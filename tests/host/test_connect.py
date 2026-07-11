@@ -1312,6 +1312,7 @@ def test_build_runner_env_forwards_harness_credentials_and_endpoints() -> None:
         "HOME": "/root",
         "ANTHROPIC_API_KEY": "sk-a",
         "ANTHROPIC_BASE_URL": "https://gateway.example.com/anthropic",
+        "ANTHROPIC_MODEL": "gateway-served-claude",
         "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat-sub",
         "CODEX_ACCESS_TOKEN": "codex-workspace-token",
         "OPENAI_API_KEY": "sk-o",
@@ -1319,6 +1320,8 @@ def test_build_runner_env_forwards_harness_credentials_and_endpoints() -> None:
         "GEMINI_API_KEY": "g-key",
         "AWS_BEARER_TOKEN_BEDROCK": "absk-fwd",
         "ANTHROPIC_BEDROCK_BASE_URL": "https://bedrock-runtime.us-east-1.amazonaws.com",
+        # An unrelated secret must never ride the credential set.
+        "MY_UNRELATED_SECRET": "leak-me-not",
     }
 
     env = _build_runner_env(
@@ -1333,6 +1336,10 @@ def test_build_runner_env_forwards_harness_credentials_and_endpoints() -> None:
     for name in (
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_BASE_URL",
+        # The gateway model pin travels with the key/endpoint — without it a
+        # LiteLLM-style gateway session launches Claude Code model-less and
+        # the gateway rejects Claude Code's own default model.
+        "ANTHROPIC_MODEL",
         "CLAUDE_CODE_OAUTH_TOKEN",
         "CODEX_ACCESS_TOKEN",
         "OPENAI_API_KEY",
@@ -1349,6 +1356,8 @@ def test_build_runner_env_forwards_harness_credentials_and_endpoints() -> None:
     # but never invented into the env.
     assert "ANTHROPIC_AUTH_TOKEN" in HARNESS_CREDENTIAL_ENV_VARS
     assert "ANTHROPIC_AUTH_TOKEN" not in env
+    # A secret not on the credential set / allowlist is not forwarded.
+    assert "MY_UNRELATED_SECRET" not in env
 
 
 def test_build_runner_env_forwards_omnigent_prefixed_harness_credentials() -> None:

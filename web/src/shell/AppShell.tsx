@@ -14,11 +14,11 @@ import { useIOSViewportLock } from "@/hooks/useIOSViewportLock";
 import { readFilesPanelPreferences, writeFilesPanelPreferences } from "@/lib/filesPanelPreferences";
 import { derivePermissionLevel, isOwnerLevel } from "@/lib/permissionsApi";
 import {
-  isElectronShell,
   isAndroidShell,
   isIOSShell,
   isMacElectronShell,
   onNativeSidebarDrag,
+  supportsBrowser,
 } from "@/lib/nativeBridge";
 import { onBrowserActionRequest } from "@/lib/browserActionBus";
 import {
@@ -57,6 +57,7 @@ import {
 } from "@/hooks/useWorkspaceChangedFiles";
 import { cn } from "@/lib/utils";
 import { isNativeWrapper as isNativeWrapperLabel } from "@/lib/nativeCodingAgents";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import { useChatStore } from "@/store/chatStore";
 import { livenessRowFromSession, useSessionLiveness } from "@/hooks/useSessionLiveness";
@@ -357,10 +358,18 @@ export function AppShell() {
   // the server's parent-delegation path — so we hide the affordance.
   const canShare =
     !!conversationId && isKnownTopLevel && (permissionLevel === null || permissionLevel >= 3);
-  const shareDisabled = canShare && isCurrentServerLocal();
-  const shareDisabledReason = shareDisabled
-    ? "Sharing is unavailable from a local server."
-    : undefined;
+  // Two independent reasons the Share affordance is present-but-disabled: a
+  // local single-user server can't share at all, and a deployed server whose
+  // admin set OMNIGENT_SHARING_MODE=off reports sharing_mode "off" via
+  // /v1/info. Fail open (share enabled) while the capability probe loads.
+  const serverInfo = useServerInfo();
+  const sharingOff = serverInfo !== "loading" && serverInfo.sharing_mode === "off";
+  const shareDisabled = canShare && (isCurrentServerLocal() || sharingOff);
+  const shareDisabledReason = !shareDisabled
+    ? undefined
+    : isCurrentServerLocal()
+      ? "Sharing is unavailable from a local server."
+      : "Sharing has been disabled for this Omnigent server.";
   // Any viewer can fork a shared session; top-level only (the server
   // rejects forking a sub-agent). Surfaced as ForkDialogContext.canFork —
   // the per-message "Fork from here" action is the only fork entry point.
@@ -462,10 +471,12 @@ export function AppShell() {
     () =>
       ({
         files: showFilesPanel,
-        // Browser tab: Electron shell only — that's where the embedded
-        // WebContentsView lives. A plain web build has no embedded browser, so
-        // the tab is hidden entirely (isElectronShell() is constant per load).
-        browser: isElectronShell(),
+        // Browser tab: shown only when the desktop shell hosts the embedded
+        // WebContentsView. A plain web build has no embedded browser, and an
+        // older desktop build predates the `browser*` bridge — both hide the
+        // tab entirely (supportsBrowser() is constant per load) so we never
+        // surface a dead tab whose calls no-op.
+        browser: supportsBrowser(),
         // Agents tab is unconditional: the panel always lists at least
         // the main agent (its "main" row), so there's never a dead end.
         subagents: true,
@@ -516,9 +527,9 @@ export function AppShell() {
 
   // Auto-surface the Browser tab on a `navigate` action, so a browser_navigate
   // fired while another tab is selected doesn't load into a hidden pane.
-  // Electron-only; no-op elsewhere (the bus never fires without a relay).
+  // Browser-capable shells only; no-op elsewhere (the bus never fires without a relay).
   useEffect(() => {
-    if (!isElectronShell()) return;
+    if (!supportsBrowser()) return;
     return onBrowserActionRequest((evt) => {
       if (evt.action !== "navigate") return;
       setRightRailTab("browser");
@@ -537,7 +548,7 @@ export function AppShell() {
   const designShotRef = useRef<Map<string, string>>(new Map());
   const boundAgentId = boundAgent?.id ?? null;
   useEffect(() => {
-    if (!isElectronShell()) return;
+    if (!supportsBrowser()) return;
     const w = window as unknown as {
       omnigentDesktop?: {
         onBrowserElementSelected?: (

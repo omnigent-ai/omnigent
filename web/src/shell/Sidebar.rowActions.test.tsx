@@ -11,6 +11,8 @@ import { cleanup, fireEvent, render, screen, within } from "@testing-library/rea
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import type { ServerInfo } from "@/lib/capabilities";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 
 // Controllable rename mutation so the double-click test can assert the
 // committed title was forwarded to the PATCH. Declared via vi.hoisted so the
@@ -93,13 +95,31 @@ function mockConversations(conversations: Conversation[]) {
   useConvMock.mockImplementation(() => dataResult);
 }
 
+/** Full ServerInfo with permissive defaults; override per test. */
+function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
+  return {
+    accounts_enabled: false,
+    login_url: null,
+    needs_setup: false,
+    databricks_features: false,
+    managed_sandboxes_enabled: false,
+    sandbox_provider: null,
+    sharing_mode: "on",
+    public_sharing_enabled: true,
+    server_version: null,
+    smart_routing_enabled: false,
+    ...overrides,
+  };
+}
+
 // `activeId` mounts the sidebar at `/c/:conversationId` (via a matching
 // Route so `useParams` populates), making that row the active one — the
-// rest of the suite renders at `/` where no row is active.
-function renderSidebar(activeId?: string) {
+// rest of the suite renders at `/` where no row is active. `info` pins the
+// server sharing policy via CapabilitiesProvider (default "loading" → on).
+function renderSidebar(activeId?: string, info?: ServerInfo) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const sidebar = <Sidebar open={true} onClose={vi.fn()} />;
-  return render(
+  const tree = (
     <QueryClientProvider client={qc}>
       <TooltipProvider>
         <MemoryRouter initialEntries={[activeId ? `/c/${activeId}` : "/"]}>
@@ -112,8 +132,11 @@ function renderSidebar(activeId?: string) {
           )}
         </MemoryRouter>
       </TooltipProvider>
-    </QueryClientProvider>,
+    </QueryClientProvider>
   );
+  // No explicit info → CapabilitiesContext default ("loading"), matching every
+  // pre-existing test (sharing treated as on).
+  return render(info ? <CapabilitiesProvider info={info}>{tree}</CapabilitiesProvider> : tree);
 }
 
 beforeEach(() => {
@@ -337,5 +360,29 @@ describe("right-click context menu", () => {
     // inline rename input appears.
     fireEvent.click(screen.getByTestId("rename-conversation"));
     expect(screen.getByTestId("rename-conversation-input")).toBeInTheDocument();
+  });
+});
+
+describe("sharing kill switch", () => {
+  it("disables the row's Share item for a manager when sharing_mode is off", () => {
+    // CONV is owner-level (permission_level null → canManage), yet a server
+    // reporting sharing_mode off must gray out Share for everyone.
+    mockConversations([CONV]);
+    renderSidebar(undefined, serverInfo({ sharing_mode: "off" }));
+
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+
+    // Radix marks a disabled menu item with data-disabled; the enabled
+    // (on / read_only) branch renders a plain selectable item without it.
+    expect(screen.getByTestId("share-conversation")).toHaveAttribute("data-disabled");
+  });
+
+  it("keeps the row's Share item enabled for a manager when sharing is on", () => {
+    mockConversations([CONV]);
+    renderSidebar(undefined, serverInfo({ sharing_mode: "on" }));
+
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+
+    expect(screen.getByTestId("share-conversation")).not.toHaveAttribute("data-disabled");
   });
 });

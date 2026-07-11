@@ -631,6 +631,8 @@ function renderLanding(infoOverrides: Partial<ServerInfo> = {}, route = "/") {
     databricks_features: false,
     managed_sandboxes_enabled: false,
     sandbox_provider: null,
+    sharing_mode: "on",
+    public_sharing_enabled: true,
     server_version: null,
     smart_routing_enabled: false,
     ...infoOverrides,

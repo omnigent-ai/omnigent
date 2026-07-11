@@ -130,6 +130,17 @@ interface ElectronDesktopApi extends NativeShellApi {
   getCliStatus?: () => Promise<CliStatus | null>;
   /** Clear the CLI-path override (revert to auto-detection); resolves status. */
   resetCliPath?: () => Promise<CliStatus | null>;
+  /**
+   * Open/navigate a conversation's embedded browser view. Present only on
+   * desktop shells new enough to ship the embedded browser feature — its
+   * presence is the capability marker the whole `browser*` suite ships with.
+   */
+  browserOpenOrNavigate?: (
+    conversationId: string,
+    url: string,
+    bounds?: unknown,
+    opts?: { force?: boolean; agent?: boolean },
+  ) => Promise<{ ok: boolean; created?: boolean; error?: string }>;
 }
 
 /** A lifecycle action for the host daemon. */
@@ -191,6 +202,17 @@ function nativeApi(): NativeShellApi | undefined {
 /** True when running inside the Electron desktop shell. */
 export function isElectronShell(): boolean {
   return electronApi() !== undefined;
+}
+
+/**
+ * True when the desktop shell is new enough to host the embedded browser pane.
+ * Older installed builds expose `omnigentDesktop` but predate the `browser*`
+ * bridge, so `isElectronShell()` alone would surface a dead Browser tab whose
+ * calls no-op. Probes the foundational browser method (the suite ships
+ * together); false in a plain browser and on shells without the feature.
+ */
+export function supportsBrowser(): boolean {
+  return typeof electronApi()?.browserOpenOrNavigate === "function";
 }
 
 /**

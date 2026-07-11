@@ -1,10 +1,12 @@
 """E2E: the embedded-browser "Browser" tab in the right Workspace rail.
 
 The browser pane is desktop-only: ``AppShell`` marks the Browser rail tab
-available when ``isElectronShell()`` is true, i.e. when the Electron preload
-exposes ``window.omnigentDesktop.kind === "electron"``
-(``web/src/lib/nativeBridge.ts``). The tab is deliberately the LAST tab in the
-rail (Files · Agents · Shells · Tasks · Browser).
+available when ``supportsBrowser()`` is true, i.e. when the Electron preload
+exposes ``window.omnigentDesktop.kind === "electron"`` *and* the embedded-
+browser bridge method ``browserOpenOrNavigate`` (an older desktop build that
+predates the feature lacks it) — see ``web/src/lib/nativeBridge.ts``. The tab
+is deliberately the LAST tab in the rail (Files · Agents · Shells · Tasks ·
+Browser).
 
 The e2e_ui harness runs the SPA in a plain Chromium browser, not Electron, so
 by default the tab is absent. To exercise the desktop path end-to-end we inject
@@ -12,7 +14,7 @@ a minimal ``window.omnigentDesktop`` stub via ``add_init_script`` *before any
 app script runs* — the same feature-detection stubbing
 ``sessions/test_pinned_session_hotkeys.py`` uses. That covers the chain the
 component/unit tests can't reach end to end: the injected bridge ->
-``isElectronShell()`` -> ``AppShell`` marking the tab available -> the
+``supportsBrowser()`` -> ``AppShell`` marking the tab available -> the
 ``WorkspacePanel`` rendering it last -> selecting it mounting the pane.
 
 No LLM turn is involved; the assertions are DOM-based.
@@ -28,10 +30,11 @@ from tests.e2e_ui.conftest import open_right_rail
 
 # Minimal stand-in for the Electron preload bridge. Runs before any app script
 # on every navigation (add_init_script), so the SPA's feature detection
-# (``electronApi()`` in nativeBridge.ts, which checks
-# ``window.omnigentDesktop?.kind === "electron"``) sees a native shell. Every
-# method the web layer may call is a guarded no-op: ``kind`` is what gates the
-# Browser tab, and the rest keep unrelated native calls (badge, notify, the
+# (``supportsBrowser()`` in nativeBridge.ts) sees a browser-capable shell. Every
+# method the web layer may call is a guarded no-op: ``kind`` marks the native
+# shell, ``browserOpenOrNavigate`` is the capability marker that gates the
+# Browser tab (a shell too old to ship the embedded browser lacks it, so the
+# tab hides), and the rest keep unrelated native calls (badge, notify, the
 # title-bar server picker, and the browser-pane bridge probes) from throwing
 # under the stub. ``browserHasView`` resolves "no view yet" so the pane shows
 # its empty state instead of trying to attach a native WebContentsView.
@@ -44,6 +47,7 @@ window.omnigentDesktop = {
   getServerPicker: function () { return Promise.resolve(null); },
   switchServer: function () { return Promise.resolve(); },
   openServerSetup: function () {},
+  browserOpenOrNavigate: function () { return Promise.resolve({ ok: true }); },
   browserHasView: function () { return Promise.resolve({ exists: false }); },
   onBrowserViewCreated: function () { return function () {}; },
   onBrowserHostActiveChanged: function () { return function () {}; },
@@ -63,7 +67,7 @@ def test_browser_tab_is_last_and_opens_pane(
     Asserts the desktop-only chain end to end:
 
     1. With the Electron bridge stubbed, the "Browser" tab appears in the
-       Workspace rail (``isElectronShell()`` -> tab available).
+       Workspace rail (``supportsBrowser()`` -> tab available).
     2. It is the LAST tab in the rail (the deliberate ordering — after
        Files / Agents / Shells / Tasks).
     3. Selecting it mounts the browser pane region.
@@ -105,7 +109,7 @@ def test_no_browser_tab_in_plain_browser(
 ) -> None:
     """A plain browser tab (no Electron bridge) never shows the Browser tab.
 
-    Without the ``window.omnigentDesktop`` stub, ``isElectronShell()`` is
+    Without the ``window.omnigentDesktop`` stub, ``supportsBrowser()`` is
     false, so ``AppShell`` marks the Browser rail tab unavailable and it must
     not render — the gate that keeps the embedded browser off the plain web
     app (there is no WebContentsView to host). This is the half of the

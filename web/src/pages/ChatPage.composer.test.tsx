@@ -528,6 +528,9 @@ describe("AgentPicker trigger label", () => {
       selectedModel: null,
       selectedEffort: null,
       llmModel: null,
+      // Reset the per-session override too: a test that sets it must not leak
+      // into the next, which now reads sessionModelOverride first for the label.
+      sessionModelOverride: null,
       codexModelOptions: [],
       nativeVendorOwnsModel: false,
     });
@@ -582,7 +585,11 @@ describe("AgentPicker trigger label", () => {
     const trigger = screen.getByTestId("agent-picker-trigger");
     expect(trigger).toHaveTextContent("Sonnet 4.6");
     expect(trigger).not.toHaveTextContent("Opus");
-    trigger.click();
+
+    // Open the picker via the bare-"/model" intercept — a synthetic click on the
+    // Radix trigger doesn't open the menu under jsdom, so the rows never mount.
+    fireEvent.change(textarea(), { target: { value: "/model " } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
 
     const sonnetRow = document.querySelector<HTMLElement>(
       '[data-testid="model-picker-item"][data-model-id="sonnet"]',
@@ -590,6 +597,8 @@ describe("AgentPicker trigger label", () => {
     const opusRow = document.querySelector<HTMLElement>(
       '[data-testid="model-picker-item"][data-model-id="opus"]',
     );
+    // The applied session override ("sonnet") is the active row, not the
+    // cross-session sticky ("opus").
     expect(sonnetRow).toHaveAttribute("data-active", "true");
     expect(opusRow).not.toHaveAttribute("data-active", "true");
   });

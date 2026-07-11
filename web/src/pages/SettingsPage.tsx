@@ -142,6 +142,9 @@ const MembersPage = lazy(() =>
 const PoliciesPage = lazy(() =>
   import("@/pages/PoliciesPage").then((m) => ({ default: m.PoliciesPage })),
 );
+const SharingPage = lazy(() =>
+  import("@/pages/SharingPage").then((m) => ({ default: m.SharingPage })),
+);
 
 /**
  * Settings content panel. The section nav lives in the sidebar card
@@ -164,10 +167,16 @@ export function SettingsPage() {
   // Rendered in ANY multi-user mode (accounts AND OIDC), not gated on
   // `accountsEnabled` — the nav + pages handle admin gating, and Members runs
   // read-only under OIDC (no password actions).
-  if (section === "members" || section === "policies") {
+  if (section === "members" || section === "policies" || section === "sharing") {
     return (
       <Suspense fallback={null}>
-        {section === "members" ? <MembersPage /> : <PoliciesPage />}
+        {section === "members" ? (
+          <MembersPage />
+        ) : section === "policies" ? (
+          <PoliciesPage />
+        ) : (
+          <SharingPage />
+        )}
       </Suspense>
     );
   }
