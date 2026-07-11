@@ -1152,7 +1152,7 @@ class SqlScheduledTask(Base):
     name: Mapped[str] = mapped_column(String(256), nullable=False)
     # Opaque free text, never SQL-queried — stored compressed (CompressedText).
     prompt: Mapped[str] = mapped_column(CompressedText, nullable=False)
-    # Recurring trigger: a required cron string, e.g. "0 9 * * *".
+    # e.g. "0 9 * * *"
     cron_expression: Mapped[str] = mapped_column(String(255), nullable=False)
     # Session-owner identity: the spawned run's LEVEL_OWNER grant is written
     # for this user. Nullable — None in single-user/OSS mode (the fire path
@@ -1170,8 +1170,9 @@ class SqlScheduledTask(Base):
     # Git base ref a firing branches from when it creates a worktree at fire
     # time (mirrors session-create's git.base_branch input). None when unset.
     base_branch: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    # Nullable compute-target hint (provider name). Persisted only in this PR —
-    # no resolution logic. A single nullable string, not an enum.
+    # Nullable compute-target hint (provider name, e.g. "local"/"isaac"). Not yet
+    # resolved — the fire path reads it in a later milestone. A single nullable
+    # string, not an enum.
     sandbox_target: Mapped[str | None] = mapped_column(String(64), nullable=True)
     timezone: Mapped[str] = mapped_column(String(64), nullable=False, server_default="UTC")
     # Enum stored as a stable int code (see omnigent.db.enum_codecs
