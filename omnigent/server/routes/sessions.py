@@ -14051,6 +14051,49 @@ def create_sessions_router(
     """
     router = APIRouter()
 
+    # ── POST /sessions/validate-bundle ───────────────────────────
+
+    @router.post(
+        "/sessions/validate-bundle",
+        response_model=None,
+        # CSRF hardening: multipart/form-data is CORS-safelisted, so a
+        # content-type guard can't stop a cross-site upload; the trusted-origin
+        # check closes that gap (absent Origin allowed for non-browser clients;
+        # a present Origin must be loopback in local mode).
+        dependencies=[Depends(require_trusted_origin)],
+    )
+    async def validate_session_bundle(
+        request: Request,
+        bundle: Annotated[UploadFile, File(...)],
+    ) -> dict[str, Any]:
+        """
+        Validate an agent bundle without creating a session.
+
+        The import-dialog preflight: runs the SAME validation the bundled
+        create path applies (:func:`validate_agent_bundle`) so a bad
+        ``config.yaml`` surfaces at import time instead of failing mid-create.
+        Nothing is stored and no session is created — only the spec is parsed
+        and checked.
+
+        :param request: The incoming FastAPI request (auth only).
+        :param bundle: Uploaded ``.tar.gz`` agent bundle file.
+        :returns: ``{"ok": True, "agent_name": <spec name>}`` on success.
+        :raises OmnigentError: ``invalid_input`` (HTTP 400) when the bundle
+            is malformed or the spec fails validation.
+        """
+        _require_user(request, auth_provider)
+        bundle_bytes = await bundle.read()
+        # Extraction + spec parse both block, so run off the event loop —
+        # mirrors the bundled-create path. The policy-handler allowlist is
+        # enforced only on a shared / multi-user server; a trusted
+        # single-user/local server keeps supporting custom handlers.
+        spec = await asyncio.to_thread(
+            validate_agent_bundle,
+            bundle_bytes,
+            enforce_handler_allowlist=not local_single_user_enabled(),
+        )
+        return {"ok": True, "agent_name": spec.name}
+
     # ── POST /sessions ───────────────────────────────────────────
 
     @router.post(

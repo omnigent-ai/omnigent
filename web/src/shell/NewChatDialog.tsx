@@ -21,6 +21,7 @@ import {
   ArrowUpIcon,
   FileTextIcon,
   FolderIcon,
+  FolderInputIcon,
   ImageIcon,
   PaperclipIcon,
   PlusIcon,
@@ -116,8 +117,24 @@ import { IntelligentModelControl, type CostControlMode } from "@/components/Cost
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { AgentRowTooltip } from "@/components/AgentHoverCard";
 import { CreateAgentDialog } from "./CreateAgentDialog";
+import { ImportAgentDialog, type ImportedAgent } from "./ImportAgentDialog";
 import { buildAgentBundle, type AgentBundleInput } from "@/lib/agentBundle";
 import { createBundledSession, launchRunner } from "@/lib/sessionsApi";
+
+/**
+ * The custom agent staged in the picker before a session is created.
+ * Either authored via the create form (bundle built at create time) or
+ * imported from disk (bundle already packed). Both surface a display name.
+ */
+type PendingAgent =
+  | {
+      kind: "created";
+      name: string;
+      description?: string;
+      harness?: string;
+      input: AgentBundleInput;
+    }
+  | { kind: "imported"; name: string; bundle: File };
 
 // Hidden from the new-session picker only. `nessie` is superseded by polly.
 // `kimi` / `kimi-code` are the headless SDK harness (kept for sub-agent / `run
@@ -1255,6 +1272,7 @@ function AgentHarnessPicker({
   pendingAgentId,
   onSelectPending,
   onCreateCustomAgent,
+  onImportConfig,
   permissionMode,
   approvalMode,
   cursorExecMode,
@@ -1278,10 +1296,11 @@ function AgentHarnessPicker({
   hasAgents: boolean;
   host: Host | undefined | null;
   onSelectAgent: (agent: AvailableAgent) => void;
-  pendingAgent: AgentBundleInput | null;
+  pendingAgent: PendingAgent | null;
   pendingAgentId: string;
   onSelectPending: () => void;
   onCreateCustomAgent: () => void;
+  onImportConfig: () => void;
   permissionMode: string;
   approvalMode: string;
   cursorExecMode: string;
@@ -1663,14 +1682,33 @@ function AgentHarnessPicker({
                 </div>
               </DropdownMenuItem>
             )}
-            <DropdownMenuItem
-              data-testid="new-chat-landing-create-agent"
-              onSelect={onCreateCustomAgent}
-              className="gap-2 rounded-sm px-2 py-1.5 text-13 text-muted-foreground"
-            >
-              <PlusIcon className="size-3.5" />
-              Create custom agent
-            </DropdownMenuItem>
+            <DropdownMenuSub>
+              <DropdownMenuSubTrigger
+                data-testid="new-chat-landing-add-agent"
+                className="gap-2 rounded-sm px-2 py-1.5 text-13 text-muted-foreground"
+              >
+                <PlusIcon className="size-3.5" />
+                Custom Agent
+              </DropdownMenuSubTrigger>
+              <DropdownMenuSubContent className="min-w-56 max-w-[calc(100vw-2rem)] p-1">
+                <DropdownMenuItem
+                  data-testid="new-chat-landing-create-agent"
+                  onSelect={onCreateCustomAgent}
+                  className="gap-2 rounded-sm px-2 py-1.5 text-13 text-muted-foreground"
+                >
+                  <PlusIcon className="size-3.5" />
+                  Configure Manually
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  data-testid="new-chat-landing-import-agent"
+                  onSelect={onImportConfig}
+                  className="gap-2 rounded-sm px-2 py-1.5 text-13 text-muted-foreground"
+                >
+                  <FolderInputIcon className="size-3.5" />
+                  Import Config
+                </DropdownMenuItem>
+              </DropdownMenuSubContent>
+            </DropdownMenuSub>
           </>
         )}
       </DropdownMenuContent>
@@ -1747,7 +1785,8 @@ export function NewChatLandingScreen() {
   // form submit, handleCreate detects the pending bundle, builds the
   // tar.gz, and uses multipart POST instead of the normal JSON path.
   const [createAgentOpen, setCreateAgentOpen] = useState(false);
-  const [pendingAgent, setPendingAgent] = useState<AgentBundleInput | null>(null);
+  const [importAgentOpen, setImportAgentOpen] = useState(false);
+  const [pendingAgent, setPendingAgent] = useState<PendingAgent | null>(null);
   // Sentinel id for the pending custom agent in the picker dropdown.
   const PENDING_AGENT_ID = "__pending_custom_agent__";
 
@@ -2115,8 +2154,9 @@ export function NewChatLandingScreen() {
             id: PENDING_AGENT_ID,
             name: pendingAgent.name,
             display_name: pendingAgent.name,
-            description: pendingAgent.description ?? null,
-            harness: pendingAgent.harness ?? null,
+            description:
+              pendingAgent.kind === "created" ? (pendingAgent.description ?? null) : null,
+            harness: pendingAgent.kind === "created" ? (pendingAgent.harness ?? null) : null,
             skills: [],
           } satisfies AvailableAgent)
         : agentList.find((a) => a.id === effectiveAgentId),
@@ -2617,7 +2657,12 @@ export function NewChatLandingScreen() {
         // NOT launch a runner on the host. We must follow up with launchRunner
         // (POST /v1/hosts/{id}/runners) to bind the session to a runner, the
         // same way the fork-resume path does.
-        const bundle = await buildAgentBundle(pendingAgent);
+        // Created agents build their bundle from form fields at create time;
+        // imported agents already carry the packed bundle from the picker.
+        const bundle =
+          pendingAgent.kind === "imported"
+            ? pendingAgent.bundle
+            : await buildAgentBundle(pendingAgent.input);
         const metadata: Record<string, unknown> = {};
         if (workspaceTrimmed) metadata.workspace = workspaceTrimmed;
         data = await createBundledSession(
@@ -3093,6 +3138,7 @@ export function NewChatLandingScreen() {
                   pendingAgentId={PENDING_AGENT_ID}
                   onSelectPending={handleSelectPending}
                   onCreateCustomAgent={() => setCreateAgentOpen(true)}
+                  onImportConfig={() => setImportAgentOpen(true)}
                   permissionMode={permissionMode}
                   approvalMode={approvalMode}
                   cursorExecMode={cursorExecMode}
@@ -3685,7 +3731,22 @@ export function NewChatLandingScreen() {
         open={createAgentOpen}
         onOpenChange={setCreateAgentOpen}
         onCreate={(input) => {
-          setPendingAgent(input);
+          setPendingAgent({
+            kind: "created",
+            name: input.name,
+            description: input.description,
+            harness: input.harness,
+            input,
+          });
+          setPickedAgentId(PENDING_AGENT_ID);
+          setPickedHarness(null);
+        }}
+      />
+      <ImportAgentDialog
+        open={importAgentOpen}
+        onOpenChange={setImportAgentOpen}
+        onImport={(agent: ImportedAgent) => {
+          setPendingAgent({ kind: "imported", name: agent.name, bundle: agent.bundle });
           setPickedAgentId(PENDING_AGENT_ID);
           setPickedHarness(null);
         }}

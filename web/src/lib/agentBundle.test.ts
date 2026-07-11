@@ -41,7 +41,32 @@ class PassthroughStream {
 (globalThis as any).CompressionStream = PassthroughStream;
 
 // Now import the function (it will use our mock CompressionStream).
-const { buildAgentBundle } = await import("./agentBundle");
+const { buildAgentBundle, buildBundleFromFiles } = await import("./agentBundle");
+
+/** Parse all tar entries (name → content) from the raw tar bytes in a File. */
+async function extractEntries(file: File): Promise<Record<string, string>> {
+  const tar = new Uint8Array(await file.arrayBuffer());
+  const dec = new TextDecoder();
+  const entries: Record<string, string> = {};
+  let off = 0;
+  while (off + 512 <= tar.length) {
+    const name = dec.decode(tar.slice(off, off + 100)).replace(/\0/g, "");
+    if (!name) break; // zero block → end of archive
+    const size = parseInt(dec.decode(tar.slice(off + 124, off + 135)).replace(/\0/g, ""), 8);
+    entries[name] = dec.decode(tar.slice(off + 512, off + 512 + size));
+    off += 512 + Math.ceil(size / 512) * 512;
+  }
+  return entries;
+}
+
+/** Build a File with an optional `webkitRelativePath` for folder-pick tests. */
+function fakeFile(name: string, content: string, relPath?: string): File {
+  const file = new File([content], name, { type: "text/yaml" });
+  if (relPath) {
+    Object.defineProperty(file, "webkitRelativePath", { value: relPath });
+  }
+  return file;
+}
 
 /** Extract the config.yaml from the raw tar bytes inside the File. */
 async function extractConfigYaml(file: File): Promise<string> {
@@ -196,5 +221,56 @@ describe("buildAgentBundle", () => {
     const yaml = await extractConfigYaml(await buildAgentBundle(input));
     expect(yaml).toContain("harness: openai-agents");
     expect(yaml).toContain("model: gpt-4o");
+  });
+});
+
+describe("buildBundleFromFiles", () => {
+  it("rejects an empty selection", async () => {
+    await expect(buildBundleFromFiles([])).rejects.toThrow(/no files/i);
+  });
+
+  it("renames a lone YAML to config.yaml when singleFileAsConfig is set", async () => {
+    const file = await buildBundleFromFiles([fakeFile("my-agent.yaml", "spec_version: 1")], {
+      singleFileAsConfig: true,
+    });
+    const entries = await extractEntries(file);
+    expect(Object.keys(entries)).toEqual(["config.yaml"]);
+    expect(entries["config.yaml"]).toBe("spec_version: 1");
+  });
+
+  it("keeps the original file name when singleFileAsConfig is not set", async () => {
+    const file = await buildBundleFromFiles([fakeFile("agent.yml", "spec_version: 1")]);
+    const entries = await extractEntries(file);
+    expect(Object.keys(entries)).toEqual(["agent.yml"]);
+  });
+
+  it("strips the top folder from webkitRelativePath so contents sit at the root", async () => {
+    const file = await buildBundleFromFiles(
+      [
+        fakeFile("config.yaml", "spec_version: 1", "my-agent/config.yaml"),
+        fakeFile("AGENTS.md", "# Instructions", "my-agent/AGENTS.md"),
+        fakeFile("SKILL.md", "skill body", "my-agent/skills/debate/SKILL.md"),
+      ],
+      { singleFileAsConfig: true },
+    );
+    const entries = await extractEntries(file);
+    expect(Object.keys(entries).sort()).toEqual([
+      "AGENTS.md",
+      "config.yaml",
+      "skills/debate/SKILL.md",
+    ]);
+    // singleFileAsConfig must not rewrite names for a multi-file folder pick.
+    expect(entries["config.yaml"]).toBe("spec_version: 1");
+    expect(entries["skills/debate/SKILL.md"]).toBe("skill body");
+  });
+
+  it("packs a folder's config.yaml verbatim (no YAML rewriting)", async () => {
+    const raw = "spec_version: 1\nname: imported\nexecutor:\n  type: omnigent\n";
+    const file = await buildBundleFromFiles(
+      [fakeFile("config.yaml", raw, "imported/config.yaml")],
+      { singleFileAsConfig: true },
+    );
+    const entries = await extractEntries(file);
+    expect(entries["config.yaml"]).toBe(raw);
   });
 });
