@@ -854,6 +854,109 @@ async def test_orphan_sweep_preserves_live_omnigent_dirs(
         await fresh.shutdown()
 
 
+@pytest.mark.posix_only
+async def test_orphan_sweep_survives_unreadable_tmp_parent(
+    short_tmp_parent: Path,
+) -> None:
+    """An unreadable tmp_parent must not abort manager startup.
+
+    Multi-tenant same-host case: the shared parent can belong to
+    another user and be unreadable to us. ``iterdir()`` then raises
+    PermissionError -- the documented best-effort contract is to log
+    and proceed with boot, not crash the runner.
+    """
+    if os.geteuid() == 0:
+        pytest.skip("permission checks do not apply to root")
+    locked_parent = short_tmp_parent / "fp"
+    locked_parent.mkdir(mode=0o700)
+    (locked_parent / "ap-unreachable").mkdir(mode=0o700)
+    # Write+search without read: our own instance dir can be created,
+    # but the sweep cannot enumerate the parent (EACCES on iterdir) --
+    # the shape of a shared parent owned by another user.
+    locked_parent.chmod(0o333)
+    manager = HarnessProcessManager(tmp_parent=locked_parent)
+    try:
+        # Before the fix this raised PermissionError out of start().
+        await manager.start()
+    finally:
+        locked_parent.chmod(0o700)
+        with contextlib.suppress(Exception):
+            await manager.shutdown()
+
+
+@pytest.mark.posix_only
+async def test_orphan_sweep_skips_unreadable_sibling_and_still_sweeps(
+    short_tmp_parent: Path,
+) -> None:
+    """A foreign, unreadable ``ap-*`` sibling is skipped, not fatal.
+
+    Plants one mode-0000 sibling (stat of its sentinel raises
+    PermissionError) and one readable dead-PID orphan. The sweep must
+    skip the former, still remove the latter, and leave a live
+    sibling untouched.
+    """
+    if os.geteuid() == 0:
+        pytest.skip("permission checks do not apply to root")
+    foreign = short_tmp_parent / "ap-foreignuser"
+    foreign.mkdir(mode=0o700)
+    (foreign / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+    foreign.chmod(0o000)
+
+    dead = short_tmp_parent / "ap-deadsibling"
+    dead.mkdir(mode=0o700)
+    (dead / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+
+    live = short_tmp_parent / "ap-livesibling"
+    live.mkdir(mode=0o700)
+    (live / _AP_PID_FILE).write_text(str(os.getpid()), encoding="utf-8")
+
+    manager = HarnessProcessManager(tmp_parent=short_tmp_parent)
+    try:
+        await manager.start()
+        assert foreign.exists(), "unreadable sibling must be skipped, not removed"
+        assert not dead.exists(), "readable dead orphan must still be swept"
+        assert live.exists(), "live sibling must remain untouched"
+    finally:
+        foreign.chmod(0o700)
+        with contextlib.suppress(Exception):
+            await manager.shutdown()
+
+
+async def test_orphan_sweep_treats_vanishing_child_as_benign_race(
+    short_tmp_parent: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A child that disappears mid-inspection does not abort the sweep.
+
+    Simulates the vanish race by making ``is_dir`` raise
+    FileNotFoundError for one planted child; the sweep must continue
+    and still remove a later dead orphan.
+    """
+    vanishing = short_tmp_parent / "ap-avanishing"
+    vanishing.mkdir(mode=0o700)
+    (vanishing / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+    dead = short_tmp_parent / "ap-zzdead"
+    dead.mkdir(mode=0o700)
+    (dead / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+
+    real_is_dir = Path.is_dir
+
+    def _racy_is_dir(self: Path, **kwargs: object) -> bool:
+        if self.name == "ap-avanishing":
+            raise FileNotFoundError(2, "vanished mid-sweep", str(self))
+        return real_is_dir(self, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "is_dir", _racy_is_dir)
+    manager = HarnessProcessManager(tmp_parent=short_tmp_parent)
+    try:
+        await manager.start()
+        assert not dead.exists(), "sweep must continue past the racy child"
+    finally:
+        monkeypatch.undo()
+        with contextlib.suppress(Exception):
+            await manager.shutdown()
+
+
 # ── Helper-level tests (small, fast) ───────────────────────────
 
 
