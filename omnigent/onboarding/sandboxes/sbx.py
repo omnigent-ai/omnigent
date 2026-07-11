@@ -1,7 +1,7 @@
 """
 Docker Sandbox (``sbx``) launcher.
 
-Implements the CLI-bootstrap subset of
+Implements both the CLI-bootstrap and the server-managed subsets of
 :class:`~omnigent.onboarding.sandboxes.base.SandboxLauncher` for local
 `Docker Sandboxes <https://docs.docker.com/ai/sandboxes/>`_ — microVMs
 driven by the external ``sbx`` binary. Unlike the cloud launchers
@@ -10,16 +10,19 @@ against ``sbx``.
 
 Platform notes that shape this launcher:
 
-- **Local, not cloud.** Sandboxes run on the machine invoking the CLI,
-  so this is a CLI-bootstrap provider only (``omnigent sandbox
-  create/connect``). There is no server-managed flow.
+- **Local, with an optional managed mode.** In CLI-bootstrap mode
+  (``omnigent sandbox create/connect``) sandboxes run on the machine
+  invoking the CLI. In managed mode the server provisions a fresh sbx
+  microVM per session from a prebaked image.
 - **Own Docker daemon per sandbox.** Each sbx sandbox is a microVM with
   its own Docker daemon, so the in-session agent can run nested Docker
   dev containers safely.
-- **Default image + full install.** Sandboxes boot sbx's default image
-  (no prebaked omnigent), so :meth:`wheel_install_command` does a full
-  dependency install and :meth:`provision` runs a one-time setup step to
-  install the host's runtime deps + the Claude Code and OpenCode CLIs.
+- **Default image + full install (CLI mode).** Sandboxes boot sbx's
+  default image (no prebaked omnigent), so :meth:`wheel_install_command`
+  does a full dependency install and :meth:`provision` runs a one-time
+  setup step to install the host's runtime deps + the Claude Code and
+  OpenCode CLIs. Managed mode skips this because the template already
+  bakes omnigent.
 - **No inbound port forwarding.** ``supports_local_port_forward`` stays
   ``False`` (matching Modal), so the CLI auto-skips the Databricks App
   OAuth step.
@@ -29,12 +32,15 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
+import tempfile
 import time
 from collections.abc import Sequence
 from pathlib import Path
 from typing import ClassVar
+from urllib.parse import urlparse
 
 import click
 
@@ -86,6 +92,28 @@ distinct ``sbx-cs-*`` placeholders instead, so this exact value always
 means "no real key behind it" — the gateway never substitutes anything
 and harnesses that prefer env keys over their own login (Claude Code)
 fail with an invalid-key error."""
+
+_MANAGED_EMPTY_WORKSPACE: Path = Path(tempfile.gettempdir()) / "omnigent-sbx-managed-empty"
+"""Throwaway empty directory passed to ``sbx create ... shell`` in managed mode.
+
+The ``sbx`` CLI requires a PATH argument even when the image provides its
+own workspace, so we bind-mount this empty directory. It is created on
+demand."""
+
+
+def _server_host_port(server_url: str | None) -> str:
+    """Extract ``host:port`` from a URL for sbx network policy allow rules."""
+    if not server_url:
+        raise click.ClickException("sbx managed mode requires sandbox.server_url")
+    parsed = urlparse(server_url)
+    host = parsed.hostname
+    if not host:
+        raise click.ClickException(f"could not parse sandbox.server_url: {server_url}")
+    if parsed.port:
+        return f"{host}:{parsed.port}"
+    default_port = "443" if parsed.scheme == "https" else "80"
+    return f"{host}:{default_port}"
+
 
 # Unsets every env var still holding the unbacked placeholder sentinel
 # before the host process starts, so it can't shadow real harness
@@ -145,6 +173,9 @@ class SbxSandboxLauncher(SandboxLauncher):
     # Databricks App OAuth flow is unsupported (CLI auto-skips it).
     supports_local_port_forward: ClassVar[bool] = False
     wheel_build_index_url: ClassVar[str | None] = None
+    # sbx sandboxes idle-stop but retain their filesystem, so a dormant
+    # managed host can be revived under the same sandbox id.
+    can_resume: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -152,6 +183,7 @@ class SbxSandboxLauncher(SandboxLauncher):
         template: str | None = None,
         env: Sequence[str] | None = None,
         kits: Sequence[str] | None = None,
+        server_url: str | None = None,
     ) -> None:
         """
         :param template: Container image for ``sbx create -t``, or
@@ -160,11 +192,22 @@ class SbxSandboxLauncher(SandboxLauncher):
             or ``None`` to resolve :data:`SANDBOX_ENV_PASSTHROUGH_ENV_VAR`.
         :param kits: sbx kit references applied at create, or ``None`` to
             resolve :data:`KITS_ENV_VAR`.
+        :param server_url: Public URL the in-sandbox host dials back to.
+            When set, the launcher operates in **managed** mode (server
+            provisions the box). When unset, it operates in CLI-bootstrap
+            mode (``omnigent sandbox create/connect``).
         """
         self._template = template
         self._env_names = tuple(env) if env is not None else None
         self._kits = tuple(kits) if kits is not None else None
+        self._server_url = server_url
         self._binary: str | None = None
+        self._managed_env_cache: tuple[list[str], dict[str, str]] | None = None
+
+    @property
+    def _managed(self) -> bool:
+        """True when this launcher is driven by the server's managed flow."""
+        return self._server_url is not None
 
     def _sbx_binary(self) -> str:
         """Locate the ``sbx`` binary, caching the result."""
@@ -179,13 +222,47 @@ class SbxSandboxLauncher(SandboxLauncher):
             self._binary = found
         return self._binary
 
-    def _run_sbx(self, args: list[str]) -> subprocess.CompletedProcess[str]:
-        """Run ``sbx <args>``, capturing text output."""
+    def _run_sbx(
+        self, args: list[str], *, extra_env: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        """
+        Run ``sbx <args>``, capturing text output.
+
+        *extra_env* is merged into the subprocess's own environment (not
+        argv), so credential VALUES forwarded with ``sbx exec -e NAME`` never
+        appear in the server host's process listing.
+        """
+        env = {**os.environ, **extra_env} if extra_env else None
         return subprocess.run(
             [self._sbx_binary(), *args],
             capture_output=True,
             text=True,
+            env=env,
         )
+
+    def _managed_env(self) -> tuple[list[str], dict[str, str]]:
+        """
+        Resolve configured env for a managed ``sbx exec``.
+
+        Returns ``(["-e", NAME, …], {NAME: VALUE})``. The VALUES ride the
+        ``sbx`` subprocess environment (see :meth:`_run_sbx`) and only the
+        NAMES reach argv via ``-e NAME`` (the ``docker exec`` inherit-from-env
+        form), so harness credentials aren't exposed in the server host's
+        process table. Resolved once and cached — a managed launch execs
+        several commands (``$HOME`` probe, ``mkdir``, clone, host start).
+
+        CLI-bootstrap mode returns empties so :meth:`run` stays unchanged for
+        the local ``omnigent sandbox create/connect`` path.
+        """
+        if not self._managed:
+            return [], {}
+        if self._managed_env_cache is None:
+            values = self._resolve_env()
+            flags: list[str] = []
+            for name in values:
+                flags += ["-e", name]
+            self._managed_env_cache = (flags, values)
+        return self._managed_env_cache
 
     def prepare(self) -> None:
         """
@@ -205,14 +282,23 @@ class SbxSandboxLauncher(SandboxLauncher):
 
     def provision(self, name: str) -> str:
         """
-        Create a `shell` sbx sandbox bind-mounting the current directory,
-        then run the one-time setup step that installs the host runtime
-        deps + the Claude Code CLI.
+        Create a `shell` sbx sandbox.
+
+        CLI-bootstrap mode bind-mounts the current directory and runs a
+        one-time setup step. Managed mode creates from a prebaked template,
+        bind-mounts an empty directory (the CLI requires a PATH), and opens
+        egress to the Omnigent server.
 
         :param name: Sandbox name (also its id — sbx is name-addressed).
         :returns: The sandbox name.
         :raises click.ClickException: When ``sbx create`` fails.
         """
+        if self._managed:
+            return self._provision_managed(name)
+        return self._provision_cli(name)
+
+    def _provision_cli(self, name: str) -> str:
+        """CLI-bootstrap provision: cwd bind-mount + runtime setup."""
         workspace = str(Path.cwd())
         args = ["create", "--name", name]
         for kit in self._resolve_kits():
@@ -262,10 +348,64 @@ class SbxSandboxLauncher(SandboxLauncher):
         click.echo(f"  → created {name}")
         return name
 
+    def _provision_managed(self, name: str) -> str:
+        """
+        Managed provision: create from the prebaked template, no setup step.
+
+        Bind-mounts an empty server-side directory (the CLI requires a
+        PATH), skips the runtime setup (the template already carries
+        omnigent), and opens egress to the Omnigent server so the in-box
+        host can register.
+        """
+        template = self._resolve_template()
+        if not template:
+            raise click.ClickException(
+                "sbx managed mode requires a template image — set "
+                "'sandbox.sbx.template' in the server config."
+            )
+        _MANAGED_EMPTY_WORKSPACE.mkdir(parents=True, exist_ok=True)
+        args = ["create", "--name", name]
+        for kit in self._resolve_kits():
+            args += ["--kit", kit]
+        args += ["-t", template, "shell", str(_MANAGED_EMPTY_WORKSPACE)]
+
+        click.echo(f"▸ Creating managed sbx sandbox '{name}'")
+        result = self._run_sbx(args)
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip()
+            if "default network policy" in detail.lower():
+                raise click.ClickException(
+                    "sbx has no default network policy configured. Run "
+                    "`sbx policy set-default balanced` (allows AI services + "
+                    "package registries; use `allow-all` if your --server host "
+                    "gets blocked), then retry."
+                )
+            raise click.ClickException(f"sbx sandbox creation failed: {detail}")
+
+        self._allow_managed_egress(name)
+        click.echo(f"  → created {name}")
+        return name
+
+    def _allow_managed_egress(self, name: str) -> None:
+        """Best-effort allow the in-box host to reach the server + Claude auth."""
+        server_host_port = _server_host_port(self._server_url)
+        domains = f"{server_host_port},{_CLAUDE_AUTH_DOMAINS}"
+        policy = self._run_sbx(["policy", "allow", "network", "--sandbox", name, domains])
+        if policy.returncode != 0:
+            click.echo(
+                "  → warning: could not allow managed egress "
+                f"({policy.stderr.strip() or policy.stdout.strip()}); "
+                "the host may not be able to register."
+            )
+
     def run(self, sandbox_id: str, command: str, *, check: bool = True) -> RemoteCommandResult:
         """
         Run a shell command in the sandbox via ``sbx exec`` and capture
         its output (stdout/stderr kept separate).
+
+        In managed mode, configured env is forwarded with ``sbx exec -e NAME``
+        and its VALUES ride the subprocess environment (never argv). CLI
+        -bootstrap mode keeps the legacy argv (no ``-e``).
 
         :param sandbox_id: Target sandbox name.
         :param command: Shell command (``bash -lc`` applies login PATH).
@@ -273,7 +413,11 @@ class SbxSandboxLauncher(SandboxLauncher):
         :returns: Exit code plus captured stdout/stderr.
         :raises click.ClickException: When *check* and the exit is non-zero.
         """
-        result = self._run_sbx(["exec", sandbox_id, "bash", "-lc", command])
+        env_flags, env_values = self._managed_env()
+        result = self._run_sbx(
+            ["exec", *env_flags, sandbox_id, "bash", "-lc", command],
+            extra_env=env_values or None,
+        )
         for stream in (result.stdout, result.stderr):
             for line in (stream or "").splitlines():
                 if line.strip():
@@ -287,6 +431,33 @@ class SbxSandboxLauncher(SandboxLauncher):
             returncode=result.returncode,
             stdout=result.stdout or "",
             stderr=result.stderr or "",
+        )
+
+    def run_background(
+        self, sandbox_id: str, command: str, *, log_path: str = "/tmp/omnigent-host.log"
+    ) -> RemoteCommandResult:
+        """
+        Background *command*, first unsetting Docker's ``proxy-managed`` env
+        placeholders so they can't shadow the host's real harness credentials.
+
+        Docker Sandboxes injects placeholder provider keys (e.g.
+        ``ANTHROPIC_API_KEY=proxy-managed``) into every exec session. For any
+        key NOT supplied via ``sandbox.sbx.env``, that placeholder would reach
+        ``omnigent host`` and break harnesses that prefer an env key over
+        their own login (Claude Code subscription auth). The strip runs in the
+        outer ``bash -lc`` shell, so the ``setsid``-detached host it spawns
+        never inherits the sentinels; ``-e``-forwarded real values survive
+        (their value isn't the sentinel).
+
+        CLI-bootstrap mode uses the base implementation unchanged.
+        """
+        if not self._managed:
+            return super().run_background(sandbox_id, command, log_path=log_path)
+        return self.run(
+            sandbox_id,
+            f"{_STRIP_PROXY_MANAGED_SNIPPET} "
+            f"setsid nohup sh -c {shlex.quote(command)} "
+            f"> {log_path} 2>&1 < /dev/null & echo launched",
         )
 
     def put(self, sandbox_id: str, local_path: Path, remote_path: str) -> None:
@@ -397,10 +568,24 @@ class SbxSandboxLauncher(SandboxLauncher):
                 f"Could not list sbx sandboxes: {result.stderr.strip() or result.stdout.strip()}"
             )
         try:
-            entries = json.loads(result.stdout or "[]")
+            parsed = json.loads(result.stdout or "{}")
         except json.JSONDecodeError:
-            entries = []
+            parsed = {}
+        # Current sbx CLI wraps the list in {"sandboxes": [...]}; older builds
+        # returned a bare list. Accept both so tests and legacy CLIs keep working.
+        entries = parsed if isinstance(parsed, list) else parsed.get("sandboxes", [])
         return any(entry.get("name") == sandbox_id for entry in entries)
+
+    def resume(self, sandbox_id: str) -> None:
+        """
+        Verify a managed sandbox still exists so the next ``exec`` wakes it.
+
+        sbx retains the sandbox filesystem across idle-stop and auto-starts
+        on the next ``exec``, so ``start_host`` will bring the compute back.
+        """
+        if not self._sandbox_exists(sandbox_id):
+            raise click.ClickException(f"sbx sandbox '{sandbox_id}' not found — cannot resume")
+        click.echo(f"  → sandbox '{sandbox_id}' exists; exec will auto-start it")
 
     def attach(self, sandbox_id: str) -> None:
         """
