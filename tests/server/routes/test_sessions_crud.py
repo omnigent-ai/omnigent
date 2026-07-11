@@ -12,6 +12,7 @@ import httpx
 import pytest_asyncio
 
 from omnigent.db.utils import generate_agent_id
+from omnigent.server.routes import sessions as sessions_module
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
@@ -109,6 +110,20 @@ async def test_delete_session_not_found(client: httpx.AsyncClient) -> None:
     """Deleting a nonexistent session returns 404."""
     resp = await client.delete("/v1/sessions/conv_nonexistent_12345")
     assert resp.status_code == 404
+
+
+async def test_delete_running_session_succeeds_after_best_effort_stop(
+    client: httpx.AsyncClient,
+    session_id: str,
+) -> None:
+    """Deleting a running session attempts a stop and proceeds."""
+    sessions_module._session_status_cache[session_id] = "running"
+    try:
+        resp = await client.delete(f"/v1/sessions/{session_id}")
+        assert resp.status_code == 200
+        assert resp.json()["deleted"] is True
+    finally:
+        sessions_module._session_status_cache.pop(session_id, None)
 
 
 # ── PATCH /v1/sessions/{id} ─────────────────────────────────────────

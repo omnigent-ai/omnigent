@@ -19,6 +19,7 @@ import tarfile
 import httpx
 import pytest
 
+from omnigent.server.routes import sessions as sessions_module
 from tests.server.helpers import create_test_session
 
 pytestmark = pytest.mark.asyncio
@@ -96,6 +97,66 @@ async def test_unarchive_restores_session_to_default_listing(
     assert listing.status_code == 200
     listed_ids = [s["id"] for s in listing.json()["data"]]
     assert session_id in listed_ids
+
+
+# ── Best-effort stop before archive ───────────────────────
+
+
+async def test_archive_running_session_succeeds_after_best_effort_stop(
+    client: httpx.AsyncClient,
+) -> None:
+    """Archiving a running session attempts a stop and proceeds."""
+    session = await create_test_session(client, name="archive-running")
+    session_id = session["id"]
+
+    sessions_module._session_status_cache[session_id] = "running"
+    try:
+        resp = await client.patch(
+            f"/v1/sessions/{session_id}",
+            json={"archived": True},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["archived"] is True
+    finally:
+        sessions_module._session_status_cache.pop(session_id, None)
+
+
+async def test_archive_idle_session(
+    client: httpx.AsyncClient,
+) -> None:
+    """An idle session can be archived normally (no stop needed)."""
+    session = await create_test_session(client, name="archive-idle")
+    session_id = session["id"]
+
+    resp = await client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"archived": True},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["archived"] is True
+
+
+async def test_unarchive_skips_stop(
+    client: httpx.AsyncClient,
+) -> None:
+    """Unarchiving does not attempt a stop, even if the session is running."""
+    session = await create_test_session(client, name="unarchive-running")
+    session_id = session["id"]
+
+    # Archive it first (while idle).
+    await client.patch(f"/v1/sessions/{session_id}", json={"archived": True})
+
+    # Simulate it becoming running, then unarchive.
+    sessions_module._session_status_cache[session_id] = "running"
+    try:
+        resp = await client.patch(
+            f"/v1/sessions/{session_id}",
+            json={"archived": False},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["archived"] is False
+    finally:
+        sessions_module._session_status_cache.pop(session_id, None)
 
 
 # ── Agent contents download ──────────────────────────────
