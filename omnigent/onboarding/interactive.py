@@ -401,8 +401,14 @@ def select(
     if not sys.stdin.isatty():
         return _select_fallback(title, options, default=default, selectable=mask)
 
-    import termios
-    import tty
+    # Platform-aware raw keyboard input: POSIX uses termios/tty,
+    # Windows uses msvcrt.
+    _IS_WINDOWS = sys.platform == "win32"
+    if _IS_WINDOWS:
+        import msvcrt  # type: ignore[import-not-found]
+    else:
+        import termios
+        import tty
 
     fd = sys.stdin.fileno()
     selected = _first_selectable(mask, default)
@@ -445,52 +451,78 @@ def select(
         sys.stdout.flush()
         prev_lines[0] = rendered.count("\n")
 
-    try:
-        old_attrs = termios.tcgetattr(fd)
-    except termios.error:
-        # Cannot enter raw mode — degrade to the numbered fallback.
-        return _select_fallback(title, options, default=default, selectable=mask)
-
-    try:
-        _redraw()
-        tty.setcbreak(fd)
-        while True:
-            ch = os.read(fd, 1)
-            if not ch:
-                break
-            if ch in (b"\x03", b"\x04"):
-                # Ctrl-C / Ctrl-D — abort the menu.
-                cancelled = True
-                break
-            if ch == b"\x1b":
-                # Escape alone, or the start of an arrow sequence.
-                import select as _select
-
-                if _select.select([fd], [], [], 0.05)[0]:
-                    nxt = os.read(fd, 1)
-                    if nxt == b"[":
-                        arrow = os.read(fd, 1)
-                        if arrow == b"A":  # Up
-                            selected = _step_selectable(mask, selected, -1)
-                            _redraw()
-                        elif arrow == b"B":  # Down
-                            selected = _step_selectable(mask, selected, +1)
-                            _redraw()
-                    # Ignore other escape sequences.
+    if _IS_WINDOWS:
+        # Windows: use msvcrt for raw keyboard input.
+        try:
+            _redraw()
+            while True:
+                ch = msvcrt.getch()
+                if ch in (b"\x03", b"\x04"):
+                    cancelled = True
+                    break
+                if ch == b"\xe0":
+                    # Extended key prefix on Windows.
+                    nxt = msvcrt.getch()
+                    if nxt == b"H":  # Up arrow
+                        selected = _step_selectable(mask, selected, -1)
+                        _redraw()
+                    elif nxt == b"P":  # Down arrow
+                        selected = _step_selectable(mask, selected, +1)
+                        _redraw()
                     continue
-                # Bare Escape — abort the menu.
-                cancelled = True
-                break
-            if ch in (b"\r", b"\n"):
-                break
-            if ch in (b"k", b"K"):  # vi-style up
-                selected = _step_selectable(mask, selected, -1)
-                _redraw()
-            elif ch in (b"j", b"J"):  # vi-style down
-                selected = _step_selectable(mask, selected, +1)
-                _redraw()
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+                if ch in (b"\r", b"\n"):
+                    break
+                if ch in (b"k", b"K"):
+                    selected = _step_selectable(mask, selected, -1)
+                    _redraw()
+                elif ch in (b"j", b"J"):
+                    selected = _step_selectable(mask, selected, +1)
+                    _redraw()
+        finally:
+            pass  # No terminal attrs to restore on Windows.
+    else:
+        # POSIX: use termios/tty for raw keyboard input.
+        try:
+            old_attrs = termios.tcgetattr(fd)
+        except termios.error:
+            return _select_fallback(title, options, default=default, selectable=mask)
+
+        try:
+            _redraw()
+            tty.setcbreak(fd)
+            while True:
+                ch = os.read(fd, 1)
+                if not ch:
+                    break
+                if ch in (b"\x03", b"\x04"):
+                    cancelled = True
+                    break
+                if ch == b"\x1b":
+                    import select as _select
+
+                    if _select.select([fd], [], [], 0.05)[0]:
+                        nxt = os.read(fd, 1)
+                        if nxt == b"[":
+                            arrow = os.read(fd, 1)
+                            if arrow == b"A":  # Up
+                                selected = _step_selectable(mask, selected, -1)
+                                _redraw()
+                            elif arrow == b"B":  # Down
+                                selected = _step_selectable(mask, selected, +1)
+                                _redraw()
+                        continue
+                    cancelled = True
+                    break
+                if ch in (b"\r", b"\n"):
+                    break
+                if ch in (b"k", b"K"):
+                    selected = _step_selectable(mask, selected, -1)
+                    _redraw()
+                elif ch in (b"j", b"J"):
+                    selected = _step_selectable(mask, selected, +1)
+                    _redraw()
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
 
     if clear_on_exit and prev_lines[0] > 0:
         # Erase the rendered frame so a re-rendering loop doesn't leave a

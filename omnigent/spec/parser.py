@@ -90,6 +90,11 @@ _YAML_1_2_BOOL_RE = re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$")
 # ``executor.config`` keys kept as their nested YAML structure instead of
 # string-coerced — their consumers read the nested mapping/list shape.
 _STRUCTURED_EXECUTOR_CONFIG_KEYS: frozenset[str] = frozenset()
+# Give the subclass its own copied dict before mutating, so that
+# yaml.SafeLoader's implicit resolvers are not damaged globally.
+_ConfigYamlLoader.yaml_implicit_resolvers = {
+    key: value[:] for key, value in yaml.SafeLoader.yaml_implicit_resolvers.items()
+}
 for _ch in list(_ConfigYamlLoader.yaml_implicit_resolvers.keys()):
     _ConfigYamlLoader.yaml_implicit_resolvers[_ch] = [
         (tag, regexp)
