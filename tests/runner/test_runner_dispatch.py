@@ -6577,6 +6577,492 @@ async def test_sys_session_share_public_allows_public_grant() -> None:
 
 
 @pytest.mark.asyncio
+async def test_sys_session_resolve_elicitation_posts_verdict() -> None:
+    """
+    ``sys_session_resolve_elicitation`` reads the target session's
+    pending elicitations, finds the matching id, and POSTs the verdict
+    to the resolve endpoint under the owning session.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    requests: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else None
+        requests.append((request.method, request.url.path, body))
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_worker":
+            return httpx.Response(
+                200,
+                json={
+                    "pending_elicitations": [
+                        {
+                            "elicitation_id": "elicit_abc",
+                            "params": {"message": "Approve?"},
+                        }
+                    ]
+                },
+            )
+        if (
+            request.method == "POST"
+            and request.url.path == "/v1/sessions/conv_worker/elicitations/elicit_abc/resolve"
+        ):
+            return httpx.Response(202, json={"queued": False})
+        return httpx.Response(500, json={"detail": "unexpected"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_resolve_elicitation",
+            arguments=json.dumps(
+                {
+                    "session_id": "conv_worker",
+                    "elicitation_id": "elicit_abc",
+                    "action": "accept",
+                }
+            ),
+            server_client=server_client,
+            conversation_id="conv_director",
+            agent_spec=AgentSpec(spec_version=1, session_control=True),
+        )
+
+    assert requests == [
+        ("GET", "/v1/sessions/conv_worker", None),
+        (
+            "POST",
+            "/v1/sessions/conv_worker/elicitations/elicit_abc/resolve",
+            {"action": "accept"},
+        ),
+    ]
+    assert json.loads(output) == {
+        "resolved": True,
+        "session_id": "conv_worker",
+        "elicitation_id": "elicit_abc",
+        "action": "accept",
+    }
+
+
+@pytest.mark.asyncio
+async def test_sys_session_resolve_elicitation_rejects_own_session() -> None:
+    """
+    Resolving an elicitation on the caller's own session is rejected
+    before any HTTP call — the not-own-session guard is the first
+    enforcement point.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    called = False
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal called
+        called = True
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_resolve_elicitation",
+            arguments=json.dumps(
+                {
+                    "session_id": "conv_director",
+                    "elicitation_id": "elicit_abc",
+                    "action": "accept",
+                }
+            ),
+            server_client=server_client,
+            conversation_id="conv_director",
+            agent_spec=AgentSpec(spec_version=1, session_control=True),
+        )
+
+    assert called is False
+    result = json.loads(output)
+    assert result["error"] == "cannot_target_own_session"
+    assert result["session_id"] == "conv_director"
+
+
+@pytest.mark.asyncio
+async def test_sys_session_resolve_elicitation_rejects_mirrored_own_elicitation() -> None:
+    """
+    A pending elicitation whose owner is actually the caller's own
+    session (mirrored into a child/ancestor via
+    ``params.target_session_id``) must still be rejected. The tool may
+    read the snapshot to discover the owner, but it must not POST the
+    resolve.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    posts: list[tuple[str, dict[str, Any] | None]] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else None
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_worker":
+            return httpx.Response(
+                200,
+                json={
+                    "pending_elicitations": [
+                        {
+                            "elicitation_id": "elicit_mirrored",
+                            "params": {
+                                "message": "Approve?",
+                                "target_session_id": "conv_director",
+                            },
+                        }
+                    ]
+                },
+            )
+        if request.method == "POST":
+            posts.append((request.url.path, body))
+        return httpx.Response(202, json={"queued": False})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_resolve_elicitation",
+            arguments=json.dumps(
+                {
+                    "session_id": "conv_worker",
+                    "elicitation_id": "elicit_mirrored",
+                    "action": "accept",
+                }
+            ),
+            server_client=server_client,
+            conversation_id="conv_director",
+            agent_spec=AgentSpec(spec_version=1, session_control=True),
+        )
+
+    assert posts == []
+    result = json.loads(output)
+    assert result["error"] == "cannot_target_own_session"
+    assert result["session_id"] == "conv_director"
+
+
+@pytest.mark.asyncio
+async def test_sys_session_resolve_elicitation_unknown_id_errors() -> None:
+    """
+    When the target session exists but the requested elicitation id is
+    not in its pending list, the tool returns a typed
+    ``elicitation_not_found`` error instead of forwarding to the server.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_worker":
+            return httpx.Response(
+                200,
+                json={
+                    "pending_elicitations": [
+                        {"elicitation_id": "elicit_other", "params": {"message": "x"}}
+                    ]
+                },
+            )
+        return httpx.Response(500, json={"detail": "unexpected"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_resolve_elicitation",
+            arguments=json.dumps(
+                {
+                    "session_id": "conv_worker",
+                    "elicitation_id": "elicit_missing",
+                    "action": "decline",
+                }
+            ),
+            server_client=server_client,
+            conversation_id="conv_director",
+            agent_spec=AgentSpec(spec_version=1, session_control=True),
+        )
+
+    result = json.loads(output)
+    assert result["error"] == "elicitation_not_found"
+    assert result["session_id"] == "conv_worker"
+    assert result["elicitation_id"] == "elicit_missing"
+
+
+@pytest.mark.asyncio
+async def test_sys_session_interrupt_posts_event() -> None:
+    """
+    ``sys_session_interrupt`` POSTs ``{"type": "interrupt"}`` to the
+    target session's events endpoint.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    requests: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else None
+        requests.append((request.method, request.url.path, body))
+        return httpx.Response(200, json={"queued": False})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_interrupt",
+            arguments=json.dumps({"session_id": "conv_worker"}),
+            server_client=server_client,
+            conversation_id="conv_director",
+            agent_spec=AgentSpec(spec_version=1, session_control=True),
+        )
+
+    assert requests == [
+        ("POST", "/v1/sessions/conv_worker/events", {"type": "interrupt", "data": {}})
+    ]
+    assert json.loads(output) == {"interrupted": True, "session_id": "conv_worker"}
+
+
+@pytest.mark.asyncio
+async def test_sys_session_stop_posts_event() -> None:
+    """
+    ``sys_session_stop`` POSTs ``{"type": "stop_session"}`` to the
+    target session's events endpoint.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    requests: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else None
+        requests.append((request.method, request.url.path, body))
+        return httpx.Response(200, json={"queued": False})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_stop",
+            arguments=json.dumps({"session_id": "conv_worker"}),
+            server_client=server_client,
+            conversation_id="conv_director",
+            agent_spec=AgentSpec(spec_version=1, session_control=True),
+        )
+
+    assert requests == [
+        ("POST", "/v1/sessions/conv_worker/events", {"type": "stop_session", "data": {}})
+    ]
+    assert json.loads(output) == {"stopped": True, "session_id": "conv_worker"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tool_name,status_code,expected_error",
+    [
+        pytest.param(
+            "sys_session_resolve_elicitation", 404, "session_not_found", id="resolve-404"
+        ),
+        pytest.param("sys_session_resolve_elicitation", 403, "access_denied", id="resolve-403"),
+        pytest.param("sys_session_resolve_elicitation", 401, "access_denied", id="resolve-401"),
+        pytest.param("sys_session_interrupt", 404, "session_not_found", id="interrupt-404"),
+        pytest.param("sys_session_interrupt", 403, "access_denied", id="interrupt-403"),
+        pytest.param("sys_session_interrupt", 401, "access_denied", id="interrupt-401"),
+        pytest.param("sys_session_stop", 404, "session_not_found", id="stop-404"),
+        pytest.param("sys_session_stop", 403, "access_denied", id="stop-403"),
+        pytest.param("sys_session_stop", 401, "access_denied", id="stop-401"),
+    ],
+)
+async def test_sys_session_control_maps_error_statuses(
+    tool_name: str,
+    status_code: int,
+    expected_error: str,
+) -> None:
+    """
+    The control tools map 404/401/403 from the server to the same typed
+    errors as the other session REST tools so the LLM can distinguish
+    "no such session" from "you cannot manage it".
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status_code, json={"detail": "x"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        if tool_name == "sys_session_resolve_elicitation":
+            arguments = json.dumps(
+                {
+                    "session_id": "conv_worker",
+                    "elicitation_id": "elicit_abc",
+                    "action": "accept",
+                }
+            )
+        else:
+            arguments = json.dumps({"session_id": "conv_worker"})
+        output = await execute_tool(
+            tool_name=tool_name,
+            arguments=arguments,
+            server_client=server_client,
+            conversation_id="conv_director",
+            agent_spec=AgentSpec(spec_version=1, session_control=True),
+        )
+
+    result = json.loads(output)
+    assert result["error"] == expected_error
+    assert result["session_id"] == "conv_worker"
+
+
+@pytest.mark.asyncio
+async def test_sys_session_stop_surfaces_runner_unreachable() -> None:
+    """
+    A 503 from the events endpoint (runner unreachable while stopping)
+    surfaces the server's own error message rather than a bare status
+    code, so the director knows the stop did not land.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    server_message = "Could not reach the runner to stop session 'conv_worker'"
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            503,
+            json={"error": {"code": "RUNNER_UNAVAILABLE", "message": server_message}},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_stop",
+            arguments=json.dumps({"session_id": "conv_worker"}),
+            server_client=server_client,
+            conversation_id="conv_director",
+            agent_spec=AgentSpec(spec_version=1, session_control=True),
+        )
+
+    result = json.loads(output)
+    assert result["error"] == server_message
+    assert result["status_code"] == 503
+    assert result["session_id"] == "conv_worker"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tool_name,arguments",
+    [
+        pytest.param(
+            "sys_session_resolve_elicitation",
+            json.dumps(
+                {
+                    "session_id": "conv_worker",
+                    "elicitation_id": "elicit_abc",
+                    "action": "accept",
+                }
+            ),
+            id="resolve",
+        ),
+        pytest.param(
+            "sys_session_interrupt",
+            json.dumps({"session_id": "conv_worker"}),
+            id="interrupt",
+        ),
+        pytest.param(
+            "sys_session_stop",
+            json.dumps({"session_id": "conv_worker"}),
+            id="stop",
+        ),
+    ],
+)
+async def test_session_control_disabled_without_grant(
+    tool_name: str,
+    arguments: str,
+) -> None:
+    """
+    Without ``session_control: true`` every control tool is refused
+    client-side and never reaches the server. The spec grant is the
+    real gate, not just tool advertisement.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    called = False
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal called
+        called = True
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name=tool_name,
+            arguments=arguments,
+            server_client=server_client,
+            conversation_id="conv_director",
+            agent_spec=AgentSpec(spec_version=1),
+        )
+
+    assert called is False
+    assert "not enabled" in json.loads(output)["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tool_name,arguments",
+    [
+        pytest.param(
+            "sys_session_resolve_elicitation",
+            json.dumps({"elicitation_id": "elicit_abc", "action": "accept"}),
+            id="resolve",
+        ),
+        pytest.param(
+            "sys_session_interrupt",
+            json.dumps({}),
+            id="interrupt",
+        ),
+        pytest.param(
+            "sys_session_stop",
+            json.dumps({}),
+            id="stop",
+        ),
+    ],
+)
+async def test_session_control_requires_explicit_session_id(
+    tool_name: str,
+    arguments: str,
+) -> None:
+    """
+    The control tools require an explicit ``session_id`` and do not
+    default to the caller's own session. Omitting it must error before
+    any HTTP call.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    called = False
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal called
+        called = True
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name=tool_name,
+            arguments=arguments,
+            server_client=server_client,
+            conversation_id="conv_director",
+            agent_spec=AgentSpec(spec_version=1, session_control=True),
+        )
+
+    assert called is False
+    assert "explicit 'session_id'" in json.loads(output)["error"]
+
+
+@pytest.mark.asyncio
 async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() -> None:
     """
     ``sys_session_get_info`` projects ``GET /v1/sessions/{id}`` metadata

@@ -1,0 +1,30 @@
+# General-purpose worker for the Director orchestrator.
+#
+# A plain claude-sdk agent with filesystem access. The director spawns it
+# via `sys_session_send` with `agent: worker` and a descriptive `title`.
+
+spec_version: 1
+name: worker
+description: >-
+  A general-purpose Claude worker that the Director orchestrator can spawn
+  for research, drafting, or other delegated tasks.
+
+executor:
+  type: omnigent
+  config:
+    harness: claude-sdk
+
+prompt: |
+  You are a helpful general-purpose worker. Do whatever task the Director
+  gives you, using `sys_os_read` / `sys_os_shell` / `web_search` / skills as
+  needed. Report results concisely and stop when done; the Director will
+  read your output from the inbox.
+
+async: true
+cancellable: true
+
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: none

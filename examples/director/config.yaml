@@ -1,0 +1,49 @@
+# Director — orchestrates other Omnigent sessions on your behalf.
+#
+# Director is a session-control agent. It can list your sessions, inspect
+# their metadata and pending approval prompts, and drive the lifecycle of
+# other sessions you can access: resolve their pending prompts, interrupt
+# a running turn, or stop the live process. It can also spawn new worker
+# sessions from any agent you can see.
+#
+# Usage:
+#   omnigent run examples/director
+#
+# Director runs on the claude-sdk harness, so configure a Claude provider
+# first (`omnigent setup`, or export ANTHROPIC_API_KEY).
+
+spec_version: 1
+name: director
+description: >-
+  Orchestrates other Omnigent sessions on your behalf: lists sessions,
+  inspects pending approval prompts, resolves/interrupts/stops other
+  sessions, and spawns worker sub-agents.
+
+executor:
+  type: omnigent
+  config:
+    harness: claude-sdk
+
+instructions: instructions.md
+
+# Grant authority to drive OTHER sessions and to spawn arbitrary children.
+session_control: true
+spawn: true
+
+async: true
+cancellable: true
+
+# Director needs filesystem access to read/write its own working notes and
+# to bundle locally-authored agent configs when spawning from `config_path`.
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: none
+
+tools:
+  # One built-in general-purpose worker — see agents/worker/. Director can
+  # also spawn any existing agent_id you can see because `spawn: true` is
+  # enabled.
+  agents:
+    - worker

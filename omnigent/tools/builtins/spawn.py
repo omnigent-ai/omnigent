@@ -783,6 +783,204 @@ class SysSessionShareTool(Tool):
         }
 
 
+class SysSessionResolveElicitationTool(Tool):
+    """
+    Resolve a pending approval or input request in another session.
+
+    Enabled by the spec's top-level ``session_control:`` grant. The
+    target session must be explicit; the tool refuses the caller's own
+    session to prevent self-approval. Discover pending elicitations via
+    ``sys_session_get_info`` on the target session.
+
+    ``action`` is ``accept``, ``decline``, or ``cancel``. For ``accept``,
+    an optional ``content`` object may carry the form values the target
+    elicitation requested. The runner posts the verdict to the server's
+    ``POST /v1/sessions/{id}/elicitations/{eid}/resolve`` endpoint, so
+    the resolution runs with the caller's identity and is subject to the
+    server's permission checks on the target.
+    """
+
+    @classmethod
+    def name(cls) -> str:
+        """:returns: ``"sys_session_resolve_elicitation"``."""
+        return "sys_session_resolve_elicitation"
+
+    @classmethod
+    def description(cls) -> str:
+        """:returns: Human-readable description of the tool."""
+        return (
+            "Resolve a pending approval or input request in another "
+            "session. Discover pending elicitations via "
+            "sys_session_get_info. Requires session_control: true. "
+            "The target must not be the caller's own session."
+        )
+
+    def get_schema(self) -> dict[str, Any]:
+        """
+        Return the OpenAI-format tool schema.
+
+        :returns: Dict with ``"type": "function"`` and a
+            ``"function"`` sub-dict; all parameters are required
+            except ``content``.
+        """
+        return {
+            "type": "function",
+            "function": {
+                "name": SysSessionResolveElicitationTool.name(),
+                "description": SysSessionResolveElicitationTool.description(),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "session_id": {
+                            "type": "string",
+                            "description": (
+                                "The session (conversation_id) that owns "
+                                "the pending elicitation, e.g. 'conv_abc123'. "
+                                "Must not be the caller's own session."
+                            ),
+                        },
+                        "elicitation_id": {
+                            "type": "string",
+                            "description": (
+                                "The elicitation id returned by "
+                                "sys_session_get_info for the target session."
+                            ),
+                        },
+                        "action": {
+                            "type": "string",
+                            "enum": ["accept", "decline", "cancel"],
+                            "description": (
+                                "How to resolve the request: accept, decline, or cancel."
+                            ),
+                        },
+                        "content": {
+                            "type": "object",
+                            "description": (
+                                "Optional response payload for accept actions, "
+                                "e.g. form values requested by the elicitation."
+                            ),
+                        },
+                    },
+                    "required": ["session_id", "elicitation_id", "action"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+
+
+class SysSessionInterruptTool(Tool):
+    """
+    Interrupt a running turn in another session.
+
+    Enabled by the spec's top-level ``session_control:`` grant. The
+    target session must be explicit; the tool refuses the caller's own
+    session. The runner posts an ``interrupt`` event to the target
+    session, which cancels its current turn if one is in progress.
+    """
+
+    @classmethod
+    def name(cls) -> str:
+        """:returns: ``"sys_session_interrupt"``."""
+        return "sys_session_interrupt"
+
+    @classmethod
+    def description(cls) -> str:
+        """:returns: Human-readable description of the tool."""
+        return (
+            "Interrupt the running turn of another session. Requires "
+            "session_control: true. The target must not be the caller's "
+            "own session."
+        )
+
+    def get_schema(self) -> dict[str, Any]:
+        """
+        Return the OpenAI-format tool schema.
+
+        :returns: Dict with ``"type": "function"`` and a
+            ``"function"`` sub-dict; ``session_id`` is required.
+        """
+        return {
+            "type": "function",
+            "function": {
+                "name": SysSessionInterruptTool.name(),
+                "description": SysSessionInterruptTool.description(),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "session_id": {
+                            "type": "string",
+                            "description": (
+                                "The session (conversation_id) to interrupt, "
+                                "e.g. 'conv_abc123'. Must not be the caller's "
+                                "own session."
+                            ),
+                        },
+                    },
+                    "required": ["session_id"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+
+
+class SysSessionStopTool(Tool):
+    """
+    Stop another session's live process without deleting it.
+
+    Enabled by the spec's top-level ``session_control:`` grant. The
+    target session must be explicit; the tool refuses the caller's own
+    session. The runner posts a ``stop_session`` event to the target.
+    Stopping is non-sticky — a later message to the target relaunches
+    it. The server requires owner-level access on the target.
+    """
+
+    @classmethod
+    def name(cls) -> str:
+        """:returns: ``"sys_session_stop"``."""
+        return "sys_session_stop"
+
+    @classmethod
+    def description(cls) -> str:
+        """:returns: Human-readable description of the tool."""
+        return (
+            "Stop another session's live process without deleting it. "
+            "Requires session_control: true and owner-level access on the "
+            "target. The target must not be the caller's own session. "
+            "Stopping is non-sticky; a later message relaunches the session."
+        )
+
+    def get_schema(self) -> dict[str, Any]:
+        """
+        Return the OpenAI-format tool schema.
+
+        :returns: Dict with ``"type": "function"`` and a
+            ``"function"`` sub-dict; ``session_id`` is required.
+        """
+        return {
+            "type": "function",
+            "function": {
+                "name": SysSessionStopTool.name(),
+                "description": SysSessionStopTool.description(),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "session_id": {
+                            "type": "string",
+                            "description": (
+                                "The session (conversation_id) to stop, "
+                                "e.g. 'conv_abc123'. Must not be the caller's "
+                                "own session and the caller must have owner "
+                                "access."
+                            ),
+                        },
+                    },
+                    "required": ["session_id"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+
+
 class SysSessionCreateTool(Tool):
     """
     Create a child session from an existing agent or a local bundle.
