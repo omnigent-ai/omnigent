@@ -23,6 +23,7 @@ import {
   SESSION_HISTORY_PAGE_SIZE,
   stopSession,
   updateSession,
+  validateAgentBundle,
 } from "./sessionsApi";
 
 function mockJsonResponse(body: unknown, init?: { ok?: boolean; status?: number }): Response {
@@ -963,6 +964,38 @@ describe("postEvent", () => {
     });
     expect(out.pendingId).toBe("pending_abc123");
     expect(out.itemId).toBeUndefined();
+  });
+});
+
+describe("validateAgentBundle", () => {
+  it("POSTs the bundle as multipart and returns the parsed agent name", async () => {
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({ ok: true, agent_name: "my-agent" }));
+    const bundle = new File([new Uint8Array([1, 2, 3])], "agent.tar.gz", {
+      type: "application/gzip",
+    });
+
+    const out = await validateAgentBundle(bundle);
+
+    expect(fetchMock).toHaveBeenCalledOnce();
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/v1/sessions/validate-bundle");
+    expect(init.method).toBe("POST");
+    // Multipart: no JSON Content-Type header (the browser sets the boundary).
+    expect(init.body).toBeInstanceOf(FormData);
+    expect((init.body as FormData).get("bundle")).toBe(bundle);
+    expect(out).toEqual({ agentName: "my-agent" });
+  });
+
+  it("throws the server's validation message on a 400", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse(
+        { error: { code: "invalid_input", message: "agent spec must include a name" } },
+        { ok: false, status: 400 },
+      ),
+    );
+    const bundle = new File([new Uint8Array([1])], "agent.tar.gz");
+
+    await expect(validateAgentBundle(bundle)).rejects.toThrow(/agent spec must include a name/);
   });
 });
 

@@ -113,6 +113,64 @@ export async function buildAgentBundle(input: AgentBundleInput): Promise<File> {
   });
 }
 
+/**
+ * Build a `.tar.gz` agent bundle from files picked off disk.
+ *
+ * Packs the selected files verbatim — no YAML parsing, no `${VAR}`
+ * expansion — mirroring how the CLI packs a directory (see
+ * `_bundle_local_agent_source`). The server's `validate_agent_bundle`
+ * requires a `config.yaml` (or a single standalone omnigent YAML) at the
+ * archive root, so entry paths are normalized accordingly:
+ *
+ * - A single file is placed at the archive root under its own name.
+ *   Pass `singleFileAsConfig` to rename a lone `*.yaml`/`*.yml` to
+ *   `config.yaml` so a bare spec file is always found at the root.
+ * - Folder picks (via `webkitdirectory`) carry a `webkitRelativePath`
+ *   like `my-agent/config.yaml`; the leading top-level directory segment
+ *   is stripped so the bundle contents sit at the root.
+ */
+export async function buildBundleFromFiles(
+  files: File[],
+  opts: { singleFileAsConfig?: boolean } = {},
+): Promise<File> {
+  if (files.length === 0) {
+    throw new Error("No files selected to import.");
+  }
+
+  const entries: TarEntry[] = await Promise.all(
+    files.map(async (file) => {
+      let name = bundleEntryName(file);
+      if (files.length === 1 && opts.singleFileAsConfig && /\.ya?ml$/i.test(name)) {
+        name = "config.yaml";
+      }
+      const content = new Uint8Array(await file.arrayBuffer());
+      return { name, content };
+    }),
+  );
+
+  const tarBytes = createTar(entries);
+  const gzipped = await gzip(tarBytes);
+  return new File([gzipped.buffer as ArrayBuffer], "agent.tar.gz", {
+    type: "application/gzip",
+  });
+}
+
+/**
+ * Derive an archive-relative path for a picked file. Folder picks expose
+ * `webkitRelativePath` (e.g. `my-agent/config.yaml`); strip the leading
+ * top-level segment so bundle contents land at the archive root. Falls
+ * back to the plain file name for single-file picks.
+ */
+function bundleEntryName(file: File): string {
+  const rel = (file as File & { webkitRelativePath?: string }).webkitRelativePath;
+  if (rel) {
+    const slash = rel.indexOf("/");
+    const stripped = slash >= 0 ? rel.slice(slash + 1) : rel;
+    if (stripped) return stripped;
+  }
+  return file.name;
+}
+
 // ── Helpers ──────────────────────────────────────────────────────
 
 /** Quote a YAML string value if it contains special characters. */
@@ -140,9 +198,13 @@ function createTar(entries: TarEntry[]): Uint8Array {
     const header = new Uint8Array(512);
     const encoder = new TextEncoder();
 
-    // File name (0..99)
-    const nameBytes = encoder.encode(entry.name);
-    header.set(nameBytes.slice(0, 100), 0);
+    // File name (0..99), with the ustar 155-byte prefix field (345..499)
+    // for paths longer than 100 bytes. Folder picks can produce entries
+    // like `skills/<descriptive-name>/SKILL.md` that exceed the legacy
+    // name field, so split at a `/` boundary rather than truncating.
+    const { name, prefix } = splitTarName(entry.name);
+    header.set(encoder.encode(name), 0);
+    if (prefix) header.set(encoder.encode(prefix), 345);
 
     // File mode (100..107) — 0644
     writeOctal(header, 100, 8, 0o644);
@@ -189,6 +251,34 @@ function createTar(entries: TarEntry[]): Uint8Array {
     offset += block.length;
   }
   return result;
+}
+
+/**
+ * Split a tar entry path into the ustar `name` (≤100 bytes) and `prefix`
+ * (≤155 bytes) header fields. The extractor rejoins them as
+ * `prefix + "/" + name`. Short paths return an empty prefix.
+ *
+ * Throws when the path can't fit — a name segment over 100 bytes, or a
+ * total over 255 — so a bundle is never silently corrupted by truncation.
+ */
+function splitTarName(path: string): { name: string; prefix: string } {
+  const encoder = new TextEncoder();
+  if (encoder.encode(path).length <= 100) {
+    return { name: path, prefix: "" };
+  }
+  // Find the split point closest to the end that keeps name ≤100 bytes and
+  // prefix ≤155 bytes. Only `/` boundaries are valid ustar split points.
+  for (let i = path.indexOf("/"); i >= 0; i = path.indexOf("/", i + 1)) {
+    const prefix = path.slice(0, i);
+    const name = path.slice(i + 1);
+    if (encoder.encode(name).length <= 100 && encoder.encode(prefix).length <= 155) {
+      return { name, prefix };
+    }
+  }
+  throw new Error(
+    `Bundle entry path is too long to archive: ${path}. ` +
+      `Path segments must fit the tar name (100 bytes) and prefix (155 bytes) fields.`,
+  );
 }
 
 /** Write a number as null-terminated octal string into a tar header field. */

@@ -41,7 +41,35 @@ class PassthroughStream {
 (globalThis as any).CompressionStream = PassthroughStream;
 
 // Now import the function (it will use our mock CompressionStream).
-const { buildAgentBundle } = await import("./agentBundle");
+const { buildAgentBundle, buildBundleFromFiles } = await import("./agentBundle");
+
+/** Parse all tar entries (name → content) from the raw tar bytes in a File. */
+async function extractEntries(file: File): Promise<Record<string, string>> {
+  const tar = new Uint8Array(await file.arrayBuffer());
+  const dec = new TextDecoder();
+  const entries: Record<string, string> = {};
+  let off = 0;
+  while (off + 512 <= tar.length) {
+    const name = dec.decode(tar.slice(off, off + 100)).split("\0")[0]!;
+    if (!name) break; // zero block → end of archive
+    // Rejoin the ustar prefix field (345..499) for long paths.
+    const prefix = dec.decode(tar.slice(off + 345, off + 500)).split("\0")[0]!;
+    const fullName = prefix ? `${prefix}/${name}` : name;
+    const size = parseInt(dec.decode(tar.slice(off + 124, off + 135)).split("\0")[0]!, 8);
+    entries[fullName] = dec.decode(tar.slice(off + 512, off + 512 + size));
+    off += 512 + Math.ceil(size / 512) * 512;
+  }
+  return entries;
+}
+
+/** Build a File with an optional `webkitRelativePath` for folder-pick tests. */
+function fakeFile(name: string, content: string, relPath?: string): File {
+  const file = new File([content], name, { type: "text/yaml" });
+  if (relPath) {
+    Object.defineProperty(file, "webkitRelativePath", { value: relPath });
+  }
+  return file;
+}
 
 /** Extract the config.yaml from the raw tar bytes inside the File. */
 async function extractConfigYaml(file: File): Promise<string> {
@@ -49,7 +77,7 @@ async function extractConfigYaml(file: File): Promise<string> {
   const tar = new Uint8Array(buf);
   // First tar entry: 512-byte header, then content.
   // File size is at offset 124, 12 bytes, octal null-terminated.
-  const sizeStr = new TextDecoder().decode(tar.slice(124, 135)).replace(/\0/g, "");
+  const sizeStr = new TextDecoder().decode(tar.slice(124, 135)).split("\0")[0]!;
   const size = parseInt(sizeStr, 8);
   return new TextDecoder().decode(tar.slice(512, 512 + size));
 }
@@ -58,18 +86,16 @@ async function extractConfigYaml(file: File): Promise<string> {
 async function extractAgentsMd(file: File): Promise<string | null> {
   const buf = await file.arrayBuffer();
   const tar = new Uint8Array(buf);
-  const size0Str = new TextDecoder().decode(tar.slice(124, 135)).replace(/\0/g, "");
+  const size0Str = new TextDecoder().decode(tar.slice(124, 135)).split("\0")[0]!;
   const size0 = parseInt(size0Str, 8);
   const blocks0 = Math.ceil(size0 / 512);
   const entry1Start = 512 + blocks0 * 512;
   if (entry1Start + 512 > tar.length) return null;
-  const name1 = new TextDecoder()
-    .decode(tar.slice(entry1Start, entry1Start + 100))
-    .replace(/\0/g, "");
+  const name1 = new TextDecoder().decode(tar.slice(entry1Start, entry1Start + 100)).split("\0")[0]!;
   if (!name1.startsWith("AGENTS.md")) return null;
   const size1Str = new TextDecoder()
     .decode(tar.slice(entry1Start + 124, entry1Start + 135))
-    .replace(/\0/g, "");
+    .split("\0")[0]!;
   const size1 = parseInt(size1Str, 8);
   return new TextDecoder().decode(tar.slice(entry1Start + 512, entry1Start + 512 + size1));
 }
@@ -196,5 +222,85 @@ describe("buildAgentBundle", () => {
     const yaml = await extractConfigYaml(await buildAgentBundle(input));
     expect(yaml).toContain("harness: openai-agents");
     expect(yaml).toContain("model: gpt-4o");
+  });
+});
+
+describe("buildBundleFromFiles", () => {
+  it("rejects an empty selection", async () => {
+    await expect(buildBundleFromFiles([])).rejects.toThrow(/no files/i);
+  });
+
+  it("renames a lone YAML to config.yaml when singleFileAsConfig is set", async () => {
+    const file = await buildBundleFromFiles([fakeFile("my-agent.yaml", "spec_version: 1")], {
+      singleFileAsConfig: true,
+    });
+    const entries = await extractEntries(file);
+    expect(Object.keys(entries)).toEqual(["config.yaml"]);
+    expect(entries["config.yaml"]).toBe("spec_version: 1");
+  });
+
+  it("keeps the original file name when singleFileAsConfig is not set", async () => {
+    const file = await buildBundleFromFiles([fakeFile("agent.yml", "spec_version: 1")]);
+    const entries = await extractEntries(file);
+    expect(Object.keys(entries)).toEqual(["agent.yml"]);
+  });
+
+  it("strips the top folder from webkitRelativePath so contents sit at the root", async () => {
+    const file = await buildBundleFromFiles(
+      [
+        fakeFile("config.yaml", "spec_version: 1", "my-agent/config.yaml"),
+        fakeFile("AGENTS.md", "# Instructions", "my-agent/AGENTS.md"),
+        fakeFile("SKILL.md", "skill body", "my-agent/skills/debate/SKILL.md"),
+      ],
+      { singleFileAsConfig: true },
+    );
+    const entries = await extractEntries(file);
+    expect(Object.keys(entries).sort()).toEqual([
+      "AGENTS.md",
+      "config.yaml",
+      "skills/debate/SKILL.md",
+    ]);
+    // singleFileAsConfig must not rewrite names for a multi-file folder pick.
+    expect(entries["config.yaml"]).toBe("spec_version: 1");
+    expect(entries["skills/debate/SKILL.md"]).toBe("skill body");
+  });
+
+  it("packs a folder's config.yaml verbatim (no YAML rewriting)", async () => {
+    const raw = "spec_version: 1\nname: imported\nexecutor:\n  type: omnigent\n";
+    const file = await buildBundleFromFiles(
+      [fakeFile("config.yaml", raw, "imported/config.yaml")],
+      { singleFileAsConfig: true },
+    );
+    const entries = await extractEntries(file);
+    expect(entries["config.yaml"]).toBe(raw);
+  });
+
+  it("packs an entry path over 100 bytes without truncation (ustar prefix)", async () => {
+    // A realistic deep skill path whose full length exceeds the 100-byte
+    // legacy name field, so the ustar prefix field must carry the head.
+    const skillDir = "a-really-quite-verbose-skill-directory-name-that-goes-on";
+    const longPath = `skills/${skillDir}/${skillDir}/SKILL.md`;
+    expect(new TextEncoder().encode(longPath).length).toBeGreaterThan(100);
+    const file = await buildBundleFromFiles(
+      [
+        fakeFile("config.yaml", "spec_version: 1", "agent/config.yaml"),
+        fakeFile("SKILL.md", "skill body", `agent/${longPath}`),
+      ],
+      { singleFileAsConfig: true },
+    );
+    const entries = await extractEntries(file);
+    expect(Object.keys(entries).sort()).toEqual(["config.yaml", longPath]);
+    expect(entries[longPath]).toBe("skill body");
+  });
+
+  it("throws rather than truncate when the file name exceeds 100 bytes", async () => {
+    // The final segment can't move into the prefix field, so a >100-byte
+    // file name has no valid split point and must fail loudly.
+    const hugeName = `${"x".repeat(120)}.md`;
+    await expect(
+      buildBundleFromFiles([fakeFile(hugeName, "body", `agent/skills/debate/${hugeName}`)], {
+        singleFileAsConfig: true,
+      }),
+    ).rejects.toThrow(/too long to archive/i);
   });
 });

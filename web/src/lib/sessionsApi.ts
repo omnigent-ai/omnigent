@@ -478,6 +478,32 @@ export async function createBundledSession(
 }
 
 /**
+ * Validate an agent bundle without creating a session:
+ * multipart `POST /v1/sessions/validate-bundle`.
+ *
+ * The import-dialog preflight. Runs the same server-side validation the
+ * bundled-create path applies (`validate_agent_bundle`) — the same check
+ * `omni run` performs — so a malformed `config.yaml` surfaces at import
+ * time instead of failing mid-create. Nothing is stored.
+ *
+ * @param bundle - The agent bundle as a `File` (`.tar.gz`).
+ * @returns The validated agent name from the bundle's spec.
+ * @throws ApiError carrying the server's validation message (HTTP 400)
+ *   when the bundle is malformed, so the caller can surface it inline.
+ */
+export async function validateAgentBundle(bundle: File): Promise<{ agentName: string | null }> {
+  const form = new FormData();
+  form.append("bundle", bundle);
+  const res = await authenticatedFetch("/v1/sessions/validate-bundle", {
+    method: "POST",
+    body: form,
+  });
+  if (!res.ok) throw await apiErrorFromResponse(res);
+  const body = (await res.json()) as { ok: boolean; agent_name: string | null };
+  return { agentName: body.agent_name };
+}
+
+/**
  * Fork (clone) a session into a new one via
  * POST /v1/sessions/{source_id}/fork.
  *
