@@ -615,6 +615,99 @@ describe("SessionPoliciesSection", () => {
     ).toBeInTheDocument();
   });
 
+  it("adds array (multi-select) values via the model combobox as a coerced list", () => {
+    // WHY: the expensive_models-style array param renders the single-input
+    // combobox; picking options and typing a free-form value must survive the
+    // comma-joined form state and coerce to a list[str] on submit — the
+    // behavior the checkbox→combobox refactor must not regress.
+    registryData.current = [
+      {
+        handler: "h.budget",
+        kind: "factory",
+        name: "Budget Guard",
+        description: "blocks expensive models",
+        params_schema: {
+          properties: {
+            expensive_models: {
+              type: "array",
+              items: { type: "string", enum: ["opus", "sonnet", "haiku"] },
+            },
+          },
+          required: [],
+        },
+      },
+    ];
+    renderContent("conv_pol");
+
+    fireEvent.click(screen.getByTitle("Add policy"));
+    const dialog = screen.getByRole("dialog");
+    fireEvent.click(within(dialog).getByText("Budget Guard"));
+
+    // Open the combobox and pick two options from the list.
+    const combo = within(dialog).getByPlaceholderText("Select or type a value…");
+    fireEvent.focus(combo);
+    fireEvent.mouseDown(within(dialog).getByRole("button", { name: "opus" }));
+    fireEvent.mouseDown(within(dialog).getByRole("button", { name: "haiku" }));
+    // Free-form typed value still works (Enter commits).
+    fireEvent.change(combo, { target: { value: "custom-tier" } });
+    fireEvent.keyDown(combo, { key: "Enter" });
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "Add" }));
+
+    expect(addMutate).toHaveBeenCalledTimes(1);
+    const payload = addMutate.mock.calls[0][0];
+    expect(payload.handler).toBe("h.budget");
+    expect(payload.factory_params).toEqual({
+      expensive_models: ["opus", "haiku", "custom-tier"],
+    });
+  });
+
+  it("removes a picked array value via its chip", () => {
+    // WHY: selected values render as removable chips above the combobox;
+    // removing one must drop it from the submitted list.
+    registryData.current = [
+      {
+        handler: "h.budget",
+        kind: "factory",
+        name: "Budget Guard",
+        description: "blocks expensive models",
+        params_schema: {
+          properties: {
+            expensive_models: {
+              type: "array",
+              items: { type: "string", enum: ["opus", "sonnet", "haiku"] },
+            },
+          },
+          required: [],
+        },
+      },
+    ];
+    renderContent("conv_pol");
+
+    fireEvent.click(screen.getByTitle("Add policy"));
+    const dialog = screen.getByRole("dialog");
+    fireEvent.click(within(dialog).getByText("Budget Guard"));
+
+    const combo = within(dialog).getByPlaceholderText("Select or type a value…");
+    fireEvent.focus(combo);
+    fireEvent.mouseDown(within(dialog).getByRole("button", { name: "opus" }));
+    fireEvent.mouseDown(within(dialog).getByRole("button", { name: "sonnet" }));
+
+    // Remove opus via its chip's X button. The chip is a <span> holding the
+    // label text plus a remove <button>; the list option, by contrast, is a
+    // <button> — so pick the "opus" match that is itself a span with a button.
+    const opusChip = within(dialog)
+      .getAllByText("opus")
+      .map((el) => el.closest("span"))
+      .find((span) => span?.querySelector("button")) as HTMLElement;
+    fireEvent.click(within(opusChip).getByRole("button"));
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "Add" }));
+
+    const payload = addMutate.mock.calls[0][0];
+    expect(payload.factory_params).toEqual({ expensive_models: ["sonnet"] });
+  });
+
   it("shows the all-applied empty message when every registry policy is already added", () => {
     // WHY: when appliedHandlers covers the whole registry the filtered list is
     // empty AND available.length === 0, so the dialog says all are applied.

@@ -1,9 +1,12 @@
-"""Tests for session policy loading in :func:`build_policy_engine`.
+"""Tests for session and default policy loading in :func:`build_policy_engine`.
 
 Verifies that enabled session policies stored via the CRUD API are
 loaded by the builder, converted to :class:`FunctionPolicySpec`,
 resolved to :class:`FunctionPolicy` instances, and participate in
 engine evaluation alongside spec-declared policies.
+
+Also covers DB-stored default policies (``session_id IS NULL``) and the
+:func:`_load_default_policy_specs` TTL-cache behaviour.
 """
 
 from __future__ import annotations
@@ -14,9 +17,14 @@ from omnigent.entities import Policy as StoredPolicy
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.policies.function import FunctionPolicy
 from omnigent.runtime.policies.builder import (
+    _DEFAULT_POLICY_SPECS_CACHE,
+    _SESSION_POLICY_SPECS_CACHE,
+    _load_default_policy_specs,
     _load_session_policy_specs,
     _stored_policy_to_spec,
     build_policy_engine,
+    invalidate_default_policy_specs_cache,
+    invalidate_session_policy_specs_cache,
 )
 from omnigent.spec.types import (
     AgentSpec,
@@ -108,6 +116,73 @@ def test_stored_url_policy_raises() -> None:
 def test_load_session_policy_specs_none_store() -> None:
     """When ``policy_store`` is ``None``, returns an empty list."""
     assert _load_session_policy_specs("conv_123", None) == []
+
+
+def test_load_session_policy_specs_caches_result(db_uri: str) -> None:
+    """A second call returns the cached result without hitting the store.
+
+    :param db_uri: Per-test SQLite URI from the root conftest.
+    """
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv = conv_store.create_conversation()
+    store = SqlAlchemyPolicyStore(db_uri)
+    store.create(
+        policy_id="pol_cache",
+        session_id=conv.id,
+        name="cache_test",
+        type="python",
+        handler="myorg.policies.allow_all",
+        enabled=True,
+    )
+    _SESSION_POLICY_SPECS_CACHE.clear()
+
+    first = _load_session_policy_specs(conv.id, store)
+    store.create(
+        policy_id="pol_cache2",
+        session_id=conv.id,
+        name="cache_test2",
+        type="python",
+        handler="myorg.policies.allow_all",
+        enabled=True,
+    )
+    second = _load_session_policy_specs(conv.id, store)
+
+    assert second is first
+
+
+def test_invalidate_session_policy_specs_cache(db_uri: str) -> None:
+    """Invalidating the cache forces the next call to re-read from the store.
+
+    :param db_uri: Per-test SQLite URI from the root conftest.
+    """
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv = conv_store.create_conversation()
+    store = SqlAlchemyPolicyStore(db_uri)
+    store.create(
+        policy_id="pol_inv1",
+        session_id=conv.id,
+        name="inv_policy1",
+        type="python",
+        handler="myorg.policies.allow_all",
+        enabled=True,
+    )
+    _SESSION_POLICY_SPECS_CACHE.clear()
+
+    first = _load_session_policy_specs(conv.id, store)
+    assert len(first) == 1
+
+    store.create(
+        policy_id="pol_inv2",
+        session_id=conv.id,
+        name="inv_policy2",
+        type="python",
+        handler="myorg.policies.allow_all",
+        enabled=True,
+    )
+    invalidate_session_policy_specs_cache(conv.id)
+
+    second = _load_session_policy_specs(conv.id, store)
+    assert len(second) == 2
 
 
 def test_load_session_policy_specs_filters_disabled(db_uri: str) -> None:
@@ -412,3 +487,226 @@ def test_root_session_does_not_double_load(db_uri: str) -> None:
     assert names.count("root_only") == 1, (
         f"root policy loaded {names.count('root_only')} times in {names}"
     )
+
+
+# ── _load_default_policy_specs ──────────────────────────────────────────────
+
+
+def test_load_default_policy_specs_none_store() -> None:
+    """When ``policy_store`` is ``None``, returns an empty list."""
+    assert _load_default_policy_specs(None) == []
+
+
+def test_load_default_policy_specs_skips_url_type(db_uri: str) -> None:
+    """A default policy with ``type='url'`` is skipped, not raised.
+
+    Unlike session policies (where an unsupported type raises loudly),
+    unsupported-type default policies must not crash engine construction
+    globally — they are logged and skipped so a stale row can't cause a
+    server-wide outage.
+
+    :param db_uri: Per-test SQLite URI from the root conftest.
+    """
+    store = SqlAlchemyPolicyStore(db_uri)
+    # Insert a url-type default directly via the store (bypassing the route
+    # guard that rejects url defaults at creation time).
+    store.create_default(
+        policy_id="dpol_url",
+        name="url_default",
+        type="url",
+        handler="https://example.com/eval",
+        enabled=True,
+    )
+    store.create_default(
+        policy_id="dpol_ok",
+        name="python_default",
+        type="python",
+        handler="myorg.policies.allow_all",
+        enabled=True,
+    )
+    _DEFAULT_POLICY_SPECS_CACHE.clear()
+
+    # Should not raise — url policy is skipped, python policy is included.
+    specs = _load_default_policy_specs(store)
+
+    assert len(specs) == 1
+    assert specs[0].name == "python_default"
+
+
+def test_load_default_policy_specs_filters_disabled(db_uri: str) -> None:
+    """Disabled default policies are excluded from the loaded specs.
+
+    :param db_uri: Per-test SQLite URI from the root conftest.
+    """
+    store = SqlAlchemyPolicyStore(db_uri)
+    store.create_default(
+        policy_id="dpol_enabled",
+        name="enabled_default",
+        type="python",
+        handler="myorg.policies.allow_all",
+        enabled=True,
+    )
+    store.create_default(
+        policy_id="dpol_disabled",
+        name="disabled_default",
+        type="python",
+        handler="myorg.policies.deny_all",
+        enabled=False,
+    )
+    _DEFAULT_POLICY_SPECS_CACHE.clear()
+
+    specs = _load_default_policy_specs(store)
+
+    assert len(specs) == 1
+    assert specs[0].name == "enabled_default"
+
+
+def test_load_default_policy_specs_caches_result(db_uri: str) -> None:
+    """A second call returns the cached result without hitting the store.
+
+    :param db_uri: Per-test SQLite URI from the root conftest.
+    """
+    store = SqlAlchemyPolicyStore(db_uri)
+    store.create_default(
+        policy_id="dpol_cache",
+        name="cache_test",
+        type="python",
+        handler="myorg.policies.allow_all",
+        enabled=True,
+    )
+    _DEFAULT_POLICY_SPECS_CACHE.clear()
+
+    first = _load_default_policy_specs(store)
+    # Add a second default policy directly — bypasses the cache.
+    store.create_default(
+        policy_id="dpol_cache2",
+        name="cache_test2",
+        type="python",
+        handler="myorg.policies.allow_all",
+        enabled=True,
+    )
+    second = _load_default_policy_specs(store)
+
+    # Cache hit: second call returns the same object as first, missing the new policy.
+    assert second is first
+
+
+def test_invalidate_default_policy_specs_cache(db_uri: str) -> None:
+    """Invalidating the cache forces the next call to re-read from the store.
+
+    :param db_uri: Per-test SQLite URI from the root conftest.
+    """
+    store = SqlAlchemyPolicyStore(db_uri)
+    store.create_default(
+        policy_id="dpol_inv1",
+        name="inv_policy1",
+        type="python",
+        handler="myorg.policies.allow_all",
+        enabled=True,
+    )
+    _DEFAULT_POLICY_SPECS_CACHE.clear()
+
+    first = _load_default_policy_specs(store)
+    assert len(first) == 1
+
+    store.create_default(
+        policy_id="dpol_inv2",
+        name="inv_policy2",
+        type="python",
+        handler="myorg.policies.allow_all",
+        enabled=True,
+    )
+    invalidate_default_policy_specs_cache()
+
+    second = _load_default_policy_specs(store)
+    assert len(second) == 2
+
+
+# ── build_policy_engine: DB default policies integration ────────────────────
+
+
+def test_build_engine_includes_db_default_policies(db_uri: str) -> None:
+    """DB-stored default policies appear in the engine's policy list.
+
+    :param db_uri: Per-test SQLite URI.
+    """
+    handler = "tests.resources.examples._shared.tool_functions.block_long_sleep"
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv = conv_store.create_conversation()
+    policy_store = SqlAlchemyPolicyStore(db_uri)
+    policy_store.create_default(
+        policy_id="dpol_test",
+        name="db_default_policy",
+        type="python",
+        handler=handler,
+    )
+    _DEFAULT_POLICY_SPECS_CACHE.clear()
+
+    engine = build_policy_engine(
+        spec=_make_minimal_spec(),
+        conversation_id=conv.id,
+        conversation_store=conv_store,
+        policy_store=policy_store,
+    )
+
+    names = [p.spec.name for p in engine.policies]
+    assert "db_default_policy" in names
+
+
+def test_build_engine_ordering_session_agent_db_default_admin(db_uri: str) -> None:
+    """Policy evaluation order is session → agent → DB default → YAML admin.
+
+    :param db_uri: Per-test SQLite URI.
+    """
+    handler = "tests.resources.examples._shared.tool_functions.block_long_sleep"
+
+    agent_policy = FunctionPolicySpec(
+        name="agent_policy",
+        on=None,
+        function=FunctionRef(path=handler),
+    )
+    spec = AgentSpec(
+        spec_version=1,
+        name="test-agent",
+        guardrails=GuardrailsSpec(policies=[agent_policy]),
+    )
+    yaml_admin_policy = FunctionPolicySpec(
+        name="yaml_admin_policy",
+        on=None,
+        function=FunctionRef(path=handler),
+    )
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv = conv_store.create_conversation()
+    policy_store = SqlAlchemyPolicyStore(db_uri)
+    policy_store.create(
+        policy_id="pol_session",
+        session_id=conv.id,
+        name="session_policy",
+        type="python",
+        handler=handler,
+    )
+    policy_store.create_default(
+        policy_id="dpol_db",
+        name="db_default_policy",
+        type="python",
+        handler=handler,
+    )
+    _DEFAULT_POLICY_SPECS_CACHE.clear()
+
+    engine = build_policy_engine(
+        spec=spec,
+        conversation_id=conv.id,
+        conversation_store=conv_store,
+        default_policies=[yaml_admin_policy],
+        policy_store=policy_store,
+    )
+
+    names = [p.spec.name for p in engine.policies]
+    assert names == [
+        "session_policy",
+        "agent_policy",
+        "db_default_policy",
+        "yaml_admin_policy",
+        "__ask_on_add_policy",
+    ]

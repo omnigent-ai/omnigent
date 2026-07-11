@@ -6,9 +6,10 @@ available", "is steering possible", "does policy DENY actually block a call" —
 instead of a human hand-maintaining a spreadsheet and hoping it still reflects
 reality.
 
-> **Status:** shipped and in use. The MVP plus most of phase-2 is on `main` —
-> three transport drivers, the six P0 probes, and a capability-derived matrix
-> that has already caught and corrected real declaration drift. See
+> **Status:** shipped and in use. The bench on `main` has three transport
+> drivers, six P0 probes, three report-only P1 probes, automatic live/offline
+> selection, and a capability-derived matrix that has already caught and
+> corrected real declaration drift. See
 > [Current state](#current-state-shipped) for what is live vs. still open. The
 > sections before it describe the design and the decisions behind it.
 
@@ -125,48 +126,42 @@ list" to "discover"; probes, profiles, and reports are untouched.
 
 ## Architecture
 
-Three layers plus a report step.
+The implementation has three layers plus reporting:
 
 ```
 tests/harness_bench/
-  profile.py         # BenchProfile: per-harness self-declared facts
-  manifest.py        # registry of official BenchProfiles (the spreadsheet as data)
-  verdict.py         # Verdict enum, ProbeResult, priority (P0/P1)
-  transports/        # transport drivers keyed by class
-    _base.py         #   TransportDriver: launch/session/turn against a harness
-    sdk_inproc.py    #   in-proc HTTP (reuses existing e2e server helpers)
-    tmux_tui.py      #   (phase 2)
-    app_server.py    #   (phase 2)
-    http_sse.py      #   (phase 2)
-  probes/            # one module per dimension
-    _base.py         #   CapabilityProbe: name, priority, applies_to, declared(), run()
-    basic_turn.py
-    streaming.py
-    tool_calling.py  #   incl. "connects to Omnigent MCP"
-    interrupt.py
-    policy_deny.py
-    model_override.py
-    ...              #   (phase 2: steering, live_queue, resume_fork, elicitation,
-                     #    reasoning, images, cost, compaction)
-  bench.py           # driver: iterate probes x harnesses -> matrix
-  report.py          # render Markdown + JSON, with a DRIFT column
-  test_bench.py      # pytest wrapper (parametrized) for CI
+  profile.py             # BenchProfile and profile-name resolution
+  manifest.py            # official profiles derived from capabilities + e2e metadata
+  verdict.py             # verdict vocabulary, priority, and drift reconciliation
+  transport.py           # semantic Driver protocol and transport resolution
+  driver.py              # sdk-inproc driver + shared TurnResult/usage helpers
+  full_server.py         # shared server/runner lifecycle and registration
+  full_server_driver.py  # full-server driver and session polling
+  native_tui_driver.py   # native vendor CLI + host-daemon/tmux driver
+  session_items.py       # shared session-item envelope parsing
+  runtime_env.py         # config/credential resolution matching `omni run`
+  probes/                # one module per capability dimension
+  events.py              # structured progress events and plain sink
+  richreport.py          # optional live Rich matrix
+  bench.py               # orchestration, concurrency, and shared-server wiring
+  report.py              # terminal, Markdown, and JSON rendering
 ```
 
-- **Layer 0 — Profile / manifest.** The spreadsheet, as data. Source of truth
-  for the static columns and the *expected* verdicts for behavioral ones.
-- **Layer 1 — Offline conformance** (no network, always in CI). Harness
-  registers, `create_app()` builds, required routes exist, `Executor` flags are
-  internally consistent, a `BenchProfile` exists. Fast, catches structural
-  regressions.
-- **Layer 2 — Live probes** (gated on CLI + creds; reuses
-  `skip_if_harness_cli_missing`). Runs the behavioral table against a live
-  server, exactly like the existing e2e tests
-  (`/v1/sessions` + `send_user_message_to_session` +
-  `poll_session_until_terminal` + `final_assistant_text`).
-- **Report.** `python -m tests.harness_bench --harness codex` prints one
-  harness's matrix; no filter regenerates the whole sheet with a `DRIFT` column
-  diffing declared vs observed.
+Reusable configuration and runtime primitives live in production modules such
+as `omnigent.config`, `find_free_port`, and the harness registry rather than
+being reimplemented under tests.
+
+- **Layer 0 — Profile / manifest.** Static facts and declared verdicts are
+  derived from `harness_capabilities()` plus the existing e2e harness metadata.
+- **Layer 1 — Offline conformance.** No network or credentials. It validates
+  registration, profile shape, capability derivation, transport resolution,
+  rendering, and orchestration behavior in normal CI.
+- **Layer 2 — Live probes.** Drivers execute behavioral probes through the
+  wrap boundary or the real server/runner session API. Missing credentials,
+  vendor binaries, or vendor login produce capability-neutral skips.
+- **Report.** The CLI renders the declared matrix offline or reconciles live
+  observations into terminal, Markdown, and JSON reports. `DRIFT` produces a
+  non-zero exit status.
 
 ### Build on `HarnessProbe`, don't reinvent it
 
@@ -206,20 +201,18 @@ Validated for presence and shape only: `Owner`, `Transport`, `Implementation`,
 
 | Dimension | How the probe proves it |
 |---|---|
-| Basic turn (prereq) | ask model to reply with `<marker>`, assert marker in final text |
-| Connects to Omnigent MCP | expose an Omnigent tool, ask model to call it, assert `ToolCallRequest` dispatched through the relay |
-| Streaming | count `TextChunk` events: >1 delta = `deltas`, single blob = `complete-only` |
-| Model override | launch with a chosen model, assert routing (gateway request / `TurnComplete` usage model); cross-family reject verified via `model_family_mismatch` |
-| Policy: DENY | set DENY on a tool, ask model to call it, assert the call is blocked + surfaced |
-| Policy: ASK -> Elicitation | set ASK, assert an elicitation event is emitted upstream (web-surfaceable) |
-| Interrupt | start a long turn, call `interrupt_session`, assert it stops promptly |
-| Live queue (concurrent) | `enqueue_session_message` mid-turn, assert accepted (not rejected) |
-| Tool-boundary steer | inject steering text at a tool boundary, assert the next turn reflects it |
-| Resume/fork from transcript | run a convo, resume in a fresh session, assert prior context present; fork = branch diverges |
-| Compaction | assert `CompactionComplete` surfaced when triggered |
-| Reasoning | reasoning-heavy prompt, assert `ReasoningChunk` emitted |
-| Images | send an image, assert the model describes it |
-| Cost tracking | assert `TurnComplete` carries usage / cost |
+| Basic turn (P0 prerequisite) | complete a marker-echo turn and require assistant text |
+| Streaming (P0) | count output-text deltas; repeated single-delta output is `PARTIAL` |
+| Tool calling (P0) | provoke the transport's tool mechanism and require a surfaced call |
+| Policy DENY (P0) | apply a tool-call deny and require a blocked-call signal |
+| Policy ALLOW (P1) | attach an explicit allow and require a non-blocked tool output; native hooks expose no positive ALLOW event |
+| Policy ASK (P1) | apply ask and require an elicitation/approval request |
+| Model override (P0) | validate the requested harness/model pair and complete a turn |
+| Cost tracking (P1) | read priced cost or token usage from the turn/session |
+| Interrupt (P0) | interrupt a long turn and require cancellation or early termination |
+
+Planned dimensions are steering, live queue, resume/fork, reasoning, images,
+and compaction.
 
 Every behavioral probe also reads the corresponding declared flag and returns
 `DRIFT` when observed disagrees with declared.
@@ -247,80 +240,56 @@ class StreamingProbe(CapabilityProbe):
 
 ## Transport drivers: the real ceiling on "all dimensions"
 
-Behavioral probes run through a **transport driver** resolved from the
-harness *family* plus flags: SDK harnesses default to `full-server` (`--fast`
-picks `sdk-inproc`), natives use `native-tui`, and `--transport NAME` overrides
-the family for any harness. A probe calls
-*semantic* methods on the driver (`run_basic_turn`, `run_streaming_turn`,
-`run_tool_turn(deny=...)`, `run_interrupt_turn`); the driver owns the
-*mechanism* and the probe owns the *interpretation*, so one probe runs across
-transports that reach the same capability by different means.
+Behavioral probes call semantic driver methods such as `run_basic_turn`,
+`run_tool_turn`, `run_policy_turn`, and `run_interrupt_turn`. Drivers own the
+transport-specific mechanism; probes interpret a common `TurnResult`.
 
-Three drivers exist today (see "Current state" above): `sdk-inproc`,
-`full-server`, `native-tui`. Two consequences fall out of this design:
+Three drivers exist:
 
-- A dimension is only observable where a driver exercises it. Tool calling and
-  Policy DENY need `full-server`; on `sdk-inproc`/`native-tui` they report `·`.
-  A `·` therefore often means "this transport can't exercise it here," not "the
-  harness lacks it" (see "Which transport exercises which dimension").
-- A harness that invents a *novel* transport (neither wrap-subprocess, full
-  server, nor native tmux) would degrade its transport-dependent probes to
-  `SKIPPED`/`UNKNOWN` until a driver for that class exists.
+- `full-server` is the SDK-family default. It drives a real server and runner,
+  uses a server-dispatched builtin for tool probes, and observes fixed
+  ALLOW/ASK/DENY policies.
+- `native-tui` drives a resident vendor CLI in a runner-owned tmux pane through
+  the server session API. It observes vendor tool calls and tool-call DENY via
+  the native policy hook. ALLOW/ASK are not yet implemented.
+- `sdk-inproc` drives the harness wrap directly. It is selected by `--fast` and
+  provides cheaper wrap-level coverage, but no server-side policy surface.
 
-So "run the bench, see all verdicts, zero code" is true *for any harness
-reusing a known transport class*, and honest about the cases where a dimension
-or a transport is not yet wired.
+A `SKIPPED` verdict therefore means the behavior was not measurable in that
+transport or environment, not that the harness lacks the capability. A novel
+transport class still requires a driver, but harnesses reusing one of these
+families flow through the existing probes without per-harness probe code.
 
 ## Current state (shipped)
 
-The MVP and most of phase-2 are landed. What exists on `main` today:
+The bench on `main` includes:
 
-- **Layer 0/1/2** — profile/manifest, offline conformance (runs in CI via the
-  `misc` pytest group), and the six P0 live probes (basic turn, streaming,
-  tool calling, policy DENY, model override, interrupt) with the `DRIFT`
-  column.
-- **Three transport drivers**, selected by harness *family* with flag overrides:
-  - `sdk-inproc` — drives a harness wrap subprocess directly (the four P0 SDK
-    harnesses: claude-sdk, codex, pi, openai-agents).
-  - `full-server` — a real server + runner; the only transport that exercises
-    **Tool calling** and **Policy DENY** as server-dispatched, policy-gated
-    calls (SDK harnesses only — it registers via an agent bundle).
-  - `native-tui` — a resident vendor CLI in a runner-owned tmux pane, driven
-    over the session HTTP surface via a host daemon.
-
-  SDK harnesses default to **`full-server`** — the fullest coverage, and a
-  strict superset of what `sdk-inproc` observes (everything sdk-inproc does,
-  *plus* Tool calling + Policy DENY). `--fast` opts the SDK family down to
-  `sdk-inproc` when you want to skip the server boot (those two dimensions then
-  report `·`). Native harnesses have a single transport `--fast` does not touch.
-  An explicit `--transport NAME` overrides the family default for any harness
-  and is mutually exclusive with `--fast`.
-- **Capability-derived matrix** — descriptive columns and declared verdicts
-  come from `harness_capabilities()` (the seam; see
-  `designs/harness-capabilities-bench-seam.md`), so a harness added to the
-  registry — in-repo *or* a community plugin — flows into the bench with no
-  bench edit.
-- **Native harnesses auto-derived** — every `NATIVE_TUI` harness is registered
-  and drivable by name; `native_vendor()` derives what the driver needs from
-  capabilities, with no per-vendor table.
+- **Six P0 probes:** Basic turn, Streaming, Tool calling, Policy DENY, Model
+  override, and Interrupt.
+- **Three P1 probes:** Policy ALLOW, Policy ASK, and Cost tracking. P1 verdicts
+  are report-only and do not gate the same way as P0 declarations.
+- **Three transport drivers:** `full-server`, `native-tui`, and `sdk-inproc`,
+  selected by harness family with `--transport` and `--fast` overrides.
+- **Automatic live selection:** without an explicit mode, the CLI runs live
+  when credentials are resolvable and otherwise renders the declared matrix.
+  `--live` and `--no-live` force either mode. Credentials are derived like
+  `omni run`; `--profile` is only an override.
+- **Concurrent execution and shared infrastructure:** `--jobs` runs harnesses
+  concurrently while preserving report order, and full-server harnesses share
+  one server/runner pair within a run.
+- **Structured progress and reports:** plain or Rich live progress plus terminal,
+  Markdown, JSON, and optional report-file output.
+- **Capability-derived registration:** official SDK and native profiles derive
+  from `harness_capabilities()` and existing e2e metadata. Session-item parsing,
+  config loading, free-port selection, and polling helpers are shared rather
+  than duplicated.
 
 ### Not yet wired
 
-- **Bench observation of Tool calling / Policy DENY on `native-tui`** — a
-  *driver gap, not a native-harness limitation*. Native harnesses do call tools
-  and enforce permissions; the bench cannot yet observe it on this transport.
-  A native tool call is the vendor's own tool (Bash/Read/...), not a
-  server-dispatched `function_call_output` the bench can force, and a native
-  deny is a vendor permission decision, not a server-side policy evaluation the
-  probe can assert against. So both cells show `·` (not measured), never `✗`.
-  Wiring the observation needs new driver work. (SDK harnesses get these via
-  `full-server`.)
-- **P1 dimensions** — steering, live-queue, resume/fork, elicitation ASK,
-  reasoning, images, cost, compaction. Probes not written yet (report
-  `UNKNOWN`).
-- **Server-side native-agent seeding is a hardcoded list** — see the
-  plugin-seamlessness note below; this is the main gap between "the bench is
-  plugin-ready" and "a plugged-in native harness just works end to end".
+- Registry-driven server seeding for community native UI agents.
+- Steering, live queue, resume/fork, reasoning, images, and compaction probes.
+- Automatic provisioning of vendor login/provider configuration for native
+  harnesses; unavailable environments skip cleanly.
 
 ## CI integration
 
@@ -332,37 +301,29 @@ The MVP and most of phase-2 are landed. What exists on `main` today:
 ## Running the bench and reading the result
 
 ```
-# Offline: the declared matrix, no creds, every harness. Fast.
-python -m tests.harness_bench
+# Declared matrix only, with no credentials.
+python -m tests.harness_bench --no-live
 
-# Live: probe one harness against a gateway profile.
-python -m tests.harness_bench --harness codex-native --profile oss
+# Auto-live when configured or ambient credentials are available.
+python -m tests.harness_bench --harness codex
 
-# Live: probe every official harness (SDK + native) sequentially.
-python -m tests.harness_bench --profile oss
+# Force a named profile and probe several harnesses concurrently.
+python -m tests.harness_bench --profile oss --jobs 4 --rich
 
 # A community harness that ships its own BenchProfile.
-python -m tests.harness_bench --harness mypkg.harness:PROFILE --profile oss
+python -m tests.harness_bench --harness mypkg.harness:PROFILE --live
 ```
 
-**You do not need to live-probe every harness on every host — and you cannot.**
-Each native harness needs its own vendor CLI logged in (a login the bench
-cannot provision), so no single host has them all. The two layers split the
-work:
+Without `--live` or `--no-live`, resolvable credentials select live mode and
+missing credentials select the offline declared matrix. Native harnesses also
+need their vendor CLI installed and logged in; the bench cannot provision those
+accounts, so unavailable harnesses skip without aborting the run.
 
-- **Offline conformance** already covers every harness in CI — registration,
-  the declared matrix, capability derivation. No host access needed.
-- **Live probes** only answer "does observed behavior match the declaration?"
-  You get value from live-probing a harness where the declaration is unverified
-  or might be wrong — not from chasing 100% coverage on one box.
-
-Run the full set on whatever host you have (`--profile oss`); harnesses whose
-vendor CLI is absent or logged out **skip cleanly** (they do not fail or abort
-the run). Read two signals only: any `!!` DRIFT, and any harness you *can* run
-that shows an unexpected `✗` / `·`. A single live run is a spot-check, not a
-gate — live probes are non-deterministic (model behavior, timing), so re-run
-before treating one `·`/timeout as a regression. Drift coverage is cumulative:
-each host that has harness X logged in contributes a live check for X.
+Offline conformance covers every registered harness in CI. Live runs are
+spot-checks of observed behavior and can vary with model behavior and timing;
+re-run an isolated timeout or skip before treating it as a regression. The
+signals that matter most are `DRIFT` and repeatable unexpected
+`UNSUPPORTED`/`PARTIAL` verdicts on a runnable harness.
 
 ## Streaming is a binary declared capability
 
@@ -386,46 +347,18 @@ stream, the bench flags a real drift on the next run, rather than a false
 
 ## Which transport exercises which dimension
 
-Not every dimension is observable on every transport, so a `·` (SKIPPED) in a
-run always means "the bench did not measure this here," never "the harness
-lacks it." Two dimensions in particular only get a real verdict on the
-`full-server` transport:
-
-| Dimension | sdk-inproc (`--fast`) | full-server (default) | native-tui |
+| Dimension | `sdk-inproc` (`--fast`) | `full-server` (SDK default) | `native-tui` |
 |---|---|---|---|
-| Basic turn, Streaming, Model override, Interrupt | ✓ | ✓ | ✓ |
-| **Tool calling** | · (harness dispatches tools internally) | ✓ (server-dispatched builtin) | · (bench can't observe vendor tools yet) |
-| **Policy DENY** | · (wrap-direct: no tool-call policy hook) | ✓ (spec-baked deny, enforced) | · (bench can't observe vendor deny yet) |
+| Basic turn, Streaming, Model override, Interrupt | Wrap-level observation | End-to-end server/runner observation | End-to-end server/runner/vendor observation |
+| Tool calling | Request-level wrap tool | Server-dispatched builtin | Vendor tool mirrored into session items |
+| Policy DENY | Not observable | Fixed policy blocks the builtin | Session CEL policy triggers the native policy hook |
+| Policy ALLOW / ASK | Not observable | Fixed policy; ASK observes and resolves an elicitation | Temporary session CEL policy; ASK observes and resolves an elicitation |
+| Cost tracking | Completed-response usage when forwarded | Session snapshot usage/cost | Session snapshot when the vendor forwards usage |
 
-The `native-tui` `·` is a *bench observation gap, not a native-harness
-limitation*: native harnesses do call tools and enforce permissions, but a
-native tool call is the vendor's own (Bash/Read/...) and a native deny is a
-vendor permission decision, neither of which is the server-dispatched,
-policy-gated call the probe watches for. Giving those cells a real verdict
-needs new driver work, not a change to the harnesses.
-
-Because `full-server` sees everything `sdk-inproc` does *plus* these two, it is
-the **default** for SDK harnesses — a plain live run proves Tool calling and
-Policy DENY out of the box:
-
-```
-python -m tests.harness_bench --harness claude-sdk --profile oss
-```
-
-Live-verified: `claude-sdk` completes the full matrix on `full-server` —
-Tool calling `✓` and Policy DENY `✓` (the deny is delivered and the blocked
-call does not stall the turn). Add `--fast` to trade that coverage for a quicker
-run on `sdk-inproc`; those two columns then show `·`, since neither `sdk-inproc`
-nor `native-tui` (for natives) routes a tool call through a server policy
-evaluation.
-
-`full-server` covers **SDK harnesses only** — it registers the harness via an
-agent bundle, which is the SDK-wrap path; native harnesses need the host-daemon
-provisioning the `native-tui` driver owns. So Tool calling / Policy DENY on
-native harnesses are not observed by *any* transport yet — a bench follow-up,
-not a native-harness gap — distinct from the `--fast` (sdk-inproc) `·`, which
-is a transport limitation the default `full-server` run already answers for SDK
-harnesses.
+`full-server` remains the SDK default because it covers the deployed server
+path and all three policy actions. `--fast` trades that policy coverage for
+lower startup cost. `native-tui` now has real Tool calling and all three policy
+action probes through the native hook path.
 
 ## Plugin seamlessness: where it is and isn't
 
@@ -478,25 +411,11 @@ agree with it.
 
 ## Open items
 
-- **Registry-driven native-agent seeding** (highest leverage) — replace the
-  hardcoded `_ensure_default_*_agent()` list in `server/app.py` with a loop over
-  `native_agents()`, so any native harness (in-repo or plugin) registers
-  automatically. This is the fix for the plugin-seamlessness seam above.
-- **Bench observation of Tool calling / Policy DENY on `native-tui`** — a
-  driver gap, not a native-harness limitation: native harnesses call tools and
-  enforce permissions, but a native tool call is the vendor's own and a native
-  deny is a vendor permission decision, not the server-dispatched
-  `function_call_output` the probe watches for. The cells show `·` (not
-  measured), never `✗`. Needs new driver work. (SDK harnesses get these via
-  `full-server`.)
-- **Per-harness native provisioning gaps** the bench has surfaced but not yet
-  resolved: goose-native returns a 500 on the terminal-ensure endpoint;
-  hermes-native's forwarder does not wire up (a lazy-chat / first-turn gate to
-  confirm); kimi-native and own-auth natives need a vendor provider setup the
-  bench cannot provision (kimi in particular has no gateway path — it routes
-  via `kimi provider add`, out of band).
-- **P1 dimensions + their probes** — steering, live-queue, resume/fork,
-  elicitation ASK, reasoning, images, cost, compaction.
-- Exact `BenchProfile` field set and whether it subsumes `HarnessProbe` or wraps
-  it; whether the manifest fully retires the spreadsheet or diffs against an
-  exported CSV during transition.
+- **Registry-driven native-agent seeding** — replace the hardcoded server
+  seeding list with registry iteration so community native harnesses work end
+  to end after plugin installation.
+- **Per-harness native provisioning** — some vendors require login or provider
+  configuration that the bench deliberately cannot create. Improve diagnostics
+  where possible while retaining clean skips.
+- **Additional dimensions** — steering, live queue, resume/fork, reasoning,
+  images, and compaction.

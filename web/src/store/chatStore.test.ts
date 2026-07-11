@@ -3446,6 +3446,56 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
     });
   });
 
+  describe("session.mcp_startup", () => {
+    it("mirrors an in-flight startup map for the MCP startup band", () => {
+      useChatStore.setState({ mcpStartup: null });
+      handleSessionEvent({
+        type: "session_mcp_startup",
+        conversationId: "conv_abc",
+        servers: {
+          safe: { status: "ready", error: null },
+          "storage-console": { status: "starting", error: null },
+        },
+      });
+      expect(useChatStore.getState().mcpStartup).toEqual({
+        safe: { status: "ready", error: null },
+        "storage-console": { status: "starting", error: null },
+      });
+    });
+
+    it("clears the map once every server settles ready", () => {
+      // An all-ready map means startup completed cleanly — retaining it
+      // would strand the startup band on screen.
+      useChatStore.setState({
+        mcpStartup: { safe: { status: "starting", error: null } },
+      });
+      handleSessionEvent({
+        type: "session_mcp_startup",
+        conversationId: "conv_abc",
+        servers: { safe: { status: "ready", error: null } },
+      });
+      expect(useChatStore.getState().mcpStartup).toBeNull();
+    });
+
+    it("retains failed and cancelled servers after startup settles", () => {
+      // The settled-with-failures map is what lets the page say which
+      // servers never came up (mirrors the Codex TUI's startup warnings).
+      useChatStore.setState({ mcpStartup: null });
+      handleSessionEvent({
+        type: "session_mcp_startup",
+        conversationId: "conv_abc",
+        servers: {
+          safe: { status: "failed", error: "handshake failed" },
+          "storage-console": { status: "cancelled", error: null },
+        },
+      });
+      expect(useChatStore.getState().mcpStartup).toEqual({
+        safe: { status: "failed", error: "handshake failed" },
+        "storage-console": { status: "cancelled", error: null },
+      });
+    });
+  });
+
   describe("session.skills", () => {
     /**
      * Route GET /v1/sessions/{seedId} to a snapshot carrying `skills`;

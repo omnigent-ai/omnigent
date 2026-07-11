@@ -11,9 +11,10 @@
  * themselves — client-side gating is just UX.
  */
 
-import { useCallback, useEffect, useState } from "react";
-import { PlusIcon, RefreshCwIcon, ShieldCheckIcon, TrashIcon } from "lucide-react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { PlusIcon, RefreshCwIcon, ShieldCheckIcon, TrashIcon, XIcon } from "lucide-react";
 import { PageScroll } from "@/components/PageScroll";
+import { ModelValueCombobox } from "@/components/ModelValueCombobox";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -32,6 +33,7 @@ import {
   type DefaultPolicy,
 } from "@/hooks/useDefaultPolicies";
 import { usePolicyRegistry, type PolicyRegistryEntry } from "@/hooks/usePolicies";
+import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { coercePolicyParams } from "@/lib/policyParams";
@@ -59,7 +61,7 @@ function AddDefaultPolicyDialog({
   const addPolicy = useAddDefaultPolicy();
 
   const entry = registry.find((r) => r.handler === selected);
-  const schema = entry?.params_schema as
+  const rawSchema = entry?.params_schema as
     | {
         properties?: Record<
           string,
@@ -68,7 +70,7 @@ function AddDefaultPolicyDialog({
             description?: string;
             default?: unknown;
             enum?: string[];
-            items?: { type?: string; enum?: string[] };
+            items?: { type?: string; enum?: string[]; "x-enum-source"?: string };
             uniqueItems?: boolean;
           }
         >;
@@ -76,7 +78,20 @@ function AddDefaultPolicyDialog({
       }
     | null
     | undefined;
-  const properties = schema?.properties ?? {};
+  const modelIds = useMemo(() => CLAUDE_NATIVE_MODELS.map((m) => m.id), []);
+  const properties = useMemo(() => {
+    const props = rawSchema?.properties ?? {};
+    if (!modelIds.length) return props;
+    const enriched: typeof props = {};
+    for (const [key, prop] of Object.entries(props)) {
+      if (prop.items?.["x-enum-source"] === "models" && !prop.items.enum) {
+        enriched[key] = { ...prop, items: { ...prop.items, enum: modelIds } };
+      } else {
+        enriched[key] = prop;
+      }
+    }
+    return enriched;
+  }, [rawSchema?.properties, modelIds]);
   const paramKeys = Object.keys(properties);
 
   function handleSelect(handler: string) {
@@ -236,7 +251,7 @@ function AddDefaultPolicyDialog({
                         <span>
                           (
                           {prop.type === "array" && prop.items?.enum
-                            ? "select"
+                            ? "multi-select"
                             : prop.type === "array"
                               ? "comma-separated"
                               : prop.type}
@@ -289,35 +304,55 @@ function AddDefaultPolicyDialog({
                         ))}
                       </select>
                     ) : prop?.type === "array" && prop.items?.enum ? (
-                      <div className="mt-0.5 flex flex-wrap gap-x-3 gap-y-1">
-                        {prop.items.enum.map((v) => {
-                          const current = factoryParams[key]
-                            ? factoryParams[key].split(",").filter(Boolean)
-                            : Array.isArray(prop?.default)
-                              ? (prop.default as string[])
-                              : [];
-                          const checked = current.includes(v);
-                          return (
-                            <label key={v} className="flex items-center gap-1 text-sm">
-                              <input
-                                type="checkbox"
-                                checked={checked}
-                                onChange={(e) => {
-                                  const next = e.target.checked
-                                    ? [...current, v]
-                                    : current.filter((x) => x !== v);
-                                  setFactoryParams((prev) => ({
-                                    ...prev,
-                                    [key]: next.join(","),
-                                  }));
-                                }}
-                                className="rounded border-border"
-                              />
-                              <span>{v}</span>
-                            </label>
-                          );
-                        })}
-                      </div>
+                      (() => {
+                        const current = factoryParams[key]
+                          ? factoryParams[key].split(",").filter(Boolean)
+                          : Array.isArray(prop?.default)
+                            ? (prop.default as string[])
+                            : [];
+                        return (
+                          <div className="mt-0.5 space-y-1.5">
+                            {current.length > 0 && (
+                              <div className="flex flex-wrap gap-1">
+                                {current.map((v) => (
+                                  <span
+                                    key={v}
+                                    className="inline-flex items-center gap-0.5 rounded-md bg-muted px-1.5 py-0.5 text-xs"
+                                  >
+                                    {v}
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        const next = current.filter((x) => x !== v);
+                                        setFactoryParams((prev) => ({
+                                          ...prev,
+                                          [key]: next.join(","),
+                                        }));
+                                      }}
+                                      className="ml-0.5 text-muted-foreground hover:text-foreground"
+                                    >
+                                      <XIcon className="size-3" />
+                                    </button>
+                                  </span>
+                                ))}
+                              </div>
+                            )}
+                            <ModelValueCombobox
+                              options={prop.items.enum}
+                              selected={current}
+                              onToggle={(v) => {
+                                const next = current.includes(v)
+                                  ? current.filter((x) => x !== v)
+                                  : [...current, v];
+                                setFactoryParams((prev) => ({
+                                  ...prev,
+                                  [key]: next.join(","),
+                                }));
+                              }}
+                            />
+                          </div>
+                        );
+                      })()
                     ) : (
                       <input
                         type={

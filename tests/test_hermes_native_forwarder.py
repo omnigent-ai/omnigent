@@ -833,6 +833,18 @@ def test_count_completed_turns_counts_regardless_of_active(tmp_path: Path) -> No
     assert f._count_completed_turns(db, "s1") == 2
 
 
+def test_count_completed_turns_respects_max_id(tmp_path: Path) -> None:
+    """Terminal rows above the mirrored high-water mark are not counted yet."""
+    db = tmp_path / "state.db"
+    # Rows: 1=user, 2=assistant(final), 3=user, 4=assistant(final).
+    _seed_turns(db, cwd=str(tmp_path), started_at=1000.0, session_id="s1", n_turns=2)
+    assert f._count_completed_turns(db, "s1", max_id=1) == 0
+    assert f._count_completed_turns(db, "s1", max_id=2) == 1
+    assert f._count_completed_turns(db, "s1", max_id=3) == 1
+    assert f._count_completed_turns(db, "s1", max_id=4) == 2
+    assert f._count_completed_turns(db, "s1") == 2
+
+
 def test_hermes_status_posted_count_roundtrip_and_clear(tmp_path: Path) -> None:
     bridge = tmp_path / "b"
     assert hstatus.read_posted_count(bridge) == 0
@@ -978,3 +990,89 @@ async def test_forward_loop_idle_dedupes_and_posts_per_new_turn(tmp_path, monkey
     # one-per-poll across the six iterations.
     assert statuses == ["idle", "idle"]
     assert hstatus.read_posted_count(bridge_dir) == 2
+
+
+async def test_forward_loop_idle_waits_for_mid_delivery_final_message(
+    tmp_path, monkeypatch
+) -> None:
+    """A final assistant row landing while a poll's batch is still being
+    delivered must not ring idle until that row is itself mirrored — the idle
+    edge wakes the parent orchestrator, which then reads the transcript, so the
+    completion signal may never overtake the content it announces."""
+    workspace = str(tmp_path)
+    db = tmp_path / "state.db"
+    con = sqlite3.connect(db)
+    con.executescript(_SCHEMA)
+    con.execute(
+        "INSERT INTO sessions(id, source, cwd, started_at) VALUES (?,?,?,?)",
+        ("s1", "cli", workspace, 1000.0),
+    )
+    tc = json.dumps([{"id": "c1", "call_id": "c1", "function": {"name": "f", "arguments": "{}"}}])
+    con.executemany(
+        "INSERT INTO messages"
+        "(session_id, role, content, tool_call_id, tool_calls, tool_name, active)"
+        " VALUES (?,?,?,?,?,?,?)",
+        [
+            ("s1", "user", "go", None, None, None, 1),
+            ("s1", "assistant", "", None, tc, None, 1),  # mid-turn tool-call step
+            ("s1", "tool", "result", "c1", None, "f", 1),
+        ],
+    )
+    con.commit()
+    con.close()
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+
+    # One ordered log for both channels so the content/signal order is provable.
+    events: list[tuple[str, object]] = []
+    landed = {"done": False}
+
+    async def _post_item(_client, *, session_id, item):
+        events.append(("item", item.msg_id))
+        if not landed["done"]:
+            # The turn's final assistant row lands while this batch is still
+            # being POSTed — after the mirror's read, before the idle check.
+            landed["done"] = True
+            con = sqlite3.connect(db)
+            con.execute(
+                "INSERT INTO messages"
+                "(session_id, role, content, tool_call_id, tool_calls, tool_name, active)"
+                " VALUES (?,?,?,?,?,?,?)",
+                ("s1", "assistant", "final answer", None, None, None, 1),
+            )
+            con.commit()
+            con.close()
+
+    async def _record_status(_client, *, session_id, status):
+        events.append(("status", status))
+
+    monkeypatch.setattr(f, "_post_conversation_item", _post_item)
+    monkeypatch.setattr(f, "_post_external_session_status", _record_status)
+
+    iteration = {"n": 0}
+
+    async def _sleep(_s):
+        iteration["n"] += 1
+        if iteration["n"] >= 3:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(f.asyncio, "sleep", _sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await f.forward_hermes_store_to_session(
+            base_url="http://x",
+            headers={},
+            session_id="conv_idle",
+            bridge_dir=bridge_dir,
+            agent_name="hermes-native-ui",
+            workspace=workspace,
+            launch_epoch_s=1000.0,
+            db_path=db,
+        )
+
+    assert ("status", "idle") in events
+    assert ("item", 4) in events  # the final answer row was mirrored
+    # The invariant under test: content first, completion signal second.
+    assert events.index(("item", 4)) < events.index(("status", "idle"))
+    assert events.count(("status", "idle")) == 1
+    assert hstatus.read_posted_count(bridge_dir) == 1

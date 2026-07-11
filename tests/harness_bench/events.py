@@ -1,19 +1,4 @@
-"""Structured progress events for a bench run.
-
-The bench emits a small stream of typed events as it works — one harness
-starts, a probe starts, a probe finishes with a verdict, a harness finishes.
-A *sink* (``ProgressSink``) consumes them. This is the seam that lets the CLI
-render progress in more than one way without the orchestrator knowing how:
-
-- :class:`LineSink` prints the plain ``[harness] Probe: VERDICT`` lines to a
-  writer (the default; what CI / a piped run wants).
-- a rich live-table sink (see :mod:`tests.harness_bench.richreport`) draws one
-  row per harness with per-dimension cells that fill in as events arrive.
-
-Events carry structured fields (harness id, probe name/title, verdict, note),
-not pre-rendered strings, so a sink can lay them out however it likes and a
-parallel run can interleave multiple harnesses' events cleanly.
-"""
+"""Structured progress events and sinks for bench runs."""
 
 from __future__ import annotations
 

@@ -35,14 +35,9 @@ from tests.harness_bench.verdict import Applicability, Priority, ProbeResult, Ve
 
 _logger = logging.getLogger(__name__)
 
-# Back-compat: a plain per-line progress callback. The orchestrator now emits
-# structured events to a ProgressSink; callers that still pass a line callback
-# get it adapted to a LineSink. ``None`` stays silent (the pytest layer).
+# Backward-compatible line callback; new callers should use ProgressSink.
 Progress = Callable[[str], None]
 
-# The prerequisite probe: if it does not pass, the harness cannot be exercised
-# at all, so the remaining probes are skipped rather than run against a dead
-# turn (which would otherwise emit misleading UNSUPPORTED/DRIFT noise).
 _PREREQ_PROBE = "basic_turn"
 
 
@@ -210,8 +205,6 @@ async def run_harness(
     sink = _as_sink(progress)
 
     if not live:
-        # Offline: still resolve the transport a live run *would* pick, so the
-        # declared matrix labels each row with its effective transport.
         resolved = resolve_transport_name(profile, override=transport, fast=fast)
         return _uniform_report(
             profile, probes, ProbeResult.skipped("offline (declared shown)"), transport=resolved
@@ -230,13 +223,8 @@ async def run_harness(
             transport=resolved_transport,
         )
 
-    # databricks_profile may be None here — the driver derives creds like
-    # `omni run` (config profile / ambient OPENAI_*); the unavailable() check
-    # above already confirmed creds are resolvable.
     _emit(sink, HarnessStarted(profile.harness, driver_cls.transport, profile.model))
     cells: list[CellResult] = []
-    # Only the full-server driver accepts a shared server; pass it through when
-    # this harness resolved to that transport, else construct plainly.
     if shared_full_server is not None and driver_cls.transport == "full-server":
         driver_cm = driver_cls(
             profile, databricks_profile=databricks_profile, shared=shared_full_server
@@ -246,20 +234,7 @@ async def run_harness(
     try:
         entered = await driver_cm.__aenter__()
     except Exception as exc:
-        # Provisioning failed (e.g. an own-auth native whose vendor CLI is
-        # installed but not logged in, so its terminal never wires up). Report
-        # a capability-neutral skip for this harness rather than aborting the
-        # whole run — a multi-harness run must survive one unrunnable harness.
-        #
-        # __aenter__ may have already spawned the server + daemon and opened a
-        # client before raising, so tear those down here or they leak for the
-        # rest of the run (_teardown null-checks each, so a half-provisioned
-        # driver is safe to tear down).
-        #
-        # An expected ProvisioningError (a known-unrunnable environment) logs
-        # only its reason — the matrix already shows the skip. Any *other*
-        # exception is a possible driver bug (e.g. an AssertionError), so keep
-        # its full traceback rather than letting it vanish behind a green skip.
+        # Provisioning failures skip one harness without aborting a matrix run.
         if isinstance(exc, ProvisioningError):
             _logger.info("skipping %s: %s", profile.harness, exc)
         else:
@@ -298,8 +273,6 @@ async def run_harness(
             )
             cell = _cell(probe, profile, observed)
             cells.append(cell)
-            # If the prerequisite turn did not pass, short-circuit the rest:
-            # they would only re-hit the same failure and pollute the matrix.
             if probe.name == _PREREQ_PROBE and cell.observed is not Verdict.SUPPORTED:
                 prereq_skip = f"prerequisite '{probe.title}' did not pass ({observed.note})"
     finally:
@@ -373,8 +346,6 @@ async def run_bench(
                     shared_full_server=shared,
                 )
 
-        # gather preserves input order, so the matrix stays in *profiles* order
-        # even though harnesses finish out of order.
         reports = await asyncio.gather(*(_one(p) for p in profiles))
         return BenchMatrix(reports=list(reports))
 
@@ -403,9 +374,6 @@ async def _maybe_shared_full_server(
             for p in profiles
             if resolve_driver_class(p, override=transport, fast=fast).transport == "full-server"
         ]
-        # Only stand one up when creds are actually resolvable (a --profile, a
-        # configured ~/.omnigent profile, or ambient OPENAI_*); otherwise let
-        # each harness's unavailable() report the clean no-creds skip.
         if len(full) > 1 and bench_creds_skip_reason(databricks_profile) is None:
             shared = SharedFullServer(resolve_bench_env(databricks_profile))
             await asyncio.to_thread(shared.__enter__)

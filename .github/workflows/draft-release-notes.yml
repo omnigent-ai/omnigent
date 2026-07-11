@@ -409,13 +409,38 @@ jobs:
           RELEASE_ID: ${{ steps.release.outputs.release_id }}
         run: |
           set -euo pipefail
+          # Always end the notes with the community thanks. The AI drafter curates
+          # freely (and can drop a hand-added line), so this is appended here rather
+          # than via the prompt — every release, AI-drafted or mechanical fallback,
+          # gets it. Idempotent, and placed just before the trailing "Full Changelog:"
+          # link to match the layout of prior releases.
+          python3 - <<'PYEOF'
+          import pathlib
+          NOTE = (
+              "### 💜 Thanks to our community\n\n"
+              "This release was shaped by the people who filed issues, opened PRs, and "
+              "talked through feature requests with us on our Discord! Thank you for "
+              "building omnigent with us, keep the bug reports, ideas and contributions "
+              "coming :)"
+          )
+          path = pathlib.Path("/tmp/release_notes.md")
+          text = path.read_text(encoding="utf-8").rstrip("\n")
+          if "Thanks to our community" not in text:
+              idx = text.find("\nFull Changelog:")
+              if idx != -1:
+                  head, tail = text[:idx].rstrip("\n"), text[idx:].lstrip("\n")
+                  text = f"{head}\n\n{NOTE}\n\n{tail}"
+              else:
+                  text = f"{text}\n\n{NOTE}"
+              path.write_text(text + "\n", encoding="utf-8")
+          PYEOF
           # github-release.yml seeds only a short placeholder body (no
           # auto-generated notes), so replace it wholesale with the curated notes.
           # Edit by release ID: a draft release can't be addressed by tag (the
           # get/edit-by-tag REST endpoint 404s until the release is published).
           gh api --method PATCH "repos/${SOURCE_REPO}/releases/${RELEASE_ID}" \
             --field body=@/tmp/release_notes.md > /dev/null
-          echo "Enriched the ${TAG} release draft with curated notes." \
+          echo "Enriched the ${TAG} release draft with curated notes + community note." \
             | tee -a "$GITHUB_STEP_SUMMARY"
 
       # ::add-mask:: redacts rendered logs, not artifact files — scrub the key

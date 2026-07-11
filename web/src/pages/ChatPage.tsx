@@ -1176,6 +1176,10 @@ interface SessionLayoutProps {
  * Inside a conversation: wraps the chat surface. The terminals panel
  * and right rail are managed by AppShell and rendered outside this
  * component as flex siblings.
+ *
+ * The embedded browser pane is NOT here — it lives as the "Browser"
+ * tab inside the right Workspace rail (WorkspacePanel), so it never floats as a
+ * mid-page column.
  */
 function SessionLayout({ mainAgent }: SessionLayoutProps) {
   return (
@@ -1428,6 +1432,11 @@ function MainAgentSurface({
   // the not-yet-host-bound session as stranded.
   const sandboxStatus = useChatStore((s) => s.sandboxStatus);
   const sandboxLaunching = sandboxStatus !== null && sandboxStatus.stage !== "failed";
+  // True while the harness reports MCP-server startup state (codex-native).
+  // Forces the message-flow branch below even with zero bubbles, so a user
+  // staring at a fresh session during a slow MCP boot sees the startup band
+  // instead of a bare "What should we work on?" empty state.
+  const mcpStartupActive = useChatStore((s) => s.mcpStartup !== null);
   // Render the inline terminal whenever the user has opted in via the
   // connection pill. The terminal surface owns its no-terminal state,
   // including stopped/resumable sessions, and the connection indicator
@@ -1642,7 +1651,7 @@ function MainAgentSurface({
               hasMoreHistory={hasMoreHistory}
               loadingMoreHistory={loadingMoreHistory}
             />
-            {bubbles.length === 0 && !showWorkingIndicator ? (
+            {bubbles.length === 0 && !showWorkingIndicator && !mcpStartupActive ? (
               // Cold launch: a centered spinner instead of the "ready to
               // type" empty state (the create-then-send path uses the
               // "row" variant). Two launch shapes land here: a
@@ -1707,6 +1716,12 @@ function MainAgentSurface({
                     Self-gates to null off the spin-up window; rendered only
                     when not already showing Working… so the two never stack. */}
                 {!showWorkingIndicator && <RunnerStartingIndicator variant="row" />}
+                {/* MCP-server startup band (codex-native): renders while the
+                    harness boots its MCP servers and, after startup settles,
+                    when servers failed or were cancelled. Independent of the
+                    Working… shimmer — it is strictly more specific about why
+                    the turn hasn't produced output yet. */}
+                <McpStartupIndicator />
               </>
             )}
           </ConversationContent>
@@ -2640,6 +2655,92 @@ export function RunnerStartingIndicator({ variant }: { variant: "hero" | "row" }
         <span className="flex items-center gap-2 text-muted-foreground text-sm">
           <Loader2Icon className="size-4 shrink-0 animate-spin" aria-hidden />
           {line}
+        </span>
+      </MessageContent>
+    </Message>
+  );
+}
+
+// How many still-starting server names the startup band spells out
+// before collapsing the rest into "…" — mirrors the Codex TUI's own
+// startup header, and keeps a 20-server config to one line.
+const MCP_STARTING_NAMES_SHOWN = 3;
+// Cap for the settled warning's failed/cancelled name lists. Longer
+// than the starting cap because these name servers the user may need
+// to fix; beyond this the count carries the signal.
+const MCP_SETTLED_NAMES_SHOWN = 8;
+
+/**
+ * The startup band's in-flight line, mirroring the Codex TUI's header.
+ *
+ * @param starting Still-starting server names, sorted.
+ * @param total Total servers in the round.
+ * @returns e.g. `"Starting MCP servers (1/20): glean, jira, safe, …"`.
+ */
+export function mcpStartingLine(starting: string[], total: number): string {
+  if (total === 1 && starting.length === 1) {
+    return `Starting MCP server: ${starting[0]}…`;
+  }
+  const shown = starting.slice(0, MCP_STARTING_NAMES_SHOWN);
+  if (starting.length > MCP_STARTING_NAMES_SHOWN) shown.push("…");
+  return `Starting MCP servers (${total - starting.length}/${total}): ${shown.join(", ")}`;
+}
+
+/**
+ * A settled warning's name list, capped so the band stays scannable.
+ *
+ * @param names Failed or cancelled server names, sorted.
+ * @returns e.g. `"a, b, c, d, e, f, g, h, +12 more"`.
+ */
+export function mcpSettledNames(names: string[]): string {
+  if (names.length <= MCP_SETTLED_NAMES_SHOWN) return names.join(", ");
+  const shown = names.slice(0, MCP_SETTLED_NAMES_SHOWN);
+  return `${shown.join(", ")}, +${names.length - MCP_SETTLED_NAMES_SHOWN} more`;
+}
+
+/**
+ * Per-MCP-server startup band for native harness sessions (codex-native).
+ * Codex defers a mid-startup turn's execution until its MCP servers
+ * settle, and the session previously showed nothing during that window.
+ * Renders a spinner naming the still-starting servers; once startup
+ * settles with failures/cancellations, a one-line notice says which
+ * servers never came up. Self-gates to null when the store carries no
+ * startup state (an all-ready map is cleared by the store handler).
+ */
+export function McpStartupIndicator() {
+  const mcpStartup = useChatStore((s) => s.mcpStartup);
+  if (mcpStartup === null) return null;
+  const names = Object.keys(mcpStartup).sort();
+  const starting = names.filter((name) => mcpStartup[name].status === "starting");
+  if (starting.length > 0) {
+    return (
+      <Message
+        from="assistant"
+        data-testid="mcp-startup-indicator"
+        role="status"
+        aria-live="polite"
+      >
+        <MessageContent>
+          <span className="flex items-center gap-2 text-muted-foreground text-sm">
+            <Loader2Icon className="size-4 shrink-0 animate-spin" aria-hidden />
+            {mcpStartingLine(starting, names.length)}
+          </span>
+        </MessageContent>
+      </Message>
+    );
+  }
+  const failed = names.filter((name) => mcpStartup[name].status === "failed");
+  const cancelled = names.filter((name) => mcpStartup[name].status === "cancelled");
+  if (failed.length === 0 && cancelled.length === 0) return null;
+  const parts: string[] = [];
+  if (failed.length > 0) parts.push(`failed: ${mcpSettledNames(failed)}`);
+  if (cancelled.length > 0) parts.push(`cancelled: ${mcpSettledNames(cancelled)}`);
+  return (
+    <Message from="assistant" data-testid="mcp-startup-indicator" role="status">
+      <MessageContent>
+        <span className="flex items-center gap-2 text-muted-foreground text-sm">
+          <AlertTriangleIcon className="size-4 shrink-0" aria-hidden />
+          {`MCP startup incomplete (${parts.join("; ")})`}
         </span>
       </MessageContent>
     </Message>
@@ -5238,7 +5339,7 @@ function AgentPicker({
   const pickerSelectedModel =
     modelPickerKind === "cursor" || modelPickerKind === "kiro" || modelPickerKind === "opencode"
       ? sessionModelOverride
-      : selectedModel;
+      : (sessionModelOverride ?? selectedModel);
   // SDK/bundle agents (no native picker) never have the cross-session sticky
   // applied to them, so their live model is the session's own — the applied
   // override or the bound default — never `selectedModel` (a pick carried over
@@ -5246,7 +5347,9 @@ function AgentPicker({
   // on a Claude-SDK agent like Polly). claude-/codex-native keep `selectedModel`:
   // there the sticky IS the applied model.
   const nonNativeModel =
-    modelPickerKind === null ? (sessionModelOverride ?? llmModel) : (selectedModel ?? llmModel);
+    modelPickerKind === null
+      ? (sessionModelOverride ?? llmModel)
+      : (sessionModelOverride ?? selectedModel ?? llmModel);
   const effectiveModel = nativeVendorOwnsModel
     ? modelPickerKind === "cursor" || modelPickerKind === "kiro"
       ? // cursor mirrors its live TUI model into ``model_override``; kiro sets it
