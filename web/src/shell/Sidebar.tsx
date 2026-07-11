@@ -335,6 +335,17 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
     [conversationsQuery.data],
   );
   const pendingApprovals = useMemo(() => sumPendingApprovals(loadedRows), [loadedRows]);
+  // The project the active session is filed under, so "New session" defaults to
+  // creating the next session in the same project. Empty when the active
+  // session is unfiled, on a non-chat route, or not among the loaded rows
+  // (e.g. a sub-agent, which the list omits) — then New session stays unfiled.
+  const { conversationId: activeConversationId } = useParams<{ conversationId: string }>();
+  const activeProject = useMemo(() => {
+    if (!activeConversationId) return "";
+    const active = loadedRows.find((c) => c.id === activeConversationId);
+    return active?.labels?.[PROJECT_LABEL_KEY] ?? "";
+  }, [activeConversationId, loadedRows]);
+  const newSessionTo = activeProject ? `/?project=${encodeURIComponent(activeProject)}` : "/";
   // Plus unseen file comments — the badge counts everything the Inbox
   // page lists. Comment queries are shared with the page/FileViewer
   // (same ["comments", id] keys), so this adds no duplicate fetches.
@@ -542,9 +553,10 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
             >
               {/* New session always creates a session the viewer owns, which
               lands under "My sessions" — so snap the tab back there on click
-              (the button stays visible on both tabs). */}
+              (the button stays visible on both tabs). Carries the active
+              session's project so the next session is filed alongside it. */}
               <Link
-                to="/"
+                to={newSessionTo}
                 onClick={(e) => {
                   setActiveTab("mine");
                   onNavClick(e);

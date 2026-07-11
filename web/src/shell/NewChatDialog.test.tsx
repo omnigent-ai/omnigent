@@ -1446,13 +1446,15 @@ describe("NewChatLandingScreen", () => {
     await waitFor(() => expect(screen.queryByTestId("new-chat-landing-error")).toBeNull());
   });
 
-  it("hides the project chip in the normal new-session flow (no project pre-selected)", async () => {
-    // Without a `?project=` param the session is unfiled, so the chip is
-    // hidden entirely — the fresh new-session flow stays project-free.
+  it("shows the project chip as 'No project' in the normal new-session flow", async () => {
+    // Without a `?project=` param the session is unfiled, but the chip is still
+    // visible (defaulting to "No project") so the target project can be seen
+    // and set before creating.
     renderLanding();
 
     await screen.findByTestId("new-chat-landing-input");
-    expect(screen.queryByTestId("new-chat-landing-project-chip")).toBeNull();
+    const chip = screen.getByTestId("new-chat-landing-project-chip");
+    expect(chip.textContent).toContain("No project");
   });
 
   it("files a pre-filled project chip's selection, and invalidates project sessions", async () => {
@@ -1497,10 +1499,10 @@ describe("NewChatLandingScreen", () => {
     invalidateSpy.mockRestore();
   });
 
-  it("hides the chip again when a pre-filled project is cleared to 'No project'", async () => {
-    // When shown, the picker still lets the user clear the selection; doing so
-    // empties `selectedProject` and the chip disappears (consistent with the
-    // "only show when selected" rule).
+  it("resets a pre-filled project chip to 'No project' when cleared", async () => {
+    // The picker lets the user clear the selection; doing so empties
+    // `selectedProject` and the chip falls back to the "No project" label
+    // (the chip stays visible so the choice can be changed again).
     renderLanding({}, "/?project=docs");
 
     await waitFor(() =>
@@ -1510,7 +1512,11 @@ describe("NewChatLandingScreen", () => {
     fireEvent.click(screen.getByTestId("new-chat-landing-project-chip"));
     fireEvent.click(screen.getByText("No project"));
 
-    await waitFor(() => expect(screen.queryByTestId("new-chat-landing-project-chip")).toBeNull());
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-project-chip").textContent).toContain(
+        "No project",
+      ),
+    );
   });
 
   it("pre-fills the project chip from the ?project= query param", async () => {

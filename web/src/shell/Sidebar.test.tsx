@@ -423,6 +423,48 @@ describe("Sidebar tabs", () => {
     expect(screen.queryByText("conv_shared")).toBeNull();
   });
 
+  it("carries the active session's project into New session so the next lands there too", () => {
+    // Viewing a session filed under "Alpha": New session should pre-file the
+    // next one under Alpha (no manual move afterward).
+    projectsMock.push("Alpha");
+    mockConversations([conv("conv_filed", "Claude Code", { labels: { omni_project: "Alpha" } })]);
+    render(
+      <QueryClientProvider
+        client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}
+      >
+        <TooltipProvider>
+          <MemoryRouter initialEntries={["/c/conv_filed"]}>
+            <Routes>
+              <Route path="/c/:conversationId" element={<Sidebar open onClose={vi.fn()} />} />
+            </Routes>
+          </MemoryRouter>
+        </TooltipProvider>
+      </QueryClientProvider>,
+    );
+    expect(screen.getByTestId("new-chat-button").closest("a")).toHaveAttribute(
+      "href",
+      "/?project=Alpha",
+    );
+  });
+
+  it("keeps New session unfiled when the active session has no project", () => {
+    mockConversations([conv("conv_unfiled", "Claude Code")]);
+    render(
+      <QueryClientProvider
+        client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}
+      >
+        <TooltipProvider>
+          <MemoryRouter initialEntries={["/c/conv_unfiled"]}>
+            <Routes>
+              <Route path="/c/:conversationId" element={<Sidebar open onClose={vi.fn()} />} />
+            </Routes>
+          </MemoryRouter>
+        </TooltipProvider>
+      </QueryClientProvider>,
+    );
+    expect(screen.getByTestId("new-chat-button").closest("a")).toHaveAttribute("href", "/");
+  });
+
   it("hides the tabs on a single-user (local) server and shows only owned sessions", () => {
     // A loopback-only server can't share sessions with anyone, so the tab
     // split is meaningless — collapse to the plain owned-session list.
