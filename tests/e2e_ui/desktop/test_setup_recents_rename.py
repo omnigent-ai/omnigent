@@ -115,6 +115,37 @@ def test_rename_escape_cancels_without_saving(page: Page) -> None:
     )
 
 
+def test_switching_rows_mid_edit_moves_edit_on_first_click(page: Page) -> None:
+    """Clicking another row's pencil mid-edit switches editors on the first click.
+
+    The open field cancels on blur; without preempting that blur, clicking a
+    different row's pencil tears the pencil down before its click lands, so the
+    first click is swallowed and edit mode never moves. This asserts the switch
+    happens on a single click and discards the in-progress (unsaved) edit.
+    """
+    _open_setup_page(page)
+
+    # Start editing the labelled entry (row 1) and type an unsaved value.
+    page.locator(".recent-row").nth(0).locator(".recent-rename").click()
+    field = page.locator(".recent-edit input")
+    expect(field).to_be_focused()
+    field.fill("Unsaved edit")
+
+    # One click on row 2's pencil must move edit mode there.
+    page.locator(".recent-row").nth(1).locator(".recent-rename").click()
+
+    # Exactly one editor, on row 2, seeded from its stored (blank) label — the
+    # unsaved row-1 text did not leak across, and nothing was persisted.
+    expect(page.locator(".recent-edit")).to_have_count(1)
+    moved = page.locator(".recent-row").nth(1).locator(".recent-edit input")
+    expect(moved).to_be_focused()
+    expect(moved).to_have_value("")
+    assert page.evaluate("() => window.__labelCalls") == []
+
+    # Row 1 reverted to its unchanged nickname.
+    expect(page.locator(".recent-row").nth(0).locator(".rb-label")).to_have_text("Prod (west)")
+
+
 def test_blank_value_clears_the_nickname(page: Page) -> None:
     """Saving a blank value clears the nickname, reverting to the bare URL."""
     _open_setup_page(page)

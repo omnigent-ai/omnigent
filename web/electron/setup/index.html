@@ -571,6 +571,9 @@
         btn.title = "Rename this server";
         btn.setAttribute("aria-label", `Rename ${entry.label || hostOf(entry.url)}`);
         btn.appendChild(renameIcon.content.cloneNode(true));
+        // Keep focus on any open editor so its blur→cancel doesn't tear this
+        // pencil down before the click lands and swallow a row switch.
+        btn.addEventListener("mousedown", (e) => e.preventDefault());
         btn.addEventListener("click", () => {
           editingUrl = entry.url;
           renderRecents();
@@ -597,7 +600,8 @@
         function cancel() {
           if (settled) return;
           settled = true;
-          editingUrl = null;
+          // Don't clobber a switch to another row: only exit if still ours.
+          if (editingUrl === entry.url) editingUrl = null;
           renderRecents();
         }
         async function save() {
