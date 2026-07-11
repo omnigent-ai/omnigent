@@ -54,6 +54,12 @@ vi.mock("@/lib/identity", async (importOriginal) => ({
   getCurrentUserId: () => viewerData.current,
 }));
 vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));
+// Session snapshot, controllable per test. Feeds the working-directory row;
+// default null workspace keeps the row hidden so unrelated cases are untouched.
+const sessionData = { current: { workspace: null as string | null } };
+vi.mock("@/hooks/useSession", () => ({
+  useSession: () => ({ session: sessionData.current, isLoading: false, error: null }),
+}));
 // The codex-only "Restart with model…" dialog mounts (closed) inside
 // AgentInfoContent for codex sessions; stub its routing + fork deps so it
 // renders without a Router/network in jsdom.
@@ -87,6 +93,7 @@ afterEach(() => {
   ownerData.current = null;
   viewerData.current = null;
   grantsData.current = undefined;
+  sessionData.current = { workspace: null };
 });
 
 function renderButton(agent: Agent | undefined) {
@@ -273,6 +280,35 @@ describe("AgentInfoButton session id row", () => {
     expect(copyTextMock).toHaveBeenCalledTimes(1);
     expect(copyTextMock).toHaveBeenCalledWith("conv_info123");
     expect(await screen.findByRole("button", { name: "Copied session ID" })).toBeInTheDocument();
+  });
+});
+
+describe("AgentInfoButton working directory row", () => {
+  it("shows and copies the session's working directory in the popover", async () => {
+    sessionData.current = { workspace: "/Users/me/projects/app" };
+    renderButtonWithSession(AGENT_WITH_BOTH, "conv_ws");
+
+    fireEvent.click(screen.getByTestId("agent-info-trigger"));
+
+    expect(screen.getByTestId("agent-info-workspace")).toHaveTextContent("/Users/me/projects/app");
+    fireEvent.click(screen.getByTestId("agent-info-copy-workspace"));
+
+    expect(copyTextMock).toHaveBeenCalledTimes(1);
+    expect(copyTextMock).toHaveBeenCalledWith("/Users/me/projects/app");
+    expect(
+      await screen.findByRole("button", { name: "Copied working directory" }),
+    ).toBeInTheDocument();
+  });
+
+  it("omits the working directory row when the session has no workspace", () => {
+    sessionData.current = { workspace: null };
+    renderButtonWithSession(AGENT_WITH_BOTH, "conv_ws_none");
+
+    fireEvent.click(screen.getByTestId("agent-info-trigger"));
+
+    // Popover still opens (agent name proves it) — just no working-dir row.
+    expect(screen.getByText("Databricks_coding_agent")).toBeInTheDocument();
+    expect(screen.queryByTestId("agent-info-workspace")).toBeNull();
   });
 });
 
