@@ -481,6 +481,10 @@ class CursorExecutor(Executor):
         :param bundle_dir: Reserved for future skill wiring; unused in v1.
         :param agent_name: Optional agent name passed to the SDK.
         :param skills_filter: Accepted for parity; cursor has no skill mechanism here.
+        :param permission_mode: When ``"bypassPermissions"``, Stage-2
+            elicitation (web-UI approval card) is skipped for native Cursor
+            tool calls, while the Stage-1 policy DENY guardrail is preserved.
+            ``None`` or any unrecognised value keeps the default elicitation.
         """
         self._cwd = cwd or (os_env.cwd if os_env is not None else None)
         self._os_env_spec = os_env
@@ -573,8 +577,18 @@ class CursorExecutor(Executor):
         # user can decide whether the rest of the turn should continue.
         # If permission_mode is "bypassPermissions", skip elicitation and
         # auto-approve while preserving the Stage-1 policy DENY guardrail.
-        if self._permission_mode == "bypassPermissions":
-            return {"block": False, "reason": ""}
+        if self._permission_mode is not None:
+            if self._permission_mode == "bypassPermissions":
+                logger.info(
+                    "cursor permission_mode = bypassPermissions — "
+                    "auto-approving native tool %s", name
+                )
+                return {"block": False, "reason": ""}
+            logger.warning(
+                "cursor permission_mode has unrecognised value %r; "
+                "falling back to elicitation",
+                self._permission_mode,
+            )
         handler = self._elicitation_handler
         if handler is not None:
             logger.info("surfacing elicitation for native cursor tool %s", name)
