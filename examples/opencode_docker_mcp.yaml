@@ -1,0 +1,59 @@
+name: opencode-docker-mcp
+description: >-
+  OpenCode native-TUI agent wired to a Docker MCP toolkit server that exposes
+  GitHub tools. Designed for the sbx shared-server deployment: the harness
+  runs inside the sbx sandbox, so the MCP server is reached via
+  host.docker.internal (the host from the sandbox's perspective).
+
+# OpenCode runs as a native-TUI harness: Omnigent boots ``opencode serve`` in
+# the sandbox and mirrors it back, so the full OpenCode TUI — including
+# ``/model`` and the model picker — is available. A model switch made in the
+# TUI is mirrored back to Omnigent and persisted as the session's
+# model_override, so it survives reload.
+executor:
+  harness: opencode-native
+  # Optional default model; override per-invocation via ``-m`` or ``/model``
+  # in the TUI. Omit to let OpenCode's own default / picker decide.
+  # model: anthropic/claude-sonnet-4-5
+
+prompt: |
+  You are OpenCode running inside Omnigent with a Docker MCP toolkit server
+  that exposes GitHub tools. Help the user with software engineering tasks —
+  read files, edit code, run tests, and use the GitHub MCP tools for issues,
+  pull requests, and repository work. Keep responses concise.
+
+# The Docker MCP toolkit server. Omnigent translates this into the synthesized
+# opencode.json ``mcp`` block (alongside the forced ``omnigent`` builtin-tool
+# relay) on every spawn, so the server is visible to OpenCode even though
+# Omnigent owns the per-session config.
+#
+# host.docker.internal: the harness runs inside the sbx sandbox, where
+# ``localhost`` is the sandbox itself — NOT the host. host.docker.internal is
+# the host machine's loopback as seen from the sandbox. (If your MCP server
+# runs inside the sandbox instead, use ``localhost``.)
+#
+# ${MCP_GATEWAY_AUTH_TOKEN}: expanded by the runner against its own environment
+# (the sandbox's ``omnigent host`` process). This ONLY happens for template
+# agents registered via ``omnigent server --agent`` (session_id NULL); a
+# per-session web-UI upload would leave ${...} unexpanded.
+tools:
+  docker-mcp:
+    type: mcp
+    url: http://host.docker.internal:9011
+    headers:
+      Authorization: "Bearer ${MCP_GATEWAY_AUTH_TOKEN}"
+
+# ── Deployment (sbx shared server) ──────────────────────────────────────────
+#
+# 1. Token: ensure MCP_GATEWAY_AUTH_TOKEN is set in the host environment (or
+#    the repo-root .env that sbx-up.sh sources). sbx-up.sh already forwards it
+#    into the sandbox env via OMNIGENT_SBX_SANDBOX_ENV.
+#
+# 2. Egress: allow the sandbox to reach the MCP server:
+#       sbx policy allow network "host.docker.internal:9011"
+#
+# 3. Register as a template agent (so ${...} expands on the runner):
+#       omnigent server --agent examples/opencode_docker_mcp.yaml
+#    Or set OMNIGENT_BUILTIN_AGENT_DIRS and restart the server.
+#
+# 4. Start a session from the web UI; pick "opencode-docker-mcp".
