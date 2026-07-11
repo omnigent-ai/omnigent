@@ -468,22 +468,36 @@ def _build_policy_llm_client(
         return None
     from omnigent.llms.client import Client
 
-    # Models prefixed with ``databricks-`` (e.g.
-    # ``databricks-claude-sonnet-4-6``) need the ``databricks/``
-    # provider prefix so the LLM adapter routes through
-    # DatabricksAdapter (Chat Completions) rather than
-    # OpenAIAdapter (Responses API). Without this, the request
-    # hits ``/responses`` on the Databricks gateway → 400.
-    model = server_llm.model
-    if "/" not in model and model.startswith("databricks-"):
-        model = f"databricks/{model}"
-
     return PolicyLLMClient(
         _client=Client(),
-        _model=model,
+        _model=_normalize_policy_model(server_llm.model),
         _connection=connection,
         _request_timeout=server_llm.request_timeout,
+        _fallback_models=[_normalize_policy_model(m) for m in server_llm.fallback_models],
     )
+
+
+def _normalize_policy_model(model: str) -> str:
+    """
+    Apply the ``databricks-`` → ``databricks/`` provider-prefix fixup.
+
+    Models prefixed with ``databricks-`` (e.g.
+    ``databricks-claude-sonnet-4-6``) need the ``databricks/``
+    provider prefix so the LLM adapter routes through
+    ``DatabricksAdapter`` (Chat Completions) rather than
+    ``OpenAIAdapter`` (Responses API). Without this, the request
+    hits ``/responses`` on the Databricks gateway → 400. Applied
+    uniformly to the primary model and every fallback so the
+    fallback path routes the same way as the primary.
+
+    :param model: A model id from the server ``llm:`` config,
+        possibly a bare ``databricks-`` name.
+    :returns: The model id with the ``databricks/`` prefix applied
+        when needed; otherwise unchanged.
+    """
+    if "/" not in model and model.startswith("databricks-"):
+        return f"databricks/{model}"
+    return model
 
 
 def _resolve_databricks_connection(profile: str) -> dict[str, str]:

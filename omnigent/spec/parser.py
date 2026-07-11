@@ -348,7 +348,18 @@ def _parse_llm(
         else 300
     )
     retry = _parse_retry(raw.get("retry"))
-    reserved = {"model", "connection", "profile", "request_timeout", "retry"}
+    fallback_models_raw = raw.get("fallback_models")
+    fallback_models = (
+        [str(m) for m in fallback_models_raw] if isinstance(fallback_models_raw, list) else []
+    )
+    reserved = {
+        "model",
+        "connection",
+        "profile",
+        "request_timeout",
+        "retry",
+        "fallback_models",
+    }
     extra = {k: v for k, v in raw.items() if k not in reserved}
     return LLMConfig(
         model=str(model),
@@ -357,6 +368,7 @@ def _parse_llm(
         profile=profile,
         request_timeout=request_timeout,
         retry=retry,
+        fallback_models=fallback_models,
     )
 
 

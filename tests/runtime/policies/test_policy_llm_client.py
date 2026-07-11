@@ -174,6 +174,40 @@ def test_parse_server_llm_parses_valid_block() -> None:
     assert result.request_timeout == 45
 
 
+def test_parse_server_llm_parses_fallback_models() -> None:
+    """
+    ``parse_server_llm`` parses a ``fallback_models:`` list into
+    ``LLMConfig.fallback_models`` and keeps it out of ``extra``.
+
+    What breaks if this fails: the fallback list is dropped or
+    leaks into SDK kwargs, so hosted never picks up fallback.
+    """
+    raw = {
+        "model": "databricks-claude-sonnet-4",
+        "fallback_models": ["databricks-claude-3-5-haiku", "openai/gpt-4o-mini"],
+    }
+    result = parse_server_llm(raw, expand_env=False)
+    assert result is not None
+    assert result.fallback_models == [
+        "databricks-claude-3-5-haiku",
+        "openai/gpt-4o-mini",
+    ]
+    assert "fallback_models" not in result.extra
+
+
+def test_parse_server_llm_fallback_models_defaults_empty() -> None:
+    """
+    Absent ``fallback_models:`` yields an empty list — the
+    default preserves single-model behaviour.
+
+    What breaks if this fails: configs without the key get a
+    non-empty or ``None`` fallback list, breaking existing specs.
+    """
+    result = parse_server_llm({"model": "openai/gpt-4o-mini"}, expand_env=False)
+    assert result is not None
+    assert result.fallback_models == []
+
+
 # ── PolicyLLMClient ─────────────────────────────────────────────────────────
 
 
@@ -246,6 +280,130 @@ async def test_policy_llm_client_create_allows_overrides() -> None:
     assert call_kwargs["model"] == "openai/gpt-4o"
     assert call_kwargs["connection_params"] == {"api_key": "sk-override"}
     assert call_kwargs["timeout"] == 120
+
+
+@pytest.mark.asyncio
+async def test_policy_llm_client_no_fallback_propagates_error() -> None:
+    """
+    With no fallbacks configured, a primary-model failure
+    propagates unchanged after a single attempt.
+
+    What breaks if this fails: the fallback loop swallows or
+    reshapes the primary error even when no fallback exists,
+    changing today's fail-closed behaviour in ``prompt_policy``.
+    """
+    fake_client = _FakeClient()
+    boom = RuntimeError("primary down")
+    fake_client.responses.create = AsyncMock(side_effect=boom)
+    policy_client = PolicyLLMClient(
+        _client=fake_client,
+        _model="openai/gpt-4o-mini",
+        _connection=None,
+        _request_timeout=60,
+    )
+
+    with pytest.raises(RuntimeError, match="primary down"):
+        await policy_client.create(input=[{"role": "user", "content": "hi"}])
+
+    # Exactly one attempt — the primary model, no retry.
+    assert fake_client.responses.create.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_policy_llm_client_falls_back_on_primary_failure() -> None:
+    """
+    When the primary model fails, ``create()`` advances to the
+    first fallback and returns its response.
+
+    What breaks if this fails: a transient primary-model failure
+    denies the request even though a healthy fallback was
+    configured.
+    """
+    fake_client = _FakeClient()
+    good = "fallback-response"
+    fake_client.responses.create = AsyncMock(side_effect=[RuntimeError("primary down"), good])
+    policy_client = PolicyLLMClient(
+        _client=fake_client,
+        _model="databricks/primary",
+        _connection={"api_key": "k"},
+        _request_timeout=60,
+        _fallback_models=["databricks/backup"],
+    )
+
+    result = await policy_client.create(input=[{"role": "user", "content": "hi"}])
+
+    assert result == good
+    assert fake_client.responses.create.await_count == 2
+    # Primary tried first, backup second — in order.
+    models = [c.kwargs["model"] for c in fake_client.responses.create.await_args_list]
+    assert models == ["databricks/primary", "databricks/backup"]
+    # The shared connection/timeout are reused across candidates.
+    for call in fake_client.responses.create.await_args_list:
+        assert call.kwargs["connection_params"] == {"api_key": "k"}
+        assert call.kwargs["timeout"] == 60
+
+
+@pytest.mark.asyncio
+async def test_policy_llm_client_all_models_fail_raises_last() -> None:
+    """
+    When the primary and every fallback fail, the last error is
+    re-raised after all candidates are exhausted.
+
+    What breaks if this fails: an exhausted fallback chain hides
+    the failure or raises the wrong (stale) error, breaking the
+    fail-closed contract in ``prompt_policy``.
+    """
+    fake_client = _FakeClient()
+    fake_client.responses.create = AsyncMock(
+        side_effect=[
+            RuntimeError("primary"),
+            RuntimeError("backup-1"),
+            RuntimeError("backup-2"),
+        ]
+    )
+    policy_client = PolicyLLMClient(
+        _client=fake_client,
+        _model="m0",
+        _connection=None,
+        _request_timeout=60,
+        _fallback_models=["m1", "m2"],
+    )
+
+    with pytest.raises(RuntimeError, match="backup-2"):
+        await policy_client.create(input=[{"role": "user", "content": "hi"}])
+
+    assert fake_client.responses.create.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_policy_llm_client_explicit_model_override_skips_fallback() -> None:
+    """
+    An explicit ``model=`` override opts out of the fallback
+    chain — only the requested model is tried, and its failure
+    propagates.
+
+    What breaks if this fails: a caller that deliberately targets
+    one model silently gets the fallback chain instead.
+    """
+    fake_client = _FakeClient()
+    fake_client.responses.create = AsyncMock(side_effect=RuntimeError("override down"))
+    policy_client = PolicyLLMClient(
+        _client=fake_client,
+        _model="m0",
+        _connection=None,
+        _request_timeout=60,
+        _fallback_models=["m1", "m2"],
+    )
+
+    with pytest.raises(RuntimeError, match="override down"):
+        await policy_client.create(
+            input=[{"role": "user", "content": "hi"}],
+            model="explicit",
+        )
+
+    # Only the explicit model was tried — fallbacks were skipped.
+    assert fake_client.responses.create.await_count == 1
+    assert fake_client.responses.create.await_args.kwargs["model"] == "explicit"
 
 
 # ── EvaluationContext.llm_client ────────────────────────────────────────────
@@ -413,6 +571,45 @@ def test_build_policy_llm_client_constructs_from_config() -> None:
     assert result._model == "openai/gpt-4o-mini"
     assert result._connection == {"api_key": "test-key", "base_url": "https://example.com"}
     assert result._request_timeout == 60
+
+
+def test_build_policy_llm_client_normalizes_databricks_prefix() -> None:
+    """
+    Bare ``databricks-`` model names get the ``databricks/``
+    provider prefix, on both the primary model and every fallback.
+
+    What breaks if this fails: hosted fallback calls route to
+    ``/responses`` on the Databricks gateway and 400 (the exact
+    bug the primary-model fixup already guards against).
+    """
+    llm_config = LLMConfig(
+        model="databricks-claude-sonnet-4",
+        fallback_models=["databricks-claude-3-5-haiku", "openai/gpt-4o-mini"],
+    )
+    result = _build_policy_llm_client(llm_config, None)
+
+    assert result is not None
+    assert result._model == "databricks/databricks-claude-sonnet-4"
+    # Fallbacks get the same fixup; already-prefixed ids pass through.
+    assert result._fallback_models == [
+        "databricks/databricks-claude-3-5-haiku",
+        "openai/gpt-4o-mini",
+    ]
+
+
+def test_build_policy_llm_client_empty_fallbacks_default() -> None:
+    """
+    A config with no ``fallback_models`` yields an empty fallback
+    list — single-model behaviour is preserved.
+
+    What breaks if this fails: the builder injects phantom
+    fallbacks, changing behaviour for every existing hosted
+    deployment that sets only ``model``.
+    """
+    result = _build_policy_llm_client(_make_server_llm(), None)
+
+    assert result is not None
+    assert result._fallback_models == []
 
 
 # ── build_policy_engine wiring ──────────────────────────────────────────────
