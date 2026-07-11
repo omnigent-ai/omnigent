@@ -124,6 +124,10 @@ _TMUX_SEND_TIMEOUT_S = 5.0
 # The glyph persists while Claude is busy responding, so its presence
 # means "input box mounted" (not "idle"), which is what injection needs.
 _CLAUDE_PROMPT_GLYPH = "❯"
+# Matches a selected numbered menu row (``❯ 2. No (recommended)``): the glyph
+# followed by a numbered choice, which the chat input never renders. Used to
+# exclude startup menus from the readiness scan (see ``_is_selected_menu_row``).
+_SELECTED_MENU_ROW_RE = re.compile(rf"{_CLAUDE_PROMPT_GLYPH}\s*\d+\.\s")
 # Box-drawing glyphs Claude Code's input-box frame is made of. A line of
 # these below ``❯`` marks the live input box (see ``_is_box_rule``),
 # distinguishing it from a bare prompt echoed into scrollback.
@@ -1086,6 +1090,9 @@ def build_hook_settings(
     ap_server_url: str | None = None,
     ap_auth_headers: dict[str, str] | None = None,
     api_key_helper: str | None = None,
+    launch_model: str | None = None,
+    launch_permission_mode: str | None = None,
+    launch_effort: str | None = None,
 ) -> dict[str, Any]:
     """
     Build invocation-local Claude Code hook settings.
@@ -1105,6 +1112,15 @@ def build_hook_settings(
     :param api_key_helper: Optional Claude Code ``apiKeyHelper``
         command from ucode state, e.g. ``"databricks auth token
         --host https://example.databricks.com ..."``.
+    :param launch_model: Effective launch model from ``--model``. Mirrored
+        into the invocation-local settings sidecar so a wrapped Claude Code
+        re-exec that preserves ``--settings`` but rebuilds argv cannot fall
+        back to the user's global default model.
+    :param launch_permission_mode: Effective launch permission mode from
+        ``--permission-mode``. Mirrored into ``permissions.defaultMode``
+        for the same re-exec hardening.
+    :param launch_effort: Effective launch effort from ``--effort``.
+        Mirrored into ``effortLevel`` for restart/re-exec parity.
     :returns: JSON-serializable Claude settings fragment.
     """
     python = python_executable or sys.executable
@@ -1290,6 +1306,12 @@ def build_hook_settings(
         # prompts, since both fire UserPromptSubmit.
         hooks["UserPromptSubmit"].append({"hooks": [evaluate_policy_hook]})
     settings: dict[str, Any] = {"hooks": hooks}
+    if launch_model:
+        settings["model"] = launch_model
+    if launch_permission_mode:
+        settings["permissions"] = {"defaultMode": launch_permission_mode}
+    if launch_effort and launch_effort in CLAUDE_EFFORTS:
+        settings["effortLevel"] = launch_effort
     if api_key_helper:
         settings["apiKeyHelper"] = api_key_helper
     # Override Claude Code's statusLine so we receive its stdin (the
@@ -1386,6 +1408,9 @@ def augment_claude_args(
         ap_server_url=ap_server_url,
         ap_auth_headers=ap_auth_headers,
         api_key_helper=api_key_helper,
+        launch_model=_arg_value(claude_args, "--model"),
+        launch_permission_mode=_arg_value(claude_args, "--permission-mode"),
+        launch_effort=_arg_value(claude_args, "--effort"),
     )
     args = _merge_disallowed_tools(list(claude_args), _OMNIGENT_DISALLOWED_TOOLS)
     args.extend(
@@ -1404,6 +1429,32 @@ def augment_claude_args(
         )
     )
     return args
+
+
+def _arg_value(args: tuple[str, ...], flag: str) -> str | None:
+    """Return the effective CLI flag value from ``args``.
+
+    Supports both ``--flag value`` and ``--flag=value`` spellings. When a
+    flag appears more than once, the last valid occurrence wins, matching the
+    usual CLI precedence for repeated long options.
+
+    :param args: Claude CLI args, e.g. ``("--model", "sonnet")``.
+    :param flag: Long flag to read, e.g. ``"--model"``.
+    :returns: The flag value, or ``None`` when absent/empty.
+    """
+    joined_prefix = f"{flag}="
+    value: str | None = None
+    for idx, arg in enumerate(args):
+        if arg.startswith(joined_prefix):
+            candidate = arg[len(joined_prefix) :]
+            if candidate:
+                value = candidate
+            continue
+        if arg == flag and idx + 1 < len(args):
+            candidate = args[idx + 1]
+            if candidate and not candidate.startswith("--"):
+                value = candidate
+    return value
 
 
 def _merge_disallowed_tools(args: list[str], extra: tuple[str, ...]) -> list[str]:
@@ -2882,12 +2933,24 @@ def _claude_prompt_rendered(pane: str) -> bool:
     it's framed by a box rule — the ``────`` closing line the live input
     box always renders below ``❯`` but a bare echoed prompt never has.
 
+    A bare ``❯`` on a selected numbered menu row is not the chat input. A
+    numbered line with an input-box rule below it still counts, however: the
+    readiness gate runs before every injection, so a restored composer draft
+    may legitimately begin with text such as ``2. buy milk``.
+
     :param pane: Captured pane text from :func:`_capture_pane`.
     :returns: ``True`` when the input box appears mounted.
     """
     non_empty = [line for line in pane.splitlines() if line.strip()]
-    if any(_CLAUDE_PROMPT_GLYPH in line for line in non_empty[-_PROMPT_SCAN_TAIL_LINES:]):
-        return True
+    tail_start = max(0, len(non_empty) - _PROMPT_SCAN_TAIL_LINES)
+    for idx in range(tail_start, len(non_empty)):
+        line = non_empty[idx]
+        if _CLAUDE_PROMPT_GLYPH not in line:
+            continue
+        if not _is_selected_menu_row(line) or any(
+            _is_box_rule(rule) for rule in non_empty[idx + 1 :]
+        ):
+            return True
     # Above that window, trust the glyph only when a box rule sits below
     # it — the live input box's closing frame, absent from scrollback.
     # The footer height scales with concurrent subagents (a fan-out of
@@ -2900,6 +2963,23 @@ def _claude_prompt_rendered(pane: str) -> bool:
         if any(_is_box_rule(rule) for rule in non_empty[idx + 1 :]):
             return True
     return False
+
+
+def _is_selected_menu_row(line: str) -> bool:
+    """
+    Return whether a ``❯`` line is a selected numbered menu row.
+
+    Claude Code's startup menus (e.g. the "Detected a custom API key"
+    confirmation) mark the highlighted choice with the same ``❯`` glyph the
+    chat input uses (``❯ 2. No (recommended)``). The readiness scan must not
+    treat such a row as the chat composer, or the first message gets typed
+    into the menu. A chat prompt never renders a numbered choice after the
+    glyph, so the ``<glyph> <digit>.`` shape distinguishes them.
+
+    :param line: A single pane line, e.g. ``"❯ 2. No (recommended)"``.
+    :returns: ``True`` when the line is a selected numbered menu choice.
+    """
+    return bool(_SELECTED_MENU_ROW_RE.match(line.strip()))
 
 
 def _is_box_rule(line: str) -> bool:

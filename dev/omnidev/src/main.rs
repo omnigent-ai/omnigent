@@ -9,6 +9,7 @@
 //!   anywhere.
 
 mod install;
+mod lan;
 mod lock;
 mod logs;
 mod paths;
@@ -55,6 +56,15 @@ struct RunArgs {
     /// Force the Vite dev-server port (default: probe from 5173).
     #[arg(long)]
     vite_port: Option<u16>,
+
+    /// Vite dev-server bind host (default: 127.0.0.1; use 0.0.0.0 for LAN access).
+    #[arg(long, default_value = "127.0.0.1")]
+    vite_host: String,
+
+    /// Trust this machine's LAN origins so a phone/tablet on the same network
+    /// can use the UI (uploads + live stream). Pairs with `--vite-host 0.0.0.0`.
+    #[arg(long)]
+    trust_lan_origins: bool,
 
     /// Use this pod directory instead of the per-repo default.
     #[arg(long)]
@@ -158,7 +168,20 @@ async fn run_supervisor(args: RunArgs) -> Result<()> {
     let _lock = lock::acquire(&pod_dir)?;
 
     let ports = Ports::resolve(&pod_dir, args.server_port, args.vite_port)?;
-    let pod = Arc::new(Pod::create(repo_root, pod_dir, ports)?);
+    // LAN origins are keyed to the resolved Vite port, so compute them here
+    // once the port is known. Empty unless `--trust-lan-origins` is set.
+    let trusted_origins = if args.trust_lan_origins {
+        lan::trusted_lan_origins(ports.vite)
+    } else {
+        Vec::new()
+    };
+    let pod = Arc::new(Pod::create(
+        repo_root,
+        pod_dir,
+        ports,
+        args.vite_host,
+        trusted_origins,
+    )?);
 
     let shared = Shared::new(&pod);
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Cmd>();
@@ -168,7 +191,12 @@ async fn run_supervisor(args: RunArgs) -> Result<()> {
     let _watcher = watcher::spawn(&pod.omnigent_dir(), cmd_tx.clone())?;
 
     // Supervisor runs on the tokio runtime; the TUI drives it via cmd_tx.
-    let supervisor = Supervisor::new(pod.clone(), shared.clone(), !args.no_vite);
+    let supervisor = Supervisor::new(
+        pod.clone(),
+        shared.clone(),
+        !args.no_vite,
+        args.trust_lan_origins,
+    );
     let sup_handle = tokio::spawn(supervisor.run(cmd_rx));
 
     // Run the TUI (owns the terminal) until the user quits.

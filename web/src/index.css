@@ -580,15 +580,13 @@
      view (the in-page pill is suppressed in the iOS shell). Height is the
      shared bottom inset — the native bar footprint (sourced from the shell, see
      nativeInsets.ts) plus the home-indicator safe area — so it can never drift
-     from the bar's real size. Chat sits 1rem tighter: its composer status line
-     already cushions the gap to the bar. */
-  [data-ios-native] .omnigent-native-bottom-spacer {
+     from the bar's real size. Chat reserves the same footprint: its composer
+     status line (host / harness / context ring) is content the bar must clear,
+     not spare cushion, so trimming the reserve here let the bar overlap it. */
+  [data-ios-native] .omnigent-native-bottom-spacer,
+  [data-ios-native] .omnigent-native-bottom-spacer--chat {
     height: var(--omnigent-inset-bottom);
     flex: none;
-  }
-
-  [data-ios-native] .omnigent-native-bottom-spacer--chat {
-    height: calc(var(--omnigent-inset-bottom) - 1rem);
   }
 
   [data-ios-native] .terminal-first-switcher {

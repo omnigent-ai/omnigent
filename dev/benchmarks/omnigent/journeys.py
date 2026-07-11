@@ -13,6 +13,11 @@ v1 journeys are pure HTTP/API (server + DB, no runner, no LLM):
 - ``get_session`` — single-session snapshot load.
 - ``load_conversation_history`` — history read, seeded runner-free via
   ``external_conversation_item`` (see :meth:`BenchEnvironment.seed_items`).
+- ``fork_session`` — fork a session (deep-copy its items), then DELETE.
+- ``add_comment`` — create a review comment on a file (DB write).
+
+``read_runner_file`` needs a runner but no LLM turn: it plants a file in the
+runner environment (setup) and times the server → runner filesystem read proxy.
 
 The framework (``Journey`` + the two runners) is harness-agnostic and reused
 verbatim by phase-2 full-turn journeys.
@@ -64,6 +69,11 @@ class Journey:
     :param needs_runner: Whether this journey drives a full agent turn and so
         requires ``BenchEnvironment(with_runner=True)`` (mock LLM + runner).
         HTTP/DB journeys leave this ``False``.
+    :param max_iterations: Upper bound on latency iterations for this journey,
+        clamping ``--iterations`` down (never up). Full-turn journeys cost ~1s+
+        per op, so 100+ iterations would blow the CI time budget; they cap at a
+        few samples per run and lean on ``--runs`` for repeats. ``None`` (HTTP
+        journeys) means no cap.
     :param description: Human-readable one-liner for ``--list``.
     """
 
@@ -74,6 +84,7 @@ class Journey:
     teardown: Callable[[BenchEnvironment, JourneyContext], Awaitable[None]] | None = None
     concurrency_safe: bool = False
     needs_runner: bool = False
+    max_iterations: int | None = None
     description: str = ""
 
     async def run_setup(self, env: BenchEnvironment) -> JourneyContext:
@@ -249,6 +260,67 @@ async def _measure_load_history(env: BenchEnvironment, ctx: JourneyContext) -> N
     resp.raise_for_status()
 
 
+@dataclass
+class _ForkContext:
+    """Fork-journey context: the session to fork + the forks to clean up.
+
+    ``measure`` records each fork's id here instead of deleting it inline, so
+    the DELETE stays out of the timed span; ``teardown`` removes them after.
+    """
+
+    source_id: str
+    fork_ids: list[str]
+
+
+async def _setup_fork_session(env: BenchEnvironment) -> _ForkContext:
+    """Resolve a session to fork; start an empty fork-id collector."""
+    source_id = await _setup_target_session(env)
+    return _ForkContext(source_id=source_id, fork_ids=[])
+
+
+async def _measure_fork_session(env: BenchEnvironment, ctx: JourneyContext) -> None:
+    assert env.client is not None
+    fork_ctx = cast(_ForkContext, ctx)  # _setup_fork_session
+    forked = await env.client.post(f"/v1/sessions/{fork_ctx.source_id}/fork", json={})
+    forked.raise_for_status()
+    # Record the fork for teardown; deleting it here would fold the DELETE into
+    # the timed span. The fork POST (a deep-copy of the source's items) is the
+    # operation of interest.
+    fork_ctx.fork_ids.append(forked.json()["id"])
+
+
+async def _teardown_fork_session(env: BenchEnvironment, ctx: JourneyContext) -> None:
+    """Delete every fork created during the run (best effort, untimed)."""
+    assert env.client is not None
+    fork_ctx = cast(_ForkContext, ctx)
+    for fork_id in fork_ctx.fork_ids:
+        with contextlib.suppress(httpx.HTTPError):
+            await env.client.delete(f"/v1/sessions/{fork_id}")
+
+
+# Anchor snapshot for the comment journey; the offsets below span it.
+_COMMENT_ANCHOR = "benchmark"
+
+
+async def _measure_add_comment(env: BenchEnvironment, ctx: JourneyContext) -> None:
+    assert env.client is not None
+    session_id = cast(str, ctx)  # _setup_target_session
+    # Each POST creates an independent comment row. Unlike sessions, an
+    # accumulating comment skews no measured read path, so there's no cleanup.
+    # The file need not exist — the handler stores the path + offsets + body.
+    resp = await env.client.post(
+        f"/v1/sessions/{session_id}/comments",
+        json={
+            "path": "bench_target.py",
+            "body": "benchmark review comment",
+            "start_index": 0,
+            "end_index": len(_COMMENT_ANCHOR),
+            "anchor_content": _COMMENT_ANCHOR,
+        },
+    )
+    resp.raise_for_status()
+
+
 # ── runner (full-turn) journeys ──────────────────────────────
 #
 # These drive a real agent turn through the runner + mock LLM (with_runner=True,
@@ -258,6 +330,23 @@ async def _measure_load_history(env: BenchEnvironment, ctx: JourneyContext) -> N
 # A multi-word reply so the streaming path emits several output_text deltas.
 _TURN_REPLY = "Hello there, this is a mock benchmark reply."
 _TURN_PROMPT = "Say hello."
+
+# Iteration cap for full-turn journeys. At ~1s+ per turn, matching the HTTP
+# journeys' iteration count would overrun the CI time budget, so we take a few
+# samples per run and lean on --runs for repeats. Sessions accumulate across a
+# run (a cold start never deletes its session), so a small count also keeps that
+# drift negligible.
+_RUNNER_MAX_ITERATIONS = 5
+
+# Iteration cap for the runner filesystem read. It's a proxied localhost read,
+# not a full turn, so it's far cheaper than the drive-a-turn journeys — a higher
+# cap gives a usable p50/p99 while staying well within the CI time budget.
+_RUNNER_FS_MAX_ITERATIONS = 50
+
+# File planted by the read-runner-file setup and fetched by its measure op.
+# ~1 KB — a modest, representative source file, not a stress case.
+_RUNNER_FILE_PATH = "bench_read_target.txt"
+_RUNNER_FILE_CONTENT = "benchmark file content line\n" * 40
 
 
 async def _setup_turn_agent(env: BenchEnvironment, *, stream: bool = False) -> str:
@@ -327,6 +416,24 @@ async def _measure_interrupt(env: BenchEnvironment, ctx: JourneyContext) -> None
     await env.drive_and_interrupt(session_id)
 
 
+async def _setup_runner_file_session(env: BenchEnvironment) -> str:
+    """Bind a session to the runner and plant a file to read; return its id.
+
+    No turn is driven and no mock reply is configured — the measured op is a
+    filesystem read proxied to the runner, which never calls the LLM.
+    """
+    name = await env.ensure_agent()
+    agent_id = await env.agent_id(name)
+    session_id = await env.create_bound_session(agent_id)
+    await env.write_runner_file(session_id, _RUNNER_FILE_PATH, _RUNNER_FILE_CONTENT)
+    return session_id
+
+
+async def _measure_read_runner_file(env: BenchEnvironment, ctx: JourneyContext) -> None:
+    session_id = cast(str, ctx)  # _setup_runner_file_session
+    await env.read_runner_file(session_id, _RUNNER_FILE_PATH)
+
+
 # ── registry ─────────────────────────────────────────────────
 
 ALL_JOURNEYS: dict[str, Journey] = {
@@ -370,6 +477,23 @@ ALL_JOURNEYS: dict[str, Journey] = {
             concurrency_safe=True,
             description="GET /v1/sessions?search_query= — unindexed LIKE over titles + items.",
         ),
+        Journey(
+            name="fork_session",
+            kind="latency",
+            measure=_measure_fork_session,
+            setup=_setup_fork_session,
+            teardown=_teardown_fork_session,
+            concurrency_safe=True,
+            description="POST /v1/sessions/{id}/fork — session fork (deep-copy); DELETE untimed.",
+        ),
+        Journey(
+            name="add_comment",
+            kind="latency",
+            measure=_measure_add_comment,
+            setup=_setup_target_session,
+            concurrency_safe=True,
+            description="POST /v1/sessions/{id}/comments — create a review comment.",
+        ),
         # Runner (full-turn) journeys — with_runner=True, openai-agents, mock LLM.
         Journey(
             name="session_cold_start",
@@ -377,6 +501,7 @@ ALL_JOURNEYS: dict[str, Journey] = {
             measure=_measure_session_cold_start,
             setup=_setup_turn_agent,
             needs_runner=True,
+            max_iterations=_RUNNER_MAX_ITERATIONS,
             description="Create+bind a fresh session and drive its first turn to idle.",
         ),
         Journey(
@@ -385,6 +510,7 @@ ALL_JOURNEYS: dict[str, Journey] = {
             measure=_measure_warm_turn,
             setup=_setup_warm_session,
             needs_runner=True,
+            max_iterations=_RUNNER_MAX_ITERATIONS,
             description="Drive a turn on an already-warm session (steady-state overhead).",
         ),
         Journey(
@@ -393,6 +519,7 @@ ALL_JOURNEYS: dict[str, Journey] = {
             measure=_measure_time_to_first_token,
             setup=_setup_streaming_session,
             needs_runner=True,
+            max_iterations=_RUNNER_MAX_ITERATIONS,
             description="Post a turn; time to the first streamed output_text delta.",
         ),
         Journey(
@@ -401,7 +528,17 @@ ALL_JOURNEYS: dict[str, Journey] = {
             measure=_measure_interrupt,
             setup=_setup_interrupt_session,
             needs_runner=True,
+            max_iterations=_RUNNER_MAX_ITERATIONS,
             description="Interrupt a running (gated) turn; time to cancellation.",
+        ),
+        Journey(
+            name="read_runner_file",
+            kind="latency",
+            measure=_measure_read_runner_file,
+            setup=_setup_runner_file_session,
+            needs_runner=True,
+            max_iterations=_RUNNER_FS_MAX_ITERATIONS,
+            description="GET .../environments/default/filesystem/{path} — runner file read proxy.",
         ),
     )
 }

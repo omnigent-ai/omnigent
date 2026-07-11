@@ -101,6 +101,7 @@ describe("createSession", () => {
       codexModelOptions: [],
       terminalPending: false,
       sandboxStatus: null,
+      mcpStartup: null,
       activeResponseId: null,
       workspace: null,
       gitBranch: null,

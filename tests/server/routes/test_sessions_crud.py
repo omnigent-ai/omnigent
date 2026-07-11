@@ -8,10 +8,13 @@ the stores.
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock, patch
+
 import httpx
 import pytest_asyncio
 
 from omnigent.db.utils import generate_agent_id
+from omnigent.server.routes import sessions as sessions_module
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
@@ -109,6 +112,39 @@ async def test_delete_session_not_found(client: httpx.AsyncClient) -> None:
     """Deleting a nonexistent session returns 404."""
     resp = await client.delete("/v1/sessions/conv_nonexistent_12345")
     assert resp.status_code == 404
+
+
+async def test_delete_running_session_attempts_stop(
+    client: httpx.AsyncClient,
+    session_id: str,
+) -> None:
+    """Deleting a running session calls ``_stop_session_via_runner``."""
+    mock_stop = AsyncMock(return_value=True)
+    sessions_module._session_status_cache[session_id] = "running"
+    try:
+        with patch.object(sessions_module, "_stop_session_via_runner", mock_stop):
+            resp = await client.delete(f"/v1/sessions/{session_id}")
+        assert resp.status_code == 200
+        assert resp.json()["deleted"] is True
+        mock_stop.assert_awaited_once()
+    finally:
+        sessions_module._session_status_cache.pop(session_id, None)
+
+
+async def test_delete_proceeds_when_stop_fails(
+    client: httpx.AsyncClient,
+    session_id: str,
+) -> None:
+    """Delete succeeds even when the runner stop raises."""
+    mock_stop = AsyncMock(side_effect=ConnectionError("runner gone"))
+    sessions_module._session_status_cache[session_id] = "running"
+    try:
+        with patch.object(sessions_module, "_stop_session_via_runner", mock_stop):
+            resp = await client.delete(f"/v1/sessions/{session_id}")
+        assert resp.status_code == 200
+        assert resp.json()["deleted"] is True
+    finally:
+        sessions_module._session_status_cache.pop(session_id, None)
 
 
 # ── PATCH /v1/sessions/{id} ─────────────────────────────────────────

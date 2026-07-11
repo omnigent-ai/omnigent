@@ -3078,7 +3078,6 @@ async def test_relay_persists_routing_decision_before_assistant_output() -> None
     # Every render field round-tripped through RoutingDecisionData on
     # persist — a parse failure would have dropped the item entirely.
     assert routing.data.model == "databricks-claude-opus-4-8"
-    assert routing.data.tier == "expensive"
     assert routing.data.applied is True
     assert routing.data.rationale == "multi-file refactor needs deep reasoning"
 

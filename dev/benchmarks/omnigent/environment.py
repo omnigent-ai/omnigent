@@ -265,6 +265,11 @@ class BenchEnvironment:
     def _spawn_runner(
         self, base_env: dict[str, str], binding_token: str
     ) -> subprocess.Popen[bytes]:
+        # Point the runner's filesystem workspace at the temp dir so file
+        # writes (e.g. read_runner_file's setup) land there and are cleaned up
+        # on teardown, rather than in the launch cwd (its default).
+        workspace = self._tmp / "workspace"
+        workspace.mkdir(exist_ok=True)
         runner_env = apply_runner_env(
             {
                 **base_env,
@@ -272,6 +277,7 @@ class BenchEnvironment:
                 "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
                 "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
                 "RUNNER_SERVER_URL": self.base_url,
+                "OMNIGENT_RUNNER_WORKSPACE": str(workspace),
             }
         )
         return subprocess.Popen(
@@ -360,6 +366,12 @@ class BenchEnvironment:
             "model": self.model,
             "config": {"harness": self.harness},
         }
+        config: dict[str, object] = {
+            "spec_version": 1,
+            "name": name,
+            "prompt": "You are a helpful assistant used for performance benchmarking.",
+            "executor": executor,
+        }
         if self.with_runner:
             executor["auth"] = {
                 "type": "api_key",
@@ -367,12 +379,15 @@ class BenchEnvironment:
                 "base_url": f"{self.mock_url}/v1",
             }
             executor["connection"] = {"base_url": f"{self.mock_url}/v1", "api_key": "mock-key"}
-        config: dict[str, object] = {
-            "spec_version": 1,
-            "name": name,
-            "prompt": "You are a helpful assistant used for performance benchmarking.",
-            "executor": executor,
-        }
+            # A filesystem env so the runner can serve the resource endpoints
+            # (read_runner_file). Without os_env the runner has no primary
+            # environment to materialize and the filesystem proxy 404s.
+            # sandbox.type=none avoids needing a bwrap binary on the host.
+            config["os_env"] = {
+                "type": "caller_process",
+                "cwd": ".",
+                "sandbox": {"type": "none"},
+            }
         buf = io.BytesIO()
         with tarfile.open(fileobj=buf, mode="w:gz") as tar:
             payload = yaml.safe_dump(config).encode()
@@ -451,6 +466,40 @@ class BenchEnvironment:
         )
         bound.raise_for_status()
         return session_id
+
+    async def write_runner_file(self, session_id: str, relative_path: str, content: str) -> None:
+        """Write a file into the runner's default environment over HTTP.
+
+        The server proxies the ``PUT`` to the bound runner, which writes to its
+        sandboxed filesystem — so this needs a runner. Used to plant a file the
+        read journey can then fetch back.
+
+        :raises RuntimeError: If not in runner mode.
+        """
+        assert self.client is not None
+        if not self.with_runner:
+            raise RuntimeError("write_runner_file requires with_runner=True")
+        resp = await self.client.put(
+            f"/v1/sessions/{session_id}/resources/environments/default/filesystem/{relative_path}",
+            json={"content": content, "encoding": "utf-8"},
+        )
+        resp.raise_for_status()
+
+    async def read_runner_file(self, session_id: str, relative_path: str) -> None:
+        """Read a file from the runner's default environment over HTTP.
+
+        Times the server → runner filesystem proxy (a localhost round-trip); no
+        LLM is involved. Requires a runner — the server returns 502 without one.
+
+        :raises RuntimeError: If not in runner mode.
+        """
+        assert self.client is not None
+        if not self.with_runner:
+            raise RuntimeError("read_runner_file requires with_runner=True")
+        resp = await self.client.get(
+            f"/v1/sessions/{session_id}/resources/environments/default/filesystem/{relative_path}",
+        )
+        resp.raise_for_status()
 
     async def drive_turn(
         self, session_id: str, text: str, *, timeout: float = _TURN_TIMEOUT_S

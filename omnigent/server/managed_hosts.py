@@ -1656,8 +1656,9 @@ def _kubernetes_launcher_factory(
     :param secret_name: Pre-created Secret projected into every Pod via
         ``envFrom`` (harness credentials), or ``None``.
     :param service_account: ServiceAccount the Pods run as, or ``None``.
-    :param node_selector: Extra node selector labels merged with the mandatory
-        amd64 constraint, or ``None``.
+    :param node_selector: Extra node selector labels merged with a default
+        ``kubernetes.io/arch: amd64`` (an entry for that key overrides it),
+        or ``None``.
     :param kubeconfig: Explicit kubeconfig path for the out-of-cluster fallback,
         or ``None``.
     :param in_cluster: Force the cluster-config source, or ``None`` to try

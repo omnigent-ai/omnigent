@@ -10,9 +10,11 @@ import { useEffect } from "react";
 import {
   ArchiveIcon,
   ArrowLeftIcon,
+  GitBranchIcon,
   KeyboardIcon,
   PaletteIcon,
   PanelRightOpenIcon,
+  Share2Icon,
   ShieldCheckIcon,
   TerminalIcon,
   UserCogIcon,
@@ -28,19 +30,23 @@ import { cn } from "@/lib/utils";
 
 export type SettingsSectionId =
   | "appearance"
+  | "git"
   | "shortcuts"
   | "account"
   | "members"
   | "policies"
+  | "sharing"
   | "archived"
   | "cli";
 
 const SECTION_IDS: readonly SettingsSectionId[] = [
   "appearance",
+  "git",
   "shortcuts",
   "account",
   "members",
   "policies",
+  "sharing",
   "archived",
   "cli",
 ];
@@ -74,6 +80,7 @@ export function settingsNavGroups(
 ): SettingsNavGroup[] {
   const general: SettingsNavItem[] = [
     { id: "appearance", label: "Appearance", icon: PaletteIcon },
+    { id: "git", label: "Git", icon: GitBranchIcon },
     { id: "shortcuts", label: "Keyboard shortcuts", icon: KeyboardIcon, hideOnMobile: true },
   ];
   if (hasAuthSession) {
@@ -104,6 +111,7 @@ export function settingsNavGroups(
       items: [
         { id: "members", label: "Members", icon: UsersIcon },
         { id: "policies", label: "Policies", icon: ShieldCheckIcon },
+        { id: "sharing", label: "Sharing", icon: Share2Icon },
       ],
     });
   }

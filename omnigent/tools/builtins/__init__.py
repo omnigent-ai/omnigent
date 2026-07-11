@@ -275,6 +275,20 @@ _BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
     # name in the runner's tool dispatch — reserved here so user specs
     # cannot shadow it.
     "sys_advise_models": None,
+    # ``browser_*`` embedded-browser tools are framework-owned: always
+    # auto-registered by ``ToolManager._register_browser_tools`` (the
+    # single source of truth for registration), so any agent can drive
+    # the desktop app's browser without the spec opting in. Reserved
+    # here with ``None`` — exactly like ``list_comments`` /
+    # ``update_comment`` — so user specs cannot shadow the names and
+    # ``get_builtin_tool`` returns ``None`` for them (they are not
+    # instantiated via this registry). Execution is runner-dispatched
+    # (``_BROWSER_TOOLS`` in omnigent/runner/tool_dispatch.py).
+    "browser_navigate": None,
+    "browser_snapshot": None,
+    "browser_click": None,
+    "browser_type": None,
+    "browser_screenshot": None,
 }
 
 # Canonical set of every reserved builtin name. Derived from

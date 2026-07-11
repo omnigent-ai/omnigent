@@ -185,6 +185,55 @@ describe("PoliciesPage actions", () => {
     expect(deleteMutate).toHaveBeenCalledWith("p1", expect.anything());
   });
 
+  it("adds array (multi-select) values via the model combobox as a coerced list", async () => {
+    // WHY: the expensive_models-style array param renders the single-input
+    // combobox; picking options and typing a free-form value must survive the
+    // comma-joined form state and coerce to a list[str] on submit — guarding
+    // the checkbox→combobox refactor against a regression.
+    vi.mocked(policies.usePolicyRegistry).mockReturnValue({
+      data: [
+        {
+          handler: "omnigent.policies.budget",
+          kind: "factory",
+          name: "Budget Guard",
+          description: "blocks expensive models",
+          params_schema: {
+            properties: {
+              expensive_models: {
+                type: "array",
+                items: { type: "string", enum: ["opus", "sonnet", "haiku"] },
+              },
+            },
+            required: [],
+          },
+        },
+      ],
+    } as never);
+    renderPage();
+    await screen.findByText(/No global policies configured/);
+
+    fireEvent.click(screen.getByRole("button", { name: /Add policy/ }));
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.click(within(dialog).getByText("Budget Guard"));
+
+    const combo = within(dialog).getByPlaceholderText("Select or type a value…");
+    fireEvent.focus(combo);
+    fireEvent.mouseDown(within(dialog).getByRole("button", { name: "opus" }));
+    fireEvent.mouseDown(within(dialog).getByRole("button", { name: "haiku" }));
+    // Free-form typed value still works (Enter commits).
+    fireEvent.change(combo, { target: { value: "custom-tier" } });
+    fireEvent.keyDown(combo, { key: "Enter" });
+
+    fireEvent.click(within(dialog).getByRole("button", { name: /^Add$/ }));
+
+    expect(addMutate).toHaveBeenCalledTimes(1);
+    const payload = addMutate.mock.calls[0][0];
+    expect(payload.handler).toBe("omnigent.policies.budget");
+    expect(payload.factory_params).toEqual({
+      expensive_models: ["opus", "haiku", "custom-tier"],
+    });
+  });
+
   it("adds a global policy from the registry via the Add dialog", async () => {
     vi.mocked(policies.usePolicyRegistry).mockReturnValue({
       data: [

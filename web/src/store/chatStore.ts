@@ -54,6 +54,7 @@ import type {
 } from "@/lib/blocks";
 import { BlockStream } from "@/lib/blockStream";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
+import { emitBrowserActionRequest } from "@/lib/browserActionBus";
 import {
   ApiError,
   approve as approveElicitation,
@@ -68,7 +69,12 @@ import {
   type SessionItemsPage,
   updateSession,
 } from "@/lib/sessionsApi";
-import type { SessionInputConsumedEvent, SessionViewer, StreamEvent } from "@/lib/events";
+import type {
+  McpServerStartup,
+  SessionInputConsumedEvent,
+  SessionViewer,
+  StreamEvent,
+} from "@/lib/events";
 import { createPresenceIdleTracker } from "@/lib/presenceIdle";
 import { parseEvent, parseSseStream, type SseStreamResult } from "@/lib/sse";
 import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
@@ -513,6 +519,15 @@ export interface ChatState {
    * launch.
    */
   sandboxStatus: SandboxStatus | null;
+  /**
+   * Per-MCP-server startup map for the bound session (codex-native).
+   * Updated by `session.mcp_startup` SSE events while the harness boots
+   * its MCP servers; cleared back to `null` once every server settles
+   * `ready`. Failed/cancelled servers are retained so the page can say
+   * which servers never came up. Always `null` for sessions whose
+   * harness reports no MCP startup.
+   */
+  mcpStartup: Record<string, McpServerStartup> | null;
 
   // Internal mutable bookkeeping. NOT meant to be subscribed to.
   abortController: AbortController | null;
@@ -902,6 +917,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   terminalPending: false,
   viewers: [],
   sandboxStatus: null,
+  mcpStartup: null,
   abortController: null,
   historyGeneration: 0,
 
@@ -1601,6 +1617,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         // discipline as ``viewers`` above.
         pendingComposerAttachments: [],
         sandboxStatus: null,
+        mcpStartup: null,
         abortController: null,
         historyGeneration: s.historyGeneration + 1,
       };
@@ -2064,6 +2081,7 @@ function sessionBindingPatch(
   | "codexModelOptions"
   | "terminalPending"
   | "sandboxStatus"
+  | "mcpStartup"
 > {
   const wrapper = session.labels?.["omnigent.wrapper"];
   return {
@@ -2087,6 +2105,7 @@ function sessionBindingPatch(
     codexModelOptions: session.codexModelOptions ?? [],
     terminalPending: session.terminalPending ?? false,
     sandboxStatus: session.sandboxStatus ?? null,
+    mcpStartup: session.mcpStartup ?? null,
   };
 }
 
@@ -3830,6 +3849,16 @@ export function handleSessionEvent(event: StreamEvent): void {
         sandboxStatus: event.stage === "ready" ? null : { stage: event.stage, error: event.error },
       });
       return;
+    case "session_mcp_startup": {
+      // Mirror the harness's per-MCP-server startup map. Cleared once
+      // every server settles `ready` (the band disappears); failures and
+      // cancellations are retained so the page can say which servers
+      // never came up.
+      const records = Object.values(event.servers);
+      const allReady = records.length === 0 || records.every((r) => r.status === "ready");
+      useChatStore.setState({ mcpStartup: allReady ? null : event.servers });
+      return;
+    }
     case "session_usage": {
       // Apply only fields that arrived; a window-only broadcast must
       // not clobber tokensUsed (and vice versa), and a cost-only
@@ -3967,6 +3996,11 @@ export function handleSessionEvent(event: StreamEvent): void {
       useChatStore.setState({
         pendingUserMessages: [],
       });
+      return;
+    case "browser_action_request":
+      // Embedded-browser action: fan out to the relay hook (which claims,
+      // executes, posts the result). No store state; no-op without a relay.
+      emitBrowserActionRequest(event);
       return;
     case "session_status": {
       // Captured BEFORE the patch below adopts event.responseId, so a
