@@ -97,6 +97,7 @@ from omnigent.harness_plugins import (
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE as _HARNESS_NOT_CONFIGURED_ERROR_CODE,
 )
+from omnigent.llms.context_window import resolve_effective_context_window
 from omnigent.model_override import validate_model_override
 from omnigent.native_coding_agents import (
     native_coding_agent_for_agent_name,
@@ -144,6 +145,7 @@ from omnigent.runtime.policies.builder import (
 )
 from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.runtime.tool_output import cap_tool_output
+from omnigent.runtime.workflow import _find_spec_by_name
 from omnigent.server import presence, session_live_state
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
@@ -22469,8 +22471,6 @@ async def _get_session_snapshot(
                     )
                     spec = loaded.spec
                     if conv.sub_agent_name:
-                        from omnigent.runtime.workflow import _find_spec_by_name
-
                         child_spec = _find_spec_by_name(spec, conv.sub_agent_name)
                         if child_spec is not None:
                             spec = child_spec
@@ -22482,9 +22482,6 @@ async def _get_session_snapshot(
                     if spec.name:
                         agent_name = spec.name
                     llm_model = spec.executor.model
-                    from omnigent.llms.context_window import (
-                        resolve_effective_context_window,
-                    )
 
                     # Size the context ring against whatever the next turn will
                     # actually run, using the SAME resolver the runner uses to
