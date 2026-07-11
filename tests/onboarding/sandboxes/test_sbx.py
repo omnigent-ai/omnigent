@@ -590,6 +590,33 @@ def test_resolve_env_opencode_key_missing_everywhere_fails_loud(
         SbxSandboxLauncher(env=["OPENCODE_API_KEY"])._resolve_env()
 
 
+def test_resolve_env_zai_key_falls_back_to_keychain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("ZHIPU_API_KEY", raising=False)
+    monkeypatch.setattr(sbxmod, "resolve_zai_key", lambda environ=None: ("keychain", "zai-vault"))
+    resolved = SbxSandboxLauncher(env=["ZHIPU_API_KEY"])._resolve_env()
+    assert resolved == {"ZHIPU_API_KEY": "zai-vault"}
+
+
+def test_resolve_env_zai_key_prefers_local_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ZHIPU_API_KEY", "zai-local")
+    monkeypatch.setattr(sbxmod, "resolve_zai_key", lambda environ=None: ("keychain", "zai-vault"))
+    resolved = SbxSandboxLauncher(env=["ZHIPU_API_KEY"])._resolve_env()
+    assert resolved == {"ZHIPU_API_KEY": "zai-local"}
+
+
+def test_resolve_env_zai_key_missing_everywhere_fails_loud(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("ZHIPU_API_KEY", raising=False)
+    monkeypatch.setattr(sbxmod, "resolve_zai_key", lambda environ=None: None)
+    with pytest.raises(click.ClickException):
+        SbxSandboxLauncher(env=["ZHIPU_API_KEY"])._resolve_env()
+
+
 # ── managed mode ────────────────────────────────────────────
 
 

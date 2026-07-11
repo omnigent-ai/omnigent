@@ -1186,6 +1186,12 @@ async def _auto_create_opencode_terminal(
 
     policy_env.update(zen_spawn_env())
 
+    # Same pattern for the Z.AI (Zhipu) key — authenticates the
+    # ``zai-coding-plan`` provider via ``ZHIPU_API_KEY``.
+    from omnigent.zai_credentials import zai_spawn_env
+
+    policy_env.update(zai_spawn_env())
+
     # Start the Omnigent builtin-tool relay BEFORE opencode boots, so
     # ``tool_relay.json`` exists when opencode launches the ``serve-mcp`` MCP
     # server and lists its tools (the sys_*/load_skill/web_fetch surface). The

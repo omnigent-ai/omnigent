@@ -145,3 +145,39 @@ def test_clear_zen_key_deletes_secret(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("omnigent.onboarding.secrets.delete_secret", deleted.append)
     assert cli._clear_opencode_zen_key() == "✓ Zen key cleared"
     assert deleted == ["opencode-zen"]
+
+
+# ── Z.AI key paste/clear ────────────────────────────────────────────────────
+
+
+def test_prompt_zai_key_stores_stripped_secret(monkeypatch: pytest.MonkeyPatch) -> None:
+    stored: dict[str, str] = {}
+    monkeypatch.setattr(
+        "omnigent.onboarding.secrets.store_secret",
+        lambda name, value: stored.update({name: value}),
+    )
+    monkeypatch.setattr("omnigent.onboarding.secrets.active_backend", lambda: "keyring")
+    monkeypatch.setattr(
+        "omnigent.onboarding.interactive.prompt_text", lambda *a, **k: " zai-abc \n"
+    )
+    status = cli._prompt_zai_key()
+    assert stored == {"zai-coding-plan": "zai-abc"}
+    assert status == "✓ Z.AI key stored (keyring)"
+
+
+def test_prompt_zai_key_empty_cancels(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(
+        "omnigent.onboarding.secrets.store_secret",
+        lambda name, value: calls.append(name),
+    )
+    monkeypatch.setattr("omnigent.onboarding.interactive.prompt_text", lambda *a, **k: "  ")
+    assert cli._prompt_zai_key() is None
+    assert calls == []
+
+
+def test_clear_zai_key_deletes_secret(monkeypatch: pytest.MonkeyPatch) -> None:
+    deleted: list[str] = []
+    monkeypatch.setattr("omnigent.onboarding.secrets.delete_secret", deleted.append)
+    assert cli._clear_zai_key() == "✓ Z.AI key cleared"
+    assert deleted == ["zai-coding-plan"]

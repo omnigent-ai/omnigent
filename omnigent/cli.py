@@ -11069,6 +11069,34 @@ def _clear_opencode_zen_key() -> str:
     return "✓ Zen key cleared"
 
 
+def _prompt_zai_key() -> str | None:
+    """Paste-and-store the Z.AI (Zhipu) API key; return a status line.
+
+    Stored in Omnigent's keychain (``zai-coding-plan``) and injected as
+    ``ZHIPU_API_KEY`` when the opencode server spawns — never written to
+    opencode's own ``auth.json``. An ambient ``ZHIPU_API_KEY`` always
+    wins over the stored key at resolution time.
+    """
+    from omnigent.onboarding import secrets as secret_store
+    from omnigent.onboarding.interactive import prompt_text
+    from omnigent.zai_credentials import ZAI_SECRET_NAME
+
+    pasted = prompt_text("Z.AI API key (ZHIPU_API_KEY)", hide_input=True).strip()
+    if not pasted:
+        return None
+    secret_store.store_secret(ZAI_SECRET_NAME, pasted)
+    return f"✓ Z.AI key stored ({secret_store.active_backend()})"
+
+
+def _clear_zai_key() -> str:
+    """Delete the stored Z.AI key from Omnigent's keychain."""
+    from omnigent.onboarding import secrets as secret_store
+    from omnigent.zai_credentials import ZAI_SECRET_NAME
+
+    secret_store.delete_secret(ZAI_SECRET_NAME)
+    return "✓ Z.AI key cleared"
+
+
 def _print_opencode_auth_help() -> None:
     """Explain where OpenCode's model credentials come from."""
     from omnigent.onboarding.interactive import console
@@ -11082,7 +11110,10 @@ def _print_opencode_auth_help() -> None:
         "      Omnigent synthesizes opencode's per-session provider config from it.\n"
         "    • [bold]OpenCode Zen[/bold] — paste an API key ('Set OpenCode Zen API key');\n"
         "      kept in Omnigent's keychain, injected as OPENCODE_API_KEY at launch.\n"
-        "  Omnigent stores only the optional Zen key — everything else stays with opencode.\n"
+        "    • [bold]Z.AI[/bold] — paste an API key ('Set Z.AI API key');\n"
+        "      kept in Omnigent's keychain, injected as ZHIPU_API_KEY at launch.\n"
+        "  Omnigent stores only the optional Zen and Z.AI keys — everything else\n"
+        "  stays with opencode.\n"
         "  [dim]Tip:[/dim] 'Set default model' picks which model `omni opencode` launches on\n"
         "  (otherwise OpenCode uses its built-in default, opencode/big-pickle)."
     )
@@ -11094,10 +11125,11 @@ def _manage_opencode_harness() -> None:
     OpenCode owns its own provider auth — ``opencode auth login`` (stored in
     ``~/.local/share/opencode/auth.json``) or ambient provider env vars — so,
     like the Goose / Qwen drill-ins, this reports which providers OpenCode can
-    reach and offers to launch its native login. The one key Omnigent stores
-    itself is the optional OpenCode Zen API key (kept in Omnigent's keychain,
+    reach and offers to launch its native login. The keys Omnigent stores
+    itself are the optional OpenCode Zen API key (kept in Omnigent's keychain,
     injected as ``OPENCODE_API_KEY`` at spawn — never written to opencode's
-    ``auth.json``). (For the Databricks-gateway path the agent's ``profile`` is
+    ``auth.json``) and the optional Z.AI API key (injected as
+    ``ZHIPU_API_KEY``). (For the Databricks-gateway path the agent's ``profile`` is
     synthesized into opencode's per-session config instead — set under
     Claude / Codex.)
 
@@ -11172,6 +11204,9 @@ def _manage_opencode_harness() -> None:
         ]
         if summary.zen_key_source == "keychain":
             rows.append(_HarnessMenuRow("Clear stored Zen key", action="zen-clear"))
+        rows.append(_HarnessMenuRow("Set Z.AI API key", action="zai"))
+        if summary.zai_key_source == "keychain":
+            rows.append(_HarnessMenuRow("Clear stored Z.AI key", action="zai-clear"))
         rows.extend(
             [
                 _HarnessMenuRow(model_label, action="model"),
@@ -11192,6 +11227,10 @@ def _manage_opencode_harness() -> None:
             status = _prompt_opencode_zen_key()
         elif action == "zen-clear":
             status = _clear_opencode_zen_key()
+        elif action == "zai":
+            status = _prompt_zai_key()
+        elif action == "zai-clear":
+            status = _clear_zai_key()
         elif action == "model":
             status = _set_opencode_default_model(default_model)
         elif action == "list":

@@ -2,13 +2,14 @@
 
 OpenCode owns its own provider auth via ``opencode auth login`` (stored in
 ``~/.local/share/opencode/auth.json``) or ambient provider env vars
-(``OPENAI_API_KEY`` / ``ANTHROPIC_API_KEY`` / …). Omnigent stores exactly one
-optional credential of its own: the OpenCode Zen API key, kept in Omnigent's
-keychain and injected as ``OPENCODE_API_KEY`` at spawn (see
-:mod:`omnigent.opencode_zen_credentials`) — it never touches ``auth.json``.
-This module is otherwise a thin, read-only reporter so ``omnigent setup``
-can show which providers OpenCode can reach and offer to run its native
-login — without ever touching its secrets.
+(``OPENAI_API_KEY`` / ``ANTHROPIC_API_KEY`` / …). Omnigent stores two
+optional credentials of its own: the OpenCode Zen API key (kept in
+Omnigent's keychain, injected as ``OPENCODE_API_KEY`` at spawn — see
+:mod:`omnigent.opencode_zen_credentials`) and the Z.AI / Zhipu API key
+(injected as ``ZHIPU_API_KEY`` — see :mod:`omnigent.zai_credentials`).
+Neither touches ``auth.json``. This module is otherwise a thin, read-only
+reporter so ``omnigent setup`` can show which providers OpenCode can reach
+and offer to run its native login — without ever touching its secrets.
 
 It reads ``auth.json`` directly (a JSON object keyed by provider id — see
 ``packages/opencode/src/auth`` in the OpenCode source) rather than scraping
@@ -26,6 +27,7 @@ from pathlib import Path
 
 from omnigent.onboarding.harness_install import OPENCODE_KEY, harness_cli_installed
 from omnigent.opencode_zen_credentials import resolve_opencode_zen_key
+from omnigent.zai_credentials import resolve_zai_key
 
 # Common OpenCode providers → (provider id, display label, env var). The
 # provider id matches OpenCode's own id (the ``auth.json`` key and the
@@ -42,6 +44,7 @@ _ENV_PROVIDER_VARS: tuple[tuple[str, str, str], ...] = (
     ("xai", "xAI", "XAI_API_KEY"),
     ("mistral", "Mistral", "MISTRAL_API_KEY"),
     ("deepseek", "DeepSeek", "DEEPSEEK_API_KEY"),
+    ("zai-coding-plan", "Z.AI Coding Plan", "ZHIPU_API_KEY"),
 )
 
 
@@ -99,6 +102,10 @@ def reachable_provider_ids(environ: dict[str, str] | None = None) -> frozenset[s
     # share the ``OPENCODE_API_KEY`` env var, so both model sets are reachable.
     if resolve_opencode_zen_key(environ) is not None:
         ids.update(("opencode", "opencode-go"))
+    # The Z.AI key (env or Omnigent keychain) authenticates the
+    # ``zai-coding-plan`` provider via ``ZHIPU_API_KEY``.
+    if resolve_zai_key(environ) is not None:
+        ids.add("zai-coding-plan")
     return frozenset(ids)
 
 
@@ -111,17 +118,25 @@ class OpenCodeAuthSummary:
     :param env_providers: Provider labels whose API-key env var is set.
     :param zen_key_source: Where the OpenCode Zen API key resolves from
         (``"env:<NAME>"`` or ``"keychain"``), or ``None`` when absent.
+    :param zai_key_source: Where the Z.AI API key resolves from
+        (``"env:<NAME>"`` or ``"keychain"``), or ``None`` when absent.
     """
 
     installed: bool
     stored_providers: tuple[str, ...]
     env_providers: tuple[str, ...]
     zen_key_source: str | None = None
+    zai_key_source: str | None = None
 
     @property
     def has_provider(self) -> bool:
-        """Whether any provider is reachable (stored, env key, or Zen key)."""
-        return bool(self.stored_providers or self.env_providers or self.zen_key_source)
+        """Whether any provider is reachable (stored, env key, Zen key, or Z.AI key)."""
+        return bool(
+            self.stored_providers
+            or self.env_providers
+            or self.zen_key_source
+            or self.zai_key_source
+        )
 
     @property
     def ready(self) -> bool:
@@ -141,15 +156,19 @@ class OpenCodeAuthSummary:
             parts.append(f"env: {', '.join(self.env_providers)}")
         if self.zen_key_source:
             parts.append(f"zen key: {self.zen_key_source}")
+        if self.zai_key_source:
+            parts.append(f"zai key: {self.zai_key_source}")
         return " · ".join(parts) if parts else "no provider configured yet"
 
 
 def opencode_auth_summary() -> OpenCodeAuthSummary:
     """Summarize the local OpenCode credential state for setup display."""
     zen = resolve_opencode_zen_key()
+    zai = resolve_zai_key()
     return OpenCodeAuthSummary(
         installed=harness_cli_installed(OPENCODE_KEY),
         stored_providers=_stored_providers(),
         env_providers=_env_providers(),
         zen_key_source=zen[0] if zen is not None else None,
+        zai_key_source=zai[0] if zai is not None else None,
     )

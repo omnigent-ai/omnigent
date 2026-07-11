@@ -19,6 +19,8 @@ def _isolate_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.delenv("OPENCODE_API_KEY", raising=False)
     monkeypatch.delenv("OMNIGENT_OPENCODE_API_KEY", raising=False)
     monkeypatch.setattr("omnigent.onboarding.secrets.load_secret", lambda _name: None)
+    monkeypatch.delenv("ZHIPU_API_KEY", raising=False)
+    monkeypatch.delenv("OMNIGENT_ZHIPU_API_KEY", raising=False)
 
 
 def _write_auth(tmp_path: Path, providers: dict[str, object]) -> None:
@@ -169,3 +171,69 @@ def test_reachable_ids_omit_opencode_without_key() -> None:
     ids = oc.reachable_provider_ids()
     assert "opencode" not in ids
     assert "opencode-go" not in ids
+
+
+def test_env_providers_detects_zhipu_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ZHIPU_API_KEY", "zai-x")
+    labels = oc._env_providers()
+    assert "Z.AI Coding Plan" in labels
+
+
+def test_summary_zai_key_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(oc, "harness_cli_installed", lambda _key: True)
+    monkeypatch.setenv("ZHIPU_API_KEY", "zai-env")
+    summary = oc.opencode_auth_summary()
+    assert summary.zai_key_source == "env:ZHIPU_API_KEY"
+    assert summary.has_provider
+    assert summary.ready
+
+
+def test_summary_zai_key_from_keychain(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(oc, "harness_cli_installed", lambda _key: True)
+    monkeypatch.setattr(
+        "omnigent.onboarding.secrets.load_secret",
+        lambda name: "zai-vault" if name == "zai-coding-plan" else None,
+    )
+    summary = oc.opencode_auth_summary()
+    assert summary.zai_key_source == "keychain"
+    assert summary.has_provider
+
+
+def test_summary_no_zai_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(oc, "harness_cli_installed", lambda _key: True)
+    summary = oc.opencode_auth_summary()
+    assert summary.zai_key_source is None
+
+
+def test_describe_includes_zai_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(oc, "harness_cli_installed", lambda _key: True)
+    monkeypatch.setattr(
+        "omnigent.onboarding.secrets.load_secret",
+        lambda name: "zai-vault" if name == "zai-coding-plan" else None,
+    )
+    text = oc.opencode_auth_summary().describe()
+    assert "zai key: keychain" in text
+
+
+def test_reachable_ids_include_zai_for_keychain_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "omnigent.onboarding.secrets.load_secret",
+        lambda name: "zai-vault" if name == "zai-coding-plan" else None,
+    )
+    ids = oc.reachable_provider_ids()
+    assert "zai-coding-plan" in ids
+
+
+def test_reachable_ids_include_zai_for_env_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ZHIPU_API_KEY", "zai-env")
+    ids = oc.reachable_provider_ids()
+    assert "zai-coding-plan" in ids
+
+
+def test_reachable_ids_omit_zai_without_key() -> None:
+    ids = oc.reachable_provider_ids()
+    assert "zai-coding-plan" not in ids

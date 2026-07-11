@@ -57,6 +57,10 @@ from omnigent.opencode_zen_credentials import (
     OPENCODE_API_KEY_ENV_VAR,
     resolve_opencode_zen_key,
 )
+from omnigent.zai_credentials import (
+    ZHIPU_API_KEY_ENV_VAR,
+    resolve_zai_key,
+)
 
 # ── Constants ──────────────────────────────────────────
 
@@ -71,7 +75,8 @@ variables whose values are forwarded into the in-sandbox host process
 (``ANTHROPIC_API_KEY``, ``CLAUDE_CODE_OAUTH_TOKEN``, gateway URLs).
 Names, not values: read from the invoking shell at exec time.
 ``OPENCODE_API_KEY`` additionally falls back to the Omnigent-keychain
-OpenCode Zen key when not set locally."""
+OpenCode Zen key when not set locally. ``ZHIPU_API_KEY`` similarly falls
+back to the Omnigent-keychain Z.AI key."""
 
 KITS_ENV_VAR: str = "OMNIGENT_SBX_KITS"
 """Environment variable naming (comma- or whitespace-separated) sbx kit
@@ -670,6 +675,12 @@ class SbxSandboxLauncher(SandboxLauncher):
                 zen = resolve_opencode_zen_key()
                 if zen is not None:
                     value = zen[1]
+            if value is None and name == ZHIPU_API_KEY_ENV_VAR:
+                # The Z.AI key may live in Omnigent's keychain rather than the
+                # local environment — resolve it before failing loud.
+                zai = resolve_zai_key()
+                if zai is not None:
+                    value = zai[1]
             if value is None:
                 raise click.ClickException(
                     f"sbx env passthrough names '{name}' but it is not set in the "
