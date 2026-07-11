@@ -2044,17 +2044,17 @@ async def _best_effort_stop(
     :param runner_router: The ``RunnerRouter`` for runner-client
         resolution, or ``None`` in tests / in-process setups.
     """
-    child_ids_map = await asyncio.to_thread(
-        conversation_store.list_child_conversation_ids_by_parent,
-        [session_id],
-    )
-    child_ids = child_ids_map.get(session_id, [])
-    status = _session_status_with_child_rollup(session_id, child_ids)
-    if status != "running":
-        return
     try:
+        child_ids_map = await asyncio.to_thread(
+            conversation_store.list_child_conversation_ids_by_parent,
+            [session_id],
+        )
+        child_ids = child_ids_map.get(session_id, [])
+        status = _session_status_with_child_rollup(session_id, child_ids)
+        if status != "running":
+            return
         await _stop_session_via_runner(session_id, runner_router)
-    except Exception:
+    except Exception:  # noqa: BLE001 — best-effort; must not block archive/delete
         _logger.debug(
             "Best-effort stop failed for %s; proceeding anyway",
             session_id,
