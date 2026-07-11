@@ -466,6 +466,7 @@ class CursorExecutor(Executor):
         bundle_dir: Path | None = None,
         agent_name: str | None = None,
         skills_filter: str | list[str] = "all",
+        permission_mode: str | None = None,
     ) -> None:
         """Create a CursorExecutor.
 
@@ -488,6 +489,7 @@ class CursorExecutor(Executor):
         self._bundle_dir = bundle_dir
         self._agent_name = agent_name
         self._skills_filter = skills_filter
+        self._permission_mode = permission_mode
         self._session_states: dict[str, _CursorSessionState] = {}
         # Installed by the runtime adapter; routes a bridged-tool call back into
         # Omnigent's session (policy gating, sub-agent dispatch, logging).
@@ -569,6 +571,10 @@ class CursorExecutor(Executor):
 
         # Stage 2 — native elicitation: surface an approval card so the
         # user can decide whether the rest of the turn should continue.
+        # If permission_mode is "bypassPermissions", skip elicitation and
+        # auto-approve while preserving the Stage-1 policy DENY guardrail.
+        if self._permission_mode == "bypassPermissions":
+            return {"block": False, "reason": ""}
         handler = self._elicitation_handler
         if handler is not None:
             logger.info("surfacing elicitation for native cursor tool %s", name)
