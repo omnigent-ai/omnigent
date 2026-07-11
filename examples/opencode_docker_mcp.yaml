@@ -46,8 +46,8 @@ tools:
 # ── Deployment (sbx shared server) ──────────────────────────────────────────
 #
 # 1. Token: ensure MCP_GATEWAY_AUTH_TOKEN is set in the host environment (or
-#    the repo-root .env that sbx-up.sh sources). sbx-up.sh already forwards it
-#    into the sandbox env via OMNIGENT_SBX_SANDBOX_ENV.
+#    a repo-root .env). Forward it into the sandbox env via
+#    OMNIGENT_SBX_SANDBOX_ENV.
 #
 # 2. Egress: allow the sandbox to reach the MCP server:
 #       sbx policy allow network "host.docker.internal:9011"
