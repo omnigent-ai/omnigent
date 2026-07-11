@@ -166,6 +166,18 @@ tools:
     - web_fetch                            # no config needed
 ```
 
+### Capability grants
+
+Top-level flags that grant authority over sessions:
+
+| Field | Type | Default | What it enables |
+|---|---|---|---|
+| `spawn` | boolean | `false` | Create arbitrary child sessions (`sys_session_create`) in addition to any declared sub-agents. |
+| `agent_session_sharing` | string | `none` | Share sessions with other users (`sys_session_share`). `none` disables it; `non-public` allows named users; `public` also allows the `__public__` anonymous-read sentinel. |
+| `session_control` | boolean | `false` | Drive the lifecycle of **other** sessions: resolve pending approval/input prompts (`sys_session_resolve_elicitation`), interrupt a running turn (`sys_session_interrupt`), or stop the live process (`sys_session_stop`). |
+
+`session_control` tools require an explicit `session_id` and refuse the caller's own session — a session can never approve its own prompts. `sys_session_stop` additionally requires owner-level access on the target and is non-sticky (a later message relaunches the session). Pending prompts are discovered via the always-available `sys_session_get_info` read tool.
+
 ---
 
 ## Instructions

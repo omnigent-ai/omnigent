@@ -532,6 +532,45 @@ def test_share_public_registers_share_tool_advertising_public() -> None:
     assert "__public__" in user_id_desc
 
 
+def test_session_control_registers_control_tools() -> None:
+    """
+    ``session_control: true`` alone (no spawn / declared agents / sharing)
+    registers the three control tools. The grant is independent, and the
+    schemas require an explicit ``session_id`` with no default-to-caller
+    fallback.
+    """
+    mgr = ToolManager(AgentSpec(spec_version=1, session_control=True))
+    schemas = {s["function"]["name"]: s["function"] for s in mgr.get_tool_schemas()}
+    assert "sys_session_resolve_elicitation" in schemas
+    assert "sys_session_interrupt" in schemas
+    assert "sys_session_stop" in schemas
+    # Control tools are decoupled from spawn/share — none of those ride along.
+    assert "sys_session_send" not in schemas
+    assert "sys_session_close" not in schemas
+    assert "sys_session_create" not in schemas
+    assert "sys_session_share" not in schemas
+    resolve_params = schemas["sys_session_resolve_elicitation"]["parameters"]
+    assert set(resolve_params["required"]) == {"session_id", "elicitation_id", "action"}
+    assert "content" not in resolve_params["required"]
+    for tool_name in ("sys_session_interrupt", "sys_session_stop"):
+        params = schemas[tool_name]["parameters"]
+        assert params["required"] == ["session_id"]
+
+
+def test_session_control_off_leaves_tools_unregistered() -> None:
+    """
+    Without ``session_control: true`` the control tools are not
+    advertised. A prompt-injected call naming them must still be
+    rejected at the runner (Task 3), but registration must not expose
+    them in the schema.
+    """
+    mgr = ToolManager(AgentSpec(spec_version=1))
+    names = {s["function"]["name"] for s in mgr.get_tool_schemas()}
+    assert "sys_session_resolve_elicitation" not in names
+    assert "sys_session_interrupt" not in names
+    assert "sys_session_stop" not in names
+
+
 def test_both_grants_compose() -> None:
     """
     A spec with BOTH ``tools.agents`` and ``spawn: true`` (the

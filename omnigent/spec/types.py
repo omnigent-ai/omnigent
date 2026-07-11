@@ -1481,6 +1481,17 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
         ``non-public`` (grant named users only), or ``public`` (also
         allow ``__public__`` anonymous read). **Defaults to
         ``SharePolicy.NONE``.**
+    :param session_control: Grant for driving OTHER sessions'
+        lifecycle: registers ``sys_session_resolve_elicitation``
+        (answer a pending approval/input prompt in another session),
+        ``sys_session_interrupt`` (cancel another session's running
+        turn), and ``sys_session_stop`` (terminate another session's
+        live process without deleting it; the server requires
+        owner-level access). YAML key is ``session_control:``
+        (top-level boolean, like ``spawn:``). All three tools require
+        an explicit target ``session_id`` and refuse the caller's own
+        session — a session can never approve its own prompts.
+        **Defaults to ``False``.**
     """
 
     spec_version: int
@@ -1527,3 +1538,4 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
     timers: bool = False
     spawn: bool = False
     agent_session_sharing: SharePolicy = SharePolicy.NONE
+    session_control: bool = False

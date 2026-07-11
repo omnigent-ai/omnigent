@@ -2496,6 +2496,39 @@ def test_parse_spawn_true_sets_flag(tmp_path: Path) -> None:
     assert spec.spawn is True
 
 
+# ─── Top-level ``session_control:`` flag (director opt-in) ─────
+
+
+def test_parse_session_control_defaults_to_false_when_omitted(agent_dir: Path) -> None:
+    """
+    Without a top-level ``session_control:`` key the parsed
+    ``AgentSpec.session_control`` is ``False``.
+
+    Default-off is the design: resolving, interrupting, or stopping
+    OTHER sessions is a powerful authority that must be explicitly
+    granted. A regression flipping the default to ``True`` would let
+    every agent drive sibling sessions.
+    """
+    spec = parse(agent_dir)
+    assert spec.session_control is False
+
+
+def test_parse_session_control_true_sets_flag(tmp_path: Path) -> None:
+    """
+    ``session_control: true`` in config.yaml round-trips to
+    ``AgentSpec.session_control == True``.
+
+    The flag gates registration of ``sys_session_resolve_elicitation``,
+    ``sys_session_interrupt``, and ``sys_session_stop`` in
+    ``ToolManager._register_sub_agent_tools``. A parser regression that
+    dropped the field would silently strip the director grant.
+    """
+    config = {"spec_version": 1, "name": "director-agent", "session_control": True}
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    assert spec.session_control is True
+
+
 def test_parse_share_defaults_to_none_when_omitted(agent_dir: Path) -> None:
     """
     Without a top-level ``agent_session_sharing:`` key the parsed

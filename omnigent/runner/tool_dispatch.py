@@ -225,6 +225,19 @@ _SESSION_QUERY_TOOLS = frozenset(
     }
 )
 
+# Priority 5f.0c: Session control tools — resolve a pending approval/input
+# request, interrupt a running turn, or stop another session's live process.
+# Gated by the spec's ``session_control:`` grant and an explicit
+# not-own-session guard; the runner proxies the server's existing event and
+# elicitation-resolve endpoints.
+_SESSION_CONTROL_TOOLS = frozenset(
+    {
+        "sys_session_resolve_elicitation",
+        "sys_session_interrupt",
+        "sys_session_stop",
+    }
+)
+
 # Grantee sentinel for an anonymous, public read-only share. Mirrors the
 # server's RESERVED_USER_PUBLIC; only specs with
 # ``agent_session_sharing: public`` may grant it (enforced in
@@ -322,6 +335,7 @@ _POLICY_TOOLS = frozenset({"sys_add_policy", "sys_policy_registry"})
 _NATIVE_RELAY_BUILTIN_TOOLS = (
     _COMMENT_TOOLS
     | _SESSION_QUERY_TOOLS
+    | _SESSION_CONTROL_TOOLS
     | _ASYNC_INBOX_TOOLS
     | _SUBAGENT_TOOLS
     | _LIST_MODELS_TOOLS
@@ -3109,6 +3123,261 @@ async def _session_share_via_rest(
     )
 
 
+async def _execute_session_control_tool(
+    tool_name: str,
+    arguments: str,
+    *,
+    conversation_id: str | None,
+    server_client: httpx.AsyncClient | None,
+    agent_spec: Any | None = None,
+) -> str:
+    """
+    Runner-local handler for the director-session control tools.
+
+    ``sys_session_resolve_elicitation``, ``sys_session_interrupt``, and
+    ``sys_session_stop`` let a session drive OTHER sessions' lifecycle.
+    All three require the spec's ``session_control:`` grant and an
+    explicit ``session_id`` argument; the caller's own session is
+    rejected before any HTTP call to prevent self-approval.
+
+    - ``sys_session_resolve_elicitation`` → ``GET /v1/sessions/{target}``
+      to locate the pending elicitation, then
+      ``POST /v1/sessions/{owner}/elicitations/{eid}/resolve`` (owner is
+      ``params.target_session_id`` when the prompt is mirrored into an
+      ancestor, otherwise the target itself).
+    - ``sys_session_interrupt`` → ``POST /v1/sessions/{target}/events``
+      with ``{"type": "interrupt"}``.
+    - ``sys_session_stop`` → ``POST /v1/sessions/{target}/events`` with
+      ``{"type": "stop_session"}``.
+
+    Error mapping matches the other session REST tools: 404 →
+    ``session_not_found``, 401/403 → ``access_denied``, other non-2xx
+    surfaces the server's own message when available.
+
+    :param tool_name: One of the ``_SESSION_CONTROL_TOOLS`` names.
+    :param arguments: JSON-encoded arguments string from the LLM.
+    :param conversation_id: The calling session id, used for the
+        not-own-session guard.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param agent_spec: The session's :class:`AgentSpec`; its
+        ``session_control`` boolean gates this call. ``None`` fails
+        closed.
+    :returns: Tool output JSON string.
+    """
+    if server_client is None:
+        return json.dumps({"error": f"{tool_name} requires server access"})
+    if conversation_id is None:
+        return json.dumps({"error": f"{tool_name} requires a session id"})
+    try:
+        args: dict[str, Any] = json.loads(arguments) if arguments.strip() else {}
+    except json.JSONDecodeError:
+        return json.dumps({"error": f"{tool_name}: malformed JSON arguments"})
+
+    if getattr(agent_spec, "session_control", False) is not True:
+        return json.dumps(
+            {
+                "error": (
+                    "session control is not enabled for this agent "
+                    "(set session_control: true in the spec)"
+                )
+            }
+        )
+
+    target = args.get("session_id")
+    if not isinstance(target, str) or not target:
+        return json.dumps({"error": f"{tool_name} requires an explicit 'session_id' string"})
+    if target == conversation_id:
+        return json.dumps({"error": "cannot_target_own_session", "session_id": target})
+
+    if tool_name == "sys_session_resolve_elicitation":
+        return await _session_resolve_elicitation_via_rest(args, conversation_id, server_client)
+    if tool_name == "sys_session_interrupt":
+        return await _session_interrupt_via_rest(target, server_client)
+    return await _session_stop_via_rest(target, server_client)
+
+
+async def _find_pending_elicitation_owner(
+    session_id: str,
+    elicitation_id: str,
+    server_client: httpx.AsyncClient,
+) -> tuple[str | None, dict[str, Any] | None]:
+    """
+    Locate the owning session for a pending elicitation.
+
+    Reads ``GET /v1/sessions/{session_id}`` and searches its
+    ``pending_elicitations`` for an event whose ``elicitation_id``
+    matches. When the event carries ``params.target_session_id``, that
+    session owns the awaiter (the prompt was mirrored into an ancestor
+    stream); otherwise the queried session owns it.
+
+    :param session_id: The session the director believes owns the prompt.
+    :param elicitation_id: The elicitation correlation id to locate.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :returns: ``(owner_session_id, None)`` on success, or
+        ``(None, error_dict)`` when the session or elicitation is not
+        found or access is denied.
+    """
+    try:
+        resp = await server_client.get(f"/v1/sessions/{session_id}", timeout=30.0)
+    except Exception as exc:  # noqa: BLE001
+        return None, {"error": f"sys_session_resolve_elicitation failed: {exc}"}
+    if resp.status_code == 404:
+        return None, {"error": "session_not_found", "session_id": session_id}
+    if resp.status_code in (401, 403):
+        return None, {"error": "access_denied", "session_id": session_id}
+    if resp.status_code != 200:
+        return None, {"error": f"sys_session_resolve_elicitation returned {resp.status_code}"}
+    snap: dict[str, Any] = resp.json()
+    pending = snap.get("pending_elicitations") or []
+    for event in pending:
+        if isinstance(event, dict) and event.get("elicitation_id") == elicitation_id:
+            params = event.get("params")
+            if isinstance(params, dict):
+                owner = params.get("target_session_id")
+                if isinstance(owner, str) and owner:
+                    return owner, None
+            return session_id, None
+    return None, {
+        "error": "elicitation_not_found",
+        "session_id": session_id,
+        "elicitation_id": elicitation_id,
+    }
+
+
+async def _session_resolve_elicitation_via_rest(
+    args: dict[str, Any],
+    conversation_id: str,
+    server_client: httpx.AsyncClient,
+) -> str:
+    """
+    Resolve a pending elicitation in another session.
+
+    Validates the action, locates the owning session (handling mirrored
+    child prompts), and posts the verdict to the server's resolve
+    endpoint. The caller's own session is rejected even when a mirrored
+    prompt reports the caller as its owner, closing the self-approval
+    bypass through ancestor mirroring.
+    """
+    target = args.get("session_id")
+    elicitation_id = args.get("elicitation_id")
+    if not isinstance(elicitation_id, str) or not elicitation_id:
+        return json.dumps(
+            {"error": "sys_session_resolve_elicitation requires a non-empty 'elicitation_id'"}
+        )
+    action = args.get("action")
+    if action not in {"accept", "decline", "cancel"}:
+        return json.dumps(
+            {
+                "error": (
+                    "sys_session_resolve_elicitation: action must be one of "
+                    "accept, decline, cancel"
+                )
+            }
+        )
+    content = args.get("content")
+    if content is not None and not isinstance(content, dict):
+        return json.dumps(
+            {"error": "sys_session_resolve_elicitation: 'content' must be an object"}
+        )
+
+    owner, err = await _find_pending_elicitation_owner(target, elicitation_id, server_client)
+    if err is not None:
+        return json.dumps(err)
+    if owner == conversation_id:
+        return json.dumps({"error": "cannot_target_own_session", "session_id": owner})
+
+    body: dict[str, Any] = {"action": action}
+    if content is not None:
+        body["content"] = content
+    try:
+        resp = await server_client.post(
+            f"/v1/sessions/{owner}/elicitations/{elicitation_id}/resolve",
+            json=body,
+            timeout=30.0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"sys_session_resolve_elicitation failed: {exc}"})
+    if resp.status_code == 404:
+        return json.dumps({"error": "session_not_found", "session_id": owner})
+    if resp.status_code in (401, 403):
+        return json.dumps({"error": "access_denied", "session_id": owner})
+    if resp.status_code >= 400:
+        detail = _omnigent_error_message(resp)
+        if detail is not None:
+            return json.dumps(
+                {"error": detail, "status_code": resp.status_code, "session_id": owner}
+            )
+        return json.dumps(
+            {"error": f"sys_session_resolve_elicitation returned {resp.status_code}"}
+        )
+    return json.dumps(
+        {
+            "resolved": True,
+            "session_id": owner,
+            "elicitation_id": elicitation_id,
+            "action": action,
+        }
+    )
+
+
+async def _session_interrupt_via_rest(
+    target: str,
+    server_client: httpx.AsyncClient,
+) -> str:
+    """
+    Post an interrupt event to another session.
+    """
+    try:
+        resp = await server_client.post(
+            f"/v1/sessions/{target}/events",
+            json={"type": "interrupt", "data": {}},
+            timeout=30.0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"sys_session_interrupt failed: {exc}"})
+    if resp.status_code == 404:
+        return json.dumps({"error": "session_not_found", "session_id": target})
+    if resp.status_code in (401, 403):
+        return json.dumps({"error": "access_denied", "session_id": target})
+    if resp.status_code >= 400:
+        detail = _omnigent_error_message(resp)
+        if detail is not None:
+            return json.dumps(
+                {"error": detail, "status_code": resp.status_code, "session_id": target}
+            )
+        return json.dumps({"error": f"sys_session_interrupt returned {resp.status_code}"})
+    return json.dumps({"interrupted": True, "session_id": target})
+
+
+async def _session_stop_via_rest(
+    target: str,
+    server_client: httpx.AsyncClient,
+) -> str:
+    """
+    Post a stop_session event to another session.
+    """
+    try:
+        resp = await server_client.post(
+            f"/v1/sessions/{target}/events",
+            json={"type": "stop_session", "data": {}},
+            timeout=30.0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"sys_session_stop failed: {exc}"})
+    if resp.status_code == 404:
+        return json.dumps({"error": "session_not_found", "session_id": target})
+    if resp.status_code in (401, 403):
+        return json.dumps({"error": "access_denied", "session_id": target})
+    if resp.status_code >= 400:
+        detail = _omnigent_error_message(resp)
+        if detail is not None:
+            return json.dumps(
+                {"error": detail, "status_code": resp.status_code, "session_id": target}
+            )
+        return json.dumps({"error": f"sys_session_stop returned {resp.status_code}"})
+    return json.dumps({"stopped": True, "session_id": target})
+
+
 async def _execute_agent_tool(
     tool_name: str,
     args: dict[str, Any],
@@ -4105,6 +4374,14 @@ async def execute_tool(
             )
         elif tool_name in _SESSION_QUERY_TOOLS:
             output = await _execute_session_query_tool(
+                tool_name,
+                arguments,
+                conversation_id=conversation_id,
+                server_client=server_client,
+                agent_spec=agent_spec,
+            )
+        elif tool_name in _SESSION_CONTROL_TOOLS:
+            output = await _execute_session_control_tool(
                 tool_name,
                 arguments,
                 conversation_id=conversation_id,

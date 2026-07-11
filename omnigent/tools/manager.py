@@ -33,9 +33,12 @@ from omnigent.tools.builtins import (
     SysSessionCreateTool,
     SysSessionGetHistoryTool,
     SysSessionGetInfoTool,
+    SysSessionInterruptTool,
     SysSessionListTool,
+    SysSessionResolveElicitationTool,
     SysSessionSendTool,
     SysSessionShareTool,
+    SysSessionStopTool,
     SysTimerCancelTool,
     SysTimerSetTool,
     UpdateCommentTool,
@@ -442,6 +445,17 @@ class ToolManager:
             self._tools[SysSessionShareTool.name()] = SysSessionShareTool(
                 allow_public=self._spec.agent_session_sharing is SharePolicy.PUBLIC,
             )
+
+        # Session control: opt-in via the dedicated ``session_control:``
+        # grant. These tools drive OTHER sessions' lifecycle (resolve
+        # pending approval prompts, interrupt a running turn, stop the
+        # live process). They are gated independently of spawn/agents.
+        if getattr(self._spec, "session_control", False):
+            self._tools[SysSessionResolveElicitationTool.name()] = (
+                SysSessionResolveElicitationTool()
+            )
+            self._tools[SysSessionInterruptTool.name()] = SysSessionInterruptTool()
+            self._tools[SysSessionStopTool.name()] = SysSessionStopTool()
 
         # send + close: opt-in via declared sub-agents or spawn: true.
         if not (self._spec.tools.agents or self._spec.spawn):

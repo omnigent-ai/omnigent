@@ -1159,6 +1159,7 @@ def agent_def_to_agent_spec(
         # ("none"/"non-public"/"public"); map it to the SharePolicy enum
         # AgentSpec expects.
         agent_session_sharing=SharePolicy(agent_def.agent_session_sharing),
+        session_control=agent_def.session_control,
         skills_filter=skills_filter,
     )
 

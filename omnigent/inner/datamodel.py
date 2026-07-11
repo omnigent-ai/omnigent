@@ -807,6 +807,12 @@ class AgentDef:
     # datamodel has no spec.types dep); mapped to SharePolicy when
     # translated to an AgentSpec.
     agent_session_sharing: str = "none"
+    # Grant for driving OTHER sessions' lifecycle via
+    # sys_session_resolve_elicitation / sys_session_interrupt /
+    # sys_session_stop. Tools require an explicit target session and
+    # refuse the caller's own session (no self-approval). YAML key:
+    # ``session_control:``.
+    session_control: bool = False
     os_env: OSEnvSpec | None = None
     terminals: dict[str, TerminalEnvSpec] = field(default_factory=dict)
     skills: SkillRegistry = field(default_factory=dict)
