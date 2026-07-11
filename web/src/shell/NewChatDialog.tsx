@@ -91,6 +91,7 @@ import {
 import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import { useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
+import { useProjectWorkspaces } from "@/hooks/useProjectWorkspaces";
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import { useHostFilesystem, type HostFilesystemEntry } from "@/hooks/useHostFilesystem";
@@ -1988,6 +1989,9 @@ export function NewChatLandingScreen() {
   }, []);
 
   const { recent, addRecent } = useRecentWorkspaces(selectedHostId);
+  // Per-project default working directory: a session started under a project
+  // pre-fills its workspace to the one last used for that project.
+  const { projectWorkspace, setProjectWorkspace } = useProjectWorkspaces(selectedProject);
 
   const allHosts = hosts ?? [];
   const onlineHosts = allHosts.filter((h) => h.status === "online");
@@ -2088,17 +2092,18 @@ export function NewChatLandingScreen() {
   );
 
   // Seed the working directory once per host, into an empty field only, so an
-  // explicit pick isn't clobbered. Prefer the most-recent path; else the
-  // derived home (which can arrive a render later, hence the dep).
+  // explicit pick isn't clobbered. Prefer the active project's saved default,
+  // then the most-recent path, else the derived home (which can arrive a
+  // render later, hence the dep).
   const seededHostRef = useRef<string | null>(null);
   useEffect(() => {
     if (selectedHostId === null) return;
     if (seededHostRef.current === selectedHostId) return;
-    const candidate = recent[0] ?? derivedHome;
+    const candidate = projectWorkspace ?? recent[0] ?? derivedHome;
     if (!candidate) return;
     seededHostRef.current = selectedHostId;
     setWorkspace((cur) => (cur === "" ? candidate : cur));
-  }, [selectedHostId, recent, derivedHome]);
+  }, [selectedHostId, projectWorkspace, recent, derivedHome]);
 
   // A pick only wins while it exists in the list — a persisted id whose
   // agent has since been unregistered (or hidden) falls back to the default.
@@ -2727,7 +2732,11 @@ export function NewChatLandingScreen() {
         }
       }
       // Sandbox creates have no user-picked workspace to remember.
-      if (!sandboxSelected) addRecent(workspaceTrimmed);
+      if (!sandboxSelected) {
+        addRecent(workspaceTrimmed);
+        // Remember this directory as the project's default for next time.
+        if (selectedProject) setProjectWorkspace(workspaceTrimmed);
+      }
       // Fire-and-forget: don't block navigation on the sidebar list refresh.
       // The background refetch (or the WS session_added push) backfills the
       // new session's row within ~1s of landing in the chat; the chat itself
