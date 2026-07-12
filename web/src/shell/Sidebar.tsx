@@ -617,11 +617,11 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                 className="w-full"
               >
                 <TabsList className="w-full">
-                  <TabsTrigger value="mine" data-testid="sidebar-tab-mine">
-                    My sessions
+                  <TabsTrigger value="mine" data-testid="sidebar-tab-mine" className="min-w-0">
+                    <span className="min-w-0 truncate">My sessions</span>
                   </TabsTrigger>
-                  <TabsTrigger value="shared" data-testid="sidebar-tab-shared">
-                    Shared with me
+                  <TabsTrigger value="shared" data-testid="sidebar-tab-shared" className="min-w-0">
+                    <span className="min-w-0 truncate">Shared with me</span>
                   </TabsTrigger>
                 </TabsList>
               </Tabs>
