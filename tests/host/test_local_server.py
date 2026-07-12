@@ -32,13 +32,13 @@ def test_local_server_url_if_healthy_returns_url_when_alive_and_healthy(
     monkeypatch.setattr(local_server, "_LOCAL_SERVER_PID_PATH", pid_file)
     monkeypatch.setattr(local_server, "_pid_alive", lambda pid: pid == 4242)
 
-    health_targets: list[str] = []
+    health_targets: list[tuple[str, bool]] = []
 
     class _Resp:
         status_code = 200
 
-    def _fake_get(url: str, *, timeout: float) -> _Resp:
-        health_targets.append(url)
+    def _fake_get(url: str, *, timeout: float, trust_env: bool) -> _Resp:
+        health_targets.append((url, trust_env))
         return _Resp()
 
     monkeypatch.setattr("httpx.get", _fake_get)
@@ -46,7 +46,36 @@ def test_local_server_url_if_healthy_returns_url_when_alive_and_healthy(
     assert local_server.local_server_url_if_healthy() == "http://127.0.0.1:8123"
     # The probe must hit the recorded port's /health, proving the port from
     # the pidfile (not a hardcoded default) was used.
-    assert health_targets == ["http://127.0.0.1:8123/health"]
+    assert health_targets == [("http://127.0.0.1:8123/health", False)]
+
+
+def test_wait_for_local_server_bypasses_environment_proxies(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The readiness poll must connect to loopback without system proxies."""
+
+    class _Proc:
+        @staticmethod
+        def poll() -> None:
+            return None
+
+    class _Resp:
+        status_code = 200
+
+    health_targets: list[tuple[str, bool]] = []
+
+    def _fake_get(url: str, *, timeout: float, trust_env: bool) -> _Resp:
+        health_targets.append((url, trust_env))
+        return _Resp()
+
+    monkeypatch.setattr("httpx.get", _fake_get)
+
+    local_server._wait_for_local_omnigent_server(
+        "http://127.0.0.1:8123", _Proc(), tmp_path / "server.log"
+    )
+
+    assert health_targets == [("http://127.0.0.1:8123/health", False)]
 
 
 def test_local_server_url_if_healthy_none_when_pid_dead(
@@ -752,9 +781,12 @@ def test_stop_untracked_local_server_kills_orphan_on_default_port(
     confirm it's our server via ``/health``, resolve its PID via lsof, and
     terminate it — returning the PID so the off-switch can report it.
     """
-    monkeypatch.setattr(
-        "httpx.get", lambda url, *, timeout: _FakeHealthResp(200, {"status": "ok"})
-    )
+
+    def _healthy(url: str, *, timeout: float, trust_env: bool) -> _FakeHealthResp:
+        assert trust_env is False
+        return _FakeHealthResp(200, {"status": "ok"})
+
+    monkeypatch.setattr("httpx.get", _healthy)
     monkeypatch.setattr(local_server, "subprocess", _fake_subprocess(stdout="93359\n93360\n"))
     monkeypatch.setattr(local_server, "_pid_alive", lambda pid: True)
     terminated: list[int] = []
@@ -777,7 +809,8 @@ def test_stop_untracked_local_server_noop_when_nothing_listening(
     """
     import httpx
 
-    def _refused(url: str, *, timeout: float) -> Any:
+    def _refused(url: str, *, timeout: float, trust_env: bool) -> Any:
+        assert trust_env is False
         raise httpx.ConnectError("connection refused")
 
     monkeypatch.setattr("httpx.get", _refused)
@@ -795,9 +828,12 @@ def test_stop_untracked_local_server_noop_on_non_omnigent_listener(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A 200 that isn't ``{"status": "ok"}`` is some other app — never killed."""
-    monkeypatch.setattr(
-        "httpx.get", lambda url, *, timeout: _FakeHealthResp(200, {"hello": "world"})
-    )
+
+    def _foreign(url: str, *, timeout: float, trust_env: bool) -> _FakeHealthResp:
+        assert trust_env is False
+        return _FakeHealthResp(200, {"hello": "world"})
+
+    monkeypatch.setattr("httpx.get", _foreign)
     monkeypatch.setattr(local_server, "_terminate_pid", _raise_if_called)
 
     assert local_server.stop_untracked_local_server(port=8000) is None
@@ -811,9 +847,12 @@ def test_stop_untracked_local_server_noop_when_lsof_unavailable(
     Without a PID we can't terminate, so the sweep returns ``None`` rather
     than crashing — the off-switch then leaves a manual hint to the user.
     """
-    monkeypatch.setattr(
-        "httpx.get", lambda url, *, timeout: _FakeHealthResp(200, {"status": "ok"})
-    )
+
+    def _healthy(url: str, *, timeout: float, trust_env: bool) -> _FakeHealthResp:
+        assert trust_env is False
+        return _FakeHealthResp(200, {"status": "ok"})
+
+    monkeypatch.setattr("httpx.get", _healthy)
     monkeypatch.setattr(
         local_server, "subprocess", _fake_subprocess(raises=FileNotFoundError("lsof"))
     )
