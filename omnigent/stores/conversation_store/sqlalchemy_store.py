@@ -526,15 +526,17 @@ def _to_item(row: SqlConversationItem) -> ConversationItem:
 
 def _ranked_latest_message_item_ids(conversation_ids: list[str]) -> Subquery:
     """
-    Build a ranked latest-message-id subquery for multiple conversations.
+    Build a ranked latest-message-key subquery for multiple conversations.
 
     :param conversation_ids: Conversation ids to fetch messages for,
         e.g. ``["conv_child1", "conv_child2"]``.
-    :returns: SQLAlchemy subquery with ``item_id`` and per-conversation
-        ``row_num`` columns, newest message first.
+    :returns: SQLAlchemy subquery with the composite item primary key and
+        per-conversation ``row_num`` column, newest message first.
     """
     return (
         select(
+            SqlConversationItem.workspace_id.label("workspace_id"),
+            SqlConversationItem.conversation_id.label("conversation_id"),
             SqlConversationItem.id.label("item_id"),
             func.row_number()
             .over(
@@ -1551,7 +1553,14 @@ class SqlAlchemyConversationStore(ConversationStore):
             rows = (
                 session.execute(
                     select(SqlConversationItem)
-                    .join(ranked, SqlConversationItem.id == ranked.c.item_id)
+                    .join(
+                        ranked,
+                        and_(
+                            SqlConversationItem.workspace_id == ranked.c.workspace_id,
+                            SqlConversationItem.conversation_id == ranked.c.conversation_id,
+                            SqlConversationItem.id == ranked.c.item_id,
+                        ),
+                    )
                     .where(
                         SqlConversationItem.workspace_id == current_workspace_id(),
                         ranked.c.row_num <= per_conversation_limit,
