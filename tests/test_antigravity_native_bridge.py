@@ -1667,3 +1667,31 @@ def test_ensure_agy_feedback_survey_disabled_write_failure_never_raises(
     leftover = [p.name for p in settings.parent.iterdir() if p.name != settings.name]
     assert leftover == []
     assert "could not write" in caplog.text
+
+
+def test_tmux_send_timeout_default_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Without ``OMNIGENT_TMUX_SEND_TIMEOUT_S`` the send timeout is the 30s default.
+    """
+    monkeypatch.delenv("OMNIGENT_TMUX_SEND_TIMEOUT_S", raising=False)
+    assert _mod._tmux_send_timeout_from_env() == 30.0
+
+
+def test_tmux_send_timeout_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    ``OMNIGENT_TMUX_SEND_TIMEOUT_S`` overrides the send timeout.
+    """
+    monkeypatch.setenv("OMNIGENT_TMUX_SEND_TIMEOUT_S", "12")
+    assert _mod._tmux_send_timeout_from_env() == 12.0
+
+
+@pytest.mark.parametrize("raw", ["banana", "", "-3", "0", "nan", "inf"])
+def test_tmux_send_timeout_malformed_falls_back(
+    monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    """
+    Unparseable, non-positive, or non-finite values must not crash the bridge
+    at import time; they fall back to the default.
+    """
+    monkeypatch.setenv("OMNIGENT_TMUX_SEND_TIMEOUT_S", raw)
+    assert _mod._tmux_send_timeout_from_env() == 30.0
