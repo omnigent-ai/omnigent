@@ -123,7 +123,9 @@ stores into ``create_app``):
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
+import posixpath
 import re
 import secrets
 import time
@@ -831,6 +833,7 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
             kubeconfig=_parse_provider_string(raw, "kubernetes", "kubeconfig"),
             in_cluster=_parse_provider_bool(raw, "kubernetes", "in_cluster"),
             resources=_parse_kubernetes_resources(raw),
+            pvc_mounts=_parse_kubernetes_pvc_mounts(raw),
         )
         token_ttl_s = KUBERNETES_MANAGED_TOKEN_TTL_S
     else:
@@ -1785,6 +1788,115 @@ def _parse_kubernetes_resources(raw: dict[str, object]) -> dict[str, object] | N
     return normalized
 
 
+# Absolute path prefixes a pvc_mounts mount_path may not land on or under:
+# "/home/omnigent" is the runner's writable-HOME emptyDir (mirrors _HOME_DIR in
+# omnigent.onboarding.sandboxes.kubernetes — fixed by design, like the RFC 1123
+# regexes above); "/var/run/secrets" is where Kubernetes projects Secrets; the
+# rest would shadow the image's OS or the host's scratch space.
+_KUBERNETES_RESERVED_MOUNT_PREFIXES: tuple[str, ...] = (
+    "/home/omnigent",
+    "/var/run/secrets",
+    "/tmp",
+    "/etc",
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib64",
+    "/proc",
+    "/sys",
+    "/dev",
+)
+
+
+def _parse_kubernetes_pvc_mounts(raw: dict[str, object]) -> list[dict[str, object]] | None:
+    """
+    Extract and validate the optional ``sandbox.kubernetes.pvc_mounts`` list.
+
+    Each entry references a PersistentVolumeClaim the operator pre-created in
+    the runner namespace: ``{claim_name, mount_path, read_only?}`` with
+    ``read_only`` defaulting to ``True``. Validated at parse time so an
+    operator typo fails server startup instead of the first managed launch.
+
+    :param raw: The raw ``sandbox`` mapping.
+    :returns: Normalized entries, or ``None`` when omitted or empty.
+    :raises ValueError: When the list or any entry has the wrong shape, a name
+        or path is malformed, a path is reserved, or paths collide.
+    """
+    section = _parse_provider_section(raw, "kubernetes")
+    if section is None:
+        return None
+    value = section.get("pvc_mounts")
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise ValueError(
+            "server config 'sandbox.kubernetes.pvc_mounts' must be a list of "
+            "{claim_name, mount_path, read_only?} entries"
+        )
+    normalized: list[dict[str, object]] = []
+    for i, entry in enumerate(value):
+        path_prefix = f"sandbox.kubernetes.pvc_mounts[{i}]"
+        if not isinstance(entry, dict):
+            raise ValueError(f"server config '{path_prefix}' must be a mapping")
+        unknown = sorted(set(entry) - {"claim_name", "mount_path", "read_only"})
+        if unknown:
+            raise ValueError(
+                f"server config '{path_prefix}' has unknown key(s): "
+                f"{', '.join(unknown)} (expected claim_name, mount_path, read_only)"
+            )
+        claim = entry.get("claim_name")
+        if not isinstance(claim, str) or not claim.strip():
+            raise ValueError(
+                f"server config '{path_prefix}.claim_name' must name a "
+                "PersistentVolumeClaim pre-created in the runner namespace"
+            )
+        claim = claim.strip()
+        if len(claim) > 253 or not _DNS1123_SUBDOMAIN_RE.fullmatch(claim):
+            raise ValueError(
+                f"server config '{path_prefix}.claim_name' is not a valid "
+                f"Kubernetes name (RFC 1123 DNS subdomain): {claim!r}"
+            )
+        mount = entry.get("mount_path")
+        if not isinstance(mount, str) or not mount.startswith("/"):
+            raise ValueError(
+                f"server config '{path_prefix}.mount_path' must be an absolute "
+                "in-Pod path, e.g. '/mnt/datasets'"
+            )
+        if mount != posixpath.normpath(mount):
+            raise ValueError(
+                f"server config '{path_prefix}.mount_path' must be a normalized "
+                f"path (no '..', '.', doubled or trailing slashes): {mount!r}"
+            )
+        if mount == "/" or any(
+            mount == p or mount.startswith(p + "/")
+            for p in _KUBERNETES_RESERVED_MOUNT_PREFIXES
+        ):
+            raise ValueError(
+                f"server config '{path_prefix}.mount_path' is a reserved path: "
+                f"{mount!r} (the runner's HOME, Secret projections, and OS "
+                "directories cannot be shadowed)"
+            )
+        read_only = entry.get("read_only", True)
+        if not isinstance(read_only, bool):
+            raise ValueError(f"server config '{path_prefix}.read_only' must be a boolean")
+        normalized.append({"claim_name": claim, "mount_path": mount, "read_only": read_only})
+    for a, b in itertools.combinations(normalized, 2):
+        pa, pb = str(a["mount_path"]), str(b["mount_path"])
+        if pa == pb:
+            raise ValueError(
+                "server config 'sandbox.kubernetes.pvc_mounts' has a duplicate "
+                f"mount_path: {pa!r}"
+            )
+        low, high = sorted((pa, pb), key=len)
+        if high.startswith(low + "/"):
+            raise ValueError(
+                "server config 'sandbox.kubernetes.pvc_mounts' has nested "
+                f"mount_paths: {low!r} contains {high!r}"
+            )
+    return normalized or None
+
+
 def _kubernetes_launcher_factory(
     *,
     image: str | None,
@@ -1796,6 +1908,7 @@ def _kubernetes_launcher_factory(
     kubeconfig: str | None,
     in_cluster: bool | None,
     resources: dict[str, object] | None,
+    pvc_mounts: list[dict[str, object]] | None,
 ) -> Callable[[], SandboxLauncher]:
     """
     Build the launcher factory for the YAML ``provider: kubernetes`` path.
@@ -1817,6 +1930,8 @@ def _kubernetes_launcher_factory(
     :param in_cluster: Force the cluster-config source, or ``None`` to try
         in-cluster then fall back to kubeconfig.
     :param resources: Validated ``resources`` block, or ``None`` for defaults.
+    :param pvc_mounts: Normalized PVC mount entries added to every runner Pod,
+        or ``None``.
     :returns: A factory producing parameterized Kubernetes launchers.
     :raises ValueError: When a name or node-selector label is malformed.
     """
@@ -1836,6 +1951,7 @@ def _kubernetes_launcher_factory(
             kubeconfig=kubeconfig,
             in_cluster=in_cluster,
             resources=resources,
+            pvc_mounts=pvc_mounts,
         )
 
     return _build

@@ -702,6 +702,119 @@ def test_parse_kubernetes_invalid_block_fails_loud(
         )
 
 
+def test_parse_kubernetes_pvc_mounts_normalizes_and_reaches_launcher(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """pvc_mounts parse into normalized entries (read_only defaults True) on the launcher."""
+    cfg = parse_sandbox_config(
+        {
+            "provider": "kubernetes",
+            "server_url": "http://s.svc.cluster.local",
+            "kubernetes": {
+                "pvc_mounts": [
+                    {"claim_name": "omnigent-datasets", "mount_path": "/mnt/datasets"},
+                    {"claim_name": "scratch", "mount_path": "/mnt/scratch", "read_only": False},
+                ]
+            },
+        }
+    )
+    assert cfg is not None
+    fake = FakeSandboxLauncher()
+    install_fake_kubernetes_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.pvc_mounts == [
+        {"claim_name": "omnigent-datasets", "mount_path": "/mnt/datasets", "read_only": True},
+        {"claim_name": "scratch", "mount_path": "/mnt/scratch", "read_only": False},
+    ]
+
+
+def test_parse_kubernetes_without_pvc_mounts_is_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Omitted (or empty) pvc_mounts reach the launcher as None — no volumes added."""
+    cfg = parse_sandbox_config(
+        {
+            "provider": "kubernetes",
+            "server_url": "http://s.svc.cluster.local",
+            "kubernetes": {"pvc_mounts": []},
+        }
+    )
+    assert cfg is not None
+    fake = FakeSandboxLauncher()
+    install_fake_kubernetes_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.pvc_mounts is None
+
+
+@pytest.mark.parametrize(
+    ("pvc_mounts", "expected_fragment"),
+    [
+        # Wrong container shapes.
+        ("nfs-share", "must be a list"),
+        ([["claim"]], "must be a mapping"),
+        # Unknown / missing keys.
+        ([{"claim_name": "c", "mount_path": "/mnt/x", "sub_path": "y"}], "unknown key"),
+        ([{"mount_path": "/mnt/x"}], "claim_name"),
+        ([{"claim_name": "c"}], "mount_path"),
+        # Bad claim names (PVC names are DNS-1123 subdomains).
+        ([{"claim_name": "Bad_Claim", "mount_path": "/mnt/x"}], "claim_name"),
+        # Bad mount paths: relative, unnormalized, root, reserved.
+        ([{"claim_name": "c", "mount_path": "mnt/x"}], "absolute"),
+        ([{"claim_name": "c", "mount_path": "/mnt/../etc"}], "normalized"),
+        ([{"claim_name": "c", "mount_path": "/mnt/x/"}], "normalized"),
+        ([{"claim_name": "c", "mount_path": "/"}], "reserved"),
+        ([{"claim_name": "c", "mount_path": "/home/omnigent/data"}], "reserved"),
+        ([{"claim_name": "c", "mount_path": "/var/run/secrets/x"}], "reserved"),
+        ([{"claim_name": "c", "mount_path": "/tmp"}], "reserved"),
+        ([{"claim_name": "c", "mount_path": "/etc"}], "reserved"),
+        # read_only must be a boolean, not a truthy string.
+        ([{"claim_name": "c", "mount_path": "/mnt/x", "read_only": "yes"}], "boolean"),
+        # Duplicates / nesting between entries.
+        (
+            [
+                {"claim_name": "a", "mount_path": "/mnt/x"},
+                {"claim_name": "b", "mount_path": "/mnt/x"},
+            ],
+            "duplicate",
+        ),
+        (
+            [
+                {"claim_name": "a", "mount_path": "/mnt/x"},
+                {"claim_name": "b", "mount_path": "/mnt/x/sub"},
+            ],
+            "nested",
+        ),
+    ],
+)
+def test_parse_kubernetes_pvc_mounts_invalid_fails_loud(
+    pvc_mounts: object, expected_fragment: str
+) -> None:
+    """An operator typo in pvc_mounts fails at parse (server startup), not at launch."""
+    with pytest.raises(ValueError, match=expected_fragment):
+        parse_sandbox_config(
+            {
+                "provider": "kubernetes",
+                "server_url": "http://s.svc.cluster.local",
+                "kubernetes": {"pvc_mounts": pvc_mounts},
+            }
+        )
+
+
+def test_parse_kubernetes_pvc_mounts_sibling_prefix_is_not_nested() -> None:
+    """/mnt/data vs /mnt/database share a string prefix but are distinct mounts."""
+    cfg = parse_sandbox_config(
+        {
+            "provider": "kubernetes",
+            "server_url": "http://s.svc.cluster.local",
+            "kubernetes": {
+                "pvc_mounts": [
+                    {"claim_name": "a", "mount_path": "/mnt/data"},
+                    {"claim_name": "b", "mount_path": "/mnt/database"},
+                ]
+            },
+        }
+    )
+    assert cfg is not None
+
+
 @pytest.mark.parametrize(
     ("raw", "expected_fragment"),
     [
