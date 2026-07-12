@@ -516,6 +516,31 @@ def test_launch_host_creates_secret_then_pod_and_returns_workspace(
     assert fake_core.deleted_pods == []
 
 
+def test_launch_host_threads_pvc_mounts_into_the_pod(fake_core: _FakeCore) -> None:
+    """A launcher built with pvc_mounts creates Pods carrying the PVC volume."""
+    fake_core.read_queue = [_pod(phase="Running")]
+    launcher = KubernetesSandboxLauncher(
+        in_cluster=True,
+        namespace="omnigent-sandboxes",
+        secret_name="omnigent-creds",
+        env=(),
+        pvc_mounts=[
+            {"claim_name": "omnigent-datasets", "mount_path": "/mnt/datasets", "read_only": True}
+        ],
+    )
+    launcher.start_host(
+        "omnigent-pod-1",
+        token=_TOKEN,
+        host_id="host_1",
+        host_name="managed-1",
+        server_url="http://srv.example.com",
+    )
+    assert {
+        "name": "pvc-0",
+        "persistentVolumeClaim": {"claimName": "omnigent-datasets", "readOnly": True},
+    } in fake_core.created_pods[0]["spec"]["volumes"]
+
+
 def test_launch_host_with_repo_returns_clone_dir(fake_core: _FakeCore) -> None:
     """With a repo, the returned workspace is the cloned directory under the workspace."""
     fake_core.read_queue = [_pod(phase="Running")]

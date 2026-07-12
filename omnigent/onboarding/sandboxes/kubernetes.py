@@ -838,6 +838,7 @@ class KubernetesSandboxLauncher(SandboxLauncher):
         kubeconfig: str | None = None,
         in_cluster: bool | None = None,
         resources: dict[str, object] | None = None,
+        pvc_mounts: Sequence[Mapping[str, object]] | None = None,
     ) -> None:
         """
         Initialize the launcher.
@@ -862,6 +863,8 @@ class KubernetesSandboxLauncher(SandboxLauncher):
             ``False`` kubeconfig only, ``None`` to try in-cluster then fall back.
         :param resources: ``sandbox.kubernetes.resources`` block, or ``None``
             for the built-in defaults.
+        :param pvc_mounts: Normalized ``sandbox.kubernetes.pvc_mounts`` entries
+            (validated at parse time), or ``None`` for none.
         """
         self._image_ref = image
         self._namespace = namespace
@@ -872,6 +875,7 @@ class KubernetesSandboxLauncher(SandboxLauncher):
         self._kubeconfig = kubeconfig
         self._in_cluster = in_cluster
         self._resources = resources
+        self._pvc_mounts = [dict(m) for m in pvc_mounts] if pvc_mounts else None
         self._core: k8s_client.CoreV1Api | None = None
         self._api_client: k8s_client.ApiClient | None = None
 
@@ -1167,6 +1171,7 @@ class KubernetesSandboxLauncher(SandboxLauncher):
                     repo_branch=repo_branch,
                     host_config=host_config,
                     resources=self._resources,
+                    pvc_mounts=self._pvc_mounts,
                 )
                 # Secret before Pod so the Pod's secretKeyRef resolves
                 # immediately — a Pod referencing a missing Secret would sit in
