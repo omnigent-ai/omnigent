@@ -770,9 +770,7 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
         token_ttl_s = DAYTONA_MANAGED_TOKEN_TTL_S
     elif provider == "boxlite":
         section = _boxlite_section(raw)
-        _reject_unknown_boxlite_keys(
-            section, {"image", "env", "local", "cloud"}, "sandbox.boxlite"
-        )
+        _reject_unknown_keys(section, {"image", "env", "local", "cloud"}, "sandbox.boxlite")
         endpoint, home_dir, registry = _parse_boxlite_mode(section)
         launcher_factory = _boxlite_launcher_factory(
             endpoint,
@@ -823,6 +821,24 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
         )
         token_ttl_s = OPENSHELL_MANAGED_TOKEN_TTL_S
     elif provider == "kubernetes":
+        kubernetes_section = _parse_provider_section(raw, "kubernetes")
+        if kubernetes_section is not None:
+            _reject_unknown_keys(
+                kubernetes_section,
+                {
+                    "image",
+                    "env",
+                    "namespace",
+                    "secret_name",
+                    "service_account",
+                    "node_selector",
+                    "kubeconfig",
+                    "in_cluster",
+                    "resources",
+                    "pvc_mounts",
+                },
+                "sandbox.kubernetes",
+            )
         launcher_factory = _kubernetes_launcher_factory(
             image=_parse_provider_image(raw, "kubernetes"),
             env=_parse_provider_env(raw, "kubernetes"),
@@ -1079,7 +1095,7 @@ def _boxlite_section(raw: dict[str, object]) -> dict[str, object]:
     return section
 
 
-def _reject_unknown_boxlite_keys(mapping: dict[str, object], allowed: set[str], path: str) -> None:
+def _reject_unknown_keys(mapping: dict[str, object], allowed: set[str], path: str) -> None:
     """
     Fail loud on any key outside *allowed* — catches typos and misplaced keys
     (e.g. ``endpoint`` at the section level instead of under ``cloud:``, or a
@@ -1130,7 +1146,7 @@ def _parse_boxlite_mode(
     if cloud_present:
         if not isinstance(cloud_block, dict):
             raise ValueError("server config 'sandbox.boxlite.cloud' must be a mapping")
-        _reject_unknown_boxlite_keys(cloud_block, {"endpoint"}, "sandbox.boxlite.cloud")
+        _reject_unknown_keys(cloud_block, {"endpoint"}, "sandbox.boxlite.cloud")
         endpoint = cloud_block.get("endpoint")
         if not isinstance(endpoint, str) or not endpoint.strip():
             raise ValueError(
@@ -1143,7 +1159,7 @@ def _parse_boxlite_mode(
         return None, None, None
     if not isinstance(local_block, dict):
         raise ValueError("server config 'sandbox.boxlite.local' must be a mapping")
-    _reject_unknown_boxlite_keys(local_block, {"home_dir", "registry"}, "sandbox.boxlite.local")
+    _reject_unknown_keys(local_block, {"home_dir", "registry"}, "sandbox.boxlite.local")
     return None, _parse_boxlite_home_dir(local_block), _parse_boxlite_registry(local_block)
 
 
@@ -1224,7 +1240,7 @@ def _parse_boxlite_registry(local: dict[str, object]) -> dict[str, object] | Non
         return None
     if not isinstance(registry, dict):
         raise ValueError("server config 'sandbox.boxlite.local.registry' must be a mapping")
-    _reject_unknown_boxlite_keys(
+    _reject_unknown_keys(
         registry,
         {"host", "transport", "skip_verify", "username_env", "password_env", "token_env"},
         "sandbox.boxlite.local.registry",

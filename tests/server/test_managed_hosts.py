@@ -556,6 +556,7 @@ def test_parse_kubernetes_without_section_defaults(monkeypatch: pytest.MonkeyPat
     assert fake.secret_name is None
     assert fake.in_cluster is None
     assert fake.resources is None
+    assert fake.pvc_mounts is None
 
 
 def test_parse_host_config_threads_verbatim_without_resolving_secrets(
@@ -686,6 +687,9 @@ def test_parse_host_config_lossy_json_key_collision_fails_loud() -> None:
         ({"resources": {"requests": {"cpu": "not a quantity!"}}}, "valid Kubernetes quantity"),
         ({"resources": {"requests": {"disk": "1Gi"}}}, "unknown key"),
         ({"in_cluster": "yes"}, "must be a boolean"),
+        # A misspelled section key would silently no-op (e.g. no PVCs mounted)
+        # without the allowlist check.
+        ({"pvc_mount": [{"claim_name": "c", "mount_path": "/mnt/x"}]}, "unknown key"),
     ],
 )
 def test_parse_kubernetes_invalid_block_fails_loud(
