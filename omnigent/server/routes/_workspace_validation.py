@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import secrets
 from typing import Any
 
@@ -214,11 +215,13 @@ async def validate_workspace(
         The exception message is suitable for surfacing to the
         API caller verbatim.
     """
-    if not workspace.startswith("/"):
+    if not os.path.isabs(workspace):
         # Belt-and-suspenders. The Pydantic schema layer also
         # rejects this; pin it here so direct callers (tests,
         # other server-internal paths) can't bypass.
-        raise WorkspaceValidationError("workspace must be an absolute path starting with /")
+        raise WorkspaceValidationError(
+            "workspace must be an absolute path (e.g. '/home/user/project' or 'C:\\project')"
+        )
 
     display_host = host_name_for_errors or host_id
 

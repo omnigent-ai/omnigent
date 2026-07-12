@@ -6167,9 +6167,9 @@ async def _validate_session_workspace(
             "workspace required when host_id is set",
             code=ErrorCode.INVALID_INPUT,
         )
-    if not workspace.startswith("/"):
+    if not os.path.isabs(workspace):
         raise OmnigentError(
-            "workspace must be an absolute path starting with /",
+            "workspace must be an absolute path (e.g. '/home/user/project' or 'C:\\project')",
             code=ErrorCode.INVALID_INPUT,
         )
     if agent_cache is None:
