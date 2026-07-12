@@ -1869,8 +1869,7 @@ def _parse_kubernetes_pvc_mounts(raw: dict[str, object]) -> list[dict[str, objec
                 f"path (no '..', '.', doubled or trailing slashes): {mount!r}"
             )
         if mount == "/" or any(
-            mount == p or mount.startswith(p + "/")
-            for p in _KUBERNETES_RESERVED_MOUNT_PREFIXES
+            mount == p or mount.startswith(p + "/") for p in _KUBERNETES_RESERVED_MOUNT_PREFIXES
         ):
             raise ValueError(
                 f"server config '{path_prefix}.mount_path' is a reserved path: "
@@ -1885,8 +1884,7 @@ def _parse_kubernetes_pvc_mounts(raw: dict[str, object]) -> list[dict[str, objec
         pa, pb = str(a["mount_path"]), str(b["mount_path"])
         if pa == pb:
             raise ValueError(
-                "server config 'sandbox.kubernetes.pvc_mounts' has a duplicate "
-                f"mount_path: {pa!r}"
+                f"server config 'sandbox.kubernetes.pvc_mounts' has a duplicate mount_path: {pa!r}"
             )
         low, high = sorted((pa, pb), key=len)
         if high.startswith(low + "/"):

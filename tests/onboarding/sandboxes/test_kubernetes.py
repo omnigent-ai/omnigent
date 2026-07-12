@@ -270,7 +270,11 @@ def test_build_pod_manifest_pvc_mounts_land_on_host_container_only() -> None:
     }
     assert volumes["pvc-1"]["persistentVolumeClaim"] == {"claimName": "scratch"}
     host_mounts = {m["name"]: m for m in spec["containers"][0]["volumeMounts"]}
-    assert host_mounts["pvc-0"] == {"name": "pvc-0", "mountPath": "/mnt/datasets", "readOnly": True}
+    assert host_mounts["pvc-0"] == {
+        "name": "pvc-0",
+        "mountPath": "/mnt/datasets",
+        "readOnly": True,
+    }
     assert host_mounts["pvc-1"] == {"name": "pvc-1", "mountPath": "/mnt/scratch"}
     # The init container keeps exactly its HOME emptyDir — no dataset exposure at clone time.
     assert spec["initContainers"][0]["volumeMounts"] == [
