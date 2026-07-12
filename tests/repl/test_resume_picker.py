@@ -27,7 +27,9 @@ import io
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
+import click
 import pytest
 
 from omnigent.entities import ConversationItem, MessageData
@@ -35,6 +37,7 @@ from omnigent.repl._resume_picker import (
     _extract_text_from_content_blocks,
     _last_message_preview_from_dicts,
     _last_message_preview_from_entities,
+    _list_sessions_with_rate_limit_retry,
     _Preview,
     pick_conversation,
     pick_conversation_from_store,
@@ -73,6 +76,53 @@ class _TtyPickResult:
     rendered: str
 
 
+@pytest.mark.asyncio
+async def test_session_list_retries_two_rate_limits(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = 0
+    sleeps: list[float] = []
+
+    class RateLimited(Exception):
+        status_code = 429
+
+    async def list_sessions(**kwargs: object) -> list[str]:
+        nonlocal calls
+        calls += 1
+        assert kwargs == {"limit": 200}
+        if calls < 3:
+            raise RateLimited
+        return ["conv_ready"]
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr("omnigent.repl._resume_picker._sleep", fake_sleep)
+    client = SimpleNamespace(sessions=SimpleNamespace(list=list_sessions))
+
+    assert await _list_sessions_with_rate_limit_retry(client, limit=200) == ["conv_ready"]
+    assert calls == 3
+    assert sleeps == [1.0, 2.0]
+
+
+@pytest.mark.asyncio
+async def test_session_list_rate_limit_exhaustion_is_clean(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RateLimited(Exception):
+        status_code = 429
+
+    async def list_sessions(**_kwargs: object) -> list[str]:
+        raise RateLimited
+
+    async def fake_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr("omnigent.repl._resume_picker._sleep", fake_sleep)
+    client = SimpleNamespace(sessions=SimpleNamespace(list=list_sessions))
+
+    with pytest.raises(click.ClickException, match="temporarily rate-limited"):
+        await _list_sessions_with_rate_limit_retry(client, limit=200)
+
+
 def _convs(n: int) -> list[_FakeConversation]:
     """
     Build *n* fake conversations with monotonically increasing
@@ -88,6 +138,23 @@ def _convs(n: int) -> list[_FakeConversation]:
         )
         for i in range(1, n + 1)
     ]
+
+
+def test_sdk_session_list_item_preserves_host_id() -> None:
+    from omnigent_client._sessions import SessionListItem
+
+    item = SessionListItem.from_dict(
+        {
+            "id": "conv_hosted",
+            "agent_id": "agent_1",
+            "status": "idle",
+            "created_at": 1,
+            "updated_at": 2,
+            "host_id": "host_this_mac",
+        }
+    )
+
+    assert item.host_id == "host_this_mac"
 
 
 # ── 1. Pure picker ───────────────────────────────────────
@@ -840,6 +907,7 @@ class _BadgeRow:
     title: str | None = "test"
     created_at: int = 0
     labels: dict[str, str] | None = None
+    host_id: str | None = None
 
 
 def test_runtime_badge_claude_native() -> None:
@@ -1021,12 +1089,20 @@ async def test_wrapper_label_picker_filters_and_lists_without_agent_filter(
             id="conv_claude_1",
             title="claude one",
             labels={"omnigent.wrapper": "claude-code-native-ui"},
+            host_id="host_this_mac",
         ),
         _BadgeRow(id="conv_chat", title="chat one", labels={}),
         _BadgeRow(
             id="conv_claude_2",
             title="claude two",
             labels={"omnigent.wrapper": "claude-code-native-ui"},
+            host_id="host_this_mac",
+        ),
+        _BadgeRow(
+            id="conv_claude_other_host",
+            title="claude elsewhere",
+            labels={"omnigent.wrapper": "claude-code-native-ui"},
+            host_id="host_other_machine",
         ),
     ]
     client = _FakeAPClient(rows=rows)
@@ -1037,6 +1113,7 @@ async def test_wrapper_label_picker_filters_and_lists_without_agent_filter(
         client,
         wrapper_value="claude-code-native-ui",
         agent_name="claude-native-ui",
+        host_id="host_this_mac",
         out=out,
         in_=io.StringIO("2\n"),
     )
@@ -1050,6 +1127,7 @@ async def test_wrapper_label_picker_filters_and_lists_without_agent_filter(
     assert "conv_claude_1" in rendered
     assert "conv_claude_2" in rendered
     assert "conv_chat" not in rendered
+    assert "conv_claude_other_host" not in rendered
     # No launch state was recorded for these fake rows, so the
     # picker should not render empty workspace placeholders.
     assert "Workspace" not in rendered

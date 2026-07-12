@@ -460,6 +460,7 @@ def _resolve_session_id_for_resume(
     headers: dict[str, str],
     session_id: str | None,
     resume_picker: bool,
+    host_id: str | None = None,
 ) -> str | None:
     """
     Translate the CLI's resume inputs into a concrete session id.
@@ -487,7 +488,10 @@ def _resolve_session_id_for_resume(
             base_url=base_url, headers=headers if headers else None
         ) as client:
             return await pick_conversation_by_wrapper_label_from_sdk(
-                client, wrapper_value=_WRAPPER_LABEL_VALUE, agent_name=_AGENT_NAME
+                client,
+                wrapper_value=_WRAPPER_LABEL_VALUE,
+                agent_name=_AGENT_NAME,
+                host_id=host_id,
             )
 
     return asyncio.run(_drive())
@@ -2885,11 +2889,13 @@ def _run_with_remote_server(
     should_print_resume_hint = False
     try:
         startup_profiler.mark("resolving remote session")
+        host_id = load_or_create_host_identity().host_id
         resolved_session_id = _resolve_session_id_for_resume(
             base_url=base_url,
             headers=headers,
             session_id=session_id,
             resume_picker=resume_picker,
+            host_id=host_id,
         )
         startup_profiler.mark(
             "remote session resolved",
@@ -2930,7 +2936,6 @@ def _run_with_remote_server(
                 "host daemon ready",
                 startup_progress=progress,
             )
-            host_id = load_or_create_host_identity().host_id
             _mark_startup_step(
                 startup_profiler,
                 "host identity loaded",

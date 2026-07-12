@@ -247,6 +247,7 @@ class SessionListItem:
     :param title: Optional human-readable title.
     :param labels: Session-scoped guardrails labels.
     :param runner_id: Runner currently bound to the session.
+    :param host_id: Host the session is bound to, when host-managed.
     :param reasoning_effort: Per-session reasoning-effort hint.
     :param owner: User ID of the session owner.
     :param external_session_id: Runtime-native session id this
@@ -271,6 +272,7 @@ class SessionListItem:
     title: str | None = None
     labels: dict[str, str] = field(default_factory=dict)
     runner_id: str | None = None
+    host_id: str | None = None
     reasoning_effort: str | None = None
     owner: str | None = None
     external_session_id: str | None = None
@@ -296,6 +298,7 @@ class SessionListItem:
             title=raw.get("title"),
             labels=labels_raw if isinstance(labels_raw, dict) else {},
             runner_id=raw.get("runner_id"),
+            host_id=raw.get("host_id"),
             reasoning_effort=raw.get("reasoning_effort"),
             owner=raw.get("owner"),
             external_session_id=raw.get("external_session_id"),
