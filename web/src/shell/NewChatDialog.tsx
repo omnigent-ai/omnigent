@@ -84,8 +84,10 @@ import {
 import { useHosts, type Host } from "@/hooks/useHosts";
 import {
   controlHost,
+  isAndroidShell,
   getHostIdentity,
   isElectronShell,
+  isIOSShell,
   onHostStatusChanged,
   type HostIdentity,
 } from "@/lib/nativeBridge";
@@ -1316,6 +1318,8 @@ function AgentHarnessPicker({
   setPickedEffort: (effort: string) => void;
   setPickedHarness: (harness: string | null, agentId?: string) => void;
 }) {
+  const canImportAgentConfig = !isIOSShell() && !isAndroidShell();
+
   // Controlled so clicking a knobbed row can commit the pick and close the
   // menu (see the sub-trigger onClick below) without diving into the submenu.
   const [open, setOpen] = useState(false);
@@ -1699,14 +1703,16 @@ function AgentHarnessPicker({
                   <PlusIcon className="size-3.5" />
                   Configure Manually
                 </DropdownMenuItem>
-                <DropdownMenuItem
-                  data-testid="new-chat-landing-import-agent"
-                  onSelect={onImportConfig}
-                  className="gap-2 rounded-sm px-2 py-1.5 text-13 text-muted-foreground"
-                >
-                  <FolderInputIcon className="size-3.5" />
-                  Import Config
-                </DropdownMenuItem>
+                {canImportAgentConfig && (
+                  <DropdownMenuItem
+                    data-testid="new-chat-landing-import-agent"
+                    onSelect={onImportConfig}
+                    className="gap-2 rounded-sm px-2 py-1.5 text-13 text-muted-foreground"
+                  >
+                    <FolderInputIcon className="size-3.5" />
+                    Import Config
+                  </DropdownMenuItem>
+                )}
               </DropdownMenuSubContent>
             </DropdownMenuSub>
           </>
@@ -3746,15 +3752,17 @@ export function NewChatLandingScreen() {
           setPickedHarness(null);
         }}
       />
-      <ImportAgentDialog
-        open={importAgentOpen}
-        onOpenChange={setImportAgentOpen}
-        onImport={(agent: ImportedAgent) => {
-          setPendingAgent({ kind: "imported", name: agent.name, bundle: agent.bundle });
-          setPickedAgentId(PENDING_AGENT_ID);
-          setPickedHarness(null);
-        }}
-      />
+      {!isIOSShell() && !isAndroidShell() && (
+        <ImportAgentDialog
+          open={importAgentOpen}
+          onOpenChange={setImportAgentOpen}
+          onImport={(agent: ImportedAgent) => {
+            setPendingAgent({ kind: "imported", name: agent.name, bundle: agent.bundle });
+            setPickedAgentId(PENDING_AGENT_ID);
+            setPickedHarness(null);
+          }}
+        />
+      )}
     </div>
   );
 }

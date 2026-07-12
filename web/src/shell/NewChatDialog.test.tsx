@@ -676,6 +676,7 @@ describe("NewChatLandingScreen", () => {
   afterEach(() => {
     cleanup();
     localStorage.clear();
+    delete (window as unknown as Record<string, unknown>).omnigentNative;
   });
 
   it("renders the inline composer with the prompt headline", () => {
@@ -744,6 +745,17 @@ describe("NewChatLandingScreen", () => {
       true,
     );
     expect(screen.getByText("No agents")).toBeTruthy();
+  });
+
+  it.each(["ios", "android"] as const)("hides config import in the %s native shell", (kind) => {
+    (window as unknown as Record<string, unknown>).omnigentNative = { kind };
+    renderLanding();
+
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.keyDown(screen.getByTestId("new-chat-landing-add-agent"), { key: "ArrowRight" });
+
+    expect(screen.getByTestId("new-chat-landing-create-agent")).toBeTruthy();
+    expect(screen.queryByTestId("new-chat-landing-import-agent")).toBeNull();
   });
 
   it("orders native built-ins together in the agent picker", () => {
