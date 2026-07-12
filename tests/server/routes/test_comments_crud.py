@@ -7,6 +7,7 @@ import pytest_asyncio
 
 from omnigent.db.utils import generate_agent_id
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -67,6 +68,21 @@ async def test_add_comment_end_before_start(client: httpx.AsyncClient, session_i
         json=_comment_payload(start_index=10, end_index=5),
     )
     assert resp.status_code == 422
+
+
+async def test_add_comment_nonexistent_session_returns_404_without_persisting(
+    client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """Adding a comment to a nonexistent single-user session returns 404."""
+    missing_session_id = "conv_does_not_exist"
+
+    resp = await client.post(
+        f"/v1/sessions/{missing_session_id}/comments",
+        json=_comment_payload(),
+    )
+
+    assert resp.status_code == 404
+    assert SqlAlchemyCommentStore(db_uri).list_for_conversation(missing_session_id) == []
 
 
 # ── GET /sessions/{id}/comments ──────────────────────────────────────

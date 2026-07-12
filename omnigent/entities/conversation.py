@@ -101,7 +101,7 @@ class Conversation:
         default from the spec's ``llm.model``. Mutable via
         ``PATCH /v1/sessions/{id}`` and the REPL's ``/model``
         command. Mirrors the persistence shape of
-        ``reasoning_effort`` so the ap-web UI and the TUI stay
+        ``reasoning_effort`` so the web UI and the TUI stay
         in sync — both read it from the session snapshot and
         write it through the same PATCH endpoint.
     :param cost_control_mode_override: Per-session cost-control
@@ -109,7 +109,7 @@ class Conversation:
         mode, ``"off"`` disables cost control for this session, and
         ``None`` (unset) defers to the spec default. Set at session
         creation via ``POST /v1/sessions`` and mutable via
-        ``PATCH /v1/sessions/{id}`` (the ap-web "Cost Optimized"
+        ``PATCH /v1/sessions/{id}`` (the web "Cost Optimized"
         toggle). Read by the cost-control advisor pipeline at turn
         start; mirrors the persistence shape of ``model_override``.
     :param harness_override: Per-session harness override for the
@@ -180,6 +180,12 @@ class Conversation:
         listing (and the sidebar), surfacing only when the caller
         passes ``include_archived=True``. ``False`` for normal
         sessions; toggled via ``PATCH /v1/sessions/{id}``.
+    :param search_snippet: Transient, list-only excerpt of the chat
+        content that matched a ``search_query`` — set by
+        ``list_conversations`` whenever the query hit an item's body (even
+        if the title also matched), so the search UI can show *where* the
+        session matched. Never persisted (not a DB column) and ``None`` on
+        every non-search read path and title-only matches.
     """
 
     id: str
@@ -205,6 +211,9 @@ class Conversation:
     workspace: str | None = None
     git_branch: str | None = None
     archived: bool = False
+    # Transient: populated only by list_conversations on a content search;
+    # never read from or written to the DB.
+    search_snippet: str | None = None
 
 
 # ── Conversation item data types ───────────────────────
@@ -404,8 +413,10 @@ class CompactionData(BaseModel):
 
     summary: str
     last_item_id: str
-    model: str
+    model: str | None = None
     token_count: int
+    compacted_messages: list[dict[str, Any]] | None = None
+    window_id: int | None = None
 
 
 class NativeToolData(BaseModel):
@@ -481,6 +492,57 @@ class TerminalCommandData(BaseModel):
     stderr: str | None = None
 
 
+class RoutingDecisionData(BaseModel):
+    """
+    Data payload for an intelligent model-router decision item.
+
+    Emitted by the server-side smart routing path at the START of an
+    advised turn and persisted
+    as a display-only transcript item so the model the router chose shows
+    in the conversation flow the moment the turn begins. Listed in
+    :data:`NON_CONTENT_ITEM_TYPES` so the agent loop's history filter
+    skips it — the brain never sees (or answers) its own router note. The
+    runner's harness-input builder also drops every non
+    message/function_call type, a second guarantee it stays out of the
+    model's context.
+
+    :param model: The concrete brain model the router chose, e.g.
+        ``"databricks-claude-opus-4-8"``.
+    :param applied: ``True`` when the brain actually ran on
+        :attr:`model` this turn (optimize mode, no user pin); ``False``
+        when the router only WOULD have picked it (advise/shadow mode, or
+        a user model pin won) — the UI renders "would have picked".
+    :param rationale: The router's one-line explanation, shown as muted
+        secondary text, e.g. ``"Multi-file refactor needs deep
+        reasoning."``.
+    """
+
+    model: str
+    applied: bool
+    rationale: str
+    #: Sub-agent name when this decision was made for a child session and the
+    #: item is being mirrored into the parent's transcript, e.g. ``"claude_code"``.
+    #: ``None`` for session-local routing decisions (the usual case).
+    agent: str | None = None
+
+    @field_validator("model")
+    @classmethod
+    def require_non_empty_model(cls, value: str) -> str:
+        """
+        Validate that the router named a non-empty model.
+
+        :param value: The chosen model id, e.g.
+            ``"databricks-claude-opus-4-8"``.
+        :returns: The stripped non-empty model id.
+        :raises ValueError: If the model id is empty or whitespace-only —
+            a routing decision with no model is meaningless to render.
+        """
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("routing_decision model must be non-empty")
+        return stripped
+
+
 class SlashCommandData(BaseModel):
     """
     Data payload for a slash-command invocation observed in a
@@ -523,6 +585,7 @@ ItemData = (
     | CompactionData
     | NativeToolData
     | ResourceEventData
+    | RoutingDecisionData
     | SlashCommandData
     | TerminalCommandData
 )
@@ -536,6 +599,7 @@ ITEM_TYPE_TO_DATA_CLS: dict[str, type[BaseModel]] = {
     "compaction": CompactionData,
     "native_tool": NativeToolData,
     "resource_event": ResourceEventData,
+    "routing_decision": RoutingDecisionData,
     "slash_command": SlashCommandData,
     "terminal_command": TerminalCommandData,
 }
@@ -548,6 +612,7 @@ NON_CONTENT_ITEM_TYPES: frozenset[str] = frozenset(
         "compaction",
         "error",
         "resource_event",
+        "routing_decision",
         "slash_command",
         "terminal_command",
     }

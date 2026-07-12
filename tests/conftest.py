@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import os
-import shutil
 import sys
-import tempfile
 import time
+from collections.abc import Generator
 from pathlib import Path
 
 import pytest
@@ -67,6 +66,9 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
     marker; each rerun resolves to a different model via
     :mod:`tests._model_pools` rotation.
     """
+    is_windows = os.name == "nt"
+    skip_posix = pytest.mark.skip(reason="POSIX-only test; skipped on Windows")
+    skip_windows = pytest.mark.skip(reason="Windows-only test; skipped on POSIX")
     for item in items:
         llm_flaky = item.get_closest_marker("llm_flaky")
         if llm_flaky is not None:
@@ -76,13 +78,13 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
             reruns = int(llm_flaky.kwargs.get("reruns", 2))
             delay = int(llm_flaky.kwargs.get("reruns_delay", 1))
             item.add_marker(pytest.mark.flaky(reruns=reruns, reruns_delay=delay))
+        # Auto-skip platform-pinned tests on the wrong OS so the Linux suite
+        # is unchanged and a Windows run doesn't choke on POSIX-only tests.
+        if item.get_closest_marker("posix_only") is not None and is_windows:
+            item.add_marker(skip_posix)
+        if item.get_closest_marker("windows_only") is not None and not is_windows:
+            item.add_marker(skip_windows)
 
-
-# Tmpdir owned by *this* process (master or single worker) for the
-# isolated MLflow SQLite store. None when we honored a caller-supplied
-# `MLFLOW_TRACKING_URI` and didn't create one ourselves. Cleaned up
-# in `pytest_unconfigure`.
-_OWNED_MLFLOW_DIR: str | None = None
 
 # Per-worker progress log path; resolved from
 # ``PYTEST_PROGRESS_LOG_DIR`` in :func:`pytest_configure`. ``None``
@@ -91,37 +93,8 @@ _PROGRESS_LOG_PATH: str | None = None
 
 
 def pytest_configure(config: pytest.Config) -> None:
-    """Isolate MLflow's tracking SQLite per pytest-xdist worker.
-
-    Without this, every worker reads/writes the same default MLflow
-    SQLite store. Two workers concurrently running alembic migrations
-    on first init race on `_alembic_tmp_*` table creation and one
-    crashes with `OperationalError: table already exists`.
-
-    Workers inherit the master process's environment, so the master's
-    `MLFLOW_TRACKING_URI` would propagate to every worker if we just
-    set it once. Instead we always set it in the worker (overriding
-    the inherited master value). Honor a caller-supplied URI only when
-    we're running outside xdist (no `PYTEST_XDIST_WORKER`).
-
-    Also resolves the per-worker progress log path used by the
-    test-start/finish hooks below.
-    """
-    global _OWNED_MLFLOW_DIR, _PROGRESS_LOG_PATH
-    worker_id = os.environ.get("PYTEST_XDIST_WORKER")
-    if worker_id is None:
-        # Master / serial run: respect caller-supplied URI.
-        if "MLFLOW_TRACKING_URI" not in os.environ:
-            worker_id = "master"
-            tmpdir = tempfile.mkdtemp(prefix=f"mlflow-{worker_id}-")
-            _OWNED_MLFLOW_DIR = tmpdir
-            os.environ["MLFLOW_TRACKING_URI"] = f"sqlite:///{tmpdir}/mlflow.db"
-    else:
-        # Workers always get their own DB; master's URI propagates
-        # otherwise and every worker collides.
-        tmpdir = tempfile.mkdtemp(prefix=f"mlflow-{worker_id}-")
-        _OWNED_MLFLOW_DIR = tmpdir
-        os.environ["MLFLOW_TRACKING_URI"] = f"sqlite:///{tmpdir}/mlflow.db"
+    """Resolve the per-worker progress log path and run guardrails."""
+    global _PROGRESS_LOG_PATH
 
     log_dir = os.environ.get("PYTEST_PROGRESS_LOG_DIR")
     if log_dir:
@@ -139,30 +112,16 @@ def _run_test_environment_guardrails(config: pytest.Config) -> None:
     looks like a real (non-test) DB or a base URL aimed at a dev/prod host
     or port. Set ``OMNIGENT_DISABLE_TEST_GUARDRAILS=1`` to temporarily
     downgrade violations to warn-only for deliberate integration runs.
-
-    The resolved DB URI mirrors how a run would pick one: an explicit
-    ``OMNIGENT_DATABASE_URI`` wins (so pointing the suite at a real DB
-    warns loudly), else we fall back to the per-worker tmp MLflow SQLite
-    set just above — a representative throwaway DB that passes cleanly.
     """
     from omnigent.testing.guardrails import check_test_environment
 
-    db_uri = os.environ.get("OMNIGENT_DATABASE_URI") or os.environ.get("MLFLOW_TRACKING_URI", "")
+    db_uri = os.environ.get("OMNIGENT_DATABASE_URI", "")
     base_url = config.getoption("--omnigent-server-url", default=None)
     check_test_environment(db_uri=db_uri, base_url=base_url, warn_only=False)
 
 
 def pytest_unconfigure(config: pytest.Config) -> None:
-    """Remove the per-worker MLflow tmpdir created in pytest_configure.
-
-    `ignore_errors=True` because MLflow / SQLite may still hold open
-    file handles at session end; on POSIX the unlink-while-open
-    behavior is fine, but on Windows or NFS-style filesystems it can
-    surface as a noisy traceback. We don't want a cleanup hiccup to
-    fail the test session.
-    """
-    if _OWNED_MLFLOW_DIR is not None:
-        shutil.rmtree(_OWNED_MLFLOW_DIR, ignore_errors=True)
+    """Clean up per-session resources."""
 
 
 # Per-worker progress logger: fsync'd START/END lines so a
@@ -377,29 +336,148 @@ def _isolate_codex_native_state(
     monkeypatch.setenv("OMNIGENT_CODEX_NATIVE_STATE_DIR", str(state_dir))
 
 
-@pytest.fixture()
-def db_uri(tmp_path: Path) -> str:
-    """
-    Return a test database URI backed by a file in tmp_path.
+@pytest.fixture(scope="session", autouse=True)
+def cleanup_snapshot_failures(pytestconfig: pytest.Config) -> Generator[None, None, None]:
+    """Give every xdist worker its own snapshot-failures directory.
 
-    Uses get_or_create_engine() which runs Alembic migrations on first
-    engine creation — same path as production. File-based (not in-memory)
-    because DBOS needs a real file to create its system tables. Cleaned
-    up after each test.
+    The pytest-playwright-visual-snapshot plugin ships a session-scoped
+    autouse fixture of this same name that ``rmtree``s then ``mkdir``s a
+    single static path (``playwright_visual_snapshot_failures_path``) at
+    session start. That fixture runs in *every* pytest session — including
+    the non-visual unit shards — and under ``-n`` all workers target the one
+    path: the rmtree/mkdir sequence is non-atomic, so one worker's
+    ``mkdir(exist_ok=True)`` re-raises ``FileExistsError`` when another
+    worker deletes the dir in the window between them, and that fixture error
+    cascades to every test on the worker. This override (a conftest fixture
+    shadows the plugin fixture of the same name for the whole ``tests/`` tree)
+    keys the leaf off ``PYTEST_XDIST_WORKER`` so no two workers ever touch the
+    same directory — the race is gone by construction, with no retries or
+    sleeps. The shared parent is only ever created (never deleted), so the
+    plugin's delete-then-create-the-same-dir window cannot recur.
 
-    :param tmp_path: pytest tmp_path fixture (per-test temp dir).
-    :returns: a ``sqlite:///…`` URI string.
+    Without xdist (the serial ``ui-snapshot.yml`` visual gate) the worker id
+    is unset and the base path is used unchanged, so the committed snapshot
+    layout and the CI artifact upload are unaffected.
     """
-    db_path = tmp_path / "test.db"
-    uri = f"sqlite:///{db_path}"
-    # Creates the engine AND runs migrations (once, cached).
+    import shutil
+
+    from pytest_playwright_visual_snapshot.plugin import SnapshotPaths, _get_option
+
+    root_dir = Path(pytestconfig.rootdir)  # type: ignore[arg-type]
+
+    SnapshotPaths.snapshots_path = Path(
+        _get_option(pytestconfig, "playwright_visual_snapshots_path", cast=str)
+        or (root_dir / "__snapshots__")
+    )
+
+    base_failures_path = Path(
+        _get_option(pytestconfig, "playwright_visual_snapshot_failures_path", cast=str)
+        or (root_dir / "snapshot_failures")
+    )
+    # Per-worker leaf under xdist; the base path itself when run serially
+    # (master process / no xdist), keeping non-xdist output identical.
+    worker = os.environ.get("PYTEST_XDIST_WORKER")
+    failures_path = base_failures_path / worker if worker else base_failures_path
+    SnapshotPaths.failures_path = failures_path
+
+    # Only this worker's own leaf is ever removed, so the rmtree/mkdir pair is
+    # uncontended; parents=True only creates the shared parent, never deletes it.
+    shutil.rmtree(failures_path, ignore_errors=True)
+    failures_path.mkdir(parents=True, exist_ok=True)
+
+    yield
+
+
+@pytest.fixture(scope="session")
+def _worker_db_uri() -> Generator[str, None, None]:
+    """
+    Session-scoped database URI — one DB per xdist worker, migrated once.
+
+    When ``OMNIGENT_TEST_DB_URI`` is set, creates one database per worker
+    (``omnigent_test_w0``, ``omnigent_test_w1``, …), runs Alembic migrations
+    exactly once per worker session, then tears the database down at the end.
+    This avoids migrating hundreds of times — one migration run per worker
+    instead of one per test.
+
+    For SQLite nothing is created here; ``db_uri`` handles per-test files.
+    """
+    import re
+
+    import sqlalchemy as _sa
+
+    base_uri = os.environ.get("OMNIGENT_TEST_DB_URI", "")
+    if not base_uri:
+        yield ""
+        return
+
+    worker = os.environ.get("PYTEST_XDIST_WORKER", "w0")
+    db_name = f"omnigent_test_{worker}"
+    uri = re.sub(r"/[^/]*(\?.*)?$", f"/{db_name}", base_uri)
+
+    root_engine = _sa.create_engine(base_uri, isolation_level="AUTOCOMMIT")
+    dialect = root_engine.dialect.name
+    with root_engine.connect() as conn:
+        if dialect == "mysql":
+            conn.execute(
+                _sa.text(
+                    f"CREATE DATABASE IF NOT EXISTS `{db_name}` "
+                    "CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+                )
+            )
+        else:
+            conn.execute(_sa.text(f'DROP DATABASE IF EXISTS "{db_name}"'))
+            conn.execute(_sa.text(f'CREATE DATABASE "{db_name}"'))
+    root_engine.dispose()
+
     engine = get_or_create_engine(uri)
-
     yield uri
 
     with _engine_lock:
         _engine_cache.pop(uri, None)
     engine.dispose()
+
+    root_engine2 = _sa.create_engine(base_uri, isolation_level="AUTOCOMMIT")
+    with root_engine2.connect() as conn:
+        if dialect == "mysql":
+            conn.execute(_sa.text(f"DROP DATABASE IF EXISTS `{db_name}`"))
+        else:
+            conn.execute(_sa.text(f'DROP DATABASE IF EXISTS "{db_name}" WITH (FORCE)'))
+    root_engine2.dispose()
+
+
+@pytest.fixture()
+def db_uri(tmp_path: Path, _worker_db_uri: str) -> Generator[str, None, None]:
+    """
+    Per-test database URI.
+
+    * **SQLite** (default): fresh file per test, fully isolated.
+    * **Postgres / MySQL** (``OMNIGENT_TEST_DB_URI`` set): reuses the
+      session-scoped worker database and truncates all non-alembic tables
+      between tests so each test starts clean without re-migrating.
+    """
+    import sqlalchemy as _sa
+
+    if not _worker_db_uri:
+        # SQLite: per-test file.
+        db_path = tmp_path / "test.db"
+        uri = f"sqlite:///{db_path}"
+        engine = get_or_create_engine(uri)
+        yield uri
+        with _engine_lock:
+            _engine_cache.pop(uri, None)
+        engine.dispose()
+        return
+
+    engine = get_or_create_engine(_worker_db_uri)
+    dialect = engine.dialect.name
+    tables = [t for t in _sa.inspect(engine).get_table_names() if t != "alembic_version"]
+    # No FK constraints exist (dropped in p1a2b3c4d5e6) so no need to toggle
+    # FOREIGN_KEY_CHECKS — one less round-trip per test on MySQL.
+    with engine.begin() as conn:
+        for table in tables:
+            q = f"`{table}`" if dialect == "mysql" else f'"{table}"'
+            conn.execute(_sa.text(f"TRUNCATE TABLE {q}"))
+    yield _worker_db_uri
 
 
 @pytest.fixture()

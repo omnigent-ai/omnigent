@@ -63,7 +63,7 @@ Sandboxes boot from `ghcr.io/omnigent-ai/omnigent-host:latest`, published
 by CI from the `host` target of
 [`deploy/docker/Dockerfile`](../docker/Dockerfile) with Omnigent and its
 dependencies preinstalled — including the coding-harness CLIs (`claude`,
-`codex`, `pi`), so agents on any harness run without an in-sandbox
+`codex`, `pi`, `kiro-cli`), so agents on any harness run without an in-sandbox
 install.
 
 To use a different image (a fork, or extra tooling baked in), build the
@@ -83,7 +83,7 @@ pulls the image, not Omnigent).
 
 > [!IMPORTANT]
 > **Native terminals need `bubblewrap`.** The `claude-native` /
-> `codex-native` / `pi` harnesses wrap each agent terminal in a bubblewrap
+> `codex-native` / `kiro-native` / `pi` harnesses wrap each agent terminal in a bubblewrap
 > (`bwrap`) OS-sandbox, and on Linux that isolation is mandatory and
 > fail-loud — a host image without the `bwrap` binary makes those terminals
 > fail to start (`linux_bwrap sandbox requires the 'bwrap' binary on PATH`).

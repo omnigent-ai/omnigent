@@ -100,6 +100,14 @@ class _FakeProcessManager:
         """
         self._sessions.discard(conversation_id)
 
+    def mark_in_flight(self, conversation_id: str, response_id: str) -> None:
+        """Reaper in-flight marker — no-op for this stub (issue #1414)."""
+        del conversation_id, response_id
+
+    def clear_in_flight(self, conversation_id: str) -> None:
+        """Reaper in-flight clear — no-op for this stub (issue #1414)."""
+        del conversation_id
+
 
 @contextlib.asynccontextmanager
 async def _runner_client(app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:

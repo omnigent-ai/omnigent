@@ -252,6 +252,7 @@ def _parse_agent_def(
     agent.runtime = data.get("runtime", False)
     agent.timers = data.get("timers", False)
     agent.spawn = data.get("spawn", False)
+    agent.agent_session_sharing = data.get("agent_session_sharing", "none")
     agent.os_env = _parse_os_env_spec(data.get("os_env"))
 
     # Executor
@@ -297,14 +298,10 @@ def _parse_agent_def(
     # Label schema
     from .datamodel import LabelSchemaRule
 
-    _MONOTONIC_ALIASES = {"up": "max", "down": "min"}
     for ls_name, ls_data in data.get("label_schema", {}).items():
         if isinstance(ls_data, dict):
-            raw_monotonic = str(ls_data.get("monotonic", "none"))
-            monotonic = _MONOTONIC_ALIASES.get(raw_monotonic, raw_monotonic)
             agent.label_schema[str(ls_name)] = LabelSchemaRule(
                 values=[str(v) for v in ls_data.get("values", [])],
-                monotonic=monotonic,
             )
 
     # Policy transparency

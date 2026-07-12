@@ -647,6 +647,25 @@ async def test_shell_nonzero_exit(
 
 
 @pytest.mark.asyncio
+async def test_shell_timeout_returns_structured_result(
+    client: httpx.AsyncClient,
+) -> None:
+    """POST /shell returns the timeout result instead of raising."""
+    resp = await client.post(
+        f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/shell",
+        json={"command": "sleep 2", "timeout": 1},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["object"] == "session.environment.shell_result"
+    assert body["stdout"] == ""
+    assert body["stderr"] == ""
+    assert body["exit_code"] is None
+    assert body["timed_out"] is True
+    assert body["cwd"] is not None
+
+
+@pytest.mark.asyncio
 async def test_shell_missing_command_returns_400(
     client: httpx.AsyncClient,
 ) -> None:

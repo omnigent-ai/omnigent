@@ -11,8 +11,12 @@ import time
 
 from omnigent.db.converters import sql_agent_to_entity
 from omnigent.db.db_models import SqlAgent
+from omnigent.db.enum_codecs import encode_agent_kind
 from omnigent.db.utils import get_or_create_engine, make_managed_session_maker
 from omnigent.entities import Agent
+
+AGENT_KIND_TEMPLATE = encode_agent_kind("template")
+AGENT_KIND_SESSION = encode_agent_kind("session")
 
 
 def _now() -> int:
@@ -30,9 +34,9 @@ class TestSqlAgentToEntity:
             name="research-agent",
             bundle_location="ag_abc123/sha256hash",
             version=3,
+            kind=AGENT_KIND_TEMPLATE,
             description="Does research",
             updated_at=1700001000,
-            session_id="conv_xyz",
         )
         entity = sql_agent_to_entity(row)
 
@@ -44,6 +48,19 @@ class TestSqlAgentToEntity:
         assert entity.version == 3
         assert entity.description == "Does research"
         assert entity.updated_at == 1700001000
+        assert entity.session_id is None  # template agents always have session_id=None
+
+    def test_session_scoped_agent_passes_session_id(self) -> None:
+        """session_id is forwarded for session-scoped agents."""
+        row = SqlAgent(
+            id="ag_sess",
+            created_at=1700000000,
+            name="session-agent",
+            bundle_location="ag_sess/hash",
+            version=1,
+            kind=AGENT_KIND_SESSION,
+        )
+        entity = sql_agent_to_entity(row, session_id="conv_xyz")
         assert entity.session_id == "conv_xyz"
 
     def test_nullable_fields_as_none(self) -> None:
@@ -54,9 +71,9 @@ class TestSqlAgentToEntity:
             name="minimal-agent",
             bundle_location="ag_minimal/hash",
             version=1,
+            kind=AGENT_KIND_TEMPLATE,
             description=None,
             updated_at=None,
-            session_id=None,
         )
         entity = sql_agent_to_entity(row)
 
@@ -72,6 +89,7 @@ class TestSqlAgentToEntity:
             name="agent-with-emoji-\u2603",
             bundle_location="ag_unicode/hash",
             version=1,
+            kind=AGENT_KIND_TEMPLATE,
             description="Handles \u00e9\u00e0\u00fc and newlines\nand tabs\t",
         )
         entity = sql_agent_to_entity(row)
@@ -91,22 +109,20 @@ class TestSqlAgentToEntity:
             version=5,
             description="A test agent for round-trip verification",
             updated_at=1700005000,
-            session_id="conv_rt1",
+            session_id=None,
         )
 
-        # Entity -> ORM row (manual construction, mirroring what a store would do)
         row = SqlAgent(
             id=original.id,
             created_at=original.created_at,
             name=original.name,
             bundle_location=original.bundle_location,
             version=original.version,
+            kind=AGENT_KIND_TEMPLATE,
             description=original.description,
             updated_at=original.updated_at,
-            session_id=original.session_id,
         )
 
-        # ORM row -> Entity (via the converter)
         result = sql_agent_to_entity(row)
 
         assert result.id == original.id
@@ -140,15 +156,15 @@ class TestSqlAgentToEntity:
             name=original.name,
             bundle_location=original.bundle_location,
             version=original.version,
+            kind=AGENT_KIND_TEMPLATE,
             description=original.description,
             updated_at=original.updated_at,
-            session_id=original.session_id,
         )
         with managed() as session:
             session.add(row)
 
         with managed() as session:
-            loaded = session.get(SqlAgent, "ag_dbrt")
+            loaded = session.get(SqlAgent, (0, "ag_dbrt"))
             assert loaded is not None
             result = sql_agent_to_entity(loaded)
 
@@ -171,12 +187,13 @@ class TestSqlAgentToEntity:
             created_at=1700000000,
             name="default-version",
             bundle_location="ag_defver/hash",
+            kind=AGENT_KIND_TEMPLATE,
         )
         with managed() as session:
             session.add(row)
 
         with managed() as session:
-            loaded = session.get(SqlAgent, "ag_defver")
+            loaded = session.get(SqlAgent, (0, "ag_defver"))
             assert loaded is not None
             entity = sql_agent_to_entity(loaded)
             assert entity.version == 1
@@ -189,6 +206,7 @@ class TestSqlAgentToEntity:
             name="empty-desc",
             bundle_location="ag_empty/hash",
             version=1,
+            kind=AGENT_KIND_TEMPLATE,
             description="",
         )
         entity = sql_agent_to_entity(row)

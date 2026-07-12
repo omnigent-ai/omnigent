@@ -44,14 +44,11 @@ def test_debby_is_two_headed_cross_vendor(debby_spec: AgentSpec) -> None:
     """
     assert debby_spec.name == "debby"
     fam = {a.name: a.executor.config.get("harness") for a in debby_spec.sub_agents}
-    # claude + gpt are the two default heads; opencode is the optional third
-    # perspective (default fanout stays claude + gpt — see the prompt).
-    assert sorted(debby_spec.tools.agents) == ["claude", "gpt", "opencode"]
+    assert sorted(debby_spec.tools.agents) == ["claude", "gpt"]
     assert fam["claude"] == "claude-sdk"
     assert fam["gpt"] == "codex"
-    assert fam["opencode"] == "opencode-native"
-    # Three distinct vendors → the heads always disagree across providers.
-    assert len(set(fam.values())) == 3
+    # Two distinct vendors → the heads always disagree across providers.
+    assert len(set(fam.values())) == 2
 
 
 def test_debby_heads_are_unpinned(debby_spec: AgentSpec) -> None:

@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import pytest
 
-from omnigent.harness_aliases import canonicalize_harness, is_native_harness
+from omnigent.harness_aliases import (
+    canonicalize_harness,
+    is_native_harness,
+    native_terminal_name,
+)
+from omnigent.spec._omnigent_compat import OMNIGENT_HARNESSES
 
 
 @pytest.mark.parametrize(
@@ -12,6 +17,7 @@ from omnigent.harness_aliases import canonicalize_harness, is_native_harness
     [
         ("claude", "claude-sdk"),
         ("native-pi", "pi-native"),
+        ("native-kiro", "kiro-native"),
         # Docs / runtime-dispatch spelling of the openai-agents harness;
         # specs and OMNIGENT_HARNESSES use "openai-agents".
         ("openai-agents-sdk", "openai-agents"),
@@ -49,6 +55,8 @@ def test_canonicalize_harness(alias: str | None, canonical: str | None) -> None:
         ("native-codex", True),
         ("pi-native", True),
         ("native-pi", True),
+        ("kiro-native", True),
+        ("native-kiro", True),
         # SDK harnesses are NOT native — they replay the Omnigent
         # transcript and don't own an on-disk runtime transcript. A
         # regression that classified these as native would wrongly route a
@@ -58,6 +66,7 @@ def test_canonicalize_harness(alias: str | None, canonical: str | None) -> None:
         ("openai-agents", False),
         ("agents_sdk", False),
         ("codex", False),
+        ("kiro", False),
         # The "claude" shorthand canonicalizes to claude-sdk (not native).
         ("claude", False),
         # cursor is a headless ACP harness, not a native CLI bridge.
@@ -74,3 +83,45 @@ def test_is_native_harness(harness: str | None, expected: bool) -> None:
     in-process SDK turns, or vice versa.
     """
     assert is_native_harness(harness) is expected
+
+
+def test_kiro_native_is_valid_omnigent_harness_but_plain_kiro_is_not() -> None:
+    """Kiro's native identity is canonical; plain ``kiro`` is not a generic harness."""
+    assert "kiro-native" in OMNIGENT_HARNESSES
+    assert "kiro" not in OMNIGENT_HARNESSES
+
+
+@pytest.mark.parametrize(
+    ("harness", "expected"),
+    [
+        ("claude-native", "claude"),
+        ("native-claude", "claude"),  # reversed alias
+        ("codex-native", "codex"),
+        ("cursor-native", "cursor"),
+        ("goose-native", "goose"),
+        ("hermes-native", "hermes"),
+        ("kiro-native", "kiro"),
+        ("qwen-native", "qwen"),
+        ("kimi-native", "kimi"),
+        ("pi-native", "pi"),
+        ("antigravity-native", "antigravity"),
+        ("opencode-native", "opencode"),
+        ("opencode", "opencode"),  # alias folds to opencode-native
+        # Non-native harnesses (and the SDK shorthands) have no native pane.
+        ("claude-sdk", None),
+        ("claude", None),
+        ("codex", None),
+        ("cursor", None),
+        ("agents_sdk", None),
+        ("some-unknown-harness", None),
+        (None, None),
+    ],
+)
+def test_native_terminal_name(harness: str | None, expected: str | None) -> None:
+    """``native_terminal_name`` maps native harness ids to their tmux pane name.
+
+    The native-pane idle reaper (#1349) and its turn-path self-heal key panes on
+    ``(conv, <short-name>, "main")``; a wrong mapping would reap/relaunch the
+    wrong pane or silently skip a harness.
+    """
+    assert native_terminal_name(harness) == expected

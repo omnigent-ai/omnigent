@@ -1,4 +1,20 @@
-"""Tests for the optional OpenCode worker in polly and debby specs."""
+"""Guards the OpenCode worker's presence in the shipped example agents.
+
+Both polly and debby once declared an optional ``opencode`` sub-agent
+(``harness: opencode-native``). Shipping a sub-agent whose harness older
+clients don't recognize made every old runner/host fail to launch the agent at
+all — the version-skew incident behind omnigent-ai/omnigent#1145. That incident
+is now mitigated on the execution path: ``spec.load(...,
+prune_invalid_sub_agents=True)`` (runner ``_entry`` + server ``agent_cache``)
+gracefully DROPS a sub-agent whose harness a client doesn't recognize, so an old
+client loads polly with its remaining workers instead of failing. Combined with
+``opencode-native`` now being a recognized harness
+(``omnigent.spec._omnigent_compat.OMNIGENT_HARNESSES``), polly re-declares its
+``opencode`` worker; the positive test below guards that it stays wired.
+
+debby, however, is still deliberately opencode-free (reverted in #1295), and the
+negative test below guards that OpenCode does not creep back into that spec.
+"""
 
 from __future__ import annotations
 
@@ -23,37 +39,30 @@ def _config(sub_agent: object) -> dict[str, object]:
 
 
 def test_polly_declares_opencode_worker() -> None:
+    """polly declares its ``opencode`` worker on the ``opencode-native`` harness.
+
+    Safe to re-add because #1145's graceful pruning drops the worker (rather than
+    failing the whole agent) on any client too old to recognize the harness, and
+    ``opencode-native`` is a recognized harness on current clients. If this ever
+    regresses to failing old clients, prune-on-load is the contract to check.
+    """
     subs = _sub_agents("polly")
     assert "opencode" in subs
-    cfg = _config(subs["opencode"])
-    assert cfg.get("harness") == "opencode-native"
+    assert _config(subs["opencode"]).get("harness") == "opencode-native"
 
 
-def test_polly_codex_worker_allowlists_opencode_override() -> None:
-    subs = _sub_agents("polly")
-    cfg = _config(subs["codex"])
-    allowed = cfg.get("allowed_harnesses")
-    assert allowed is not None
-    assert "opencode-native" in allowed
-    assert "codex-native" in allowed
+def test_debby_does_not_declare_opencode_head() -> None:
+    """debby stays opencode-free, so an older client can load it without skew.
 
-
-def test_polly_prompt_preflight_probes_opencode() -> None:
-    config = (_REPO_ROOT / "examples" / "polly" / "config.yaml").read_text(encoding="utf-8")
-    assert "command -v claude codex pi opencode" in config
-
-
-def test_debby_declares_opencode_perspective() -> None:
+    debby is reverted to its two-head roster (claude + gpt). Re-adding an
+    ``opencode`` head (or any ``opencode-native`` harness override) would
+    reintroduce the harness that broke old clients on spec validation.
+    """
     subs = _sub_agents("debby")
-    assert "opencode" in subs
-    cfg = _config(subs["opencode"])
-    assert cfg.get("harness") == "opencode-native"
-    # Default fanout is still the two heads.
-    assert "claude" in subs
-    assert "gpt" in subs
-
-
-def test_debby_prompt_keeps_opencode_optional() -> None:
-    config = (_REPO_ROOT / "examples" / "debby" / "config.yaml").read_text(encoding="utf-8")
-    assert "Optional OpenCode perspective" in config
-    assert "do not dispatch" in config.lower()
+    assert "opencode" not in subs
+    assert {"claude", "gpt"} <= set(subs)
+    config_text = (_REPO_ROOT / "examples" / "debby" / "config.yaml").read_text(encoding="utf-8")
+    assert "opencode" not in config_text.lower()
+    # No head re-introduces opencode-native via a harness override either.
+    for sub in subs.values():
+        assert "opencode-native" not in (_config(sub).get("allowed_harnesses") or [])

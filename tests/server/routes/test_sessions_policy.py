@@ -19,6 +19,7 @@ from omnigent.entities.agent import Agent, LoadedAgent
 from omnigent.entities.conversation import FunctionCallData
 from omnigent.policies.types import PolicyAction, PolicyResult
 from omnigent.server.routes.sessions import (
+    _build_evaluation_context,
     _build_skill_slash_command_policy_body,
     _evaluate_input_policy,
     _evaluate_tool_call_policy,
@@ -953,3 +954,25 @@ async def test_output_deny_replaces_text():
     denied_text = denied_content[0]["text"]
     assert "[Denied by policy: Response contains a secret]" in denied_text
     assert "sk-1234" not in denied_text
+
+
+def test_build_evaluation_context_request_accepts_string_data() -> None:
+    """REQUEST-phase ``data`` may be a bare string and must NOT raise.
+
+    opencode's policy plugin sends the prompt text directly as ``data`` for
+    PHASE_REQUEST (``{"event": {"type": "PHASE_REQUEST", "data": "<prompt>"}}``).
+    The old code did ``data.get("text")`` unconditionally and ``AttributeError``ed
+    on a string, 500ing the evaluate endpoint — which silently failed the
+    request-phase gate OPEN (cost-over-budget terminal prompts sailed through).
+    """
+    ctx = _build_evaluation_context(Phase.REQUEST, "delete the prod database", {})
+    assert ctx.content == "delete the prod database"
+
+
+def test_build_evaluation_context_request_dict_still_works() -> None:
+    """The native-hook convention (dict with ``text``) still resolves."""
+    ctx = _build_evaluation_context(Phase.REQUEST, {"text": "hello"}, {})
+    assert ctx.content == "hello"
+    # ``content`` fallback also honored.
+    ctx2 = _build_evaluation_context(Phase.REQUEST, {"content": "hi"}, {})
+    assert ctx2.content == "hi"

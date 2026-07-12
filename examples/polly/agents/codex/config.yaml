@@ -10,14 +10,6 @@ executor:
     # with full bypass. The server translates this into
     # ``--dangerously-bypass-approvals-and-sandbox`` (native sub-agents only).
     yolo: true
-    # Opt this worker into a runtime harness override: the orchestrator may
-    # pass ``args.harness: opencode-native`` to sys_session_send to run this
-    # same scoped-task worker on OpenCode instead of Codex when a different
-    # vendor is wanted for cross-review. Only harnesses listed here are
-    # accepted; both runner dispatch and the server create route enforce it.
-    allowed_harnesses:
-      - codex-native
-      - opencode-native
 
 prompt: |
   You are Codex, a coding sub-agent dispatched by the polly

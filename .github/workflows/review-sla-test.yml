@@ -1,0 +1,35 @@
+name: Reviewer SLA Test
+
+# Offline unit test for the SLA sweep logic: runs review-sla.test.js (mocked
+# GitHub client, real .github/MAINTAINER; ownership pinned to a frozen fixture).
+# Triggers only when the sweep, its test, or the pool files it reads change. Runs
+# on `pull_request` (PR head checkout) so it tests the PR's own version. No
+# secrets, no network.
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/review-sla.js
+      - .github/workflows/review-sla.test.js
+      - .github/workflows/review-sla.yml
+      - .github/MAINTAINER
+      - .github/areas.json
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: review-sla-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Run reviewer-SLA unit test
+        run: node .github/workflows/review-sla.test.js

@@ -7,7 +7,8 @@ the agent responds after the user approves a policy ASK.
 This exercises the full Phase 10 path — prompt_toolkit's
 real input loop, the SSE stream consuming ``ElicitationRequest``
 events, the REPL's future-based approval wiring, and the
-server PATCHing the verdict back through DBOS.
+server PATCHing the verdict back through the durable
+session workflow.
 
 Unlike ``test_policies_e2e.py`` (polling API, background=True),
 this test drives the REPL through the actual streaming code
@@ -59,6 +60,32 @@ _LABEL_ASK_GATE_DIR = _FIXTURES_DIR / "e2e-label-ask-gate"
 _OUTPUT_GATE_DIR = _FIXTURES_DIR / "e2e-output-gate"
 _TOOL_RESULT_GATE_DIR = _FIXTURES_DIR / "e2e-tool-result-gate"
 _SUBAGENT_TOOL_GATE_DIR = _FIXTURES_DIR / "e2e-subagent-tool-gate"
+
+# Seconds to wait for ``omnigent run`` to reach an input-ready REPL —
+# the LAUNCH phase only (daemon spawn, local-server boot, agent upload,
+# runner bring-up, session attach, wrapper-redirect probe).
+#
+# This MUST exceed the CLI's own internal cold-start budget, which is
+# sequential on the critical path of every launch
+# (``_prepare_chat_session_via_daemon`` in omnigent/chat.py):
+#
+#   wait_for_host_online           up to 30s  (_DAEMON_CHAT_HOST_ONLINE_TIMEOUT_S)
+#   launch_or_reuse_daemon_runner  ~16.5s     (transient-409 host-reconnect retry)
+#   wait_for_runner_online         up to 60s  (_DAEMON_CHAT_RUNNER_ONLINE_TIMEOUT_S)
+#                                  ≈ 106s worst case
+#
+# The old 60s sat *below* that budget, so on the rare slow path (loaded
+# CI runner, host-tunnel reconnect) the test aborted — still animating
+# the "Launching your agent…" spinner, before the approval path was
+# reached — before the CLI itself would have. This value tracks the
+# internal budget + margin, NOT an arbitrary inflation: the median
+# launch is a few seconds, so this ceiling only bites on the tail. To
+# lower it, first lower the internal timeouts above (they guard real
+# users on cold/slow hosts). Deliberately separate from the post-launch
+# assertion timeouts (approval, echo, turn-complete), which stay tight
+# so a real hang *after* launch still fails fast. Kept under the
+# ``--timeout=180`` per-test cap.
+_LAUNCH_TIMEOUT = 120
 
 # Regex to strip ANSI escape codes from pexpect output before
 # asserting. prompt_toolkit emits heavy styling — searching for
@@ -298,7 +325,7 @@ def _wait_for_prompt_ready(
     sleeping``) once prompt_toolkit's application is running
     and idle. Waiting for that after the banner makes the
     subsequent ``child.send(...)`` land in the live input
-    loop. Using a generous timeout — agent upload + DBOS boot
+    loop. Using a generous timeout — agent upload + server boot
     add latency on cold starts.
 
     :param child: Active pexpect child.
@@ -378,8 +405,8 @@ def test_repl_single_approval_allows_llm_response(
     end-to-end stack — prompt_toolkit's raw keystroke
     handling, the SDK's ``ElicitationRequest`` event routing,
     the server's ``response.elicitation_request`` emission, the
-    session ``approval`` event reply path, and DBOS wake
-    semantics — all cohere in production.
+    session ``approval`` event reply path, and the
+    server's durable-workflow wake semantics — all cohere in production.
 
     Load-bearing assertion: EXACTLY ONE approval prompt. The
     "three approvals for one message" bug (prior bug:
@@ -398,10 +425,10 @@ def test_repl_single_approval_allows_llm_response(
         encoding="utf-8",
         codec_errors="replace",
         dimensions=(40, 120),  # rows, cols
-        timeout=60,
+        timeout=_LAUNCH_TIMEOUT,
     )
     try:
-        _wait_for_prompt_ready(child, timeout=60)
+        _wait_for_prompt_ready(child, timeout=_LAUNCH_TIMEOUT)
 
         # Send the user message and wait for the approval
         # banner. 'approval required' is the human-readable
@@ -494,10 +521,10 @@ def test_repl_refusal_shows_deny_sentinel(
         encoding="utf-8",
         codec_errors="replace",
         dimensions=(40, 120),
-        timeout=60,
+        timeout=_LAUNCH_TIMEOUT,
     )
     try:
-        _wait_for_prompt_ready(child, timeout=60)
+        _wait_for_prompt_ready(child, timeout=_LAUNCH_TIMEOUT)
 
         child.send("Hello deny-sentinel" + "\r")
         child.expect("approval required", timeout=30)
@@ -558,10 +585,10 @@ def test_repl_two_turns_fires_one_approval_per_turn(
         encoding="utf-8",
         codec_errors="replace",
         dimensions=(40, 120),
-        timeout=60,
+        timeout=_LAUNCH_TIMEOUT,
     )
     try:
-        _wait_for_prompt_ready(child, timeout=60)
+        _wait_for_prompt_ready(child, timeout=_LAUNCH_TIMEOUT)
 
         # Turn 1: approve, wait for reply.
         child.send("Hello two-turns-guard" + "\r")
@@ -677,10 +704,10 @@ def test_repl_approve_always_caches_for_later_turns(
         encoding="utf-8",
         codec_errors="replace",
         dimensions=(40, 120),
-        timeout=60,
+        timeout=_LAUNCH_TIMEOUT,
     )
     try:
-        _wait_for_prompt_ready(child, timeout=60)
+        _wait_for_prompt_ready(child, timeout=_LAUNCH_TIMEOUT)
 
         # Turn 1: approve always.
         child.send("Hello approve-cache" + "\r")
@@ -778,10 +805,10 @@ def test_repl_tool_call_approval_allows_tool_to_run(
         encoding="utf-8",
         codec_errors="replace",
         dimensions=(40, 120),
-        timeout=60,
+        timeout=_LAUNCH_TIMEOUT,
     )
     try:
-        _wait_for_prompt_ready(child, timeout=60, welcome_pattern="e2e.tool.gate")
+        _wait_for_prompt_ready(child, timeout=_LAUNCH_TIMEOUT, welcome_pattern="e2e.tool.gate")
         child.send("testing123" + "\r")
         child.expect("approval required", timeout=45)
         banner_tail = _read_pending(child, seconds=1.0)
@@ -824,18 +851,17 @@ def test_repl_tool_call_refusal_blocks_tool(
     mock_llm_server_url: str,
 ) -> None:
     """
-    TOOL_CALL ASK → refuse → tool NEVER runs → sentinel
-    replaces output → LLM sees sentinel and typically relays
-    that denial to the user.
+    TOOL_CALL ASK → explicit decline → turn aborts → tool NEVER runs.
 
-    Load-bearing: the raw tool output MUST NOT reach the
-    conversation — ``_enforce_tool_result_policy`` substitutes
-    ``[Denied by policy: ...]``. This test is the end-to-end
-    proof that the pre-persistence ordering holds under real
-    streaming + DBOS parking. The mock LLM is scripted to emit
-    the ``echo`` ``function_call`` so the TOOL_CALL ASK fires.
+    An explicit refusal (typing "n") now aborts the agent turn rather
+    than feeding a denial marker to the LLM and letting it continue.
+    The tool must never execute: its raw output must not appear in the
+    terminal or reach the mock LLM as a function_call_output.
+
+    The mock LLM is scripted to emit the ``echo`` ``function_call`` so
+    the TOOL_CALL ASK fires. (The follow-up text is never reached: the
+    turn aborts on decline before any second LLM call.)
     """
-    follow_up = "tool-call-refuse-followup-marker"
     _configure_mock_tool_then_text(
         mock_llm_server_url,
         [
@@ -845,7 +871,7 @@ def test_repl_tool_call_refusal_blocks_tool(
                 "arguments": json.dumps({"message": "testing456"}),
             }
         ],
-        follow_up,
+        "tool-call-refuse-followup-marker",
         match="testing456",
     )
     child = pexpect.spawn(
@@ -855,32 +881,29 @@ def test_repl_tool_call_refusal_blocks_tool(
         encoding="utf-8",
         codec_errors="replace",
         dimensions=(40, 120),
-        timeout=60,
+        timeout=_LAUNCH_TIMEOUT,
     )
     try:
-        _wait_for_prompt_ready(child, timeout=60, welcome_pattern="e2e.tool.gate")
+        _wait_for_prompt_ready(child, timeout=_LAUNCH_TIMEOUT, welcome_pattern="e2e.tool.gate")
         child.send("testing456" + "\r")
         child.expect("approval required", timeout=45)
         child.send("n" + "\r")
         child.expect("refused", timeout=5)
-        # Sync on the post-tool follow-up reply — the LLM only makes its
-        # second call after the (blocked) tool round-trip completes.
-        child.expect(follow_up, timeout=120)
-        # On a TOOL_CALL-phase refusal the tool never runs: its
-        # function_call_output is a denial marker, NOT the raw echo
-        # output. (The ``[Denied by policy: ...]`` sentinel is the
-        # separate TOOL_RESULT substitution path.) The regression
-        # guard: a denial is recorded AND the raw echo output must
-        # NEVER reach the conversation.
-        joined = _wait_for_function_call_outputs(mock_llm_server_url)
-        assert "denied" in joined.lower(), (
-            "Tool-call denial marker did not appear in the LLM's "
-            "function_call_output — refusal enforcement may have "
-            f"regressed.\nfunction_call_outputs: {joined[:800]}"
+        # Turn is now aborted — wait for the REPL to return to idle.
+        _wait_for_turn_complete(child, timeout=30)
+        # The tool must never have run: raw echo output must not appear
+        # anywhere in the terminal buffer captured so far.
+        assert "echo: testing456" not in child.before, (
+            "Raw tool output appeared in REPL despite refusal — the tool "
+            "ran when it must not have."
         )
+        # The mock LLM must NOT have received a second request carrying a
+        # function_call_output, because the turn was aborted before the
+        # denial reached the LLM.
+        joined = _wait_for_function_call_outputs(mock_llm_server_url, timeout=5.0)
         assert "echo: testing456" not in joined, (
-            "Raw tool output leaked to the LLM despite refusal — the tool "
-            f"ran when it must not have.\nfunction_call_outputs: {joined[:800]}"
+            "Raw tool output leaked to the LLM despite refusal — "
+            f"function_call_outputs: {joined[:800]}"
         )
     finally:
         try:
@@ -1078,12 +1101,12 @@ def test_repl_label_driven_ask_approves(
         encoding="utf-8",
         codec_errors="replace",
         dimensions=(40, 120),
-        timeout=60,
+        timeout=_LAUNCH_TIMEOUT,
     )
     try:
         _wait_for_prompt_ready(
             child,
-            timeout=60,
+            timeout=_LAUNCH_TIMEOUT,
             welcome_pattern="e2e.label.ask.gate",
         )
         # Turn 1: trigger taint — no ASK fires this turn
@@ -1159,12 +1182,12 @@ def test_repl_label_driven_ask_refuse_shows_sentinel(
         encoding="utf-8",
         codec_errors="replace",
         dimensions=(40, 120),
-        timeout=60,
+        timeout=_LAUNCH_TIMEOUT,
     )
     try:
         _wait_for_prompt_ready(
             child,
-            timeout=60,
+            timeout=_LAUNCH_TIMEOUT,
             welcome_pattern="e2e.label.ask.gate",
         )
         # Turn 1: taint.
@@ -1240,12 +1263,12 @@ def test_repl_output_ask_does_not_prompt_in_repl(
         encoding="utf-8",
         codec_errors="replace",
         dimensions=(40, 120),
-        timeout=60,
+        timeout=_LAUNCH_TIMEOUT,
     )
     try:
         _wait_for_prompt_ready(
             child,
-            timeout=60,
+            timeout=_LAUNCH_TIMEOUT,
             welcome_pattern="e2e.output.gate",
         )
         child.send("say hi output-noprompt" + "\r")
@@ -1303,12 +1326,12 @@ def test_repl_output_ask_passes_reply_through_no_sentinel(
         encoding="utf-8",
         codec_errors="replace",
         dimensions=(40, 120),
-        timeout=60,
+        timeout=_LAUNCH_TIMEOUT,
     )
     try:
         _wait_for_prompt_ready(
             child,
-            timeout=60,
+            timeout=_LAUNCH_TIMEOUT,
             welcome_pattern="e2e.output.gate",
         )
         child.send("say hi output-passthru" + "\r")
@@ -1398,12 +1421,12 @@ def test_repl_tool_result_ask_does_not_prompt_in_repl(
         encoding="utf-8",
         codec_errors="replace",
         dimensions=(40, 120),
-        timeout=60,
+        timeout=_LAUNCH_TIMEOUT,
     )
     try:
         _wait_for_prompt_ready(
             child,
-            timeout=60,
+            timeout=_LAUNCH_TIMEOUT,
             welcome_pattern="e2e.tool.result.gate",
         )
         child.send("pineapple" + "\r")
@@ -1486,12 +1509,12 @@ def test_repl_tool_result_ask_passes_output_through(
         encoding="utf-8",
         codec_errors="replace",
         dimensions=(40, 120),
-        timeout=60,
+        timeout=_LAUNCH_TIMEOUT,
     )
     try:
         _wait_for_prompt_ready(
             child,
-            timeout=60,
+            timeout=_LAUNCH_TIMEOUT,
             welcome_pattern="e2e.tool.result.gate",
         )
         child.send("mangosteen" + "\r")
@@ -1666,11 +1689,11 @@ def test_repl_subagent_tool_call_ask_does_not_tunnel_banner_to_root(
         )
         # No interactive approval banner tunneled to the root REPL —
         # the sub-agent TOOL_CALL ASK is a non-interactive pass-through
-        # today (see #765), exactly like the sub-agent INPUT-phase ASK.
+        # today, exactly like the sub-agent INPUT-phase ASK.
         assert "approval required" not in full_turn, (
             "A sub-agent TOOL_CALL ASK banner surfaced on the root REPL — "
-            "interactive tunneled mid-flight ASK is not implemented (see "
-            "#765); the sub-agent ASK is non-interactive today.\n"
+            "interactive tunneled mid-flight ASK is not implemented; "
+            "the sub-agent ASK is non-interactive today.\n"
             f"Captured:\n{full_turn[:1500]}"
         )
     finally:

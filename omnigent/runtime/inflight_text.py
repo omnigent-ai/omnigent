@@ -216,7 +216,7 @@ _native_inflight: dict[str, dict[str, _NativeMessage]] = {}
 # :func:`record_publish` returns a "suppress" verdict for any delta whose
 # message_id is retired, and :func:`omnigent.runtime.session_stream.publish`
 # withholds it from the live fan-out (mirrors the web client's
-# ``retiredLiveMessages`` in ap-web ``chatStore.ts``). Insertion-ordered +
+# ``retiredLiveMessages`` in web ``chatStore.ts``). Insertion-ordered +
 # bounded so a long-lived session can't grow it without limit (vendor
 # message_ids are unique, so an evicted-then-revived id is not a real
 # concern — the race window is a single forwarder poll).
@@ -562,7 +562,7 @@ def record_publish(conversation_id: str, event: dict[str, Any]) -> bool:
 
     if event_type == "response.output_text.delta":
         delta = event.get("delta")
-        if not isinstance(delta, str) or not delta:
+        if not isinstance(delta, str):
             return False
         message_id = event.get("message_id")
         if isinstance(message_id, str) and message_id:
@@ -570,6 +570,17 @@ def record_publish(conversation_id: str, event: dict[str, Any]) -> bool:
             # track per message_id, NOT in the response-scoped blob (it
             # has no response.created and interleaves multiple messages
             # per turn). ``index`` orders chunks and de-dupes a replay.
+            #
+            # An EMPTY delta is NOT dropped on this path: a finalize marker
+            # (``delta="", final=true`` — pi-native's end-of-message signal,
+            # see the extension's ``finalizeStreamingMessage``) carries no
+            # text but IS the completion signal that flips ``final_seen``,
+            # which in turn gates the byte-equal retire on
+            # ``output_item.done``. The old ``not delta`` guard dropped that
+            # marker before ``final_seen`` could be set, so pi-native
+            # messages were NEVER retired — ``snapshot_for`` then replayed
+            # the committed message on every reconnect/cold-load and it
+            # double-rendered beside the snapshot's persisted copy.
             index = event.get("index")
             final = bool(event.get("final"))
             with _lock:
@@ -583,13 +594,25 @@ def record_publish(conversation_id: str, event: dict[str, Any]) -> bool:
                 messages = _native_inflight.setdefault(conversation_id, {})
                 message = messages.get(message_id)
                 if message is None:
+                    if not delta and not final:
+                        # An empty, non-final delta for an untracked message
+                        # carries neither text nor a completion signal —
+                        # don't create an empty entry (``snapshot_for`` would
+                        # skip its blank text anyway; this just keeps the
+                        # index from holding inert keys).
+                        if not messages:
+                            _native_inflight.pop(conversation_id, None)
+                        return False
                     message = _NativeMessage()
                     messages[message_id] = message
                 if isinstance(index, int) and not isinstance(index, bool):
                     if index <= message.last_index:
                         return False
                     message.last_index = index
-                message.parts.append(delta)
+                # Only real text advances the buffer; the finalize marker's
+                # empty string is a signal, not content.
+                if delta:
+                    message.parts.append(delta)
                 if final:
                     message.final_seen = True
                     # The message's text is now complete. If its committed
@@ -602,6 +625,11 @@ def record_publish(conversation_id: str, event: dict[str, Any]) -> bool:
                     if _consume_committed_fingerprint(conversation_id, message.parts):
                         _retire_native_message(conversation_id, message_id)
                         return True
+            return False
+        if not delta:
+            # Response-scoped (in-process) path: an empty delta carries no
+            # text and, lacking a ``message_id``, no message-scoped
+            # completion signal — there is nothing to accumulate.
             return False
         with _lock:
             entry = _inflight.get(conversation_id)

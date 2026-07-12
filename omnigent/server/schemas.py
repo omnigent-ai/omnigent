@@ -14,7 +14,7 @@ from __future__ import annotations
 import re
 from typing import Annotated, Any, Literal, get_args
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, Strict, field_validator, model_validator
 
 from omnigent.entities import ConversationItem
 
@@ -80,6 +80,59 @@ class MCPServerSummary(BaseModel):
     url: str | None = None
     command: str | None = None
     args: list[str] = Field(default_factory=list)
+
+
+_MCP_SERVER_NAME_RE = r"^[A-Za-z0-9_-][A-Za-z0-9_.-]{0,127}$"
+
+
+class UpsertMCPServerRequest(BaseModel):
+    """
+    Request body for creating or updating a session agent MCP server.
+
+    Secret-bearing fields (``headers`` and ``env``) are intentionally
+    not accepted by the UI route. Existing secrets are preserved when a
+    server is edited without changing transport.
+    """
+
+    name: str = Field(min_length=1, max_length=128, pattern=_MCP_SERVER_NAME_RE)
+    transport: Literal["http", "stdio"]
+    description: str | None = Field(default=None, max_length=512)
+    url: str | None = None
+    command: str | None = None
+    args: list[str] = Field(default_factory=list, max_length=64)
+
+    @field_validator("name")
+    @classmethod
+    def _reject_dot_names(cls, value: str) -> str:
+        """Reject names that would make unsafe or confusing YAML filenames."""
+        if value in {".", ".."}:
+            raise ValueError("name cannot be '.' or '..'")
+        return value
+
+    @field_validator("args")
+    @classmethod
+    def _string_args_only(cls, value: list[str]) -> list[str]:
+        """Keep args as a small list of strings."""
+        return [str(item) for item in value]
+
+    @model_validator(mode="after")
+    def _validate_transport_fields(self) -> UpsertMCPServerRequest:
+        """Enforce the same transport shape as the agent spec parser."""
+        if self.transport == "http":
+            if not self.url:
+                raise ValueError("url is required when transport is 'http'")
+            if not (self.url.startswith("http://") or self.url.startswith("https://")):
+                raise ValueError("url must start with http:// or https://")
+            if self.command:
+                raise ValueError("command is not allowed when transport is 'http'")
+            if self.args:
+                raise ValueError("args are not allowed when transport is 'http'")
+        if self.transport == "stdio":
+            if not self.command:
+                raise ValueError("command is required when transport is 'stdio'")
+            if self.url:
+                raise ValueError("url is not allowed when transport is 'stdio'")
+        return self
 
 
 class SkillSummary(BaseModel):
@@ -158,6 +211,9 @@ class AgentObject(BaseModel):
         (secret fields omitted). Empty list when the spec
         declares no MCP servers or when the bundle cannot be
         loaded.
+    :param mcp_servers_editable: Whether the MCP list can be edited
+        through the session UI. Built-in template agents are read-only;
+        session-scoped uploaded agents are editable.
     :param policies: Guardrails policies declared on the agent.
         Each entry summarises the policy name, type, and
         phases. Empty list when the spec declares no policies
@@ -178,6 +234,16 @@ class AgentObject(BaseModel):
         the launchable choices. Empty list when the spec
         declares no terminals or when the bundle cannot be
         loaded.
+    :param builtin: Whether this is a server-*seeded* built-in
+        agent (deterministic, name-derived id) as opposed to an
+        operator/user-registered template (random id, e.g. via
+        ``omnigent server --agent``) or a session-scoped upload.
+        The Web UI's new-session picker uses this to decide
+        whether a same-named ``omnigent run`` upload may shadow
+        the catalog entry: seeded built-ins are protected, while
+        a user-registered template is superseded by a newer
+        same-named upload. Always ``False`` for session-scoped
+        agents.
     """
 
     id: str
@@ -189,9 +255,11 @@ class AgentObject(BaseModel):
     updated_at: int | None = None
     harness: str | None = None
     mcp_servers: list[MCPServerSummary] = Field(default_factory=list)
+    mcp_servers_editable: bool = False
     policies: list[PolicySummary] = Field(default_factory=list)
     skills: list[SkillSummary] = Field(default_factory=list)
     terminals: list[str] = Field(default_factory=list)
+    builtin: bool = False
 
 
 # ── Session Policies ───────────────────────────────────────────
@@ -443,6 +511,61 @@ class FileObject(BaseModel):
     filename: str
     bytes: int
     created_at: int
+
+
+class CopyFilesRequest(BaseModel):
+    """
+    Request to copy files from a lineage ancestor into a session.
+
+    The destination session is the path parameter; ``source_session_id``
+    must be a STRICT ancestor of the destination up its
+    ``parent_conversation_id`` chain (spawn lineage) — the destination may
+    not name itself as the source. The copy creates new child-scoped rows —
+    it does not grant cross-session read access.
+
+    :param source_session_id: Session that owns the source files, e.g.
+        ``"conv_parent"``. Must be a strict ancestor of the destination.
+    :param file_ids: Non-empty, unique ids of the source-owned files to
+        copy, e.g. ``["file_abc123"]``.
+    """
+
+    source_session_id: str
+    file_ids: list[Annotated[str, Field(min_length=1)]] = Field(
+        min_length=1,
+        json_schema_extra={"uniqueItems": True},
+    )
+
+
+class CopiedFile(BaseModel):
+    """
+    A single copied file's new identity and preserved metadata.
+
+    :param new_id: The new child-scoped file id, e.g. ``"file_def456"``.
+    :param filename: The copied file's name, carried over from the source.
+    :param content_type: The copied file's MIME type, preserved from the
+        source row so the caller need not re-fetch it or guess from the
+        filename. ``None`` when the source row had no recorded type.
+    """
+
+    new_id: str
+    filename: str
+    content_type: str | None = None
+
+
+class CopyFilesResponse(BaseModel):
+    """
+    Result of a lineage-scoped file copy.
+
+    :param object: Fixed type, always ``"session.files.copied"``.
+    :param session_id: Destination session that now owns the copies.
+    :param mapping: Map of source ``file_id`` to the copied file's new
+        identity and preserved metadata (id, filename, content type), so a
+        caller can attach the copy without a follow-up metadata fetch.
+    """
+
+    object: str = "session.files.copied"
+    session_id: str
+    mapping: dict[str, CopiedFile]
 
 
 # ── Session Resources ───────────────────────────────────────────
@@ -712,6 +835,12 @@ class Usage(BaseModel):
         (e.g. supervisors that delegate / use the harness default).
         ``None`` when the executor doesn't report it; the cost path
         then falls back to the session override / spec model.
+    :param cost_usd: Authoritative per-turn cost in USD reported
+        directly by the harness/provider (e.g. GitHub Copilot's
+        AI-credit total). When present, the server-side cost path uses
+        it in preference to the catalog token-price estimate; ``None``
+        when the harness doesn't report a cost (the common case, where
+        cost is computed from token counts x catalog pricing).
     """
 
     input_tokens: int = 0
@@ -722,6 +851,7 @@ class Usage(BaseModel):
     cache_read_input_tokens: int = 0
     cache_creation_input_tokens: int = 0
     model: str | None = None
+    cost_usd: float | None = None
 
 
 class ErrorDetail(BaseModel):
@@ -1016,23 +1146,50 @@ class SessionGitOptions(BaseModel):
     """
     Git worktree options for ``POST /v1/sessions``.
 
-    When present, the server creates a git worktree on the host for a
-    new branch and starts the runner in that worktree instead of the
-    picked directory. Requires ``host_id`` to be set (and therefore
-    ``workspace``, which is interpreted as the source repository
-    directory). See designs/SESSION_GIT_WORKTREE.md.
+    Requires ``host_id`` to be set (and therefore ``workspace``, which
+    is interpreted as the source repository directory). Two modes,
+    selected by ``existing_worktree``:
 
-    :param branch_name: Name of the new branch to create and check
-        out in the worktree, e.g. ``"feature/login"``. Validated
-        against git ref-format rules; invalid names fail with
-        ``invalid_input``.
+    - **create** (default): the server creates a git worktree on the
+      host for a new branch and starts the runner in that worktree
+      instead of the picked directory.
+    - **bind** (``existing_worktree=True``): ``workspace`` already IS a
+      pre-existing worktree; no worktree is created. ``branch_name`` is
+      recorded as the session's ``git_branch`` for display and opt-in
+      cleanup, and ``base_branch`` must not be set.
+
+    See designs/SESSION_GIT_WORKTREE.md.
+
+    :param branch_name: In create mode, the new branch to create and
+        check out, e.g. ``"feature/login"``. In bind mode, the branch
+        already checked out in the existing worktree. Validated against
+        git ref-format rules; invalid names fail with ``invalid_input``.
     :param base_branch: Optional base ref to branch from, e.g.
         ``"main"`` or ``"origin/main"``. ``None`` branches from the
-        source repository's current ``HEAD``.
+        source repository's current ``HEAD``. Create mode only —
+        invalid with ``existing_worktree``.
+    :param existing_worktree: When ``True``, bind to the pre-existing
+        worktree at ``workspace`` instead of creating one (see above).
     """
 
     branch_name: str
     base_branch: str | None = None
+    existing_worktree: bool = False
+
+    @model_validator(mode="after")
+    def _check_existing_worktree(self) -> SessionGitOptions:
+        """Reject ``base_branch`` in bind mode (422).
+
+        ``base_branch`` selects the ref a *new* branch forks from; it is
+        meaningless when binding to a worktree that already exists.
+
+        :returns: The validated instance.
+        :raises ValueError: If ``base_branch`` is set with
+            ``existing_worktree``.
+        """
+        if self.existing_worktree and self.base_branch is not None:
+            raise ValueError("base_branch cannot be set when existing_worktree is true")
+        return self
 
 
 class SessionCreateRequest(BaseModel):
@@ -1119,6 +1276,15 @@ class SessionCreateRequest(BaseModel):
         harness (native CLIs read it as ``--model`` at terminal launch;
         SDK harnesses via the spawn env). Validated server-side against
         a conservative model-id charset. ``None`` = harness default.
+    :param reasoning_effort: Optional per-session reasoning-effort
+        override to persist at create time, e.g. ``"high"``. Set by the
+        web UI's new-chat model/effort picker (claude-native today) so
+        the value is on the session row before the runner launches the
+        harness — native Claude Code reads it as ``--effort`` at terminal
+        launch; SDK harnesses via the spawn env. Validated server-side
+        against the shared effort vocabulary; provider-specific support
+        is enforced downstream at launch. ``None`` = harness default.
+        Mirrors the multipart create path (:class:`SessionCreateMetadata`).
     :param cost_control_mode_override: Optional per-session
         cost-control switch to persist at create time: ``"on"``
         activates the spec's configured cost-control mode, ``"off"``
@@ -1151,6 +1317,7 @@ class SessionCreateRequest(BaseModel):
     git: SessionGitOptions | None = None
     terminal_launch_args: list[str] | None = None
     model_override: str | None = None
+    reasoning_effort: str | None = None
     cost_control_mode_override: str | None = None
     harness_override: str | None = None
 
@@ -1398,7 +1565,16 @@ class SessionResponse(BaseModel):
         be found (deleted or orphaned session).
     :param status: Session lifecycle status. One of
         ``"idle"`` (no loop running), ``"running"`` (loop
-        executing), or ``"failed"`` (terminal failure).
+        executing), ``"waiting"`` (loop parked on background
+        work / sub-agents), or ``"failed"`` (terminal failure).
+        Current read paths collapse ``"waiting"`` -> ``"running"``
+        before building this snapshot; the literal stays a superset
+        of what the runtime can produce so a server that forwards
+        the raw status never 500s on serialization.
+    :param background_task_count: Background shells (claude-native) still
+        running as of the last status edge, so a reload re-shows "N shells
+        still running" even though the session has settled to ``"idle"``.
+        ``None`` (the default / omitted) when no shells are tracked.
     :param created_at: Unix epoch seconds of creation.
     :param title: Optional human-readable title, e.g.
         ``"debugging auth flow"``. ``None`` when unset.
@@ -1474,7 +1650,7 @@ class SessionResponse(BaseModel):
         e.g. ``"claude-opus-4-7"``. ``None`` means no override is
         active (the agent's ``llm_model`` applies). Set via
         ``PATCH /v1/sessions/{id}`` or the REPL's ``/model``
-        command; both write the same column so the ap-web UI and
+        command; both write the same column so the web UI and
         the TUI stay in sync.
     :param cost_control_mode_override: Per-session cost-control
         switch: ``"on"`` activates the spec's configured cost-control
@@ -1596,12 +1772,22 @@ class SessionResponse(BaseModel):
         ``_session_sandbox_status_cache`` at snapshot build time, so
         a client opening the session mid-launch sees the current
         stage.
+    :param active_response_id: Response id of the turn currently in
+        flight, or ``None`` when the session is idle. Sourced from the
+        server's ``_session_active_response_cache`` at snapshot build
+        time so a client connecting mid-turn can reopen a streaming
+        ``activeResponse`` — the SSE stream is snapshot + live tail with
+        no replay, so the turn-start ``running`` edge that carried this
+        id is not re-sent on reconnect. Today only native-terminal
+        forwarders (claude-native) stamp a turn id on their status
+        edges; other harnesses leave this ``None``.
     """
 
     id: str
     agent_id: str
     agent_name: str | None = None
-    status: Literal["idle", "running", "failed"]
+    status: Literal["idle", "running", "waiting", "failed"]
+    background_task_count: int | None = None
     created_at: int
     title: str | None = None
     labels: dict[str, str] = Field(default_factory=dict)
@@ -1644,6 +1830,13 @@ class SessionResponse(BaseModel):
     model_options: list[dict[str, Any]] = Field(default_factory=list)
     terminal_pending: bool = False
     sandbox_status: SandboxStatus | None = None
+    # Per-MCP-server startup state for native harness sessions
+    # (codex-native), present while the harness boots its MCP servers or
+    # when servers were cancelled/failed. ``None`` otherwise. Sourced from
+    # ``_session_mcp_startup_cache`` at snapshot build time so a client
+    # opening the session mid-startup sees the startup band.
+    mcp_startup: dict[str, McpServerStartup] | None = None
+    active_response_id: str | None = None
 
 
 class UpdateSessionRequest(BaseModel):
@@ -1702,7 +1895,7 @@ class UpdateSessionRequest(BaseModel):
         the runner-side side effects — specifically the
         native ``/effort`` / ``/model`` / Codex collaboration-mode
         forwards into the live runtime. Used by automatic bind-time
-        handoffs (ap-web's sticky-pref apply on session switch, the
+        handoffs (web's sticky-pref apply on session switch, the
         REPL's pre-create ``/model`` snapshot) where injecting a
         visible slash command into a freshly-spawned pane would
         render as an unexpected "Command model X" item before the
@@ -1730,6 +1923,103 @@ class UpdateSessionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class CodexGoalObject(BaseModel):
+    """
+    Current Codex goal state for a Codex-native session.
+
+    Mirrors Codex app-server's ``ThreadGoal`` shape using Omnigent's
+    snake-case API convention. ``created_at`` and ``updated_at`` are optional
+    because older app-server documentation examples omit them even though the
+    current protocol includes them.
+
+    :param thread_id: Codex app-server thread id, e.g. ``"thr_123"``.
+    :param objective: Goal objective text, e.g.
+        ``"Finish the migration and keep tests green"``.
+    :param status: Raw Codex goal lifecycle status, e.g. ``"active"``.
+    :param token_budget: Optional token budget, e.g. ``40000``.
+        ``None`` means no explicit budget is set.
+    :param tokens_used: Tokens spent while pursuing this goal, e.g. ``1024``.
+    :param time_used_seconds: Wall-clock seconds spent on this goal,
+        e.g. ``60``.
+    :param created_at: Unix timestamp when the goal was created, e.g.
+        ``1776272400``. ``None`` when not provided by Codex.
+    :param updated_at: Unix timestamp when the goal was last updated, e.g.
+        ``1776272460``. ``None`` when not provided by Codex.
+    """
+
+    thread_id: str
+    objective: str
+    status: str
+    token_budget: Annotated[int, Strict(), Field(gt=0)] | None = None
+    tokens_used: Annotated[int, Strict(), Field(ge=0)]
+    time_used_seconds: Annotated[int, Strict(), Field(ge=0)]
+    created_at: int | None = None
+    updated_at: int | None = None
+
+
+class CodexGoalResponse(BaseModel):
+    """
+    Response body for reading or setting a Codex-native session goal.
+
+    :param goal: Current goal state, or ``None`` when the session has no
+        persisted Codex goal.
+    """
+
+    goal: CodexGoalObject | None
+
+
+class SetCodexGoalRequest(BaseModel):
+    """
+    Request body for ``PUT /v1/sessions/{id}/codex_goal``.
+
+    :param objective: Goal objective text, e.g.
+        ``"Finish the migration and keep tests green"``. Must be non-empty
+        after trimming and no longer than 4000 characters, matching Codex
+        app-server's goal contract.
+    :param token_budget: Optional positive token budget, e.g. ``40000``.
+        Explicit JSON ``null`` clears the Codex goal budget; omitting the
+        field leaves it absent from the forwarded request.
+    :param status: Optional user-selected goal status. ``"active"`` starts or
+        resumes the goal, and ``"paused"`` stores it paused. Omit this field
+        to preserve Codex's current lifecycle state.
+    """
+
+    objective: str = Field(min_length=1, max_length=4000)
+    token_budget: Annotated[int, Strict(), Field(gt=0)] | None = None
+    status: Literal["active", "paused"] | None = None
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class UpdateCodexGoalStatusRequest(BaseModel):
+    """
+    Request body for ``PATCH /v1/sessions/{id}/codex_goal/status``.
+
+    Codex app-server represents pause/resume as ``thread/goal/set`` status
+    updates. Omnigent exposes the two user-driven transitions explicitly:
+    ``"paused"`` pauses an active goal, and ``"active"`` resumes a paused,
+    blocked, or usage-limited goal.
+
+    :param status: Target Codex goal status, either ``"paused"`` or
+        ``"active"``.
+    """
+
+    status: Literal["active", "paused"]
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class ClearCodexGoalResponse(BaseModel):
+    """
+    Response body for ``DELETE /v1/sessions/{id}/codex_goal``.
+
+    :param cleared: ``True`` when Codex removed an existing goal; ``False``
+        when no goal was present.
+    """
+
+    cleared: bool
+
+
 class SessionForkRequest(BaseModel):
     """
     Request body for ``POST /v1/sessions/{source_id}/fork``.
@@ -1754,6 +2044,31 @@ class SessionForkRequest(BaseModel):
     title: str | None = None
     agent_id: str | None = None
     up_to_response_id: str | None = None
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class ReadStatePutRequest(BaseModel):
+    """
+    Request body for ``PUT /v1/sessions/{session_id}/read-state``.
+
+    Sets the *calling user's* read tracking for one session. Mirrors the
+    two values the web client keeps per session: a "last seen" wall-clock
+    baseline (seconds since epoch) and an explicit "marked unread"
+    override. The unread dot shows when ``updated_at > last_seen`` and the
+    session is finished; ``unread`` separately pins the override so the
+    thread the user is *viewing* (or a running one) still surfaces the dot
+    where the automatic "seen" logic would otherwise suppress it.
+
+    :param last_seen: Wall-clock baseline in seconds, e.g. ``1717000000``.
+        Marking seen sets this to "now"; marking unread pins it to
+        ``updated_at - 1`` so the row reads unseen.
+    :param unread: Whether this session is explicitly flagged unread for
+        the caller.
+    """
+
+    last_seen: int
+    unread: bool
 
     model_config = ConfigDict(extra="forbid")
 
@@ -1861,12 +2176,28 @@ class SessionListItem(BaseModel):
         distinguishable while staying an exact integer in JavaScript;
         clients only compare it for change. ``None`` when the session
         has no comments or the server has no comment store wired.
+    :param viewer_last_seen: The *requesting user's* "last seen"
+        wall-clock baseline in seconds for this session, or ``None``
+        when they have never seen it. Per-viewer (built from the
+        server's in-memory per-user read-state, written by
+        ``PUT /v1/sessions/{id}/read-state``); the unread dot shows
+        when ``updated_at > viewer_last_seen`` and the session is
+        finished. In-memory only — resets on a server restart.
+    :param viewer_unread: Whether the *requesting user* explicitly
+        marked this session unread. Per-viewer; lifts the active-row
+        dot suppression on the client. ``False`` by default.
+    :param search_snippet: Excerpt of the chat content that matched the
+        request's ``search_query``, centered on the match with ``…``
+        marking elided ends, so the search UI can show *where* a session
+        matched in its body. Present whenever the query hit an item body
+        (even if the title also matched); ``None`` on non-search reads and
+        when only the title matched.
     """
 
     id: str
     agent_id: str
     agent_name: str | None = None
-    status: Literal["idle", "running", "failed"]
+    status: Literal["idle", "running", "waiting", "failed"]
     created_at: int
     updated_at: int
     title: str | None = None
@@ -1885,6 +2216,29 @@ class SessionListItem(BaseModel):
     archived: bool = False
     comments_count: int = 0
     comments_updated_at: int | None = None
+    viewer_last_seen: int | None = None
+    viewer_unread: bool = False
+    search_snippet: str | None = None
+
+
+class SessionList(BaseModel):
+    """Paginated list of sessions; ``data`` is a page of ``SessionListItem``."""
+
+    object: Literal["list"] = "list"
+    data: list[SessionListItem] = Field(default_factory=list)
+    first_id: str | None = None
+    last_id: str | None = None
+    has_more: bool = False
+
+
+class ChildSessionList(BaseModel):
+    """Paginated list of child sessions; ``data`` is a page of ``ChildSessionSummary``."""
+
+    object: Literal["list"] = "list"
+    data: list[ChildSessionSummary] = Field(default_factory=list)
+    first_id: str | None = None
+    last_id: str | None = None
+    has_more: bool = False
 
 
 # ── Permissions ────────────────────────────────────────────────────
@@ -2067,6 +2421,7 @@ class SessionStatusEvent(_SSEEventBase):
     status: Literal["idle", "launching", "running", "waiting", "failed"]
     response_id: str | None = None
     error: ErrorDetail | None = None
+    background_task_count: int | None = None
 
 
 class SessionUsageEvent(_SSEEventBase):
@@ -2228,7 +2583,7 @@ class SessionTodosEvent(_SSEEventBase):
     Emitted after an ``external_session_todos`` POST from the
     ``omnigent claude`` transcript forwarder, which captures todo
     updates via ``PostToolUse``/``TodoWrite`` hook events from Claude
-    Code and forwards them to the Omnigent server. Lets ap-web render a
+    Code and forwards them to the Omnigent server. Lets web render a
     live todo panel in the right column without polling.
 
     :param type: Always ``"session.todos"``.
@@ -2266,7 +2621,7 @@ class SessionTerminalPendingEvent(_SSEEventBase):
        sub-agents) and carries the authoritative ``pending=False`` clear
        emitted by the runner's ``finally`` block.
 
-    Together they allow ap-web to show a spinner on the Terminal pill
+    Together they allow web to show a spinner on the Terminal pill
     while the backend boots the terminal instead of a silent greyed-out
     button, and to distinguish "still starting up" from "no terminal"
     (killed or never created).
@@ -2319,6 +2674,48 @@ class SessionSandboxStatusEvent(_SSEEventBase):
     conversation_id: str
     stage: SandboxLaunchStage
     error: str | None = None
+
+
+class McpServerStartup(BaseModel):
+    """
+    One MCP server's startup state within a ``session.mcp_startup`` event.
+
+    :param status: Latest startup state reported by the harness, mirroring
+        Codex's ``McpServerStartupState`` enum.
+    :param error: Failure detail when ``status == "failed"``, e.g.
+        ``"handshaking with MCP server failed"``. ``None`` otherwise.
+    """
+
+    status: Literal["starting", "ready", "failed", "cancelled"]
+    error: str | None = None
+
+
+class SessionMcpStartupEvent(_SSEEventBase):
+    """
+    Per-MCP-server startup progress for a native harness session.
+
+    A codex-native session brings up its configured MCP servers when its
+    Codex thread starts; slow or failing servers previously left the web
+    session looking hung with no signal. The native forwarder mirrors
+    Codex's ``mcpServer/startupStatus/updated`` notifications as
+    ``external_mcp_startup`` posts, republished here so the web UI can
+    show which servers are still starting and which failed or were
+    cancelled.
+
+    :param type: Always ``"session.mcp_startup"``.
+    :param conversation_id: Session identifier,
+        e.g. ``"conv_abc123"``.
+    :param servers: Latest per-server startup map, e.g.
+        ``{"safe": {"status": "starting", "error": None}}``.
+
+    Category: **transient** (SSE + snapshot cache). Not persisted; a
+    client connecting mid-startup seeds from the session snapshot's
+    ``mcp_startup`` field and updates live off this event.
+    """
+
+    type: Literal["session.mcp_startup"]
+    conversation_id: str
+    servers: dict[str, McpServerStartup]
 
 
 class SessionSkillsEvent(_SSEEventBase):
@@ -2545,6 +2942,46 @@ class SessionCreatedEvent(_SSEEventBase):
     child_session_id: str
     agent_id: str | None = None
     parent_session_id: str | None = None
+
+
+class SessionSupersededEvent(_SSEEventBase):
+    """
+    This conversation was superseded by another and clients should
+    follow to it.
+
+    Emitted by ``_publish_session_superseded`` in
+    ``omnigent/server/routes/sessions.py`` when the claude-native
+    forwarder rotates a session away on a Claude ``/clear`` (the old
+    conversation keeps its history but the live terminal moves to a
+    fresh conversation — see ``_post_clear_supersession`` in
+    ``omnigent/claude_native_forwarder.py``). A client actively viewing
+    the superseded conversation auto-redirects to ``target_conversation_id``.
+
+    Category: **transient** (SSE-only), live-only by design. There is no
+    SSE replay: a client that connects after the rotation does not get
+    this event. The durable counterpart is the persisted notice message
+    appended to the old conversation (a ``message`` item linking to the
+    new conversation), which a reloading client renders instead of being
+    force-redirected.
+
+    The wire shape is FLAT (not enveloped):
+    ``{"type": "session.superseded", "conversation_id": <old>,
+    "target_conversation_id": <new>, "reason": "clear"}``.
+
+    :param type: Always ``"session.superseded"``.
+    :param conversation_id: The superseded (old) conversation id this
+        event rides the stream of, e.g. ``"conv_old"``.
+    :param target_conversation_id: The conversation to follow to, e.g.
+        ``"conv_new"``.
+    :param reason: Why the session was superseded. Currently always
+        ``"clear"`` (a Claude Code ``/clear``); kept as a field so the
+        client can branch on future supersession causes.
+    """
+
+    type: Literal["session.superseded"]
+    conversation_id: str
+    target_conversation_id: str
+    reason: Literal["clear"] = "clear"
 
 
 # ── Response pass-through events (response.*) ──────────────────────
@@ -2933,6 +3370,35 @@ class ElicitationRequestEvent(_SSEEventBase):
     params: ElicitationRequestParams
 
 
+class BrowserActionRequestEvent(_SSEEventBase):
+    """
+    Request that the desktop renderer perform one browser action.
+
+    Emitted by the server ``POST /v1/sessions/{id}/browser/action_request``
+    route when a runner-side ``browser_*`` tool dispatch needs the
+    Omnigent desktop app's embedded browser to act. The event fans out
+    on the session stream to every subscribed renderer; each renderer
+    first POSTs ``/browser/action_claim/{action_id}`` and only the
+    winning claimant executes the action and POSTs the result back to
+    ``/browser/action_result/{action_id}``. The claim lease prevents
+    double execution when more than one renderer is subscribed.
+
+    :param type: Always ``"browser.action_request"``.
+    :param action_id: Unique correlation id for this request, e.g.
+        ``"baction_abc123"``. Echoed on the claim and result routes.
+    :param action: The browser action to perform — the ``browser_``
+        tool name with the prefix stripped, e.g. ``"navigate"``,
+        ``"snapshot"``, ``"click"``, ``"type"``, ``"screenshot"``.
+    :param args: Action arguments forwarded from the tool call, e.g.
+        ``{"url": "https://example.com"}``.
+    """
+
+    type: Literal["browser.action_request"]
+    action_id: str
+    action: str
+    args: dict[str, Any]
+
+
 class ElicitationResolvedEvent(_SSEEventBase):
     """
     Signal that a previously-published elicitation is no longer
@@ -2960,6 +3426,37 @@ class ElicitationResolvedEvent(_SSEEventBase):
 
     type: Literal["response.elicitation_resolved"]
     elicitation_id: str
+
+
+class PolicyDeniedEvent(_SSEEventBase):
+    """
+    Signal that a policy DENY was enforced on a native harness turn.
+
+    A native harness (Claude Code, Codex, ...) routes each tool call and
+    prompt through Omnigent's policy engine via the vendor command-hook
+    (``POST /v1/sessions/{id}/policies/evaluate``). The DENY verdict is
+    returned synchronously to that hook, so unlike the SDK/wrap path there is
+    no stream-visible signal that a native action was blocked — only the
+    *effect* (the blocked tool never runs). This event surfaces the decision
+    itself on the session stream so observers (the web UI, the capability
+    bench) can see a native DENY as a positive signal rather than infer it
+    from an absence.
+
+    Fire-and-forget and observational: it does not gate the turn (the hook
+    response already did that) and carries no correlation id.
+
+    :param type: Always ``"response.policy_denied"``.
+    :param conversation_id: Session/conversation id the DENY applies to,
+        e.g. ``"conv_abc123"``.
+    :param reason: Human-readable deny reason from the deciding policy, e.g.
+        ``"Blocked by policy."``.
+    :param phase: The policy phase the DENY landed on, e.g. ``"tool_call"``.
+    """
+
+    type: Literal["response.policy_denied"]
+    conversation_id: str
+    reason: str = ""
+    phase: str = ""
 
 
 class CreatedEvent(_SSEEventBase):
@@ -3173,11 +3670,17 @@ class CompactionCompletedEvent(_SSEEventBase):
     """
     Conversation history compaction has finished.
 
-    Emitted by ``omnigent/server/routes/sessions.py`` after
-    ``compact_conversation_now()`` returns successfully. Clients
-    that rendered a "Compacting…" spinner on
+    Emitted after compaction completes — either by the server after
+    ``compact_conversation_now()`` (explicit ``/compact``), or by a
+    harness that compacted its own internal context. Clients that
+    rendered a "Compacting…" spinner on
     :class:`CompactionInProgressEvent` should upgrade it to the
     permanent "Conversation compacted" marker on this event.
+
+    When emitted by a harness, ``summary`` and ``summary_model``
+    are populated so the runner can persist a compaction item for
+    session resume. When emitted by the server's explicit
+    ``/compact`` path, those fields are ``None``.
 
     :param type: Always ``"response.compaction.completed"``.
     :param total_tokens: Tiktoken estimate of the post-compaction
@@ -3185,10 +3688,17 @@ class CompactionCompletedEvent(_SSEEventBase):
         update the context-ring immediately without waiting for the
         next ``response.completed`` usage report. ``None`` when
         token counting is unavailable.
+    :param summary: Text summary of the compacted conversation,
+        or ``None`` for server-side compaction (already persisted).
+    :param summary_model: Model used for summarization, or ``None``
+        if truncation-based or server-side.
     """
 
     type: Literal["response.compaction.completed"]
     total_tokens: int | None = None
+    summary: str | None = None
+    summary_model: str | None = None
+    compacted_messages: list[dict[str, Any]] | None = None
 
 
 class CompactionFailedEvent(_SSEEventBase):
@@ -3422,11 +3932,13 @@ ServerStreamEvent = Annotated[
     | SessionTodosEvent
     | SessionTerminalPendingEvent
     | SessionSandboxStatusEvent
+    | SessionMcpStartupEvent
     | SessionSkillsEvent
     | SessionModelOptionsEvent
     | SessionInputConsumedEvent
     | SessionInterruptedEvent
     | SessionCreatedEvent
+    | SessionSupersededEvent
     | SessionPresenceEvent
     # ── Transient (SSE-only) — session resource lifecycle ─────
     | SessionResourceCreatedEvent
@@ -3448,6 +3960,10 @@ ServerStreamEvent = Annotated[
     # ── Transient (SSE-only) — synchronous decision request ────
     | ElicitationRequestEvent
     | ElicitationResolvedEvent
+    # ── Transient (SSE-only) — embedded-browser action request ─
+    | BrowserActionRequestEvent
+    # ── Transient (SSE-only) — native policy DENY signal ───────
+    | PolicyDeniedEvent
     # ── Transient (SSE-only) — Responses-API turn lifecycle ────
     | CreatedEvent
     | QueuedEvent

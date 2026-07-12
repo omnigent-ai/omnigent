@@ -13,7 +13,9 @@ import json
 import logging
 import os
 import pathlib
+import re
 import sys
+import tempfile
 from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol, TextIO
@@ -59,7 +61,10 @@ from omnigent_ui_sdk.terminal._formatter import FormattedItem
 from omnigent_ui_sdk.terminal._theme import LIGHT_THEME, get_theme
 from prompt_toolkit.completion import CompleteEvent, Completer, Completion, merge_completers
 from prompt_toolkit.document import Document
+from prompt_toolkit.formatted_text import StyleAndTextTuples
+from prompt_toolkit.lexers import Lexer
 from rich.console import RenderableType
+from rich.markup import escape
 from rich.text import Text
 
 from omnigent.spec.types import SkillSpec
@@ -172,6 +177,12 @@ class _SessionSnapshot(Protocol):
 # by iTerm2/Warp/tmux). Updating the hint without updating the
 # binding would desync the user's expectation from what actually
 # fires.
+# NOTE: keep this list short enough that the bottom toolbar
+# (``{model · state} … hints … state: sleeping``) fits the e2e PTY
+# width (120 cols). Adding an entry here can wrap the toolbar and
+# split the ``state: sleeping`` sync marker the e2e harness waits on
+# (tests/e2e/omnigent/_pexpect_harness.py). /quit discoverability is
+# served by the grouped ``/help`` output instead.
 WELCOME_HINTS = ["/help help", "Ctrl+O debug", "Ctrl+T show tools", "Esc cancel", "Ctrl+C exit"]
 
 # Per-request item count for ``client.sessions.list_items``
@@ -187,7 +198,7 @@ WELCOME_HINTS = ["/help help", "Ctrl+O debug", "Ctrl+T show tools", "Esc cancel"
 # position 99.
 _LIST_ITEMS_PAGE_SIZE = 100
 
-# Sub-agent tree (state badge + ``↓`` menu). The depth cap mirrors ap-web's
+# Sub-agent tree (state badge + ``↓`` menu). The depth cap mirrors web's
 # ``MAX_TREE_DEPTH`` so the CLI tree matches the web Agents rail; the poll
 # cadence refreshes deeper levels (the SSE stream only carries the active
 # session's direct children) while sub-agents are active.
@@ -365,6 +376,7 @@ def _build_startup_header(
     from omnigent.onboarding.detected import effective_config_with_detected
     from omnigent.onboarding.provider_config import (
         describe_active_credential,
+        first_available_provider,
         load_config,
         surface_default_provider,
     )
@@ -390,7 +402,24 @@ def _build_startup_header(
             # pi scope, else the cross-family fallback).
             entry = surface_default_provider(config, fam)
             if entry is None:
-                label = "not configured"
+                # No default for this surface — but a launch falls back to the
+                # first credential that can serve it (the same
+                # first_available_provider the runtime spawn-env builders use).
+                # Name it so the header tells the truth: no default was chosen,
+                # yet the head WILL launch through this one.
+                fallback = first_available_provider(config, fam)
+                if fallback is None:
+                    label = "not configured"
+                else:
+                    cred_text = credential_label(
+                        fallback.kind,
+                        fallback.name,
+                        profile=fallback.profile,
+                        display_name=fallback.display_name,
+                    )
+                    label = (
+                        f"no default → will use {_header_glyph(fallback.kind)} {cred_text}"
+                    ).strip()
             else:
                 cred_text = credential_label(
                     entry.kind,
@@ -415,6 +444,7 @@ def _render_startup_banner_ansi(
     ui_name: str,
     *,
     server_url: str | None = None,
+    server_version: str | None = None,
     header: _StartupHeader | None = None,
 ) -> str:
     """
@@ -426,29 +456,54 @@ def _render_startup_banner_ansi(
 
     When *header* is supplied, the box becomes a Claude-Code-style header:
     the agent name (bold) plus dim rows for the one-line summary, the
-    model + credential, the working folder, and (for a remote server) the
-    server URL; a per-family creds line is appended beneath the box for
-    multi-vendor agents. When *header* is ``None`` the box keeps its
-    minimal form — just the name, with the server URL taking the single
-    info row when the host is non-loopback (keybinding hints live in the
-    bottom toolbar, so the hint row is omitted).
+    model + credential, the working folder, and the server URL (shown for
+    any target, loopback included) with the installed version appended
+    inline as ``"<url>  ·  server <ver>"``; a per-family creds line is
+    appended beneath the box for multi-vendor agents. When *header* is
+    ``None`` the box keeps its minimal form — just the name, with the
+    server URL taking the single info row when the host is non-loopback
+    (keybinding hints live in the bottom toolbar, so the hint row is
+    omitted).
 
     :param ui_name: Humanized agent label shown bold at the top of the box.
-    :param server_url: Base URL the REPL is connected to. Surfaced only
-        when the host is non-loopback. ``None`` skips it.
+    :param server_url: Base URL the REPL is connected to. In the header
+        box it's shown for any target (including a local
+        ``http://127.0.0.1:<port>`` dev server); the minimal banner still
+        surfaces it only when the host is non-loopback. ``None`` skips it.
+    :param server_version: Installed server version (e.g. ``"0.3.0.dev0"``)
+        from a best-effort ``GET /v1/info`` probe, rendered inline on the
+        server-URL row (or its own row if there's no URL). ``None`` (probe
+        failed /
+        not attempted) skips the row. Only consulted on the *header* path.
     :param header: Resolved header data (folder / model / credential /
         summary / creds line) from :func:`_build_startup_header`, or
         ``None`` for the minimal banner.
     :returns: ANSI-styled string ready to be written to stdout.
     """
+    from omnigent.conversation_browser import display_server_url, is_workspace_hosted_url
     from omnigent.inner.banner import BannerLine, startup_banner_strings
 
     remote = _is_remote_server_url(server_url)
+    # User-facing form of the URL: a Databricks workspace-hosted server is
+    # connected to on its ``/api/2.0/omnigent`` API mount, but the banner
+    # should show the recognizable workspace ``/omnigent`` URL. Non-Databricks
+    # URLs pass through unchanged. The probe still uses the real base URL via
+    # the client; only the displayed string is mapped.
+    display_url = display_server_url(server_url) if server_url else server_url
+    # Suppress the version on Databricks workspace mounts — a workspace build
+    # has no meaningful version string to show (authoritative gate; the call
+    # site also skips the probe there, but this guarantees it never renders
+    # regardless of caller).
+    version = (
+        None
+        if (server_url is not None and is_workspace_hosted_url(server_url))
+        else server_version
+    )
 
     if header is None:
         banner = startup_banner_strings(
             ui_name,
-            hint_line=server_url if remote else "",
+            hint_line=display_url if remote else "",
             art_color="#F43BA6",
         )
         return banner.ansi
@@ -467,8 +522,20 @@ def _render_startup_banner_ansi(
     elif header.model_label:
         info_lines.append(BannerLine(header.model_label, dim=True))
     info_lines.append(BannerLine(header.folder, dim=True))
-    if remote and server_url is not None:
-        info_lines.append(BannerLine(server_url, dim=True))
+    # Server URL + installed version on one row: "<url>  ·  server <ver>".
+    # The URL is shown for ANY server target, loopback included — a local
+    # dev server (``http://127.0.0.1:<port>``) is meaningful context here,
+    # so "which server am I on / what version is it" reads as one line. The
+    # version comes from a best-effort ``GET /v1/info`` probe; when it's
+    # unresolved (slow / old server) only the URL shows, and when there's no
+    # URL at all the version stands on its own row.
+    if display_url is not None:
+        url_row = display_url
+        if version:
+            url_row = f"{display_url}  ·  server {version}"
+        info_lines.append(BannerLine(url_row, dim=True))
+    elif version:
+        info_lines.append(BannerLine(f"server {server_version}", dim=True))
 
     banner = startup_banner_strings(ui_name, info_lines=info_lines, art_color="#F43BA6")
     if header.creds_line:
@@ -483,6 +550,60 @@ def _render_startup_banner_ansi(
             f"  {_ANSI_DIM}{header.creds_line}{_ANSI_RESET}"
         )
     return banner.ansi
+
+
+async def _fetch_server_version(client: OmnigentClient) -> str | None:
+    """Best-effort server version for the header row, with a legacy fallback.
+
+    Tries ``GET /v1/info`` → ``server_version`` first, then falls back to
+    the long-standing ``GET /api/version`` → ``version`` endpoint. The
+    fallback matters for older servers (e.g. a staging deployment that
+    predates ``server_version`` landing in ``/v1/info``): ``/api/version``
+    has reported the same installed version for far longer, so the row
+    still fills in instead of waiting for that server to redeploy. Both
+    return the identical ``importlib.metadata`` version, so the fallback is
+    not a different value, just an older surface.
+
+    Routed through the REPL's already-connected :class:`OmnigentClient` so
+    the probe carries the SAME auth (bearer / cookie), base URL, and TLS /
+    custom-CA configuration the REPL is already using. These endpoints are
+    NOT universally unauthed — a hosted deployment (behind OIDC / accounts /
+    a Databricks front door) gates them like any other route, so a bare
+    credential-less GET would 401 and the version would silently never show
+    on exactly the remote servers where the URL row is displayed. Reusing
+    the authenticated client makes the probe answer there.
+
+    Because the client's ``httpx.AsyncClient`` is awaited directly (not run
+    on a thread), this never blocks the event loop. Each request is bounded
+    *per phase* (connect / read / write each 1.0s) so the worst case a
+    healthy-but-slow or unreachable server can add to the previously-instant
+    banner stays small — the connect phase, the dominant cost for an
+    unreachable host, fails within a second (and a dead host fails the first
+    request, so the fallback adds no latency there). Any failure —
+    unreachable, slow, 401/4xx/5xx, non-JSON, or a server too old to report
+    either field — returns ``None`` and the banner simply omits the version
+    row. A welcome-banner detail must never block or fail REPL boot, so this
+    swallows every error.
+
+    :param client: The connected client the REPL drives; its authenticated
+        ``_http`` and ``_base_url`` are reused for the probe.
+    :returns: The installed server version string (e.g. ``"0.3.0.dev0"``),
+        or ``None`` when it can't be resolved.
+    """
+    import httpx
+
+    timeout = httpx.Timeout(1.0)
+    # (endpoint, response key) pairs tried in order: the richer capabilities
+    # probe first, then the legacy version endpoint older servers still have.
+    for path, key in (("/v1/info", "server_version"), ("/api/version", "version")):
+        try:
+            resp = await client._http.get(f"{client._base_url}{path}", timeout=timeout)
+            version = resp.json().get(key)
+        except Exception:  # noqa: BLE001 — startup-UI boundary: never block boot on a banner detail
+            return None
+        if isinstance(version, str) and version:
+            return version
+    return None
 
 
 def _is_remote_server_url(url: str | None) -> bool:
@@ -1395,7 +1516,7 @@ class _SessionsChatReplAdapter:
         event's workflow already sees ``conv.model_override`` via the
         server-side fallback. After the session exists, persists
         through ``PATCH /v1/sessions/{id}`` (matching
-        :meth:`set_reasoning_effort`) so the ap-web picker and the
+        :meth:`set_reasoning_effort`) so the web picker and the
         REPL stay in sync on the next snapshot read.
 
         :param model: New model identifier, e.g. ``"claude-opus-4-7"``,
@@ -3702,6 +3823,22 @@ async def run_repl(
 
     host.on_help = show_help
 
+    # Output of "!" shell commands, buffered and folded into the next turn's
+    # llm_text so the agent can reason about what the user ran.
+    _pending_bang_blocks: list[str] = []
+    # Lightweight cwd persistence for "!" commands: a standalone "!cd <dir>"
+    # updates this; other "!" commands run in it. One-element list so the
+    # nested closure can rebind the value.
+    _bang_cwd: list[str] = [os.getcwd()]
+
+    # Paint the composer in the omnigent-logo green while the line is a "!"
+    # shell command, so bang mode is visible before Enter is pressed.
+    # ``PromptSession`` reads ``.lexer`` through a ``DynamicLexer``, so setting
+    # it here takes effect live.
+    _prompt_session = getattr(host, "_prompt", None)
+    if _prompt_session is not None:
+        _prompt_session.lexer = _BangInputLexer()
+
     async def on_input(text: str, attachments: list[PendingAttachment] | None = None) -> None:
         nonlocal conversation_id, is_streaming
 
@@ -3745,11 +3882,53 @@ async def run_repl(
             approval_state.resolve_verdict(verdict)
             return
 
+        # A line starting with "!" runs a shell command (Claude Code parity);
+        # its output is buffered and folded into the next agent turn. "!!"
+        # escapes — it sends a literal leading "!" as an ordinary prompt.
+        if text.startswith("!") and not text.startswith("!!"):
+            cmd = text[1:].strip()
+            if not cmd:
+                host.output(
+                    Text.from_markup(
+                        f"   [{fmt.muted}]! <command> runs a shell command · "
+                        f"!! sends a literal ![/{fmt.muted}]",
+                    ),
+                )
+                return
+            # Lightweight cwd persistence: a standalone "!cd <dir>" changes the
+            # directory subsequent "!" commands run in (see _resolve_cd).
+            cd_target = _resolve_cd(cmd, _bang_cwd[0])
+            if cd_target is not None:
+                if os.path.isdir(cd_target):
+                    _bang_cwd[0] = cd_target
+                    host.output(Text.from_markup(f"  [{_BANG_ECHO_MARKUP}]! {escape(cmd)}[/]"))
+                    host.output(
+                        Text.from_markup(
+                            f"   [{fmt.muted}]now in {escape(cd_target)}[/{fmt.muted}]"
+                        ),
+                    )
+                    _pending_bang_blocks.append(
+                        f"$ {cmd}\n(changed shell directory to: {cd_target})"
+                    )
+                else:
+                    msg = f"cd: not a directory: {escape(cd_target)}"
+                    host.output(Text.from_markup(f"   [{fmt.warning}]{msg}[/{fmt.warning}]"))
+                return
+            _pending_bang_blocks.append(await _run_bang_command(cmd, host, fmt, cwd=_bang_cwd[0]))
+            return
+        if text.startswith("!!"):
+            text = text[1:]  # drop one "!"; fall through as a normal prompt
+
         # Slash commands are short tokens like "/help", "/clear".
         # File paths like "/Users/foo/bar.jpg" start with "/" but
         # contain more path separators — don't treat those as commands.
         first_token = text.split()[0] if text.split() else ""
         if first_token.startswith("/") and "/" not in first_token[1:]:
+            # Starting a new conversation orphans any buffered "!" output — it
+            # belonged to the prior conversation. Drop it so it can't leak into
+            # the fresh conversation's first turn.
+            if first_token in ("/clear", "/new"):
+                _pending_bang_blocks.clear()
             await handle_slash_command(text, session, client, host, fmt)
             return
 
@@ -3782,6 +3961,10 @@ async def run_repl(
         if filenames:
             suffix = " ".join(filenames)
             llm_text = f"{text} {suffix}".strip() if text else suffix
+        # Fold any buffered "!" shell output into this turn so the agent sees it.
+        if _pending_bang_blocks:
+            llm_text = "\n\n".join([*_pending_bang_blocks, llm_text]).strip()
+            _pending_bang_blocks.clear()
 
         if is_streaming:
             # Show the message immediately in dimmed style so the
@@ -4197,8 +4380,27 @@ async def run_repl(
                 _header = _build_startup_header(harness, agent_description, used_families)
             except Exception:  # noqa: BLE001 — startup-UI boundary: a config read must never block REPL boot
                 _log.exception("Failed to build startup header; falling back to plain banner")
+        # Installed server version for the header's "server <ver>" row.
+        # Probed via the connected (authenticated) client so a short, bounded
+        # GET /v1/info never stalls boot and answers even on auth-gated hosted
+        # servers; None on any failure simply omits the row. Skipped when:
+        #   - there's no header (minimal banner ignores the version), or
+        #   - the server is a Databricks workspace mount — a workspace build
+        #     reports no meaningful version string (its /api/version returns a
+        #     placeholder like "source"), so showing it is noise.
+        from omnigent.conversation_browser import is_workspace_hosted_url
+
+        _show_version = _header is not None and not (
+            server_url is not None and is_workspace_hosted_url(server_url)
+        )
+        server_version = await _fetch_server_version(client) if _show_version else None
         _sys.stdout.write(
-            _render_startup_banner_ansi(ui_name, server_url=server_url, header=_header)
+            _render_startup_banner_ansi(
+                ui_name,
+                server_url=server_url,
+                server_version=server_version,
+                header=_header,
+            )
         )
         _sys.stdout.flush()
 
@@ -4395,11 +4597,36 @@ async def _cmd_help(
 ) -> None:
     from rich.text import Text
 
-    lines = []
-    for name, (desc, _) in COMMANDS.items():
-        if name in ("/?", "/exit"):
-            continue  # Skip aliases.
-        lines.append(f"  [{fmt.accent}]{name}[/{fmt.accent}]  [{fmt.muted}]{desc}[/{fmt.muted}]")
+    # Grouped, column-aligned command help instead of a flat alphabetical
+    # wall. Commands not listed in a group still render (under "Other"), so a
+    # newly registered command is never silently hidden from /help.
+    groups: list[tuple[str, list[str]]] = [
+        ("Chat", ["/new", "/clear", "/switch", "/fork", "/history", "/cancel"]),
+        ("Context", ["/compact", "/context", "/model", "/effort"]),
+        ("Display", ["/theme"]),
+        ("Diagnostics", ["/logs", "/report"]),
+        ("Help", ["/help", "/quit"]),
+    ]
+    visible = {n: d for n, (d, _) in COMMANDS.items() if n not in ("/?", "/exit")}
+    grouped = {name for _, names in groups for name in names}
+    leftover = [n for n in visible if n not in grouped]
+    if leftover:
+        groups.append(("Other", leftover))
+
+    name_width = max((len(n) for n in visible), default=0)
+    lines: list[str] = []
+    for title, names in groups:
+        rows = [(n, visible[n]) for n in names if n in visible]
+        if not rows:
+            continue
+        if lines:
+            lines.append("")  # blank line between sections
+        lines.append(f"  [{fmt.muted}]{title}[/{fmt.muted}]")
+        for name, desc in rows:
+            padded = name.ljust(name_width)
+            lines.append(
+                f"    [{fmt.accent}]{padded}[/{fmt.accent}]  [{fmt.muted}]{desc}[/{fmt.muted}]"
+            )
     host.output(Text.from_markup("\n".join(lines)))
 
 
@@ -4711,8 +4938,7 @@ def _build_model_readout_lines(
         # provider; switching the active provider mid-session is not wired,
         # so it goes through `configure harnesses` + a restart.
         lines.append(
-            "  /model <name> changes the model. To switch provider: "
-            "omnigent setup --no-internal-beta (then restart)."
+            "  /model <name> changes the model. To switch provider: omnigent setup (then restart)."
         )
     return lines
 
@@ -5630,8 +5856,12 @@ def _render_context_tree(
         + _CONTEXT_COIN_BUF * buf_coins
     )
 
-    free_tokens = max(context_window - message_tokens, 0)
     buf_tokens = int(context_window * buf_frac)
+    # Free space excludes the compaction buffer so the three rows partition the
+    # window (Messages + Free + Buffer = window) and each row's token count
+    # agrees with its own percentage. (Previously free omitted the buffer, so it
+    # read e.g. "920,150 tokens (72%)" — a count that is 92% of the window.)
+    free_tokens = max(context_window - message_tokens - buf_tokens, 0)
     used_pct = used_frac * 100.0
 
     tree.add(
@@ -7941,6 +8171,13 @@ def _render_history_item(
 _SLASH_COMMAND_ALIASES: frozenset[str] = frozenset({"/?", "/exit"})
 
 
+# A skill name must read as a slash-command token: an alphanumeric start then
+# word chars, ``:`` (Claude ``plugin:skill``), or ``-`` (Cursor ``plugin--skill``).
+# Rejects whitespace, ``/``, and control characters. Mirrors the web composer's
+# SLASH_COMMAND_RE so the terminal and the menu agree on what is a command.
+_SKILL_COMMAND_NAME_RE = re.compile(r"^[A-Za-z0-9][\w:-]*$")
+
+
 def register_skill_commands(skills: list[SkillSpec]) -> list[str]:
     """
     Auto-register each discovered skill as a REPL slash command.
@@ -7950,6 +8187,12 @@ def register_skill_commands(skills: list[SkillSpec]) -> list[str]:
     global :data:`COMMANDS` registry. Collisions are skipped with a
     warning log so built-in commands always win.
 
+    Skills marked ``user-invocable: false`` are skipped — they are
+    internal orchestration skills, not user-typeable slash commands, so
+    they must not appear in the REPL's slash-command/autocomplete surface
+    (the same contract the web composer menu honors). The skill stays
+    loadable by the agent itself; only the user-facing command is hidden.
+
     :param skills: The agent's parsed skill list.
     :returns: List of registered command names (e.g. ``["/code-review"]``).
         Callers should pass this to :func:`unregister_skill_commands`
@@ -7957,6 +8200,17 @@ def register_skill_commands(skills: list[SkillSpec]) -> list[str]:
     """
     registered: list[str] = []
     for skill in skills:
+        if not skill.user_invocable:
+            continue
+        if not _SKILL_COMMAND_NAME_RE.match(skill.name):
+            # A name with whitespace, ``/``, or control chars yields an
+            # uninvocable or colliding command — skip + warn rather than
+            # register garbage. Mirrors the web composer's SLASH_COMMAND_RE.
+            _log.warning(
+                "Skill %r skipped: name is not a valid slash-command token",
+                skill.name,
+            )
+            continue
         cmd_name = f"/{skill.name}"
         if cmd_name in COMMANDS:
             _log.warning(
@@ -8061,6 +8315,227 @@ class _SlashCommandCompleter(Completer):
                 display=name,
                 display_meta=desc,
             )
+
+
+# ── "!" shell passthrough ──────────────────────────────────────────────
+# A line beginning with "!" runs the rest in the user's shell; its output is
+# shown and folded into the next agent turn so the agent can reason about it.
+# Env-overridable knobs (Claude Code-parity defaults).
+_BANG_TIMEOUT_S: float = float(os.environ.get("OMNIGENT_BANG_TIMEOUT_S") or 120.0)
+_BANG_DISPLAY_MAX: int = int(os.environ.get("OMNIGENT_BANG_DISPLAY_MAX") or 30_000)
+_BANG_CONTEXT_MAX: int = int(os.environ.get("OMNIGENT_BANG_CONTEXT_MAX") or 16_000)
+
+# The omnigent-logo green. Marks a "!" shell command consistently: the composer
+# while it's being typed, and the echoed command line once it runs.
+_BANG_GREEN = "#26a079"
+_BANG_INPUT_STYLE = f"fg:{_BANG_GREEN} bold"  # prompt-toolkit composer style
+# Rich-markup style for the echoed "! <cmd>" line (see _run_bang_command).
+_BANG_ECHO_MARKUP = f"bold {_BANG_GREEN}"
+
+
+class _BangInputLexer(Lexer):
+    """
+    Color the composer green while the current line is a "!" shell command.
+
+    A line that begins with ``!`` (but not the ``!!`` literal-escape) runs in
+    the shell via the passthrough; painting it in the omnigent-logo green is
+    live feedback that bang mode is active. Any other input renders unstyled.
+    """
+
+    def lex_document(self, document: Document) -> Callable[[int], StyleAndTextTuples]:
+        text = document.text
+        is_bang = text.startswith("!") and not text.startswith("!!")
+        style = _BANG_INPUT_STYLE if is_bang else ""
+        lines = document.lines
+
+        def get_line(lineno: int) -> StyleAndTextTuples:
+            return [(style, lines[lineno])]
+
+        return get_line
+
+
+def _bang_shell_argv(cmd: str) -> list[str]:
+    """Argv to run ``cmd`` via the platform shell.
+
+    POSIX: ``$SHELL -c <cmd>`` (falling back to ``/bin/sh``). Windows:
+    ``%COMSPEC% /c <cmd>`` (falling back to ``cmd.exe``). ``-c`` (not a login
+    shell) keeps it predictable and avoids ``!``-history expansion, at the cost
+    of not loading interactive-rc aliases.
+    """
+    if os.name == "nt":
+        return [os.environ.get("COMSPEC") or "cmd.exe", "/c", cmd]
+    return [os.environ.get("SHELL") or "/bin/sh", "-c", cmd]
+
+
+def _resolve_cd(cmd: str, cwd: str) -> str | None:
+    """If ``cmd`` is a standalone ``cd`` (no shell operators), return the
+    resolved absolute target directory, else ``None``.
+
+    ``cd`` with no argument resolves to home. Only a lone ``cd`` is handled —
+    a ``cd`` inside a compound command (``cd x && …``) runs in its own subshell
+    and does not persist (lightweight cwd model; full shell-state persistence
+    would need a long-lived shell).
+    """
+    s = cmd.strip()
+    if s != "cd" and not s.startswith("cd "):
+        return None
+    if any(op in s for op in ("&&", "||", ";", "|", ">", "<", "`", "$(", "\n")):
+        return None
+    arg = s[2:].strip().strip("\"'")
+    if not arg or arg == "~":
+        return os.path.expanduser("~")
+    target = os.path.expanduser(arg)
+    if not os.path.isabs(target):
+        target = os.path.join(cwd, target)
+    return os.path.normpath(target)
+
+
+def _clip_text(text: str, limit: int) -> str:
+    """Clip ``text`` to ``limit`` chars, keeping head + tail with a marker."""
+    if len(text) <= limit:
+        return text
+    head = limit * 3 // 4
+    tail = limit - head
+    omitted = len(text) - limit
+    return f"{text[:head]}\n… [{omitted} chars truncated] …\n{text[-tail:]}"
+
+
+def _write_bang_overflow(cmd: str, stdout: str, stderr: str) -> str | None:
+    """
+    When combined output exceeds the model cap, spill the FULL (ANSI-stripped)
+    capture to a temp file and return its path; else ``None``. Lets the agent
+    read everything instead of losing the truncated remainder.
+
+    The overflow is measured on the ANSI-stripped text — the same form the
+    context builder caps — so heavily-styled output doesn't trip the spill when
+    the text the model sees would fit. The file is intentionally left in place
+    for the agent to read on a later turn; the OS temp dir reclaims it.
+    """
+    from rich.text import Text as _RText
+
+    plain_out = _RText.from_ansi(stdout).plain if stdout else ""
+    plain_err = _RText.from_ansi(stderr).plain if stderr else ""
+    if len(plain_out) + len(plain_err) <= _BANG_CONTEXT_MAX:
+        return None
+    fd, path = tempfile.mkstemp(prefix="omnigent-bang-", suffix=".log")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(f"$ {cmd}\n\n")
+        if plain_out:
+            fh.write(plain_out)
+        if plain_err:
+            fh.write("\n--- stderr ---\n")
+            fh.write(plain_err)
+    return path
+
+
+def _build_bang_context(
+    cmd: str,
+    stdout: str,
+    stderr: str,
+    status: str,
+    overflow_path: str | None = None,
+) -> str:
+    """Build the model-facing block for a "!" command: ANSI stripped, capped,
+    with separate stdout/stderr fences. ``status`` is e.g. ``"exit: 0"``. When
+    ``overflow_path`` is given, the full output was spilled there and is noted
+    so the agent can read it in full."""
+    from rich.text import Text as _RText
+
+    parts = [
+        "I ran a shell command in the terminal. Here is the command and its output.",
+        "",
+        f"$ {cmd}",
+        status,
+    ]
+    out = _clip_text(_RText.from_ansi(stdout).plain.rstrip(), _BANG_CONTEXT_MAX)
+    err = _clip_text(_RText.from_ansi(stderr).plain.rstrip(), _BANG_CONTEXT_MAX)
+    if out:
+        parts += ["", "```stdout", out, "```"]
+    if err:
+        parts += ["", "```stderr", err, "```"]
+    if not out and not err:
+        parts += ["", "(no output)"]
+    if overflow_path:
+        parts += ["", f"(output truncated above — full output saved to: {overflow_path})"]
+    return "\n".join(parts)
+
+
+async def _run_bang_command(
+    cmd: str, host: TerminalHost, fmt: RichBlockFormatter, *, cwd: str | None = None
+) -> str:
+    """Run ``cmd`` in the user's shell, render its output, and return a
+    model-facing block to fold into the next turn.
+
+    Best-effort and non-interactive: stdin is ``/dev/null`` (interactive
+    commands fail fast instead of hanging) and the run is bounded by a timeout.
+    Cross-platform (POSIX ``$SHELL -c`` / Windows ``cmd.exe /c``). stdout/stderr
+    are captured separately; ANSI is preserved on screen and stripped for the
+    model; output is capped, with the full capture spilled to a temp file when
+    it overflows.
+    """
+    from rich.text import Text as _RText
+
+    host.output(_RText.from_markup(""))
+    host.output(_RText.from_markup(f"  [{_BANG_ECHO_MARKUP}]! {escape(cmd)}[/]"))
+
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *_bang_shell_argv(cmd),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            stdin=asyncio.subprocess.DEVNULL,
+            cwd=cwd or os.getcwd(),
+        )
+    except OSError as exc:
+        host.output(
+            _RText.from_markup(
+                f"   [{fmt.warning}]! could not run: {escape(str(exc))}[/{fmt.warning}]"
+            ),
+        )
+        return f"$ {cmd}\n(command could not be started: {exc})"
+
+    timed_out = False
+    try:
+        out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=_BANG_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        timed_out = True
+        proc.kill()
+        out_b, err_b = await proc.communicate()
+
+    elapsed = loop.time() - start
+    stdout = out_b.decode(errors="replace")
+    stderr = err_b.decode(errors="replace")
+    code = proc.returncode
+
+    if stdout:
+        host.output(_RText.from_ansi(_clip_text(stdout, _BANG_DISPLAY_MAX)))
+    if stderr:
+        host.output(_RText.from_markup(f"  [{fmt.muted}][stderr][/{fmt.muted}]"))
+        host.output(_RText.from_ansi(_clip_text(stderr, _BANG_DISPLAY_MAX)))
+
+    overflow_path = _write_bang_overflow(cmd, stdout, stderr)
+    if overflow_path:
+        host.output(
+            _RText.from_markup(
+                f"   [{fmt.muted}]full output: {escape(overflow_path)}[/{fmt.muted}]"
+            )
+        )
+
+    if timed_out:
+        secs = int(_BANG_TIMEOUT_S)
+        host.output(
+            _RText.from_markup(
+                f"   [{fmt.warning}]⏱ killed after {secs}s (timeout)[/{fmt.warning}]"
+            )
+        )
+        status = f"timed out and was killed after {secs}s"
+    else:
+        style = fmt.muted if code == 0 else fmt.warning
+        host.output(_RText.from_markup(f"   [{style}]exit {code} · {elapsed:.1f}s[/{style}]"))
+        status = f"exit: {code}"
+    return _build_bang_context(cmd, stdout, stderr, status, overflow_path)
 
 
 async def handle_slash_command(

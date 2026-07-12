@@ -262,6 +262,184 @@ async def test_respond_to_unknown_method_returns_jsonrpc_error() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Filesystem delegation (fs/read_text_file, fs/write_text_file)
+# ---------------------------------------------------------------------------
+
+
+class _FakeOSEnv:
+    """Minimal OSEnvironment stand-in capturing read/write calls."""
+
+    def __init__(self, read_result: dict | None = None, write_result: dict | None = None) -> None:
+        self._read_result = read_result if read_result is not None else {}
+        self._write_result = write_result if write_result is not None else {}
+        self.read_calls: list[tuple] = []
+        self.write_calls: list[tuple] = []
+        self.closed = False
+
+    async def read(self, path: str, offset: int = 1, limit: int | None = None) -> dict:
+        self.read_calls.append((path, offset, limit))
+        return self._read_result
+
+    async def write(self, path: str, content: str) -> dict:
+        self.write_calls.append((path, content))
+        return self._write_result
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_fs_delegation_flag_tracks_os_env() -> None:
+    """Delegation is on with an os_env, off without one or for a fork env."""
+    from omnigent.inner.datamodel import OSEnvSpec
+
+    assert GooseExecutor()._fs_delegation is False
+    assert GooseExecutor(os_env=OSEnvSpec(type="caller_process"))._fs_delegation is True
+    assert (
+        GooseExecutor(os_env=OSEnvSpec(type="caller_process", fork=True))._fs_delegation is False
+    )
+
+
+@pytest.mark.asyncio
+async def test_initialize_advertises_fs_capability_per_delegation() -> None:
+    """initialize advertises clientCapabilities.fs matching the delegation flag."""
+    from omnigent.inner.datamodel import OSEnvSpec
+
+    init_result = {"result": {"agentCapabilities": {"promptCapabilities": {}}}}
+
+    on = GooseExecutor(os_env=OSEnvSpec(type="caller_process"))
+    on._rpc = AsyncMock(return_value=init_result)  # type: ignore[method-assign]
+    await on._ensure_initialized()
+    assert on._rpc.call_args.args[1]["clientCapabilities"]["fs"] == {
+        "readTextFile": True,
+        "writeTextFile": True,
+    }
+
+    off = GooseExecutor()
+    off._rpc = AsyncMock(return_value=init_result)  # type: ignore[method-assign]
+    await off._ensure_initialized()
+    assert off._rpc.call_args.args[1]["clientCapabilities"]["fs"] == {
+        "readTextFile": False,
+        "writeTextFile": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_fs_read_returns_content_and_maps_window() -> None:
+    """fs/read_text_file reads through the OSEnvironment; line/limit → offset/limit."""
+    from omnigent.inner.datamodel import OSEnvSpec
+
+    executor = GooseExecutor(os_env=OSEnvSpec(type="caller_process"))
+    fake = _FakeOSEnv(read_result={"content": "hi\n", "encoding": "utf-8"})
+    executor._os_environment = fake  # type: ignore[assignment]
+    sent: list[dict] = []
+    executor._send = AsyncMock(side_effect=lambda m: sent.append(m))  # type: ignore[method-assign]
+
+    await executor._respond_to_agent_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "fs/read_text_file",
+            "params": {"path": "a.txt", "line": 2, "limit": 5},
+        }
+    )
+
+    assert sent[0]["result"] == {"content": "hi\n"}
+    assert fake.read_calls == [("a.txt", 2, 5)]
+
+
+@pytest.mark.asyncio
+async def test_fs_read_missing_file_maps_to_enoent() -> None:
+    """A 'no such file' read error maps to the ENOENT code (-32002)."""
+    from omnigent.inner.datamodel import OSEnvSpec
+
+    executor = GooseExecutor(os_env=OSEnvSpec(type="caller_process"))
+    executor._os_environment = _FakeOSEnv(  # type: ignore[assignment]
+        read_result={"error": "[Errno 2] No such file or directory: 'gone.txt'"}
+    )
+    sent: list[dict] = []
+    executor._send = AsyncMock(side_effect=lambda m: sent.append(m))  # type: ignore[method-assign]
+
+    await executor._respond_to_agent_request(
+        {"jsonrpc": "2.0", "id": 5, "method": "fs/read_text_file", "params": {"path": "gone.txt"}}
+    )
+
+    assert sent[0]["error"]["code"] == -32002
+
+
+@pytest.mark.asyncio
+async def test_fs_read_binary_file_is_rejected() -> None:
+    """A non-utf-8 (binary) file is refused rather than returned as bytes."""
+    from omnigent.inner.datamodel import OSEnvSpec
+
+    executor = GooseExecutor(os_env=OSEnvSpec(type="caller_process"))
+    executor._os_environment = _FakeOSEnv(  # type: ignore[assignment]
+        read_result={"content": "AAAA", "encoding": "base64"}
+    )
+    sent: list[dict] = []
+    executor._send = AsyncMock(side_effect=lambda m: sent.append(m))  # type: ignore[method-assign]
+
+    await executor._respond_to_agent_request(
+        {"jsonrpc": "2.0", "id": 6, "method": "fs/read_text_file", "params": {"path": "img.png"}}
+    )
+
+    assert sent[0]["error"]["code"] == -32603
+
+
+@pytest.mark.asyncio
+async def test_fs_write_writes_through_os_env() -> None:
+    """fs/write_text_file writes via the OSEnvironment and returns an empty result."""
+    from omnigent.inner.datamodel import OSEnvSpec
+
+    executor = GooseExecutor(os_env=OSEnvSpec(type="caller_process"))
+    fake = _FakeOSEnv(write_result={"path": "out.txt"})
+    executor._os_environment = fake  # type: ignore[assignment]
+    sent: list[dict] = []
+    executor._send = AsyncMock(side_effect=lambda m: sent.append(m))  # type: ignore[method-assign]
+
+    await executor._respond_to_agent_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 8,
+            "method": "fs/write_text_file",
+            "params": {"path": "out.txt", "content": "abc"},
+        }
+    )
+
+    assert sent[0]["result"] == {}
+    assert fake.write_calls == [("out.txt", "abc")]
+
+
+@pytest.mark.asyncio
+async def test_fs_unsupported_when_delegation_off() -> None:
+    """Without an os_env, fs/* is method-not-found (delegation not advertised)."""
+    executor = GooseExecutor()  # no os_env
+    assert executor._fs_delegation is False
+    sent: list[dict] = []
+    executor._send = AsyncMock(side_effect=lambda m: sent.append(m))  # type: ignore[method-assign]
+
+    await executor._respond_to_agent_request(
+        {"jsonrpc": "2.0", "id": 7, "method": "fs/read_text_file", "params": {"path": "/x"}}
+    )
+
+    assert sent[0]["error"]["code"] == -32601
+
+
+@pytest.mark.asyncio
+async def test_close_releases_fs_os_environment() -> None:
+    """close() tears down a lazily-created fs-delegation OSEnvironment."""
+    from omnigent.inner.datamodel import OSEnvSpec
+
+    executor = GooseExecutor(os_env=OSEnvSpec(type="caller_process"))
+    fake = _FakeOSEnv()
+    executor._os_environment = fake  # type: ignore[assignment]
+
+    await executor.close()
+
+    assert fake.closed is True
+    assert executor._os_environment is None
+
+
+# ---------------------------------------------------------------------------
 # run_turn streaming
 # ---------------------------------------------------------------------------
 
@@ -321,6 +499,108 @@ async def test_run_turn_streams_text_and_usage() -> None:
     assert len(completes) == 1
     assert completes[0].response == "Done"
     assert completes[0].usage == {"input_tokens": 7, "output_tokens": 3, "total_tokens": 10}
+
+
+def test_history_prefix_serializes_prior_turns() -> None:
+    """_history_prefix renders prior turns as labeled role: content lines."""
+    prior = [
+        {"role": "user", "content": "what is 2+2"},
+        {"role": "assistant", "content": [{"type": "output_text", "text": "4"}]},
+    ]
+    out = GooseExecutor._history_prefix(prior)
+    assert out.startswith("Conversation so far:")
+    assert "user: what is 2+2" in out
+    assert "assistant: 4" in out
+    assert out.rstrip().endswith("using the conversation above as context.")
+
+
+@pytest.mark.asyncio
+async def test_run_turn_replays_history_on_fresh_session() -> None:
+    """A fresh Goose session folds prior turns into the prompt (e.g. /model respawn).
+
+    Goose normally only sees the latest user turn; on a brand-new subprocess
+    that would drop everything before the switch, so the first turn replays
+    the transcript to keep context.
+    """
+    executor = GooseExecutor()
+    executor._initialized = True
+    executor._session_id = "20260623_fresh"
+    executor._proc = MagicMock()
+    executor._proc.returncode = None
+    loop = asyncio.get_event_loop()
+
+    sent_prompts: list[str] = []
+
+    async def fake_send(msg: dict) -> None:
+        if msg.get("method") == "session/prompt":
+            sent_prompts.append(msg["params"]["prompt"][0]["text"])
+            req_id = msg["id"]
+
+            def _resolve() -> None:
+                fut = executor._pending.get(req_id)
+                if fut and not fut.done():
+                    fut.set_result(
+                        {"jsonrpc": "2.0", "id": req_id, "result": {"stopReason": "end_turn"}}
+                    )
+
+            loop.call_soon(_resolve)
+
+    executor._send = fake_send  # type: ignore[method-assign]
+
+    messages = [
+        {"role": "user", "content": "remember 42"},
+        {"role": "assistant", "content": "ok, 42"},
+        {"role": "user", "content": "what number?"},
+    ]
+    async for _ in executor.run_turn(messages, [], "SYS"):
+        pass
+
+    prompt = sent_prompts[0]
+    assert prompt.startswith("SYS\n\n")
+    assert "Conversation so far:" in prompt
+    assert "user: remember 42" in prompt
+    assert "assistant: ok, 42" in prompt
+    assert prompt.rstrip().endswith("user: what number?")
+
+
+@pytest.mark.asyncio
+async def test_run_turn_no_replay_on_continuing_session() -> None:
+    """A continuing Goose session sends only the latest turn (it retains context)."""
+    executor = GooseExecutor()
+    executor._initialized = True
+    executor._session_id = "20260623_cont"
+    executor._system_prompt_sent = True  # not a fresh session
+    executor._proc = MagicMock()
+    executor._proc.returncode = None
+    loop = asyncio.get_event_loop()
+
+    sent_prompts: list[str] = []
+
+    async def fake_send(msg: dict) -> None:
+        if msg.get("method") == "session/prompt":
+            sent_prompts.append(msg["params"]["prompt"][0]["text"])
+            req_id = msg["id"]
+
+            def _resolve() -> None:
+                fut = executor._pending.get(req_id)
+                if fut and not fut.done():
+                    fut.set_result(
+                        {"jsonrpc": "2.0", "id": req_id, "result": {"stopReason": "end_turn"}}
+                    )
+
+            loop.call_soon(_resolve)
+
+    executor._send = fake_send  # type: ignore[method-assign]
+
+    messages = [
+        {"role": "user", "content": "earlier"},
+        {"role": "assistant", "content": "ok"},
+        {"role": "user", "content": "latest"},
+    ]
+    async for _ in executor.run_turn(messages, [], "SYS"):
+        pass
+
+    assert sent_prompts[0] == "latest"
 
 
 @pytest.mark.asyncio

@@ -1657,20 +1657,28 @@ def poll_session_until_terminal(
     """
     deadline = time.monotonic() + timeout
     last_body: dict[str, Any] = {}
+    # A queued turn reads ``idle`` until the runner dispatches it, so accept
+    # ``idle`` as terminal only once the turn has started — seen as a
+    # running/waiting edge, or as real output (a non-user, non-resource_event
+    # item) for turns that finish between polls. ``failed`` is always terminal.
+    seen_running = False
     while time.monotonic() < deadline:
         resp = client.get(f"/v1/sessions/{session_id}")
         resp.raise_for_status()
         last_body = resp.json()
         status = last_body.get("status")
-        if status in ("idle", "failed"):
-            output = [
-                flattened
-                for item in last_body.get("items", [])
-                if not (
-                    (flattened := _flatten_session_item(item)).get("type") == "message"
-                    and flattened.get("role") == "user"
-                )
-            ]
+        if status in ("running", "waiting"):
+            seen_running = True
+        output = [
+            flattened
+            for item in last_body.get("items", [])
+            if not (
+                (flattened := _flatten_session_item(item)).get("type") == "message"
+                and flattened.get("role") == "user"
+            )
+        ]
+        has_turn_output = any(item.get("type") != "resource_event" for item in output)
+        if status == "failed" or (status == "idle" and (seen_running or has_turn_output)):
             return {
                 "id": response_id,
                 "status": "completed" if status == "idle" else "failed",

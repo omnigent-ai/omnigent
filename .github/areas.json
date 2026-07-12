@@ -1,0 +1,594 @@
+{
+  "_readme": [
+    "Central area / codeowner map. Single source of truth for BOTH issue triage",
+    "(.github/workflows/issue-triage.yml) and PR reviewer assignment",
+    "(.github/workflows/auto-assign-reviewer.js). Replaces the old .github/reviewers",
+    "and .github/ISSUE_ASSIGNEES files.",
+    "",
+    "It is .json (not .yaml) on purpose: the github-script sandbox has no YAML parser",
+    "and the CI runner has no PyYAML, so JSON is read natively by both the JS",
+    "(JSON.parse) and Python (json.load) with zero dependencies.",
+    "",
+    "Each area:",
+    "  key        - stable identifier (not user-facing)",
+    "  label      - the comp:* GitHub label applied to issues in this area. MUST be",
+    "               one of the 8 labels that already exist in the repo",
+    "               (comp:server, comp:runner, comp:repr, comp:web-ui, comp:tui,",
+    "               comp:policies, comp:harnesses, comp:infra) -- gh cannot add a",
+    "               label that does not exist, and there is no label-sync. Several",
+    "               areas may share a label (all harness areas share comp:harnesses).",
+    "  definition - prose the LLM reads to route issues/PRs to this area.",
+    "  paths      - file-PREFIX list. Matching is filename.startsWith(prefix), and the",
+    "               LAST matching area in this array wins per file. So broad prefixes",
+    "               MUST come before their more-specific children:",
+    "                 - 'web/' before 'web/electron/' and 'web/ios/'",
+    "                 - 'omnigent/inner/' before every 'omnigent/inner/<harness>_'.",
+    "  owners     - candidate reviewers/assignees. Must be maintainers in",
+    "               .github/MAINTAINER. 2+ each. Edit these freely: the",
+    "               reviewer-logic tests run against a frozen fixture",
+    "               (auto-assign-reviewer.fixture.json), so ownership changes here",
+    "               do not churn them. areas.test.js validates this file (every",
+    "               owner in MAINTAINER, real comp:* label, 2+ owners, path",
+    "               resolution).",
+    "  owners_paused - optional. Owners temporarily benched (e.g. OOO). Ignored by",
+    "               every reader -- only `owners` is used for routing -- so this is",
+    "               the 'commented out, not deleted' form: to re-activate someone,",
+    "               move their login from owners_paused back into owners."
+  ],
+  "areas": [
+    {
+      "key": "repo-automation",
+      "label": "comp:infra",
+      "definition": "Repo automation and CI: GitHub Actions workflows, scripts, Dependabot, issue/PR templates.",
+      "paths": [
+        ".github/"
+      ],
+      "owners": [
+        "PattaraS",
+        "dhruv0811",
+        "TomeHirata"
+      ]
+    },
+    {
+      "key": "web",
+      "label": "comp:web-ui",
+      "definition": "The web frontend (web/) shared by all clients: React UI, components, embed. NOT the desktop or mobile app shells (those are separate areas below).",
+      "paths": [
+        "web/"
+      ],
+      "owners": [
+        "serena-ruan",
+        "daniellok-db",
+        "hzub"
+      ]
+    },
+    {
+      "key": "desktop-app",
+      "label": "comp:web-ui",
+      "definition": "The desktop app shell (Electron wrapper around the web UI): main process, packaging, native desktop chrome.",
+      "paths": [
+        "web/electron/"
+      ],
+      "owners": [
+        "fanzeyi",
+        "serena-ruan",
+        "daniellok-db"
+      ]
+    },
+    {
+      "key": "mobile-app",
+      "label": "comp:web-ui",
+      "definition": "The mobile app shell (iOS wrapper around the web UI): native mobile integration and packaging.",
+      "paths": [
+        "web/ios/"
+      ],
+      "owners": [
+        "serena-ruan",
+        "fanzeyi",
+        "daniellok-db"
+      ]
+    },
+    {
+      "key": "inner",
+      "label": "comp:harnesses",
+      "definition": "Core agent runtime and the harness/executor layer shared by all harnesses (loader, executor base, tool bridge, sandboxes). Harness-specific code has its own areas below.",
+      "paths": [
+        "omnigent/inner/"
+      ],
+      "owners": [
+        "dhruv0811",
+        "TomeHirata",
+        "SabhyaC26",
+        "bbqiu",
+        "fanzeyi",
+        "aravind-segu"
+      ],
+      "owners_paused": [
+        "dbczumar"
+      ]
+    },
+    {
+      "key": "runner",
+      "label": "comp:runner",
+      "definition": "The agent runner: the execution engine that drives a turn.",
+      "paths": [
+        "omnigent/runner/"
+      ],
+      "owners": [
+        "dhruv0811",
+        "bbqiu",
+        "fanzeyi",
+        "aravind-segu"
+      ],
+      "owners_paused": [
+        "dbczumar"
+      ]
+    },
+    {
+      "key": "runtime",
+      "label": "comp:runner",
+      "definition": "The agent runtime and execution scaffolding surrounding the runner.",
+      "paths": [
+        "omnigent/runtime/"
+      ],
+      "owners": [
+        "dhruv0811",
+        "bbqiu",
+        "fanzeyi",
+        "aravind-segu"
+      ],
+      "owners_paused": [
+        "dbczumar"
+      ]
+    },
+    {
+      "key": "server",
+      "label": "comp:server",
+      "definition": "The Omnigent server: HTTP API, session creation and lifecycle, request routing.",
+      "paths": [
+        "omnigent/server/"
+      ],
+      "owners": [
+        "dhruv0811",
+        "TomeHirata",
+        "SabhyaC26",
+        "bbqiu",
+        "fanzeyi",
+        "aravind-segu"
+      ],
+      "owners_paused": [
+        "dbczumar"
+      ]
+    },
+    {
+      "key": "onboarding",
+      "label": "comp:tui",
+      "definition": "The setup / onboarding flow: first-run setup, provider auth, credential onboarding driven through the CLI.",
+      "paths": [
+        "omnigent/onboarding/"
+      ],
+      "owners": [
+        "SabhyaC26",
+        "dhruv0811",
+        "fanzeyi"
+      ]
+    },
+    {
+      "key": "policies",
+      "label": "comp:policies",
+      "definition": "Safety policies, guardrails, and policy evaluation/elicitation.",
+      "paths": [
+        "omnigent/policies/"
+      ],
+      "owners": [
+        "TomeHirata",
+        "ckcuslife-source"
+      ]
+    },
+    {
+      "key": "spec",
+      "label": "comp:repr",
+      "definition": "Spec and schema layer: representation of agents/sessions and their serialized form.",
+      "paths": [
+        "omnigent/spec/"
+      ],
+      "owners": [
+        "TomeHirata",
+        "SabhyaC26",
+        "bbqiu"
+      ],
+      "owners_paused": [
+        "dbczumar"
+      ]
+    },
+    {
+      "key": "llms",
+      "label": "comp:harnesses",
+      "definition": "LLM provider and model-catalog layer: gateways, provider adapters, model selection.",
+      "paths": [
+        "omnigent/llms/"
+      ],
+      "owners": [
+        "dhruv0811",
+        "PattaraS",
+        "SabhyaC26"
+      ]
+    },
+    {
+      "key": "host",
+      "label": "comp:server",
+      "definition": "The host / daemon: the long-running local process that hosts sessions and terminals.",
+      "paths": [
+        "omnigent/host/"
+      ],
+      "owners": [
+        "fanzeyi",
+        "dhruv0811",
+        "bbqiu"
+      ],
+      "owners_paused": [
+        "dbczumar"
+      ]
+    },
+    {
+      "key": "sandbox",
+      "label": "comp:runner",
+      "definition": "The OS sandbox (bwrap/seatbelt isolation) and egress controls around agent execution.",
+      "paths": [
+        "omnigent/sandbox/"
+      ],
+      "owners": [
+        "SabhyaC26",
+        "fanzeyi"
+      ],
+      "owners_paused": [
+        "dbczumar"
+      ]
+    },
+    {
+      "key": "db",
+      "label": "comp:server",
+      "definition": "Database and persistence layer for the server.",
+      "paths": [
+        "omnigent/db/"
+      ],
+      "owners": [
+        "bbqiu",
+        "aravind-segu",
+        "fanzeyi",
+        "dhruv0811",
+        "SabhyaC26"
+      ],
+      "owners_paused": [
+        "dbczumar"
+      ]
+    },
+    {
+      "key": "stores",
+      "label": "comp:repr",
+      "definition": "Stores: persistence and serialization of sessions, history, and artifacts.",
+      "paths": [
+        "omnigent/stores/"
+      ],
+      "owners": [
+        "bbqiu",
+        "aravind-segu",
+        "fanzeyi",
+        "dhruv0811",
+        "SabhyaC26",
+        "serena-ruan",
+        "daniellok-db",
+        "TomeHirata"
+      ],
+      "owners_paused": [
+        "dbczumar"
+      ]
+    },
+    {
+      "key": "terminals",
+      "label": "comp:tui",
+      "definition": "Terminal management: PTY/terminal launch, read, and lifecycle.",
+      "paths": [
+        "omnigent/terminals/"
+      ],
+      "owners": [
+        "fanzeyi",
+        "dhruv0811",
+        "aravind-segu",
+        "bbqiu",
+        "SabhyaC26"
+      ],
+      "owners_paused": [
+        "dbczumar"
+      ]
+    },
+    {
+      "key": "tools",
+      "label": "comp:harnesses",
+      "definition": "Built-in tools and the tool-bridge exposed to harnesses.",
+      "paths": [
+        "omnigent/tools/"
+      ],
+      "owners": [
+        "dhruv0811",
+        "TomeHirata",
+        "SabhyaC26",
+        "bbqiu",
+        "fanzeyi",
+        "aravind-segu"
+      ],
+      "owners_paused": [
+        "dbczumar"
+      ]
+    },
+    {
+      "key": "entities",
+      "label": "comp:repr",
+      "definition": "Entity models: the core data model for agents, sessions, and related objects.",
+      "paths": [
+        "omnigent/entities/"
+      ],
+      "owners": [
+        "daniellok-db",
+        "TomeHirata"
+      ]
+    },
+    {
+      "key": "repl",
+      "label": "comp:tui",
+      "definition": "The interactive REPL and its terminal UI.",
+      "paths": [
+        "omnigent/repl/"
+      ],
+      "owners": [
+        "dhruv0811",
+        "fanzeyi",
+        "serena-ruan",
+        "daniellok-db"
+      ],
+      "owners_paused": [
+        "dbczumar"
+      ]
+    },
+    {
+      "key": "resources",
+      "label": "comp:server",
+      "definition": "Bundled resources and static assets used by the runtime.",
+      "paths": [
+        "omnigent/resources/"
+      ],
+      "owners": [
+        "fanzeyi",
+        "serena-ruan",
+        "daniellok-db"
+      ]
+    },
+    {
+      "key": "deploy",
+      "label": "comp:infra",
+      "definition": "Deploy targets and deployment configuration (Docker, Railway, Render, etc.).",
+      "paths": [
+        "deploy/"
+      ],
+      "owners": [
+        "dhruv0811",
+        "PattaraS",
+        "SabhyaC26"
+      ],
+      "owners_paused": [
+        "dbczumar"
+      ]
+    },
+    {
+      "key": "sdks",
+      "label": "comp:server",
+      "definition": "Python and UI client SDKs.",
+      "paths": [
+        "sdks/"
+      ],
+      "owners": [
+        "dhruv0811",
+        "fanzeyi",
+        "SabhyaC26",
+        "TomeHirata",
+        "bbqiu",
+        "aravind-segu"
+      ],
+      "owners_paused": [
+        "dbczumar"
+      ]
+    },
+    {
+      "key": "harness-claude",
+      "label": "comp:harnesses",
+      "definition": "The Claude harness family: the Claude SDK executor/harness (claude-sdk) and the native Claude Code terminal integration.",
+      "paths": [
+        "omnigent/inner/claude_",
+        "omnigent/claude_native"
+      ],
+      "owners": [
+        "dhruv0811",
+        "TomeHirata",
+        "SabhyaC26",
+        "bbqiu",
+        "fanzeyi",
+        "aravind-segu"
+      ],
+      "owners_paused": [
+        "dbczumar"
+      ]
+    },
+    {
+      "key": "harness-codex",
+      "label": "comp:harnesses",
+      "definition": "The Codex / OpenAI harness family: the OpenAI Agents SDK executor/harness, the open-responses SDK, and the native Codex integration.",
+      "paths": [
+        "omnigent/inner/codex_",
+        "omnigent/inner/openai_",
+        "omnigent/inner/open_responses_sdk.py",
+        "omnigent/codex_native"
+      ],
+      "owners": [
+        "dhruv0811",
+        "TomeHirata",
+        "SabhyaC26",
+        "bbqiu",
+        "fanzeyi",
+        "aravind-segu"
+      ],
+      "owners_paused": [
+        "dbczumar"
+      ]
+    },
+    {
+      "key": "harness-cursor",
+      "label": "comp:harnesses",
+      "definition": "The Cursor harness: SDK executor/harness and the native Cursor integration.",
+      "paths": [
+        "omnigent/inner/cursor_",
+        "omnigent/cursor_native"
+      ],
+      "owners": [
+        "SabhyaC26",
+        "dhruv0811"
+      ],
+      "owners_paused": [
+        "dbczumar"
+      ]
+    },
+    {
+      "key": "harness-antigravity",
+      "label": "comp:harnesses",
+      "definition": "The Antigravity (Gemini) harness: SDK executor/harness, native integration, and Gemini/Antigravity auth.",
+      "paths": [
+        "omnigent/inner/antigravity_",
+        "omnigent/antigravity_native",
+        "omnigent/onboarding/antigravity_auth.py",
+        "omnigent/onboarding/gemini_auth.py"
+      ],
+      "owners": [
+        "SabhyaC26",
+        "TomeHirata"
+      ]
+    },
+    {
+      "key": "harness-goose",
+      "label": "comp:harnesses",
+      "definition": "The Goose harness: SDK executor/harness, native TUI/ACP integration, and Goose auth.",
+      "paths": [
+        "omnigent/inner/goose_",
+        "omnigent/goose_native",
+        "omnigent/onboarding/goose_auth.py"
+      ],
+      "owners": [
+        "dhruv0811",
+        "PattaraS"
+      ]
+    },
+    {
+      "key": "harness-hermes",
+      "label": "comp:harnesses",
+      "definition": "The Hermes harness: SDK executor/harness and the native Hermes integration.",
+      "paths": [
+        "omnigent/inner/hermes_",
+        "omnigent/hermes_native"
+      ],
+      "owners": [
+        "dhruv0811",
+        "SabhyaC26",
+        "TomeHirata"
+      ]
+    },
+    {
+      "key": "harness-kimi",
+      "label": "comp:harnesses",
+      "definition": "The Kimi harness: SDK executor/harness and the native Kimi integration.",
+      "paths": [
+        "omnigent/inner/kimi_",
+        "omnigent/kimi_native"
+      ],
+      "owners": [
+        "aravind-segu",
+        "dhruv0811",
+        "fanzeyi"
+      ]
+    },
+    {
+      "key": "harness-kiro",
+      "label": "comp:harnesses",
+      "definition": "The Kiro harness: SDK executor/harness and the native Kiro integration.",
+      "paths": [
+        "omnigent/inner/kiro_",
+        "omnigent/kiro_native"
+      ],
+      "owners": [
+        "PattaraS",
+        "SabhyaC26",
+        "TomeHirata",
+        "dhruv0811"
+      ]
+    },
+    {
+      "key": "harness-opencode",
+      "label": "comp:harnesses",
+      "definition": "The OpenCode harness: SDK executor/harness, native integration, HTTP transport, and OpenCode auth.",
+      "paths": [
+        "omnigent/inner/opencode_",
+        "omnigent/opencode_",
+        "omnigent/onboarding/opencode_auth.py"
+      ],
+      "owners": [
+        "dhruv0811",
+        "PattaraS",
+        "TomeHirata",
+        "SabhyaC26"
+      ],
+      "owners_paused": [
+        "dbczumar"
+      ]
+    },
+    {
+      "key": "harness-pi",
+      "label": "comp:harnesses",
+      "definition": "The Pi harness: SDK executor/harness and the native Pi integration.",
+      "paths": [
+        "omnigent/inner/pi_",
+        "omnigent/pi_native"
+      ],
+      "owners": [
+        "SabhyaC26",
+        "TomeHirata",
+        "dhruv0811"
+      ]
+    },
+    {
+      "key": "harness-qwen",
+      "label": "comp:harnesses",
+      "definition": "The Qwen harness: SDK executor/harness and the native Qwen integration.",
+      "paths": [
+        "omnigent/inner/qwen_",
+        "omnigent/qwen_native"
+      ],
+      "owners": [
+        "serena-ruan",
+        "dhruv0811",
+        "TomeHirata"
+      ]
+    },
+    {
+      "key": "harness-copilot",
+      "label": "comp:harnesses",
+      "definition": "The GitHub Copilot harness: SDK executor/harness and Copilot auth.",
+      "paths": [
+        "omnigent/inner/copilot_",
+        "omnigent/onboarding/copilot_auth.py"
+      ],
+      "owners": [
+        "SabhyaC26",
+        "PattaraS",
+        "TomeHirata",
+        "dhruv0811"
+      ]
+    }
+  ]
+}

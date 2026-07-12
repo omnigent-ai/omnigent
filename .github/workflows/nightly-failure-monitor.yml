@@ -1,0 +1,141 @@
+name: Nightly Failure Monitor
+
+# The nightly-only tests (native-CLI render-parity, real-LLM approval/multi-turn)
+# are excluded from the PR gate, so a break in them blocks no PR and can rot
+# silently. This watches the scheduled (cron) runs of the e2e suites and, once a
+# suite fails TWICE IN A ROW, files/updates a single tracking issue assigned to
+# the maintainer; it comments-and-closes that issue when a later nightly is
+# green. A single flake (one red run) is ignored -- the real-LLM legs are
+# 429-sensitive -- so only a sustained break pages.
+
+on:
+  workflow_run:
+    workflows: ["E2E Tests", "E2E UI Tests"]
+    types: [completed]
+
+permissions:
+  # issues: open/comment/close the tracking issue; actions:read: inspect the
+  # prior scheduled run to detect a 2nd consecutive failure.
+  issues: write
+  actions: read
+  contents: read
+
+jobs:
+  monitor:
+    name: monitor nightly result
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Triage scheduled run outcome
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
+        with:
+          script: |
+            const run = context.payload.workflow_run;
+
+            // Only nightly (cron) runs on the default branch. PR/push/dispatch
+            // runs of these workflows gate their own PRs and are out of scope.
+            if (run.event !== 'schedule') {
+              core.info(`run event is '${run.event}', not 'schedule' -- skipping`);
+              return;
+            }
+            if (run.head_branch !== context.payload.repository.default_branch) {
+              core.info(`run on '${run.head_branch}', not default branch -- skipping`);
+              return;
+            }
+
+            const FAIL = new Set(['failure', 'timed_out']);
+            const OK = new Set(['success']);
+            const conclusion = run.conclusion;
+            if (!FAIL.has(conclusion) && !OK.has(conclusion)) {
+              // cancelled / skipped / neutral: no signal, don't touch the issue.
+              core.info(`conclusion '${conclusion}' is not pass/fail -- skipping`);
+              return;
+            }
+
+            const { owner, repo } = context.repo;
+            const LABEL = 'nightly-failure';
+            const ASSIGNEE = 'PattaraS';
+            const title = `Nightly failure: ${run.name}`;
+
+            // The single open tracking issue for this workflow, if any.
+            const existing = (await github.rest.issues.listForRepo({
+              owner, repo, state: 'open', labels: LABEL, per_page: 100,
+            })).data.find(i => i.title === title && !i.pull_request);
+
+            if (OK.has(conclusion)) {
+              if (existing) {
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: existing.number,
+                  body: `Recovered: [${run.name} #${run.run_number}](${run.html_url}) `
+                      + `is green again (${run.head_sha.slice(0, 9)}). Closing.`,
+                });
+                await github.rest.issues.update({
+                  owner, repo, issue_number: existing.number, state: 'closed',
+                });
+                core.info(`closed #${existing.number} on recovery`);
+              } else {
+                core.info('green and no open issue -- nothing to do');
+              }
+              return;
+            }
+
+            // conclusion is a failure. Only page on the SECOND consecutive
+            // failure: look at the most recent prior completed scheduled run of
+            // this same workflow on the default branch.
+            const prior = (await github.rest.actions.listWorkflowRuns({
+              owner, repo, workflow_id: run.workflow_id, event: 'schedule',
+              branch: run.head_branch, status: 'completed', per_page: 10,
+            })).data.workflow_runs.filter(r => r.id !== run.id)[0];
+
+            if (!prior || !FAIL.has(prior.conclusion)) {
+              core.info(
+                `single failure (prior run: ${prior ? prior.conclusion : 'none'})`
+                + ` -- waiting for a 2nd consecutive failure before paging`);
+              return;
+            }
+
+            // Two in a row: ensure the label exists, then file or update.
+            try {
+              await github.rest.issues.getLabel({ owner, repo, name: LABEL });
+            } catch (e) {
+              if (e.status === 404) {
+                await github.rest.issues.createLabel({
+                  owner, repo, name: LABEL, color: 'b60205',
+                  description: 'A scheduled/nightly test suite failed on consecutive runs',
+                });
+              } else { throw e; }
+            }
+
+            const line = `- [${run.name} #${run.run_number}](${run.html_url})`
+                       + ` failed (${run.head_sha.slice(0, 9)})`;
+            if (existing) {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: existing.number,
+                body: `Still failing:\n${line}`,
+              });
+              core.info(`commented on existing #${existing.number}`);
+              return;
+            }
+
+            const body = [
+              `**${run.name}** has failed on two consecutive nightly runs.`,
+              '',
+              'These tests are nightly-only (native-CLI / real-LLM), so no PR is',
+              'blocked -- please triage.',
+              '',
+              'Failing runs:',
+              line,
+              '',
+              `_Filed by ${context.workflow}. Auto-closes when a later nightly run is green._`,
+            ].join('\n');
+            const created = await github.rest.issues.create({
+              owner, repo, title, body, labels: [LABEL],
+            });
+            try {
+              await github.rest.issues.addAssignees({
+                owner, repo, issue_number: created.data.number, assignees: [ASSIGNEE],
+              });
+            } catch (e) {
+              core.warning(`could not assign ${ASSIGNEE}: ${e.message}`);
+            }
+            core.info(`opened #${created.data.number}`);
