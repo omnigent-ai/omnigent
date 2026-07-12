@@ -22,6 +22,7 @@ from omnigent.session_lifecycle import (
     CLOSED_LABEL_VALUE,
     CLOSED_TITLE_INFIX,
     is_session_closed,
+    title_without_closed_marker,
 )
 from omnigent.spec import AgentSpec
 from omnigent.stores import ConversationStore
@@ -1537,11 +1538,23 @@ class SysSessionCloseTool(Tool):
         busy_error = _busy_check_or_none(child_conv_id=resolution.child.id)
         if busy_error is not None:
             return busy_error
-        labelled = _agent_title_from_conversation(resolution.child)
-        # Re-build the tombstoned title from the parsed components so
-        # the marker lands in the canonical position even if the
-        # original title used uncommon characters around the colon.
-        new_title = f"{labelled.agent}:{labelled.title}{_CLOSED_TITLE_INFIX}{resolution.child.id}"
+        if resolution.child.title and ":" in resolution.child.title:
+            labelled = _agent_title_from_conversation(resolution.child)
+            agent_out: str | None = labelled.agent
+            title_out: str | None = labelled.title
+            # Re-build the tombstoned title from the parsed components so
+            # the marker lands in the canonical position even if the
+            # original title used uncommon characters around the colon.
+            new_title = f"{labelled.agent}:{labelled.title}{_CLOSED_TITLE_INFIX}{resolution.child.id}"
+        else:
+            # A child created via sys_session_create carries the caller's
+            # plain title (or none) — no "<agent>:" prefix, so there is no
+            # (agent, title) named slot to free. It passed the sub-agent
+            # gate in _resolve_session_call, so it must still be closable.
+            display = title_without_closed_marker(resolution.child.title) or ""
+            agent_out = None
+            title_out = display or None
+            new_title = f"{display}{_CLOSED_TITLE_INFIX}{resolution.child.id}"
         resolution.conv_store.update_conversation(resolution.child.id, title=new_title)
         resolution.conv_store.set_labels(
             resolution.child.id,
@@ -1551,8 +1564,8 @@ class SysSessionCloseTool(Tool):
             {
                 "closed": True,
                 "conversation_id": resolution.child.id,
-                "agent": labelled.agent,
-                "title": labelled.title,
+                "agent": agent_out,
+                "title": title_out,
             }
         )
 

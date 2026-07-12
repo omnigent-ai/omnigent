@@ -7191,3 +7191,58 @@ async def test_spawn_async_tool_cancels_losing_future_no_leak(
     await asyncio.sleep(0)
     assert inbox.get_nowait()["status"] == "cancelled"
     assert _leaked(before) == []
+
+
+@pytest.mark.asyncio
+async def test_session_close_accepts_plain_titled_id_created_child() -> None:
+    """
+    The REST close path tombstones a child whose title has no agent prefix.
+
+    Children created via ``sys_session_create`` carry the caller's plain
+    ``title`` (no ``"<agent>:"`` shape). They have a parent, so the
+    sub-agent gate passes; the old title-shape check then returned a
+    misleading ``session_not_a_sub_agent`` and made such children
+    uncloseable (their tmux-hosted CLIs accumulated until deletion).
+    """
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    patched: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_leaf":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_leaf",
+                    "title": "leaf~run1~a1~0.1",
+                    "root_conversation_id": "conv_root",
+                    "parent_session_id": "conv_caller",
+                },
+            )
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_caller":
+            return httpx.Response(
+                200,
+                json={"id": "conv_caller", "root_conversation_id": "conv_root"},
+            )
+        if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_leaf":
+            patched.update(json.loads(request.content))
+            return httpx.Response(200, json={"id": "conv_leaf"})
+        raise AssertionError(f"unexpected {request.method} {request.url.path}")
+
+    async with _session_query_client(handler) as client:
+        out = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_close",
+                json.dumps({"conversation_id": "conv_leaf"}),
+                conversation_id="conv_caller",
+                server_client=client,
+            )
+        )
+    assert patched["title"] == "leaf~run1~a1~0.1:closed:conv_leaf"
+    assert patched["labels"] == {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE}
+    assert out == {
+        "closed": True,
+        "conversation_id": "conv_leaf",
+        "agent": None,
+        "title": "leaf~run1~a1~0.1",
+    }

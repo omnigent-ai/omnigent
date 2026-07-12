@@ -915,3 +915,72 @@ def test_peek_empty_conversation_id_returns_error(session_fixture: _Fixture) -> 
 # ``test_peek_out_of_tree_conversation_is_rejected`` (rejection
 # path). No standalone resolver test — the mechanism has no
 # observable behavior beyond those two outcomes.
+
+
+def test_close_plain_titled_id_created_child(session_fixture: _Fixture) -> None:
+    """
+    Close works for a child whose title has no ``"<agent>:"`` prefix.
+
+    Children created via ``sys_session_create`` carry the caller's plain
+    ``title`` (no named ``(agent, title)`` slot). They pass the sub-agent
+    gate (they have a parent), so close must tombstone them rather than
+    raise from ``_agent_title_from_conversation`` — before this path
+    existed such children were uncloseable and their harness CLIs
+    accumulated until session deletion.
+    """
+    plain_child = session_fixture.conv_store.create_conversation(
+        kind="sub_agent",
+        title="leaf~run1~a1~0.1",
+        parent_conversation_id=session_fixture.parent_conv_id,
+    )
+    tool = SysSessionCloseTool()
+    payload = json.loads(
+        tool.invoke(
+            json.dumps({"conversation_id": plain_child.id}),
+            session_fixture.ctx,
+        )
+    )
+    assert payload == {
+        "closed": True,
+        "conversation_id": plain_child.id,
+        "agent": None,
+        "title": "leaf~run1~a1~0.1",
+    }
+    refreshed = session_fixture.conv_store.get_conversation(plain_child.id)
+    assert refreshed is not None
+    assert refreshed.title == f"leaf~run1~a1~0.1{_CLOSED_TITLE_INFIX}{plain_child.id}"
+    assert refreshed.labels[CLOSED_LABEL_KEY] == CLOSED_LABEL_VALUE
+
+
+def test_close_untitled_id_created_child(session_fixture: _Fixture) -> None:
+    """
+    Close works for an id-created child with no title at all.
+
+    ``sys_session_create``'s ``title`` is optional; the store defaults
+    such rows to ``"untitled:<conv_id>"``, which parses down the named
+    branch (pseudo-agent ``"untitled"``). The tombstone must still land
+    and the closed label must be set.
+    """
+    untitled_child = session_fixture.conv_store.create_conversation(
+        kind="sub_agent",
+        parent_conversation_id=session_fixture.parent_conv_id,
+    )
+    tool = SysSessionCloseTool()
+    payload = json.loads(
+        tool.invoke(
+            json.dumps({"conversation_id": untitled_child.id}),
+            session_fixture.ctx,
+        )
+    )
+    assert payload == {
+        "closed": True,
+        "conversation_id": untitled_child.id,
+        "agent": "untitled",
+        "title": untitled_child.id,
+    }
+    refreshed = session_fixture.conv_store.get_conversation(untitled_child.id)
+    assert refreshed is not None
+    assert refreshed.title == (
+        f"untitled:{untitled_child.id}{_CLOSED_TITLE_INFIX}{untitled_child.id}"
+    )
+    assert refreshed.labels[CLOSED_LABEL_KEY] == CLOSED_LABEL_VALUE

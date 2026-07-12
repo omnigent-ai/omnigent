@@ -4306,9 +4306,20 @@ async def _session_close_via_rest(
     if scope_error is not None:
         return scope_error
     parsed = _parse_session_title(target_snap.get("title"))
-    if parsed.agent is None or parsed.title is None:
-        return json.dumps({"error": "session_not_a_sub_agent", "conversation_id": target_id})
-    new_title = f"{parsed.agent}:{parsed.title}{_CLOSED_TITLE_INFIX}{target_id}"
+    agent_out = parsed.agent
+    title_out = parsed.title
+    if parsed.agent is not None and parsed.title is not None:
+        new_title = f"{parsed.agent}:{parsed.title}{_CLOSED_TITLE_INFIX}{target_id}"
+    else:
+        # A child created via sys_session_create carries the caller's plain
+        # title (no "<agent>:" prefix). It passed the parent gate above, so
+        # it IS a sub-agent — refusing here (the old behavior) returned a
+        # misleading session_not_a_sub_agent and made id-created children
+        # uncloseable. There is no (agent, title) named slot to free, so the
+        # tombstone just appends the closed marker to whatever title exists.
+        display = title_without_closed_marker(target_snap.get("title")) or ""
+        title_out = display or None
+        new_title = f"{display}{_CLOSED_TITLE_INFIX}{target_id}"
     try:
         patch = await server_client.patch(
             f"/v1/sessions/{target_id}",
@@ -4326,8 +4337,8 @@ async def _session_close_via_rest(
         {
             "closed": True,
             "conversation_id": target_id,
-            "agent": parsed.agent,
-            "title": parsed.title,
+            "agent": agent_out,
+            "title": title_out,
         }
     )
 
