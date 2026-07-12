@@ -121,6 +121,7 @@ import { useCommentInbox } from "@/hooks/useCommentInbox";
 import { sumPendingApprovals } from "@/lib/inbox";
 import { isSessionStoppable } from "@/lib/sessionStop";
 import { isOwnerLevel } from "@/lib/permissionsApi";
+import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { getSessionState, type SessionState } from "@/hooks/useSessionState";
 import {
   isConversationUnseen,
@@ -3440,6 +3441,10 @@ function ConversationEditRow({ initialTitle, onCommit, onCancel }: ConversationE
   // checks this so we don't double-fire onCommit with the unedited
   // value when the input loses focus as part of unmounting.
   const cancelledRef = useRef(false);
+  // Tracks an active IME composition (e.g. Japanese conversion) so the Enter
+  // that confirms a candidate doesn't commit the rename. Mirrors the chat
+  // composer guard (#132/#243).
+  const isComposingRef = useRef(false);
 
   useEffect(() => {
     inputRef.current?.focus();
@@ -3447,6 +3452,7 @@ function ConversationEditRow({ initialTitle, onCommit, onCancel }: ConversationE
   }, []);
 
   function handleKeyDown(e: KeyboardEvent<HTMLInputElement>) {
+    if (isImeCompositionKeyEvent(e, isComposingRef.current)) return;
     if (e.key === "Enter") {
       e.preventDefault();
       onCommit(value);
@@ -3473,6 +3479,12 @@ function ConversationEditRow({ initialTitle, onCommit, onCancel }: ConversationE
         type="text"
         value={value}
         onChange={(e) => setValue(e.target.value)}
+        onCompositionStart={() => {
+          isComposingRef.current = true;
+        }}
+        onCompositionEnd={() => {
+          isComposingRef.current = false;
+        }}
         onKeyDown={handleKeyDown}
         onBlur={handleBlur}
         data-testid="rename-conversation-input"

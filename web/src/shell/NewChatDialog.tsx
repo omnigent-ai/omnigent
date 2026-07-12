@@ -838,6 +838,9 @@ function LandingProjectPicker({
                 value={newName}
                 onChange={(e) => setNewName(e.target.value)}
                 onKeyDown={(e) => {
+                  // Don't commit while an IME composition Enter is being
+                  // confirmed (e.g. Japanese conversion). Mirrors #132/#243.
+                  if (isImeCompositionKeyEvent(e)) return;
                   if (e.key === "Enter") {
                     e.preventDefault();
                     commitNew();
