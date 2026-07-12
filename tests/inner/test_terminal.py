@@ -19,6 +19,9 @@ from omnigent.inner.terminal import (
     TERMINAL_TRANSPORT_CONTROL,
     TERMINAL_TRANSPORT_PTY,
     TerminalInstance,
+    _apply_utf8_locale_default,
+    _has_utf8_locale,
+    _is_utf8_locale_value,
     create_terminal_instance,
     resolve_terminal_transport,
 )
@@ -1320,3 +1323,90 @@ def test_create_terminal_instance_denies_control_socket_but_keeps_private_dir_wr
         )
     finally:
         shutil.rmtree(instance.private_dir, ignore_errors=True)
+
+
+# ── UTF-8 locale default for native TUI panes (issue #2427) ──────────────────
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("C.UTF-8", True),
+        ("en_US.UTF-8", True),
+        ("en_US.utf8", True),
+        ("en_US.UTF8", True),
+        ("de_DE.UTF-8@euro", True),
+        ("C", False),
+        ("POSIX", False),
+        ("en_US", False),
+        ("en_US.ISO-8859-1", False),
+        ("", False),
+        (None, False),
+    ],
+)
+def test_is_utf8_locale_value(value: str | None, expected: bool) -> None:
+    """Only a UTF-8 codeset (after the dot) counts, case/separator-insensitive."""
+    assert _is_utf8_locale_value(value) is expected
+
+
+def test_has_utf8_locale_lc_all_overrides_lang() -> None:
+    """A non-empty LC_ALL wins over LANG per POSIX precedence."""
+    # LC_ALL UTF-8 beats a non-UTF-8 LANG.
+    assert _has_utf8_locale({"LC_ALL": "C.UTF-8", "LANG": "C"}) is True
+    # A pinned non-UTF-8 LC_ALL shadows an otherwise-UTF-8 LANG.
+    assert _has_utf8_locale({"LC_ALL": "C", "LANG": "en_US.UTF-8"}) is False
+    # Empty LC_ALL falls through to LANG.
+    assert _has_utf8_locale({"LC_ALL": "", "LANG": "en_US.UTF-8"}) is True
+
+
+def test_has_utf8_locale_ignores_lc_ctype() -> None:
+    """The affected CLIs read LC_ALL/LANG directly; a UTF-8 LC_CTYPE alone
+    (the CoDA container repro: empty LANG, unset LC_ALL) is not a signal."""
+    assert _has_utf8_locale({"LC_CTYPE": "C.UTF-8", "LANG": ""}) is False
+
+
+def test_apply_utf8_locale_default_fixes_repro_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The repro env (LC_CTYPE=C.UTF-8, empty LANG, no LC_ALL) gets C.UTF-8."""
+    monkeypatch.setattr(terminal_mod, "IS_WINDOWS", False)
+    env = {"LC_CTYPE": "C.UTF-8", "LANG": ""}
+    _apply_utf8_locale_default(env)
+    assert env["LANG"] == "C.UTF-8"
+    assert env["LC_ALL"] == "C.UTF-8"
+    # LC_CTYPE is left untouched.
+    assert env["LC_CTYPE"] == "C.UTF-8"
+
+
+def test_apply_utf8_locale_default_preserves_operator_locale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An operator-provided UTF-8 locale is left exactly as-is."""
+    monkeypatch.setattr(terminal_mod, "IS_WINDOWS", False)
+    env = {"LANG": "en_US.UTF-8"}
+    _apply_utf8_locale_default(env)
+    assert env["LANG"] == "en_US.UTF-8"
+    assert "LC_ALL" not in env
+
+
+def test_apply_utf8_locale_default_corrects_pinned_non_utf8_lc_all(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pinned non-UTF-8 LC_ALL is corrected to C.UTF-8."""
+    monkeypatch.setattr(terminal_mod, "IS_WINDOWS", False)
+    env = {"LC_ALL": "C", "LANG": "C"}
+    _apply_utf8_locale_default(env)
+    assert env["LANG"] == "C.UTF-8"
+    assert env["LC_ALL"] == "C.UTF-8"
+
+
+def test_apply_utf8_locale_default_noop_on_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No-op on Windows: tmux panes are POSIX-only, and forcing a locale onto
+    a Windows operator's env would be wrong."""
+    monkeypatch.setattr(terminal_mod, "IS_WINDOWS", True)
+    env = {"LANG": ""}
+    _apply_utf8_locale_default(env)
+    assert "LC_ALL" not in env
+    assert env["LANG"] == ""
