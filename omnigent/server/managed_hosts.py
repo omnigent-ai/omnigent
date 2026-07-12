@@ -1804,11 +1804,9 @@ def _parse_kubernetes_resources(raw: dict[str, object]) -> dict[str, object] | N
     return normalized
 
 
-# Absolute path prefixes a pvc_mounts mount_path may not land on or under:
-# "/home/omnigent" is the runner's writable-HOME emptyDir (mirrors _HOME_DIR in
-# omnigent.onboarding.sandboxes.kubernetes — fixed by design, like the RFC 1123
-# regexes above); "/var/run/secrets" is where Kubernetes projects Secrets; the
-# rest would shadow the image's OS or the host's scratch space.
+# Path prefixes a pvc_mounts mount_path may not shadow: the runner's
+# writable-HOME emptyDir (mirrors the launcher's _HOME_DIR — pinned by test),
+# Kubernetes Secret projections, and the image's OS / scratch directories.
 _KUBERNETES_RESERVED_MOUNT_PREFIXES: tuple[str, ...] = (
     "/home/omnigent",
     "/var/run/secrets",
@@ -1855,12 +1853,7 @@ def _parse_kubernetes_pvc_mounts(raw: dict[str, object]) -> list[dict[str, objec
         path_prefix = f"sandbox.kubernetes.pvc_mounts[{i}]"
         if not isinstance(entry, dict):
             raise ValueError(f"server config '{path_prefix}' must be a mapping")
-        unknown = sorted(set(entry) - {"claim_name", "mount_path", "read_only"})
-        if unknown:
-            raise ValueError(
-                f"server config '{path_prefix}' has unknown key(s): "
-                f"{', '.join(unknown)} (expected claim_name, mount_path, read_only)"
-            )
+        _reject_unknown_keys(entry, {"claim_name", "mount_path", "read_only"}, path_prefix)
         claim = entry.get("claim_name")
         if not isinstance(claim, str) or not claim.strip():
             raise ValueError(
@@ -1868,11 +1861,7 @@ def _parse_kubernetes_pvc_mounts(raw: dict[str, object]) -> list[dict[str, objec
                 "PersistentVolumeClaim pre-created in the runner namespace"
             )
         claim = claim.strip()
-        if len(claim) > 253 or not _DNS1123_SUBDOMAIN_RE.fullmatch(claim):
-            raise ValueError(
-                f"server config '{path_prefix}.claim_name' is not a valid "
-                f"Kubernetes name (RFC 1123 DNS subdomain): {claim!r}"
-            )
+        _validate_dns1123_subdomain(claim, f"pvc_mounts[{i}].claim_name")
         mount = entry.get("mount_path")
         if not isinstance(mount, str) or not mount.startswith("/"):
             raise ValueError(

@@ -875,7 +875,7 @@ class KubernetesSandboxLauncher(SandboxLauncher):
         self._kubeconfig = kubeconfig
         self._in_cluster = in_cluster
         self._resources = resources
-        self._pvc_mounts = [dict(m) for m in pvc_mounts] if pvc_mounts else None
+        self._pvc_mounts = list(pvc_mounts) if pvc_mounts else None
         self._core: k8s_client.CoreV1Api | None = None
         self._api_client: k8s_client.ApiClient | None = None
 
