@@ -819,6 +819,55 @@ def test_parse_kubernetes_pvc_mounts_sibling_prefix_is_not_nested() -> None:
     assert cfg is not None
 
 
+def test_parse_kubernetes_pvc_mounts_nesting_is_rejected_regardless_of_order() -> None:
+    """The pairwise collision check catches nesting anywhere in a 3-entry list."""
+    with pytest.raises(ValueError, match="nested"):
+        parse_sandbox_config(
+            {
+                "provider": "kubernetes",
+                "server_url": "http://s.svc.cluster.local",
+                "kubernetes": {
+                    "pvc_mounts": [
+                        {"claim_name": "a", "mount_path": "/mnt/x/sub"},
+                        {"claim_name": "b", "mount_path": "/mnt/y"},
+                        {"claim_name": "c", "mount_path": "/mnt/x"},
+                    ]
+                },
+            }
+        )
+
+
+def test_parse_kubernetes_pvc_mounts_rejects_explicit_null_read_only() -> None:
+    """An explicit YAML `read_only: null` is rejected, not silently defaulted."""
+    with pytest.raises(ValueError, match="boolean"):
+        parse_sandbox_config(
+            {
+                "provider": "kubernetes",
+                "server_url": "http://s.svc.cluster.local",
+                "kubernetes": {
+                    "pvc_mounts": [{"claim_name": "c", "mount_path": "/mnt/x", "read_only": None}]
+                },
+            }
+        )
+
+
+def test_parse_kubernetes_pvc_mounts_allows_same_claim_at_two_paths() -> None:
+    """One claim may be mounted at two paths (e.g. RO datasets + RW scratch subtrees)."""
+    cfg = parse_sandbox_config(
+        {
+            "provider": "kubernetes",
+            "server_url": "http://s.svc.cluster.local",
+            "kubernetes": {
+                "pvc_mounts": [
+                    {"claim_name": "shared", "mount_path": "/mnt/a"},
+                    {"claim_name": "shared", "mount_path": "/mnt/b", "read_only": False},
+                ]
+            },
+        }
+    )
+    assert cfg is not None
+
+
 @pytest.mark.parametrize(
     ("raw", "expected_fragment"),
     [
