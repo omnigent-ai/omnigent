@@ -308,12 +308,10 @@ class SessionsNamespace:
     """
     Client namespace for ``/v1/sessions`` endpoints.
 
-    Provides the four operations the route module exposes: create a
-    session from an uploaded agent bundle, bind it to a runner, fetch
-    a snapshot, post an event into the session's input queue (or an
-    interrupt that bypasses it), and live-tail the SSE stream. There
-    is no replay; see the module docstring for the snapshot +
-    live-tail reconnect contract.
+    Creates sessions from either an uploaded bundle or an existing
+    registered agent, binds caller-managed runners, fetches snapshots,
+    posts inputs, and live-tails the SSE stream. There is no replay;
+    see the module docstring for the snapshot + live-tail contract.
 
     :param http: Pre-built ``httpx.AsyncClient`` shared with the
         parent :class:`OmnigentClient`. Owned by the parent;
@@ -390,6 +388,35 @@ class SessionsNamespace:
         created = require_json_object(resp, "POST /v1/sessions")
         session_id = str(created["session_id"])
         return await self.get(session_id)
+
+    async def create_registered(
+        self,
+        agent_id: str,
+        *,
+        host_id: str | None = None,
+        workspace: str | None = None,
+    ) -> Session:
+        """Create a fresh session from an already-registered agent.
+
+        Calls JSON ``POST /v1/sessions`` with the same agent/host/workspace
+        contract used by the web new-chat flow. The server launches and binds
+        the host runner before returning the session snapshot.
+
+        :param agent_id: Durable registered-agent id, e.g. ``"ag_abc123"``.
+        :param host_id: Optional host that should launch the runner.
+        :param workspace: Absolute workspace on that host. Required with
+            ``host_id`` and invalid without it.
+        :returns: The newly created and host-bound session snapshot.
+        :raises OmnigentError: If the server returns a non-2xx status.
+        """
+        if (host_id is None) != (workspace is None):
+            raise ValueError("host_id and workspace must be provided together")
+        body = {"agent_id": agent_id}
+        if host_id is not None and workspace is not None:
+            body.update({"host_id": host_id, "workspace": workspace})
+        resp = await self._http.post(f"{self._base}/v1/sessions", json=body)
+        raise_for_status(resp.status_code, response_body(resp))
+        return Session.from_dict(require_json_object(resp, "POST /v1/sessions"))
 
     async def list(
         self,

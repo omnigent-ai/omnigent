@@ -12,12 +12,14 @@ Runs entirely against the mock LLM server — no real API key needed::
 
 from __future__ import annotations
 
+import asyncio
 import os
 import uuid
 from pathlib import Path
 
 import httpx
 import yaml as _yaml
+from omnigent_client import OmnigentClient
 
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from tests.e2e.conftest import (
@@ -316,22 +318,21 @@ def test_chat_local_accepts_omnigent_yaml_file(
         _stop_local_server(server)
 
 
-def test_chat_remote_pick_agent(
+def test_sdk_creates_registered_agent_session(
     mock_llm_server_url: str | None,
     tmp_path: Path,
 ) -> None:
     """
-    Remote chat can list and identify agents on a server.
+    The SDK can create a session from a server-registered agent.
 
-    Tests the remote mode's agent discovery by starting a server with
-    an inline agent and verifying ``_pick_agent`` finds it.
+    Starts a real server with an inline agent, resolves its durable id,
+    and exercises the SDK's JSON session-creation contract.
 
     **What breaks if this fails:**
-    - _pick_agent can't parse server agent listing response.
-    - Agent name extraction broken.
+    - The SDK's registered-agent request no longer matches the server route.
+    - The returned session cannot be bound to a runner through the SDK.
     """
     from omnigent.chat import (
-        _pick_agent,
         _start_local_server,
         _stop_local_server,
         _wait_for_server,
@@ -356,19 +357,20 @@ def test_chat_remote_pick_agent(
     try:
         _wait_for_server(port, server)
 
-        # Create a session so _pick_agent can discover the agent name
-        # from GET /v1/sessions (which it uses to list agent names).
-        client = httpx.Client(base_url=base_url, timeout=30.0)
-        _create_runner_bound_session_for_builtin(
-            client,
-            agent_name=agent_name,
-            runner_id=server.runner_id or "",
-        )
+        http_client = httpx.Client(base_url=base_url, timeout=30.0)
+        agent_id = _lookup_builtin_agent_id(http_client, agent_name)
 
-        # _pick_agent auto-selects when there's only one agent.
-        picked = _pick_agent(base_url)
-        assert picked == agent_name, (
-            f"Expected _pick_agent to return {agent_name!r}, got {picked!r}."
-        )
+        async def _create_and_bind() -> tuple[str, str | None]:
+            async with OmnigentClient(base_url=base_url) as client:
+                session = await client.sessions.create_registered(agent_id)
+                bound = await client.sessions.bind_runner(
+                    session.id,
+                    runner_id=server.runner_id or "",
+                )
+                return bound.id, bound.runner_id
+
+        session_id, runner_id = asyncio.run(_create_and_bind())
+        assert session_id.startswith("conv_")
+        assert runner_id == server.runner_id
     finally:
         _stop_local_server(server)

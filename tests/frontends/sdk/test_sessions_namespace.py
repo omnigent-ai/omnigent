@@ -218,6 +218,100 @@ async def test_create_404_raises_omnigent_error() -> None:
     assert "no such agent" in str(exc_info.value)
 
 
+@pytest.mark.asyncio
+async def test_create_registered_posts_json_launch_contract() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["content_type"] = request.headers.get("content-type")
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(
+            201,
+            json=_session_response_body(items=[]) | {"runner_id": "runner_local_test"},
+        )
+
+    ns, client = _make_namespace(handler)
+    try:
+        session = await ns.create_registered(
+            "ag_eric",
+            host_id="host_hermes",
+            workspace="/srv/project",
+        )
+    finally:
+        await client.aclose()
+
+    assert captured == {
+        "method": "POST",
+        "content_type": "application/json",
+        "body": {
+            "agent_id": "ag_eric",
+            "host_id": "host_hermes",
+            "workspace": "/srv/project",
+        },
+    }
+    assert session.agent_id == "ag_abc"
+    assert session.runner_id == "runner_local_test"
+
+
+@pytest.mark.asyncio
+async def test_create_registered_allows_agent_only_contract() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(201, json=_session_response_body(items=[]))
+
+    ns, client = _make_namespace(handler)
+    try:
+        await ns.create_registered("ag_eric")
+    finally:
+        await client.aclose()
+
+    assert captured["body"] == {"agent_id": "ag_eric"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("host_id", "workspace"),
+    [("host_hermes", None), (None, "/srv/project")],
+)
+async def test_create_registered_rejects_partial_host_binding(
+    host_id: str | None,
+    workspace: str | None,
+) -> None:
+    ns, client = _make_namespace(lambda _request: pytest.fail("request sent"))
+    try:
+        with pytest.raises(ValueError, match="must be provided together"):
+            await ns.create_registered(
+                "ag_eric",
+                host_id=host_id,
+                workspace=workspace,
+            )
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_create_registered_propagates_server_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            403,
+            json={"error": {"code": "forbidden", "message": "host not owned"}},
+        )
+
+    ns, client = _make_namespace(handler)
+    try:
+        with pytest.raises(OmnigentError, match="host not owned"):
+            await ns.create_registered(
+                "ag_eric",
+                host_id="host_other",
+                workspace="/srv/project",
+            )
+    finally:
+        await client.aclose()
+
+
 # ── get() ─────────────────────────────────────────────────────────────
 
 

@@ -498,12 +498,14 @@ def run_prompt(
                 "agent paths. The remote server controls its own agent registrations."
             )
         base_url = target.rstrip("/")
-        agent_name = _pick_agent(base_url, quiet=True)
-        _run_headless_prompt(
-            base_url,
-            agent_name,
-            tool_handler,
+        choice = _pick_remote_agent(base_url, quiet=True)
+        session_id = _create_remote_registered_session(base_url, choice)
+        _run_one_shot(
+            base_url=base_url,
+            agent_name=choice.name,
+            tool_handler=tool_handler,
             prompt=prompt,
+            resume_conversation_id=session_id,
         )
         return
 
@@ -964,7 +966,23 @@ def _chat_with_server(
     ):
         return
 
-    selected_agent = agent_name or _pick_agent(base_url)
+    remote_choice = (
+        _pick_remote_agent(base_url, quiet=initial_message is not None)
+        if agent_name is None
+        else None
+    )
+    selected_agent = remote_choice.name if remote_choice is not None else agent_name
+    if selected_agent is None:
+        raise click.ClickException("No agent selected")
+    if (
+        remote_choice is not None
+        and resume_conversation_id is None
+        and fork_session_id is None
+        and session_bundle is None
+        and runner_id is None
+    ):
+        resume_conversation_id = _create_remote_registered_session(base_url, remote_choice)
+        attach_only = True
 
     # Bring-up is done — clear the spinner the instant before we produce
     # terminal output (the one-shot reply or the REPL's first paint), so it
@@ -1480,21 +1498,19 @@ def _attach_session_info(
     )
 
 
-def _pick_agent(base_url: str, *, quiet: bool = False) -> str:
-    """
-    Discover agent names from existing sessions and let the user pick.
+@dataclass(frozen=True)
+class _RemoteAgentChoice:
+    """Registered-agent launch facts recovered from a prior session."""
 
-    If only one agent name is found, selects it automatically.
-    Falls back to requiring the user to specify ``--agent`` if no
-    sessions exist yet.
+    name: str
+    agent_id: str
+    host_id: str
+    workspace: str
 
-    :param base_url: Server base URL.
-    :param quiet: When ``True``, suppress interactive prompts and
-        auto-select the first available agent.
-    :returns: The chosen agent name.
-    :raises click.ClickException: If no sessions exist or no
-        agent name can be discovered.
-    """
+
+def _remote_agent_choices(base_url: str) -> list[_RemoteAgentChoice]:
+    """Return launchable registered agents from recent remote sessions."""
+
     resp = httpx.get(
         f"{base_url}/v1/sessions",
         headers=_remote_headers(server_url=base_url),
@@ -1502,42 +1518,89 @@ def _pick_agent(base_url: str, *, quiet: bool = False) -> str:
         timeout=10.0,
     )
     resp.raise_for_status()
-    sessions = resp.json()["data"]
-
-    # Collect unique agent names from sessions.
-    names: list[str] = []
+    choices: list[_RemoteAgentChoice] = []
     seen: set[str] = set()
-    for s in sessions:
-        name = s.get("agent_name")
-        if name and name not in seen:
-            names.append(name)
+    for session in resp.json()["data"]:
+        name = session.get("agent_name")
+        agent_id = session.get("agent_id")
+        host_id = session.get("host_id")
+        workspace = session.get("workspace")
+        if (
+            isinstance(name, str)
+            and name
+            and name not in seen
+            and isinstance(agent_id, str)
+            and agent_id
+            and isinstance(host_id, str)
+            and host_id
+            and isinstance(workspace, str)
+            and workspace
+        ):
+            choices.append(
+                _RemoteAgentChoice(
+                    name=name,
+                    agent_id=agent_id,
+                    host_id=host_id,
+                    workspace=workspace,
+                )
+            )
             seen.add(name)
+    return choices
 
-    if not names:
+
+def _pick_remote_agent(base_url: str, *, quiet: bool = False) -> _RemoteAgentChoice:
+    """Pick a launchable registered agent for a fresh remote session."""
+
+    choices = _remote_agent_choices(base_url)
+    if not choices:
         raise click.ClickException(
-            "No sessions found on the server. Start a session first "
-            "or specify the agent with --agent."
+            "No launchable agents found on the server. Start a host-bound "
+            "session in the web UI first."
+        )
+    if len(choices) == 1:
+        if not quiet:
+            click.echo(f"\n  Agent: {choices[0].name}")
+        return choices[0]
+    if quiet:
+        raise click.ClickException(
+            "Multiple remote agents are available. Run without -p to choose one interactively."
         )
 
-    if len(names) == 1:
-        if not quiet:
-            click.echo(f"\n  Agent: {names[0]}")
-        return names[0]
-
     click.echo("\n  Available agents:\n")
-    for i, name in enumerate(names, 1):
-        click.echo(f"    {i}. {name}")
-
+    for index, choice in enumerate(choices, 1):
+        click.echo(f"    {index}. {choice.name}")
     while True:
         raw = str(click.prompt("\n  Agent", default="1"))
         try:
-            choice = int(raw)
-            if 1 <= choice <= len(names):
-                return names[choice - 1]
+            index = int(raw)
+            if 1 <= index <= len(choices):
+                return choices[index - 1]
         except ValueError:
-            if raw.strip() in seen:
-                return raw.strip()
-        click.echo(f"  Enter a number between 1 and {len(names)}.")
+            for choice in choices:
+                if raw.strip() == choice.name:
+                    return choice
+        click.echo(f"  Enter a number between 1 and {len(choices)}.")
+
+
+def _create_remote_registered_session(
+    base_url: str,
+    choice: _RemoteAgentChoice,
+) -> str:
+    """Create and host-launch one fresh registered-agent session."""
+
+    async def _main() -> str:
+        async with OmnigentClient(
+            base_url=base_url,
+            auth=_server_auth(server_url=base_url),
+        ) as client:
+            session = await client.sessions.create_registered(
+                choice.agent_id,
+                host_id=choice.host_id,
+                workspace=choice.workspace,
+            )
+            return session.id
+
+    return asyncio.run(_main())
 
 
 # ---------------------------------------------------------------------------
@@ -2320,7 +2383,7 @@ async def _query_sessions_once(
     agent_name: str,
     tool_handler: ToolHandler | None,
     prompt: str,
-    session_bundle: bytes,
+    session_bundle: bytes | None,
     session_bundle_filename: str,
     runner_id: str | None,
     resume_conversation_id: str | None = None,
@@ -2334,7 +2397,8 @@ async def _query_sessions_once(
         Used only for tool-handler validation messages.
     :param tool_handler: Optional client-side tool handler.
     :param prompt: User prompt for the single turn.
-    :param session_bundle: Gzipped agent tarball bytes.
+    :param session_bundle: Gzipped agent tarball bytes. May be ``None``
+        only when resuming a server-created session.
     :param session_bundle_filename: Multipart filename, e.g.
         ``"agent.tar.gz"``.
     :param runner_id: Registered runner id, e.g.
@@ -2350,17 +2414,22 @@ async def _query_sessions_once(
     """
     from omnigent_client import SessionsChat
 
-    if runner_id is None:
-        raise RuntimeError(
-            "Sessions API headless prompt requires a registered runner id. "
-            "Start through `omnigent run <agent>` or pass --server so the CLI "
-            "can launch and bind a runner."
-        )
     tool_callables = _sessions_tool_callables(tool_handler, agent_name)
     if resume_conversation_id is not None:
         bound = await client.sessions.get(resume_conversation_id)
-        await client.sessions.bind_runner(resume_conversation_id, runner_id=runner_id)
+        if runner_id is not None:
+            bound = await client.sessions.bind_runner(resume_conversation_id, runner_id=runner_id)
+        elif bound.runner_id is None:
+            raise RuntimeError("The remote session has no bound runner")
     else:
+        if runner_id is None:
+            raise RuntimeError(
+                "Sessions API headless prompt requires a registered runner id. "
+                "Start through `omnigent run <agent>` or pass --server so the CLI "
+                "can launch and bind a runner."
+            )
+        if session_bundle is None:
+            raise RuntimeError("Fresh local sessions require an agent bundle")
         created = await client.sessions.create(
             session_bundle,
             filename=session_bundle_filename,
@@ -4070,7 +4139,7 @@ def _run_one_shot(
             headers=_server_headers(runner_id=runner_id),
             auth=_server_auth(server_url=base_url),
         ) as client:
-            if session_bundle is not None:
+            if session_bundle is not None or resume_conversation_id is not None:
                 text = await _query_sessions_once(
                     client=client,
                     agent_name=agent_name,

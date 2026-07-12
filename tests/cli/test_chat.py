@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import click
 import httpx
 import pytest
+from click.testing import CliRunner
 from omnigent_client import OmnigentError as ClientOmnigentError
 from omnigent_client import QueryResult
 
@@ -2420,6 +2421,235 @@ def test_run_chat_remote_dispatches_without_profile_plumbing(
     assert "profile" not in kwargs, kwargs
 
 
+def test_remote_agent_choices_keep_latest_complete_launch_template(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fresh remote chat needs durable agent, host, and workspace facts."""
+
+    response = httpx.Response(
+        200,
+        request=httpx.Request("GET", "https://server.test/v1/sessions"),
+        json={
+            "data": [
+                {
+                    "agent_name": "Eric",
+                    "agent_id": "ag_eric_new",
+                    "host_id": "host_hermes",
+                    "workspace": "/srv/current",
+                },
+                {
+                    "agent_name": "Eric",
+                    "agent_id": "ag_eric_old",
+                    "host_id": "host_old",
+                    "workspace": "/srv/old",
+                },
+                {"agent_name": "No host", "agent_id": "ag_unbound"},
+            ]
+        },
+    )
+    monkeypatch.setattr(chat_module.httpx, "get", lambda *_a, **_k: response)
+
+    assert chat_module._remote_agent_choices("https://server.test") == [
+        chat_module._RemoteAgentChoice(
+            name="Eric",
+            agent_id="ag_eric_new",
+            host_id="host_hermes",
+            workspace="/srv/current",
+        )
+    ]
+
+
+def test_pick_remote_agent_headless_rejects_ambiguous_choice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Headless mode never silently launches the first remote agent."""
+
+    monkeypatch.setattr(
+        chat_module,
+        "_remote_agent_choices",
+        lambda _url: [
+            chat_module._RemoteAgentChoice("Eric", "ag_eric", "host_h", "/srv/e"),
+            chat_module._RemoteAgentChoice("Codex", "ag_codex", "host_c", "/srv/c"),
+        ],
+    )
+
+    with pytest.raises(click.ClickException, match="Multiple remote agents"):
+        chat_module._pick_remote_agent("https://server.test", quiet=True)
+
+
+def test_chat_remote_creates_fresh_registered_session_before_repl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """URL chat creates a fresh server-hosted session, never a stale attach."""
+
+    choice = chat_module._RemoteAgentChoice(
+        "Eric",
+        "ag_eric",
+        "host_hermes",
+        "/srv/current",
+    )
+    monkeypatch.setattr(
+        chat_module,
+        "_pick_remote_agent",
+        lambda _url, *, quiet: choice if quiet is False else pytest.fail(),
+    )
+    monkeypatch.setattr(
+        chat_module,
+        "_create_remote_registered_session",
+        lambda _url, selected: "conv_fresh" if selected == choice else pytest.fail(),
+    )
+    captured: dict[str, object] = {}
+
+    def _capture_repl(*args: object, **kwargs: object) -> None:
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+
+    monkeypatch.setattr(chat_module, "_run_repl", _capture_repl)
+
+    chat_module._chat_with_server("https://server.test", None)
+
+    assert captured["args"][:2] == ("https://server.test", "Eric")
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["resume_conversation_id"] == "conv_fresh"
+    assert kwargs["attach_only"] is True
+
+
+def test_run_prompt_remote_creates_fresh_session_before_one_shot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Headless URL mode launches one unambiguous registered agent."""
+
+    choice = chat_module._RemoteAgentChoice(
+        "Eric",
+        "ag_eric",
+        "host_hermes",
+        "/srv/current",
+    )
+    monkeypatch.setattr(chat_module, "_pick_remote_agent", lambda _url, quiet: choice)
+    monkeypatch.setattr(
+        chat_module,
+        "_create_remote_registered_session",
+        lambda _url, _choice: "conv_fresh",
+    )
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        chat_module,
+        "_run_one_shot",
+        lambda **kwargs: captured.update(kwargs),
+    )
+
+    chat_module.run_prompt(
+        "https://server.test",
+        None,
+        prompt="say hi",
+    )
+
+    assert captured["agent_name"] == "Eric"
+    assert captured["prompt"] == "say hi"
+    assert captured["resume_conversation_id"] == "conv_fresh"
+
+
+def test_cli_remote_prompt_rejects_ambiguous_agents_without_creating_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real ``run --server ... -p`` route fails before any launch side effect."""
+
+    from omnigent.cli import cli
+
+    monkeypatch.setattr(
+        chat_module,
+        "_remote_agent_choices",
+        lambda _url: [
+            chat_module._RemoteAgentChoice("Eric", "ag_eric", "host_h", "/srv/e"),
+            chat_module._RemoteAgentChoice("Codex", "ag_codex", "host_c", "/srv/c"),
+        ],
+    )
+    monkeypatch.setattr(
+        chat_module,
+        "_create_remote_registered_session",
+        lambda *_a, **_k: pytest.fail("ambiguous headless mode created a session"),
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        ["run", "--server", "https://server.test", "-p", "say hi"],
+    )
+
+    assert result.exit_code != 0
+    assert "Multiple remote agents are available" in result.output
+    assert "Run without -p" in result.output
+    assert "Available agents" not in result.output
+
+
+def test_cli_remote_prompt_with_one_agent_creates_session_and_runs_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real ``-p`` route proceeds when remote selection is unambiguous."""
+
+    from omnigent.cli import cli
+
+    choice = chat_module._RemoteAgentChoice("Eric", "ag_eric", "host_h", "/srv/e")
+    monkeypatch.setattr(chat_module, "_remote_agent_choices", lambda _url: [choice])
+    monkeypatch.setattr(
+        chat_module,
+        "_create_remote_registered_session",
+        lambda _url, selected: "conv_fresh" if selected == choice else pytest.fail(),
+    )
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        chat_module,
+        "_run_one_shot",
+        lambda **kwargs: captured.update(kwargs),
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        ["run", "--server", "https://server.test", "-p", "say hi"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["agent_name"] == "Eric"
+    assert captured["prompt"] == "say hi"
+    assert captured["resume_conversation_id"] == "conv_fresh"
+
+
+def test_cli_remote_interactive_keeps_agent_picker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Interactive direct-server mode still lets the operator choose an agent."""
+
+    from omnigent.cli import cli
+
+    choices = [
+        chat_module._RemoteAgentChoice("Eric", "ag_eric", "host_h", "/srv/e"),
+        chat_module._RemoteAgentChoice("Codex", "ag_codex", "host_c", "/srv/c"),
+    ]
+    monkeypatch.setattr(chat_module, "_remote_agent_choices", lambda _url: choices)
+    monkeypatch.setattr(
+        chat_module,
+        "_create_remote_registered_session",
+        lambda _url, selected: f"conv_{selected.name.lower()}",
+    )
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        chat_module,
+        "_run_repl",
+        lambda *args, **kwargs: captured.update(args=args, kwargs=kwargs),
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        ["run", "--server", "https://server.test"],
+        input="2\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Available agents" in result.output
+    assert captured["args"][:2] == ("https://server.test", "Codex")
+    assert captured["kwargs"]["resume_conversation_id"] == "conv_codex"
+
+
 def test_run_repl_auto_opens_conversation_when_session_starts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3325,6 +3555,7 @@ class _FakeSessionsNamespace:
         self._items = items
         self._forbid_list_items = list_items_must_not_be_called
         self.list_items_calls = 0
+        self.bind_runner_calls = 0
 
     async def create(self, bundle: bytes, *, filename: str, workspace: str) -> SimpleNamespace:
         """Pretend to create a session; return an object with an ``id``."""
@@ -3332,7 +3563,12 @@ class _FakeSessionsNamespace:
 
     async def bind_runner(self, session_id: str, *, runner_id: str) -> SimpleNamespace:
         """Pretend to bind a runner; echo back the session id."""
+        self.bind_runner_calls += 1
         return SimpleNamespace(id=session_id)
+
+    async def get(self, session_id: str) -> SimpleNamespace:
+        """Return an existing session already bound by its remote host."""
+        return SimpleNamespace(id=session_id, runner_id="runner_remote")
 
     async def list_items(
         self, session_id: str, *, limit: int, order: str
@@ -3575,6 +3811,29 @@ async def test_query_sessions_once_returns_text_without_reconcile_on_success(
     result = await _run_one_shot(client, _return_text, monkeypatch)
     assert result == "direct answer"
     assert client.sessions.list_items_calls == 0  # no reconcile on success
+
+
+async def test_query_sessions_once_uses_existing_remote_runner_without_rebinding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A server-hosted fresh session is queried without client affinity writes."""
+
+    client = _FakeAPClient([], list_items_must_not_be_called=True)
+    monkeypatch.setattr("omnigent_client.SessionsChat", _fake_sessions_chat_cls(_return_text))
+
+    result = await _query_sessions_once(
+        client=client,
+        agent_name="Eric",
+        tool_handler=None,
+        prompt="say hi",
+        session_bundle=None,
+        session_bundle_filename="agent.tar.gz",
+        runner_id=None,
+        resume_conversation_id="conv_fresh",
+    )
+
+    assert result == "direct answer"
+    assert client.sessions.bind_runner_calls == 0
 
 
 async def test_query_sessions_once_multi_turn_async_orchestrator(
@@ -3853,11 +4112,11 @@ def test_cursor_native_resume_never_drives_an_omnigent_turn(
 
     monkeypatch.setattr(chat_module, "_run_repl", _fail_repl)
     monkeypatch.setattr(chat_module, "_run_one_shot", _fail_one_shot)
-    # _pick_agent runs only on the non-redirect path; tripping it also signals
-    # the redirect failed to short-circuit.
+    # _pick_remote_agent runs only on the non-redirect path; tripping it also
+    # signals the redirect failed to short-circuit.
     monkeypatch.setattr(
         chat_module,
-        "_pick_agent",
+        "_pick_remote_agent",
         lambda *_a, **_k: pytest.fail("reached the non-redirect path"),
     )
 
