@@ -851,6 +851,15 @@ def test_parse_kubernetes_pvc_mounts_rejects_explicit_null_read_only() -> None:
         )
 
 
+def test_reserved_mount_prefixes_pin_the_launcher_home_dir() -> None:
+    """The mirrored HOME prefix must track the launcher's _HOME_DIR — a rename
+    there without updating the reserved list would let a mount shadow HOME."""
+    from omnigent.onboarding.sandboxes.kubernetes import _HOME_DIR
+    from omnigent.server.managed_hosts import _KUBERNETES_RESERVED_MOUNT_PREFIXES
+
+    assert _HOME_DIR in _KUBERNETES_RESERVED_MOUNT_PREFIXES
+
+
 def test_parse_kubernetes_pvc_mounts_allows_same_claim_at_two_paths() -> None:
     """One claim may be mounted at two paths (e.g. RO datasets + RW scratch subtrees)."""
     cfg = parse_sandbox_config(
