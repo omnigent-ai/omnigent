@@ -2456,13 +2456,18 @@ def _build_host_daemon_env(
     else:
         # Allowlist the remote daemon's environment (W8): pass process
         # essentials + TLS trust + the user's Databricks auth (the daemon
-        # authenticates to the server with it), but not unrelated provider
-        # secrets like ANTHROPIC_API_KEY / OPENAI_API_KEY.
+        # authenticates to the server with it), plus the explicit remote
+        # bearer accepted by the parent CLI. The daemon owns the long-lived
+        # host WebSocket, so dropping that bearer authenticates the HTTP
+        # setup calls but leaves the host tunnel anonymous. Do not broaden
+        # this to OMNIGENT_*: unrelated runtime/provider credentials remain
+        # outside the remote daemon.
         daemon_env_prefixes = (*_RUNNER_ENV_ALLOWLIST_PREFIXES, "DATABRICKS_")
         env = {
             key: value
             for key, value in os.environ.items()
-            if key in _RUNNER_ENV_ALLOWLIST or key.startswith(daemon_env_prefixes)
+            if key in (*_RUNNER_ENV_ALLOWLIST, "OMNIGENT_REMOTE_AUTH_TOKEN")
+            or key.startswith(daemon_env_prefixes)
         }
     return env
 

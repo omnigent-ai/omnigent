@@ -1239,6 +1239,7 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
         "OMNIGENT_LOG_LEVEL": "DEBUG",
         "OMNIGENT_LOG_TO_STDERR": "1",
         "OMNIGENT_LOG_TTY_FD": "9",
+        "OMNIGENT_REMOTE_AUTH_TOKEN": "remote-owner-token",
     }
 
     env = _build_runner_env(
@@ -1293,6 +1294,9 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
     assert env["OMNIGENT_LOG_LEVEL"] == "DEBUG"
     assert env["OMNIGENT_LOG_TO_STDERR"] == "1"
     assert env["OMNIGENT_LOG_TTY_FD"] == "9"
+    # The runner tunnel and callbacks must authenticate as the same owner as
+    # the user-launched remote host daemon.
+    assert env["OMNIGENT_REMOTE_AUTH_TOKEN"] == "remote-owner-token"
     # Non-harness secrets are stripped — the point of the allowlist.
     assert "DATABRICKS_TOKEN" not in env
     assert "AWS_SECRET_ACCESS_KEY" not in env

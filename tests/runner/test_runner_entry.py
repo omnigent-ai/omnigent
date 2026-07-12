@@ -159,6 +159,26 @@ def test_make_auth_token_factory_returns_factory_when_databricks_creds_available
     assert factory() == "fresh-token"
 
 
+def test_make_auth_token_factory_prefers_explicit_remote_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The daemon/runner uses the explicit bearer supplied by its parent CLI."""
+    monkeypatch.setenv("OMNIGENT_REMOTE_AUTH_TOKEN", "explicit-remote-token")
+    monkeypatch.setattr(
+        "omnigent.cli_auth.load_token",
+        lambda _server_url: pytest.fail("stored token should not be consulted"),
+    )
+    monkeypatch.setattr(
+        "omnigent.inner.databricks_executor._resolve_databricks_auth",
+        lambda **_kwargs: pytest.fail("Databricks auth should not be consulted"),
+    )
+
+    factory = _make_auth_token_factory(server_url="https://server.test")
+
+    assert factory is not None
+    assert factory() == "explicit-remote-token"
+
+
 def test_make_auth_token_factory_returns_none_without_databricks_creds(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

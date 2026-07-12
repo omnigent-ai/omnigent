@@ -261,6 +261,8 @@ def test_build_host_daemon_env_remote_strips_provider_credentials(
     monkeypatch.setenv("OPENAI_BASE_URL", "https://example.databricks.com/serving-endpoints")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-anthropic-key")
     monkeypatch.setenv("DATABRICKS_TOKEN", "test-databricks-token")
+    monkeypatch.setenv("OMNIGENT_REMOTE_AUTH_TOKEN", "test-remote-token")
+    monkeypatch.setenv("OMNIGENT_DATABASE_URI", "unrelated-database-secret")
 
     env = _build_host_daemon_env(server_url="https://example.databricksapps.com")
 
@@ -270,6 +272,9 @@ def test_build_host_daemon_env_remote_strips_provider_credentials(
     assert "ANTHROPIC_API_KEY" not in env
     # Databricks auth is intentionally preserved for the daemon's server auth.
     assert env["DATABRICKS_TOKEN"] == "test-databricks-token"
+    # The explicit remote bearer authenticates the daemon-owned host tunnel.
+    assert env["OMNIGENT_REMOTE_AUTH_TOKEN"] == "test-remote-token"
+    assert "OMNIGENT_DATABASE_URI" not in env
 
 
 def test_ensure_host_daemon_reuses_same_target(

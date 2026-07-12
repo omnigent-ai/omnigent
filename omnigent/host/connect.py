@@ -313,6 +313,12 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # cli._ensure_host_daemon), never to a (possibly hosted) runner.
         "OMNIGENT_CONFIG_HOME",
         "OMNIGENT_DATA_DIR",
+        # Explicit bearer for a user-launched remote host. The host daemon
+        # authenticates its own tunnel with this token; its spawned runners
+        # must present the same owner identity on their runner tunnels and
+        # HTTP callbacks. This is a deliberate auth credential, not a broad
+        # OMNIGENT_* passthrough. Provider and database secrets remain out.
+        "OMNIGENT_REMOTE_AUTH_TOKEN",
         # Auth provider selection. The env-unset default was flipped
         # to "accounts", so the whole CLI → daemon → local-server chain has
         # to agree on the mode. Without this, the daemon strips

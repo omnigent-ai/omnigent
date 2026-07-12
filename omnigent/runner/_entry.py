@@ -291,9 +291,10 @@ def _make_auth_token_factory(
     """Build a callable that mints fresh auth tokens.
 
     Resolution order:
-      1. Stored OIDC token from ``~/.omnigent/auth_tokens.json``
+      1. Explicit ``OMNIGENT_REMOTE_AUTH_TOKEN`` from the invoking CLI.
+      2. Stored OIDC token from ``~/.omnigent/auth_tokens.json``
          (populated by ``omnigent login``), keyed by ``server_url``.
-      2. Databricks OAuth token (refreshed via the SDK) — host-keyed
+      3. Databricks OAuth token (refreshed via the SDK) — host-keyed
          when a Databricks Apps pointer record is stored for
          ``server_url`` (``omnigent login <apps-url>``), ambient
          otherwise.
@@ -325,6 +326,9 @@ def _make_auth_token_factory(
     )
 
     resolved_server_url = server_url or os.environ.get(_RUNNER_SERVER_URL_ENV_VAR)
+    explicit_remote_token = os.environ.get("OMNIGENT_REMOTE_AUTH_TOKEN")
+    if explicit_remote_token:
+        return lambda: explicit_remote_token
 
     # Reused Databricks SDK auth, resolved once on first use and cached
     # here for the life of the factory. Reusing one Config is the whole
