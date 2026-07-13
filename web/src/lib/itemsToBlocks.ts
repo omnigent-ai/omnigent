@@ -138,13 +138,7 @@ function isCompactionSummaryMessage(item: MessageItem): boolean {
 
 // Hide legacy Claude Task notifications persisted before the bridge marked them meta.
 function isClaudeTaskNotificationMessage(item: MessageItem): boolean {
-  const requiredMarkers = [
-    "<task-notification>",
-    "<task-id>",
-    "<tool-use-id>",
-    "<status>",
-    "</task-notification>",
-  ];
+  const requiredMarkers = ["<task-notification>", "<task-id>", "</task-notification>"];
   for (const block of item.content) {
     if (block.type === "input_text" && typeof block.text === "string") {
       const text = block.text.trimStart();

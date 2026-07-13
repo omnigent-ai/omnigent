@@ -4341,8 +4341,6 @@ _BASH_STDERR_RE = re.compile(r"<bash-stderr>(.*?)</bash-stderr>", re.DOTALL)
 _TASK_NOTIFICATION_REQUIRED_MARKERS: tuple[str, ...] = (
     "<task-notification>",
     "<task-id>",
-    "<tool-use-id>",
-    "<status>",
     "</task-notification>",
 )
 

@@ -127,6 +127,24 @@ describe("itemsToBlocks — flat shape", () => {
     expect(texts).toEqual(["visible before", "visible after"]);
   });
 
+  it("hides legacy Claude Monitor task notifications with optional fields omitted", () => {
+    const items: ConversationItem[] = [
+      userMessage(
+        "resp_task",
+        [
+          "<task-notification>",
+          "<task-id>b1mhekpmy</task-id>",
+          '<summary>Monitor event: "PR 2086 E2E UI + npm test CI results"</summary>',
+          "<event>E2E UI Tests (shard 2/3)\tfail\t1m50s\thttps://example.test</event>",
+          "</task-notification>",
+        ].join("\n"),
+        "msg_legacy_monitor_notification",
+      ),
+    ];
+
+    expect(itemsToBlocks(items)).toEqual([]);
+  });
+
   it("user + assistant items produce [UserMessageBlock, TextDone] in order", () => {
     const items: ConversationItem[] = [
       userMessage("resp_1", "Hello", "msg_user1"),
