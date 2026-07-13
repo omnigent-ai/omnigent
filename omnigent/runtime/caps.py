@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from cryptography.hazmat.primitives.asymmetric.ec import EllipticCurvePrivateKey
+
     from omnigent.server.smart_routing import RoutingClient
     from omnigent.spec.types import LLMConfig, PolicySpec
 
@@ -75,3 +77,8 @@ class RuntimeCaps:
     # Managed deployments can supply a different implementation (e.g.
     # a rules engine or remote service).  ``None`` disables routing.
     routing_client: RoutingClient | None = None
+    # Web Push (#8). The server's stable VAPID signing key (loaded/persisted at
+    # startup) and the operator contact for the JWT ``sub`` claim. ``None`` key
+    # disables push (the endpoints 503 and the sender no-ops).
+    vapid_signing_key: EllipticCurvePrivateKey | None = None
+    vapid_subject: str = "mailto:admin@localhost"
