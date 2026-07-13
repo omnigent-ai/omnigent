@@ -366,6 +366,7 @@ def build_policy_engine(
     # root-seeding pattern below).
     conv = conversation_store.get_conversation(conversation_id)
     root_conversation_id = conv.root_conversation_id if conv is not None else conversation_id
+    sub_agent_name = conv.sub_agent_name if conv is not None else None
     if root_conversation_id != conversation_id:
         root_policy_specs = _load_session_policy_specs(root_conversation_id, policy_store)
         # Deduplicate: skip root policies already present on the child
@@ -460,6 +461,7 @@ def build_policy_engine(
         initial_model=initial_model,
         conversation_store=conversation_store,
         root_conversation_id=root_conversation_id,
+        sub_agent_name=sub_agent_name,
         llm_client=llm_client,
     )
 

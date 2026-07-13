@@ -117,6 +117,7 @@ class PolicyEngine:
         initial_model: str | None = None,
         conversation_store: ConversationStore,
         root_conversation_id: str | None = None,
+        sub_agent_name: str | None = None,
         llm_client: Any = None,
     ) -> None:
         self.policies = policies
@@ -128,6 +129,11 @@ class PolicyEngine:
         # approving once covers the whole tree — a sub-agent runs as its own
         # conversation. Defaults to ``conversation_id`` for a top-level session.
         self._root_conversation_id = root_conversation_id or conversation_id
+        # The dispatched sub-agent's name when this conversation is a
+        # child (the conversation row's ``sub_agent_name``); ``None`` for
+        # top-level sessions. Surfaced to policies via
+        # ``event["context"]["sub_agent_name"]``.
+        self._sub_agent_name = sub_agent_name
         self._labels = dict(initial_labels)
         self._session_state: dict[str, Any] = dict(initial_session_state or {})
         self._usage: dict[str, float] = dict(
@@ -346,6 +352,7 @@ class PolicyEngine:
         ctx = self._inject_user_daily_cost(ctx)
         ctx = self._inject_model(ctx)
         ctx = self._inject_labels(ctx)
+        ctx = self._inject_conversation(ctx)
         ctx = self._inject_llm_client(ctx)
 
         for policy in self.policies:
@@ -758,6 +765,35 @@ class PolicyEngine:
         if ctx.model is not None:
             return ctx
         return replace(ctx, model=self._model)
+
+    def _inject_conversation(self, ctx: EvaluationContext) -> EvaluationContext:
+        """
+        Return a copy of *ctx* with conversation identity populated.
+
+        Injects the engine's ``conversation_id`` / ``root_conversation_id``
+        (it owns both) and the dispatched sub-agent's name so function
+        policy callables can key session-scoped state or telemetry and
+        recognize sub-agent children via
+        ``event["context"]["conversation_id"]`` /
+        ``["root_conversation_id"]`` / ``["sub_agent_name"]`` without a
+        label convention or side channel. When the caller already
+        supplied a ``conversation_id`` on *ctx* (test contexts), *ctx*
+        is returned unchanged.
+
+        :param ctx: Original :class:`EvaluationContext` from the
+            caller.
+        :returns: *ctx* unchanged when it already carries a
+            conversation id, else a copy with all three identity fields
+            set from the engine.
+        """
+        if ctx.conversation_id is not None:
+            return ctx
+        return replace(
+            ctx,
+            conversation_id=self._conversation_id,
+            root_conversation_id=self._root_conversation_id,
+            sub_agent_name=self._sub_agent_name,
+        )
 
     def _inject_labels(self, ctx: EvaluationContext) -> EvaluationContext:
         """

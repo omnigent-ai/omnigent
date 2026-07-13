@@ -201,7 +201,10 @@ def _build_event(ctx: EvaluationContext) -> dict[str, Any]:
             "data": <phase-specific-payload>,
             "context": {"actor": {"run_as": "...", "client_id": "..."},
                         "usage": {"input_tokens": N, ...},
-                        "model": "<active-model-or-None>"},
+                        "model": "<active-model-or-None>",
+                        "conversation_id": "<conv-id-or-None>",
+                        "root_conversation_id": "<root-id-or-None>",
+                        "sub_agent_name": "<child-name-or-None>"},
             "session_state": {...},
             "llm_client": <PolicyLLMClient-or-None>,
             "request_data": <original-tool-call-on-TOOL_RESULT>,
@@ -236,6 +239,14 @@ def _build_event(ctx: EvaluationContext) -> dict[str, Any]:
             "harness": ctx.harness,
             # Conversation labels (engine hot cache), empty when unpopulated.
             "labels": dict(ctx.labels) if ctx.labels is not None else {},
+            # Conversation identity, injected by the engine (None on
+            # paths that never populated it — runner-local gate, test
+            # contexts). root_conversation_id != conversation_id marks a
+            # sub-agent child; sub_agent_name is the dispatched child's
+            # name (None for top-level sessions).
+            "conversation_id": ctx.conversation_id,
+            "root_conversation_id": ctx.root_conversation_id,
+            "sub_agent_name": ctx.sub_agent_name,
             # Subtree-scoped cumulative cost (this conversation + its
             # descendants only), injected by the engine only when a
             # subagent_cost_budget policy is present; empty dict otherwise.
