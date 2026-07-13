@@ -68,8 +68,12 @@ a non-empty ``arguments`` block (the registry declares it
 
 from __future__ import annotations
 
+import json
+import logging
 from dataclasses import dataclass
 from typing import Any
+
+import httpx
 
 from omnigent.policies.schema import (
     SESSION_COST_ASK_APPROVED_STATE_KEY,
@@ -78,7 +82,10 @@ from omnigent.policies.schema import (
     PolicyCallable,
     PolicyEvent,
     PolicyResponse,
+    StateUpdateEntry,
 )
+
+_logger = logging.getLogger(__name__)
 
 _ALLOW: PolicyResponse = {"result": "ALLOW"}
 
@@ -877,6 +884,347 @@ def subagent_cost_budget(
     return evaluate  # type: ignore[return-value]
 
 
+# ── Real spend budget (AB#2899) ──────────────────────────────────────────
+#
+# Unlike cost_budget / user_daily_cost_budget / subagent_cost_budget above
+# (which gate on LLM token spend tracked in-process), this factory gates on
+# REAL business spend tracked OUTSIDE the engine entirely, by an external
+# "goettl-core Harness Status" oracle HTTP service. The oracle owns both the
+# running spend totals (spend_today / spend_mtd) AND the four operator-set
+# thresholds (daily ask/limit, MTD ask/limit) — an operator can tighten or
+# loosen the budget by editing the oracle's own config, with no redeploy of
+# this policy or the agent bundle that references it.
+#
+# Because the thresholds live on the oracle side (not as factory_params),
+# there is nothing to validate at factory-build time; instead every fetch
+# defensively re-checks the strict ``0 < ask < limit`` invariant on both
+# horizons before trusting the numbers (FINDING #1) — a violation is treated
+# exactly like any other malformed oracle payload: fail open (ALLOW).
+#
+# FINDING #4: this factory's ASK-approval session_state keys are deliberately
+# distinct from cost_budget's ``SESSION_COST_ASK_APPROVED_STATE_KEY``
+# (``_policy_cost_ask_approved_usd``). Approving an LLM-spend ASK must never
+# silently also approve a real-spend ASK (or vice versa) — they are
+# independent guards over independent kinds of spend.
+
+# The goettl-core Harness Status oracle's quota endpoint. Overridable via
+# factory_params for non-default deployments; defaults to the documented
+# localhost port the oracle listens on.
+_REAL_SPEND_ORACLE_URL_DEFAULT = "http://localhost:5151/quota"
+
+# Deliberately short: this GET runs inline in the policy hot path (blocking
+# the request / tool_call phase), and per AB#2899 ANY failure to reach the
+# oracle in time must fail open rather than stall the turn.
+_REAL_SPEND_TIMEOUT_S_DEFAULT = 2.0
+
+# The six numeric fields the oracle's /quota response must carry for the
+# gate to trust it at all. Any missing key fails open (see
+# ``_fetch_real_spend_quota``).
+_REAL_SPEND_REQUIRED_KEYS = (
+    "spend_today",
+    "spend_mtd",
+    "daily_ask",
+    "daily_limit",
+    "mtd_ask",
+    "mtd_limit",
+)
+
+# session_state keys recording the highest spend value (USD) the user has
+# already approved continuing past, per horizon. Distinct from
+# ``SESSION_COST_ASK_APPROVED_STATE_KEY`` (cost_budget's key) by construction
+# (FINDING #4) — approving one guard's ASK must never suppress the other's.
+_REAL_SPEND_DAILY_ASK_APPROVED_KEY = "_policy_real_spend_budget_daily_ask_approved_usd"
+_REAL_SPEND_MTD_ASK_APPROVED_KEY = "_policy_real_spend_budget_mtd_ask_approved_usd"
+
+
+def _fetch_real_spend_quota(
+    oracle_url: str,
+    timeout_s: float,
+    transport: httpx.BaseTransport | None,
+) -> dict[str, float] | None:
+    """GET the Harness Status oracle and return its validated numeric fields.
+
+    Returns ``None`` on every failure mode the gate must fail open on — this
+    is non-negotiable per AB#2899:
+
+    - request timeout or connection error (any :class:`httpx.HTTPError`, or
+      a bare :class:`OSError` from the underlying transport);
+    - a non-200 HTTP response;
+    - a response body that is not parseable JSON;
+    - JSON that does not decode to an object (dict);
+    - the oracle's own ``{"error": ...}`` stub response;
+    - any of the six required keys missing;
+    - any required value that is ``None``, a bool, or otherwise non-numeric;
+    - a threshold pair that fails the strict ``0 < ask < limit`` invariant on
+      EITHER horizon (FINDING #1) — treated as a malformed / degenerate
+      oracle config, not a valid non-degenerate one.
+
+    :param oracle_url: Full URL of the oracle's quota endpoint, e.g.
+        ``"http://localhost:5151/quota"``.
+    :param timeout_s: Request timeout in seconds. Kept short by design (see
+        :data:`_REAL_SPEND_TIMEOUT_S_DEFAULT`).
+    :param transport: Optional httpx transport override so tests mock the
+        HTTP boundary; ``None`` uses the real network.
+    :returns: A dict with the six keys in :data:`_REAL_SPEND_REQUIRED_KEYS`
+        as floats, or ``None`` to signal "fail open".
+    """
+    try:
+        with httpx.Client(transport=transport, timeout=timeout_s) as client:
+            response = client.get(oracle_url)
+    except httpx.HTTPError:
+        return None
+    except OSError:
+        # Defensive: some transport-level connection failures surface as a
+        # bare OSError rather than an httpx.HTTPError subclass.
+        return None
+
+    if response.status_code != 200:
+        return None
+
+    try:
+        payload = response.json()
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+    if "error" in payload:
+        # The oracle's own stub/error response (e.g. not yet configured) —
+        # fail open, never DENY on a shape we can't trust.
+        return None
+
+    values: dict[str, float] = {}
+    for key in _REAL_SPEND_REQUIRED_KEYS:
+        if key not in payload:
+            return None
+        raw = payload[key]
+        # bool is an int subclass in Python — exclude explicitly so a stray
+        # `"daily_ask": true` doesn't get silently coerced to 1.0.
+        if raw is None or isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            return None
+        values[key] = float(raw)
+
+    if not (0 < values["daily_ask"] < values["daily_limit"]):
+        return None
+    if not (0 < values["mtd_ask"] < values["mtd_limit"]):
+        return None
+
+    return values
+
+
+def _real_spend_reason(
+    *,
+    verdict: str,
+    phase: str,
+    spend_today: float,
+    daily_threshold: float,
+    daily_tripped: bool,
+    spend_mtd: float,
+    mtd_threshold: float,
+    mtd_tripped: bool,
+) -> str:
+    """Build the ASK / DENY reason for the real-spend budget gate.
+
+    On the ``request`` phase the message is surfaced directly to the user
+    (the turn never reaches the model), so it is the plain user-facing
+    message. On the ``tool_call`` phase native harnesses hand the reason to
+    the model, so it is phrased as a directive telling the agent to relay it
+    verbatim and wait, matching the convention used by
+    :func:`_over_budget_deny_reason` above.
+
+    :param verdict: ``"ASK"`` or ``"DENY"`` — selects the wording.
+    :param phase: The enforcement phase — ``"request"`` or ``"tool_call"``.
+    :param spend_today: Current day spend (USD) from the oracle.
+    :param daily_threshold: The daily threshold that was checked (ask or
+        limit, matching *verdict*).
+    :param daily_tripped: Whether the daily horizon tripped this verdict.
+    :param spend_mtd: Current month-to-date spend (USD) from the oracle.
+    :param mtd_threshold: The MTD threshold that was checked (ask or limit,
+        matching *verdict*).
+    :param mtd_tripped: Whether the MTD horizon tripped this verdict.
+    :returns: The reason string.
+    """
+    horizon_label = "limit" if verdict == "DENY" else "warning threshold"
+    parts = []
+    if daily_tripped:
+        parts.append(
+            f"today's spend ${spend_today:.2f} reached the ${daily_threshold:.2f} daily "
+            f"{horizon_label}"
+        )
+    if mtd_tripped:
+        parts.append(
+            f"month-to-date spend ${spend_mtd:.2f} reached the ${mtd_threshold:.2f} MTD "
+            f"{horizon_label}"
+        )
+    detail = " and ".join(parts)
+    if verdict == "DENY":
+        verbatim = (
+            f"Blocked by the real-spend budget policy: {detail}. Further spend-generating "
+            f"actions are blocked until an operator raises the limit or the horizon rolls over."
+        )
+    else:
+        verbatim = f"Real-spend warning: {detail}. Continue?"
+    if phase == "request":
+        return verbatim
+    if verdict == "DENY":
+        return (
+            f"{verbatim} Relay this to the user verbatim, then stop and wait for them — do "
+            f"not silently retry this tool call right now. This block is NOT permanent: once "
+            f"an operator raises the relevant limit (or the day/month rolls over) and the user "
+            f"asks you to continue, actually re-issue the tool call — do not just repeat this "
+            f"message."
+        )
+    return (
+        f"{verbatim} Relay this to the user verbatim and wait for their approval before "
+        f"re-issuing this tool call."
+    )
+
+
+def real_spend_budget(
+    oracle_url: str = _REAL_SPEND_ORACLE_URL_DEFAULT,
+    timeout_s: float = _REAL_SPEND_TIMEOUT_S_DEFAULT,
+    *,
+    transport: httpx.BaseTransport | None = None,
+) -> PolicyCallable:
+    """Factory: gate on REAL (non-LLM) spend from the goettl-core oracle.
+
+    Distinct from :func:`cost_budget` and its siblings: those gate on
+    in-process LLM token spend; this gates on real business spend tracked
+    entirely outside the engine by the goettl-core "Harness Status" oracle
+    (``GET {oracle_url}``), which is expected to respond with
+    ``spend_today``, ``spend_mtd``, and the four operator-set thresholds
+    ``daily_ask`` / ``daily_limit`` / ``mtd_ask`` / ``mtd_limit`` (all USD).
+
+    Gates the ``request`` phase (before the LLM turn, so text-only turns are
+    covered too) and the ``tool_call`` phase (the native ``PreToolUse``
+    block point) — abstains (ALLOW) on every other phase. On each gated
+    call:
+
+    - DENY when EITHER horizon's spend has reached its limit
+      (``spend_today >= daily_limit`` or ``spend_mtd >= mtd_limit``);
+    - else ASK when EITHER horizon's spend has reached its ask threshold
+      (``spend_today >= daily_ask`` or ``spend_mtd >= mtd_ask``), unless the
+      user has already approved continuing past the current spend level on
+      every horizon that tripped (approval remembered via ``session_state``,
+      keyed separately per horizon so a new, higher spend level re-asks);
+    - else ALLOW.
+
+    FAILS OPEN (returns ALLOW) on every oracle failure mode — timeout,
+    connection error, non-200, malformed/unparseable JSON, a non-dict body,
+    the oracle's own ``{"error": ...}`` stub, a missing expected key, a
+    non-numeric/null value, or a threshold pair that fails the strict
+    ``0 < ask < limit`` invariant on either horizon. This is non-negotiable
+    per AB#2899: the guard should never block real work because of its own
+    unavailability or misconfiguration.
+
+    Uses its own ``session_state`` approval keys
+    (:data:`_REAL_SPEND_DAILY_ASK_APPROVED_KEY` /
+    :data:`_REAL_SPEND_MTD_ASK_APPROVED_KEY`), NOT
+    ``SESSION_COST_ASK_APPROVED_STATE_KEY`` (cost_budget's key) — approving
+    an LLM cost-budget ASK must never silently suppress this guard's
+    prompts, or vice versa (FINDING #4).
+
+    :param oracle_url: Full URL of the goettl-core Harness Status oracle's
+        quota endpoint. Defaults to
+        :data:`_REAL_SPEND_ORACLE_URL_DEFAULT`.
+    :param timeout_s: Request timeout in seconds for the oracle GET. Must be
+        ``> 0``. Defaults to :data:`_REAL_SPEND_TIMEOUT_S_DEFAULT`.
+    :param transport: Optional httpx transport override so tests mock the
+        HTTP boundary; ``None`` uses the real network. Not exposed via
+        ``factory_params`` — a Python-only testing hook.
+    :returns: A policy callable implementing the real-spend budget gate.
+    :raises ValueError: If *oracle_url* is not a non-empty string, or
+        *timeout_s* is not ``> 0``.
+    """
+    if not isinstance(oracle_url, str) or not oracle_url:
+        raise ValueError(f"oracle_url must be a non-empty string, got {oracle_url!r}")
+    if timeout_s <= 0:
+        raise ValueError(f"timeout_s must be > 0, got {timeout_s!r}")
+
+    def evaluate(event: PolicyEvent) -> PolicyResponse:
+        """Evaluate the real-spend budget for a request or tool call.
+
+        :param event: Policy event dict.
+        :returns: DENY when either horizon is at/over its limit; ASK when
+            either horizon is at/over its ask threshold and not yet
+            approved at the current spend level; ALLOW otherwise, including
+            every oracle fail-open case.
+        """
+        phase = event.get("type")
+        if phase not in _GATED_PHASES:
+            return _ALLOW
+
+        values = _fetch_real_spend_quota(oracle_url, timeout_s, transport)
+        if values is None:
+            return _ALLOW
+
+        spend_today = values["spend_today"]
+        spend_mtd = values["spend_mtd"]
+        daily_ask, daily_limit = values["daily_ask"], values["daily_limit"]
+        mtd_ask, mtd_limit = values["mtd_ask"], values["mtd_limit"]
+
+        daily_deny = spend_today >= daily_limit
+        mtd_deny = spend_mtd >= mtd_limit
+        if daily_deny or mtd_deny:
+            return {
+                "result": "DENY",
+                "reason": _real_spend_reason(
+                    verdict="DENY",
+                    phase=phase,
+                    spend_today=spend_today,
+                    daily_threshold=daily_limit,
+                    daily_tripped=daily_deny,
+                    spend_mtd=spend_mtd,
+                    mtd_threshold=mtd_limit,
+                    mtd_tripped=mtd_deny,
+                ),
+            }
+
+        daily_over_ask = spend_today >= daily_ask
+        mtd_over_ask = spend_mtd >= mtd_ask
+        if daily_over_ask or mtd_over_ask:
+            state = event.get("session_state") or {}
+            daily_approved = float(state.get(_REAL_SPEND_DAILY_ASK_APPROVED_KEY, 0.0) or 0.0)
+            mtd_approved = float(state.get(_REAL_SPEND_MTD_ASK_APPROVED_KEY, 0.0) or 0.0)
+            daily_needs_ask = daily_over_ask and spend_today > daily_approved
+            mtd_needs_ask = mtd_over_ask and spend_mtd > mtd_approved
+            if daily_needs_ask or mtd_needs_ask:
+                state_updates: list[StateUpdateEntry] = []
+                if daily_needs_ask:
+                    state_updates.append(
+                        {
+                            "key": _REAL_SPEND_DAILY_ASK_APPROVED_KEY,
+                            "action": "set",
+                            "value": spend_today,
+                        }
+                    )
+                if mtd_needs_ask:
+                    state_updates.append(
+                        {
+                            "key": _REAL_SPEND_MTD_ASK_APPROVED_KEY,
+                            "action": "set",
+                            "value": spend_mtd,
+                        }
+                    )
+                return {
+                    "result": "ASK",
+                    "reason": _real_spend_reason(
+                        verdict="ASK",
+                        phase=phase,
+                        spend_today=spend_today,
+                        daily_threshold=daily_ask,
+                        daily_tripped=daily_needs_ask,
+                        spend_mtd=spend_mtd,
+                        mtd_threshold=mtd_ask,
+                        mtd_tripped=mtd_needs_ask,
+                    ),
+                    "state_updates": state_updates,
+                }
+        return _ALLOW
+
+    return evaluate  # type: ignore[return-value]
+
+
 # ── Registry ─────────────────────────────────────────────────────────────────
 
 POLICY_REGISTRY: list[dict[str, Any]] = [
@@ -990,5 +1338,37 @@ POLICY_REGISTRY: list[dict[str, Any]] = [
             "required": [],
         },
         "internal_only": True,
+    },
+    {
+        "handler": "omnigent.policies.builtins.cost.real_spend_budget",
+        "kind": "factory",
+        "name": "Real Spend Budget (AB#2899)",
+        "description": "Gates a session on REAL (non-LLM) business spend reported by the "
+        "goettl-core Harness Status oracle: GETs spend_today / spend_mtd and the four "
+        "operator-set thresholds (daily_ask, daily_limit, mtd_ask, mtd_limit) from the "
+        "oracle's quota endpoint. DENYs (the whole turn at the request phase, or each tool "
+        "call) when either the daily or MTD spend has reached its limit, ASKs for approval "
+        "when either has reached its ask threshold (approval remembered per horizon so it "
+        "does not re-prompt until spend rises further), and ALLOWs otherwise. FAILS OPEN "
+        "(ALLOW) on any oracle failure — timeout, connection error, non-200, malformed JSON, "
+        "missing/non-numeric fields, the oracle's own error stub, or a threshold pair that "
+        "fails the strict 0 < ask < limit invariant — this is non-negotiable. Uses its own "
+        "approval-state keys, distinct from the cost_budget policy's.",
+        "params_schema": {
+            "type": "object",
+            "properties": {
+                "oracle_url": {
+                    "type": "string",
+                    "description": "Full URL of the goettl-core Harness Status oracle's quota "
+                    "endpoint. Defaults to http://localhost:5151/quota.",
+                },
+                "timeout_s": {
+                    "type": "number",
+                    "description": "Request timeout in seconds for the oracle GET. Must be > "
+                    "0. Kept short since the guard fails open on timeout. Defaults to 2.0.",
+                },
+            },
+            "required": [],
+        },
     },
 ]
