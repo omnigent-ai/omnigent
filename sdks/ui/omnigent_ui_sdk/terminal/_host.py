@@ -30,6 +30,7 @@ from omnigent_client import TERMINAL_TASK_STATUSES, child_session_busy
 from prompt_toolkit import PromptSession
 from prompt_toolkit.application import Application
 from prompt_toolkit.application.current import get_app
+from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.completion import Completer
 from prompt_toolkit.data_structures import Point
 from prompt_toolkit.filters import Condition, is_searching
@@ -1222,6 +1223,17 @@ class TerminalHost:
             completer=completer,
             reserve_space_for_menu=0,
         )
+        previous_completion_text = ""
+
+        def _restart_completions_after_delete(buffer: Buffer) -> None:
+            nonlocal previous_completion_text
+            current_text = buffer.text
+            deleted = len(current_text) < len(previous_completion_text)
+            previous_completion_text = current_text
+            if deleted and current_text and completer is not None:
+                buffer.start_completion()
+
+        self._prompt.default_buffer.on_text_changed += _restart_completions_after_delete
 
         # ----------------------------------------------------------
         # Layout patches.
