@@ -1173,7 +1173,7 @@ class SqlScheduledTask(Base):
     # Nullable compute-target hint (provider name, e.g. "local"/"e2b"). Not yet
     # resolved — the fire path reads it in a later milestone. A single nullable
     # string, not an enum.
-    sandbox_target: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    sandbox_target: Mapped[str | None] = mapped_column(String(32), nullable=True)
     timezone: Mapped[str] = mapped_column(String(64), nullable=False, server_default="UTC")
     # Enum stored as a stable int code (see omnigent.db.enum_codecs
     # SCHEDULED_TASK_STATE: active=1, paused=2, deleted=3). The
