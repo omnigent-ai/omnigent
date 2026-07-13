@@ -984,3 +984,62 @@ def test_close_untitled_id_created_child(session_fixture: _Fixture) -> None:
         f"untitled:{untitled_child.id}{_CLOSED_TITLE_INFIX}{untitled_child.id}"
     )
     assert refreshed.labels[CLOSED_LABEL_KEY] == CLOSED_LABEL_VALUE
+
+
+# ── Description contract tests ────────────────────────────
+
+
+def test_send_description_states_async_handle() -> None:
+    """
+    ``sys_session_send``'s LLM-facing description matches the actual
+    contract: an async ``{status: 'launching'}`` handle immediately,
+    output via the inbox — not "returns the child's output" (the old
+    text, which cost callers real polling-loop bugs).
+    """
+    from omnigent.tools.builtins.spawn import _build_sys_session_send_schema
+
+    named = SysSessionSendTool.description()
+    fallback = _build_sys_session_send_schema({})["function"]["description"]
+    for desc in (named, fallback):
+        assert "Returns the child's output when its turn completes" not in desc
+        assert "launching" in desc
+        assert "sys_read_inbox" in desc
+
+
+def test_all_session_tool_descriptions_note_turn_scoped_availability() -> None:
+    """
+    Every sys_session_* description documents the advertisement window.
+
+    The tools are served through the session's runner and vanish between
+    turns for native-CLI sessions; detached callers hit 'unknown tool' /
+    proxy errors with no documented explanation before this note.
+    """
+    from omnigent.tools.builtins import spawn as spawn_module
+
+    tool_classes = [
+        spawn_module.SysSessionSendTool,
+        spawn_module.SysSessionListTool,
+        spawn_module.SysSessionGetInfoTool,
+        spawn_module.SysSessionShareTool,
+        spawn_module.SysSessionCreateTool,
+        spawn_module.SysSessionGetHistoryTool,
+        spawn_module.SysSessionCloseTool,
+    ]
+    for cls in tool_classes:
+        assert "while a turn is active" in cls.description(), cls.__name__
+
+
+def test_create_title_description_documents_uniqueness() -> None:
+    """
+    ``sys_session_create``'s title arg warns about per-parent uniqueness.
+
+    A duplicate title fails (structured 409 → title_already_exists);
+    without the warning the failure mode was undiscoverable from the
+    schema.
+    """
+    from omnigent.tools.builtins.spawn import SysSessionCreateTool
+
+    schema = SysSessionCreateTool().get_schema()
+    title_desc = schema["function"]["parameters"]["properties"]["title"]["description"]
+    assert "unique" in title_desc
+    assert "title_already_exists" in title_desc

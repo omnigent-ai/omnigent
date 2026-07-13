@@ -373,3 +373,32 @@ async def test_patch_close_succeeds_when_runner_unreachable(
             headers={"Content-Type": "application/json"},
         )
     assert resp.status_code == 200
+
+
+async def test_create_duplicate_child_title_returns_conflict(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+) -> None:
+    """Creating two children with the same (parent, title) yields a 409.
+
+    The store's NameAlreadyExistsError used to escape through the
+    generic exception handler as an opaque 500; the create route now
+    translates it to a structured conflict the tool layer can surface
+    as title_already_exists.
+    """
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    agent_id = generate_agent_id()
+    agent_store.create(agent_id, name="child-agent", bundle_location="test:///bundle")
+    body = {
+        "agent_id": agent_id,
+        "parent_session_id": session_id,
+        "title": "leaf~run1~a1~0.1",
+    }
+    first = await client.post("/v1/sessions", json=body)
+    assert first.status_code < 400, first.text
+    second = await client.post("/v1/sessions", json=body)
+    assert second.status_code == 409, second.text
+    payload = second.json()
+    assert payload["error"]["code"] == "conflict"
+    assert "already exists" in payload["error"]["message"]

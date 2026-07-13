@@ -12532,11 +12532,10 @@ async def _create_session_from_existing_agent(
             git_branch=git_branch,
             terminal_launch_args=validated_launch_args,
         )
-    except Exception:
+    except Exception as create_exc:
         # Broad catch is intentional: ANY create_conversation failure
         # (integrity error, name clash, ...) must trigger orphan-worktree
-        # cleanup before the error propagates. We re-raise unchanged
-        # below, so nothing is swallowed. Gate on created_worktree_path,
+        # cleanup before the error propagates. Gate on created_worktree_path,
         # NOT git_branch: only a worktree Omnigent created here may be
         # force-removed. An existing worktree bound via workspace_branch
         # also sets git_branch but is the user's — never destroy it.
@@ -12553,6 +12552,16 @@ async def _create_session_from_existing_agent(
                 request=request,
                 reason="create-rollback",
             )
+        if isinstance(create_exc, NameAlreadyExistsError):
+            # The store raises this exactly so callers can surface a clean
+            # tool error; without the translation it escaped through the
+            # generic Exception handler as an opaque 500 to MCP clients.
+            raise OmnigentError(
+                f"a session titled {body.title!r} already exists under "
+                f"parent {body.parent_session_id!r}; close it first or "
+                "pick a different title",
+                code=ErrorCode.CONFLICT,
+            ) from create_exc
         raise
 
     # The create request has no conv id in its URL, so the path-based

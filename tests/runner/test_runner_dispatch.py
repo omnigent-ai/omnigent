@@ -7246,3 +7246,84 @@ async def test_session_close_accepts_plain_titled_id_created_child() -> None:
         "agent": None,
         "title": "leaf~run1~a1~0.1",
     }
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_maps_title_conflict_to_typed_error() -> None:
+    """
+    A 409 from the create maps to ``title_already_exists``.
+
+    The server translates the ``(parent, title)`` unique-index clash to a
+    structured 409; without this mapping the LLM saw only
+    "sys_session_create returned 500/409" and couldn't tell a title
+    collision from a transport failure.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            409,
+            json={"error": {"code": "conflict", "message": "a session titled 'auth' ..."}},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"agent_id": "ag_x", "title": "auth"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    info = json.loads(output)
+    assert info["error"] == "title_already_exists"
+    assert info["title"] == "auth"
+
+
+@pytest.mark.asyncio
+async def test_send_missing_mode_error_tracks_declared_subagents() -> None:
+    """
+    The missing-addressing error mirrors the advertised schema.
+
+    With no declared sub-agents the schema omits agent/title entirely, so
+    the error must steer to session_id only; with declared sub-agents the
+    original wording stands. A mismatch here dangles an 'agent' option
+    the caller's schema never advertised.
+    """
+    from types import SimpleNamespace
+
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(404)),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            no_subagents = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps({"args": "hello"}),
+                server_client=server_client,
+                conversation_id="conv_parent",
+                session_inbox=session_inbox,
+                agent_spec=None,
+            )
+            with_subagents = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps({"args": "hello"}),
+                server_client=server_client,
+                conversation_id="conv_parent",
+                session_inbox=session_inbox,
+                agent_spec=SimpleNamespace(
+                    sub_agents=[SimpleNamespace(name="researcher")],
+                ),
+            )
+        finally:
+            runner_app._session_inboxes_ref.pop("conv_parent", None)
+
+    assert "requires 'session_id'" in no_subagents
+    assert "'agent'" not in no_subagents.split("declares no named sub-agents")[0]
+    assert "requires 'agent' (or 'session_id')" in with_subagents

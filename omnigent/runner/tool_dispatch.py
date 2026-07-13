@@ -1514,7 +1514,17 @@ async def _execute_subagent_tool(
     sub_agent_name = args.get("agent")
     session_name = args.get("title")
     if not sub_agent_name:
-        return "Error: sys_session_send requires 'agent' (or 'session_id')"
+        # Mirror the advertised schema: when the spec declares no
+        # sub-agents, _build_sys_session_send_schema omits agent/title
+        # entirely, so referencing 'agent' here would dangle an option
+        # the caller never saw.
+        if _spec_declares_subagents(agent_spec):
+            return "Error: sys_session_send requires 'agent' (or 'session_id')"
+        return (
+            "Error: sys_session_send requires 'session_id' (this agent "
+            "declares no named sub-agents, so only the session_id mode "
+            "is available; create children with sys_session_create)"
+        )
     if not session_name or not isinstance(session_name, str):
         return "Error: sys_session_send requires non-empty 'title' string"
 
@@ -2216,6 +2226,17 @@ async def _execute_session_create(
         return json.dumps({"error": "agent_not_found", "agent_id": agent_id})
     if resp.status_code in (401, 403):
         return json.dumps({"error": "access_denied", "agent_id": agent_id})
+    if resp.status_code == 409:
+        # The server maps a (parent, title) unique-index clash to a
+        # structured 409; surface it as an actionable tool error instead
+        # of a generic status echo.
+        return json.dumps(
+            {
+                "error": "title_already_exists",
+                "title": args.get("title"),
+                "detail": resp.text[:200],
+            }
+        )
     if resp.status_code >= 400:
         return json.dumps(
             {"error": f"sys_session_create returned {resp.status_code}", "detail": resp.text[:200]}
@@ -2672,6 +2693,26 @@ async def _execute_hindsight_tool(
         conversation_id=conversation_id,
     )
     return await asyncio.to_thread(tool.invoke, json.dumps(args), ctx)
+
+
+def _spec_declares_subagents(agent_spec: Any | None) -> bool:
+    """
+    Check whether the parent spec declares any named sub-agents at all.
+
+    Same two spec shapes as :func:`_has_subagent`; used to keep the
+    named-mode validation error consistent with the advertised schema
+    (which omits ``agent``/``title`` when nothing is declared).
+
+    :param agent_spec: Parent agent's spec. ``None`` when no spec is
+        available.
+    :returns: ``True`` if at least one sub-agent is declared.
+    """
+    if agent_spec is None:
+        return False
+    if getattr(agent_spec, "sub_agents", None):
+        return True
+    tools = getattr(agent_spec, "tools", None)
+    return bool(isinstance(tools, dict) and tools)
 
 
 def _has_subagent(

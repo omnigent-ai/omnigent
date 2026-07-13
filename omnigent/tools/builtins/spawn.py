@@ -53,6 +53,18 @@ _HISTORY_MAX_TAIL = 50
 # paths strip this marker and expose ``omnigent.closed=true`` instead.
 _CLOSED_TITLE_INFIX = CLOSED_TITLE_INFIX
 
+# Appended to every sys_session_* tool description. The tools are served
+# through the session's runner, whose relay is only up while a turn is
+# active (for native-CLI sessions the runner IS the CLI process, which
+# disconnects between turns) — so a detached caller between turns sees
+# them as unknown/unavailable rather than failing.
+_TURN_SCOPED_AVAILABILITY_NOTE = (
+    " Note: session tools are served through your session's runner and are "
+    "reachable only while a turn is active; a detached caller between turns "
+    "may see them as unknown or get proxy errors — wait and retry once a "
+    "turn is active."
+)
+
 
 class SysSessionSendTool(Tool):
     """
@@ -126,14 +138,17 @@ class SysSessionSendTool(Tool):
             "session you created (e.g. via sys_session_create) — this "
             "is confined to your direct children. Provide exactly one "
             "of (agent + title) or session_id, always with args. "
-            "Returns the child's output when its turn completes. To run "
+            "Returns an async handle immediately ({status: 'launching', "
+            "conversation_id, ...}); the child's output is delivered to "
+            "your inbox when its turn completes (check with "
+            "sys_read_inbox, or poll sys_session_get_history). To run "
             "multiple sessions in parallel, emit multiple "
             "sys_session_send tool_calls in the same response — they "
             "dispatch concurrently. To attach previously-uploaded files, "
             "pass their file ids via the object args form's 'file_ids' "
             "list on the first named (agent, title) send only; file_ids "
             "cannot be used with session_id or when continuing an existing "
-            "named session."
+            "named session." + _TURN_SCOPED_AVAILABILITY_NOTE
         )
 
     def __init__(self, sub_specs: dict[str, AgentSpec]) -> None:
@@ -247,10 +262,14 @@ def _build_sys_session_send_schema(
             "conversation, visible in the session tree) — not your "
             "harness's built-in subagent/Task tool, which remains the "
             "right choice for quick in-context delegation. "
-            "Confined to your direct children. Returns the child's "
-            "output when its turn completes. To run multiple sessions "
+            "Confined to your direct children. Returns an async handle "
+            "immediately ({status: 'launching', conversation_id, ...}); "
+            "the child's output is delivered to your inbox when its turn "
+            "completes (check with sys_read_inbox, or poll "
+            "sys_session_get_history). To run multiple sessions "
             "in parallel, emit multiple sys_session_send tool_calls in "
             "the same response — they dispatch concurrently."
+            + _TURN_SCOPED_AVAILABILITY_NOTE
         )
     )
     # ``args.harness`` is allowlist-gated (design D.4): advertise it only when
@@ -500,7 +519,7 @@ class SysSessionListTool(Tool):
             "for orchestration (inspect via sys_agent_get / "
             "sys_session_get_info, or drive via sys_session_send by "
             "session_id). Pass agent_name to filter the global list to "
-            "sessions running that agent."
+            "sessions running that agent." + _TURN_SCOPED_AVAILABILITY_NOTE
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -629,7 +648,7 @@ class SysSessionGetInfoTool(Tool):
             "and outstanding approval prompts. Global read — any "
             "session you can access. Pass session_id to target another "
             "session; omit it to describe your own. Metadata only — "
-            "use sys_session_get_history for the conversation transcript."
+            "use sys_session_get_history for the conversation transcript." + _TURN_SCOPED_AVAILABILITY_NOTE
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -720,7 +739,7 @@ class SysSessionShareTool(Tool):
             "(level 'read' default, 'edit', or 'manage'). Omit "
             "session_id to share the calling session itself, or pass it "
             "to share another session you manage. Requires manage-level "
-            "access (the session owner has it)."
+            "access (the session owner has it)." + _TURN_SCOPED_AVAILABILITY_NOTE
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -859,7 +878,7 @@ class SysSessionCreateTool(Tool):
             "Returns {conversation_id, agent_id, title, status}; the "
             "session runs asynchronously — monitor it with "
             "sys_session_get_history / sys_session_get_info or drive it "
-            "with sys_session_send."
+            "with sys_session_send." + _TURN_SCOPED_AVAILABILITY_NOTE
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -908,7 +927,12 @@ class SysSessionCreateTool(Tool):
                             "type": "string",
                             "description": (
                                 "Optional human-readable label for the "
-                                "new session, e.g. 'auth refactor'."
+                                "new session, e.g. 'auth refactor'. "
+                                "Must be unique among your child "
+                                "sessions: creating a second child "
+                                "with an already-used title fails "
+                                "with title_already_exists (closed "
+                                "children release their title)."
                             ),
                         },
                         "message": {
@@ -1336,7 +1360,7 @@ class SysSessionGetHistoryTool(Tool):
             "tail of conversation items (assistant/user messages, tool "
             "calls, tool results) in chronological order. Returns "
             "session_not_found if conversation_id is unknown, or "
-            "session_out_of_tree if the server denies read access."
+            "session_out_of_tree if the server denies read access." + _TURN_SCOPED_AVAILABILITY_NOTE
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -1481,7 +1505,7 @@ class SysSessionCloseTool(Tool):
             "continuing this one. Returns session_not_found if "
             "conversation_id is unknown, session_out_of_tree if it "
             "isn't part of the caller's tree, or sub_agent_busy if "
-            "the child has a non-terminal task in flight."
+            "the child has a non-terminal task in flight." + _TURN_SCOPED_AVAILABILITY_NOTE
         )
 
     def get_schema(self) -> dict[str, Any]:
