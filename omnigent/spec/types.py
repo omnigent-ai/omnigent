@@ -677,12 +677,16 @@ class LLMConfig:  # type: ignore[explicit-any]  # extra: dict[str, Any] field (s
     :param fallback_models: Ordered backup models tried, in order,
         when a call to ``model`` fails. Same provider-prefixed
         format as ``model``, e.g.
-        ``["anthropic/claude-3-5-haiku", "openai/gpt-4o-mini"]``.
+        ``["databricks/claude-3-5-haiku", "databricks/gpt-4o-mini"]``.
         Consumed today by the policy LLM client
         (:class:`~omnigent.policies.types.PolicyLLMClient`): a call
         advances to the next model on any failure and only surfaces
         an error once every candidate is exhausted. Empty (the
-        default) preserves single-model behaviour.
+        default) preserves single-model behaviour. The resolved
+        ``connection`` (or ``profile``) is shared across the primary
+        and every fallback, so prefer same-provider fallbacks; a
+        fallback on a different provider only works when credentials
+        come from environment defaults (no ``connection``/``profile``).
     """
 
     model: str

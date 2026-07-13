@@ -349,9 +349,19 @@ def _parse_llm(
     )
     retry = _parse_retry(raw.get("retry"))
     fallback_models_raw = raw.get("fallback_models")
-    fallback_models = (
-        [str(m) for m in fallback_models_raw] if isinstance(fallback_models_raw, list) else []
-    )
+    if fallback_models_raw is None:
+        fallback_models = []
+    elif isinstance(fallback_models_raw, list):
+        fallback_models = [str(m) for m in fallback_models_raw]
+    else:
+        # A non-list value (e.g. a bare string) is almost certainly a
+        # config typo — a bare string would iterate per-character, so
+        # reject it loudly rather than silently dropping the fallbacks.
+        _log.warning(
+            "llm.fallback_models must be a list, got %s; ignoring it",
+            type(fallback_models_raw).__name__,
+        )
+        fallback_models = []
     reserved = {
         "model",
         "connection",

@@ -208,6 +208,28 @@ def test_parse_server_llm_fallback_models_defaults_empty() -> None:
     assert result.fallback_models == []
 
 
+def test_parse_server_llm_fallback_models_non_list_warns(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A non-list ``fallback_models:`` (e.g. a bare string typo) is
+    rejected with a warning and yields an empty list.
+
+    What breaks if this fails: a bare string is dropped silently
+    (or iterated per-character), so the operator's intended
+    fallback is lost with no hint.
+    """
+    with caplog.at_level("WARNING"):
+        result = parse_server_llm(
+            {"model": "openai/gpt-4o-mini", "fallback_models": "openai/gpt-4o"},
+            expand_env=False,
+        )
+
+    assert result is not None
+    assert result.fallback_models == []
+    assert any("fallback_models must be a list" in r.message for r in caplog.records)
+
+
 # ── PolicyLLMClient ─────────────────────────────────────────────────────────
 
 
@@ -610,6 +632,52 @@ def test_build_policy_llm_client_empty_fallbacks_default() -> None:
 
     assert result is not None
     assert result._fallback_models == []
+
+
+def test_build_policy_llm_client_warns_on_cross_provider_fallback_with_connection(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A fallback on a different provider than the primary, combined
+    with a resolved connection, warns at build time.
+
+    What breaks if this fails: the shared connection is silently
+    handed to a fallback on another provider, so the fallback
+    request fails to authenticate mid-policy-evaluation with no
+    hint at startup.
+    """
+    llm_config = LLMConfig(
+        model="databricks/primary",
+        fallback_models=["openai/gpt-4o-mini"],
+    )
+    with caplog.at_level("WARNING"):
+        result = _build_policy_llm_client(llm_config, {"api_key": "k"})
+
+    assert result is not None
+    assert any(
+        "fallback_models target" in r.message and "openai" in r.message for r in caplog.records
+    )
+
+
+def test_build_policy_llm_client_no_warn_same_provider_fallback(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    Same-provider fallbacks with a connection do not warn — the
+    shared connection is valid for every candidate.
+
+    What breaks if this fails: correct configs get spurious
+    warnings, training operators to ignore the real ones.
+    """
+    llm_config = LLMConfig(
+        model="databricks/primary",
+        fallback_models=["databricks/backup"],
+    )
+    with caplog.at_level("WARNING"):
+        result = _build_policy_llm_client(llm_config, {"api_key": "k"})
+
+    assert result is not None
+    assert not any("fallback_models target" in r.message for r in caplog.records)
 
 
 # ── build_policy_engine wiring ──────────────────────────────────────────────

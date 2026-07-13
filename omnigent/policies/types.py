@@ -360,6 +360,10 @@ class PolicyLLMClient:
         primary ``_model`` call fails. Same provider-prefixed
         format as ``_model``. Empty (the default) preserves
         single-model behaviour — one attempt, no fallback loop.
+        ``_connection``/``_request_timeout`` are shared across the
+        primary and every fallback, so same-provider fallbacks are
+        the reliable case (a cross-provider fallback only works when
+        ``_connection`` is ``None``).
     """
 
     _client: Any  # omnigent.llms.client.Client — Any to avoid import cycle
@@ -389,6 +393,11 @@ class PolicyLLMClient:
         re-raised only after every candidate has failed. A caller
         that passes an explicit ``model`` opts out of fallback — the
         single requested model is used as-is.
+
+        Candidates are tried serially, so the worst-case latency of
+        this call is ``(1 + len(_fallback_models)) * timeout``. On
+        the policy hot path this delays the fail-closed (DENY)
+        verdict, so keep the fallback list short.
 
         :param input: Messages in OpenAI Responses API format,
             e.g. ``[{"role": "user", "content": [{"type": "input_text",
@@ -441,6 +450,15 @@ class PolicyLLMClient:
                         exc_info=True,
                     )
         # Every candidate failed — surface the last error to the caller.
+        # This is the fail-closed (DENY) path and, because candidates are
+        # tried serially, the caller has now waited up to
+        # ``len(candidates) * timeout``; log it so the latency is visible.
+        _log.error(
+            "PolicyLLMClient: all %d candidate model(s) failed after "
+            "serial attempts (up to %ds each); surfacing last error",
+            len(candidates),
+            timeout,
+        )
         assert last_exc is not None
         raise last_exc
 

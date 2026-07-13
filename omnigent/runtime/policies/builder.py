@@ -468,12 +468,34 @@ def _build_policy_llm_client(
         return None
     from omnigent.llms.client import Client
 
+    primary = _normalize_policy_model(server_llm.model)
+    fallbacks = [_normalize_policy_model(m) for m in server_llm.fallback_models]
+
+    # The resolved ``connection`` (api_key / profile creds) is shared
+    # across the primary and every fallback. It is provider-specific,
+    # so a fallback on a different provider would be handed the wrong
+    # credentials. Warn at build time rather than failing mid-request.
+    if connection is not None:
+        primary_provider = _model_provider(primary)
+        mismatched = sorted(
+            {_model_provider(m) for m in fallbacks if _model_provider(m) != primary_provider}
+        )
+        if mismatched:
+            _logger.warning(
+                "Policy llm: connection is configured for provider %r but "
+                "fallback_models target %s; the shared connection likely "
+                "won't authenticate those providers. Use same-provider "
+                "fallbacks, or rely on environment defaults (no connection).",
+                primary_provider,
+                mismatched,
+            )
+
     return PolicyLLMClient(
         _client=Client(),
-        _model=_normalize_policy_model(server_llm.model),
+        _model=primary,
         _connection=connection,
         _request_timeout=server_llm.request_timeout,
-        _fallback_models=[_normalize_policy_model(m) for m in server_llm.fallback_models],
+        _fallback_models=fallbacks,
     )
 
 
@@ -498,6 +520,18 @@ def _normalize_policy_model(model: str) -> str:
     if "/" not in model and model.startswith("databricks-"):
         return f"databricks/{model}"
     return model
+
+
+def _model_provider(model: str) -> str:
+    """
+    Extract the provider prefix from a normalized model id.
+
+    :param model: A provider-prefixed model id, e.g.
+        ``"databricks/claude-sonnet-4"`` or ``"openai/gpt-4o-mini"``.
+    :returns: The provider segment before the first ``/`` (e.g.
+        ``"openai"``), or the whole string when unprefixed.
+    """
+    return model.split("/", 1)[0] if "/" in model else model
 
 
 def _resolve_databricks_connection(profile: str) -> dict[str, str]:
