@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "generated_at": "2026-07-08T18:30:00+00:00",
   "git_sha": "0000000000000000000000000000000000000000",
   "git_branch": "main",
@@ -66,7 +66,8 @@
         "avg_rps": 162.7669557884957
       },
       "kind": "latency",
-      "backend": "sqlite"
+      "backend": "sqlite",
+      "needs_runner": false
     },
     "create_session": {
       "runs": [
@@ -115,7 +116,8 @@
         "avg_rps": 40.548671853654
       },
       "kind": "latency",
-      "backend": "sqlite"
+      "backend": "sqlite",
+      "needs_runner": false
     },
     "get_session": {
       "runs": [
@@ -164,7 +166,8 @@
         "avg_rps": 199.59858100569238
       },
       "kind": "latency",
-      "backend": "sqlite"
+      "backend": "sqlite",
+      "needs_runner": false
     },
     "load_conversation_history": {
       "runs": [
@@ -213,7 +216,8 @@
         "avg_rps": 503.8957501013986
       },
       "kind": "latency",
-      "backend": "sqlite"
+      "backend": "sqlite",
+      "needs_runner": false
     },
     "search_sessions": {
       "runs": [
@@ -262,7 +266,8 @@
         "avg_rps": 12.317410535217997
       },
       "kind": "latency",
-      "backend": "sqlite"
+      "backend": "sqlite",
+      "needs_runner": false
     }
   }
 }

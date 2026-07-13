@@ -96,6 +96,13 @@ def test_coding_subagents(polly_spec: AgentSpec) -> None:
     assert fam["pi"] == "pi"
     # Six distinct vendors → any implementer's diff is reviewable by another.
     assert len(set(fam.values())) == 6
+    # Headless bypass knobs so workers don't stall on ApprovalCards.
+    by_name = {a.name: a for a in polly_spec.sub_agents}
+    assert by_name["claude_code"].executor.config.get("permission_mode") == "auto"
+    assert by_name["claude_code"].executor.model is None
+    assert by_name["codex"].executor.config.get("yolo") in (True, "True", "true")
+    assert by_name["cursor"].executor.config.get("yolo") in (True, "True", "true")
+    assert by_name["cursor"].executor.model == "grok-4.5"
     for name in ("claude_code", "codex", "opencode", "cursor", "hermes", "pi"):
         prompt = (_POLLY_BUNDLE / "agents" / name / "config.yaml").read_text(encoding="utf-8")
         assert "IMPLEMENT — write real product code" in prompt

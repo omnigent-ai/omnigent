@@ -1,4 +1,4 @@
-"""Tests for the ``conversations.terminal_launch_args`` column.
+"""Tests for the ``omnigent_conversation_metadata.terminal_launch_args`` column.
 
 Per ``designs/NATIVE_RUNNER_SERVER_LAUNCH.md``: the column holds a nullable
 JSON-encoded list of pass-through CLI args for a native terminal wrapper
@@ -7,6 +7,9 @@ non-native sessions and for rows that pre-date the feature. The column is now
 a binary (``BLOB``/``BYTEA``) type storing the value zstd-compressed
 (``omnigent.db.compression``). These tests exercise the schema directly (raw
 SQL, no ORM) so column drift is caught independently of the store wrapper.
+
+After the schema split (aa1b2c3d4e5f), ``terminal_launch_args`` lives on
+``omnigent_conversation_metadata`` rather than ``conversations``.
 """
 
 from __future__ import annotations
@@ -41,7 +44,8 @@ def db_engine(tmp_path: Path) -> Iterator[Engine]:
 
 def test_terminal_launch_args_column_present_and_nullable(db_engine: Engine) -> None:
     """
-    Verify the migration creates ``conversations.terminal_launch_args``
+    Verify the migration creates
+    ``omnigent_conversation_metadata.terminal_launch_args``
     as a nullable binary column.
 
     (1) The column must exist — proves the migration applied; without
@@ -53,16 +57,17 @@ def test_terminal_launch_args_column_present_and_nullable(db_engine: Engine) -> 
     ``omnigent.db.compression``, whose framed bytes can contain NUL and
     would be rejected by a ``TEXT`` column on PostgreSQL.
     """
-    cols = sa.inspect(db_engine).get_columns("conversations")
+    cols = sa.inspect(db_engine).get_columns("omnigent_conversation_metadata")
     matches = [c for c in cols if c["name"] == "terminal_launch_args"]
     assert len(matches) == 1, (
         f"Expected exactly one 'terminal_launch_args' column on "
-        f"conversations, got {len(matches)}. If 0, the migration didn't apply."
+        f"omnigent_conversation_metadata, got {len(matches)}. "
+        f"If 0, the migration didn't apply."
     )
     col = matches[0]
     assert col["nullable"], (
-        "conversations.terminal_launch_args must be NULLABLE — non-native "
-        "and pre-feature rows have no launch args and would otherwise be "
+        "omnigent_conversation_metadata.terminal_launch_args must be NULLABLE — "
+        "non-native and pre-feature rows have no launch args and would otherwise be "
         "rejected on read."
     )
     assert isinstance(col["type"], sa.LargeBinary), (
@@ -86,13 +91,19 @@ def test_terminal_launch_args_round_trip_null_and_json(db_engine: Engine) -> Non
         conn.execute(
             sa.text(
                 "INSERT INTO conversations "
-                "(id, created_at, updated_at, kind, root_conversation_id) "
-                "VALUES (:id, :ts, :ts, 1, :id)"
+                "(id, created_at, updated_at, root_conversation_id) "
+                "VALUES (:id, :ts, :ts, :id)"
             ),
             {"id": "conv_tla_null", "ts": 1700000000},
         )
+        conn.execute(
+            sa.text("INSERT INTO omnigent_conversation_metadata (id, kind) VALUES (:id, 1)"),
+            {"id": "conv_tla_null"},
+        )
         result = conn.execute(
-            sa.text("SELECT terminal_launch_args FROM conversations WHERE id = :id"),
+            sa.text(
+                "SELECT terminal_launch_args FROM omnigent_conversation_metadata WHERE id = :id"
+            ),
             {"id": "conv_tla_null"},
         ).scalar_one()
         assert result is None, (
@@ -103,18 +114,26 @@ def test_terminal_launch_args_round_trip_null_and_json(db_engine: Engine) -> Non
         conn.execute(
             sa.text(
                 "INSERT INTO conversations "
-                "(id, created_at, updated_at, kind, terminal_launch_args, "
-                "root_conversation_id) "
-                "VALUES (:id, :ts, :ts, 1, :tla, :id)"
+                "(id, created_at, updated_at, root_conversation_id) "
+                "VALUES (:id, :ts, :ts, :id)"
+            ),
+            {"id": "conv_tla_value", "ts": 1700000000},
+        )
+        conn.execute(
+            sa.text(
+                "INSERT INTO omnigent_conversation_metadata "
+                "(id, kind, terminal_launch_args) "
+                "VALUES (:id, 1, :tla)"
             ),
             {
                 "id": "conv_tla_value",
-                "ts": 1700000000,
                 "tla": '["--dangerously-skip-permissions", "--model", "opus"]',
             },
         )
         result = conn.execute(
-            sa.text("SELECT terminal_launch_args FROM conversations WHERE id = :id"),
+            sa.text(
+                "SELECT terminal_launch_args FROM omnigent_conversation_metadata WHERE id = :id"
+            ),
             {"id": "conv_tla_value"},
         ).scalar_one()
         assert result == '["--dangerously-skip-permissions", "--model", "opus"]', (

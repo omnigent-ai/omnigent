@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from sqlalchemy import delete, exists, select, update
+from sqlalchemy import delete, exists, literal, select, update
+from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
@@ -79,13 +80,13 @@ class SqlAlchemyPermissionStore(PermissionStore):
     ) -> SessionPermission:
         """Upsert a permission grant. See base class for contract."""
         with self._session() as session:
-            is_sqlite = self._engine.dialect.name == "sqlite"
+            dialect = self._engine.dialect.name
             values = {
                 "user_id": user_id,
                 "conversation_id": conversation_id,
                 "level": level,
             }
-            if is_sqlite:
+            if dialect == "sqlite":
                 stmt = (
                     sqlite_insert(SqlSessionPermission)
                     .values(**values)
@@ -93,6 +94,12 @@ class SqlAlchemyPermissionStore(PermissionStore):
                         index_elements=["workspace_id", "user_id", "conversation_id"],
                         set_={"level": level},
                     )
+                )
+            elif dialect == "mysql":
+                stmt = (
+                    mysql_insert(SqlSessionPermission)
+                    .values(**values)
+                    .on_duplicate_key_update(level=level)
                 )
             else:
                 stmt = (
@@ -248,13 +255,20 @@ class SqlAlchemyPermissionStore(PermissionStore):
     def ensure_user(self, user_id: str, *, is_admin: bool = False) -> None:
         """Upsert a user row. See base class for contract."""
         with self._session() as session:
-            is_sqlite = self._engine.dialect.name == "sqlite"
+            dialect = self._engine.dialect.name
             values = {"id": user_id, "is_admin": is_admin}
-            if is_sqlite:
+            if dialect == "sqlite":
                 stmt = (
                     sqlite_insert(SqlUser)
                     .values(**values)
                     .on_conflict_do_nothing(index_elements=["workspace_id", "id"])
+                )
+            elif dialect == "mysql":
+                # ON DUPLICATE KEY UPDATE with a no-op to silently skip conflicts.
+                stmt = (
+                    mysql_insert(SqlUser)
+                    .values(**values)
+                    .on_duplicate_key_update(id=literal(user_id))
                 )
             else:
                 stmt = (

@@ -837,3 +837,214 @@ def test_run_turn_surfaces_recorded_startup_error(
     assert "never started" in error.message
     assert "startup timeout" in error.message
     assert error.message != "Codex native bridge state is missing"
+
+
+# ── MCP startup: no client-side gate + Stop cancel (issue #2058) ────────
+
+
+def _seed_bridge(tmp_path: Path, active_turn_id: str | None = None) -> None:
+    """
+    Write bridge state for the executor under test.
+
+    :param tmp_path: Bridge directory.
+    :param active_turn_id: Active turn id to seed, or ``None``.
+    """
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_123",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_123",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id=active_turn_id,
+        ),
+    )
+
+
+def test_turn_start_is_not_gated_on_pending_mcp_startup(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    ``turn/start`` dispatches immediately while MCP servers still boot.
+
+    The Codex app-server accepts a mid-startup ``turn/start`` and defers
+    its execution until the startup round settles (verified against codex
+    0.142.5), so a client-side wait would only add latency — up to its
+    full bound when a server hangs. The bounded ``asyncio.timeout`` fails
+    this test if a gate sneaks back in.
+    """
+    from omnigent.codex_native_bridge import update_mcp_server_startup
+
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.created = []
+    _FakeCodexNativeClient.next_turn = 1
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    _seed_bridge(tmp_path)
+    update_mcp_server_startup(tmp_path, "storage-console", "starting")
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    async def run() -> list[Any]:
+        """
+        Drive one turn under a budget any startup gate would blow.
+
+        :returns: Events yielded by the turn.
+        """
+        events: list[Any] = []
+        async with asyncio.timeout(5.0):
+            async for event in executor.run_turn(
+                [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+                [],
+                "",
+            ):
+                events.append(event)
+        return events
+
+    events = asyncio.run(run())
+
+    assert [type(event) for event in events] == [TurnComplete]
+    assert [method for method, _ in _FakeCodexNativeClient.requests] == ["turn/start"]
+
+
+def test_turn_error_names_pending_mcp_servers(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A turn failure during MCP startup names the still-pending servers.
+
+    An injection failure this early in the session's life is most often
+    the startup itself; without the suffix the user sees a bare transport
+    error and has no idea codex is still booting MCP servers.
+    """
+    from omnigent.codex_native_bridge import update_mcp_server_startup
+
+    class _FailingTurnClient(_FakeCodexNativeClient):
+        """Fake client whose ``turn/start`` fails like a mid-boot app-server."""
+
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            """
+            Reject ``turn/start``; defer to the base fake otherwise.
+
+            :param method: JSON-RPC method, e.g. ``"turn/start"``.
+            :param params: JSON-RPC params.
+            :returns: Codex-shaped response payload.
+            """
+            if method == "turn/start":
+                raise RuntimeError("app-server hiccup")
+            return await super().request(method, params)
+
+    _FailingTurnClient.requests = []
+    _FailingTurnClient.created = []
+    _FailingTurnClient.next_turn = 1
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server.CodexAppServerClient",
+        _FailingTurnClient,
+    )
+    _seed_bridge(tmp_path)
+    update_mcp_server_startup(tmp_path, "storage-console", "starting")
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    events = _collect_turn_events(executor, "hi")
+
+    assert [type(event) for event in events] == [ExecutorError]
+    assert "MCP startup still waiting on storage-console" in events[0].message
+
+
+def test_interrupt_with_active_turn_and_pending_mcp_stops_both(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    Stop during a startup-deferred turn interrupts the turn AND the startup.
+
+    Codex holds a mid-startup turn until the MCP round settles, so
+    stopping only the turn would leave the user watching a startup they
+    asked to stop. The startup interrupt (empty turn id) is sent first and
+    best-effort, then the recorded turn is interrupted.
+    """
+    from omnigent.codex_native_bridge import read_mcp_startup, update_mcp_server_startup
+
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.created = []
+    _FakeCodexNativeClient.next_turn = 1
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    _seed_bridge(tmp_path, active_turn_id="turn_active")
+    update_mcp_server_startup(tmp_path, "storage-console", "starting")
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    interrupted = asyncio.run(executor.interrupt_session("key"))
+
+    assert interrupted is True
+    assert _FakeCodexNativeClient.requests == [
+        ("turn/interrupt", {"threadId": "thread_123", "turnId": ""}),
+        ("turn/interrupt", {"threadId": "thread_123", "turnId": "turn_active"}),
+    ]
+    assert read_mcp_startup(tmp_path)["storage-console"]["status"] == "cancelled"
+
+
+def test_interrupt_with_no_active_turn_cancels_mcp_startup(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    Stop during MCP startup cancels it instead of no-oping.
+
+    With no active turn id recorded, ``interrupt_session`` used to return
+    ``False`` and the user's Stop did nothing while Codex was wedged on a
+    slow MCP server. It must flip the pending servers to ``cancelled``
+    (unblocking the first-turn gate) and send Codex the TUI's startup
+    interrupt: ``turn/interrupt`` with an empty turn id.
+    """
+    from omnigent.codex_native_bridge import read_mcp_startup, update_mcp_server_startup
+
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.created = []
+    _FakeCodexNativeClient.next_turn = 1
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    _seed_bridge(tmp_path, active_turn_id=None)
+    update_mcp_server_startup(tmp_path, "storage-console", "starting")
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    interrupted = asyncio.run(executor.interrupt_session("key"))
+
+    assert interrupted is True
+    assert _FakeCodexNativeClient.requests == [
+        ("turn/interrupt", {"threadId": "thread_123", "turnId": ""})
+    ]
+    assert read_mcp_startup(tmp_path)["storage-console"]["status"] == "cancelled"
+
+
+def test_interrupt_with_no_active_turn_and_no_pending_mcp_is_noop(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    Stop with nothing running and nothing starting stays a no-op.
+
+    An idle session must not send spurious ``turn/interrupt`` requests to
+    the app-server on every Stop press.
+    """
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.created = []
+    _FakeCodexNativeClient.next_turn = 1
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    _seed_bridge(tmp_path, active_turn_id=None)
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    interrupted = asyncio.run(executor.interrupt_session("key"))
+
+    assert interrupted is False
+    assert _FakeCodexNativeClient.requests == []

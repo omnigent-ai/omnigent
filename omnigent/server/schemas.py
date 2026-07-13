@@ -1830,6 +1830,12 @@ class SessionResponse(BaseModel):
     model_options: list[dict[str, Any]] = Field(default_factory=list)
     terminal_pending: bool = False
     sandbox_status: SandboxStatus | None = None
+    # Per-MCP-server startup state for native harness sessions
+    # (codex-native), present while the harness boots its MCP servers or
+    # when servers were cancelled/failed. ``None`` otherwise. Sourced from
+    # ``_session_mcp_startup_cache`` at snapshot build time so a client
+    # opening the session mid-startup sees the startup band.
+    mcp_startup: dict[str, McpServerStartup] | None = None
     active_response_id: str | None = None
 
 
@@ -2180,6 +2186,12 @@ class SessionListItem(BaseModel):
     :param viewer_unread: Whether the *requesting user* explicitly
         marked this session unread. Per-viewer; lifts the active-row
         dot suppression on the client. ``False`` by default.
+    :param search_snippet: Excerpt of the chat content that matched the
+        request's ``search_query``, centered on the match with ``…``
+        marking elided ends, so the search UI can show *where* a session
+        matched in its body. Present whenever the query hit an item body
+        (even if the title also matched); ``None`` on non-search reads and
+        when only the title matched.
     """
 
     id: str
@@ -2206,6 +2218,7 @@ class SessionListItem(BaseModel):
     comments_updated_at: int | None = None
     viewer_last_seen: int | None = None
     viewer_unread: bool = False
+    search_snippet: str | None = None
 
 
 class SessionList(BaseModel):
@@ -2661,6 +2674,48 @@ class SessionSandboxStatusEvent(_SSEEventBase):
     conversation_id: str
     stage: SandboxLaunchStage
     error: str | None = None
+
+
+class McpServerStartup(BaseModel):
+    """
+    One MCP server's startup state within a ``session.mcp_startup`` event.
+
+    :param status: Latest startup state reported by the harness, mirroring
+        Codex's ``McpServerStartupState`` enum.
+    :param error: Failure detail when ``status == "failed"``, e.g.
+        ``"handshaking with MCP server failed"``. ``None`` otherwise.
+    """
+
+    status: Literal["starting", "ready", "failed", "cancelled"]
+    error: str | None = None
+
+
+class SessionMcpStartupEvent(_SSEEventBase):
+    """
+    Per-MCP-server startup progress for a native harness session.
+
+    A codex-native session brings up its configured MCP servers when its
+    Codex thread starts; slow or failing servers previously left the web
+    session looking hung with no signal. The native forwarder mirrors
+    Codex's ``mcpServer/startupStatus/updated`` notifications as
+    ``external_mcp_startup`` posts, republished here so the web UI can
+    show which servers are still starting and which failed or were
+    cancelled.
+
+    :param type: Always ``"session.mcp_startup"``.
+    :param conversation_id: Session identifier,
+        e.g. ``"conv_abc123"``.
+    :param servers: Latest per-server startup map, e.g.
+        ``{"safe": {"status": "starting", "error": None}}``.
+
+    Category: **transient** (SSE + snapshot cache). Not persisted; a
+    client connecting mid-startup seeds from the session snapshot's
+    ``mcp_startup`` field and updates live off this event.
+    """
+
+    type: Literal["session.mcp_startup"]
+    conversation_id: str
+    servers: dict[str, McpServerStartup]
 
 
 class SessionSkillsEvent(_SSEEventBase):
@@ -3315,6 +3370,35 @@ class ElicitationRequestEvent(_SSEEventBase):
     params: ElicitationRequestParams
 
 
+class BrowserActionRequestEvent(_SSEEventBase):
+    """
+    Request that the desktop renderer perform one browser action.
+
+    Emitted by the server ``POST /v1/sessions/{id}/browser/action_request``
+    route when a runner-side ``browser_*`` tool dispatch needs the
+    Omnigent desktop app's embedded browser to act. The event fans out
+    on the session stream to every subscribed renderer; each renderer
+    first POSTs ``/browser/action_claim/{action_id}`` and only the
+    winning claimant executes the action and POSTs the result back to
+    ``/browser/action_result/{action_id}``. The claim lease prevents
+    double execution when more than one renderer is subscribed.
+
+    :param type: Always ``"browser.action_request"``.
+    :param action_id: Unique correlation id for this request, e.g.
+        ``"baction_abc123"``. Echoed on the claim and result routes.
+    :param action: The browser action to perform — the ``browser_``
+        tool name with the prefix stripped, e.g. ``"navigate"``,
+        ``"snapshot"``, ``"click"``, ``"type"``, ``"screenshot"``.
+    :param args: Action arguments forwarded from the tool call, e.g.
+        ``{"url": "https://example.com"}``.
+    """
+
+    type: Literal["browser.action_request"]
+    action_id: str
+    action: str
+    args: dict[str, Any]
+
+
 class ElicitationResolvedEvent(_SSEEventBase):
     """
     Signal that a previously-published elicitation is no longer
@@ -3848,6 +3932,7 @@ ServerStreamEvent = Annotated[
     | SessionTodosEvent
     | SessionTerminalPendingEvent
     | SessionSandboxStatusEvent
+    | SessionMcpStartupEvent
     | SessionSkillsEvent
     | SessionModelOptionsEvent
     | SessionInputConsumedEvent
@@ -3875,6 +3960,8 @@ ServerStreamEvent = Annotated[
     # ── Transient (SSE-only) — synchronous decision request ────
     | ElicitationRequestEvent
     | ElicitationResolvedEvent
+    # ── Transient (SSE-only) — embedded-browser action request ─
+    | BrowserActionRequestEvent
     # ── Transient (SSE-only) — native policy DENY signal ───────
     | PolicyDeniedEvent
     # ── Transient (SSE-only) — Responses-API turn lifecycle ────

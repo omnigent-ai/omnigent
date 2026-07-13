@@ -63,12 +63,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        backend: [sqlite, postgres]
+        backend: [sqlite, postgres, mysql]
     services:
-      # A Postgres service is defined unconditionally (GitHub Actions has no
-      # per-matrix-value service gating), but only the postgres leg connects to
-      # it — the sqlite leg simply ignores it. postgres:16 mirrors Lakebase's
-      # major version.
+      # The Postgres and MySQL services are defined unconditionally (GitHub
+      # Actions has no per-matrix-value service gating); each leg connects only
+      # to its own backend and ignores the others. postgres:16 mirrors
+      # Lakebase's major version; mysql:8.0 matches the stores-mysql CI lane.
       postgres:
         image: postgres:16
         env:
@@ -78,6 +78,18 @@ jobs:
           - 5432:5432
         options: >-
           --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: bench
+          MYSQL_DATABASE: benchdb
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -u root -pbench"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
@@ -101,17 +113,30 @@ jobs:
         # `databricks` extra carries psycopg[binary] for the Postgres backend.
         run: uv sync --extra dev --extra databricks
 
+      - name: Install MySQL driver
+        # mysqlclient (mysql+mysqldb://) needs the system client library and is
+        # not in any extra, so install it only on the mysql leg. Matches the
+        # stores-mysql lane in ci.yml.
+        if: matrix.backend == 'mysql'
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -q libmysqlclient-dev
+          uv pip install mysqlclient
+
       # Resolve the DB URI + a stable seed-cache key for this backend. The
       # cache key binds the DB schema head + seed.py contents + corpus config,
       # so a schema change or seed edit busts the cache and forces a reseed —
       # the "you changed the schema, refresh the seed" contract (SQLite only;
-      # the Postgres service is fresh each run so its DB is never cached).
+      # the Postgres/MySQL services are fresh each run so their DB is never
+      # cached).
       - name: Resolve DB target
         id: db
         run: |
           HEAD="$(uv run --no-sync dev/benchmarks/omnigent/seed.py --print-head)"
           if [[ "${{ matrix.backend }}" == "postgres" ]]; then
             echo "uri=postgresql+psycopg://postgres:bench@localhost:5432/benchdb" >> "$GITHUB_OUTPUT"
+            echo "cache_path=" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ matrix.backend }}" == "mysql" ]]; then
+            echo "uri=mysql+mysqldb://root:bench@127.0.0.1:3306/benchdb" >> "$GITHUB_OUTPUT"
             echo "cache_path=" >> "$GITHUB_OUTPUT"
           else
             echo "uri=sqlite:///$PWD/bench.db" >> "$GITHUB_OUTPUT"
@@ -120,7 +145,7 @@ jobs:
           echo "cache_key=benchdb-${{ matrix.backend }}-$HEAD-${SESSIONS}x${ITEMS}-${{ hashFiles('dev/benchmarks/omnigent/seed.py') }}" >> "$GITHUB_OUTPUT"
 
       # Reuse a previously-seeded SQLite corpus when schema + seed + config are
-      # unchanged. No-op for the postgres leg (empty path).
+      # unchanged. No-op for the server-backed legs (empty path).
       - name: Restore seeded SQLite corpus
         if: matrix.backend == 'sqlite'
         id: seedcache
@@ -130,9 +155,10 @@ jobs:
           key: ${{ steps.db.outputs.cache_key }}
 
       - name: Seed corpus
-        # Postgres always seeds (fresh service each run); SQLite seeds only on a
-        # cache miss. seed.py is itself idempotent, so a stray hit is harmless.
-        if: matrix.backend == 'postgres' || steps.seedcache.outputs.cache-hit != 'true'
+        # The fresh-service backends (postgres, mysql) always seed; SQLite seeds
+        # only on a cache miss. seed.py is itself idempotent, so a stray hit is
+        # harmless.
+        if: matrix.backend != 'sqlite' || steps.seedcache.outputs.cache-hit != 'true'
         run: |
           uv run --no-sync dev/benchmarks/omnigent/seed.py \
             --database-uri "${{ steps.db.outputs.uri }}" \

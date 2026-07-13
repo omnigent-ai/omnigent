@@ -31,6 +31,7 @@ import logging
 import os
 import time
 from abc import ABC, abstractmethod
+from enum import Enum
 
 from starlette.requests import HTTPConnection
 
@@ -77,6 +78,78 @@ LEVEL_READ = 1
 LEVEL_EDIT = 2
 LEVEL_MANAGE = 3
 LEVEL_OWNER = 4
+
+
+class SharingMode(str, Enum):
+    """Server policy for creating new session permission grants.
+
+    - ``ON``: grants at any level (read/edit/manage) plus workspace/public read.
+    - ``READ_ONLY``: grants are capped at read (view) — edit/manage grants are
+      rejected; workspace/public read still allowed.
+    - ``RESTRICTED_READ_ONLY``: like ``READ_ONLY`` (grants capped at read), but
+      sessions whose working directory is a user home directory or the
+      filesystem root (see :func:`workspace_sharing_blocked`) cannot be shared
+      at all — not even read — because that cwd exposes an entire home/filesystem.
+    - ``OFF``: no new grants at all.
+
+    Value is the lowercase name so ``GET /v1/info`` and the
+    ``OMNIGENT_SHARING_MODE`` env var round-trip it directly. Defaults to ``ON``.
+    """
+
+    OFF = "off"
+    READ_ONLY = "read_only"
+    RESTRICTED_READ_ONLY = "restricted_read_only"
+    ON = "on"
+
+    @classmethod
+    def coerce(cls, value: object) -> SharingMode:
+        """Map a ``SharingMode``/str/``None`` to a mode, failing open to ``ON``
+        for anything unset or unrecognized (env-var parse + callable boundary)."""
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, str):
+            try:
+                return cls(value.strip().lower())
+            except ValueError:
+                return cls.ON
+        return cls.ON
+
+
+# Directories whose *direct children* are user home directories, across the
+# Unix / macOS / container layouts a runner might use: ``/home`` (Linux),
+# ``/Users`` (macOS), and ``/var/home`` (ostree — Silverblue/CoreOS/Flatcar,
+# where ``/home`` symlinks here). Matched by path *shape*, never by resolving
+# ``~``: the runner and its home may live on a different host than this server
+# process, so the local process's home is not a reliable signal. Deliberately
+# excludes project-workspace roots (``/workspace``, ``/workspaces/<repo>``) —
+# those hold a single checkout, not a whole home, and stay shareable.
+_HOME_PARENT_DIRS = ("/home", "/Users", "/var/home")
+# Absolute paths that are themselves a home or the filesystem root.
+_BLOCKED_WORKSPACE_ROOTS = ("/", "/root")
+
+
+def workspace_sharing_blocked(workspace: str | None) -> bool:
+    """True when a session's working directory is too broad to share under
+    :attr:`SharingMode.RESTRICTED_READ_ONLY` — the filesystem root or a user
+    home directory, whose whole contents a grant would expose.
+
+    Recognizes the filesystem root (``/``), root's home (``/root``), and any
+    direct child of a common home parent (see :data:`_HOME_PARENT_DIRS` — e.g.
+    ``/home/alice``, ``/Users/bob``, ``/var/home/carol``). A subdirectory of a
+    home (``/home/alice/proj``) is shareable, as is a ``None``/empty workspace
+    (no recorded cwd).
+
+    Pattern-based on purpose: the runner (and thus the home the session lives
+    in) may be on a different host than this server process, so only the path
+    shape is reliable — resolving the local ``~`` would test the wrong host.
+    """
+    if not workspace:
+        return False
+    path = os.path.normpath(workspace)
+    if path in _BLOCKED_WORKSPACE_ROOTS:
+        return True
+    parent, _, leaf = path.rpartition("/")
+    return bool(leaf) and parent in _HOME_PARENT_DIRS
 
 
 def env_var_is_truthy(name: str, *, default: bool = False) -> bool:

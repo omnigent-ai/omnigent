@@ -16,6 +16,7 @@
 // sessions, and we filter the (tiny, static) action list ourselves so both
 // groups react to the same input.
 
+import type React from "react";
 import { useEffect, useMemo, useState } from "react";
 import {
   InboxIcon,
@@ -59,6 +60,34 @@ interface ActionCommand {
 
 /** Debounce matches the sidebar search (300ms) so keystrokes don't each fetch. */
 const SEARCH_DEBOUNCE_MS = 300;
+
+/** Split `text` on case-insensitive occurrences of `query`, bolding the matches
+    so a search hit is visible in the title / content snippet. Returns the raw
+    text unchanged when the query is empty or doesn't occur (e.g. the snippet
+    matched a stemmed form). */
+function HighlightedText({ text, query }: { text: string; query: string }): React.ReactNode {
+  const q = query.trim();
+  if (!q) return text;
+  // Escape regex metacharacters so a query like "a.b" matches literally.
+  const escaped = q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const parts = text.split(new RegExp(`(${escaped})`, "gi"));
+  const lower = q.toLowerCase();
+  // Non-matches stay raw strings (React needs no key for those); each match is
+  // keyed by its running offset so repeated terms get stable, unique keys
+  // without leaning on the bare array index.
+  let offset = 0;
+  return parts.map((part) => {
+    const at = offset;
+    offset += part.length;
+    return part.toLowerCase() === lower ? (
+      <mark key={at} className="bg-transparent font-semibold text-foreground">
+        {part}
+      </mark>
+    ) : (
+      part
+    );
+  });
+}
 
 /** How many recent sessions to show before the user types, so the Actions
     group stays visible without scrolling. Typing lifts the cap. */
@@ -146,7 +175,7 @@ export function CommandPalette({
 
   const sessions = useMemo(() => {
     const seen = new Set<string>();
-    const out: { id: string; label: string; agent: string }[] = [];
+    const out: { id: string; label: string; agent: string; snippet: string | null }[] = [];
     for (const page of data?.pages ?? []) {
       for (const c of page.data) {
         if (seen.has(c.id)) continue;
@@ -155,6 +184,9 @@ export function CommandPalette({
           id: c.id,
           label: conversationDisplayLabel(c),
           agent: getConversationAgentType(c),
+          // Present only when the match was in chat content (not the title);
+          // the server omits it otherwise. Shown as a dimmed second line.
+          snippet: c.search_snippet ?? null,
         });
       }
     }
@@ -207,9 +239,20 @@ export function CommandPalette({
                     key={s.id}
                     value={s.id}
                     onSelect={() => goToSession(s.id)}
-                    className="pl-6"
+                    className="items-start pl-6"
                   >
-                    <span className="flex-1 truncate text-left">{s.label}</span>
+                    <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+                      <span className="truncate text-left">
+                        <HighlightedText text={s.label} query={debouncedQuery} />
+                      </span>
+                      {s.snippet && (
+                        // Where the match was found in the chat body — the
+                        // session is often unidentifiable from the title alone.
+                        <span className="truncate text-left text-muted-foreground text-xs">
+                          <HighlightedText text={s.snippet} query={debouncedQuery} />
+                        </span>
+                      )}
+                    </div>
                     <span className="ml-2 shrink-0 text-xs text-muted-foreground">{s.agent}</span>
                   </CommandItem>
                 ))}

@@ -25,6 +25,7 @@ from sqlalchemy.exc import IntegrityError
 from omnigent.entities import Policy
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.policies.registry import is_registered_handler, validate_factory_params
+from omnigent.runtime.policies.builder import invalidate_default_policy_specs_cache
 from omnigent.server.auth import AuthProvider
 from omnigent.server.routes._auth_helpers import get_user_id
 from omnigent.server.schemas import (
@@ -145,23 +146,28 @@ def create_default_policies_router(
             already exists.
         """
         user_id = await _require_admin(request, auth_provider, permission_store)
-        if body.type == "python":
-            # Restrict handlers to the registry allowlist.
-            # Admins are not exempt: a custom handler must be added via
-            # the ``policy_modules`` config so it appears in the registry,
-            # rather than being named ad hoc here. This keeps a single
-            # allowlist and blocks arbitrary callable injection.
-            if not is_registered_handler(body.handler):
-                raise OmnigentError(
-                    f"Policy handler '{body.handler}' is not registered. Add the "
-                    f"module that declares it to the server's 'policy_modules' "
-                    f"config so it appears in the policy registry.",
-                    code=ErrorCode.INVALID_INPUT,
-                )
-            # Validate factory_params against the registry schema.
-            validation_error = validate_factory_params(body.handler, body.factory_params)
-            if validation_error:
-                raise OmnigentError(validation_error, code=ErrorCode.INVALID_INPUT)
+        if body.type != "python":
+            raise OmnigentError(
+                f"Default policies only support type='python'; type={body.type!r} "
+                f"cannot be evaluated. URL policy evaluation is a future extension.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        # Restrict handlers to the registry allowlist.
+        # Admins are not exempt: a custom handler must be added via
+        # the ``policy_modules`` config so it appears in the registry,
+        # rather than being named ad hoc here. This keeps a single
+        # allowlist and blocks arbitrary callable injection.
+        if not is_registered_handler(body.handler):
+            raise OmnigentError(
+                f"Policy handler '{body.handler}' is not registered. Add the "
+                f"module that declares it to the server's 'policy_modules' "
+                f"config so it appears in the policy registry.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        # Validate factory_params against the registry schema.
+        validation_error = validate_factory_params(body.handler, body.factory_params)
+        if validation_error:
+            raise OmnigentError(validation_error, code=ErrorCode.INVALID_INPUT)
         policy_id = _generate_default_policy_id()
         try:
             policy = store.create_default(
@@ -177,6 +183,7 @@ def create_default_policies_router(
                 f"Default policy with name '{body.name}' already exists",
                 code=ErrorCode.CONFLICT,
             ) from exc
+        invalidate_default_policy_specs_cache()
         return _entity_to_response(policy)
 
     @router.get("/policies")
@@ -291,6 +298,7 @@ def create_default_policies_router(
             ) from exc
         if policy is None:
             raise OmnigentError("Policy not found", code=ErrorCode.NOT_FOUND)
+        invalidate_default_policy_specs_cache()
         return _entity_to_response(policy)
 
     @router.delete("/policies/{policy_id}")
@@ -313,6 +321,7 @@ def create_default_policies_router(
         """
         await _require_admin(request, auth_provider, permission_store)
         store.delete_default(policy_id)
+        invalidate_default_policy_specs_cache()
         return {"deleted": True}
 
     return router
