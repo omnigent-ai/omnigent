@@ -792,7 +792,7 @@ def test_bundled_agent_launches_with_first_available_credential(
     assert provider.get("default") is True
     # The silent config mutation is announced (mirrors setup / /model).
     assert (
-        "No default Claude credential set — using Anthropic API Key and saving "
+        "No default Claude credential set — using Anthropic Key API Key and saving "
         "it as the default (change anytime with: omnigent /model)." in result.output
     )
     assert "credentials found" not in result.output
@@ -850,7 +850,7 @@ def test_bundled_agent_multiple_credentials_notice_preserves_first_pick(
     assert providers["anthropic_first"].get("default") is True
     assert "default" not in providers["anthropic_second"]
     assert (
-        "No default Claude credential set — using Anthropic API Key "
+        "No default Claude credential set — using Anthropic First API Key "
         "(2 Claude credentials found; pick another with: omnigent /model) "
         "and saving it as the default." in result.output
     )
