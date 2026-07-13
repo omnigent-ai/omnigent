@@ -1149,9 +1149,11 @@ class SqlScheduledTask(Base):
     cron_expression: Mapped[str] = mapped_column(String(255), nullable=False)
     # Session-owner identity: the spawned run's LEVEL_OWNER grant is written
     # for this user. Nullable — None in single-user/OSS mode (the fire path
-    # resolves null to the reserved "local" user in a later PR). Indexed, so
-    # kept at 255 (<= the indexed-string length ceiling) rather than 256.
-    owner_user_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # resolves null to the reserved "local" user in a later PR). String(128) to
+    # match session_permissions.user_id (the column the LEVEL_OWNER grant is
+    # written into) and every other user-identity column in this schema; 128 is
+    # well under the MySQL utf8mb4 indexed-key ceiling.
+    owner_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     # Relates to agents.id. No DB foreign key (Rule R032); cascade is app-owned.
     agent_id: Mapped[str] = mapped_column(String(64), nullable=False)
     # Per-task overrides — None means fall back to the agent default. Widths

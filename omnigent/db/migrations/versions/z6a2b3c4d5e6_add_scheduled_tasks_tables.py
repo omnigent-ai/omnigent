@@ -47,7 +47,7 @@ def upgrade() -> None:
         sa.Column("prompt", sa.LargeBinary(), nullable=False),
         # Recurring trigger: a required cron string (e.g. "0 9 * * *").
         sa.Column("cron_expression", sa.String(255), nullable=False),
-        sa.Column("owner_user_id", sa.String(255), nullable=True),
+        sa.Column("owner_user_id", sa.String(128), nullable=True),
         sa.Column("agent_id", sa.String(64), nullable=False),
         sa.Column("model_override", sa.String(128), nullable=True),
         sa.Column("reasoning_effort", sa.String(32), nullable=True),
