@@ -11581,11 +11581,13 @@ async def _stream_live_events(
     reconcile pre-subscribe state via the snapshot endpoint
     (``GET /v1/sessions/{id}``) and dedupe by item id.
 
-    On client disconnect the subscribe loop breaks; the
-    ``finally`` block emits a ``[DONE]`` sentinel so well-behaved
-    SSE consumers see a clean stream termination. The pub-sub
-    layer auto-cleans this generator's subscriber slot in its own
-    ``finally`` when iteration exits.
+    On client disconnect the subscribe loop breaks; the ``finally`` block
+    emits a ``[DONE]`` sentinel so well-behaved SSE consumers see a clean
+    stream termination. A subscriber-queue overflow instead ends without
+    ``[DONE]`` so clients treat it as a dropped transport, reconnect, and
+    reconcile from the persisted snapshot. The pub-sub layer auto-cleans
+    this generator's subscriber slot in its own ``finally`` when iteration
+    exits.
 
     Each emitted dict is validated against
     :data:`ServerStreamEvent` at the wire boundary so a runtime
@@ -11645,6 +11647,7 @@ async def _stream_live_events(
         presence_token = presence.connect(
             presence_root_id, session_id, viewer_user_id, viewer_idle
         )
+    subscriber_overflowed = False
     try:
         async for event in session_stream.subscribe(
             session_id,
@@ -11667,6 +11670,12 @@ async def _stream_live_events(
                 )
             validated = _SERVER_STREAM_EVENT_ADAPTER.validate_python(event)
             yield _format_sse(event_type, validated.model_dump())
+    except session_stream.SubscriberOverflowError:
+        subscriber_overflowed = True
+        _logger.warning(
+            "session stream subscriber overflowed for %s; closing for snapshot reconnect",
+            session_id,
+        )
     finally:
         # The non-None checks besides presence_token's are type
         # narrowing only: a minted token implies both were set above.
@@ -11676,7 +11685,8 @@ async def _stream_live_events(
             and presence_root_id is not None
         ):
             presence.disconnect(presence_root_id, viewer_user_id, presence_token)
-        yield "data: [DONE]\n\n"
+        if not subscriber_overflowed:
+            yield "data: [DONE]\n\n"
 
 
 # Bounds for per-session native-terminal pass-through args
