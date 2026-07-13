@@ -764,11 +764,18 @@ def test_parse_kubernetes_without_pvc_mounts_is_none(monkeypatch: pytest.MonkeyP
         ([{"claim_name": "c", "mount_path": "mnt/x"}], "absolute"),
         ([{"claim_name": "c", "mount_path": "/mnt/../etc"}], "normalized"),
         ([{"claim_name": "c", "mount_path": "/mnt/x/"}], "normalized"),
+        # Exactly two leading slashes survive posixpath.normpath (POSIX) but
+        # the kernel collapses them, so '//home/omnigent' would shadow HOME.
+        ([{"claim_name": "c", "mount_path": "//home/omnigent"}], "normalized"),
+        ([{"claim_name": "c", "mount_path": "//mnt/x"}], "normalized"),
         ([{"claim_name": "c", "mount_path": "/"}], "reserved"),
         ([{"claim_name": "c", "mount_path": "/home/omnigent/data"}], "reserved"),
         ([{"claim_name": "c", "mount_path": "/var/run/secrets/x"}], "reserved"),
         ([{"claim_name": "c", "mount_path": "/tmp"}], "reserved"),
         ([{"claim_name": "c", "mount_path": "/etc"}], "reserved"),
+        # /opt hosts the image's omnigent venv (/opt/venv).
+        ([{"claim_name": "c", "mount_path": "/opt"}], "reserved"),
+        ([{"claim_name": "c", "mount_path": "/opt/venv"}], "reserved"),
         # read_only must be a boolean, not a truthy string.
         ([{"claim_name": "c", "mount_path": "/mnt/x", "read_only": "yes"}], "boolean"),
         # Duplicates / nesting between entries.

@@ -1806,7 +1806,8 @@ def _parse_kubernetes_resources(raw: dict[str, object]) -> dict[str, object] | N
 
 # Path prefixes a pvc_mounts mount_path may not shadow: the runner's
 # writable-HOME emptyDir (mirrors the launcher's _HOME_DIR — pinned by test),
-# Kubernetes Secret projections, and the image's OS / scratch directories.
+# Kubernetes Secret projections, the image's OS / scratch directories, and
+# /opt (the host image's omnigent venv lives at /opt/venv).
 _KUBERNETES_RESERVED_MOUNT_PREFIXES: tuple[str, ...] = (
     "/home/omnigent",
     "/var/run/secrets",
@@ -1817,6 +1818,7 @@ _KUBERNETES_RESERVED_MOUNT_PREFIXES: tuple[str, ...] = (
     "/sbin",
     "/lib",
     "/lib64",
+    "/opt",
     "/proc",
     "/sys",
     "/dev",
@@ -1868,7 +1870,10 @@ def _parse_kubernetes_pvc_mounts(raw: dict[str, object]) -> list[dict[str, objec
                 f"server config '{path_prefix}.mount_path' must be an absolute "
                 "in-Pod path, e.g. '/mnt/datasets'"
             )
-        if mount != posixpath.normpath(mount):
+        # normpath preserves exactly two leading slashes (POSIX), but the
+        # kernel collapses them at mount time — reject them explicitly so
+        # '//home/omnigent' cannot slip past the reserved-prefix check.
+        if mount.startswith("//") or mount != posixpath.normpath(mount):
             raise ValueError(
                 f"server config '{path_prefix}.mount_path' must be a normalized "
                 f"path (no '..', '.', doubled or trailing slashes): {mount!r}"
