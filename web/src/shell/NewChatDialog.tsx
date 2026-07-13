@@ -2370,9 +2370,23 @@ export function NewChatLandingScreen() {
   }
 
   // Always-visible skill pills for the allowlisted orchestrators, fed by
-  // the same bundled-skills list as the "/" menu.
-  const pillSkills =
-    selectedAgent && SKILL_PILL_AGENTS.has(selectedAgent.name) ? selectedAgent.skills : [];
+  // the same bundled-skills list as the "/" menu. Capped to a few so the row
+  // stays on the composer's first line; the full set is one "/" away. Featured
+  // skills are surfaced first (in this order); any remaining slots fill from
+  // the rest in bundle order, so the cap holds even if a featured skill is
+  // absent from a given agent.
+  const pillSkills = useMemo(() => {
+    if (!selectedAgent || !SKILL_PILL_AGENTS.has(selectedAgent.name)) return [];
+    const MAX_SKILL_PILLS = 4;
+    const featured = ["investigate", "adversarial-implement", "deep-research", "tiered-models"];
+    const rank = (name: string) => {
+      const i = featured.indexOf(name);
+      return i === -1 ? featured.length : i;
+    };
+    return [...selectedAgent.skills]
+      .sort((a, b) => rank(a.name) - rank(b.name))
+      .slice(0, MAX_SKILL_PILLS);
+  }, [selectedAgent]);
 
   // Pills only render over an empty draft, so there's never args to preserve.
   function applySkillPill(name: string) {

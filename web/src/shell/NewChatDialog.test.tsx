@@ -1808,6 +1808,41 @@ describe("NewChatLandingScreen skill pills", () => {
     expect(screen.getByTestId("skill-pill-compare").textContent).toBe("/compare");
   });
 
+  it("caps pills at four, featured skills first, when an agent has many", () => {
+    // Polly carries nine skills; the composer only has room for a few, so it
+    // shows four — the featured ones first — with the rest one "/" away.
+    const pollyAgent = (): AvailableAgent => ({
+      id: "ag_polly",
+      name: "polly",
+      display_name: "Polly",
+      description: "Coding orchestrator",
+      harness: "claude-sdk",
+      skills: [
+        // Deliberately NOT in featured order, to prove the reorder.
+        { name: "adversarial-implement", description: "implement then refute" },
+        { name: "cross-review", description: "verify a diff" },
+        { name: "deep-research", description: "gather, verify, synthesize" },
+        { name: "fanout", description: "parallel tasks" },
+        { name: "fanout-synthesize", description: "parallel + merge" },
+        { name: "investigate", description: "read-only investigation" },
+        { name: "tiered-models", description: "plan strong, implement cheap" },
+        { name: "tournament", description: "pairwise selection" },
+        { name: "triage", description: "classify, dedupe, act" },
+      ],
+    });
+    mockAgents([pollyAgent()]);
+    renderLanding();
+
+    // Exactly the four featured skills, in featured order.
+    for (const name of ["investigate", "adversarial-implement", "deep-research", "tiered-models"]) {
+      expect(screen.getByTestId(`skill-pill-${name}`)).toBeTruthy();
+    }
+    // Non-featured skills are NOT pills (they live in the "/" menu).
+    for (const name of ["cross-review", "fanout", "tournament", "triage", "fanout-synthesize"]) {
+      expect(screen.queryByTestId(`skill-pill-${name}`)).toBeNull();
+    }
+  });
+
   it("hides pills for agents outside the allowlist even when they carry skills", () => {
     // Same skills, non-allowlisted name: no pill row. Fails if the gate
     // ever degrades to "any agent with skills", which would spam the
