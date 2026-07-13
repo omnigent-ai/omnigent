@@ -7570,6 +7570,80 @@ describe("chatStore — policy deny renders once", () => {
       await run({ delta: "[Denied by policy: over budget]", message_id: "deny_abc", index: 0 }),
     ).toBe(1);
   });
+
+  it("keeps the deny visible after its terminal response.completed", async () => {
+    // Full server sequence for an input-phase deny: the sentinel delta (a
+    // `live:` provisional preview), the committed item as
+    // `response.output_item.done` (carrying the persisted itemId), then the
+    // terminal `response.completed`. The terminal sweeps unfinalized `live:`
+    // previews; the commit event upgrades the deny to a durable, itemId-keyed
+    // `text_done` block that survives the sweep (and, being itemId-keyed, a
+    // reconnect and a refresh too). Without it the deny vanished until a
+    // refresh re-hydrated the persisted item.
+    const sentinel = "[Denied by policy: over budget]";
+    // Non-native session: the committed item reconciles via the itemId-stamp
+    // path (not the native-terminal provisional-replace path).
+    useChatStore.setState({
+      conversationId: "conv_deny2",
+      blocks: [],
+      isNativeTerminalSession: false,
+    });
+    const sink = pushableStream();
+    const controller = new AbortController();
+    const manual = manualSched();
+    void pumpStreamEvents(
+      "conv_deny2",
+      sink.stream,
+      controller,
+      setState,
+      getState,
+      manual.scheduler,
+    );
+    sink.push(
+      sse("response.output_text.delta", {
+        delta: sentinel,
+        message_id: "deny_xyz",
+        index: 0,
+      }),
+    );
+    sink.push(
+      sse("response.output_item.done", {
+        item: {
+          id: "msg_deny_1",
+          type: "message",
+          role: "assistant",
+          response_id: "deny_resp_1",
+          content: [{ type: "output_text", text: sentinel }],
+        },
+      }),
+    );
+    sink.push(
+      sse("response.completed", {
+        id: "deny_term",
+        status: "completed",
+        output: [
+          {
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: sentinel }],
+          },
+        ],
+      }),
+    );
+    await tick();
+    manual.fire();
+    await tick();
+    const denyBlocks = useChatStore
+      .getState()
+      .blocks.filter(
+        (b) => b.type === "text_done" && (b as TextDone).fullText.includes("Denied by policy"),
+      );
+    controller.abort();
+    // Exactly one durable deny block survives the terminal sweep, keyed by
+    // the persisted itemId (not a swept `live:` provisional id).
+    expect(denyBlocks).toHaveLength(1);
+    expect(denyBlocks[0]!.ctx.itemId).toBe("msg_deny_1");
+  });
 });
 
 describe("chatStore — client-side message queue", () => {
