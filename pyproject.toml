@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "omnigent"
 # Keep in sync with omnigent/version.py's VERSION constant.
-version = "0.5.0.dev0"
+version = "0.6.0.dev0"
 description = "Omnigent: declarative agent authoring and runtime framework"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -26,8 +26,8 @@ dependencies = [
     # one version, so a published `omnigent==X` must resolve the SDK wheels
     # built alongside it (release-omnigent.yml verifies these pins match the
     # release tag). Local/editable installs still resolve via tool.uv.sources.
-    "omnigent-client==0.5.0.dev0",
-    "omnigent-ui-sdk==0.5.0.dev0",
+    "omnigent-client==0.6.0.dev0",
+    "omnigent-ui-sdk==0.6.0.dev0",
     # Merged from omnigent + omnigent.
     "pyyaml>=6.0,<7",
     "openai>=1.0,<3",
@@ -77,6 +77,10 @@ dependencies = [
     "pyte>=0.8,<1; platform_system != 'Windows'",
     "pydantic>=2.0,<3",
     "sqlalchemy>=2.0,<3",
+    # Client-side compression for opaque text columns (omnigent/db/compression.py),
+    # so per-conversation JSON/text is stored uniformly compressed across SQLite,
+    # PostgreSQL, and MySQL rather than depending on each backend's storage engine.
+    "zstandard>=0.22,<1",
     "tiktoken>=0.7,<1",
     "opentelemetry-exporter-otlp-proto-grpc>=1.20,<2",
     "opentelemetry-exporter-otlp-proto-http>=1.20,<2",
@@ -168,18 +172,26 @@ copilot = ["github-copilot-sdk>=1,<2"]
 # cursor` users need this extra (`omnigent[cursor]`). Was a baseline dependency;
 # now opt-in to keep the default install lean.
 cursor = ["cursor-sdk>=0.1.7"]
+# Hindsight long-term memory built-in tools (hindsight_retain / _recall /
+# _reflect). The tools import the client lazily, so only users who enable a
+# Hindsight memory tool need this extra.
+memory = ["hindsight-client>=0.4.0"]
 databricks = [
     # Floor matches what core code was tested against when the SDK was a
     # default dependency (it moved here from `dependencies` above).
     "databricks-sdk>=0.56.0,<1",
     "opentelemetry-distro>=0,<1",
     "psycopg[binary]>=3.1,<4",
+    "pymysql>=1.1,<2",
     # Databricks-specific MCP servers. Not imported by core Omnigent
     # code, so it is opt-in here rather than a default dependency.
     "databricks-mcp>=0.1.0",
 ]
 dev = [
     "pytest>=7.0",
+    # hindsight-client is opt-in (the `memory` extra), but the Hindsight
+    # memory tool tests import + mock it, so keep it in the dev set.
+    "hindsight-client>=0.4.0",
     "pytest-asyncio>=0.21",
     "pytest-xdist>=3.6",
     # Line coverage during the unit-test matrix. Each CI shard writes its
@@ -532,6 +544,12 @@ ignore_missing_imports = true
 # posture as modal above.
 [[tool.mypy.overrides]]
 module = "daytona.*"
+ignore_missing_imports = true
+
+# hindsight-client is an optional dep (the `memory` extra); the memory
+# built-in tools import it lazily so the base install never needs it.
+[[tool.mypy.overrides]]
+module = "hindsight_client.*"
 ignore_missing_imports = true
 
 # cwsandbox is an optional dep (the `cwsandbox` extra); same lazy-import

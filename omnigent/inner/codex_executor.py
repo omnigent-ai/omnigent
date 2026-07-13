@@ -796,6 +796,7 @@ def _databricks_codex_config_overrides(
     return [
         f"model={json.dumps(model)}",
         f'model_provider="{provider_name}"',
+        "model_supports_reasoning_summaries=true",
         (
             "model_providers.omnigent_databricks="
             '{name="Omnigent Databricks",'
@@ -1471,12 +1472,18 @@ class _CodexAppServerSession:
         # ``TurnStartParams`` has no ``effort`` field, so an ``effort`` set on
         # ``turn/start`` is silently dropped by serde and never takes effect.
         # ``ThreadSettingsUpdateParams`` is where ``model``/``effort`` live —
-        # the same path the TUI ``/model`` picker uses. Deduped against the
+        # the same path the TUI ``/model`` picker uses. Request a detailed
+        # summary too; effort controls internal work, while summary controls
+        # whether observable reasoning events are emitted. Deduped against the
         # last value applied on this thread to avoid a redundant per-turn RPC.
         if reasoning_effort and reasoning_effort != self._applied_effort:
             await self._request(
                 "thread/settings/update",
-                {"threadId": self.thread_id, "effort": reasoning_effort},
+                {
+                    "threadId": self.thread_id,
+                    "effort": reasoning_effort,
+                    "summary": "detailed",
+                },
             )
             self._applied_effort = reasoning_effort
         turn_params: CodexParams = {

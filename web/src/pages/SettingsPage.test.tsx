@@ -6,6 +6,7 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ReactNode } from "react";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 
@@ -59,6 +60,33 @@ vi.mock("@/pages/MembersPage", () => ({
 vi.mock("@/pages/PoliciesPage", () => ({
   PoliciesPage: () => <div>policies-page-stub</div>,
 }));
+// Radix Select uses a portal + pointer events jsdom can't drive, so stub it to
+// a native <select>; lets the color-theme dropdown be exercised via change.
+vi.mock("@/components/ui/select", () => ({
+  Select: ({
+    value,
+    onValueChange,
+    children,
+  }: {
+    value: string;
+    onValueChange: (v: string) => void;
+    children: ReactNode;
+  }) => (
+    <select
+      data-testid="color-theme-select"
+      value={value}
+      onChange={(e) => onValueChange(e.target.value)}
+    >
+      {children}
+    </select>
+  ),
+  SelectTrigger: ({ children }: { children: ReactNode }) => <>{children}</>,
+  SelectValue: () => null,
+  SelectContent: ({ children }: { children: ReactNode }) => <>{children}</>,
+  SelectItem: ({ value, children }: { value: string; children: ReactNode }) => (
+    <option value={value}>{children}</option>
+  ),
+}));
 
 import { SettingsPage } from "./SettingsPage";
 
@@ -101,6 +129,9 @@ afterEach(() => {
   // don't leak persisted state or the --ui-font-scale variable into each other.
   localStorage.clear();
   document.documentElement.style.removeProperty("--ui-font-scale");
+  // The palette picker sets data-theme on <html>; clear it so a palette
+  // selected in one test doesn't leak into the next.
+  document.documentElement.removeAttribute("data-theme");
 });
 
 describe("SettingsPage", () => {
@@ -111,6 +142,66 @@ describe("SettingsPage", () => {
     expect(screen.getByTestId("theme-system")).toHaveAttribute("aria-checked", "true");
     fireEvent.click(screen.getByTestId("theme-dark"));
     expect(mocks.setTheme).toHaveBeenCalledWith("dark");
+  });
+
+  it("renders the Terminal theme radiogroup with auto selected by default", () => {
+    renderPage("/settings/appearance");
+    expect(screen.getByRole("radiogroup", { name: "Terminal theme" })).toBeInTheDocument();
+    expect(screen.getByTestId("terminal-theme-auto")).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByTestId("terminal-theme-light")).toHaveAttribute("aria-checked", "false");
+    expect(screen.getByTestId("terminal-theme-dark")).toHaveAttribute("aria-checked", "false");
+    expect(localStorage.getItem("omnigent:terminal-theme")).toBeNull();
+  });
+
+  it("persists dark and light terminal theme choices on card click", () => {
+    renderPage("/settings/appearance");
+
+    fireEvent.click(screen.getByTestId("terminal-theme-dark"));
+    expect(localStorage.getItem("omnigent:terminal-theme")).toBe("dark");
+    expect(screen.getByTestId("terminal-theme-dark")).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByTestId("terminal-theme-auto")).toHaveAttribute("aria-checked", "false");
+
+    fireEvent.click(screen.getByTestId("terminal-theme-light"));
+    expect(localStorage.getItem("omnigent:terminal-theme")).toBe("light");
+    expect(screen.getByTestId("terminal-theme-light")).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByTestId("terminal-theme-dark")).toHaveAttribute("aria-checked", "false");
+  });
+
+  it("reflects a stored light terminal theme on mount", () => {
+    localStorage.setItem("omnigent:terminal-theme", "light");
+    renderPage("/settings/appearance");
+    expect(screen.getByTestId("terminal-theme-light")).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByTestId("terminal-theme-auto")).toHaveAttribute("aria-checked", "false");
+  });
+
+  it("renders the color theme dropdown, defaults to Omnigent, and applies a palette on change", () => {
+    localStorage.clear();
+    renderPage("/settings/appearance");
+
+    const select = screen.getByTestId("color-theme-select") as HTMLSelectElement;
+    // Nothing stored → the default (Omnigent) palette is selected and no
+    // data-theme override is applied to the document.
+    expect(select.value).toBe("omni");
+    expect(document.documentElement.getAttribute("data-theme")).toBeNull();
+
+    // Choosing a palette applies it live to <html> and persists it.
+    fireEvent.change(select, { target: { value: "github" } });
+    expect(select.value).toBe("github");
+    expect(document.documentElement.getAttribute("data-theme")).toBe("github");
+    expect(localStorage.getItem("omnigent:ui-theme-palette")).toBe(JSON.stringify("github"));
+  });
+
+  it("moves the mode selection with arrow keys (radiogroup keyboard nav)", () => {
+    renderPage("/settings/appearance");
+
+    // Arrow keys move within the mode radiogroup and select as focus moves (the
+    // WAI-ARIA radiogroup pattern). themeCards order is System / Light / Dark,
+    // so ArrowRight from System selects Light.
+    const system = screen.getByTestId("theme-system");
+    system.focus();
+    fireEvent.keyDown(system, { key: "ArrowRight" });
+
+    expect(mocks.setTheme).toHaveBeenCalledWith("light");
   });
 
   it("shows the default UI font size and steps it up, persisting the choice", () => {
@@ -227,6 +318,91 @@ describe("SettingsPage", () => {
     expect(localStorage.getItem("omnigent:ui-font-size")).toBe("15");
   });
 
+  it("shows the default code font size and steps it up, persisting the choice", () => {
+    localStorage.clear();
+    renderPage("/settings/appearance");
+    const input = screen.getByTestId("code-font-size-input") as HTMLInputElement;
+    // No stored preference → 13px default (code widgets read a touch smaller
+    // than the 16px chrome default).
+    expect(input.value).toBe("13");
+
+    fireEvent.click(screen.getByTestId("code-font-size-inc"));
+    expect(input.value).toBe("14");
+    // Persisted under the code-font key (distinct from the chrome font's) so it
+    // survives a refresh. There's no --ui-font-scale here — the pref reaches the
+    // editor/terminal imperatively, not via a CSS variable.
+    expect(localStorage.getItem("omnigent:code-font-size")).toBe("14");
+  });
+
+  it("disables the code font steppers at the min and max bounds", () => {
+    localStorage.setItem("omnigent:code-font-size", "24");
+    renderPage("/settings/appearance");
+    // At the 24px max, only the increase button is disabled.
+    expect(screen.getByTestId("code-font-size-inc")).toBeDisabled();
+    expect(screen.getByTestId("code-font-size-dec")).not.toBeDisabled();
+
+    cleanup();
+    localStorage.setItem("omnigent:code-font-size", "10");
+    renderPage("/settings/appearance");
+    // At the 10px min, only the decrease button is disabled.
+    expect(screen.getByTestId("code-font-size-dec")).toBeDisabled();
+    expect(screen.getByTestId("code-font-size-inc")).not.toBeDisabled();
+  });
+
+  it("lets you clear and retype the code font size, clamping below-min on blur", () => {
+    localStorage.setItem("omnigent:code-font-size", "13");
+    renderPage("/settings/appearance");
+    const input = screen.getByTestId("code-font-size-input") as HTMLInputElement;
+    expect(input.value).toBe("13");
+
+    // Backspacing to "1" is below the 10px min: the box SHOWS "1" (free editing)
+    // without snapping or persisting the transient value.
+    fireEvent.change(input, { target: { value: "1" } });
+    expect(input.value).toBe("1");
+    expect(localStorage.getItem("omnigent:code-font-size")).toBe("13");
+
+    // Finishing to a valid size applies + persists it.
+    fireEvent.change(input, { target: { value: "20" } });
+    expect(input.value).toBe("20");
+    expect(localStorage.getItem("omnigent:code-font-size")).toBe("20");
+
+    // A still-out-of-range draft clamps to the minimum on blur.
+    fireEvent.change(input, { target: { value: "2" } });
+    fireEvent.blur(input);
+    expect(input.value).toBe("10");
+    expect(localStorage.getItem("omnigent:code-font-size")).toBe("10");
+  });
+
+  it("shows the empty code font family default and applies + persists a typed name", () => {
+    localStorage.clear();
+    renderPage("/settings/appearance");
+    const input = screen.getByTestId("code-font-family-input") as HTMLInputElement;
+    // No stored preference → empty input, editor-default placeholder.
+    expect(input.value).toBe("");
+    expect(input.placeholder).toBe("Editor default");
+    // Reset has nothing to do at the default.
+    expect(screen.getByTestId("code-font-family-reset")).toBeDisabled();
+
+    fireEvent.change(input, { target: { value: "Fira Code" } });
+    expect(input.value).toBe("Fira Code");
+    // The choice is persisted under the code-font family key so it survives a refresh.
+    expect(localStorage.getItem("omnigent:code-font-family")).toBe(JSON.stringify("Fira Code"));
+    expect(screen.getByTestId("code-font-family-reset")).not.toBeDisabled();
+  });
+
+  it("reset restores the default code font family", () => {
+    localStorage.setItem("omnigent:code-font-family", JSON.stringify("JetBrains Mono"));
+    renderPage("/settings/appearance");
+    const input = screen.getByTestId("code-font-family-input") as HTMLInputElement;
+    // The control reflects the stored preference on mount.
+    expect(input.value).toBe("JetBrains Mono");
+
+    fireEvent.click(screen.getByTestId("code-font-family-reset"));
+    // Reset clears the field and the stored key.
+    expect(input.value).toBe("");
+    expect(localStorage.getItem("omnigent:code-font-family")).toBeNull();
+  });
+
   it("defaults bare /settings to Account when a login session exists, else Appearance", async () => {
     // Login session (accounts OR OIDC) → Account leads, so /settings lands on it.
     renderPage("/settings");
@@ -296,6 +472,39 @@ describe("SettingsPage", () => {
     await waitFor(() => expect(screen.getByText("alice")).toBeInTheDocument());
     expect(screen.queryByRole("link", { name: /Members/ })).toBeNull();
     expect(screen.queryByRole("link", { name: /Policies/ })).toBeNull();
+  });
+
+  it("shows an empty default base branch by default and persists a typed value", () => {
+    localStorage.clear();
+    renderPage("/settings/git");
+    expect(screen.getByRole("heading", { name: "Git" })).toBeInTheDocument();
+    const input = screen.getByTestId("settings-default-base-branch-input") as HTMLInputElement;
+    // Nothing stored → blank field, so the composer won't auto-fill.
+    expect(input.value).toBe("");
+
+    fireEvent.change(input, { target: { value: "main" } });
+    expect(input.value).toBe("main");
+    // The choice persists so the composer can read it on the next new branch.
+    expect(localStorage.getItem("omnigent:default-base-branch")).toBe("main");
+  });
+
+  it("reflects a stored default base branch on mount", () => {
+    localStorage.setItem("omnigent:default-base-branch", "develop");
+    renderPage("/settings/git");
+    const input = screen.getByTestId("settings-default-base-branch-input") as HTMLInputElement;
+    expect(input.value).toBe("develop");
+  });
+
+  it("clears the default base branch preference when emptied", () => {
+    localStorage.setItem("omnigent:default-base-branch", "main");
+    renderPage("/settings/git");
+    const input = screen.getByTestId("settings-default-base-branch-input") as HTMLInputElement;
+    expect(input.value).toBe("main");
+
+    // Emptying the field turns auto-fill off — the key is removed, not stored blank.
+    fireEvent.change(input, { target: { value: "" } });
+    expect(input.value).toBe("");
+    expect(localStorage.getItem("omnigent:default-base-branch")).toBeNull();
   });
 
   it("lists archived sessions and unarchives on click", () => {

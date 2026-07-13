@@ -51,6 +51,7 @@ vi.mock("next-themes", () => ({ useTheme: () => ({ resolvedTheme: "light" }) }))
 vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn(() => true) }));
 
 import { MonacoDiffViewer } from "./MonacoDiffViewer";
+import { codeFontFamilyForEditor, writeCodeFontSizePx } from "@/lib/codeFontPreferences";
 
 function renderDiff(props: {
   before: string | null;
@@ -80,6 +81,9 @@ beforeEach(() => {
 });
 afterEach(() => {
   cleanup();
+  // writeCodeFontSizePx (live-apply test) persists to localStorage; clear it so
+  // other suites start from the code-font default.
+  localStorage.clear();
 });
 
 describe("MonacoDiffViewer", () => {
@@ -139,5 +143,34 @@ describe("MonacoDiffViewer", () => {
     expect(h.commentOptions?.mounted).toBe(true);
     // CRLF "after" → model EOL set to CRLF (1) so comment offsets stay aligned.
     expect(setEOL).toHaveBeenCalledWith(1);
+  });
+
+  it("re-fonts the mounted diff editor when the code-font preference changes", async () => {
+    const updateOptions = vi.fn();
+    const fakeModified = { getModel: () => ({ setEOL: vi.fn() }) };
+    const fakeDiff = { getModifiedEditor: () => fakeModified, updateOptions };
+    renderDiff({ before: "a", after: "b", layout: "split" });
+    await waitFor(() => expect(h.onMount).not.toBeNull());
+
+    // Mount wires diffEditorRef → our fake diff editor.
+    act(() => {
+      h.onMount?.(
+        fakeDiff as unknown as Parameters<DiffOnMount>[0],
+        {
+          editor: { EndOfLineSequence: { LF: 0, CRLF: 1 } },
+        } as unknown as Parameters<DiffOnMount>[1],
+      );
+    });
+
+    // A Settings change emits through the code-font pub/sub; the mounted diff
+    // editor re-fonts in place via updateOptions (both panes) — the imperative
+    // path a fixed-pixel Monaco widget needs, vs the chrome font's CSS variable.
+    act(() => {
+      writeCodeFontSizePx(20);
+    });
+    expect(updateOptions).toHaveBeenCalledWith({
+      fontSize: 20,
+      fontFamily: codeFontFamilyForEditor(""),
+    });
   });
 });

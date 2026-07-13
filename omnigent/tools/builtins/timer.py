@@ -4,32 +4,38 @@ LLM-callable timer builtins.
 Two tools:
 
 - :class:`SysTimerSetTool` (``sys_timer_set``) — schedules a timer
-  that fires inbox notifications at a future timestamp.
+  that fires a notification after a delay.
 - :class:`SysTimerCancelTool` (``sys_timer_cancel``) — cancels a
   previously scheduled timer by ``timer_id``.
 
 Both tools are gated on the agent spec's top-level ``timers:`` flag
-(see :attr:`AgentSpec.timers`, defaulting to ``False`` to match the
-inner stack). On the sessions-native path the timer workflow has
-not yet been re-implemented on the runner; ``sys_timer_set`` raises
-``NotImplementedError`` and ``sys_timer_cancel`` always returns
-``status="not_found"``.
+(see :attr:`AgentSpec.timers`, defaulting to ``False``).
+
+These classes own the LLM-facing schema and argument validation.
+The firing itself runs in the runner: ``execute_tool`` intercepts
+``sys_timer_set`` / ``sys_timer_cancel`` and dispatches to
+:func:`omnigent.runner.tool_dispatch._execute_timer_set` /
+``_execute_timer_cancel``, which run the sleep-and-wake loop and own
+the per-session timer registry. The shared :func:`validate_timer_set_args`
+helper keeps both surfaces rejecting the same inputs.
 
 The tools are **synchronous** (``is_async() == False``): the LLM
-gets the ``timer_id`` directly so it can later cancel by ID. The
-firing (when implemented) arrives as a ``[System: timer X fired]``
-system message in the conversation, with ``kind="timer"`` so the
-parent's end-of-turn auto-collect (which consults
-:data:`_DRAIN_KINDS`) does NOT block on pending firings.
+gets the ``timer_id`` back immediately so it can later cancel by ID.
+A firing arrives as a hidden ``[System: timer X fired]`` meta message
+that wakes the session on the normal ingest path.
 
-See ``designs/SERVER_HARNESS_CONTRACT.md`` §Timers and step 10.
+Invoked in-process (off the runner dispatch path) these tools have no
+timer registry to schedule or cancel against, so ``invoke`` validates
+its arguments and then reports that no timer was scheduled or found
+rather than raising.
+
+See ``designs/SERVER_HARNESS_CONTRACT.md`` §Timers.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import uuid
 from typing import Any
 
 from omnigent.tools.base import Tool, ToolContext
@@ -46,21 +52,52 @@ _logger = logging.getLogger(__name__)
 _MAX_TIMER_SECONDS = 1_000_000.0
 
 
+def validate_timer_set_args(
+    args: dict[str, Any],
+) -> tuple[float, bool, str | None] | str:
+    """
+    Validate parsed ``sys_timer_set`` arguments.
+
+    Shared by :meth:`SysTimerSetTool.invoke` and the runner's
+    ``_execute_timer_set`` so both surfaces reject the same inputs with
+    identical messages and honor one delay ceiling.
+
+    :param args: JSON-decoded argument mapping, e.g.
+        ``{"seconds": 5, "repeat": False, "note": "x"}``.
+    :returns: ``(seconds, repeat, note)`` when valid, otherwise an error
+        message naming the first invalid field, e.g.
+        ``"seconds must be a number"``.
+    """
+    seconds_raw = args.get("seconds")
+    # Reject bool explicitly: ``isinstance(True, int)`` is True, so a bare
+    # int/float check would silently coerce ``True`` to ``1.0``.
+    if not isinstance(seconds_raw, (int, float)) or isinstance(seconds_raw, bool):
+        return "seconds must be a number"
+    seconds = float(seconds_raw)
+    if seconds < 0:
+        return "seconds must be non-negative"
+    if seconds > _MAX_TIMER_SECONDS:
+        return f"seconds must be <= {_MAX_TIMER_SECONDS}"
+    repeat = args.get("repeat", False)
+    if not isinstance(repeat, bool):
+        return "repeat must be a boolean"
+    note = args.get("note")
+    if note is not None and not isinstance(note, str):
+        return "note must be a string"
+    return seconds, repeat, note
+
+
 class SysTimerSetTool(Tool):
     """
-    Schedule a timer that fires inbox notifications.
+    Schedule a timer that fires a notification after a delay.
 
     The LLM passes ``seconds`` (delay), optional ``repeat`` (default
-    ``False``), and optional ``note`` (string echoed back in each
-    firing). The tool generates a fresh ``timer_id`` of the form
-    ``"timer_<32-char hex>"``, starts a
-    the runner-side timer task pinned to that id via
-    :class:`SetWorkflowID`, and returns the id immediately.
-
-    Firings arrive later in the conversation as ``[System: timer X
-    fired]`` system messages between iterations (the existing
-    ``async_work_complete`` drain path). Repeating timers continue
-    until ``sys_timer_cancel`` is called.
+    ``False``), and optional ``note`` (echoed back in each firing). On
+    the runner dispatch path the timer is assigned a fresh ``timer_id``
+    of the form ``"timer_<32-char hex>"`` and the id is returned
+    immediately; the firing arrives later as a hidden ``[System: timer X
+    fired]`` meta message that wakes the session. Repeating timers
+    continue until ``sys_timer_cancel`` is called.
     """
 
     @classmethod
@@ -133,105 +170,58 @@ class SysTimerSetTool(Tool):
 
     def invoke(self, arguments: str, ctx: ToolContext) -> str:
         """
-        Generate a ``timer_id``, start the
-        the runner-side timer task, return the id to the LLM.
+        Validate arguments; report that the in-process path scheduled
+        no timer.
+
+        The firing loop runs in the runner, which intercepts
+        ``sys_timer_set`` before this builtin is reached. When
+        ``invoke`` does run (off the runner dispatch path) there is no
+        timer registry to schedule against, so it validates its input
+        for a consistent error surface and then returns a structured
+        error instead of falsely reporting success.
 
         :param arguments: JSON-encoded args, e.g.
             ``'{"seconds": 5, "repeat": false, "note": "x"}'``.
-        :param ctx: Provides ``ctx.conversation_id`` — the
-            conversation the workflow appends firing messages to.
-            Required; the tool fails loud when it's ``None``.
-        :returns: JSON string ``{"timer_id", "status": "scheduled",
-            "seconds", "repeat", "note"}`` on success, or
-            ``{"error": "..."}`` on validation failure.
+        :param ctx: Provides ``ctx.conversation_id`` — required so the
+            argument contract matches the runner path.
+        :returns: JSON string ``{"error": "..."}`` — either a validation
+            failure or a note that no timer was scheduled.
         """
         try:
             args = json.loads(arguments) if arguments else {}
         except json.JSONDecodeError as exc:
             return json.dumps({"error": f"invalid arguments: {exc}"})
 
-        seconds_raw = args.get("seconds")
-        if not isinstance(seconds_raw, (int, float)) or isinstance(seconds_raw, bool):
-            # Reject bool explicitly because Python's ``isinstance(True, int)``
-            # is True; allowing it would silently coerce ``True`` to 1.0.
-            return json.dumps({"error": "seconds must be a number"})
-        seconds = float(seconds_raw)
-        if seconds < 0:
-            return json.dumps({"error": "seconds must be non-negative"})
-        if seconds > _MAX_TIMER_SECONDS:
-            return json.dumps({"error": f"seconds must be <= {_MAX_TIMER_SECONDS}"})
-
-        repeat_raw = args.get("repeat", False)
-        if not isinstance(repeat_raw, bool):
-            return json.dumps({"error": "repeat must be a boolean"})
-        repeat = bool(repeat_raw)
-
-        note_raw = args.get("note")
-        if note_raw is not None and not isinstance(note_raw, str):
-            return json.dumps({"error": "note must be a string"})
-        note: str | None = note_raw
+        validated = validate_timer_set_args(args)
+        if isinstance(validated, str):
+            return json.dumps({"error": validated})
 
         if ctx.conversation_id is None:
-            # Fail loud — the timer workflow needs a stable
-            # destination to append firing messages to.
+            # Match the runner contract: a timer needs a destination
+            # conversation to fire into.
             return json.dumps({"error": "sys_timer_set requires a conversation context"})
-
-        timer_id = f"timer_{uuid.uuid4().hex}"
-        _spawn_timer_workflow(
-            timer_id=timer_id,
-            conversation_id=ctx.conversation_id,
-            seconds=seconds,
-            repeat=repeat,
-            note=note,
-        )
 
         return json.dumps(
             {
-                "timer_id": timer_id,
-                "status": "scheduled",
-                "seconds": seconds,
-                "repeat": repeat,
-                "note": note,
+                "error": (
+                    "sys_timer_set is executed by the runner dispatch path; this "
+                    "in-process call cannot schedule a timer, so none was started."
+                )
             }
         )
-
-
-def _spawn_timer_workflow(
-    *,
-    timer_id: str,
-    conversation_id: str,
-    seconds: float,
-    repeat: bool,
-    note: str | None,
-) -> None:
-    """
-    Stub entry point — raises ``NotImplementedError`` until the
-    runner provides a timer implementation.
-
-    :param timer_id: The workflow id the timer would have been
-        pinned to (the value the LLM uses with ``sys_timer_cancel``).
-    :param conversation_id: Conversation the timer would append
-        firings to.
-    :param seconds: Sleep duration before each firing.
-    :param repeat: Whether the timer loops indefinitely.
-    :param note: Optional caller-supplied note echoed in firings.
-    """
-    del timer_id, conversation_id, seconds, repeat, note
-    raise NotImplementedError(
-        "sys_timer_set is unavailable on the sessions-native path; "
-        "the runner does not yet provide a timer implementation."
-    )
 
 
 class SysTimerCancelTool(Tool):
     """
     Cancel a scheduled timer by ``timer_id``.
 
-    On the sessions-native path no active timer can exist (the
-    timer workflow has not been re-implemented on the runner), so
-    this always returns ``status="not_found"``. Matches the
-    inner-stack semantics where a timer that already fired and
-    cleaned up is indistinguishable from one that never existed.
+    Cancellation is executed by the runner, which intercepts
+    ``sys_timer_cancel`` and drops the timer from its per-session
+    registry. When this builtin runs in-process (off the runner
+    dispatch path) there is no registry to consult, so a valid
+    ``timer_id`` reports ``status="not_found"`` — a timer that already
+    fired and cleaned up is indistinguishable from one that never
+    existed.
     """
 
     @classmethod
@@ -280,14 +270,18 @@ class SysTimerCancelTool(Tool):
 
     def invoke(self, arguments: str, ctx: ToolContext) -> str:
         """
-        Cancel the timer (always ``not_found`` on sessions-native).
+        Report cancellation for a ``timer_id`` (in-process fallback).
+
+        The runner owns the timer registry and intercepts this tool
+        before the builtin is reached; this in-process path has no
+        registry, so a valid id reports ``not_found``.
 
         :param arguments: JSON-encoded args, e.g.
             ``'{"timer_id": "timer_..."}'``.
         :param ctx: Tool context (unused; cancellation is keyed on
             ``timer_id`` alone).
-        :returns: JSON string
-            ``{"timer_id", "status": "not_found"}``.
+        :returns: JSON string ``{"timer_id", "status": "not_found"}``,
+            or ``{"error": "..."}`` for invalid input.
         """
         del ctx  # The tool doesn't need any per-invocation context.
         try:
@@ -299,5 +293,5 @@ class SysTimerCancelTool(Tool):
         if not isinstance(timer_id, str) or not timer_id:
             return json.dumps({"error": "timer_id is required"})
 
-        # No active timer can exist on the sessions-native path.
+        # No timer registry exists on the in-process path.
         return json.dumps({"timer_id": timer_id, "status": "not_found"})

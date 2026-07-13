@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import sys
 import time
+from collections.abc import Generator
 from pathlib import Path
 
 import pytest
@@ -335,29 +336,148 @@ def _isolate_codex_native_state(
     monkeypatch.setenv("OMNIGENT_CODEX_NATIVE_STATE_DIR", str(state_dir))
 
 
-@pytest.fixture()
-def db_uri(tmp_path: Path) -> str:
-    """
-    Return a test database URI backed by a file in tmp_path.
+@pytest.fixture(scope="session", autouse=True)
+def cleanup_snapshot_failures(pytestconfig: pytest.Config) -> Generator[None, None, None]:
+    """Give every xdist worker its own snapshot-failures directory.
 
-    Uses get_or_create_engine() which runs Alembic migrations on first
-    engine creation — same path as production. File-based (not in-memory)
-    because DBOS needs a real file to create its system tables. Cleaned
-    up after each test.
+    The pytest-playwright-visual-snapshot plugin ships a session-scoped
+    autouse fixture of this same name that ``rmtree``s then ``mkdir``s a
+    single static path (``playwright_visual_snapshot_failures_path``) at
+    session start. That fixture runs in *every* pytest session — including
+    the non-visual unit shards — and under ``-n`` all workers target the one
+    path: the rmtree/mkdir sequence is non-atomic, so one worker's
+    ``mkdir(exist_ok=True)`` re-raises ``FileExistsError`` when another
+    worker deletes the dir in the window between them, and that fixture error
+    cascades to every test on the worker. This override (a conftest fixture
+    shadows the plugin fixture of the same name for the whole ``tests/`` tree)
+    keys the leaf off ``PYTEST_XDIST_WORKER`` so no two workers ever touch the
+    same directory — the race is gone by construction, with no retries or
+    sleeps. The shared parent is only ever created (never deleted), so the
+    plugin's delete-then-create-the-same-dir window cannot recur.
 
-    :param tmp_path: pytest tmp_path fixture (per-test temp dir).
-    :returns: a ``sqlite:///…`` URI string.
+    Without xdist (the serial ``ui-snapshot.yml`` visual gate) the worker id
+    is unset and the base path is used unchanged, so the committed snapshot
+    layout and the CI artifact upload are unaffected.
     """
-    db_path = tmp_path / "test.db"
-    uri = f"sqlite:///{db_path}"
-    # Creates the engine AND runs migrations (once, cached).
+    import shutil
+
+    from pytest_playwright_visual_snapshot.plugin import SnapshotPaths, _get_option
+
+    root_dir = Path(pytestconfig.rootdir)  # type: ignore[arg-type]
+
+    SnapshotPaths.snapshots_path = Path(
+        _get_option(pytestconfig, "playwright_visual_snapshots_path", cast=str)
+        or (root_dir / "__snapshots__")
+    )
+
+    base_failures_path = Path(
+        _get_option(pytestconfig, "playwright_visual_snapshot_failures_path", cast=str)
+        or (root_dir / "snapshot_failures")
+    )
+    # Per-worker leaf under xdist; the base path itself when run serially
+    # (master process / no xdist), keeping non-xdist output identical.
+    worker = os.environ.get("PYTEST_XDIST_WORKER")
+    failures_path = base_failures_path / worker if worker else base_failures_path
+    SnapshotPaths.failures_path = failures_path
+
+    # Only this worker's own leaf is ever removed, so the rmtree/mkdir pair is
+    # uncontended; parents=True only creates the shared parent, never deletes it.
+    shutil.rmtree(failures_path, ignore_errors=True)
+    failures_path.mkdir(parents=True, exist_ok=True)
+
+    yield
+
+
+@pytest.fixture(scope="session")
+def _worker_db_uri() -> Generator[str, None, None]:
+    """
+    Session-scoped database URI — one DB per xdist worker, migrated once.
+
+    When ``OMNIGENT_TEST_DB_URI`` is set, creates one database per worker
+    (``omnigent_test_w0``, ``omnigent_test_w1``, …), runs Alembic migrations
+    exactly once per worker session, then tears the database down at the end.
+    This avoids migrating hundreds of times — one migration run per worker
+    instead of one per test.
+
+    For SQLite nothing is created here; ``db_uri`` handles per-test files.
+    """
+    import re
+
+    import sqlalchemy as _sa
+
+    base_uri = os.environ.get("OMNIGENT_TEST_DB_URI", "")
+    if not base_uri:
+        yield ""
+        return
+
+    worker = os.environ.get("PYTEST_XDIST_WORKER", "w0")
+    db_name = f"omnigent_test_{worker}"
+    uri = re.sub(r"/[^/]*(\?.*)?$", f"/{db_name}", base_uri)
+
+    root_engine = _sa.create_engine(base_uri, isolation_level="AUTOCOMMIT")
+    dialect = root_engine.dialect.name
+    with root_engine.connect() as conn:
+        if dialect == "mysql":
+            conn.execute(
+                _sa.text(
+                    f"CREATE DATABASE IF NOT EXISTS `{db_name}` "
+                    "CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+                )
+            )
+        else:
+            conn.execute(_sa.text(f'DROP DATABASE IF EXISTS "{db_name}"'))
+            conn.execute(_sa.text(f'CREATE DATABASE "{db_name}"'))
+    root_engine.dispose()
+
     engine = get_or_create_engine(uri)
-
     yield uri
 
     with _engine_lock:
         _engine_cache.pop(uri, None)
     engine.dispose()
+
+    root_engine2 = _sa.create_engine(base_uri, isolation_level="AUTOCOMMIT")
+    with root_engine2.connect() as conn:
+        if dialect == "mysql":
+            conn.execute(_sa.text(f"DROP DATABASE IF EXISTS `{db_name}`"))
+        else:
+            conn.execute(_sa.text(f'DROP DATABASE IF EXISTS "{db_name}" WITH (FORCE)'))
+    root_engine2.dispose()
+
+
+@pytest.fixture()
+def db_uri(tmp_path: Path, _worker_db_uri: str) -> Generator[str, None, None]:
+    """
+    Per-test database URI.
+
+    * **SQLite** (default): fresh file per test, fully isolated.
+    * **Postgres / MySQL** (``OMNIGENT_TEST_DB_URI`` set): reuses the
+      session-scoped worker database and truncates all non-alembic tables
+      between tests so each test starts clean without re-migrating.
+    """
+    import sqlalchemy as _sa
+
+    if not _worker_db_uri:
+        # SQLite: per-test file.
+        db_path = tmp_path / "test.db"
+        uri = f"sqlite:///{db_path}"
+        engine = get_or_create_engine(uri)
+        yield uri
+        with _engine_lock:
+            _engine_cache.pop(uri, None)
+        engine.dispose()
+        return
+
+    engine = get_or_create_engine(_worker_db_uri)
+    dialect = engine.dialect.name
+    tables = [t for t in _sa.inspect(engine).get_table_names() if t != "alembic_version"]
+    # No FK constraints exist (dropped in p1a2b3c4d5e6) so no need to toggle
+    # FOREIGN_KEY_CHECKS — one less round-trip per test on MySQL.
+    with engine.begin() as conn:
+        for table in tables:
+            q = f"`{table}`" if dialect == "mysql" else f'"{table}"'
+            conn.execute(_sa.text(f"TRUNCATE TABLE {q}"))
+    yield _worker_db_uri
 
 
 @pytest.fixture()

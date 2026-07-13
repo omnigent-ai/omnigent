@@ -185,6 +185,55 @@ describe("PoliciesPage actions", () => {
     expect(deleteMutate).toHaveBeenCalledWith("p1", expect.anything());
   });
 
+  it("adds array (multi-select) values via the model combobox as a coerced list", async () => {
+    // WHY: the expensive_models-style array param renders the single-input
+    // combobox; picking options and typing a free-form value must survive the
+    // comma-joined form state and coerce to a list[str] on submit — guarding
+    // the checkbox→combobox refactor against a regression.
+    vi.mocked(policies.usePolicyRegistry).mockReturnValue({
+      data: [
+        {
+          handler: "omnigent.policies.budget",
+          kind: "factory",
+          name: "Budget Guard",
+          description: "blocks expensive models",
+          params_schema: {
+            properties: {
+              expensive_models: {
+                type: "array",
+                items: { type: "string", enum: ["opus", "sonnet", "haiku"] },
+              },
+            },
+            required: [],
+          },
+        },
+      ],
+    } as never);
+    renderPage();
+    await screen.findByText(/No global policies configured/);
+
+    fireEvent.click(screen.getByRole("button", { name: /Add policy/ }));
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.click(within(dialog).getByText("Budget Guard"));
+
+    const combo = within(dialog).getByPlaceholderText("Select or type a value…");
+    fireEvent.focus(combo);
+    fireEvent.mouseDown(within(dialog).getByRole("button", { name: "opus" }));
+    fireEvent.mouseDown(within(dialog).getByRole("button", { name: "haiku" }));
+    // Free-form typed value still works (Enter commits).
+    fireEvent.change(combo, { target: { value: "custom-tier" } });
+    fireEvent.keyDown(combo, { key: "Enter" });
+
+    fireEvent.click(within(dialog).getByRole("button", { name: /^Add$/ }));
+
+    expect(addMutate).toHaveBeenCalledTimes(1);
+    const payload = addMutate.mock.calls[0][0];
+    expect(payload.handler).toBe("omnigent.policies.budget");
+    expect(payload.factory_params).toEqual({
+      expensive_models: ["opus", "haiku", "custom-tier"],
+    });
+  });
+
   it("adds a global policy from the registry via the Add dialog", async () => {
     vi.mocked(policies.usePolicyRegistry).mockReturnValue({
       data: [
@@ -209,6 +258,64 @@ describe("PoliciesPage actions", () => {
       { name: "block_canada", type: "python", handler: "omnigent.policies.block_canada" },
       expect.anything(),
     );
+  });
+
+  it("Cancel steps back to the policy list after a policy is selected", async () => {
+    // WHY: once a policy is selected the dialog shows its config; Cancel must
+    // return to the list so the user can pick a different policy (not close).
+    vi.mocked(policies.usePolicyRegistry).mockReturnValue({
+      data: [
+        {
+          handler: "omnigent.policies.block_canada",
+          kind: "callable",
+          name: "Block Canada",
+          description: "Deny anything mentioning Canada.",
+          params_schema: null,
+        },
+        {
+          handler: "omnigent.policies.rate_limit",
+          kind: "callable",
+          name: "Rate Limit",
+          description: "Cap request rate.",
+          params_schema: null,
+        },
+      ],
+    } as never);
+    renderPage();
+    await screen.findByText(/No global policies configured/);
+
+    fireEvent.click(screen.getByRole("button", { name: /Add policy/ }));
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.click(within(dialog).getByText("Block Canada"));
+    expect(within(dialog).queryByPlaceholderText("Filter policies...")).toBeNull();
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+
+    expect(within(dialog).getByPlaceholderText("Filter policies...")).toBeInTheDocument();
+    expect(within(dialog).getByText("Block Canada")).toBeInTheDocument();
+    expect(within(dialog).getByText("Rate Limit")).toBeInTheDocument();
+    expect(addMutate).not.toHaveBeenCalled();
+  });
+
+  it("Cancel from the policy list closes the dialog", async () => {
+    vi.mocked(policies.usePolicyRegistry).mockReturnValue({
+      data: [
+        {
+          handler: "omnigent.policies.block_canada",
+          kind: "callable",
+          name: "Block Canada",
+          description: "Deny anything mentioning Canada.",
+          params_schema: null,
+        },
+      ],
+    } as never);
+    renderPage();
+    await screen.findByText(/No global policies configured/);
+
+    fireEvent.click(screen.getByRole("button", { name: /Add policy/ }));
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
   });
 });
 

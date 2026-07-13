@@ -33,7 +33,6 @@ vi.mock("@/lib/agentLabels", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/lib/agentLabels")>()),
   useBrainHarnessLabels: () => ({
     "claude-sdk": "Claude SDK",
-    "openai-agents": "OpenAI Agents SDK",
     codex: "Codex",
     cursor: "Cursor",
     pi: "Pi",
@@ -43,7 +42,8 @@ vi.mock("@/lib/agentLabels", async (importOriginal) => ({
 }));
 import type { ElicitationBlock } from "@/lib/blocks";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { Composer } from "./ChatPage";
+import { Composer, shouldQueueSend } from "./ChatPage";
+import type { QueuedMessage } from "@/store/chatStore";
 import { SlashCommandMenu } from "@/components/SlashCommandMenu";
 
 // These tests pin the slash-command suggestions menu UX in the composer:
@@ -528,6 +528,9 @@ describe("AgentPicker trigger label", () => {
       selectedModel: null,
       selectedEffort: null,
       llmModel: null,
+      // Reset the per-session override too: a test that sets it must not leak
+      // into the next, which now reads sessionModelOverride first for the label.
+      sessionModelOverride: null,
       codexModelOptions: [],
       nativeVendorOwnsModel: false,
     });
@@ -558,6 +561,46 @@ describe("AgentPicker trigger label", () => {
     // Model black, effort grey.
     expect(within(trigger).getByText("Opus")).toHaveClass("text-foreground");
     expect(within(trigger).getByText("High")).toHaveClass("text-muted-foreground");
+  });
+
+  it("prefers a claude session override over the cross-session sticky model", () => {
+    useChatStore.setState({
+      selectedModel: "opus",
+      sessionModelOverride: "sonnet",
+      selectedEffort: null,
+      llmModel: "haiku",
+    });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          agents: [{ id: "a1", name: "claude" }],
+          selectedAgentId: "a1",
+          modelPickerKind: "claude",
+          showModels: true,
+          showEffort: false,
+        })}
+      />,
+    );
+
+    const trigger = screen.getByTestId("agent-picker-trigger");
+    expect(trigger).toHaveTextContent("Sonnet 4.6");
+    expect(trigger).not.toHaveTextContent("Opus");
+
+    // Open the picker via the bare-"/model" intercept — a synthetic click on the
+    // Radix trigger doesn't open the menu under jsdom, so the rows never mount.
+    fireEvent.change(textarea(), { target: { value: "/model " } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+
+    const sonnetRow = document.querySelector<HTMLElement>(
+      '[data-testid="model-picker-item"][data-model-id="sonnet"]',
+    );
+    const opusRow = document.querySelector<HTMLElement>(
+      '[data-testid="model-picker-item"][data-model-id="opus"]',
+    );
+    // The applied session override ("sonnet") is the active row, not the
+    // cross-session sticky ("opus").
+    expect(sonnetRow).toHaveAttribute("data-active", "true");
+    expect(opusRow).not.toHaveAttribute("data-active", "true");
   });
 
   it("still renders an enabled trigger when the model/effort label is unresolved", () => {
@@ -1221,5 +1264,37 @@ describe("Composer — queued-message flush gating", () => {
     await waitFor(() => expect(sendSpy).toHaveBeenCalledTimes(1));
     expect(sendSpy.mock.calls[0]!.slice(0, 2)).toEqual(["held", "agent_xyz"]);
     expect(useChatStore.getState().queuedMessages).toHaveLength(0);
+  });
+});
+
+describe("shouldQueueSend", () => {
+  const q = (conversationId: string): QueuedMessage => ({
+    queueId: `q_${conversationId}`,
+    text: "queued",
+    conversationId,
+  });
+
+  it("sends directly (no queue) for a brand-new chat with no conversation", () => {
+    expect(shouldQueueSend(null, "streaming", "running", [])).toBe(false);
+  });
+
+  it("queues while the session is busy (streaming or running/waiting)", () => {
+    expect(shouldQueueSend("conv_a", "streaming", "idle", [])).toBe(true);
+    expect(shouldQueueSend("conv_a", "idle", "running", [])).toBe(true);
+    expect(shouldQueueSend("conv_a", "idle", "waiting", [])).toBe(true);
+  });
+
+  it("sends directly when idle and nothing is queued for this conversation", () => {
+    expect(shouldQueueSend("conv_a", "idle", "idle", [])).toBe(false);
+  });
+
+  it("queues when idle but this conversation already has a queued message", () => {
+    // The ordering fix: an idle flicker must not let a later send overtake the
+    // still-queued earlier one.
+    expect(shouldQueueSend("conv_a", "idle", "idle", [q("conv_a")])).toBe(true);
+  });
+
+  it("ignores queued messages belonging to a different conversation", () => {
+    expect(shouldQueueSend("conv_a", "idle", "idle", [q("conv_b")])).toBe(false);
   });
 });

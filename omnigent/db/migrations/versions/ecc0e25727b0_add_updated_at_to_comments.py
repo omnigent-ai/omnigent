@@ -39,9 +39,13 @@ def upgrade() -> None:
     op.add_column("comments", sa.Column("updated_at", sa.BigInteger(), nullable=True))
     # CAST first: created_at is int4 on PostgreSQL and int4 * int4 stays
     # int4, so epoch-seconds * 1e6 overflows on any table with rows.
+    # MySQL uses SIGNED instead of BIGINT in CAST(); PostgreSQL/SQLite use BIGINT.
+    cast_type = "SIGNED" if op.get_bind().dialect.name == "mysql" else "BIGINT"
     op.execute(
-        "UPDATE comments SET updated_at = CAST(created_at AS BIGINT) * 1000000 "
-        "WHERE updated_at IS NULL"
+        sa.text(
+            f"UPDATE comments SET updated_at = CAST(created_at AS {cast_type}) * 1000000 "
+            f"WHERE updated_at IS NULL"
+        )
     )
     with op.batch_alter_table("comments") as batch_op:
         batch_op.alter_column("updated_at", existing_type=sa.BigInteger(), nullable=False)

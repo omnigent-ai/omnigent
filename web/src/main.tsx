@@ -21,6 +21,7 @@ import {
   readUiFontFamily,
   readUiFontSizePx,
 } from "./lib/uiFontPreferences";
+import { applyThemePalette, readThemePalette } from "./lib/themePalette";
 import { initChatStore } from "./store/chatStore";
 import "./index.css";
 
@@ -59,6 +60,10 @@ initNativeInsets();
 applyUiFontScale(readUiFontSizePx());
 applyUiFontFamily(readUiFontFamily());
 
+// Apply the saved color palette (data-theme on <html>) before first paint too,
+// so the app renders in the chosen theme rather than flashing the brand default.
+applyThemePalette(readThemePalette());
+
 // Probe /v1/info BEFORE the first render so the route table knows
 // whether to mount accounts routes. The probe is unauthed and the
 // failure path resolves to "accounts off" — so even a stalled or
@@ -77,6 +82,8 @@ const _bootProbe: Promise<ServerInfo> = Promise.race([
           databricks_features: false,
           managed_sandboxes_enabled: false,
           sandbox_provider: null,
+          sharing_mode: "on",
+          public_sharing_enabled: true,
           server_version: null,
           smart_routing_enabled: false,
         }),

@@ -1084,22 +1084,12 @@ Request body matches `SessionForkRequest`:
     source's full native transcript. When null or omitted, the full
     history is copied.
 
-  model_override (string | null, optional)
-    Model id to launch the fork on ("restart with model"), e.g.
-    "databricks-gpt-5-4-mini". Overrides the model the fork would
-    otherwise inherit from the source; the value is validated and
-    family-checked against the fork's harness (a cross-family id —
-    e.g. a Claude model on a codex fork — is rejected with 400).
-    When null or omitted, the fork keeps the source's model (within
-    the same provider family).
-
 201 Created — body matches `SessionResponse` (status "idle",
   items are the deep-copied items from the source session).
 
 400 Bad Request — source session is a sub-agent session, has
-  no agent binding, up_to_response_id names no response in
-  the source session, or model_override is invalid / not in the
-  fork harness's provider family
+  no agent binding, or up_to_response_id names no response in
+  the source session
 404 Not Found — no session with that source_id, or the source's
   agent row is missing
 ```

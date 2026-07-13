@@ -27,7 +27,7 @@ on:
   pull_request_target:
     types: [labeled]
   workflow_run:
-    workflows: [PR Template, CI, Lint, E2E UI Tests, E2E Tests, Integration Tests]
+    workflows: [PR Template, CI, Lint, Docker build, E2E UI Tests, E2E Tests, Integration Tests]
     types: [completed]
   issue_comment:
     types: [created]

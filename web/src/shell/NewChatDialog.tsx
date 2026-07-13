@@ -62,7 +62,13 @@ import { WorkspacePicker, isNavigablePath } from "./WorkspacePicker";
 import { getCliServerUrl } from "@/lib/host";
 import { getOmnigentHostConfig } from "@/lib/host";
 import { readLastAgentId, writeLastAgentId } from "@/lib/agentPreferences";
+import {
+  readLastHostChoice,
+  writeLastHostChoice,
+  SANDBOX_HOST_CHOICE,
+} from "@/lib/hostPreferences";
 import { readLastHarness, writeLastHarness } from "@/lib/harnessPreferences";
+import { readDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 import { readHarnessOptions, writeHarnessOption } from "@/lib/modePreferences";
 import { useBrainHarnessLabels } from "@/lib/agentLabels";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
@@ -1686,7 +1692,6 @@ type LandingDraft = {
   sandboxRepoBranch: string;
   workspace: string;
   branchName: string;
-  baseBranch: string;
   prefilledBranch: string;
   permissionMode: string;
   approvalMode: string;
@@ -1714,7 +1719,7 @@ export function NewChatLandingScreen() {
   const serverUrl = getCliServerUrl();
   const { data: agents } = useAvailableAgents();
   const brainHarnessLabels = useBrainHarnessLabels();
-  const { data: hosts } = useHosts();
+  const { data: hosts, isLoading: hostsLoading } = useHosts();
   // Sessions the caller can access, to warn when a new session would share a
   // working directory with a live one (see the conflict tooltip below).
   const { data: directorySessions } = useDirectorySessions(true);
@@ -1854,7 +1859,17 @@ export function NewChatLandingScreen() {
   );
   const [workspace, setWorkspace] = useState<string>(() => landingDraft?.workspace ?? "");
   const [branchName, setBranchName] = useState<string>(() => landingDraft?.branchName ?? "");
-  const [baseBranch, setBaseBranch] = useState<string>(() => landingDraft?.baseBranch ?? "");
+  // The base branch auto-fills from the configured default (Settings › Git)
+  // when the user names a worktree branch, and is left alone once the user
+  // touches it — clearing the branch name re-arms the auto-fill (see the effect
+  // below). `baseBranchEdited` tracks that hand-off; any edit (including
+  // clearing the field) sets it so a later re-seed won't clobber the choice.
+  const [baseBranch, _setBaseBranch] = useState<string>("");
+  const [baseBranchEdited, setBaseBranchEdited] = useState<boolean>(false);
+  const setBaseBranch = useCallback((next: string) => {
+    _setBaseBranch(next);
+    setBaseBranchEdited(true);
+  }, []);
   // Branch prefilled from the existing worktree the current workspace points
   // at. When `branchName` still equals this, the session starts directly in
   // that worktree (no git opts). Editing the field away from it means the user
@@ -1956,7 +1971,6 @@ export function NewChatLandingScreen() {
     sandboxRepoBranch,
     workspace,
     branchName,
-    baseBranch,
     prefilledBranch,
     permissionMode,
     approvalMode,
@@ -2006,21 +2020,53 @@ export function NewChatLandingScreen() {
     };
   }, []);
 
-  // Auto-select the FIRST AVAILABLE option, mirroring the menu order, so
-  // a session can be started without an explicit pick: the sandbox when
-  // the server supports it (it's pinned first in the picker), else the
-  // first online host. Only fills an empty slot; explicit choices are
-  // never overridden.
+  // Auto-select an option so a session can be started without an explicit
+  // pick. Prefer the user's last explicit choice (persisted across visits);
+  // otherwise fall back to the FIRST AVAILABLE option in menu order — the
+  // sandbox when the server supports it (it's pinned first in the picker),
+  // else the first online host. Only fills an empty slot; an explicit choice
+  // already in state (or restored from the in-memory draft) is never
+  // overridden.
   useEffect(() => {
     if (sandboxSelected) return;
     if (selectedHostId !== null) return;
+
+    // Read the persisted pick once, as a mount-time seed — deliberately NOT a
+    // dependency: it only matters until the slot is filled, and re-running on
+    // its value would fight an explicit in-session selection.
+    const lastChoice = readLastHostChoice();
+    if (lastChoice === SANDBOX_HOST_CHOICE) {
+      // Wait for the server-info probe before acting on a sandbox pick: until
+      // it resolves we don't know whether the sandbox is offered, and falling
+      // through to a connected host would strand the returning sandbox user
+      // (this effect wouldn't re-run to correct it once a host is set).
+      if (info === "loading") return;
+      if (managedSandboxesEnabled) {
+        setSandboxSelected(true);
+        return;
+      }
+      // Sandbox no longer offered (e.g. an OSS server) — fall through.
+    } else if (lastChoice) {
+      // A persisted host pick can only be honored once the host list has
+      // loaded and shows it online. Wait for the load rather than defaulting
+      // past it — defaulting to the sandbox here would set sandboxSelected and
+      // this effect would then never re-run to restore the host.
+      if (hostsLoading) return;
+      const stored = (hosts ?? []).find((h) => h.host_id === lastChoice && h.status === "online");
+      if (stored) {
+        setSelectedHostId(stored.host_id);
+        return;
+      }
+      // Stored host is gone or offline — fall through to the default.
+    }
+
     if (managedSandboxesEnabled) {
       setSandboxSelected(true);
       return;
     }
     const firstOnline = (hosts ?? []).find((h) => h.status === "online");
     if (firstOnline) setSelectedHostId(firstOnline.host_id);
-  }, [hosts, selectedHostId, sandboxSelected, managedSandboxesEnabled]);
+  }, [hosts, hostsLoading, selectedHostId, sandboxSelected, managedSandboxesEnabled, info]);
 
   // Fall back to the host's home directory when it has no recorded recents, so
   // the working-directory field is pre-filled and the user can send in one
@@ -2230,6 +2276,22 @@ export function NewChatLandingScreen() {
   // A new, isolated worktree is created only when a branch is named and the
   // workspace isn't already sitting on that existing worktree.
   const shouldCreateWorktree = branchName.trim() !== "" && !startInExistingWorktree;
+  // Auto-fill the base branch from the configured default (Settings › Git) when
+  // a new-worktree branch is named, but only until the user touches the base
+  // field — then their choice (including a cleared field) stands. Clearing the
+  // branch name (so the base field goes away) re-arms the auto-fill, so naming
+  // a branch again starts fresh from the current default.
+  useEffect(() => {
+    if (!shouldCreateWorktree) {
+      // No base field shown: reset so the next named branch re-seeds cleanly.
+      setBaseBranchEdited(false);
+      _setBaseBranch("");
+      return;
+    }
+    if (!baseBranchEdited) {
+      _setBaseBranch(readDefaultBaseBranch() ?? "");
+    }
+  }, [shouldCreateWorktree, baseBranchEdited]);
   // The branch input doubles as a combobox: focusing it reveals existing
   // worktrees, and what the user types filters them (match on branch or path
   // substring, case-insensitive). Typing a name that matches none = a new
@@ -2475,6 +2537,10 @@ export function NewChatLandingScreen() {
   };
 
   function selectHost(hostId: string) {
+    // Persist the explicit pick even when it matches the current selection, so
+    // clicking the auto-selected host still records it as the sticky default
+    // for the next visit.
+    writeLastHostChoice(hostId);
     // Re-selecting the current host is a no-op. Clearing the workspace here
     // would empty the field for good: the seeding effect's deps (host id,
     // recents, derived home) are all unchanged on a same-host pick, so it
@@ -2491,6 +2557,10 @@ export function NewChatLandingScreen() {
   }
 
   function selectSandbox() {
+    // Persist the explicit sandbox pick (as the reserved sentinel) even when
+    // it's already selected, mirroring selectHost — so the sandbox becomes the
+    // sticky default for the next visit.
+    writeLastHostChoice(SANDBOX_HOST_CHOICE);
     if (sandboxSelected) return;
     // Mirror selectHost: a managed session's host and workspace are both
     // server-chosen, so clear any prior host pick and its workspace.
@@ -2557,9 +2627,14 @@ export function NewChatLandingScreen() {
         // Launch the runner on the selected host. The multipart create
         // only stores DB rows — launchRunner binds + starts the runner.
         if (!sandboxSelected && selectedHostId && workspaceTrimmed) {
+          // Create a new worktree, bind an existing one (records the branch
+          // for the sidebar + delete flow without creating anything), or
+          // neither — mirrored on the `git` block.
           const gitOpts = shouldCreateWorktree
             ? { branchName: trimmedBranch, baseBranch: baseBranch.trim() || undefined }
-            : undefined;
+            : startInExistingWorktree
+              ? { branchName: trimmedBranch, existingWorktree: true }
+              : undefined;
           await launchRunner(selectedHostId, data.id, workspaceTrimmed, gitOpts);
         }
         // Clear pending agent after successful creation.
@@ -2579,9 +2654,14 @@ export function NewChatLandingScreen() {
               : {
                   host_id: selectedHostId,
                   workspace: workspaceTrimmed,
+                  // Create a new worktree, or bind an existing one
+                  // (`existing_worktree` records the branch for the sidebar +
+                  // delete flow without creating anything), or neither.
                   git: shouldCreateWorktree
                     ? { branch_name: trimmedBranch, base_branch: baseBranch.trim() || undefined }
-                    : undefined,
+                    : startInExistingWorktree
+                      ? { branch_name: trimmedBranch, existing_worktree: true }
+                      : undefined,
                 }),
             // Native terminal agents open terminal-first: `omnigent.ui:
             // terminal` tells the UI to render the terminal wrapper, and
@@ -3162,6 +3242,7 @@ export function NewChatLandingScreen() {
                     <DropdownMenuItem
                       key={host.host_id}
                       onSelect={() => selectHost(host.host_id)}
+                      data-testid={`new-chat-landing-host-${host.host_id}`}
                       data-active={host.host_id === selectedHostId ? "true" : undefined}
                       className="text-xs data-[active=true]:bg-accent/60"
                     >

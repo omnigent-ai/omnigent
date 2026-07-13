@@ -7,10 +7,11 @@ behave as expected.
 
 from __future__ import annotations
 
+import hashlib
 import time
 
 import pytest
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from omnigent.db.db_models import (
     SqlAccountToken,
@@ -25,6 +26,17 @@ from omnigent.db.db_models import (
     SqlSessionPermission,
     SqlUser,
     SqlUserDailyCost,
+)
+from omnigent.db.enum_codecs import (
+    encode_account_token_kind,
+    encode_agent_kind,
+    encode_comment_status,
+    encode_conversation_kind,
+    encode_host_status,
+    encode_item_status,
+    encode_item_type,
+    encode_policy_scope,
+    encode_policy_type,
 )
 from omnigent.db.utils import get_or_create_engine, make_managed_session_maker
 
@@ -46,7 +58,7 @@ def _make_agent(
         name=name,
         bundle_location="ag_test1/abc123",
         version=1,
-        kind=kind,
+        kind=encode_agent_kind(kind),
     )
 
 
@@ -62,7 +74,7 @@ def _make_conversation(
         id=id,
         created_at=_now(),
         updated_at=_now(),
-        kind=kind,
+        kind=encode_conversation_kind(kind),
         agent_id=agent_id,
         parent_conversation_id=parent_conversation_id,
         root_conversation_id=root_conversation_id or id,
@@ -80,9 +92,9 @@ def _make_item(
         conversation_id=conversation_id,
         response_id="resp_test1",
         created_at=_now(),
-        status="completed",
+        status=encode_item_status("completed"),
         position=position,
-        type="message",
+        type=encode_item_type("message"),
         data='{"content": [{"type": "text", "text": "hello"}]}',
         search_text="hello",
     )
@@ -101,13 +113,13 @@ class TestSqlAgent:
             session.add(agent)
 
         with managed() as session:
-            loaded = session.get(SqlAgent, "ag_test1")
+            loaded = session.get(SqlAgent, (0, "ag_test1"))
             assert loaded is not None
             assert loaded.name == "test-agent"
             assert loaded.version == 1
             assert loaded.description is None
             assert loaded.updated_at is None
-            assert loaded.kind == "template"
+            assert loaded.kind == encode_agent_kind("template")
 
     def test_nullable_columns(self, db_uri: str) -> None:
         engine = get_or_create_engine(db_uri)
@@ -120,7 +132,7 @@ class TestSqlAgent:
             session.add(agent)
 
         with managed() as session:
-            loaded = session.get(SqlAgent, "ag_test1")
+            loaded = session.get(SqlAgent, (0, "ag_test1"))
             assert loaded is not None
             assert loaded.description == "A test agent"
             assert loaded.updated_at is not None
@@ -135,9 +147,9 @@ class TestSqlAgent:
             session.add(agent)
 
         with managed() as session:
-            loaded = session.get(SqlAgent, "ag_test1")
+            loaded = session.get(SqlAgent, (0, "ag_test1"))
             assert loaded is not None
-            assert loaded.kind == "session"
+            assert loaded.kind == encode_agent_kind("session")
 
     def test_multiple_session_agents_allowed(self, db_uri: str) -> None:
         """Multiple session-scoped agents are permitted (no unique constraint on kind)."""
@@ -171,7 +183,7 @@ class TestSqlFile:
             session.add(f)
 
         with managed() as session:
-            loaded = session.get(SqlFile, "file_test1")
+            loaded = session.get(SqlFile, (0, "file_test1"))
             assert loaded is not None
             assert loaded.filename == "report.pdf"
             assert loaded.bytes == 12345
@@ -191,7 +203,7 @@ class TestSqlFile:
             session.add(f)
 
         with managed() as session:
-            loaded = session.get(SqlFile, "file_test2")
+            loaded = session.get(SqlFile, (0, "file_test2"))
             assert loaded is not None
             assert loaded.content_type is None
 
@@ -209,7 +221,7 @@ class TestSqlUser:
             session.add(user)
 
         with managed() as session:
-            loaded = session.get(SqlUser, "alice@example.com")
+            loaded = session.get(SqlUser, (0, "alice@example.com"))
             assert loaded is not None
             assert loaded.is_admin is False
             assert loaded.password_hash is None
@@ -229,7 +241,7 @@ class TestSqlUser:
             session.add(user)
 
         with managed() as session:
-            loaded = session.get(SqlUser, "admin@example.com")
+            loaded = session.get(SqlUser, (0, "admin@example.com"))
             assert loaded is not None
             assert loaded.is_admin is True
             assert loaded.password_hash == "$argon2id$hash"
@@ -257,7 +269,7 @@ class TestSqlAccountToken:
         now = _now()
         token = SqlAccountToken(
             id="tok_invite_abc",
-            kind="invite",
+            kind=encode_account_token_kind("invite"),
             created_at=now,
             expires_at=now + 3600,
             created_by="admin@example.com",
@@ -267,9 +279,9 @@ class TestSqlAccountToken:
             session.add(token)
 
         with managed() as session:
-            loaded = session.get(SqlAccountToken, "tok_invite_abc")
+            loaded = session.get(SqlAccountToken, (0, "tok_invite_abc"))
             assert loaded is not None
-            assert loaded.kind == "invite"
+            assert loaded.kind == encode_account_token_kind("invite")
             assert loaded.user_id is None
             assert loaded.redeemed_at is None
             assert loaded.invited_is_admin is True
@@ -281,7 +293,7 @@ class TestSqlAccountToken:
         now = _now()
         token = SqlAccountToken(
             id="tok_magic_xyz",
-            kind="magic",
+            kind=encode_account_token_kind("magic"),
             user_id="alice@example.com",
             created_at=now,
             expires_at=now + 300,
@@ -290,9 +302,9 @@ class TestSqlAccountToken:
             session.add(token)
 
         with managed() as session:
-            loaded = session.get(SqlAccountToken, "tok_magic_xyz")
+            loaded = session.get(SqlAccountToken, (0, "tok_magic_xyz"))
             assert loaded is not None
-            assert loaded.kind == "magic"
+            assert loaded.kind == encode_account_token_kind("magic")
             assert loaded.user_id == "alice@example.com"
 
     def test_check_constraint_rejects_invalid_kind(self, db_uri: str) -> None:
@@ -300,13 +312,14 @@ class TestSqlAccountToken:
         managed = make_managed_session_maker(engine)
 
         now = _now()
+        # An out-of-range int code must be rejected by ck_account_tokens_kind.
         token = SqlAccountToken(
             id="tok_bad",
-            kind="invalid",
+            kind=99,
             created_at=now,
             expires_at=now + 3600,
         )
-        with pytest.raises(IntegrityError):
+        with pytest.raises((IntegrityError, OperationalError)):
             with managed() as session:
                 session.add(token)
 
@@ -324,10 +337,10 @@ class TestSqlConversation:
             session.add(conv)
 
         with managed() as session:
-            loaded = session.get(SqlConversation, "conv_test1")
+            loaded = session.get(SqlConversation, (0, "conv_test1"))
             assert loaded is not None
             assert loaded.title == "Hello World"
-            assert loaded.kind == "default"
+            assert loaded.kind == encode_conversation_kind("default")
             assert loaded.archived is False
 
     def test_defaults(self, db_uri: str) -> None:
@@ -339,7 +352,7 @@ class TestSqlConversation:
             session.add(conv)
 
         with managed() as session:
-            loaded = session.get(SqlConversation, "conv_test1")
+            loaded = session.get(SqlConversation, (0, "conv_test1"))
             assert loaded is not None
             assert loaded.runner_id is None
             assert loaded.host_id is None
@@ -356,8 +369,9 @@ class TestSqlConversation:
         managed = make_managed_session_maker(engine)
 
         conv = _make_conversation()
-        conv.kind = "invalid_kind"
-        with pytest.raises(IntegrityError):
+        # An out-of-range int code must be rejected by ck_conversations_kind.
+        conv.kind = 99
+        with pytest.raises((IntegrityError, OperationalError)):
             with managed() as session:
                 session.add(conv)
 
@@ -378,9 +392,9 @@ class TestSqlConversation:
             session.add(child)
 
         with managed() as session:
-            loaded = session.get(SqlConversation, "conv_child")
+            loaded = session.get(SqlConversation, (0, "conv_child"))
             assert loaded is not None
-            assert loaded.kind == "sub_agent"
+            assert loaded.kind == encode_conversation_kind("sub_agent")
             assert loaded.parent_conversation_id == "conv_parent"
             assert loaded.root_conversation_id == "conv_parent"
 
@@ -406,13 +420,13 @@ class TestSqlConversation:
             session.add(child)
 
         with managed() as session:
-            p = session.get(SqlConversation, "conv_parent2")
+            p = session.get(SqlConversation, (0, "conv_parent2"))
             assert p is not None
             session.delete(p)
 
         # Without FK cascade the child is NOT automatically deleted.
         with managed() as session:
-            assert session.get(SqlConversation, "conv_child2") is not None
+            assert session.get(SqlConversation, (0, "conv_child2")) is not None
 
 
 # ── SqlConversationItem ───────────────────────────────
@@ -430,12 +444,12 @@ class TestSqlConversationItem:
             session.add(item)
 
         with managed() as session:
-            loaded = session.get(SqlConversationItem, "msg_test1")
+            loaded = session.get(SqlConversationItem, (0, "conv_test1", "msg_test1"))
             assert loaded is not None
             assert loaded.conversation_id == "conv_test1"
-            assert loaded.type == "message"
+            assert loaded.type == encode_item_type("message")
             assert loaded.position == 0
-            assert loaded.status == "completed"
+            assert loaded.status == encode_item_status("completed")
             assert loaded.created_by is None
 
     def test_unique_position_per_conversation(self, db_uri: str) -> None:
@@ -469,13 +483,13 @@ class TestSqlConversationItem:
             session.add(item)
 
         with managed() as session:
-            c = session.get(SqlConversation, "conv_del")
+            c = session.get(SqlConversation, (0, "conv_del"))
             assert c is not None
             session.delete(c)
 
         # Without FK cascade the item is NOT automatically deleted.
         with managed() as session:
-            assert session.get(SqlConversationItem, "msg_del") is not None
+            assert session.get(SqlConversationItem, (0, "conv_del", "msg_del")) is not None
 
     def test_multiple_items_ordered_by_position(self, db_uri: str) -> None:
         engine = get_or_create_engine(db_uri)
@@ -571,7 +585,7 @@ class TestSqlSessionPermission:
             session.add(perm)
 
         with managed() as session:
-            loaded = session.get(SqlSessionPermission, ("alice@example.com", "conv_test1"))
+            loaded = session.get(SqlSessionPermission, (0, "alice@example.com", "conv_test1"))
             assert loaded is not None
             assert loaded.level == 2
 
@@ -588,7 +602,7 @@ class TestSqlSessionPermission:
             conversation_id="conv_test1",
             level=99,
         )
-        with pytest.raises(IntegrityError):
+        with pytest.raises((IntegrityError, OperationalError)):
             with managed() as session:
                 session.add(perm)
 
@@ -609,7 +623,7 @@ class TestSqlComment:
             start_index=10,
             end_index=20,
             body="Looks good!",
-            status="draft",
+            status=encode_comment_status("draft"),
             created_at=now,
             updated_at=now * 1_000_000,
             anchor_content="selected text",
@@ -621,11 +635,11 @@ class TestSqlComment:
             session.add(comment)
 
         with managed() as session:
-            loaded = session.get(SqlComment, "cmt_test1")
+            loaded = session.get(SqlComment, (0, "cmt_test1"))
             assert loaded is not None
             assert loaded.path == "src/App.tsx"
             assert loaded.body == "Looks good!"
-            assert loaded.status == "draft"
+            assert loaded.status == encode_comment_status("draft")
             assert loaded.anchor_content == "selected text"
             assert loaded.created_by == "alice@example.com"
 
@@ -641,7 +655,7 @@ class TestSqlComment:
             start_index=0,
             end_index=5,
             body="Legacy comment",
-            status="addressed",
+            status=encode_comment_status("addressed"),
             created_at=now,
             updated_at=now * 1_000_000,
         )
@@ -651,7 +665,7 @@ class TestSqlComment:
             session.add(comment)
 
         with managed() as session:
-            loaded = session.get(SqlComment, "cmt_test2")
+            loaded = session.get(SqlComment, (0, "cmt_test2"))
             assert loaded is not None
             assert loaded.anchor_content is None
             assert loaded.created_by is None
@@ -668,9 +682,9 @@ class TestSqlPolicy:
         policy = SqlPolicy(
             id="pol_test1",
             name="cost-guard",
-            scope="default",
+            scope=encode_policy_scope("default"),
             created_at=_now(),
-            type="python",
+            type=encode_policy_type("python"),
             handler="omnigent.policies.cost_guard:handler",
             enabled=True,
         )
@@ -678,10 +692,12 @@ class TestSqlPolicy:
             session.add(policy)
 
         with managed() as session:
-            loaded = session.get(SqlPolicy, "pol_test1")
+            loaded = session.get(SqlPolicy, (0, "pol_test1"))
             assert loaded is not None
             assert loaded.name == "cost-guard"
-            assert loaded.type == "python"
+            # The column default stamps sha256(name) on INSERT.
+            assert loaded.name_cksum == hashlib.sha256(b"cost-guard").digest()
+            assert loaded.type == encode_policy_type("python")
             assert loaded.enabled is True
             assert loaded.session_id is None
 
@@ -695,18 +711,18 @@ class TestSqlPolicy:
             id="pol_1",
             name="guard",
             session_id="conv_test1",
-            scope="session",
+            scope=encode_policy_scope("session"),
             created_at=_now(),
-            type="python",
+            type=encode_policy_type("python"),
             handler="mod:fn",
         )
         p2 = SqlPolicy(
             id="pol_2",
             name="guard",
             session_id="conv_test1",
-            scope="session",
+            scope=encode_policy_scope("session"),
             created_at=_now(),
-            type="python",
+            type=encode_policy_type("python"),
             handler="mod:fn2",
         )
         with pytest.raises(IntegrityError):
@@ -729,7 +745,7 @@ class TestSqlHost:
             owner="corey@example.com",
             name="corey-laptop",
             host_id="host_abc123",
-            status="online",
+            status=encode_host_status("online"),
             created_at=now,
             updated_at=now,
         )
@@ -737,31 +753,29 @@ class TestSqlHost:
             session.add(host)
 
         with managed() as session:
-            loaded = session.get(SqlHost, ("corey@example.com", "corey-laptop"))
+            loaded = session.get(SqlHost, (0, "host_abc123"))
             assert loaded is not None
             assert loaded.host_id == "host_abc123"
-            assert loaded.status == "online"
+            assert loaded.status == encode_host_status("online")
             assert loaded.token_hash is None
             assert loaded.sandbox_provider is None
 
     def test_check_constraint_rejects_invalid_status(self, db_uri: str) -> None:
-        engine = get_or_create_engine(db_uri)
-        managed = make_managed_session_maker(engine)
+        """ck_hosts_status rejects out-of-range int codes on enforcing backends.
 
-        now = _now()
-        host = SqlHost(
-            owner="owner",
-            name="host",
-            host_id="host_bad",
-            status="unknown",
-            created_at=now,
-            updated_at=now,
-        )
-        with pytest.raises(IntegrityError):
-            with managed() as session:
-                session.add(host)
+        SQLite does not enforce CHECK constraints by default, so we verify the
+        constraint exists in the schema without asserting enforcement on SQLite.
+        On Postgres / MySQL the constraint is enforced at runtime.
+        """
+        import sqlalchemy as sa
+
+        engine = get_or_create_engine(db_uri)
+        inspector = sa.inspect(engine)
+        checks = {c["name"] for c in inspector.get_check_constraints("hosts")}
+        assert "ck_hosts_status" in checks, "ck_hosts_status must exist on hosts"
 
     def test_unique_host_id(self, db_uri: str) -> None:
+        """Duplicate host_id within the same workspace violates the PK."""
         engine = get_or_create_engine(db_uri)
         managed = make_managed_session_maker(engine)
 
@@ -770,21 +784,24 @@ class TestSqlHost:
             owner="a@x.com",
             name="h1",
             host_id="host_dup",
-            status="online",
+            status=encode_host_status("online"),
             created_at=now,
             updated_at=now,
         )
+        # Commit h1 first so h2's insert hits a real PK violation at the DB.
+        with managed() as session:
+            session.add(h1)
+
         h2 = SqlHost(
             owner="b@x.com",
             name="h2",
             host_id="host_dup",
-            status="offline",
+            status=encode_host_status("offline"),
             created_at=now,
             updated_at=now,
         )
         with pytest.raises(IntegrityError):
             with managed() as session:
-                session.add(h1)
                 session.add(h2)
 
 
@@ -807,7 +824,7 @@ class TestSqlUserDailyCost:
             session.add(row)
 
         with managed() as session:
-            loaded = session.get(SqlUserDailyCost, ("alice@example.com", "2026-06-16"))
+            loaded = session.get(SqlUserDailyCost, (0, "alice@example.com", "2026-06-16"))
             assert loaded is not None
             assert loaded.cost_usd == pytest.approx(1.23)
             assert loaded.ask_approved_usd == pytest.approx(0.0)

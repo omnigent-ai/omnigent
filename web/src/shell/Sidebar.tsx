@@ -107,6 +107,8 @@ import {
   useStopSession,
 } from "@/hooks/useConversations";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { showToast } from "@/components/ui/toast";
 import { PermissionsModal } from "@/components/PermissionsModal";
 import { SessionStateBadge } from "@/components/SessionStateBadge";
@@ -129,6 +131,7 @@ import { useSessionSwitchHotkey } from "@/hooks/useSessionSwitchHotkey";
 import { usePinnedSessionHotkeys } from "@/hooks/usePinnedSessionHotkeys";
 import { absoluteTime, relativeTime } from "@/lib/relativeTime";
 import { MOD_KEY } from "@/components/KeyboardShortcutsDialog";
+import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import { SettingsSidebarBody, useSettingsRoute, useTrackSettingsReturn } from "./settingsNav";
 import {
   type ActiveChatOverride,
@@ -158,6 +161,14 @@ const TIME_MARKER_SLOT_CLASS =
 // gentler gray in light mode (a gentler glow in dark mode) and reads as "active
 // area" without the heavy fill. Pair with `transition-colors` so it eases in.
 const DROP_TARGET_HIGHLIGHT = "bg-primary/5";
+
+/**
+ * Which session tab the sidebar is showing. ``"mine"`` is the viewer's own
+ * sessions (the Pinned / Projects / Chats structure); ``"shared"`` is the flat
+ * list of sessions others have shared with the viewer. The split mirrors
+ * :func:`isOwnedByViewer`.
+ */
+type SidebarTab = "mine" | "shared";
 
 interface SidebarProps {
   open: boolean;
@@ -252,9 +263,21 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
   const [pinnedConversationIds, setPinnedConversationIds] = useState(readPinnedConversationIds);
   const [selectionMode, setSelectionMode] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  // Which session tab is shown. "mine" (default) keeps the full Pinned /
+  // Projects / Chats structure; "shared" is a flat list of sessions others
+  // shared with the viewer.
+  const [activeTab, setActiveTab] = useState<SidebarTab>("mine");
+  // The "Shared with me" tab only makes sense when sessions can be shared with
+  // other people at all — i.e. a multi-user server. A loopback-only local
+  // server has just the one user (mirrors the disabled Share affordance; see
+  // `isCurrentServerLocal` and AppShell's `shareDisabled`), so hide the tabs
+  // and always show the viewer's own sessions there.
+  const multiUser = !isCurrentServerLocal();
 
   const lastSelectedIdRef = useRef<string | null>(null);
   const getVisibleIdsRef = useRef<() => string[]>(() => []);
+  const getVisibleConversationsRef = useRef<() => Conversation[]>(() => []);
+  const [visibleConversationCount, setVisibleConversationCount] = useState(0);
 
   const toggleSelected = useCallback((id: string, shiftKey?: boolean) => {
     setSelectedIds((prev) => {
@@ -518,7 +541,16 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
               variant="ghost"
               data-testid="new-chat-button"
             >
-              <Link to="/" onClick={onNavClick}>
+              {/* New session always creates a session the viewer owns, which
+              lands under "My sessions" — so snap the tab back there on click
+              (the button stays visible on both tabs). */}
+              <Link
+                to="/"
+                onClick={(e) => {
+                  setActiveTab("mine");
+                  onNavClick(e);
+                }}
+              >
                 <SquarePenIcon className="size-4 text-foreground" />
                 New session
               </Link>
@@ -526,12 +558,9 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
             {selectionMode ? (
               <BulkActionBar
                 selectedIds={selectedIds}
-                allConversations={(conversationsQuery.data?.pages ?? []).flatMap(
-                  (page) => page.data,
-                )}
-                onSelectAll={() =>
-                  selectAll((conversationsQuery.data?.pages ?? []).flatMap((page) => page.data))
-                }
+                allConversations={loadedRows}
+                visibleCount={visibleConversationCount}
+                onSelectAll={() => selectAll(getVisibleConversationsRef.current())}
                 onDeselectAll={deselectAll}
                 onClear={deselectAll}
                 onExit={exitSelectionMode}
@@ -577,6 +606,30 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
             )}
           </div>
 
+          {/* Session-scope tabs: split the viewer's own sessions ("My
+          sessions") from ones shared with them ("Shared with me"). Sits above
+          the scrolling list (non-scrolling) so it stays put while the list
+          scrolls. Hidden during selection mode, where the bulk-action bar owns
+          this strip. */}
+          {multiUser && !selectionMode && (
+            <div className="px-3 pb-2">
+              <Tabs
+                value={activeTab}
+                onValueChange={(v) => setActiveTab(v as SidebarTab)}
+                className="w-full"
+              >
+                <TabsList className="w-full">
+                  <TabsTrigger value="mine" data-testid="sidebar-tab-mine">
+                    My sessions
+                  </TabsTrigger>
+                  <TabsTrigger value="shared" data-testid="sidebar-tab-shared">
+                    Shared with me
+                  </TabsTrigger>
+                </TabsList>
+              </Tabs>
+            </div>
+          )}
+
           {/* Mobile: extra bottom padding so the last session scrolls clear of
           the floating Settings icon (which is absolutely positioned, out of
           flow, over the bottom-left corner). */}
@@ -589,6 +642,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
               scrollContainerRef={scrollContainerRef}
               onRowClick={onNavClick}
               searchQuery=""
+              activeTab={multiUser ? activeTab : "mine"}
               pinnedConversationIds={pinnedConversationIds}
               onPinnedConversationIdsChange={setPinnedConversationIds}
               onTogglePinned={togglePinnedConversation}
@@ -596,6 +650,8 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
               selectedIds={selectedIds}
               onToggleSelected={toggleSelected}
               getVisibleIdsRef={getVisibleIdsRef}
+              getVisibleConversationsRef={getVisibleConversationsRef}
+              onVisibleCountChange={setVisibleConversationCount}
             />
           </nav>
 
@@ -833,6 +889,7 @@ interface ConversationListProps {
   scrollContainerRef: RefObject<HTMLElement | null>;
   onRowClick: (e: MouseEvent<HTMLAnchorElement>) => void;
   searchQuery: string;
+  activeTab: SidebarTab;
   pinnedConversationIds: string[];
   onPinnedConversationIdsChange: (ids: string[]) => void;
   onTogglePinned: (conversationId: string) => void;
@@ -840,6 +897,8 @@ interface ConversationListProps {
   selectedIds: Set<string>;
   onToggleSelected: (conversationId: string, shiftKey?: boolean) => void;
   getVisibleIdsRef: RefObject<() => string[]>;
+  getVisibleConversationsRef: RefObject<() => Conversation[]>;
+  onVisibleCountChange: (count: number) => void;
 }
 
 // permission_level null (no ACL row / legacy) or >= 4 both mean owner.
@@ -852,6 +911,7 @@ function ConversationList({
   scrollContainerRef,
   onRowClick,
   searchQuery,
+  activeTab,
   pinnedConversationIds,
   onPinnedConversationIdsChange,
   onTogglePinned,
@@ -859,6 +919,8 @@ function ConversationList({
   selectedIds,
   onToggleSelected,
   getVisibleIdsRef,
+  getVisibleConversationsRef,
+  onVisibleCountChange,
 }: ConversationListProps) {
   // All loaded conversations from the single paginated list (for pinned
   // backfill, normalization, and the flat session list).
@@ -897,51 +959,59 @@ function ConversationList({
   const sections = useMemo(() => {
     const allWithBackfill = [...allConversations, ...pinnedBackfill];
     const notArchived = allWithBackfill.filter((c) => c.archived !== true);
+    // Each tab shows a disjoint slice — "mine" is the sessions the viewer owns,
+    // "shared" is the ones others shared with them. The Pinned / Projects /
+    // Sessions structure is then built from that slice, so both tabs reuse the
+    // same section layout with different conversations.
+    const tabScoped =
+      activeTab === "shared"
+        ? notArchived.filter((c) => !isOwnedByViewer(c))
+        : notArchived.filter(isOwnedByViewer);
 
     // Pinned takes precedence over Project: pinning a session moves it OUT of
     // its project into the flat global Pinned section (no nested pins). Ordered
     // strictly by when they were pinned (newest pin at the bottom), not by
     // `updated_at`, so a pinned session doesn't jump when it gets a new message.
+    // Pins are localStorage and ownership-agnostic, so a pinned shared session
+    // floats to Pinned on the Shared tab just like an owned one on My sessions.
     const pinned = orderByPinnedSequence(
-      notArchived.filter((c) => pinnedSet.has(c.id)),
+      tabScoped.filter((c) => pinnedSet.has(c.id)),
       pinnedConversationIds,
     );
     const pinnedIdSet = new Set(pinned.map((c) => c.id));
 
-    // Projects: each folder holds its non-pinned, non-archived sessions. A
-    // pinned member is excluded here (it lives under Pinned instead), so
-    // pinning a project's last session leaves the folder showing "No chats".
+    // Projects are a "My sessions"-only tool (filing into a project is
+    // owner-only), so the Shared tab renders no folders. On "mine" each folder
+    // holds its non-pinned, non-archived sessions; a pinned member is excluded
+    // (it lives under Pinned), so pinning a project's last session leaves the
+    // folder showing "No chats".
     const filedIds = new Set<string>();
-    const projectGroups: { name: string; conversations: Conversation[] }[] = projectNames.map(
-      (name) => {
-        const inProject = notArchived.filter(
-          (c) => c.labels?.[PROJECT_LABEL_KEY] === name && !pinnedIdSet.has(c.id),
-        );
-        inProject.forEach((c) => filedIds.add(c.id));
-        return { name, conversations: sortByUpdatedAtDesc(inProject, activeOverride) };
-      },
-    );
+    const projectGroups: { name: string; conversations: Conversation[] }[] =
+      activeTab === "shared"
+        ? []
+        : projectNames.map((name) => {
+            const inProject = tabScoped.filter(
+              (c) => c.labels?.[PROJECT_LABEL_KEY] === name && !pinnedIdSet.has(c.id),
+            );
+            inProject.forEach((c) => filedIds.add(c.id));
+            return { name, conversations: sortByUpdatedAtDesc(inProject, activeOverride) };
+          });
     // NOTE: empty projects are intentionally NOT filtered out. A project comes
     // from the server project list (useProjects), so it can have zero *loaded*
     // conversations — either genuinely empty or because its chats live on an
     // unloaded page. We render it as a folder with a "No chats" placeholder
     // rather than hiding it (matches the target sidebar layout).
 
-    // Chats / Shared: the remainder — not archived, not pinned, and not in any
-    // project.
-    const rest = allConversations.filter(
-      (c) => c.archived !== true && !pinnedIdSet.has(c.id) && !filedIds.has(c.id),
-    );
-    const sessions = sortByUpdatedAtDesc(rest.filter(isOwnedByViewer), activeOverride);
-    const shared = sortByUpdatedAtDesc(
-      rest.filter((c) => !isOwnedByViewer(c)),
+    // Sessions: the remainder of the tab's slice — not pinned, not filed.
+    const sessions = sortByUpdatedAtDesc(
+      tabScoped.filter((c) => !pinnedIdSet.has(c.id) && !filedIds.has(c.id)),
       activeOverride,
     );
     const archived = sortByUpdatedAtDesc(
       allWithBackfill.filter((c) => c.archived === true),
       activeOverride,
     );
-    return { pinned, sessions, shared, archived, projectGroups };
+    return { pinned, sessions, archived, projectGroups };
   }, [
     allConversations,
     pinnedBackfill,
@@ -949,6 +1019,7 @@ function ConversationList({
     pinnedConversationIds,
     activeOverride,
     projectNames,
+    activeTab,
   ]);
 
   // Collapsed section titles — persisted like pins so the preference
@@ -1193,13 +1264,29 @@ function ConversationList({
     const projectsCollapsed = effectiveCollapsedSections.includes("Projects");
     const projectVisible = (name: string, list: readonly Conversation[]) =>
       !projectsCollapsed && expandedProjects.includes(name) ? list : [];
+    // `sections` is already scoped to the active tab, so the same Pinned /
+    // Projects / Sessions walk covers both tabs (Projects is empty on shared).
     return [
       ...visible("Pinned", sections.pinned),
       ...sections.projectGroups.flatMap((g) => projectVisible(g.name, g.conversations)),
       ...visible("Chats", sections.sessions),
-      ...visible("Shared with me", sections.shared),
     ].map((c) => c.id);
   }, [sections, effectiveCollapsedSections, expandedProjects]);
+  useEffect(() => {
+    onVisibleCountChange(orderedConversationIds.length);
+  }, [orderedConversationIds.length, onVisibleCountChange]);
+  getVisibleConversationsRef.current = () => {
+    const visible = (title: string, list: readonly Conversation[]) =>
+      effectiveCollapsedSections.includes(title) ? [] : [...list];
+    const projectsCollapsed = effectiveCollapsedSections.includes("Projects");
+    const projectVisible = (name: string, list: readonly Conversation[]) =>
+      !projectsCollapsed && expandedProjects.includes(name) ? [...list] : [];
+    return [
+      ...visible("Pinned", sections.pinned),
+      ...sections.projectGroups.flatMap((g) => projectVisible(g.name, g.conversations)),
+      ...visible("Chats", sections.sessions),
+    ];
+  };
   // Getter that builds the shift-select visible order on demand (at click
   // time). Reading projectRenderedIdsRef lazily — rather than snapshotting it
   // during render — guarantees the project segment is always fresh even when a
@@ -1215,7 +1302,6 @@ function ConversationList({
         ? []
         : sections.projectGroups.flatMap((g) => projectRenderedIdsRef.current.get(g.name) ?? [])),
       ...vis("Chats", sections.sessions),
-      ...vis("Shared with me", sections.shared),
     ];
   };
   useSessionSwitchHotkey(orderedConversationIds, activeId);
@@ -1261,17 +1347,22 @@ function ConversationList({
       </p>
     );
   }
-  const emptyMessage = searchQuery ? "No matching conversations" : "No active sessions";
+  const showShared = activeTab === "shared";
+  const emptyMessage = searchQuery
+    ? "No matching conversations"
+    : showShared
+      ? "No sessions shared with you"
+      : "No active sessions";
 
   // Archived sessions are surfaced on the Settings page, not here, so they
   // don't count toward the sidebar's empty-state threshold. Each project
   // counts itself (not just its loaded chats) so an empty project still
   // renders its "Projects" header + "No chats" folder rather than the global
-  // empty-state message.
+  // empty-state message. `sections` is tab-scoped, so this counts the active
+  // tab only (Projects is empty on the Shared tab).
   const totalVisible =
     sections.pinned.length +
     sections.sessions.length +
-    sections.shared.length +
     sections.projectGroups.length +
     sections.projectGroups.reduce((sum, g) => sum + g.conversations.length, 0);
 
@@ -1295,9 +1386,26 @@ function ConversationList({
             ungroup target (wrapped below). This top strip is only a FALLBACK
             for when there are no ungrouped chats yet, so the Chats section
             isn't rendered and there'd otherwise be nowhere to drop. */}
-        {activeDrag?.project != null && sections.sessions.length === 0 && <UngroupDropZone />}
+        {!showShared && activeDrag?.project != null && sections.sessions.length === 0 && (
+          <UngroupDropZone />
+        )}
         {totalVisible === 0 ? (
-          <p className="px-2 py-1 text-muted-foreground text-xs">{emptyMessage}</p>
+          <>
+            <p className="px-2 py-1 text-muted-foreground text-xs">{emptyMessage}</p>
+            {/* The list is one paginated stream ordered by updated_at across
+              owned + shared sessions, so the current tab can be empty on the
+              loaded window while its sessions live on a later page. Keep the
+              sentinel mounted so pagination continues instead of stranding the
+              user on a false "empty" state. */}
+            {hasMorePages && (
+              <InfiniteScrollSentinel
+                hasMore={hasMorePages}
+                isFetching={isFetchingNextPage}
+                fetchMore={fetchNextPage}
+                scrollRoot={scrollContainerRef}
+              />
+            )}
+          </>
         ) : (
           <>
             {sections.pinned.length > 0 && (
@@ -1430,21 +1538,9 @@ function ConversationList({
                 />
               </ChatsDropZone>
             )}
-            {sections.shared.length > 0 && (
-              <ConversationSection
-                title="Shared with me"
-                conversations={sections.shared}
-                pinnedConversationIds={pinnedConversationIds}
-                collapsed={effectiveCollapsedSections.includes("Shared with me")}
-                onToggleCollapsed={() => effectiveToggleSectionCollapsed("Shared with me")}
-                onRowClick={onRowClick}
-                onTogglePinned={onTogglePinned}
-                selectionMode={selectionMode}
-                selectedIds={selectedIds}
-                onToggleSelected={onToggleSelected}
-                onProjectAssigned={expandProject}
-              />
-            )}
+            {/* Both tabs render this same Pinned / Projects / Sessions tree;
+              `sections` is scoped to the active tab's conversations (owned vs.
+              shared), and Projects is empty on the Shared tab. */}
             {/* Archived sessions are no longer listed here — they live on the
               Settings page ("Archived chats"), reachable from the footer. */}
             {/* Infinite-scroll sentinel for the global list. Pagination extends
@@ -1891,6 +1987,7 @@ function ConversationMenuItems({
   isOwner,
   canEdit,
   canManage,
+  sharingOff,
   canStop,
   canMarkUnread,
   currentProject,
@@ -1914,6 +2011,9 @@ function ConversationMenuItems({
   isOwner: boolean;
   canEdit: boolean;
   canManage: boolean;
+  // Server-wide sharing kill switch (OMNIGENT_SHARING_MODE=off): disables the
+  // Share item for everyone, independent of the per-user manage check.
+  sharingOff: boolean;
   canStop: boolean;
   // Whether "Mark as unread" applies: any row not already showing the
   // unread dot (the active thread and running sessions included).
@@ -1949,7 +2049,7 @@ function ConversationMenuItems({
           {isPinned ? "Unpin" : "Pin"}
         </C.Item>
       )}
-      {canManage ? (
+      {canManage && !sharingOff ? (
         <C.Item data-testid="share-conversation" onSelect={() => setShareOpen(true)}>
           <ShareIcon className="size-3.5" />
           Share
@@ -1964,8 +2064,12 @@ function ConversationMenuItems({
               </C.Item>
             </div>
           </TooltipTrigger>
+          {/* Sharing-off is server-wide, so it outranks the per-user manage
+              reason when both apply. */}
           <TooltipContent side="left">
-            You need manage permissions to share this session
+            {sharingOff
+              ? "Sharing has been disabled for this Omnigent server."
+              : "You need manage permissions to share this session"}
           </TooltipContent>
         </Tooltip>
       )}
@@ -2004,7 +2108,9 @@ function ConversationMenuItems({
           Mark as unread
         </C.Item>
       )}
-      {canEdit && (
+      {/* Projects are a My-sessions-only tool, so filing is owner-only — a
+          shared session (even editable) shows no project affordance. */}
+      {canEdit && isOwner && (
         <C.Sub>
           <C.SubTrigger data-testid="move-to-project" className="whitespace-nowrap">
             <FolderInputIcon className="size-3.5" />
@@ -2233,6 +2339,11 @@ function ConversationRow({
   const isOwner = isOwnedByViewer(conversation);
   const canEdit = conversation.permission_level === null || conversation.permission_level >= 2;
   const canManage = conversation.permission_level === null || conversation.permission_level >= 3;
+  // Server-wide sharing kill switch (OMNIGENT_SHARING_MODE=off) reported by
+  // /v1/info — disables the row's Share item even for managers. Fail open
+  // (share enabled) while the capability probe is still loading.
+  const serverInfo = useServerInfo();
+  const sharingOff = serverInfo !== "loading" && serverInfo.sharing_mode === "off";
   // Gates the kebab's "Stop session" item. `false` = runner known-offline
   // (already stopped — hide the destructive control); `undefined` = not yet
   // observed, don't block. Non-sticky Stop: no "Resume" affordance — the
@@ -2433,6 +2544,7 @@ function ConversationRow({
     isOwner,
     canEdit,
     canManage,
+    sharingOff,
     canStop,
     canMarkUnread,
     currentProject,
@@ -2717,9 +2829,12 @@ function ConversationRow({
             </DialogDescription>
           </DialogHeader>
           {stopSession.isError && (
-            // 503 = runner couldn't deliver the kill; keep the dialog open.
             <p className="text-sm text-destructive" role="alert">
-              Couldn't stop the session — it may still be running. Try again in a moment.
+              Couldn't stop the session
+              {stopSession.error instanceof Error && stopSession.error.message
+                ? `: ${stopSession.error.message}`
+                : " — it may still be running"}
+              . Try again in a moment.
             </p>
           )}
           <DialogFooter>
@@ -3065,7 +3180,7 @@ function ProjectPickerMenu({
       </div>
       <div className="max-h-48 overflow-y-auto">
         {filtered.map((name) => (
-          <C.Item key={name} onSelect={() => onSelect(name)}>
+          <C.Item key={name} className="px-2 py-1" onSelect={() => onSelect(name)}>
             <span className="flex-1 truncate text-left">{name}</span>
             {currentProject === name && (
               <CheckMarkIcon className="size-3.5 shrink-0 text-primary" />
@@ -3100,6 +3215,7 @@ function ProjectPickerMenu({
           </div>
         ) : (
           <C.Item
+            className="px-2 py-1"
             // Keep the menu open so the inline input can take over in place.
             onSelect={(e) => {
               e.preventDefault();
@@ -3111,7 +3227,7 @@ function ProjectPickerMenu({
           </C.Item>
         )}
         {currentProject && (
-          <C.Item onSelect={() => onSelect("")}>
+          <C.Item className="px-2 py-1" onSelect={() => onSelect("")}>
             Remove from{" "}
             <span className="rounded bg-muted px-1 py-0.5 font-mono text-[0.95em]">
               {currentProject}
@@ -3218,6 +3334,7 @@ function ConversationEditRow({ initialTitle, onCommit, onCancel }: ConversationE
 function BulkActionBar({
   selectedIds,
   allConversations,
+  visibleCount,
   onSelectAll,
   onDeselectAll,
   onClear,
@@ -3225,6 +3342,7 @@ function BulkActionBar({
 }: {
   selectedIds: Set<string>;
   allConversations: Conversation[];
+  visibleCount: number;
   onSelectAll: () => void;
   onDeselectAll: () => void;
   onClear: () => void;
@@ -3259,7 +3377,7 @@ function BulkActionBar({
     ownedSelected.length > 0 && (archivedSelected.length === 0 || nonArchivedSelected.length === 0);
 
   const count = selectedIds.size;
-  const allSelected = count > 0 && count === allConversations.length;
+  const allSelected = count > 0 && count === visibleCount;
   const isBusy = bulkArchive.isPending || bulkDelete.isPending;
 
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);

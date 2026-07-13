@@ -53,7 +53,9 @@ import type {
   UserMessageBlock,
 } from "@/lib/blocks";
 import { BlockStream } from "@/lib/blockStream";
+import { isSystemUserContent } from "@/lib/systemMessage";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
+import { emitBrowserActionRequest } from "@/lib/browserActionBus";
 import {
   ApiError,
   approve as approveElicitation,
@@ -68,7 +70,12 @@ import {
   type SessionItemsPage,
   updateSession,
 } from "@/lib/sessionsApi";
-import type { SessionInputConsumedEvent, SessionViewer, StreamEvent } from "@/lib/events";
+import type {
+  McpServerStartup,
+  SessionInputConsumedEvent,
+  SessionViewer,
+  StreamEvent,
+} from "@/lib/events";
 import { createPresenceIdleTracker } from "@/lib/presenceIdle";
 import { parseEvent, parseSseStream, type SseStreamResult } from "@/lib/sse";
 import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
@@ -513,6 +520,15 @@ export interface ChatState {
    * launch.
    */
   sandboxStatus: SandboxStatus | null;
+  /**
+   * Per-MCP-server startup map for the bound session (codex-native).
+   * Updated by `session.mcp_startup` SSE events while the harness boots
+   * its MCP servers; cleared back to `null` once every server settles
+   * `ready`. Failed/cancelled servers are retained so the page can say
+   * which servers never came up. Always `null` for sessions whose
+   * harness reports no MCP startup.
+   */
+  mcpStartup: Record<string, McpServerStartup> | null;
 
   // Internal mutable bookkeeping. NOT meant to be subscribed to.
   abortController: AbortController | null;
@@ -631,6 +647,14 @@ export interface ChatState {
    * or there is no active conversation / oldest-item cursor yet.
    */
   loadMoreHistory: () => Promise<void>;
+  /**
+   * Page older history back-to-back until at least `minUserMessages` user
+   * prompts are loaded (or history runs out), committing all pages in ONE
+   * update. Used by the turn rail so it lands with its initial run of ticks
+   * in a single render instead of growing page-by-page. No-op if the target
+   * is already met or a fetch is already in flight.
+   */
+  loadHistoryUntilUserMessages: (minUserMessages: number) => Promise<void>;
   /** Flash a bubble briefly; rapid calls reschedule so the latest target wins. */
   flashUserMessage: (itemId: string) => void;
   /** Queue an "@"-mention chip into the active composer from outside it. */
@@ -754,6 +778,9 @@ export function initChatStore(client: QueryClient): void {
   workspaceInvalidationTimers.clear();
   backgroundFlushInFlight.clear();
   backgroundFlushCooldownUntil.clear();
+  // Reset the POST-ordering chain so a prior run's unresolved send can't block
+  // the next one (production calls this once at boot; tests call it per case).
+  sendChain = Promise.resolve();
   queryClient = client;
 }
 
@@ -899,6 +926,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   terminalPending: false,
   viewers: [],
   sandboxStatus: null,
+  mcpStartup: null,
   abortController: null,
   historyGeneration: 0,
 
@@ -1051,6 +1079,18 @@ export const useChatStore = create<ChatState>((set, get) => ({
       set((st) => ({
         queuedMessages: st.queuedMessages.filter((m) => m.queueId !== head.queueId),
       }));
+      // Join the SAME send chain the foreground path uses. A queued message can
+      // hand off from the foreground flush (send() → sendChain) to here the
+      // moment the user navigates away, and the two POST paths would otherwise
+      // race — a background postEvent could overtake a foreground send() still
+      // awaiting its chain slot, delivering out of FIFO order. Taking a slot
+      // here (await priorSend before the upload/post, release in finally)
+      // serializes every POST across both paths through one ordering primitive.
+      const priorSend = sendChain;
+      let releaseSend: () => void = () => {};
+      sendChain = new Promise<void>((resolve) => {
+        releaseSend = resolve;
+      });
       // Upload any attachments, then post the message referencing their
       // server-assigned file_ids — the same two-phase sequence send() runs
       // (no combined endpoint exists: /resources/files stores the blob and
@@ -1063,6 +1103,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       // head (preserving this conversation's FIFO order) and set a cooldown so
       // the next trigger backs off instead of hammering a failing runner.
       void (async () => {
+        await priorSend;
         const fileBlocks: ContentBlock[] = [];
         for (const file of head.files ?? []) {
           // Reuse a prior successful upload so the cooldown-paced retry doesn't
@@ -1097,6 +1138,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
         })
         .finally(() => {
           backgroundFlushInFlight.delete(conversationId);
+          // Hand the chain to the next POST (foreground or background) so it
+          // can start its own network work in submission order.
+          releaseSend();
         });
     }
   },
@@ -1582,6 +1626,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         // discipline as ``viewers`` above.
         pendingComposerAttachments: [],
         sandboxStatus: null,
+        mcpStartup: null,
         abortController: null,
         historyGeneration: s.historyGeneration + 1,
       };
@@ -1714,17 +1759,38 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const { conversationId } = get();
     if (!conversationId) return;
     const previous = get().costControlModeOverride;
+    // Routing and a pinned model are mutually exclusive: the server's routing
+    // guard skips whenever model_override is set, so turning routing ON must
+    // also clear this session's pinned model (in the SAME PATCH) — otherwise
+    // the old pick (e.g. Opus from the new-chat picker) would win and the judge
+    // would never run. Mirrors the new-chat dialog's mutual exclusion. Only
+    // clear when a model is actually pinned, so toggling routing on a
+    // model-less (e.g. SDK) session doesn't emit a spurious model-cleared change.
+    const previousModel = get().sessionModelOverride;
+    const clearModel = mode === "on" && previousModel != null;
     // Optimistic flip so the pill responds instantly; the PATCH
     // response (or the rollback below) is the settled truth.
-    set({ costControlModeOverride: mode });
+    set({
+      costControlModeOverride: mode,
+      ...(clearModel ? { sessionModelOverride: null } : {}),
+    });
     try {
-      const session = await updateSession(conversationId, { costControlModeOverride: mode });
+      const session = await updateSession(conversationId, {
+        costControlModeOverride: mode,
+        ...(clearModel ? { modelOverride: null } : {}),
+      });
       if (get().conversationId !== conversationId) return;
-      set({ costControlModeOverride: session.costControlModeOverride ?? null });
+      set({
+        costControlModeOverride: session.costControlModeOverride ?? null,
+        ...(clearModel ? { sessionModelOverride: session.modelOverride ?? null } : {}),
+      });
     } catch (err) {
-      // Roll back so the pill doesn't claim a state the server never persisted.
+      // Roll back so neither control claims a state the server never persisted.
       if (get().conversationId === conversationId) {
-        set({ costControlModeOverride: previous });
+        set({
+          costControlModeOverride: previous,
+          ...(clearModel ? { sessionModelOverride: previousModel } : {}),
+        });
       }
       throw err;
     }
@@ -1784,6 +1850,100 @@ export const useChatStore = create<ChatState>((set, get) => ({
       // Disable further fetches on error — a persistent server failure
       // would otherwise re-trigger the scroll listener on every scroll event.
       set({ loadingMoreHistory: false, hasMoreHistory: false });
+    }
+  },
+
+  loadHistoryUntilUserMessages: async (minUserMessages) => {
+    const start = get();
+    if (start.loadingMoreHistory) return;
+    // Count only REAL user turns, not `[System: …]` marker blocks (task/timer/
+    // sub-agent notices arrive as user-role). The rail derives its ticks from
+    // the same non-system predicate, so counting markers here would let the
+    // loader hit the target while the rail has too few ticks — and, since the
+    // early-return leaves hasMoreHistory set, wedge the rail permanently hidden.
+    const countUsers = (blocks: AnyBlock[]): number =>
+      blocks.reduce(
+        (n, b) => n + (b.type === "user_message" && !isSystemUserContent(b.content) ? 1 : 0),
+        0,
+      );
+    // Users already in state count toward the target: we only need to fetch
+    // enough MORE to top up to minUserMessages, else we overshoot by whatever
+    // state already holds and blow past the "≤20 ticks initially" intent.
+    const existingUsers = countUsers(start.blocks);
+    if (existingUsers >= minUserMessages) return;
+
+    const { conversationId, historyGeneration } = start;
+    if (!conversationId) return;
+    const stale = (): boolean =>
+      get().conversationId !== conversationId || get().historyGeneration !== historyGeneration;
+
+    // Page older windows into a local buffer, then commit ONCE so the rail
+    // (and transcript) jump straight to the initial run of turns rather than
+    // growing one page per render. Large per-page limit because turns can span
+    // many items (tool calls, reasoning) — a turn here averages well over the
+    // default 20-item page, so small pages would need a dozen+ round-trips to
+    // reach the target. Bounded page count is a backstop against a pathological
+    // single turn.
+    const EAGER_PAGE_LIMIT = 200;
+    const MAX_EAGER_PAGES = 10;
+    set({ loadingMoreHistory: true });
+    let cursor = start.oldestItemId;
+    let hasMore = start.hasMoreHistory;
+    const older: AnyBlock[] = [];
+    const seenNew = new Set<string>();
+    // Commit whatever pages we gathered, even on a mid-loop error — discarding
+    // the buffer would lose progress AND leave turns.length unchanged, so the
+    // rail's eager-load effect (keyed on it) would never re-fire and the rail
+    // would wedge at a partial, unscrollable set of ticks.
+    const commit = () => {
+      set((state) => {
+        const seen = new Set(
+          state.blocks.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
+        );
+        const unique = older.filter((b) => !b.ctx.itemId || !seen.has(b.ctx.itemId));
+        return {
+          blocks: [...unique, ...state.blocks],
+          hasMoreHistory: hasMore,
+          oldestItemId: cursor ?? state.oldestItemId,
+          loadingMoreHistory: false,
+        };
+      });
+    };
+    try {
+      for (let pages = 0; pages < MAX_EAGER_PAGES && hasMore && cursor; pages++) {
+        const page = await fetchSessionItemsPage(conversationId, {
+          olderThan: cursor,
+          limit: EAGER_PAGE_LIMIT,
+        });
+        if (stale()) return;
+        hasMore = page.hasMore;
+        cursor = page.items[0]?.id ?? cursor;
+        // Each page is chronological (oldest→newest) and older than the last.
+        // Collect this page's new blocks in order, then prepend the whole page
+        // as a group — prepending item-by-item would reverse each page's
+        // internal order, scrambling the transcript.
+        const pageBlocks: AnyBlock[] = [];
+        for (const b of itemsToBlocks(page.items)) {
+          const iid = b.ctx.itemId;
+          if (iid && seenNew.has(iid)) continue;
+          if (iid) seenNew.add(iid);
+          pageBlocks.push(b);
+        }
+        older.unshift(...pageBlocks);
+        if (existingUsers + countUsers(older) >= minUserMessages) break;
+        if (!page.items[0]?.id) break;
+      }
+      commit();
+    } catch {
+      if (stale()) return;
+      // Commit progress, but disable further history fetches. This function is
+      // auto-fired by the rail's eager-load effect (no user gesture), so a
+      // persistent failure that left hasMoreHistory true would re-arm the
+      // effect on the very next render — a tight retry loop hammering the
+      // failing endpoint. Matching loadMoreHistory's policy stops the loop
+      // (and lets the rail's `revealed` latch instead of staying hidden).
+      hasMore = false;
+      commit();
     }
   },
 }));
@@ -2024,6 +2184,7 @@ function sessionBindingPatch(
   | "codexModelOptions"
   | "terminalPending"
   | "sandboxStatus"
+  | "mcpStartup"
 > {
   const wrapper = session.labels?.["omnigent.wrapper"];
   return {
@@ -2047,6 +2208,7 @@ function sessionBindingPatch(
     codexModelOptions: session.codexModelOptions ?? [],
     terminalPending: session.terminalPending ?? false,
     sandboxStatus: session.sandboxStatus ?? null,
+    mcpStartup: session.mcpStartup ?? null,
   };
 }
 
@@ -2182,8 +2344,16 @@ async function bindStream(
     // pick for non-native sessions), this is the session truth the `/model`
     // readout shows, so a non-applied sticky pick is never mislabeled as
     // an active "(override)".
+    // Intelligent routing owns model selection: never carry a sticky model
+    // onto a routing-enabled session. Leaving model_override null is what lets
+    // the server-side judge pick on the first turn; a silent sticky PATCH here
+    // would re-pin the session (e.g. to the last-used Opus) and trip the
+    // server's ``model_override is None`` routing guard. effectiveSessionOverride
+    // then resolves to null too, so the /model readout doesn't mislabel it.
+    const routingOn = session.costControlModeOverride === "on";
     const willApplyStickyModel =
       !isSubAgentSession &&
+      !routingOn &&
       nativeModelFamily !== null &&
       session.modelOverride == null &&
       compatibleStickyModel != null;
@@ -3782,6 +3952,16 @@ export function handleSessionEvent(event: StreamEvent): void {
         sandboxStatus: event.stage === "ready" ? null : { stage: event.stage, error: event.error },
       });
       return;
+    case "session_mcp_startup": {
+      // Mirror the harness's per-MCP-server startup map. Cleared once
+      // every server settles `ready` (the band disappears); failures and
+      // cancellations are retained so the page can say which servers
+      // never came up.
+      const records = Object.values(event.servers);
+      const allReady = records.length === 0 || records.every((r) => r.status === "ready");
+      useChatStore.setState({ mcpStartup: allReady ? null : event.servers });
+      return;
+    }
     case "session_usage": {
       // Apply only fields that arrived; a window-only broadcast must
       // not clobber tokensUsed (and vice versa), and a cost-only
@@ -3919,6 +4099,11 @@ export function handleSessionEvent(event: StreamEvent): void {
       useChatStore.setState({
         pendingUserMessages: [],
       });
+      return;
+    case "browser_action_request":
+      // Embedded-browser action: fan out to the relay hook (which claims,
+      // executes, posts the result). No store state; no-op without a relay.
+      emitBrowserActionRequest(event);
       return;
     case "session_status": {
       // Captured BEFORE the patch below adopts event.responseId, so a

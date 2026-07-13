@@ -22,7 +22,9 @@ import java.util.concurrent.Executors
  * Trust is enforced upstream by the bridge's origin allowlist + main-frame gate,
  * so this class does no origin checking of its own.
  */
-class BlobSaver(private val context: Context) {
+class BlobSaver(
+    private val context: Context,
+) {
     private val main = Handler(Looper.getMainLooper())
     private val io = Executors.newSingleThreadExecutor()
 
@@ -31,7 +33,11 @@ class BlobSaver(private val context: Context) {
         io.shutdown()
     }
 
-    fun save(base64: String, mimeType: String, suggestedName: String) {
+    fun save(
+        base64: String,
+        mimeType: String,
+        suggestedName: String,
+    ) {
         io.execute {
             val bytes =
                 try {
@@ -54,7 +60,11 @@ class BlobSaver(private val context: Context) {
     }
 
     @RequiresApi(Build.VERSION_CODES.Q)
-    private fun saveViaMediaStore(name: String, mimeType: String, bytes: ByteArray): Boolean =
+    private fun saveViaMediaStore(
+        name: String,
+        mimeType: String,
+        bytes: ByteArray,
+    ): Boolean =
         runCatching {
             val resolver = context.contentResolver
             val values =
@@ -73,7 +83,10 @@ class BlobSaver(private val context: Context) {
             true
         }.getOrDefault(false)
 
-    private fun saveToAppDownloads(name: String, bytes: ByteArray): Boolean =
+    private fun saveToAppDownloads(
+        name: String,
+        bytes: ByteArray,
+    ): Boolean =
         runCatching {
             val dir =
                 context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
@@ -86,7 +99,9 @@ class BlobSaver(private val context: Context) {
         // Basename past either separator style — a Windows-flavored "foo\bar.txt"
         // suggestion should save as "bar.txt", not "foo_bar.txt".
         val cleaned =
-            suggested.substringAfterLast('/').substringAfterLast('\\')
+            suggested
+                .substringAfterLast('/')
+                .substringAfterLast('\\')
                 .replace(Regex("[^A-Za-z0-9._-]"), "_")
         // "" / "." / ".." aren't usable names — on the API 28 File path "." and
         // ".." resolve to a directory, so the write would fail. Fall back instead.

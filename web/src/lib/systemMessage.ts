@@ -6,6 +6,8 @@
 // system-event role; the UI re-classifies them so they render as muted
 // markers instead of normal user bubbles.
 
+import type { MessageContentBlock } from "@/lib/blocks";
+
 export type SystemMessageKind =
   | "task_completed"
   | "task_failed"
@@ -112,4 +114,32 @@ export function parseSystemMessage(text: string): ParsedSystemMessage | null {
   // Known prefix, unknown pattern — still treat as a system marker so new
   // producers get the muted styling without an web change.
   return { kind: "generic", label: inner, body };
+}
+
+// Matches ChatPage's inline "[Attached: …]" marker stripper; the header check
+// must see the same text extraction the bubble render uses.
+const ATTACHED_RE = /\[Attached(?: file)?:\s*([^\]]*)\]\s*/g;
+
+/**
+ * True when a user-role message is actually a runtime `[System: …]` marker
+ * (task/timer/sub-agent notice, interrupt record) rather than a real user
+ * turn. Shared by the transcript's turn derivation and the rail's eager
+ * history loader so both agree on what counts as a rail tick — a mismatch
+ * (loader counting markers the rail drops) can wedge the rail hidden.
+ *
+ * :param content: A user message block's content array.
+ * :returns: ``true`` for a system marker, ``false`` for a real user message.
+ */
+export function isSystemUserContent(content: MessageContentBlock[]): boolean {
+  const hasAttachments = content.some((c) => c.type === "input_image" || c.type === "input_file");
+  if (hasAttachments) return false;
+  const text = content
+    .filter(
+      (c): c is Extract<MessageContentBlock, { type: "input_text" }> => c.type === "input_text",
+    )
+    .map((c) => c.text)
+    .join("")
+    .replace(ATTACHED_RE, "")
+    .trim();
+  return parseSystemMessage(text) !== null;
 }

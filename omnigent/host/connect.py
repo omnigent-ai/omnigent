@@ -60,6 +60,14 @@ from omnigent.onboarding.harness_readiness import (
     configured_harness_map,
     harness_is_configured,
 )
+from omnigent.process_logging import (
+    LOG_TTY_FD_ENV_VAR,
+    PROCESS_LOG_FILE_ENV_VAR,
+    child_logging_popen_kwargs,
+    configure_process_logging,
+    open_process_log_file,
+    process_log_dir,
+)
 from omnigent.runner.identity import (
     RUNNER_ID_ENV_VAR,
     RUNNER_PARENT_PID_ENV_VAR,
@@ -90,17 +98,17 @@ def _runner_log_dir() -> Path:
     (not a module constant) so tests that repoint ``Path.home`` see the
     override.
 
-    :returns: The host-runner log directory, e.g.
-        ``Path.home() / ".omnigent" / "logs" / "host-runner"``.
+    :returns: The runner log directory, e.g.
+        ``<data-dir>/logs/runner``.
     """
-    return Path.home() / ".omnigent" / "logs" / "host-runner"
+    return process_log_dir("runner")
 
 
 def _display_log_path(path: Path) -> str:
     """Format a log path for display, collapsing the home prefix to ``~``.
 
     :param path: Absolute path, typically under the user's state dir, e.g.
-        ``Path("/Users/alice/.omnigent/logs/host-runner/runner-ab12.log")``.
+        ``Path("/Users/alice/.omnigent/logs/runner/runner-ab12.log")``.
     :returns: ``"~/.omnigent/..."`` when *path* is under ``$HOME``,
         otherwise ``str(path)``.
     """
@@ -171,7 +179,7 @@ def _read_log_tail(path: Path, max_bytes: int = _LOG_TAIL_MAX_BYTES) -> str:
     """Read the last portion of a runner log file for diagnostics.
 
     :param path: The runner's captured stdout/stderr log file, e.g.
-        ``Path("~/.omnigent/logs/host-runner/runner-ab12.log")``.
+        ``Path("~/.omnigent/logs/runner/runner-ab12.log")``.
     :param max_bytes: Max bytes to read from the end of the file,
         e.g. ``4096``.
     :returns: The decoded tail (lossy UTF-8 — runner output may
@@ -282,6 +290,15 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # executor.profile propagated into the daemon's env).
         "DATABRICKS_CONFIG_PROFILE",
         "DATABRICKS_CONFIG_FILE",
+        # DATABRICKS_AUTH_STORAGE selects the token-storage backend ("secure"
+        # OS keychain vs "plaintext" JSON cache) — also a non-secret selector.
+        # Without it a runner falls back to the ~/.databrickscfg [__settings__]
+        # auth_storage default and can resolve a DIFFERENT token store than the
+        # host/daemon (which inherits it via the daemon env's DATABRICKS_ prefix
+        # in cli.py). That mismatch makes the runner read an empty/stale store
+        # and fail to mint a token — the runner tunnel is rejected with HTTP 401
+        # even though the host authenticated fine.
+        "DATABRICKS_AUTH_STORAGE",
         # Runtime config/data-dir selection. These are filesystem PATHS, not
         # secrets, so they're safe to propagate to the host owner's own
         # daemon/runner subprocesses. They MUST propagate so the whole local
@@ -314,6 +331,10 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # alias, still propagated so existing setups keep working.
         "OMNIGENT_AUTH_ENABLED",
         "OMNIGENT_ACCOUNTS_ENABLED",
+        # Process logging controls. These are diagnostics knobs, not secrets.
+        "OMNIGENT_LOG_LEVEL",
+        "OMNIGENT_LOG_TO_STDERR",
+        LOG_TTY_FD_ENV_VAR,
         # Secret-store backend selector. The CLI's `configure harnesses` stores
         # pasted API keys via the file backend when this is set (headless /
         # locked-keyring hosts), writing `keychain:<name>` refs. The runner
@@ -371,6 +392,16 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # telemetry is opt-in. Not a secret (a boolean). The OMNIGENT_OTEL_*
         # knobs (capture-content, FastAPI toggle) ride the prefix allowlist below.
         "OMNIGENT_TELEMETRY_ENABLED",
+        # Opaque request-routing headers (dev/test): a JSON header map folded by
+        # cli_auth.databricks_request_headers into every client→server connection
+        # so a request pins to a specific server instance/replica. Must reach the
+        # spawned runner so its tunnel + server callbacks route to the SAME
+        # instance the host registered on — otherwise the host lands on the
+        # selected instance while its runners fall back to the default one.
+        # Routing config, not a secret; unset in prod. Allowlisting it forwards it
+        # host→runner intrinsically, so the setter need not also list it in
+        # OMNIGENT_RUNNER_ENV_PASSTHROUGH.
+        "OMNIGENT_DATABRICKS_EXTRA_HEADERS",
     }
     # Windows system / profile constants (SYSTEMROOT is mandatory for Winsock,
     # USERPROFILE for Path.home(), etc.); a no-op on POSIX. See _platform.
@@ -384,8 +415,10 @@ _RUNNER_ENV_ALLOWLIST_PREFIXES: tuple[str, ...] = ("LC_", "MLFLOW_", "OTEL_", "O
 # Harness credential / endpoint env vars forwarded host→runner when
 # present. These are the names the harnesses themselves resolve —
 # ANTHROPIC_* for claude-sdk / pi (claude-code also honors
-# ANTHROPIC_AUTH_TOKEN + ANTHROPIC_BASE_URL for gateways,
-# AWS_BEARER_TOKEN_BEDROCK + ANTHROPIC_BEDROCK_BASE_URL for Bedrock mode,
+# ANTHROPIC_AUTH_TOKEN + ANTHROPIC_BASE_URL for gateways, and
+# ANTHROPIC_MODEL to pin a gateway-served model (must travel with the
+# key/endpoint, else native Claude launches with a default the gateway
+# rejects), AWS_BEARER_TOKEN_BEDROCK + ANTHROPIC_BEDROCK_BASE_URL for Bedrock mode,
 # and CLAUDE_CODE_OAUTH_TOKEN for `claude setup-token` subscription auth),
 # OPENAI_* for codex / openai-agents (CODEX_ACCESS_TOKEN is the codex
 # CLI's headless ChatGPT-workspace credential, minted in the ChatGPT
@@ -404,6 +437,7 @@ _BASE_HARNESS_CREDENTIAL_ENV_VARS: frozenset[str] = frozenset(
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_AUTH_TOKEN",
         "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_MODEL",
         "ANTHROPIC_BEDROCK_BASE_URL",
         "AWS_BEARER_TOKEN_BEDROCK",
         "CLAUDE_CODE_OAUTH_TOKEN",
@@ -580,7 +614,7 @@ class _RunnerHandle:
 
     :param proc: The runner subprocess handle.
     :param log_path: File capturing the runner's stdout/stderr, e.g.
-        ``Path("~/.omnigent/logs/host-runner/runner-ab12.log")``.
+        ``Path("~/.omnigent/logs/runner/runner-ab12.log")``.
         Read back for diagnostics when the runner dies before
         connecting its tunnel.
     """
@@ -1044,31 +1078,39 @@ class HostProcess:
         )
 
         try:
-            log_dir = _runner_log_dir()
-            log_dir.mkdir(parents=True, exist_ok=True)
-            import tempfile
+            # Embed the session id so operators can find all logs for a
+            # session with `omnigent debug logs --session <id>`. Cap at 32
+            # chars to keep filenames manageable; strip anything non-word to
+            # guard against unexpected id shapes from older servers.
+            import re
 
-            _log_fd, _log_name = tempfile.mkstemp(
-                prefix="runner-",
-                suffix=".log",
-                dir=log_dir,
+            _session_slug = (
+                re.sub(r"[^\w-]", "", frame.session_id)[:32] + "-" if frame.session_id else ""
             )
-            _log_fh = os.fdopen(_log_fd, "wb")
-            proc = subprocess.Popen(
-                [sys.executable, "-m", "omnigent.runner._entry"],
-                env=env,
-                # Runners are WS-tunnel clients with no interactive input.
-                # Give them a clean /dev/null stdin instead of inheriting the
-                # daemon's: a long-lived daemon (e.g. backgrounded / nohup'd)
-                # can end up with a closed or recycled stdin fd, and an
-                # inherited bad fd makes the runner die at interpreter startup
-                # with "init_sys_streams: Bad file descriptor" — it never
-                # connects, so the session fails with "runner did not connect".
-                stdin=subprocess.DEVNULL,
-                stdout=_log_fh,
-                stderr=_log_fh,
+            log_path, _log_fh = open_process_log_file(
+                "runner",
+                prefix=f"runner-{_session_slug}",
             )
-            _log_fh.close()
+            env[PROCESS_LOG_FILE_ENV_VAR] = str(log_path)
+            try:
+                with child_logging_popen_kwargs(env) as logging_kwargs:
+                    proc = subprocess.Popen(
+                        [sys.executable, "-m", "omnigent.runner._entry"],
+                        env=env,
+                        # Runners are WS-tunnel clients with no interactive input.
+                        # Give them a clean /dev/null stdin instead of inheriting the
+                        # daemon's: a long-lived daemon (e.g. backgrounded / nohup'd)
+                        # can end up with a closed or recycled stdin fd, and an
+                        # inherited bad fd makes the runner die at interpreter startup
+                        # with "init_sys_streams: Bad file descriptor" — it never
+                        # connects, so the session fails with "runner did not connect".
+                        stdin=subprocess.DEVNULL,
+                        stdout=_log_fh,
+                        stderr=_log_fh,
+                        **logging_kwargs,
+                    )
+            finally:
+                _log_fh.close()
         except OSError as exc:
             return HostLaunchRunnerResultFrame(
                 request_id=frame.request_id,
@@ -1076,7 +1118,6 @@ class HostProcess:
                 error=f"failed to spawn runner: {exc}",
             )
 
-        log_path = Path(_log_name)
         if proc.poll() is not None:
             # The runner died before Popen returned — its actual error
             # is in the captured log, so ship the tail with the result
@@ -1100,9 +1141,11 @@ class HostProcess:
         # Print the exact runner log file (not just the dir): a foreground
         # host's own terminal shows lifecycle lines, but the runner's real
         # output — the agent turn, tracebacks — lands only in this file.
+        session_line = f"\n    session: {frame.session_id}" if frame.session_id else ""
         print(
             f"  ↑ Runner started: {runner_id} (pid={proc.pid})\n"
-            f"    log: {_display_log_path(log_path)}",
+            f"    log: {_display_log_path(log_path)}"
+            f"{session_line}",
             flush=True,
         )
         return HostLaunchRunnerResultFrame(
@@ -1923,6 +1966,7 @@ def run_host_process(
         (auth / authorization / outdated server). The
         actionable cause is printed to stderr first.
     """
+    host_log_path = configure_process_logging("host")
     # Initialize tracing so the host daemon exports its own spans
     # (e.g. handling launch_runner / stat / list_dir frames) into the
     # same distributed trace as the server that requested them. The
@@ -1940,17 +1984,16 @@ def run_host_process(
     print(f"Connecting to {server_url} as {identity.name!r} ({identity.host_id})")
     # Tell the user where logs land up front — `omnigent host` used to run
     # silently, so a stuck/quiet host gave no hint where to look. Session
-    # work goes to per-runner files under the host-runner dir (the exact
-    # file is printed when each runner launches). The foreground process's
-    # own diagnostics (warnings, tracebacks) go to the always-on cli-*.log;
-    # that path is None in the background daemon (no setup_cli_logging) —
-    # its stdout is already captured to the daemon log, so skip the line.
+    # work goes to per-runner files under the runner dir (the exact
+    # file is printed when each runner launches). The host process's
+    # own diagnostics go to the host destination.
     print(f"Session logs: {_display_log_path(_runner_log_dir())}/")
+    print(f"This host's log: {_display_log_path(host_log_path)}")
     from omnigent.cli_diagnostics import current_cli_log_path
 
     _cli_log = current_cli_log_path()
-    if _cli_log is not None:
-        print(f"This host's log: {_display_log_path(_cli_log)}")
+    if _cli_log is not None and _cli_log != host_log_path:
+        print(f"CLI diagnostics: {_display_log_path(_cli_log)}")
 
     host = HostProcess(identity, server_url)
     try:
