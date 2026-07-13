@@ -12770,10 +12770,23 @@ def _persist_stored_session_bundle(
         parent session, e.g. ``"runner_abc123"``.
     :returns: Response with the new session id.
     :raises OmnigentError: If the agent insert violates integrity
-        checks or the parent session no longer exists.
+        checks, ``metadata.model_override`` fails validation, or the
+        parent session no longer exists.
     :raises SQLAlchemyError: If the database transaction fails for
         any non-integrity reason.
     """
+    # Mirror the JSON create path: the persisted override reaches a native
+    # CLI as a ``--model`` argv element, so it must pass the conservative
+    # model-id charset before any row exists.
+    model_override: str | None = None
+    if metadata.model_override is not None:
+        try:
+            model_override = validate_model_override(metadata.model_override)
+        except ValueError as exc:
+            raise OmnigentError(
+                f"invalid model_override: {exc}",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
     try:
         created = conversation_store.create_session_with_agent(
             agent_id=agent_id,
@@ -12817,6 +12830,16 @@ def _persist_stored_session_bundle(
             agent_bundle_location,
         )
         raise
+
+    if model_override is not None:
+        # ``create_session_with_agent`` has no override param; reuse the
+        # PATCH path's store write before the runner reads the snapshot
+        # (the first turn / terminal launch happens only after this
+        # create returns), mirroring the JSON create route.
+        conversation_store.update_conversation(
+            created.conversation.id,
+            model_override=model_override,
+        )
 
     # The create request has no conv id in its URL; stamp the minted id so
     # the create span joins the session's session.id group.

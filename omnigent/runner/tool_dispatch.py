@@ -1236,15 +1236,65 @@ def _subagent_harness_override_from_args(args: dict[str, Any]) -> str | None:
     return raw_harness
 
 
+def _validated_cost_budget(budget: Any) -> dict[str, Any] | None:
+    """
+    Validate a ``cost_budget`` payload shared by send and create.
+
+    The payload is an object with max_cost_usd (hard limit) and/or
+    ask_thresholds_usd (soft checkpoints); at least one must be present.
+
+    :param budget: The raw ``cost_budget`` value; ``None`` passes through.
+    :returns: A dict with max_cost_usd and/or ask_thresholds_usd, or
+        ``None`` when absent.
+    :raises ValueError: If cost_budget is malformed or values are invalid.
+    """
+    if budget is None:
+        return None
+
+    if not isinstance(budget, dict):
+        raise ValueError("cost_budget must be an object")
+
+    result: dict[str, Any] = {}
+
+    # Extract and validate max_cost_usd if present.
+    if "max_cost_usd" in budget:
+        max_cost = budget["max_cost_usd"]
+        if max_cost is not None:
+            max_cost = float(max_cost)
+            if max_cost <= 0:
+                raise ValueError("cost_budget.max_cost_usd must be > 0")
+            result["max_cost_usd"] = max_cost
+
+    # Extract and validate ask_thresholds_usd if present.
+    if "ask_thresholds_usd" in budget:
+        thresholds = budget["ask_thresholds_usd"]
+        if thresholds is not None:
+            if not isinstance(thresholds, list):
+                raise ValueError("cost_budget.ask_thresholds_usd must be an array")
+            thresholds = [float(t) for t in thresholds]
+            if not all(t > 0 for t in thresholds):
+                raise ValueError("cost_budget.ask_thresholds_usd values must be > 0")
+            # Check that thresholds are less than max if both are set.
+            if "max_cost_usd" in result and result["max_cost_usd"] is not None:
+                if any(t >= result["max_cost_usd"] for t in thresholds):
+                    raise ValueError("ask_thresholds_usd values must be < max_cost_usd")
+            result["ask_thresholds_usd"] = thresholds
+
+    # At least one must be present.
+    if not result:
+        raise ValueError("cost_budget must include max_cost_usd and/or ask_thresholds_usd")
+    return result
+
+
 def _subagent_cost_budget_from_args(
     args: dict[str, Any],
 ) -> dict[str, Any] | None:
     """
     Extract and validate the per-dispatch cost budget from ``sys_session_send`` args.
 
-    The optional ``cost_budget`` field is an object with max_cost_usd
-    (hard limit) and/or ask_thresholds_usd (soft checkpoints). At least
-    one must be present.
+    The optional ``cost_budget`` field lives inside the object form of
+    ``args``; shape validation is shared with ``sys_session_create`` via
+    :func:`_validated_cost_budget`.
 
     :param args: Parsed ``sys_session_send`` arguments.
     :returns: A dict with max_cost_usd and/or ask_thresholds_usd, or
@@ -1253,45 +1303,52 @@ def _subagent_cost_budget_from_args(
     """
     raw_args = args.get("args")
     if isinstance(raw_args, dict):
-        budget = raw_args.get("cost_budget")
-        if budget is None:
-            return None
-
-        if not isinstance(budget, dict):
-            raise ValueError("cost_budget must be an object")
-
-        result: dict[str, Any] = {}
-
-        # Extract and validate max_cost_usd if present.
-        if "max_cost_usd" in budget:
-            max_cost = budget["max_cost_usd"]
-            if max_cost is not None:
-                max_cost = float(max_cost)
-                if max_cost <= 0:
-                    raise ValueError("cost_budget.max_cost_usd must be > 0")
-                result["max_cost_usd"] = max_cost
-
-        # Extract and validate ask_thresholds_usd if present.
-        if "ask_thresholds_usd" in budget:
-            thresholds = budget["ask_thresholds_usd"]
-            if thresholds is not None:
-                if not isinstance(thresholds, list):
-                    raise ValueError("cost_budget.ask_thresholds_usd must be an array")
-                thresholds = [float(t) for t in thresholds]
-                if not all(t > 0 for t in thresholds):
-                    raise ValueError("cost_budget.ask_thresholds_usd values must be > 0")
-                # Check that thresholds are less than max if both are set.
-                if "max_cost_usd" in result and result["max_cost_usd"] is not None:
-                    if any(t >= result["max_cost_usd"] for t in thresholds):
-                        raise ValueError("ask_thresholds_usd values must be < max_cost_usd")
-                result["ask_thresholds_usd"] = thresholds
-
-        # At least one must be present.
-        if not result:
-            raise ValueError("cost_budget must include max_cost_usd and/or ask_thresholds_usd")
-        return result
-
+        return _validated_cost_budget(raw_args.get("cost_budget"))
     return None
+
+
+async def _attach_subagent_cost_budget(
+    child_session_id: str,
+    cost_budget: dict[str, Any],
+    server_client: httpx.AsyncClient,
+) -> None:
+    """
+    Attach the ``__subagent_cost_budget`` policy to a freshly created child.
+
+    Non-fatal by contract: the child session is still usable without the
+    budget, so failures are logged, never raised. Shared by named-mode
+    ``sys_session_send`` and both ``sys_session_create`` modes.
+
+    :param child_session_id: The new child's session id.
+    :param cost_budget: Validated payload from :func:`_validated_cost_budget`.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    """
+    policy_body = {
+        "name": "__subagent_cost_budget",
+        "type": "python",
+        "handler": "omnigent.policies.builtins.cost.subagent_cost_budget",
+        "factory_params": cost_budget,  # Dict with max_cost_usd and/or ask_thresholds_usd
+        "enabled": True,
+    }
+    try:
+        pol_resp = await server_client.post(
+            f"/v1/sessions/{child_session_id}/policies",
+            json=policy_body,
+            timeout=10.0,
+        )
+        if pol_resp.status_code >= 400:
+            _logger.warning(
+                "failed to set subagent_cost_budget policy on child %s: %s %s",
+                child_session_id,
+                pol_resp.status_code,
+                pol_resp.text[:200],
+            )
+    except httpx.HTTPError:
+        _logger.warning(
+            "failed to set subagent_cost_budget policy on child %s",
+            child_session_id,
+            exc_info=True,
+        )
 
 
 def _subagent_allowed_harnesses(sub_agent_name: str, agent_spec: Any | None) -> frozenset[str]:
@@ -1725,32 +1782,7 @@ async def _execute_subagent_tool(
         # Attach a subagent_cost_budget policy to the child when requested.
         # Non-fatal: the child session is still usable without the budget.
         if cost_budget is not None:
-            policy_body = {
-                "name": "__subagent_cost_budget",
-                "type": "python",
-                "handler": "omnigent.policies.builtins.cost.subagent_cost_budget",
-                "factory_params": cost_budget,  # Dict with max_cost_usd and/or ask_thresholds_usd
-                "enabled": True,
-            }
-            try:
-                pol_resp = await server_client.post(
-                    f"/v1/sessions/{child_session_id}/policies",
-                    json=policy_body,
-                    timeout=10.0,
-                )
-                if pol_resp.status_code >= 400:
-                    _logger.warning(
-                        "failed to set subagent_cost_budget policy on child %s: %s %s",
-                        child_session_id,
-                        pol_resp.status_code,
-                        pol_resp.text[:200],
-                    )
-            except httpx.HTTPError:
-                _logger.warning(
-                    "failed to set subagent_cost_budget policy on child %s",
-                    child_session_id,
-                    exc_info=True,
-                )
+            await _attach_subagent_cost_budget(child_session_id, cost_budget, server_client)
 
     # Publish session.created on the parent's SSE stream so the
     # REPL debug panel and any client subscribers discover the
@@ -2047,6 +2079,7 @@ def _build_session_create_body(
     conversation_id: str,
     title: Any,
     message: Any,
+    model_override: str | None = None,
 ) -> dict[str, Any]:
     """
     Build the JSON ``POST /v1/sessions`` body for ``sys_session_create``.
@@ -2063,6 +2096,9 @@ def _build_session_create_body(
         string.
     :param message: Optional first user message; included only when a
         non-empty string.
+    :param model_override: Optional validated model id persisted as the
+        child's session-level override (the server create route already
+        accepts and persists this field).
     :returns: The JSON request body.
     """
     body: dict[str, Any] = {
@@ -2071,6 +2107,8 @@ def _build_session_create_body(
     }
     if isinstance(title, str) and title:
         body["title"] = title
+    if model_override is not None:
+        body["model_override"] = model_override
     if isinstance(message, str) and message:
         body["initial_items"] = [
             {
@@ -2205,6 +2243,23 @@ async def _execute_session_create(
                 )
             }
         )
+    # Optional create-time knobs, shared by both modes. ``model`` is
+    # validated here (fail loud, before any session exists) and persisted
+    # as the child's session-level override — the same field named-mode
+    # send sets; ``cost_budget`` reuses named-mode's validation + policy.
+    raw_model = args.get("model")
+    model: str | None = None
+    if raw_model is not None:
+        if not isinstance(raw_model, str):
+            return json.dumps({"error": "sys_session_create 'model' must be a string"})
+        try:
+            model = validate_model_override(raw_model)
+        except ValueError as exc:
+            return json.dumps({"error": f"sys_session_create invalid 'model': {exc}"})
+    try:
+        cost_budget = _validated_cost_budget(args.get("cost_budget"))
+    except (ValueError, TypeError) as exc:
+        return json.dumps({"error": f"sys_session_create invalid 'cost_budget': {exc}"})
     if has_config_path:
         return await _session_create_from_config_path(
             str(config_path),
@@ -2214,9 +2269,15 @@ async def _execute_session_create(
             publish_event=publish_event,
             agent_spec=agent_spec,
             runner_workspace=runner_workspace,
+            model_override=model,
+            cost_budget=cost_budget,
         )
     body = _build_session_create_body(
-        str(agent_id), conversation_id, args.get("title"), args.get("message")
+        str(agent_id),
+        conversation_id,
+        args.get("title"),
+        args.get("message"),
+        model_override=model,
     )
     try:
         resp = await server_client.post("/v1/sessions", json=body, timeout=30.0)
@@ -2244,6 +2305,8 @@ async def _execute_session_create(
     data = resp.json()
     if not isinstance(data.get("id"), str) or not data["id"]:
         return json.dumps({"error": "server did not return a child session id"})
+    if cost_budget is not None:
+        await _attach_subagent_cost_budget(data["id"], cost_budget, server_client)
     return _finalize_created_session(
         data,
         conversation_id=conversation_id,
@@ -2354,6 +2417,7 @@ async def _upload_config_bundle(
     conversation_id: str,
     agent_spec: Any | None,
     runner_workspace: Path | None,
+    model_override: str | None = None,
 ) -> dict[str, Any] | str:
     """
     Resolve, bundle, and upload a local agent config as a child session.
@@ -2393,6 +2457,8 @@ async def _upload_config_bundle(
     title = args.get("title")
     if isinstance(title, str) and title:
         metadata["title"] = title
+    if model_override is not None:
+        metadata["model_override"] = model_override
     try:
         resp = await server_client.post(
             "/v1/sessions",
@@ -2421,6 +2487,8 @@ async def _session_create_from_config_path(
     publish_event: Callable[[str, dict[str, Any]], None] | None,
     agent_spec: Any | None,
     runner_workspace: Path | None,
+    model_override: str | None = None,
+    cost_budget: dict[str, Any] | None = None,
 ) -> str:
     """
     Bundle-mode ``sys_session_create``: upload a new agent and launch it.
@@ -2450,12 +2518,15 @@ async def _session_create_from_config_path(
         conversation_id=conversation_id,
         agent_spec=agent_spec,
         runner_workspace=runner_workspace,
+        model_override=model_override,
     )
     if isinstance(data, str):
         return data
     child_session_id = data.get("session_id")
     if not isinstance(child_session_id, str) or not child_session_id:
         return json.dumps({"error": "server did not return a child session id"})
+    if cost_budget is not None:
+        await _attach_subagent_cost_budget(child_session_id, cost_budget, server_client)
     created_agent_id = data.get("agent_id")
     if not isinstance(created_agent_id, str) or not created_agent_id:
         # CreatedSessionResponse.agent_id is a required field — a

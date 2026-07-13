@@ -1428,11 +1428,17 @@ class SessionCreateMetadata(BaseModel):
         inherits the parent's runner binding for co-location. The
         caller must have READ access to the parent. ``None``
         creates a top-level session.
+    :param model_override: Optional per-session LLM model override
+        persisted at create time, e.g. ``"databricks-claude-haiku-4-5"``.
+        Same semantics and validation as the JSON create path's
+        ``model_override``; set by ``sys_session_create``'s ``model``
+        arg in config_path mode. ``None`` defers to the agent default.
     """
 
     title: str | None = None
     labels: dict[str, str] = Field(default_factory=dict)
     reasoning_effort: str | None = None
+    model_override: str | None = None
     host_id: str | None = None
     workspace: str | None = None
     terminal_launch_args: list[str] | None = None

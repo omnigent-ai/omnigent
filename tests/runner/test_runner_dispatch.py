@@ -7327,3 +7327,102 @@ async def test_send_missing_mode_error_tracks_declared_subagents() -> None:
     assert "requires 'session_id'" in no_subagents
     assert "'agent'" not in no_subagents.split("declares no named sub-agents")[0]
     assert "requires 'agent' (or 'session_id')" in with_subagents
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_threads_model_and_cost_budget() -> None:
+    """
+    ``sys_session_create`` threads ``model`` into the create body and
+    attaches the ``__subagent_cost_budget`` policy to the new child.
+
+    This is the generic-path counterpart of named-mode send's create
+    branch: without it, per-child model/cost controls only existed for
+    spec-declared sub-agents and id-created children always launched on
+    the harness default with no budget.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    captured: dict[str, Any] = {}
+    policy_posts: list[dict[str, Any]] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            captured.update(json.loads(request.content))
+            return httpx.Response(
+                201,
+                json={"id": "conv_child", "agent_id": "ag_x", "agent_name": "leaf"},
+            )
+        if request.method == "POST" and request.url.path == "/v1/sessions/conv_child/policies":
+            policy_posts.append(json.loads(request.content))
+            return httpx.Response(201, json={"ok": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps(
+                {
+                    "agent_id": "ag_x",
+                    "title": "leaf-1",
+                    "model": "databricks-claude-haiku-4-5",
+                    "cost_budget": {"max_cost_usd": 2.5},
+                }
+            ),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    assert captured["model_override"] == "databricks-claude-haiku-4-5"
+    assert captured["parent_session_id"] == "conv_caller"
+    assert len(policy_posts) == 1
+    assert policy_posts[0]["name"] == "__subagent_cost_budget"
+    assert policy_posts[0]["factory_params"] == {"max_cost_usd": 2.5}
+    handle = json.loads(output)
+    assert handle["conversation_id"] == "conv_child"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("arguments", "expected_fragment"),
+    [
+        ({"agent_id": "ag_x", "model": "bad model; rm -rf"}, "invalid 'model'"),
+        ({"agent_id": "ag_x", "model": 42}, "'model' must be a string"),
+        ({"agent_id": "ag_x", "cost_budget": {"max_cost_usd": -1}}, "invalid 'cost_budget'"),
+        ({"agent_id": "ag_x", "cost_budget": {}}, "invalid 'cost_budget'"),
+    ],
+)
+async def test_sys_session_create_rejects_malformed_model_and_budget(
+    arguments: dict[str, Any],
+    expected_fragment: str,
+) -> None:
+    """
+    Malformed ``model`` / ``cost_budget`` fail loud before any session
+    exists — the model value later crosses the harness spawn boundary as
+    a ``--model`` argv element, so it must never be silently dropped or
+    passed through unvalidated.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    created = False
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal created
+        created = True
+        return httpx.Response(201, json={"id": "conv_child"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps(arguments),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    assert expected_fragment in json.loads(output)["error"]
+    assert created is False

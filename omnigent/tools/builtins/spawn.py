@@ -873,7 +873,9 @@ class SysSessionCreateTool(Tool):
             "with sys_os_write) and launches it. Always use agent_id "
             "for an agent that already exists — never download and "
             "re-upload its bundle. Optionally queue an initial user "
-            "message. The new session is always a child of the calling "
+            "message, pin a per-child 'model', and/or attach a "
+            "'cost_budget' (both create-time only). The new session is "
+            "always a child of the calling "
             "session (you cannot create top-level or sibling sessions). "
             "Returns {conversation_id, agent_id, title, status}; the "
             "session runs asynchronously — monitor it with "
@@ -942,6 +944,52 @@ class SysSessionCreateTool(Tool):
                                 "for the child. Omit to create an idle "
                                 "session and drive it later via "
                                 "sys_session_send."
+                            ),
+                        },
+                        "model": {
+                            "type": "string",
+                            "description": (
+                                "Optional model id for the new session, "
+                                "e.g. 'claude-haiku-4-5' or "
+                                "'databricks-claude-haiku-4-5'. "
+                                "Persisted as the child's session-level "
+                                "model override and applied when its "
+                                "harness launches. Create-time only — "
+                                "it cannot be changed by a later "
+                                "sys_session_send; harnesses without "
+                                "model-override plumbing keep their "
+                                "default."
+                            ),
+                        },
+                        "cost_budget": {
+                            "type": "object",
+                            "properties": {
+                                "max_cost_usd": {
+                                    "type": "number",
+                                    "description": (
+                                        "Optional hard limit in USD. "
+                                        "Blocks tool calls once exceeded "
+                                        "on expensive models."
+                                    ),
+                                },
+                                "ask_thresholds_usd": {
+                                    "type": "array",
+                                    "items": {"type": "number"},
+                                    "description": (
+                                        "Optional soft warning checkpoints "
+                                        "in USD. The child asks for "
+                                        "approval the first time spend "
+                                        "crosses each threshold (each must "
+                                        "be < max_cost_usd if both are set)."
+                                    ),
+                                },
+                            },
+                            "description": (
+                                "Optional per-child cost budget with "
+                                "max_cost_usd (hard limit) and/or "
+                                "ask_thresholds_usd (soft checkpoints). "
+                                "At least one must be set. Applied as a "
+                                "policy on the new session at creation."
                             ),
                         },
                     },
