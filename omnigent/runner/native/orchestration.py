@@ -44,6 +44,7 @@ from omnigent.runner.resource_registry import (
     ANTIGRAVITY_NATIVE_TERMINAL_ROLE,
     CLAUDE_NATIVE_TERMINAL_ROLE,
     CODEX_NATIVE_TERMINAL_ROLE,
+    COPILOT_NATIVE_TERMINAL_ROLE,
     CURSOR_NATIVE_TERMINAL_ROLE,
     GOOSE_NATIVE_TERMINAL_ROLE,
     HERMES_NATIVE_TERMINAL_ROLE,
@@ -4025,6 +4026,98 @@ async def _run_antigravity_reader(
     )
 
 
+async def _auto_create_copilot_terminal(
+    session_id: str,
+    resource_registry: SessionResourceRegistry,
+    publish_event: Callable[[str, dict[str, Any]], None],
+    *,
+    server_client: httpx.AsyncClient | None,
+    ensure_comment_relay: Callable[..., Awaitable[None]] | None = None,
+    agent_spec: AgentSpec | ResolvedSpec | None = None,
+) -> SessionResourceView:
+    """Auto-create the Copilot TUI terminal for a copilot-native session."""
+    del ensure_comment_relay
+    from omnigent.copilot_native import resolve_copilot_executable
+    from omnigent.copilot_native_bridge import (
+        bridge_dir_for_session_id,
+        inject_model_command,
+        write_tmux_target,
+    )
+    from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
+    from omnigent.onboarding.copilot_auth import (
+        COPILOT_TOKEN_ENV_VARS,
+        resolve_copilot_github_token,
+    )
+    from omnigent.spec.types import ApiKeyAuth
+
+    launch_config = await _pi_native_launch_config(
+        session_id=session_id,
+        server_client=server_client,
+    )
+    workspace = os.path.realpath(str(launch_config.workspace))
+    bridge_dir = bridge_dir_for_session_id(session_id)
+    copilot_command = resolve_copilot_executable()
+    launch_args = list(launch_config.terminal_launch_args or [])
+    model = launch_config.model_override or _copilot_native_model_from_spec(agent_spec)
+    env: dict[str, str] = {}
+    spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
+    if spec is not None and isinstance(spec.executor.auth, ApiKeyAuth):
+        token = spec.executor.auth.api_key
+    else:
+        token = resolve_copilot_github_token()
+        if token is None:
+            for var in COPILOT_TOKEN_ENV_VARS:
+                token = os.environ.get(var)
+                if token:
+                    break
+    if token:
+        env["GH_TOKEN"] = token
+        env["GITHUB_TOKEN"] = token
+        env["COPILOT_GITHUB_TOKEN"] = token
+
+    terminal_view = await resource_registry.launch_required_terminal(
+        session_id=session_id,
+        terminal_name="copilot",
+        session_key="main",
+        resource_role=COPILOT_NATIVE_TERMINAL_ROLE,
+        spec=TerminalEnvSpec(
+            os_env=OSEnvSpec(type="caller_process", cwd=workspace),
+            command=copilot_command,
+            args=launch_args,
+            env=env,
+            scrollback=100_000,
+            tmux_allow_passthrough=True,
+            tmux_start_on_attach=False,
+        ),
+    )
+    terminal_registry = resource_registry.terminal_registry
+    if terminal_registry is not None:
+        instance = terminal_registry.get(session_id, "copilot", "main")
+        if instance is not None and instance.running:
+            write_tmux_target(
+                bridge_dir,
+                socket_path=instance.socket_path,
+                tmux_target=instance.tmux_target,
+            )
+            if model:
+                try:
+                    await asyncio.to_thread(inject_model_command, bridge_dir, model=model)
+                except Exception:  # noqa: BLE001 — best-effort; launch fresh on failure
+                    _logger.warning(
+                        "Failed to apply Copilot model override for session %s",
+                        session_id,
+                        exc_info=True,
+                    )
+    publish_event(
+        session_id,
+        {
+            "type": "session.resource.created",
+            "resource": session_resource_view_to_dict(terminal_view),
+        },
+    )
+    return terminal_view
+
+
 async def _auto_create_antigravity_terminal(
     session_id: str,
     resource_registry: SessionResourceRegistry,
@@ -4742,6 +4835,15 @@ def _codex_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) -
         return model
     config_model = spec.executor.config.get("model")
     return config_model if isinstance(config_model, str) and config_model else None
+
+
+def _copilot_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) -> str | None:
+    """Read the Copilot model default from a resolved agent spec."""
+    spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
+    if spec is None:
+        return None
+    model = spec.executor.model
+    return model if isinstance(model, str) and model else None
 
 
 def _claude_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) -> str | None:

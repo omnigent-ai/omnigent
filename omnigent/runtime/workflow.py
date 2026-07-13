@@ -144,7 +144,16 @@ _logger = logging.getLogger(__name__)
 
 
 AgentHarnessType = Literal[
-    "claude-sdk", "codex", "pi", "openai-agents-sdk", "antigravity", "kimi", "qwen", "goose"
+    "claude-sdk",
+    "codex",
+    "copilot",
+    "copilot-native",
+    "pi",
+    "openai-agents-sdk",
+    "antigravity",
+    "kimi",
+    "qwen",
+    "goose",
 ]
 
 
@@ -1988,7 +1997,8 @@ def _build_copilot_spawn_env(
     Build the ``HARNESS_COPILOT_*`` env-var dict the copilot harness wrap reads.
 
     Maps spec.executor fields → the ``HARNESS_COPILOT_*`` env vars defined in
-    ``omnigent/inner/copilot_harness.py``. Like the cursor / antigravity
+    ``omnigent/inner/copilot_harness.py`` and the ``copilot-native`` shim.
+    Like the cursor / antigravity
     builders there is NO gateway or Databricks-profile resolution: the GitHub
     Copilot SDK talks only to GitHub's Copilot backend (a GitHub token) and has
     no custom API base-URL override, so it never routes through the Databricks

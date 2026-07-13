@@ -55,7 +55,7 @@ of the agent YAML.
 
 ```yaml
 executor:
-  harness: claude-sdk        # claude-sdk, openai-agents, codex, cursor, kiro-native, pi, antigravity, qwen, kimi, copilot, hermes, ...
+  harness: claude-sdk        # claude-sdk, openai-agents, codex, cursor, kiro-native, pi, antigravity, qwen, kimi, copilot, copilot-native, hermes, ...
   model: databricks-claude-opus-4-7
   auth:
     type: databricks
@@ -122,6 +122,10 @@ executor:
     type: api_key
     api_key: ${GH_TOKEN}       # a GitHub token with Copilot access
 ```
+
+`copilot-native` is also accepted as a harness id. It launches the GitHub
+Copilot CLI in a runner-owned tmux terminal and injects web turns into that
+terminal, sharing the same GitHub-token auth path as `copilot`.
 
 To route through OpenRouter / a gateway, declare a key/gateway provider in
 `~/.omnigent/config.yaml` and reference it (`auth: {type: provider, name: …}`),

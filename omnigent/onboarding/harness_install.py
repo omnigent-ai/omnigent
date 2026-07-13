@@ -81,10 +81,8 @@ OPENCODE_KEY = "opencode"
 GOOSE_KEY = "goose"
 
 # Copilot runs in-process via the ``github-copilot-sdk`` package, which bundles
-# the Copilot CLI binary it drives — so, like cursor, there is no separately
-# installed CLI to gate on; readiness is whether a GitHub token resolves (see
-# :func:`omnigent.onboarding.harness_readiness.harness_is_configured`). The key
-# is kept here purely as the canonical harness id the readiness layer shares.
+# the Copilot CLI binary it drives. The SDK harness is token-gated; the native
+# Copilot wrapper additionally requires the ``copilot`` CLI on PATH.
 COPILOT_KEY = "copilot"
 
 # Hermes Agent is installed via a curl installer from Nous Research and
@@ -202,6 +200,12 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         install_hint=_HERMES_INSTALL_HINT,
         install_command=("bash", "-c", _HERMES_INSTALL_HINT),
     ),
+    COPILOT_KEY: HarnessInstallSpec(
+        "Copilot",
+        "copilot",
+        package=None,
+        install_hint="npm install -g @github/copilot",
+    ),
 }
 
 
@@ -266,6 +270,8 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     # gates on the same binary.
     "hermes-native": HERMES_KEY,
     "native-hermes": HERMES_KEY,
+    "copilot-native": COPILOT_KEY,
+    "native-copilot": COPILOT_KEY,
 }
 
 

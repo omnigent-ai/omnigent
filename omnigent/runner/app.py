@@ -77,6 +77,7 @@ from omnigent.runner.native import (
     _auto_create_antigravity_terminal,
     _auto_create_claude_terminal,
     _auto_create_codex_terminal,
+    _auto_create_copilot_terminal,
     _auto_create_cursor_terminal,
     _auto_create_goose_terminal,
     _auto_create_hermes_terminal,
@@ -176,6 +177,7 @@ for _builder_name in (
     "_auto_create_antigravity_terminal",
     "_auto_create_claude_terminal",
     "_auto_create_codex_terminal",
+    "_auto_create_copilot_terminal",
     "_auto_create_cursor_terminal",
     "_auto_create_goose_terminal",
     "_auto_create_hermes_terminal",
@@ -1810,6 +1812,7 @@ def create_runner_app(
     _pi_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _opencode_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _cursor_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
+    _copilot_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _kiro_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _goose_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _qwen_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
@@ -3100,6 +3103,44 @@ def create_runner_app(
                     finally:
                         _publish_terminal_pending(_publish_event, session_id, False)
 
+        if harness_name == "copilot-native":
+            _copilot_ensure_lock = _copilot_terminal_ensure_locks.setdefault(
+                session_id, asyncio.Lock()
+            )
+            async with _copilot_ensure_lock:
+                _tr = resource_registry.terminal_registry
+                _has_copilot_terminal = (
+                    _tr is not None and _tr.get(session_id, "copilot", "main") is not None
+                )
+                if not _has_copilot_terminal:
+                    _publish_terminal_pending(_publish_event, session_id, True)
+                    try:
+                        try:
+                            _copilot_spec = await _resolve_session_agent_spec(session_id)
+                        except OmnigentError:
+                            _copilot_spec = None
+                        await _auto_create_copilot_terminal(
+                            session_id,
+                            resource_registry,
+                            _publish_event,
+                            server_client=server_client,
+                            ensure_comment_relay=_ensure_comment_relay_started,
+                            agent_spec=_copilot_spec,
+                        )
+                    except Exception as exc:
+                        _logger.exception(
+                            "Failed to auto-create copilot terminal for %s",
+                            session_id,
+                        )
+                        _publish_native_terminal_start_error(
+                            _publish_event,
+                            session_id,
+                            "Copilot",
+                            exc,
+                        )
+                    finally:
+                        _publish_terminal_pending(_publish_event, session_id, False)
+
         if harness_name == "qwen-native":
             _qwen_ensure_lock = _qwen_terminal_ensure_locks.setdefault(session_id, asyncio.Lock())
             async with _qwen_ensure_lock:
@@ -3416,6 +3457,7 @@ def create_runner_app(
         _claude_terminal_ensure_locks.pop(session_id, None)
         _pi_terminal_ensure_locks.pop(session_id, None)
         _cursor_terminal_ensure_locks.pop(session_id, None)
+        _copilot_terminal_ensure_locks.pop(session_id, None)
         _kiro_terminal_ensure_locks.pop(session_id, None)
         _antigravity_terminal_ensure_locks.pop(session_id, None)
         _goose_terminal_ensure_locks.pop(session_id, None)
@@ -7593,6 +7635,45 @@ def create_runner_app(
                 status_code=200,
                 content=session_resource_view_to_dict(terminal_view),
             )
+        if (
+            body.get("ensure_native_terminal")
+            and terminal_name == "copilot"
+            and session_key == "main"
+        ):
+            copilot_terminal_id = terminal_resource_id("copilot", "main")
+            ensure_lock = _copilot_terminal_ensure_locks.setdefault(session_id, asyncio.Lock())
+            async with ensure_lock:
+                existing = await resource_registry.get_terminal_resource(
+                    session_id, copilot_terminal_id
+                )
+                if existing is not None:
+                    return JSONResponse(
+                        status_code=200,
+                        content=session_resource_view_to_dict(existing),
+                    )
+                try:
+                    try:
+                        copilot_agent_spec = await _resolve_session_agent_spec(session_id)
+                    except OmnigentError:
+                        copilot_agent_spec = None
+                    terminal_view = await _auto_create_copilot_terminal(
+                        session_id,
+                        resource_registry,
+                        _publish_event,
+                        server_client=server_client,
+                        ensure_comment_relay=_ensure_comment_relay_started,
+                        agent_spec=copilot_agent_spec,
+                    )
+                except Exception as exc:
+                    _logger.exception(
+                        "Copilot terminal ensure failed for session=%s",
+                        session_id,
+                    )
+                    return _native_terminal_start_error_response(exc, "Copilot")
+            return JSONResponse(
+                status_code=200,
+                content=session_resource_view_to_dict(terminal_view),
+            )
 
         if (
             body.get("ensure_native_terminal")
@@ -8959,6 +9040,7 @@ def create_runner_app(
         _claude_terminal_ensure_locks.pop(session_id, None)
         _pi_terminal_ensure_locks.pop(session_id, None)
         _cursor_terminal_ensure_locks.pop(session_id, None)
+        _copilot_terminal_ensure_locks.pop(session_id, None)
         _kiro_terminal_ensure_locks.pop(session_id, None)
         _antigravity_terminal_ensure_locks.pop(session_id, None)
         _goose_terminal_ensure_locks.pop(session_id, None)
@@ -8986,6 +9068,7 @@ def create_runner_app(
         _claude_terminal_ensure_locks.pop(session_id, None)
         _pi_terminal_ensure_locks.pop(session_id, None)
         _cursor_terminal_ensure_locks.pop(session_id, None)
+        _copilot_terminal_ensure_locks.pop(session_id, None)
         _kiro_terminal_ensure_locks.pop(session_id, None)
         _antigravity_terminal_ensure_locks.pop(session_id, None)
         _goose_terminal_ensure_locks.pop(session_id, None)
@@ -9697,6 +9780,7 @@ _HARNESS_MODEL_ENV_KEY: dict[str, str] = {
     "qwen": "HARNESS_QWEN_MODEL",
     "goose": "HARNESS_GOOSE_MODEL",
     "copilot": "HARNESS_COPILOT_MODEL",
+    "copilot-native": "HARNESS_COPILOT_MODEL",
 }
 _HARNESS_MODEL_ENV_KEY = model_env_keys()
 
@@ -9764,7 +9848,7 @@ def _build_spawn_env_from_spec(
             env = _build_goose_spawn_env(spec, cwd=cwd, workdir=workdir)
         elif harness == "acp":
             env = _build_acp_spawn_env(spec, cwd=cwd, workdir=workdir)
-        elif harness == "copilot":
+        elif harness in {"copilot", "copilot-native"}:
             env = _build_copilot_spawn_env(spec, cwd=cwd, workdir=workdir)
         else:
             builder_path = spawn_env_builders().get(harness)

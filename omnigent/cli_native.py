@@ -479,6 +479,104 @@ def register_native_commands(cli: click.Group) -> None:
         default=None,
         help=(
             "Remote omnigent URL. Ensures the host daemon, asks the "
+            "daemon-spawned runner to launch Copilot, and attaches this TTY. "
+            'Pass --server "" to auto-spawn a persistent local server in the '
+            "background and use that instead of a remote one."
+        ),
+    )
+    @click.option(
+        "-r",
+        "--resume",
+        "resume",
+        is_flag=False,
+        flag_value=_RESUME_PICKER_SENTINEL,
+        default=None,
+        help=(
+            "Resume a prior Omnigent conversation. With a conversation id "
+            "(e.g. ``--resume conv_abc123``) attaches directly; with no value "
+            "opens an interactive picker scoped to copilot-native sessions."
+        ),
+    )
+    @click.option(
+        "--session",
+        "session_id",
+        metavar="SESSION_ID",
+        default=None,
+        hidden=True,
+        help="Deprecated alias for ``--resume <id>``; kept for one release.",
+    )
+    @click.option("--model", default=None, help="Copilot model to use for the native session.")
+    @click.argument("copilot_args", nargs=-1, type=click.UNPROCESSED)
+    def copilot(
+        server: str | None,
+        resume: str | None,
+        session_id: str | None,
+        model: str | None,
+        copilot_args: tuple[str, ...],
+    ) -> None:
+        # :param server: Remote Omnigent server URL, or None for local.
+        # :param resume: None, picker sentinel, or a conversation id.
+        # :param session_id: Legacy ``--session`` id; mutually exclusive with ``--resume``.
+        # :param model: Copilot model id to apply via the in-pane ``/model`` command.
+        # :param copilot_args: Pass-through args for the ``copilot`` TUI.
+        """Launch GitHub Copilot in an Omnigent terminal.
+
+        \b
+        Examples:
+          omnigent copilot
+          omnigent copilot --resume conv_abc123
+          omnigent copilot --resume                  # interactive picker
+          omnigent copilot --server https://<app>.databricksapps.com
+        """
+        from omnigent.copilot_native import run_copilot_native
+
+        cfg = _load_effective_config()
+        if server is None:
+            server = cfg.get("server")
+        if model is None:
+            # Prefer the Copilot-specific default; fall back to the shared
+            # `model` key for back-compat.
+            model = cfg.get("copilot_model") or cfg.get("model")
+        auto_open_conversation = _resolve_auto_open_conversation_from_config(cfg)
+
+        # Validate option combinations before any side effects (see the codex
+        # command): _ensure_backend can spawn the daemon and take the full
+        # local-server-discover timeout, which would mask a bad arg pair as an
+        # outage instead of a usage error.
+        choice = _split_resume_value(resume)
+        if session_id is not None and (choice.picker or choice.conversation_id is not None):
+            raise click.UsageError(
+                "--session and --resume are mutually exclusive; "
+                "prefer --resume (--session is deprecated).",
+            )
+
+        # Ensure the host daemon (local when ``--server`` is omitted/empty, remote
+        # otherwise); the daemon-spawned runner owns the Copilot CLI + the TUI,
+        # and this CLI attaches to the tmux terminal.
+        server = _ensure_backend(server)
+        resolved_session_id = (
+            choice.conversation_id if choice.conversation_id is not None else session_id
+        )
+        run_copilot_native(
+            server=server,
+            session_id=resolved_session_id,
+            resume_picker=choice.picker,
+            copilot_args=_resolve_harness_startup_args(cfg, "copilot-native", copilot_args),
+            model=model,
+            auto_open_conversation=auto_open_conversation,
+        )
+
+    @cli.command(
+        context_settings={
+            "ignore_unknown_options": True,
+            "allow_extra_args": True,
+        }
+    )
+    @click.option(
+        "--server",
+        default=None,
+        help=(
+            "Remote omnigent URL. Ensures the host daemon, asks the "
             "daemon-spawned runner to launch Pi, and attaches this TTY. "
             'Pass --server "" to auto-spawn a persistent local server in the '
             "background and use that instead of a remote one."

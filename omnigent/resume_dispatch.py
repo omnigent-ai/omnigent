@@ -306,6 +306,15 @@ def _dispatch_wrapper(
             hermes_args=(),
         )
         return True
+    if native_agent.key == "copilot":
+        from omnigent.copilot_native import run_copilot_native
+
+        run_copilot_native(
+            server=server,
+            session_id=session_id,
+            copilot_args=(),
+        )
+        return True
     return False
 
 

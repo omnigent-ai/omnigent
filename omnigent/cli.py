@@ -1447,6 +1447,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "claude",
         "codex",
         "config",
+        "copilot",
         "cursor",
         "debby",
         "debug",
@@ -5734,6 +5735,12 @@ _NATIVE_TERMINAL_DISPATCH_SPECS: dict[str, _NativeTerminalDispatchSpec] = {
         module="omnigent.codex_native",
         function="run_codex_native",
         args_param="codex_args",
+        model_strategy="first_class",
+    ),
+    "copilot": _NativeTerminalDispatchSpec(
+        module="omnigent.copilot_native",
+        function="run_copilot_native",
+        args_param="copilot_args",
         model_strategy="first_class",
     ),
     "pi": _NativeTerminalDispatchSpec(

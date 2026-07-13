@@ -54,6 +54,7 @@ OPENCODE_NATIVE_TERMINAL_ROLE = "opencode-native"
 CURSOR_NATIVE_TERMINAL_ROLE = "cursor-native"
 KIRO_NATIVE_TERMINAL_ROLE = "kiro-native"
 GOOSE_NATIVE_TERMINAL_ROLE = "goose-native"
+COPILOT_NATIVE_TERMINAL_ROLE = "copilot-native"
 # Role marker for the runner-owned native Antigravity (agy) TUI terminal.
 # A generic terminal launched with ``terminal=antigravity`` shares the same
 # public resource id, so the ensure path uses this private marker to tell a

@@ -46,6 +46,7 @@ def test_canonical_native_harnesses_resolve() -> None:
         "cursor-native",
         "kimi-native",
         "kiro-native",
+        "copilot-native",
     ):
         assert native_coding_agent_for_harness(harness) is not None
 
@@ -97,6 +98,7 @@ def test_public_agent_name_hides_native_ui_wrapper_names() -> None:
     assert public_agent_name("claude-native-ui") == "Claude"
     assert public_agent_name("codex-native-ui") == "Codex"
     assert public_agent_name("cursor-native-ui") == "Cursor"
+    assert public_agent_name("copilot-native-ui") == "Copilot"
 
 
 def test_public_agent_name_passes_through_regular_names() -> None:

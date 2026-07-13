@@ -17,6 +17,7 @@ from omnigent._wrapper_labels import (
     ANTIGRAVITY_NATIVE_WRAPPER_VALUE,
     CLAUDE_NATIVE_WRAPPER_VALUE,
     CODEX_NATIVE_WRAPPER_VALUE,
+    COPILOT_NATIVE_WRAPPER_VALUE,
     CURSOR_NATIVE_WRAPPER_VALUE,
     GOOSE_NATIVE_WRAPPER_VALUE,
     HERMES_NATIVE_WRAPPER_VALUE,
@@ -207,6 +208,15 @@ HERMES_NATIVE_CODING_AGENT = NativeCodingAgent(
     harness="hermes-native",
     wrapper_label=HERMES_NATIVE_WRAPPER_VALUE,
     terminal_name="hermes",
+)
+
+COPILOT_NATIVE_CODING_AGENT = NativeCodingAgent(
+    key="copilot",
+    display_name="Copilot",
+    agent_name="copilot-native-ui",
+    harness="copilot-native",
+    wrapper_label=COPILOT_NATIVE_WRAPPER_VALUE,
+    terminal_name="copilot",
 )
 
 
@@ -497,6 +507,19 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         interrupt=True,
         streaming=True,
     ),
+    # ``copilot-native`` is a native TUI harness: it launches the Copilot CLI
+    # in a runner-owned tmux pane and injects web turns into that pane.
+    "copilot-native": _C(
+        _IM.NATIVE_TUI,
+        _EL.NONE,
+        _RS.WARM_REATTACH,
+        _EF.COPILOT,
+        _MF.MULTI,
+        _AU.OWN_AUTH,
+        subagents=False,
+        interrupt=True,
+        streaming=False,
+    ),
     # open-responses is resolved via an alternate path, but its executor
     # (omnigent/inner/open_responses_sdk.py) is concrete: interrupt_session()
     # closes the active stream and returns True, supports_streaming() is True,
@@ -528,6 +551,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
             "codex",
             "codex-native",
             "copilot",
+            "copilot-native",
             "cursor",
             "cursor-native",
             "goose",
@@ -555,6 +579,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "codex": "omnigent.inner.codex_harness",
         "codex-native": "omnigent.inner.codex_native_harness",
         "copilot": "omnigent.inner.copilot_harness",
+        "copilot-native": "omnigent.inner.copilot_native_harness",
         "cursor": "omnigent.inner.cursor_harness",
         "cursor-native": "omnigent.inner.cursor_native_harness",
         "goose": "omnigent.inner.goose_harness",
@@ -575,6 +600,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "agy": "antigravity",
         "claude": "claude-sdk",
         "github-copilot": "copilot",
+        "native-copilot": "copilot-native",
         "google-antigravity": "antigravity",
         "kimi-code": "kimi",
         "native-antigravity": "antigravity-native",
@@ -594,6 +620,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
             "antigravity-native",
             "claude-native",
             "codex-native",
+            "copilot-native",
             "cursor-native",
             "goose-native",
             "hermes-native",
@@ -605,6 +632,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
             "native-cursor",
             "native-goose",
             "native-hermes",
+            "native-copilot",
             "native-kimi",
             "native-kiro",
             "native-opencode",
@@ -627,6 +655,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         QWEN_NATIVE_CODING_AGENT,
         KIMI_NATIVE_CODING_AGENT,
         HERMES_NATIVE_CODING_AGENT,
+        COPILOT_NATIVE_CODING_AGENT,
     ),
     model_env_keys={
         "acp": "HARNESS_ACP_MODEL",
@@ -634,6 +663,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "claude-sdk": "HARNESS_CLAUDE_SDK_MODEL",
         "codex": "HARNESS_CODEX_MODEL",
         "copilot": "HARNESS_COPILOT_MODEL",
+        "copilot-native": "HARNESS_COPILOT_MODEL",
         "cursor": "HARNESS_CURSOR_MODEL",
         "goose": "HARNESS_GOOSE_MODEL",
         "kimi": "HARNESS_KIMI_MODEL",
@@ -661,6 +691,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "claude-sdk": "Claude SDK",
         "codex": "Codex",
         "copilot": "Copilot",
+        "copilot-native": "Copilot Native",
         "cursor": "Cursor",
         # openai-agents is intentionally omitted from the picker catalog: it
         # stays a valid harness for YAML specs (and the credential-free
