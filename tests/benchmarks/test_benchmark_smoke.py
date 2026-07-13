@@ -60,6 +60,14 @@ def _smoke_args(**overrides: object) -> argparse.Namespace:
 # ── pure-layer unit checks (no server) ───────────────────────
 
 
+def test_backend_of_classifies_uri_schemes() -> None:
+    """The report's backend label is derived from the URI scheme."""
+    assert bench_run._backend_of(None) == "sqlite"
+    assert bench_run._backend_of("sqlite:////abs/bench.db") == "sqlite"
+    assert bench_run._backend_of("postgresql+psycopg://u@h:5432/db") == "postgres"
+    assert bench_run._backend_of("mysql+mysqldb://u@h:3306/db") == "mysql"
+
+
 def test_percentile_and_throughput() -> None:
     r = RunResult(latencies_ms=[10.0, 20.0, 30.0, 40.0], wall_time=2.0)
     assert r.n_success == 4
@@ -161,6 +169,9 @@ async def test_benchmark_smoke_end_to_end() -> None:
         block = _d(journeys[name])
         assert block["kind"] == "latency"
         assert block["backend"] == "sqlite"
+        # Hardcoded per-journey flag: HTTP journeys are always False, even in a
+        # run whose config.with_runner is True because a runner journey rode along.
+        assert block["needs_runner"] is False
         run_rows = cast(list[dict[str, object]], block["runs"])
         assert run_rows, f"{name} produced no runs"
         # Zero failures — a failure here means the HTTP path itself broke.
@@ -208,6 +219,8 @@ async def test_benchmark_smoke_runner_journeys() -> None:
     for name in _RUNNER_JOURNEYS:
         assert ALL_JOURNEYS[name].needs_runner
         block = _d(journeys[name])
+        # The hardcoded per-journey flag surfaces in the report block.
+        assert block["needs_runner"] is True
         run_rows = cast(list[dict[str, object]], block["runs"])
         assert run_rows, f"{name} produced no runs"
         # Zero failures — a failure here means the full-turn path broke.
