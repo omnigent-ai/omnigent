@@ -3495,7 +3495,7 @@ def _start_local_server(
     :returns: The server handle bundling the subprocess and
         the path to its captured stdout/stderr log file.
     """
-    log_path, log_fh = open_process_log_file("server")
+    log_path, log_fh = open_process_log_file("server", root=_omnigent_log_dir())
     if ephemeral:
         data_tmpdir = tempfile.mkdtemp(prefix="ap-chat-data-")
         db_path = Path(data_tmpdir) / "chat.db"

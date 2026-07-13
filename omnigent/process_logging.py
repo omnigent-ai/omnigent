@@ -120,7 +120,7 @@ def terminal_stream_handler() -> logging.Handler:
     if stream is None:
         return logging.NullHandler()
     handler = logging.StreamHandler(stream)
-    setattr(handler, "_omnigent_process_log_stderr", True)
+    handler._omnigent_process_log_stderr = True
     return handler
 
 
@@ -151,7 +151,7 @@ def configure_process_logging(
     file_handler = logging.FileHandler(path, encoding="utf-8")
     file_handler.setLevel(resolved_level)
     file_handler.setFormatter(formatter)
-    setattr(file_handler, "_omnigent_process_log_path", str(path))
+    file_handler._omnigent_process_log_path = str(path)
     handlers.append(file_handler)
 
     mirror = should_log_to_stderr() if log_to_stderr is None else log_to_stderr
