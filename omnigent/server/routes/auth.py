@@ -772,9 +772,10 @@ def _resolve_oidc_email(
     :param config: The OIDC configuration with JWKS URI and
         expected issuer/audience.
     :returns: The user's email from the ``id_token`` when present and
-        marked verified; ``None`` if the token is missing/invalid,
-        the email claim is absent, or ``email_verified`` is not
-        truthy (and verification is not skipped via config).
+        marked verified; ``None`` if the token is missing/invalid, the
+        email claim is absent or not a non-empty string, or
+        ``email_verified`` is not truthy (and verification is not
+        skipped via config).
     """
     id_token = token_json.get("id_token")
     if not id_token:
@@ -795,15 +796,17 @@ def _resolve_oidc_email(
         return None
 
     email = claims.get(config.email_claim)
-    if not email:
+    if not isinstance(email, str) or not email.strip():
         _logger.warning(
-            "Rejecting id_token: no %r claim (claims present: %s). "
+            "Rejecting id_token: %r claim is missing or not a non-empty string "
+            "(claims present: %s). "
             "IdPs that use a different claim for the email identity "
             "can set OMNIGENT_OIDC_EMAIL_CLAIM.",
             config.email_claim,
             sorted(claims.keys()),
         )
         return None
+    email = email.strip()
 
     # ``email_verified`` refers to the ``email`` claim (OIDC core), so
     # it vouches nothing about a custom identity claim — a token can

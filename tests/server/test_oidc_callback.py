@@ -320,10 +320,11 @@ def test_callback_custom_email_claim_admits_upn(
     claim configured via ``OMNIGENT_OIDC_EMAIL_CLAIM`` and the
     verification opt-out set (a custom claim has no ``email_verified``
     marker), the UPN mints the session. Before the fix this token was
-    rejected outright.
+    rejected outright. Surrounding whitespace is removed before the
+    identity is normalized.
     """
     client, keys = callback_client
-    token = keys.sign_id_token({"preferred_username": "Dana@Example.com"})
+    token = keys.sign_id_token({"preferred_username": " Dana@Example.com "})
 
     resp = _do_callback(client, token)
 
@@ -333,6 +334,33 @@ def test_callback_custom_email_claim_admits_upn(
     decoded = jwt.decode(session_cookie, _TEST_SECRET, algorithms=["HS256"])
     # The UPN flowed into the session sub, normalized like an email.
     assert decoded["sub"] == "dana@example.com"
+
+
+@pytest.mark.parametrize(
+    "callback_client",
+    [{"email_claim": "preferred_username", "skip_email_verification": True}],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "claim_value",
+    [
+        pytest.param(["dana@example.com"], id="list"),
+        pytest.param({"value": "dana@example.com"}, id="object"),
+        pytest.param("   ", id="blank"),
+    ],
+)
+def test_callback_custom_email_claim_rejects_invalid_value(
+    callback_client: tuple[TestClient, _IdpKeys],
+    claim_value: object,
+) -> None:
+    """A malformed configured identity claim is rejected cleanly."""
+    client, keys = callback_client
+    token = keys.sign_id_token({"preferred_username": claim_value})
+
+    resp = _do_callback(client, token)
+
+    assert resp.status_code == 400, resp.text
+    assert resp.cookies.get("ap_session") is None
 
 
 @pytest.mark.parametrize(
