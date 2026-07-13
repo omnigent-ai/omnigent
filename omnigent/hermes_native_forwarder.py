@@ -34,9 +34,15 @@ id (see :func:`_annotate_turn_actions`). The server keys the live card off a
 The forwarder deliberately does NOT take ``idle`` ownership: the runner's
 PTY-activity watcher (see :mod:`omnigent.runner.app`) still emits the id-less
 ``running``/``idle`` ``session.status`` edges for hermes-native (as for
-goose-/cursor-native), and the server pops the active response id on *any* ``idle``
-— so an aborted turn (whose terminal row may never be written) still resolves the
-card. That watcher drives only the web spinner, though — it never wakes a parent
+goose-/cursor-native), and the server pops the active response id on *any* ``idle``.
+A silent tool (e.g. ``sleep``) leaves the pane quiet, so that watcher's ~1s idle
+would settle a live card mid-turn — the forwarder therefore re-asserts the in-flight
+turn's ``running`` each poll. The trade-off: an aborted turn whose terminal row is
+never written is indistinguishable from a silent tool in the store, so its card
+stays live until a terminal row lands (an interrupt's empty-prose assistant row
+closes the turn) or the next user turn re-opens with a fresh id; the watcher's idle
+settles the card only once nothing re-arms the id (turn closed, or this forwarder
+died). That watcher drives only the web spinner, though — it never wakes a parent
 orchestrator. So this forwarder additionally derives turn completion from the
 message log (an ``assistant`` row with no ``tool_calls`` is the agentic loop's
 terminal step) and POSTs an ``external_session_status: idle`` event once per
@@ -677,9 +683,10 @@ def _annotate_turn_actions(
     - an ``assistant`` group with **no** ``function_call`` item is the terminal step
       → clear the id after it.
 
-    The ``idle`` edge is intentionally NOT emitted here: the existing completed-turn
-    idle post and the runner's PTY-activity watcher both resolve the card (the server
-    pops the active response id on any idle) and remain the abort-robust resolvers.
+    The ``idle`` edge is intentionally NOT emitted here: the completed-turn idle
+    post settles the card when the turn closes. A turn that never writes a terminal
+    row (some aborts) keeps its id active — the poll loop's ``running`` re-assert
+    holds the card live until the next turn replaces the id (see module docstring).
     """
     actions: list[_TurnAction] = []
     for msg_id, group_iter in groupby(items, key=lambda it: it.msg_id):

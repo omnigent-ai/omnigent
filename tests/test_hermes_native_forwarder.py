@@ -1307,7 +1307,12 @@ async def test_forward_loop_reasserts_running_while_turn_in_flight(tmp_path, mon
     """A turn that stays in flight across polls (no terminal row yet) re-posts its
     ``running`` edge each poll, so the runner's PTY-activity ``idle`` (fired when the
     pane goes quiet mid-tool) can't strand the live card. No ``idle`` is posted while
-    the turn is unfinished, and the open poll does not double-post ``running``."""
+    the turn is unfinished, and the open poll does not double-post ``running``.
+
+    This is deliberately also the abort-without-terminal-row behavior: from the
+    store such an abort is indistinguishable from a silent tool, so the card stays
+    live until a terminal row lands or the next user turn re-opens with a fresh id
+    (see ``test_annotate_abort_then_new_user_reopens``)."""
     workspace = str(tmp_path)
     db = tmp_path / "state.db"
     con = sqlite3.connect(db)
