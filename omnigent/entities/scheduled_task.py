@@ -44,8 +44,6 @@ class ScheduledTask:
         start (the source repo / working dir). ``None`` when unset.
     :param base_branch: Git base ref a firing branches from when it creates a
         worktree at fire time. Pairs with ``workspace``. ``None`` when unset.
-    :param sandbox_target: Nullable compute-target hint (a provider name such
-        as ``"local"`` or ``"e2b"``). Persisted only; no resolution logic yet.
     :param state: Lifecycle state — one of ``"active"``, ``"paused"``,
         ``"deleted"``. Defaults to ``"active"``.
     :param last_run_at: Unix epoch seconds of the most recent firing, or
@@ -70,7 +68,6 @@ class ScheduledTask:
     reasoning_effort: str | None = None
     workspace: str | None = None
     base_branch: str | None = None
-    sandbox_target: str | None = None
     state: str = "active"
     last_run_at: int | None = None
     last_run_conversation_id: str | None = None

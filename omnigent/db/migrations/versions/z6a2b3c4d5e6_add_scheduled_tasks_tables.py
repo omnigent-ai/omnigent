@@ -55,7 +55,6 @@ def upgrade() -> None:
         sa.Column("workspace", sa.Text(), nullable=True),
         # Git base ref a firing branches from when it creates a worktree.
         sa.Column("base_branch", sa.String(255), nullable=True),
-        sa.Column("sandbox_target", sa.String(32), nullable=True),
         sa.Column("timezone", sa.String(64), nullable=False, server_default="UTC"),
         # Enum stored as a stable int code (see omnigent.db.enum_codecs
         # SCHEDULED_TASK_STATE: active=1, paused=2, deleted=3).

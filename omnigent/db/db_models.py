@@ -1112,10 +1112,6 @@ class SqlScheduledTask(Base):
         session-create's ``git.base_branch`` input). Pairs with ``workspace``:
         ``workspace`` is where, ``base_branch`` is what to branch from. ``None``
         when unset. The per-run *output* branch is not stored on the definition.
-    :param sandbox_target: Nullable compute-target hint naming where a firing
-        should run (a provider name such as ``"local"`` or
-        ``"e2b"`` may live here in a later PR). Persisted only — there is no
-        resolution logic in this PR.
     :param timezone: IANA timezone the trigger is evaluated in, e.g.
         ``"America/Los_Angeles"``.
     :param state: Lifecycle state — ``active``/``paused``/``deleted``.
@@ -1170,10 +1166,6 @@ class SqlScheduledTask(Base):
     # Git base ref a firing branches from when it creates a worktree at fire
     # time (mirrors session-create's git.base_branch input). None when unset.
     base_branch: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    # Nullable compute-target hint (provider name, e.g. "local"/"e2b"). Not yet
-    # resolved — the fire path reads it in a later milestone. A single nullable
-    # string, not an enum.
-    sandbox_target: Mapped[str | None] = mapped_column(String(32), nullable=True)
     timezone: Mapped[str] = mapped_column(String(64), nullable=False, server_default="UTC")
     # Enum stored as a stable int code (see omnigent.db.enum_codecs
     # SCHEDULED_TASK_STATE: active=1, paused=2, deleted=3). The

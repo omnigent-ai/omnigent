@@ -63,7 +63,6 @@ def test_scheduled_tasks_columns(db_engine: Engine) -> None:
         "reasoning_effort",
         "workspace",
         "base_branch",
-        "sandbox_target",
         "timezone",
         "state",
         "last_run_at",

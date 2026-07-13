@@ -50,7 +50,6 @@ class ScheduledTaskStore(ABC):
         reasoning_effort: str | None = None,
         workspace: str | None = None,
         base_branch: str | None = None,
-        sandbox_target: str | None = None,
         state: str = "active",
         metadata: dict[str, Any] | None = None,
     ) -> ScheduledTask:
@@ -71,7 +70,6 @@ class ScheduledTaskStore(ABC):
         :param reasoning_effort: Optional reasoning-effort hint.
         :param workspace: Optional runner start path (source repo / working dir).
         :param base_branch: Optional git base ref to branch from at fire time.
-        :param sandbox_target: Optional compute-target hint.
         :param state: Lifecycle state — ``active``/``paused``/``deleted``/
             ``completed``. Defaults to ``"active"``.
         :param metadata: Optional free-form metadata dict.
@@ -124,7 +122,6 @@ class ScheduledTaskStore(ABC):
         reasoning_effort: str | None = None,
         workspace: str | None = None,
         base_branch: str | None = None,
-        sandbox_target: str | None = None,
         state: str | None = None,
         metadata: dict[str, Any] | None = None,
         last_run_at: int | None = None,

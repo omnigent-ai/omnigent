@@ -42,7 +42,6 @@ def test_create_returns_scheduled_task_with_all_fields(
         reasoning_effort="high",
         workspace="/home/alice/repo",
         base_branch="main",
-        sandbox_target="local",
         metadata={"source": "ui"},
     )
     assert task.id == "st_1"
@@ -57,7 +56,6 @@ def test_create_returns_scheduled_task_with_all_fields(
     assert task.reasoning_effort == "high"
     assert task.workspace == "/home/alice/repo"
     assert task.base_branch == "main"
-    assert task.sandbox_target == "local"
     assert task.metadata == {"source": "ui"}
     assert task.state == "active"
     assert task.last_run_at is None
@@ -82,7 +80,6 @@ def test_create_minimal_defaults(store: SqlAlchemyScheduledTaskStore) -> None:
     assert task.reasoning_effort is None
     assert task.workspace is None
     assert task.base_branch is None
-    assert task.sandbox_target is None
     assert task.metadata == {}
     assert task.state == "active"
 

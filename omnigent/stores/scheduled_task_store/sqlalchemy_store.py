@@ -48,7 +48,6 @@ def _to_entity(row: SqlScheduledTask) -> ScheduledTask:
         reasoning_effort=row.reasoning_effort,
         workspace=row.workspace,
         base_branch=row.base_branch,
-        sandbox_target=row.sandbox_target,
         state=decode_scheduled_task_state(row.state),
         last_run_at=row.last_run_at,
         last_run_conversation_id=row.last_run_conversation_id,
@@ -116,7 +115,6 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         reasoning_effort: str | None = None,
         workspace: str | None = None,
         base_branch: str | None = None,
-        sandbox_target: str | None = None,
         state: str = "active",
         metadata: dict[str, Any] | None = None,
     ) -> ScheduledTask:
@@ -134,7 +132,6 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             reasoning_effort=reasoning_effort,
             workspace=workspace,
             base_branch=base_branch,
-            sandbox_target=sandbox_target,
             state=encode_scheduled_task_state(state),
             last_run_at=None,
             last_run_conversation_id=None,
@@ -191,7 +188,6 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         reasoning_effort: str | None = None,
         workspace: str | None = None,
         base_branch: str | None = None,
-        sandbox_target: str | None = None,
         state: str | None = None,
         metadata: dict[str, Any] | None = None,
         last_run_at: int | None = None,
@@ -233,9 +229,6 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 changed = True
             if base_branch is not None and row.base_branch != base_branch:
                 row.base_branch = base_branch
-                changed = True
-            if sandbox_target is not None and row.sandbox_target != sandbox_target:
-                row.sandbox_target = sandbox_target
                 changed = True
             if state is not None:
                 encoded_state = encode_scheduled_task_state(state)
