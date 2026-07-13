@@ -11,6 +11,7 @@
 // `SessionEventInput`, `SessionStatusEvent.status`).
 
 import type { ConversationItem } from "./conversationItems";
+import type { McpServerStartup } from "./events";
 import type { MessageContentBlock } from "./blocks";
 
 /** Reference to a conversation, as returned on response objects. */
@@ -432,6 +433,14 @@ export interface Session {
    * sees the current stage.
    */
   sandboxStatus?: SandboxStatus | null;
+  /**
+   * Per-MCP-server startup state for native harness sessions
+   * (codex-native). Present while the harness boots its MCP servers or
+   * when servers were cancelled/failed; `null` otherwise. Sourced from
+   * the server's `_session_mcp_startup_cache` at snapshot build time so
+   * a client opening the session mid-startup sees the startup band.
+   */
+  mcpStartup?: Record<string, McpServerStartup> | null;
   /**
    * Response id of the turn currently in flight, or `null`/absent when
    * the session is idle. Sourced from the server's

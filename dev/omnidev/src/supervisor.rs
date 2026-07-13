@@ -62,6 +62,9 @@ pub struct Supervisor {
     shared: Arc<Mutex<Shared>>,
     env: Vec<(String, String)>,
     vite_enabled: bool,
+    /// Whether `--trust-lan-origins` was requested, so we can warn if it was
+    /// asked for but no LAN interface turned up any origins to trust.
+    trust_lan_origins: bool,
     slots: [Slot; 3],
     /// Generations we stopped on purpose — their exits are not crashes.
     expected_stops: HashSet<(usize, u64)>,
@@ -71,7 +74,12 @@ pub struct Supervisor {
 }
 
 impl Supervisor {
-    pub fn new(pod: Arc<Pod>, shared: Arc<Mutex<Shared>>, vite_enabled: bool) -> Supervisor {
+    pub fn new(
+        pod: Arc<Pod>,
+        shared: Arc<Mutex<Shared>>,
+        vite_enabled: bool,
+        trust_lan_origins: bool,
+    ) -> Supervisor {
         let env = pod.env();
         let (exit_tx, exit_rx) = mpsc::unbounded_channel();
         Supervisor {
@@ -79,6 +87,7 @@ impl Supervisor {
             shared,
             env,
             vite_enabled,
+            trust_lan_origins,
             slots: Default::default(),
             expected_stops: HashSet::new(),
             gen_counter: 0,
@@ -104,9 +113,18 @@ impl Supervisor {
             self.pod.ports.server,
             self.pod.ports.vite
         ));
+        if !self.pod.trusted_origins.is_empty() {
+            self.event(format!(
+                "trusting LAN origins for device testing: {}",
+                self.pod.trusted_origins.join(", ")
+            ));
+        } else if self.trust_lan_origins {
+            self.event("--trust-lan-origins: no LAN interface found; no extra origins trusted");
+        }
 
         self.start_backend().await;
         if self.vite_enabled {
+            self.prepare_vite().await;
             self.spawn(ProcId::Vite);
         }
 
@@ -169,6 +187,7 @@ impl Supervisor {
                 if self.vite_enabled {
                     self.event("restarting vite");
                     self.stop(ProcId::Vite).await;
+                    self.prepare_vite().await;
                     self.spawn(ProcId::Vite);
                 }
             }
@@ -192,6 +211,7 @@ impl Supervisor {
         cmd.args(&spec.args)
             .current_dir(&spec.cwd)
             .envs(self.env.iter().cloned())
+            .envs(spec.extra_env.iter().cloned())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -250,6 +270,77 @@ impl Supervisor {
                 status,
             });
         });
+    }
+
+    /// Run `npm install` to completion before Vite starts, but only when deps
+    /// are missing or stale — otherwise Vite's dependency scan fails on an
+    /// unresolved import (e.g. a dep added to package.json but not installed).
+    /// Output streams into the Vite pane. A failed/absent install is logged but
+    /// non-fatal: we still let Vite try, so a transient npm hiccup doesn't block
+    /// the whole session.
+    async fn prepare_vite(&self) {
+        if !self.pod.needs_npm_install() {
+            return;
+        }
+        self.set_status(ProcId::Vite, ProcStatus::Starting);
+        self.shared.lock().unwrap().log_proc(
+            ProcId::Vite,
+            "web deps missing or stale — running npm install".into(),
+        );
+
+        let spec = ProcSpec::npm_install(&self.pod);
+        let mut cmd = Command::new(&spec.program);
+        cmd.args(&spec.args)
+            .current_dir(&spec.cwd)
+            .envs(self.env.iter().cloned())
+            .envs(spec.extra_env.iter().cloned())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                self.shared
+                    .lock()
+                    .unwrap()
+                    .log_proc(ProcId::Vite, format!("failed to run npm install: {e}"));
+                return;
+            }
+        };
+        if let Some(out) = child.stdout.take() {
+            self.pump(ProcId::Vite, out);
+        }
+        if let Some(err) = child.stderr.take() {
+            self.pump(ProcId::Vite, err);
+        }
+
+        // `--loglevel http` streams a line per package fetch, but npm still
+        // goes quiet during the final tree-build/link phase. A slow heartbeat
+        // covers those gaps so the pane never looks frozen.
+        let started = Instant::now();
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
+        heartbeat.tick().await; // the first tick fires immediately; skip it
+        let status = loop {
+            tokio::select! {
+                result = child.wait() => break result,
+                _ = heartbeat.tick() => {
+                    let secs = started.elapsed().as_secs();
+                    self.shared
+                        .lock()
+                        .unwrap()
+                        .log_proc(ProcId::Vite, format!("… npm install running ({secs}s)"));
+                }
+            }
+        };
+        match status {
+            Ok(s) if s.success() => self.event(format!(
+                "npm install complete ({}s)",
+                started.elapsed().as_secs()
+            )),
+            Ok(s) => self.event(format!("npm install exited {s} — starting Vite anyway")),
+            Err(e) => self.event(format!("npm install wait error: {e}")),
+        }
     }
 
     /// Spawn a task that streams one pipe into the shared buffer, line by line.

@@ -180,6 +180,12 @@ class Conversation:
         listing (and the sidebar), surfacing only when the caller
         passes ``include_archived=True``. ``False`` for normal
         sessions; toggled via ``PATCH /v1/sessions/{id}``.
+    :param search_snippet: Transient, list-only excerpt of the chat
+        content that matched a ``search_query`` — set by
+        ``list_conversations`` whenever the query hit an item's body (even
+        if the title also matched), so the search UI can show *where* the
+        session matched. Never persisted (not a DB column) and ``None`` on
+        every non-search read path and title-only matches.
     """
 
     id: str
@@ -205,6 +211,9 @@ class Conversation:
     workspace: str | None = None
     git_branch: str | None = None
     archived: bool = False
+    # Transient: populated only by list_conversations on a content search;
+    # never read from or written to the DB.
+    search_snippet: str | None = None
 
 
 # ── Conversation item data types ───────────────────────
@@ -487,8 +496,8 @@ class RoutingDecisionData(BaseModel):
     """
     Data payload for an intelligent model-router decision item.
 
-    Emitted by the runner's per-turn cost advisor at the START of an
-    advised turn (see :func:`omnigent.runner.cost_advisor`) and persisted
+    Emitted by the server-side smart routing path at the START of an
+    advised turn and persisted
     as a display-only transcript item so the model the router chose shows
     in the conversation flow the moment the turn begins. Listed in
     :data:`NON_CONTENT_ITEM_TYPES` so the agent loop's history filter
@@ -499,9 +508,6 @@ class RoutingDecisionData(BaseModel):
 
     :param model: The concrete brain model the router chose, e.g.
         ``"databricks-claude-opus-4-8"``.
-    :param tier: The difficulty tier the router assigned, one of
-        ``"cheap"`` / ``"medium"`` / ``"expensive"``, e.g.
-        ``"expensive"``.
     :param applied: ``True`` when the brain actually ran on
         :attr:`model` this turn (optimize mode, no user pin); ``False``
         when the router only WOULD have picked it (advise/shadow mode, or
@@ -512,9 +518,12 @@ class RoutingDecisionData(BaseModel):
     """
 
     model: str
-    tier: Literal["cheap", "medium", "expensive"]
     applied: bool
     rationale: str
+    #: Sub-agent name when this decision was made for a child session and the
+    #: item is being mirrored into the parent's transcript, e.g. ``"claude_code"``.
+    #: ``None`` for session-local routing decisions (the usual case).
+    agent: str | None = None
 
     @field_validator("model")
     @classmethod

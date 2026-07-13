@@ -1,7 +1,7 @@
 // Agent info surface: the MCP-server and policy badges, and the
 // header info-icon popover that displays them.
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   CheckIcon,
   CopyIcon,
@@ -45,9 +45,11 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { ModelValueCombobox } from "@/components/ModelValueCombobox";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { capitalizeAgentName } from "@/lib/agentLabels";
 import { coercePolicyParams } from "@/lib/policyParams";
+import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import { agentRootName } from "@/lib/forkHarness";
 import { nativeCodingAgentForAgentName } from "@/lib/nativeCodingAgents";
 import { copyText } from "@/lib/clipboard";
@@ -275,9 +277,10 @@ function AddPolicyDialog({
   const [factoryParams, setFactoryParams] = useState<Record<string, string>>({});
   const [paramError, setParamError] = useState<string | null>(null);
   const addPolicy = useAddPolicy(sessionId);
+  const codexModelOptions = useChatStore((s) => s.codexModelOptions);
 
   const entry = registry.find((r) => r.handler === selected);
-  const schema = entry?.params_schema as
+  const rawSchema = entry?.params_schema as
     | {
         properties?: Record<
           string,
@@ -286,7 +289,7 @@ function AddPolicyDialog({
             description?: string;
             default?: unknown;
             enum?: string[];
-            items?: { type?: string; enum?: string[] };
+            items?: { type?: string; enum?: string[]; "x-enum-source"?: string };
             uniqueItems?: boolean;
           }
         >;
@@ -294,7 +297,26 @@ function AddPolicyDialog({
       }
     | null
     | undefined;
-  const properties = schema?.properties ?? {};
+  const modelIds = useMemo(() => {
+    const ids: string[] = CLAUDE_NATIVE_MODELS.map((m) => m.id);
+    for (const opt of codexModelOptions) {
+      if (opt.id && !ids.includes(opt.id)) ids.push(opt.id);
+    }
+    return ids;
+  }, [codexModelOptions]);
+  const properties = useMemo(() => {
+    const props = rawSchema?.properties ?? {};
+    if (!modelIds.length) return props;
+    const enriched: typeof props = {};
+    for (const [key, prop] of Object.entries(props)) {
+      if (prop.items?.["x-enum-source"] === "models" && !prop.items.enum) {
+        enriched[key] = { ...prop, items: { ...prop.items, enum: modelIds } };
+      } else {
+        enriched[key] = prop;
+      }
+    }
+    return enriched;
+  }, [rawSchema?.properties, modelIds]);
   const paramKeys = Object.keys(properties);
 
   function handleSelect(handler: string) {
@@ -461,7 +483,7 @@ function AddPolicyDialog({
                         <span>
                           (
                           {prop.type === "array" && prop.items?.enum
-                            ? "select"
+                            ? "multi-select"
                             : prop.type === "array"
                               ? "comma-separated"
                               : prop.type}
@@ -507,42 +529,62 @@ function AddPolicyDialog({
                         }
                         className="mt-0.5 w-full rounded border border-border bg-background px-2 py-1.5 text-sm"
                       >
-                        {prop.enum.map((v) => (
+                        {prop.enum.map((v: string) => (
                           <option key={v} value={v}>
                             {v}
                           </option>
                         ))}
                       </select>
                     ) : prop?.type === "array" && prop.items?.enum ? (
-                      <div className="mt-0.5 flex flex-wrap gap-x-3 gap-y-1">
-                        {prop.items.enum.map((v) => {
-                          const current = factoryParams[key]
-                            ? factoryParams[key].split(",").filter(Boolean)
-                            : Array.isArray(prop?.default)
-                              ? (prop.default as string[])
-                              : [];
-                          const checked = current.includes(v);
-                          return (
-                            <label key={v} className="flex items-center gap-1 text-sm">
-                              <input
-                                type="checkbox"
-                                checked={checked}
-                                onChange={(e) => {
-                                  const next = e.target.checked
-                                    ? [...current, v]
-                                    : current.filter((x) => x !== v);
-                                  setFactoryParams((prev) => ({
-                                    ...prev,
-                                    [key]: next.join(","),
-                                  }));
-                                }}
-                                className="rounded border-border"
-                              />
-                              <span>{v}</span>
-                            </label>
-                          );
-                        })}
-                      </div>
+                      (() => {
+                        const current = factoryParams[key]
+                          ? factoryParams[key].split(",").filter(Boolean)
+                          : Array.isArray(prop?.default)
+                            ? (prop.default as string[])
+                            : [];
+                        return (
+                          <div className="mt-0.5 space-y-1.5">
+                            {current.length > 0 && (
+                              <div className="flex flex-wrap gap-1">
+                                {current.map((v: string) => (
+                                  <span
+                                    key={v}
+                                    className="inline-flex items-center gap-0.5 rounded-md bg-muted px-1.5 py-0.5 text-xs"
+                                  >
+                                    {v}
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        const next = current.filter((x) => x !== v);
+                                        setFactoryParams((prev) => ({
+                                          ...prev,
+                                          [key]: next.join(","),
+                                        }));
+                                      }}
+                                      className="ml-0.5 text-muted-foreground hover:text-foreground"
+                                    >
+                                      <XIcon className="size-3" />
+                                    </button>
+                                  </span>
+                                ))}
+                              </div>
+                            )}
+                            <ModelValueCombobox
+                              options={prop.items.enum}
+                              selected={current}
+                              onToggle={(v) => {
+                                const next = current.includes(v)
+                                  ? current.filter((x) => x !== v)
+                                  : [...current, v];
+                                setFactoryParams((prev) => ({
+                                  ...prev,
+                                  [key]: next.join(","),
+                                }));
+                              }}
+                            />
+                          </div>
+                        );
+                      })()
                     ) : (
                       <input
                         type={

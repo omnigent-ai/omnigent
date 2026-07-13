@@ -132,6 +132,14 @@ export interface Conversation {
    * Per-viewer; lifts the active-row dot suppression on the client.
    */
   viewer_unread?: boolean;
+  /**
+   * Excerpt of the chat content that matched the current `search_query`,
+   * centered on the match with `…` marking elided ends. Present only on
+   * search responses where the query hit a message body rather than the
+   * title, so the search UI (command palette) can show *where* a session
+   * matched. Absent on non-search fetches and title-only matches.
+   */
+  search_snippet?: string | null;
 }
 
 export interface ConversationsPage {

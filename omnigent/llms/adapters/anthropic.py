@@ -432,9 +432,13 @@ def _anthropic_to_chat(resp: dict[str, Any]) -> dict[str, Any]:
         "usage": {
             "prompt_tokens": usage.get("input_tokens"),
             "completion_tokens": usage.get("output_tokens"),
-            "total_tokens": (
-                (usage.get("input_tokens") or 0) + (usage.get("output_tokens") or 0) or None
-            ),
+            # NB: no trailing ``or None``. Precedence makes
+            # ``(a or 0) + (b or 0) or None`` collapse a genuine zero total to
+            # ``None`` (yielding an inconsistent ``prompt=0, completion=0,
+            # total=None``), and it disagrees with the streaming path, which
+            # reports ``input + output`` directly. Keep the per-operand ``or 0``
+            # guards so a missing count is treated as zero.
+            "total_tokens": (usage.get("input_tokens") or 0) + (usage.get("output_tokens") or 0),
         },
     }
 

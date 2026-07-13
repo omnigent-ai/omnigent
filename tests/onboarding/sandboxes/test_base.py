@@ -99,3 +99,79 @@ def test_start_host_env_prefix_is_honored_by_a_real_shell() -> None:
         ["sh", "-c", probe], capture_output=True, text=True, check=True
     ).stdout.strip()
     assert out == "tok-123:host_abc:managed-abc"
+
+
+def test_start_host_default_materialize_clones_repo() -> None:
+    """
+    With a ``repo_url``, the default :meth:`materialize_workspace` clones into
+    ``<workspace>/<repo_name>`` and ``start_host`` returns that checkout dir —
+    the exec-model behavior every default provider (Modal/Daytona/E2B/…)
+    inherits, unchanged by the extraction of the clone into its own method.
+    """
+    launcher = _RecordingLauncher()
+
+    workspace = launcher.start_host(
+        "sb-1",
+        token="tok-123",
+        host_id="host_abc",
+        host_name="managed-abc",
+        server_url="https://srv",
+        repo_url="https://github.com/org/repo",
+        repo_branch="release-1.2",
+        repo_name="repo",
+    )
+
+    assert workspace == "/root/workspace/repo"
+    assert (
+        "git clone --branch release-1.2 --single-branch -- "
+        "https://github.com/org/repo /root/workspace/repo"
+    ) in launcher.commands
+
+
+def test_materialize_workspace_override_resolves_local_checkout_without_cloning() -> None:
+    """
+    A provider whose sandbox already carries the repository overrides
+    :meth:`materialize_workspace` to resolve the identity to a local path and
+    performs NO clone. ``start_host`` must use the override's returned path and
+    still launch the host — proving the seam lets a provider swap repo
+    materialization without reimplementing ``start_host``.
+    """
+
+    class _LocalCheckoutLauncher(_RecordingLauncher):
+        def materialize_workspace(
+            self,
+            sandbox_id: str,
+            *,
+            workspace: str,
+            repo_url: str,
+            repo_branch,
+            repo_name,
+            on_stage=None,
+        ) -> str:
+            # Resolve the repo identity to a pre-provisioned local checkout;
+            # fetch the branch into it rather than cloning the URL.
+            local = f"/checkouts/{repo_name}"
+            if repo_branch is not None:
+                self.run(sandbox_id, f"git -C {local} checkout {repo_branch}")
+            return local
+
+    launcher = _LocalCheckoutLauncher()
+
+    workspace = launcher.start_host(
+        "sb-1",
+        token="tok-123",
+        host_id="host_abc",
+        host_name="managed-abc",
+        server_url="https://srv",
+        repo_url="https://github.com/org/repo",
+        repo_branch="main",
+        repo_name="repo",
+    )
+
+    assert workspace == "/checkouts/repo"
+    # No clone happened; the override resolved a local checkout instead.
+    assert not any(cmd.startswith("git clone") for cmd in launcher.commands)
+    assert "git -C /checkouts/repo checkout main" in launcher.commands
+    # The host still launched, in the resolved workspace.
+    [raw] = launcher.backgrounded
+    assert raw.endswith("omnigent host --server https://srv")

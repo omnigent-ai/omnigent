@@ -1638,7 +1638,7 @@ def _overview_row_names(options: list[str], selectable: list[bool]) -> list[str]
 def test_overview_lists_all_harnesses_in_priority_order(isolated_config, monkeypatch) -> None:
     """The overview shows every harness on one compact row, in 0.3 priority order.
 
-    No "More" folding: all twelve harnesses are visible at once, followed by
+    No "More" folding: all thirteen harnesses are visible at once, followed by
     Quit. A regression that hides a harness, reorders the core six, or
     reintroduces a collapse row fails here. The menu also opts into the compact
     top-level rendering.
@@ -1659,6 +1659,7 @@ def test_overview_lists_all_harnesses_in_priority_order(isolated_config, monkeyp
         "Copilot",
         "Kiro",
         "Kimi Code",
+        "Custom ACP agent",
         "Quit",
     ]
     assert _overview_row_names(options, selectable) == expected
@@ -1677,6 +1678,38 @@ def test_overview_lists_all_harnesses_in_priority_order(isolated_config, monkeyp
     for row in expected:
         assert row in rendered
     assert "more" not in rendered.lower()
+
+
+def test_overview_lists_configured_acp_agents_as_rows(isolated_config, monkeypatch) -> None:
+    """Each configured ACP agent gets its own top-level overview row.
+
+    Promotes the generic-ACP agents out of the drill-in so they sit alongside
+    the built-in harnesses (matching the web picker, which lists each
+    ``acp:<slug>``), followed by an "Add custom ACP agent" row. A regression that
+    re-buries them under a single opaque "Custom ACP agent" row fails here.
+    """
+    config_path = os.path.join(isolated_config, "config.yaml")
+    with open(config_path, "w") as f:
+        yaml.safe_dump(
+            {
+                "acp": {
+                    "agents": [
+                        {"name": "Gemini CLI", "command": "gemini --experimental-acp"},
+                        {"name": "My Goose", "command": "goose acp"},
+                    ]
+                }
+            },
+            f,
+        )
+    options, selectable, _descriptions, _compact, _max_visible = _capture_setup_overview(
+        monkeypatch
+    )
+    names = _overview_row_names(options, selectable)
+    assert "Gemini CLI" in names
+    assert "My Goose" in names
+    assert "Add custom ACP agent" in names
+    # Once agents exist, the single opaque "Custom ACP agent" row is gone.
+    assert "Custom ACP agent" not in names
 
 
 def test_overview_rows_are_single_line(isolated_config, monkeypatch) -> None:
@@ -1827,6 +1860,7 @@ def test_overview_truncates_long_status_for_narrow_terminal(isolated_config, mon
         ("10", "_manage_copilot_harness"),
         ("11", "_manage_kiro_harness"),
         ("12", "_manage_kimi_harness"),
+        ("13", "_add_acp_agent"),
     ],
 )
 def test_overview_dispatches_to_correct_manager(

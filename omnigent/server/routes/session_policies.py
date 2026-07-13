@@ -25,6 +25,7 @@ from omnigent.policies.registry import (
     validate_factory_params,
 )
 from omnigent.runtime import get_caps
+from omnigent.runtime.policies.builder import invalidate_session_policy_specs_cache
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, AuthProvider
 from omnigent.server.routes._auth_helpers import get_user_id, require_access
 from omnigent.server.schemas import (
@@ -205,6 +206,7 @@ def create_session_policies_router(
                 f"Policy with name '{body.name}' already exists in this session",
                 code=ErrorCode.CONFLICT,
             ) from exc
+        invalidate_session_policy_specs_cache(session_id)
         return _entity_to_response(policy)
 
     @router.get("/sessions/{session_id}/policies")
@@ -337,6 +339,7 @@ def create_session_policies_router(
         )
         if policy is None:
             raise OmnigentError("Policy not found", code=ErrorCode.NOT_FOUND)
+        invalidate_session_policy_specs_cache(session_id)
         return _entity_to_response(policy)
 
     @router.delete("/sessions/{session_id}/policies/{policy_id}")
@@ -366,6 +369,7 @@ def create_session_policies_router(
                 user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
             )
         store.delete(policy_id, session_id)
+        invalidate_session_policy_specs_cache(session_id)
         return {"deleted": True}
 
     return router

@@ -154,7 +154,9 @@ from omnigent.server.auth import (
     LEVEL_READ,
     RESERVED_USER_PUBLIC,
     AuthProvider,
+    SharingMode,
     local_single_user_enabled,
+    workspace_sharing_blocked,
 )
 from omnigent.server.bundles import bundle_location, validate_agent_bundle
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
@@ -198,6 +200,7 @@ from omnigent.server.routes._host_worktree import CreatedWorktree
 from omnigent.server.routes._origin import require_trusted_origin
 from omnigent.server.schemas import (
     AgentObject,
+    BrowserActionRequestEvent,
     ChildSessionList,
     ChildSessionSummary,
     CompletedEvent,
@@ -212,6 +215,7 @@ from omnigent.server.schemas import (
     ErrorDetail,
     ErrorEvent,
     GrantPermissionRequest,
+    McpServerStartup,
     MCPServerSummary,
     ModelUsage,
     OutputItemDoneEvent,
@@ -241,6 +245,7 @@ from omnigent.server.schemas import (
     SessionLabelsResponse,
     SessionList,
     SessionListItem,
+    SessionMcpStartupEvent,
     SessionModelEvent,
     SessionModelOptionsEvent,
     SessionReasoningEffortEvent,
@@ -282,6 +287,12 @@ from omnigent.stores.conversation_store import (
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.host_store import Host, HostStore
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.telemetry import emit as _tel_emit
+from omnigent.telemetry.events import SessionCreatedEvent as _TelSessionCreatedEvent
+from omnigent.telemetry.events import SessionDeletedEvent as _TelSessionDeletedEvent
+from omnigent.telemetry.events import SessionStoppedEvent as _TelSessionStoppedEvent
+from omnigent.telemetry.installation_id import get_installation_id as _get_installation_id
+from omnigent.telemetry.surface import classify_surface as _classify_surface
 from omnigent.tools.client_specified import parse_client_side_tool_specs
 
 _logger = logging.getLogger(__name__)
@@ -401,6 +412,17 @@ _EXTERNAL_STATUS_ASSISTANT_SCAN_LIMIT: int = 1000
 _EXTERNAL_COMPACTION_STATUS_TYPE: str = "external_compaction_status"
 _EXTERNAL_COMPACTION_STATUS_VALUES: frozenset[str] = frozenset(
     {"in_progress", "completed", "failed"}
+)
+
+# Per-MCP-server startup progress observed by a native forwarder while
+# its harness boots MCP servers (codex-native today). Republished as a
+# ``session.mcp_startup`` SSE event so the web UI shows which servers
+# are still starting — instead of an apparently hung session — and
+# which failed or were cancelled. Payload:
+# ``{"servers": {"safe": {"status": "starting", "error": null}}}``.
+_EXTERNAL_MCP_STARTUP_TYPE: str = "external_mcp_startup"
+_EXTERNAL_MCP_STARTUP_STATUS_VALUES: frozenset[str] = frozenset(
+    {"starting", "ready", "failed", "cancelled"}
 )
 
 # Usage update from a terminal-backed runtime (claude-native
@@ -560,6 +582,7 @@ _CODEX_NATIVE_WRAPPER_LABEL_VALUE = CODEX_NATIVE_CODING_AGENT.wrapper_label
 _CODEX_NATIVE_HARNESS = CODEX_NATIVE_CODING_AGENT.harness
 _CODEX_NATIVE_MODEL = CODEX_NATIVE_CODING_AGENT.agent_name
 _CURSOR_NATIVE_WRAPPER_LABEL_VALUE = CURSOR_NATIVE_CODING_AGENT.wrapper_label
+_CURSOR_NATIVE_HARNESS = CURSOR_NATIVE_CODING_AGENT.harness
 _KIRO_NATIVE_WRAPPER_LABEL_VALUE = KIRO_NATIVE_CODING_AGENT.wrapper_label
 _CLAUDE_NATIVE_MESSAGE_TIMEOUT_S = 30.0
 _NATIVE_TERMINAL_START_FAILED_CODE = "native_terminal_start_failed"
@@ -598,6 +621,27 @@ _HOST_LAUNCH_RESULT_TIMEOUT_S = 10.0
 # the wait first. Empty 2xx body on timeout → Claude defers to its
 # built-in prompt (fail-ask).
 _CLAUDE_NATIVE_PERMISSION_HOOK_TIMEOUT_S = 86400.0
+
+# ── Embedded-browser action bridge ──────────────────────────────────
+# In-process registries (keyed by action_id) bridging a runner-side
+# ``browser_*`` tool POST, parked on a Future, to the desktop renderer that
+# drives the browser and POSTs the result back.
+_browser_action_registry: dict[str, asyncio.Future[dict[str, Any]]] = {}  # -> parked Future
+_browser_action_owners: dict[str, str] = {}  # -> issuing session_id (result POST must match)
+# -> claim_token: single-winner lease so fan-out to multiple renderers can't
+# double-execute; the result POST must present the matching token.
+_browser_action_claims: dict[str, str] = {}
+
+# Server-side wait budget for an interactive browser action. MUST stay below the
+# runner's 60s read timeout (``_BROWSER_ACTION_TIMEOUT`` in tool_dispatch.py) so
+# the server returns its own clean timeout JSON before the runner severs the POST.
+_BROWSER_ACTION_AWAIT_S = 30.0
+
+# Returned (HTTP 200) when the await elapses with no renderer result (desktop app
+# not open / no subscriber); matches the runner-side timeout JSON.
+_BROWSER_ACTION_TIMEOUT_RESULT: dict[str, Any] = {
+    "error": "browser action timed out — is the session open in the Omnigent desktop app?"
+}
 
 # Tools whose prompts get the "Accept & allow all edits" UI affordance —
 # the exact set ``acceptEdits`` mode auto-approves.
@@ -844,6 +888,7 @@ _ALLOWED_EVENT_TYPES: frozenset[str] = frozenset(ITEM_TYPE_TO_DATA_CLS.keys()) |
     _EXTERNAL_SESSION_STATUS_TYPE,
     _EXTERNAL_SESSION_USAGE_TYPE,
     _EXTERNAL_COMPACTION_STATUS_TYPE,
+    _EXTERNAL_MCP_STARTUP_TYPE,
     _EXTERNAL_MODEL_CHANGE_TYPE,
     _EXTERNAL_REASONING_EFFORT_CHANGE_TYPE,
     _EXTERNAL_SESSION_TODOS_TYPE,
@@ -1064,6 +1109,13 @@ _session_terminal_pending_cache: dict[str, bool] = {}
 # ManagedLaunchTracker — so a reload after a dead launch still shows
 # why the sandbox never came up.
 _session_sandbox_status_cache: dict[str, SandboxStatus] = {}
+# Per-MCP-server startup state keyed by session id. Written by
+# _publish_mcp_startup as the native forwarder reports harness MCP
+# startup progress; read by _build_session_response to populate the
+# ``mcp_startup`` snapshot field so a client opening (or reloading) the
+# session mid-startup still sees the startup band. Evicted when the
+# forwarder posts an empty/settled map — absent == no startup state.
+_session_mcp_startup_cache: dict[str, dict[str, McpServerStartup]] = {}
 # Per-session runner-skills cache + in-flight fetch. The snapshot fetches
 # these off its critical path (see _fetch_runner_skills) so the continuous
 # poll can't pin the runner's event loop and wedge a turn.
@@ -2005,6 +2057,42 @@ def _session_status_with_child_rollup(
     return own_status
 
 
+async def _best_effort_stop(
+    session_id: str,
+    conversation_store: ConversationStore,
+    runner_router: Any,
+) -> None:
+    """Stop a running session before a destructive lifecycle action.
+
+    Mirrors the client-side stop-then-archive/delete pattern: if the
+    session (or any direct sub-agent child) is still running, attempt to
+    stop it via the runner. Failures are swallowed so the caller can
+    always proceed — the session must remain deletable/archivable even
+    when the runner is offline or unreachable.
+
+    :param session_id: Session/conversation identifier.
+    :param conversation_store: Store for child-id lookup.
+    :param runner_router: The ``RunnerRouter`` for runner-client
+        resolution, or ``None`` in tests / in-process setups.
+    """
+    try:
+        child_ids_map = await asyncio.to_thread(
+            conversation_store.list_child_conversation_ids_by_parent,
+            [session_id],
+        )
+        child_ids = child_ids_map.get(session_id, [])
+        status = _session_status_with_child_rollup(session_id, child_ids)
+        if status != "running":
+            return
+        await _stop_session_via_runner(session_id, runner_router)
+    except Exception:  # noqa: BLE001 — best-effort; must not block archive/delete
+        _logger.debug(
+            "Best-effort stop failed for %s; proceeding anyway",
+            session_id,
+            exc_info=True,
+        )
+
+
 @dataclass(frozen=True)
 class SessionLiveness:
     """
@@ -2136,6 +2224,9 @@ def _build_session_list_item(
         ),
         viewer_last_seen=viewer_last_seen,
         viewer_unread=viewer_unread,
+        # Transient; set by the store only on a content search. The WS
+        # push-stream path leaves it None (no query in flight there).
+        search_snippet=conv.search_snippet,
     )
 
 
@@ -2570,6 +2661,9 @@ def _build_session_response(
         # once the launch succeeds; a failed launch is retained with
         # its reason. Populated by _publish_sandbox_status.
         sandbox_status=_session_sandbox_status_cache.get(conv.id),
+        # Replay harness MCP-server startup state (codex-native) so a
+        # client opening the session mid-startup sees the startup band.
+        mcp_startup=_session_mcp_startup_cache.get(conv.id),
         # In-flight turn id so a mid-turn reconnect can reopen a streaming
         # ``activeResponse`` (the turn-start ``running`` edge that carried it
         # is not replayed on the SSE stream). Populated for native-terminal
@@ -3247,7 +3341,7 @@ def _persist_native_cumulative_usage(
     # delta negative (clawing back already-spent budget). Monotonicity makes a
     # downward report a no-op, so the worst a forged post can do is leave the
     # figure unchanged. (See also the runner-token guard on cost_control.*
-    # label writes in ``cost_advisor`` — usage was the missing half.)
+    # label writes — usage was the missing half.)
     old_cost = float(current.get("total_cost_usd", 0.0) or 0.0)
     old_policy_cost = float(current.get("policy_cost_usd", 0.0) or 0.0)
     if cin is not None:
@@ -4053,6 +4147,15 @@ async def _resolve_elicitation(
                 result=pre_resolved,
             )
             _prune_pre_resolved_harness_elicitations()
+    # Wake a currently-parked long-poll via resolved_elsewhere, not only its
+    # Future: setting the Future alone races the sever/re-park cycle and the
+    # ASK-gated call hangs. Set the event directly; the signal helper's
+    # parked-is-None branch would clobber the verdict-carrying tombstone.
+    if isinstance(elicitation_id, str) and elicitation_id:
+        _parked = _harness_parked_elicitations.get(elicitation_id)
+        if _parked is not None and _harness_elicitation_owners.get(elicitation_id) == session_id:
+            _parked.resolved_elsewhere.set()
+
     # Fan-out for every other subscribed client (other tabs, REPL
     # TUI). Idempotent vs. the runner's own ``wait_for_user_approval``
     # finally / harness hook finally — those also publish for the id.
@@ -5704,6 +5807,37 @@ def _publish_sandbox_status(session_id: str, stage: str, error: str | None = Non
         conversation_id=session_id,
         stage=stage,
         error=error,
+    )
+    session_stream.publish(session_id, event.model_dump())
+
+
+def _publish_mcp_startup(session_id: str, servers: dict[str, McpServerStartup]) -> None:
+    """
+    Publish a typed :class:`SessionMcpStartupEvent` to the live stream.
+
+    Fired when a native forwarder reports harness MCP-server startup
+    progress via ``external_mcp_startup``, so the web UI can show
+    per-server startup state while the harness boots instead of an
+    apparently hung session. Also updates the snapshot cache so a client
+    opening the session mid-startup seeds the band from the snapshot's
+    ``mcp_startup`` field; a map with nothing left to show — empty, or
+    every server ``ready`` — evicts the cache entry, mirroring the web
+    store's all-ready clear so a reloading client never seeds a band
+    that renders nothing.
+
+    :param session_id: Session/conversation identifier,
+        e.g. ``"conv_abc123"``.
+    :param servers: Latest per-server startup map, e.g.
+        ``{"safe": McpServerStartup(status="starting", error=None)}``.
+    """
+    if any(record.status != "ready" for record in servers.values()):
+        _session_mcp_startup_cache[session_id] = servers
+    else:
+        _session_mcp_startup_cache.pop(session_id, None)
+    event = SessionMcpStartupEvent(
+        type="session.mcp_startup",
+        conversation_id=session_id,
+        servers=servers,
     )
     session_stream.publish(session_id, event.model_dump())
 
@@ -8590,6 +8724,8 @@ async def _emit_server_routing_decision(
     conversation_store: ConversationStore,
     model: str,
     verdict: dict[str, Any],
+    *,
+    agent: str | None = None,
 ) -> None:
     """Persist and publish a ``routing_decision`` transcript chip.
 
@@ -8597,19 +8733,22 @@ async def _emit_server_routing_decision(
     to the runner.  The chip shows the judge's model pick at turn start
     — the same UX the runner-side advisor produced, but driven entirely
     by the server.
+
+    :param agent: Sub-agent name to include when mirroring a child
+        session's routing decision into the parent's transcript.
     """
     import uuid
 
     from omnigent.runtime import session_stream
 
-    tier = verdict.get("tier", "medium")
     rationale = verdict.get("rationale", "")
-    item_data = {
+    item_data: dict[str, Any] = {
         "model": model,
-        "tier": tier if tier in ("cheap", "medium", "expensive") else "medium",
         "applied": True,
         "rationale": rationale if isinstance(rationale, str) else "",
     }
+    if agent is not None:
+        item_data["agent"] = agent
     try:
         parsed_data = parse_item_data("routing_decision", item_data)
     except (ValueError, TypeError):
@@ -8805,7 +8944,15 @@ async def _forward_event_to_runner(
     ) or _parent_routing_on
     _routed_model: str | None = None
     _verdict: dict[str, Any] | None = None
-    if effective_runner_override is None and _routing_enabled and body.type == "message":
+    # For child sessions, route even when the orchestrator specified a model via
+    # sys_session_send (effective_runner_override is already set). Smart routing
+    # always wins over the LLM's own model choice when the parent toggle is on.
+    _should_route = (
+        _routing_enabled
+        and body.type == "message"
+        and (effective_runner_override is None or conv.parent_conversation_id is not None)
+    )
+    if _should_route:
         from omnigent.server.smart_routing import route_turn
 
         _harness = _resolve_harness(conv)
@@ -8864,6 +9011,18 @@ async def _forward_event_to_runner(
                 _routed_model,
                 _verdict,
             )
+            # Mirror the routing decision into the parent session so the
+            # orchestrator's transcript also shows which model was chosen
+            # for this sub-agent — the decision is otherwise only visible
+            # on the child session screen.
+            if _parent_routing_on and conv.parent_conversation_id is not None:
+                await _emit_server_routing_decision(
+                    conv.parent_conversation_id,
+                    conversation_store,
+                    _routed_model,
+                    _verdict,
+                    agent=agent_name or "",
+                )
     except (httpx.HTTPError, ConnectionError):
         _logger.exception(
             "Forward to runner failed for session=%s; "
@@ -9034,7 +9193,9 @@ async def _dispatch_session_event_to_runner(
         ) or _native_parent_routing_on
         _native_routed_model: str | None = None
         _native_verdict: dict[str, Any] | None = None
-        if conv.model_override is None and _native_routing_enabled:
+        if _native_routing_enabled and (
+            conv.model_override is None or conv.parent_conversation_id is not None
+        ):
             from omnigent.server.smart_routing import route_turn
 
             _harness = _resolve_harness(conv)
@@ -9100,6 +9261,14 @@ async def _dispatch_session_event_to_runner(
                 _native_routed_model,
                 _native_verdict,
             )
+            if _native_parent_routing_on and conv.parent_conversation_id is not None:
+                await _emit_server_routing_decision(
+                    conv.parent_conversation_id,
+                    conversation_store,
+                    _native_routed_model,
+                    _native_verdict,
+                    agent=agent_name or "",
+                )
         return _SessionEventDispatchResult(item_id=None, pending_id=pending_id)
     item_id = await _forward_event_to_runner(
         session_id,
@@ -9271,8 +9440,7 @@ def _routing_decision_item_from_sse(
     double render).
 
     Returns ``None`` for every other event, and for a malformed routing
-    item (empty model / unknown tier) so a bad frame can't poison the
-    relay.
+    item (empty model) so a bad frame can't poison the relay.
 
     :param event: Parsed SSE event dict from the runner stream.
     :returns: A ``routing_decision`` :class:`NewConversationItem`, or
@@ -10942,6 +11110,16 @@ async def _persist_policy_deny_sentinel(
     policy DENY keeps follow-up turns and the items API consistent with the
     streamed deny users already see.
 
+    After persisting, publish the committed item as a
+    ``response.output_item.done`` — the same commit event a streamed
+    assistant message emits (see :func:`_flush_relay_text`). Without it the
+    live deny only exists as the ``_publish_policy_deny`` sentinel delta,
+    which the web folds into a provisional ``live:`` preview block that the
+    terminal ``response.completed`` sweeps; the deny then reappeared only
+    after a refresh re-hydrated the persisted item. Emitting the commit event
+    lets the web reconcile the preview into a durable, itemId-keyed block that
+    survives the sweep, a reconnect, and a refresh alike.
+
     :param session_id: Session/conversation identifier.
     :param conv: Conversation whose agent/model name tags the message.
     :param reason: Human-readable deny reason from the policy verdict.
@@ -10966,7 +11144,13 @@ async def _persist_policy_deny_sentinel(
             },
         ),
     )
-    await asyncio.to_thread(conversation_store.append, session_id, [item])
+    persisted = await asyncio.to_thread(conversation_store.append, session_id, [item])
+    if persisted:
+        done_event = OutputItemDoneEvent(
+            type="response.output_item.done",
+            item=persisted[0].to_api_dict(),
+        )
+        session_stream.publish(session_id, done_event.model_dump())
 
 
 async def _evaluate_input_policy(
@@ -11887,12 +12071,12 @@ def _derive_terminal_launch_args_from_spec(sub_spec: AgentSpec) -> list[str] | N
     """
     Derive native-terminal YOLO pass-through args from a trusted sub-spec.
 
-    polly's native workers (claude-native / codex-native) launch in a
-    headless pane where no human can answer an ApprovalCard, so every
-    Edit/Write/Bash that prompts stalls the worker. This translates a
+    polly's native workers (claude-native / codex-native / cursor-native)
+    launch in a headless pane where no human can answer an ApprovalCard, so
+    every Edit/Write/Bash that prompts stalls the worker. This translates a
     worker bundle's declared full-bypass intent into the per-session
-    ``terminal_launch_args`` the runner already appends to the claude /
-    codex argv:
+    ``terminal_launch_args`` the runner already appends to the native CLI
+    argv:
 
     - claude-native + ``executor.config.permission_mode`` set ->
       ``["--permission-mode", "<value>"]``. The value is passed through
@@ -11909,12 +12093,21 @@ def _derive_terminal_launch_args_from_spec(sub_spec: AgentSpec) -> list[str] | N
       and the codex-sdk executor's ``approvalPolicy="never"``). An explicit
       ``executor.config.yolo: false`` opts back out for a read-only / must
       -keep-prompting sub-agent. See issue #171.
+    - cursor-native -> ``["--yolo"]`` by DEFAULT. Headless cursor workers
+      otherwise stall on cursor-agent's in-terminal approval prompts (also
+      mirrored as web elicitation cards). ``--yolo`` is cursor-agent's
+      don't-ask / full-bypass flag (``--auto-review`` still prompts for
+      some calls). An explicit ``executor.config.yolo: false`` opts back
+      out. When ``executor.config.permission_mode`` / ``exec_mode`` is set
+      to ``auto`` or ``auto-review``, emit ``["--auto-review"]`` instead
+      (Smart Auto) so a bundle can choose Claude-style auto without full
+      yolo.
 
-    Only the two native harnesses are translated; for any other harness
-    (e.g. ``claude-sdk``, whose bypass is set via the SDK ``permissionMode``
-    spawn env, not a terminal flag) this returns ``None`` so no terminal
-    args are set. ``None`` is also returned when the relevant field is
-    absent / falsey.
+    Only those native harnesses are translated; for any other harness
+    (e.g. ``claude-sdk`` / ``cursor``, whose bypass is set via the SDK
+    ``permissionMode`` / ``auto_review`` spawn path, not a terminal flag)
+    this returns ``None`` so no terminal args are set. ``None`` is also
+    returned when the relevant field is absent / falsey.
 
     :param sub_spec: The trusted child sub-agent spec, resolved from the
         server-loaded parent bundle via :func:`_resolve_subagent_spec`.
@@ -11941,6 +12134,22 @@ def _derive_terminal_launch_args_from_spec(sub_spec: AgentSpec) -> list[str] | N
         if _spec_config_flag_explicitly_disabled(sub_spec, "yolo"):
             return None
         return _validate_terminal_launch_args(["--dangerously-bypass-approvals-and-sandbox"])
+    if harness == _CURSOR_NATIVE_HARNESS:
+        # Prefer an explicit Smart Auto mode when the bundle asks for it
+        # (mirrors Claude's ``permission_mode: auto``), else full --yolo
+        # by default so headless polly workers don't stall on mirrored
+        # approval cards. ``yolo: false`` is the keep-prompting opt-out.
+        mode = (
+            sub_spec.executor.config.get("permission_mode")
+            or sub_spec.executor.config.get("exec_mode")
+            or ""
+        )
+        mode_norm = str(mode).strip().lower()
+        if mode_norm in ("auto", "auto-review"):
+            return _validate_terminal_launch_args(["--auto-review"])
+        if _spec_config_flag_explicitly_disabled(sub_spec, "yolo"):
+            return None
+        return _validate_terminal_launch_args(["--yolo"])
     return None
 
 
@@ -12277,12 +12486,12 @@ async def _create_session_from_existing_agent(
     # from the trusted, server-loaded sub-spec only — any caller-supplied
     # ``body.terminal_launch_args`` is ignored. This is the YOLO seam:
     # claude-native maps ``permission_mode`` to ``--permission-mode``,
-    # while codex-native defaults to full bypass
-    # (``--dangerously-bypass-approvals-and-sandbox``) so a headless
-    # codex worker can edit/run unattended without stalling on codex's
-    # on-request approval default (opt out with ``yolo: false``). A
-    # caller cannot inject launch wiring by smuggling args through the
-    # spawn body.
+    # codex-native defaults to full bypass
+    # (``--dangerously-bypass-approvals-and-sandbox``), and cursor-native
+    # defaults to ``--yolo`` so a headless worker can edit/run unattended
+    # without stalling on native approval prompts (opt out with
+    # ``yolo: false``). A caller cannot inject launch wiring by smuggling
+    # args through the spawn body.
     #
     # Sessions that resolve their own agent (top-level sessions and the
     # manual Add Agent child flow where ``sub_agent_name`` is null) keep
@@ -12407,6 +12616,39 @@ async def _create_session_from_existing_agent(
         conv = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
     elif body.labels:
         await asyncio.to_thread(conversation_store.set_labels, conv.id, body.labels)
+
+    # Emit session.created exactly once at creation time.
+    # Best-effort: skip if the host opted out via HostHelloFrame.
+    try:
+        import hashlib as _hashlib
+
+        _hr: HostRegistry | None = getattr(request.app.state, "host_registry", None)
+        _host_opted_out = (
+            _hr is not None
+            and conv.host_id is not None
+            and _hr.is_host_telemetry_opted_out(conv.host_id)
+        )
+        if not _host_opted_out:
+            _install_id = _get_installation_id()
+            _anon_uid: str | None = None
+            if user_id is not None:
+                _salt = f"{_install_id}:{user_id}" if _install_id else user_id
+                _anon_uid = _hashlib.sha256(_salt.encode()).hexdigest()[:16]
+            _tel_emit(
+                _TelSessionCreatedEvent(
+                    session_id=conv.id,
+                    agent_id=agent.id,
+                    harness=native_agent.harness if native_agent is not None else None,
+                    surface=_classify_surface(request.headers.get("user-agent")),
+                    installation_id=_install_id,
+                    anon_user_id=_anon_uid,
+                    is_fork=body.parent_session_id is not None,
+                    is_sub_agent=body.sub_agent_name is not None,
+                )
+            )
+    except Exception:  # noqa: BLE001 — telemetry must not disrupt session creation
+        pass
+
     if body.initial_items:
         runner_client = await _get_runner_client(conv.id, runner_router)
         if runner_client is None:
@@ -14321,9 +14563,13 @@ def create_sessions_router(
         :returns: List of project names.
         """
         user_id = _require_user(request, auth_provider)
+        # Filing into a project is owner-only, so the sidebar renders project
+        # folders only on "My sessions". Scope to owned sessions so a project
+        # owned by someone else (with a session shared to this user) doesn't
+        # surface as one of their own folders.
         return await asyncio.to_thread(
             conversation_store.list_projects,
-            accessible_by=user_id,
+            owned_by=user_id,
         )
 
     # ── PUT /sessions/{session_id}/read-state ─────────────────────
@@ -14556,6 +14802,12 @@ def create_sessions_router(
         # disabled entirely — no auth_provider).
         user_id = _require_user(request, auth_provider)
         normalized_query = search_query if search_query else None
+        # A specific project folder ("My sessions"-only) must show only the
+        # viewer's own sessions — a session shared with them but filed under a
+        # like-named project belongs on "Shared with me", not in this folder.
+        # The flat list (project=None) and Unfiled (project="") stay unscoped so
+        # shared sessions still surface for the "Shared with me" tab.
+        owned_by = user_id if project else None
         page = await asyncio.to_thread(
             conversation_store.list_conversations,
             limit=limit,
@@ -14564,6 +14816,7 @@ def create_sessions_router(
             agent_id=agent_id,
             agent_name=agent_name,
             accessible_by=user_id,
+            owned_by=owned_by,
             has_agent_id=True,
             # The store treats ``None`` as "no kind filter"; the API
             # spells that ``kind=any`` to keep the param required-ish
@@ -14771,7 +15024,14 @@ def create_sessions_router(
         # ``permission_level === null`` full-access sentinel in the web sidebar
         # is never tripped by a streamed null. The GET list endpoint keeps
         # exclude_none — it replaces whole pages, so it has nothing to clear.
-        return [item.model_dump() for item in items]
+        #
+        # search_snippet is excluded: it is search-only (populated just by
+        # GET /v1/sessions?search_query=), so this no-query path always has it
+        # None. Dumping it as an explicit null would overwrite a snippet the
+        # search response put in the client cache, making the palette's match
+        # preview flicker away on the next stream tick. Omitting the key leaves
+        # the cached snippet untouched.
+        return [item.model_dump(exclude={"search_snippet"}) for item in items]
 
     @router.websocket("/sessions/updates")
     async def session_updates(websocket: WebSocket) -> None:
@@ -15078,6 +15338,8 @@ def create_sessions_router(
         await _require_access(
             user_id, session_id, required_level, permission_store, conversation_store
         )
+        if body.archived is True:
+            await _best_effort_stop(session_id, conversation_store, runner_router)
         if body.runner_id is not None and permission_store is not None:
             if not check_session_access(
                 user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
@@ -18465,6 +18727,174 @@ def create_sessions_router(
         path = f"/v1/sessions/{session_id}/resources/{resource_id}"
         return await _proxy_get_to_runner(session_id, path)
 
+    # ── Embedded-browser action bridge ───────────────────────────
+
+    @router.post(
+        "/sessions/{session_id}/browser/action_request",
+        # Internal embedded-browser flow — hidden from the public API reference.
+        include_in_schema=False,
+        response_model=None,
+    )
+    async def browser_action_request(
+        request: Request,
+        session_id: str,
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        """
+        Park one embedded-browser action and await the renderer result.
+
+        Mints an ``action_id``, parks a Future owned by ``session_id``, publishes
+        a ``browser.action_request`` event, and awaits up to
+        ``_BROWSER_ACTION_AWAIT_S``; on timeout returns the timeout result (HTTP
+        200) so the runner gets a clean tool error. Called by the runner's
+        ``browser_*`` dispatch, not the LLM.
+
+        :param request: The inbound request, used for identity extraction.
+        :param session_id: Session/conversation identifier, e.g.
+            ``"conv_abc123"``.
+        :param body: ``{"action": <str>, "args": <dict>}`` where ``action``
+            is the ``browser_`` tool name minus the prefix.
+        :returns: The renderer's action-result JSON, or the timeout result.
+        :raises OmnigentError: 404 if no session exists.
+        """
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access_and_level(
+            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+        )
+        action = body.get("action")
+        args = body.get("args")
+        if not isinstance(action, str) or not action:
+            raise OmnigentError(
+                "browser action_request requires a non-empty 'action'",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if not isinstance(args, dict):
+            args = {}
+
+        action_id = f"baction_{secrets.token_hex(16)}"
+        future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+        _browser_action_registry[action_id] = future
+        _browser_action_owners[action_id] = session_id
+        try:
+            event = BrowserActionRequestEvent(
+                type="browser.action_request",
+                action_id=action_id,
+                action=action,
+                args=args,
+            )
+            session_stream.publish(session_id, event.model_dump())
+            done, _pending = await asyncio.wait(
+                {future},
+                timeout=_BROWSER_ACTION_AWAIT_S,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if future in done and not future.cancelled():
+                return future.result()
+            # Timed out/cancelled with no renderer result (no subscribed app).
+            return _BROWSER_ACTION_TIMEOUT_RESULT
+        finally:
+            # Drop registry entries so a resolved/timed-out action leaks nothing.
+            if _browser_action_registry.get(action_id) is future:
+                _browser_action_registry.pop(action_id, None)
+            _browser_action_owners.pop(action_id, None)
+            _browser_action_claims.pop(action_id, None)
+
+    @router.post(
+        "/sessions/{session_id}/browser/action_claim/{action_id}",
+        # Internal embedded-browser flow — hidden from the public API reference.
+        include_in_schema=False,
+        response_model=None,
+    )
+    async def browser_action_claim(
+        request: Request,
+        session_id: str,
+        action_id: str,
+    ) -> dict[str, Any]:
+        """
+        Atomically claim a parked browser action (one winner per action).
+
+        The request event fans out to every subscribed renderer; an atomic
+        ``setdefault`` grants exactly one claim so they don't double-execute.
+        Winner gets ``{"claimed": true, "claim_token": <token>}``; everyone
+        else ``{"claimed": false}``.
+
+        :param request: The inbound request, used for identity extraction.
+        :param session_id: Session/conversation identifier, e.g.
+            ``"conv_abc123"``.
+        :param action_id: The action to claim, e.g. ``"baction_abc123"``.
+        :returns: ``{"claimed": true, "claim_token": <str>}`` to the winner,
+            ``{"claimed": false}`` to losers or for an unknown/expired action.
+        :raises OmnigentError: 404 if no session exists.
+        """
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access_and_level(
+            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+        )
+        # Unknown / already-resolved action: nothing to claim.
+        if _browser_action_owners.get(action_id) != session_id:
+            return {"claimed": False}
+        # Single-winner lease via atomic setdefault: a losing racer sees the
+        # winner's token, not its own, and bails.
+        claim_token = secrets.token_hex(16)
+        existing = _browser_action_claims.setdefault(action_id, claim_token)
+        if existing != claim_token:
+            return {"claimed": False}
+        return {"claimed": True, "claim_token": claim_token}
+
+    @router.post(
+        "/sessions/{session_id}/browser/action_result/{action_id}",
+        # Internal embedded-browser flow — hidden from the public API reference.
+        include_in_schema=False,
+        status_code=202,
+        response_model=None,
+    )
+    async def browser_action_result(
+        request: Request,
+        session_id: str,
+        action_id: str,
+        body: dict[str, Any],
+    ) -> dict[str, bool]:
+        """
+        Deliver a browser action result, resolving the parked Future.
+
+        Guarded by owner + claim-token: the caller must present the token this
+        action was leased under, so a renderer that lost the claim race can't
+        resolve the Future with stale work (tokenless/mismatched → 403).
+
+        :param request: The inbound request, used for identity extraction.
+        :param session_id: Session/conversation identifier, e.g.
+            ``"conv_abc123"``.
+        :param action_id: The action being resolved, e.g. ``"baction_abc"``.
+        :param body: ``{"result": <dict>, "claim_token": <str>}``.
+        :returns: ``{"resolved": true}`` when the Future was set,
+            ``{"resolved": false}`` when it was already done/gone.
+        :raises OmnigentError: 404 if no session exists; 403 on a missing or
+            mismatched claim token or an owner mismatch.
+        """
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access_and_level(
+            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+        )
+        claim_token = body.get("claim_token")
+        expected = _browser_action_claims.get(action_id)
+        if not isinstance(claim_token, str) or expected is None or claim_token != expected:
+            raise OmnigentError(
+                "browser action result requires a matching claim_token",
+                code=ErrorCode.FORBIDDEN,
+            )
+        # Only the session that issued the action may resolve it.
+        if _browser_action_owners.get(action_id) != session_id:
+            raise OmnigentError(
+                "browser action is not owned by this session",
+                code=ErrorCode.FORBIDDEN,
+            )
+        future = _browser_action_registry.get(action_id)
+        if future is None or future.done():
+            return {"resolved": False}
+        result = body.get("result")
+        future.set_result(result if isinstance(result, dict) else {"result": result})
+        return {"resolved": True}
+
     # ── POST /sessions/{session_id}/events ───────────────────────
 
     @router.post(
@@ -18728,6 +19158,7 @@ def create_sessions_router(
             _EXTERNAL_SESSION_STATUS_TYPE,
             _EXTERNAL_SESSION_USAGE_TYPE,
             _EXTERNAL_COMPACTION_STATUS_TYPE,
+            _EXTERNAL_MCP_STARTUP_TYPE,
             _EXTERNAL_MODEL_CHANGE_TYPE,
             _EXTERNAL_REASONING_EFFORT_CHANGE_TYPE,
             _EXTERNAL_SESSION_TODOS_TYPE,
@@ -18972,6 +19403,23 @@ def create_sessions_router(
             # honestly, and the next message auto-relaunches the session on
             # its (still-online) host via the normal message-dispatch
             # relaunch path below.
+            try:
+                import hashlib as _hashlib
+
+                _srv_id = _get_installation_id()
+                _anon: str | None = None
+                if user_id is not None:
+                    _salt = f"{_srv_id}:{user_id}" if _srv_id else user_id
+                    _anon = _hashlib.sha256(_salt.encode()).hexdigest()[:16]
+                _tel_emit(
+                    _TelSessionStoppedEvent(
+                        session_id=session_id,
+                        installation_id=_srv_id,
+                        anon_user_id=_anon,
+                    )
+                )
+            except Exception:  # noqa: BLE001 — telemetry is best-effort
+                pass
             return {"queued": False}
         if body.type == _APPROVAL_TYPE:
             # Deliver the verdict through the shared resolver: it
@@ -19241,6 +19689,40 @@ def create_sessions_router(
                 _publish_compaction_completed(session_id, None)
             else:
                 _publish_compaction_failed(session_id)
+            return {"queued": False}
+        if body.type == _EXTERNAL_MCP_STARTUP_TYPE:
+            # Harness MCP-server startup progress (codex-native forwarder):
+            # republish as a ``session.mcp_startup`` SSE so the web UI shows
+            # per-server startup state while the harness boots. Malformed
+            # entries are rejected at the boundary — a bogus map would only
+            # strand the UI's startup band.
+            raw_servers = body.data.get("servers")
+            if not isinstance(raw_servers, dict):
+                raise OmnigentError(
+                    "external_mcp_startup requires data.servers to be an object "
+                    f"mapping server names to startup records; got {raw_servers!r}",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            mcp_servers: dict[str, McpServerStartup] = {}
+            for server_name, record in raw_servers.items():
+                record_status = record.get("status") if isinstance(record, dict) else None
+                if not (
+                    isinstance(server_name, str)
+                    and server_name
+                    and record_status in _EXTERNAL_MCP_STARTUP_STATUS_VALUES
+                ):
+                    raise OmnigentError(
+                        "external_mcp_startup server records require a status in "
+                        f"{sorted(_EXTERNAL_MCP_STARTUP_STATUS_VALUES)}; got "
+                        f"{server_name!r}: {record!r}",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+                record_error = record.get("error")
+                mcp_servers[server_name] = McpServerStartup(
+                    status=record_status,
+                    error=record_error if isinstance(record_error, str) and record_error else None,
+                )
+            _publish_mcp_startup(session_id, mcp_servers)
             return {"queued": False}
         if body.type == _EXTERNAL_SESSION_USAGE_TYPE:
             # Persist the harness-reported cumulative usage so the
@@ -19867,6 +20349,7 @@ def create_sessions_router(
                 "Session not found",
                 code=ErrorCode.NOT_FOUND,
             )
+        await _best_effort_stop(session_id, conversation_store, runner_router)
         # Runner-side resource cleanup is best-effort: if the bound
         # runner is offline or unbound, the session must still be
         # deletable. Server-owned records (files and conversation row
@@ -19936,6 +20419,10 @@ def create_sessions_router(
         # failed-launch session would leak one entry for the process
         # lifetime.
         _session_sandbox_status_cache.pop(session_id, None)
+        # Same for MCP startup state: failed/cancelled maps are retained
+        # for reload visibility while the session exists, so a session
+        # whose MCP startup never settled clean would leak its entry.
+        _session_mcp_startup_cache.pop(session_id, None)
         # Drop the deleted session's per-user read-state from every user's
         # caches so they don't accumulate orphan entries for the process
         # lifetime.
@@ -19969,6 +20456,32 @@ def create_sessions_router(
                     # still deletes the row and revokes the token.
                     getattr(request.app.state, "sandbox_config", None),
                 )
+        try:
+            import hashlib as _hashlib
+            import time as _time
+
+            _srv_id = _get_installation_id()
+            _anon_d: str | None = None
+            if user_id is not None:
+                _salt_d = f"{_srv_id}:{user_id}" if _srv_id else user_id
+                _anon_d = _hashlib.sha256(_salt_d.encode()).hexdigest()[:16]
+            _usage = conv.session_usage or {}
+            _duration: float | None = None
+            with contextlib.suppress(Exception):
+                _duration = _time.time() - conv.created_at
+            _tel_emit(
+                _TelSessionDeletedEvent(
+                    session_id=session_id,
+                    installation_id=_srv_id,
+                    anon_user_id=_anon_d,
+                    duration_seconds=_duration,
+                    input_tokens=_usage.get("input_tokens"),
+                    output_tokens=_usage.get("output_tokens"),
+                    total_cost_usd=_usage.get("total_cost_usd"),
+                )
+            )
+        except Exception:  # noqa: BLE001 — telemetry is best-effort
+            pass
         return ConversationDeleted(id=session_id)
 
     # ── Permission management endpoints ──────────────────────────
@@ -20001,6 +20514,36 @@ def create_sessions_router(
         await _require_access(
             user_id, session_id, LEVEL_MANAGE, permission_store, conversation_store
         )
+        # Server-wide sharing policy gate (see SharingMode). Applied only
+        # to *new* grants — revoke/list and owner grants are unaffected.
+        # ``getattr`` default keeps a hand-built app (a router mounted without
+        # create_app, e.g. in a focused test) from AttributeError-ing; every
+        # production path sets these via create_app.
+        _sharing_mode = getattr(request.app.state, "sharing_mode", lambda: SharingMode.ON)()
+        if _sharing_mode == SharingMode.OFF:
+            raise OmnigentError(
+                "Sharing has been disabled for this Omnigent server.",
+                code=ErrorCode.FORBIDDEN,
+            )
+        # RESTRICTED_READ_ONLY blocks sharing entirely (even read) for a session
+        # whose cwd is a home dir or the filesystem root — that workspace is too
+        # broad to expose. Other sessions fall through to the read-only cap.
+        if _sharing_mode == SharingMode.RESTRICTED_READ_ONLY:
+            _conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if _conv is not None and workspace_sharing_blocked(_conv.workspace):
+                raise OmnigentError(
+                    "This session's working directory (a home or root directory) "
+                    "cannot be shared on this Omnigent server.",
+                    code=ErrorCode.FORBIDDEN,
+                )
+        if (
+            _sharing_mode in (SharingMode.READ_ONLY, SharingMode.RESTRICTED_READ_ONLY)
+            and body.level > LEVEL_READ
+        ):
+            raise OmnigentError(
+                "Sharing is limited to read-only access on this Omnigent server.",
+                code=ErrorCode.FORBIDDEN,
+            )
         if permission_store is None:
             raise OmnigentError(
                 "Permissions not enabled",
@@ -20011,11 +20554,21 @@ def create_sessions_router(
                 "Cannot modify your own permissions",
                 code=ErrorCode.FORBIDDEN,
             )
-        if body.user_id == RESERVED_USER_PUBLIC and body.level > LEVEL_READ:
-            raise OmnigentError(
-                "Public access is limited to read-only (level 1)",
-                code=ErrorCode.INVALID_INPUT,
-            )
+        if body.user_id == RESERVED_USER_PUBLIC:
+            # Public-access kill switch, independent of the sharing_mode gate
+            # above (see app.state.public_sharing). Blocks the anyone-with-the
+            # -link grant while leaving user-to-user sharing intact. ``getattr``
+            # default mirrors the sharing_mode read above (hand-built apps).
+            if not getattr(request.app.state, "public_sharing", lambda: True)():
+                raise OmnigentError(
+                    "Public access has been disabled for this Omnigent server.",
+                    code=ErrorCode.FORBIDDEN,
+                )
+            if body.level > LEVEL_READ:
+                raise OmnigentError(
+                    "Public access is limited to read-only (level 1)",
+                    code=ErrorCode.INVALID_INPUT,
+                )
         existing = await asyncio.to_thread(permission_store.get, body.user_id, session_id)
         if existing is not None and existing.level == LEVEL_OWNER:
             raise OmnigentError(

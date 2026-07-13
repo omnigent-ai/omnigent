@@ -9,7 +9,6 @@ import pytest
 import sqlalchemy as sa
 from alembic import command
 from sqlalchemy.engine import Engine
-from sqlalchemy.exc import IntegrityError
 
 from omnigent.db.utils import (
     _build_alembic_config,
@@ -49,17 +48,31 @@ def test_agents_session_id_index_removed(db_engine: Engine) -> None:
     assert "ix_agents_session_id" not in index_names
 
 
-def test_ix_conversations_agent_id_added(db_engine: Engine) -> None:
-    """ix_conversations_agent_id must be present after the migration."""
-    index_names = {i["name"] for i in sa.inspect(db_engine).get_indexes("conversations")}
-    assert "ix_conversations_agent_id" in index_names
+def test_ix_agent_configuration_agent_id_added(db_engine: Engine) -> None:
+    """The agent-lookup index lives on agent_configuration at head.
+
+    ix_conversations_agent_id moved there when the agent binding split
+    out of conversations.
+    """
+    conv_indexes = {i["name"] for i in sa.inspect(db_engine).get_indexes("conversations")}
+    assert "ix_conversations_agent_id" not in conv_indexes
+    ra_indexes = {i["name"] for i in sa.inspect(db_engine).get_indexes("agent_configuration")}
+    assert "ix_agent_configuration_agent_id" in ra_indexes
 
 
-def test_agents_name_unique_index_exists(db_engine: Engine) -> None:
-    """ix_agents_template_name unique index must still exist."""
+def test_agents_name_index_exists(db_engine: Engine) -> None:
+    """The template-name partial unique index is replaced by a plain name index.
+
+    Template-name uniqueness now lives in the store (MySQL has no partial
+    indexes); the DB keeps only a non-unique lookup index on
+    ``(workspace_id, name, kind, id)`` — kind is included so the template
+    lookup seeks past same-named session copies.
+    """
     indexes = {i["name"]: i for i in sa.inspect(db_engine).get_indexes("agents")}
-    assert "ix_agents_template_name" in indexes
-    assert indexes["ix_agents_template_name"]["unique"]
+    assert "ix_agents_template_name" not in indexes
+    assert "ix_agents_name" in indexes
+    assert not indexes["ix_agents_name"]["unique"]
+    assert indexes["ix_agents_name"]["column_names"] == ["workspace_id", "name", "kind", "id"]
 
 
 def test_template_agent_kind_stored_and_read(db_engine: Engine) -> None:
@@ -97,7 +110,7 @@ def test_session_agent_kind_stored_and_read(db_engine: Engine) -> None:
 
 
 def test_agents_session_id_fk_accepts_existing_session(db_engine: Engine) -> None:
-    """conversations.agent_id (forward pointer) accepts a valid agent id."""
+    """agent_configuration.agent_id (forward pointer) accepts a valid agent id."""
     with db_engine.begin() as conn:
         conn.execute(
             sa.text(
@@ -107,23 +120,32 @@ def test_agents_session_id_fk_accepts_existing_session(db_engine: Engine) -> Non
             ),
             {"id": "ag_bound", "ts": 1700000001, "name": "bound-agent", "loc": "ag_bound/bundle"},
         )
+        # The agent binding lives on agent_configuration, paired 1:1 with
+        # the conversations row.
         conn.execute(
             sa.text(
                 "INSERT INTO conversations"
-                " (id, created_at, updated_at, root_conversation_id, kind, agent_id)"
-                " VALUES (:id, :ts, :ts, :id, 1, :agent_id)"
+                " (id, created_at, updated_at, root_conversation_id)"
+                " VALUES (:id, :ts, :ts, :id)"
             ),
-            {"id": "conv_bound", "ts": 1700000002, "agent_id": "ag_bound"},
+            {"id": "conv_bound", "ts": 1700000002},
+        )
+        conn.execute(
+            sa.text(
+                "INSERT INTO agent_configuration (conversation_id, agent_id)"
+                " VALUES (:id, :agent_id)"
+            ),
+            {"id": "conv_bound", "agent_id": "ag_bound"},
         )
         stored = conn.execute(
-            sa.text("SELECT agent_id FROM conversations WHERE id = :id"),
+            sa.text("SELECT agent_id FROM agent_configuration WHERE conversation_id = :id"),
             {"id": "conv_bound"},
         ).scalar_one()
     assert stored == "ag_bound"
 
 
 def test_agents_session_id_fk_rejects_missing_session(db_engine: Engine) -> None:
-    """Without DB FK, conversations.agent_id accepts any value including nonexistent agents.
+    """Without DB FK, agent_configuration.agent_id accepts any value including nonexistent agents.
 
     Referential integrity is now the application's responsibility.
     """
@@ -132,36 +154,55 @@ def test_agents_session_id_fk_rejects_missing_session(db_engine: Engine) -> None
         conn.execute(
             sa.text(
                 "INSERT INTO conversations"
-                " (id, created_at, updated_at, root_conversation_id, kind, agent_id)"
-                " VALUES (:id, :ts, :ts, :id, 1, :agent_id)"
+                " (id, created_at, updated_at, root_conversation_id)"
+                " VALUES (:id, :ts, :ts, :id)"
             ),
-            {"id": "conv_missing", "ts": 1700000002, "agent_id": "ag_nonexistent"},
+            {"id": "conv_missing", "ts": 1700000002},
+        )
+        conn.execute(
+            sa.text(
+                "INSERT INTO agent_configuration (conversation_id, agent_id)"
+                " VALUES (:id, :agent_id)"
+            ),
+            {"id": "conv_missing", "agent_id": "ag_nonexistent"},
         )
     # Clean up
     with db_engine.begin() as conn:
+        conn.execute(
+            sa.text("DELETE FROM agent_configuration WHERE conversation_id = 'conv_missing'")
+        )
         conn.execute(sa.text("DELETE FROM conversations WHERE id = 'conv_missing'"))
 
 
-def test_agents_template_name_unique_index_rejects_duplicate_template(
+def test_agents_allow_duplicate_template_names_at_db_layer(
     db_engine: Engine,
 ) -> None:
-    """Two template agents may not share the same name (ix_agents_template_name)."""
-    with pytest.raises(IntegrityError):
-        with db_engine.begin() as conn:
-            conn.execute(
-                sa.text(
-                    "INSERT INTO agents (id, created_at, name, bundle_location, version, kind)"
-                    " VALUES (:id1, :ts, 'dup-template', :loc1, 1, 1),"
-                    "        (:id2, :ts, 'dup-template', :loc2, 1, 1)"
-                ),
-                {
-                    "id1": "ag_dup1",
-                    "id2": "ag_dup2",
-                    "ts": 1700000001,
-                    "loc1": "ag_dup1/bundle",
-                    "loc2": "ag_dup2/bundle",
-                },
-            )
+    """The DB no longer rejects duplicate template names.
+
+    Uniqueness moved from a partial unique index to the store layer (MySQL
+    has no partial indexes), so a raw double-insert succeeds; the guard lives
+    in ``SqlAlchemyAgentStore.create`` (see tests/stores/test_agent_store.py).
+    """
+    with db_engine.begin() as conn:
+        conn.execute(
+            sa.text(
+                "INSERT INTO agents (id, created_at, name, bundle_location, version, kind)"
+                " VALUES (:id1, :ts, 'dup-template', :loc1, 1, 1),"
+                "        (:id2, :ts, 'dup-template', :loc2, 1, 1)"
+            ),
+            {
+                "id1": "ag_dup1",
+                "id2": "ag_dup2",
+                "ts": 1700000001,
+                "loc1": "ag_dup1/bundle",
+                "loc2": "ag_dup2/bundle",
+            },
+        )
+        count = conn.execute(
+            sa.text("SELECT COUNT(*) FROM agents WHERE name = 'dup-template'")
+        ).scalar_one()
+        assert count == 2
+        conn.execute(sa.text("DELETE FROM agents WHERE name = 'dup-template'"))
 
 
 def test_agents_session_id_allows_duplicate_names_for_distinct_sessions(
@@ -286,9 +327,27 @@ def test_agents_session_id_downgrade_round_trip(tmp_path: Path) -> None:
         conn.execute(
             sa.text(
                 "INSERT INTO conversations"
-                " (workspace_id, id, created_at, updated_at, root_conversation_id,"
-                "  kind, agent_id, title)"
-                " VALUES (0, 'conv_1', 3, 3, 'conv_1', 1, 'ag_sess', '')"
+                " (workspace_id, id, created_at, updated_at, root_conversation_id, title)"
+                " VALUES (0, 'conv_1', 3, 3, 'conv_1', '')"
+            )
+        )
+        # agent_id lives on agent_configuration at head; the bb2c3d4e5f6a
+        # downgrade restores it to conversations before the older
+        # downgrades read it.
+        conn.execute(
+            sa.text(
+                "INSERT INTO agent_configuration (workspace_id, conversation_id, agent_id)"
+                " VALUES (0, 'conv_1', 'ag_sess')"
+            )
+        )
+        # kind lives on omnigent_conversation_metadata at head; insert a
+        # matching row so the aa1b2c3d4e5f downgrade can restore kind to
+        # conversations without leaving a NULL (which would break u1 downgrade).
+        conn.execute(
+            sa.text(
+                "INSERT INTO omnigent_conversation_metadata"
+                " (workspace_id, id, kind)"
+                " VALUES (0, 'conv_1', 1)"
             )
         )
 

@@ -528,6 +528,9 @@ describe("AgentPicker trigger label", () => {
       selectedModel: null,
       selectedEffort: null,
       llmModel: null,
+      // Reset the per-session override too: a test that sets it must not leak
+      // into the next, which now reads sessionModelOverride first for the label.
+      sessionModelOverride: null,
       codexModelOptions: [],
       nativeVendorOwnsModel: false,
     });
@@ -558,6 +561,46 @@ describe("AgentPicker trigger label", () => {
     // Model black, effort grey.
     expect(within(trigger).getByText("Opus")).toHaveClass("text-foreground");
     expect(within(trigger).getByText("High")).toHaveClass("text-muted-foreground");
+  });
+
+  it("prefers a claude session override over the cross-session sticky model", () => {
+    useChatStore.setState({
+      selectedModel: "opus",
+      sessionModelOverride: "sonnet",
+      selectedEffort: null,
+      llmModel: "haiku",
+    });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          agents: [{ id: "a1", name: "claude" }],
+          selectedAgentId: "a1",
+          modelPickerKind: "claude",
+          showModels: true,
+          showEffort: false,
+        })}
+      />,
+    );
+
+    const trigger = screen.getByTestId("agent-picker-trigger");
+    expect(trigger).toHaveTextContent("Sonnet 4.6");
+    expect(trigger).not.toHaveTextContent("Opus");
+
+    // Open the picker via the bare-"/model" intercept — a synthetic click on the
+    // Radix trigger doesn't open the menu under jsdom, so the rows never mount.
+    fireEvent.change(textarea(), { target: { value: "/model " } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+
+    const sonnetRow = document.querySelector<HTMLElement>(
+      '[data-testid="model-picker-item"][data-model-id="sonnet"]',
+    );
+    const opusRow = document.querySelector<HTMLElement>(
+      '[data-testid="model-picker-item"][data-model-id="opus"]',
+    );
+    // The applied session override ("sonnet") is the active row, not the
+    // cross-session sticky ("opus").
+    expect(sonnetRow).toHaveAttribute("data-active", "true");
+    expect(opusRow).not.toHaveAttribute("data-active", "true");
   });
 
   it("still renders an enabled trigger when the model/effort label is unresolved", () => {

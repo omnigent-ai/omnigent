@@ -54,13 +54,14 @@ import {
 import { Shimmer } from "@/components/ai-elements/shimmer";
 import { ElicitationCard } from "@/components/blocks/ApprovalCard";
 import { BlockRenderer, FilePathAwareMessageResponse } from "@/components/blocks/BlockRenderer";
-import { CompactionMarker, RoutingDecisionChip } from "@/components/blocks/StatusBlocks";
+import { CompactionMarker, RoutingDecisionCard } from "@/components/blocks/StatusBlocks";
 import { SystemMessageView } from "@/components/blocks/SystemMessage";
-import { parseSystemMessage } from "@/lib/systemMessage";
+import { isSystemUserContent, parseSystemMessage } from "@/lib/systemMessage";
 import { Button } from "@/components/ui/button";
 import { OttoIcon } from "@/components/icons/OttoIcon";
 import { cn } from "@/lib/utils";
 import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
+import { TurnRail, type Turn } from "@/pages/TurnRail";
 import { validateAttachments } from "@/lib/attachments";
 import { useSurfaceFrontmost } from "@/hooks/useNativeServerSwitcher";
 import {
@@ -177,6 +178,9 @@ import {
   useCodexGoalState,
   type CodexGoal,
 } from "@/components/codex";
+import { copyText } from "@/lib/clipboard";
+import { showToast } from "@/components/ui/toast";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 
 // Matches both wordings the native executors emit: "[Attached: <path>]"
 // (claude/pi/cursor) and "[Attached file: <path>]" (codex). Capturing group
@@ -1173,6 +1177,10 @@ interface SessionLayoutProps {
  * Inside a conversation: wraps the chat surface. The terminals panel
  * and right rail are managed by AppShell and rendered outside this
  * component as flex siblings.
+ *
+ * The embedded browser pane is NOT here — it lives as the "Browser"
+ * tab inside the right Workspace rail (WorkspacePanel), so it never floats as a
+ * mid-page column.
  */
 function SessionLayout({ mainAgent }: SessionLayoutProps) {
   return (
@@ -1419,12 +1427,22 @@ function MainAgentSurface({
   subAgentLabel,
 }: MainAgentSurfaceProps) {
   const terminalFirst = useTerminalFirst();
+  // The turn rail is a hover minimap with no mobile affordance (CSS-hidden
+  // under `md`). Gate its MOUNT — not just its visibility — on the viewport so
+  // mobile never runs its eager history backfill (up to 2000 items/open) for a
+  // rail the user can't see.
+  const isMobileViewport = useIsMobileViewport();
   // Mirrors ChatPage's `sandboxLaunching`: while the managed-sandbox
   // launch runs, the composer must stay sendable — the server parks
   // the message on the launch rendezvous — even though liveness reads
   // the not-yet-host-bound session as stranded.
   const sandboxStatus = useChatStore((s) => s.sandboxStatus);
   const sandboxLaunching = sandboxStatus !== null && sandboxStatus.stage !== "failed";
+  // True while the harness reports MCP-server startup state (codex-native).
+  // Forces the message-flow branch below even with zero bubbles, so a user
+  // staring at a fresh session during a slow MCP boot sees the startup band
+  // instead of a bare "What should we work on?" empty state.
+  const mcpStartupActive = useChatStore((s) => s.mcpStartup !== null);
   // Render the inline terminal whenever the user has opted in via the
   // connection pill. The terminal surface owns its no-terminal state,
   // including stopped/resumable sessions, and the connection indicator
@@ -1449,6 +1467,40 @@ function MainAgentSurface({
     [bubbles],
   );
   const nav = useUserMessageNav(userMessageIds);
+
+  // One rail tick per real user turn, paired with a preview of the reply that
+  // followed. Walk bubbles in order: each non-system user bubble opens a turn,
+  // and the first assistant text after it (before the next user bubble) is the
+  // preview. Same first-page window as the transcript, so a fresh load shows
+  // ≤20 ticks and older ones page in on scroll-up.
+  const turns = useMemo<Turn[]>(() => {
+    const out: Turn[] = [];
+    for (let i = 0; i < bubbles.length; i++) {
+      const b = bubbles[i];
+      if (b.kind !== "user" || isSystemBubble(b)) continue;
+      let preview = "";
+      for (let j = i + 1; j < bubbles.length; j++) {
+        const next = bubbles[j];
+        // Stop at the next REAL user turn only. A system-marker user bubble
+        // isn't a tick of its own, so breaking on it would strand this turn
+        // with a blank preview even though its reply follows the marker.
+        if (next.kind === "user" && !isSystemBubble(next)) break;
+        if (next.kind === "assistant") {
+          const textItem = next.items.find((it) => it.kind === "text" && it.text.trim());
+          if (textItem && textItem.kind === "text") {
+            preview = textItem.text.trim();
+            break;
+          }
+        }
+      }
+      out.push({
+        itemId: b.itemId,
+        userText: extractUserText(b.content),
+        responsePreview: preview.slice(0, 240),
+      });
+    }
+    return out;
+  }, [bubbles]);
 
   // Pending elicitation cards float to the bottom of the chat: rendered as the
   // last items in the scroll flow and removed from their inline position so
@@ -1624,10 +1676,13 @@ function MainAgentSurface({
             content dissolves into the canvas before reaching the
             ChatHeader overlay's controls (geometry in index.css). */}
         <Conversation className="chat-scroll-fade flex-1">
-          {/* gap-4 overrides ConversationContent's default gap-8 so consecutive agent turns read as one thread. */}
+          {/* gap-4 overrides ConversationContent's default gap-8 so consecutive agent turns read as one thread.
+              md:pl-12 opens a gap between the left-edge TurnRail (24px wide) and
+              the message column so the ticks don't butt against the text; the
+              rail is hidden on mobile, so the extra left padding is md-only. */}
           <ConversationContent
             className={cn(
-              "chat-conversation-content mx-auto w-full gap-4 pt-20 pb-6",
+              "chat-conversation-content mx-auto w-full gap-4 pt-20 pb-6 md:pl-12",
               CHAT_COLUMN_WIDTH,
             )}
           >
@@ -1639,7 +1694,7 @@ function MainAgentSurface({
               hasMoreHistory={hasMoreHistory}
               loadingMoreHistory={loadingMoreHistory}
             />
-            {bubbles.length === 0 && !showWorkingIndicator ? (
+            {bubbles.length === 0 && !showWorkingIndicator && !mcpStartupActive ? (
               // Cold launch: a centered spinner instead of the "ready to
               // type" empty state (the create-then-send path uses the
               // "row" variant). Two launch shapes land here: a
@@ -1704,6 +1759,12 @@ function MainAgentSurface({
                     Self-gates to null off the spin-up window; rendered only
                     when not already showing Working… so the two never stack. */}
                 {!showWorkingIndicator && <RunnerStartingIndicator variant="row" />}
+                {/* MCP-server startup band (codex-native): renders while the
+                    harness boots its MCP servers and, after startup settles,
+                    when servers failed or were cancelled. Independent of the
+                    Working… shimmer — it is strictly more specific about why
+                    the turn hasn't produced output yet. */}
+                <McpStartupIndicator />
               </>
             )}
           </ConversationContent>
@@ -1728,6 +1789,19 @@ function MainAgentSurface({
           scroller={scroller}
           hasMoreHistory={hasMoreHistory}
         />
+        {/* Left-edge minimap: one tick per turn, scrolls independently, pages
+            in older history on scroll-up. Sibling of Conversation for the same
+            reason as JumpToTopButton — it escapes the chat-scroll-fade mask.
+            Desktop-only: not mounted on mobile so its eager backfill never
+            runs where the rail is hidden. */}
+        {!isMobileViewport && (
+          <TurnRail
+            turns={turns}
+            scroller={scroller}
+            hasMoreHistory={hasMoreHistory}
+            loadingMoreHistory={loadingMoreHistory}
+          />
+        )}
       </div>
       {/* Floating reply button — scoped to the conversation container. */}
       <SelectionPopup
@@ -1834,7 +1908,15 @@ function ConversationLoadError({
 function UserMessageNavConnected(props: React.ComponentProps<typeof UserMessageNav>) {
   const { isAtBottom } = useStickToBottomContext();
   return (
-    <UserMessageNav {...props} className={cn(props.className, isAtBottom && "max-md:hidden")} />
+    <UserMessageNav
+      {...props}
+      // Mobile-only: the TurnRail (a hover minimap) replaces these buttons on
+      // desktop, but mobile has no hover, so the ↑↓ nav stays there. Hidden at
+      // the bottom on mobile too — nothing above to page up to matters less
+      // than keeping the composer area clear. Keyboard ⌘⌥↑↓ still works on all
+      // sizes regardless of the buttons.
+      className={cn(props.className, "md:hidden", isAtBottom && "max-md:hidden")}
+    />
   );
 }
 
@@ -2643,6 +2725,92 @@ export function RunnerStartingIndicator({ variant }: { variant: "hero" | "row" }
   );
 }
 
+// How many still-starting server names the startup band spells out
+// before collapsing the rest into "…" — mirrors the Codex TUI's own
+// startup header, and keeps a 20-server config to one line.
+const MCP_STARTING_NAMES_SHOWN = 3;
+// Cap for the settled warning's failed/cancelled name lists. Longer
+// than the starting cap because these name servers the user may need
+// to fix; beyond this the count carries the signal.
+const MCP_SETTLED_NAMES_SHOWN = 8;
+
+/**
+ * The startup band's in-flight line, mirroring the Codex TUI's header.
+ *
+ * @param starting Still-starting server names, sorted.
+ * @param total Total servers in the round.
+ * @returns e.g. `"Starting MCP servers (1/20): glean, jira, safe, …"`.
+ */
+export function mcpStartingLine(starting: string[], total: number): string {
+  if (total === 1 && starting.length === 1) {
+    return `Starting MCP server: ${starting[0]}…`;
+  }
+  const shown = starting.slice(0, MCP_STARTING_NAMES_SHOWN);
+  if (starting.length > MCP_STARTING_NAMES_SHOWN) shown.push("…");
+  return `Starting MCP servers (${total - starting.length}/${total}): ${shown.join(", ")}`;
+}
+
+/**
+ * A settled warning's name list, capped so the band stays scannable.
+ *
+ * @param names Failed or cancelled server names, sorted.
+ * @returns e.g. `"a, b, c, d, e, f, g, h, +12 more"`.
+ */
+export function mcpSettledNames(names: string[]): string {
+  if (names.length <= MCP_SETTLED_NAMES_SHOWN) return names.join(", ");
+  const shown = names.slice(0, MCP_SETTLED_NAMES_SHOWN);
+  return `${shown.join(", ")}, +${names.length - MCP_SETTLED_NAMES_SHOWN} more`;
+}
+
+/**
+ * Per-MCP-server startup band for native harness sessions (codex-native).
+ * Codex defers a mid-startup turn's execution until its MCP servers
+ * settle, and the session previously showed nothing during that window.
+ * Renders a spinner naming the still-starting servers; once startup
+ * settles with failures/cancellations, a one-line notice says which
+ * servers never came up. Self-gates to null when the store carries no
+ * startup state (an all-ready map is cleared by the store handler).
+ */
+export function McpStartupIndicator() {
+  const mcpStartup = useChatStore((s) => s.mcpStartup);
+  if (mcpStartup === null) return null;
+  const names = Object.keys(mcpStartup).sort();
+  const starting = names.filter((name) => mcpStartup[name].status === "starting");
+  if (starting.length > 0) {
+    return (
+      <Message
+        from="assistant"
+        data-testid="mcp-startup-indicator"
+        role="status"
+        aria-live="polite"
+      >
+        <MessageContent>
+          <span className="flex items-center gap-2 text-muted-foreground text-sm">
+            <Loader2Icon className="size-4 shrink-0 animate-spin" aria-hidden />
+            {mcpStartingLine(starting, names.length)}
+          </span>
+        </MessageContent>
+      </Message>
+    );
+  }
+  const failed = names.filter((name) => mcpStartup[name].status === "failed");
+  const cancelled = names.filter((name) => mcpStartup[name].status === "cancelled");
+  if (failed.length === 0 && cancelled.length === 0) return null;
+  const parts: string[] = [];
+  if (failed.length > 0) parts.push(`failed: ${mcpSettledNames(failed)}`);
+  if (cancelled.length > 0) parts.push(`cancelled: ${mcpSettledNames(cancelled)}`);
+  return (
+    <Message from="assistant" data-testid="mcp-startup-indicator" role="status">
+      <MessageContent>
+        <span className="flex items-center gap-2 text-muted-foreground text-sm">
+          <AlertTriangleIcon className="size-4 shrink-0" aria-hidden />
+          {`MCP startup incomplete (${parts.join("; ")})`}
+        </span>
+      </MessageContent>
+    </Message>
+  );
+}
+
 /**
  * Mirrors the Chat/Terminal state onto the iOS shell's native Liquid Glass
  * switcher and routes its taps back into `setView`. Driven by a stable
@@ -2777,11 +2945,7 @@ function ConnectedTerminalFirstPill({
  */
 function isSystemBubble(bubble: Bubble): boolean {
   if (bubble.kind !== "user") return false;
-  const hasAttachments = bubble.content.some(
-    (c) => c.type === "input_image" || c.type === "input_file",
-  );
-  if (hasAttachments) return false;
-  return parseSystemMessage(extractUserText(bubble.content)) !== null;
+  return isSystemUserContent(bubble.content);
 }
 
 function CompactionLoadingIndicator() {
@@ -2828,11 +2992,11 @@ export const BubbleView = memo(
     if (bubble.kind === "compaction") return <CompactionMarker />;
     if (bubble.kind === "routing_decision") {
       return (
-        <RoutingDecisionChip
+        <RoutingDecisionCard
           model={bubble.model}
-          tier={bubble.tier}
           applied={bubble.applied}
           rationale={bubble.rationale}
+          agent={bubble.agent}
         />
       );
     }
@@ -2840,6 +3004,52 @@ export const BubbleView = memo(
   },
   (prev, next) => bubblesEqual(prev.bubble, next.bubble),
 );
+
+/**
+ * Copy-to-clipboard handler for a message bubble's "Copy" action.
+ *
+ * Uses the shared {@link copyText} helper (async Clipboard API with an
+ * `execCommand` fallback) rather than `navigator.clipboard.writeText`
+ * directly — the latter is undefined in the iOS webview and on non-secure
+ * origins, where a bare guard made the button silently no-op. Drives the
+ * inline check-icon confirmation for 2s, and on mobile (where the desktop
+ * hover affordance and tooltip aren't visible) also fires a toast so the
+ * copy is confirmed.
+ *
+ * @param getText - Produces the text to copy at click time.
+ * @returns `{ isCopied, handleCopy }` for the action button.
+ */
+function useCopyMessage(getText: () => string): {
+  isCopied: boolean;
+  handleCopy: () => void;
+} {
+  const [isCopied, setIsCopied] = useState(false);
+  const timeoutRef = useRef<number>(0);
+  const isMobile = useIsMobileViewport();
+
+  useEffect(() => () => window.clearTimeout(timeoutRef.current), []);
+
+  const handleCopy = useCallback(() => {
+    if (isCopied) return;
+    const text = getText();
+    if (!text) return;
+    copyText(text).then(
+      () => {
+        setIsCopied(true);
+        window.clearTimeout(timeoutRef.current);
+        timeoutRef.current = window.setTimeout(() => setIsCopied(false), 2000);
+        if (isMobile) {
+          showToast(<span className="text-sm">Copied to clipboard</span>, { duration: 1500 });
+        }
+      },
+      (error) => {
+        console.warn("Failed to copy message", error);
+      },
+    );
+  }, [getText, isCopied, isMobile]);
+
+  return { isCopied, handleCopy };
+}
 
 function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   const sessionId = useChatStore((s) => s.conversationId);
@@ -2876,20 +3086,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   const showAuthorBadge = shouldShowAuthorBadge(author, getCurrentAuthorId(), isSessionShared);
   // Equality selector so Zustand only re-renders the matching bubble.
   const flashing = useChatStore((s) => s.flashItemId === bubble.itemId);
-  const [isCopied, setIsCopied] = useState(false);
-  const copyTimeoutRef = useRef<number>(0);
-
-  const handleCopy = async () => {
-    if (!text || !navigator?.clipboard?.writeText) return;
-    try {
-      await navigator.clipboard.writeText(text);
-      setIsCopied(true);
-      window.clearTimeout(copyTimeoutRef.current);
-      copyTimeoutRef.current = window.setTimeout(() => setIsCopied(false), 2000);
-    } catch {
-      // ignore clipboard errors
-    }
-  };
+  const { isCopied, handleCopy } = useCopyMessage(() => text);
 
   return (
     <Message
@@ -3027,8 +3224,10 @@ function AssistantBubble({ bubble }: { bubble: Extract<Bubble, { kind: "assistan
   // common case. The "Working…" shimmer for the empty-items / streaming
   // gap is rendered at the page level, not inside this component.
   const sessionStatus = useChatStore((s) => s.sessionStatus);
-  const [isCopied, setIsCopied] = useState(false);
-  const copyTimeoutRef = useRef<number>(0);
+  // Getter computes the markdown lazily at click time — the hook must run
+  // before the early return below (rules of hooks), but `markdownText` is
+  // derived after it.
+  const { isCopied, handleCopy } = useCopyMessage(() => collectBubbleMarkdown(bubble.items));
   // null outside AppShell's provider (isolated tests) → hide the action.
   const forkDialog = useForkDialog();
 
@@ -3040,18 +3239,6 @@ function AssistantBubble({ bubble }: { bubble: Extract<Bubble, { kind: "assistan
   // width to match the composer, not the default w-fit shrink-to-content.
   const hasElicitation = bubble.items.some((it) => it.kind === "elicitation");
   const isWide = hasElicitation || containsMarkdownTable(bubble.items);
-
-  const handleCopy = async () => {
-    if (!markdownText || !navigator?.clipboard?.writeText) return;
-    try {
-      await navigator.clipboard.writeText(markdownText);
-      setIsCopied(true);
-      window.clearTimeout(copyTimeoutRef.current);
-      copyTimeoutRef.current = window.setTimeout(() => setIsCopied(false), 2000);
-    } catch {
-      // ignore clipboard errors
-    }
-  };
 
   return (
     <>
@@ -5212,7 +5399,7 @@ function AgentPicker({
   const pickerSelectedModel =
     modelPickerKind === "cursor" || modelPickerKind === "kiro" || modelPickerKind === "opencode"
       ? sessionModelOverride
-      : selectedModel;
+      : (sessionModelOverride ?? selectedModel);
   // SDK/bundle agents (no native picker) never have the cross-session sticky
   // applied to them, so their live model is the session's own — the applied
   // override or the bound default — never `selectedModel` (a pick carried over
@@ -5220,7 +5407,9 @@ function AgentPicker({
   // on a Claude-SDK agent like Polly). claude-/codex-native keep `selectedModel`:
   // there the sticky IS the applied model.
   const nonNativeModel =
-    modelPickerKind === null ? (sessionModelOverride ?? llmModel) : (selectedModel ?? llmModel);
+    modelPickerKind === null
+      ? (sessionModelOverride ?? llmModel)
+      : (sessionModelOverride ?? selectedModel ?? llmModel);
   const effectiveModel = nativeVendorOwnsModel
     ? modelPickerKind === "cursor" || modelPickerKind === "kiro"
       ? // cursor mirrors its live TUI model into ``model_override``; kiro sets it

@@ -63,6 +63,9 @@ describe("copyText", () => {
         expect(selectedTextAreas[0]?.selectionStart).toBe(0);
         expect(selectedTextAreas[0]?.selectionEnd).toBe("first line\nsecond line".length);
         expect(document.body.contains(selectedTextAreas[0] ?? null)).toBe(true);
+        // Marked so editable-focus detection ignores it: focusing this helper
+        // must not read as the keyboard opening and hide the iOS native bar.
+        expect(selectedTextAreas[0]?.hasAttribute("data-clipboard-helper")).toBe(true);
 
         const event = new Event("copy", {
           bubbles: true,
