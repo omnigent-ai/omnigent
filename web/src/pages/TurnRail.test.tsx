@@ -101,6 +101,34 @@ describe("TurnRail", () => {
     expect(screen.getByText("prompt number 2")).toBeInTheDocument();
   });
 
+  it("shows the preview on keyboard focus and clears it on blur", () => {
+    // Keyboard users reach ticks via Tab: onFocus opens the preview, and
+    // blurring the tick must close it so tabbing away doesn't strand a stale
+    // preview on screen.
+    renderRail(makeTurns(3));
+    const ticks = screen.getAllByRole("button");
+    fireEvent.focus(ticks[1]!);
+    expect(screen.getByText("prompt number 1")).toBeInTheDocument();
+
+    fireEvent.blur(ticks[1]!);
+    expect(screen.queryByText("prompt number 1")).not.toBeInTheDocument();
+  });
+
+  it("a tick's blur doesn't clear a preview owned by another tick", () => {
+    // The blur handler only clears when the blurring tick still owns the
+    // preview, so a late blur from a previously-focused tick can't wipe the
+    // preview a newer focus just opened.
+    renderRail(makeTurns(3));
+    const ticks = screen.getAllByRole("button");
+    fireEvent.focus(ticks[0]!);
+    fireEvent.focus(ticks[2]!);
+    expect(screen.getByText("prompt number 2")).toBeInTheDocument();
+
+    // Stale blur from the first tick — the preview is now turn 2's, so it stays.
+    fireEvent.blur(ticks[0]!);
+    expect(screen.getByText("prompt number 2")).toBeInTheDocument();
+  });
+
   it("makes the rail interactive only once revealed", () => {
     // hasMoreHistory=false → the rail latches revealed on mount, so the inner
     // scroller must be pointer-interactive rather than a dead (or silent) box.

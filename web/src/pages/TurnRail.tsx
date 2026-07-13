@@ -120,14 +120,19 @@ export function TurnRail({
         return next;
       });
     };
-    const onScroll = () => {
+    const schedule = () => {
       if (frame === 0) frame = requestAnimationFrame(recompute);
     };
-    recompute();
-    scrollEl.addEventListener("scroll", onScroll, { passive: true });
+    // Schedule the initial recompute through the same rAF gate rather than
+    // running it synchronously: `turns` is a fresh array on every stream token,
+    // so a synchronous read here would force a layout pass per token. Deferring
+    // to rAF (and cancelling the pending frame on cleanup) coalesces a burst of
+    // token-level re-renders into at most one layout read per frame.
+    schedule();
+    scrollEl.addEventListener("scroll", schedule, { passive: true });
     return () => {
       if (frame !== 0) cancelAnimationFrame(frame);
-      scrollEl.removeEventListener("scroll", onScroll);
+      scrollEl.removeEventListener("scroll", schedule);
     };
   }, [scrollEl, turns]);
 
@@ -239,6 +244,17 @@ export function TurnRail({
     const id = el.dataset.turnTick;
     if (id) tickRefs.current.set(id, el);
   }, []);
+
+  // Drop ref entries for turns no longer rendered. setTickRef never deletes on
+  // unmount (to avoid churn), so on a session switch — where every itemId
+  // changes — the old entries would otherwise leak references to detached
+  // buttons for the component's lifetime. Prune to the live turn id-set here.
+  useEffect(() => {
+    const live = new Set(turns.map((t) => t.itemId));
+    for (const id of tickRefs.current.keys()) {
+      if (!live.has(id)) tickRefs.current.delete(id);
+    }
+  }, [turns]);
 
   const handleHover = useCallback((itemId: string) => {
     const rail = railRef.current;
@@ -371,6 +387,9 @@ export function TurnRail({
               ref={setTickRef}
               onMouseEnter={(e) => handleTickEnter(turn.itemId, e.clientX, e.clientY)}
               onFocus={() => handleHover(turn.itemId)}
+              // Keyboard focus shows the preview via onFocus; clear it on blur
+              // so tabbing away doesn't leave the preview stranded on-screen.
+              onBlur={() => setHoveredId((cur) => (cur === turn.itemId ? null : cur))}
               onClick={() => scrollToUserMessage(turn.itemId, flashUserMessage)}
               aria-label={`Jump to: ${turn.userText.slice(0, 80) || "message"}`}
               // Full-pitch hit area (h-4, no gap between ticks) so clicking
