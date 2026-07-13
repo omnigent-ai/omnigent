@@ -4802,6 +4802,12 @@ def _codex_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) -
     """
     Read the Codex model default from a resolved agent spec.
 
+    Reads the canonical ``spec.executor.model`` field (the same field the
+    in-process harnesses and the other native launchers consume). The
+    legacy ``executor.config["model"]`` read is kept as a fallback for
+    configs written against the old (never-canonical) location, so fixing
+    the primary read cannot regress them.
+
     :param agent_spec: Agent spec object, or a resolved wrapper carrying a
         ``spec`` attribute. ``None`` means no spec was available.
     :returns: Model id, e.g. ``"gpt-5.4-mini"``, or ``None``.
@@ -4809,7 +4815,32 @@ def _codex_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) -
     spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
     if spec is None:
         return None
-    model = spec.executor.config.get("model")
+    model = spec.executor.model
+    if isinstance(model, str) and model:
+        return model
+    legacy = spec.executor.config.get("model")
+    return legacy if isinstance(legacy, str) and legacy else None
+
+
+def _claude_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) -> str | None:
+    """
+    Read the Claude model id to launch the native CLI with, from a spec.
+
+    Reads the canonical ``spec.executor.model`` field (the same field the
+    in-process claude-sdk harness and the pi/cursor native launchers
+    consume). Without this read, an agent config's ``executor.model`` was
+    silently ignored on native launch — the terminal came up on the
+    harness default and the host log showed ``model_override_set=False``.
+
+    :param agent_spec: Agent spec object, or a resolved wrapper carrying a
+        ``spec`` attribute. ``None`` means no spec was available.
+    :returns: A model id, e.g. ``"claude-haiku-4-5"``, or ``None`` when
+        the spec declares no model.
+    """
+    spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
+    if spec is None:
+        return None
+    model = spec.executor.model
     return model if isinstance(model, str) and model else None
 
 
@@ -5694,7 +5725,13 @@ async def _auto_create_claude_terminal(
     # CLI path.
     claude_config: ClaudeNativeUcodeConfig | None = None
     try:
-        claude_config = resolve_native_claude_config(spec=None)
+        # Pass the session's spec (when resolved) so a spec-declared
+        # provider (executor.auth / profile) is honored — previously this
+        # was hardcoded spec=None, so only the global provider config ever
+        # applied on the host-spawned path.
+        claude_config = resolve_native_claude_config(
+            spec=agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
+        )
     except Exception:  # noqa: BLE001 — best-effort; fall back to native auth
         _logger.warning(
             "native-claude: could not derive a provider/ucode launch config "
@@ -5716,11 +5753,12 @@ async def _auto_create_claude_terminal(
 
     base_claude_args = _build_claude_native_base_args(
         reasoning_effort=session_effort,
-        # Session override wins; the ucode gateway model is the default
-        # when no per-session override is set. Both yield to an explicit
-        # ``--model`` in the user's pass-through args (handled in the
-        # helper).
+        # Session override wins; then the spec's own executor.model pin;
+        # the ucode gateway model is the default when neither is set. All
+        # yield to an explicit ``--model`` in the user's pass-through args
+        # (handled in the helper).
         model_override=session_model_override
+        or _claude_native_model_from_spec(agent_spec)
         or (claude_config.model if claude_config is not None else None),
         terminal_launch_args=session_launch_args,
         resume_external_session_id=resume_external_session_id,

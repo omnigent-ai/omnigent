@@ -265,6 +265,8 @@ from omnigent.server.schemas import (
     UpdateSessionRequest,
 )
 from omnigent.session_lifecycle import (
+    CLOSED_LABEL_KEY,
+    CLOSED_LABEL_VALUE,
     is_session_closed,
     labels_with_closed_status,
     title_without_closed_marker,
@@ -2091,6 +2093,47 @@ async def _best_effort_stop(
             session_id,
             exc_info=True,
         )
+
+
+async def _best_effort_release_runner_resources(session_id: str) -> None:
+    """Release a session's runner-side resources (terminals, envs).
+
+    Drives the runner's ``DELETE /v1/sessions/{id}/resources`` — the same
+    teardown session deletion uses — falling back to the local terminal
+    registry for in-process setups. Best-effort by contract: the caller's
+    lifecycle action (delete, or a close tombstone) must succeed even when
+    the runner is offline or unbound; runner-side resources are gone with
+    the runner anyway.
+
+    :param session_id: Session/conversation identifier.
+    """
+    runner_client: httpx.AsyncClient | None = None
+    try:
+        runner_client = await _get_runner_client_for_resource_access(session_id)
+    except OmnigentError as exc:
+        _logger.info(
+            "Skipping runner-side resource release for %s: %s",
+            session_id,
+            exc,
+        )
+    if runner_client is not None:
+        try:
+            await runner_client.delete(
+                f"/v1/sessions/{session_id}/resources",
+                timeout=10.0,
+            )
+        except (httpx.HTTPError, ConnectionError):
+            _logger.warning(
+                "Runner resource release failed for %s, falling back",
+                session_id,
+            )
+    else:
+        import contextlib
+
+        from omnigent.runtime import get_terminal_registry
+
+        with contextlib.suppress(RuntimeError):
+            await get_terminal_registry().cleanup_conversation(session_id)
 
 
 @dataclass(frozen=True)
@@ -12537,11 +12580,10 @@ async def _create_session_from_existing_agent(
             git_branch=git_branch,
             terminal_launch_args=validated_launch_args,
         )
-    except Exception:
+    except Exception as create_exc:
         # Broad catch is intentional: ANY create_conversation failure
         # (integrity error, name clash, ...) must trigger orphan-worktree
-        # cleanup before the error propagates. We re-raise unchanged
-        # below, so nothing is swallowed. Gate on created_worktree_path,
+        # cleanup before the error propagates. Gate on created_worktree_path,
         # NOT git_branch: only a worktree Omnigent created here may be
         # force-removed. An existing worktree bound via workspace_branch
         # also sets git_branch but is the user's — never destroy it.
@@ -12558,6 +12600,16 @@ async def _create_session_from_existing_agent(
                 request=request,
                 reason="create-rollback",
             )
+        if isinstance(create_exc, NameAlreadyExistsError):
+            # The store raises this exactly so callers can surface a clean
+            # tool error; without the translation it escaped through the
+            # generic Exception handler as an opaque 500 to MCP clients.
+            raise OmnigentError(
+                f"a session titled {body.title!r} already exists under "
+                f"parent {body.parent_session_id!r}; close it first or "
+                "pick a different title",
+                code=ErrorCode.CONFLICT,
+            ) from create_exc
         raise
 
     # The create request has no conv id in its URL, so the path-based
@@ -12799,10 +12851,23 @@ def _persist_stored_session_bundle(
         parent session, e.g. ``"runner_abc123"``.
     :returns: Response with the new session id.
     :raises OmnigentError: If the agent insert violates integrity
-        checks or the parent session no longer exists.
+        checks, ``metadata.model_override`` fails validation, or the
+        parent session no longer exists.
     :raises SQLAlchemyError: If the database transaction fails for
         any non-integrity reason.
     """
+    # Mirror the JSON create path: the persisted override reaches a native
+    # CLI as a ``--model`` argv element, so it must pass the conservative
+    # model-id charset before any row exists.
+    model_override: str | None = None
+    if metadata.model_override is not None:
+        try:
+            model_override = validate_model_override(metadata.model_override)
+        except ValueError as exc:
+            raise OmnigentError(
+                f"invalid model_override: {exc}",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
     try:
         created = conversation_store.create_session_with_agent(
             agent_id=agent_id,
@@ -12846,6 +12911,16 @@ def _persist_stored_session_bundle(
             agent_bundle_location,
         )
         raise
+
+    if model_override is not None:
+        # ``create_session_with_agent`` has no override param; reuse the
+        # PATCH path's store write before the runner reads the snapshot
+        # (the first turn / terminal launch happens only after this
+        # create returns), mirroring the JSON create route.
+        conversation_store.update_conversation(
+            created.conversation.id,
+            model_override=model_override,
+        )
 
     # The create request has no conv id in its URL; stamp the minted id so
     # the create span joins the session's session.id group.
@@ -15340,6 +15415,16 @@ def create_sessions_router(
         )
         if body.archived is True:
             await _best_effort_stop(session_id, conversation_store, runner_router)
+        # Detect a close transition BEFORE any writes land: the close
+        # tombstone rewrites the title with the legacy closed marker in
+        # the same request, so a post-write snapshot would always read
+        # as already-closed and the teardown below would never fire.
+        closing_now = False
+        if (body.labels or {}).get(CLOSED_LABEL_KEY) == CLOSED_LABEL_VALUE:
+            _prior_conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            closing_now = _prior_conv is not None and not is_session_closed(
+                _prior_conv.labels, _prior_conv.title
+            )
         if body.runner_id is not None and permission_store is not None:
             if not check_session_access(
                 user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
@@ -15644,6 +15729,17 @@ def create_sessions_router(
             await asyncio.to_thread(conversation_store.delete_label, session_id, PROJECT_LABEL_KEY)
         if labels_to_set:
             await asyncio.to_thread(conversation_store.set_labels, session_id, labels_to_set)
+        if closing_now:
+            # A close (sys_session_close tombstone, or any client setting the
+            # closed label) retires the session for good: closed sessions
+            # reject user-input writes and named-mode lookups skip them, so a
+            # still-running harness CLI is dead weight that otherwise
+            # accumulates until session deletion (one leaked tmux-hosted CLI
+            # per closed child). Mirror delete: stop, then release
+            # runner-side resources. History stays readable — the runner
+            # teardown touches processes and registries, not the store.
+            await _best_effort_stop(session_id, conversation_store, runner_router)
+            await _best_effort_release_runner_resources(session_id)
         if requested_codex_collaboration_mode is not None:
             _publish_collaboration_mode(
                 session_id,
@@ -20355,33 +20451,7 @@ def create_sessions_router(
         # deletable. Server-owned records (files and conversation row
         # below) live independently of the runner, and runner-side
         # resources are gone with the runner anyway.
-        runner_client: httpx.AsyncClient | None = None
-        try:
-            runner_client = await _get_runner_client_for_resource_access(session_id)
-        except OmnigentError as exc:
-            _logger.info(
-                "Skipping runner-side cleanup for %s; proceeding with server-side delete: %s",
-                session_id,
-                exc,
-            )
-        if runner_client is not None:
-            try:
-                await runner_client.delete(
-                    f"/v1/sessions/{session_id}/resources",
-                    timeout=10.0,
-                )
-            except (httpx.HTTPError, ConnectionError):
-                _logger.warning(
-                    "Runner cleanup failed for %s, falling back",
-                    session_id,
-                )
-        else:
-            import contextlib
-
-            from omnigent.runtime import get_terminal_registry
-
-            with contextlib.suppress(RuntimeError):
-                await get_terminal_registry().cleanup_conversation(session_id)
+        await _best_effort_release_runner_resources(session_id)
         # Session file cleanup.
         if file_store is not None and artifact_store is not None:
             deleted_file_ids = await asyncio.to_thread(

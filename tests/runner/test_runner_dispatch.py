@@ -7191,3 +7191,238 @@ async def test_spawn_async_tool_cancels_losing_future_no_leak(
     await asyncio.sleep(0)
     assert inbox.get_nowait()["status"] == "cancelled"
     assert _leaked(before) == []
+
+
+@pytest.mark.asyncio
+async def test_session_close_accepts_plain_titled_id_created_child() -> None:
+    """
+    The REST close path tombstones a child whose title has no agent prefix.
+
+    Children created via ``sys_session_create`` carry the caller's plain
+    ``title`` (no ``"<agent>:"`` shape). They have a parent, so the
+    sub-agent gate passes; the old title-shape check then returned a
+    misleading ``session_not_a_sub_agent`` and made such children
+    uncloseable (their tmux-hosted CLIs accumulated until deletion).
+    """
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    patched: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_leaf":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_leaf",
+                    "title": "leaf~run1~a1~0.1",
+                    "root_conversation_id": "conv_root",
+                    "parent_session_id": "conv_caller",
+                },
+            )
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_caller":
+            return httpx.Response(
+                200,
+                json={"id": "conv_caller", "root_conversation_id": "conv_root"},
+            )
+        if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_leaf":
+            patched.update(json.loads(request.content))
+            return httpx.Response(200, json={"id": "conv_leaf"})
+        raise AssertionError(f"unexpected {request.method} {request.url.path}")
+
+    async with _session_query_client(handler) as client:
+        out = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_close",
+                json.dumps({"conversation_id": "conv_leaf"}),
+                conversation_id="conv_caller",
+                server_client=client,
+            )
+        )
+    assert patched["title"] == "leaf~run1~a1~0.1:closed:conv_leaf"
+    assert patched["labels"] == {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE}
+    assert out == {
+        "closed": True,
+        "conversation_id": "conv_leaf",
+        "agent": None,
+        "title": "leaf~run1~a1~0.1",
+    }
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_maps_title_conflict_to_typed_error() -> None:
+    """
+    A 409 from the create maps to ``title_already_exists``.
+
+    The server translates the ``(parent, title)`` unique-index clash to a
+    structured 409; without this mapping the LLM saw only
+    "sys_session_create returned 500/409" and couldn't tell a title
+    collision from a transport failure.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            409,
+            json={"error": {"code": "conflict", "message": "a session titled 'auth' ..."}},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"agent_id": "ag_x", "title": "auth"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    info = json.loads(output)
+    assert info["error"] == "title_already_exists"
+    assert info["title"] == "auth"
+
+
+@pytest.mark.asyncio
+async def test_send_missing_mode_error_tracks_declared_subagents() -> None:
+    """
+    The missing-addressing error mirrors the advertised schema.
+
+    With no declared sub-agents the schema omits agent/title entirely, so
+    the error must steer to session_id only; with declared sub-agents the
+    original wording stands. A mismatch here dangles an 'agent' option
+    the caller's schema never advertised.
+    """
+    from types import SimpleNamespace
+
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(404)),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            no_subagents = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps({"args": "hello"}),
+                server_client=server_client,
+                conversation_id="conv_parent",
+                session_inbox=session_inbox,
+                agent_spec=None,
+            )
+            with_subagents = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps({"args": "hello"}),
+                server_client=server_client,
+                conversation_id="conv_parent",
+                session_inbox=session_inbox,
+                agent_spec=SimpleNamespace(
+                    sub_agents=[SimpleNamespace(name="researcher")],
+                ),
+            )
+        finally:
+            runner_app._session_inboxes_ref.pop("conv_parent", None)
+
+    assert "requires 'session_id'" in no_subagents
+    assert "'agent'" not in no_subagents.split("declares no named sub-agents")[0]
+    assert "requires 'agent' (or 'session_id')" in with_subagents
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_threads_model_and_cost_budget() -> None:
+    """
+    ``sys_session_create`` threads ``model`` into the create body and
+    attaches the ``__subagent_cost_budget`` policy to the new child.
+
+    This is the generic-path counterpart of named-mode send's create
+    branch: without it, per-child model/cost controls only existed for
+    spec-declared sub-agents and id-created children always launched on
+    the harness default with no budget.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    captured: dict[str, Any] = {}
+    policy_posts: list[dict[str, Any]] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            captured.update(json.loads(request.content))
+            return httpx.Response(
+                201,
+                json={"id": "conv_child", "agent_id": "ag_x", "agent_name": "leaf"},
+            )
+        if request.method == "POST" and request.url.path == "/v1/sessions/conv_child/policies":
+            policy_posts.append(json.loads(request.content))
+            return httpx.Response(201, json={"ok": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps(
+                {
+                    "agent_id": "ag_x",
+                    "title": "leaf-1",
+                    "model": "databricks-claude-haiku-4-5",
+                    "cost_budget": {"max_cost_usd": 2.5},
+                }
+            ),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    assert captured["model_override"] == "databricks-claude-haiku-4-5"
+    assert captured["parent_session_id"] == "conv_caller"
+    assert len(policy_posts) == 1
+    assert policy_posts[0]["name"] == "__subagent_cost_budget"
+    assert policy_posts[0]["factory_params"] == {"max_cost_usd": 2.5}
+    handle = json.loads(output)
+    assert handle["conversation_id"] == "conv_child"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("arguments", "expected_fragment"),
+    [
+        ({"agent_id": "ag_x", "model": "bad model; rm -rf"}, "invalid 'model'"),
+        ({"agent_id": "ag_x", "model": 42}, "'model' must be a string"),
+        ({"agent_id": "ag_x", "cost_budget": {"max_cost_usd": -1}}, "invalid 'cost_budget'"),
+        ({"agent_id": "ag_x", "cost_budget": {}}, "invalid 'cost_budget'"),
+    ],
+)
+async def test_sys_session_create_rejects_malformed_model_and_budget(
+    arguments: dict[str, Any],
+    expected_fragment: str,
+) -> None:
+    """
+    Malformed ``model`` / ``cost_budget`` fail loud before any session
+    exists — the model value later crosses the harness spawn boundary as
+    a ``--model`` argv element, so it must never be silently dropped or
+    passed through unvalidated.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    created = False
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal created
+        created = True
+        return httpx.Response(201, json={"id": "conv_child"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps(arguments),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    assert expected_fragment in json.loads(output)["error"]
+    assert created is False

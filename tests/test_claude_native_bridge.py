@@ -5627,3 +5627,29 @@ def test_hook_record_non_stop_event_has_zero_background_tasks() -> None:
         )
     )
     assert record.background_task_count == 0
+
+
+def test_tmux_send_timeout_default_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Without ``OMNIGENT_TMUX_SEND_TIMEOUT_S`` the send timeout is the 30s default.
+    """
+    monkeypatch.delenv("OMNIGENT_TMUX_SEND_TIMEOUT_S", raising=False)
+    assert claude_native_bridge._tmux_send_timeout_from_env() == 30.0
+
+
+def test_tmux_send_timeout_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    ``OMNIGENT_TMUX_SEND_TIMEOUT_S`` overrides the send timeout.
+    """
+    monkeypatch.setenv("OMNIGENT_TMUX_SEND_TIMEOUT_S", "7.5")
+    assert claude_native_bridge._tmux_send_timeout_from_env() == 7.5
+
+
+@pytest.mark.parametrize("raw", ["banana", "", "-1", "0", "nan", "inf", "1e9"])
+def test_tmux_send_timeout_malformed_falls_back(monkeypatch: pytest.MonkeyPatch, raw: str) -> None:
+    """
+    Unparseable, non-positive, non-finite, or absurd values must not crash the
+    bridge at import time; they fall back to the default.
+    """
+    monkeypatch.setenv("OMNIGENT_TMUX_SEND_TIMEOUT_S", raw)
+    assert claude_native_bridge._tmux_send_timeout_from_env() == 30.0

@@ -285,3 +285,118 @@ async def test_patch_session_empty_project_removes_label(
     conv = conv_store.get_conversation(session_id)
     assert conv is not None
     assert "omni_project" not in conv.labels
+
+
+# ── PATCH close-label teardown ──────────────────────────────────────
+
+
+async def test_patch_closing_label_stops_and_releases_resources(
+    client: httpx.AsyncClient,
+    session_id: str,
+) -> None:
+    """Setting ``omnigent.closed=true`` triggers stop + resource release.
+
+    A close tombstone retires the session for good; without the teardown
+    the child's harness CLI (e.g. a tmux-hosted claude process) would
+    keep running until the session is deleted.
+    """
+    mock_stop = AsyncMock(return_value=None)
+    mock_release = AsyncMock(return_value=None)
+    with (
+        patch.object(sessions_module, "_best_effort_stop", mock_stop),
+        patch.object(sessions_module, "_best_effort_release_runner_resources", mock_release),
+    ):
+        resp = await client.patch(
+            f"/v1/sessions/{session_id}",
+            json={
+                "title": f"researcher:auth:closed:{session_id}",
+                "labels": {"omnigent.closed": "true"},
+            },
+            headers={"Content-Type": "application/json"},
+        )
+    assert resp.status_code == 200
+    mock_stop.assert_awaited_once()
+    mock_release.assert_awaited_once()
+
+
+async def test_patch_already_closed_session_skips_teardown(
+    client: httpx.AsyncClient,
+    session_id: str,
+) -> None:
+    """Re-asserting the closed label on a closed session is a no-op.
+
+    The teardown fires only on the open→closed transition; a repeated
+    close PATCH (or a label re-stamp) must not re-drive the runner.
+    """
+    first = await client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"labels": {"omnigent.closed": "true"}},
+        headers={"Content-Type": "application/json"},
+    )
+    assert first.status_code == 200
+    mock_stop = AsyncMock(return_value=None)
+    mock_release = AsyncMock(return_value=None)
+    with (
+        patch.object(sessions_module, "_best_effort_stop", mock_stop),
+        patch.object(sessions_module, "_best_effort_release_runner_resources", mock_release),
+    ):
+        resp = await client.patch(
+            f"/v1/sessions/{session_id}",
+            json={"labels": {"omnigent.closed": "true"}},
+            headers={"Content-Type": "application/json"},
+        )
+    assert resp.status_code == 200
+    mock_stop.assert_not_awaited()
+    mock_release.assert_not_awaited()
+
+
+async def test_patch_close_succeeds_when_runner_unreachable(
+    client: httpx.AsyncClient,
+    session_id: str,
+) -> None:
+    """The close PATCH succeeds even when no runner can be resolved.
+
+    ``_best_effort_release_runner_resources`` swallows resolution
+    failures by contract — the tombstone write must land regardless.
+    """
+    mock_get_client = AsyncMock(
+        side_effect=sessions_module.OmnigentError(
+            "no runner", code=sessions_module.ErrorCode.CONFLICT
+        )
+    )
+    with patch.object(sessions_module, "_get_runner_client_for_resource_access", mock_get_client):
+        resp = await client.patch(
+            f"/v1/sessions/{session_id}",
+            json={"labels": {"omnigent.closed": "true"}},
+            headers={"Content-Type": "application/json"},
+        )
+    assert resp.status_code == 200
+
+
+async def test_create_duplicate_child_title_returns_conflict(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+) -> None:
+    """Creating two children with the same (parent, title) yields a 409.
+
+    The store's NameAlreadyExistsError used to escape through the
+    generic exception handler as an opaque 500; the create route now
+    translates it to a structured conflict the tool layer can surface
+    as title_already_exists.
+    """
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    agent_id = generate_agent_id()
+    agent_store.create(agent_id, name="child-agent", bundle_location="test:///bundle")
+    body = {
+        "agent_id": agent_id,
+        "parent_session_id": session_id,
+        "title": "leaf~run1~a1~0.1",
+    }
+    first = await client.post("/v1/sessions", json=body)
+    assert first.status_code < 400, first.text
+    second = await client.post("/v1/sessions", json=body)
+    assert second.status_code == 409, second.text
+    payload = second.json()
+    assert payload["error"]["code"] == "conflict"
+    assert "already exists" in payload["error"]["message"]

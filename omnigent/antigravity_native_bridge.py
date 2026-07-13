@@ -832,9 +832,36 @@ def update_conversation_id(
 # delivery; no shared tmux helper exists, so the small primitives are duplicated
 # per the established per-harness convention.
 
-# tmux probe/command timeout. Short: these are local IPC calls to the runner's
-# own tmux server.
-_TMUX_SEND_TIMEOUT_S = 5.0
+
+def _tmux_send_timeout_from_env(default: float = 30.0) -> float:
+    """Read ``OMNIGENT_TMUX_SEND_TIMEOUT_S``, ignoring a malformed value.
+
+    A bad value must not crash the bridge at import time, so anything
+    unparseable, non-positive, or non-finite falls back to *default*
+    (mirrors the guarded env parses in ``claude_native_hook``). Duplicated
+    from ``claude_native_bridge`` per the per-harness convention above.
+
+    :param default: Value used when unset or malformed.
+    :returns: The parsed timeout in seconds, or *default*.
+    """
+    raw = os.environ.get("OMNIGENT_TMUX_SEND_TIMEOUT_S")
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    # ``0 < value <= 86400`` is False for nan and inf, so this also rejects
+    # non-finite values that ``float()`` parses without error.
+    return value if 0 < value <= 86400.0 else default
+
+
+# tmux probe/command timeout. These are local IPC calls to the runner's own
+# tmux server, but send-keys is not always fast: when many child CLIs boot
+# concurrently the tmux server fork/exec-starves and healthy sends have been
+# measured at 10-25s. A flat 5s tripped on slow-but-healthy sends, so the
+# ceiling is generous and env-overridable for constrained hosts.
+_TMUX_SEND_TIMEOUT_S = _tmux_send_timeout_from_env()
 # Per-readiness-gate wait (tmux.json advertised, then the agy input box mounted).
 _TMUX_READY_TIMEOUT_S = 30.0
 # Poll cadence for the readiness / paste-commit / submit-verify loops.

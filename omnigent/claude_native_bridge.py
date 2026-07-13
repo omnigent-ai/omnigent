@@ -117,7 +117,35 @@ _TOOL_RELAY_POST_TIMEOUT_S = _TOOL_CALL_TIMEOUT_S + 30.0
 # ``tmux.json`` after the Claude terminal launches; the harness
 # tails it and shells out to tmux.
 _TMUX_READY_TIMEOUT_S = 30.0
-_TMUX_SEND_TIMEOUT_S = 5.0
+
+
+def _tmux_send_timeout_from_env(default: float = 30.0) -> float:
+    """Read ``OMNIGENT_TMUX_SEND_TIMEOUT_S``, ignoring a malformed value.
+
+    A bad value must not crash the bridge's stdio MCP server at import time,
+    so anything unparseable, non-positive, or non-finite falls back to
+    *default* (mirrors the guarded env parses in ``claude_native_hook``).
+
+    :param default: Value used when unset or malformed.
+    :returns: The parsed timeout in seconds, or *default*.
+    """
+    raw = os.environ.get("OMNIGENT_TMUX_SEND_TIMEOUT_S")
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    # ``0 < value <= 86400`` is False for nan and inf, so this also rejects
+    # non-finite values that ``float()`` parses without error.
+    return value if 0 < value <= 86400.0 else default
+
+
+# tmux commands are local IPC, but send-keys is not always fast: when many
+# child CLIs boot concurrently the tmux server fork/exec-starves and healthy
+# sends have been measured at 10-25s. A flat 5s tripped on slow-but-healthy
+# sends, so the ceiling is generous and env-overridable for constrained hosts.
+_TMUX_SEND_TIMEOUT_S = _tmux_send_timeout_from_env()
 # Claude Code renders this prompt glyph in its input box once the TUI
 # is interactive. We poll ``capture-pane`` for it before injecting the
 # first message so keystrokes typed during Claude's boot aren't dropped.
