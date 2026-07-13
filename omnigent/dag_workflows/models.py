@@ -37,7 +37,7 @@ class WorkflowRuntimeConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     enabled: bool = False
-    max_concurrency: int = Field(default=6, ge=1, le=64)
+    max_concurrency: int = Field(default=12, ge=1, le=64)
     max_nodes: int = Field(default=100, ge=1, le=1000)
     max_dispatches: int = Field(default=100, ge=1, le=10_000)
     max_cost_usd: float | None = Field(default=None, gt=0)
@@ -46,7 +46,7 @@ class WorkflowRuntimeConfig(BaseModel):
 class WorkflowBudget(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    max_concurrency: int = Field(default=4, ge=1)
+    max_concurrency: int = Field(default=12, ge=1)
     max_dispatches: int = Field(default=100, ge=1)
     max_cost_usd: float | None = Field(default=None, gt=0)
 

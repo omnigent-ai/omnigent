@@ -116,7 +116,7 @@ _WORKFLOW_BUDGET_SCHEMA = {
         "max_concurrency": {
             "type": "integer",
             "minimum": 1,
-            "description": "Max nodes running at once. Defaults to 4.",
+            "description": "Max nodes running at once. Defaults to 12.",
         },
         "max_dispatches": {
             "type": "integer",

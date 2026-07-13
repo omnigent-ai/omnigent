@@ -261,3 +261,68 @@ async def test_late_completion_cannot_overwrite_cancelled_status() -> None:
         assert "late-a" in run.seen_work_ids
     finally:
         await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_default_budget_dispatches_twelve_nodes_concurrently() -> None:
+    """The default per-workflow budget allows 12 independent nodes at once.
+
+    Thirteen root nodes with no explicit budget: the default max_concurrency of
+    12 dispatches twelve immediately and holds the thirteenth until a slot frees.
+    """
+    dispatches: list[str] = []
+
+    async def dispatch(node: Any, _prompt: str, ref: dict[str, Any], existing: str | None):
+        dispatches.append(node.id)
+        return {"conversation_id": existing or f"conv_{node.id}"}
+
+    async def noop(_value: str) -> None:
+        return None
+
+    async def cost(_child: str) -> float:
+        return 0.0
+
+    async def result(payload: dict[str, Any]) -> dict[str, Any]:
+        return payload
+
+    definition = {
+        "id": "wide",
+        "name": "wide fanout",
+        "budget": {"max_dispatches": 100},
+        "nodes": [
+            {"id": f"n{i}", "title": f"t{i}", "contract": "do", "agent": "codex"}
+            for i in range(13)
+        ],
+    }
+    manager = WorkflowManager(
+        parent_session_id="conv_parent",
+        limits=WorkflowRuntimeConfig(enabled=True),
+        dispatch=dispatch,
+        cancel_child=noop,
+        wake_parent=noop,
+        publish=lambda _event: None,
+        get_child_cost=cost,
+        evaluate_result=result,
+    )
+    try:
+        draft = await manager.submit(definition)
+        assert draft.definition.budget.max_concurrency == 12
+        await manager.start("wide", 1, draft.definition_hash)
+        # Exactly twelve dispatch concurrently; the thirteenth waits for a slot.
+        await _wait_until(lambda: len(dispatches) == 12)
+        await asyncio.sleep(0.05)
+        assert len(dispatches) == 12
+
+        manager.enqueue_completion(
+            WorkflowRef("wide", dispatches[0], 1),
+            {
+                "work_id": "work-0",
+                "conversation_id": f"conv_{dispatches[0]}",
+                "status": "completed",
+                "output": '<workflow_result>{}</workflow_result>',
+            },
+        )
+        # Freeing one slot dispatches the held thirteenth node.
+        await _wait_until(lambda: len(dispatches) == 13)
+    finally:
+        await manager.close()

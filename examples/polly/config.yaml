@@ -20,7 +20,7 @@ spawn: true
 # non-durable; Polly receives one wake when a workflow blocks or completes.
 workflows:
   enabled: true
-  max_concurrency: 6
+  max_concurrency: 12
   max_nodes: 100
   max_dispatches: 100
 
