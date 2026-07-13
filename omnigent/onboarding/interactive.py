@@ -401,8 +401,17 @@ def select(
     if not sys.stdin.isatty():
         return _select_fallback(title, options, default=default, selectable=mask)
 
-    import termios
-    import tty
+    try:
+        import termios
+        import tty
+    except ImportError:
+        # termios/tty are POSIX-only. On Windows a real TTY (PowerShell,
+        # Windows Terminal) reports isatty() == True, so the non-TTY guard
+        # above does not catch it — without this guard the import raises
+        # ModuleNotFoundError and crashes ``omnigent setup`` on entry.
+        # Degrade to the numbered fallback instead, mirroring the
+        # ``termios.error`` path below.
+        return _select_fallback(title, options, default=default, selectable=mask)
 
     fd = sys.stdin.fileno()
     selected = _first_selectable(mask, default)
