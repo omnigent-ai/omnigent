@@ -7644,6 +7644,76 @@ describe("chatStore — policy deny renders once", () => {
     expect(denyBlocks).toHaveLength(1);
     expect(denyBlocks[0]!.ctx.itemId).toBe("msg_deny_1");
   });
+
+  it("keeps the deny visible on a native-terminal session", async () => {
+    // Same server sequence as the non-native case, but on a native-terminal
+    // session the committed `text_done` reconciles via a DIFFERENT branch:
+    // it replaces the `live:` provisional IN PLACE (and retires the live
+    // message id) rather than appending and letting the terminal sweep drop
+    // the provisional. Both paths must yield exactly one durable, itemId-keyed
+    // deny block.
+    const sentinel = "[Denied by policy: over budget]";
+    useChatStore.setState({
+      conversationId: "conv_deny3",
+      blocks: [],
+      isNativeTerminalSession: true,
+    });
+    const sink = pushableStream();
+    const controller = new AbortController();
+    const manual = manualSched();
+    void pumpStreamEvents(
+      "conv_deny3",
+      sink.stream,
+      controller,
+      setState,
+      getState,
+      manual.scheduler,
+    );
+    sink.push(
+      sse("response.output_text.delta", {
+        delta: sentinel,
+        message_id: "deny_native",
+        index: 0,
+      }),
+    );
+    sink.push(
+      sse("response.output_item.done", {
+        item: {
+          id: "msg_deny_native",
+          type: "message",
+          role: "assistant",
+          response_id: "deny_resp_native",
+          content: [{ type: "output_text", text: sentinel }],
+        },
+      }),
+    );
+    sink.push(
+      sse("response.completed", {
+        id: "deny_term",
+        status: "completed",
+        output: [
+          {
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: sentinel }],
+          },
+        ],
+      }),
+    );
+    await tick();
+    manual.fire();
+    await tick();
+    const denyBlocks = useChatStore
+      .getState()
+      .blocks.filter(
+        (b) => b.type === "text_done" && (b as TextDone).fullText.includes("Denied by policy"),
+      );
+    controller.abort();
+    // The in-place replace leaves exactly one deny block, keyed by the
+    // persisted itemId — no swept `live:` provisional, no duplicate.
+    expect(denyBlocks).toHaveLength(1);
+    expect(denyBlocks[0]!.ctx.itemId).toBe("msg_deny_native");
+  });
 });
 
 describe("chatStore — client-side message queue", () => {
