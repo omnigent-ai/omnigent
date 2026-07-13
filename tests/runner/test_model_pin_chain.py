@@ -10,6 +10,7 @@ Chains the two fixed seams exactly as the live call site does
         or provider_default
     _build_claude_native_base_args(model_override=model_override, ...)  # -> --model
 """
+
 from __future__ import annotations
 
 from omnigent.runner.app import (

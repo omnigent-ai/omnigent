@@ -832,6 +832,7 @@ def update_conversation_id(
 # delivery; no shared tmux helper exists, so the small primitives are duplicated
 # per the established per-harness convention.
 
+
 def _tmux_send_timeout_from_env(default: float = 30.0) -> float:
     """Read ``OMNIGENT_TMUX_SEND_TIMEOUT_S``, ignoring a malformed value.
 

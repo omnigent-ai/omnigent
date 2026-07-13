@@ -1686,9 +1686,7 @@ def test_tmux_send_timeout_env_override(monkeypatch: pytest.MonkeyPatch) -> None
 
 
 @pytest.mark.parametrize("raw", ["banana", "", "-3", "0", "nan", "inf"])
-def test_tmux_send_timeout_malformed_falls_back(
-    monkeypatch: pytest.MonkeyPatch, raw: str
-) -> None:
+def test_tmux_send_timeout_malformed_falls_back(monkeypatch: pytest.MonkeyPatch, raw: str) -> None:
     """
     Unparseable, non-positive, or non-finite values must not crash the bridge
     at import time; they fall back to the default.

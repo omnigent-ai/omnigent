@@ -364,9 +364,7 @@ async def test_patch_close_succeeds_when_runner_unreachable(
             "no runner", code=sessions_module.ErrorCode.CONFLICT
         )
     )
-    with patch.object(
-        sessions_module, "_get_runner_client_for_resource_access", mock_get_client
-    ):
+    with patch.object(sessions_module, "_get_runner_client_for_resource_access", mock_get_client):
         resp = await client.patch(
             f"/v1/sessions/{session_id}",
             json={"labels": {"omnigent.closed": "true"}},

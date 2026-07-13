@@ -15421,9 +15421,7 @@ def create_sessions_router(
         # as already-closed and the teardown below would never fire.
         closing_now = False
         if (body.labels or {}).get(CLOSED_LABEL_KEY) == CLOSED_LABEL_VALUE:
-            _prior_conv = await asyncio.to_thread(
-                conversation_store.get_conversation, session_id
-            )
+            _prior_conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             closing_now = _prior_conv is not None and not is_session_closed(
                 _prior_conv.labels, _prior_conv.title
             )

@@ -268,8 +268,7 @@ def _build_sys_session_send_schema(
             "completes (check with sys_read_inbox, or poll "
             "sys_session_get_history). To run multiple sessions "
             "in parallel, emit multiple sys_session_send tool_calls in "
-            "the same response — they dispatch concurrently."
-            + _TURN_SCOPED_AVAILABILITY_NOTE
+            "the same response — they dispatch concurrently." + _TURN_SCOPED_AVAILABILITY_NOTE
         )
     )
     # ``args.harness`` is allowlist-gated (design D.4): advertise it only when
@@ -648,7 +647,8 @@ class SysSessionGetInfoTool(Tool):
             "and outstanding approval prompts. Global read — any "
             "session you can access. Pass session_id to target another "
             "session; omit it to describe your own. Metadata only — "
-            "use sys_session_get_history for the conversation transcript." + _TURN_SCOPED_AVAILABILITY_NOTE
+            "use sys_session_get_history for the conversation transcript."
+            + _TURN_SCOPED_AVAILABILITY_NOTE
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -1408,7 +1408,8 @@ class SysSessionGetHistoryTool(Tool):
             "tail of conversation items (assistant/user messages, tool "
             "calls, tool results) in chronological order. Returns "
             "session_not_found if conversation_id is unknown, or "
-            "session_out_of_tree if the server denies read access." + _TURN_SCOPED_AVAILABILITY_NOTE
+            "session_out_of_tree if the server denies read access."
+            + _TURN_SCOPED_AVAILABILITY_NOTE
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -1617,7 +1618,9 @@ class SysSessionCloseTool(Tool):
             # Re-build the tombstoned title from the parsed components so
             # the marker lands in the canonical position even if the
             # original title used uncommon characters around the colon.
-            new_title = f"{labelled.agent}:{labelled.title}{_CLOSED_TITLE_INFIX}{resolution.child.id}"
+            new_title = (
+                f"{labelled.agent}:{labelled.title}{_CLOSED_TITLE_INFIX}{resolution.child.id}"
+            )
         else:
             # A child created via sys_session_create carries the caller's
             # plain title (or none) — no "<agent>:" prefix, so there is no
