@@ -878,7 +878,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
                 ["git", "show", f"HEAD:{git_path}"],
                 cwd=str(self._git_root),
                 capture_output=True,
-                timeout=5,
+                timeout=self._git_status_timeout_s,
             )
             if result.returncode == 0:
                 return result.stdout.decode("utf-8", errors="replace")
