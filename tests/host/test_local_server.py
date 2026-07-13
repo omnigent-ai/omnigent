@@ -623,7 +623,7 @@ def test_ensure_local_omnigent_server_spawn_records_and_returns_log_path(
     # The captured log lives under the per-user server log dir as a .log file.
     assert result.log_path.parent == tmp_path / ".omnigent" / "logs" / "server"
     assert result.log_path.suffix == ".log"
-    assert result.log_path.name.startswith("local-server-")
+    assert result.log_path.name.startswith("server-")
     # Recorded in the sidecar so a later status/reuse names the same file.
     assert log_ref.read_text().strip() == str(result.log_path)
 
@@ -654,7 +654,7 @@ def test_ensure_local_omnigent_server_reuse_reads_log_path_sidecar(
     sig_file = tmp_path / "local_server.sig"
     sig_file.write_text(local_server.server_config_signature() + "\n")
     log_ref = tmp_path / "local_server.logpath"
-    recorded = tmp_path / ".omnigent" / "logs" / "server" / "local-server-cd34.log"
+    recorded = tmp_path / ".omnigent" / "logs" / "server" / "server-cd34.log"
     log_ref.write_text(str(recorded) + "\n")
     monkeypatch.setattr(local_server, "_LOCAL_SERVER_SIG_PATH", sig_file)
     monkeypatch.setattr(local_server, "_LOCAL_SERVER_LOG_REF_PATH", log_ref)

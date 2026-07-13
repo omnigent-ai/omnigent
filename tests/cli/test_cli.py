@@ -31,6 +31,7 @@ from omnigent.cli import (
     _dispatch_run,
     _ensure_sqlite_parent_dir,
     _expand_config_env_vars,
+    _extract_global_logging_flags,
     _HostHttpResult,
     _is_removed_ad_hoc_invocation,
     _is_run_shorthand,
@@ -50,6 +51,7 @@ from omnigent.cli import (
     _resolve_default_agent_target,
     _resolve_first_run_plan,
     _save_global_config,
+    _server_uvicorn_log_config,
     _start_cli_runner_process,
     _warn_missing_harness_dependencies,
     cli,
@@ -150,6 +152,92 @@ def test_removed_ad_hoc_detection(argv: list[str], expected: bool) -> None:
         prompt shape.
     """
     assert _is_removed_ad_hoc_invocation(argv) is expected
+
+
+def test_extract_global_logging_flags_preserves_run_shorthand() -> None:
+    """Global logging flags are stripped before run-shorthand detection."""
+    argv, debug, log_to_stderr = _extract_global_logging_flags(
+        ["--debug", "--log-to-stderr", "--harness", "claude"]
+    )
+
+    assert argv == ["--harness", "claude"]
+    assert debug is True
+    assert log_to_stderr is True
+    assert _is_run_shorthand(argv) is False
+
+
+def test_extract_global_logging_flags_preserves_passthrough_args() -> None:
+    """Logging flag names after ``--`` belong to the wrapped CLI."""
+    argv, debug, log_to_stderr = _extract_global_logging_flags(
+        ["claude", "--debug", "--", "--log-to-stderr", "--debug"]
+    )
+
+    assert argv == ["claude", "--", "--log-to-stderr", "--debug"]
+    assert debug is True
+    assert log_to_stderr is False
+
+
+def test_server_uvicorn_log_config_uses_terminal_handler_when_requested(
+    tmp_path: Path,
+) -> None:
+    """Uvicorn logs mirror through the shared terminal handler on request."""
+    log_config = _server_uvicorn_log_config(tmp_path / "server.log", log_to_stderr=True)
+
+    assert log_config["handlers"]["server_terminal"]["()"] == (
+        "omnigent.process_logging.terminal_stream_handler"
+    )
+    assert log_config["handlers"]["server_access_terminal"]["()"] == (
+        "omnigent.process_logging.terminal_stream_handler"
+    )
+    assert log_config["loggers"]["uvicorn"]["handlers"] == [
+        "server_terminal",
+        "server_file",
+    ]
+    assert log_config["loggers"]["uvicorn.access"]["handlers"] == [
+        "server_access_terminal",
+        "server_access_file",
+    ]
+
+
+def test_debug_logs_runner_session_reads_new_and_legacy_dirs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``debug logs --session`` finds canonical runner and legacy host-runner logs."""
+    data_dir = tmp_path / "data"
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(data_dir))
+    runner_dir = data_dir / "logs" / "runner"
+    legacy_dir = data_dir / "logs" / "host-runner"
+    runner_dir.mkdir(parents=True)
+    legacy_dir.mkdir(parents=True)
+    (runner_dir / "runner-conv_abc-new.log").write_text("new\n", encoding="utf-8")
+    (legacy_dir / "runner-conv_abc-old.log").write_text("old\n", encoding="utf-8")
+
+    result = CliRunner().invoke(
+        cli,
+        ["debug", "logs", "--type", "runner", "--session", "conv_abc", "--list"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "runner-conv_abc-new.log" in result.output
+    assert "runner-conv_abc-old.log" in result.output
+
+
+def test_debug_logs_host_daemon_alias_reads_host_destination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The legacy host-daemon type aliases to the canonical host destination."""
+    data_dir = tmp_path / "data"
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(data_dir))
+    host_dir = data_dir / "logs" / "host"
+    host_dir.mkdir(parents=True)
+    (host_dir / "host-20260101-000000-000000.log").write_text("host log\n", encoding="utf-8")
+
+    result = CliRunner().invoke(cli, ["debug", "logs", "--type", "host-daemon", "-n", "0"])
+
+    assert result.exit_code == 0, result.output
+    assert "host log" in result.output
 
 
 def _fake_run_claude_native_capture(
