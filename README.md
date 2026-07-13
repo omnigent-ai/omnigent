@@ -120,6 +120,8 @@ uv tool install -q --python 3.12 git+https://github.com/omnigent-ai/omnigent.git
   `uv tool install "omnigent[databricks]"` — or pass it to the bootstrap
   installer with `... | sh -s -- --extra databricks`. Signing in to the
   workspace also uses the [Databricks CLI](https://docs.databricks.com/aws/en/dev-tools/cli/install).
+- **PostgreSQL** (optional). To use a PostgreSQL `database_uri`, install the
+  database driver with `uv tool install "omnigent[postgres]"`.
 
 </details>
 

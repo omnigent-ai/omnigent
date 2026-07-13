@@ -2909,6 +2909,9 @@ modal = [
 openshell = [
     { name = "openshell" },
 ]
+postgres = [
+    { name = "psycopg", extra = ["binary"] },
+]
 s3 = [
     { name = "boto3" },
     { name = "botocore" },
@@ -2975,6 +2978,7 @@ requires-dist = [
     { name = "protobuf", specifier = ">=6,<7" },
     { name = "psutil", specifier = ">=5.9,<8" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'databricks'", specifier = ">=3.1,<4" },
+    { name = "psycopg", extras = ["binary"], marker = "extra == 'postgres'", specifier = ">=3.1,<4" },
     { name = "pydantic", specifier = ">=2.0,<3" },
     { name = "pyjwt", extras = ["crypto"], specifier = ">=2.8,<3" },
     { name = "pymysql", marker = "extra == 'databricks'", specifier = ">=1.1,<2" },
@@ -3002,7 +3006,7 @@ requires-dist = [
     { name = "websockets", specifier = ">=10.4,<15" },
     { name = "zstandard", specifier = ">=0.22,<1" },
 ]
-provides-extras = ["claude-sdk", "openai-agents", "all", "bedrock", "s3", "vertex", "modal", "daytona", "boxlite", "cwsandbox", "e2b", "openshell", "kubernetes", "tracing", "agents-sdk", "antigravity", "copilot", "cursor", "memory", "databricks", "dev"]
+provides-extras = ["claude-sdk", "openai-agents", "all", "bedrock", "s3", "vertex", "modal", "daytona", "boxlite", "cwsandbox", "e2b", "openshell", "kubernetes", "tracing", "agents-sdk", "antigravity", "copilot", "cursor", "memory", "postgres", "databricks", "dev"]
 
 [[package]]
 name = "omnigent-client"

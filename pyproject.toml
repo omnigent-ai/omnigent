@@ -179,6 +179,9 @@ cursor = ["cursor-sdk>=0.1.7"]
 # _reflect). The tools import the client lazily, so only users who enable a
 # Hindsight memory tool need this extra.
 memory = ["hindsight-client>=0.4.0"]
+# PostgreSQL database backend. SQLAlchemy support ships in the base package;
+# the driver is opt-in so SQLite-only installs stay lean.
+postgres = ["psycopg[binary]>=3.1,<4"]
 databricks = [
     # Floor matches what core code was tested against when the SDK was a
     # default dependency (it moved here from `dependencies` above).
