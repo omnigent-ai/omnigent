@@ -95,6 +95,9 @@ class ScheduledTaskRun:
     :param finished_at: Unix epoch seconds the run reached a terminal state,
         or ``None``.
     :param error: Failure detail when ``status == "failed"``; ``None`` otherwise.
+    :param error_code: Short failure classification (e.g. ``"timeout"``,
+        ``"rate_limited"``) for future retry logic; ``None`` unless
+        ``status == "failed"``.
     """
 
     id: str
@@ -105,3 +108,4 @@ class ScheduledTaskRun:
     fired_at: int | None = None
     finished_at: int | None = None
     error: str | None = None
+    error_code: str | None = None

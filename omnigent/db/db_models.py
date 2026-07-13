@@ -1231,6 +1231,9 @@ class SqlScheduledTaskRun(Base):
     :param finished_at: Unix epoch seconds the run reached a terminal state, or
         ``None`` if still pending/running.
     :param error: Failure detail when ``status = 'failed'``; ``None`` otherwise.
+    :param error_code: Short failure classification (e.g. ``"timeout"``,
+        ``"rate_limited"``) for future retryable-vs-terminal retry logic;
+        ``None`` unless ``status = 'failed'``.
     """
 
     __tablename__ = "scheduled_task_runs"
@@ -1259,6 +1262,10 @@ class SqlScheduledTaskRun(Base):
     finished_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # Opaque free-text error blob, never SQL-queried — stored compressed.
     error: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    # Short, queryable failure classification token (e.g. "timeout",
+    # "rate_limited") for future retry logic. Bounded plain string, not a blob;
+    # no CHECK constraint (no code taxonomy defined yet).
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     __table_args__ = (
         CheckConstraint(

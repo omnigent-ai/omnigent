@@ -105,6 +105,8 @@ def upgrade() -> None:
         sa.Column("finished_at", sa.Integer(), nullable=True),
         # Opaque free-text error blob stored compressed (CompressedText → LargeBinary).
         sa.Column("error", sa.LargeBinary(), nullable=True),
+        # Short, queryable failure classification token for future retry logic.
+        sa.Column("error_code", sa.String(64), nullable=True),
         sa.CheckConstraint(
             "status IN (1, 2, 3, 4, 5)",
             name="ck_scheduled_task_runs_status",

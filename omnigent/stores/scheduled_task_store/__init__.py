@@ -167,6 +167,7 @@ class ScheduledTaskStore(ABC):
         fired_at: int | None = None,
         finished_at: int | None = None,
         error: str | None = None,
+        error_code: str | None = None,
     ) -> ScheduledTaskRun:
         """
         Insert a new scheduled-task-run row.
@@ -180,6 +181,8 @@ class ScheduledTaskStore(ABC):
         :param fired_at: Optional Unix epoch seconds dispatch began.
         :param finished_at: Optional Unix epoch seconds of terminal state.
         :param error: Optional failure detail.
+        :param error_code: Optional short failure classification for future
+            retry logic (e.g. ``"timeout"``, ``"rate_limited"``).
         :returns: The newly created :class:`ScheduledTaskRun`.
         """
         ...

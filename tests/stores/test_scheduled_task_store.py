@@ -357,11 +357,14 @@ def test_create_run_and_list_runs(store: SqlAlchemyScheduledTaskStore) -> None:
         status="failed",
         scheduled_at=200,
         error="boom",
+        error_code="rate_limited",
     )
     runs = store.list_runs("st_runs")
     assert [r.id for r in runs] == ["sr_2", "sr_1"]  # scheduled_at DESC
     assert runs[0].status == "failed"
     assert runs[0].error == "boom"
+    assert runs[0].error_code == "rate_limited"
+    assert runs[1].error_code is None
     assert runs[1].conversation_id == "conv_1"
     assert runs[1].fired_at == 101
     assert runs[1].finished_at == 102

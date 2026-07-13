@@ -73,6 +73,7 @@ def _run_to_entity(row: SqlScheduledTaskRun) -> ScheduledTaskRun:
         fired_at=row.fired_at,
         finished_at=row.finished_at,
         error=row.error,
+        error_code=row.error_code,
     )
 
 
@@ -282,6 +283,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         fired_at: int | None = None,
         finished_at: int | None = None,
         error: str | None = None,
+        error_code: str | None = None,
     ) -> ScheduledTaskRun:
         """Insert a new scheduled-task-run row."""
         row = SqlScheduledTaskRun(
@@ -293,6 +295,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             fired_at=fired_at,
             finished_at=finished_at,
             error=error,
+            error_code=error_code,
         )
         with self._session() as session:
             session.add(row)
