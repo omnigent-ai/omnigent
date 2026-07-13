@@ -128,7 +128,8 @@ that a schema change hasn't broken seeding.
 ## Backends
 
 `--database-uri` selects the DB; the report's `backend` field (`sqlite` /
-`postgres`) is derived from the URI scheme so results group by backend.
+`postgres` / `mysql`) is derived from the URI scheme so results group by
+backend.
 
 - **SQLite** (default) — in-process; fast, but not prod-representative.
 - **Postgres** — `postgresql+psycopg://user@host:5432/db` (the fully-qualified
@@ -136,6 +137,11 @@ that a schema change hasn't broken seeding.
   Requires `psycopg[binary]` (the `databricks` extra). Matches prod's
   round-trip/pooling profile. Stand up a local one with
   `docker run -e POSTGRES_PASSWORD=… -p 5432:5432 postgres:16`.
+- **MySQL** — `mysql+mysqldb://user@host:3306/db`. Requires the `mysqlclient`
+  driver (`pip install mysqlclient`, which needs the `libmysqlclient-dev`
+  system library) — it is not in any extra. A supported backend, though prod
+  runs on Postgres. Stand up a local one with
+  `docker run -e MYSQL_ROOT_PASSWORD=… -e MYSQL_DATABASE=benchdb -p 3306:3306 mysql:8.0`.
 
 ## Output → Databricks → dashboard
 
@@ -157,7 +163,7 @@ document without running the harness.
 
 ```jsonc
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "generated_at": "<ISO-8601 UTC>",
   "git_sha": "<HEAD sha>",
   "git_branch": "<branch>",
@@ -169,7 +175,8 @@ document without running the harness.
   "journeys": {
     "<journey name>": {
       "kind": "latency" | "throughput",
-      "backend": "sqlite" | "postgres",
+      "backend": "sqlite" | "postgres" | "mysql",
+      "needs_runner": false,          // hardcoded per journey: HTTP=false, full-turn=true
       "runs": [                       // one per --runs
         {"n_success": N, "n_failures": N, "failures": {"HTTP 500": 1},
          "wall_time_s": …, "mean_ms": …, "p50_ms": …, "p95_ms": …,
@@ -205,10 +212,11 @@ creds).
 ## CI
 
 `.github/workflows/benchmark.yml` runs nightly (and on dispatch) as a backend
-matrix — `sqlite` and `postgres` (a `postgres:16` service container). Each leg
-seeds a corpus (SQLite reuses a cache keyed on the schema head + `seed.py` +
-corpus config, so a migration busts the cache and forces a reseed; Postgres is
-fresh per run), runs the benchmark, and uploads
+matrix — `sqlite`, `postgres` (a `postgres:16` service container), and `mysql`
+(a `mysql:8.0` service container; the `mysqlclient` driver is installed on that
+leg only). Each leg seeds a corpus (SQLite reuses a cache keyed on the schema
+head + `seed.py` + corpus config, so a migration busts the cache and forces a
+reseed; Postgres and MySQL are fresh per run), runs the benchmark, and uploads
 `benchmark-results-<backend>-<run_id>.json`. The workspace notebook pulls those
 artifacts.
 

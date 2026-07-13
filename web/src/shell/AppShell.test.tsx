@@ -10,6 +10,8 @@ import {
 } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import type { ServerInfo } from "@/lib/capabilities";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 
 vi.mock("@/hooks/useConversations", () => ({
@@ -303,11 +305,28 @@ function SessionNavButton({ to }: { to: string }) {
   );
 }
 
-function renderShell(path: string) {
+/** Full ServerInfo with permissive defaults; override per test. */
+function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
+  return {
+    accounts_enabled: false,
+    login_url: null,
+    needs_setup: false,
+    databricks_features: false,
+    managed_sandboxes_enabled: false,
+    sandbox_provider: null,
+    sharing_mode: "on",
+    public_sharing_enabled: true,
+    server_version: null,
+    smart_routing_enabled: false,
+    ...overrides,
+  };
+}
+
+function renderShell(path: string, info?: ServerInfo) {
   const qc = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
-  return render(
+  const tree = (
     <QueryClientProvider client={qc}>
       <TooltipProvider>
         <MemoryRouter initialEntries={[path]}>
@@ -336,8 +355,11 @@ function renderShell(path: string) {
           </Routes>
         </MemoryRouter>
       </TooltipProvider>
-    </QueryClientProvider>,
+    </QueryClientProvider>
   );
+  // Without an explicit info the CapabilitiesContext default ("loading")
+  // applies, matching production first paint and every pre-existing test.
+  return render(info ? <CapabilitiesProvider info={info}>{tree}</CapabilitiesProvider> : tree);
 }
 
 function mockConversations(
@@ -2721,6 +2743,36 @@ describe("AppShell share action", () => {
         ),
       ).toBeInTheDocument();
       expect(shareButton).toHaveAttribute("title", "Sharing is unavailable from a local server.");
+    });
+  });
+
+  it("disables the Share button when the server reports sharing_mode off", () => {
+    // Non-local origin isolates the reason to the server policy (not the
+    // local-server path), so the tooltip must be the sharing-off message.
+    withWindowOrigin("https://app.example.com", () => {
+      mockConversations([{ id: "conv_top", permission_level: null }]);
+
+      renderShell("/c/conv_top", serverInfo({ sharing_mode: "off" }));
+
+      const shareButton = screen.getByRole("button", { name: /share session/i });
+      expect(shareButton).toBeDisabled();
+      expect(shareButton).toHaveAttribute(
+        "title",
+        "Sharing has been disabled for this Omnigent server.",
+      );
+    });
+  });
+
+  it("keeps the Share button enabled when sharing_mode is read_only", () => {
+    // read_only still permits (read) grants, so the affordance stays live —
+    // the modal caps the level, the button is not disabled.
+    withWindowOrigin("https://app.example.com", () => {
+      mockConversations([{ id: "conv_top", permission_level: null }]);
+
+      renderShell("/c/conv_top", serverInfo({ sharing_mode: "read_only" }));
+
+      const shareButton = screen.getByRole("button", { name: /share session/i });
+      expect(shareButton).toBeEnabled();
     });
   });
 

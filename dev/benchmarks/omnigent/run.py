@@ -64,6 +64,8 @@ def _backend_of(database_uri: str | None) -> str:
         return "sqlite"
     if database_uri.startswith("postgres"):
         return "postgres"
+    if database_uri.startswith("mysql"):
+        return "mysql"
     return "other"
 
 
@@ -133,6 +135,11 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[dict[str, object], bo
             block = aggregate(results)
             block["kind"] = kind
             block["backend"] = backend
+            # Hardcoded per-journey mapping: HTTP journeys are False, full-turn
+            # journeys True. Sourced from the journey itself, not the run-level
+            # env, so it stays correct in a mixed selection (where with_runner
+            # is True for the whole run because *some* journey needs it).
+            block["needs_runner"] = journey.needs_runner
             journey_results[journey.name] = block
             if not check_thresholds(
                 results,
@@ -178,10 +185,10 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         "--database-uri",
         default=None,
         metavar="URI",
-        help="DB the server boots against — a pre-seeded SQLite file or a "
-        "postgresql+psycopg://… instance (see seed.py). Default: a fresh "
-        "throwaway SQLite DB (empty — best-case numbers). The report's "
-        "`backend` field is derived from this.",
+        help="DB the server boots against — a pre-seeded SQLite file, a "
+        "postgresql+psycopg://… instance, or a mysql+mysqldb://… instance "
+        "(see seed.py). Default: a fresh throwaway SQLite DB (empty — "
+        "best-case numbers). The report's `backend` field is derived from this.",
     )
     parser.add_argument(
         "--iterations",

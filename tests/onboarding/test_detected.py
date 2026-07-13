@@ -48,12 +48,16 @@ def _codex_login() -> DetectedProvider:
     )
 
 
-def test_synthesize_env_key_anthropic() -> None:
+def test_synthesize_env_key_anthropic(monkeypatch: pytest.MonkeyPatch) -> None:
     """An anthropic env key becomes a ``key`` entry with an ``env:`` ref.
 
     Failure means the detected key wouldn't route (wrong kind/family) or
-    would leak as an inline secret instead of an env reference.
+    would leak as an inline secret instead of an env reference. Clears the
+    companion gateway env so the assertion pins the vendor default rather
+    than an ambient ``ANTHROPIC_BASE_URL`` from the surrounding shell.
     """
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
     entries = synthesize_detected_entries([_anthropic_key()])
     assert set(entries) == {"anthropic"}
     parsed = load_providers({"providers": entries})["anthropic"]
@@ -127,6 +131,46 @@ def test_synthesize_env_key_openai_without_base_url_uses_default(
     )
     entries = synthesize_detected_entries([det])
     assert entries["openai"]["openai"]["base_url"] == "https://api.openai.com/v1"
+
+
+def test_synthesize_env_key_anthropic_honors_base_url_and_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A detected ``ANTHROPIC_API_KEY`` adopts companion base URL + model.
+
+    An Anthropic-compatible gateway (LiteLLM, …) issues a gateway-scoped key
+    that 401s against ``api.anthropic.com`` and serves a non-default model.
+    Both the endpoint and the model pin must ride the synthesized provider;
+    otherwise native Claude routes to the real API (auth fail) or launches
+    without ``--model`` (invalid-model).
+    """
+    gateway = "https://gateway.example/anthropic"
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", gateway)
+    monkeypatch.setenv("ANTHROPIC_MODEL", "gateway-served-claude")
+    entries = synthesize_detected_entries([_anthropic_key()])
+    anthropic_block = entries["anthropic"]["anthropic"]
+    assert anthropic_block["base_url"] == gateway
+    assert anthropic_block["api_key_ref"] == "env:ANTHROPIC_API_KEY"
+    # The model pin lands as the family default so the launch gets ``--model``.
+    assert anthropic_block["models"] == {"default": "gateway-served-claude"}
+
+
+def test_synthesize_env_key_anthropic_without_overrides_uses_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Absent overrides, a detected Anthropic key keeps the vendor default.
+
+    No ``ANTHROPIC_BASE_URL`` / ``ANTHROPIC_MODEL`` means the canonical
+    ``https://api.anthropic.com`` endpoint and no pinned model (the spec /
+    catalog default picks the model).
+    """
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
+    entries = synthesize_detected_entries([_anthropic_key()])
+    anthropic_block = entries["anthropic"]["anthropic"]
+    assert anthropic_block["base_url"] == "https://api.anthropic.com"
+    # No model pinned — the block carries no ``models`` key.
+    assert "models" not in anthropic_block
 
 
 def test_synthesize_subscription_cli() -> None:

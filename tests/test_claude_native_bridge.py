@@ -4999,6 +4999,59 @@ def test_claude_prompt_rendered_ignores_unframed_glyph_deep_in_tail() -> None:
     assert _claude_prompt_rendered(pane) is False
 
 
+def test_claude_prompt_rendered_ignores_custom_api_key_menu() -> None:
+    """The custom-API-key menu's selected row is not the chat input.
+
+    Claude Code's startup "Detected a custom API key" confirmation renders
+    its highlighted choice with the same ``❯`` glyph the chat composer uses
+    (``❯ 2. No (recommended)``). Treating it as ready pastes the first web
+    message into the menu, so no turn starts — the tmux delivery false
+    positive this guards against.
+    """
+    pane = "\n".join(
+        [
+            "Detected a custom API key in your environment",
+            "Do you want to use this API key?",
+            "  1. Yes",
+            "❯ 2. No (recommended)",  # selected menu row, NOT the chat input
+        ]
+    )
+    assert _claude_prompt_rendered(pane) is False
+
+
+def test_claude_prompt_rendered_sees_chat_input_below_menu_glyph() -> None:
+    """A real chat prompt still reads ready even past a menu-shaped echo.
+
+    A numbered ``❯`` choice echoed into scrollback must not suppress the
+    live input box below it: the chat ``❯`` row (no numbered choice after
+    the glyph) is the one that marks readiness.
+    """
+    pane = "\n".join(
+        [
+            "❯ 2. No (recommended)",  # scrollback echo of a prior menu row
+            "output",
+            "────────────────────────────────────────",  # input box top rule
+            "❯ ",  # the live chat prompt
+            "────────────────────────────────────────",  # box closing rule
+            "  Opus 4.8 (1M context) | effort:high",
+        ]
+    )
+    assert _claude_prompt_rendered(pane) is True
+
+
+def test_claude_prompt_rendered_sees_numbered_draft_in_framed_input() -> None:
+    """A numbered composer draft is distinguished from an unframed menu row."""
+    pane = "\n".join(
+        [
+            "────────────────────────────────────────",
+            "❯ 2. buy milk",
+            "────────────────────────────────────────",
+            "  Opus 4.8 (1M context) | effort:high",
+        ]
+    )
+    assert _claude_prompt_rendered(pane) is True
+
+
 def _write_deltas_lines(bridge_dir: Path, lines: list[str]) -> None:
     """
     Append raw JSONL lines to the bridge deltas file.
