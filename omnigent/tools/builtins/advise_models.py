@@ -7,10 +7,13 @@ Omnigent server intercepts the ``tools/call`` in
 :func:`~omnigent.server.routes.sessions._handle_advise_models_mcp`
 before the MCP proxy ever reaches the runner.
 
-The tool is registered by ``ToolManager`` when:
-- ``tools.agents`` is declared in the spec, AND
-- ``RuntimeCaps.routing_client`` is configured
-  (``OMNIGENT_SMART_ROUTING=1`` + ``llm:`` config block).
+The tool is registered by ``ToolManager`` whenever the dispatch grant is
+present (``tools.agents`` declared or ``spawn: true``) — the runner cannot
+see the server's routing state at registration time, so it is always
+surfaced. When routing is not configured (no ``RuntimeCaps.routing_client``;
+i.e. ``OMNIGENT_SMART_ROUTING=1`` + ``llm:`` block absent) the server's MCP
+intercept returns ``{"router_on": false, "recommendations": []}`` so the
+caller knows to pick models itself instead of calling again.
 """
 
 from __future__ import annotations
@@ -48,9 +51,11 @@ class SysAdviseModelsTool(Tool):
             "Recommend the best model per worker per task before fan-out. "
             "Each task specifies one or more agents to get recommendations "
             "for, plus an optional model list to constrain the pick. "
-            "Returns one {agent, model, rationale} entry per agent entry. "
-            "Use the returned model as args.model in sys_session_send. "
-            "Advisory only. Available when OMNIGENT_SMART_ROUTING=1."
+            "Returns {router_on, recommendations}; each recommendation is a "
+            "{agent, model, rationale} entry. Use the returned model as "
+            "args.model in sys_session_send. Advisory only. When routing is "
+            "off the call returns router_on:false with no recommendations — "
+            "pick models yourself instead of calling again."
         )
 
     def get_schema(self) -> dict[str, Any]:

@@ -141,8 +141,9 @@ def test_builtin_names_size_matches_registry() -> None:
                 "update_comment",
                 # sys_list_models / sys_advise_models: auto-registered
                 # by ToolManager alongside the sub-agent dispatch grant.
-                # sys_advise_models is only included when smart routing
-                # is enabled (RuntimeCaps.routing_client is set).
+                # sys_advise_models is always surfaced (the runner can't see
+                # the server's routing state); the server's MCP intercept
+                # returns router_on:false when routing is disabled.
                 "sys_list_models",
                 "sys_advise_models",
                 # Embedded-browser tools: always registered (schema-only
