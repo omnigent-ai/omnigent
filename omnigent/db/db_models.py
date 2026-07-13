@@ -1078,15 +1078,15 @@ class SqlScheduledTask(Base):
     session on a recurring cron schedule (``cron_expression``). This PR persists
     the definition only — no scheduler reads or dispatches these rows yet.
 
-    The entity mirrors the internal Isaac ``ScheduledTask`` spec (fields
+    The entity mirrors an external scheduler's scheduled-task spec (fields
     ``prompt``/``org``/``repo``/``base_branch``/``model``/``effort``; a required
     recurring ``cron_expression`` trigger; a ``state`` enum
     ``active``/``paused``/``deleted``) so a future merge is a
     column mapping rather than a rewrite.
 
-    :param id: Opaque PK, e.g. ``"st_a1b2c3..."``. On Isaac→Omni migration a
-        fresh id is minted here; Isaac's schedule_id is kept in metadata (not
-        reused as the PK).
+    :param id: Opaque PK, e.g. ``"st_a1b2c3..."``. On migration from an external
+        scheduler a fresh id is minted here; the source scheduler's id is kept in
+        metadata (not reused as the PK).
     :param name: Human-readable task name, e.g. ``"nightly triage"``.
     :param prompt: The instruction dispatched to the agent on each firing.
     :param cron_expression: The required cron string for the recurring trigger,
@@ -1113,7 +1113,7 @@ class SqlScheduledTask(Base):
         ``workspace`` is where, ``base_branch`` is what to branch from. ``None``
         when unset. The per-run *output* branch is not stored on the definition.
     :param sandbox_target: Nullable compute-target hint naming where a firing
-        should run (a provider name such as ``"local"``, ``"isaac"``, or
+        should run (a provider name such as ``"local"`` or
         ``"e2b"`` may live here in a later PR). Persisted only — there is no
         resolution logic in this PR.
     :param timezone: IANA timezone the trigger is evaluated in, e.g.
@@ -1130,7 +1130,7 @@ class SqlScheduledTask(Base):
         referenced conversation was deleted (application-owned SET-NULL cleanup;
         no DB foreign key).
     :param scheduled_task_metadata: JSON-encoded free-form metadata object (also
-        holds Isaac provenance like ``isaac_schedule_id`` on migrated rows).
+        holds provenance like ``source_schedule_id`` on migrated rows).
         Mapped to the column named ``metadata`` (the bare ``metadata`` attribute
         is reserved on the declarative base). Defaults to ``"{}"``.
     :param created_at: Unix epoch seconds at row creation.
@@ -1170,7 +1170,7 @@ class SqlScheduledTask(Base):
     # Git base ref a firing branches from when it creates a worktree at fire
     # time (mirrors session-create's git.base_branch input). None when unset.
     base_branch: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    # Nullable compute-target hint (provider name, e.g. "local"/"isaac"). Not yet
+    # Nullable compute-target hint (provider name, e.g. "local"/"e2b"). Not yet
     # resolved — the fire path reads it in a later milestone. A single nullable
     # string, not an enum.
     sandbox_target: Mapped[str | None] = mapped_column(String(64), nullable=True)

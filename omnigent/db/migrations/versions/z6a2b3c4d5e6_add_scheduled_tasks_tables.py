@@ -38,9 +38,9 @@ def upgrade() -> None:
     op.create_table(
         "scheduled_tasks",
         sa.Column("workspace_id", sa.BigInteger(), nullable=False, server_default="0"),
-        # Opaque PK, e.g. "st_<hex>". On Isaac→Omni migration a FRESH id is minted
-        # here (not Isaac's schedule_id); the original Isaac schedule_id is preserved
-        # in `metadata` (e.g. {"isaac_schedule_id": ...}) for traceability + idempotent re-runs.
+        # Opaque PK, e.g. "st_<hex>". On migration from an external scheduler a FRESH id is minted
+        # here (not the source id); the original source schedule id is preserved
+        # in `metadata` (e.g. {"source_schedule_id": ...}) for traceability + idempotent re-runs.
         sa.Column("id", sa.String(64), nullable=False),
         sa.Column("name", sa.String(256), nullable=False),
         # Opaque free text stored compressed (CompressedText → LargeBinary).

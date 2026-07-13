@@ -21,9 +21,9 @@ class ScheduledTask:
 
     A task's trigger is a required recurring ``cron_expression``.
 
-    :param id: Opaque primary key, e.g. ``"st_a1b2c3..."``. On Isaac→Omni
-        migration a fresh id is minted; Isaac's schedule_id is preserved in
-        metadata.
+    :param id: Opaque primary key, e.g. ``"st_a1b2c3..."``. On migration from
+        an external scheduler a fresh id is minted; the source scheduler's id is
+        preserved in metadata.
     :param name: Human-readable task name, e.g. ``"nightly triage"``.
     :param prompt: The instruction dispatched to the agent on each firing.
     :param cron_expression: The required cron string for the recurring trigger,
@@ -45,7 +45,7 @@ class ScheduledTask:
     :param base_branch: Git base ref a firing branches from when it creates a
         worktree at fire time. Pairs with ``workspace``. ``None`` when unset.
     :param sandbox_target: Nullable compute-target hint (a provider name such
-        as ``"local"`` or ``"isaac"``). Persisted only; no resolution logic yet.
+        as ``"local"`` or ``"e2b"``). Persisted only; no resolution logic yet.
     :param state: Lifecycle state — one of ``"active"``, ``"paused"``,
         ``"deleted"``. Defaults to ``"active"``.
     :param last_run_at: Unix epoch seconds of the most recent firing, or
