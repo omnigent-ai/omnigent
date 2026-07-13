@@ -1051,7 +1051,7 @@ class SqlUserDailyCost(OmnigentBase):
     updated_at: Mapped[int] = mapped_column(Integer)
 
 
-class SqlScheduledTask(Base):
+class SqlScheduledTask(OmnigentBase):
     """
     SQLAlchemy model for the ``scheduled_tasks`` table.
 
@@ -1175,7 +1175,7 @@ class SqlScheduledTask(Base):
     )
 
 
-class SqlScheduledTaskRun(Base):
+class SqlScheduledTaskRun(OmnigentBase):
     """
     SQLAlchemy model for the ``scheduled_task_runs`` table.
 

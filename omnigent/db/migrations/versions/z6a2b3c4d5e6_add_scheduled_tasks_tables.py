@@ -1,7 +1,7 @@
 """add scheduled_tasks and scheduled_task_runs tables
 
 Revision ID: z6a2b3c4d5e6
-Revises: z5a2b3c4d5e6
+Revises: bb2c3d4e5f6a
 Create Date: 2026-07-09 00:00:00.000000
 
 Adds the ``scheduled_tasks`` table (saved, scheduled agent instructions) and its
@@ -28,7 +28,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "z6a2b3c4d5e6"
-down_revision: str | None = "z5a2b3c4d5e6"
+down_revision: str | None = "bb2c3d4e5f6a"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
