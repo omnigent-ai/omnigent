@@ -37,6 +37,7 @@ def test_hello_round_trip() -> None:
         frame_protocol_version=1,
         harnesses=["claude-sdk", "codex"],
         envs=["os_sandbox"],
+        telemetry_opt_out=True,
     )
     decoded = decode_frame(encode_frame(f))
     assert isinstance(decoded, HelloFrame)
@@ -44,6 +45,20 @@ def test_hello_round_trip() -> None:
     assert decoded.frame_protocol_version == 1
     assert decoded.harnesses == ["claude-sdk", "codex"]
     assert decoded.envs == ["os_sandbox"]
+    assert decoded.telemetry_opt_out is True
+
+
+def test_hello_telemetry_opt_out_defaults_false() -> None:
+    payload = {
+        "kind": "hello",
+        "runner_version": "0.1.2",
+        "frame_protocol_version": 1,
+        "harnesses": [],
+        "envs": [],
+    }
+    decoded = decode_frame(json.dumps(payload))
+    assert isinstance(decoded, HelloFrame)
+    assert decoded.telemetry_opt_out is False
 
 
 def test_request_round_trip_with_body_and_query_string() -> None:

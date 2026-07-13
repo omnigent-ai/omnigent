@@ -39,8 +39,14 @@ class _NoopWS:
         return await asyncio.Future()
 
 
-def _hello() -> HelloFrame:
-    return HelloFrame(runner_version="0.1.0", frame_protocol_version=1, harnesses=[], envs=[])
+def _hello(*, telemetry_opt_out: bool = False) -> HelloFrame:
+    return HelloFrame(
+        runner_version="0.1.0",
+        frame_protocol_version=1,
+        harnesses=[],
+        envs=[],
+        telemetry_opt_out=telemetry_opt_out,
+    )
 
 
 async def _wait_until(predicate: Callable[[], object], *, timeout_s: float = 1.0) -> None:
@@ -73,6 +79,20 @@ async def test_register_then_get_returns_session() -> None:
 def test_get_returns_none_for_unknown() -> None:
     reg = TunnelRegistry()
     assert reg.get("ghost") is None
+
+
+@pytest.mark.asyncio
+async def test_is_runner_telemetry_opted_out_reads_hello_flag() -> None:
+    reg = TunnelRegistry()
+    reg.register("r1", _NoopWS(), _hello(telemetry_opt_out=True))
+
+    assert reg.is_runner_telemetry_opted_out("r1") is True
+
+
+def test_is_runner_telemetry_opted_out_false_for_unknown() -> None:
+    reg = TunnelRegistry()
+
+    assert reg.is_runner_telemetry_opted_out("ghost") is False
 
 
 @pytest.mark.asyncio

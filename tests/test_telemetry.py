@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+import yaml
 
 from omnigent.telemetry.surface import classify_surface
 
@@ -123,6 +124,7 @@ def test_is_disabled_none_set(monkeypatch: pytest.MonkeyPatch) -> None:
     """When none of the opt-out vars are set, telemetry is enabled."""
     _ci_vars = [
         "OMNIGENT_TELEMETRY",
+        "DISABLE_TELEMETRY",
         "OMNIGENT_DISABLE_TELEMETRY",
         "DO_NOT_TRACK",
         "CI",
@@ -195,6 +197,65 @@ _ALL_OPT_OUT_VARS = [
 ]
 
 
+def _clear_opt_out_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Remove env vars that can disable telemetry."""
+    for var in _ALL_OPT_OUT_VARS:
+        monkeypatch.delenv(var, raising=False)
+
+
+@pytest.mark.parametrize(
+    ("var", "value"),
+    [
+        ("OMNIGENT_TELEMETRY", "0"),
+        ("DISABLE_TELEMETRY", "1"),
+        ("DISABLE_TELEMETRY", "true"),
+        ("DISABLE_TELEMETRY", "yes"),
+        ("DISABLE_TELEMETRY", "TRUE"),
+        ("OMNIGENT_DISABLE_TELEMETRY", "1"),
+        ("OMNIGENT_DISABLE_TELEMETRY", "true"),
+        ("OMNIGENT_DISABLE_TELEMETRY", "yes"),
+        ("DO_NOT_TRACK", "1"),
+    ],
+)
+def test_is_disabled_env_var_variants(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    var: str,
+    value: str,
+) -> None:
+    """Every documented env-var opt-out disables telemetry."""
+    _clear_opt_out_env(monkeypatch)
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv(var, value)
+    from omnigent.telemetry.client import is_disabled
+
+    assert is_disabled() is True
+
+
+@pytest.mark.parametrize(
+    ("var", "value"),
+    [
+        ("OMNIGENT_TELEMETRY", "1"),
+        ("DISABLE_TELEMETRY", "false"),
+        ("OMNIGENT_DISABLE_TELEMETRY", "false"),
+        ("DO_NOT_TRACK", "0"),
+    ],
+)
+def test_is_disabled_env_var_non_opt_out_values(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    var: str,
+    value: str,
+) -> None:
+    """Truthy-only env vars do not opt out on unrelated values."""
+    _clear_opt_out_env(monkeypatch)
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv(var, value)
+    from omnigent.telemetry.client import is_disabled
+
+    assert is_disabled() is False
+
+
 def test_is_disabled_config_yaml(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """``telemetry: false`` in config.yaml disables telemetry."""
     config_file = tmp_path / "config.yaml"
@@ -202,6 +263,18 @@ def test_is_disabled_config_yaml(monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
     for var in _ALL_OPT_OUT_VARS:
         monkeypatch.delenv(var, raising=False)
+    from omnigent.telemetry.client import is_disabled
+
+    assert is_disabled() is True
+
+
+def test_is_disabled_config_home_override(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """``OMNIGENT_CONFIG_HOME`` controls which config.yaml is read."""
+    config_home = tmp_path / "custom-home"
+    config_home.mkdir()
+    (config_home / "config.yaml").write_text("telemetry: false\n", encoding="utf-8")
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+    _clear_opt_out_env(monkeypatch)
     from omnigent.telemetry.client import is_disabled
 
     assert is_disabled() is True
@@ -219,6 +292,49 @@ def test_is_disabled_config_yaml_telemetry_true(
     from omnigent.telemetry.client import is_disabled
 
     assert is_disabled() is False
+
+
+def test_is_disabled_malformed_config_yaml_returns_false(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Malformed config text does not silently suppress telemetry."""
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text("telemetry: [false\n", encoding="utf-8")
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    _clear_opt_out_env(monkeypatch)
+    from omnigent.telemetry.client import is_disabled
+
+    assert is_disabled() is False
+
+
+def test_config_opts_out_bool_false() -> None:
+    """A real YAML bool false opts out."""
+    from omnigent.telemetry.client import _config_opts_out
+
+    assert _config_opts_out(False) is True
+
+
+def test_config_opts_out_bool_true() -> None:
+    """A real YAML bool true does not opt out."""
+    from omnigent.telemetry.client import _config_opts_out
+
+    assert _config_opts_out(True) is False
+
+
+@pytest.mark.parametrize("value", ["false", "no", "off", "0", " FALSE "])
+def test_config_opts_out_corrupted_string_opt_out(value: str) -> None:
+    """String spellings produced by the corrupted loader opt out."""
+    from omnigent.telemetry.client import _config_opts_out
+
+    assert _config_opts_out(value) is True
+
+
+@pytest.mark.parametrize("value", ["true", "yes", "on", "1", ""])
+def test_config_opts_out_corrupted_string_not_opt_out(value: str) -> None:
+    """Opt-in string spellings do not disable telemetry."""
+    from omnigent.telemetry.client import _config_opts_out
+
+    assert _config_opts_out(value) is False
 
 
 # ── init_client — server_config ──────────────────────────────────────────────
@@ -252,6 +368,26 @@ def test_init_client_server_config_disabled(monkeypatch: pytest.MonkeyPatch) -> 
     try:
         monkeypatch.setattr(_mod, "_CLIENT", None)
         _mod.init_client(config={"telemetry": False})
+        assert _mod._CLIENT is None
+    finally:
+        monkeypatch.setattr(_mod, "_CLIENT", original_client)
+
+
+def test_init_client_c_file_false_after_spec_import(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``telemetry: false`` from ``omnigent server -c`` disables telemetry."""
+    import omnigent.spec.parser  # noqa: F401 — reproduces the SafeLoader mutation
+    import omnigent.telemetry.client as _mod
+
+    for var in _ALL_OPT_OUT_VARS:
+        monkeypatch.delenv(var, raising=False)
+
+    config = yaml.safe_load("telemetry: false\n")
+    assert config["telemetry"] == "false"
+
+    original_client = _mod._CLIENT
+    try:
+        monkeypatch.setattr(_mod, "_CLIENT", None)
+        _mod.init_client(config=config)
         assert _mod._CLIENT is None
     finally:
         monkeypatch.setattr(_mod, "_CLIENT", original_client)

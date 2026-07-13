@@ -297,6 +297,31 @@ from omnigent.tools.client_specified import parse_client_side_tool_specs
 
 _logger = logging.getLogger(__name__)
 
+
+def _session_telemetry_opted_out(request: Request, conv: Conversation) -> bool:
+    """Return whether this session's host or runner opted out of telemetry."""
+    try:
+        host_registry: HostRegistry | None = getattr(request.app.state, "host_registry", None)
+        if (
+            host_registry is not None
+            and conv.host_id is not None
+            and host_registry.is_host_telemetry_opted_out(conv.host_id)
+        ):
+            return True
+        tunnel_registry: TunnelRegistry | None = getattr(
+            request.app.state, "tunnel_registry", None
+        )
+        if (
+            tunnel_registry is not None
+            and conv.runner_id is not None
+            and tunnel_registry.is_runner_telemetry_opted_out(conv.runner_id)
+        ):
+            return True
+    except Exception:  # noqa: BLE001 — telemetry gating must never disrupt requests
+        return False
+    return False
+
+
 # ── Module-level constants (rule 34) ──────────────────────────────
 
 # Wire literal for the interrupt input type. Lives here so the
@@ -12618,17 +12643,11 @@ async def _create_session_from_existing_agent(
         await asyncio.to_thread(conversation_store.set_labels, conv.id, body.labels)
 
     # Emit session.created exactly once at creation time.
-    # Best-effort: skip if the host opted out via HostHelloFrame.
+    # Best-effort: skip if the host or runner opted out.
     try:
         import hashlib as _hashlib
 
-        _hr: HostRegistry | None = getattr(request.app.state, "host_registry", None)
-        _host_opted_out = (
-            _hr is not None
-            and conv.host_id is not None
-            and _hr.is_host_telemetry_opted_out(conv.host_id)
-        )
-        if not _host_opted_out:
+        if not _session_telemetry_opted_out(request, conv):
             _install_id = _get_installation_id()
             _anon_uid: str | None = None
             if user_id is not None:
@@ -19406,18 +19425,19 @@ def create_sessions_router(
             try:
                 import hashlib as _hashlib
 
-                _srv_id = _get_installation_id()
-                _anon: str | None = None
-                if user_id is not None:
-                    _salt = f"{_srv_id}:{user_id}" if _srv_id else user_id
-                    _anon = _hashlib.sha256(_salt.encode()).hexdigest()[:16]
-                _tel_emit(
-                    _TelSessionStoppedEvent(
-                        session_id=session_id,
-                        installation_id=_srv_id,
-                        anon_user_id=_anon,
+                if stop_conv is not None and not _session_telemetry_opted_out(request, stop_conv):
+                    _srv_id = _get_installation_id()
+                    _anon: str | None = None
+                    if user_id is not None:
+                        _salt = f"{_srv_id}:{user_id}" if _srv_id else user_id
+                        _anon = _hashlib.sha256(_salt.encode()).hexdigest()[:16]
+                    _tel_emit(
+                        _TelSessionStoppedEvent(
+                            session_id=session_id,
+                            installation_id=_srv_id,
+                            anon_user_id=_anon,
+                        )
                     )
-                )
             except Exception:  # noqa: BLE001 — telemetry is best-effort
                 pass
             return {"queued": False}
@@ -20460,26 +20480,27 @@ def create_sessions_router(
             import hashlib as _hashlib
             import time as _time
 
-            _srv_id = _get_installation_id()
-            _anon_d: str | None = None
-            if user_id is not None:
-                _salt_d = f"{_srv_id}:{user_id}" if _srv_id else user_id
-                _anon_d = _hashlib.sha256(_salt_d.encode()).hexdigest()[:16]
-            _usage = conv.session_usage or {}
-            _duration: float | None = None
-            with contextlib.suppress(Exception):
-                _duration = _time.time() - conv.created_at
-            _tel_emit(
-                _TelSessionDeletedEvent(
-                    session_id=session_id,
-                    installation_id=_srv_id,
-                    anon_user_id=_anon_d,
-                    duration_seconds=_duration,
-                    input_tokens=_usage.get("input_tokens"),
-                    output_tokens=_usage.get("output_tokens"),
-                    total_cost_usd=_usage.get("total_cost_usd"),
+            if not _session_telemetry_opted_out(request, conv):
+                _srv_id = _get_installation_id()
+                _anon_d: str | None = None
+                if user_id is not None:
+                    _salt_d = f"{_srv_id}:{user_id}" if _srv_id else user_id
+                    _anon_d = _hashlib.sha256(_salt_d.encode()).hexdigest()[:16]
+                _usage = conv.session_usage or {}
+                _duration: float | None = None
+                with contextlib.suppress(Exception):
+                    _duration = _time.time() - conv.created_at
+                _tel_emit(
+                    _TelSessionDeletedEvent(
+                        session_id=session_id,
+                        installation_id=_srv_id,
+                        anon_user_id=_anon_d,
+                        duration_seconds=_duration,
+                        input_tokens=_usage.get("input_tokens"),
+                        output_tokens=_usage.get("output_tokens"),
+                        total_cost_usd=_usage.get("total_cost_usd"),
+                    )
                 )
-            )
         except Exception:  # noqa: BLE001 — telemetry is best-effort
             pass
         return ConversationDeleted(id=session_id)

@@ -1,3 +1,9 @@
 llm:
   model: databricks-claude-haiku-4-5
   profile: oss
+
+# Anonymous usage telemetry is default-on. Set to false to opt out.
+# Env vars OMNIGENT_TELEMETRY=0 / DISABLE_TELEMETRY=true /
+# OMNIGENT_DISABLE_TELEMETRY=true / DO_NOT_TRACK=1 also opt out.
+# See docs/telemetry.md.
+# telemetry: false

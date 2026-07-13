@@ -207,6 +207,15 @@ def _config_telemetry_disabled() -> bool:
         return False
 
 
+def _config_opts_out(value: object) -> bool:
+    """Return whether a parsed ``telemetry`` config value opts out."""
+    if value is False:
+        return True
+    if isinstance(value, str):
+        return value.strip().lower() in ("false", "no", "off", "0")
+    return False
+
+
 def is_disabled() -> bool:
     """Return ``True`` when telemetry should be completely suppressed.
 
@@ -522,13 +531,13 @@ def init_client(*, config: dict[str, Any] | None = None) -> None:
     Safe to call multiple times; idempotent after the first call.
 
     :param config: Optional parsed server config dict (e.g. from ``-c
-        config.yaml``).  When ``config.get("telemetry") is False``
+        config.yaml``).  When ``telemetry`` is an opt-out value,
         telemetry is disabled regardless of env vars.
     """
     global _CLIENT
     if is_disabled():
         return
-    if config is not None and config.get("telemetry") is False:
+    if config is not None and "telemetry" in config and _config_opts_out(config["telemetry"]):
         return
     # Prime the installation-id cache on startup so later request
     # handlers do not perform synchronous file I/O on the event loop.

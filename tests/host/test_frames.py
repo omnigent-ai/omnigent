@@ -82,6 +82,7 @@ def test_hello_frame_round_trip() -> None:
         frame_protocol_version=1,
         name="corey-laptop",
         runners=["runner_token_aaa", "runner_token_bbb"],
+        telemetry_opt_out=True,
     )
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostHelloFrame)
@@ -89,6 +90,7 @@ def test_hello_frame_round_trip() -> None:
     assert decoded.frame_protocol_version == 1
     assert decoded.name == "corey-laptop"
     assert decoded.runners == ["runner_token_aaa", "runner_token_bbb"]
+    assert decoded.telemetry_opt_out is True
 
 
 def test_hello_frame_empty_runners() -> None:
@@ -105,6 +107,7 @@ def test_hello_frame_empty_runners() -> None:
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostHelloFrame)
     assert decoded.runners == []
+    assert decoded.telemetry_opt_out is False
 
 
 def test_launch_runner_frame_round_trip() -> None:

@@ -39,7 +39,7 @@ class FakeWebSocket:
         return ""  # pragma: no cover
 
 
-def _make_hello(name: str = "test-host") -> HostHelloFrame:
+def _make_hello(name: str = "test-host", *, telemetry_opt_out: bool = False) -> HostHelloFrame:
     """Build a minimal HostHelloFrame for tests.
 
     :param name: Human-readable host name.
@@ -49,6 +49,7 @@ def _make_hello(name: str = "test-host") -> HostHelloFrame:
         version="0.1.0",
         frame_protocol_version=1,
         name=name,
+        telemetry_opt_out=telemetry_opt_out,
     )
 
 
@@ -114,6 +115,26 @@ def test_online_host_ids() -> None:
     registry.deregister("host_c1")
     ids = registry.online_host_ids()
     assert ids == ["host_c2"]
+
+
+def test_is_host_telemetry_opted_out_reads_hello_flag() -> None:
+    """The registry exposes the host hello telemetry opt-out bit."""
+    registry = HostRegistry()
+    registry.register(
+        "host_telemetry",
+        FakeWebSocket(),
+        _make_hello(telemetry_opt_out=True),
+        owner="alice",
+    )
+
+    assert registry.is_host_telemetry_opted_out("host_telemetry") is True
+
+
+def test_is_host_telemetry_opted_out_false_for_unknown() -> None:
+    """Unknown/offline hosts are treated as no opt-out signal."""
+    registry = HostRegistry()
+
+    assert registry.is_host_telemetry_opted_out("missing") is False
 
 
 def test_register_replaces_stale_connection() -> None:

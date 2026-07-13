@@ -400,6 +400,18 @@ See the [policy guide](https://github.com/omnigent-ai/omnigent/blob/main/docs/PO
 
 ---
 
+## Telemetry
+
+Omnigent collects limited anonymous session lifecycle telemetry by default; it
+does not send prompts, responses, code, file contents, tool arguments, or
+workspace paths. Opt out with `telemetry: false` in `~/.omnigent/config.yaml` or
+an `omnigent server -c` config file, or set `OMNIGENT_TELEMETRY=0`,
+`DISABLE_TELEMETRY=true`, `OMNIGENT_DISABLE_TELEMETRY=true`, or `DO_NOT_TRACK=1`.
+Hosts started with `omnigent host` forward their opt-out state so the server skips
+telemetry for sessions on that host. See [docs/telemetry.md](docs/telemetry.md).
+
+---
+
 ## Write your own agent
 
 An agent is a short YAML file: your prompt, your tools — local Python
@@ -463,4 +475,3 @@ Thanks to all of our amazing contributors!
 <a href="https://github.com/omnigent-ai/omnigent/graphs/contributors">
   <img src="https://contrib.rocks/image?repo=omnigent-ai/omnigent" />
 </a>
-
