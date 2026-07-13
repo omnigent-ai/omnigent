@@ -345,8 +345,8 @@ async def test_input_deny_publishes_committed_item_event(
     item = done_events[0]["item"]
     assert item.get("id"), f"committed item must carry a store-assigned id; got {item}"
     text = "".join(
-        part.get("text", "")
-        for part in item.get("content", [])
-        if isinstance(part, dict)
+        part.get("text", "") for part in item.get("content", []) if isinstance(part, dict)
     )
-    assert "Blocked by test policy" in text, f"deny sentinel missing from committed item; got {item}"
+    assert "Blocked by test policy" in text, (
+        f"deny sentinel missing from committed item; got {item}"
+    )
