@@ -170,6 +170,25 @@ def test_anthropic_zero_usage_total_is_zero_not_none() -> None:
     )
 
 
+def test_anthropic_missing_usage_counts_are_treated_as_zero() -> None:
+    """Missing non-streaming usage counts normalize to zero."""
+    resp = {
+        "id": "msg_missing_usage",
+        "model": "claude-test",
+        "content": [{"type": "text", "text": ""}],
+        "stop_reason": "end_turn",
+        "usage": {},
+    }
+
+    chat = _anthropic_to_chat(resp)
+
+    assert chat["usage"] == {
+        "prompt_tokens": None,
+        "completion_tokens": None,
+        "total_tokens": 0,
+    }
+
+
 def test_anthropic_tool_use_response_to_chat() -> None:
     resp = {
         "id": "msg_456",
