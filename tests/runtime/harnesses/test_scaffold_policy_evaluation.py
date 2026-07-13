@@ -182,16 +182,16 @@ async def test_policy_verdict_event_handler(_turn_ctx: TurnContext) -> None:
 
 
 @pytest.mark.asyncio()
-async def test_evaluate_policy_timeout_returns_allow(
+async def test_evaluate_policy_llm_timeout_fails_open(
     _turn_ctx: TurnContext,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    ``evaluate_policy`` returns ALLOW after the timeout expires.
+    ``evaluate_policy`` returns ALLOW for advisory LLM phases after timeout.
 
     If the verdict never arrives (race condition, network hiccup,
-    evaluation_id mismatch), the executor must not hang forever.
-    Fail-open prevents silent session hangs.
+    evaluation_id mismatch), the executor must not hang forever. LLM request
+    policy is advisory, so this path fails open.
     """
     # Shrink timeout to 0.1s so the test runs fast.
     import omnigent.runtime.harnesses._scaffold as _scaffold_mod
