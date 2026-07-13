@@ -135,6 +135,11 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[dict[str, object], bo
             block = aggregate(results)
             block["kind"] = kind
             block["backend"] = backend
+            # Hardcoded per-journey mapping: HTTP journeys are False, full-turn
+            # journeys True. Sourced from the journey itself, not the run-level
+            # env, so it stays correct in a mixed selection (where with_runner
+            # is True for the whole run because *some* journey needs it).
+            block["needs_runner"] = journey.needs_runner
             journey_results[journey.name] = block
             if not check_thresholds(
                 results,

@@ -163,7 +163,7 @@ document without running the harness.
 
 ```jsonc
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "generated_at": "<ISO-8601 UTC>",
   "git_sha": "<HEAD sha>",
   "git_branch": "<branch>",
@@ -176,6 +176,7 @@ document without running the harness.
     "<journey name>": {
       "kind": "latency" | "throughput",
       "backend": "sqlite" | "postgres" | "mysql",
+      "needs_runner": false,          // hardcoded per journey: HTTP=false, full-turn=true
       "runs": [                       // one per --runs
         {"n_success": N, "n_failures": N, "failures": {"HTTP 500": 1},
          "wall_time_s": …, "mean_ms": …, "p50_ms": …, "p95_ms": …,

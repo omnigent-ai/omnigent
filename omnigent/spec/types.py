@@ -674,6 +674,19 @@ class LLMConfig:  # type: ignore[explicit-any]  # extra: dict[str, Any] field (s
         ``request_timeout`` to distinguish from the task-level
         ``executor.timeout``.
     :param retry: Retry policy for transient LLM failures.
+    :param fallback_models: Ordered backup models tried, in order,
+        when a call to ``model`` fails. Same provider-prefixed
+        format as ``model``, e.g.
+        ``["databricks/claude-3-5-haiku", "databricks/gpt-4o-mini"]``.
+        Consumed today by the policy LLM client
+        (:class:`~omnigent.policies.types.PolicyLLMClient`): a call
+        advances to the next model on any failure and only surfaces
+        an error once every candidate is exhausted. Empty (the
+        default) preserves single-model behaviour. The resolved
+        ``connection`` (or ``profile``) is shared across the primary
+        and every fallback, so prefer same-provider fallbacks; a
+        fallback on a different provider only works when credentials
+        come from environment defaults (no ``connection``/``profile``).
     """
 
     model: str
@@ -690,6 +703,9 @@ class LLMConfig:  # type: ignore[explicit-any]  # extra: dict[str, Any] field (s
     profile: str | None = None
     request_timeout: int = 300
     retry: RetryPolicy = field(default_factory=RetryPolicy)
+    # Ordered backup models tried when a call to ``model`` fails.
+    # Empty preserves single-model behaviour.
+    fallback_models: list[str] = field(default_factory=list)
 
 
 @dataclass
