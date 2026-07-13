@@ -56,7 +56,7 @@ import { ElicitationCard } from "@/components/blocks/ApprovalCard";
 import { BlockRenderer, FilePathAwareMessageResponse } from "@/components/blocks/BlockRenderer";
 import { CompactionMarker, RoutingDecisionCard } from "@/components/blocks/StatusBlocks";
 import { SystemMessageView } from "@/components/blocks/SystemMessage";
-import { parseSystemMessage } from "@/lib/systemMessage";
+import { isSystemUserContent, parseSystemMessage } from "@/lib/systemMessage";
 import { Button } from "@/components/ui/button";
 import { OttoIcon } from "@/components/icons/OttoIcon";
 import { cn } from "@/lib/utils";
@@ -1427,6 +1427,11 @@ function MainAgentSurface({
   subAgentLabel,
 }: MainAgentSurfaceProps) {
   const terminalFirst = useTerminalFirst();
+  // The turn rail is a hover minimap with no mobile affordance (CSS-hidden
+  // under `md`). Gate its MOUNT — not just its visibility — on the viewport so
+  // mobile never runs its eager history backfill (up to 2000 items/open) for a
+  // rail the user can't see.
+  const isMobileViewport = useIsMobileViewport();
   // Mirrors ChatPage's `sandboxLaunching`: while the managed-sandbox
   // launch runs, the composer must stay sendable — the server parks
   // the message on the launch rendezvous — even though liveness reads
@@ -1786,13 +1791,17 @@ function MainAgentSurface({
         />
         {/* Left-edge minimap: one tick per turn, scrolls independently, pages
             in older history on scroll-up. Sibling of Conversation for the same
-            reason as JumpToTopButton — it escapes the chat-scroll-fade mask. */}
-        <TurnRail
-          turns={turns}
-          scroller={scroller}
-          hasMoreHistory={hasMoreHistory}
-          loadingMoreHistory={loadingMoreHistory}
-        />
+            reason as JumpToTopButton — it escapes the chat-scroll-fade mask.
+            Desktop-only: not mounted on mobile so its eager backfill never
+            runs where the rail is hidden. */}
+        {!isMobileViewport && (
+          <TurnRail
+            turns={turns}
+            scroller={scroller}
+            hasMoreHistory={hasMoreHistory}
+            loadingMoreHistory={loadingMoreHistory}
+          />
+        )}
       </div>
       {/* Floating reply button — scoped to the conversation container. */}
       <SelectionPopup
@@ -2936,11 +2945,7 @@ function ConnectedTerminalFirstPill({
  */
 function isSystemBubble(bubble: Bubble): boolean {
   if (bubble.kind !== "user") return false;
-  const hasAttachments = bubble.content.some(
-    (c) => c.type === "input_image" || c.type === "input_file",
-  );
-  if (hasAttachments) return false;
-  return parseSystemMessage(extractUserText(bubble.content)) !== null;
+  return isSystemUserContent(bubble.content);
 }
 
 function CompactionLoadingIndicator() {

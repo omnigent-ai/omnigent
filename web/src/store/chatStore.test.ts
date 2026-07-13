@@ -84,6 +84,19 @@ function userMessage(responseId: string, text: string): ConversationItem {
   };
 }
 
+// A `[System: …]` marker — sent as a user-role message but re-classified by
+// the UI as a muted marker, not a real user turn / rail tick.
+function systemMarker(responseId: string, inner = "timer t1 fired"): ConversationItem {
+  return {
+    id: `msg_${responseId}_sys`,
+    response_id: responseId,
+    type: "message",
+    role: "user",
+    status: "completed",
+    content: [{ type: "input_text", text: `[System: ${inner}]` }],
+  };
+}
+
 function assistantMessage(responseId: string, text: string): ConversationItem {
   return {
     id: `msg_${responseId}_asst`,
@@ -1472,6 +1485,77 @@ describe("chatStore — switchTo", () => {
     // hasMoreHistory is cleared so the auto-firing effect can't re-loop.
     expect(state.hasMoreHistory).toBe(false);
     expect(state.loadingMoreHistory).toBe(false);
+  });
+
+  it("loadHistoryUntilUserMessages ignores [System: …] markers when counting turns", async () => {
+    // The rail derives ticks from REAL user turns only (system markers are
+    // dropped), so the loader must count the same way. If it counted markers,
+    // it could early-return at the target while the rail has too few ticks —
+    // and, since the early-return leaves hasMoreHistory set, wedge the rail
+    // permanently hidden. Here every turn carries a [System: …] marker: with
+    // 15 real turns the loader must page ALL of them (running history dry)
+    // rather than stopping early on the inflated user-block count.
+    const TARGET = 10;
+    const TURNS = 15;
+    const items: ConversationItem[] = [];
+    for (let t = 0; t < TURNS; t++) {
+      const rid = `s_${t.toString().padStart(3, "0")}`;
+      items.push(userMessage(rid, `prompt ${t}`));
+      items.push(systemMarker(rid)); // a user-role block that is NOT a real turn
+      items.push(assistantMessage(rid, `reply ${t}`));
+    }
+    seedSessionSnapshot("conv_sys", items.slice(-SESSION_HISTORY_PAGE_SIZE));
+    seedSessionItems("conv_sys", items);
+
+    await useChatStore.getState().switchTo("conv_sys");
+    await useChatStore.getState().loadHistoryUntilUserMessages(TARGET);
+
+    const state = useChatStore.getState();
+    // Real user turns actually loaded — the count that feeds the rail.
+    const blockText = (b: (typeof state.blocks)[number]): string =>
+      b.type === "user_message"
+        ? b.content
+            .filter((c): c is { type: "input_text"; text: string } => c.type === "input_text")
+            .map((c) => c.text)
+            .join("")
+        : "";
+    const realTurns = state.blocks.filter(
+      (b) => b.type === "user_message" && !/^\[System: /.test(blockText(b)),
+    ).length;
+    expect(realTurns).toBeGreaterThanOrEqual(TARGET);
+    // hasMoreHistory settles false only because we counted real turns, not the
+    // (larger) raw user-block count — proving the loader didn't stop early.
+    expect(state.loadingMoreHistory).toBe(false);
+  });
+
+  it("loadHistoryUntilUserMessages assembles turns across multiple pages in order", async () => {
+    // EAGER_PAGE_LIMIT is 200, so to actually exercise the cross-page
+    // `older.unshift(...)` assembly (and the MAX_EAGER_PAGES loop) we need more
+    // than 200 items. 120 turns × 2 items = 240 items > one page.
+    const TURNS = 120;
+    const items: ConversationItem[] = [];
+    for (let t = 0; t < TURNS; t++) {
+      const rid = `p_${t.toString().padStart(3, "0")}`;
+      items.push(userMessage(rid, `prompt ${t}`));
+      items.push(assistantMessage(rid, `reply ${t}`));
+    }
+    seedSessionSnapshot("conv_multi", items.slice(-SESSION_HISTORY_PAGE_SIZE));
+    seedSessionItems("conv_multi", items);
+
+    await useChatStore.getState().switchTo("conv_multi");
+    // Target more turns than fit in a single 200-item page, forcing ≥2 pages.
+    await useChatStore.getState().loadHistoryUntilUserMessages(110);
+
+    // Whatever loaded must be a contiguous chronological suffix of the seed —
+    // any per-page reversal or misordered cross-page splice would break this.
+    const loadedIds = useChatStore
+      .getState()
+      .blocks.map((b) => b.ctx.itemId)
+      .filter((iid): iid is string => Boolean(iid));
+    const seededIds = items.map((it) => it.id);
+    const suffix = seededIds.slice(seededIds.length - loadedIds.length);
+    expect(loadedIds).toEqual(suffix);
+    expect(loadedIds.length).toBeGreaterThan(2 * SESSION_HISTORY_PAGE_SIZE);
   });
 
   it("does not run flat session items through the nested snapshot flattener", async () => {

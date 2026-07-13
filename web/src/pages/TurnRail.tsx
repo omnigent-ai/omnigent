@@ -63,8 +63,9 @@ export function TurnRail({
   // (cursor moved) from a scroll-induced one (same position), independent of
   // whether the browser fires mouseenter before or after the scroll event.
   const hoverPointRef = useRef({ x: -1, y: -1 });
-  // Last pointer position over the rail, used to pick the settle tick.
-  const pointerRef = useRef({ x: 0, y: 0 });
+  // Last pointer position over the rail, used to pick the settle tick. Starts
+  // off-screen so a settle before any pointermove resolves to no element.
+  const pointerRef = useRef({ x: -1, y: -1 });
   // itemIds of the turns whose messages are currently on screen. Their ticks
   // read as active (black) when the user isn't hovering the rail.
   const [visibleIds, setVisibleIds] = useState<ReadonlySet<string>>(() => new Set());
@@ -228,6 +229,17 @@ export function TurnRail({
     };
   }, [hasMoreHistory, loadingMoreHistory]);
 
+  // Stable ref callback so React doesn't detach/re-attach every tick on every
+  // render (an inline arrow changes identity each render, thrashing the Map).
+  // Keyed off the element's own data-turn-tick. Entries for removed turns are
+  // left stale — never iterated for absent turns, overwritten if the id returns
+  // — so we skip the null (unmount) call rather than delete.
+  const setTickRef = useCallback((el: HTMLButtonElement | null) => {
+    if (!el) return;
+    const id = el.dataset.turnTick;
+    if (id) tickRefs.current.set(id, el);
+  }, []);
+
   const handleHover = useCallback((itemId: string) => {
     const rail = railRef.current;
     const tick = tickRefs.current.get(itemId);
@@ -279,6 +291,9 @@ export function TurnRail({
     const onScroll = () => {
       window.clearTimeout(settle);
       settle = window.setTimeout(() => {
+        // Don't re-hover after the pointer has left the rail: mouseLeave clears
+        // hoveredId, and a late settle would flicker a preview back on.
+        if (!interactingRef.current) return;
         // Pick the tick now under the last pointer position and preview it.
         const el = document.elementFromPoint(pointerRef.current.x, pointerRef.current.y);
         const button = el?.closest<HTMLButtonElement>("[data-turn-tick]");
@@ -336,8 +351,12 @@ export function TurnRail({
         // past both ends. items-start (not center) so a hover-widened tick
         // extends rightward from a fixed left edge instead of re-centering the
         // column; pl-2 insets the dashes from the screen edge; scrollbar hidden
-        // — this is chrome.
-        className="turn-rail-fade pointer-events-auto flex max-h-72 flex-col items-start overflow-y-auto py-6 pl-2 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+        // — this is chrome. pointer-events only once revealed, so the invisible
+        // (opacity-0) rail isn't a silent click target before it fades in.
+        className={cn(
+          "turn-rail-fade flex max-h-72 flex-col items-start overflow-y-auto py-6 pl-2 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden",
+          revealed ? "pointer-events-auto" : "pointer-events-none",
+        )}
       >
         {turns.map((turn) => {
           const isHovered = turn.itemId === hoveredId;
@@ -349,10 +368,7 @@ export function TurnRail({
               key={turn.itemId}
               type="button"
               data-turn-tick={turn.itemId}
-              ref={(el) => {
-                if (el) tickRefs.current.set(turn.itemId, el);
-                else tickRefs.current.delete(turn.itemId);
-              }}
+              ref={setTickRef}
               onMouseEnter={(e) => handleTickEnter(turn.itemId, e.clientX, e.clientY)}
               onFocus={() => handleHover(turn.itemId)}
               onClick={() => scrollToUserMessage(turn.itemId, flashUserMessage)}

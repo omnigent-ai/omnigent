@@ -53,6 +53,7 @@ import type {
   UserMessageBlock,
 } from "@/lib/blocks";
 import { BlockStream } from "@/lib/blockStream";
+import { isSystemUserContent } from "@/lib/systemMessage";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
 import {
@@ -1855,8 +1856,16 @@ export const useChatStore = create<ChatState>((set, get) => ({
   loadHistoryUntilUserMessages: async (minUserMessages) => {
     const start = get();
     if (start.loadingMoreHistory) return;
+    // Count only REAL user turns, not `[System: …]` marker blocks (task/timer/
+    // sub-agent notices arrive as user-role). The rail derives its ticks from
+    // the same non-system predicate, so counting markers here would let the
+    // loader hit the target while the rail has too few ticks — and, since the
+    // early-return leaves hasMoreHistory set, wedge the rail permanently hidden.
     const countUsers = (blocks: AnyBlock[]): number =>
-      blocks.reduce((n, b) => n + (b.type === "user_message" ? 1 : 0), 0);
+      blocks.reduce(
+        (n, b) => n + (b.type === "user_message" && !isSystemUserContent(b.content) ? 1 : 0),
+        0,
+      );
     // Users already in state count toward the target: we only need to fetch
     // enough MORE to top up to minUserMessages, else we overshoot by whatever
     // state already holds and blow past the "≤20 ticks initially" intent.
