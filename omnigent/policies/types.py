@@ -429,7 +429,7 @@ class PolicyLLMClient:
         last_exc: Exception | None = None
         for index, model in enumerate(candidates):
             try:
-                return await self._client.responses.create(
+                response = await self._client.responses.create(
                     input=input,
                     model=model,
                     connection_params=connection_params,
@@ -449,6 +449,18 @@ class PolicyLLMClient:
                         remaining,
                         exc_info=True,
                     )
+                continue
+            # A non-primary candidate succeeded — record which fallback
+            # recovered the call so the fallback path is visible in logs.
+            if index > 0:
+                _log.warning(
+                    "PolicyLLMClient: recovered on fallback model %r "
+                    "(candidate %d of %d) after primary failure",
+                    model,
+                    index + 1,
+                    len(candidates),
+                )
+            return response
         # Every candidate failed — surface the last error to the caller.
         # This is the fail-closed (DENY) path and, because candidates are
         # tried serially, the caller has now waited up to

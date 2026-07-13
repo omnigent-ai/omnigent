@@ -332,10 +332,12 @@ async def test_policy_llm_client_no_fallback_propagates_error() -> None:
 
 
 @pytest.mark.asyncio
-async def test_policy_llm_client_falls_back_on_primary_failure() -> None:
+async def test_policy_llm_client_falls_back_on_primary_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """
     When the primary model fails, ``create()`` advances to the
-    first fallback and returns its response.
+    first fallback, logs the recovery, and returns its response.
 
     What breaks if this fails: a transient primary-model failure
     denies the request even though a healthy fallback was
@@ -352,10 +354,13 @@ async def test_policy_llm_client_falls_back_on_primary_failure() -> None:
         _fallback_models=["databricks/backup"],
     )
 
-    result = await policy_client.create(input=[{"role": "user", "content": "hi"}])
+    with caplog.at_level("WARNING"):
+        result = await policy_client.create(input=[{"role": "user", "content": "hi"}])
 
     assert result == good
     assert fake_client.responses.create.await_count == 2
+    # The recovery is logged so the fallback path is visible in ops logs.
+    assert any("recovered on fallback model" in r.message for r in caplog.records)
     # Primary tried first, backup second — in order.
     models = [c.kwargs["model"] for c in fake_client.responses.create.await_args_list]
     assert models == ["databricks/primary", "databricks/backup"]
