@@ -141,6 +141,52 @@ def test_anthropic_text_response_to_chat() -> None:
     assert chat["choices"][0]["finish_reason"] == "stop"
     assert chat["usage"]["prompt_tokens"] == 10
     assert chat["usage"]["completion_tokens"] == 5
+    assert chat["usage"]["total_tokens"] == 15
+
+
+def test_anthropic_zero_usage_total_is_zero_not_none() -> None:
+    """A genuine zero token total stays ``0``, not ``None``.
+
+    The non-streaming usage builder used ``(a or 0) + (b or 0) or None``, whose
+    precedence collapses a real ``0`` total to ``None`` — yielding an
+    inconsistent ``prompt=0, completion=0, total=None`` and disagreeing with the
+    streaming path, which reports ``input + output`` directly.
+
+    Regression guard: pre-fix ``total_tokens`` is ``None`` here.
+    """
+    resp = {
+        "id": "msg_0",
+        "model": "claude-test",
+        "content": [{"type": "text", "text": ""}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 0, "output_tokens": 0},
+    }
+    chat = _anthropic_to_chat(resp)
+    assert chat["usage"]["prompt_tokens"] == 0
+    assert chat["usage"]["completion_tokens"] == 0
+    assert chat["usage"]["total_tokens"] == 0, (
+        f"total_tokens is {chat['usage']['total_tokens']!r}, expected 0 — a real "
+        "zero total must not collapse to None."
+    )
+
+
+def test_anthropic_missing_usage_counts_are_treated_as_zero() -> None:
+    """Missing non-streaming usage counts normalize to zero."""
+    resp = {
+        "id": "msg_missing_usage",
+        "model": "claude-test",
+        "content": [{"type": "text", "text": ""}],
+        "stop_reason": "end_turn",
+        "usage": {},
+    }
+
+    chat = _anthropic_to_chat(resp)
+
+    assert chat["usage"] == {
+        "prompt_tokens": None,
+        "completion_tokens": None,
+        "total_tokens": 0,
+    }
 
 
 def test_anthropic_tool_use_response_to_chat() -> None:

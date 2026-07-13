@@ -86,11 +86,13 @@ def _error_text(error: object) -> str:
     return str(error or "")
 
 
-def infra_failure_reason(result: TurnResult) -> str | None:
+def infra_failure_reason(result: TurnResult | ForkResult) -> str | None:
     """Return a skip reason when failure reflects infrastructure, not capability."""
-    if not result.failed:
-        return None
     text = _error_text(result.error)
+    if isinstance(result, TurnResult) and result.text:
+        text = f"{text} {result.text}"
+    if not result.failed and not any(marker in text for marker in _INFRA_ERROR_MARKERS):
+        return None
     if not any(marker in text for marker in _INFRA_ERROR_MARKERS):
         return None
     for code in ("403", "401"):
@@ -156,6 +158,19 @@ class TurnResult:
     @property
     def event_types(self) -> list[str]:
         return [e.get("type", "") for e in self.events]
+
+
+@dataclass
+class ForkResult:
+    """Probe-observable state from cloning a session and replaying its history."""
+
+    created: bool = False
+    history_copied: bool = False
+    recalled: bool = False
+    text: str = ""
+    failed: bool = False
+    error: Any = None
+    timed_out: bool = False
 
 
 def fill_snapshot_cost(result: TurnResult, snapshot: dict[str, Any]) -> None:
@@ -283,6 +298,12 @@ class SdkInprocDriver:
             auto_tool_output="bench-tool-ok",
             timeout=150.0,
         )
+
+    async def run_mcp_tool_turn(self) -> TurnResult:
+        return TurnResult(error="Omnigent MCP relay is not observable on sdk-inproc")
+
+    async def run_fork_turn(self, marker: str) -> ForkResult:
+        return ForkResult(error="session fork is not observable on sdk-inproc")
 
     async def run_policy_turn(self, *, action: str) -> TurnResult:
         """Return unmeasured because wrap-direct cannot observe ALLOW or ASK."""

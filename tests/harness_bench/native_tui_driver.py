@@ -32,15 +32,27 @@ from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
 from tests._helpers.live_server import find_free_port
 from tests.e2e._harness_probes import cli_unavailable_reason
-from tests.harness_bench.driver import ProvisioningError, TurnResult, fill_snapshot_cost
+from tests.harness_bench.driver import (
+    ForkResult,
+    ProvisioningError,
+    TurnResult,
+    fill_snapshot_cost,
+)
 from tests.harness_bench.full_server import spawn_omnigent_server
+from tests.harness_bench.mcp_tools import is_target_omnigent_mcp_tool
 from tests.harness_bench.profile import BenchProfile
 from tests.harness_bench.runtime_env import (
     BenchRuntimeEnv,
     bench_creds_skip_reason,
     resolve_bench_env,
 )
-from tests.harness_bench.session_items import assistant_text, function_calls, item_role, item_type
+from tests.harness_bench.session_items import (
+    assistant_text,
+    contains_user_text,
+    function_calls,
+    item_role,
+    item_type,
+)
 
 # Timeouts are "clearly stuck" ceilings, not expected durations: provisioning is
 # local (server/runner/host/forwarder boot, no model call) and a healthy native
@@ -137,6 +149,28 @@ _NATIVE_TOOL_PROVOCATION: dict[str, tuple[str, str]] = {
     "kimi-native": ("Bash", "Use the Bash tool to run this exact command: echo omnigent-bench-ok"),
 }
 
+_NATIVE_OMNIGENT_MCP_HARNESSES = frozenset(
+    {
+        "antigravity-native",
+        "claude-native",
+        "codex-native",
+        "cursor-native",
+        "goose-native",
+        "hermes-native",
+        "kiro-native",
+        "qwen-native",
+    }
+)
+_MCP_TOOL_PROMPT = (
+    "You must call the omnigent MCP tool mcp__omnigent__sys_session_list exactly once. "
+    "It may be displayed as sys_session_list by your client. Do not use a shell or any "
+    "other tool. After the tool returns, reply with done."
+)
+_MCP_TOOL_RETRY_PROMPT = (
+    "Call the available tool named sys_session_list now with an empty argument object. "
+    "This is required; do not answer from memory and do not use any other tool."
+)
+
 
 def native_vendor(harness: str) -> NativeVendor | None:
     """Derive the :class:`NativeVendor` for *harness* from its capabilities.
@@ -184,6 +218,7 @@ class NativeTuiDriver:
         self._daemon: subprocess.Popen[bytes] | None = None
         self._client: httpx.Client | None = None
         self._session_id: str | None = None
+        self._runner_id: str | None = None
         self._base_url = ""
         self._tmp = Path("/tmp") / f"omni-bench-nt-{uuid.uuid4().hex[:8]}"
         self._policy_hook_disabled_reason: str | None = None
@@ -223,6 +258,12 @@ class NativeTuiDriver:
 
     async def run_tool_turn(self, *, deny: bool) -> TurnResult:
         return await asyncio.to_thread(self._drive_tool_turn, deny=deny)
+
+    async def run_mcp_tool_turn(self) -> TurnResult:
+        return await asyncio.to_thread(self._drive_mcp_tool_turn)
+
+    async def run_fork_turn(self, marker: str) -> ForkResult:
+        return await asyncio.to_thread(self._drive_fork_turn, marker)
 
     async def run_policy_turn(self, *, action: str) -> TurnResult:
         return await asyncio.to_thread(self._drive_policy_turn, action=action)
@@ -280,7 +321,7 @@ class NativeTuiDriver:
         assert self._client is not None and self._session_id is not None
         assert self._vendor is not None
         session_id = self._session_id
-        self._launch_and_bind_runner(host_id, workspace)
+        self._runner_id = self._launch_and_bind_runner(host_id, workspace)
         ensure = self._client.post(
             f"/v1/sessions/{session_id}/resources/terminals",
             json={
@@ -563,6 +604,62 @@ class NativeTuiDriver:
             self._delete_tool_policy(policy_id)
 
         result.completed = _OUTPUT_DONE_EVENT in events or bool(result.tool_calls)
+        return result
+
+    def _drive_mcp_tool_turn(self, *, timeout: float = _TOOL_TURN_TIMEOUT_S) -> TurnResult:
+        """Call the read-only Omnigent MCP relay tool for this native harness."""
+        assert self._vendor is not None
+        result = TurnResult()
+        if self._vendor.harness not in _NATIVE_OMNIGENT_MCP_HARNESSES:
+            result.error = (
+                f"{self._vendor.harness!r} has no Omnigent MCP bridge; "
+                "its relayed tools use another native mechanism"
+            )
+            return result
+
+        baseline = self._tool_item_count()
+        for prompt in (_MCP_TOOL_PROMPT, _MCP_TOOL_RETRY_PROMPT):
+            calls_before = len(result.tool_calls)
+            self._post_message(prompt)
+            self._poll_new_tool_calls(baseline, result, timeout=timeout)
+            if any(is_target_omnigent_mcp_tool(call.get("name")) for call in result.tool_calls):
+                result.completed = True
+                break
+            baseline += len(result.tool_calls) - calls_before
+        return result
+
+    def _drive_fork_turn(self, marker: str, *, timeout: float = _TURN_TIMEOUT_S) -> ForkResult:
+        """Fork the native session and verify the clone replays copied history."""
+        assert self._client is not None and self._session_id is not None
+        assert self._runner_id is not None
+        source_id = self._session_id
+        result = ForkResult()
+        try:
+            forked = self._client.post(f"/v1/sessions/{source_id}/fork", json={})
+            forked.raise_for_status()
+            fork_id = str(forked.json()["id"])
+            result.created = fork_id != source_id
+            bound = self._client.patch(
+                f"/v1/sessions/{fork_id}", json={"runner_id": self._runner_id}
+            )
+            bound.raise_for_status()
+            copied = self._client.get(f"/v1/sessions/{fork_id}/items", params={"order": "asc"})
+            copied.raise_for_status()
+            result.history_copied = contains_user_text(copied.json().get("data", []), marker)
+
+            self._session_id = fork_id
+            recall = self._drive_turn(
+                "Reply with exactly the literal string you were instructed to return "
+                "in the first user message, and nothing else."
+            )
+            result.text = recall.text
+            result.recalled = recall.completed and marker in recall.text
+            result.failed = recall.failed
+            result.error = recall.error
+            result.timed_out = recall.timed_out
+        except httpx.HTTPError as exc:
+            result.failed = True
+            result.error = repr(exc)
         return result
 
     def _drive_policy_turn(self, *, action: str) -> TurnResult:

@@ -13,7 +13,7 @@ from typing import Any
 import httpx
 
 from tests.e2e._harness_probes import cli_unavailable_reason
-from tests.harness_bench.driver import TurnResult, fill_snapshot_cost
+from tests.harness_bench.driver import ForkResult, TurnResult, fill_snapshot_cost
 from tests.harness_bench.full_server import (
     _DENY_REASON,
     _POLL_INTERVAL_S,
@@ -113,6 +113,12 @@ class FullServerDriver:
     async def run_tool_turn(self, *, deny: bool) -> TurnResult:
         return await asyncio.to_thread(lambda: self.tool_probe_turn(deny=deny))
 
+    async def run_mcp_tool_turn(self) -> TurnResult:
+        return TurnResult(error="Omnigent MCP relay is a native-harness dimension")
+
+    async def run_fork_turn(self, marker: str) -> ForkResult:
+        return await asyncio.to_thread(self.fork_probe_turn, marker)
+
     async def run_policy_turn(self, *, action: str) -> TurnResult:
         return await asyncio.to_thread(lambda: self.policy_probe_turn(action=action))
 
@@ -126,6 +132,40 @@ class FullServerDriver:
             name = self._shared.register_agent(self._profile, policy_action=action)
             self._policy_session_ids[action] = self._shared.create_session(name)
         return self._policy_session_ids[action]
+
+    def fork_probe_turn(self, marker: str, *, timeout: float = 180.0) -> ForkResult:
+        """Fork the current session and verify copied history is visible to the clone."""
+        assert self._client is not None and self._session_id is not None
+        assert self._shared is not None
+        result = ForkResult()
+        try:
+            forked = self._client.post(f"/v1/sessions/{self._session_id}/fork", json={})
+            forked.raise_for_status()
+            fork_id = str(forked.json()["id"])
+            result.created = fork_id != self._session_id
+            bound = self._client.patch(
+                f"/v1/sessions/{fork_id}", json={"runner_id": self._shared.runner_id}
+            )
+            bound.raise_for_status()
+            snapshot = self._client.get(f"/v1/sessions/{fork_id}")
+            snapshot.raise_for_status()
+            result.history_copied = contains_user_text(snapshot.json().get("items", []), marker)
+
+            recall = self._run_turn_on_session(
+                fork_id,
+                "Reply with exactly the literal string you were instructed to return "
+                "in the first user message, and nothing else.",
+                timeout=timeout,
+            )
+            result.text = recall.text
+            result.recalled = recall.completed and marker in recall.text
+            result.failed = recall.failed
+            result.error = recall.error
+            result.timed_out = recall.timed_out
+        except httpx.HTTPError as exc:
+            result.failed = True
+            result.error = repr(exc)
+        return result
 
     def _poll_session(
         self,
@@ -386,13 +426,18 @@ class FullServerDriver:
         Posts the user message and polls the session snapshot to a terminal
         state, filling text, completion, failure, timeout, and usage fields.
         """
-        assert self._client is not None and self._session_id is not None
+        assert self._session_id is not None
+        return self._run_turn_on_session(self._session_id, prompt, timeout=timeout)
+
+    def _run_turn_on_session(self, sid: str, prompt: str, *, timeout: float) -> TurnResult:
+        """Drive one basic turn on *sid* and return its terminal result."""
+        assert self._client is not None
         result = TurnResult()
         body: dict[str, Any] = {
             "type": "message",
             "data": {"role": "user", "content": [{"type": "input_text", "text": prompt}]},
         }
-        posted = self._client.post(f"/v1/sessions/{self._session_id}/events", json=body)
+        posted = self._client.post(f"/v1/sessions/{sid}/events", json=body)
         if posted.status_code == 202 and posted.json().get("denied"):
             result.failed = True
             result.error = {"denied": True, "reason": posted.json().get("reason")}
@@ -400,7 +445,7 @@ class FullServerDriver:
         posted.raise_for_status()
 
         return self._poll_session(
-            self._session_id,
+            sid,
             result,
             timeout=timeout,
             fill_cost=True,

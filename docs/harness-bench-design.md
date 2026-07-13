@@ -7,7 +7,7 @@ instead of a human hand-maintaining a spreadsheet and hoping it still reflects
 reality.
 
 > **Status:** shipped and in use. The bench on `main` has three transport
-> drivers, six P0 probes, three report-only P1 probes, automatic live/offline
+> drivers, six P0 probes, five report-only P1 probes, automatic live/offline
 > selection, and a capability-derived matrix that has already caught and
 > corrected real declaration drift. See
 > [Current state](#current-state-shipped) for what is live vs. still open. The
@@ -202,8 +202,10 @@ Validated for presence and shape only: `Owner`, `Transport`, `Implementation`,
 | Dimension | How the probe proves it |
 |---|---|
 | Basic turn (P0 prerequisite) | complete a marker-echo turn and require assistant text |
+| Fork replay (P1) | clone the session after Basic turn, require copied marker history, and require the clone to recall it |
 | Streaming (P0) | count output-text deltas; repeated single-delta output is `PARTIAL` |
 | Tool calling (P0) | provoke the transport's tool mechanism and require a surfaced call |
+| Omnigent MCP (P1, native only) | call read-only `sys_session_list` through the generated `omnigent` MCP relay and require a matching function-call item |
 | Policy DENY (P0) | apply a tool-call deny and require a blocked-call signal |
 | Policy ALLOW (P1) | attach an explicit allow and require a non-blocked tool output; native hooks expose no positive ALLOW event |
 | Policy ASK (P1) | apply ask and require an elicitation/approval request |
@@ -211,7 +213,7 @@ Validated for presence and shape only: `Owner`, `Transport`, `Implementation`,
 | Cost tracking (P1) | read priced cost or token usage from the turn/session |
 | Interrupt (P0) | interrupt a long turn and require cancellation or early termination |
 
-Planned dimensions are steering, live queue, resume/fork, reasoning, images,
+Planned dimensions are steering, live queue, resume, reasoning, images,
 and compaction.
 
 Every behavioral probe also reads the corresponding declared flag and returns
@@ -266,7 +268,7 @@ The bench on `main` includes:
 
 - **Six P0 probes:** Basic turn, Streaming, Tool calling, Policy DENY, Model
   override, and Interrupt.
-- **Three P1 probes:** Policy ALLOW, Policy ASK, and Cost tracking. P1 verdicts
+- **Five P1 probes:** Fork replay, Omnigent MCP, Policy ALLOW, Policy ASK, and Cost tracking. P1 verdicts
   are report-only and do not gate the same way as P0 declarations.
 - **Three transport drivers:** `full-server`, `native-tui`, and `sdk-inproc`,
   selected by harness family with `--transport` and `--fast` overrides.
@@ -287,7 +289,7 @@ The bench on `main` includes:
 ### Not yet wired
 
 - Registry-driven server seeding for community native UI agents.
-- Steering, live queue, resume/fork, reasoning, images, and compaction probes.
+- Steering, live queue, resume, reasoning, images, and compaction probes.
 - Automatic provisioning of vendor login/provider configuration for native
   harnesses; unavailable environments skip cleanly.
 
@@ -350,7 +352,9 @@ stream, the bench flags a real drift on the next run, rather than a false
 | Dimension | `sdk-inproc` (`--fast`) | `full-server` (SDK default) | `native-tui` |
 |---|---|---|---|
 | Basic turn, Streaming, Model override, Interrupt | Wrap-level observation | End-to-end server/runner observation | End-to-end server/runner/vendor observation |
+| Fork replay | Not observable | Clone + copied-history replay through server/runner | Clone + copied-history replay through server/runner/vendor |
 | Tool calling | Request-level wrap tool | Server-dispatched builtin | Vendor tool mirrored into session items |
+| Omnigent MCP | Not applicable | Not applicable | Generated `omnigent` MCP relay when supported by the vendor |
 | Policy DENY | Not observable | Fixed policy blocks the builtin | Session CEL policy triggers the native policy hook |
 | Policy ALLOW / ASK | Not observable | Fixed policy; ASK observes and resolves an elicitation | Temporary session CEL policy; ASK observes and resolves an elicitation |
 | Cost tracking | Completed-response usage when forwarded | Session snapshot usage/cost | Session snapshot when the vendor forwards usage |
@@ -411,11 +415,15 @@ agree with it.
 
 ## Open items
 
+- **Declarative native tool-relay mechanism** — extend the harness capability
+  model to distinguish generated MCP, native registration, and no relay. Derive
+  the Omnigent MCP probe's applicability from that declaration instead of the
+  bench's temporary `_NATIVE_OMNIGENT_MCP_HARNESSES` list.
 - **Registry-driven native-agent seeding** — replace the hardcoded server
   seeding list with registry iteration so community native harnesses work end
   to end after plugin installation.
 - **Per-harness native provisioning** — some vendors require login or provider
   configuration that the bench deliberately cannot create. Improve diagnostics
   where possible while retaining clean skips.
-- **Additional dimensions** — steering, live queue, resume/fork, reasoning,
+- **Additional dimensions** — steering, live queue, resume, reasoning,
   images, and compaction.

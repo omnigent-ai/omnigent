@@ -7328,7 +7328,7 @@ async def _build_debug_overview(
     :param server_log_path: Optional path to the local server log.
     :param event_log_path: Optional path to the JSONL event log.
     :param cli_log_path: Optional path to the always-on CLI
-        diagnostics log (``~/.omnigent/logs/cli-*.log``).
+        diagnostics log (``~/.omnigent/logs/cli/cli-*.log``).
     :returns: A Rich :class:`Group` suitable for passing to
         :meth:`TerminalHost.add_overlay`'s ``builder`` contract.
     """

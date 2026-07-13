@@ -11103,6 +11103,16 @@ async def _persist_policy_deny_sentinel(
     policy DENY keeps follow-up turns and the items API consistent with the
     streamed deny users already see.
 
+    After persisting, publish the committed item as a
+    ``response.output_item.done`` — the same commit event a streamed
+    assistant message emits (see :func:`_flush_relay_text`). Without it the
+    live deny only exists as the ``_publish_policy_deny`` sentinel delta,
+    which the web folds into a provisional ``live:`` preview block that the
+    terminal ``response.completed`` sweeps; the deny then reappeared only
+    after a refresh re-hydrated the persisted item. Emitting the commit event
+    lets the web reconcile the preview into a durable, itemId-keyed block that
+    survives the sweep, a reconnect, and a refresh alike.
+
     :param session_id: Session/conversation identifier.
     :param conv: Conversation whose agent/model name tags the message.
     :param reason: Human-readable deny reason from the policy verdict.
@@ -11127,7 +11137,13 @@ async def _persist_policy_deny_sentinel(
             },
         ),
     )
-    await asyncio.to_thread(conversation_store.append, session_id, [item])
+    persisted = await asyncio.to_thread(conversation_store.append, session_id, [item])
+    if persisted:
+        done_event = OutputItemDoneEvent(
+            type="response.output_item.done",
+            item=persisted[0].to_api_dict(),
+        )
+        session_stream.publish(session_id, done_event.model_dump())
 
 
 async def _evaluate_input_policy(

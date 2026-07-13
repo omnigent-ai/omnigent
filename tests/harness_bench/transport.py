@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from tests.harness_bench.driver import TurnResult
+from tests.harness_bench.driver import ForkResult, TurnResult
 from tests.harness_bench.profile import BenchProfile
 
 
@@ -43,6 +43,17 @@ class Driver(Protocol):
         """Provoke a tool call. With *deny*, a tool-call policy DENY is in
         force so the call should be blocked (``tool_call_denied``); otherwise
         the call is dispatched and answered (``tool_calls`` populated)."""
+
+    async def run_mcp_tool_turn(self) -> TurnResult:
+        """Provoke an Omnigent MCP relay tool call.
+
+        Native transports use this to distinguish the Omnigent MCP bridge from
+        the vendor's own shell/tool surface. Unsupported transports return an
+        unmeasured result so the probe SKIPs.
+        """
+
+    async def run_fork_turn(self, marker: str) -> ForkResult:
+        """Fork the current session and prove its history is replayed."""
 
     async def run_policy_turn(self, *, action: str) -> TurnResult:
         """Provoke a tool call under an explicit tool-call policy *action*
