@@ -40,14 +40,23 @@ function getScrollParent(node: Element): Element | null {
   return null;
 }
 
-function jumpTo(itemId: string, flash: (id: string) => void): void {
+/**
+ * Smooth-scroll a user message into view (centered) and flash it once the
+ * scroll settles. Shared by the Cmd+Alt nav hook and the turn rail so both
+ * land on the message the same way. Anchors on the `data-user-message-id`
+ * DOM attribute stamped by UserBubble.
+ *
+ * @param itemId - The user bubble's itemId (the DOM anchor to scroll to).
+ * @param flash - Optional highlight callback fired when the scroll settles.
+ */
+export function scrollToUserMessage(itemId: string, flash?: (id: string) => void): void {
   const el = document.querySelector(
     // CSS.escape is defensive — itemIds are alphanumeric today.
     `[data-user-message-id="${CSS.escape(itemId)}"]`,
   );
   if (!el) {
     // Fail loud: id exists in the list but DOM anchor is missing.
-    console.warn(`useUserMessageNav: no element for itemId=${itemId}`);
+    console.warn(`scrollToUserMessage: no element for itemId=${itemId}`);
     return;
   }
 
@@ -56,6 +65,10 @@ function jumpTo(itemId: string, flash: (id: string) => void): void {
   cancelPendingFlash?.();
 
   el.scrollIntoView({ block: "center", behavior: "smooth" });
+
+  // Nothing to defer when there's no flash to fire — the smooth-scroll runs
+  // to completion on its own.
+  if (!flash) return;
 
   // Defer the flash until the smooth-scroll settles. On a long jump the
   // highlight would otherwise burn out before the message is on screen.
@@ -75,7 +88,7 @@ function jumpTo(itemId: string, flash: (id: string) => void): void {
     if (done) return;
     done = true;
     cleanup();
-    flash(itemId);
+    flash?.(itemId);
   }
 
   function onScroll(): void {
@@ -109,7 +122,7 @@ export function useUserMessageNav(userMessageIds: readonly string[]): UserMessag
       ? userMessageIds[userMessageIds.length - 1]
       : userMessageIds[currentIndex - 1];
     setAnchorId(target);
-    jumpTo(target, flashUserMessage);
+    scrollToUserMessage(target, flashUserMessage);
   }, [userMessageIds, currentIndex, outside, flashUserMessage]);
 
   const goNext = useCallback(() => {
@@ -117,7 +130,7 @@ export function useUserMessageNav(userMessageIds: readonly string[]): UserMessag
     if (currentIndex >= userMessageIds.length - 1) return;
     const target = userMessageIds[currentIndex + 1];
     setAnchorId(target);
-    jumpTo(target, flashUserMessage);
+    scrollToUserMessage(target, flashUserMessage);
   }, [userMessageIds, currentIndex, outside, flashUserMessage]);
 
   // Stable identity so consumers can put the return value in an

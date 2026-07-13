@@ -1219,6 +1219,11 @@ async def test_native_subagent_session_stamps_terminal_ui_labels(
             {"yolo": True},
             ["--dangerously-bypass-approvals-and-sandbox"],
         ),
+        (
+            "cursor-native",
+            {"yolo": True},
+            ["--yolo"],
+        ),
     ],
 )
 async def test_native_subagent_yolo_args_derived_from_trusted_spec(
@@ -1232,11 +1237,12 @@ async def test_native_subagent_yolo_args_derived_from_trusted_spec(
 
     The worker sub-agent's own bundle declares its full-bypass intent
     (``permission_mode: bypassPermissions`` for claude-native,
-    ``yolo: true`` for codex-native). On a sub-agent create, the server
-    derives the matching flag list from that trusted, server-loaded spec
-    and persists it as the child session's ``terminal_launch_args`` —
-    which the runner appends to the claude / codex argv so the headless
-    worker can edit without stalling on an ApprovalCard.
+    ``yolo: true`` for codex-native / cursor-native). On a sub-agent create,
+    the server derives the matching flag list from that trusted,
+    server-loaded spec and persists it as the child session's
+    ``terminal_launch_args`` — which the runner appends to the native CLI
+    argv so the headless worker can edit without stalling on an
+    ApprovalCard.
 
     A failure here means the translation seam regressed and the worker
     would launch in its default prompting mode (and hang headless).

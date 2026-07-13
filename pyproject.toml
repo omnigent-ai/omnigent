@@ -100,6 +100,9 @@ dependencies = [
     # version against the latest PyPI release. Previously only a
     # transitive dep; pinned here now that we import it directly.
     "packaging>=23,<26",
+    # Protobuf schema for the AI-gateway routing API (omnigent/api/routing.proto).
+    # Previously only a transitive dep; declared directly now that we ship a proto.
+    "protobuf>=6,<7",
 ]
 
 [project.optional-dependencies]
@@ -475,6 +478,9 @@ known-first-party = ["omnigent"]
 # waived for these top-level antigravity_native modules (see the inline
 # comments at each catch site).
 "omnigent/antigravity_native*.py" = ["BLE001"]
+# Telemetry modules intentionally catch all exceptions at every boundary —
+# telemetry must never disrupt the application under any circumstances.
+"omnigent/telemetry/*.py" = ["BLE001", "SIM105"]
 "sdks/**/*.py" = [
     "ARG001", "ARG002", "BLE001", "B008", "RUF012",
 ]

@@ -13,7 +13,7 @@ import platform
 import subprocess
 
 # Incremented on any breaking change to the report document shape below.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def _git(*args: str) -> str:

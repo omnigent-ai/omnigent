@@ -289,6 +289,12 @@ from omnigent.stores.conversation_store import (
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.host_store import Host, HostStore
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.telemetry import emit as _tel_emit
+from omnigent.telemetry.events import SessionCreatedEvent as _TelSessionCreatedEvent
+from omnigent.telemetry.events import SessionDeletedEvent as _TelSessionDeletedEvent
+from omnigent.telemetry.events import SessionStoppedEvent as _TelSessionStoppedEvent
+from omnigent.telemetry.installation_id import get_installation_id as _get_installation_id
+from omnigent.telemetry.surface import classify_surface as _classify_surface
 from omnigent.tools.client_specified import parse_client_side_tool_specs
 
 _logger = logging.getLogger(__name__)
@@ -578,6 +584,7 @@ _CODEX_NATIVE_WRAPPER_LABEL_VALUE = CODEX_NATIVE_CODING_AGENT.wrapper_label
 _CODEX_NATIVE_HARNESS = CODEX_NATIVE_CODING_AGENT.harness
 _CODEX_NATIVE_MODEL = CODEX_NATIVE_CODING_AGENT.agent_name
 _CURSOR_NATIVE_WRAPPER_LABEL_VALUE = CURSOR_NATIVE_CODING_AGENT.wrapper_label
+_CURSOR_NATIVE_HARNESS = CURSOR_NATIVE_CODING_AGENT.harness
 _KIRO_NATIVE_WRAPPER_LABEL_VALUE = KIRO_NATIVE_CODING_AGENT.wrapper_label
 _CLAUDE_NATIVE_MESSAGE_TIMEOUT_S = 30.0
 _NATIVE_TERMINAL_START_FAILED_CODE = "native_terminal_start_failed"
@@ -11146,6 +11153,16 @@ async def _persist_policy_deny_sentinel(
     policy DENY keeps follow-up turns and the items API consistent with the
     streamed deny users already see.
 
+    After persisting, publish the committed item as a
+    ``response.output_item.done`` — the same commit event a streamed
+    assistant message emits (see :func:`_flush_relay_text`). Without it the
+    live deny only exists as the ``_publish_policy_deny`` sentinel delta,
+    which the web folds into a provisional ``live:`` preview block that the
+    terminal ``response.completed`` sweeps; the deny then reappeared only
+    after a refresh re-hydrated the persisted item. Emitting the commit event
+    lets the web reconcile the preview into a durable, itemId-keyed block that
+    survives the sweep, a reconnect, and a refresh alike.
+
     :param session_id: Session/conversation identifier.
     :param conv: Conversation whose agent/model name tags the message.
     :param reason: Human-readable deny reason from the policy verdict.
@@ -11170,7 +11187,13 @@ async def _persist_policy_deny_sentinel(
             },
         ),
     )
-    await asyncio.to_thread(conversation_store.append, session_id, [item])
+    persisted = await asyncio.to_thread(conversation_store.append, session_id, [item])
+    if persisted:
+        done_event = OutputItemDoneEvent(
+            type="response.output_item.done",
+            item=persisted[0].to_api_dict(),
+        )
+        session_stream.publish(session_id, done_event.model_dump())
 
 
 async def _evaluate_input_policy(
@@ -12091,12 +12114,12 @@ def _derive_terminal_launch_args_from_spec(sub_spec: AgentSpec) -> list[str] | N
     """
     Derive native-terminal YOLO pass-through args from a trusted sub-spec.
 
-    polly's native workers (claude-native / codex-native) launch in a
-    headless pane where no human can answer an ApprovalCard, so every
-    Edit/Write/Bash that prompts stalls the worker. This translates a
+    polly's native workers (claude-native / codex-native / cursor-native)
+    launch in a headless pane where no human can answer an ApprovalCard, so
+    every Edit/Write/Bash that prompts stalls the worker. This translates a
     worker bundle's declared full-bypass intent into the per-session
-    ``terminal_launch_args`` the runner already appends to the claude /
-    codex argv:
+    ``terminal_launch_args`` the runner already appends to the native CLI
+    argv:
 
     - claude-native + ``executor.config.permission_mode`` set ->
       ``["--permission-mode", "<value>"]``. The value is passed through
@@ -12113,12 +12136,21 @@ def _derive_terminal_launch_args_from_spec(sub_spec: AgentSpec) -> list[str] | N
       and the codex-sdk executor's ``approvalPolicy="never"``). An explicit
       ``executor.config.yolo: false`` opts back out for a read-only / must
       -keep-prompting sub-agent. See issue #171.
+    - cursor-native -> ``["--yolo"]`` by DEFAULT. Headless cursor workers
+      otherwise stall on cursor-agent's in-terminal approval prompts (also
+      mirrored as web elicitation cards). ``--yolo`` is cursor-agent's
+      don't-ask / full-bypass flag (``--auto-review`` still prompts for
+      some calls). An explicit ``executor.config.yolo: false`` opts back
+      out. When ``executor.config.permission_mode`` / ``exec_mode`` is set
+      to ``auto`` or ``auto-review``, emit ``["--auto-review"]`` instead
+      (Smart Auto) so a bundle can choose Claude-style auto without full
+      yolo.
 
-    Only the two native harnesses are translated; for any other harness
-    (e.g. ``claude-sdk``, whose bypass is set via the SDK ``permissionMode``
-    spawn env, not a terminal flag) this returns ``None`` so no terminal
-    args are set. ``None`` is also returned when the relevant field is
-    absent / falsey.
+    Only those native harnesses are translated; for any other harness
+    (e.g. ``claude-sdk`` / ``cursor``, whose bypass is set via the SDK
+    ``permissionMode`` / ``auto_review`` spawn path, not a terminal flag)
+    this returns ``None`` so no terminal args are set. ``None`` is also
+    returned when the relevant field is absent / falsey.
 
     :param sub_spec: The trusted child sub-agent spec, resolved from the
         server-loaded parent bundle via :func:`_resolve_subagent_spec`.
@@ -12145,6 +12177,22 @@ def _derive_terminal_launch_args_from_spec(sub_spec: AgentSpec) -> list[str] | N
         if _spec_config_flag_explicitly_disabled(sub_spec, "yolo"):
             return None
         return _validate_terminal_launch_args(["--dangerously-bypass-approvals-and-sandbox"])
+    if harness == _CURSOR_NATIVE_HARNESS:
+        # Prefer an explicit Smart Auto mode when the bundle asks for it
+        # (mirrors Claude's ``permission_mode: auto``), else full --yolo
+        # by default so headless polly workers don't stall on mirrored
+        # approval cards. ``yolo: false`` is the keep-prompting opt-out.
+        mode = (
+            sub_spec.executor.config.get("permission_mode")
+            or sub_spec.executor.config.get("exec_mode")
+            or ""
+        )
+        mode_norm = str(mode).strip().lower()
+        if mode_norm in ("auto", "auto-review"):
+            return _validate_terminal_launch_args(["--auto-review"])
+        if _spec_config_flag_explicitly_disabled(sub_spec, "yolo"):
+            return None
+        return _validate_terminal_launch_args(["--yolo"])
     return None
 
 
@@ -12481,12 +12529,12 @@ async def _create_session_from_existing_agent(
     # from the trusted, server-loaded sub-spec only — any caller-supplied
     # ``body.terminal_launch_args`` is ignored. This is the YOLO seam:
     # claude-native maps ``permission_mode`` to ``--permission-mode``,
-    # while codex-native defaults to full bypass
-    # (``--dangerously-bypass-approvals-and-sandbox``) so a headless
-    # codex worker can edit/run unattended without stalling on codex's
-    # on-request approval default (opt out with ``yolo: false``). A
-    # caller cannot inject launch wiring by smuggling args through the
-    # spawn body.
+    # codex-native defaults to full bypass
+    # (``--dangerously-bypass-approvals-and-sandbox``), and cursor-native
+    # defaults to ``--yolo`` so a headless worker can edit/run unattended
+    # without stalling on native approval prompts (opt out with
+    # ``yolo: false``). A caller cannot inject launch wiring by smuggling
+    # args through the spawn body.
     #
     # Sessions that resolve their own agent (top-level sessions and the
     # manual Add Agent child flow where ``sub_agent_name`` is null) keep
@@ -12620,6 +12668,39 @@ async def _create_session_from_existing_agent(
         conv = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
     elif body.labels:
         await asyncio.to_thread(conversation_store.set_labels, conv.id, body.labels)
+
+    # Emit session.created exactly once at creation time.
+    # Best-effort: skip if the host opted out via HostHelloFrame.
+    try:
+        import hashlib as _hashlib
+
+        _hr: HostRegistry | None = getattr(request.app.state, "host_registry", None)
+        _host_opted_out = (
+            _hr is not None
+            and conv.host_id is not None
+            and _hr.is_host_telemetry_opted_out(conv.host_id)
+        )
+        if not _host_opted_out:
+            _install_id = _get_installation_id()
+            _anon_uid: str | None = None
+            if user_id is not None:
+                _salt = f"{_install_id}:{user_id}" if _install_id else user_id
+                _anon_uid = _hashlib.sha256(_salt.encode()).hexdigest()[:16]
+            _tel_emit(
+                _TelSessionCreatedEvent(
+                    session_id=conv.id,
+                    agent_id=agent.id,
+                    harness=native_agent.harness if native_agent is not None else None,
+                    surface=_classify_surface(request.headers.get("user-agent")),
+                    installation_id=_install_id,
+                    anon_user_id=_anon_uid,
+                    is_fork=body.parent_session_id is not None,
+                    is_sub_agent=body.sub_agent_name is not None,
+                )
+            )
+    except Exception:  # noqa: BLE001 — telemetry must not disrupt session creation
+        pass
+
     if body.initial_items:
         runner_client = await _get_runner_client(conv.id, runner_router)
         if runner_client is None:
@@ -19420,6 +19501,23 @@ def create_sessions_router(
             # honestly, and the next message auto-relaunches the session on
             # its (still-online) host via the normal message-dispatch
             # relaunch path below.
+            try:
+                import hashlib as _hashlib
+
+                _srv_id = _get_installation_id()
+                _anon: str | None = None
+                if user_id is not None:
+                    _salt = f"{_srv_id}:{user_id}" if _srv_id else user_id
+                    _anon = _hashlib.sha256(_salt.encode()).hexdigest()[:16]
+                _tel_emit(
+                    _TelSessionStoppedEvent(
+                        session_id=session_id,
+                        installation_id=_srv_id,
+                        anon_user_id=_anon,
+                    )
+                )
+            except Exception:  # noqa: BLE001 — telemetry is best-effort
+                pass
             return {"queued": False}
         if body.type == _APPROVAL_TYPE:
             # Deliver the verdict through the shared resolver: it
@@ -20430,6 +20528,32 @@ def create_sessions_router(
                     # still deletes the row and revokes the token.
                     getattr(request.app.state, "sandbox_config", None),
                 )
+        try:
+            import hashlib as _hashlib
+            import time as _time
+
+            _srv_id = _get_installation_id()
+            _anon_d: str | None = None
+            if user_id is not None:
+                _salt_d = f"{_srv_id}:{user_id}" if _srv_id else user_id
+                _anon_d = _hashlib.sha256(_salt_d.encode()).hexdigest()[:16]
+            _usage = conv.session_usage or {}
+            _duration: float | None = None
+            with contextlib.suppress(Exception):
+                _duration = _time.time() - conv.created_at
+            _tel_emit(
+                _TelSessionDeletedEvent(
+                    session_id=session_id,
+                    installation_id=_srv_id,
+                    anon_user_id=_anon_d,
+                    duration_seconds=_duration,
+                    input_tokens=_usage.get("input_tokens"),
+                    output_tokens=_usage.get("output_tokens"),
+                    total_cost_usd=_usage.get("total_cost_usd"),
+                )
+            )
+        except Exception:  # noqa: BLE001 — telemetry is best-effort
+            pass
         return ConversationDeleted(id=session_id)
 
     # ── Permission management endpoints ──────────────────────────

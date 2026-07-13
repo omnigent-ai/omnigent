@@ -375,6 +375,27 @@
   -webkit-mask-image: linear-gradient(to bottom, transparent 48px, black 80px);
 }
 
+/* Turn rail's edges dissolve so it's clear the ticks scroll past both ends.
+ * Short symmetric ramps since the ticks are small and evenly spaced. The ramp
+ * width comes from --turn-rail-fade, set inline from TurnRail's FADE constant
+ * so the visual mask and the thumb-tracking math can't silently desync. */
+.turn-rail-fade {
+  mask-image: linear-gradient(
+    to bottom,
+    transparent 0,
+    black var(--turn-rail-fade),
+    black calc(100% - var(--turn-rail-fade)),
+    transparent 100%
+  );
+  -webkit-mask-image: linear-gradient(
+    to bottom,
+    transparent 0,
+    black var(--turn-rail-fade),
+    black calc(100% - var(--turn-rail-fade)),
+    transparent 100%
+  );
+}
+
 /* Elevated surfaces — frosted glass effect with backdrop blur.
  * Targets top-level cards only, including responsive card surfaces like
  * the workspace panel's md:bg-card (so its chrome matches the sidebar's

@@ -303,6 +303,19 @@ class HostRegistry:
         with self._lock:
             return list(self._hosts.keys())
 
+    def is_host_telemetry_opted_out(self, host_id: str) -> bool:
+        """Return whether the host has opted out of telemetry.
+
+        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :returns: ``True`` when the host sent ``telemetry_opt_out=True``
+            in its hello frame.  Defaults to ``False`` when the host is
+            offline or unknown.
+        """
+        conn = self.get(host_id)
+        if conn is None:
+            return False
+        return conn.hello.telemetry_opt_out
+
     def send_text(self, conn: HostConnection, data: str) -> None:
         """Enqueue a text frame for sending to the host.
 

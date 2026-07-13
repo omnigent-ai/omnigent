@@ -1228,13 +1228,9 @@ def main() -> None:
 
     :returns: None.
     """
-    log_level = os.environ.get("OMNIGENT_LOG_LEVEL", "INFO").upper()
-    logging.basicConfig(
-        level=getattr(logging, log_level, logging.INFO),
-        format="%(asctime)s %(levelname)s:%(name)s:%(message)s",
-        datefmt="%Y-%m-%dT%H:%M:%S%z",
-        stream=sys.stderr,
-    )
+    from omnigent.process_logging import configure_process_logging
+
+    configure_process_logging("runner", force=True)
     try:
         asyncio.run(_run_tunnel_from_env())
     except RuntimeError as exc:

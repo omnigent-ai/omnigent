@@ -56,11 +56,12 @@ import { ElicitationCard } from "@/components/blocks/ApprovalCard";
 import { BlockRenderer, FilePathAwareMessageResponse } from "@/components/blocks/BlockRenderer";
 import { CompactionMarker, RoutingDecisionCard } from "@/components/blocks/StatusBlocks";
 import { SystemMessageView } from "@/components/blocks/SystemMessage";
-import { parseSystemMessage } from "@/lib/systemMessage";
+import { isSystemUserContent, parseSystemMessage } from "@/lib/systemMessage";
 import { Button } from "@/components/ui/button";
 import { OttoIcon } from "@/components/icons/OttoIcon";
 import { cn } from "@/lib/utils";
 import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
+import { TurnRail, type Turn } from "@/pages/TurnRail";
 import { validateAttachments } from "@/lib/attachments";
 import { useSurfaceFrontmost } from "@/hooks/useNativeServerSwitcher";
 import {
@@ -1426,6 +1427,11 @@ function MainAgentSurface({
   subAgentLabel,
 }: MainAgentSurfaceProps) {
   const terminalFirst = useTerminalFirst();
+  // The turn rail is a hover minimap with no mobile affordance (CSS-hidden
+  // under `md`). Gate its MOUNT — not just its visibility — on the viewport so
+  // mobile never runs its eager history backfill (up to 2000 items/open) for a
+  // rail the user can't see.
+  const isMobileViewport = useIsMobileViewport();
   // Mirrors ChatPage's `sandboxLaunching`: while the managed-sandbox
   // launch runs, the composer must stay sendable — the server parks
   // the message on the launch rendezvous — even though liveness reads
@@ -1461,6 +1467,40 @@ function MainAgentSurface({
     [bubbles],
   );
   const nav = useUserMessageNav(userMessageIds);
+
+  // One rail tick per real user turn, paired with a preview of the reply that
+  // followed. Walk bubbles in order: each non-system user bubble opens a turn,
+  // and the first assistant text after it (before the next user bubble) is the
+  // preview. Same first-page window as the transcript, so a fresh load shows
+  // ≤20 ticks and older ones page in on scroll-up.
+  const turns = useMemo<Turn[]>(() => {
+    const out: Turn[] = [];
+    for (let i = 0; i < bubbles.length; i++) {
+      const b = bubbles[i];
+      if (b.kind !== "user" || isSystemBubble(b)) continue;
+      let preview = "";
+      for (let j = i + 1; j < bubbles.length; j++) {
+        const next = bubbles[j];
+        // Stop at the next REAL user turn only. A system-marker user bubble
+        // isn't a tick of its own, so breaking on it would strand this turn
+        // with a blank preview even though its reply follows the marker.
+        if (next.kind === "user" && !isSystemBubble(next)) break;
+        if (next.kind === "assistant") {
+          const textItem = next.items.find((it) => it.kind === "text" && it.text.trim());
+          if (textItem && textItem.kind === "text") {
+            preview = textItem.text.trim();
+            break;
+          }
+        }
+      }
+      out.push({
+        itemId: b.itemId,
+        userText: extractUserText(b.content),
+        responsePreview: preview.slice(0, 240),
+      });
+    }
+    return out;
+  }, [bubbles]);
 
   // Pending elicitation cards float to the bottom of the chat: rendered as the
   // last items in the scroll flow and removed from their inline position so
@@ -1636,10 +1676,13 @@ function MainAgentSurface({
             content dissolves into the canvas before reaching the
             ChatHeader overlay's controls (geometry in index.css). */}
         <Conversation className="chat-scroll-fade flex-1">
-          {/* gap-4 overrides ConversationContent's default gap-8 so consecutive agent turns read as one thread. */}
+          {/* gap-4 overrides ConversationContent's default gap-8 so consecutive agent turns read as one thread.
+              md:pl-12 opens a gap between the left-edge TurnRail (24px wide) and
+              the message column so the ticks don't butt against the text; the
+              rail is hidden on mobile, so the extra left padding is md-only. */}
           <ConversationContent
             className={cn(
-              "chat-conversation-content mx-auto w-full gap-4 pt-20 pb-6",
+              "chat-conversation-content mx-auto w-full gap-4 pt-20 pb-6 md:pl-12",
               CHAT_COLUMN_WIDTH,
             )}
           >
@@ -1746,6 +1789,19 @@ function MainAgentSurface({
           scroller={scroller}
           hasMoreHistory={hasMoreHistory}
         />
+        {/* Left-edge minimap: one tick per turn, scrolls independently, pages
+            in older history on scroll-up. Sibling of Conversation for the same
+            reason as JumpToTopButton — it escapes the chat-scroll-fade mask.
+            Desktop-only: not mounted on mobile so its eager backfill never
+            runs where the rail is hidden. */}
+        {!isMobileViewport && (
+          <TurnRail
+            turns={turns}
+            scroller={scroller}
+            hasMoreHistory={hasMoreHistory}
+            loadingMoreHistory={loadingMoreHistory}
+          />
+        )}
       </div>
       {/* Floating reply button — scoped to the conversation container. */}
       <SelectionPopup
@@ -1852,7 +1908,15 @@ function ConversationLoadError({
 function UserMessageNavConnected(props: React.ComponentProps<typeof UserMessageNav>) {
   const { isAtBottom } = useStickToBottomContext();
   return (
-    <UserMessageNav {...props} className={cn(props.className, isAtBottom && "max-md:hidden")} />
+    <UserMessageNav
+      {...props}
+      // Mobile-only: the TurnRail (a hover minimap) replaces these buttons on
+      // desktop, but mobile has no hover, so the ↑↓ nav stays there. Hidden at
+      // the bottom on mobile too — nothing above to page up to matters less
+      // than keeping the composer area clear. Keyboard ⌘⌥↑↓ still works on all
+      // sizes regardless of the buttons.
+      className={cn(props.className, "md:hidden", isAtBottom && "max-md:hidden")}
+    />
   );
 }
 
@@ -2881,11 +2945,7 @@ function ConnectedTerminalFirstPill({
  */
 function isSystemBubble(bubble: Bubble): boolean {
   if (bubble.kind !== "user") return false;
-  const hasAttachments = bubble.content.some(
-    (c) => c.type === "input_image" || c.type === "input_file",
-  );
-  if (hasAttachments) return false;
-  return parseSystemMessage(extractUserText(bubble.content)) !== null;
+  return isSystemUserContent(bubble.content);
 }
 
 function CompactionLoadingIndicator() {

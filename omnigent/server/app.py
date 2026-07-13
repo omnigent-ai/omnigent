@@ -1080,6 +1080,7 @@ def create_app(
     sandbox_config: ManagedSandboxConfig | None = None,
     sharing_mode: SharingMode | Callable[[], SharingMode] | None = None,
     public_sharing: bool | Callable[[], bool] | None = None,
+    server_config: dict[str, Any] | None = None,
 ) -> FastAPI:
     """
     Build and return the FastAPI application with all routes mounted.
@@ -1256,6 +1257,11 @@ def create_app(
         from anyio import to_thread as _to_thread
 
         _to_thread.current_default_thread_limiter().total_tokens = 200
+
+        # Initialise usage telemetry (fire-and-forget; no-op when disabled).
+        from omnigent.telemetry import init_client as _init_telemetry
+
+        _init_telemetry(config=server_config)
 
         # Apply OMNIGENT_LOG_LEVEL to the omnigent namespace after
         # uvicorn's dictConfig runs (dictConfig resets existing handlers,

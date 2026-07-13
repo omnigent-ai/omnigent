@@ -211,6 +211,7 @@ impl Supervisor {
         cmd.args(&spec.args)
             .current_dir(&spec.cwd)
             .envs(self.env.iter().cloned())
+            .envs(spec.extra_env.iter().cloned())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -292,6 +293,7 @@ impl Supervisor {
         cmd.args(&spec.args)
             .current_dir(&spec.cwd)
             .envs(self.env.iter().cloned())
+            .envs(spec.extra_env.iter().cloned())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
