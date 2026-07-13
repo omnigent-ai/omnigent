@@ -1,7 +1,7 @@
 """Scheduled-task store — persists scheduled tasks and their run history.
 
 A scheduled task is a saved instruction that fires an agent session on a
-schedule (recurring cron or one-shot). This store owns the ``scheduled_tasks``
+recurring cron schedule. This store owns the ``scheduled_tasks``
 table and its ``scheduled_task_runs`` history table. No scheduler consumes these
 rows yet — this is the persistence layer only.
 """
@@ -68,8 +68,8 @@ class ScheduledTaskStore(ABC):
         :param reasoning_effort: Optional reasoning-effort hint.
         :param workspace: Optional runner start path (source repo / working dir).
         :param base_branch: Optional git base ref to branch from at fire time.
-        :param state: Lifecycle state — ``active``/``paused``/``deleted``/
-            ``completed``. Defaults to ``"active"``.
+        :param state: Lifecycle state — ``active``/``paused``/``deleted``.
+            Defaults to ``"active"``.
         :param metadata: Optional free-form metadata dict.
         :returns: The newly created :class:`ScheduledTask`.
         :raises ValueError: If ``state`` is not a recognized value.

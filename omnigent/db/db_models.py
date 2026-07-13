@@ -1105,8 +1105,8 @@ class SqlScheduledTask(Base):
     :param workspace: Absolute path on disk where a fired session's runner
         should start (the source repo / working dir). ``None`` when unset.
     :param base_branch: Git base ref a firing branches FROM when it creates a
-        worktree at fire time (maps 1:1 to Harry's ``base_branch`` and to
-        session-create's ``git.base_branch`` input). Pairs with ``workspace``:
+        worktree at fire time (mirrors session-create's ``git.base_branch``
+        input). Pairs with ``workspace``:
         ``workspace`` is where, ``base_branch`` is what to branch from. ``None``
         when unset. The per-run *output* branch is not stored on the definition.
     :param timezone: IANA timezone the trigger is evaluated in, e.g.
