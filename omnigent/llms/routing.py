@@ -84,11 +84,8 @@ _HARNESS_FOR_MODEL_PREFIX: dict[str, str] = {
     "databricks-gpt-": "openai-agents",
     "openai/gpt-": "openai-agents",
     "gpt-": "openai-agents",
-    # xAI exposes an OpenAI-compatible endpoint and is classified
-    # OPENAI_FAMILY in configure_models.py, so openai-agents is the
-    # right harness for both provider-prefixed and bare grok- strings.
+    # xAI is OpenAI-compatible; provider prefix required (bare grok- defaults to openai).
     "xai/grok-": "openai-agents",
-    "grok-": "openai-agents",
 }
 
 
