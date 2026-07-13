@@ -1,0 +1,119 @@
+# Omnigent server — systemd unit template.
+#
+# Install to /etc/systemd/system/omnigent-server.service and edit the
+# two placeholders marked EDIT-ME below. See README.md in this directory
+# for the full walkthrough (user creation, binary path, logs, TLS).
+#
+# This runs the FOREGROUND server (`omni server`), which is the correct
+# systemd shape: it blocks, logs to stdout/stderr, and exits on SIGTERM.
+# Do NOT use `omni server start` as ExecStart — that is a detached dev
+# daemon that forks and returns immediately, so systemd would see the
+# parent exit and tear the service down.
+
+[Unit]
+Description=Omnigent server
+Documentation=https://github.com/omnigent-ai/omnigent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# EDIT-ME: the dedicated non-root account this runs as. Create it first:
+#   sudo useradd --system --home-dir /var/lib/omnigent --shell /usr/sbin/nologin omnigent
+User=omnigent
+Group=omnigent
+
+# EDIT-ME: absolute path to the `omni` entrypoint. A unit does not get a
+# login shell, so $PATH will not find a venv/pipx binary — it MUST be
+# absolute. Find yours with `which omni` (see README.md § Finding the
+# omni binary).
+#
+# --port is passed EXPLICITLY on purpose, even though 6767 is already the
+# default. A bare `omni server` with every default (loopback + default
+# port + default db + default artifacts) is treated as the "canonical
+# local server": if a healthy one is already running (e.g. one spawned by
+# a developer's `omni run` daemon on the same box) it prints "reusing it"
+# and EXITS 0 -- systemd would then mark the unit inactive and, with
+# Restart=on-failure, never bring it back. An explicit --port opts into
+# the "dedicated server" path, which always binds its own port.
+# (omnigent/cli.py, _is_canonical_local_server.)
+#
+# --no-open is required: --open (the default) tries to launch a browser
+# on first boot of accounts auth, which is meaningless headless.
+ExecStart=/opt/omnigent/venv/bin/omni server --host 127.0.0.1 --port 6767 --no-open
+
+# Loopback by default: the safe bind that needs no auth configuration.
+# To expose beyond loopback you MUST also configure auth, or every
+# request 401s -- see README.md § Exposing beyond loopback.
+
+EnvironmentFile=-/etc/omnigent/omnigent-server.env
+
+# $HOME must be set and writable. `omni server` writes diagnostic logs to
+# $HOME/.omnigent/logs/ via state_dir(), which is hardcoded to
+# Path.home()/".omnigent" and does NOT honor OMNIGENT_DATA_DIR
+# (sdks/ui/omnigent_ui_sdk/terminal/_config.py). Pinning HOME here makes
+# that path deterministic regardless of the account's passwd entry.
+Environment=HOME=/var/lib/omnigent
+
+# Creates /var/lib/omnigent (0750, owned by User=/Group=) if absent and
+# implicitly adds it to ReadWritePaths, which is what makes the unit
+# writable under ProtectSystem=strict below. Set OMNIGENT_DATA_DIR to this
+# path in the env file so the sqlite db + artifacts land here too.
+StateDirectory=omnigent
+WorkingDirectory=/var/lib/omnigent
+
+Restart=on-failure
+RestartSec=5s
+
+# uvicorn drains in-flight WebSocket/SSE connections for 30s after SIGTERM
+# (OMNIGENT_SERVER_SHUTDOWN_TIMEOUT_S, default 30 -- omnigent/cli.py).
+# Give it headroom so systemd doesn't SIGKILL mid-drain.
+TimeoutStopSec=45s
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=omnigent-server
+
+# ── Hardening ────────────────────────────────────────────────────────
+# Verified against what the server actually does at runtime. Note the
+# server owns a HarnessProcessManager and may spawn runner subprocesses
+# in-process (omnigent/server/app.py), so anything that blocks fork/exec
+# or write+execute memory is deliberately NOT set here.
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# Masks /home, /root and /run/user. This is safe ONLY because the service
+# account's home is /var/lib/omnigent (set above), which is not under
+# /home. Two cases where you must relax this:
+#   - the account's home really is under /home  -> drop this line
+#   - agents need to read/write repos under /home -> drop this line, or
+#     add the specific paths to ReadWritePaths=
+ProtectHome=yes
+
+# @system-service permits fork/exec, which the runner subprocesses need.
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# Deliberately NOT set:
+#   MemoryDenyWriteExecute=yes  -- breaks the JIT in the Node-based coding
+#                                  CLIs (claude/codex) the runners exec.
+#   PrivateNetwork / IPAddressDeny -- the server must reach LLM APIs and
+#                                  accept runner tunnel connections.
+
+[Install]
+WantedBy=multi-user.target

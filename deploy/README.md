@@ -64,6 +64,11 @@ deploy/
 │   ├── modal_app.py
 │   └── README.md
 │
+├── systemd/           ← Linux host, no Docker (venv + systemd unit)
+│   ├── omnigent-server.service
+│   ├── omnigent-server.env.example
+│   └── README.md
+│
 ├── trycloudflare/     ← Cloudflare quick tunnel (public URL for a LOCAL server)
 │   └── README.md
 │
@@ -88,6 +93,7 @@ deploy/
 | **Deploy from a browser (no local tools)** | **Render or Railway** | Buttons above: [Render](render/README.md) · [Railway](railway/README.md) |
 | Try the server on your laptop | Docker compose | [`docker/README.md`](docker/README.md): `./bootstrap.sh` to mint the `.env` secrets, then `docker compose up -d` |
 | Run on any host you already have (VPS, home server, on-prem) | Docker compose | [`docker/README.md`](docker/README.md): copy the compose stack, `./bootstrap.sh`, then `docker compose up -d` |
+| Run on a Linux host **without Docker**, as a service that survives reboots | systemd | [`systemd/README.md`](systemd/README.md): a venv + a unit template; `systemctl enable --now omnigent-server` |
 | Deploy to Fly.io | Fly | [`fly/README.md`](fly/README.md): `fly deploy`, SQLite on a volume |
 | Deploy to Modal (durable artifact Volume) | Modal | [`modal/README.md`](modal/README.md): `modal deploy`, BYO Neon Postgres |
 | Stand up a quick demo (no DB to provision) | HF Spaces | [`hf-spaces/README.md`](hf-spaces/README.md): Docker Space, SQLite |
