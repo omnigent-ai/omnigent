@@ -618,6 +618,29 @@ def read_only_os(
     return _evaluate
 
 
+def workflow_launch_approval() -> Callable[[_Json], _Json]:
+    """Require human approval for each distinct static workflow definition."""
+
+    def _evaluate(event: _Json) -> _Json:
+        args = _tool_call(event, {"sys_workflow_start"})
+        if args is None:
+            return _ALLOW
+        definition_hash = args.get("definition_hash")
+        if not isinstance(definition_hash, str) or not definition_hash:
+            return _decision("DENY", "Workflow start requires a definition hash.")
+        context = event.get("context")
+        labels = context.get("labels") if isinstance(context, dict) else None
+        if isinstance(labels, dict) and labels.get("workflow.approved_hash") == definition_hash:
+            return _ALLOW
+        return {
+            "result": "ASK",
+            "reason": "Approve this static workflow DAG and its declared execution budget?",
+            "set_labels": {"workflow.approved_hash": definition_hash},
+        }
+
+    return _evaluate
+
+
 # ── Registry ─────────────────────────────────────────────────────────────────
 
 POLICY_REGISTRY: list[dict[str, Any]] = [
@@ -658,5 +681,12 @@ POLICY_REGISTRY: list[dict[str, Any]] = [
         "description": "Denies every file-mutating tool (sys_os_write/edit, Claude/Codex "
         "native Write/Edit/MultiEdit, and Pi native write/edit) so a report-only agent "
         "can read and run shell but never change code",
+    },
+    {
+        "handler": "omnigent.policies.builtins.orchestration.workflow_launch_approval",
+        "kind": "factory",
+        "name": "Approve Static Workflow Launches",
+        "description": "Asks once for each distinct workflow definition hash and allows "
+        "subsequent starts of the approved version",
     },
 ]

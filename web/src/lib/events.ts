@@ -741,6 +741,12 @@ export interface SessionChildSessionUpdatedEvent {
   child: Record<string, unknown>;
 }
 
+export interface SessionWorkflowUpdatedEvent {
+  type: "session_workflow_updated";
+  conversationId: string;
+  workflow: Record<string, unknown>;
+}
+
 /**
  * `session.changed_files.invalidated` — the session's changed-files list
  * may have changed; the consumer should refetch it. Coarse signal (no
@@ -894,6 +900,7 @@ export type StreamEvent =
   | SessionResourceCreatedEvent
   | SessionResourceDeletedEvent
   | SessionChildSessionUpdatedEvent
+  | SessionWorkflowUpdatedEvent
   | SessionChangedFilesInvalidatedEvent
   | SessionTerminalActivityEvent
   | SessionSkillsEvent

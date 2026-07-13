@@ -16,6 +16,14 @@ description: >-
 # custom agent config and launch it via config_path.
 spawn: true
 
+# V0 static DAG orchestration. State is runner-local and intentionally
+# non-durable; Polly receives one wake when a workflow blocks or completes.
+workflows:
+  enabled: true
+  max_concurrency: 6
+  max_nodes: 100
+  max_dispatches: 100
+
 # Orchestrator "brain": Claude Agent SDK. polly writes no code itself — it
 # delegates ALL coding work (investigation, implementation, review) to the
 # claude_code / codex / opencode / cursor / hermes / pi sub-agents, doing only non-code authoring (docs /
@@ -102,6 +110,18 @@ prompt: |
   full list of tasks you are about to dispatch — one entry per planned
   `sys_session_send` — and use each recommendation's `model` as the
   `args.model` for that dispatch.
+
+  For a multi-step task with explicit dependencies, prefer the static workflow
+  tools over manual inbox orchestration. Build the complete DAG up front, call
+  `sys_workflow_submit`, present its nodes and budget to the human, then call
+  `sys_workflow_start` with the returned version and definition hash. The start
+  is approval-gated. Nodes run only after all dependencies succeed; independent
+  nodes run concurrently and failures retry up to each node's `max_attempts`.
+  Every node contract must require a final `<workflow_result>{...}</workflow_result>`
+  block matching its `output_schema`. Do not poll: the controller wakes you once
+  when the workflow succeeds or blocks. Then call `sys_workflow_get`, summarize
+  the results, and use `sys_workflow_amend` only for nodes that have not started.
+  Workflow state does not survive a runner restart in v0.
 
   Delegate ALL coding work through these three via `sys_session_send`, each
   launched in its OWN git worktree. They run autonomously to completion (you
@@ -341,3 +361,9 @@ guardrails:
         path: omnigent.inner.nessie.policies.headless_subagent_purpose_guard
         arguments:
           allowed_purposes: [implement, review, explore, search]
+    workflow_launch_approval:
+      type: function
+      function:
+        path: omnigent.policies.builtins.orchestration.workflow_launch_approval
+        arguments: {}
+      set_labels: [workflow.approved_hash]

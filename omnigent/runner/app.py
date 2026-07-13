@@ -7102,6 +7102,8 @@ class _SubagentWorkEntry:
     created_at: float = dataclasses.field(default_factory=time.time)
     completed_at: float | None = None
     delivered: bool = False
+    workflow_ref: dict[str, Any] | None = None
+    workflow_delivered: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -7138,6 +7140,7 @@ def register_subagent_work(
     agent: str,
     title: str,
     wrapper_label: str | None = None,
+    workflow_ref: dict[str, Any] | None = None,
 ) -> _SubagentWorkEntry:
     """
     Register one running sub-agent dispatch.
@@ -7170,6 +7173,7 @@ def register_subagent_work(
         agent=agent,
         title=title,
         wrapper_label=wrapper_label,
+        workflow_ref=workflow_ref,
     )
     _drained_delivered_subagent_children.discard(child_session_id)
     _subagent_work_by_child[child_session_id] = entry
@@ -7353,36 +7357,44 @@ def _deliver_subagent_completion(entry: _SubagentWorkEntry) -> _SubagentDelivery
             delivered_now=False,
             reason=_SUBAGENT_DELIVERY_ALREADY_DELIVERED,
         )
-    inbox = _session_inboxes_ref.get(entry.parent_session_id)
-    if inbox is None:
-        _logger.warning(
-            "Sub-agent work completed but parent inbox is missing; parent=%s child=%s",
-            entry.parent_session_id,
-            entry.child_session_id,
-        )
-        return _SubagentDeliveryAck(
-            entry=entry,
-            delivered=False,
-            delivered_now=False,
-            reason=_SUBAGENT_DELIVERY_MISSING_PARENT_INBOX,
-        )
     output = entry.output
     if output is None:
         output = "[System: sub-agent completed with no output]"
-    inbox.put_nowait(
-        {
-            "type": "sub_agent",
-            "work_id": entry.work_id,
-            "task_id": entry.child_session_id,
-            "handle_id": entry.child_session_id,
-            "conversation_id": entry.child_session_id,
-            "tool_name": entry.agent,
-            "agent": entry.agent,
-            "title": entry.title,
-            "status": entry.status,
-            "output": output,
-        }
-    )
+    payload = {
+        "type": "sub_agent",
+        "work_id": entry.work_id,
+        "task_id": entry.child_session_id,
+        "handle_id": entry.child_session_id,
+        "conversation_id": entry.child_session_id,
+        "tool_name": entry.agent,
+        "agent": entry.agent,
+        "title": entry.title,
+        "status": entry.status,
+        "output": output,
+    }
+    if entry.workflow_ref is not None:
+        from omnigent.dag_workflows.runtime import deliver_workflow_completion
+
+        entry.workflow_delivered = deliver_workflow_completion(
+            entry.parent_session_id,
+            entry.workflow_ref,
+            payload,
+        )
+    if not entry.workflow_delivered:
+        inbox = _session_inboxes_ref.get(entry.parent_session_id)
+        if inbox is None:
+            _logger.warning(
+                "Sub-agent work completed but parent inbox is missing; parent=%s child=%s",
+                entry.parent_session_id,
+                entry.child_session_id,
+            )
+            return _SubagentDeliveryAck(
+                entry=entry,
+                delivered=False,
+                delivered_now=False,
+                reason=_SUBAGENT_DELIVERY_MISSING_PARENT_INBOX,
+            )
+        inbox.put_nowait(payload)
     entry.delivered = True
     return _SubagentDeliveryAck(
         entry=entry,
@@ -13223,7 +13235,14 @@ def create_runner_app(
         """
         ack = mark_subagent_work_terminal(child_session_id, status=status, output=output)
         if ack.entry is not None and ack.delivered_now:
-            _schedule_subagent_wake(ack.entry)
+            if ack.entry.workflow_delivered:
+                unregister_subagent_work(
+                    child_session_id,
+                    work_id=ack.entry.work_id,
+                    remember_drained_delivery=True,
+                )
+            else:
+                _schedule_subagent_wake(ack.entry)
         return ack
 
     async def _ensure_comment_relay_started(
@@ -17906,6 +17925,32 @@ def create_runner_app(
             content=session_resource_view_to_dict(resource),
         )
 
+    @app.get("/v1/sessions/{session_id}/workflows")
+    async def list_session_workflows(session_id: str) -> JSONResponse:
+        """Return runner-local workflow summaries for a parent session."""
+        from omnigent.dag_workflows.runtime import get_workflow_manager
+
+        manager = get_workflow_manager(session_id)
+        runs = await manager.list() if manager is not None else []
+        return JSONResponse(
+            status_code=200,
+            content={"object": "list", "data": [run.summary() for run in runs]},
+        )
+
+    @app.get("/v1/sessions/{session_id}/workflows/{workflow_id}")
+    async def get_session_workflow(session_id: str, workflow_id: str) -> JSONResponse:
+        """Return one runner-local workflow summary."""
+        from omnigent.dag_workflows.runtime import get_workflow_manager
+
+        manager = get_workflow_manager(session_id)
+        if manager is None:
+            return JSONResponse(status_code=404, content={"error": "workflow not found"})
+        try:
+            run = await manager.require(workflow_id)
+        except KeyError:
+            return JSONResponse(status_code=404, content={"error": "workflow not found"})
+        return JSONResponse(status_code=200, content=run.summary())
+
     def _clear_session_agent_caches(session_id: str, agent_id: str | None = None) -> None:
         """Drop cached spec/tool data derived from a session's agent bundle."""
         _session_spec_cache.pop(session_id, None)
@@ -17943,6 +17988,9 @@ def create_runner_app(
         _hermes_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         await resource_registry.cleanup_session(session_id)
+        from omnigent.dag_workflows.runtime import remove_workflow_manager
+
+        await remove_workflow_manager(session_id)
         # This is the runner endpoint the SERVER's session-delete actually
         # drives (server delete_session -> DELETE /v1/sessions/{id}/resources),
         # so the token-bearing native bridge dir must be removed here, not only

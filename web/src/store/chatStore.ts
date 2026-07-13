@@ -79,6 +79,7 @@ import type {
 import { createPresenceIdleTracker } from "@/lib/presenceIdle";
 import { parseEvent, parseSseStream, type SseStreamResult } from "@/lib/sse";
 import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
+import { workflowsQueryKey } from "@/hooks/useWorkflows";
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
 import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
 import { useTerminalActivityStore } from "./terminalActivity";
@@ -4422,6 +4423,11 @@ export function handleSessionEvent(event: StreamEvent): void {
           queryKey: childSessionsQueryKey(event.conversationId),
         });
       }
+      return;
+    case "session_workflow_updated":
+      queryClient?.invalidateQueries({
+        queryKey: workflowsQueryKey(event.conversationId),
+      });
       return;
     case "session_changed_files_invalidated":
       // Coarse "something changed" signal. Coalesce bursts into one

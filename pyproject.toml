@@ -76,6 +76,7 @@ dependencies = [
     "pexpect>=4.9,<5; platform_system != 'Windows'",
     "pyte>=0.8,<1; platform_system != 'Windows'",
     "pydantic>=2.0,<3",
+    "jsonschema>=4.0,<5",
     "sqlalchemy>=2.0,<3",
     # Client-side compression for opaque text columns (omnigent/db/compression.py),
     # so per-conversation JSON/text is stored uniformly compressed across SQLite,

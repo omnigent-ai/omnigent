@@ -210,6 +210,16 @@ _ASYNC_INBOX_TOOLS = frozenset(
 # (peek/list/close) dispatch via ``_SESSION_QUERY_TOOLS`` below.
 _SUBAGENT_TOOLS = frozenset({"sys_session_send"})
 
+_WORKFLOW_TOOLS = frozenset(
+    {
+        "sys_workflow_submit",
+        "sys_workflow_amend",
+        "sys_workflow_start",
+        "sys_workflow_get",
+        "sys_workflow_cancel",
+    }
+)
+
 # Priority 5f.0a: Session-create write. ``sys_session_create`` spawns a
 # child session (parent forced to the caller) from an existing agent_id
 # via the JSON POST /v1/sessions create — same server-permission posture
@@ -368,6 +378,7 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     | _SESSION_QUERY_TOOLS
     | _ASYNC_INBOX_TOOLS
     | _SUBAGENT_TOOLS
+    | _WORKFLOW_TOOLS
     | _LIST_MODELS_TOOLS
     | _ADVISE_MODELS_TOOLS
     | _SESSION_CREATE_TOOLS
@@ -509,6 +520,7 @@ _ALL_LOCAL_TOOLS = (
     | _TERMINAL_TOOLS
     | _ASYNC_INBOX_TOOLS
     | _SUBAGENT_TOOLS
+    | _WORKFLOW_TOOLS
     | _LIST_MODELS_TOOLS
     | _ADVISE_MODELS_TOOLS
     | _SESSION_CREATE_TOOLS
@@ -1401,6 +1413,7 @@ async def _execute_subagent_tool(
     agent_spec: Any | None = None,
     publish_event: Callable[[str, dict[str, Any]], None] | None = None,
     session_inbox: asyncio.Queue[dict[str, Any]] | None = None,
+    workflow_ref: dict[str, Any] | None = None,
 ) -> str:
     """
     Dispatch a sub-agent tool call (``sys_session_send``).
@@ -1508,6 +1521,7 @@ async def _execute_subagent_tool(
             server_client=server_client,
             conversation_id=conversation_id,
             publish_event=publish_event,
+            workflow_ref=workflow_ref,
         )
 
     # Named mode: (agent, title) spawn-or-continue.
@@ -1791,6 +1805,7 @@ async def _execute_subagent_tool(
         agent=str(sub_agent_name),
         title=session_name,
         wrapper_label=child_wrapper_label,
+        workflow_ref=workflow_ref,
     )
     _publish_child_launching_update(
         parent_session_id=conversation_id,
@@ -1895,6 +1910,7 @@ async def _send_to_existing_session(
     server_client: httpx.AsyncClient,
     conversation_id: str,
     publish_event: Callable[[str, dict[str, Any]], None] | None = None,
+    workflow_ref: dict[str, Any] | None = None,
 ) -> str:
     """
     Post a message to an existing direct-child session, return a handle.
@@ -1976,6 +1992,7 @@ async def _send_to_existing_session(
         agent=agent_label,
         title=parsed.title or "",
         wrapper_label=_session_wrapper_label(snap_data),
+        workflow_ref=workflow_ref,
     )
     _publish_child_launching_update(
         parent_session_id=conversation_id,
@@ -4510,6 +4527,17 @@ async def execute_tool(
                 publish_event=publish_event,
                 session_inbox=session_inbox,
             )
+        elif tool_name in _WORKFLOW_TOOLS:
+            output = await _execute_workflow_tool(
+                tool_name,
+                args,
+                server_client=server_client,
+                conversation_id=conversation_id,
+                agent_spec=agent_spec,
+                publish_event=publish_event,
+                session_inbox=session_inbox,
+                session_async_tasks=session_async_tasks,
+            )
         elif tool_name in _LIST_MODELS_TOOLS:
             output = await _execute_list_models_tool(agent_spec=agent_spec)
         elif tool_name in _SESSION_CREATE_TOOLS:
@@ -4630,6 +4658,172 @@ async def execute_tool(
         output = f"Error: {type(exc).__name__}: {exc}"
 
     return output
+
+
+async def _execute_workflow_tool(
+    tool_name: str,
+    args: dict[str, Any],
+    *,
+    server_client: httpx.AsyncClient | None,
+    conversation_id: str | None,
+    agent_spec: Any | None,
+    publish_event: Callable[[str, dict[str, Any]], None] | None,
+    session_inbox: asyncio.Queue[dict[str, Any]] | None,
+    session_async_tasks: dict[str, tuple[asyncio.Task[str], asyncio.Event]] | None,
+) -> str:
+    """Execute one opt-in static workflow tool against runner-local state."""
+    if server_client is None or conversation_id is None or agent_spec is None:
+        return json.dumps({"error": f"{tool_name} requires an active runner session"})
+    limits = getattr(agent_spec, "workflows", None)
+    if limits is None or not getattr(limits, "enabled", False):
+        return json.dumps({"error": "workflows are disabled for this agent"})
+
+    from omnigent.dag_workflows.runtime import (
+        WorkflowManager,
+        get_workflow_manager,
+        register_workflow_manager,
+    )
+
+    manager = get_workflow_manager(conversation_id)
+    if manager is None:
+        purpose_by_role = {
+            "investigate": "explore",
+            "implement": "implement",
+            "review": "review",
+            "generic": "explore",
+        }
+
+        async def authorize_dispatch(arguments: dict[str, Any]) -> str | None:
+            try:
+                response = await server_client.post(
+                    f"/v1/sessions/{conversation_id}/policies/evaluate",
+                    json={
+                        "event": {
+                            "type": "PHASE_TOOL_CALL",
+                            "data": {"name": "sys_session_send", "arguments": arguments},
+                        }
+                    },
+                    timeout=_ASK_GATE_DELIVERY_TIMEOUT,
+                )
+                response.raise_for_status()
+                verdict = response.json()
+            except Exception as exc:  # noqa: BLE001 - policy failure is fail-closed
+                return f"workflow dispatch policy evaluation failed: {exc}"
+            result = verdict.get("result")
+            if result in {"POLICY_ACTION_ALLOW", "POLICY_ACTION_UNSPECIFIED"}:
+                return None
+            return str(verdict.get("reason") or f"workflow dispatch policy returned {result}")
+
+        async def dispatch_node(
+            node: Any,
+            prompt: str,
+            workflow_ref: dict[str, Any],
+            existing_session: str | None,
+        ) -> dict[str, Any]:
+            child_args: dict[str, Any] = {
+                "input": prompt,
+                "purpose": purpose_by_role[node.role],
+            }
+            if existing_session is None:
+                if node.model is not None:
+                    child_args["model"] = node.model
+                if node.cost_budget is not None:
+                    child_args["cost_budget"] = node.cost_budget.model_dump()
+                arguments: dict[str, Any] = {
+                    "agent": node.agent,
+                    "title": f"wf-{workflow_ref['workflow_id']}-{node.id}"[:120],
+                    "args": child_args,
+                }
+            else:
+                arguments = {"session_id": existing_session, "args": child_args}
+            denial = await authorize_dispatch(arguments)
+            if denial is not None:
+                return {"error": f"Denied by policy: {denial}"}
+            raw = await _execute_subagent_tool(
+                arguments,
+                server_client=server_client,
+                conversation_id=conversation_id,
+                agent_spec=agent_spec,
+                publish_event=publish_event,
+                session_inbox=session_inbox,
+                workflow_ref=workflow_ref,
+            )
+            try:
+                parsed = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                return {"error": raw}
+            if not isinstance(parsed, dict):
+                return {"error": f"unexpected sub-agent dispatch response: {raw}"}
+            return parsed
+
+        async def cancel_child(child_id: str) -> None:
+            await _execute_task_lifecycle_tool(
+                {"task_id": child_id},
+                session_async_tasks=session_async_tasks,
+                conversation_id=conversation_id,
+                server_client=server_client,
+            )
+
+        async def wake_parent(notice: str) -> None:
+            from omnigent.runner.app import _deliver_subagent_wake_post
+
+            await _deliver_subagent_wake_post(server_client, conversation_id, notice)
+
+        def publish(event: dict[str, Any]) -> None:
+            if publish_event is not None:
+                publish_event(conversation_id, event)
+
+        async def child_cost(child_id: str) -> float:
+            response = await server_client.get(f"/v1/sessions/{child_id}", timeout=30.0)
+            response.raise_for_status()
+            value = response.json().get("total_cost_usd")
+            return float(value) if value is not None else 0.0
+
+        async def evaluate_result(payload: dict[str, Any]) -> dict[str, Any]:
+            evaluation = await _evaluate_subagent_inbox_output(
+                payload,
+                server_client=server_client,
+                conversation_id=conversation_id,
+            )
+            return evaluation.payload
+
+        manager = register_workflow_manager(
+            WorkflowManager(
+                parent_session_id=conversation_id,
+                limits=limits,
+                dispatch=dispatch_node,
+                cancel_child=cancel_child,
+                wake_parent=wake_parent,
+                publish=publish,
+                get_child_cost=child_cost,
+                evaluate_result=evaluate_result,
+            )
+        )
+
+    try:
+        if tool_name == "sys_workflow_submit":
+            run = await manager.submit(args.get("definition") or {})
+        elif tool_name == "sys_workflow_amend":
+            run = await manager.amend(
+                str(args.get("workflow_id", "")),
+                int(args.get("expected_version", 0)),
+                args.get("delta") or {},
+            )
+        elif tool_name == "sys_workflow_start":
+            run = await manager.start(
+                str(args.get("workflow_id", "")),
+                int(args.get("version", 0)),
+                str(args.get("definition_hash", "")),
+            )
+        elif tool_name == "sys_workflow_get":
+            run = await manager.require(str(args.get("workflow_id", "")))
+        elif tool_name == "sys_workflow_cancel":
+            run = await manager.cancel(str(args.get("workflow_id", "")))
+        else:
+            return json.dumps({"error": f"unknown workflow tool {tool_name}"})
+    except Exception as exc:  # noqa: BLE001 - LLM receives a structured validation error
+        return json.dumps({"error": str(exc)})
+    return json.dumps(run.summary(), sort_keys=True)
 
 
 # Per-session leading-edge throttle for changed-files invalidation

@@ -27,6 +27,7 @@ provider. See ``SKILL.md`` for the live (real claude/codex/pi) recipe.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import shutil
@@ -662,12 +663,123 @@ def scenario_fanout_dispatch(ctx: Ctx) -> Result:
     return res
 
 
+def scenario_workflow_dag(ctx: Ctx) -> Result:  # noqa: ARG001
+    """Static DAG runs parallel roots, retries once, then wakes exactly once."""
+    from omnigent.dag_workflows.models import WorkflowRuntimeConfig
+    from omnigent.dag_workflows.runtime import WorkflowManager, WorkflowRef
+
+    async def run() -> tuple[list[str], int, str, int]:
+        dispatches: list[tuple[str, dict, str | None]] = []
+        wakes: list[str] = []
+
+        async def dispatch(node: object, _prompt: str, ref: dict, existing: str | None) -> dict:
+            node_id = str(node.id)  # type: ignore[attr-defined]
+            dispatches.append((node_id, ref, existing))
+            return {"conversation_id": existing or f"conv_{node_id}"}
+
+        async def noop(_value: str) -> None:
+            return None
+
+        async def cost(_value: str) -> float:
+            return 0.0
+
+        async def result(payload: dict) -> dict:
+            return payload
+
+        manager = WorkflowManager(
+            parent_session_id="cuj-parent",
+            limits=WorkflowRuntimeConfig(enabled=True),
+            dispatch=dispatch,
+            cancel_child=noop,
+            wake_parent=lambda message: _append_async(wakes, message),
+            publish=lambda _event: None,
+            get_child_cost=cost,
+            evaluate_result=result,
+        )
+        definition = {
+            "id": "cuj-dag",
+            "name": "CUJ DAG",
+            "budget": {"max_concurrency": 2, "max_dispatches": 8},
+            "nodes": [
+                {
+                    "id": node_id,
+                    "title": node_id.upper(),
+                    "contract": "Return value",
+                    "agent": "pi",
+                    "deps": deps,
+                    "max_attempts": 2,
+                    "output_schema": {"type": "object", "required": ["value"]},
+                }
+                for node_id, deps in (("a", []), ("b", []), ("c", ["a", "b"]))
+            ],
+        }
+
+        async def wait_for(count: int) -> None:
+            for _ in range(100):
+                if len(dispatches) >= count:
+                    return
+                await asyncio.sleep(0.01)
+            raise TimeoutError(f"expected {count} workflow dispatches")
+
+        def complete(node_id: str, attempt: int, work_id: str, output: str) -> None:
+            manager.enqueue_completion(
+                WorkflowRef("cuj-dag", node_id, attempt),
+                {
+                    "work_id": work_id,
+                    "conversation_id": f"conv_{node_id}",
+                    "status": "completed",
+                    "output": output,
+                },
+            )
+
+        try:
+            draft = await manager.submit(definition)
+            await manager.start("cuj-dag", 1, draft.definition_hash)
+            await wait_for(2)
+            complete("a", 1, "wa", '<workflow_result>{"value": 1}</workflow_result>')
+            complete("b", 1, "wb1", "invalid")
+            await wait_for(3)
+            complete("b", 1, "wb1", '<workflow_result>{"value": 99}</workflow_result>')
+            complete("b", 2, "wb2", '<workflow_result>{"value": 2}</workflow_result>')
+            await wait_for(4)
+            complete("c", 1, "wc", '<workflow_result>{"value": 3}</workflow_result>')
+            for _ in range(100):
+                state = await manager.require("cuj-dag")
+                if state.status.value == "succeeded":
+                    break
+                await asyncio.sleep(0.01)
+            state = await manager.require("cuj-dag")
+            return (
+                [item[0] for item in dispatches],
+                state.nodes["b"].attempt_count,
+                state.status.value,
+                len(wakes),
+            )
+        finally:
+            await manager.close()
+
+    dispatches, retry_count, status, wake_count = asyncio.run(run())
+    res = Result("workflow_dag")
+    res.add("parallel_roots", set(dispatches[:2]) == {"a", "b"}, repr(dispatches))
+    res.add("retry_then_dependency", dispatches[2:] == ["b", "c"], repr(dispatches))
+    res.add("duplicate_ignored", retry_count == 2, f"attempts={retry_count}")
+    res.add(
+        "one_terminal_wake", status == "succeeded" and wake_count == 1, f"{status=}, {wake_count=}"
+    )
+    return res
+
+
+async def _append_async(values: list[str], value: str) -> None:
+    values.append(value)
+
+
 _SCENARIOS: dict[str, Callable[[Ctx], Result]] = {
     "boot": scenario_boot,
     "tool_dispatch": scenario_tool_dispatch,
     "guardrail_purpose": scenario_guardrail_purpose,
     "guardrail_blast_radius": scenario_guardrail_blast_radius,
     "fanout_dispatch": scenario_fanout_dispatch,
+    "workflow_dag": scenario_workflow_dag,
 }
 
 

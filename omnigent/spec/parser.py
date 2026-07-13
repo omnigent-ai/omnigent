@@ -263,6 +263,24 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
     # granting named users; ``public`` also allows ``__public__``
     # anonymous read.
     agent_session_sharing = _parse_share_policy(raw.get("agent_session_sharing"))
+    from omnigent.dag_workflows.models import WorkflowRuntimeConfig
+
+    raw_workflows = raw.get("workflows")
+    if raw_workflows is None:
+        workflows = WorkflowRuntimeConfig()
+    elif not isinstance(raw_workflows, dict):
+        raise OmnigentError(
+            "workflows must be an object",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    else:
+        try:
+            workflows = WorkflowRuntimeConfig.model_validate(raw_workflows)
+        except ValidationError as exc:
+            raise OmnigentError(
+                f"invalid workflows config: {_format_validation_error(exc)}",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
 
     # Honor ``prompt:`` as the legacy alias for ``instructions:`` (per
     # ``_OMNIGENT_SYSTEM_PROMPT_KEYS``); ``instructions:`` wins if both set.
@@ -300,6 +318,7 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
         timers=timers,
         spawn=spawn,
         agent_session_sharing=agent_session_sharing,
+        workflows=workflows,
     )
 
 

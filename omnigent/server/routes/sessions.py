@@ -52,7 +52,7 @@ from fastapi import (
     WebSocketException,
     status,
 )
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import TypeAdapter, ValidationError
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from starlette.datastructures import UploadFile as StarletteUploadFile
@@ -17366,6 +17366,56 @@ def create_sessions_router(
                     page.first_id = page.data[0].id
 
         return page
+
+    @router.get("/sessions/{session_id}/workflows")
+    async def list_session_workflows(request: Request, session_id: str) -> JSONResponse:
+        """Proxy runner-local workflow summaries for an authorized session."""
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access_and_level(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        )
+        runner_client = await _get_runner_client_for_resource_access(session_id)
+        if runner_client is None:
+            return JSONResponse(status_code=200, content={"object": "list", "data": []})
+        try:
+            response = await runner_client.get(
+                f"/v1/sessions/{session_id}/workflows", timeout=10.0
+            )
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail="runner workflow endpoint failed") from exc
+        if response.status_code != 200:
+            raise HTTPException(status_code=502, detail="runner workflow endpoint failed")
+        body = response.json()
+        if not isinstance(body, dict) or not isinstance(body.get("data"), list):
+            raise HTTPException(status_code=502, detail="runner workflow response was malformed")
+        return JSONResponse(status_code=200, content=body)
+
+    @router.get("/sessions/{session_id}/workflows/{workflow_id}")
+    async def get_session_workflow(
+        request: Request, session_id: str, workflow_id: str
+    ) -> JSONResponse:
+        """Proxy one runner-local workflow summary for an authorized session."""
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access_and_level(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        )
+        runner_client = await _get_runner_client_for_resource_access(session_id)
+        if runner_client is None:
+            raise HTTPException(status_code=404, detail="workflow not found")
+        try:
+            response = await runner_client.get(
+                f"/v1/sessions/{session_id}/workflows/{workflow_id}", timeout=10.0
+            )
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail="runner workflow endpoint failed") from exc
+        if response.status_code == 404:
+            raise HTTPException(status_code=404, detail="workflow not found")
+        if response.status_code != 200:
+            raise HTTPException(status_code=502, detail="runner workflow endpoint failed")
+        body = response.json()
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=502, detail="runner workflow response was malformed")
+        return JSONResponse(status_code=200, content=body)
 
     # ── Phase 1b: typed resource collections & terminal lifecycle ──
 

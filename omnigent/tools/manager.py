@@ -38,6 +38,11 @@ from omnigent.tools.builtins import (
     SysSessionShareTool,
     SysTimerCancelTool,
     SysTimerSetTool,
+    SysWorkflowAmendTool,
+    SysWorkflowCancelTool,
+    SysWorkflowGetTool,
+    SysWorkflowStartTool,
+    SysWorkflowSubmitTool,
     UpdateCommentTool,
     any_skill_has_resources,
     get_builtin_tool,
@@ -172,6 +177,7 @@ class ToolManager:
         # as ``sys_call_async``, but with ``kind="timer"`` so they
         # don't block end-of-turn auto-collect.
         self._register_timer_tools()
+        self._register_workflow_tools()
         # Task lifecycle builtin (sys_cancel_task) is auto-enabled
         # at the end so any AP-created background handle can point
         # at a stable cancel tool.
@@ -265,6 +271,20 @@ class ToolManager:
                 raise ValueError(
                     f"sys_timer_* tool {tool.name()!r} collides with an already-registered tool"
                 )
+            self._tools[tool.name()] = tool
+
+    def _register_workflow_tools(self) -> None:
+        """Register static DAG tools when the agent opts into workflows."""
+        workflows = getattr(self._spec, "workflows", None)
+        if workflows is None or not getattr(workflows, "enabled", False):
+            return
+        for tool in (
+            SysWorkflowSubmitTool(),
+            SysWorkflowAmendTool(),
+            SysWorkflowStartTool(),
+            SysWorkflowGetTool(),
+            SysWorkflowCancelTool(),
+        ):
             self._tools[tool.name()] = tool
 
     def _register_skill_tools(self) -> None:

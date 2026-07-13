@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from omnigent.dag_workflows.models import WorkflowRuntimeConfig
 from omnigent.errors import OmnigentError
 from omnigent.spec.types import (
     AgentSpec,
@@ -25,6 +26,25 @@ from omnigent.tools import ToolManager
 from omnigent.tools.base import ToolContext
 from omnigent.tools.client_specified import ClientSideTool, ClientSideToolSpec
 from omnigent.tools.mcp import clear_discovery_cache
+
+
+def test_workflow_tools_are_opt_in() -> None:
+    disabled = set(ToolManager(AgentSpec(spec_version=1)).get_tool_names())
+    enabled = set(
+        ToolManager(
+            AgentSpec(spec_version=1, workflows=WorkflowRuntimeConfig(enabled=True))
+        ).get_tool_names()
+    )
+    names = {
+        "sys_workflow_submit",
+        "sys_workflow_amend",
+        "sys_workflow_start",
+        "sys_workflow_get",
+        "sys_workflow_cancel",
+    }
+    assert names.isdisjoint(disabled)
+    assert names <= enabled
+
 
 _TEST_CTX = ToolContext(task_id="task_test", agent_id="agent_test")
 

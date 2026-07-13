@@ -3,6 +3,7 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type ChildSessionInfo, useChildSessions } from "@/hooks/useChildSessions";
 import { useSession } from "@/hooks/useSession";
+import { type WorkflowSummary, useWorkflows } from "@/hooks/useWorkflows";
 import {
   buildTree,
   childActivity,
@@ -29,6 +30,12 @@ vi.mock("./SubagentsGraphView", () => ({
   ),
 }));
 
+vi.mock("./WorkflowGraphView", () => ({
+  WorkflowGraphView: (props: Record<string, unknown>) => (
+    <div data-testid="workflow-graph-view" data-root-session-id={props.rootSessionId} />
+  ),
+}));
+
 vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/hooks/useChildSessions")>()),
   useChildSessions: vi.fn(),
@@ -36,6 +43,11 @@ vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
 
 vi.mock("@/hooks/useSession", () => ({
   useSession: vi.fn(),
+}));
+
+vi.mock("@/hooks/useWorkflows", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/hooks/useWorkflows")>()),
+  useWorkflows: vi.fn(),
 }));
 
 vi.mock("@/components/icons/ClaudeIcon", () => ({
@@ -56,6 +68,7 @@ vi.mock("@/components/icons/OttoIcon", () => ({
 
 const useChildSessionsMock = vi.mocked(useChildSessions);
 const useSessionMock = vi.mocked(useSession);
+const useWorkflowsMock = vi.mocked(useWorkflows);
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -134,7 +147,9 @@ function leaf(id: string, overrides: Partial<TreeNode> = {}): TreeNode {
 beforeEach(() => {
   useChildSessionsMock.mockReset();
   useSessionMock.mockReset();
+  useWorkflowsMock.mockReset();
   useSessionMock.mockReturnValue(defaultSession() as ReturnType<typeof useSession>);
+  useWorkflowsMock.mockReturnValue({ workflows: [], isLoading: false, error: null });
 });
 
 afterEach(cleanup);
@@ -457,6 +472,32 @@ describe("buildTree", () => {
 // ===========================================================================
 
 describe("SubagentsPanel view-mode toggle", () => {
+  it("shows workflow mode only when a DAG exists", async () => {
+    useChildSessionsMock.mockReturnValue({ children: [], isLoading: false, error: null });
+    const workflow = {
+      workflow_id: "wf",
+      name: "Workflow",
+      version: 1,
+      definition_hash: "hash",
+      status: "running",
+      blocked_reason: null,
+      dispatch_count: 0,
+      spent_cost_usd: 0,
+      created_at: 1,
+      updated_at: 1,
+      nodes: [],
+    } satisfies WorkflowSummary;
+    useWorkflowsMock.mockReturnValue({ workflows: [workflow], isLoading: false, error: null });
+
+    renderPanel();
+    fireEvent.click(screen.getByTestId("view-mode-workflow"));
+
+    expect(await screen.findByTestId("workflow-graph-view")).toHaveAttribute(
+      "data-root-session-id",
+      "conv_root",
+    );
+  });
+
   it("defaults to list view", () => {
     useChildSessionsMock.mockReturnValue({ children: [], isLoading: false, error: null });
 

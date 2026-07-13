@@ -2,7 +2,37 @@
 
 import { describe, expect, it } from "vitest";
 import { parseEvent } from "./sse";
-import type { SessionStatusEvent, SessionSupersededEvent, TextDelta } from "./events";
+import type {
+  SessionStatusEvent,
+  SessionSupersededEvent,
+  SessionWorkflowUpdatedEvent,
+  TextDelta,
+} from "./events";
+
+describe("parseEvent — session.workflow.updated", () => {
+  it("parses a workflow state push", () => {
+    expect(
+      parseEvent("session.workflow.updated", {
+        conversation_id: "conv_parent",
+        workflow: { workflow_id: "wf", status: "running", nodes: [] },
+      }),
+    ).toEqual({
+      type: "session_workflow_updated",
+      conversationId: "conv_parent",
+      workflow: { workflow_id: "wf", status: "running", nodes: [] },
+    } satisfies SessionWorkflowUpdatedEvent);
+  });
+
+  it("rejects malformed workflow pushes", () => {
+    expect(parseEvent("session.workflow.updated", { workflow: {} })).toBeNull();
+    expect(
+      parseEvent("session.workflow.updated", {
+        conversation_id: "conv_parent",
+        workflow: [],
+      }),
+    ).toBeNull();
+  });
+});
 
 describe("parseEvent — response.output_text.delta", () => {
   it("parses a plain delta with no streaming identifiers", () => {

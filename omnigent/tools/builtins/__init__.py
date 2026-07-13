@@ -62,6 +62,13 @@ from omnigent.tools.builtins.timer import (
 )
 from omnigent.tools.builtins.update_comment import UpdateCommentTool
 from omnigent.tools.builtins.web_search import WebSearchTool
+from omnigent.tools.builtins.workflow import (
+    SysWorkflowAmendTool,
+    SysWorkflowCancelTool,
+    SysWorkflowGetTool,
+    SysWorkflowStartTool,
+    SysWorkflowSubmitTool,
+)
 
 __all__ = [
     "BUILTIN_NAMES",
@@ -86,6 +93,11 @@ __all__ = [
     "SysSessionShareTool",
     "SysTimerCancelTool",
     "SysTimerSetTool",
+    "SysWorkflowAmendTool",
+    "SysWorkflowCancelTool",
+    "SysWorkflowGetTool",
+    "SysWorkflowStartTool",
+    "SysWorkflowSubmitTool",
     "UpdateCommentTool",
     "WebSearchTool",
     "any_skill_has_resources",

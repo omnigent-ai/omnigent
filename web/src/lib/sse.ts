@@ -34,6 +34,7 @@ import type {
   RetryEvent,
   SessionChangedFilesInvalidatedEvent,
   SessionChildSessionUpdatedEvent,
+  SessionWorkflowUpdatedEvent,
   SessionModelOptionsEvent,
   SessionCreatedEvent,
   SessionInputConsumedEvent,
@@ -729,6 +730,17 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       childSessionId,
       child: child as Record<string, unknown>,
     } satisfies SessionChildSessionUpdatedEvent;
+  }
+  if (eventType === "session.workflow.updated") {
+    const conversationId = data.conversation_id;
+    const workflow = data.workflow;
+    if (typeof conversationId !== "string" || !conversationId) return null;
+    if (!workflow || typeof workflow !== "object" || Array.isArray(workflow)) return null;
+    return {
+      type: "session_workflow_updated",
+      conversationId,
+      workflow: workflow as Record<string, unknown>,
+    } satisfies SessionWorkflowUpdatedEvent;
   }
   if (eventType === "session.changed_files.invalidated") {
     const sessionId = data.session_id;

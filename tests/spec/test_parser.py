@@ -36,6 +36,22 @@ def test_parse_minimal(agent_dir: Path) -> None:
     assert spec.mcp_servers == []
     assert spec.local_tools == []
     assert spec.sub_agents == []
+    assert spec.workflows is not None
+    assert spec.workflows.enabled is False
+
+
+def test_parse_workflow_limits(agent_dir: Path) -> None:
+    config = {
+        "spec_version": 1,
+        "name": "workflow-agent",
+        "workflows": {"enabled": True, "max_concurrency": 3, "max_nodes": 20},
+    }
+    (agent_dir / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(agent_dir)
+    assert spec.workflows is not None
+    assert spec.workflows.enabled is True
+    assert spec.workflows.max_concurrency == 3
+    assert spec.workflows.max_nodes == 20
 
 
 def test_parse_missing_config_yaml(tmp_path: Path) -> None:

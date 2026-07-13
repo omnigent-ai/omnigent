@@ -29,6 +29,7 @@ import {
   PlusIcon,
   ScanSearchIcon,
   SearchIcon,
+  WorkflowIcon,
 } from "lucide-react";
 import { Link, useLocation } from "@/lib/routing";
 import { Badge } from "@/components/ui/badge";
@@ -47,8 +48,12 @@ import { PiIcon } from "@/components/icons/PiIcon";
 import { Button } from "@/components/ui/button";
 import { RunningDot } from "@/components/RunningDot";
 import { MAX_TREE_DEPTH, useChildSessions, type ChildSessionInfo } from "@/hooks/useChildSessions";
+import { useWorkflows } from "@/hooks/useWorkflows";
 const SubagentsGraphView = lazy(() =>
   import("./SubagentsGraphView").then((m) => ({ default: m.SubagentsGraphView })),
+);
+const WorkflowGraphView = lazy(() =>
+  import("./WorkflowGraphView").then((m) => ({ default: m.WorkflowGraphView })),
 );
 import { useSession } from "@/hooks/useSession";
 import type { SessionItem } from "@/lib/types";
@@ -96,7 +101,7 @@ interface SubagentsPanelProps {
   rootSessionId: string;
 }
 
-type ViewMode = "list" | "graph";
+type ViewMode = "list" | "graph" | "workflow";
 
 export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanelProps) {
   // Every list in the tree polls at TREE_POLL_MS as a staleness floor;
@@ -108,6 +113,7 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
   // busy even when its parent is "idle" (parent parked awaiting the
   // child); the poll + stream together surface that.
   const { children, isLoading, error } = useChildSessions(rootSessionId, TREE_POLL_MS);
+  const { workflows } = useWorkflows(rootSessionId, TREE_POLL_MS);
   const [addOpen, setAddOpen] = useState(false);
   const [viewMode, setViewMode] = useState<ViewMode>("list");
 
@@ -129,10 +135,14 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
     );
   }
 
-  if (viewMode === "graph") {
+  if (viewMode === "graph" || viewMode === "workflow") {
     return (
       <div className="flex h-full min-h-0 flex-col overflow-hidden bg-card">
-        <ViewModeToggle viewMode={viewMode} onViewModeChange={setViewMode} />
+        <ViewModeToggle
+          viewMode={viewMode}
+          onViewModeChange={setViewMode}
+          hasWorkflow={workflows.length > 0}
+        />
         <Suspense
           fallback={
             <div className="flex h-full flex-1 items-center justify-center text-xs text-muted-foreground">
@@ -140,7 +150,11 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
             </div>
           }
         >
-          <SubagentsGraphView conversationId={conversationId} rootSessionId={rootSessionId} />
+          {viewMode === "workflow" ? (
+            <WorkflowGraphView rootSessionId={rootSessionId} />
+          ) : (
+            <SubagentsGraphView conversationId={conversationId} rootSessionId={rootSessionId} />
+          )}
         </Suspense>
       </div>
     );
@@ -148,7 +162,11 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
 
   return (
     <div className="flex h-full min-h-0 flex-col overflow-hidden bg-card">
-      <ViewModeToggle viewMode={viewMode} onViewModeChange={setViewMode} />
+      <ViewModeToggle
+        viewMode={viewMode}
+        onViewModeChange={setViewMode}
+        hasWorkflow={workflows.length > 0}
+      />
       <button
         type="button"
         data-testid="add-agent-button"
@@ -176,9 +194,11 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
 function ViewModeToggle({
   viewMode,
   onViewModeChange,
+  hasWorkflow,
 }: {
   viewMode: ViewMode;
   onViewModeChange: (mode: ViewMode) => void;
+  hasWorkflow: boolean;
 }) {
   return (
     <div className="flex shrink-0 items-center justify-end gap-0.5 border-b px-2 py-1">
@@ -192,6 +212,18 @@ function ViewModeToggle({
       >
         <ListIcon className="size-3.5" />
       </Button>
+      {hasWorkflow && (
+        <Button
+          variant={viewMode === "workflow" ? "secondary" : "ghost"}
+          size="icon-xs"
+          onClick={() => onViewModeChange("workflow")}
+          aria-label="Workflow DAG"
+          title="Workflow DAG"
+          data-testid="view-mode-workflow"
+        >
+          <WorkflowIcon className="size-3.5" />
+        </Button>
+      )}
       <Button
         variant={viewMode === "graph" ? "secondary" : "ghost"}
         size="icon-xs"
@@ -215,14 +247,7 @@ function ViewModeToggle({
 // NOT genuinely fail, so it renders a quiet, non-destructive grey dot rather
 // than the red "Failed" one.
 type AgentActivity =
-  | "launching"
-  | "working"
-  | "awaiting"
-  | "done"
-  | "failed"
-  | "disconnected"
-  | "idle"
-  | "other";
+  "launching" | "working" | "awaiting" | "done" | "failed" | "disconnected" | "idle" | "other";
 
 // Error codes that mean "the runner went away", not "the task failed".
 // ``runner_disconnected`` is published when the SSE relay's tunnel drops

@@ -3804,6 +3804,14 @@ class SessionChildSessionUpdatedEvent(_SSEEventBase):
     child: dict[str, Any]
 
 
+class SessionWorkflowUpdatedEvent(_SSEEventBase):
+    """A runner-local workflow DAG changed state on the parent session."""
+
+    type: Literal["session.workflow.updated"]
+    conversation_id: str
+    workflow: dict[str, Any]
+
+
 class SessionChangedFilesInvalidatedEvent(_SSEEventBase):
     """
     The session's changed-files list may have changed — refetch it.
@@ -3944,6 +3952,7 @@ ServerStreamEvent = Annotated[
     | SessionResourceCreatedEvent
     | SessionResourceDeletedEvent
     | SessionChildSessionUpdatedEvent
+    | SessionWorkflowUpdatedEvent
     | SessionChangedFilesInvalidatedEvent
     | SessionTerminalActivityEvent
     # ── Transient (SSE-only) — incremental token deltas ────────

@@ -13,6 +13,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { OttoIcon } from "@/components/icons/OttoIcon";
 import { type ChildSessionInfo, useChildSessions } from "@/hooks/useChildSessions";
 import { useSession } from "@/hooks/useSession";
+import { useWorkflows } from "@/hooks/useWorkflows";
 import { iconForAgentType, SubagentsPanel } from "./SubagentsPanel";
 
 vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
@@ -24,6 +25,11 @@ vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
 
 vi.mock("@/hooks/useSession", () => ({
   useSession: vi.fn(),
+}));
+
+vi.mock("@/hooks/useWorkflows", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/hooks/useWorkflows")>()),
+  useWorkflows: vi.fn(),
 }));
 
 // Stub the brand logos with plain SVGs so jsdom doesn't have to resolve
@@ -52,6 +58,7 @@ vi.mock("@/components/icons/OttoIcon", () => ({
 
 const useChildSessionsMock = vi.mocked(useChildSessions);
 const useSessionMock = vi.mocked(useSession);
+const useWorkflowsMock = vi.mocked(useWorkflows);
 
 interface RenderOptions {
   /** The conversation in main — used only for active-row highlighting. */
@@ -127,6 +134,8 @@ const ICON_CASES: Array<[string | null, ReturnType<typeof iconForAgentType>]> = 
 beforeEach(() => {
   useChildSessionsMock.mockReset();
   useSessionMock.mockReset();
+  useWorkflowsMock.mockReset();
+  useWorkflowsMock.mockReturnValue({ workflows: [], isLoading: false, error: null });
   // Default: parent's status is idle. Tests override per-case.
   useSessionMock.mockReturnValue({
     session: {
