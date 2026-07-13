@@ -38,6 +38,7 @@ import { SmartRoutingCard } from "./SmartRoutingCard";
 import { TerminalCommandCard } from "./TerminalCommandCard";
 import { ErrorBanner, PolicyDeniedBanner, RetryIndicator } from "./StatusBlocks";
 import { ToolCard, ToolGroupSummary } from "./ToolCard";
+import { parseWorkflowResult, WorkflowResultCard } from "./WorkflowResultCard";
 
 /**
  * Inline-`code` renderer that turns workspace file paths (e.g.
@@ -494,16 +495,38 @@ function renderItem(
 ): ReactNode {
   const key = keyFor(item, index);
   switch (item.kind) {
-    case "text":
+    case "text": {
+      // A workflow node's terminal ``<workflow_result>{...}</workflow_result>``
+      // block renders as a structured card instead of raw JSON; surrounding
+      // agent prose stays as markdown. A malformed block parses to null and
+      // falls through to plain markdown, so nothing is ever swallowed.
+      const workflowResult = parseWorkflowResult(item.text);
       return (
         <div
           key={key}
           data-testid="assistant-text-section"
           className={cn("min-w-0", followsText && "mt-2")}
         >
-          <FilePathAwareMessageResponse>{item.text}</FilePathAwareMessageResponse>
+          {workflowResult ? (
+            <div className="flex flex-col gap-2">
+              {workflowResult.before && (
+                <FilePathAwareMessageResponse>
+                  {workflowResult.before}
+                </FilePathAwareMessageResponse>
+              )}
+              <WorkflowResultCard result={workflowResult.result} raw={workflowResult.raw} />
+              {workflowResult.after && (
+                <FilePathAwareMessageResponse>
+                  {workflowResult.after}
+                </FilePathAwareMessageResponse>
+              )}
+            </div>
+          ) : (
+            <FilePathAwareMessageResponse>{item.text}</FilePathAwareMessageResponse>
+          )}
         </div>
       );
+    }
     case "reasoning":
       return (
         <ReasoningView

@@ -117,6 +117,15 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
   const [addOpen, setAddOpen] = useState(false);
   const [viewMode, setViewMode] = useState<ViewMode>("list");
 
+  // The workflow DAG supersedes the session-spawn network graph: for a
+  // workflow the network graph hangs every node off the shared parent and
+  // shows no real dependencies, which is misleading. When a workflow exists we
+  // hide the network-graph toggle and coerce a lingering "graph" selection to
+  // the DAG so the two never present conflicting dependency pictures.
+  const hasWorkflow = workflows.length > 0;
+  const effectiveViewMode: ViewMode =
+    hasWorkflow && viewMode === "graph" ? "workflow" : viewMode;
+
   // Loading/error states only surface when there's no cached data to
   // show alongside the "main" row. Once any data is available we
   // render the list and let polling refresh it transparently.
@@ -135,13 +144,13 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
     );
   }
 
-  if (viewMode === "graph" || viewMode === "workflow") {
+  if (effectiveViewMode === "graph" || effectiveViewMode === "workflow") {
     return (
       <div className="flex h-full min-h-0 flex-col overflow-hidden bg-card">
         <ViewModeToggle
-          viewMode={viewMode}
+          viewMode={effectiveViewMode}
           onViewModeChange={setViewMode}
-          hasWorkflow={workflows.length > 0}
+          hasWorkflow={hasWorkflow}
         />
         <Suspense
           fallback={
@@ -150,7 +159,7 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
             </div>
           }
         >
-          {viewMode === "workflow" ? (
+          {effectiveViewMode === "workflow" ? (
             <WorkflowGraphView rootSessionId={rootSessionId} />
           ) : (
             <SubagentsGraphView conversationId={conversationId} rootSessionId={rootSessionId} />
@@ -163,9 +172,9 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
   return (
     <div className="flex h-full min-h-0 flex-col overflow-hidden bg-card">
       <ViewModeToggle
-        viewMode={viewMode}
+        viewMode={effectiveViewMode}
         onViewModeChange={setViewMode}
-        hasWorkflow={workflows.length > 0}
+        hasWorkflow={hasWorkflow}
       />
       <button
         type="button"
@@ -212,7 +221,9 @@ function ViewModeToggle({
       >
         <ListIcon className="size-3.5" />
       </Button>
-      {hasWorkflow && (
+      {hasWorkflow ? (
+        // A workflow's DAG replaces the network graph: the session-spawn graph
+        // shows no real dependencies for a workflow, so only offer the DAG.
         <Button
           variant={viewMode === "workflow" ? "secondary" : "ghost"}
           size="icon-xs"
@@ -223,17 +234,18 @@ function ViewModeToggle({
         >
           <WorkflowIcon className="size-3.5" />
         </Button>
+      ) : (
+        <Button
+          variant={viewMode === "graph" ? "secondary" : "ghost"}
+          size="icon-xs"
+          onClick={() => onViewModeChange("graph")}
+          aria-label="Graph view"
+          title="Graph view"
+          data-testid="view-mode-graph"
+        >
+          <NetworkIcon className="size-3.5" />
+        </Button>
       )}
-      <Button
-        variant={viewMode === "graph" ? "secondary" : "ghost"}
-        size="icon-xs"
-        onClick={() => onViewModeChange("graph")}
-        aria-label="Graph view"
-        title="Graph view"
-        data-testid="view-mode-graph"
-      >
-        <NetworkIcon className="size-3.5" />
-      </Button>
     </div>
   );
 }

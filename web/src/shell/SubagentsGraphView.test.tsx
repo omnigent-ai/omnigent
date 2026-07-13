@@ -498,6 +498,61 @@ describe("SubagentsPanel view-mode toggle", () => {
     );
   });
 
+  function withWorkflow(): void {
+    useChildSessionsMock.mockReturnValue({ children: [], isLoading: false, error: null });
+    useWorkflowsMock.mockReturnValue({
+      workflows: [
+        {
+          workflow_id: "wf",
+          name: "Workflow",
+          version: 1,
+          definition_hash: "hash",
+          status: "running",
+          blocked_reason: null,
+          dispatch_count: 0,
+          spent_cost_usd: 0,
+          created_at: 1,
+          updated_at: 1,
+          nodes: [],
+        } satisfies WorkflowSummary,
+      ],
+      isLoading: false,
+      error: null,
+    });
+  }
+
+  it("hides the network-graph toggle when a workflow DAG exists", () => {
+    withWorkflow();
+
+    renderPanel();
+
+    // The DAG supersedes the session-spawn network graph for workflows.
+    expect(screen.getByTestId("view-mode-workflow")).toBeInTheDocument();
+    expect(screen.queryByTestId("view-mode-graph")).toBeNull();
+  });
+
+  it("coerces a stale graph selection to the workflow DAG", async () => {
+    // Start with no workflow, switch to the network graph...
+    mockChildTree({ conv_root: [childInfo({ id: "c1", tool: "researcher" })] });
+    const { rerender } = renderPanel();
+    fireEvent.click(screen.getByTestId("view-mode-graph"));
+    await waitFor(() => {
+      expect(screen.getByTestId("subagents-graph-view")).toBeInTheDocument();
+    });
+
+    // ...then a workflow appears: the view must flip to the DAG, not keep
+    // showing the misleading network graph.
+    withWorkflow();
+    rerender(
+      <MemoryRouter>
+        <SubagentsPanel conversationId="conv_root" rootSessionId="conv_root" />
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByTestId("workflow-graph-view")).toBeInTheDocument();
+    expect(screen.queryByTestId("subagents-graph-view")).toBeNull();
+  });
+
   it("defaults to list view", () => {
     useChildSessionsMock.mockReturnValue({ children: [], isLoading: false, error: null });
 

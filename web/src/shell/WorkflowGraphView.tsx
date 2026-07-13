@@ -1,11 +1,13 @@
 import { useMemo } from "react";
 import type { Node, NodeProps, NodeTypes } from "@xyflow/react";
 import { Background, Handle, Position, ReactFlow } from "@xyflow/react";
-import { Link, useLocation } from "@/lib/routing";
+import { useLocation } from "@/lib/routing";
 import { Badge } from "@/components/ui/badge";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { RunningDot } from "@/components/RunningDot";
 import { useWorkflows, type WorkflowNodeState } from "@/hooks/useWorkflows";
 import { cn } from "@/lib/utils";
+import { WorkflowNodeDetails } from "./WorkflowNodeDetails";
 import {
   buildWorkflowGraphLayout,
   WORKFLOW_NODE_WIDTH,
@@ -36,8 +38,7 @@ function WorkflowNode({ data }: NodeProps<Node<WorkflowGraphNodeData>>) {
   const card = (
     <div
       className={cn(
-        "rounded-lg border px-3 py-2 shadow-sm transition-shadow",
-        node.child_session_id && "cursor-pointer hover:shadow-md",
+        "cursor-pointer rounded-lg border px-3 py-2 shadow-sm transition-shadow hover:shadow-md",
         STATE_STYLE[node.state],
       )}
       style={{ width: WORKFLOW_NODE_WIDTH }}
@@ -63,11 +64,12 @@ function WorkflowNode({ data }: NodeProps<Node<WorkflowGraphNodeData>>) {
   return (
     <>
       <Handle type="target" position={Position.Left} className="!size-1.5 !border-0" />
-      {node.child_session_id ? (
-        <Link to={{ pathname: `/c/${node.child_session_id}`, search }}>{card}</Link>
-      ) : (
-        card
-      )}
+      <Popover>
+        <PopoverTrigger asChild>{card}</PopoverTrigger>
+        <PopoverContent align="start" className="w-72">
+          <WorkflowNodeDetails node={node} search={search} />
+        </PopoverContent>
+      </Popover>
       <Handle type="source" position={Position.Right} className="!size-1.5 !border-0" />
     </>
   );
@@ -113,7 +115,6 @@ export function WorkflowGraphView({ rootSessionId }: { rootSessionId: string }) 
           fitViewOptions={{ padding: 0.25 }}
           nodesDraggable={false}
           nodesConnectable={false}
-          elementsSelectable={false}
           zoomOnDoubleClick={false}
           minZoom={0.35}
           maxZoom={1.5}
