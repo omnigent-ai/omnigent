@@ -9,6 +9,16 @@ Use for any read-only task: investigation, debugging, audit, search, code
 understanding, architecture comparison, failure analysis, or answering a
 repository-specific technical question.
 
+**Simple case → this skill (inbox orchestration). Structured case → a
+workflow.** When the investigation is one or a few independent lenses answered
+in a single round, dispatch via `sys_session_send` and synthesize from the
+inbox, as below. When it has real structure — many parallel sources whose
+findings must be verified and merged, or a debugging effort that needs
+independent hypotheses tested and refuted — build a static DAG instead:
+[[deep-research]] (gather → verify → synthesize) or [[fanout-synthesize]].
+Testing rival hypotheses to avoid self-preferential bias is exactly what the
+DAG's independent-context refuter nodes are for.
+
 ## Procedure
 1. Decompose the question into one or more bounded investigation tasks. Prefer
    two independent lenses for ambiguous or high-stakes questions.

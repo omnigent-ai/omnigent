@@ -9,6 +9,15 @@ The implementer never signs off on its own work — a different model does, and
 review is a sub-agent that returns a structured report, not a transcript
 anyone needs to read through.
 
+**Single PR → this skill. A batch of units → a workflow.** For one diff, run
+the cross-vendor review loop below. When you're reviewing many units at once,
+or want each unit refuted by 2+ independent agents rather than one reviewer,
+express it as a static DAG: [[adversarial-implement]] makes the
+implement → refute → apply loop the graph's structure. The core discipline is
+identical and carries over — a DIFFERENT-vendor reviewer, diff + contract only
+(never the implementer's worktree), issues surfaced not fixed, and the fix-loop
+that re-sends blocking issues to the SAME implementer conversation.
+
 ## Procedure
 1. Get the task's diff — `sys_os_shell("gh pr diff <pr>")` (or
    `git -C .worktrees/<task_id> diff main...HEAD`).

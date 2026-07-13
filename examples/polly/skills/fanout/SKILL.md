@@ -8,6 +8,16 @@ description: Run independent subtasks in parallel — one git worktree and one i
 Use ONLY for subtasks that are parallel-safe (no shared files, no ordering
 dependency).
 
+**When to use a workflow instead.** This skill is inbox-orchestrated: good for
+a flat batch of parallel tasks you supervise turn by turn. Reach for a static
+DAG ([[adversarial-implement]], [[tiered-models]]) when the work has structure
+this skill can't express: units that each need 2+ independent refuters before
+counting as done, a plan node that must finish before implementers fan out, or
+per-node model tiering. The DAG schedules deps + concurrency deterministically
+and wakes you once at the end, rather than you managing waves by hand. The
+worktree-per-task and "polly never merges" rules below apply to workflow
+`implement` nodes too (set each node's `worktree_path`).
+
 ## Procedure
 1. Per task, create an isolated worktree:
    `sys_os_shell("git worktree add .worktrees/<task_id> -b polly/<task_id>")`.
