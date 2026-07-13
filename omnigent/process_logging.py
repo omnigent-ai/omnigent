@@ -17,11 +17,126 @@ from omnigent._platform import IS_POSIX
 DATA_DIR_ENV_VAR = "OMNIGENT_DATA_DIR"
 LOG_LEVEL_ENV_VAR = "OMNIGENT_LOG_LEVEL"
 LOG_TO_STDERR_ENV_VAR = "OMNIGENT_LOG_TO_STDERR"
+LOG_FORCE_COLOR_ENV_VAR = "OMNIGENT_LOG_FORCE_COLOR"
 PROCESS_LOG_FILE_ENV_VAR = "OMNIGENT_PROCESS_LOG_FILE"
 LOG_TTY_FD_ENV_VAR = "OMNIGENT_LOG_TTY_FD"
 
-DEFAULT_LOG_FORMAT = "%(asctime)s %(levelname)s:%(name)s:%(message)s"
-DEFAULT_LOG_DATEFMT = "%Y-%m-%dT%H:%M:%S%z"
+DEFAULT_LOG_SOURCE_WIDTH = 32
+DEFAULT_LOG_FUNC_WIDTH = 18
+DEFAULT_LOG_PREFIX_FORMAT = "%(levelname)s %(asctime)s %(source_name)s %(func_name)s | "
+DEFAULT_LOG_FORMAT = f"{DEFAULT_LOG_PREFIX_FORMAT}%(message)s"
+DEFAULT_LOG_DATEFMT = "%m-%d %H:%M:%S"
+_LEVEL_WIDTH = 5
+_ANSI_RESET = "\x1b[0m"
+_SOURCE_COLOR = "\x1b[34m"
+_FUNCTION_COLOR = "\x1b[35m"
+_LEVEL_NAMES = {
+    logging.WARNING: "WARN",
+    logging.CRITICAL: "CRIT",
+}
+_LEVEL_COLORS = {
+    logging.DEBUG: "\x1b[36m",
+    logging.INFO: "\x1b[32m",
+    logging.WARNING: "\x1b[33m",
+    logging.ERROR: "\x1b[31m",
+    logging.CRITICAL: "\x1b[91m",
+}
+
+
+def format_log_level_name(levelno: int, levelname: str, *, use_colors: bool) -> str:
+    """Return the aligned display level for one log record."""
+    display = _LEVEL_NAMES.get(levelno, levelname)
+    display = display[:_LEVEL_WIDTH].ljust(_LEVEL_WIDTH)
+    color = _LEVEL_COLORS.get(levelno) if use_colors else None
+    return f"{color}{display}{_ANSI_RESET}" if color is not None else display
+
+
+def _compact_field(value: str, width: int) -> str:
+    if len(value) <= width:
+        return value
+    if width <= 3:
+        return value[-width:]
+    return "..." + value[-(width - 3) :]
+
+
+def _color_field(value: str, color: str, *, use_colors: bool) -> str:
+    return f"{color}{value}{_ANSI_RESET}" if use_colors else value
+
+
+def short_logger_name(name: str) -> str:
+    """Return a compact, fixed-column logger source name."""
+    for prefix in ("omnigent.", "omnigent_ui_sdk."):
+        if name.startswith(prefix):
+            name = name[len(prefix) :]
+            break
+    return _compact_field(name, DEFAULT_LOG_SOURCE_WIDTH)
+
+
+def short_function_name(name: str | None) -> str:
+    """Return a compact function name for log display."""
+    return _compact_field(name or "-", DEFAULT_LOG_FUNC_WIDTH)
+
+
+def format_log_source_name(name: str, *, use_colors: bool) -> str:
+    """Return the padded, optionally colored logger source column."""
+    display = short_logger_name(name).ljust(DEFAULT_LOG_SOURCE_WIDTH)
+    return _color_field(display, _SOURCE_COLOR, use_colors=use_colors)
+
+
+def format_log_function_name(name: str | None, *, use_colors: bool) -> str:
+    """Return the padded, optionally colored function column."""
+    display = short_function_name(name).ljust(DEFAULT_LOG_FUNC_WIDTH)
+    return _color_field(display, _FUNCTION_COLOR, use_colors=use_colors)
+
+
+@contextmanager
+def log_record_display_fields(
+    record: logging.LogRecord,
+    *,
+    use_colors: bool,
+    format_level: bool = True,
+) -> Iterator[None]:
+    """Temporarily add Omnigent display columns to a log record."""
+    original_levelname = record.levelname
+    display_fields = ("source_name", "func_name")
+    originals = {
+        field: (field in record.__dict__, record.__dict__.get(field)) for field in display_fields
+    }
+    if format_level:
+        record.levelname = format_log_level_name(
+            record.levelno,
+            original_levelname,
+            use_colors=use_colors,
+        )
+    record.source_name = format_log_source_name(record.name, use_colors=use_colors)
+    record.func_name = format_log_function_name(record.funcName, use_colors=use_colors)
+    try:
+        yield
+    finally:
+        record.levelname = original_levelname
+        for field, (had_field, value) in originals.items():
+            if had_field:
+                setattr(record, field, value)
+            else:
+                record.__dict__.pop(field, None)
+
+
+class TerminalLogFormatter(logging.Formatter):
+    """Formatter for mirrored terminal logs with optional colored levels."""
+
+    def __init__(
+        self,
+        fmt: str = DEFAULT_LOG_FORMAT,
+        datefmt: str = DEFAULT_LOG_DATEFMT,
+        *,
+        use_colors: bool,
+    ) -> None:
+        super().__init__(fmt, datefmt=datefmt)
+        self._use_colors = use_colors
+
+    def format(self, record: logging.LogRecord) -> str:
+        with log_record_display_fields(record, use_colors=self._use_colors):
+            return super().format(record)
 
 
 def data_dir() -> Path:
@@ -114,6 +229,24 @@ def _terminal_stream() -> object | None:
     return None
 
 
+def terminal_supports_color() -> bool:
+    """Return whether the requested terminal mirror can render ANSI colors."""
+    # Omnigent-owned mirrors (omnidev panes) may force ANSI; otherwise NO_COLOR wins.
+    if env_truthy(os.environ.get(LOG_FORCE_COLOR_ENV_VAR)):
+        return True
+    if os.environ.get("NO_COLOR") is not None:
+        return False
+    if env_truthy(os.environ.get("FORCE_COLOR")) or env_truthy(os.environ.get("CLICOLOR_FORCE")):
+        return True
+    fd_value = os.environ.get(LOG_TTY_FD_ENV_VAR)
+    if fd_value and IS_POSIX:
+        try:
+            return os.isatty(int(fd_value))
+        except (OSError, ValueError):
+            return False
+    return sys.stderr.isatty()
+
+
 def terminal_stream_handler() -> logging.Handler:
     """Return a stream handler for the requested terminal mirror."""
     stream = _terminal_stream()
@@ -122,6 +255,11 @@ def terminal_stream_handler() -> logging.Handler:
     handler = logging.StreamHandler(stream)
     handler._omnigent_process_log_stderr = True
     return handler
+
+
+def terminal_log_formatter() -> logging.Formatter:
+    """Return the formatter used by mirrored terminal process logs."""
+    return TerminalLogFormatter(use_colors=terminal_supports_color())
 
 
 def configure_process_logging(
@@ -145,7 +283,7 @@ def configure_process_logging(
         path = create_process_log_path(destination)
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    formatter = logging.Formatter(DEFAULT_LOG_FORMAT, datefmt=DEFAULT_LOG_DATEFMT)
+    formatter = TerminalLogFormatter(use_colors=False)
     handlers: list[logging.Handler] = []
 
     file_handler = logging.FileHandler(path, encoding="utf-8")
@@ -159,7 +297,7 @@ def configure_process_logging(
         stream_handler = terminal_stream_handler()
         if not isinstance(stream_handler, logging.NullHandler):
             stream_handler.setLevel(resolved_level)
-            stream_handler.setFormatter(formatter)
+            stream_handler.setFormatter(terminal_log_formatter())
             handlers.append(stream_handler)
 
     if root:

@@ -36,7 +36,13 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import cast
 
-from omnigent.process_logging import effective_log_level, env_truthy, process_log_dir
+from omnigent.process_logging import (
+    TerminalLogFormatter,
+    effective_log_level,
+    env_truthy,
+    process_log_dir,
+    terminal_supports_color,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -132,7 +138,7 @@ def _redact(text: str) -> str:
     return text
 
 
-class _RedactingFormatter(logging.Formatter):
+class _RedactingFormatter(TerminalLogFormatter):
     """
     Formatter that scrubs obvious secrets from the *final* formatted
     output — after ``%``-interpolation of ``record.args`` and after
@@ -275,8 +281,7 @@ def setup_cli_logging(argv: list[str]) -> CliLogContext:
 
     handler.setFormatter(
         _RedactingFormatter(
-            fmt="%(asctime)s %(levelname)-5s [%(name)s] %(message)s",
-            datefmt="%H:%M:%S",
+            use_colors=False,
         )
     )
 
@@ -284,7 +289,7 @@ def setup_cli_logging(argv: list[str]) -> CliLogContext:
     if env_truthy(os.environ.get("OMNIGENT_LOG_TO_STDERR")) and sys.stderr.isatty():
         stream_handler = logging.StreamHandler(sys.stderr)
         stream_handler.setLevel(log_level)
-        stream_handler.setFormatter(handler.formatter)
+        stream_handler.setFormatter(_RedactingFormatter(use_colors=terminal_supports_color()))
 
     # Wire our two package hierarchies at the effective level so their records reach
     # the file handler.

@@ -58,6 +58,11 @@ from omnigent.cli import (
 )
 from omnigent.errors import OmnigentError
 from omnigent.onboarding.ambient import DetectedProvider
+from omnigent.process_logging import (
+    DEFAULT_LOG_DATEFMT,
+    DEFAULT_LOG_FORMAT,
+    DEFAULT_LOG_PREFIX_FORMAT,
+)
 from omnigent.runner.identity import (
     RUNNER_ID_ENV_VAR,
     RUNNER_PARENT_PID_ENV_VAR,
@@ -178,9 +183,12 @@ def test_extract_global_logging_flags_preserves_passthrough_args() -> None:
 
 
 def test_server_uvicorn_log_config_uses_terminal_handler_when_requested(
+    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     """Uvicorn logs mirror through the shared terminal handler on request."""
+    monkeypatch.setattr("omnigent.process_logging.terminal_supports_color", lambda: True)
+
     log_config = _server_uvicorn_log_config(tmp_path / "server.log", log_to_stderr=True)
 
     assert log_config["handlers"]["server_terminal"]["()"] == (
@@ -189,6 +197,10 @@ def test_server_uvicorn_log_config_uses_terminal_handler_when_requested(
     assert log_config["handlers"]["server_access_terminal"]["()"] == (
         "omnigent.process_logging.terminal_stream_handler"
     )
+    assert log_config["handlers"]["server_terminal"]["formatter"] == "default"
+    assert log_config["handlers"]["server_access_terminal"]["formatter"] == "access"
+    assert log_config["handlers"]["server_file"]["formatter"] == "default_file"
+    assert log_config["handlers"]["server_access_file"]["formatter"] == "access_file"
     assert log_config["loggers"]["uvicorn"]["handlers"] == [
         "server_terminal",
         "server_file",
@@ -197,6 +209,36 @@ def test_server_uvicorn_log_config_uses_terminal_handler_when_requested(
         "server_access_terminal",
         "server_access_file",
     ]
+
+
+def test_server_uvicorn_log_config_standardizes_timestamp_and_color(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Uvicorn default and access logs include timestamps and terminal colors."""
+    monkeypatch.setattr("omnigent.process_logging.terminal_supports_color", lambda: True)
+
+    log_config = _server_uvicorn_log_config(tmp_path / "server.log", log_to_stderr=True)
+    expected_access_format = (
+        DEFAULT_LOG_PREFIX_FORMAT + '%(client_addr)s - "%(request_line)s" %(status_code)s'
+    )
+
+    assert log_config["formatters"]["default"]["fmt"] == DEFAULT_LOG_FORMAT
+    assert log_config["formatters"]["default_file"]["fmt"] == DEFAULT_LOG_FORMAT
+    assert log_config["formatters"]["access"]["fmt"] == expected_access_format
+    assert log_config["formatters"]["access_file"]["fmt"] == expected_access_format
+    for formatter in (
+        log_config["formatters"]["default"],
+        log_config["formatters"]["access"],
+        log_config["formatters"]["default_file"],
+        log_config["formatters"]["access_file"],
+    ):
+        assert formatter["datefmt"] == DEFAULT_LOG_DATEFMT
+
+    assert log_config["formatters"]["default"]["use_colors"] is True
+    assert log_config["formatters"]["access"]["use_colors"] is True
+    assert log_config["formatters"]["default_file"]["use_colors"] is False
+    assert log_config["formatters"]["access_file"]["use_colors"] is False
 
 
 def test_debug_logs_runner_session_reads_new_and_legacy_dirs(

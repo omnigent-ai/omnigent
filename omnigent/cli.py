@@ -88,9 +88,9 @@ def _server_uvicorn_log_config(
     """
     Return Uvicorn logging config with request-duration access logs.
 
-    Uvicorn emits the FastAPI access line itself, so Omnigent swaps
-    only the access formatter while preserving Uvicorn's default
-    handlers, levels, and server-log formatting.
+    Uvicorn emits the FastAPI access line itself, so Omnigent standardizes
+    its default and access formatters while preserving handler routing and
+    request-duration enrichment.
 
     :param log_path: Optional server process log file. When set, Uvicorn
         default/error/access logs write there.
@@ -99,12 +99,44 @@ def _server_uvicorn_log_config(
     """
     import uvicorn.config
 
-    from omnigent.process_logging import effective_log_level, should_log_to_stderr
-
-    log_config = copy.deepcopy(uvicorn.config.LOGGING_CONFIG)
-    log_config["formatters"]["access"]["()"] = (
-        "omnigent.server.performance_metrics.RequestDurationAccessFormatter"
+    from omnigent.process_logging import (
+        DEFAULT_LOG_DATEFMT,
+        DEFAULT_LOG_FORMAT,
+        DEFAULT_LOG_PREFIX_FORMAT,
+        effective_log_level,
+        should_log_to_stderr,
+        terminal_supports_color,
     )
+
+    access_log_format = (
+        DEFAULT_LOG_PREFIX_FORMAT + '%(client_addr)s - "%(request_line)s" %(status_code)s'
+    )
+    use_terminal_colors = terminal_supports_color()
+    log_config = copy.deepcopy(uvicorn.config.LOGGING_CONFIG)
+    log_config["formatters"]["default"] = {
+        "()": "omnigent.process_logging.TerminalLogFormatter",
+        "fmt": DEFAULT_LOG_FORMAT,
+        "datefmt": DEFAULT_LOG_DATEFMT,
+        "use_colors": use_terminal_colors,
+    }
+    log_config["formatters"]["access"] = {
+        "()": "omnigent.server.performance_metrics.RequestDurationAccessFormatter",
+        "fmt": access_log_format,
+        "datefmt": DEFAULT_LOG_DATEFMT,
+        "use_colors": use_terminal_colors,
+    }
+    log_config["formatters"]["default_file"] = {
+        "()": "omnigent.process_logging.TerminalLogFormatter",
+        "fmt": DEFAULT_LOG_FORMAT,
+        "datefmt": DEFAULT_LOG_DATEFMT,
+        "use_colors": False,
+    }
+    log_config["formatters"]["access_file"] = {
+        "()": "omnigent.server.performance_metrics.RequestDurationAccessFormatter",
+        "fmt": access_log_format,
+        "datefmt": DEFAULT_LOG_DATEFMT,
+        "use_colors": False,
+    }
     if log_path is not None:
         level_name = logging.getLevelName(effective_log_level())
         if not isinstance(level_name, str):
@@ -112,13 +144,13 @@ def _server_uvicorn_log_config(
         mirror = should_log_to_stderr() if log_to_stderr is None else log_to_stderr
         log_config["handlers"]["server_file"] = {
             "class": "logging.FileHandler",
-            "formatter": "default",
+            "formatter": "default_file",
             "filename": str(log_path),
             "encoding": "utf-8",
         }
         log_config["handlers"]["server_access_file"] = {
             "class": "logging.FileHandler",
-            "formatter": "access",
+            "formatter": "access_file",
             "filename": str(log_path),
             "encoding": "utf-8",
         }

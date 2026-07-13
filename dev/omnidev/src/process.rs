@@ -17,8 +17,11 @@ impl ProcSpec {
     fn omnigent_log_env() -> Vec<(String, String)> {
         // Child stderr is a pipe that omnidev reads into its process panes.
         // Let Omnigent's process logger mirror to that pipe despite it not
-        // being a terminal.
-        vec![("OMNIGENT_LOG_TTY_FD".into(), "2".into())]
+        // being a terminal, and force ANSI colors because omnidev parses them.
+        vec![
+            ("OMNIGENT_LOG_TTY_FD".into(), "2".into()),
+            ("OMNIGENT_LOG_FORCE_COLOR".into(), "1".into()),
+        ]
     }
 
     /// `uv run omnigent --log-to-stderr server --host 127.0.0.1 --port <p>
@@ -160,6 +163,13 @@ mod tests {
                     .find(|(key, _)| key == "OMNIGENT_LOG_TTY_FD")
                     .map(|(_, value)| value.as_str()),
                 Some("2")
+            );
+            assert_eq!(
+                spec.extra_env
+                    .iter()
+                    .find(|(key, _)| key == "OMNIGENT_LOG_FORCE_COLOR")
+                    .map(|(_, value)| value.as_str()),
+                Some("1")
             );
         }
     }
