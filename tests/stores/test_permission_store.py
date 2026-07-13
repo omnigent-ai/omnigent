@@ -983,7 +983,7 @@ def test_check_access_public_grant_fallback(store: SqlAlchemyPermissionStore, db
 
 def test_check_access_none_user(store: SqlAlchemyPermissionStore) -> None:
     """check_access returns False when user_id is None."""
-    assert store.check_access(None, "conv_any", required_level=1) is False
+    assert store.check_access(None, "483e55280c4ee1d3ddf0492148f9eeb5", required_level=1) is False
 
 
 def test_check_access_no_grants(store: SqlAlchemyPermissionStore, db_uri: str) -> None:
@@ -1033,7 +1033,7 @@ def test_get_permission_level_public_fallback(
 
 def test_get_permission_level_none_user(store: SqlAlchemyPermissionStore) -> None:
     """get_permission_level returns None for None user_id."""
-    assert store.get_permission_level(None, "conv_any") is None
+    assert store.get_permission_level(None, "483e55280c4ee1d3ddf0492148f9eeb5") is None
 
 
 def test_get_permission_level_no_grants(store: SqlAlchemyPermissionStore, db_uri: str) -> None:

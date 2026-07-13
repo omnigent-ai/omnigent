@@ -33,37 +33,37 @@ class _ConversationStore:
         :returns: None.
         """
         self._conversations = {
-            "conv_proxy": Conversation(
-                id="conv_proxy",
+            "79b22ebd2309e48fdeb450c65611d51b": Conversation(
+                id="79b22ebd2309e48fdeb450c65611d51b",
                 created_at=1,
                 updated_at=1,
-                root_conversation_id="conv_proxy",
-                agent_id="ag_test",
+                root_conversation_id="79b22ebd2309e48fdeb450c65611d51b",
+                agent_id="087b7cb7ac30abf4debfaa578d052ec6",
             ),
-            "conv_local": Conversation(
-                id="conv_local",
+            "5d29bee4350489d66feafecfebd94a97": Conversation(
+                id="5d29bee4350489d66feafecfebd94a97",
                 created_at=1,
                 updated_at=1,
-                root_conversation_id="conv_local",
-                agent_id="ag_test",
+                root_conversation_id="5d29bee4350489d66feafecfebd94a97",
+                agent_id="087b7cb7ac30abf4debfaa578d052ec6",
             ),
-            "conv_claude": Conversation(
-                id="conv_claude",
+            "64a784c3aa907d1774f44313546947c6": Conversation(
+                id="64a784c3aa907d1774f44313546947c6",
                 created_at=1,
                 updated_at=1,
-                root_conversation_id="conv_claude",
-                agent_id="ag_test",
+                root_conversation_id="64a784c3aa907d1774f44313546947c6",
+                agent_id="087b7cb7ac30abf4debfaa578d052ec6",
                 labels={
                     "omnigent.ui": "terminal",
                     "omnigent.wrapper": "claude-code-native-ui",
                 },
             ),
-            "conv_kiro": Conversation(
-                id="conv_kiro",
+            "823dbd1aab969b5a813fac59bb977a77": Conversation(
+                id="823dbd1aab969b5a813fac59bb977a77",
                 created_at=1,
                 updated_at=1,
-                root_conversation_id="conv_kiro",
-                agent_id="ag_kiro",
+                root_conversation_id="823dbd1aab969b5a813fac59bb977a77",
+                agent_id="2c515637c67d0717ad0bebc2747b71bc",
                 labels={
                     "omnigent.ui": "terminal",
                     "omnigent.wrapper": "kiro-native-ui",
@@ -74,14 +74,14 @@ class _ConversationStore:
             # ref and the regular native wrapper label (NOT the
             # internal "-subagent" label), so the native message
             # bypass runs on its first message.
-            "conv_child_native": Conversation(
-                id="conv_child_native",
+            "01d6217454439d2ce8fdace0d4e089b2": Conversation(
+                id="01d6217454439d2ce8fdace0d4e089b2",
                 created_at=1,
                 updated_at=1,
-                root_conversation_id="conv_parent",
+                root_conversation_id="ead6d59a6b650d19dbdf61ec32426f4e",
                 kind="sub_agent",
-                parent_conversation_id="conv_parent",
-                agent_id="ag_test",
+                parent_conversation_id="ead6d59a6b650d19dbdf61ec32426f4e",
+                agent_id="087b7cb7ac30abf4debfaa578d052ec6",
                 labels={
                     "omnigent.ui": "terminal",
                     "omnigent.wrapper": "claude-code-native-ui",
@@ -89,30 +89,30 @@ class _ConversationStore:
             ),
             # A three-level spawn lineage for the file-copy tests:
             # conv_gp (root) -> conv_p (child) -> conv_c (grandchild).
-            "conv_gp": Conversation(
-                id="conv_gp",
+            "46b658cc1407206c877965810133b32f": Conversation(
+                id="46b658cc1407206c877965810133b32f",
                 created_at=1,
                 updated_at=1,
-                root_conversation_id="conv_gp",
-                agent_id="ag_test",
+                root_conversation_id="46b658cc1407206c877965810133b32f",
+                agent_id="087b7cb7ac30abf4debfaa578d052ec6",
             ),
-            "conv_p": Conversation(
-                id="conv_p",
+            "b460374fc8e697b296708f52dc9d8179": Conversation(
+                id="b460374fc8e697b296708f52dc9d8179",
                 created_at=1,
                 updated_at=1,
-                root_conversation_id="conv_gp",
+                root_conversation_id="46b658cc1407206c877965810133b32f",
                 kind="sub_agent",
-                parent_conversation_id="conv_gp",
-                agent_id="ag_test",
+                parent_conversation_id="46b658cc1407206c877965810133b32f",
+                agent_id="087b7cb7ac30abf4debfaa578d052ec6",
             ),
-            "conv_c": Conversation(
-                id="conv_c",
+            "405bfe154d5c0e795a2b87021bc897bf": Conversation(
+                id="405bfe154d5c0e795a2b87021bc897bf",
                 created_at=1,
                 updated_at=1,
-                root_conversation_id="conv_gp",
+                root_conversation_id="46b658cc1407206c877965810133b32f",
                 kind="sub_agent",
-                parent_conversation_id="conv_p",
-                agent_id="ag_test",
+                parent_conversation_id="b460374fc8e697b296708f52dc9d8179",
+                agent_id="087b7cb7ac30abf4debfaa578d052ec6",
             ),
         }
         self.appended_items: list[Any] = []
@@ -275,7 +275,7 @@ class _FakeRunnerClient:
         :param exc: Exception to raise on every request.
         :param exc_paths: Per-URL exception overrides — raise only when
             the request targets that exact path, e.g.
-            ``{"/v1/sessions/conv_x/events": ConnectionError("boom")}``.
+            ``{"/v1/sessions/8af356d908005a65f872c246158c6293/events": ConnectionError("boom")}``.
             Lets a test pass one stage (terminal ensure) and fail the
             next (message forward) on the same client.
         :param responses: Per-URL JSON response overrides.
@@ -479,7 +479,7 @@ def _runner_payload() -> dict[str, object]:
                 "id": DEFAULT_ENVIRONMENT_ID,
                 "object": "session.resource",
                 "type": "environment",
-                "session_id": "conv_proxy",
+                "session_id": "79b22ebd2309e48fdeb450c65611d51b",
                 "name": "Primary environment",
                 "metadata": {
                     "environment_type": "caller_process",
@@ -490,7 +490,7 @@ def _runner_payload() -> dict[str, object]:
                 "id": "terminal_runner_s1",
                 "object": "session.resource",
                 "type": "terminal",
-                "session_id": "conv_proxy",
+                "session_id": "79b22ebd2309e48fdeb450c65611d51b",
                 "name": "runner:s1",
                 "environment": DEFAULT_ENVIRONMENT_ID,
                 "metadata": {
@@ -524,12 +524,12 @@ async def test_get_session_labels_uses_labels_only_path(
     fake_runner = _FakeRunnerClient(payload={"status": "running"})
     set_runner_client(fake_runner)  # type: ignore[arg-type]
 
-    resp = await client.get("/v1/sessions/conv_claude/labels")
+    resp = await client.get("/v1/sessions/64a784c3aa907d1774f44313546947c6/labels")
 
     assert resp.status_code == 200
     assert resp.headers["cache-control"] == "no-store"
     assert resp.json() == {
-        "id": "conv_claude",
+        "id": "64a784c3aa907d1774f44313546947c6",
         "labels": {
             "omnigent.ui": "terminal",
             "omnigent.wrapper": "claude-code-native-ui",
@@ -547,11 +547,13 @@ async def test_list_session_resources_proxies_to_bound_runner(
     fake_router = _FakeRunnerRouter(fake_runner)
     set_runner_router(fake_router)  # type: ignore[arg-type]
 
-    resp = await client.get("/v1/sessions/conv_proxy/resources")
+    resp = await client.get("/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources")
 
     assert resp.status_code == 200
-    assert fake_router.resource_calls == ["conv_proxy"]
-    assert fake_runner.calls == [("GET", "/v1/sessions/conv_proxy/resources")]
+    assert fake_router.resource_calls == ["79b22ebd2309e48fdeb450c65611d51b"]
+    assert fake_runner.calls == [
+        ("GET", "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources")
+    ]
     body = resp.json()
     ids = [resource["id"] for resource in body["data"]]
     assert ids == [DEFAULT_ENVIRONMENT_ID, "terminal_runner_s1"]
@@ -565,7 +567,7 @@ async def test_list_session_resources_validates_session_before_proxy(
     fake_router = _FakeRunnerRouter(fake_runner)
     set_runner_router(fake_router)  # type: ignore[arg-type]
 
-    resp = await client.get("/v1/sessions/conv_missing/resources")
+    resp = await client.get("/v1/sessions/5eca720dc2bc6cdc3a99028d7bd0f917/resources")
 
     assert resp.status_code == 404
     assert resp.json()["error"]["code"] == "not_found"
@@ -582,7 +584,7 @@ async def test_list_session_resources_rejects_malformed_runner_response(
     )
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
 
-    resp = await client.get("/v1/sessions/conv_proxy/resources")
+    resp = await client.get("/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources")
 
     assert resp.status_code == 502
     assert resp.json()["detail"] == "runner session-resources endpoint returned malformed response"
@@ -592,7 +594,7 @@ async def test_list_session_resources_rejects_malformed_runner_response(
 async def test_list_session_resources_local_fallback_lists_default(
     client: httpx.AsyncClient,
 ) -> None:
-    resp = await client.get("/v1/sessions/conv_local/resources")
+    resp = await client.get("/v1/sessions/5d29bee4350489d66feafecfebd94a97/resources")
 
     assert resp.status_code == 200
     body = resp.json()
@@ -601,7 +603,7 @@ async def test_list_session_resources_local_fallback_lists_default(
             "id": DEFAULT_ENVIRONMENT_ID,
             "object": "session.resource",
             "type": "environment",
-            "session_id": "conv_local",
+            "session_id": "5d29bee4350489d66feafecfebd94a97",
             "name": "Primary environment",
             "metadata": {
                 "environment_type": "caller_process",
@@ -627,7 +629,7 @@ async def test_claude_native_message_forwards_to_runner_without_persisting(
     set_runner_client(fake_runner)  # type: ignore[arg-type]
 
     resp = await client.post(
-        "/v1/sessions/conv_claude/events",
+        "/v1/sessions/64a784c3aa907d1774f44313546947c6/events",
         json={
             "type": "message",
             "data": {
@@ -646,12 +648,12 @@ async def test_claude_native_message_forwards_to_runner_without_persisting(
     assert body["queued"] is True
     assert body["pending_id"].startswith("pending_")
     assert fake_runner.calls == [
-        ("POST", "/v1/sessions/conv_claude/resources/terminals"),
-        ("POST", "/v1/sessions/conv_claude/events"),
+        ("POST", "/v1/sessions/64a784c3aa907d1774f44313546947c6/resources/terminals"),
+        ("POST", "/v1/sessions/64a784c3aa907d1774f44313546947c6/events"),
     ]
     assert fake_runner.post_json_calls == [
         (
-            "/v1/sessions/conv_claude/resources/terminals",
+            "/v1/sessions/64a784c3aa907d1774f44313546947c6/resources/terminals",
             {
                 "terminal": "claude",
                 "session_key": "main",
@@ -659,7 +661,7 @@ async def test_claude_native_message_forwards_to_runner_without_persisting(
             },
         ),
         (
-            "/v1/sessions/conv_claude/events",
+            "/v1/sessions/64a784c3aa907d1774f44313546947c6/events",
             {
                 "type": "message",
                 "role": "user",
@@ -668,7 +670,7 @@ async def test_claude_native_message_forwards_to_runner_without_persisting(
                 "harness": "claude-native",
                 # Forwarded so the runner resolves the harness spec on the
                 # first message (before POST /v1/sessions caches it).
-                "agent_id": "ag_test",
+                "agent_id": "087b7cb7ac30abf4debfaa578d052ec6",
             },
         ),
     ]
@@ -685,7 +687,7 @@ async def test_claude_native_assistant_message_rejected_not_forwarded(
     set_runner_client(fake_runner)  # type: ignore[arg-type]
 
     resp = await client.post(
-        "/v1/sessions/conv_claude/events",
+        "/v1/sessions/64a784c3aa907d1774f44313546947c6/events",
         json={
             "type": "message",
             "data": {
@@ -716,7 +718,7 @@ async def test_claude_native_message_surfaces_runner_sse_failure(
     )
     fake_runner = _FakeRunnerClient(
         text_responses={
-            "/v1/sessions/conv_claude/events": (
+            "/v1/sessions/64a784c3aa907d1774f44313546947c6/events": (
                 200,
                 sse,
                 {"content-type": "text/event-stream"},
@@ -727,7 +729,7 @@ async def test_claude_native_message_surfaces_runner_sse_failure(
     set_runner_client(fake_runner)  # type: ignore[arg-type]
 
     resp = await client.post(
-        "/v1/sessions/conv_claude/events",
+        "/v1/sessions/64a784c3aa907d1774f44313546947c6/events",
         json={
             "type": "message",
             "data": {
@@ -742,8 +744,8 @@ async def test_claude_native_message_surfaces_runner_sse_failure(
         "Claude terminal message delivery failed: tmux target missing"
     )
     assert fake_runner.calls == [
-        ("POST", "/v1/sessions/conv_claude/resources/terminals"),
-        ("POST", "/v1/sessions/conv_claude/events"),
+        ("POST", "/v1/sessions/64a784c3aa907d1774f44313546947c6/resources/terminals"),
+        ("POST", "/v1/sessions/64a784c3aa907d1774f44313546947c6/events"),
     ]
 
 
@@ -766,7 +768,7 @@ async def test_claude_native_message_tunnel_close_mid_forward_returns_502(
         exc_paths={
             # Ensure (terminals POST) succeeds via the default payload;
             # only the message-forward leg drops the tunnel.
-            "/v1/sessions/conv_claude/events": ConnectionError(
+            "/v1/sessions/64a784c3aa907d1774f44313546947c6/events": ConnectionError(
                 "tunnel closed before request completed"
             ),
         },
@@ -775,7 +777,7 @@ async def test_claude_native_message_tunnel_close_mid_forward_returns_502(
     set_runner_client(fake_runner)  # type: ignore[arg-type]
 
     resp = await client.post(
-        "/v1/sessions/conv_claude/events",
+        "/v1/sessions/64a784c3aa907d1774f44313546947c6/events",
         json={
             "type": "message",
             "data": {
@@ -791,8 +793,8 @@ async def test_claude_native_message_tunnel_close_mid_forward_returns_502(
     assert resp.json()["detail"] == "Claude terminal message delivery failed"
     # Ensure ran (and passed) before the forward leg hit the drop.
     assert fake_runner.calls == [
-        ("POST", "/v1/sessions/conv_claude/resources/terminals"),
-        ("POST", "/v1/sessions/conv_claude/events"),
+        ("POST", "/v1/sessions/64a784c3aa907d1774f44313546947c6/resources/terminals"),
+        ("POST", "/v1/sessions/64a784c3aa907d1774f44313546947c6/events"),
     ]
 
 
@@ -825,7 +827,7 @@ async def test_native_subagent_terminal_boot_failure_wakes_parent(
     # bypass takes the terminal-failure branch.
     fake_runner = _FakeRunnerClient(
         responses={
-            "/v1/sessions/conv_child_native/resources/terminals": (
+            "/v1/sessions/01d6217454439d2ce8fdace0d4e089b2/resources/terminals": (
                 503,
                 {
                     "error": {
@@ -840,7 +842,7 @@ async def test_native_subagent_terminal_boot_failure_wakes_parent(
     set_runner_client(fake_runner)  # type: ignore[arg-type]
 
     resp = await client.post(
-        "/v1/sessions/conv_child_native/events",
+        "/v1/sessions/01d6217454439d2ce8fdace0d4e089b2/events",
         json={
             "type": "message",
             "data": {
@@ -858,8 +860,8 @@ async def test_native_subagent_terminal_boot_failure_wakes_parent(
     # parent-wake status forward. A third call, or the forward missing,
     # both indicate a regression.
     assert fake_runner.calls == [
-        ("POST", "/v1/sessions/conv_child_native/resources/terminals"),
-        ("POST", "/v1/sessions/conv_child_native/events"),
+        ("POST", "/v1/sessions/01d6217454439d2ce8fdace0d4e089b2/resources/terminals"),
+        ("POST", "/v1/sessions/01d6217454439d2ce8fdace0d4e089b2/events"),
     ], f"expected ensure + status-forward; saw {fake_runner.calls!r}"
 
     # The second POST is the parent-wake edge. It must be a failed
@@ -868,7 +870,7 @@ async def test_native_subagent_terminal_boot_failure_wakes_parent(
     # (runner: ``output or "...turn failed"``). Asserting the exact
     # payload proves the parent is notified — not left running forever.
     forward_url, forward_body = fake_runner.post_json_calls[-1]
-    assert forward_url == "/v1/sessions/conv_child_native/events"
+    assert forward_url == "/v1/sessions/01d6217454439d2ce8fdace0d4e089b2/events"
     assert forward_body == {
         "type": "external_session_status",
         "data": {
@@ -897,7 +899,7 @@ async def test_native_subagent_terminal_boot_failure_surfaces_unreachable_runner
     """
     fake_runner = _FakeRunnerClient(
         responses={
-            "/v1/sessions/conv_child_native/resources/terminals": (
+            "/v1/sessions/01d6217454439d2ce8fdace0d4e089b2/resources/terminals": (
                 503,
                 {
                     "error": {
@@ -935,7 +937,7 @@ async def test_native_subagent_terminal_boot_failure_surfaces_unreachable_runner
     set_runner_client(fake_runner)  # type: ignore[arg-type]
 
     resp = await client.post(
-        "/v1/sessions/conv_child_native/events",
+        "/v1/sessions/01d6217454439d2ce8fdace0d4e089b2/events",
         json={
             "type": "message",
             "data": {
@@ -949,7 +951,10 @@ async def test_native_subagent_terminal_boot_failure_surfaces_unreachable_runner
     # be delivered, so the route must not pretend the message landed.
     assert resp.status_code == 503, resp.text
     # The forward was attempted on the child's events endpoint.
-    assert fake_runner.post_json_calls[-1][0] == "/v1/sessions/conv_child_native/events"
+    assert (
+        fake_runner.post_json_calls[-1][0]
+        == "/v1/sessions/01d6217454439d2ce8fdace0d4e089b2/events"
+    )
     assert fake_runner.post_json_calls[-1][1]["type"] == "external_session_status"
     assert fake_runner.post_json_calls[-1][1]["data"]["status"] == "failed"
 
@@ -966,7 +971,7 @@ def _env_only_payload() -> dict[str, object]:
                 "id": DEFAULT_ENVIRONMENT_ID,
                 "object": "session.resource",
                 "type": "environment",
-                "session_id": "conv_proxy",
+                "session_id": "79b22ebd2309e48fdeb450c65611d51b",
                 "name": "Primary environment",
                 "metadata": {"environment_type": "caller_process", "role": "primary"},
             },
@@ -983,7 +988,7 @@ def _single_resource_payload() -> dict[str, object]:
         "id": DEFAULT_ENVIRONMENT_ID,
         "object": "session.resource",
         "type": "environment",
-        "session_id": "conv_proxy",
+        "session_id": "79b22ebd2309e48fdeb450c65611d51b",
         "name": "Primary environment",
         "metadata": {"environment_type": "caller_process", "role": "primary"},
     }
@@ -997,12 +1002,12 @@ async def test_list_environments_proxies_to_runner(
     fake_runner = _FakeRunnerClient(payload=_env_only_payload())
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
 
-    resp = await client.get("/v1/sessions/conv_proxy/resources/environments")
+    resp = await client.get("/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments")
 
     assert resp.status_code == 200
     assert resp.json()["object"] == "list"
     assert fake_runner.calls == [
-        ("GET", "/v1/sessions/conv_proxy/resources/environments"),
+        ("GET", "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments"),
     ]
 
 
@@ -1022,12 +1027,12 @@ async def test_list_terminals_forwards_pagination_params_to_runner(
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
 
     resp = await client.get(
-        "/v1/sessions/conv_proxy/resources/terminals?order=asc&limit=1000&bogus=1",
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals?order=asc&limit=1000&bogus=1",
     )
 
     assert resp.status_code == 200
     assert fake_runner.calls == [
-        ("GET", "/v1/sessions/conv_proxy/resources/terminals"),
+        ("GET", "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals"),
     ]
     # Exactly the runner endpoint's supported pagination params are
     # forwarded; an unknown param (``bogus``) must be dropped so the
@@ -1045,7 +1050,7 @@ async def test_list_environments_rejects_unknown_session(
     fake_runner = _FakeRunnerClient(payload=_env_only_payload())
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
 
-    resp = await client.get("/v1/sessions/conv_missing/resources/environments")
+    resp = await client.get("/v1/sessions/5eca720dc2bc6cdc3a99028d7bd0f917/resources/environments")
 
     assert resp.status_code == 404
     assert not fake_runner.calls
@@ -1059,12 +1064,17 @@ async def test_get_resource_by_id_proxies_to_runner(
     fake_runner = _FakeRunnerClient(payload=_single_resource_payload())
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
 
-    resp = await client.get(f"/v1/sessions/conv_proxy/resources/{DEFAULT_ENVIRONMENT_ID}")
+    resp = await client.get(
+        f"/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/{DEFAULT_ENVIRONMENT_ID}"
+    )
 
     assert resp.status_code == 200
     assert resp.json()["id"] == DEFAULT_ENVIRONMENT_ID
     assert fake_runner.calls == [
-        ("GET", f"/v1/sessions/conv_proxy/resources/{DEFAULT_ENVIRONMENT_ID}"),
+        (
+            "GET",
+            f"/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/{DEFAULT_ENVIRONMENT_ID}",
+        ),
     ]
 
 
@@ -1075,7 +1085,7 @@ async def test_get_resource_by_id_404_from_runner(
     """GET /resources/{id} surfaces runner 404."""
     fake_runner = _FakeRunnerClient(
         responses={
-            "/v1/sessions/conv_proxy/resources/nonexistent": (
+            "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/nonexistent": (
                 404,
                 {"error": {"code": "not_found", "message": "Resource 'nonexistent' not found"}},
             ),
@@ -1083,7 +1093,7 @@ async def test_get_resource_by_id_404_from_runner(
     )
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
 
-    resp = await client.get("/v1/sessions/conv_proxy/resources/nonexistent")
+    resp = await client.get("/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/nonexistent")
 
     assert resp.status_code == 404
     assert resp.json()["error"]["code"] == "not_found"
@@ -1124,7 +1134,7 @@ async def test_create_terminal_proxies_to_runner(
         "id": "terminal_bash_s1",
         "object": "session.resource",
         "type": "terminal",
-        "session_id": "conv_proxy",
+        "session_id": "79b22ebd2309e48fdeb450c65611d51b",
         "name": "bash:s1",
         "environment": DEFAULT_ENVIRONMENT_ID,
         "metadata": {
@@ -1137,14 +1147,14 @@ async def test_create_terminal_proxies_to_runner(
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
 
     resp = await client.post(
-        "/v1/sessions/conv_proxy/resources/terminals",
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals",
         json={"terminal": "bash", "session_key": "s1"},
     )
 
     assert resp.status_code == 200
     assert resp.json()["id"] == "terminal_bash_s1"
     assert fake_runner.calls == [
-        ("POST", "/v1/sessions/conv_proxy/resources/terminals"),
+        ("POST", "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals"),
     ]
 
 
@@ -1163,7 +1173,7 @@ async def test_create_terminal_rejected_without_agent_terminal_access(
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
 
     resp = await client.post(
-        "/v1/sessions/conv_proxy/resources/terminals",
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals",
         json={"terminal": "bash", "session_key": "s1"},
     )
 
@@ -1189,7 +1199,7 @@ async def test_create_terminal_rejected_for_undeclared_name(
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
 
     resp = await client.post(
-        "/v1/sessions/conv_proxy/resources/terminals",
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals",
         json={"terminal": "zsh", "session_key": "s1"},
     )
 
@@ -1218,7 +1228,7 @@ async def test_create_terminal_native_bootstrap_exempt_from_gate(
         "id": "terminal_claude_main",
         "object": "session.resource",
         "type": "terminal",
-        "session_id": "conv_proxy",
+        "session_id": "79b22ebd2309e48fdeb450c65611d51b",
         "name": "claude:main",
         "metadata": {"terminal_name": "claude", "session_key": "main", "running": True},
     }
@@ -1226,14 +1236,14 @@ async def test_create_terminal_native_bootstrap_exempt_from_gate(
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
 
     resp = await client.post(
-        "/v1/sessions/conv_proxy/resources/terminals",
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals",
         json={"terminal": "claude", "session_key": "main", "ensure_native_terminal": True},
     )
 
     assert resp.status_code == 200
     assert resp.json()["id"] == "terminal_claude_main"
     assert fake_runner.calls == [
-        ("POST", "/v1/sessions/conv_proxy/resources/terminals"),
+        ("POST", "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals"),
     ]
 
 
@@ -1273,7 +1283,7 @@ async def test_create_terminal_bootstrap_markers_do_not_bypass_gate_for_other_sh
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
 
     resp = await client.post(
-        "/v1/sessions/conv_proxy/resources/terminals",
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals",
         json=body,
     )
 
@@ -1344,7 +1354,7 @@ async def test_create_terminal_surfaces_runner_error_without_crashing(
         surface.
     :returns: None.
     """
-    path = "/v1/sessions/conv_proxy/resources/terminals"
+    path = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals"
     fake_runner = _FakeRunnerClient(responses={path: (runner_status, runner_payload)})
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
 
@@ -1379,13 +1389,16 @@ async def test_delete_terminal_proxies_to_runner(
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
 
     resp = await client.delete(
-        "/v1/sessions/conv_proxy/resources/terminals/terminal_bash_s1",
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals/terminal_bash_s1",
     )
 
     assert resp.status_code == 200
     assert resp.json()["deleted"] is True
     assert fake_runner.calls == [
-        ("DELETE", "/v1/sessions/conv_proxy/resources/terminals/terminal_bash_s1"),
+        (
+            "DELETE",
+            "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals/terminal_bash_s1",
+        ),
     ]
 
 
@@ -1398,7 +1411,7 @@ async def test_transfer_terminal_authorizes_sessions_and_proxies_to_runner(
         "id": "terminal_bash_s1",
         "object": "session.resource",
         "type": "terminal",
-        "session_id": "conv_local",
+        "session_id": "5d29bee4350489d66feafecfebd94a97",
         "name": "bash:s1",
         "environment": DEFAULT_ENVIRONMENT_ID,
         "metadata": {
@@ -1412,22 +1425,25 @@ async def test_transfer_terminal_authorizes_sessions_and_proxies_to_runner(
     set_runner_router(router)  # type: ignore[arg-type]
 
     resp = await client.post(
-        "/v1/sessions/conv_proxy/resources/terminals/terminal_bash_s1/transfer",
-        json={"target_session_id": "conv_local"},
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals/terminal_bash_s1/transfer",
+        json={"target_session_id": "5d29bee4350489d66feafecfebd94a97"},
     )
 
     assert resp.status_code == 200
-    assert resp.json()["session_id"] == "conv_local"
+    assert resp.json()["session_id"] == "5d29bee4350489d66feafecfebd94a97"
     assert fake_runner.calls == [
-        ("POST", "/v1/sessions/conv_proxy/resources/terminals/terminal_bash_s1/transfer"),
+        (
+            "POST",
+            "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals/terminal_bash_s1/transfer",
+        ),
     ]
     assert fake_runner.post_json_calls == [
         (
-            "/v1/sessions/conv_proxy/resources/terminals/terminal_bash_s1/transfer",
-            {"target_session_id": "conv_local"},
+            "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals/terminal_bash_s1/transfer",
+            {"target_session_id": "5d29bee4350489d66feafecfebd94a97"},
         ),
     ]
-    assert router.resource_calls == ["conv_proxy"]
+    assert router.resource_calls == ["79b22ebd2309e48fdeb450c65611d51b"]
 
 
 @pytest.mark.asyncio
@@ -1492,11 +1508,12 @@ async def test_transfer_terminal_surfaces_runner_error_without_crashing(
         surface.
     :returns: None.
     """
-    path = "/v1/sessions/conv_proxy/resources/terminals/terminal_bash_s1/transfer"
+    session_id = "79b22ebd2309e48fdeb450c65611d51b"
+    path = f"/v1/sessions/{session_id}/resources/terminals/terminal_bash_s1/transfer"
     fake_runner = _FakeRunnerClient(responses={path: (runner_status, runner_payload)})
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
 
-    resp = await client.post(path, json={"target_session_id": "conv_local"})
+    resp = await client.post(path, json={"target_session_id": "5d29bee4350489d66feafecfebd94a97"})
 
     # http_status is derived from the surfaced code: 503 proves the runner's
     # ``runner_unavailable`` propagated; a 500 would mean it was masked by the
@@ -1520,7 +1537,7 @@ async def test_delete_terminal_surfaces_runner_404(
     """DELETE /resources/terminals/{id} surfaces runner 404."""
     fake_runner = _FakeRunnerClient(
         responses={
-            "/v1/sessions/conv_proxy/resources/terminals/terminal_nope_s1": (
+            "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals/terminal_nope_s1": (
                 404,
                 {"error": {"code": "not_found", "message": "Terminal not found"}},
             ),
@@ -1529,7 +1546,7 @@ async def test_delete_terminal_surfaces_runner_404(
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
 
     resp = await client.delete(
-        "/v1/sessions/conv_proxy/resources/terminals/terminal_nope_s1",
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals/terminal_nope_s1",
     )
 
     assert resp.status_code == 404
@@ -1640,19 +1657,19 @@ async def test_upload_and_list_session_files(
 ) -> None:
     """POST + GET /resources/files round-trips through server."""
     resp = await file_client.post(
-        "/v1/sessions/conv_proxy/resources/files",
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/files",
         files={"file": ("report.txt", b"hello world", "text/plain")},
     )
     assert resp.status_code == 201
     body = resp.json()
     assert body["object"] == "session.resource"
     assert body["type"] == "file"
-    assert body["session_id"] == "conv_proxy"
+    assert body["session_id"] == "79b22ebd2309e48fdeb450c65611d51b"
     assert body["name"] == "report.txt"
     file_id = body["id"]
 
     list_resp = await file_client.get(
-        "/v1/sessions/conv_proxy/resources/files",
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/files",
     )
     assert list_resp.status_code == 200
     ids = [f["id"] for f in list_resp.json()["data"]]
@@ -1665,13 +1682,13 @@ async def test_get_session_file_validates_ownership(
 ) -> None:
     """GET /resources/files/{id} 404s for wrong session."""
     upload = await file_client.post(
-        "/v1/sessions/conv_proxy/resources/files",
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/files",
         files={"file": ("owned.txt", b"data", "text/plain")},
     )
     file_id = upload.json()["id"]
 
     resp = await file_client.get(
-        f"/v1/sessions/conv_local/resources/files/{file_id}",
+        f"/v1/sessions/5d29bee4350489d66feafecfebd94a97/resources/files/{file_id}",
     )
     assert resp.status_code == 404
 
@@ -1682,13 +1699,13 @@ async def test_download_session_file_content(
 ) -> None:
     """GET /resources/files/{id}/content returns raw bytes."""
     upload = await file_client.post(
-        "/v1/sessions/conv_proxy/resources/files",
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/files",
         files={"file": ("hello.txt", b"hello world", "text/plain")},
     )
     file_id = upload.json()["id"]
 
     resp = await file_client.get(
-        f"/v1/sessions/conv_proxy/resources/files/{file_id}/content",
+        f"/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/files/{file_id}/content",
     )
     assert resp.status_code == 200
     assert resp.content == b"hello world"
@@ -1715,7 +1732,7 @@ async def test_download_session_file_html_is_attachment_not_inline(
     nosniff headers neutralize that.
     """
     upload = await file_client.post(
-        "/v1/sessions/conv_proxy/resources/files",
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/files",
         files={
             "file": (
                 "evil.html",
@@ -1727,7 +1744,7 @@ async def test_download_session_file_html_is_attachment_not_inline(
     file_id = upload.json()["id"]
 
     resp = await file_client.get(
-        f"/v1/sessions/conv_proxy/resources/files/{file_id}/content",
+        f"/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/files/{file_id}/content",
     )
     assert resp.status_code == 200
     # The bytes are still served verbatim — we don't mangle content,
@@ -1746,19 +1763,19 @@ async def test_delete_session_file(
 ) -> None:
     """DELETE /resources/files/{id} removes the file."""
     upload = await file_client.post(
-        "/v1/sessions/conv_proxy/resources/files",
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/files",
         files={"file": ("temp.txt", b"gone", "text/plain")},
     )
     file_id = upload.json()["id"]
 
     resp = await file_client.delete(
-        f"/v1/sessions/conv_proxy/resources/files/{file_id}",
+        f"/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/files/{file_id}",
     )
     assert resp.status_code == 200
     assert resp.json()["deleted"] is True
 
     get_resp = await file_client.get(
-        f"/v1/sessions/conv_proxy/resources/files/{file_id}",
+        f"/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/files/{file_id}",
     )
     assert get_resp.status_code == 404
 
@@ -1792,26 +1809,28 @@ def test_ancestor_session_ids_stops_on_parent_cycle(
     file_conv_store: _ConversationStore,
 ) -> None:
     """A malformed parent cycle terminates at the first repeated session."""
-    file_conv_store._conversations["conv_cycle_a"] = Conversation(
-        id="conv_cycle_a",
+    file_conv_store._conversations["1c5312db831f2aff90bd83b0acb5b98a"] = Conversation(
+        id="1c5312db831f2aff90bd83b0acb5b98a",
         created_at=1,
         updated_at=1,
-        root_conversation_id="conv_cycle_a",
+        root_conversation_id="1c5312db831f2aff90bd83b0acb5b98a",
         kind="sub_agent",
-        parent_conversation_id="conv_cycle_b",
-        agent_id="ag_test",
+        parent_conversation_id="1204226336299fc62295d6aa5cc5975b",
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
     )
-    file_conv_store._conversations["conv_cycle_b"] = Conversation(
-        id="conv_cycle_b",
+    file_conv_store._conversations["1204226336299fc62295d6aa5cc5975b"] = Conversation(
+        id="1204226336299fc62295d6aa5cc5975b",
         created_at=1,
         updated_at=1,
-        root_conversation_id="conv_cycle_a",
+        root_conversation_id="1c5312db831f2aff90bd83b0acb5b98a",
         kind="sub_agent",
-        parent_conversation_id="conv_cycle_a",
-        agent_id="ag_test",
+        parent_conversation_id="1c5312db831f2aff90bd83b0acb5b98a",
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
     )
 
-    assert _ancestor_session_ids(file_conv_store, "conv_cycle_a") == ["conv_cycle_b"]
+    assert _ancestor_session_ids(file_conv_store, "1c5312db831f2aff90bd83b0acb5b98a") == [
+        "1204226336299fc62295d6aa5cc5975b"
+    ]
 
 
 @pytest.mark.asyncio
@@ -1820,16 +1839,18 @@ async def test_copy_files_from_direct_parent(
     file_store: Any,
 ) -> None:
     """A child copies one parent-owned file into its own namespace."""
-    parent_file = await _upload_file(file_client, "conv_p", "doc.txt", b"parent bytes")
+    parent_file = await _upload_file(
+        file_client, "b460374fc8e697b296708f52dc9d8179", "doc.txt", b"parent bytes"
+    )
 
     resp = await file_client.post(
-        "/v1/sessions/conv_c/resources/files:copy",
-        json={"source_session_id": "conv_p", "file_ids": [parent_file]},
+        "/v1/sessions/405bfe154d5c0e795a2b87021bc897bf/resources/files:copy",
+        json={"source_session_id": "b460374fc8e697b296708f52dc9d8179", "file_ids": [parent_file]},
     )
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["object"] == "session.files.copied"
-    assert body["session_id"] == "conv_c"
+    assert body["session_id"] == "405bfe154d5c0e795a2b87021bc897bf"
     entry = body["mapping"][parent_file]
     new_id = entry["new_id"]
     # A copy, not an alias: the new row is distinct from the source.
@@ -1840,15 +1861,15 @@ async def test_copy_files_from_direct_parent(
     assert entry["content_type"] == "text/plain"
 
     # The new row is child-scoped and readable by the child only.
-    copied = file_store.get(new_id, session_id="conv_c")
+    copied = file_store.get(new_id, session_id="405bfe154d5c0e795a2b87021bc897bf")
     assert copied is not None
     assert copied.filename == "doc.txt"
     # The source row is unchanged and still owned by the parent.
-    assert file_store.get(parent_file, session_id="conv_p") is not None
+    assert file_store.get(parent_file, session_id="b460374fc8e697b296708f52dc9d8179") is not None
 
     # The bytes match the source.
     content = await file_client.get(
-        f"/v1/sessions/conv_c/resources/files/{new_id}/content",
+        f"/v1/sessions/405bfe154d5c0e795a2b87021bc897bf/resources/files/{new_id}/content",
     )
     assert content.status_code == 200
     assert content.content == b"parent bytes"
@@ -1860,8 +1881,8 @@ async def test_copy_files_rejects_empty_file_ids(
 ) -> None:
     """The request body requires at least one file id."""
     resp = await file_client.post(
-        "/v1/sessions/conv_c/resources/files:copy",
-        json={"source_session_id": "conv_p", "file_ids": []},
+        "/v1/sessions/405bfe154d5c0e795a2b87021bc897bf/resources/files:copy",
+        json={"source_session_id": "b460374fc8e697b296708f52dc9d8179", "file_ids": []},
     )
 
     assert resp.status_code == 422, resp.text
@@ -1873,8 +1894,8 @@ async def test_copy_files_rejects_blank_file_id(
 ) -> None:
     """Each requested file id must be non-empty."""
     resp = await file_client.post(
-        "/v1/sessions/conv_c/resources/files:copy",
-        json={"source_session_id": "conv_p", "file_ids": [""]},
+        "/v1/sessions/405bfe154d5c0e795a2b87021bc897bf/resources/files:copy",
+        json={"source_session_id": "b460374fc8e697b296708f52dc9d8179", "file_ids": [""]},
     )
 
     assert resp.status_code == 422, resp.text
@@ -1886,8 +1907,11 @@ async def test_copy_files_rejects_duplicate_file_ids(
 ) -> None:
     """Duplicate source ids are rejected instead of copied twice."""
     resp = await file_client.post(
-        "/v1/sessions/conv_c/resources/files:copy",
-        json={"source_session_id": "conv_p", "file_ids": ["file_same", "file_same"]},
+        "/v1/sessions/405bfe154d5c0e795a2b87021bc897bf/resources/files:copy",
+        json={
+            "source_session_id": "b460374fc8e697b296708f52dc9d8179",
+            "file_ids": ["247a8c2023856d2eabf41f938df8f032", "247a8c2023856d2eabf41f938df8f032"],
+        },
     )
 
     assert resp.status_code == 400, resp.text
@@ -1900,12 +1924,12 @@ async def test_copy_files_multi_file_mapping(
     file_store: Any,
 ) -> None:
     """A multi-file copy returns a complete source→new mapping."""
-    f1 = await _upload_file(file_client, "conv_p", "a.txt", b"aaa")
-    f2 = await _upload_file(file_client, "conv_p", "b.txt", b"bbb")
+    f1 = await _upload_file(file_client, "b460374fc8e697b296708f52dc9d8179", "a.txt", b"aaa")
+    f2 = await _upload_file(file_client, "b460374fc8e697b296708f52dc9d8179", "b.txt", b"bbb")
 
     resp = await file_client.post(
-        "/v1/sessions/conv_c/resources/files:copy",
-        json={"source_session_id": "conv_p", "file_ids": [f1, f2]},
+        "/v1/sessions/405bfe154d5c0e795a2b87021bc897bf/resources/files:copy",
+        json={"source_session_id": "b460374fc8e697b296708f52dc9d8179", "file_ids": [f1, f2]},
     )
     assert resp.status_code == 200, resp.text
     mapping = resp.json()["mapping"]
@@ -1913,7 +1937,7 @@ async def test_copy_files_multi_file_mapping(
     new_ids = {entry["new_id"] for entry in mapping.values()}
     assert len(new_ids) == 2
     for new_id in new_ids:
-        assert file_store.get(new_id, session_id="conv_c") is not None
+        assert file_store.get(new_id, session_id="405bfe154d5c0e795a2b87021bc897bf") is not None
 
 
 @pytest.mark.asyncio
@@ -1922,15 +1946,17 @@ async def test_copy_files_from_grandparent_in_chain(
     file_store: Any,
 ) -> None:
     """Copying from a grandparent (two levels up) is authorized."""
-    gp_file = await _upload_file(file_client, "conv_gp", "root.txt", b"grandparent")
+    gp_file = await _upload_file(
+        file_client, "46b658cc1407206c877965810133b32f", "root.txt", b"grandparent"
+    )
 
     resp = await file_client.post(
-        "/v1/sessions/conv_c/resources/files:copy",
-        json={"source_session_id": "conv_gp", "file_ids": [gp_file]},
+        "/v1/sessions/405bfe154d5c0e795a2b87021bc897bf/resources/files:copy",
+        json={"source_session_id": "46b658cc1407206c877965810133b32f", "file_ids": [gp_file]},
     )
     assert resp.status_code == 200, resp.text
     new_id = resp.json()["mapping"][gp_file]["new_id"]
-    assert file_store.get(new_id, session_id="conv_c") is not None
+    assert file_store.get(new_id, session_id="405bfe154d5c0e795a2b87021bc897bf") is not None
 
 
 @pytest.mark.asyncio
@@ -1940,19 +1966,21 @@ async def test_copy_files_rejects_source_outside_lineage(
 ) -> None:
     """A source session not in the destination's lineage is forbidden."""
     # conv_proxy is a top-level session with no link to conv_c's chain.
-    foreign_file = await _upload_file(file_client, "conv_proxy", "x.txt", b"foreign")
+    foreign_file = await _upload_file(
+        file_client, "79b22ebd2309e48fdeb450c65611d51b", "x.txt", b"foreign"
+    )
 
-    before = file_store.list(session_id="conv_c").data
+    before = file_store.list(session_id="405bfe154d5c0e795a2b87021bc897bf").data
 
     resp = await file_client.post(
-        "/v1/sessions/conv_c/resources/files:copy",
-        json={"source_session_id": "conv_proxy", "file_ids": [foreign_file]},
+        "/v1/sessions/405bfe154d5c0e795a2b87021bc897bf/resources/files:copy",
+        json={"source_session_id": "79b22ebd2309e48fdeb450c65611d51b", "file_ids": [foreign_file]},
     )
     assert resp.status_code == 403
     assert resp.json()["error"]["code"] == "forbidden"
 
     # Nothing was copied into the destination.
-    after = file_store.list(session_id="conv_c").data
+    after = file_store.list(session_id="405bfe154d5c0e795a2b87021bc897bf").data
     assert len(after) == len(before)
 
 
@@ -1962,20 +1990,23 @@ async def test_copy_files_missing_source_file_is_all_or_nothing(
     file_store: Any,
 ) -> None:
     """A missing source file fails the whole request with no partial copy."""
-    good = await _upload_file(file_client, "conv_p", "good.txt", b"ok")
+    good = await _upload_file(file_client, "b460374fc8e697b296708f52dc9d8179", "good.txt", b"ok")
 
-    before = file_store.list(session_id="conv_c").data
+    before = file_store.list(session_id="405bfe154d5c0e795a2b87021bc897bf").data
 
     resp = await file_client.post(
-        "/v1/sessions/conv_c/resources/files:copy",
-        json={"source_session_id": "conv_p", "file_ids": [good, "file_does_not_exist"]},
+        "/v1/sessions/405bfe154d5c0e795a2b87021bc897bf/resources/files:copy",
+        json={
+            "source_session_id": "b460374fc8e697b296708f52dc9d8179",
+            "file_ids": [good, "65f7ae83b2200f8c848848e9afc4b8af"],
+        },
     )
     assert resp.status_code == 404
     assert resp.json()["error"]["code"] == "not_found"
 
     # The valid file in the batch must NOT have been committed: validation
     # is all-or-nothing, so the destination is unchanged.
-    after = file_store.list(session_id="conv_c").data
+    after = file_store.list(session_id="405bfe154d5c0e795a2b87021bc897bf").data
     assert len(after) == len(before)
 
 
@@ -1992,20 +2023,25 @@ async def test_copy_files_missing_blob_surfaces_before_any_write(
     absent blob — is caught during validation and copies nothing, preserving
     the "missing blob surfaces before any child row is created" guarantee.
     """
-    good = await _upload_file(file_client, "conv_p", "good.txt", b"ok")
-    dangling = await _upload_file(file_client, "conv_p", "gone.txt", b"bye")
+    good = await _upload_file(file_client, "b460374fc8e697b296708f52dc9d8179", "good.txt", b"ok")
+    dangling = await _upload_file(
+        file_client, "b460374fc8e697b296708f52dc9d8179", "gone.txt", b"bye"
+    )
     # Drop the blob but leave the metadata row — a dangling source.
     artifact_store.delete(dangling)
-    before = file_store.list(session_id="conv_c").data
+    before = file_store.list(session_id="405bfe154d5c0e795a2b87021bc897bf").data
 
     resp = await file_client.post(
-        "/v1/sessions/conv_c/resources/files:copy",
-        json={"source_session_id": "conv_p", "file_ids": [good, dangling]},
+        "/v1/sessions/405bfe154d5c0e795a2b87021bc897bf/resources/files:copy",
+        json={
+            "source_session_id": "b460374fc8e697b296708f52dc9d8179",
+            "file_ids": [good, dangling],
+        },
     )
     assert resp.status_code == 404, resp.text
     assert resp.json()["error"]["code"] == "not_found"
     # The valid file in the batch was NOT committed — validation is all-or-nothing.
-    after = file_store.list(session_id="conv_c").data
+    after = file_store.list(session_id="405bfe154d5c0e795a2b87021bc897bf").data
     assert len(after) == len(before)
 
 
@@ -2023,10 +2059,10 @@ async def test_copy_files_midbatch_write_failure_persists_no_resource_events(
     ``session.resource.created`` for it — clients must not see a phantom
     file that was rolled back.
     """
-    f1 = await _upload_file(file_client, "conv_p", "a.txt", b"aa")
-    f2 = await _upload_file(file_client, "conv_p", "b.txt", b"bb")
+    f1 = await _upload_file(file_client, "b460374fc8e697b296708f52dc9d8179", "a.txt", b"aa")
+    f2 = await _upload_file(file_client, "b460374fc8e697b296708f52dc9d8179", "b.txt", b"bb")
     file_conv_store.appended_items.clear()
-    before = file_store.list(session_id="conv_c").data
+    before = file_store.list(session_id="405bfe154d5c0e795a2b87021bc897bf").data
 
     real_put = artifact_store.put
     calls = {"n": 0}
@@ -2040,15 +2076,15 @@ async def test_copy_files_midbatch_write_failure_persists_no_resource_events(
     artifact_store.put = _put_then_fail  # type: ignore[assignment]
 
     resp = await file_client.post(
-        "/v1/sessions/conv_c/resources/files:copy",
-        json={"source_session_id": "conv_p", "file_ids": [f1, f2]},
+        "/v1/sessions/405bfe154d5c0e795a2b87021bc897bf/resources/files:copy",
+        json={"source_session_id": "b460374fc8e697b296708f52dc9d8179", "file_ids": [f1, f2]},
     )
     assert resp.status_code == 500, resp.text
     assert resp.json()["error"]["code"] == "internal_error"
     assert "Failed to copy files" in resp.json()["error"]["message"]
 
     # First file's row + blob rolled back: destination unchanged.
-    after = file_store.list(session_id="conv_c").data
+    after = file_store.list(session_id="405bfe154d5c0e795a2b87021bc897bf").data
     assert len(after) == len(before)
     # No phantom resource event persisted for the rolled-back first file.
     events = [i for i in file_conv_store.appended_items if i.type == "resource_event"]
@@ -2064,8 +2100,8 @@ async def test_copy_files_rollback_deletes_blobs_when_row_delete_fails(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Rollback still attempts blob cleanup if row cleanup fails."""
-    f1 = await _upload_file(file_client, "conv_p", "a.txt", b"aa")
-    f2 = await _upload_file(file_client, "conv_p", "b.txt", b"bb")
+    f1 = await _upload_file(file_client, "b460374fc8e697b296708f52dc9d8179", "a.txt", b"aa")
+    f2 = await _upload_file(file_client, "b460374fc8e697b296708f52dc9d8179", "b.txt", b"bb")
 
     real_put = artifact_store.put
     calls = {"n": 0}
@@ -2093,8 +2129,8 @@ async def test_copy_files_rollback_deletes_blobs_when_row_delete_fails(
     caplog.set_level(logging.WARNING, logger="omnigent.server.routes.sessions")
 
     resp = await file_client.post(
-        "/v1/sessions/conv_c/resources/files:copy",
-        json={"source_session_id": "conv_p", "file_ids": [f1, f2]},
+        "/v1/sessions/405bfe154d5c0e795a2b87021bc897bf/resources/files:copy",
+        json={"source_session_id": "b460374fc8e697b296708f52dc9d8179", "file_ids": [f1, f2]},
     )
 
     assert resp.status_code == 500, resp.text
@@ -2111,8 +2147,8 @@ async def test_copy_files_rollback_logs_blob_delete_failures(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Rollback logs blob cleanup failures after deleting rows."""
-    f1 = await _upload_file(file_client, "conv_p", "a.txt", b"aa")
-    f2 = await _upload_file(file_client, "conv_p", "b.txt", b"bb")
+    f1 = await _upload_file(file_client, "b460374fc8e697b296708f52dc9d8179", "a.txt", b"aa")
+    f2 = await _upload_file(file_client, "b460374fc8e697b296708f52dc9d8179", "b.txt", b"bb")
 
     real_put = artifact_store.put
     calls = {"n": 0}
@@ -2140,8 +2176,8 @@ async def test_copy_files_rollback_logs_blob_delete_failures(
     caplog.set_level(logging.WARNING, logger="omnigent.server.routes.sessions")
 
     resp = await file_client.post(
-        "/v1/sessions/conv_c/resources/files:copy",
-        json={"source_session_id": "conv_p", "file_ids": [f1, f2]},
+        "/v1/sessions/405bfe154d5c0e795a2b87021bc897bf/resources/files:copy",
+        json={"source_session_id": "b460374fc8e697b296708f52dc9d8179", "file_ids": [f1, f2]},
     )
 
     assert resp.status_code == 500, resp.text
@@ -2155,18 +2191,18 @@ async def test_copy_files_self_source_is_rejected(
     file_store: Any,
 ) -> None:
     """A session may not name ITSELF as the source — lineage is ancestors only."""
-    own = await _upload_file(file_client, "conv_c", "self.txt", b"mine")
-    before = file_store.list(session_id="conv_c").data
+    own = await _upload_file(file_client, "405bfe154d5c0e795a2b87021bc897bf", "self.txt", b"mine")
+    before = file_store.list(session_id="405bfe154d5c0e795a2b87021bc897bf").data
 
     resp = await file_client.post(
-        "/v1/sessions/conv_c/resources/files:copy",
-        json={"source_session_id": "conv_c", "file_ids": [own]},
+        "/v1/sessions/405bfe154d5c0e795a2b87021bc897bf/resources/files:copy",
+        json={"source_session_id": "405bfe154d5c0e795a2b87021bc897bf", "file_ids": [own]},
     )
     assert resp.status_code == 403, resp.text
     assert resp.json()["error"]["code"] == "forbidden"
 
     # Nothing copied — the destination is unchanged.
-    after = file_store.list(session_id="conv_c").data
+    after = file_store.list(session_id="405bfe154d5c0e795a2b87021bc897bf").data
     assert len(after) == len(before)
 
 
@@ -2186,10 +2222,10 @@ async def test_copy_files_rejects_over_count_before_any_blob_read(
     import omnigent.server.server_config as server_config
 
     monkeypatch.setattr(server_config, "copy_file_count_limit", lambda: 2)
-    f1 = await _upload_file(file_client, "conv_p", "a.txt", b"a")
-    f2 = await _upload_file(file_client, "conv_p", "b.txt", b"b")
-    f3 = await _upload_file(file_client, "conv_p", "c.txt", b"c")
-    before = file_store.list(session_id="conv_c").data
+    f1 = await _upload_file(file_client, "b460374fc8e697b296708f52dc9d8179", "a.txt", b"a")
+    f2 = await _upload_file(file_client, "b460374fc8e697b296708f52dc9d8179", "b.txt", b"b")
+    f3 = await _upload_file(file_client, "b460374fc8e697b296708f52dc9d8179", "c.txt", b"c")
+    before = file_store.list(session_id="405bfe154d5c0e795a2b87021bc897bf").data
 
     get_calls = {"n": 0}
     real_get = artifact_store.get
@@ -2201,14 +2237,14 @@ async def test_copy_files_rejects_over_count_before_any_blob_read(
     artifact_store.get = _counting_get  # type: ignore[assignment]
 
     resp = await file_client.post(
-        "/v1/sessions/conv_c/resources/files:copy",
-        json={"source_session_id": "conv_p", "file_ids": [f1, f2, f3]},
+        "/v1/sessions/405bfe154d5c0e795a2b87021bc897bf/resources/files:copy",
+        json={"source_session_id": "b460374fc8e697b296708f52dc9d8179", "file_ids": [f1, f2, f3]},
     )
     assert resp.status_code == 400, resp.text
     assert resp.json()["error"]["code"] == "invalid_input"
     # No blob was read and nothing was copied.
     assert get_calls["n"] == 0
-    after = file_store.list(session_id="conv_c").data
+    after = file_store.list(session_id="405bfe154d5c0e795a2b87021bc897bf").data
     assert len(after) == len(before)
 
 
@@ -2223,9 +2259,9 @@ async def test_copy_files_rejects_over_total_bytes_before_any_blob_read(
     import omnigent.server.server_config as server_config
 
     monkeypatch.setattr(server_config, "copy_total_bytes_limit", lambda: 5)
-    f1 = await _upload_file(file_client, "conv_p", "a.txt", b"aaa")
-    f2 = await _upload_file(file_client, "conv_p", "b.txt", b"bbb")
-    before = file_store.list(session_id="conv_c").data
+    f1 = await _upload_file(file_client, "b460374fc8e697b296708f52dc9d8179", "a.txt", b"aaa")
+    f2 = await _upload_file(file_client, "b460374fc8e697b296708f52dc9d8179", "b.txt", b"bbb")
+    before = file_store.list(session_id="405bfe154d5c0e795a2b87021bc897bf").data
 
     get_calls = {"n": 0}
     real_get = artifact_store.get
@@ -2237,13 +2273,13 @@ async def test_copy_files_rejects_over_total_bytes_before_any_blob_read(
     artifact_store.get = _counting_get  # type: ignore[assignment]
 
     resp = await file_client.post(
-        "/v1/sessions/conv_c/resources/files:copy",
-        json={"source_session_id": "conv_p", "file_ids": [f1, f2]},
+        "/v1/sessions/405bfe154d5c0e795a2b87021bc897bf/resources/files:copy",
+        json={"source_session_id": "b460374fc8e697b296708f52dc9d8179", "file_ids": [f1, f2]},
     )
     assert resp.status_code == 400, resp.text
     assert resp.json()["error"]["code"] == "invalid_input"
     assert get_calls["n"] == 0
-    after = file_store.list(session_id="conv_c").data
+    after = file_store.list(session_id="405bfe154d5c0e795a2b87021bc897bf").data
     assert len(after) == len(before)
 
 
@@ -2258,12 +2294,12 @@ async def test_copy_files_at_limit_boundary_succeeds(
 
     monkeypatch.setattr(server_config, "copy_file_count_limit", lambda: 2)
     monkeypatch.setattr(server_config, "copy_total_bytes_limit", lambda: 6)
-    f1 = await _upload_file(file_client, "conv_p", "a.txt", b"aaa")
-    f2 = await _upload_file(file_client, "conv_p", "b.txt", b"bbb")
+    f1 = await _upload_file(file_client, "b460374fc8e697b296708f52dc9d8179", "a.txt", b"aaa")
+    f2 = await _upload_file(file_client, "b460374fc8e697b296708f52dc9d8179", "b.txt", b"bbb")
 
     resp = await file_client.post(
-        "/v1/sessions/conv_c/resources/files:copy",
-        json={"source_session_id": "conv_p", "file_ids": [f1, f2]},
+        "/v1/sessions/405bfe154d5c0e795a2b87021bc897bf/resources/files:copy",
+        json={"source_session_id": "b460374fc8e697b296708f52dc9d8179", "file_ids": [f1, f2]},
     )
     assert resp.status_code == 200, resp.text
     mapping = resp.json()["mapping"]
@@ -2275,16 +2311,18 @@ async def test_copy_files_then_download_returns_bytes(
     file_client: httpx.AsyncClient,
 ) -> None:
     """After copy, the child can download the copied content."""
-    parent_file = await _upload_file(file_client, "conv_p", "payload.bin", b"\x00\x01\x02data")
+    parent_file = await _upload_file(
+        file_client, "b460374fc8e697b296708f52dc9d8179", "payload.bin", b"\x00\x01\x02data"
+    )
 
     copy_resp = await file_client.post(
-        "/v1/sessions/conv_c/resources/files:copy",
-        json={"source_session_id": "conv_p", "file_ids": [parent_file]},
+        "/v1/sessions/405bfe154d5c0e795a2b87021bc897bf/resources/files:copy",
+        json={"source_session_id": "b460374fc8e697b296708f52dc9d8179", "file_ids": [parent_file]},
     )
     new_id = copy_resp.json()["mapping"][parent_file]["new_id"]
 
     resp = await file_client.get(
-        f"/v1/sessions/conv_c/resources/files/{new_id}/content",
+        f"/v1/sessions/405bfe154d5c0e795a2b87021bc897bf/resources/files/{new_id}/content",
     )
     assert resp.status_code == 200
     assert resp.content == b"\x00\x01\x02data"
@@ -2299,7 +2337,7 @@ async def test_files_route_not_captured_as_resource_id(
 ) -> None:
     """'files' is a typed collection route, not a resource id."""
     resp = await file_client.get(
-        "/v1/sessions/conv_proxy/resources/files",
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/files",
     )
     assert resp.status_code == 200
     assert resp.json()["object"] == "list"
@@ -2311,12 +2349,12 @@ async def test_files_appear_in_unified_inventory(
 ) -> None:
     """Uploaded files appear in GET /resources with type 'file'."""
     upload = await file_client.post(
-        "/v1/sessions/conv_local/resources/files",
+        "/v1/sessions/5d29bee4350489d66feafecfebd94a97/resources/files",
         files={"file": ("report.txt", b"data", "text/plain")},
     )
     file_id = upload.json()["id"]
 
-    resp = await file_client.get("/v1/sessions/conv_local/resources")
+    resp = await file_client.get("/v1/sessions/5d29bee4350489d66feafecfebd94a97/resources")
     assert resp.status_code == 200
     body = resp.json()
     ids = [r["id"] for r in body["data"]]
@@ -2324,7 +2362,7 @@ async def test_files_appear_in_unified_inventory(
     file_resource = next(r for r in body["data"] if r["id"] == file_id)
     assert file_resource["type"] == "file"
     assert file_resource["object"] == "session.resource"
-    assert file_resource["session_id"] == "conv_local"
+    assert file_resource["session_id"] == "5d29bee4350489d66feafecfebd94a97"
 
 
 @pytest.mark.asyncio
@@ -2335,22 +2373,22 @@ async def test_delete_for_session_cleans_up_all_files(
     """delete_all_for_session removes all session files."""
     for name in ("a.txt", "b.txt", "c.txt"):
         await file_client.post(
-            "/v1/sessions/conv_proxy/resources/files",
+            "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/files",
             files={"file": (name, b"data", "text/plain")},
         )
 
     list_resp = await file_client.get(
-        "/v1/sessions/conv_proxy/resources/files",
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/files",
     )
     assert len(list_resp.json()["data"]) == 3
 
     # Use the injected file_store fixture directly — no closure
     # introspection needed.
-    deleted_ids = file_store.delete_all_for_session("conv_proxy")
+    deleted_ids = file_store.delete_all_for_session("79b22ebd2309e48fdeb450c65611d51b")
     assert len(deleted_ids) == 3
 
     list_after = await file_client.get(
-        "/v1/sessions/conv_proxy/resources/files",
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/files",
     )
     assert len(list_after.json()["data"]) == 0
 
@@ -2371,24 +2409,24 @@ def test_resource_lifecycle_event_schemas_in_union() -> None:
         {
             "type": "session.resource.created",
             "resource": {
-                "id": "file_abc",
+                "id": "2e6cfcecf239b5c4a5e4548682173207",
                 "object": "session.resource",
                 "type": "file",
-                "session_id": "conv_1",
+                "session_id": "8e32600337d08f59ad381caf96a90659",
                 "name": "test.txt",
                 "metadata": {},
             },
         }
     )
     assert isinstance(created, SessionResourceCreatedEvent)
-    assert created.resource["id"] == "file_abc"
+    assert created.resource["id"] == "2e6cfcecf239b5c4a5e4548682173207"
 
     deleted = adapter.validate_python(
         {
             "type": "session.resource.deleted",
             "resource_id": "terminal_bash_s1",
             "resource_type": "terminal",
-            "session_id": "conv_1",
+            "session_id": "8e32600337d08f59ad381caf96a90659",
         }
     )
     assert isinstance(deleted, SessionResourceDeletedEvent)
@@ -2466,7 +2504,7 @@ async def test_filesystem_list_proxies_to_runner(
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
 
     resp = await client.get(
-        "/v1/sessions/conv_proxy/resources/environments/default/filesystem",
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default/filesystem",
     )
     assert resp.status_code == 200
     assert resp.json()["object"] == "list"
@@ -2474,7 +2512,7 @@ async def test_filesystem_list_proxies_to_runner(
     assert fake_runner.calls == [
         (
             "GET",
-            "/v1/sessions/conv_proxy/resources/environments/default/filesystem?limit=20&order=desc",
+            "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default/filesystem?limit=20&order=desc",
         ),
     ]
 
@@ -2488,7 +2526,7 @@ async def test_filesystem_list_forwards_custom_limit_and_order(
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
 
     resp = await client.get(
-        "/v1/sessions/conv_proxy/resources/environments/default/filesystem?limit=1000&order=asc",
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default/filesystem?limit=1000&order=asc",
     )
 
     assert resp.status_code == 200
@@ -2496,7 +2534,7 @@ async def test_filesystem_list_forwards_custom_limit_and_order(
     assert fake_runner.calls == [
         (
             "GET",
-            "/v1/sessions/conv_proxy/resources/environments/default/filesystem?limit=1000&order=asc",
+            "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default/filesystem?limit=1000&order=asc",
         ),
     ]
 
@@ -2510,7 +2548,7 @@ async def test_filesystem_list_forwards_after_cursor(
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
 
     resp = await client.get(
-        "/v1/sessions/conv_proxy/resources/environments/default/filesystem"
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default/filesystem"
         "?limit=100&order=asc&after=README.md",
     )
 
@@ -2532,7 +2570,7 @@ async def test_filesystem_list_forwards_before_cursor(
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
 
     resp = await client.get(
-        "/v1/sessions/conv_proxy/resources/environments/default/filesystem"
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default/filesystem"
         "?limit=50&order=asc&before=src",
     )
 
@@ -2552,7 +2590,7 @@ async def test_filesystem_list_omits_absent_cursors(
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
 
     resp = await client.get(
-        "/v1/sessions/conv_proxy/resources/environments/default/filesystem?limit=50",
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default/filesystem?limit=50",
     )
 
     assert resp.status_code == 200
@@ -2573,7 +2611,7 @@ async def test_filesystem_path_forwards_pagination_params(
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
 
     resp = await client.get(
-        "/v1/sessions/conv_proxy/resources/environments/default/filesystem/src"
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default/filesystem/src"
         "?limit=1000&order=asc",
     )
 
@@ -2594,7 +2632,7 @@ async def test_filesystem_path_omits_absent_cursors(
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
 
     resp = await client.get(
-        "/v1/sessions/conv_proxy/resources/environments/default/filesystem/src"
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default/filesystem/src"
         "?limit=100&order=asc",
     )
 
@@ -2623,7 +2661,7 @@ async def test_filesystem_read_proxies_to_runner(
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
 
     resp = await client.get(
-        "/v1/sessions/conv_proxy/resources/environments/default/filesystem/hello.txt",
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default/filesystem/hello.txt",
     )
     assert resp.status_code == 200
     assert resp.json()["content"] == "hello world"
@@ -2638,13 +2676,16 @@ async def test_filesystem_write_proxies_to_runner(
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
 
     resp = await client.put(
-        "/v1/sessions/conv_proxy/resources/environments/default/filesystem/new.txt",
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default/filesystem/new.txt",
         json={"content": "hello", "encoding": "utf-8"},
     )
     assert resp.status_code == 200
     assert resp.json()["created"] is True
     assert fake_runner.calls == [
-        ("PUT", "/v1/sessions/conv_proxy/resources/environments/default/filesystem/new.txt"),
+        (
+            "PUT",
+            "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default/filesystem/new.txt",
+        ),
     ]
 
 
@@ -2655,12 +2696,14 @@ async def test_filesystem_write_publishes_changed_files_invalidation(
     """Successful filesystem writes publish a session filesystem invalidation."""
     fake_runner = _FakeRunnerClient(payload=_fs_write_payload())
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
-    stream = session_stream.subscribe("conv_proxy", ready_event={"type": "test.ready"})
+    stream = session_stream.subscribe(
+        "79b22ebd2309e48fdeb450c65611d51b", ready_event={"type": "test.ready"}
+    )
     try:
         assert await anext(stream) == {"type": "test.ready"}
 
         resp = await client.put(
-            "/v1/sessions/conv_proxy/resources/environments/default/filesystem/new.txt",
+            "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default/filesystem/new.txt",
             json={"content": "hello", "encoding": "utf-8"},
         )
         event = await asyncio.wait_for(anext(stream), timeout=1)
@@ -2670,7 +2713,7 @@ async def test_filesystem_write_publishes_changed_files_invalidation(
     assert resp.status_code == 200
     assert event == {
         "type": "session.changed_files.invalidated",
-        "session_id": "conv_proxy",
+        "session_id": "79b22ebd2309e48fdeb450c65611d51b",
         "environment_id": "default",
     }
 
@@ -2684,13 +2727,16 @@ async def test_filesystem_edit_proxies_to_runner(
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
 
     resp = await client.patch(
-        "/v1/sessions/conv_proxy/resources/environments/default/filesystem/hello.txt",
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default/filesystem/hello.txt",
         json={"old_text": "hello", "new_text": "goodbye"},
     )
     assert resp.status_code == 200
     assert resp.json()["replacements"] == 1
     assert fake_runner.calls == [
-        ("PATCH", "/v1/sessions/conv_proxy/resources/environments/default/filesystem/hello.txt"),
+        (
+            "PATCH",
+            "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default/filesystem/hello.txt",
+        ),
     ]
 
 
@@ -2703,7 +2749,7 @@ async def test_filesystem_delete_proxies_to_runner(
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
 
     resp = await client.delete(
-        "/v1/sessions/conv_proxy/resources/environments/default/filesystem/old.txt",
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default/filesystem/old.txt",
     )
     assert resp.status_code == 200
     assert resp.json()["deleted"] is True
@@ -2718,7 +2764,7 @@ async def test_filesystem_proxy_validates_session(
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
 
     resp = await client.get(
-        "/v1/sessions/conv_missing/resources/environments/default/filesystem",
+        "/v1/sessions/5eca720dc2bc6cdc3a99028d7bd0f917/resources/environments/default/filesystem",
     )
     assert resp.status_code == 404
     assert not fake_runner.calls
@@ -2751,7 +2797,7 @@ async def test_shell_proxies_to_runner(
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
 
     resp = await client.post(
-        "/v1/sessions/conv_proxy/resources/environments/default/shell",
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default/shell",
         json={"command": "echo hello"},
     )
     assert resp.status_code == 200
@@ -2761,7 +2807,10 @@ async def test_shell_proxies_to_runner(
     assert body["exit_code"] == 0
     assert body["timed_out"] is False
     assert fake_runner.calls == [
-        ("POST", "/v1/sessions/conv_proxy/resources/environments/default/shell"),
+        (
+            "POST",
+            "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default/shell",
+        ),
     ]
     assert published == []
 
@@ -2777,18 +2826,18 @@ async def test_session_file_cleanup_on_delete(
 ) -> None:
     """Session file cleanup removes metadata and artifact bytes."""
     upload = await file_client.post(
-        "/v1/sessions/conv_proxy/resources/files",
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/files",
         files={"file": ("cleanup.txt", b"session data", "text/plain")},
     )
     file_id = upload.json()["id"]
     assert artifact_store.get(file_id) is not None
 
-    deleted_ids = file_store.delete_all_for_session("conv_proxy")
+    deleted_ids = file_store.delete_all_for_session("79b22ebd2309e48fdeb450c65611d51b")
     assert file_id in deleted_ids
     for fid in deleted_ids:
         artifact_store.delete(fid)
 
-    assert file_store.get(file_id, session_id="conv_proxy") is None
+    assert file_store.get(file_id, session_id="79b22ebd2309e48fdeb450c65611d51b") is None
     assert file_id not in artifact_store._blobs
 
 
@@ -2802,7 +2851,7 @@ async def test_file_upload_persists_resource_event(
 ) -> None:
     """Uploading a file persists a resource_event conversation item."""
     await file_client.post(
-        "/v1/sessions/conv_proxy/resources/files",
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/files",
         files={"file": ("persist.txt", b"data", "text/plain")},
     )
 
@@ -2820,14 +2869,14 @@ async def test_file_delete_persists_resource_event(
 ) -> None:
     """Deleting a file persists a resource_event conversation item."""
     upload = await file_client.post(
-        "/v1/sessions/conv_proxy/resources/files",
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/files",
         files={"file": ("del.txt", b"gone", "text/plain")},
     )
     file_id = upload.json()["id"]
     file_conv_store.appended_items.clear()
 
     await file_client.delete(
-        f"/v1/sessions/conv_proxy/resources/files/{file_id}",
+        f"/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/files/{file_id}",
     )
 
     events = [i for i in file_conv_store.appended_items if i.type == "resource_event"]
@@ -2978,7 +3027,7 @@ async def test_relay_persists_terminal_resource_created_from_runner() -> None:
         ]
     )
 
-    await _relay_runner_stream("conv_proxy", client, store)  # type: ignore[arg-type]
+    await _relay_runner_stream("79b22ebd2309e48fdeb450c65611d51b", client, store)  # type: ignore[arg-type]
 
     events = [i for i in store.appended_items if i.type == "resource_event"]
     # Exactly one durable item — the created event. Zero would mean the
@@ -2992,7 +3041,7 @@ async def test_relay_persists_terminal_resource_created_from_runner() -> None:
     assert events[0].data.resource is not None
     assert events[0].data.resource["id"] == "terminal_zsh_s1"
     # Resource events thread on the session id (matches the REST path).
-    assert events[0].response_id == "conv_proxy"
+    assert events[0].response_id == "79b22ebd2309e48fdeb450c65611d51b"
 
 
 @pytest.mark.asyncio
@@ -3013,14 +3062,14 @@ async def test_relay_persists_terminal_resource_deleted_from_runner() -> None:
                     "type": "session.resource.deleted",
                     "resource_id": "terminal_zsh_s1",
                     "resource_type": "terminal",
-                    "session_id": "conv_proxy",
+                    "session_id": "79b22ebd2309e48fdeb450c65611d51b",
                 }
             ),
             "data: [DONE]\n\n",
         ]
     )
 
-    await _relay_runner_stream("conv_proxy", client, store)  # type: ignore[arg-type]
+    await _relay_runner_stream("79b22ebd2309e48fdeb450c65611d51b", client, store)  # type: ignore[arg-type]
 
     events = [i for i in store.appended_items if i.type == "resource_event"]
     assert len(events) == 1, f"expected 1 resource_event, got {store.appended_items}"
@@ -3053,14 +3102,18 @@ async def test_relay_persists_failed_status_error_labels_from_runner() -> None:
         ]
     )
 
-    await _relay_runner_stream("conv_proxy", client, store)  # type: ignore[arg-type]
+    await _relay_runner_stream("79b22ebd2309e48fdeb450c65611d51b", client, store)  # type: ignore[arg-type]
 
     assert (
-        store._conversations["conv_proxy"].labels["omnigent.last_task_error_code"]
+        store._conversations["79b22ebd2309e48fdeb450c65611d51b"].labels[
+            "omnigent.last_task_error_code"
+        ]
         == "required_terminal_exited"
     )
     assert (
-        store._conversations["conv_proxy"].labels["omnigent.last_task_error_message"]
+        store._conversations["79b22ebd2309e48fdeb450c65611d51b"].labels[
+            "omnigent.last_task_error_message"
+        ]
         == "Required terminal exited unexpectedly"
     )
 
@@ -3096,9 +3149,11 @@ async def test_relay_truncates_long_error_message_before_persisting() -> None:
         ]
     )
 
-    await _relay_runner_stream("conv_proxy", client, store)  # type: ignore[arg-type]
+    await _relay_runner_stream("79b22ebd2309e48fdeb450c65611d51b", client, store)  # type: ignore[arg-type]
 
-    stored = store._conversations["conv_proxy"].labels["omnigent.last_task_error_message"]
+    stored = store._conversations["79b22ebd2309e48fdeb450c65611d51b"].labels[
+        "omnigent.last_task_error_message"
+    ]
     assert len(stored) <= _LABEL_VALUE_MAX_LEN
 
 
@@ -3148,7 +3203,7 @@ async def test_relay_persists_routing_decision_before_assistant_output() -> None
         ]
     )
 
-    await _relay_runner_stream("conv_proxy", client, store)  # type: ignore[arg-type]
+    await _relay_runner_stream("79b22ebd2309e48fdeb450c65611d51b", client, store)  # type: ignore[arg-type]
 
     # Arrival order is preserved, and the router item lands BEFORE the
     # assistant message. If the order flipped (or the routing item were
@@ -3182,7 +3237,7 @@ async def test_relay_routing_decision_live_event_carries_persisted_id() -> None:
     routing_seen = asyncio.Event()
 
     async def _consume() -> None:
-        async for event in session_stream.subscribe("conv_proxy"):
+        async for event in session_stream.subscribe("79b22ebd2309e48fdeb450c65611d51b"):
             published.append(event)
             item = event.get("item")
             if isinstance(item, dict) and item.get("type") == "routing_decision":
@@ -3209,7 +3264,7 @@ async def test_relay_routing_decision_live_event_carries_persisted_id() -> None:
                 "data: [DONE]\n\n",
             ]
         )
-        await _relay_runner_stream("conv_proxy", client, store)  # type: ignore[arg-type]
+        await _relay_runner_stream("79b22ebd2309e48fdeb450c65611d51b", client, store)  # type: ignore[arg-type]
         await asyncio.wait_for(routing_seen.wait(), timeout=1)
     finally:
         consumer.cancel()
@@ -3267,7 +3322,7 @@ async def test_relay_drops_malformed_routing_decision() -> None:
         ]
     )
 
-    await _relay_runner_stream("conv_proxy", client, store)  # type: ignore[arg-type]
+    await _relay_runner_stream("79b22ebd2309e48fdeb450c65611d51b", client, store)  # type: ignore[arg-type]
 
     routing = [i for i in store.appended_items if i.type == "routing_decision"]
     # Empty-model frame dropped — zero persisted. A persisted item would
@@ -3305,7 +3360,7 @@ async def test_relay_does_not_persist_session_level_response_error() -> None:
         ]
     )
 
-    await _relay_runner_stream("conv_proxy", client, store)  # type: ignore[arg-type]
+    await _relay_runner_stream("79b22ebd2309e48fdeb450c65611d51b", client, store)  # type: ignore[arg-type]
 
     errors = [i for i in store.appended_items if i.type == "error"]
     assert errors == []
@@ -3355,7 +3410,7 @@ async def test_relay_persists_in_turn_response_error_once_from_runner() -> None:
         ]
     )
 
-    await _relay_runner_stream("conv_proxy", client, store)  # type: ignore[arg-type]
+    await _relay_runner_stream("79b22ebd2309e48fdeb450c65611d51b", client, store)  # type: ignore[arg-type]
 
     errors = [i for i in store.appended_items if i.type == "error"]
     # One durable error proves the first in-turn frame was persisted;
@@ -3384,7 +3439,7 @@ async def test_relay_dedupes_duplicate_error_persistence_but_forwards_live_frame
     live_errors_seen = asyncio.Event()
 
     async def _consume() -> None:
-        async for event in session_stream.subscribe("conv_proxy"):
+        async for event in session_stream.subscribe("79b22ebd2309e48fdeb450c65611d51b"):
             published.append(event)
             if len([item for item in published if item.get("type") == "response.error"]) == 2:
                 live_errors_seen.set()
@@ -3425,7 +3480,7 @@ async def test_relay_dedupes_duplicate_error_persistence_but_forwards_live_frame
             ]
         )
 
-        await _relay_runner_stream("conv_proxy", client, store)  # type: ignore[arg-type]
+        await _relay_runner_stream("79b22ebd2309e48fdeb450c65611d51b", client, store)  # type: ignore[arg-type]
         await asyncio.wait_for(live_errors_seen.wait(), timeout=1)
     finally:
         consumer.cancel()
@@ -3455,11 +3510,11 @@ async def test_native_dispatch_fast_fails_and_consumes_message_on_terminal_error
     from omnigent.server.routes.sessions import _dispatch_session_event_to_runner
 
     store = _ConversationStore()
-    conv = store.get_conversation("conv_claude")
+    conv = store.get_conversation("64a784c3aa907d1774f44313546947c6")
     assert conv is not None
     client = _FakeRunnerClient(
         responses={
-            "/v1/sessions/conv_claude/resources/terminals": (
+            "/v1/sessions/64a784c3aa907d1774f44313546947c6/resources/terminals": (
                 500,
                 {
                     "error": {
@@ -3476,7 +3531,7 @@ async def test_native_dispatch_fast_fails_and_consumes_message_on_terminal_error
     )
 
     result = await _dispatch_session_event_to_runner(
-        "conv_claude",
+        "64a784c3aa907d1774f44313546947c6",
         conv,
         body,
         store,  # type: ignore[arg-type]
@@ -3490,7 +3545,7 @@ async def test_native_dispatch_fast_fails_and_consumes_message_on_terminal_error
     assert result.pending_id is None
     assert result.item_id is not None
     assert [call[0] for call in client.post_json_calls] == [
-        "/v1/sessions/conv_claude/resources/terminals"
+        "/v1/sessions/64a784c3aa907d1774f44313546947c6/resources/terminals"
     ]
     messages = [i for i in store.appended_items if i.type == "message"]
     errors = [i for i in store.appended_items if i.type == "error"]
@@ -3517,7 +3572,7 @@ async def test_kiro_native_dispatch_forwards_without_persisting() -> None:
 
     pending_inputs.reset_for_tests()
     store = _ConversationStore()
-    conv = store.get_conversation("conv_kiro")
+    conv = store.get_conversation("823dbd1aab969b5a813fac59bb977a77")
     assert conv is not None
     client = _FakeRunnerClient()
     body = SessionEventInput(
@@ -3527,7 +3582,7 @@ async def test_kiro_native_dispatch_forwards_without_persisting() -> None:
 
     try:
         result = await _dispatch_session_event_to_runner(
-            "conv_kiro",
+            "823dbd1aab969b5a813fac59bb977a77",
             conv,
             body,
             store,  # type: ignore[arg-type]
@@ -3542,15 +3597,15 @@ async def test_kiro_native_dispatch_forwards_without_persisting() -> None:
         assert result.pending_id is not None
         assert result.pending_id.startswith("pending_")
         assert [call[0] for call in client.post_json_calls] == [
-            "/v1/sessions/conv_kiro/resources/terminals",
-            "/v1/sessions/conv_kiro/events",
+            "/v1/sessions/823dbd1aab969b5a813fac59bb977a77/resources/terminals",
+            "/v1/sessions/823dbd1aab969b5a813fac59bb977a77/events",
         ]
-        pending = pending_inputs.snapshot_for("conv_kiro")
+        pending = pending_inputs.snapshot_for("823dbd1aab969b5a813fac59bb977a77")
         assert len(pending) == 1
         assert pending[0]["content"] == [{"type": "input_text", "text": "hello"}]
         assert store.appended_items == []
         forwarded = client.post_json_calls[1][1]
-        assert forwarded["agent_id"] == "ag_kiro"
+        assert forwarded["agent_id"] == "2c515637c67d0717ad0bebc2747b71bc"
         assert forwarded["model"] == "kiro-native-ui"
     finally:
         pending_inputs.reset_for_tests()
@@ -3564,10 +3619,12 @@ async def test_kiro_native_dispatch_clears_pending_when_injection_fails() -> Non
 
     pending_inputs.reset_for_tests()
     store = _ConversationStore()
-    conv = store.get_conversation("conv_kiro")
+    conv = store.get_conversation("823dbd1aab969b5a813fac59bb977a77")
     assert conv is not None
     client = _FakeRunnerClient(
-        responses={"/v1/sessions/conv_kiro/events": (500, {"error": "tmux failed"})}
+        responses={
+            "/v1/sessions/823dbd1aab969b5a813fac59bb977a77/events": (500, {"error": "tmux failed"})
+        }
     )
     body = SessionEventInput(
         type="message",
@@ -3577,7 +3634,7 @@ async def test_kiro_native_dispatch_clears_pending_when_injection_fails() -> Non
     try:
         with pytest.raises(HTTPException):
             await _dispatch_session_event_to_runner(
-                "conv_kiro",
+                "823dbd1aab969b5a813fac59bb977a77",
                 conv,
                 body,
                 store,  # type: ignore[arg-type]
@@ -3589,11 +3646,11 @@ async def test_kiro_native_dispatch_clears_pending_when_injection_fails() -> Non
             )
 
         assert [call[0] for call in client.post_json_calls] == [
-            "/v1/sessions/conv_kiro/resources/terminals",
-            "/v1/sessions/conv_kiro/events",
+            "/v1/sessions/823dbd1aab969b5a813fac59bb977a77/resources/terminals",
+            "/v1/sessions/823dbd1aab969b5a813fac59bb977a77/events",
         ]
         assert store.appended_items == []
-        assert pending_inputs.snapshot_for("conv_kiro") == []
+        assert pending_inputs.snapshot_for("823dbd1aab969b5a813fac59bb977a77") == []
     finally:
         pending_inputs.reset_for_tests()
 
@@ -3606,15 +3663,15 @@ async def test_kiro_external_prompt_matches_pending_and_reports_skipped_input() 
 
     pending_inputs.reset_for_tests()
     store = _ConversationStore()
-    conv = store.get_conversation("conv_kiro")
+    conv = store.get_conversation("823dbd1aab969b5a813fac59bb977a77")
     assert conv is not None
     first = pending_inputs.record(
-        "conv_kiro",
+        "823dbd1aab969b5a813fac59bb977a77",
         [{"type": "input_text", "text": "!!!! XOXOX !!!!"}],
         created_by="alice@example.com",
     )
     second = pending_inputs.record(
-        "conv_kiro",
+        "823dbd1aab969b5a813fac59bb977a77",
         [{"type": "input_text", "text": "tell me a joke"}],
         created_by="alice@example.com",
     )
@@ -3632,14 +3689,14 @@ async def test_kiro_external_prompt_matches_pending_and_reports_skipped_input() 
 
     try:
         item_id = await _persist_external_conversation_item(
-            "conv_kiro",
+            "823dbd1aab969b5a813fac59bb977a77",
             conv,
             body,
             store,  # type: ignore[arg-type]
         )
 
         assert item_id == "item_2"
-        assert pending_inputs.snapshot_for("conv_kiro") == []
+        assert pending_inputs.snapshot_for("823dbd1aab969b5a813fac59bb977a77") == []
         assert [item.type for item in store.appended_items] == ["message", "error", "message"]
         skipped_user, skipped_error, matched_user = store.appended_items
         assert skipped_user.data.role == "user"
@@ -3667,11 +3724,11 @@ async def test_native_dispatch_reports_malformed_runner_error_body() -> None:
     from omnigent.server.routes.sessions import _dispatch_session_event_to_runner
 
     store = _ConversationStore()
-    conv = store.get_conversation("conv_claude")
+    conv = store.get_conversation("64a784c3aa907d1774f44313546947c6")
     assert conv is not None
     client = _FakeRunnerClient(
         text_responses={
-            "/v1/sessions/conv_claude/resources/terminals": (
+            "/v1/sessions/64a784c3aa907d1774f44313546947c6/resources/terminals": (
                 500,
                 "Internal Server Error",
                 {"content-type": "text/plain"},
@@ -3684,7 +3741,7 @@ async def test_native_dispatch_reports_malformed_runner_error_body() -> None:
     )
 
     result = await _dispatch_session_event_to_runner(
-        "conv_claude",
+        "64a784c3aa907d1774f44313546947c6",
         conv,
         body,
         store,  # type: ignore[arg-type]
@@ -3720,14 +3777,14 @@ async def test_native_dispatch_transport_error_does_not_fallback_to_forwarding()
     from omnigent.server.routes.sessions import _dispatch_session_event_to_runner
 
     store = _ConversationStore()
-    conv = store.get_conversation("conv_claude")
+    conv = store.get_conversation("64a784c3aa907d1774f44313546947c6")
     assert conv is not None
     client = _FakeRunnerClient(
         exc=httpx.ConnectError(
             "connection refused",
             request=httpx.Request(
                 "POST",
-                "/v1/sessions/conv_claude/resources/terminals",
+                "/v1/sessions/64a784c3aa907d1774f44313546947c6/resources/terminals",
             ),
         )
     )
@@ -3737,7 +3794,7 @@ async def test_native_dispatch_transport_error_does_not_fallback_to_forwarding()
     )
 
     result = await _dispatch_session_event_to_runner(
-        "conv_claude",
+        "64a784c3aa907d1774f44313546947c6",
         conv,
         body,
         store,  # type: ignore[arg-type]
@@ -3750,7 +3807,7 @@ async def test_native_dispatch_transport_error_does_not_fallback_to_forwarding()
 
     assert result.pending_id is None
     assert [call[0] for call in client.post_json_calls] == [
-        "/v1/sessions/conv_claude/resources/terminals"
+        "/v1/sessions/64a784c3aa907d1774f44313546947c6/resources/terminals"
     ]
     assert [i.type for i in store.appended_items] == ["message", "error"]
     errors = [i for i in store.appended_items if i.type == "error"]
@@ -3781,7 +3838,7 @@ async def test_native_dispatch_tunnel_close_is_definitive_ensure_error() -> None
     from omnigent.server.routes.sessions import _dispatch_session_event_to_runner
 
     store = _ConversationStore()
-    conv = store.get_conversation("conv_claude")
+    conv = store.get_conversation("64a784c3aa907d1774f44313546947c6")
     assert conv is not None
     client = _FakeRunnerClient(exc=ConnectionError("tunnel closed before request completed"))
     body = SessionEventInput(
@@ -3790,7 +3847,7 @@ async def test_native_dispatch_tunnel_close_is_definitive_ensure_error() -> None
     )
 
     result = await _dispatch_session_event_to_runner(
-        "conv_claude",
+        "64a784c3aa907d1774f44313546947c6",
         conv,
         body,
         store,  # type: ignore[arg-type]
@@ -3827,11 +3884,11 @@ async def test_native_dispatch_persists_error_for_each_user_retry() -> None:
     from omnigent.server.routes.sessions import _dispatch_session_event_to_runner
 
     store = _ConversationStore()
-    conv = store.get_conversation("conv_claude")
+    conv = store.get_conversation("64a784c3aa907d1774f44313546947c6")
     assert conv is not None
     client = _FakeRunnerClient(
         responses={
-            "/v1/sessions/conv_claude/resources/terminals": (
+            "/v1/sessions/64a784c3aa907d1774f44313546947c6/resources/terminals": (
                 500,
                 {
                     "error": {
@@ -3849,7 +3906,7 @@ async def test_native_dispatch_persists_error_for_each_user_retry() -> None:
             data={"role": "user", "content": [{"type": "input_text", "text": text}]},
         )
         result = await _dispatch_session_event_to_runner(
-            "conv_claude",
+            "64a784c3aa907d1774f44313546947c6",
             conv,
             body,
             store,  # type: ignore[arg-type]
@@ -3870,8 +3927,8 @@ async def test_native_dispatch_persists_error_for_each_user_retry() -> None:
     # more would mean one retry wrote duplicate banners.
     assert len(errors) == 2
     assert [call[0] for call in client.post_json_calls] == [
-        "/v1/sessions/conv_claude/resources/terminals",
-        "/v1/sessions/conv_claude/resources/terminals",
+        "/v1/sessions/64a784c3aa907d1774f44313546947c6/resources/terminals",
+        "/v1/sessions/64a784c3aa907d1774f44313546947c6/resources/terminals",
     ]
     assert all(
         e.data.message == "Native Claude requires the 'claude' CLI on PATH." for e in errors
@@ -3891,11 +3948,11 @@ async def test_native_dispatch_records_same_error_after_recovery_boundary() -> N
     from omnigent.server.routes.sessions import _dispatch_session_event_to_runner
 
     store = _ConversationStore()
-    conv = store.get_conversation("conv_claude")
+    conv = store.get_conversation("64a784c3aa907d1774f44313546947c6")
     assert conv is not None
     client = _FakeRunnerClient(
         responses={
-            "/v1/sessions/conv_claude/resources/terminals": (
+            "/v1/sessions/64a784c3aa907d1774f44313546947c6/resources/terminals": (
                 500,
                 {
                     "error": {
@@ -3912,7 +3969,7 @@ async def test_native_dispatch_records_same_error_after_recovery_boundary() -> N
         data={"role": "user", "content": [{"type": "input_text", "text": "first retry"}]},
     )
     await _dispatch_session_event_to_runner(
-        "conv_claude",
+        "64a784c3aa907d1774f44313546947c6",
         conv,
         first,
         store,  # type: ignore[arg-type]
@@ -3923,7 +3980,7 @@ async def test_native_dispatch_records_same_error_after_recovery_boundary() -> N
         created_by=None,
     )
     store.append(
-        "conv_claude",
+        "64a784c3aa907d1774f44313546947c6",
         [
             NewConversationItem(
                 type="message",
@@ -3941,7 +3998,7 @@ async def test_native_dispatch_records_same_error_after_recovery_boundary() -> N
         data={"role": "user", "content": [{"type": "input_text", "text": "second retry"}]},
     )
     await _dispatch_session_event_to_runner(
-        "conv_claude",
+        "64a784c3aa907d1774f44313546947c6",
         conv,
         second,
         store,  # type: ignore[arg-type]
@@ -3979,7 +4036,7 @@ async def test_relay_skips_malformed_resource_created_from_runner() -> None:
         ]
     )
 
-    await _relay_runner_stream("conv_proxy", client, store)  # type: ignore[arg-type]
+    await _relay_runner_stream("79b22ebd2309e48fdeb450c65611d51b", client, store)  # type: ignore[arg-type]
 
     events = [i for i in store.appended_items if i.type == "resource_event"]
     assert events == []
@@ -3998,13 +4055,13 @@ async def test_relay_skips_malformed_resource_created_from_runner() -> None:
             "type": "session.resource.deleted",
             "resource_id": "",
             "resource_type": "terminal",
-            "session_id": "conv_proxy",
+            "session_id": "79b22ebd2309e48fdeb450c65611d51b",
         },
         {
             "type": "session.resource.deleted",
             "resource_id": "terminal_zsh_s1",
             "resource_type": "",
-            "session_id": "conv_proxy",
+            "session_id": "79b22ebd2309e48fdeb450c65611d51b",
         },
     ],
 )
@@ -4023,7 +4080,7 @@ async def test_relay_skips_empty_resource_id_or_type_from_runner(
     store = _ConversationStore()
     client = _FakeStreamingRunnerClient([_sse_frame(frame_payload), "data: [DONE]\n\n"])
 
-    await _relay_runner_stream("conv_proxy", client, store)  # type: ignore[arg-type]
+    await _relay_runner_stream("79b22ebd2309e48fdeb450c65611d51b", client, store)  # type: ignore[arg-type]
 
     events = [i for i in store.appended_items if i.type == "resource_event"]
     assert events == []
@@ -4092,7 +4149,7 @@ async def test_relay_pairs_function_call_output_with_call_response_id() -> None:
         ]
     )
 
-    await _relay_runner_stream("conv_proxy", client, store)  # type: ignore[arg-type]
+    await _relay_runner_stream("79b22ebd2309e48fdeb450c65611d51b", client, store)  # type: ignore[arg-type]
 
     outputs = [i for i in store.appended_items if i.type == "function_call_output"]
     # Exactly one output — the single tool result in the stream. Zero
@@ -4134,7 +4191,7 @@ async def test_relay_publishes_inflight_frames_and_discards_on_exit() -> None:
     published: list[dict[str, Any]] = []
 
     async def _consume() -> None:
-        async for event in session_stream.subscribe("conv_proxy"):
+        async for event in session_stream.subscribe("79b22ebd2309e48fdeb450c65611d51b"):
             published.append(event)
 
     try:
@@ -4165,8 +4222,8 @@ async def test_relay_publishes_inflight_frames_and_discards_on_exit() -> None:
             ]
         )
 
-        await _relay_runner_stream("conv_proxy", client, store)  # type: ignore[arg-type]
-        session_stream.close("conv_proxy")
+        await _relay_runner_stream("79b22ebd2309e48fdeb450c65611d51b", client, store)  # type: ignore[arg-type]
+        session_stream.close("79b22ebd2309e48fdeb450c65611d51b")
         await consumer
 
         # Producer: the relay published the lifecycle + text frames that
@@ -4182,7 +4239,7 @@ async def test_relay_publishes_inflight_frames_and_discards_on_exit() -> None:
         # Leak fix: the relay's teardown discarded the entry. A non-empty
         # result means the finally discard was dropped and a Stop / runner
         # death would strand stale text (replayed on the next reload).
-        assert inflight_text.snapshot_for("conv_proxy") == [], (
+        assert inflight_text.snapshot_for("79b22ebd2309e48fdeb450c65611d51b") == [], (
             "relay exit must discard the in-flight entry"
         )
     finally:
@@ -4207,7 +4264,7 @@ async def test_relay_fences_cancelled_turn_and_resumes_on_next_turn(
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.server.routes.sessions import _relay_runner_stream
 
-    sid = "conv_fenced"
+    sid = "693c79ed3286f353bfb89489e0f4f643"
     published: list[dict[str, Any]] = []
 
     def _capture(session_id: str, event: dict[str, Any]) -> None:
@@ -4276,7 +4333,7 @@ async def test_relay_flushes_partial_text_on_failed_turn_before_error_item() -> 
     from omnigent.server.routes.sessions import _relay_runner_stream
 
     inflight_text.reset_for_tests()
-    sid = "conv_proxy"
+    sid = "79b22ebd2309e48fdeb450c65611d51b"
     store = _ConversationStore()
     # In-flight replay snapshots probed at deterministic points: after the
     # deltas (entry populated) and after the failed terminal (entry cleared).
@@ -4365,7 +4422,7 @@ async def test_relay_flushes_final_text_on_fenced_response_completed(
     from omnigent.server.routes.sessions import _relay_runner_stream
 
     inflight_text.reset_for_tests()
-    sid = "conv_fence_completed"
+    sid = "0324351dd7cff62baefd1172b4d99a31"
     store = _ConversationStore()
     published: list[dict[str, Any]] = []
     real_publish = session_stream.publish
@@ -4434,7 +4491,7 @@ async def test_relay_persists_pre_stop_narration_on_fenced_incomplete(
     from omnigent.server.routes.sessions import _relay_runner_stream
 
     inflight_text.reset_for_tests()
-    sid = "conv_fence_incomplete"
+    sid = "b47007d2de93605dd8229a49620b190a"
     store = _ConversationStore()
     published: list[dict[str, Any]] = []
     real_publish = session_stream.publish
@@ -4507,7 +4564,7 @@ async def test_relay_lets_elicitation_resolved_pass_the_fence(
 
     inflight_text.reset_for_tests()
     pending_elicitations.reset_for_tests()
-    sid = "conv_fence_elicit"
+    sid = "9a77e31b1f918849f16318b90d8759a3"
     store = _ConversationStore()
     published: list[dict[str, Any]] = []
     real_publish = session_stream.publish
@@ -4579,7 +4636,7 @@ async def test_relay_suppresses_fenced_deltas_until_running_when_no_terminal_arr
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.server.routes.sessions import _relay_runner_stream
 
-    sid = "conv_fence_no_terminal"
+    sid = "7e19212006f58af9e334464ad92d69d8"
     published: list[dict[str, Any]] = []
 
     def _capture(session_id: str, event: dict[str, Any]) -> None:
@@ -4694,7 +4751,7 @@ async def test_relay_interleaves_text_segments_with_tool_calls() -> None:
     )
 
     try:
-        await _relay_runner_stream("conv_proxy", client, store)  # type: ignore[arg-type]
+        await _relay_runner_stream("79b22ebd2309e48fdeb450c65611d51b", client, store)  # type: ignore[arg-type]
 
         # Persisted order interleaves narration with its tool calls — the
         # first text lands BEFORE call_1, not pooled after every tool.
@@ -4772,7 +4829,7 @@ async def test_relay_flush_drops_committed_text_from_inflight_replay(
         ]
     )
     try:
-        await _relay_runner_stream("conv_proxy", client, store)  # type: ignore[arg-type]
+        await _relay_runner_stream("79b22ebd2309e48fdeb450c65611d51b", client, store)  # type: ignore[arg-type]
 
         # The narration committed as its own message...
         msgs = [i for i in store.appended_items if i.type == "message"]
@@ -4782,7 +4839,7 @@ async def test_relay_flush_drops_committed_text_from_inflight_replay(
         # ...and the flush dropped it from the replay, so a reconnect here
         # gets nothing. If reset_text were removed, snapshot_for would
         # replay the committed text and double-render it.
-        assert inflight_text.snapshot_for("conv_proxy") == [], (
+        assert inflight_text.snapshot_for("79b22ebd2309e48fdeb450c65611d51b") == [], (
             "flushed (committed) text must not replay on mid-turn reconnect"
         )
     finally:
@@ -4877,7 +4934,7 @@ class _SubagentTerminalStore:
 def _make_subagent_conv(child_id: str, *, wrapper: str, kind: str = "sub_agent") -> Conversation:
     """Build a sub-agent conversation row for terminal-delivery relay tests.
 
-    :param child_id: Child session id, e.g. ``"conv_cc_child"``.
+    :param child_id: Child session id, e.g. ``"81c8ded726a170a0b623598bcc465efc"``.
     :param wrapper: ``omnigent.wrapper`` label, e.g.
         ``"claude-code-native-ui"`` or ``"codex-native-ui"``.
     :param kind: Conversation kind, ``"sub_agent"`` or ``"default"``.
@@ -4887,9 +4944,9 @@ def _make_subagent_conv(child_id: str, *, wrapper: str, kind: str = "sub_agent")
         id=child_id,
         created_at=1,
         updated_at=1,
-        root_conversation_id="conv_parent",
-        parent_conversation_id="conv_parent",
-        agent_id="ag_test",
+        root_conversation_id="ead6d59a6b650d19dbdf61ec32426f4e",
+        parent_conversation_id="ead6d59a6b650d19dbdf61ec32426f4e",
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
         kind=kind,
         labels={"omnigent.ui": "terminal", "omnigent.wrapper": wrapper},
     )
@@ -4924,7 +4981,7 @@ async def test_relay_never_delivers_terminal_on_pty_status(
     """
     from omnigent.server.routes.sessions import _relay_runner_stream
 
-    child_id = "conv_relay_nodeliver"
+    child_id = "d30d5c132923e646113e9a2bfb28f15a"
     store = _SubagentTerminalStore(
         _make_subagent_conv(child_id, wrapper=wrapper, kind=kind),
         assistant_text="work in progress",

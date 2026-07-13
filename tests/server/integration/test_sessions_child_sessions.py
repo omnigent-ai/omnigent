@@ -98,7 +98,7 @@ def _seed_child(
     ``agent_name`` fields in the summary are always ``None``.
 
     :param conv_store: Store for the child conversation.
-    :param parent_id: Parent conversation id, e.g. ``"conv_parent1"``.
+    :param parent_id: Parent conversation id, e.g. ``"0c4b962f26d3fb76dce69d9dade142f5"``.
     :param title: Sub-agent title in the canonical
         ``"{agent_type}:{session_name}"`` format,
         e.g. ``"researcher:auth"``.
@@ -121,7 +121,7 @@ async def test_child_sessions_404_for_nonexistent_session(
     client: httpx.AsyncClient,
 ) -> None:
     """Route returns 404 when the parent session does not exist."""
-    resp = await client.get("/v1/sessions/conv_nonexistent/child_sessions")
+    resp = await client.get("/v1/sessions/ad563e906854634c49e1a6fd2fbb31d4/child_sessions")
     assert resp.status_code == 404
 
 
@@ -1491,7 +1491,7 @@ async def test_native_subagent_message_uses_native_terminal_forward(
         """
         Route the native child message to the fake runner.
 
-        :param session_id: Session being routed, e.g. ``"conv_child"``.
+        :param session_id: Session being routed, e.g. ``"ff5cac23d0beb79fad914046049f32ff"``.
         :param runner_router: Real runner router, unused.
         :returns: The fake runner client.
         """
@@ -1609,7 +1609,7 @@ async def test_multipart_create_with_parent_links_child(
     # The created agent identifiers prove the response contract the
     # runner's bundle-mode handle depends on; a missing/empty agent_id
     # would make sys_session_create fail loud on the runner side.
-    assert body["agent_id"].startswith("ag_")
+    assert len(body["agent_id"]) == 32
     assert body["agent_name"] == "bundle-child"
 
     snap = await client.get(f"/v1/sessions/{child_id}")
@@ -1640,7 +1640,7 @@ async def test_multipart_create_with_unknown_parent_404s(
     bundle = build_agent_bundle(name="bundle-orphan")
     resp = await client.post(
         "/v1/sessions",
-        data={"metadata": json.dumps({"parent_session_id": "conv_missing"})},
+        data={"metadata": json.dumps({"parent_session_id": "5eca720dc2bc6cdc3a99028d7bd0f917"})},
         files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
     )
     assert resp.status_code == 404, resp.text

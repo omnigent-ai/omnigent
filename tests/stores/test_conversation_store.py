@@ -26,7 +26,7 @@ from omnigent.stores.host_store import HostStore
 
 def test_create_and_get(conversation_store: SqlAlchemyConversationStore) -> None:
     conv = conversation_store.create_conversation()
-    assert conv.id.startswith("conv_")
+    assert len(conv.id) == 32
 
     fetched = conversation_store.get_conversation(conv.id)
     assert fetched is not None
@@ -34,7 +34,7 @@ def test_create_and_get(conversation_store: SqlAlchemyConversationStore) -> None
 
 
 def test_get_nonexistent(conversation_store: SqlAlchemyConversationStore) -> None:
-    assert conversation_store.get_conversation("conv_none") is None
+    assert conversation_store.get_conversation("c55a64c3f6f954fe0fc8738ba3f45f26") is None
 
 
 def test_get_conversations_bulk(
@@ -52,7 +52,7 @@ def test_get_conversations_bulk(
     # across the batch or dropped for the unlabeled row.
     conversation_store.set_labels(a.id, {"omnigent.ui": "terminal"})
 
-    result = conversation_store.get_conversations([a.id, b.id, "conv_missing"])
+    result = conversation_store.get_conversations([a.id, b.id, "5eca720dc2bc6cdc3a99028d7bd0f917"])
 
     # The unknown id is omitted rather than mapped to None — the caller
     # treats absence as "no longer resolves".
@@ -155,7 +155,7 @@ def test_list_latest_message_items_for_conversations(
     )
 
     result = conversation_store.list_latest_message_items_for_conversations(
-        [conv_a.id, conv_b.id, conv_empty.id, "conv_missing"],
+        [conv_a.id, conv_b.id, conv_empty.id, "5eca720dc2bc6cdc3a99028d7bd0f917"],
         per_conversation_limit=2,
     )
 
@@ -173,11 +173,11 @@ def test_list_latest_message_items_for_conversations(
             texts.append(item.data.content[0]["text"])
         return texts
 
-    assert set(result) == {conv_a.id, conv_b.id, conv_empty.id, "conv_missing"}
+    assert set(result) == {conv_a.id, conv_b.id, conv_empty.id, "5eca720dc2bc6cdc3a99028d7bd0f917"}
     assert _texts(conv_a.id) == ["alpha new", "alpha old"]
     assert _texts(conv_b.id) == ["bravo new", "bravo middle"]
     assert result[conv_empty.id] == []
-    assert result["conv_missing"] == []
+    assert result["5eca720dc2bc6cdc3a99028d7bd0f917"] == []
 
 
 def test_ranked_latest_message_items_omits_search_text(
@@ -196,7 +196,7 @@ def test_ranked_latest_message_items_omits_search_text(
         _ranked_latest_message_items,
     )
 
-    ranked = _ranked_latest_message_items(["conv_x"])
+    ranked = _ranked_latest_message_items(["8af356d908005a65f872c246158c6293"])
     columns = {c.key for c in ranked.c}
     assert "search_text" not in columns
     # The columns _to_item + the preview actually consume must all be present.
@@ -242,7 +242,10 @@ def test_update_title(conversation_store: SqlAlchemyConversationStore) -> None:
     assert updated is not None
     assert updated.title == "Chat 1"
 
-    assert conversation_store.update_conversation("conv_none", title="x") is None
+    assert (
+        conversation_store.update_conversation("c55a64c3f6f954fe0fc8738ba3f45f26", title="x")
+        is None
+    )
 
 
 def test_update_archived_round_trip(
@@ -355,8 +358,8 @@ def test_append_and_list_items(conversation_store: SqlAlchemyConversationStore) 
         ],
     )
     assert len(items) == 2
-    assert items[0].id.startswith("msg_")
-    assert items[1].id.startswith("msg_")
+    assert len(items[0].id) == 32
+    assert len(items[1].id) == 32
 
     page = conversation_store.list_items(conv.id)
     assert len(page.data) == 2
@@ -449,8 +452,8 @@ def test_append_function_call_items(
             ),
         ],
     )
-    assert items[0].id.startswith("fc_")
-    assert items[1].id.startswith("fco_")
+    assert len(items[0].id) == 32
+    assert len(items[1].id) == 32
 
 
 def test_append_tool_output_with_nul_bytes(
@@ -488,7 +491,7 @@ def test_append_tool_output_with_nul_bytes(
     # append() returning normally (not raising DataError) is the
     # primary reproduction: pre-fix this INSERT aborted on Postgres.
     item_id = items[0].id
-    assert item_id.startswith("fco_")
+    assert len(item_id) == 32
 
     # The payload round-trips faithfully: NUL is preserved in the data
     # column (json.dumps escapes it to the literal 6-char
@@ -507,7 +510,7 @@ def test_append_tool_output_with_nul_bytes(
     with engine.connect() as conn:
         row = conn.execute(
             text("SELECT data, search_text FROM conversation_items WHERE id = :id"),
-            {"id": item_id},
+            {"id": bytes.fromhex(item_id)},  # id column is now 16-byte binary
         ).one()
     assert "\x00" not in row.search_text
     assert "\x00" not in row.data
@@ -533,7 +536,7 @@ def test_append_reasoning_item(conversation_store: SqlAlchemyConversationStore) 
             ),
         ],
     )
-    assert items[0].id.startswith("rs_")
+    assert len(items[0].id) == 32
 
 
 def test_append_error_item_round_trips_for_history(
@@ -567,7 +570,7 @@ def test_append_error_item_round_trips_for_history(
         ],
     )
 
-    assert persisted.id.startswith("err_")
+    assert len(persisted.id) == 32
     [read_back] = conversation_store.list_items(conv.id).data
     assert read_back.id == persisted.id
     assert read_back.response_id == "resp_failed"
@@ -1477,7 +1480,7 @@ def test_list_items_type_filter_returns_only_matching_type(
                 response_id="resp_001",
                 data=CompactionData(
                     summary="Summary text",
-                    last_item_id="msg_001",
+                    last_item_id="7ae6efab548a4e13ae0ac9efc56d841e",
                     model="openai/gpt-4o",
                     token_count=50,
                 ),
@@ -1543,7 +1546,7 @@ def test_list_items_type_filter_with_order_and_limit(
                 response_id="resp_001",
                 data=CompactionData(
                     summary="First summary",
-                    last_item_id="msg_010",
+                    last_item_id="7cd616150a23fe70bf378669c79387f2",
                     model="openai/gpt-4o",
                     token_count=100,
                 ),
@@ -1558,7 +1561,7 @@ def test_list_items_type_filter_with_order_and_limit(
                 response_id="resp_002",
                 data=CompactionData(
                     summary="Second summary",
-                    last_item_id="msg_020",
+                    last_item_id="cb01aedfa2199bc66feb77ba3b82f90a",
                     model="openai/gpt-4o",
                     token_count=120,
                 ),
@@ -1817,7 +1820,7 @@ def test_list_conversations_sort_by_updated_at(
         kind=None,
     )
     assert by_created.data[0].id == conv_b.id, (
-        "Expected conv_b first when sorting by created_at desc."
+        "Expected bfcc6c068875253adf2f20bf30a19015 first when sorting by created_at desc."
     )
 
     # sort_by=updated_at desc → conv_a first (updated more recently)
@@ -1827,8 +1830,8 @@ def test_list_conversations_sort_by_updated_at(
         kind=None,
     )
     assert by_updated.data[0].id == conv_a.id, (
-        "Expected conv_a first when sorting by updated_at desc, "
-        "because it was updated at t=300 vs conv_b at t=200."
+        "Expected 94c349190e241f85a984b3df8f129696 first when sorting by updated_at desc, "
+        "because it was updated at t=300 vs bfcc6c068875253adf2f20bf30a19015 at t=200."
     )
 
 
@@ -2070,14 +2073,14 @@ def test_list_child_conversation_ids_by_parent_groups_direct_subagents(
     )
 
     result = conversation_store.list_child_conversation_ids_by_parent(
-        [parent_a.id, parent_b.id, "conv_missing", parent_a.id]
+        [parent_a.id, parent_b.id, "5eca720dc2bc6cdc3a99028d7bd0f917", parent_a.id]
     )
 
-    assert set(result) == {parent_a.id, parent_b.id, "conv_missing"}
+    assert set(result) == {parent_a.id, parent_b.id, "5eca720dc2bc6cdc3a99028d7bd0f917"}
     assert len(result[parent_a.id]) == 2
     assert sorted(result[parent_a.id]) == sorted([child_a1.id, child_a2.id])
     assert result[parent_b.id] == [child_b.id]
-    assert result["conv_missing"] == []
+    assert result["5eca720dc2bc6cdc3a99028d7bd0f917"] == []
     # A grandchild is a direct child of child_a1, not of parent_a — the helper
     # groups by the immediate parent and does not widen to nested descendants.
     assert nested.id not in result[parent_a.id]
@@ -2110,8 +2113,16 @@ def test_list_conversations_filtered_by_agent_id_returns_matching_only(
     :param conversation_store: The conversation store fixture.
     :param agent_store: The agent store fixture.
     """
-    alpha = agent_store.create(agent_id="ag_alpha", name="alpha", bundle_location="ag_alpha/h")
-    beta = agent_store.create(agent_id="ag_beta", name="beta", bundle_location="ag_beta/h")
+    alpha = agent_store.create(
+        agent_id="f1e73205d3a559f97d5e9021d95832d2",
+        name="alpha",
+        bundle_location="f1e73205d3a559f97d5e9021d95832d2/h",
+    )
+    beta = agent_store.create(
+        agent_id="c796e62af763f9d951301fead40d20de",
+        name="beta",
+        bundle_location="c796e62af763f9d951301fead40d20de/h",
+    )
     conv1 = conversation_store.create_conversation(agent_id=alpha.id)
     conv2 = conversation_store.create_conversation(agent_id=alpha.id)
     conv3 = conversation_store.create_conversation(agent_id=beta.id)
@@ -2138,7 +2149,11 @@ def test_list_conversations_agent_id_none_disables_filter(
     :param conversation_store: The conversation store fixture.
     :param agent_store: The agent store fixture.
     """
-    alpha = agent_store.create(agent_id="ag_alpha2", name="alpha2", bundle_location="ag_alpha2/h")
+    alpha = agent_store.create(
+        agent_id="1b8cb3bf470399f2dab62adfc4e0a47e",
+        name="alpha2",
+        bundle_location="1b8cb3bf470399f2dab62adfc4e0a47e/h",
+    )
     conv_with_agent = conversation_store.create_conversation(agent_id=alpha.id)
     conv_without_agent = conversation_store.create_conversation()
 
@@ -2164,7 +2179,11 @@ def test_list_conversations_filter_distinct_by_agent_id(
     :param conversation_store: The conversation store fixture.
     :param agent_store: The agent store fixture.
     """
-    alpha = agent_store.create(agent_id="ag_alpha3", name="alpha3", bundle_location="ag_alpha3/h")
+    alpha = agent_store.create(
+        agent_id="088b0cf9ba41af7589984807d30c5789",
+        name="alpha3",
+        bundle_location="088b0cf9ba41af7589984807d30c5789/h",
+    )
     conv = conversation_store.create_conversation(agent_id=alpha.id)
 
     page = conversation_store.list_conversations(agent_id=alpha.id)
@@ -2192,7 +2211,11 @@ def test_list_conversations_filter_orders_by_sort_by(
     """
     import omnigent.stores.conversation_store.sqlalchemy_store as store_mod
 
-    alpha = agent_store.create(agent_id="ag_alpha4", name="alpha4", bundle_location="ag_alpha4/h")
+    alpha = agent_store.create(
+        agent_id="56d6facd8237c8523d783d591fa43baa",
+        name="alpha4",
+        bundle_location="56d6facd8237c8523d783d591fa43baa/h",
+    )
 
     # Create two conversations at distinct timestamps so
     # ``updated_at`` differs.
@@ -2320,7 +2343,7 @@ def _register_host(db_uri: str, host_id: str) -> None:
     with the ``conversation_store`` fixture so both hit the same DB.
 
     :param db_uri: SQLite URI shared with the conversation store.
-    :param host_id: Host identifier to register, e.g. ``"host_abc123"``.
+    :param host_id: Host identifier to register, e.g. ``"4f64b6ee625f4e8259185c35c6e63f3d"``.
     """
     HostStore(db_uri).upsert_on_connect(host_id, f"laptop-{host_id}", RESERVED_USER_LOCAL)
 
@@ -2357,17 +2380,17 @@ def test_create_conversation_with_host_id(
     dropping the column or the row→entity converter is skipping it.
     """
     # host_id is an FK to hosts.host_id, so the host must exist first.
-    _register_host(db_uri, "host_abc123")
+    _register_host(db_uri, "4f64b6ee625f4e8259185c35c6e63f3d")
     conv = conversation_store.create_conversation(
-        host_id="host_abc123",
+        host_id="4f64b6ee625f4e8259185c35c6e63f3d",
         workspace="/Users/corey/projects/myapp",
     )
-    assert conv.host_id == "host_abc123"
+    assert conv.host_id == "4f64b6ee625f4e8259185c35c6e63f3d"
     assert conv.workspace == "/Users/corey/projects/myapp"
 
     fetched = conversation_store.get_conversation(conv.id)
     assert fetched is not None
-    assert fetched.host_id == "host_abc123"
+    assert fetched.host_id == "4f64b6ee625f4e8259185c35c6e63f3d"
     assert fetched.workspace == "/Users/corey/projects/myapp"
 
 
@@ -2422,7 +2445,7 @@ def test_set_host_id(
     statement is not executing or not committing.
     """
     # host_id is an FK to hosts.host_id, so the host must exist first.
-    _register_host(db_uri, "host_def456")
+    _register_host(db_uri, "292dfcdf8a31f1319b469f4fa179ac6b")
     # Pre-set workspace so the host_id update doesn't violate the
     # workspace-required-for-host check constraint.
     conv = conversation_store.create_conversation(
@@ -2431,12 +2454,12 @@ def test_set_host_id(
     assert conv.host_id is None
     assert conv.workspace == "/Users/corey/projects/myapp"
 
-    updated = conversation_store.set_host_id(conv.id, "host_def456")
-    assert updated.host_id == "host_def456"
+    updated = conversation_store.set_host_id(conv.id, "292dfcdf8a31f1319b469f4fa179ac6b")
+    assert updated.host_id == "292dfcdf8a31f1319b469f4fa179ac6b"
 
     fetched = conversation_store.get_conversation(conv.id)
     assert fetched is not None
-    assert fetched.host_id == "host_def456"
+    assert fetched.host_id == "292dfcdf8a31f1319b469f4fa179ac6b"
     assert fetched.workspace == "/Users/corey/projects/myapp"
 
 
@@ -2453,7 +2476,9 @@ def test_set_host_id_missing_conversation_raises(
     from omnigent.stores.conversation_store import ConversationNotFoundError
 
     with pytest.raises(ConversationNotFoundError):
-        conversation_store.set_host_id("conv_nonexistent", "host_xyz")
+        conversation_store.set_host_id(
+            "ad563e906854634c49e1a6fd2fbb31d4", "2173662ad94ab46f03cfbdd5f968d22b"
+        )
 
 
 def test_set_host_id_with_workspace_satisfies_constraint(
@@ -2470,17 +2495,17 @@ def test_set_host_id_with_workspace_satisfies_constraint(
     request.
     """
     # host_id is an FK to hosts.host_id, so the host must exist first.
-    _register_host(db_uri, "host_with_workspace")
+    _register_host(db_uri, "8f48061706cb92d5e7cd7c4aadc56ef0")
     conv = conversation_store.create_conversation()
     assert conv.host_id is None
     assert conv.workspace is None
 
     updated = conversation_store.set_host_id(
         conv.id,
-        "host_with_workspace",
+        "8f48061706cb92d5e7cd7c4aadc56ef0",
         workspace="/Users/corey/projects/myapp",
     )
-    assert updated.host_id == "host_with_workspace"
+    assert updated.host_id == "8f48061706cb92d5e7cd7c4aadc56ef0"
     assert updated.workspace == "/Users/corey/projects/myapp"
 
 
@@ -2499,13 +2524,13 @@ def test_clear_host_binding_nulls_all_binding_fields(
     worktree-cleanup paths (git_branch IS NOT NULL); a leftover runner_id
     would block the picker's retry on the atomic set_runner_id CAS.
     """
-    _register_host(db_uri, "host_to_unbind")
+    _register_host(db_uri, "873f058a4a48002a654a80be0ee09bfb")
     conv = conversation_store.create_conversation()
     # Fully bind it the way a worktree launch would: host + worktree path
     # + branch, then a runner.
     conversation_store.set_host_id(
         conv.id,
-        "host_to_unbind",
+        "873f058a4a48002a654a80be0ee09bfb",
         workspace="/Users/corey/repo-worktrees/feature-x",
         git_branch="feature/x",
     )
@@ -2514,7 +2539,7 @@ def test_clear_host_binding_nulls_all_binding_fields(
     assert bound is not None
     # Precondition: every binding field is set (so the assertions below
     # prove clearing, not a no-op on already-empty fields).
-    assert bound.host_id == "host_to_unbind"
+    assert bound.host_id == "873f058a4a48002a654a80be0ee09bfb"
     assert bound.workspace == "/Users/corey/repo-worktrees/feature-x"
     assert bound.git_branch == "feature/x"
     assert bound.runner_id == "runner_token_abc"
@@ -2542,7 +2567,7 @@ def test_clear_host_binding_missing_conversation_raises(
     from omnigent.stores.conversation_store import ConversationNotFoundError
 
     with pytest.raises(ConversationNotFoundError):
-        conversation_store.clear_host_binding("conv_nonexistent")
+        conversation_store.clear_host_binding("ad563e906854634c49e1a6fd2fbb31d4")
 
 
 def test_create_session_with_agent_records_workspace(
@@ -2559,9 +2584,9 @@ def test_create_session_with_agent_records_workspace(
     session is running.
     """
     created = conversation_store.create_session_with_agent(
-        agent_id="ag_session_ws",
+        agent_id="28373c2f7c4d68719e6dbc4b9599b9b0",
         agent_name="cli-test-agent",
-        agent_bundle_location="ag_session_ws/bundle1",
+        agent_bundle_location="28373c2f7c4d68719e6dbc4b9599b9b0/bundle1",
         agent_description=None,
         workspace="/Users/corey/projects/cli-launch",
     )
@@ -2585,9 +2610,9 @@ def test_create_session_with_agent_workspace_defaults_to_none(
     that path through the public method.
     """
     created = conversation_store.create_session_with_agent(
-        agent_id="ag_session_no_ws",
+        agent_id="f8ec0ed35d503406f640ae51bf44c7f7",
         agent_name="no-ws-agent",
-        agent_bundle_location="ag_session_no_ws/bundle1",
+        agent_bundle_location="f8ec0ed35d503406f640ae51bf44c7f7/bundle1",
         agent_description=None,
     )
     fetched = conversation_store.get_conversation(created.conversation.id)
@@ -2609,9 +2634,9 @@ def test_create_session_with_agent_records_terminal_launch_args(
     of the list, and the runner would launch with the wrong args.
     """
     created = conversation_store.create_session_with_agent(
-        agent_id="ag_session_tla",
+        agent_id="df7e0acd3e245704fe6b286dbfd4ded9",
         agent_name="cli-test-agent",
-        agent_bundle_location="ag_session_tla/bundle1",
+        agent_bundle_location="df7e0acd3e245704fe6b286dbfd4ded9/bundle1",
         agent_description=None,
         terminal_launch_args=["--dangerously-skip-permissions", "--model", "opus"],
     )
@@ -2640,9 +2665,9 @@ def test_create_session_with_agent_terminal_launch_args_defaults_to_none(
     launch with zero extra args".
     """
     created = conversation_store.create_session_with_agent(
-        agent_id="ag_session_no_tla",
+        agent_id="a4b69df8a4ccfd0bea607c33acb68493",
         agent_name="no-tla-agent",
-        agent_bundle_location="ag_session_no_tla/bundle1",
+        agent_bundle_location="a4b69df8a4ccfd0bea607c33acb68493/bundle1",
         agent_description=None,
     )
     fetched = conversation_store.get_conversation(created.conversation.id)
@@ -2666,9 +2691,9 @@ def test_create_session_with_agent_links_parent_and_inherits_root(
     """
     parent = conversation_store.create_conversation(runner_id="runner_swa1")
     created = conversation_store.create_session_with_agent(
-        agent_id="ag_session_child",
+        agent_id="9d05fc5310e5daf30deff6eaf5ecfbc8",
         agent_name="bundle-child-agent",
-        agent_bundle_location="ag_session_child/bundle1",
+        agent_bundle_location="9d05fc5310e5daf30deff6eaf5ecfbc8/bundle1",
         agent_description=None,
         parent_conversation_id=parent.id,
         runner_id=parent.runner_id,
@@ -2697,9 +2722,9 @@ def test_create_session_with_agent_top_level_unchanged(
     no parent link, and the row roots its own tree.
     """
     created = conversation_store.create_session_with_agent(
-        agent_id="ag_session_top",
+        agent_id="8d0934d981d62b34d0e1fe28b44c55e4",
         agent_name="top-level-agent",
-        agent_bundle_location="ag_session_top/bundle1",
+        agent_bundle_location="8d0934d981d62b34d0e1fe28b44c55e4/bundle1",
         agent_description=None,
     )
     fetched = conversation_store.get_conversation(created.conversation.id)
@@ -2726,14 +2751,14 @@ def test_create_session_with_agent_missing_parent_fails_loud(
 
     with pytest.raises(ConversationNotFoundError):
         conversation_store.create_session_with_agent(
-            agent_id="ag_session_orphan",
+            agent_id="bcde8586d4addf002f0c904bbd000dad",
             agent_name="orphan-agent",
-            agent_bundle_location="ag_session_orphan/bundle1",
+            agent_bundle_location="bcde8586d4addf002f0c904bbd000dad/bundle1",
             agent_description=None,
-            parent_conversation_id="conv_does_not_exist",
+            parent_conversation_id="1d0b12236c77f69f5073a53583de1a3f",
         )
     # The transaction rolled back: no agent row leaked either.
-    assert conversation_store.get_conversation("conv_does_not_exist") is None
+    assert conversation_store.get_conversation("1d0b12236c77f69f5073a53583de1a3f") is None
 
 
 def test_create_conversation_records_terminal_launch_args(
@@ -2793,9 +2818,9 @@ def test_update_conversation_replaces_terminal_launch_args(
     would make repeated resumes accumulate stale/conflicting flags.
     """
     created = conversation_store.create_session_with_agent(
-        agent_id="ag_session_tla_update",
+        agent_id="1e86f0ad04829bc03ee95dfa02291e33",
         agent_name="update-agent",
-        agent_bundle_location="ag_session_tla_update/bundle1",
+        agent_bundle_location="1e86f0ad04829bc03ee95dfa02291e33/bundle1",
         agent_description=None,
         terminal_launch_args=["--model", "opus"],
     )
@@ -2829,9 +2854,9 @@ def test_update_conversation_terminal_launch_args_empty_list_distinct_from_none(
     caller clearing args back to none-extra would be silently ignored.
     """
     created = conversation_store.create_session_with_agent(
-        agent_id="ag_session_tla_empty",
+        agent_id="85f2913caabe8215094e0d0cba22ad57",
         agent_name="empty-agent",
-        agent_bundle_location="ag_session_tla_empty/bundle1",
+        agent_bundle_location="85f2913caabe8215094e0d0cba22ad57/bundle1",
         agent_description=None,
         terminal_launch_args=["--model", "opus"],
     )
@@ -2862,7 +2887,7 @@ def test_set_host_id_no_workspace_fails_when_row_has_none(
     assert conv.workspace is None
 
     with pytest.raises((IntegrityError, OperationalError)):
-        conversation_store.set_host_id(conv.id, "host_no_ws")
+        conversation_store.set_host_id(conv.id, "1aaae06a39eb66a54f9d97f8e9592155")
 
 
 # ── Workspace ───────────────────────────────────────
@@ -2928,7 +2953,7 @@ def test_create_conversation_with_host_id_no_workspace_raises(
     from sqlalchemy.exc import IntegrityError, OperationalError
 
     with pytest.raises((IntegrityError, OperationalError)):
-        conversation_store.create_conversation(host_id="host_abc")
+        conversation_store.create_conversation(host_id="abb32306b80732bdfa6153b2f5f6eb92")
 
 
 # ── External session id ─────────────────────────────
@@ -3033,7 +3058,7 @@ def test_set_external_session_id_missing_conversation_raises(
 
     with pytest.raises(ConversationNotFoundError):
         conversation_store.set_external_session_id(
-            "conv_does_not_exist",
+            "1d0b12236c77f69f5073a53583de1a3f",
             "sid-1",
         )
 
@@ -3052,12 +3077,12 @@ def test_fork_conversation_copies_items(
     mutated.
     """
     agent_store.create(
-        agent_id="ag_fork_test",
+        agent_id="971f31bb0aac3f2d93931ee788150527",
         name="fork-test",
-        bundle_location="ag_fork_test/fakehash",
+        bundle_location="971f31bb0aac3f2d93931ee788150527/fakehash",
     )
     source = conversation_store.create_conversation(
-        agent_id="ag_fork_test",
+        agent_id="971f31bb0aac3f2d93931ee788150527",
         title="Original",
     )
     conversation_store.append(
@@ -3087,10 +3112,10 @@ def test_fork_conversation_copies_items(
 
     # The fork is a new conversation with a different ID.
     assert fork.id != source.id
-    assert fork.id.startswith("conv_")
+    assert len(fork.id) == 32
     assert fork.title == "My Fork"
     # Agent binding is copied from the source.
-    assert fork.agent_id == "ag_fork_test"
+    assert fork.agent_id == "971f31bb0aac3f2d93931ee788150527"
 
     # Items are deep-copied — same count, different IDs, same data.
     fork_items = conversation_store.list_items(fork.id)
@@ -3123,11 +3148,11 @@ def test_fork_conversation_preserves_created_by(
     conversation does not blank out who authored each message.
     """
     agent_store.create(
-        agent_id="ag_fork_attr",
+        agent_id="3d56c2bb70655f419c942112eaa0e339",
         name="fork-attr",
-        bundle_location="ag_fork_attr/fakehash",
+        bundle_location="3d56c2bb70655f419c942112eaa0e339/fakehash",
     )
-    source = conversation_store.create_conversation(agent_id="ag_fork_attr")
+    source = conversation_store.create_conversation(agent_id="3d56c2bb70655f419c942112eaa0e339")
     conversation_store.append(
         source.id,
         [
@@ -3165,12 +3190,12 @@ def test_fork_conversation_default_title(
 ) -> None:
     """When no title is given, fork derives one from the source title."""
     agent_store.create(
-        agent_id="ag_fork_title",
+        agent_id="909c5b9f4c8a48c5d3ea9f34e6a6cc47",
         name="fork-title",
-        bundle_location="ag_fork_title/fakehash",
+        bundle_location="909c5b9f4c8a48c5d3ea9f34e6a6cc47/fakehash",
     )
     source = conversation_store.create_conversation(
-        agent_id="ag_fork_title",
+        agent_id="909c5b9f4c8a48c5d3ea9f34e6a6cc47",
         title="Chat about Python",
     )
     fork = conversation_store.fork_conversation(source.id)
@@ -3184,16 +3209,16 @@ def test_fork_conversation_empty_source(
 ) -> None:
     """Forking a conversation with no items produces an empty fork."""
     agent_store.create(
-        agent_id="ag_fork_empty",
+        agent_id="bd68e16fae506630f309e6e4a0674c0d",
         name="fork-empty",
-        bundle_location="ag_fork_empty/fakehash",
+        bundle_location="bd68e16fae506630f309e6e4a0674c0d/fakehash",
     )
-    source = conversation_store.create_conversation(agent_id="ag_fork_empty")
+    source = conversation_store.create_conversation(agent_id="bd68e16fae506630f309e6e4a0674c0d")
     fork = conversation_store.fork_conversation(source.id)
 
     fork_items = conversation_store.list_items(fork.id)
     assert fork_items.data == [], "Fork of an empty conversation should have no items"
-    assert fork.agent_id == "ag_fork_empty"
+    assert fork.agent_id == "bd68e16fae506630f309e6e4a0674c0d"
 
 
 def test_fork_conversation_nonexistent_raises(
@@ -3201,7 +3226,7 @@ def test_fork_conversation_nonexistent_raises(
 ) -> None:
     """Forking a non-existent conversation raises LookupError."""
     with pytest.raises(LookupError, match="conversation not found"):
-        conversation_store.fork_conversation("conv_does_not_exist")
+        conversation_store.fork_conversation("1d0b12236c77f69f5073a53583de1a3f")
 
 
 def test_fork_conversation_copies_labels(
@@ -3210,11 +3235,11 @@ def test_fork_conversation_copies_labels(
 ) -> None:
     """Labels on the source conversation are copied to the fork."""
     agent_store.create(
-        agent_id="ag_fork_labels",
+        agent_id="f1afc45b190c3da9cec1acf12aa3600f",
         name="fork-labels",
-        bundle_location="ag_fork_labels/fakehash",
+        bundle_location="f1afc45b190c3da9cec1acf12aa3600f/fakehash",
     )
-    source = conversation_store.create_conversation(agent_id="ag_fork_labels")
+    source = conversation_store.create_conversation(agent_id="f1afc45b190c3da9cec1acf12aa3600f")
     conversation_store.set_labels(source.id, {"sensitivity": "high", "dept": "eng"})
 
     fork = conversation_store.fork_conversation(source.id)
@@ -3247,11 +3272,11 @@ def test_fork_conversation_drops_instance_scoped_labels(
     contract (#657). It must be dropped so the clone opts in afresh.
     """
     agent_store.create(
-        agent_id="ag_fork_instance",
+        agent_id="f88a23d7428c44557a974c2e07787713",
         name="fork-instance",
-        bundle_location="ag_fork_instance/fakehash",
+        bundle_location="f88a23d7428c44557a974c2e07787713/fakehash",
     )
-    source = conversation_store.create_conversation(agent_id="ag_fork_instance")
+    source = conversation_store.create_conversation(agent_id="f88a23d7428c44557a974c2e07787713")
     conversation_store.set_labels(
         source.id,
         {
@@ -3294,11 +3319,11 @@ def test_fork_conversation_stamps_source_external_session_id(
     own on first launch. Sources without a native session get no label.
     """
     agent_store.create(
-        agent_id="ag_fork_ext",
+        agent_id="f27f858bf73f99ab4bdef6152e0f8729",
         name="fork-ext",
-        bundle_location="ag_fork_ext/fakehash",
+        bundle_location="f27f858bf73f99ab4bdef6152e0f8729/fakehash",
     )
-    source = conversation_store.create_conversation(agent_id="ag_fork_ext")
+    source = conversation_store.create_conversation(agent_id="f27f858bf73f99ab4bdef6152e0f8729")
     conversation_store.set_external_session_id(source.id, "claude-uuid-abc")
 
     fork = conversation_store.fork_conversation(source.id)
@@ -3323,11 +3348,11 @@ def test_fork_conversation_no_external_session_id_no_directive(
 ) -> None:
     """A source with no native session id stamps no fork directive."""
     agent_store.create(
-        agent_id="ag_fork_noext",
+        agent_id="51b730ece6dd86c0b9d83180634d3eb9",
         name="fork-noext",
-        bundle_location="ag_fork_noext/fakehash",
+        bundle_location="51b730ece6dd86c0b9d83180634d3eb9/fakehash",
     )
-    source = conversation_store.create_conversation(agent_id="ag_fork_noext")
+    source = conversation_store.create_conversation(agent_id="51b730ece6dd86c0b9d83180634d3eb9")
 
     fork = conversation_store.fork_conversation(source.id)
 
@@ -3349,7 +3374,7 @@ def _append_three_responses(
 
     :param conversation_store: Store to append into.
     :param conversation_id: Target conversation id, e.g.
-        ``"conv_abc123"``.
+        ``"d1f9214d74c38b9f9a9db17ed8352dc4"``.
     """
     for index in (1, 2, 3):
         conversation_store.append(
@@ -3387,11 +3412,11 @@ def test_fork_conversation_up_to_response_truncates_items(
     and drop everything after it, while leaving the source untouched.
     """
     agent_store.create(
-        agent_id="ag_fork_trunc",
+        agent_id="1e63c4993591d0eed8605bac4927a143",
         name="fork-trunc",
-        bundle_location="ag_fork_trunc/fakehash",
+        bundle_location="1e63c4993591d0eed8605bac4927a143/fakehash",
     )
-    source = conversation_store.create_conversation(agent_id="ag_fork_trunc")
+    source = conversation_store.create_conversation(agent_id="1e63c4993591d0eed8605bac4927a143")
     _append_three_responses(conversation_store, source.id)
 
     fork = conversation_store.fork_conversation(source.id, up_to_response_id="resp_002")
@@ -3429,11 +3454,11 @@ def test_fork_conversation_truncated_drops_external_session_directive(
     )
 
     agent_store.create(
-        agent_id="ag_fork_trunc_ext",
+        agent_id="ab940db594b0b58507f706fa30a355b9",
         name="fork-trunc-ext",
-        bundle_location="ag_fork_trunc_ext/fakehash",
+        bundle_location="ab940db594b0b58507f706fa30a355b9/fakehash",
     )
-    source = conversation_store.create_conversation(agent_id="ag_fork_trunc_ext")
+    source = conversation_store.create_conversation(agent_id="ab940db594b0b58507f706fa30a355b9")
     conversation_store.set_external_session_id(source.id, "claude-uuid-trunc")
     _append_three_responses(conversation_store, source.id)
 
@@ -3471,11 +3496,11 @@ def test_fork_conversation_cross_family_drops_external_session_directive(
     )
 
     agent_store.create(
-        agent_id="ag_fork_xfam",
+        agent_id="203798a08983a6a0d0290e53cf717e65",
         name="fork-xfam",
-        bundle_location="ag_fork_xfam/fakehash",
+        bundle_location="203798a08983a6a0d0290e53cf717e65/fakehash",
     )
-    source = conversation_store.create_conversation(agent_id="ag_fork_xfam")
+    source = conversation_store.create_conversation(agent_id="203798a08983a6a0d0290e53cf717e65")
     # A codex thread id on the source: resumable only by a codex target.
     conversation_store.set_external_session_id(source.id, "codex-thread-xfam")
     _append_three_responses(conversation_store, source.id)
@@ -3511,11 +3536,11 @@ def test_fork_conversation_up_to_last_response_keeps_external_directive(
     from omnigent.stores.conversation_store import FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY
 
     agent_store.create(
-        agent_id="ag_fork_trunc_last",
+        agent_id="c774126dd8d6bf6ca0d1baba1893dec2",
         name="fork-trunc-last",
-        bundle_location="ag_fork_trunc_last/fakehash",
+        bundle_location="c774126dd8d6bf6ca0d1baba1893dec2/fakehash",
     )
-    source = conversation_store.create_conversation(agent_id="ag_fork_trunc_last")
+    source = conversation_store.create_conversation(agent_id="c774126dd8d6bf6ca0d1baba1893dec2")
     conversation_store.set_external_session_id(source.id, "claude-uuid-last")
     _append_three_responses(conversation_store, source.id)
 
@@ -3540,11 +3565,11 @@ def test_fork_conversation_up_to_unknown_response_raises(
     and create nothing.
     """
     agent_store.create(
-        agent_id="ag_fork_trunc_bad",
+        agent_id="8114524af82a012591d6af5a76e7773c",
         name="fork-trunc-bad",
-        bundle_location="ag_fork_trunc_bad/fakehash",
+        bundle_location="8114524af82a012591d6af5a76e7773c/fakehash",
     )
-    source = conversation_store.create_conversation(agent_id="ag_fork_trunc_bad")
+    source = conversation_store.create_conversation(agent_id="8114524af82a012591d6af5a76e7773c")
     _append_three_responses(conversation_store, source.id)
 
     with pytest.raises(ValueError, match="resp_nope"):
@@ -3563,29 +3588,29 @@ def test_fork_clone_agent_is_session_scoped(
     "Codex" entries in the fork dialog.
     """
     agent_store.create(
-        agent_id="ag_fork_src",
+        agent_id="2f9e296b0ecfc976c94f8630a80881f8",
         name="claude-native-ui",
-        bundle_location="ag_fork_src/hash",
+        bundle_location="2f9e296b0ecfc976c94f8630a80881f8/hash",
     )
-    source = conversation_store.create_conversation(agent_id="ag_fork_src")
+    source = conversation_store.create_conversation(agent_id="2f9e296b0ecfc976c94f8630a80881f8")
 
     fork = conversation_store.fork_conversation(
         source.id,
-        agent_id="ag_clone_ok",
-        cloned_agent_name="claude-native-ui (fork ag_clone_o)",
-        cloned_agent_bundle_location="ag_fork_src/hash",
+        agent_id="42176d50dd2adf7a0ad796da46b94968",
+        cloned_agent_name="claude-native-ui (fork 267eeb019e971bf79ab32a875543d2ed)",
+        cloned_agent_bundle_location="2f9e296b0ecfc976c94f8630a80881f8/hash",
         cloned_agent_description=None,
     )
 
-    assert fork.agent_id == "ag_clone_ok"
-    cloned = agent_store.get("ag_clone_ok")
+    assert fork.agent_id == "42176d50dd2adf7a0ad796da46b94968"
+    cloned = agent_store.get("42176d50dd2adf7a0ad796da46b94968")
     assert cloned is not None
     assert cloned.session_id == fork.id, "clone must be bound to the fork session"
     # The clone is session-scoped, so it must NOT leak into the built-in
     # list (the source built-in is the only template-name row).
     builtin_ids = {a.id for a in agent_store.list(limit=100).data}
-    assert "ag_clone_ok" not in builtin_ids
-    assert "ag_fork_src" in builtin_ids
+    assert "42176d50dd2adf7a0ad796da46b94968" not in builtin_ids
+    assert "2f9e296b0ecfc976c94f8630a80881f8" in builtin_ids
 
 
 def test_fork_clone_agent_failure_leaves_no_orphan(
@@ -3601,25 +3626,25 @@ def test_fork_clone_agent_failure_leaves_no_orphan(
     failure rolls it back too.
     """
     agent_store.create(
-        agent_id="ag_fork_src2",
+        agent_id="778757750ea50dc358d584451281795d",
         name="codex-native-ui",
-        bundle_location="ag_fork_src2/hash",
+        bundle_location="778757750ea50dc358d584451281795d/hash",
     )
-    source = conversation_store.create_conversation(agent_id="ag_fork_src2")
+    source = conversation_store.create_conversation(agent_id="778757750ea50dc358d584451281795d")
     _append_three_responses(conversation_store, source.id)
 
     before = {a.id for a in agent_store.list(limit=100).data}
     with pytest.raises(ValueError, match="resp_nope"):
         conversation_store.fork_conversation(
             source.id,
-            agent_id="ag_clone_orphan",
-            cloned_agent_name="codex-native-ui (fork ag_clone_o)",
-            cloned_agent_bundle_location="ag_fork_src2/hash",
+            agent_id="77511ca47f5b6c6085061ccf10622eb5",
+            cloned_agent_name="codex-native-ui (fork 267eeb019e971bf79ab32a875543d2ed)",
+            cloned_agent_bundle_location="778757750ea50dc358d584451281795d/hash",
             up_to_response_id="resp_nope",
         )
 
     # The clone must not exist at all, and the built-in list is unchanged.
-    assert agent_store.get("ag_clone_orphan") is None
+    assert agent_store.get("77511ca47f5b6c6085061ccf10622eb5") is None
     after = {a.id for a in agent_store.list(limit=100).data}
     assert after == before
 
@@ -3651,11 +3676,11 @@ def test_fork_conversation_copies_reasoning_effort(
 ) -> None:
     """Fork inherits the source's reasoning_effort setting."""
     agent_store.create(
-        agent_id="ag_fork_re",
+        agent_id="1452a86e49ece29f759b09f04d96c57b",
         name="fork-reasoning",
-        bundle_location="ag_fork_re/fakehash",
+        bundle_location="1452a86e49ece29f759b09f04d96c57b/fakehash",
     )
-    source = conversation_store.create_conversation(agent_id="ag_fork_re")
+    source = conversation_store.create_conversation(agent_id="1452a86e49ece29f759b09f04d96c57b")
     conversation_store.update_conversation(source.id, reasoning_effort="high")
 
     fork = conversation_store.fork_conversation(source.id)
@@ -3672,11 +3697,11 @@ def test_fork_conversation_copies_terminal_launch_args(
 ) -> None:
     """Fork inherits the source's terminal_launch_args setting."""
     agent_store.create(
-        agent_id="ag_fork_tla",
+        agent_id="864e495d9e1b288de879148957c0ae9a",
         name="fork-tla",
-        bundle_location="ag_fork_tla/fakehash",
+        bundle_location="864e495d9e1b288de879148957c0ae9a/fakehash",
     )
-    source = conversation_store.create_conversation(agent_id="ag_fork_tla")
+    source = conversation_store.create_conversation(agent_id="864e495d9e1b288de879148957c0ae9a")
     conversation_store.update_conversation(
         source.id,
         terminal_launch_args=["--dangerously-skip-permissions"],
@@ -3706,11 +3731,11 @@ def test_fork_conversation_copy_model_settings_false_resets(
     the default (``True``) still copies them.
     """
     agent_store.create(
-        agent_id="ag_fork_cms",
+        agent_id="6bfca10f1de66d54bdff530d697d1b68",
         name="fork-cms",
-        bundle_location="ag_fork_cms/fakehash",
+        bundle_location="6bfca10f1de66d54bdff530d697d1b68/fakehash",
     )
-    source = conversation_store.create_conversation(agent_id="ag_fork_cms")
+    source = conversation_store.create_conversation(agent_id="6bfca10f1de66d54bdff530d697d1b68")
     conversation_store.update_conversation(
         source.id, reasoning_effort="high", model_override="claude-opus-4"
     )
@@ -3752,11 +3777,11 @@ def test_fork_conversation_carry_history_into_native_stamps_label(
     from omnigent.stores.conversation_store import FORK_CARRY_HISTORY_LABEL_KEY
 
     agent_store.create(
-        agent_id="ag_fork_carry",
+        agent_id="69ca49f61d21b0fe5219340e39afecf4",
         name="fork-carry",
-        bundle_location="ag_fork_carry/fakehash",
+        bundle_location="69ca49f61d21b0fe5219340e39afecf4/fakehash",
     )
-    source = conversation_store.create_conversation(agent_id="ag_fork_carry")
+    source = conversation_store.create_conversation(agent_id="69ca49f61d21b0fe5219340e39afecf4")
 
     carried = conversation_store.fork_conversation(source.id, carry_history_into_native=True)
     assert carried.labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1", (
@@ -3778,23 +3803,23 @@ def test_fork_conversation_agent_id_override(
     instead of the source's agent.
     """
     agent_store.create(
-        agent_id="ag_original",
+        agent_id="6239422fb5e1335506bb6dedf0f5e8cb",
         name="original-agent",
-        bundle_location="ag_original/fakehash",
+        bundle_location="6239422fb5e1335506bb6dedf0f5e8cb/fakehash",
     )
     agent_store.create(
-        agent_id="ag_cloned",
+        agent_id="ef45a1fbab40c51165f0fe615492ef91",
         name="cloned-agent",
-        bundle_location="ag_original/fakehash",
+        bundle_location="6239422fb5e1335506bb6dedf0f5e8cb/fakehash",
     )
-    source = conversation_store.create_conversation(agent_id="ag_original")
+    source = conversation_store.create_conversation(agent_id="6239422fb5e1335506bb6dedf0f5e8cb")
 
     fork = conversation_store.fork_conversation(
         source.id,
-        agent_id="ag_cloned",
+        agent_id="ef45a1fbab40c51165f0fe615492ef91",
     )
 
-    assert fork.agent_id == "ag_cloned", (
+    assert fork.agent_id == "ef45a1fbab40c51165f0fe615492ef91", (
         "Fork should use the overridden agent_id, not the source's"
     )
 
@@ -3825,9 +3850,9 @@ def test_switch_conversation_agent_cross_family_resets_and_relabels(
 
     # A real session binds a session-scoped agent (agent.session_id == conv).
     created = conversation_store.create_session_with_agent(
-        agent_id="ag_switch_old",
+        agent_id="af75a9579488e3520ba6842699e43323",
         agent_name="claude (switch src)",
-        agent_bundle_location="ag_switch_old/hash",
+        agent_bundle_location="af75a9579488e3520ba6842699e43323/hash",
         agent_description="old",
     )
     conv_id = created.conversation.id
@@ -3867,23 +3892,23 @@ def test_switch_conversation_agent_cross_family_resets_and_relabels(
     }
     updated = conversation_store.switch_conversation_agent(
         conv_id,
-        new_agent_id="ag_switch_new",
+        new_agent_id="9d2c8d5e342b7da390dc38351c49fb72",
         new_agent_name="codex (switch new)",
-        new_agent_bundle_location="ag_switch_new/hash",
+        new_agent_bundle_location="9d2c8d5e342b7da390dc38351c49fb72/hash",
         new_agent_description="new",
         copy_model_settings=False,  # cross-family
         carry_history_into_native=True,  # native target
         presentation_labels=target_labels,
-        previous_builtin_id="ag_builtin_claude",
+        previous_builtin_id="52adb39f0c5ea92b5563da5327dac08f",
     )
 
     # New agent bound; old session-scoped agent deleted (unique session_id
     # index would otherwise be violated by leaving both).
-    assert updated.agent_id == "ag_switch_new"
-    assert agent_store.get("ag_switch_old") is None, (
+    assert updated.agent_id == "9d2c8d5e342b7da390dc38351c49fb72"
+    assert agent_store.get("af75a9579488e3520ba6842699e43323") is None, (
         "old session-scoped agent must be deleted on switch"
     )
-    new_agent = agent_store.get("ag_switch_new")
+    new_agent = agent_store.get("9d2c8d5e342b7da390dc38351c49fb72")
     assert new_agent is not None and new_agent.session_id == conv_id, (
         "new agent must be session-scoped to this conversation"
     )
@@ -3898,7 +3923,7 @@ def test_switch_conversation_agent_cross_family_resets_and_relabels(
     assert updated.labels[UI_MODE_LABEL_KEY] == UI_MODE_TERMINAL_VALUE
     assert updated.labels[WRAPPER_LABEL_KEY] == CODEX_NATIVE_WRAPPER_VALUE
     assert updated.labels[FORK_CARRY_HISTORY_LABEL_KEY] == "1"
-    assert updated.labels[SWITCH_PREVIOUS_BUILTIN_LABEL_KEY] == "ag_builtin_claude"
+    assert updated.labels[SWITCH_PREVIOUS_BUILTIN_LABEL_KEY] == "52adb39f0c5ea92b5563da5327dac08f"
     assert instance_label not in updated.labels, "instance-scoped labels must not survive a switch"
     assert "omnigent.codex_native.bypass_sandbox" not in updated.labels, (
         "the dangerous bypass opt-in must not survive a switch (re-confirm per context)"
@@ -3926,9 +3951,9 @@ def test_switch_conversation_agent_same_family_keeps_model_settings(
     )
 
     created = conversation_store.create_session_with_agent(
-        agent_id="ag_switch_old2",
+        agent_id="06efca8dd5c2e87b8cfed1aae99cc239",
         agent_name="claude-native-ui",
-        agent_bundle_location="ag_switch_old2/hash",
+        agent_bundle_location="06efca8dd5c2e87b8cfed1aae99cc239/hash",
         agent_description=None,
     )
     conv_id = created.conversation.id
@@ -3941,15 +3966,15 @@ def test_switch_conversation_agent_same_family_keeps_model_settings(
             UI_MODE_LABEL_KEY: UI_MODE_TERMINAL_VALUE,
             WRAPPER_LABEL_KEY: "claude-code-native-ui",
             # A stale previous-builtin pointer from an earlier switch.
-            SWITCH_PREVIOUS_BUILTIN_LABEL_KEY: "ag_stale_builtin",
+            SWITCH_PREVIOUS_BUILTIN_LABEL_KEY: "a8361389acc16b7721305a16d0ec739e",
         },
     )
 
     updated = conversation_store.switch_conversation_agent(
         conv_id,
-        new_agent_id="ag_switch_new2",
+        new_agent_id="6b49de4c1bc8cb4d4c02a933f68bd3b1",
         new_agent_name="claude (switch new)",
-        new_agent_bundle_location="ag_switch_new2/hash",
+        new_agent_bundle_location="6b49de4c1bc8cb4d4c02a933f68bd3b1/hash",
         new_agent_description=None,
         copy_model_settings=True,  # same family (anthropic native → sdk)
         carry_history_into_native=False,  # SDK target rebuilds nothing
@@ -3989,18 +4014,20 @@ def test_get_session_connectivity_batches_runner_and_host(
     - an unknown id is absent from the result (callers treat that as
       reachable, matching the legacy single-row path).
     """
-    _register_host(db_uri, "host_conn")
+    _register_host(db_uri, "a6bfc420101272fcd5906a9eff904dfd")
     runner_bound = conversation_store.create_conversation(runner_id="runner_xyz")
-    host_bound = conversation_store.create_conversation(host_id="host_conn", workspace="/tmp/ws")
+    host_bound = conversation_store.create_conversation(
+        host_id="a6bfc420101272fcd5906a9eff904dfd", workspace="/tmp/ws"
+    )
 
     result = conversation_store.get_session_connectivity(
-        [runner_bound.id, host_bound.id, "conv_unknown"]
+        [runner_bound.id, host_bound.id, "fee171f70cf25c4cff8203046e727fd4"]
     )
 
     assert set(result) == {runner_bound.id, host_bound.id}
     assert result[runner_bound.id].runner_id == "runner_xyz"
     assert result[runner_bound.id].host_id is None
-    assert result[host_bound.id].host_id == "host_conn"
+    assert result[host_bound.id].host_id == "a6bfc420101272fcd5906a9eff904dfd"
     assert result[host_bound.id].runner_id is None
     # None of these are forks of a coding session, so needs_workspace is
     # off across the board — a True here would wrongly force the online
@@ -4023,7 +4050,9 @@ def test_get_session_connectivity_reports_needs_workspace_for_fork(
     dropping the first message.
     """
     fork = conversation_store.create_conversation()
-    conversation_store.set_labels(fork.id, {"omnigent.fork.source_id": "conv_src"})
+    conversation_store.set_labels(
+        fork.id, {"omnigent.fork.source_id": "e9f8f58523cec9a57d3bdf93be543e8c"}
+    )
     plain = conversation_store.create_conversation()
 
     result = conversation_store.get_session_connectivity([fork.id, plain.id])
@@ -4424,8 +4453,12 @@ def test_fork_seeds_next_position_from_copied_items(
 ) -> None:
     """A full fork seeds the clone's allocator from the number of copied items,
     so the clone's first append is scan-free and collision-free."""
-    agent_store.create(agent_id="ag_fork_pos", name="fork-pos", bundle_location="ag_fork_pos/h")
-    source = conversation_store.create_conversation(agent_id="ag_fork_pos")
+    agent_store.create(
+        agent_id="ff3484a650590e134422ae11acaae3ac",
+        name="fork-pos",
+        bundle_location="ff3484a650590e134422ae11acaae3ac/h",
+    )
+    source = conversation_store.create_conversation(agent_id="ff3484a650590e134422ae11acaae3ac")
     conversation_store.append(
         source.id, [_user_message(f"s{i}", response_id="resp_1") for i in range(3)]
     )
@@ -4445,9 +4478,11 @@ def test_truncated_fork_seeds_next_position_from_copied_items(
     """A truncated fork seeds the allocator from the count of the *copied*
     items, not the source length, so the shorter clone stays collision-free."""
     agent_store.create(
-        agent_id="ag_fork_trunc", name="fork-trunc", bundle_location="ag_fork_trunc/h"
+        agent_id="1e63c4993591d0eed8605bac4927a143",
+        name="fork-trunc",
+        bundle_location="1e63c4993591d0eed8605bac4927a143/h",
     )
-    source = conversation_store.create_conversation(agent_id="ag_fork_trunc")
+    source = conversation_store.create_conversation(agent_id="1e63c4993591d0eed8605bac4927a143")
     conversation_store.append(
         source.id,
         [_user_message("a", "resp_1"), _user_message("b", "resp_1")],

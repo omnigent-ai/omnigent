@@ -12,9 +12,11 @@ from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 
 def test_create_and_get(agent_store: SqlAlchemyAgentStore) -> None:
     agent = agent_store.create(
-        agent_id="ag_test_gpt4", name="gpt-4", bundle_location="ag_test_gpt4/fakehash"
+        agent_id="88089a8b5dd4eb29fe17d41b2b028cfa",
+        name="gpt-4",
+        bundle_location="ag_test_gpt4/fakehash",
     )
-    assert agent.id.startswith("ag_")
+    assert len(agent.id) == 32
     assert agent.name == "gpt-4"
 
     fetched = agent_store.get(agent.id)
@@ -24,12 +26,14 @@ def test_create_and_get(agent_store: SqlAlchemyAgentStore) -> None:
 
 
 def test_get_nonexistent(agent_store: SqlAlchemyAgentStore) -> None:
-    assert agent_store.get("ag_nonexistent") is None
+    assert agent_store.get("5ff5b2e31fe10beb80134394037b17b0") is None
 
 
 def test_get_by_name(agent_store: SqlAlchemyAgentStore) -> None:
     agent_store.create(
-        agent_id="ag_test_claude", name="claude", bundle_location="ag_test_claude/fakehash"
+        agent_id="d949d15d8243d399d68ce236abee269d",
+        name="claude",
+        bundle_location="ag_test_claude/fakehash",
     )
     found = agent_store.get_by_name("claude")
     assert found is not None
@@ -43,10 +47,16 @@ def test_create_rejects_duplicate_template_name(agent_store: SqlAlchemyAgentStor
     The DB has no partial unique index (MySQL can't build one), so the store's
     create() is the guard.
     """
-    agent_store.create(agent_id="ag_dup_a", name="dup-name", bundle_location="ag_dup_a/fakehash")
+    agent_store.create(
+        agent_id="7881b57b13260d58fd37b103ee69db65",
+        name="dup-name",
+        bundle_location="ag_dup_a/fakehash",
+    )
     with pytest.raises(IntegrityError):
         agent_store.create(
-            agent_id="ag_dup_b", name="dup-name", bundle_location="ag_dup_b/fakehash"
+            agent_id="d924ef7a50570dbbf38c67b059afc7ef",
+            name="dup-name",
+            bundle_location="ag_dup_b/fakehash",
         )
 
 
@@ -64,7 +74,9 @@ def test_get_by_name_and_list_hide_session_scoped_agents(
                 "(id, created_at, updated_at, root_conversation_id) "
                 "VALUES (:id, :ts, :ts, :id)",
             ),
-            {"id": "conv_agent_store_session", "ts": 1700000000},
+            # Raw SQL bypasses the Uuid16 TypeDecorator, so bind 16 raw bytes;
+            # a 32-char hex string overflows the BINARY(16) column on MySQL.
+            {"id": bytes.fromhex("3e2c8fc48e056223d18a47a8d4660491"), "ts": 1700000000},
         )
         conn.execute(
             sa.text(
@@ -73,14 +85,14 @@ def test_get_by_name_and_list_hide_session_scoped_agents(
                 "VALUES (:id, :ts, :name, :loc, 1, 2)",  # kind=2 → 'session'
             ),
             {
-                "id": "ag_agent_store_session",
+                "id": bytes.fromhex("6ec5d35246127ba7b23bd47aa95208ec"),
                 "ts": 1700000001,
                 "name": "session-only-agent",
                 "loc": "ag_agent_store_session/bundle",
             },
         )
     template_agent = agent_store.create(
-        agent_id="ag_agent_store_template",
+        agent_id="ee6a8659002db5242a56278b73f7a06d",
         name="template-agent",
         bundle_location="ag_agent_store_template/bundle",
     )
@@ -94,7 +106,7 @@ def test_get_by_name_and_list_hide_session_scoped_agents(
 
 def test_create_with_description(agent_store: SqlAlchemyAgentStore) -> None:
     agent = agent_store.create(
-        agent_id="ag_test_helper",
+        agent_id="81b344a1abb05d6096989e2aff583e37",
         name="helper",
         bundle_location="ag_test_helper/fakehash",
         description="A helper agent",
@@ -104,7 +116,9 @@ def test_create_with_description(agent_store: SqlAlchemyAgentStore) -> None:
 
 def test_delete(agent_store: SqlAlchemyAgentStore) -> None:
     agent = agent_store.create(
-        agent_id="ag_test_temp", name="temp", bundle_location="ag_test_temp/fakehash"
+        agent_id="ef3b53ae229c2fa6af1e4189fa27b74e",
+        name="temp",
+        bundle_location="ag_test_temp/fakehash",
     )
     assert agent_store.delete(agent.id) is True
     assert agent_store.get(agent.id) is None
@@ -114,7 +128,7 @@ def test_delete(agent_store: SqlAlchemyAgentStore) -> None:
 def test_list_pagination(agent_store: SqlAlchemyAgentStore) -> None:
     for i in range(5):
         agent_store.create(
-            agent_id=f"ag_test_{i}", name=f"agent-{i}", bundle_location=f"ag_test_{i}/fakehash"
+            agent_id=f"{i:032x}", name=f"agent-{i}", bundle_location=f"{i:032x}/fakehash"
         )
 
     page1 = agent_store.list(limit=2)
@@ -132,10 +146,14 @@ def test_list_pagination(agent_store: SqlAlchemyAgentStore) -> None:
 
 def test_list_returns_newest_first(agent_store: SqlAlchemyAgentStore) -> None:
     a1 = agent_store.create(
-        agent_id="ag_test_first", name="first", bundle_location="ag_test_first/fakehash"
+        agent_id="7dc777d26c3e1b66897f9fa0bf4848fb",
+        name="first",
+        bundle_location="ag_test_first/fakehash",
     )
     a2 = agent_store.create(
-        agent_id="ag_test_second", name="second", bundle_location="ag_test_second/fakehash"
+        agent_id="c7ba0ac9893ab0ecef5f36f17b808045",
+        name="second",
+        bundle_location="ag_test_second/fakehash",
     )
     page = agent_store.list()
     ids = {a.id for a in page.data}
@@ -147,7 +165,7 @@ def test_list_returns_newest_first(agent_store: SqlAlchemyAgentStore) -> None:
 def test_list_order_asc(agent_store: SqlAlchemyAgentStore) -> None:
     for i in range(3):
         agent_store.create(
-            agent_id=f"ag_test_{i}", name=f"agent-{i}", bundle_location=f"ag_test_{i}/fakehash"
+            agent_id=f"{i:032x}", name=f"agent-{i}", bundle_location=f"{i:032x}/fakehash"
         )
     page_desc = agent_store.list(order="desc")
     page_asc = agent_store.list(order="asc")
@@ -157,7 +175,7 @@ def test_list_order_asc(agent_store: SqlAlchemyAgentStore) -> None:
 def test_list_before_cursor(agent_store: SqlAlchemyAgentStore) -> None:
     for i in range(5):
         agent_store.create(
-            agent_id=f"ag_test_{i}", name=f"agent-{i}", bundle_location=f"ag_test_{i}/fakehash"
+            agent_id=f"{i:032x}", name=f"agent-{i}", bundle_location=f"{i:032x}/fakehash"
         )
     # Paginate with after, then use before on the last page's first item
     # to go backwards and verify no overlap.
@@ -171,7 +189,7 @@ def test_list_before_cursor(agent_store: SqlAlchemyAgentStore) -> None:
 def test_list_asc_with_after_cursor(agent_store: SqlAlchemyAgentStore) -> None:
     for i in range(5):
         agent_store.create(
-            agent_id=f"ag_test_{i}", name=f"agent-{i}", bundle_location=f"ag_test_{i}/fakehash"
+            agent_id=f"{i:032x}", name=f"agent-{i}", bundle_location=f"{i:032x}/fakehash"
         )
     page1 = agent_store.list(limit=2, order="asc")
     assert len(page1.data) == 2
@@ -197,7 +215,7 @@ def test_list_asc_with_after_cursor(agent_store: SqlAlchemyAgentStore) -> None:
 def test_update_agent(agent_store: SqlAlchemyAgentStore) -> None:
     """update() changes bundle_location, bumps version, sets updated_at."""
     agent = agent_store.create(
-        agent_id="ag_test_upd",
+        agent_id="409a6849f6efefc6ba8da809a29b9b0b",
         name="updatable",
         bundle_location="ag_test_upd/hash1",
     )
@@ -205,7 +223,7 @@ def test_update_agent(agent_store: SqlAlchemyAgentStore) -> None:
     assert agent.version == 1
     assert agent.updated_at is None
 
-    updated = agent_store.update("ag_test_upd", "ag_test_upd/hash2")
+    updated = agent_store.update("409a6849f6efefc6ba8da809a29b9b0b", "ag_test_upd/hash2")
     assert updated is not None
     assert updated.version == 2
     assert updated.bundle_location == "ag_test_upd/hash2"
@@ -216,18 +234,18 @@ def test_update_agent(agent_store: SqlAlchemyAgentStore) -> None:
 
 def test_update_nonexistent_agent(agent_store: SqlAlchemyAgentStore) -> None:
     """update() returns None for a nonexistent agent."""
-    assert agent_store.update("ag_nonexistent", "loc") is None
+    assert agent_store.update("5ff5b2e31fe10beb80134394037b17b0", "loc") is None
 
 
 def test_update_increments_version(agent_store: SqlAlchemyAgentStore) -> None:
     """Multiple updates increment version monotonically."""
     agent_store.create(
-        agent_id="ag_test_ver",
+        agent_id="9dafdd1d4311d9f16337323a6d653308",
         name="versioned",
         bundle_location="ag_test_ver/h1",
     )
-    v2 = agent_store.update("ag_test_ver", "ag_test_ver/h2")
-    v3 = agent_store.update("ag_test_ver", "ag_test_ver/h3")
+    v2 = agent_store.update("9dafdd1d4311d9f16337323a6d653308", "ag_test_ver/h2")
+    v3 = agent_store.update("9dafdd1d4311d9f16337323a6d653308", "ag_test_ver/h3")
     assert v2 is not None and v2.version == 2
     assert v3 is not None and v3.version == 3
 
@@ -235,7 +253,7 @@ def test_update_increments_version(agent_store: SqlAlchemyAgentStore) -> None:
 def test_create_agent_has_version_1(agent_store: SqlAlchemyAgentStore) -> None:
     """Newly created agents start at version 1."""
     agent = agent_store.create(
-        agent_id="ag_test_v1",
+        agent_id="3b1917f10e098e91d3e2fe6bd30104ef",
         name="fresh",
         bundle_location="ag_test_v1/hash",
     )
@@ -248,17 +266,34 @@ def test_create_agent_has_version_1(agent_store: SqlAlchemyAgentStore) -> None:
 
 def test_get_names_returns_id_to_name_mapping(agent_store: SqlAlchemyAgentStore) -> None:
     """get_names batch-fetches agent names by ID."""
-    agent_store.create(agent_id="ag_names_a", name="alpha", bundle_location="ag_names_a/hash")
-    agent_store.create(agent_id="ag_names_b", name="beta", bundle_location="ag_names_b/hash")
-    result = agent_store.get_names(["ag_names_a", "ag_names_b"])
-    assert result == {"ag_names_a": "alpha", "ag_names_b": "beta"}
+    agent_store.create(
+        agent_id="3f1269c64e8e0dae1e03bd1472ff4d84",
+        name="alpha",
+        bundle_location="ag_names_a/hash",
+    )
+    agent_store.create(
+        agent_id="1dd1e3e87699fdd5c6d60680291dbaef", name="beta", bundle_location="ag_names_b/hash"
+    )
+    result = agent_store.get_names(
+        ["3f1269c64e8e0dae1e03bd1472ff4d84", "1dd1e3e87699fdd5c6d60680291dbaef"]
+    )
+    assert result == {
+        "3f1269c64e8e0dae1e03bd1472ff4d84": "alpha",
+        "1dd1e3e87699fdd5c6d60680291dbaef": "beta",
+    }
 
 
 def test_get_names_omits_missing_ids(agent_store: SqlAlchemyAgentStore) -> None:
     """get_names silently omits IDs not found in the store."""
-    agent_store.create(agent_id="ag_names_c", name="gamma", bundle_location="ag_names_c/hash")
-    result = agent_store.get_names(["ag_names_c", "ag_nonexistent"])
-    assert result == {"ag_names_c": "gamma"}
+    agent_store.create(
+        agent_id="e78cb9ee170f482daddce8809f06daec",
+        name="gamma",
+        bundle_location="ag_names_c/hash",
+    )
+    result = agent_store.get_names(
+        ["e78cb9ee170f482daddce8809f06daec", "5ff5b2e31fe10beb80134394037b17b0"]
+    )
+    assert result == {"e78cb9ee170f482daddce8809f06daec": "gamma"}
 
 
 def test_get_names_empty_input(agent_store: SqlAlchemyAgentStore) -> None:
@@ -280,5 +315,5 @@ def test_list_empty(agent_store: SqlAlchemyAgentStore) -> None:
 
 def test_delete_nonexistent_returns_false(agent_store: SqlAlchemyAgentStore) -> None:
     """delete returns False for an ID that was never created."""
-    result = agent_store.delete("ag_never_existed")
+    result = agent_store.delete("5996d55aa263c10a717e2ee631f46409")
     assert result is False

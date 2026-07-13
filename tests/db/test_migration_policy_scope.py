@@ -57,7 +57,8 @@ def test_backfill_sets_session_scope_for_session_policies(db_engine: Engine) -> 
             sa.text(
                 "INSERT INTO conversations"
                 " (id, created_at, updated_at, root_conversation_id)"
-                " VALUES ('conv_sc1', 1, 1, 'conv_sc1')"
+                " VALUES ('7e75643c5e9dd8d8b8e06424e743c7d5', 1, 1,"
+                " '7e75643c5e9dd8d8b8e06424e743c7d5')"
             )
         )
         conn.execute(
@@ -66,12 +67,13 @@ def test_backfill_sets_session_scope_for_session_policies(db_engine: Engine) -> 
                 # name_cksum is NOT NULL at head (x1a2b3c4d5e6) — sha256(name).
                 "INSERT INTO policies"
                 " (id, name, name_cksum, session_id, scope, created_at, type, handler, enabled)"
-                " VALUES ('pol_sc1', 'sess_pol', :cksum, 'conv_sc1', 2, 1, 1, 'mod.f', 1)"
+                " VALUES ('975d8b3b3c096896c86e3a2c9007130e', 'sess_pol', :cksum,"
+                " '7e75643c5e9dd8d8b8e06424e743c7d5', 2, 1, 1, 'mod.f', 1)"
             ),
             {"cksum": hashlib.sha256(b"sess_pol").digest()},
         )
         scope = conn.execute(
-            sa.text("SELECT scope FROM policies WHERE id = 'pol_sc1'")
+            sa.text("SELECT scope FROM policies WHERE id = '975d8b3b3c096896c86e3a2c9007130e'")
         ).scalar_one()
     assert scope == 2
 
@@ -85,12 +87,13 @@ def test_backfill_sets_default_scope_for_default_policies(db_engine: Engine) -> 
                 # name_cksum is NOT NULL at head (x1a2b3c4d5e6) — sha256(name).
                 "INSERT INTO policies"
                 " (id, name, name_cksum, session_id, scope, created_at, type, handler, enabled)"
-                " VALUES ('pol_def1', 'def_pol', :cksum, NULL, 1, 1, 1, 'mod.f', 1)"
+                " VALUES ('62faa13b832455d2a47b5538702afb21', 'def_pol', :cksum,"
+                " NULL, 1, 1, 1, 'mod.f', 1)"
             ),
             {"cksum": hashlib.sha256(b"def_pol").digest()},
         )
         scope = conn.execute(
-            sa.text("SELECT scope FROM policies WHERE id = 'pol_def1'")
+            sa.text("SELECT scope FROM policies WHERE id = '62faa13b832455d2a47b5538702afb21'")
         ).scalar_one()
     assert scope == 1
 
@@ -107,14 +110,14 @@ def test_scope_round_trip_via_store(db_engine: Engine) -> None:
     session_id = conv_store.create_conversation().id
 
     session_pol = policy_store.create(
-        policy_id="pol_rt_sess",
+        policy_id="45b37dc423a384a33427ddb51b418ee0",
         session_id=session_id,
         name="session_policy",
         type="python",
         handler="mod.func",
     )
     default_pol = policy_store.create_default(
-        policy_id="pol_rt_def",
+        policy_id="a095b97d94573f6bba493e2bd479ad88",
         name="default_policy",
         type="python",
         handler="mod.func",
@@ -135,14 +138,14 @@ def test_list_defaults_uses_scope_filter(db_engine: Engine) -> None:
 
     session_id = conv_store.create_conversation().id
     policy_store.create(
-        policy_id="pol_sess_x",
+        policy_id="76437b0af2988606d009e8ecf550ce62",
         session_id=session_id,
         name="sess_x",
         type="python",
         handler="mod.func",
     )
     policy_store.create_default(
-        policy_id="pol_def_x",
+        policy_id="58bf9f55f214321754995cb4beebed38",
         name="def_x",
         type="python",
         handler="mod.func",
@@ -150,7 +153,7 @@ def test_list_defaults_uses_scope_filter(db_engine: Engine) -> None:
 
     defaults = policy_store.list_defaults()
     assert len(defaults) == 1
-    assert defaults[0].id == "pol_def_x"
+    assert defaults[0].id == "58bf9f55f214321754995cb4beebed38"
     assert defaults[0].scope == "default"
 
 

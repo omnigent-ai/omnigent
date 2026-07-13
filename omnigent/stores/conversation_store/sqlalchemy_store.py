@@ -38,6 +38,7 @@ from omnigent.db.db_models import (
     SqlSessionPermission,
     SqlUserDailyCost,
     current_workspace_id,
+    uuid_to_bytes,
 )
 from omnigent.db.enum_codecs import (
     decode_item_status,
@@ -800,7 +801,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             # want here.
             session.execute(
                 text("UPDATE conversations SET updated_at = updated_at WHERE id = :id"),
-                {"id": conversation_id},
+                # Raw SQL bypasses the Uuid16 decorator; bind the 16-byte form
+                # so the WHERE matches the binary id column.
+                {"id": uuid_to_bytes(conversation_id)},
             )
 
     def create_conversation(
@@ -1603,14 +1606,20 @@ class SqlAlchemyConversationStore(ConversationStore):
                         f"ORDER BY ci.created_at DESC LIMIT :limit"
                     )
                 query = like_pattern
-            params: dict[str, str | int] = {
+            params: dict[str, str | int | bytes] = {
                 "query": query,
                 "limit": limit,
                 "ws": current_workspace_id(),
             }
             if conversation_id is not None:
-                params["cid"] = conversation_id
-            item_ids = [row[0] for row in session.execute(stmt, params).fetchall()]
+                # Raw SQL bypasses Uuid16: the FTS mirror stores hex text, but
+                # conversation_items.conversation_id is 16 raw bytes — bind the
+                # form each branch actually compares against.
+                params["cid"] = conversation_id if use_fts else uuid_to_bytes(conversation_id)
+            item_ids = [
+                item_id.hex() if isinstance(item_id, (bytes, memoryview)) else item_id
+                for item_id in (row[0] for row in session.execute(stmt, params).fetchall())
+            ]
             if not item_ids:
                 return []
             rows = (

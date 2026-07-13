@@ -464,12 +464,12 @@ async def test_session_labels_for_runner_spawn_timeout_is_quiet(
         with caplog.at_level(logging.DEBUG, logger="omnigent.runner.app"):
             labels = await _session_labels_for_runner_spawn(
                 server_client=client,
-                session_id="conv_slow",
+                session_id="1dbe53c9796da07f3960b9226435a5c8",
             )
 
     assert labels == {}
     assert [(request.method, request.url.path) for request in transport.requests] == [
-        ("GET", "/v1/sessions/conv_slow/labels")
+        ("GET", "/v1/sessions/1dbe53c9796da07f3960b9226435a5c8/labels")
     ]
     timeout = transport.requests[0].extensions.get("timeout")
     assert isinstance(timeout, dict)
@@ -515,7 +515,7 @@ async def test_session_labels_for_runner_spawn_empty_200_body_recovers(
         with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
             labels = await _session_labels_for_runner_spawn(
                 server_client=client,
-                session_id="conv_empty",
+                session_id="2d4033c255b393808b12437cbdc9c47f",
             )
 
     # Recovered to the fallback instead of raising JSONDecodeError —
@@ -561,7 +561,11 @@ class _FakeFileServerClient:
         if url.endswith("/content"):
             return _Response(body=b"png-bytes")
         return _Response(
-            payload={"id": "file_img", "filename": "photo.png", "content_type": "image/png"}
+            payload={
+                "id": "07b38328508bae2010c8b9933a310846",
+                "filename": "photo.png",
+                "content_type": "image/png",
+            }
         )
 
 
@@ -580,14 +584,18 @@ async def test_sessions_native_resolves_file_id_before_harness() -> None:
 
     async with _runner_client(app) as client:
         resp = await client.post(
-            "/v1/sessions/conv_file/events",
+            "/v1/sessions/d43f93c220661ddaf203a63b45050304/events",
             json={
                 "type": "message",
                 "role": "user",
-                "agent_id": "ag_abc",
+                "agent_id": "0e36e3219954d2deaef06b8e2a936f38",
                 "model": "test-agent",
                 "content": [
-                    {"type": "input_image", "file_id": "file_img", "filename": "photo.png"},
+                    {
+                        "type": "input_image",
+                        "file_id": "07b38328508bae2010c8b9933a310846",
+                        "filename": "photo.png",
+                    },
                     {"type": "input_text", "text": "what is this?"},
                 ],
             },
@@ -596,11 +604,11 @@ async def test_sessions_native_resolves_file_id_before_harness() -> None:
     assert resp.status_code == 202
     assert server_client.get_calls == [
         # file_id blocks are resolved first (before the harness sees them)...
-        "/v1/sessions/conv_file/resources/files/file_img",
-        "/v1/sessions/conv_file/resources/files/file_img/content",
+        "/v1/sessions/d43f93c220661ddaf203a63b45050304/resources/files/07b38328508bae2010c8b9933a310846",
+        "/v1/sessions/d43f93c220661ddaf203a63b45050304/resources/files/07b38328508bae2010c8b9933a310846/content",
         # ...then the cold in-memory cache is rehydrated from the store
         # (empty here) before the turn is dispatched.
-        "/v1/sessions/conv_file/items",
+        "/v1/sessions/d43f93c220661ddaf203a63b45050304/items",
     ]
     for _ in range(20):
         if harness_client.posted_bodies:
@@ -674,11 +682,11 @@ async def test_runner_session_tool_schemas_use_resolved_bundle_workdir(tmp_path:
     )
     async with _runner_client(app) as client:
         resp = await client.post(
-            "/v1/sessions/conv_bundle/events",
+            "/v1/sessions/c7f36aa769270cac30144784fad50acc/events",
             json={
                 "type": "message",
                 "role": "user",
-                "agent_id": "ag_bundle",
+                "agent_id": "31ebfedf721b44dabd76f662cb70a400",
                 "model": "bundle-agent",
                 "content": [{"type": "input_text", "text": "hi"}],
                 "harness": "openai-agents",
@@ -813,11 +821,11 @@ async def test_sessions_native_dispatches_native_tool_with_bundle_workdir(
     )
     async with _runner_client(app) as client:
         resp = await client.post(
-            "/v1/sessions/conv_bundle/events",
+            "/v1/sessions/c7f36aa769270cac30144784fad50acc/events",
             json={
                 "type": "message",
                 "role": "user",
-                "agent_id": "ag_bundle",
+                "agent_id": "31ebfedf721b44dabd76f662cb70a400",
                 "model": "bundle-agent",
                 "content": [{"type": "input_text", "text": "hi"}],
                 "harness": "openai-agents",
@@ -867,11 +875,11 @@ async def test_sessions_native_marks_and_clears_in_flight_turn() -> None:
     )
     async with _runner_client(app) as client:
         resp = await client.post(
-            "/v1/sessions/conv_live/events",
+            "/v1/sessions/ce84b0dc308668bb715607e42ae268b0/events",
             json={
                 "type": "message",
                 "role": "user",
-                "agent_id": "ag_live",
+                "agent_id": "e61df75e32ee590087e03aa37b33abac",
                 "model": "plain-agent",
                 "content": [{"type": "input_text", "text": "hi"}],
                 "harness": "openai-agents",
@@ -886,8 +894,10 @@ async def test_sessions_native_marks_and_clears_in_flight_turn() -> None:
 
     # Live turn was registered with the reaper's in-flight guard on
     # response.created, then cleared once the stream ended.
-    assert pm.marked_in_flight == [("conv_live", "resp_live")], pm.marked_in_flight
-    assert pm.cleared_in_flight == ["conv_live"], pm.cleared_in_flight
+    assert pm.marked_in_flight == [("ce84b0dc308668bb715607e42ae268b0", "resp_live")], (
+        pm.marked_in_flight
+    )
+    assert pm.cleared_in_flight == ["ce84b0dc308668bb715607e42ae268b0"], pm.cleared_in_flight
 
 
 class _StreamErrorHarnessClient(_ScriptedHarnessClient):
@@ -962,11 +972,11 @@ async def test_sessions_native_clears_in_flight_when_stream_errors() -> None:
     )
     async with _runner_client(app) as client:
         resp = await client.post(
-            "/v1/sessions/conv_drop/events",
+            "/v1/sessions/9217a860245985f541fd686eb2a32b73/events",
             json={
                 "type": "message",
                 "role": "user",
-                "agent_id": "ag_drop",
+                "agent_id": "965906f5d9fb596610dda599a80faaee",
                 "model": "plain-agent",
                 "content": [{"type": "input_text", "text": "hi"}],
                 "harness": "openai-agents",
@@ -980,8 +990,10 @@ async def test_sessions_native_clears_in_flight_when_stream_errors() -> None:
             await asyncio.sleep(0.05)
 
     # Marked live on response.created, then cleared despite the mid-stream drop.
-    assert pm.marked_in_flight == [("conv_drop", "resp_drop")], pm.marked_in_flight
-    assert pm.cleared_in_flight == ["conv_drop"], pm.cleared_in_flight
+    assert pm.marked_in_flight == [("9217a860245985f541fd686eb2a32b73", "resp_drop")], (
+        pm.marked_in_flight
+    )
+    assert pm.cleared_in_flight == ["9217a860245985f541fd686eb2a32b73"], pm.cleared_in_flight
 
 
 @pytest.mark.asyncio
@@ -1001,14 +1013,14 @@ async def test_stop_session_clears_in_flight_marker() -> None:
 
     gate = _aio.Event()  # never set → harness blocks after response.created
     app, pm, hc = _build_interrupt_app(gate)
-    conv_id = "conv_stop_clear"
+    conv_id = "a136ad3e8265e86eba8564d6cda81a14"
     async with _runner_client(app) as client:
         resp = await client.post(
             f"/v1/sessions/{conv_id}/events",
             json={
                 "type": "message",
                 "role": "user",
-                "agent_id": "ag_stop",
+                "agent_id": "b528b24f9d6ece39ef11de7fb6dfeedf",
                 "model": "test-agent",
                 "content": [{"type": "input_text", "text": "blocked"}],
                 "harness": "openai-agents",
@@ -1146,14 +1158,14 @@ async def test_sessions_native_clears_in_flight_on_lazy_spec_error() -> None:
         spec_resolver=_resolver,
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
-    conv_id = "conv_lazy"
+    conv_id = "a15313a5b85c6fa97a92d1e2d74d44dc"
     async with _runner_client(app) as client:
         resp = await client.post(
             f"/v1/sessions/{conv_id}/events",
             json={
                 "type": "message",
                 "role": "user",
-                "agent_id": "ag_lazy",
+                "agent_id": "4d198b17724988de49d7ac2b4d29605b",
                 "model": "plain-agent",
                 "content": [{"type": "input_text", "text": "hi"}],
                 "harness": "openai-agents",
@@ -1231,11 +1243,11 @@ async def test_sessions_native_dispatches_builtin_tool_with_runner_workspace(
     )
     async with _runner_client(app) as client:
         resp = await client.post(
-            "/v1/sessions/conv_builtin/events",
+            "/v1/sessions/f690906478f5c81a97fd4301a80cb213/events",
             json={
                 "type": "message",
                 "role": "user",
-                "agent_id": "ag_bundle",
+                "agent_id": "31ebfedf721b44dabd76f662cb70a400",
                 "model": "bundle-agent",
                 "content": [{"type": "input_text", "text": "write a file"}],
                 "harness": "openai-agents",
@@ -1290,11 +1302,11 @@ async def test_mcp_execute_dispatches_builtin_tool_with_runner_workspace(
     )
     async with _runner_client(app) as client:
         seed_resp = await client.post(
-            "/v1/sessions/conv_execute_builtin/events",
+            "/v1/sessions/38f6cf055029a2a23b227a8305f76c9d/events",
             json={
                 "type": "message",
                 "role": "user",
-                "agent_id": "ag_bundle",
+                "agent_id": "31ebfedf721b44dabd76f662cb70a400",
                 "model": "bundle-agent",
                 "content": [{"type": "input_text", "text": "seed"}],
                 "harness": "openai-agents",
@@ -1307,7 +1319,7 @@ async def test_mcp_execute_dispatches_builtin_tool_with_runner_workspace(
             await asyncio.sleep(0.05)
 
         execute_resp = await client.post(
-            "/v1/sessions/conv_execute_builtin/mcp/execute",
+            "/v1/sessions/38f6cf055029a2a23b227a8305f76c9d/mcp/execute",
             json={
                 "method": "tools/call",
                 "params": {
@@ -1331,12 +1343,15 @@ async def test_mcp_execute_dispatches_full_namespaced_mcp_tool_name() -> None:
     async with _runner_client(app) as client:
         seed_resp = await client.post(
             "/v1/sessions",
-            json={"session_id": "conv_execute_mcp", "agent_id": "ag_abc"},
+            json={
+                "session_id": "6a09e2c1b63301fc6be99bb645418905",
+                "agent_id": "0e36e3219954d2deaef06b8e2a936f38",
+            },
         )
         assert seed_resp.status_code == 201, seed_resp.text
 
         execute_resp = await client.post(
-            "/v1/sessions/conv_execute_mcp/mcp/execute",
+            "/v1/sessions/6a09e2c1b63301fc6be99bb645418905/mcp/execute",
             json={
                 "method": "tools/call",
                 "params": {
@@ -1361,11 +1376,11 @@ async def test_sessions_native_path_injects_mcp_schemas() -> None:
     app, _mcp_manager, harness_client, _server_client = _build_app_with_mcp_tool()
     async with _runner_client(app) as client:
         resp = await client.post(
-            "/v1/sessions/conv_abc/events",
+            "/v1/sessions/4e92b5a0c0ee6db3f874f9c4a3f855a5/events",
             json={
                 "type": "message",
                 "role": "user",
-                "agent_id": "ag_abc",
+                "agent_id": "0e36e3219954d2deaef06b8e2a936f38",
                 "model": "test-agent",
                 "input": [{"type": "input_text", "text": "hi"}],
                 "harness": "openai-agents",
@@ -1396,11 +1411,11 @@ async def test_action_required_marker_round_trips_to_relayed_frame() -> None:
     app, _mcp_manager, _client, server_client = _build_app_with_mcp_tool()
     async with _runner_client(app) as client:
         resp = await client.post(
-            "/v1/sessions/conv_abc/events?stream=true",
+            "/v1/sessions/4e92b5a0c0ee6db3f874f9c4a3f855a5/events?stream=true",
             json={
                 "type": "message",
                 "role": "user",
-                "agent_id": "ag_abc",
+                "agent_id": "0e36e3219954d2deaef06b8e2a936f38",
                 "model": "test-agent",
                 "content": [{"type": "input_text", "text": "hi"}],
                 "harness": "openai-agents",
@@ -1493,13 +1508,16 @@ async def test_create_session_threads_resolved_bundle_dir_to_codex_spawn_env(
     async with _runner_client(app) as client:
         resp = await client.post(
             "/v1/sessions",
-            json={"session_id": "conv_codex", "agent_id": "ag_codex"},
+            json={
+                "session_id": "415c9954e2fe4b9276083a4d2c66f689",
+                "agent_id": "12c8c7631b209d1027416b4bf7604999",
+            },
         )
 
     assert resp.status_code == 201
     assert pm.get_client_calls
     conversation_id, harness, env = pm.get_client_calls[-1]
-    assert conversation_id == "conv_codex"
+    assert conversation_id == "415c9954e2fe4b9276083a4d2c66f689"
     assert harness == "codex"
     assert env is not None
     assert env["HARNESS_CODEX_BUNDLE_DIR"] == str(bundle_dir)
@@ -1543,17 +1561,20 @@ async def test_create_session_threads_cursor_bridge_dir_without_dead_guard_env(
     async with _runner_client(app) as client:
         resp = await client.post(
             "/v1/sessions",
-            json={"session_id": "conv_cursor", "agent_id": "ag_cursor"},
+            json={
+                "session_id": "0229f28e408c700b084b2a2e265f9b3c",
+                "agent_id": "209bc0df7e730c9f33fcda57504c2623",
+            },
         )
 
     assert resp.status_code == 201
     assert pm.get_client_calls
     conversation_id, harness, env = pm.get_client_calls[-1]
-    assert conversation_id == "conv_cursor"
+    assert conversation_id == "0229f28e408c700b084b2a2e265f9b3c"
     assert harness == "cursor-native"
     assert env == {
         cursor_native_bridge.BRIDGE_DIR_ENV_VAR: str(
-            cursor_native_bridge.bridge_dir_for_session_id("conv_cursor")
+            cursor_native_bridge.bridge_dir_for_session_id("0229f28e408c700b084b2a2e265f9b3c")
         )
     }
     assert "HARNESS_CURSOR_NATIVE_REQUEST_SESSION_ID" not in env
@@ -1589,17 +1610,20 @@ async def test_create_session_threads_kiro_bridge_dir(
     async with _runner_client(app) as client:
         resp = await client.post(
             "/v1/sessions",
-            json={"session_id": "conv_kiro", "agent_id": "ag_kiro"},
+            json={
+                "session_id": "823dbd1aab969b5a813fac59bb977a77",
+                "agent_id": "2c515637c67d0717ad0bebc2747b71bc",
+            },
         )
 
     assert resp.status_code == 201
     assert pm.get_client_calls
     conversation_id, harness, env = pm.get_client_calls[-1]
-    assert conversation_id == "conv_kiro"
+    assert conversation_id == "823dbd1aab969b5a813fac59bb977a77"
     assert harness == "kiro-native"
     assert env == {
         kiro_native_bridge.KIRO_NATIVE_BRIDGE_DIR_ENV_VAR: str(
-            kiro_native_bridge.bridge_dir_for_session_id("conv_kiro")
+            kiro_native_bridge.bridge_dir_for_session_id("823dbd1aab969b5a813fac59bb977a77")
         )
     }
 
@@ -1610,10 +1634,10 @@ async def test_create_session_threads_workspace_to_pi_cwd(
 ) -> None:
     """Pi pre-spawn receives the session workspace, not the bundle dir."""
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config-home"))
-    session_id = "conv_pi_worktree"
+    session_id = "18f39ab73f49285e4dab0c80ff7b8455"
     runner_workspace = tmp_path / "runner-workspace"
     runner_workspace.mkdir()
-    bundle_dir = tmp_path / "runner-specs" / "ag_pi-v1"
+    bundle_dir = tmp_path / "runner-specs" / "86c64e0f9cab937bd04c79b9957dd55a-v1"
     bundle_dir.mkdir(parents=True)
     worktree = tmp_path / "repo-worktrees" / "feature-x"
     worktree.mkdir(parents=True)
@@ -1638,7 +1662,7 @@ async def test_create_session_threads_workspace_to_pi_cwd(
                     200,
                     json={
                         "id": session_id,
-                        "agent_id": "ag_pi",
+                        "agent_id": "86c64e0f9cab937bd04c79b9957dd55a",
                         "created_at": 1.0,
                         "workspace": str(worktree),
                     },
@@ -1656,7 +1680,7 @@ async def test_create_session_threads_workspace_to_pi_cwd(
     async with _runner_client(app) as client:
         resp = await client.post(
             "/v1/sessions",
-            json={"session_id": session_id, "agent_id": "ag_pi"},
+            json={"session_id": session_id, "agent_id": "86c64e0f9cab937bd04c79b9957dd55a"},
         )
 
     assert resp.status_code == 201
@@ -1678,10 +1702,10 @@ async def test_create_session_threads_runner_workspace_to_pi_cwd_when_session_wo
 ) -> None:
     """Pi pre-spawn falls back to runner workspace when session workspace is empty."""
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config-home"))
-    session_id = "conv_pi_runner_workspace"
+    session_id = "3f1d20a97a7d0ba93e02cf17aeb92367"
     runner_workspace = tmp_path / "runner-workspace"
     runner_workspace.mkdir()
-    bundle_dir = tmp_path / "runner-specs" / "ag_pi-v1"
+    bundle_dir = tmp_path / "runner-specs" / "86c64e0f9cab937bd04c79b9957dd55a-v1"
     bundle_dir.mkdir(parents=True)
     spec = AgentSpec(
         spec_version=1,
@@ -1704,7 +1728,7 @@ async def test_create_session_threads_runner_workspace_to_pi_cwd_when_session_wo
                     200,
                     json={
                         "id": session_id,
-                        "agent_id": "ag_pi",
+                        "agent_id": "86c64e0f9cab937bd04c79b9957dd55a",
                         "created_at": 1.0,
                         "workspace": workspace_value,
                     },
@@ -1722,7 +1746,7 @@ async def test_create_session_threads_runner_workspace_to_pi_cwd_when_session_wo
     async with _runner_client(app) as client:
         resp = await client.post(
             "/v1/sessions",
-            json={"session_id": session_id, "agent_id": "ag_pi"},
+            json={"session_id": session_id, "agent_id": "86c64e0f9cab937bd04c79b9957dd55a"},
         )
 
     assert resp.status_code == 201
@@ -1739,11 +1763,17 @@ async def test_create_session_threads_runner_workspace_to_pi_cwd_when_session_wo
     ("session_json", "expected"),
     [
         # Host-spawned (web UI): bound to a host -> auto-create.
-        ({"id": "conv_x", "host_id": "host_abc"}, True),
+        (
+            {
+                "id": "8af356d908005a65f872c246158c6293",
+                "host_id": "abb32306b80732bdfa6153b2f5f6eb92",
+            },
+            True,
+        ),
         # Top-level CLI session: no host_id and no parent, but the runner
         # still owns the Codex app-server and terminal.
-        ({"id": "conv_x", "host_id": None}, True),
-        ({"id": "conv_x"}, True),
+        ({"id": "8af356d908005a65f872c246158c6293", "host_id": None}, True),
+        ({"id": "8af356d908005a65f872c246158c6293"}, True),
     ],
 )
 @pytest.mark.asyncio
@@ -1764,7 +1794,10 @@ async def test_codex_top_level_session_needs_runner_terminal_for_all_session_sha
         async def get(self, url: str, *, timeout: float) -> httpx.Response:
             return httpx.Response(200, json=session_json, request=httpx.Request("GET", url))
 
-    assert await _codex_session_needs_runner_terminal(_Client(), "conv_x") is expected
+    assert (
+        await _codex_session_needs_runner_terminal(_Client(), "8af356d908005a65f872c246158c6293")
+        is expected
+    )
 
 
 @pytest.mark.asyncio
@@ -1790,7 +1823,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     import omnigent.codex_native_app_server as codex_app_mod
     import omnigent.runner.app as runner_app_mod
 
-    session_id = "conv_codex_resume"
+    session_id = "76cbdcbbf84d4149b2a7d7441b6966c1"
     thread_id = "019e96aa-0be2-7343-8d3b-6f914d60936b"
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
     monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path / "workspace"))
@@ -1816,7 +1849,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
             Return the session snapshot consumed by the runner helper.
 
             :param url: Request path, e.g.
-                ``"/v1/sessions/conv_codex_resume"``.
+                ``"/v1/sessions/76cbdcbbf84d4149b2a7d7441b6966c1"``.
             :param kwargs: Request keyword arguments such as
                 ``{"timeout": 10.0}`` or ``{"params": {"limit": 1000}}``.
             :returns: HTTP 200 response carrying launch config.
@@ -1827,7 +1860,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
                     json={
                         "data": [
                             {
-                                "id": "msg_user_1",
+                                "id": "b1649a5cbfec3f92bec12275c14f4b5f",
                                 "response_id": "codex_turn_1",
                                 "type": "message",
                                 "role": "user",
@@ -1945,7 +1978,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
             :param resource_role: Private runner resource marker.
             :returns: Terminal resource view.
             """
-            assert session_id == "conv_codex_resume"
+            assert session_id == "76cbdcbbf84d4149b2a7d7441b6966c1"
             assert terminal_name == "codex"
             assert session_key == "main"
             assert resource_role == CODEX_NATIVE_TERMINAL_ROLE
@@ -2082,8 +2115,8 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
         FORK_SOURCE_LABEL_KEY,
     )
 
-    session_id = "conv_codex_clone"
-    source_id = "conv_codex_source"
+    session_id = "8aedf63f5e4046ae21b35fec5b35da50"
+    source_id = "f143372bb481f9e85ffe3415f56f744f"
     source_thread = "019e96aa-0be2-7343-8d3b-6f914d60936b"
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -2128,7 +2161,7 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
             """
             Return the clone's snapshot carrying fork labels but no thread id.
 
-            :param url: Request path, e.g. ``"/v1/sessions/conv_codex_clone"``.
+            :param url: Request path, e.g. ``"/v1/sessions/8aedf63f5e4046ae21b35fec5b35da50"``.
             :param timeout: Request timeout in seconds.
             :returns: HTTP 200 response with fork labels.
             """
@@ -2349,8 +2382,8 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
         FORK_SOURCE_LABEL_KEY,
     )
 
-    session_id = "conv_codex_sdkfork"
-    source_id = "conv_sdk_source"
+    session_id = "70a19efac3ec27549a70acbb4d0c635a"
+    source_id = "4bd4c10aa9a3237eb5213cbeda70b70f"
     codeword = "swordfish-7281"
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -2600,7 +2633,7 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
     import omnigent.runner.app as runner_app_mod
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 
-    session_id = "conv_codex_worktree"
+    session_id = "54e4d4410c43954c11e702f5a8646483"
     # Three distinct dirs so the assertion can only pass for the worktree:
     #   runner_env  — OMNIGENT_RUNNER_WORKSPACE (claude-native's source)
     #   bundle_dir  — ResolvedSpec.workdir (what the bug used)
@@ -2636,7 +2669,7 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
             Return the session snapshot with a worktree ``workspace``.
 
             :param url: Request path, e.g.
-                ``"/v1/sessions/conv_codex_worktree"``.
+                ``"/v1/sessions/54e4d4410c43954c11e702f5a8646483"``.
             :param timeout: Request timeout in seconds.
             :returns: HTTP 200 response carrying the worktree workspace.
             """
@@ -2850,7 +2883,7 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
     import omnigent.codex_native_app_server as codex_app_mod
     import omnigent.runner.app as runner_app_mod
 
-    session_id = "conv_codex_relay_start"
+    session_id = "de154ca6405fb8912623984a14a2b044"
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
     monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path / "workspace"))
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
@@ -3012,7 +3045,7 @@ async def test_claude_native_first_turn_not_blocked_by_cold_bridge_notify(
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
-    session_id = f"conv_{uuid.uuid4().hex[:12]}"
+    session_id = uuid.uuid4().hex
     # claude-native pins the bridge tree under /tmp (see _ensure_secure_dir);
     # use the real per-user bridge dir like tests/runner/test_comment_relay.py
     # and rmtree it on teardown rather than redirecting _BRIDGE_ROOT.
@@ -3077,7 +3110,7 @@ async def test_claude_native_first_turn_not_blocked_by_cold_bridge_notify(
                     "type": "message",
                     "role": "user",
                     "model": "claude-agent",
-                    "agent_id": "ag_claude",
+                    "agent_id": "3a9725fd4de1720e83e53a632da41da8",
                     "content": [{"type": "input_text", "text": "hi"}],
                 },
             )
@@ -3305,7 +3338,7 @@ async def test_auto_create_antigravity_cold_starts_real_conversation(
     PATCHes it onto the session as ``external_session_id`` so a later ``--resume``
     continues it.
     """
-    session_id = "conv_agy_coldstart"
+    session_id = "72a4f9222c7ac0f45ba2736b57b51f62"
     state, start_cascade_calls, reader_calls, patch_calls = await _run_antigravity_auto_create(
         tmp_path,
         monkeypatch,
@@ -3345,7 +3378,7 @@ async def test_auto_create_antigravity_cold_start_scopes_to_pane_agy(
     session. With a resolvable pane the cold-start uses the pane-scoped port
     (61000) even though a lower foreign candidate (52548) exists.
     """
-    session_id = "conv_agy_paneScoped"
+    session_id = "4130b87cea0f50aab661215a1c220d2a"
     state, start_cascade_calls, _reader_calls, patch_calls = await _run_antigravity_auto_create(
         tmp_path,
         monkeypatch,
@@ -3379,7 +3412,7 @@ async def test_auto_create_antigravity_cold_start_falls_back_when_no_pane(
     ``_terminal_tmux_pane`` yields no socket/target the pane cannot be scoped, so
     the cold-start falls back to ``_candidate_agy_rpc_ports()[0]``.
     """
-    session_id = "conv_agy_noPaneFallback"
+    session_id = "dd3b597d06f41a0914a65689398c6047"
     state, start_cascade_calls, _reader_calls, patch_calls = await _run_antigravity_auto_create(
         tmp_path,
         monkeypatch,
@@ -3410,7 +3443,7 @@ async def test_auto_create_antigravity_cold_start_waits_when_pane_agy_absent(
     deadline, leaving the placeholder for the reader to bind later. No
     ``StartCascade``, no ``external_session_id`` PATCH.
     """
-    session_id = "conv_agy_paneEarlyPoll"
+    session_id = "b4741a5530a1e4f6de788ecc6bf2ed16"
     state, start_cascade_calls, _reader_calls, patch_calls = await _run_antigravity_auto_create(
         tmp_path,
         monkeypatch,
@@ -3441,7 +3474,7 @@ async def test_auto_create_antigravity_cold_start_falls_back_when_port_unattribu
     port is ``None``. Since agy exists here, the lone candidate is ours and the
     candidate fallback is safe.
     """
-    session_id = "conv_agy_paneNoPort"
+    session_id = "09ac5119b8cc54502810b565d8206821"
     state, start_cascade_calls, _reader_calls, patch_calls = await _run_antigravity_auto_create(
         tmp_path,
         monkeypatch,
@@ -3472,7 +3505,7 @@ async def test_auto_create_antigravity_resume_skips_cold_start(
     resume id verbatim, and — since no cold-start runs — no ``external_session_id``
     PATCH is issued (it already holds the resume id).
     """
-    session_id = "conv_agy_resume"
+    session_id = "ac8a43ec8a770428cdb9eb718114efc5"
     resume_id = "68caaeac-2eaf-4e2c-9b95-721b022f4903"
     state, start_cascade_calls, _reader_calls, patch_calls = await _run_antigravity_auto_create(
         tmp_path,
@@ -3507,7 +3540,7 @@ async def test_cold_start_agy_conversation_returns_early_on_real_id_in_bridge_st
     import omnigent.runner.app as runner_app_mod
 
     monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
-    session_id = "conv_agy_guard"
+    session_id = "0f44894f77886259ee71e892a9e2afd7"
     real_id = "68caaeac-2eaf-4e2c-9b95-721b022f4903"  # NOT an agy_conv_* placeholder
     assert not bridge_mod.is_placeholder_conversation_id(real_id)
 
@@ -3569,7 +3602,7 @@ async def test_auto_create_antigravity_cold_start_port_timeout_keeps_placeholder
     is never called, bridge state retains the ``agy_conv_*`` placeholder, and no
     ``external_session_id`` PATCH is issued (there is no real id to record).
     """
-    session_id = "conv_agy_noport"
+    session_id = "3d781eaf3cbda148c8f3212c7c21ea04"
     state, start_cascade_calls, reader_calls, patch_calls = await _run_antigravity_auto_create(
         tmp_path,
         monkeypatch,
@@ -3610,7 +3643,7 @@ async def test_auto_create_antigravity_wires_reader_task_and_interaction_bridge(
     from omnigent.antigravity_native_interactions import agy_elicitation_id
     from omnigent.antigravity_native_steps import pending_interaction
 
-    session_id = "conv_agy_wiring"
+    session_id = "b68c3f1da613f48fb4126e965ab594a3"
     monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
     monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path / "workspace"))
@@ -3791,7 +3824,7 @@ async def test_auto_create_antigravity_wires_omnigent_mcp_relay(
     import omnigent.antigravity_native_rpc as rpc_mod
     import omnigent.runner.app as runner_app_mod
 
-    session_id = "conv_agy_mcp"
+    session_id = "1fd85439049bbfc88cbf04221bad5079"
     monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
     monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path / "workspace"))
@@ -3928,7 +3961,7 @@ async def test_auto_create_antigravity_prepends_gemini_dir_to_generated_flags(
     import omnigent.antigravity_native_rpc as rpc_mod
     import omnigent.runner.app as runner_app_mod
 
-    session_id = "conv_agy_argv"
+    session_id = "976793baf55bcdf96830aa376e394f80"
     monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
     monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path / "workspace"))
@@ -4022,7 +4055,7 @@ async def test_auto_create_antigravity_prepends_gemini_dir_to_generated_flags(
     assert captured_spec["args"] == [f"--gemini_dir={iso_gemini}", *generated_tail]
 
 
-@pytest.mark.parametrize("parent_host_id", ["host_parent", None])
+@pytest.mark.parametrize("parent_host_id", ["21506f91db53823dba9a99e9b0db742d", None])
 @pytest.mark.asyncio
 async def test_codex_subagent_always_needs_runner_terminal(
     parent_host_id: str | None,
@@ -4043,7 +4076,7 @@ async def test_codex_subagent_always_needs_runner_terminal(
     ``False``, the regression has reappeared.
 
     :param parent_host_id: The parent session's ``host_id`` value to simulate;
-        ``"host_parent"`` (web-UI parent) or ``None`` (CLI-driven parent).
+        ``"21506f91db53823dba9a99e9b0db742d"`` (web-UI parent) or ``None`` (CLI-driven parent).
     """
     from omnigent.runner.app import _codex_session_needs_runner_terminal
 
@@ -4057,26 +4090,29 @@ async def test_codex_subagent_always_needs_runner_terminal(
             :returns: Fake Omnigent session response.
             """
             del timeout
-            if url.endswith("/conv_child"):
+            if url.endswith("/ff5cac23d0beb79fad914046049f32ff"):
                 return httpx.Response(
                     200,
                     json={
-                        "id": "conv_child",
-                        "parent_session_id": "conv_parent",
+                        "id": "ff5cac23d0beb79fad914046049f32ff",
+                        "parent_session_id": "ead6d59a6b650d19dbdf61ec32426f4e",
                         "host_id": None,
                     },
                     request=httpx.Request("GET", url),
                 )
-            if url.endswith("/conv_parent"):
+            if url.endswith("/ead6d59a6b650d19dbdf61ec32426f4e"):
                 return httpx.Response(
                     200,
-                    json={"id": "conv_parent", "host_id": parent_host_id},
+                    json={"id": "ead6d59a6b650d19dbdf61ec32426f4e", "host_id": parent_host_id},
                     request=httpx.Request("GET", url),
                 )
             return httpx.Response(404, request=httpx.Request("GET", url))
 
     # True for both parent host_ids; a False for the None parent = regressed.
-    assert await _codex_session_needs_runner_terminal(_Client(), "conv_child") is True
+    assert (
+        await _codex_session_needs_runner_terminal(_Client(), "ff5cac23d0beb79fad914046049f32ff")
+        is True
+    )
 
 
 @pytest.mark.asyncio
@@ -4088,7 +4124,10 @@ async def test_codex_session_needs_runner_terminal_false_without_client() -> Non
     """
     from omnigent.runner.app import _codex_session_needs_runner_terminal
 
-    assert await _codex_session_needs_runner_terminal(None, "conv_x") is False
+    assert (
+        await _codex_session_needs_runner_terminal(None, "8af356d908005a65f872c246158c6293")
+        is False
+    )
 
 
 @pytest.mark.asyncio
@@ -4124,7 +4163,7 @@ async def test_codex_discover_thread_and_forward_cleans_up_on_discovery_failure(
     # module on each call, so patching the module attribute takes effect.
     monkeypatch.setattr(codex_native_forwarder, "wait_for_thread_started", _raise_no_thread)
 
-    session_id = "conv_codex_cleanup_test"
+    session_id = "2053b47e49239a8c24e3cd30cdb21c8e"
     _AUTO_CODEX_APP_SERVERS[session_id] = _AppServer()
     try:
         await _codex_discover_thread_and_forward(
@@ -4186,7 +4225,7 @@ async def test_codex_discover_thread_and_forward_records_accurate_startup_error(
 
     monkeypatch.setattr(codex_native_forwarder, "wait_for_thread_started", _raise)
 
-    session_id = "conv_codex_startup_error_test"
+    session_id = "5cb1fea582a3bd8aad3619ca820af75b"
     _AUTO_CODEX_APP_SERVERS[session_id] = _AppServer()
     try:
         await _codex_discover_thread_and_forward(
@@ -4215,16 +4254,19 @@ async def test_create_session() -> None:
     async with _runner_client(app) as client:
         resp = await client.post(
             "/v1/sessions",
-            json={"session_id": "conv_1", "agent_id": "ag_1"},
+            json={
+                "session_id": "8e32600337d08f59ad381caf96a90659",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
         )
     assert resp.status_code == 201
     body = resp.json()
-    assert body["id"] == "conv_1"
-    assert body["agent_id"] == "ag_1"
+    assert body["id"] == "8e32600337d08f59ad381caf96a90659"
+    assert body["agent_id"] == "880b5afda28ad55ff74cbeb9b5fc67fb"
     assert body["status"] == "idle"
     assert "created_at" in body
     assert body["items"] == []
-    assert pm.has_session("conv_1")
+    assert pm.has_session("8e32600337d08f59ad381caf96a90659")
 
 
 @pytest.mark.asyncio
@@ -4248,19 +4290,22 @@ async def test_create_session_preserves_existing_event_queue() -> None:
     # Simulate the relay's GET /stream having already attached (lazily
     # created the queue) before init runs.
     sentinel: asyncio.Queue[Any] = asyncio.Queue()
-    _session_event_queues_ref["conv_pre"] = sentinel
+    _session_event_queues_ref["943f9d13fadeff4db5bb295673530474"] = sentinel
     try:
         async with _runner_client(app) as client:
             resp = await client.post(
                 "/v1/sessions",
-                json={"session_id": "conv_pre", "agent_id": "ag_1"},
+                json={
+                    "session_id": "943f9d13fadeff4db5bb295673530474",
+                    "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+                },
             )
         assert resp.status_code == 201
         # Same object → a relay already blocked on it keeps receiving
         # events that ``_publish_event`` enqueues after init.
-        assert _session_event_queues_ref.get("conv_pre") is sentinel
+        assert _session_event_queues_ref.get("943f9d13fadeff4db5bb295673530474") is sentinel
     finally:
-        _session_event_queues_ref.pop("conv_pre", None)
+        _session_event_queues_ref.pop("943f9d13fadeff4db5bb295673530474", None)
 
 
 @pytest.mark.asyncio
@@ -4273,13 +4318,16 @@ async def test_has_active_work_reports_process_manager_turns() -> None:
     async with _runner_client(app) as client:
         resp = await client.post(
             "/v1/sessions",
-            json={"session_id": "conv_1", "agent_id": "ag_1"},
+            json={
+                "session_id": "8e32600337d08f59ad381caf96a90659",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
         )
 
     assert resp.status_code == 201
     assert app.state.has_active_work() is False
 
-    pm.mark_turn_active("conv_1")
+    pm.mark_turn_active("8e32600337d08f59ad381caf96a90659")
 
     assert app.state.has_active_work() is True
 
@@ -4291,7 +4339,7 @@ async def test_create_session_missing_fields() -> None:
     async with _runner_client(app) as client:
         resp = await client.post(
             "/v1/sessions",
-            json={"session_id": "conv_1"},
+            json={"session_id": "8e32600337d08f59ad381caf96a90659"},
         )
     assert resp.status_code == 400
 
@@ -4303,7 +4351,10 @@ async def test_create_session_scaffold_mode() -> None:
     async with _runner_client(app) as client:
         resp = await client.post(
             "/v1/sessions",
-            json={"session_id": "conv_1", "agent_id": "ag_1"},
+            json={
+                "session_id": "8e32600337d08f59ad381caf96a90659",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
         )
     assert resp.status_code == 501
 
@@ -4315,9 +4366,12 @@ async def test_get_session_status_idle() -> None:
     async with _runner_client(app) as client:
         await client.post(
             "/v1/sessions",
-            json={"session_id": "conv_1", "agent_id": "ag_1"},
+            json={
+                "session_id": "8e32600337d08f59ad381caf96a90659",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
         )
-        resp = await client.get("/v1/sessions/conv_1")
+        resp = await client.get("/v1/sessions/8e32600337d08f59ad381caf96a90659")
     assert resp.status_code == 200
     assert resp.json()["status"] == "idle"
 
@@ -4329,10 +4383,13 @@ async def test_get_session_status_running() -> None:
     async with _runner_client(app) as client:
         await client.post(
             "/v1/sessions",
-            json={"session_id": "conv_1", "agent_id": "ag_1"},
+            json={
+                "session_id": "8e32600337d08f59ad381caf96a90659",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
         )
-        pm.mark_turn_active("conv_1")
-        resp = await client.get("/v1/sessions/conv_1")
+        pm.mark_turn_active("8e32600337d08f59ad381caf96a90659")
+        resp = await client.get("/v1/sessions/8e32600337d08f59ad381caf96a90659")
     assert resp.status_code == 200
     assert resp.json()["status"] == "running"
 
@@ -4353,15 +4410,18 @@ async def test_delete_session() -> None:
     async with _runner_client(app) as client:
         await client.post(
             "/v1/sessions",
-            json={"session_id": "conv_1", "agent_id": "ag_1"},
+            json={
+                "session_id": "8e32600337d08f59ad381caf96a90659",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
         )
-        resp = await client.delete("/v1/sessions/conv_1")
+        resp = await client.delete("/v1/sessions/8e32600337d08f59ad381caf96a90659")
     assert resp.status_code == 200
     body = resp.json()
     assert body["deleted"] is True
-    assert body["session_id"] == "conv_1"
-    assert "conv_1" in pm.released
-    assert not pm.has_session("conv_1")
+    assert body["session_id"] == "8e32600337d08f59ad381caf96a90659"
+    assert "8e32600337d08f59ad381caf96a90659" in pm.released
+    assert not pm.has_session("8e32600337d08f59ad381caf96a90659")
 
 
 @pytest.mark.asyncio
@@ -4371,13 +4431,16 @@ async def test_delete_session_with_active_turn() -> None:
     async with _runner_client(app) as client:
         await client.post(
             "/v1/sessions",
-            json={"session_id": "conv_1", "agent_id": "ag_1"},
+            json={
+                "session_id": "8e32600337d08f59ad381caf96a90659",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
         )
-        pm.mark_turn_active("conv_1")
-        resp = await client.delete("/v1/sessions/conv_1")
+        pm.mark_turn_active("8e32600337d08f59ad381caf96a90659")
+        resp = await client.delete("/v1/sessions/8e32600337d08f59ad381caf96a90659")
     assert resp.status_code == 200
-    assert "conv_1" in pm.cancelled
-    assert "conv_1" in pm.released
+    assert "8e32600337d08f59ad381caf96a90659" in pm.cancelled
+    assert "8e32600337d08f59ad381caf96a90659" in pm.released
 
 
 @pytest.mark.asyncio
@@ -4389,7 +4452,10 @@ async def test_session_stream_receives_events() -> None:
         # Create the session first.
         await client.post(
             "/v1/sessions",
-            json={"session_id": "conv_s", "agent_id": "ag_1"},
+            json={
+                "session_id": "4ee52d986b72704408b5ff36fe8421e0",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
         )
 
         import asyncio
@@ -4398,7 +4464,9 @@ async def test_session_stream_receives_events() -> None:
 
         async def _subscribe() -> None:
             """Subscribe to SSE and collect events until [DONE]."""
-            async with client.stream("GET", "/v1/sessions/conv_s/stream") as stream:
+            async with client.stream(
+                "GET", "/v1/sessions/4ee52d986b72704408b5ff36fe8421e0/stream"
+            ) as stream:
                 async for line in stream.aiter_lines():
                     if line.startswith("data: "):
                         payload = line[6:]
@@ -4413,7 +4481,7 @@ async def test_session_stream_receives_events() -> None:
         # session_stream. The stream stays open across turns;
         # deleting the session sends [DONE].
         resp = await client.post(
-            "/v1/sessions/conv_s/events",
+            "/v1/sessions/4ee52d986b72704408b5ff36fe8421e0/events",
             json={
                 "type": "message",
                 "role": "user",
@@ -4429,7 +4497,7 @@ async def test_session_stream_receives_events() -> None:
         await asyncio.sleep(0.05)
 
         # Delete the session to close the stream ([DONE]).
-        await client.delete("/v1/sessions/conv_s")
+        await client.delete("/v1/sessions/4ee52d986b72704408b5ff36fe8421e0")
 
         await asyncio.wait_for(sub_task, timeout=5.0)
 
@@ -4457,12 +4525,17 @@ async def test_session_stream_emits_heartbeat_on_idle() -> None:
         async with _runner_client(app) as client:
             await client.post(
                 "/v1/sessions",
-                json={"session_id": "conv_hb", "agent_id": "ag_1"},
+                json={
+                    "session_id": "2fa978f2a04f84d78d2dde3c4de2a306",
+                    "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+                },
             )
             collected: list[dict[str, Any]] = []
 
             async def _subscribe() -> None:
-                async with client.stream("GET", "/v1/sessions/conv_hb/stream") as stream:
+                async with client.stream(
+                    "GET", "/v1/sessions/2fa978f2a04f84d78d2dde3c4de2a306/stream"
+                ) as stream:
                     async for line in stream.aiter_lines():
                         if line.startswith("data: "):
                             payload = line[6:]
@@ -4472,7 +4545,7 @@ async def test_session_stream_emits_heartbeat_on_idle() -> None:
 
             sub_task = asyncio.create_task(_subscribe())
             await asyncio.sleep(0.2)
-            await client.delete("/v1/sessions/conv_hb")
+            await client.delete("/v1/sessions/2fa978f2a04f84d78d2dde3c4de2a306")
             await asyncio.wait_for(sub_task, timeout=5.0)
 
         heartbeats = [e for e in collected if e.get("type") == "session.heartbeat"]
@@ -4587,13 +4660,16 @@ async def test_turn_sequencing_buffers_concurrent_message() -> None:
     async with _runner_client(app) as client:
         await client.post(
             "/v1/sessions",
-            json={"session_id": "conv_buf", "agent_id": "ag_1"},
+            json={
+                "session_id": "49ed0bd1f0cae058f05f48057e9f98cf",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
         )
 
         async def _run_first_turn() -> None:
             """Start the first turn and drain its response."""
             resp = await client.post(
-                "/v1/sessions/conv_buf/events",
+                "/v1/sessions/49ed0bd1f0cae058f05f48057e9f98cf/events",
                 json={
                     "type": "message",
                     "role": "user",
@@ -4614,7 +4690,7 @@ async def test_turn_sequencing_buffers_concurrent_message() -> None:
 
         # Second message while turn active → 202 buffered.
         resp2 = await client.post(
-            "/v1/sessions/conv_buf/events",
+            "/v1/sessions/49ed0bd1f0cae058f05f48057e9f98cf/events",
             json={
                 "type": "message",
                 "role": "user",
@@ -4643,7 +4719,10 @@ async def test_turn_lifecycle_events() -> None:
     async with _runner_client(app) as client:
         await client.post(
             "/v1/sessions",
-            json={"session_id": "conv_lc", "agent_id": "ag_1"},
+            json={
+                "session_id": "490f8ac07b3f7ac2c9b265eec87eb0e8",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
         )
 
         import asyncio
@@ -4652,7 +4731,9 @@ async def test_turn_lifecycle_events() -> None:
 
         async def _sub() -> None:
             """Collect events until [DONE]."""
-            async with client.stream("GET", "/v1/sessions/conv_lc/stream") as stream:
+            async with client.stream(
+                "GET", "/v1/sessions/490f8ac07b3f7ac2c9b265eec87eb0e8/stream"
+            ) as stream:
                 async for line in stream.aiter_lines():
                     if line.startswith("data: "):
                         payload = line[6:]
@@ -4664,7 +4745,7 @@ async def test_turn_lifecycle_events() -> None:
         await asyncio.sleep(0.05)
 
         resp = await client.post(
-            "/v1/sessions/conv_lc/events",
+            "/v1/sessions/490f8ac07b3f7ac2c9b265eec87eb0e8/events",
             json={
                 "type": "message",
                 "role": "user",
@@ -4677,7 +4758,7 @@ async def test_turn_lifecycle_events() -> None:
             pass
         await asyncio.sleep(0.05)
 
-        await client.delete("/v1/sessions/conv_lc")
+        await client.delete("/v1/sessions/490f8ac07b3f7ac2c9b265eec87eb0e8")
         await asyncio.wait_for(task, timeout=5.0)
 
     lifecycle_events = [e for e in collected if e.get("type") != "session.heartbeat"]
@@ -4706,11 +4787,14 @@ async def test_delete_during_active_turn_cleans_state() -> None:
     async with _runner_client(app) as client:
         await client.post(
             "/v1/sessions",
-            json={"session_id": "conv_del", "agent_id": "ag_1"},
+            json={
+                "session_id": "553a265445caf1cdb034abe0b449485d",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
         )
         # Start a turn (don't drain — turn stays active).
         await client.post(
-            "/v1/sessions/conv_del/events",
+            "/v1/sessions/553a265445caf1cdb034abe0b449485d/events",
             json={
                 "type": "message",
                 "role": "user",
@@ -4722,7 +4806,7 @@ async def test_delete_during_active_turn_cleans_state() -> None:
 
         # Buffer a second message.
         await client.post(
-            "/v1/sessions/conv_del/events",
+            "/v1/sessions/553a265445caf1cdb034abe0b449485d/events",
             json={
                 "type": "message",
                 "role": "user",
@@ -4733,9 +4817,9 @@ async def test_delete_during_active_turn_cleans_state() -> None:
         )
 
         # DELETE while turn active.
-        del_resp = await client.delete("/v1/sessions/conv_del")
+        del_resp = await client.delete("/v1/sessions/553a265445caf1cdb034abe0b449485d")
         assert del_resp.status_code == 200
-        assert "conv_del" in pm.released
+        assert "553a265445caf1cdb034abe0b449485d" in pm.released
 
 
 @pytest.mark.asyncio
@@ -4749,13 +4833,16 @@ async def test_post_turn_continuation() -> None:
     async with _runner_client(app) as client:
         await client.post(
             "/v1/sessions",
-            json={"session_id": "conv_cont", "agent_id": "ag_1"},
+            json={
+                "session_id": "68d532c6117d7c15ec58a38e9c7f4790",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
         )
 
         async def _first() -> None:
             """Run and drain the first turn."""
             resp = await client.post(
-                "/v1/sessions/conv_cont/events",
+                "/v1/sessions/68d532c6117d7c15ec58a38e9c7f4790/events",
                 json={
                     "type": "message",
                     "role": "user",
@@ -4772,7 +4859,7 @@ async def test_post_turn_continuation() -> None:
 
         # Buffer a second message while the first turn is active.
         resp2 = await client.post(
-            "/v1/sessions/conv_cont/events",
+            "/v1/sessions/68d532c6117d7c15ec58a38e9c7f4790/events",
             json={
                 "type": "message",
                 "role": "user",
@@ -4969,14 +5056,17 @@ async def test_midturn_message_not_double_delivered_to_harness() -> None:
     async with _runner_client(app) as client:
         await client.post(
             "/v1/sessions",
-            json={"session_id": "conv_dup", "agent_id": "ag_1"},
+            json={
+                "session_id": "ede98a0180773a70b1e81cc854ff7d8a",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
         )
 
         # Turn 1 starts fire-and-forget (202) and its background task
         # blocks inside the harness stream on `gate`. The 0.05s yield lets
         # the runner mark the turn active before the second message lands.
         resp1 = await client.post(
-            "/v1/sessions/conv_dup/events",
+            "/v1/sessions/ede98a0180773a70b1e81cc854ff7d8a/events",
             json={
                 "type": "message",
                 "role": "user",
@@ -4992,7 +5082,7 @@ async def test_midturn_message_not_double_delivered_to_harness() -> None:
         # on the gate) → the runner buffers it AND forwards it as a live
         # mid-turn injection with a correlation id.
         resp2 = await client.post(
-            "/v1/sessions/conv_dup/events",
+            "/v1/sessions/ede98a0180773a70b1e81cc854ff7d8a/events",
             json={
                 "type": "message",
                 "role": "user",
@@ -5173,12 +5263,12 @@ async def test_native_buffered_messages_each_delivered_once_in_order(
     async def _post(text: str) -> httpx.Response:
         """POST one user message carrying an agent_id (drives spec resolve)."""
         return await client.post(
-            "/v1/sessions/conv_nat/events",
+            "/v1/sessions/11b4a5755857531509b492c3f9a7a1a6/events",
             json={
                 "type": "message",
                 "role": "user",
                 "model": "test-agent",
-                "agent_id": "ag_native",
+                "agent_id": "0c5de81a62eeb73d54466214cf37e5db",
                 "content": [{"type": "input_text", "text": text}],
             },
         )
@@ -5255,7 +5345,11 @@ class _GatedFileServerClient:
         self.meta_fetch_started.set()
         await self.release.wait()
         return _GatedFileServerClient._Resp(
-            payload={"id": "file_gated", "filename": "a.png", "content_type": "image/png"}
+            payload={
+                "id": "c531a3c97ad5fca15709d73d1f734a0c",
+                "filename": "a.png",
+                "content_type": "image/png",
+            }
         )
 
     class _Resp:
@@ -5317,13 +5411,17 @@ async def test_messages_reach_harness_in_submission_order() -> None:
         async def _post_alpha() -> httpx.Response:
             """POST the first message (gated image + text)."""
             return await client.post(
-                "/v1/sessions/conv_ord/events",
+                "/v1/sessions/ea532aed7642ec833ab31a5649c3495b/events",
                 json={
                     "type": "message",
                     "role": "user",
                     "model": "test-agent",
                     "content": [
-                        {"type": "input_image", "file_id": "file_gated", "filename": "a.png"},
+                        {
+                            "type": "input_image",
+                            "file_id": "c531a3c97ad5fca15709d73d1f734a0c",
+                            "filename": "a.png",
+                        },
                         {"type": "input_text", "text": "alpha-first"},
                     ],
                     "harness": "openai-agents",
@@ -5344,7 +5442,7 @@ async def test_messages_reach_harness_in_submission_order() -> None:
         async def _post_bravo() -> httpx.Response:
             """POST the second message (plain text)."""
             return await client.post(
-                "/v1/sessions/conv_ord/events",
+                "/v1/sessions/ea532aed7642ec833ab31a5649c3495b/events",
                 json={
                     "type": "message",
                     "role": "user",
@@ -5405,13 +5503,18 @@ async def test_buffered_continuation_skips_transient_idle() -> None:
     async with _runner_client(app) as client:
         await client.post(
             "/v1/sessions",
-            json={"session_id": "conv_skip", "agent_id": "ag_1"},
+            json={
+                "session_id": "daec53e4bab215026ded66b565924480",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
         )
 
         collected: list[dict[str, Any]] = []
 
         async def _sub() -> None:
-            async with client.stream("GET", "/v1/sessions/conv_skip/stream") as stream:
+            async with client.stream(
+                "GET", "/v1/sessions/daec53e4bab215026ded66b565924480/stream"
+            ) as stream:
                 async for line in stream.aiter_lines():
                     if line.startswith("data: "):
                         payload = line[6:]
@@ -5424,7 +5527,7 @@ async def test_buffered_continuation_skips_transient_idle() -> None:
 
         async def _first() -> None:
             resp = await client.post(
-                "/v1/sessions/conv_skip/events",
+                "/v1/sessions/daec53e4bab215026ded66b565924480/events",
                 json={
                     "type": "message",
                     "role": "user",
@@ -5440,7 +5543,7 @@ async def test_buffered_continuation_skips_transient_idle() -> None:
         await _aio.sleep(0.05)
 
         await client.post(
-            "/v1/sessions/conv_skip/events",
+            "/v1/sessions/daec53e4bab215026ded66b565924480/events",
             json={
                 "type": "message",
                 "role": "user",
@@ -5454,7 +5557,7 @@ async def test_buffered_continuation_skips_transient_idle() -> None:
         await _aio.wait_for(turn_task, timeout=5.0)
         await _aio.sleep(0.3)
 
-        await client.delete("/v1/sessions/conv_skip")
+        await client.delete("/v1/sessions/daec53e4bab215026ded66b565924480")
         await _aio.wait_for(sub_task, timeout=5.0)
 
     statuses = [e["status"] for e in collected if e.get("type") == "session.status"]
@@ -5481,13 +5584,18 @@ async def test_cancelled_turn_publishes_idle_so_client_unsticks() -> None:
     async with _runner_client(app) as client:
         await client.post(
             "/v1/sessions",
-            json={"session_id": "conv_cancel", "agent_id": "ag_1"},
+            json={
+                "session_id": "1a6237b81972b420cfd54818b51d1e21",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
         )
 
         collected: list[dict[str, Any]] = []
 
         async def _sub() -> None:
-            async with client.stream("GET", "/v1/sessions/conv_cancel/stream") as stream:
+            async with client.stream(
+                "GET", "/v1/sessions/1a6237b81972b420cfd54818b51d1e21/stream"
+            ) as stream:
                 async for line in stream.aiter_lines():
                     if line.startswith("data: "):
                         payload = line[6:]
@@ -5500,7 +5608,7 @@ async def test_cancelled_turn_publishes_idle_so_client_unsticks() -> None:
 
         async def _stuck() -> None:
             resp = await client.post(
-                "/v1/sessions/conv_cancel/events",
+                "/v1/sessions/1a6237b81972b420cfd54818b51d1e21/events",
                 json={
                     "type": "message",
                     "role": "user",
@@ -5517,7 +5625,7 @@ async def test_cancelled_turn_publishes_idle_so_client_unsticks() -> None:
 
         # DELETE cancels the turn task — exercises `_drain_streaming_response`'s
         # CancelledError path.
-        del_resp = await client.delete("/v1/sessions/conv_cancel")
+        del_resp = await client.delete("/v1/sessions/1a6237b81972b420cfd54818b51d1e21")
         assert del_resp.status_code == 200
 
         gate.set()  # unblock the stuck stream so the test can finish
@@ -5680,7 +5788,10 @@ async def test_session_creation_auto_starts_turn_for_unanswered_user_message() -
     async with _runner_client(app) as client:
         resp = await client.post(
             "/v1/sessions",
-            json={"session_id": "conv_recover_1", "agent_id": "ag_1"},
+            json={
+                "session_id": "5f35011bda530550543bf0c329c309f1",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
         )
         assert resp.status_code == 201
         # "running" proves the recovery turn was started during
@@ -5733,7 +5844,7 @@ async def test_session_creation_does_not_replay_trailing_user_for_codex_native(
 
     import omnigent.runner.app as runner_app_mod
 
-    session_id = "conv_codex_failed_recover"
+    session_id = "c5bceafbef391eeff567c144d1d33f3f"
     runner_app_mod._session_histories_ref.pop(session_id, None)
 
     monkeypatch.setattr(
@@ -5756,7 +5867,7 @@ async def test_session_creation_does_not_replay_trailing_user_for_codex_native(
         async with _runner_client(app) as client:
             resp = await client.post(
                 "/v1/sessions",
-                json={"session_id": session_id, "agent_id": "ag_1"},
+                json={"session_id": session_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
             )
             assert resp.status_code == 201
             assert resp.json()["status"] == "idle"
@@ -5791,7 +5902,7 @@ async def test_catch_up_scan_skips_codex_native_history_entries(
 
     import omnigent.runner.app as runner_app_mod
 
-    session_id = "conv_codex_catchup_skip"
+    session_id = "97990a9c3b849bb4710a9fb1e9fdc6c8"
     saved_histories = dict(runner_app_mod._session_histories_ref)
     runner_app_mod._session_histories_ref.clear()
     missed_user_item = {
@@ -5837,7 +5948,7 @@ async def test_catch_up_scan_skips_codex_native_history_entries(
         async with _runner_client(app) as client:
             resp = await client.post(
                 "/v1/sessions",
-                json={"session_id": session_id, "agent_id": "ag_1"},
+                json={"session_id": session_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
             )
             assert resp.status_code == 201
             assert resp.json()["status"] == "idle"
@@ -5897,7 +6008,10 @@ async def test_session_creation_stays_idle_for_completed_conversation() -> None:
     async with _runner_client(app) as client:
         resp = await client.post(
             "/v1/sessions",
-            json={"session_id": "conv_idle_1", "agent_id": "ag_1"},
+            json={
+                "session_id": "92613c24e132e95e80519e59b2134a38",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
         )
         assert resp.status_code == 201
         # "idle" proves no recovery turn was started. "running"
@@ -5942,7 +6056,10 @@ async def test_session_creation_auto_starts_turn_for_pending_tool_call() -> None
     async with _runner_client(app) as client:
         resp = await client.post(
             "/v1/sessions",
-            json={"session_id": "conv_recover_tc", "agent_id": "ag_1"},
+            json={
+                "session_id": "f74b6cc12acef4605aa5808eb214b53c",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
         )
         assert resp.status_code == 201
         assert resp.json()["status"] == "running"
@@ -5969,7 +6086,10 @@ async def test_session_creation_no_recovery_for_empty_history() -> None:
     async with _runner_client(app) as client:
         resp = await client.post(
             "/v1/sessions",
-            json={"session_id": "conv_fresh", "agent_id": "ag_1"},
+            json={
+                "session_id": "19f000886345b9519ac5977b97d3a795",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
         )
         assert resp.status_code == 201
         assert resp.json()["status"] == "idle"
@@ -6025,7 +6145,10 @@ async def test_history_load_paginates_beyond_100_items() -> None:
         # Create session — loads history via pagination.
         resp = await client.post(
             "/v1/sessions",
-            json={"session_id": "conv_paginate", "agent_id": "ag_1"},
+            json={
+                "session_id": "1371f04fe2cf189fe4246131ddff016d",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
         )
         assert resp.status_code == 201
         assert resp.json()["status"] == "idle"
@@ -6033,7 +6156,7 @@ async def test_history_load_paginates_beyond_100_items() -> None:
         # Now send a message to trigger a turn — the turn uses
         # _session_histories which should have all 150 items.
         resp2 = await client.post(
-            "/v1/sessions/conv_paginate/events",
+            "/v1/sessions/1371f04fe2cf189fe4246131ddff016d/events",
             json={
                 "type": "message",
                 "role": "user",
@@ -6105,7 +6228,10 @@ async def test_resume_sends_full_history_plus_new_message_to_harness() -> None:
     async with _runner_client(app) as client:
         resp = await client.post(
             "/v1/sessions",
-            json={"session_id": "conv_resume_1", "agent_id": "ag_1"},
+            json={
+                "session_id": "b76becb60586615cf61d0894efbbbfe0",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
         )
         # History ends with assistant — session stays idle (no recovery).
         assert resp.status_code == 201
@@ -6113,11 +6239,11 @@ async def test_resume_sends_full_history_plus_new_message_to_harness() -> None:
 
         # Now send a new message (simulating user typing after resume).
         resp2 = await client.post(
-            "/v1/sessions/conv_resume_1/events",
+            "/v1/sessions/b76becb60586615cf61d0894efbbbfe0/events",
             json={
                 "type": "message",
                 "role": "user",
-                "agent_id": "ag_1",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
                 "model": "test-agent",
                 "content": [{"type": "input_text", "text": "Postresume"}],
             },
@@ -6216,7 +6342,10 @@ async def test_compaction_item_in_history_expands_and_discards_prior() -> None:
         # Session has a trailing user message → crash recovery fires.
         resp = await client.post(
             "/v1/sessions",
-            json={"session_id": "conv_compact_1", "agent_id": "ag_1"},
+            json={
+                "session_id": "f29d4764cd2a1682c103dff3562976eb",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
         )
         assert resp.status_code == 201
         assert resp.json()["status"] == "running"
@@ -6308,7 +6437,10 @@ async def test_error_item_in_history_is_surfaced_as_error_block_not_dropped() ->
         # Trailing user message → crash recovery starts a turn, replaying history.
         resp = await client.post(
             "/v1/sessions",
-            json={"session_id": "conv_err_1", "agent_id": "ag_1"},
+            json={
+                "session_id": "e65fe670b242ca2ea48eb8930779d5ff",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
         )
         assert resp.status_code == 201
         assert resp.json()["status"] == "running"
@@ -6380,7 +6512,10 @@ async def test_crash_recovery_with_compaction_uses_post_compaction_history() -> 
     async with _runner_client(app) as client:
         resp = await client.post(
             "/v1/sessions",
-            json={"session_id": "conv_compact_cr", "agent_id": "ag_1"},
+            json={
+                "session_id": "ebfd802a516c4aa95f33f58c894aad31",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
         )
         assert resp.status_code == 201
         # History ends with assistant message (post-compaction) → idle.
@@ -6648,7 +6783,7 @@ async def test_interrupt_forwards_to_harness_before_cancelling() -> None:
     app, _pm, _hc = _build_fwd_blocking_app(gate, fwd_gate)
 
     async with _runner_client(app) as client:
-        conv_id = "conv_fwd_first"
+        conv_id = "d741917a64f51f2d41226b88d53daf58"
         resp = await client.post(
             f"/v1/sessions/{conv_id}/events",
             json={
@@ -6713,7 +6848,7 @@ async def test_interrupt_inserts_cancellation_items_in_history() -> None:
     app, _pm, _hc = _build_interrupt_app(gate)
 
     async with _runner_client(app) as client:
-        conv_id = "conv_int"
+        conv_id = "85b147537400967b1fb8542367423306"
 
         # Start the turn — it blocks after the first function_call
         # frame, before the second one and response.completed.
@@ -6831,7 +6966,7 @@ async def test_interrupt_cancel_floor_finalizes_stuck_turn() -> None:
     app, _pm, _hc = _build_interrupt_app(gate)
 
     async with _runner_client(app) as client:
-        conv_id = "conv_stuck_int"
+        conv_id = "97d2b96d733e685433e2b3864eb97652"
         resp = await client.post(
             f"/v1/sessions/{conv_id}/events",
             json={
@@ -6881,7 +7016,7 @@ async def test_stop_session_cancels_inprocess_turn() -> None:
     app, _pm, _hc = _build_interrupt_app(gate)
 
     async with _runner_client(app) as client:
-        conv_id = "conv_stuck_stop"
+        conv_id = "422963919abf3c166633d99ea20f2b8e"
         resp = await client.post(
             f"/v1/sessions/{conv_id}/events",
             json={
@@ -6957,13 +7092,13 @@ async def test_interrupt_during_setup_phase_recovers_stuck_turn() -> None:
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
 
-    conv_id = "conv_setup_cancel"
+    conv_id = "9fb432c546c7dbf9f34c6acbc861b05f"
     # agent_id is required for the background turn's setup to invoke the resolver.
     msg = {
         "type": "message",
         "role": "user",
         "model": "test-agent",
-        "agent_id": "ag_1",
+        "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
         "content": [{"type": "input_text", "text": "do something"}],
         "harness": "openai-agents",
     }
@@ -7029,7 +7164,7 @@ async def test_interrupt_marker_instructs_model_to_disregard_abandoned_request()
     app, _pm, _hc = _build_interrupt_app(gate)
 
     async with _runner_client(app) as client:
-        conv_id = "conv_int_disregard"
+        conv_id = "86ba5bc9053ae8771fdb988e882f04b5"
         resp = await client.post(
             f"/v1/sessions/{conv_id}/events",
             json={
@@ -7097,8 +7232,8 @@ async def test_external_session_status_idle_delivers_forwarded_native_output_to_
     from omnigent.runner import app as runner_app
     from omnigent.runner.tool_dispatch import execute_tool
 
-    parent_id = "conv_parent_native_complete"
-    child_id = "conv_child_native_complete"
+    parent_id = "d4cfd8ebd7ef0ae6f6f0c4310d2df7ce"
+    child_id = "66a84f142181a489d004f744cc76c67b"
     session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     pm = _FakeProcessManager(_ScriptedHarnessClient([]))
     app = create_runner_app(
@@ -7157,7 +7292,7 @@ async def test_external_session_status_idle_delivers_forwarded_native_output_to_
         runner_app._session_inboxes_ref.pop(parent_id, None)
         runner_app._session_histories_ref.pop(child_id, None)
 
-    assert "sub-agent task conv_child_native_complete completed" in inbox_output
+    assert "sub-agent task 66a84f142181a489d004f744cc76c67b completed" in inbox_output
     assert "worker:native returned: AP_NATIVE_DONE" in inbox_output
     assert "LOCAL_SHOULD_NOT_WIN" not in inbox_output
 
@@ -7175,8 +7310,8 @@ async def test_external_session_status_running_fans_out_child_busy_to_parent() -
     """
     from omnigent.runner import app as runner_app
 
-    parent_id = "conv_parent_native_status_fanout"
-    child_id = "conv_child_native_status_fanout"
+    parent_id = "d72e6c2c5866b0f946739fa5a9f964f7"
+    child_id = "8c9f35bc1cb0566b101c59941a576689"
     pm = _FakeProcessManager(_ScriptedHarnessClient([]))
     app = create_runner_app(
         process_manager=pm,  # type: ignore[arg-type]
@@ -7251,8 +7386,8 @@ async def test_external_status_sequence_coalesces_duplicates_but_emits_task_stat
     """
     from omnigent.runner import app as runner_app
 
-    parent_id = "conv_parent_native_status_sequence"
-    child_id = "conv_child_native_status_sequence"
+    parent_id = "75115d379fc444a3731a92c930150c8e"
+    child_id = "2d88f6c2b566daadfb256052a0ee5abe"
     pm = _FakeProcessManager(_ScriptedHarnessClient([]))
     app = create_runner_app(
         process_manager=pm,  # type: ignore[arg-type]
@@ -7350,8 +7485,8 @@ async def test_external_status_idle_fans_out_forwarded_output_preview_to_parent(
     """
     from omnigent.runner import app as runner_app
 
-    parent_id = "conv_parent_native_preview_fanout"
-    child_id = "conv_child_native_preview_fanout"
+    parent_id = "83676fab214be9a9ba799712c450e385"
+    child_id = "ffa0293c16d5a9e5e6c362846277c631"
     pm = _FakeProcessManager(_ScriptedHarnessClient([]))
     app = create_runner_app(
         process_manager=pm,  # type: ignore[arg-type]
@@ -7424,8 +7559,8 @@ async def test_external_status_idle_without_output_omits_stale_history_preview()
     """
     from omnigent.runner import app as runner_app
 
-    parent_id = "conv_parent_native_no_preview"
-    child_id = "conv_child_native_no_preview"
+    parent_id = "1dc34bd0fea39227de4779abc14c4b74"
+    child_id = "f7423fb08cf726ea957c2f907d85edbd"
     session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     server_client = _WakeRecordingServerClient(parent_id)
     pm = _FakeProcessManager(_ScriptedHarnessClient([]))
@@ -7513,7 +7648,7 @@ class _WakeRecordingServerClient(NullServerClient):
     def __init__(self, parent_id: str) -> None:
         """
         :param parent_id: Parent session whose ``/events`` POSTs to capture,
-            e.g. ``"conv_parent_wake"``.
+            e.g. ``"bf881b8f7e32add48bfcd6afc476452a"``.
         """
         self._parent_events_path = f"/v1/sessions/{parent_id}/events"
         self.wake_posts: list[dict[str, Any]] = []
@@ -7522,7 +7657,7 @@ class _WakeRecordingServerClient(NullServerClient):
     async def post(self, url: str, **kwargs: Any) -> NullServerClient._Response:
         """Capture a wake POST to the watched parent, else defer to the base.
 
-        :param url: Request URL, e.g. ``"/v1/sessions/conv_parent_wake/events"``.
+        :param url: Request URL, e.g. ``"/v1/sessions/bf881b8f7e32add48bfcd6afc476452a/events"``.
         :param kwargs: Request kwargs; the wake notice is in ``json``.
         :returns: Stub 200 response from :class:`NullServerClient`.
         """
@@ -7549,8 +7684,8 @@ async def test_native_subagent_completion_wakes_idle_parent() -> None:
     """
     from omnigent.runner import app as runner_app
 
-    parent_id = "conv_parent_wake"
-    child_id = "conv_child_wake"
+    parent_id = "bf881b8f7e32add48bfcd6afc476452a"
+    child_id = "7ec2f4cd958a2c2a8c02bd3c03cbacc6"
     session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     server_client = _WakeRecordingServerClient(parent_id)
     pm = _FakeProcessManager(_ScriptedHarnessClient([]))
@@ -7614,7 +7749,7 @@ async def test_external_status_for_untracked_session_does_not_wake() -> None:
     wake is scheduled. A regression that dropped the ``entry is not None`` guard
     would either 500 (None.delivered) or post a spurious wake — both caught here.
     """
-    orphan_id = "conv_not_a_subagent"
+    orphan_id = "28e85f4c5fb460c5185e374605bc4364"
     server_client = _WakeRecordingServerClient(orphan_id)
     pm = _FakeProcessManager(_ScriptedHarnessClient([]))
     app = create_runner_app(
@@ -7654,8 +7789,8 @@ async def test_tracked_subagent_status_without_parent_inbox_returns_503() -> Non
     """
     from omnigent.runner import app as runner_app
 
-    parent_id = "conv_parent_missing_inbox"
-    child_id = "conv_child_missing_inbox"
+    parent_id = "41bd085f8d34ad9201cd59c372312a1a"
+    child_id = "6d17e94dcad6a73de34441f490d140b4"
     pm = _FakeProcessManager(_ScriptedHarnessClient([]))
     app = create_runner_app(
         process_manager=pm,  # type: ignore[arg-type]
@@ -7702,8 +7837,8 @@ def test_subagent_terminal_delivery_retry_uses_latest_undelivered_report() -> No
     """
     from omnigent.runner import app as runner_app
 
-    parent_id = "conv_parent_retry_missing_inbox"
-    child_id = "conv_child_retry_missing_inbox"
+    parent_id = "05f117c03074f5d4b0ebe450f79b0684"
+    child_id = "01a9880c1386637a7d0a154ecb2c4a72"
     session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     runner_app.register_subagent_work(
         parent_session_id=parent_id,
@@ -7754,8 +7889,8 @@ def test_subagent_terminal_delivery_handles_missing_output() -> None:
     """
     from omnigent.runner import app as runner_app
 
-    parent_id = "conv_parent_missing_output"
-    child_id = "conv_child_missing_output"
+    parent_id = "9c98fbe12742d712819dd26553a7a9ee"
+    child_id = "c2a7357e26dc400e4aa6e5c25c611853"
     session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     runner_app._session_inboxes_ref[parent_id] = session_inbox
     runner_app.register_subagent_work(
@@ -7792,7 +7927,7 @@ async def test_known_subagent_status_without_work_entry_returns_503() -> None:
     metadata. Returning 503 forces the AP/forwarder path to preserve the
     failed delivery instead of reporting success.
     """
-    child_id = "conv_child_missing_work_entry"
+    child_id = "38c56dfa64cb80c126c49429f7e482cd"
     pm = _FakeProcessManager(_ScriptedHarnessClient([]))
     app = create_runner_app(
         process_manager=pm,  # type: ignore[arg-type]
@@ -7804,7 +7939,7 @@ async def test_known_subagent_status_without_work_entry_returns_503() -> None:
             "/v1/sessions",
             json={
                 "session_id": child_id,
-                "agent_id": "ag_missing_work_entry",
+                "agent_id": "6eadea15d6e06f43d026b25b656a73ec",
                 "sub_agent_name": "worker",
             },
         )
@@ -7836,8 +7971,8 @@ async def test_repeated_idle_status_wakes_parent_only_once() -> None:
     """
     from omnigent.runner import app as runner_app
 
-    parent_id = "conv_parent_wake_once"
-    child_id = "conv_child_wake_once"
+    parent_id = "f42f428f0217c078c09803aea44cd57b"
+    child_id = "e63625ecd31e483b65e5333e6195cc13"
     session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     server_client = _WakeRecordingServerClient(parent_id)
     pm = _FakeProcessManager(_ScriptedHarnessClient([]))
@@ -7896,9 +8031,9 @@ async def test_delete_session_clears_pending_subagent_wake() -> None:
     """
     from omnigent.runner import app as runner_app
 
-    parent_id = "conv_parent_delete_clears_wake"
-    first_child_id = "conv_child_before_delete"
-    second_child_id = "conv_child_after_delete"
+    parent_id = "514616cf803ec0ca696db4cdf75be6f6"
+    first_child_id = "7cb2d00b228b559198a369204d1e1ffd"
+    second_child_id = "06e5e6cd8edde087a16afcd0aa6a37f8"
     first_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     second_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     server_client = _WakeRecordingServerClient(parent_id)
@@ -7912,7 +8047,7 @@ async def test_delete_session_clears_pending_subagent_wake() -> None:
         async with _runner_client(app) as client:
             create_resp = await client.post(
                 "/v1/sessions",
-                json={"session_id": parent_id, "agent_id": "ag_parent_delete_wake"},
+                json={"session_id": parent_id, "agent_id": "727cdb9ef83160bc29658b70782734ac"},
             )
             assert create_resp.status_code == 201, create_resp.text
 
@@ -7983,9 +8118,9 @@ async def test_subagent_completion_during_parent_wake_turn_posts_followup_wake()
     """
     from omnigent.runner import app as runner_app
 
-    parent_id = "conv_parent_wake_turn_race"
-    first_child_id = "conv_child_initial_wake"
-    second_child_id = "conv_child_followup_wake"
+    parent_id = "44026e683bcf8dd047e509d974196bf9"
+    first_child_id = "1a9cf84a190d53d5e9b6ec4e9c534f31"
+    second_child_id = "e3099fa95ced5bb8786b79a131429c78"
     session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     server_client = _WakeRecordingServerClient(parent_id)
     gate = asyncio.Event()
@@ -8029,7 +8164,7 @@ async def test_subagent_completion_during_parent_wake_turn_posts_followup_wake()
                 json={
                     "type": "message",
                     "role": "user",
-                    "agent_id": "ag_parent_wake_turn",
+                    "agent_id": "3006a2a399391aa72a65a507ff92dae3",
                     "model": "test-agent",
                     "harness": "openai-agents",
                     "content": [{"type": "input_text", "text": "wake notice"}],
@@ -8094,10 +8229,10 @@ async def test_parent_idle_with_stuck_wake_flag_posts_recovery_wake() -> None:
     """
     from omnigent.runner import app as runner_app
 
-    parent_id = "conv_parent_rewake_after_consume"
-    child_a = "conv_child_round1_a"
-    child_b = "conv_child_round1_b"
-    child_c = "conv_child_round2_c"
+    parent_id = "22b91e208e5501fb8d2b502837391f04"
+    child_a = "27cb54833afaf691aacb1bb7ec7ce66b"
+    child_b = "06bc724cd3a9b5ee75c95a057a561cfb"
+    child_c = "8cc1d911d72dee40ec6956d369f0b55a"
     session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     server_client = _WakeRecordingServerClient(parent_id)
     gate = asyncio.Event()
@@ -8148,7 +8283,7 @@ async def test_parent_idle_with_stuck_wake_flag_posts_recovery_wake() -> None:
                 json={
                     "type": "message",
                     "role": "user",
-                    "agent_id": "ag_parent_rewake",
+                    "agent_id": "7c04e18ef7e3a769f7eecca21b049374",
                     "model": "test-agent",
                     "harness": "openai-agents",
                     "content": [{"type": "input_text", "text": "wake notice"}],
@@ -8309,10 +8444,10 @@ async def test_parent_idle_with_stuck_wake_flag_and_drained_inbox_clears_flag() 
     """
     from omnigent.runner import app as runner_app
 
-    parent_id = "conv_parent_rewake_drained_inbox"
-    child_a = "conv_child_drained_a"
-    child_b = "conv_child_drained_b"
-    child_c = "conv_child_drained_c"
+    parent_id = "8f0e87b24df3f773e7f8de693347dad9"
+    child_a = "95dae25caa3d012baa1a1309cde1674b"
+    child_b = "f92aa6bcffbfc5ed559a93d8c9404572"
+    child_c = "41967d48eb327dd8f2f6e4442977c813"
     session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     server_client = _WakeRecordingServerClient(parent_id)
     gate = asyncio.Event()
@@ -8363,7 +8498,7 @@ async def test_parent_idle_with_stuck_wake_flag_and_drained_inbox_clears_flag() 
                 json={
                     "type": "message",
                     "role": "user",
-                    "agent_id": "ag_parent_drained",
+                    "agent_id": "d99814e82ffc3ad874ca24f44a86ffc7",
                     "model": "test-agent",
                     "harness": "openai-agents",
                     "content": [{"type": "input_text", "text": "wake notice"}],
@@ -8518,8 +8653,8 @@ async def test_replayed_idle_status_after_inbox_drain_is_acknowledged() -> None:
     from omnigent.runner import app as runner_app
     from omnigent.runner.tool_dispatch import execute_tool
 
-    parent_id = "conv_parent_drain_replay"
-    child_id = "conv_child_drain_replay"
+    parent_id = "fde99284fcd969bcadb10a80290e6dc5"
+    child_id = "6ce8004b6fc222e4a2794d177dc55042"
     session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     server_client = _WakeRecordingServerClient(parent_id)
     pm = _FakeProcessManager(_ScriptedHarnessClient([]))
@@ -8560,7 +8695,7 @@ async def test_replayed_idle_status_after_inbox_drain_is_acknowledged() -> None:
                 "/v1/sessions",
                 json={
                     "session_id": child_id,
-                    "agent_id": "ag_drain_replay",
+                    "agent_id": "c14cab5182af3847da17636fdc7644e0",
                     "sub_agent_name": "worker",
                 },
             )
@@ -8605,8 +8740,12 @@ async def test_concurrent_subagent_completions_coalesce_into_one_wake() -> None:
     """
     from omnigent.runner import app as runner_app
 
-    parent_id = "conv_parent_fanout"
-    child_ids = ["conv_child_fan_a", "conv_child_fan_b", "conv_child_fan_c"]
+    parent_id = "0c51258a4c62e5c390402b8473ae8271"
+    child_ids = [
+        "cef7ed6e3019655ad11ad769184a43a7",
+        "62e17066cdf6a5a732c054faefb7ef39",
+        "a0c5b28f0854df92006a4ff0c857ac3a",
+    ]
     session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     server_client = _WakeRecordingServerClient(parent_id)
     pm = _FakeProcessManager(_ScriptedHarnessClient([]))
@@ -8727,7 +8866,10 @@ async def test_events_interrupt_on_native_session_injects_escape_without_marker(
         # interrupt dispatch can detect "claude-native".
         create_resp = await client.post(
             "/v1/sessions",
-            json={"session_id": "conv_native_int", "agent_id": "ag_1"},
+            json={
+                "session_id": "664449321754215750a1d43e89fca21e",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
         )
         assert create_resp.status_code == 201, create_resp.text
 
@@ -8738,7 +8880,7 @@ async def test_events_interrupt_on_native_session_injects_escape_without_marker(
         # both ``_session_histories`` and ``_session_event_queues`` from
         # the test without any subscribe / sleep dance.
         int_resp = await client.post(
-            "/v1/sessions/conv_native_int/events",
+            "/v1/sessions/664449321754215750a1d43e89fca21e/events",
             json={"type": "interrupt"},
         )
 
@@ -8746,11 +8888,11 @@ async def test_events_interrupt_on_native_session_injects_escape_without_marker(
         # DELETE clears ``_session_histories`` and pops the queue from
         # ``_session_event_queues``, so reading after delete would
         # always see empty.
-        captured_history = list(_session_histories_ref.get("conv_native_int", []))
-        queue = _session_event_queues_ref.get("conv_native_int")
+        captured_history = list(_session_histories_ref.get("664449321754215750a1d43e89fca21e", []))
+        queue = _session_event_queues_ref.get("664449321754215750a1d43e89fca21e")
         assert queue is not None, (
             "Session creation should have initialized the event queue "
-            "for ``conv_native_int``; ``_session_event_queues_ref`` is "
+            "for ``664449321754215750a1d43e89fca21e``; ``_session_event_queues_ref`` is "
             "missing the entry, so we couldn't drain it to verify the "
             "interrupt handler did not enqueue a synthesized idle."
         )
@@ -8774,7 +8916,7 @@ async def test_events_interrupt_on_native_session_injects_escape_without_marker(
         f"canonical name."
     )
     bridge_dir, timeout_s = captured_inject[0]
-    assert bridge_dir == bridge_dir_for_conversation_id("conv_native_int")
+    assert bridge_dir == bridge_dir_for_conversation_id("664449321754215750a1d43e89fca21e")
     # 1.0s short timeout: UI stop must feel snappy. If this becomes
     # the helper's 30s default, the user's click would hang on any
     # missing tmux.json.
@@ -8867,7 +9009,7 @@ async def test_message_turn_lifecycle_status_suppressed_for_terminal_backed_harn
     """
     from omnigent.runner.app import _session_event_queues_ref
 
-    session_id = f"conv_ts_{harness.replace('-', '_')}"
+    session_id = uuid.uuid4().hex
     spec = AgentSpec(
         spec_version=1,
         name="t",
@@ -8890,7 +9032,7 @@ async def test_message_turn_lifecycle_status_suppressed_for_terminal_backed_harn
         # resolve the harness and decide whether to suppress turn status.
         create_resp = await client.post(
             "/v1/sessions",
-            json={"session_id": session_id, "agent_id": "ag_1"},
+            json={"session_id": session_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
         )
         assert create_resp.status_code == 201, create_resp.text
         # Native session creation may try to auto-create a terminal. This
@@ -8913,7 +9055,7 @@ async def test_message_turn_lifecycle_status_suppressed_for_terminal_backed_harn
                 "type": "message",
                 "role": "user",
                 "content": [{"type": "input_text", "text": "test"}],
-                "agent_id": "ag_1",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
             },
         )
         assert msg_resp.status_code in (200, 202), msg_resp.text
@@ -9002,17 +9144,20 @@ async def test_events_interrupt_on_native_session_503_skips_cleanup_when_inject_
     async with _runner_client(app) as client:
         create_resp = await client.post(
             "/v1/sessions",
-            json={"session_id": "conv_native_int_fail", "agent_id": "ag_1"},
+            json={
+                "session_id": "57ac398df7e3972b95ddba8d6109f396",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
         )
         assert create_resp.status_code == 201, create_resp.text
 
         int_resp = await client.post(
-            "/v1/sessions/conv_native_int_fail/events",
+            "/v1/sessions/57ac398df7e3972b95ddba8d6109f396/events",
             json={"type": "interrupt"},
         )
 
-        captured_history = list(_session_histories_ref.get("conv_native_int_fail", []))
-        queue = _session_event_queues_ref.get("conv_native_int_fail")
+        captured_history = list(_session_histories_ref.get("57ac398df7e3972b95ddba8d6109f396", []))
+        queue = _session_event_queues_ref.get("57ac398df7e3972b95ddba8d6109f396")
         assert queue is not None, (
             "Session creation should have initialized the event queue; "
             "the failure path still needs the queue to exist so we can "
@@ -9191,7 +9336,7 @@ async def test_events_codex_native_settings_change_uses_thread_settings_update(
     from omnigent import codex_native_app_server
     from omnigent.spec.types import ExecutorSpec
 
-    conv_id = "conv_codex_native_settings"
+    conv_id = "524fe55f9d5a7f66fec5c5401a930b84"
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
     bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(conv_id)
     codex_native_bridge.write_bridge_state(
@@ -9258,7 +9403,7 @@ async def test_events_codex_native_settings_change_uses_thread_settings_update(
     async with _runner_client(app) as client:
         create_resp = await client.post(
             "/v1/sessions",
-            json={"session_id": conv_id, "agent_id": "ag_1"},
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
         )
         assert create_resp.status_code == 201, create_resp.text
 
@@ -9362,7 +9507,7 @@ async def test_codex_native_model_options_returns_503_until_bridge_state_exists(
     """
     from omnigent import codex_native_app_server
 
-    conv_id = "conv_codex_native_model_options_not_ready"
+    conv_id = "d2f0a2d856bc03c1674d3d634b4f250c"
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
 
     def _client_for_transport(
@@ -9410,7 +9555,7 @@ async def test_codex_native_model_options_returns_503_until_bridge_state_exists(
     async with _runner_client(app) as client:
         create_resp = await client.post(
             "/v1/sessions",
-            json={"session_id": conv_id, "agent_id": "ag_1"},
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
         )
         assert create_resp.status_code == 201, create_resp.text
 
@@ -9441,7 +9586,7 @@ async def test_codex_native_model_options_query_model_list(
     from omnigent import codex_native_app_server
     from omnigent.spec.types import ExecutorSpec
 
-    conv_id = "conv_codex_native_model_options"
+    conv_id = "68ba0a62ebe928d26adf37c8974ce1eb"
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
     bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(conv_id)
     codex_native_bridge.write_bridge_state(
@@ -9541,7 +9686,7 @@ async def test_codex_native_model_options_query_model_list(
     async with _runner_client(app) as client:
         create_resp = await client.post(
             "/v1/sessions",
-            json={"session_id": conv_id, "agent_id": "ag_1"},
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
         )
         assert create_resp.status_code == 201, create_resp.text
 
@@ -9594,7 +9739,7 @@ async def test_events_codex_native_plan_mode_requires_loaded_bridge(
     persist a false Plan indicator even though Codex app-server never received
     ``thread/settings/update``.
     """
-    conv_id = "conv_codex_native_plan_no_bridge"
+    conv_id = "290b63ecec11a7ae5b93da19be2d9195"
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
 
     codex_native_spec = AgentSpec(
@@ -9610,8 +9755,8 @@ async def test_events_codex_native_plan_mode_requires_loaded_bridge(
         """
         Return the codex-native spec for any agent id.
 
-        :param agent_id: Agent identifier, e.g. ``"ag_1"``.
-        :param session_id: Session identifier, e.g. ``"conv_abc123"``.
+        :param agent_id: Agent identifier, e.g. ``"880b5afda28ad55ff74cbeb9b5fc67fb"``.
+        :param session_id: Session identifier, e.g. ``"d1f9214d74c38b9f9a9db17ed8352dc4"``.
         :returns: Codex-native agent spec.
         """
         del agent_id, session_id
@@ -9627,7 +9772,7 @@ async def test_events_codex_native_plan_mode_requires_loaded_bridge(
     async with _runner_client(app) as client:
         create_resp = await client.post(
             "/v1/sessions",
-            json={"session_id": conv_id, "agent_id": "ag_1"},
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
         )
         assert create_resp.status_code == 201, create_resp.text
 
@@ -9666,7 +9811,7 @@ async def test_events_interrupt_on_codex_native_uses_turn_interrupt_without_mark
     from omnigent.runner.app import _session_histories_ref
     from omnigent.spec.types import ExecutorSpec
 
-    conv_id = "conv_codex_native_int"
+    conv_id = "83d1472d16e3e635c84ca44f29624fca"
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
     bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(conv_id)
     codex_native_bridge.write_bridge_state(
@@ -9732,7 +9877,7 @@ async def test_events_interrupt_on_codex_native_uses_turn_interrupt_without_mark
         # Seeds _session_spec_cache so the dispatch detects "codex-native".
         create_resp = await client.post(
             "/v1/sessions",
-            json={"session_id": conv_id, "agent_id": "ag_1"},
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
         )
         assert create_resp.status_code == 201, create_resp.text
 
@@ -9814,7 +9959,7 @@ async def test_events_stop_session_on_codex_native_uses_turn_interrupt_without_m
     from omnigent.runner.app import _session_histories_ref
     from omnigent.spec.types import ExecutorSpec
 
-    conv_id = "conv_codex_native_stop"
+    conv_id = "fa87fda193a47e99e6a2599e44032807"
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
     bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(conv_id)
     codex_native_bridge.write_bridge_state(
@@ -9879,7 +10024,7 @@ async def test_events_stop_session_on_codex_native_uses_turn_interrupt_without_m
     async with _runner_client(app) as client:
         create_resp = await client.post(
             "/v1/sessions",
-            json={"session_id": conv_id, "agent_id": "ag_1"},
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
         )
         assert create_resp.status_code == 201, create_resp.text
 
@@ -9960,7 +10105,7 @@ async def test_events_stop_on_codex_native_cancels_mcp_startup_without_active_tu
     from omnigent import codex_native_app_server
     from omnigent.spec.types import ExecutorSpec
 
-    conv_id = f"conv_codex_native_mcp_{event_type}"
+    conv_id = f"36ea25fd09df4a2d85136100fbecd3e9{event_type}"
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
     # Abort the session-create auto-terminal path before it reaches
     # ``clear_bridge_state`` — otherwise the seeded bridge state below is
@@ -10038,7 +10183,7 @@ async def test_events_stop_on_codex_native_cancels_mcp_startup_without_active_tu
     async with _runner_client(app) as client:
         create_resp = await client.post(
             "/v1/sessions",
-            json={"session_id": conv_id, "agent_id": "ag_1"},
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
         )
         assert create_resp.status_code == 201, create_resp.text
 
@@ -10096,7 +10241,7 @@ async def test_events_interrupt_on_codex_native_with_turn_and_mcp_stops_both(
     from omnigent import codex_native_app_server
     from omnigent.spec.types import ExecutorSpec
 
-    conv_id = "conv_codex_native_dual_stop"
+    conv_id = "14fb6a0dde97fc0f7a58a84e1be2c538"
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
     # Keep the seeded bridge state alive through session create (see the
     # sister startup-cancel test for why auto-create must abort early).
@@ -10172,7 +10317,7 @@ async def test_events_interrupt_on_codex_native_with_turn_and_mcp_stops_both(
     async with _runner_client(app) as client:
         create_resp = await client.post(
             "/v1/sessions",
-            json={"session_id": conv_id, "agent_id": "ag_1"},
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
         )
         assert create_resp.status_code == 201, create_resp.text
 
@@ -10211,7 +10356,7 @@ async def test_events_interrupt_on_codex_native_without_turn_or_mcp_is_noop(
     from omnigent import codex_native_app_server
     from omnigent.spec.types import ExecutorSpec
 
-    conv_id = "conv_codex_native_idle_stop"
+    conv_id = "5cb0fd92163581dee07e5462a93d5021"
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
     # Keep the seeded bridge state alive through session create (see the
     # sister startup-cancel test for why auto-create must abort early).
@@ -10274,7 +10419,7 @@ async def test_events_interrupt_on_codex_native_without_turn_or_mcp_is_noop(
     async with _runner_client(app) as client:
         create_resp = await client.post(
             "/v1/sessions",
-            json={"session_id": conv_id, "agent_id": "ag_1"},
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
         )
         assert create_resp.status_code == 201, create_resp.text
 
@@ -10317,7 +10462,7 @@ async def test_events_interrupt_and_stop_on_pi_native_enqueue_bridge_interrupt(
     from omnigent.runner.app import _session_histories_ref
     from omnigent.spec.types import ExecutorSpec
 
-    conv_id = f"conv_pi_native_{event_type}"
+    conv_id = uuid.uuid4().hex
     monkeypatch.setattr(pi_native_bridge, "_BRIDGE_ROOT", tmp_path / "pi-bridge")
 
     pi_native_spec = AgentSpec(
@@ -10343,7 +10488,7 @@ async def test_events_interrupt_and_stop_on_pi_native_enqueue_bridge_interrupt(
         # Seeds _session_spec_cache so the dispatch detects "pi-native".
         create_resp = await client.post(
             "/v1/sessions",
-            json={"session_id": conv_id, "agent_id": "ag_1"},
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
         )
         assert create_resp.status_code == 201, create_resp.text
 
@@ -10490,8 +10635,8 @@ def test_interrupted_sessions_isolated_per_app_instance() -> None:
         "the same object, the set is module-global again and flags leak across apps."
     )
 
-    app1.state.interrupted_sessions.add("conv_x")
-    assert "conv_x" not in app2.state.interrupted_sessions, (
+    app1.state.interrupted_sessions.add("8af356d908005a65f872c246158c6293")
+    assert "8af356d908005a65f872c246158c6293" not in app2.state.interrupted_sessions, (
         "app2 must not observe app1's interrupt flag. If it does, "
         "_interrupted_sessions is shared process-global state and a stale flag "
         "would fire a bogus [System: interrupted] marker on app2's next turn."
@@ -10553,20 +10698,23 @@ async def test_events_stop_session_on_native_kills_tmux_and_publishes_idle(
     async with _runner_client(app) as client:
         create_resp = await client.post(
             "/v1/sessions",
-            json={"session_id": "conv_native_stop", "agent_id": "ag_1"},
+            json={
+                "session_id": "1fb90dd3b9d3f24e2356ace505314db1",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
         )
         assert create_resp.status_code == 201, create_resp.text
 
         stop_resp = await client.post(
-            "/v1/sessions/conv_native_stop/events",
+            "/v1/sessions/1fb90dd3b9d3f24e2356ace505314db1/events",
             json={"type": "stop_session"},
         )
 
-        captured_history = list(_session_histories_ref.get("conv_native_stop", []))
-        queue = _session_event_queues_ref.get("conv_native_stop")
+        captured_history = list(_session_histories_ref.get("1fb90dd3b9d3f24e2356ace505314db1", []))
+        queue = _session_event_queues_ref.get("1fb90dd3b9d3f24e2356ace505314db1")
         assert queue is not None, (
             "Session creation should have initialized the event queue "
-            "for ``conv_native_stop``; without it ``_publish_event`` had "
+            "for ``1fb90dd3b9d3f24e2356ace505314db1``; without it ``_publish_event`` had "
             "nowhere to land its idle event."
         )
         queued_events: list[dict[str, Any]] = []
@@ -10590,7 +10738,7 @@ async def test_events_stop_session_on_native_kills_tmux_and_publishes_idle(
         f"wrong canonical name."
     )
     bridge_dir, timeout_s = captured_kill[0]
-    assert bridge_dir == bridge_dir_for_conversation_id("conv_native_stop")
+    assert bridge_dir == bridge_dir_for_conversation_id("1fb90dd3b9d3f24e2356ace505314db1")
     # 1.0s short timeout: the UI stop must feel snappy. The helper's
     # 30s default would hang the user's click on a missing tmux.json.
     assert timeout_s == 1.0
@@ -10639,8 +10787,8 @@ async def test_stop_session_on_native_subagent_reclaims_work_entry(
     from omnigent.runner import app as runner_app
     from omnigent.spec.types import ExecutorSpec
 
-    parent_id = "conv_parent_stop_reclaim"
-    worker_id = "conv_worker_stop_reclaim"
+    parent_id = "c4315225d4a12d320df065ed1ac8baad"
+    worker_id = "8dcfd4c64c7a29cddaefa4af686da1da"
     session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
 
     monkeypatch.setattr(claude_native_bridge, "kill_session", lambda *a, **k: None)
@@ -10674,7 +10822,7 @@ async def test_stop_session_on_native_subagent_reclaims_work_entry(
         async with _runner_client(app) as client:
             create_resp = await client.post(
                 "/v1/sessions",
-                json={"session_id": worker_id, "agent_id": "ag_1"},
+                json={"session_id": worker_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
             )
             assert create_resp.status_code == 201, create_resp.text
             stop_resp = await client.post(
@@ -10713,8 +10861,8 @@ async def test_stop_session_on_native_subagent_without_parent_inbox_returns_204(
     from omnigent.runner import app as runner_app
     from omnigent.spec.types import ExecutorSpec
 
-    parent_id = "conv_parent_stop_missing_inbox"
-    worker_id = "conv_worker_stop_missing_inbox"
+    parent_id = "a87dd01585f0c6f0f82f73d74e4124c0"
+    worker_id = "d2af8cd6293253c5937d8c7d35fb3d6b"
 
     monkeypatch.setattr(claude_native_bridge, "kill_session", lambda *a, **k: None)
 
@@ -10752,7 +10900,7 @@ async def test_stop_session_on_native_subagent_without_parent_inbox_returns_204(
         async with _runner_client(app) as client:
             create_resp = await client.post(
                 "/v1/sessions",
-                json={"session_id": worker_id, "agent_id": "ag_1"},
+                json={"session_id": worker_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
             )
             assert create_resp.status_code == 201, create_resp.text
             stop_resp = await client.post(
@@ -10816,16 +10964,19 @@ async def test_events_stop_session_on_native_returns_503_when_kill_fails(
     async with _runner_client(app) as client:
         create_resp = await client.post(
             "/v1/sessions",
-            json={"session_id": "conv_native_stop_fail", "agent_id": "ag_1"},
+            json={
+                "session_id": "baabd23def56efdbe0b84b9c924aa6a6",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
         )
         assert create_resp.status_code == 201, create_resp.text
 
         stop_resp = await client.post(
-            "/v1/sessions/conv_native_stop_fail/events",
+            "/v1/sessions/baabd23def56efdbe0b84b9c924aa6a6/events",
             json={"type": "stop_session"},
         )
 
-        queue = _session_event_queues_ref.get("conv_native_stop_fail")
+        queue = _session_event_queues_ref.get("baabd23def56efdbe0b84b9c924aa6a6")
         assert queue is not None
         queued_events: list[dict[str, Any]] = []
         while not queue.empty():
@@ -10899,12 +11050,15 @@ async def test_events_stop_session_on_non_native_session_is_204_noop(
     async with _runner_client(app) as client:
         create_resp = await client.post(
             "/v1/sessions",
-            json={"session_id": "conv_default_stop", "agent_id": "ag_1"},
+            json={
+                "session_id": "aec413c7f4d6fc308bcaa55ad32c3b98",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
         )
         assert create_resp.status_code == 201, create_resp.text
 
         resp = await client.post(
-            "/v1/sessions/conv_default_stop/events",
+            "/v1/sessions/aec413c7f4d6fc308bcaa55ad32c3b98/events",
             json={"type": "stop_session"},
         )
 
@@ -10945,7 +11099,7 @@ async def test_events_stop_session_closes_terminal_and_publishes_deleted(
     # ``claude:main`` terminal, mirroring what the host-spawned
     # auto-create path leaves behind. Private-attr seed matches the
     # existing resource-registry test convention (no real tmux).
-    conv_id = "conv_native_stop_term"
+    conv_id = "778e0486ee2f733acdf021ca8334d0bd"
     terminal_registry = TerminalRegistry(
         conversation_link_base_url="http://127.0.0.1:8000",
     )
@@ -10974,7 +11128,7 @@ async def test_events_stop_session_closes_terminal_and_publishes_deleted(
     async with _runner_client(app) as client:
         create_resp = await client.post(
             "/v1/sessions",
-            json={"session_id": conv_id, "agent_id": "ag_1"},
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
         )
         assert create_resp.status_code == 201, create_resp.text
         # Precondition: the terminal is live before the stop, so a later
@@ -11033,8 +11187,8 @@ async def test_required_terminal_exit_publishes_deleted_and_failed(tmp_path: Pat
     from omnigent.runner.app import _session_event_queues_ref
     from tests.runner.helpers import make_test_terminal_instance
 
-    parent_id = f"conv_parent_required_exit_{uuid.uuid4().hex[:12]}"
-    conv_id = f"conv_required_exit_{uuid.uuid4().hex[:12]}"
+    parent_id = uuid.uuid4().hex
+    conv_id = uuid.uuid4().hex
     parent_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     terminal_registry = TerminalRegistry()
     instance = make_test_terminal_instance("worker", "main", tmp_path)
@@ -11176,8 +11330,8 @@ async def test_required_terminal_exit_while_idle_does_not_fail_session(tmp_path:
     from omnigent.runner.app import _session_event_queues_ref
     from tests.runner.helpers import make_test_terminal_instance
 
-    parent_id = f"conv_parent_idle_exit_{uuid.uuid4().hex[:12]}"
-    conv_id = f"conv_idle_exit_{uuid.uuid4().hex[:12]}"
+    parent_id = uuid.uuid4().hex
+    conv_id = uuid.uuid4().hex
     parent_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     terminal_registry = TerminalRegistry()
     instance = make_test_terminal_instance("worker", "main", tmp_path)
@@ -11301,7 +11455,7 @@ async def test_required_terminal_clean_quit_publishes_idle_not_failed(
         TerminalLifecycle,
     )
 
-    conv_id = f"conv_clean_quit_{terminal_name}_{uuid.uuid4().hex[:12]}"
+    conv_id = uuid.uuid4().hex
     pm = _FakeProcessManager(_ScriptedHarnessClient([]))
     pm._sessions.add(conv_id)
     app = create_runner_app(
@@ -11373,7 +11527,7 @@ async def test_external_idle_status_makes_required_terminal_exit_clean(tmp_path:
     from omnigent.runner.app import _session_event_queues_ref
     from tests.runner.helpers import make_test_terminal_instance
 
-    conv_id = f"conv_kiro_external_idle_exit_{uuid.uuid4().hex[:12]}"
+    conv_id = uuid.uuid4().hex
     terminal_registry = TerminalRegistry()
     instance = make_test_terminal_instance("kiro", "main", tmp_path)
     terminal_registry._by_conversation.setdefault(conv_id, {})[("kiro", "main")] = instance
@@ -11510,23 +11664,28 @@ async def test_events_effort_change_on_native_session_types_slash_command(
         # Seed _session_spec_cache so /events can detect "claude-native".
         create_resp = await client.post(
             "/v1/sessions",
-            json={"session_id": "conv_native_effort", "agent_id": "ag_1"},
+            json={
+                "session_id": "c7e9584b9bb34910a0068521106c1abc",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
         )
         assert create_resp.status_code == 201, create_resp.text
         # Drain creation-time events (the claude-native auto-create path
         # enqueues session.terminal_pending) so the post-effort_change
         # drain below isolates only what the control event emits.
-        _drain_session_event_queue(_session_event_queues_ref.get("conv_native_effort"))
+        _drain_session_event_queue(
+            _session_event_queues_ref.get("c7e9584b9bb34910a0068521106c1abc")
+        )
 
         resp = await client.post(
-            "/v1/sessions/conv_native_effort/events",
+            "/v1/sessions/c7e9584b9bb34910a0068521106c1abc/events",
             json={"type": "effort_change", "effort": "high"},
         )
 
         # Drain the event queue before delete clears it, so we can
         # assert that effort_change does NOT enqueue spurious events
         # (it's a control signal, not a session-state change).
-        queue = _session_event_queues_ref.get("conv_native_effort")
+        queue = _session_event_queues_ref.get("c7e9584b9bb34910a0068521106c1abc")
         queued_events: list[dict[str, Any]] = []
         if queue is not None:
             while not queue.empty():
@@ -11547,7 +11706,7 @@ async def test_events_effort_change_on_native_session_types_slash_command(
         f"Expected one inject_slash_command call from native effort_change, got {len(captured)}."
     )
     bridge_dir, command, timeout_s = captured[0]
-    assert bridge_dir == bridge_dir_for_conversation_id("conv_native_effort")
+    assert bridge_dir == bridge_dir_for_conversation_id("c7e9584b9bb34910a0068521106c1abc")
     # Body contract: ``/effort high`` is the literal Claude Code's TUI
     # accepts. A regression in shape (``/efforthigh``, ``effort high``,
     # missing leading slash) would either 404 on the slash router or
@@ -11632,12 +11791,15 @@ async def test_events_effort_change_on_native_session_skips_inject_for_unsupport
     async with _runner_client(app) as client:
         create_resp = await client.post(
             "/v1/sessions",
-            json={"session_id": "conv_native_effort_skip", "agent_id": "ag_1"},
+            json={
+                "session_id": "1c88519bd9daa4e9bc2df649fe4685fc",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
         )
         assert create_resp.status_code == 201, create_resp.text
 
         resp = await client.post(
-            "/v1/sessions/conv_native_effort_skip/events",
+            "/v1/sessions/1c88519bd9daa4e9bc2df649fe4685fc/events",
             json={"type": "effort_change", "effort": effort_value},
         )
 
@@ -11701,12 +11863,15 @@ async def test_events_effort_change_on_native_session_returns_503_when_bridge_no
     async with _runner_client(app) as client:
         create_resp = await client.post(
             "/v1/sessions",
-            json={"session_id": "conv_native_effort_fail", "agent_id": "ag_1"},
+            json={
+                "session_id": "876bea5691e426b42ecc3cc2c02cbf92",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
         )
         assert create_resp.status_code == 201, create_resp.text
 
         resp = await client.post(
-            "/v1/sessions/conv_native_effort_fail/events",
+            "/v1/sessions/876bea5691e426b42ecc3cc2c02cbf92/events",
             json={"type": "effort_change", "effort": "high"},
         )
 
@@ -11777,12 +11942,15 @@ async def test_events_effort_change_on_non_native_session_is_204_noop(
     async with _runner_client(app) as client:
         create_resp = await client.post(
             "/v1/sessions",
-            json={"session_id": "conv_default_effort", "agent_id": "ag_1"},
+            json={
+                "session_id": "df1b63ea1861c5d7765dd4541f60d99a",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
         )
         assert create_resp.status_code == 201, create_resp.text
 
         resp = await client.post(
-            "/v1/sessions/conv_default_effort/events",
+            "/v1/sessions/df1b63ea1861c5d7765dd4541f60d99a/events",
             json={"type": "effort_change", "effort": "high"},
         )
 
@@ -11854,22 +12022,27 @@ async def test_events_compact_on_native_session_types_slash_command(
     async with _runner_client(app) as client:
         create_resp = await client.post(
             "/v1/sessions",
-            json={"session_id": "conv_native_compact", "agent_id": "ag_1"},
+            json={
+                "session_id": "f70a14aaa23f51a5c4d915b9a29b0cd3",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
         )
         assert create_resp.status_code == 201, create_resp.text
         # Drain creation-time events (claude-native auto-create enqueues
         # session.terminal_pending) so the drain below isolates only
         # what /compact emits.
-        _drain_session_event_queue(_session_event_queues_ref.get("conv_native_compact"))
+        _drain_session_event_queue(
+            _session_event_queues_ref.get("f70a14aaa23f51a5c4d915b9a29b0cd3")
+        )
 
         resp = await client.post(
-            "/v1/sessions/conv_native_compact/events",
+            "/v1/sessions/f70a14aaa23f51a5c4d915b9a29b0cd3/events",
             json={"type": "compact"},
         )
 
         # Drain the event queue: /compact is a control signal and must
         # not enqueue session.status events.
-        queue = _session_event_queues_ref.get("conv_native_compact")
+        queue = _session_event_queues_ref.get("f70a14aaa23f51a5c4d915b9a29b0cd3")
         queued_events: list[dict[str, Any]] = []
         if queue is not None:
             while not queue.empty():
@@ -11890,7 +12063,7 @@ async def test_events_compact_on_native_session_types_slash_command(
         f"Expected one inject_slash_command call from native compact, got {len(captured)}."
     )
     bridge_dir, command, timeout_s, auto_confirm = captured[0]
-    assert bridge_dir == bridge_dir_for_conversation_id("conv_native_compact")
+    assert bridge_dir == bridge_dir_for_conversation_id("f70a14aaa23f51a5c4d915b9a29b0cd3")
     # Body contract: the literal ``/compact`` is what Claude Code's TUI
     # accepts. A shape regression (``compact``, missing slash) would
     # land as plain prompt text instead of running compaction.
@@ -11957,12 +12130,15 @@ async def test_events_compact_on_native_session_returns_503_when_bridge_not_read
     async with _runner_client(app) as client:
         create_resp = await client.post(
             "/v1/sessions",
-            json={"session_id": "conv_native_compact_fail", "agent_id": "ag_1"},
+            json={
+                "session_id": "22126529b89836ff13480ca578a6dcf5",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
         )
         assert create_resp.status_code == 201, create_resp.text
 
         resp = await client.post(
-            "/v1/sessions/conv_native_compact_fail/events",
+            "/v1/sessions/22126529b89836ff13480ca578a6dcf5/events",
             json={"type": "compact"},
         )
 
@@ -12013,7 +12189,7 @@ async def test_events_compact_on_codex_native_injects_slash_command(
         del agent_id, session_id
         return codex_native_spec
 
-    conv_id = "conv_codex_compact"
+    conv_id = "9864122f95f2f013c9599f4014725784"
     terminal_registry = TerminalRegistry()
     instance = make_test_terminal_instance("codex", "main", tmp_path)
     terminal_registry._by_conversation.setdefault(conv_id, {})[("codex", "main")] = instance
@@ -12029,7 +12205,7 @@ async def test_events_compact_on_codex_native_injects_slash_command(
     async with _runner_client(app) as client:
         create_resp = await client.post(
             "/v1/sessions",
-            json={"session_id": conv_id, "agent_id": "ag_1"},
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
         )
         assert create_resp.status_code == 201, create_resp.text
         _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
@@ -12096,7 +12272,7 @@ async def test_events_compact_on_codex_native_returns_204_when_no_terminal() -> 
         del agent_id, session_id
         return codex_native_spec
 
-    conv_id = "conv_codex_compact_no_term"
+    conv_id = "4be2f8fe2204fade6a89dafade0a0fd2"
     # Empty registry — no codex terminal registered.
     terminal_registry = TerminalRegistry()
 
@@ -12111,7 +12287,7 @@ async def test_events_compact_on_codex_native_returns_204_when_no_terminal() -> 
     async with _runner_client(app) as client:
         create_resp = await client.post(
             "/v1/sessions",
-            json={"session_id": conv_id, "agent_id": "ag_1"},
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
         )
         assert create_resp.status_code == 201, create_resp.text
 
@@ -12158,7 +12334,7 @@ async def test_events_compact_on_codex_native_returns_503_on_tmux_failure(
         del agent_id, session_id
         return codex_native_spec
 
-    conv_id = "conv_codex_compact_fail"
+    conv_id = "e5d09a0ff8458b2d6abb7f0c7deda0d3"
     terminal_registry = TerminalRegistry()
     instance = make_test_terminal_instance("codex", "main", tmp_path)
     terminal_registry._by_conversation.setdefault(conv_id, {})[("codex", "main")] = instance
@@ -12174,7 +12350,7 @@ async def test_events_compact_on_codex_native_returns_503_on_tmux_failure(
     async with _runner_client(app) as client:
         create_resp = await client.post(
             "/v1/sessions",
-            json={"session_id": conv_id, "agent_id": "ag_1"},
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
         )
         assert create_resp.status_code == 201, create_resp.text
 
@@ -12251,7 +12427,7 @@ async def test_events_compact_on_cursor_native_pastes_summarize_and_raises_spinn
         del agent_id, session_id
         return cursor_native_spec
 
-    conv_id = "conv_cursor_compact"
+    conv_id = "764ebbade28dd774a5d673378c034933"
     pm = _FakeProcessManager(_ScriptedHarnessClient([]))
     app = create_runner_app(
         process_manager=pm,  # type: ignore[arg-type]
@@ -12262,7 +12438,7 @@ async def test_events_compact_on_cursor_native_pastes_summarize_and_raises_spinn
     async with _runner_client(app) as client:
         create_resp = await client.post(
             "/v1/sessions",
-            json={"session_id": conv_id, "agent_id": "ag_1"},
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
         )
         assert create_resp.status_code == 201, create_resp.text
         # Drain creation-time events so the drain below isolates only what
@@ -12370,7 +12546,7 @@ async def test_events_compact_on_cursor_native_503_dismisses_spinner_on_inject_f
         del agent_id, session_id
         return cursor_native_spec
 
-    conv_id = f"conv_cursor_compact_fail_{label}"
+    conv_id = uuid.uuid4().hex
     pm = _FakeProcessManager(_ScriptedHarnessClient([]))
     app = create_runner_app(
         process_manager=pm,  # type: ignore[arg-type]
@@ -12381,7 +12557,7 @@ async def test_events_compact_on_cursor_native_503_dismisses_spinner_on_inject_f
     async with _runner_client(app) as client:
         create_resp = await client.post(
             "/v1/sessions",
-            json={"session_id": conv_id, "agent_id": "ag_1"},
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
         )
         assert create_resp.status_code == 201, create_resp.text
         _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
@@ -12445,7 +12621,7 @@ async def test_events_compact_on_pi_native_enqueues_compact_payload(
     from omnigent.runner.app import _session_event_queues_ref
     from omnigent.spec.types import ExecutorSpec
 
-    conv_id = "conv_pi_native_compact"
+    conv_id = "03f435963d78fe4ea313325f729eefc5"
     monkeypatch.setattr(pi_native_bridge, "_BRIDGE_ROOT", tmp_path / "pi-bridge")
 
     pi_native_spec = AgentSpec(
@@ -12470,7 +12646,7 @@ async def test_events_compact_on_pi_native_enqueues_compact_payload(
         # Seeds _session_spec_cache so the dispatch detects "pi-native".
         create_resp = await client.post(
             "/v1/sessions",
-            json={"session_id": conv_id, "agent_id": "ag_1"},
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
         )
         assert create_resp.status_code == 201, create_resp.text
         # Drain creation-time events (pi-native auto-create enqueues
@@ -12531,7 +12707,7 @@ async def test_events_compact_on_pi_native_returns_503_when_inbox_unwritable(
     import omnigent.pi_native_bridge as pi_native_bridge
     from omnigent.spec.types import ExecutorSpec
 
-    conv_id = "conv_pi_native_compact_fail"
+    conv_id = "9c52b3dbe1d543718c1678a256017326"
     monkeypatch.setattr(pi_native_bridge, "_BRIDGE_ROOT", tmp_path / "pi-bridge")
 
     def _boom(*_args: Any, **_kwargs: Any) -> str:
@@ -12561,7 +12737,7 @@ async def test_events_compact_on_pi_native_returns_503_when_inbox_unwritable(
     async with _runner_client(app) as client:
         create_resp = await client.post(
             "/v1/sessions",
-            json={"session_id": conv_id, "agent_id": "ag_1"},
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
         )
         assert create_resp.status_code == 201, create_resp.text
 
@@ -12618,7 +12794,7 @@ async def test_events_compact_on_qwen_native_submits_compress_and_raises_spinner
         del agent_id, session_id
         return qwen_native_spec
 
-    conv_id = "conv_qwen_compact"
+    conv_id = "233c1fedaaeb18c91267904e79b7d10c"
     pm = _FakeProcessManager(_ScriptedHarnessClient([]))
     app = create_runner_app(
         process_manager=pm,  # type: ignore[arg-type]
@@ -12629,7 +12805,7 @@ async def test_events_compact_on_qwen_native_submits_compress_and_raises_spinner
     async with _runner_client(app) as client:
         create_resp = await client.post(
             "/v1/sessions",
-            json={"session_id": conv_id, "agent_id": "ag_1"},
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
         )
         assert create_resp.status_code == 201, create_resp.text
         _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
@@ -12689,7 +12865,7 @@ async def test_events_compact_on_qwen_native_503_dismisses_spinner_on_submit_fai
         del agent_id, session_id
         return qwen_native_spec
 
-    conv_id = "conv_qwen_compact_fail"
+    conv_id = "7c94e9a0306b300d81233cccef543a84"
     pm = _FakeProcessManager(_ScriptedHarnessClient([]))
     app = create_runner_app(
         process_manager=pm,  # type: ignore[arg-type]
@@ -12700,7 +12876,7 @@ async def test_events_compact_on_qwen_native_503_dismisses_spinner_on_submit_fai
     async with _runner_client(app) as client:
         create_resp = await client.post(
             "/v1/sessions",
-            json={"session_id": conv_id, "agent_id": "ag_1"},
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
         )
         assert create_resp.status_code == 201, create_resp.text
         _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
@@ -12873,7 +13049,7 @@ async def _drive_opencode_native_compact(
         async with _runner_client(app) as http_client:
             create_resp = await http_client.post(
                 "/v1/sessions",
-                json={"session_id": conv_id, "agent_id": "ag_1"},
+                json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
             )
             assert create_resp.status_code == 201, create_resp.text
             _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
@@ -12999,7 +13175,7 @@ async def test_events_compact_on_opencode_native_summarizes_from_assistant_messa
     resp, client = await _drive_opencode_native_compact(
         monkeypatch,
         tmp_path,
-        conv_id="conv_opencode_compact_msg",
+        conv_id="f67241520c2101c4de5f81b976467bad",
         session_payload={"id": "ses_x"},
         messages=[
             {
@@ -13038,7 +13214,7 @@ async def test_events_compact_on_opencode_native_summarizes_from_session_model(
     resp, client = await _drive_opencode_native_compact(
         monkeypatch,
         tmp_path,
-        conv_id="conv_opencode_compact_session",
+        conv_id="7b333fd1a0e1c32b3961f98930f41bf3",
         session_payload={
             "id": "ses_x",
             "model": {"providerID": "anthropic", "id": "claude-opus-4"},
@@ -13067,7 +13243,7 @@ async def test_events_compact_on_opencode_native_summarizes_from_model_override(
     resp, client = await _drive_opencode_native_compact(
         monkeypatch,
         tmp_path,
-        conv_id="conv_opencode_compact_override",
+        conv_id="e45977bad8d13b2fdc00eb2bbdae2bd7",
         session_payload={"id": "ses_x"},
         messages=[],
         model_override="openai/gpt-5",
@@ -13092,7 +13268,7 @@ async def test_events_compact_on_opencode_native_204_when_model_unresolvable(
     resp, client = await _drive_opencode_native_compact(
         monkeypatch,
         tmp_path,
-        conv_id="conv_opencode_compact_none",
+        conv_id="90c89e7e5e9131aa4bb062fd427927ae",
         session_payload={"id": "ses_x"},
         messages=[],
         model_override=None,
@@ -13123,7 +13299,7 @@ async def test_events_compact_on_opencode_native_503_when_summarize_raises(
     resp, client = await _drive_opencode_native_compact(
         monkeypatch,
         tmp_path,
-        conv_id="conv_opencode_compact_fail",
+        conv_id="309c268a432cb4dbda4e8c15585578ee",
         session_payload={"id": "ses_x"},
         messages=[
             {
@@ -13201,12 +13377,15 @@ async def test_events_compact_on_non_native_session_is_204_noop(
     async with _runner_client(app) as client:
         create_resp = await client.post(
             "/v1/sessions",
-            json={"session_id": "conv_default_compact", "agent_id": "ag_1"},
+            json={
+                "session_id": "49f1d65e8b591ac277b7fca4e50f228c",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
         )
         assert create_resp.status_code == 201, create_resp.text
 
         resp = await client.post(
-            "/v1/sessions/conv_default_compact/events",
+            "/v1/sessions/49f1d65e8b591ac277b7fca4e50f228c/events",
             json={"type": "compact"},
         )
 
@@ -13307,11 +13486,11 @@ async def test_events_native_dispatch_resolves_bridge_id_via_label_lookup(
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
 
-    conv_id = "conv_fork_bridge_check"
+    conv_id = "94e59ac02c7c81b1f65ba05e6481d759"
     async with _runner_client(app) as client:
         create_resp = await client.post(
             "/v1/sessions",
-            json={"session_id": conv_id, "agent_id": "ag_1"},
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
         )
         assert create_resp.status_code == 201, create_resp.text
 
@@ -13393,23 +13572,28 @@ async def test_events_model_change_on_native_session_types_slash_command(
     async with _runner_client(app) as client:
         create_resp = await client.post(
             "/v1/sessions",
-            json={"session_id": "conv_native_model", "agent_id": "ag_1"},
+            json={
+                "session_id": "57c7c1acc5eeec3978c5e62043da51a4",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
         )
         assert create_resp.status_code == 201, create_resp.text
         # Drain creation-time events (claude-native auto-create enqueues
         # session.terminal_pending) so the drain below isolates only
         # what model_change emits.
-        _drain_session_event_queue(_session_event_queues_ref.get("conv_native_model"))
+        _drain_session_event_queue(
+            _session_event_queues_ref.get("57c7c1acc5eeec3978c5e62043da51a4")
+        )
 
         resp = await client.post(
-            "/v1/sessions/conv_native_model/events",
+            "/v1/sessions/57c7c1acc5eeec3978c5e62043da51a4/events",
             json={"type": "model_change", "model": "claude-opus-4-7"},
         )
 
         # Drain the event queue before delete clears it. model_change
         # is a control signal, not a state change — no events should
         # land on the SSE queue.
-        queue = _session_event_queues_ref.get("conv_native_model")
+        queue = _session_event_queues_ref.get("57c7c1acc5eeec3978c5e62043da51a4")
         queued_events: list[dict[str, Any]] = []
         if queue is not None:
             while not queue.empty():
@@ -13477,14 +13661,19 @@ async def test_events_model_change_on_kiro_session_types_slash_command(
     async with _runner_client(app) as client:
         create_resp = await client.post(
             "/v1/sessions",
-            json={"session_id": "conv_kiro_model", "agent_id": "ag_1"},
+            json={
+                "session_id": "b07013b8f257ae8e087e343a0d7008a3",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
         )
         assert create_resp.status_code == 201, create_resp.text
         # Drain kiro auto-create events so nothing below trips on them.
-        _drain_session_event_queue(_session_event_queues_ref.get("conv_kiro_model"))
+        _drain_session_event_queue(
+            _session_event_queues_ref.get("b07013b8f257ae8e087e343a0d7008a3")
+        )
 
         resp = await client.post(
-            "/v1/sessions/conv_kiro_model/events",
+            "/v1/sessions/b07013b8f257ae8e087e343a0d7008a3/events",
             json={"type": "model_change", "model": "claude-haiku-4.5"},
         )
 
@@ -13557,12 +13746,15 @@ async def test_events_model_change_on_native_session_skips_inject_for_empty_or_n
     async with _runner_client(app) as client:
         create_resp = await client.post(
             "/v1/sessions",
-            json={"session_id": "conv_native_model_skip", "agent_id": "ag_1"},
+            json={
+                "session_id": "5aaed5c8eac5f60a5030e6e830602018",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
         )
         assert create_resp.status_code == 201, create_resp.text
 
         resp = await client.post(
-            "/v1/sessions/conv_native_model_skip/events",
+            "/v1/sessions/5aaed5c8eac5f60a5030e6e830602018/events",
             json={"type": "model_change", "model": model_value},
         )
 
@@ -13622,12 +13814,15 @@ async def test_events_model_change_on_native_session_returns_503_when_bridge_not
     async with _runner_client(app) as client:
         create_resp = await client.post(
             "/v1/sessions",
-            json={"session_id": "conv_native_model_fail", "agent_id": "ag_1"},
+            json={
+                "session_id": "75db03d3ecf58400bd53ce0326f49c4d",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
         )
         assert create_resp.status_code == 201, create_resp.text
 
         resp = await client.post(
-            "/v1/sessions/conv_native_model_fail/events",
+            "/v1/sessions/75db03d3ecf58400bd53ce0326f49c4d/events",
             json={"type": "model_change", "model": "claude-opus-4-7"},
         )
 
@@ -13694,12 +13889,15 @@ async def test_events_model_change_on_non_native_session_is_204_noop(
     async with _runner_client(app) as client:
         create_resp = await client.post(
             "/v1/sessions",
-            json={"session_id": "conv_default_model", "agent_id": "ag_1"},
+            json={
+                "session_id": "3bd7b988ac7f00912b39823dbb0c6956",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
         )
         assert create_resp.status_code == 201, create_resp.text
 
         resp = await client.post(
-            "/v1/sessions/conv_default_model/events",
+            "/v1/sessions/3bd7b988ac7f00912b39823dbb0c6956/events",
             json={"type": "model_change", "model": "claude-opus-4-7"},
         )
 
@@ -13752,12 +13950,15 @@ async def test_events_model_change_on_cursor_native_session_types_slash_command(
     async with _runner_client(app) as client:
         create_resp = await client.post(
             "/v1/sessions",
-            json={"session_id": "conv_cursor_model", "agent_id": "ag_1"},
+            json={
+                "session_id": "c42dbcb16fd3a87ee8f5d1fe4cabfdf8",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
         )
         assert create_resp.status_code == 201, create_resp.text
 
         resp = await client.post(
-            "/v1/sessions/conv_cursor_model/events",
+            "/v1/sessions/c42dbcb16fd3a87ee8f5d1fe4cabfdf8/events",
             json={"type": "model_change", "model": "gpt-5.2"},
         )
 
@@ -13814,12 +14015,15 @@ async def test_events_model_change_on_cursor_native_session_skips_inject_for_emp
     async with _runner_client(app) as client:
         create_resp = await client.post(
             "/v1/sessions",
-            json={"session_id": "conv_cursor_model_skip", "agent_id": "ag_1"},
+            json={
+                "session_id": "1f86fc567a3d953efdbbc6409ca286e3",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
         )
         assert create_resp.status_code == 201, create_resp.text
 
         resp = await client.post(
-            "/v1/sessions/conv_cursor_model_skip/events",
+            "/v1/sessions/1f86fc567a3d953efdbbc6409ca286e3/events",
             json={"type": "model_change", "model": model_value},
         )
 
@@ -13870,12 +14074,15 @@ async def test_events_model_change_on_cursor_native_session_returns_503_when_not
     async with _runner_client(app) as client:
         create_resp = await client.post(
             "/v1/sessions",
-            json={"session_id": "conv_cursor_model_fail", "agent_id": "ag_1"},
+            json={
+                "session_id": "ccf1b995c37a1ae8339d408fb227dff5",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
         )
         assert create_resp.status_code == 201, create_resp.text
 
         resp = await client.post(
-            "/v1/sessions/conv_cursor_model_fail/events",
+            "/v1/sessions/ccf1b995c37a1ae8339d408fb227dff5/events",
             json={"type": "model_change", "model": "gpt-5.2"},
         )
 
@@ -13924,12 +14131,15 @@ async def test_events_effort_change_on_cursor_native_session_is_disabled_noop(
     async with _runner_client(app) as client:
         create_resp = await client.post(
             "/v1/sessions",
-            json={"session_id": "conv_cursor_effort", "agent_id": "ag_1"},
+            json={
+                "session_id": "6d57cf20b7c9680bd7bfe465b4b666d5",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
         )
         assert create_resp.status_code == 201, create_resp.text
 
         resp = await client.post(
-            "/v1/sessions/conv_cursor_effort/events",
+            "/v1/sessions/6d57cf20b7c9680bd7bfe465b4b666d5/events",
             json={"type": "effort_change", "effort": effort_value},
         )
 
@@ -14006,7 +14216,7 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
             )
 
     await _auto_create_claude_terminal(
-        "conv_abc",
+        "4e92b5a0c0ee6db3f874f9c4a3f855a5",
         _FakeResourceRegistry(),
         lambda _sid, _evt: None,
         server_client=NullServerClient(),  # type: ignore[arg-type]
@@ -14028,7 +14238,9 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
 
     # The hook reads the server URL back out of this file at hook time,
     # so it must be written with the runner's Omnigent server URL.
-    config = read_permission_hook_config(bridge_dir_for_bridge_id("conv_abc"))
+    config = read_permission_hook_config(
+        bridge_dir_for_bridge_id("4e92b5a0c0ee6db3f874f9c4a3f855a5")
+    )
     assert config["ap_server_url"] == "http://127.0.0.1:8000"
 
     # The forwarder must get a refresh-capable httpx.Auth (not just a
@@ -14122,7 +14334,7 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     published: list[dict[str, Any]] = []
 
     await _auto_create_pi_terminal(
-        "conv_pi",
+        "47f049b9d13df4db397c7f46859b825f",
         _FakeResourceRegistry(),  # type: ignore[arg-type]
         lambda _sid, evt: published.append(evt),
         server_client=NullServerClient(),  # type: ignore[arg-type]
@@ -14220,7 +14432,7 @@ async def test_auto_create_kiro_terminal_launches_required_terminal_with_isolate
     published: list[dict[str, Any]] = []
 
     await _auto_create_kiro_terminal(
-        "conv_kiro",
+        "823dbd1aab969b5a813fac59bb977a77",
         _FakeResourceRegistry(),  # type: ignore[arg-type]
         lambda _sid, evt: published.append(evt),
         server_client=NullServerClient(),  # type: ignore[arg-type]
@@ -14251,27 +14463,29 @@ async def test_auto_create_kiro_terminal_launches_required_terminal_with_isolate
     assert "OPENAI_API_KEY" not in spec.env
     assert "OPENAI_API_KEY" in spec.env_unset
     assert spec.env[kiro_native_bridge.KIRO_NATIVE_BRIDGE_DIR_ENV_VAR] == str(
-        kiro_native_bridge.bridge_dir_for_session_id("conv_kiro")
+        kiro_native_bridge.bridge_dir_for_session_id("823dbd1aab969b5a813fac59bb977a77")
     )
     assert spec.env[kiro_native_bridge.KIRO_ACP_RECORD_PATH_ENV_VAR] == str(
         kiro_native_bridge.acp_record_path(
-            kiro_native_bridge.bridge_dir_for_session_id("conv_kiro")
+            kiro_native_bridge.bridge_dir_for_session_id("823dbd1aab969b5a813fac59bb977a77")
         )
     )
     assert any(evt.get("type") == "session.resource.created" for evt in published)
     assert forwarder_calls
     assert forwarder_calls[0]["base_url"] == "http://127.0.0.1:6767"
-    assert forwarder_calls[0]["session_id"] == "conv_kiro"
+    assert forwarder_calls[0]["session_id"] == "823dbd1aab969b5a813fac59bb977a77"
     assert forwarder_calls[0]["agent_name"] == "kiro-native-ui"
     assert forwarder_calls[0]["workspace"] == str(tmp_path)
     assert permission_mirror_calls
     assert permission_mirror_calls[0]["base_url"] == "http://127.0.0.1:6767"
-    assert permission_mirror_calls[0]["session_id"] == "conv_kiro"
+    assert permission_mirror_calls[0]["session_id"] == "823dbd1aab969b5a813fac59bb977a77"
     # The Omnigent MCP tool relay is seeded for this session's bridge dir.
     assert relay_calls == [
         {
-            "session_id": "conv_kiro",
-            "explicit_bridge_dir": kiro_native_bridge.bridge_dir_for_session_id("conv_kiro"),
+            "session_id": "823dbd1aab969b5a813fac59bb977a77",
+            "explicit_bridge_dir": kiro_native_bridge.bridge_dir_for_session_id(
+                "823dbd1aab969b5a813fac59bb977a77"
+            ),
             "await_notify": False,
         }
     ]
@@ -14349,7 +14563,7 @@ async def test_auto_create_kiro_terminal_skips_mcp_wiring_without_relay(
 
     # No ``ensure_comment_relay`` argument -> the MCP wiring gate stays closed.
     await _auto_create_kiro_terminal(
-        "conv_kiro_no_relay",
+        "17b3209fb5684c628f95edee0042e455",
         _FakeResourceRegistry(),  # type: ignore[arg-type]
         lambda _sid, _evt: None,
         server_client=NullServerClient(),  # type: ignore[arg-type]
@@ -14454,7 +14668,7 @@ async def test_auto_create_pi_terminal_inherits_agent_sandbox(
     )
 
     await _auto_create_pi_terminal(
-        "conv_pi_sandbox_none",
+        "28a25c47fe4fd8ccde95c80bab47c1c7",
         _FakeResourceRegistry(),  # type: ignore[arg-type]
         lambda _sid, _evt: None,
         server_client=NullServerClient(),  # type: ignore[arg-type]
@@ -14539,7 +14753,7 @@ async def test_auto_create_claude_terminal_passes_session_effort(
     )
 
     await _auto_create_claude_terminal(
-        "conv_effort",
+        "f89fd41f6eefee45b2117ac0fcbc73fa",
         _FakeResourceRegistry(),
         lambda _sid, _evt: None,
         server_client=fake_client,
@@ -14681,7 +14895,7 @@ async def test_auto_create_claude_terminal_inherits_agent_sandbox(
     )
 
     await _auto_create_claude_terminal(
-        "conv_sandbox_none",
+        "e27fc87ef2a8d798895ce8c1e66db82d",
         _FakeResourceRegistry(),
         lambda _sid, _evt: None,
         server_client=fake_client,
@@ -14794,7 +15008,7 @@ async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
     )
 
     await _auto_create_claude_terminal(
-        "conv_ucode",
+        "13efa494411f3ae60211e6be5635062a",
         _FakeResourceRegistry(),
         lambda _sid, _evt: None,
         server_client=fake_client,
@@ -14890,7 +15104,7 @@ async def _run_auto_create_cursor_terminal(
     )
     try:
         await _auto_create_cursor_terminal(
-            "conv_cursor_model",
+            "c42dbcb16fd3a87ee8f5d1fe4cabfdf8",
             _FakeResourceRegistry(),  # type: ignore[arg-type]
             lambda _sid, _evt: None,
             server_client=fake_client,
@@ -15090,7 +15304,7 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
 
                 return _LabelsResponse()
 
-            assert url == "/v1/sessions/conv_resume"
+            assert url == "/v1/sessions/5cdbea97a2fb0c659bc09605401e2bb2"
 
             class _SnapResponse(NullServerClient._Response):
                 """Snapshot response carrying the parametrized resume id."""
@@ -15127,7 +15341,7 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
             )
 
     await _auto_create_claude_terminal(
-        "conv_resume",
+        "5cdbea97a2fb0c659bc09605401e2bb2",
         _FakeResourceRegistry(),
         lambda _sid, _evt: None,
         server_client=_SnapshotServerClient(),  # type: ignore[arg-type]
@@ -15189,7 +15403,7 @@ class _PublishedEvent:
     One event captured from the runner's per-session publisher.
 
     :param session_id: Routing session id the event was published under,
-        e.g. ``"conv_emit"``.
+        e.g. ``"c74c7a36c4736e2153ed6046d16bcf76"``.
     :param event: The published SSE event dict.
     """
 
@@ -15260,7 +15474,7 @@ async def test_auto_create_claude_terminal_emits_resource_created_event(
         published.append(_PublishedEvent(session_id=session_id, event=event))
 
     await _auto_create_claude_terminal(
-        "conv_emit",
+        "c74c7a36c4736e2153ed6046d16bcf76",
         _ViewResourceRegistry(),
         _capture,
         server_client=NullServerClient(),  # type: ignore[arg-type]
@@ -15275,7 +15489,7 @@ async def test_auto_create_claude_terminal_emits_resource_created_event(
     )
     # Routed under the session id so the Omnigent relay forwards it to that
     # session's web stream.
-    assert created[0].session_id == "conv_emit"
+    assert created[0].session_id == "c74c7a36c4736e2153ed6046d16bcf76"
     resource = created[0].event["resource"]
     assert resource["type"] == "terminal"
     assert resource["id"] == "terminal_claude_main"
@@ -15300,8 +15514,8 @@ def test_publish_terminal_pending_emits_pending_then_clear() -> None:
     def _capture(session_id: str, event: dict[str, Any]) -> None:
         published.append(_PublishedEvent(session_id=session_id, event=event))
 
-    _publish_terminal_pending(_capture, "conv_pending", True)
-    _publish_terminal_pending(_capture, "conv_pending", False)
+    _publish_terminal_pending(_capture, "7cef62c6518d5591cc7991974e33ec4c", True)
+    _publish_terminal_pending(_capture, "7cef62c6518d5591cc7991974e33ec4c", False)
 
     assert [p.event for p in published] == [
         {"type": "session.terminal_pending", "pending": True},
@@ -15309,7 +15523,7 @@ def test_publish_terminal_pending_emits_pending_then_clear() -> None:
     ]
     # Routed under the session id so the Omnigent relay forwards it to that
     # session's web stream.
-    assert all(p.session_id == "conv_pending" for p in published)
+    assert all(p.session_id == "7cef62c6518d5591cc7991974e33ec4c" for p in published)
 
 
 def test_publish_native_terminal_start_error_emits_failed_status_only(
@@ -15340,7 +15554,7 @@ def test_publish_native_terminal_start_error_emits_failed_status_only(
     with caplog.at_level(logging.WARNING):
         error = _publish_native_terminal_start_error(
             _capture,
-            "conv_codex",
+            "415c9954e2fe4b9276083a4d2c66f689",
             "Codex",
             ImportError("Native Codex requires the 'codex' CLI on PATH."),
         )
@@ -15362,7 +15576,7 @@ def test_publish_native_terminal_start_error_emits_failed_status_only(
             "error": error,
         },
     ]
-    assert all(p.session_id == "conv_codex" for p in published)
+    assert all(p.session_id == "415c9954e2fe4b9276083a4d2c66f689" for p in published)
 
 
 def test_terminal_lookup_miss_log_explains_stopped_registered_terminal(
@@ -15389,7 +15603,9 @@ def test_terminal_lookup_miss_log_explains_stopped_registered_terminal(
         private_dir=tmp_path,
         running=False,
     )
-    terminal_registry._by_conversation["conv_lookup"] = {("claude", "main"): instance}
+    terminal_registry._by_conversation["49b1b4ef0f1c9ba81d232a6f31dfeb24"] = {
+        ("claude", "main"): instance
+    }
     resource_registry = SessionResourceRegistry(terminal_registry=terminal_registry)
 
     _terminal_lookup_miss_log_state.clear()
@@ -15397,12 +15613,12 @@ def test_terminal_lookup_miss_log_explains_stopped_registered_terminal(
         with caplog.at_level(logging.INFO, logger="omnigent.runner.app"):
             _log_terminal_lookup_miss(
                 resource_registry,
-                "conv_lookup",
+                "49b1b4ef0f1c9ba81d232a6f31dfeb24",
                 "terminal_claude_main",
             )
             _log_terminal_lookup_miss(
                 resource_registry,
-                "conv_lookup",
+                "49b1b4ef0f1c9ba81d232a6f31dfeb24",
                 "terminal_claude_main",
             )
     finally:
@@ -15504,7 +15720,7 @@ async def test_auto_create_claude_terminal_resets_stale_bridge_id_label(
     )
 
     await _auto_create_claude_terminal(
-        "conv_relay_label_fix",
+        "9a0bec6675dc7ac693d7bf6f53cfb984",
         _FakeResourceRegistry(),
         lambda _sid, _evt: None,
         server_client=fake_client,
@@ -15525,9 +15741,11 @@ async def test_auto_create_claude_terminal_resets_stale_bridge_id_label(
     import json as _json
 
     patch_body = _json.loads(patch_requests[0].content)
-    assert patch_body.get("labels", {}).get(BRIDGE_ID_LABEL_KEY) == "conv_relay_label_fix", (
+    assert (
+        patch_body.get("labels", {}).get(BRIDGE_ID_LABEL_KEY) == "9a0bec6675dc7ac693d7bf6f53cfb984"
+    ), (
         f"PATCH must set {BRIDGE_ID_LABEL_KEY!r} to the session_id "
-        f"'conv_relay_label_fix' so _ensure_comment_relay_started finds the "
+        f"'9a0bec6675dc7ac693d7bf6f53cfb984' so _ensure_comment_relay_started finds the "
         f"correct bridge dir; got {patch_body.get('labels', {})!r}"
     )
 
@@ -15612,7 +15830,7 @@ async def test_auto_create_claude_terminal_honours_cleared_bridge_label(
             200,
             json={
                 "reasoning_effort": None,
-                "labels": {BRIDGE_ID_LABEL_KEY: "conv_cleared-cleared"},
+                "labels": {BRIDGE_ID_LABEL_KEY: "b3e788af0ecd4516439ee859b8c74536-cleared"},
             },
             request=req,
         )
@@ -15623,15 +15841,17 @@ async def test_auto_create_claude_terminal_honours_cleared_bridge_label(
     )
 
     await _auto_create_claude_terminal(
-        "conv_cleared",
+        "b3e788af0ecd4516439ee859b8c74536",
         _FakeResourceRegistry(),
         lambda _sid, _evt: None,
         server_client=fake_client,
     )
     await fake_client.aclose()
 
-    cleared_dir = claude_native_bridge.bridge_dir_for_bridge_id("conv_cleared-cleared")
-    natural_dir = claude_native_bridge.bridge_dir_for_bridge_id("conv_cleared")
+    cleared_dir = claude_native_bridge.bridge_dir_for_bridge_id(
+        "b3e788af0ecd4516439ee859b8c74536-cleared"
+    )
+    natural_dir = claude_native_bridge.bridge_dir_for_bridge_id("b3e788af0ecd4516439ee859b8c74536")
     # The isolated cleared dir is prepared; the natural (live-sibling) dir is not.
     assert cleared_dir.exists()
     assert not natural_dir.exists()
@@ -15646,7 +15866,10 @@ async def test_auto_create_claude_terminal_honours_cleared_bridge_label(
     patch_requests = [r for r in recorded_requests if r.method == "PATCH"]
     assert len(patch_requests) == 1
     patch_body = _json.loads(patch_requests[0].content)
-    assert patch_body.get("labels", {}).get(BRIDGE_ID_LABEL_KEY) == "conv_cleared-cleared"
+    assert (
+        patch_body.get("labels", {}).get(BRIDGE_ID_LABEL_KEY)
+        == "b3e788af0ecd4516439ee859b8c74536-cleared"
+    )
 
 
 @dataclass
@@ -15657,14 +15880,14 @@ class _AutoCreateScenario:
     :param case_id: Human-readable scenario id used as the pytest id,
         e.g. ``"clear_rotation_target_skips"``.
     :param active_session_id: ``active_session_id`` to seed into the
-        shared bridge config, e.g. ``"conv_old"``. ``None`` seeds no
+        shared bridge config, e.g. ``"3bb59abc6e20b834cbb2269f28880895"``. ``None`` seeds no
         bridge dir at all (models a genuinely fresh session).
     :param terminal_under: Session id to seed a live ``claude:main``
-        terminal under in the registry, e.g. ``"conv_old"``. ``None``
+        terminal under in the registry, e.g. ``"3bb59abc6e20b834cbb2269f28880895"``. ``None``
         seeds no terminal (models a dead/absent original terminal).
     :param bridge_id_label: Value returned for the new session's
         ``BRIDGE_ID_LABEL_KEY`` label, e.g. ``"bridge_shared"`` for a
-        rotation target (shares the original's bridge) or ``"conv_new"``
+        rotation target (shares the original's bridge) or ``"2d1b1a96e3e08f2cd43c0cc4b695ac5d"``
         for a fresh session (own bridge).
     :param expect_auto_create: Whether the guard should invoke
         ``_auto_create_claude_terminal`` for the new session.
@@ -15700,8 +15923,8 @@ class _LabelsAndEmptyHistoryServerClient:
         """
         Return a canned snapshot or empty items page for *url*.
 
-        :param url: Request path, e.g. ``"/v1/sessions/conv_new"`` or
-            ``"/v1/sessions/conv_new/items"``.
+        :param url: Request path, e.g. ``"/v1/sessions/2d1b1a96e3e08f2cd43c0cc4b695ac5d"`` or
+            ``"/v1/sessions/2d1b1a96e3e08f2cd43c0cc4b695ac5d/items"``.
         :returns: A response object exposing ``status_code`` and
             ``json()`` matching the subset the runner reads.
         """
@@ -15729,8 +15952,8 @@ _AUTO_CREATE_SCENARIOS = [
     # the live terminal that is about to be transferred onto conv_new.
     _AutoCreateScenario(
         case_id="clear_rotation_target_skips",
-        active_session_id="conv_old",
-        terminal_under="conv_old",
+        active_session_id="3bb59abc6e20b834cbb2269f28880895",
+        terminal_under="3bb59abc6e20b834cbb2269f28880895",
         bridge_id_label="bridge_shared",
         expect_auto_create=False,
     ),
@@ -15740,14 +15963,14 @@ _AUTO_CREATE_SCENARIOS = [
         case_id="fresh_session_creates",
         active_session_id=None,
         terminal_under=None,
-        bridge_id_label="conv_new",
+        bridge_id_label="2d1b1a96e3e08f2cd43c0cc4b695ac5d",
         expect_auto_create=True,
     ),
     # The bridge's active session is conv_new itself (e.g. a relaunch
     # after the terminal died) — not a rotation, so auto-create proceeds.
     _AutoCreateScenario(
         case_id="active_is_self_creates",
-        active_session_id="conv_new",
+        active_session_id="2d1b1a96e3e08f2cd43c0cc4b695ac5d",
         terminal_under=None,
         bridge_id_label="bridge_shared",
         expect_auto_create=True,
@@ -15756,7 +15979,7 @@ _AUTO_CREATE_SCENARIOS = [
     # exists under it — nothing to transfer in, so auto-create proceeds.
     _AutoCreateScenario(
         case_id="dead_terminal_under_active_creates",
-        active_session_id="conv_old",
+        active_session_id="3bb59abc6e20b834cbb2269f28880895",
         terminal_under=None,
         bridge_id_label="bridge_shared",
         expect_auto_create=True,
@@ -15832,7 +16055,7 @@ async def test_create_session_auto_create_guard_skips_rotation_targets(
         Record the auto-create call instead of launching a real Claude.
 
         :param session_id: Session id the guard chose to auto-create for,
-            e.g. ``"conv_new"``.
+            e.g. ``"2d1b1a96e3e08f2cd43c0cc4b695ac5d"``.
         :param resource_registry: Unused — the real launch path is stubbed.
         :param publish_event: Unused — the real launch path is stubbed.
         :param _kwargs: Absorbs keyword args added to the real function
@@ -15874,7 +16097,10 @@ async def test_create_session_auto_create_guard_skips_rotation_targets(
     async with _runner_client(app) as client:
         resp = await client.post(
             "/v1/sessions",
-            json={"session_id": "conv_new", "agent_id": "ag_1"},
+            json={
+                "session_id": "2d1b1a96e3e08f2cd43c0cc4b695ac5d",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
         )
     assert resp.status_code == 201, resp.text
 
@@ -15883,7 +16109,7 @@ async def test_create_session_auto_create_guard_skips_rotation_targets(
         # Claude — the guard only suppresses true rotation targets. An
         # empty ``created`` here would mean the guard over-fired and a
         # host-spawned session would never get a terminal.
-        assert created == ["conv_new"], (
+        assert created == ["2d1b1a96e3e08f2cd43c0cc4b695ac5d"], (
             f"Expected auto-create for {scenario.case_id}; got {created}"
         )
     else:
@@ -15901,15 +16127,15 @@ class _AntigravityAutoCreateScenario:
     :param case_id: Human-readable scenario id used as the pytest id,
         e.g. ``"clear_rotation_target_skips"``.
     :param bridge_state_session: ``session_id`` to seed into the shared
-        bridge state, e.g. ``"conv_old"``. ``None`` seeds no bridge state
+        bridge state, e.g. ``"3bb59abc6e20b834cbb2269f28880895"``. ``None`` seeds no bridge state
         at all (models a genuinely fresh session).
     :param terminal_under: Session id to seed a live ``antigravity:main``
-        terminal under in the registry, e.g. ``"conv_old"``. ``None``
+        terminal under in the registry, e.g. ``"3bb59abc6e20b834cbb2269f28880895"``. ``None``
         seeds no terminal (models a dead/absent original terminal).
     :param bridge_id_label: Value returned for the new session's
         :data:`ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY` label, e.g.
         ``"bridge_shared"`` for a rotation target (shares the original's
-        bridge) or ``"conv_new"`` for a fresh session (own bridge).
+        bridge) or ``"2d1b1a96e3e08f2cd43c0cc4b695ac5d"`` for a fresh session (own bridge).
     :param expect_auto_create: Whether the guard should invoke
         ``_auto_create_antigravity_terminal`` for the new session.
     """
@@ -15925,10 +16151,10 @@ class _AntigravitySnapshotServerClient:
     """
     Server-client stub for the antigravity auto-create guard route test.
 
-    Answers the two GETs the antigravity branch issues for ``conv_new``: the
-    session snapshot (``/v1/sessions/conv_new`` — non-``None`` so
+    Answers the two GETs the antigravity branch issues for that session: the
+    session snapshot (``/v1/sessions/2d1b1a96e3e08f2cd43c0cc4b695ac5d`` — non-``None`` so
     ``_session_payload_for_host_spawn_check`` reports the session needs a
-    terminal) and the labels lookup (``/v1/sessions/conv_new/labels`` — returns
+    terminal) and the labels lookup (``/v1/sessions/<id>/labels`` — returns
     the bridge-id label so the transfer-inbound check can resolve the shared
     bridge dir). A real stub class — not ``MagicMock`` — so an unexpected call
     shape fails loudly instead of silently returning a mock.
@@ -15945,8 +16171,8 @@ class _AntigravitySnapshotServerClient:
         """
         Return a canned snapshot or labels payload for *url*.
 
-        :param url: Request path, e.g. ``"/v1/sessions/conv_new"`` or
-            ``"/v1/sessions/conv_new/labels"``.
+        :param url: Request path, e.g. ``"/v1/sessions/2d1b1a96e3e08f2cd43c0cc4b695ac5d"`` or
+            ``"/v1/sessions/2d1b1a96e3e08f2cd43c0cc4b695ac5d/labels"``.
         :returns: A response object exposing ``status_code`` and ``json()``
             matching the subset the runner reads.
         """
@@ -15969,7 +16195,7 @@ class _AntigravitySnapshotServerClient:
             return _Response({"labels": labels})
         # The session snapshot: non-None so the host-spawn check reports the
         # session needs a terminal, and carries the same labels.
-        return _Response({"id": "conv_new", "labels": labels})
+        return _Response({"id": "2d1b1a96e3e08f2cd43c0cc4b695ac5d", "labels": labels})
 
 
 _ANTIGRAVITY_AUTO_CREATE_SCENARIOS = [
@@ -15977,8 +16203,8 @@ _ANTIGRAVITY_AUTO_CREATE_SCENARIOS = [
     # live agy terminal that is about to be transferred onto conv_new.
     _AntigravityAutoCreateScenario(
         case_id="clear_rotation_target_skips",
-        bridge_state_session="conv_old",
-        terminal_under="conv_old",
+        bridge_state_session="3bb59abc6e20b834cbb2269f28880895",
+        terminal_under="3bb59abc6e20b834cbb2269f28880895",
         bridge_id_label="bridge_shared",
         expect_auto_create=False,
     ),
@@ -15988,14 +16214,14 @@ _ANTIGRAVITY_AUTO_CREATE_SCENARIOS = [
         case_id="fresh_session_creates",
         bridge_state_session=None,
         terminal_under=None,
-        bridge_id_label="conv_new",
+        bridge_id_label="2d1b1a96e3e08f2cd43c0cc4b695ac5d",
         expect_auto_create=True,
     ),
     # The bridge's recorded session is conv_new itself (e.g. a relaunch after
     # the terminal died) — not a rotation, so auto-create proceeds.
     _AntigravityAutoCreateScenario(
         case_id="active_is_self_creates",
-        bridge_state_session="conv_new",
+        bridge_state_session="2d1b1a96e3e08f2cd43c0cc4b695ac5d",
         terminal_under=None,
         bridge_id_label="bridge_shared",
         expect_auto_create=True,
@@ -16004,7 +16230,7 @@ _ANTIGRAVITY_AUTO_CREATE_SCENARIOS = [
     # it — nothing to transfer in, so auto-create proceeds.
     _AntigravityAutoCreateScenario(
         case_id="dead_terminal_under_active_creates",
-        bridge_state_session="conv_old",
+        bridge_state_session="3bb59abc6e20b834cbb2269f28880895",
         terminal_under=None,
         bridge_id_label="bridge_shared",
         expect_auto_create=True,
@@ -16086,7 +16312,7 @@ async def test_create_session_antigravity_auto_create_guard_skips_rotation_targe
         Record the auto-create call instead of launching a real agy.
 
         :param session_id: Session id the guard chose to auto-create for,
-            e.g. ``"conv_new"``.
+            e.g. ``"2d1b1a96e3e08f2cd43c0cc4b695ac5d"``.
         :param resource_registry: Unused — the real launch path is stubbed.
         :param publish_event: Unused — the real launch path is stubbed.
         :param _kwargs: Absorbs keyword args added to the real function
@@ -16130,7 +16356,10 @@ async def test_create_session_antigravity_auto_create_guard_skips_rotation_targe
     async with _runner_client(app) as client:
         resp = await client.post(
             "/v1/sessions",
-            json={"session_id": "conv_new", "agent_id": "ag_1"},
+            json={
+                "session_id": "2d1b1a96e3e08f2cd43c0cc4b695ac5d",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
         )
     assert resp.status_code == 201, resp.text
 
@@ -16139,7 +16368,7 @@ async def test_create_session_antigravity_auto_create_guard_skips_rotation_targe
         # the guard only suppresses true rotation targets. An empty ``created``
         # here would mean the guard over-fired and a host-spawned session would
         # never get a terminal.
-        assert created == ["conv_new"], (
+        assert created == ["2d1b1a96e3e08f2cd43c0cc4b695ac5d"], (
             f"Expected auto-create for {scenario.case_id}; got {created}"
         )
     else:
@@ -16236,7 +16465,7 @@ async def test_create_session_terminal_ensure_routes_claude_native(
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
-    sid = "conv_ensure"
+    sid = "babf6c60e977e4e5f2654080d24cab40"
     auto_create_calls: list[str] = []
     launch_calls: list[str] = []
 
@@ -16333,7 +16562,7 @@ async def test_create_session_terminal_ensure_failure_returns_json_without_live_
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
-    sid = "conv_ensure_failure"
+    sid = "aefc71354fadf0dd2ae5c224c40e772c"
 
     async def _failing_auto_create(
         session_id: str,
@@ -16473,7 +16702,7 @@ async def test_create_session_terminal_ensure_routes_codex_native(
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
-    sid = "conv_codex_ensure"
+    sid = "ad2c1855c982b13e9c4df55b75d26ef8"
     auto_create_calls: list[str] = []
     auto_create_kwargs: list[dict[str, object]] = []
     launch_calls: list[str] = []
@@ -16490,7 +16719,7 @@ async def test_create_session_terminal_ensure_routes_codex_native(
         Record the codex-native ensure path.
 
         :param session_id: Session id being ensured, e.g.
-            ``"conv_codex_ensure"``.
+            ``"ad2c1855c982b13e9c4df55b75d26ef8"``.
         :param resource_registry: Runner resource registry collaborator.
         :param publish_event: Runner event publisher collaborator.
         :param kwargs: Additional keyword arguments such as
@@ -16518,7 +16747,7 @@ async def test_create_session_terminal_ensure_routes_codex_native(
 
         :param self: Bound registry instance.
         :param session_id: Session id being queried, e.g.
-            ``"conv_codex_ensure"``.
+            ``"ad2c1855c982b13e9c4df55b75d26ef8"``.
         :param terminal_id: Terminal resource id, e.g.
             ``"terminal_codex_main"``.
         :returns: Existing resource view or ``None``.
@@ -16547,7 +16776,7 @@ async def test_create_session_terminal_ensure_routes_codex_native(
 
         :param self: Bound registry instance.
         :param session_id: Session id being queried, e.g.
-            ``"conv_codex_ensure"``.
+            ``"ad2c1855c982b13e9c4df55b75d26ef8"``.
         :param terminal_id: Terminal resource id, e.g.
             ``"terminal_codex_main"``.
         :returns: ``"codex-native"`` for native seeded terminals.
@@ -16567,7 +16796,7 @@ async def test_create_session_terminal_ensure_routes_codex_native(
 
         :param self: Bound registry instance.
         :param session_id: Session id being modified, e.g.
-            ``"conv_codex_ensure"``.
+            ``"ad2c1855c982b13e9c4df55b75d26ef8"``.
         :param terminal_id: Terminal resource id, e.g.
             ``"terminal_codex_main"``.
         :returns: ``True`` to allow replacement.
@@ -16591,7 +16820,7 @@ async def test_create_session_terminal_ensure_routes_codex_native(
 
         :param self: Bound registry instance.
         :param session_id: Session id being launched, e.g.
-            ``"conv_codex_ensure"``.
+            ``"ad2c1855c982b13e9c4df55b75d26ef8"``.
         :param terminal_name: Terminal name, e.g. ``"codex"``.
         :param session_key: Terminal session key, e.g. ``"main"``.
         :param kwargs: Additional launch keyword arguments.
@@ -16660,7 +16889,7 @@ async def test_late_status_for_deleted_sub_agent_child_is_not_a_spurious_503() -
     ``503 subagent_delivery_not_confirmed`` (which Omnigent then retries) plus an
     unbounded leak of the name map across deleted sessions.
     """
-    child_id = "conv_child_late_status_after_delete"
+    child_id = "045873be7e66575e49c755387fecf59a"
     pm = _FakeProcessManager(_ScriptedHarnessClient([]))
     app = create_runner_app(
         process_manager=pm,  # type: ignore[arg-type]
@@ -16672,7 +16901,7 @@ async def test_late_status_for_deleted_sub_agent_child_is_not_a_spurious_503() -
             "/v1/sessions",
             json={
                 "session_id": child_id,
-                "agent_id": "ag_late_status_after_delete",
+                "agent_id": "2c81960171b1c893befb5cc2598ecf5c",
                 "sub_agent_name": "worker",
             },
         )
@@ -16703,7 +16932,7 @@ class _RecordedPatch:
     """
     A PATCH captured from the REPL terminal auto-create helper.
 
-    :param url: Request path, e.g. ``"/v1/sessions/conv_repl"``.
+    :param url: Request path, e.g. ``"/v1/sessions/11c50cd73e9c32ccb0af5b9db291db8b"``.
     :param json: JSON body, e.g. ``{"labels": {"omnigent.ui": "terminal"}}``.
     """
 
@@ -16735,7 +16964,7 @@ async def test_auto_create_repl_terminal_launches_attach_and_stamps_label(
     """
     from omnigent._wrapper_labels import UI_MODE_LABEL_KEY, UI_MODE_TERMINAL_VALUE
 
-    session_id = "conv_repl"
+    session_id = "11c50cd73e9c32ccb0af5b9db291db8b"
     workspace = tmp_path / "workspace"
     monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(workspace))
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
@@ -16765,7 +16994,7 @@ async def test_auto_create_repl_terminal_launches_attach_and_stamps_label(
             :param resource_role: Private runner resource marker.
             :returns: Terminal resource view.
             """
-            assert session_id == "conv_repl"
+            assert session_id == "11c50cd73e9c32ccb0af5b9db291db8b"
             assert terminal_name == "tui"
             assert session_key == "main"
             # The REPL role marks the pane for recreate-on-attach (a
@@ -16793,7 +17022,7 @@ async def test_auto_create_repl_terminal_launches_attach_and_stamps_label(
             """
             Record the PATCH and return a 200.
 
-            :param url: Request path, e.g. ``"/v1/sessions/conv_repl"``.
+            :param url: Request path, e.g. ``"/v1/sessions/11c50cd73e9c32ccb0af5b9db291db8b"``.
             :param kwargs: Request keyword arguments carrying ``json``.
             :returns: HTTP 200 response.
             """
@@ -16878,7 +17107,7 @@ async def test_auto_create_repl_terminal_inherits_agent_sandbox(
     """
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 
-    session_id = "conv_repl_sandbox_none"
+    session_id = "f75bf7158ce8716ae3b934522271979c"
     workspace = tmp_path / "workspace"
     monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(workspace))
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
@@ -17047,7 +17276,10 @@ async def test_create_session_repl_terminal_dispatch(
         terminal_registry=TerminalRegistry(),
     )
 
-    body: dict[str, Any] = {"session_id": "conv_dispatch", "agent_id": "ag_dispatch"}
+    body: dict[str, Any] = {
+        "session_id": "5eef02d60f39cba3fbd0ae188348643f",
+        "agent_id": "26def1563ee359def46b274c20739c03",
+    }
     if sub_agent_name is not None:
         body["sub_agent_name"] = sub_agent_name
     async with _runner_client(app) as client:
@@ -17057,7 +17289,7 @@ async def test_create_session_repl_terminal_dispatch(
     # Dispatch fired exactly for the SDK top-level case. An unexpected
     # entry here means natives/sub-agents grew a REPL pane; a missing
     # one means SDK sessions lost the embedded web TUI.
-    assert created_sessions == (["conv_dispatch"] if expect_created else [])
+    assert created_sessions == (["5eef02d60f39cba3fbd0ae188348643f"] if expect_created else [])
 
 
 # ── Sub-agent wake-POST status check + bounded retry ──────────────────
@@ -17069,7 +17301,7 @@ class _WakePost:
     A single recorded POST made by ``_QueuedResponseServerClient``.
 
     :param url: The path the wake notice was POSTed to, e.g.
-        ``"/v1/sessions/conv_parent123/events"``.
+        ``"/v1/sessions/0349c7f62dcaa06b868e9c088c39f062/events"``.
     :param notice: The injected notice text pulled out of the request body.
     """
 
@@ -17105,7 +17337,7 @@ class _QueuedResponseServerClient:
         """
         Record the POST and return the next queued response.
 
-        :param url: Target path, e.g. ``"/v1/sessions/conv_p/events"``.
+        :param url: Target path, e.g. ``"/v1/sessions/b460374fc8e697b296708f52dc9d8179/events"``.
         :param json: Wake-notice request body in the ingest message shape.
         :param timeout: Per-request timeout (recorded only, not enforced).
         :returns: The next pre-built response from the queue.
@@ -17174,7 +17406,7 @@ async def test_wake_post_retries_transient_503_then_succeeds(
     reconnects. The wake POST must treat that as a failure and retry, not
     accept it as delivered.
     """
-    parent_id = "conv_parent_503_then_ok"
+    parent_id = "dd17997e050fc080efac96bc9ec22b55"
     client = _QueuedResponseServerClient(
         [_wake_response(503, parent_id), _wake_response(200, parent_id)]
     )
@@ -17215,7 +17447,7 @@ async def test_wake_post_persistent_503_returns_failure(
     surfaced as a delivery failure (so the caller releases the debounce flag
     and logs), never swallowed as a success.
     """
-    parent_id = "conv_parent_always_503"
+    parent_id = "a25887ef53cb74bba721c20edf204d10"
     client = _QueuedResponseServerClient(
         [_wake_response(503, parent_id) for _ in range(_WAKE_POST_MAX_ATTEMPTS)]
     )
@@ -17250,7 +17482,7 @@ async def test_wake_post_permanent_4xx_not_retried(
     A 400 is a client-side rejection that retrying cannot fix, so the loop
     must give up after one attempt rather than burn the whole budget.
     """
-    parent_id = "conv_parent_400"
+    parent_id = "43cc3eccd350fed1b91854b2adf5ec3e"
     client = _QueuedResponseServerClient([_wake_response(400, parent_id)])
 
     delivered = await _deliver_subagent_wake_post(
@@ -17362,7 +17594,7 @@ async def test_cancel_auto_forwarder_task_cancels_and_awaits_registered_task() -
     """
     import omnigent.runner.app as runner_app_mod
 
-    session_id = "conv_fwd_cancel_awaits"
+    session_id = "f98115a89870f7e364064c9d06c52ee7"
     run = _ForwarderRun()
 
     async def _parked() -> None:
@@ -17419,7 +17651,7 @@ async def test_register_auto_forwarder_task_replaces_incumbent_and_survives_stal
     """
     import omnigent.runner.app as runner_app_mod
 
-    session_id = "conv_fwd_stale_evict"
+    session_id = "f14ef86c47cc555be7e4c5eb00e88a9a"
     run_a = _ForwarderRun()
     run_b = _ForwarderRun()
 
@@ -17489,27 +17721,29 @@ async def test_auto_forwarder_registry_isolates_sessions_and_evicts_completed() 
     try:
         task_a = asyncio.create_task(_parked(run_a))
         task_b = asyncio.create_task(_parked(run_b))
-        runner_app_mod._register_auto_forwarder_task("conv_fwd_sess_a", task_a)
-        runner_app_mod._register_auto_forwarder_task("conv_fwd_sess_b", task_b)
+        runner_app_mod._register_auto_forwarder_task("4263b99f5e92593cafda836bdb6b7690", task_a)
+        runner_app_mod._register_auto_forwarder_task("414de30f273a0a21428e869a1d7a2a3d", task_b)
         await asyncio.sleep(0)
 
-        await runner_app_mod._cancel_auto_forwarder_task("conv_fwd_sess_a")
+        await runner_app_mod._cancel_auto_forwarder_task("4263b99f5e92593cafda836bdb6b7690")
 
         assert run_a.cancelled is True
         # Session B's forwarder is untouched by session A's cancel — keying
         # by session id must not regress to whole-registry cancellation.
         assert run_b.cancelled is False
         assert not task_b.done()
-        assert runner_app_mod._AUTO_FORWARDER_TASKS.get("conv_fwd_sess_b") is task_b
+        assert (
+            runner_app_mod._AUTO_FORWARDER_TASKS.get("414de30f273a0a21428e869a1d7a2a3d") is task_b
+        )
 
         # Natural completion evicts the entry (no leak for finished tasks).
         task_b.cancel()
         await asyncio.wait({task_b})
         await asyncio.sleep(0)
-        assert "conv_fwd_sess_b" not in runner_app_mod._AUTO_FORWARDER_TASKS
+        assert "414de30f273a0a21428e869a1d7a2a3d" not in runner_app_mod._AUTO_FORWARDER_TASKS
     finally:
-        runner_app_mod._AUTO_FORWARDER_TASKS.pop("conv_fwd_sess_a", None)
-        runner_app_mod._AUTO_FORWARDER_TASKS.pop("conv_fwd_sess_b", None)
+        runner_app_mod._AUTO_FORWARDER_TASKS.pop("4263b99f5e92593cafda836bdb6b7690", None)
+        runner_app_mod._AUTO_FORWARDER_TASKS.pop("414de30f273a0a21428e869a1d7a2a3d", None)
         await _drain_forwarder_runs([run_a, run_b])
 
 
@@ -17539,7 +17773,7 @@ async def test_auto_create_claude_terminal_recreate_cancels_prior_forwarder(
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
 
-    session_id = "conv_fwd_recreate"
+    session_id = "f3e241b72bac7d5e33d7a9819e0fa865"
     runs: list[_ForwarderRun] = []
 
     async def _parking_forwarder(**kwargs: Any) -> None:
@@ -17650,7 +17884,7 @@ async def test_auto_create_codex_terminal_recreate_cancels_prior_forwarder(
     import omnigent.codex_native_app_server as codex_app_mod
     import omnigent.runner.app as runner_app_mod
 
-    session_id = "conv_codex_fwd_recreate"
+    session_id = "a3f4361a350851cfb9eb3db2bf2b0380"
     thread_id = "019e96aa-0be2-7343-8d3b-6f914d60936b"
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
     monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path / "workspace"))
@@ -17676,7 +17910,7 @@ async def test_auto_create_codex_terminal_recreate_cancels_prior_forwarder(
                     json={
                         "data": [
                             {
-                                "id": "msg_user_1",
+                                "id": "b1649a5cbfec3f92bec12275c14f4b5f",
                                 "response_id": "codex_turn_1",
                                 "type": "message",
                                 "role": "user",
@@ -17892,11 +18126,14 @@ async def test_events_interrupt_on_kiro_native_routes_to_escape(
     async with _runner_client(app) as client:
         create_resp = await client.post(
             "/v1/sessions",
-            json={"session_id": "conv_kiro_int", "agent_id": "ag_1"},
+            json={
+                "session_id": "cd6b589814147431cc1a92ec2c979998",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
         )
         assert create_resp.status_code == 201, create_resp.text
         int_resp = await client.post(
-            "/v1/sessions/conv_kiro_int/events",
+            "/v1/sessions/cd6b589814147431cc1a92ec2c979998/events",
             json={"type": "interrupt"},
         )
 
@@ -17908,7 +18145,9 @@ async def test_events_interrupt_on_kiro_native_routes_to_escape(
         f"kiro-native interrupt dispatch entry is missing."
     )
     bridge_dir, timeout_s = captured[0]
-    assert bridge_dir == kiro_native_bridge.bridge_dir_for_session_id("conv_kiro_int")
+    assert bridge_dir == kiro_native_bridge.bridge_dir_for_session_id(
+        "cd6b589814147431cc1a92ec2c979998"
+    )
     assert timeout_s == 1.0
 
 
@@ -17951,14 +18190,17 @@ async def test_events_stop_session_on_kiro_native_kills_tmux_and_publishes_idle(
     async with _runner_client(app) as client:
         create_resp = await client.post(
             "/v1/sessions",
-            json={"session_id": "conv_kiro_stop", "agent_id": "ag_1"},
+            json={
+                "session_id": "cd2a2b575af18bbc3a38fd025e379be0",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
         )
         assert create_resp.status_code == 201, create_resp.text
         stop_resp = await client.post(
-            "/v1/sessions/conv_kiro_stop/events",
+            "/v1/sessions/cd2a2b575af18bbc3a38fd025e379be0/events",
             json={"type": "stop_session"},
         )
-        queue = _session_event_queues_ref.get("conv_kiro_stop")
+        queue = _session_event_queues_ref.get("cd2a2b575af18bbc3a38fd025e379be0")
         queued_events: list[dict[str, Any]] = []
         while queue is not None and not queue.empty():
             item = queue.get_nowait()
@@ -17971,7 +18213,9 @@ async def test_events_stop_session_on_kiro_native_kills_tmux_and_publishes_idle(
         f"kiro-native stop dispatch entry is missing."
     )
     bridge_dir, timeout_s = captured[0]
-    assert bridge_dir == kiro_native_bridge.bridge_dir_for_session_id("conv_kiro_stop")
+    assert bridge_dir == kiro_native_bridge.bridge_dir_for_session_id(
+        "cd2a2b575af18bbc3a38fd025e379be0"
+    )
     assert timeout_s == 1.0
     idle_events = [
         e for e in queued_events if e.get("type") == "session.status" and e.get("status") == "idle"
@@ -18021,14 +18265,17 @@ async def test_events_interrupt_on_kiro_native_503_skips_idle_when_inject_fails(
     async with _runner_client(app) as client:
         create_resp = await client.post(
             "/v1/sessions",
-            json={"session_id": "conv_kiro_int_fail", "agent_id": "ag_1"},
+            json={
+                "session_id": "b756aafcdc68c0ed2cf92b34085be5bb",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
         )
         assert create_resp.status_code == 201, create_resp.text
         int_resp = await client.post(
-            "/v1/sessions/conv_kiro_int_fail/events",
+            "/v1/sessions/b756aafcdc68c0ed2cf92b34085be5bb/events",
             json={"type": "interrupt"},
         )
-        queue = _session_event_queues_ref.get("conv_kiro_int_fail")
+        queue = _session_event_queues_ref.get("b756aafcdc68c0ed2cf92b34085be5bb")
         queued_events: list[dict[str, Any]] = []
         while queue is not None and not queue.empty():
             item = queue.get_nowait()
@@ -18091,14 +18338,17 @@ async def test_events_stop_session_on_kiro_native_503_when_kill_fails(
     async with _runner_client(app) as client:
         create_resp = await client.post(
             "/v1/sessions",
-            json={"session_id": "conv_kiro_stop_fail", "agent_id": "ag_1"},
+            json={
+                "session_id": "695c27b61206353f312efe5f6a7ca0f6",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
         )
         assert create_resp.status_code == 201, create_resp.text
         stop_resp = await client.post(
-            "/v1/sessions/conv_kiro_stop_fail/events",
+            "/v1/sessions/695c27b61206353f312efe5f6a7ca0f6/events",
             json={"type": "stop_session"},
         )
-        queue = _session_event_queues_ref.get("conv_kiro_stop_fail")
+        queue = _session_event_queues_ref.get("695c27b61206353f312efe5f6a7ca0f6")
         queued_events: list[dict[str, Any]] = []
         while queue is not None and not queue.empty():
             item = queue.get_nowait()

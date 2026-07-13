@@ -72,7 +72,7 @@ class _ConversationStore:
             created_at=1,
             updated_at=1,
             root_conversation_id=conversation_id,
-            agent_id="ag_test",
+            agent_id="087b7cb7ac30abf4debfaa578d052ec6",
         )
 
     def list_conversations(
@@ -103,7 +103,7 @@ class _ConversationStore:
                     created_at=1,
                     updated_at=1,
                     root_conversation_id=root_conversation_id or "",
-                    agent_id="ag_test",
+                    agent_id="087b7cb7ac30abf4debfaa578d052ec6",
                 )
             ]
         return PagedList(
@@ -166,11 +166,11 @@ async def test_session_snapshot_reads_latest_items_then_returns_chronological() 
     ]
     conv_store = _ConversationStore(newest_first)
 
-    snapshot = await _get_session_snapshot(conv_store, "conv_test")  # type: ignore[arg-type]
+    snapshot = await _get_session_snapshot(conv_store, "e1f7c651c9f97fac088ea70ef633409d")  # type: ignore[arg-type]
 
     assert conv_store.list_items_calls == [
         {
-            "conversation_id": "conv_test",
+            "conversation_id": "e1f7c651c9f97fac088ea70ef633409d",
             "limit": 100,
             "after": None,
             "before": None,
@@ -179,7 +179,7 @@ async def test_session_snapshot_reads_latest_items_then_returns_chronological() 
         }
     ]
     assert [item.id for item in snapshot.items] == ["item_103", "item_104", "item_105"]
-    assert snapshot.agent_id == "ag_test"
+    assert snapshot.agent_id == "087b7cb7ac30abf4debfaa578d052ec6"
     assert snapshot.status == "idle"
 
 
@@ -194,19 +194,23 @@ async def test_session_snapshot_populates_runner_online_from_session_lookup() ->
         Return scripted liveness for the requested session ids.
 
         :param session_ids: Session ids to resolve, e.g.
-            ``["conv_shared"]``.
+            ``["1949523062921b6989466e2fc257925a"]``.
         :returns: Session-scoped split liveness by id.
         """
         lookup_calls.append(session_ids)
-        return {"conv_shared": SessionLiveness(runner_online=False, host_online=False)}
+        return {
+            "1949523062921b6989466e2fc257925a": SessionLiveness(
+                runner_online=False, host_online=False
+            )
+        }
 
     snapshot = await _get_session_snapshot(
         conv_store,
-        "conv_shared",  # type: ignore[arg-type]
+        "1949523062921b6989466e2fc257925a",  # type: ignore[arg-type]
         liveness_lookup=_liveness_lookup,
     )
 
-    assert lookup_calls == [["conv_shared"]]
+    assert lookup_calls == [["1949523062921b6989466e2fc257925a"]]
     assert snapshot.runner_online is False
     assert snapshot.host_online is False
 
@@ -225,16 +229,16 @@ async def test_session_snapshot_surfaces_runner_exit_report_as_failed() -> None:
     from omnigent.server.host_registry import RunnerExitReports
 
     conv = Conversation(
-        id="conv_crashed",
+        id="87876a3cec563d43c2430b633747c7b7",
         created_at=1,
         updated_at=1,
-        root_conversation_id="conv_crashed",
-        agent_id="ag_test",
+        root_conversation_id="87876a3cec563d43c2430b633747c7b7",
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
         runner_id="runner_dead",
     )
     conv_store = _ConversationStore(
         [_message_item("item_1", "hi")],
-        conversations={"conv_crashed": conv},
+        conversations={"87876a3cec563d43c2430b633747c7b7": conv},
     )
     reports = RunnerExitReports()
     daemon_error = "runner process exited with code 1\n--- runner log tail ---\nboom"
@@ -242,7 +246,7 @@ async def test_session_snapshot_surfaces_runner_exit_report_as_failed() -> None:
 
     snapshot = await _get_session_snapshot(
         conv_store,  # type: ignore[arg-type]
-        "conv_crashed",
+        "87876a3cec563d43c2430b633747c7b7",
         runner_exit_reports=reports,
     )
 
@@ -266,11 +270,11 @@ async def test_session_snapshot_surfaces_status_error_labels_as_last_task_error(
     failure banner instead of ``last_task_error=None``.
     """
     conv = Conversation(
-        id="conv_failed_terminal",
+        id="bb66c1adb93f9520bc882bcd05c838e2",
         created_at=1,
         updated_at=1,
-        root_conversation_id="conv_failed_terminal",
-        agent_id="ag_test",
+        root_conversation_id="bb66c1adb93f9520bc882bcd05c838e2",
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
         labels={
             "omnigent.last_task_error_code": "required_terminal_exited",
             "omnigent.last_task_error_message": "Required terminal exited unexpectedly",
@@ -278,12 +282,12 @@ async def test_session_snapshot_surfaces_status_error_labels_as_last_task_error(
     )
     conv_store = _ConversationStore(
         [_message_item("item_1", "hi")],
-        conversations={"conv_failed_terminal": conv},
+        conversations={"bb66c1adb93f9520bc882bcd05c838e2": conv},
     )
 
     snapshot = await _get_session_snapshot(  # type: ignore[arg-type]
         conv_store,
-        "conv_failed_terminal",
+        "bb66c1adb93f9520bc882bcd05c838e2",
     )
 
     assert snapshot.last_task_error == {
@@ -302,22 +306,22 @@ async def test_session_snapshot_no_exit_report_stays_unfailed() -> None:
     from omnigent.server.host_registry import RunnerExitReports
 
     conv = Conversation(
-        id="conv_ok",
+        id="428fdbbaac5e190e6360103acc4fe6c5",
         created_at=1,
         updated_at=1,
-        root_conversation_id="conv_ok",
-        agent_id="ag_test",
+        root_conversation_id="428fdbbaac5e190e6360103acc4fe6c5",
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
         runner_id="runner_live",
     )
     conv_store = _ConversationStore(
         [_message_item("item_1", "hi")],
-        conversations={"conv_ok": conv},
+        conversations={"428fdbbaac5e190e6360103acc4fe6c5": conv},
     )
     reports = RunnerExitReports()  # empty — no crash recorded
 
     snapshot = await _get_session_snapshot(
         conv_store,  # type: ignore[arg-type]
-        "conv_ok",
+        "428fdbbaac5e190e6360103acc4fe6c5",
         runner_exit_reports=reports,
     )
 
@@ -360,18 +364,18 @@ async def test_session_snapshot_queries_runner_on_cache_miss(
     conv_store = _ConversationStore([_message_item("item_1", "hi")])
     snapshot = await _get_session_snapshot(
         conv_store,
-        "conv_cache_miss",  # type: ignore[arg-type]
+        "cef2fb55a9d4841cff0b30b2826d91f1",  # type: ignore[arg-type]
     )
 
     # Runner was queried for this session's status.
-    assert "/v1/sessions/conv_cache_miss" in fake_client.get_calls[0]
+    assert "/v1/sessions/cef2fb55a9d4841cff0b30b2826d91f1" in fake_client.get_calls[0]
     assert snapshot.status == "running"
 
     # Verify the cache is warm: a second call should NOT query the
     # runner again (proves the cache was populated).
     snapshot2 = await _get_session_snapshot(
         conv_store,
-        "conv_cache_miss",  # type: ignore[arg-type]
+        "cef2fb55a9d4841cff0b30b2826d91f1",  # type: ignore[arg-type]
     )
     # Still "running" from the cached value.
     assert snapshot2.status == "running"
@@ -410,7 +414,7 @@ async def test_session_snapshot_defaults_idle_when_runner_unreachable(
     conv_store = _ConversationStore([_message_item("item_1", "hi")])
     snapshot = await _get_session_snapshot(
         conv_store,
-        "conv_no_runner",  # type: ignore[arg-type]
+        "68dcdb50d850d9c2b905cad807dad25f",  # type: ignore[arg-type]
     )
 
     assert snapshot.status == "idle"
@@ -477,19 +481,19 @@ async def test_session_snapshot_uses_router_when_singleton_unset(
     conv_store = _ConversationStore([_message_item("item_1", "hi")])
     snapshot = await _get_session_snapshot(
         conv_store,
-        "conv_router_only",  # type: ignore[arg-type]
+        "3ce755917a74a49f0c8feaf50f058ed9",  # type: ignore[arg-type]
     )
 
-    assert fake_router.resolved_for == ["conv_router_only"], (
+    assert fake_router.resolved_for == ["3ce755917a74a49f0c8feaf50f058ed9"], (
         "snapshot should have consulted the runner_router on cache miss "
         "instead of synthesizing a default status"
     )
     assert snapshot.status == "running"
     # Status is synchronous; the skills GET is now a background fetch.
-    await _drain_runner_skills("conv_router_only")
+    await _drain_runner_skills("3ce755917a74a49f0c8feaf50f058ed9")
     assert fake_client.get_calls == [
-        "/v1/sessions/conv_router_only",
-        "/v1/sessions/conv_router_only/skills",
+        "/v1/sessions/3ce755917a74a49f0c8feaf50f058ed9",
+        "/v1/sessions/3ce755917a74a49f0c8feaf50f058ed9/skills",
     ]
 
 
@@ -542,16 +546,16 @@ async def test_session_snapshot_includes_skills_from_runner(
     # First poll returns [] and kicks the background fetch; a later poll serves them.
     first = await _get_session_snapshot(
         conv_store,  # type: ignore[arg-type]
-        "conv_skills",
+        "6dc1e933ea5626723a7c79af592a4dc8",
     )
     assert first.skills == []
-    await _drain_runner_skills("conv_skills")
+    await _drain_runner_skills("6dc1e933ea5626723a7c79af592a4dc8")
     snapshot = await _get_session_snapshot(
         conv_store,  # type: ignore[arg-type]
-        "conv_skills",
+        "6dc1e933ea5626723a7c79af592a4dc8",
     )
 
-    assert "/v1/sessions/conv_skills/skills" in fake_client.get_calls
+    assert "/v1/sessions/6dc1e933ea5626723a7c79af592a4dc8/skills" in fake_client.get_calls
     assert [s.name for s in snapshot.skills] == ["triage-issues", "mlflow-bug"]
     assert snapshot.skills[0].description == "Triage issues."
 
@@ -807,24 +811,24 @@ async def test_session_snapshot_serves_static_cursor_model_options(
     monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
 
     conv = Conversation(
-        id="conv_cursor_options",
+        id="4747fb03a3b45bb1f96bf130f4d704e5",
         created_at=1,
         updated_at=1,
-        root_conversation_id="conv_cursor_options",
-        agent_id="ag_test",
+        root_conversation_id="4747fb03a3b45bb1f96bf130f4d704e5",
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
         labels={
             _mod._CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _mod._CURSOR_NATIVE_WRAPPER_LABEL_VALUE,
         },
     )
     conv_store = _ConversationStore(
         [_message_item("item_1", "hi")],
-        conversations={"conv_cursor_options": conv},
+        conversations={"4747fb03a3b45bb1f96bf130f4d704e5": conv},
     )
 
     # First snapshot already carries the full catalog — no kick-and-empty.
     snapshot = await _get_session_snapshot(
         conv_store,  # type: ignore[arg-type]
-        "conv_cursor_options",
+        "4747fb03a3b45bb1f96bf130f4d704e5",
     )
 
     # No runner round-trip for cursor model options (served statically).
@@ -834,7 +838,7 @@ async def test_session_snapshot_serves_static_cursor_model_options(
     # base-id namespace only — no flattened effort variants leak through.
     assert not any("-high" in i or "-xhigh" in i for i in ids)
     # The cache must stay untouched — that's what makes it refresh_state-proof.
-    assert "conv_cursor_options" not in _mod._model_options_cache
+    assert "4747fb03a3b45bb1f96bf130f4d704e5" not in _mod._model_options_cache
 
 
 @pytest.mark.asyncio
@@ -857,7 +861,7 @@ async def test_session_snapshot_refresh_state_reloads_model_options(
     _mod._runner_skills_inflight.clear()
     _mod._model_options_cache.clear()
     _mod._model_options_inflight.clear()
-    _mod._model_options_cache["conv_codex_refresh"] = [
+    _mod._model_options_cache["3626053dfa9668a8604cc06e0b590ae0"] = [
         {
             "id": "stale-model",
             "model": "stale-provider-model",
@@ -908,35 +912,38 @@ async def test_session_snapshot_refresh_state_reloads_model_options(
     monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
 
     conv = Conversation(
-        id="conv_codex_refresh",
+        id="3626053dfa9668a8604cc06e0b590ae0",
         created_at=1,
         updated_at=1,
-        root_conversation_id="conv_codex_refresh",
-        agent_id="ag_test",
+        root_conversation_id="3626053dfa9668a8604cc06e0b590ae0",
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
         labels={
             _mod._CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _mod._CODEX_NATIVE_WRAPPER_LABEL_VALUE,
         },
     )
     conv_store = _ConversationStore(
         [_message_item("item_1", "hi")],
-        conversations={"conv_codex_refresh": conv},
+        conversations={"3626053dfa9668a8604cc06e0b590ae0": conv},
     )
 
     refreshed = await _get_session_snapshot(
         conv_store,  # type: ignore[arg-type]
-        "conv_codex_refresh",
+        "3626053dfa9668a8604cc06e0b590ae0",
         refresh_state=True,
     )
     # Refresh must not echo the stale cached row. If this is "stale-model",
     # browser reloads would not recover after the server-side cache shape is fixed.
     assert [m["id"] for m in refreshed.model_options] == []
-    await _drain_model_options("conv_codex_refresh")
+    await _drain_model_options("3626053dfa9668a8604cc06e0b590ae0")
     snapshot = await _get_session_snapshot(
         conv_store,  # type: ignore[arg-type]
-        "conv_codex_refresh",
+        "3626053dfa9668a8604cc06e0b590ae0",
     )
 
-    assert "/v1/sessions/conv_codex_refresh/codex-model-options" in fake_client.get_calls
+    assert (
+        "/v1/sessions/3626053dfa9668a8604cc06e0b590ae0/codex-model-options"
+        in fake_client.get_calls
+    )
     assert [m["id"] for m in snapshot.model_options] == ["fresh-model"]
     assert snapshot.model_options[0]["displayName"] == "Fresh Model"
 
@@ -1005,35 +1012,37 @@ async def test_session_snapshot_retries_empty_model_options(
     monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
 
     conv = Conversation(
-        id="conv_codex_empty_then_ready",
+        id="a17f935755fe66e4a0f42878eee28820",
         created_at=1,
         updated_at=1,
-        root_conversation_id="conv_codex_empty_then_ready",
-        agent_id="ag_test",
+        root_conversation_id="a17f935755fe66e4a0f42878eee28820",
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
         labels={
             _mod._CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _mod._CODEX_NATIVE_WRAPPER_LABEL_VALUE,
         },
     )
     conv_store = _ConversationStore(
         [_message_item("item_1", "hi")],
-        conversations={"conv_codex_empty_then_ready": conv},
+        conversations={"a17f935755fe66e4a0f42878eee28820": conv},
     )
 
     first = await _get_session_snapshot(
         conv_store,  # type: ignore[arg-type]
-        "conv_codex_empty_then_ready",
+        "a17f935755fe66e4a0f42878eee28820",
     )
     assert first.model_options == []
-    await _drain_model_options("conv_codex_empty_then_ready")
+    await _drain_model_options("a17f935755fe66e4a0f42878eee28820")
     snapshot = await _get_session_snapshot(
         conv_store,  # type: ignore[arg-type]
-        "conv_codex_empty_then_ready",
+        "a17f935755fe66e4a0f42878eee28820",
     )
 
     # Two codex-model-options calls means the empty catalog was not cached;
     # one call would recreate the missing-picker regression.
     assert (
-        fake_client.get_calls.count("/v1/sessions/conv_codex_empty_then_ready/codex-model-options")
+        fake_client.get_calls.count(
+            "/v1/sessions/a17f935755fe66e4a0f42878eee28820/codex-model-options"
+        )
         == 2
     )
     assert [m["id"] for m in snapshot.model_options] == ["gpt-5.5"]
@@ -1117,35 +1126,37 @@ async def test_session_snapshot_retries_503_model_options(
     monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
 
     conv = Conversation(
-        id="conv_codex_503_then_ready",
+        id="a5cf1ddab988dcc43e643401b70c56d0",
         created_at=1,
         updated_at=1,
-        root_conversation_id="conv_codex_503_then_ready",
-        agent_id="ag_test",
+        root_conversation_id="a5cf1ddab988dcc43e643401b70c56d0",
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
         labels={
             _mod._CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _mod._CODEX_NATIVE_WRAPPER_LABEL_VALUE,
         },
     )
     conv_store = _ConversationStore(
         [_message_item("item_1", "hi")],
-        conversations={"conv_codex_503_then_ready": conv},
+        conversations={"a5cf1ddab988dcc43e643401b70c56d0": conv},
     )
 
     first = await _get_session_snapshot(
         conv_store,  # type: ignore[arg-type]
-        "conv_codex_503_then_ready",
+        "a5cf1ddab988dcc43e643401b70c56d0",
     )
     assert first.model_options == []
-    await _drain_model_options("conv_codex_503_then_ready")
+    await _drain_model_options("a5cf1ddab988dcc43e643401b70c56d0")
     snapshot = await _get_session_snapshot(
         conv_store,  # type: ignore[arg-type]
-        "conv_codex_503_then_ready",
+        "a5cf1ddab988dcc43e643401b70c56d0",
     )
 
     # Two calls proves the transient 503 did not terminate discovery; one
     # call would leave the cache cold forever until another snapshot request.
     assert (
-        fake_client.get_calls.count("/v1/sessions/conv_codex_503_then_ready/codex-model-options")
+        fake_client.get_calls.count(
+            "/v1/sessions/a5cf1ddab988dcc43e643401b70c56d0/codex-model-options"
+        )
         == 2
     )
     assert [m["id"] for m in snapshot.model_options] == ["gpt-5.4"]
@@ -1204,9 +1215,9 @@ async def test_session_snapshot_publishes_skills_event_when_fetch_resolves(
 
     conv_store = _ConversationStore([_message_item("item_1", "hi")])
     # First poll serves [] and kicks the background fetch.
-    first = await _get_session_snapshot(conv_store, "conv_push")  # type: ignore[arg-type]
+    first = await _get_session_snapshot(conv_store, "38aed2dc1dc1b08dbbaa1cf9592d7ae5")  # type: ignore[arg-type]
     assert first.skills == []
-    await _drain_runner_skills("conv_push")
+    await _drain_runner_skills("38aed2dc1dc1b08dbbaa1cf9592d7ae5")
 
     # Exactly one session.skills event for this session was published when
     # the fetch resolved. A missing event means the push regressed and the
@@ -1215,7 +1226,8 @@ async def test_session_snapshot_publishes_skills_event_when_fetch_resolves(
     skills_events = [
         e
         for e in published
-        if e.get("type") == "session.skills" and e.get("conversation_id") == "conv_push"
+        if e.get("type") == "session.skills"
+        and e.get("conversation_id") == "38aed2dc1dc1b08dbbaa1cf9592d7ae5"
     ]
     assert len(skills_events) == 1, (
         f"Expected exactly 1 session.skills publish on fetch resolve, "
@@ -1247,7 +1259,7 @@ async def test_session_snapshot_skills_empty_without_runner(
 
     snapshot = await _get_session_snapshot(
         conv_store,  # type: ignore[arg-type]
-        "conv_no_runner_skills",
+        "6222f438412b74067ff5915857f79312",
     )
 
     assert snapshot.skills == []
@@ -1287,7 +1299,7 @@ async def test_session_snapshot_skills_empty_on_malformed_runner_payload(
 
     snapshot = await _get_session_snapshot(
         conv_store,  # type: ignore[arg-type]
-        "conv_malformed_skills",
+        "21ad0587558979245a26b40ebe2638ef",
     )
 
     assert snapshot.skills == []
@@ -1344,15 +1356,15 @@ async def test_session_snapshot_prefers_router_over_singleton(
     conv_store = _ConversationStore([_message_item("item_1", "hi")])
     snapshot = await _get_session_snapshot(
         conv_store,
-        "conv_prefer_router",  # type: ignore[arg-type]
+        "1cef6d7d1ef0c577c6ccfc690e5bc8ed",  # type: ignore[arg-type]
     )
 
     assert snapshot.status == "running"
     # Status is synchronous; the skills GET is now a background fetch.
-    await _drain_runner_skills("conv_prefer_router")
+    await _drain_runner_skills("1cef6d7d1ef0c577c6ccfc690e5bc8ed")
     assert router_client.get_calls == [
-        "/v1/sessions/conv_prefer_router",
-        "/v1/sessions/conv_prefer_router/skills",
+        "/v1/sessions/1cef6d7d1ef0c577c6ccfc690e5bc8ed",
+        "/v1/sessions/1cef6d7d1ef0c577c6ccfc690e5bc8ed/skills",
     ]
     assert singleton_client.get_calls == [], (
         "singleton should not have been queried when the router resolved a client"
@@ -1395,7 +1407,7 @@ def _graph_conv(
 ) -> Conversation:
     """Build a spawn-tree conversation with optional priced ``session_usage``.
 
-    :param conv_id: This conversation's id, e.g. ``"conv_child"``.
+    :param conv_id: This conversation's id, e.g. ``"ff5cac23d0beb79fad914046049f32ff"``.
     :param root: Shared spawn-tree root id (every node in a tree shares it).
     :param parent: Parent conversation id, or ``None`` for the tree root.
     :param cost: ``total_cost_usd`` to record, or ``None`` for an unpriced
@@ -1418,7 +1430,7 @@ def _graph_conv(
         updated_at=1,
         root_conversation_id=root,
         parent_conversation_id=parent,
-        agent_id="ag_test",
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
         kind="default" if parent is None else "sub_agent",
         session_usage=usage,
     )
@@ -1433,14 +1445,27 @@ async def test_session_snapshot_cost_sums_subagent_subtree() -> None:
     its spend on its own child conversation, so without the subtree sum the
     parent's badge would never reflect it.
     """
-    parent = _graph_conv("conv_parent", root="conv_parent", parent=None, cost=1.0)
-    child = _graph_conv("conv_child", root="conv_parent", parent="conv_parent", cost=2.5)
+    parent = _graph_conv(
+        "ead6d59a6b650d19dbdf61ec32426f4e",
+        root="ead6d59a6b650d19dbdf61ec32426f4e",
+        parent=None,
+        cost=1.0,
+    )
+    child = _graph_conv(
+        "ff5cac23d0beb79fad914046049f32ff",
+        root="ead6d59a6b650d19dbdf61ec32426f4e",
+        parent="ead6d59a6b650d19dbdf61ec32426f4e",
+        cost=2.5,
+    )
     conv_store = _ConversationStore(
         [_message_item("item_1", "hi")],
-        conversations={"conv_parent": parent, "conv_child": child},
+        conversations={
+            "ead6d59a6b650d19dbdf61ec32426f4e": parent,
+            "ff5cac23d0beb79fad914046049f32ff": child,
+        },
     )
 
-    snapshot = await _get_session_snapshot(conv_store, "conv_parent")  # type: ignore[arg-type]
+    snapshot = await _get_session_snapshot(conv_store, "ead6d59a6b650d19dbdf61ec32426f4e")  # type: ignore[arg-type]
 
     # 3.5 = parent $1.00 + sub-agent $2.50. If this reads 1.00, the snapshot
     # regressed to the parent's own session_usage and dropped the subtree sum —
@@ -1455,13 +1480,18 @@ async def test_session_snapshot_cost_is_own_usage_for_childless_session() -> Non
     Guards the fallback: a childless session's subtree is just itself, so the
     badge must equal the conversation's own ``total_cost_usd`` (not None/0).
     """
-    solo = _graph_conv("conv_solo", root="conv_solo", parent=None, cost=0.42)
+    solo = _graph_conv(
+        "6d996c055256e5975b8e5683c4d77d47",
+        root="6d996c055256e5975b8e5683c4d77d47",
+        parent=None,
+        cost=0.42,
+    )
     conv_store = _ConversationStore(
         [_message_item("item_1", "hi")],
-        conversations={"conv_solo": solo},
+        conversations={"6d996c055256e5975b8e5683c4d77d47": solo},
     )
 
-    snapshot = await _get_session_snapshot(conv_store, "conv_solo")  # type: ignore[arg-type]
+    snapshot = await _get_session_snapshot(conv_store, "6d996c055256e5975b8e5683c4d77d47")  # type: ignore[arg-type]
 
     # 0.42 = the session's own cost; no descendants to add.
     assert snapshot.total_cost_usd == 0.42
@@ -1477,27 +1507,30 @@ async def test_session_snapshot_sums_by_model_over_subtree() -> None:
     and child share the same model, their buckets must be summed.
     """
     parent = _graph_conv(
-        "conv_parent",
-        root="conv_parent",
+        "ead6d59a6b650d19dbdf61ec32426f4e",
+        root="ead6d59a6b650d19dbdf61ec32426f4e",
         parent=None,
         cost=1.0,
         tokens={"input_tokens": 100, "output_tokens": 20},
         by_model={"model-a": {"input_tokens": 100, "output_tokens": 20, "total_cost_usd": 1.0}},
     )
     child = _graph_conv(
-        "conv_child",
-        root="conv_parent",
-        parent="conv_parent",
+        "ff5cac23d0beb79fad914046049f32ff",
+        root="ead6d59a6b650d19dbdf61ec32426f4e",
+        parent="ead6d59a6b650d19dbdf61ec32426f4e",
         cost=2.5,
         tokens={"input_tokens": 400, "output_tokens": 80},
         by_model={"model-a": {"input_tokens": 400, "output_tokens": 80, "total_cost_usd": 2.5}},
     )
     conv_store = _ConversationStore(
         [_message_item("item_1", "hi")],
-        conversations={"conv_parent": parent, "conv_child": child},
+        conversations={
+            "ead6d59a6b650d19dbdf61ec32426f4e": parent,
+            "ff5cac23d0beb79fad914046049f32ff": child,
+        },
     )
 
-    snapshot = await _get_session_snapshot(conv_store, "conv_parent")  # type: ignore[arg-type]
+    snapshot = await _get_session_snapshot(conv_store, "ead6d59a6b650d19dbdf61ec32426f4e")  # type: ignore[arg-type]
 
     # The per-model buckets must be parent + child summed.
     assert snapshot.usage_by_model is not None
@@ -1513,13 +1546,18 @@ async def test_session_snapshot_usage_by_model_none_when_unrecorded() -> None:
     ``None`` (no row rendered) rather than an empty dict — an empty dict
     would imply models were tracked but none contributed.
     """
-    solo = _graph_conv("conv_solo", root="conv_solo", parent=None, cost=None)
+    solo = _graph_conv(
+        "6d996c055256e5975b8e5683c4d77d47",
+        root="6d996c055256e5975b8e5683c4d77d47",
+        parent=None,
+        cost=None,
+    )
     conv_store = _ConversationStore(
         [_message_item("item_1", "hi")],
-        conversations={"conv_solo": solo},
+        conversations={"6d996c055256e5975b8e5683c4d77d47": solo},
     )
 
-    snapshot = await _get_session_snapshot(conv_store, "conv_solo")  # type: ignore[arg-type]
+    snapshot = await _get_session_snapshot(conv_store, "6d996c055256e5975b8e5683c4d77d47")  # type: ignore[arg-type]
 
     assert snapshot.usage_by_model is None
 
@@ -1534,27 +1572,30 @@ async def test_session_snapshot_usage_by_model_merges_differing_models() -> None
     differently-modeled worker would hide that model's spend.
     """
     parent = _graph_conv(
-        "conv_parent",
-        root="conv_parent",
+        "ead6d59a6b650d19dbdf61ec32426f4e",
+        root="ead6d59a6b650d19dbdf61ec32426f4e",
         parent=None,
         cost=0.10,
         tokens={"input_tokens": 1000},
         by_model={"model-a": {"input_tokens": 1000, "total_cost_usd": 0.10}},
     )
     child = _graph_conv(
-        "conv_child",
-        root="conv_parent",
-        parent="conv_parent",
+        "ff5cac23d0beb79fad914046049f32ff",
+        root="ead6d59a6b650d19dbdf61ec32426f4e",
+        parent="ead6d59a6b650d19dbdf61ec32426f4e",
         cost=0.04,
         tokens={"input_tokens": 150},
         by_model={"model-b": {"input_tokens": 150, "total_cost_usd": 0.04}},
     )
     conv_store = _ConversationStore(
         [_message_item("item_1", "hi")],
-        conversations={"conv_parent": parent, "conv_child": child},
+        conversations={
+            "ead6d59a6b650d19dbdf61ec32426f4e": parent,
+            "ff5cac23d0beb79fad914046049f32ff": child,
+        },
     )
 
-    snapshot = await _get_session_snapshot(conv_store, "conv_parent")  # type: ignore[arg-type]
+    snapshot = await _get_session_snapshot(conv_store, "ead6d59a6b650d19dbdf61ec32426f4e")  # type: ignore[arg-type]
 
     assert snapshot.usage_by_model is not None
     # Both models present (typed ModelUsage), each with its own attributed
@@ -1579,54 +1620,64 @@ def test_publish_subtree_cost_to_ancestors_publishes_each_ancestor_subtree(
     publish to the originating child.
     """
     g = _graph_conv(
-        "conv_g",
-        root="conv_g",
+        "8463f762110b86b1ba33ddf7a8fc1172",
+        root="8463f762110b86b1ba33ddf7a8fc1172",
         parent=None,
         cost=1.0,
         tokens={"input_tokens": 10},
         by_model={"model-a": {"input_tokens": 10, "total_cost_usd": 1.0}},
     )
     p = _graph_conv(
-        "conv_p",
-        root="conv_g",
-        parent="conv_g",
+        "b460374fc8e697b296708f52dc9d8179",
+        root="8463f762110b86b1ba33ddf7a8fc1172",
+        parent="8463f762110b86b1ba33ddf7a8fc1172",
         cost=2.0,
         tokens={"input_tokens": 20},
         by_model={"model-a": {"input_tokens": 20, "total_cost_usd": 2.0}},
     )
     c = _graph_conv(
-        "conv_c",
-        root="conv_g",
-        parent="conv_p",
+        "405bfe154d5c0e795a2b87021bc897bf",
+        root="8463f762110b86b1ba33ddf7a8fc1172",
+        parent="b460374fc8e697b296708f52dc9d8179",
         cost=4.0,
         tokens={"input_tokens": 40},
         by_model={"model-a": {"input_tokens": 40, "total_cost_usd": 4.0}},
     )
     conv_store = _ConversationStore(
         [],
-        conversations={"conv_g": g, "conv_p": p, "conv_c": c},
+        conversations={
+            "8463f762110b86b1ba33ddf7a8fc1172": g,
+            "b460374fc8e697b296708f52dc9d8179": p,
+            "405bfe154d5c0e795a2b87021bc897bf": c,
+        },
     )
     recorder = _UsageStreamRecorder()
     monkeypatch.setattr(_sessions_mod, "session_stream", recorder)
 
-    _publish_subtree_cost_to_ancestors(conv_store, "conv_c")  # type: ignore[arg-type]
+    _publish_subtree_cost_to_ancestors(conv_store, "405bfe154d5c0e795a2b87021bc897bf")  # type: ignore[arg-type]
 
     by_conv = {pub.conversation_id: pub.event for pub in recorder.published}
     # Only the two ancestors are re-published — never the originating child.
     # A "conv_c" entry would mean the helper republished the node that already
     # got its own session.usage event (double broadcast); a missing ancestor
     # would mean the parent-to-root walk stopped early.
-    assert set(by_conv) == {"conv_p", "conv_g"}
+    assert set(by_conv) == {"b460374fc8e697b296708f52dc9d8179", "8463f762110b86b1ba33ddf7a8fc1172"}
     # parent subtree = parent $2 + child $4. A wrong value means the walk
     # summed the wrong subtree (parent-only, or the whole tree w/ grandparent).
-    assert by_conv["conv_p"]["total_cost_usd"] == 6.0
+    assert by_conv["b460374fc8e697b296708f52dc9d8179"]["total_cost_usd"] == 6.0
     # grandparent subtree = $1 + $2 + $4 (itself + both descendants).
-    assert by_conv["conv_g"]["total_cost_usd"] == 7.0
+    assert by_conv["8463f762110b86b1ba33ddf7a8fc1172"]["total_cost_usd"] == 7.0
     # The per-model breakdown rolls up the same subtree alongside the cost.
-    assert by_conv["conv_p"]["usage_by_model"]["model-a"]["input_tokens"] == 60
-    assert by_conv["conv_g"]["usage_by_model"]["model-a"]["input_tokens"] == 70
+    assert (
+        by_conv["b460374fc8e697b296708f52dc9d8179"]["usage_by_model"]["model-a"]["input_tokens"]
+        == 60
+    )
+    assert (
+        by_conv["8463f762110b86b1ba33ddf7a8fc1172"]["usage_by_model"]["model-a"]["input_tokens"]
+        == 70
+    )
     # The payload is a session.usage broadcast the web client renders as the badge.
-    assert by_conv["conv_p"]["type"] == "session.usage"
+    assert by_conv["b460374fc8e697b296708f52dc9d8179"]["type"] == "session.usage"
 
 
 # ── _truncate_label ──────────────────────────────────────────────────────────
@@ -1679,9 +1730,11 @@ async def test_persist_error_labels_truncates_long_message() -> None:
     long_message = "Runner MCP execute failed: " + "x" * 300
     error = ErrorDetail(code="mcp_error", message=long_message)
 
-    await _persist_session_status_error_labels("conv_123", error, _MockStore())  # type: ignore[arg-type]
+    await _persist_session_status_error_labels(
+        "0099dc8be6d82871e2e450424d46d1b7", error, _MockStore()
+    )  # type: ignore[arg-type]
 
-    stored = captured["conv_123"]["omnigent.last_task_error_message"]
+    stored = captured["0099dc8be6d82871e2e450424d46d1b7"]["omnigent.last_task_error_message"]
     assert len(stored) <= _LABEL_VALUE_MAX_LEN
     # The diagnostic prefix survives so the reload-visible reason is still useful.
     assert stored.startswith("Runner MCP execute failed: ")
@@ -1700,7 +1753,15 @@ async def test_persist_error_labels_short_message_stored_verbatim() -> None:
 
     error = ErrorDetail(code="runner_error", message="Process exited with code 1")
 
-    await _persist_session_status_error_labels("conv_456", error, _MockStore())  # type: ignore[arg-type]
+    await _persist_session_status_error_labels(
+        "d6e1678fb446a1cf5a892e0df60aaba3", error, _MockStore()
+    )  # type: ignore[arg-type]
 
-    assert captured["conv_456"]["omnigent.last_task_error_message"] == "Process exited with code 1"
-    assert captured["conv_456"]["omnigent.last_task_error_code"] == "runner_error"
+    assert (
+        captured["d6e1678fb446a1cf5a892e0df60aaba3"]["omnigent.last_task_error_message"]
+        == "Process exited with code 1"
+    )
+    assert (
+        captured["d6e1678fb446a1cf5a892e0df60aaba3"]["omnigent.last_task_error_code"]
+        == "runner_error"
+    )

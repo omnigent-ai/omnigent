@@ -37,19 +37,113 @@ from omnigent.db.compression import CompressedText
 _CKSUM32 = LargeBinary(32).with_variant(MySQLBinary(32), "mysql")
 
 
+# Hex length of a bare uuid4 id, the canonical Python-side form.
+_UUID_HEX_LEN = 32
+
+# Prefixes ids carried before they became bare 32-char hex. ``uuid_to_bytes``
+# strips exactly these (so old URLs/clients keep resolving) and nothing else —
+# an unknown prefix fails loud rather than silently storing a wrong-typed id's
+# hex tail (e.g. a ``resp_``/``runner_token_`` value mis-passed to a uuid column).
+_LEGACY_ID_PREFIXES = frozenset(
+    {
+        "ag",
+        "conv",
+        "host",
+        "pol",
+        "file",
+        "cmt",
+        # conversation-item per-type prefixes
+        "msg",
+        "fc",
+        "fco",
+        "err",
+        "rs",
+        "cmp",
+        "nt",
+        "rse",
+        "sc",
+        "tc",
+        "rd",
+        # runner-internal conversation binding
+        "agy_conv",
+    }
+)
+
+
+class InvalidUuidError(ValueError):
+    """An id string could not be normalised to a 32-char hex uuid.
+
+    Subclasses ``ValueError`` so existing ``except ValueError`` sites keep
+    working. Surfaced (wrapped in ``sqlalchemy.exc.StatementError``) when a
+    malformed id reaches a ``Uuid16`` column bind; the server maps it to a 404
+    so a bad id in a URL is not-found rather than a 500.
+    """
+
+
+def uuid_to_bytes(value: str | uuid.UUID) -> bytes:
+    """Normalise an id to the 16 raw bytes stored in a ``Uuid16`` column.
+
+    Accepts, reducing them all to the same 16 bytes: a :class:`uuid.UUID`
+    object; the bare 32-char hex form (what generators emit); the dashed
+    canonical uuid (``str(uuid4())``); and a legacy id carrying one of the
+    known :data:`_LEGACY_ID_PREFIXES` (``conv_<hex>``, ``ag_<hex>``, …) — so
+    old bookmarked URLs, pasted ids, and pre-migration clients keep resolving.
+    Anything else — a truncated id, non-hex text, an unknown prefix — fails
+    loud rather than silently storing the wrong bytes.
+
+    :param value: A ``uuid.UUID``, or a 32-char hex uuid optionally dashed or
+        legacy-prefixed.
+    :returns: The 16-byte big-endian value.
+    :raises InvalidUuidError: If *value* is not a 32-char hex uuid.
+    """
+    if isinstance(value, uuid.UUID):
+        return value.bytes
+    normalized = value.replace("-", "")
+    if "_" in normalized:
+        prefix, _, tail = normalized.rpartition("_")
+        if prefix in _LEGACY_ID_PREFIXES and len(tail) == _UUID_HEX_LEN:
+            normalized = tail
+    if len(normalized) != _UUID_HEX_LEN:
+        raise InvalidUuidError(f"expected a 32-char hex uuid, got {value!r}")
+    try:
+        return bytes.fromhex(normalized)
+    except ValueError as exc:
+        raise InvalidUuidError(f"invalid hex uuid: {value!r}") from exc
+
+
+def normalize_uuid(value: str | None) -> str | None:
+    """Return the bare 32-char hex form of *value*, or *value* unchanged.
+
+    The forgiving companion to :func:`uuid_to_bytes` for **Python-side** id
+    comparisons (e.g. a store's scope check against an ORM attribute, which
+    always reads back bare hex). A legacy-prefixed or dashed input normalises
+    to bare hex; a malformed input is returned as-is so the comparison simply
+    mismatches — preserving the pre-migration "unknown id = not found"
+    behaviour instead of raising. ``None`` passes through.
+
+    :param value: Any caller-supplied id string, or ``None``.
+    :returns: The bare 32-char hex form, or *value* verbatim if not a uuid.
+    """
+    if value is None:
+        return None
+    try:
+        return uuid_to_bytes(value).hex()
+    except InvalidUuidError:
+        return value
+
+
 class Uuid16(TypeDecorator[str]):
-    """A UUID primary key stored as 16 raw bytes.
+    """A uuid stored as 16 raw bytes, presented to Python as bare 32-char hex.
 
-    Python-side values are bare 32-char hex strings (e.g.
-    ``"a1b2c3d4..."``, no dashes — matching the schema-wide UUID
-    convention); the database stores the 16-byte form —
-    ``BINARY(16)`` on MySQL (fixed-length and fully indexable, the same
-    reasoning as :data:`_CKSUM32`) and ``BLOB`` / ``BYTEA`` elsewhere.
-    Halves the storage of a 32-char hex string and indexes tighter.
-
-    ``process_bind_param`` accepts either a canonical/hex string or a
-    :class:`uuid.UUID`; ``process_result_value`` always returns the
-    bare 32-char hex string (``.hex``, no dashes).
+    Our ids are opaque 128-bit uuid4s stored as raw bytes — ``BYTEA``
+    (PostgreSQL), ``BLOB`` (SQLite / D1), fixed-length ``BINARY(16)`` (MySQL,
+    where a BLOB is not indexable without a key-prefix length). The rest of
+    the system keeps the readable bare 32-char hex form (entities, JSON
+    blobs, URLs, the FTS mirror), so this type converts at the column
+    boundary and nothing else has to change. Binds accept bare, dashed, or
+    legacy-prefixed uuids; results always come back as bare lowercase hex.
+    Result values guard the same driver variance ``CompressedText`` does:
+    ``bytes``, ``memoryview`` (some drivers), or ``str`` (already hex).
     """
 
     impl = LargeBinary(16)
@@ -60,15 +154,19 @@ class Uuid16(TypeDecorator[str]):
             return dialect.type_descriptor(MySQLBinary(16))
         return dialect.type_descriptor(LargeBinary(16))
 
-    def process_bind_param(self, value: str | uuid.UUID | None, dialect: Any) -> bytes | None:  # noqa: ARG002
+    def process_bind_param(self, value: str | uuid.UUID | None, _dialect: object) -> bytes | None:
         if value is None:
             return None
-        return (value if isinstance(value, uuid.UUID) else uuid.UUID(value)).bytes
+        return uuid_to_bytes(value)
 
-    def process_result_value(self, value: bytes | None, dialect: Any) -> str | None:  # noqa: ARG002
+    def process_result_value(
+        self, value: bytes | memoryview | str | None, _dialect: object
+    ) -> str | None:
         if value is None:
             return None
-        return uuid.UUID(bytes=bytes(value)).hex
+        if isinstance(value, str):
+            return value
+        return bytes(value).hex()
 
 
 class OmnigentBase(DeclarativeBase):
@@ -179,7 +277,7 @@ class SqlAgent(OmnigentBase):
         server_default="0",
         default=current_workspace_id,
     )
-    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
     created_at: Mapped[int] = mapped_column(Integer)
     name: Mapped[str] = mapped_column(String(256))
     bundle_location: Mapped[str] = mapped_column(String(512))
@@ -231,12 +329,12 @@ class SqlFile(OmnigentBase):
         server_default="0",
         default=current_workspace_id,
     )
-    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
     created_at: Mapped[int] = mapped_column(Integer)
     filename: Mapped[str] = mapped_column(String(512))
     bytes: Mapped[int] = mapped_column(Integer)
     content_type: Mapped[str | None] = mapped_column(String(256), nullable=True)
-    session_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    session_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
 
     __table_args__ = (
         Index("ix_files_created_at", "workspace_id", "created_at", "id"),
@@ -389,7 +487,7 @@ class SqlSessionPermission(OmnigentBase):
         primary_key=True,
     )
     conversation_id: Mapped[str] = mapped_column(
-        String(64),
+        Uuid16(),
         primary_key=True,
     )
     level: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -426,12 +524,12 @@ class SqlConversationMetadata(OmnigentBase):
         server_default="0",
         default=current_workspace_id,
     )
-    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
     # Enum stored as a stable int code (CONVERSATION_KIND: default=1, sub_agent=2).
     kind: Mapped[int] = mapped_column(SmallInteger, default=1)
     runner_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # No FK: host records are managed outside this table.
-    host_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    host_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
     sub_agent_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
     external_session_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     session_state: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
@@ -485,8 +583,8 @@ class SqlAgentConfiguration(ConversationBase):
         server_default="0",
         default=current_workspace_id,
     )
-    conversation_id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    agent_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    conversation_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    agent_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
     # Per-session reasoning-effort hint, e.g. "high". Nullable;
     # None means use the agent default.
     reasoning_effort: Mapped[str | None] = mapped_column(String(32), nullable=True)
@@ -548,16 +646,16 @@ class SqlConversation(ConversationBase):
         server_default="0",
         default=current_workspace_id,
     )
-    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
     created_at: Mapped[int] = mapped_column(Integer)
     updated_at: Mapped[int] = mapped_column(Integer)
     title: Mapped[str] = mapped_column(String(768), nullable=False, server_default="")
     parent_conversation_id: Mapped[str | None] = mapped_column(
-        String(64),
+        Uuid16(),
         nullable=True,
     )
     root_conversation_id: Mapped[str] = mapped_column(
-        String(64),
+        Uuid16(),
         nullable=False,
     )
     # Monotonic allocator for the next item position in this conversation.
@@ -646,10 +744,10 @@ class SqlConversationItem(ConversationBase):
     # conversation_id leads id in the PK so a conversation's items stay
     # contiguous for the per-conversation prefix scans that dominate reads.
     conversation_id: Mapped[str] = mapped_column(
-        String(64),
+        Uuid16(),
         primary_key=True,
     )
-    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
     response_id: Mapped[str] = mapped_column(String(64))
     created_at: Mapped[int] = mapped_column(Integer)
     # Enum stored as a stable int code (see omnigent.db.enum_codecs
@@ -749,7 +847,7 @@ class SqlConversationLabel(ConversationBase):
         default=current_workspace_id,
     )
     conversation_id: Mapped[str] = mapped_column(
-        String(64),
+        Uuid16(),
         primary_key=True,
     )
     key: Mapped[str] = mapped_column(String(128), primary_key=True)
@@ -803,8 +901,8 @@ class SqlComment(OmnigentBase):
         server_default="0",
         default=current_workspace_id,
     )
-    id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    conversation_id: Mapped[str] = mapped_column(String(64))
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    conversation_id: Mapped[str] = mapped_column(Uuid16())
     path: Mapped[str] = mapped_column(String(4096))
     start_index: Mapped[int] = mapped_column(Integer)
     end_index: Mapped[int] = mapped_column(Integer)
@@ -908,7 +1006,7 @@ class SqlPolicy(OmnigentBase):
         server_default="0",
         default=current_workspace_id,
     )
-    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
     name: Mapped[str] = mapped_column(String(256))
     # sha256(name) — the value the name-uniqueness indexes key on instead of
     # the wide name column. Stamped from `name` on INSERT via the column
@@ -916,7 +1014,7 @@ class SqlPolicy(OmnigentBase):
     name_cksum: Mapped[bytes] = mapped_column(_CKSUM32, default=_default_policy_name_cksum)
     # Nullable: NULL for server-wide default policies.
     session_id: Mapped[str | None] = mapped_column(
-        String(64),
+        Uuid16(),
         nullable=True,
     )
     created_at: Mapped[int] = mapped_column(Integer)
@@ -1023,7 +1121,7 @@ class SqlHost(OmnigentBase):
         server_default="0",
         default=current_workspace_id,
     )
-    host_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    host_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
     owner: Mapped[str] = mapped_column(String(256), nullable=False)
     name: Mapped[str] = mapped_column(String(64), nullable=False)
     # Enum stored as a stable int code (see omnigent.db.enum_codecs
@@ -1190,7 +1288,7 @@ class SqlScheduledTask(OmnigentBase):
     # written into) and every other user-identity column in this schema.
     owner_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     # Relates to agents.id. No DB foreign key (Rule R032); cascade is app-owned.
-    agent_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    agent_id: Mapped[str] = mapped_column(Uuid16, nullable=False)
     # Per-task overrides — None means fall back to the agent default. Widths
     # mirror the matching conversations.* override columns.
     model_override: Mapped[str | None] = mapped_column(String(128), nullable=True)
@@ -1211,7 +1309,7 @@ class SqlScheduledTask(OmnigentBase):
     # freshest online host, whichever". Always None for managed_sandbox (the
     # sandbox is provisioned/adopted under a deterministic id at fire time, so
     # there is nothing to pin here).
-    host_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    host_id: Mapped[str | None] = mapped_column(Uuid16, nullable=True)
     timezone: Mapped[str] = mapped_column(String(64), nullable=False, server_default="UTC")
     # Enum stored as a stable int code (see omnigent.db.enum_codecs
     # SCHEDULED_TASK_STATE: active=1, paused=2, deleted=3). The
@@ -1220,7 +1318,7 @@ class SqlScheduledTask(OmnigentBase):
     last_run_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # Relates to conversations.id. No DB foreign key (Rule R032); the
     # application nulls this out when the referenced conversation is deleted.
-    last_run_conversation_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    last_run_conversation_id: Mapped[str | None] = mapped_column(Uuid16, nullable=True)
     created_at: Mapped[int] = mapped_column(Integer)
     updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
@@ -1282,7 +1380,7 @@ class SqlScheduledTaskRun(OmnigentBase):
     # app-owned.
     scheduled_task_id: Mapped[str] = mapped_column(Uuid16, nullable=False)
     # Relates to conversations.id. No DB foreign key; app nulls on delete.
-    conversation_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    conversation_id: Mapped[str | None] = mapped_column(Uuid16, nullable=True)
     # Enum stored as a stable int code (see omnigent.db.enum_codecs
     # SCHEDULED_TASK_RUN_STATUS: scheduled=1, running=2, succeeded=3, failed=4,
     # skipped=5). The store converts to/from the string name at the

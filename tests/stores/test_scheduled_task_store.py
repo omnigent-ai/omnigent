@@ -47,28 +47,28 @@ def test_create_returns_scheduled_task_with_all_fields(
         prompt="Triage the inbox",
         cron_expression="0 9 * * *",
         owner_user_id="alice@example.com",
-        agent_id="ag_abc",
+        agent_id=_uid("ag_abc"),
         timezone="America/Los_Angeles",
         model_override="claude-opus-4-7",
         reasoning_effort="high",
         workspace="/home/alice/repo",
         base_branch="main",
         execution_target="connected_host",
-        host_id="host_abc123",
+        host_id=_uid("host_abc123"),
     )
     assert task.id == _uid("st_1")
     assert task.name == "nightly triage"
     assert task.prompt == "Triage the inbox"
     assert task.cron_expression == "0 9 * * *"
     assert task.owner_user_id == "alice@example.com"
-    assert task.agent_id == "ag_abc"
+    assert task.agent_id == _uid("ag_abc")
     assert task.timezone == "America/Los_Angeles"
     assert task.model_override == "claude-opus-4-7"
     assert task.reasoning_effort == "high"
     assert task.workspace == "/home/alice/repo"
     assert task.base_branch == "main"
     assert task.execution_target == "connected_host"
-    assert task.host_id == "host_abc123"
+    assert task.host_id == _uid("host_abc123")
     assert task.state == "active"
     assert task.last_run_at is None
     assert task.last_run_conversation_id is None
@@ -84,7 +84,7 @@ def test_create_minimal_defaults(store: SqlAlchemyScheduledTaskStore) -> None:
         prompt="do a thing",
         cron_expression="* * * * *",
         owner_user_id="bob@example.com",
-        agent_id="ag_min",
+        agent_id=_uid("ag_min"),
         timezone="UTC",
     )
     assert task.model_override is None
@@ -111,7 +111,7 @@ def test_state_round_trips_as_string(store: SqlAlchemyScheduledTaskStore) -> Non
             prompt="p",
             cron_expression="* * * * *",
             owner_user_id="u",
-            agent_id="ag",
+            agent_id=_uid("ag"),
             timezone="UTC",
             state=name,
         )
@@ -128,7 +128,7 @@ def test_create_rejects_invalid_state(store: SqlAlchemyScheduledTaskStore) -> No
             prompt="p",
             cron_expression="* * * * *",
             owner_user_id="u",
-            agent_id="ag",
+            agent_id=_uid("ag"),
             timezone="UTC",
             state="bogus",
         )
@@ -150,7 +150,7 @@ def test_execution_target_round_trips_as_string(store: SqlAlchemyScheduledTaskSt
             prompt="p",
             cron_expression="* * * * *",
             owner_user_id="u",
-            agent_id="ag",
+            agent_id=_uid("ag"),
             timezone="UTC",
             execution_target=name,
         )
@@ -167,7 +167,7 @@ def test_create_rejects_invalid_execution_target(store: SqlAlchemyScheduledTaskS
             prompt="p",
             cron_expression="* * * * *",
             owner_user_id="u",
-            agent_id="ag",
+            agent_id=_uid("ag"),
             timezone="UTC",
             execution_target="bogus",
         )
@@ -183,15 +183,15 @@ def test_update_execution_target_and_host_id_read_back(
         prompt="p",
         cron_expression="* * * * *",
         owner_user_id="u",
-        agent_id="ag",
+        agent_id=_uid("ag"),
         timezone="UTC",
     )
     updated = store.update(
-        _uid("st_upd_target"), execution_target="managed_sandbox", host_id="host_xyz"
+        _uid("st_upd_target"), execution_target="managed_sandbox", host_id=_uid("host_xyz")
     )
     assert updated is not None
     assert updated.execution_target == "managed_sandbox"
-    assert updated.host_id == "host_xyz"
+    assert updated.host_id == _uid("host_xyz")
 
 
 def test_update_state_reads_back(store: SqlAlchemyScheduledTaskStore) -> None:
@@ -202,7 +202,7 @@ def test_update_state_reads_back(store: SqlAlchemyScheduledTaskStore) -> None:
         prompt="p",
         cron_expression="* * * * *",
         owner_user_id="u",
-        agent_id="ag",
+        agent_id=_uid("ag"),
         timezone="UTC",
     )
     updated = store.update(_uid("st_upd_state"), state="paused")
@@ -221,7 +221,7 @@ def test_create_recurring_task(store: SqlAlchemyScheduledTaskStore) -> None:
         prompt="p",
         cron_expression="0 9 * * *",
         owner_user_id="u",
-        agent_id="ag",
+        agent_id=_uid("ag"),
         timezone="UTC",
     )
     assert task.cron_expression == "0 9 * * *"
@@ -235,7 +235,7 @@ def test_update_changes_cron_expression(store: SqlAlchemyScheduledTaskStore) -> 
         prompt="p",
         cron_expression="0 9 * * *",
         owner_user_id="u",
-        agent_id="ag",
+        agent_id=_uid("ag"),
         timezone="UTC",
     )
     updated = store.update(_uid("st_recron"), cron_expression="0 0 * * *")
@@ -251,7 +251,7 @@ def test_get_returns_created_task(store: SqlAlchemyScheduledTaskStore) -> None:
         prompt="p",
         cron_expression="* * * * *",
         owner_user_id="u",
-        agent_id="ag_1",
+        agent_id=_uid("ag_1"),
         timezone="UTC",
     )
     fetched = store.get(_uid("st_get"))
@@ -283,7 +283,7 @@ def test_list_orders_by_created_at_then_id(store: SqlAlchemyScheduledTaskStore) 
         prompt="p",
         cron_expression="* * * * *",
         owner_user_id="u",
-        agent_id="ag",
+        agent_id=_uid("ag"),
         timezone="UTC",
     )
     store.create(
@@ -292,7 +292,7 @@ def test_list_orders_by_created_at_then_id(store: SqlAlchemyScheduledTaskStore) 
         prompt="p",
         cron_expression="* * * * *",
         owner_user_id="u",
-        agent_id="ag",
+        agent_id=_uid("ag"),
         timezone="UTC",
     )
     ids = [r.id for r in store.list()]
@@ -307,7 +307,7 @@ def test_list_active_excludes_non_active(store: SqlAlchemyScheduledTaskStore) ->
         prompt="p",
         cron_expression="* * * * *",
         owner_user_id="u",
-        agent_id="ag",
+        agent_id=_uid("ag"),
         timezone="UTC",
         state="active",
     )
@@ -318,7 +318,7 @@ def test_list_active_excludes_non_active(store: SqlAlchemyScheduledTaskStore) ->
             prompt="p",
             cron_expression="* * * * *",
             owner_user_id="u",
-            agent_id="ag",
+            agent_id=_uid("ag"),
             timezone="UTC",
             state=other_state,
         )
@@ -337,7 +337,7 @@ def test_update_changes_fields_and_stamps_updated_at(store: SqlAlchemyScheduledT
         prompt="p",
         cron_expression="* * * * *",
         owner_user_id="u",
-        agent_id="ag",
+        agent_id=_uid("ag"),
         timezone="UTC",
     )
     updated = store.update(
@@ -347,7 +347,7 @@ def test_update_changes_fields_and_stamps_updated_at(store: SqlAlchemyScheduledT
         base_branch="develop",
         state="paused",
         last_run_at=1700000000,
-        last_run_conversation_id="conv_x",
+        last_run_conversation_id=_uid("conv_x"),
     )
     assert updated is not None
     assert updated.name == "after"
@@ -355,7 +355,7 @@ def test_update_changes_fields_and_stamps_updated_at(store: SqlAlchemyScheduledT
     assert updated.base_branch == "develop"
     assert updated.state == "paused"
     assert updated.last_run_at == 1700000000
-    assert updated.last_run_conversation_id == "conv_x"
+    assert updated.last_run_conversation_id == _uid("conv_x")
     assert updated.updated_at is not None
 
 
@@ -367,7 +367,7 @@ def test_update_noop_leaves_updated_at_none(store: SqlAlchemyScheduledTaskStore)
         prompt="p",
         cron_expression="* * * * *",
         owner_user_id="u",
-        agent_id="ag",
+        agent_id=_uid("ag"),
         timezone="UTC",
     )
     result = store.update(_uid("st_noop"), name="n")  # same value
@@ -391,7 +391,7 @@ def test_delete_removes_task(store: SqlAlchemyScheduledTaskStore) -> None:
         prompt="p",
         cron_expression="* * * * *",
         owner_user_id="u",
-        agent_id="ag",
+        agent_id=_uid("ag"),
         timezone="UTC",
     )
     assert store.delete(_uid("st_del")) is True
@@ -414,7 +414,7 @@ def test_create_run_and_list_runs(store: SqlAlchemyScheduledTaskStore) -> None:
         prompt="p",
         cron_expression="* * * * *",
         owner_user_id="u",
-        agent_id="ag",
+        agent_id=_uid("ag"),
         timezone="UTC",
     )
     store.create_run(
@@ -422,7 +422,7 @@ def test_create_run_and_list_runs(store: SqlAlchemyScheduledTaskStore) -> None:
         scheduled_task_id=_uid("st_runs"),
         status="succeeded",
         scheduled_at=100,
-        conversation_id="conv_1",
+        conversation_id=_uid("conv_1"),
         fired_at=101,
         finished_at=102,
     )
@@ -440,7 +440,7 @@ def test_create_run_and_list_runs(store: SqlAlchemyScheduledTaskStore) -> None:
     assert runs[0].error == "boom"
     assert runs[0].error_code == "rate_limited"
     assert runs[1].error_code is None
-    assert runs[1].conversation_id == "conv_1"
+    assert runs[1].conversation_id == _uid("conv_1")
     assert runs[1].fired_at == 101
     assert runs[1].finished_at == 102
 
@@ -454,7 +454,7 @@ def test_list_runs_scoped_to_task(store: SqlAlchemyScheduledTaskStore) -> None:
             prompt="p",
             cron_expression="* * * * *",
             owner_user_id="u",
-            agent_id="ag",
+            agent_id=_uid("ag"),
             timezone="UTC",
         )
     store.create_run(
@@ -484,7 +484,7 @@ def test_run_status_round_trips_as_string(store: SqlAlchemyScheduledTaskStore) -
         prompt="p",
         cron_expression="* * * * *",
         owner_user_id="u",
-        agent_id="ag",
+        agent_id=_uid("ag"),
         timezone="UTC",
     )
     for i, name in enumerate(("scheduled", "running", "succeeded", "failed", "skipped")):
@@ -506,7 +506,7 @@ def test_create_run_rejects_invalid_status_name(store: SqlAlchemyScheduledTaskSt
         prompt="p",
         cron_expression="* * * * *",
         owner_user_id="u",
-        agent_id="ag",
+        agent_id=_uid("ag"),
         timezone="UTC",
     )
     with pytest.raises(ValueError, match=r"scheduled_task_runs\.status"):
@@ -529,10 +529,10 @@ def test_update_host_id_can_be_cleared_to_null(store: SqlAlchemyScheduledTaskSto
         prompt="p",
         cron_expression="* * * * *",
         owner_user_id="u",
-        agent_id="ag",
+        agent_id=_uid("ag"),
         timezone="UTC",
         execution_target="connected_host",
-        host_id="host_abc",
+        host_id=_uid("host_abc"),
     )
     updated = store.update(_uid("st_clear_host"), execution_target="managed_sandbox", host_id=None)
     assert updated is not None
@@ -553,10 +553,10 @@ def test_update_last_run_conversation_id_can_be_cleared_to_null(
         prompt="p",
         cron_expression="* * * * *",
         owner_user_id="u",
-        agent_id="ag",
+        agent_id=_uid("ag"),
         timezone="UTC",
     )
-    store.update(_uid("st_clear_conv"), last_run_conversation_id="conv_abc")
+    store.update(_uid("st_clear_conv"), last_run_conversation_id=_uid("conv_abc"))
     updated = store.update(_uid("st_clear_conv"), last_run_conversation_id=None)
     assert updated is not None
     assert updated.last_run_conversation_id is None
@@ -575,16 +575,16 @@ def test_update_omitting_nullable_param_leaves_field_unchanged(
         prompt="p",
         cron_expression="* * * * *",
         owner_user_id="u",
-        agent_id="ag",
+        agent_id=_uid("ag"),
         timezone="UTC",
-        host_id="host_keep",
+        host_id=_uid("host_keep"),
     )
-    store.update(_uid("st_omit"), last_run_conversation_id="conv_keep")
+    store.update(_uid("st_omit"), last_run_conversation_id=_uid("conv_keep"))
     # Update name only — host_id and last_run_conversation_id must be untouched.
     updated = store.update(_uid("st_omit"), name="new_name")
     assert updated is not None
-    assert updated.host_id == "host_keep"
-    assert updated.last_run_conversation_id == "conv_keep"
+    assert updated.host_id == _uid("host_keep")
+    assert updated.last_run_conversation_id == _uid("conv_keep")
 
 
 def test_update_clearing_already_null_field_is_noop_for_updated_at(
@@ -597,7 +597,7 @@ def test_update_clearing_already_null_field_is_noop_for_updated_at(
         prompt="p",
         cron_expression="* * * * *",
         owner_user_id="u",
-        agent_id="ag",
+        agent_id=_uid("ag"),
         timezone="UTC",
     )
     # host_id starts NULL; passing None should be a no-op (no updated_at).
@@ -617,7 +617,7 @@ def test_delete_also_removes_associated_runs(store: SqlAlchemyScheduledTaskStore
         prompt="p",
         cron_expression="* * * * *",
         owner_user_id="u",
-        agent_id="ag",
+        agent_id=_uid("ag"),
         timezone="UTC",
     )
     store.create_run(
@@ -646,7 +646,7 @@ def test_delete_does_not_remove_other_tasks_runs(store: SqlAlchemyScheduledTaskS
             prompt="p",
             cron_expression="* * * * *",
             owner_user_id="u",
-            agent_id="ag",
+            agent_id=_uid("ag"),
             timezone="UTC",
         )
         store.create_run(

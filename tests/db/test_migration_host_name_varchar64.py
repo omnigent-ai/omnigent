@@ -59,7 +59,8 @@ def test_downgrade_restores_varchar256(tmp_path: Path) -> None:
             sa.text(
                 "INSERT INTO hosts "
                 "(workspace_id, owner, name, host_id, status, created_at, updated_at) "
-                "VALUES (0, 'user@example.com', 'my-laptop', 'host_abc123', 1, "
+                "VALUES (0, 'user@example.com', 'my-laptop',"
+                " '4f64b6ee625f4e8259185c35c6e63f3d', 1, "
                 "1700000000, 1700000001)"
             )
         )

@@ -90,7 +90,7 @@ async def test_get_session(
 
 async def test_get_session_not_found(client: httpx.AsyncClient) -> None:
     """Getting a nonexistent session returns 404."""
-    resp = await client.get("/v1/sessions/conv_nonexistent_12345")
+    resp = await client.get("/v1/sessions/4fe12335002377c209e501c3fe3bcffc")
     assert resp.status_code == 404
 
 
@@ -110,7 +110,7 @@ async def test_delete_session(
 
 async def test_delete_session_not_found(client: httpx.AsyncClient) -> None:
     """Deleting a nonexistent session returns 404."""
-    resp = await client.delete("/v1/sessions/conv_nonexistent_12345")
+    resp = await client.delete("/v1/sessions/4fe12335002377c209e501c3fe3bcffc")
     assert resp.status_code == 404
 
 
@@ -166,7 +166,7 @@ async def test_patch_session_title(
 async def test_patch_session_not_found(client: httpx.AsyncClient) -> None:
     """Patching a nonexistent session returns 404."""
     resp = await client.patch(
-        "/v1/sessions/conv_nonexistent_12345",
+        "/v1/sessions/4fe12335002377c209e501c3fe3bcffc",
         json={"title": "New Title"},
         headers={"Content-Type": "application/json"},
     )
