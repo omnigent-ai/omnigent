@@ -3,9 +3,11 @@
 import base64
 import json
 
+import httpx
 import pytest
 
 from omnigent.llms.adapters.anthropic import (
+    AnthropicAdapter,
     _anthropic_to_chat,
     _chat_to_anthropic,
     _convert_tool_choice,
@@ -374,6 +376,66 @@ def test_reasoning_effort_adds_thinking_to_payload() -> None:
     payload = _chat_to_anthropic(messages, "claude-test", None, {"reasoning_effort": "high"})
     assert payload["thinking"]["type"] == "enabled"
     assert payload["thinking"]["budget_tokens"] == 8192
+
+
+def test_explicit_thinking_configuration_takes_precedence() -> None:
+    """Provider-native thinking settings bypass reasoning-effort translation."""
+    messages = [{"role": "user", "content": "Hi"}]
+    payload = _chat_to_anthropic(
+        messages,
+        "MiniMax-M3",
+        None,
+        {"thinking": {"type": "adaptive"}, "reasoning_effort": "high"},
+    )
+    assert payload["thinking"] == {"type": "adaptive"}
+
+
+@pytest.mark.parametrize(
+    "api_base_url",
+    [
+        "https://api.minimax.io/anthropic",
+        "https://api.minimaxi.com/anthropic",
+    ],
+)
+@pytest.mark.asyncio
+async def test_minimax_anthropic_base_url_derives_messages_path(
+    monkeypatch: pytest.MonkeyPatch,
+    api_base_url: str,
+) -> None:
+    """The public MiniMax base URL resolves to ``/anthropic/v1/messages``."""
+    requested_urls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested_urls.append(str(request.url))
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg-test",
+                "model": "MiniMax-M3",
+                "content": [{"type": "text", "text": "ok"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+        )
+
+    real_async_client = httpx.AsyncClient
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(
+        "omnigent.llms.adapters.anthropic.httpx.AsyncClient",
+        lambda **kwargs: real_async_client(transport=transport, **kwargs),
+    )
+
+    adapter = AnthropicAdapter()
+    await adapter.chat_completions(
+        messages=[{"role": "user", "content": "Hello"}],
+        model="MiniMax-M3",
+        tools=None,
+        stream=False,
+        extra={"thinking": {"type": "adaptive"}},
+        connection_params={"api_key": "test-key", "base_url": api_base_url},
+    )
+
+    assert requested_urls == [f"{api_base_url}/v1/messages"]
 
 
 # ── Stop sequences ───────────────────────────────────────

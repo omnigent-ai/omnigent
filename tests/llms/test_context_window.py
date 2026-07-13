@@ -362,6 +362,10 @@ def test_provider_catalog_caches_fetch_failure(
 
 def test_registry_context_window_normalizes_id() -> None:
     """The registry strips provider prefixes and ``:tag`` suffixes before matching."""
+    assert _registry_context_window("MiniMax-M3") == 1_000_000
+    assert _registry_context_window("minimax/MiniMax-M3") == 1_000_000
+    assert _registry_context_window("anthropic/MiniMax-M3") == 1_000_000
+    assert _registry_context_window("minimax/MiniMax-M2.7") == 204_800
     assert _registry_context_window("qwen3-coder-plus") == 1_048_576
     assert _registry_context_window("qwen/qwen3-coder") == 262_144
     assert _registry_context_window("qwen3-coder:free") == 262_144
@@ -408,5 +412,8 @@ def test_get_model_context_window_uses_registry_first(monkeypatch: pytest.Monkey
     assert get_model_context_window("anthropic/claude-opus-4-8[1m]") == 1_000_000
     # Qwen: curated window, not the default.
     assert get_model_context_window("qwen3-coder-plus") == 1_048_576
+    # MiniMax: both current model ids resolve without catalog access.
+    assert get_model_context_window("minimax/MiniMax-M3") == 1_000_000
+    assert get_model_context_window("minimax/MiniMax-M2.7") == 204_800
     # A model the registry doesn't own still falls back to the conservative default.
     assert get_model_context_window("qwen-nonexistent-xyz") == 128_000

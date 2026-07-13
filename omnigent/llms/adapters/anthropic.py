@@ -21,6 +21,10 @@ from omnigent.llms.adapters.base import BaseAdapter
 from omnigent.reasoning_effort import ANTHROPIC_EFFORTS, validate_effort_or_llm_error
 
 _BASE_URL = "https://api.anthropic.com/v1"
+_MINIMAX_BASE_URLS = {
+    "https://api.minimax.io/anthropic",
+    "https://api.minimaxi.com/anthropic",
+}
 _API_VERSION = "2023-06-01"
 _DEFAULT_MAX_TOKENS = 16384
 _REQUEST_TIMEOUT = 120
@@ -66,8 +70,7 @@ class AnthropicAdapter(BaseAdapter):
         headers = _build_headers(
             api_key_override=params.get("api_key"),
         )
-        override_base = params.get("base_url")
-        effective_base = override_base.rstrip("/") if override_base else _BASE_URL
+        effective_base = _resolve_base_url(params.get("base_url"))
 
         if stream:
             payload["stream"] = True
@@ -156,8 +159,11 @@ def _chat_to_anthropic(
     if tool_choice := extra.pop("tool_choice", None):
         payload["tool_choice"] = _convert_tool_choice(tool_choice)
 
-    # Reasoning effort (for Claude extended thinking)
-    if reasoning_effort := extra.pop("reasoning_effort", None):
+    # Explicit provider-native thinking configuration takes precedence over
+    # the generic reasoning-effort translation.
+    if thinking := extra.pop("thinking", None):
+        payload["thinking"] = thinking
+    elif reasoning_effort := extra.pop("reasoning_effort", None):
         effort = validate_effort_or_llm_error(reasoning_effort, "Anthropic", ANTHROPIC_EFFORTS)
         if effort is not None:
             payload["thinking"] = {
@@ -568,6 +574,22 @@ def _make_chunk(
 
 
 # ── HTTP helpers ──────────────────────────────────────────
+
+
+def _resolve_base_url(override: str | None) -> str:
+    """Resolve an Anthropic-compatible base URL for the Messages endpoint.
+
+    MiniMax publishes a base URL ending in ``/anthropic`` while its Messages
+    endpoint lives under ``/anthropic/v1/messages``. Keep the public base URL
+    unchanged and derive the version segment inside the adapter.
+
+    :param override: Per-call base URL override, or ``None``.
+    :returns: Base URL to which ``/messages`` can be appended.
+    """
+    effective_base = override.rstrip("/") if override else _BASE_URL
+    if effective_base in _MINIMAX_BASE_URLS:
+        return f"{effective_base}/v1"
+    return effective_base
 
 
 def _build_headers(

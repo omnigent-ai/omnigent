@@ -67,9 +67,13 @@ _DEFAULT_CONTEXT_WINDOW: int = 128_000
 # Covered today:
 #  - Qwen models (absent from litellm + the MLflow catalog) — published Alibaba
 #    Cloud Model Studio / DashScope maxima.
+#  - MiniMax models whose catalog entries are absent or report input and output
+#    limits separately from the published total context window.
 #  - Anthropic 1M-context beta ids (the ``[1m]`` suffix) — handled by a rule in
 #    :func:`_registry_context_window` rather than enumerated per base model.
 _CONTEXT_WINDOW_REGISTRY: dict[str, int] = {
+    "minimax-m3": 1_000_000,
+    "minimax-m2.7": 204_800,
     "qwen3-coder-plus": 1_048_576,  # DashScope coding-plan default: 1M tokens
     "qwen3-coder-flash": 1_048_576,  # served flash variant: 1M tokens
     "qwen3-coder": 262_144,  # 480B open weights: 256K native (1M w/ YaRN)

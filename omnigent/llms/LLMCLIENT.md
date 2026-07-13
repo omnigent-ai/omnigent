@@ -216,8 +216,50 @@ Chat Completions IS the native format. Minimal translation (add model to payload
 | `xai` | `https://api.x.ai/v1` | `XAI_API_KEY` |
 | `openrouter` | `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` |
 | `ollama` | `http://localhost:11434/v1` | (none) |
+| `minimax` | `https://api.minimax.io/v1` | (none) |
 
 HTTP via sync `httpx` (already a project dependency).
+
+#### MiniMax
+
+The `minimax` provider supports `MiniMax-M3` with a 1,000,000-token context
+window and `MiniMax-M2.7` with a 204,800-token context window. The OpenAI
+compatible global endpoint is the default. Use `connection_params["base_url"]`
+for another region or use the `anthropic` model prefix with an Anthropic base
+URL to select the Messages protocol:
+
+| Region | Protocol | Model prefix | Base URL |
+|--------|----------|--------------|----------|
+| Global | OpenAI compatible | `minimax/` | `https://api.minimax.io/v1` |
+| China | OpenAI compatible | `minimax/` | `https://api.minimaxi.com/v1` |
+| Global | Anthropic compatible | `anthropic/` | `https://api.minimax.io/anthropic` |
+| China | Anthropic compatible | `anthropic/` | `https://api.minimaxi.com/anthropic` |
+
+```python
+from omnigent.llms import Client
+
+client = Client()
+
+response = await client.responses.create(
+    input=[{"role": "user", "content": "Hello"}],
+    model="minimax/MiniMax-M3",
+    connection_params={"api_key": "..."},
+    thinking={"type": "disabled"},
+)
+
+response = await client.responses.create(
+    input=[{"role": "user", "content": "Hello"}],
+    model="anthropic/MiniMax-M3",
+    connection_params={
+        "api_key": "...",
+        "base_url": "https://api.minimax.io/anthropic",
+    },
+    thinking={"type": "adaptive"},
+)
+```
+
+The Anthropic base URLs intentionally end in `/anthropic`. The adapter derives
+the `/v1/messages` request path internally.
 
 ### Anthropic — `adapters/anthropic.py`
 

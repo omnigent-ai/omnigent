@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
+from omnigent.llms.adapters import _create_adapter
 from omnigent.llms.adapters.openai import (
     OpenAIAdapter,
     OpenAICompatibleAdapter,
@@ -98,6 +99,63 @@ def test_base_url_trailing_slash_stripped() -> None:
         api_key_env=None,
     )
     assert adapter._base_url == "https://api.openai.com/v1"
+
+
+@pytest.mark.parametrize(
+    ("api_base_url", "expected_url"),
+    [
+        (None, "https://api.minimax.io/v1/chat/completions"),
+        ("https://api.minimaxi.com/v1", "https://api.minimaxi.com/v1/chat/completions"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_minimax_openai_endpoints_use_default_and_override(
+    monkeypatch: pytest.MonkeyPatch,
+    api_base_url: str | None,
+    expected_url: str,
+) -> None:
+    """MiniMax uses the global default and accepts the China base URL override."""
+    requested_urls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested_urls.append(str(request.url))
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl-test",
+                "model": "MiniMax-M3",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            },
+        )
+
+    real_async_client = httpx.AsyncClient
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(
+        "omnigent.llms.adapters.openai.httpx.AsyncClient",
+        lambda **kwargs: real_async_client(transport=transport, **kwargs),
+    )
+    adapter = _create_adapter("minimax")
+    connection_params = {"api_key": "test-key"}
+    if api_base_url is not None:
+        connection_params["base_url"] = api_base_url
+
+    await adapter.chat_completions(
+        messages=[{"role": "user", "content": "Hello"}],
+        model="MiniMax-M3",
+        tools=None,
+        stream=False,
+        extra={},
+        connection_params=connection_params,
+    )
+
+    assert requested_urls == [expected_url]
 
 
 # ── Headers ──────────────────────────────────────────────
