@@ -1160,7 +1160,7 @@ class SqlScheduledTask(Base):
     # mirror the matching conversations.* override columns.
     model_override: Mapped[str | None] = mapped_column(String(128), nullable=True)
     reasoning_effort: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    workspace: Mapped[str | None] = mapped_column(Text, nullable=True)
+    workspace: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     # Git base ref a firing branches from when it creates a worktree at fire
     # time (mirrors session-create's git.base_branch input). None when unset.
     base_branch: Mapped[str | None] = mapped_column(String(255), nullable=True)

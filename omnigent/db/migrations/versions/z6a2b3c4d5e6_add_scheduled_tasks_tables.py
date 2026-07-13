@@ -51,7 +51,7 @@ def upgrade() -> None:
         sa.Column("agent_id", sa.String(64), nullable=False),
         sa.Column("model_override", sa.String(128), nullable=True),
         sa.Column("reasoning_effort", sa.String(32), nullable=True),
-        sa.Column("workspace", sa.Text(), nullable=True),
+        sa.Column("workspace", sa.String(2048), nullable=True),
         # Git base ref a firing branches from when it creates a worktree.
         sa.Column("base_branch", sa.String(255), nullable=True),
         sa.Column("timezone", sa.String(64), nullable=False, server_default="UTC"),
