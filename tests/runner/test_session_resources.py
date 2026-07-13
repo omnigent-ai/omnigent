@@ -132,6 +132,7 @@ class _CapturingResourceRegistry:
         self.launches: list[TerminalEnvSpec] = []
         self.parent_os_envs: list[Any | None] = []
         self.resource_roles: list[str | None] = []
+        self.launch_lifecycles: list[str] = []
 
     def set_terminal_activity_publisher(
         self,
@@ -163,6 +164,18 @@ class _CapturingResourceRegistry:
         """
         self._session_status_publisher = publisher
 
+    def set_terminal_exit_publisher(
+        self,
+        publisher: Callable[[Any], None],
+    ) -> None:
+        """
+        Accept the terminal-exit publisher installed by the runner app.
+
+        :param publisher: Callable receiving a terminal-exit event.
+        :returns: None.
+        """
+        self._terminal_exit_publisher = publisher
+
     def compute_default_env_root(self, session_id: str, agent_spec: Any) -> str | None:
         """Return the runner workspace as the default cwd, or None.
 
@@ -172,13 +185,62 @@ class _CapturingResourceRegistry:
         """
         return str(self._runner_workspace) if self._runner_workspace is not None else None
 
-    async def launch_terminal(
+    async def launch_required_terminal(
         self,
         session_id: str,
         terminal_name: str,
         session_key: str,
         spec: TerminalEnvSpec,
+        cwd_override: str | None = None,
+        sandbox_override: str | None = None,
+        parent_os_env: Any | None = None,
+        resource_role: str | None = None,
+    ) -> SessionResourceView:
+        """Capture a required terminal launch."""
+        return await self._launch(
+            "required",
+            session_id=session_id,
+            terminal_name=terminal_name,
+            session_key=session_key,
+            spec=spec,
+            cwd_override=cwd_override,
+            sandbox_override=sandbox_override,
+            parent_os_env=parent_os_env,
+            resource_role=resource_role,
+        )
+
+    async def launch_auxiliary_terminal(
+        self,
+        session_id: str,
+        terminal_name: str,
+        session_key: str,
+        spec: TerminalEnvSpec,
+        cwd_override: str | None = None,
+        sandbox_override: str | None = None,
+        parent_os_env: Any | None = None,
+        resource_role: str | None = None,
+    ) -> SessionResourceView:
+        """Capture an auxiliary terminal launch."""
+        return await self._launch(
+            "auxiliary",
+            session_id=session_id,
+            terminal_name=terminal_name,
+            session_key=session_key,
+            spec=spec,
+            cwd_override=cwd_override,
+            sandbox_override=sandbox_override,
+            parent_os_env=parent_os_env,
+            resource_role=resource_role,
+        )
+
+    async def _launch(
+        self,
+        lifecycle: str,
         *,
+        session_id: str,
+        terminal_name: str,
+        session_key: str,
+        spec: TerminalEnvSpec,
         cwd_override: str | None = None,
         sandbox_override: str | None = None,
         parent_os_env: Any | None = None,
@@ -187,6 +249,7 @@ class _CapturingResourceRegistry:
         """
         Capture the launch spec and return a terminal resource view.
 
+        :param lifecycle: ``"required"`` or ``"auxiliary"``.
         :param session_id: Session/conversation identifier.
         :param terminal_name: Terminal name from the request.
         :param session_key: Per-launch terminal key.
@@ -203,6 +266,7 @@ class _CapturingResourceRegistry:
         """
         assert cwd_override is None
         assert sandbox_override is None
+        self.launch_lifecycles.append(lifecycle)
         self.launches.append(spec)
         self.parent_os_envs.append(parent_os_env)
         self.resource_roles.append(resource_role)
@@ -1110,6 +1174,85 @@ async def test_create_terminal_uses_declared_terminal_spec_over_body(
 
 
 @pytest.mark.asyncio
+async def test_create_terminal_resolves_declared_placeholder_cwd_to_workspace(
+    tmp_path: Path,
+) -> None:
+    """A UI-created shell whose declared spec has a placeholder cwd
+    (``.``) launches in the session workspace, not the runner's
+    process cwd (the dir ``omni host`` ran in).
+
+    The declared-terminal branch previously passed ``cwd: .`` through
+    unresolved, so ``create_terminal_instance`` fell back to
+    ``Path(".").resolve()`` — the host launch dir. The resolved
+    workspace must be baked into the launched spec (never via
+    ``cwd_override``, which the stub asserts stays ``None``).
+    """
+    from omnigent.inner.datamodel import (
+        AgentDef,
+        OSEnvSandboxSpec,
+        OSEnvSpec,
+        TerminalEnvSpec,
+    )
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    # Declared shell owns its os_env with the placeholder cwd — the
+    # real ``examples/polly`` ``shell`` terminal shape.
+    declared_shell = TerminalEnvSpec(
+        command="bash",
+        os_env=OSEnvSpec(
+            type="caller_process",
+            cwd=".",
+            sandbox=OSEnvSandboxSpec(type="none"),
+        ),
+    )
+    agent = AgentDef(
+        name="polly-like",
+        os_env=OSEnvSpec(
+            type="caller_process",
+            cwd=".",
+            sandbox=OSEnvSandboxSpec(type="none"),
+        ),
+        terminals={"shell": declared_shell},
+    )
+
+    async def _session_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"id": "conv_test", "agent_id": "agent_polly"})
+
+    async def _resolver(agent_id: str, session_id: str) -> AgentDef:
+        return agent
+
+    server_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_session_handler),
+        base_url="http://server",
+    )
+    resource_registry = _CapturingResourceRegistry(tmp_path, runner_workspace=workspace)
+    app = create_runner_app(
+        resource_registry=resource_registry,
+        server_client=server_client,
+        spec_resolver=_resolver,
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with (
+        server_client,
+        httpx.AsyncClient(transport=transport, base_url="http://runner") as c,
+    ):
+        resp = await c.post(
+            "/v1/sessions/conv_test/resources/terminals",
+            json={"terminal": "shell", "session_key": "u-abc123"},
+        )
+
+    assert resp.status_code == 200
+    launch = resource_registry.launches[0]
+    # Placeholder resolved to the workspace, not "." (the process cwd).
+    assert isinstance(launch.os_env, OSEnvSpec)
+    assert launch.os_env.cwd == str(workspace)
+    # The original declared spec is untouched (shared across launches).
+    assert isinstance(declared_shell.os_env, OSEnvSpec)
+    assert declared_shell.os_env.cwd == "."
+
+
+@pytest.mark.asyncio
 async def test_create_terminal_publishes_bridge_tmux_target(
     client: httpx.AsyncClient,
     tmp_path: Path,
@@ -1329,6 +1472,8 @@ class _WatcherCapture:
         or ``None`` if none was wired.
     :param on_idle: The idle-edge callback the registry passed, or
         ``None`` if none was wired.
+    :param on_exit: The exit callback the registry passed, or ``None`` if none
+        was wired.
     :param idle_threshold_s: The per-watcher idle threshold the registry
         passed, or ``None`` for the module default.
     :param poll_interval_s: The per-watcher poll interval the registry
@@ -1338,8 +1483,10 @@ class _WatcherCapture:
     started: bool = False
     on_activity: Callable[[], None] | None = None
     on_idle: Callable[[], None] | None = None
+    on_exit: Callable[[], None] | None = None
     idle_threshold_s: float | None = None
     poll_interval_s: float | None = None
+    replace: bool = False
 
 
 def _make_capturing_instance(
@@ -1370,14 +1517,18 @@ def _make_capturing_instance(
         on_idle: Callable[[], None] | None = None,
         *,
         on_activity: Callable[[], None] | None = None,
+        on_exit: Callable[[], None] | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
+        replace: bool = False,
     ) -> None:
         capture.started = True
         capture.on_idle = on_idle
         capture.on_activity = on_activity
+        capture.on_exit = on_exit
         capture.idle_threshold_s = idle_threshold_s
         capture.poll_interval_s = poll_interval_s
+        capture.replace = replace
 
     # Instance attribute shadows the bound method, so the registry's call
     # lands on the recorder (no real daemon thread / tmux poll).
@@ -1388,7 +1539,7 @@ def _make_capturing_instance(
 class _LaunchReturningRegistry:
     """Terminal-registry stub whose ``launch`` returns a fixed instance.
 
-    The real :meth:`SessionResourceRegistry.launch_terminal` only calls
+    The real terminal launch helpers only call
     ``launch`` on its terminal registry; returning a prepared instance
     lets the test exercise the real ``_start_terminal_activity_watcher``
     wiring without spawning a terminal.
@@ -1474,7 +1625,7 @@ async def test_claude_native_terminal_drives_session_status_from_pane_activity(
         lambda sid, status: status_edges.append(_StatusEdge(session_id=sid, status=status))
     )
 
-    await registry.launch_terminal(
+    await registry.launch_required_terminal(
         session_id="conv_x",
         terminal_name="claude",
         session_key="main",
@@ -1537,7 +1688,7 @@ async def test_generic_terminal_does_not_drive_session_status(
         lambda sid, status: status_edges.append(_StatusEdge(session_id=sid, status=status))
     )
 
-    await registry.launch_terminal(
+    await registry.launch_auxiliary_terminal(
         session_id="conv_y",
         terminal_name="zsh",
         session_key="s1",
@@ -1601,7 +1752,7 @@ async def test_terminal_activity_pulses_throttled_to_one_per_second(
     # the status publisher must be installed to exercise on_idle.
     registry.set_session_status_publisher(lambda _sid, _status: None)
 
-    await registry.launch_terminal(
+    await registry.launch_required_terminal(
         session_id="conv_throttle",
         terminal_name="claude",
         session_key="main",

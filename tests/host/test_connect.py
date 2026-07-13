@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import subprocess
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -22,6 +23,8 @@ from omnigent.host.connect import (
 )
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    HostCreateDirFrame,
+    HostCreateDirResultFrame,
     HostHelloFrame,
     HostLaunchRunnerFrame,
     HostLaunchRunnerResultFrame,
@@ -222,6 +225,45 @@ async def test_handle_launch_refuses_unconfigured_harness(
     assert host._runners == {}
 
 
+async def test_handle_launch_native_cursor_message_points_at_cursor_installer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A native-Cursor refusal must name the ``cursor-agent`` installer and
+    login, not ``omnigent setup`` — which only configures the SDK ``cursor``
+    harness and never installs the ``cursor-agent`` CLI ``omni cursor`` boots.
+
+    Here ``harness_setup_hint`` is the real function (only the readiness check
+    is forced False), so this exercises the connect.py → hint wiring end to end.
+    """
+    host = _make_host_process()
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    monkeypatch.setattr(
+        "omnigent.host.connect.harness_is_configured",
+        lambda harness: False,
+    )
+
+    frame = HostLaunchRunnerFrame(
+        request_id="req_cursor_native",
+        binding_token="token_abc",
+        workspace=str(workspace),
+        harness="cursor-native",
+    )
+    result = await host._handle_launch(frame)
+
+    assert result.status == "failed"
+    assert result.error_code == HARNESS_NOT_CONFIGURED_ERROR_CODE
+    message = result.error or ""
+    assert "'cursor-native'" in message
+    assert "test-laptop" in message
+    assert "cursor.com/install" in message
+    assert "cursor-agent login" in message
+    assert "omnigent setup" not in message
+    assert host._runners == {}
+
+
 async def test_handle_launch_configured_harness_proceeds_to_spawn(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -355,6 +397,7 @@ async def test_handle_launch_prints_exact_runner_log_path(
         request_id="req_log",
         binding_token="tok_log",
         workspace=str(workspace),
+        session_id="conv_log",
     )
 
     original_popen = subprocess.Popen
@@ -376,14 +419,15 @@ async def test_handle_launch_prints_exact_runner_log_path(
         result = await host._handle_launch(frame)
 
     assert result.status == "launched", result.error
-    # Exactly one runner-*.log was created under the host-runner dir.
-    runner_log_dir = tmp_path / ".omnigent" / "logs" / "host-runner"
+    # Exactly one runner-*.log was created under the runner log dir.
+    runner_log_dir = tmp_path / ".omnigent" / "logs" / "runner"
     log_files = list(runner_log_dir.glob("runner-*.log"))
     assert len(log_files) == 1
     out = capsys.readouterr().out
     assert "↑ Runner started:" in out
     # The exact file path is printed, home-collapsed to ``~`` for readability.
-    assert f"log: ~/.omnigent/logs/host-runner/{log_files[0].name}" in out
+    assert f"log: ~/.omnigent/logs/runner/{log_files[0].name}" in out
+    assert "session: conv_log" in out
 
     _cleanup_host(host)
 
@@ -471,7 +515,7 @@ async def test_handle_launch_immediate_exit_reports_exit_code_and_log_tail(
     # The exit code identifies the failure class without log-reading.
     assert "code 7" in error
     # The log path lets the user fetch the full log on the host.
-    assert "~/.omnigent/logs/host-runner/runner-" in error
+    assert "~/.omnigent/logs/runner/runner-" in error
     # The tail carries the actual cause — the whole point of the report.
     assert "RuntimeError: boom-traceback" in error
 
@@ -630,6 +674,28 @@ async def test_unreported_exit_flushes_after_reconnect(
     assert host._unreported_exits == {}
 
 
+async def test_hello_advertises_installed_version() -> None:
+    """The ``host.hello`` frame reports the omnigent version, not a placeholder.
+
+    A hard-coded placeholder would make every host look like the same
+    stale build in the server's version popover. The hello must carry the
+    shared resolved version this host is actually running.
+    """
+    from omnigent.version import VERSION
+
+    host = _make_host_process()
+    tunnel = _FakeTunnel()
+
+    with pytest.raises(ConnectionError, match="test disconnect"):
+        await host._serve_frames(tunnel)  # type: ignore[arg-type] — duck-typed ws
+
+    hello = decode_host_frame(tunnel.sent[0])
+    assert isinstance(hello, HostHelloFrame)
+    assert hello.version == VERSION
+    # Guard against the old hard-coded literal creeping back.
+    assert hello.version != "0.1.0"
+
+
 def test_handle_stop_terminates_process(tmp_path: Path) -> None:
     """
     Verify that _handle_stop terminates a tracked runner and
@@ -744,6 +810,157 @@ def test_cleanup_runners_terminates_all(tmp_path: Path) -> None:
         assert proc.poll() is not None, f"Runner pid={proc.pid} should be dead after cleanup"
     # Tracking dict should be empty.
     assert host._runners == {}
+
+
+def test_reap_orphans_reaps_orphaned_children(tmp_path: Path) -> None:
+    """Regression for #1782: orphaned children are reaped, not leaked.
+
+    In production the leak is a harness tool subprocess (node/chromium/tmux)
+    whose runner parent died: it is orphaned and reparented to the host
+    (PID 1 in a container, or a subreaper). Once reparented it is a *direct*
+    child of the host that nothing ``wait()``s — so it lingers as a
+    ``<defunct>`` zombie forever. This test models that end state directly by
+    forking a child the host does not track and never waits: ``os.fork`` is
+    portable (no ``PR_SET_CHILD_SUBREAPER``, which macOS lacks), and a
+    reparented orphan is indistinguishable from a plain unwaited child to the
+    reaper. ``_reap_orphans_once`` must drain it.
+    """
+    import errno
+    import os
+
+    host = _make_host_process()
+
+    # Fork a bare child (NOT a tracked runner, NOT wrapped in Popen) that
+    # exits immediately — the faithful model of an orphan reparented to us.
+    pid = os.fork()
+    if pid == 0:  # pragma: no cover — child leg never returns to pytest
+        os._exit(0)
+
+    # Let it exit and become a zombie parented to this process.
+    deadline = time.monotonic() + 5.0
+    reaped_total = 0
+    while time.monotonic() < deadline:
+        reaped_total += host._reap_orphans_once()
+        if reaped_total >= 1:
+            break
+        time.sleep(0.05)
+
+    assert reaped_total >= 1, "orphaned child was not reaped (zombie leak — #1782)"
+    # It is truly reaped: a direct waitpid now raises ECHILD (no such child).
+    with pytest.raises(OSError) as exc_info:
+        os.waitpid(pid, 0)
+    assert exc_info.value.errno == errno.ECHILD
+    # A second sweep with no orphans left is a clean no-op.
+    assert host._reap_orphans_once() == 0
+
+
+def test_reap_orphans_never_steals_tracked_runner_exit_code(tmp_path: Path) -> None:
+    """The reaper must not consume a tracked runner's exit status (#1782).
+
+    A naive ``waitpid(-1)`` reaper would reap a just-exited tracked runner
+    behind ``Popen``'s back, making ``_watch_runner``'s ``poll()`` report a
+    bogus exit 0 for a crash. ``_reap_orphans_once`` peeks with ``WNOWAIT``
+    and skips tracked pids, so the runner's real exit code survives for the
+    ``host.runner_exited`` report.
+    """
+    host = _make_host_process()
+
+    # A tracked runner that exits non-zero (a "crash").
+    runner = subprocess.Popen(["python3", "-c", "import sys; sys.exit(42)"])
+    host._runners["runner_crash"] = _RunnerHandle(
+        proc=runner, log_path=tmp_path / "runner-crash.log"
+    )
+    # Wait until the OS reports it as exited (zombie), WITHOUT Popen.wait().
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and runner.poll() is None:
+        # poll() would itself reap; instead peek via the reaper repeatedly.
+        host._reap_orphans_once()
+        time.sleep(0.05)
+
+    # The reaper ran while the crashed runner was reapable; it must NOT have
+    # stolen it. Popen must still see the true exit code.
+    assert runner.poll() == 42, "reaper corrupted the tracked runner's exit code"
+
+    runner.wait()
+
+
+def test_reaper_does_not_steal_host_owned_subprocess_exit_code(tmp_path: Path) -> None:
+    """The reaper must not reap a host-owned subprocess's child (#1782).
+
+    Regression for the Polly-flagged race: the host also spawns *direct*
+    children that are not tracked runners — the ``git`` commands in
+    :mod:`omnigent.host.git_worktree`, run via ``subprocess.run`` under
+    ``asyncio.to_thread`` from the worktree handlers. If the 2s reaper sweep
+    fires after such a git child has exited but before ``subprocess``'s own
+    ``wait()`` collects it, a blind reaper would ``waitpid`` it — and CPython
+    then swallows the resulting ``ECHILD`` and reports ``returncode == 0``,
+    silently turning a *failed* ``git worktree`` op into a success.
+
+    ``_host_subprocess_op`` pauses the reaper for exactly that window. Here a
+    ``sh -c 'exit 42'`` stands in for a failing git command: while the op is
+    marked in flight, ``_reap_orphans_once`` must be a no-op and must NOT
+    consume the child, so the owner still reads the true exit code 42.
+    """
+    host = _make_host_process()
+
+    # A host-owned subprocess (git stand-in) that FAILS with a distinctive
+    # code. NOT a tracked runner — indistinguishable from an orphan to a naive
+    # reaper.
+    proc = subprocess.Popen(["sh", "-c", "exit 42"])
+    # Let it exit so it is reapable (the dangerous window subprocess.run has
+    # between the child exiting and its internal wait()).
+    time.sleep(0.3)
+
+    with host._host_subprocess_op():
+        # Every sweep during the op must be a no-op — the reaper is paused.
+        for _ in range(5):
+            assert host._reap_orphans_once() == 0, "reaper ran during a host-owned op"
+            time.sleep(0.02)
+
+    # The owner still collects its child's TRUE exit code — not corrupted to 0.
+    assert proc.poll() == 42, "reaper stole the host-owned subprocess's exit code (#1782)"
+    proc.wait()
+
+
+def test_host_subprocess_op_guard_is_reentrant_and_balanced(tmp_path: Path) -> None:
+    """``_host_subprocess_op`` nests correctly and always rebalances (#1782).
+
+    The reaper resumes only when the counter returns to 0, and the decrement
+    must survive an exception in the guarded body (``finally``), or a raising
+    worktree op would wedge the reaper off permanently.
+    """
+    host = _make_host_process()
+    assert host._owned_subprocess_ops == 0
+
+    with host._host_subprocess_op():
+        assert host._owned_subprocess_ops == 1
+        with host._host_subprocess_op():  # re-entrant
+            assert host._owned_subprocess_ops == 2
+        assert host._owned_subprocess_ops == 1
+    assert host._owned_subprocess_ops == 0
+
+    # An exception inside the guarded body must still rebalance the counter.
+    with pytest.raises(RuntimeError):
+        with host._host_subprocess_op():
+            assert host._owned_subprocess_ops == 1
+            raise RuntimeError("worktree op blew up")
+    assert host._owned_subprocess_ops == 0, "guard leaked a ref on exception — reaper wedged"
+
+
+def test_install_child_subreaper_is_safe_to_call() -> None:
+    """``_install_child_subreaper`` never raises and reports a bool.
+
+    ``True`` on Linux where ``prctl`` set the bit; ``False`` on non-Linux or
+    when ``prctl`` is unavailable — both are acceptable, non-fatal outcomes.
+    """
+    import sys
+
+    from omnigent.host.connect import _install_child_subreaper
+
+    result = _install_child_subreaper()
+    assert isinstance(result, bool)
+    if sys.platform != "linux":
+        assert result is False
 
 
 def test_host_spawned_runner_has_parent_pid_env(
@@ -1009,11 +1226,19 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
         "LC_CTYPE": "UTF-8",
         "DATABRICKS_CONFIG_PROFILE": "ambient",
         "DATABRICKS_CONFIG_FILE": "/tmp/databrickscfg",
+        "DATABRICKS_AUTH_STORAGE": "plaintext",
         "ANTHROPIC_API_KEY": "sk-harness",
         "IS_SANDBOX": "1",
         "DATABRICKS_TOKEN": "dapi-secret",
         "AWS_SECRET_ACCESS_KEY": "aws-secret",
         "SOME_RANDOM_VAR": "x",
+        "OMNIGENT_CLAUDE_SDK_NO_SANDBOX": "1",
+        "KUBECONFIG": "/home/alice/.kube/config",
+        "CLAUDE_CODE_SKIP_BEDROCK_AUTH": "1",
+        "OMNIGENT_DATABRICKS_EXTRA_HEADERS": '{"x-databricks-route-hint": "instance-abc"}',
+        "OMNIGENT_LOG_LEVEL": "DEBUG",
+        "OMNIGENT_LOG_TO_STDERR": "1",
+        "OMNIGENT_LOG_TTY_FD": "9",
     }
 
     env = _build_runner_env(
@@ -1034,6 +1259,10 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
     # the ambient value reaches the runner unmodified (no flag override).
     assert env["DATABRICKS_CONFIG_PROFILE"] == "ambient"
     assert env["DATABRICKS_CONFIG_FILE"] == "/tmp/databrickscfg"
+    # The token-storage backend selector forwards too — without it the runner
+    # falls back to the ~/.databrickscfg default and can read a different token
+    # store than the host/daemon, failing to mint a token (runner tunnel 401).
+    assert env["DATABRICKS_AUTH_STORAGE"] == "plaintext"
     # Harness credentials forward — they exist FOR the runner's
     # harnesses (laptop: exported keys; managed sandbox: the
     # deployment's injected provider secrets).
@@ -1042,6 +1271,28 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
     # needs it to allow --dangerously-skip-permissions under root in
     # sandbox containers. Only the baked host image ever sets it.
     assert env["IS_SANDBOX"] == "1"
+    # The claude-sdk sandbox bypass flag forwards — it is read inside the
+    # harness, so a bare ``OMNIGENT_CLAUDE_SDK_NO_SANDBOX=1 omnigent run …``
+    # must reach the runner without also forcing
+    # ``OMNIGENT_RUNNER_ENV_PASSTHROUGH=OMNIGENT_CLAUDE_SDK_NO_SANDBOX``.
+    assert env["OMNIGENT_CLAUDE_SDK_NO_SANDBOX"] == "1"
+    # KUBECONFIG is a filesystem path (not a secret) — kubectl, helm, k9s
+    # need it to resolve the user's cluster contexts and namespaces.
+    assert env["KUBECONFIG"] == "/home/alice/.kube/config"
+    # CLAUDE_CODE_SKIP_BEDROCK_AUTH disables AWS SigV4 auth for LiteLLM
+    # proxies — a non-secret boolean, same rationale as CLAUDE_CODE_USE_BEDROCK.
+    assert env["CLAUDE_CODE_SKIP_BEDROCK_AUTH"] == "1"
+    # Opaque request-routing headers forward host→runner so the runner's tunnel
+    # and server callbacks reach the same server instance the host registered on
+    # (without the operator also listing it in OMNIGENT_RUNNER_ENV_PASSTHROUGH).
+    assert (
+        env["OMNIGENT_DATABRICKS_EXTRA_HEADERS"] == '{"x-databricks-route-hint": "instance-abc"}'
+    )
+    # Process logging controls forward so host-spawned runners honor --debug
+    # and --log-to-stderr.
+    assert env["OMNIGENT_LOG_LEVEL"] == "DEBUG"
+    assert env["OMNIGENT_LOG_TO_STDERR"] == "1"
+    assert env["OMNIGENT_LOG_TTY_FD"] == "9"
     # Non-harness secrets are stripped — the point of the allowlist.
     assert "DATABRICKS_TOKEN" not in env
     assert "AWS_SECRET_ACCESS_KEY" not in env
@@ -1069,11 +1320,16 @@ def test_build_runner_env_forwards_harness_credentials_and_endpoints() -> None:
         "HOME": "/root",
         "ANTHROPIC_API_KEY": "sk-a",
         "ANTHROPIC_BASE_URL": "https://gateway.example.com/anthropic",
+        "ANTHROPIC_MODEL": "gateway-served-claude",
         "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat-sub",
         "CODEX_ACCESS_TOKEN": "codex-workspace-token",
         "OPENAI_API_KEY": "sk-o",
         "OPENAI_BASE_URL": "https://gateway.example.com/openai",
         "GEMINI_API_KEY": "g-key",
+        "AWS_BEARER_TOKEN_BEDROCK": "absk-fwd",
+        "ANTHROPIC_BEDROCK_BASE_URL": "https://bedrock-runtime.us-east-1.amazonaws.com",
+        # An unrelated secret must never ride the credential set.
+        "MY_UNRELATED_SECRET": "leak-me-not",
     }
 
     env = _build_runner_env(
@@ -1088,11 +1344,17 @@ def test_build_runner_env_forwards_harness_credentials_and_endpoints() -> None:
     for name in (
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_BASE_URL",
+        # The gateway model pin travels with the key/endpoint — without it a
+        # LiteLLM-style gateway session launches Claude Code model-less and
+        # the gateway rejects Claude Code's own default model.
+        "ANTHROPIC_MODEL",
         "CLAUDE_CODE_OAUTH_TOKEN",
         "CODEX_ACCESS_TOKEN",
         "OPENAI_API_KEY",
         "OPENAI_BASE_URL",
         "GEMINI_API_KEY",
+        "AWS_BEARER_TOKEN_BEDROCK",
+        "ANTHROPIC_BEDROCK_BASE_URL",
     ):
         # Pins each conventional name into the default set — dropping
         # one breaks that harness's credentials on managed sandboxes.
@@ -1102,6 +1364,32 @@ def test_build_runner_env_forwards_harness_credentials_and_endpoints() -> None:
     # but never invented into the env.
     assert "ANTHROPIC_AUTH_TOKEN" in HARNESS_CREDENTIAL_ENV_VARS
     assert "ANTHROPIC_AUTH_TOKEN" not in env
+    # A secret not on the credential set / allowlist is not forwarded.
+    assert "MY_UNRELATED_SECRET" not in env
+
+
+def test_build_runner_env_forwards_omnigent_prefixed_harness_credentials() -> None:
+    """Prefixed harness credential aliases forward without creating raw names."""
+    from omnigent.host.connect import HARNESS_CREDENTIAL_ENV_VARS
+
+    base = {
+        "PATH": "/usr/bin",
+        "HOME": "/root",
+        "OMNIGENT_ANTHROPIC_API_KEY": "sk-prefixed",
+    }
+
+    env = _build_runner_env(
+        base,
+        server_url="http://server",
+        runner_id="runner_abc",
+        binding_token="tok",
+        workspace="/ws",
+        parent_pid=42,
+    )
+
+    assert "OMNIGENT_ANTHROPIC_API_KEY" in HARNESS_CREDENTIAL_ENV_VARS
+    assert env["OMNIGENT_ANTHROPIC_API_KEY"] == "sk-prefixed"
+    assert "ANTHROPIC_API_KEY" not in env
 
 
 def test_build_runner_env_passthrough_extends_forwarded_set() -> None:
@@ -1463,6 +1751,120 @@ def test_handle_list_dir_pagination_last_page_has_more_false(
     assert result.has_more is False
 
 
+# ── host.create_dir handler ─────────────────────────────
+
+
+def test_handle_create_dir_creates_directory(tmp_path: Path) -> None:
+    """
+    Verify ``_handle_create_dir`` makes the directory and returns its
+    absolute path.
+
+    This is the picker's "New folder" happy path — the returned path
+    is what the picker navigates into afterward.
+    """
+    host = _make_host_process()
+    target = tmp_path / "new-app"
+
+    result = host._handle_create_dir(HostCreateDirFrame(request_id="m1", path=str(target)))
+
+    assert isinstance(result, HostCreateDirResultFrame)
+    assert result.status == "ok"
+    assert result.error is None
+    assert result.path == str(target)
+    assert target.is_dir()
+
+
+def test_handle_create_dir_creates_missing_parents(tmp_path: Path) -> None:
+    """
+    Verify missing parent directories are created (``os.makedirs``).
+
+    Lets the picker accept a nested name like ``a/b/c`` in one go
+    rather than forcing the user to create each level.
+    """
+    host = _make_host_process()
+    target = tmp_path / "a" / "b" / "c"
+
+    result = host._handle_create_dir(HostCreateDirFrame(request_id="m2", path=str(target)))
+
+    assert result.status == "ok"
+    assert target.is_dir()
+
+
+def test_handle_create_dir_existing_returns_error_not_failed(tmp_path: Path) -> None:
+    """
+    Verify creating an existing directory returns ``status: "ok"`` with
+    an "already exists" error rather than ``status: "failed"``.
+
+    The route maps a non-empty ``error`` to a 409 so the picker shows
+    "directory already exists" inline; surfacing ``failed`` would 502
+    instead.
+    """
+    host = _make_host_process()
+    existing = tmp_path / "dup"
+    existing.mkdir()
+
+    result = host._handle_create_dir(HostCreateDirFrame(request_id="m3", path=str(existing)))
+
+    assert result.status == "ok"
+    assert result.error == "directory already exists"
+    assert result.path is None
+
+
+def test_handle_create_dir_leaf_is_file_reports_file_not_directory(tmp_path: Path) -> None:
+    """
+    Verify a regular file at the target path reports a file, not a
+    directory.
+
+    ``os.makedirs`` raises ``FileExistsError`` for both an existing
+    directory and an existing file; the handler must distinguish them
+    so the picker doesn't mislabel "a file is in the way" as
+    "directory already exists".
+    """
+    host = _make_host_process()
+    a_file = tmp_path / "taken"
+    a_file.write_text("hi")
+
+    result = host._handle_create_dir(HostCreateDirFrame(request_id="m3b", path=str(a_file)))
+
+    assert result.status == "ok"
+    assert result.error == "a file already exists at that path"
+    assert result.path is None
+
+
+def test_handle_create_dir_parent_is_file_returns_error(tmp_path: Path) -> None:
+    """
+    Verify creating under a path whose parent is a regular file returns
+    a clean error rather than crashing.
+    """
+    host = _make_host_process()
+    a_file = tmp_path / "file.txt"
+    a_file.write_text("hi")
+    target = a_file / "child"
+
+    result = host._handle_create_dir(HostCreateDirFrame(request_id="m4", path=str(target)))
+
+    assert result.status == "ok"
+    assert "not a directory" in (result.error or "")
+    assert result.path is None
+
+
+def test_handle_create_dir_expands_tilde(tmp_path: Path, monkeypatch) -> None:
+    """
+    Verify ``~`` expands against the host process owner's home.
+
+    The host owns ``~`` resolution; without expansion ``~/scratch``
+    would become a literal ``~`` subdir of the process cwd.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    host = _make_host_process()
+    result = host._handle_create_dir(HostCreateDirFrame(request_id="m5", path="~/scratch"))
+
+    assert result.status == "ok"
+    assert (tmp_path / "scratch").is_dir()
+    assert result.path == str(tmp_path / "scratch")
+
+
 # --- Fail-loud on permanent tunnel failures ----------------------------
 #
 # Before the fix, HostProcess.run() caught every connection exception and
@@ -1641,6 +2043,31 @@ def _host(
     """
     identity = HostIdentity(host_id="host_test_connect", name="test-laptop")
     return HostProcess(identity, server_url)
+
+
+def test_build_connect_headers_adds_org_header(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A recorded ?o= selector rides the tunnel handshake.
+
+    The WS upgrade must name the workspace via ``X-Databricks-Org-Id`` or it
+    routes to the account. The header rides alongside the Origin sentinel,
+    independent of the bearer/managed-token branch.
+
+    :param monkeypatch: The pytest monkeypatch fixture.
+    :returns: None.
+    """
+    import omnigent.runner._entry as entry_mod
+
+    # No managed token + no real Databricks creds: isolate the bearer
+    # branch so only the routing header is under test.
+    monkeypatch.delenv("OMNIGENT_HOST_TOKEN", raising=False)
+    monkeypatch.setattr(entry_mod, "_make_auth_token_factory", lambda *, server_url=None: None)
+    monkeypatch.setattr(
+        "omnigent.cli_auth.load_databricks_org_id", lambda _url: "2850744067564480"
+    )
+
+    headers = _host("https://acme.databricks.com/api/2.0/omnigent")._build_connect_headers()
+
+    assert headers["X-Databricks-Org-Id"] == "2850744067564480"
 
 
 async def test_run_retries_on_login_redirect(
@@ -1953,4 +2380,5 @@ def test_run_host_process_announces_session_log_dir_on_start(
     )
 
     out = capsys.readouterr().out
-    assert "Session logs: ~/.omnigent/logs/host-runner/" in out
+    assert "Session logs: ~/.omnigent/logs/runner/" in out
+    assert "This host's log: ~/.omnigent/logs/host/host-" in out

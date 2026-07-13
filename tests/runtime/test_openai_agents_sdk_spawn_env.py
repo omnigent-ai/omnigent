@@ -5,7 +5,7 @@ Tests for ``_build_openai_agents_sdk_spawn_env`` in
 The spawn-env builder maps ``spec.executor`` fields to
 ``HARNESS_OPENAI_AGENTS_*`` env vars that the openai-agents harness
 wrap reads at first-turn time. Mirrors the
-``test_databricks_supervisor_spawn_env.py`` pattern for other harnesses.
+the spawn-env pattern used by the other SDK-style harness tests.
 
 This is a unit test — no subprocess spawn, no real httpx. End-to-end
 verification of the spawn-env → wrap → runtime executor → gateway

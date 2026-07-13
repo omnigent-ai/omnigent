@@ -10,6 +10,14 @@ WebSocket connections at ``/v1/runner/tunnel`` and never spawns
 harness subprocesses on its own. Users run ``omnigent run … --server
 <url>`` on their own machine; that runner dials in.
 
+Importing this module has **no side effects**: configuration loading,
+DB migrations, store construction, and app building all live inside
+``build_app()`` / ``run_migrations()`` / ``main()``. Nothing connects
+to a database, reads config, or builds the app until ``main()`` runs —
+which the ``if __name__ == "__main__":`` block (i.e. the Docker
+``CMD ["python", "/app/entrypoint.py"]``) invokes. This keeps the
+module importable for testing / tooling without a live database.
+
 Configuration is via environment variables:
 
   DATABASE_URL          Required. SQLAlchemy URL. Both PaaS-style URLs
@@ -29,7 +37,14 @@ import logging
 import os
 import sys
 import traceback
+from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from fastapi import FastAPI
+
+    from omnigent.stores.artifact_store import ArtifactStore
 
 logging.basicConfig(level=logging.INFO, stream=sys.stderr, force=True)
 logger = logging.getLogger("omnigent-docker")
@@ -45,16 +60,63 @@ _DEFAULT_HOST = "0.0.0.0"
 _DEFAULT_PORT = "8000"
 _DEFAULT_ARTIFACT_DIR = "/data/artifacts"
 
-try:
-    import uvicorn
+
+@dataclass(frozen=True)
+class _ResolvedConfig:
+    """Configuration resolved before migrations and app construction."""
+
+    cfg: dict[str, Any]
+    database_url: str
+    artifact_dir: Path
+    # When set (an ``s3://bucket[/prefix]`` URI), the artifact store is remote
+    # (S3/R2) and ``artifact_dir`` is only a local scratch dir (cookie secret,
+    # on-disk cache). ``None`` -> the local filesystem store at ``artifact_dir``.
+    artifact_store_uri: str | None
+    host: str
+    port: int
+
+
+@dataclass(frozen=True)
+class _BuiltApp:
+    """The FastAPI app plus resolved bind settings.
+
+    ``_resolve_config`` handles config loading, database URL normalization,
+    artifact directory setup, auth defaults, and HOST/PORT resolution before
+    migrations run. ``main()`` then runs migrations explicitly and calls
+    ``build_app`` to construct the app from that resolved config. Returning
+    HOST/PORT with the app keeps the handoff to ``uvicorn.run`` explicit
+    without requiring a second config-resolution pass.
+    """
+
+    app: FastAPI
+    host: str
+    port: int
+
+
+def run_migrations(database_url: str) -> None:
+    """Run the Alembic upgrade against ``database_url``.
+
+    The SQLAlchemy stores refuse to start on a stale schema, so this
+    runs before any store boots. Creates a throwaway engine, upgrades,
+    and disposes it.
+    """
+    import sqlalchemy
+
+    from omnigent.db.utils import _run_migrations as _run_alembic_upgrade
+
+    migration_engine = sqlalchemy.create_engine(database_url)
+    try:
+        _run_alembic_upgrade(migration_engine, database_url)
+    finally:
+        migration_engine.dispose()
+
+
+def _resolve_config() -> _ResolvedConfig:
+    """Load config and resolve startup settings before migrations run."""
 
     from omnigent.db.utils import normalize_database_url
-    from omnigent.runner.transports.ws_tunnel.limits import (
-        RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
-    )
-    from omnigent.server.app import create_app
     from omnigent.server.paas_env import detect_base_url, resolve_bind_host
-    from omnigent.server.server_config import config_str_list, load_server_config
+    from omnigent.server.server_config import load_server_config
 
     # ── Configuration ────────────────────────────────────────
     # Non-secret settings come from a YAML config file (default
@@ -66,8 +128,8 @@ try:
 
     # DATABASE_URL is env-first (compose/PaaS inject it; it's a secret),
     # with `database_uri:` in the config as a fallback for self-managed DBs.
-    DATABASE_URL = os.environ.get("DATABASE_URL") or cfg.get("database_uri")
-    if not DATABASE_URL:
+    database_url = os.environ.get("DATABASE_URL") or cfg.get("database_uri")
+    if not database_url:
         raise RuntimeError(
             "DATABASE_URL is required (env), or set `database_uri:` in the server config. "
             "Accepted forms: "
@@ -76,26 +138,36 @@ try:
         )
     # Normalize PaaS-style URLs (postgres:// or postgresql://) to the
     # psycopg3 dialect specifier that SQLAlchemy requires.
-    DATABASE_URL = normalize_database_url(DATABASE_URL)
+    database_url = normalize_database_url(database_url)
 
     # App settings are config-first, env fallback, then the built-in default.
-    ARTIFACT_DIR = Path(
+    artifact_dir = Path(
         cfg.get("artifact_location") or os.environ.get("ARTIFACT_DIR") or _DEFAULT_ARTIFACT_DIR
     )
     # resolve_bind_host strips the bracketed IPv6 form some platforms inject
     # ("[::]") and coerces Railway's IPv6 wildcard to IPv4 (its edge is v4-only).
-    HOST = resolve_bind_host(
+    host = resolve_bind_host(
         cfg.get("host") or os.environ.get("HOST"), os.environ, default=_DEFAULT_HOST
     )
-    PORT = int(cfg.get("port") or os.environ.get("PORT") or _DEFAULT_PORT)
-    ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+    port = int(cfg.get("port") or os.environ.get("PORT") or _DEFAULT_PORT)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+
+    # Optional remote artifact store (S3 / Cloudflare R2 / MinIO / …). When set,
+    # the artifact STORE is remote and durable; artifact_dir stays local for the
+    # cookie secret and on-disk cache. Mirrors how DATABASE_URL selects the DB.
+    artifact_store_uri = cfg.get("artifact_store_uri") or os.environ.get("OMNIGENT_ARTIFACT_URI")
+    if artifact_store_uri and not artifact_store_uri.startswith("s3://"):
+        raise RuntimeError(
+            "OMNIGENT_ARTIFACT_URI (or `artifact_store_uri:` in config) must be an "
+            f"'s3://bucket[/prefix]' URI, got: {artifact_store_uri!r}"
+        )
 
     logger.info(
         "Config: HOST=%s PORT=%d DB=%s ARTIFACTS=%s",
-        HOST,
-        PORT,
-        DATABASE_URL.split("@", 1)[-1] if "@" in DATABASE_URL else DATABASE_URL,
-        ARTIFACT_DIR,
+        host,
+        port,
+        database_url.split("@", 1)[-1] if "@" in database_url else database_url,
+        artifact_store_uri or artifact_dir,
     )
 
     # Containerized / remote deploys default to authenticated auth.
@@ -139,29 +211,64 @@ try:
         # ("${VAR:-}"), which setdefault would leave in place — defeating the default.
         if not os.environ.get("OMNIGENT_ACCOUNTS_COOKIE_SECRET"):
             os.environ["OMNIGENT_ACCOUNTS_COOKIE_SECRET"] = load_or_generate_cookie_secret(
-                ARTIFACT_DIR
+                artifact_dir
             )
         if not os.environ.get("OMNIGENT_ACCOUNTS_BASE_URL"):
             # Auto-detect the public URL from the PaaS env (Render / Railway /
             # Fly / HF Spaces) so a 1-click deploy needs zero manual config;
             # falls back to the bind address for local / Docker / EC2.
             os.environ["OMNIGENT_ACCOUNTS_BASE_URL"] = detect_base_url(
-                os.environ, host=HOST, port=PORT
+                os.environ, host=host, port=port
             )
 
-    # ── Migrations ───────────────────────────────────────────
-    # Alembic upgrade runs before the stores boot — the SQLAlchemy
-    # stores refuse to start on a stale schema.
+    return _ResolvedConfig(
+        cfg=cfg,
+        database_url=database_url,
+        artifact_dir=artifact_dir,
+        artifact_store_uri=artifact_store_uri,
+        host=host,
+        port=port,
+    )
 
-    import sqlalchemy
 
-    from omnigent.db.utils import _run_migrations as _run_alembic_upgrade
+def _select_artifact_store(resolved_config: _ResolvedConfig) -> ArtifactStore:
+    """
+    Pick the artifact store implementation from the resolved config.
 
-    _migration_engine = sqlalchemy.create_engine(DATABASE_URL)
-    try:
-        _run_alembic_upgrade(_migration_engine, DATABASE_URL)
-    finally:
-        _migration_engine.dispose()
+    An ``s3://bucket[/prefix]`` ``artifact_store_uri`` selects the remote,
+    durable :class:`~omnigent.stores.artifact_store.s3.S3ArtifactStore` (AWS S3,
+    Cloudflare R2, MinIO, …), which survives an ephemeral or multi-replica
+    deploy. Otherwise the local-filesystem store at ``artifact_dir`` is used.
+    Mirrors how ``DATABASE_URL`` selects the database backend.
+
+    :param resolved_config: The resolved startup configuration.
+    :returns: The selected
+        :class:`~omnigent.stores.artifact_store.ArtifactStore`.
+    """
+    from omnigent.stores.artifact_store.local import LocalArtifactStore
+
+    if resolved_config.artifact_store_uri:
+        from omnigent.stores.artifact_store.s3 import S3ArtifactStore
+
+        return S3ArtifactStore(resolved_config.artifact_store_uri)
+    return LocalArtifactStore(str(resolved_config.artifact_dir))
+
+
+def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
+    """Resolve config if needed, wire the stores, and build the app.
+
+    This function intentionally does not run migrations; ``main()`` runs
+    them explicitly after config resolution and before store construction.
+    """
+    from omnigent.server.app import create_app
+    from omnigent.server.server_config import config_str_list
+
+    if resolved_config is None:
+        resolved_config = _resolve_config()
+
+    cfg = resolved_config.cfg
+    database_url = resolved_config.database_url
+    artifact_dir = resolved_config.artifact_dir
 
     # ── Stores ───────────────────────────────────────────────
 
@@ -171,7 +278,6 @@ try:
     from omnigent.runtime.caps import RuntimeCaps
     from omnigent.server.managed_hosts import parse_sandbox_config
     from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
-    from omnigent.stores.artifact_store.local import LocalArtifactStore
     from omnigent.stores.comment_store.sqlalchemy_store import (
         SqlAlchemyCommentStore,
     )
@@ -186,21 +292,21 @@ try:
 
     telemetry.init()
 
-    agent_store = SqlAlchemyAgentStore(DATABASE_URL)
-    file_store = SqlAlchemyFileStore(DATABASE_URL)
-    conversation_store = SqlAlchemyConversationStore(DATABASE_URL)
-    comment_store = SqlAlchemyCommentStore(DATABASE_URL)
-    permission_store = SqlAlchemyPermissionStore(DATABASE_URL)
-    host_store = HostStore(DATABASE_URL)
+    agent_store = SqlAlchemyAgentStore(database_url)
+    file_store = SqlAlchemyFileStore(database_url)
+    conversation_store = SqlAlchemyConversationStore(database_url)
+    comment_store = SqlAlchemyCommentStore(database_url)
+    permission_store = SqlAlchemyPermissionStore(database_url)
+    host_store = HostStore(database_url)
     # Fail startup loud on a malformed `sandbox:` section (an operator
     # typo should not surface as a runtime 502 on the first managed
     # session); the startup catch-all below logs it.
     sandbox_config = parse_sandbox_config(cfg.get("sandbox"))
-    artifact_store = LocalArtifactStore(str(ARTIFACT_DIR))
+    artifact_store = _select_artifact_store(resolved_config)
 
     agent_cache = AgentCache(
         artifact_store=artifact_store,
-        cache_dir=ARTIFACT_DIR / ".cache",
+        cache_dir=artifact_dir / ".cache",
     )
 
     init_runtime(
@@ -227,7 +333,7 @@ try:
     if isinstance(auth_provider, _UAP) and auth_provider._source == "accounts":
         from omnigent.server.accounts_store import SqlAlchemyAccountStore
 
-        account_store = SqlAlchemyAccountStore(DATABASE_URL)
+        account_store = SqlAlchemyAccountStore(database_url)
 
     app = create_app(
         agent_store=agent_store,
@@ -248,20 +354,49 @@ try:
         sandbox_config=sandbox_config,
     )
 
-    if __name__ == "__main__":
-        logger.info("Starting omnigent server on %s:%d", HOST, PORT)
-        uvicorn.run(
-            app,
-            host=HOST,
-            port=PORT,
-            ws_max_size=RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
+    return _BuiltApp(app=app, host=resolved_config.host, port=resolved_config.port)
+
+
+def main() -> None:
+    """Boot the server: build the app and hand it to uvicorn.
+
+    Wraps the whole boot in the startup catch-all so any failure
+    (config, migrations, store wiring) lands in the container logs and
+    the process holds open briefly for log capture before exiting
+    non-zero — the orchestrator then restarts us.
+    """
+    try:
+        resolved_config = _resolve_config()
+
+        # ── Migrations ───────────────────────────────────────────
+        # Alembic upgrade runs before the stores boot — the SQLAlchemy
+        # stores refuse to start on a stale schema.
+        run_migrations(resolved_config.database_url)
+
+        resolved = build_app(resolved_config)
+
+        import uvicorn
+
+        from omnigent.runner.transports.ws_tunnel.limits import (
+            RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
         )
 
-except Exception:  # noqa: BLE001 — startup catch-all so failures land in logs
-    logger.error("FATAL: omnigent server failed to start:\n%s", traceback.format_exc())
-    # Keep the process alive briefly so the container log capture has time
-    # to flush before the orchestrator restarts us.
-    import time
+        logger.info("Starting omnigent server on %s:%d", resolved.host, resolved.port)
+        uvicorn.run(
+            resolved.app,
+            host=resolved.host,
+            port=resolved.port,
+            ws_max_size=RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
+        )
+    except Exception:  # noqa: BLE001 — startup catch-all so failures land in logs
+        logger.error("FATAL: omnigent server failed to start:\n%s", traceback.format_exc())
+        # Keep the process alive briefly so the container log capture has time
+        # to flush before the orchestrator restarts us.
+        import time  # deferred — keeps module inert
 
-    time.sleep(30)
-    sys.exit(1)
+        time.sleep(30)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

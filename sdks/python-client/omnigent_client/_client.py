@@ -7,6 +7,8 @@ from typing import Any, Literal, overload
 
 import httpx
 
+from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+
 from ._files import FilesNamespace
 from ._query import QueryResult, QueryStream
 from ._responses import ResponsesNamespace
@@ -75,8 +77,17 @@ class OmnigentClient:
             write=30.0,
             pool=30.0,
         )
+        # Announce this as a first-party non-browser client via the sentinel
+        # Origin. The server's require_trusted_origin CSRF guard on the
+        # multipart routes (POST /v1/sessions bundle create, file upload)
+        # requires a trusted Origin; the SDK sends none of its own, so the
+        # sentinel is what lets it through. Caller-supplied headers win on
+        # conflict (so an explicit Origin override is still honored).
+        default_headers = {"Origin": OMNIGENT_INTERNAL_WS_ORIGIN}
+        if headers:
+            default_headers.update(headers)
         self._http = httpx.AsyncClient(
-            headers=headers or {},
+            headers=default_headers,
             auth=auth,
             timeout=sse_timeout,
         )
@@ -221,6 +232,7 @@ class OmnigentClient:
         *,
         filename: str = "agent.tar.gz",
         tool_callables: dict[str, ToolCallable] | None = None,
+        hooks: StreamHooks | None = None,
     ) -> SessionsChat:
         """Create a sessions-API-native chat helper bound to a new session.
 
@@ -239,6 +251,8 @@ class OmnigentClient:
             ``send()`` / ``query()`` / ``stream()`` call), not at
             construction. See :class:`SessionsChat` for the
             validation rules.
+        :param hooks: Optional lifecycle hooks fired from sessions
+            stream events.
         :returns: A :class:`SessionsChat` ready for use.
         :raises OmnigentError: If session creation fails.
         """
@@ -249,6 +263,7 @@ class OmnigentClient:
             files_namespace=self.files,
             tool_callables=tool_callables,
             agent_tools_getter=self._fetch_agent_tools,
+            hooks=hooks,
         )
 
     async def _fetch_agent_tools(

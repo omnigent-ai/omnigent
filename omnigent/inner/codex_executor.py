@@ -14,10 +14,9 @@ import logging
 import os
 import re
 import shutil
-import signal
 import tempfile
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,11 +24,14 @@ from typing import Any, Protocol, TypeAlias
 
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.reasoning_effort import CODEX_EFFORTS, validate_effort
+from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
 from omnigent.spec.types import RetryPolicy
 
+from . import _proc
 from ._subprocess_lifecycle import close_subprocess_transport
 from .databricks_executor import (
     _read_databrickscfg,
+    _read_databrickscfg_host,
 )
 from .datamodel import OSEnvSandboxSpec, OSEnvSpec
 from .executor import (
@@ -38,6 +40,7 @@ from .executor import (
     ExecutorError,
     ExecutorEvent,
     Message,
+    ReasoningChunk,
     TextChunk,
     ToolArgs,
     ToolCallComplete,
@@ -102,28 +105,17 @@ _OPENAI_CODEX_DEFAULT_MODEL = "gpt-5.4-mini"
 # from ~/.databrickscfg credentials with no spec/override model.
 _DATABRICKS_CODEX_DEFAULT_MODEL = "databricks-gpt-5-5"
 
-# Config files from the user's real ``CODEX_HOME`` that the per-conversation
-# temp ``CODEX_HOME`` should see. Symlinked (not copied) so credential
-# refreshes in the real home propagate to running sessions.
-#
-# KNOWN LIMITATION (config.toml is shared across ALL codex sessions):
-# Because ``config.toml`` is symlinked — not copied — every codex-native
-# session's ``<codex-home>/config.toml`` points at the SAME real
-# ``~/.codex/config.toml``. An in-TUI ``/model`` writes that one shared file,
-# so the selection is global, not per-session. The cost-budget policy reads
-# the model from this file (via ``read_codex_config_model`` in the codex
-# hook), which means:
-#   * Session A switching ``/model`` to a cheap model flips the policy's view
-#     for session B too — so a session B still running an EXPENSIVE model can
-#     read the shared cheap value and never get gated (and vice-versa).
-#   * A freshly spawned session reads whatever the last ``/model`` (from any
-#     session) left in the shared file, which may not match its own launch
-#     ``--model``.
-# Acceptable for single-user/local use; a correctness hole under concurrent
-# codex sessions or multi-user deploys. The fix (not yet done) is to COPY
-# config.toml per-session and seed it with that session's launch model, so
-# ``/model`` writes stay isolated. Tracked in the codex-cost-policy design.
-_CODEX_HOME_CONFIG_FILES = ("auth.json", "config.toml")
+# Files symlinked from the real CODEX_HOME into the per-session temp home.
+# Symlinks (not copies) so credential refreshes in the real home propagate
+# to running sessions without any action from Omnigent.
+_CODEX_HOME_SYMLINK_FILES = ("auth.json",)
+
+# Files copied (not symlinked) from the real CODEX_HOME into the per-session
+# temp home. config.toml is intentionally copied so that an in-TUI ``/model``
+# command writes only to the session's own private copy and never touches the
+# shared ``~/.codex/config.toml``. This keeps model selection and cost-policy
+# enforcement isolated between concurrent sessions.
+_CODEX_HOME_COPY_FILES = ("config.toml",)
 
 # Environment variables explicitly excluded from the codex subprocess even
 # when their prefix is in the allowlist. ``OPENAI_API_KEY`` is stripped so
@@ -282,27 +274,11 @@ class _Process(Protocol):
 
 
 def _terminate_process_tree(process: _Process | None) -> None:
-    if process is None or process.returncode is not None:
-        return
-    pid = process.pid
-    if pid is not None:
-        with suppress(ProcessLookupError, PermissionError, OSError):
-            os.killpg(pid, signal.SIGTERM)
-            return
-    with suppress(ProcessLookupError, Exception):
-        process.terminate()
+    _proc.terminate_tree(process)
 
 
 def _kill_process_tree(process: _Process | None) -> None:
-    if process is None or process.returncode is not None:
-        return
-    pid = process.pid
-    if pid is not None:
-        with suppress(ProcessLookupError, PermissionError, OSError):
-            os.killpg(pid, signal.SIGKILL)
-            return
-    with suppress(ProcessLookupError, Exception):
-        process.kill()
+    _proc.kill_tree(process)
 
 
 def _find_codex_cli() -> str | None:
@@ -372,7 +348,7 @@ async def _create_subprocess_exec(*args: Any, **kwargs: Any) -> asyncio.subproce
     return await asyncio.create_subprocess_exec(*args, **kwargs)
 
 
-def _clean_codex_env() -> dict[str, str]:
+def _clean_codex_env(extra_allow: Iterable[str] = ()) -> dict[str, str]:
     """
     Build a filtered copy of ``os.environ`` for the codex subprocess.
 
@@ -409,13 +385,103 @@ def _clean_codex_env() -> dict[str, str]:
         "PYTHONUTF8",
         "DATABRICKS_BEARER",  # explicit CI/integration bearer used by auth.command
         "DATABRICKS_CODEX_TOKEN",  # env_key referenced by ~/.codex/config.toml's DB provider
-    }
+        OMNIGENT_SESSION_ENV_VAR,  # "inside Omnigent" marker (CLAUDE_CODE/CODEX analog)
+    } | set(extra_allow)
     for key, value in os.environ.items():
         if key in _CODEX_ENV_DENY_EXACT:
             continue
         if key in allow_exact or key.startswith(allow_prefixes):
             env[key] = value
     return env
+
+
+def _declared_passthrough(os_env: OSEnvSpec | None) -> tuple[str, ...]:
+    """Env-var names an agent declared for tool passthrough.
+
+    Lives on ``os_env.sandbox.env_passthrough`` (an
+    :class:`OSEnvSandboxSpec` field), not on ``OSEnvSpec`` directly.
+    Returns an empty tuple when any link in that chain is absent.
+    """
+    if os_env is not None and os_env.sandbox is not None and os_env.sandbox.env_passthrough:
+        return tuple(os_env.sandbox.env_passthrough)
+    return ()
+
+
+def codex_skill_sources(bundle_dir: Path | None, home: Path) -> list[Path]:
+    """
+    Build the ordered Codex skill-source list: bundle skills, then host skills.
+
+    The single source of truth for *where* Codex skills come from, shared
+    by :func:`populate_codex_skills_from_bundle` (which symlinks them into
+    ``$CODEX_HOME/skills/``) and the slash-command menu's ``codex_host_skills``
+    provider — so the linked set and the menu cannot drift on which roots
+    are scanned. Priority order: the agent's own ``<bundle>/skills/`` before
+    host-installed ``<home>/.codex/skills/`` (a bundled skill shadows a host
+    skill of the same name). Only existing directories are returned.
+
+    :param bundle_dir: Materialized agent-bundle root, or ``None``.
+    :param home: The user home directory (``Path.home()``); injected so
+        tests and the menu provider can pin it.
+    :returns: Existing skill-dir roots in priority order.
+    """
+    sources: list[Path] = []
+    if bundle_dir is not None and (bundle_dir / "skills").is_dir():
+        sources.append(bundle_dir / "skills")
+    host = home / ".codex" / "skills"
+    if host.is_dir():
+        sources.append(host)
+    return sources
+
+
+def select_codex_skill_dirs(
+    skills_filter: str | list[str],
+    sources: list[Path],
+) -> dict[str, Path]:
+    """
+    Resolve skill name → directory for a Codex skill source list.
+
+    The single source of truth for "which skills does this Codex session
+    expose", shared by :func:`_populate_codex_skills` (which symlinks the
+    result into ``$CODEX_HOME/skills/``) and the slash-command menu's
+    Codex skill source — so the menu and the actually-linked set cannot
+    diverge.
+
+    :param skills_filter: ``"all"`` selects every skill found in
+        *sources*; ``"none"`` selects nothing; a ``list[str]`` selects
+        only the named skills present in some source. Names not present
+        are silently skipped.
+    :param sources: Ordered skill-dir roots (each containing
+        ``<name>/SKILL.md`` subdirs). The first source that contains a
+        given skill name wins.
+    :returns: Ordered mapping of selected skill name → absolute dir.
+    """
+    if skills_filter == "none":
+        return {}
+    available: dict[str, Path] = {}
+    for source in sources:
+        if not source.is_dir():
+            continue
+        try:
+            children = sorted(source.iterdir())
+        except OSError as exc:
+            # An unreadable source (permission denied, races) must not abort
+            # skill discovery / session startup — skip it and continue.
+            logger.warning("could not list codex skill source %s (%s); skipping", source, exc)
+            continue
+        for child in children:
+            if not child.is_dir():
+                continue
+            if not (child / "SKILL.md").is_file():
+                continue
+            available.setdefault(child.name, child)
+
+    if skills_filter == "all":
+        names = list(available.keys())
+    elif isinstance(skills_filter, list):
+        names = [n for n in skills_filter if n in available]
+    else:
+        return {}
+    return {n: available[n] for n in names}
 
 
 def _populate_codex_skills(
@@ -432,7 +498,8 @@ def _populate_codex_skills(
     which means by default Codex sees zero skills. This helper populates
     the temp ``skills/`` subdir based on the agent spec's ``skills:``
     field, sourcing skill directories from ``sources`` (typically the
-    user's ``~/.codex/skills/`` plus any ``<bundle>/skills/``).
+    user's ``~/.codex/skills/`` plus any ``<bundle>/skills/``). Skill
+    selection is delegated to :func:`select_codex_skill_dirs`.
 
     :param target_dir: ``<temp_codex_home>/skills/`` — the directory
         Codex will scan. Created if it doesn't exist (unless
@@ -452,25 +519,9 @@ def _populate_codex_skills(
         return
 
     target_dir.mkdir(parents=True, exist_ok=True)
-    available: dict[str, Path] = {}
-    for source in sources:
-        if not source.is_dir():
-            continue
-        for child in sorted(source.iterdir()):
-            if not child.is_dir():
-                continue
-            if not (child / "SKILL.md").is_file():
-                continue
-            available.setdefault(child.name, child)
+    selected = select_codex_skill_dirs(skills_filter, sources)
 
-    if skills_filter == "all":
-        names = list(available.keys())
-    elif isinstance(skills_filter, list):
-        names = [n for n in skills_filter if n in available]
-    else:
-        return
-
-    for name in names:
+    for name, skill_dir in selected.items():
         link_path = target_dir / name
         if link_path.exists() or link_path.is_symlink():
             continue
@@ -478,7 +529,7 @@ def _populate_codex_skills(
             # Resolve to absolute so the symlink doesn't break when
             # the source was a relative path (relative symlinks resolve
             # against the link's parent, not the original cwd).
-            link_path.symlink_to(available[name].resolve())
+            link_path.symlink_to(skill_dir.resolve())
         except OSError as exc:
             # Filesystems without symlink support (e.g. some Windows
             # configs) — fall back to a copy. Don't crash the harness
@@ -489,7 +540,17 @@ def _populate_codex_skills(
                 target_dir,
                 exc,
             )
-            shutil.copytree(available[name], link_path)
+            try:
+                shutil.copytree(skill_dir, link_path)
+            except OSError as copy_exc:
+                # Copy fallback can also fail (unreadable source, race) — skip
+                # this one skill rather than abort the whole session boot.
+                logger.warning(
+                    "could not copy skill %r into %s (%s); skipping",
+                    name,
+                    target_dir,
+                    copy_exc,
+                )
 
 
 def populate_codex_skills_from_bundle(
@@ -519,14 +580,7 @@ def populate_codex_skills_from_bundle(
         ``"none"`` / a list of skill names.
     :returns: None.
     """
-    skill_sources: list[Path] = []
-    if bundle_dir is not None:
-        bundle_skills = bundle_dir / "skills"
-        if bundle_skills.is_dir():
-            skill_sources.append(bundle_skills)
-    host_skills = Path.home() / ".codex" / "skills"
-    if host_skills.is_dir():
-        skill_sources.append(host_skills)
+    skill_sources = codex_skill_sources(bundle_dir, Path.home())
     _populate_codex_skills(codex_home / "skills", skills_filter, skill_sources)
 
 
@@ -570,7 +624,7 @@ def _private_codex_home_config_source(path: Path) -> Path | None:
         or ``None`` if the private home has no usable source symlink.
     """
     source_dirs: set[Path] = set()
-    for filename in _CODEX_HOME_CONFIG_FILES:
+    for filename in _CODEX_HOME_SYMLINK_FILES:
         config_file = path / filename
         if not config_file.is_symlink():
             continue
@@ -627,19 +681,21 @@ def _codex_home_config_source_from_env() -> Path:
 
 def _populate_codex_home_config(target_dir: Path, source_dir: Path) -> None:
     """
-    Symlink user config files from the real ``CODEX_HOME`` into the temp one.
+    Bridge user config files from the real ``CODEX_HOME`` into the temp one.
 
     The executor overrides ``CODEX_HOME`` to a per-conversation temp
     directory so session data (conversation history, etc.) stays isolated
     from the user's ``~/.codex/``. However, the codex CLI also reads
     authentication tokens (``auth.json``) and provider configuration
     (``config.toml``) from ``$CODEX_HOME``. This helper bridges those
-    read-only config files into the temp directory via symlinks,
-    preserving isolation while allowing codex to authenticate via the
-    user's subscription.
+    files into the temp directory:
 
-    Follows the same symlink-with-copy-fallback pattern as
-    :func:`_populate_codex_skills`.
+    - ``auth.json`` is **symlinked** so OAuth token refreshes written to
+      the real home propagate to running sessions without delay.
+    - ``config.toml`` is **copied** so an in-TUI ``/model`` command writes
+      only to the session's own private copy and never mutates the shared
+      ``~/.codex/config.toml``. This keeps model selection and cost-policy
+      enforcement isolated between concurrent sessions.
 
     :param target_dir: The per-conversation temp ``CODEX_HOME``
         directory. Must already exist.
@@ -650,7 +706,7 @@ def _populate_codex_home_config(target_dir: Path, source_dir: Path) -> None:
     if not source_dir.is_dir():
         return
 
-    for filename in _CODEX_HOME_CONFIG_FILES:
+    for filename in _CODEX_HOME_SYMLINK_FILES:
         source_file = source_dir / filename
         if not source_file.is_file():
             continue
@@ -667,6 +723,15 @@ def _populate_codex_home_config(target_dir: Path, source_dir: Path) -> None:
                 exc,
             )
             shutil.copy2(source_file, link_path)
+
+    for filename in _CODEX_HOME_COPY_FILES:
+        source_file = source_dir / filename
+        if not source_file.is_file():
+            continue
+        dest_path = target_dir / filename
+        if dest_path.exists() or dest_path.is_symlink():
+            continue
+        shutil.copy2(source_file, dest_path)
 
 
 def _databricks_codex_base_url(host: str) -> str:
@@ -729,12 +794,12 @@ def _databricks_codex_config_overrides(
     provider_name = "omnigent_databricks"
     auth_command_json = json.dumps(auth_command)
     return [
-        f'model="{model}"',
+        f"model={json.dumps(model)}",
         f'model_provider="{provider_name}"',
         (
             "model_providers.omnigent_databricks="
             '{name="Omnigent Databricks",'
-            f'base_url="{base_url}",'
+            f"base_url={json.dumps(base_url)},"
             'auth={command="sh",'
             f'args=["-c",{auth_command_json}],'
             "timeout_ms=5000,"
@@ -790,12 +855,12 @@ def _provider_codex_config_overrides(
     effective_wire_api = "responses" if wire_api == "chat" else wire_api
     overrides: list[str] = []
     if model:
-        overrides.append(f'model="{model}"')
+        overrides.append(f"model={json.dumps(model)}")
     overrides.append(f'model_provider="{provider_name}"')
     overrides.append(
         f"model_providers.{provider_name}="
         '{name="Omnigent Provider",'
-        f'base_url="{base_url}",'
+        f"base_url={json.dumps(base_url)},"
         'auth={command="sh",'
         f'args=["-c",{auth_command_json}],'
         "timeout_ms=5000,"
@@ -1121,6 +1186,12 @@ class _CodexAppServerSession:
         self._loop: asyncio.AbstractEventLoop | None = None
         self.thread_id: str | None = None
         self.active_turn_id: str | None = None
+        # Last reasoning effort applied via ``thread/settings/update`` on the
+        # current thread. Effort is not part of the executor's session
+        # signature, so a change must be re-applied per turn; this is reset on
+        # a fresh thread so it is re-sent. ``turn/start`` carries no ``effort``
+        # field (it is silently dropped), hence the separate settings update.
+        self._applied_effort: str | None = None
         self._recent_stderr: list[str] = []
         self._recent_events: list[CodexMessage] = []
         self._process_cwd: Path | None = None
@@ -1179,7 +1250,7 @@ class _CodexAppServerSession:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=proc_env,
-                start_new_session=(os.name == "posix"),
+                **_proc.spawn_kwargs(),
                 cwd=self._cwd or os.getcwd(),
             )
             self._reader_task = asyncio.create_task(self._reader_loop())
@@ -1338,12 +1409,15 @@ class _CodexAppServerSession:
             if not isinstance(item, dict) or item.get("type") != "agentMessage":
                 continue
             phase, completed_text = _completed_agent_message_text(item, message_buffers)
-            if phase == "final_answer" or not final_response:
+            if phase == "commentary":
+                item_id = item.get("id")
+                if isinstance(item_id, str):
+                    message_buffers.pop(item_id, None)
+                continue
+            if phase == "final_answer" or phase is None:
                 final_response = completed_text
             if phase == "final_answer":
                 return final_response
-            if not final_response:
-                final_response = _latest_buffered_agent_message(message_buffers)
 
     async def run_turn(
         self,
@@ -1383,6 +1457,9 @@ class _CodexAppServerSession:
             # below fails loud for a protocol violation instead of
             # silently carrying an empty-string thread id.
             self.thread_id = raw_thread_id if isinstance(raw_thread_id, str) else None
+            # Fresh thread: forget the prior thread's applied effort so the
+            # settings update below re-sends it for this thread.
+            self._applied_effort = None
 
         assert self.thread_id is not None
         prompt = _prompt_for_turn(messages, is_new_thread=is_new_thread)
@@ -1390,12 +1467,22 @@ class _CodexAppServerSession:
             turn_input = _to_codex_input_items(prompt)
         else:
             turn_input = [{"type": "text", "text": prompt}]
+        # Apply reasoning effort via ``thread/settings/update``: Codex's
+        # ``TurnStartParams`` has no ``effort`` field, so an ``effort`` set on
+        # ``turn/start`` is silently dropped by serde and never takes effect.
+        # ``ThreadSettingsUpdateParams`` is where ``model``/``effort`` live —
+        # the same path the TUI ``/model`` picker uses. Deduped against the
+        # last value applied on this thread to avoid a redundant per-turn RPC.
+        if reasoning_effort and reasoning_effort != self._applied_effort:
+            await self._request(
+                "thread/settings/update",
+                {"threadId": self.thread_id, "effort": reasoning_effort},
+            )
+            self._applied_effort = reasoning_effort
         turn_params: CodexParams = {
             "threadId": self.thread_id,
             "input": turn_input,
         }
-        if reasoning_effort:
-            turn_params["effort"] = reasoning_effort
         start_response = await self._request(
             "turn/start",
             turn_params,
@@ -1579,6 +1666,15 @@ class _CodexAppServerSession:
                     yield TextChunk(text=delta)
                     continue
 
+                if method in ("item/reasoning/textDelta", "item/reasoning/summaryTextDelta"):
+                    if not _event_turn_matches(params):
+                        continue
+                    raw_reasoning_delta = params.get("delta")
+                    if not isinstance(raw_reasoning_delta, str) or not raw_reasoning_delta:
+                        continue
+                    yield ReasoningChunk(delta=raw_reasoning_delta, event_type="reasoning_text")
+                    continue
+
                 if method == "item/completed":
                     if not _event_turn_matches(params):
                         continue
@@ -1604,7 +1700,10 @@ class _CodexAppServerSession:
                         phase, completed_text = _completed_agent_message_text(
                             item, message_buffers
                         )
-                        if phase == "final_answer" or not final_response:
+                        if phase == "commentary":
+                            message_buffers.pop(completed_item_id, None)
+                            continue
+                        if phase == "final_answer" or phase is None:
                             final_response = completed_text
                         if phase == "final_answer":
                             # Diagnostic: log response head + turn id so
@@ -1662,6 +1761,8 @@ class _CodexAppServerSession:
                     return
 
                 if method == "turn/failed":
+                    if isinstance(params, dict) and params.get("willRetry") is True:
+                        continue
                     turn = params.get("turn", {}) if isinstance(params, dict) else {}
                     raw_failed_turn_id = turn.get("id")
                     failed_turn_id: str | None = (
@@ -1684,6 +1785,8 @@ class _CodexAppServerSession:
                     return
 
                 if method == "error":
+                    if isinstance(params, dict) and params.get("willRetry") is True:
+                        continue
                     # JSON-RPC-shaped error frames from the app server
                     # carry ``code`` / ``message`` / ``data``. Some error
                     # paths populate only ``code``+``data`` and leave
@@ -2025,7 +2128,7 @@ class CodexExecutor(Executor):
         if not resolved_codex:
             raise ImportError("CodexExecutor requires the 'codex' CLI on PATH.")
         self._codex_path = resolved_codex
-        self._env = _clean_codex_env()
+        self._env = _clean_codex_env(_declared_passthrough(self._os_env_spec))
         # Retry policy → OpenAI SDK env vars (Codex uses the OpenAI
         # SDK internally). Speculative — empirical audit pending.
         self._retry_policy = retry_policy if retry_policy is not None else RetryPolicy()
@@ -2064,13 +2167,18 @@ class CodexExecutor(Executor):
                 # No gateway host supplied directly: derive the transport from
                 # a Databricks profile (the Databricks producer's fallback).
                 creds = _read_databrickscfg(databricks_profile)
-                if creds is None:
+                host = (
+                    creds.host
+                    if creds is not None
+                    else _read_databrickscfg_host(databricks_profile)
+                )
+                if not host:
                     raise OSError(
                         "CodexExecutor(gateway=True) requires gateway credentials via "
                         "the gateway base URL / auth command or a valid "
                         "~/.databrickscfg profile."
                     )
-                host = creds.host.rstrip("/")
+                host = host.rstrip("/")
                 base_url = (
                     base_url_override
                     if base_url_override is not None

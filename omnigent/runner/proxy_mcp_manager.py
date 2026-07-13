@@ -222,7 +222,7 @@ class ProxyMcpManager:
                     json=payload,
                     # Short connect timeout still fails fast on an unreachable
                     # server; the read timeout covers ordinary proxy request
-                    # hangs. Sub-agent dispatch returns a running handle
+                    # hangs. Sub-agent dispatch returns an async handle
                     # immediately and no longer holds this call for a child turn.
                     timeout=httpx.Timeout(
                         connect=10.0,

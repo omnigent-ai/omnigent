@@ -30,7 +30,6 @@ from omnigent.spec import (
     MCPServerConfig,
     Phase,
     PhaseSelector,
-    PolicyAction,
     ToolRuntime,
     ToolsConfig,
 )
@@ -216,7 +215,6 @@ def test_policies_dropped_from_forward_translation(
                 function=FunctionRef(
                     path="tests.spec.test_omnigent_translator.sample_tool_callable"
                 ),
-                action=[PolicyAction.ALLOW],
             ),
         ],
     )
@@ -231,14 +229,14 @@ def test_sandbox_block_rejected_with_clear_message(
     basic_spec: AgentSpec,
 ) -> None:
     """
-    A spec that requests a sandbox (``tools.sandbox.docker_image``)
+    A spec that requests a sandbox (``tools.sandbox.container_image``)
     is rejected with a message naming ``sandbox``.
 
     **What breaks if this fails**: the harness runs tools outside
     the sandbox the spec asked for — a security violation.
     """
     basic_spec.tools = ToolsConfig(
-        sandbox=SandboxConfig(docker_image="python:3.12-slim"),
+        sandbox=SandboxConfig(container_image="python:3.12-slim"),
     )
     with pytest.raises(OmnigentError, match=r"sandbox"):
         agent_spec_to_agent_def(basic_spec)

@@ -1,7 +1,7 @@
 """Tests for the per-user daily cost-budget policy.
 
-``user_daily_cost_budget`` gates the ``tool_call`` phase on the session
-OWNER's cumulative spend for the current UTC day, read from
+``user_daily_cost_budget`` gates the ``request`` and ``tool_call`` phases
+on the session OWNER's cumulative spend for the current UTC day, read from
 ``event["context"]["user_daily_cost"]`` (injected by the engine). Same
 ASK/DENY/downgrade logic as ``cost_budget``, but:
 
@@ -72,17 +72,73 @@ def test_below_ask_threshold_allows() -> None:
     assert policy(_tool(1.0)) == {"result": "ALLOW"}
 
 
-def test_non_tool_call_phase_allows() -> None:
-    """Only the tool_call phase is gated; other phases abstain even over budget."""
+@pytest.mark.parametrize("phase", ["response", "tool_result", "llm_request", "llm_response"])
+def test_non_gated_phase_allows(phase: str) -> None:
+    """Non-gated phases abstain even over budget (request/tool_call ARE gated)."""
     policy = user_daily_cost_budget(max_cost_usd=5.0)
     event: PolicyEvent = {
-        "type": "request",
+        "type": phase,
         "target": None,
         "data": "x",
         "context": {"user_daily_cost": {"cost_usd": 9.99}, "model": "opus"},
         "session_state": {},
     }
     assert policy(event) == {"result": "ALLOW"}
+
+
+def test_request_phase_over_budget_on_expensive_model_denies() -> None:
+    """Over the hard daily limit on an expensive model DENYs at the request phase.
+
+    The daily gate now also fires before the LLM turn, so a text-only turn
+    counts against the daily budget. The reason must be the user-facing
+    variant (no tool-call directive), since a request-phase DENY is shown
+    straight to the user.
+    """
+    policy = user_daily_cost_budget(max_cost_usd=5.0)
+    event: PolicyEvent = {
+        "type": "request",
+        "target": None,
+        "data": "please run the build",
+        "context": {
+            "actor": {},
+            "user_daily_cost": {"cost_usd": 6.0, "ask_approved_usd": 0.0},
+            "model": "databricks-claude-opus-4-8",
+        },
+        "session_state": {},
+    }
+    result = policy(event)
+    assert result["result"] == "DENY"
+    assert "6.00" in result["reason"]
+    assert "daily" in result["reason"].lower()
+    # User-facing phrasing only — no tool-call directive leaks through.
+    assert "re-issue the tool call" not in result["reason"]
+
+
+def test_request_phase_soft_checkpoint_asks_and_records_daily_key() -> None:
+    """Crossing a daily checkpoint ASKs at the request phase → ASK + daily key.
+
+    The soft warning now also fires before the LLM turn (the request phase
+    has a server-side approval round-trip), so a text-only turn that
+    crosses a daily checkpoint parks for approval. The ASK still records to
+    the per-user+day store via ``USER_DAILY_ASK_APPROVED_STATE_KEY``.
+    """
+    policy = user_daily_cost_budget(max_cost_usd=5.0, ask_thresholds_usd=[2.0])
+    event: PolicyEvent = {
+        "type": "request",
+        "target": None,
+        "data": "please run the build",
+        "context": {
+            "actor": {},
+            "user_daily_cost": {"cost_usd": 2.0, "ask_approved_usd": 0.0},
+            "model": "databricks-claude-opus-4-8",
+        },
+        "session_state": {},
+    }
+    result = policy(event)
+    assert result["result"] == "ASK"
+    assert result["state_updates"] == [
+        {"key": USER_DAILY_ASK_APPROVED_STATE_KEY, "action": "set", "value": 2.0},
+    ]
 
 
 def test_zero_or_missing_daily_cost_allows() -> None:
@@ -128,20 +184,21 @@ def test_approved_checkpoint_from_daily_store_does_not_reprompt() -> None:
     ]
 
 
-def test_over_daily_budget_on_expensive_model_denies() -> None:
-    """Over the hard daily limit on an expensive model → DENY (force downgrade).
+def test_over_daily_budget_denies_any_model() -> None:
+    """Over the hard daily limit → DENY for any model (default hard stop).
 
-    The reason must surface the spend and the high-cost tokens, and frame
-    it as the DAILY budget (not the session one) so the message is
-    accurate.
+    The default is a true hard stop — all models are blocked. The reason
+    must surface the spend, say all calls are blocked, and frame it as the
+    DAILY budget (not the session one).
     """
     policy = user_daily_cost_budget(max_cost_usd=5.0, ask_thresholds_usd=[2.0])
-    result = policy(_tool(6.0, model="databricks-claude-opus-4-8"))
-    assert result["result"] == "DENY"
-    assert "6.00" in result["reason"]
-    assert "opus" in result["reason"]
-    # Framed as the per-user daily budget, not the session one.
-    assert "daily" in result["reason"].lower()
+    for model in ("databricks-claude-opus-4-8", "databricks-claude-sonnet-4-6"):
+        result = policy(_tool(6.0, model=model))
+        assert result["result"] == "DENY", f"expected DENY for {model}"
+        assert "6.00" in result["reason"]
+        assert "All model calls are blocked" in result["reason"]
+        # Framed as the per-user daily budget, not the session one.
+        assert "daily" in result["reason"].lower()
 
 
 def test_ask_message_names_the_owner_when_present() -> None:
@@ -175,10 +232,14 @@ def test_deny_message_names_the_owner_when_present() -> None:
     assert "bob@example.com's spend $6.00 reached" in result["reason"]
 
 
-def test_over_daily_budget_on_cheaper_model_allows() -> None:
-    """Over the daily limit but already on a cheaper model → ALLOW (downgrade satisfied)."""
-    policy = user_daily_cost_budget(max_cost_usd=5.0)
-    assert policy(_tool(6.0, model="databricks-gpt-5-4")) == {"result": "ALLOW"}
+def test_over_daily_budget_on_cheaper_model_allows_with_explicit_list() -> None:
+    """Over the daily limit on a cheaper model → ALLOW when using an explicit expensive list.
+
+    With explicit expensive_models (downgrade-gate mode), Sonnet is not in
+    the list, so a downgraded session proceeds even over the daily limit.
+    """
+    policy = user_daily_cost_budget(max_cost_usd=5.0, expensive_models=["opus"])
+    assert policy(_tool(6.0, model="databricks-claude-sonnet-4-6")) == {"result": "ALLOW"}
 
 
 @pytest.mark.parametrize(
@@ -228,10 +289,10 @@ def test_daily_deny_reason_for_codex_points_to_terminal() -> None:
     """The daily DENY reason is harness-aware: codex-native → terminal /model.
 
     Guards that the per-user daily factory wires the harness through to
-    the (shared) deny-reason builder, so a codex user is told the one
-    switch mechanism that works for them.
+    the (shared) deny-reason builder. Uses explicit expensive_models
+    (downgrade-gate mode) so a cheaper model exists and the switch hint applies.
     """
-    policy = user_daily_cost_budget(max_cost_usd=5.0)
+    policy = user_daily_cost_budget(max_cost_usd=5.0, expensive_models=["opus"])
     result = policy(_tool(6.0, model="opus", harness="codex-native"))
     assert result["result"] == "DENY"
     assert "in the terminal" in result["reason"]

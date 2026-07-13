@@ -8,6 +8,8 @@ import pytest
 
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    HostCreateDirFrame,
+    HostCreateDirResultFrame,
     HostCreateWorktreeFrame,
     HostCreateWorktreeResultFrame,
     HostHelloFrame,
@@ -16,6 +18,8 @@ from omnigent.host.frames import (
     HostListDirEntry,
     HostListDirFrame,
     HostListDirResultFrame,
+    HostListWorktreesFrame,
+    HostListWorktreesResultFrame,
     HostRemoveWorktreeFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
@@ -26,6 +30,43 @@ from omnigent.host.frames import (
     decode_host_frame,
     encode_host_frame,
 )
+
+
+def test_encode_injects_traceparent_under_active_span() -> None:
+    """
+    Encoding a host frame inside an active span stamps a W3C
+    ``traceparent`` into the JSON envelope so the Host Daemon ↔ Server
+    boundary joins the distributed trace; with no span active the wire
+    form is unchanged (byte-for-byte wire-compatible), and decode always
+    ignores the extra envelope key.
+    """
+    from opentelemetry import trace as otel_trace
+    from opentelemetry.sdk.trace import TracerProvider
+
+    frame = HostLaunchRunnerFrame(
+        request_id="req_1",
+        binding_token="tok",
+        workspace="/tmp/ws",
+        harness="claude-sdk",
+    )
+
+    # No active span: no traceparent added.
+    assert "traceparent" not in json.loads(encode_host_frame(frame))
+
+    provider = TracerProvider()
+    otel_trace._TRACER_PROVIDER = provider  # type: ignore[attr-defined]
+    otel_trace._TRACER_PROVIDER_SET_ONCE._done = True  # type: ignore[attr-defined]
+    tracer = otel_trace.get_tracer("tests.host.frames")
+    with tracer.start_as_current_span("rest"):
+        encoded = encode_host_frame(frame)
+
+    payload = json.loads(encoded)
+    assert "traceparent" in payload
+    # The extra envelope key must not break decoding back to the dataclass.
+    decoded = decode_host_frame(encoded)
+    assert isinstance(decoded, HostLaunchRunnerFrame)
+    assert decoded.request_id == "req_1"
+    assert decoded.workspace == "/tmp/ws"
 
 
 def test_hello_frame_round_trip() -> None:
@@ -77,12 +118,14 @@ def test_launch_runner_frame_round_trip() -> None:
         request_id="req_001",
         binding_token="secret_token_xyz",
         workspace="/Users/corey/projects/frontend",
+        session_id="conv_abc123",
     )
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostLaunchRunnerFrame)
     assert decoded.request_id == "req_001"
     assert decoded.binding_token == "secret_token_xyz"
     assert decoded.workspace == "/Users/corey/projects/frontend"
+    assert decoded.session_id == "conv_abc123"
 
 
 def test_launch_runner_result_frame_success_round_trip() -> None:
@@ -140,13 +183,13 @@ def test_hello_frame_configured_harnesses_round_trip() -> None:
         version="0.1.0",
         frame_protocol_version=1,
         name="corey-laptop",
-        configured_harnesses={"claude-sdk": True, "codex": False},
+        configured_harnesses={"claude-sdk": True, "codex": "needs-auth"},
     )
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostHelloFrame)
     # Exact map equality: both the True and the False must survive —
     # False is the actionable "warn the user" value.
-    assert decoded.configured_harnesses == {"claude-sdk": True, "codex": False}
+    assert decoded.configured_harnesses == {"claude-sdk": True, "codex": "needs-auth"}
 
 
 def test_hello_frame_legacy_payload_decodes_unknown_harnesses() -> None:
@@ -232,6 +275,7 @@ def test_launch_runner_frame_legacy_payload_decodes_harness_none() -> None:
     )
     decoded = decode_host_frame(legacy)
     assert isinstance(decoded, HostLaunchRunnerFrame)
+    assert decoded.session_id is None
     assert decoded.harness is None
 
 
@@ -796,3 +840,149 @@ def test_remove_worktree_result_frame_round_trip() -> None:
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostRemoveWorktreeResultFrame)
     assert decoded == original
+
+
+# ── host.list_worktrees frames ──────────────────────────
+
+
+def test_list_worktrees_frame_round_trip() -> None:
+    """Verify HostListWorktreesFrame survives encode → decode.
+
+    A garbled repo_path would list the wrong repository's worktrees.
+    """
+    original = HostListWorktreesFrame(
+        request_id="req_wt_ls_1",
+        repo_path="/Users/alice/myrepo",
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostListWorktreesFrame)
+    assert decoded == original
+
+
+def test_list_worktrees_result_frame_round_trip() -> None:
+    """Verify HostListWorktreesResultFrame survives encode → decode.
+
+    The worktree dicts feed the picker; a dropped or reshaped field
+    would break branch prefill / start-in-worktree selection.
+    """
+    original = HostListWorktreesResultFrame(
+        request_id="req_wt_ls_1",
+        status="ok",
+        worktrees=[
+            {"path": "/Users/alice/myrepo", "branch": "main", "is_main": True, "detached": False},
+            {
+                "path": "/Users/alice/myrepo-worktrees/feature-login",
+                "branch": "feature/login",
+                "is_main": False,
+                "detached": False,
+            },
+        ],
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostListWorktreesResultFrame)
+    assert decoded == original
+
+
+def test_list_worktrees_result_frame_failure_round_trip() -> None:
+    """Verify a failed list-worktrees result carries its error and null list."""
+    original = HostListWorktreesResultFrame(
+        request_id="req_wt_ls_1",
+        status="failed",
+        error="not a git repository",
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostListWorktreesResultFrame)
+    assert decoded.worktrees is None
+    assert decoded.error == "not a git repository"
+
+
+def test_list_worktrees_result_frame_rejects_non_list() -> None:
+    """A non-list ``worktrees`` field is rejected, not coerced."""
+    bad = (
+        '{"kind": "host.list_worktrees_result", "request_id": "r", '
+        '"status": "ok", "worktrees": "nope"}'
+    )
+    with pytest.raises(ValueError, match="worktrees"):
+        decode_host_frame(bad)
+
+
+# ── host.create_dir frames ──────────────────────────────
+
+
+def test_create_dir_frame_round_trip() -> None:
+    """
+    Verify HostCreateDirFrame request frame survives encode → decode.
+
+    Pins the wire shape used by the picker's "New folder" action:
+    ``request_id`` plus the directory ``path`` to create.
+    """
+    original = HostCreateDirFrame(
+        request_id="req_mkdir_1",
+        path="/Users/corey/projects/new-app",
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostCreateDirFrame)
+    assert decoded == original
+
+
+def test_create_dir_frame_accepts_tilde_path() -> None:
+    """
+    Verify a tilde-prefixed path round-trips verbatim.
+
+    The host (not the server) expands ``~``, same rules as
+    ``host.list_dir`` — so the tilde must survive the wire.
+    """
+    original = HostCreateDirFrame(request_id="req_mkdir_tilde", path="~/scratch")
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostCreateDirFrame)
+    assert decoded.path == "~/scratch"
+
+
+def test_create_dir_request_missing_path_raises() -> None:
+    """
+    Verify decoding a create_dir without ``path`` raises ValueError.
+
+    Without ``path`` the host has nothing to create; failing loud
+    beats silently creating something under the process cwd.
+    """
+    with pytest.raises(ValueError, match="missing required string field"):
+        decode_host_frame('{"kind": "host.create_dir", "request_id": "r"}')
+
+
+def test_create_dir_result_success_round_trip() -> None:
+    """
+    Verify a successful create-dir result round-trips with the created
+    absolute path intact.
+
+    The picker navigates into ``path`` after creating it; a dropped
+    field would leave the user staring at the old directory.
+    """
+    original = HostCreateDirResultFrame(
+        request_id="req_mkdir_2",
+        status="ok",
+        path="/Users/corey/projects/new-app",
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostCreateDirResultFrame)
+    assert decoded == original
+
+
+def test_create_dir_result_error_round_trip() -> None:
+    """
+    Verify an expected filesystem error round-trips with the message
+    intact and ``path`` left ``None``.
+
+    The route maps a non-empty ``error`` to a 409 so the picker can
+    show "directory already exists" — that hinges on the message
+    surviving the wire.
+    """
+    original = HostCreateDirResultFrame(
+        request_id="req_mkdir_3",
+        status="ok",
+        error="directory already exists",
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostCreateDirResultFrame)
+    assert decoded.status == "ok"
+    assert decoded.path is None
+    assert decoded.error == "directory already exists"

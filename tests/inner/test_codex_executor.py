@@ -26,6 +26,7 @@ from omnigent.inner.codex_executor import (
 from omnigent.inner.databricks_executor import DatabricksCredentials
 from omnigent.inner.executor import (
     ExecutorError,
+    ReasoningChunk,
     TextChunk,
     ToolCallComplete,
     ToolCallRequest,
@@ -146,6 +147,31 @@ class TestCodexExecutor(unittest.TestCase):
         self.assertTrue(any("databricks auth token --host" in item for item in overrides))
         self.assertTrue(any("refresh_interval_ms=900000" in item for item in overrides))
         self.assertFalse(any('env_key="DATABRICKS_TOKEN"' in item for item in overrides))
+
+    def test_codex_config_overrides_neutralize_toml_breakout(self):
+        """A model id full of TOML metacharacters stays a literal string.
+
+        Defense-in-depth for the model_override RCE: the model value is
+        ``json.dumps``-escaped, so even a string crafted to close the
+        ``model="..."`` field and inject its own ``auth.command`` parses
+        back as one inert model name and never overwrites the real
+        token-minting auth command.
+        """
+        import tomllib
+
+        payload = 'x",auth={command="sh",args=["-c","touch /tmp/pwned"]},wire_api="responses"}'
+        real_auth = 'databricks auth token --host "https://example.cloud.databricks.com"'
+        overrides = _databricks_codex_config_overrides(
+            model=payload,
+            base_url="https://example.cloud.databricks.com/ai-gateway/codex/v1",
+            auth_command=real_auth,
+        )
+        parsed = tomllib.loads("\n".join(overrides))
+        # The whole payload round-trips as the literal model name.
+        self.assertEqual(parsed["model"], payload)
+        # The injected auth command did not survive — the legit one did.
+        provider = parsed["model_providers"]["omnigent_databricks"]
+        self.assertEqual(provider["auth"]["args"], ["-c", real_auth])
 
     def test_constructor_databricks_flag_with_profile(self):
         with (
@@ -283,6 +309,7 @@ class TestCodexExecutor(unittest.TestCase):
             patch("omnigent.inner.codex_executor._find_codex_cli", return_value="/usr/bin/codex"),
             patch.dict("os.environ", {}, clear=True),
             patch("omnigent.inner.codex_executor._read_databrickscfg", return_value=None),
+            patch("omnigent.inner.codex_executor._read_databrickscfg_host", return_value=None),
         ):
             with self.assertRaises(EnvironmentError):
                 CodexExecutor(gateway=True)
@@ -502,6 +529,112 @@ class TestCodexExecutor(unittest.TestCase):
             params = thread_start_call.args[1]
             self.assertNotIn("shell_tool", params["config"]["features"])
             self.assertEqual(params["dynamicTools"][0]["name"], "sys_os_shell")
+
+        _run(_t())
+
+    def test_app_server_run_turn_applies_effort_via_thread_settings_update(self):
+        """Reasoning effort rides thread/settings/update, not turn/start.
+
+        Codex's ``TurnStartParams`` has no ``effort`` field, so an effort set
+        on ``turn/start`` is silently dropped by serde and never takes effect.
+        It must go through ``thread/settings/update`` (whose
+        ``ThreadSettingsUpdateParams`` carries ``effort``) — the same path the
+        TUI ``/model`` picker uses.
+        """
+
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/tmp/workspace",
+                env={},
+                tool_executor=None,
+            )
+            session.start = AsyncMock()
+            session._proc = _FakeProcess()
+            session._request = AsyncMock(
+                side_effect=[
+                    {"result": {"thread": {"id": "thread-1"}}},  # thread/start
+                    {"result": {}},  # thread/settings/update
+                    {"result": {"turn": {"id": "turn-1"}}},  # turn/start
+                ]
+            )
+
+            async def _inject_turn_completed() -> None:
+                await asyncio.sleep(0.01)
+                session._events.put_nowait(
+                    {"method": "turn/completed", "params": {"turn": {"id": "turn-1"}}}
+                )
+
+            inject_task = asyncio.create_task(_inject_turn_completed())
+            # Drive the turn to completion (consume the event stream for its
+            # side effects — the RPCs we assert on below).
+            async for _event in session.run_turn(
+                messages=[{"role": "user", "content": "hi"}],
+                tools=[],
+                system_prompt="",
+                model="gpt-5.4-mini",
+                cwd=".",
+                sandbox="workspace-write",
+                reasoning_effort="high",
+            ):
+                pass
+            await inject_task
+
+            methods = [call.args[0] for call in session._request.await_args_list]
+            # Settings update lands BEFORE the turn starts so the effort applies
+            # to this turn, and turn/start carries no (dropped) effort field.
+            self.assertEqual(methods, ["thread/start", "thread/settings/update", "turn/start"])
+            settings_params = session._request.await_args_list[1].args[1]
+            self.assertEqual(settings_params, {"threadId": "thread-1", "effort": "high"})
+            turn_params = session._request.await_args_list[2].args[1]
+            self.assertNotIn("effort", turn_params)
+
+        _run(_t())
+
+    def test_app_server_run_turn_dedupes_unchanged_effort(self):
+        """An unchanged effort is not re-sent on a later turn of one thread.
+
+        Effort persists on the thread once applied, so re-issuing
+        ``thread/settings/update`` every turn would be a redundant RPC.
+        """
+
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/tmp/workspace",
+                env={},
+                tool_executor=None,
+            )
+            session.start = AsyncMock()
+            session._proc = _FakeProcess()
+            # Existing thread (no thread/start) with effort already applied.
+            session.thread_id = "thread-1"
+            session._applied_effort = "high"
+            session._request = AsyncMock(side_effect=[{"result": {"turn": {"id": "turn-2"}}}])
+
+            async def _inject_turn_completed() -> None:
+                await asyncio.sleep(0.01)
+                session._events.put_nowait(
+                    {"method": "turn/completed", "params": {"turn": {"id": "turn-2"}}}
+                )
+
+            inject_task = asyncio.create_task(_inject_turn_completed())
+            # Drive the turn to completion (consume the event stream for its
+            # side effects — the RPCs we assert on below).
+            async for _event in session.run_turn(
+                messages=[{"role": "user", "content": "again"}],
+                tools=[],
+                system_prompt="",
+                model="gpt-5.4-mini",
+                cwd=".",
+                sandbox="workspace-write",
+                reasoning_effort="high",
+            ):
+                pass
+            await inject_task
+
+            methods = [call.args[0] for call in session._request.await_args_list]
+            self.assertEqual(methods, ["turn/start"])
 
         _run(_t())
 
@@ -1325,6 +1458,79 @@ class TestCodexExecutor(unittest.TestCase):
 
         _run(_t())
 
+    def test_app_server_run_turn_reasoning_deltas_yield_reasoning_chunks(self):
+        """item/reasoning/textDelta and item/reasoning/summaryTextDelta events
+        yield ReasoningChunk events so the idle watchdog resets during long
+        think phases (regression guard for omnigent-ai/omnigent#738)."""
+
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/tmp/workspace",
+                env={},
+                tool_executor=None,
+            )
+            session.start = AsyncMock()
+            session._proc = _FakeProcess()
+            session.thread_id = "thread-1"
+            session._request = AsyncMock(return_value={"result": {"turn": {"id": "turn-1"}}})
+
+            async def _inject() -> None:
+                await asyncio.sleep(0.01)
+                session._events.put_nowait(
+                    {
+                        "method": "item/reasoning/textDelta",
+                        "params": {"turnId": "turn-1", "delta": "thinking hard..."},
+                    }
+                )
+                session._events.put_nowait(
+                    {
+                        "method": "item/reasoning/summaryTextDelta",
+                        "params": {"turnId": "turn-1", "delta": "summary of thoughts"},
+                    }
+                )
+                session._events.put_nowait(
+                    {
+                        "method": "item/completed",
+                        "params": {
+                            "turnId": "turn-1",
+                            "item": {
+                                "id": "msg-1",
+                                "type": "agentMessage",
+                                "phase": "final_answer",
+                                "text": "Here is my answer.",
+                            },
+                        },
+                    }
+                )
+
+            inject_task = asyncio.create_task(_inject())
+            events = [
+                event
+                async for event in session.run_turn(
+                    messages=[{"role": "user", "content": "complex question"}],
+                    tools=[],
+                    system_prompt="",
+                    model="gpt-5.4-mini",
+                    cwd=".",
+                    sandbox="workspace-write",
+                )
+            ]
+            await inject_task
+
+            reasoning_events = [e for e in events if isinstance(e, ReasoningChunk)]
+            self.assertEqual(len(reasoning_events), 2)
+            self.assertEqual(reasoning_events[0].delta, "thinking hard...")
+            self.assertEqual(reasoning_events[0].event_type, "reasoning_text")
+            self.assertEqual(reasoning_events[1].delta, "summary of thoughts")
+            self.assertEqual(reasoning_events[1].event_type, "reasoning_text")
+
+            turn_complete = events[-1]
+            self.assertIsInstance(turn_complete, TurnComplete)
+            self.assertEqual(turn_complete.response, "Here is my answer.")
+
+        _run(_t())
+
     def test_stderr_loop_handles_oversized_lines(self):
         async def _t():
             session = _CodexAppServerSession(
@@ -1927,13 +2133,12 @@ def test_populate_codex_skills_from_bundle_none_leaves_no_dir(tmp_path: Path) ->
 
 
 def test_populate_codex_home_config_symlinks_auth_and_config(tmp_path: Path) -> None:
-    """When ``auth.json`` and ``config.toml`` exist in the source dir,
-    both are symlinked into the target dir.
+    """``auth.json`` is symlinked; ``config.toml`` is copied (not symlinked).
 
-    Verifies the subscription-auth bridge: the per-conversation temp
-    ``CODEX_HOME`` must see the user's OAuth tokens (``auth.json``)
-    and model provider definitions (``config.toml``) so the codex CLI
-    authenticates via the user's subscription plan.
+    ``auth.json`` is symlinked so OAuth token refreshes written to the real
+    home propagate to running sessions. ``config.toml`` is copied so an
+    in-TUI ``/model`` command writes only to the session's private copy and
+    never mutates the shared ``~/.codex/config.toml``.
     """
     from omnigent.inner.codex_executor import _populate_codex_home_config
 
@@ -1946,10 +2151,37 @@ def test_populate_codex_home_config_symlinks_auth_and_config(tmp_path: Path) -> 
 
     _populate_codex_home_config(target, source)
 
+    # auth.json: symlink so live credential refreshes propagate.
     assert (target / "auth.json").is_symlink()
-    assert (target / "config.toml").is_symlink()
     assert (target / "auth.json").read_text() == '{"auth_mode": "chatgpt"}'
+    # config.toml: independent copy so /model writes stay session-local.
+    assert not (target / "config.toml").is_symlink()
+    assert (target / "config.toml").is_file()
     assert (target / "config.toml").read_text() == '[default]\nmodel = "gpt-5.4"'
+
+
+def test_populate_codex_home_config_config_toml_copy_is_isolated(tmp_path: Path) -> None:
+    """Writing to the session's ``config.toml`` copy does not affect the source.
+
+    Proves that ``/model`` inside a session cannot mutate the shared
+    ``~/.codex/config.toml`` and silently change another session's model or
+    cost-policy enforcement.
+    """
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    (source / "config.toml").write_text('[default]\nmodel = "gpt-5.4"')
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    _populate_codex_home_config(target, source)
+
+    # Simulate a /model write inside the session.
+    (target / "config.toml").write_text('[default]\nmodel = "gpt-4o-mini"')
+
+    # Source must be untouched.
+    assert (source / "config.toml").read_text() == '[default]\nmodel = "gpt-5.4"'
 
 
 def test_populate_codex_home_config_missing_source_dir(tmp_path: Path) -> None:
@@ -2043,7 +2275,8 @@ def test_app_server_start_uses_real_home_for_private_inherited_codex_home(
             target_at_spawn = Path(recorded_env["CODEX_HOME"])
             assert target_at_spawn != inherited
             assert (target_at_spawn / "auth.json").is_symlink()
-            assert (target_at_spawn / "config.toml").is_symlink()
+            assert not (target_at_spawn / "config.toml").is_symlink()
+            assert (target_at_spawn / "config.toml").is_file()
             assert (target_at_spawn / "auth.json").read_text() == '{"auth_mode": "api_key"}'
             assert (target_at_spawn / "config.toml").read_text() == 'model_provider = "openai"'
             return fake_proc
@@ -2211,6 +2444,28 @@ def test_clean_codex_env_includes_databricks_bearer(monkeypatch) -> None:
 
     assert env.get("DATABRICKS_BEARER") == "ci-bearer"
     assert "DATABRICKS_TOKEN" not in env
+
+
+def test_clean_codex_env_includes_omnigent_session_marker(monkeypatch) -> None:
+    """The ``OMNIGENT`` session marker survives the codex env scrub.
+
+    The marker (set once on the runner) must reach the codex CLI so the
+    shell commands codex runs can detect they are inside an Omnigent
+    session, like ``CLAUDE_CODE`` / ``CODEX``.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    from omnigent.inner.codex_executor import _clean_codex_env
+    from omnigent.runner.identity import (
+        OMNIGENT_SESSION_ENV_VALUE,
+        OMNIGENT_SESSION_ENV_VAR,
+    )
+
+    monkeypatch.setenv(OMNIGENT_SESSION_ENV_VAR, OMNIGENT_SESSION_ENV_VALUE)
+
+    env = _clean_codex_env()
+
+    assert env.get(OMNIGENT_SESSION_ENV_VAR) == OMNIGENT_SESSION_ENV_VALUE
 
 
 # ---------------------------------------------------------------------------
@@ -2473,3 +2728,94 @@ def test_model_provider_override_with_gateway_raises() -> None:
             model="some-model",
             model_provider_override="Databricks",
         )
+
+
+def _mk_codex_skill(skills_dir: Path, name: str) -> None:
+    """Create a ``<skills_dir>/<name>/SKILL.md`` skill directory."""
+    d = skills_dir / name
+    d.mkdir(parents=True)
+    (d / "SKILL.md").write_text(f"---\nname: {name}\ndescription: d\n---\nbody\n")
+
+
+def test_select_codex_skill_dirs_all_first_source_wins(tmp_path: Path) -> None:
+    from omnigent.inner.codex_executor import select_codex_skill_dirs
+
+    a, b = tmp_path / "a", tmp_path / "b"
+    _mk_codex_skill(a, "shared")
+    _mk_codex_skill(b, "shared")
+    _mk_codex_skill(b, "only-b")
+    out = select_codex_skill_dirs("all", [a, b])
+    assert out["shared"] == a / "shared"
+    assert out["only-b"] == b / "only-b"
+
+
+def test_select_codex_skill_dirs_none_and_list(tmp_path: Path) -> None:
+    from omnigent.inner.codex_executor import select_codex_skill_dirs
+
+    a = tmp_path / "a"
+    _mk_codex_skill(a, "x")
+    _mk_codex_skill(a, "y")
+    assert select_codex_skill_dirs("none", [a]) == {}
+    assert set(select_codex_skill_dirs(["x"], [a])) == {"x"}
+
+
+def test_codex_skill_sources_order_bundle_then_host(tmp_path: Path) -> None:
+    """codex_skill_sources lists <bundle>/skills before <home>/.codex/skills."""
+    from omnigent.inner.codex_executor import codex_skill_sources
+
+    bundle = tmp_path / "bundle"
+    (bundle / "skills").mkdir(parents=True)
+    home = tmp_path / "home"
+    (home / ".codex" / "skills").mkdir(parents=True)
+    assert codex_skill_sources(bundle, home) == [
+        bundle / "skills",
+        home / ".codex" / "skills",
+    ]
+
+
+def test_codex_skill_sources_omits_absent_dirs(tmp_path: Path) -> None:
+    """Only existing dirs are returned (bundle absent → host only)."""
+    from omnigent.inner.codex_executor import codex_skill_sources
+
+    home = tmp_path / "home"
+    (home / ".codex" / "skills").mkdir(parents=True)
+    assert codex_skill_sources(None, home) == [home / ".codex" / "skills"]
+    assert codex_skill_sources(tmp_path / "no-bundle", home) == [home / ".codex" / "skills"]
+
+
+def test_clean_codex_env_honors_extra_allow(monkeypatch):
+    from omnigent.inner.codex_executor import _clean_codex_env
+
+    monkeypatch.setenv("CRAWL4AI_API_TOKEN", "secret-tok")
+    monkeypatch.setenv("COMPANIES_HOUSE_API_KEY", "ch-key")
+    # undeclared → stripped by the hardcoded allowlist
+    assert "CRAWL4AI_API_TOKEN" not in _clean_codex_env()
+    # declared via env_passthrough → admitted
+    env = _clean_codex_env(["CRAWL4AI_API_TOKEN", "COMPANIES_HOUSE_API_KEY"])
+    assert env["CRAWL4AI_API_TOKEN"] == "secret-tok"
+    assert env["COMPANIES_HOUSE_API_KEY"] == "ch-key"
+
+
+def test_clean_codex_env_deny_wins_over_extra_allow(monkeypatch):
+    from omnigent.inner.codex_executor import _clean_codex_env
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-stripped")
+    # the deny rule (subscription auth) wins even if a caller declares it
+    assert "OPENAI_API_KEY" not in _clean_codex_env(["OPENAI_API_KEY"])
+
+
+def test_declared_passthrough_reads_sandbox_env_passthrough():
+    from omnigent.inner.codex_executor import _declared_passthrough
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+
+    # env_passthrough lives on os_env.sandbox, not os_env directly
+    spec = OSEnvSpec(
+        sandbox=OSEnvSandboxSpec(
+            type="none", env_passthrough=["CRAWL4AI_API_TOKEN", "COMPANIES_HOUSE_API_KEY"]
+        )
+    )
+    assert _declared_passthrough(spec) == ("CRAWL4AI_API_TOKEN", "COMPANIES_HOUSE_API_KEY")
+    # guards: None os_env / None sandbox / unset list all yield ()
+    assert _declared_passthrough(None) == ()
+    assert _declared_passthrough(OSEnvSpec(sandbox=None)) == ()
+    assert _declared_passthrough(OSEnvSpec(sandbox=OSEnvSandboxSpec(type="none"))) == ()

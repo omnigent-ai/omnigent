@@ -1,4 +1,4 @@
-"""E2E test: zero-downtime agent update.
+"""E2E test: zero-downtime agent update (mock LLM).
 
 Verifies that an in-flight request on the old agent version completes
 successfully, and a new request after the update uses the new version
@@ -6,8 +6,7 @@ successfully, and a new request after the update uses the new version
 
 Usage::
 
-    pytest tests/e2e/test_agent_update.py \
-        --llm-api-key $LLM_API_KEY -v
+    pytest tests/e2e/test_agent_update.py -v
 """
 
 from __future__ import annotations
@@ -17,29 +16,23 @@ import json
 import os
 import tarfile
 import tempfile
-import time
 from pathlib import Path
 from typing import Any
 
 import httpx
-import pytest
 import yaml
 
 from tests.e2e.conftest import (
-    _rewrite_yaml_models,
+    configure_mock_llm,
     create_runner_bound_session,
     poll_session_until_terminal,
+    release_mock_gate,
+    reset_mock_llm,
     send_user_message_to_session,
 )
 from tests.e2e.helpers import final_assistant_text
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-# Use compaction-test — a minimal agent (gpt-5.4 via openai-agents, no
-# tools, no sub-agents) so the test runs fast and cheap. An OpenAI-family
-# model is required: the openai-agents harness returns empty output when
-# pointed at a Claude model on the Databricks gateway. Archer-style
-# research agents make dozens of tool calls per request, which blows test
-# timeouts without exercising anything specific to the update path.
 _TEST_AGENT_DIR = _REPO_ROOT / "tests" / "resources" / "agents" / "compaction-test"
 _TEST_AGENT_NAME = "compaction-test"
 
@@ -51,17 +44,18 @@ _V2_MARKER = "ZEBRAFINCH"
 def _upload_agent_with_id(
     client: httpx.Client,
     agent_dir: Path,
-    databricks_workspace_host: str | None = None,
+    mock_llm_server_url: str,
 ) -> dict[str, Any]:
     """
     Upload an agent bundle via multipart ``POST /v1/sessions`` and
     return the agent metadata (including ``id``) from the
     session-scoped agent endpoint.
 
+    Patches the config to route through the mock LLM server.
+
     :param client: HTTP client pointed at the server.
     :param agent_dir: Path to the agent directory.
-    :param databricks_workspace_host: Workspace host when --profile
-        is set; triggers model name rewriting.
+    :param mock_llm_server_url: Mock LLM server URL.
     :returns: The agent response JSON with ``id``, ``name``,
         ``version``, etc.
     """
@@ -71,9 +65,14 @@ def _upload_agent_with_id(
                 if not item.is_file():
                     continue
                 arcname = str(item.relative_to(agent_dir))
-                if item.name == "config.yaml" and databricks_workspace_host is not None:
+                if item.name == "config.yaml":
                     cfg = yaml.safe_load(item.read_text())
-                    _rewrite_yaml_models(cfg)
+                    # Point at mock LLM
+                    cfg.setdefault("executor", {})["auth"] = {
+                        "type": "api_key",
+                        "api_key": "mock-key",
+                        "base_url": f"{mock_llm_server_url}/v1",
+                    }
                     data = yaml.dump(cfg).encode()
                     info = tarfile.TarInfo(name=arcname)
                     info.size = len(data)
@@ -100,8 +99,6 @@ def _upload_agent_with_id(
         agent_resp = client.get(f"/v1/sessions/{session_id}/agent")
         agent_resp.raise_for_status()
         agent_data: dict[str, Any] = agent_resp.json()
-        # Stash the session_id so _update_agent can use the
-        # session-scoped PUT endpoint.
         agent_data["_session_id"] = session_id
         return agent_data
     finally:
@@ -111,19 +108,16 @@ def _upload_agent_with_id(
 def _build_updated_bundle(
     agent_dir: Path,
     config_overrides: dict[str, Any],
-    databricks_workspace_host: str | None = None,
+    mock_llm_server_url: str,
 ) -> bytes:
     """
     Build a tarball from an agent directory with config.yaml
-    fields overridden.
-
-    Reads the original config.yaml, merges the overrides, and
-    writes the modified config into the tarball. All other files
-    are included as-is.
+    fields overridden and mock LLM auth injected.
 
     :param agent_dir: Path to the original agent directory.
     :param config_overrides: Dict of fields to merge into
-        config.yaml, e.g. ``{"description": "v2"}``.
+        config.yaml.
+    :param mock_llm_server_url: Mock LLM server URL.
     :returns: Raw bytes of the ``.tar.gz`` bundle.
     """
     buf = io.BytesIO()
@@ -133,11 +127,13 @@ def _build_updated_bundle(
                 continue
             arcname = str(item.relative_to(agent_dir))
             if item.name == "config.yaml" and item.parent == agent_dir:
-                # Override the root config.yaml
                 config = yaml.safe_load(item.read_text())
                 config.update(config_overrides)
-                if databricks_workspace_host is not None:
-                    _rewrite_yaml_models(config)
+                config.setdefault("executor", {})["auth"] = {
+                    "type": "api_key",
+                    "api_key": "mock-key",
+                    "base_url": f"{mock_llm_server_url}/v1",
+                }
                 data = yaml.dump(config).encode()
                 info = tarfile.TarInfo(name=arcname)
                 info.size = len(data)
@@ -175,10 +171,24 @@ def _update_agent(
     return resp.json()
 
 
+def _wait_for_gate_pending(mock_llm_server_url: str, timeout: float = 30) -> None:
+    """Poll until a request is blocked on the mock LLM gate."""
+    import time
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        resp = httpx.get(f"{mock_llm_server_url}/gate/pending", timeout=2.0)
+        resp.raise_for_status()
+        if resp.json().get("pending"):
+            return
+        time.sleep(0.1)
+    raise AssertionError(f"No gate pending within {timeout}s")
+
+
 def test_update_agent_zero_downtime(
     http_client: httpx.Client,
     live_runner_id: str,
-    databricks_workspace_host: str | None,
+    mock_llm_server_url: str,
 ) -> None:
     """
     Verifies that the update endpoint doesn't disrupt in-flight
@@ -188,45 +198,45 @@ def test_update_agent_zero_downtime(
     - The PUT endpoint succeeds while a background request is
       running (the server doesn't crash or deadlock).
     - A request created after the update uses the new spec
-      (verified via a marker phrase in instructions).
+      (verified via a marker phrase in the mock response).
     - The in-flight request completes without error.
-
-    **What this test does NOT prove (inherent E2E limitation):**
-    - It does not guarantee the v1 request was mid-LLM-call when
-      the update happened. The gateway often finishes the turn in
-      under 2s, so the PUT may land after v1 already completed.
-      Either way the update must not error and v2 must pick up the
-      new spec -- that is what we assert. True mid-execution
-      concurrent update testing requires the mock LLM's blocking
-      mechanism, which is not available with a real LLM.
-    - The marker assertion depends on the LLM following the
-      injected instruction. If the LLM ignores it, the test
-      gives a false negative, not a false positive.
 
     Steps:
     1. Upload compaction-test agent (version 1).
-    2. Send a verbose request (best-effort in-flight window).
-    3. PUT a new bundle with modified instructions containing a
-       marker phrase (version 2).
-    4. Send a second request on a fresh v2 session.
+    2. Send a request whose mock response blocks on a gate.
+    3. PUT a new bundle with modified instructions (version 2).
+    4. Release the gate so v1 completes; send v2 request.
     5. Both requests complete successfully.
-    6. V1 response does NOT contain the marker.
-    7. V2 response DOES contain the marker.
+    6. V1 response does NOT contain the v2 marker.
+    7. V2 response DOES contain the v2 marker.
     8. Agent metadata shows version=2 and updated_at is set.
     """
-    if databricks_workspace_host is None:
-        pytest.skip(
-            "agent-update e2e requires --profile: the openai-agents harness "
-            "routes through the Databricks serving endpoint"
-        )
+    # Use a unique model key for the agent so our mock queue is isolated.
+    # The compaction-test agent ships with model: gpt-5.4 which the mock
+    # maps via the "default" queue. We configure the default queue since
+    # the bundled config.yaml keeps the original model name.
+    reset_mock_llm(mock_llm_server_url)
+
+    # Queue: v1 response blocks, then v2 response carries the marker.
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {
+                "text": (
+                    "Photosynthesis is the process by which green plants "
+                    "convert light energy into chemical energy."
+                ),
+                "block": True,
+            },
+            {"text": f"The answer is 4. {_V2_MARKER}"},
+        ],
+    )
 
     # Step 1: Upload compaction-test (v1) and bind the runner.
-    # The multipart POST creates a session but doesn't bind a runner —
-    # PATCH is required before sending any events.
     created = _upload_agent_with_id(
         http_client,
         _TEST_AGENT_DIR,
-        databricks_workspace_host=databricks_workspace_host,
+        mock_llm_server_url=mock_llm_server_url,
     )
     session_id = created["_session_id"]
     assert created["version"] == 1
@@ -235,47 +245,34 @@ def test_update_agent_zero_downtime(
         json={"runner_id": live_runner_id},
     ).raise_for_status()
 
-    # Step 2: Start a turn with verbose output so the session stays
-    # running long enough to PUT the update.
+    # Step 2: Start a turn whose mock response blocks on the gate.
     response_id_1 = send_user_message_to_session(
         http_client,
         session_id=session_id,
-        content=(
-            "Generate verbose output: write a detailed, multi-"
-            "paragraph explanation of how photosynthesis works, "
-            "covering the light-dependent reactions, the Calvin "
-            "cycle, and the role of chlorophyll. At least 5 "
-            "paragraphs."
-        ),
+        content="Explain photosynthesis in detail.",
     )
 
-    # Best-effort: give the turn a moment to start. We do NOT skip if
-    # it already finished -- the PUT-then-new-request path below is the
-    # real regression guard and runs regardless. Catching the turn
-    # mid-flight (status == "running") additionally exercises the
-    # zero-downtime path, but the gateway often finishes the turn in
-    # under 2s, so we treat that as a bonus, not a precondition.
-    time.sleep(2)
+    # Wait for the mock LLM to be blocked on the gate.
+    _wait_for_gate_pending(mock_llm_server_url)
 
-    # Step 3: Update agent to v2 with marker in instructions. The v1
-    # turn either is still running (in-flight update) or already
-    # completed under the old spec; both leave v1 free of the marker.
+    # Step 3: Update agent to v2 with marker in instructions.
     v2_bundle = _build_updated_bundle(
         _TEST_AGENT_DIR,
         {
             "description": "Updated compaction-test v2 for e2e test",
             "instructions": (
-                f"You MUST include the word '{_V2_MARKER}' "
-                f"somewhere in every response you give. This is "
-                f"a mandatory requirement."
+                f"You MUST include the word '{_V2_MARKER}' somewhere in every response you give."
             ),
         },
-        databricks_workspace_host=databricks_workspace_host,
+        mock_llm_server_url=mock_llm_server_url,
     )
     updated = _update_agent(http_client, session_id, v2_bundle)
     assert updated["version"] == 2
 
-    # Step 4: New session on v2 — ask something simple.
+    # Release the gate so v1 completes.
+    release_mock_gate(mock_llm_server_url)
+
+    # Step 4: New session on v2.
     session_id_2 = create_runner_bound_session(
         http_client,
         agent_name=_TEST_AGENT_NAME,
@@ -295,42 +292,27 @@ def test_update_agent_zero_downtime(
         http_client, session_id=session_id_2, response_id=response_id_2, timeout=60
     )
 
-    # Both requests completed — neither was disrupted
     assert body1["status"] == "completed", (
-        f"V1 request failed with status {body1['status']!r}. "
-        f"The update should not disrupt in-flight requests. "
-        f"Output: {body1.get('output', [])}"
+        f"V1 request failed with status {body1['status']!r}. Output: {body1.get('output', [])}"
     )
     assert body2["status"] == "completed", (
         f"V2 request failed with status {body2['status']!r}. Output: {body2.get('output', [])}"
     )
 
-    # Step 6: V1 response should NOT contain the marker —
-    # it was served by the old spec before the update.
+    # Step 6: V1 response should NOT contain the marker.
     v1_text = final_assistant_text(body1)
     assert _V2_MARKER not in v1_text, (
         f"V1 response unexpectedly contains the v2 marker "
-        f"'{_V2_MARKER}'. This means the in-flight request "
-        f"picked up the new spec instead of using the one it "
-        f"loaded at start. First 500 chars: {v1_text[:500]}"
+        f"'{_V2_MARKER}'. First 500 chars: {v1_text[:500]}"
     )
 
-    # Step 7: V2 response MUST contain the marker — it was
-    # served by the updated spec with the injected instruction.
-    # NOTE: This assertion depends on the LLM following the
-    # mandatory instruction. A false negative (test fails but
-    # spec was loaded correctly) is possible if the LLM ignores
-    # the instruction. A false positive is NOT possible — the
-    # marker only exists in v2's instructions.
+    # Step 7: V2 response MUST contain the marker.
     v2_text = final_assistant_text(body2)
     assert _V2_MARKER in v2_text, (
-        f"V2 response does NOT contain the marker "
-        f"'{_V2_MARKER}'. This means the new request did not "
-        f"use the updated spec's instructions. The cache swap "
-        f"may have failed. First 500 chars: {v2_text[:500]}"
+        f"V2 response does NOT contain the marker '{_V2_MARKER}'. First 500 chars: {v2_text[:500]}"
     )
 
-    # Step 8: Agent metadata reflects the update
+    # Step 8: Agent metadata reflects the update.
     agent_resp = http_client.get(f"/v1/sessions/{session_id}/agent")
     agent_resp.raise_for_status()
     agent = agent_resp.json()

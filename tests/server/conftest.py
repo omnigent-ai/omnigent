@@ -31,6 +31,7 @@ from omnigent.llms.types import (
     ResponseStreamEvent,
     ResponseTextDeltaEvent,
 )
+from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from omnigent.runtime import init as init_runtime
 from omnigent.runtime import pending_elicitations
 from omnigent.runtime.agent_cache import AgentCache
@@ -521,6 +522,47 @@ def runtime_init(
         lambda: mock_llm,
     )
     yield
+
+
+@pytest.fixture(autouse=True)
+def _first_party_origin_on_asgi(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Stamp the first-party sentinel ``Origin`` on every in-process ASGI request.
+
+    The ``require_trusted_origin`` CSRF guard on the multipart routes (POST
+    ``/v1/sessions`` bundled-create, file upload) trusts a request carrying
+    the sentinel ``Origin``. Test clients built on :class:`httpx.ASGITransport`
+    (the in-process app transport used throughout this suite, including the
+    per-test Alice/Bob multi-user clients) otherwise send none. The guard
+    currently fails open on an absent ``Origin``, but the tests should not
+    depend on that (it is a temporary posture, to be closed): stamping the
+    sentinel makes them announce themselves the way the real SDK / runner do,
+    so they keep passing once absent is no longer allowed.
+
+    Patching :meth:`httpx.ASGITransport.handle_async_request` injects the
+    sentinel in one place instead of on every ad-hoc client. It is scoped
+    to ``ASGITransport`` so it never touches real outbound HTTP, and it only
+    fills in a *missing* ``Origin`` — a test that sets its own (the
+    cross-origin / loopback CSRF cases) is left untouched.
+
+    :param monkeypatch: pytest attribute patcher (auto-reverted per test).
+    :returns: None.
+    """
+    original = httpx.ASGITransport.handle_async_request
+
+    async def _with_origin(self: httpx.ASGITransport, request: httpx.Request) -> httpx.Response:
+        """
+        Inject the sentinel ``Origin`` when absent, then delegate.
+
+        :param self: The patched ``ASGITransport`` instance.
+        :param request: The outgoing in-process request.
+        :returns: The app's response.
+        """
+        if "origin" not in request.headers:
+            request.headers["origin"] = OMNIGENT_INTERNAL_WS_ORIGIN
+        return await original(self, request)
+
+    monkeypatch.setattr(httpx.ASGITransport, "handle_async_request", _with_origin)
 
 
 @pytest.fixture()

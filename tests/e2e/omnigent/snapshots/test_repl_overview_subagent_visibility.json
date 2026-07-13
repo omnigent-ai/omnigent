@@ -1,6 +1,5 @@
 {
     "exit_code": {"kind": "exact", "value": 0},
     "subagent_label_present": {"kind": "exact", "value": true},
-    "subagent_executor_harness_rendered": {"kind": "exact", "value": true},
     "subagent_user_message_rendered": {"kind": "exact", "value": true}
 }

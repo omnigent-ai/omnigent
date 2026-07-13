@@ -44,7 +44,6 @@ from omnigent.claude_native_bridge import (
     prepare_bridge_dir,
     write_tmux_target,
 )
-from tests._model_pools import resolve_model
 from tests.e2e.conftest import (
     create_runner_bound_session,
     send_user_message_to_session,
@@ -57,8 +56,6 @@ _BRIDGE_READY_TIMEOUT_S = 90.0
 
 _RESPONSE_POLL_TIMEOUT_S = 120.0
 _RESPONSE_POLL_INTERVAL_S = 3.0
-
-_CLAUDE_NATIVE_MODEL = resolve_model("databricks-claude-sonnet-4-6", key=__name__)
 
 _NESTED_SESSION_ENV = "CLAUDECODE"
 
@@ -126,7 +123,7 @@ def _claude_code_session(
     :param model: Claude model id to pin, e.g.
         ``"databricks-claude-sonnet-4-6"``. ``None`` lets the CLI choose.
     :param launch_env: Extra environment for the launched ``claude``
-        process — Databricks Anthropic gateway auth, etc.
+        process — mock LLM base URL and API key.
     :yields: The bridge directory path.
     :raises pytest.fail: If the bridge server does not start within
         :data:`_BRIDGE_READY_TIMEOUT_S`.
@@ -164,30 +161,9 @@ def _claude_code_session(
     launcher.chmod(0o700)
 
     tmux_env = {k: v for k, v in os.environ.items() if k != _NESTED_SESSION_ENV}
-    if "ANTHROPIC_AUTH_TOKEN" in launch_env:
-        tmux_env.pop("ANTHROPIC_API_KEY", None)
     tmux_env.update(launch_env)
 
     claude_cwd = str(Path.cwd())
-    if "ANTHROPIC_AUTH_TOKEN" in launch_env:
-        claude_home = Path(tmp) / "claude-home"
-        claude_home.mkdir()
-        (claude_home / ".claude.json").write_text(
-            json.dumps(
-                {
-                    "hasCompletedOnboarding": True,
-                    "theme": "dark",
-                    "lastOnboardingVersion": "2.0.0",
-                    "projects": {
-                        claude_cwd: {
-                            "hasTrustDialogAccepted": True,
-                            "hasCompletedProjectOnboarding": True,
-                        },
-                    },
-                }
-            )
-        )
-        tmux_env["HOME"] = str(claude_home)
 
     try:
         subprocess.check_call(
@@ -278,8 +254,7 @@ def test_claude_native_session_tools_visible(
     http_client: httpx.Client,
     claude_native_ui_agent: str,
     live_runner_id: str,
-    databricks_workspace_host: str | None,
-    llm_api_key: str,
+    mock_llm_server_url: str,
 ) -> None:
     """
     Session-discovery tools are visible in a claude-native MCP session.
@@ -293,7 +268,7 @@ def test_claude_native_session_tools_visible(
 
     1. Skip unless opted in and ``claude`` / ``tmux`` are available.
     2. Create a runner-bound session with ``claude-native-ui``.
-    3. Launch Claude Code in a private tmux window.
+    3. Launch Claude Code in a private tmux window with mock LLM routing.
     4. Verify ``tool_relay.json`` contains ``sys_session_get_history``.
     5. Send a prompt asking Claude to list its omnigent MCP tools.
     6. Poll session items until Claude's response mentions
@@ -314,8 +289,8 @@ def test_claude_native_session_tools_visible(
     :param http_client: HTTP client pointed at the live server.
     :param claude_native_ui_agent: Registered agent name.
     :param live_runner_id: Runner id the session is bound to.
-    :param databricks_workspace_host: Workspace host from ``--profile``.
-    :param llm_api_key: ``--llm-api-key`` value.
+    :param mock_llm_server_url: Mock LLM server base URL (no ``/v1`` suffix —
+        the Anthropic SDK appends ``/v1/messages`` automatically).
     """
     if not os.environ.get(_RUN_GATE_ENV):
         pytest.skip(
@@ -334,21 +309,17 @@ def test_claude_native_session_tools_visible(
         runner_id=live_runner_id,
     )
 
-    launch_env: dict[str, str] = {}
-    model: str | None = None
-    if databricks_workspace_host:
-        model = _CLAUDE_NATIVE_MODEL
-        launch_env = {
-            "ANTHROPIC_BASE_URL": f"{databricks_workspace_host}/serving-endpoints/anthropic",
-            "ANTHROPIC_AUTH_TOKEN": llm_api_key,
-            "ANTHROPIC_CUSTOM_HEADERS": "x-databricks-use-coding-agent-mode: true",
-            "ANTHROPIC_DEFAULT_FABLE_MODEL": _CLAUDE_NATIVE_MODEL,
-            "ANTHROPIC_DEFAULT_SONNET_MODEL": _CLAUDE_NATIVE_MODEL,
-            "ANTHROPIC_DEFAULT_OPUS_MODEL": _CLAUDE_NATIVE_MODEL,
-            "ANTHROPIC_DEFAULT_HAIKU_MODEL": _CLAUDE_NATIVE_MODEL,
-        }
+    # Route the Claude CLI's LLM calls to the mock server.  ANTHROPIC_API_KEY
+    # bypasses the CLI's OAuth login gate so no real account is needed.
+    # CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS suppresses beta headers the mock
+    # server does not expect.
+    launch_env: dict[str, str] = {
+        "ANTHROPIC_BASE_URL": mock_llm_server_url,
+        "ANTHROPIC_API_KEY": "mock-key",
+        "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
+    }
 
-    with _claude_code_session(session_id, model=model, launch_env=launch_env) as bridge_dir:
+    with _claude_code_session(session_id, model=None, launch_env=launch_env) as bridge_dir:
         # ── Step 4: Verify tool_relay.json has peek before asking Claude ──
         relay_file = bridge_dir / "tool_relay.json"
         # The relay is started by _ensure_comment_relay_started in the
@@ -434,8 +405,7 @@ def test_claude_native_relay_advertises_broadened_orchestrator_surface(
     http_client: httpx.Client,
     claude_native_ui_agent: str,
     live_runner_id: str,
-    databricks_workspace_host: str | None,
-    llm_api_key: str,
+    mock_llm_server_url: str,
 ) -> None:
     """
     The native relay advertises the full gated orchestrator surface.
@@ -470,8 +440,7 @@ def test_claude_native_relay_advertises_broadened_orchestrator_surface(
     :param http_client: HTTP client pointed at the live server.
     :param claude_native_ui_agent: Registered agent name.
     :param live_runner_id: Runner id the session is bound to.
-    :param databricks_workspace_host: Workspace host from ``--profile``.
-    :param llm_api_key: ``--llm-api-key`` value.
+    :param mock_llm_server_url: Mock LLM server base URL (no ``/v1`` suffix).
     """
     if not os.environ.get(_RUN_GATE_ENV):
         pytest.skip(f"Set {_RUN_GATE_ENV}=1 to run.")
@@ -486,21 +455,14 @@ def test_claude_native_relay_advertises_broadened_orchestrator_surface(
         runner_id=live_runner_id,
     )
 
-    launch_env: dict[str, str] = {}
-    model: str | None = None
-    if databricks_workspace_host:
-        model = _CLAUDE_NATIVE_MODEL
-        launch_env = {
-            "ANTHROPIC_BASE_URL": f"{databricks_workspace_host}/serving-endpoints/anthropic",
-            "ANTHROPIC_AUTH_TOKEN": llm_api_key,
-            "ANTHROPIC_CUSTOM_HEADERS": "x-databricks-use-coding-agent-mode: true",
-            "ANTHROPIC_DEFAULT_FABLE_MODEL": _CLAUDE_NATIVE_MODEL,
-            "ANTHROPIC_DEFAULT_SONNET_MODEL": _CLAUDE_NATIVE_MODEL,
-            "ANTHROPIC_DEFAULT_OPUS_MODEL": _CLAUDE_NATIVE_MODEL,
-            "ANTHROPIC_DEFAULT_HAIKU_MODEL": _CLAUDE_NATIVE_MODEL,
-        }
+    # Route the Claude CLI's LLM calls to the mock server.
+    launch_env: dict[str, str] = {
+        "ANTHROPIC_BASE_URL": mock_llm_server_url,
+        "ANTHROPIC_API_KEY": "mock-key",
+        "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
+    }
 
-    with _claude_code_session(session_id, model=model, launch_env=launch_env) as bridge_dir:
+    with _claude_code_session(session_id, model=None, launch_env=launch_env) as bridge_dir:
         # Trigger the first turn so the runner writes tool_relay.json via
         # _run_turn_bg → _ensure_comment_relay_started. (The relay is also
         # written on the create_session_terminal route; this synthetic

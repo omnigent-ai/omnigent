@@ -1,31 +1,30 @@
 name: Integration Tests
 
-# Per-PR twin of nightly.yml's journey-suite matrix (tests/integration/):
-# multi-turn context retention, client-tool threading, and cross-user
-# sharing, once per wrapped harness against the real Databricks gateway.
-#
-# Burn-in status: NOT in merge-ready's REQUIRED list yet. The checks
-# report on every PR for signal; flip them to required in
-# .github/scripts/merge-ready/required.sh once they have a clean week.
-# nightly.yml remains the scheduled canary with Slack/issue notify.
-#
-# Triggers:
-#   pull_request        signal on every non-draft PR push.
-#   push (main)         post-merge verification, matches ci.yml / e2e.yml.
-#   workflow_dispatch   manual run against a branch.
+# Per-PR journey-suite matrix (tests/integration/), once per wrapped harness
+# using the mock LLM server (no real gateway credentials required). All tests
+# are mock_only: they script the LLM responses via configure_mock_llm and run
+# against a local mock FastAPI server. Because it uses NO secrets, it runs on
+# ALL PRs -- same-repo AND fork -- directly via `pull_request`, like ci.yml; no
+# fork-e2e/** mirror needed. Triggers: daily schedule, the PR gate, and
+# workflow_dispatch.
 
 on:
   schedule:
     - cron: "30 9 * * *"
+  pull_request:
+    # No labeled/unlabeled: a skip-security-scan waiver re-runs this workflow's
+    # Security Gate via rerun-security-gate.yml, so label churn need not re-run
+    # the heavy integration suite. (#399 added these for the gate; superseded.)
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths-ignore: ['web/**', 'tests/e2e_ui/**']
   workflow_dispatch:
 
 permissions:
   contents: read
 
 env:
-  # No ap-web SPA build during `uv sync` (setup.py `_build_web_ui`):
-  # this job never serves the bundle, and the hardened runner's npm has
-  # no registry mirror so the build otherwise times out ~10min on public npm.
+  # No web SPA build during `uv sync`: this job never serves the bundle
+  # and the hardened runner has no npm mirror (build would time out).
   OMNIGENT_SKIP_WEB_UI: "true"
   # Never let the test server pick up the runner's own credentials.
   ANTHROPIC_API_KEY: ""
@@ -35,187 +34,73 @@ env:
   CLAUDE_CODE: ""
 
 concurrency:
-  # PR re-syncs share a group by PR number so old runs cancel; push and
-  # dispatch key by SHA / branch.
+  # Key by PR number so re-syncs cancel; push/dispatch key by SHA/branch.
   group: integration-${{ github.workflow }}-${{ github.event.pull_request.number || github.event.inputs.branch || github.sha }}
   cancel-in-progress: true
 
 jobs:
+  # Security precondition gate: untrusted PRs hold until the scan passes
+  # (see security-gate.yml); trusted authors / non-PR events pass instantly.
+  gate:
+    uses: ./.github/workflows/security-gate.yml
+
+  # Harness matrix (integration-matrix.sh). Fork PRs run by default; draft PRs
+  # resolve to an empty matrix.
+  setup:
+    name: setup
+    needs: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Check out CI scripts
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          # Triggering ref (not pinned to main): the script must exist on the
+          # running ref, and it is not a security gate -- it only selects which
+          # harness legs run and can't expose secrets, so the PR's own copy is
+          # fine.
+          sparse-checkout: .github/scripts/ci
+          persist-credentials: false
+      - name: Compute integration matrix
+        id: matrix
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          IS_DRAFT: ${{ github.event.pull_request.draft }}
+        run: bash .github/scripts/ci/integration-matrix.sh
+
   integration:
     name: Integration (${{ matrix.name }})
-    if: ${{ !github.event.pull_request.draft }}
+    # Draft PRs resolve to an EMPTY matrix in `setup`, so this job produces zero
+    # leg runs (and thus no skipped placeholder check). Fork PRs DO run (mock
+    # LLM, no secrets) -- same as ci.yml.
+    needs: setup
     runs-on: ubuntu-latest
-    # Per-leg ceiling. Inner test step caps at 25 min; the rest of
-    # the budget covers install and the junit upload.
-    # All four legs run in parallel; longest leg gates wall-time.
+    # Per-leg ceiling; inner test step caps at 25 min, rest covers install +
+    # junit upload. Legs run in parallel; longest gates wall-time.
     timeout-minutes: 30
     strategy:
-      # Don't cancel sibling harnesses when one fails. The whole point of
-      # the matrix is to surface which harness is red without losing the
-      # signal on the others.
+      # Don't cancel sibling harnesses on failure; surface which is red.
       fail-fast: false
-      # One leg per wrapped harness, no pytest-shard splitting: the
-      # journey suite is a handful of tests per leg. Keep the
-      # ``Integration (...)`` leg-name prefix; the notify job's jq
-      # filter keys on it.
-      #
-      # Model pinning rationale:
-      # - claude-sdk on sonnet-4-6: tier 4, most TPM headroom.
-      # - codex on gpt-5-5: gpt-5-4-mini hit 429s historically.
-      # - openai-agents on gpt-5-4-mini: green there historically.
-      # OMNIGENT_TEST_MODEL_SPREAD below may rebalance within the
-      # same provider/tier pool (tests/_model_pools.py).
-      matrix:
-        include:
-          - name: claude-sdk
-            harness: claude-sdk
-            model: databricks-claude-sonnet-4-6
-            workers: 4
-          - name: openai-agents
-            harness: openai-agents
-            model: databricks-gpt-5-4-mini
-            workers: 4
-          # codex has the least rate-limit headroom of the three legs
-          # (burn-in failures were codex-only, clustered at peak PR
-          # traffic); halve its concurrent CLI + gateway burst.
-          - name: codex
-            harness: codex
-            model: databricks-gpt-5-5
-            workers: 2
+      # Harness legs (per-leg model + worker pinning) come from `setup`; [] when
+      # skipped. The ``Integration (...)`` leg-name prefix is load-bearing --
+      # the notify job's jq keys on it. Pinning rationale + codex worker halving
+      # live in .github/scripts/ci/integration-matrix.sh.
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
 
     steps:
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           ref: ${{ github.event.inputs.branch || github.ref }}
 
-      - name: Set up Python
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+      # Shared verbatim with server-compat.yml's backcompat-integration job via
+      # the composite action, so the two never drift. server_version is omitted
+      # here -> normal gate (tests the checked-out server, mock LLM).
+      - name: Run integration suite
+        uses: ./.github/actions/integration-run
         with:
-          python-version-file: ".python-version"
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v4
-        with:
-          enable-cache: true
-
-
-
-
-      - name: Cache virtualenv
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684  # v4
-        with:
-          path: .venv
-          key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
-      - name: Set LLM credentials
-        run: echo "LLM_API_KEY=${{ secrets.LLM_API_KEY }}" >> "$GITHUB_ENV"
-      - name: Write gateway profile (~/.databrickscfg)
-        env:
-          GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
-          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
-        run: |
-          # Strip the /serving-endpoints suffix the conftest re-appends.
-          host="${GATEWAY_BASE_URL%/serving-endpoints}"
-          cat > "$HOME/.databrickscfg" <<EOF
-          [default]
-          host  = $host
-          token = $LLM_API_KEY
-          EOF
-          # PAT passthrough for the codex / claude-sdk auth commands.
-          echo "DATABRICKS_BEARER=$LLM_API_KEY" >> "$GITHUB_ENV"
-
-      - name: Install project and dev dependencies
-        run: uv sync --extra all --extra dev
-
-      - name: Install binary dependencies
-        # Mirrors e2e.yml. `--ignore-scripts` blocks arbitrary postinstall
-        # hooks for every npm package; we run `claude-code`'s install.cjs
-        # explicitly (audited carve-out, no network, just a same-tree copy
-        # of the native binary already pulled in via optionalDependencies).
-        # `bubblewrap` is needed by the `linux_bwrap` sandbox backend used
-        # by tests/inner/* (same as ci.yml).
-        working-directory: .github/ci-deps
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y tmux ripgrep bubblewrap
-          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-          npm install --ignore-scripts
-          node node_modules/@anthropic-ai/claude-code/install.cjs
-          echo "${GITHUB_WORKSPACE}/.github/ci-deps/node_modules/.bin" >> "$GITHUB_PATH"
-
-
-
-      - name: Run nightly tests
-        timeout-minutes: 25
-        env:
-          HARNESS: ${{ matrix.harness }}
-          MODEL: ${{ matrix.model }}
-          WORKERS: ${{ matrix.workers }}
-          # Stable basetemp so the failure-upload step below can find
-          # the spawned server/runner logs.
-          INTEGRATION_TMP_BASE: /tmp/omnigent-integration-${{ github.run_id }}-${{ matrix.harness }}
-          # SDK's initialize control-request timeout in ms. Pinned here
-          # so the knob is visible alongside _CONNECT_TIMEOUT_SECONDS.
-          CLAUDE_CODE_STREAM_CLOSE_TIMEOUT: '60000'
-          # Diagnostic: bypass ``create_exec_launcher`` on the
-          # claude-sdk leg to isolate whether the silent connect hang is
-          # sandbox-related. Remove once the root cause lands.
-          OMNIGENT_CLAUDE_SDK_NO_SANDBOX: ${{ matrix.harness == 'claude-sdk' && '1' || '' }}
-          # Per-xdist-worker progress log (#426). pytest hook in
-          # tests/conftest.py fsyncs START/END per test so we recover
-          # the last-started test when a runner wedges.
-          PYTEST_PROGRESS_LOG_DIR: ${{ github.workspace }}/artifacts/progress-${{ matrix.harness }}
-          # Per-model call/token tally (dev/aggregate_token_usage.py).
-          OMNIGENT_TOKEN_USAGE_JSON: ${{ github.workspace }}/artifacts/tokens-${{ matrix.harness }}.json
-          # Load-balance interchangeable gateway models (tests/_model_pools.py).
-          OMNIGENT_TEST_MODEL_SPREAD: '1'
-          # 2026-06-11: the workspace FMAPI quota on gpt-5-4 is far
-          # below gpt-5-5 / gpt-5-4-mini, so the tests deterministically
-          # hashed to gpt-5-4 fail on sustained 429s while their pool
-          # neighbors pass. Drain it until the tier is raised.
-          OMNIGENT_TEST_MODEL_POOL_GPT: 'databricks-gpt-5-5,databricks-gpt-5-4-mini'
-        run: |
-          set -euo pipefail
-          mkdir -p artifacts "$INTEGRATION_TMP_BASE"
-          # --capture=no + --log-cli-level=INFO stream output live so
-          # the GitHub Actions log shows test progress and the
-          # executor's logs even if the step hits its 25-min timeout
-          # before pytest can render the buffered failure sections.
-          # --timeout=180 caps a single hung test with a traceback
-          # instead of letting it eat the step budget (see e2e.yml).
-          env -u OPENAI_API_KEY -u ANTHROPIC_API_KEY -u DATABRICKS_TOKEN \
-            uv run pytest tests/integration/ \
-              --integration \
-              --model "$MODEL" \
-              --harness "$HARNESS" \
-              --profile default \
-              --llm-api-key "$LLM_API_KEY" \
-              -n "$WORKERS" \
-              --dist=loadscope \
-              --timeout=180 \
-              --timeout-method=thread \
-              --basetemp="$INTEGRATION_TMP_BASE" \
-              --junitxml="artifacts/integration-${HARNESS}.xml" \
-              --capture=no --log-cli-level=INFO \
-              -v --tb=long --showlocals --log-level=INFO -r a
-
-      - name: Upload server/runner logs on failure
-        if: failure() || cancelled()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
-        with:
-          name: integration-server-logs-${{ matrix.harness }}-${{ github.run_id }}
-          path: |
-            /tmp/omnigent-integration-${{ github.run_id }}-${{ matrix.harness }}/**/server.log
-            /tmp/omnigent-integration-${{ github.run_id }}-${{ matrix.harness }}/**/runner.log
-          retention-days: 7
-          if-no-files-found: warn
-
-      - name: Upload junit + logs
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
-        with:
-          name: integration-${{ matrix.harness }}-${{ github.run_id }}
-          path: artifacts/
-          retention-days: 14
-          if-no-files-found: ignore
+          harness: ${{ matrix.harness }}
+          model: ${{ matrix.model }}
+          workers: ${{ matrix.workers }}

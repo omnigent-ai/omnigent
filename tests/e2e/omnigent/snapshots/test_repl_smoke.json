@@ -1,6 +1,5 @@
 {
     "exit_code": {"kind": "exact", "value": 0},
     "signal_status": {"kind": "exact", "value": null},
-    "user_banner_present": {"kind": "exact", "value": true},
-    "agent_banner_present": {"kind": "exact", "value": true}
+    "user_prompt_echoed": {"kind": "exact", "value": true}
 }

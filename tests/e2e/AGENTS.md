@@ -64,7 +64,7 @@ Some tests gate on local binaries. Install whichever you need; tests for missing
 |---------|-------------------------------------------------------|--------------------------------------------------------|
 | `tmux`  | `test_sys_terminal_e2e.py`, `test_repl_terminal_overview_e2e.py`, `tests/inner/test_terminal*.py`, `tests/terminals/`, `tests/tools/builtins/test_sys_terminal.py` | `brew install tmux` (macOS) / `apt install tmux` (Debian) |
 | `claude` | `claude-sdk` harness rows (`test_per_harness_claude_sdk.py` and any `[claude-sdk]` parametrize) | Anthropic Claude CLI — see `claude-agent-sdk` docs    |
-| `codex`  | `codex` harness rows (`test_per_harness_codex.py`, `test_openai_coder_codex_tools.py`, `test_run_omnigent_coding_supervisor.py`)                              | OpenAI Codex CLI                                       |
+| `codex`  | `codex` harness rows (`test_per_harness_codex.py`, `test_run_omnigent_coding_supervisor.py`)                              | OpenAI Codex CLI                                       |
 | `pi`     | `pi` harness rows (`test_per_harness_pi.py`)                                                            | Internal CLI — see project docs                        |
 | `databricks` | Required only when using `--profile <name>`                                                         | `brew install databricks` (macOS) / official installer |
 | `omnigent` (formerly `ap`) | A handful of legacy tests (`test_repl_approval_e2e.py`, `test_dispatch_fork_repl_e2e.py`)        | `uv sync` makes the CLI available via `uv run omnigent …`. Tests checking for a standalone `ap` binary on PATH currently skip — that's pre-existing infra debt unrelated to this directory. |

@@ -152,6 +152,36 @@ def test_redirect_stderr_to_log_redacts_direct_stderr_writes(
     )
 
 
+def test_setup_cli_logging_uses_data_dir_cli_destination(
+    isolated_cli_diagnostics: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """CLI diagnostics live under ``<data-dir>/logs/cli``."""
+    del isolated_cli_diagnostics
+    data_dir = tmp_path / "data"
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(data_dir))
+
+    ctx = cli_diagnostics.setup_cli_logging(["run", "agent.yaml"])
+
+    assert ctx.path.parent == data_dir / "logs" / "cli"
+    assert ctx.path.name.startswith("cli-")
+
+
+def test_setup_cli_logging_honors_debug_level(
+    isolated_cli_diagnostics: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``OMNIGENT_LOG_LEVEL=DEBUG`` makes debug records reach cli logs."""
+    del isolated_cli_diagnostics
+    monkeypatch.setenv("OMNIGENT_LOG_LEVEL", "DEBUG")
+    ctx = cli_diagnostics.setup_cli_logging(["run", "agent.yaml"])
+
+    logging.getLogger("omnigent.test").debug("debug-visible")
+
+    assert "debug-visible" in ctx.path.read_text(encoding="utf-8")
+
+
 def test_restore_stderr_returns_writes_to_original_terminal(
     isolated_cli_diagnostics: None,
     monkeypatch: pytest.MonkeyPatch,
@@ -363,21 +393,11 @@ def test_main_logs_click_exceptions(
     del isolated_cli_diagnostics
     from omnigent import cli as cli_module
 
-    def _skip_update_check(_argv: list[str]) -> bool:
-        """
-        Disable update checking so the test exercises only CLI error handling.
-
-        :param _argv: CLI argv passed by :func:`omnigent.cli.main`.
-        :returns: Always ``True``.
-        """
-        return True
-
     # An unsupported --harness is a deterministic ClickException trigger that
     # raises before any daemon/network work. (A bare `omnigent run` no longer
     # errors — it drops into first-run `configure harnesses` — so it can't be
     # the trigger here.)
     monkeypatch.setattr(sys, "argv", ["omnigent", "run", "--harness", "not-a-real-harness"])
-    monkeypatch.setattr(cli_module, "_should_skip_update_check", _skip_update_check)
     # Isolate from any real ~/.omnigent/config.yaml on the developer's machine.
     monkeypatch.setattr(cli_module, "_load_global_config", dict)
 
@@ -458,3 +478,29 @@ async def test_slash_command_exceptions_reach_cli_log(
     assert "openai/gpt-5.4-mini" not in log_text, (
         f"slash-command diagnostics should not copy command arguments into the log: {log_text!r}"
     )
+
+
+def test_safe_mtime_returns_zero_for_vanished_file(tmp_path: Path) -> None:
+    """A file present at glob time but gone before stat resolves to 0.0, not a raise."""
+    real = tmp_path / "cli-real.log"
+    real.write_text("x")
+    assert cli_diagnostics._safe_mtime(real) > 0.0
+    assert cli_diagnostics._safe_mtime(tmp_path / "cli-gone.log") == 0.0
+
+
+def test_prune_old_logs_survives_file_vanishing_mid_sort(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Concurrent ``omnigent run`` launches race to prune the same logs; a file
+    globbed by one but deleted by the other must not crash the sort (previously a
+    FileNotFoundError in the stat sort key aborted CLI startup)."""
+    real = [tmp_path / f"cli-{i:03d}.log" for i in range(cli_diagnostics.MAX_LOG_FILES + 3)]
+    for p in real:
+        p.write_text("x")
+    vanished = tmp_path / "cli-vanished.log"  # globbed, then deleted by a peer run
+    monkeypatch.setattr(Path, "glob", lambda self, pattern: [*real, vanished])
+
+    cli_diagnostics._prune_old_logs(tmp_path)  # must not raise
+
+    surviving = [p for p in real if p.exists()]
+    assert len(surviving) == cli_diagnostics.MAX_LOG_FILES  # newest kept, oldest pruned

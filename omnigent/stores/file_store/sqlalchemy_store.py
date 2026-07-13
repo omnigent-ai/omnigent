@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from sqlalchemy import and_, asc, desc, or_, select
 
-from omnigent.db.db_models import SqlFile
+from omnigent.db.db_models import SqlFile, current_workspace_id
 from omnigent.db.utils import (
     generate_file_id,
     get_or_create_engine,
@@ -97,7 +97,7 @@ class SqlAlchemyFileStore(FileStore):
             ``None``.
         """
         with self._session() as session:
-            row = session.get(SqlFile, file_id)
+            row = session.get(SqlFile, (current_workspace_id(), file_id))
             if row is None:
                 return None
             if session_id is not None and row.session_id != session_id:
@@ -129,7 +129,7 @@ class SqlAlchemyFileStore(FileStore):
         with self._session() as session:
             is_desc = order == "desc"
             sort_fn = desc if is_desc else asc
-            stmt = select(SqlFile)
+            stmt = select(SqlFile).where(SqlFile.workspace_id == current_workspace_id())
             if session_id is not None:
                 if include_unscoped:
                     stmt = stmt.where(
@@ -138,12 +138,26 @@ class SqlAlchemyFileStore(FileStore):
                 else:
                     stmt = stmt.where(SqlFile.session_id == session_id)
             if after:
-                sub = select(SqlFile.created_at).where(SqlFile.id == after).scalar_subquery()
+                sub = (
+                    select(SqlFile.created_at)
+                    .where(
+                        SqlFile.workspace_id == current_workspace_id(),
+                        SqlFile.id == after,
+                    )
+                    .scalar_subquery()
+                )
                 ts_cmp = SqlFile.created_at < sub if is_desc else SqlFile.created_at > sub
                 id_cmp = SqlFile.id < after if is_desc else SqlFile.id > after
                 stmt = stmt.where(or_(ts_cmp, and_(SqlFile.created_at == sub, id_cmp)))
             if before:
-                sub = select(SqlFile.created_at).where(SqlFile.id == before).scalar_subquery()
+                sub = (
+                    select(SqlFile.created_at)
+                    .where(
+                        SqlFile.workspace_id == current_workspace_id(),
+                        SqlFile.id == before,
+                    )
+                    .scalar_subquery()
+                )
                 ts_cmp = SqlFile.created_at > sub if is_desc else SqlFile.created_at < sub
                 id_cmp = SqlFile.id > before if is_desc else SqlFile.id < before
                 stmt = stmt.where(or_(ts_cmp, and_(SqlFile.created_at == sub, id_cmp)))
@@ -179,7 +193,7 @@ class SqlAlchemyFileStore(FileStore):
         :returns: ``True`` if deleted, ``False`` otherwise.
         """
         with self._session() as session:
-            row = session.get(SqlFile, file_id)
+            row = session.get(SqlFile, (current_workspace_id(), file_id))
             if not row:
                 return False
             if session_id is not None and row.session_id != session_id:
@@ -196,6 +210,7 @@ class SqlAlchemyFileStore(FileStore):
         """
         with self._session() as session:
             stmt = select(SqlFile).where(
+                SqlFile.workspace_id == current_workspace_id(),
                 SqlFile.session_id == session_id,
             )
             rows = list(session.execute(stmt).scalars().all())

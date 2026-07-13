@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from omnigent.tools.base import Tool, ToolContext
+from omnigent.tools.builtins.upload_file import safe_resolve
 
 _SCHEMA: dict[str, Any] = {
     "type": "function",
@@ -59,9 +60,14 @@ class ExportAgentTool(Tool):
 
     The onboarding assistant generates agent files inside the
     conversation's workspace (via ``sys_os_shell``). This tool
-    copies the result to the user's chosen location. The target
-    directory must not already exist (to prevent accidental
-    overwrites).
+    copies the result to the user's chosen location.
+
+    Security: the ``source`` is resolved with workspace containment
+    so it cannot escape the sandbox, symlinks inside ``source`` are
+    copied as links rather than dereferenced (so host files are never
+    read out of the workspace), and an existing ``target`` is refused
+    rather than deleted. The tool never recursively removes a path on
+    the user's filesystem.
     """
 
     @classmethod
@@ -111,7 +117,14 @@ class ExportAgentTool(Tool):
         if ctx.workspace is None:
             return "Error: no workspace available."
 
-        source = ctx.workspace / source_rel
+        # Contain ``source`` inside the workspace so a traversal path
+        # (e.g. "../../etc") or an escaping symlink cannot copy host
+        # files out of the sandbox.
+        try:
+            source = safe_resolve(source_rel, ctx.workspace)
+        except ValueError:
+            return f"Error: source '{source_rel}' escapes the workspace."
+
         target = Path(target_str)
 
         if not source.exists():
@@ -120,10 +133,17 @@ class ExportAgentTool(Tool):
         if not source.is_dir():
             return f"Error: source '{source_rel}' is not a directory."
 
-        if target.exists():
-            # Replace previous export — the onboarding workflow
-            # iterates and re-exports as the user refines the agent.
-            shutil.rmtree(str(target))
+        # Never recursively delete an LLM-controlled target path. The
+        # target lives on the user's filesystem, so refusing an
+        # existing path avoids arbitrary directory deletion.
+        if target.exists() or target.is_symlink():
+            return (
+                f"Error: target '{target}' already exists. Refusing to "
+                "delete or overwrite it; choose a path that does not exist."
+            )
 
-        shutil.copytree(str(source), str(target))
+        # symlinks=True copies links as links instead of dereferencing
+        # them, so a symlink inside ``source`` cannot pull host file
+        # contents into the exported copy.
+        shutil.copytree(str(source), str(target), symlinks=True)
         return f"Exported agent to {target}"

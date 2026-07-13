@@ -1,6 +1,6 @@
 """
 PTY-driven e2e: ``omnigent run --harness <harness>`` returns
-the LLM's reply through the new harness contract.
+the LLM's reply through the new harness contract (mock LLM).
 
 Why this test exists: it covers the interactive CLI path that
 server integration tests miss — the CLI's spec-bundling pipeline
@@ -11,7 +11,8 @@ back into the terminal). CLAUDE.md mandates a real REPL run
 before declaring an executor change done; this test pins it for
 every wrapped harness.
 
-Gated on ``--profile`` (real LLM). Without it, the test skips.
+Mock LLM: the mock server responds with ``XYZZY42`` so the test
+verifies the full REPL rendering pipeline without real credentials.
 """
 
 from __future__ import annotations
@@ -26,7 +27,8 @@ from typing import Any
 
 import pytest
 
-from tests.e2e._harness_probes import HARNESS_HARNESS_MODELS, HARNESS_IDS
+from tests.e2e._harness_probes import HARNESS_PROBES
+from tests.e2e.conftest import configure_mock_llm
 
 pexpect = pytest.importorskip("pexpect")
 
@@ -37,64 +39,30 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 _ANSI_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 _MARKER_TIMEOUT_S = 120.0
 
-
-@pytest.fixture
-def databricks_profile(request: pytest.FixtureRequest) -> str:
-    """
-    Return the ``--profile`` CLI arg, or skip if not provided.
-    """
-    profile: str = request.config.getoption("--profile")
-    if not profile:
-        pytest.skip("REPL e2e requires --profile <name> (e.g. --profile test-profile)")
-    return profile
+# Mock-only model for the REPL repl test — keyed per harness so
+# concurrent parametrize rows get isolated mock queues.
+_MOCK_MODEL_PREFIX = "mock-repl-harness"
 
 
-@pytest.fixture
-def repl_env(databricks_profile: str, tmp_path: Path) -> dict[str, str]:
-    """
-    Build the env dict for the REPL subprocess.
+def _mock_model_key(harness: str) -> str:
+    """Return the unique mock model name (= queue key) for *harness*."""
+    return f"{_MOCK_MODEL_PREFIX}-{harness}"
 
-    Strips ambient credentials that this agent process may have
-    inherited (DATABRICKS_TOKEN, ANTHROPIC_API_KEY, CODEX,
-    CLAUDE_CODE) so the test forces config to flow through the
-    spec — matches CLAUDE.md's "clear environment variables...
-    before running project code" guidance.
 
-    The Databricks profile is supplied through the global config's
-    ``auth:`` block in an isolated ``OMNIGENT_CONFIG_HOME`` — the
-    supported replacement for the removed ``--profile`` CLI flag.
+# Harnesses whose LLM client honours OPENAI_BASE_URL / ANTHROPIC_BASE_URL
+# and therefore work against the mock server without a real API key.
+# ``claude-sdk`` and ``pi`` use native CLI binaries that call additional
+# auth/metadata endpoints not served by the mock (e.g. /v1/beta/auth,
+# pi gateway initialisation), so they are excluded from this mock-only
+# parametrize and remain covered by the real-LLM e2e suite.
+_MOCK_COMPATIBLE_HARNESSES = {"openai-agents", "codex"}
 
-    :returns: Env mapping for ``pexpect.spawn``.
-    """
-    from tests.e2e.omnigent._pexpect_harness import ensure_repl_test_theme_env
-
-    config_home = tmp_path / "omnigent-config"
-    config_home.mkdir()
-    (config_home / "config.yaml").write_text(
-        f"auth:\n  type: databricks\n  profile: {databricks_profile}\n",
-        encoding="utf-8",
-    )
-    env = {
-        **os.environ,
-        "OMNIGENT_CONFIG_HOME": str(config_home),
-        "DATABRICKS_CONFIG_PROFILE": databricks_profile,
-        # PYTHONPATH so the worktree wins over any sibling
-        # editable install of omnigent.
-        "PYTHONPATH": (f"{_REPO_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}"),
-        # Force ANSI on; we strip it per-assertion via _ANSI_RE.
-        "TERM": "xterm-256color",
-        # Disable cursor-position reporting so the buffer doesn't
-        # fill with control sequences that confuse expect()
-        # patterns.
-        "PROMPT_TOOLKIT_NO_CPR": "1",
-        # The workflow's compaction layer constructs an LLM
-        # client at startup; never actually called for the
-        # claude-sdk routing, but the env check happens first.
-        "OPENAI_API_KEY": "stub-not-used-by-claude-sdk-path",
-    }
-    for var in ("DATABRICKS_TOKEN", "ANTHROPIC_API_KEY", "CODEX", "CLAUDE_CODE"):
-        env.pop(var, None)
-    return ensure_repl_test_theme_env(env)
+_MOCK_PARAMS = [
+    (p.harness, _mock_model_key(p.harness))
+    for p in HARNESS_PROBES
+    if p.harness in _MOCK_COMPATIBLE_HARNESSES
+]
+_MOCK_IDS = [p.harness for p in HARNESS_PROBES if p.harness in _MOCK_COMPATIBLE_HARNESSES]
 
 
 def _strip_ansi(text: str) -> str:
@@ -157,52 +125,83 @@ def _read_until_marker(
     )
 
 
-@pytest.mark.parametrize("harness,model", HARNESS_HARNESS_MODELS, ids=HARNESS_IDS)
+@pytest.fixture
+def repl_env(mock_llm_server_url: str, tmp_path: Path) -> dict[str, str]:
+    """
+    Build the env dict for the REPL subprocess using the mock LLM server.
+
+    Injects ``OPENAI_BASE_URL`` (and ``ANTHROPIC_BASE_URL`` for the
+    claude-sdk harness path) pointing at the mock server so the REPL
+    process's LLM calls are answered by the mock without real credentials.
+
+    :param mock_llm_server_url: Mock LLM server base URL.
+    :param tmp_path: Isolated temp directory for OMNIGENT_CONFIG_HOME.
+    :returns: Env mapping for ``pexpect.spawn``.
+    """
+    from tests.e2e.omnigent._pexpect_harness import ensure_repl_test_theme_env
+
+    config_home = tmp_path / "omnigent-config"
+    config_home.mkdir()
+    (config_home / "config.yaml").write_text(
+        "auth:\n  type: none\n",
+        encoding="utf-8",
+    )
+    env = {
+        **os.environ,
+        "OMNIGENT_CONFIG_HOME": str(config_home),
+        # PYTHONPATH so the worktree wins over any sibling
+        # editable install of omnigent.
+        "PYTHONPATH": (f"{_REPO_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}"),
+        # Force ANSI on; we strip it per-assertion via _ANSI_RE.
+        "TERM": "xterm-256color",
+        # Disable cursor-position reporting so the buffer doesn't
+        # fill with control sequences that confuse expect() patterns.
+        "PROMPT_TOOLKIT_NO_CPR": "1",
+        # Point all harnesses at the mock LLM server.
+        # openai-agents / codex / pi speak the Responses API.
+        "OPENAI_API_KEY": "mock-key",
+        "OPENAI_BASE_URL": f"{mock_llm_server_url}/v1",
+        # claude-sdk speaks the Anthropic Messages API; the mock
+        # server also serves POST /v1/messages. The Anthropic SDK
+        # appends /v1/messages to ANTHROPIC_BASE_URL, so set the
+        # base WITHOUT the /v1 suffix.
+        "ANTHROPIC_API_KEY": "mock-key",
+        "ANTHROPIC_BASE_URL": mock_llm_server_url,
+    }
+    # Strip real credentials that may have been inherited.
+    for var in ("DATABRICKS_TOKEN", "CODEX", "CLAUDE_CODE"):
+        env.pop(var, None)
+    return ensure_repl_test_theme_env(env)
+
+
+@pytest.mark.parametrize("harness,model", _MOCK_PARAMS, ids=_MOCK_IDS)
 def test_repl_run_routes_harness_through_new_harness_contract(
     repl_env: dict[str, str],
     harness: str,
     model: str,
+    mock_llm_server_url: str,
 ) -> None:
     """
     Drive the full ``omnigent run --harness <harness>``
-    flow under a PTY and verify the LLM's reply comes back.
+    flow under a PTY and verify the mock LLM's reply comes back.
 
     Verifies the path that the HTTP-only e2e tests miss:
 
     1. The CLI's ``run_chat`` packs ``--harness <harness>`` +
-       ``--model`` (plus the config-home auth block's profile)
-       into the temporary spec.
+       ``--model`` into the temporary spec.
     2. It spawns a local Omnigent server subprocess.
     3. It uploads the spec via ``/api/agents``.
     4. The Omnigent server's ``_create_executor`` sees an
        ``executor.type == "omnigent"`` +
        ``config.harness == <harness>`` spec (after the
        omnigent-YAML translator runs) and dispatches to
-       the harness HTTP client via the step-5f
-       branch.
-    5. The LLM's reply streams back through SSE → the REPL's
-       SDK client → terminal rendering.
+       the harness HTTP client via the step-5f branch.
+    5. The mock LLM replies with ``XYZZY42`` which streams back
+       through SSE → the REPL's SDK client → terminal rendering.
 
-    The marker is XYZZY (not in the prompt) so the assertion
+    The marker is XYZZY42 (not in the prompt) so the assertion
     checks the model's reply specifically, not the echoed prompt.
     """
-    # The marker MUST NOT appear in the user prompt verbatim:
-    # the REPL echoes the prompt back into the PTY, and a marker
-    # in the prompt would fire the substring assertion before
-    # the model's reply has even been generated. So we describe
-    # the 7 characters individually and ask the model to
-    # concatenate them.
-    #
-    # The earlier prompt — "output the 7 characters X-Y-Z-Z-Y-4-2
-    # concatenated, no dashes" — was ambiguous enough that
-    # codex (gpt-5-4-mini) and openai-agents both sometimes
-    # echoed the dashed form ``X-Y-Z-Z-Y-4-2`` instead of the
-    # concatenated ``XYZZY42``, manifesting as a 180s timeout
-    # on the marker substring check. The new instruction names
-    # each character explicitly ("capital X then capital Y
-    # ...") and asserts the exact length, leaving no room for
-    # the model to interpret "concatenated, no dashes" as a
-    # description of the input rather than the output.
     marker = "XYZZY42"
     user_prompt = (
         "Reply with EXACTLY 7 characters and nothing else: "
@@ -212,6 +211,13 @@ def test_repl_run_routes_harness_through_new_harness_contract(
         "must be those 7 characters in that order with no "
         "spaces, no dashes, no quotes, no commas, no "
         "newlines, and no surrounding text."
+    )
+
+    # Pre-configure the mock server to return XYZZY42 for this harness.
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": marker}],
+        key=model,
     )
 
     child = pexpect.spawn(

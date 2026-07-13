@@ -1,0 +1,176 @@
+# Omnigent UBI images: server (default target) + host (`--target host`).
+#
+# Red Hat Universal Base Image (UBI 9) variant of the standard Dockerfile,
+# for RHEL/OpenShift environments that require UBI-compliant containers.
+# Same two-target structure: `runtime` (server) and `host` (sandbox).
+#
+# Build (from repo root):
+#
+#   docker build -t omnigent-server:ubi \
+#                -f deploy/docker/Dockerfile.ubi .
+#
+#   docker build -t omnigent-host:ubi --target host \
+#                -f deploy/docker/Dockerfile.ubi .
+
+ARG PYTHON_VERSION=3.12
+ARG NODE_VERSION=20
+
+# ── Web UI builder ──────────────────────────────────────
+FROM registry.access.redhat.com/ubi9/nodejs-${NODE_VERSION} AS web-builder
+ARG NPM_CONFIG_REGISTRY=
+ENV NPM_CONFIG_REGISTRY=${NPM_CONFIG_REGISTRY}
+
+USER 0
+WORKDIR /web/web
+COPY web/package.json web/package-lock.json ./
+RUN npm install --no-audit --no-fund
+COPY web/ ./
+RUN npm run build
+
+# ── Python builder (shared: server + host) ──────────────
+FROM registry.access.redhat.com/ubi9/python-312 AS builder
+
+ARG PYPI_INDEX_URL=https://pypi.org/simple
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+USER 0
+
+RUN dnf install -y --nodocs gcc gcc-c++ make python3-devel \
+ && dnf clean all
+
+RUN pip install --index-url ${PYPI_INDEX_URL} --no-cache-dir uv
+
+WORKDIR /build
+
+COPY pyproject.toml setup.py ./
+COPY LICENSE NOTICE ./
+COPY sdks/ ./sdks/
+COPY omnigent/ ./omnigent/
+COPY examples/ ./examples/
+
+RUN python -m venv /opt/venv
+ENV VIRTUAL_ENV=/opt/venv \
+    PATH="/opt/venv/bin:${PATH}"
+
+RUN uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} -e .
+
+# ── Server builder ──────────────────────────────────────
+FROM builder AS server-builder
+
+ARG PYPI_INDEX_URL=https://pypi.org/simple
+
+COPY --from=web-builder /web/omnigent/server/static/web-ui ./omnigent/server/static/web-ui
+RUN test -f ./omnigent/server/static/web-ui/index.html \
+    || (echo "ERROR: SPA bundle missing after web-builder stage — check the web build." && exit 1)
+
+RUN uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} 'psycopg[binary]>=3.1,<4'
+
+# ── Node alias stage ─────────────────────────────────────
+FROM registry.access.redhat.com/ubi9/nodejs-${NODE_VERSION} AS node-runtime
+
+# ── Host runtime (`--target host`) ──────────────────────
+FROM registry.access.redhat.com/ubi9/python-312 AS host
+ARG NPM_CONFIG_REGISTRY=
+ENV NPM_CONFIG_REGISTRY=${NPM_CONFIG_REGISTRY}
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PATH="/opt/venv/bin:${PATH}" \
+    IS_SANDBOX=1
+
+USER 0
+
+# curl-minimal and ca-certificates are preinstalled in UBI9.
+RUN dnf install -y --nodocs git tmux unzip \
+ && dnf clean all
+
+RUN git config --system credential.helper \
+      '!f() { [ "$1" = get ] || return 0; [ -n "$GIT_TOKEN" ] || return 0; printf "username=%s\npassword=%s\n" "${GIT_USERNAME:-x-access-token}" "$GIT_TOKEN"; }; f'
+
+# Node runtime from the UBI Node image.
+COPY --from=node-runtime /usr/bin/node /usr/local/bin/node
+COPY --from=node-runtime /usr/lib/node_modules /usr/local/lib/node_modules
+RUN ln -sf /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
+ && ln -sf /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
+
+RUN npm install -g --no-audit --no-fund \
+      @anthropic-ai/claude-code \
+      @openai/codex \
+      @earendil-works/pi-coding-agent \
+ && npm cache clean --force
+
+# Kiro CLI is not published as an npm package and its installer has no version
+# flag (always fetches `latest`). Pin it by fetching the immutable per-arch zip
+# from the versioned CDN path + verifying sha256, then running the package's own
+# install.sh and copying the binaries onto the global PATH. The `--version` check
+# asserts the binary is the pinned version (a sanity guard atop the sha256). See
+# the fuller rationale in deploy/docker/Dockerfile — keep KIRO_CLI_VERSION + both
+# SHA256s in sync.
+ARG KIRO_CLI_VERSION=2.10.0
+ARG KIRO_CLI_SHA256_AMD64=be9d8b6d7c44f93a83ca22466043d98ad058e6ed3c12fffd068f3fb8a60b3b70
+ARG KIRO_CLI_SHA256_ARM64=0afb37399b9e2847c2f2e3f5d9052c8bc52bbf1e30401ea284a602661bce34bc
+RUN set -eu; \
+    case "$(uname -m)" in \
+      x86_64)  asset="kirocli-x86_64-linux.zip";  sha="$KIRO_CLI_SHA256_AMD64" ;; \
+      aarch64) asset="kirocli-aarch64-linux.zip"; sha="$KIRO_CLI_SHA256_ARM64" ;; \
+      *) echo "ERROR: unsupported arch '$(uname -m)' for kiro-cli" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /tmp/kiro.zip "https://prod.download.cli.kiro.dev/stable/${KIRO_CLI_VERSION}/${asset}"; \
+    echo "${sha}  /tmp/kiro.zip" | sha256sum -c -; \
+    unzip -q /tmp/kiro.zip -d /tmp/kiro; \
+    KIRO_CLI_SKIP_SETUP=1 sh /tmp/kiro/kirocli/install.sh; \
+    install -m 0755 /root/.local/bin/kiro-cli /usr/local/bin/kiro-cli; \
+    if [ -f /root/.local/bin/kiro-cli-chat ]; then \
+      install -m 0755 /root/.local/bin/kiro-cli-chat /usr/local/bin/kiro-cli-chat; \
+    fi; \
+    rm -rf /tmp/kiro /tmp/kiro.zip; \
+    installed="$(/usr/local/bin/kiro-cli --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"; \
+    [ "$installed" = "$KIRO_CLI_VERSION" ] || { \
+      echo "ERROR: kiro-cli reports '${installed:-<none>}', expected '$KIRO_CLI_VERSION'." >&2; exit 1; }; \
+    echo "kiro-cli ${KIRO_CLI_VERSION} pinned (sha256 verified)"
+
+COPY --from=builder /opt/venv /opt/venv
+COPY --from=builder /build /build
+
+RUN echo 'export PATH="/opt/venv/bin:${PATH}"' > /etc/profile.d/omnigent-venv.sh
+
+WORKDIR /root
+CMD ["sleep", "infinity"]
+
+# ── Server runtime (default target) ─────────────────────
+FROM registry.access.redhat.com/ubi9/python-312 AS runtime
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PATH="/opt/venv/bin:${PATH}"
+
+USER 0
+
+# curl-minimal and ca-certificates are preinstalled in UBI9;
+# installing full curl would conflict with curl-minimal.
+
+
+COPY --from=server-builder /opt/venv /opt/venv
+COPY --from=server-builder /build /build
+COPY deploy/docker/entrypoint.py /app/entrypoint.py
+
+WORKDIR /app
+
+RUN mkdir -p /data/artifacts \
+ && chown -R 1001:0 /data \
+ && chmod -R g=u /data
+
+ENV PORT=8000 \
+    HOST=0.0.0.0 \
+    ARTIFACT_DIR=/data/artifacts
+
+EXPOSE 8000
+
+USER 1001
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD curl -fsS "http://127.0.0.1:${PORT}/health" || exit 1
+
+CMD ["python", "/app/entrypoint.py"]

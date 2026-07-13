@@ -1,39 +1,53 @@
 """Built-in cost-budget policy.
 
 A single factory, :func:`cost_budget`, that gates a session on its
-cumulative LLM spend (USD) at the **tool-call** phase — the one point a
-native ``PreToolUse`` hook can actually block before the action runs:
+cumulative LLM spend (USD) at the **request** phase (before the LLM
+turn, so text-only turns are budgeted too) and the **tool-call** phase
+(the point a native ``PreToolUse`` hook can block before the action
+runs):
 
-- ``ask_thresholds_usd`` (optional, soft): a list of warning
-  checkpoints. The first time the session's ``total_cost_usd`` crosses
-  each checkpoint, the tool call is parked for user approval (ASK). Each
+- ``ask_thresholds_usd`` (optional, soft, **request + tool-call
+  phases**): a list of warning checkpoints. The first time the session's
+  ``total_cost_usd`` crosses each checkpoint, the turn (request phase) or
+  the tool call (tool-call phase) is parked for user approval (ASK). Each
   checkpoint prompts at most once *per approval* — the highest-approved
   checkpoint is remembered in ``session_state``, so approving lets spend
-  continue to the next checkpoint. A decline blocks that one tool call
-  but does not record the checkpoint, so the next tool call over the
-  same threshold re-asks until it is approved.
-- ``max_cost_usd`` (required, hard): once spend reaches this, the
-  policy forces a model downgrade. Rather than stopping the session, it
-  DENYs every tool call **while the session is still on an expensive
-  model** (``expensive_models``), telling the user to switch to a
+  continue to the next checkpoint. A decline blocks that one turn / tool
+  call but does not record the checkpoint, so the next request or tool
+  call over the same threshold re-asks until it is approved. (Both phases
+  have a server-side approval round-trip that applies the ASK's
+  ``state_updates`` only on accept — the request phase parks the whole
+  turn before it reaches the model, so text-only turns are warned too.)
+- ``max_cost_usd`` (required, hard, **request + tool-call phases**): once
+  spend reaches this, the policy forces a model downgrade. Rather than
+  stopping the session, it DENYs **while the session is still on an
+  expensive model** (``expensive_models``) — the whole turn at the
+  request phase, or each tool call — telling the user to switch to a
   cheaper model with ``/model``. Once the session has switched off an
-  expensive model the tool calls are allowed again — the budget becomes
-  a "downgrade gate," not a hard stop.
+  expensive model it is allowed again — the budget becomes a "downgrade
+  gate," not a hard stop.
 
 It reads cumulative spend from
 ``event["context"]["usage"]["total_cost_usd"]`` — the running session
 total maintained server-side (token-priced for relay/codex sessions,
 billed directly for claude-native) — and the active model from
 ``event["context"]["model"]`` (the conversation's ``model_override`` or
-the agent spec's ``llm.model``, resolved by the policy engine). When
-pricing is unavailable the cost stays ``0.0`` and the policy never trips
-(it cannot budget what it cannot price).
+the agent spec's ``llm.model``, resolved by the policy engine). When a
+model has no catalog pricing, ``total_cost_usd`` is never written to the
+session, so the policy would score the session at ``$0`` and never
+enforce the budget. To prevent unpriced spend silently bypassing the cap,
+the gate **fails closed** when token usage is present but
+``total_cost_usd`` is absent: it returns DENY with a message asking the
+user to switch to a priced model.
 
-Because the gate runs on ``tool_call``, a DENY/ASK blocks that specific
-tool call (the native hook returns ``deny`` / parks for approval) rather
-than ending the session. Text-only turns with no tool calls are not
-gated. Cost is refreshed at turn boundaries, so a single very expensive
-turn can still overshoot before the next check.
+On the ``tool_call`` phase a DENY/ASK blocks that specific tool call
+(the native hook returns ``deny`` / parks for approval) rather than
+ending the session. On the ``request`` phase a DENY/ASK blocks the whole
+turn before the model runs — so text-only turns with no tool calls are
+budgeted (DENY) and warned (ASK) too; the verdict is surfaced straight
+to the user via the same server-side approval round-trip. Cost is
+refreshed at turn boundaries, so a single very expensive turn can still
+overshoot before the next check.
 
 YAML usage::
 
@@ -45,7 +59,7 @@ YAML usage::
           arguments:
             max_cost_usd: 5.0
             ask_thresholds_usd: [1.0, 2.5]
-            expensive_models: ["opus", "gpt-5.5"]
+            expensive_models: ["opus", "gpt-5"]
 
 The factory must be referenced via ``function: {path, arguments}`` with
 a non-empty ``arguments`` block (the registry declares it
@@ -54,10 +68,12 @@ a non-empty ``arguments`` block (the registry declares it
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 from omnigent.policies.schema import (
     SESSION_COST_ASK_APPROVED_STATE_KEY,
+    SESSION_COST_UNPRICED_APPROVED_KEY,
     USER_DAILY_ASK_APPROVED_STATE_KEY,
     PolicyCallable,
     PolicyEvent,
@@ -66,6 +82,65 @@ from omnigent.policies.schema import (
 
 _ALLOW: PolicyResponse = {"result": "ALLOW"}
 
+# session_state key recording that the user has acknowledged and approved
+# continuing a session whose active model has no catalog pricing. Routed to
+# the ROOT conversation (like SESSION_COST_ASK_APPROVED_STATE_KEY) so a
+# single approval on the parent covers the whole spawn tree.
+_UNPRICED_APPROVED_KEY = SESSION_COST_UNPRICED_APPROVED_KEY
+
+# ASK response emitted when the session has consumed tokens on a model with
+# no catalog pricing and the user has not yet acknowledged it. The gate
+# cannot enforce a budget it cannot measure — asking rather than denying lets
+# the operator or user make an informed choice, while still preventing silent
+# pass-through at $0.
+_UNPRICED_ASK: PolicyResponse = {
+    "result": "ASK",
+    "reason": (
+        "The active model has no catalog pricing so cumulative spend cannot be "
+        "tracked. Continuing will allow untracked spend that counts against "
+        "neither the cap nor the warning thresholds. Switch to a priced model "
+        "to restore budget enforcement, or approve to continue without it."
+    ),
+    "state_updates": [
+        {
+            "key": _UNPRICED_APPROVED_KEY,
+            "action": "set",
+            "value": True,
+        }
+    ],
+}
+
+
+def _usage_is_unpriced(usage: dict[str, Any]) -> bool:
+    """Return ``True`` when token usage is present but cost is unpriced.
+
+    The session has had at least one turn (token counters are non-zero) yet
+    ``total_cost_usd`` is absent — meaning no turn was ever priced by the
+    catalog. The gate cannot enforce a budget against this session: it would
+    score every check at ``$0`` and never fire. Callers use this to fail
+    closed (DENY) rather than fail open.
+
+    Returns ``False`` when ``total_cost_usd`` is already present (priced) or
+    when no tokens have been consumed yet (first request, nothing to price).
+    The first turn on an unpriced model still runs — the gate only has
+    post-turn data at check time — but every subsequent turn is denied.
+
+    :param usage: ``event["context"]["usage"]`` or equivalent subtree dict.
+    :returns: ``True`` when enforcement should fail closed due to missing
+        pricing.
+    """
+    if "total_cost_usd" in usage:
+        return False
+    return bool(
+        usage.get("input_tokens") or usage.get("output_tokens") or usage.get("total_tokens")
+    )
+
+
+# Phases the budget gate fires on. ``tool_call`` is the native ``PreToolUse``
+# block point; ``request`` runs before the LLM turn so text-only turns (no
+# tool call) are budgeted too. Every other phase abstains (ALLOW).
+_GATED_PHASES = frozenset({"request", "tool_call"})
+
 # session_state key recording the highest ``ask_thresholds_usd`` checkpoint
 # the user has already approved continuing past (a USD float; 0.0 when none).
 # Set when an ASK is approved so each checkpoint prompts at most once. Shared
@@ -73,17 +148,6 @@ _ALLOW: PolicyResponse = {"result": "ALLOW"}
 # covers the whole spawn tree (the budget is per-session, but a sub-agent runs
 # as its own conversation).
 _ASK_APPROVED_KEY = SESSION_COST_ASK_APPROVED_STATE_KEY
-
-# Default substring tokens (case-insensitive) identifying the "expensive"
-# model tiers that must be downgraded once the session passes
-# ``max_cost_usd``. Matched as substrings of the active model id so a single
-# token hits every deployment spelling AND the tier aliases the native
-# ``/model`` command stores: ``"opus"`` matches ``claude-opus-4-8``,
-# ``databricks-claude-opus-4-7``, and the bare alias ``"opus"``; GPT-5.5
-# ships as ``databricks-gpt-5-5`` (dashes) in this stack, so both the dash
-# and dot spellings are listed. Fable (``claude-fable-5``, the tier above
-# Opus at 2x its price), Opus, and GPT-5.5 are the costly tiers today.
-_DEFAULT_EXPENSIVE_MODELS = ("fable", "opus", "gpt-5.5", "gpt-5-5")
 
 
 def _session_cost_usd(event: PolicyEvent) -> float:
@@ -140,11 +204,20 @@ def _over_budget_deny_reason(
     expensive_tokens: tuple[str, ...],
     harness: str | None,
     *,
+    phase: str = "tool_call",
     policy_label: str = "session cost-budget",
     budget_label: str = "cost budget",
     subject_user: str | None = None,
+    block_all: bool = False,
 ) -> str:
-    """Build the over-budget DENY reason for the tool-call gate.
+    """Build the over-budget DENY reason for the budget gate.
+
+    On the ``request`` phase the DENY reason is surfaced directly to the
+    user (the turn never reaches the model), so it is the plain
+    user-facing message — no "relay this verbatim" / "re-issue the tool
+    call" wrapper. On the ``tool_call`` phase the reason is handed to the
+    model by native harnesses, so it is phrased as a DIRECTIVE (see
+    below).
 
     Phrased as a DIRECTIVE to the agent (not a statement): native harnesses
     hand this reason to the model, which otherwise paraphrases it and drops
@@ -164,10 +237,13 @@ def _over_budget_deny_reason(
     :param cost: Current cumulative session spend in USD, e.g. ``6.0``.
     :param max_cost_usd: The hard limit in USD, e.g. ``5.0``.
     :param expensive_tokens: The high-cost model substring tokens, listed for
-        the user, e.g. ``("opus", "gpt-5.5", "gpt-5-5")``.
+        the user, e.g. ``("opus", "gpt-5")``.
     :param harness: The harness name from the event (see
         :func:`_current_harness`), e.g. ``"codex-native"``; ``None`` when
         unstamped.
+    :param phase: The enforcement phase the DENY is for — ``"request"``
+        (user-facing message) or ``"tool_call"`` (model-directed directive).
+        Defaults to ``"tool_call"``.
     :param policy_label: Which budget policy is speaking, woven into
         "Blocked by the {policy_label} policy". Defaults to
         ``"session cost-budget"``; the per-user daily variant passes
@@ -181,16 +257,41 @@ def _over_budget_deny_reason(
         the session cost-budget output is unchanged.
     :returns: The DENY reason string.
     """
+    spend_subject = f"{subject_user}'s spend" if subject_user else "spend"
+    if block_all:
+        # All models are blocked (expensive_models=[]): no cheaper model exists
+        # to switch to, so the message is a hard stop with no switch hint.
+        verbatim = (
+            f"You've hit the ${max_cost_usd:.2f} {budget_label}. "
+            f"All model calls are blocked over budget."
+        )
+        if phase == "request":
+            return (
+                f"Blocked by the {policy_label} policy: {spend_subject} ${cost:.2f} reached the "
+                f"${max_cost_usd:.2f} limit. {verbatim}"
+            )
+        return (
+            f"Blocked by the {policy_label} policy: {spend_subject} ${cost:.2f} reached the "
+            f"${max_cost_usd:.2f} limit, and all further tool calls are blocked. Relay this to "
+            f"the user verbatim, then stop and wait for them — do not silently re-run the tool "
+            f'right now: "{verbatim}"'
+        )
     expensive_list = ", ".join(expensive_tokens) or "the configured high-cost models"
     if harness is not None and "codex" in harness:
         switch_hint = "in the terminal, run /model and pick a cheaper model to continue"
     else:
         switch_hint = "switch to a cheaper model to continue"
-    spend_subject = f"{subject_user}'s spend" if subject_user else "spend"
     verbatim = (
         f"You've hit the ${max_cost_usd:.2f} {budget_label}. High-cost models "
         f"({expensive_list}) are blocked over budget — {switch_hint}."
     )
+    if phase == "request":
+        # Request-phase DENY: surfaced straight to the user (the turn never
+        # reaches the model), so this is the plain message — no relay wrapper.
+        return (
+            f"Blocked by the {policy_label} policy: {spend_subject} ${cost:.2f} reached the "
+            f"${max_cost_usd:.2f} limit. {verbatim}"
+        )
     return (
         f"Blocked by the {policy_label} policy: {spend_subject} ${cost:.2f} reached the "
         f"${max_cost_usd:.2f} limit, and tool calls are blocked while on a high-cost "
@@ -201,117 +302,228 @@ def _over_budget_deny_reason(
     )
 
 
-def _model_blocked_over_budget(model: str | None, expensive_tokens: tuple[str, ...]) -> bool:
+def _model_blocked_over_budget(
+    model: str | None,
+    expensive_tokens: tuple[str, ...],
+    exclude_tokens: tuple[str, ...] = (),
+    *,
+    block_all: bool = False,
+) -> bool:
     """Decide whether the active model is blocked once over budget.
 
     Returns ``True`` when the session must downgrade to keep calling
-    tools — i.e. the model matches one of the expensive tokens, OR the
-    model is undeterminable (``None``). Failing closed on an unknown
-    model keeps the budget enforceable: rather than silently allowing
-    unbounded spend, it asks the user to pick a cheaper model with
-    ``/model`` (which sets ``model_override``, making the model
-    knowable and — if cheap — unblocking the session).
+    tools — i.e. the model matches one of the expensive tokens (and is
+    not carved out by an exclude token), OR the model is undeterminable
+    (``None``). Failing closed on an unknown model keeps the budget
+    enforceable: rather than silently allowing unbounded spend, it asks
+    the user to pick a cheaper model with ``/model`` (which sets
+    ``model_override``, making the model knowable and — if cheap —
+    unblocking the session).
+
+    An exclude token takes precedence over an expensive token: a model
+    matching both (e.g. ``gpt-5-mini`` matches ``"gpt-5"`` and the
+    exclude ``"-mini"``) is NOT blocked. This lets a broad expensive
+    token (``"gpt-5"``) cover a whole family while exempting its cheap
+    variants.
+
+    When ``block_all=True`` (``expensive_models=[]`` was passed to the
+    factory) every model is blocked — the budget is a true hard stop.
 
     :param model: The active model id, or ``None`` when
         undeterminable.
     :param expensive_tokens: Lowercased substring tokens identifying
-        expensive models, e.g. ``("opus", "gpt-5.5")``.
+        expensive models, e.g. ``("opus", "gpt-5")``.
+    :param exclude_tokens: Lowercased substring tokens that override an
+        expensive match back to "not expensive", e.g.
+        ``("-mini", "-nano")``. Defaults to empty (no exclusions).
+    :param block_all: When ``True``, return ``True`` for every model
+        (``expensive_models=[]`` semantics — all models blocked).
     :returns: ``True`` when tool calls should be DENYed over budget.
     """
+    if block_all:
+        return True
     if model is None:
         return True
     low = model.lower()
+    if any(token in low for token in exclude_tokens):
+        return False
     return any(token in low for token in expensive_tokens)
 
 
+@dataclass(frozen=True)
+class _ExpensiveModelConfig:
+    """Resolved expensive-model matching configuration for a budget factory.
+
+    :param expensive_tokens: Lowercased substring tokens that mark a
+        model as expensive, e.g. ``("fable", "opus", "gpt-5")``.
+    :param exclude_tokens: Lowercased substring tokens that override an
+        expensive match back to "not expensive", e.g. ``("-mini",
+        "-nano")``. Non-empty only for the built-in default set; empty
+        when the caller supplies an explicit ``expensive_models`` list.
+    :param hard_cap_enabled: Whether the hard over-budget DENY gate is
+        active. Always ``True`` — including when the caller passes an
+        empty ``expensive_models`` list, which means *all* models are
+        blocked once over budget (see ``block_all_models``).
+    :param block_all_models: When ``True`` (set only when the caller
+        passes ``expensive_models=[]``) every model — not just a named
+        expensive tier — is blocked once the hard limit is reached.
+        ``_model_blocked_over_budget`` short-circuits to ``True``
+        regardless of the active model id.
+    """
+
+    expensive_tokens: tuple[str, ...]
+    exclude_tokens: tuple[str, ...]
+    hard_cap_enabled: bool
+    block_all_models: bool = False
+
+
+def _resolve_expensive_models(expensive_models: list[str] | None) -> _ExpensiveModelConfig:
+    """Resolve the ``expensive_models`` factory argument into matching config.
+
+    Shared by :func:`cost_budget` and :func:`user_daily_cost_budget` so
+    both treat the argument identically:
+
+    - ``None`` or ``[]`` → **all models blocked** once over budget
+      (``block_all_models=True``, hard gate on). This is a true hard
+      stop: no model can continue once the limit is reached.
+    - a non-empty list → those tokens (lowercased), matched literally
+      with no exclusions (the caller controls the set exactly); hard gate
+      on (downgrade gate — cheaper models still allowed over budget).
+
+    :param expensive_models: The factory argument, e.g.
+        ``["opus", "gpt-5"]``, ``None``, or ``[]``.
+    :returns: The resolved :class:`_ExpensiveModelConfig`.
+    :raises ValueError: If any entry is not a non-empty string.
+    """
+    if expensive_models is None or len(expensive_models) == 0:
+        return _ExpensiveModelConfig(
+            expensive_tokens=(),
+            exclude_tokens=(),
+            hard_cap_enabled=True,
+            block_all_models=True,
+        )
+    for m in expensive_models:
+        if not isinstance(m, str) or not m:
+            raise ValueError(f"each expensive_models value must be a non-empty string, got {m!r}")
+    expensive_tokens = tuple(m.lower() for m in expensive_models)
+    return _ExpensiveModelConfig(
+        expensive_tokens=expensive_tokens,
+        exclude_tokens=(),
+        hard_cap_enabled=True,
+    )
+
+
 def cost_budget(
-    max_cost_usd: float,
+    max_cost_usd: float | None = None,
     ask_thresholds_usd: list[float] | None = None,
     expensive_models: list[str] | None = None,
 ) -> PolicyCallable:
-    """Factory: gate a session on cumulative LLM spend (USD) at tool-call.
+    """Factory: gate a session on cumulative LLM spend (USD).
 
-    Gates the ``tool_call`` phase only: ASK at each soft warning
-    checkpoint ("continue?"; recorded on approve so it doesn't re-prompt,
-    re-asked after a decline) and, once the hard limit is reached, DENY
-    every tool call while the session is still on an expensive model —
-    telling the user to ``/model`` to a cheaper one. Abstains (ALLOW) on
-    every other phase and whenever cost is unpriced (``0.0``).
+    The hard limit (when set) gates BOTH the ``request`` phase (blocking
+    the whole turn before the LLM runs, so text-only turns are budgeted
+    too) and the ``tool_call`` phase: once the limit is reached, DENY
+    while the session is still on an expensive model — telling the user
+    to ``/model`` to a cheaper one. The soft warning checkpoints (ASK
+    "continue?"; recorded on approve so they don't re-prompt, re-asked
+    after a decline) fire on BOTH the ``request`` and ``tool_call``
+    phases — both have a server-side approval round-trip (see
+    ``evaluate``). Abstains (ALLOW) on every other phase and whenever
+    cost is unpriced (``0.0``).
 
-    :param max_cost_usd: Hard limit in USD. Once cumulative session cost
-        reaches this, tool calls are DENYed while the session is on an
-        expensive model, e.g. ``5.0``. Must be ``> 0``.
+    :param max_cost_usd: Optional hard limit in USD. Once cumulative
+        session cost reaches this, tool calls are DENYed while the
+        session is on an expensive model, e.g. ``5.0``. Must be ``> 0``
+        if provided. Either this or *ask_thresholds_usd* must be set.
     :param ask_thresholds_usd: Optional soft warning checkpoints in USD,
         e.g. ``[1.0, 2.5]``. Each ASKs for approval the first time
         cumulative cost crosses it (approval remembered via
         ``session_state``, so an approved checkpoint prompts at most
-        once; a decline blocks the one tool call and re-asks next time).
-        ``None`` or ``[]`` disables the soft gate. Every value must be
-        ``> 0`` and strictly less than *max_cost_usd*. Order does not
-        matter — they are sorted internally.
+        once; a decline blocks the one turn / tool call and re-asks next
+        time). ``None`` or ``[]`` disables the soft gate. Every value must be
+        ``> 0`` and strictly less than *max_cost_usd* when both are set.
+        Order does not matter — they are sorted internally.
     :param expensive_models: Optional case-insensitive substring tokens
         identifying the model tiers blocked once over *max_cost_usd*,
-        e.g. ``["opus", "gpt-5.5"]``. A token matches when it is a
+        e.g. ``["opus", "gpt-5"]``. A token matches when it is a
         substring of the active model id (so ``"opus"`` matches both
         ``"databricks-claude-opus-4-8"`` and the alias ``"opus"``).
-        ``None`` uses the built-in default (Opus + GPT-5.5). ``[]``
-        disables the hard gate entirely (soft thresholds only, no
-        budget block). Each value must be a non-empty string.
+        ``None`` (the default) or ``[]`` makes the hard cap a true hard
+        stop: **all** models are blocked once the limit is reached. Pass
+        an explicit non-empty list for a downgrade gate that only blocks
+        the named tiers, letting cheaper models continue over budget.
+        Each value must be a non-empty string.
     :returns: A policy callable implementing the budget gate.
-    :raises ValueError: If *max_cost_usd* is not positive, any
-        *ask_thresholds_usd* value is not in ``(0, max_cost_usd)``, or
-        any *expensive_models* entry is not a non-empty string.
+    :raises ValueError: If neither *max_cost_usd* nor *ask_thresholds_usd*
+        is provided, *max_cost_usd* is not positive, any
+        *ask_thresholds_usd* value is not in ``(0, max_cost_usd)`` when
+        both are set, or any *expensive_models* entry is not a non-empty
+        string.
     """
-    if max_cost_usd <= 0:
+    if max_cost_usd is None and not ask_thresholds_usd:
+        raise ValueError("cost_budget requires max_cost_usd and/or ask_thresholds_usd")
+    if max_cost_usd is not None and max_cost_usd <= 0:
         raise ValueError(f"max_cost_usd must be > 0, got {max_cost_usd!r}")
     thresholds = sorted({float(t) for t in (ask_thresholds_usd or [])})
     for t in thresholds:
-        if not (0 < t < max_cost_usd):
+        if max_cost_usd is not None and not (0 < t < max_cost_usd):
             raise ValueError(
                 f"each ask_thresholds_usd value must be in "
                 f"(0, max_cost_usd={max_cost_usd}), got {t!r}"
             )
-    # ``None`` → default tokens, hard gate on. ``[]`` → hard gate off
-    # (soft thresholds only). A non-empty list replaces the default.
-    if expensive_models is None:
-        expensive_tokens = _DEFAULT_EXPENSIVE_MODELS
-        hard_cap_enabled = True
-    else:
-        for m in expensive_models:
-            if not isinstance(m, str) or not m:
-                raise ValueError(
-                    f"each expensive_models value must be a non-empty string, got {m!r}"
-                )
-        expensive_tokens = tuple(m.lower() for m in expensive_models)
-        hard_cap_enabled = len(expensive_tokens) > 0
+    cfg = _resolve_expensive_models(expensive_models)
 
     def evaluate(event: PolicyEvent) -> PolicyResponse:
-        """Evaluate the session cost budget for a tool call.
+        """Evaluate the session cost budget for a request or tool call.
 
-        Gates only the ``tool_call`` phase — abstains on every other
-        phase.
+        Gates the ``request`` phase (before the LLM turn, so text-only
+        turns are budgeted too) and the ``tool_call`` phase (the native
+        ``PreToolUse`` block) — abstains on every other phase.
 
         - ``cost >= max_cost_usd`` and the active model is expensive
           (or undeterminable) → DENY (switch to a cheaper model);
-          ``cost >= max_cost_usd`` on a cheaper model → ALLOW.
+          ``cost >= max_cost_usd`` on a cheaper model → ALLOW. This hard
+          gate runs on BOTH gated phases.
         - the highest soft checkpoint newly crossed and not yet
           approved → ASK ("continue?") carrying a ``state_updates``
           write of the crossed value, applied only on approve so the
           checkpoint (and lower ones) won't re-prompt once approved.
+          This soft gate runs on BOTH gated phases: each has a
+          server-side approval round-trip that parks the turn (request)
+          or tool call (tool_call) and persists the ASK's
+          ``state_updates`` only on accept. Firing on ``request`` means
+          text-only turns are warned too, and the recorded checkpoint
+          stops the first tool call of the same turn from re-asking.
 
         :param event: Policy event dict.
         :returns: DENY when over budget on an expensive model; ASK when
-            a new soft checkpoint is crossed; ALLOW otherwise.
+            a new soft checkpoint is newly crossed; ALLOW otherwise.
         """
-        if event.get("type") != "tool_call":
+        phase = event.get("type")
+        if phase not in _GATED_PHASES:
+            return _ALLOW
+        context = event.get("context") or {}
+        if _usage_is_unpriced(context.get("usage") or {}):
+            if not (event.get("session_state") or {}).get(_UNPRICED_APPROVED_KEY):
+                return _UNPRICED_ASK
             return _ALLOW
         cost = _session_cost_usd(event)
-        if hard_cap_enabled and cost >= max_cost_usd:
-            if _model_blocked_over_budget(_current_model(event), expensive_tokens):
+        if max_cost_usd is not None and cfg.hard_cap_enabled and cost >= max_cost_usd:
+            if _model_blocked_over_budget(
+                _current_model(event),
+                cfg.expensive_tokens,
+                cfg.exclude_tokens,
+                block_all=cfg.block_all_models,
+            ):
                 return {
                     "result": "DENY",
                     "reason": _over_budget_deny_reason(
-                        cost, max_cost_usd, expensive_tokens, _current_harness(event)
+                        cost,
+                        max_cost_usd,
+                        cfg.expensive_tokens,
+                        _current_harness(event),
+                        phase=phase,
+                        block_all=cfg.block_all_models,
                     ),
                 }
             # Already on a cheaper model — the downgrade gate is satisfied.
@@ -323,16 +535,17 @@ def cost_budget(
                 state = event.get("session_state") or {}
                 approved_up_to = float(state.get(_ASK_APPROVED_KEY, 0.0) or 0.0)
                 if crossed > approved_up_to:
+                    limit_str = f" (limit ${max_cost_usd:.2f})" if max_cost_usd is not None else ""
                     return {
                         "result": "ASK",
                         "reason": (
                             f"Session cost ${cost:.2f} passed the ${crossed:.2f} "
-                            f"warning threshold (limit ${max_cost_usd:.2f}). Continue?"
+                            f"warning threshold{limit_str}. Continue?"
                         ),
                         # Applied only on approve → this and every lower
                         # checkpoint won't re-prompt; higher ones still will.
-                        # A declined ASK leaves this unset, so the next tool
-                        # call over the same threshold re-asks.
+                        # A declined ASK leaves this unset, so the next
+                        # request or tool call over the same threshold re-asks.
                         "state_updates": [
                             {"key": _ASK_APPROVED_KEY, "action": "set", "value": crossed},
                         ],
@@ -404,17 +617,19 @@ def user_daily_cost_budget(
     ``event["context"]["user_daily_cost"]`` (``cost_usd`` /
     ``ask_approved_usd``), which the policy engine injects — at
     engine-build time — only when this policy is configured (from the
-    ``user_daily_cost`` store, attributed to the session owner). Gates
-    the ``tool_call`` phase only.
+    ``user_daily_cost`` store, attributed to the session owner). The hard
+    limit and the soft warning checkpoints both gate the ``request`` phase
+    (before the LLM turn) and the ``tool_call`` phase (see
+    :func:`cost_budget`).
 
     - **Soft (`ask_thresholds_usd`)**: the first time the owner's daily
-      spend crosses a checkpoint, the tool call is parked for approval
-      (ASK). The approval is recorded **per user+day** (in
-      ``user_daily_cost.ask_approved_usd`` via a reserved
-      ``state_updates`` key the engine routes to that store), so an
-      approved checkpoint won't re-prompt the user again that day —
-      including from a different session. A decline blocks that one
-      tool call and re-asks next time.
+      spend crosses a checkpoint, the turn (request phase) or tool call
+      (tool-call phase) is parked for approval (ASK). The approval is
+      recorded **per user+day** (in ``user_daily_cost.ask_approved_usd``
+      via a reserved ``state_updates`` key the engine routes to that
+      store), so an approved checkpoint won't re-prompt the user again
+      that day — including from a different session. A decline blocks
+      that one turn / tool call and re-asks next time.
     - **Hard (`max_cost_usd`)**: once the owner's daily spend reaches
       the limit, DENY every tool call while the session is on an
       ``expensive_models`` model (a ``/model`` downgrade gate, not a
@@ -429,8 +644,10 @@ def user_daily_cost_budget(
         ``< max_cost_usd``. ``None`` / ``[]`` disables the soft gate.
     :param expensive_models: Optional case-insensitive substring tokens
         for the model tiers blocked once over the daily limit. ``None``
-        uses the built-in default (Opus + GPT-5.5); ``[]`` disables the
-        hard gate (soft thresholds only).
+        (the default) or ``[]`` makes the hard cap a true hard stop —
+        all models are blocked once the limit is reached. Pass an
+        explicit non-empty list for a downgrade gate that only blocks the
+        named tiers.
     :returns: A policy callable implementing the per-user daily budget.
     :raises ValueError: Same validation as :func:`cost_budget`.
     """
@@ -443,20 +660,10 @@ def user_daily_cost_budget(
                 f"each ask_thresholds_usd value must be in "
                 f"(0, max_cost_usd={max_cost_usd}), got {t!r}"
             )
-    if expensive_models is None:
-        expensive_tokens = _DEFAULT_EXPENSIVE_MODELS
-        hard_cap_enabled = True
-    else:
-        for m in expensive_models:
-            if not isinstance(m, str) or not m:
-                raise ValueError(
-                    f"each expensive_models value must be a non-empty string, got {m!r}"
-                )
-        expensive_tokens = tuple(m.lower() for m in expensive_models)
-        hard_cap_enabled = len(expensive_tokens) > 0
+    cfg = _resolve_expensive_models(expensive_models)
 
     def evaluate(event: PolicyEvent) -> PolicyResponse:
-        """Evaluate the per-user daily cost budget for a tool call.
+        """Evaluate the per-user daily cost budget for a request or tool call.
 
         Mirrors :func:`cost_budget`'s ``evaluate`` exactly, reading the
         owner's daily spend / approval instead of the session totals,
@@ -465,28 +672,44 @@ def user_daily_cost_budget(
 
         :param event: Policy event dict.
         :returns: DENY when over the daily budget on an expensive model;
-            ASK when a new daily soft checkpoint is crossed; ALLOW
+            ASK when a new daily soft checkpoint is newly crossed; ALLOW
             otherwise.
         """
-        if event.get("type") != "tool_call":
+        phase = event.get("type")
+        if phase not in _GATED_PHASES:
+            return _ALLOW
+        context = event.get("context") or {}
+        if _usage_is_unpriced(context.get("usage") or {}):
+            if not (event.get("session_state") or {}).get(_UNPRICED_APPROVED_KEY):
+                return _UNPRICED_ASK
             return _ALLOW
         cost = _user_daily_cost_usd(event)
         owner = _user_daily_owner(event)
-        if hard_cap_enabled and cost >= max_cost_usd:
-            if _model_blocked_over_budget(_current_model(event), expensive_tokens):
+        if cfg.hard_cap_enabled and cost >= max_cost_usd:
+            if _model_blocked_over_budget(
+                _current_model(event),
+                cfg.expensive_tokens,
+                cfg.exclude_tokens,
+                block_all=cfg.block_all_models,
+            ):
                 return {
                     "result": "DENY",
                     "reason": _over_budget_deny_reason(
                         cost,
                         max_cost_usd,
-                        expensive_tokens,
+                        cfg.expensive_tokens,
                         _current_harness(event),
+                        phase=phase,
                         policy_label="per-user daily cost-budget",
                         budget_label="daily cost budget",
                         subject_user=owner,
+                        block_all=cfg.block_all_models,
                     ),
                 }
             return _ALLOW
+        # Soft ASK fires on both gated phases — each has a server-side
+        # approval round-trip that persists the checkpoint on accept (see
+        # cost_budget.evaluate).
         if thresholds:
             crossed = max((t for t in thresholds if cost >= t), default=None)
             if crossed is not None:
@@ -517,6 +740,143 @@ def user_daily_cost_budget(
     return evaluate  # type: ignore[return-value]
 
 
+# session_state key recording the highest ``ask_thresholds_usd`` checkpoint
+# the user has already approved continuing past for a SUBAGENT cost budget.
+# Unlike ``_ASK_APPROVED_KEY`` (which routes to the ROOT conversation), this
+# stays local to the child's own session_state so approvals are scoped to the
+# subagent, not the whole spawn tree.
+_SUBAGENT_ASK_APPROVED_KEY = "subagent_cost_ask_approved_usd"
+
+
+def _subtree_cost_usd(event: PolicyEvent) -> float:
+    """Read cumulative subtree cost (USD) from a policy event.
+
+    :param event: Policy event dict.
+    :returns: ``event["context"]["subtree_usage"]["total_cost_usd"]`` as a
+        float, or ``0.0`` when the field is absent / not yet priced.
+    """
+    context = event.get("context") or {}
+    subtree_usage = context.get("subtree_usage") or {}
+    raw = subtree_usage.get("total_cost_usd", 0.0)
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def subagent_cost_budget(
+    max_cost_usd: float | None = None,
+    ask_thresholds_usd: list[float] | None = None,
+    expensive_models: list[str] | None = None,
+) -> PolicyCallable:
+    """Factory: gate a sub-agent on its own subtree LLM spend (USD).
+
+    Identical gating logic to :func:`cost_budget`, but scoped to the
+    **child conversation's subtree** (itself + its descendants) rather
+    than the whole session tree. Reads
+    ``event["context"]["subtree_usage"]["total_cost_usd"]`` instead of
+    ``event["context"]["usage"]["total_cost_usd"]``.
+
+    Intended to be attached to a child session at spawn time via
+    ``sys_session_send``'s ``cost_budget`` argument. The parent sets the
+    budget; the child gates against its own subtree spend.
+
+    The soft-checkpoint approval key (``subagent_cost_ask_approved_usd``)
+    stays local to the child's ``session_state`` — it is NOT routed to
+    the root conversation, so approvals are scoped to the subagent.
+
+    :param max_cost_usd: Optional hard limit in USD for the subtree. Must be
+        ``> 0`` if provided. Either this or ask_thresholds_usd must be set.
+    :param ask_thresholds_usd: Optional soft warning checkpoints in USD.
+        Same semantics as :func:`cost_budget`.
+    :param expensive_models: Optional case-insensitive substring tokens.
+        Same semantics as :func:`cost_budget`.
+    :returns: A policy callable implementing the subtree budget gate.
+    :raises ValueError: If neither max_cost_usd nor ask_thresholds_usd is set,
+        or if validation fails.
+    """
+    # At least one of max_cost_usd or ask_thresholds_usd must be present.
+    if max_cost_usd is None and not ask_thresholds_usd:
+        raise ValueError("subagent_cost_budget requires max_cost_usd and/or ask_thresholds_usd")
+    if max_cost_usd is not None and max_cost_usd <= 0:
+        raise ValueError(f"max_cost_usd must be > 0, got {max_cost_usd!r}")
+    thresholds = sorted({float(t) for t in (ask_thresholds_usd or [])})
+    for t in thresholds:
+        if max_cost_usd is not None and not (0 < t < max_cost_usd):
+            raise ValueError(
+                f"each ask_thresholds_usd value must be in "
+                f"(0, max_cost_usd={max_cost_usd}), got {t!r}"
+            )
+    cfg = _resolve_expensive_models(expensive_models)
+
+    def evaluate(event: PolicyEvent) -> PolicyResponse:
+        """Evaluate the subagent subtree cost budget for a request or tool call.
+
+        Same gating logic as :func:`cost_budget`'s ``evaluate``, reading
+        the subtree cost and using a local approval key.
+
+        :param event: Policy event dict.
+        :returns: DENY when over budget on an expensive model; ASK when
+            a new soft checkpoint is newly crossed; ALLOW otherwise.
+        """
+        phase = event.get("type")
+        if phase not in _GATED_PHASES:
+            return _ALLOW
+        context = event.get("context") or {}
+        if _usage_is_unpriced(context.get("subtree_usage") or {}):
+            if not (event.get("session_state") or {}).get(_UNPRICED_APPROVED_KEY):
+                return _UNPRICED_ASK
+            return _ALLOW
+        cost = _subtree_cost_usd(event)
+        # Check hard limit if max_cost_usd is set.
+        if max_cost_usd is not None and cfg.hard_cap_enabled and cost >= max_cost_usd:
+            if _model_blocked_over_budget(
+                _current_model(event),
+                cfg.expensive_tokens,
+                cfg.exclude_tokens,
+                block_all=cfg.block_all_models,
+            ):
+                return {
+                    "result": "DENY",
+                    "reason": _over_budget_deny_reason(
+                        cost,
+                        max_cost_usd,
+                        cfg.expensive_tokens,
+                        _current_harness(event),
+                        phase=phase,
+                        policy_label="subagent cost-budget",
+                        budget_label="subagent cost budget",
+                        block_all=cfg.block_all_models,
+                    ),
+                }
+            return _ALLOW
+        # Check soft thresholds if ask_thresholds_usd is set.
+        if thresholds:
+            crossed = max((t for t in thresholds if cost >= t), default=None)
+            if crossed is not None:
+                state = event.get("session_state") or {}
+                approved_up_to = float(state.get(_SUBAGENT_ASK_APPROVED_KEY, 0.0) or 0.0)
+                if crossed > approved_up_to:
+                    limit_str = f" (limit ${max_cost_usd:.2f})" if max_cost_usd else ""
+                    return {
+                        "result": "ASK",
+                        "reason": (
+                            f"Subagent subtree cost ${cost:.2f} passed the ${crossed:.2f} "
+                            f"warning threshold{limit_str}. Continue?"
+                        ),
+                        "state_updates": [
+                            {
+                                "key": _SUBAGENT_ASK_APPROVED_KEY,
+                                "action": "set",
+                                "value": crossed,
+                            },
+                        ],
+                    }
+        return _ALLOW
+
+    return evaluate  # type: ignore[return-value]
+
+
 # ── Registry ─────────────────────────────────────────────────────────────────
 
 POLICY_REGISTRY: list[dict[str, Any]] = [
@@ -524,34 +884,36 @@ POLICY_REGISTRY: list[dict[str, Any]] = [
         "handler": "omnigent.policies.builtins.cost.cost_budget",
         "kind": "factory",
         "name": "Session Cost Budget",
-        "description": "Gates a session on cumulative LLM spend (USD) at tool-call: ASK for "
-        "approval at each soft warning checkpoint, and once a hard limit is reached DENY tool "
-        "calls while still on an expensive model (prompting a /model downgrade). Reads "
+        "description": "Gates a session on cumulative LLM spend (USD): once a hard limit is "
+        "reached DENY (the whole turn at the request phase, or each tool call) while still on "
+        "an expensive model (prompting a /model downgrade), and ASK for approval at each soft "
+        "warning checkpoint (request + tool-call phases). Reads "
         "event.context.usage.total_cost_usd and event.context.model.",
         "params_schema": {
             "type": "object",
             "properties": {
                 "max_cost_usd": {
                     "type": "number",
-                    "description": "Hard limit in USD; once cumulative session cost reaches "
-                    "it, tool calls are blocked while the session is on an expensive model.",
+                    "description": "Optional hard limit in USD; once cumulative session cost "
+                    "reaches it, tool calls are blocked while the session is on an expensive "
+                    "model. Either this or ask_thresholds_usd must be set.",
                 },
                 "ask_thresholds_usd": {
                     "type": "array",
                     "items": {"type": "number"},
                     "description": "Optional soft warning checkpoints in USD; the session asks "
                     "for approval the first time spend crosses each (every value must be < "
-                    "max_cost_usd).",
+                    "max_cost_usd when both are set).",
                 },
                 "expensive_models": {
                     "type": "array",
-                    "items": {"type": "string"},
+                    "items": {"type": "string", "x-enum-source": "models"},
                     "description": "Optional case-insensitive substring tokens for the model "
-                    "tiers blocked once over budget (default: Opus + GPT-5.5). An empty list "
-                    "disables the hard limit, leaving only the soft thresholds.",
+                    "tiers blocked once over budget. Omit (or pass []) for a true hard stop "
+                    "that blocks all models; pass a non-empty list for a downgrade gate that "
+                    "only blocks the named tiers.",
                 },
             },
-            "required": ["max_cost_usd"],
         },
     },
     {
@@ -559,10 +921,11 @@ POLICY_REGISTRY: list[dict[str, Any]] = [
         "kind": "factory",
         "name": "Per-User Daily Cost Budget",
         "description": "Gates the session OWNER's cumulative LLM spend across all their "
-        "sessions for the current UTC day, at tool-call: ASK for approval at each soft "
-        "warning checkpoint (remembered per user+day), and once a hard daily limit is "
-        "reached DENY tool calls while still on an expensive model (prompting a /model "
-        "downgrade). Reads event.context.user_daily_cost and event.context.model.",
+        "sessions for the current UTC day: once a hard daily limit is reached DENY (the whole "
+        "turn at the request phase, or each tool call) while still on an expensive model "
+        "(prompting a /model downgrade), and ASK for approval at each soft warning checkpoint "
+        "(request + tool-call phases, remembered per user+day). Reads "
+        "event.context.user_daily_cost and event.context.model.",
         "params_schema": {
             "type": "object",
             "properties": {
@@ -580,13 +943,52 @@ POLICY_REGISTRY: list[dict[str, Any]] = [
                 },
                 "expensive_models": {
                     "type": "array",
-                    "items": {"type": "string"},
+                    "items": {"type": "string", "x-enum-source": "models"},
                     "description": "Optional case-insensitive substring tokens for the model "
-                    "tiers blocked once over the daily budget (default: Opus + GPT-5.5). An "
-                    "empty list disables the hard limit, leaving only the soft thresholds.",
+                    "tiers blocked once over the daily budget. Omit (or pass []) for a true "
+                    "hard stop that blocks all models; pass a non-empty list for a downgrade "
+                    "gate that only blocks the named tiers.",
                 },
             },
             "required": ["max_cost_usd"],
         },
+    },
+    {
+        "handler": "omnigent.policies.builtins.cost.subagent_cost_budget",
+        "kind": "factory",
+        "name": "Subagent Cost Budget",
+        "description": "Gates a sub-agent on its own subtree LLM spend (USD): once a hard limit "
+        "is reached DENY (the whole turn at the request phase, or each tool call) while still on "
+        "an expensive model (prompting a /model downgrade), and ASK for approval at each soft "
+        "warning checkpoint (request + tool-call phases). Reads "
+        "event.context.subtree_usage.total_cost_usd and event.context.model. Intended to be "
+        "attached to a child session via sys_session_send's cost_budget argument.",
+        "params_schema": {
+            "type": "object",
+            "properties": {
+                "max_cost_usd": {
+                    "type": "number",
+                    "description": "Hard limit in USD for the subtree; once cumulative subtree "
+                    "cost reaches it, tool calls are blocked while on an expensive model.",
+                },
+                "ask_thresholds_usd": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "description": "Optional soft warning checkpoints in USD; the subagent asks "
+                    "for approval the first time subtree spend crosses each (every value must "
+                    "be < max_cost_usd).",
+                },
+                "expensive_models": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional case-insensitive substring tokens for the model "
+                    "tiers blocked once over budget (default: Fable + Opus + GPT-5, excluding "
+                    "the cheap -mini/-nano variants). An empty list disables the hard limit, "
+                    "leaving only the soft thresholds.",
+                },
+            },
+            "required": [],
+        },
+        "internal_only": True,
     },
 ]

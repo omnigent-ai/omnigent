@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import pytest
 import sqlalchemy as sa
+from sqlalchemy.exc import IntegrityError
 
 from omnigent.db.utils import get_or_create_engine
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
@@ -35,6 +37,19 @@ def test_get_by_name(agent_store: SqlAlchemyAgentStore) -> None:
     assert agent_store.get_by_name("missing") is None
 
 
+def test_create_rejects_duplicate_template_name(agent_store: SqlAlchemyAgentStore) -> None:
+    """Template names are unique within a workspace, enforced by the store.
+
+    The DB has no partial unique index (MySQL can't build one), so the store's
+    create() is the guard.
+    """
+    agent_store.create(agent_id="ag_dup_a", name="dup-name", bundle_location="ag_dup_a/fakehash")
+    with pytest.raises(IntegrityError):
+        agent_store.create(
+            agent_id="ag_dup_b", name="dup-name", bundle_location="ag_dup_b/fakehash"
+        )
+
+
 def test_get_by_name_and_list_hide_session_scoped_agents(
     agent_store: SqlAlchemyAgentStore,
     db_uri: str,
@@ -46,22 +61,21 @@ def test_get_by_name_and_list_hide_session_scoped_agents(
             sa.text(
                 "INSERT INTO conversations "
                 "(id, created_at, updated_at, root_conversation_id, kind) "
-                "VALUES (:id, :ts, :ts, :id, 'default')",
+                "VALUES (:id, :ts, :ts, :id, 1)",
             ),
             {"id": "conv_agent_store_session", "ts": 1700000000},
         )
         conn.execute(
             sa.text(
                 "INSERT INTO agents "
-                "(id, created_at, name, bundle_location, version, session_id) "
-                "VALUES (:id, :ts, :name, :loc, 1, :session_id)",
+                "(id, created_at, name, bundle_location, version, kind) "
+                "VALUES (:id, :ts, :name, :loc, 1, 2)",  # kind=2 → 'session'
             ),
             {
                 "id": "ag_agent_store_session",
                 "ts": 1700000001,
                 "name": "session-only-agent",
                 "loc": "ag_agent_store_session/bundle",
-                "session_id": "conv_agent_store_session",
             },
         )
     template_agent = agent_store.create(
@@ -226,3 +240,44 @@ def test_create_agent_has_version_1(agent_store: SqlAlchemyAgentStore) -> None:
     )
     assert agent.version == 1
     assert agent.updated_at is None
+
+
+# ── get_names tests ───────────────────────────────────────────────
+
+
+def test_get_names_returns_id_to_name_mapping(agent_store: SqlAlchemyAgentStore) -> None:
+    """get_names batch-fetches agent names by ID."""
+    agent_store.create(agent_id="ag_names_a", name="alpha", bundle_location="ag_names_a/hash")
+    agent_store.create(agent_id="ag_names_b", name="beta", bundle_location="ag_names_b/hash")
+    result = agent_store.get_names(["ag_names_a", "ag_names_b"])
+    assert result == {"ag_names_a": "alpha", "ag_names_b": "beta"}
+
+
+def test_get_names_omits_missing_ids(agent_store: SqlAlchemyAgentStore) -> None:
+    """get_names silently omits IDs not found in the store."""
+    agent_store.create(agent_id="ag_names_c", name="gamma", bundle_location="ag_names_c/hash")
+    result = agent_store.get_names(["ag_names_c", "ag_nonexistent"])
+    assert result == {"ag_names_c": "gamma"}
+
+
+def test_get_names_empty_input(agent_store: SqlAlchemyAgentStore) -> None:
+    """get_names with empty list returns empty dict without hitting DB."""
+    assert agent_store.get_names([]) == {}
+
+
+# ── list edge cases ───────────────────────────────────────────────
+
+
+def test_list_empty(agent_store: SqlAlchemyAgentStore) -> None:
+    """list on an empty store returns empty PagedList."""
+    page = agent_store.list()
+    assert page.data == []
+    assert page.first_id is None
+    assert page.last_id is None
+    assert page.has_more is False
+
+
+def test_delete_nonexistent_returns_false(agent_store: SqlAlchemyAgentStore) -> None:
+    """delete returns False for an ID that was never created."""
+    result = agent_store.delete("ag_never_existed")
+    assert result is False

@@ -30,6 +30,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    HostCreateDirFrame,
     HostLaunchRunnerFrame,
     HostListDirFrame,
     encode_host_frame,
@@ -54,6 +55,10 @@ _LAUNCH_RESULT_TIMEOUT_S = 30.0
 _LIST_DIR_TIMEOUT_S = 5.0
 _LIST_DIR_DEFAULT_LIMIT = 20
 _LIST_DIR_MAX_LIMIT = 1000
+# Per-call timeout for host.create_dir round-trips. mkdir is a single
+# fast syscall on the host side; 5s matches list_dir and is generous
+# for transient network slowness without making the picker feel hung.
+_CREATE_DIR_TIMEOUT_S = 5.0
 
 
 async def _proxy_list_dir(
@@ -128,6 +133,78 @@ async def _proxy_list_dir(
         host_conn.pending_list_dirs.pop(request_id, None)
 
 
+async def _proxy_create_dir(
+    *,
+    host_registry: HostRegistry,
+    host_conn: HostConnection,
+    path: str,
+) -> dict[str, Any]:
+    """
+    Send a ``host.create_dir`` frame and await the result.
+
+    Mirrors :func:`_proxy_list_dir`: enqueue the frame, register a
+    future on the host connection's ``pending_create_dirs`` map, await
+    with a timeout, and clean up in a finally block. The host's WS
+    receive loop in ``host_tunnel.py`` resolves the future when the
+    result frame arrives.
+
+    :param host_registry: Server-side registry; used to enqueue the
+        outbound frame on the host's send queue.
+    :param host_conn: Live host connection.
+    :param path: Absolute or tilde-prefixed directory to create. The
+        host expands ``~`` itself.
+    :returns: Dict with the result fields: ``status`` (``"ok"`` or
+        ``"failed"``), ``path`` (created absolute path or ``None``),
+        ``error`` (string or ``None``).
+    :raises HTTPException: 504 on timeout, 502 on connection drop.
+    """
+    request_id = secrets.token_hex(8)
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[dict[str, Any]] = loop.create_future()
+    host_conn.pending_create_dirs[request_id] = future
+
+    frame = encode_host_frame(
+        HostCreateDirFrame(
+            request_id=request_id,
+            path=path,
+        )
+    )
+    try:
+        try:
+            host_registry.send_text(host_conn, frame)
+        except ConnectionError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"host '{host_conn.host_id}' connection lost",
+            ) from exc
+        try:
+            return await asyncio.wait_for(future, timeout=_CREATE_DIR_TIMEOUT_S)
+        except asyncio.TimeoutError as exc:
+            raise HTTPException(
+                status_code=504,
+                detail=(
+                    f"host '{host_conn.host_id}' did not respond to create_dir "
+                    f"within {_CREATE_DIR_TIMEOUT_S:.0f}s"
+                ),
+            ) from exc
+    finally:
+        # Cleanup runs on every path so a cancelled caller doesn't
+        # leave an orphan in the pending dict.
+        host_conn.pending_create_dirs.pop(request_id, None)
+
+
+class CreateDirectoryRequest(BaseModel):
+    """Request body for ``POST /v1/hosts/{host_id}/directories``.
+
+    :param path: Absolute path of the directory to create on the host
+        machine, e.g. ``"/Users/corey/projects/new-app"``, or a
+        tilde-prefixed path (``"~/scratch"``) the host expands against
+        its own process owner. Missing parents are created.
+    """
+
+    path: str
+
+
 class LaunchRunnerRequest(BaseModel):
     """Request body for ``POST /v1/hosts/{host_id}/runners``.
 
@@ -138,12 +215,15 @@ class LaunchRunnerRequest(BaseModel):
         ``"/Users/corey/projects/frontend"``. When ``git`` is set,
         this is interpreted as the source repository directory and
         the runner starts in the created worktree instead.
-    :param git: Optional git worktree options. When set, the server
-        creates a worktree for a new branch off ``workspace`` on the
-        host and binds the runner to it (the fork-resume path; mirrors
-        ``POST /v1/sessions``). ``None`` binds ``workspace`` directly.
-        ``host_id`` is always present (it is in the path), so no
-        host requirement check is needed here.
+    :param git: Optional git worktree options. In create mode the
+        server creates a worktree for a new branch off ``workspace`` on
+        the host and binds the runner to it (the fork-resume path;
+        mirrors ``POST /v1/sessions``). In bind mode
+        (``existing_worktree=True``) ``workspace`` already IS a
+        worktree — no worktree is created; ``branch_name`` is recorded
+        as the session's ``git_branch`` for display and opt-in cleanup.
+        ``None`` binds ``workspace`` directly. ``host_id`` is always
+        present (it is in the path), so no host check is needed here.
     """
 
     session_id: str
@@ -406,39 +486,52 @@ def create_hosts_router(
         # lost CAS or a failed launch can roll it back, leaving no orphan
         # worktree on the host.
         git_branch: str | None = None
-        worktree = None  # CreatedWorktree | None — set when body.git is used
+        # CreatedWorktree | None — set ONLY when Omnigent creates a worktree
+        # (create mode). Left None in bind mode so the rollback below never
+        # force-removes the user's pre-existing worktree.
+        worktree = None
         if body.git is not None:
             from omnigent.host.git_worktree import (
                 WorktreeError,
                 validate_branch_name,
             )
-            from omnigent.server.routes._host_worktree import (
-                WorktreeHostUnavailableError,
-                WorktreeProxyError,
-                create_worktree_on_host,
-            )
 
+            # Shared by both modes — the host never runs git in bind mode, so
+            # the server is the only gate on the name there.
             try:
                 validate_branch_name(body.git.branch_name)
             except WorktreeError as exc:
                 raise HTTPException(status_code=400, detail=exc.message) from exc
-            try:
-                worktree = await create_worktree_on_host(
-                    host_registry=host_registry,
-                    host_conn=conn,
-                    repo_path=workspace,
-                    branch_name=body.git.branch_name,
-                    base_branch=body.git.base_branch,
+
+            if body.git.existing_worktree:
+                # Binding to a pre-existing worktree: no worktree is created,
+                # but record its branch so the sidebar shows it and the opt-in
+                # delete flow can offer to remove it.
+                git_branch = body.git.branch_name
+            else:
+                from omnigent.server.routes._host_worktree import (
+                    WorktreeHostUnavailableError,
+                    WorktreeProxyError,
+                    create_worktree_on_host,
                 )
-            except WorktreeHostUnavailableError as exc:
-                # Host offline / unresponsive — infra, not user input.
-                raise HTTPException(status_code=409, detail=exc.message) from exc
-            except WorktreeProxyError as exc:
-                # Host-reported git failure (dup branch, bad base, not a
-                # repo) — user-correctable input.
-                raise HTTPException(status_code=400, detail=exc.message) from exc
-            workspace = worktree.worktree_path
-            git_branch = worktree.branch
+
+                try:
+                    worktree = await create_worktree_on_host(
+                        host_registry=host_registry,
+                        host_conn=conn,
+                        repo_path=workspace,
+                        branch_name=body.git.branch_name,
+                        base_branch=body.git.base_branch,
+                    )
+                except WorktreeHostUnavailableError as exc:
+                    # Host offline / unresponsive — infra, not user input.
+                    raise HTTPException(status_code=409, detail=exc.message) from exc
+                except WorktreeProxyError as exc:
+                    # Host-reported git failure (dup branch, bad base, not a
+                    # repo) — user-correctable input.
+                    raise HTTPException(status_code=400, detail=exc.message) from exc
+                workspace = worktree.worktree_path
+                git_branch = worktree.branch
 
         async def _rollback_worktree() -> None:
             """
@@ -541,6 +634,7 @@ def create_hosts_router(
                 request_id=request_id,
                 binding_token=binding_token,
                 workspace=workspace,
+                session_id=body.session_id,
                 harness=harness,
             )
         )
@@ -755,5 +849,154 @@ def create_hosts_router(
             "data": result.get("entries", []),
             "has_more": bool(result.get("has_more", False)),
         }
+
+    @router.post("/hosts/{host_id}/directories")
+    async def create_host_directory(
+        request: Request,
+        host_id: str,
+        body: CreateDirectoryRequest,
+    ) -> dict[str, Any]:
+        """
+        Create a new directory on a host.
+
+        Backs the Web UI workspace picker's "New folder" action so a
+        user can make a fresh directory to start a session in without
+        dropping to a terminal. Owner-scoped exactly like the
+        filesystem browse endpoints (``GET /v1/hosts/{id}/filesystem``):
+        only the host owner can create directories, and — like browse —
+        this is NOT scoped to a session. The workspace-boundary check
+        still runs at session-create time, so creating a directory here
+        does not by itself grant an agent access to it.
+
+        :param request: FastAPI request (for auth).
+        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :param body: Request body carrying the absolute (or
+            tilde-prefixed) ``path`` to create.
+        :returns: ``{"object": "directory", "path": "<created abs path>"}``.
+        :raises HTTPException: 404 if host not found, 403 if not owned
+            by caller, 409 if host is offline or the directory could not
+            be created (already exists / permission denied), 400 on path
+            validation, 504 on host timeout, 502 on host I/O failure.
+        """
+        # require_user: unauthenticated callers 401 instead of slipping
+        # past the owner check below as None.
+        user_id = require_user(request, auth_provider)
+
+        host = await asyncio.to_thread(host_store.get_host, host_id)
+        if host is None:
+            raise HTTPException(status_code=404, detail="host not found")
+        if user_id is not None and host.owner != user_id:
+            raise HTTPException(status_code=403, detail="not your host")
+
+        path = body.path
+        if not path.strip():
+            raise HTTPException(status_code=400, detail="path must not be empty")
+        if "\x00" in path:
+            raise HTTPException(
+                status_code=400,
+                detail="path must not contain NUL bytes",
+            )
+        # Absolute or tilde-prefixed only — the host needs a path it can
+        # resolve on its own; a relative path has no stable meaning here.
+        if not path.startswith(("/", "~")):
+            raise HTTPException(
+                status_code=400,
+                detail="path must be absolute or tilde-prefixed",
+            )
+
+        conn = host_registry.get(host.host_id)
+        if conn is None:
+            raise HTTPException(status_code=409, detail="host is offline")
+
+        result = await _proxy_create_dir(
+            host_registry=host_registry,
+            host_conn=conn,
+            path=path,
+        )
+
+        if result.get("status") == "failed":
+            # Unexpected I/O failure on the host.
+            raise HTTPException(
+                status_code=502,
+                detail=f"host create_dir failed: {result.get('error') or 'unknown error'}",
+            )
+        # Expected filesystem error (already exists / permission denied /
+        # parent is a file) → 409 Conflict with the host's message, so
+        # the picker can show "directory already exists" inline.
+        if result.get("error"):
+            raise HTTPException(
+                status_code=409,
+                detail=str(result.get("error")),
+            )
+
+        return {
+            "object": "directory",
+            "path": result.get("path"),
+        }
+
+    @router.get("/hosts/{host_id}/worktrees")
+    async def list_host_worktrees(
+        request: Request,
+        host_id: str,
+        path: str = Query(...),
+    ) -> dict[str, Any]:
+        """
+        List the git worktrees of a repository on a host.
+
+        Used by the Web UI's new-session worktree picker to show the
+        worktrees a session can start in directly. Owner-scoped exactly
+        like the filesystem browse endpoints; NOT scoped to a session.
+        A path that is not a git repository is reported as 400 so the
+        picker can quietly fall back to "no worktrees".
+
+        :param request: FastAPI request (for auth).
+        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :param path: Absolute path inside the repo on the host to list
+            worktrees for, e.g. ``"/Users/alice/myrepo"``.
+        :returns: ``{"object": "list", "data": [{path, branch,
+            is_main, detached}, ...]}`` (main first).
+        :raises HTTPException: 404 if host not found, 403 if not owned
+            by caller, 409 if host is offline/unresponsive, 400 on path
+            validation or a non-git path.
+        """
+        from omnigent.server.routes._host_worktree import (
+            WorktreeHostUnavailableError,
+            WorktreeProxyError,
+            list_worktrees_on_host,
+        )
+
+        # require_user: unauthenticated callers 401 instead of slipping
+        # past the owner check below as None.
+        user_id = require_user(request, auth_provider)
+
+        host = await asyncio.to_thread(host_store.get_host, host_id)
+        if host is None:
+            raise HTTPException(status_code=404, detail="host not found")
+        if user_id is not None and host.owner != user_id:
+            raise HTTPException(status_code=403, detail="not your host")
+
+        if not path.strip():
+            raise HTTPException(status_code=400, detail="path must not be empty")
+        if "\x00" in path:
+            raise HTTPException(status_code=400, detail="path must not contain NUL bytes")
+
+        conn = host_registry.get(host.host_id)
+        if conn is None:
+            raise HTTPException(status_code=409, detail="host is offline")
+
+        try:
+            worktrees = await list_worktrees_on_host(
+                host_registry=host_registry,
+                host_conn=conn,
+                repo_path=path,
+            )
+        except WorktreeHostUnavailableError as exc:
+            raise HTTPException(status_code=409, detail=exc.message) from exc
+        except WorktreeProxyError as exc:
+            # Not a git repo / git failure — user-correctable; the picker
+            # treats this as "no worktrees here".
+            raise HTTPException(status_code=400, detail=exc.message) from exc
+
+        return {"object": "list", "data": worktrees}
 
     return router

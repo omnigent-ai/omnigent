@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import threading
 import time
 import uuid
@@ -13,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from sqlalchemy import Engine, create_engine, inspect, text
+from sqlalchemy import Engine, create_engine, event, inspect, text
 
 if TYPE_CHECKING:
     from alembic.config import Config
@@ -25,6 +26,151 @@ _logger = logging.getLogger(__name__)
 
 # A callable that returns a context manager yielding a Session.
 ManagedSessionMaker = Callable[[], AbstractContextManager[Session]]
+
+# A zero-argument callable returning a fresh database password (e.g. a
+# short-lived Lakebase OAuth token). Invoked once per *new* DBAPI connection.
+LakebaseTokenProvider = Callable[[], str]
+
+
+# ── Lakebase token-aware connections ───────────────────
+#
+# Databricks Lakebase (managed Postgres) authenticates with a short-lived
+# OAuth token (~1h TTL, rotated) used as the Postgres *password* — there is no
+# static password to bake into the URL. To stay connected we must mint a fresh
+# token for every new physical connection instead of pinning one at engine
+# construction. This is OPT-IN: it activates only when a token provider is
+# resolvable (``OMNIGENT_LAKEBASE_INSTANCE`` is set, or a provider was injected
+# via :func:`set_lakebase_token_provider`). When it is not active, engine
+# creation is byte-for-byte the legacy static-URI path (SQLite or
+# static-password Postgres) — see :func:`_create_engine`.
+
+# Env var naming the Lakebase database *instance* whose OAuth token should be
+# minted per connection. Its presence is what flips a Postgres engine into
+# token-refresh mode.
+_LAKEBASE_INSTANCE_ENV = "OMNIGENT_LAKEBASE_INSTANCE"
+
+# Recycle (close + reopen) pooled connections older than this many seconds.
+# Static deployments use 30 min (stale-connection hygiene). Lakebase lowers it
+# to 10 min so a connection is rebuilt — and its OAuth token re-minted via the
+# ``do_connect`` hook — comfortably before the ~1h token lifetime lapses, even
+# for connections that sit idle in the pool across a rotation.
+_SERVER_POOL_RECYCLE_SECONDS = 1800
+_LAKEBASE_POOL_RECYCLE_SECONDS = 600
+
+# Process-wide override, primarily for tests and for callers that want to plug
+# in their own token source (e.g. a non-default Databricks auth flow) without
+# the env-var path. ``None`` means "not overridden".
+_lakebase_token_provider_override: LakebaseTokenProvider | None = None
+
+
+def set_lakebase_token_provider(provider: LakebaseTokenProvider | None) -> None:
+    """
+    Install (or clear) a process-wide Lakebase token provider.
+
+    When set, every Postgres engine subsequently created by
+    :func:`get_or_create_engine` mints its connection password by calling
+    *provider* once per new DBAPI connection, and uses the shorter
+    Lakebase pool-recycle window. Pass ``None`` to clear the override and
+    fall back to the ``OMNIGENT_LAKEBASE_INSTANCE`` env-var path.
+
+    This is the documented seam for swapping the token source: the default
+    env-var path mints tokens via the Databricks SDK
+    (:func:`_databricks_lakebase_token_provider`), but a deployment with a
+    bespoke credential flow can inject its own zero-arg ``() -> str`` here.
+
+    :param provider: A zero-arg callable returning a fresh password string,
+        or ``None`` to clear a previously installed override.
+    """
+    global _lakebase_token_provider_override
+    _lakebase_token_provider_override = provider
+
+
+def _databricks_lakebase_token_provider(instance_name: str) -> str:
+    """
+    Mint a fresh short-lived Lakebase OAuth token via the Databricks SDK.
+
+    Uses ambient Databricks authentication (the workspace's app identity /
+    service principal when running inside a Databricks App, or a configured
+    profile / env credentials elsewhere). The returned token is used as the
+    Postgres password for a single connection; it expires in roughly an hour,
+    which is why it is re-minted per connection rather than cached.
+
+    :param instance_name: The Lakebase database instance name, e.g.
+        ``"omnigent-db"`` (the value of ``OMNIGENT_LAKEBASE_INSTANCE``).
+    :returns: A short-lived OAuth token string to use as the DB password.
+    :raises ImportError: If the ``databricks-sdk`` (the ``databricks`` extra)
+        is not installed.
+    """
+    from databricks.sdk import WorkspaceClient
+
+    workspace_client = WorkspaceClient()
+    credential = workspace_client.database.generate_database_credential(
+        request_id=str(uuid.uuid4()),
+        instance_names=[instance_name],
+    )
+    if not credential.token:
+        raise RuntimeError(
+            f"Databricks returned no Lakebase credential token for instance "
+            f"{instance_name!r}. Verify the instance name and that this identity "
+            f"has access to it."
+        )
+    return credential.token
+
+
+def _resolve_lakebase_token_provider() -> LakebaseTokenProvider | None:
+    """
+    Return the active Lakebase token provider, or ``None`` if not configured.
+
+    Resolution order:
+
+    1. A provider installed via :func:`set_lakebase_token_provider` (override).
+    2. The Databricks SDK provider, bound to the instance named by
+       ``OMNIGENT_LAKEBASE_INSTANCE``.
+    3. ``None`` — no token path; engines use the static-URI behavior.
+
+    :returns: A zero-arg ``() -> str`` token provider, or ``None``.
+    """
+    if _lakebase_token_provider_override is not None:
+        return _lakebase_token_provider_override
+    instance_name = os.environ.get(_LAKEBASE_INSTANCE_ENV)
+    if instance_name:
+        return lambda: _databricks_lakebase_token_provider(instance_name)
+    return None
+
+
+def _install_lakebase_token_refresh(
+    engine: Engine,
+    token_provider: LakebaseTokenProvider,
+) -> Callable[[object, object, list[object], dict[str, object]], None]:
+    """
+    Wire *engine* to refresh its connection password on every new connection.
+
+    Registers a SQLAlchemy ``do_connect`` listener that overwrites the
+    ``password`` connection parameter with a freshly minted token immediately
+    before each physical DBAPI connection is opened. ``do_connect`` fires once
+    per *new* connection (not per pool checkout), so pooled connections reuse
+    their token until recycled — which is why :func:`_create_engine` pairs this
+    with the shorter ``_LAKEBASE_POOL_RECYCLE_SECONDS`` window.
+
+    :param engine: The SQLAlchemy engine to attach the listener to.
+    :param token_provider: Zero-arg callable returning a fresh password.
+    :returns: The registered listener (returned so callers/tests can assert it
+        is wired and exercise it directly).
+    """
+
+    def _provide_fresh_token(
+        _dialect: object,
+        _conn_rec: object,
+        _cargs: list[object],
+        cparams: dict[str, object],
+    ) -> None:
+        # do_connect lets us mutate the connection params psycopg receives.
+        # Overwriting ``password`` here means the token is read fresh for each
+        # new connection — never baked into the cached engine's URL.
+        cparams["password"] = token_provider()
+
+    event.listen(engine, "do_connect", _provide_fresh_token)
+    return _provide_fresh_token
 
 
 # ── URL normalization ──────────────────────────────────
@@ -64,7 +210,11 @@ def _create_engine(db_uri: str) -> Engine:
     WAL also lets readers proceed concurrently with a writer.
 
     Non-SQLite databases use connection pooling with
-    ``pool_pre_ping`` to verify connections before use.
+    ``pool_pre_ping`` to verify connections before use. When a Lakebase
+    token provider is active (see :func:`_resolve_lakebase_token_provider`),
+    the engine additionally re-mints its OAuth token per new connection and
+    uses a shorter ``pool_recycle`` window; otherwise the static URI (and its
+    baked-in password, if any) is used unchanged.
 
     :param db_uri: SQLAlchemy database connection string, e.g.
         ``"sqlite:///mydb.db"`` or
@@ -90,9 +240,7 @@ def _create_engine(db_uri: str) -> Engine:
         # paths that go through that helper.
         import sqlite3
 
-        from sqlalchemy import event
-
-        @event.listens_for(engine, "connect")  # type: ignore[misc]
+        @event.listens_for(engine, "connect")
         def _set_sqlite_pragma(dbapi_conn: sqlite3.Connection, _conn_record: object) -> None:
             cur = dbapi_conn.cursor()
             try:
@@ -104,16 +252,26 @@ def _create_engine(db_uri: str) -> Engine:
                 cur.close()
 
         return engine
-    return create_engine(
+    # Lakebase (managed Postgres) authenticates with a short-lived OAuth token
+    # re-minted per connection; everything else uses the static URI as-is. The
+    # token path is OPT-IN — ``_resolve_lakebase_token_provider`` returns
+    # ``None`` unless ``OMNIGENT_LAKEBASE_INSTANCE`` is set or a provider was
+    # injected — so a static-password Postgres URI is byte-for-byte unchanged.
+    token_provider = _resolve_lakebase_token_provider()
+    pool_recycle = (
+        _LAKEBASE_POOL_RECYCLE_SECONDS if token_provider else _SERVER_POOL_RECYCLE_SECONDS
+    )
+    engine = create_engine(
         db_uri,
         # Verify connections are alive before checking them out
         # from the pool. Prevents "server has gone away" errors
         # after idle periods.
         pool_pre_ping=True,
-        # Recycle connections older than 30 minutes. Prevents
-        # stale connections when the database server restarts
-        # or closes idle connections.
-        pool_recycle=1800,
+        # Recycle connections older than this window. Prevents stale
+        # connections when the database server restarts or closes idle
+        # connections; in Lakebase token mode the shorter window also keeps
+        # each connection's OAuth token refreshed ahead of its ~1h expiry.
+        pool_recycle=pool_recycle,
         # Aligned with the AnyIO thread limiter in
         # ``server/app.py:_lifespan``. Every DB call runs via
         # ``asyncio.to_thread``, so connections beyond the thread
@@ -126,6 +284,9 @@ def _create_engine(db_uri: str) -> Engine:
         # error rather than a hang.
         pool_timeout=10,
     )
+    if token_provider:
+        _install_lakebase_token_refresh(engine, token_provider)
+    return engine
 
 
 def get_or_create_engine(db_uri: str) -> Engine:
@@ -147,6 +308,9 @@ def get_or_create_engine(db_uri: str) -> Engine:
             if db_uri not in _engine_cache:
                 engine = _create_engine(db_uri)
                 _initialize_or_verify_schema(engine, db_uri)
+                from omnigent.runtime.telemetry import instrument_sqlalchemy_engine
+
+                instrument_sqlalchemy_engine(engine)
                 _engine_cache[db_uri] = engine
     return _engine_cache[db_uri]
 
@@ -411,6 +575,7 @@ _ITEM_TYPE_PREFIX: dict[str, str] = {
     "resource_event": "rse_",
     "slash_command": "sc_",
     "terminal_command": "tc_",
+    "routing_decision": "rd_",
 }
 
 
@@ -505,18 +670,37 @@ _CREATE_FTS = text(
     "item_id UNINDEXED, conversation_id UNINDEXED, search_text)"
 )
 
+# Dialects that support SQLite's FTS5 extension. Cloudflare D1 is SQLite
+# served over HTTP, so it gets full-text search too — gate FTS on the dialect
+# *family*, not the literal name "sqlite". (The engine-level WAL/PRAGMA path in
+# ``_create_engine`` stays sqlite-only: those are local-file concerns that D1
+# neither needs nor supports over the wire.)
+_FTS5_DIALECTS = frozenset({"sqlite", "cloudflare_d1"})
+
+
+def _supports_fts5(dialect_name: str) -> bool:
+    """
+    Whether *dialect_name* is a SQLite-family dialect that supports FTS5.
+
+    :param dialect_name: A SQLAlchemy ``dialect.name``, e.g. ``"sqlite"``,
+        ``"cloudflare_d1"``, or ``"postgresql"``.
+    :returns: ``True`` for SQLite and SQLite-over-the-wire dialects (D1),
+        ``False`` otherwise.
+    """
+    return dialect_name in _FTS5_DIALECTS
+
 
 def ensure_fts_table(engine: Engine) -> None:
     """
-    Create the FTS5 virtual table if on SQLite. Idempotent.
+    Create the FTS5 virtual table on SQLite-family dialects. Idempotent.
 
-    On non-SQLite dialects this is a no-op.
+    On dialects without FTS5 (e.g. PostgreSQL) this is a no-op.
 
     :param engine: The SQLAlchemy engine whose dialect is inspected.
-        If SQLite, the ``conversation_items_fts`` virtual table is
-        created (if it does not already exist).
+        On a SQLite-family dialect (SQLite or Cloudflare D1) the
+        ``conversation_items_fts`` virtual table is created if absent.
     """
-    if engine.dialect.name == "sqlite":
+    if _supports_fts5(engine.dialect.name):
         with engine.connect() as conn:
             conn.execute(_CREATE_FTS)
             conn.commit()
@@ -529,9 +713,9 @@ def insert_fts(
     search_text: str,
 ) -> None:
     """
-    Dual-write a row into the FTS5 table (SQLite only).
+    Dual-write a row into the FTS5 table (SQLite-family dialects only).
 
-    On non-SQLite dialects this is a no-op.
+    On dialects without FTS5 this is a no-op.
 
     :param session: An active SQLAlchemy session. Its bound engine's
         dialect is checked to decide whether to write.
@@ -542,7 +726,7 @@ def insert_fts(
     :param search_text: Plain-text content to store in the FTS
         index for this item.
     """
-    if session.bind and session.bind.dialect.name == "sqlite":
+    if session.bind and _supports_fts5(session.bind.dialect.name):
         session.execute(
             text(
                 f"INSERT INTO {_FTS_TABLE}"
@@ -555,16 +739,16 @@ def insert_fts(
 
 def delete_fts_by_conversation(session: Session, conversation_id: str) -> None:
     """
-    Remove all FTS rows for a conversation (SQLite only).
+    Remove all FTS rows for a conversation (SQLite-family dialects only).
 
-    On non-SQLite dialects this is a no-op.
+    On dialects without FTS5 this is a no-op.
 
     :param session: An active SQLAlchemy session. Its bound engine's
         dialect is checked to decide whether to delete.
     :param conversation_id: The conversation whose FTS rows should be
         removed, e.g. ``"conv_e4f5a6b7..."``.
     """
-    if session.bind and session.bind.dialect.name == "sqlite":
+    if session.bind and _supports_fts5(session.bind.dialect.name):
         session.execute(
             text(f"DELETE FROM {_FTS_TABLE} WHERE conversation_id = :cid"),
             {"cid": conversation_id},
@@ -590,7 +774,8 @@ def extract_search_text(item: NewConversationItem) -> str:
         ``type`` is one of ``"message"``, ``"function_call"``,
         ``"function_call_output"``, ``"reasoning"``,
         ``"compaction"``, ``"native_tool"``, ``"resource_event"``,
-        ``"slash_command"``, or ``"terminal_command"``.
+        ``"slash_command"``, ``"terminal_command"``, or
+        ``"routing_decision"``.
     :returns: A single plain-text string suitable for FTS indexing.
     :raises ValueError: If *item.type* is not a recognised type.
     """
@@ -645,6 +830,10 @@ def extract_search_text(item: NewConversationItem) -> str:
         return " ".join(
             part for part in (data.get("input") or "", data.get("stdout") or "") if part
         )
+    if item.type == "routing_decision":
+        # Index model + rationale so FTS can find a router verdict by
+        # the model it picked or its one-line explanation.
+        return " ".join(part for part in (data.get("model"), data.get("rationale")) if part)
     raise ValueError(f"unknown item type: {item.type!r}")
 
 
@@ -667,6 +856,55 @@ def strip_nul_bytes(value: str) -> str:
         unchanged when no NUL bytes are present.
     """
     return value.replace("\x00", "")
+
+
+def build_search_snippet(
+    text: str,
+    query: str,
+    *,
+    context: int = 60,
+    max_len: int = 160,
+) -> str | None:
+    """
+    Build a short excerpt of ``text`` centered on the first ``query`` match.
+
+    Powers the session-search preview: the sidebar/palette matches on chat
+    content, so a hit is often invisible in the session title. This returns
+    the matching span plus a little surrounding context, with ``…`` marking
+    elided ends, so the UI can show *where* a session matched.
+
+    Matching is case-insensitive substring (mirrors the ``LIKE`` filter that
+    selected the row). Whitespace in ``text`` is collapsed first so a match
+    inside a multi-line tool output renders as one clean line.
+
+    :param text: The item's plain search text to excerpt from.
+    :param query: The user's search string, e.g. ``"deploy error"``.
+    :param context: Characters of context to keep on each side of the match.
+    :param max_len: Hard cap on the returned snippet length (excluding the
+        ``…`` markers) so a giant match term can't blow up the row.
+    :returns: The excerpt, or ``None`` when ``query`` is empty or does not
+        occur in ``text`` (caller then falls back to no preview).
+    """
+    if not query:
+        return None
+    collapsed = " ".join(text.split())
+    idx = collapsed.lower().find(query.lower())
+    if idx == -1:
+        return None
+    match_end = idx + len(query)
+    start = max(0, idx - context)
+    end = min(len(collapsed), match_end + context)
+    # Keep the total under max_len, but never clamp the matched term itself out
+    # of the window — otherwise the UI would highlight nothing. A pathologically
+    # long match term overflows max_len rather than being cut mid-term.
+    if end - start > max_len:
+        end = max(start + max_len, match_end)
+    snippet = collapsed[start:end]
+    if start > 0:
+        snippet = f"…{snippet}"
+    if end < len(collapsed):
+        snippet = f"{snippet}…"
+    return snippet
 
 
 # ── Timestamp ──────────────────────────────────────────

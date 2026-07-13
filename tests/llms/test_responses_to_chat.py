@@ -672,3 +672,188 @@ async def test_kimi_reasoning_started_emitted_once_per_run() -> None:
 
     assert len(reasoning_started) == 1
     assert [e.delta for e in reasoning_deltas] == ["part 1", " part 2"]
+
+
+@pytest.mark.asyncio
+async def test_grok_top_level_reasoning_content_streams() -> None:
+    """
+    xAI Grok / DeepSeek emit chain-of-thought as a top-level
+    ``delta.reasoning_content`` string (with ``content`` null during the
+    thinking phase), not as typed blocks nested inside ``content``. It must
+    surface as ``ResponseReasoningStartedEvent`` + ``ResponseReasoningTextDeltaEvent``
+    and stay out of the final answer text.
+    """
+    chunks = [
+        {"choices": [{"delta": {"reasoning_content": "Let me think..."}, "finish_reason": None}]},
+        {"choices": [{"delta": {"reasoning_content": " still thinking"}, "finish_reason": None}]},
+        {"choices": [{"delta": {"content": "42"}, "finish_reason": None}]},
+        {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+    ]
+    events = [
+        e async for e in chat_stream_to_response_events(_aiter(chunks), model="xai/grok-4.3")
+    ]
+
+    reasoning_started = [e for e in events if isinstance(e, ResponseReasoningStartedEvent)]
+    reasoning_deltas = [e for e in events if isinstance(e, ResponseReasoningTextDeltaEvent)]
+    text_deltas = [e for e in events if isinstance(e, ResponseTextDeltaEvent)]
+    completed = events[-1]
+
+    # One reasoning.started sentinel; both reasoning deltas surfaced in order.
+    assert len(reasoning_started) == 1
+    assert [e.delta for e in reasoning_deltas] == ["Let me think...", " still thinking"]
+
+    # Reasoning is hidden from the main answer text.
+    assert len(text_deltas) == 1
+    assert text_deltas[0].delta == "42"
+
+    assert isinstance(completed, ResponseCompletedEvent)
+    assert completed.response.output[0].content[0].text == "42"
+
+
+# ── _extract_delta_content unit tests ──────────────────────────────
+
+
+def test_extract_delta_content_plain_string() -> None:
+    """Plain string content returns (text, empty_reasoning)."""
+    from omnigent.llms._responses_to_chat import _extract_delta_content
+
+    text, reasoning = _extract_delta_content("Hello")
+    assert text == "Hello"
+    assert reasoning == ""
+
+
+def test_extract_delta_content_non_string_non_list() -> None:
+    """Non-string, non-list content returns empty strings."""
+    from omnigent.llms._responses_to_chat import _extract_delta_content
+
+    text, reasoning = _extract_delta_content(42)  # type: ignore[arg-type]
+    assert text == ""
+    assert reasoning == ""
+
+
+def test_extract_delta_content_list_with_text_blocks() -> None:
+    """List of text blocks extracts text."""
+    from omnigent.llms._responses_to_chat import _extract_delta_content
+
+    content = [{"type": "text", "text": "Hello"}, {"type": "text", "text": " world"}]
+    text, reasoning = _extract_delta_content(content)
+    assert text == "Hello world"
+    assert reasoning == ""
+
+
+def test_extract_delta_content_list_with_output_text_blocks() -> None:
+    """output_text blocks also count as text."""
+    from omnigent.llms._responses_to_chat import _extract_delta_content
+
+    content = [{"type": "output_text", "text": "Hello"}]
+    text, _reasoning = _extract_delta_content(content)
+    assert text == "Hello"
+
+
+def test_extract_delta_content_list_with_reasoning_blocks() -> None:
+    """Reasoning blocks extract summary text into reasoning output."""
+    from omnigent.llms._responses_to_chat import _extract_delta_content
+
+    content = [
+        {
+            "type": "reasoning",
+            "summary": [{"type": "summary_text", "text": "thinking..."}],
+        }
+    ]
+    text, reasoning = _extract_delta_content(content)
+    assert text == ""
+    assert reasoning == "thinking..."
+
+
+def test_extract_delta_content_list_with_bare_strings() -> None:
+    """Bare strings in the list are treated as text."""
+    from omnigent.llms._responses_to_chat import _extract_delta_content
+
+    content = ["Hello", " world"]
+    text, _reasoning = _extract_delta_content(content)
+    assert text == "Hello world"
+
+
+def test_extract_delta_content_list_skips_non_dict_non_string() -> None:
+    """Non-dict, non-string items in the list are skipped."""
+    from omnigent.llms._responses_to_chat import _extract_delta_content
+
+    content = [42, {"type": "text", "text": "ok"}]
+    text, _reasoning = _extract_delta_content(content)
+    assert text == "ok"
+
+
+def test_extract_delta_content_reasoning_without_summary() -> None:
+    """Reasoning block without summary key yields no reasoning text."""
+    from omnigent.llms._responses_to_chat import _extract_delta_content
+
+    content = [{"type": "reasoning"}]
+    _text, reasoning = _extract_delta_content(content)
+    assert reasoning == ""
+
+
+# ── _extract_usage unit tests ──────────────────────────────────────
+
+
+def test_extract_usage_returns_none_for_none() -> None:
+    from omnigent.llms._responses_to_chat import _extract_usage
+
+    assert _extract_usage(None) is None
+
+
+def test_extract_usage_returns_none_for_empty_dict() -> None:
+    from omnigent.llms._responses_to_chat import _extract_usage
+
+    assert _extract_usage({}) is None
+
+
+def test_extract_usage_maps_fields() -> None:
+    from omnigent.llms._responses_to_chat import _extract_usage
+
+    usage = _extract_usage({"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15})
+    assert usage is not None
+    assert usage.input_tokens == 10
+    assert usage.output_tokens == 5
+    assert usage.total_tokens == 15
+
+
+# ── Streaming: usage-only final chunk ──────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_streaming_usage_only_chunk() -> None:
+    """A trailing chunk with only usage (no choices) captures the usage."""
+    chunks = [
+        {"choices": [{"delta": {"content": "Hi"}, "finish_reason": None}]},
+        {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+        {
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 2,
+                "total_tokens": 12,
+            }
+        },
+    ]
+    events = [e async for e in chat_stream_to_response_events(_aiter(chunks), model="test")]
+    completed = events[-1]
+    assert isinstance(completed, ResponseCompletedEvent)
+    assert completed.response.usage == Usage(input_tokens=10, output_tokens=2, total_tokens=12)
+
+
+# ── Trailing tool calls flushed ────────────────────────────────────
+
+
+def test_trailing_function_calls_flushed() -> None:
+    """Function call items at the end of input are flushed into assistant msg."""
+    items = [
+        {
+            "type": "function_call",
+            "call_id": "c1",
+            "name": "fn",
+            "arguments": "{}",
+        },
+    ]
+    messages = responses_input_to_chat_messages(items, None)
+    assert len(messages) == 1
+    assert messages[0]["role"] == "assistant"
+    assert len(messages[0]["tool_calls"]) == 1

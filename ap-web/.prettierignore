@@ -1,5 +1,0 @@
-node_modules
-dist
-../omnigent/server/static/web-ui
-src/components/ui
-package-lock.json

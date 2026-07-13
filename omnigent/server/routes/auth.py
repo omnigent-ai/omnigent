@@ -553,6 +553,57 @@ def create_auth_router(
             },
         )
 
+    # ── Admin: read-only user list ────────────────────────────────
+
+    @router.get("/users")
+    async def list_users(request: Request) -> Response:
+        """List all users (admin only).
+
+        The OIDC analog of the accounts provider's ``GET /auth/users``
+        — same response shape, so the SPA's Members surface renders
+        identically. This is the read-only discovery half of the
+        admin surface: OIDC identities are owned by the IdP, so there
+        are no server-side password actions (invite/reset/delete) to
+        offer here, and the SPA hides those controls in OIDC mode.
+
+        Admin is gated on the same ``is_admin`` flag the rest of the
+        app uses (set by the admin-list promotion at login), with the
+        admin list as a direct fallback — matching the OIDC invite
+        route above.
+
+        :param request: The incoming request (carries the session cookie).
+        :returns: 200 with ``{"users": [...]}``, 401 if unauthenticated,
+            403 if not an admin, or 200 with an empty list if no
+            permission store is wired.
+        """
+        from fastapi.responses import JSONResponse
+
+        caller = auth_provider.get_user_id(request)
+        if caller is None:
+            return JSONResponse(status_code=401, content={"error": "not authenticated"})
+        is_admin = (
+            permission_store is not None and permission_store.is_admin(caller)
+        ) or admin_list.is_admin(caller)
+        if not is_admin:
+            return JSONResponse(status_code=403, content={"error": "admin only"})
+
+        users = permission_store.list_users() if permission_store is not None else []
+        return JSONResponse(
+            status_code=200,
+            content={
+                "users": [
+                    {
+                        "id": u.id,
+                        "is_admin": u.is_admin,
+                        "created_at": u.created_at,
+                        "last_login_at": u.last_login_at,
+                        "has_password": u.has_password,
+                    }
+                    for u in users
+                ]
+            },
+        )
+
     return router
 
 
@@ -584,7 +635,7 @@ def _sanitize_return_to(raw: str | None) -> str:
     the state cookie protects its *integrity* across the IdP round-trip
     but does nothing for its *safety* — the value still originates with
     the caller. This is the server-side mirror of ``sanitizeReturnTo``
-    in ``ap-web/src/pages/LoginPage.tsx``; the accounts flow navigates
+    in ``web/src/pages/LoginPage.tsx``; the accounts flow navigates
     client-side and is already guarded there, but the OIDC redirect
     happens in Python and bypasses that check.
 
@@ -629,12 +680,21 @@ async def _resolve_github_email(
     client: httpx.AsyncClient,
     access_token: str,
 ) -> str | None:
-    """Fetch the primary verified email from GitHub's user API.
+    """Fetch the primary *verified* email from GitHub's user API.
+
+    Only a ``primary`` and ``verified`` address from ``/user/emails`` is
+    returned. GitHub's ``/user.email`` (the public *profile* email) is not
+    guaranteed to be verified or owned by the caller, so it is never used
+    as the sign-in identity — trusting it would let a user log in as an
+    arbitrary address they merely typed into their profile, bypassing the
+    domain allowlist and (if that address is admin-listed) escalating to
+    admin. This mirrors the ``email_verified`` gate the OIDC ``id_token``
+    path already enforces.
 
     :param client: An active ``httpx.AsyncClient``.
     :param access_token: GitHub OAuth access token.
-    :returns: The user's primary verified email, or ``None`` if
-        unavailable.
+    :returns: The user's primary verified email, or ``None`` if none is
+        available (the caller rejects a ``None`` email with 400).
     """
     headers = {
         "Authorization": f"Bearer {access_token}",
@@ -652,15 +712,10 @@ async def _resolve_github_email(
             if entry.get("primary") and entry.get("verified"):
                 return entry.get("email")
 
-    # Fallback: try the user profile endpoint.
-    user_resp = await client.get(
-        "https://api.github.com/user",
-        headers=headers,
-        timeout=10.0,
-    )
-    if user_resp.status_code == 200:
-        return user_resp.json().get("email")
-
+    # No primary, verified address. Deliberately do NOT fall back to the
+    # ``/user.email`` profile field: it is unverified and attacker-settable,
+    # so returning it would let a caller assume an identity they do not own.
+    # Fail closed — the caller turns a ``None`` email into a 400.
     return None
 
 
@@ -701,6 +756,11 @@ def _resolve_oidc_email(
     allowed domain. This mirrors the GitHub path, which
     requires ``verified`` on the primary email.
 
+    ``config.skip_email_verification`` (from
+    ``OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION``) waives the gate for
+    IdPs that omit the claim for directory-managed users (e.g. Okta
+    without custom API Access Management).
+
     :param token_json: The token endpoint response JSON containing
         ``id_token``.
     :param config: The OIDC configuration with JWKS URI and
@@ -708,7 +768,7 @@ def _resolve_oidc_email(
     :returns: The user's email from the ``id_token`` when present and
         marked verified; ``None`` if the token is missing/invalid,
         the email claim is absent, or ``email_verified`` is not
-        truthy.
+        truthy (and verification is not skipped via config).
     """
     id_token = token_json.get("id_token")
     if not id_token:
@@ -734,8 +794,17 @@ def _resolve_oidc_email(
 
     # Reject unless the IdP affirmatively verified the email. A signed
     # token only proves IdP provenance, not mailbox ownership.
-    # Absent/false ``email_verified`` is a hard reject.
+    # Absent/false ``email_verified`` is a hard reject — unless the
+    # operator opted out (OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION) for
+    # IdPs like Okta that omit the claim for directory-managed users.
     if not _claim_is_verified_true(claims.get("email_verified")):
+        if config.skip_email_verification:
+            _logger.info(
+                "Accepting id_token email %r without email_verified "
+                "(OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION is set)",
+                email,
+            )
+            return email
         _logger.warning(
             "Rejecting id_token: email %r present but email_verified is not true",
             email,

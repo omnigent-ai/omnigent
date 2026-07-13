@@ -6,21 +6,17 @@ Omnigent continues to use canonical harness identifiers internally.
 
 from __future__ import annotations
 
-HARNESS_ALIASES: dict[str, str] = {
-    "claude": "claude-sdk",
-    # The SDK package / runtime dispatch spelling; specs use "openai-agents".
-    "openai-agents-sdk": "openai-agents",
-}
+from omnigent.harness_plugins import harness_aliases, native_harnesses
 
-# Canonical native-CLI harness spellings. These are the only harnesses that
-# own an on-disk runtime transcript (Claude Code's project JSONL / Codex's
-# rollout); a fork into one carries history only via a transcript rebuild
-# (same-format clone on the same-family diagonal, or build-from-AP-items for
-# an SDK source). ``AgentSpec.harness_kind`` returns these canonical
-# spellings for native agents, so no executor-type aliasing is needed here.
-NATIVE_HARNESSES: frozenset[str] = frozenset(
-    {"claude-native", "native-claude", "codex-native", "native-codex"}
-)
+HARNESS_ALIASES: dict[str, str] = harness_aliases()
+
+# Canonical native-CLI harness spellings. These harnesses type messages into
+# a resident terminal process and mirror their transcript back to Omnigent, so
+# the runner must not replay Omnigent history or treat a completed queue call
+# as a full in-process model turn. ``AgentSpec.harness_kind`` returns these
+# canonical spellings for native agents, so no executor-type aliasing is needed
+# here.
+NATIVE_HARNESSES: frozenset[str] = native_harnesses()
 
 
 def canonicalize_harness(harness: str | None) -> str | None:
@@ -31,6 +27,12 @@ def canonicalize_harness(harness: str | None) -> str | None:
     """
     if harness is None:
         return None
+    # Namespaced generic-ACP ids (``acp:<slug>``) canonicalize to the base
+    # ``acp`` harness for identity / validity / module resolution / model-family
+    # checks. The ``<slug>`` selecting the concrete agent is carried separately in
+    # the spec's ``executor.config`` and read by ``_build_acp_spawn_env``.
+    if harness.startswith("acp:"):
+        return "acp"
     return HARNESS_ALIASES.get(harness, harness)
 
 
@@ -42,12 +44,9 @@ def is_claude_sdk_harness_name(harness: str | None) -> bool:
 def is_native_harness(harness: str | None) -> bool:
     """Return whether *harness* is a native CLI harness.
 
-    Native harnesses (Claude Code, Codex) boot from their own on-disk
-    runtime transcript and ignore the Omnigent transcript, so a fork into
-    one needs a transcript rebuild to carry history. Accepts the canonical
-    native spellings that :attr:`AgentSpec.harness_kind` returns
-    (``"claude-native"`` / ``"codex-native"`` and the reversed
-    ``"native-claude"`` / ``"native-codex"`` forms).
+    Native harnesses boot a vendor TUI in a terminal and route user messages
+    into that running process. Accepts the canonical native spellings that
+    :attr:`AgentSpec.harness_kind` returns plus their reversed aliases.
 
     :param harness: A harness id, e.g. ``"codex-native"`` or ``"claude_sdk"``;
         ``None`` returns ``False``.
@@ -56,3 +55,25 @@ def is_native_harness(harness: str | None) -> bool:
     if harness is None:
         return False
     return (canonicalize_harness(harness) or harness) in NATIVE_HARNESSES
+
+
+def native_terminal_name(harness: str | None) -> str | None:
+    """Return the tmux terminal short-name a native harness runs its CLI in.
+
+    Native CLI panes are keyed ``(conversation_id, <short-name>, "main")`` in the
+    terminal registry, where the short name is the canonical native harness id
+    with the ``-native`` suffix dropped — e.g. ``"claude-native"`` -> ``"claude"``,
+    ``"native-codex"`` -> ``"codex"``, ``"opencode-native"`` -> ``"opencode"``.
+
+    :param harness: A harness id (canonical or reversed alias), e.g.
+        ``"cursor-native"``; ``None`` or a non-native harness returns ``None``.
+    :returns: The terminal short-name, e.g. ``"cursor"``, or ``None`` when
+        *harness* is not a native CLI harness.
+    """
+    if not is_native_harness(harness):
+        return None
+    canonical = canonicalize_harness(harness) or harness
+    # Canonical native ids are ``<name>-native``; some accepted aliases keep the
+    # reversed ``native-<name>`` spelling (not all are folded by
+    # ``canonicalize_harness``), so strip either affix.
+    return canonical.removesuffix("-native").removeprefix("native-")

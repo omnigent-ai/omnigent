@@ -227,6 +227,58 @@ async def test_wait_for_user_approval_publishes_on_cancellation() -> None:
     assert publishes[0][1]["elicitation_id"] == "elicit_cancel"
 
 
+@pytest.mark.asyncio
+async def test_wait_for_user_approval_default_budget_gates_until_verdict() -> None:
+    """With NO explicit timeout, the ASK gate blocks until a human verdict.
+
+    Behavioral guard for the cost-policy auto-resolve bug. The relay / MCP
+    callers (``proxy_mcp_manager`` / ``mcp_manager``) invoke
+    :func:`wait_for_user_approval` WITHOUT ``timeout_seconds``, so it falls
+    back to :data:`pending_approvals._DEFAULT_WAIT_SECONDS`. That default was
+    once 120s, which silently refused (``False``) any prompt the human didn't
+    answer within two minutes — the card "auto-resolved" and the agent moved
+    on. The default is now one day (matching the policy's ``ask_timeout``), so
+    the gate must KEEP blocking until a real verdict arrives; ONLY the verdict —
+    never the budget elapsing on its own — may release it.
+
+    This exercises the exact default-budget path the real callers use (no
+    ``timeout_seconds``) and asserts: (1) the gate is still parked after a
+    real delay, and (2) a human verdict — and only that — releases it with
+    the right value. A regression that shortens the default to anything
+    inside the sleep window flips assertion (1); the companion drift-guard in
+    ``tests/test_ask_timeout.py`` pins the exact one-day value so a 120s-style
+    regression (too long to catch by waiting) still fails loudly.
+    """
+    publishes: list[tuple[str, dict[str, Any]]] = []
+
+    def _publish(conv_id: str, event: dict[str, Any]) -> None:
+        publishes.append((conv_id, event))
+
+    task = asyncio.create_task(
+        pending_approvals.wait_for_user_approval(
+            elicitation_id="elicit_default_budget",
+            conversation_id="conv_default_budget",
+            publish_event=_publish,
+            # NOTE: no timeout_seconds — drive the default budget, the exact
+            # path the relay/MCP approval callers use.
+        )
+    )
+    # The gate must STILL be blocking after a real delay — it must not
+    # auto-resolve on the default budget. (Pre-fix, a short/expired default
+    # would have already returned False here.)
+    await asyncio.sleep(0.2)
+    assert not task.done(), (
+        "ASK gate auto-resolved on the default budget — it must keep gating "
+        "until a human verdict, never refuse on its own."
+    )
+    assert pending_approvals.has_pending("conv_default_budget") is True
+
+    # Only a real human verdict releases the gate, and the value is honored.
+    assert pending_approvals.resolve("elicit_default_budget", approved=True) is True
+    assert await asyncio.wait_for(task, timeout=1.0) is True
+    assert pending_approvals.has_pending("conv_default_budget") is False
+
+
 # ---------------------------------------------------------------------------
 # has_pending — session is "awaiting human approval"
 # ---------------------------------------------------------------------------

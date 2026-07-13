@@ -11,9 +11,8 @@ distinct from native Omnigent local tools, which live as
 :class:`omnigent.tools.local.LocalPythonTool` in a subprocess.
 
 The harness contract migration (``designs/SERVER_HARNESS_CONTRACT.md``,
-step 5g) routes spec-declared tools through AP's ToolManager so
-:meth:`omnigent.runtime.executors.base.ExecutorContext.call_tool`
-can dispatch them. This module supplies the AP-side wrapper:
+step 5g) routes spec-declared tools through AP's ToolManager so the
+executor can dispatch them. This module supplies the AP-side wrapper:
 
 - :class:`LocalCallableTool` — one :class:`Tool` per registered
   callable. Imports the dotted path lazily on first invoke;
@@ -150,9 +149,8 @@ class LocalCallableTool(Tool):
         (the LLM produces JSON per the OpenAI tool-call shape).
         Runs the callable in-process; converts its return value
         to a string for the workflow to record. Exceptions are
-        re-raised to the caller — :meth:`ExecutorContext.call_tool`
-        wraps them into a ``status="error"`` :class:`ToolResult`
-        upstream.
+        re-raised to the caller — the tool-dispatch layer wraps
+        them into a ``status="error"`` :class:`ToolResult` upstream.
 
         :param arguments: JSON-encoded arguments string from
             the LLM, e.g. ``'{"expression": "2+2"}'``.

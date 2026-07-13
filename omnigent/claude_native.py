@@ -18,10 +18,16 @@ import secrets
 import shlex
 import shutil
 import signal
+import subprocess
 import sys
-import termios
-import tty
 import uuid
+
+# termios/tty are POSIX-only and drive the native (tmux/PTY) Claude terminal,
+# which is disabled on Windows. Guard the import (special-cased by mypy, which
+# type-checks on Linux) so importing this module never crashes the CLI there.
+if sys.platform != "win32":
+    import termios
+    import tty
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -55,6 +61,7 @@ from omnigent._wrapper_labels import (
 from omnigent._wrapper_labels import (
     WRAPPER_LABEL_KEY as _WRAPPER_LABEL_KEY,
 )
+from omnigent.claude_launcher import resolve_claude_launch
 from omnigent.claude_native_bridge import (
     BRIDGE_ID_LABEL_KEY,
     augment_claude_args,
@@ -82,6 +89,7 @@ from omnigent.host.daemon_launch import (
     wait_for_host_online,
     wait_for_runner_online,
 )
+from omnigent.native_coding_agents import native_shell_terminal_spec
 from omnigent.native_terminal import (
     DAEMON_HOST_ONLINE_TIMEOUT_S as _DAEMON_HOST_ONLINE_TIMEOUT_S,
 )
@@ -112,6 +120,12 @@ _TERMINAL_SESSION_KEY = "main"
 _UCODE_CLAUDE_AGENT_NAME = "claude"
 _UCODE_CLAUDE_BASE_URL_ENV = "ANTHROPIC_BASE_URL"
 _ANTHROPIC_API_KEY_ENV = "ANTHROPIC_API_KEY"
+_ANTHROPIC_BEDROCK_BASE_URL_ENV = "ANTHROPIC_BEDROCK_BASE_URL"
+_AWS_BEARER_TOKEN_BEDROCK_ENV = "AWS_BEARER_TOKEN_BEDROCK"
+_CLAUDE_CODE_USE_BEDROCK_ENV = "CLAUDE_CODE_USE_BEDROCK"
+# Bedrock mode reads the token from the env (not an apiKeyHelper), so a
+# provider ``auth_command`` is resolved to a concrete token at launch.
+_BEDROCK_AUTH_COMMAND_TIMEOUT_S = 15.0
 _CLAUDE_CODE_NESTED_SESSION_ENV = "CLAUDECODE"
 _CLAUDE_CODE_API_KEY_HELPER_TTL_ENV = "CLAUDE_CODE_API_KEY_HELPER_TTL_MS"
 _CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS_ENV = "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"
@@ -136,6 +150,17 @@ _UCODE_CLAUDE_TIER_TO_ENV: dict[str, str] = {
     "sonnet": _ANTHROPIC_DEFAULT_SONNET_MODEL_ENV,
     "haiku": _ANTHROPIC_DEFAULT_HAIKU_MODEL_ENV,
 }
+# The 4 family aliases above pin one model ID each. Claude Code has exactly
+# one more independently-selectable /model picker slot beyond those
+# families — ANTHROPIC_CUSTOM_MODEL_OPTION — used here to surface Sonnet 5
+# as an opt-in *alongside* the "sonnet" alias, which stays pinned to the
+# workspace's existing default Sonnet (4.6). This keeps the default Sonnet
+# unchanged and adds the newer generation as a separate, explicit choice.
+# See https://code.claude.com/docs/en/model-config#custom-model-options
+_ANTHROPIC_CUSTOM_MODEL_OPTION_ENV = "ANTHROPIC_CUSTOM_MODEL_OPTION"
+_ANTHROPIC_CUSTOM_MODEL_OPTION_NAME_ENV = "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME"
+_UCODE_CLAUDE_CUSTOM_TIER = "sonnet_5"
+_UCODE_CLAUDE_CUSTOM_TIER_LABEL = "Sonnet 5"
 _DEFAULT_UCODE_AUTH_REFRESH_INTERVAL_MS = 900_000
 _SESSION_LABELS = {
     "omnigent.ui": "terminal",
@@ -260,13 +285,16 @@ class ClaudeNativeUcodeConfig:
         "https://example.databricks.com/ai-gateway/anthropic"}``.
     :param api_key_helper: Claude Code ``apiKeyHelper`` command from
         ucode state, e.g. ``"databricks auth token --host
-        https://example.databricks.com ..."``.
+        https://example.databricks.com ..."``. ``None`` writes no
+        ``apiKeyHelper`` (the Bedrock path delivers its credential via
+        ``AWS_BEARER_TOKEN_BEDROCK`` instead; Claude Code ignores
+        ``apiKeyHelper`` once ``CLAUDE_CODE_USE_BEDROCK=1``).
     :param model: Optional model id from ucode state, e.g.
         ``"databricks-claude-opus-4-7"``.
     """
 
     env: dict[str, str]
-    api_key_helper: str
+    api_key_helper: str | None = None
     model: str | None = None
 
 
@@ -294,6 +322,16 @@ def build_native_claude_terminal_env(
         terminal_env.update(claude_config.env)
         terminal_env[_CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV] = "true"
         terminal_env[_CLAUDE_CODE_DISABLE_AGENT_VIEW_ENV] = "1"
+    # On the apiKeyHelper path the credential reaches Claude Code via the
+    # helper; a raw ANTHROPIC_API_KEY here re-triggers Claude Code's "Detected a
+    # custom API key" menu, which hangs tmux delivery. Fail loud if one leaks.
+    if claude_config is not None and claude_config.api_key_helper:
+        if _ANTHROPIC_API_KEY_ENV in terminal_env:
+            raise RuntimeError(
+                "native-claude: apiKeyHelper is configured but the terminal env "
+                f"carries a raw {_ANTHROPIC_API_KEY_ENV}; the credential must reach "
+                "Claude Code via the helper, not the environment."
+            )
     return terminal_env
 
 
@@ -1433,6 +1471,10 @@ def _ucode_config_for_profile(profile: str | None) -> ClaudeNativeUcodeConfig | 
         model_id = workspace_state.claude_models.get(tier)
         if model_id:
             env[env_var] = model_id
+    custom_model_id = workspace_state.claude_models.get(_UCODE_CLAUDE_CUSTOM_TIER)
+    if custom_model_id:
+        env[_ANTHROPIC_CUSTOM_MODEL_OPTION_ENV] = custom_model_id
+        env[_ANTHROPIC_CUSTOM_MODEL_OPTION_NAME_ENV] = _UCODE_CLAUDE_CUSTOM_TIER_LABEL
     # When ucode caches no model, default it so Claude Code doesn't fall back
     # to its host-config model (an Anthropic-direct id the gateway rejects).
     return ClaudeNativeUcodeConfig(
@@ -1491,8 +1533,116 @@ def _provider_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcod
         family.default_model,
     )
     return ClaudeNativeUcodeConfig(
-        env={_UCODE_CLAUDE_BASE_URL_ENV: family.base_url},
+        env={
+            _UCODE_CLAUDE_BASE_URL_ENV: family.base_url,
+            # Disable Claude Code's experimental anthropic-beta flags. Gateways
+            # (Databricks serving-endpoints and the like) reject beta flags they
+            # don't implement with a 400 "invalid beta flag", which kills every
+            # turn. The ucode/databricks path already sets this; mirror it here
+            # so the generic key/gateway/local provider path is equally
+            # gateway-safe.
+            _CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS_ENV: "1",
+        },
         api_key_helper=api_key_helper,
+        model=family.default_model,
+    )
+
+
+def _bedrock_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcodeConfig | None:
+    """Build native Claude Code launch config for Bedrock-style gateways.
+
+    AWS Bedrock and Bedrock-compatible gateways (like corporate AI gateways)
+    use a different set of environment variables than the standard Anthropic API:
+    - ``ANTHROPIC_BEDROCK_BASE_URL`` instead of ``ANTHROPIC_BASE_URL``
+    - ``AWS_BEARER_TOKEN_BEDROCK`` for the credential (a static ``api_key``
+      or the resolved stdout of an ``auth_command``)
+    - ``CLAUDE_CODE_USE_BEDROCK=1`` to enable Bedrock mode
+
+    A ``base_url`` is required (it becomes ``ANTHROPIC_BEDROCK_BASE_URL``), so
+    this targets gateways with an explicit endpoint; for direct AWS Bedrock,
+    point it at the regional runtime endpoint
+    (``https://bedrock-runtime.<region>.amazonaws.com``). The configured
+    ``models.default`` must be a Bedrock model id / inference profile such as
+    ``us.anthropic.claude-opus-4-5-20251101-v1:0`` — friendly aliases like
+    ``claude-opus-4.5`` are rejected by Bedrock.
+
+    An ``auth_command`` is resolved to a token once, at launch — Bedrock mode
+    reads the token from the env and never re-invokes a helper — so a
+    short-lived/rotating token won't refresh mid-session; prefer a long-lived
+    credential for long runs.
+
+    :param entry: A resolved provider entry with ``kind="bedrock"``.
+    :returns: The launch config, or ``None`` when the provider does not serve
+        the anthropic surface or carries no usable credential.
+    """
+    from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY
+
+    family = entry.family(ANTHROPIC_FAMILY)
+    if family is None:
+        _logger.warning(
+            "native-claude: bedrock provider %r does not serve the anthropic surface "
+            "— falling back to Claude Code's own login.",
+            entry.name,
+        )
+        return None
+    # A family carries exactly one of api_key / api_key_ref / auth_command;
+    # api_key_ref is collapsed into api_key at resolution, but auth_command is
+    # left for the consumer. Bedrock mode reads the token from the env and
+    # ignores any apiKeyHelper, so (unlike the sibling gateway path) we resolve
+    # the auth_command to a concrete token here, once, at launch.
+    token = family.api_key
+    if not token and family.auth_command:
+        try:
+            result = subprocess.run(
+                ["/bin/sh", "-c", family.auth_command],
+                capture_output=True,
+                text=True,
+                timeout=_BEDROCK_AUTH_COMMAND_TIMEOUT_S,
+                check=True,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            # CalledProcessError / TimeoutExpired carry captured stderr; surface
+            # it so a misconfigured auth_command is diagnosable. stdout (which
+            # would hold the minted token) is deliberately never logged.
+            stderr = getattr(exc, "stderr", None)
+            _logger.warning(
+                "native-claude: bedrock provider %r auth_command failed (%s)%s "
+                "— falling back to Claude Code's own login.",
+                entry.name,
+                exc,
+                f"\nstderr: {stderr.strip()}" if stderr else "",
+            )
+            return None
+        token = result.stdout.strip()
+    if not token:
+        _logger.warning(
+            "native-claude: bedrock provider %r has no usable credential "
+            "— falling back to Claude Code's own login.",
+            entry.name,
+        )
+        return None
+    if family.default_model is None:
+        _logger.warning(
+            "native-claude: bedrock provider %r sets no models.default — Claude Code "
+            "will choose its own default model, which is usually not enabled on a "
+            "Bedrock account. Set models.default to a Bedrock inference-profile id "
+            "(e.g. us.anthropic.claude-opus-4-5-20251101-v1:0).",
+            entry.name,
+        )
+    _logger.info(
+        "native-claude routing: bedrock provider %r (base_url=%s, model=%s)",
+        entry.name,
+        family.base_url,
+        family.default_model,
+    )
+    return ClaudeNativeUcodeConfig(
+        env={
+            _ANTHROPIC_BEDROCK_BASE_URL_ENV: family.base_url,
+            _AWS_BEARER_TOKEN_BEDROCK_ENV: token,
+            _CLAUDE_CODE_USE_BEDROCK_ENV: "1",
+            _CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS_ENV: "1",
+        },
+        # No apiKeyHelper: Bedrock mode authenticates from the env token above.
         model=family.default_model,
     )
 
@@ -1504,6 +1654,8 @@ def _native_claude_config_from_entry(
 
     - ``key`` / ``gateway`` / ``local`` → provider gateway config
       (:func:`_provider_config_for_native_claude`).
+    - ``bedrock`` → Bedrock-style gateway config
+      (:func:`_bedrock_config_for_native_claude`).
     - ``databricks`` → the existing ucode path keyed on the provider profile.
     - ``subscription`` → ``None`` (use the ``claude`` CLI's own login, e.g. a
       Claude Enterprise seat) — intentional, not a fallback to ucode.
@@ -1512,6 +1664,7 @@ def _native_claude_config_from_entry(
     :returns: The launch config, or ``None`` to use Claude's own login.
     """
     from omnigent.onboarding.provider_config import (
+        BEDROCK_KIND,
         DATABRICKS_KIND,
         GATEWAY_KIND,
         KEY_KIND,
@@ -1520,6 +1673,8 @@ def _native_claude_config_from_entry(
 
     if entry.kind in (KEY_KIND, GATEWAY_KIND, LOCAL_KIND):
         return _provider_config_for_native_claude(entry)
+    if entry.kind == BEDROCK_KIND:
+        return _bedrock_config_for_native_claude(entry)
     if entry.kind == DATABRICKS_KIND:
         _logger.info("native-claude routing: Databricks ucode profile %r", entry.profile)
         return _ucode_config_for_profile(entry.profile)
@@ -1641,20 +1796,10 @@ def _materialize_claude_agent_spec(tmpdir: Path) -> Path:
         # Declare a default shell terminal so the relay advertises the
         # ``sys_terminal_*`` family to the wrapped Claude Code (the
         # relay's gate is a non-empty ``terminals:`` block on this
-        # spec). Caller process / no sandbox matches the ``os_env``
-        # stance above — the native CLI already runs unsandboxed on
-        # the user's workspace.
-        "terminals": {
-            "shell": {
-                "command": "bash",
-                "allow_cwd_override": True,
-                "os_env": {
-                    "type": "caller_process",
-                    "cwd": ".",
-                    "sandbox": {"type": "none"},
-                },
-            },
-        },
+        # spec). Its command follows the user's ``$SHELL`` (zsh/fish/bash);
+        # caller process / no sandbox matches the ``os_env`` stance above —
+        # the native CLI already runs unsandboxed on the user's workspace.
+        "terminals": native_shell_terminal_spec(),
     }
     yaml_path.write_text(yaml.safe_dump(raw, sort_keys=False))
     return yaml_path
@@ -1893,7 +2038,7 @@ async def _attach_direct_tmux(
         outlives the attach (user detached), else
         :attr:`_AttachOutcome.EXITED`.
     """
-    from omnigent.terminals.ws_bridge import _tmux_session_alive
+    from omnigent.terminals.ws_bridge import _check_pane_dead_definitive, _tmux_session_alive
 
     startup_profiler = startup_profiler or StartupProfiler(name="omnigent claude", enabled=False)
     env = dict(os.environ)
@@ -1911,11 +2056,46 @@ async def _attach_direct_tmux(
         env=env,
     )
     startup_profiler.mark("tmux attach subprocess started")
-    await process.wait()
+
+    # Poll for a dead pane in the background. With ``remain-on-exit on``,
+    # the tmux session outlives the inner CLI, so ``tmux attach`` never exits
+    # on its own — the user sees "Pane is dead" and Ctrl-C is silently
+    # dropped because there is no process to receive the signal. Killing the
+    # attach subprocess forces it to exit so the CLI can tear down cleanly.
+    async def _kill_when_pane_dead() -> None:
+        _POLL_INTERVAL_S = 0.5
+        while True:
+            await asyncio.sleep(_POLL_INTERVAL_S)
+            if process.returncode is not None:
+                return  # already exited naturally
+            is_dead = await _check_pane_dead_definitive(str(socket_path), tmux_target)
+            if is_dead is True:
+                _logger.debug("direct-tmux: pane is dead; killing tmux attach child")
+                with contextlib.suppress(ProcessLookupError):
+                    process.kill()
+                return
+
+    watcher = asyncio.create_task(_kill_when_pane_dead(), name="direct-tmux-pane-watcher")
+    try:
+        await process.wait()
+    finally:
+        watcher.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await watcher
+
     startup_profiler.mark("tmux attach subprocess exited")
-    if await _tmux_session_alive(str(socket_path), tmux_target):
-        return _AttachOutcome.DETACHED
-    return _AttachOutcome.EXITED
+    # Use the tri-state probe so a dead pane (session alive, pane_dead=1) is
+    # treated as EXITED rather than DETACHED. With remain-on-exit the session
+    # outlives the inner CLI, so _tmux_session_alive alone would wrongly signal
+    # a user detach and the reconnect loop would re-attach to the dead pane.
+    pane_dead = await _check_pane_dead_definitive(str(socket_path), tmux_target)
+    if pane_dead is True:
+        return _AttachOutcome.EXITED
+    if pane_dead is None:
+        # Inconclusive probe — fall back to session-existence check.
+        if not await _tmux_session_alive(str(socket_path), tmux_target):
+            return _AttachOutcome.EXITED
+    return _AttachOutcome.DETACHED
 
 
 async def _attach_with_transcript_forwarder(
@@ -2854,7 +3034,8 @@ def _run_with_remote_server(
         if prepared is not None and outcome is _AttachOutcome.DETACHED:
             active_session_id = read_active_session_id(prepared.bridge_dir) or prepared.session_id
             click.echo(
-                f"\nDetached. Agent still running at {base_url}/c/{active_session_id}",
+                f"\nDetached. Agent still running at "
+                f"{conversation_url(base_url, active_session_id)}",
                 err=True,
             )
             echo_native_resume_hint(
@@ -3332,6 +3513,63 @@ def _claude_transcript_records_from_session_items(
     parent_uuid: str | None = None
     tool_parent_by_call_id: dict[str, str] = {}
     for index, item in enumerate(items):
+        # Compaction items carry the post-compaction context. Replace
+        # all prior records with the compacted messages so the
+        # reconstructed transcript reflects the compacted state.
+        if item.get("type") == "compaction":
+            compacted_msgs = item.get("compacted_messages")
+            if compacted_msgs:
+                records.clear()
+                parent_uuid = None
+                tool_parent_by_call_id.clear()
+                # Emit a compact_boundary system record so Claude
+                # Code recognizes the compaction on resume.
+                boundary_uuid = _synthetic_claude_transcript_uuid(
+                    session_id=session_id,
+                    external_session_id=external_session_id,
+                    item=item,
+                    index=index,
+                )
+                records.append(
+                    {
+                        "parentUuid": None,
+                        "isSidechain": False,
+                        "type": "system",
+                        "subtype": "compact_boundary",
+                        "content": "Conversation compacted",
+                        "isMeta": False,
+                        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                        "uuid": boundary_uuid,
+                        "level": "info",
+                        # Claude scans every compact_boundary and destructures
+                        # compactMetadata; a missing object crashes /compact
+                        # (and auto-compact) on resume. token_count is the
+                        # post-compaction summary size.
+                        "compactMetadata": {
+                            "trigger": "auto",
+                            "postTokens": item.get("token_count"),
+                        },
+                    }
+                )
+                parent_uuid = boundary_uuid
+                for ci, cm in enumerate(compacted_msgs):
+                    cm_uuid = _synthetic_claude_transcript_uuid(
+                        session_id=session_id,
+                        external_session_id=external_session_id,
+                        item=cm,
+                        index=ci,
+                    )
+                    cm_record = _claude_transcript_record_from_session_item(
+                        cm,
+                        session_id=external_session_id,
+                        record_uuid=cm_uuid,
+                        parent_uuid=parent_uuid,
+                        cwd=cwd,
+                    )
+                    if cm_record is not None:
+                        records.append(cm_record)
+                        parent_uuid = cm_uuid
+            continue
         record_uuid = _synthetic_claude_transcript_uuid(
             session_id=session_id,
             external_session_id=external_session_id,
@@ -3443,7 +3681,7 @@ def _claude_transcript_record_from_session_item(
                 }
             ],
         }
-        extra["toolUseResult"] = output
+        extra["toolUseResult"] = _json_safe_tool_use_result(output)
     else:
         return None
     return {
@@ -3561,6 +3799,36 @@ def _json_object_from_string(value: object) -> dict[str, Any]:
     except json.JSONDecodeError:
         return {}
     return parsed if isinstance(parsed, dict) else {}
+
+
+def _json_safe_tool_use_result(output: str) -> str:
+    """
+    Return a ``toolUseResult`` value Claude Code can ``JSON.parse``.
+
+    Some built-in result renderers (notably ``TaskOutput``) call
+    ``JSON.parse`` on ``toolUseResult`` when the transcript is resumed.
+    A raw display string such as ``"<retrieval_status>timeout</...>"``
+    throws ``JSON Parse error: Unrecognized token '<'`` at TUI boot,
+    before the input prompt renders — so the whole resume fails and the
+    first web-UI message is never delivered.
+
+    Outputs that are already JSON (e.g. an image content-block array)
+    pass through verbatim; anything else is wrapped as a JSON string
+    literal so the parse always succeeds. The plain-text output still
+    lives verbatim in the ``tool_result`` content block, so this does
+    not change what the model or the web UI sees.
+
+    :param output: The tool result string synthesized for the
+        transcript, e.g. ``"<retrieval_status>timeout</...>"`` or
+        ``'[{"type":"image",...}]'``.
+    :returns: A JSON-parseable string for the record's
+        ``toolUseResult`` field.
+    """
+    try:
+        json.loads(output)
+    except (json.JSONDecodeError, ValueError):
+        return json.dumps(output)
+    return output
 
 
 def _preflight_local_tools(command: str) -> None:
@@ -3837,6 +4105,10 @@ def _claude_terminal_request(
         ap_auth_headers=ap_auth_headers,
         api_key_helper=claude_config.api_key_helper if claude_config is not None else None,
     )
+    # Let a registered launcher plugin (e.g. Databricks' isaac) rewrite the
+    # command/args to wrap the same fully-augmented Claude launch. Identity by
+    # default. See omnigent.claude_launcher.
+    command, args = resolve_claude_launch(command, args)
     spec: dict[str, Any] = {
         "command": command,
         "args": args,
@@ -4032,16 +4304,23 @@ def _websocket_connect(attach_url: str, *, headers: dict[str, str]) -> Any:
     """
     import websockets
 
+    from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+
+    # Identify as a first-party client so the server's WebSocket origin
+    # guard (CSWSH protection) allows the handshake — this attach client
+    # is not a browser. Set on a copy so the caller's dict (which also
+    # carries auth headers and may be reused) is not mutated here.
+    handshake_headers = {**headers, "Origin": OMNIGENT_INTERNAL_WS_ORIGIN}
     try:
         return websockets.connect(
             attach_url,
-            additional_headers=headers,
+            additional_headers=handshake_headers,
             close_timeout=_CLAUDE_ATTACH_WS_CLOSE_TIMEOUT_S,
         )
     except TypeError:
         return websockets.connect(
             attach_url,
-            extra_headers=headers,
+            extra_headers=handshake_headers,
             close_timeout=_CLAUDE_ATTACH_WS_CLOSE_TIMEOUT_S,
         )
 

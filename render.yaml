@@ -1,5 +1,5 @@
 # Render blueprint: web service (pulls the CI image — it ships the gitignored
-# web UI bundle a source build can't) + managed Postgres + artifact disk.
+# web UI bundle a source build can't) + managed Postgres + data disk.
 # Defaults to built-in `accounts` auth (multi-user, no IdP). Full walkthrough:
 # deploy/render/README.md.
 
@@ -15,7 +15,7 @@ services:
     healthCheckPath: /health
     disk:
       name: artifact-data
-      mountPath: /data/artifacts
+      mountPath: /data
       sizeGB: 10
     envVars:
       - key: DATABASE_URL

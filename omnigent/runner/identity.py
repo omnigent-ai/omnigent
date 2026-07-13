@@ -13,16 +13,38 @@ RUNNER_ID_ENV_VAR = "OMNIGENT_RUNNER_ID"
 RUNNER_PARENT_PID_ENV_VAR = "OMNIGENT_RUNNER_PARENT_PID"
 # Signal the CLI sends to "adopt" a runner: stop watching the parent
 # pid so the runner survives an intentional CLI exit (tmux detach) and
-# keeps serving the web UI. SIGUSR1 is unused elsewhere
-# in the runner and is POSIX-only, which matches the runner's platforms.
-RUNNER_ADOPT_SIGNAL = signal.SIGUSR1
+# keeps serving the web UI. SIGUSR1 is unused elsewhere in the runner.
+# Some platforms (notably native Windows) do not define SIGUSR1; keep
+# imports working there and let callers skip adopt signaling.
+RUNNER_ADOPT_SIGNAL: signal.Signals | None = getattr(signal, "SIGUSR1", None)
 RUNNER_WORKSPACE_ENV_VAR = "OMNIGENT_RUNNER_WORKSPACE"
 RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR = "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN"
 RUNNER_TUNNEL_TOKEN_HEADER = "X-Omnigent-Runner-Tunnel-Token"
+# Sentinel ``Origin`` header that the project's own non-browser WebSocket
+# clients (runner -> server tunnel, host/daemon -> server tunnel,
+# terminal-attach) set on their handshakes so the server's CSWSH origin
+# guard allows them. Lives here, alongside the tunnel token header,
+# because it is part of the same client/server handshake contract and the
+# server imports it from this module (server -> runner, not the reverse).
+# The non-HTTP scheme is deliberate: a browser computes ``Origin`` from
+# the page URL and can never emit this value.
+OMNIGENT_INTERNAL_WS_ORIGIN = "omnigent://internal"
 # "1" enables per-session workspace isolation so each session
 # gets its own subdirectory. Set by shared-host servers; single-user
 # CLI flows leave it unset (agent sees the project root directly).
 RUNNER_ISOLATE_SESSION_ENV_VAR = "OMNIGENT_RUNNER_ISOLATE_SESSION"
+
+# Marker env var stamped into every agent-facing environment so any
+# process launched inside an Omnigent agent session can detect it is
+# running under Omnigent. This is the analog of Claude Code's
+# ``CLAUDE_CODE`` / ``CLAUDECODE`` and Codex's ``CODEX``. It is set once
+# on the runner process (see :mod:`omnigent.runner._entry`) and inherited
+# by harness workers, terminals, and the in-process SDK harnesses. The
+# deny-by-default env scrubbers (os_env sandbox, codex CLI, pi CLI) name
+# it in their passthrough allowlists so this one marker survives the
+# scrub.
+OMNIGENT_SESSION_ENV_VAR = "OMNIGENT"
+OMNIGENT_SESSION_ENV_VALUE = "1"
 
 # Env vars carrying the runner's control-plane auth secret. The tunnel
 # binding token is seeded into the runner process by the launcher and

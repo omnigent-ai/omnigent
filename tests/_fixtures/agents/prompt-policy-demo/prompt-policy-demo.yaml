@@ -13,7 +13,6 @@ labels:
 label_schema:
   sensitivity:
     values: [public, internal, confidential]
-    monotonic: max
 
 policies:
   block_canada_input:

@@ -4,14 +4,17 @@ import json
 
 import pytest
 
+from omnigent.llms._responses_to_chat import chat_stream_to_response_events
 from omnigent.llms.adapters.gemini import (
     _chat_to_gemini,
     _convert_tools,
     _extract_usage,
+    _gemini_stream_chunk_to_chat,
     _gemini_to_chat,
     _normalize_finish_reason,
     _translate_part_to_gemini,
 )
+from omnigent.llms.types import FunctionCallOutput
 
 # ── Request translation ──────────────────────────────────
 
@@ -305,3 +308,257 @@ def test_string_user_content_becomes_text_part() -> None:
     messages = [{"role": "user", "content": "Hello"}]
     payload = _chat_to_gemini(messages, None, {})
     assert payload["contents"][0]["parts"] == [{"text": "Hello"}]
+
+
+# ── Streaming ─────────────────────────────────────────────
+
+
+def _parallel_function_call_chunk() -> dict:
+    """A single Gemini stream chunk with two parallel function calls."""
+    return {
+        "candidates": [
+            {
+                "content": {
+                    "role": "model",
+                    "parts": [
+                        {"functionCall": {"name": "get_weather", "args": {"city": "London"}}},
+                        {"functionCall": {"name": "get_time", "args": {"tz": "UTC"}}},
+                    ],
+                },
+                "finishReason": "STOP",
+            }
+        ],
+        "usageMetadata": {},
+    }
+
+
+def test_stream_parallel_function_calls_get_distinct_indices() -> None:
+    """
+    Parallel ``functionCall`` parts in one chunk must each receive a
+    distinct ``tool_calls`` index. A fixed index of 0 makes the downstream
+    accumulator collapse them into one call with concatenated arguments.
+    """
+    chunks = list(_gemini_stream_chunk_to_chat(_parallel_function_call_chunk()))
+    indices = [
+        tc["index"]
+        for chunk in chunks
+        for choice in chunk["choices"]
+        for tc in (choice["delta"].get("tool_calls") or [])
+    ]
+    assert indices == [0, 1]
+
+
+async def test_stream_parallel_function_calls_survive_accumulation() -> None:
+    """
+    Two parallel Gemini function calls in a streamed response are assembled
+    into two separate, uncorrupted ``FunctionCallOutput``s — matching what the
+    non-streaming path produces for the same content.
+    """
+
+    async def _chunks():
+        for chunk in _gemini_stream_chunk_to_chat(_parallel_function_call_chunk()):
+            yield chunk
+
+    events = [e async for e in chat_stream_to_response_events(_chunks(), model="gemini-test")]
+    response = events[-1].response
+    calls = [o for o in response.output if isinstance(o, FunctionCallOutput)]
+
+    assert len(calls) == 2
+    by_name = {c.name: c for c in calls}
+    assert json.loads(by_name["get_weather"].arguments) == {"city": "London"}
+    assert json.loads(by_name["get_time"].arguments) == {"tz": "UTC"}
+
+
+# ── Streaming chunk translation ──────────────────────────
+
+
+def test_gemini_stream_text_chunk() -> None:
+    """A streaming chunk with text produces a Chat Completions text delta."""
+    from omnigent.llms.adapters.gemini import _gemini_stream_chunk_to_chat
+
+    data = {
+        "candidates": [
+            {
+                "content": {"parts": [{"text": "Hello"}], "role": "model"},
+            }
+        ],
+    }
+    chunks = list(_gemini_stream_chunk_to_chat(data))
+    assert len(chunks) == 1
+    assert chunks[0]["choices"][0]["delta"]["content"] == "Hello"
+    assert chunks[0]["choices"][0]["finish_reason"] is None
+
+
+def test_gemini_stream_function_call_chunk() -> None:
+    """A streaming chunk with functionCall produces a tool_calls delta."""
+    from omnigent.llms.adapters.gemini import _gemini_stream_chunk_to_chat
+
+    data = {
+        "candidates": [
+            {
+                "content": {
+                    "parts": [
+                        {
+                            "functionCall": {
+                                "name": "get_weather",
+                                "args": {"city": "London"},
+                            }
+                        }
+                    ],
+                    "role": "model",
+                },
+            }
+        ],
+    }
+    chunks = list(_gemini_stream_chunk_to_chat(data))
+    assert len(chunks) == 1
+    tc = chunks[0]["choices"][0]["delta"]["tool_calls"][0]
+    assert tc["function"]["name"] == "get_weather"
+    assert json.loads(tc["function"]["arguments"]) == {"city": "London"}
+
+
+def test_gemini_stream_finish_reason_chunk() -> None:
+    """A streaming chunk with finishReason emits a separate finish chunk."""
+    from omnigent.llms.adapters.gemini import _gemini_stream_chunk_to_chat
+
+    data = {
+        "candidates": [
+            {
+                "content": {"parts": [{"text": "Done"}], "role": "model"},
+                "finishReason": "STOP",
+            }
+        ],
+    }
+    chunks = list(_gemini_stream_chunk_to_chat(data))
+    # Text chunk + finish reason chunk
+    assert len(chunks) == 2
+    assert chunks[1]["choices"][0]["finish_reason"] == "stop"
+
+
+def test_gemini_stream_usage_only_chunk() -> None:
+    """A streaming chunk with no candidates but usageMetadata yields usage."""
+    from omnigent.llms.adapters.gemini import _gemini_stream_chunk_to_chat
+
+    data = {
+        "usageMetadata": {
+            "promptTokenCount": 10,
+            "candidatesTokenCount": 5,
+            "totalTokenCount": 15,
+        },
+    }
+    chunks = list(_gemini_stream_chunk_to_chat(data))
+    assert len(chunks) == 1
+    assert chunks[0]["usage"]["prompt_tokens"] == 10
+    assert chunks[0]["usage"]["completion_tokens"] == 5
+
+
+def test_gemini_stream_empty_candidates_no_usage() -> None:
+    """A streaming chunk with empty candidates and no usage yields nothing."""
+    from omnigent.llms.adapters.gemini import _gemini_stream_chunk_to_chat
+
+    chunks = list(_gemini_stream_chunk_to_chat({"candidates": []}))
+    assert chunks == []
+
+
+# ── Empty response ───────────────────────────────────────
+
+
+def test_empty_chat_response_structure() -> None:
+    """_empty_chat_response returns a well-formed empty response."""
+    from omnigent.llms.adapters.gemini import _empty_chat_response
+
+    resp = _empty_chat_response("gemini-test")
+    assert resp["model"] == "gemini-test"
+    assert resp["choices"][0]["message"]["content"] is None
+    assert resp["choices"][0]["message"]["tool_calls"] is None
+    assert resp["choices"][0]["finish_reason"] == "stop"
+
+
+# ── None content becomes empty parts ────────────────────
+
+
+def test_none_content_becomes_empty_parts() -> None:
+    """None content (e.g. assistant with tool_calls only) yields empty parts."""
+    from omnigent.llms.adapters.gemini import _content_to_gemini_parts
+
+    assert _content_to_gemini_parts(None) == []
+
+
+# ── Gemini headers ───────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_headers_with_api_key() -> None:
+    """API key is set in x-goog-api-key header."""
+    from omnigent.llms.adapters.gemini import GeminiAdapter
+
+    adapter = GeminiAdapter()
+    headers = await adapter._get_headers(api_key_override="test-key")
+    assert headers["x-goog-api-key"] == "test-key"
+    assert headers["Content-Type"] == "application/json"
+
+
+@pytest.mark.asyncio
+async def test_get_headers_raises_without_api_key() -> None:
+    """Missing API key raises OmnigentError."""
+    from omnigent.errors import OmnigentError
+    from omnigent.llms.adapters.gemini import GeminiAdapter
+
+    adapter = GeminiAdapter()
+    with pytest.raises(OmnigentError, match="api_key"):
+        await adapter._get_headers(api_key_override=None)
+
+
+# ── Tool without description ─────────────────────────────
+
+
+def test_tool_without_description_omits_description() -> None:
+    """Tool declarations without description omit the field."""
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "fn",
+                "parameters": {},
+            },
+        }
+    ]
+    result = _convert_tools(tools)
+    assert "description" not in result[0]
+
+
+# ── Non-function tools skipped ───────────────────────────
+
+
+def test_non_function_tools_skipped() -> None:
+    """Non-function tool types are filtered out."""
+    tools = [
+        {"type": "not_function", "whatever": {}},
+        {"type": "function", "function": {"name": "fn", "parameters": {}}},
+    ]
+    result = _convert_tools(tools)
+    assert len(result) == 1
+    assert result[0]["name"] == "fn"
+
+
+# ── Unrecognized part passthrough ────────────────────────
+
+
+def test_unrecognized_part_passes_through() -> None:
+    """Unrecognized content part types pass through as-is."""
+    part = {"type": "input_audio", "data": "base64data"}
+    result = _translate_part_to_gemini(part)
+    assert result is part
+
+
+# ── file_data without data URI raises ────────────────────
+
+
+def test_file_data_without_data_uri_raises() -> None:
+    """input_file without a data: URI prefix raises ValueError."""
+    part = {
+        "type": "input_file",
+        "file_data": "https://example.com/file.pdf",
+    }
+    with pytest.raises(ValueError, match="data: URI"):
+        _translate_part_to_gemini(part)
