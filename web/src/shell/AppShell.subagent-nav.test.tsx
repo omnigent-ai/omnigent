@@ -322,4 +322,49 @@ describe("click sub-agent in rail (real SubagentsPanel)", () => {
     expect(agentsTab).toHaveAttribute("aria-selected", "false");
     expect(screen.getByRole("tab", { name: /Files/i })).toHaveAttribute("aria-selected", "true");
   });
+
+  it("keeps the right rail collapsed for new sessions when the default is hide", () => {
+    localStorage.setItem("omnigent:right-workspace-default-open", "hide");
+    vi.mocked(useChildSessions).mockReturnValue({
+      children: [],
+      isLoading: false,
+      error: null,
+    });
+    vi.mocked(useSession).mockReturnValue({
+      session: {
+        id: "conv_hidden_default",
+        agentId: "ag",
+        agentName: null,
+        runnerId: null,
+        status: "idle",
+        createdAt: 0,
+        title: null,
+        labels: {},
+        items: [],
+        pendingElicitations: [],
+        permissionLevel: 4,
+        parentSessionId: null,
+      },
+      isLoading: false,
+      error: null,
+    } as never);
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={["/c/conv_hidden_default"]}>
+            <Routes>
+              <Route element={<AppShell />}>
+                <Route path="c/:conversationId" element={<div data-testid="page" />} />
+              </Route>
+            </Routes>
+          </MemoryRouter>
+        </TooltipProvider>
+      </QueryClientProvider>,
+    );
+
+    expect(screen.queryByRole("tab", { name: /Files/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("tab", { name: /Agents/i })).not.toBeInTheDocument();
+  });
 });

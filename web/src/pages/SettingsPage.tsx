@@ -119,6 +119,13 @@ import {
   writeTerminalThemeMode,
   type TerminalThemeMode,
 } from "@/lib/terminalThemePreferences";
+import {
+  openToVisibility,
+  readRightWorkspaceDefaultOpen,
+  visibilityToOpen,
+  writeRightWorkspaceDefaultOpen,
+  type RightWorkspaceDefaultVisibility,
+} from "@/lib/rightRailPreferences";
 import { readDefaultBaseBranch, writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 import {
   applyThemePalette,
@@ -477,6 +484,61 @@ function TerminalThemeControl() {
   );
 }
 
+/** Default visibility for the Files / Agents / Shells workspace rail. */
+function RightWorkspaceDefaultControl() {
+  const [visibility, setVisibility] = useState<RightWorkspaceDefaultVisibility>(() =>
+    openToVisibility(readRightWorkspaceDefaultOpen()),
+  );
+  const labelId = useId();
+
+  const choose = useCallback((next: RightWorkspaceDefaultVisibility) => {
+    setVisibility(next);
+    writeRightWorkspaceDefaultOpen(visibilityToOpen(next));
+  }, []);
+
+  return (
+    <ThemeSubsection
+      labelId={labelId}
+      title="Right workspace panel"
+      helper="Show or hide the Files, Agents, and Shells tabs by default in new chats."
+    >
+      <CardRadioGroup<RightWorkspaceDefaultVisibility>
+        labelledBy={labelId}
+        value={visibility}
+        onSelect={choose}
+        className="grid grid-cols-2 gap-3"
+        cardClassName="items-start gap-1.5 p-4 text-left"
+        items={[
+          {
+            value: "show",
+            testId: "right-workspace-default-show",
+            body: (
+              <>
+                <span className="text-sm font-medium">Show</span>
+                <span className="text-xs text-muted-foreground">
+                  New chats open with the right tabs visible.
+                </span>
+              </>
+            ),
+          },
+          {
+            value: "hide",
+            testId: "right-workspace-default-hide",
+            body: (
+              <>
+                <span className="text-sm font-medium">Hide</span>
+                <span className="text-xs text-muted-foreground">
+                  New chats start with the right tabs collapsed.
+                </span>
+              </>
+            ),
+          },
+        ]}
+      />
+    </ThemeSubsection>
+  );
+}
+
 /**
  * Color-theme (palette) picker — a dropdown (à la Codex). Each option shows a
  * swatch chip + name and the trigger mirrors the current selection. Choosing
@@ -602,6 +664,8 @@ function AppearanceSection() {
         )}
 
         <TerminalThemeControl />
+
+        <RightWorkspaceDefaultControl />
 
         <UiFontSizeControl />
 

@@ -174,6 +174,27 @@ describe("SettingsPage", () => {
     expect(screen.getByTestId("terminal-theme-auto")).toHaveAttribute("aria-checked", "false");
   });
 
+  it("persists the right workspace panel default for new chats", () => {
+    renderPage("/settings/appearance");
+    expect(screen.getByRole("radiogroup", { name: "Right workspace panel" })).toBeInTheDocument();
+    expect(screen.getByTestId("right-workspace-default-show")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(localStorage.getItem("omnigent:right-workspace-default-open")).toBeNull();
+
+    fireEvent.click(screen.getByTestId("right-workspace-default-hide"));
+    expect(localStorage.getItem("omnigent:right-workspace-default-open")).toBe("hide");
+    expect(screen.getByTestId("right-workspace-default-hide")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(screen.getByTestId("right-workspace-default-show")).toHaveAttribute(
+      "aria-checked",
+      "false",
+    );
+  });
+
   it("renders the color theme dropdown, defaults to Omnigent, and applies a palette on change", () => {
     localStorage.clear();
     renderPage("/settings/appearance");

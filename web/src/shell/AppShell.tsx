@@ -27,6 +27,7 @@ import {
   type DesignModeElement,
 } from "@/lib/designModePrompt";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+import { readRightWorkspaceDefaultOpen } from "@/lib/rightRailPreferences";
 import {
   Dialog,
   DialogContent,
@@ -227,15 +228,13 @@ export function AppShell() {
   const [subagentsPanelOpen, setSubagentsPanelOpen] = useState(false);
   const [shellsPanelOpen, setShellsPanelOpen] = useState(false);
   const [todosPanelOpen, setTodosPanelOpen] = useState(false);
-  // The right "Workspace" rail (WorkspacePanel) is open by default and
-  // remembers its open/closed state per session — a brand-new session starts
-  // open; reopening a session restores how the user last left it. Toggled
-  // via the header's PanelRightIcon, mirroring the sidebar collapse. With no
-  // conversation the rail can't render, so the state stays false — leaving it
-  // true would let rail-gated side effects (the ?view= URL sync) fire on
-  // non-session routes like the home page.
+  // Brand-new sessions follow the Appearance default; existing sessions restore
+  // their own rail state. Non-session routes stay false so rail-gated URL sync
+  // does not run without a workspace.
   const [rightPanelOpen, setRightPanelOpen] = useState(() =>
-    conversationId ? (readSessionWorkspaceState(conversationId).open ?? true) : false,
+    conversationId
+      ? (readSessionWorkspaceState(conversationId).open ?? readRightWorkspaceDefaultOpen())
+      : false,
   );
   const [shareOpen, setShareOpen] = useState(false);
   const [forkOpen, setForkOpen] = useState(false);
@@ -742,7 +741,7 @@ export function AppShell() {
       viewParam === "changed" ||
       viewParam === "explore" ||
       (commentParam !== null && commentParam !== "");
-    setRightPanelOpen((persisted.open ?? true) || hasWorkspaceUrlSignal);
+    setRightPanelOpen((persisted.open ?? readRightWorkspaceDefaultOpen()) || hasWorkspaceUrlSignal);
 
     stateConvRef.current = conversationId;
   }, [conversationId]); // eslint-disable-line react-hooks/exhaustive-deps
