@@ -49,7 +49,6 @@ def upgrade() -> None:
         sa.Column("cron_expression", sa.String(255), nullable=False),
         sa.Column("owner_user_id", sa.String(255), nullable=True),
         sa.Column("agent_id", sa.String(64), nullable=False),
-        sa.Column("harness_override", sa.String(64), nullable=True),
         sa.Column("model_override", sa.String(128), nullable=True),
         sa.Column("reasoning_effort", sa.String(32), nullable=True),
         sa.Column("workspace", sa.Text(), nullable=True),

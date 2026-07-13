@@ -1098,9 +1098,6 @@ class SqlScheduledTask(Base):
     :param agent_id: The agent bound to this task (relates to
         ``agents.id``). Cascade cleanup on agent deletion is application-owned
         — there is no DB-level foreign key (schema Rule R032).
-    :param harness_override: Per-task brain-harness override, e.g. ``"pi"``.
-        ``None`` means use the agent default. Mirrors
-        ``conversations.harness_override``.
     :param model_override: Per-task LLM model override, e.g.
         ``"claude-opus-4-7"``. ``None`` means use the agent default.
     :param reasoning_effort: Per-task reasoning-effort hint, e.g. ``"high"``.
@@ -1159,7 +1156,6 @@ class SqlScheduledTask(Base):
     agent_id: Mapped[str] = mapped_column(String(64), nullable=False)
     # Per-task overrides — None means fall back to the agent default. Widths
     # mirror the matching conversations.* override columns.
-    harness_override: Mapped[str | None] = mapped_column(String(64), nullable=True)
     model_override: Mapped[str | None] = mapped_column(String(128), nullable=True)
     reasoning_effort: Mapped[str | None] = mapped_column(String(32), nullable=True)
     workspace: Mapped[str | None] = mapped_column(Text, nullable=True)

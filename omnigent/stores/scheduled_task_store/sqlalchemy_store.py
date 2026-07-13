@@ -43,7 +43,6 @@ def _to_entity(row: SqlScheduledTask) -> ScheduledTask:
         timezone=row.timezone,
         created_at=row.created_at,
         cron_expression=row.cron_expression,
-        harness_override=row.harness_override,
         model_override=row.model_override,
         reasoning_effort=row.reasoning_effort,
         workspace=row.workspace,
@@ -110,7 +109,6 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         agent_id: str,
         timezone: str,
         *,
-        harness_override: str | None = None,
         model_override: str | None = None,
         reasoning_effort: str | None = None,
         workspace: str | None = None,
@@ -127,7 +125,6 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             owner_user_id=owner_user_id,
             agent_id=agent_id,
             timezone=timezone,
-            harness_override=harness_override,
             model_override=model_override,
             reasoning_effort=reasoning_effort,
             workspace=workspace,
@@ -183,7 +180,6 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         prompt: str | None = None,
         cron_expression: str | None = None,
         timezone: str | None = None,
-        harness_override: str | None = None,
         model_override: str | None = None,
         reasoning_effort: str | None = None,
         workspace: str | None = None,
@@ -214,9 +210,6 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 changed = True
             if timezone is not None and row.timezone != timezone:
                 row.timezone = timezone
-                changed = True
-            if harness_override is not None and row.harness_override != harness_override:
-                row.harness_override = harness_override
                 changed = True
             if model_override is not None and row.model_override != model_override:
                 row.model_override = model_override

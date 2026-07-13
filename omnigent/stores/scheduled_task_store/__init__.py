@@ -45,7 +45,6 @@ class ScheduledTaskStore(ABC):
         agent_id: str,
         timezone: str,
         *,
-        harness_override: str | None = None,
         model_override: str | None = None,
         reasoning_effort: str | None = None,
         workspace: str | None = None,
@@ -65,7 +64,6 @@ class ScheduledTaskStore(ABC):
             is written for; ``None`` in single-user mode.
         :param agent_id: The agent bound to this task.
         :param timezone: IANA timezone the trigger is evaluated in.
-        :param harness_override: Optional brain-harness override.
         :param model_override: Optional LLM model override.
         :param reasoning_effort: Optional reasoning-effort hint.
         :param workspace: Optional runner start path (source repo / working dir).
@@ -117,7 +115,6 @@ class ScheduledTaskStore(ABC):
         prompt: str | None = None,
         cron_expression: str | None = None,
         timezone: str | None = None,
-        harness_override: str | None = None,
         model_override: str | None = None,
         reasoning_effort: str | None = None,
         workspace: str | None = None,

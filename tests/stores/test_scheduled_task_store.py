@@ -37,7 +37,6 @@ def test_create_returns_scheduled_task_with_all_fields(
         owner_user_id="alice@example.com",
         agent_id="ag_abc",
         timezone="America/Los_Angeles",
-        harness_override="pi",
         model_override="claude-opus-4-7",
         reasoning_effort="high",
         workspace="/home/alice/repo",
@@ -51,7 +50,6 @@ def test_create_returns_scheduled_task_with_all_fields(
     assert task.owner_user_id == "alice@example.com"
     assert task.agent_id == "ag_abc"
     assert task.timezone == "America/Los_Angeles"
-    assert task.harness_override == "pi"
     assert task.model_override == "claude-opus-4-7"
     assert task.reasoning_effort == "high"
     assert task.workspace == "/home/alice/repo"
@@ -75,7 +73,6 @@ def test_create_minimal_defaults(store: SqlAlchemyScheduledTaskStore) -> None:
         agent_id="ag_min",
         timezone="UTC",
     )
-    assert task.harness_override is None
     assert task.model_override is None
     assert task.reasoning_effort is None
     assert task.workspace is None

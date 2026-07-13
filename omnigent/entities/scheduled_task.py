@@ -34,8 +34,6 @@ class ScheduledTask:
     :param timezone: IANA timezone the trigger is evaluated in,
         e.g. ``"America/Los_Angeles"``.
     :param created_at: Unix epoch seconds at row creation.
-    :param harness_override: Per-task brain-harness override, e.g. ``"pi"``.
-        ``None`` means use the agent default.
     :param model_override: Per-task LLM model override, e.g.
         ``"claude-opus-4-7"``. ``None`` means use the agent default.
     :param reasoning_effort: Per-task reasoning-effort hint, e.g. ``"high"``.
@@ -63,7 +61,6 @@ class ScheduledTask:
     agent_id: str
     timezone: str
     created_at: int
-    harness_override: str | None = None
     model_override: str | None = None
     reasoning_effort: str | None = None
     workspace: str | None = None

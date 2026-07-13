@@ -58,7 +58,6 @@ def test_scheduled_tasks_columns(db_engine: Engine) -> None:
         "cron_expression",
         "owner_user_id",
         "agent_id",
-        "harness_override",
         "model_override",
         "reasoning_effort",
         "workspace",
