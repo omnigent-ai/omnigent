@@ -12,6 +12,7 @@ from omnigent.onboarding import extra_install
 from omnigent.onboarding.antigravity_auth import ANTIGRAVITY_EXTRA
 from omnigent.onboarding.copilot_auth import COPILOT_EXTRA
 from omnigent.onboarding.cursor_auth import CURSOR_EXTRA
+from omnigent.onboarding.databricks_config import DATABRICKS_EXTRA
 from omnigent.onboarding.extra_install import (
     _installed_vcs_url,
     _is_uv_tool_install,
@@ -131,13 +132,27 @@ def test_extra_install_display_matches_command(
     assert display.startswith("uv")
 
 
+# -- databricks extra install hint -------------------------------------------
+
+
+def test_databricks_extra_install_display_not_hardcoded_git(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A registry uv tool install yields the short form, not a hardcoded git URL."""
+    monkeypatch.setattr(extra_install, "_is_uv_tool_install", lambda: True)
+    monkeypatch.setattr(extra_install, "_installed_vcs_url", lambda: None)
+    hint = extra_install_display(DATABRICKS_EXTRA)
+    assert hint == "uv tool install --with 'omnigent[databricks]' omnigent --force"
+    assert "git+" not in hint
+
+
 # -- extra names stay in sync with pyproject packaging -----------------------
 
 
 @pytest.mark.parametrize(
     "extra",
-    [CURSOR_EXTRA, ANTIGRAVITY_EXTRA, COPILOT_EXTRA],
-    ids=["cursor", "antigravity", "copilot"],
+    [CURSOR_EXTRA, ANTIGRAVITY_EXTRA, COPILOT_EXTRA, DATABRICKS_EXTRA],
+    ids=["cursor", "antigravity", "copilot", "databricks"],
 )
 def test_harness_extra_is_a_real_pyproject_extra(extra: str) -> None:
     """Each harness ``*_EXTRA`` must name a real ``optional-dependencies`` key.

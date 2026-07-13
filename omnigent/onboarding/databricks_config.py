@@ -40,18 +40,12 @@ def normalize_workspace_url(raw: str) -> str:
     return raw.strip().rstrip("/")
 
 
-# The install command surfaced wherever a Databricks flow is gated on the
-# `databricks` extra (the add-provider menu, `setup --internal-beta`).
-# Matches the README's canonical `uv tool install` path. Dev clones use
-# `uv sync --extra databricks` instead, but the tool install is the path
-# end users actually took. The repo URL sits on its own line: the slug
-# differs per distribution, and inlining it into the hint string would
-# make the line's width — and therefore its ruff formatting — depend on
-# which slug a checkout carries.
-_SOURCE_REPO_URL = "https://github.com/omnigent-ai/omnigent.git"
-DATABRICKS_EXTRA_INSTALL_HINT = (
-    f'uv tool install --force "omnigent[databricks] @ git+{_SOURCE_REPO_URL}"'
-)
+# The pip extra that ships databricks-sdk. Surfaced wherever a Databricks
+# flow is gated on it (the add-provider menu, `setup --internal-beta`,
+# workspace login), passed to
+# :func:`omnigent.onboarding.extra_install.extra_install_display` for the
+# install command matched to how omnigent was actually installed.
+DATABRICKS_EXTRA = "databricks"
 
 
 def databricks_sdk_installed() -> bool:
@@ -61,8 +55,8 @@ def databricks_sdk_installed() -> bool:
     ``databricks`` (and ``all``) extras. The ``kind: databricks`` provider
     path needs it to mint workspace OAuth tokens at runtime
     (:mod:`omnigent.runtime.credentials.databricks`), so onboarding flows
-    gate the Databricks option on this check and surface
-    :data:`DATABRICKS_EXTRA_INSTALL_HINT` when it fails.
+    gate the Databricks option on this check and surface the
+    ``omnigent[databricks]`` install command when it fails.
 
     Uses :func:`importlib.util.find_spec` so the check never pays the cost
     of actually importing the SDK.

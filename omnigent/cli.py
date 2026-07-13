@@ -9174,9 +9174,10 @@ def _configure_harness_add(family: str | None = None) -> str | None:
         # `databricks auth login` browser flow, `ucode configure`) so the
         # user isn't signed into a workspace that routing then can't use.
         from omnigent.onboarding.databricks_config import (
-            DATABRICKS_EXTRA_INSTALL_HINT,
+            DATABRICKS_EXTRA,
             databricks_sdk_installed,
         )
+        from omnigent.onboarding.extra_install import extra_install_display
 
         if not databricks_sdk_installed():
             from rich.markup import escape as _rich_escape
@@ -9185,7 +9186,7 @@ def _configure_harness_add(family: str | None = None) -> str | None:
             # `[databricks]` in the install command would parse as a tag.
             return (
                 "✗ Databricks routing needs the databricks extra — "
-                f"{_rich_escape(DATABRICKS_EXTRA_INSTALL_HINT)}"
+                f"{_rich_escape(extra_install_display(DATABRICKS_EXTRA))}"
             )
 
         # The intro + URL prompt render inline, exactly like every other add
@@ -11826,14 +11827,16 @@ def setup(internal_beta: bool) -> None:
         # extra rather than the default install. Fail loud up front instead
         # of completing the whole login flow and breaking on the first turn.
         from omnigent.onboarding.databricks_config import (
-            DATABRICKS_EXTRA_INSTALL_HINT,
+            DATABRICKS_EXTRA,
             databricks_sdk_installed,
         )
+        from omnigent.onboarding.extra_install import extra_install_display
 
         if not databricks_sdk_installed():
             raise click.ClickException(
-                "Databricks internal-beta setup needs the databricks extra "
-                f"(databricks-sdk). Reinstall with:\n  {DATABRICKS_EXTRA_INSTALL_HINT}"
+                "Databricks internal-beta setup needs the `databricks` extra. "
+                "Install `omnigent[databricks]` and retry:\n  "
+                f"{extra_install_display(DATABRICKS_EXTRA)}"
             )
         # Surface missing external tooling (Node, tmux) before the Databricks
         # bootstrap so a fresh machine sees every gap at once.
@@ -12596,18 +12599,19 @@ def _databricks_login(server: str, workspace_host: str, org_id: str | None = Non
         rejects the workspace token.
     """
     from omnigent.onboarding.databricks_config import (
-        DATABRICKS_EXTRA_INSTALL_HINT,
+        DATABRICKS_EXTRA,
         databricks_sdk_installed,
     )
+    from omnigent.onboarding.extra_install import extra_install_display
 
     click.echo(f"{server} authenticates via the Databricks workspace {workspace_host}.")
 
     if not databricks_sdk_installed():
         raise click.ClickException(
             "Logging in to a Databricks-fronted server (a Databricks App or "
-            "workspace-hosted omnigent) requires the `databricks` extra "
-            f"(databricks-sdk is not installed). Reinstall with:\n  "
-            f"{DATABRICKS_EXTRA_INSTALL_HINT}"
+            "workspace-hosted omnigent) needs the `databricks` extra, which is "
+            "not installed. Install `omnigent[databricks]` and retry:\n  "
+            f"{extra_install_display(DATABRICKS_EXTRA)}"
         )
 
     token = _databricks_workspace_token(workspace_host)
