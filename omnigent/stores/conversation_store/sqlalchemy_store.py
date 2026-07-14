@@ -593,18 +593,24 @@ def _to_item(row: SqlConversationItem) -> ConversationItem:
     )
 
 
-def _ranked_latest_message_item_ids(conversation_ids: list[str]) -> Subquery:
+def _ranked_latest_message_items(conversation_ids: list[str]) -> Subquery:
     """
-    Build a ranked latest-message-id subquery for multiple conversations.
+    Build a ranked latest-message subquery for multiple conversations.
+
+    Selects all ``SqlConversationItem`` columns plus a per-conversation
+    ``row_num`` so the caller can filter to the top-N rows without a
+    join back to the base table. Avoiding the join is critical: the
+    primary key is ``(workspace_id, conversation_id, id)``, so a join
+    on ``id`` alone forces a full table scan.
 
     :param conversation_ids: Conversation ids to fetch messages for,
         e.g. ``["conv_child1", "conv_child2"]``.
-    :returns: SQLAlchemy subquery with ``item_id`` and per-conversation
-        ``row_num`` columns, newest message first.
+    :returns: SQLAlchemy subquery with all item columns plus per-conversation
+        ``row_num``, newest message first.
     """
     return (
         select(
-            SqlConversationItem.id.label("item_id"),
+            SqlConversationItem,
             func.row_number()
             .over(
                 partition_by=SqlConversationItem.conversation_id,
@@ -930,13 +936,13 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         Fetch a conversation by its unique ID.
 
-        Populates ``Conversation.labels`` via a second query
-        against ``conversation_labels`` — separate from the
-        conversation row fetch because the label JOIN would
-        otherwise multiply the row count by the label count
-        and require post-processing. The two queries run in
-        the same session so they see a consistent snapshot
-        under serializable isolation.
+        Issues two queries inside one session:
+
+        1. A single LEFT OUTER JOIN of ``conversations`` +
+           ``agent_configuration`` (same PK, same DB) so both rows
+           arrive in one round-trip instead of two serial
+           ``session.get`` calls.
+        2. A label fetch on ``conversation_labels``.
 
         :param conversation_id: Unique conversation identifier,
             e.g. ``"conv_abc123"``.
@@ -944,12 +950,21 @@ class SqlAlchemyConversationStore(ConversationStore):
             ``None``.
         """
         with self._conv_session() as session:
-            row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
-            if row is None:
+            result = session.execute(
+                select(SqlConversation, SqlAgentConfiguration)
+                .outerjoin(
+                    SqlAgentConfiguration,
+                    (SqlAgentConfiguration.workspace_id == SqlConversation.workspace_id)
+                    & (SqlAgentConfiguration.conversation_id == SqlConversation.id),
+                )
+                .where(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.id == conversation_id,
+                )
+            ).first()
+            if result is None:
                 return None
-            agent_config = session.get(
-                SqlAgentConfiguration, (current_workspace_id(), conversation_id)
-            )
+            row, agent_config = result
             meta = self._get_meta(session, conversation_id)
             return _to_conversation(
                 row, meta, _fetch_labels(session, conversation_id), agent_config
@@ -1719,25 +1734,14 @@ class SqlAlchemyConversationStore(ConversationStore):
             return result
 
         with self._conv_session() as session:
-            ranked = _ranked_latest_message_item_ids(unique_ids)
-            rows = (
-                session.execute(
-                    select(SqlConversationItem)
-                    .join(ranked, SqlConversationItem.id == ranked.c.item_id)
-                    .where(
-                        SqlConversationItem.workspace_id == current_workspace_id(),
-                        ranked.c.row_num <= per_conversation_limit,
-                    )
-                    .order_by(
-                        SqlConversationItem.conversation_id,
-                        desc(SqlConversationItem.position),
-                    )
-                )
-                .scalars()
-                .all()
-            )
+            ranked = _ranked_latest_message_items(unique_ids)
+            rows = session.execute(
+                select(ranked)
+                .where(ranked.c.row_num <= per_conversation_limit)
+                .order_by(ranked.c.conversation_id, ranked.c.position.desc())
+            ).all()
             for row in rows:
-                result[row.conversation_id].append(_to_item(row))
+                result[row.conversation_id].append(_to_item(row))  # type: ignore[arg-type]
         return result
 
     def append(
