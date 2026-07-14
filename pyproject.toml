@@ -180,12 +180,22 @@ cursor = ["cursor-sdk>=0.1.7"]
 # _reflect). The tools import the client lazily, so only users who enable a
 # Hindsight memory tool need this extra.
 memory = ["hindsight-client>=0.4.0"]
+# PostgreSQL storage backend. The server builds a psycopg engine whenever
+# the database URI is Postgres (``OMNIGENT_DATABASE_URI=postgresql+psycopg://…``
+# / ``--database-uri``). That is a general-purpose escape hatch — any
+# standalone Postgres deployment needs the driver, not only Databricks — so it
+# gets its own extra rather than being reachable only via `databricks`.
+# ``_create_engine`` raises an actionable "install omnigent[postgres]" error
+# when the URI is Postgres but this driver is absent.
+postgres = ["psycopg[binary]>=3.1,<4"]
 databricks = [
     # Floor matches what core code was tested against when the SDK was a
     # default dependency (it moved here from `dependencies` above).
     "databricks-sdk>=0.56.0,<1",
     "opentelemetry-distro>=0,<1",
-    "psycopg[binary]>=3.1,<4",
+    # Databricks uses a Postgres control plane (Lakebase); reuse the single
+    # psycopg pin from the `postgres` extra so the two never drift.
+    "omnigent[postgres]",
     "pymysql>=1.1,<2",
     # Databricks-specific MCP servers. Not imported by core Omnigent
     # code, so it is opt-in here rather than a default dependency.
@@ -526,12 +536,12 @@ ignore_missing_imports = true
 module = "databricks_mcp.*"
 ignore_missing_imports = true
 
-# psycopg is an optional dep (only declared in the ``databricks``
-# extra, used by ``deploy/databricks/grant_sp_perms.py``). Previously installed
-# transitively via ``dbos``; after the DBOS removal, ``uv sync
-# --extra dev`` no longer pulls it, so the lint workflow can't
-# import it. Treat the missing module as silent — runtime use still
-# requires installing the ``databricks`` extra.
+# psycopg is an optional dep (declared in the ``postgres`` extra, which the
+# ``databricks`` extra also pulls in). Previously installed transitively via
+# ``dbos``; after the DBOS removal, ``uv sync --extra dev`` no longer pulls it,
+# so the lint workflow can't import it. Treat the missing module as silent —
+# runtime use still requires installing the ``postgres`` (or ``databricks``)
+# extra.
 [[tool.mypy.overrides]]
 module = "psycopg.*"
 ignore_missing_imports = true

@@ -1124,3 +1124,147 @@ def test_ensure_does_not_advertise_pidfile_before_ownership_confirmed(
     assert result.url == "http://127.0.0.1:6767"
     # Once confirmed, the record IS advertised for reuse/discovery.
     assert pid_file.read_text() == "9001\n6767\n"
+
+
+def test_log_tail_redacts_credentials_and_strips_control_sequences(tmp_path: Path) -> None:
+    """
+    Regression for the credential-exposure review finding: migration errors
+    deliberately embed the full db_uri (``user:password@host``) for a
+    copy-pasteable command, and that traceback lands in the server log. The
+    surfaced tail must redact URL userinfo — terminal output routinely gets
+    pasted into bug reports. ANSI/control sequences from captured subprocess
+    output must be stripped so the log cannot inject terminal control.
+    """
+    log = tmp_path / "server-20260101-000000-000000.log"
+    log.write_text(
+        "RuntimeError: ... Take a backup of your database, then run\n"
+        "    omnigent debug db-upgrade 'postgresql+psycopg://user:secret@host/db'\n"
+        "\x1b[31mred alert\x1b[0m and a bell \x07 plus \x1b]0;title\x1b\\\n"
+    )
+
+    tail = local_server._read_log_tail(log)
+
+    assert "secret" not in tail  # the password never reaches the terminal
+    assert "[REDACTED]@host/db" in tail  # host part stays readable
+    assert "\x1b" not in tail and "\x07" not in tail  # no terminal control
+    assert "red alert" in tail  # visible text survives
+
+
+def test_failure_record_roundtrip_requires_matching_pid(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    The failure record must be surfaced only for the daemon attempt the CLI
+    was waiting on: the recorded writer PID has to match. Freshness alone is
+    not correlation — a record from another attempt (or a concurrent
+    foreground server) must be dropped. Consumed on read either way, so a
+    later unrelated failure can never resurface it.
+    """
+    import os
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    log_dir = tmp_path / "logs" / "server"
+    log_dir.mkdir(parents=True)
+    failed = log_dir / "server-20260101-000000-000000.log"
+    failed.write_text("ModuleNotFoundError: No module named 'psycopg'\n")
+
+    local_server._record_server_startup_failure(failed)
+
+    # Matching PID (the recorder is this process): exact log surfaces.
+    result = local_server.consume_failed_server_log_tail(os.getpid())
+    assert result is not None
+    path, tail = result
+    assert path == failed
+    assert "No module named 'psycopg'" in tail
+    # Consumed: a second read finds nothing.
+    assert local_server.consume_failed_server_log_tail(os.getpid()) is None
+
+    # Mismatched PID: record is dropped (and still consumed), never shown.
+    local_server._record_server_startup_failure(failed)
+    assert local_server.consume_failed_server_log_tail(os.getpid() + 1) is None
+    assert local_server.consume_failed_server_log_tail(os.getpid()) is None
+
+
+def test_failure_record_ignores_stale_unknown_and_garbage(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    A stale record (old log mtime), an unknown daemon PID, or a degenerate
+    sidecar must yield ``None`` — better no tail than a misleading one, and
+    never an exception.
+    """
+    import os
+    import time
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    log_dir = tmp_path / "logs" / "server"
+    log_dir.mkdir(parents=True)
+    log = log_dir / "server-20260101-000000-000000.log"
+    log.write_text("old failure\n")
+    ancient = time.time() - 24 * 3600
+    os.utime(log, (ancient, ancient))
+
+    record_path = tmp_path / "local_server_failed.logpath"
+    pid = os.getpid()
+    # Stale: the referenced log was last written far outside the window.
+    record_path.write_text(f"{log}\n{pid}\n")
+    assert local_server.consume_failed_server_log_tail(pid) is None
+    # Unknown daemon PID: nothing can be attributed.
+    record_path.write_text(f"{log}\n{pid}\n")
+    assert local_server.consume_failed_server_log_tail(None) is None
+    # Missing PID line (legacy/corrupt record).
+    record_path.write_text(f"{log}\n")
+    assert local_server.consume_failed_server_log_tail(pid) is None
+    # Non-numeric PID line.
+    record_path.write_text(f"{log}\nnot-a-pid\n")
+    assert local_server.consume_failed_server_log_tail(pid) is None
+    # Record pointing at a vanished log file.
+    record_path.write_text(f"{log_dir / 'gone.log'}\n{pid}\n")
+    assert local_server.consume_failed_server_log_tail(pid) is None
+
+
+def test_read_log_tail_is_bounded(tmp_path: Path) -> None:
+    """
+    Tailing must not read the whole file: a long-lived server's log can be
+    hundreds of MB. Only the trailing block is read, and the last lines
+    survive intact.
+    """
+    log = tmp_path / "big.log"
+    filler = "x" * 100
+    with log.open("w") as fh:
+        for i in range(5000):  # ~500 KB, well past the 64 KB tail window
+            fh.write(f"{filler} {i}\n")
+        fh.write("FINAL: ModuleNotFoundError: No module named 'psycopg'\n")
+
+    tail = local_server._read_log_tail(log, max_lines=50)
+
+    assert "FINAL: ModuleNotFoundError" in tail
+    assert len(tail.splitlines()) == 50
+
+
+def test_spawn_normalizes_paas_postgres_uri(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    ``OMNIGENT_DATABASE_URI=postgres://…`` (PaaS style) is not a SQLAlchemy
+    dialect and bare ``postgresql://`` selects the psycopg2 driver no extra
+    ships. The spawn path must canonicalize both to ``postgresql+psycopg://``
+    — the same normalization the Docker entrypoint applies.
+    """
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_DATABASE_URI", "postgres://user:pw@127.0.0.1:5432/db")
+
+    captured_args: list[str] = []
+
+    class _Proc:
+        pid = 4242
+
+        def __init__(self, args: list[str], **_kwargs: Any) -> None:
+            captured_args.extend(args)
+
+    monkeypatch.setattr(local_server.subprocess, "Popen", _Proc)
+
+    local_server._spawn_local_server(6767)
+
+    uri = captured_args[captured_args.index("--database-uri") + 1]
+    assert uri == "postgresql+psycopg://user:pw@127.0.0.1:5432/db"

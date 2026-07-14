@@ -504,3 +504,187 @@ def test_prune_old_logs_survives_file_vanishing_mid_sort(
 
     surviving = [p for p in real if p.exists()]
     assert len(surviving) == cli_diagnostics.MAX_LOG_FILES  # newest kept, oldest pruned
+
+
+def test_suppresses_setup_hint_for_import_errors() -> None:
+    """
+    A missing dependency (ImportError / ModuleNotFoundError) is never fixed by
+    the model-credential wizard, so the setup hint must be withheld.
+    """
+    assert cli_diagnostics.suppresses_setup_hint(ImportError("no module")) is True
+    assert (
+        cli_diagnostics.suppresses_setup_hint(
+            ModuleNotFoundError("No module named 'psycopg'", name="psycopg")
+        )
+        is True
+    )
+
+
+def test_suppresses_setup_hint_honors_marker_attribute() -> None:
+    """
+    Any exception may opt out of the setup hint by carrying the marker
+    attribute — this keeps ``cli_diagnostics`` decoupled from the modules that
+    raise server-startup / dependency errors.
+    """
+
+    class _Marked(Exception):
+        omnigent_suppress_setup_hint = True
+
+    assert getattr(_Marked, cli_diagnostics.SUPPRESS_SETUP_HINT_ATTR) is True
+    assert cli_diagnostics.suppresses_setup_hint(_Marked()) is True
+
+
+def test_local_server_startup_error_suppresses_hint() -> None:
+    """
+    The real ``LocalServerStartupError`` carries the marker, so a crashed
+    background server does not trigger the misleading "run omnigent setup" hint.
+    """
+    from omnigent.host.local_server import LocalServerStartupError
+
+    err = LocalServerStartupError("server failed to start")
+    assert cli_diagnostics.suppresses_setup_hint(err) is True
+
+
+def test_does_not_suppress_hint_for_ordinary_errors() -> None:
+    """
+    Ordinary errors (including a plain ClickException) keep the setup hint —
+    the dominant real-world cause is still a missing/misconfigured credential.
+    """
+    import click
+
+    assert cli_diagnostics.suppresses_setup_hint(RuntimeError("boom")) is False
+    assert cli_diagnostics.suppresses_setup_hint(click.ClickException("bad")) is False
+
+
+def test_daemon_exit_error_carries_server_log_tail(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    Foreground acceptance, part 1: when the daemon dies before its server is
+    ready, ``_discover_local_server_url`` must embed the failed spawn's log
+    tail — the actionable cause (e.g. the Postgres-driver install command)
+    lives there, and the CLI process never saw the subprocess's own error.
+    The tail is attributed via the daemon's failure record: recorded writer
+    PID must match the dead daemon's PID.
+    """
+    from types import SimpleNamespace
+
+    import omnigent.cli as cli
+    from omnigent.host import local_server
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    log_dir = tmp_path / "logs" / "server"
+    log_dir.mkdir(parents=True)
+    failed_log = log_dir / "server-20260101-000000-000000.log"
+    failed_log.write_text(
+        "Traceback (most recent call last):\n"
+        "ModuleNotFoundError: Database backend 'postgresql+psycopg' needs the "
+        "PostgreSQL driver 'psycopg', which is not installed. Install it with "
+        "one of:\n    pip install 'omnigent[postgres]'\n"
+    )
+    # The daemon (this process, in the test) recorded the failing log before
+    # dying; the CLI finds the dead daemon's record carrying the same PID.
+    local_server._record_server_startup_failure(failed_log)
+    import os
+
+    monkeypatch.setattr(
+        cli, "_find_daemon_record", lambda target: SimpleNamespace(pid=os.getpid())
+    )
+    monkeypatch.setattr(cli, "local_server_url_if_healthy", lambda: None)
+    monkeypatch.setattr(cli, "_host_daemon_alive", lambda: False)
+
+    from omnigent.host.local_server import LocalServerStartupError
+
+    with pytest.raises(LocalServerStartupError) as excinfo:
+        cli._discover_local_server_url(timeout=1.0)
+
+    message = str(excinfo.value)
+    assert "daemon exited before its Omnigent server became ready" in message
+    assert "Server log" in message
+    assert "omnigent[postgres]" in message  # the actionable cause, inline
+
+
+def test_daemon_exit_error_omits_tail_without_attributable_record(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    No failure record (or one from a different attempt) must yield the plain
+    pointer error — never some other log presented as this attempt's cause.
+    """
+    from types import SimpleNamespace
+
+    import omnigent.cli as cli
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    log_dir = tmp_path / "logs" / "server"
+    log_dir.mkdir(parents=True)
+    # A fresh log exists (e.g. a concurrent dedicated server) but no failure
+    # record ties it to the daemon attempt that just died.
+    (log_dir / "server-20260101-000000-000000.log").write_text("unrelated humming server\n")
+    monkeypatch.setattr(cli, "_find_daemon_record", lambda target: SimpleNamespace(pid=12345))
+    monkeypatch.setattr(cli, "local_server_url_if_healthy", lambda: None)
+    monkeypatch.setattr(cli, "_host_daemon_alive", lambda: False)
+
+    from omnigent.host.local_server import LocalServerStartupError
+
+    with pytest.raises(LocalServerStartupError) as excinfo:
+        cli._discover_local_server_url(timeout=1.0)
+
+    message = str(excinfo.value)
+    assert "daemon exited before its Omnigent server became ready" in message
+    assert "unrelated humming server" not in message
+    assert "Last 50 lines" not in message
+
+
+def test_redact_secrets_scrubs_url_userinfo() -> None:
+    """
+    The public redaction wrapper must scrub URL userinfo — the exact shape a
+    migration error embeds (``omnigent debug db-upgrade '<full uri>'``) —
+    while leaving the host/db part readable for diagnostics.
+    """
+    text = (
+        "run omnigent debug db-upgrade "
+        "'postgresql+psycopg://user:hunter2@db.example:5432/omnigent'"
+    )
+    scrubbed = cli_diagnostics.redact_secrets(text)
+    assert "hunter2" not in scrubbed
+    assert "://user:" not in scrubbed  # whole userinfo gone, not just password
+    assert "db.example:5432/omnigent" in scrubbed  # target stays readable
+
+
+def test_main_surfaces_install_command_on_stderr_without_setup_hint(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    Foreground acceptance, part 2 (top-level ``main()``): the terminal output
+    for a daemon-startup failure must contain the corrective install command
+    and must NOT contain the "run `omnigent setup`" hint — the wizard cannot
+    install a missing dependency.
+    """
+    import contextlib
+    import io
+
+    import omnigent.cli as cli
+    from omnigent.host.local_server import LocalServerStartupError
+
+    # Keep the test hermetic: no diagnostics log files, no update check.
+    monkeypatch.setattr("omnigent.cli_diagnostics.setup_cli_logging", lambda argv: None)
+
+    def _boom(*_args: object, **_kwargs: object) -> None:
+        raise LocalServerStartupError(
+            "The local daemon exited before its Omnigent server became ready.\n"
+            "  Last 50 lines:\n"
+            "  ModuleNotFoundError: ... pip install 'omnigent[postgres]' ..."
+        )
+
+    monkeypatch.setattr(cli, "cli", _boom)
+    monkeypatch.setattr(sys, "argv", ["omnigent", "run"])
+
+    stderr = io.StringIO()
+    with contextlib.redirect_stderr(stderr), pytest.raises(SystemExit) as excinfo:
+        cli.main()
+
+    assert excinfo.value.code == 1
+    output = stderr.getvalue()
+    assert "omnigent[postgres]" in output  # corrective command reaches the terminal
+    assert "auth or configuration problem" not in output  # no misleading hint

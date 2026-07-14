@@ -119,6 +119,10 @@ _SECRET_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"\bsk-[A-Za-z0-9_-]{10,}\b"),
     # Databricks PATs
     re.compile(r"\bdapi[A-Za-z0-9]{10,}\b"),
+    # URL userinfo: scheme://user:password@host — e.g. a database URI baked
+    # into a migration error's copy-pasteable command. Redacts the whole
+    # userinfo (the lookahead keeps the ``@host`` part readable).
+    re.compile(r"(://)[^/\s@]+(?=@)"),
 ]
 _REDACTED = "[REDACTED]"
 
@@ -136,6 +140,22 @@ def _redact(text: str) -> str:
             text,
         )
     return text
+
+
+def redact_secrets(text: str) -> str:
+    """
+    Public wrapper around the diagnostics redaction filter.
+
+    For callers outside the logging pipeline that are about to surface
+    captured log content on a user-visible channel (e.g. the server-log
+    tail embedded in a startup error) and must scrub secret-shaped
+    substrings — including URL userinfo like
+    ``postgresql+psycopg://user:password@host`` — first.
+
+    :param text: Arbitrary log text (may include tracebacks).
+    :returns: Scrubbed text.
+    """
+    return _redact(text)
 
 
 class _RedactingFormatter(TerminalLogFormatter):
@@ -418,6 +438,35 @@ def print_setup_hint() -> None:
         "`omnigent setup` to configure a model credential.",
         file=dest,
     )
+
+
+#: Attribute an exception may carry to opt out of the ``omnigent setup``
+#: recovery hint. Any exception type that represents a failure the setup
+#: wizard cannot fix (a missing dependency, a failed background server) can
+#: set this to ``True`` — keeps :mod:`cli_diagnostics` decoupled from the
+#: modules that raise those errors.
+SUPPRESS_SETUP_HINT_ATTR = "omnigent_suppress_setup_hint"
+
+
+def suppresses_setup_hint(exc: BaseException) -> bool:
+    """
+    Report whether the ``omnigent setup`` hint should be withheld for *exc*.
+
+    The setup hint (:func:`print_setup_hint`) assumes the dominant CLI
+    failure is a missing model credential. That is misleading for whole
+    classes of error the wizard cannot fix — a missing Python dependency
+    (e.g. the ``psycopg`` Postgres driver) or a background local server that
+    crashed for a non-credential reason. Suppressing the hint for those keeps
+    the surfaced error pointing at the real fix.
+
+    :param exc: The exception about to be surfaced by :func:`omnigent.cli.main`.
+    :returns: ``True`` when the hint should be suppressed — either *exc* is an
+        :class:`ImportError` (missing dependency) or it carries a truthy
+        :data:`SUPPRESS_SETUP_HINT_ATTR` marker.
+    """
+    if isinstance(exc, ImportError):
+        return True
+    return bool(getattr(exc, SUPPRESS_SETUP_HINT_ATTR, False))
 
 
 def log_cli_exception(exc: BaseException, *, prefix: str = "CLI error") -> None:

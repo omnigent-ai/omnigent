@@ -20,6 +20,7 @@ from omnigent.db.utils import (
     _initialize_or_verify_schema,
     _install_lakebase_token_refresh,
     _resolve_lakebase_token_provider,
+    _translate_missing_driver_error,
     build_search_snippet,
     builtin_agent_id,
     clear_engine_cache,
@@ -82,6 +83,153 @@ def test_non_sqlite_engine_has_pool_settings(
     # the database server restarts or closes idle connections.
     # Failure means connections could persist indefinitely and break.
     assert captured_kwargs.get("pool_recycle") == 1800
+
+
+def test_missing_psycopg_translates_to_actionable_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A Postgres URI whose driver is uninstalled must surface an actionable
+    install hint, not SQLAlchemy's bare ``No module named 'psycopg'``.
+
+    Simulates the driver being absent by making ``create_engine`` raise the
+    same ``ModuleNotFoundError`` SQLAlchemy raises when it lazily imports the
+    DBAPI. ``_create_engine`` must catch it and re-raise a message that names
+    the install command and the ``omnigent[postgres]`` extra.
+    """
+
+    def _raise_missing_driver(uri: str, **_kwargs: Any) -> MagicMock:
+        raise ModuleNotFoundError("No module named 'psycopg'", name="psycopg")
+
+    monkeypatch.setattr("omnigent.db.utils.create_engine", _raise_missing_driver)
+    monkeypatch.setattr("omnigent.db.utils._run_migrations", lambda engine, db_uri: None)
+
+    with pytest.raises(ModuleNotFoundError) as excinfo:
+        get_or_create_engine("postgresql+psycopg://user:pass@host:5432/db")
+
+    message = str(excinfo.value)
+    # Names the extra and at least one concrete install command.
+    assert "omnigent[postgres]" in message
+    assert "psycopg[binary]" in message
+    # ``name`` is preserved so callers keying on the missing module still work.
+    assert excinfo.value.name == "psycopg"
+    # The original SQLAlchemy-raised error stays chained for diagnostics.
+    assert excinfo.value.__cause__ is not None
+    # The credentials in the URI must never leak into the surfaced message.
+    assert "user:pass" not in message
+    assert "host:5432" not in message
+
+
+@pytest.mark.parametrize(
+    "db_uri",
+    [
+        # A bare ``postgresql://`` makes SQLAlchemy select the legacy
+        # psycopg2 DBAPI — installing psycopg 3 would not fix it.
+        "postgresql://user:pass@host:5432/db",
+        "postgresql+psycopg2://user:pass@host:5432/db",
+    ],
+)
+def test_missing_psycopg2_guidance_is_dialect_correct(db_uri: str) -> None:
+    """
+    The psycopg2 dialects must NOT be told "install psycopg 3 and retry" —
+    that provably reproduces the same error. The guidance must lead with
+    switching the URI scheme to ``postgresql+psycopg://`` and offer the
+    explicit psycopg2 install as the alternative.
+    """
+    exc = ModuleNotFoundError("No module named 'psycopg2'", name="psycopg2")
+    translated = _translate_missing_driver_error(db_uri, exc)
+
+    assert translated is not exc
+    message = str(translated)
+    assert "postgresql+psycopg://" in message  # the preferred fix: switch dialect
+    assert "psycopg2-binary" in message  # the keep-the-dialect alternative
+    assert translated.name == "psycopg2"
+    assert "user:pass" not in message
+    assert "host:5432" not in message
+
+
+def test_translate_missing_driver_passes_through_unrelated_errors() -> None:
+    """
+    ``_translate_missing_driver_error`` only rewrites a *Postgres driver*
+    import failure. A non-Postgres backend, or a ModuleNotFoundError for some
+    other module, is returned unchanged so real bugs are not masked.
+    """
+    # Non-Postgres backend: return the original untouched.
+    other_backend = ModuleNotFoundError("No module named 'psycopg'", name="psycopg")
+    assert _translate_missing_driver_error("sqlite:///x.db", other_backend) is other_backend
+
+    # Postgres backend, but the missing module is something unrelated (e.g. a
+    # transitive import failure) — not the driver, so leave it alone.
+    unrelated = ModuleNotFoundError("No module named 'greenlet'", name="greenlet")
+    assert _translate_missing_driver_error("postgresql+psycopg://u@h/db", unrelated) is unrelated
+
+    # A URI make_url cannot parse must fall back to the scheme split, not
+    # blow up inside error handling.
+    garbage = ModuleNotFoundError("No module named 'psycopg'", name="psycopg")
+    assert _translate_missing_driver_error("not a uri at all", garbage) is garbage
+
+
+def test_paas_postgres_scheme_gets_conversion_guidance() -> None:
+    """
+    ``postgres://`` is not a SQLAlchemy dialect at all — it fails with an
+    opaque ``NoSuchModuleError`` *before* any driver import. The engine
+    factory must append conversion guidance pointing at
+    ``postgresql+psycopg://`` (the spawn path normalizes this away, but a
+    direct ``--database-uri`` can still get here). Credentials must not leak.
+    """
+    from sqlalchemy.exc import NoSuchModuleError
+
+    from omnigent.db import utils
+
+    with pytest.raises(NoSuchModuleError) as excinfo:
+        utils._create_engine("postgres://user:secret@host:5432/db")
+
+    message = str(excinfo.value)
+    assert "postgresql+psycopg://" in message
+    assert "omnigent[postgres]" in message
+    assert "secret" not in message
+    assert excinfo.value.__cause__ is not None  # original plugin error chained
+
+
+def test_non_postgres_dialect_error_passes_through() -> None:
+    """
+    A bogus non-Postgres scheme must re-raise SQLAlchemy's original
+    ``NoSuchModuleError`` untouched — the Postgres guidance would only
+    mislead there.
+    """
+    from sqlalchemy.exc import NoSuchModuleError
+
+    from omnigent.db import utils
+
+    with pytest.raises(NoSuchModuleError) as excinfo:
+        utils._create_engine("bogusdb://user@host/db")
+
+    assert "postgresql+psycopg" not in str(excinfo.value)
+    assert excinfo.value.__cause__ is None  # bare re-raise, nothing stamped
+
+
+def test_unrelated_import_error_reraises_without_self_cause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The pass-through path must use a bare ``raise``: the surfaced exception is
+    the original object with ``__cause__`` untouched. A ``raise exc from exc``
+    would stamp a self-referential ``__cause__`` and confuse diagnostics
+    integrations even though traceback rendering survives via cycle detection.
+    """
+    original = ModuleNotFoundError("No module named 'greenlet'", name="greenlet")
+
+    def _raise_unrelated(uri: str, **_kwargs: Any) -> MagicMock:
+        raise original
+
+    monkeypatch.setattr("omnigent.db.utils.create_engine", _raise_unrelated)
+    monkeypatch.setattr("omnigent.db.utils._run_migrations", lambda engine, db_uri: None)
+
+    with pytest.raises(ModuleNotFoundError) as excinfo:
+        get_or_create_engine("postgresql+psycopg://u@h/db")
+
+    assert excinfo.value is original
+    assert excinfo.value.__cause__ is None
 
 
 def test_sqlite_engine_skips_server_pool_settings_and_enables_wal(
