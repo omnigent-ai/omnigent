@@ -411,17 +411,63 @@ class ModelPricing:
     :param cache_write_per_token: Price per cache-write (cache-creation)
         input token (typically ~1.25x input), or ``None`` when
         unpublished.
+    :param long_context_threshold_tokens: Input-token threshold above which
+        the long-context rates apply, or ``None`` for flat pricing.
+    :param long_context_input_per_token: Long-context input price per token.
+    :param long_context_output_per_token: Long-context output price per token.
+    :param long_context_cache_read_per_token: Long-context cache-read price
+        per token.
+    :param long_context_cache_write_per_token: Long-context cache-write price
+        per token.
     """
 
     input_per_token: float
     output_per_token: float
     cache_read_per_token: float | None = None
     cache_write_per_token: float | None = None
+    long_context_threshold_tokens: int | None = None
+    long_context_input_per_token: float | None = None
+    long_context_output_per_token: float | None = None
+    long_context_cache_read_per_token: float | None = None
+    long_context_cache_write_per_token: float | None = None
 
 
-def fetch_model_pricing(model: str) -> ModelPricing | None:
+_MODEL_PRICING_REGISTRY: dict[tuple[str, str], ModelPricing] = {
+    ("minimax-m3", "standard"): ModelPricing(
+        input_per_token=0.3e-6,
+        output_per_token=1.2e-6,
+        cache_read_per_token=0.06e-6,
+        long_context_threshold_tokens=512_000,
+        long_context_input_per_token=0.6e-6,
+        long_context_output_per_token=2.4e-6,
+        long_context_cache_read_per_token=0.12e-6,
+    ),
+    ("minimax-m3", "priority"): ModelPricing(
+        input_per_token=0.45e-6,
+        output_per_token=1.8e-6,
+        cache_read_per_token=0.09e-6,
+        long_context_threshold_tokens=512_000,
+        long_context_input_per_token=0.9e-6,
+        long_context_output_per_token=3.6e-6,
+        long_context_cache_read_per_token=0.18e-6,
+    ),
+    ("minimax-m2.7", "standard"): ModelPricing(
+        input_per_token=0.3e-6,
+        output_per_token=1.2e-6,
+        cache_read_per_token=0.06e-6,
+        cache_write_per_token=0.375e-6,
+    ),
+}
+_CURATED_PRICING_MODELS = frozenset(model for model, _tier in _MODEL_PRICING_REGISTRY)
+
+
+def fetch_model_pricing(
+    model: str,
+    *,
+    service_tier: str = "standard",
+) -> ModelPricing | None:
     """
-    Look up per-token pricing for *model* from the MLflow catalog.
+    Look up per-token pricing for *model* from the curated registry or catalog.
 
     Returns prices per token (not per million), including cache-read /
     cache-write rates when the catalog publishes them. Uses the same
@@ -431,19 +477,29 @@ def fetch_model_pricing(model: str) -> ModelPricing | None:
 
     :param model: Model identifier, e.g. ``"anthropic/claude-sonnet-4-6"``
         or ``"databricks-gpt-5-5"``.
+    :param service_tier: Provider service tier, such as ``"standard"`` or
+        ``"priority"``, used when curated pricing defines that tier.
     :returns: A :class:`ModelPricing`, or ``None`` when pricing is
         unavailable (network error, model not in catalog, or catalog
         entry lacks input/output pricing data).
     """
-    if os.environ.get("OMNIGENT_DISABLE_CATALOG_LOOKUP") == "1":
-        return None
-
     if "/" in model:
         _explicit_provider, bare = model.split("/", 1)
         provider = _explicit_provider
     else:
         bare = model
         provider = _infer_provider(bare)
+
+    normalized_model = bare.strip().lower()
+    normalized_tier = service_tier.strip().lower()
+    registered = _MODEL_PRICING_REGISTRY.get((normalized_model, normalized_tier))
+    if registered is not None:
+        return registered
+    if normalized_model in _CURATED_PRICING_MODELS:
+        return None
+
+    if os.environ.get("OMNIGENT_DISABLE_CATALOG_LOOKUP") == "1":
+        return None
 
     if provider is None:
         return None
@@ -503,7 +559,7 @@ def fetch_model_pricing(model: str) -> ModelPricing | None:
     if provider == "databricks" and bare.startswith("databricks-"):
         base = bare[len("databricks-") :]
         if base and base != bare:
-            return fetch_model_pricing(base)
+            return fetch_model_pricing(base, service_tier=service_tier)
 
     return None
 
@@ -545,25 +601,40 @@ def compute_llm_cost(usage: dict[str, Any], pricing: ModelPricing) -> float:
     output_tokens = usage.get("output_tokens") or 0
     cache_read = usage.get("cache_read_input_tokens") or 0
     cache_write = usage.get("cache_creation_input_tokens") or 0
+    input_rate = pricing.input_per_token
+    output_rate = pricing.output_per_token
+    cache_read_rate = pricing.cache_read_per_token
+    cache_write_rate = pricing.cache_write_per_token
+    total_input_tokens = input_tokens + cache_read + cache_write
+    if (
+        pricing.long_context_threshold_tokens is not None
+        and total_input_tokens > pricing.long_context_threshold_tokens
+    ):
+        if pricing.long_context_input_per_token is not None:
+            input_rate = pricing.long_context_input_per_token
+        if pricing.long_context_output_per_token is not None:
+            output_rate = pricing.long_context_output_per_token
+        cache_read_rate = pricing.long_context_cache_read_per_token
+        cache_write_rate = pricing.long_context_cache_write_per_token
     # No published cache rate → derive one from the input rate using the
     # industry-standard ratios (see _FALLBACK_CACHE_*_INPUT_RATIO). This keeps
     # cache reads at ~10% of input on models whose catalog entry omits cache
     # pricing (``databricks-*`` today) instead of billing them at full input
     # rate, which over-charged cache-heavy sessions ~10×. Never drop the
     # tokens — cache reads/writes still cost something.
-    cache_read_rate = (
-        pricing.cache_read_per_token
-        if pricing.cache_read_per_token is not None
-        else pricing.input_per_token * _FALLBACK_CACHE_READ_INPUT_RATIO
+    resolved_cache_read_rate = (
+        cache_read_rate
+        if cache_read_rate is not None
+        else input_rate * _FALLBACK_CACHE_READ_INPUT_RATIO
     )
-    cache_write_rate = (
-        pricing.cache_write_per_token
-        if pricing.cache_write_per_token is not None
-        else pricing.input_per_token * _FALLBACK_CACHE_WRITE_INPUT_RATIO
+    resolved_cache_write_rate = (
+        cache_write_rate
+        if cache_write_rate is not None
+        else input_rate * _FALLBACK_CACHE_WRITE_INPUT_RATIO
     )
     return (
-        input_tokens * pricing.input_per_token
-        + output_tokens * pricing.output_per_token
-        + cache_read * cache_read_rate
-        + cache_write * cache_write_rate
+        input_tokens * input_rate
+        + output_tokens * output_rate
+        + cache_read * resolved_cache_read_rate
+        + cache_write * resolved_cache_write_rate
     )

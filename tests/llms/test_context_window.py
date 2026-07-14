@@ -175,6 +175,56 @@ def test_compute_llm_cost_without_cache_tokens_is_the_flat_formula() -> None:
     assert compute_llm_cost(usage, pricing) == pytest.approx(0.007)
 
 
+def test_fetch_model_pricing_preserves_minimax_published_tiers() -> None:
+    """Curated MiniMax pricing keeps service and long-context tiers distinct."""
+    standard = fetch_model_pricing("minimax/MiniMax-M3")
+    priority = fetch_model_pricing("anthropic/MiniMax-M3", service_tier="priority")
+    m27 = fetch_model_pricing("minimax/MiniMax-M2.7")
+
+    assert standard == ModelPricing(
+        input_per_token=0.3e-6,
+        output_per_token=1.2e-6,
+        cache_read_per_token=0.06e-6,
+        long_context_threshold_tokens=512_000,
+        long_context_input_per_token=0.6e-6,
+        long_context_output_per_token=2.4e-6,
+        long_context_cache_read_per_token=0.12e-6,
+    )
+    assert priority == ModelPricing(
+        input_per_token=0.45e-6,
+        output_per_token=1.8e-6,
+        cache_read_per_token=0.09e-6,
+        long_context_threshold_tokens=512_000,
+        long_context_input_per_token=0.9e-6,
+        long_context_output_per_token=3.6e-6,
+        long_context_cache_read_per_token=0.18e-6,
+    )
+    assert m27 == ModelPricing(
+        input_per_token=0.3e-6,
+        output_per_token=1.2e-6,
+        cache_read_per_token=0.06e-6,
+        cache_write_per_token=0.375e-6,
+    )
+
+
+def test_compute_llm_cost_switches_above_long_context_threshold() -> None:
+    """The published long-context rates apply only above 512,000 input tokens."""
+    pricing = fetch_model_pricing("minimax/MiniMax-M3")
+    assert pricing is not None
+
+    short_cost = compute_llm_cost(
+        {"input_tokens": 512_000, "output_tokens": 1_000},
+        pricing,
+    )
+    long_cost = compute_llm_cost(
+        {"input_tokens": 512_001, "output_tokens": 1_000},
+        pricing,
+    )
+
+    assert short_cost == pytest.approx(0.1548)
+    assert long_cost == pytest.approx(0.3096006)
+
+
 def test_fetch_model_pricing_parses_cache_rates(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     ``fetch_model_pricing`` surfaces catalog cache-read/write rates.

@@ -29,12 +29,14 @@ from pathlib import Path
 
 import pytest
 
+from omnigent.llms.context_window import ModelPricing
 from omnigent.runtime.policies.builder import build_policy_engine
 from omnigent.spec.parser import parse
 from omnigent.spec.types import (
     AgentSpec,
     GuardrailsSpec,
     LabelDef,
+    LLMConfig,
     Phase,
     PhaseSelector,
 )
@@ -122,6 +124,46 @@ guardrails: {}
     assert engine.policies[0].spec.name == "__ask_on_add_policy"
     assert engine.label_defs == {}
     assert engine.labels == {}
+
+
+def test_build_uses_llm_service_tier_for_model_pricing(
+    monkeypatch: pytest.MonkeyPatch,
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """The configured service tier selects the matching model prices."""
+    observed: dict[str, str] = {}
+    pricing = ModelPricing(input_per_token=1e-6, output_per_token=2e-6)
+
+    def _fetch_pricing(model: str, *, service_tier: str = "standard") -> ModelPricing:
+        observed["model"] = model
+        observed["service_tier"] = service_tier
+        return pricing
+
+    monkeypatch.setattr(
+        "omnigent.runtime.policies.builder.fetch_model_pricing",
+        _fetch_pricing,
+    )
+    spec = AgentSpec(
+        spec_version=1,
+        name="tiered-pricing",
+        llm=LLMConfig(
+            model="minimax/MiniMax-M3",
+            extra={"service_tier": "priority"},
+        ),
+    )
+    conv = conversation_store.create_conversation()
+
+    engine = build_policy_engine(
+        spec=spec,
+        conversation_id=conv.id,
+        conversation_store=conversation_store,
+    )
+
+    assert observed == {
+        "model": "minimax/MiniMax-M3",
+        "service_tier": "priority",
+    }
+    assert engine._token_pricing is pricing
 
 
 # ── Declared policies + label seeding ──────────────────

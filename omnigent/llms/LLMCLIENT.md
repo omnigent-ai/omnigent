@@ -228,8 +228,23 @@ compatible global endpoint is the default. Use `connection_params["base_url"]`
 for another region or use the `anthropic` model prefix with an Anthropic base
 URL to select the Messages protocol:
 
-`MiniMax-M3` accepts text, image, and video input. Both protocols also accept
-`service_tier="priority"`; omitting it uses the standard admission tier.
+`MiniMax-M3` accepts text, image, and video input. OpenAI-compatible requests
+enable thinking by default, while Anthropic-compatible requests disable it by
+default. Use `thinking={"type": "adaptive"}` or
+`thinking={"type": "disabled"}` to select the behavior explicitly.
+`MiniMax-M2.7` accepts text input and always uses thinking.
+
+Both protocols also accept `service_tier="priority"` for `MiniMax-M3`;
+omitting it uses the standard admission tier. Published prices are in USD per
+million tokens:
+
+| Model | Service tier | Input length | Input | Output | Cache read | Cache write |
+|-------|--------------|--------------|-------|--------|------------|-------------|
+| `MiniMax-M3` | Standard | Up to 512,000 | $0.30 | $1.20 | $0.06 | N/A |
+| `MiniMax-M3` | Standard | Above 512,000 | $0.60 | $2.40 | $0.12 | N/A |
+| `MiniMax-M3` | Priority | Up to 512,000 | $0.45 | $1.80 | $0.09 | N/A |
+| `MiniMax-M3` | Priority | Above 512,000 | $0.90 | $3.60 | $0.18 | N/A |
+| `MiniMax-M2.7` | Standard | Any | $0.30 | $1.20 | $0.06 | $0.375 |
 
 | Region | Protocol | Model prefix | Base URL |
 |--------|----------|--------------|----------|

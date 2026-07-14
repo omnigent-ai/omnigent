@@ -382,7 +382,15 @@ def build_policy_engine(
     initial_model = _resolve_session_model(conversation_id, conversation_store, spec)
     # Pass the full ModelPricing so the engine can price cache-read and
     # cache-write tokens at their own rates via compute_llm_cost().
-    token_pricing = fetch_model_pricing(spec.llm.model) if spec.llm else None
+    if spec.llm:
+        service_tier = spec.llm.extra.get("service_tier")
+        token_pricing = (
+            fetch_model_pricing(spec.llm.model, service_tier=service_tier)
+            if isinstance(service_tier, str)
+            else fetch_model_pricing(spec.llm.model)
+        )
+    else:
+        token_pricing = None
     server_connection = _resolve_server_llm_connection(server_llm)
     # host_connection carries the per-request caller token (billed to
     # the caller). It takes precedence over the static server-level
