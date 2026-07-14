@@ -134,3 +134,35 @@ def test_shared_url_module_defaults_scheme_in_browser(page: Page) -> None:
         page.evaluate("() => window.omnigentUrl.normalizeUrl('localhost:6767')")
         == "http://localhost:6767/"
     )
+
+
+def test_shared_url_module_routes_workspace_api_mount_to_ui(page: Page) -> None:
+    """A pasted workspace API URL resolves directly to the desktop UI."""
+    _open_setup_page(page)
+
+    result = page.evaluate(
+        """
+        async () => {
+          const originalFetch = window.fetch;
+          let probes = 0;
+          window.fetch = () => {
+            probes += 1;
+            throw new Error("unexpected workspace probe");
+          };
+          try {
+            const target =
+              await window.omnigentUrl.expandDatabricksWorkspaceUrl(
+                "https://dbc-x.cloud.databricks.com/api/2.0/omnigent/?o=123#session"
+              );
+            return { target, probes };
+          } finally {
+            window.fetch = originalFetch;
+          }
+        }
+        """
+    )
+
+    assert result == {
+        "target": "https://dbc-x.cloud.databricks.com/ml/omnigents?o=123#session",
+        "probes": 0,
+    }
