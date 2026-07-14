@@ -3682,6 +3682,105 @@ async def test_query_sessions_once_multi_turn_async_orchestrator(
     assert "Looks good." in result
 
 
+async def _never_return(_prompt: str) -> QueryResult:
+    """Simulate the lost-terminal-event race: heartbeats keep the SSE
+    iterator alive, so ``query`` neither returns nor raises."""
+    await asyncio.Event().wait()
+    raise AssertionError("unreachable")
+
+
+async def test_query_sessions_once_reconciles_on_lost_terminal_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The third race variant — ``query`` never returns because the terminal
+    event was lost while heartbeats keep the subscription alive — recovers
+    the persisted text once the guard fires and the session reports idle.
+
+    If this fails, a lost terminal event hangs headless ``-p`` forever.
+    """
+    monkeypatch.setattr(chat_module, "_PER_TURN_TIMEOUT_S", 0.05)
+    client = _FakeAPClient([_item_user("say hi"), _item_assistant("hi there")])
+    result = await asyncio.wait_for(_run_one_shot(client, _never_return, monkeypatch), timeout=10)
+    assert result == "hi there"
+
+
+async def test_query_sessions_once_raises_on_lost_terminal_event_without_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A guard trip on an idle session with no persisted output raises loud.
+
+    If this fails, a turn that genuinely produced nothing would be
+    reported as a silent empty success after the guard fires.
+    """
+    monkeypatch.setattr(chat_module, "_PER_TURN_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(chat_module, "_LOOP_TIMEOUT_S", 5.0)
+    client = _FakeAPClient([_item_user("say hi")])
+    with pytest.raises(RuntimeError, match=r"no\s+persisted assistant text"):
+        await asyncio.wait_for(_run_one_shot(client, _never_return, monkeypatch), timeout=10)
+
+
+async def test_query_sessions_once_slow_first_turn_not_truncated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A healthy first turn that outlasts the guard is not cut short.
+
+    The server persists each assistant item as it completes, so a
+    mid-turn fragment is already readable when the guard fires. The
+    recovery path must keep waiting while the session reports
+    ``running`` and reconcile only once it goes idle — returning the
+    whole turn's output, not the fragment.
+
+    If this fails, headless ``-p`` silently truncates any first turn
+    longer than the guard window (exit 0, partial answer).
+    """
+    monkeypatch.setattr(chat_module, "_PER_TURN_TIMEOUT_S", 0.05)
+    client = _FakeAPClient(
+        [_item_user("do the big refactor"), _item_assistant("intermediate note")]
+    )
+
+    class _SlowTurnChat:
+        """Turn still in flight when the guard fires; finishes two
+        status polls later, appending its final message to the
+        transcript like the server's incremental item persistence."""
+
+        def __init__(self, **_kwargs: object) -> None:
+            self._polls_left = 2
+            self._status = "running"
+
+        @property
+        def status(self) -> str:
+            return self._status
+
+        async def refresh(self) -> None:
+            pass
+
+        async def query(self, prompt: str) -> QueryResult:
+            return await _never_return(prompt)
+
+        async def await_turn(self, *, timeout: float | None = None) -> QueryResult:
+            self._polls_left -= 1
+            if self._polls_left <= 0:
+                client.sessions._items.append(_item_assistant("FULL final answer"))
+                self._status = "idle"
+            return QueryResult(text="", files=[])
+
+    monkeypatch.setattr("omnigent_client.SessionsChat", _SlowTurnChat)
+    result = await asyncio.wait_for(
+        _query_sessions_once(
+            client=client,
+            agent_name="hello_world",
+            tool_handler=None,
+            prompt="do the big refactor",
+            session_bundle=b"bundle-bytes",
+            session_bundle_filename="agent.tar.gz",
+            runner_id="runner_test",
+        ),
+        timeout=10,
+    )
+    assert result is not None
+    assert "FULL final answer" in result
+
+
 async def test_persisted_turn_text_anchors_on_last_user_message() -> None:
     """Only the current turn's assistant output is returned, not a prior turn's.
 
