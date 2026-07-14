@@ -12,7 +12,7 @@
 import { useEffect, useState } from "react";
 import { PageScroll } from "@/components/PageScroll";
 import { Switch } from "@/components/ui/switch";
-import type { SharingMode } from "@/lib/capabilities";
+import { type SharingMode, isSingleUserMode } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
 import { cn } from "@/lib/utils";
@@ -48,13 +48,9 @@ const TIERS: { id: SharingMode; label: string; description: string }[] = [
 
 export function SharingPage() {
   const info = useServerInfo();
-  // Plain header/single-user mode: no auth endpoints exist. server_version
-  // distinguishes a live single-user server from a failed /v1/info probe.
-  const isSingleUser =
-    info !== "loading" &&
-    !info.accounts_enabled &&
-    info.login_url === null &&
-    info.server_version !== null;
+  // Plain header/single-user mode: no auth endpoints exist. The nav + route
+  // already hide Sharing here; this stays as a fallback for a direct hit.
+  const isSingleUser = isSingleUserMode(info);
   const [meIsAdmin, setMeIsAdmin] = useState<boolean | null>(null);
 
   const { data: state, isLoading } = useSharing();

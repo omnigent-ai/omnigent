@@ -2797,6 +2797,20 @@ describe("AppShell share action", () => {
     });
   });
 
+  it("hides the Share button entirely in single-user mode", () => {
+    // Non-local origin isolates the single-user gate from the local-server
+    // path. Header single-user (accounts off, no login_url, live version) has
+    // no other users to share with, so the button is removed — not disabled
+    // like the local-server / sharing-off cases.
+    withWindowOrigin("https://app.example.com", () => {
+      mockConversations([{ id: "conv_top", permission_level: null }]);
+
+      renderShell("/c/conv_top", serverInfo({ server_version: "0.0.0" }));
+
+      expect(screen.queryByRole("button", { name: /share session/i })).toBeNull();
+    });
+  });
+
   it("keeps the Share button enabled when sharing_mode is read_only", () => {
     // read_only still permits (read) grants, so the affordance stays live —
     // the modal caps the level, the button is not disabled.

@@ -385,4 +385,19 @@ describe("sharing kill switch", () => {
 
     expect(screen.getByTestId("share-conversation")).not.toHaveAttribute("data-disabled");
   });
+
+  it("omits the row's Share item entirely in single-user mode", () => {
+    // Header single-user (accounts off, no login_url, live server version):
+    // no other users to share with, so the item is removed — not just
+    // disabled like the sharing-off case. isCurrentServerLocal is mocked
+    // false, so this exercises the single-user gate specifically.
+    mockConversations([CONV]);
+    renderSidebar(undefined, serverInfo({ server_version: "0.0.0" }));
+
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+
+    expect(screen.queryByTestId("share-conversation")).toBeNull();
+    // Other row actions still render — only Share is gated on single-user.
+    expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
+  });
 });

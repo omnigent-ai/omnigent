@@ -174,6 +174,23 @@ export function getCachedServerInfo(): ServerInfo | null {
 }
 
 /**
+ * Whether the server is in plain header / single-user mode (no accounts,
+ * no OIDC login). ``server_version`` distinguishes a live single-user
+ * server from a failed ``/v1/info`` probe — both share the
+ * ``accounts_enabled:false`` / ``login_url:null`` sentinel, but the OFF
+ * sentinel reports a null version while a live server always sets it.
+ * Returns ``false`` while the probe is still loading.
+ */
+export function isSingleUserMode(info: ServerInfo | "loading"): boolean {
+  return (
+    info !== "loading" &&
+    !info.accounts_enabled &&
+    info.login_url === null &&
+    info.server_version !== null
+  );
+}
+
+/**
  * Known provider id → display name for the sandbox label. Providers
  * not listed here fall back to a title-cased id so a newly-wired
  * provider still reads sensibly without a frontend change.
