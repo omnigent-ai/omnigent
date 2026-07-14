@@ -47,9 +47,10 @@ from tests.e2e_ui.conftest import (
     _find_free_port,
 )
 
-# Admin identity the browser presents via X-Forwarded-Email. Declared in
-# OMNIGENT_ADMINS so it resolves as an admin (manage on any session, so the
-# Share button renders on the local-owned seeded session).
+# Admin identity the browser presents via X-Forwarded-Email. Listed in the
+# admin-list file (OMNIGENT_ADMIN_LIST_PATH) so it resolves as an admin —
+# is_admin:true on /v1/me → the Settings Admin group renders, and manage on any
+# session → the Share button shows.
 ADMIN_EMAIL = "admin@ui.test"
 
 
@@ -113,6 +114,13 @@ def spawn_multi_user_server(
     artifact_dir.mkdir(parents=True, exist_ok=True)
     agent_yaml_path = server_tmp / "hello_world.yaml"
     agent_yaml_path.write_text(_TEST_AGENT_YAML)
+    # Declare the admin roster via the admin-list file (one identity per line;
+    # see omnigent/server/admin_list.py). There is no admin *env var* — the
+    # roster is the config ``admins:`` list or this file — so point
+    # OMNIGENT_ADMIN_LIST_PATH at it. This makes ADMIN_EMAIL resolve as admin
+    # so /v1/me reports is_admin:true and the Settings Admin group renders.
+    admins_path = server_tmp / "admins"
+    admins_path.write_text(f"{ADMIN_EMAIL}\n")
 
     base_url = f"http://127.0.0.1:{port}"
     pythonpath = f"{_REPO_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}"
@@ -127,8 +135,8 @@ def spawn_multi_user_server(
         # /v1/info reports single_user:false and the Share chrome stays.
         "OMNIGENT_LOCAL_SINGLE_USER": "",
         # A header-identified admin so the browser (X-Forwarded-Email) can
-        # manage its session and thus see the Share button + admin settings.
-        "OMNIGENT_ADMINS": ADMIN_EMAIL,
+        # manage its session (Share button) and see the admin settings group.
+        "OMNIGENT_ADMIN_LIST_PATH": str(admins_path),
         "OPENAI_BASE_URL": f"{mock_llm_server_url}/v1",
         "OPENAI_API_KEY": "mock-key",
         "ANTHROPIC_API_KEY": "",
