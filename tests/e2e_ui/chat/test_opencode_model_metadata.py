@@ -1,10 +1,9 @@
-"""E2E: opencode-native surfaces its live model as a read-only pill.
+"""E2E: opencode-native exposes its live model and session model catalog.
 
 opencode owns its model (the user switches it inside the opencode TUI), but it
 mirrors the live model into the session's ``model_override`` — set at launch and
-updated by the forwarder on every in-TUI switch. The web UI must surface *that*
-in the model pill so the indicator tracks the TUI, even though opencode ships no
-switchable web model list (the dropdown stays empty / display-only).
+updated by the forwarder on every in-TUI switch. The web UI surfaces *that* in
+the model pill and lists the session-scoped catalog returned by the runner.
 """
 
 from __future__ import annotations
@@ -19,57 +18,80 @@ LAUNCH_MODEL = "openrouter/nemotron"
 # The model the user switched to inside the opencode TUI; the forwarder mirrored
 # it into ``model_override``. This — not the launch default — must show.
 LIVE_TUI_MODEL = "openrouter/llama-3.3-70b-instruct"
+ALTERNATE_MODEL = "opencode-go/glm-5.2"
 
 
-def _patch_session_as_opencode_native(page: Page, session_id: str) -> None:
+def _patch_session_as_opencode_native(page: Page, session_id: str) -> list[dict]:
     """Patch the browser's session snapshot into an opencode-native response.
 
     The server fixture seeds a normal ``hello_world`` session so the page can
     boot against the real app/server. This route patch rewrites only the
     ``GET /v1/sessions/{session_id}`` response as seen by the browser, mirroring
     the AP snapshot after an opencode-native runner has mirrored its live TUI
-    model into ``model_override``. opencode exposes no switchable web model
-    list, so ``model_options`` stays absent.
+    model into ``model_override`` and carrying the runner-discovered model
+    catalog. PATCH responses mirror model selections back into the snapshot.
 
     :param page: Playwright page before navigation.
     :param session_id: Session id to patch, e.g. ``"conv_abc123"``.
-    :returns: None.
+    :returns: Captured PATCH request bodies.
     """
+    latest_payload: dict | None = None
+    patch_bodies: list[dict] = []
 
     def _handle(route: Route) -> None:
+        nonlocal latest_payload
         request = route.request
         parsed = urlparse(request.url)
-        if parsed.path != f"/v1/sessions/{session_id}" or request.method != "GET":
+        if parsed.path != f"/v1/sessions/{session_id}":
             route.continue_()
             return
 
-        response = route.fetch()
-        payload = response.json()
+        headers = {"content-type": "application/json"}
+        if request.method == "GET":
+            response = route.fetch()
+            payload = response.json()
+            headers = {**response.headers, **headers}
+        elif request.method == "PATCH":
+            request_body = json.loads(request.post_data or "{}")
+            patch_bodies.append(request_body)
+            payload = dict(latest_payload or {})
+            if "model_override" in request_body:
+                payload["model_override"] = request_body["model_override"]
+        else:
+            route.continue_()
+            return
+
         payload["labels"] = {
             **payload.get("labels", {}),
             "omnigent.wrapper": "opencode-native-ui",
         }
         payload["harness"] = "opencode"
         payload["llm_model"] = LAUNCH_MODEL
-        payload["model_override"] = LIVE_TUI_MODEL
+        payload.setdefault("model_override", LIVE_TUI_MODEL)
+        payload["model_options"] = [
+            {"id": LIVE_TUI_MODEL, "displayName": LIVE_TUI_MODEL},
+            {"id": ALTERNATE_MODEL, "displayName": ALTERNATE_MODEL},
+        ]
+        latest_payload = dict(payload)
         route.fulfill(
             status=200,
-            headers={**response.headers, "content-type": "application/json"},
+            headers=headers,
             body=json.dumps(payload),
         )
 
     page.route("**/v1/sessions/**", _handle)
+    return patch_bodies
 
 
-def test_opencode_native_pill_shows_live_tui_model(
+def test_opencode_native_model_command_opens_picker_and_persists_pick(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """The model pill surfaces opencode's mirrored ``model_override``.
+    """Bare ``/model`` opens the catalog and a pick persists its override.
 
-    Covers the PR's user-facing path: an opencode-native session shows its live
-    model (the override the forwarder mirrors from the TUI), not the stale
-    launch default, and the harness identity reads "OpenCode".
+    Covers the user-facing path required by the PR: bare ``/model`` opens the
+    server-backed catalog, and selecting a row PATCHes the same
+    ``model_override`` used by the native bridge.
 
     :param page: Playwright page fixture.
     :param seeded_session: ``(base_url, session_id)`` for a real server-backed
@@ -77,18 +99,38 @@ def test_opencode_native_pill_shows_live_tui_model(
     :returns: None.
     """
     base_url, session_id = seeded_session
-    _patch_session_as_opencode_native(page, session_id)
+    patch_bodies = _patch_session_as_opencode_native(page, session_id)
 
     page.goto(f"{base_url}/c/{session_id}")
 
-    # The pill mirrors the live TUI model (the override), NOT the launch default.
     trigger = page.get_by_test_id("agent-picker-trigger")
-    expect(trigger).to_contain_text(LIVE_TUI_MODEL, timeout=15_000)
-    expect(trigger).not_to_contain_text(LAUNCH_MODEL)
+    expect(trigger).to_be_visible(timeout=15_000)
 
     # opencode is identified as its own native wrapper in the status tray.
     expect(page.get_by_test_id("composer-harness")).to_contain_text("OpenCode")
 
-    # Display-only: opencode ships no switchable web model rows. (Switching
-    # stays in the opencode TUI; the web pill only reflects it.)
-    expect(page.locator('[data-testid="model-picker-item"]')).to_have_count(0)
+    # Bare /model opens the existing picker with the session-scoped catalog.
+    composer = page.get_by_placeholder("Ask the agent anything…")
+    composer.fill("/model ")
+    composer.press("Enter")
+
+    current_row = page.locator(
+        f'[data-testid="model-picker-item"][data-model-id="{LIVE_TUI_MODEL}"]'
+    )
+    alternate_row = page.locator(
+        f'[data-testid="model-picker-item"][data-model-id="{ALTERNATE_MODEL}"]'
+    )
+    expect(current_row).to_be_visible()
+    expect(alternate_row).to_be_visible()
+
+    with page.expect_response(
+        lambda response: (
+            response.request.method == "PATCH"
+            and urlparse(response.url).path == f"/v1/sessions/{session_id}"
+            and response.status == 200
+        )
+    ):
+        alternate_row.click()
+
+    assert patch_bodies[-1] == {"model_override": ALTERNATE_MODEL}
+    expect(trigger).to_contain_text(ALTERNATE_MODEL)

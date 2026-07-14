@@ -557,8 +557,17 @@ async def test_session_snapshot_includes_skills_from_runner(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("session_id", "wrapper_attr"),
+    [
+        ("conv_codex_options", "_CODEX_NATIVE_WRAPPER_LABEL_VALUE"),
+        ("conv_opencode_options", "_OPENCODE_NATIVE_WRAPPER_LABEL_VALUE"),
+    ],
+)
 async def test_session_snapshot_includes_model_options_from_runner(
     monkeypatch: pytest.MonkeyPatch,
+    session_id: str,
+    wrapper_attr: str,
 ) -> None:
     """
     Codex-native model and effort controls use Codex's live ``model/list``.
@@ -620,32 +629,32 @@ async def test_session_snapshot_includes_model_options_from_runner(
     monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
 
     conv = Conversation(
-        id="conv_codex_options",
+        id=session_id,
         created_at=1,
         updated_at=1,
-        root_conversation_id="conv_codex_options",
+        root_conversation_id=session_id,
         agent_id="ag_test",
         labels={
-            _mod._CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _mod._CODEX_NATIVE_WRAPPER_LABEL_VALUE,
+            _mod._CLAUDE_NATIVE_WRAPPER_LABEL_KEY: getattr(_mod, wrapper_attr),
         },
     )
     conv_store = _ConversationStore(
         [_message_item("item_1", "hi")],
-        conversations={"conv_codex_options": conv},
+        conversations={session_id: conv},
     )
 
     first = await _get_session_snapshot(
         conv_store,  # type: ignore[arg-type]
-        "conv_codex_options",
+        session_id,
     )
     assert first.model_options == []
-    await _drain_model_options("conv_codex_options")
+    await _drain_model_options(session_id)
     snapshot = await _get_session_snapshot(
         conv_store,  # type: ignore[arg-type]
-        "conv_codex_options",
+        session_id,
     )
 
-    assert "/v1/sessions/conv_codex_options/codex-model-options" in fake_client.get_calls
+    assert f"/v1/sessions/{session_id}/codex-model-options" in fake_client.get_calls
     assert [m["id"] for m in snapshot.model_options] == ["gpt-5.5"]
     assert snapshot.model_options[0]["displayName"] == "GPT-5.5"
     assert snapshot.model_options[0]["supportedReasoningEfforts"] == [
