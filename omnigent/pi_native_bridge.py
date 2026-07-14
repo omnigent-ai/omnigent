@@ -190,6 +190,33 @@ def enqueue_compact(bridge_dir: Path, custom_instructions: str | None = None) ->
     return compact_id
 
 
+def enqueue_model_change(bridge_dir: Path, model: str) -> str:
+    """
+    Queue a UI-originated model switch for the resident Pi extension.
+
+    Pi owns the active model inside the already-open TUI process, so a
+    web-picked model must be applied there rather than at the next spawn's
+    ``--model`` arg (which would only take effect on relaunch). Mirrors
+    :func:`enqueue_compact`: the extension consumes this inbox payload in the
+    Pi process, resolves *model* against ``ctx.modelRegistry`` and calls Pi's
+    ``setModel`` — taking effect immediately, no ``/reload`` required.
+
+    :param bridge_dir: Native Pi bridge directory.
+    :param model: Model id to switch to, e.g.
+        ``"databricks-claude-sonnet-4-6"``.
+    :returns: Opaque model-change id.
+    """
+    model_change_id = f"model_change_{uuid.uuid4().hex}"
+    payload = {
+        "id": model_change_id,
+        "type": "model_change",
+        "model": model,
+        "created_at": time.time(),
+    }
+    _enqueue_payload(bridge_dir, model_change_id, payload)
+    return model_change_id
+
+
 def _enqueue_payload(bridge_dir: Path, item_id: str, payload: dict[str, Any]) -> None:
     inbox = bridge_dir / _INBOX_DIR
     inbox.mkdir(mode=0o700, parents=True, exist_ok=True)

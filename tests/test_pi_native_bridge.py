@@ -93,6 +93,30 @@ def test_enqueue_compact_includes_custom_instructions(tmp_path: Path) -> None:
     assert with_instructions[0]["custom_instructions"] == "focus on the refactor"
 
 
+def test_enqueue_model_change_payload_shape(tmp_path: Path) -> None:
+    """A queued model change round-trips as well-formed JSON the extension reads.
+
+    The extension dispatches on ``payload.type == "model_change"`` and resolves
+    ``payload.model`` against ``ctx.modelRegistry`` before calling Pi's
+    ``setModel``. The id must equal the returned ``model_change_`` id (the
+    extension dedups on it).
+    """
+    bridge_dir = tmp_path / "bridge"
+    (bridge_dir / "inbox").mkdir(parents=True)
+
+    model_change_id = pi_native_bridge.enqueue_model_change(
+        bridge_dir, "databricks-claude-sonnet-4-6"
+    )
+
+    (path,) = list((bridge_dir / "inbox").glob("*.json"))
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["id"] == model_change_id
+    assert model_change_id.startswith("model_change_")
+    assert payload["type"] == "model_change"
+    assert payload["model"] == "databricks-claude-sonnet-4-6"
+    assert isinstance(payload["created_at"], (int, float))
+
+
 def test_enqueue_user_message_payload_shape(tmp_path: Path) -> None:
     """A queued user message round-trips as well-formed JSON the extension reads.
 
