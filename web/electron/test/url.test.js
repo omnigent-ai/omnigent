@@ -10,8 +10,10 @@ const {
   defaultSchemeFor,
   normalizeUrl,
   isPlainHttpRemote,
+  WORKSPACE_API_PATH,
   expandDatabricksWorkspaceUrl,
   WORKSPACE_UI_PATH,
+  canonicalizeDesktopServerUrl,
 } = require("../src/url");
 
 describe("defaultSchemeFor", () => {
@@ -106,6 +108,35 @@ describe("isPlainHttpRemote", () => {
   });
 });
 
+describe("canonicalizeDesktopServerUrl", () => {
+  it("maps the workspace API mount to the desktop UI mount", () => {
+    assert.equal(
+      canonicalizeDesktopServerUrl(`https://ws.cloud.databricks.com${WORKSPACE_API_PATH}`),
+      `https://ws.cloud.databricks.com${WORKSPACE_UI_PATH}`,
+    );
+  });
+
+  it("accepts a trailing slash and preserves the workspace selector", () => {
+    assert.equal(
+      canonicalizeDesktopServerUrl(
+        `https://ws.cloud.databricks.com${WORKSPACE_API_PATH}/?o=123#section`,
+      ),
+      `https://ws.cloud.databricks.com${WORKSPACE_UI_PATH}?o=123#section`,
+    );
+  });
+
+  it("leaves unrelated and nested API paths untouched", () => {
+    for (const url of [
+      "https://ws.cloud.databricks.com/omnigent",
+      `https://ws.cloud.databricks.com${WORKSPACE_API_PATH}/v1/me`,
+      "https://example.com/custom",
+      "not a url",
+    ]) {
+      assert.equal(canonicalizeDesktopServerUrl(url), url);
+    }
+  });
+});
+
 /**
  * Run `fn` with `globalThis.fetch` swapped for `stub` and `AbortSignal.timeout`
  * neutralized (no real timer), restoring both afterward.
@@ -129,6 +160,25 @@ function fakeResponse(serverHeader) {
 }
 
 describe("expandDatabricksWorkspaceUrl", () => {
+  it("maps a pasted workspace API URL without probing it", async () => {
+    let probed = false;
+    await withFetch(
+      async () => {
+        probed = true;
+        return fakeResponse("databricks");
+      },
+      async () => {
+        assert.equal(
+          await expandDatabricksWorkspaceUrl(
+            `https://ws.cloud.databricks.com${WORKSPACE_API_PATH}`,
+          ),
+          `https://ws.cloud.databricks.com${WORKSPACE_UI_PATH}`,
+        );
+      },
+    );
+    assert.equal(probed, false);
+  });
+
   it("expands a bare https Databricks workspace root to the UI mount", async () => {
     const calls = [];
     await withFetch(

@@ -327,3 +327,33 @@ describe("deep-link ingestion wiring (src/main.js)", () => {
     );
   });
 });
+
+describe("workspace API URL canonicalization wiring (src/main.js)", () => {
+  it("canonicalizes saved defaults and recents when settings load", () => {
+    assert.match(
+      liveCode,
+      /settings\.server_url\s*=\s*canonicalizeDesktopServerUrl\(settings\.server_url\)/,
+    );
+    assert.match(
+      liveCode,
+      /settings\.recent_servers[\s\S]{0,400}\.map\(canonicalizeDesktopServerUrl\)/,
+    );
+  });
+
+  it("canonicalizes selected and explicit window destinations before navigation", () => {
+    assert.match(
+      liveCode,
+      /const serverUrl\s*=\s*requestedServerUrl\s*\?\s*canonicalizeDesktopServerUrl\(requestedServerUrl\)\s*:\s*null/,
+    );
+    assert.match(
+      liveCode,
+      /explicit\s*\?\s*canonicalizeDesktopServerUrl\(explicit\)\s*:\s*null/,
+    );
+  });
+});
+
+describe("fallback JSON document theme wiring (src/main.js)", () => {
+  it("registers the light JSON theme on each shell window", () => {
+    assert.match(liveCode, /registerLightJsonDocumentTheme\(win\.webContents\)/);
+  });
+});

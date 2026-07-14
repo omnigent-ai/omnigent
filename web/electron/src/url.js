@@ -114,6 +114,34 @@
    */
   const WORKSPACE_UI_PATH = "/ml/omnigents";
 
+  /** Internal API mount used by workspace-hosted Omnigent servers. */
+  const WORKSPACE_API_PATH = "/api/2.0/omnigent";
+
+  /**
+   * Convert a workspace API base into the URL that serves the desktop SPA.
+   *
+   * The CLI connects to ``/api/2.0/omnigent``, so that URL is commonly copied
+   * into the desktop setup form. Loading it in Chromium renders the API's JSON
+   * response instead of Omnigent. Match only the exact, reserved API mount;
+   * arbitrary server paths remain untouched.
+   *
+   * @param {string} serverUrl A normalized server URL.
+   * @returns {string} The workspace UI URL, or the input unchanged.
+   */
+  function canonicalizeDesktopServerUrl(serverUrl) {
+    let url;
+    try {
+      url = new URL(serverUrl);
+    } catch {
+      return serverUrl;
+    }
+    if (url.pathname !== WORKSPACE_API_PATH && url.pathname !== `${WORKSPACE_API_PATH}/`) {
+      return serverUrl;
+    }
+    url.pathname = WORKSPACE_UI_PATH;
+    return url.toString();
+  }
+
   /**
    * Databricks Apps are served from ``*.databricksapps.com`` and answer with the
    * same ``server: databricks`` header as a workspace, but they are NOT
@@ -149,6 +177,9 @@
    *   else the input unchanged.
    */
   async function expandDatabricksWorkspaceUrl(normalized) {
+    const canonical = canonicalizeDesktopServerUrl(normalized);
+    if (canonical !== normalized) return canonical;
+
     let url;
     try {
       url = new URL(normalized);
@@ -190,8 +221,10 @@
     defaultSchemeFor,
     normalizeUrl,
     isPlainHttpRemote,
+    WORKSPACE_API_PATH,
     WORKSPACE_UI_PATH,
     WORKSPACE_PROBE_TIMEOUT_MS,
+    canonicalizeDesktopServerUrl,
     expandDatabricksWorkspaceUrl,
   };
 });

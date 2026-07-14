@@ -37,7 +37,12 @@ const path = require("node:path");
 const { pathToFileURL } = require("node:url");
 const { execFile } = require("node:child_process");
 const { registerLocalhostCors } = require("./localhost_cors");
-const { normalizeUrl, expandDatabricksWorkspaceUrl } = require("./url");
+const { registerLightJsonDocumentTheme } = require("./json-document-theme");
+const {
+  normalizeUrl,
+  canonicalizeDesktopServerUrl,
+  expandDatabricksWorkspaceUrl,
+} = require("./url");
 const { parseOmnigentDeepLink, chooseDeepLinkStrategy } = require("./deepLink");
 const { registerWorkspaceChromeHide } = require("./workspace-chrome");
 const { createBrowserViewRegistry } = require("./browserViewRegistry");
@@ -669,7 +674,22 @@ function settingsPath() {
 
 function loadSettings() {
   try {
-    return JSON.parse(fs.readFileSync(settingsPath(), "utf8"));
+    const settings = JSON.parse(fs.readFileSync(settingsPath(), "utf8"));
+    // The workspace API mount is a server address, not a browser destination.
+    // Canonicalize it for saved defaults, recents, and server switching.
+    if (typeof settings.server_url === "string") {
+      settings.server_url = canonicalizeDesktopServerUrl(settings.server_url);
+    }
+    if (Array.isArray(settings.recent_servers)) {
+      settings.recent_servers = [
+        ...new Set(
+          settings.recent_servers
+            .filter((url) => typeof url === "string")
+            .map(canonicalizeDesktopServerUrl),
+        ),
+      ];
+    }
+    return settings;
   } catch {
     // Missing/corrupt file → empty settings (first launch).
     return {};
@@ -1024,6 +1044,7 @@ function createWindow(targetUrl, opts = {}) {
       spellcheck: true,
     },
   });
+  registerLightJsonDocumentTheme(win.webContents);
   const explicit =
     typeof targetUrl === "string" && /^https?:\/\//i.test(targetUrl) ? targetUrl : undefined;
   const saved = loadSettings().server_url;
@@ -1033,10 +1054,13 @@ function createWindow(targetUrl, opts = {}) {
   // override (deep link); else the explicit target (New Window cloning a
   // sibling — preserves prior behavior); else the saved default for normal
   // windows; else null (ephemeral windows start on the setup page).
-  const serverUrl =
+  const requestedServerUrl =
     (typeof opts.serverUrl === "string" && opts.serverUrl.length > 0 ? opts.serverUrl : null) ??
     explicit ??
     (ephemeral ? null : typeof saved === "string" && saved.length > 0 ? saved : null);
+  const serverUrl = requestedServerUrl
+    ? canonicalizeDesktopServerUrl(requestedServerUrl)
+    : null;
   // loadUrl: what the webContents actually loads. A deep-link path resolves
   // under the server URL (mount-aware — see resolveServerPath); an explicit
   // target (New Window) loads that exact URL; otherwise load the server URL.
@@ -1044,7 +1068,7 @@ function createWindow(targetUrl, opts = {}) {
     (typeof opts.path === "string" && opts.path.length > 0 && serverUrl
       ? resolveServerPath(serverUrl, opts.path)
       : null) ??
-    explicit ??
+    (explicit ? canonicalizeDesktopServerUrl(explicit) : null) ??
     serverUrl;
   // A serverUrl that doesn't parse (hand-edited/corrupt settings.json) is
   // treated as "no server configured" rather than crashing window creation.
