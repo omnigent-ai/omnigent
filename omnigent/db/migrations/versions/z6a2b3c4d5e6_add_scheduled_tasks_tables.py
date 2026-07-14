@@ -39,8 +39,7 @@ def upgrade() -> None:
         "scheduled_tasks",
         sa.Column("workspace_id", sa.BigInteger(), nullable=False, server_default="0"),
         # Opaque PK, e.g. "st_<hex>". On migration from an external scheduler a FRESH id is minted
-        # here (not the source id); the original source schedule id is preserved
-        # in `metadata` (e.g. {"source_schedule_id": ...}) for traceability + idempotent re-runs.
+        # here (not the source id).
         sa.Column("id", sa.String(64), nullable=False),
         sa.Column("name", sa.String(256), nullable=False),
         # Opaque free text stored compressed (CompressedText → LargeBinary).
@@ -60,10 +59,6 @@ def upgrade() -> None:
         sa.Column("state", sa.SmallInteger(), nullable=False, server_default="1"),
         sa.Column("last_run_at", sa.Integer(), nullable=True),
         sa.Column("last_run_conversation_id", sa.String(64), nullable=True),
-        # Opaque JSON stored compressed (CompressedText → LargeBinary). No
-        # server_default: BLOB columns can't have one; NOT NULL is fine — the
-        # store always writes "{}" explicitly on insert.
-        sa.Column("metadata", sa.LargeBinary(), nullable=False),
         sa.Column("created_at", sa.Integer(), nullable=False),
         sa.Column("updated_at", sa.Integer(), nullable=True),
         sa.CheckConstraint("state IN (1, 2, 3)", name="ck_scheduled_tasks_state"),

@@ -66,7 +66,6 @@ def test_scheduled_tasks_columns(db_engine: Engine) -> None:
         "state",
         "last_run_at",
         "last_run_conversation_id",
-        "metadata",
         "created_at",
         "updated_at",
     }
@@ -141,17 +140,16 @@ def test_expected_indexes(db_engine: Engine) -> None:
 def test_state_default_on_omitted_insert(db_engine: Engine) -> None:
     """A raw insert omitting ``state`` / ``workspace_id`` picks up their defaults.
 
-    ``metadata`` is NOT NULL with no server_default (MySQL forbids a TEXT
-    default), so it must be supplied explicitly — only the integer server_defaults
-    (``state`` / ``workspace_id``) are exercised here.
+    Only the integer server_defaults (``state`` / ``workspace_id``) are exercised
+    here — both are omitted from the insert and must fall back to their defaults.
     """
     with db_engine.begin() as conn:
         conn.execute(
             sa.text(
                 "INSERT INTO scheduled_tasks "
                 "(id, name, prompt, cron_expression, owner_user_id, agent_id, "
-                " timezone, metadata, created_at) "
-                "VALUES ('st_def', 'n', 'p', '0 9 * * *', 'u', 'ag_1', 'UTC', '{}', 1)"
+                " timezone, created_at) "
+                "VALUES ('st_def', 'n', 'p', '0 9 * * *', 'u', 'ag_1', 'UTC', 1)"
             )
         )
         state, workspace_id = conn.execute(
@@ -168,8 +166,8 @@ def test_cron_expression_accepts_recurring_row(db_engine: Engine) -> None:
             sa.text(
                 "INSERT INTO scheduled_tasks "
                 "(id, name, prompt, cron_expression, owner_user_id, agent_id, "
-                " timezone, metadata, created_at) "
-                "VALUES ('st_cron', 'n', 'p', '0 9 * * *', 'u', 'ag', 'UTC', '{}', 1)"
+                " timezone, created_at) "
+                "VALUES ('st_cron', 'n', 'p', '0 9 * * *', 'u', 'ag', 'UTC', 1)"
             )
         )
 
@@ -182,8 +180,8 @@ def test_cron_expression_is_not_null(db_engine: Engine) -> None:
                 sa.text(
                     "INSERT INTO scheduled_tasks "
                     "(id, name, prompt, owner_user_id, agent_id, timezone, "
-                    " metadata, created_at) "
-                    "VALUES ('st_none', 'n', 'p', 'u', 'ag', 'UTC', '{}', 1)"
+                    " created_at) "
+                    "VALUES ('st_none', 'n', 'p', 'u', 'ag', 'UTC', 1)"
                 )
             )
 

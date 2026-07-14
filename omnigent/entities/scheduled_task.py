@@ -10,8 +10,7 @@ owns the JSON (de)serialization of the Text-backed columns.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import dataclass
 
 
 @dataclass
@@ -22,8 +21,7 @@ class ScheduledTask:
     A task's trigger is a required recurring ``cron_expression``.
 
     :param id: Opaque primary key, e.g. ``"st_a1b2c3..."``. On migration from
-        an external scheduler a fresh id is minted; the source scheduler's id is
-        preserved in metadata.
+        an external scheduler a fresh id is minted.
     :param name: Human-readable task name, e.g. ``"nightly triage"``.
     :param prompt: The instruction dispatched to the agent on each firing.
     :param cron_expression: The required cron string for the recurring trigger,
@@ -48,7 +46,6 @@ class ScheduledTask:
         ``None`` if it has never fired.
     :param last_run_conversation_id: Conversation created by the most recent
         firing, or ``None``.
-    :param metadata: Free-form metadata dict. Defaults to an empty dict.
     :param updated_at: Unix epoch seconds of the last write, or ``None`` if the
         row has never been updated.
     """
@@ -68,7 +65,6 @@ class ScheduledTask:
     state: str = "active"
     last_run_at: int | None = None
     last_run_conversation_id: str | None = None
-    metadata: dict[str, Any] = field(default_factory=dict)
     updated_at: int | None = None
 
 

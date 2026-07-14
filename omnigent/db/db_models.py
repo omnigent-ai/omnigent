@@ -1066,8 +1066,8 @@ class SqlScheduledTask(OmnigentBase):
     column mapping rather than a rewrite.
 
     :param id: Opaque PK, e.g. ``"st_a1b2c3..."``. On migration from an external
-        scheduler a fresh id is minted here; the source scheduler's id is kept in
-        metadata (not reused as the PK).
+        scheduler a fresh id is minted here (the source scheduler's id is not
+        reused as the PK).
     :param name: Human-readable task name, e.g. ``"nightly triage"``.
     :param prompt: The instruction dispatched to the agent on each firing.
     :param cron_expression: The required cron string for the recurring trigger,
@@ -1103,10 +1103,6 @@ class SqlScheduledTask(OmnigentBase):
         firing (relates to ``conversations.id``). ``None`` if never fired or the
         referenced conversation was deleted (application-owned SET-NULL cleanup;
         no DB foreign key).
-    :param scheduled_task_metadata: JSON-encoded free-form metadata object (also
-        holds provenance like ``source_schedule_id`` on migrated rows).
-        Mapped to the column named ``metadata`` (the bare ``metadata`` attribute
-        is reserved on the declarative base). Defaults to ``"{}"``.
     :param created_at: Unix epoch seconds at row creation.
     :param updated_at: Unix epoch seconds of the last write, or ``None`` if the
         row has never been updated.
@@ -1154,14 +1150,6 @@ class SqlScheduledTask(OmnigentBase):
     # Relates to conversations.id. No DB foreign key (Rule R032); the
     # application nulls this out when the referenced conversation is deleted.
     last_run_conversation_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    # Free-form JSON metadata. The Python attribute is ``scheduled_task_metadata``
-    # because ``metadata`` is reserved on DeclarativeBase; the column is
-    # ``metadata``. Stored as CompressedText (compressed BLOB/BYTEA); the store
-    # json.loads/dumps it.
-    # Opaque JSON, never SQL-queried — stored compressed (CompressedText).
-    # No server_default: BLOB columns can't have one; the store always writes
-    # "{}" explicitly on insert, so the app layer owns the default.
-    scheduled_task_metadata: Mapped[str] = mapped_column("metadata", CompressedText)
     created_at: Mapped[int] = mapped_column(Integer)
     updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
 

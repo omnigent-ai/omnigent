@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-import json
-from typing import Any
-
 from sqlalchemy import asc, desc, select
 
 from omnigent.db.db_models import (
@@ -50,7 +47,6 @@ def _to_entity(row: SqlScheduledTask) -> ScheduledTask:
         state=decode_scheduled_task_state(row.state),
         last_run_at=row.last_run_at,
         last_run_conversation_id=row.last_run_conversation_id,
-        metadata=json.loads(row.scheduled_task_metadata) if row.scheduled_task_metadata else {},
         updated_at=row.updated_at,
     )
 
@@ -114,7 +110,6 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         workspace: str | None = None,
         base_branch: str | None = None,
         state: str = "active",
-        metadata: dict[str, Any] | None = None,
     ) -> ScheduledTask:
         """Insert a new scheduled task with a required recurring ``cron_expression``."""
         row = SqlScheduledTask(
@@ -132,7 +127,6 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             state=encode_scheduled_task_state(state),
             last_run_at=None,
             last_run_conversation_id=None,
-            scheduled_task_metadata=json.dumps(metadata if metadata is not None else {}),
             created_at=now_epoch(),
             updated_at=None,
         )
@@ -185,7 +179,6 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         workspace: str | None = None,
         base_branch: str | None = None,
         state: str | None = None,
-        metadata: dict[str, Any] | None = None,
         last_run_at: int | None = None,
         last_run_conversation_id: str | None = None,
     ) -> ScheduledTask | None:
@@ -227,11 +220,6 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 encoded_state = encode_scheduled_task_state(state)
                 if row.state != encoded_state:
                     row.state = encoded_state
-                    changed = True
-            if metadata is not None:
-                encoded = json.dumps(metadata)
-                if row.scheduled_task_metadata != encoded:
-                    row.scheduled_task_metadata = encoded
                     changed = True
             if last_run_at is not None and row.last_run_at != last_run_at:
                 row.last_run_at = last_run_at

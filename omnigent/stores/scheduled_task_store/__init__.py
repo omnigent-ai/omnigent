@@ -9,7 +9,6 @@ rows yet — this is the persistence layer only.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any
 
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
 
@@ -50,7 +49,6 @@ class ScheduledTaskStore(ABC):
         workspace: str | None = None,
         base_branch: str | None = None,
         state: str = "active",
-        metadata: dict[str, Any] | None = None,
     ) -> ScheduledTask:
         """
         Insert a new scheduled task.
@@ -70,7 +68,6 @@ class ScheduledTaskStore(ABC):
         :param base_branch: Optional git base ref to branch from at fire time.
         :param state: Lifecycle state — ``active``/``paused``/``deleted``.
             Defaults to ``"active"``.
-        :param metadata: Optional free-form metadata dict.
         :returns: The newly created :class:`ScheduledTask`.
         :raises ValueError: If ``state`` is not a recognized value.
         """
@@ -120,7 +117,6 @@ class ScheduledTaskStore(ABC):
         workspace: str | None = None,
         base_branch: str | None = None,
         state: str | None = None,
-        metadata: dict[str, Any] | None = None,
         last_run_at: int | None = None,
         last_run_conversation_id: str | None = None,
     ) -> ScheduledTask | None:

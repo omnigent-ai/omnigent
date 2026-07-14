@@ -41,7 +41,6 @@ def test_create_returns_scheduled_task_with_all_fields(
         reasoning_effort="high",
         workspace="/home/alice/repo",
         base_branch="main",
-        metadata={"source": "ui"},
     )
     assert task.id == "st_1"
     assert task.name == "nightly triage"
@@ -54,7 +53,6 @@ def test_create_returns_scheduled_task_with_all_fields(
     assert task.reasoning_effort == "high"
     assert task.workspace == "/home/alice/repo"
     assert task.base_branch == "main"
-    assert task.metadata == {"source": "ui"}
     assert task.state == "active"
     assert task.last_run_at is None
     assert task.last_run_conversation_id is None
@@ -63,7 +61,7 @@ def test_create_returns_scheduled_task_with_all_fields(
 
 
 def test_create_minimal_defaults(store: SqlAlchemyScheduledTaskStore) -> None:
-    """Optional fields default sensibly (None overrides, empty metadata)."""
+    """Optional fields default sensibly (None overrides)."""
     task = store.create(
         scheduled_task_id="st_min",
         name="minimal",
@@ -77,7 +75,6 @@ def test_create_minimal_defaults(store: SqlAlchemyScheduledTaskStore) -> None:
     assert task.reasoning_effort is None
     assert task.workspace is None
     assert task.base_branch is None
-    assert task.metadata == {}
     assert task.state == "active"
 
 
@@ -263,7 +260,6 @@ def test_update_changes_fields_and_stamps_updated_at(store: SqlAlchemyScheduledT
         cron_expression="0 0 * * *",
         base_branch="develop",
         state="paused",
-        metadata={"k": "v"},
         last_run_at=1700000000,
         last_run_conversation_id="conv_x",
     )
@@ -272,7 +268,6 @@ def test_update_changes_fields_and_stamps_updated_at(store: SqlAlchemyScheduledT
     assert updated.cron_expression == "0 0 * * *"
     assert updated.base_branch == "develop"
     assert updated.state == "paused"
-    assert updated.metadata == {"k": "v"}
     assert updated.last_run_at == 1700000000
     assert updated.last_run_conversation_id == "conv_x"
     assert updated.updated_at is not None
