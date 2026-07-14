@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import pytest_asyncio
@@ -25,7 +27,12 @@ from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.server.host_registry import HostRegistry
-from omnigent.server.managed_hosts import parse_sandbox_config
+from omnigent.server.managed_hosts import (
+    ManagedHostLaunch,
+    ManagedLaunchTracker,
+    ManagedSandboxConfig,
+    parse_sandbox_config,
+)
 from omnigent.server.routes.host_tunnel import create_host_tunnel_router
 from omnigent.server.routes.hosts import create_hosts_router
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
@@ -738,9 +745,13 @@ async def test_managed_launch_progress_surfaces_on_snapshot_and_stream(
 
     env = managed_session_env
     monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 10)
-    # No real runner connects; settle the background task quickly.
+    # This test asserts the happy-path "ready" progress edge; fake the
+    # runner tunnel connect so settlement is driven by progress ordering,
+    # not by the runner WebSocket harness.
     monkeypatch.setattr(
-        "omnigent.server.routes.sessions._HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.2
+        env.app.state.tunnel_registry,
+        "wait_for_runner",
+        lambda _runner_id, *, timeout_s: asyncio.sleep(0, result=object()),
     )
     loop = asyncio.get_running_loop()
     gate = threading.Event()
@@ -920,8 +931,14 @@ async def test_message_relaunches_dead_managed_sandbox(
     """
     env = managed_session_env
     monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 10)
-    # No real runner connects in this harness; shrink both runner
-    # waits so the message POST and the background task settle fast.
+    # Let the initial create settle successfully; after that this test switches
+    # the relaunch generation back to a runner-connect timeout.
+    monkeypatch.setattr(
+        env.app.state.tunnel_registry,
+        "wait_for_runner",
+        lambda _runner_id, *, timeout_s: asyncio.sleep(0, result=object()),
+    )
+    # Shrink relaunch waits so the message POST and background task settle fast.
     monkeypatch.setattr(
         "omnigent.server.routes.sessions._HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.2
     )
@@ -963,6 +980,12 @@ async def test_message_relaunches_dead_managed_sandbox(
     while loop.time() < deadline and tracker.get(session_id) is not None:
         await asyncio.sleep(0.05)
     assert tracker.get(session_id) is None, "create launch never settled"
+
+    monkeypatch.setattr(
+        env.app.state.tunnel_registry,
+        "wait_for_runner",
+        lambda _runner_id, *, timeout_s: asyncio.sleep(0, result=None),
+    )
 
     # Kill generation 1: a clean tunnel close marks the host row
     # offline — the state a dead sandbox leaves. Wait until both the
@@ -1027,6 +1050,281 @@ async def test_message_relaunches_dead_managed_sandbox(
     # communicator) only after the assertions.
     second_tunnel = await host_futures[1]
     del first_tunnel, second_tunnel
+
+
+async def test_resumable_managed_wake_ignores_stale_db_liveness(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A paused Islo host wakes even while its DB liveness row is still fresh."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    host_store = HostStore(db_uri)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    host_store.register_managed_host(
+        host_id="host_stale_live_islo",
+        name="managed-stale-live-islo",
+        owner=RESERVED_USER_LOCAL,
+        token="tok-stale-live-islo",
+        provider="islo",
+        sandbox_id="sb-stale-live-islo",
+        token_expires_at=9_999_999_999,
+    )
+    host_store.upsert_on_connect(
+        host_id="host_stale_live_islo",
+        name="managed-stale-live-islo",
+        owner=RESERVED_USER_LOCAL,
+    )
+    conv = conv_store.create_conversation(
+        agent_id=None,
+        host_id="host_stale_live_islo",
+        workspace="/root/workspace",
+    )
+    fake = FakeSandboxLauncher(can_resume=True)
+    fake.provider = "islo"  # type: ignore[misc]
+    config = ManagedSandboxConfig(
+        server_url="https://managed-test.example.com",
+        launcher_factory=lambda: fake,
+        token_ttl_s=3600,
+        provider="islo",
+    )
+    tracker = ManagedLaunchTracker()
+    calls: list[str] = []
+
+    def _finish_wake(**kwargs: object) -> None:
+        del kwargs
+        calls.append("wake")
+        tracker.begin(conv.id)
+        tracker.finish(conv.id)
+
+    monkeypatch.setattr(sessions_module, "_kick_managed_wake", _finish_wake)
+    app_state = SimpleNamespace(
+        host_store=host_store,
+        sandbox_config=config,
+        managed_launches=tracker,
+        host_registry=SimpleNamespace(get=lambda _host_id: None),
+    )
+
+    assert host_store.is_online("host_stale_live_islo") is True
+    assert (
+        await sessions_module._maybe_relaunch_managed_sandbox(
+            session_id=conv.id,
+            conv=conv,
+            app_state=app_state,
+            conversation_store=conv_store,
+        )
+        is True
+    )
+    assert calls == ["wake"]
+
+
+async def test_resumable_managed_wake_drops_fresh_local_tunnels_when_provider_paused(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A paused Islo host can wake before local tunnel liveness notices."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    host_store = HostStore(db_uri)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    host_store.register_managed_host(
+        host_id="host_stale_tunnel_islo",
+        name="managed-stale-tunnel-islo",
+        owner=RESERVED_USER_LOCAL,
+        token="tok-stale-tunnel-islo",
+        provider="islo",
+        sandbox_id="sb-stale-tunnel-islo",
+        token_expires_at=9_999_999_999,
+    )
+    host_store.upsert_on_connect(
+        host_id="host_stale_tunnel_islo",
+        name="managed-stale-tunnel-islo",
+        owner=RESERVED_USER_LOCAL,
+    )
+    conv = conv_store.create_conversation(
+        agent_id=None,
+        host_id="host_stale_tunnel_islo",
+        workspace="/root/workspace",
+    )
+    conv_store.set_runner_id(conv.id, "runner_stale_tunnel")
+    conv = conv_store.get_conversation(conv.id)
+    assert conv is not None
+    assert host_store.is_online("host_stale_tunnel_islo") is True
+
+    fake = FakeSandboxLauncher(can_resume=True)
+    fake.provider = "islo"  # type: ignore[misc]
+    fake.is_running = lambda _sandbox_id: False  # type: ignore[method-assign]
+    config = ManagedSandboxConfig(
+        server_url="https://managed-test.example.com",
+        launcher_factory=lambda: fake,
+        token_ttl_s=3600,
+        provider="islo",
+    )
+    tracker = ManagedLaunchTracker()
+    calls: list[str] = []
+    host_deregistered: list[str] = []
+    runner_deregistered: list[str] = []
+    fresh_host_conn = SimpleNamespace(last_frame_at=time.time())
+    fresh_runner_session = object()
+    host_registry_state: dict[str, object | None] = {"conn": fresh_host_conn}
+
+    def _finish_wake(**kwargs: object) -> None:
+        del kwargs
+        calls.append("wake")
+        tracker.begin(conv.id)
+        tracker.finish(conv.id)
+
+    def _deregister_host(host_id: str) -> None:
+        host_deregistered.append(host_id)
+        host_registry_state["conn"] = None
+
+    monkeypatch.setattr(sessions_module, "_kick_managed_wake", _finish_wake)
+    app_state = SimpleNamespace(
+        host_store=host_store,
+        sandbox_config=config,
+        managed_launches=tracker,
+        host_registry=SimpleNamespace(
+            get=lambda _host_id: host_registry_state["conn"],
+            deregister=_deregister_host,
+        ),
+        tunnel_registry=SimpleNamespace(
+            get=lambda _runner_id: fresh_runner_session,
+            seconds_since_last_frame=lambda _session: 0.0,
+            deregister=lambda runner_id: runner_deregistered.append(runner_id),
+        ),
+    )
+
+    assert (
+        await sessions_module._maybe_wake_stale_resumable_managed_sandbox(
+            session_id=conv.id,
+            conv=conv,
+            app_state=app_state,
+            conversation_store=conv_store,
+        )
+        is True
+    )
+    assert calls == ["wake"]
+    assert host_deregistered == ["host_stale_tunnel_islo"]
+    assert runner_deregistered == ["runner_stale_tunnel"]
+
+
+async def test_managed_wake_fails_when_runner_never_reconnects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A wake cannot publish ready if the launched runner tunnel times out."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    session_id = "conv_wake_runner_timeout"
+    conv = SimpleNamespace(
+        id=session_id,
+        host_id="host_wake_runner_timeout",
+        workspace="/root/workspace",
+        agent_id=None,
+        sub_agent_name=None,
+    )
+    tracker = ManagedLaunchTracker()
+    tracker.begin(session_id)
+    stages: list[tuple[str, str | None]] = []
+
+    async def _resume_noop(*_args: object, **_kwargs: object) -> None:
+        pass
+
+    async def _launch_runner(*_args: object, **_kwargs: object) -> object:
+        return sessions_module._HostLaunchAttempt(runner_id="runner_never_connects")
+
+    class _HostRegistry:
+        def get(self, _host_id: str) -> object:
+            return object()
+
+    class _TunnelRegistry:
+        async def wait_for_runner(self, _runner_id: str, *, timeout_s: float) -> None:
+            del timeout_s
+
+    monkeypatch.setattr("omnigent.server.managed_hosts.resume_managed_host", _resume_noop)
+    monkeypatch.setattr(sessions_module, "_launch_runner_on_host", _launch_runner)
+    monkeypatch.setattr(
+        sessions_module,
+        "_publish_sandbox_status",
+        lambda _sid, stage, error=None: stages.append((stage, error)),
+    )
+
+    await sessions_module._run_managed_wake(
+        session_id=session_id,
+        conv=conv,  # type: ignore[arg-type]
+        sandbox_config=ManagedSandboxConfig(
+            server_url="https://managed-test.example.com",
+            launcher_factory=lambda: FakeSandboxLauncher(),
+            token_ttl_s=3600,
+        ),
+        tracker=tracker,
+        conversation_store=SimpleNamespace(get_conversation=lambda _sid: conv),
+        host_store=SimpleNamespace(),
+        host_registry=_HostRegistry(),  # type: ignore[arg-type]
+        tunnel_registry=_TunnelRegistry(),  # type: ignore[arg-type]
+    )
+
+    launch = tracker.get(session_id)
+    assert launch is not None
+    assert launch.settled.is_set()
+    assert launch.error == "managed runner did not connect after launch"
+    assert stages[-1] == ("failed", "managed runner did not connect after launch")
+
+
+async def test_managed_launch_fails_when_runner_never_connects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Initial managed launch settlement also depends on the runner tunnel."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    session_id = "conv_launch_runner_timeout"
+    conv = SimpleNamespace(id=session_id)
+    tracker = ManagedLaunchTracker()
+    tracker.begin(session_id)
+    stages: list[tuple[str, str | None]] = []
+
+    async def _launch_runner(*_args: object, **_kwargs: object) -> object:
+        return sessions_module._HostLaunchAttempt(runner_id="runner_never_connects")
+
+    class _HostRegistry:
+        def get(self, _host_id: str) -> object:
+            return object()
+
+    class _TunnelRegistry:
+        async def wait_for_runner(self, _runner_id: str, *, timeout_s: float) -> None:
+            del timeout_s
+
+    monkeypatch.setattr(sessions_module, "_launch_runner_on_host", _launch_runner)
+    monkeypatch.setattr(
+        sessions_module,
+        "_publish_sandbox_status",
+        lambda _sid, stage, error=None: stages.append((stage, error)),
+    )
+
+    await sessions_module._bind_and_launch_managed_runner(
+        session_id=session_id,
+        managed=ManagedHostLaunch(
+            host_id="host_launch_runner_timeout",
+            workspace="/root/workspace",
+        ),
+        sandbox_config=ManagedSandboxConfig(
+            server_url="https://managed-test.example.com",
+            launcher_factory=lambda: FakeSandboxLauncher(),
+            token_ttl_s=3600,
+        ),
+        tracker=tracker,
+        conversation_store=SimpleNamespace(
+            set_host_id=lambda _sid, _host_id, _workspace: conv,
+        ),
+        host_store=SimpleNamespace(),
+        host_registry=_HostRegistry(),  # type: ignore[arg-type]
+        tunnel_registry=_TunnelRegistry(),  # type: ignore[arg-type]
+    )
+
+    launch = tracker.get(session_id)
+    assert launch is not None
+    assert launch.settled.is_set()
+    assert launch.error == "managed runner did not connect after launch"
+    assert stages[-1] == ("failed", "managed runner did not connect after launch")
 
 
 async def test_cancel_managed_launch_tasks_returns_while_provision_parked(

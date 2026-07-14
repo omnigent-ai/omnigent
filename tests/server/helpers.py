@@ -201,6 +201,7 @@ class FakeSandboxLauncher(SandboxLauncher):
         self.vcpus: int | None = None
         self.memory_mb: int | None = None
         self.disk_gb: int | None = None
+        self.idle_pause_after_s: int | None = None
         self.cluster: str | None = None
         # Kubernetes ctor wiring (captured by install_fake_kubernetes_launcher).
         self.namespace: str | None = None
@@ -410,9 +411,9 @@ def install_fake_islo_launcher(
 
     The managed flow constructs ``IsloSandboxLauncher(image=…, env=…,
     base_url=…, gateway_profile=…, snapshot_name=…, workdir=…,
-    vcpus=…, memory_mb=…, disk_gb=…)``; the shim records those
-    constructor args on the fake and hands it back, so production code
-    runs unmodified against it.
+    vcpus=…, memory_mb=…, disk_gb=…, idle_pause_after_s=…)``; the shim
+    records those constructor args on the fake and hands it back, so
+    production code runs unmodified against it.
 
     :param monkeypatch: The test's ``pytest.MonkeyPatch``.
     :param fake: The fake launcher to substitute.
@@ -430,6 +431,7 @@ def install_fake_islo_launcher(
         vcpus: int | None = None,
         memory_mb: int | None = None,
         disk_gb: int | None = None,
+        idle_pause_after_s: int | None = None,
     ) -> FakeSandboxLauncher:
         """Stand-in constructor recording the construction wiring."""
         fake.image = image
@@ -441,6 +443,7 @@ def install_fake_islo_launcher(
         fake.vcpus = vcpus
         fake.memory_mb = memory_mb
         fake.disk_gb = disk_gb
+        fake.idle_pause_after_s = idle_pause_after_s
         return fake
 
     monkeypatch.setattr(islo_mod, "IsloSandboxLauncher", _ctor)

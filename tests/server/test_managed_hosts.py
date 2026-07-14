@@ -314,6 +314,7 @@ def test_parse_valid_islo_config_builds_parameterized_factory(
                 "vcpus": 4,
                 "memory_mb": 8192,
                 "disk_gb": 40,
+                "idle_pause_after_s": 1200,
             },
         }
     )
@@ -334,6 +335,7 @@ def test_parse_valid_islo_config_builds_parameterized_factory(
     assert fake.vcpus == 4
     assert fake.memory_mb == 8192
     assert fake.disk_gb == 40
+    assert fake.idle_pause_after_s == 1200
 
 
 def test_parse_islo_without_section_defaults(
@@ -358,6 +360,26 @@ def test_parse_islo_without_section_defaults(
     assert fake.vcpus is None
     assert fake.memory_mb is None
     assert fake.disk_gb is None
+    assert fake.idle_pause_after_s == 900
+
+
+def test_parse_islo_config_idle_pause_null_disables_lifecycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Explicit null opts out of Islo's default idle pause policy."""
+    cfg = parse_sandbox_config(
+        {
+            "provider": "islo",
+            "server_url": "https://s.example.com",
+            "islo": {"idle_pause_after_s": None},
+        }
+    )
+    assert cfg is not None
+    fake = FakeSandboxLauncher()
+    install_fake_islo_launcher(monkeypatch, fake)
+
+    assert cfg.launcher_factory() is fake
+    assert fake.idle_pause_after_s is None
 
 
 def test_parse_valid_e2b_config_builds_parameterized_factory(
@@ -722,6 +744,18 @@ def test_parse_kubernetes_invalid_block_fails_loud(
         (
             {"provider": "islo", "server_url": "https://s", "islo": {"memory_mb": "large"}},
             "sandbox.islo.memory_mb",
+        ),
+        (
+            {"provider": "islo", "server_url": "https://s", "islo": {"idle_pause_after_s": 0}},
+            "sandbox.islo.idle_pause_after_s",
+        ),
+        (
+            {
+                "provider": "islo",
+                "server_url": "https://s",
+                "islo": {"idle_pause_after_s": "900"},
+            },
+            "sandbox.islo.idle_pause_after_s",
         ),
         # openshell section present but malformed.
         (
@@ -1542,6 +1576,35 @@ async def test_resume_managed_host_wakes_same_sandbox_and_refreshes_token(db_uri
     assert host_store.resolve_launch_token(first_token) is None
     resolved = host_store.resolve_launch_token(second_token)
     assert resolved is not None and resolved.host_id == first.host_id
+
+
+async def test_resume_managed_host_force_wakes_fresh_online_row(db_uri: str) -> None:
+    """A local missing-tunnel wake can bypass stale cross-replica DB freshness."""
+    host_store = HostStore(db_uri)
+    host_store.register_managed_host(
+        host_id="host_resume_force",
+        name="managed-resume-force",
+        owner=_OWNER,
+        token="tok-resume-force",
+        provider="islo",
+        sandbox_id="sb-resume-force",
+        token_expires_at=now_epoch() + 3600,
+    )
+    host_store.upsert_on_connect(
+        host_id="host_resume_force",
+        name="managed-resume-force",
+        owner=_OWNER,
+    )
+    assert host_store.is_online("host_resume_force") is True
+    fake = _IsloFakeLauncher(can_resume=True)
+
+    await resume_managed_host("host_resume_force", host_store, _injected_config(fake), force=True)
+
+    assert fake.resumed == ["sb-resume-force"]
+    assert len(fake.host_starts) == 1
+    assert host_store.resolve_launch_token("tok-resume-force") is None
+    resolved = host_store.resolve_launch_token(fake.host_starts[0].token)
+    assert resolved is not None and resolved.host_id == "host_resume_force"
 
 
 async def test_resume_managed_host_noops_for_non_resumable_provider(db_uri: str) -> None:

@@ -167,6 +167,7 @@ from omnigent.server.managed_hosts import (
     ManagedSandboxConfig,
     RepoWorkspace,
     host_resume_supported,
+    host_sandbox_is_running,
 )
 from omnigent.server.mcp_pool import ServerMcpPool
 from omnigent.server.permissions import check_session_access
@@ -595,6 +596,7 @@ _NATIVE_TERMINAL_ENSURE_FAILED_CODE = "native_terminal_ensure_failed"
 _NATIVE_POLICY_NOT_ENFORCED_CODE = "native_policy_not_enforced"
 _HOST_BOUND_RUNNER_CONNECT_GRACE_S = 3.0
 _HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S = 30.0
+_MANAGED_RESUMABLE_TUNNEL_STALE_S = 30.0
 # How often the runner-connect wait re-checks the crash-report store while
 # racing the event-driven connect signal. Small enough that conviction is
 # detected within a fraction of a second of the daemon's report, without
@@ -6655,16 +6657,44 @@ async def _bind_and_launch_managed_runner(
                 return
             runner_id = launch_attempt.runner_id
     if runner_id is not None and tunnel_registry is not None:
-        # Wait for the runner tunnel before settling so a rendezvoused
-        # message POST resolves its runner client on the first try. A
-        # timeout still settles successfully — the host is bound, and
-        # post_event's normal host-relaunch path owns dead runners.
-        await tunnel_registry.wait_for_runner(
+        connected = await _wait_for_managed_runner_tunnel(
+            session_id,
             runner_id,
-            timeout_s=_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S,
+            tunnel_registry,
+            tracker,
         )
+        if not connected:
+            return
     tracker.finish(session_id)
     _publish_sandbox_status(session_id, "ready")
+
+
+async def _wait_for_managed_runner_tunnel(
+    session_id: str,
+    runner_id: str,
+    tunnel_registry: TunnelRegistry,
+    tracker: ManagedLaunchTracker,
+) -> bool:
+    """
+    Wait for a launched managed runner to connect, failing the launch on timeout.
+
+    :param session_id: Session/conversation identifier.
+    :param runner_id: Runner id returned by the host launch frame.
+    :param tunnel_registry: Runner tunnel registry to wait on.
+    :param tracker: Managed launch tracker to settle on failure.
+    :returns: ``True`` when the runner connected; ``False`` after publishing
+        and retaining a failed launch status.
+    """
+    runner = await tunnel_registry.wait_for_runner(
+        runner_id,
+        timeout_s=_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S,
+    )
+    if runner is not None:
+        return True
+    reason = "managed runner did not connect after launch"
+    tracker.fail(session_id, reason)
+    _publish_sandbox_status(session_id, "failed", reason)
+    return False
 
 
 async def _await_settled_managed_launch(launch: ManagedLaunch) -> None:
@@ -6748,14 +6778,17 @@ async def _maybe_relaunch_managed_sandbox(
     if host is None or host.sandbox_provider is None:
         return False
     if await asyncio.to_thread(host_store.is_online, conv.host_id):
-        # The host row still reads live (status online with a fresh
-        # heartbeat) — the missing tunnel is likely a transient blip
-        # on THIS replica and the host will reconnect on its own
-        # backoff. Replacing the sandbox now would destroy a healthy
-        # workspace; let the message fail unavailable instead. A dead
-        # sandbox goes stale within the host liveness TTL, after which
-        # the next message lands here and relaunches.
-        return False
+        host_registry = getattr(app_state, "host_registry", None)
+        host_conn = host_registry.get(conv.host_id) if host_registry is not None else None
+        if not (host_resume_supported(host, sandbox_config) and host_conn is None):
+            # The host row still reads live (status online with a fresh
+            # heartbeat). For non-resumable providers or a live local tunnel,
+            # avoid replacing a healthy workspace and let normal unavailable
+            # handling surface the transient. Resumable managed hosts are the
+            # exception: an idle-paused VM can leave a fresh DB row while this
+            # process has no usable tunnel, so the first post-idle message must
+            # attempt a wake immediately.
+            return False
     launch = tracker.get(session_id)
     if launch is None or launch.settled.is_set():
         # A resumable managed host whose sandbox merely idle-stopped is WOKEN
@@ -6789,6 +6822,90 @@ async def _maybe_relaunch_managed_sandbox(
     if launch is not None:
         await _await_settled_managed_launch(launch)
     return True
+
+
+async def _maybe_wake_stale_resumable_managed_sandbox(
+    *,
+    session_id: str,
+    conv: Conversation,
+    app_state: Any,
+    conversation_store: ConversationStore,
+) -> bool:
+    """
+    Wake a resumable managed host whose persisted liveness has gone stale.
+
+    Islo idle pause is memory-preserving: the local host/runner WebSocket
+    objects can remain registered until their ping loops time out, even though
+    the VM is already paused and cannot answer new requests. When the durable
+    host-store liveness row is stale, trust it over those in-memory objects,
+    drop the stale entries, and route through the normal managed wake path.
+
+    :param session_id: Session/conversation identifier.
+    :param conv: Current conversation row.
+    :param app_state: ``request.app.state`` — supplies stores and registries.
+    :param conversation_store: Store holding the session row.
+    :returns: ``True`` when a managed wake ran and settled.
+    """
+    host_store = getattr(app_state, "host_store", None)
+    sandbox_config = getattr(app_state, "sandbox_config", None)
+    if host_store is None or sandbox_config is None or conv.host_id is None:
+        return False
+
+    host = await asyncio.to_thread(host_store.get_host, conv.host_id)
+    if host is None or not host_resume_supported(host, sandbox_config):
+        return False
+    host_registry = getattr(app_state, "host_registry", None)
+    tunnel_registry = getattr(app_state, "tunnel_registry", None)
+    host_conn = host_registry.get(conv.host_id) if host_registry is not None else None
+    host_tunnel_stale = (
+        host_conn is not None
+        and time.time() - host_conn.last_frame_at >= _MANAGED_RESUMABLE_TUNNEL_STALE_S
+    )
+    runner_session = (
+        tunnel_registry.get(conv.runner_id)
+        if tunnel_registry is not None and conv.runner_id is not None
+        else None
+    )
+    runner_tunnel_stale = False
+    if runner_session is not None and hasattr(tunnel_registry, "seconds_since_last_frame"):
+        runner_idle_s = tunnel_registry.seconds_since_last_frame(runner_session)
+        runner_tunnel_stale = (
+            runner_idle_s is not None and runner_idle_s >= _MANAGED_RESUMABLE_TUNNEL_STALE_S
+        )
+
+    host_row_online = await asyncio.to_thread(host_store.is_online, conv.host_id)
+    sandbox_running = await asyncio.to_thread(host_sandbox_is_running, host, sandbox_config)
+    if (
+        sandbox_running is not False
+        and host_row_online
+        and host_conn is not None
+        and not host_tunnel_stale
+        and not runner_tunnel_stale
+    ):
+        return False
+
+    if host_registry is not None:
+        host_registry.deregister(conv.host_id)
+    if tunnel_registry is not None and conv.runner_id is not None:
+        tunnel_registry.deregister(conv.runner_id)
+
+    _logger.info(
+        "Managed host %s for session %s needs wake before reusing tunnels "
+        "(host_row_online=%s, sandbox_running=%s, host_tunnel_stale=%s, "
+        "runner_tunnel_stale=%s)",
+        conv.host_id,
+        session_id,
+        host_row_online,
+        sandbox_running,
+        host_tunnel_stale,
+        runner_tunnel_stale,
+    )
+    return await _maybe_relaunch_managed_sandbox(
+        session_id=session_id,
+        conv=conv,
+        app_state=app_state,
+        conversation_store=conversation_store,
+    )
 
 
 def _kick_managed_relaunch(
@@ -6964,7 +7081,7 @@ async def _run_managed_wake(
     try:
         # Wake the same sandbox in place; resume_managed_host is single-flight
         # per host and a no-op if it's already online.
-        await resume_managed_host(conv.host_id, host_store, sandbox_config)
+        await resume_managed_host(conv.host_id, host_store, sandbox_config, force=True)
         _publish_sandbox_status(session_id, "connecting")
         refreshed = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if refreshed is None:
@@ -7002,14 +7119,14 @@ async def _run_managed_wake(
                 return
             runner_id = launch_attempt.runner_id
         if runner_id is not None and tunnel_registry is not None:
-            # Wait for the runner tunnel before settling so a rendezvoused
-            # message resolves its runner client on the first try (the
-            # post-settle session-init handshake then attaches the forwarder
-            # before the message is forwarded).
-            await tunnel_registry.wait_for_runner(
+            connected = await _wait_for_managed_runner_tunnel(
+                session_id,
                 runner_id,
-                timeout_s=_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S,
+                tunnel_registry,
+                tracker,
             )
+            if not connected:
+                return
         tracker.finish(session_id)
         _publish_sandbox_status(session_id, "ready")
     except HTTPException as exc:
@@ -19836,7 +19953,31 @@ def create_sessions_router(
                     code=ErrorCode.RUNNER_UNAVAILABLE,
                 ) from exc
             return {"queued": True, "item_id": body.data["call_id"]}
+        # Whether the runner was initially unavailable or was woken below. In
+        # that case the session-init handshake may still be racing the first
+        # message, even if we reused the original binding instead of launching
+        # a replacement.
+        _runner_needs_session_init = False
         # Item event (message, function_call_output, etc.).
+        if conv.host_id is not None and await _maybe_wake_stale_resumable_managed_sandbox(
+            session_id=session_id,
+            conv=conv,
+            app_state=request.app.state,
+            conversation_store=conversation_store,
+        ):
+            # A resumable managed wake may have re-launched the runner and
+            # updated liveness while this handler was holding an old row.
+            conv_after_wake = await asyncio.to_thread(
+                conversation_store.get_conversation,
+                session_id,
+            )
+            if conv_after_wake is None:
+                raise OmnigentError(
+                    "Session not found",
+                    code=ErrorCode.NOT_FOUND,
+                )
+            conv = conv_after_wake
+            _runner_needs_session_init = True
         runner_client = await _get_runner_client(session_id, runner_router)
         # Managed-launch rendezvous: a ``host_type="managed"`` create
         # returns before the sandbox exists, so the first message (the
@@ -19863,11 +20004,6 @@ def create_sessions_router(
                         code=ErrorCode.NOT_FOUND,
                     )
                 runner_client = await _get_runner_client(session_id, runner_router)
-        # Whether the runner was initially unavailable but became routable
-        # below. In that case the session-init handshake may still be
-        # racing the first message, even if we reused the original binding
-        # instead of launching a replacement.
-        _runner_needs_session_init = False
         if runner_client is None and conv.host_id is not None:
             _tunnel_registry = getattr(request.app.state, "tunnel_registry", None)
             # A just-created host session already has a runner_id before

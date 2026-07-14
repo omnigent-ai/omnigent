@@ -327,7 +327,8 @@ class _FakeIsloAPI:
         if self.exec_error is not None:
             raise self.exec_error
         self.exec_calls.append(_ExecCall(sandbox_id=name, command=command))
-        return (self.exec_returncode, "out\n", "err\n")
+        stdout = "/root\n" if 'printf %s "$HOME"' in command[-1] else "out\n"
+        return (self.exec_returncode, stdout, "err\n")
 
     def exec_stream(
         self,
@@ -431,6 +432,7 @@ def test_provision_builds_islo_create_payload(monkeypatch: pytest.MonkeyPatch) -
         vcpus=4,
         memory_mb=8192,
         disk_gb=40,
+        idle_pause_after_s=1200,
     )
     monkeypatch.setattr(launcher, "_islo", lambda: fake)
 
@@ -449,6 +451,7 @@ def test_provision_builds_islo_create_payload(monkeypatch: pytest.MonkeyPatch) -
             "gateway_profile": "default",
             "snapshot_name": "warm-host",
             "disk_gb": 40,
+            "lifecycle": {"pause_after_idle": 1200, "auto_resume": "never"},
         }
     ]
 
@@ -482,7 +485,21 @@ def test_provision_uses_image_and_env_var_fallbacks(monkeypatch: pytest.MonkeyPa
 
     [payload2] = fake2.create_payloads
     assert payload2["image"] == DEFAULT_HOST_IMAGE
+    assert payload2["lifecycle"] == {"pause_after_idle": 900, "auto_resume": "never"}
     assert "env" not in payload2
+
+
+def test_provision_can_disable_idle_pause_lifecycle(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``None`` leaves lifecycle policy to the operator."""
+    monkeypatch.setattr(islo_mod, "_new_sandbox_name", lambda label: "omnigent-manual")
+    fake = _FakeIsloAPI()
+    launcher = IsloSandboxLauncher(idle_pause_after_s=None)
+    monkeypatch.setattr(launcher, "_islo", lambda: fake)
+
+    launcher.provision("manual")
+
+    [payload] = fake.create_payloads
+    assert "lifecycle" not in payload
 
 
 def test_provision_env_passthrough_missing_var_fails_loud(
@@ -606,6 +623,28 @@ def test_resume_sdk_failure_maps_to_click_exception(monkeypatch: pytest.MonkeyPa
 
     with pytest.raises(click.ClickException, match="Could not resume"):
         launcher.resume("sb-1")
+
+
+def test_start_host_stops_preserved_daemon_before_launch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Islo resume restarts the host daemon with the newly armed token."""
+    fake = _FakeIsloAPI()
+    launcher = IsloSandboxLauncher()
+    monkeypatch.setattr(launcher, "_islo", lambda: fake)
+
+    workspace = launcher.start_host(
+        "sb-1",
+        token="tok-new",
+        host_id="host_1",
+        host_name="managed-1",
+        server_url="https://omnigent.example.com",
+    )
+
+    assert workspace == "/root/workspace"
+    commands = [call.command[-1] for call in fake.exec_calls]
+    cleanup_index = next(i for i, cmd in enumerate(commands) if "preserved omnigent host" in cmd)
+    launch_index = next(i for i, cmd in enumerate(commands) if "OMNIGENT_HOST_TOKEN" in cmd)
+    assert cleanup_index < launch_index
+    assert "tok-new" in commands[launch_index]
 
 
 def test_terminate_deletes_sandbox_and_closes_client(monkeypatch: pytest.MonkeyPatch) -> None:

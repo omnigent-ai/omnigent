@@ -64,6 +64,7 @@ into created Islo sandboxes."""
 _DEFAULT_BASE_URL = "https://api.islo.dev"
 _SANDBOX_CPU = 2
 _SANDBOX_MEMORY_MB = 4096
+DEFAULT_IDLE_PAUSE_AFTER_S = 15 * 60
 _REQUEST_TIMEOUT_S = 30.0
 _STREAM_TIMEOUT_S = None
 _RUNNING_STATUSES = frozenset({"running", "ready"})
@@ -93,6 +94,56 @@ except (FileNotFoundError, ValueError):
 if isinstance(settings, dict) and settings.pop("apiKeyHelper", None) is not None:
     with open(path, "w") as handle:
         json.dump(settings, handle, indent=2)
+"""
+
+_STOP_PRESERVED_HOST_DAEMON_SCRIPT = """\
+import os, signal, subprocess, time
+
+self_pids = {os.getpid(), os.getppid()}
+try:
+    output = subprocess.check_output(["ps", "-eo", "pid=,args="], text=True)
+except Exception as exc:
+    print(f"could not inspect process table: {exc}")
+    raise SystemExit(0)
+
+targets = []
+for line in output.splitlines():
+    parts = line.strip().split(None, 1)
+    if len(parts) != 2:
+        continue
+    try:
+        pid = int(parts[0])
+    except ValueError:
+        continue
+    args = parts[1]
+    if pid in self_pids:
+        continue
+    if "omnigent host" in args:
+        targets.append(pid)
+
+for pid in targets:
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    except PermissionError as exc:
+        print(f"could not terminate preserved omnigent host pid {pid}: {exc}")
+
+time.sleep(0.5)
+for pid in targets:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        continue
+    except PermissionError:
+        continue
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+if targets:
+    print(f"stopped preserved omnigent host daemon(s): {', '.join(map(str, targets))}")
 """
 
 
@@ -369,6 +420,7 @@ class IsloSandboxLauncher(SandboxLauncher):
         vcpus: int | None = None,
         memory_mb: int | None = None,
         disk_gb: int | None = None,
+        idle_pause_after_s: int | None = DEFAULT_IDLE_PAUSE_AFTER_S,
     ) -> None:
         self._image_ref = image
         self._env_names = tuple(env) if env is not None else None
@@ -379,6 +431,7 @@ class IsloSandboxLauncher(SandboxLauncher):
         self._vcpus = vcpus
         self._memory_mb = memory_mb
         self._disk_gb = disk_gb
+        self._idle_pause_after_s = idle_pause_after_s
         self._client: _IsloClient | None = None
 
     def prepare(self) -> None:
@@ -412,6 +465,11 @@ class IsloSandboxLauncher(SandboxLauncher):
             payload["snapshot_name"] = self._snapshot_name
         if self._disk_gb is not None:
             payload["disk_gb"] = self._disk_gb
+        if self._idle_pause_after_s is not None:
+            payload["lifecycle"] = {
+                "pause_after_idle": self._idle_pause_after_s,
+                "auto_resume": "never",
+            }
         click.echo(f"▸ Creating Islo sandbox '{sandbox_name}' from {resolved_ref}")
         try:
             sandbox = self._islo().create_sandbox(payload)
@@ -455,6 +513,50 @@ class IsloSandboxLauncher(SandboxLauncher):
         except click.ClickException as exc:
             click.echo(f"  → warning: could not clear seeded apiKeyHelper: {exc}", err=True)
 
+    def start_host(
+        self,
+        sandbox_id: str,
+        *,
+        token: str,
+        host_id: str,
+        host_name: str,
+        server_url: str,
+        repo_url: str | None = None,
+        repo_branch: str | None = None,
+        repo_name: str | None = None,
+        on_stage: Callable[[str], None] | None = None,
+    ) -> str:
+        """Stop any memory-preserved host daemon, then start with a fresh token."""
+        self._stop_preserved_host_daemon(sandbox_id)
+        return super().start_host(
+            sandbox_id,
+            token=token,
+            host_id=host_id,
+            host_name=host_name,
+            server_url=server_url,
+            repo_url=repo_url,
+            repo_branch=repo_branch,
+            repo_name=repo_name,
+            on_stage=on_stage,
+        )
+
+    def _stop_preserved_host_daemon(self, sandbox_id: str) -> None:
+        """
+        Best-effort cleanup for Islo's memory-preserving pause/resume.
+
+        A paused VM can resume with the old ``omnigent host`` process still
+        alive and carrying a stale launch token. Stop it before the shared
+        startup path launches a fresh daemon.
+        """
+        try:
+            self.run(
+                sandbox_id,
+                f"python3 -c {shlex.quote(_STOP_PRESERVED_HOST_DAEMON_SCRIPT)}",
+                check=False,
+            )
+        except click.ClickException as exc:
+            click.echo(f"  → warning: could not stop preserved omnigent host: {exc}", err=True)
+
     def attach(self, sandbox_id: str) -> None:
         """Validate access to an existing Islo sandbox."""
         click.echo(f"▸ Reusing existing Islo sandbox '{sandbox_id}'")
@@ -495,6 +597,21 @@ class IsloSandboxLauncher(SandboxLauncher):
             f"Islo sandbox '{sandbox_id}' is in unknown state {status!r}; "
             "it cannot be safely resumed in place."
         )
+
+    def is_running(self, sandbox_id: str) -> bool | None:
+        """Return whether Islo currently reports the sandbox as running."""
+        try:
+            sandbox = self._islo().get_sandbox(sandbox_id)
+        except _IsloAPIError as exc:
+            raise click.ClickException(
+                f"Could not inspect Islo sandbox '{sandbox_id}': {exc}"
+            ) from exc
+        status = str(sandbox.get("status") or "").lower()
+        if status in _RUNNING_STATUSES:
+            return True
+        if status in _RESUMABLE_STATUSES or status in _NON_RESUMABLE_STATUSES:
+            return False
+        return None
 
     def keep_alive(self, sandbox_id: str) -> None:
         """No local keep-alive setting is exposed by the Islo API."""

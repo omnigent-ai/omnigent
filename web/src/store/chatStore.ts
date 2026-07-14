@@ -1342,7 +1342,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
             // instead of being left on a silent, empty composer.
             set((s) => ({ blocks: [...s.blocks, makeClientErrorBlock(message, code)] }));
           }
-          set({ status: "idle" });
+          set({ status: "idle", sessionStatus: "idle", backgroundTaskCount: 0 });
         }
       }
     } finally {
