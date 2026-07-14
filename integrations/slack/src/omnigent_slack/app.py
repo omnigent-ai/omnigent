@@ -61,9 +61,7 @@ async def run() -> None:
             f"No Omnigent agent named {settings.omnigent_agent_name!r} was found. "
             f"Available agents: {available}"
         )
-    logger.info(
-        "Resolved Omnigent agent name=%s to id=%s", settings.omnigent_agent_name, agent_id
-    )
+    logger.info("Resolved Omnigent agent name=%s to id=%s", settings.omnigent_agent_name, agent_id)
 
     service = SlackOmnigentService(
         store=store,

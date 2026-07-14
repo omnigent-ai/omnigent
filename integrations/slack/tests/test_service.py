@@ -277,9 +277,7 @@ async def test_turn_error_posts_separate_reply_and_keeps_answer(tmp_path: Path) 
     slack = FakeSlackClient()
 
     class ErroringAfterAnswerClient(FakeOmnigentClient):
-        async def run_turn(
-            self, session_id: str, text: str
-        ) -> AsyncIterator[dict[str, Any]]:
+        async def run_turn(self, session_id: str, text: str) -> AsyncIterator[dict[str, Any]]:
             self.turns.append((session_id, text))
             yield {
                 "type": "response.output_item.done",
@@ -330,9 +328,7 @@ async def test_turn_error_without_answer_uses_placeholder(tmp_path: Path) -> Non
     slack = FakeSlackClient()
 
     class ErroringNoAnswerClient(FakeOmnigentClient):
-        async def run_turn(
-            self, session_id: str, text: str
-        ) -> AsyncIterator[dict[str, Any]]:
+        async def run_turn(self, session_id: str, text: str) -> AsyncIterator[dict[str, Any]]:
             self.turns.append((session_id, text))
             yield {
                 "type": "response.failed",

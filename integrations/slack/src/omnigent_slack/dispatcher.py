@@ -67,6 +67,4 @@ class ThreadTurnDispatcher:
                         # before this teardown reacquired the lock. The queue
                         # stays registered, so no future enqueue would spawn a
                         # worker — re-arm one here to keep draining it.
-                        self._tasks[key] = asyncio.create_task(
-                            self._run_queue(key, queue)
-                        )
+                        self._tasks[key] = asyncio.create_task(self._run_queue(key, queue))
