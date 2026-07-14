@@ -1121,3 +1121,120 @@ async def test_orphan_sweep_escalates_to_sigkill(
 
     assert calls == 2
     assert killed == [(12345, signal.SIGTERM), (12345, signal.SIGKILL)]
+
+
+# ── Mid-spawn cancellation ──────────────────────────────────────
+
+
+async def test_mid_spawn_cancellation_reaps_subprocess(
+    manager: HarnessProcessManager,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Cancelling ``get_client`` while the spawn is still waiting for
+    the runner to bind must kill the just-spawned subprocess.
+
+    The subprocess exists from ``create_subprocess_exec`` onward but
+    is only registered in ``_entries`` after ``_spawn_entry``
+    returns; a cancellation landing inside ``_wait_for_bind`` used
+    to leak it — unregistered, so ``release()`` no-ops and the idle
+    reaper never sees it.
+    """
+    from omnigent.runtime.harnesses import process_manager as pm_mod
+
+    await manager.start()
+    try:
+        spawned: list[asyncio.subprocess.Process] = []
+        real_exec = asyncio.create_subprocess_exec
+
+        async def capturing_exec(*args: object, **kwargs: object) -> asyncio.subprocess.Process:
+            process = await real_exec(*args, **kwargs)  # type: ignore[arg-type]
+            spawned.append(process)
+            return process
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", capturing_exec)
+
+        in_bind = asyncio.Event()
+
+        async def hanging_bind(*args: object, **kwargs: object) -> None:
+            in_bind.set()
+            await asyncio.sleep(3600)
+
+        monkeypatch.setattr(pm_mod, "_wait_for_bind", hanging_bind)
+
+        task = asyncio.create_task(manager.get_client("conv_leak", "test"))
+        await asyncio.wait_for(in_bind.wait(), timeout=10.0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert spawned, "spawn was never reached"
+        process = spawned[0]
+        try:
+            await asyncio.wait_for(process.wait(), timeout=5.0)
+        finally:
+            # Never leak the subprocess out of the test, even when
+            # the assertion below is about to fail on main.
+            if process.returncode is None:
+                process.kill()
+                await process.wait()
+        assert process.returncode is not None
+        assert not manager.has_session("conv_leak")
+    finally:
+        await manager.shutdown()
+
+
+async def test_mid_spawn_double_cancellation_still_reaps(
+    manager: HarnessProcessManager,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A second cancellation arriving while the first one's cleanup is
+    reaping the subprocess must not abort the reap: the corpse-wait
+    is shielded, so the process is still collected and the task
+    still ends cancelled.
+    """
+    from omnigent.runtime.harnesses import process_manager as pm_mod
+
+    await manager.start()
+    try:
+        spawned: list[asyncio.subprocess.Process] = []
+        real_exec = asyncio.create_subprocess_exec
+
+        async def capturing_exec(*args: object, **kwargs: object) -> asyncio.subprocess.Process:
+            process = await real_exec(*args, **kwargs)  # type: ignore[arg-type]
+            spawned.append(process)
+            return process
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", capturing_exec)
+
+        in_bind = asyncio.Event()
+
+        async def hanging_bind(*args: object, **kwargs: object) -> None:
+            in_bind.set()
+            await asyncio.sleep(3600)
+
+        monkeypatch.setattr(pm_mod, "_wait_for_bind", hanging_bind)
+
+        task = asyncio.create_task(manager.get_client("conv_leak2", "test"))
+        await asyncio.wait_for(in_bind.wait(), timeout=10.0)
+        task.cancel()
+        # Let the first cancellation reach the cleanup path, then
+        # cancel again so the second one lands on its awaits.
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert spawned, "spawn was never reached"
+        process = spawned[0]
+        try:
+            await asyncio.wait_for(process.wait(), timeout=5.0)
+        finally:
+            if process.returncode is None:
+                process.kill()
+                await process.wait()
+        assert process.returncode is not None
+        assert not manager.has_session("conv_leak2")
+    finally:
+        await manager.shutdown()

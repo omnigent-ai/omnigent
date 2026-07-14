@@ -28,6 +28,22 @@
 export type SidebarDragPhase = "begin" | "move" | "open" | "close";
 
 /**
+ * Extra hints for the badge on shells that render it as a tappable OS
+ * notification. Android has no numeric icon badge, so the count is surfaced as
+ * a notification — without these it's a dead, generic "N pending" toast. They
+ * let that notification open a target and carry descriptive text. Ignored by
+ * shells with a real icon badge (Electron dock, iOS app icon).
+ */
+export interface BadgeActivation {
+  /** In-app path to open when the badge notification is tapped, e.g. "/inbox". */
+  navigatePath?: string;
+  /** Notification title; falls back to the app name when absent. */
+  title?: string;
+  /** Notification body; falls back to a generic "N pending" when absent. */
+  body?: string;
+}
+
+/**
  * Minimal API surface exposed by native shells. Electron exposes the legacy
  * `window.omnigentDesktop`; newer shells expose `window.omnigentNative`.
  * Kept intentionally tiny and string/number only so it survives bridge
@@ -36,8 +52,13 @@ export type SidebarDragPhase = "begin" | "move" | "open" | "close";
 interface NativeShellApi {
   /** Discriminator so feature detection is unambiguous. */
   kind: "electron" | "ios" | "android";
-  /** Paint the dock/taskbar badge; 0 clears it. */
-  setBadgeCount: (count: number) => void;
+  /**
+   * Paint the dock/taskbar badge; 0 clears it. `activation` is consumed only by
+   * the Android shell, which renders the badge as a tray notification and needs
+   * a tap target + descriptive text; Electron/iOS paint a real icon badge and
+   * ignore it.
+   */
+  setBadgeCount: (count: number, activation?: BadgeActivation) => void;
   /** Fire an OS notification; resolves true when it was shown. */
   notify: (params: NativeNotifyParams) => Promise<boolean>;
   // Optional: a shell older than this SPA may lack notification-click routing,
@@ -345,12 +366,20 @@ export function onNativeSidebarDrag(
  * No-op outside the Electron shell. The Electron main process calls
  * `app.setBadgeCount`, which on Windows is unsupported at the app level — we
  * intentionally don't paper over that.
+ *
+ * `activation` is only meaningful on the Android shell, where the badge is a
+ * tray notification: it makes that notification open a target and show
+ * descriptive text. Electron/iOS have a real icon badge and ignore it.
  */
-export async function setBadgeCount(count: number): Promise<void> {
+export async function setBadgeCount(count: number, activation?: BadgeActivation): Promise<void> {
   const native = nativeApi();
   if (!native) return;
   try {
-    native.setBadgeCount(count);
+    // Forward `activation` only when present so shells (and tests) that expect
+    // the single-arg call keep matching; Android reads it to make the badge
+    // notification actionable + descriptive.
+    if (activation) native.setBadgeCount(count, activation);
+    else native.setBadgeCount(count);
   } catch (err) {
     console.warn("[nativeBridge] native setBadgeCount failed:", err);
   }

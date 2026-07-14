@@ -1209,9 +1209,16 @@ class _CodexAppServerSession:
             return
         self._loop = asyncio.get_running_loop()
         codex_home_root = Path(tempfile.gettempdir())
-        if self._cwd:
-            codex_home_root = Path(self._cwd) / ".codex-tmp"
-            codex_home_root.mkdir(parents=True, exist_ok=True)
+        if self._cwd and self._cwd != "/":
+            try:
+                codex_home_root = Path(self._cwd) / ".codex-tmp"
+                codex_home_root.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                # The cwd may be on a read-only filesystem — e.g. macOS
+                # root ``/`` inherited from a runner whose working
+                # directory was never explicitly set.  Fall back to the
+                # system temp directory so the codex home is still writable.
+                codex_home_root = Path(tempfile.gettempdir())
         self._codex_home_dir = Path(
             tempfile.mkdtemp(prefix="omnigent-codex-home-", dir=str(codex_home_root))
         )

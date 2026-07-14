@@ -219,6 +219,14 @@ Planned dimensions are steering, live queue, resume, images, and compaction.
 Every behavioral probe also reads the corresponding declared flag and returns
 `DRIFT` when observed disagrees with declared.
 
+The CLI can slice this catalog with repeatable or comma-separated
+`--dimension` values. A slice always includes `basic_turn` because it proves
+the harness is exercisable before interpreting another probe's result. Reports
+and the live Rich grid contain only the selected columns. Each repeated
+`--harness NAME[=MODEL]` binds an optional model override directly to that
+harness, avoiding both test model-pool environment variables and positional
+cross-family assignment. Omitting `=MODEL` keeps that profile's default.
+
 ### Illustrative probe shape
 
 ```python

@@ -16,6 +16,17 @@ python -m tests.harness_bench --no-live
 # Probe one harness. Credentials are resolved like `omni run`.
 python -m tests.harness_bench --harness codex
 
+# Run only Reasoning (plus its automatic Basic turn prerequisite).
+python -m tests.harness_bench --harness codex --dimension reasoning
+
+# Pin one harness to an exact model for this run.
+python -m tests.harness_bench --harness codex=system.ai.gpt-5-6-sol
+
+# Mix custom and default models in a multi-harness run.
+python -m tests.harness_bench \
+  --harness codex=system.ai.gpt-5-6-sol \
+  --harness claude-sdk
+
 # Override the configured/ambient Databricks profile.
 python -m tests.harness_bench --harness codex --profile my-profile
 
@@ -35,9 +46,17 @@ non-zero exit means at least one `DRIFT` cell was found.
   `--live` requires resolvable gateway credentials.
 - `--profile NAME` -- optional Databricks profile override; it is not required
   when config or ambient `OPENAI_*` already supplies credentials.
-- `--harness NAME` -- probe one harness (repeatable). Accepts an official name
-  or a `module:attr` / `module.ATTR` reference to a community `BenchProfile`.
-  Defaults to every official harness.
+- `--harness NAME[=MODEL]` -- probe one harness (repeatable), optionally
+  replacing that harness profile's model for this run. `NAME` accepts an
+  official name or a `module:attr` / `module.ATTR` community `BenchProfile`.
+  Omitting `=MODEL` keeps the profile default. This is the simple alternative
+  to test model-pool environment variables. Defaults to every official harness.
+- `--dimension NAME[,NAME...]` -- run only selected dimensions. Repeat the flag
+  or pass a comma-separated list. Names use the identifiers shown by
+  `--list-dimensions`; `basic_turn` is added automatically as the
+  exercisability prerequisite.
+- `--list-dimensions` -- list dimension identifiers, display titles, and
+  priorities.
 - `--fast` -- run SDK harnesses on `sdk-inproc` instead of the `full-server`
   default. This skips server startup, but policy ALLOW/ASK/DENY are not
   observable and tool/cost verdicts are limited to what the wrap forwards.
