@@ -8,18 +8,25 @@ against a server that is *not* single-user — a header-auth deploy with more
 than one possible user, exactly like a Databricks Apps / SSO-proxy install.
 
 This spins one up: the single-user marker is cleared, an admin identity is
-declared via ``OMNIGENT_ADMINS`` so a header-identified browser can manage,
-and a hello_world session is created and runner-bound. Served through the
+declared via ``OMNIGENT_ADMINS`` so a header-identified browser can manage, and
+an admin-owned hello_world session is created. Served through the
 public-looking loopback alias (``_PUBLIC_LOOPBACK_HOST``) so
 ``isCurrentServerLocal()`` is false and the Share affordances aren't masked by
 the local-server disable.
+
+No runner is bound: the Share button / modal / settings nav all key off the
+session existing plus the admin identity (``canShare`` in AppShell.tsx needs a
+top-level session at manage level, not an online runner), and no agent turn is
+dispatched. This also sidesteps the runner-ownership rule — a loopback runner
+registers as the reserved ``local`` user, which an admin-owned session can't
+bind to — while keeping the create authenticated (a multi-user server 401s
+headerless writes, so a ``local``-owned session can't be created here anyway).
 """
 
 from __future__ import annotations
 
 import json as _json
 import os
-import secrets
 import signal
 import subprocess
 import sys
@@ -48,12 +55,12 @@ ADMIN_EMAIL = "admin@ui.test"
 
 @dataclass
 class MultiUserServer:
-    """A running multi-user server plus one runner-bound session.
+    """A running multi-user server plus one admin-owned session (no runner).
 
     :param base_url: Loopback base URL (``http://127.0.0.1:<port>``) for REST.
     :param public_url: The same server via the public-looking loopback alias,
         so the browser's ``isCurrentServerLocal()`` is false.
-    :param session_id: A hello_world session bound to the runner.
+    :param session_id: A hello_world session owned by the admin identity.
     """
 
     base_url: str
@@ -86,19 +93,19 @@ def spawn_multi_user_server(
     *,
     extra_server_env: dict[str, str] | None = None,
 ) -> Iterator[MultiUserServer]:
-    """Spawn a multi-user server + runner + one session; yield a handle.
+    """Spawn a multi-user server + one admin-owned session; yield a handle.
 
     Mirrors the shared ``live_server`` spawn but with the single-user marker
-    cleared and an admin declared. ``extra_server_env`` overrides/augments the
-    server env (e.g. ``OMNIGENT_SHARING_MODE=off``).
+    cleared and an admin declared, and NO runner (the Share/settings chrome
+    under test needs only a session to exist, not an online runner).
+    ``extra_server_env`` overrides/augments the server env (e.g.
+    ``OMNIGENT_SHARING_MODE=off``).
 
     :param mock_llm_server_url: Session-scoped mock LLM base (no real creds).
     :param server_tmp: A per-test temp dir (``tmp_path_factory.mktemp(...)``).
     :param extra_server_env: Extra env vars for the server process.
     :yields: A :class:`MultiUserServer` handle.
     """
-    from omnigent.runner.identity import token_bound_runner_id
-
     port = _find_free_port()
     log_path = server_tmp / "server.log"
     db_path = server_tmp / "test.db"
@@ -107,20 +114,20 @@ def spawn_multi_user_server(
     agent_yaml_path = server_tmp / "hello_world.yaml"
     agent_yaml_path.write_text(_TEST_AGENT_YAML)
 
-    binding_token = secrets.token_urlsafe(32)
-    runner_id = token_bound_runner_id(binding_token)
     base_url = f"http://127.0.0.1:{port}"
     pythonpath = f"{_REPO_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}"
+    # Requests authenticated as the admin identity. A multi-user header-auth
+    # server 401s headerless requests, so every REST call here carries it.
+    admin_headers = {"X-Forwarded-Email": ADMIN_EMAIL}
 
     server_env = {
         **os.environ,
         "PYTHONPATH": pythonpath,
-        "OMNIGENT_RUNNER_TUNNEL_TOKEN": binding_token,
         # The whole point: NOT single-user. Clear the marker the suite sets so
         # /v1/info reports single_user:false and the Share chrome stays.
         "OMNIGENT_LOCAL_SINGLE_USER": "",
         # A header-identified admin so the browser (X-Forwarded-Email) can
-        # manage the local-owned session and thus see the Share button.
+        # manage its session and thus see the Share button + admin settings.
         "OMNIGENT_ADMINS": ADMIN_EMAIL,
         "OPENAI_BASE_URL": f"{mock_llm_server_url}/v1",
         "OPENAI_API_KEY": "mock-key",
@@ -152,30 +159,8 @@ def spawn_multi_user_server(
         stderr=subprocess.STDOUT,
     )
 
-    runner_log_path = server_tmp / "runner.log"
-    runner_log_handle = open(runner_log_path, "w")  # noqa: SIM115
-    runner_env = {
-        **os.environ,
-        "PYTHONPATH": pythonpath,
-        # The runner registers headerless over loopback → owns sessions as the
-        # reserved "local" user (unchanged from the shared fixture); the admin
-        # browser still manages them via is_admin.
-        "OMNIGENT_LOCAL_SINGLE_USER": "",
-        "OMNIGENT_RUNNER_ID": runner_id,
-        "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
-        "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
-        "RUNNER_SERVER_URL": base_url,
-        "OPENAI_BASE_URL": f"{mock_llm_server_url}/v1",
-        "OPENAI_API_KEY": "mock-key",
-    }
-    runner_proc = subprocess.Popen(
-        [sys.executable, "-m", "omnigent.runner._entry"],
-        env=runner_env,
-        stdout=runner_log_handle,
-        stderr=subprocess.STDOUT,
-    )
-
     try:
+        # /health is unauthed; wait for it (no runner to poll).
         deadline = time.monotonic() + _HEALTH_TIMEOUT_S
         ready = False
         last_error = "not polled yet"
@@ -185,11 +170,8 @@ def spawn_multi_user_server(
                 break
             try:
                 if httpx.get(f"{base_url}/health", timeout=2).status_code == 200:
-                    status = httpx.get(f"{base_url}/v1/runners/{runner_id}/status", timeout=2)
-                    if status.status_code == 200 and status.json()["online"] is True:
-                        ready = True
-                        break
-                    last_error = f"runner status HTTP {status.status_code}"
+                    ready = True
+                    break
             except (httpx.ConnectError, httpx.ReadError, httpx.TimeoutException) as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
             time.sleep(_HEALTH_POLL_INTERVAL_S)
@@ -201,22 +183,20 @@ def spawn_multi_user_server(
                 f"{base_url} (last_error={last_error}).\n{log_text[-3000:]}"
             )
 
-        # Create a hello_world session (headerless → owned by "local") and bind
-        # it to the runner. No turn runs — Share only needs a session to exist.
+        # Create an admin-owned hello_world session (authenticated, so it's
+        # owned by ADMIN_EMAIL — headerless would 401 here). No runner bind and
+        # no turn: the Share modal / button / settings nav only need a
+        # top-level session to exist at manage level, which the owner has.
         bundle = _build_hello_world_bundle()
         create = httpx.post(
             f"{base_url}/v1/sessions",
             data={"metadata": _json.dumps({})},
             files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
+            headers=admin_headers,
             timeout=30.0,
         )
         create.raise_for_status()
         session_id = create.json()["session_id"]
-        httpx.patch(
-            f"{base_url}/v1/sessions/{session_id}",
-            json={"runner_id": runner_id},
-            timeout=10.0,
-        ).raise_for_status()
 
         yield MultiUserServer(
             base_url=base_url,
@@ -224,7 +204,5 @@ def spawn_multi_user_server(
             session_id=session_id,
         )
     finally:
-        _terminate(runner_proc)
-        runner_log_handle.close()
         _terminate(proc)
         log_handle.close()
