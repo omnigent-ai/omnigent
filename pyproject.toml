@@ -8,7 +8,10 @@ name = "omnigent"
 version = "0.6.0.dev0"
 description = "Omnigent: declarative agent authoring and runtime framework"
 readme = "README.md"
-requires-python = ">=3.12"
+# Cap below 3.14: the `databricks` extra pulls pyarrow (via mlflow), which has
+# no cp314 wheels yet, so 3.14 falls back to a source build that needs cmake.
+# Raise the cap once that toolchain ships 3.14 wheels.
+requires-python = ">=3.12,<3.14"
 authors = [
     { name = "Databricks, Inc." },
 ]
