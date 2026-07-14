@@ -1235,6 +1235,165 @@ async def test_relaunch_posts_session_init_before_forwarding_message(
     )
 
 
+async def test_codex_goal_relaunch_posts_session_init_before_goal_event(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Opening the Goal dialog on a slept Codex-native session runs the
+    session-init handshake (POST /v1/sessions) on the woken runner BEFORE
+    forwarding the goal control event.
+
+    Codex goal state lives in the Codex app-server bridge, which only
+    exists after ``create_session`` runs on the runner. When the Goal
+    dialog wakes a host-bound session whose runner had slept, the goal
+    route relaunches a runner and must run the session-init handshake
+    first — otherwise the goal event lands on a runner with no bridge and
+    is lost. This is the codex-goal sibling of
+    ``test_relaunch_posts_session_init_before_forwarding_message``; the
+    invariant (handshake precedes the forward) is the same, only the
+    triggering path differs.
+
+    The runner-resolution helpers are staged so the route deterministically
+    enters its relaunch branch: no live runner, no already-bound runner,
+    a successful host launch, and a relaunched runner that resolves to the
+    recording client. ``_initialize_codex_goal_runner`` (and the handshake
+    it drives) run for real against that client.
+
+    Regression / mutation check: dropping the ``conversation_store`` arg
+    from the ``_ensure_runner_session_initialized`` call in
+    ``_initialize_codex_goal_runner`` (the exact pre-fix state) makes that
+    call raise ``TypeError`` before any handshake POST — ``runner_paths``
+    loses its ``/v1/sessions`` entry (first assertion fails) and the route
+    500s. Moving the init after the goal-event forward fails the ordering
+    assertion.
+    """
+    from omnigent._wrapper_labels import CODEX_NATIVE_WRAPPER_VALUE, WRAPPER_LABEL_KEY
+    from omnigent.server.routes.codex import sessions as codex_sessions_module
+
+    # Inline-launch a host-bound session (the goal relaunch path bails early
+    # unless ``conv.host_id`` is set), then mark it codex-native so the goal
+    # route accepts it (``_require_codex_native_goal_session`` keys off this
+    # label). Its runner is treated as slept — the resolution helpers below
+    # are staged to force the relaunch branch.
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+    SqlAlchemyConversationStore(db_uri).set_labels(
+        session_id, {WRAPPER_LABEL_KEY: CODEX_NATIVE_WRAPPER_VALUE}
+    )
+
+    # Record runner POSTs in arrival order so we can assert the handshake
+    # precedes the goal-event forward.
+    runner_paths: list[str] = []
+    init_bodies: list[dict[str, Any]] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """Record runner POSTs in arrival order and accept them.
+
+        :param request: Request the server sent to the relaunched runner —
+            a POST to ``/v1/sessions`` (handshake) or
+            ``/v1/sessions/<id>/events`` (goal-event forward).
+        :returns: A 2xx so the route proceeds past each step; the /events
+            reply is a valid ``CodexGoalResponse`` body.
+        """
+        if request.method == "POST":
+            runner_paths.append(request.url.path)
+            if request.url.path == "/v1/sessions":
+                init_bodies.append(json.loads(request.content))
+        if request.url.path.endswith("/events"):
+            return httpx.Response(200, json={"goal": None})
+        return httpx.Response(200, json={})
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://runner",
+    )
+
+    async def _no_live_runner(
+        session_id_arg: str, runner_router_arg: object, event: dict[str, Any]
+    ) -> None:
+        """Return ``None`` so the goal route enters its relaunch branch.
+
+        :param session_id_arg: Session being routed (unused; one session).
+        :param runner_router_arg: App runner router (unused — staged here).
+        :param event: Goal control event (unused; branch is unconditional).
+        :returns: ``None``.
+        """
+        del session_id_arg, runner_router_arg, event
+
+    async def _no_bound_runner(**kwargs: Any) -> None:
+        """Report no already-bound runner so a relaunch is attempted.
+
+        :param kwargs: Keyword args from the call site (unused).
+        :returns: ``None``.
+        """
+        del kwargs
+
+    async def _launched(**kwargs: Any) -> str:
+        """Stand in for a successful host launch.
+
+        :param kwargs: Keyword args from the call site (unused).
+        :returns: The runner id expected to connect.
+        """
+        del kwargs
+        return "runner_token_codexgoal"
+
+    async def _relaunched_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        """Return the recording fake runner as the relaunched client.
+
+        :param args: Positional args from the call site (unused).
+        :param kwargs: Keyword args from the call site (unused).
+        :returns: The recording fake runner client.
+        """
+        del args, kwargs
+        return fake_runner
+
+    monkeypatch.setattr(
+        codex_sessions_module, "_forward_session_change_to_runner", _no_live_runner
+    )
+    monkeypatch.setattr(
+        codex_sessions_module, "_wait_for_existing_codex_goal_runner", _no_bound_runner
+    )
+    monkeypatch.setattr(codex_sessions_module, "_start_codex_goal_runner_on_bound_host", _launched)
+    monkeypatch.setattr(codex_sessions_module, "_wait_for_runner_client", _relaunched_client)
+
+    try:
+        resp = await client.put(
+            f"/v1/sessions/{session_id}/codex_goal",
+            json={"objective": "keep tests green"},
+        )
+    finally:
+        # Always close the recording client so a regression can't leak the
+        # AsyncClient / emit unclosed-client warnings.
+        await fake_runner.aclose()
+
+    assert resp.status_code < 300, resp.text
+
+    # Handshake must be recorded AND precede the goal-event forward.
+    # Pre-fix: the missing ``conversation_store`` arg raises TypeError
+    # before the handshake POST, so there is no "/v1/sessions" entry.
+    assert "/v1/sessions" in runner_paths, (
+        f"goal relaunch must POST /v1/sessions (session-init handshake) to the "
+        f"runner before forwarding the goal event; recorded runner POSTs were "
+        f"{runner_paths!r}"
+    )
+    event_paths = [p for p in runner_paths if p.endswith("/events")]
+    assert event_paths, (
+        f"the goal control event should still be forwarded to the runner's "
+        f"/events; recorded runner POSTs were {runner_paths!r}"
+    )
+    assert runner_paths.index("/v1/sessions") < runner_paths.index(event_paths[0]), (
+        f"session-init handshake must precede the goal-event forward so the "
+        f"Codex app-server bridge is loaded first; got order {runner_paths!r}"
+    )
+    # The handshake targets this session (proves it's the real init call).
+    assert init_bodies and init_bodies[0]["session_id"] == session_id, (
+        f"handshake body should target session {session_id!r}; got {init_bodies!r}"
+    )
+
+
 async def test_health_reports_online_for_host_on_other_replica(
     client: httpx.AsyncClient,
     app: FastAPI,

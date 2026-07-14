@@ -5,6 +5,12 @@ generated at release time from each PR's `## Changelog` section, tagged by the
 PR's `Type of change` (e.g. `[UI]`); the concise, curated highlights live on the
 website under `/releases`.
 
+## [Unreleased]
+
+### Features
+
+- [UI / Feature] Added a Nord color theme (arctic frost-blue palette) to the Appearance settings palette picker.
+
 ## [v0.5.0] — 2026-07-10
 
 - [Bug fix] Messaging a long-idle session no longer risks the new turn being killed mid-flight by the idle reaper (#1834)

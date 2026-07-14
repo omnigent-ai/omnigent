@@ -23,7 +23,7 @@ on:
     # (rerun-security-gate-run.yml falls back to this trigger). The concurrency
     # group key isolates label events so they never cancel a code-push run.
     types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
-    paths-ignore: ['web/**', 'tests/e2e_ui/**']
+    paths-ignore: ['web/**', 'tests/e2e_ui/**', 'CHANGELOG.md']
   workflow_dispatch:
     inputs:
       branch:

@@ -44,6 +44,7 @@ class Elicitation(str, Enum):
 class Resume(str, Enum):
     """Whether a prior conversation is reattached or rebuilt."""
 
+    NONE = "none"  # prior conversations cannot be resumed
     WARM_REATTACH = "warm-reattach"  # reattach to a live vendor session / terminal
     COLD_ONLY = "cold-only"  # rebuild from Omnigent transcript / history replay
 
@@ -92,6 +93,14 @@ class HarnessCapabilities:
     :param streaming: Whether the harness forwards token-level deltas (vs a
         single complete blob). Declared claim; verified by the bench's
         streaming probe.
+    :param steering: Whether input can be added to an active turn.
+    :param live_queue: Whether follow-up input can be queued during an active
+        turn.
+    :param images: Whether the harness accepts image input.
+    :param compaction: Whether the harness can compact conversation history.
+        Optional capability fields use ``None`` when the harness makes no claim;
+        the bench reports those declarations as ``UNKNOWN`` rather than assuming
+        the capability is unsupported.
     """
 
     integration_mode: IntegrationMode
@@ -103,8 +112,12 @@ class HarnessCapabilities:
     subagents: bool
     interrupt: bool
     streaming: bool
+    steering: bool | None = None
+    live_queue: bool | None = None
+    images: bool | None = None
+    compaction: bool | None = None
 
-    def as_dict(self) -> dict[str, str | bool]:
+    def as_dict(self) -> dict[str, str | bool | None]:
         """Return a JSON-serializable view for the ``/v1/harnesses`` catalog."""
         return {
             "integration_mode": self.integration_mode.value,
@@ -116,4 +129,8 @@ class HarnessCapabilities:
             "subagents": self.subagents,
             "interrupt": self.interrupt,
             "streaming": self.streaming,
+            "steering": self.steering,
+            "live_queue": self.live_queue,
+            "images": self.images,
+            "compaction": self.compaction,
         }

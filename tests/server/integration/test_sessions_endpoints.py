@@ -5233,6 +5233,133 @@ async def test_post_external_model_change_does_not_forward_to_runner(
     )
 
 
+async def test_post_external_model_options_populates_picker_and_publishes(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``external_model_options`` fills the snapshot picker and posts SSE.
+
+    A native harness's extension (pi-native: its live ``ctx.modelRegistry``)
+    posts its model catalog so the Web UI picker populates from what the
+    harness actually loaded — regardless of how it authenticated. The route
+    caches it (reload-surviving) and publishes ``session.model_options`` so
+    open clients re-read the snapshot. Asserts the deduped/normalized options
+    land on the snapshot and the SSE fires.
+    """
+    from omnigent.server.routes import sessions as _mod
+
+    _mod._pushed_model_options_cache.clear()
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda sid, ev: published.append((sid, ev)),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(
+        client,
+        agent["id"],
+        labels={"omnigent.ui": "terminal", "omnigent.wrapper": "pi-native-ui"},
+    )
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_model_options",
+            "data": {
+                "models": [
+                    {"id": "databricks-claude-sonnet-4-6", "displayName": "Sonnet 4.6"},
+                    # No displayName → falls back to the id.
+                    {"id": "anthropic-claude-opus-4-1"},
+                    # Duplicate id collapses.
+                    {"id": "databricks-claude-sonnet-4-6"},
+                ]
+            },
+        },
+    )
+    assert resp.status_code == 202, resp.text
+    assert resp.json() == {"queued": False}
+
+    assert "session.model_options" in [event["type"] for _, event in published]
+
+    snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert [m["id"] for m in snapshot["model_options"]] == [
+        "databricks-claude-sonnet-4-6",
+        "anthropic-claude-opus-4-1",
+    ]
+    assert snapshot["model_options"][0]["displayName"] == "Sonnet 4.6"
+    # Missing displayName defaults to the id.
+    assert snapshot["model_options"][1]["displayName"] == "anthropic-claude-opus-4-1"
+
+
+async def test_post_external_model_options_empty_evicts_cache(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    An empty ``data.models`` clears any prior pushed catalog; a non-list 400s.
+
+    Empty means "no catalog to show" — the entry is evicted so the picker
+    hides rather than serving a stale list. A malformed (non-list) payload
+    fails loud at the boundary.
+    """
+    from omnigent.server.routes import sessions as _mod
+
+    agent = await create_test_agent(client)
+    session = await _create_session(
+        client,
+        agent["id"],
+        labels={"omnigent.ui": "terminal", "omnigent.wrapper": "pi-native-ui"},
+    )
+
+    # Seed a catalog, then clear it with an empty push.
+    seed = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_model_options", "data": {"models": [{"id": "m-1"}]}},
+    )
+    assert seed.status_code == 202, seed.text
+    assert _mod._pushed_model_options_cache.get(session["id"])
+
+    cleared = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_model_options", "data": {"models": []}},
+    )
+    assert cleared.status_code == 202, cleared.text
+    assert session["id"] not in _mod._pushed_model_options_cache
+
+    bad = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_model_options", "data": {"models": "nope"}},
+    )
+    assert bad.status_code == 400, bad.text
+    assert "external_model_options" in bad.text
+
+
+async def test_post_external_model_options_rejects_non_pi_native_session(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    ``external_model_options`` is only accepted for pi-native sessions.
+
+    Only ``_fetch_model_options`` serves this cache for the pi-native wrapper,
+    so accepting a push from any other session would just leave a stray cache
+    entry alive until teardown. The route rejects it at ingest (400) and writes
+    nothing, keeping the contract explicit.
+    """
+    from omnigent.server.routes import sessions as _mod
+
+    agent = await create_test_agent(client)
+    # A plain (non-native) session — no pi-native wrapper label.
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_model_options", "data": {"models": [{"id": "m-1"}]}},
+    )
+    assert resp.status_code == 400, resp.text
+    assert "external_model_options" in resp.text
+    assert session["id"] not in _mod._pushed_model_options_cache
+
+
 async def test_post_external_reasoning_effort_change_publishes_session_effort(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -7393,3 +7520,69 @@ async def test_non_native_message_still_raises_when_runner_offline(
     assert resp.status_code >= 400, resp.text
     items = (await client.get(f"/v1/sessions/{sid}/items")).json()["data"]
     assert [i for i in items if i["type"] == "error"] == []
+
+
+@pytest.mark.parametrize("failure_mode", ["transport_error", "bare_connection_error"])
+async def test_message_forward_failure_surfaces_runner_unavailable(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_mode: str,
+) -> None:
+    """
+    A runner that is bound but unreachable surfaces 503, not silent 200.
+
+    Before the fix (issue #2428): when a bound runner's /events POST
+    failed with an HTTPError or ConnectionError, _forward_event_to_runner
+    swallowed the exception, returned the persisted item id, and the
+    server responded 200 ``{queued: true}`` as if the turn had been
+    accepted. The message was persisted but never delivered — the runner
+    never saw it, so no turn started. For sys_session_send orchestration
+    patterns this left the parent permanently blocked on sys_read_inbox.
+
+    After the fix: the exception is re-raised as RUNNER_UNAVAILABLE (503)
+    so the caller (e.g. _send_to_existing_session) can detect the failure,
+    unregister the orphaned work entry, and let the LLM fall back to
+    spawning a fresh session.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/events"):
+            if failure_mode == "transport_error":
+                raise httpx.ConnectError("runner unreachable")
+            # Bare ConnectionError: what WSTunnelTransport raises on tunnel close.
+            raise ConnectionError("tunnel closed mid-request")
+        return httpx.Response(202, json={})
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://runner",
+    )
+
+    async def _fake_get_runner_client(
+        session_id: str,
+        runner_router: object,
+    ) -> httpx.AsyncClient | None:
+        del session_id, runner_router
+        return fake_runner
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _fake_get_runner_client)
+    try:
+        agent = await create_test_agent(client)
+        session = await _create_session(client, agent["id"])
+        sid = session["id"]
+
+        resp = await client.post(
+            f"/v1/sessions/{sid}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+            },
+        )
+        # Must surface as RUNNER_UNAVAILABLE (503), not a silent 200.
+        assert resp.status_code == 503, (
+            f"Expected 503 RUNNER_UNAVAILABLE when runner forward fails, "
+            f"got {resp.status_code}: {resp.text}"
+        )
+    finally:
+        await fake_runner.aclose()

@@ -1,6 +1,6 @@
 // Cmd/Ctrl+↓/↑ steps next/prev with wrap; off-list ↓ enters at top, ↑ at
-// bottom; fires inside text fields but ignores Alt/Shift/bare arrows; a no-op
-// step (same id) doesn't navigate.
+// bottom; suppressed inside editable fields; ignores Alt/Shift/bare arrows; a
+// no-op step (same id) doesn't navigate.
 
 import { renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -93,12 +93,20 @@ describe("useSessionSwitchHotkey", () => {
     expect(navigate).not.toHaveBeenCalled();
   });
 
-  it("still switches while a text field is focused (no click-out needed)", () => {
+  it("does not switch while a textarea is focused (composer editing)", () => {
     renderHook(() => useSessionSwitchHotkey(ids, "a"));
     const ta = document.createElement("textarea");
     document.body.appendChild(ta);
     press("ArrowDown", { metaKey: true }, ta);
-    expect(navigate).toHaveBeenCalledWith("/c/b");
+    expect(navigate).not.toHaveBeenCalled();
+  });
+
+  it("does not switch while an input is focused", () => {
+    renderHook(() => useSessionSwitchHotkey(ids, "a"));
+    const input = document.createElement("input");
+    document.body.appendChild(input);
+    press("ArrowDown", { metaKey: true }, input);
+    expect(navigate).not.toHaveBeenCalled();
   });
 
   it("does nothing when the list is empty", () => {

@@ -311,3 +311,42 @@ async def test_deny_policy_only_blocks_matching_phase(
     assert body.get("denied") is not True, (
         f"tool_call-only DENY policy incorrectly blocked an input message; got {body}"
     )
+
+
+async def test_input_deny_publishes_committed_item_event(
+    policy_client: httpx.AsyncClient,
+    mock_llm: ControllableMockClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An input-phase DENY publishes the sentinel as ``output_item.done``.
+
+    The deny text streams live as an ``output_text.delta`` (a provisional
+    web preview) and is persisted as an assistant item. Without a commit
+    event the web preview is swept by the terminal ``response.completed``,
+    so the deny only reappeared on refresh. Assert the persisted item is
+    published as ``response.output_item.done`` — carrying a real itemId —
+    so the web reconciles it into a durable block.
+    """
+    published: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda sid, ev: published.append((sid, ev)),
+    )
+
+    agent = await create_test_agent(policy_client)
+    session_id = await _create_session(policy_client, agent["id"])
+    await _attach_deny_policy(policy_client, session_id)
+
+    resp = await _send_user_message(policy_client, session_id, "Hello, this should be blocked.")
+    assert resp.json().get("denied") is True, f"expected synchronous DENY; got {resp.json()}"
+
+    done_events = [ev for _sid, ev in published if ev.get("type") == "response.output_item.done"]
+    assert len(done_events) == 1, f"expected one committed-item event; got {done_events}"
+    item = done_events[0]["item"]
+    assert item.get("id"), f"committed item must carry a store-assigned id; got {item}"
+    text = "".join(
+        part.get("text", "") for part in item.get("content", []) if isinstance(part, dict)
+    )
+    assert "Blocked by test policy" in text, (
+        f"deny sentinel missing from committed item; got {item}"
+    )

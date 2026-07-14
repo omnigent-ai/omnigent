@@ -210,14 +210,20 @@ class ConversationStore(ABC):
     updates, and deletion.
     """
 
-    def __init__(self, storage_location: str) -> None:
+    def __init__(
+        self, storage_location: str, conversation_storage_location: str | None = None
+    ) -> None:
         """
         Initialize the conversation store.
 
-        :param storage_location: Backend-specific storage URI,
-            e.g. ``"sqlite:///conversations.db"``.
+        :param storage_location: Backend-specific storage URI for the
+            Omnigent operational DB, e.g. ``"sqlite:///conversations.db"``.
+        :param conversation_storage_location: Optional URI for the Agent Platform DB.
+            When ``None`` (default), the AP tables live in the same DB as
+            the Omnigent tables.
         """
         self.storage_location = storage_location
+        self.conversation_storage_location = conversation_storage_location
 
     @abstractmethod
     def create_conversation(

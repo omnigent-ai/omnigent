@@ -24,7 +24,7 @@
     "                 - 'web/' before 'web/electron/' and 'web/ios/'",
     "                 - 'omnigent/inner/' before every 'omnigent/inner/<harness>_'.",
     "  owners     - candidate reviewers/assignees. Must be maintainers in",
-    "               .github/MAINTAINER. 2+ each. Edit these freely: the",
+    "               .github/MAINTAINER. 2+ each incl. owners_paused. Edit these freely: the",
     "               reviewer-logic tests run against a frozen fixture",
     "               (auto-assign-reviewer.fixture.json), so ownership changes here",
     "               do not churn them. areas.test.js validates this file (every",
@@ -181,7 +181,9 @@
         "omnigent/policies/"
       ],
       "owners": [
-        "TomeHirata",
+        "TomeHirata"
+      ],
+      "owners_paused": [
         "ckcuslife-source"
       ]
     },

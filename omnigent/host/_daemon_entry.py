@@ -15,7 +15,6 @@ Two modes:
 from __future__ import annotations
 
 import argparse
-import logging
 
 
 def main() -> None:
@@ -44,10 +43,9 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(name)s] %(message)s",
-    )
+    from omnigent.process_logging import configure_process_logging
+
+    configure_process_logging("host", force=True)
 
     if args.local == bool(args.server):
         # Both or neither — the CLI always passes exactly one; fail loud.

@@ -9,8 +9,8 @@
  *
  * Sections:
  *
- * - **Appearance** — theme mode (System / Light / Dark). This is the new
- *   home of the theme control that used to sit in the sidebar header.
+ * - **Appearance** — theme mode (System / Light / Dark), terminal theme,
+ *   Workspace panel default for new chats, and UI/code font controls.
  * - **Git** — Git behavior, e.g. the default base branch pre-filled when
  *   naming a new worktree branch in the composer.
  * - **Keyboard shortcuts** — the full shortcuts reference, shown inline.
@@ -39,19 +39,19 @@ import {
 } from "react";
 import {
   ArchiveRestoreIcon,
-  KeyRoundIcon,
-  LogOutIcon,
-  Trash2Icon,
-  UserCogIcon,
-} from "lucide-react";
-import {
   CheckIcon,
+  KeyRoundIcon,
   LaptopMinimalIcon,
+  LogOutIcon,
   MinusIcon,
   MonitorIcon,
   MoonIcon,
+  PanelRightCloseIcon,
+  PanelRightIcon,
   PlusIcon,
   SunIcon,
+  Trash2Icon,
+  UserCogIcon,
 } from "lucide-react";
 import { useTheme } from "next-themes";
 import { PageScroll } from "@/components/PageScroll";
@@ -119,6 +119,11 @@ import {
   writeTerminalThemeMode,
   type TerminalThemeMode,
 } from "@/lib/terminalThemePreferences";
+import {
+  readWorkspacePanelDefault,
+  writeWorkspacePanelDefault,
+  type WorkspacePanelDefault,
+} from "@/lib/workspacePanelPreferences";
 import { readDefaultBaseBranch, writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 import {
   applyThemePalette,
@@ -222,6 +227,15 @@ const terminalThemeCards: { mode: TerminalThemeMode; label: string; icon: typeof
   { mode: "auto", label: "Match app", icon: MonitorIcon },
   { mode: "light", label: "Light", icon: SunIcon },
   { mode: "dark", label: "Dark", icon: MoonIcon },
+];
+
+const workspacePanelCards: {
+  value: WorkspacePanelDefault;
+  label: string;
+  icon: typeof PanelRightIcon;
+}[] = [
+  { value: "open", label: "Open", icon: PanelRightIcon },
+  { value: "collapsed", label: "Collapsed", icon: PanelRightCloseIcon },
 ];
 
 /**
@@ -478,6 +492,40 @@ function TerminalThemeControl() {
 }
 
 /**
+ * Default open/collapsed state for the right Workspace rail on brand-new chats.
+ * Only applies when a session has no saved per-chat open state — existing
+ * sessions keep restoring whatever the user last left them as.
+ */
+function WorkspacePanelDefaultControl() {
+  const [value, setValue] = useState(() => readWorkspacePanelDefault());
+  const labelId = useId();
+  const choose = useCallback((next: WorkspacePanelDefault) => {
+    setValue(next);
+    writeWorkspacePanelDefault(next);
+  }, []);
+  return (
+    <ThemeSubsection
+      labelId={labelId}
+      title="Workspace panel"
+      helper="Whether new chats open with the Files / Agents / Shells panel visible. Existing chats keep their last layout."
+    >
+      <CardRadioGroup<WorkspacePanelDefault>
+        labelledBy={labelId}
+        value={value}
+        onSelect={choose}
+        className="grid grid-cols-2 gap-3"
+        cardClassName="items-center gap-2 p-4"
+        items={workspacePanelCards.map((card) => ({
+          value: card.value,
+          testId: `workspace-panel-default-${card.value}`,
+          body: iconCardBody(card.icon, card.label),
+        }))}
+      />
+    </ThemeSubsection>
+  );
+}
+
+/**
  * Color-theme (palette) picker — a dropdown (à la Codex). Each option shows a
  * swatch chip + name and the trigger mirrors the current selection. Choosing
  * one applies it live to <html> via `data-theme`, persists it, and composes on
@@ -602,6 +650,8 @@ function AppearanceSection() {
         )}
 
         <TerminalThemeControl />
+
+        <WorkspacePanelDefaultControl />
 
         <UiFontSizeControl />
 

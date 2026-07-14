@@ -48,6 +48,7 @@ function createWrapper() {
 function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
   return {
     accounts_enabled: false,
+    single_user: false,
     login_url: null,
     needs_setup: false,
     databricks_features: false,

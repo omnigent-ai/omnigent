@@ -100,6 +100,10 @@ dependencies = [
     # version against the latest PyPI release. Previously only a
     # transitive dep; pinned here now that we import it directly.
     "packaging>=23,<26",
+    # Protobuf schema for the AI-gateway routing API
+    # (omnigent/api/routing/v1/routing.proto).
+    # Previously only a transitive dep; declared directly now that we ship a proto.
+    "protobuf>=6,<7",
 ]
 
 [project.optional-dependencies]
@@ -140,6 +144,11 @@ cwsandbox = ["cwsandbox>=0.24,<1"]
 # server-managed `sandbox.provider: e2b`).
 # Same lazy-import posture as above.
 e2b = ["e2b>=2.26,<3"]
+# Islo sandbox launcher (`omnigent sandbox --provider islo` and
+# server-managed `sandbox.provider: islo`). The launcher module ships in
+# the base package and imports the SDK lazily, so only users of the
+# provider need this extra.
+islo = ["islo>=0.3.5,<0.4"]
 # NVIDIA OpenShell launcher (`omnigent sandbox --provider openshell`).
 # Self-hosted gRPC gateway; the SDK pulls grpcio + protobuf. Same
 # lazy-import posture as above. Pre-1.0 SDK: pin minor.
@@ -184,8 +193,17 @@ databricks = [
     "psycopg[binary]>=3.1,<4",
     "pymysql>=1.1,<2",
     # Databricks-specific MCP servers. Not imported by core Omnigent
-    # code, so it is opt-in here rather than a default dependency.
-    "databricks-mcp>=0.1.0",
+    # code, so it is opt-in here rather than a default dependency. Floored
+    # at 0.9.0 (the release the lock already resolves): with the old >=0.1.0
+    # floor, a fresh install could satisfy the ai-bridge floor below by
+    # dropping mcp to 0.1.0, which pulls no mlflow/pyarrow at all.
+    "databricks-mcp>=0.9.0",
+    # Floor the transitive databricks-ai-bridge: older releases pull a
+    # databricks-vectorsearch that pins protobuf 5.x (conflicts with our
+    # protobuf>=6), so the resolver backtracks to an ai-bridge that caps
+    # mlflow at 3.2 and pyarrow<22 — and pyarrow 21 has no cp314 wheel, so a
+    # fresh install on Python 3.14 tries (and fails) to build it from source.
+    "databricks-ai-bridge>=0.19",
 ]
 dev = [
     "pytest>=7.0",
@@ -249,6 +267,14 @@ dev = [
     # The Cloudflare D1 SQLAlchemy dialect, exercised by the D1 FTS integration
     # test (tests/db/test_d1_fts_dialect.py) via respx + sqlite3.
     "sqlalchemy-cloudflare-d1==0.3.10",
+    # protoc + the well-known-type protos, for regenerating the routing API
+    # bindings (omnigent/api/routing/v1/routing_pb2.*). Bundles its own compiler so no
+    # system protoc is needed. Pinned to the 1.x line whose bundled gencode
+    # matches the runtime `protobuf>=6,<7` above, so `scripts/gen_routing_pb2.py`
+    # reproduces the committed output byte-for-byte (the routing-pb2-fresh
+    # pre-commit hook diffs against it). Dev-only: generated code is committed,
+    # so neither the library nor its wheels depend on this.
+    "grpcio-tools>=1.68,<2",
 ]
 
 [project.scripts]
@@ -375,6 +401,9 @@ target-version = "py310"
 extend-exclude = [
     "omnigent/inner/databricks_mcps/google",
     "assistant-ui",
+    # Protobuf-generated code (DO NOT EDIT); not ours to restyle.
+    "omnigent/api/**/*_pb2.py",
+    "omnigent/api/**/*_pb2.pyi",
 ]
 
 [tool.ruff.lint]
@@ -475,6 +504,9 @@ known-first-party = ["omnigent"]
 # waived for these top-level antigravity_native modules (see the inline
 # comments at each catch site).
 "omnigent/antigravity_native*.py" = ["BLE001"]
+# Telemetry modules intentionally catch all exceptions at every boundary —
+# telemetry must never disrupt the application under any circumstances.
+"omnigent/telemetry/*.py" = ["BLE001", "SIM105"]
 "sdks/**/*.py" = [
     "ARG001", "ARG002", "BLE001", "B008", "RUF012",
 ]
@@ -491,7 +523,7 @@ disallow_any_explicit = true
 # setup.py — build-time scaffolding that imports the (untyped) setuptools
 # build_py and subclasses it; not application code, so excluded from mypy
 # rather than pulling in types-setuptools just for one shim file.
-exclude = ["^omnigent/inner/databricks_mcps/google/", "^setup\\.py$"]
+exclude = ["^omnigent/inner/databricks_mcps/google/", "^setup\\.py$", "_pb2\\.pyi?$"]
 # Incremental rollout: load imported modules for type info but don't
 # report their errors. Remove once every omnigent/ module is clean.
 follow_imports = "silent"

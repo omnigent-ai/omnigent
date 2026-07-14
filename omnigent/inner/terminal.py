@@ -124,8 +124,13 @@ def _read_terminal_transport_config() -> str | None:
     """Read ``terminal.transport`` from the global config, or ``None``.
 
     Best-effort: any failure (missing/unreadable file, non-mapping YAML,
-    absent table/key, non-string value) returns ``None`` so the caller uses
-    the control default. Never raises.
+    absent table/key, non-string/bool value) returns ``None`` so the caller
+    uses the control default. Never raises.
+
+    An unquoted YAML ``true``/``false`` parses as a real bool rather than a
+    string, so a bool value is normalized to its lowercase string spelling
+    before returning — ``terminal.transport: false`` still selects the PTY
+    alias in :data:`_TRANSPORT_PTY_ALIASES`.
 
     :returns: The raw configured transport string, or ``None`` when unset.
     """
@@ -146,6 +151,8 @@ def _read_terminal_transport_config() -> str | None:
     if not isinstance(table, dict):
         return None
     value = table.get(_TERMINAL_TRANSPORT_CONFIG_KEY)
+    if isinstance(value, bool):
+        return "true" if value else "false"
     return value if isinstance(value, str) else None
 
 

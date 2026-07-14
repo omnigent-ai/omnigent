@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import importlib
 import io
-import logging
 import os
 import tarfile
 import time
@@ -1445,30 +1444,28 @@ def test_main_reports_tunnel_rejection_without_traceback(
     assert "Traceback" not in stderr
 
 
-def test_main_installs_timestamped_runner_log_format(
+def test_main_configures_runner_process_logging(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    Runner process logs include timestamps at the formatter boundary.
-
-    Host-spawned runners redirect stderr to
-    ``~/.omnigent/logs/host-runner/runner-*.log``. The entrypoint's
-    logging formatter therefore has to include ``asctime`` globally; adding
-    timestamps to individual messages would miss library and framework logs.
+    Runner process logs are configured through the shared process logger.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
     captured: dict[str, Any] = {}
 
-    def _capture_basic_config(**kwargs: Any) -> None:
+    def _capture_process_logging(destination: str, **kwargs: Any) -> None:
         """
-        Record the logging configuration requested by ``main``.
+        Record the process logging configuration requested by ``main``.
 
-        :param kwargs: Keyword arguments passed to ``logging.basicConfig``.
+        :param destination: Process-log destination.
+        :param kwargs: Keyword arguments passed to ``configure_process_logging``.
         :returns: None.
         """
+        captured["destination"] = destination
         captured.update(kwargs)
+        return
 
     async def _stop_immediately() -> None:
         """
@@ -1478,8 +1475,8 @@ def test_main_installs_timestamped_runner_log_format(
         """
 
     monkeypatch.setattr(
-        "omnigent.runner._entry.logging.basicConfig",
-        _capture_basic_config,
+        "omnigent.process_logging.configure_process_logging",
+        _capture_process_logging,
     )
     monkeypatch.setattr(
         "omnigent.runner._entry._run_tunnel_from_env",
@@ -1488,10 +1485,7 @@ def test_main_installs_timestamped_runner_log_format(
 
     main()
 
-    assert captured["level"] == logging.INFO
-    assert captured["format"].startswith("%(asctime)s ")
-    assert "%(levelname)s:%(name)s:%(message)s" in captured["format"]
-    assert captured["datefmt"] == "%Y-%m-%dT%H:%M:%S%z"
+    assert captured == {"destination": "runner", "force": True}
 
 
 def test_main_preserves_unexpected_runtime_errors(

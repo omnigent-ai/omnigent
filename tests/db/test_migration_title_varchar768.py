@@ -55,8 +55,8 @@ def test_title_defaults_empty_string_on_insert(db_engine: Engine) -> None:
         conn.execute(
             sa.text(
                 "INSERT INTO conversations "
-                "(id, created_at, updated_at, kind, root_conversation_id) "
-                "VALUES (:id, :ts, :ts, 1, :id)"
+                "(id, created_at, updated_at, root_conversation_id) "
+                "VALUES (:id, :ts, :ts, :id)"
             ),
             {"id": "conv_varchar768_default", "ts": 1700000000},
         )
@@ -75,8 +75,8 @@ def test_existing_title_survives_upgrade(db_engine: Engine) -> None:
         conn.execute(
             sa.text(
                 "INSERT INTO conversations "
-                "(id, created_at, updated_at, kind, root_conversation_id, title) "
-                "VALUES (:id, :ts, :ts, 1, :id, :title)"
+                "(id, created_at, updated_at, root_conversation_id, title) "
+                "VALUES (:id, :ts, :ts, :id, :title)"
             ),
             {"id": "conv_long_title", "ts": 1700000001, "title": long_title},
         )
@@ -99,8 +99,8 @@ def test_downgrade_restores_text_type(tmp_path: Path) -> None:
         conn.execute(
             sa.text(
                 "INSERT INTO conversations "
-                "(id, created_at, updated_at, kind, root_conversation_id, title) "
-                "VALUES (:id, :ts, :ts, 1, :id, :title)"
+                "(id, created_at, updated_at, root_conversation_id, title) "
+                "VALUES (:id, :ts, :ts, :id, :title)"
             ),
             {"id": "conv_downgrade_varchar", "ts": 1700000002, "title": "My Session"},
         )

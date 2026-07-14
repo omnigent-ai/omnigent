@@ -35,6 +35,16 @@ const _SHARING_MODES: readonly SharingMode[] = ["on", "read_only", "restricted_r
 /** Shape of the response from ``GET /v1/info``. */
 export interface ServerInfo {
   accounts_enabled: boolean;
+  /**
+   * True only on an explicit single-user local runtime
+   * (``OMNIGENT_LOCAL_SINGLE_USER=1``). This is the sole signal that
+   * separates a genuine one-user server from a multi-user header-auth
+   * deploy (e.g. an SSO proxy injecting ``X-Forwarded-Email``) — both
+   * report ``accounts_enabled: false`` / ``login_url: null``. Gates
+   * account/sharing chrome that's meaningless without other users.
+   * Fails to ``false`` (multi-user) so a failed probe never hides it.
+   */
+  single_user: boolean;
   login_url: string | null;
   /**
    * True when accounts mode is on but no admin has been claimed yet —
@@ -98,6 +108,8 @@ export interface ServerInfo {
 /** Sentinel used when the probe fails — accounts is off, no login URL. */
 const _OFF: ServerInfo = {
   accounts_enabled: false,
+  // Fail to multi-user: a failed probe must not hide account/sharing chrome.
+  single_user: false,
   login_url: null,
   needs_setup: false,
   databricks_features: false,
@@ -135,6 +147,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
         const data = (await res.json()) as Partial<ServerInfo>;
         _cached = {
           accounts_enabled: data.accounts_enabled === true,
+          single_user: data.single_user === true,
           login_url: typeof data.login_url === "string" ? data.login_url : null,
           needs_setup: data.needs_setup === true,
           databricks_features: data.databricks_features === true,
@@ -171,6 +184,19 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
  */
 export function getCachedServerInfo(): ServerInfo | null {
   return _cached;
+}
+
+/**
+ * Whether the server is an explicit single-user local runtime, per the
+ * server's ``single_user`` signal (``OMNIGENT_LOCAL_SINGLE_USER=1``). This
+ * is NOT the same as "no accounts / no login" — a multi-user header-auth
+ * deploy (SSO proxy injecting ``X-Forwarded-Email``) also reports
+ * ``accounts_enabled: false`` / ``login_url: null`` but is genuinely
+ * multi-user, so it must keep its account/sharing chrome. Returns ``false``
+ * while the probe is still loading (and on the failed-probe sentinel).
+ */
+export function isSingleUserMode(info: ServerInfo | "loading"): boolean {
+  return info !== "loading" && info.single_user;
 }
 
 /**
