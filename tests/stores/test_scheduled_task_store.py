@@ -7,9 +7,21 @@ SQLite database.
 
 from __future__ import annotations
 
+import uuid
+
 import pytest
 
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
+
+
+# scheduled_tasks.id / scheduled_task_runs.id / scheduled_task_id are Uuid16
+# columns (16 raw bytes), so every id must be a canonical UUID string. ``_uid``
+# maps a readable seed to a deterministic UUID so tests stay legible while the
+# store still round-trips real UUIDs. agent_id / owner_user_id / conversation_id
+# stay plain strings — those columns are still ``String``.
+def _uid(seed: str) -> str:
+    """Deterministic canonical UUID string from a short readable seed."""
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, seed))
 
 
 @pytest.fixture()
@@ -30,7 +42,7 @@ def test_create_returns_scheduled_task_with_all_fields(
 ) -> None:
     """``create`` echoes every field back, round-tripping the JSON columns."""
     task = store.create(
-        scheduled_task_id="st_1",
+        scheduled_task_id=_uid("st_1"),
         name="nightly triage",
         prompt="Triage the inbox",
         cron_expression="0 9 * * *",
@@ -42,7 +54,7 @@ def test_create_returns_scheduled_task_with_all_fields(
         workspace="/home/alice/repo",
         base_branch="main",
     )
-    assert task.id == "st_1"
+    assert task.id == _uid("st_1")
     assert task.name == "nightly triage"
     assert task.prompt == "Triage the inbox"
     assert task.cron_expression == "0 9 * * *"
@@ -63,7 +75,7 @@ def test_create_returns_scheduled_task_with_all_fields(
 def test_create_minimal_defaults(store: SqlAlchemyScheduledTaskStore) -> None:
     """Optional fields default sensibly (None overrides)."""
     task = store.create(
-        scheduled_task_id="st_min",
+        scheduled_task_id=_uid("st_min"),
         name="minimal",
         prompt="do a thing",
         cron_expression="* * * * *",
@@ -88,7 +100,7 @@ def test_state_round_trips_as_string(store: SqlAlchemyScheduledTaskStore) -> Non
     """
     for i, name in enumerate(("active", "paused", "deleted")):
         task = store.create(
-            scheduled_task_id=f"st_state_{i}",
+            scheduled_task_id=_uid(f"st_state_{i}"),
             name="n",
             prompt="p",
             cron_expression="* * * * *",
@@ -105,7 +117,7 @@ def test_create_rejects_invalid_state(store: SqlAlchemyScheduledTaskStore) -> No
     """An unknown state name is rejected by the codec (never reaches the DB)."""
     with pytest.raises(ValueError, match=r"scheduled_tasks\.state"):
         store.create(
-            scheduled_task_id="st_badstate",
+            scheduled_task_id=_uid("st_badstate"),
             name="n",
             prompt="p",
             cron_expression="* * * * *",
@@ -119,7 +131,7 @@ def test_create_rejects_invalid_state(store: SqlAlchemyScheduledTaskStore) -> No
 def test_update_state_reads_back(store: SqlAlchemyScheduledTaskStore) -> None:
     """Updating ``state`` to ``paused`` reads back ``paused``."""
     store.create(
-        scheduled_task_id="st_upd_state",
+        scheduled_task_id=_uid("st_upd_state"),
         name="n",
         prompt="p",
         cron_expression="* * * * *",
@@ -127,7 +139,7 @@ def test_update_state_reads_back(store: SqlAlchemyScheduledTaskStore) -> None:
         agent_id="ag",
         timezone="UTC",
     )
-    updated = store.update("st_upd_state", state="paused")
+    updated = store.update(_uid("st_upd_state"), state="paused")
     assert updated is not None
     assert updated.state == "paused"
 
@@ -138,7 +150,7 @@ def test_update_state_reads_back(store: SqlAlchemyScheduledTaskStore) -> None:
 def test_create_recurring_task(store: SqlAlchemyScheduledTaskStore) -> None:
     """A recurring task sets ``cron_expression``."""
     task = store.create(
-        scheduled_task_id="st_recur",
+        scheduled_task_id=_uid("st_recur"),
         name="recurring",
         prompt="p",
         cron_expression="0 9 * * *",
@@ -152,7 +164,7 @@ def test_create_recurring_task(store: SqlAlchemyScheduledTaskStore) -> None:
 def test_update_changes_cron_expression(store: SqlAlchemyScheduledTaskStore) -> None:
     """Updating with a new ``cron_expression`` reschedules the recurring trigger."""
     store.create(
-        scheduled_task_id="st_recron",
+        scheduled_task_id=_uid("st_recron"),
         name="n",
         prompt="p",
         cron_expression="0 9 * * *",
@@ -160,7 +172,7 @@ def test_update_changes_cron_expression(store: SqlAlchemyScheduledTaskStore) -> 
         agent_id="ag",
         timezone="UTC",
     )
-    updated = store.update("st_recron", cron_expression="0 0 * * *")
+    updated = store.update(_uid("st_recron"), cron_expression="0 0 * * *")
     assert updated is not None
     assert updated.cron_expression == "0 0 * * *"
 
@@ -168,7 +180,7 @@ def test_update_changes_cron_expression(store: SqlAlchemyScheduledTaskStore) -> 
 def test_get_returns_created_task(store: SqlAlchemyScheduledTaskStore) -> None:
     """``get`` returns a previously created task."""
     store.create(
-        scheduled_task_id="st_get",
+        scheduled_task_id=_uid("st_get"),
         name="n",
         prompt="p",
         cron_expression="* * * * *",
@@ -176,23 +188,30 @@ def test_get_returns_created_task(store: SqlAlchemyScheduledTaskStore) -> None:
         agent_id="ag_1",
         timezone="UTC",
     )
-    fetched = store.get("st_get")
+    fetched = store.get(_uid("st_get"))
     assert fetched is not None
-    assert fetched.id == "st_get"
+    assert fetched.id == _uid("st_get")
 
 
 def test_get_missing_returns_none(store: SqlAlchemyScheduledTaskStore) -> None:
     """``get`` returns ``None`` for an unknown id."""
-    assert store.get("st_nope") is None
+    assert store.get(_uid("st_nope")) is None
 
 
 # ── list / list_active ────────────────────────────────────────────────────────
 
 
 def test_list_orders_by_created_at_then_id(store: SqlAlchemyScheduledTaskStore) -> None:
-    """``list`` returns all tasks ordered by ``created_at, id``."""
+    """``list`` returns all tasks ordered by ``created_at, id``.
+
+    ``created_at`` is integer seconds, so two back-to-back creates tie on it and
+    the tiebreak is ``id`` ASC. ``Uuid16`` orders by raw bytes, so pick two ids
+    whose byte order is deterministic (``…aa`` < ``…bb``).
+    """
+    id_a = "00000000-0000-0000-0000-0000000000aa"
+    id_b = "00000000-0000-0000-0000-0000000000bb"
     store.create(
-        scheduled_task_id="st_a",
+        scheduled_task_id=id_a,
         name="a",
         prompt="p",
         cron_expression="* * * * *",
@@ -201,7 +220,7 @@ def test_list_orders_by_created_at_then_id(store: SqlAlchemyScheduledTaskStore) 
         timezone="UTC",
     )
     store.create(
-        scheduled_task_id="st_b",
+        scheduled_task_id=id_b,
         name="b",
         prompt="p",
         cron_expression="* * * * *",
@@ -210,13 +229,13 @@ def test_list_orders_by_created_at_then_id(store: SqlAlchemyScheduledTaskStore) 
         timezone="UTC",
     )
     ids = [r.id for r in store.list()]
-    assert ids == ["st_a", "st_b"]
+    assert ids == [id_a, id_b]
 
 
 def test_list_active_excludes_non_active(store: SqlAlchemyScheduledTaskStore) -> None:
     """``list_active`` returns only active tasks, excluding paused/deleted."""
     store.create(
-        scheduled_task_id="st_active",
+        scheduled_task_id=_uid("st_active"),
         name="active",
         prompt="p",
         cron_expression="* * * * *",
@@ -227,7 +246,7 @@ def test_list_active_excludes_non_active(store: SqlAlchemyScheduledTaskStore) ->
     )
     for i, other_state in enumerate(("paused", "deleted")):
         store.create(
-            scheduled_task_id=f"st_{other_state}",
+            scheduled_task_id=_uid(f"st_{other_state}"),
             name=other_state,
             prompt="p",
             cron_expression="* * * * *",
@@ -237,7 +256,7 @@ def test_list_active_excludes_non_active(store: SqlAlchemyScheduledTaskStore) ->
             state=other_state,
         )
     active_ids = [r.id for r in store.list_active()]
-    assert active_ids == ["st_active"]
+    assert active_ids == [_uid("st_active")]
 
 
 # ── update ────────────────────────────────────────────────────────────────────
@@ -246,7 +265,7 @@ def test_list_active_excludes_non_active(store: SqlAlchemyScheduledTaskStore) ->
 def test_update_changes_fields_and_stamps_updated_at(store: SqlAlchemyScheduledTaskStore) -> None:
     """``update`` mutates supplied fields and sets ``updated_at``."""
     store.create(
-        scheduled_task_id="st_u",
+        scheduled_task_id=_uid("st_u"),
         name="before",
         prompt="p",
         cron_expression="* * * * *",
@@ -255,7 +274,7 @@ def test_update_changes_fields_and_stamps_updated_at(store: SqlAlchemyScheduledT
         timezone="UTC",
     )
     updated = store.update(
-        "st_u",
+        _uid("st_u"),
         name="after",
         cron_expression="0 0 * * *",
         base_branch="develop",
@@ -276,7 +295,7 @@ def test_update_changes_fields_and_stamps_updated_at(store: SqlAlchemyScheduledT
 def test_update_noop_leaves_updated_at_none(store: SqlAlchemyScheduledTaskStore) -> None:
     """An update that changes nothing does not stamp ``updated_at``."""
     store.create(
-        scheduled_task_id="st_noop",
+        scheduled_task_id=_uid("st_noop"),
         name="n",
         prompt="p",
         cron_expression="* * * * *",
@@ -284,14 +303,14 @@ def test_update_noop_leaves_updated_at_none(store: SqlAlchemyScheduledTaskStore)
         agent_id="ag",
         timezone="UTC",
     )
-    result = store.update("st_noop", name="n")  # same value
+    result = store.update(_uid("st_noop"), name="n")  # same value
     assert result is not None
     assert result.updated_at is None
 
 
 def test_update_missing_returns_none(store: SqlAlchemyScheduledTaskStore) -> None:
     """Updating an unknown task returns ``None``."""
-    assert store.update("st_missing", name="x") is None
+    assert store.update(_uid("st_missing"), name="x") is None
 
 
 # ── delete ────────────────────────────────────────────────────────────────────
@@ -300,7 +319,7 @@ def test_update_missing_returns_none(store: SqlAlchemyScheduledTaskStore) -> Non
 def test_delete_removes_task(store: SqlAlchemyScheduledTaskStore) -> None:
     """``delete`` removes the row and returns ``True``."""
     store.create(
-        scheduled_task_id="st_del",
+        scheduled_task_id=_uid("st_del"),
         name="n",
         prompt="p",
         cron_expression="* * * * *",
@@ -308,13 +327,13 @@ def test_delete_removes_task(store: SqlAlchemyScheduledTaskStore) -> None:
         agent_id="ag",
         timezone="UTC",
     )
-    assert store.delete("st_del") is True
-    assert store.get("st_del") is None
+    assert store.delete(_uid("st_del")) is True
+    assert store.get(_uid("st_del")) is None
 
 
 def test_delete_missing_returns_false(store: SqlAlchemyScheduledTaskStore) -> None:
     """``delete`` is idempotent — returns ``False`` when nothing was removed."""
-    assert store.delete("st_missing") is False
+    assert store.delete(_uid("st_missing")) is False
 
 
 # ── runs ──────────────────────────────────────────────────────────────────────
@@ -323,7 +342,7 @@ def test_delete_missing_returns_false(store: SqlAlchemyScheduledTaskStore) -> No
 def test_create_run_and_list_runs(store: SqlAlchemyScheduledTaskStore) -> None:
     """Runs are created and listed most-recent-first."""
     store.create(
-        scheduled_task_id="st_runs",
+        scheduled_task_id=_uid("st_runs"),
         name="n",
         prompt="p",
         cron_expression="* * * * *",
@@ -332,8 +351,8 @@ def test_create_run_and_list_runs(store: SqlAlchemyScheduledTaskStore) -> None:
         timezone="UTC",
     )
     store.create_run(
-        run_id="sr_1",
-        scheduled_task_id="st_runs",
+        run_id=_uid("sr_1"),
+        scheduled_task_id=_uid("st_runs"),
         status="succeeded",
         scheduled_at=100,
         conversation_id="conv_1",
@@ -341,15 +360,15 @@ def test_create_run_and_list_runs(store: SqlAlchemyScheduledTaskStore) -> None:
         finished_at=102,
     )
     store.create_run(
-        run_id="sr_2",
-        scheduled_task_id="st_runs",
+        run_id=_uid("sr_2"),
+        scheduled_task_id=_uid("st_runs"),
         status="failed",
         scheduled_at=200,
         error="boom",
         error_code="rate_limited",
     )
-    runs = store.list_runs("st_runs")
-    assert [r.id for r in runs] == ["sr_2", "sr_1"]  # scheduled_at DESC
+    runs = store.list_runs(_uid("st_runs"))
+    assert [r.id for r in runs] == [_uid("sr_2"), _uid("sr_1")]  # scheduled_at DESC
     assert runs[0].status == "failed"
     assert runs[0].error == "boom"
     assert runs[0].error_code == "rate_limited"
@@ -363,7 +382,7 @@ def test_list_runs_scoped_to_task(store: SqlAlchemyScheduledTaskStore) -> None:
     """``list_runs`` only returns runs for the requested task."""
     for rid in ("st_x", "st_y"):
         store.create(
-            scheduled_task_id=rid,
+            scheduled_task_id=_uid(rid),
             name=rid,
             prompt="p",
             cron_expression="* * * * *",
@@ -371,14 +390,18 @@ def test_list_runs_scoped_to_task(store: SqlAlchemyScheduledTaskStore) -> None:
             agent_id="ag",
             timezone="UTC",
         )
-    store.create_run(run_id="sr_x", scheduled_task_id="st_x", status="scheduled", scheduled_at=1)
-    store.create_run(run_id="sr_y", scheduled_task_id="st_y", status="scheduled", scheduled_at=1)
-    assert [r.id for r in store.list_runs("st_x")] == ["sr_x"]
+    store.create_run(
+        run_id=_uid("sr_x"), scheduled_task_id=_uid("st_x"), status="scheduled", scheduled_at=1
+    )
+    store.create_run(
+        run_id=_uid("sr_y"), scheduled_task_id=_uid("st_y"), status="scheduled", scheduled_at=1
+    )
+    assert [r.id for r in store.list_runs(_uid("st_x"))] == [_uid("sr_x")]
 
 
 def test_list_runs_empty_for_unknown_task(store: SqlAlchemyScheduledTaskStore) -> None:
     """A task with no runs (or an unknown id) yields an empty list."""
-    assert store.list_runs("st_none") == []
+    assert store.list_runs(_uid("st_none")) == []
 
 
 def test_run_status_round_trips_as_string(store: SqlAlchemyScheduledTaskStore) -> None:
@@ -389,7 +412,7 @@ def test_run_status_round_trips_as_string(store: SqlAlchemyScheduledTaskStore) -
     unchanged for every member of the closed set.
     """
     store.create(
-        scheduled_task_id="st_rt",
+        scheduled_task_id=_uid("st_rt"),
         name="n",
         prompt="p",
         cron_expression="* * * * *",
@@ -399,8 +422,8 @@ def test_run_status_round_trips_as_string(store: SqlAlchemyScheduledTaskStore) -
     )
     for i, name in enumerate(("scheduled", "running", "succeeded", "failed", "skipped")):
         run = store.create_run(
-            run_id=f"sr_{i}",
-            scheduled_task_id="st_rt",
+            run_id=_uid(f"sr_{i}"),
+            scheduled_task_id=_uid("st_rt"),
             status=name,
             scheduled_at=i,
         )
@@ -411,7 +434,7 @@ def test_run_status_round_trips_as_string(store: SqlAlchemyScheduledTaskStore) -
 def test_create_run_rejects_invalid_status_name(store: SqlAlchemyScheduledTaskStore) -> None:
     """An unknown status name is rejected by the codec (never reaches the DB)."""
     store.create(
-        scheduled_task_id="st_bad",
+        scheduled_task_id=_uid("st_bad"),
         name="n",
         prompt="p",
         cron_expression="* * * * *",
@@ -421,8 +444,8 @@ def test_create_run_rejects_invalid_status_name(store: SqlAlchemyScheduledTaskSt
     )
     with pytest.raises(ValueError, match=r"scheduled_task_runs\.status"):
         store.create_run(
-            run_id="sr_bad",
-            scheduled_task_id="st_bad",
+            run_id=_uid("sr_bad"),
+            scheduled_task_id=_uid("st_bad"),
             status="bogus",
             scheduled_at=1,
         )

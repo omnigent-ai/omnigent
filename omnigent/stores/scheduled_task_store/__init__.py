@@ -53,7 +53,7 @@ class ScheduledTaskStore(ABC):
         """
         Insert a new scheduled task.
 
-        :param scheduled_task_id: Pre-generated unique task id, e.g. ``"st_..."``.
+        :param scheduled_task_id: Pre-generated unique task id (a UUID string).
         :param name: Human-readable task name.
         :param prompt: The instruction dispatched to the agent on each firing.
         :param cron_expression: The required cron string for the recurring
@@ -162,7 +162,7 @@ class ScheduledTaskStore(ABC):
         """
         Insert a new scheduled-task-run row.
 
-        :param run_id: Pre-generated unique run id, e.g. ``"sr_..."``.
+        :param run_id: Pre-generated unique run id (a UUID string).
         :param scheduled_task_id: The task this run belongs to.
         :param status: One of ``scheduled``/``running``/``succeeded``/
             ``failed``/``skipped``.

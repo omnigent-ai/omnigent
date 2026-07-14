@@ -149,11 +149,15 @@ def test_state_default_on_omitted_insert(db_engine: Engine) -> None:
                 "INSERT INTO scheduled_tasks "
                 "(id, name, prompt, cron_expression, owner_user_id, agent_id, "
                 " timezone, created_at) "
-                "VALUES ('st_def', 'n', 'p', '0 9 * * *', 'u', 'ag_1', 'UTC', 1)"
+                "VALUES (X'00000000000000000000000000000de1', 'n', 'p', "
+                "'0 9 * * *', 'u', 'ag_1', 'UTC', 1)"
             )
         )
         state, workspace_id = conn.execute(
-            sa.text("SELECT state, workspace_id FROM scheduled_tasks WHERE id = 'st_def'")
+            sa.text(
+                "SELECT state, workspace_id FROM scheduled_tasks "
+                "WHERE id = X'00000000000000000000000000000de1'"
+            )
         ).one()
     assert state == 1  # 1 = 'active'
     assert workspace_id == 0
@@ -167,7 +171,8 @@ def test_cron_expression_accepts_recurring_row(db_engine: Engine) -> None:
                 "INSERT INTO scheduled_tasks "
                 "(id, name, prompt, cron_expression, owner_user_id, agent_id, "
                 " timezone, created_at) "
-                "VALUES ('st_cron', 'n', 'p', '0 9 * * *', 'u', 'ag', 'UTC', 1)"
+                "VALUES (X'0000000000000000000000000000c40e', 'n', 'p', "
+                "'0 9 * * *', 'u', 'ag', 'UTC', 1)"
             )
         )
 
@@ -181,7 +186,8 @@ def test_cron_expression_is_not_null(db_engine: Engine) -> None:
                     "INSERT INTO scheduled_tasks "
                     "(id, name, prompt, owner_user_id, agent_id, timezone, "
                     " created_at) "
-                    "VALUES ('st_none', 'n', 'p', 'u', 'ag', 'UTC', 1)"
+                    "VALUES (X'000000000000000000000000000000e0', 'n', 'p', "
+                    "'u', 'ag', 'UTC', 1)"
                 )
             )
 
@@ -205,7 +211,8 @@ def test_state_check_rejects_bad_code(db_engine: Engine) -> None:
                     "INSERT INTO scheduled_tasks "
                     "(id, name, prompt, cron_expression, owner_user_id, agent_id, "
                     " timezone, state, created_at) "
-                    "VALUES ('st_badstate', 'n', 'p', '0 9 * * *', 'u', 'ag', 'UTC', 99, 1)"
+                    "VALUES (X'00000000000000000000000000badc0d', 'n', 'p', "
+                    "'0 9 * * *', 'u', 'ag', 'UTC', 99, 1)"
                 )
             )
 
@@ -223,7 +230,8 @@ def test_scheduled_task_runs_status_check_rejects_bad_code(db_engine: Engine) ->
                 sa.text(
                     "INSERT INTO scheduled_task_runs "
                     "(id, scheduled_task_id, status, scheduled_at) "
-                    "VALUES ('sr_bad', 'st_1', 99, 1)"
+                    "VALUES (X'00000000000000000000000000005bad', "
+                    "X'00000000000000000000000000000001', 99, 1)"
                 )
             )
 
@@ -235,11 +243,15 @@ def test_scheduled_task_runs_status_check_accepts_valid_code(db_engine: Engine) 
             sa.text(
                 "INSERT INTO scheduled_task_runs "
                 "(id, scheduled_task_id, status, scheduled_at) "
-                "VALUES ('sr_ok', 'st_1', 1, 1)"  # 1 = 'scheduled'
+                "VALUES (X'000000000000000000000000000000c0', "
+                "X'00000000000000000000000000000001', 1, 1)"  # 1 = 'scheduled'
             )
         )
         status = conn.execute(
-            sa.text("SELECT status FROM scheduled_task_runs WHERE id = 'sr_ok'")
+            sa.text(
+                "SELECT status FROM scheduled_task_runs "
+                "WHERE id = X'000000000000000000000000000000c0'"
+            )
         ).scalar_one()
     assert status == 1
 

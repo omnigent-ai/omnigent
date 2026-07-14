@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import uuid
 from collections.abc import Iterator
 from contextvars import ContextVar
 from typing import Any
@@ -19,6 +20,7 @@ from sqlalchemy import (
     SmallInteger,
     String,
     Text,
+    TypeDecorator,
     UniqueConstraint,
     false,
     text,
@@ -33,6 +35,39 @@ from omnigent.db.compression import CompressedText
 # but MySQL cannot index a BLOB without a key-prefix length, so use fixed-length
 # BINARY(32) there — an exact fit for the digest and fully indexable.
 _CKSUM32 = LargeBinary(32).with_variant(MySQLBinary(32), "mysql")
+
+
+class Uuid16(TypeDecorator[str]):
+    """A UUID primary key stored as 16 raw bytes.
+
+    Python-side values are canonical UUID strings (e.g.
+    ``"a1b2c3d4-..."``); the database stores the 16-byte form —
+    ``BINARY(16)`` on MySQL (fixed-length and fully indexable, the same
+    reasoning as :data:`_CKSUM32`) and ``BLOB`` / ``BYTEA`` elsewhere.
+    Halves the storage of a 32-char hex string and indexes tighter.
+
+    ``process_bind_param`` accepts either a canonical/hex string or a
+    :class:`uuid.UUID`; ``process_result_value`` always returns the
+    canonical string form.
+    """
+
+    impl = LargeBinary(16)
+    cache_ok = True
+
+    def load_dialect_impl(self, dialect: Any) -> Any:
+        if dialect.name == "mysql":
+            return dialect.type_descriptor(MySQLBinary(16))
+        return dialect.type_descriptor(LargeBinary(16))
+
+    def process_bind_param(self, value: str | uuid.UUID | None, dialect: Any) -> bytes | None:  # noqa: ARG002
+        if value is None:
+            return None
+        return (value if isinstance(value, uuid.UUID) else uuid.UUID(value)).bytes
+
+    def process_result_value(self, value: bytes | None, dialect: Any) -> str | None:  # noqa: ARG002
+        if value is None:
+            return None
+        return str(uuid.UUID(bytes=bytes(value)))
 
 
 class OmnigentBase(DeclarativeBase):
@@ -1065,7 +1100,8 @@ class SqlScheduledTask(OmnigentBase):
     ``active``/``paused``/``deleted``) so a future merge is a
     column mapping rather than a rewrite.
 
-    :param id: Opaque PK, e.g. ``"st_a1b2c3..."``. On migration from an external
+    :param id: UUID primary key stored as 16 raw bytes (see :class:`Uuid16`),
+        surfaced as a canonical UUID string. On migration from an external
         scheduler a fresh id is minted here (the source scheduler's id is not
         reused as the PK).
     :param name: Human-readable task name, e.g. ``"nightly triage"``.
@@ -1118,7 +1154,7 @@ class SqlScheduledTask(OmnigentBase):
         server_default="0",
         default=current_workspace_id,
     )
-    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    id: Mapped[str] = mapped_column(Uuid16, primary_key=True)
     name: Mapped[str] = mapped_column(String(256), nullable=False)
     # Opaque free text, never SQL-queried — stored compressed (CompressedText).
     prompt: Mapped[str] = mapped_column(CompressedText, nullable=False)
@@ -1171,11 +1207,12 @@ class SqlScheduledTaskRun(OmnigentBase):
     advanced by the (future) scheduler as a firing moves through its lifecycle;
     this PR persists the shape only.
 
-    :param id: Opaque PK, e.g. ``"sr_a1b2c3..."``.
+    :param id: UUID primary key stored as 16 raw bytes (see :class:`Uuid16`),
+        surfaced as a canonical UUID string.
     :param scheduled_task_id: The task this run belongs to (relates to
-        ``scheduled_tasks.id``). Indexed for per-task history listing. Cascade
-        cleanup on task deletion is application-owned — no DB foreign key
-        (Rule R032).
+        ``scheduled_tasks.id``; also a :class:`Uuid16`). Indexed for per-task
+        history listing. Cascade cleanup on task deletion is application-owned —
+        no DB foreign key (Rule R032).
     :param conversation_id: The conversation created by this firing (relates to
         ``conversations.id``). ``None`` before dispatch, or after the referenced
         conversation is deleted (application-owned SET-NULL; no DB foreign key).
@@ -1205,10 +1242,10 @@ class SqlScheduledTaskRun(OmnigentBase):
         server_default="0",
         default=current_workspace_id,
     )
-    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    id: Mapped[str] = mapped_column(Uuid16, primary_key=True)
     # Relates to scheduled_tasks.id. No DB foreign key (Rule R032); cascade is
     # app-owned.
-    scheduled_task_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    scheduled_task_id: Mapped[str] = mapped_column(Uuid16, nullable=False)
     # Relates to conversations.id. No DB foreign key; app nulls on delete.
     conversation_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # Enum stored as a stable int code (see omnigent.db.enum_codecs

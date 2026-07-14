@@ -27,6 +27,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
+from omnigent.db.db_models import Uuid16
+
 revision: str = "z6a2b3c4d5e6"
 down_revision: str | None = "bb2c3d4e5f6a"
 branch_labels: str | Sequence[str] | None = None
@@ -38,9 +40,10 @@ def upgrade() -> None:
     op.create_table(
         "scheduled_tasks",
         sa.Column("workspace_id", sa.BigInteger(), nullable=False, server_default="0"),
-        # Opaque PK, e.g. "st_<hex>". On migration from an external scheduler a FRESH id is minted
+        # UUID PK stored as 16 raw bytes (Uuid16 → BINARY(16) on MySQL, BLOB/BYTEA
+        # elsewhere). On migration from an external scheduler a FRESH id is minted
         # here (not the source id).
-        sa.Column("id", sa.String(64), nullable=False),
+        sa.Column("id", Uuid16(), nullable=False),
         sa.Column("name", sa.String(256), nullable=False),
         # Opaque free text stored compressed (CompressedText → LargeBinary).
         sa.Column("prompt", sa.LargeBinary(), nullable=False),
@@ -86,8 +89,10 @@ def upgrade() -> None:
     op.create_table(
         "scheduled_task_runs",
         sa.Column("workspace_id", sa.BigInteger(), nullable=False, server_default="0"),
-        sa.Column("id", sa.String(64), nullable=False),
-        sa.Column("scheduled_task_id", sa.String(64), nullable=False),
+        # UUID PK + self-ref stored as 16 raw bytes (Uuid16). conversation_id
+        # relates to conversations.id (String) and stays a String column.
+        sa.Column("id", Uuid16(), nullable=False),
+        sa.Column("scheduled_task_id", Uuid16(), nullable=False),
         sa.Column("conversation_id", sa.String(64), nullable=True),
         # Enum stored as a stable int code (see omnigent.db.enum_codecs
         # SCHEDULED_TASK_RUN_STATUS: scheduled=1, running=2, succeeded=3,
