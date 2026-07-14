@@ -159,6 +159,10 @@ def _chat_to_anthropic(
     if tool_choice := extra.pop("tool_choice", None):
         payload["tool_choice"] = _convert_tool_choice(tool_choice)
 
+    # Provider-compatible admission tier.
+    if service_tier := extra.pop("service_tier", None):
+        payload["service_tier"] = service_tier
+
     # Explicit provider-native thinking configuration takes precedence over
     # the generic reasoning-effort translation.
     if thinking := extra.pop("thinking", None):
@@ -246,6 +250,7 @@ def _translate_part_to_anthropic(part: dict[str, Any]) -> dict[str, Any]:
       {"type": "base64", "media_type": "...", "data": "..."}}``
     - ``image_url`` with external URL → ``{"type": "image", "source":
       {"type": "url", "url": "..."}}``
+    - ``video_url`` -> ``{"type": "video", "source": ...}``
     - ``input_file`` with file_data → ``{"type": "document", "source":
       {"type": "base64", "media_type": "...", "data": "..."}}``
     - Unrecognized → passed through as-is.
@@ -276,6 +281,23 @@ def _translate_part_to_anthropic(part: dict[str, Any]) -> dict[str, Any]:
             "type": "image",
             "source": {"type": "url", "url": url},
         }
+
+    if part_type == "video_url":
+        video_url = part["video_url"]
+        url = video_url["url"]
+        parsed = parse_data_uri(url)
+        if parsed is not None:
+            source: dict[str, Any] = {
+                "type": "base64",
+                "media_type": parsed.media_type,
+                "data": parsed.data,
+            }
+        else:
+            source = {"type": "url", "url": url}
+        for key in ("detail", "fps", "max_long_side_pixel"):
+            if key in video_url:
+                source[key] = video_url[key]
+        return {"type": "video", "source": source}
 
     if part_type == "input_file":
         # file_data is a data: URI (e.g. "data:application/pdf;base64,...").

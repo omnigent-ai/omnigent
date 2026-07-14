@@ -228,6 +228,9 @@ compatible global endpoint is the default. Use `connection_params["base_url"]`
 for another region or use the `anthropic` model prefix with an Anthropic base
 URL to select the Messages protocol:
 
+`MiniMax-M3` accepts text, image, and video input. Both protocols also accept
+`service_tier="priority"`; omitting it uses the standard admission tier.
+
 | Region | Protocol | Model prefix | Base URL |
 |--------|----------|--------------|----------|
 | Global | OpenAI compatible | `minimax/` | `https://api.minimax.io/v1` |

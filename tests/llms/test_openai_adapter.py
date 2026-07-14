@@ -116,9 +116,11 @@ async def test_minimax_openai_endpoints_use_default_and_override(
 ) -> None:
     """MiniMax uses the global default and accepts the China base URL override."""
     requested_urls: list[str] = []
+    requested_bodies: list[dict] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         requested_urls.append(str(request.url))
+        requested_bodies.append(json.loads(request.content))
         return httpx.Response(
             200,
             json={
@@ -147,15 +149,35 @@ async def test_minimax_openai_endpoints_use_default_and_override(
         connection_params["base_url"] = api_base_url
 
     await adapter.chat_completions(
-        messages=[{"role": "user", "content": "Hello"}],
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe this video"},
+                    {
+                        "type": "video_url",
+                        "video_url": {"url": "https://example.com/demo.mp4"},
+                    },
+                ],
+            }
+        ],
         model="MiniMax-M3",
         tools=None,
         stream=False,
-        extra={},
+        extra={
+            "thinking": {"type": "adaptive"},
+            "service_tier": "priority",
+        },
         connection_params=connection_params,
     )
 
     assert requested_urls == [expected_url]
+    assert requested_bodies[0]["service_tier"] == "priority"
+    assert requested_bodies[0]["thinking"] == {"type": "adaptive"}
+    assert requested_bodies[0]["messages"][0]["content"][1] == {
+        "type": "video_url",
+        "video_url": {"url": "https://example.com/demo.mp4"},
+    }
 
 
 # ── Headers ──────────────────────────────────────────────

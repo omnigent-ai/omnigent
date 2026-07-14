@@ -231,6 +231,28 @@ def test_user_message_with_external_url() -> None:
     }
 
 
+def test_user_message_with_video_url() -> None:
+    """Video URLs translate to Anthropic-compatible video blocks."""
+    part = {
+        "type": "video_url",
+        "video_url": {
+            "url": "https://example.com/demo.mp4",
+            "detail": "high",
+            "fps": 2,
+        },
+    }
+    result = _translate_part_to_anthropic(part)
+    assert result == {
+        "type": "video",
+        "source": {
+            "type": "url",
+            "url": "https://example.com/demo.mp4",
+            "detail": "high",
+            "fps": 2,
+        },
+    }
+
+
 def test_user_message_with_file_data() -> None:
     """
     input_file with file_data translates to Anthropic document type.
@@ -404,9 +426,11 @@ async def test_minimax_anthropic_base_url_derives_messages_path(
 ) -> None:
     """The public MiniMax base URL resolves to ``/anthropic/v1/messages``."""
     requested_urls: list[str] = []
+    requested_bodies: list[dict] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         requested_urls.append(str(request.url))
+        requested_bodies.append(json.loads(request.content))
         return httpx.Response(
             200,
             json={
@@ -427,15 +451,35 @@ async def test_minimax_anthropic_base_url_derives_messages_path(
 
     adapter = AnthropicAdapter()
     await adapter.chat_completions(
-        messages=[{"role": "user", "content": "Hello"}],
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe this video"},
+                    {
+                        "type": "video_url",
+                        "video_url": {"url": "https://example.com/demo.mp4"},
+                    },
+                ],
+            }
+        ],
         model="MiniMax-M3",
         tools=None,
         stream=False,
-        extra={"thinking": {"type": "adaptive"}},
+        extra={
+            "thinking": {"type": "adaptive"},
+            "service_tier": "priority",
+        },
         connection_params={"api_key": "test-key", "base_url": api_base_url},
     )
 
     assert requested_urls == [f"{api_base_url}/v1/messages"]
+    assert requested_bodies[0]["service_tier"] == "priority"
+    assert requested_bodies[0]["thinking"] == {"type": "adaptive"}
+    assert requested_bodies[0]["messages"][0]["content"][1] == {
+        "type": "video",
+        "source": {"type": "url", "url": "https://example.com/demo.mp4"},
+    }
 
 
 # ── Stop sequences ───────────────────────────────────────
