@@ -164,7 +164,7 @@ def _fetch_remote_config() -> TelemetryConfig | None:
             _logger.debug("Telemetry disabled for OS %s by remote config", platform.system())
             return None
         rollout = cfg.get("rollout_percentage", 100)
-        if random.randint(0, 100) > rollout:
+        if random.random() * 100 >= rollout:
             _logger.debug("Telemetry excluded by rollout_percentage=%s", rollout)
             return None
 

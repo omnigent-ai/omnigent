@@ -257,6 +257,43 @@ def test_init_client_server_config_disabled(monkeypatch: pytest.MonkeyPatch) -> 
         monkeypatch.setattr(_mod, "_CLIENT", original_client)
 
 
+# ── _fetch_remote_config — rollout percentage ─────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("rollout", "sample", "included"),
+    [
+        (0, 0.0, False),
+        (50, 0.499, True),
+        (50, 0.5, False),
+        (100, 0.999, True),
+    ],
+)
+def test_fetch_remote_config_respects_rollout_percentage_boundaries(
+    rollout: int,
+    sample: float,
+    included: bool,
+) -> None:
+    """Rollout percentages include exactly their half-open share of samples."""
+    import omnigent.telemetry.client as _mod
+
+    config = {
+        "omnigent_version": _mod.VERSION,
+        "ingestion_url": "https://telemetry.example.test",
+        "rollout_percentage": rollout,
+    }
+    with (
+        patch("urllib.request.urlopen") as urlopen,
+        patch.object(_mod.random, "random", return_value=sample) as random_sample,
+    ):
+        response = urlopen.return_value.__enter__.return_value
+        response.read.return_value = json.dumps(config).encode("utf-8")
+        result = _mod._fetch_remote_config()
+
+    random_sample.assert_called_once_with()
+    assert (result is not None) is included
+
+
 # ── get_installation_id ──────────────────────────────────────────────────────
 
 
