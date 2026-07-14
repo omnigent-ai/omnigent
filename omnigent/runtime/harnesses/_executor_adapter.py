@@ -646,7 +646,9 @@ class ExecutorAdapter(HarnessApp):
             # so the post-stream dispatch reuses the same call_id for deduplication.
             # Emit bare names (strip MCP prefix) to match the Omnigent wire shape.
             tool_use_id = _call_id_from_metadata(event.metadata)
-            if tool_use_id is not None:
+            # Self-executed tools never round-trip _stable_tool_executor. Queuing their ids
+            # would mis-pair the next dispatched tool call.
+            if tool_use_id is not None and not (event.metadata or {}).get("self_executed"):
                 self._pending_mcp_call_ids.append(tool_use_id)
             call_id = tool_use_id or f"call_{uuid.uuid4().hex[:12]}"
             bare_name = _strip_mcp_tool_prefix(event.name)
@@ -671,6 +673,35 @@ class ExecutorAdapter(HarnessApp):
             call_id = _call_id_from_metadata(getattr(event, "metadata", None)) or ""
             if not call_id or call_id in self._dispatched_call_ids:
                 return
+            # Self-executed completions: the observed function_call above went
+            # out with status "in_progress", which the item store does not
+            # persist -- only completed function_calls become stored items.
+            # Emit a completed function_call with the SAME call_id: live
+            # consumers dedupe it against the inline observed card by call_id,
+            # and the store gets a persistable pair so the card survives reload.
+            if (getattr(event, "metadata", None) or {}).get("self_executed"):
+                fc_args = (event.metadata or {}).get("arguments")
+                ctx.emit(
+                    OutputItemDoneEvent(
+                        type="response.output_item.done",
+                        item={
+                            "id": f"fc_{uuid.uuid4().hex[:12]}",
+                            "type": "function_call",
+                            "status": "completed",
+                            # Same normalization as the observed request emit,
+                            # so the reloaded card's name matches the live one.
+                            "name": _strip_mcp_tool_prefix(event.name),
+                            "arguments": _serialize_args(fc_args)
+                            if isinstance(fc_args, dict)
+                            else "{}",
+                            "call_id": call_id,
+                            # Durable card: carry the active model like the
+                            # scaffold dispatch path does. response_id is the
+                            # fallback for events translated outside a turn.
+                            "agent": self._current_agent or ctx.response_id,
+                        },
+                    )
+                )
             item: dict[str, Any] = {
                 "id": f"fco_{uuid.uuid4().hex[:12]}",
                 "type": "function_call_output",
