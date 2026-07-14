@@ -22,16 +22,16 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import urlencode
 
-import httpx
 import pytest
 import uvicorn
 from fastapi import FastAPI, Request
-from playwright.sync_api import Browser, expect
+from playwright.sync_api import Browser, Playwright, expect
 from starlette.responses import HTMLResponse
 
 from omnigent.server.admin_list import AdminList
 from omnigent.server.auth import UnifiedAuthProvider
 from omnigent.server.oidc import OIDCConfig
+from omnigent.server.routes import auth as auth_routes
 from omnigent.server.routes.auth import create_auth_router
 from tests.e2e_ui.conftest import _find_free_port
 
@@ -135,15 +135,13 @@ def _build_auth_app(base_url: str, admin_list_path: Path) -> FastAPI:
     return app
 
 
-def _wait_for_server(base_url: str, timeout: float = 10.0) -> None:
-    """Wait until the local uvicorn listener accepts HTTP requests."""
+def _wait_for_server(server: uvicorn.Server, base_url: str, timeout: float = 10.0) -> None:
+    """Wait until the local uvicorn server reports that it has started."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        try:
-            httpx.get(base_url, timeout=0.5)
+        if server.started:
             return
-        except (httpx.ConnectError, httpx.ReadError, httpx.TimeoutException):
-            time.sleep(0.05)
+        time.sleep(0.05)
     raise RuntimeError(f"OIDC handoff test server did not start at {base_url}")
 
 
@@ -163,12 +161,13 @@ def oidc_handoff_server(tmp_path: Path) -> Iterator[OidcHandoffServer]:
     )
     server_thread = threading.Thread(target=server.run, daemon=True)
 
-    with patch(
-        "omnigent.server.routes.auth.httpx.AsyncClient",
+    with patch.object(
+        auth_routes.httpx,  # type: ignore[attr-defined]
+        "AsyncClient",
         return_value=_mock_idp_client(),
     ):
         server_thread.start()
-        _wait_for_server(base_url)
+        _wait_for_server(server, base_url)
         try:
             yield OidcHandoffServer(base_url=base_url)
         finally:
@@ -181,28 +180,28 @@ def oidc_handoff_server(tmp_path: Path) -> Iterator[OidcHandoffServer]:
 
 def test_system_browser_session_is_bridged_to_isolated_webview(
     browser: Browser,
+    playwright: Playwright,
     oidc_handoff_server: OidcHandoffServer,
 ) -> None:
     """Complete browser OIDC, poll its ticket, and authenticate the WebView."""
     base_url = oidc_handoff_server.base_url
-
-    ticket_response = httpx.post(f"{base_url}/auth/cli-login", timeout=5)
-    ticket_response.raise_for_status()
-    ticket_payload = ticket_response.json()
-    ticket = ticket_payload["ticket"]
-    login_url = f"{base_url}{ticket_payload['login_url']}"
-
-    pending_response = httpx.get(
-        f"{base_url}/auth/cli-poll",
-        params={"ticket": ticket},
-        timeout=5,
-    )
-    assert pending_response.status_code == 202
-    assert pending_response.json() == {"status": "pending"}
-
+    native_request_context = playwright.request.new_context(base_url=base_url)
     system_browser_context = browser.new_context()
     webview_context = browser.new_context()
     try:
+        ticket_response = native_request_context.post("/auth/cli-login")
+        assert ticket_response.ok, ticket_response.text()
+        ticket_payload = ticket_response.json()
+        ticket = ticket_payload["ticket"]
+        login_url = f"{base_url}{ticket_payload['login_url']}"
+
+        pending_response = native_request_context.get(
+            "/auth/cli-poll",
+            params={"ticket": ticket},
+        )
+        assert pending_response.status == 202
+        assert pending_response.json() == {"status": "pending"}
+
         system_browser_page = system_browser_context.new_page()
         system_browser_page.goto(login_url)
         expect(
@@ -213,12 +212,11 @@ def test_system_browser_session_is_bridged_to_isolated_webview(
         expect(system_browser_page.get_by_role("heading", name="Login successful")).to_be_visible()
         expect(system_browser_page.get_by_text(_TEST_EMAIL)).to_be_visible()
 
-        poll_response = httpx.get(
-            f"{base_url}/auth/cli-poll",
+        poll_response = native_request_context.get(
+            "/auth/cli-poll",
             params={"ticket": ticket},
-            timeout=5,
         )
-        poll_response.raise_for_status()
+        assert poll_response.ok, poll_response.text()
         session_token = poll_response.json()["token"]
 
         webview_page = webview_context.new_page()
@@ -234,12 +232,12 @@ def test_system_browser_session_is_bridged_to_isolated_webview(
         expect(webview_page.get_by_role("heading", name="Authenticated WebView")).to_be_visible()
         expect(webview_page.get_by_text(_TEST_EMAIL)).to_be_visible()
 
-        consumed_response = httpx.get(
-            f"{base_url}/auth/cli-poll",
+        consumed_response = native_request_context.get(
+            "/auth/cli-poll",
             params={"ticket": ticket},
-            timeout=5,
         )
-        assert consumed_response.status_code == 410
+        assert consumed_response.status == 410
     finally:
         webview_context.close()
         system_browser_context.close()
+        native_request_context.dispose()
