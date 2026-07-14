@@ -90,6 +90,7 @@ from omnigent.harness_plugins import (
     CODEX_NATIVE_CODING_AGENT,
     CURSOR_NATIVE_CODING_AGENT,
     KIRO_NATIVE_CODING_AGENT,
+    PI_NATIVE_CODING_AGENT,
     NativeCodingAgent,
 )
 from omnigent.host.frames import (
@@ -436,6 +437,14 @@ _EXTERNAL_SESSION_USAGE_TYPE: str = "external_session_usage"
 # on the conversation and publishes a ``session.model`` SSE event so the
 # web model picker reflects the switch. Payload: ``{"model": "opus"}``.
 _EXTERNAL_MODEL_CHANGE_TYPE: str = "external_model_change"
+# Full model catalog a native harness loaded, reported by its resident
+# extension on session start (pi-native: ``ctx.modelRegistry.getAll()``).
+# Unlike the runner file-read path, this reflects whatever models the harness
+# actually has regardless of how it authenticated (Omnigent-configured
+# provider OR the harness's own ``/login``), so the Web UI picker populates in
+# every auth path. Cached (reload-surviving) and published as
+# ``session.model_options``. Payload: ``{"models": [{"id": "..."}, ...]}``.
+_EXTERNAL_MODEL_OPTIONS_TYPE: str = "external_model_options"
 # Active reasoning-effort switch observed inside a native terminal. Persists
 # ``reasoning_effort`` on the conversation and publishes a
 # ``session.reasoning_effort`` SSE event so the web effort picker reflects the
@@ -585,6 +594,7 @@ _CODEX_NATIVE_MODEL = CODEX_NATIVE_CODING_AGENT.agent_name
 _CURSOR_NATIVE_WRAPPER_LABEL_VALUE = CURSOR_NATIVE_CODING_AGENT.wrapper_label
 _CURSOR_NATIVE_HARNESS = CURSOR_NATIVE_CODING_AGENT.harness
 _KIRO_NATIVE_WRAPPER_LABEL_VALUE = KIRO_NATIVE_CODING_AGENT.wrapper_label
+_PI_NATIVE_WRAPPER_LABEL_VALUE = PI_NATIVE_CODING_AGENT.wrapper_label
 _CLAUDE_NATIVE_MESSAGE_TIMEOUT_S = 30.0
 _NATIVE_TERMINAL_START_FAILED_CODE = "native_terminal_start_failed"
 _NATIVE_TERMINAL_ENSURE_FAILED_CODE = "native_terminal_ensure_failed"
@@ -896,6 +906,7 @@ _ALLOWED_EVENT_TYPES: frozenset[str] = frozenset(ITEM_TYPE_TO_DATA_CLS.keys()) |
     _EXTERNAL_COMPACTION_STATUS_TYPE,
     _EXTERNAL_MCP_STARTUP_TYPE,
     _EXTERNAL_MODEL_CHANGE_TYPE,
+    _EXTERNAL_MODEL_OPTIONS_TYPE,
     _EXTERNAL_REASONING_EFFORT_CHANGE_TYPE,
     _EXTERNAL_SESSION_TODOS_TYPE,
     _EXTERNAL_SUBAGENT_START_TYPE,
@@ -1133,6 +1144,13 @@ _runner_skills_inflight: dict[str, asyncio.Task[None]] = {}
 _model_options_cache: dict[str, list[dict[str, Any]]] = {}
 _model_options_inflight: dict[str, asyncio.Task[None]] = {}
 _CODEX_MODEL_OPTIONS_RETRY_DELAYS_S = (0.25, 0.5, 1.0, 2.0, 2.0)
+# Per-session model catalog PUSHED by a native harness's extension
+# (``external_model_options``), as opposed to the runner-fetched
+# ``_model_options_cache`` above. Kept in a separate cache that a browser
+# reload (``refresh_state``) does NOT clear: the extension only pushes on
+# session start, which does not re-fire on reload, so clearing it would blank
+# the picker on every refresh. Dropped only on session teardown/delete.
+_pushed_model_options_cache: dict[str, list[dict[str, Any]]] = {}
 
 
 @dataclass
@@ -3651,6 +3669,72 @@ async def _persist_external_model_change(
         model=model,
     )
     session_stream.publish(session_id, event.model_dump())
+
+
+def _persist_external_model_options(
+    session_id: str,
+    conv: Conversation,
+    body: SessionEventInput,
+) -> None:
+    """
+    Record the model catalog a native harness's extension reported.
+
+    Sourced from the harness's live model registry (pi-native:
+    ``ctx.modelRegistry.getAvailable()``), so it reflects the models the
+    harness actually loaded no matter how it authenticated — an
+    Omnigent-configured provider OR the harness's own ``/login``. This is why
+    the pi picker populates even in the ``/login`` path, where no
+    ``models.json`` is written into the bridge dir for a file-read to find.
+
+    Gated to the pi-native wrapper: only :func:`_fetch_model_options` *serves*
+    this cache for pi-native, so accepting a push from any other session would
+    just leave a stray cache entry alive until teardown. Reject at ingest to
+    keep the contract explicit.
+
+    Stores into :data:`_pushed_model_options_cache` (which a browser reload
+    does NOT clear — the extension only pushes on session start) and publishes
+    ``session.model_options`` so open clients re-read the snapshot. An empty
+    list evicts the entry rather than caching nothing.
+
+    :param session_id: Session/conversation identifier, e.g.
+        ``"conv_abc123"``.
+    :param conv: Conversation row whose labels identify the wrapper.
+    :param body: External model-options event body. ``data.models`` must be a
+        list of ``{"id": str, ...}`` objects.
+    :raises OmnigentError: If the session is not pi-native, or ``data.models``
+        is missing or malformed.
+    """
+    if conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY) != _PI_NATIVE_WRAPPER_LABEL_VALUE:
+        raise OmnigentError(
+            "external_model_options is only accepted for pi-native sessions",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    raw_models = body.data.get("models")
+    if not isinstance(raw_models, list):
+        raise OmnigentError(
+            "external_model_options requires data.models to be a list",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    options: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw in raw_models:
+        model_id = raw.get("id") if isinstance(raw, dict) else None
+        if not isinstance(model_id, str) or not model_id or model_id in seen:
+            continue
+        seen.add(model_id)
+        display = raw.get("displayName") if isinstance(raw, dict) else None
+        options.append(
+            {
+                "id": model_id,
+                "displayName": display if isinstance(display, str) and display else model_id,
+                "isDefault": bool(raw.get("isDefault", False)) if isinstance(raw, dict) else False,
+            }
+        )
+    if options:
+        _pushed_model_options_cache[session_id] = options
+    else:
+        _pushed_model_options_cache.pop(session_id, None)
+    _publish_model_options(session_id)
 
 
 def _validate_external_reasoning_effort(body: SessionEventInput) -> str | None:
@@ -19206,6 +19290,10 @@ def create_sessions_router(
         - ``"external_model_change"`` persists a terminal-observed
           model switch to ``model_override`` and publishes a
           ``session.model`` SSE event so the web picker reflects it.
+        - ``"external_model_options"`` records the model catalog a native
+          harness's extension reported (its live model registry) into a
+          reload-surviving cache and publishes ``session.model_options`` so
+          the web picker populates regardless of how the harness authenticated.
         - ``"external_reasoning_effort_change"`` persists a terminal-observed
           thinking-level switch to ``reasoning_effort`` and publishes a
           ``session.reasoning_effort`` SSE event so the web picker reflects it.
@@ -19289,6 +19377,7 @@ def create_sessions_router(
             _EXTERNAL_COMPACTION_STATUS_TYPE,
             _EXTERNAL_MCP_STARTUP_TYPE,
             _EXTERNAL_MODEL_CHANGE_TYPE,
+            _EXTERNAL_MODEL_OPTIONS_TYPE,
             _EXTERNAL_REASONING_EFFORT_CHANGE_TYPE,
             _EXTERNAL_SESSION_TODOS_TYPE,
             _EXTERNAL_SUBAGENT_START_TYPE,
@@ -19872,6 +19961,9 @@ def create_sessions_router(
                 body,
                 conversation_store,
             )
+            return {"queued": False}
+        if body.type == _EXTERNAL_MODEL_OPTIONS_TYPE:
+            _persist_external_model_options(session_id, conv, body)
             return {"queued": False}
         if body.type == _EXTERNAL_REASONING_EFFORT_CHANGE_TYPE:
             await _persist_external_reasoning_effort_change(
@@ -20571,6 +20663,10 @@ def create_sessions_router(
         # for reload visibility while the session exists, so a session
         # whose MCP startup never settled clean would leak its entry.
         _session_mcp_startup_cache.pop(session_id, None)
+        # Same for the extension-pushed model catalog: kept across reloads
+        # while the session exists (the extension only pushes on start), so a
+        # deleted session would otherwise leak its entry for the process life.
+        _pushed_model_options_cache.pop(session_id, None)
         # Drop the deleted session's per-user read-state from every user's
         # caches so they don't accumulate orphan entries for the process
         # lifetime.
@@ -21413,6 +21509,10 @@ def _model_options_from_wire(raw_models: Any) -> list[dict[str, Any]]:
 # the cursor picker mid-session.
 _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER: dict[str, str] = {
     _CODEX_NATIVE_WRAPPER_LABEL_VALUE: "codex-model-options",
+    # pi-native is deliberately NOT here: its catalog is PUSHED by the resident
+    # extension (``external_model_options`` → ``_pushed_model_options_cache``),
+    # not fetched from a runner route, so the picker works in every auth path
+    # (Omnigent provider OR pi's own ``/login``) — see ``_fetch_model_options``.
 }
 
 
@@ -21454,6 +21554,14 @@ async def _fetch_model_options(
         from omnigent.kiro_native import kiro_base_model_options
 
         return kiro_base_model_options()
+    if wrapper == _PI_NATIVE_WRAPPER_LABEL_VALUE:
+        # pi-native's catalog is PUSHED by its extension (its live
+        # ``ctx.modelRegistry``), not fetched: that reflects the models pi
+        # actually loaded regardless of auth path (Omnigent provider OR pi's
+        # own ``/login``), so the picker populates even when no ``models.json``
+        # is written into the bridge dir. Empty until the extension posts
+        # ``external_model_options`` on session start.
+        return _pushed_model_options_cache.get(session_id, [])
     endpoint = _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER.get(wrapper or "")
     if endpoint is None:
         return []

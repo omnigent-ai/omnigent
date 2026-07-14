@@ -11142,6 +11142,58 @@ def create_runner_app(
         _wake_parent_after_native_interrupt(conv_id)
         return Response(status_code=204)
 
+    async def _handle_pi_native_model_change(
+        conv_id: str,
+        model: str | None,
+    ) -> Response:
+        """
+        Switch a pi-native session's model inside the resident Pi process.
+
+        Pi-native turns run inside the terminal's Pi process, and the
+        ``--model`` flag on the ``pi`` binary is baked in at spawn. To
+        propagate a web-picked model live — without relaunching the pane —
+        queue a ``model_change`` payload; the extension consumes it in the
+        TUI process, resolves the id against ``ctx.modelRegistry`` and calls
+        Pi's ``setModel`` (immediate, no ``/reload``).
+
+        Skipped silently when *model* is ``None`` or empty / whitespace only:
+        Pi has no "use the spawn default" API, so a clear only takes effect on
+        the next spawn via ``--model``.
+
+        :param conv_id: Session/conversation identifier, e.g.
+            ``"conv_abc123"``.
+        :param model: New persisted model identifier, e.g.
+            ``"databricks-claude-sonnet-4-6"``; ``None`` when the user
+            cleared the override.
+        :returns: 204 when the payload was queued or skipped; 503 if the
+            bridge inbox could not be written (persisted value still applies
+            on the next spawn).
+        """
+        from omnigent.pi_native_bridge import bridge_dir_for_session_id, enqueue_model_change
+
+        if model is None or not model.strip():
+            return Response(status_code=204)
+        try:
+            await asyncio.to_thread(
+                enqueue_model_change,
+                bridge_dir_for_session_id(conv_id),
+                model.strip(),
+            )
+        except OSError as exc:
+            _logger.warning(
+                "Pi-native model change failed for session=%s",
+                conv_id,
+                exc_info=True,
+            )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "pi_native_model_failed",
+                    "detail": _client_safe_error_detail(exc, context="pi-native model change"),
+                },
+            )
+        return Response(status_code=204)
+
     async def _teardown_session_terminals(conv_id: str) -> None:
         """Close a session's terminal resources and announce their removal.
 
@@ -15250,8 +15302,9 @@ def create_runner_app(
             # boundaries can propagate it live. Claude-native and
             # cursor-native type ``/model`` into their tmux pane;
             # codex-native queues a Codex app-server next-turn settings
-            # update. Other harnesses pick up the persisted value on the
-            # next turn and 204 here.
+            # update; pi-native queues an inbox ``model_change`` its
+            # extension applies via Pi's ``setModel``. Other harnesses pick
+            # up the persisted value on the next turn and 204 here.
             harness = _session_harness_name(conversation_id)
             if harness in (
                 "claude-native",
@@ -15259,6 +15312,7 @@ def create_runner_app(
                 "cursor-native",
                 "opencode-native",
                 "kiro-native",
+                "pi-native",
             ):
                 model = body.get("model") if isinstance(body, dict) else None
                 if model is not None and not isinstance(model, str):
@@ -15288,6 +15342,11 @@ def create_runner_app(
                     )
                 if harness == "kiro-native":
                     return await _handle_kiro_native_model_change(
+                        conversation_id,
+                        model,
+                    )
+                if harness == "pi-native":
+                    return await _handle_pi_native_model_change(
                         conversation_id,
                         model,
                     )
@@ -17658,11 +17717,14 @@ def create_runner_app(
                 },
             )
 
-    # Note: cursor-native has no model-options route. Its catalog is a curated
-    # *static* base list served directly by the AP server (see
-    # ``_fetch_model_options`` in omnigent/server/routes/sessions.py), so it
-    # needs no runner round-trip and stays immune to the runner-backed cache
-    # invalidation that would otherwise blank the picker on an effort change.
+    # Note: neither cursor-native nor pi-native has a model-options route.
+    # Cursor's catalog is a curated *static* base list served directly by the
+    # AP server (see ``_fetch_model_options`` in
+    # omnigent/server/routes/sessions.py). Pi's is PUSHED by its resident
+    # extension (``external_model_options``, from the live ``ctx.modelRegistry``)
+    # rather than read from a file, so the picker works in every auth path
+    # (Omnigent-configured provider OR pi's own ``/login``) — a launch-written
+    # ``models.json`` isn't present in the ``/login`` case.
 
     @app.post("/v1/sessions/{session_id}/skills/resolve")
     async def resolve_session_skill(session_id: str, request: Request) -> JSONResponse:

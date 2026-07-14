@@ -59,6 +59,7 @@ import {
 import { cn } from "@/lib/utils";
 import { isNativeWrapper as isNativeWrapperLabel } from "@/lib/nativeCodingAgents";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isSingleUserMode } from "@/lib/capabilities";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import { useChatStore } from "@/store/chatStore";
 import { livenessRowFromSession, useSessionLiveness } from "@/hooks/useSessionLiveness";
@@ -370,13 +371,19 @@ export function AppShell() {
   // Read-write or higher can manage sharing; top-level only. Sharing a
   // sub-agent is a no-op anyway — children inherit the parent's grants via
   // the server's parent-delegation path — so we hide the affordance.
+  // Also hidden in single-user mode: with no other users to grant to, the
+  // affordance is meaningless (unlike the local-server / sharing-off cases
+  // below, which stay present-but-disabled with an explanatory tooltip).
+  const serverInfo = useServerInfo();
   const canShare =
-    !!conversationId && isKnownTopLevel && (permissionLevel === null || permissionLevel >= 3);
+    !!conversationId &&
+    isKnownTopLevel &&
+    (permissionLevel === null || permissionLevel >= 3) &&
+    !isSingleUserMode(serverInfo);
   // Two independent reasons the Share affordance is present-but-disabled: a
-  // local single-user server can't share at all, and a deployed server whose
+  // local server can't produce openable links, and a deployed server whose
   // admin set OMNIGENT_SHARING_MODE=off reports sharing_mode "off" via
   // /v1/info. Fail open (share enabled) while the capability probe loads.
-  const serverInfo = useServerInfo();
   const sharingOff = serverInfo !== "loading" && serverInfo.sharing_mode === "off";
   const shareDisabled = canShare && (isCurrentServerLocal() || sharingOff);
   const shareDisabledReason = !shareDisabled

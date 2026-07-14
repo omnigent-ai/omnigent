@@ -238,30 +238,6 @@ def _databricks_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
     )
 
 
-def _gateway_workspace_url(gateway_base_url: str) -> str | None:
-    """Derive the Databricks workspace base URL from an AI Gateway URL.
-
-    The AI Gateway hostname carries an ``ai-gateway`` DNS label that the
-    workspace host does not (e.g. ``12345.ai-gateway.cloud.databricks.com`` →
-    ``12345.cloud.databricks.com``). The workspace URL is the root for both
-    ``/api/2.0/serving-endpoints`` (model catalog) and ``/serving-endpoints``
-    (OpenAI Completions base URL).
-
-    :param gateway_base_url: An AI Gateway base URL, e.g.
-        ``"https://<id>.ai-gateway.cloud.databricks.com/codex/v1"``.
-    :returns: ``https://<workspace>``, or ``None`` when the URL doesn't carry
-        the expected ``ai-gateway`` label.
-    """
-    parsed = urlparse(gateway_base_url)
-    if not parsed.hostname:
-        return None
-    labels = parsed.hostname.split(".")
-    if _DATABRICKS_AI_GATEWAY_LABEL not in labels:
-        return None
-    labels.remove(_DATABRICKS_AI_GATEWAY_LABEL)
-    return f"https://{'.'.join(labels)}"
-
-
 def _databricks_openai_provider(
     api_key: str,
     serving_endpoints_url: str,
@@ -532,25 +508,39 @@ def _cli_config_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
     if transport is None:
         return None
     api_key = f"!{transport.auth_command}"
-    # Derive the workspace base URL from the AI Gateway URL. Used for both the
-    # serving-endpoints OpenAI Completions base URL and the model-catalog API
-    # call. Falls back gracefully when the URL lacks the ai-gateway label.
-    workspace_url = _gateway_workspace_url(transport.base_url)
-    # Fetch the live model list. Run the auth command once to get the current
-    # token — Pi will refresh per request via the !command apiKey.
+    # The AI Gateway hostname (e.g. ``<id>.ai-gateway.cloud.databricks.com``)
+    # is NOT the workspace hostname — stripping ``ai-gateway.`` produces an
+    # NXDOMAIN. Use resolve_databricks_workspace for the real workspace URL,
+    # but use the auth_command token (same credential the gateway uses) for
+    # the API call. The SDK's minted token may not have serving-endpoints
+    # access on workspaces where access is controlled via the auth command.
     claude_models: list[dict[str, Any]] = []
     openai_models: list[dict[str, Any]] = []
-    if workspace_url and transport.auth_command:
+    real_workspace_url: str | None = None
+    try:
+        from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
+
+        real_workspace_url = resolve_databricks_workspace(None).host
+    except Exception:  # noqa: BLE001 — no .databrickscfg → skip listing
+        _LOGGER.info(
+            "pi-native: cli-config path could not resolve workspace URL "
+            "for model listing; Pi will show only the selected model"
+        )
+    if real_workspace_url and transport.auth_command:
         token = _run_auth_command(transport.auth_command)
         if token:
-            claude_models, openai_models = _fetch_pi_model_lists(workspace_url, token)
+            claude_models, openai_models = _fetch_pi_model_lists(real_workspace_url, token)
+        else:
+            _LOGGER.info(
+                "pi-native: auth command produced no token; Pi will show only the selected model"
+            )
     additional: dict[str, Any] = (
         {
             _PI_OPENAI_PROVIDER_ID: _databricks_openai_provider(
-                api_key, f"{workspace_url}/serving-endpoints", openai_models
+                api_key, f"{real_workspace_url}/serving-endpoints", openai_models
             )
         }
-        if workspace_url and openai_models
+        if real_workspace_url and openai_models
         else {}
     )
     return PiProviderConfig(
@@ -687,15 +677,30 @@ def resolve_pi_native_provider(
         if resolved is None:
             # The provider matched a translatable kind but its details could not
             # be resolved (e.g. a Databricks gateway whose codex config table is
-            # missing). Don't swallow it silently — a future user mystified by an
-            # "OpenRouter auth error despite configuring Databricks" needs this.
+            # missing). Try the databricks-kind provider as a fallback — a common
+            # setup has a cli-config pi default alongside a databricks-kind
+            # provider that carries the actual workspace credentials.
             _LOGGER.warning(
                 "pi-native: configured provider %r (kind %r) could not be translated "
-                "into native Pi config; Pi will use its own login (which may hold "
-                "unrelated/stale credentials).",
+                "into native Pi config; trying databricks-kind fallback.",
                 entry.name,
                 entry.kind,
             )
+            from omnigent.onboarding.provider_config import _parse_provider
+
+            providers = config.get("providers") or {}
+            db_entry = next(
+                (
+                    _parse_provider(name, raw)  # type: ignore[arg-type]
+                    for name, raw in (providers.items() if isinstance(providers, dict) else [])
+                    if isinstance(raw, dict) and raw.get("kind") == DATABRICKS_KIND
+                ),
+                None,
+            )
+            if db_entry is not None:
+                resolved = _databricks_pi_provider(db_entry, model=model)
+            if resolved is None:
+                _LOGGER.warning("pi-native: no usable provider found; Pi will use its own login.")
         return resolved
     except Exception:  # noqa: BLE001 — any resolution failure must not break launch
         # Any failure (malformed config, duplicate per-family default, or an

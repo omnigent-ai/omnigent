@@ -310,6 +310,7 @@ function SessionNavButton({ to }: { to: string }) {
 function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
   return {
     accounts_enabled: false,
+    single_user: false,
     login_url: null,
     needs_setup: false,
     databricks_features: false,
@@ -2794,6 +2795,36 @@ describe("AppShell share action", () => {
         "title",
         "Sharing has been disabled for this Omnigent server.",
       );
+    });
+  });
+
+  it("hides the Share button entirely in single-user mode", () => {
+    // Non-local origin isolates the single-user gate from the local-server
+    // path. The explicit single_user marker (not just accounts-off/no-login,
+    // which a multi-user header deploy also reports) means no other users to
+    // share with, so the button is removed — not disabled like the
+    // local-server / sharing-off cases.
+    withWindowOrigin("https://app.example.com", () => {
+      mockConversations([{ id: "conv_top", permission_level: null }]);
+
+      renderShell("/c/conv_top", serverInfo({ single_user: true }));
+
+      expect(screen.queryByRole("button", { name: /share session/i })).toBeNull();
+    });
+  });
+
+  it("keeps the Share button on a multi-user header-auth deploy (not single_user)", () => {
+    // Header-auth multi-user (SSO proxy): accounts off AND no login_url, same
+    // shape as single-user, but single_user is false — the button must stay.
+    // This is the regression the single_user signal fixes.
+    withWindowOrigin("https://app.example.com", () => {
+      mockConversations([{ id: "conv_top", permission_level: null }]);
+
+      renderShell("/c/conv_top", serverInfo({ single_user: false }));
+
+      const shareButton = screen.getByRole("button", { name: /share session/i });
+      expect(shareButton).toBeInTheDocument();
+      expect(shareButton).toBeEnabled();
     });
   });
 
