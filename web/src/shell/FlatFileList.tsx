@@ -104,6 +104,25 @@ function FileListItem({
           >
             {gitStatusLetter(file.status)}
           </span>
+          {(file.lines_added !== null || file.lines_removed !== null) && (
+            <span
+              className="shrink-0 font-mono text-[10px]"
+              aria-label={[
+                file.lines_added !== null && `${file.lines_added} lines added`,
+                file.lines_removed !== null && `${file.lines_removed} removed`,
+              ]
+                .filter(Boolean)
+                .join(", ")}
+            >
+              {file.lines_added !== null && (
+                <span className="text-green-600 dark:text-green-400">+{file.lines_added}</span>
+              )}
+              {file.lines_added !== null && file.lines_removed !== null && " "}
+              {file.lines_removed !== null && (
+                <span className="text-destructive">&minus;{file.lines_removed}</span>
+              )}
+            </span>
+          )}
           <FileIcon className="size-3.5 shrink-0 text-muted-foreground" />
           <span
             className={cn(

@@ -170,10 +170,16 @@ function FileScopeSwitch({
   flatView,
   onChange,
   count,
+  linesAdded,
+  linesRemoved,
 }: {
   flatView: boolean;
   onChange: (flatView: boolean) => void;
   count: number;
+  /** Total lines added across changed files, or null to omit the +/− totals. */
+  linesAdded?: number | null;
+  /** Total lines removed across changed files, or null to omit. */
+  linesRemoved?: number | null;
 }) {
   const changedSelected = flatView;
   const allSelected = !flatView;
@@ -197,6 +203,23 @@ function FileScopeSwitch({
         {count > 0 && (
           <span className="shrink-0 font-normal text-[11px] text-muted-foreground tabular-nums">
             {count}
+          </span>
+        )}
+        {(linesAdded != null || linesRemoved != null) && (
+          <span
+            className="shrink-0 font-mono text-[10px]"
+            aria-label={[
+              linesAdded != null && `${linesAdded} lines added`,
+              linesRemoved != null && `${linesRemoved} removed`,
+            ]
+              .filter(Boolean)
+              .join(", ")}
+          >
+            {linesAdded != null && (
+              <span className="text-green-600 dark:text-green-400">+{linesAdded}</span>
+            )}
+            {linesAdded != null && linesRemoved != null && " "}
+            {linesRemoved != null && <span className="text-destructive">&minus;{linesRemoved}</span>}
           </span>
         )}
       </button>
@@ -319,8 +342,21 @@ export function FilesPanel({
     enabled: true,
   });
   const workingDir = envQuery.data?.root ?? null;
-  const changedCount = changedQuery.data?.data.length ?? 0;
-  const hiddenFilesCount = (changedQuery.data?.data ?? []).filter((f) =>
+  const changedFiles = changedQuery.data?.data ?? [];
+  const changedCount = changedFiles.length;
+  // Client-side totals over the FULL fetched set (matches changedCount —
+  // search/hidden filtering happens inside FlatFileList, not here). `?? 0`
+  // skips null/undefined counts (binaries, non-git mode); `any` gates whether
+  // the +/− totals render at all.
+  const lineTotals = changedFiles.reduce(
+    (acc, f) => ({
+      added: acc.added + (f.lines_added ?? 0),
+      removed: acc.removed + (f.lines_removed ?? 0),
+      any: acc.any || f.lines_added != null || f.lines_removed != null,
+    }),
+    { added: 0, removed: 0, any: false },
+  );
+  const hiddenFilesCount = changedFiles.filter((f) =>
     f.path.split("/").some((seg) => seg.startsWith(".")),
   ).length;
 
@@ -418,7 +454,13 @@ export function FilesPanel({
           className="shrink-0 flex items-center gap-2 px-2 py-1.5 @max-[400px]/filespanel:flex-col @max-[400px]/filespanel:items-stretch"
           onClick={(e) => e.stopPropagation()}
         >
-          <FileScopeSwitch flatView={flatView} onChange={onFlatViewChange} count={changedCount} />
+          <FileScopeSwitch
+            flatView={flatView}
+            onChange={onFlatViewChange}
+            count={changedCount}
+            linesAdded={lineTotals.any ? lineTotals.added : null}
+            linesRemoved={lineTotals.any ? lineTotals.removed : null}
+          />
           <div className="flex min-w-0 flex-1 items-center gap-2">
             <div className="flex min-w-0 flex-1 items-center gap-[6px] rounded-full border border-border px-[10px] py-[4px] transition-colors focus-within:border-border-strong">
               <SearchIcon className="size-4 shrink-0 text-muted-foreground" />
@@ -438,7 +480,13 @@ export function FilesPanel({
       {!flatView && (
         <div className="shrink-0" onClick={(e) => e.stopPropagation()}>
           <div className="flex items-center gap-2 px-2 py-1.5 @max-[400px]/filespanel:flex-col @max-[400px]/filespanel:items-stretch">
-            <FileScopeSwitch flatView={flatView} onChange={onFlatViewChange} count={changedCount} />
+            <FileScopeSwitch
+              flatView={flatView}
+              onChange={onFlatViewChange}
+              count={changedCount}
+              linesAdded={lineTotals.any ? lineTotals.added : null}
+              linesRemoved={lineTotals.any ? lineTotals.removed : null}
+            />
             <div className="flex min-w-0 flex-1 items-center gap-2">
               <div className="flex min-w-0 flex-1 items-center gap-[6px] rounded-full border border-border px-[10px] py-[4px] transition-colors focus-within:border-border-strong">
                 <SearchIcon className="size-4 shrink-0 text-muted-foreground" />

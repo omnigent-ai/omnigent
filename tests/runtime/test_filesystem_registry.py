@@ -926,3 +926,136 @@ def test_unquote_git_path(raw: str, expected: str) -> None:
     assert result == expected, (
         f"_unquote_git_path({raw!r}) returned {result!r}, expected {expected!r}."
     )
+
+
+# ── Git-mode line counts (numstat) ─────────────────────────────────────────
+
+
+def _init_git_with_commit(tmp_path: Path, name: str, content: str) -> dict[str, str]:
+    """Init a git repo in *tmp_path* with one committed file, return the env."""
+    env = _git_env()
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, env=env)
+    (tmp_path / name).write_text(content)
+    subprocess.run(["git", "add", name], cwd=tmp_path, check=True, capture_output=True, env=env)
+    subprocess.run(
+        ["git", "commit", "-m", "init"], cwd=tmp_path, check=True, capture_output=True, env=env
+    )
+    return env
+
+
+def test_git_line_counts_modified(tmp_path: Path) -> None:
+    """A tracked modified file reports added/removed line counts from numstat."""
+    _init_git_with_commit(tmp_path, "f.py", "a\nb\nc\n")
+    (tmp_path / "f.py").write_text("a\nB\nc\nd\n")  # 1 line changed, 1 added → +2 -1
+
+    reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+    [rec] = reg.list_changed_files("any-conv", limit=100)
+    assert rec["status"] == "modified"
+    assert rec["lines_added"] == 2, rec
+    assert rec["lines_removed"] == 1, rec
+
+
+def test_git_line_counts_untracked_added_only(tmp_path: Path) -> None:
+    """An untracked new file (absent from `git diff HEAD`) reports adds only."""
+    _init_git_with_commit(tmp_path, "committed.py", "x\n")
+    (tmp_path / "new.py").write_text("one\ntwo\nthree\n")
+
+    reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+    rec = next(r for r in reg.list_changed_files("any-conv", limit=100) if r["path"] == "new.py")
+    assert rec["status"] == "created"
+    assert rec["lines_added"] == 3, rec
+    assert rec["lines_removed"] == 0, rec
+
+
+def test_git_line_counts_deleted_removed_only(tmp_path: Path) -> None:
+    """A deleted tracked file reports removed lines only (added side is 0)."""
+    _init_git_with_commit(tmp_path, "gone.py", "a\nb\nc\n")
+    (tmp_path / "gone.py").unlink()
+
+    reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+    [rec] = reg.list_changed_files("any-conv", limit=100)
+    assert rec["status"] == "deleted"
+    assert rec["lines_added"] == 0, rec
+    assert rec["lines_removed"] == 3, rec
+
+
+def test_git_line_counts_binary_is_none(tmp_path: Path) -> None:
+    """A binary file reports (None, None) — numstat emits `-\\t-`."""
+    _init_git_with_commit(tmp_path, "keep.txt", "hi\n")
+    (tmp_path / "img.bin").write_bytes(bytes(range(256)) * 4)
+    subprocess.run(
+        ["git", "add", "img.bin"], cwd=tmp_path, check=True, capture_output=True, env=_git_env()
+    )
+
+    reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+    rec = next(r for r in reg.list_changed_files("any-conv", limit=100) if r["path"] == "img.bin")
+    assert rec["lines_added"] is None, rec
+    assert rec["lines_removed"] is None, rec
+
+
+def test_git_line_counts_untracked_binary_is_none(tmp_path: Path) -> None:
+    """An untracked binary file (NUL bytes, never git-add'd) reports (None, None).
+
+    Regression guard: the untracked-`created` branch reads the file to count
+    lines; without a NUL check it returned a bogus count for binaries (a
+    downloaded PNG rendered "+N"). The tracked-binary case is covered by
+    numstat's `-\\t-`; this covers the untracked case that bypasses numstat.
+    """
+    _init_git_with_commit(tmp_path, "keep.txt", "hi\n")
+    # Fake PNG header with an embedded NUL — untracked (not git-add'd).
+    (tmp_path / "fake.png").write_bytes(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR")
+
+    reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+    rec = next(r for r in reg.list_changed_files("any-conv", limit=100) if r["path"] == "fake.png")
+    assert rec["status"] == "created"
+    assert rec["lines_added"] is None, rec
+    assert rec["lines_removed"] is None, rec
+
+
+def test_git_line_counts_untracked_large_file_is_none(tmp_path: Path, monkeypatch) -> None:
+    """An untracked file over the read cap reports (None, None), not a full read.
+
+    Regression guard: the untracked-`created` branch used to slurp the whole
+    file into memory to count lines (a 22 MB file rendered "+220000"). The cap
+    is monkeypatched tiny so the test stays fast rather than writing 10 MiB.
+    """
+    monkeypatch.setattr("omnigent.runtime.filesystem_registry._MAX_READ_BYTES", 16)
+    _init_git_with_commit(tmp_path, "keep.txt", "hi\n")
+    # Untracked text file larger than the (patched) 16-byte cap.
+    (tmp_path / "big.txt").write_text("line\n" * 100)
+
+    reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+    rec = next(r for r in reg.list_changed_files("any-conv", limit=100) if r["path"] == "big.txt")
+    assert rec["status"] == "created"
+    assert rec["lines_added"] is None, rec
+    assert rec["lines_removed"] is None, rec
+
+
+def test_git_line_counts_numstat_failure_degrades_but_status_intact(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """If numstat fails, counts are None but the status list still renders.
+
+    Only the numstat subprocess is broken; `git status` still runs, so the
+    file must still appear (with counts degraded to None) rather than the whole
+    list failing.
+    """
+    _init_git_with_commit(tmp_path, "f.py", "a\nb\n")
+    (tmp_path / "f.py").write_text("a\nb\nc\n")
+
+    reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+    real_run = subprocess.run
+
+    def _fail_numstat(argv, *args, **kwargs):
+        if isinstance(argv, list) and "--numstat" in argv:
+            raise subprocess.TimeoutExpired(cmd="git diff --numstat", timeout=5)
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(
+        "omnigent.runtime.filesystem_registry.subprocess.run", _fail_numstat
+    )
+
+    [rec] = reg.list_changed_files("any-conv", limit=100)
+    assert rec["status"] == "modified"
+    assert rec["lines_added"] is None, rec
+    assert rec["lines_removed"] is None, rec
