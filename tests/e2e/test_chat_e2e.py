@@ -14,10 +14,12 @@ from __future__ import annotations
 
 import asyncio
 import os
+import subprocess
 import uuid
 from pathlib import Path
 
 import httpx
+import pytest
 import yaml as _yaml
 from omnigent_client import OmnigentClient
 
@@ -373,4 +375,96 @@ def test_sdk_creates_registered_agent_session(
         assert session_id.startswith("conv_")
         assert runner_id == server.runner_id
     finally:
+        _stop_local_server(server)
+
+
+def test_remote_prompt_creates_fresh_host_bound_session(
+    mock_llm_server_url: str,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Remote headless chat discovers an agent and completes in a fresh session."""
+    from omnigent.chat import (
+        _start_local_server,
+        _stop_local_server,
+        _wait_for_server,
+        run_prompt,
+    )
+    from tests.e2e.test_host_e2e import _spawn_host_daemon, _wait_for_host_online
+
+    marker = f"REMOTE_FRESH_OK_{uuid.uuid4().hex[:6]}"
+    model = f"mock-remote-fresh-{uuid.uuid4().hex[:6]}"
+    agent_name = f"remote-fresh-probe-{uuid.uuid4().hex[:6]}"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    host_home = tmp_path / "host-home"
+    host_home.mkdir()
+
+    yaml_path = _make_inline_agent_yaml(
+        tmp_path,
+        agent_name=agent_name,
+        model=model,
+        mock_llm_server_url=mock_llm_server_url,
+    )
+    os.environ["OPENAI_API_KEY"] = "mock-key"
+    os.environ["OPENAI_BASE_URL"] = f"{mock_llm_server_url}/v1"
+    reset_mock_llm(mock_llm_server_url)
+    configure_mock_llm(mock_llm_server_url, [{"text": marker}], key=model)
+
+    port = find_free_port()
+    server = _start_local_server(yaml_path, port, ephemeral=True)
+    base_url = f"http://127.0.0.1:{port}"
+    daemon = None
+    try:
+        _wait_for_server(port, server)
+        client = httpx.Client(
+            base_url=base_url,
+            timeout=60.0,
+            headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
+        )
+        agent_id = _lookup_builtin_agent_id(client, agent_name)
+        daemon = _spawn_host_daemon(
+            tmp_path=host_home,
+            live_server=base_url,
+            mock_llm_server_url=mock_llm_server_url,
+        )
+        _wait_for_host_online(client, daemon.host_id)
+
+        seed = client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent_id,
+                "host_id": daemon.host_id,
+                "workspace": str(workspace),
+            },
+        )
+        seed.raise_for_status()
+        seed_id = str(seed.json()["id"])
+        client.post(
+            f"/v1/sessions/{seed_id}/events",
+            json={"type": "stop_session", "data": {}},
+        ).raise_for_status()
+
+        run_prompt(base_url, None, prompt="Reply with the configured marker.")
+
+        assert marker in capsys.readouterr().out
+        sessions = client.get(
+            "/v1/sessions",
+            params={"agent_id": agent_id, "limit": 10, "order": "desc"},
+        )
+        sessions.raise_for_status()
+        rows = sessions.json()["data"]
+        assert len(rows) == 2
+        fresh = next(row for row in rows if row["id"] != seed_id)
+        assert fresh["host_id"] == daemon.host_id
+        assert fresh["workspace"] == str(workspace)
+        assert fresh["runner_id"]
+    finally:
+        if daemon is not None:
+            daemon.proc.terminate()
+            try:
+                daemon.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                daemon.proc.kill()
+                daemon.proc.wait()
         _stop_local_server(server)

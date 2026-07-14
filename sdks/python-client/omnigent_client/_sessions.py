@@ -399,14 +399,14 @@ class SessionsNamespace:
         """Create a fresh session from an already-registered agent.
 
         Calls JSON ``POST /v1/sessions`` with the same agent/host/workspace
-        contract used by the web new-chat flow. The server launches and binds
-        the host runner before returning the session snapshot.
+        contract used by the web new-chat flow. When host fields are supplied,
+        the server launches and binds the runner before returning.
 
         :param agent_id: Durable registered-agent id, e.g. ``"ag_abc123"``.
         :param host_id: Optional host that should launch the runner.
         :param workspace: Absolute workspace on that host. Required with
             ``host_id`` and invalid without it.
-        :returns: The newly created and host-bound session snapshot.
+        :returns: The newly created session snapshot.
         :raises OmnigentError: If the server returns a non-2xx status.
         """
         if (host_id is None) != (workspace is None):
