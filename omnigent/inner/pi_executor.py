@@ -1076,26 +1076,6 @@ class BlockedCheck:
     reason: str
 
 
-def _tool_result_text_for_recovery(result: object) -> str:
-    """Return the assistant text to use when Pi fails after a successful tool."""
-    if isinstance(result, str):
-        return result
-    if isinstance(result, dict):
-        # The generated Pi extension wraps tool results as a content block.
-        content = result.get("content")
-        if isinstance(content, list):
-            for item in content:
-                if not isinstance(item, dict) or item.get("type") != "text":
-                    continue
-                text = item.get("text")
-                if isinstance(text, str):
-                    return text
-    try:
-        return json.dumps(result, ensure_ascii=False)
-    except TypeError:
-        return str(result)
-
-
 @dataclass(frozen=True)
 class PiSubprocessConfig:
     """Materialized environment + CLI args for a Pi subprocess.
@@ -2111,12 +2091,18 @@ class PiExecutor(Executor):
         # multi-step (tool-loop) turn bills for every call, not just the
         # last. Empty when pi reports no usage — cost tracking is skipped.
         message_usages: list[dict[str, Any]] = []  # type: ignore[explicit-any]
-        last_successful_tool_result_text: str | None = None
+        # Error reported by a ``message_end`` (stopReason=error); surfaced at
+        # ``agent_end`` so the terminal event is consumed off the RPC stream.
+        pending_error: str | None = None
 
         while True:
-            line = await rpc.read_line(timeout=120.0)
+            # After an errored message the only thing left to drain is the
+            # already-emitted agent_end, so don't wait the full idle budget.
+            line = await rpc.read_line(timeout=120.0 if pending_error is None else 10.0)
             if line is None:
-                if not streamed_any and not response_text:
+                if pending_error is not None:
+                    yield ExecutorError(message=pending_error)
+                elif not streamed_any and not response_text:
                     stderr = "\n".join(rpc._stderr_lines) if rpc._stderr_lines else ""
                     stderr_suffix = f" Stderr: {stderr}" if stderr else ""
                     yield ExecutorError(
@@ -2239,9 +2225,6 @@ class PiExecutor(Executor):
                 else:
                     status = ToolCallStatus.SUCCESS
 
-                if status == ToolCallStatus.SUCCESS:
-                    last_successful_tool_result_text = _tool_result_text_for_recovery(result)
-
                 yield ToolCallComplete(
                     name=tool_name,
                     status=status,
@@ -2252,6 +2235,9 @@ class PiExecutor(Executor):
 
             # Agent ended — the turn is complete.
             if event_type == "agent_end":
+                if pending_error is not None:
+                    yield ExecutorError(message=pending_error)
+                    return
                 end_messages = event.get("messages", [])
                 if not response_text:
                     for m in reversed(end_messages):
@@ -2295,27 +2281,17 @@ class PiExecutor(Executor):
                         message_usages.append(captured)
                     raw_stop = msg.get("stopReason")
                     stop: str | None = raw_stop if isinstance(raw_stop, str) else None
-                    if stop in ("error", "aborted"):
+                    if stop == "aborted":
                         err = msg.get("errorMessage", stop)
-                        err_text = str(err)
-                        if (
-                            last_successful_tool_result_text
-                            and not response_text
-                            and "Expected property name" in err_text
-                            and "JSON" in err_text
-                        ):
-                            response_text = last_successful_tool_result_text
-                            logger.warning(
-                                "PiExecutor recovered from post-tool JSON parse error; "
-                                "returning last successful tool result as final response."
-                            )
-                            turn_usage = _aggregate_pi_turn_usage(message_usages, model)
-                            _notify_usage_from_dict(model=model, usage=turn_usage)
-                            yield TextChunk(text=response_text)
-                            yield TurnComplete(response=response_text, usage=turn_usage)
-                            return
-                        yield ExecutorError(message=err_text)
+                        yield ExecutorError(message=str(err))
                         return
+                    if stop == "error":
+                        # Pi emits the turn-terminal ``agent_end`` after an
+                        # errored LLM call; returning here would leave it
+                        # queued, so the next turn on this RPC session reads
+                        # the stale event as its own end. Record the error
+                        # and keep draining until ``agent_end``.
+                        pending_error = str(msg.get("errorMessage", stop))
                 continue
 
             logger.debug("PiExecutor: ignoring event type=%s", event_type)

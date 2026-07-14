@@ -2048,14 +2048,17 @@ class TestRunTurn(unittest.TestCase):
             fake_rpc.process.stdin = _FakeStreamWriter()
             fake_rpc._stderr_lines = []
 
+            errored = {
+                "role": "assistant",
+                "content": [],
+                "stopReason": "error",
+                "errorMessage": "Rate limited",
+            }
             lines = [
                 json.dumps({"type": "response", "success": True}),
-                json.dumps(
-                    {
-                        "type": "message_end",
-                        "message": {"stopReason": "error", "errorMessage": "Rate limited"},
-                    }
-                ),
+                json.dumps({"type": "message_end", "message": errored}),
+                # Pi's agent loop always emits agent_end after an errored call.
+                json.dumps({"type": "agent_end", "messages": [errored]}),
             ]
             for line in lines:
                 fake_rpc._line_queue.put_nowait(line)
@@ -2080,7 +2083,12 @@ class TestRunTurn(unittest.TestCase):
 
         _run(_test())
 
-    def test_recovers_post_tool_json_parse_error(self):
+    def test_message_end_error_with_stream_eof_fails_with_real_error(self):
+        """If pi dies after reporting the errored message (no agent_end ever
+        arrives), the turn still fails with pi's error message rather than
+        the generic ended-without-response fallback.
+        """
+
         async def _test():
             executor = self._make_executor()
 
@@ -2091,17 +2099,68 @@ class TestRunTurn(unittest.TestCase):
             fake_rpc.process.stdin = _FakeStreamWriter()
             fake_rpc._stderr_lines = []
 
-            tool_text = json.dumps(
-                {
-                    "stdout": "/root\nPI_PIEXEC_PATCH_OK\n",
-                    "stderr": "",
-                    "exit_code": 0,
-                    "timed_out": False,
-                    "shell": "/usr/bin/bash",
-                    "cwd": "/root",
-                },
-                separators=(",", ":"),
-            )
+            lines = [
+                json.dumps({"type": "response", "success": True}),
+                json.dumps(
+                    {
+                        "type": "message_end",
+                        "message": {"stopReason": "error", "errorMessage": "boom"},
+                    }
+                ),
+            ]
+
+            async def fake_read_line(timeout=120.0):
+                del timeout
+                if lines:
+                    return lines.pop(0)
+                return None  # EOF: process died without agent_end.
+
+            fake_rpc.read_line = fake_read_line
+
+            async def fake_ensure_rpc(*args, **kwargs):
+                return fake_rpc
+
+            executor._ensure_rpc = fake_ensure_rpc
+
+            events = [
+                e
+                async for e in executor.run_turn(
+                    [{"role": "user", "content": "hello"}],
+                    [],
+                    "system",
+                )
+            ]
+
+            self.assertEqual(len(events), 1)
+            self.assertIsInstance(events[0], ExecutorError)
+            self.assertEqual(events[0].message, "boom")
+
+        _run(_test())
+
+    def test_post_tool_error_drains_agent_end_before_failing(self):
+        """A message_end error after a successful tool call fails the turn
+        with pi's error message, but only after consuming the trailing
+        ``agent_end`` — leaving it queued would make the next turn on the
+        same RPC session read the stale terminal event as its own end.
+        """
+
+        async def _test():
+            executor = self._make_executor()
+
+            fake_rpc = _PiRpcSession()
+            fake_rpc._line_queue = asyncio.Queue()
+            fake_rpc.process = MagicMock()
+            fake_rpc.process.returncode = None
+            fake_rpc.process.stdin = _FakeStreamWriter()
+            fake_rpc._stderr_lines = []
+
+            parse_error = "Expected property name or '}' in JSON at position 1 (line 1 column 2)"
+            errored_assistant = {
+                "role": "assistant",
+                "content": [],
+                "stopReason": "error",
+                "errorMessage": parse_error,
+            }
             lines = [
                 json.dumps({"type": "response", "success": True}),
                 json.dumps(
@@ -2109,21 +2168,18 @@ class TestRunTurn(unittest.TestCase):
                         "type": "tool_execution_end",
                         "toolName": "sys_os_shell",
                         "isError": False,
-                        "result": {"content": [{"type": "text", "text": tool_text}]},
+                        "result": {"content": [{"type": "text", "text": "ok"}]},
                     }
                 ),
                 json.dumps(
                     {
                         "type": "message_end",
-                        "message": {
-                            "stopReason": "error",
-                            "errorMessage": (
-                                "Expected property name or '}' in JSON "
-                                "at position 1 (line 1 column 2)"
-                            ),
-                        },
+                        "message": errored_assistant,
                     }
                 ),
+                # Pi always emits agent_end after the errored LLM call ends
+                # the agent loop; it carries the errored message.
+                json.dumps({"type": "agent_end", "messages": [errored_assistant]}),
             ]
             for line in lines:
                 fake_rpc._line_queue.put_nowait(line)
@@ -2145,12 +2201,15 @@ class TestRunTurn(unittest.TestCase):
             tool_completes = [e for e in events if isinstance(e, ToolCallComplete)]
             self.assertEqual(len(tool_completes), 1)
             self.assertEqual(tool_completes[0].status, ToolCallStatus.SUCCESS)
-            self.assertFalse(any(isinstance(e, ExecutorError) for e in events))
-            text_chunks = [e for e in events if isinstance(e, TextChunk)]
-            self.assertEqual([e.text for e in text_chunks], [tool_text])
-            turn_complete = [e for e in events if isinstance(e, TurnComplete)]
-            self.assertEqual(len(turn_complete), 1)
-            self.assertEqual(turn_complete[0].response, tool_text)
+            # The turn fails with pi's real error — no fabricated assistant
+            # text, no synthetic TurnComplete.
+            errors = [e for e in events if isinstance(e, ExecutorError)]
+            self.assertEqual([e.message for e in errors], [parse_error])
+            self.assertFalse(any(isinstance(e, TurnComplete) for e in events))
+            self.assertFalse(any(isinstance(e, TextChunk) for e in events))
+            # The trailing agent_end was consumed: nothing stale is left for
+            # the next turn on this RPC session.
+            self.assertTrue(fake_rpc._line_queue.empty())
 
         _run(_test())
 
