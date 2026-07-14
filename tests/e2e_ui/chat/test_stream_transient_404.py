@@ -74,19 +74,33 @@ def test_transient_stream_404_recovers_without_manual_reload(
 
     composer = page.get_by_placeholder(_COMPOSER)
     expect(composer).to_be_visible()
-    composer.fill("Say hello")
-    page.get_by_role("button", name="Send", exact=True).click()
 
-    # The stream must reconnect and the turn must complete despite the
-    # opening 404s -- the old code flipped sessionStatus to "failed" on the
-    # very first one and never rendered a reply.
-    expect(page.locator(_ASSISTANT).first).to_be_visible(timeout=30_000)
+    # Let the retry loop run its course BEFORE sending anything: the old
+    # code gave up and flipped to "failed" on the very first 404, so
+    # `attempts` would freeze at 1 forever. Waiting here (rather than
+    # sending a message immediately) also avoids racing the turn's reply
+    # against the still-reconnecting stream -- this is a first-ever
+    # connect, not a reconnect, so the client has no backlog replay for
+    # events emitted before it's actually listening.
+    #
+    # Poll via page.wait_for_timeout(), NOT time.sleep(): Playwright's sync
+    # API dispatches route/console callbacks cooperatively on the same
+    # thread, so a bare time.sleep() here would starve our own route
+    # handler and never let `attempts` advance.
+    for _ in range(100):
+        if attempts[0] > _TRANSIENT_404_COUNT:
+            break
+        page.wait_for_timeout(100)
+    assert attempts[0] > _TRANSIENT_404_COUNT, (
+        f"stream never recovered from the transient 404s within 10s "
+        f"(attempts={attempts[0]}) -- the old code gives up on the first 404"
+    )
 
-    # No failed-turn error banner anywhere on the page.
+    # No failed-session banner anywhere on the page.
     expect(page.get_by_text("stream unavailable", exact=False)).to_have_count(0)
 
-    assert attempts[0] > _TRANSIENT_404_COUNT, (
-        f"expected the stream route to be requested more than "
-        f"{_TRANSIENT_404_COUNT} times (retries + the eventual success), "
-        f"got {attempts[0]}"
-    )
+    # The connection is healthy again -- prove the chat is still fully usable,
+    # not just that the retry counter moved.
+    composer.fill("Say hello")
+    page.get_by_role("button", name="Send", exact=True).click()
+    expect(page.locator(_ASSISTANT).first).to_be_visible(timeout=15_000)
