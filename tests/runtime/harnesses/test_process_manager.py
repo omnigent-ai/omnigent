@@ -29,6 +29,7 @@ import shutil
 import signal
 import sys
 import tempfile
+import time
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
@@ -41,8 +42,10 @@ from omnigent.runtime.harnesses.process_manager import (
     _TMP_PARENT_ENV_VAR,
     HarnessProcessManager,
     NoLiveHarnessError,
+    _default_tmp_parent,
     _pid_alive,
     _pids_holding_socket,
+    _SubprocessEntry,
 )
 
 _TEST_HARNESS_NAME = "test"
@@ -194,6 +197,28 @@ async def test_start_uses_harness_tmp_parent_env(
         assert (manager.instance_dir / _AP_PID_FILE).read_text(encoding="utf-8")
     finally:
         await manager.shutdown()
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Per-uid tmp parent is POSIX-only; Windows uses gettempdir().",
+)
+def test_default_tmp_parent_is_per_uid_on_posix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The default socket root is namespaced per Unix uid.
+
+    A shared ``/tmp/omnigent`` breaks multi-user hosts: the first
+    user's runner creates it ``0700`` and every other user's runner
+    then dies in ``_sweep_orphans`` stat()ing foreign instance dirs.
+    The POSIX default must carry the uid so each user gets a private
+    parent. Regression guard against the pre-fix bare ``/tmp/omnigent``.
+    """
+    monkeypatch.delenv(_TMP_PARENT_ENV_VAR, raising=False)
+    parent = _default_tmp_parent()
+    assert parent == Path(f"/tmp/omnigent-{os.getuid()}")
+    # The shared parent that locked out other users must be gone.
+    assert parent != Path("/tmp/omnigent")
 
 
 async def test_shutdown_without_start_is_noop(
@@ -594,11 +619,11 @@ async def test_idle_reaper_survives_release_error(
         real_release = fast.release
         calls = {"n": 0}
 
-        async def flaky_release(conversation_id: str) -> None:
+        async def flaky_release(conversation_id: str, **kw: object) -> None:
             calls["n"] += 1
             if calls["n"] == 1:
                 raise RuntimeError("simulated close failure")
-            await real_release(conversation_id)
+            await real_release(conversation_id, **kw)  # type: ignore[arg-type]
 
         monkeypatch.setattr(fast, "release", flaky_release)
 
@@ -666,6 +691,100 @@ async def test_idle_reaper_skips_in_flight_turn(
         assert not socket_path.exists()
     finally:
         await fast.shutdown()
+
+
+class _FakeReapProc:
+    """Minimal process stand-in recording whether the reaper killed it."""
+
+    def __init__(self) -> None:
+        self.returncode: int | None = None
+        self.killed = False
+        self._done = asyncio.Event()
+
+    def send_signal(self, sig: int) -> None:
+        self.killed = True
+        self.returncode = -15
+        self._done.set()
+
+    def kill(self) -> None:
+        self.killed = True
+        self.returncode = -9
+        self._done.set()
+
+    async def wait(self) -> int | None:
+        await self._done.wait()
+        return self.returncode
+
+
+class _SlowCloseClient:
+    """httpx-client stand-in whose aclose() stalls, holding the reaper pass open."""
+
+    def __init__(self, delay_s: float) -> None:
+        self._delay_s = delay_s
+
+    async def aclose(self) -> None:
+        await asyncio.sleep(self._delay_s)
+
+
+class _FakeEndpoint:
+    def cleanup(self) -> None:
+        pass
+
+
+async def test_idle_reaper_spares_turn_started_during_pass(tmp_path: Path) -> None:
+    """A turn that starts while an earlier stale entry tears down is not reaped.
+
+    The reaper snapshots its stale list under the registry lock, then releases
+    each entry outside it; a single teardown can hold the pass open for seconds
+    (graceful-SIGTERM wait). A turn that starts on a later-listed conversation
+    during that window refreshes ``last_used_at`` and marks itself in flight —
+    but the snapshot has already been taken, and ``release`` used to tear the
+    entry down without re-checking, SIGTERMing the subprocess mid-turn
+    ("Harness stream connection error" seconds after messaging an idle
+    session). ``only_if_idle_cutoff`` re-checks idleness atomically with the
+    unregister, so the now-active entry is spared; the genuinely idle entry in
+    the same pass is still reaped, and the spared one is reclaimed by a later
+    pass once it goes idle again.
+    """
+    mgr = HarnessProcessManager(idle_timeout_s=0.5, reaper_interval_s=0.2, tmp_parent=tmp_path)
+    e1 = _SubprocessEntry(_FakeReapProc(), _SlowCloseClient(0.6), _FakeEndpoint(), "h")  # type: ignore[arg-type]
+    e2 = _SubprocessEntry(_FakeReapProc(), _SlowCloseClient(0.0), _FakeEndpoint(), "h")  # type: ignore[arg-type]
+    e1.last_used_at = time.monotonic() - 100.0
+    e2.last_used_at = time.monotonic() - 100.0
+    mgr._entries = {"conv1": e1, "conv2": e2}
+
+    reaper = asyncio.create_task(mgr._idle_reaper_loop())
+    try:
+        # Wait for the pass to claim conv1 and enter its slow teardown.
+        deadline = time.monotonic() + 3.0
+        while "conv1" in mgr._entries:
+            assert time.monotonic() < deadline, "reaper never started a pass"
+            await asyncio.sleep(0.01)
+
+        # While conv1 tears down, a new turn arrives for conv2: get_client
+        # refreshes last_used_at and the runner marks the response in flight.
+        e2.last_used_at = time.monotonic()
+        mgr.mark_in_flight("conv2", "resp_live")
+
+        await asyncio.sleep(1.0)
+        assert e1.process.killed, "the genuinely idle entry must still be reaped"
+        assert not e2.process.killed, (
+            "reaper SIGTERMed a subprocess whose turn started during the pass"
+        )
+        assert "conv2" in mgr._entries
+
+        # Once the turn ends and the entry goes idle again, a later pass
+        # reclaims it — sparing is a deferral, not an exemption.
+        mgr.clear_in_flight("conv2")
+        e2.last_used_at = time.monotonic() - 100.0
+        deadline = time.monotonic() + 3.0
+        while not e2.process.killed:
+            assert time.monotonic() < deadline, "spared entry never reaped later"
+            await asyncio.sleep(0.05)
+    finally:
+        reaper.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await reaper
 
 
 async def test_idle_reaper_disabled_when_timeout_zero(
@@ -791,6 +910,21 @@ async def test_pids_holding_socket_returns_empty_for_missing(
     """
     nonexistent = short_tmp_parent / "no-such.sock"
     pids = await _pids_holding_socket(nonexistent)
+    assert pids == []
+
+
+async def test_pids_holding_socket_returns_empty_when_lsof_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    short_tmp_parent: Path,
+) -> None:
+    """Missing ``lsof`` is best-effort cleanup noise, not a boot failure."""
+
+    async def missing_lsof(*_args: object, **_kwargs: object) -> object:
+        raise FileNotFoundError(2, "No such file or directory", "lsof")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", missing_lsof)
+
+    pids = await _pids_holding_socket(short_tmp_parent / "conv-stale.sock")
     assert pids == []
 
 
@@ -1010,3 +1144,120 @@ async def test_orphan_sweep_escalates_to_sigkill(
 
     assert calls == 2
     assert killed == [(12345, signal.SIGTERM), (12345, signal.SIGKILL)]
+
+
+# ── Mid-spawn cancellation ──────────────────────────────────────
+
+
+async def test_mid_spawn_cancellation_reaps_subprocess(
+    manager: HarnessProcessManager,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Cancelling ``get_client`` while the spawn is still waiting for
+    the runner to bind must kill the just-spawned subprocess.
+
+    The subprocess exists from ``create_subprocess_exec`` onward but
+    is only registered in ``_entries`` after ``_spawn_entry``
+    returns; a cancellation landing inside ``_wait_for_bind`` used
+    to leak it — unregistered, so ``release()`` no-ops and the idle
+    reaper never sees it.
+    """
+    from omnigent.runtime.harnesses import process_manager as pm_mod
+
+    await manager.start()
+    try:
+        spawned: list[asyncio.subprocess.Process] = []
+        real_exec = asyncio.create_subprocess_exec
+
+        async def capturing_exec(*args: object, **kwargs: object) -> asyncio.subprocess.Process:
+            process = await real_exec(*args, **kwargs)  # type: ignore[arg-type]
+            spawned.append(process)
+            return process
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", capturing_exec)
+
+        in_bind = asyncio.Event()
+
+        async def hanging_bind(*args: object, **kwargs: object) -> None:
+            in_bind.set()
+            await asyncio.sleep(3600)
+
+        monkeypatch.setattr(pm_mod, "_wait_for_bind", hanging_bind)
+
+        task = asyncio.create_task(manager.get_client("conv_leak", "test"))
+        await asyncio.wait_for(in_bind.wait(), timeout=10.0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert spawned, "spawn was never reached"
+        process = spawned[0]
+        try:
+            await asyncio.wait_for(process.wait(), timeout=5.0)
+        finally:
+            # Never leak the subprocess out of the test, even when
+            # the assertion below is about to fail on main.
+            if process.returncode is None:
+                process.kill()
+                await process.wait()
+        assert process.returncode is not None
+        assert not manager.has_session("conv_leak")
+    finally:
+        await manager.shutdown()
+
+
+async def test_mid_spawn_double_cancellation_still_reaps(
+    manager: HarnessProcessManager,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A second cancellation arriving while the first one's cleanup is
+    reaping the subprocess must not abort the reap: the corpse-wait
+    is shielded, so the process is still collected and the task
+    still ends cancelled.
+    """
+    from omnigent.runtime.harnesses import process_manager as pm_mod
+
+    await manager.start()
+    try:
+        spawned: list[asyncio.subprocess.Process] = []
+        real_exec = asyncio.create_subprocess_exec
+
+        async def capturing_exec(*args: object, **kwargs: object) -> asyncio.subprocess.Process:
+            process = await real_exec(*args, **kwargs)  # type: ignore[arg-type]
+            spawned.append(process)
+            return process
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", capturing_exec)
+
+        in_bind = asyncio.Event()
+
+        async def hanging_bind(*args: object, **kwargs: object) -> None:
+            in_bind.set()
+            await asyncio.sleep(3600)
+
+        monkeypatch.setattr(pm_mod, "_wait_for_bind", hanging_bind)
+
+        task = asyncio.create_task(manager.get_client("conv_leak2", "test"))
+        await asyncio.wait_for(in_bind.wait(), timeout=10.0)
+        task.cancel()
+        # Let the first cancellation reach the cleanup path, then
+        # cancel again so the second one lands on its awaits.
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert spawned, "spawn was never reached"
+        process = spawned[0]
+        try:
+            await asyncio.wait_for(process.wait(), timeout=5.0)
+        finally:
+            if process.returncode is None:
+                process.kill()
+                await process.wait()
+        assert process.returncode is not None
+        assert not manager.has_session("conv_leak2")
+    finally:
+        await manager.shutdown()

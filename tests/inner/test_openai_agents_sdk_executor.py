@@ -21,6 +21,7 @@ import databricks.sdk.config as _sdk_config_mod
 from omnigent.inner.executor import (
     ExecutorConfig,
     ExecutorError,
+    ReasoningChunk,
     TextChunk,
     ToolCallComplete,
     ToolCallRequest,
@@ -80,6 +81,12 @@ class _FakeToolOutputItem:
 class _FakeRawTextDelta:
     delta: str
     type: str = "response.output_text.delta"
+
+
+@dataclass
+class _FakeRawReasoningDelta:
+    delta: str
+    type: str = "response.reasoning_summary_text.delta"
 
 
 @dataclass
@@ -500,6 +507,40 @@ class TestOpenAIAgentsSDKExecutor(unittest.TestCase):
             self.assertIsNone(
                 _FakeRunner.last_calls[0]["agent"].model_settings.parallel_tool_calls
             )
+
+        _run(_t())
+
+    def test_streams_reasoning_deltas(self):
+        async def _t():
+            _FakeRunner.last_calls = []
+            _FakeRunner.next_result = _FakeResult(
+                events=[
+                    _FakeRawEvent(_FakeRawReasoningDelta("thinking...")),
+                    _FakeRawEvent(_FakeRawReasoningDelta("")),
+                    _FakeRawEvent(_FakeRawTextDelta("Hello")),
+                ],
+                final_output="Hello",
+            )
+            executor = OpenAIAgentsSDKExecutor(client=object())
+            with patch(
+                "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+                return_value=_fake_agents_sdk(),
+            ):
+                events = [
+                    e
+                    async for e in executor.run_turn(
+                        [{"role": "user", "content": "hi", "session_id": "s1"}],
+                        [],
+                        "Be helpful.",
+                    )
+                ]
+
+            reasoning = [e for e in events if isinstance(e, ReasoningChunk)]
+            self.assertEqual(len(reasoning), 1)
+            self.assertEqual(reasoning[0].delta, "thinking...")
+            self.assertEqual(reasoning[0].event_type, "reasoning_text")
+            text = [e for e in events if isinstance(e, TextChunk)]
+            self.assertEqual([t.text for t in text], ["Hello"])
 
         _run(_t())
 

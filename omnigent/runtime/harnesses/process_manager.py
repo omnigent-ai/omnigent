@@ -50,16 +50,21 @@ _logger = logging.getLogger(__name__)
 # uuid-named subdir so concurrent Omnigent processes (zero-downtime restarts,
 # multi-tenant single-machine deployments) don't step on each other.
 #
-# POSIX pins ``/tmp/omnigent`` deliberately: Unix socket paths have a tight
-# length limit, so a short, predictable parent matters (gettempdir() can be a
-# long ``/var/folders/...`` path on macOS). Windows uses TCP loopback for the
-# harness IPC (no socket-path length concern) and has no ``/tmp`` — a literal
-# ``/tmp/omnigent`` there resolves to ``\tmp\omnigent`` on the current drive —
-# so use the real temp dir.
+# POSIX pins ``/tmp/omnigent-<uid>`` deliberately: Unix socket paths have a
+# tight length limit, so a short, predictable parent matters (gettempdir()
+# can be a long ``/var/folders/...`` path on macOS) — and the uid suffix
+# keeps the parent per-Unix-user. A shared parent breaks multi-user hosts:
+# whichever user's runner starts first creates it ``0700`` and locks every
+# other user out, and even a ``1777`` parent leaves ``_sweep_orphans``
+# walking other users' ``0700`` instance dirs (and all sockets sharing one
+# world-writable directory). Windows uses TCP loopback for the harness IPC
+# (no socket-path length concern) and has no ``/tmp`` — a literal
+# ``/tmp/omnigent`` there resolves to ``\tmp\omnigent`` on the current
+# drive — so use the real (already per-user) temp dir.
 if IS_WINDOWS:
     _TMP_PARENT = Path(tempfile.gettempdir()) / "omnigent"
 else:
-    _TMP_PARENT = Path("/tmp/omnigent")
+    _TMP_PARENT = Path(f"/tmp/omnigent-{os.getuid()}")
 _TMP_PARENT_ENV_VAR = "OMNIGENT_HARNESS_TMP_PARENT"
 
 # S1 (security): env var carrying the per-spawn bearer token for the harness
@@ -193,8 +198,8 @@ def _default_tmp_parent() -> Path:
     length limits, and a short path such as ``.tmp/oa`` is useful
     for local worktrees whose absolute path is long.
 
-    :returns: Configured parent path, or the default
-        ``/tmp/omnigent``.
+    :returns: Configured parent path, or the per-uid default
+        ``/tmp/omnigent-<uid>`` on POSIX.
     """
     configured = os.environ.get(_TMP_PARENT_ENV_VAR)
     if configured:
@@ -239,6 +244,12 @@ def _resolve_module_path(harness: str) -> str:
     module_path = _HARNESS_MODULES.get(harness)
     if module_path is not None:
         return module_path
+    # Generic-ACP ids (``acp:<slug>``) all resolve to the base ``acp`` module;
+    # the slug selecting the concrete agent is read from the spec at spawn.
+    if harness.startswith("acp:"):
+        acp_module = _HARNESS_MODULES.get("acp")
+        if acp_module is not None:
+            return acp_module
     package = missing_install_packages().get(harness)
     if package:
         raise RuntimeError(f"unknown harness {harness!r}; install `{package}` to add this harness")
@@ -895,12 +906,23 @@ class HarnessProcessManager:
         """
         self._in_flight_response_ids.pop(conversation_id, None)
 
-    async def release(self, conversation_id: str) -> None:
+    async def release(
+        self, conversation_id: str, *, only_if_idle_cutoff: float | None = None
+    ) -> None:
         """
         Terminate and unregister the subprocess for a conversation.
 
         Called when the conversation reaches a terminal state. No-op
         if no subprocess is registered for the id.
+
+        ``only_if_idle_cutoff`` (the idle reaper's pass cutoff) makes the
+        release conditional: the entry is torn down only if it is still
+        idle — untouched since the cutoff and with no turn in flight.
+        The check happens under the registry lock, atomically with the
+        unregister, so a turn that starts while an earlier entry in the
+        same reaper pass tears down can never be killed mid-flight
+        (mirrors ``pane_reaper``'s busy re-check immediately before
+        teardown).
 
         Note: ``_spawn_locks[conversation_id]`` is intentionally NOT
         removed here. If we removed it, a concurrent caller already
@@ -917,6 +939,19 @@ class HarnessProcessManager:
         :param conversation_id: AP-allocated conversation id.
         """
         async with self._registry_lock:
+            if only_if_idle_cutoff is not None:
+                current = self._entries.get(conversation_id)
+                if (
+                    current is None
+                    or current.last_used_at > only_if_idle_cutoff
+                    or conversation_id in self._in_flight_response_ids
+                ):
+                    _logger.info(
+                        "skipping idle reap for conversation %s: entry became "
+                        "active or was already released during the pass",
+                        conversation_id,
+                    )
+                    return
             entry = self._entries.pop(conversation_id, None)
             # NOTE: ``_spawn_locks[conversation_id]`` intentionally
             # NOT popped — see this method's docstring for the
@@ -1045,41 +1080,62 @@ class HarnessProcessManager:
             stderr=None,
             env=effective_env,
         )
-        await _wait_for_bind(process, endpoint, harness, conversation_id)
+        try:
+            await _wait_for_bind(process, endpoint, harness, conversation_id)
 
-        # ``base_url`` is required for relative-URL routing; the
-        # actual host portion is irrelevant under uds transport,
-        # but httpx insists on a syntactically-valid URL. The
-        # default httpx read-timeout (5s) is too short for SSE
-        # streams that may pause for tens of seconds during
-        # tool dispatch round-trips (action_required → AP
-        # call_tool → PATCH → resume); use a generous fixed
-        # timeout that still surfaces a genuinely-stuck harness.
-        client = httpx.AsyncClient(
-            transport=endpoint.make_transport(),
-            base_url=endpoint.base_url,
-            # S1 (security): present the per-spawn bearer token (Windows only)
-            # so the harness scaffold accepts this client and rejects any
-            # unauthenticated local peer on the loopback-TCP channel. Empty on
-            # POSIX, where the uid-isolated UDS is the access boundary.
-            headers=({"Authorization": f"Bearer {auth_token}"} if auth_token else {}),
-            # See the comment above the constant for rationale.
-            # Connect/write/pool keep the 5s default so a vanished
-            # harness still surfaces quickly; read=None defers
-            # liveness to the heartbeat path.
-            timeout=httpx.Timeout(5.0, read=None),
-        )
-        return _SubprocessEntry(
-            process=process,
-            client=client,
-            endpoint=endpoint,
-            harness=harness,
-            # Record the model this subprocess was spawned with so a later
-            # turn requesting a different model (e.g. after ``/model``)
-            # triggers a respawn in ``get_client`` — the model is a fixed
-            # process env var, not re-read per turn.
-            model=(env or {}).get(_model_env_key(harness)),
-        )
+            # ``base_url`` is required for relative-URL routing; the
+            # actual host portion is irrelevant under uds transport,
+            # but httpx insists on a syntactically-valid URL. The
+            # default httpx read-timeout (5s) is too short for SSE
+            # streams that may pause for tens of seconds during
+            # tool dispatch round-trips (action_required → AP
+            # call_tool → PATCH → resume); use a generous fixed
+            # timeout that still surfaces a genuinely-stuck harness.
+            client = httpx.AsyncClient(
+                transport=endpoint.make_transport(),
+                base_url=endpoint.base_url,
+                # S1 (security): present the per-spawn bearer token (Windows only)
+                # so the harness scaffold accepts this client and rejects any
+                # unauthenticated local peer on the loopback-TCP channel. Empty on
+                # POSIX, where the uid-isolated UDS is the access boundary.
+                headers=({"Authorization": f"Bearer {auth_token}"} if auth_token else {}),
+                # See the comment above the constant for rationale.
+                # Connect/write/pool keep the 5s default so a vanished
+                # harness still surfaces quickly; read=None defers
+                # liveness to the heartbeat path.
+                timeout=httpx.Timeout(5.0, read=None),
+            )
+            return _SubprocessEntry(
+                process=process,
+                client=client,
+                endpoint=endpoint,
+                harness=harness,
+                # Record the model this subprocess was spawned with so a later
+                # turn requesting a different model (e.g. after ``/model``)
+                # triggers a respawn in ``get_client`` — the model is a fixed
+                # process env var, not re-read per turn.
+                model=(env or {}).get(_model_env_key(harness)),
+            )
+        except BaseException:
+            # From spawn onward the process must have exactly one owner:
+            # either it reaches the caller (who registers it in ``_entries``)
+            # or it dies here. A cancellation landing in ``_wait_for_bind``
+            # (e.g. the turn task cancelled during cold start) would
+            # otherwise leak a live runner that ``release`` no-ops on and
+            # the idle reaper — which only walks ``_entries`` — never sees.
+            if process.returncode is None:
+                with contextlib.suppress(ProcessLookupError):
+                    process.kill()
+                # Shield the corpse-wait so a second cancellation cannot
+                # abandon the reap halfway; the pending cancellation is
+                # re-raised below regardless.
+                with contextlib.suppress(BaseException):
+                    await asyncio.shield(process.wait())
+            with contextlib.suppress(Exception):
+                close_subprocess_transport(process)
+            with contextlib.suppress(Exception):
+                endpoint.cleanup()
+            raise
 
     async def _close_entry(self, entry: _SubprocessEntry) -> None:
         """
@@ -1192,7 +1248,11 @@ class HarnessProcessManager:
                     conv_id,
                 )
                 try:
-                    await self.release(conv_id)
+                    # Teardown of earlier entries in this pass yields the
+                    # loop, so the snapshot above can be stale by the time
+                    # this entry's turn comes — release re-checks idleness
+                    # atomically with the unregister.
+                    await self.release(conv_id, only_if_idle_cutoff=cutoff)
                 except Exception:
                     # A release failure (e.g. ``client.aclose()`` on a broken
                     # transport, or ``process.wait()`` raising) must not escape
@@ -1356,13 +1416,16 @@ async def _pids_holding_socket(socket_path: Path) -> list[int]:
     :returns: List of holding PIDs (often a single one — the
         bound runner).
     """
-    proc = await asyncio.create_subprocess_exec(
-        "lsof",
-        "-t",
-        str(socket_path),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
-    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "lsof",
+            "-t",
+            str(socket_path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+    except OSError:
+        return []
     stdout, _ = await proc.communicate()
     if proc.returncode != 0:
         return []

@@ -25,6 +25,7 @@ import {
   PaperclipIcon,
   PlusIcon,
   SearchIcon,
+  ShuffleIcon,
   TagIcon,
   TriangleAlertIcon,
   XIcon,
@@ -61,6 +62,13 @@ import { WorkspacePicker, isNavigablePath } from "./WorkspacePicker";
 import { getCliServerUrl } from "@/lib/host";
 import { getOmnigentHostConfig } from "@/lib/host";
 import { readLastAgentId, writeLastAgentId } from "@/lib/agentPreferences";
+import {
+  readLastHostChoice,
+  writeLastHostChoice,
+  SANDBOX_HOST_CHOICE,
+} from "@/lib/hostPreferences";
+import { readLastHarness, writeLastHarness } from "@/lib/harnessPreferences";
+import { readDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 import { readHarnessOptions, writeHarnessOption } from "@/lib/modePreferences";
 import { useBrainHarnessLabels } from "@/lib/agentLabels";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
@@ -86,6 +94,7 @@ import { useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import { useHostFilesystem, type HostFilesystemEntry } from "@/hooks/useHostFilesystem";
+import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 import { useNativeServerSwitcherForMainSurface } from "@/hooks/useNativeServerSwitcher";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 import type { Conversation } from "@/hooks/useConversations";
@@ -384,6 +393,22 @@ export function normalizeWorkspacePath(path: string): string | null {
   const stripped = trimmed.replace(/\/+$/, "");
   // All-slashes input (e.g. "///") collapses to the root.
   return stripped === "" ? "/" : stripped;
+}
+
+/**
+ * Shorten an absolute path to its last two segments with a leading
+ * ellipsis, so worktree rows show the disambiguating tail (e.g.
+ * ``"…/myrepo-worktrees/feature-x"``) instead of a shared prefix that
+ * truncates to the same string for every entry.
+ *
+ * @param path Absolute path, e.g. ``"/Users/me/myrepo-worktrees/feature-x"``.
+ * @returns The tail, prefixed with ``"…/"`` when segments were dropped;
+ *   the original path when it already has two or fewer segments.
+ */
+export function worktreePathTail(path: string): string {
+  const segments = path.replace(/\/+$/, "").split("/").filter(Boolean);
+  if (segments.length <= 2) return path;
+  return `…/${segments.slice(-2).join("/")}`;
 }
 
 /**
@@ -1270,7 +1295,7 @@ function AgentHarnessPicker({
   setBypassSandbox: (enabled: boolean) => void;
   setPickedModel: (model: string) => void;
   setPickedEffort: (effort: string) => void;
-  setPickedHarness: (harness: string | null) => void;
+  setPickedHarness: (harness: string | null, agentId?: string) => void;
 }) {
   // Controlled so clicking a knobbed row can commit the pick and close the
   // menu (see the sub-trigger onClick below) without diving into the submenu.
@@ -1459,7 +1484,7 @@ function AgentHarnessPicker({
             onSelectAgent(agent);
             // Picking the spec default clears the override so the session
             // tracks the spec.
-            setPickedHarness(h === defaultHarness ? null : h);
+            setPickedHarness(h === defaultHarness ? null : h, agent.id);
           }}
           host={host}
           labels={brainHarnessLabels}
@@ -1667,7 +1692,7 @@ type LandingDraft = {
   sandboxRepoBranch: string;
   workspace: string;
   branchName: string;
-  baseBranch: string;
+  prefilledBranch: string;
   permissionMode: string;
   approvalMode: string;
   bypassSandbox: boolean;
@@ -1694,7 +1719,7 @@ export function NewChatLandingScreen() {
   const serverUrl = getCliServerUrl();
   const { data: agents } = useAvailableAgents();
   const brainHarnessLabels = useBrainHarnessLabels();
-  const { data: hosts } = useHosts();
+  const { data: hosts, isLoading: hostsLoading } = useHosts();
   // Sessions the caller can access, to warn when a new session would share a
   // working directory with a live one (see the conflict tooltip below).
   const { data: directorySessions } = useDirectorySessions(true);
@@ -1834,7 +1859,24 @@ export function NewChatLandingScreen() {
   );
   const [workspace, setWorkspace] = useState<string>(() => landingDraft?.workspace ?? "");
   const [branchName, setBranchName] = useState<string>(() => landingDraft?.branchName ?? "");
-  const [baseBranch, setBaseBranch] = useState<string>(() => landingDraft?.baseBranch ?? "");
+  // The base branch auto-fills from the configured default (Settings › Git)
+  // when the user names a worktree branch, and is left alone once the user
+  // touches it — clearing the branch name re-arms the auto-fill (see the effect
+  // below). `baseBranchEdited` tracks that hand-off; any edit (including
+  // clearing the field) sets it so a later re-seed won't clobber the choice.
+  const [baseBranch, _setBaseBranch] = useState<string>("");
+  const [baseBranchEdited, setBaseBranchEdited] = useState<boolean>(false);
+  const setBaseBranch = useCallback((next: string) => {
+    _setBaseBranch(next);
+    setBaseBranchEdited(true);
+  }, []);
+  // Branch prefilled from the existing worktree the current workspace points
+  // at. When `branchName` still equals this, the session starts directly in
+  // that worktree (no git opts). Editing the field away from it means the user
+  // wants a *new* worktree off that name.
+  const [prefilledBranch, setPrefilledBranch] = useState<string>(
+    () => landingDraft?.prefilledBranch ?? "",
+  );
   // Project to file the new session under (an implicit collection stored as a
   // conversation_labels row). Empty = unfiled. Applied right after create.
   // Pre-filled from a `?project=` query param so the sidebar's per-project
@@ -1873,10 +1915,12 @@ export function NewChatLandingScreen() {
     () => landingDraft?.cursorExecMode ?? CURSOR_NATIVE_DEFAULT_EXEC_MODE,
   );
   // Per-session brain-harness override for bundle agents (polly / debby).
-  // null = the agent spec's declared harness (no override sent); cleared on
-  // every agent switch so a pick never leaks across agents.
+  // null = the agent spec's declared harness (no override sent). On agent
+  // switch, seeded from the user's last stored pick for that agent.
   const [pickedHarness, setPickedHarness] = useState<string | null>(
-    () => landingDraft?.pickedHarness ?? null,
+    () =>
+      landingDraft?.pickedHarness ??
+      readLastHarness(landingDraft?.pickedAgentId ?? readLastAgentId()),
   );
   // Per-session model + reasoning effort for the claude-native model picker.
   // "" = unselected: nothing is checked and `model_override` / `reasoning_effort`
@@ -1904,6 +1948,8 @@ export function NewChatLandingScreen() {
   }, []);
   // Controls the working-directory popover so picking a directory closes it.
   const [workspacePopoverOpen, setWorkspacePopoverOpen] = useState(false);
+  // Controlled so selecting an existing worktree can close the popover.
+  const [worktreePopoverOpen, setWorktreePopoverOpen] = useState(false);
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
   // "Connect a host" instructions modal, opened from the host dropdown.
@@ -1925,7 +1971,7 @@ export function NewChatLandingScreen() {
     sandboxRepoBranch,
     workspace,
     branchName,
-    baseBranch,
+    prefilledBranch,
     permissionMode,
     approvalMode,
     bypassSandbox,
@@ -1974,21 +2020,53 @@ export function NewChatLandingScreen() {
     };
   }, []);
 
-  // Auto-select the FIRST AVAILABLE option, mirroring the menu order, so
-  // a session can be started without an explicit pick: the sandbox when
-  // the server supports it (it's pinned first in the picker), else the
-  // first online host. Only fills an empty slot; explicit choices are
-  // never overridden.
+  // Auto-select an option so a session can be started without an explicit
+  // pick. Prefer the user's last explicit choice (persisted across visits);
+  // otherwise fall back to the FIRST AVAILABLE option in menu order — the
+  // sandbox when the server supports it (it's pinned first in the picker),
+  // else the first online host. Only fills an empty slot; an explicit choice
+  // already in state (or restored from the in-memory draft) is never
+  // overridden.
   useEffect(() => {
     if (sandboxSelected) return;
     if (selectedHostId !== null) return;
+
+    // Read the persisted pick once, as a mount-time seed — deliberately NOT a
+    // dependency: it only matters until the slot is filled, and re-running on
+    // its value would fight an explicit in-session selection.
+    const lastChoice = readLastHostChoice();
+    if (lastChoice === SANDBOX_HOST_CHOICE) {
+      // Wait for the server-info probe before acting on a sandbox pick: until
+      // it resolves we don't know whether the sandbox is offered, and falling
+      // through to a connected host would strand the returning sandbox user
+      // (this effect wouldn't re-run to correct it once a host is set).
+      if (info === "loading") return;
+      if (managedSandboxesEnabled) {
+        setSandboxSelected(true);
+        return;
+      }
+      // Sandbox no longer offered (e.g. an OSS server) — fall through.
+    } else if (lastChoice) {
+      // A persisted host pick can only be honored once the host list has
+      // loaded and shows it online. Wait for the load rather than defaulting
+      // past it — defaulting to the sandbox here would set sandboxSelected and
+      // this effect would then never re-run to restore the host.
+      if (hostsLoading) return;
+      const stored = (hosts ?? []).find((h) => h.host_id === lastChoice && h.status === "online");
+      if (stored) {
+        setSelectedHostId(stored.host_id);
+        return;
+      }
+      // Stored host is gone or offline — fall through to the default.
+    }
+
     if (managedSandboxesEnabled) {
       setSandboxSelected(true);
       return;
     }
     const firstOnline = (hosts ?? []).find((h) => h.status === "online");
     if (firstOnline) setSelectedHostId(firstOnline.host_id);
-  }, [hosts, selectedHostId, sandboxSelected, managedSandboxesEnabled]);
+  }, [hosts, hostsLoading, selectedHostId, sandboxSelected, managedSandboxesEnabled, info]);
 
   // Fall back to the host's home directory when it has no recorded recents, so
   // the working-directory field is pre-filled and the user can send in one
@@ -2149,6 +2227,91 @@ export function NewChatLandingScreen() {
     }
     return counts;
   }, [conflictCandidates, runnerHealth]);
+
+  // Existing git worktrees of the picked directory's repo, for the
+  // worktree picker. Skipped for sandbox sessions (server-managed) and
+  // when no directory is picked. A non-git path resolves to [].
+  const worktreesEnabled = !sandboxSelected && selectedHostId !== null && workspaceTrimmed !== "";
+  const { data: hostWorktrees } = useHostWorktrees(
+    worktreesEnabled ? selectedHostId : null,
+    worktreesEnabled ? workspaceTrimmed : null,
+  );
+  // Linked worktrees (exclude the main work tree — "starting in the main
+  // repo" is just picking that directory, not selecting a worktree).
+  const linkedWorktrees = useMemo(
+    () => (hostWorktrees ?? []).filter((w) => !w.is_main),
+    [hostWorktrees],
+  );
+  // The worktree the picked directory currently points at, if any. Set when
+  // the user navigated the picker straight into a worktree folder, or clicked
+  // one in the list below.
+  const activeWorktree = useMemo(() => {
+    const target = normalizeWorkspacePath(workspaceTrimmed);
+    if (target === null) return null;
+    return linkedWorktrees.find((w) => normalizeWorkspacePath(w.path) === target) ?? null;
+  }, [linkedWorktrees, workspaceTrimmed]);
+  // When the workspace lands on an existing worktree, prefill the branch
+  // field with its branch and remember it as the prefill. Leaving the
+  // worktree clears the prefill (but not a name the user typed themselves).
+  useEffect(() => {
+    const branch = activeWorktree?.branch ?? "";
+    if (branch !== "") {
+      setPrefilledBranch(branch);
+      setBranchName(branch);
+    } else {
+      setPrefilledBranch((prev) => {
+        // Only clear the field if it still holds the previous prefill —
+        // don't wipe a branch name the user typed for a new worktree.
+        setBranchName((cur) => (cur === prev ? "" : cur));
+        return "";
+      });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeWorktree?.path]);
+  // True when the session should start directly in the existing worktree:
+  // the workspace is a worktree and the branch field still holds its
+  // prefilled branch (the user hasn't edited it to request a new worktree).
+  const startInExistingWorktree =
+    activeWorktree !== null && prefilledBranch !== "" && branchName.trim() === prefilledBranch;
+  // A new, isolated worktree is created only when a branch is named and the
+  // workspace isn't already sitting on that existing worktree.
+  const shouldCreateWorktree = branchName.trim() !== "" && !startInExistingWorktree;
+  // Auto-fill the base branch from the configured default (Settings › Git) when
+  // a new-worktree branch is named, but only until the user touches the base
+  // field — then their choice (including a cleared field) stands. Clearing the
+  // branch name (so the base field goes away) re-arms the auto-fill, so naming
+  // a branch again starts fresh from the current default.
+  useEffect(() => {
+    if (!shouldCreateWorktree) {
+      // No base field shown: reset so the next named branch re-seeds cleanly.
+      setBaseBranchEdited(false);
+      _setBaseBranch("");
+      return;
+    }
+    if (!baseBranchEdited) {
+      _setBaseBranch(readDefaultBaseBranch() ?? "");
+    }
+  }, [shouldCreateWorktree, baseBranchEdited]);
+  // The branch input doubles as a combobox: focusing it reveals existing
+  // worktrees, and what the user types filters them (match on branch or path
+  // substring, case-insensitive). Typing a name that matches none = a new
+  // worktree; picking a match = start in that existing worktree.
+  const [branchInputFocused, setBranchInputFocused] = useState(false);
+  const filteredWorktrees = useMemo(() => {
+    const q = branchName.trim().toLowerCase();
+    if (q === "") return linkedWorktrees;
+    return linkedWorktrees.filter(
+      (w) => (w.branch ?? "").toLowerCase().includes(q) || w.path.toLowerCase().includes(q),
+    );
+  }, [linkedWorktrees, branchName]);
+  // Fill the branch field with a unique auto-generated name so the user can
+  // spin up a throwaway worktree without inventing one. crypto.randomUUID is
+  // available in every browser the app targets; the short prefix keeps the
+  // dir/branch readable (worktree-1a2b3c4d).
+  const generateBranchName = useCallback(() => {
+    const suffix = crypto.randomUUID().replace(/-/g, "").slice(0, 8);
+    setBranchName(`worktree-${suffix}`);
+  }, []);
 
   // Sandbox repo inputs are valid when blank (empty workspace), or when
   // the URL passes the shape check; a branch without a URL is dangling.
@@ -2330,6 +2493,8 @@ export function NewChatLandingScreen() {
     : sandboxSelected
       ? sandboxLabel
       : (selectedHost?.name ?? (onlineHosts.length === 0 ? "No hosts" : "Select host"));
+  // The chip shows just the branch (the "(existing)" distinction lives in the
+  // popover's warning; appending it here only gets clipped by the chip's cap).
   const worktreeLabel = branchName.trim() || "No worktree";
   // Sandbox repository chip label: repo name (server's clone-dir rule)
   // plus the pinned branch, e.g. "repo#main"; placeholder when unset.
@@ -2344,11 +2509,25 @@ export function NewChatLandingScreen() {
   // redundant.
   const agentLabel = selectedAgent ? selectedAgent.display_name : "Select agent";
 
-  // Select an agent/harness from the picker. Switching agents drops the
-  // harness override so a pick never leaks across agents; explicit picks
-  // persist (auto-defaults never do).
+  // Wrap the harness setter so every explicit pick is persisted to
+  // localStorage. The caller can pass an explicit `agentId` for the
+  // switch-via-submenu path where `effectiveAgentId` still reflects the
+  // previously selected agent (the state update from `onSelectAgent` hasn't
+  // applied yet).
+  const handleSetPickedHarness = useCallback(
+    (harness: string | null, agentId?: string) => {
+      setPickedHarness(harness);
+      writeLastHarness(agentId ?? effectiveAgentId, harness);
+    },
+    [effectiveAgentId],
+  );
+
+  // Select an agent/harness from the picker. Switching agents seeds the
+  // harness override from the user's last pick for that agent (so a
+  // returning user lands on the harness they used last); explicit picks
+  // persist via localStorage.
   const handleSelectAgent = (agent: AvailableAgent) => {
-    if (agent.id !== effectiveAgentId) setPickedHarness(null);
+    if (agent.id !== effectiveAgentId) setPickedHarness(readLastHarness(agent.id));
     setPickedAgentId(agent.id);
     writeLastAgentId(agent.id);
   };
@@ -2358,6 +2537,10 @@ export function NewChatLandingScreen() {
   };
 
   function selectHost(hostId: string) {
+    // Persist the explicit pick even when it matches the current selection, so
+    // clicking the auto-selected host still records it as the sticky default
+    // for the next visit.
+    writeLastHostChoice(hostId);
     // Re-selecting the current host is a no-op. Clearing the workspace here
     // would empty the field for good: the seeding effect's deps (host id,
     // recents, derived home) are all unchanged on a same-host pick, so it
@@ -2374,6 +2557,10 @@ export function NewChatLandingScreen() {
   }
 
   function selectSandbox() {
+    // Persist the explicit sandbox pick (as the reserved sentinel) even when
+    // it's already selected, mirroring selectHost — so the sandbox becomes the
+    // sticky default for the next visit.
+    writeLastHostChoice(SANDBOX_HOST_CHOICE);
     if (sandboxSelected) return;
     // Mirror selectHost: a managed session's host and workspace are both
     // server-chosen, so clear any prior host pick and its workspace.
@@ -2411,6 +2598,11 @@ export function NewChatLandingScreen() {
     setCreateError(null);
     try {
       const trimmedBranch = branchName.trim();
+      // `shouldCreateWorktree` (component scope): true only when a branch is
+      // named and the workspace isn't already an existing worktree. Starting
+      // in an existing worktree sends no git opts — the workspace is bound
+      // straight to that dir, which also sidesteps the "branch already
+      // exists" guard.
       const agent = agentList.find((a) => a.id === effectiveAgentId);
       const nativeLabels = nativeWrapperLabelsForAgent(agent);
       const agentSupportsPermissionMode = nativeAgentHasCapability(agent, "permissionMode");
@@ -2435,9 +2627,14 @@ export function NewChatLandingScreen() {
         // Launch the runner on the selected host. The multipart create
         // only stores DB rows — launchRunner binds + starts the runner.
         if (!sandboxSelected && selectedHostId && workspaceTrimmed) {
-          const gitOpts = trimmedBranch
+          // Create a new worktree, bind an existing one (records the branch
+          // for the sidebar + delete flow without creating anything), or
+          // neither — mirrored on the `git` block.
+          const gitOpts = shouldCreateWorktree
             ? { branchName: trimmedBranch, baseBranch: baseBranch.trim() || undefined }
-            : undefined;
+            : startInExistingWorktree
+              ? { branchName: trimmedBranch, existingWorktree: true }
+              : undefined;
           await launchRunner(selectedHostId, data.id, workspaceTrimmed, gitOpts);
         }
         // Clear pending agent after successful creation.
@@ -2457,9 +2654,14 @@ export function NewChatLandingScreen() {
               : {
                   host_id: selectedHostId,
                   workspace: workspaceTrimmed,
-                  git: trimmedBranch
+                  // Create a new worktree, or bind an existing one
+                  // (`existing_worktree` records the branch for the sidebar +
+                  // delete flow without creating anything), or neither.
+                  git: shouldCreateWorktree
                     ? { branch_name: trimmedBranch, base_branch: baseBranch.trim() || undefined }
-                    : undefined,
+                    : startInExistingWorktree
+                      ? { branch_name: trimmedBranch, existing_worktree: true }
+                      : undefined,
                 }),
             // Native terminal agents open terminal-first: `omnigent.ui:
             // terminal` tells the UI to render the terminal wrapper, and
@@ -2904,7 +3106,7 @@ export function NewChatLandingScreen() {
                   setBypassSandbox={setBypassSandbox}
                   setPickedModel={setPickedModel}
                   setPickedEffort={setPickedEffort}
-                  setPickedHarness={setPickedHarness}
+                  setPickedHarness={handleSetPickedHarness}
                 />
                 {smartRoutingEnabled &&
                   selectedAgent &&
@@ -3040,6 +3242,7 @@ export function NewChatLandingScreen() {
                     <DropdownMenuItem
                       key={host.host_id}
                       onSelect={() => selectHost(host.host_id)}
+                      data-testid={`new-chat-landing-host-${host.host_id}`}
                       data-active={host.host_id === selectedHostId ? "true" : undefined}
                       className="text-xs data-[active=true]:bg-accent/60"
                     >
@@ -3212,11 +3415,12 @@ export function NewChatLandingScreen() {
                         }
                         onNavigate={setWorkspace}
                         // Warn when browsing into a directory other live agents
-                        // occupy. Suppressed once a git branch is named — that
-                        // starts an isolated worktree, so there's no shared-dir
-                        // conflict regardless of the picked directory.
+                        // occupy. Suppressed only when a NEW isolated worktree
+                        // will be created (no shared-dir conflict then). When
+                        // starting directly in an existing worktree the branch
+                        // is prefilled but the dir IS shared, so keep warning.
                         occupancyForPath={
-                          branchName.trim() === ""
+                          !shouldCreateWorktree
                             ? (abs) => occupancyByDir.get(normalizeWorkspacePath(abs) ?? "") ?? 0
                             : undefined
                         }
@@ -3231,7 +3435,7 @@ export function NewChatLandingScreen() {
               {/* Git worktree chip — hidden for sandbox sessions (worktree
                 creation requires a caller-supplied host_id). */}
               {!sandboxSelected && (
-                <Popover>
+                <Popover open={worktreePopoverOpen} onOpenChange={setWorktreePopoverOpen}>
                   <PopoverTrigger asChild>
                     <button
                       type="button"
@@ -3247,7 +3451,14 @@ export function NewChatLandingScreen() {
                       <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
                     </button>
                   </PopoverTrigger>
-                  <PopoverContent align="start" className="w-[min(20rem,calc(100vw-2rem))] p-3">
+                  <PopoverContent
+                    align="start"
+                    collisionPadding={16}
+                    // No overflow clip here — the worktree dropdown floats as an
+                    // absolute overlay (below) and must be able to escape the
+                    // popover's padding box.
+                    className="w-[min(20rem,calc(100vw-2rem))] p-3"
+                  >
                     <div className="flex flex-col gap-2">
                       <label
                         htmlFor="landing-branch-name"
@@ -3255,30 +3466,138 @@ export function NewChatLandingScreen() {
                       >
                         Git worktree branch (optional)
                       </label>
-                      <input
-                        id="landing-branch-name"
-                        type="text"
-                        value={branchName}
-                        onChange={(e) => setBranchName(e.target.value)}
-                        placeholder="feature/my-branch"
-                        className="rounded-md border border-input bg-background px-3 py-2 text-xs outline-none transition-colors focus-visible:border-ring"
-                        data-testid="new-chat-landing-branch-input"
-                      />
-                      {branchName.trim() !== "" && (
+                      {/* Help text sits above the field. The warning for a picked
+                        existing worktree stays below the input (contextual to the
+                        selection). */}
+                      <p className="text-xs text-muted-foreground">
+                        New branch name, or pick an existing worktree. Leave blank to start directly
+                        in the working directory.
+                      </p>
+                      {/* The branch field is a combobox: focusing it reveals the
+                        repo's existing worktrees, and typing filters them.
+                        Picking one starts in that worktree; a name matching none
+                        creates a new worktree. */}
+                      <div className="relative flex flex-col">
+                        <input
+                          id="landing-branch-name"
+                          type="text"
+                          value={branchName}
+                          onChange={(e) => setBranchName(e.target.value)}
+                          onFocus={() => setBranchInputFocused(true)}
+                          // Delay so a click on a dropdown option registers
+                          // before the list unmounts on blur.
+                          onBlur={() => setTimeout(() => setBranchInputFocused(false), 120)}
+                          placeholder="feature/my-branch"
+                          role="combobox"
+                          aria-expanded={branchInputFocused && filteredWorktrees.length > 0}
+                          aria-autocomplete="list"
+                          // Suppress the browser's native autofill dropdown so it
+                          // doesn't overlay our worktree combobox. `off` alone is
+                          // ignored by some browsers, so also disable spellcheck /
+                          // autocorrect and give it an unrecognized name.
+                          autoComplete="off"
+                          autoCorrect="off"
+                          autoCapitalize="off"
+                          spellCheck={false}
+                          name="omnigent-worktree-branch"
+                          // pr-9 leaves room for the generate button overlaid at
+                          // the right edge.
+                          className="rounded-md border border-input bg-background py-2 pr-9 pl-3 text-xs outline-none transition-colors focus-visible:border-ring"
+                          data-testid="new-chat-landing-branch-input"
+                        />
+                        {/* Fill a unique branch name for a throwaway worktree.
+                          onMouseDown so it fires before the input's blur closes
+                          the combobox and preventDefault keeps focus on the
+                          input. */}
+                        <button
+                          type="button"
+                          onMouseDown={(e) => {
+                            e.preventDefault();
+                            generateBranchName();
+                          }}
+                          title="Generate a unique branch name"
+                          aria-label="Generate a unique branch name"
+                          className="absolute top-0 right-0 flex h-9 w-9 items-center justify-center text-muted-foreground transition-colors hover:text-foreground"
+                          data-testid="new-chat-landing-branch-generate"
+                        >
+                          <ShuffleIcon className="size-4" />
+                        </button>
+                        {branchInputFocused && filteredWorktrees.length > 0 && (
+                          <div
+                            // Floats over the popover as a combobox popup, so it
+                            // doesn't stretch the box. Bounded height + internal
+                            // scroll keep it from running off the viewport.
+                            className="absolute top-full right-0 left-0 z-20 mt-1 flex max-h-40 flex-col overflow-y-auto rounded-md border border-input bg-popover p-1 shadow-md"
+                            data-testid="new-chat-landing-worktree-dropdown"
+                          >
+                            <span className="px-2 pt-1 pb-0.5 text-[11px] font-medium tracking-wide text-muted-foreground uppercase">
+                              Existing worktrees
+                            </span>
+                            <ul className="flex flex-col gap-0.5">
+                              {filteredWorktrees.map((w) => {
+                                const selected =
+                                  normalizeWorkspacePath(w.path) ===
+                                  normalizeWorkspacePath(workspaceTrimmed);
+                                return (
+                                  <li key={w.path}>
+                                    <button
+                                      type="button"
+                                      // onMouseDown (not onClick): fires before the
+                                      // input's blur, so the selection lands even
+                                      // though blur is about to hide the list.
+                                      onMouseDown={(e) => {
+                                        e.preventDefault();
+                                        setWorkspace(w.path);
+                                        setBranchInputFocused(false);
+                                        setWorktreePopoverOpen(false);
+                                      }}
+                                      className={`flex w-full flex-col items-start gap-0.5 rounded-md px-2 py-1 text-left text-xs transition-colors hover:bg-accent ${
+                                        selected ? "bg-accent" : ""
+                                      }`}
+                                      data-testid="new-chat-landing-worktree-option"
+                                    >
+                                      <span className="font-medium text-foreground">
+                                        {w.branch ?? "(detached)"}
+                                      </span>
+                                      {/* Tail-truncated so the disambiguating
+                                      folder shows, not a shared prefix; full
+                                      path on hover. */}
+                                      <span
+                                        className="w-full truncate text-muted-foreground"
+                                        title={w.path}
+                                      >
+                                        {worktreePathTail(w.path)}
+                                      </span>
+                                    </button>
+                                  </li>
+                                );
+                              })}
+                            </ul>
+                          </div>
+                        )}
+                      </div>
+                      {/* Base branch only matters when creating a NEW worktree
+                        — hidden once the workspace points at an existing one
+                        (no worktree is created, so there's nothing to base). */}
+                      {branchName.trim() !== "" && !startInExistingWorktree && (
                         <input
                           type="text"
                           value={baseBranch}
                           onChange={(e) => setBaseBranch(e.target.value)}
-                          placeholder="Base branch (defaults to current branch)"
+                          placeholder="Base branch (defaults to current)"
                           aria-label="Base branch"
                           className="rounded-md border border-input bg-background px-3 py-2 text-xs outline-none transition-colors focus-visible:border-ring"
                           data-testid="new-chat-landing-base-branch-input"
                         />
                       )}
-                      <p className="text-xs text-muted-foreground">
-                        Creates an isolated git worktree for a new branch. Leave blank to start
-                        directly in the working directory.
-                      </p>
+                      {startInExistingWorktree && (
+                        <p
+                          className="text-xs text-amber-600 dark:text-amber-500"
+                          data-testid="new-chat-landing-existing-worktree-warning"
+                        >
+                          Starts in existing worktree, edit the name to create a new one.
+                        </p>
+                      )}
                     </div>
                   </PopoverContent>
                 </Popover>

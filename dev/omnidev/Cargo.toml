@@ -1,0 +1,34 @@
+[package]
+name = "omnidev"
+version = "0.1.0"
+edition = "2021"
+description = "Per-repo dev pod supervisor TUI for the Omnigent repo"
+publish = false
+
+[[bin]]
+name = "omnidev"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.28"
+ratatui = "0.29"
+ansi-to-tui = "7"
+notify = "8"
+notify-debouncer-full = "0.5"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "process",
+    "io-util",
+    "net",
+    "time",
+    "sync",
+    "signal",
+] }
+if-addrs = "0.15"

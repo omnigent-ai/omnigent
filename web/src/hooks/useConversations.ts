@@ -34,6 +34,7 @@ import {
   type SessionListWireItem,
 } from "@/lib/sessionListCache";
 import { stopSession } from "@/lib/sessionsApi";
+import { useChatStore } from "@/store/chatStore";
 import type { Session } from "@/lib/types";
 import { useSessionUpdatesConnected } from "./useSessionUpdatesConnected";
 import { markConversationSeen } from "./useUnseenConversations";
@@ -131,6 +132,14 @@ export interface Conversation {
    * Per-viewer; lifts the active-row dot suppression on the client.
    */
   viewer_unread?: boolean;
+  /**
+   * Excerpt of the chat content that matched the current `search_query`,
+   * centered on the match with `…` marking elided ends. Present only on
+   * search responses where the query hit a message body rather than the
+   * title, so the search UI (command palette) can show *where* a session
+   * matched. Absent on non-search fetches and title-only matches.
+   */
+  search_snippet?: string | null;
 }
 
 export interface ConversationsPage {
@@ -286,6 +295,9 @@ export async function deleteConversation(id: string, deleteBranch = false): Prom
     method: "DELETE",
   });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  // Drop any client-side queued messages for the now-deleted session; bound to
+  // a dead conversation, they could never flush.
+  useChatStore.getState().clearQueuedMessages(id);
 }
 
 /**

@@ -271,7 +271,9 @@ def _is_login_redirect_or_unauthorized(response: httpx.Response) -> bool:
     :returns: ``True`` when the response indicates the request should
         be retried with a fresh token, ``False`` otherwise.
     """
-    if response.status_code == 401:
+    if response.status_code in (401, 403):
+        # Databricks Apps returns 403 "Invalid Token" for an expired bearer
+        # in addition to the 302→/oidc/ bounce; treat both as re-auth signals.
         return True
     if not response.is_redirect:
         return False
@@ -1007,7 +1009,7 @@ def create_app(
     )
 
     async def _start_pm() -> None:
-        """Start harness process manager; kick off MCP prewarm if requested."""
+        """Start harness process manager; register MCP prewarm metadata if requested."""
         await pm.start()
         prewarm_path = os.environ.get(_RUNNER_PREWARM_SPEC_PATH_ENV_VAR)
         if prewarm_path and mcp_manager is not None:
@@ -1021,7 +1023,7 @@ def create_app(
                 prewarm_spec = _load_spec(Path(prewarm_path), expand_env=True)
                 await mcp_manager.prewarm(prewarm_spec)
                 _logger.info(
-                    "runner MCP prewarm scheduled for %s (servers=%d)",
+                    "runner MCP prewarm registered for %s (servers=%d)",
                     prewarm_path,
                     len(prewarm_spec.mcp_servers or []),
                 )
@@ -1226,13 +1228,9 @@ def main() -> None:
 
     :returns: None.
     """
-    log_level = os.environ.get("OMNIGENT_LOG_LEVEL", "INFO").upper()
-    logging.basicConfig(
-        level=getattr(logging, log_level, logging.INFO),
-        format="%(asctime)s %(levelname)s:%(name)s:%(message)s",
-        datefmt="%Y-%m-%dT%H:%M:%S%z",
-        stream=sys.stderr,
-    )
+    from omnigent.process_logging import configure_process_logging
+
+    configure_process_logging("runner", force=True)
     try:
         asyncio.run(_run_tunnel_from_env())
     except RuntimeError as exc:

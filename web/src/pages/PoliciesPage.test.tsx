@@ -15,6 +15,22 @@ import * as identity from "@/lib/identity";
 import * as defaultPolicies from "@/hooks/useDefaultPolicies";
 import * as policies from "@/hooks/usePolicies";
 
+const serverInfoMocks = vi.hoisted(() => ({
+  accountsEnabled: true,
+  loginUrl: null as string | null,
+  serverVersion: "0.3.0.dev0" as string | null,
+  singleUser: false,
+}));
+
+vi.mock("@/lib/CapabilitiesContext", () => ({
+  useServerInfo: () => ({
+    accounts_enabled: serverInfoMocks.accountsEnabled,
+    login_url: serverInfoMocks.loginUrl,
+    server_version: serverInfoMocks.serverVersion,
+    single_user: serverInfoMocks.singleUser,
+  }),
+}));
+
 const addMutate = vi.fn();
 const updateMutate = vi.fn();
 const deleteMutate = vi.fn();
@@ -73,6 +89,10 @@ function renderPage() {
 }
 
 beforeEach(() => {
+  serverInfoMocks.accountsEnabled = true;
+  serverInfoMocks.loginUrl = null;
+  serverInfoMocks.serverVersion = "0.3.0.dev0";
+  serverInfoMocks.singleUser = false;
   vi.mocked(identity.resolveIdentity).mockResolvedValue("admin");
   vi.mocked(identity.getCurrentIsAdmin).mockReturnValue(true);
   setPolicies([]);
@@ -168,6 +188,55 @@ describe("PoliciesPage actions", () => {
     expect(deleteMutate).toHaveBeenCalledWith("p1", expect.anything());
   });
 
+  it("adds array (multi-select) values via the model combobox as a coerced list", async () => {
+    // WHY: the expensive_models-style array param renders the single-input
+    // combobox; picking options and typing a free-form value must survive the
+    // comma-joined form state and coerce to a list[str] on submit — guarding
+    // the checkbox→combobox refactor against a regression.
+    vi.mocked(policies.usePolicyRegistry).mockReturnValue({
+      data: [
+        {
+          handler: "omnigent.policies.budget",
+          kind: "factory",
+          name: "Budget Guard",
+          description: "blocks expensive models",
+          params_schema: {
+            properties: {
+              expensive_models: {
+                type: "array",
+                items: { type: "string", enum: ["opus", "sonnet", "haiku"] },
+              },
+            },
+            required: [],
+          },
+        },
+      ],
+    } as never);
+    renderPage();
+    await screen.findByText(/No global policies configured/);
+
+    fireEvent.click(screen.getByRole("button", { name: /Add policy/ }));
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.click(within(dialog).getByText("Budget Guard"));
+
+    const combo = within(dialog).getByPlaceholderText("Select or type a value…");
+    fireEvent.focus(combo);
+    fireEvent.mouseDown(within(dialog).getByRole("button", { name: "opus" }));
+    fireEvent.mouseDown(within(dialog).getByRole("button", { name: "haiku" }));
+    // Free-form typed value still works (Enter commits).
+    fireEvent.change(combo, { target: { value: "custom-tier" } });
+    fireEvent.keyDown(combo, { key: "Enter" });
+
+    fireEvent.click(within(dialog).getByRole("button", { name: /^Add$/ }));
+
+    expect(addMutate).toHaveBeenCalledTimes(1);
+    const payload = addMutate.mock.calls[0][0];
+    expect(payload.handler).toBe("omnigent.policies.budget");
+    expect(payload.factory_params).toEqual({
+      expensive_models: ["opus", "haiku", "custom-tier"],
+    });
+  });
+
   it("adds a global policy from the registry via the Add dialog", async () => {
     vi.mocked(policies.usePolicyRegistry).mockReturnValue({
       data: [
@@ -192,5 +261,112 @@ describe("PoliciesPage actions", () => {
       { name: "block_canada", type: "python", handler: "omnigent.policies.block_canada" },
       expect.anything(),
     );
+  });
+
+  it("Cancel steps back to the policy list after a policy is selected", async () => {
+    // WHY: once a policy is selected the dialog shows its config; Cancel must
+    // return to the list so the user can pick a different policy (not close).
+    vi.mocked(policies.usePolicyRegistry).mockReturnValue({
+      data: [
+        {
+          handler: "omnigent.policies.block_canada",
+          kind: "callable",
+          name: "Block Canada",
+          description: "Deny anything mentioning Canada.",
+          params_schema: null,
+        },
+        {
+          handler: "omnigent.policies.rate_limit",
+          kind: "callable",
+          name: "Rate Limit",
+          description: "Cap request rate.",
+          params_schema: null,
+        },
+      ],
+    } as never);
+    renderPage();
+    await screen.findByText(/No global policies configured/);
+
+    fireEvent.click(screen.getByRole("button", { name: /Add policy/ }));
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.click(within(dialog).getByText("Block Canada"));
+    expect(within(dialog).queryByPlaceholderText("Filter policies...")).toBeNull();
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+
+    expect(within(dialog).getByPlaceholderText("Filter policies...")).toBeInTheDocument();
+    expect(within(dialog).getByText("Block Canada")).toBeInTheDocument();
+    expect(within(dialog).getByText("Rate Limit")).toBeInTheDocument();
+    expect(addMutate).not.toHaveBeenCalled();
+  });
+
+  it("Cancel from the policy list closes the dialog", async () => {
+    vi.mocked(policies.usePolicyRegistry).mockReturnValue({
+      data: [
+        {
+          handler: "omnigent.policies.block_canada",
+          kind: "callable",
+          name: "Block Canada",
+          description: "Deny anything mentioning Canada.",
+          params_schema: null,
+        },
+      ],
+    } as never);
+    renderPage();
+    await screen.findByText(/No global policies configured/);
+
+    fireEvent.click(screen.getByRole("button", { name: /Add policy/ }));
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  });
+});
+
+describe("PoliciesPage single-user mode", () => {
+  beforeEach(() => {
+    // Explicit single-user local runtime (single_user marker): no auth
+    // endpoints, so the admin probe is skipped and the page renders directly.
+    serverInfoMocks.accountsEnabled = false;
+    serverInfoMocks.loginUrl = null;
+    serverInfoMocks.serverVersion = "0.3.0.dev0";
+    serverInfoMocks.singleUser = true;
+  });
+
+  it("shows the full page without the admin gate (empty state)", async () => {
+    renderPage();
+    expect(await screen.findByText(/No global policies configured/)).toBeInTheDocument();
+    expect(screen.queryByText("Loading...")).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("You don't have permission to manage global policies."),
+    ).not.toBeInTheDocument();
+  });
+
+  it("shows policies list directly without probing identity", async () => {
+    setPolicies([policy({ id: "p1", name: "block_canada", enabled: true })]);
+    renderPage();
+    expect(await screen.findByText("block_canada")).toBeInTheDocument();
+    expect(identity.resolveIdentity).not.toHaveBeenCalled();
+  });
+});
+
+describe("PoliciesPage on a multi-user header-auth deploy", () => {
+  beforeEach(() => {
+    // Header-auth multi-user (SSO proxy): accounts off AND no login_url, same
+    // shape as single-user, but single_user is false — so the admin gate must
+    // still run (probe identity, 403 non-admins). This is the regression the
+    // single_user signal fixes: before, this deploy skipped the gate entirely.
+    serverInfoMocks.accountsEnabled = false;
+    serverInfoMocks.loginUrl = null;
+    serverInfoMocks.serverVersion = "0.3.0.dev0";
+    serverInfoMocks.singleUser = false;
+  });
+
+  it("probes identity and gates non-admins", async () => {
+    vi.mocked(identity.getCurrentIsAdmin).mockReturnValue(false);
+    renderPage();
+    expect(
+      await screen.findByText("You don't have permission to manage global policies."),
+    ).toBeInTheDocument();
+    expect(identity.resolveIdentity).toHaveBeenCalled();
   });
 });

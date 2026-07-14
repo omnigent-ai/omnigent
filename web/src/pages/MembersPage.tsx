@@ -48,6 +48,7 @@ import {
 } from "@/lib/accountsApi";
 import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isSingleUserMode } from "@/lib/capabilities";
 
 export function MembersPage() {
   const info = useServerInfo();
@@ -55,6 +56,10 @@ export function MembersPage() {
   // accounts mode — OIDC identities are owned by the IdP, so under OIDC
   // this page is a read-only user list (no action column, no modals).
   const manageable = info !== "loading" && info.accounts_enabled;
+  // Plain header/single-user mode: no auth endpoints exist. The nav + route
+  // already hide Members here; this placeholder is a fallback for a direct
+  // hit before the redirect resolves.
+  const isSingleUser = isSingleUserMode(info);
   const [meIsAdmin, setMeIsAdmin] = useState<boolean | null>(null);
   const [meId, setMeId] = useState<string | null>(null);
   const [users, setUsers] = useState<AccountListEntry[] | null>(null);
@@ -82,12 +87,11 @@ export function MembersPage() {
     setUsers(list);
   }, []);
 
-  // Initial load: identity probe + members list. The identity probe
-  // gates the UI (non-admins see "no access"); the list is what we
-  // render the table from. Uses the mode-agnostic `/v1/me` identity
-  // (via resolveIdentity) rather than the accounts-only `/auth/me`, so
-  // the page also works under OIDC where `/auth/me` doesn't exist.
+  // Initial load: identity probe + members list. Skipped in single-user
+  // mode since no auth endpoints exist. isSingleUser is a stable boolean
+  // so it is safe as a dep without risking infinite re-renders.
   useEffect(() => {
+    if (isSingleUser) return;
     void (async () => {
       const userId = await resolveIdentity();
       if (userId === null) {
@@ -101,9 +105,22 @@ export function MembersPage() {
       setMeIsAdmin(isAdmin);
       if (isAdmin) await refresh();
     })();
-  }, [refresh]);
+  }, [refresh, isSingleUser]);
+
+  if (isSingleUser) {
+    return (
+      <PageScroll contentClassName="px-8" extraBottom="2.5rem">
+        <h1 className="mb-2 text-2xl font-semibold">Members</h1>
+        <p className="text-sm text-muted-foreground">
+          Member management is not available in single-user mode.
+        </p>
+      </PageScroll>
+    );
+  }
 
   // Pre-admin-check render: blank loading state. min-h-full so the
+  // AppShell's outlet container governs height — we're a child view,
+  // not a full-page replacement. min-h-full so the
   // AppShell's outlet container governs height — we're a child view,
   // not a full-page replacement.
   if (meIsAdmin === null) {
@@ -117,12 +134,12 @@ export function MembersPage() {
   // Non-admin: hard stop. Server would also 403, this is just UX.
   if (meIsAdmin === false) {
     return (
-      <div className="mx-auto w-full max-w-2xl px-6 py-12">
+      <PageScroll contentClassName="px-8" extraBottom="2.5rem">
         <h1 className="mb-2 text-2xl font-semibold">Members</h1>
         <p className="text-sm text-muted-foreground">
           You don't have permission to manage members.
         </p>
-      </div>
+      </PageScroll>
     );
   }
 
@@ -169,7 +186,7 @@ export function MembersPage() {
   }
 
   return (
-    <PageScroll contentClassName="px-6">
+    <PageScroll contentClassName="px-8" extraBottom="2.5rem">
       <div className="mb-6 flex items-center justify-between">
         <h1 className="text-2xl font-semibold">Members</h1>
         {/* Invite mints a password-backed account — accounts mode only.

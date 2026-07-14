@@ -21,6 +21,8 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
+from tests.e2e_ui.conftest import switch_markdown_view_mode
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 _MARKDOWN_FILE_PATH = "tasks.md"
@@ -69,6 +71,9 @@ def test_task_lists_render_as_checkboxes(
 
     file_viewer = page.locator('[data-testid="file-viewer"]:visible')
     expect(file_viewer).to_be_visible()
+
+    # Markdown opens in the rich-text editor by default, where task lists
+    # render as the dedicated TaskList node view.
     editor = file_viewer.locator("[contenteditable='true']")
     expect(editor).to_be_visible(timeout=10_000)
 
@@ -96,7 +101,7 @@ def test_task_lists_render_as_checkboxes(
     expect(plain).to_have_count(1)
     expect(plain.locator('input[type="checkbox"]')).to_have_count(0)
 
-    # Source toggle: the raw markers are visible verbatim in the source view.
-    file_viewer.get_by_role("button", name="Source view").click()
+    # Source view: the raw markers are visible verbatim.
+    switch_markdown_view_mode(page, file_viewer, "Source")
     expect(file_viewer.locator("[contenteditable='true']")).to_have_count(0)
     expect(file_viewer.get_by_text("- [x] Ship the PR", exact=False)).to_be_visible(timeout=10_000)

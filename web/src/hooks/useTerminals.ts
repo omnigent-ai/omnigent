@@ -24,6 +24,14 @@ export interface TerminalInfo {
   session: string;
   /** Whether the underlying tmux session is currently running. */
   running: boolean;
+  /**
+   * Web-attach transport for this terminal, from
+   * ``metadata.terminal_transport``: ``"control"`` (tmux control mode —
+   * native browser scrollback + selection) or ``"pty"`` (the legacy forked
+   * ``tmux attach`` stream). ``undefined`` when the server omits it (older
+   * server / treat as PTY).
+   */
+  transport?: "control" | "pty";
 }
 
 /**
@@ -203,6 +211,8 @@ export function terminalInfoFromResource(resource: Record<string, unknown>): Ter
   const terminalName = metadata.terminal_name;
   const sessionKey = metadata.session_key;
   const running = metadata.running;
+  const rawTransport = metadata.terminal_transport;
+  const transport = rawTransport === "control" || rawTransport === "pty" ? rawTransport : undefined;
   const fallbackName = resource.name;
   return {
     id,
@@ -219,6 +229,7 @@ export function terminalInfoFromResource(resource: Record<string, unknown>): Ter
           : "",
     session: typeof sessionKey === "string" ? sessionKey : "",
     running: typeof running === "boolean" ? running : false,
+    transport,
   };
 }
 
@@ -287,7 +298,8 @@ export async function fetchTerminals(conversationId: string): Promise<TerminalIn
  * :param conversationId: Session/conversation identifier,
  *     e.g. ``"conv_abc123"``.
  * :param terminal: Declared terminal name from the agent spec,
- *     e.g. ``"shell"``.
+ *     e.g. ``"shell"`` (or a shell basename like ``"zsh"`` for a native
+ *     session offering the host's installed shells).
  * :returns: The created terminal mapped to :class:`TerminalInfo`.
  * :raises Error: When the server rejects the create (e.g. the agent
  *     has no terminal access) or the launch fails.

@@ -65,7 +65,10 @@ interface ShortcutGroup {
 const SHORTCUT_GROUPS: ShortcutGroup[] = [
   {
     title: "General",
-    items: [{ label: "Show keyboard shortcuts", keys: [MOD_KEY, "/"] }],
+    items: [
+      { label: "Open command palette", keys: [MOD_KEY, "K"] },
+      { label: "Show keyboard shortcuts", keys: [MOD_KEY, "/"] },
+    ],
   },
   {
     title: "In chats",
@@ -103,20 +106,22 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
   },
 ];
 
-// Desktop-only: Cmd/Ctrl+digit collides with browser tab-switching, so the
-// pinned-session hotkey ships only in the Electron shell (see
-// usePinnedSessionHotkeys). Injected into "Navigation" when running natively.
-const PINNED_SESSION_SHORTCUT: Shortcut = {
-  label: "Jump to pinned session (1–10)",
-  keys: [MOD_KEY, "1…0"],
-};
+// Numeric pinned-session jump. The chord is platform-aware (see
+// usePinnedSessionHotkeys): plain Cmd/Ctrl+digit in the Electron shell, but
+// Cmd/Ctrl+Alt+digit in a browser tab, where plain Cmd+digit is reserved for
+// native tab-switching. Shown in both, with the matching glyphs.
+function pinnedSessionShortcut(native: boolean): Shortcut {
+  return {
+    label: "Jump to pinned session (1–10)",
+    keys: native ? [MOD_KEY, "1…0"] : [MOD_KEY, ALT, "1…0"],
+  };
+}
 
-/** Shortcut groups for the current runtime — adds desktop-only rows natively. */
+/** Shortcut groups for the current runtime — the pinned-jump chord differs by shell. */
 function shortcutGroupsFor(native: boolean): ShortcutGroup[] {
-  if (!native) return SHORTCUT_GROUPS;
   return SHORTCUT_GROUPS.map((group) =>
     group.title === "Navigation"
-      ? { ...group, items: [...group.items, PINNED_SESSION_SHORTCUT] }
+      ? { ...group, items: [...group.items, pinnedSessionShortcut(native)] }
       : group,
   );
 }

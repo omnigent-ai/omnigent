@@ -18,8 +18,9 @@ and recency. Relevant wire events:
   → a user message.
 - ``{"type": "context.append_loop_event", "event": {"type": "content.part",
   "part": {"type": "text", "text": …}, "uuid": …}}`` → an assistant message.
-  (``part.type == "think"`` is reasoning and is skipped for v1; ``tool.call`` /
-  ``tool.result`` events are likewise skipped — the embedded terminal shows them.)
+  (``part.type == "think"`` is reasoning, mirrored as a transient
+  ``external_output_reasoning_delta`` from ``part["think"]``; ``tool.call`` /
+  ``tool.result`` events are still skipped — the embedded terminal shows them.)
 
 Each mirrored turn is POSTed as an ``external_conversation_item`` to
 ``/v1/sessions/{id}/events`` (the same shape :mod:`omnigent.kimi_native_hook`
@@ -67,6 +68,9 @@ class _MirrorItem:
     role: str
     text: str
     response_id: str
+    # "message" (a user/assistant turn → external_conversation_item) or
+    # "reasoning" (a think block → external_output_reasoning_delta).
+    kind: str = "message"
 
 
 def clear_kimi_bridge_state(bridge_dir: Path) -> None:
@@ -202,14 +206,33 @@ def _row_to_item(line_no: int, row: dict[str, object]) -> _MirrorItem | None:
         if not isinstance(event, dict) or event.get("type") != "content.part":
             return None
         part = event.get("part")
-        if not isinstance(part, dict) or part.get("type") != "text":
-            return None
-        text = part.get("text")
-        if not isinstance(text, str) or not text:
+        if not isinstance(part, dict):
             return None
         uuid = event.get("uuid")
         response_id = f"kimi:{uuid}" if isinstance(uuid, str) and uuid else f"kimi:line:{line_no}"
-        return _MirrorItem(line_no=line_no, role="assistant", text=text, response_id=response_id)
+        part_type = part.get("type")
+        if part_type == "text":
+            text = part.get("text")
+            if not isinstance(text, str) or not text:
+                return None
+            return _MirrorItem(
+                line_no=line_no, role="assistant", text=text, response_id=response_id
+            )
+        if part_type == "think":
+            # Reasoning lives in ``part["think"]`` (not ``part["text"]``). Mirror it
+            # as a transient reasoning event so the web UI paints a thinking block —
+            # the kimi analogue of codex-native's #1254 reasoning fix.
+            think = part.get("think")
+            if not isinstance(think, str) or not think:
+                return None
+            return _MirrorItem(
+                line_no=line_no,
+                role="assistant",
+                text=think,
+                response_id=response_id,
+                kind="reasoning",
+            )
+        return None
     return None
 
 
@@ -270,6 +293,29 @@ async def _post_conversation_item(
     resp.raise_for_status()
 
 
+async def _post_reasoning_item(
+    client: httpx.AsyncClient,
+    *,
+    base_url: str,
+    headers: dict[str, str],
+    session_id: str,
+    item: _MirrorItem,
+) -> None:
+    """POST one mirrored think block as a transient reasoning event.
+
+    Mirrors codex-native (#1254): a one-shot ``external_output_reasoning_delta``
+    with ``started: true`` opens a reasoning block in the web UI. Kimi persists
+    completed think parts (not streamed deltas), so one delta per part is correct.
+    """
+    body = {
+        "type": "external_output_reasoning_delta",
+        "data": {"delta": item.text, "started": True},
+    }
+    url = f"{base_url.rstrip('/')}/v1/sessions/{session_id}/events"
+    resp = await client.post(url, headers=headers, json=body)
+    resp.raise_for_status()
+
+
 async def forward_kimi_wire_to_session(
     *,
     base_url: str,
@@ -304,14 +350,23 @@ async def forward_kimi_wire_to_session(
                 items = await asyncio.to_thread(_read_new_items, wire_path, last_line)
                 for item in items:
                     try:
-                        await _post_conversation_item(
-                            client,
-                            base_url=base_url,
-                            headers=headers,
-                            session_id=session_id,
-                            item=item,
-                            agent_name=agent_name,
-                        )
+                        if item.kind == "reasoning":
+                            await _post_reasoning_item(
+                                client,
+                                base_url=base_url,
+                                headers=headers,
+                                session_id=session_id,
+                                item=item,
+                            )
+                        else:
+                            await _post_conversation_item(
+                                client,
+                                base_url=base_url,
+                                headers=headers,
+                                session_id=session_id,
+                                item=item,
+                                agent_name=agent_name,
+                            )
                     except httpx.HTTPError as exc:
                         _logger.warning("kimi forwarder: POST failed (will retry): %s", exc)
                         break

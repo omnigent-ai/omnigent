@@ -44,6 +44,79 @@ def test_default_shell_argv_runs_an_echo() -> None:
     assert "omnigent-shell-ok" in out.stdout
 
 
+@pytest.mark.posix_only
+def test_default_interactive_shell_honors_known_shell_on_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``$SHELL`` naming a known shell that resolves on PATH is kept.
+
+    Returns the basename (not the ``$SHELL`` path) so it stays resolvable
+    when the terminal launches under a runner on a different host.
+    """
+    # Patch shutil.which on the shared module so the function's local
+    # ``import shutil`` sees the fake; make every known shell "installed".
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    for shell_path, expected in (
+        ("/bin/zsh", "zsh"),
+        ("/usr/local/bin/fish", "fish"),
+        ("/bin/bash", "bash"),
+    ):
+        monkeypatch.setenv("SHELL", shell_path)
+        assert _platform.default_interactive_shell() == expected
+
+
+@pytest.mark.posix_only
+def test_default_interactive_shell_falls_back_to_bash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unset / unknown / not-on-PATH ``$SHELL`` all fall back to bash."""
+    # Unset $SHELL → bash (known shells resolve on PATH here).
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.delenv("SHELL", raising=False)
+    assert _platform.default_interactive_shell() == "bash"
+    # An unknown shell name is never honored, even if on PATH.
+    monkeypatch.setenv("SHELL", "/opt/weird/nushell")
+    assert _platform.default_interactive_shell() == "bash"
+    # A known shell that does not resolve on PATH also falls back.
+    monkeypatch.setattr("shutil.which", lambda name: None)
+    monkeypatch.setenv("SHELL", "/bin/zsh")
+    assert _platform.default_interactive_shell() == "bash"
+
+
+@pytest.mark.posix_only
+def test_installed_interactive_shells_lists_default_first_then_alternatives(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The default ($SHELL) leads; installed alternatives follow, deduped."""
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setenv("SHELL", "/bin/zsh")
+    # zsh is the default → first; bash/fish follow in offer order; no dupes.
+    assert _platform.installed_interactive_shells() == ["zsh", "bash", "fish"]
+
+
+@pytest.mark.posix_only
+def test_installed_interactive_shells_skips_uninstalled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Alternatives that don't resolve on PATH are omitted."""
+    # Only bash and zsh installed; fish absent.
+    monkeypatch.setattr(
+        "shutil.which", lambda name: f"/usr/bin/{name}" if name in {"bash", "zsh"} else None
+    )
+    monkeypatch.setenv("SHELL", "/bin/bash")
+    assert _platform.installed_interactive_shells() == ["bash", "zsh"]
+
+
+@pytest.mark.posix_only
+def test_installed_interactive_shells_always_nonempty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With nothing resolvable the bash fallback is still offered alone."""
+    monkeypatch.setattr("shutil.which", lambda name: None)
+    monkeypatch.delenv("SHELL", raising=False)
+    assert _platform.installed_interactive_shells() == ["bash"]
+
+
 def test_stable_user_id_is_stable_and_path_safe() -> None:
     uid = _platform.stable_user_id()
     assert uid == _platform.stable_user_id()

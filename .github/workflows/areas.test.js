@@ -32,9 +32,10 @@ for (const a of areas)
 for (const a of areas)
   assert(`area ${a.key} label ${a.label} is a real comp:*`, ALLOWED_LABELS.has(a.label));
 
-// Every area has >= 2 owners (the 2+ codeowner requirement).
+// Every area has >= 2 owners (the 2+ codeowner requirement). Paused owners
+// still count -- pausing someone must not force adding a new active owner.
 for (const a of areas) {
-  const n = (a.owners || []).length;
+  const n = (a.owners || []).length + (a.owners_paused || []).length;
   assert(`area ${a.key} has >= 2 owners`, n >= 2, `${n} owner(s)`);
 }
 

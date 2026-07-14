@@ -3,14 +3,23 @@ name: cursor
 description: Cursor coding sub-agent — implements, cross-vendor reviews, or explores a scoped task in its own worktree.
 
 # Native Cursor TUI harness (`cursor-agent`): runs in its own terminal the
-# human can open in the UI's Subagents panel and TAKE OVER. cursor-agent owns
-# its own tool-approval gating (omnigent does not intercept it), so dangerous
-# actions surface in the cursor TUI / mirrored web cards rather than being
-# auto-bypassed.
+# human can open in the UI's Subagents panel and TAKE OVER. Headless workers
+# can't answer ApprovalCards, so YOLO skips cursor-agent's in-terminal
+# prompts (and the mirrored web cards). Omnigent ``blast_radius`` still
+# DENYs the catastrophic set. Opt out with ``yolo: false``; or set
+# ``permission_mode: auto`` for Smart Auto (``--auto-review``) instead.
 executor:
   type: omnigent
+  # Faster default for Polly Cursor workers; override per-session with ``/model``.
+  # Use the base id from Cursor's model list / SDK (``grok-4.5``). The compound
+  # ``cursor-grok-4.5-high`` also works on cursor-agent, but the SDK catalog
+  # exposes ``grok-4.5``.
+  model: grok-4.5
   config:
     harness: cursor-native
+    # YOLO: headless workers can't answer approval prompts, so run
+    # cursor-agent with full bypass (``--yolo``).
+    yolo: true
 
 prompt: |
   You are Cursor, a coding sub-agent dispatched by the polly

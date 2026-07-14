@@ -1,7 +1,7 @@
 // Agent info surface: the MCP-server and policy badges, and the
 // header info-icon popover that displays them.
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   CheckIcon,
   CopyIcon,
@@ -45,27 +45,17 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { ModelValueCombobox } from "@/components/ModelValueCombobox";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { capitalizeAgentName } from "@/lib/agentLabels";
 import { coercePolicyParams } from "@/lib/policyParams";
+import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import { agentRootName } from "@/lib/forkHarness";
 import { nativeCodingAgentForAgentName } from "@/lib/nativeCodingAgents";
 import { copyText } from "@/lib/clipboard";
 import { useChatStore } from "@/store/chatStore";
-import { RestartWithModelDialog } from "@/shell/RestartWithModelDialog";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useSessionHostVersion } from "@/hooks/RunnerHealthProvider";
-
-/**
- * Whether a harness id is in the codex (GPT) family — the only harness the
- * "Restart with model…" affordance is offered for. Both the canonical and
- * reversed native spellings count, mirroring the server's
- * ``_CODEX_FAMILY_HARNESSES``. ``null`` / undefined (harness not loaded) is
- * not codex, so the affordance stays hidden until the harness is known.
- */
-function isCodexHarness(harness: string | null | undefined): boolean {
-  return harness === "codex" || harness === "codex-native" || harness === "native-codex";
-}
 
 /**
  * Display label for an agent name: the wrapper alias when mapped, else
@@ -283,12 +273,14 @@ function AddPolicyDialog({
 }) {
   const [selected, setSelected] = useState<string>("");
   const [filter, setFilter] = useState("");
+  const [policyName, setPolicyName] = useState<string>("");
   const [factoryParams, setFactoryParams] = useState<Record<string, string>>({});
   const [paramError, setParamError] = useState<string | null>(null);
   const addPolicy = useAddPolicy(sessionId);
+  const codexModelOptions = useChatStore((s) => s.codexModelOptions);
 
   const entry = registry.find((r) => r.handler === selected);
-  const schema = entry?.params_schema as
+  const rawSchema = entry?.params_schema as
     | {
         properties?: Record<
           string,
@@ -297,7 +289,7 @@ function AddPolicyDialog({
             description?: string;
             default?: unknown;
             enum?: string[];
-            items?: { type?: string; enum?: string[] };
+            items?: { type?: string; enum?: string[]; "x-enum-source"?: string };
             uniqueItems?: boolean;
           }
         >;
@@ -305,12 +297,33 @@ function AddPolicyDialog({
       }
     | null
     | undefined;
-  const properties = schema?.properties ?? {};
+  const modelIds = useMemo(() => {
+    const ids: string[] = CLAUDE_NATIVE_MODELS.map((m) => m.id);
+    for (const opt of codexModelOptions) {
+      if (opt.id && !ids.includes(opt.id)) ids.push(opt.id);
+    }
+    return ids;
+  }, [codexModelOptions]);
+  const properties = useMemo(() => {
+    const props = rawSchema?.properties ?? {};
+    if (!modelIds.length) return props;
+    const enriched: typeof props = {};
+    for (const [key, prop] of Object.entries(props)) {
+      if (prop.items?.["x-enum-source"] === "models" && !prop.items.enum) {
+        enriched[key] = { ...prop, items: { ...prop.items, enum: modelIds } };
+      } else {
+        enriched[key] = prop;
+      }
+    }
+    return enriched;
+  }, [rawSchema?.properties, modelIds]);
   const paramKeys = Object.keys(properties);
 
   function handleSelect(handler: string) {
+    const e = registry.find((r) => r.handler === handler);
     setSelected(handler);
     setFilter("");
+    setPolicyName(e ? e.name.toLowerCase().replace(/\s+/g, "_") : "");
     setFactoryParams({});
     setParamError(null);
   }
@@ -338,7 +351,7 @@ function AddPolicyDialog({
       entry.kind === "factory" ? { factory_params: parsedParams ?? {} } : {};
     addPolicy.mutate(
       {
-        name: entry.name.toLowerCase().replace(/\s+/g, "_"),
+        name: policyName || entry.name.toLowerCase().replace(/\s+/g, "_"),
         type: "python",
         handler: entry.handler,
         ...includeFactoryParams,
@@ -346,6 +359,7 @@ function AddPolicyDialog({
       {
         onSuccess: () => {
           setSelected("");
+          setPolicyName("");
           setFactoryParams({});
           onOpenChange(false);
         },
@@ -354,13 +368,25 @@ function AddPolicyDialog({
   }
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog
+      open={open}
+      onOpenChange={(next) => {
+        // Reset to the policy list on close so reopening never lands mid-config.
+        if (!next) {
+          setSelected("");
+          setPolicyName("");
+          setFactoryParams({});
+          setParamError(null);
+        }
+        onOpenChange(next);
+      }}
+    >
       <DialogContent className="max-h-[80vh] overflow-y-auto sm:max-w-md">
         <DialogHeader>
           <DialogTitle>Add Policy</DialogTitle>
           <DialogDescription>Choose a policy to apply to this session.</DialogDescription>
         </DialogHeader>
-        <div className="space-y-3 pt-1">
+        <div className="min-w-0 space-y-3 pt-1">
           {!selected &&
             (() => {
               const available = registry.filter((r) => !appliedHandlers.has(r.handler));
@@ -418,6 +444,7 @@ function AddPolicyDialog({
                   type="button"
                   onClick={() => {
                     setSelected("");
+                    setPolicyName("");
                     setFactoryParams({});
                     setParamError(null);
                   }}
@@ -429,6 +456,19 @@ function AddPolicyDialog({
               {entry.description && (
                 <p className="text-xs text-muted-foreground">{entry.description}</p>
               )}
+            </div>
+          )}
+          {entry && (
+            <div>
+              <label className="flex items-center gap-1 text-xs text-muted-foreground">
+                <span className="font-medium text-foreground">name</span>
+              </label>
+              <input
+                type="text"
+                value={policyName}
+                onChange={(e) => setPolicyName(e.target.value)}
+                className="mt-0.5 w-full rounded border border-border bg-background px-2 py-1.5 text-sm"
+              />
             </div>
           )}
           {entry?.kind === "factory" && paramKeys.length > 0 && (
@@ -443,7 +483,7 @@ function AddPolicyDialog({
                         <span>
                           (
                           {prop.type === "array" && prop.items?.enum
-                            ? "select"
+                            ? "multi-select"
                             : prop.type === "array"
                               ? "comma-separated"
                               : prop.type}
@@ -452,7 +492,9 @@ function AddPolicyDialog({
                       )}
                     </label>
                     {prop?.description && (
-                      <p className="text-[11px] text-muted-foreground">{prop.description}</p>
+                      <p className="break-all text-[11px] text-muted-foreground">
+                        {prop.description}
+                      </p>
                     )}
                     {prop?.type === "boolean" ? (
                       <select
@@ -487,42 +529,62 @@ function AddPolicyDialog({
                         }
                         className="mt-0.5 w-full rounded border border-border bg-background px-2 py-1.5 text-sm"
                       >
-                        {prop.enum.map((v) => (
+                        {prop.enum.map((v: string) => (
                           <option key={v} value={v}>
                             {v}
                           </option>
                         ))}
                       </select>
                     ) : prop?.type === "array" && prop.items?.enum ? (
-                      <div className="mt-0.5 flex flex-wrap gap-x-3 gap-y-1">
-                        {prop.items.enum.map((v) => {
-                          const current = factoryParams[key]
-                            ? factoryParams[key].split(",").filter(Boolean)
-                            : Array.isArray(prop?.default)
-                              ? (prop.default as string[])
-                              : [];
-                          const checked = current.includes(v);
-                          return (
-                            <label key={v} className="flex items-center gap-1 text-sm">
-                              <input
-                                type="checkbox"
-                                checked={checked}
-                                onChange={(e) => {
-                                  const next = e.target.checked
-                                    ? [...current, v]
-                                    : current.filter((x) => x !== v);
-                                  setFactoryParams((prev) => ({
-                                    ...prev,
-                                    [key]: next.join(","),
-                                  }));
-                                }}
-                                className="rounded border-border"
-                              />
-                              <span>{v}</span>
-                            </label>
-                          );
-                        })}
-                      </div>
+                      (() => {
+                        const current = factoryParams[key]
+                          ? factoryParams[key].split(",").filter(Boolean)
+                          : Array.isArray(prop?.default)
+                            ? (prop.default as string[])
+                            : [];
+                        return (
+                          <div className="mt-0.5 space-y-1.5">
+                            {current.length > 0 && (
+                              <div className="flex flex-wrap gap-1">
+                                {current.map((v: string) => (
+                                  <span
+                                    key={v}
+                                    className="inline-flex items-center gap-0.5 rounded-md bg-muted px-1.5 py-0.5 text-xs"
+                                  >
+                                    {v}
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        const next = current.filter((x) => x !== v);
+                                        setFactoryParams((prev) => ({
+                                          ...prev,
+                                          [key]: next.join(","),
+                                        }));
+                                      }}
+                                      className="ml-0.5 text-muted-foreground hover:text-foreground"
+                                    >
+                                      <XIcon className="size-3" />
+                                    </button>
+                                  </span>
+                                ))}
+                              </div>
+                            )}
+                            <ModelValueCombobox
+                              options={prop.items.enum}
+                              selected={current}
+                              onToggle={(v) => {
+                                const next = current.includes(v)
+                                  ? current.filter((x) => x !== v)
+                                  : [...current, v];
+                                setFactoryParams((prev) => ({
+                                  ...prev,
+                                  [key]: next.join(","),
+                                }));
+                              }}
+                            />
+                          </div>
+                        );
+                      })()
                     ) : (
                       <input
                         type={
@@ -563,7 +625,17 @@ function AddPolicyDialog({
           <div className="flex justify-end gap-2 pt-1">
             <button
               type="button"
-              onClick={() => onOpenChange(false)}
+              onClick={() => {
+                // With a policy selected, Cancel steps back to the list so the
+                // user can pick another; only close the dialog from the list.
+                if (selected) {
+                  setSelected("");
+                  setFactoryParams({});
+                  setParamError(null);
+                } else {
+                  onOpenChange(false);
+                }
+              }}
               className="rounded px-3 py-1.5 text-xs hover:bg-muted"
             >
               Cancel
@@ -1131,12 +1203,6 @@ export function AgentInfoContent({ agent, sessionId }: AgentInfoProps) {
   // which case the row is omitted rather than showing a placeholder.
   const { data: owner } = useSessionOwner(sessionId ?? null);
   const viewerId = getCurrentUserId();
-  // The session's current model override, prefilled into the restart dialog.
-  const sessionModelOverride = useChatStore((s) => s.sessionModelOverride);
-  // "Restart with model…" is codex-only: codex applies its model at launch
-  // (no mid-turn switch), so a model change is a fork that carries history.
-  const showRestartWithModel = isCodexHarness(agent?.harness) && !!sessionId;
-  const [restartOpen, setRestartOpen] = useState(false);
   // Only surface the owner once the session is actually shared — a private
   // solo session has no "owner" worth showing. A non-owner viewer already
   // implies a share; the owner needs the grant list (manage-only, readable by
@@ -1237,27 +1303,6 @@ export function AgentInfoContent({ agent, sessionId }: AgentInfoProps) {
             )}
           </div>
         )}
-      {showRestartWithModel && sessionId && (
-        <div className="flex flex-col gap-1.5 py-3">
-          <SectionLabel>Model</SectionLabel>
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            data-testid="restart-with-model-trigger"
-            onClick={() => setRestartOpen(true)}
-            className="justify-start text-xs"
-          >
-            Restart with model…
-          </Button>
-          <RestartWithModelDialog
-            sessionId={sessionId}
-            currentModel={sessionModelOverride}
-            open={restartOpen}
-            onOpenChange={setRestartOpen}
-          />
-        </div>
-      )}
       <McpServersSection sessionId={sessionId} servers={servers} editable={mcpEditable} />
       {sessionId && <SessionPoliciesSection sessionId={sessionId} />}
       {versionFooter && (

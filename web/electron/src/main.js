@@ -16,6 +16,7 @@
 const {
   app,
   BrowserWindow,
+  WebContentsView,
   Menu,
   Notification,
   clipboard,
@@ -30,9 +31,15 @@ const {
 const fs = require("node:fs");
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
+const { execFile } = require("node:child_process");
 const { registerLocalhostCors } = require("./localhost_cors");
 const { normalizeUrl, expandDatabricksWorkspaceUrl } = require("./url");
 const { registerWorkspaceChromeHide } = require("./workspace-chrome");
+const { createBrowserViewRegistry } = require("./browserViewRegistry");
+const { createBrowserViewBoundsController } = require("./browserViewBounds");
+const { registerBrowserIpc } = require("./browserIpc");
+const { registerSessionExpiryReload } = require("./session-expiry");
+const { decideWindowOpen, stripCrossOriginOpenerHeaders, WEB_SCHEMES } = require("./popupPolicy");
 const omnigentCli = require("./omnigent_cli");
 const serverManager = require("./server_manager");
 
@@ -61,13 +68,10 @@ const FIND_BAR_INSET = 16;
 const ERR_ABORTED = -3;
 
 /**
- * Schemes that open externally with no confirmation: they land in the
- * user's browser / mail client, which apply their own safety UX. Anything
- * else launches an OS protocol handler (vscode://, ssh://, …) with
- * page-controlled arguments — and `shell.openExternal`, unlike a browser,
- * shows no prompt of its own — so it goes through a consent dialog first.
+ * No-op preload for OAuth popup windows — children must never inherit the
+ * shell preload's IPC bridges. See popup_preload.js.
  */
-const WEB_SCHEMES = new Set(["http:", "https:", "mailto:"]);
+const POPUP_PRELOAD = path.join(__dirname, "popup_preload.js");
 
 /** Absolute path to the app icon (PNG works for the macOS dock at runtime). */
 const ICON_PNG = path.join(__dirname, "..", "icons", "icon.png");
@@ -337,11 +341,12 @@ function registerPermissions() {
  * frame through SSO/IdP origins that can't be known in advance (e.g.
  * ``abc.aws.databricksapps.com`` → an SSO domain that probes a localhost
  * helper), and this is what lets those pages reach localhost while the
- * user is actually on them. The reachable set stays narrow because
- * in-window navigation only starts from the pinned server (links and
- * window.open go to the external browser — see setWindowOpenHandler);
- * unpinned windows (the setup page) confer nothing, and an iframe never
- * matches because this checks the main frame's origin only.
+ * user is actually on them. The reachable set stays narrow because this
+ * iterates `windows`, which OAuth popups never join (they get their own,
+ * equally narrow trust — see isCurrentPopupOrigin) — and links and every
+ * other window.open leave for the external browser. Unpinned windows (the
+ * setup page) confer nothing, and an iframe never matches because this
+ * checks the main frame's origin only.
  *
  * @param {string} origin e.g. ``"https://login.example.com"``.
  * @returns {boolean}
@@ -355,14 +360,33 @@ function isCurrentWindowOrigin(origin) {
 }
 
 /**
+ * Popup counterpart of isCurrentWindowOrigin, same rationale: IdP
+ * device-trust scripts (Okta FastPass) must reach their localhost helper
+ * from inside the sign-in popup too, and fail closed when denied. Same
+ * narrowness: popups only START on allowlisted hosts (popupPolicy.js),
+ * only the main frame counts, and a closed popup confers nothing.
+ *
+ * @param {string} origin e.g. ``"https://company.okta.com"``.
+ * @returns {boolean}
+ */
+function isCurrentPopupOrigin(origin) {
+  for (const popup of oauthPopups) {
+    if (popup.isDestroyed()) continue;
+    if (originOf(popup.webContents.getURL()) === origin) return true;
+  }
+  return false;
+}
+
+/**
  * The trust predicate for localhost access, shared by the CORS injection
  * (registerLocalhostAccess) and the Local Network Access permission answer
  * (lnaPermissionGranted). An origin is trusted when it is: an origin some
  * window is pinned to (a server the user explicitly connected to), the
- * current top-level page of a pinned window (SSO/IdP pages reached via
- * auth redirects — see isCurrentWindowOrigin), or hand-listed in
- * settings.json under ``localhost_allowed_origins`` (escape hatch for
- * pages that need localhost while NOT being the visible top-level page).
+ * current top-level page of a pinned window or of a live OAuth popup
+ * (SSO/IdP pages reached via auth redirects — see isCurrentWindowOrigin /
+ * isCurrentPopupOrigin), or hand-listed in settings.json under
+ * ``localhost_allowed_origins`` (escape hatch for pages that need
+ * localhost while NOT being the visible top-level page).
  *
  * @param {string | null} origin e.g. ``"https://login.example.com"``.
  * @returns {boolean}
@@ -371,18 +395,85 @@ function isLocalhostTrustedOrigin(origin) {
   if (!origin) return false;
   if (isPinnedServerUrl(origin)) return true;
   if (isCurrentWindowOrigin(origin)) return true;
+  if (isCurrentPopupOrigin(origin)) return true;
   const extra = loadSettings().localhost_allowed_origins;
   return Array.isArray(extra) && extra.includes(origin);
+}
+
+/**
+ * True when a webContents id belongs to a live OAuth popup.
+ *
+ * @param {number} webContentsId
+ * @returns {boolean}
+ */
+function isOauthPopupWebContentsId(webContentsId) {
+  for (const popup of oauthPopups) {
+    if (!popup.isDestroyed() && popup.webContents.id === webContentsId) return true;
+  }
+  return false;
+}
+
+/**
+ * First-look response hook (composed into localhost_cors's single
+ * onHeadersReceived registration): strip COOP from main-frame responses
+ * inside tracked OAuth popups so a sign-in hop can't sever window.opener —
+ * the "first sign-in fails, retry works" flake (see
+ * OPENER_SEVERING_HEADERS in popupPolicy.js). Every other window keeps
+ * provider COOP untouched.
+ *
+ * @param {Electron.OnHeadersReceivedListenerDetails} details
+ * @returns {Electron.HeadersReceivedResponse | null}
+ */
+function popupResponseHeadersHook(details) {
+  if (details.resourceType !== "mainFrame") return null;
+  if (typeof details.webContentsId !== "number") return null;
+  if (!isOauthPopupWebContentsId(details.webContentsId)) return null;
+  const stripped = stripCrossOriginOpenerHeaders(details.responseHeaders);
+  return stripped ? { responseHeaders: stripped } : null;
 }
 
 /**
  * Allow pages on trusted origins to call localhost services (auth helpers,
  * local runners) by injecting CORS/preflight headers on localhost responses
  * — see localhost_cors.js for the mechanism and isLocalhostTrustedOrigin
- * for the trust scope.
+ * for the trust scope. The OAuth-popup COOP strip composes in here because
+ * Electron allows one onHeadersReceived listener per session.
  */
 function registerLocalhostAccess() {
-  registerLocalhostCors(session.defaultSession, isLocalhostTrustedOrigin);
+  registerLocalhostCors(session.defaultSession, isLocalhostTrustedOrigin, popupResponseHeadersHook);
+}
+
+// Per-window timestamp of the last expired-session reload, so a host whose SSO
+// stays expired doesn't reload-loop. An expired session redirects EVERY API
+// call to the login page (many redirects per second — and the reload itself
+// triggers fresh API calls), so a "once until next navigation" guard would
+// clear on its own reload and loop. A minimum interval caps reloads to one per
+// window per interval regardless: enough to re-run the host's auth challenge,
+// never a tight loop. In the normal case the gate full-page-redirects the
+// reload's top-level navigation to its login page, so no further API calls
+// (hence no further redirects) fire anyway.
+const _lastExpiryReloadAt = new WeakMap();
+const _EXPIRY_RELOAD_MIN_INTERVAL_MS = 15_000;
+
+/**
+ * Recover the desktop window when the workspace SSO session expires.
+ *
+ * When the auth gate redirects a connected server's API call to its login
+ * page, reload every window pinned to that origin so the gate can re-challenge
+ * — see session-expiry.js. A desktop user has no address bar to refresh out of
+ * the resulting "Failed to load" state manually, so the shell does it.
+ */
+function registerSessionExpiryAccess() {
+  registerSessionExpiryReload(session.defaultSession, isPinnedServerUrl, (origin) => {
+    const now = Date.now();
+    for (const [win, state] of windows) {
+      if (state.origin !== origin || win.isDestroyed()) continue;
+      const last = _lastExpiryReloadAt.get(win) ?? 0;
+      if (now - last < _EXPIRY_RELOAD_MIN_INTERVAL_MS) continue;
+      _lastExpiryReloadAt.set(win, now);
+      win.webContents.reload();
+    }
+  });
 }
 
 /**
@@ -426,10 +517,23 @@ function applyDockIcon() {
  *   so the OS badge aggregates per distinct ORIGIN (not per window — two
  *   windows on the same server report the same number and must not be
  *   double-counted), then sums across origins.
+ * @property {ReturnType<typeof createBrowserViewRegistry>} [browserRegistry]
+ *   Per-conversation embedded-browser view registry for this window.
  *
  * @type {Map<BrowserWindow, WindowState>}
  */
 const windows = new Map();
+
+/**
+ * Live OAuth popup child windows (see hardenOauthPopup). Tracked apart
+ * from `windows` on purpose: a popup gains NO shell-window privileges —
+ * its only grant is localhost trust for its CURRENT top-level page
+ * (isCurrentPopupOrigin), because IdP device-trust checks (Okta FastPass)
+ * probe a localhost helper from inside the popup too.
+ *
+ * @type {Set<BrowserWindow>}
+ */
+const oauthPopups = new Set();
 
 /**
  * Recompute the app-wide dock/taskbar badge: take each distinct pinned
@@ -824,6 +928,53 @@ function cascadeIfCovering(win) {
 }
 
 /**
+ * Harden an OAuth popup the window-open policy allowed (popupPolicy.js).
+ * The popup deliberately keeps `window.opener` and the opener's session —
+ * that IS the handshake — so hardening covers what a chromeless window
+ * lacks: the title always leads with the CURRENT host (the page controls
+ * document.title, never the prefix; an app-drawn URL strip is the planned
+ * upgrade), and window.open from the child leaves the shell — no popup
+ * chains, and no consent dialog for non-web schemes since a third-party
+ * page has no pinned-origin trust to anchor one. Tracked in `oauthPopups`
+ * (localhost trust only), never in `windows`.
+ *
+ * @param {BrowserWindow} child The freshly created popup window.
+ */
+function hardenOauthPopup(child) {
+  oauthPopups.add(child);
+  child.on("closed", () => oauthPopups.delete(child));
+  const stampTitle = () => {
+    if (child.isDestroyed()) return;
+    let host = "";
+    try {
+      host = new URL(child.webContents.getURL()).host;
+    } catch {
+      // about:blank / early lifecycle — no host to show yet.
+    }
+    const pageTitle = child.webContents.getTitle();
+    child.setTitle(host ? (pageTitle ? `${host} — ${pageTitle}` : host) : pageTitle || "Sign in");
+  };
+  child.webContents.on("page-title-updated", (event) => {
+    event.preventDefault(); // keep the host prefix; we compose the title
+    stampTitle();
+  });
+  child.webContents.on("did-navigate", stampTitle);
+  stampTitle();
+  child.webContents.setWindowOpenHandler(({ url }) => {
+    let scheme = null;
+    try {
+      scheme = new URL(url).protocol;
+    } catch {
+      // Unparseable URL from page content — nothing safe to open.
+    }
+    if (scheme && WEB_SCHEMES.has(scheme)) {
+      void shell.openExternal(url);
+    }
+    return { action: "deny" };
+  });
+}
+
+/**
  * Create a shell window and load a destination, in priority order:
  *   1. `targetUrl`, when given (used by "New Window" to clone the current
  *      window's exact URL — e.g. a specific conversation).
@@ -892,6 +1043,8 @@ function createWindow(targetUrl, opts = {}) {
     serverUrl: destination,
     ephemeral,
     badgeCount: 0,
+    // Per-conversation embedded-browser view registry for this window.
+    browserRegistry: createBrowserRegistryForWindow(win),
   });
   if (destination) {
     void win.loadURL(destination);
@@ -909,23 +1062,47 @@ function createWindow(targetUrl, opts = {}) {
     void win.loadFile(SETUP_PAGE, search.size > 0 ? { search: search.toString() } : undefined);
   }
 
-  // Never spawn chromeless Electron windows: web links open in the user's
-  // real browser, and any other scheme (a custom OS protocol handler like
-  // vscode://) requires explicit user consent first — see WEB_SCHEMES.
-  win.webContents.setWindowOpenHandler(({ url }) => {
-    let scheme = null;
-    try {
-      scheme = new URL(url).protocol;
-    } catch {
-      // Unparseable URL from page content — nothing safe to open.
+  // Page-initiated window.open / target=_blank: web links open in the
+  // user's real browser and non-web schemes get a consent dialog. The one
+  // exception — an OAuth sign-in popup, whose callback needs window.opener
+  // and the opener's localStorage — opens as a hardened child window.
+  // Conditions in popupPolicy.js; hardening in hardenOauthPopup.
+  win.webContents.setWindowOpenHandler(({ url, disposition, features }) => {
+    const decision = decideWindowOpen(
+      { url, disposition, features },
+      {
+        openerOrigin: originOf(win.webContents.getURL()),
+        pinnedOrigin: pinnedOrigin(win),
+        extraPopupOrigins: loadSettings().popup_allowed_origins,
+      },
+    );
+    if (decision.kind === "popup") {
+      return {
+        action: "allow",
+        overrideBrowserWindowOptions: {
+          autoHideMenuBar: true,
+          webPreferences: {
+            // Never inherit the shell preload's IPC bridges into
+            // third-party sign-in pages.
+            preload: POPUP_PRELOAD,
+            sandbox: true,
+            contextIsolation: true,
+            nodeIntegration: false,
+          },
+        },
+      };
     }
-    if (scheme && WEB_SCHEMES.has(scheme)) {
+    if (decision.kind === "external") {
       void shell.openExternal(url);
-    } else if (scheme) {
-      void confirmExternalProtocol(win, url, scheme);
+    } else if (decision.kind === "protocol-consent") {
+      void confirmExternalProtocol(win, url, decision.scheme);
     }
+    // "ignore": unparseable URL from page content — nothing safe to open.
     return { action: "deny" };
   });
+
+  // Fires only for window.open the handler above allowed (OAuth popups).
+  win.webContents.on("did-create-window", (child) => hardenOauthPopup(child));
 
   // Server unreachable / DNS failure / TLS error → fall back to the setup
   // page with the failure shown, instead of stranding the user on Chromium's
@@ -964,6 +1141,12 @@ function createWindow(targetUrl, opts = {}) {
   // connect. Connecting is an explicit action from the host menu.
 
   win.on("closed", () => {
+    // Destroy this window's embedded-browser views, else they leak webContents.
+    try {
+      windows.get(win)?.browserRegistry?.closeAll("window-closed");
+    } catch {
+      /* registry already torn down */
+    }
     windows.delete(win);
     updateBadge(); // drop this window's contribution from the app-wide badge
   });
@@ -1362,6 +1545,127 @@ function signalForeground() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Notification sound (macOS). The frontmost app's own OS-notification sound is
+// suppressed by macOS, so to make the alert audible in BOTH the foreground and
+// the background we play a system sound ourselves with `afplay` and mute the
+// toast's built-in sound (see the notify handler). The chosen sound and the
+// on/off switch live in the native Notifications menu, persisted in settings
+// (`notification_sound_enabled`, `notification_sound_name`).
+// ---------------------------------------------------------------------------
+
+const SYSTEM_SOUNDS_DIR = "/System/Library/Sounds";
+// A pleasant default that ships on every macOS. Used when nothing is saved or
+// the saved name no longer resolves to a file.
+const DEFAULT_NOTIFICATION_SOUND = "Glass";
+// Fallback list if the system sounds dir can't be read (matches stock macOS).
+const FALLBACK_SYSTEM_SOUNDS = [
+  "Basso",
+  "Blow",
+  "Bottle",
+  "Frog",
+  "Funk",
+  "Glass",
+  "Hero",
+  "Morse",
+  "Ping",
+  "Pop",
+  "Purr",
+  "Sosumi",
+  "Submarine",
+  "Tink",
+];
+
+/**
+ * The macOS built-in notification sounds, by name (no extension), sorted.
+ * Reads `/System/Library/Sounds` so the list tracks the OS; falls back to the
+ * stock set if the directory can't be read.
+ *
+ * @returns {string[]} e.g. `["Basso", "Blow", ... "Tink"]`.
+ */
+function systemSoundNames() {
+  try {
+    const names = fs
+      .readdirSync(SYSTEM_SOUNDS_DIR)
+      .filter((f) => f.endsWith(".aiff"))
+      .map((f) => f.replace(/\.aiff$/, ""));
+    return names.length > 0 ? names.sort() : FALLBACK_SYSTEM_SOUNDS;
+  } catch {
+    return FALLBACK_SYSTEM_SOUNDS;
+  }
+}
+
+/**
+ * Whether the notification sound is enabled. Opt-in: OFF unless the user has
+ * explicitly turned it on via the Notifications menu, so a fresh install stays
+ * silent until the user asks for sound.
+ */
+function notificationSoundEnabled() {
+  return loadSettings().notification_sound_enabled === true;
+}
+
+/**
+ * The currently-selected system sound name, validated against what's installed.
+ * Falls back to the default (then the first available) when the saved value is
+ * missing or no longer present.
+ *
+ * @returns {string} A sound name guaranteed to be in `systemSoundNames()`.
+ */
+function currentNotificationSoundName() {
+  const names = systemSoundNames();
+  const saved = loadSettings().notification_sound_name;
+  if (saved && names.includes(saved)) return saved;
+  if (names.includes(DEFAULT_NOTIFICATION_SOUND)) return DEFAULT_NOTIFICATION_SOUND;
+  return names[0];
+}
+
+/**
+ * Play a macOS system sound by name via `afplay`, fire-and-forget. No-op off
+ * macOS (afplay is macOS-only). Used both for live notifications and for the
+ * menu's pick-to-preview.
+ *
+ * @param {string} name A name from `systemSoundNames()`, e.g. `"Glass"`.
+ */
+function playSystemSound(name) {
+  if (process.platform !== "darwin") return;
+  const file = path.join(SYSTEM_SOUNDS_DIR, `${name}.aiff`);
+  try {
+    // Detached + unref'd so a slow play never holds up app quit.
+    const child = execFile("afplay", [file], (err) => {
+      if (err) console.warn("[omnigent] afplay failed:", err.message);
+    });
+    child.unref();
+  } catch (err) {
+    console.warn("[omnigent] failed to spawn afplay:", err);
+  }
+}
+
+// Per-session sound throttle. The web layer can fire several notifications for
+// one response (a turn that streams in chunks, status that flaps
+// `running`→`idle`→`running`, or repeated tool-approval prompts), each tagged
+// to the same session. The OS already collapses those into a single replaced
+// toast via that tag, but our explicit `afplay` would otherwise sound on every
+// one. Keyed by the notification's target (its navigatePath), so a burst for
+// one session plays once while distinct sessions each still sound.
+const SOUND_THROTTLE_MS = 3000;
+/** @type {Map<string, number>} last play time (ms) keyed by session/target. */
+const lastSoundAtByKey = new Map();
+
+/**
+ * Whether enough time has passed to sound again for `key`. Records "now" and
+ * returns true on the first call for a key (or after the throttle window);
+ * returns false during a burst so repeats for the same session stay quiet.
+ *
+ * @param {string} key Dedup key — the notification's navigatePath, else title.
+ * @returns {boolean}
+ */
+function shouldPlayNotificationSound(key) {
+  const now = Date.now();
+  if (now - (lastSoundAtByKey.get(key) ?? 0) < SOUND_THROTTLE_MS) return false;
+  lastSoundAtByKey.set(key, now);
+  return true;
+}
+
 /**
  * Forget the saved server URL and return the focused window to the bundled
  * setup page so the user can enter a new one. For an ephemeral (debug
@@ -1433,6 +1737,46 @@ function buildMenu() {
     label: "Server",
     submenu: serverSubmenu,
   });
+
+  // Notifications menu (macOS only — sound playback uses `afplay`): an on/off
+  // switch for the notification sound plus a picker of macOS system sounds.
+  // Selections persist in settings.json and are read live by the notify
+  // handler, so a change applies to the next notification without a relaunch.
+  if (isMac) {
+    /** @type {Electron.MenuItemConstructorOptions[]} */
+    const soundChoices = systemSoundNames().map((name) => ({
+      id: `notification_sound_${name}`,
+      label: name,
+      type: "radio",
+      checked: currentNotificationSoundName() === name,
+      click: () => {
+        const settings = loadSettings();
+        settings.notification_sound_name = name;
+        saveSettings(settings);
+        // Pick-to-preview: play the choice immediately so the user hears it,
+        // even when the sound is currently toggled off.
+        playSystemSound(name);
+      },
+    }));
+    template.push({
+      label: "Notifications",
+      submenu: [
+        {
+          id: "notification_sound_enabled",
+          label: "Play Notification Sound",
+          type: "checkbox",
+          checked: notificationSoundEnabled(),
+          click: (item) => {
+            const settings = loadSettings();
+            settings.notification_sound_enabled = item.checked;
+            saveSettings(settings);
+          },
+        },
+        { type: "separator" },
+        { label: "Sound", submenu: soundChoices },
+      ],
+    });
+  }
 
   // Standard roles — these carry the predefined keyboard shortcuts.
   template.push({ role: "fileMenu" });
@@ -1539,6 +1883,64 @@ function isPinnedOriginSender(event) {
   if (originOf(event.senderFrame?.url ?? "") !== pinned) return false;
   // event.sender.getURL() is the webContents' main-frame URL.
   return originOf(event.sender.getURL()) === pinned;
+}
+
+// ---------------------------------------------------------------------------
+// Embedded browser pane
+//
+// The agent's `browser_*` tools drive a native WebContentsView per conversation,
+// positioned over a placeholder the SPA measures. Each window owns its own
+// registry; child views stay sandboxed (nodeIntegration:false, contextIsolation
+// + sandbox true) and detach — not destroy — on hide.
+//
+// `omnigent:browser-execute` runs JS via executeJavaScript; exposed to preload
+// for the relay's fixed templates only, never a generic agent `evaluate`.
+// See preload.js + README.
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the per-conversation WebContentsView registry for a shell window
+ * (positions child views in `win.contentView`, pings back via `win.webContents`).
+ *
+ * @param {BrowserWindow} win The shell window that hosts the browser panes.
+ * @returns {ReturnType<typeof createBrowserViewRegistry>}
+ */
+function createBrowserRegistryForWindow(win) {
+  return createBrowserViewRegistry({
+    WebContentsViewCtor: (opts) => new WebContentsView(opts),
+    createBoundsController: createBrowserViewBoundsController,
+    attachToHost: (view) => win.contentView.addChildView(view),
+    detachFromHost: (view) => win.contentView.removeChildView(view),
+    sendToRenderer: (channel, payload) => {
+      try {
+        win.webContents.send(channel, payload);
+      } catch {
+        /* window torn down */
+      }
+    },
+    // Renderer measures in CSS px; convert to window DIPs using the host
+    // webContents zoom factor (Cmd+/Cmd- changes this out from under us).
+    getHostZoomFactor: () => {
+      try {
+        return win.webContents.getZoomFactor();
+      } catch {
+        return 1;
+      }
+    },
+  });
+}
+
+/**
+ * Look up the browser-view registry for the window that sent an IPC event.
+ * Returns null for unknown windows (torn-down / setup-page senders).
+ *
+ * @param {Electron.IpcMainInvokeEvent} event
+ * @returns {ReturnType<typeof createBrowserViewRegistry> | null}
+ */
+function browserRegistryForSender(event) {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  if (!win) return null;
+  return windows.get(win)?.browserRegistry ?? null;
 }
 
 function registerIpc() {
@@ -1757,9 +2159,18 @@ function registerIpc() {
       // isPinnedOriginSender above guarantees a pinned, parseable origin.
       title = `[${new URL(origin).host}] ${title}`;
     }
+    // On macOS we play the notification sound ourselves (afplay, after show())
+    // so the alert is audible in the foreground too — macOS suppresses the
+    // frontmost app's OWN notification sound, so we mute the toast there and
+    // play it explicitly, which also keeps the cue consistent when backgrounded
+    // (no double sound). Off macOS, let the OS play its default sound, gated on
+    // the same enable switch.
+    const isMac = process.platform === "darwin";
+    const soundOn = notificationSoundEnabled();
     const notification = new Notification({
       title,
       body: String(params?.body ?? ""),
+      silent: isMac ? true : !soundOn,
     });
     // In-app path the SPA wants opened on click (e.g. "/c/conv_abc"). Captured
     // here so the click handler can tell the renderer where to route.
@@ -1786,6 +2197,13 @@ function registerIpc() {
     });
     notification.show();
     signalForeground();
+    // Foreground + background audible cue on macOS: play the user's chosen
+    // system sound. macOS muted the toast's own sound above, so this is the one
+    // and only sound. Throttled per session so a chunked/flapping response
+    // sounds once, not once per intermediate notification.
+    if (isMac && soundOn && shouldPlayNotificationSound(navigatePath || title)) {
+      playSystemSound(currentNotificationSoundName());
+    }
     return true;
   });
 
@@ -1928,6 +2346,14 @@ function registerIpc() {
   // polling) — the server-management module owns the subprocess and reports
   // lifecycle changes here.
   serverManager.onChange(broadcastHostStatus);
+
+  // Embedded browser pane — the `omnigent:browser-*` surface lives in
+  // browserIpc.js; the trust gate + per-window registry lookup are injected.
+  registerBrowserIpc({
+    ipcMain,
+    isPinnedOriginSender,
+    getRegistryForEvent: browserRegistryForSender,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1956,9 +2382,22 @@ if (!gotLock) {
     applyDockIcon();
     registerPermissions();
     registerLocalhostAccess();
+    registerSessionExpiryAccess();
     registerWebAuthn();
     registerIpc();
     buildMenu();
+    // Patch PATH for GUI-launched Electron on macOS/Linux:
+    // A desktop launcher inherits a minimal system PATH that omits directories like
+    // /opt/homebrew/bin and ~/.nvm/... where CLI tools (claude, codex, tmux) live.
+    // One synchronous interactive+login shell invocation at startup (`$SHELL -ilc`)
+    // resolves the user's full PATH; we merge it into process.env so every
+    // subsequent spawn/execFile call inherits it. Runs before resolvedCliPath()
+    // (a PATH consumer) and any host spawn, so the ordering guarantee is implicit.
+    const { resolveLoginShellPath, mergePath } = require("./loginShellPath");
+    const _loginPath = resolveLoginShellPath();
+    if (_loginPath) {
+      process.env.PATH = mergePath(process.env.PATH, _loginPath);
+    }
     // Resolve the CLI path once at startup so the first status/control call is
     // instant (primes the in-memory cache in resolvedCliPath); also lets the
     // setup page / Local CLI settings pre-fill the resolved path immediately.

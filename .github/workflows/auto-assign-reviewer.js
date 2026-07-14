@@ -210,16 +210,15 @@ module.exports = async ({ github, context, core }) => {
     }
   const loadOf = (u) => load.get(u.toLowerCase()) || 0;
 
-  // Helper: take the N most-preferred from a list. Sort key is (rank, load,
-  // random): LLM area-fit rank first (lower = better; Infinity for unranked, so
-  // an all-unranked list -- no rank file -- sorts purely by load, i.e. today's
-  // behavior), then fewest open review requests, then a pre-rolled random value
-  // to break any remaining same-rank-same-load tie. The `!==` guards avoid
-  // subtracting two Infinities (which would be NaN).
+  // Helper: take the N most-preferred from a list. Sort key is (load, rank,
+  // random): fewest open review requests first so workload stays balanced;
+  // LLM area-fit rank breaks ties within the same load bucket; a pre-rolled
+  // random value breaks any remaining tie. The `!==` guards avoid subtracting
+  // two Infinities (which would be NaN).
   const takeLowest = (list, n) => {
     const keyed = list.map((u) => ({ u, r: rankOf(u), l: loadOf(u), j: Math.random() }));
     keyed.sort((a, b) =>
-      a.r !== b.r ? a.r - b.r : a.l !== b.l ? a.l - b.l : a.j - b.j
+      a.l !== b.l ? a.l - b.l : a.r !== b.r ? a.r - b.r : a.j - b.j
     );
     return keyed.slice(0, n).map((x) => x.u);
   };

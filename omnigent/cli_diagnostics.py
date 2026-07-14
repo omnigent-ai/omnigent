@@ -2,7 +2,7 @@
 Always-on CLI diagnostics log.
 
 Captures exceptions, warnings, and diagnostic info to a per-invocation
-log file under ``~/.omnigent/logs/cli-*.log``. Separate from the
+log file under ``<data-dir>/logs/cli/cli-*.log``. Separate from the
 ``--log`` conversation JSON transcript and the ``--debug-events`` SSE
 tape — this layer is always on so crash context is available even when
 the user didn't know to enable debugging ahead of time.
@@ -36,14 +36,20 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import cast
 
-from omnigent_ui_sdk import state_dir
+from omnigent.process_logging import (
+    TerminalLogFormatter,
+    effective_log_level,
+    env_truthy,
+    process_log_dir,
+    terminal_supports_color,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-#: Subdirectory under :func:`state_dir` for CLI diagnostic logs.
-_LOGS_SUBDIR = "logs"
+#: Destination subdirectory under ``<data-dir>/logs`` for CLI diagnostics.
+_LOG_DESTINATION = "cli"
 
 #: Maximum number of ``cli-*.log`` files kept before pruning.
 MAX_LOG_FILES = 20
@@ -132,7 +138,7 @@ def _redact(text: str) -> str:
     return text
 
 
-class _RedactingFormatter(logging.Formatter):
+class _RedactingFormatter(TerminalLogFormatter):
     """
     Formatter that scrubs obvious secrets from the *final* formatted
     output — after ``%``-interpolation of ``record.args`` and after
@@ -224,12 +230,12 @@ def _log_dir() -> Path:
     """
     Return the CLI diagnostics log directory.
 
-    Uses :func:`omnigent_ui_sdk.state_dir` as the shared
-    ``~/.omnigent`` root so the path is defined in one place.
+    Uses the shared Omnigent runtime data dir so ``OMNIGENT_DATA_DIR``
+    isolates diagnostics with the DB, artifacts, and process logs.
 
-    :returns: ``~/.omnigent/logs``.
+    :returns: ``<data-dir>/logs/cli``.
     """
-    return Path(state_dir()) / _LOGS_SUBDIR
+    return process_log_dir(_LOG_DESTINATION)
 
 
 def setup_cli_logging(argv: list[str]) -> CliLogContext:
@@ -261,29 +267,38 @@ def setup_cli_logging(argv: list[str]) -> CliLogContext:
     log_path = log_dir / filename
 
     # Rotating handler — caps a single invocation at MAX_LOG_BYTES.
+    log_level = effective_log_level()
     handler = RotatingFileHandler(
         log_path,
         maxBytes=MAX_LOG_BYTES,
         backupCount=_BACKUP_COUNT,
         encoding="utf-8",
     )
+    handler.setLevel(log_level)
     # Best-effort 0600 permissions on the log file.
     with contextlib.suppress(OSError):
         os.chmod(log_path, 0o600)
 
     handler.setFormatter(
         _RedactingFormatter(
-            fmt="%(asctime)s %(levelname)-5s [%(name)s] %(message)s",
-            datefmt="%H:%M:%S",
+            use_colors=False,
         )
     )
 
-    # Wire our two package hierarchies at INFO so their records reach
+    stream_handler: logging.Handler | None = None
+    if env_truthy(os.environ.get("OMNIGENT_LOG_TO_STDERR")) and sys.stderr.isatty():
+        stream_handler = logging.StreamHandler(sys.stderr)
+        stream_handler.setLevel(log_level)
+        stream_handler.setFormatter(_RedactingFormatter(use_colors=terminal_supports_color()))
+
+    # Wire our two package hierarchies at the effective level so their records reach
     # the file handler.
     for name in ("omnigent", "omnigent_ui_sdk"):
         logger = logging.getLogger(name)
-        logger.setLevel(logging.INFO)
+        logger.setLevel(log_level)
         logger.addHandler(handler)
+        if stream_handler is not None:
+            logger.addHandler(stream_handler)
         logger.propagate = False
 
     # Suppress noisy third-party loggers that are commonly present.

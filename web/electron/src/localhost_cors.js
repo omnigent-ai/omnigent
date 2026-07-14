@@ -101,15 +101,23 @@ function headerValue(headers, name) {
  *
  * NOTE: Electron allows only ONE listener per webRequest event per session,
  * so this module must stay the sole owner of onBeforeSendHeaders /
- * onHeadersReceived / onCompleted / onErrorOccurred on the shell session.
+ * onHeadersReceived / onCompleted / onErrorOccurred on the shell session —
+ * which is why `responseHeadersHook` composes in here.
  *
  * @param {Electron.Session} ses The session to hook (the shell's default
  *   session).
  * @param {(origin: string) => boolean} isTrustedPageOrigin Decides which
  *   page origins may reach localhost. Called per localhost-bound request
  *   with the requesting page's origin (e.g. ``"https://my-server.example"``).
+ * @param {(details: Electron.OnHeadersReceivedListenerDetails) =>
+ *   Electron.HeadersReceivedResponse | null} [responseHeadersHook]
+ *   Optional first look at every response (the shell strips COOP inside
+ *   OAuth popups — see main.js): non-null answers the request, null falls
+ *   through to the CORS logic. Providing it widens the onHeadersReceived
+ *   registration to all URLs; CORS stays scoped to requests the
+ *   localhost-filtered onBeforeSendHeaders admitted into `inflight`.
  */
-function registerLocalhostCors(ses, isTrustedPageOrigin) {
+function registerLocalhostCors(ses, isTrustedPageOrigin, responseHeadersHook) {
   /**
    * In-flight localhost requests from trusted pages, keyed by webRequest
    * id: what to echo back in the injected CORS headers. Entries are
@@ -147,7 +155,14 @@ function registerLocalhostCors(ses, isTrustedPageOrigin) {
     callback({});
   });
 
-  ses.webRequest.onHeadersReceived(LOCALHOST_URL_FILTER, (details, callback) => {
+  const handleHeadersReceived = (details, callback) => {
+    if (responseHeadersHook) {
+      const hooked = responseHeadersHook(details);
+      if (hooked) {
+        callback(hooked);
+        return;
+      }
+    }
     const info = inflight.get(details.id);
     if (!info) {
       callback({});
@@ -179,7 +194,13 @@ function registerLocalhostCors(ses, isTrustedPageOrigin) {
       return;
     }
     callback({ responseHeaders });
-  });
+  };
+  if (responseHeadersHook) {
+    // Popup sign-in chains traverse arbitrary hosts → no URL filter.
+    ses.webRequest.onHeadersReceived(handleHeadersReceived);
+  } else {
+    ses.webRequest.onHeadersReceived(LOCALHOST_URL_FILTER, handleHeadersReceived);
+  }
 
   ses.webRequest.onCompleted(LOCALHOST_URL_FILTER, (details) => {
     inflight.delete(details.id);

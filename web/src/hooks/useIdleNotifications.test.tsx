@@ -72,6 +72,21 @@ async function flushPreview(): Promise<void> {
   });
 }
 
+// Turn-end notifications are now DEFERRED by a settle window (see
+// IDLE_SETTLE_MS in the hook): a running→idle edge schedules a timer that only
+// fires if the session stays idle. Advance past the window, then flush the
+// async preview fetch, so the deferred toast resolves before assertions. Only
+// setTimeout/clearTimeout are faked (below), so React's microtask-based act
+// scheduling and promises stay real.
+const SETTLE_MS = 10_000;
+async function settle(): Promise<void> {
+  await act(async () => {
+    vi.advanceTimersByTime(SETTLE_MS);
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+}
+
 function conv(id: string, status: Conversation["status"], pendingElicitations = 0): Conversation {
   return {
     id,
@@ -99,6 +114,9 @@ function setWindowFocused(focused: boolean): void {
 }
 
 beforeEach(() => {
+  // Fake only the timers the settle uses, leaving Date/microtasks/etc. real so
+  // React's act scheduling and the preview promise keep working.
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
   navigateMock.mockReset();
   showMock.mockReset();
   requestPermMock.mockReset();
@@ -124,6 +142,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  vi.useRealTimers();
   vi.restoreAllMocks();
 });
 
@@ -134,9 +153,9 @@ describe("useIdleNotifications turn-end transitions", () => {
 
     setConversations([conv("a", "idle")]);
     rerender();
-    await flushPreview();
+    await settle();
 
-    // running -> idle on an unviewed session must fire exactly one toast.
+    // running -> idle on an unviewed session, once settled, fires one toast.
     expect(showMock).toHaveBeenCalledOnce();
     expect(showMock.mock.calls[0][0]).toMatchObject({
       title: "a",
@@ -152,7 +171,7 @@ describe("useIdleNotifications turn-end transitions", () => {
 
     setConversations([conv("a", "idle")]);
     rerender();
-    await flushPreview();
+    await settle();
 
     // The preview text replaces the generic body; fetched for this session.
     expect(fetchPreviewMock).toHaveBeenCalledWith("a");
@@ -167,7 +186,7 @@ describe("useIdleNotifications turn-end transitions", () => {
     const { rerender } = renderHook(() => useIdleNotifications());
     setConversations([conv("a", "idle")]);
     rerender();
-    await flushPreview();
+    await settle();
 
     showMock.mock.calls[0][0].onClick?.();
     // Click routes to the session's chat page.
@@ -204,15 +223,56 @@ describe("useIdleNotifications turn-end transitions", () => {
     const { rerender } = renderHook(() => useIdleNotifications());
     setConversations([conv("a", "idle")]);
     rerender();
-    // Flush the first transition's async toast before clearing, else its
-    // late-resolving notification would leak into the post-clear assertion.
-    await flushPreview();
+    // Let the first turn-end settle and fire, then clear it so the steady-state
+    // refresh below is the only thing the assertion sees.
+    await settle();
     showMock.mockClear();
 
     setConversations([conv("a", "idle")]);
     rerender();
-    await flushPreview();
+    await settle();
     expect(showMock).not.toHaveBeenCalled();
+  });
+
+  it("defers a turn-end until the settle window — not immediate", async () => {
+    setConversations([conv("a", "running")]);
+    const { rerender } = renderHook(() => useIdleNotifications());
+
+    setConversations([conv("a", "idle")]);
+    rerender();
+    await flushPreview();
+    // Held back to confirm the agent is really done, not just between steps.
+    expect(showMock).not.toHaveBeenCalled();
+
+    await settle();
+    expect(showMock).toHaveBeenCalledOnce();
+  });
+
+  it("cancels the deferred cue when the agent resumes (a step, not the end)", async () => {
+    setConversations([conv("a", "running")]);
+    const { rerender } = renderHook(() => useIdleNotifications());
+
+    setConversations([conv("a", "idle")]); // step finished -> schedule the cue
+    rerender();
+    setConversations([conv("a", "running")]); // next step -> cancel it
+    rerender();
+
+    await settle();
+    expect(showMock).not.toHaveBeenCalled();
+  });
+
+  it("notifies once at the end of a multi-step run, not per step", async () => {
+    setConversations([conv("a", "running")]);
+    const { rerender } = renderHook(() => useIdleNotifications());
+
+    // running -> idle -> running -> idle -> running -> idle (final idle stays).
+    for (const status of ["idle", "running", "idle", "running", "idle"] as const) {
+      setConversations([conv("a", status)]);
+      rerender();
+    }
+
+    await settle();
+    expect(showMock).toHaveBeenCalledOnce();
   });
 });
 
@@ -243,16 +303,103 @@ describe("useIdleNotifications elicitation transitions", () => {
     setConversations([conv("a", "running", 0)]);
     const { rerender } = renderHook(() => useIdleNotifications());
 
-    // Same tick: status running -> idle AND elicitation 0 -> 1. The hook must
-    // de-dupe to one toast for the session (the idle branch wins).
+    // Same tick: status running -> idle AND elicitation 0 -> 1. "Needs
+    // response" wins and fires immediately; the same-tick turn-end is deferred
+    // and then dropped (the session is awaiting input, not quietly finishing),
+    // so there's exactly one toast.
     setConversations([conv("a", "idle", 1)]);
     rerender();
-    await flushPreview();
 
     expect(showMock).toHaveBeenCalledOnce();
     expect(showMock.mock.calls[0][0]).toMatchObject({
-      body: "Agent finished and is ready for your input.",
+      body: "Agent is asking for your input.",
     });
+
+    // Settling confirms the deferred turn-end was cancelled — still one toast.
+    await settle();
+    expect(showMock).toHaveBeenCalledOnce();
+  });
+});
+
+describe("useIdleNotifications offline-runner suppression", () => {
+  it("does NOT notify a transition on a session whose runner is offline (stale reconciliation)", async () => {
+    // A dead-runner session flipping running -> failed is the server
+    // reconciling stale state, not a real completion — the phantom beep. It
+    // must not sound. (Default focus is blurred, so only the runner filter
+    // is in play here.)
+    setConversations([{ ...conv("a", "running"), runner_online: false }]);
+    const { rerender } = renderHook(() => useIdleNotifications());
+    setConversations([{ ...conv("a", "failed"), runner_online: false }]);
+    rerender();
+    await settle();
+    expect(showMock).not.toHaveBeenCalled();
+  });
+
+  it("DOES notify a turn end on a session with a live runner", async () => {
+    setConversations([{ ...conv("a", "running"), runner_online: true }]);
+    const { rerender } = renderHook(() => useIdleNotifications());
+    setConversations([{ ...conv("a", "idle"), runner_online: true }]);
+    rerender();
+    await settle();
+    expect(showMock).toHaveBeenCalledOnce();
+  });
+
+  it("does NOT notify a new elicitation on a session whose runner is offline", () => {
+    setConversations([{ ...conv("a", "running", 0), runner_online: false }]);
+    const { rerender } = renderHook(() => useIdleNotifications());
+    setConversations([{ ...conv("a", "running", 1), runner_online: false }]);
+    rerender();
+    expect(showMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("useIdleNotifications re-notification dedup (one beep until viewed)", () => {
+  it("does not re-beep a session that finishes again before the user has viewed it", async () => {
+    // First finish while away -> one beep.
+    setConversations([conv("a", "running")]);
+    const { rerender } = renderHook(() => useIdleNotifications());
+    setConversations([conv("a", "idle")]);
+    rerender();
+    await settle();
+    expect(showMock).toHaveBeenCalledOnce();
+    showMock.mockClear();
+
+    // Runs and finishes again, still unviewed -> no second beep. (This is the
+    // async multi-agent case: launch turn-end + report-back turn-end = one beep.)
+    setConversations([conv("a", "running")]);
+    rerender();
+    setConversations([conv("a", "idle")]);
+    rerender();
+    await settle();
+    expect(showMock).not.toHaveBeenCalled();
+  });
+
+  it("beeps again after the user views the session between finishes", async () => {
+    setConversations([conv("a", "running")]);
+    const { rerender } = renderHook(() => useIdleNotifications("a"));
+    setConversations([conv("a", "idle")]);
+    rerender();
+    await settle();
+    expect(showMock).toHaveBeenCalledOnce();
+    showMock.mockClear();
+
+    // User views 'a' (focused + active) -> clears the "already beeped" mark.
+    act(() => {
+      window.dispatchEvent(new Event("focus"));
+    });
+    setConversations([conv("a", "idle")]);
+    rerender();
+
+    // They step away and 'a' finishes a fresh turn -> beeps again.
+    act(() => {
+      window.dispatchEvent(new Event("blur"));
+    });
+    setConversations([conv("a", "running")]);
+    rerender();
+    setConversations([conv("a", "idle")]);
+    rerender();
+    await settle();
+    expect(showMock).toHaveBeenCalledOnce();
   });
 });
 
@@ -276,7 +423,7 @@ describe("useIdleNotifications active-view suppression", () => {
     // 'b' finishes while the user is focused on 'a' -> still notify for 'b'.
     setConversations([conv("a", "running"), conv("b", "idle")]);
     rerender();
-    await flushPreview();
+    await settle();
     expect(showMock).toHaveBeenCalledOnce();
     expect(showMock.mock.calls[0][0]).toMatchObject({ title: "b" });
   });
@@ -289,8 +436,44 @@ describe("useIdleNotifications active-view suppression", () => {
     // Viewing 'a' but window blurred -> the user isn't looking, so notify.
     setConversations([conv("a", "idle")]);
     rerender();
-    await flushPreview();
+    await settle();
     expect(showMock).toHaveBeenCalledOnce();
+  });
+
+  it("suppresses the active session via a focus event even when document.hasFocus() misreports", async () => {
+    // Reproduces the Electron quirk: document.hasFocus() reports the focused
+    // window as unfocused. A real `focus` event is the source of truth and must
+    // still suppress the actively-viewed session.
+    setWindowFocused(false); // hasFocus() lies -> false, seeding the ref false
+    setConversations([conv("a", "running")]);
+    const { rerender } = renderHook(() => useIdleNotifications("a"));
+
+    // The window is genuinely focused; the focus event says so.
+    act(() => {
+      window.dispatchEvent(new Event("focus"));
+    });
+
+    setConversations([conv("a", "idle")]);
+    rerender();
+    await settle();
+    expect(showMock).not.toHaveBeenCalled();
+  });
+
+  it("suppresses the active session while the user is typing in it (keydown), despite hasFocus() misreporting", async () => {
+    // "I am looking or typing on it": a keystroke means our window is focused,
+    // so the chat being typed in must not ping even if hasFocus() says false.
+    setWindowFocused(false);
+    setConversations([conv("a", "running")]);
+    const { rerender } = renderHook(() => useIdleNotifications("a"));
+
+    act(() => {
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "h" }));
+    });
+
+    setConversations([conv("a", "idle")]);
+    rerender();
+    await settle();
+    expect(showMock).not.toHaveBeenCalled();
   });
 });
 
@@ -318,7 +501,7 @@ describe("useIdleNotifications badge (native shell)", () => {
     setConversations([unseenConv("a")]);
     renderHook(() => useIdleNotifications());
 
-    expect(setBadgeMock).toHaveBeenCalledWith(1);
+    expect(setBadgeMock).toHaveBeenCalledWith(1, expect.objectContaining({ navigatePath: "/c/a" }));
   });
 
   it("sends 0 on the first computation when nothing is unread", () => {
@@ -341,7 +524,7 @@ describe("useIdleNotifications badge (native shell)", () => {
     setConversations([unseenConv("a")]);
     rerender();
     // First resolved fetch computes and sends the real count.
-    expect(setBadgeMock).toHaveBeenCalledWith(1);
+    expect(setBadgeMock).toHaveBeenCalledWith(1, expect.objectContaining({ navigatePath: "/c/a" }));
   });
 
   it("counts sessions awaiting input (pending elicitations)", () => {
@@ -350,7 +533,7 @@ describe("useIdleNotifications badge (native shell)", () => {
     setConversations([conv("a", "running", 1)]);
     renderHook(() => useIdleNotifications());
 
-    expect(setBadgeMock).toHaveBeenCalledWith(1);
+    expect(setBadgeMock).toHaveBeenCalledWith(1, expect.objectContaining({ navigatePath: "/c/a" }));
   });
 
   it("updates the badge when a watched session's turn ends", () => {
@@ -364,13 +547,16 @@ describe("useIdleNotifications badge (native shell)", () => {
     setConversations([{ ...conv("a", "idle"), updated_at: 100 }]);
     rerender();
     // The turn ended -> the session is now unseen -> badge 1.
-    expect(setBadgeMock).toHaveBeenLastCalledWith(1);
+    expect(setBadgeMock).toHaveBeenLastCalledWith(
+      1,
+      expect.objectContaining({ navigatePath: "/c/a" }),
+    );
   });
 
   it("does not resend an unchanged count", () => {
     setConversations([unseenConv("a")]);
     const { rerender } = renderHook(() => useIdleNotifications());
-    expect(setBadgeMock).toHaveBeenCalledWith(1);
+    expect(setBadgeMock).toHaveBeenCalledWith(1, expect.objectContaining({ navigatePath: "/c/a" }));
     setBadgeMock.mockClear();
 
     // Same unread state on the next tick (fresh data object, same content)
@@ -383,7 +569,10 @@ describe("useIdleNotifications badge (native shell)", () => {
   it("clears a session from the badge once it's marked seen", () => {
     setConversations([unseenConv("a")]);
     const { rerender } = renderHook(() => useIdleNotifications());
-    expect(setBadgeMock).toHaveBeenLastCalledWith(1);
+    expect(setBadgeMock).toHaveBeenLastCalledWith(
+      1,
+      expect.objectContaining({ navigatePath: "/c/a" }),
+    );
 
     // The user viewed the session (ChatPage's useMarkConversationSeen
     // advances the baseline past updated_at); the next data tick must drop
@@ -409,7 +598,7 @@ describe("useIdleNotifications badge (native shell)", () => {
     renderHook(() => useIdleNotifications("a"));
 
     // Viewing 'a' but blurred -> the user isn't looking, so it counts.
-    expect(setBadgeMock).toHaveBeenCalledWith(1);
+    expect(setBadgeMock).toHaveBeenCalledWith(1, expect.objectContaining({ navigatePath: "/c/a" }));
   });
 
   it("clears the badge when the window regains focus on the open conversation", () => {
@@ -417,7 +606,10 @@ describe("useIdleNotifications badge (native shell)", () => {
     setConversations([unseenConv("a")]);
     renderHook(() => useIdleNotifications("a"));
     // Precondition: 'a' is unread (badge 1).
-    expect(setBadgeMock).toHaveBeenLastCalledWith(1);
+    expect(setBadgeMock).toHaveBeenLastCalledWith(
+      1,
+      expect.objectContaining({ navigatePath: "/c/a" }),
+    );
     setBadgeMock.mockClear();
 
     // User refocuses the window while 'a' is the active conversation.
@@ -434,8 +626,11 @@ describe("useIdleNotifications badge (native shell)", () => {
     setWindowFocused(false);
     setConversations([unseenConv("a"), unseenConv("b")]);
     renderHook(() => useIdleNotifications("a"));
-    // Both unread -> badge 2.
-    expect(setBadgeMock).toHaveBeenLastCalledWith(2);
+    // Both unread (finished, none awaiting) -> badge 2, routed to the list.
+    expect(setBadgeMock).toHaveBeenLastCalledWith(
+      2,
+      expect.objectContaining({ navigatePath: "/?sidebar=open" }),
+    );
     setBadgeMock.mockClear();
 
     setWindowFocused(true);
@@ -444,7 +639,45 @@ describe("useIdleNotifications badge (native shell)", () => {
     });
 
     // Focusing on 'a' suppresses only 'a'; 'b' remains unread -> badge 1.
-    expect(setBadgeMock).toHaveBeenCalledWith(1);
+    expect(setBadgeMock).toHaveBeenCalledWith(1, expect.objectContaining({ navigatePath: "/c/b" }));
+  });
+
+  it("makes the single-session badge actionable + descriptive", () => {
+    // The one waiting session becomes a tap-to-open, labelled notification —
+    // not a dead "1 pending" toast.
+    setConversations([unseenConv("a")]);
+    renderHook(() => useIdleNotifications());
+
+    // Title stays unset (shell -> app name) so it doesn't clone the per-session
+    // toast; the body names the session.
+    expect(setBadgeMock).toHaveBeenCalledWith(1, {
+      navigatePath: "/c/a",
+      body: "a needs your attention",
+    });
+  });
+
+  it("routes a multi-session badge to the session list when none await input", () => {
+    // Both merely finished (unseen activity, no pending prompt) -> the inbox
+    // would read "Nothing waiting on you", so route to the session list;
+    // ?sidebar=open makes phone-width shells actually show it.
+    setConversations([unseenConv("a"), unseenConv("b")]);
+    renderHook(() => useIdleNotifications());
+
+    expect(setBadgeMock).toHaveBeenCalledWith(2, {
+      navigatePath: "/?sidebar=open",
+      body: "2 sessions need your attention",
+    });
+  });
+
+  it("routes a multi-session badge to the inbox when a session awaits input", () => {
+    // 'a' has a pending prompt, so /inbox will actually list something.
+    setConversations([conv("a", "running", 1), unseenConv("b")]);
+    renderHook(() => useIdleNotifications());
+
+    expect(setBadgeMock).toHaveBeenCalledWith(2, {
+      navigatePath: "/inbox",
+      body: "2 sessions need your attention",
+    });
   });
 });
 
@@ -467,7 +700,7 @@ describe("useIdleNotifications gating", () => {
     const { rerender } = renderHook(() => useIdleNotifications());
     setConversations([conv("a", "idle")]);
     rerender();
-    await flushPreview();
+    await settle();
     // Native shell manages permission downstream, so the web grant gate is
     // bypassed and the toast still fires.
     expect(showMock).toHaveBeenCalledOnce();

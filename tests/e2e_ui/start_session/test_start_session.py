@@ -66,6 +66,9 @@ _SESSIONS_RE = re.compile(r"/v1/sessions(\?.*)?$")
 # ``…/filesystem/home/e2e/projects``; it never matches the bare
 # ``/v1/hosts`` list (no ``/filesystem`` segment).
 _FILESYSTEM_RE = re.compile(r"/v1/hosts/[^/]+/filesystem")
+# The worktree-list endpoint the branch combobox queries for the picked repo.
+# Distinct ``/worktrees`` segment, so it never collides with ``/filesystem``.
+_WORKTREES_RE = re.compile(r"/v1/hosts/[^/]+/worktrees")
 
 
 def _run_in_fresh_loop(coro: Coroutine[Any, Any, None]) -> None:
@@ -407,6 +410,25 @@ def _hosts_body() -> str:
     )
 
 
+# Two online hosts for the sticky-default test. The composer auto-selects the
+# FIRST online host (alpha) when there's no stored pick; the test then picks
+# beta and asserts it's restored after a reload.
+_HOST_ALPHA = ("host_e2e_alpha", "e2e-host-alpha")
+_HOST_BETA = ("host_e2e_beta", "e2e-host-beta")
+
+
+def _two_hosts_body() -> str:
+    """Stub body for ``GET /v1/hosts``: two online, user-connected hosts."""
+    return json.dumps(
+        {
+            "hosts": [
+                {"host_id": hid, "name": name, "owner": "e2e", "status": "online"}
+                for hid, name in (_HOST_ALPHA, _HOST_BETA)
+            ]
+        }
+    )
+
+
 async def _register_common_routes(
     page,
     *,
@@ -566,6 +588,213 @@ async def _drive_permission_mode(base_url: str, session_id: str) -> None:
             assert body["host_id"] == _HOST_ID, body
             assert body["workspace"] == "/work/repo", body
             assert body.get("terminal_launch_args") == ["--permission-mode", "acceptEdits"], body
+        finally:
+            await browser.close()
+
+
+def test_start_session_remembers_last_picked_host(seeded_session: tuple[str, str]) -> None:
+    """The host chip restores the last explicitly-picked host after a reload.
+
+    With no stored pick the composer auto-selects the first online host
+    (alpha). After the user picks a different host (beta), that choice must be
+    persisted (``omnigent:last-host-choice`` in localStorage) and restored on
+    the next visit — instead of reverting to the first-online default. This is
+    the OSS mirror of the managed complaint where the picker always reverted to
+    the "Databricks Sandbox" default.
+    """
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_remembers_last_picked_host(base_url, session_id))
+
+
+async def _drive_remembers_last_picked_host(base_url: str, session_id: str) -> None:
+    alpha_id, alpha_name = _HOST_ALPHA
+    beta_id, beta_name = _HOST_BETA
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_bodies: list[dict[str, Any]] = []
+            await _register_common_routes(
+                page, created_session_id=session_id, create_bodies=create_bodies
+            )
+
+            # Override the single-host stub with the two-host body (registered
+            # after the common routes so this handler wins).
+            async def handle_two_hosts(route: Route) -> None:
+                await route.fulfill(
+                    status=200, content_type="application/json", body=_two_hosts_body()
+                )
+
+            await page.route("**/v1/hosts", handle_two_hosts)
+
+            # Neutralize agent discovery so a leaked native agent from another
+            # test can't switch the picker mid-flow (see _drive_permission_mode).
+            async def handle_agent_scan(route: Route) -> None:
+                await route.fulfill(
+                    status=200, content_type="application/json", body=json.dumps({"data": []})
+                )
+
+            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+
+            # Seed recents for both hosts so the working-directory chip auto-fills
+            # and the composer never blocks on the (host-less) file browser.
+            await page.add_init_script(
+                f"""window.localStorage.setItem(
+                    "omnigent:recent-workspaces",
+                    JSON.stringify({{
+                        "{alpha_id}": ["/work/repo"],
+                        "{beta_id}": ["/work/repo"]
+                    }})
+                );"""
+            )
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+
+            chip = page.get_by_test_id("new-chat-landing-host-chip")
+            # No stored pick yet → auto-selects the first online host (alpha).
+            await expect(chip).to_contain_text(alpha_name)
+
+            # Explicitly pick the second host.
+            await chip.click()
+            await page.get_by_test_id(f"new-chat-landing-host-{beta_id}").click()
+            await expect(chip).to_contain_text(beta_name)
+
+            # Reload: a full document load resets the in-memory landing draft, so
+            # the only thing that can restore the pick is the persisted
+            # preference. The chip must come back on beta, NOT the alpha default.
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+            chip = page.get_by_test_id("new-chat-landing-host-chip")
+            await expect(chip).to_contain_text(beta_name)
+        finally:
+            await browser.close()
+
+
+def _managed_info_body() -> str:
+    """Stub body for ``GET /v1/info``: a managed deployment offering a sandbox.
+
+    ``managed_sandboxes_enabled: true`` + ``sandbox_provider: "lakebox"`` makes
+    the picker offer (and default to) the "Databricks Sandbox" option, exactly
+    the deployment shape behind the original complaint. Every field the SPA
+    reads is supplied so the boot probe resolves to a fully-managed capability
+    set rather than the fail-closed sentinel.
+    """
+    return json.dumps(
+        {
+            "accounts_enabled": False,
+            "login_url": None,
+            "needs_setup": False,
+            "databricks_features": True,
+            "managed_sandboxes_enabled": True,
+            "sandbox_provider": "lakebox",
+            "server_version": "0.0.0-e2e",
+            "smart_routing_enabled": False,
+        }
+    )
+
+
+def test_start_session_managed_remembers_host_over_sandbox_default(
+    seeded_session: tuple[str, str],
+) -> None:
+    """In a managed deployment, a picked host survives reload — not the sandbox.
+
+    This is the original complaint end-to-end: the managed picker defaults to
+    "Databricks Sandbox", so a user who picks a connected host used to lose it
+    on the next visit (the picker reverted to the sandbox default). With the
+    last-host preference persisted, picking the host and reloading must restore
+    the host, NOT snap back to the sandbox default.
+    """
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_managed_remembers_host(base_url, session_id))
+
+
+async def _drive_managed_remembers_host(base_url: str, session_id: str) -> None:
+    host_id, host_name = _HOST_ALPHA
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_bodies: list[dict[str, Any]] = []
+            await _register_common_routes(
+                page, created_session_id=session_id, create_bodies=create_bodies
+            )
+
+            # Managed capability probe: makes the sandbox the offered default.
+            # `/v1/info` is fetched once per document load and module-cached, so
+            # a full reload re-hits this stub and re-enters managed mode.
+            async def handle_info(route: Route) -> None:
+                await route.fulfill(
+                    status=200, content_type="application/json", body=_managed_info_body()
+                )
+
+            await page.route("**/v1/info", handle_info)
+
+            # One connected online host alongside the managed sandbox default.
+            async def handle_one_host(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps(
+                        {
+                            "hosts": [
+                                {
+                                    "host_id": host_id,
+                                    "name": host_name,
+                                    "owner": "e2e",
+                                    "status": "online",
+                                }
+                            ]
+                        }
+                    ),
+                )
+
+            await page.route("**/v1/hosts", handle_one_host)
+
+            # Neutralize agent discovery so a leaked native agent from another
+            # test can't switch the picker mid-flow (see _drive_permission_mode).
+            async def handle_agent_scan(route: Route) -> None:
+                await route.fulfill(
+                    status=200, content_type="application/json", body=json.dumps({"data": []})
+                )
+
+            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+
+            await page.add_init_script(
+                f"""window.localStorage.setItem(
+                    "omnigent:recent-workspaces",
+                    JSON.stringify({{ "{host_id}": ["/work/repo"] }})
+                );"""
+            )
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+
+            chip = page.get_by_test_id("new-chat-landing-host-chip")
+            # Managed default with no stored pick: the sandbox, labeled by its
+            # provider ("Databricks Sandbox").
+            await expect(chip).to_contain_text("Databricks Sandbox")
+
+            # Explicitly pick the connected host instead.
+            await chip.click()
+            await page.get_by_test_id(f"new-chat-landing-host-{host_id}").click()
+            await expect(chip).to_contain_text(host_name)
+
+            # Reload: the host must be restored, NOT reverted to the sandbox
+            # default — the exact regression this change fixes.
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+            chip = page.get_by_test_id("new-chat-landing-host-chip")
+            await expect(chip).to_contain_text(host_name)
+            await expect(chip).not_to_contain_text("Databricks Sandbox")
         finally:
             await browser.close()
 
@@ -1002,8 +1231,9 @@ async def _drive_select_harness(base_url: str, session_id: str) -> None:
             # Polly auto-selects (ranked ahead of Debby); its brain-harness
             # override radios live in the picker's per-entry config submenu.
             await _open_entry_config(page, "ag_polly_e2e")
-            # All four brain harnesses render as radio rows, in registry order.
-            for harness in ("claude-sdk", "openai-agents", "codex", "pi"):
+            # The built-in brain harnesses render as radio rows, in registry
+            # order (openai-agents is intentionally not offered in the picker).
+            for harness in ("claude-sdk", "codex", "pi"):
                 await expect(
                     page.get_by_test_id(f"new-chat-landing-harness-{harness}")
                 ).to_be_visible()
@@ -1727,6 +1957,106 @@ async def _drive_add_worktree(base_url: str, session_id: str) -> None:
             assert body["host_id"] == _HOST_ID, body
             assert body["workspace"] == "/work/repo", body
             assert body.get("git") == {"branch_name": "feature/login", "base_branch": "main"}, body
+        finally:
+            await browser.close()
+
+
+def test_start_session_select_existing_worktree(seeded_session: tuple[str, str]) -> None:
+    """Picking an existing worktree starts in its directory in git bind mode.
+
+    The branch chip's input doubles as a combobox: focusing it lists the
+    repo's existing worktrees (``GET /v1/hosts/{id}/worktrees``). Selecting
+    one must (a) point the workspace at that worktree's directory and
+    (b) send the ``git`` spec in bind mode on ``POST /v1/sessions`` —
+    ``existing_worktree: true`` with the worktree's branch as
+    ``branch_name`` — so no worktree is created but the sidebar shows the
+    branch and the delete flow can offer to remove it.
+    """
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_select_existing_worktree(base_url, session_id))
+
+
+async def _drive_select_existing_worktree(base_url: str, session_id: str) -> None:
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_bodies: list[dict[str, Any]] = []
+            await _register_common_routes(
+                page, created_session_id=session_id, create_bodies=create_bodies
+            )
+
+            async def handle_worktrees(route: Route) -> None:
+                # The main tree (is_main) plus one linked worktree. The picker
+                # hides the main tree, so only "feature/x" is offered.
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps(
+                        {
+                            "object": "list",
+                            "data": [
+                                {
+                                    "path": "/work/repo",
+                                    "branch": "main",
+                                    "is_main": True,
+                                    "detached": False,
+                                },
+                                {
+                                    "path": "/work/repo-worktrees/feature-x",
+                                    "branch": "feature/x",
+                                    "is_main": False,
+                                    "detached": False,
+                                },
+                            ],
+                        }
+                    ),
+                )
+
+            # Registered after the common routes so it wins for its URL.
+            await page.route(_WORKTREES_RE, handle_worktrees)
+
+            await page.add_init_script(
+                f"""window.localStorage.setItem(
+                    "omnigent:recent-workspaces",
+                    JSON.stringify({{ {_HOST_ID}: ["/work/repo"] }})
+                );"""
+            )
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+
+            # Open the worktree chip; focusing the branch combobox reveals the
+            # repo's existing (linked) worktrees. The main tree is filtered out,
+            # so only the one linked worktree is offered.
+            await page.get_by_test_id("new-chat-landing-branch-chip").click()
+            await page.get_by_test_id("new-chat-landing-branch-input").focus()
+            option = page.get_by_test_id("new-chat-landing-worktree-option")
+            await expect(option).to_have_count(1)
+            await expect(option).to_contain_text("feature/x")
+            await option.click()
+
+            # The warning confirms the session will start in the existing
+            # worktree (rather than creating a new one).
+            await expect(
+                page.get_by_test_id("new-chat-landing-existing-worktree-warning")
+            ).to_be_visible()
+
+            await page.get_by_test_id("new-chat-landing-input").fill("work in the worktree")
+            await page.get_by_test_id("new-chat-landing-submit").click()
+
+            await _wait_until(lambda: len(create_bodies) == 1)
+            body = create_bodies[0]
+            assert body["host_id"] == _HOST_ID, body
+            # Workspace is the worktree dir; the git spec is in bind mode
+            # (existing_worktree) so no worktree is created, and the worktree's
+            # branch rides along as branch_name so the sidebar shows it and the
+            # delete flow can offer to remove it.
+            assert body["workspace"] == "/work/repo-worktrees/feature-x", body
+            assert body["git"]["existing_worktree"] is True, body
+            assert body["git"]["branch_name"] == "feature/x", body
         finally:
             await browser.close()
 

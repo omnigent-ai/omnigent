@@ -82,6 +82,21 @@ describe("mergeItemsIntoPages", () => {
     expect(found).toEqual(new Set(["a"]));
   });
 
+  it("leaves a cached search_snippet intact when the wire omits the key", () => {
+    // search_snippet is search-only: the WS stream excludes it from its dump,
+    // so a changed/snapshot frame never carries the key. A key-absent overlay
+    // must NOT touch the snippet the search response put in the cache — this is
+    // what stops the palette's match preview from flickering away on a tick.
+    const before = data([conv("a", { search_snippet: "…setup.py test…" })]);
+    const items = new Map<string, SessionListWireItem>([["a", { id: "a", status: "running" }]]);
+
+    const { data: after } = mergeItemsIntoPages(before, items, DEFAULT_FILTERS, NO_ACTIVE);
+
+    // Snippet survives; only the field the frame carried is applied.
+    expect(after!.pages[0].data[0].search_snippet).toBe("…setup.py test…");
+    expect(after!.pages[0].data[0].status).toBe("running");
+  });
+
   it("returns the same data reference when nothing actually changed", () => {
     const before = data([conv("a", { status: "running" })]);
     // Wire item restates the current values — an idempotent snapshot replay.

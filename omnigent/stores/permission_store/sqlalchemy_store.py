@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from sqlalchemy import delete, exists, select, update
+from sqlalchemy import delete, exists, literal, select, update
+from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-from omnigent.db.db_models import SqlSessionPermission, SqlUser
+from omnigent.db.db_models import SqlSessionPermission, SqlUser, current_workspace_id
 from omnigent.db.utils import get_or_create_engine, make_managed_session_maker
 from omnigent.entities import Account, ResolvedAccess, SessionPermission
 from omnigent.server.auth import (
@@ -79,27 +80,33 @@ class SqlAlchemyPermissionStore(PermissionStore):
     ) -> SessionPermission:
         """Upsert a permission grant. See base class for contract."""
         with self._session() as session:
-            is_sqlite = self._engine.dialect.name == "sqlite"
+            dialect = self._engine.dialect.name
             values = {
                 "user_id": user_id,
                 "conversation_id": conversation_id,
                 "level": level,
             }
-            if is_sqlite:
+            if dialect == "sqlite":
                 stmt = (
                     sqlite_insert(SqlSessionPermission)
                     .values(**values)
                     .on_conflict_do_update(
-                        index_elements=["user_id", "conversation_id"],
+                        index_elements=["workspace_id", "user_id", "conversation_id"],
                         set_={"level": level},
                     )
+                )
+            elif dialect == "mysql":
+                stmt = (
+                    mysql_insert(SqlSessionPermission)
+                    .values(**values)
+                    .on_duplicate_key_update(level=level)
                 )
             else:
                 stmt = (
                     pg_insert(SqlSessionPermission)
                     .values(**values)
                     .on_conflict_do_update(
-                        index_elements=["user_id", "conversation_id"],
+                        index_elements=["workspace_id", "user_id", "conversation_id"],
                         set_={"level": level},
                     )
                 )
@@ -116,6 +123,7 @@ class SqlAlchemyPermissionStore(PermissionStore):
         with self._session() as session:
             result = session.execute(
                 delete(SqlSessionPermission).where(
+                    SqlSessionPermission.workspace_id == current_workspace_id(),
                     SqlSessionPermission.user_id == user_id,
                     SqlSessionPermission.conversation_id == conversation_id,
                 )
@@ -125,7 +133,9 @@ class SqlAlchemyPermissionStore(PermissionStore):
     def get(self, user_id: str, conversation_id: str) -> SessionPermission | None:
         """Look up a single grant. See base class for contract."""
         with self._session() as session:
-            row = session.get(SqlSessionPermission, (user_id, conversation_id))
+            row = session.get(
+                SqlSessionPermission, (current_workspace_id(), user_id, conversation_id)
+            )
             return _to_entity(row) if row is not None else None
 
     def reassign_user_grants(self, from_user_id: str, to_user_id: str) -> int:
@@ -150,12 +160,13 @@ class SqlAlchemyPermissionStore(PermissionStore):
         with self._session() as session:
             # FK target: ensure the destination users.id row exists. Don't
             # downgrade an existing admin flag; only create it if missing.
-            if session.get(SqlUser, to_user_id) is None:
+            if session.get(SqlUser, (current_workspace_id(), to_user_id)) is None:
                 session.add(SqlUser(id=to_user_id, is_admin=False))
                 session.flush()
             rows = (
                 session.execute(
                     select(SqlSessionPermission).where(
+                        SqlSessionPermission.workspace_id == current_workspace_id(),
                         SqlSessionPermission.user_id == from_user_id,
                     )
                 )
@@ -164,7 +175,13 @@ class SqlAlchemyPermissionStore(PermissionStore):
             )
             for row in rows:
                 conversation_id = row.conversation_id
-                if session.get(SqlSessionPermission, (to_user_id, conversation_id)) is not None:
+                if (
+                    session.get(
+                        SqlSessionPermission,
+                        (current_workspace_id(), to_user_id, conversation_id),
+                    )
+                    is not None
+                ):
                     # Destination already has access — drop the duplicate.
                     session.delete(row)
                     continue
@@ -173,6 +190,7 @@ class SqlAlchemyPermissionStore(PermissionStore):
                 session.execute(
                     update(SqlSessionPermission)
                     .where(
+                        SqlSessionPermission.workspace_id == current_workspace_id(),
                         SqlSessionPermission.user_id == from_user_id,
                         SqlSessionPermission.conversation_id == conversation_id,
                     )
@@ -187,6 +205,7 @@ class SqlAlchemyPermissionStore(PermissionStore):
             rows = (
                 session.execute(
                     select(SqlSessionPermission).where(
+                        SqlSessionPermission.workspace_id == current_workspace_id(),
                         SqlSessionPermission.conversation_id == conversation_id,
                     )
                 )
@@ -206,7 +225,8 @@ class SqlAlchemyPermissionStore(PermissionStore):
                 _to_entity(r)
                 for r in session.execute(
                     select(SqlSessionPermission).where(
-                        SqlSessionPermission.conversation_id.in_(conversation_ids)
+                        SqlSessionPermission.workspace_id == current_workspace_id(),
+                        SqlSessionPermission.conversation_id.in_(conversation_ids),
                     )
                 )
                 .scalars()
@@ -223,6 +243,7 @@ class SqlAlchemyPermissionStore(PermissionStore):
             rows = (
                 session.execute(
                     select(SqlSessionPermission).where(
+                        SqlSessionPermission.workspace_id == current_workspace_id(),
                         SqlSessionPermission.user_id == user_id,
                     )
                 )
@@ -234,38 +255,58 @@ class SqlAlchemyPermissionStore(PermissionStore):
     def ensure_user(self, user_id: str, *, is_admin: bool = False) -> None:
         """Upsert a user row. See base class for contract."""
         with self._session() as session:
-            is_sqlite = self._engine.dialect.name == "sqlite"
+            dialect = self._engine.dialect.name
             values = {"id": user_id, "is_admin": is_admin}
-            if is_sqlite:
+            if dialect == "sqlite":
                 stmt = (
                     sqlite_insert(SqlUser)
                     .values(**values)
-                    .on_conflict_do_nothing(index_elements=["id"])
+                    .on_conflict_do_nothing(index_elements=["workspace_id", "id"])
+                )
+            elif dialect == "mysql":
+                # ON DUPLICATE KEY UPDATE with a no-op to silently skip conflicts.
+                stmt = (
+                    mysql_insert(SqlUser)
+                    .values(**values)
+                    .on_duplicate_key_update(id=literal(user_id))
                 )
             else:
                 stmt = (
                     pg_insert(SqlUser)
                     .values(**values)
-                    .on_conflict_do_nothing(index_elements=["id"])
+                    .on_conflict_do_nothing(index_elements=["workspace_id", "id"])
                 )
             session.execute(stmt)
 
     def list_users(self) -> list[Account]:
         """List every real user row. See base class for contract."""
         with self._session() as session:
-            rows = session.execute(select(SqlUser)).scalars().all()
+            rows = (
+                session.execute(
+                    select(SqlUser).where(SqlUser.workspace_id == current_workspace_id())
+                )
+                .scalars()
+                .all()
+            )
             return [_to_account(r) for r in rows if r.id not in _HIDDEN_LIST_USERS]
 
     def is_admin(self, user_id: str) -> bool:
         """Check the admin flag. See base class for contract."""
         with self._session() as session:
-            row = session.get(SqlUser, user_id)
+            row = session.get(SqlUser, (current_workspace_id(), user_id))
             return row is not None and row.is_admin
 
     def set_admin(self, user_id: str, is_admin: bool) -> None:
         """Set the admin flag on an existing user. See base class for contract."""
         with self._session() as session:
-            session.execute(update(SqlUser).where(SqlUser.id == user_id).values(is_admin=is_admin))
+            session.execute(
+                update(SqlUser)
+                .where(
+                    SqlUser.workspace_id == current_workspace_id(),
+                    SqlUser.id == user_id,
+                )
+                .values(is_admin=is_admin)
+            )
 
     def check_access(
         self,
@@ -324,10 +365,13 @@ class SqlAlchemyPermissionStore(PermissionStore):
         # calling is_admin + check_access + get_permission_level separately
         # did — see the GET /v1/sessions/{id} snapshot path).
         with self._session() as session:
-            user_row = session.get(SqlUser, user_id)
-            user_grant = session.get(SqlSessionPermission, (user_id, conversation_id))
+            user_row = session.get(SqlUser, (current_workspace_id(), user_id))
+            user_grant = session.get(
+                SqlSessionPermission, (current_workspace_id(), user_id, conversation_id)
+            )
             public_grant = session.get(
-                SqlSessionPermission, (RESERVED_USER_PUBLIC, conversation_id)
+                SqlSessionPermission,
+                (current_workspace_id(), RESERVED_USER_PUBLIC, conversation_id),
             )
             return ResolvedAccess(
                 is_admin=user_row is not None and user_row.is_admin,
@@ -341,6 +385,7 @@ class SqlAlchemyPermissionStore(PermissionStore):
             return session.execute(
                 select(
                     exists().where(
+                        SqlSessionPermission.workspace_id == current_workspace_id(),
                         SqlSessionPermission.conversation_id == conversation_id,
                     )
                 )

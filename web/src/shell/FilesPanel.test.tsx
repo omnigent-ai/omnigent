@@ -204,19 +204,19 @@ describe("FilesPanel working folder directory", () => {
 });
 
 describe("FilesPanel working folder header role", () => {
-  // The inline right-rail panel passes `frameless` to fill the rail height
-  // without the card chrome. That must NOT downgrade the "Working folder"
-  // header to a plain label: it stays a collapsible button (accessible name
-  // + aria-expanded) so the rail header is focusable and toggleable, and so
-  // the e2e suite can target it by role. Only the drawer (onClose), which
-  // has its own X close button, uses the static label header.
-  it("renders the header as a collapsible button in the standalone card", () => {
+  // The "Working folder" header is a static label in every mode — it is not a
+  // collapse toggle. Collapsing was removed: the panel's content is the whole
+  // point of the panel, so there is nothing to collapse to. The content is
+  // always visible and the header never carries aria-expanded.
+  it("renders the header as a static label (no toggle button) in the standalone card", () => {
     renderPanel({ conversationId: "conv_header_card", files: [] });
-    const header = screen.getByRole("button", { name: /working folder/i });
-    expect(header).toHaveAttribute("aria-expanded", "true");
+    expect(screen.queryByRole("button", { name: /working folder/i })).toBeNull();
+    expect(screen.getByText("Working folder")).toBeInTheDocument();
+    // Content is always shown — the scope switch is part of it.
+    expect(screen.getByRole("radiogroup", { name: "File scope" })).toBeInTheDocument();
   });
 
-  it("renders the header as a collapsible button in frameless (inline rail) mode", () => {
+  it("renders the header as a static label (no toggle button) in frameless (inline rail) mode", () => {
     useAllFilesMock.mockReturnValue(allFilesResult([]));
     useChangedFilesMock.mockReturnValue(changedFilesResult([]));
     useDirectoryMock.mockReturnValue(directoryResult());
@@ -245,14 +245,14 @@ describe("FilesPanel working folder header role", () => {
       </MemoryRouter>,
     );
 
-    const header = screen.getByRole("button", { name: /working folder/i });
-    expect(header).toHaveAttribute("aria-expanded", "true");
+    expect(screen.queryByRole("button", { name: /working folder/i })).toBeNull();
+    expect(screen.getByText("Working folder")).toBeInTheDocument();
+    expect(screen.getByRole("radiogroup", { name: "File scope" })).toBeInTheDocument();
   });
 
-  it("renders a static label header (no toggle button) in the drawer", () => {
+  it("renders a static label header with a Close button in the drawer", () => {
     renderPanel({ conversationId: "conv_header_drawer", files: [], onClose: vi.fn() });
-    // The drawer has its own X close button, so the title is a plain label,
-    // not a collapse toggle.
+    // The drawer adds an X close button; the title is a plain label everywhere.
     expect(screen.queryByRole("button", { name: /working folder/i })).toBeNull();
     expect(screen.getByText("Working folder")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Close files" })).toBeInTheDocument();

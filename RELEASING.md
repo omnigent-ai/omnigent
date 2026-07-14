@@ -46,6 +46,27 @@ never double-publishes. Use the secure repo for real releases.
   there (`vX.Y.Z`); patches (`vX.Y.1`, `vX.Y.2`, …) are cherry-picked onto the
   same `branch-X.Y`. `main` is never tagged.
 
+## Docs staging
+
+Because `main` carries the **next** version, the docs generated from merged PRs
+describe a release that isn't out yet — so they must **not** deploy to the live
+site on merge. Two workflows enforce this by staging onto a **per-minor docs
+branch** on `omnigent-site` instead of `main`:
+
+- **`doc-sync.yml`** — drafts prose docs for each merged PR that needs them.
+- **`sync-openapi-to-site.yml`** — syncs the API reference (`openapi.json`).
+
+Both derive the branch name from `omnigent/version.py` (`0.5.0.dev0` → `0.5-docs`)
+and create it off site `main` the first time a doc PR lands in the cycle. All docs
+for the `0.5` line — including patches — accumulate on `0.5-docs`. Each PR still
+gets its own review, but merging one only lands it on the staging branch, not the
+live site.
+
+At release, publishing the GitHub Release fires `publish-changelog.yml`, which
+opens the **`0.5-docs → main`** PR (see step 5). Merging that publishes the whole
+cycle's docs at once. Nothing to create or retarget by hand — the branch name
+tracks `main`'s version automatically.
+
 ---
 
 ## Release steps (example: `v0.2.0`)
@@ -175,10 +196,11 @@ two workflows have already done the prep for you:
 - `draft-release-notes.yml` (fires right after) then:
   1. opened a **`CHANGELOG.md` PR to `main`** — the granular, feature-level log,
      harvested mechanically from each merged PR's `## Changelog` section; and
-  2. **filled the draft's body** with concise, curated two-section notes (Major new
-     features / Bug fixes & hardening), synthesized by an agent from the merged
-     PRs, with the original auto-notes tucked into a collapsed `<details>` for
-     reference.
+  2. **filled the draft's body** with concise, curated notes (Major new features /
+     Breaking changes / Bug fixes — user-facing only), synthesized by an agent from
+     the merged PRs, with the original auto-notes tucked into a collapsed
+     `<details>` for reference. Security and CI/internal fixes are deliberately left
+     out of the highlights.
 
 Now:
 
@@ -192,11 +214,15 @@ Now:
    succeeded, so you never advertise a version that isn't installable).
 
 Publishing a **final** release fires `.github/workflows/publish-changelog.yml`,
-which opens **one** PR to review and merge (pre-releases are skipped):
+which opens **two** PRs to review and merge (pre-releases are skipped):
 
 - **`omnigent-site` `/releases/<version>`** — a per-version post mirroring the
   notes you just curated (PR refs and angle/brace characters are made MDX-safe for
-  you).
+  you). Targets `main`.
+- **`omnigent-site` `X.Y-docs → main`** — publishes the docs staged this cycle
+  (see [Docs staging](#docs-staging) below). Skipped if that branch doesn't exist
+  or has nothing beyond `main`. Review the batch and merge to take the version's
+  docs live.
 
 To re-run either half for an already-cut tag: dispatch `draft-release-notes.yml`
 with the `tag` (re-opens the CHANGELOG PR; it leaves the notes alone once the

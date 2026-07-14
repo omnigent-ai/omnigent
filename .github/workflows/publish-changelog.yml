@@ -165,3 +165,44 @@ jobs:
             --head "$RELEASES_BRANCH" \
             --title "docs(releases): publish ${TAG} release post" \
             --body "$body"
+
+      # The per-minor docs branch (X.Y-docs) has accumulated this release's docs
+      # from doc-sync and the OpenAPI sync, held back from the live site. Now the
+      # release is public — open a PR to merge that batch into main. A human reviews
+      # and merges it, publishing all the version's docs at once. Skipped cleanly
+      # when the branch doesn't exist or carries nothing beyond main (e.g. a patch
+      # release with no staged docs).
+      - name: Open docs-branch → main PR (omnigent-site)
+        working-directory: site
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          DOCS_BRANCH="${VERSION%.*}-docs"
+
+          if ! git ls-remote --exit-code --heads origin "$DOCS_BRANCH" >/dev/null 2>&1; then
+            echo "No ${DOCS_BRANCH} branch — no staged docs to publish for ${TAG}." \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          git fetch origin main "$DOCS_BRANCH" >/dev/null 2>&1
+          ahead="$(git rev-list --count "origin/main..origin/${DOCS_BRANCH}" 2>/dev/null || echo 0)"
+          if [ "$ahead" = "0" ]; then
+            echo "${DOCS_BRANCH} has nothing beyond main — nothing to publish." \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if [ -n "$(gh pr list --repo "$SITE_REPO" --head "$DOCS_BRANCH" --base main --state open --json number --jq '.[].number')" ]; then
+            echo "docs → main PR for ${DOCS_BRANCH} already open." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          body="$(printf 'Publishes the staged **%s** documentation to the live site: merges `%s` (%s commit(s) of doc-sync + OpenAPI updates accumulated this cycle) into main.\n\nOpened by omnigent `.github/workflows/publish-changelog.yml` on the **%s** release. Review the batch and merge to go live.' "${VERSION%.*}" "$DOCS_BRANCH" "$ahead" "$TAG")"
+          gh pr create \
+            --repo "$SITE_REPO" \
+            --base main \
+            --head "$DOCS_BRANCH" \
+            --title "docs: publish ${VERSION%.*} docs to the live site" \
+            --body "$body"

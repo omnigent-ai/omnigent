@@ -6537,12 +6537,63 @@ class _ForwardBlockingHarnessClient(_BlockingHarnessClient):
         """
         super().__init__(sse_frames, gate)
         self._fwd_gate = fwd_gate
+        self.fwd_seen: asyncio.Event = asyncio.Event()
+        self.order: list[str] = []
+
+    def stream(self, method: str, url: str, *, json: dict[str, Any], timeout: Any) -> Any:
+        """Stream that records when the blocked turn is cancelled."""
+        del method, url, timeout
+        self.posted_bodies.append(json)
+        self.post_seen.set()
+        frames = self._sse_frames
+        gate = self._gate
+        order = self.order
+
+        class _ForwardBlockingCtx:
+            status_code = 200
+
+            async def __aenter__(self) -> _ForwardBlockingHarnessClient._ForwardBlockingHandle:
+                return _ForwardBlockingHarnessClient._ForwardBlockingHandle(frames, gate, order)
+
+            async def __aexit__(self, *_: Any) -> None:
+                return None
+
+        return _ForwardBlockingCtx()
 
     async def post(self, url: str, *, json: dict[str, Any], timeout: Any = None) -> Any:
         """Block an interrupt forward on ``fwd_gate``; pass other posts through."""
         if isinstance(json, dict) and json.get("type") == "interrupt":
+            self.order.append("forward")
+            self.fwd_seen.set()
             await self._fwd_gate.wait()
         return await super().post(url, json=json, timeout=timeout)
+
+    class _ForwardBlockingHandle:
+        """Stream handle that records cancellation while paused on the gate."""
+
+        status_code = 200
+
+        def __init__(
+            self,
+            frames: list[str],
+            gate: asyncio.Event,
+            order: list[str],
+        ) -> None:
+            """Initialize with frames, gate, and shared order log."""
+            self._frames = frames
+            self._gate = gate
+            self._order = order
+
+        async def aiter_text(self) -> AsyncIterator[str]:
+            """Yield first frame, then record cancellation of the blocked turn."""
+            try:
+                for i, frame in enumerate(self._frames):
+                    if i == 1:
+                        await self._gate.wait()
+                    yield frame
+            except asyncio.CancelledError:
+                self._order.append("cancel")
+                raise
 
 
 def _build_fwd_blocking_app(
@@ -6609,7 +6660,12 @@ async def test_interrupt_forwards_to_harness_before_cancelling() -> None:
             },
         )
         assert resp.status_code == 202
-        await _aio.wait_for(_hc.post_seen.wait(), timeout=15.0)
+        # Await these events / the interrupt task directly rather than through
+        # asyncio.wait_for: a wall-clock timeout races task completion when the
+        # loaded misc shard starves the event loop — the interrupt could return
+        # 204 yet still raise TimeoutError because the timer fired first. pytest's
+        # global --timeout guards against a genuine hang.
+        await _hc.post_seen.wait()
 
         # The interrupt route must block on the (still-blocked) harness forward —
         # forward-first awaits it before cancelling. If it completes here, the
@@ -6618,14 +6674,18 @@ async def test_interrupt_forwards_to_harness_before_cancelling() -> None:
         int_task = _aio.create_task(
             client.post(f"/v1/sessions/{conv_id}/events", json={"type": "interrupt"})
         )
-        with pytest.raises(_aio.TimeoutError):
-            await _aio.wait_for(_aio.shield(int_task), timeout=0.5)
+        # Wait until the route is actually blocked on fwd_gate — deterministic
+        # proof the forward is in-flight. This replaces a flaky 0.5 s sleep that
+        # could race on loaded CI machines.
+        await _hc.fwd_seen.wait()
         assert not int_task.done(), "interrupt must await the harness forward (forward-first)"
+        assert _hc.order == ["forward"]
 
         # Release the forward → the harness gets the interrupt, then the cancel runs.
         fwd_gate.set()
-        int_resp = await _aio.wait_for(int_task, timeout=15.0)
+        int_resp = await int_task
         assert int_resp.status_code == 204, int_resp.text
+        assert _hc.order == ["forward", "cancel"]
         markers = _interrupt_markers(list(_session_histories_ref.get(conv_id, [])))
 
     assert len(markers) == 1, (
@@ -9010,22 +9070,27 @@ async def test_events_interrupt_on_native_session_503_skips_cleanup_when_inject_
 
 
 class _EventRecordingServerClient(NullServerClient):
-    """Records Omnigent ``external_conversation_item`` POSTs for assertion.
+    """Records Omnigent ``external_*`` event POSTs for assertion.
 
     Subclasses :class:`NullServerClient` so all other runner→AP calls still
-    succeed silently; captures the bodies so a test can assert that NO
-    interrupt marker was persisted.
+    succeed silently; captures ``external_conversation_item`` bodies so a
+    test can assert that NO interrupt marker was persisted, and
+    ``external_mcp_startup`` bodies so Stop tests can assert the cancelled
+    MCP map was published.
     """
 
     def __init__(self) -> None:
         self.posted_items: list[dict[str, Any]] = []
+        self.posted_mcp_startup: list[dict[str, Any]] = []
 
     async def post(self, url: str, **kwargs: Any) -> NullServerClient._Response:
-        """Record ``external_conversation_item`` bodies."""
+        """Record ``external_conversation_item`` / ``external_mcp_startup`` bodies."""
         del url
         body = kwargs.get("json")
         if isinstance(body, dict) and body.get("type") == "external_conversation_item":
             self.posted_items.append(body.get("data") or {})
+        if isinstance(body, dict) and body.get("type") == "external_mcp_startup":
+            self.posted_mcp_startup.append(body.get("data") or {})
         return self._Response()
 
 
@@ -9811,6 +9876,352 @@ async def test_events_stop_session_on_codex_native_uses_turn_interrupt_without_m
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("event_type", ["interrupt", "stop_session"])
+async def test_events_stop_on_codex_native_cancels_mcp_startup_without_active_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    event_type: str,
+) -> None:
+    """
+    Stop/interrupt with no active turn cancels in-flight MCP startup.
+
+    During codex-native startup no turn id is recorded yet, so Stop used to
+    204 no-op while Codex sat wedged on a slow or failing MCP server
+    (issue #2058). The handler must flip the bridge's pending servers to
+    ``cancelled`` (unblocking the executor's first-turn gate) and send the
+    Codex TUI's startup interrupt — ``turn/interrupt`` with an empty turn
+    id — instead of doing nothing.
+    """
+    from omnigent import codex_native_app_server
+    from omnigent.spec.types import ExecutorSpec
+
+    conv_id = f"conv_codex_native_mcp_{event_type}"
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    # Abort the session-create auto-terminal path before it reaches
+    # ``clear_bridge_state`` — otherwise the seeded bridge state below is
+    # wiped on hosts where the codex CLI/provider config exist (in CI the
+    # auto-create aborts on its own before the clear).
+    import omnigent.runner.app as runner_app_module
+
+    async def _fail_launch_config(**kwargs: Any) -> None:
+        """Abort codex auto-create before it clears bridge state."""
+        del kwargs
+        raise RuntimeError("launch config disabled in test")
+
+    monkeypatch.setattr(runner_app_module, "_codex_native_launch_config", _fail_launch_config)
+    bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(conv_id)
+    codex_native_bridge.write_bridge_state(
+        bridge_dir,
+        codex_native_bridge.CodexNativeBridgeState(
+            session_id=conv_id,
+            socket_path="ws://127.0.0.1:43212",
+            thread_id="thread_codex_mcp",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id=None,
+        ),
+    )
+    codex_native_bridge.update_mcp_server_startup(bridge_dir, "storage-console", "starting")
+
+    fake_client = _RecordingCodexAppServerClient(
+        transport="ws://127.0.0.1:43212",
+        client_name="omnigent-codex-native-runner",
+    )
+
+    def _fake_client_for_transport(
+        transport: str,
+        *,
+        client_name: str = "omnigent",
+    ) -> _RecordingCodexAppServerClient:
+        """
+        Return the fake Codex app-server client for the startup-cancel path.
+
+        :param transport: App-server transport from bridge state, e.g.
+            ``"ws://127.0.0.1:43212"``.
+        :param client_name: Client name supplied by the runner, e.g.
+            ``"omnigent-codex-native-runner"``.
+        :returns: Fake client that records JSON-RPC calls.
+        """
+        assert transport == fake_client.transport
+        assert client_name == fake_client.client_name
+        return fake_client
+
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "client_for_transport",
+        _fake_client_for_transport,
+    )
+
+    codex_native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the codex-native spec for any agent_id."""
+        del agent_id, session_id
+        return codex_native_spec
+
+    server_client = _EventRecordingServerClient()
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        stop_resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": event_type},
+        )
+
+    assert stop_resp.status_code == 204, (
+        f"codex-native {event_type} must return 204; got {stop_resp.status_code}: {stop_resp.text}"
+    )
+    # The Codex TUI's startup interrupt shape: turn/interrupt with an
+    # EMPTY turn id (its ``startup_interrupt``); a recorded-turn shape
+    # here would be rejected by the app-server mid-startup.
+    assert fake_client.requests == [
+        (
+            "turn/interrupt",
+            {"threadId": "thread_codex_mcp", "turnId": ""},
+        )
+    ], (
+        f"codex-native {event_type} during MCP startup must send the startup "
+        f"interrupt (empty turnId); got {fake_client.requests!r}."
+    )
+    # The local flip is authoritative even if Codex never acknowledges
+    # the interrupt.
+    assert codex_native_bridge.read_mcp_startup(bridge_dir) == {
+        "storage-console": {"status": "cancelled", "error": None}
+    }
+    # And the flipped map is PUBLISHED: the forwarder only reposts when it
+    # changes the map itself and codex's cancelled edges are owner-only,
+    # so without this post the web band would stay stuck on "starting".
+    assert server_client.posted_mcp_startup == [
+        {"servers": {"storage-console": {"status": "cancelled", "error": None}}}
+    ], (
+        f"codex-native {event_type} must publish the cancelled MCP map; "
+        f"got {server_client.posted_mcp_startup!r}."
+    )
+
+
+@pytest.mark.asyncio
+async def test_events_interrupt_on_codex_native_with_turn_and_mcp_stops_both(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    Stop during a startup-deferred turn interrupts the turn AND the startup.
+
+    Codex accepts ``turn/start`` mid-MCP-startup and defers its execution
+    until the round settles, so a Stop pressed in that window finds an
+    active turn id recorded. Interrupting only the turn would leave the
+    user watching a startup they asked to stop — the handler must also
+    send the startup interrupt (empty turn id, best-effort, first) and
+    flip the bridge's pending servers to ``cancelled``.
+    """
+    from omnigent import codex_native_app_server
+    from omnigent.spec.types import ExecutorSpec
+
+    conv_id = "conv_codex_native_dual_stop"
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    # Keep the seeded bridge state alive through session create (see the
+    # sister startup-cancel test for why auto-create must abort early).
+    import omnigent.runner.app as runner_app_module
+
+    async def _fail_launch_config(**kwargs: Any) -> None:
+        """Abort codex auto-create before it clears bridge state."""
+        del kwargs
+        raise RuntimeError("launch config disabled in test")
+
+    monkeypatch.setattr(runner_app_module, "_codex_native_launch_config", _fail_launch_config)
+    bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(conv_id)
+    codex_native_bridge.write_bridge_state(
+        bridge_dir,
+        codex_native_bridge.CodexNativeBridgeState(
+            session_id=conv_id,
+            socket_path="ws://127.0.0.1:43214",
+            thread_id="thread_codex_dual",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id="turn_deferred",
+        ),
+    )
+    codex_native_bridge.update_mcp_server_startup(bridge_dir, "storage-console", "starting")
+
+    fake_client = _RecordingCodexAppServerClient(
+        transport="ws://127.0.0.1:43214",
+        client_name="omnigent-codex-native-runner",
+    )
+
+    def _fake_client_for_transport(
+        transport: str,
+        *,
+        client_name: str = "omnigent",
+    ) -> _RecordingCodexAppServerClient:
+        """
+        Return the fake Codex app-server client for the dual-stop path.
+
+        :param transport: App-server transport from bridge state, e.g.
+            ``"ws://127.0.0.1:43214"``.
+        :param client_name: Client name supplied by the runner, e.g.
+            ``"omnigent-codex-native-runner"``.
+        :returns: Fake client that records JSON-RPC calls.
+        """
+        assert transport == fake_client.transport
+        assert client_name == fake_client.client_name
+        return fake_client
+
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "client_for_transport",
+        _fake_client_for_transport,
+    )
+
+    codex_native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the codex-native spec for any agent_id."""
+        del agent_id, session_id
+        return codex_native_spec
+
+    server_client = _EventRecordingServerClient()
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        int_resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "interrupt"},
+        )
+
+    assert int_resp.status_code == 204, int_resp.text
+    # Startup interrupt (empty turnId) first — best-effort — then the
+    # recorded turn's interrupt.
+    assert fake_client.requests == [
+        ("turn/interrupt", {"threadId": "thread_codex_dual", "turnId": ""}),
+        ("turn/interrupt", {"threadId": "thread_codex_dual", "turnId": "turn_deferred"}),
+    ], f"dual stop must send startup interrupt then turn interrupt; got {fake_client.requests!r}."
+    assert codex_native_bridge.read_mcp_startup(bridge_dir) == {
+        "storage-console": {"status": "cancelled", "error": None}
+    }
+    # The cancelled map is published to the session (band + snapshot update).
+    assert server_client.posted_mcp_startup == [
+        {"servers": {"storage-console": {"status": "cancelled", "error": None}}}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_events_interrupt_on_codex_native_without_turn_or_mcp_is_noop(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    Stop with no active turn and no pending MCP startup stays a 204 no-op.
+
+    An idle codex-native session must not send spurious ``turn/interrupt``
+    requests to the app-server on every Stop press.
+    """
+    from omnigent import codex_native_app_server
+    from omnigent.spec.types import ExecutorSpec
+
+    conv_id = "conv_codex_native_idle_stop"
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    # Keep the seeded bridge state alive through session create (see the
+    # sister startup-cancel test for why auto-create must abort early).
+    import omnigent.runner.app as runner_app_module
+
+    async def _fail_launch_config(**kwargs: Any) -> None:
+        """Abort codex auto-create before it clears bridge state."""
+        del kwargs
+        raise RuntimeError("launch config disabled in test")
+
+    monkeypatch.setattr(runner_app_module, "_codex_native_launch_config", _fail_launch_config)
+    bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(conv_id)
+    codex_native_bridge.write_bridge_state(
+        bridge_dir,
+        codex_native_bridge.CodexNativeBridgeState(
+            session_id=conv_id,
+            socket_path="ws://127.0.0.1:43213",
+            thread_id="thread_codex_idle",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id=None,
+        ),
+    )
+
+    def _fail_client_for_transport(
+        transport: str,
+        *,
+        client_name: str = "omnigent",
+    ) -> _RecordingCodexAppServerClient:
+        """Fail the test if the runner opens an app-server connection."""
+        raise AssertionError(
+            f"idle codex-native interrupt must not reach the app-server; "
+            f"attempted connect to {transport!r} as {client_name!r}"
+        )
+
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "client_for_transport",
+        _fail_client_for_transport,
+    )
+
+    codex_native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the codex-native spec for any agent_id."""
+        del agent_id, session_id
+        return codex_native_spec
+
+    server_client = _EventRecordingServerClient()
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        int_resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "interrupt"},
+        )
+
+    assert int_resp.status_code == 204, int_resp.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("event_type", ["interrupt", "stop_session"])
 async def test_events_interrupt_and_stop_on_pi_native_enqueue_bridge_interrupt(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -9912,6 +10323,84 @@ async def test_events_interrupt_and_stop_on_pi_native_enqueue_bridge_interrupt(
         )
         for h in captured_history
     ), f"no interrupt marker should enter _session_histories; got {captured_history!r}"
+
+
+@pytest.mark.asyncio
+async def test_events_model_change_on_pi_native_enqueues_bridge_model_change(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    POST ``/events`` ``model_change`` on a pi-native session queues a
+    ``model_change`` payload to the Pi extension inbox.
+
+    A pi-native turn runs inside the resident Pi TUI process, and the
+    ``--model`` launch flag is baked in at spawn. The dispatch must route to
+    ``_handle_pi_native_model_change``, which drops a ``model_change`` payload
+    the extension applies live via Pi's ``setModel``.
+
+    Regression guard: the ``model_change`` branch originally enumerated only
+    claude/codex/cursor/opencode/kiro, so pi-native fell through to the no-op
+    and a web-picked model never reached the running Pi process.
+
+    Pins:
+    1. 204 returned.
+    2. A ``model_change_*`` payload carrying the model id is written to the
+       session's bridge inbox.
+    """
+    import json as _json
+
+    import omnigent.pi_native_bridge as pi_native_bridge
+    from omnigent.spec.types import ExecutorSpec
+
+    conv_id = "conv_pi_native_model_change"
+    monkeypatch.setattr(pi_native_bridge, "_BRIDGE_ROOT", tmp_path / "pi-bridge")
+
+    pi_native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "pi-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return pi_native_spec
+
+    server_client = _EventRecordingServerClient()
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "model_change", "model": "databricks-claude-opus-4-1"},
+        )
+
+    assert resp.status_code == 204, (
+        f"pi-native model_change must return 204; got {resp.status_code}: {resp.text}"
+    )
+
+    inbox = pi_native_bridge.bridge_dir_for_session_id(conv_id) / "inbox"
+    payloads = [
+        _json.loads(p.read_text(encoding="utf-8"))
+        for p in (inbox.glob("*.json") if inbox.exists() else [])
+    ]
+    model_changes = [p for p in payloads if p.get("type") == "model_change"]
+    assert len(model_changes) == 1, (
+        f"pi-native model_change must enqueue exactly one payload; got {payloads!r}."
+    )
+    assert model_changes[0]["model"] == "databricks-claude-opus-4-1"
+    assert model_changes[0]["id"].startswith("model_change_")
 
 
 def test_interrupted_sessions_isolated_per_app_instance() -> None:
@@ -10679,31 +11168,26 @@ async def test_required_terminal_exit_while_idle_does_not_fail_session(tmp_path:
         on_exit = callbacks.get("on_exit")
         assert callable(on_exit)
         on_exit()
-        # Terminal-exit cleanup fans out across two independent background
-        # tasks: one publishes the resource events, a second releases the
-        # harness subprocess. Their completion order is not guaranteed, so
-        # settle on BOTH the published ``deleted`` event and the subprocess
-        # release — accumulating drained events each tick — rather than using
-        # the release as a proxy for the publish (which raced: the release
-        # task could finish first, leaving the drain empty).
+        # Await terminal-exit cleanup deterministically instead of polling;
+        # then await any pending harness-release task so ``pm.released`` is set.
+        await resource_registry.wait_for_terminal_exit_cleanup()
+        release_task_name = f"required-terminal-release:{conv_id}"
+        pending_release = [
+            task
+            for task in asyncio.all_tasks()
+            if task.get_name() == release_task_name and not task.done()
+        ]
+        if pending_release:
+            await asyncio.gather(*pending_release)
+
         deleted_event = {
             "type": "session.resource.deleted",
             "resource_id": "terminal_worker_main",
             "resource_type": "terminal",
             "session_id": conv_id,
         }
-        queued_events: list[dict[str, Any]] = []
-        parent_events: list[dict[str, Any]] = []
-        for _ in range(1000):
-            queued_events.extend(
-                _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
-            )
-            parent_events.extend(
-                _drain_session_event_queue(_session_event_queues_ref.get(parent_id))
-            )
-            if pm.released and deleted_event in queued_events:
-                break
-            await asyncio.sleep(0)
+        queued_events = _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+        parent_events = _drain_session_event_queue(_session_event_queues_ref.get(parent_id))
     finally:
         _session_event_queues_ref.pop(conv_id, None)
         _session_event_queues_ref.pop(parent_id, None)
@@ -10870,20 +11354,25 @@ async def test_external_idle_status_makes_required_terminal_exit_clean(tmp_path:
         on_exit = callbacks.get("on_exit")
         assert callable(on_exit)
         on_exit()
+        # Await terminal-exit cleanup deterministically instead of polling;
+        # then await any pending harness-release task so ``pm.released`` is set.
+        await resource_registry.wait_for_terminal_exit_cleanup()
+        release_task_name = f"required-terminal-release:{conv_id}"
+        pending_release = [
+            task
+            for task in asyncio.all_tasks()
+            if task.get_name() == release_task_name and not task.done()
+        ]
+        if pending_release:
+            await asyncio.gather(*pending_release)
+
         deleted_event = {
             "type": "session.resource.deleted",
             "resource_id": "terminal_kiro_main",
             "resource_type": "terminal",
             "session_id": conv_id,
         }
-        queued_events: list[dict[str, Any]] = []
-        for _ in range(1000):
-            queued_events.extend(
-                _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
-            )
-            if pm.released and deleted_event in queued_events:
-                break
-            await asyncio.sleep(0)
+        queued_events = _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
     finally:
         _session_event_queues_ref.pop(conv_id, None)
 
@@ -16757,434 +17246,6 @@ def test_wake_post_transport_error_is_retryable() -> None:
     exc = httpx.ConnectError("connection refused", request=request)
     # True because a transport failure is not a definitive server rejection.
     assert _wake_post_is_retryable(exc) is True
-
-
-# ── Cost advisor v3 turn-path: application + note + label ─────────────────────
-
-
-_ADVISOR_TIERS_YAML: dict[str, Any] = {  # type: ignore[explicit-any]  # YAML-shaped marker
-    "mode": "optimize",
-    "tiers": {
-        "cheap": ["model-cheap"],
-        "expensive": ["model-pricey"],
-    },
-}
-
-
-def _advisor_orchestrator_spec(*, mode: str = "optimize") -> AgentSpec:
-    """Build an opted-in claude-sdk orchestrator spec for the advisor tests.
-
-    The brain harness is ``claude-sdk`` (the only harness the advisor
-    APPLIES to); the fake process manager serves any harness name, so the
-    scripted client still handles the turn. One sub-agent is declared so a
-    realistic orchestrator spec is exercised.
-
-    :param mode: The advisor mode baked into the marker, ``"optimize"`` or
-        ``"advise"``.
-    :returns: An :class:`AgentSpec` with the ``cost_optimize`` marker.
-    """
-    return AgentSpec(
-        spec_version=1,
-        name="advisor-orchestrator",
-        executor=ExecutorSpec(
-            type="omnigent",
-            config={
-                "harness": "claude-sdk",
-                "cost_optimize": {**_ADVISOR_TIERS_YAML, "mode": mode},
-            },
-        ),
-        sub_agents=[
-            AgentSpec(
-                spec_version=1,
-                name="worker",
-                executor=ExecutorSpec(type="omnigent", config={"harness": "codex"}),
-            ),
-        ],
-    )
-
-
-def _patch_judge_returns_pricey(monkeypatch: pytest.MonkeyPatch) -> None:
-    """
-    Replace the production LLM judge with a deterministic stub.
-
-    The stub always sizes the turn to the expensive tier (``model-pricey``)
-    so the application path is observable; the judge's own prompt/parse
-    behavior is covered in ``test_cost_judge.py``. Patches the symbol the
-    advisor imports lazily inside ``maybe_run_advisor``.
-
-    :param monkeypatch: Pytest monkeypatch fixture.
-    :returns: None.
-    """
-    from omnigent.cost_plan import AdvisorVerdict
-    from omnigent.runner import cost_advisor as cost_advisor_mod
-
-    class _PriceyJudge:
-        """Judge stub returning a fixed expensive-tier verdict."""
-
-        async def judge(self, *, query: str, turn_anchor: str) -> AdvisorVerdict:
-            """:returns: An expensive-tier verdict anchored to the turn."""
-            del query
-            return AdvisorVerdict(
-                tier="expensive",
-                model="model-pricey",
-                applied=False,
-                rationale="hard work",
-                turn_anchor=turn_anchor,
-            )
-
-    def _build_stub_judge(**kwargs: Any) -> _PriceyJudge:  # type: ignore[explicit-any]
-        """:returns: The deterministic judge stub regardless of config."""
-        del kwargs
-        return _PriceyJudge()
-
-    monkeypatch.setattr(cost_advisor_mod, "build_llm_judge", _build_stub_judge)
-
-
-class _LabelPatchRecordingServerClient(_FakeServerClient):
-    """``_FakeServerClient`` that also records label PATCHes.
-
-    The advisor's verdict persist is a ``PATCH /v1/sessions/{id}`` with a
-    ``labels`` body; recording it lets the turn-path tests assert the
-    verdict label actually reached the server.
-
-    :param items: History items served by the inherited GET handler.
-    """
-
-    def __init__(
-        self,
-        items: list[dict[str, Any]],
-        *,
-        session_snapshot: dict[str, Any] | None = None,
-    ) -> None:
-        super().__init__(items, session_snapshot=session_snapshot)
-        self.label_patches: list[dict[str, Any]] = []  # type: ignore[explicit-any]  # JSON bodies
-
-    async def patch(
-        self,
-        url: str,
-        *,
-        json: dict[str, Any],  # type: ignore[explicit-any]  # JSON body
-        headers: dict[str, str] | None = None,
-        timeout: float | None = None,
-    ) -> Any:
-        """Record the PATCH body and answer 200."""
-        del url, headers, timeout
-        self.label_patches.append(json)
-
-        class _Resp:
-            status_code = 200
-
-        return _Resp()
-
-
-def _advisor_note_items(content: list[dict[str, Any]]) -> list[str]:  # type: ignore[explicit-any]
-    """Extract the v3 advisor-note texts from a harness body's content.
-
-    Handles both body shapes the advisor merges into: history-shaped
-    message items (background-turn path) and raw content blocks
-    (``?stream=true`` path).
-
-    :param content: The ``content`` list POSTed to the harness.
-    :returns: The texts of blocks whose text starts with the v3 note
-        marker, e.g. ``["[Cost advisor: this turn runs on ...]"]``.
-    """
-    texts: list[str] = []
-    for item in content:
-        if not isinstance(item, dict):
-            continue
-        # A message item carries blocks; a raw block IS the text carrier.
-        blocks = item.get("content") or [] if item.get("type") == "message" else [item]
-        for block in blocks:
-            text = block.get("text") if isinstance(block, dict) else None
-            if isinstance(text, str) and text.startswith("[Cost advisor: "):
-                texts.append(text)
-    return texts
-
-
-def _latest_user_texts(content: list[dict[str, Any]]) -> list[str]:  # type: ignore[explicit-any]
-    """Extract the text blocks of the message the executor would deliver.
-
-    Mirrors the claude-sdk executor's latest-user-message selection: for
-    history-shaped content, the LAST ``role == "user"`` item's block
-    texts; for raw content blocks, the whole list (it IS one message).
-
-    :param content: The ``content`` list POSTed to the harness.
-    :returns: The latest user message's block texts in order, e.g.
-        ``["refactor the auth flow", "[Cost advisor: ...]"]``.
-    """
-    if any(isinstance(it, dict) and it.get("type") == "message" for it in content):
-        for item in reversed(content):
-            if isinstance(item, dict) and item.get("role") == "user":
-                return [
-                    block.get("text")
-                    for block in item.get("content") or []
-                    if isinstance(block, dict) and isinstance(block.get("text"), str)
-                ]
-        return []
-    return [
-        block.get("text")
-        for block in content
-        if isinstance(block, dict) and isinstance(block.get("text"), str)
-    ]
-
-
-@pytest.mark.asyncio
-async def test_optimize_turn_applies_model_and_injects_note(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """An optimize-mode turn on a claude-sdk brain runs THIS turn on the
-    verdict model and announces it.
-
-    The core v3 proof: the harness body the runner POSTs carries
-    ``model_override == "model-pricey"`` (the per-turn brain-model switch,
-    which the claude-sdk executor honors via ``set_model``) AND a single
-    ``[Cost advisor:`` note, and the persisted label is ``applied=True``.
-
-    :param monkeypatch: Replaces the production judge with the stub.
-    """
-    from omnigent.cost_plan import parse_verdict
-
-    _patch_judge_returns_pricey(monkeypatch)
-    spec = _advisor_orchestrator_spec()
-    sse_frames = [
-        _sse({"type": "response.created", "response": {"id": "resp_o1"}}),
-        _sse({"type": "response.completed", "response": {"id": "resp_o1"}}),
-    ]
-    hc = _ScriptedHarnessClient(sse_frames)
-    pm = _FakeProcessManager(hc)
-    server_client = _LabelPatchRecordingServerClient([])
-
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        del agent_id, session_id
-        return spec
-
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=server_client,  # type: ignore[arg-type]
-    )
-
-    async with _runner_client(app) as client:
-        resp = await client.post(
-            "/v1/sessions",
-            json={"session_id": "conv_adv_opt", "agent_id": "ag_adv"},
-        )
-        assert resp.status_code == 201
-        resp2 = await client.post(
-            "/v1/sessions/conv_adv_opt/events?stream=true",
-            json={
-                "type": "message",
-                "role": "user",
-                "agent_id": "ag_adv",
-                "model": "test",
-                "content": [{"type": "input_text", "text": "refactor the auth flow"}],
-            },
-        )
-        assert resp2.status_code == 200
-        assert "response.completed" in resp2.text
-
-    # The verdict label persisted with applied=True (the advisor decided to
-    # apply, so the label must say so — applied=False would mean the runner
-    # silently didn't switch the model the label claims).
-    label_bodies = [body for body in server_client.label_patches if "labels" in body]
-    assert len(label_bodies) == 1
-    verdict = parse_verdict(label_bodies[0]["labels"])
-    assert verdict is not None
-    assert verdict.model == "model-pricey"
-    assert verdict.applied is True
-
-    # The harness body the runner POSTed carries the per-turn model switch.
-    assert len(hc.posted_bodies) == 1
-    body = hc.posted_bodies[0]
-    assert body.get("model_override") == "model-pricey", (
-        "the optimize turn did not stamp the verdict model on the harness body; "
-        "the brain would have run on the spec/gateway default, not the verdict."
-    )
-    # ...and exactly one v3 note announcing it.
-    notes = _advisor_note_items(body.get("content") or [])
-    assert notes == ["[Cost advisor: this turn runs on model-pricey (expensive)]"]
-    # REGRESSION (live 2026-06-11): the note must ride INSIDE the user's
-    # message, after the question — a trailing note-only user message
-    # shadows the question entirely (claude-sdk sends only the latest user
-    # message on resumed sessions, so the brain answers the note: "Got it,
-    # the model is now set to ..." and the user's task is dropped).
-    assert _latest_user_texts(body.get("content") or []) == [
-        "refactor the auth flow",
-        "[Cost advisor: this turn runs on model-pricey (expensive)]",
-    ], (
-        "the advisor note displaced the user's question from the message the "
-        "executor delivers; the question must stay primary with the note "
-        "riding along in the same message."
-    )
-
-
-@pytest.mark.asyncio
-async def test_advise_turn_records_but_does_not_apply(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """An advise-mode turn shadows: the verdict is recorded (applied=False)
-    but the brain model is untouched and no note is injected.
-
-    :param monkeypatch: Replaces the production judge with the stub.
-    """
-    from omnigent.cost_plan import parse_verdict
-
-    _patch_judge_returns_pricey(monkeypatch)
-    spec = _advisor_orchestrator_spec(mode="advise")
-    sse_frames = [
-        _sse({"type": "response.created", "response": {"id": "resp_a1"}}),
-        _sse({"type": "response.completed", "response": {"id": "resp_a1"}}),
-    ]
-    hc = _ScriptedHarnessClient(sse_frames)
-    pm = _FakeProcessManager(hc)
-    server_client = _LabelPatchRecordingServerClient([])
-
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        del agent_id, session_id
-        return spec
-
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=server_client,  # type: ignore[arg-type]
-    )
-
-    async with _runner_client(app) as client:
-        resp = await client.post(
-            "/v1/sessions",
-            json={"session_id": "conv_adv_shadow", "agent_id": "ag_adv"},
-        )
-        assert resp.status_code == 201
-        resp2 = await client.post(
-            "/v1/sessions/conv_adv_shadow/events?stream=true",
-            json={
-                "type": "message",
-                "role": "user",
-                "agent_id": "ag_adv",
-                "model": "test",
-                "content": [{"type": "input_text", "text": "refactor the auth flow"}],
-            },
-        )
-        assert resp2.status_code == 200
-        assert "response.completed" in resp2.text
-
-    # Advise mode: recorded but not applied.
-    label_bodies = [body for body in server_client.label_patches if "labels" in body]
-    assert len(label_bodies) == 1
-    verdict = parse_verdict(label_bodies[0]["labels"])
-    assert verdict is not None
-    assert verdict.model == "model-pricey"
-    assert verdict.applied is False
-
-    # Shadow: no model_override, no note.
-    assert len(hc.posted_bodies) == 1
-    body = hc.posted_bodies[0]
-    assert body.get("model_override") is None
-    assert _advisor_note_items(body.get("content") or []) == []
-
-
-@pytest.mark.asyncio
-async def test_user_pin_suppresses_sticky_model_on_background_turn(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A user-pinned turn on the BACKGROUND path carries NO advisor model.
-
-    Live precedence bug this guards: ``_run_turn_bg`` rebuilds the harness
-    body without the inbound ``model_override``, so after an applied
-    optimize turn the sticky carry-forward stamped the advisor's last model
-    onto the pinned turn — and ``cfg.model`` beats the env-carried user pin
-    in the claude-sdk executor, silently running the turn on the advisor's
-    model instead of the user's. (The stream path keeps the inbound body,
-    so only the background path exposes this.)
-
-    :param monkeypatch: Replaces the production judge with the stub.
-    """
-    import asyncio as _aio
-
-    from omnigent.cost_plan import parse_verdict
-
-    _patch_judge_returns_pricey(monkeypatch)
-    spec = _advisor_orchestrator_spec()
-    sse_frames = [
-        _sse({"type": "response.created", "response": {"id": "resp_pin"}}),
-        _sse({"type": "response.completed", "response": {"id": "resp_pin"}}),
-    ]
-    hc = _ScriptedHarnessClient(sse_frames)
-    pm = _FakeProcessManager(hc)
-    server_client = _LabelPatchRecordingServerClient([])
-
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        del agent_id, session_id
-        return spec
-
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=server_client,  # type: ignore[arg-type]
-    )
-
-    async with _runner_client(app) as client:
-        resp = await client.post(
-            "/v1/sessions",
-            json={"session_id": "conv_adv_pin", "agent_id": "ag_adv"},
-        )
-        assert resp.status_code == 201
-        # Turn 1 (no pin): optimize applies the verdict model → sticky set.
-        resp1 = await client.post(
-            "/v1/sessions/conv_adv_pin/events",
-            json={
-                "type": "message",
-                "role": "user",
-                "agent_id": "ag_adv",
-                "model": "test",
-                "content": [{"type": "input_text", "text": "refactor the auth flow"}],
-            },
-        )
-        assert resp1.status_code == 202
-        for _ in range(500):  # event-driven wait, no fixed sleep
-            if hc.posted_bodies:
-                break
-            await _aio.sleep(0.01)
-        assert len(hc.posted_bodies) == 1, "turn 1 never reached the harness"
-        # Turn 2: the server forwards the session's user pin on the message.
-        resp2 = await client.post(
-            "/v1/sessions/conv_adv_pin/events",
-            json={
-                "type": "message",
-                "role": "user",
-                "agent_id": "ag_adv",
-                "model": "test",
-                "model_override": "user-pinned-model",
-                "content": [{"type": "input_text", "text": "now do something hard"}],
-            },
-        )
-        assert resp2.status_code == 202
-        for _ in range(500):
-            if len(hc.posted_bodies) >= 2:
-                break
-            await _aio.sleep(0.01)
-        assert len(hc.posted_bodies) == 2, "turn 2 never reached the harness"
-
-    body1, body2 = hc.posted_bodies
-    # Turn 1 applied the verdict model (sticky state now holds it).
-    assert body1.get("model_override") == "model-pricey"
-    # Turn 2: the sticky model must NOT be stamped — body model_override
-    # (cfg.model) would beat the env-carried user pin in the executor.
-    # "model-pricey" here = the pre-fix bug (advisor silently overrode /model).
-    assert body2.get("model_override") is None, (
-        f"pinned turn carried model_override={body2.get('model_override')!r}; "
-        "the advisor's sticky model must never override a user pin."
-    )
-    # ...and no note: nothing was applied on the pinned turn.
-    assert _advisor_note_items(body2.get("content") or []) == []
-    # Both verdicts persisted; the pinned turn's is shadow (applied=False).
-    label_bodies = [body for body in server_client.label_patches if "labels" in body]
-    assert len(label_bodies) == 2
-    pinned_verdict = parse_verdict(label_bodies[1]["labels"])
-    assert pinned_verdict is not None
-    assert pinned_verdict.applied is False, (
-        "the pinned turn's verdict must be recorded as NOT applied"
-    )
 
 
 # ── Per-session transcript-forwarder registry (double-mirror regression) ──

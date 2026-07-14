@@ -28,6 +28,7 @@ from omnigent.host.daemon_launch import (
     wait_for_host_online,
     wait_for_runner_online,
 )
+from omnigent.native_coding_agents import native_shell_terminal_spec
 from omnigent.native_terminal import (
     DAEMON_HOST_ONLINE_TIMEOUT_S as _DAEMON_HOST_ONLINE_TIMEOUT_S,
 )
@@ -116,6 +117,58 @@ def resolve_pi_executable(
     return resolved
 
 
+def pi_version(executable: str) -> tuple[int, int, int] | None:
+    """Return the Pi CLI version as ``(major, minor, patch)``, or ``None``.
+
+    Runs ``pi --version`` synchronously with a short timeout. Returns
+    ``None`` on any failure (not installed, hung, unexpected output) so
+    callers treat an unknown version as "feature not supported" and avoid
+    passing flags the installed Pi may not recognise.
+
+    :param executable: Resolved path to the Pi CLI.
+    :returns: Parsed version tuple, e.g. ``(0, 79, 10)``, or ``None``.
+    """
+    import re
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            [executable, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    # Older Pi (mariozechner package) prints the version to stderr via
+    # console.error; newer Pi (earendil-works) prints to stdout via
+    # console.log. Check both so the probe works across all versions.
+    combined = result.stdout + result.stderr
+    match = re.search(r"(\d+)\.(\d+)\.(\d+)", combined)
+    if match is None:
+        return None
+    return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+
+
+def pi_supports_approve(executable: str) -> bool:
+    """Return ``True`` when the Pi CLI at *executable* supports ``--approve``.
+
+    ``--approve`` (``projectTrustOverride=true``) was added in
+    ``@earendil-works/pi-coding-agent@0.79.0``. Passing it to an older
+    version produces an "Unknown option" error and Pi exits immediately.
+
+    Fails open — returns ``False`` on any version-probe error so an older
+    Pi keeps working without the flag.
+
+    :param executable: Resolved path to the Pi CLI.
+    :returns: ``True`` iff the installed Pi version is >= 0.79.0.
+    """
+    ver = pi_version(executable)
+    if ver is None:
+        return False
+    return ver >= (0, 79, 0)
+
+
 def build_pi_launch(
     pi_args: Sequence[str],
     *,
@@ -185,17 +238,9 @@ def _materialize_pi_agent_spec(tmpdir: Path) -> Path:
             "cwd": ".",
             "sandbox": {"type": "none"},
         },
-        "terminals": {
-            "shell": {
-                "command": "bash",
-                "allow_cwd_override": True,
-                "os_env": {
-                    "type": "caller_process",
-                    "cwd": ".",
-                    "sandbox": {"type": "none"},
-                },
-            },
-        },
+        # Default shell terminal for the web-UI "+ New shell" affordance;
+        # its command follows the user's ``$SHELL`` (zsh/fish/bash).
+        "terminals": native_shell_terminal_spec(),
     }
     yaml_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
     return yaml_path

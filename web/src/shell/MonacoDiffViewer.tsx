@@ -10,6 +10,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { DiffEditor, type DiffEditorProps, type DiffOnMount } from "@monaco-editor/react";
 import { useTheme } from "next-themes";
 import { normalizeResolvedTheme } from "@/components/theme/themeMode";
+import {
+  codeFontFamilyForEditor,
+  readCodeFontFamily,
+  readCodeFontSizePx,
+  subscribeCodeFont,
+} from "@/lib/codeFontPreferences";
 import type { Comment } from "@/hooks/useComments";
 import { useCanEdit } from "@/hooks/usePermissions";
 import { detectLang, type ActiveSelection } from "./codeViewerHelpers";
@@ -93,10 +99,14 @@ export function MonacoDiffViewer({
 
   // The modified-side code editor, obtained from the diff editor on mount.
   const modifiedEditorRef = useRef<CodeEditorInstance | null>(null);
+  // The diff editor itself — its updateOptions propagates the code font to both
+  // panes (per-pane updateOptions would only re-font one side).
+  const diffEditorRef = useRef<Parameters<DiffOnMount>[0] | null>(null);
   const [mounted, setMounted] = useState(false);
 
   const handleMount: DiffOnMount = useCallback(
     (diffEditor, monaco) => {
+      diffEditorRef.current = diffEditor;
       const modified = diffEditor.getModifiedEditor();
       modifiedEditorRef.current = modified;
       // Align the modified model's offsets with the raw "after" char offsets that
@@ -116,9 +126,23 @@ export function MonacoDiffViewer({
   useEffect(
     () => () => {
       modifiedEditorRef.current = null;
+      diffEditorRef.current = null;
     },
     [],
   );
+
+  // Apply live code-font changes to both diff panes. Monaco is a fixed-pixel
+  // widget with no CSS-variable path like the chrome font, so the new
+  // size/family must be pushed imperatively; the options memo seeds the initial
+  // value at creation.
+  useEffect(() => {
+    return subscribeCodeFont((font) => {
+      diffEditorRef.current?.updateOptions({
+        fontSize: font.sizePx,
+        fontFamily: codeFontFamilyForEditor(font.family),
+      });
+    });
+  }, []);
 
   // Comments anchor into the current ("after") content == the saved file, so
   // they're always offset-valid here; gate only on edit permission.
@@ -145,7 +169,12 @@ export function MonacoDiffViewer({
       // responsive default in place rather than forcing split at any width.
       minimap: { enabled: false },
       scrollBeyondLastLine: false,
-      fontSize: 12,
+      // Code-font preference (Settings → Appearance), read at creation; live
+      // changes arrive via updateOptions in the effect above. An unset family
+      // resolves to the shared mono stack, so the diff matches the terminal
+      // rather than falling back to Monaco's own platform default.
+      fontSize: readCodeFontSizePx(),
+      fontFamily: codeFontFamilyForEditor(readCodeFontFamily()),
       automaticLayout: true,
       renderOverviewRuler: false,
       ignoreTrimWhitespace: hideWhitespace,

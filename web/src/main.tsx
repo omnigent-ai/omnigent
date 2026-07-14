@@ -8,12 +8,20 @@ import { ThemeProvider } from "./components/theme/ThemeProvider";
 import { TooltipProvider } from "./components/ui/tooltip";
 import { ImageLightboxProvider } from "./components/ImageLightbox";
 import { RunnerHealthProvider } from "./hooks/RunnerHealthProvider";
+import { QueueFlushProvider } from "./hooks/QueueFlushProvider";
 import { SessionUpdatesProvider } from "./hooks/SessionUpdatesProvider";
 import { resolveServerInfo, type ServerInfo } from "./lib/capabilities";
 import { CapabilitiesProvider } from "./lib/CapabilitiesContext";
 import { resolveIdentity } from "./lib/identity";
 import { initNativeInsets } from "./lib/nativeInsets";
 import { initBrowserTelemetry } from "./lib/telemetry";
+import {
+  applyUiFontFamily,
+  applyUiFontScale,
+  readUiFontFamily,
+  readUiFontSizePx,
+} from "./lib/uiFontPreferences";
+import { applyThemePalette, readThemePalette } from "./lib/themePalette";
 import { initChatStore } from "./store/chatStore";
 import "./index.css";
 
@@ -48,6 +56,14 @@ void resolveIdentity();
 // No-op off the iOS shell (the inset vars stay at their env()-only defaults).
 initNativeInsets();
 
+// Apply the saved UI font size and family before first paint so there's no flash.
+applyUiFontScale(readUiFontSizePx());
+applyUiFontFamily(readUiFontFamily());
+
+// Apply the saved color palette (data-theme on <html>) before first paint too,
+// so the app renders in the chosen theme rather than flashing the brand default.
+applyThemePalette(readThemePalette());
+
 // Probe /v1/info BEFORE the first render so the route table knows
 // whether to mount accounts routes. The probe is unauthed and the
 // failure path resolves to "accounts off" — so even a stalled or
@@ -61,11 +77,14 @@ const _bootProbe: Promise<ServerInfo> = Promise.race([
       () =>
         resolve({
           accounts_enabled: false,
+          single_user: false,
           login_url: null,
           needs_setup: false,
           databricks_features: false,
           managed_sandboxes_enabled: false,
           sandbox_provider: null,
+          sharing_mode: "on",
+          public_sharing_enabled: true,
           server_version: null,
           smart_routing_enabled: false,
         }),
@@ -86,7 +105,9 @@ void _bootProbe.then((info) => {
                 <BrowserRouter>
                   <SessionUpdatesProvider>
                     <RunnerHealthProvider>
-                      <App />
+                      <QueueFlushProvider>
+                        <App />
+                      </QueueFlushProvider>
                     </RunnerHealthProvider>
                   </SessionUpdatesProvider>
                 </BrowserRouter>

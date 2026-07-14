@@ -881,8 +881,12 @@ def _claude_internal_write_roots() -> list[pathlib.Path]:
 def _claude_internal_write_files() -> list[pathlib.Path]:
     """Exact files the Claude CLI updates outside its writable roots."""
 
-    path = pathlib.Path.home() / ".claude.json"
-    return [path] if path.exists() else []
+    # .credentials.json holds the Claude CLI's OAuth token on Linux.
+    candidates = [
+        pathlib.Path.home() / ".claude.json",
+        pathlib.Path.home() / ".claude" / ".credentials.json",
+    ]
+    return [path for path in candidates if path.exists()]
 
 
 def prepare_claude_cli_path(

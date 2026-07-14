@@ -179,7 +179,7 @@ mirrors work out of the box; override with `OMNIGENT_INDEX_URL` if needed.
 also launches a local web UI at `http://localhost:6767` that shows the same
 session in the browser, or on a phone on your network (step 4). The
 [desktop app](https://omnigent.ai/docs/interact/desktop) wraps that same UI
-in a native window and adds OS notifications and a dock badge —
+in a native window and adds OS notifications (with a configurable sound) and a dock badge —
 [download it for macOS](https://omnigent.ai/download/mac).
 
 > [!NOTE]
@@ -450,6 +450,10 @@ Polly at [`examples/polly/`](https://github.com/omnigent-ai/omnigent/tree/main/e
 ## Contributing
 
 Contributions are welcome. See [CONTRIBUTING.md](https://github.com/omnigent-ai/omnigent/blob/main/CONTRIBUTING.md) for how to set up your environment, run the checks, and open a pull request.
+
+Adding or changing support for a harness (Claude, Codex, Cursor, OpenCode,
+Hermes, Pi, ...)? Run the [harness test bench](https://github.com/omnigent-ai/omnigent/tree/main/tests/harness_bench)
+to check its capability matrix against observed behavior.
 
 
 ### Contributors

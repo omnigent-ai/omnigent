@@ -1485,7 +1485,7 @@ def test_admin_list_excludes_legacy_local_and_public_sentinels(
     session_maker = make_managed_session_maker(engine)
     with session_maker() as session:
         for sentinel in ("local", "__public__"):
-            if session.get(SqlUser, sentinel) is None:
+            if session.get(SqlUser, (0, sentinel)) is None:
                 session.add(SqlUser(id=sentinel, is_admin=False))
         session.commit()
 

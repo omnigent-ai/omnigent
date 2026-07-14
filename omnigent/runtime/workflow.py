@@ -1457,6 +1457,66 @@ def _build_goose_spawn_env(
     return env
 
 
+def _build_acp_spawn_env(
+    spec: AgentSpec,
+    *,
+    workdir: Path | None = None,
+) -> dict[str, str]:
+    """Build the env-var dict the generic ACP harness wrap reads.
+
+    Resolves the picked ``acp:<slug>`` (carried in ``spec.executor.config`` — the
+    slug is the addressable half of the harness id) to a user-configured agent in
+    the ``acp:`` config block, and forwards its command + protocol knobs as the
+    ``HARNESS_ACP_*`` env vars defined in ``omnigent/inner/acp_harness.py``.
+
+    Like Goose, a generic ACP agent owns its own auth, so this wires **no**
+    provider/gateway credential. A ``databricks-*`` model is dropped (not a valid
+    third-party model id); the agent's own configured model (or a flag in its
+    command) then applies. When the slug is missing/unknown, falls back to the
+    first configured agent so a bare ``acp`` id still launches something.
+
+    :param spec: The agent spec.
+    :param workdir: Accepted for signature parity with the other builders; the
+        ACP wrap consumes no bundle dir.
+    :returns: A dict of ``HARNESS_ACP_*`` env-var overrides for the spawn.
+    """
+    env: dict[str, str] = {}
+    raw_harness = ""
+    cfg = getattr(spec.executor, "config", None)
+    if isinstance(cfg, dict):
+        raw_harness = str(cfg.get("harness") or "")
+    slug = raw_harness.split(":", 1)[1] if raw_harness.startswith("acp:") else ""
+
+    # Lazily import the config reader — the hot spawn-env path shouldn't pull in
+    # the onboarding/config stack eagerly (mirrors the cursor builder).
+    from omnigent.onboarding.acp_auth import acp_agents, resolve_acp_agent
+
+    agent = resolve_acp_agent(slug) if slug else None
+    if agent is None:
+        agents = acp_agents()
+        agent = agents[0] if agents else None
+
+    if agent is not None:
+        env["HARNESS_ACP_COMMAND"] = agent.command
+        env["HARNESS_ACP_NAME"] = agent.name
+        env["HARNESS_ACP_SESSION_ID_MODE"] = agent.session_id_mode
+        if agent.send_model:
+            env["HARNESS_ACP_SEND_MODEL"] = "1"
+
+        model = _resolve_spec_model(spec)
+        if model is not None and not model.startswith(("databricks-", "databricks/")):
+            env["HARNESS_ACP_MODEL"] = model
+        elif agent.model:
+            env["HARNESS_ACP_MODEL"] = agent.model
+    # else: no agent configured — leave HARNESS_ACP_COMMAND unset so the wrap
+    # raises a clear request-time error pointing the user at `omnigent setup`.
+
+    os_env_payload = _serialize_os_env(spec.os_env)
+    if os_env_payload is not None:
+        env["HARNESS_ACP_OS_ENV"] = os_env_payload
+    return env
+
+
 def _load_global_auth() -> ApiKeyAuth | DatabricksAuth | None:
     """
     Load the ``auth:`` block from ``~/.omnigent/config.yaml``.
@@ -1696,6 +1756,12 @@ def _build_cursor_spawn_env(
     os_env_payload = _serialize_os_env(spec.os_env)
     if os_env_payload is not None:
         env["HARNESS_CURSOR_OS_ENV"] = os_env_payload
+    # Permission stance for native-tool elicitation. Default ``auto`` (set by
+    # the harness wrap when unset) skips ApprovalCards so headless / Polly
+    # Cursor SDK workers don't stall; an explicit config value overrides.
+    permission_mode = spec.executor.config.get("permission_mode")
+    if permission_mode is not None:
+        env["HARNESS_CURSOR_PERMISSION_MODE"] = str(permission_mode)
     return env
 
 
@@ -2388,7 +2454,7 @@ async def compact_conversation_now(
         return CompactionResult(messages=[], summary_metadata=None)
 
     effective_llm_config = _apply_request_model_override(llm_config, model_override)
-    effective_llm_config = _route_databricks_model_for_compaction(effective_llm_config)
+    effective_llm_config = _route_bare_model_for_compaction(effective_llm_config)
     compaction_config = spec.compaction
     if preserve_recent_window is not None:
         # The compaction helper's boundary is inclusive: recent_window=1
@@ -2454,20 +2520,36 @@ async def compact_conversation_now(
     return result
 
 
-def _route_databricks_model_for_compaction(llm_config: LLMConfig) -> LLMConfig:
+def _route_bare_model_for_compaction(llm_config: LLMConfig) -> LLMConfig:
     """
-    Route bare Databricks model ids through the Databricks LLM adapter.
+    Prefix bare model ids so compaction's generic client picks the right provider.
 
-    Normal openai-agents execution handles ``databricks-gpt-*`` via its
-    harness-specific Databricks client. Explicit ``/compact`` uses the
-    generic runtime LLM client; without a provider prefix that client
-    defaults to OpenAI and incorrectly calls api.openai.com.
+    Normal harness execution infers the provider from the harness (e.g.
+    ``claude-sdk`` → Anthropic, ``openai-agents`` → Databricks/OpenAI).
+    Explicit ``/compact`` instead uses the generic runtime LLM client,
+    whose :func:`~omnigent.llms.routing.parse_model_string` defaults any
+    prefix-less id to OpenAI — so a bare ``databricks-*`` or Anthropic
+    ``claude-*`` id gets sent to ``api.openai.com`` and the summarization
+    call fails with a 500 (issue #1950). Already-prefixed ids
+    (``anthropic/…``, ``openai/…``) and bare ``gpt-*`` (correctly OpenAI)
+    are left untouched.
 
     :param llm_config: Effective LLM config for the session.
-    :returns: ``llm_config`` or a copy with ``model='databricks/<id>'``.
+    :returns: ``llm_config`` unchanged, or a copy with a provider-prefixed model.
     """
-    if llm_config.model.startswith("databricks-"):
-        return replace(llm_config, model=f"databricks/{llm_config.model}")
+    model = llm_config.model
+    if "/" in model:
+        # Already provider-prefixed (e.g. "anthropic/claude-…") — trust it.
+        return llm_config
+    if model.startswith("databricks-"):
+        return replace(llm_config, model=f"databricks/{model}")
+    if model.startswith("claude-"):
+        # Bare Anthropic id (e.g. "claude-haiku-4-5-20251001") — route to
+        # Anthropic instead of the prefix-less OpenAI default.
+        return replace(llm_config, model=f"anthropic/{model}")
+    # ponytail: only databricks + anthropic here — the /compact failures seen
+    # in the wild. Other bare non-OpenAI prefixes (deepseek-, moonshot-, …)
+    # would need the same nudge if they ever surface.
     return llm_config
 
 

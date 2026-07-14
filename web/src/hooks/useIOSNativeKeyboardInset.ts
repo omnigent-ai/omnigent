@@ -101,5 +101,10 @@ function getIOSNativeKeyboardInset(): number {
 function isEditableElementFocused(): boolean {
   const active = document.activeElement;
   if (!(active instanceof HTMLElement)) return false;
+  // The transient textarea `copyText`'s execCommand fallback focuses is not a
+  // real editing surface — treating it as one would hide the native bar for
+  // the rest of the session, since WebKit doesn't reliably fire `focusout`
+  // when a focused element is removed. Exclude it via its marker attribute.
+  if (active.hasAttribute("data-clipboard-helper")) return false;
   return active.matches('input, textarea, select, [contenteditable="true"]');
 }
