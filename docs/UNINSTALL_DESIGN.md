@@ -1,7 +1,7 @@
 # Omnigent Uninstaller Design
 
 Status: Proposed (ready for implementation)
-Owner: TBD
+Owner: Pat Sukprasert (@PattaraS)
 Related discussion: brainstormed and debated via Debby (claude + gpt partners)
 
 This document specifies how Omnigent should be uninstalled. It is written to be
