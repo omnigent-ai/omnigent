@@ -1,4 +1,4 @@
-"""Tests for the ``conversations.workspace`` column and its check constraint.
+"""Tests for the ``omnigent_conversation_metadata.workspace`` column and its check constraint.
 
 Per ``designs/SESSION_WORKSPACE_SELECTION.md``: column is nullable so
 existing rows pre-dating the feature stay valid; CLI sessions can populate
@@ -6,6 +6,9 @@ it without setting ``host_id``; but a ``host_id`` row without a
 ``workspace`` is forbidden by the check constraint. Without the check,
 host-launched sessions could land in a permanently-broken state where
 the launch frame has no path to send.
+
+These columns now live on ``omnigent_conversation_metadata`` rather than
+``conversations`` following the schema split migration (aa1b2c3d4e5f).
 """
 
 from __future__ import annotations
@@ -40,8 +43,8 @@ def db_engine(tmp_path: Path) -> Iterator[Engine]:
 
 def test_workspace_column_present_and_nullable(db_engine: Engine) -> None:
     """
-    Verify the migration creates ``conversations.workspace`` as a nullable
-    VARCHAR(2048).
+    Verify the migration creates ``omnigent_conversation_metadata.workspace``
+    as a nullable VARCHAR(2048).
 
     Three properties matter:
     1. The column exists (proves the migration applied).
@@ -56,15 +59,15 @@ def test_workspace_column_present_and_nullable(db_engine: Engine) -> None:
     reject every legacy row at first read. (3) failing would silently
     truncate workspace paths, leaving the runner unable to find them.
     """
-    cols = sa.inspect(db_engine).get_columns("conversations")
+    cols = sa.inspect(db_engine).get_columns("omnigent_conversation_metadata")
     workspace_cols = [c for c in cols if c["name"] == "workspace"]
     assert len(workspace_cols) == 1, (
-        f"Expected exactly one 'workspace' column on conversations, "
+        f"Expected exactly one 'workspace' column on omnigent_conversation_metadata, "
         f"got {len(workspace_cols)}. If 0, the migration didn't apply."
     )
     workspace_col = workspace_cols[0]
     assert workspace_col["nullable"], (
-        "conversations.workspace must be NULLABLE — pre-feature rows "
+        "omnigent_conversation_metadata.workspace must be NULLABLE — pre-feature rows "
         "have no workspace and would otherwise be rejected on read."
     )
     assert "VARCHAR" in str(workspace_col["type"]).upper(), (
@@ -87,13 +90,17 @@ def test_workspace_round_trip_null_and_value(db_engine: Engine) -> None:
         conn.execute(
             sa.text(
                 "INSERT INTO conversations "
-                "(id, created_at, updated_at, kind, root_conversation_id) "
-                "VALUES (:id, :ts, :ts, 1, :id)"
+                "(id, created_at, updated_at, root_conversation_id) "
+                "VALUES (:id, :ts, :ts, :id)"
             ),
             {"id": "conv_ws_null", "ts": 1700000000},
         )
+        conn.execute(
+            sa.text("INSERT INTO omnigent_conversation_metadata (id, kind) VALUES (:id, 1)"),
+            {"id": "conv_ws_null"},
+        )
         result = conn.execute(
-            sa.text("SELECT workspace FROM conversations WHERE id = :id"),
+            sa.text("SELECT workspace FROM omnigent_conversation_metadata WHERE id = :id"),
             {"id": "conv_ws_null"},
         ).scalar_one()
         assert result is None, f"Expected NULL workspace on default insert; got {result!r}."
@@ -102,17 +109,24 @@ def test_workspace_round_trip_null_and_value(db_engine: Engine) -> None:
         conn.execute(
             sa.text(
                 "INSERT INTO conversations "
-                "(id, created_at, updated_at, kind, workspace, root_conversation_id) "
-                "VALUES (:id, :ts, :ts, 1, :ws, :id)"
+                "(id, created_at, updated_at, root_conversation_id) "
+                "VALUES (:id, :ts, :ts, :id)"
+            ),
+            {"id": "conv_ws_cli", "ts": 1700000000},
+        )
+        conn.execute(
+            sa.text(
+                "INSERT INTO omnigent_conversation_metadata "
+                "(id, kind, workspace) "
+                "VALUES (:id, 1, :ws)"
             ),
             {
                 "id": "conv_ws_cli",
-                "ts": 1700000000,
                 "ws": "/Users/corey/projects/myapp",
             },
         )
         result = conn.execute(
-            sa.text("SELECT workspace FROM conversations WHERE id = :id"),
+            sa.text("SELECT workspace FROM omnigent_conversation_metadata WHERE id = :id"),
             {"id": "conv_ws_cli"},
         ).scalar_one()
         assert result == "/Users/corey/projects/myapp", (
@@ -125,8 +139,8 @@ def test_check_constraint_blocks_host_id_without_workspace(
     db_engine: Engine,
 ) -> None:
     """
-    Verify ``ck_conversations_workspace_required_for_host`` blocks
-    ``(host_id NOT NULL, workspace NULL)``.
+    Verify ``ck_conversation_metadata_workspace_required_for_host`` blocks
+    ``(host_id NOT NULL, workspace NULL)`` on omnigent_conversation_metadata.
 
     Without this constraint, a host-launched session row could be
     written with no workspace path, causing every subsequent launch to
@@ -135,22 +149,29 @@ def test_check_constraint_blocks_host_id_without_workspace(
     constraint is the last line of defense.
     """
     with db_engine.connect() as conn:
+        conn.execute(
+            sa.text(
+                "INSERT INTO conversations "
+                "(id, created_at, updated_at, root_conversation_id) "
+                "VALUES (:id, :ts, :ts, :id)"
+            ),
+            {"id": "conv_ws_host_no_ws", "ts": 1700000000},
+        )
         with pytest.raises(IntegrityError) as exc_info:
             conn.execute(
                 sa.text(
-                    "INSERT INTO conversations "
-                    "(id, created_at, updated_at, kind, host_id, root_conversation_id) "
-                    "VALUES (:id, :ts, :ts, 1, :hid, :id)"
+                    "INSERT INTO omnigent_conversation_metadata "
+                    "(id, kind, host_id) "
+                    "VALUES (:id, 1, :hid)"
                 ),
                 {
                     "id": "conv_ws_host_no_ws",
-                    "ts": 1700000000,
                     "hid": "host_abc",
                 },
             )
         # The constraint name should appear in the error so failures
         # are diagnosable in production logs.
-        assert "ck_conversations_workspace_required_for_host" in str(exc_info.value), (
+        assert "ck_conversation_metadata_workspace_required_for_host" in str(exc_info.value), (
             f"Expected check-constraint name in IntegrityError; "
             f"got {exc_info.value!r}. Without this name we'd have to "
             f"guess which constraint fired."
@@ -181,12 +202,19 @@ def test_check_constraint_allows_host_id_with_workspace(
         conn.execute(
             sa.text(
                 "INSERT INTO conversations "
-                "(id, created_at, updated_at, kind, host_id, workspace, root_conversation_id) "
-                "VALUES (:id, :ts, :ts, 1, :hid, :ws, :id)"
+                "(id, created_at, updated_at, root_conversation_id) "
+                "VALUES (:id, :ts, :ts, :id)"
+            ),
+            {"id": "conv_ws_host_ok", "ts": 1700000000},
+        )
+        conn.execute(
+            sa.text(
+                "INSERT INTO omnigent_conversation_metadata "
+                "(id, kind, host_id, workspace) "
+                "VALUES (:id, 1, :hid, :ws)"
             ),
             {
                 "id": "conv_ws_host_ok",
-                "ts": 1700000000,
                 "hid": "host_abc",
                 "ws": "/Users/corey/universe/src/foo",
             },
@@ -194,7 +222,9 @@ def test_check_constraint_allows_host_id_with_workspace(
         conn.commit()
 
         result = conn.execute(
-            sa.text("SELECT host_id, workspace FROM conversations WHERE id = :id"),
+            sa.text(
+                "SELECT host_id, workspace FROM omnigent_conversation_metadata WHERE id = :id"
+            ),
             {"id": "conv_ws_host_ok"},
         ).one()
         assert result.host_id == "host_abc"
@@ -218,25 +248,28 @@ def test_host_id_index_dropped(db_engine: Engine) -> None:
 
 def test_runner_id_is_indexed(db_engine: Engine) -> None:
     """
-    Verify ``ix_conversations_runner_id`` exists at head.
+    Verify ``ix_conversation_metadata_runner_id`` exists on
+    omnigent_conversation_metadata at head.
 
     Reconnect/relaunch reconciliation queries conversations by
-    ``runner_id`` (``list_conversations_by_runner_id``) on every runner
-    reconnect; without the index (migration ``z2a2b3c4d5e6``) that's a
+    ``runner_id`` on every runner reconnect; without the index that's a
     full table scan.
     """
-    index_names = {ix["name"] for ix in sa.inspect(db_engine).get_indexes("conversations")}
-    assert "ix_conversations_runner_id" in index_names, (
-        f"Expected ix_conversations_runner_id on conversations; got {sorted(index_names)}."
+    index_names = {
+        ix["name"] for ix in sa.inspect(db_engine).get_indexes("omnigent_conversation_metadata")
+    }
+    assert "ix_conversation_metadata_runner_id" in index_names, (
+        f"Expected ix_conversation_metadata_runner_id on omnigent_conversation_metadata; "
+        f"got {sorted(n for n in index_names if n is not None)}."
     )
 
 
 def test_host_id_fk_sets_null_when_host_deleted(db_engine: Engine) -> None:
     """
-    After the FK was removed, deleting a host leaves conversations.host_id
+    After the FK was removed, deleting a host leaves metadata.host_id
     as a dangling reference — the application is responsible for nulling it.
     This test documents the current (post-FK-removal) DB-level behavior:
-    host deletion does NOT automatically null conversations.host_id.
+    host deletion does NOT automatically null host_id.
     """
     with db_engine.connect() as conn:
         conn.execute(
@@ -250,10 +283,18 @@ def test_host_id_fk_sets_null_when_host_deleted(db_engine: Engine) -> None:
         conn.execute(
             sa.text(
                 "INSERT INTO conversations "
-                "(id, created_at, updated_at, kind, host_id, workspace, root_conversation_id) "
-                "VALUES (:id, :ts, :ts, 1, :hid, :ws, :id)"
+                "(id, created_at, updated_at, root_conversation_id) "
+                "VALUES (:id, :ts, :ts, :id)"
             ),
-            {"id": "conv_fk", "ts": 1700000000, "hid": "host_del", "ws": "/ws/foo"},
+            {"id": "conv_fk", "ts": 1700000000},
+        )
+        conn.execute(
+            sa.text(
+                "INSERT INTO omnigent_conversation_metadata "
+                "(id, kind, host_id, workspace) "
+                "VALUES (:id, 1, :hid, :ws)"
+            ),
+            {"id": "conv_fk", "hid": "host_del", "ws": "/ws/foo"},
         )
         conn.commit()
 
@@ -261,14 +302,16 @@ def test_host_id_fk_sets_null_when_host_deleted(db_engine: Engine) -> None:
         conn.commit()
 
         row = conn.execute(
-            sa.text("SELECT host_id, workspace FROM conversations WHERE id = :id"),
+            sa.text(
+                "SELECT host_id, workspace FROM omnigent_conversation_metadata WHERE id = :id"
+            ),
             {"id": "conv_fk"},
         ).one()
         # No FK cascade: host_id is left dangling after host deletion.
         # The application (host store / disconnect handler) is responsible
-        # for nulling conversations.host_id when a host is removed.
+        # for nulling host_id when a host is removed.
         assert row.host_id == "host_del", (
-            "Without a DB FK, host deletion must not auto-null conversations.host_id."
+            "Without a DB FK, host deletion must not auto-null host_id."
         )
         assert row.workspace == "/ws/foo", "workspace must be untouched."
 
@@ -289,12 +332,19 @@ def test_check_constraint_allows_cli_session_workspace_no_host(
         conn.execute(
             sa.text(
                 "INSERT INTO conversations "
-                "(id, created_at, updated_at, kind, workspace, root_conversation_id) "
-                "VALUES (:id, :ts, :ts, 1, :ws, :id)"
+                "(id, created_at, updated_at, root_conversation_id) "
+                "VALUES (:id, :ts, :ts, :id)"
+            ),
+            {"id": "conv_cli_ws_only", "ts": 1700000000},
+        )
+        conn.execute(
+            sa.text(
+                "INSERT INTO omnigent_conversation_metadata "
+                "(id, kind, workspace) "
+                "VALUES (:id, 1, :ws)"
             ),
             {
                 "id": "conv_cli_ws_only",
-                "ts": 1700000000,
                 "ws": "/Users/corey/projects/cli-launched",
             },
         )
@@ -302,7 +352,9 @@ def test_check_constraint_allows_cli_session_workspace_no_host(
         # The row's host_id must be NULL — verifying explicitly so we'd
         # catch a regression that introduced an implicit default.
         result = conn.execute(
-            sa.text("SELECT host_id, workspace FROM conversations WHERE id = :id"),
+            sa.text(
+                "SELECT host_id, workspace FROM omnigent_conversation_metadata WHERE id = :id"
+            ),
             {"id": "conv_cli_ws_only"},
         ).one()
         assert result.host_id is None
@@ -317,10 +369,17 @@ def test_compressed_columns_are_binary_at_head(db_engine: Engine) -> None:
     the compression codec writes raw bytes, so a regression that left any of
     them as ``TEXT`` would corrupt values on a NUL-rejecting backend
     (PostgreSQL) the moment a compressed payload contained a NUL byte.
+
+    After the schema split (aa1b2c3d4e5f), the session-level binary columns
+    live on ``omnigent_conversation_metadata``.
     """
     inspector = sa.inspect(db_engine)
     expected = {
-        "conversations": ["session_usage", "session_state", "terminal_launch_args"],
+        "omnigent_conversation_metadata": [
+            "session_usage",
+            "session_state",
+            "terminal_launch_args",
+        ],
         "comments": ["body", "anchor_content"],
         "agents": ["description"],
     }

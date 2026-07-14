@@ -10,6 +10,7 @@ import {
   onNativeSidebarDrag,
   setBadgeCount as bridgeSetBadge,
   setNativeServerSwitcherHidden,
+  supportsBrowser,
 } from "./nativeBridge";
 
 // The Electron preload bridge mock, installed on window.omnigentDesktop.
@@ -40,8 +41,11 @@ const androidOnNotificationActivated = vi.fn().mockReturnValue(androidUnsubscrib
  * Simulate running inside / outside the Electron shell via the preload key.
  * `withClickRouting` toggles the optional `onNotificationActivated` method so
  * tests can also exercise a shell too old to support click routing.
+ * `withBrowser` toggles the optional `browserOpenOrNavigate` method — the
+ * capability marker `supportsBrowser()` probes; off by default so it stands in
+ * for a desktop build that predates the embedded browser feature.
  */
-function setElectron(on: boolean, withClickRouting = true): void {
+function setElectron(on: boolean, withClickRouting = true, withBrowser = false): void {
   if (on) {
     (window as unknown as Record<string, unknown>).omnigentDesktop = {
       kind: "electron",
@@ -53,6 +57,7 @@ function setElectron(on: boolean, withClickRouting = true): void {
               electronOnNotificationActivated(...args),
           }
         : {}),
+      ...(withBrowser ? { browserOpenOrNavigate: () => Promise.resolve({ ok: true }) } : {}),
     };
   } else {
     delete (window as unknown as Record<string, unknown>).omnigentDesktop;
@@ -164,6 +169,31 @@ describe("isNativeShell / isElectronShell", () => {
     expect(isNativeShell()).toBe(false);
     delete (window as unknown as Record<string, unknown>).omnigentDesktop;
     delete (window as unknown as Record<string, unknown>).omnigentNative;
+  });
+});
+
+describe("supportsBrowser", () => {
+  it("is false in a plain browser (no preload bridge)", () => {
+    setElectron(false);
+    expect(supportsBrowser()).toBe(false);
+  });
+
+  it("is false on an Electron shell too old for the browser bridge", () => {
+    // Electron shell present, but no `browserOpenOrNavigate` method — mirrors an
+    // installed desktop build that predates the embedded browser feature.
+    setElectron(true, true, false);
+    expect(isElectronShell()).toBe(true);
+    expect(supportsBrowser()).toBe(false);
+  });
+
+  it("is true when the shell exposes the browser bridge", () => {
+    setElectron(true, true, true);
+    expect(supportsBrowser()).toBe(true);
+  });
+
+  it("is false under a non-Electron native shell (iOS)", () => {
+    setIOS(true);
+    expect(supportsBrowser()).toBe(false);
   });
 });
 
@@ -332,6 +362,20 @@ describe("setBadgeCount", () => {
     await bridgeSetBadge(5);
     expect(androidSetBadge).toHaveBeenCalledWith(5);
     expect(electronSetBadge).not.toHaveBeenCalled();
+  });
+
+  it("forwards badge activation (tap target + text) to the Android bridge", async () => {
+    setAndroid(true);
+    const activation = { navigatePath: "/inbox", body: "2 sessions need your attention" };
+    await bridgeSetBadge(2, activation);
+    expect(androidSetBadge).toHaveBeenCalledWith(2, activation);
+  });
+
+  it("omits the activation arg when none is given (single-arg call preserved)", async () => {
+    setAndroid(true);
+    await bridgeSetBadge(3);
+    // Older shells expect the bare-count signature — no trailing undefined.
+    expect(androidSetBadge).toHaveBeenCalledWith(3);
   });
 
   it("forwards a zero count (the bridge clears the badge for <= 0)", async () => {

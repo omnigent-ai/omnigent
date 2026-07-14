@@ -57,11 +57,12 @@ def test_get_by_name_and_list_hide_session_scoped_agents(
     """Public agent lookup APIs return only template agents."""
     engine = get_or_create_engine(db_uri)
     with engine.begin() as conn:
+        # kind moved to omnigent_conversation_metadata; conversations no longer has it.
         conn.execute(
             sa.text(
                 "INSERT INTO conversations "
-                "(id, created_at, updated_at, root_conversation_id, kind) "
-                "VALUES (:id, :ts, :ts, :id, 1)",
+                "(id, created_at, updated_at, root_conversation_id) "
+                "VALUES (:id, :ts, :ts, :id)",
             ),
             {"id": "conv_agent_store_session", "ts": 1700000000},
         )

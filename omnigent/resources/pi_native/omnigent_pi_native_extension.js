@@ -820,7 +820,148 @@ async function triggerCompaction(config, ctx, customInstructions) {
   }
 }
 
-function startInboxPoller(pi, config, handleInterrupt, handleCompact) {
+/**
+ * Apply a web-picked model switch to the resident Pi process.
+ *
+ * Pi owns the active model inside this TUI process, so a model picked in the
+ * Omnigent web UI must be applied here (the ``--model`` launch arg is baked in
+ * at spawn). Resolves *modelId* against the session's ``modelRegistry`` (the
+ * same catalog Pi's own ``/model`` picker uses, sourced from the generated
+ * models.json) and calls Pi's ``setModel`` — immediate, no ``/reload``.
+ *
+ * Outcomes (mirrors triggerCompaction's visible-error contract so a web pick
+ * never silently vanishes — the runner already returned 204, so there is no
+ * server-side fallback):
+ *   - No resident context / registry: post an error item, return false.
+ *   - Model id not in the registry: post an error item, return false.
+ *   - setModel returned false (no API key for the model): post an error item,
+ *     return false.
+ *   - Applied: return true. The paired ``model_select`` handler mirrors the
+ *     resulting model back to Omnigent, so the web pill reflects the switch.
+ */
+async function applyModelChange(pi, config, ctx, modelId) {
+  const id = typeof modelId === "string" ? modelId.trim() : "";
+  if (!id) return false;
+  const registry = ctx ? ctx.modelRegistry : undefined;
+  // Resolve against whichever listing method exists. Accept EITHER getAll or
+  // getAvailable so the resolve path can never be narrower than the picker's:
+  // postModelOptions lists from getAvailable(), so gating apply on getAll alone
+  // would fail every switch on a hypothetical Pi build exposing only
+  // getAvailable. getAll (the full catalog) is a superset of getAvailable, so
+  // prefer it to resolve; fall back to getAvailable when getAll is absent.
+  const listModels =
+    registry && typeof registry.getAll === "function"
+      ? () => registry.getAll()
+      : registry && typeof registry.getAvailable === "function"
+        ? () => registry.getAvailable()
+        : null;
+  if (!pi || typeof pi.setModel !== "function" || !listModels) {
+    await postModelChangeError(
+      config,
+      `Omnigent: could not switch to model "${id}" — this Pi session exposes ` +
+        "no model-switch API (the model or Pi version may not support it).",
+    );
+    return false;
+  }
+  let model;
+  try {
+    model = listModels().find((m) => m && m.id === id);
+  } catch (_err) {
+    model = undefined;
+  }
+  if (!model) {
+    await postModelChangeError(
+      config,
+      `Omnigent: model "${id}" is not available in this Pi session.`,
+    );
+    return false;
+  }
+  try {
+    const applied = await pi.setModel(model);
+    if (applied === false) {
+      await postModelChangeError(
+        config,
+        `Omnigent: could not switch to model "${id}" — no API key is ` +
+          "configured for it.",
+      );
+      return false;
+    }
+    return true;
+  } catch (_err) {
+    await postModelChangeError(
+      config,
+      `Omnigent: switching to model "${id}" failed inside Pi.`,
+    );
+    return false;
+  }
+}
+
+async function postModelChangeError(config, message) {
+  await postEvent(config, {
+    type: "external_conversation_item",
+    data: {
+      response_id: `pi-model-change-error-${Date.now()}`,
+      item_type: "error",
+      item_data: {
+        source: "execution",
+        code: "pi_model_change_failed",
+        message,
+      },
+    },
+  });
+}
+
+/**
+ * Report Pi's live model catalog to Omnigent for the Web UI model picker.
+ *
+ * Sourced from Pi's model registry — the models Pi actually loaded for THIS
+ * session, whatever their origin: an Omnigent-configured provider's generated
+ * models.json, or Pi's own ``/login`` / ``~/.pi`` config. Posting the live
+ * registry (rather than the server reading a launch-written file) means the
+ * picker populates in every auth path, including ``/login`` where no Omnigent
+ * models.json exists.
+ *
+ * Prefers ``getAvailable()`` — only models with configured auth — over
+ * ``getAll()`` (Pi's entire built-in catalog spanning every vendor, most with
+ * no credentials). This scopes the picker to models the user can actually
+ * switch to, and naturally to whichever provider(s) they are logged into.
+ * Falls back to ``getAll()`` only when ``getAvailable()`` is unavailable
+ * (older Pi). Best-effort and fire-and-forget: an empty or unavailable
+ * registry posts nothing, leaving the picker hidden.
+ */
+async function postModelOptions(config, ctx) {
+  const registry = ctx ? ctx.modelRegistry : undefined;
+  if (!registry) return;
+  let models;
+  try {
+    if (typeof registry.getAvailable === "function") {
+      models = registry.getAvailable();
+    } else if (typeof registry.getAll === "function") {
+      models = registry.getAll();
+    } else {
+      return;
+    }
+  } catch (_err) {
+    return;
+  }
+  if (!Array.isArray(models) || models.length === 0) return;
+  const options = [];
+  const seen = new Set();
+  for (const model of models) {
+    const id = model && typeof model.id === "string" ? model.id : "";
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    const name = model && typeof model.name === "string" && model.name ? model.name : id;
+    options.push({ id, displayName: name });
+  }
+  if (options.length === 0) return;
+  await postEvent(config, {
+    type: "external_model_options",
+    data: { models: options },
+  });
+}
+
+function startInboxPoller(pi, config, handleInterrupt, handleCompact, handleModelChange) {
   if (!config || !config.inboxDir || pi.__omnigentInboxPoller) return;
   // Bound the dedup set (FIFO eviction) — delivered files are unlinked, so a
   // long-lived TUI mustn't grow it unboundedly.
@@ -937,6 +1078,16 @@ function startInboxPoller(pi, config, handleInterrupt, handleCompact) {
               : undefined,
           );
         }
+      }
+      if (payload.type === "model_change") {
+        // Point-in-time like compact/interrupt: one delivery attempt against
+        // the resident context, then always consume the file (below).
+        // handleModelChange owns its visible-error item and posts nothing on
+        // success — the paired model_select handler mirrors the applied model
+        // back — so the returned promise is intentionally discarded.
+        handleModelChange(
+          typeof payload.model === "string" ? payload.model : undefined,
+        );
       }
       if (id !== null) rememberSeen(id);
       try {
@@ -1336,15 +1487,52 @@ module.exports = function (pi) {
       () => requestInterrupt(latestContext),
       (customInstructions) =>
         triggerCompaction(config, latestContext, customInstructions),
+      (model) => applyModelChange(pi, config, latestContext, model),
     );
     const nativeSessionId =
       ctx && ctx.sessionManager && ctx.sessionManager.getSessionId
         ? ctx.sessionManager.getSessionId()
         : undefined;
     await patchExternalSessionId(config, nativeSessionId);
+    // Publish Pi's live model catalog so the Web UI picker populates from what
+    // Pi actually loaded, independent of how it authenticated.
+    await postModelOptions(config, ctx);
+    // Report the model Pi launched with so the composer pill and the picker's
+    // active row reflect the current model from the start. Without this, a
+    // ``/login`` session (no Omnigent ``model_override``, no ``llm_model``)
+    // shows no active model until the user switches. Mirrors the
+    // ``model_select`` handler, but for the startup value ``ctx.model``.
+    const startupModelId =
+      ctx && ctx.model && typeof ctx.model.id === "string" ? ctx.model.id : "";
+    if (startupModelId) {
+      await postEvent(config, {
+        type: "external_model_change",
+        data: { model: startupModelId },
+      });
+    }
     await postEvent(config, {
       type: "external_session_status",
       data: { status: "idle", response_id: `pi-${Date.now()}-${++sequence}` },
+    });
+  });
+
+  pi.on("model_select", async (event, ctx) => {
+    rememberContext(ctx);
+    // Mirror a model switch made inside the Pi TUI (the ``/model`` command or
+    // Ctrl+P cycling) back to Omnigent so the web picker reflects it. Skip
+    // ``restore`` — that is Pi re-applying the session's saved model at
+    // startup, not a user switch, and posting it could clobber a pending
+    // web-side override. The server dedups against ``model_override``, so a
+    // web-initiated switch (which already persisted the value before queuing
+    // the inbox ``model_change``) round-trips here as a no-op.
+    const source = event && typeof event.source === "string" ? event.source : "";
+    if (source === "restore") return;
+    const model = event && event.model ? event.model : undefined;
+    const modelId = model && typeof model.id === "string" ? model.id : "";
+    if (!modelId) return;
+    await postEvent(config, {
+      type: "external_model_change",
+      data: { model: modelId },
     });
   });
 

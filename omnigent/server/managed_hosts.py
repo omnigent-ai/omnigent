@@ -60,6 +60,7 @@ stores into ``create_app``):
            vcpus: 2
            memory_mb: 4096
            disk_gb: 20
+          idle_pause_after_s: 900           # optional; null disables idle pause
          openshell:               # optional block (provider: openshell)
            image: docker.io/me/omnigent-host:latest  # default: official image
            env: [OPENAI_API_KEY, GIT_TOKEN]  # SERVER env var NAMES injected
@@ -676,6 +677,7 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
             vcpus=_parse_provider_positive_int(raw, "islo", "vcpus"),
             memory_mb=_parse_provider_positive_int(raw, "islo", "memory_mb"),
             disk_gb=_parse_provider_positive_int(raw, "islo", "disk_gb"),
+            idle_pause_after_s=_parse_islo_idle_pause_after_s(raw),
         )
         token_ttl_s = ISLO_MANAGED_TOKEN_TTL_S
     elif provider == "e2b":
@@ -1249,6 +1251,29 @@ def _parse_e2b_template(raw: dict[str, object]) -> str | None:
     return template.strip()
 
 
+def _parse_islo_idle_pause_after_s(raw: dict[str, object]) -> int | None:
+    """
+    Extract Islo's managed idle-pause policy.
+
+    Omitted keeps the Islo launcher's default. Explicit YAML ``null``
+    disables provider-managed idle pause for operators who want manual
+    lifecycle control.
+    """
+    from omnigent.onboarding.sandboxes.islo import DEFAULT_IDLE_PAUSE_AFTER_S
+
+    section = _parse_provider_section(raw, "islo")
+    if section is None or "idle_pause_after_s" not in section:
+        return DEFAULT_IDLE_PAUSE_AFTER_S
+    value = section["idle_pause_after_s"]
+    if value is None:
+        return None
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ValueError(
+            "server config 'sandbox.islo.idle_pause_after_s' must be a positive integer or null"
+        )
+    return value
+
+
 def _islo_launcher_factory(
     *,
     image: str | None,
@@ -1260,6 +1285,7 @@ def _islo_launcher_factory(
     vcpus: int | None,
     memory_mb: int | None,
     disk_gb: int | None,
+    idle_pause_after_s: int | None,
 ) -> Callable[[], SandboxLauncher]:
     """
     Build the launcher factory for the YAML ``provider: islo`` path.
@@ -1279,6 +1305,8 @@ def _islo_launcher_factory(
     :param vcpus: Optional vCPU count.
     :param memory_mb: Optional memory allocation in MiB.
     :param disk_gb: Optional disk allocation in GiB.
+    :param idle_pause_after_s: Idle seconds before Islo pauses the sandbox,
+        or ``None`` to disable provider-managed idle pause.
     :returns: A factory producing parameterized Islo launchers.
     """
 
@@ -1296,6 +1324,7 @@ def _islo_launcher_factory(
             vcpus=vcpus,
             memory_mb=memory_mb,
             disk_gb=disk_gb,
+            idle_pause_after_s=idle_pause_after_s,
         )
 
     return _build
@@ -2021,6 +2050,23 @@ def host_resume_supported(
     return launcher is not None and launcher.can_resume and host.sandbox_id is not None
 
 
+def host_sandbox_is_running(
+    host: Host,
+    config: ManagedSandboxConfig | None,
+) -> bool | None:
+    """
+    Ask the matched provider whether this managed host's sandbox is running.
+
+    ``None`` means the provider has no cheap status hook or the deployment no
+    longer matches the host's provider. Callers should treat that as unknown
+    and fall back to Omnigent liveness checks.
+    """
+    launcher = _launcher_for_teardown(host, config)
+    if launcher is None or host.sandbox_id is None:
+        return None
+    return launcher.is_running(host.sandbox_id)
+
+
 # ── Managed-host wake (resume a dormant host on demand) ─────────────────────
 
 # Per-host resume single-flight: one in-flight resume per host_id on this
@@ -2034,6 +2080,8 @@ async def resume_managed_host(
     host_id: str,
     host_store: HostStore,
     config: ManagedSandboxConfig | None,
+    *,
+    force: bool = False,
 ) -> None:
     """
     Wake a dormant managed host so a session bound to it can run again.
@@ -2048,9 +2096,11 @@ async def resume_managed_host(
 
     No-op when the host is already online, is unknown, or its provider cannot
     resume (e.g. Modal — the caller falls through to its normal host-offline
-    behavior, i.e. the user starts a new session). Single-flight and
-    idempotent: concurrent callers serialize on a per-host lock and re-check
-    liveness under it, so only the first wakes the host.
+    behavior, i.e. the user starts a new session). ``force=True`` is reserved
+    for the route path that has already proven this server process has no live
+    host tunnel even though the cross-replica DB row is still fresh.
+    Single-flight and idempotent: concurrent callers serialize on a per-host
+    lock and re-check liveness under it, so only the first wakes the host.
 
     Unlike a launch, a failed wake does NOT tear the sandbox down — the volume
     + workspace are the user's and must survive for a retry.
@@ -2059,13 +2109,15 @@ async def resume_managed_host(
     :param host_store: Persistent host registrations (cross-replica liveness).
     :param config: The deployment's managed-sandbox config, or ``None`` when
         the ``sandbox:`` section has been removed since launch.
+    :param force: Skip the DB-liveness no-op gate when the caller has local
+        evidence that the tunnel is gone.
     :raises HTTPException: 502 when the resume or host restart fails.
     """
     if config is None:
         return
     # Cross-replica DB liveness (freshness-gated): never trust the per-replica
     # registry alone. Cheap gate before taking the lock.
-    if await asyncio.to_thread(host_store.is_online, host_id):
+    if not force and await asyncio.to_thread(host_store.is_online, host_id):
         return
     host = await asyncio.to_thread(host_store.get_host, host_id)
     if host is None:
@@ -2082,7 +2134,7 @@ async def resume_managed_host(
     async with resume_lock:
         # Re-check under the lock: a concurrent waker may have brought the host
         # online while we waited.
-        if await asyncio.to_thread(host_store.is_online, host_id):
+        if not force and await asyncio.to_thread(host_store.is_online, host_id):
             return
         _logger.info(
             "Waking dormant managed host %s (sandbox %s, provider %s)",

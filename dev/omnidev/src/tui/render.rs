@@ -26,6 +26,7 @@ const SERVER: Color = Color::Rgb(38, 139, 210); // blue
 const HOST: Color = Color::Rgb(42, 161, 152); // cyan
 const VITE: Color = Color::Rgb(211, 54, 130); // magenta
 const EVENT: Color = Color::Rgb(181, 137, 0); // amber (omnidev channel)
+const LABEL_WIDTH: usize = 7;
 
 const OK: Color = Color::Rgb(133, 153, 0); // green (running)
 const WARN: Color = Color::Rgb(203, 75, 22); // orange (starting/restarting)
@@ -195,7 +196,7 @@ fn render_line(raw: &str, all_view: bool) -> Line<'static> {
                 let label = &rest[..end];
                 let body = &rest[end + 1..];
                 let mut spans = vec![Span::styled(
-                    format!("[{label}]"),
+                    format!("[{label:<LABEL_WIDTH$}]"),
                     Style::default()
                         .fg(label_color(label))
                         .add_modifier(Modifier::BOLD),

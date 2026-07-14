@@ -1980,6 +1980,80 @@ def test_evaluate_policy_reauths_on_expired_token_instead_of_failing_closed(
     assert "re-minted token and retrying" in captured.err
 
 
+def test_evaluate_policy_reauths_on_403_invalid_token(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    A 403 "Invalid Token" self-heals: re-mints the bearer and the tool is allowed.
+
+    Databricks Apps returns 403 (not 401) for an expired bearer. End-to-end
+    regression guard for the fix that added 403 to the re-auth signal set.
+    The first attempt carries the stale token (403), the retry carries the
+    fresh token and gets the ALLOW verdict.
+    """
+    attempts: list[dict[str, str]] = []
+
+    class _ForbiddenThenOkClient:
+        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+            del timeout
+            self._headers = headers
+
+        def __enter__(self) -> _ForbiddenThenOkClient:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, *, json: object = None) -> httpx.Response:
+            del json
+            attempts.append(dict(self._headers))
+            req = httpx.Request("POST", url)
+            if len(attempts) == 1:
+                return httpx.Response(403, text="Invalid Token", request=req)
+            return httpx.Response(200, text='{"result":"POLICY_ACTION_ALLOW"}', request=req)
+
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _ForbiddenThenOkClient)
+    monkeypatch.setattr(
+        "omnigent.runner._entry._make_auth_token_factory",
+        lambda server_url=None: lambda: "fresh-token",
+    )
+    bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_shared", workspace=tmp_path)
+    write_active_session_id(bridge_dir, "conv_active")
+    build_hook_settings(
+        bridge_dir,
+        ap_server_url="https://omnigents.example.databricksapps.com",
+        ap_auth_headers={"Authorization": "Bearer stale-token", "X-Databricks-Org-Id": "o1"},
+    )
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        io.StringIO(
+            json.dumps(
+                {
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "Bash",
+                    "tool_input": {"command": "ls"},
+                }
+            )
+        ),
+    )
+
+    exit_code = claude_native_hook.main(["evaluate-policy", "--bridge-dir", str(bridge_dir)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert len(attempts) == 2
+    assert attempts[0]["Authorization"] == "Bearer stale-token"
+    assert attempts[1]["Authorization"] == "Bearer fresh-token"
+    assert attempts[1]["X-Databricks-Org-Id"] == "o1"
+    assert captured.out == ""
+    assert "re-minted token and retrying" in captured.err
+
+
 def test_evaluate_policy_fails_closed_when_reauth_unavailable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

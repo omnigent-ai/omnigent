@@ -292,6 +292,140 @@ async def test_session_error_message_aborted_takes_idle_path() -> None:
     assert "output" not in status
 
 
+def _status_edges(posts: list[tuple[str, dict[str, Any]]]) -> list[dict[str, Any]]:
+    return [b["data"] for _u, b in posts if b["type"] == "external_session_status"]
+
+
+async def test_running_and_idle_carry_assistant_response_id() -> None:
+    """running/idle edges carry the turn's assistant messageID as ``response_id``.
+
+    The web chat renders in-flight tool calls live only when the ``running`` edge
+    and the mirrored ``function_call`` items share the SAME ``response_id``. Here
+    the tool call and both status edges must all group under ``msg_1``.
+    """
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_event("message.updated", info={"id": "msg_1", "role": "assistant"}))
+    await fwd.handle_event(
+        _event(
+            "message.part.updated",
+            part={
+                "id": "prt_t",
+                "messageID": "msg_1",
+                "type": "tool",
+                "callID": "call_1",
+                "tool": "bash",
+                "state": {"status": "completed", "input": {"command": "ls"}, "output": "ok"},
+            },
+        )
+    )
+    await fwd.handle_event(_event("session.idle"))
+
+    edges = _status_edges(server.posts)
+    assert [(e["status"], e["response_id"]) for e in edges] == [
+        ("running", "msg_1"),
+        ("idle", "msg_1"),
+    ]
+    call = next(b for _u, b in server.posts if b["data"].get("item_type") == "function_call")
+    # The live-card contract: same id on the running edge and the tool call.
+    assert call["data"]["response_id"] == edges[0]["response_id"]
+
+
+async def test_running_edge_fires_once_per_turn() -> None:
+    """A turn's many parts still produce exactly one ``running`` edge."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_event("message.updated", info={"id": "msg_1", "role": "assistant"}))
+    for part in (
+        {"id": "s", "messageID": "msg_1", "type": "step-start"},
+        {"id": "prt_x", "messageID": "msg_1", "type": "text", "text": "hi"},
+        {
+            "id": "prt_t",
+            "messageID": "msg_1",
+            "type": "tool",
+            "callID": "c1",
+            "tool": "bash",
+            "state": {"status": "running", "input": {"command": "ls"}},
+        },
+    ):
+        await fwd.handle_event(_event("message.part.updated", part=part))
+    running = [e for e in _status_edges(server.posts) if e["status"] == "running"]
+    assert len(running) == 1
+    assert running[0]["response_id"] == "msg_1"
+
+
+async def test_running_edge_deferred_until_message_id_known() -> None:
+    """A bare ``session.status`` busy before ``message.updated`` still yields the id.
+
+    opencode can open a turn with ``session.status`` busy (no messageID) before
+    the assistant ``message.updated`` arrives. The ``running`` edge must defer
+    until the id is known and carry ``msg_1`` — not an id-less/session-id edge
+    that would never match the tool-call items — and still fire exactly once.
+    """
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_event("session.status", status={"type": "busy"}))
+    # No running edge yet: the id is unknown.
+    assert _status_edges(server.posts) == []
+    await fwd.handle_event(_event("message.updated", info={"id": "msg_1", "role": "assistant"}))
+    running = [e for e in _status_edges(server.posts) if e["status"] == "running"]
+    assert len(running) == 1
+    assert running[0]["response_id"] == "msg_1"
+
+
+async def test_second_turn_gets_its_own_running_response_id() -> None:
+    """Each turn's running/idle edges carry that turn's own assistant id."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    for msg in ("msg_a", "msg_b"):
+        await fwd.handle_event(_event("message.updated", info={"id": msg, "role": "assistant"}))
+        await fwd.handle_event(_event("session.idle"))
+    edges = _status_edges(server.posts)
+    assert [(e["status"], e["response_id"]) for e in edges] == [
+        ("running", "msg_a"),
+        ("idle", "msg_a"),
+        ("running", "msg_b"),
+        ("idle", "msg_b"),
+    ]
+
+
+async def test_multi_assistant_message_turn_retires_with_the_live_id() -> None:
+    """Two assistant messages in ONE turn: idle carries the id that went live.
+
+    If opencode emits more than one assistant ``message.updated`` before
+    ``session.idle`` (no idle between them), the ``running`` edge locks to the
+    first id (``msg_1``) while ``_active_message_id`` advances to ``msg_2``. The
+    terminal ``idle`` edge must still carry ``msg_1`` — the id the running edge
+    used — so the web retires the tool cards that were actually rendered live.
+    """
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_event("message.updated", info={"id": "msg_1", "role": "assistant"}))
+    await fwd.handle_event(_event("message.updated", info={"id": "msg_2", "role": "assistant"}))
+    await fwd.handle_event(_event("session.idle"))
+    edges = _status_edges(server.posts)
+    assert [(e["status"], e["response_id"]) for e in edges] == [
+        ("running", "msg_1"),
+        ("idle", "msg_1"),
+    ]
+
+
+async def test_turn_without_assistant_message_idles_with_session_fallback() -> None:
+    """A turn that opens (busy) and idles with no assistant ``message.updated``.
+
+    No ``running`` edge fires (there was never an id to carry) and the terminal
+    ``idle`` edge falls back to the session id. Benign — there are no live tool
+    cards to retire — but the fallback id is deliberate, not a mismatch bug.
+    """
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_event("session.status", status={"type": "busy"}))
+    await fwd.handle_event(_event("session.idle"))
+    edges = _status_edges(server.posts)
+    assert [e["status"] for e in edges] == ["idle"]
+    assert edges[0]["response_id"] == _SESSION
+
+
 async def test_permission_asked_rejects_when_no_policy_wired() -> None:
     """Absent a policy evaluator the forwarder FAILS CLOSED (no auto-approve).
 

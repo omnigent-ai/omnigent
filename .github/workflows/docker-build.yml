@@ -1,0 +1,81 @@
+# Build-only Docker check for PRs. Compensates for retiring per-commit main
+# publishes (oss-publish-images.yml now builds on tags + nightly only): a broken
+# Dockerfile / lockfile / frontend build would otherwise not surface until the
+# nightly rebuild or a release. Builds the server image single-arch (linux/amd64)
+# with the GHA layer cache and runs a `omnigent --help` CLI smoke. It never pushes.
+#
+# Scope: the server target exercises the shared builder stage (Python deps +
+# web SPA build) that all four published variants inherit, so it catches the
+# common breakage without paying for the host/openshell/kubernetes variants or
+# the emulated arm64 leg.
+#
+# Blocking merge-gate check: "Docker build" is in the REQUIRED list in
+# .github/scripts/merge-ready/required.sh. Because of the paths filter below it
+# can legitimately be absent (a PR touching nothing in the image), so it is also
+# in ALLOW_SKIP with a workflow_for() arm, and this workflow's name is in
+# merge-ready.yml's workflow_run list so the gate re-evaluates when it completes.
+name: Docker build
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    # Only build when something that lands in the image changes. Mirrors the
+    # publish workflow's former push paths (web/** IS included here — the image
+    # bakes the SPA, so a web-only PR can still break the build).
+    paths:
+      - 'deploy/docker/Dockerfile'
+      - 'deploy/docker/entrypoint.py'
+      - 'omnigent/**'
+      - 'web/**'
+      - 'sdks/**'
+      - 'pyproject.toml'
+      - 'setup.py'
+      - 'uv.lock'
+      - 'web/package-lock.json'
+      - '.github/workflows/docker-build.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-build-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  # Security precondition gate (security-gate.yml): untrusted PRs wait for the
+  # scan before the build runs on their code; trusted authors pass through.
+  gate:
+    uses: ./.github/workflows/security-gate.yml
+
+  build:
+    name: Docker build
+    needs: gate
+    # Draft PRs skip the build (ready_for_review re-fires the workflow), matching
+    # the pytest job in ci.yml.
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4.1.0
+
+      # Single-arch (amd64) build, no push. load: true imports the result into
+      # the runner's Docker so the smoke step below can run it. Shares the same
+      # type=gha cache the publish workflow writes, so warm PRs reuse layers.
+      - name: Build server image (amd64, no push)
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          push: false
+          load: true
+          tags: omnigent-server:pr-${{ github.event.pull_request.number || github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
+      - name: CLI smoke
+        run: docker run --rm omnigent-server:pr-${{ github.event.pull_request.number || github.sha }} omnigent --help

@@ -51,6 +51,7 @@ describe("themePalette", () => {
   it("guards known vs unknown palette ids", () => {
     expect(isThemePalette("github")).toBe(true);
     expect(isThemePalette("omni")).toBe(true);
+    expect(isThemePalette("nord")).toBe(true);
     expect(isThemePalette("nope")).toBe(false);
     expect(isThemePalette(undefined)).toBe(false);
     expect(isThemePalette(42)).toBe(false);

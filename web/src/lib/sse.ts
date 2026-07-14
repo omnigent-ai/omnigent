@@ -9,6 +9,7 @@
 // catch — please add an SSE-parser test when you touch this.
 
 import type {
+  BrowserActionRequestEvent,
   ClientTaskCancel,
   CompactionCompleted,
   CompactionFailed,
@@ -52,6 +53,8 @@ import type {
   SessionAgentChangedEvent,
   SessionTodosEvent,
   SessionSandboxStatusEvent,
+  McpServerStartup,
+  SessionMcpStartupEvent,
   SessionTerminalPendingEvent,
   SessionUsageEvent,
   SlashCommand,
@@ -599,6 +602,37 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       error: typeof data.error === "string" ? data.error : null,
     } satisfies SessionSandboxStatusEvent;
   }
+  if (eventType === "session.mcp_startup") {
+    const conversationId = data.conversation_id;
+    if (typeof conversationId !== "string" || !conversationId) return null;
+    const rawServers = data.servers;
+    if (!rawServers || typeof rawServers !== "object" || Array.isArray(rawServers)) return null;
+    // Skip malformed entries rather than dropping the frame — a partial
+    // map still updates the startup band; unknown statuses are ignored.
+    const servers: Record<string, McpServerStartup> = {};
+    for (const [name, record] of Object.entries(rawServers as Record<string, unknown>)) {
+      if (!name || !record || typeof record !== "object" || Array.isArray(record)) continue;
+      const status = (record as Record<string, unknown>).status;
+      if (
+        status !== "starting" &&
+        status !== "ready" &&
+        status !== "failed" &&
+        status !== "cancelled"
+      ) {
+        continue;
+      }
+      const error = (record as Record<string, unknown>).error;
+      servers[name] = {
+        status,
+        error: typeof error === "string" && error ? error : null,
+      };
+    }
+    return {
+      type: "session_mcp_startup",
+      conversationId,
+      servers,
+    } satisfies SessionMcpStartupEvent;
+  }
   if (eventType === "session.input.consumed") {
     // Nested envelope: `{type, data: {item_id, type, data}}`.
     const inner = data.data;
@@ -756,6 +790,25 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       conversationId,
       viewers,
     } satisfies SessionPresenceEvent;
+  }
+
+  // Embedded-browser action request: asks the desktop relay to run the agent's
+  // browser_* action against the view. Ignored by non-Electron renderers.
+  if (eventType === "browser.action_request") {
+    const actionId = data.action_id;
+    const action = data.action;
+    if (typeof actionId !== "string" || !actionId) return null;
+    if (typeof action !== "string" || !action) return null;
+    const rawArgs = data.args;
+    return {
+      type: "browser_action_request",
+      actionId,
+      action,
+      args:
+        rawArgs && typeof rawArgs === "object" && !Array.isArray(rawArgs)
+          ? (rawArgs as Record<string, unknown>)
+          : {},
+    } satisfies BrowserActionRequestEvent;
   }
 
   // MCP-shape elicitation request.

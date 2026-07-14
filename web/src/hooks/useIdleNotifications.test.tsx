@@ -501,7 +501,7 @@ describe("useIdleNotifications badge (native shell)", () => {
     setConversations([unseenConv("a")]);
     renderHook(() => useIdleNotifications());
 
-    expect(setBadgeMock).toHaveBeenCalledWith(1);
+    expect(setBadgeMock).toHaveBeenCalledWith(1, expect.objectContaining({ navigatePath: "/c/a" }));
   });
 
   it("sends 0 on the first computation when nothing is unread", () => {
@@ -524,7 +524,7 @@ describe("useIdleNotifications badge (native shell)", () => {
     setConversations([unseenConv("a")]);
     rerender();
     // First resolved fetch computes and sends the real count.
-    expect(setBadgeMock).toHaveBeenCalledWith(1);
+    expect(setBadgeMock).toHaveBeenCalledWith(1, expect.objectContaining({ navigatePath: "/c/a" }));
   });
 
   it("counts sessions awaiting input (pending elicitations)", () => {
@@ -533,7 +533,7 @@ describe("useIdleNotifications badge (native shell)", () => {
     setConversations([conv("a", "running", 1)]);
     renderHook(() => useIdleNotifications());
 
-    expect(setBadgeMock).toHaveBeenCalledWith(1);
+    expect(setBadgeMock).toHaveBeenCalledWith(1, expect.objectContaining({ navigatePath: "/c/a" }));
   });
 
   it("updates the badge when a watched session's turn ends", () => {
@@ -547,13 +547,16 @@ describe("useIdleNotifications badge (native shell)", () => {
     setConversations([{ ...conv("a", "idle"), updated_at: 100 }]);
     rerender();
     // The turn ended -> the session is now unseen -> badge 1.
-    expect(setBadgeMock).toHaveBeenLastCalledWith(1);
+    expect(setBadgeMock).toHaveBeenLastCalledWith(
+      1,
+      expect.objectContaining({ navigatePath: "/c/a" }),
+    );
   });
 
   it("does not resend an unchanged count", () => {
     setConversations([unseenConv("a")]);
     const { rerender } = renderHook(() => useIdleNotifications());
-    expect(setBadgeMock).toHaveBeenCalledWith(1);
+    expect(setBadgeMock).toHaveBeenCalledWith(1, expect.objectContaining({ navigatePath: "/c/a" }));
     setBadgeMock.mockClear();
 
     // Same unread state on the next tick (fresh data object, same content)
@@ -566,7 +569,10 @@ describe("useIdleNotifications badge (native shell)", () => {
   it("clears a session from the badge once it's marked seen", () => {
     setConversations([unseenConv("a")]);
     const { rerender } = renderHook(() => useIdleNotifications());
-    expect(setBadgeMock).toHaveBeenLastCalledWith(1);
+    expect(setBadgeMock).toHaveBeenLastCalledWith(
+      1,
+      expect.objectContaining({ navigatePath: "/c/a" }),
+    );
 
     // The user viewed the session (ChatPage's useMarkConversationSeen
     // advances the baseline past updated_at); the next data tick must drop
@@ -592,7 +598,7 @@ describe("useIdleNotifications badge (native shell)", () => {
     renderHook(() => useIdleNotifications("a"));
 
     // Viewing 'a' but blurred -> the user isn't looking, so it counts.
-    expect(setBadgeMock).toHaveBeenCalledWith(1);
+    expect(setBadgeMock).toHaveBeenCalledWith(1, expect.objectContaining({ navigatePath: "/c/a" }));
   });
 
   it("clears the badge when the window regains focus on the open conversation", () => {
@@ -600,7 +606,10 @@ describe("useIdleNotifications badge (native shell)", () => {
     setConversations([unseenConv("a")]);
     renderHook(() => useIdleNotifications("a"));
     // Precondition: 'a' is unread (badge 1).
-    expect(setBadgeMock).toHaveBeenLastCalledWith(1);
+    expect(setBadgeMock).toHaveBeenLastCalledWith(
+      1,
+      expect.objectContaining({ navigatePath: "/c/a" }),
+    );
     setBadgeMock.mockClear();
 
     // User refocuses the window while 'a' is the active conversation.
@@ -617,8 +626,11 @@ describe("useIdleNotifications badge (native shell)", () => {
     setWindowFocused(false);
     setConversations([unseenConv("a"), unseenConv("b")]);
     renderHook(() => useIdleNotifications("a"));
-    // Both unread -> badge 2.
-    expect(setBadgeMock).toHaveBeenLastCalledWith(2);
+    // Both unread (finished, none awaiting) -> badge 2, routed to the list.
+    expect(setBadgeMock).toHaveBeenLastCalledWith(
+      2,
+      expect.objectContaining({ navigatePath: "/?sidebar=open" }),
+    );
     setBadgeMock.mockClear();
 
     setWindowFocused(true);
@@ -627,7 +639,45 @@ describe("useIdleNotifications badge (native shell)", () => {
     });
 
     // Focusing on 'a' suppresses only 'a'; 'b' remains unread -> badge 1.
-    expect(setBadgeMock).toHaveBeenCalledWith(1);
+    expect(setBadgeMock).toHaveBeenCalledWith(1, expect.objectContaining({ navigatePath: "/c/b" }));
+  });
+
+  it("makes the single-session badge actionable + descriptive", () => {
+    // The one waiting session becomes a tap-to-open, labelled notification —
+    // not a dead "1 pending" toast.
+    setConversations([unseenConv("a")]);
+    renderHook(() => useIdleNotifications());
+
+    // Title stays unset (shell -> app name) so it doesn't clone the per-session
+    // toast; the body names the session.
+    expect(setBadgeMock).toHaveBeenCalledWith(1, {
+      navigatePath: "/c/a",
+      body: "a needs your attention",
+    });
+  });
+
+  it("routes a multi-session badge to the session list when none await input", () => {
+    // Both merely finished (unseen activity, no pending prompt) -> the inbox
+    // would read "Nothing waiting on you", so route to the session list;
+    // ?sidebar=open makes phone-width shells actually show it.
+    setConversations([unseenConv("a"), unseenConv("b")]);
+    renderHook(() => useIdleNotifications());
+
+    expect(setBadgeMock).toHaveBeenCalledWith(2, {
+      navigatePath: "/?sidebar=open",
+      body: "2 sessions need your attention",
+    });
+  });
+
+  it("routes a multi-session badge to the inbox when a session awaits input", () => {
+    // 'a' has a pending prompt, so /inbox will actually list something.
+    setConversations([conv("a", "running", 1), unseenConv("b")]);
+    renderHook(() => useIdleNotifications());
+
+    expect(setBadgeMock).toHaveBeenCalledWith(2, {
+      navigatePath: "/inbox",
+      body: "2 sessions need your attention",
+    });
   });
 });
 

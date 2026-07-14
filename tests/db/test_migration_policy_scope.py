@@ -55,11 +55,9 @@ def test_backfill_sets_session_scope_for_session_policies(db_engine: Engine) -> 
     with db_engine.begin() as conn:
         conn.execute(
             sa.text(
-                # kind/type run at head, where they are int codes
-                # (1 = "default"/"python" per enum_codecs).
                 "INSERT INTO conversations"
-                " (id, created_at, updated_at, root_conversation_id, kind)"
-                " VALUES ('conv_sc1', 1, 1, 'conv_sc1', 1)"
+                " (id, created_at, updated_at, root_conversation_id)"
+                " VALUES ('conv_sc1', 1, 1, 'conv_sc1')"
             )
         )
         conn.execute(

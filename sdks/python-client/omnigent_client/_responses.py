@@ -21,6 +21,8 @@ import httpx
 from ._errors import ToolCallDenied, raise_for_status, require_json_object, response_body
 from ._events import (
     ClientTaskCancel,
+    CompactionCompleted,
+    CompactionFailed,
     CompactionInProgress,
     ElicitationRequest,
     ErrorEvent,
@@ -43,6 +45,7 @@ from ._events import (
 )
 from ._sse import parse_sse_stream
 from ._tool_handler import (
+    CompactionEndCtx,
     CompactionStartCtx,
     ElicitationRequestCtx,
     FileOutputCtx,
@@ -275,6 +278,31 @@ class ResponsesNamespace:
 
                     elif isinstance(event, CompactionInProgress):
                         await _call_hook(hooks.on_compaction_start, CompactionStartCtx())
+
+                    elif isinstance(event, CompactionCompleted):
+                        item: dict[str, object] = {
+                            "type": "response.compaction.completed",
+                            "status": "completed",
+                            "total_tokens": event.total_tokens,
+                        }
+                        if event.summary is not None:
+                            item["summary"] = event.summary
+                        if event.summary_model is not None:
+                            item["summary_model"] = event.summary_model
+                        if event.compacted_messages is not None:
+                            item["compacted_messages"] = event.compacted_messages
+                        await _call_hook(hooks.on_compaction_end, CompactionEndCtx(item=item))
+
+                    elif isinstance(event, CompactionFailed):
+                        await _call_hook(
+                            hooks.on_compaction_end,
+                            CompactionEndCtx(
+                                item={
+                                    "type": "response.compaction.failed",
+                                    "status": "failed",
+                                },
+                            ),
+                        )
 
                     elif isinstance(event, ToolCall):
                         is_client_side = (
@@ -899,9 +927,8 @@ async def _post_elicitation_result(
 
     :param http: Shared HTTPX client.
     :param base_url: Server base URL.
-    :param session_id: Session/conversation id that emitted the
-        elicitation. The resolve URL is scoped to this session so
-        the server can apply normal session authorization.
+    :param session_id: Session/conversation id that owns the
+        elicitation's resolve endpoint.
     :param elicitation_id: Server-assigned elicitation id.
     :param accepted: Hook verdict — ``True`` → ``"accept"``,
         ``False`` → ``"decline"``.
@@ -959,8 +986,8 @@ async def _handle_elicitation_request(
     :param response_id: Root response id (the parked workflow);
         carried into the ctx for the hook's audit/logging only.
     :param session_id: Session/conversation id that emitted the
-        elicitation. The verdict is posted back as a session
-        ``approval`` event.
+        elicitation. Mirrored child prompts override this with the
+        event's ``target_session_id`` when posting the verdict.
     """
     ctx = ElicitationRequestCtx(
         elicitation_id=event.elicitation_id,
@@ -972,6 +999,14 @@ async def _handle_elicitation_request(
         content_preview=event.content_preview,
         response_id=response_id,
         url=event.url,
+        target_session_id=event.target_session_id,
     )
     accepted = await _invoke_elicitation_hook(hooks, ctx)
-    await _post_elicitation_result(http, base_url, session_id, event.elicitation_id, accepted)
+    target_session_id = event.target_session_id or session_id
+    await _post_elicitation_result(
+        http,
+        base_url,
+        target_session_id,
+        event.elicitation_id,
+        accepted,
+    )

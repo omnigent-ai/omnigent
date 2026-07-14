@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     # Type-only import: the runner keeps codex deps out of its runtime import
     # graph (they are imported lazily inside the codex-native helpers).
+    from omnigent.claude_native import ClaudeNativeUcodeConfig
     from omnigent.codex_native_app_server import CodexAppServerClient
     from omnigent.terminals.registry import TerminalListEntry
 
@@ -1160,7 +1161,15 @@ async def _auto_create_opencode_terminal(
         _policy_factory = _make_auth_token_factory()
         _policy_token = _policy_factory() if _policy_factory is not None else None
         if _policy_token:
-            policy_env["OMNIGENT_POLICY_AUTH"] = f"Bearer {_policy_token}"
+            from omnigent.cli_auth import databricks_request_headers
+
+            # Bake the FULL routing header map (bearer + workspace / deployment
+            # selectors), not a bare bearer: the plugin POSTs /policies/evaluate
+            # to the omnigent server out-of-process, so without the selectors it
+            # could land on a different server instance than the runner's.
+            policy_env["OMNIGENT_POLICY_HEADERS"] = json.dumps(
+                databricks_request_headers(runner_server_url, bearer_token=_policy_token)
+            )
 
     # Merge the user's global provider definitions (e.g. OpenAI-compatible
     # endpoints with custom base URLs) into the synthesized config so the
@@ -1698,6 +1707,7 @@ def _build_pi_native_args(
     extension_path: Path,
     session_dir: Path,
     external_session_id: str | None,
+    approve: bool = False,
 ) -> list[str]:
     """
     Build Pi CLI args for a runner-owned native TUI session.
@@ -1706,10 +1716,18 @@ def _build_pi_native_args(
     :param extension_path: Generated Omnigent Pi extension path.
     :param session_dir: Per-Omnigent-session Pi session directory.
     :param external_session_id: Captured Pi session id, if any.
+    :param approve: When ``True``, pass ``--approve`` to pre-accept Pi's
+        project-folder trust dialog (supported from Pi 0.79+).
     :returns: Complete Pi arg vector excluding the executable.
     """
     user_args = list(terminal_launch_args or [])
     args = ["--extension", str(extension_path)]
+    if approve:
+        # Pre-accept the project-folder trust dialog. Pi 0.79+ shows a
+        # blocking TUI prompt on first launch in a directory with .pi/
+        # resources. In a web-UI-driven session there is nobody at the
+        # terminal to answer it — mirroring ensure_claude_workspace_trusted.
+        args.append("--approve")
     if not _pi_args_have_session_control(user_args):
         args.extend(["--session-dir", str(session_dir)])
         if external_session_id:
@@ -1910,7 +1928,15 @@ async def _auto_create_pi_terminal(
     session_dir = pi_session_dir(bridge_dir)
     auth_factory = _make_auth_token_factory()
     auth_token = auth_factory() if auth_factory is not None else None
-    auth_headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
+    # Route the extension's out-of-process POSTs (/events, /mcp,
+    # /policies/evaluate) through the shared header builder so they carry the
+    # workspace / deployment routing selectors, not just a bare bearer. A bare
+    # bearer skips those selectors and can land on a different server instance
+    # than the one the runner (and the web UI) are on, so live-streamed items
+    # never reach the browser's in-process event stream (they only appear on reload).
+    from omnigent.cli_auth import databricks_request_headers
+
+    auth_headers = databricks_request_headers(launch_config.server_url, bearer_token=auth_token)
     # Build the Omnigent tool surface (sys_* tools) the Pi extension registers
     # via pi.registerTool. Reuses the same schema set the claude-native /
     # codex-native relay advertises, gated by the session's spec. Each tool's
@@ -1951,11 +1977,14 @@ async def _auto_create_pi_terminal(
         workspace=launch_config.workspace,
         server_client=server_client,
     )
+    from omnigent.pi_native import pi_supports_approve
+
     pi_args = _build_pi_native_args(
         terminal_launch_args=launch_config.terminal_launch_args,
         extension_path=pi_extension,
         session_dir=session_dir,
         external_session_id=resume_session_id,
+        approve=pi_supports_approve(pi_command),
     )
     pi_env = {
         PI_NATIVE_CONFIG_ENV_VAR: str(config),
@@ -4796,6 +4825,30 @@ def _codex_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) -
     return model if isinstance(model, str) and model else None
 
 
+def _claude_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) -> str | None:
+    """
+    Read the Claude Code model id to launch the native TUI with, from a spec.
+
+    Reads the canonical ``spec.executor.model`` field (the same field the
+    in-process claude-sdk harness consumes via ``_resolve_spec_model``). Unlike
+    cursor-native, gateway-routed ``databricks-*`` ids are valid Claude Code
+    models when the launch is wired through the Databricks AI gateway, so they
+    are passed through.
+
+    :param agent_spec: Agent spec object, or a resolved wrapper carrying a
+        ``spec`` attribute. ``None`` means no spec was available.
+    :returns: A Claude model id, e.g. ``"claude-sonnet-5"``, or ``None`` when
+        the spec declares no model pin.
+    """
+    spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
+    if spec is None:
+        return None
+    model = spec.executor.model
+    if not isinstance(model, str) or not model:
+        return None
+    return model
+
+
 def _cursor_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) -> str | None:
     """
     Read the cursor-agent model id to launch the native TUI with, from a spec.
@@ -5073,6 +5126,34 @@ def _build_claude_native_base_args(
     if model_override and not any(arg == "--model" or arg.startswith("--model=") for arg in args):
         args.extend(("--model", model_override))
     return tuple(args)
+
+
+def _claude_terminal_env_unset(
+    claude_config: ClaudeNativeUcodeConfig | None,
+) -> list[str]:
+    """
+    Env vars to strip from a native Claude terminal child.
+
+    Always drops ``DATABRICKS_CONFIG_PROFILE`` so the terminal's MCP
+    servers don't inherit the runner's ambient Databricks profile and
+    resolve auth against the wrong workspace.
+
+    Always drops ``CLAUDECODE`` because Claude Code rejects any child launch
+    carrying that nested-session marker, regardless of its auth mode. When the
+    launch config carries an ``apiKeyHelper``, also drops the raw
+    ``ANTHROPIC_API_KEY``: seeing both opens Claude Code's "Detected a custom
+    API key" menu, whose selected row uses the same ``❯`` glyph the tmux
+    delivery path waits for, so the first web message is typed into the menu.
+
+    :param claude_config: The resolved native launch config, or ``None``
+        (Claude's own login) — which still strips the nested-session marker.
+    :returns: The env var names to unset, e.g.
+        ``["DATABRICKS_CONFIG_PROFILE", "CLAUDECODE", "ANTHROPIC_API_KEY"]``.
+    """
+    env_unset = ["DATABRICKS_CONFIG_PROFILE", "CLAUDECODE"]
+    if claude_config is not None and claude_config.api_key_helper:
+        env_unset.append("ANTHROPIC_API_KEY")
+    return env_unset
 
 
 def _publish_terminal_pending(
@@ -5408,7 +5489,6 @@ async def _auto_create_claude_terminal(
 
     from omnigent.claude_launcher import resolve_claude_launch
     from omnigent.claude_native import (
-        ClaudeNativeUcodeConfig,
         augment_claude_args,
         build_native_claude_terminal_env,
         resolve_native_claude_config,
@@ -5641,10 +5721,7 @@ async def _auto_create_claude_terminal(
     # the CLI injects this in ``_claude_terminal_request``; on this path
     # the runner must, since it (not the CLI) launches the terminal.
     # Best-effort: no profile / no ucode state / malformed state falls
-    # back to Claude's own native config (empty env). The runner env is
-    # an allowlist that excludes ``ANTHROPIC_API_KEY`` /
-    # ``CLAUDE_CODE_*``, so — unlike the CLI — there are no stray
-    # provider/session vars to unset before the gateway env applies.
+    # back to Claude's own native config (empty env).
     # See designs/NATIVE_RUNNER_SERVER_LAUNCH.md.
     # Resolve the launch config across all offerings — a configured provider
     # (omnigent setup), a Databricks ucode profile from provider config, or
@@ -5675,11 +5752,12 @@ async def _auto_create_claude_terminal(
 
     base_claude_args = _build_claude_native_base_args(
         reasoning_effort=session_effort,
-        # Session override wins; the ucode gateway model is the default
-        # when no per-session override is set. Both yield to an explicit
-        # ``--model`` in the user's pass-through args (handled in the
+        # Precedence: per-session ``/model`` override > agent-spec pin
+        # (``executor.model``) > provider/ucode default. All three yield to an
+        # explicit ``--model`` in the user's pass-through args (handled in the
         # helper).
         model_override=session_model_override
+        or _claude_native_model_from_spec(agent_spec)
         or (claude_config.model if claude_config is not None else None),
         terminal_launch_args=session_launch_args,
         resume_external_session_id=resume_external_session_id,
@@ -5709,6 +5787,8 @@ async def _auto_create_claude_terminal(
     # managed-host path. Identity by default. See omnigent.claude_launcher.
     launch_command, launch_args = resolve_claude_launch("claude", list(claude_args))
 
+    claude_terminal_env_unset = _claude_terminal_env_unset(claude_config)
+
     # Inherit the agent's os_env so its sandbox (e.g. ``type: none``),
     # egress_rules and env_passthrough are honoured. Without ``sandbox`` here
     # and ``parent_os_env`` below, launch_terminal falls back to
@@ -5726,21 +5806,15 @@ async def _auto_create_claude_terminal(
         # etc.) when derived. Empty provider config still forces
         # ENABLE_TOOL_SEARCH=true so MCP schemas are loaded on demand.
         env=build_native_claude_terminal_env(claude_config),
-        # Strip the ambient Databricks-SDK profile selection from
-        # the Claude tmux env. Claude's MCP servers inherit this env,
-        # and several construct ``WorkspaceClient`` without pinning
-        # ``auth_type``; when ``DATABRICKS_CONFIG_PROFILE`` is set,
-        # the SDK's auth resolver picks up that profile's cached
-        # OAuth token and ignores the explicit token the MCP was
-        # configured with — sending a bearer minted for the wrong
-        # workspace and getting back a 400 ``Invalid Token`` from
-        # the right one. Claude itself doesn't read this env var
-        # (provider routing is via ``ANTHROPIC_BASE_URL`` /
-        # ``apiKeyHelper``), so dropping it from the terminal env
-        # affects only the leak path. MCPs that genuinely need a
-        # specific profile must declare it in their own per-MCP env
-        # configuration rather than inheriting it from the runner.
-        env_unset=["DATABRICKS_CONFIG_PROFILE"],
+        # Names to strip (see ``_claude_terminal_env_unset``). Dropping
+        # ``DATABRICKS_CONFIG_PROFILE`` matters because Claude's MCP servers
+        # inherit this env and several build ``WorkspaceClient`` without pinning
+        # ``auth_type``: a set profile makes the SDK prefer that profile's cached
+        # OAuth token over the MCP's explicit token, 400ing against the wrong
+        # workspace. Claude itself ignores the var (routing is
+        # ``ANTHROPIC_BASE_URL`` / ``apiKeyHelper``), so this affects only MCPs;
+        # ones needing a specific profile must set it in their own per-MCP env.
+        env_unset=claude_terminal_env_unset,
         scrollback=50000,
         # Keep the private tmux server alive if the `claude` CLI exits (e.g. a
         # sub-agent worker whose CLI exits right after rendering its prompt on
@@ -10701,19 +10775,69 @@ def create_runner_app(
         message). claude-native is unaffected: its badge mirrors Claude Code's
         *own* ``[Request interrupted by user]`` record, which is real.
 
+        Stop also cancels an in-flight MCP startup round (issue #2058): the
+        bridge's still-``starting`` servers are marked ``cancelled``
+        locally (what the web band and turn-error text read, even if Codex
+        never acknowledges) and the app-server is asked to abort startup
+        the way the Codex TUI does — ``turn/interrupt`` with an EMPTY turn
+        id (its ``startup_interrupt``). This runs alongside the active-turn
+        interrupt when both apply, because codex defers a mid-startup
+        turn's execution until the round settles: stopping only the turn
+        would leave the user watching a startup they asked to stop.
+
         :param conv_id: Session/conversation identifier, e.g.
             ``"conv_abc123"``.
-        :returns: 204 when no active turn is recorded or the interrupt lands;
-            503 when Codex rejects the active-turn interrupt.
+        :returns: 204 when nothing needs interrupting or the interrupts
+            land; 503 when Codex rejects the active-turn interrupt.
         """
         from omnigent.codex_native_app_server import client_for_transport
+        from omnigent.codex_native_bridge import (
+            CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
+            bridge_dir_for_bridge_id,
+            cancel_pending_mcp_startup,
+            read_mcp_startup,
+        )
 
         state = await _codex_native_bridge_state_for_session(conv_id, action="interrupt")
         if state is None:
             return Response(status_code=204)
-        if state.active_turn_id is None:
-            _logger.info("Codex-native interrupt skipped for %s: no active turn.", conv_id)
+        labels = await _session_labels_for_runner_spawn(
+            server_client=server_client,
+            session_id=conv_id,
+        )
+        bridge_dir = bridge_dir_for_bridge_id(
+            labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY) or conv_id
+        )
+        pending_mcp = cancel_pending_mcp_startup(bridge_dir)
+        if state.active_turn_id is None and not pending_mcp:
+            _logger.info(
+                "Codex-native interrupt skipped for %s: no active turn or MCP startup.",
+                conv_id,
+            )
             return Response(status_code=204)
+        if pending_mcp:
+            _logger.info(
+                "Codex-native interrupt for %s cancels MCP startup: %s",
+                conv_id,
+                ", ".join(pending_mcp),
+            )
+            # Publish the flipped map ourselves: the forwarder only reposts
+            # when IT changes the map, and codex's own cancelled edges are
+            # owner-only — without this post the web band and snapshot stay
+            # stuck on "Starting MCP servers" after a Stop.
+            try:
+                await server_client.post(
+                    f"/v1/sessions/{conv_id}/events",
+                    json={
+                        "type": "external_mcp_startup",
+                        "data": {"servers": read_mcp_startup(bridge_dir)},
+                    },
+                    timeout=10.0,
+                )
+            except Exception:  # noqa: BLE001 - the bridge flip already took effect locally.
+                _logger.warning(
+                    "Failed to publish cancelled MCP startup for %s", conv_id, exc_info=True
+                )
 
         codex_client = client_for_transport(
             state.socket_path,
@@ -10721,13 +10845,29 @@ def create_runner_app(
         )
         try:
             await codex_client.connect()
-            await codex_client.request(
-                "turn/interrupt",
-                {
-                    "threadId": state.thread_id,
-                    "turnId": state.active_turn_id,
-                },
-            )
+            if pending_mcp:
+                # Startup interrupt first and best-effort: the local
+                # cancel above already updated what Omnigent shows.
+                try:
+                    await codex_client.request(
+                        "turn/interrupt",
+                        {"threadId": state.thread_id, "turnId": ""},
+                    )
+                except Exception:  # noqa: BLE001 - the local cancel already took effect.
+                    _logger.warning(
+                        "Codex-native MCP startup interrupt failed for session=%s thread=%s",
+                        conv_id,
+                        state.thread_id,
+                        exc_info=True,
+                    )
+            if state.active_turn_id is not None:
+                await codex_client.request(
+                    "turn/interrupt",
+                    {
+                        "threadId": state.thread_id,
+                        "turnId": state.active_turn_id,
+                    },
+                )
         except Exception as exc:  # noqa: BLE001 - surface active-turn interrupt failures to caller.
             _logger.warning(
                 "Codex-native turn/interrupt failed for session=%s thread=%s turn=%s",
@@ -11000,6 +11140,58 @@ def create_runner_app(
                 },
             )
         _wake_parent_after_native_interrupt(conv_id)
+        return Response(status_code=204)
+
+    async def _handle_pi_native_model_change(
+        conv_id: str,
+        model: str | None,
+    ) -> Response:
+        """
+        Switch a pi-native session's model inside the resident Pi process.
+
+        Pi-native turns run inside the terminal's Pi process, and the
+        ``--model`` flag on the ``pi`` binary is baked in at spawn. To
+        propagate a web-picked model live — without relaunching the pane —
+        queue a ``model_change`` payload; the extension consumes it in the
+        TUI process, resolves the id against ``ctx.modelRegistry`` and calls
+        Pi's ``setModel`` (immediate, no ``/reload``).
+
+        Skipped silently when *model* is ``None`` or empty / whitespace only:
+        Pi has no "use the spawn default" API, so a clear only takes effect on
+        the next spawn via ``--model``.
+
+        :param conv_id: Session/conversation identifier, e.g.
+            ``"conv_abc123"``.
+        :param model: New persisted model identifier, e.g.
+            ``"databricks-claude-sonnet-4-6"``; ``None`` when the user
+            cleared the override.
+        :returns: 204 when the payload was queued or skipped; 503 if the
+            bridge inbox could not be written (persisted value still applies
+            on the next spawn).
+        """
+        from omnigent.pi_native_bridge import bridge_dir_for_session_id, enqueue_model_change
+
+        if model is None or not model.strip():
+            return Response(status_code=204)
+        try:
+            await asyncio.to_thread(
+                enqueue_model_change,
+                bridge_dir_for_session_id(conv_id),
+                model.strip(),
+            )
+        except OSError as exc:
+            _logger.warning(
+                "Pi-native model change failed for session=%s",
+                conv_id,
+                exc_info=True,
+            )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "pi_native_model_failed",
+                    "detail": _client_safe_error_detail(exc, context="pi-native model change"),
+                },
+            )
         return Response(status_code=204)
 
     async def _teardown_session_terminals(conv_id: str) -> None:
@@ -13741,6 +13933,20 @@ def create_runner_app(
             await _ensure_comment_relay_started(
                 conv, explicit_bridge_dir=antigravity_bdir, await_notify=False
             )
+        elif harness_name == "hermes":
+            from omnigent.hermes_native_bridge import (
+                bridge_dir_for_session_id as hermes_bridge_dir_for_session,
+            )
+
+            # The headless hermes executor writes bridge.json + mcp_servers into
+            # this same deterministic dir; the relay adds tool_relay.json so
+            # serve-mcp can dispatch Omnigent builtin tools. Hermes starts
+            # serve-mcp lazily, so awaiting delivery would stall the turn.
+            await _ensure_comment_relay_started(
+                conv,
+                explicit_bridge_dir=hermes_bridge_dir_for_session(conv),
+                await_notify=False,
+            )
 
         try:
             response = await _stream_message_to_harness(
@@ -15096,8 +15302,9 @@ def create_runner_app(
             # boundaries can propagate it live. Claude-native and
             # cursor-native type ``/model`` into their tmux pane;
             # codex-native queues a Codex app-server next-turn settings
-            # update. Other harnesses pick up the persisted value on the
-            # next turn and 204 here.
+            # update; pi-native queues an inbox ``model_change`` its
+            # extension applies via Pi's ``setModel``. Other harnesses pick
+            # up the persisted value on the next turn and 204 here.
             harness = _session_harness_name(conversation_id)
             if harness in (
                 "claude-native",
@@ -15105,6 +15312,7 @@ def create_runner_app(
                 "cursor-native",
                 "opencode-native",
                 "kiro-native",
+                "pi-native",
             ):
                 model = body.get("model") if isinstance(body, dict) else None
                 if model is not None and not isinstance(model, str):
@@ -15134,6 +15342,11 @@ def create_runner_app(
                     )
                 if harness == "kiro-native":
                     return await _handle_kiro_native_model_change(
+                        conversation_id,
+                        model,
+                    )
+                if harness == "pi-native":
+                    return await _handle_pi_native_model_change(
                         conversation_id,
                         model,
                     )
@@ -17504,11 +17717,14 @@ def create_runner_app(
                 },
             )
 
-    # Note: cursor-native has no model-options route. Its catalog is a curated
-    # *static* base list served directly by the AP server (see
-    # ``_fetch_model_options`` in omnigent/server/routes/sessions.py), so it
-    # needs no runner round-trip and stays immune to the runner-backed cache
-    # invalidation that would otherwise blank the picker on an effort change.
+    # Note: neither cursor-native nor pi-native has a model-options route.
+    # Cursor's catalog is a curated *static* base list served directly by the
+    # AP server (see ``_fetch_model_options`` in
+    # omnigent/server/routes/sessions.py). Pi's is PUSHED by its resident
+    # extension (``external_model_options``, from the live ``ctx.modelRegistry``)
+    # rather than read from a file, so the picker works in every auth path
+    # (Omnigent-configured provider OR pi's own ``/login``) — a launch-written
+    # ``models.json`` isn't present in the ``/login`` case.
 
     @app.post("/v1/sessions/{session_id}/skills/resolve")
     async def resolve_session_skill(session_id: str, request: Request) -> JSONResponse:

@@ -2593,3 +2593,289 @@ function usage(id) {
 });
 """
     _run_extension_script(node, _extension_path(), script)
+
+
+# Shared Node preamble for the model-switch tests: loads the extension with a
+# mocked ``pi`` that records ``setModel`` calls and drives the real inbox
+# poller through a temp inbox directory (so an inbox ``model_change`` payload
+# exercises the same path the runner uses).
+_MODEL_SWITCH_HARNESS = r"""
+const assert = require("assert").strict;
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+
+const extensionPath = process.argv[1];
+const inboxDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-model-inbox-"));
+const configPath = path.join(inboxDir, "config.json");
+fs.writeFileSync(
+  configPath,
+  JSON.stringify({ serverUrl: "http://omnigent.test", sessionId: "session-1", inboxDir }),
+);
+process.env.OMNIGENT_PI_NATIVE_CONFIG = configPath;
+
+const posted = [];
+global.fetch = async (_url, request) => {
+  posted.push(JSON.parse(request.body));
+  return { ok: true };
+};
+
+const setModelCalls = [];
+// The catalog Pi's modelRegistry exposes; setModel returns false for a model
+// with no configured API key (mirrors Pi's real contract).
+const catalog = [
+  { id: "databricks-claude-sonnet-4-6", name: "Sonnet", hasKey: true },
+  { id: "databricks-claude-opus-4-1", name: "Opus", hasKey: true },
+  { id: "no-key-model", name: "NoKey", hasKey: false },
+];
+const pi = {
+  registerCommand() {},
+  on(name, handler) { (pi.__handlers = pi.__handlers || {})[name] = handler; },
+  sendUserMessage() {},
+  async setModel(model) {
+    setModelCalls.push(model);
+    return !!(model && model.hasKey);
+  },
+};
+
+require(extensionPath)(pi);
+const handlers = pi.__handlers;
+
+const ctx = {
+  isIdle: () => true,
+  ui: { setTitle() {}, setStatus() {}, notify() {} },
+  // ``model`` is the model Pi launched with (used for the startup
+  // external_model_change). ``getAvailable`` returns only auth-configured
+  // models (what the picker should show); ``getAll`` is Pi's full built-in
+  // catalog (the fallback for older Pi).
+  model: { id: "databricks-claude-sonnet-4-6", name: "Sonnet" },
+  modelRegistry: {
+    getAll: () => catalog,
+    getAvailable: () => catalog.filter((m) => m.hasKey),
+  },
+};
+
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+// Drop a model_change payload into the inbox and wait for the poller to consume it.
+async function deliverModelChange(model) {
+  const suffix = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const file = path.join(inboxDir, `000-model-${suffix}.json`);
+  fs.writeFileSync(file, JSON.stringify({ id: path.basename(file), type: "model_change", model }));
+  const deadline = Date.now() + 3000;
+  while (fs.existsSync(file)) {
+    if (Date.now() > deadline) throw new Error("model_change file was not consumed");
+    await sleep(20);
+  }
+  // The poller invokes handleModelChange (async, discarded) then unlinks; give
+  // the microtask/awaits a beat to settle.
+  await sleep(20);
+}
+
+function errorItems() {
+  return posted.filter(
+    (e) =>
+      e.type === "external_conversation_item" &&
+      e.data && e.data.item_data && e.data.item_data.code === "pi_model_change_failed",
+  );
+}
+
+function finish() {
+  if (pi.__omnigentInboxPoller) clearInterval(pi.__omnigentInboxPoller);
+  try { fs.rmSync(inboxDir, { recursive: true, force: true }); } catch (_err) {}
+}
+"""
+
+
+def test_inbox_model_change_applies_via_set_model(tmp_path: Path) -> None:
+    """A web-picked ``model_change`` inbox payload calls Pi's ``setModel``.
+
+    The runner queues the payload after the Omnigent server persisted the
+    override; the extension must resolve the id against ``ctx.modelRegistry``
+    and apply it live via ``pi.setModel`` — with no error item posted.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension e2e test")
+
+    script = (
+        _MODEL_SWITCH_HARNESS
+        + r"""
+(async () => {
+  await handlers.session_start({}, ctx); // starts the inbox poller
+  await deliverModelChange("databricks-claude-opus-4-1");
+
+  assert.equal(setModelCalls.length, 1, JSON.stringify(setModelCalls));
+  assert.equal(setModelCalls[0].id, "databricks-claude-opus-4-1");
+  // Success posts no error item (the model_select mirror handles the web pill).
+  assert.equal(errorItems().length, 0, JSON.stringify(posted));
+  finish();
+})().catch((error) => {
+  finish();
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    )
+    _run_extension_script(node, _extension_path(), script)
+
+
+def test_inbox_model_change_unknown_model_posts_error(tmp_path: Path) -> None:
+    """An unresolvable model id posts a visible error item and never calls setModel."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension e2e test")
+
+    script = (
+        _MODEL_SWITCH_HARNESS
+        + r"""
+(async () => {
+  await handlers.session_start({}, ctx);
+  await deliverModelChange("model-that-does-not-exist");
+
+  assert.equal(setModelCalls.length, 0, JSON.stringify(setModelCalls));
+  const errs = errorItems();
+  assert.equal(errs.length, 1, JSON.stringify(posted));
+  assert.match(errs[0].data.item_data.message, /not available/);
+  finish();
+})().catch((error) => {
+  finish();
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    )
+    _run_extension_script(node, _extension_path(), script)
+
+
+def test_model_select_mirrors_to_external_model_change(tmp_path: Path) -> None:
+    """A user ``/model`` pick inside Pi posts ``external_model_change`` (two-way sync).
+
+    Pi fires ``model_select`` for both in-TUI switches and startup restores.
+    A ``set`` / ``cycle`` source must mirror back to Omnigent; a ``restore``
+    (Pi re-applying the saved model at startup) must NOT.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension e2e test")
+
+    script = (
+        _MODEL_SWITCH_HARNESS
+        + r"""
+(async () => {
+  await handlers.session_start({}, ctx);
+  assert.equal(typeof handlers.model_select, "function");
+
+  // session_start itself mirrors the launch model (ctx.model) so the pill
+  // resolves from the start; ignore that when checking the user switch.
+  const startupChanges = posted.filter((e) => e.type === "external_model_change");
+  assert.equal(startupChanges.length, 1, JSON.stringify(posted));
+  assert.equal(startupChanges[0].data.model, "databricks-claude-sonnet-4-6");
+
+  // A genuine user switch mirrors back.
+  await handlers.model_select(
+    { source: "set", model: { id: "databricks-claude-opus-4-1" } },
+    ctx,
+  );
+  // A startup restore must be ignored (could clobber a pending web override).
+  await handlers.model_select(
+    { source: "restore", model: { id: "databricks-claude-sonnet-4-6" } },
+    ctx,
+  );
+
+  const changes = posted.filter((e) => e.type === "external_model_change");
+  // Two total: the startup mirror + the one user switch (restore ignored).
+  assert.equal(changes.length, 2, JSON.stringify(posted));
+  assert.equal(changes[1].data.model, "databricks-claude-opus-4-1");
+  finish();
+})().catch((error) => {
+  finish();
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    )
+    _run_extension_script(node, _extension_path(), script)
+
+
+def test_session_start_posts_model_options_from_registry(tmp_path: Path) -> None:
+    """
+    On ``session_start`` the extension posts Pi's auth-configured model catalog.
+
+    The Web UI picker is populated from ``external_model_options``. The
+    extension prefers ``ctx.modelRegistry.getAvailable()`` — only models with
+    configured auth — over ``getAll()`` (Pi's entire built-in catalog), so the
+    picker shows only models the user can actually switch to (scoped to the
+    provider(s) they are logged into), not hundreds of credential-less models.
+    It also posts ``external_model_change`` for the launch model (``ctx.model``)
+    so the composer pill resolves from the start.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension e2e test")
+
+    script = (
+        _MODEL_SWITCH_HARNESS
+        + r"""
+(async () => {
+  await handlers.session_start({}, ctx);
+
+  const opts = posted.filter((e) => e.type === "external_model_options");
+  assert.equal(opts.length, 1, JSON.stringify(posted));
+  const models = opts[0].data.models;
+  // getAvailable() filters out ``no-key-model`` (no configured auth).
+  assert.deepEqual(
+    models.map((m) => m.id),
+    ["databricks-claude-sonnet-4-6", "databricks-claude-opus-4-1"],
+    JSON.stringify(models),
+  );
+  // Display name falls back to the model's ``name``.
+  assert.equal(models[0].displayName, "Sonnet");
+
+  // The launch model is mirrored so the pill/active-row resolve immediately.
+  const changes = posted.filter((e) => e.type === "external_model_change");
+  assert.equal(changes.length, 1, JSON.stringify(posted));
+  assert.equal(changes[0].data.model, "databricks-claude-sonnet-4-6");
+  finish();
+})().catch((error) => {
+  finish();
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    )
+    _run_extension_script(node, _extension_path(), script)
+
+
+def test_session_start_empty_registry_posts_no_model_options(tmp_path: Path) -> None:
+    """
+    An empty / unavailable model registry posts no ``external_model_options``.
+
+    Best-effort: when Pi exposes no registry (older Pi, or a registry that
+    throws), the extension stays silent rather than posting an empty catalog —
+    the server would only evict, and the picker stays hidden as before.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension e2e test")
+
+    script = (
+        _MODEL_SWITCH_HARNESS
+        + r"""
+(async () => {
+  // Registry present but empty.
+  await handlers.session_start({}, { ...ctx, modelRegistry: { getAll: () => [] } });
+  // No registry at all.
+  await handlers.session_start({}, { ...ctx, modelRegistry: undefined });
+
+  const opts = posted.filter((e) => e.type === "external_model_options");
+  assert.equal(opts.length, 0, JSON.stringify(posted));
+  finish();
+})().catch((error) => {
+  finish();
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    )
+    _run_extension_script(node, _extension_path(), script)

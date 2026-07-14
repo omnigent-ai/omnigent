@@ -19,7 +19,11 @@ _EXPECTED_ROWS = [
 ]
 
 
-def _patch_session_as_claude_native(page: Page, session_id: str) -> list[dict]:
+def _patch_session_as_claude_native(
+    page: Page,
+    session_id: str,
+    model_override: str | None = None,
+) -> list[dict]:
     """Patch the browser's session snapshot into a claude-native response.
 
     The server fixture seeds a normal ``hello_world`` session so the page can
@@ -30,6 +34,7 @@ def _patch_session_as_claude_native(page: Page, session_id: str) -> list[dict]:
 
     :param page: Playwright page before navigation.
     :param session_id: Session id to patch, e.g. ``"conv_abc123"``.
+    :param model_override: Optional session-scoped model override to expose.
     :returns: Captured PATCH request bodies.
     """
     latest_payload: dict | None = None
@@ -66,6 +71,8 @@ def _patch_session_as_claude_native(page: Page, session_id: str) -> list[dict]:
         # A concrete newer-generation id: must light up the opt-in "Sonnet 5"
         # row, not the default "sonnet" row (both ids contain "sonnet").
         payload["llm_model"] = "databricks-claude-sonnet-5"
+        if model_override is not None:
+            payload["model_override"] = model_override
         latest_payload = dict(payload)
         route.fulfill(
             status=200,
@@ -149,3 +156,26 @@ def test_claude_native_sonnet_5_selection_persists(
 
     assert patch_bodies[-1] == {"model_override": "sonnet_5"}
     expect(trigger).to_contain_text("Sonnet 5")
+
+
+def test_claude_native_picker_prefers_session_override_over_sticky_model(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """The active row follows the session override, not another session's pick."""
+    page.add_init_script("window.localStorage.setItem('omnigent.picker.model', 'sonnet')")
+    base_url, session_id = seeded_session
+    _patch_session_as_claude_native(page, session_id, model_override="sonnet_5")
+
+    page.goto(f"{base_url}/c/{session_id}")
+
+    trigger = page.get_by_test_id("agent-picker-trigger")
+    expect(trigger).to_be_visible(timeout=15_000)
+    trigger.click()
+
+    expect(
+        page.locator('[data-testid="model-picker-item"][data-model-id="sonnet_5"]')
+    ).to_have_attribute("data-active", "true")
+    expect(
+        page.locator('[data-testid="model-picker-item"][data-model-id="sonnet"]')
+    ).not_to_have_attribute("data-active", "true")

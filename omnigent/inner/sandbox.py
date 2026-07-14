@@ -368,21 +368,66 @@ def register_backend(backend: SandboxBackend) -> None:
     _BACKENDS[backend.type_name] = backend
 
 
+def _resolve_grant_root(cwd: Path, root: str) -> Path:
+    """Resolve a spec-supplied path grant against *cwd*.
+
+    Expands ``~`` but intentionally NOT ``$VAR`` -- env-var expansion at
+    resolve time is a grant-widening lever when an attacker can shape the
+    parent environment (mirrors the hardening in
+    :func:`omnigent.inner.bwrap_sandbox._resolve_root`). Relative entries
+    resolve against *cwd*; the result is absolute and symlink-normalised
+    (``strict=False`` -- a granted path need not exist yet). Callers compare
+    already-resolved target paths against these roots, so traversal via
+    symlinks or ``..`` cannot escape a grant.
+
+    :param cwd: The environment's working directory; relative grants resolve
+        against it.
+    :param root: The raw path string from the spec, e.g. ``"~/code"`` or
+        ``"../sibling"``.
+    :returns: An absolute, normalised :class:`Path`.
+    """
+    if "$" in root:
+        logger.warning(
+            "sandbox: grant path %r contains '$', which is NOT expanded "
+            "against the parent environment (security hardening -- env-var "
+            "expansion was a grant-widening lever). Use a literal path or ~.",
+            root,
+        )
+    expanded = os.path.expanduser(root)
+    path = Path(expanded)
+    if not path.is_absolute():
+        path = cwd / path
+    return path.resolve(strict=False)
+
+
 def resolve_sandbox(spec: OSEnvSpec, cwd: Path) -> SandboxPolicy:
     sandbox_spec = spec.sandbox or _default_sandbox_for_platform()
     if sandbox_spec.type == "none":
-        if (
-            sandbox_spec.read_paths is not None
-            or sandbox_spec.write_paths is not None
-            or sandbox_spec.allow_network is False
-        ):
-            raise ValueError("sandbox type 'none' cannot restrict reads, writes, or network")
+        # ``sandbox.type: none`` runs the helper UNSANDBOXED, so path grants
+        # cannot *restrict* the (unconfined) shell -- a network restriction is
+        # still meaningless here and rejected. But ``read_paths`` /
+        # ``write_paths`` / ``write_files`` ARE honoured as explicit
+        # FILE-TOOL reach grants: they are the opt-in that lets
+        # ``sys_os_read`` / ``sys_os_write`` / ``sys_os_edit`` reach declared
+        # paths OUTSIDE the workspace root (enforced by ``_assert_within_reach``
+        # in ``os_env.py``). With none declared, ``read_roots``/``write_roots``
+        # stay empty and the file tools remain confined to cwd exactly as
+        # before -- the default is byte-for-byte unchanged.
+        if sandbox_spec.allow_network is False:
+            raise ValueError("sandbox type 'none' cannot restrict network")
+        read_roots = (
+            [_resolve_grant_root(cwd, root) for root in sandbox_spec.read_paths]
+            if sandbox_spec.read_paths is not None
+            else None
+        )
+        write_roots = [_resolve_grant_root(cwd, root) for root in (sandbox_spec.write_paths or [])]
+        write_files = [_resolve_grant_root(cwd, root) for root in (sandbox_spec.write_files or [])]
         return SandboxPolicy(
             backend_type="none",
             active=False,
-            read_roots=None,
-            write_roots=[],
-            write_files=[],
+            read_roots=read_roots,
+            write_roots=write_roots,
+            write_files=write_files,
             allow_network=True,
         )
     return _get_backend(sandbox_spec.type).resolve(spec, cwd)

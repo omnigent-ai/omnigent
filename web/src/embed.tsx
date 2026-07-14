@@ -102,11 +102,14 @@ export interface OmnigentAppProps extends OmnigentHostConfig {
 // `main.tsx`'s fallback (accounts off, no login).
 const SERVER_INFO_OFFLINE_FALLBACK: ServerInfo = {
   accounts_enabled: false,
+  single_user: false,
   login_url: null,
   needs_setup: false,
   databricks_features: false,
   managed_sandboxes_enabled: false,
   sandbox_provider: null,
+  sharing_mode: "on",
+  public_sharing_enabled: true,
   server_version: null,
   smart_routing_enabled: false,
 };
