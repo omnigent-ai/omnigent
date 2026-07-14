@@ -180,6 +180,61 @@ def test_list_latest_message_items_for_conversations(
     assert result["conv_missing"] == []
 
 
+def test_list_latest_message_items_joins_on_full_item_primary_key(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Latest-message lookup keeps rows scoped to their conversation.
+
+    ``conversation_items`` uses ``(workspace_id, conversation_id, id)`` as
+    its primary key, so the same item id may exist in different
+    conversations. The ranked subquery must join back on that full key or
+    each matching id is duplicated across conversations.
+    """
+    monkeypatch.setattr(
+        "omnigent.stores.conversation_store.sqlalchemy_store.generate_item_id",
+        lambda _item_type: "msg_shared",
+    )
+    conv_a = conversation_store.create_conversation(title="alpha")
+    conv_b = conversation_store.create_conversation(title="beta")
+    conversation_store.append(
+        conv_a.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_a",
+                data=MessageData(
+                    role="assistant",
+                    content=[{"type": "output_text", "text": "alpha"}],
+                    agent="worker",
+                ),
+            )
+        ],
+    )
+    conversation_store.append(
+        conv_b.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_b",
+                data=MessageData(
+                    role="assistant",
+                    content=[{"type": "output_text", "text": "beta"}],
+                    agent="worker",
+                ),
+            )
+        ],
+    )
+
+    result = conversation_store.list_latest_message_items_for_conversations(
+        [conv_a.id, conv_b.id],
+        per_conversation_limit=1,
+    )
+
+    assert [item.data.content[0]["text"] for item in result[conv_a.id]] == ["alpha"]
+    assert [item.data.content[0]["text"] for item in result[conv_b.id]] == ["beta"]
+
+
 def test_update_title(conversation_store: SqlAlchemyConversationStore) -> None:
     conv = conversation_store.create_conversation()
     updated = conversation_store.update_conversation(conv.id, title="Chat 1")
