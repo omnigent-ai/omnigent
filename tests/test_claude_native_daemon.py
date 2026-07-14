@@ -225,11 +225,12 @@ def _install_daemon_seam_mocks(
         "omnigent.host.identity.load_or_create_host_identity",
         lambda *a, **k: SimpleNamespace(host_id="host_1", name="h"),
     )
-    monkeypatch.setattr(
-        claude_native,
-        "_resolve_session_id_for_resume",
-        lambda **k: k.get("session_id"),
-    )
+
+    def _resolve_session(**kwargs: Any) -> str | None:
+        captured["resume_host_id"] = kwargs.get("host_id")
+        return kwargs.get("session_id")
+
+    monkeypatch.setattr(claude_native, "_resolve_session_id_for_resume", _resolve_session)
     monkeypatch.setattr(
         claude_native, "_align_working_directory_with_session", lambda *a, **k: None
     )
@@ -294,6 +295,7 @@ def test_run_with_remote_server_routes_through_daemon(
     # The launch was routed through the daemon prepare with this host,
     # the cwd workspace, and the user's args.
     assert captured["host_id"] == "host_1"
+    assert captured["resume_host_id"] == "host_1"
     assert captured["workspace"] == str(tmp_path.resolve())
     assert captured["claude_args"] == ("--dangerously-skip-permissions",)
     assert captured["session_id"] is None

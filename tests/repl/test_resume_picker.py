@@ -27,9 +27,7 @@ import io
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from types import SimpleNamespace
 
-import click
 import pytest
 
 from omnigent.entities import ConversationItem, MessageData
@@ -37,7 +35,6 @@ from omnigent.repl._resume_picker import (
     _extract_text_from_content_blocks,
     _last_message_preview_from_dicts,
     _last_message_preview_from_entities,
-    _list_sessions_with_rate_limit_retry,
     _Preview,
     pick_conversation,
     pick_conversation_from_store,
@@ -74,53 +71,6 @@ class _TtyPickResult:
 
     selected: str | None
     rendered: str
-
-
-@pytest.mark.asyncio
-async def test_session_list_retries_two_rate_limits(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls = 0
-    sleeps: list[float] = []
-
-    class RateLimited(Exception):
-        status_code = 429
-
-    async def list_sessions(**kwargs: object) -> list[str]:
-        nonlocal calls
-        calls += 1
-        assert kwargs == {"limit": 200}
-        if calls < 3:
-            raise RateLimited
-        return ["conv_ready"]
-
-    async def fake_sleep(delay: float) -> None:
-        sleeps.append(delay)
-
-    monkeypatch.setattr("omnigent.repl._resume_picker._sleep", fake_sleep)
-    client = SimpleNamespace(sessions=SimpleNamespace(list=list_sessions))
-
-    assert await _list_sessions_with_rate_limit_retry(client, limit=200) == ["conv_ready"]
-    assert calls == 3
-    assert sleeps == [1.0, 2.0]
-
-
-@pytest.mark.asyncio
-async def test_session_list_rate_limit_exhaustion_is_clean(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class RateLimited(Exception):
-        status_code = 429
-
-    async def list_sessions(**_kwargs: object) -> list[str]:
-        raise RateLimited
-
-    async def fake_sleep(_delay: float) -> None:
-        return None
-
-    monkeypatch.setattr("omnigent.repl._resume_picker._sleep", fake_sleep)
-    client = SimpleNamespace(sessions=SimpleNamespace(list=list_sessions))
-
-    with pytest.raises(click.ClickException, match="temporarily rate-limited"):
-        await _list_sessions_with_rate_limit_retry(client, limit=200)
 
 
 def _convs(n: int) -> list[_FakeConversation]:

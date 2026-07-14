@@ -31,8 +31,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import IO, Any, Protocol
 
-import click
-
 from omnigent._terminal_picker_theme import (
     PICKER_ACCENT as _ACCENT,
 )
@@ -875,27 +873,6 @@ def _page_start_for_selection(selected_index: int) -> int:
     return (selected_index // _PAGE_SIZE) * _PAGE_SIZE
 
 
-async def _list_sessions_with_rate_limit_retry(client: Any, **kwargs: Any) -> list[Any]:
-    """List sessions with a short bounded retry for an edge 429."""
-    for attempt in range(3):
-        try:
-            return await client.sessions.list(**kwargs)
-        except Exception as exc:
-            if getattr(exc, "status_code", None) != 429:
-                raise
-            if attempt == 2:
-                raise click.ClickException(
-                    "Session listing is temporarily rate-limited; retry shortly."
-                ) from None
-            await _sleep(float(2**attempt))
-    raise AssertionError("unreachable")
-
-
-async def _sleep(seconds: float) -> None:
-    """Sleep indirection kept local so tests never patch global asyncio state."""
-    await asyncio.sleep(seconds)
-
-
 async def pick_conversation_from_sdk(
     # ``Any`` to avoid coupling the repl package to the client's load order.
     client: Any,
@@ -917,8 +894,7 @@ async def pick_conversation_from_sdk(
         has this name. Used for session-scoped agents that share a
         YAML name but intentionally do not share ``agent_id``.
     """
-    convos = await _list_sessions_with_rate_limit_retry(
-        client,
+    convos = await client.sessions.list(
         limit=200,
         agent_id=agent_id,
         agent_name=agent_name_filter,
@@ -957,9 +933,7 @@ async def pick_conversation_by_wrapper_label_from_sdk(
     The cwd comes from the wrapper's client-side persistent state
     (``~/.omnigent/claude-native/``); sessions created on a
     different machine will show as having no recorded cwd."""
-    all_convos = await _list_sessions_with_rate_limit_retry(
-        client, limit=200, agent_id=None, order="desc"
-    )
+    all_convos = await client.sessions.list(limit=200, agent_id=None, order="desc")
     convos = [
         c
         for c in all_convos
@@ -987,9 +961,7 @@ async def pick_conversation_cross_agent_from_sdk(
     """Cross-agent variant: lists every session the caller can see
     via ``/v1/sessions`` and renders runtime metadata for
     ``omnigent resume``'s runtime-dispatch UX."""
-    convos = await _list_sessions_with_rate_limit_retry(
-        client, limit=200, agent_id=None, order="desc"
-    )
+    convos = await client.sessions.list(limit=200, agent_id=None, order="desc")
     previews = await _collect_previews_async(client, convos)
     # Header label is intentionally generic — "resume" describes the
     # action, not a single agent. Without overriding the legacy
