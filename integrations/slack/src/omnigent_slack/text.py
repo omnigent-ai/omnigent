@@ -18,10 +18,49 @@ def normalize_whitespace(text: str) -> str:
     return WHITESPACE_RE.sub(" ", text).strip()
 
 
-def truncate_for_slack(text: str, limit: int = 39000) -> str:
+# Slack rejects a message whose `text` exceeds its limit with `msg_too_long`.
+# The documented ceiling is higher, but updates fail well below it in practice,
+# so keep a conservative default that also renders without a "Show more" fold.
+SLACK_MESSAGE_CHAR_LIMIT = 3900
+
+
+def truncate_for_slack(text: str, limit: int = SLACK_MESSAGE_CHAR_LIMIT) -> str:
     if len(text) <= limit:
         return text
     suffix = "\n\n[truncated]"
     if limit <= len(suffix):
         return text[:limit]
     return text[: limit - len(suffix)].rstrip() + suffix
+
+
+def split_for_slack(text: str, limit: int = SLACK_MESSAGE_CHAR_LIMIT) -> list[str]:
+    """Split ``text`` into chunks no longer than ``limit`` characters.
+
+    Preserves every character so a long assistant answer (code blocks,
+    reports) is delivered in full across multiple messages instead of being
+    truncated. Prefers to break after a newline, then a space, and only
+    hard-cuts a run with no whitespace (e.g. a long URL). A blank string
+    yields ``[""]`` so the caller always has a message to post.
+    """
+    if limit <= 0:
+        raise ValueError("limit must be positive")
+    if not text:
+        return [""]
+
+    chunks: list[str] = []
+    start = 0
+    length = len(text)
+    while start < length:
+        end = start + limit
+        if end >= length:
+            chunks.append(text[start:])
+            break
+        window = text[start:end]
+        boundary = window.rfind("\n")
+        if boundary == -1:
+            boundary = window.rfind(" ")
+        # Include the delimiter in the current chunk; hard-cut if none found.
+        cut = end if boundary <= 0 else start + boundary + 1
+        chunks.append(text[start:cut])
+        start = cut
+    return chunks

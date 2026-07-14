@@ -13,7 +13,12 @@ from omnigent_slack.omnigent import (
     extract_error_text,
 )
 from omnigent_slack.store import SQLiteStore
-from omnigent_slack.text import normalize_whitespace, strip_bot_mention, truncate_for_slack
+from omnigent_slack.text import (
+    normalize_whitespace,
+    split_for_slack,
+    strip_bot_mention,
+    truncate_for_slack,
+)
 
 
 class SlackClientProtocol(Protocol):
@@ -249,19 +254,44 @@ class SlackOmnigentService:
         if error_text:
             final_text = f"Omnigent request failed: {error_text}"
         if not final_text:
-            final_text = (
-                streamed_text.strip() or await self._omnigent.latest_assistant_text(session_id)
+            final_text = streamed_text.strip() or await self._omnigent.latest_assistant_text(
+                session_id
             )
         if not final_text:
             final_text = "Omnigent completed without returning response text."
 
-        await self._update_slack(slack_client, turn.key, message_ts, final_text)
+        await self._deliver_final(slack_client, turn.key, message_ts, final_text)
         self._logger.info(
             "Completed Slack turn thread=%s session_id=%s final_chars=%s",
             turn.key.display(),
             session_id,
             len(final_text),
         )
+
+    async def _deliver_final(
+        self,
+        client: SlackClientProtocol,
+        key: ThreadKey,
+        message_ts: str,
+        text: str,
+    ) -> None:
+        # A single Slack message can't hold a long assistant answer, so split it
+        # and edit the placeholder to the first chunk, posting the rest as thread
+        # replies. This delivers the full answer instead of truncating it.
+        chunks = split_for_slack(text)
+        await self._update_slack(client, key, message_ts, chunks[0])
+        for chunk in chunks[1:]:
+            await client.chat_postMessage(
+                channel=key.channel_id,
+                thread_ts=key.thread_ts,
+                text=chunk,
+            )
+        if len(chunks) > 1:
+            self._logger.info(
+                "Delivered long Slack answer across parts thread=%s parts=%s",
+                key.display(),
+                len(chunks),
+            )
 
     async def _update_slack(
         self,

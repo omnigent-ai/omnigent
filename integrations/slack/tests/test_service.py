@@ -23,11 +23,12 @@ class FakeSlackClient:
 
 
 class FakeOmnigentClient:
-    def __init__(self) -> None:
+    def __init__(self, final_text: str = "hello final") -> None:
         self.created: list[tuple[str, str]] = []
         self.bound: list[str] = []
         self.turns: list[tuple[str, str]] = []
         self.next_session_id = "conv_1"
+        self.final_text = final_text
 
     async def create_session(self, agent_id: str, title: str) -> str:
         self.created.append((agent_id, title))
@@ -46,7 +47,7 @@ class FakeOmnigentClient:
             "item": {
                 "type": "message",
                 "role": "assistant",
-                "content": [{"type": "output_text", "text": "hello final"}],
+                "content": [{"type": "output_text", "text": self.final_text}],
             },
         }
         yield {"type": "response.completed", "response": {"status": "completed"}}
@@ -96,6 +97,43 @@ async def test_app_mention_creates_session_and_posts_response(tmp_path: Path) ->
     assert omnigent.turns == [("conv_1", "hello")]
     assert slack.posts[0]["thread_ts"] == "100.1"
     assert slack.updates[-1]["text"] == "hello final"
+
+
+async def test_long_answer_is_split_across_thread_replies(tmp_path: Path) -> None:
+    from omnigent_slack.text import SLACK_MESSAGE_CHAR_LIMIT
+
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    long_answer = "x" * (SLACK_MESSAGE_CHAR_LIMIT * 2 + 100)
+    omnigent = FakeOmnigentClient(final_text=long_answer)
+    service = SlackOmnigentService(
+        store=store,
+        omnigent=omnigent,  # type: ignore[arg-type]
+        omnigent_agent_id="ag_1",
+        update_interval_seconds=0,
+    )
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> hello"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await _wait_for_updates(slack, 1)
+    # Placeholder update + two overflow replies = original placeholder post + 2.
+    for _ in range(50):
+        if len(slack.posts) >= 3:
+            break
+        await asyncio.sleep(0.02)
+    await service.shutdown()
+
+    # Every message stays within Slack's limit and the full answer is preserved.
+    parts = [slack.updates[-1]["text"]]
+    parts.extend(post["text"] for post in slack.posts[1:])
+    assert all(len(part) <= SLACK_MESSAGE_CHAR_LIMIT for part in parts)
+    assert "".join(parts) == long_answer
+    # Overflow replies land in the same thread.
+    assert all(post["thread_ts"] == "100.1" for post in slack.posts[1:])
 
 
 async def test_empty_app_mention_prompts_without_creating_session(tmp_path: Path) -> None:
