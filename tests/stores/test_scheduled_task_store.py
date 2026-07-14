@@ -53,6 +53,8 @@ def test_create_returns_scheduled_task_with_all_fields(
         reasoning_effort="high",
         workspace="/home/alice/repo",
         base_branch="main",
+        execution_target="connected_host",
+        host_id="host_abc123",
     )
     assert task.id == _uid("st_1")
     assert task.name == "nightly triage"
@@ -65,6 +67,8 @@ def test_create_returns_scheduled_task_with_all_fields(
     assert task.reasoning_effort == "high"
     assert task.workspace == "/home/alice/repo"
     assert task.base_branch == "main"
+    assert task.execution_target == "connected_host"
+    assert task.host_id == "host_abc123"
     assert task.state == "active"
     assert task.last_run_at is None
     assert task.last_run_conversation_id is None
@@ -87,6 +91,8 @@ def test_create_minimal_defaults(store: SqlAlchemyScheduledTaskStore) -> None:
     assert task.reasoning_effort is None
     assert task.workspace is None
     assert task.base_branch is None
+    assert task.execution_target == "connected_host"
+    assert task.host_id is None
     assert task.state == "active"
 
 
@@ -126,6 +132,66 @@ def test_create_rejects_invalid_state(store: SqlAlchemyScheduledTaskStore) -> No
             timezone="UTC",
             state="bogus",
         )
+
+
+# ── execution target ──────────────────────────────────────────────────────────
+
+
+def test_execution_target_round_trips_as_string(store: SqlAlchemyScheduledTaskStore) -> None:
+    """Every valid execution_target name survives the string→int→string round trip.
+
+    The entity exposes ``execution_target`` as a string; the column stores an
+    int code.
+    """
+    for i, name in enumerate(("connected_host", "managed_sandbox")):
+        task = store.create(
+            scheduled_task_id=_uid(f"st_target_{i}"),
+            name="n",
+            prompt="p",
+            cron_expression="* * * * *",
+            owner_user_id="u",
+            agent_id="ag",
+            timezone="UTC",
+            execution_target=name,
+        )
+        assert task.execution_target == name
+        assert isinstance(task.execution_target, str)
+
+
+def test_create_rejects_invalid_execution_target(store: SqlAlchemyScheduledTaskStore) -> None:
+    """An unknown execution_target name is rejected by the codec (never reaches the DB)."""
+    with pytest.raises(ValueError, match=r"scheduled_tasks\.execution_target"):
+        store.create(
+            scheduled_task_id=_uid("st_badtarget"),
+            name="n",
+            prompt="p",
+            cron_expression="* * * * *",
+            owner_user_id="u",
+            agent_id="ag",
+            timezone="UTC",
+            execution_target="bogus",
+        )
+
+
+def test_update_execution_target_and_host_id_read_back(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """Updating ``execution_target`` / ``host_id`` reads the new values back."""
+    store.create(
+        scheduled_task_id=_uid("st_upd_target"),
+        name="n",
+        prompt="p",
+        cron_expression="* * * * *",
+        owner_user_id="u",
+        agent_id="ag",
+        timezone="UTC",
+    )
+    updated = store.update(
+        _uid("st_upd_target"), execution_target="managed_sandbox", host_id="host_xyz"
+    )
+    assert updated is not None
+    assert updated.execution_target == "managed_sandbox"
+    assert updated.host_id == "host_xyz"
 
 
 def test_update_state_reads_back(store: SqlAlchemyScheduledTaskStore) -> None:

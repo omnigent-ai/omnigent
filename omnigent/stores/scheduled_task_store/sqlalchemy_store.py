@@ -10,8 +10,10 @@ from omnigent.db.db_models import (
     current_workspace_id,
 )
 from omnigent.db.enum_codecs import (
+    decode_scheduled_task_execution_target,
     decode_scheduled_task_run_status,
     decode_scheduled_task_state,
+    encode_scheduled_task_execution_target,
     encode_scheduled_task_run_status,
     encode_scheduled_task_state,
 )
@@ -44,6 +46,8 @@ def _to_entity(row: SqlScheduledTask) -> ScheduledTask:
         reasoning_effort=row.reasoning_effort,
         workspace=row.workspace,
         base_branch=row.base_branch,
+        execution_target=decode_scheduled_task_execution_target(row.execution_target),
+        host_id=row.host_id,
         state=decode_scheduled_task_state(row.state),
         last_run_at=row.last_run_at,
         last_run_conversation_id=row.last_run_conversation_id,
@@ -109,6 +113,8 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         reasoning_effort: str | None = None,
         workspace: str | None = None,
         base_branch: str | None = None,
+        execution_target: str = "connected_host",
+        host_id: str | None = None,
         state: str = "active",
     ) -> ScheduledTask:
         """Insert a new scheduled task with a required recurring ``cron_expression``."""
@@ -124,6 +130,8 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             reasoning_effort=reasoning_effort,
             workspace=workspace,
             base_branch=base_branch,
+            execution_target=encode_scheduled_task_execution_target(execution_target),
+            host_id=host_id,
             state=encode_scheduled_task_state(state),
             last_run_at=None,
             last_run_conversation_id=None,
@@ -178,6 +186,8 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         reasoning_effort: str | None = None,
         workspace: str | None = None,
         base_branch: str | None = None,
+        execution_target: str | None = None,
+        host_id: str | None = None,
         state: str | None = None,
         last_run_at: int | None = None,
         last_run_conversation_id: str | None = None,
@@ -215,6 +225,14 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 changed = True
             if base_branch is not None and row.base_branch != base_branch:
                 row.base_branch = base_branch
+                changed = True
+            if execution_target is not None:
+                encoded_target = encode_scheduled_task_execution_target(execution_target)
+                if row.execution_target != encoded_target:
+                    row.execution_target = encoded_target
+                    changed = True
+            if host_id is not None and row.host_id != host_id:
+                row.host_id = host_id
                 changed = True
             if state is not None:
                 encoded_state = encode_scheduled_task_state(state)

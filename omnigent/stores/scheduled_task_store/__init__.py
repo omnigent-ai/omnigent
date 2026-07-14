@@ -48,6 +48,8 @@ class ScheduledTaskStore(ABC):
         reasoning_effort: str | None = None,
         workspace: str | None = None,
         base_branch: str | None = None,
+        execution_target: str = "connected_host",
+        host_id: str | None = None,
         state: str = "active",
     ) -> ScheduledTask:
         """
@@ -66,10 +68,16 @@ class ScheduledTaskStore(ABC):
         :param reasoning_effort: Optional reasoning-effort hint.
         :param workspace: Optional runner start path (source repo / working dir).
         :param base_branch: Optional git base ref to branch from at fire time.
+        :param execution_target: Where a firing runs —
+            ``connected_host``/``managed_sandbox``. Defaults to
+            ``"connected_host"``.
+        :param host_id: For ``connected_host``, the specific host to pin;
+            ``None`` means the owner's freshest online host.
         :param state: Lifecycle state — ``active``/``paused``/``deleted``.
             Defaults to ``"active"``.
         :returns: The newly created :class:`ScheduledTask`.
-        :raises ValueError: If ``state`` is not a recognized value.
+        :raises ValueError: If ``state`` or ``execution_target`` is not a
+            recognized value.
         """
         ...
 
@@ -116,6 +124,8 @@ class ScheduledTaskStore(ABC):
         reasoning_effort: str | None = None,
         workspace: str | None = None,
         base_branch: str | None = None,
+        execution_target: str | None = None,
+        host_id: str | None = None,
         state: str | None = None,
         last_run_at: int | None = None,
         last_run_conversation_id: str | None = None,

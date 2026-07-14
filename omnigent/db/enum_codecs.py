@@ -4,6 +4,7 @@ Several low-cardinality closed-set columns (``conversations.kind``,
 ``conversation_items.type``/``status``, ``comments.status``,
 ``account_tokens.kind``, ``policies.type``, ``policies.scope``,
 ``hosts.status``, ``agents.kind``, ``scheduled_tasks.state``,
+``scheduled_tasks.execution_target``,
 ``scheduled_task_runs.status``) are stored as
 integer codes rather
 than their string names — smaller rows and a tighter ``CHECK`` than a
@@ -92,6 +93,11 @@ SCHEDULED_TASK_STATE: dict[str, int] = {
     "active": 1,
     "paused": 2,
     "deleted": 3,
+}
+
+SCHEDULED_TASK_EXECUTION_TARGET: dict[str, int] = {
+    "connected_host": 1,
+    "managed_sandbox": 2,
 }
 
 SCHEDULED_TASK_RUN_STATUS: dict[str, int] = {
@@ -273,6 +279,16 @@ def encode_scheduled_task_state(name: str) -> int:
 def decode_scheduled_task_state(code: int) -> str:
     """Decode a ``scheduled_tasks.state`` int code to its name."""
     return _decode(SCHEDULED_TASK_STATE, code, field="scheduled_tasks.state")
+
+
+def encode_scheduled_task_execution_target(name: str) -> int:
+    """Encode a ``scheduled_tasks.execution_target`` name to its int code."""
+    return _encode(SCHEDULED_TASK_EXECUTION_TARGET, name, field="scheduled_tasks.execution_target")
+
+
+def decode_scheduled_task_execution_target(code: int) -> str:
+    """Decode a ``scheduled_tasks.execution_target`` int code to its name."""
+    return _decode(SCHEDULED_TASK_EXECUTION_TARGET, code, field="scheduled_tasks.execution_target")
 
 
 def encode_scheduled_task_run_status(name: str) -> int:

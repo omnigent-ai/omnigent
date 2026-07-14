@@ -56,6 +56,14 @@ def upgrade() -> None:
         sa.Column("workspace", sa.String(2048), nullable=True),
         # Git base ref a firing branches from when it creates a worktree.
         sa.Column("base_branch", sa.String(255), nullable=True),
+        # Where a firing runs, as a stable int code (see omnigent.db.enum_codecs
+        # SCHEDULED_TASK_EXECUTION_TARGET: connected_host=1, managed_sandbox=2).
+        # Defaults to connected_host so existing rows keep the V1 behavior.
+        sa.Column("execution_target", sa.SmallInteger(), nullable=False, server_default="1"),
+        # For execution_target=connected_host: the specific host to run on
+        # (relates to hosts.host_id; no DB FK, Rule R032). NULL = owner's
+        # freshest online host. Always NULL for managed_sandbox.
+        sa.Column("host_id", sa.String(64), nullable=True),
         sa.Column("timezone", sa.String(64), nullable=False, server_default="UTC"),
         # Enum stored as a stable int code (see omnigent.db.enum_codecs
         # SCHEDULED_TASK_STATE: active=1, paused=2, deleted=3).
@@ -65,6 +73,9 @@ def upgrade() -> None:
         sa.Column("created_at", sa.Integer(), nullable=False),
         sa.Column("updated_at", sa.Integer(), nullable=True),
         sa.CheckConstraint("state IN (1, 2, 3)", name="ck_scheduled_tasks_state"),
+        sa.CheckConstraint(
+            "execution_target IN (1, 2)", name="ck_scheduled_tasks_execution_target"
+        ),
         sa.PrimaryKeyConstraint("workspace_id", "id"),
     )
     op.create_index(

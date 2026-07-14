@@ -32,6 +32,11 @@ _CODECS = [
         ec.decode_scheduled_task_state,
     ),
     (
+        ec.SCHEDULED_TASK_EXECUTION_TARGET,
+        ec.encode_scheduled_task_execution_target,
+        ec.decode_scheduled_task_execution_target,
+    ),
+    (
         ec.SCHEDULED_TASK_RUN_STATUS,
         ec.encode_scheduled_task_run_status,
         ec.decode_scheduled_task_run_status,
@@ -111,6 +116,10 @@ def test_shipped_codes_are_stable() -> None:
         "active": 1,
         "paused": 2,
         "deleted": 3,
+    }
+    assert ec.SCHEDULED_TASK_EXECUTION_TARGET == {
+        "connected_host": 1,
+        "managed_sandbox": 2,
     }
     assert ec.SCHEDULED_TASK_RUN_STATUS == {
         "scheduled": 1,

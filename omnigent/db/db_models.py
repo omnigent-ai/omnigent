@@ -1126,6 +1126,18 @@ class SqlScheduledTask(OmnigentBase):
         input). Pairs with ``workspace``:
         ``workspace`` is where, ``base_branch`` is what to branch from. ``None``
         when unset. The per-run *output* branch is not stored on the definition.
+    :param execution_target: Where a firing runs —
+        ``connected_host``/``managed_sandbox``. ``connected_host`` resolves the
+        owner's live host at fire time (see ``host_id``); ``managed_sandbox``
+        provisions/adopts a sandbox at fire time. Stored as a stable int code
+        (see omnigent.db.enum_codecs SCHEDULED_TASK_EXECUTION_TARGET); the store
+        converts to/from the string name at the row↔entity boundary. Defaults to
+        ``connected_host``.
+    :param host_id: For ``execution_target=connected_host``, the specific host
+        to run on (relates to ``hosts.host_id``; no DB foreign key, Rule R032).
+        ``None`` means "the owner's freshest online host". Always ``None`` for
+        ``managed_sandbox`` (the sandbox is provisioned/adopted under a
+        deterministic id at fire time, so there is nothing to pin).
     :param timezone: IANA timezone the trigger is evaluated in, e.g.
         ``"America/Los_Angeles"``.
     :param state: Lifecycle state — ``active``/``paused``/``deleted``.
@@ -1177,6 +1189,19 @@ class SqlScheduledTask(OmnigentBase):
     # Git base ref a firing branches from when it creates a worktree at fire
     # time (mirrors session-create's git.base_branch input). None when unset.
     base_branch: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Where a firing runs, as a stable int code (see omnigent.db.enum_codecs
+    # SCHEDULED_TASK_EXECUTION_TARGET: connected_host=1, managed_sandbox=2).
+    # connected_host → resolve the owner's live host at fire time (see host_id);
+    # managed_sandbox → provision/adopt a sandbox at fire time. Defaults to
+    # connected_host so existing rows keep the V1 behavior. The store converts
+    # to/from the string name at the row↔entity boundary.
+    execution_target: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default="1")
+    # For execution_target=connected_host: the specific host to run on (relates
+    # to hosts.host_id; No DB foreign key, Rule R032). None = "the owner's
+    # freshest online host, whichever". Always None for managed_sandbox (the
+    # sandbox is provisioned/adopted under a deterministic id at fire time, so
+    # there is nothing to pin here).
+    host_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     timezone: Mapped[str] = mapped_column(String(64), nullable=False, server_default="UTC")
     # Enum stored as a stable int code (see omnigent.db.enum_codecs
     # SCHEDULED_TASK_STATE: active=1, paused=2, deleted=3). The
@@ -1191,6 +1216,7 @@ class SqlScheduledTask(OmnigentBase):
 
     __table_args__ = (
         CheckConstraint("state IN (1, 2, 3)", name="ck_scheduled_tasks_state"),
+        CheckConstraint("execution_target IN (1, 2)", name="ck_scheduled_tasks_execution_target"),
         Index("ix_scheduled_tasks_created_at", "workspace_id", "created_at", "id"),
         Index("ix_scheduled_tasks_owner_user_id", "workspace_id", "owner_user_id", "id"),
         # Covers the future scheduler's read path:

@@ -62,6 +62,8 @@ def test_scheduled_tasks_columns(db_engine: Engine) -> None:
         "reasoning_effort",
         "workspace",
         "base_branch",
+        "execution_target",
+        "host_id",
         "timezone",
         "state",
         "last_run_at",
@@ -138,10 +140,12 @@ def test_expected_indexes(db_engine: Engine) -> None:
 
 
 def test_state_default_on_omitted_insert(db_engine: Engine) -> None:
-    """A raw insert omitting ``state`` / ``workspace_id`` picks up their defaults.
+    """A raw insert omitting ``state`` / ``workspace_id`` / ``execution_target``
+    picks up their defaults.
 
-    Only the integer server_defaults (``state`` / ``workspace_id``) are exercised
-    here — both are omitted from the insert and must fall back to their defaults.
+    Only the integer server_defaults (``state`` / ``workspace_id`` /
+    ``execution_target``) are exercised here — all are omitted from the insert
+    and must fall back to their defaults.
     """
     with db_engine.begin() as conn:
         conn.execute(
@@ -153,14 +157,35 @@ def test_state_default_on_omitted_insert(db_engine: Engine) -> None:
                 "'0 9 * * *', 'u', 'ag_1', 'UTC', 1)"
             )
         )
-        state, workspace_id = conn.execute(
+        state, workspace_id, execution_target = conn.execute(
             sa.text(
-                "SELECT state, workspace_id FROM scheduled_tasks "
+                "SELECT state, workspace_id, execution_target FROM scheduled_tasks "
                 "WHERE id = X'00000000000000000000000000000de1'"
             )
         ).one()
     assert state == 1  # 1 = 'active'
     assert workspace_id == 0
+    assert execution_target == 1  # 1 = 'connected_host'
+
+
+def test_execution_target_check_rejects_bad_code(db_engine: Engine) -> None:
+    """The ``scheduled_tasks.execution_target`` CHECK rejects codes outside the set.
+
+    execution_target is a stable int code (see enum_codecs
+    SCHEDULED_TASK_EXECUTION_TARGET, codes 1-2); a code outside that range must
+    fail the CHECK.
+    """
+    with pytest.raises(IntegrityError):
+        with db_engine.begin() as conn:
+            conn.execute(
+                sa.text(
+                    "INSERT INTO scheduled_tasks "
+                    "(id, name, prompt, cron_expression, owner_user_id, agent_id, "
+                    " timezone, execution_target, created_at) "
+                    "VALUES (X'00000000000000000000000000e6bad0', 'n', 'p', "
+                    "'0 9 * * *', 'u', 'ag', 'UTC', 99, 1)"
+                )
+            )
 
 
 def test_cron_expression_accepts_recurring_row(db_engine: Engine) -> None:
