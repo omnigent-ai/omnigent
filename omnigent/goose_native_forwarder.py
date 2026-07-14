@@ -21,8 +21,13 @@ We poll ``messages`` past a high-water ``id`` and POST new user/assistant rows a
 assistant message it emits ``function_call`` / ``function_call_output`` items
 stamped with a per-turn ``response_id`` (``goose:turn:{first_assistant_msg_id}``).
 A ``running`` status edge carrying the same id is POSTed on the first assistant
-item of each turn; an ``idle`` edge closes the card when the next user message
-arrives or after :data:`_IDLE_AFTER_QUIET_S` seconds of transcript inactivity.
+item of each turn. The closing ``idle`` edge is posted when the turn's final
+prose message lands (Goose's agent loop ends on an assistant reply with no tool
+calls), when the next user message arrives, or — as a backstop for turns that
+died without either (TUI interrupt, Goose crash) — after
+:data:`_STALLED_TURN_IDLE_S` of store inactivity. On restart the open turn is
+replayed from the store (:func:`_replay_open_turn`) so resumed rows keep the
+same turn id and a card left running by a crash still gets closed.
 The PTY-activity watcher continues to drive the generic session-level
 running/idle badge (id-less); the id-bearing edges here drive only the
 streaming lifecycle of the individual tool-call bubbles.
@@ -38,7 +43,7 @@ import os
 import re
 import sqlite3
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import httpx
@@ -55,11 +60,13 @@ _logger = logging.getLogger(__name__)
 _DEFAULT_POLL_INTERVAL_S = 0.4
 _POST_TIMEOUT_S = 30.0
 
-#: Seconds of transcript inactivity after which the forwarder posts ``idle`` for
-#: the active turn. Closes the live tool-card spinner when Goose finishes a turn
-#: but no new user message has arrived yet to act as the authoritative close signal.
-#: 8 s comfortably absorbs a stalled tool call without leaving a stale spinner.
-_IDLE_AFTER_QUIET_S = 8.0
+#: Seconds of store inactivity after which an open turn's live card is closed.
+#: This is only a backstop for turns that died without their normal close (the
+#: final prose row or the next user message) — e.g. a TUI interrupt or a Goose
+#: crash. Minutes, not seconds: a legitimately long tool call writes no store
+#: rows while it runs, and closing early makes the spinner flicker on exactly
+#: the calls the live card is most useful for.
+_STALLED_TURN_IDLE_S = 300.0
 
 # Supervisor backoff (mirrors cursor_native_forwarder.supervise_cursor_forwarder).
 _SUPERVISOR_INITIAL_BACKOFF_S = 1.0
@@ -451,6 +458,132 @@ def _read_new_items(
     return result
 
 
+@dataclass
+class _TurnState:
+    """Live-card lifecycle state for the assistant turn currently being mirrored.
+
+    In-memory only; rebuilt from the store on restart by :func:`_replay_open_turn`.
+
+    :param response_id: Shared response id stamped on the open turn's items
+        (``goose:turn:{first_msg_id}``), or ``None`` before any turn opened.
+        Retained after a close so a turn that unexpectedly resumes rejoins its
+        original streaming group instead of minting a new one.
+    :param live: A ``running`` edge for ``response_id`` was posted and not yet
+        closed by an ``idle``.
+    :param pending_tool_call_ids: ``toolreq`` ids still awaiting a ``toolresp``;
+        while non-empty the turn is provably mid-tool-call, so a prose row
+        cannot be its final message.
+    :param last_activity_ts: Monotonic time of the last store row seen while a
+        turn was open, for the stalled-turn backstop close.
+    """
+
+    response_id: str | None = None
+    live: bool = False
+    pending_tool_call_ids: set[str] = field(default_factory=set)
+    last_activity_ts: float | None = None
+
+    def reset(self) -> None:
+        """Forget the turn (a user row closed it, or replay found it finished)."""
+        self.response_id = None
+        self.live = False
+        self.pending_tool_call_ids.clear()
+        self.last_activity_ts = None
+
+
+def _row_completes_turn(state: _TurnState, role: str, items: list[_MirrorItem]) -> bool:
+    """Advance *state*'s tool-call ledger by one mirrored row; ``True`` if the
+    row is the turn's final message.
+
+    Goose's agent loop keeps stepping while the model returns tool calls and
+    stops on a plain reply, so an assistant prose row with no tool calls (and
+    none outstanding) is the authoritative end of the turn.
+    """
+    if role not in ("assistant", "tool") or not items:
+        return False
+    saw_call = False
+    for item in items:
+        call_id = str(item.item_data.get("call_id", ""))
+        if item.item_type == "function_call":
+            state.pending_tool_call_ids.add(call_id)
+            saw_call = True
+        elif item.item_type == "function_call_output":
+            state.pending_tool_call_ids.discard(call_id)
+    return role == "assistant" and not saw_call and not state.pending_tool_call_ids
+
+
+def _read_open_turn_rows(
+    db_path: Path, goose_session_id: str, last_id: int
+) -> list[tuple[int, str, str]]:
+    """Read the already-processed rows of the possibly-open turn: everything
+    after the last user row, up to and including the ``last_id`` cursor.
+
+    Empty when the cursor sits on a user row (no turn open) or on error.
+    """
+    con = _connect_ro(db_path)
+    if con is None:
+        return []
+    try:
+        return con.execute(
+            "SELECT id, role, content_json FROM messages "
+            "WHERE session_id = ? AND id <= ? "
+            "AND id > COALESCE((SELECT MAX(id) FROM messages "
+            "WHERE session_id = ? AND id <= ? AND role = 'user'), 0) "
+            "ORDER BY id",
+            (goose_session_id, last_id, goose_session_id, last_id),
+        ).fetchall()
+    except sqlite3.Error as exc:
+        _warn_sqlite_once("open-turn replay read", exc)
+        return []
+    finally:
+        con.close()
+
+
+async def _replay_open_turn(
+    client: httpx.AsyncClient,
+    *,
+    db: Path,
+    goose_session_id: str,
+    last_id: int,
+    agent_name: str,
+    session_id: str,
+    state: _TurnState,
+) -> None:
+    """Rebuild *state* for a turn that was mid-flight when the previous run stopped.
+
+    Turn state is in-memory, so without this a restart would mint a fresh turn id
+    for the remaining rows (splitting the streaming group of items already posted
+    under the original id) and could never close a ``running`` edge the previous
+    run posted (a spinner that never settles). Replaying the open turn's rows
+    through the same transitions restores the original id and ledger; if the
+    replayed turn already ended, the closing ``idle`` is (re-)posted — redundant
+    when the previous run got there first, but idempotent for the UI.
+    """
+    rows = await asyncio.to_thread(_read_open_turn_rows, db, goose_session_id, last_id)
+    any_items = False
+    completed = False
+    for msg_id, role, content_json in rows:
+        if role in ("assistant", "tool") and state.response_id is None:
+            state.response_id = f"goose:turn:{msg_id}"
+        items = _message_to_items(msg_id, role, content_json, agent_name, state.response_id)
+        any_items = any_items or bool(items)
+        # Item-less scaffolding rows (system, empty) don't reopen a turn whose
+        # final prose already landed.
+        completed = _row_completes_turn(state, role, items) or (completed and not items)
+    if state.response_id is None or not any_items:
+        # No turn open, or one that never produced a postable item (so the
+        # previous run never posted `running` for it either).
+        state.reset()
+        return
+    if completed:
+        await post_external_session_status(
+            client, session_id=session_id, status="idle", response_id=state.response_id
+        )
+        state.reset()
+    else:
+        state.live = True
+        state.last_activity_ts = time.monotonic()
+
+
 async def _post_conversation_item(
     client: httpx.AsyncClient, *, session_id: str, item: _MirrorItem
 ) -> None:
@@ -506,20 +639,29 @@ async def forward_goose_store_to_session(
     last_id = persisted.last_id if goose_session_id is not None else 0
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
 
-    # Per-turn live-card state (in-memory; not persisted — recomputed on restart).
-    # current_turn_response_id: shared response_id for all items in the active turn.
-    # posted_running_response_id: dedupe guard so we POST running only once per turn.
-    # last_assistant_item_ts: wall-clock of the last assistant/tool item, for idle
-    #     quiescence when no next user message arrives promptly.
-    current_turn_response_id: str | None = None
-    posted_running_response_id: str | None = None
-    last_assistant_item_ts: float | None = None
+    state = _TurnState()
+    # A previous run may have died mid-turn; rebuild the turn state from the
+    # store before mirroring anything new. Retried in-band (not via the
+    # supervisor) if the replay's idle post hits a transient server error.
+    needs_replay = goose_session_id is not None and last_id > 0
 
     async with httpx.AsyncClient(
         base_url=base_url, headers=headers, auth=auth, timeout=timeout
     ) as client:
         while True:
             try:
+                if needs_replay and goose_session_id is not None:
+                    await _replay_open_turn(
+                        client,
+                        db=db,
+                        goose_session_id=goose_session_id,
+                        last_id=last_id,
+                        agent_name=agent_name,
+                        session_id=session_id,
+                        state=state,
+                    )
+                    needs_replay = False
+
                 if goose_session_id is None:
                     resolved = await asyncio.to_thread(
                         _resolve_goose_session_id, db, goose_session_name
@@ -536,46 +678,51 @@ async def forward_goose_store_to_session(
                     rows = await asyncio.to_thread(_read_new_rows, db, goose_session_id, last_id)
                     for msg_id, role, content_json in rows:
                         if role == "user":
-                            # A new user turn closes the previous assistant turn.
-                            if (
-                                current_turn_response_id is not None
-                                and posted_running_response_id == current_turn_response_id
-                            ):
+                            # A new user turn authoritatively closes the previous one.
+                            if state.live:
                                 await post_external_session_status(
                                     client,
                                     session_id=session_id,
                                     status="idle",
-                                    response_id=current_turn_response_id,
+                                    response_id=state.response_id,
                                 )
-                            current_turn_response_id = None
-                            posted_running_response_id = None
-                            last_assistant_item_ts = None
+                            state.reset()
 
-                        elif role in ("assistant", "tool") and current_turn_response_id is None:
+                        elif role in ("assistant", "tool") and state.response_id is None:
                             # First assistant/tool row of a new turn: mint the turn id.
-                            current_turn_response_id = f"goose:turn:{msg_id}"
+                            state.response_id = f"goose:turn:{msg_id}"
 
                         items = _message_to_items(
-                            msg_id, role, content_json, agent_name, current_turn_response_id
+                            msg_id, role, content_json, agent_name, state.response_id
                         )
 
-                        # Post running status once per turn, before the first item.
-                        if items and role in ("assistant", "tool"):
-                            if (
-                                current_turn_response_id is not None
-                                and posted_running_response_id != current_turn_response_id
-                            ):
-                                await post_external_session_status(
-                                    client,
-                                    session_id=session_id,
-                                    status="running",
-                                    response_id=current_turn_response_id,
-                                )
-                                posted_running_response_id = current_turn_response_id
-                            last_assistant_item_ts = time.monotonic()
+                        # Post running once per turn, before the turn's first item.
+                        if items and role in ("assistant", "tool") and not state.live:
+                            await post_external_session_status(
+                                client,
+                                session_id=session_id,
+                                status="running",
+                                response_id=state.response_id,
+                            )
+                            state.live = True
 
                         for item in items:
                             await _post_conversation_item(client, session_id=session_id, item=item)
+
+                        # The turn's final prose row closes its live card at once.
+                        if _row_completes_turn(state, role, items) and state.live:
+                            await post_external_session_status(
+                                client,
+                                session_id=session_id,
+                                status="idle",
+                                response_id=state.response_id,
+                            )
+                            state.live = False
+
+                        if state.response_id is not None:
+                            # Any store write while a turn is open proves Goose is
+                            # alive; only true silence should trip the backstop.
+                            state.last_activity_ts = time.monotonic()
 
                         last_id = msg_id
                         _write_state(
@@ -583,23 +730,21 @@ async def forward_goose_store_to_session(
                             _ForwardState(goose_session_id=goose_session_id, last_id=last_id),
                         )
 
-                    # Quiescence: close a stale live card when Goose finishes but
-                    # the next user message hasn't arrived yet.
+                    # Backstop: a turn that died without its normal close (TUI
+                    # interrupt, Goose crash) must not leave a spinner forever.
                     if (
-                        current_turn_response_id is not None
-                        and posted_running_response_id == current_turn_response_id
-                        and last_assistant_item_ts is not None
-                        and time.monotonic() - last_assistant_item_ts > _IDLE_AFTER_QUIET_S
+                        state.live
+                        and state.last_activity_ts is not None
+                        and time.monotonic() - state.last_activity_ts > _STALLED_TURN_IDLE_S
                     ):
                         await post_external_session_status(
                             client,
                             session_id=session_id,
                             status="idle",
-                            response_id=current_turn_response_id,
+                            response_id=state.response_id,
                         )
-                        # Clear so we don't re-fire idle on every subsequent poll.
-                        posted_running_response_id = None
-                        last_assistant_item_ts = None
+                        # Keep response_id: a late resume rejoins the same turn.
+                        state.live = False
 
             except asyncio.CancelledError:
                 raise

@@ -4,11 +4,15 @@ Builds a fixture SQLite store matching Goose 1.38.0's verified schema
 (``sessions`` + ``messages`` with a monotonic ``id`` cursor and JSON
 ``content_json``) and exercises discovery-by-name, message decode, attachment
 stripping, role mapping, the idempotent high-water cursor, tool-call extraction,
-and live-card per-turn response-id grouping.
+and live-card per-turn response-id grouping. The poll-loop tests at the bottom
+drive ``forward_goose_store_to_session`` end to end against a recording poster
+to pin the live-card lifecycle (running/idle edges, stalled-turn backstop, and
+restart replay).
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 from pathlib import Path
@@ -277,3 +281,230 @@ def test_default_sessions_db_honors_override(monkeypatch) -> None:
     assert f.default_sessions_db() == Path("/custom/sessions.db")
     monkeypatch.delenv("GOOSE_SESSIONS_DB", raising=False)
     assert f.default_sessions_db().name == "sessions.db"
+
+
+# ── poll-loop live-card lifecycle ─────────────────────────────────────────────
+
+
+_SID = "20260619_1"
+
+
+def _seed_empty_db(path: Path) -> None:
+    """Schema + session row only; tests insert messages as the 'turn' unfolds."""
+    con = sqlite3.connect(path)
+    con.executescript(_SCHEMA)
+    con.execute(f"INSERT INTO sessions(id, name, working_dir) VALUES('{_SID}', 'omni-1', '/tmp')")
+    con.commit()
+    con.close()
+
+
+def _insert(db: Path, role: str, content: list[dict]) -> int:
+    con = sqlite3.connect(db)
+    cur = con.execute(
+        "INSERT INTO messages(session_id, role, content_json, created_timestamp) VALUES (?,?,?,0)",
+        (_SID, role, json.dumps(content)),
+    )
+    con.commit()
+    rowid = cur.lastrowid
+    con.close()
+    assert rowid is not None
+    return rowid
+
+
+def _prose(text: str) -> list[dict]:
+    return [{"type": "text", "text": text}]
+
+
+def _toolreq(call_id: str) -> list[dict]:
+    return [{"type": "toolreq", "id": call_id, "name": "bash", "parameters": {"cmd": "ls"}}]
+
+
+def _toolresp(call_id: str) -> list[dict]:
+    return [{"type": "toolresp", "id": call_id, "output": "ok"}]
+
+
+class _Recorder:
+    """Records every status edge and mirrored item the loop posts, in order."""
+
+    def __init__(self) -> None:
+        self.events: list[tuple[str, str, str | None]] = []
+
+    async def post_status(self, client, *, session_id, status, response_id=None, **_) -> None:
+        self.events.append(("status", status, response_id))
+
+    async def post_item(self, client, *, session_id, item) -> None:
+        self.events.append(("item", item.item_type, item.response_id))
+
+    def statuses(self) -> list[tuple[str, str | None]]:
+        return [(status, rid) for kind, status, rid in self.events if kind == "status"]
+
+
+async def _run_loop(db, bridge_dir, rec, monkeypatch, until, max_ticks=1500) -> None:
+    """Run the real poll loop against *db* + *rec* until *until()* holds.
+
+    Raises if the condition is never reached within *max_ticks* (~2ms each) —
+    i.e. the loop wedged or the expected posts never happened.
+    """
+    monkeypatch.setattr(f, "post_external_session_status", rec.post_status)
+    monkeypatch.setattr(f, "_post_conversation_item", rec.post_item)
+    task = asyncio.create_task(
+        f.forward_goose_store_to_session(
+            base_url="http://test",
+            headers={},
+            session_id="conv_1",
+            bridge_dir=bridge_dir,
+            agent_name="goose-native",
+            goose_session_name="omni-1",
+            db_path=db,
+            poll_interval_s=0.001,
+        )
+    )
+    try:
+        for _ in range(max_ticks):
+            if until():
+                break
+            await asyncio.sleep(0.002)
+        else:
+            raise AssertionError(f"loop never reached expected state; events={rec.events}")
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+def _idle_seen(rec: _Recorder, turn: str):
+    """Until-condition: the closing idle edge for *turn* has been posted."""
+
+    def check() -> bool:
+        return ("status", "idle", turn) in rec.events
+
+    return check
+
+
+async def test_turn_closes_immediately_on_final_prose(tmp_path, monkeypatch) -> None:
+    # The normal close: Goose's loop ends on an assistant reply with no tool
+    # calls, so the idle edge must land right after that row is mirrored — not
+    # after a quiescence wait (the stall backstop is minutes away).
+    db = tmp_path / "sessions.db"
+    _seed_empty_db(db)
+    _insert(db, "user", _prose("hi"))
+    req_id = _insert(db, "assistant", _toolreq("call_1"))
+    _insert(db, "tool", _toolresp("call_1"))
+    _insert(db, "assistant", _prose("done"))
+    turn = f"goose:turn:{req_id}"
+
+    rec = _Recorder()
+    await _run_loop(db, tmp_path / "bridge", rec, monkeypatch, _idle_seen(rec, turn))
+
+    assert rec.statuses() == [("running", turn), ("idle", turn)]
+    # running precedes the turn's first item; idle follows its last.
+    assert rec.events.index(("status", "running", turn)) < rec.events.index(
+        ("item", "function_call", turn)
+    )
+    assert rec.events.index(("status", "idle", turn)) > rec.events.index(("item", "message", turn))
+
+
+async def test_no_idle_while_tool_call_runs_long(tmp_path, monkeypatch) -> None:
+    # A tool call writes no store rows while it executes; quiet alone must not
+    # close the card (the old 8s quiescence flickered on every long call).
+    db = tmp_path / "sessions.db"
+    _seed_empty_db(db)
+    _insert(db, "user", _prose("hi"))
+    req_id = _insert(db, "assistant", _toolreq("call_1"))
+    turn = f"goose:turn:{req_id}"
+
+    rec = _Recorder()
+    db_done: list[bool] = []
+
+    def _finished() -> bool:
+        if not db_done and ("item", "function_call", turn) in rec.events:
+            # Card is live; let the "tool" run quietly for a while, then land
+            # its result + the final prose.
+            db_done.append(True)
+            loop = asyncio.get_running_loop()
+            loop.call_later(0.3, _insert, db, "tool", _toolresp("call_1"))
+            loop.call_later(0.3, _insert, db, "assistant", _prose("done"))
+        return ("status", "idle", turn) in rec.events
+
+    await _run_loop(db, tmp_path / "bridge", rec, monkeypatch, _finished)
+
+    # Exactly one running and one closing idle — no mid-call flicker.
+    assert rec.statuses() == [("running", turn), ("idle", turn)]
+
+
+async def test_stalled_turn_backstop_closes_and_resume_rejoins(tmp_path, monkeypatch) -> None:
+    # A turn that dies without its normal close (interrupt/crash) is closed by
+    # the backstop; if rows do arrive later they rejoin the same turn id.
+    monkeypatch.setattr(f, "_STALLED_TURN_IDLE_S", 0.15)
+    db = tmp_path / "sessions.db"
+    _seed_empty_db(db)
+    _insert(db, "user", _prose("hi"))
+    req_id = _insert(db, "assistant", _toolreq("call_1"))
+    turn = f"goose:turn:{req_id}"
+
+    rec = _Recorder()
+    resumed: list[bool] = []
+    full = [("running", turn), ("idle", turn), ("running", turn), ("idle", turn)]
+
+    def staged() -> bool:
+        if not resumed and rec.statuses() == full[:2]:
+            # Backstop closed the quiet turn; the result + final prose arriving
+            # late must re-open and re-close the SAME turn, not mint a new one.
+            resumed.append(True)
+            _insert(db, "tool", _toolresp("call_1"))
+            _insert(db, "assistant", _prose("done"))
+        return rec.statuses() == full
+
+    await _run_loop(db, tmp_path / "bridge", rec, monkeypatch, staged)
+    assert rec.statuses() == full
+
+
+async def test_restart_replay_resumes_turn_id_without_reposting(tmp_path, monkeypatch) -> None:
+    # Crash simulation: the previous run mirrored the toolreq row (cursor=req
+    # row, running edge already posted) and died mid-tool-call. The restart must
+    # adopt the original turn id for the remaining rows — not re-post running,
+    # not mint a fresh id that would split the streaming group.
+    db = tmp_path / "sessions.db"
+    _seed_empty_db(db)
+    _insert(db, "user", _prose("hi"))
+    req_id = _insert(db, "assistant", _toolreq("call_1"))
+    _insert(db, "tool", _toolresp("call_1"))
+    _insert(db, "assistant", _prose("done"))
+    turn = f"goose:turn:{req_id}"
+
+    bridge = tmp_path / "bridge"
+    f._write_state(bridge, f._ForwardState(goose_session_id=_SID, last_id=req_id))
+
+    rec = _Recorder()
+    await _run_loop(db, bridge, rec, monkeypatch, _idle_seen(rec, turn))
+
+    assert rec.statuses() == [("idle", turn)]  # no duplicate running
+    assert ("item", "function_call_output", turn) in rec.events
+    assert ("item", "message", turn) in rec.events
+
+
+async def test_restart_replay_closes_already_finished_turn(tmp_path, monkeypatch) -> None:
+    # Crash simulation: the previous run mirrored the turn's final prose row but
+    # died before posting the closing idle. The restart must close the card (a
+    # redundant idle is harmless; a spinner that never settles is not).
+    db = tmp_path / "sessions.db"
+    _seed_empty_db(db)
+    _insert(db, "user", _prose("hi"))
+    prose_id = _insert(db, "assistant", _prose("all done"))
+    turn = f"goose:turn:{prose_id}"
+
+    bridge = tmp_path / "bridge"
+    f._write_state(bridge, f._ForwardState(goose_session_id=_SID, last_id=prose_id))
+
+    rec = _Recorder()
+    await _run_loop(db, bridge, rec, monkeypatch, _idle_seen(rec, turn))
+    assert rec.events[0] == ("status", "idle", turn)
+
+    # And the forwarder is clean for the next turn: a fresh user message and
+    # reply run the normal lifecycle under a new turn id. (A restart replays
+    # the same close first — the cursor never moved past the finished turn.)
+    _insert(db, "user", _prose("thanks"))
+    next_id = _insert(db, "assistant", _prose("np"))
+    next_turn = f"goose:turn:{next_id}"
+    rec2 = _Recorder()
+    await _run_loop(db, bridge, rec2, monkeypatch, _idle_seen(rec2, next_turn))
+    assert rec2.statuses() == [("idle", turn), ("running", next_turn), ("idle", next_turn)]
