@@ -12910,6 +12910,8 @@ async def _create_session_from_existing_agent(
                 runner_client,
                 conversation_store,
             )
+            # Dispatch (not a plain forward) so native-terminal sessions take the
+            # single-writer bypass — otherwise the forwarder's echo duplicates the kickoff.
             for item in body.initial_items:
                 await _dispatch_session_event_to_runner(
                     conv.id,
