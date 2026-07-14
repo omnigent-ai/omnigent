@@ -58,6 +58,15 @@ class ThreadTurnDispatcher:
                     queue.task_done()
         finally:
             async with self._lock:
-                if self._queues.get(key) is queue and queue.empty():
-                    self._queues.pop(key, None)
-                    self._tasks.pop(key, None)
+                if self._queues.get(key) is queue:
+                    if queue.empty():
+                        self._queues.pop(key, None)
+                        self._tasks.pop(key, None)
+                    else:
+                        # A turn slipped in after the idle timeout fired but
+                        # before this teardown reacquired the lock. The queue
+                        # stays registered, so no future enqueue would spawn a
+                        # worker — re-arm one here to keep draining it.
+                        self._tasks[key] = asyncio.create_task(
+                            self._run_queue(key, queue)
+                        )

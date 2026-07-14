@@ -238,7 +238,19 @@ class SlackOmnigentService:
                     )
                     now = time.monotonic()
                     if now - last_update >= self._update_interval_seconds:
-                        await self._update_slack(slack_client, turn.key, message_ts, streamed_text)
+                        # A progress edit is best-effort: a failure here (e.g. a
+                        # transient Slack error) must not abort the turn or
+                        # clobber the real answer delivered below.
+                        try:
+                            await self._update_slack(
+                                slack_client, turn.key, message_ts, streamed_text
+                            )
+                        except Exception:
+                            self._logger.warning(
+                                "Slack progress update failed thread=%s; continuing",
+                                turn.key.display(),
+                                exc_info=True,
+                            )
                         last_update = now
 
                 item_text = extract_assistant_text(omnigent_event)
@@ -252,21 +264,49 @@ class SlackOmnigentService:
             self._logger.exception("Omnigent turn failed for %s", turn.key.display())
             error_text = str(exc)
 
-        if error_text:
-            final_text = f"Omnigent request failed: {error_text}"
+        # Resolve the answer independently of any error so a failure never
+        # erases what the user already saw stream in.
         if not final_text:
             final_text = streamed_text.strip() or await self._omnigent.latest_assistant_text(
                 session_id
             )
-        if not final_text:
-            final_text = "Omnigent completed without returning response text."
 
-        await self._deliver_final(slack_client, turn.key, message_ts, final_text)
+        if final_text:
+            # Deliver the real answer, then, if the turn also errored, report
+            # the failure as a separate reply instead of overwriting it.
+            await self._deliver_final(slack_client, turn.key, message_ts, final_text)
+            if error_text:
+                await self._post_failure_reply(slack_client, turn.key, error_text)
+        else:
+            # Nothing to preserve — surface the error (or a fallback) in the
+            # placeholder itself.
+            fallback = (
+                f"Omnigent request failed: {error_text}"
+                if error_text
+                else "Omnigent completed without returning response text."
+            )
+            await self._deliver_final(slack_client, turn.key, message_ts, fallback)
+
         self._logger.info(
-            "Completed Slack turn thread=%s session_id=%s final_chars=%s",
+            "Completed Slack turn thread=%s session_id=%s final_chars=%s errored=%s",
             turn.key.display(),
             session_id,
-            len(final_text),
+            len(final_text or ""),
+            bool(error_text),
+        )
+
+    async def _post_failure_reply(
+        self,
+        client: SlackClientProtocol,
+        key: ThreadKey,
+        error_text: str,
+    ) -> None:
+        # Post the failure as its own thread reply so the already-delivered
+        # answer stays intact. Keep it to a single message.
+        await client.chat_postMessage(
+            channel=key.channel_id,
+            thread_ts=key.thread_ts,
+            text=truncate_for_slack(f":warning: Omnigent request failed: {error_text}"),
         )
 
     async def _deliver_final(

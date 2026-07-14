@@ -30,10 +30,11 @@ def normalize_whitespace(text: str) -> str:
     return WHITESPACE_RE.sub(" ", text).strip()
 
 
-# Slack rejects a message whose `text` exceeds its limit with `msg_too_long`.
-# The documented ceiling is higher, but updates fail well below it in practice,
-# so keep a conservative default that also renders without a "Show more" fold.
-SLACK_MESSAGE_CHAR_LIMIT = 3900
+# Slack accepts up to 40,000 characters in a message `text`, but its own
+# guidance is to keep messages under 4,000 so they render without a "Show more"
+# fold. Stay at that best-practice ceiling and split longer answers across
+# replies (see `split_for_slack`).
+SLACK_MESSAGE_CHAR_LIMIT = 4000
 
 
 def truncate_for_slack(text: str, limit: int = SLACK_MESSAGE_CHAR_LIMIT) -> str:
