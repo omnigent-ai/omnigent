@@ -206,8 +206,7 @@ class OmnigentClient:
                 return
             if asyncio.get_running_loop().time() >= deadline:
                 raise OmnigentError(
-                    "Timed out waiting for launched Omnigent runner to come online: "
-                    f"{runner_id}"
+                    f"Timed out waiting for launched Omnigent runner to come online: {runner_id}"
                 )
             await asyncio.sleep(1)
 
@@ -334,12 +333,21 @@ async def iter_sse_events(lines: AsyncIterator[str]) -> AsyncIterator[dict[str, 
 
 
 def is_terminal_event(event: dict[str, Any]) -> bool:
-    return str(event.get("type")) in {
-        "response.completed",
+    # A turn ends at the SESSION level, not the response level. Orchestrator
+    # agents emit a `response.completed`/`turn.completed` every time they end a
+    # turn to wait on a background sub-agent, then resume with more responses in
+    # the same turn — so treating those as terminal cuts the stream off at the
+    # first sub-agent dispatch. `session.status` is the authoritative signal:
+    # `running` -> `waiting` (parked on async work) -> `running` -> `idle`, and
+    # only `idle`/`failed` mean the turn is truly over.
+    event_type = str(event.get("type"))
+    if event_type == "session.status":
+        return str(event.get("status")) in {"idle", "failed"}
+    # Explicit turn/response failure and cancellation still end the turn; keep
+    # them as a fallback in case the session settles without an `idle` edge.
+    return event_type in {
         "response.failed",
-        "response.incomplete",
         "response.cancelled",
-        "turn.completed",
         "turn.failed",
         "turn.cancelled",
     }

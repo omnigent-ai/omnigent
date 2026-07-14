@@ -9,8 +9,27 @@ from omnigent_slack.omnigent import (
     OmnigentError,
     RunnerUnavailableError,
     extract_assistant_text,
+    is_terminal_event,
     iter_sse_events,
 )
+
+
+def test_is_terminal_event_only_ends_on_session_idle_or_failed() -> None:
+    # Per-response completions are NOT terminal: an orchestrator emits one each
+    # time it ends a turn to wait on a sub-agent, then resumes the same turn.
+    assert not is_terminal_event({"type": "response.completed"})
+    assert not is_terminal_event({"type": "turn.completed"})
+    assert not is_terminal_event({"type": "response.output_text.delta", "delta": "x"})
+    assert not is_terminal_event({"type": "session.status", "status": "running"})
+    assert not is_terminal_event({"type": "session.status", "status": "waiting"})
+
+    # The session settling is the authoritative turn boundary.
+    assert is_terminal_event({"type": "session.status", "status": "idle"})
+    assert is_terminal_event({"type": "session.status", "status": "failed"})
+
+    # Explicit failure/cancel still ends the turn as a fallback.
+    assert is_terminal_event({"type": "response.failed"})
+    assert is_terminal_event({"type": "turn.cancelled"})
 
 
 async def _lines(values: list[str]) -> AsyncIterator[str]:
@@ -216,6 +235,41 @@ async def test_client_errors_when_no_runner_and_no_launch_workspace() -> None:
         await client.aclose()
 
     assert "OMNIGENT_RUNNER_WORKSPACE" in message
+
+
+@respx.mock
+async def test_run_turn_streams_across_multiple_responses_until_session_idle() -> None:
+    # An orchestrator ends its first response to wait on a sub-agent, then
+    # resumes with the real answer in a second response. The turn is only over
+    # once the session settles to idle — `response.completed` alone must not
+    # cut the stream off after the "dispatched, waiting" message.
+    sse_body = (
+        'data: {"type":"response.output_text.delta","delta":"Explorer dispatched."}\n\n'
+        'data: {"type":"response.completed","response":{"status":"completed"}}\n\n'
+        'data: {"type":"response.output_text.delta","delta":"Here is the report."}\n\n'
+        'data: {"type":"response.completed","response":{"status":"completed"}}\n\n'
+        'data: {"type":"session.status","conversation_id":"conv_1","status":"idle"}\n\n'
+        "data: [DONE]\n\n"
+    )
+    respx.get("http://omnigent.test/v1/sessions/conv_1/stream").mock(
+        return_value=httpx.Response(200, text=sse_body)
+    )
+    respx.post("http://omnigent.test/v1/sessions/conv_1/events").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    try:
+        deltas = [
+            event.get("delta")
+            async for event in client.run_turn("conv_1", "hello")
+            if event.get("type") == "response.output_text.delta"
+        ]
+    finally:
+        await client.aclose()
+
+    # Both responses stream; the second (the real answer) is not dropped.
+    assert deltas == ["Explorer dispatched.", "Here is the report."]
 
 
 @respx.mock
