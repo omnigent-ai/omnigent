@@ -405,9 +405,6 @@ class SqlConversationMetadata(OmnigentBase):
     # Required when host_id is set; enforced by check constraint below.
     workspace: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     git_branch: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    archived: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=False, server_default=false()
-    )
 
     __table_args__ = (
         CheckConstraint("kind IN (1, 2)", name="ck_conversation_metadata_kind"),
@@ -529,10 +526,20 @@ class SqlConversation(ConversationBase):
     )
     # Monotonic allocator for the next item position in this conversation.
     next_position: Mapped[int | None] = mapped_column(Integer, nullable=True, default=0)
+    # Whether the session is archived (hidden from the default sidebar). Lives
+    # here on the AP table so list_conversations can filter it inline alongside
+    # the created_at/updated_at sort keys, instead of pre-fetching ids from the
+    # Omnigent metadata DB.
+    archived: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
 
     __table_args__ = (
         Index("ix_conversations_created_at", "workspace_id", "created_at", "id"),
         Index("ix_conversations_updated_at", "workspace_id", "updated_at", "id"),
+        # Default sidebar filters archived=false and sorts by updated_at DESC;
+        # archived leads as an equality so the page walk stays index-only.
+        Index("ix_conversations_archived_updated", "workspace_id", "archived", "updated_at", "id"),
         Index(
             "ix_conversations_root_conversation_id",
             "workspace_id",

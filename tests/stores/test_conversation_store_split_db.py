@@ -454,16 +454,17 @@ def test_agent_store_resolves_session_id_across_dbs(
 # ── Orphan repair: update with a missing metadata row ─────────────────
 
 
-def test_update_conversation_repairs_missing_metadata(
+def test_update_conversation_archives_without_metadata_row(
     omnigent_db: Path,
     conv_db: Path,
     store: SqlAlchemyConversationStore,
 ) -> None:
     """
-    A crash between the AP and metadata transactions during creation
-    leaves a conversation with no metadata row. An archive update must
-    recreate the row (deriving ``kind`` from the parent pointer) rather
-    than silently dropping the write and reporting ``archived=False``.
+    A crash between the AP and metadata transactions during creation leaves a
+    conversation with no metadata row. ``archived`` now lives on the AP
+    conversations row, so an archive update must persist and report correctly
+    even without a metadata row — and ``kind`` stays correct (derived from the
+    parent pointer), never silently reporting ``archived=False``.
     """
     parent = store.create_conversation(title="orphan parent")
     child = store.create_conversation(
@@ -483,17 +484,20 @@ def test_update_conversation_repairs_missing_metadata(
     updated = store.update_conversation(parent.id, archived=True)
     assert updated is not None
     assert updated.archived is True
+    assert updated.kind == "default"
 
     child_updated = store.update_conversation(child.id, archived=True)
     assert child_updated is not None
     assert child_updated.archived is True
-    # kind is rederived from the parent pointer during repair.
+    # kind is derived from the parent pointer, not the (missing) metadata row.
     assert child_updated.kind == "sub_agent"
 
-    # Both metadata rows were recreated in the Omnigent DB.
-    assert sorted(_col(omnigent_db, "omnigent_conversation_metadata", "id")) == sorted(
+    # archived is persisted on the AP conversations rows.
+    assert sorted(_col(conv_db, "conversations", "id", where="archived = 1")) == sorted(
         [parent.id, child.id]
     )
+    # The archive path does not resurrect metadata rows (archived is AP-side now).
+    assert _count(omnigent_db, "omnigent_conversation_metadata") == 0
 
 
 # ── Session-scoped agent cleanup on conversation delete ───────────────

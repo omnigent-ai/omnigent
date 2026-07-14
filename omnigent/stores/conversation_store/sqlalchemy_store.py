@@ -157,7 +157,7 @@ def _to_conversation(
         ),
         workspace=meta.workspace if meta else None,
         git_branch=meta.git_branch if meta else None,
-        archived=meta.archived if meta else False,
+        archived=row.archived,
     )
 
 
@@ -265,7 +265,6 @@ def _new_session_metadata_row(
         terminal_launch_args=(
             json.dumps(terminal_launch_args) if terminal_launch_args is not None else None
         ),
-        archived=False,
     )
 
 
@@ -917,7 +916,6 @@ class SqlAlchemyConversationStore(ConversationStore):
                 terminal_launch_args=(
                     json.dumps(terminal_launch_args) if terminal_launch_args is not None else None
                 ),
-                archived=False,
             )
             with self._session() as meta_sess:
                 meta_sess.add(meta)
@@ -1884,29 +1882,45 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         from omnigent.server.auth import LEVEL_OWNER
 
-        # Get non-archived IDs from Omnigent, then filter labels in AP.
-        with self._session() as meta_sess:
-            non_archived_q = select(SqlConversationMetadata.id).where(
-                SqlConversationMetadata.workspace_id == current_workspace_id(),
-                SqlConversationMetadata.archived.is_(False),
-            )
-            if accessible_by is not None:
-                accessible_ids = select(SqlSessionPermission.conversation_id).where(
-                    SqlSessionPermission.workspace_id == current_workspace_id(),
-                    SqlSessionPermission.user_id == accessible_by,
-                )
-                non_archived_q = non_archived_q.where(
-                    SqlConversationMetadata.id.in_(accessible_ids)
-                )
-            if owned_by is not None:
-                owned_ids = select(SqlSessionPermission.conversation_id).where(
-                    SqlSessionPermission.workspace_id == current_workspace_id(),
-                    SqlSessionPermission.user_id == owned_by,
-                    SqlSessionPermission.level >= LEVEL_OWNER,
-                )
-                non_archived_q = non_archived_q.where(SqlConversationMetadata.id.in_(owned_ids))
-            non_archived_ids = list(meta_sess.execute(non_archived_q).scalars().all())
+        # ACL (accessible_by/owned_by) resolves against session_permissions on
+        # the Omnigent DB, so it still needs a pre-fetch; archived now lives on
+        # the AP conversations table and is filtered inline below.
+        permission_ids: list[str] | None = None
+        if accessible_by is not None or owned_by is not None:
+            with self._session() as meta_sess:
+                accessible_set: set[str] | None = None
+                owned_set: set[str] | None = None
+                if accessible_by is not None:
+                    accessible_set = set(
+                        meta_sess.execute(
+                            select(SqlSessionPermission.conversation_id).where(
+                                SqlSessionPermission.workspace_id == current_workspace_id(),
+                                SqlSessionPermission.user_id == accessible_by,
+                            )
+                        ).scalars()
+                    )
+                if owned_by is not None:
+                    owned_set = set(
+                        meta_sess.execute(
+                            select(SqlSessionPermission.conversation_id).where(
+                                SqlSessionPermission.workspace_id == current_workspace_id(),
+                                SqlSessionPermission.user_id == owned_by,
+                                SqlSessionPermission.level >= LEVEL_OWNER,
+                            )
+                        ).scalars()
+                    )
+                if accessible_set is not None and owned_set is not None:
+                    permission_ids = list(accessible_set & owned_set)
+                else:
+                    permission_ids = list(
+                        accessible_set if accessible_set is not None else owned_set or set()
+                    )
         with self._conv_session() as ap_sess:
+            # Non-archived conversations, resolved on the AP table.
+            non_archived_ids = select(SqlConversation.id).where(
+                SqlConversation.workspace_id == current_workspace_id(),
+                SqlConversation.archived.is_(False),
+            )
             stmt = (
                 select(SqlConversationLabel.value)
                 .where(
@@ -1917,6 +1931,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                 .distinct()
                 .order_by(SqlConversationLabel.value)
             )
+            if permission_ids is not None:
+                stmt = stmt.where(SqlConversationLabel.conversation_id.in_(permission_ids))
             return [row[0] for row in ap_sess.execute(stmt).all()]
 
     def delete_label(
@@ -2033,43 +2049,46 @@ class SqlAlchemyConversationStore(ConversationStore):
         elif kind == "default":
             kind_requires_parent = False
 
-        # A metadata-side prefetch is only needed for filters that live on the
-        # Omnigent DB: the permission scopes and (workspace-wide) archived
-        # exclusion. When the query is scoped to a single parent's children, skip
-        # the prefetch — a parent's children are a small, bounded set reachable
-        # via ``idx_conversations_parent``, so ``archived`` is applied on the
-        # page's own metadata after the fetch. A workspace-wide id prefetch here
-        # (the pre-fix behaviour) is both needless and the source of the
-        # post-split child-session slowdown.
-        parent_scoped = parent_conversation_id is not None
-        archived_via_prefetch = (not include_archived) and not parent_scoped
-        needs_meta_filter = (
-            archived_via_prefetch or (accessible_by is not None) or (owned_by is not None)
-        )
+        # kind and archived both live on the AP ``conversations`` table now
+        # (kind derived from parent-nullness, archived a real column), so they
+        # are filtered directly on the AP query below. The only filters that
+        # still require an Omnigent-side prefetch are the permission scopes.
+        needs_meta_filter = (accessible_by is not None) or (owned_by is not None)
 
         qualifying_ids: list[str] | None = None
         if needs_meta_filter:
-            # Pre-fetch qualifying IDs from Omnigent DB, then filter the AP query.
+            # Pre-fetch permission-qualifying IDs from the Omnigent DB
+            # (session_permissions), then filter the AP query. accessible_by and
+            # owned_by are intersected (both applied) to match the prior
+            # behaviour. (ACL pushdown to a single AP query is a follow-up.)
             with self._session() as meta_sess:
-                meta_q = select(SqlConversationMetadata.id).where(
-                    SqlConversationMetadata.workspace_id == current_workspace_id()
-                )
-                if archived_via_prefetch:
-                    meta_q = meta_q.where(SqlConversationMetadata.archived.is_(False))
+                accessible_set: set[str] | None = None
+                owned_set: set[str] | None = None
                 if accessible_by is not None:
-                    accessible_ids = select(SqlSessionPermission.conversation_id).where(
-                        SqlSessionPermission.workspace_id == current_workspace_id(),
-                        SqlSessionPermission.user_id == accessible_by,
+                    accessible_set = set(
+                        meta_sess.execute(
+                            select(SqlSessionPermission.conversation_id).where(
+                                SqlSessionPermission.workspace_id == current_workspace_id(),
+                                SqlSessionPermission.user_id == accessible_by,
+                            )
+                        ).scalars()
                     )
-                    meta_q = meta_q.where(SqlConversationMetadata.id.in_(accessible_ids))
                 if owned_by is not None:
-                    owned_ids = select(SqlSessionPermission.conversation_id).where(
-                        SqlSessionPermission.workspace_id == current_workspace_id(),
-                        SqlSessionPermission.user_id == owned_by,
-                        SqlSessionPermission.level >= LEVEL_OWNER,
+                    owned_set = set(
+                        meta_sess.execute(
+                            select(SqlSessionPermission.conversation_id).where(
+                                SqlSessionPermission.workspace_id == current_workspace_id(),
+                                SqlSessionPermission.user_id == owned_by,
+                                SqlSessionPermission.level >= LEVEL_OWNER,
+                            )
+                        ).scalars()
                     )
-                    meta_q = meta_q.where(SqlConversationMetadata.id.in_(owned_ids))
-                qualifying_ids = list(meta_sess.execute(meta_q).scalars().all())
+                if accessible_set is not None and owned_set is not None:
+                    qualifying_ids = list(accessible_set & owned_set)
+                else:
+                    qualifying_ids = list(
+                        accessible_set if accessible_set is not None else owned_set or set()
+                    )
 
         with self._conv_session() as session:
             stmt = select(SqlConversation).where(
@@ -2084,6 +2103,11 @@ class SqlAlchemyConversationStore(ConversationStore):
                 stmt = stmt.where(SqlConversation.parent_conversation_id.is_not(None))
             elif kind_requires_parent is False:
                 stmt = stmt.where(SqlConversation.parent_conversation_id.is_(None))
+
+            # archived lives on the AP conversations table, so exclude it inline
+            # (no metadata prefetch, no post-fetch filtering).
+            if not include_archived:
+                stmt = stmt.where(SqlConversation.archived.is_(False))
 
             if parent_conversation_id is not None:
                 stmt = stmt.where(
@@ -2239,14 +2263,6 @@ class SqlAlchemyConversationStore(ConversationStore):
                 ]
         else:
             convs = []
-        # Parent-scoped listing skips the metadata prefetch, so apply the
-        # archived exclusion here on the page's own (already-fetched) metadata.
-        # A parent's children are a small, bounded set and are not archived in
-        # practice (archiving is an owner-gated top-level action with no
-        # child cascade), so this filter is a no-op in the common case and
-        # never yields a short page; ``has_more`` stays conservative.
-        if parent_scoped and not include_archived:
-            convs = [conv for conv in convs if not conv.archived]
         for conv in convs:
             conv.search_snippet = snippets.get(conv.id)
         return PagedList(
@@ -2430,10 +2446,12 @@ class SqlAlchemyConversationStore(ConversationStore):
                 agent_config.harness_override = harness_override
                 ap_changed = True
             if archived is not None:
-                ap_changed = True  # archived is a visible state change
+                # archived lives on the AP conversations row; a visible state change.
+                row.archived = archived
+                ap_changed = True
             if ap_changed:
                 row.updated_at = now
-        if archived is not None or terminal_launch_args is not None:
+        if terminal_launch_args is not None:
             with self._session() as meta_sess:
                 meta = meta_sess.get(
                     SqlConversationMetadata, (current_workspace_id(), conversation_id)
@@ -2453,10 +2471,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                         parent_conversation_id=row.parent_conversation_id,
                     )
                     meta_sess.add(meta)
-                if archived is not None:
-                    meta.archived = archived
-                if terminal_launch_args is not None:
-                    meta.terminal_launch_args = json.dumps(terminal_launch_args)
+                meta.terminal_launch_args = json.dumps(terminal_launch_args)
         return self.get_conversation(conversation_id)
 
     def set_runner_id(self, conversation_id: str, runner_id: str) -> bool:

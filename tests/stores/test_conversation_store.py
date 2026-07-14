@@ -1303,6 +1303,54 @@ def test_list_conversations_excludes_archived_by_default(
     )
 
 
+def test_list_conversations_kind_filter_returns_only_matching(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    ``kind`` filtering (derived from ``parent_conversation_id``) returns exactly
+    the default rows or exactly the sub-agent rows.
+
+    A top-level and a sub-agent conversation must land in the right bucket,
+    ``kind=None`` must return both, and the sub-agent must never appear in the
+    default listing (the sidebar's view).
+    """
+    top = conversation_store.create_conversation(kind="default", title="top")
+    parent = conversation_store.create_conversation(kind="default", title="parent")
+    child = conversation_store.create_conversation(
+        kind="sub_agent", title="child", parent_conversation_id=parent.id
+    )
+
+    default_ids = {c.id for c in conversation_store.list_conversations(kind="default").data}
+    sub_ids = {c.id for c in conversation_store.list_conversations(kind="sub_agent").data}
+    any_ids = {c.id for c in conversation_store.list_conversations(kind=None).data}
+
+    assert default_ids == {top.id, parent.id}, (
+        f"kind=default must return only top-level rows; got {default_ids}"
+    )
+    assert sub_ids == {child.id}, f"kind=sub_agent must return only children; got {sub_ids}"
+    assert child.id not in default_ids, "sub-agent must never appear in the default listing"
+    assert any_ids >= {top.id, parent.id, child.id}, "kind=None must return every kind"
+
+
+def test_list_conversations_archive_toggle_round_trips(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    Archiving then unarchiving a session moves it out of and back into the
+    default listing — the AP-side ``archived`` column is the source of truth.
+    """
+    conv = conversation_store.create_conversation(title="toggle")
+    assert conv.id in {c.id for c in conversation_store.list_conversations().data}
+
+    archived = conversation_store.update_conversation(conv.id, archived=True)
+    assert archived is not None and archived.archived is True
+    assert conv.id not in {c.id for c in conversation_store.list_conversations().data}
+
+    unarchived = conversation_store.update_conversation(conv.id, archived=False)
+    assert unarchived is not None and unarchived.archived is False
+    assert conv.id in {c.id for c in conversation_store.list_conversations().data}
+
+
 # ── Delete ───────────────────────────────────────────
 
 
@@ -1551,8 +1599,16 @@ def test_subagent_conversations_are_isolated(
     in ``list_items`` is broken, which would cause sub-agents to
     see each other's messages and produce incoherent LLM prompts.
     """
-    conv_a = conversation_store.create_conversation(kind="sub_agent")
-    conv_b = conversation_store.create_conversation(kind="sub_agent")
+    # Sub-agents require a parent (kind="sub_agent" iff parent set). A shared
+    # parent is fine — the test only asserts the two children's items are
+    # isolated from each other.
+    parent = conversation_store.create_conversation(kind="default")
+    conv_a = conversation_store.create_conversation(
+        kind="sub_agent", parent_conversation_id=parent.id, title="alpha"
+    )
+    conv_b = conversation_store.create_conversation(
+        kind="sub_agent", parent_conversation_id=parent.id, title="bravo"
+    )
 
     # Append distinct items to each conversation.
     conversation_store.append(
