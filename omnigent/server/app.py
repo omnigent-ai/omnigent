@@ -1080,6 +1080,7 @@ def create_app(
     sandbox_config: ManagedSandboxConfig | None = None,
     sharing_mode: SharingMode | Callable[[], SharingMode] | None = None,
     public_sharing: bool | Callable[[], bool] | None = None,
+    server_config: dict[str, Any] | None = None,
 ) -> FastAPI:
     """
     Build and return the FastAPI application with all routes mounted.
@@ -1256,6 +1257,11 @@ def create_app(
         from anyio import to_thread as _to_thread
 
         _to_thread.current_default_thread_limiter().total_tokens = 200
+
+        # Initialise usage telemetry (fire-and-forget; no-op when disabled).
+        from omnigent.telemetry import init_client as _init_telemetry
+
+        _init_telemetry(config=server_config)
 
         # Apply OMNIGENT_LOG_LEVEL to the omnigent namespace after
         # uvicorn's dictConfig runs (dictConfig resets existing handlers,
@@ -1864,17 +1870,25 @@ def create_app(
         source, the login URL, whether first-run admin setup is
         still pending (``needs_setup``), coarse capability
         booleans (``databricks_features``,
-        ``managed_sandboxes_enabled``), the short sandbox
-        provider name (``sandbox_provider``) the web UI labels the
-        new-session sandbox option with, and the installed
+        ``managed_sandboxes_enabled``, ``single_user``), the short
+        sandbox provider name (``sandbox_provider``) the web UI labels
+        the new-session sandbox option with, and the installed
         ``server_version`` (already public via ``/api/version``).
         """
-        from omnigent.server.auth import UnifiedAuthProvider
+        from omnigent.server.auth import UnifiedAuthProvider, local_single_user_enabled
 
         accounts_enabled = (
             isinstance(auth_provider, UnifiedAuthProvider) and auth_provider._source == "accounts"
         )
         login_url = getattr(auth_provider, "login_url", None)
+        # single_user marks the explicit single-user local runtime
+        # (OMNIGENT_LOCAL_SINGLE_USER=1, set by the managed local spawn paths).
+        # This is the ONLY signal that distinguishes a genuine one-user server
+        # from a multi-user header-auth deploy (e.g. an SSO proxy injecting
+        # X-Forwarded-Email) — both report accounts_enabled=false / login_url
+        # null. The SPA uses it to hide account/sharing chrome that has no
+        # meaning without other users.
+        single_user = local_single_user_enabled()
         # needs_setup drives the SPA's first-run "Create admin" form:
         # true only in accounts mode while no password-having account
         # exists yet. Same predicate bootstrap_admin uses, computed
@@ -1936,6 +1950,7 @@ def create_app(
             smart_routing_enabled = False
         return {
             "accounts_enabled": accounts_enabled,
+            "single_user": single_user,
             "login_url": login_url,
             "needs_setup": needs_setup,
             "databricks_features": databricks_features,

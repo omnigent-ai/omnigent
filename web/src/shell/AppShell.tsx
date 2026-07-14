@@ -27,6 +27,7 @@ import {
   type DesignModeElement,
 } from "@/lib/designModePrompt";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+import { readDefaultWorkspacePanelOpen } from "@/lib/workspacePanelPreferences";
 import {
   Dialog,
   DialogContent,
@@ -58,6 +59,7 @@ import {
 import { cn } from "@/lib/utils";
 import { isNativeWrapper as isNativeWrapperLabel } from "@/lib/nativeCodingAgents";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isSingleUserMode } from "@/lib/capabilities";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import { useChatStore } from "@/store/chatStore";
 import { livenessRowFromSession, useSessionLiveness } from "@/hooks/useSessionLiveness";
@@ -154,6 +156,17 @@ export function AppShell() {
     useResizableInlinePanel(conversationId ?? null, inlinePanelMinWidth);
   const [searchParams, setSearchParams] = useSearchParams();
   const [sidebarOpen, setSidebarOpen] = useState(initialSidebarOpen);
+  // ?sidebar=open surfaces the session list on phone-width shells where the
+  // sidebar is closed by default — the destination for a "N sessions need
+  // your attention" notification tap, which would otherwise land on a bare
+  // composer. One-shot: applied then stripped from the URL.
+  useEffect(() => {
+    if (searchParams.get("sidebar") !== "open") return;
+    setSidebarOpen(true);
+    const next = new URLSearchParams(searchParams);
+    next.delete("sidebar");
+    setSearchParams(next, { replace: true });
+  }, [searchParams, setSearchParams]);
   // Live open fraction (0→1) while the iOS edge-swipe drags the sidebar; null
   // when not dragging. Drives the mobile overlay's finger-tracking transform.
   const [sidebarDragProgress, setSidebarDragProgress] = useState<number | null>(null);
@@ -227,15 +240,17 @@ export function AppShell() {
   const [subagentsPanelOpen, setSubagentsPanelOpen] = useState(false);
   const [shellsPanelOpen, setShellsPanelOpen] = useState(false);
   const [todosPanelOpen, setTodosPanelOpen] = useState(false);
-  // The right "Workspace" rail (WorkspacePanel) is open by default and
-  // remembers its open/closed state per session — a brand-new session starts
-  // open; reopening a session restores how the user last left it. Toggled
-  // via the header's PanelRightIcon, mirroring the sidebar collapse. With no
-  // conversation the rail can't render, so the state stays false — leaving it
-  // true would let rail-gated side effects (the ?view= URL sync) fire on
-  // non-session routes like the home page.
+  // The right "Workspace" rail (WorkspacePanel) remembers its open/closed
+  // state per session. A brand-new session (no saved `open`) follows the
+  // Appearance "Workspace panel" default; reopening a session restores how
+  // the user last left it. Toggled via the header's PanelRightIcon, mirroring
+  // the sidebar collapse. With no conversation the rail can't render, so the
+  // state stays false — leaving it true would let rail-gated side effects
+  // (the ?view= URL sync) fire on non-session routes like the home page.
   const [rightPanelOpen, setRightPanelOpen] = useState(() =>
-    conversationId ? (readSessionWorkspaceState(conversationId).open ?? true) : false,
+    conversationId
+      ? (readSessionWorkspaceState(conversationId).open ?? readDefaultWorkspacePanelOpen())
+      : false,
   );
   const [shareOpen, setShareOpen] = useState(false);
   const [forkOpen, setForkOpen] = useState(false);
@@ -356,13 +371,19 @@ export function AppShell() {
   // Read-write or higher can manage sharing; top-level only. Sharing a
   // sub-agent is a no-op anyway — children inherit the parent's grants via
   // the server's parent-delegation path — so we hide the affordance.
+  // Also hidden in single-user mode: with no other users to grant to, the
+  // affordance is meaningless (unlike the local-server / sharing-off cases
+  // below, which stay present-but-disabled with an explanatory tooltip).
+  const serverInfo = useServerInfo();
   const canShare =
-    !!conversationId && isKnownTopLevel && (permissionLevel === null || permissionLevel >= 3);
+    !!conversationId &&
+    isKnownTopLevel &&
+    (permissionLevel === null || permissionLevel >= 3) &&
+    !isSingleUserMode(serverInfo);
   // Two independent reasons the Share affordance is present-but-disabled: a
-  // local single-user server can't share at all, and a deployed server whose
+  // local server can't produce openable links, and a deployed server whose
   // admin set OMNIGENT_SHARING_MODE=off reports sharing_mode "off" via
   // /v1/info. Fail open (share enabled) while the capability probe loads.
-  const serverInfo = useServerInfo();
   const sharingOff = serverInfo !== "loading" && serverInfo.sharing_mode === "off";
   const shareDisabled = canShare && (isCurrentServerLocal() || sharingOff);
   const shareDisabledReason = !shareDisabled
@@ -742,7 +763,7 @@ export function AppShell() {
       viewParam === "changed" ||
       viewParam === "explore" ||
       (commentParam !== null && commentParam !== "");
-    setRightPanelOpen((persisted.open ?? true) || hasWorkspaceUrlSignal);
+    setRightPanelOpen((persisted.open ?? readDefaultWorkspacePanelOpen()) || hasWorkspaceUrlSignal);
 
     stateConvRef.current = conversationId;
   }, [conversationId]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -768,10 +789,16 @@ export function AppShell() {
   // since the scope is meaningless (and shouldn't deep-link the rail back open)
   // once the workspace is collapsed. Collapsing thus drops ?view= here.
   useEffect(() => {
+    // Skip when the URL already agrees: setSearchParams always navigates, and
+    // a no-op write replays this effect's stale params over whatever another
+    // same-commit effect just wrote (e.g. the one-shot ?sidebar=open strip).
+    const current = new URLSearchParams(window.location.search);
+    const wantChanged = rightPanelOpen && filesPanelFlatView;
+    if (wantChanged ? current.get("view") === "changed" : !current.has("view")) return;
     setSearchParams(
       (prev) => {
         const next = new URLSearchParams(prev);
-        if (rightPanelOpen && filesPanelFlatView) {
+        if (wantChanged) {
           next.set("view", "changed");
         } else {
           next.delete("view");
@@ -824,12 +851,11 @@ export function AppShell() {
       setRightRailTab((prev) =>
         prev === "terminals" || prev === "subagents" || prev === "todos" ? "files" : prev,
       );
-      // Reveal the rail so the viewer is actually visible — the rail defaults
-      // open but a session the user collapsed restores collapsed, so opening a
-      // file (e.g. via a chat file-path link) there would otherwise route the
-      // file into an invisible panel. Persist open=true so the rail stays in
-      // sync with the open file on the next visit (mirroring the header
-      // toggle's persistence).
+      // Reveal the rail so the viewer is actually visible — a session the user
+      // collapsed (or one that started collapsed via the Appearance default)
+      // would otherwise route the file into an invisible panel. Persist
+      // open=true so the rail stays in sync with the open file on the next
+      // visit (mirroring the header toggle's persistence).
       setRightPanelOpen(true);
       if (conversationId) writeSessionWorkspaceState(conversationId, { open: true });
       // Set URL in the callback (not a useEffect) to avoid racing with
@@ -851,18 +877,22 @@ export function AppShell() {
   // ``setSearchParams`` so it always closes over react-router's *current*
   // ``navigate`` — which is bound to the live ``locationPathname`` — rather
   // than a stale one captured at first mount (see ``showScopeView`` below).
-  const clearFileViewerUrl = useCallback(() => {
-    setSearchParams(
-      (prev) => {
-        const next = new URLSearchParams(prev);
-        next.delete("file");
-        next.delete("diff");
-        next.delete("comment");
-        return next;
-      },
-      { replace: true },
-    );
-  }, [setSearchParams]);
+  const clearFileViewerUrl = useCallback(
+    (includeView = false) => {
+      setSearchParams(
+        (prev) => {
+          const next = new URLSearchParams(prev);
+          next.delete("file");
+          next.delete("diff");
+          next.delete("comment");
+          if (includeView) next.delete("view");
+          return next;
+        },
+        { replace: true },
+      );
+    },
+    [setSearchParams],
+  );
 
   // Toggle the right (Workspace) sidebar — shared by the header's collapse
   // button and the ⌘⌥]/Ctrl+Alt+] hotkey so they can't drift. Beyond flipping the
@@ -893,11 +923,9 @@ export function AppShell() {
       }
     } else {
       // Collapsing the rail hides the workspace, so strip the deep-
-      // link params that point into it (file/diff/comment) — otherwise
-      // the URL advertises a file that isn't shown and a reload would
-      // re-open the rail. (?view= is dropped by the scope-sync effect,
-      // which is gated on rightPanelOpen.)
-      clearFileViewerUrl();
+      // link params that point into it; otherwise the URL advertises
+      // a workspace view a reload would re-open.
+      clearFileViewerUrl(true);
     }
     setRightPanelOpen(next);
   };

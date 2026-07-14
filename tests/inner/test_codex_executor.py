@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import contextlib
 import json
 import tempfile
 import unittest
@@ -141,6 +142,7 @@ class TestCodexExecutor(unittest.TestCase):
         )
         self.assertIn('model="databricks-gpt-5-4-mini"', overrides)
         self.assertIn('model_provider="omnigent_databricks"', overrides)
+        self.assertIn("model_supports_reasoning_summaries=true", overrides)
         self.assertTrue(any("/ai-gateway/codex/v1" in item for item in overrides))
         self.assertFalse(any("/serving-endpoints" in item for item in overrides))
         self.assertTrue(any('auth={command="sh"' in item for item in overrides))
@@ -585,7 +587,14 @@ class TestCodexExecutor(unittest.TestCase):
             # to this turn, and turn/start carries no (dropped) effort field.
             self.assertEqual(methods, ["thread/start", "thread/settings/update", "turn/start"])
             settings_params = session._request.await_args_list[1].args[1]
-            self.assertEqual(settings_params, {"threadId": "thread-1", "effort": "high"})
+            self.assertEqual(
+                settings_params,
+                {
+                    "threadId": "thread-1",
+                    "effort": "high",
+                    "summary": "detailed",
+                },
+            )
             turn_params = session._request.await_args_list[2].args[1]
             self.assertNotIn("effort", turn_params)
 
@@ -2819,3 +2828,74 @@ def test_declared_passthrough_reads_sandbox_env_passthrough():
     assert _declared_passthrough(None) == ()
     assert _declared_passthrough(OSEnvSpec(sandbox=None)) == ()
     assert _declared_passthrough(OSEnvSpec(sandbox=OSEnvSandboxSpec(type="none"))) == ()
+
+
+class TestCodexAppServerSessionReadOnlyCwd(unittest.TestCase):
+    """Regression tests for .codex-tmp fallback on read-only cwd."""
+
+    def _run_start_and_capture_mkdtemp_dir(self, cwd: str) -> str:
+        """Run ``_CodexAppServerSession.start()`` with *cwd* and return
+        the ``dir=`` keyword passed to ``tempfile.mkdtemp`` for the
+        codex-home directory.
+
+        ``start()`` is stopped just after ``mkdtemp`` by forcing a
+        ``RuntimeError`` from the subprocess launch; the session's
+        ``close()`` cleans up the temp dir before we can inspect it,
+        so we capture the argument instead.
+        """
+        import tempfile as _tempfile
+
+        mkdtemp_dirs: list[str] = []
+        original_mkdtemp = _tempfile.mkdtemp
+
+        def _capture(**kwargs):
+            mkdtemp_dirs.append(kwargs.get("dir", ""))
+            return original_mkdtemp(**kwargs)
+
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd=cwd,
+                env={},
+                tool_executor=None,
+            )
+            with (
+                patch("omnigent.inner.codex_executor.populate_codex_skills_from_bundle"),
+                patch("omnigent.inner.codex_executor._populate_codex_home_config"),
+                patch(
+                    "omnigent.inner.codex_executor._codex_home_config_source_from_env",
+                    return_value=None,
+                ),
+                patch(
+                    "omnigent.inner.codex_executor._create_subprocess_exec",
+                    new_callable=AsyncMock,
+                    side_effect=RuntimeError("stop"),
+                ),
+                patch("tempfile.mkdtemp", side_effect=_capture),
+            ):
+                with contextlib.suppress(RuntimeError):
+                    await session.start()
+
+            self.assertTrue(mkdtemp_dirs, "mkdtemp was never called")
+            return mkdtemp_dirs[0]
+
+        return _run(_t())
+
+    def test_start_falls_back_to_tempdir_when_cwd_is_readonly(self):
+        """When cwd is ``/`` (read-only on macOS SSV), the codex home
+        must be placed under the system temp directory, not under
+        ``/.codex-tmp``.
+        """
+        import tempfile as _tempfile
+
+        dir_used = self._run_start_and_capture_mkdtemp_dir("/")
+        self.assertEqual(dir_used, _tempfile.gettempdir())
+
+    def test_start_uses_cwd_when_writable(self):
+        """When cwd is writable, .codex-tmp is placed there as before."""
+        import tempfile as _tempfile
+
+        with _tempfile.TemporaryDirectory() as writable_dir:
+            dir_used = self._run_start_and_capture_mkdtemp_dir(writable_dir)
+            expected = str(Path(writable_dir) / ".codex-tmp")
+            self.assertEqual(dir_used, expected)

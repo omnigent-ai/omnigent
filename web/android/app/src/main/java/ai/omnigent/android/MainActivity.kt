@@ -60,9 +60,12 @@ class MainActivity : ComponentActivity() {
     private var pendingMicRequest: PermissionRequest? = null
 
     private val requestNotifications =
-        registerForActivityResult(ActivityResultContracts.RequestPermission()) {
-            // Granted or not: notify() no-ops when notifications are disabled and
-            // the web layer keeps working without OS toasts.
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            // Denied: notify() no-ops when notifications are disabled and the
+            // web layer keeps working without OS toasts. Granted: replay the
+            // badge the web layer may have computed (and deduped) while the
+            // permission dialog was still open — its post was silently dropped.
+            if (granted) notifications.replayBadge()
         }
 
     private val requestMic =

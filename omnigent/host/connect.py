@@ -60,6 +60,14 @@ from omnigent.onboarding.harness_readiness import (
     configured_harness_map,
     harness_is_configured,
 )
+from omnigent.process_logging import (
+    LOG_TTY_FD_ENV_VAR,
+    PROCESS_LOG_FILE_ENV_VAR,
+    child_logging_popen_kwargs,
+    configure_process_logging,
+    open_process_log_file,
+    process_log_dir,
+)
 from omnigent.runner.identity import (
     RUNNER_ID_ENV_VAR,
     RUNNER_PARENT_PID_ENV_VAR,
@@ -90,17 +98,17 @@ def _runner_log_dir() -> Path:
     (not a module constant) so tests that repoint ``Path.home`` see the
     override.
 
-    :returns: The host-runner log directory, e.g.
-        ``Path.home() / ".omnigent" / "logs" / "host-runner"``.
+    :returns: The runner log directory, e.g.
+        ``<data-dir>/logs/runner``.
     """
-    return Path.home() / ".omnigent" / "logs" / "host-runner"
+    return process_log_dir("runner")
 
 
 def _display_log_path(path: Path) -> str:
     """Format a log path for display, collapsing the home prefix to ``~``.
 
     :param path: Absolute path, typically under the user's state dir, e.g.
-        ``Path("/Users/alice/.omnigent/logs/host-runner/runner-ab12.log")``.
+        ``Path("/Users/alice/.omnigent/logs/runner/runner-ab12.log")``.
     :returns: ``"~/.omnigent/..."`` when *path* is under ``$HOME``,
         otherwise ``str(path)``.
     """
@@ -171,7 +179,7 @@ def _read_log_tail(path: Path, max_bytes: int = _LOG_TAIL_MAX_BYTES) -> str:
     """Read the last portion of a runner log file for diagnostics.
 
     :param path: The runner's captured stdout/stderr log file, e.g.
-        ``Path("~/.omnigent/logs/host-runner/runner-ab12.log")``.
+        ``Path("~/.omnigent/logs/runner/runner-ab12.log")``.
     :param max_bytes: Max bytes to read from the end of the file,
         e.g. ``4096``.
     :returns: The decoded tail (lossy UTF-8 — runner output may
@@ -323,6 +331,10 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # alias, still propagated so existing setups keep working.
         "OMNIGENT_AUTH_ENABLED",
         "OMNIGENT_ACCOUNTS_ENABLED",
+        # Process logging controls. These are diagnostics knobs, not secrets.
+        "OMNIGENT_LOG_LEVEL",
+        "OMNIGENT_LOG_TO_STDERR",
+        LOG_TTY_FD_ENV_VAR,
         # Secret-store backend selector. The CLI's `configure harnesses` stores
         # pasted API keys via the file backend when this is set (headless /
         # locked-keyring hosts), writing `keychain:<name>` refs. The runner
@@ -602,7 +614,7 @@ class _RunnerHandle:
 
     :param proc: The runner subprocess handle.
     :param log_path: File capturing the runner's stdout/stderr, e.g.
-        ``Path("~/.omnigent/logs/host-runner/runner-ab12.log")``.
+        ``Path("~/.omnigent/logs/runner/runner-ab12.log")``.
         Read back for diagnostics when the runner dies before
         connecting its tunnel.
     """
@@ -1066,39 +1078,39 @@ class HostProcess:
         )
 
         try:
-            log_dir = _runner_log_dir()
-            log_dir.mkdir(parents=True, exist_ok=True)
             # Embed the session id so operators can find all logs for a
             # session with `omnigent debug logs --session <id>`. Cap at 32
             # chars to keep filenames manageable; strip anything non-word to
             # guard against unexpected id shapes from older servers.
             import re
-            import tempfile
 
             _session_slug = (
                 re.sub(r"[^\w-]", "", frame.session_id)[:32] + "-" if frame.session_id else ""
             )
-            _log_fd, _log_name = tempfile.mkstemp(
+            log_path, _log_fh = open_process_log_file(
+                "runner",
                 prefix=f"runner-{_session_slug}",
-                suffix=".log",
-                dir=log_dir,
             )
-            _log_fh = os.fdopen(_log_fd, "wb")
-            proc = subprocess.Popen(
-                [sys.executable, "-m", "omnigent.runner._entry"],
-                env=env,
-                # Runners are WS-tunnel clients with no interactive input.
-                # Give them a clean /dev/null stdin instead of inheriting the
-                # daemon's: a long-lived daemon (e.g. backgrounded / nohup'd)
-                # can end up with a closed or recycled stdin fd, and an
-                # inherited bad fd makes the runner die at interpreter startup
-                # with "init_sys_streams: Bad file descriptor" — it never
-                # connects, so the session fails with "runner did not connect".
-                stdin=subprocess.DEVNULL,
-                stdout=_log_fh,
-                stderr=_log_fh,
-            )
-            _log_fh.close()
+            env[PROCESS_LOG_FILE_ENV_VAR] = str(log_path)
+            try:
+                with child_logging_popen_kwargs(env) as logging_kwargs:
+                    proc = subprocess.Popen(
+                        [sys.executable, "-m", "omnigent.runner._entry"],
+                        env=env,
+                        # Runners are WS-tunnel clients with no interactive input.
+                        # Give them a clean /dev/null stdin instead of inheriting the
+                        # daemon's: a long-lived daemon (e.g. backgrounded / nohup'd)
+                        # can end up with a closed or recycled stdin fd, and an
+                        # inherited bad fd makes the runner die at interpreter startup
+                        # with "init_sys_streams: Bad file descriptor" — it never
+                        # connects, so the session fails with "runner did not connect".
+                        stdin=subprocess.DEVNULL,
+                        stdout=_log_fh,
+                        stderr=_log_fh,
+                        **logging_kwargs,
+                    )
+            finally:
+                _log_fh.close()
         except OSError as exc:
             return HostLaunchRunnerResultFrame(
                 request_id=frame.request_id,
@@ -1106,7 +1118,6 @@ class HostProcess:
                 error=f"failed to spawn runner: {exc}",
             )
 
-        log_path = Path(_log_name)
         if proc.poll() is not None:
             # The runner died before Popen returned — its actual error
             # is in the captured log, so ship the tail with the result
@@ -1826,6 +1837,13 @@ class HostProcess:
         :raises Exception: On WebSocket disconnect or error — propagated
             to the reconnect loop in :meth:`run`.
         """
+        _tel_opt_out = False
+        try:
+            from omnigent.telemetry.client import is_disabled as _tel_disabled
+
+            _tel_opt_out = _tel_disabled()
+        except Exception:  # noqa: BLE001 — telemetry errors must not abort hello
+            pass
         hello = HostHelloFrame(
             version=VERSION,
             frame_protocol_version=1,
@@ -1836,6 +1854,7 @@ class HostProcess:
             # the server's view refreshes whenever the tunnel does; the
             # launch-time check above stays the authoritative gate.
             configured_harnesses=await asyncio.to_thread(configured_harness_map),
+            telemetry_opt_out=_tel_opt_out,
         )
         await ws.send(encode_host_frame(hello))
         self._ws = ws
@@ -1955,6 +1974,7 @@ def run_host_process(
         (auth / authorization / outdated server). The
         actionable cause is printed to stderr first.
     """
+    host_log_path = configure_process_logging("host")
     # Initialize tracing so the host daemon exports its own spans
     # (e.g. handling launch_runner / stat / list_dir frames) into the
     # same distributed trace as the server that requested them. The
@@ -1972,17 +1992,16 @@ def run_host_process(
     print(f"Connecting to {server_url} as {identity.name!r} ({identity.host_id})")
     # Tell the user where logs land up front — `omnigent host` used to run
     # silently, so a stuck/quiet host gave no hint where to look. Session
-    # work goes to per-runner files under the host-runner dir (the exact
-    # file is printed when each runner launches). The foreground process's
-    # own diagnostics (warnings, tracebacks) go to the always-on cli-*.log;
-    # that path is None in the background daemon (no setup_cli_logging) —
-    # its stdout is already captured to the daemon log, so skip the line.
+    # work goes to per-runner files under the runner dir (the exact
+    # file is printed when each runner launches). The host process's
+    # own diagnostics go to the host destination.
     print(f"Session logs: {_display_log_path(_runner_log_dir())}/")
+    print(f"This host's log: {_display_log_path(host_log_path)}")
     from omnigent.cli_diagnostics import current_cli_log_path
 
     _cli_log = current_cli_log_path()
-    if _cli_log is not None:
-        print(f"This host's log: {_display_log_path(_cli_log)}")
+    if _cli_log is not None and _cli_log != host_log_path:
+        print(f"CLI diagnostics: {_display_log_path(_cli_log)}")
 
     host = HostProcess(identity, server_url)
     try:

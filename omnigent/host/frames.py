@@ -86,6 +86,7 @@ class HostHelloFrame:
     name: str
     runners: list[str] = field(default_factory=list)
     configured_harnesses: dict[str, HarnessAvailability] | None = None
+    telemetry_opt_out: bool = False
 
 
 @dataclass
@@ -583,6 +584,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "name": frame.name,
                 "runners": list(frame.runners),
                 "configured_harnesses": frame.configured_harnesses,
+                "telemetry_opt_out": frame.telemetry_opt_out,
             }
         )
     if isinstance(frame, HostLaunchRunnerFrame):
@@ -870,6 +872,7 @@ def _decode_host_hello(msg: dict[str, Any]) -> HostHelloFrame:
         name=_required_str(msg, "name"),
         runners=_optional_str_list(msg, "runners"),
         configured_harnesses=_optional_str_availability_map(msg, "configured_harnesses"),
+        telemetry_opt_out=bool(msg.get("telemetry_opt_out", False)),
     )
 
 

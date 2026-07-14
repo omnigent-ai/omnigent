@@ -203,11 +203,20 @@ object NativeBridgeScript {
 
           window.omnigentNative = Object.freeze({
             kind: "android",
-            setBadgeCount(count) {
+            setBadgeCount(count, options) {
               // Note: unlike iOS, the native side ignores count <= 0 — Android has
               // no badge-clear API, so a previously-set badge can't be cleared
               // from the web (see NativeNotificationManager.setBadgeCount).
-              post({ method: "setBadgeCount", count: Number.isFinite(count) ? count : 0 });
+              // `options` (navigatePath/title/body) makes the badge notification
+              // actionable + descriptive; absent on older web builds.
+              post({
+                method: "setBadgeCount",
+                count: Number.isFinite(count) ? count : 0,
+                navigatePath:
+                  options && typeof options.navigatePath === "string" ? options.navigatePath : "",
+                title: options && typeof options.title === "string" ? options.title : "",
+                body: options && typeof options.body === "string" ? options.body : "",
+              });
             },
             notify(params) {
               post({

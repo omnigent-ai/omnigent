@@ -19,33 +19,53 @@ from __future__ import annotations
 
 import re
 import time
-from collections.abc import Callable
-from urllib.parse import urlsplit, urlunsplit
+from collections.abc import Callable, Iterator
 
 import httpx
-from playwright.sync_api import Page, expect
+import pytest
+from playwright.sync_api import Browser, Page, expect
 
-from tests.e2e_ui.conftest import _PUBLIC_LOOPBACK_HOST
+from tests.e2e_ui.collaboration._multi_user_server import (
+    ADMIN_EMAIL,
+    MultiUserServer,
+    spawn_multi_user_server,
+)
 
 # ``__public__`` is the synthetic user id the server stores for a public
 # grant (mirrors ``PUBLIC_USER`` in PermissionsModal.tsx).
 _PUBLIC_USER = "__public__"
 _LEVEL_READ = 1
 _LEVEL_EDIT = 2
-_LOCAL_SHARE_DISABLED_REASON = "Sharing is unavailable from a local server."
 
 
-def _public_loopback_url(base_url: str) -> str:
-    """Return *base_url* through the browser's public-looking loopback alias."""
-    parsed = urlsplit(base_url)
-    if parsed.port is None:
-        raise AssertionError(f"e2e base URL missing port: {base_url!r}")
-    return urlunsplit((parsed.scheme, f"{_PUBLIC_LOOPBACK_HOST}:{parsed.port}", "", "", ""))
+@pytest.fixture(scope="module")
+def multi_user_server(
+    built_spa: None,
+    mock_llm_server_url: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[MultiUserServer]:
+    """A dedicated NON-single-user server (Share chrome enabled)."""
+    server_tmp = tmp_path_factory.mktemp("e2e_ui_permissions_multi_user")
+    yield from spawn_multi_user_server(mock_llm_server_url, server_tmp)
+
+
+def _admin_page(browser: Browser) -> Page:
+    """A page whose requests carry the admin identity header."""
+    context = browser.new_context(extra_http_headers={"X-Forwarded-Email": ADMIN_EMAIL})
+    return context.new_page()
 
 
 def _permissions(base_url: str, session_id: str) -> dict[str, int]:
-    """Read the session's grants as a ``{user_id: level}`` map (owner view)."""
-    resp = httpx.get(f"{base_url}/v1/sessions/{session_id}/permissions", timeout=10.0)
+    """Read the session's grants as a ``{user_id: level}`` map (admin view).
+
+    The multi-user server 401s headerless reads, so this authenticates as the
+    admin identity the browser also uses.
+    """
+    resp = httpx.get(
+        f"{base_url}/v1/sessions/{session_id}/permissions",
+        headers={"X-Forwarded-Email": ADMIN_EMAIL},
+        timeout=10.0,
+    )
     resp.raise_for_status()
     return {p["user_id"]: p["level"] for p in resp.json()}
 
@@ -116,42 +136,45 @@ def _install_clipboard_stub(page: Page) -> None:
     )
 
 
-def test_local_server_disables_share_button_with_tooltip(
+def test_single_user_hides_share_button(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """A loopback-served SPA explains why session sharing is unavailable."""
+    """The shared e2e server is single-user (OMNIGENT_LOCAL_SINGLE_USER=1), so
+    there are no other users to share with and the header Share button is
+    omitted entirely — not merely disabled.
+
+    (The disabled-with-tooltip states — local server, sharing off — still apply
+    on a *multi-user* server; those are covered on the dedicated multi-user
+    fixtures in this file and in test_sharing_mode_off.)
+    """
     base_url, session_id = seeded_session
     page.goto(f"{base_url}/c/{session_id}")
 
-    share = page.get_by_role("button", name="Share session")
-    expect(share).to_be_visible(timeout=60_000)
-    expect(share).to_be_disabled()
-
-    page.get_by_label(f"Share session disabled: {_LOCAL_SHARE_DISABLED_REASON}").hover()
-    tooltip = page.locator(
-        "[data-slot=tooltip-content]",
-        has_text=_LOCAL_SHARE_DISABLED_REASON,
-    )
-    expect(tooltip).to_be_visible(timeout=5_000)
-    expect(tooltip).to_be_in_viewport()
-    expect(page.get_by_role("dialog")).to_have_count(0)
+    # The agent-info trigger anchors the header actions region; wait for it so
+    # we assert Share's absence against a rendered header, not an unmounted one.
+    expect(page.get_by_test_id("agent-info-trigger")).to_be_visible(timeout=60_000)
+    expect(page.get_by_role("button", name="Share session")).to_have_count(0)
 
 
 def test_permissions_modal_controls_drive_server_state(
-    page: Page,
-    seeded_session: tuple[str, str],
+    browser: Browser,
+    multi_user_server: MultiUserServer,
 ) -> None:
     """Public toggle, copy-link, grant, level-change and revoke all work.
 
     Walks the whole modal surface in one session so each control is
-    pinned against the ``/permissions`` REST state it mutates.
+    pinned against the ``/permissions`` REST state it mutates. Runs on a
+    NON-single-user server (Share is hidden in single-user mode), driven by an
+    admin browser identity so the Share button renders on the local-owned
+    session.
     """
-    base_url, session_id = seeded_session
-    public_base_url = _public_loopback_url(base_url)
+    base_url = multi_user_server.base_url
+    session_id = multi_user_server.session_id
     grantee = "alice@ui.test"
+    page = _admin_page(browser)
     _install_clipboard_stub(page)
-    page.goto(f"{public_base_url}/c/{session_id}")
+    page.goto(f"{multi_user_server.public_url}/c/{session_id}")
 
     _open_share_modal(page)
     dialog = page.get_by_role("dialog")
@@ -192,3 +215,45 @@ def test_permissions_modal_controls_drive_server_state(
     dialog.get_by_role("button", name="Revoke").click()
     expect(dialog.get_by_title(grantee)).to_have_count(0)
     _wait_for(lambda: grantee not in _permissions(base_url, session_id))
+
+
+def test_multi_user_shows_enabled_share_button(
+    browser: Browser,
+    multi_user_server: MultiUserServer,
+) -> None:
+    """On a NON-single-user server the header Share button renders and is
+    enabled — the counterpart to the single-user hide.
+
+    This is the regression the ``single_user`` /v1/info signal fixes: a
+    header-auth multi-user deploy reports ``accounts_enabled:false`` /
+    ``login_url:null`` just like single-user, but must keep its Share chrome.
+    Served via the public loopback alias so the local-server disable can't mask
+    the button.
+    """
+    page = _admin_page(browser)
+    page.goto(f"{multi_user_server.public_url}/c/{multi_user_server.session_id}")
+
+    share = page.get_by_role("button", name="Share session")
+    expect(share).to_be_visible(timeout=60_000)
+    expect(share).to_be_enabled()
+
+
+def test_multi_user_admin_sees_members_and_sharing_settings(
+    browser: Browser,
+    multi_user_server: MultiUserServer,
+) -> None:
+    """On a NON-single-user server an admin's Settings nav shows the full Admin
+    group — Members, Policies, and Sharing.
+
+    Counterpart to ``test_single_user_hides_members_and_sharing_settings``: the
+    same auth shape (accounts off / no login) keeps these when the server isn't
+    single-user. The admin browser identity is what surfaces the Admin group.
+    """
+    page = _admin_page(browser)
+    page.goto(f"{multi_user_server.public_url}/c/{multi_user_server.session_id}")
+    page.get_by_test_id("settings-button").click()
+    page.wait_for_url("**/settings**", timeout=30_000)
+
+    expect(page.get_by_test_id("settings-nav-members")).to_be_visible(timeout=30_000)
+    expect(page.get_by_test_id("settings-nav-sharing")).to_be_visible()
+    expect(page.get_by_test_id("settings-nav-policies")).to_be_visible()

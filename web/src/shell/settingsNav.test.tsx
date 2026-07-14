@@ -14,8 +14,12 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 const mocks = vi.hoisted(() => ({
   accountsEnabled: false,
   // login_url: non-null for any sign-in mode (accounts OR OIDC), null in
-  // header single-user. Gates the Account section + the bare-/settings default.
+  // header mode. Gates the Account section + the bare-/settings default.
   loginUrl: null as string | null,
+  // single_user: the server's explicit single-user marker. A multi-user
+  // header-auth deploy reports false even though it has no accounts / login,
+  // so this is the ONLY signal that hides account/sharing chrome.
+  singleUser: false,
   isAdmin: false,
 }));
 
@@ -23,6 +27,7 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
   useServerInfo: () => ({
     accounts_enabled: mocks.accountsEnabled,
     login_url: mocks.loginUrl,
+    single_user: mocks.singleUser,
   }),
 }));
 // Admin gating is now mode-agnostic, sourced from `/v1/me` via useIsAdmin
@@ -55,6 +60,7 @@ function renderBody(opts: { onNavClick?: () => void; onClose?: () => void } = {}
 beforeEach(() => {
   mocks.accountsEnabled = false;
   mocks.loginUrl = null;
+  mocks.singleUser = false;
   mocks.isAdmin = false;
 });
 afterEach(cleanup);
@@ -109,6 +115,16 @@ describe("settingsNavGroups", () => {
     // #1489 fix: OIDC previously had no admin chrome at all.
     const oidcAdmin = settingsNavGroups(false, false, true).find((g) => g.title === "Admin");
     expect(oidcAdmin?.items.map((i) => i.id)).toEqual(["members", "policies", "sharing"]);
+  });
+
+  it("drops Members and Sharing from the Admin group in single-user mode, keeping Policies", () => {
+    // 4th arg is isSingleUser. Members (manage accounts) and Sharing (grant to
+    // other users) are meaningless with no other users, so both are hidden;
+    // Policies stays — global policies apply to the solo user's own sessions.
+    const singleUserAdmin = settingsNavGroups(false, false, true, true).find(
+      (g) => g.title === "Admin",
+    );
+    expect(singleUserAdmin?.items.map((i) => i.id)).toEqual(["policies"]);
   });
 });
 
@@ -178,11 +194,30 @@ describe("SettingsSidebarBody", () => {
   });
 
   it("renders the admin sub-categories for an admin under OIDC (accounts off)", () => {
-    // #1489: admin chrome must surface under OIDC, where accounts is off.
+    // #1489: admin chrome must surface under OIDC, where accounts is off. OIDC
+    // advertises a login_url, so this is NOT single-user mode — Members shows.
     mocks.accountsEnabled = false;
+    mocks.loginUrl = "/auth/login";
     mocks.isAdmin = true;
     renderBody();
     expect(screen.getByTestId("settings-nav-members")).toHaveAttribute("href", "/settings/members");
+    expect(screen.getByTestId("settings-nav-policies")).toHaveAttribute(
+      "href",
+      "/settings/policies",
+    );
+  });
+
+  it("hides Members and Sharing but keeps Policies for an admin in single-user mode", () => {
+    // Explicit single-user local runtime (single_user marker set): there are
+    // no other users to manage or share with, so Members and Sharing drop from
+    // the nav. Policies stays — it's meaningful for a solo user's own sessions.
+    mocks.accountsEnabled = false;
+    mocks.loginUrl = null;
+    mocks.singleUser = true;
+    mocks.isAdmin = true;
+    renderBody();
+    expect(screen.queryByTestId("settings-nav-members")).toBeNull();
+    expect(screen.queryByTestId("settings-nav-sharing")).toBeNull();
     expect(screen.getByTestId("settings-nav-policies")).toHaveAttribute(
       "href",
       "/settings/policies",
@@ -221,9 +256,34 @@ describe("useSettingsRoute", () => {
     // #1489: Members / Policies are admin sections valid in ANY multi-user
     // mode (accounts AND OIDC). They no longer fall back to the default
     // section off an accounts deploy — the nav gates them on is_admin and the
-    // pages self-gate / the server 403s.
+    // pages self-gate / the server 403s. OIDC has a login_url, so it's NOT
+    // single-user mode and Members stays valid.
     mocks.accountsEnabled = false;
+    mocks.loginUrl = "/auth/login";
     expect(routeHook("/settings/members")).toEqual({ inSettings: true, section: "members" });
+    expect(routeHook("/settings/policies")).toEqual({ inSettings: true, section: "policies" });
+  });
+
+  it("keeps Members / Sharing valid on a multi-user header-auth deploy (not single_user)", () => {
+    // Header-auth multi-user (SSO proxy): accounts off AND no login_url, same
+    // shape as single-user, but single_user is false so the admin sections
+    // stay valid. This is the regression the single_user signal fixes.
+    mocks.accountsEnabled = false;
+    mocks.loginUrl = null;
+    mocks.singleUser = false;
+    expect(routeHook("/settings/members")).toEqual({ inSettings: true, section: "members" });
+    expect(routeHook("/settings/sharing")).toEqual({ inSettings: true, section: "sharing" });
+  });
+
+  it("redirects a direct /settings/members or /settings/sharing to the default section in single-user mode", () => {
+    // Explicit single-user local runtime (single_user marker): Members and
+    // Sharing are hidden, so a direct hit to either falls back to the default
+    // section (Appearance). Policies stays valid — it's functional single-user.
+    mocks.accountsEnabled = false;
+    mocks.loginUrl = null;
+    mocks.singleUser = true;
+    expect(routeHook("/settings/members")).toEqual({ inSettings: true, section: "appearance" });
+    expect(routeHook("/settings/sharing")).toEqual({ inSettings: true, section: "appearance" });
     expect(routeHook("/settings/policies")).toEqual({ inSettings: true, section: "policies" });
   });
 

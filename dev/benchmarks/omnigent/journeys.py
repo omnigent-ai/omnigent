@@ -19,6 +19,11 @@ v1 journeys are pure HTTP/API (server + DB, no runner, no LLM):
 ``read_runner_file`` needs a runner but no LLM turn: it plants a file in the
 runner environment (setup) and times the server → runner filesystem read proxy.
 
+Full-turn journeys (``needs_runner=True``) drive a real turn through the runner
++ mock LLM. ``session_cold_start`` measures the new-conversation cold path: it
+spawns a fresh runner per iteration and waits for its tunnel, so the timed span
+includes the runner process start + handshake, not just the first-turn overhead.
+
 The framework (``Journey`` + the two runners) is harness-agnostic and reused
 verbatim by phase-2 full-turn journeys.
 """
@@ -396,9 +401,29 @@ async def _setup_interrupt_session(env: BenchEnvironment) -> str:
 
 
 async def _measure_session_cold_start(env: BenchEnvironment, ctx: JourneyContext) -> None:
+    """Time the full new-conversation cold path: spawn a runner, then first turn.
+
+    Spawns a *fresh* runner process per iteration and waits for its tunnel to
+    register before binding a session and driving the first turn — capturing
+    the runner process start + reverse-tunnel handshake a new conversation
+    always pays (and that a host-launched session pays on its first message),
+    not just steady-state per-turn overhead. The env's boot runner is reused
+    only by the warm journeys; measuring cold start against it would miss the
+    spawn + handshake cost this journey exists to isolate.
+
+    The runner is terminated inline after the turn (not deferred to teardown)
+    so at most one extra runner is ever live — deferring would leave one per
+    warmup+timed iteration alive at once. The spawn + connect + first turn
+    dominates the timed span; the trailing SIGTERM is negligible beside it,
+    mirroring how ``create_session`` folds its inline DELETE into the span.
+    """
     agent_id = cast(str, ctx)  # _setup_turn_agent
-    session_id = await env.create_bound_session(agent_id)
-    await env.drive_turn(session_id, _TURN_PROMPT)
+    proc, runner_id = await env.spawn_extra_runner()
+    try:
+        session_id = await env.create_session_bound_to(agent_id, runner_id)
+        await env.drive_turn(session_id, _TURN_PROMPT)
+    finally:
+        env.terminate_runner(proc)
 
 
 async def _measure_warm_turn(env: BenchEnvironment, ctx: JourneyContext) -> None:
@@ -502,7 +527,8 @@ ALL_JOURNEYS: dict[str, Journey] = {
             setup=_setup_turn_agent,
             needs_runner=True,
             max_iterations=_RUNNER_MAX_ITERATIONS,
-            description="Create+bind a fresh session and drive its first turn to idle.",
+            description="Spawn a fresh runner, wait for its tunnel, bind a session, "
+            "and drive the first turn — the full new-conversation cold path.",
         ),
         Journey(
             name="warm_turn",

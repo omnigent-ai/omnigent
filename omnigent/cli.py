@@ -7,6 +7,7 @@ import contextlib
 import copy
 import hashlib
 import json
+import logging
 import os
 import secrets
 import shutil
@@ -56,6 +57,7 @@ from omnigent.onboarding.ucode_setup import (
     find_ucode_command,
     model_gateway_workspace_urls,
 )
+from omnigent.process_logging import LOG_LEVEL_ENV_VAR, LOG_TO_STDERR_ENV_VAR
 
 if TYPE_CHECKING:
     import httpx
@@ -78,22 +80,113 @@ def _load_config(path: str | None) -> dict[str, Any]:  # type: ignore[explicit-a
         return yaml.safe_load(f) or {}
 
 
-def _server_uvicorn_log_config() -> dict[str, Any]:  # type: ignore[explicit-any]
+def _server_uvicorn_log_config(
+    log_path: Path | None = None,
+    *,
+    log_to_stderr: bool | None = None,
+) -> dict[str, Any]:  # type: ignore[explicit-any]
     """
     Return Uvicorn logging config with request-duration access logs.
 
-    Uvicorn emits the FastAPI access line itself, so Omnigent swaps
-    only the access formatter while preserving Uvicorn's default
-    handlers, levels, and server-log formatting.
+    Uvicorn emits the FastAPI access line itself, so Omnigent standardizes
+    its default and access formatters while preserving handler routing and
+    request-duration enrichment.
 
+    :param log_path: Optional server process log file. When set, Uvicorn
+        default/error/access logs write there.
+    :param log_to_stderr: Optional override for terminal mirroring.
     :returns: Uvicorn ``log_config`` suitable for ``uvicorn.run``.
     """
     import uvicorn.config
 
-    log_config = copy.deepcopy(uvicorn.config.LOGGING_CONFIG)
-    log_config["formatters"]["access"]["()"] = (
-        "omnigent.server.performance_metrics.RequestDurationAccessFormatter"
+    from omnigent.process_logging import (
+        DEFAULT_LOG_DATEFMT,
+        DEFAULT_LOG_FORMAT,
+        DEFAULT_LOG_PREFIX_FORMAT,
+        effective_log_level,
+        should_log_to_stderr,
+        terminal_supports_color,
     )
+
+    access_log_format = (
+        DEFAULT_LOG_PREFIX_FORMAT + '%(client_addr)s - "%(request_line)s" %(status_code)s'
+    )
+    use_terminal_colors = terminal_supports_color()
+    log_config = copy.deepcopy(uvicorn.config.LOGGING_CONFIG)
+    log_config["formatters"]["default"] = {
+        "()": "omnigent.process_logging.TerminalLogFormatter",
+        "fmt": DEFAULT_LOG_FORMAT,
+        "datefmt": DEFAULT_LOG_DATEFMT,
+        "use_colors": use_terminal_colors,
+    }
+    log_config["formatters"]["access"] = {
+        "()": "omnigent.server.performance_metrics.RequestDurationAccessFormatter",
+        "fmt": access_log_format,
+        "datefmt": DEFAULT_LOG_DATEFMT,
+        "use_colors": use_terminal_colors,
+    }
+    log_config["formatters"]["default_file"] = {
+        "()": "omnigent.process_logging.TerminalLogFormatter",
+        "fmt": DEFAULT_LOG_FORMAT,
+        "datefmt": DEFAULT_LOG_DATEFMT,
+        "use_colors": False,
+    }
+    log_config["formatters"]["access_file"] = {
+        "()": "omnigent.server.performance_metrics.RequestDurationAccessFormatter",
+        "fmt": access_log_format,
+        "datefmt": DEFAULT_LOG_DATEFMT,
+        "use_colors": False,
+    }
+    if log_path is not None:
+        level_name = logging.getLevelName(effective_log_level())
+        if not isinstance(level_name, str):
+            level_name = "INFO"
+        if log_to_stderr is None:
+            mirror = should_log_to_stderr() or sys.stderr.isatty()
+        else:
+            mirror = log_to_stderr
+        log_config["handlers"]["server_file"] = {
+            "class": "logging.FileHandler",
+            "formatter": "default_file",
+            "filename": str(log_path),
+            "encoding": "utf-8",
+        }
+        log_config["handlers"]["server_access_file"] = {
+            "class": "logging.FileHandler",
+            "formatter": "access_file",
+            "filename": str(log_path),
+            "encoding": "utf-8",
+        }
+        default_handlers: list[str] = []
+        access_handlers: list[str] = []
+        if mirror:
+            log_config["handlers"]["server_terminal"] = {
+                "()": "omnigent.process_logging.terminal_stream_handler",
+                "formatter": "default",
+                "level": level_name,
+            }
+            log_config["handlers"]["server_access_terminal"] = {
+                "()": "omnigent.process_logging.terminal_stream_handler",
+                "formatter": "access",
+                "level": level_name,
+            }
+            default_handlers.append("server_terminal")
+            access_handlers.append("server_access_terminal")
+        log_config["loggers"]["uvicorn"] = {
+            "handlers": [*default_handlers, "server_file"],
+            "level": level_name,
+            "propagate": False,
+        }
+        log_config["loggers"]["uvicorn.error"] = {
+            "handlers": [*default_handlers, "server_file"],
+            "level": level_name,
+            "propagate": False,
+        }
+        log_config["loggers"]["uvicorn.access"] = {
+            "handlers": [*access_handlers, "server_access_file"],
+            "level": level_name,
+            "propagate": False,
+        }
     return log_config
 
 
@@ -319,7 +412,7 @@ def _display_path(path: Path) -> str:
     its real location rather than a misleading ``~``.
 
     :param path: The path to display, e.g.
-        ``Path("/Users/alice/.omnigent/logs/server/local-server-ab12.log")``.
+        ``Path("/Users/alice/.omnigent/logs/server/server-ab12.log")``.
     :returns: ``"~/.omnigent/..."`` when *path* is under ``$HOME``,
         otherwise ``str(path)``.
     """
@@ -1150,7 +1243,63 @@ class _OmnigentCLI(click.Group):
         super().format_help(ctx, formatter)
 
 
+def _set_debug_logging(
+    _ctx: click.Context,
+    _param: click.Parameter,
+    value: bool,
+) -> bool:
+    if value:
+        os.environ[LOG_LEVEL_ENV_VAR] = "DEBUG"
+    return value
+
+
+def _set_log_to_stderr(
+    _ctx: click.Context,
+    _param: click.Parameter,
+    value: bool,
+) -> bool:
+    if value:
+        os.environ[LOG_TO_STDERR_ENV_VAR] = "1"
+    return value
+
+
+def _extract_global_logging_flags(argv: list[str]) -> tuple[list[str], bool, bool]:
+    """Remove global logging flags before run-shorthand rewriting."""
+    debug_logging = False
+    log_to_stderr = False
+    remaining: list[str] = []
+    passthrough = False
+    for token in argv:
+        if token == "--":
+            passthrough = True
+            remaining.append(token)
+        elif not passthrough and token == "--debug":
+            debug_logging = True
+        elif not passthrough and token == "--log-to-stderr":
+            log_to_stderr = True
+        else:
+            remaining.append(token)
+    return remaining, debug_logging, log_to_stderr
+
+
 @click.group(cls=_OmnigentCLI)
+@click.option(
+    "--debug",
+    "debug_logging",
+    is_flag=True,
+    is_eager=True,
+    expose_value=False,
+    callback=_set_debug_logging,
+    help="Enable verbose DEBUG logging for Omnigent processes.",
+)
+@click.option(
+    "--log-to-stderr",
+    is_flag=True,
+    is_eager=True,
+    expose_value=False,
+    callback=_set_log_to_stderr,
+    help="Mirror process logs to the terminal when stderr is interactive.",
+)
 @click.option(
     "--version",
     is_flag=True,
@@ -1260,7 +1409,11 @@ def main() -> None:
     # (update-check cache, diagnostics logs, config). No-op once migrated.
     _migrate_legacy_state_dir()
 
-    argv = sys.argv[1:]
+    argv, debug_logging, log_to_stderr = _extract_global_logging_flags(sys.argv[1:])
+    if debug_logging:
+        os.environ[LOG_LEVEL_ENV_VAR] = "DEBUG"
+    if log_to_stderr:
+        os.environ[LOG_TO_STDERR_ENV_VAR] = "1"
 
     # Bare ``omnigent`` with no args behaves like ``omnigent run`` on an
     # interactive terminal: ``run`` resolves the configured default agent /
@@ -1302,7 +1455,7 @@ def main() -> None:
         raise SystemExit(2)
 
     # Always-on diagnostics — captures exceptions, lifecycle events,
-    # and warnings to ~/.omnigent/logs/cli-*.log even when --log
+    # and warnings to ~/.omnigent/logs/cli/cli-*.log even when --log
     # (conversation JSON) and --debug-events (SSE tape) are off.
     # Skip for pure help/version so quick invocations don't create
     # log litter.
@@ -1473,7 +1626,7 @@ class _HostDaemonRecord:
         mode, e.g. ``"https://example.databricksapps.com"``. ``None``
         for local mode.
     :param log_path: Daemon log file path, e.g.
-        ``"/Users/me/.omnigent/logs/host-daemon/daemon-abc.log"``.
+        ``"/Users/me/.omnigent/logs/host/host-abc.log"``.
     :param started_at: Unix epoch seconds when the daemon was spawned,
         e.g. ``1710000000``.
     :param host_id: Local host id advertised to Omnigent servers, e.g.
@@ -1587,7 +1740,7 @@ class _SpawnedDaemonProcess:
 
     :param pid: Spawned process id, e.g. ``4242``.
     :param log_path: Daemon log path, e.g.
-        ``"/Users/me/.omnigent/logs/host-daemon/daemon-abc.log"``.
+        ``"/Users/me/.omnigent/logs/host/host-abc.log"``.
     """
 
     pid: int
@@ -2050,23 +2203,29 @@ def _spawn_host_daemon_process(
     :param env: Allowlisted daemon environment.
     :returns: Spawned process metadata, or ``None`` if spawn fails.
     """
-    log_dir = _HOST_PID_PATH.parent / "logs" / "host-daemon"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_fd, log_path = tempfile.mkstemp(prefix="daemon-", suffix=".log", dir=log_dir)
-    log_fh = os.fdopen(log_fd, "wb")
+    from omnigent.process_logging import (
+        PROCESS_LOG_FILE_ENV_VAR,
+        child_logging_popen_kwargs,
+        open_process_log_file,
+    )
+
+    log_path, log_fh = open_process_log_file("host")
+    env = {**env, PROCESS_LOG_FILE_ENV_VAR: str(log_path)}
     try:
-        proc = subprocess.Popen(
-            args,
-            env=env,
-            stdout=log_fh,
-            stderr=log_fh,
-            **_proc.spawn_kwargs(),
-        )
+        with child_logging_popen_kwargs(env) as logging_kwargs:
+            proc = subprocess.Popen(
+                args,
+                env=env,
+                stdout=log_fh,
+                stderr=log_fh,
+                **_proc.spawn_kwargs(),
+                **logging_kwargs,
+            )
     except OSError:
         return None
     finally:
         log_fh.close()
-    return _SpawnedDaemonProcess(pid=proc.pid, log_path=log_path)
+    return _SpawnedDaemonProcess(pid=proc.pid, log_path=str(log_path))
 
 
 def _persist_spawned_daemon(
@@ -2518,7 +2677,7 @@ def _discover_local_server_url(
         if not _host_daemon_alive():
             raise click.ClickException(
                 "The local daemon exited before its Omnigent server became ready. "
-                "See logs under ~/.omnigent/logs/host-daemon/ and "
+                "See logs under ~/.omnigent/logs/host/ and "
                 "~/.omnigent/logs/server/."
             )
         time.sleep(0.2)
@@ -2607,6 +2766,11 @@ def _start_cli_runner_process(
     :returns: The spawned runner process metadata.
     :raises click.ClickException: If the runner exits immediately.
     """
+    from omnigent.process_logging import (
+        PROCESS_LOG_FILE_ENV_VAR,
+        child_logging_popen_kwargs,
+        open_process_log_file,
+    )
     from omnigent.runner.identity import (
         RUNNER_ID_ENV_VAR,
         RUNNER_ISOLATE_SESSION_ENV_VAR,
@@ -2648,24 +2812,18 @@ def _start_cli_runner_process(
     log_path: Path | None = None
     log_fh: BinaryIO | None = None
     if capture_logs:
-        base_log_dir = (
-            Path(log_dir).expanduser()
-            if log_dir is not None
-            else Path.home() / ".omnigent" / "logs"
-        )
-        runner_log_dir = base_log_dir / "runner"
-        runner_log_dir.mkdir(parents=True, exist_ok=True)
-        log_fd, log_name = tempfile.mkstemp(prefix="runner-", suffix=".log", dir=runner_log_dir)
-        log_path = Path(log_name)
-        log_fh = os.fdopen(log_fd, "wb")
+        log_path, log_fh = open_process_log_file("runner", root=log_dir)
+        env[PROCESS_LOG_FILE_ENV_VAR] = str(log_path)
     try:
-        runner_proc = subprocess.Popen(
-            [sys.executable, "-m", "omnigent.runner._entry"],
-            env=env,
-            stdout=log_fh,
-            stderr=log_fh,
-            **_proc.spawn_kwargs(),
-        )
+        with child_logging_popen_kwargs(env) as logging_kwargs:
+            runner_proc = subprocess.Popen(
+                [sys.executable, "-m", "omnigent.runner._entry"],
+                env=env,
+                stdout=log_fh,
+                stderr=log_fh,
+                **_proc.spawn_kwargs(),
+                **logging_kwargs,
+            )
     finally:
         if log_fh is not None:
             log_fh.close()
@@ -2777,6 +2935,12 @@ def _assert_server_port_bindable(host: str, port: int) -> None:
     "machine-global so `server` and `run` share one admin]",
 )
 @click.option(
+    "--conversation-database-uri",
+    default=None,
+    help="Database URI for the Agent Platform tables (conversations, items, labels). "
+    "Defaults to --database-uri when not set (single-DB mode).",
+)
+@click.option(
     "--artifact-location",
     default=None,
     help="Path for artifact storage.  [default: <data-dir>/artifacts]",
@@ -2832,6 +2996,7 @@ def server(
     host: str,
     port: int,
     database_uri: str | None,
+    conversation_database_uri: str | None,
     artifact_location: str | None,
     config_path: str | None,
     execution_timeout: int | None,
@@ -2992,6 +3157,7 @@ def server(
     # CLI args take precedence over config file, which takes precedence
     # over defaults.
     db_uri = database_uri or cfg.get("database_uri", _default_db_uri())
+    conv_db_uri = conversation_database_uri or cfg.get("conversation_database_uri", None)
     art_loc = artifact_location or cfg.get("artifact_location", _default_artifact_location())
 
     # Resolve relative artifact location against config file's directory
@@ -3006,9 +3172,9 @@ def server(
 
     from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 
-    agent_store = SqlAlchemyAgentStore(db_uri)
+    agent_store = SqlAlchemyAgentStore(db_uri, conv_db_uri)
     file_store = SqlAlchemyFileStore(db_uri)
-    conversation_store = SqlAlchemyConversationStore(db_uri)
+    conversation_store = SqlAlchemyConversationStore(db_uri, conv_db_uri)
     comment_store = SqlAlchemyCommentStore(db_uri)
     policy_store = SqlAlchemyPolicyStore(db_uri)
     permission_store = SqlAlchemyPermissionStore(db_uri)
@@ -3148,6 +3314,13 @@ def server(
 
         account_store = SqlAlchemyAccountStore(db_uri)
 
+    from omnigent.process_logging import configure_process_logging
+
+    server_log_path = configure_process_logging(
+        "server",
+        logger_names=("omnigent", "uvicorn", "uvicorn.error", "uvicorn.access"),
+    )
+
     app = create_app(
         agent_store=agent_store,
         file_store=file_store,
@@ -3165,22 +3338,13 @@ def server(
         admins=config_str_list(cfg.get("admins")),
         allowed_domains=config_str_list(cfg.get("allowed_domains")),
         sandbox_config=sandbox_config,
+        server_config=cfg,
     )
 
     click.echo(f"Starting omnigent server on {host}:{port}")
     click.echo(f"  database:  {db_uri}")
     click.echo(f"  artifacts: {art_loc}")
-    # A foreground server streams uvicorn logs to this terminal, but the
-    # always-on diagnostics (omnigent.* loggers, captured warnings) also land
-    # in a persistent per-invocation file — point at it so there's a concrete
-    # log to grep after the terminal scrolls. None only in the detached spawn
-    # path (`-m omnigent.cli server`, no setup_cli_logging), whose captured
-    # log `server start` already reports.
-    from omnigent.cli_diagnostics import current_cli_log_path
-
-    _cli_log = current_cli_log_path()
-    if _cli_log is not None:
-        click.echo(f"  log:       {_display_path(_cli_log)}")
+    click.echo(f"  log:       {_display_path(server_log_path)}")
 
     # First-run terminal setup: the FALLBACK entry point. Fires only on
     # an interactive TTY when no admin exists AND the browser isn't about
@@ -3254,7 +3418,7 @@ def server(
         app,
         host=host,
         port=port,
-        log_config=_server_uvicorn_log_config(),
+        log_config=_server_uvicorn_log_config(server_log_path),
         ws_max_size=RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
         # Server side of the runner/host tunnels' protocol keepalive, aligned
         # to the 90 s app-level budget instead of uvicorn's 20 s default that
@@ -4702,20 +4866,36 @@ def _ensure_bundled_agent_brain_credential(name: str) -> None:
         if not isinstance(disk_block, dict):
             return
         # Skip ambient-detected entries (not on disk) — auto-defaulted upstream.
-        for entry_name, entry in load_providers(config).items():
-            if family not in provider_families(entry) or entry_name not in disk_block:
-                continue
-            _save_global_config(
-                {"providers": set_default_provider(disk_block, entry_name, family)}
-            )
-            # Announce: this mutates the user's config on a launch command.
-            click.echo(
-                f"No default {family_label(family)} credential set — "
-                f"using {_credential_label(entry_name, entry)} and saving it as "
-                f"the default (change anytime with: omnigent /model).",
-                err=True,
-            )
+        candidates = [
+            (entry_name, entry)
+            for entry_name, entry in load_providers(config).items()
+            if family in provider_families(entry) and entry_name in disk_block
+        ]
+        if not candidates:
             return
+        entry_name, entry = candidates[0]
+        _save_global_config({"providers": set_default_provider(disk_block, entry_name, family)})
+        family_name = family_label(family)
+        credential_name = _credential_label(entry_name, entry)
+        # Announce: this mutates the user's config on a launch command.
+        if len(candidates) > 1:
+            message = (
+                f"No default {family_name} credential set — "
+                f"using {credential_name} "
+                f"({len(candidates)} {family_name} credentials found; "
+                "pick another with: omnigent /model) and saving it as the default."
+            )
+        else:
+            message = (
+                f"No default {family_name} credential set — "
+                f"using {credential_name} and saving it as the default "
+                "(change anytime with: omnigent /model)."
+            )
+        click.echo(
+            message,
+            err=True,
+        )
+        return
     except (OSError, yaml.YAMLError, OmnigentError):
         return
 
@@ -11911,20 +12091,22 @@ def debug_migrate_accounts_to_oidc(
 @click.option(
     "--type",
     "log_type",
-    type=click.Choice(["runner", "host-runner", "server", "cli"], case_sensitive=False),
+    type=click.Choice(
+        ["runner", "host", "server", "cli", "host-runner", "host-daemon"],
+        case_sensitive=False,
+    ),
     default="runner",
     show_default=True,
-    help="Log category: runner (local CLI runner via omnigent run), "
-    "host-runner (runner spawned by a host daemon), "
-    "server (local server), or cli (CLI diagnostics).",
+    help="Log category: runner, host, server, or cli. "
+    "Legacy aliases host-runner and host-daemon are still accepted.",
 )
 @click.option(
     "--session",
     "session_id",
     default=None,
     metavar="SESSION_ID",
-    help="Filter host-runner logs by session id, e.g. conv_abc123. "
-    "Only applies to --type host-runner. Shows all log files for the "
+    help="Filter runner logs by session id, e.g. conv_abc123. "
+    "Only applies to --type runner/host-runner. Shows all log files for the "
     "session, oldest first.",
 )
 @click.option(
@@ -11962,15 +12144,15 @@ def debug_logs(
     Use ``--list`` to see all available files, or ``--follow`` to stream
     new output as it is written.
 
-    Pass ``--session SESSION_ID`` (``--type host-runner`` only) to scope
+    Pass ``--session SESSION_ID`` (``--type runner`` only) to scope
     output to all log files produced for a specific session across relaunches.
 
     \b
     Log locations (relative to ~/.omnigent or $OMNIGENT_DATA_DIR):
       runner       logs/runner/runner-*.log
-      host-runner  logs/host-runner/runner-*.log
-      server       logs/server/*server*.log
-      cli          logs/cli-*.log
+      host         logs/host/host-*.log
+      server       logs/server/server-*.log
+      cli          logs/cli/cli-*.log
 
     \b
     Examples:
@@ -11978,10 +12160,10 @@ def debug_logs(
       omnigent debug logs
       # List all local runner log files with sizes
       omnigent debug logs --list
-      # Show host-runner logs for a specific session (across relaunches)
-      omnigent debug logs --type host-runner --session conv_abc123
-      # List host-runner log files for a session
-      omnigent debug logs --type host-runner --session conv_abc123 --list
+      # Show runner logs for a specific session (across relaunches)
+      omnigent debug logs --type runner --session conv_abc123
+      # List runner log files for a session
+      omnigent debug logs --type runner --session conv_abc123 --list
       # Follow the latest server log in real-time
       omnigent debug logs --type server --follow
       # Show the full latest CLI diagnostics log
@@ -11992,35 +12174,59 @@ def debug_logs(
 
     from omnigent.host.local_server import _local_data_dir
 
-    if session_id is not None and log_type != "host-runner":
-        raise click.UsageError("--session is only supported with --type host-runner")
+    log_type = log_type.lower()
+    alias_map = {"host-runner": "runner", "host-daemon": "host"}
+    requested_log_type = log_type
+    log_type = alias_map.get(log_type, log_type)
+
+    if session_id is not None and log_type != "runner":
+        raise click.UsageError("--session is only supported with --type runner")
 
     if follow and IS_WINDOWS:
         raise click.UsageError("--follow is not supported on Windows")
 
     data_dir = _local_data_dir()
 
-    _log_configs: dict[str, tuple[Path, str]] = {
-        "runner": (data_dir / "logs" / "runner", "runner-*.log"),
-        "host-runner": (data_dir / "logs" / "host-runner", "runner-*.log"),
-        # Covers both server-*.log (omnigent run) and local-server-*.log (daemon).
-        "server": (data_dir / "logs" / "server", "*server*.log"),
-        "cli": (data_dir / "logs", "cli-*.log"),
+    _log_configs: dict[str, list[tuple[Path, str]]] = {
+        # Include the legacy host-runner dir so old session logs remain visible.
+        "runner": [
+            (data_dir / "logs" / "runner", "runner-*.log"),
+            (data_dir / "logs" / "host-runner", "runner-*.log"),
+        ],
+        "host": [
+            (data_dir / "logs" / "host", "host-*.log"),
+            (data_dir / "logs" / "host-daemon", "daemon-*.log"),
+        ],
+        # Covers both server-*.log and legacy local-server-*.log.
+        "server": [(data_dir / "logs" / "server", "*server*.log")],
+        "cli": [
+            (data_dir / "logs" / "cli", "cli-*.log"),
+            (data_dir / "logs", "cli-*.log"),
+        ],
     }
-
-    log_dir, pattern = _log_configs[log_type]
-
-    if not log_dir.exists():
-        raise click.ClickException(f"No {log_type} logs found — {log_dir} does not exist.")
 
     if session_id is not None:
         # Sanitize the same way connect.py does so the glob matches.
         slug = re.sub(r"[^\w-]", "", session_id)[:32]
         pattern = f"runner-{slug}-*.log"
+        configs = [(directory, pattern) for directory, _pattern in _log_configs[log_type]]
+    else:
+        configs = _log_configs[log_type]
+
+    existing_dirs = [directory for directory, _pattern in configs if directory.exists()]
+    if not existing_dirs:
+        dirs = ", ".join(str(directory) for directory, _pattern in configs)
+        raise click.ClickException(f"No {requested_log_type} logs found — none of {dirs} exist.")
 
     # Exclude symlinks (e.g. latest-cli.log), sort newest first.
     log_files = sorted(
-        (f for f in log_dir.glob(pattern) if not f.is_symlink()),
+        (
+            f
+            for directory, pattern in configs
+            if directory.exists()
+            for f in directory.glob(pattern)
+            if not f.is_symlink()
+        ),
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )
@@ -12028,17 +12234,18 @@ def debug_logs(
     if not log_files:
         if session_id is not None:
             raise click.ClickException(
-                f"No host-runner logs found for session {session_id!r}. "
+                f"No runner logs found for session {session_id!r}. "
                 "Session ids appear in filenames only for runners launched "
                 "after this feature was added."
             )
-        raise click.ClickException(f"No {log_type} log files found in {log_dir}.")
+        dirs = ", ".join(str(directory) for directory, _pattern in configs)
+        raise click.ClickException(f"No {requested_log_type} log files found in {dirs}.")
 
     if list_only:
         header = (
-            f"host-runner logs for session {session_id!r} in {log_dir}:"
+            f"runner logs for session {session_id!r}:"
             if session_id
-            else f"{log_type} logs in {log_dir}:"
+            else f"{requested_log_type} logs:"
         )
         click.echo(header)
         for f in log_files:

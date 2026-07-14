@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from tests.harness_bench.driver import TurnResult
+from tests.harness_bench.driver import ForkResult, TurnResult
 from tests.harness_bench.profile import BenchProfile
 
 
@@ -39,10 +39,25 @@ class Driver(Protocol):
         """A multi-token turn; the result's ``text_delta_count`` reflects
         whether the transport streamed token-level deltas."""
 
+    async def run_reasoning_turn(self) -> TurnResult:
+        """A reasoning-eligible turn; ``reasoning_delta_count`` records
+        reasoning events forwarded by the transport."""
+
     async def run_tool_turn(self, *, deny: bool) -> TurnResult:
         """Provoke a tool call. With *deny*, a tool-call policy DENY is in
         force so the call should be blocked (``tool_call_denied``); otherwise
         the call is dispatched and answered (``tool_calls`` populated)."""
+
+    async def run_mcp_tool_turn(self) -> TurnResult:
+        """Provoke an Omnigent MCP relay tool call.
+
+        Native transports use this to distinguish the Omnigent MCP bridge from
+        the vendor's own shell/tool surface. Unsupported transports return an
+        unmeasured result so the probe SKIPs.
+        """
+
+    async def run_fork_turn(self, marker: str) -> ForkResult:
+        """Fork the current session and prove its history is replayed."""
 
     async def run_policy_turn(self, *, action: str) -> TurnResult:
         """Provoke a tool call under an explicit tool-call policy *action*

@@ -99,6 +99,7 @@ function mockConversations(conversations: Conversation[]) {
 function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
   return {
     accounts_enabled: false,
+    single_user: false,
     login_url: null,
     needs_setup: false,
     databricks_features: false,
@@ -383,6 +384,33 @@ describe("sharing kill switch", () => {
 
     fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
 
+    expect(screen.getByTestId("share-conversation")).not.toHaveAttribute("data-disabled");
+  });
+
+  it("omits the row's Share item entirely in single-user mode", () => {
+    // Explicit single_user marker: no other users to share with, so the item
+    // is removed — not just disabled like the sharing-off case.
+    // isCurrentServerLocal is mocked false, so this exercises the single-user
+    // gate specifically (not the local-server path).
+    mockConversations([CONV]);
+    renderSidebar(undefined, serverInfo({ single_user: true }));
+
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+
+    expect(screen.queryByTestId("share-conversation")).toBeNull();
+    // Other row actions still render — only Share is gated on single-user.
+    expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
+  });
+
+  it("keeps the row's Share item on a multi-user header-auth deploy (not single_user)", () => {
+    // Header-auth multi-user (SSO proxy): accounts off AND no login_url, same
+    // shape as single-user, but single_user false — the item must stay.
+    mockConversations([CONV]);
+    renderSidebar(undefined, serverInfo({ single_user: false }));
+
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+
+    expect(screen.getByTestId("share-conversation")).toBeInTheDocument();
     expect(screen.getByTestId("share-conversation")).not.toHaveAttribute("data-disabled");
   });
 });

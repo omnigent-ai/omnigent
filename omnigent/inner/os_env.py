@@ -948,7 +948,7 @@ def _handle_helper_request(
             return {"error": "path must be a non-empty string"}
         path = _resolve_path(cwd, raw_path)
         try:
-            _assert_within_cwd(cwd, path)
+            _assert_within_reach(cwd, sandbox, path, need_write=False)
             _assert_read_allowed(sandbox, path)
         except PermissionError as exc:
             return {"error": str(exc)}
@@ -969,7 +969,7 @@ def _handle_helper_request(
             return {"error": "path must be a non-empty string"}
         path = _resolve_path(cwd, raw_path)
         try:
-            _assert_within_cwd(cwd, path)
+            _assert_within_reach(cwd, sandbox, path, need_write=True)
             _assert_write_allowed(sandbox, path)
         except PermissionError as exc:
             return {"error": str(exc)}
@@ -990,7 +990,7 @@ def _handle_helper_request(
             return {"error": "path must be a non-empty string"}
         path = _resolve_path(cwd, raw_path)
         try:
-            _assert_within_cwd(cwd, path)
+            _assert_within_reach(cwd, sandbox, path, need_write=True)
             _assert_read_allowed(sandbox, path)
             _assert_write_allowed(sandbox, path)
         except PermissionError as exc:
@@ -1059,6 +1059,82 @@ def _assert_within_cwd(cwd: Path, resolved: Path) -> None:
             f"Access to '{resolved}' is blocked: path is outside "
             f"the environment root '{resolved_cwd}'"
         ) from exc
+
+
+def _assert_within_reach(
+    cwd: Path,
+    policy: SandboxPolicy,
+    resolved: Path,
+    *,
+    need_write: bool,
+) -> None:
+    """Confine a file-tool op to *cwd*, extended by declared sandbox grants.
+
+    Replaces the historical cwd-only guard at the read / write / edit sites.
+    *resolved* is already canonicalised by :func:`_resolve_path` (symlinks
+    followed, ``..`` collapsed) and every grant root is canonicalised at
+    resolve time, so a symlink or ``..`` chain whose real target leaves both
+    *cwd* and every grant is rejected -- the confinement boundary cannot be
+    escaped by traversal.
+
+    Precedence and grant semantics:
+
+    - A path inside *cwd* is always permitted here (the active-sandbox
+      allow-list narrowing in :func:`_assert_read_allowed` /
+      :func:`_assert_write_allowed` still runs afterwards, unchanged).
+    - A path OUTSIDE *cwd* is permitted only when an explicitly declared
+      grant of the right kind covers it. These reuse the SAME grant shapes the
+      active backends already populate -- ``read_paths`` / ``write_paths`` are
+      directory roots (containment match against ``read_roots`` /
+      ``write_roots``) and ``write_files`` is the single-file grant (exact
+      resolved-path match); no new grant vocabulary is introduced. A **write**
+      grant (``write_paths`` / ``write_files``) admits both reads and writes of
+      that subtree (a writable path is readable); a **read** grant
+      (``read_paths``) admits reads only -- so a read grant never confers
+      write. Read grants are directory roots; a single readable file is
+      expressed by rooting a ``read_paths`` entry at that file (an exact-path
+      match still succeeds, but there is no ``read_files`` shape).
+    - With NO grants declared, ``write_roots`` / ``write_files`` are empty and
+      ``read_roots`` is ``None``: nothing outside *cwd* is permitted, byte for
+      byte the previous cwd-confinement behaviour. This default-unchanged
+      property is the security invariant.
+
+    The target is resolved ONCE (by :func:`_resolve_path`) before comparison,
+    so this guard shares the prior cwd-guard's TOCTOU posture: a symlink
+    swapped between this check and the later open could redirect the op. That
+    is unchanged by this diff -- for an ACTIVE sandbox the backend's OS-level
+    mount mask stays the hard boundary, and under ``type: none`` the file tools
+    were never a containment boundary anyway (the co-resident ``sys_os_shell``
+    is unconfined). Widening reach to declared grants does not alter that
+    posture.
+
+    :param cwd: The environment root (resolved inside).
+    :param policy: Resolved sandbox policy carrying the declared grants.
+    :param resolved: Fully-resolved target path (post ``_resolve_path``).
+    :param need_write: ``True`` for write / edit ops (only write grants admit
+        an out-of-cwd path); ``False`` for read ops (read OR write grants
+        admit).
+    :raises PermissionError: If *resolved* is outside *cwd* and no grant of
+        the required kind covers it.
+    """
+    resolved_cwd = cwd.resolve()
+    if _is_within(resolved, resolved_cwd):
+        return
+    # Write grants (directories + single files) admit both reads and writes.
+    if any(_is_within(resolved, root) for root in policy.write_roots):
+        return
+    if any(resolved == grant for grant in policy.write_files):
+        return
+    # Read grants admit reads only.
+    if not need_write and policy.read_roots is not None:
+        if any(_is_within(resolved, root) for root in policy.read_roots):
+            return
+    kind = "write" if need_write else "read"
+    raise PermissionError(
+        f"Access to '{resolved}' is blocked: path is outside the "
+        f"environment root '{resolved_cwd}' and no sandbox {kind} grant "
+        f"covers it"
+    )
 
 
 def _assert_read_allowed(policy: SandboxPolicy, path: Path) -> None:

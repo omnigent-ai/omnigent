@@ -24,7 +24,7 @@ spawn: true
 # (`omnigent setup --no-internal-beta`) — an Anthropic API key, a Claude
 # subscription, an OpenAI-compatible gateway, or a Databricks workspace. With
 # no model named the claude-sdk harness resolves the configured provider's
-# default Claude model (the bundled catalog default is claude-opus-4-8).
+# default Claude model.
 executor:
   type: omnigent
   context_window: 1000000

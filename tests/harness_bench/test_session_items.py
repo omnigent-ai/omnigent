@@ -6,6 +6,7 @@ from tests.harness_bench.session_items import (
     function_calls,
     item_role,
     item_type,
+    reasoning_item_count,
     tool_output_states,
 )
 
@@ -50,6 +51,11 @@ def test_function_calls_and_output_states_are_normalized() -> None:
     ]
     assert function_calls(items) == [{"call_id": "c1", "name": "Bash", "arguments": None}]
     assert tool_output_states(items, deny_marker="bench-deny") == (True, True)
+
+
+def test_reasoning_item_count_accepts_enveloped_items() -> None:
+    items = [{"type": "reasoning"}, {"data": {"type": "reasoning"}}, {"type": "message"}]
+    assert reasoning_item_count(items) == 2
 
 
 def test_contains_user_text_reads_message_blocks() -> None:

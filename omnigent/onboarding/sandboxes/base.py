@@ -244,12 +244,16 @@ class SandboxLauncher(ABC):
         Start ``omnigent host`` in the sandbox and return the workspace path.
 
         The default is the EXEC model: probe ``$HOME``, create
-        ``<HOME>/workspace``, optionally clone the repository into it, and start
-        the host detached (``setsid``-backgrounded, identity + token in the
-        process environment) — all driven through :meth:`run` /
-        :meth:`run_background`. It is shared by every provider whose sandbox is a
-        bare box the server execs into (Modal, Daytona, …); entrypoint-as-host
-        providers (e.g. Kubernetes, whose Pod boots running the host) override it.
+        ``<HOME>/workspace``, optionally materialize the repository into it (via
+        :meth:`materialize_workspace`, which clones by default), and start the
+        host detached (``setsid``-backgrounded, identity + token in the process
+        environment) — all driven through :meth:`run` / :meth:`run_background`.
+        It is shared by every provider whose sandbox is a bare box the server
+        execs into (Modal, Daytona, …); entrypoint-as-host providers (e.g.
+        Kubernetes, whose Pod boots running the host) override it. A provider
+        that only needs to change how the repository is obtained (resolve a local
+        checkout instead of cloning) overrides :meth:`materialize_workspace`
+        alone.
 
         The launch token is registered before this call, so the host
         authenticates the moment it dials back. The ``repo_*`` arguments arrive
@@ -287,28 +291,14 @@ class SandboxLauncher(ABC):
         workspace = f"{home}/workspace"
         self.run(sandbox_id, f"mkdir -p {shlex.quote(workspace)}")
         if repo_url is not None:
-            if on_stage is not None:
-                on_stage("cloning")
-            clone_dir = f"{workspace}/{repo_name}"
-            branch_args = (
-                f"--branch {shlex.quote(repo_branch)} --single-branch "
-                if repo_branch is not None
-                else ""
+            workspace = self.materialize_workspace(
+                sandbox_id,
+                workspace=workspace,
+                repo_url=repo_url,
+                repo_branch=repo_branch,
+                repo_name=repo_name,
+                on_stage=on_stage,
             )
-            try:
-                self.run(
-                    sandbox_id,
-                    f"git clone {branch_args}-- {shlex.quote(repo_url)} {shlex.quote(clone_dir)}",
-                )
-            except click.ClickException as exc:
-                # Provider boundary: re-raise with the repository named so the
-                # create-session 502 says WHAT failed to clone, not just that a
-                # sandbox command exited non-zero.
-                raise click.ClickException(
-                    f"failed to clone repository '{repo_url}'"
-                    f"{f' (branch {repo_branch!r})' if repo_branch else ''}: {exc.message}"
-                ) from exc
-            workspace = clone_dir
         # "starting" covers from here through host registration — the caller's
         # online poll resolves it.
         if on_stage is not None:
@@ -326,6 +316,77 @@ class SandboxLauncher(ABC):
             f"{env_prefix} omnigent host --server {shlex.quote(server_url)}",
         )
         return workspace
+
+    def materialize_workspace(
+        self,
+        sandbox_id: str,
+        *,
+        workspace: str,
+        repo_url: str,
+        repo_branch: str | None,
+        repo_name: str | None,
+        on_stage: Callable[[str], None] | None = None,
+    ) -> str:
+        """
+        Materialize the requested repository into the sandbox and return the
+        working directory the host should start in.
+
+        Override point for how a repository *identity* becomes an on-disk
+        checkout. The default is the EXEC model — ``git clone`` the URL into
+        ``<workspace>/<repo_name>`` via :meth:`run` — shared by every provider
+        whose sandbox is a bare box with outbound git access (Modal, Daytona,
+        E2B, …). Providers whose sandbox already carries the repository (a
+        pre-provisioned checkout, a local mirror, a cached worktree) override
+        this to *resolve* the identity to that local path instead of cloning,
+        without having to reimplement :meth:`start_host`. Called by
+        :meth:`start_host` only when ``repo_url`` is set, after ``<workspace>``
+        has been created and before the host launches.
+
+        The ``repo_*`` arguments are the same repository identity
+        :meth:`start_host` received (the server's ``RepoWorkspace`` unpacked into
+        primitives, so this onboarding-layer method carries no server
+        dependency). An override is free to interpret ``repo_url`` as an identity
+        to map to a local checkout rather than a URL to fetch.
+
+        :param sandbox_id: The sandbox from :meth:`provision`.
+        :param workspace: The already-created workspace root, e.g.
+            ``"/root/workspace"``.
+        :param repo_url: Repository clone URL (or, for a resolving override, the
+            repository identity), e.g. ``"https://github.com/org/repo"``.
+        :param repo_branch: Branch to check out, or ``None`` for the default
+            branch.
+        :param repo_name: Directory the checkout lands in under *workspace*, or
+            ``None``.
+        :param on_stage: Progress observer; the default invokes it with
+            ``"cloning"`` before the clone. Runs on this (worker) thread, so it
+            must be thread-safe. ``None`` disables progress reporting.
+        :returns: The absolute in-sandbox path the host should start in (the
+            checkout directory).
+        :raises click.ClickException: If materialization fails (e.g. the clone
+            fails).
+        """
+        if on_stage is not None:
+            on_stage("cloning")
+        clone_dir = f"{workspace}/{repo_name}"
+        branch_args = (
+            f"--branch {shlex.quote(repo_branch)} --single-branch "
+            if repo_branch is not None
+            else ""
+        )
+        try:
+            self.run(
+                sandbox_id,
+                f"git clone {branch_args}-- {shlex.quote(repo_url)} {shlex.quote(clone_dir)}",
+            )
+        except click.ClickException as exc:
+            # Provider boundary: re-raise with the repository named so the
+            # create-session 502 says WHAT failed to clone, not just that a
+            # sandbox command exited non-zero.
+            raise click.ClickException(
+                f"failed to clone repository '{repo_url}'"
+                f"{f' (branch {repo_branch!r})' if repo_branch else ''}: {exc.message}"
+            ) from exc
+        return clone_dir
 
     def attach(self, sandbox_id: str) -> None:
         """

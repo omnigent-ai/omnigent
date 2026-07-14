@@ -1,8 +1,11 @@
-"""Tests for the ``conversations.runner_id`` column added to the initial schema migration.
+"""Tests for the ``omnigent_conversation_metadata.runner_id`` column.
 
 Per ``designs/RUNNER.md`` Phase 0: the column is nullable, no FK
 (runner records aren't persisted in v1), and is the load-bearing
 column for hard conversation affinity.
+
+After the schema split (aa1b2c3d4e5f), ``runner_id`` lives on
+``omnigent_conversation_metadata`` rather than ``conversations``.
 """
 
 from __future__ import annotations
@@ -30,7 +33,7 @@ def db_engine(tmp_path: Path) -> Iterator[Engine]:
 
 
 def test_migration_adds_runner_id_column_nullable(db_engine: Engine) -> None:
-    """The migration creates ``conversations.runner_id`` as a nullable VARCHAR(64).
+    """The migration creates ``omnigent_conversation_metadata.runner_id`` as nullable VARCHAR(64).
 
     Three properties matter:
     1. The column exists at all (proves the migration includes it).
@@ -43,14 +46,15 @@ def test_migration_adds_runner_id_column_nullable(db_engine: Engine) -> None:
     it'd need a value at insert time; (3) is mostly cosmetic but a
     drift signal.
     """
-    cols = sa.inspect(db_engine).get_columns("conversations")
+    cols = sa.inspect(db_engine).get_columns("omnigent_conversation_metadata")
     runner_id_cols = [c for c in cols if c["name"] == "runner_id"]
     assert len(runner_id_cols) == 1, (
-        f"Expected exactly one 'runner_id' column on conversations, got {len(runner_id_cols)}. "
+        f"Expected exactly one 'runner_id' column on omnigent_conversation_metadata, "
+        f"got {len(runner_id_cols)}. "
         f"If 0, the migration didn't include the column."
     )
     runner_id_col = runner_id_cols[0]
-    assert runner_id_col["nullable"], "conversations.runner_id must be NULLABLE"
+    assert runner_id_col["nullable"], "omnigent_conversation_metadata.runner_id must be NULLABLE"
     # SQLite reports VARCHAR(64) as VARCHAR(64); SQLAlchemy normalizes the
     # type. Compare on the type's class string rather than the raw repr.
     assert "VARCHAR" in str(runner_id_col["type"]).upper(), (
@@ -71,13 +75,17 @@ def test_runner_id_round_trip_null_and_value(db_engine: Engine) -> None:
         conn.execute(
             sa.text(
                 "INSERT INTO conversations "
-                "(id, created_at, updated_at, root_conversation_id, kind) "
-                "VALUES (:id, :ts, :ts, :id, 1)"
+                "(id, created_at, updated_at, root_conversation_id) "
+                "VALUES (:id, :ts, :ts, :id)"
             ),
             {"id": "conv_null_test", "ts": 1700000000},
         )
+        conn.execute(
+            sa.text("INSERT INTO omnigent_conversation_metadata (id, kind) VALUES (:id, 1)"),
+            {"id": "conv_null_test"},
+        )
         result = conn.execute(
-            sa.text("SELECT runner_id FROM conversations WHERE id = :id"),
+            sa.text("SELECT runner_id FROM omnigent_conversation_metadata WHERE id = :id"),
             {"id": "conv_null_test"},
         ).scalar_one()
         assert result is None, f"Expected NULL on default-insert; got {result!r}"
@@ -86,13 +94,20 @@ def test_runner_id_round_trip_null_and_value(db_engine: Engine) -> None:
         conn.execute(
             sa.text(
                 "INSERT INTO conversations "
-                "(id, created_at, updated_at, root_conversation_id, kind, runner_id) "
-                "VALUES (:id, :ts, :ts, :id, 1, :rid)"
+                "(id, created_at, updated_at, root_conversation_id) "
+                "VALUES (:id, :ts, :ts, :id)"
             ),
-            {"id": "conv_value_test", "ts": 1700000000, "rid": "runner-uuid-abc"},
+            {"id": "conv_value_test", "ts": 1700000000},
+        )
+        conn.execute(
+            sa.text(
+                "INSERT INTO omnigent_conversation_metadata (id, kind, runner_id) "
+                "VALUES (:id, 1, :rid)"
+            ),
+            {"id": "conv_value_test", "rid": "runner-uuid-abc"},
         )
         result = conn.execute(
-            sa.text("SELECT runner_id FROM conversations WHERE id = :id"),
+            sa.text("SELECT runner_id FROM omnigent_conversation_metadata WHERE id = :id"),
             {"id": "conv_value_test"},
         ).scalar_one()
         assert result == "runner-uuid-abc", (
@@ -104,16 +119,16 @@ def test_runner_id_round_trip_null_and_value(db_engine: Engine) -> None:
 
 
 def test_no_foreign_key_constraint_on_runner_id(db_engine: Engine) -> None:
-    """``conversations.runner_id`` MUST NOT have a foreign key constraint.
+    """``omnigent_conversation_metadata.runner_id`` MUST NOT have a foreign key constraint.
 
     Per RUNNER.md §5 "Persistence" the runner registry is in-memory
     only — there's no ``runners`` table for the column to reference.
     A FK here would either (a) require a runners table we don't have,
     or (b) silently succeed against a phantom row. Either is wrong.
     """
-    fks = sa.inspect(db_engine).get_foreign_keys("conversations")
+    fks = sa.inspect(db_engine).get_foreign_keys("omnigent_conversation_metadata")
     runner_fks = [fk for fk in fks if "runner_id" in fk.get("constrained_columns", [])]
     assert runner_fks == [], (
-        f"conversations.runner_id should have no FK; got {runner_fks}. "
+        f"omnigent_conversation_metadata.runner_id should have no FK; got {runner_fks}. "
         f"Runner records aren't persisted in v1, so any FK would be a bug."
     )

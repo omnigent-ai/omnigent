@@ -444,10 +444,11 @@ def _runner_pid_from_daemon_log(home: Path, runner_id: str) -> int:
     :returns: The runner subprocess pid.
     :raises AssertionError: When the pid is not found in the daemon log.
     """
-    log_dir = home / ".omnigent" / "logs" / "host-daemon"
-    logs = sorted(log_dir.glob("daemon-*.log"))
+    log_root = home / ".omnigent" / "logs"
+    logs = sorted((log_root / "host").glob("host-*.log"))
+    logs += sorted((log_root / "host-daemon").glob("daemon-*.log"))
     if not logs:
-        raise AssertionError(f"no connect-daemon log under {log_dir}")
+        raise AssertionError(f"no connect-daemon log under {log_root}")
     text = "".join(p.read_text(errors="replace") for p in logs)
     matches = re.findall(
         rf"Launched runner {re.escape(runner_id)}\b.*?\(pid=(\d+)\)",
@@ -455,7 +456,7 @@ def _runner_pid_from_daemon_log(home: Path, runner_id: str) -> int:
     )
     if not matches:
         raise AssertionError(
-            f"runner {runner_id!r} launch pid not found in daemon log under {log_dir}"
+            f"runner {runner_id!r} launch pid not found in daemon log under {log_root}"
         )
     return int(matches[-1])
 

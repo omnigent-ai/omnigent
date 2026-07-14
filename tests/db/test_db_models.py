@@ -16,10 +16,12 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 from omnigent.db.db_models import (
     SqlAccountToken,
     SqlAgent,
+    SqlAgentConfiguration,
     SqlComment,
     SqlConversation,
     SqlConversationItem,
     SqlConversationLabel,
+    SqlConversationMetadata,
     SqlFile,
     SqlHost,
     SqlPolicy,
@@ -64,21 +66,35 @@ def _make_agent(
 
 def _make_conversation(
     id: str = "conv_test1",
-    agent_id: str | None = None,
     parent_conversation_id: str | None = None,
     root_conversation_id: str | None = None,
-    kind: str = "default",
     title: str | None = None,
 ) -> SqlConversation:
     return SqlConversation(
         id=id,
         created_at=_now(),
         updated_at=_now(),
-        kind=encode_conversation_kind(kind),
-        agent_id=agent_id,
         parent_conversation_id=parent_conversation_id,
         root_conversation_id=root_conversation_id or id,
         title=title,
+    )
+
+
+def _make_agent_configuration(
+    conversation_id: str = "conv_test1",
+    agent_id: str | None = None,
+) -> SqlAgentConfiguration:
+    return SqlAgentConfiguration(conversation_id=conversation_id, agent_id=agent_id)
+
+
+def _make_metadata(
+    id: str = "conv_test1",
+    kind: str = "default",
+) -> SqlConversationMetadata:
+    return SqlConversationMetadata(
+        id=id,
+        kind=encode_conversation_kind(kind),
+        archived=False,
     )
 
 
@@ -340,63 +356,83 @@ class TestSqlConversation:
             loaded = session.get(SqlConversation, (0, "conv_test1"))
             assert loaded is not None
             assert loaded.title == "Hello World"
-            assert loaded.kind == encode_conversation_kind("default")
-            assert loaded.archived is False
+            # Identity/hierarchy columns only; kind/archived live on
+            # SqlConversationMetadata, agent binding + overrides on
+            # SqlAgentConfiguration.
+            assert loaded.root_conversation_id == "conv_test1"
+            assert loaded.next_position == 0
 
     def test_defaults(self, db_uri: str) -> None:
         engine = get_or_create_engine(db_uri)
         managed = make_managed_session_maker(engine)
 
         conv = _make_conversation()
+        agent_config = _make_agent_configuration()
         with managed() as session:
             session.add(conv)
+            session.add(agent_config)
 
         with managed() as session:
-            loaded = session.get(SqlConversation, (0, "conv_test1"))
+            loaded = session.get(SqlAgentConfiguration, (0, "conv_test1"))
             assert loaded is not None
-            assert loaded.runner_id is None
-            assert loaded.host_id is None
             assert loaded.reasoning_effort is None
             assert loaded.model_override is None
-            assert loaded.external_session_id is None
-            assert loaded.workspace is None
-            assert loaded.git_branch is None
-            assert loaded.session_state is None
-            assert loaded.session_usage is None
+            assert loaded.agent_id is None
 
-    def test_check_constraint_rejects_invalid_kind(self, db_uri: str) -> None:
+    def test_metadata_kind_and_archived(self, db_uri: str) -> None:
+        """kind and archived live on SqlConversationMetadata, not SqlConversation."""
         engine = get_or_create_engine(db_uri)
         managed = make_managed_session_maker(engine)
 
         conv = _make_conversation()
-        # An out-of-range int code must be rejected by ck_conversations_kind.
-        conv.kind = 99
+        meta = _make_metadata(kind="default")
+        with managed() as session:
+            session.add(conv)
+            session.add(meta)
+
+        with managed() as session:
+            loaded = session.get(SqlConversationMetadata, (0, "conv_test1"))
+            assert loaded is not None
+            assert loaded.kind == encode_conversation_kind("default")
+            assert loaded.archived is False
+
+    def test_metadata_check_constraint_rejects_invalid_kind(self, db_uri: str) -> None:
+        engine = get_or_create_engine(db_uri)
+        managed = make_managed_session_maker(engine)
+
+        meta = _make_metadata()
+        meta.kind = 99  # out-of-range — rejected by ck_conversation_metadata_kind
         with pytest.raises((IntegrityError, OperationalError)):
             with managed() as session:
-                session.add(conv)
+                session.add(meta)
 
     def test_sub_agent_kind(self, db_uri: str) -> None:
         engine = get_or_create_engine(db_uri)
         managed = make_managed_session_maker(engine)
 
         parent = _make_conversation(id="conv_parent")
+        parent_meta = _make_metadata(id="conv_parent", kind="default")
         child = _make_conversation(
             id="conv_child",
-            kind="sub_agent",
             parent_conversation_id="conv_parent",
             root_conversation_id="conv_parent",
             title="summarizer",
         )
+        child_meta = _make_metadata(id="conv_child", kind="sub_agent")
         with managed() as session:
             session.add(parent)
+            session.add(parent_meta)
             session.add(child)
+            session.add(child_meta)
 
         with managed() as session:
             loaded = session.get(SqlConversation, (0, "conv_child"))
             assert loaded is not None
-            assert loaded.kind == encode_conversation_kind("sub_agent")
             assert loaded.parent_conversation_id == "conv_parent"
             assert loaded.root_conversation_id == "conv_parent"
+            loaded_meta = session.get(SqlConversationMetadata, (0, "conv_child"))
+            assert loaded_meta is not None
+            assert loaded_meta.kind == encode_conversation_kind("sub_agent")
 
     def test_delete_parent_leaves_children_without_fk(self, db_uri: str) -> None:
         """Without DB-level FK cascade, deleting a parent leaves child rows intact.
@@ -410,7 +446,6 @@ class TestSqlConversation:
         parent = _make_conversation(id="conv_parent2")
         child = _make_conversation(
             id="conv_child2",
-            kind="sub_agent",
             parent_conversation_id="conv_parent2",
             root_conversation_id="conv_parent2",
             title="child",

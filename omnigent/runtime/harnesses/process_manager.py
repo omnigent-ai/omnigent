@@ -1075,41 +1075,62 @@ class HarnessProcessManager:
             stderr=None,
             env=effective_env,
         )
-        await _wait_for_bind(process, endpoint, harness, conversation_id)
+        try:
+            await _wait_for_bind(process, endpoint, harness, conversation_id)
 
-        # ``base_url`` is required for relative-URL routing; the
-        # actual host portion is irrelevant under uds transport,
-        # but httpx insists on a syntactically-valid URL. The
-        # default httpx read-timeout (5s) is too short for SSE
-        # streams that may pause for tens of seconds during
-        # tool dispatch round-trips (action_required → AP
-        # call_tool → PATCH → resume); use a generous fixed
-        # timeout that still surfaces a genuinely-stuck harness.
-        client = httpx.AsyncClient(
-            transport=endpoint.make_transport(),
-            base_url=endpoint.base_url,
-            # S1 (security): present the per-spawn bearer token (Windows only)
-            # so the harness scaffold accepts this client and rejects any
-            # unauthenticated local peer on the loopback-TCP channel. Empty on
-            # POSIX, where the uid-isolated UDS is the access boundary.
-            headers=({"Authorization": f"Bearer {auth_token}"} if auth_token else {}),
-            # See the comment above the constant for rationale.
-            # Connect/write/pool keep the 5s default so a vanished
-            # harness still surfaces quickly; read=None defers
-            # liveness to the heartbeat path.
-            timeout=httpx.Timeout(5.0, read=None),
-        )
-        return _SubprocessEntry(
-            process=process,
-            client=client,
-            endpoint=endpoint,
-            harness=harness,
-            # Record the model this subprocess was spawned with so a later
-            # turn requesting a different model (e.g. after ``/model``)
-            # triggers a respawn in ``get_client`` — the model is a fixed
-            # process env var, not re-read per turn.
-            model=(env or {}).get(_model_env_key(harness)),
-        )
+            # ``base_url`` is required for relative-URL routing; the
+            # actual host portion is irrelevant under uds transport,
+            # but httpx insists on a syntactically-valid URL. The
+            # default httpx read-timeout (5s) is too short for SSE
+            # streams that may pause for tens of seconds during
+            # tool dispatch round-trips (action_required → AP
+            # call_tool → PATCH → resume); use a generous fixed
+            # timeout that still surfaces a genuinely-stuck harness.
+            client = httpx.AsyncClient(
+                transport=endpoint.make_transport(),
+                base_url=endpoint.base_url,
+                # S1 (security): present the per-spawn bearer token (Windows only)
+                # so the harness scaffold accepts this client and rejects any
+                # unauthenticated local peer on the loopback-TCP channel. Empty on
+                # POSIX, where the uid-isolated UDS is the access boundary.
+                headers=({"Authorization": f"Bearer {auth_token}"} if auth_token else {}),
+                # See the comment above the constant for rationale.
+                # Connect/write/pool keep the 5s default so a vanished
+                # harness still surfaces quickly; read=None defers
+                # liveness to the heartbeat path.
+                timeout=httpx.Timeout(5.0, read=None),
+            )
+            return _SubprocessEntry(
+                process=process,
+                client=client,
+                endpoint=endpoint,
+                harness=harness,
+                # Record the model this subprocess was spawned with so a later
+                # turn requesting a different model (e.g. after ``/model``)
+                # triggers a respawn in ``get_client`` — the model is a fixed
+                # process env var, not re-read per turn.
+                model=(env or {}).get(_model_env_key(harness)),
+            )
+        except BaseException:
+            # From spawn onward the process must have exactly one owner:
+            # either it reaches the caller (who registers it in ``_entries``)
+            # or it dies here. A cancellation landing in ``_wait_for_bind``
+            # (e.g. the turn task cancelled during cold start) would
+            # otherwise leak a live runner that ``release`` no-ops on and
+            # the idle reaper — which only walks ``_entries`` — never sees.
+            if process.returncode is None:
+                with contextlib.suppress(ProcessLookupError):
+                    process.kill()
+                # Shield the corpse-wait so a second cancellation cannot
+                # abandon the reap halfway; the pending cancellation is
+                # re-raised below regardless.
+                with contextlib.suppress(BaseException):
+                    await asyncio.shield(process.wait())
+            with contextlib.suppress(Exception):
+                close_subprocess_transport(process)
+            with contextlib.suppress(Exception):
+                endpoint.cleanup()
+            raise
 
     async def _close_entry(self, entry: _SubprocessEntry) -> None:
         """

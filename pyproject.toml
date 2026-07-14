@@ -100,6 +100,10 @@ dependencies = [
     # version against the latest PyPI release. Previously only a
     # transitive dep; pinned here now that we import it directly.
     "packaging>=23,<26",
+    # Protobuf schema for the AI-gateway routing API
+    # (omnigent/api/routing/v1/routing.proto).
+    # Previously only a transitive dep; declared directly now that we ship a proto.
+    "protobuf>=6,<7",
 ]
 
 [project.optional-dependencies]
@@ -249,6 +253,14 @@ dev = [
     # The Cloudflare D1 SQLAlchemy dialect, exercised by the D1 FTS integration
     # test (tests/db/test_d1_fts_dialect.py) via respx + sqlite3.
     "sqlalchemy-cloudflare-d1==0.3.10",
+    # protoc + the well-known-type protos, for regenerating the routing API
+    # bindings (omnigent/api/routing/v1/routing_pb2.*). Bundles its own compiler so no
+    # system protoc is needed. Pinned to the 1.x line whose bundled gencode
+    # matches the runtime `protobuf>=6,<7` above, so `scripts/gen_routing_pb2.py`
+    # reproduces the committed output byte-for-byte (the routing-pb2-fresh
+    # pre-commit hook diffs against it). Dev-only: generated code is committed,
+    # so neither the library nor its wheels depend on this.
+    "grpcio-tools>=1.68,<2",
 ]
 
 [project.scripts]
@@ -375,6 +387,9 @@ target-version = "py310"
 extend-exclude = [
     "omnigent/inner/databricks_mcps/google",
     "assistant-ui",
+    # Protobuf-generated code (DO NOT EDIT); not ours to restyle.
+    "omnigent/api/**/*_pb2.py",
+    "omnigent/api/**/*_pb2.pyi",
 ]
 
 [tool.ruff.lint]
@@ -475,6 +490,9 @@ known-first-party = ["omnigent"]
 # waived for these top-level antigravity_native modules (see the inline
 # comments at each catch site).
 "omnigent/antigravity_native*.py" = ["BLE001"]
+# Telemetry modules intentionally catch all exceptions at every boundary —
+# telemetry must never disrupt the application under any circumstances.
+"omnigent/telemetry/*.py" = ["BLE001", "SIM105"]
 "sdks/**/*.py" = [
     "ARG001", "ARG002", "BLE001", "B008", "RUF012",
 ]
@@ -491,7 +509,7 @@ disallow_any_explicit = true
 # setup.py — build-time scaffolding that imports the (untyped) setuptools
 # build_py and subclasses it; not application code, so excluded from mypy
 # rather than pulling in types-setuptools just for one shim file.
-exclude = ["^omnigent/inner/databricks_mcps/google/", "^setup\\.py$"]
+exclude = ["^omnigent/inner/databricks_mcps/google/", "^setup\\.py$", "_pb2\\.pyi?$"]
 # Incremental rollout: load imported modules for type info but don't
 # report their errors. Remove once every omnigent/ module is clean.
 follow_imports = "silent"

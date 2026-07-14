@@ -1,0 +1,292 @@
+{
+  "_readme": [
+    "Discord-watch schedule. Read by .github/scripts/rotation.py.",
+    "",
+    "One row per assigned weekday, in date order. On each run the bot finds the",
+    "row whose date is today (in the assignee timezone) and pings that person on",
+    "the morning of their timezone. Dates not listed here get no ping, so keep",
+    "this topped up \u2014 extend it before it runs out.",
+    "",
+    "To swap or cover a holiday, just edit the name on the affected date(s).",
+    "name must match an entry in rotation_roster.json (which holds the",
+    "name -> slack_id + timezone mapping)."
+  ],
+  "schedule": [
+    {
+      "date": "2026-07-14",
+      "name": "Edwin He"
+    },
+    {
+      "date": "2026-07-15",
+      "name": "Pat Sukprasert"
+    },
+    {
+      "date": "2026-07-16",
+      "name": "Sabhya Chhabria"
+    },
+    {
+      "date": "2026-07-17",
+      "name": "Serena Ruan"
+    },
+    {
+      "date": "2026-07-20",
+      "name": "Shivam Mittal"
+    },
+    {
+      "date": "2026-07-21",
+      "name": "Tomu Hirata"
+    },
+    {
+      "date": "2026-07-22",
+      "name": "Zeyi (Rice) Fan"
+    },
+    {
+      "date": "2026-07-23",
+      "name": "Aravind Segu"
+    },
+    {
+      "date": "2026-07-24",
+      "name": "Bryan Qiu"
+    },
+    {
+      "date": "2026-07-27",
+      "name": "Daniel Lok"
+    },
+    {
+      "date": "2026-07-28",
+      "name": "Dhruv Gupta"
+    },
+    {
+      "date": "2026-07-29",
+      "name": "Edwin He"
+    },
+    {
+      "date": "2026-07-30",
+      "name": "Pat Sukprasert"
+    },
+    {
+      "date": "2026-07-31",
+      "name": "Sabhya Chhabria"
+    },
+    {
+      "date": "2026-08-03",
+      "name": "Serena Ruan"
+    },
+    {
+      "date": "2026-08-04",
+      "name": "Shivam Mittal"
+    },
+    {
+      "date": "2026-08-05",
+      "name": "Tomu Hirata"
+    },
+    {
+      "date": "2026-08-06",
+      "name": "Zeyi (Rice) Fan"
+    },
+    {
+      "date": "2026-08-07",
+      "name": "Aravind Segu"
+    },
+    {
+      "date": "2026-08-10",
+      "name": "Bryan Qiu"
+    },
+    {
+      "date": "2026-08-11",
+      "name": "Daniel Lok"
+    },
+    {
+      "date": "2026-08-12",
+      "name": "Dhruv Gupta"
+    },
+    {
+      "date": "2026-08-13",
+      "name": "Edwin He"
+    },
+    {
+      "date": "2026-08-14",
+      "name": "Pat Sukprasert"
+    },
+    {
+      "date": "2026-08-17",
+      "name": "Sabhya Chhabria"
+    },
+    {
+      "date": "2026-08-18",
+      "name": "Serena Ruan"
+    },
+    {
+      "date": "2026-08-19",
+      "name": "Shivam Mittal"
+    },
+    {
+      "date": "2026-08-20",
+      "name": "Tomu Hirata"
+    },
+    {
+      "date": "2026-08-21",
+      "name": "Zeyi (Rice) Fan"
+    },
+    {
+      "date": "2026-08-24",
+      "name": "Aravind Segu"
+    },
+    {
+      "date": "2026-08-25",
+      "name": "Bryan Qiu"
+    },
+    {
+      "date": "2026-08-26",
+      "name": "Daniel Lok"
+    },
+    {
+      "date": "2026-08-27",
+      "name": "Dhruv Gupta"
+    },
+    {
+      "date": "2026-08-28",
+      "name": "Edwin He"
+    },
+    {
+      "date": "2026-08-31",
+      "name": "Pat Sukprasert"
+    },
+    {
+      "date": "2026-09-01",
+      "name": "Sabhya Chhabria"
+    },
+    {
+      "date": "2026-09-02",
+      "name": "Serena Ruan"
+    },
+    {
+      "date": "2026-09-03",
+      "name": "Shivam Mittal"
+    },
+    {
+      "date": "2026-09-04",
+      "name": "Tomu Hirata"
+    },
+    {
+      "date": "2026-09-07",
+      "name": "Zeyi (Rice) Fan"
+    },
+    {
+      "date": "2026-09-08",
+      "name": "Aravind Segu"
+    },
+    {
+      "date": "2026-09-09",
+      "name": "Bryan Qiu"
+    },
+    {
+      "date": "2026-09-10",
+      "name": "Daniel Lok"
+    },
+    {
+      "date": "2026-09-11",
+      "name": "Dhruv Gupta"
+    },
+    {
+      "date": "2026-09-14",
+      "name": "Edwin He"
+    },
+    {
+      "date": "2026-09-15",
+      "name": "Pat Sukprasert"
+    },
+    {
+      "date": "2026-09-16",
+      "name": "Sabhya Chhabria"
+    },
+    {
+      "date": "2026-09-17",
+      "name": "Serena Ruan"
+    },
+    {
+      "date": "2026-09-18",
+      "name": "Shivam Mittal"
+    },
+    {
+      "date": "2026-09-21",
+      "name": "Tomu Hirata"
+    },
+    {
+      "date": "2026-09-22",
+      "name": "Zeyi (Rice) Fan"
+    },
+    {
+      "date": "2026-09-23",
+      "name": "Aravind Segu"
+    },
+    {
+      "date": "2026-09-24",
+      "name": "Bryan Qiu"
+    },
+    {
+      "date": "2026-09-25",
+      "name": "Daniel Lok"
+    },
+    {
+      "date": "2026-09-28",
+      "name": "Dhruv Gupta"
+    },
+    {
+      "date": "2026-09-29",
+      "name": "Edwin He"
+    },
+    {
+      "date": "2026-09-30",
+      "name": "Pat Sukprasert"
+    },
+    {
+      "date": "2026-10-01",
+      "name": "Sabhya Chhabria"
+    },
+    {
+      "date": "2026-10-02",
+      "name": "Serena Ruan"
+    },
+    {
+      "date": "2026-10-05",
+      "name": "Shivam Mittal"
+    },
+    {
+      "date": "2026-10-06",
+      "name": "Tomu Hirata"
+    },
+    {
+      "date": "2026-10-07",
+      "name": "Zeyi (Rice) Fan"
+    },
+    {
+      "date": "2026-10-08",
+      "name": "Aravind Segu"
+    },
+    {
+      "date": "2026-10-09",
+      "name": "Bryan Qiu"
+    },
+    {
+      "date": "2026-10-12",
+      "name": "Daniel Lok"
+    },
+    {
+      "date": "2026-10-13",
+      "name": "Dhruv Gupta"
+    },
+    {
+      "date": "2026-10-14",
+      "name": "Edwin He"
+    },
+    {
+      "date": "2026-10-15",
+      "name": "Pat Sukprasert"
+    },
+    {
+      "date": "2026-10-16",
+      "name": "Sabhya Chhabria"
+    }
+  ]
+}

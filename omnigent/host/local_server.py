@@ -29,6 +29,11 @@ import click
 import psutil
 
 from omnigent.inner import _proc
+from omnigent.process_logging import (
+    PROCESS_LOG_FILE_ENV_VAR,
+    child_logging_popen_kwargs,
+    open_process_log_file,
+)
 
 _LOCAL_SERVER_READY_TIMEOUT_SECONDS = 45.0
 
@@ -76,7 +81,7 @@ _LOCAL_SERVER_SIG_PATH = _local_data_dir() / "local_server.sig"
 
 # Sidecar carrying the absolute path of the background server's captured
 # stdout/stderr log file (one line). Lets `server start` / `server status`
-# point at the exact ``logs/server/local-server-*.log`` even when reusing a
+# point at the exact ``logs/server/server-*.log`` even when reusing a
 # server this invocation didn't spawn. Absent for a foreground
 # ``omnigent server`` (its logs stream to the terminal, not a file).
 _LOCAL_SERVER_LOG_REF_PATH = _local_data_dir() / "local_server.logpath"
@@ -189,7 +194,7 @@ def local_server_url_if_healthy() -> str | None:
         return None
     base_url = f"http://127.0.0.1:{port}"
     try:
-        resp = httpx.get(f"{base_url}/health", timeout=2.0)
+        resp = httpx.get(f"{base_url}/health", timeout=2.0, trust_env=False)
     except httpx.HTTPError:
         return None
     if resp.status_code == 200:
@@ -213,7 +218,7 @@ def _write_local_server_record(
     :param port: Loopback port the server bound, e.g. ``6767``.
     :param sig: Config signature from :func:`server_config_signature`.
     :param log_path: Absolute path of the spawned server's captured log file,
-        e.g. ``Path("/Users/alice/.omnigent/logs/server/local-server-ab12cd.log")``.
+        e.g. ``Path("/Users/alice/.omnigent/logs/server/server-ab12cd.log")``.
         ``None`` for a foreground server whose logs stream to the terminal —
         any stale log-ref sidecar is then removed so status never reports a
         log file that doesn't apply to the running server.
@@ -237,7 +242,7 @@ def _read_local_server_log_path() -> Path | None:
     """Read the running local server's captured-log path from its sidecar.
 
     :returns: The absolute log path the background server writes to, e.g.
-        ``Path("/Users/alice/.omnigent/logs/server/local-server-ab12cd.log")``, or
+        ``Path("/Users/alice/.omnigent/logs/server/server-ab12cd.log")``, or
         ``None`` when the sidecar is absent (foreground server, legacy
         record, or no server) or unreadable.
     """
@@ -374,7 +379,7 @@ class LocalServerInfo:
     :param url: Base URL when running, e.g. ``"http://127.0.0.1:8123"``;
         ``None`` when not running.
     :param log_path: Absolute path of the background server's captured log
-        file, e.g. ``Path("/Users/alice/.omnigent/logs/server/local-server-ab12cd.log")``.
+        file, e.g. ``Path("/Users/alice/.omnigent/logs/server/server-ab12cd.log")``.
         ``None`` for a foreground server (logs stream to its terminal) or a
         legacy record without the log-path sidecar.
     """
@@ -421,7 +426,7 @@ class LocalServerStartup:
         offer to stop a server they actually brought up, never one the user
         started independently.
     :param log_path: Absolute path of the background server's captured log
-        file, e.g. ``Path("/Users/alice/.omnigent/logs/server/local-server-ab12cd.log")``
+        file, e.g. ``Path("/Users/alice/.omnigent/logs/server/server-ab12cd.log")``
         — surfaced so callers (``server start``) can point the user at the
         exact log. For a spawned server this is the freshly created log; for
         a reused one it is read back from the log-path sidecar, and may be
@@ -526,7 +531,7 @@ class _SpawnedLocalServer:
 
     :param proc: The ``omnigent server`` subprocess handle.
     :param log_path: File capturing the child's stdout/stderr, e.g.
-        ``Path("~/.omnigent/logs/server/local-server-ab12cd.log")``.
+        ``Path("~/.omnigent/logs/server/server-ab12cd.log")``.
     :param base_url: Loopback URL the child was asked to bind, e.g.
         ``"http://127.0.0.1:6767"``.
     """
@@ -598,11 +603,7 @@ def _spawn_local_server(port: int) -> _SpawnedLocalServer:
     # isolated sqlite db under the runtime data dir.
     db_uri = os.environ.get("OMNIGENT_DATABASE_URI") or f"sqlite:///{db_path}"
 
-    log_dir = data_dir / "logs" / "server"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_fd, log_name = tempfile.mkstemp(prefix="local-server-", suffix=".log", dir=log_dir)
-    log_path = Path(log_name)
-    log_fh = os.fdopen(log_fd, "wb")
+    log_path, log_fh = open_process_log_file("server", root=data_dir / "logs")
 
     # Pass the full parent env: this server IS the local runtime —
     # loopback-only, same single user, and it needs the LLM creds to
@@ -617,7 +618,7 @@ def _spawn_local_server(port: int) -> _SpawnedLocalServer:
     # POV, `omnigent run` (no --server) in accounts mode gets
     # "browser auto-opens signed in + TUI auto-signed in" once
     # the spawned server's bootstrap fires.
-    child_env = {**os.environ}
+    child_env = {**os.environ, PROCESS_LOG_FILE_ENV_VAR: str(log_path)}
     # Mirror create_auth_provider's resolution via the shared helper so the
     # daemon-owned server agrees with the server's own auth wiring: header is
     # the env-unset default; OMNIGENT_AUTH_ENABLED=1 opts into accounts (or
@@ -645,26 +646,28 @@ def _spawn_local_server(port: int) -> _SpawnedLocalServer:
         child_env["OMNIGENT_ACCOUNTS_BASE_URL"] = f"http://127.0.0.1:{port}"
 
     try:
-        proc = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "omnigent.cli",
-                "server",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                str(port),
-                "--database-uri",
-                db_uri,
-                "--artifact-location",
-                str(artifact_path),
-            ],
-            env=child_env,
-            stdout=log_fh,
-            stderr=log_fh,
-            **_proc.spawn_kwargs(),
-        )
+        with child_logging_popen_kwargs(child_env) as logging_kwargs:
+            proc = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "omnigent.cli",
+                    "server",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    str(port),
+                    "--database-uri",
+                    db_uri,
+                    "--artifact-location",
+                    str(artifact_path),
+                ],
+                env=child_env,
+                stdout=log_fh,
+                stderr=log_fh,
+                **_proc.spawn_kwargs(),
+                **logging_kwargs,
+            )
     finally:
         log_fh.close()
 
@@ -760,7 +763,7 @@ def _local_server_health_ok(base_url: str) -> bool:
     import httpx
 
     try:
-        resp = httpx.get(f"{base_url}/health", timeout=2.0)
+        resp = httpx.get(f"{base_url}/health", timeout=2.0, trust_env=False)
     except httpx.HTTPError:
         return False
     if resp.status_code != 200:
@@ -864,7 +867,7 @@ def _wait_for_local_omnigent_server(
         if proc.poll() is not None:
             _raise_local_server_failed(base_url, log_path)
         try:
-            resp = httpx.get(f"{base_url}/health", timeout=2.0)
+            resp = httpx.get(f"{base_url}/health", timeout=2.0, trust_env=False)
             if resp.status_code == 200:
                 return
         except httpx.TransportError:

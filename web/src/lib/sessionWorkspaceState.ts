@@ -1,8 +1,8 @@
 // Per-session UI state for the right "Workspace" rail, keyed by conversationId
 // so each session restores its own layout: whether the rail is open, its width,
 // the selected rail tab, and the set of open file tabs (plus which one is
-// active). A brand-new session (no stored entry) starts closed at the default
-// width with no open files.
+// active). A brand-new session (no stored `open`) follows the Appearance
+// Workspace panel default; width and file tabs start empty.
 
 import type { RightRailTab } from "@/shell/railTabs";
 

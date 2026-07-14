@@ -54,6 +54,10 @@ _HEALTH_TIMEOUT_S = 90.0
 _MOCK_TIMEOUT_S = 15.0
 _POLL_INTERVAL_S = 0.2
 _TURN_TIMEOUT_S = 180.0
+# Budget for a freshly-spawned runner (session_cold_start journey) to boot and
+# register its tunnel. Generous: it covers interpreter start + imports + the
+# reverse-tunnel handshake, the very cost the journey exists to measure.
+_RUNNER_ONLINE_TIMEOUT_S = 90.0
 
 # Terminal SSE events — if one arrives before any delta, the turn produced no
 # streamed text (a failure for the TTFT journey).
@@ -123,6 +127,13 @@ class BenchEnvironment:
         self._mock_proc: subprocess.Popen[bytes] | None = None
         self._server_proc: subprocess.Popen[bytes] | None = None
         self._runner_proc: subprocess.Popen[bytes] | None = None
+        # Base env retained so the session_cold_start journey can spawn extra
+        # runners on demand, building each env identically to the boot runner's.
+        self._runner_base_env: dict[str, str] = {}
+        # Runners spawned after boot (session_cold_start journey). Reaped on
+        # teardown in case a measure op failed before terminating its own runner.
+        self._extra_runners: list[subprocess.Popen[bytes]] = []
+        self._extra_runner_count = 0
         self._log_handles: list[IO[bytes]] = []
         self._agent_cache: dict[str, str] = {}
 
@@ -172,6 +183,9 @@ class BenchEnvironment:
             base_env["OPENAI_BASE_URL"] = f"{self.mock_url}/v1"
         # Prepend the worktree so subprocesses import this branch's source.
         apply_server_env(base_env, _REPO_ROOT)
+        # Retained so spawn_extra_runner (session_cold_start journey) can build
+        # a fresh runner's env identically to the boot runner's.
+        self._runner_base_env = base_env
 
         self._server_proc = self._spawn_server(port, base_env, binding_token, artifact_dir)
         if self.with_runner:
@@ -180,7 +194,9 @@ class BenchEnvironment:
 
     def _stop(self) -> None:
         """Terminate runner, server, and mock; remove the temp dir."""
-        for proc in (self._runner_proc, self._server_proc, self._mock_proc):
+        # Extra runners first (session_cold_start): a measure op normally reaps
+        # its own, but a mid-op failure can leak one, so drain the list here too.
+        for proc in (*self._extra_runners, self._runner_proc, self._server_proc, self._mock_proc):
             if proc is not None and proc.poll() is None:
                 proc.send_signal(signal.SIGTERM)
                 try:
@@ -270,10 +286,36 @@ class BenchEnvironment:
         # on teardown, rather than in the launch cwd (its default).
         workspace = self._tmp / "workspace"
         workspace.mkdir(exist_ok=True)
+        return self._spawn_runner_process(
+            base_env,
+            binding_token,
+            runner_id=self.runner_id,
+            workspace=workspace,
+            log_name="runner.log",
+        )
+
+    def _spawn_runner_process(
+        self,
+        base_env: dict[str, str],
+        binding_token: str,
+        *,
+        runner_id: str,
+        workspace: Path,
+        log_name: str,
+    ) -> subprocess.Popen[bytes]:
+        """Spawn one runner subprocess under *runner_id* + *binding_token*.
+
+        Factored out of :meth:`_spawn_runner` so the ``session_cold_start``
+        journey can spawn additional runners on demand, each under its own id,
+        binding token, and workspace. The caller must pair *runner_id* with the token
+        it derives from (``token_bound_runner_id(binding_token)``): the runner
+        derives its managed-mint URL from the token internally, so a mismatch
+        would register the tunnel under one id but mint under another (→ 401).
+        """
         runner_env = apply_runner_env(
             {
                 **base_env,
-                "OMNIGENT_RUNNER_ID": self.runner_id,
+                "OMNIGENT_RUNNER_ID": runner_id,
                 "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
                 "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
                 "RUNNER_SERVER_URL": self.base_url,
@@ -284,7 +326,7 @@ class BenchEnvironment:
             [runner_executable(), "-m", "omnigent.runner._entry"],
             env=runner_env,
             cwd=compat_runner_cwd(),
-            stdout=self._log("runner.log"),
+            stdout=self._log(log_name),
             stderr=subprocess.STDOUT,
         )
 
@@ -456,16 +498,105 @@ class BenchEnvironment:
     # ── runner-mode session driving (phase 2) ────────────────
 
     async def create_bound_session(self, agent_id: str) -> str:
-        """Create a session for *agent_id* and bind it to the runner."""
+        """Create a session for *agent_id* and bind it to the boot runner."""
+        return await self.create_session_bound_to(agent_id, self.runner_id)
+
+    async def create_session_bound_to(self, agent_id: str, runner_id: str) -> str:
+        """Create a session for *agent_id* and bind it to *runner_id*.
+
+        Unlike :meth:`create_bound_session` (which pins the boot runner), this
+        binds to an arbitrary runner — the session_cold_start journey uses it to
+        attach each session to the fresh runner it just spawned.
+        """
         assert self.client is not None
         if not self.with_runner:
-            raise RuntimeError("create_bound_session requires with_runner=True")
+            raise RuntimeError("create_session_bound_to requires with_runner=True")
         session_id = await self.create_session(agent_id)
         bound = await self.client.patch(
-            f"/v1/sessions/{session_id}", json={"runner_id": self.runner_id}
+            f"/v1/sessions/{session_id}", json={"runner_id": runner_id}
         )
         bound.raise_for_status()
         return session_id
+
+    async def spawn_extra_runner(self) -> tuple[subprocess.Popen[bytes], str]:
+        """Spawn a fresh runner and wait for its tunnel to register.
+
+        The end-to-end cost a new conversation always pays: a runner process
+        start plus its reverse-tunnel handshake. Each call mints its own fresh
+        binding token and derives the ``runner_id`` from it (so tunnel, mint,
+        and session binding all agree on one id), then registers over loopback
+        via the tunnel's no-allow-list fallback — the same path the boot runner
+        takes, so the runner is a fully self-consistent independent runner.
+
+        The returned process is tracked for teardown and should be passed to
+        :meth:`terminate_runner` once the caller is done, so a long run doesn't
+        accumulate live runners.
+
+        :returns: ``(process, runner_id)`` for the online runner.
+        :raises RuntimeError: If not in runner mode, or the runner does not
+            come online within :data:`_RUNNER_ONLINE_TIMEOUT_S`.
+        """
+        if not self.with_runner:
+            raise RuntimeError("spawn_extra_runner requires with_runner=True")
+        self._extra_runner_count += 1
+        n = self._extra_runner_count
+        # A fresh binding token per spawn, with the id derived from it — the
+        # runner's tunnel path, its managed-mint URL, and the session binding
+        # must all agree on one id, and the runner derives its mint URL from
+        # ``token_bound_runner_id(binding_token)`` internally. Reusing the boot
+        # token but overriding the id would split those two apart (tunnel under
+        # the override, mint under the boot id → 401, spec resolve fails). A
+        # non-allow-listed token still registers over loopback via the tunnel's
+        # no-allow-list fallback, the same path the boot runner takes.
+        binding_token = uuid.uuid4().hex
+        runner_id = token_bound_runner_id(binding_token)
+        workspace = self._tmp / f"workspace-extra-{n}"
+        workspace.mkdir(exist_ok=True)
+        proc = self._spawn_runner_process(
+            self._runner_base_env,
+            binding_token,
+            runner_id=runner_id,
+            workspace=workspace,
+            log_name=f"runner-extra-{n}.log",
+        )
+        self._extra_runners.append(proc)
+        await self._wait_runner_online(runner_id, proc)
+        return proc, runner_id
+
+    async def _wait_runner_online(self, runner_id: str, proc: subprocess.Popen[bytes]) -> None:
+        """Poll ``/v1/runners/{id}/status`` until the runner reports online."""
+        assert self.client is not None
+        deadline = time.monotonic() + _RUNNER_ONLINE_TIMEOUT_S
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                raise RuntimeError(
+                    f"runner {runner_id} exited (code {proc.returncode}) before "
+                    f"coming online; logs in {self._tmp}"
+                )
+            resp = await self.client.get(f"/v1/runners/{runner_id}/status")
+            if resp.status_code == 200 and resp.json().get("online") is True:
+                return
+            await asyncio.sleep(_POLL_INTERVAL_S)
+        raise RuntimeError(
+            f"runner {runner_id} not online within {_RUNNER_ONLINE_TIMEOUT_S}s; "
+            f"logs in {self._tmp}"
+        )
+
+    def terminate_runner(self, proc: subprocess.Popen[bytes]) -> None:
+        """Terminate a runner spawned by :meth:`spawn_extra_runner`.
+
+        Best-effort and idempotent: an already-exited process is a no-op, and
+        teardown re-drains any survivor via :data:`_extra_runners`.
+        """
+        if proc.poll() is None:
+            proc.send_signal(signal.SIGTERM)
+            try:
+                proc.wait(timeout=8)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+        with contextlib.suppress(ValueError):
+            self._extra_runners.remove(proc)
 
     async def write_runner_file(self, session_id: str, relative_path: str, content: str) -> None:
         """Write a file into the runner's default environment over HTTP.
