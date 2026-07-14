@@ -174,8 +174,10 @@ open platform item.
 
 Add a `CapabilityProbe` under `probes/`, register it in
 `probes/__init__.py:ALL_PROBES`, add a semantic method to the driver protocol,
-and derive or declare the expected verdict. Keep transport-specific mechanics
-inside drivers so probes remain harness-agnostic.
+and map its `HarnessCapabilities` declaration to the expected verdict. Optional
+capability values remain `UNKNOWN` until a harness makes an explicit claim.
+Keep transport-specific mechanics inside drivers so probes remain
+harness-agnostic.
 
 ## Current gaps
 

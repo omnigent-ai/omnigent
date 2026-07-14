@@ -10,6 +10,7 @@ worktree picker (branch prefill / start-in-existing-worktree).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -170,6 +171,14 @@ async def wt_setup(
             await asyncio.wait_for(drain_task, timeout=1.0)
         except asyncio.TimeoutError:
             drain_task.cancel()
+        # Send an explicit disconnect so the tunnel endpoint's finally-block
+        # calls host_store.set_offline() and registry.deregister() before
+        # this fixture returns. Without this, those calls happen whenever the
+        # comm is GC'd — potentially during the next test's setup window.
+        # Swallow CancelledError: the asgiref communicator may already be done
+        # if the event loop cancelled its internal future during teardown.
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await comm.send_input({"type": "websocket.disconnect", "code": 1000})
 
 
 async def test_list_worktrees_returns_data(
@@ -230,10 +239,12 @@ async def test_list_worktrees_unknown_host_404(
 ) -> None:
     """An unknown host id yields 404 (existence is gated before the offline check)."""
     app, _reg, _hs, _cs = wt_app
+    # Use a host id that no other test or tunnel registers — never "offline", just absent.
+    unknown_id = "host_wt_does_not_exist"
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.get(
-            f"/v1/hosts/{_HOST_ID}/worktrees",
+            f"/v1/hosts/{unknown_id}/worktrees",
             params={"path": "/Users/corey/repo"},
         )
-    # No host record was created (no tunnel connected) → 404, not 409.
+    # No host record exists for this id → 404, not 409 ("offline").
     assert resp.status_code == 404, resp.text

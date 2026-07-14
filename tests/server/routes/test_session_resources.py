@@ -1431,6 +1431,89 @@ async def test_transfer_terminal_authorizes_sessions_and_proxies_to_runner(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "runner_status,runner_payload,expected_status,expected_code,expected_message",
+    [
+        # Runner returns its own error body (tunnel dropped mid-transfer,
+        # runner reports offline). The runner's code drives the HTTP status,
+        # and its message is surfaced verbatim.
+        (
+            503,
+            {
+                "error": {
+                    "code": ErrorCode.RUNNER_UNAVAILABLE,
+                    "message": "tunnel closed before request completed",
+                }
+            },
+            503,
+            ErrorCode.RUNNER_UNAVAILABLE,
+            "tunnel closed before request completed",
+        ),
+        # Runner returns an error with no body — fall back to INTERNAL_ERROR
+        # (→500) and the route's default transfer-failure message.
+        (
+            500,
+            {},
+            500,
+            ErrorCode.INTERNAL_ERROR,
+            "Terminal transfer failed",
+        ),
+    ],
+)
+async def test_transfer_terminal_surfaces_runner_error_without_crashing(
+    client: httpx.AsyncClient,
+    runner_status: int,
+    runner_payload: dict[str, Any],
+    expected_status: int,
+    expected_code: str,
+    expected_message: str,
+) -> None:
+    """A runner ``>=400`` (non-404/409) on terminal transfer yields a clean
+    error, not a 500 crash.
+
+    Regression for the masking bug at ``transfer_session_terminal`` — the
+    exact sibling of the one already fixed at ``create_session_terminal``:
+    its ``status >= 400`` branch built ``OmnigentError(..., http_status=status)``,
+    but ``OmnigentError`` has no ``http_status`` arg (it is a derived
+    property), so any runner error other than 404/409 turned into an
+    unhandled ``TypeError`` instead of a legible error. With the bug present,
+    ``client.post`` below raises ``TypeError`` rather than returning a
+    response, so this test errors out — the failure signal.
+
+    :param runner_status: HTTP status the fake runner returns for the
+        transfer proxy POST, e.g. ``503``.
+    :param runner_payload: JSON body the fake runner returns, e.g.
+        ``{"error": {"code": "runner_unavailable", "message": "..."}}``.
+    :param expected_status: HTTP status the route should surface (derived
+        from the error code), e.g. ``503``.
+    :param expected_code: Machine-readable error code the route should
+        surface, e.g. ``"runner_unavailable"``.
+    :param expected_message: The human-readable message the route should
+        surface.
+    :returns: None.
+    """
+    path = "/v1/sessions/conv_proxy/resources/terminals/terminal_bash_s1/transfer"
+    fake_runner = _FakeRunnerClient(responses={path: (runner_status, runner_payload)})
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.post(path, json={"target_session_id": "conv_local"})
+
+    # http_status is derived from the surfaced code: 503 proves the runner's
+    # ``runner_unavailable`` propagated; a 500 would mean it was masked by the
+    # old TypeError path or a generic internal error.
+    assert resp.status_code == expected_status
+    body = resp.json()
+    # The runner's own code/message reach the client unchanged — proves the
+    # error was surfaced, not swallowed or replaced by a generic 500.
+    assert body["error"]["code"] == expected_code
+    assert body["error"]["message"] == expected_message
+    # The transfer failed, so no resource is returned.
+    assert "id" not in body
+    # The proxy POST was actually attempted before the error was raised.
+    assert fake_runner.calls == [("POST", path)]
+
+
+@pytest.mark.asyncio
 async def test_delete_terminal_surfaces_runner_404(
     client: httpx.AsyncClient,
 ) -> None:

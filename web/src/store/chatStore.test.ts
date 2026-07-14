@@ -2026,6 +2026,7 @@ describe("chatStore — send (first-send ordering)", () => {
       conversationId: "conv_existing",
       abortController: new AbortController(),
       status: "idle",
+      sessionStatus: "running",
       blocks: [],
       pendingUserMessages: [],
     });
@@ -2047,6 +2048,7 @@ describe("chatStore — send (first-send ordering)", () => {
     // Optimistic bubble rolled back, turn settled to idle.
     expect(state.pendingUserMessages).toEqual([]);
     expect(state.status).toBe("idle");
+    expect(state.sessionStatus).toBe("idle");
     // A standalone error block is appended carrying the friendly, retryable
     // copy — NOT the server's terse "No runner bound for session" — and no
     // raw code in the banner (code "" → clean "Error" title).

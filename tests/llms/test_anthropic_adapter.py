@@ -1,8 +1,10 @@
 """Tests for llms.adapters.anthropic — translation logic."""
 
+import asyncio
 import base64
 import json
 
+import httpx
 import pytest
 
 from omnigent.llms.adapters.anthropic import (
@@ -10,8 +12,11 @@ from omnigent.llms.adapters.anthropic import (
     _chat_to_anthropic,
     _convert_tool_choice,
     _convert_tools,
+    _stream_request,
     _translate_part_to_anthropic,
 )
+from omnigent.llms.errors import ContextWindowExceededError
+from omnigent.runtime.llm_retry import classify_llm_error
 
 
 def test_system_messages_extracted() -> None:
@@ -601,3 +606,56 @@ def test_max_completion_tokens_alias() -> None:
     messages = [{"role": "user", "content": "Hi"}]
     payload = _chat_to_anthropic(messages, "claude-test", None, {"max_completion_tokens": 2048})
     assert payload["max_tokens"] == 2048
+
+
+# ── Streaming error body buffering ───────────────────────
+
+
+def test_streamed_400_overflow_classified_as_context_window_exceeded(
+    serve_streamed_response,
+) -> None:
+    """
+    A streamed HTTP 400 buffers the error body before raising so
+    ``classify_llm_error`` can detect context-window overflow.
+
+    Without the ``aread()`` guard in ``_stream_request`` the body of a
+    streamed error response is never read; ``exc.response.text`` then
+    raises ``ResponseNotRead``, degrades to
+    ``"<unreadable response body>"``, and a genuine overflow 400 is
+    misclassified as a plain ``PermanentLLMError`` — the workflow's
+    compact-and-retry path never fires.
+
+    Failure meaning: the guard has been removed and streaming
+    Anthropic overflow errors no longer trigger compaction.
+    """
+    overflow_body = json.dumps(
+        {
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": ("prompt is too long: 210141 tokens > 200000 maximum"),
+            },
+        }
+    ).encode()
+    serve_streamed_response(400, overflow_body)
+
+    async def _run() -> Exception:
+        gen = _stream_request(
+            headers={},
+            payload={"model": "claude-test", "stream": True},
+            base_url="https://fake-host/v1",
+        )
+        try:
+            async for _ in gen:
+                pass
+        except httpx.HTTPStatusError as exc:
+            return classify_llm_error(exc, [429, 500, 502, 503])
+        raise AssertionError("Expected HTTPStatusError was not raised")
+
+    err = asyncio.run(_run())
+
+    assert isinstance(err, ContextWindowExceededError)
+    assert err.max_context_tokens == 200000
+    assert err.actual_tokens == 210141
+    assert err.detail is not None
+    assert "prompt is too long" in (err.detail.response_body or "")

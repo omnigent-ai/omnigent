@@ -36,6 +36,7 @@ import { usePolicyRegistry, type PolicyRegistryEntry } from "@/hooks/usePolicies
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isSingleUserMode } from "@/lib/capabilities";
 import { coercePolicyParams } from "@/lib/policyParams";
 
 // ---------------------------------------------------------------------------
@@ -429,14 +430,10 @@ function AddDefaultPolicyDialog({
 
 export function PoliciesPage() {
   const info = useServerInfo();
-  // Plain header/single-user mode: no auth endpoints exist. server_version
-  // distinguishes a live single-user server from a failed /v1/info probe
-  // (which uses the same accounts_enabled:false / login_url:null sentinel).
-  const isSingleUser =
-    info !== "loading" &&
-    !info.accounts_enabled &&
-    info.login_url === null &&
-    info.server_version !== null;
+  // Explicit single-user local runtime: no auth endpoints exist, so skip the
+  // admin probe. A multi-user header-auth deploy (same accounts_enabled:false
+  // / login_url:null shape) is NOT single-user and keeps its admin gate.
+  const isSingleUser = isSingleUserMode(info);
   const [meIsAdmin, setMeIsAdmin] = useState<boolean | null>(null);
   const { data: policies = [], refetch } = useDefaultPolicies();
   const { data: registry = [] } = usePolicyRegistry();
@@ -476,12 +473,12 @@ export function PoliciesPage() {
 
   if (!isSingleUser && meIsAdmin === false) {
     return (
-      <div className="mx-auto w-full max-w-2xl px-6 py-12">
+      <PageScroll contentClassName="px-8" extraBottom="2.5rem">
         <h1 className="mb-2 text-2xl font-semibold">Global Policies</h1>
         <p className="text-sm text-muted-foreground">
           You don't have permission to manage global policies.
         </p>
-      </div>
+      </PageScroll>
     );
   }
 
@@ -502,7 +499,7 @@ export function PoliciesPage() {
   }
 
   return (
-    <PageScroll contentClassName="px-6">
+    <PageScroll contentClassName="px-8" extraBottom="2.5rem">
       <div className="mb-6 flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-semibold">Global Policies</h1>

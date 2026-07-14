@@ -50,16 +50,21 @@ _logger = logging.getLogger(__name__)
 # uuid-named subdir so concurrent Omnigent processes (zero-downtime restarts,
 # multi-tenant single-machine deployments) don't step on each other.
 #
-# POSIX pins ``/tmp/omnigent`` deliberately: Unix socket paths have a tight
-# length limit, so a short, predictable parent matters (gettempdir() can be a
-# long ``/var/folders/...`` path on macOS). Windows uses TCP loopback for the
-# harness IPC (no socket-path length concern) and has no ``/tmp`` — a literal
-# ``/tmp/omnigent`` there resolves to ``\tmp\omnigent`` on the current drive —
-# so use the real temp dir.
+# POSIX pins ``/tmp/omnigent-<uid>`` deliberately: Unix socket paths have a
+# tight length limit, so a short, predictable parent matters (gettempdir()
+# can be a long ``/var/folders/...`` path on macOS) — and the uid suffix
+# keeps the parent per-Unix-user. A shared parent breaks multi-user hosts:
+# whichever user's runner starts first creates it ``0700`` and locks every
+# other user out, and even a ``1777`` parent leaves ``_sweep_orphans``
+# walking other users' ``0700`` instance dirs (and all sockets sharing one
+# world-writable directory). Windows uses TCP loopback for the harness IPC
+# (no socket-path length concern) and has no ``/tmp`` — a literal
+# ``/tmp/omnigent`` there resolves to ``\tmp\omnigent`` on the current
+# drive — so use the real (already per-user) temp dir.
 if IS_WINDOWS:
     _TMP_PARENT = Path(tempfile.gettempdir()) / "omnigent"
 else:
-    _TMP_PARENT = Path("/tmp/omnigent")
+    _TMP_PARENT = Path(f"/tmp/omnigent-{os.getuid()}")
 _TMP_PARENT_ENV_VAR = "OMNIGENT_HARNESS_TMP_PARENT"
 
 # S1 (security): env var carrying the per-spawn bearer token for the harness
@@ -193,8 +198,8 @@ def _default_tmp_parent() -> Path:
     length limits, and a short path such as ``.tmp/oa`` is useful
     for local worktrees whose absolute path is long.
 
-    :returns: Configured parent path, or the default
-        ``/tmp/omnigent``.
+    :returns: Configured parent path, or the per-uid default
+        ``/tmp/omnigent-<uid>`` on POSIX.
     """
     configured = os.environ.get(_TMP_PARENT_ENV_VAR)
     if configured:

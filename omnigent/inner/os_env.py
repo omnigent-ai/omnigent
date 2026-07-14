@@ -1409,6 +1409,7 @@ def _shell_impl(
         completed = subprocess.run(
             argv,
             cwd=str(cwd),
+            env=_child_shell_env(),
             text=True,
             capture_output=True,
             timeout=timeout,
@@ -1499,6 +1500,40 @@ def _project_root() -> Path:
     # File lives at omnigent/inner/os_env.py; climb two levels to the
     # repo root that hosts `omnigent/` as a package.
     return Path(__file__).resolve().parents[2]
+
+
+def _same_path(entry: str, root: Path) -> bool:
+    """True when ``entry`` names the same directory as ``root``."""
+    try:
+        return Path(entry).resolve() == root
+    except OSError:
+        return os.path.normpath(entry) == os.path.normpath(str(root))
+
+
+def _child_shell_env() -> dict[str, str]:
+    """
+    Environment for agent shell commands, minus omnigent's own package root.
+
+    The helper prepends its project root to ``PYTHONPATH`` at spawn (see
+    ``_HelperProcessClient._start_locked``) purely so ``python -m
+    omnigent.inner.os_env`` can import omnigent. That entry has no business in
+    the commands the agent runs: under a tool install it points at omnigent's
+    ``site-packages`` and shadows the project venv's own packages on
+    ``sys.path`` (e.g. a 3.12 ``pydantic_core`` failing to load under a 3.13
+    project). Strip only omnigent's entry — any other ``PYTHONPATH`` the caller
+    set is preserved, in order.
+    """
+    env = os.environ.copy()
+    raw = env.get("PYTHONPATH")
+    if not raw:
+        return env
+    root = _project_root()
+    kept = [entry for entry in raw.split(os.pathsep) if not (entry and _same_path(entry, root))]
+    if kept:
+        env["PYTHONPATH"] = os.pathsep.join(kept)
+    else:
+        env.pop("PYTHONPATH", None)
+    return env
 
 
 def _read_config_from_fd(fd: int) -> JsonValue:

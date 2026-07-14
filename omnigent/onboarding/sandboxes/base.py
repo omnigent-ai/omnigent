@@ -585,6 +585,20 @@ class SandboxLauncher(ABC):
         """
         raise self._capability_error("resume a stopped sandbox")
 
+    def is_running(self, sandbox_id: str) -> bool | None:
+        """
+        Return whether the provider reports this sandbox as running.
+
+        Optional capability: ``None`` means the launcher cannot cheaply answer
+        and callers should preserve their existing liveness behavior.
+
+        :param sandbox_id: The sandbox to inspect, e.g. ``"sb-a1b2c3"``.
+        :returns: ``True`` when running, ``False`` when not running, or ``None``
+            when the provider status is unknown.
+        """
+        del sandbox_id
+        return None
+
     def exec_foreground(self, sandbox_id: str, command: str) -> int:
         """
         Run a command in the sandbox with stdio inherited from the

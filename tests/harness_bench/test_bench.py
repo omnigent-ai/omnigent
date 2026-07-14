@@ -77,6 +77,44 @@ def test_streaming_capability_declares_binary_verdict() -> None:
         assert declared is not Verdict.PARTIAL, f"{harness!r}: PARTIAL is never a declared verdict"
 
 
+def test_remaining_capabilities_map_to_declared_verdicts(monkeypatch: pytest.MonkeyPatch) -> None:
+    from omnigent.harness_capabilities import (
+        AuthModel,
+        EffortFamily,
+        Elicitation,
+        HarnessCapabilities,
+        IntegrationMode,
+        ModelFamily,
+        Resume,
+    )
+    from tests.harness_bench import manifest
+
+    capability = HarnessCapabilities(
+        IntegrationMode.SDK_IN_PROCESS,
+        Elicitation.NONE,
+        Resume.NONE,
+        EffortFamily.NONE,
+        ModelFamily.MULTI,
+        AuthModel.OWN_AUTH,
+        subagents=False,
+        interrupt=True,
+        streaming=True,
+        steering=True,
+        live_queue=False,
+        images=None,
+        compaction=True,
+    )
+    monkeypatch.setattr(manifest, "harness_capabilities", lambda: {"fake": capability})
+
+    declared = manifest._declared_from_capabilities("fake")
+
+    assert declared["resume"] is Verdict.UNSUPPORTED
+    assert declared["steering"] is Verdict.SUPPORTED
+    assert declared["live_queue"] is Verdict.UNSUPPORTED
+    assert "images" not in declared
+    assert declared["compaction"] is Verdict.SUPPORTED
+
+
 def test_reconcile_flags_concrete_mismatch() -> None:
     assert reconcile(Verdict.UNSUPPORTED, Verdict.SUPPORTED) is Verdict.DRIFT
     assert reconcile(Verdict.SUPPORTED, Verdict.UNSUPPORTED) is Verdict.DRIFT

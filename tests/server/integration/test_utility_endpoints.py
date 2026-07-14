@@ -78,6 +78,31 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     assert data["needs_setup"] is False
     assert isinstance(data["databricks_features"], bool)
     assert isinstance(data["managed_sandboxes_enabled"], bool)
+    # single_user reflects OMNIGENT_LOCAL_SINGLE_USER, which the suite's
+    # conftest sets to "1" (the default local-dev posture), so it's true here.
+    # The multi-user (marker-off) case is covered below.
+    assert data["single_user"] is True
+
+
+async def test_info_single_user_false_without_marker(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``single_user`` tracks ``OMNIGENT_LOCAL_SINGLE_USER`` live.
+
+    It's the sole signal that separates a genuine one-user local server
+    from a multi-user header-auth deploy (both otherwise report
+    ``accounts_enabled: false`` / ``login_url: null``), so it must come
+    from the explicit marker, not the auth shape. With the marker cleared,
+    the same auth-shape app reports false — the regression this signal fixes.
+    """
+    monkeypatch.delenv("OMNIGENT_LOCAL_SINGLE_USER", raising=False)
+    resp = await client.get("/v1/info")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["single_user"] is False
+    # Auth shape is unchanged — single_user is orthogonal to it.
+    assert data["accounts_enabled"] is False
+    assert data["login_url"] is None
 
 
 # ── GET /v1/me ───────────────────────────────────────────

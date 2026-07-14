@@ -10325,6 +10325,84 @@ async def test_events_interrupt_and_stop_on_pi_native_enqueue_bridge_interrupt(
     ), f"no interrupt marker should enter _session_histories; got {captured_history!r}"
 
 
+@pytest.mark.asyncio
+async def test_events_model_change_on_pi_native_enqueues_bridge_model_change(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    POST ``/events`` ``model_change`` on a pi-native session queues a
+    ``model_change`` payload to the Pi extension inbox.
+
+    A pi-native turn runs inside the resident Pi TUI process, and the
+    ``--model`` launch flag is baked in at spawn. The dispatch must route to
+    ``_handle_pi_native_model_change``, which drops a ``model_change`` payload
+    the extension applies live via Pi's ``setModel``.
+
+    Regression guard: the ``model_change`` branch originally enumerated only
+    claude/codex/cursor/opencode/kiro, so pi-native fell through to the no-op
+    and a web-picked model never reached the running Pi process.
+
+    Pins:
+    1. 204 returned.
+    2. A ``model_change_*`` payload carrying the model id is written to the
+       session's bridge inbox.
+    """
+    import json as _json
+
+    import omnigent.pi_native_bridge as pi_native_bridge
+    from omnigent.spec.types import ExecutorSpec
+
+    conv_id = "conv_pi_native_model_change"
+    monkeypatch.setattr(pi_native_bridge, "_BRIDGE_ROOT", tmp_path / "pi-bridge")
+
+    pi_native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "pi-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return pi_native_spec
+
+    server_client = _EventRecordingServerClient()
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "model_change", "model": "databricks-claude-opus-4-1"},
+        )
+
+    assert resp.status_code == 204, (
+        f"pi-native model_change must return 204; got {resp.status_code}: {resp.text}"
+    )
+
+    inbox = pi_native_bridge.bridge_dir_for_session_id(conv_id) / "inbox"
+    payloads = [
+        _json.loads(p.read_text(encoding="utf-8"))
+        for p in (inbox.glob("*.json") if inbox.exists() else [])
+    ]
+    model_changes = [p for p in payloads if p.get("type") == "model_change"]
+    assert len(model_changes) == 1, (
+        f"pi-native model_change must enqueue exactly one payload; got {payloads!r}."
+    )
+    assert model_changes[0]["model"] == "databricks-claude-opus-4-1"
+    assert model_changes[0]["id"].startswith("model_change_")
+
+
 def test_interrupted_sessions_isolated_per_app_instance() -> None:
     """
     Each ``create_runner_app()`` gets its own ``_interrupted_sessions`` set.

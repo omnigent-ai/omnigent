@@ -17,8 +17,11 @@ const mocks = vi.hoisted(() => ({
   deleteMutate: vi.fn(),
   accountsEnabled: true,
   // login_url: non-null for any sign-in mode (accounts OR OIDC), null in
-  // header single-user mode. Gates the Account section.
+  // header mode. Gates the Account section.
   loginUrl: "/login" as string | null,
+  // single_user: explicit single-user marker; false for accounts/OIDC/
+  // multi-user-header. Gates the settings-route single-user redirect.
+  singleUser: false,
   // Identity from the mode-agnostic `/v1/me` probe (resolveIdentity returns
   // the id, getCurrentIsAdmin the flag). null → unauthenticated.
   me: { id: "alice", is_admin: false } as { id: string; is_admin: boolean } | null,
@@ -33,6 +36,7 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
   useServerInfo: () => ({
     accounts_enabled: mocks.accountsEnabled,
     login_url: mocks.loginUrl,
+    single_user: mocks.singleUser,
   }),
 }));
 vi.mock("@/lib/accountsApi", () => ({

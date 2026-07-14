@@ -216,6 +216,12 @@ Validated for presence and shape only: `Owner`, `Transport`, `Implementation`,
 
 Planned dimensions are steering, live queue, resume, images, and compaction.
 
+Their declarations already have a place in `HarnessCapabilities`: resume uses
+the `Resume` mechanism enum, while steering, live queue, images, and compaction
+are optional booleans. An unset optional value makes no claim and therefore
+stays `UNKNOWN` until the corresponding probe work establishes the harness's
+expected behavior.
+
 Every behavioral probe also reads the corresponding declared flag and returns
 `DRIFT` when observed disagrees with declared.
 
@@ -433,5 +439,5 @@ agree with it.
 - **Per-harness native provisioning** — some vendors require login or provider
   configuration that the bench deliberately cannot create. Improve diagnostics
   where possible while retaining clean skips.
-- **Additional dimensions** — steering, live queue, resume, reasoning,
-  images, and compaction.
+- **Additional dimensions** — steering, live queue, resume, images, and
+  compaction.

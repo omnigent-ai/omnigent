@@ -42,6 +42,7 @@ from omnigent.runtime.harnesses.process_manager import (
     _TMP_PARENT_ENV_VAR,
     HarnessProcessManager,
     NoLiveHarnessError,
+    _default_tmp_parent,
     _pid_alive,
     _pids_holding_socket,
     _SubprocessEntry,
@@ -196,6 +197,28 @@ async def test_start_uses_harness_tmp_parent_env(
         assert (manager.instance_dir / _AP_PID_FILE).read_text(encoding="utf-8")
     finally:
         await manager.shutdown()
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Per-uid tmp parent is POSIX-only; Windows uses gettempdir().",
+)
+def test_default_tmp_parent_is_per_uid_on_posix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The default socket root is namespaced per Unix uid.
+
+    A shared ``/tmp/omnigent`` breaks multi-user hosts: the first
+    user's runner creates it ``0700`` and every other user's runner
+    then dies in ``_sweep_orphans`` stat()ing foreign instance dirs.
+    The POSIX default must carry the uid so each user gets a private
+    parent. Regression guard against the pre-fix bare ``/tmp/omnigent``.
+    """
+    monkeypatch.delenv(_TMP_PARENT_ENV_VAR, raising=False)
+    parent = _default_tmp_parent()
+    assert parent == Path(f"/tmp/omnigent-{os.getuid()}")
+    # The shared parent that locked out other users must be gone.
+    assert parent != Path("/tmp/omnigent")
 
 
 async def test_shutdown_without_start_is_noop(
