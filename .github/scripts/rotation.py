@@ -21,10 +21,15 @@ from __future__ import annotations
 import datetime
 import json
 import os
+import pathlib
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from zoneinfo import ZoneInfo
+
+# Roster lives in a sibling JSON file so it can be edited (swaps, holidays)
+# without touching the logic here.
+ROSTER_PATH = pathlib.Path(__file__).with_name("rotation_roster.json")
 
 # Each cron run is one timezone's morning scan: we ping today's assignee only
 # if it's currently morning where they are. A run that's morning in SF is night
@@ -54,24 +59,24 @@ class Person:
     # Out-of-office spans as inclusive (start, end) ISO date pairs, e.g.
     # (("2026-07-13", "2026-07-17"),). On any OOO day the person is skipped and
     # the next available person covers; the OOO person keeps their later slots.
-    ooo: tuple[tuple[str, str], ...] = ()
+    ooo: tuple[tuple[str, str], ...] = field(default_factory=tuple)
 
 
-# Rotation order. Slack member IDs (profile -> ⋮ More -> Copy member ID) and
-# each person's IANA timezone.
-PEOPLE: list[Person] = [
-    Person("Aravind Segu", "U01A12R8NUR", "America/Los_Angeles"),
-    Person("Bryan Qiu", "U05KA5T983Y", "America/Los_Angeles"),
-    Person("Daniel Lok", "U060CNWNHSQ", "Asia/Singapore"),
-    Person("Dhruv Gupta", "U0A76097E1F", "America/Los_Angeles"),
-    Person("Edwin He", "U077B1V6WQJ", "America/Los_Angeles"),
-    Person("Pat Sukprasert", "U05HRKWFY81", "Asia/Singapore"),
-    Person("Sabhya Chhabria", "U07A1KQDXAB", "America/Los_Angeles"),
-    Person("Serena Ruan", "U0571L5KNLR", "Asia/Singapore"),
-    Person("Shivam Mittal", "U09FZKX9S6B", "America/Los_Angeles"),
-    Person("Tomu Hirata", "U07TX4PR5MZ", "Asia/Singapore"),
-    Person("Zeyi (Rice) Fan", "U09L5HT4CH0", "America/Los_Angeles"),
-]
+def load_people(roster_path: pathlib.Path = ROSTER_PATH) -> list[Person]:
+    """Load the rotation roster from JSON. Order defines the rotation order."""
+    roster = json.loads(roster_path.read_text())
+    return [
+        Person(
+            name=entry["name"],
+            slack_id=entry["slack_id"],
+            tz=entry["tz"],
+            ooo=tuple(tuple(span) for span in entry.get("ooo", ())),
+        )
+        for entry in roster["people"]
+    ]
+
+
+PEOPLE: list[Person] = load_people()
 
 
 def _workdays_between(start: datetime.date, end: datetime.date) -> int:
