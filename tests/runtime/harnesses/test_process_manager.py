@@ -857,6 +857,7 @@ async def test_orphan_sweep_preserves_live_omnigent_dirs(
 @pytest.mark.posix_only
 async def test_orphan_sweep_survives_unreadable_tmp_parent(
     short_tmp_parent: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """An unreadable tmp_parent must not abort manager startup.
 
@@ -878,6 +879,10 @@ async def test_orphan_sweep_survives_unreadable_tmp_parent(
     try:
         # Before the fix this raised PermissionError out of start().
         await manager.start()
+        assert any(
+            "cannot enumerate" in record.getMessage() and str(locked_parent) in record.getMessage()
+            for record in caplog.records
+        )
     finally:
         locked_parent.chmod(0o700)
         with contextlib.suppress(Exception):
@@ -887,6 +892,7 @@ async def test_orphan_sweep_survives_unreadable_tmp_parent(
 @pytest.mark.posix_only
 async def test_orphan_sweep_skips_unreadable_sibling_and_still_sweeps(
     short_tmp_parent: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A foreign, unreadable ``ap-*`` sibling is skipped, not fatal.
 
@@ -916,6 +922,10 @@ async def test_orphan_sweep_skips_unreadable_sibling_and_still_sweeps(
         assert foreign.exists(), "unreadable sibling must be skipped, not removed"
         assert not dead.exists(), "readable dead orphan must still be swept"
         assert live.exists(), "live sibling must remain untouched"
+        assert any(
+            "cannot inspect" in record.getMessage() and str(foreign) in record.getMessage()
+            for record in caplog.records
+        )
     finally:
         foreign.chmod(0o700)
         with contextlib.suppress(Exception):
