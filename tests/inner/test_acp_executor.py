@@ -178,7 +178,8 @@ def test_tool_call_and_update_emit_cards() -> None:
     assert len(started) == 1
     req = started[0]
     assert isinstance(req, ToolCallRequest)
-    assert req.name == "shell" and req.metadata == {"call_id": "c1"}
+    assert req.name == "shell"
+    assert req.metadata == {"call_id": "c1", "self_executed": True}
     assert ex._tool_names["c1"] == "shell"
 
     done = ex._handle_session_update(
@@ -188,8 +189,13 @@ def test_tool_call_and_update_emit_cards() -> None:
     comp = done[0]
     assert isinstance(comp, ToolCallComplete)
     assert comp.name == "shell" and comp.status is ToolCallStatus.SUCCESS
-    assert comp.metadata == {"call_id": "c1"}
+    assert comp.metadata == {
+        "call_id": "c1",
+        "arguments": {"command": "ls"},
+        "self_executed": True,
+    }
     assert "c1" not in ex._tool_names  # popped
+    assert "c1" not in ex._self_executed_args
 
 
 def test_tool_call_update_failed_maps_to_error() -> None:
@@ -217,6 +223,123 @@ def test_in_progress_tool_update_emits_nothing() -> None:
         )
         == []
     )
+
+
+@pytest.mark.parametrize(
+    ("update", "is_bridge"),
+    [
+        ({"title": "sys_session_get_info", "rawInput": {}}, True),
+        (
+            {"title": "Session info", "rawInput": {"tool": "mcp_omnigent_sys_session_get_info"}},
+            True,
+        ),
+        (
+            {"title": "Session info", "rawInput": {"tool": "mcp__omnigent__sys_session_get_info"}},
+            True,
+        ),
+        (
+            {
+                "title": "omnigent: sys session get info",
+                "rawInput": {"session_id": ""},
+                "_meta": {
+                    "goose": {
+                        "toolCall": {
+                            "toolName": "omnigent__sys_session_get_info",
+                            "extensionName": "omnigent",
+                        }
+                    }
+                },
+            },
+            True,
+        ),
+        (
+            {"title": "GitHub comments", "rawInput": {"tool": "github__list_comments"}},
+            False,
+        ),
+        (
+            {"title": "shell: git status", "rawInput": {"command": "git status"}},
+            False,
+        ),
+    ],
+)
+def test_bridge_classification_matches_only_advertised_aliases(
+    update: dict[str, object], is_bridge: bool
+) -> None:
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._bridge_tool_aliases = frozenset(
+        {
+            "sys_session_get_info",
+            "mcp_omnigent_sys_session_get_info",
+            "mcp__omnigent__sys_session_get_info",
+            "omnigent__sys_session_get_info",
+            "list_comments",
+            "mcp_omnigent_list_comments",
+            "mcp__omnigent__list_comments",
+            "omnigent__list_comments",
+        }
+    )
+
+    event = ex._handle_session_update(
+        {"sessionUpdate": "tool_call", "toolCallId": "c1", **update}
+    )[0]
+
+    assert ("self_executed" not in event.metadata) is is_bridge
+
+
+def test_no_advertised_bridge_keeps_exact_match_self_executed() -> None:
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._omnigent_tools = [{"name": "sys_session_get_info"}]
+
+    event = ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "c1",
+            "title": "sys_session_get_info",
+        }
+    )[0]
+
+    assert event.metadata == {"call_id": "c1", "self_executed": True}
+
+
+@pytest.mark.asyncio
+async def test_session_mcp_snapshot_is_stable_until_session_reset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._rpc = AsyncMock(return_value={"result": {"sessionId": "s1"}})  # type: ignore[method-assign]
+    monkeypatch.setattr(ex._mcp, "session_new_servers", lambda **_: [{"name": "omnigent"}])
+
+    ex._omnigent_tools = [{"name": "sys_session_get_info"}]
+    await ex._ensure_session()
+    first_aliases = ex._bridge_tool_aliases
+    ex._omnigent_tools = [{"name": "web_search"}]
+
+    assert "sys_session_get_info" in first_aliases
+    assert "web_search" not in ex._bridge_tool_aliases
+
+    ex._reset_session_state()
+    ex._rpc = AsyncMock(return_value={"result": {"sessionId": "s2"}})  # type: ignore[method-assign]
+    await ex._ensure_session()
+    assert "web_search" in ex._bridge_tool_aliases
+    assert "sys_session_get_info" not in ex._bridge_tool_aliases
+
+
+def test_session_reset_clears_incomplete_tool_state() -> None:
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "pending",
+            "title": "shell",
+            "rawInput": {"command": "sleep 10"},
+        }
+    )
+
+    ex._reset_session_state()
+
+    assert ex._tool_names == {}
+    assert ex._self_executed_args == {}
+    assert ex._bridge_tool_aliases == frozenset()
 
 
 # ---------------------------------------------------------------------------

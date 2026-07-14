@@ -290,6 +290,15 @@ class AcpExecutor(Executor):
         self._mcp = OmnigentAcpMcp(label=config.name)
         self._omnigent_tools: list[Any] = []  # type: ignore[explicit-any]
 
+        # Arguments of self-executed tool calls, keyed by ACP toolCallId, so
+        # the completion can carry them for a persistable card (the observed
+        # ``in_progress`` function_call is never stored).
+        self._self_executed_args: dict[str, dict[str, Any]] = {}  # type: ignore[explicit-any]
+        # Exact names the agent can use for the Omnigent MCP bridge in this
+        # session. Built once from the server entries and tools sent at
+        # ``session/new``; empty means no call enters dispatch correlation.
+        self._bridge_tool_aliases: frozenset[str] = frozenset()
+
     # ------------------------------------------------------------------
     # Low-level ACP transport
     # ------------------------------------------------------------------
@@ -511,12 +520,7 @@ class AcpExecutor(Executor):
         if self._session_id is not None:
             return self._session_id
 
-        mcp_servers = self._mcp.session_new_servers(
-            tools=self._omnigent_tools,
-            tool_executor=getattr(self, "_tool_executor", None),
-            loop=asyncio.get_event_loop(),
-            enabled=self._config.omnigent_mcp,
-        )
+        mcp_servers = self._session_mcp_servers()
         params: dict[str, Any] = {"cwd": self._cwd, "mcpServers": mcp_servers}  # type: ignore[explicit-any]
         client_id: str | None = None
         if self._config.session_id_mode == "client":
@@ -539,6 +543,36 @@ class AcpExecutor(Executor):
             )
         self._session_id = session_id
         return self._session_id
+
+    def _session_mcp_servers(self) -> list[dict[str, Any]]:
+        """Create MCP entries and snapshot the matching aliases atomically.
+
+        Subclasses that customize ``session/new`` use this helper instead of
+        calling the relay directly, so relay creation and tool-call
+        classification cannot drift apart.
+        """
+        mcp_servers = self._mcp.session_new_servers(
+            tools=self._omnigent_tools,
+            tool_executor=getattr(self, "_tool_executor", None),
+            loop=asyncio.get_event_loop(),
+            enabled=self._config.omnigent_mcp,
+        )
+        server_names = {str(s.get("name", "")) for s in mcp_servers if isinstance(s, dict)}
+        server_names.discard("")
+        tool_names = {
+            str(getattr(t, "name", None) or (t.get("name") if isinstance(t, dict) else ""))
+            for t in (self._omnigent_tools or [])
+        }
+        tool_names.discard("")
+
+        aliases = set(tool_names) if server_names else set()
+        for server in server_names:
+            for tool in tool_names:
+                aliases.update(
+                    (f"mcp_{server}_{tool}", f"mcp__{server}__{tool}", f"{server}__{tool}")
+                )
+        self._bridge_tool_aliases = frozenset(aliases)
+        return mcp_servers
 
     # ------------------------------------------------------------------
     # Server-initiated requests (agent → client)
@@ -884,6 +918,42 @@ class AcpExecutor(Executor):
             out["total_tokens"] = usage["totalTokens"]
         return out or None
 
+    def _is_bridge_tool_call(self, name: str, update: dict[str, Any]) -> bool:  # type: ignore[explicit-any]
+        """True when this ACP tool call is an Omnigent MCP-bridge tool.
+
+        Aliases come from the tools and MCP server entries sent at
+        ``session/new``. Goose humanizes the title, so its machine-name metadata
+        is included among the candidates. Unknown shapes fail closed as
+        self-executed: that may duplicate a card, but cannot poison dispatch
+        correlation.
+        """
+        if not self._bridge_tool_aliases:
+            return False
+        raw = update.get("rawInput")
+        raw_tool = str(raw.get("tool", "")) if isinstance(raw, dict) else ""
+        # Goose stamps the machine name under ``_meta.goose.toolCall.toolName``
+        # (observed on the wire from goose 1.41); older builds used the flatter
+        # ``_meta.goose.toolName``. Read both.
+        meta = update.get("_meta")
+        goose_meta = meta.get("goose") if isinstance(meta, dict) else None
+        meta_tool = ""
+        if isinstance(goose_meta, dict):
+            inner = goose_meta.get("toolCall")
+            meta_tool = str(
+                (inner.get("toolName", "") if isinstance(inner, dict) else "")
+                or goose_meta.get("toolName", "")
+            )
+        candidates = {candidate for candidate in (name, raw_tool, meta_tool) if candidate}
+        return not self._bridge_tool_aliases.isdisjoint(candidates)
+
+    def _reset_session_state(self) -> None:
+        """Forget state that is valid only for the current ACP session."""
+        self._session_id = None
+        self._system_prompt_sent = False
+        self._tool_names.clear()
+        self._self_executed_args.clear()
+        self._bridge_tool_aliases = frozenset()
+
     def _handle_session_update(self, update: dict[str, Any]) -> list[ExecutorEvent]:  # type: ignore[explicit-any]
         """Translate one ``session/update`` payload into ExecutorEvents.
 
@@ -911,9 +981,14 @@ class AcpExecutor(Executor):
             args = raw_input if isinstance(raw_input, dict) else {}
             if isinstance(call_id, str) and call_id:
                 self._tool_names[call_id] = str(name)
-                events.append(
-                    ToolCallRequest(name=str(name), args=args, metadata={"call_id": call_id})
-                )
+                metadata: dict[str, Any] = {"call_id": call_id}
+                # Agent-native tools run inside the agent's own loop and never
+                # round-trip Omnigent dispatch; mark them so the adapter skips
+                # dispatch correlation and re-emits a persistable card.
+                if not self._is_bridge_tool_call(str(name), update):
+                    self._self_executed_args[call_id] = args
+                    metadata["self_executed"] = True
+                events.append(ToolCallRequest(name=str(name), args=args, metadata=metadata))
         elif update_type == _UPDATE_TOOL_CALL_UPDATE:
             call_id = update.get("toolCallId")
             status = update.get("status")
@@ -922,6 +997,12 @@ class AcpExecutor(Executor):
                 _TOOL_STATUS_FAILED,
             ):
                 name = self._tool_names.pop(call_id, "tool")
+                complete_metadata: dict[str, Any] = {"call_id": call_id}
+                if call_id in self._self_executed_args:
+                    # Carry the request arguments so the adapter can emit a
+                    # completed (persistable) function_call for this card.
+                    complete_metadata["arguments"] = self._self_executed_args.pop(call_id)
+                    complete_metadata["self_executed"] = True
                 events.append(
                     ToolCallComplete(
                         name=name,
@@ -931,7 +1012,7 @@ class AcpExecutor(Executor):
                             else ToolCallStatus.ERROR
                         ),
                         result=update.get("content") or update.get("rawOutput"),
-                        metadata={"call_id": call_id},
+                        metadata=complete_metadata,
                     )
                 )
         elif update_type == _UPDATE_USAGE:
@@ -1048,15 +1129,13 @@ class AcpExecutor(Executor):
                 try:
                     response = fut.result()
                 except Exception as exc:  # noqa: BLE001
-                    self._session_id = None
-                    self._system_prompt_sent = False
+                    self._reset_session_state()
                     yield ExecutorError(message=f"ACP process error: {exc}", retryable=True)
                     return
                 if "error" in response:
                     error_msg = response["error"].get("message", "Unknown ACP error")
                     if "Session not found" in error_msg:
-                        self._session_id = None
-                        self._system_prompt_sent = False
+                        self._reset_session_state()
                     yield ExecutorError(message=error_msg, retryable=True)
                     return
                 result = response.get("result", {}) if isinstance(response, dict) else {}
@@ -1115,6 +1194,7 @@ class AcpExecutor(Executor):
 
     async def close(self) -> None:
         """Terminate the agent subprocess and clean up."""
+        self._reset_session_state()
         # Tear down the Omnigent MCP relay HTTP server + its bridge dir first.
         with contextlib.suppress(Exception):
             self._mcp.close()
