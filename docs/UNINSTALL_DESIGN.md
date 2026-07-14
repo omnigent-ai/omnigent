@@ -188,12 +188,12 @@ detected."
 
 Fast vs deep:
 
-- Fast (startup, target <100ms, no subprocess spawns): stat the ledger; if
-  valid, return. Else cheap checks only - stat `installation_id`, stat +
-  bounded-`grep` candidate profiles for markers, stat known `~/.omnigent`
-  subdirs, existence checks for Electron dirs. Mark wheel/deps `confidence: low`
-  or omit; `generator.strategy = fast-backfill`. Never spawn `uv`/`command -v`
-  on the hot path.
+- Fast (startup, target <100ms, no package-manager subprocesses): stat the
+  ledger; if valid, return. Else cheap checks only - stat `installation_id`,
+  read + in-process scan of candidate profiles for markers (no shelling out to
+  `grep`), stat known `~/.omnigent` subdirs, existence checks for Electron
+  dirs. Mark wheel/deps `confidence: low` or omit; `generator.strategy =
+  fast-backfill`. Never spawn `uv`/`command -v` on the hot path.
 - Deep (uninstall / doctor, no budget): fast steps plus `uv tool list`/
   `uv tool dir`, `command -v omnigent omni uv node tmux bwrap`, version
   resolution, allowlisted external-config marker scans, LaunchAgent/systemd
@@ -238,7 +238,8 @@ only with `--apply`.
 
 Checklist:
 
-- [ ] Fast reconstruction (<100ms, no subprocess spawns) on startup when missing
+- [ ] Fast reconstruction (<100ms, no package-manager subprocesses, in-process
+      marker scan) on startup when missing
 - [ ] Deep reconstruction at uninstall / doctor
 - [ ] Anchor guard (refuse to fabricate without an install signal)
 - [ ] Per-field confidence assignment per table
@@ -274,6 +275,10 @@ Flags:
 - `--modify-external-config` - primary gate to touch third-party config files.
 - `--no-backup` - with `state`/`--purge`, skip archive creation.
 - `--assume-inferred` - secondary gate to act on `inferred` entries.
+- `--purge-workspace` - the only way to clear `~/omnigent` (your working files)
+  non-interactively. Without it, `--purge --yes` still removes `~/.omnigent`
+  (credentials/history) but leaves `~/omnigent` untouched and prints a notice.
+  This keeps a stray `--yes` in automation from wiping user work.
 
 Gate decision table. Two orthogonal gates. Intrinsic-risk (primary): own
 reversible artifacts auto-remove under `--yes`; third-party edits and data
@@ -288,7 +293,8 @@ friction, never grant it.
 | Delimited PATH block (marker match) | prompt then remove | auto-remove | none; refuse if `block_sha256` mismatch (tampered) unless `--force` |
 | Injected external config, marker/observed | reported, skipped | reported, skipped | `--modify-external-config` |
 | Injected external config, inferred (no marker) | reported, skipped | reported, skipped | `--modify-external-config` AND `--assume-inferred` |
-| State roots (`~/.omnigent`, `~/omnigent`) | reported, skipped | reported, skipped | `--purge` (+ separate confirm for `~/omnigent`) |
+| `~/.omnigent` state root | reported, skipped | removed only with `--purge` | `--purge` |
+| `~/omnigent` workspace | reported, skipped | kept unless `--purge-workspace` | `--purge` AND (`--purge-workspace` or interactive confirm) |
 | Desktop data | via `desktop-data`/`all` | same | none beyond target |
 | Shared deps (uv/node/tmux/bwrap) | report-only | report-only | none - never removed this version |
 
@@ -296,8 +302,8 @@ Checklist:
 
 - [ ] Python `omnigent uninstall` subcommand that execs the shell script
 - [ ] Targets: `cli`, `state`, `desktop-data`, `all`
-- [ ] Flags: `--purge`, `--dry-run`, `--yes`, `--json`, `--force`,
-      `--modify-external-config`, `--no-backup`, `--assume-inferred`
+- [ ] Flags: `--purge`, `--purge-workspace`, `--dry-run`, `--yes`, `--json`,
+      `--force`, `--modify-external-config`, `--no-backup`, `--assume-inferred`
 - [ ] Two-gate decision table implemented (intrinsic-risk + confidence
       tighten-only)
 - [ ] External-config stripping (marker/allowlist scoped only)
@@ -321,11 +327,15 @@ execs the shell script for removal. Sequence:
 5. Strip injected external config (gated per table; marker-scoped /
    allowlist-scoped only).
 6. Optional state / desktop-data (only with `--purge` / target). For `--purge`:
-   archive to a backup tarball OUTSIDE the target
-   (`~/.omnigent-backups/<ts>.tar.zst` or `$XDG_STATE_HOME`), print the restore
-   command, then delete. Never back up into `~/.omnigent`. Separate confirm for
-   `~/omnigent`. Note that purging `installation_id` makes a reinstall look like
-   a new device (telemetry).
+   archive to a backup tarball OUTSIDE the target under `~/.omnigent-backups/`
+   (or `$XDG_STATE_HOME`). Prefer `<ts>.tar.zst` when `zstd` is present; fall
+   back to `<ts>.tar.gz` (gzip is POSIX-baseline) otherwise. Never silently skip
+   the backup because a compressor is missing - a purge that can't write its
+   backup must fail closed (exit 1) unless `--no-backup` was given. Print the
+   restore command, then delete. Never back up into `~/.omnigent`. Clearing
+   `~/omnigent` non-interactively requires `--purge-workspace` (see section 5);
+   otherwise it prompts for a separate confirm. Note that purging
+   `installation_id` makes a reinstall look like a new device (telemetry).
 7. `uv tool uninstall omnigent` - LAST (so earlier Python-driven steps still
    have the wheel available).
 
@@ -335,8 +345,9 @@ Checklist:
       `omnigent:*` tmux, ledger LaunchAgents, abort-if-won't-stop)
 - [ ] Profile block removal across all shells incl. fish; profile backed up
       first; tamper-refusal
-- [ ] `--purge` archives OUTSIDE the target, prints restore command, then
-      deletes; separate `~/omnigent` confirm
+- [ ] `--purge` archives OUTSIDE the target (`.tar.zst`, gzip fallback; fail
+      closed if it can't write the backup), prints restore command, then
+      deletes; `~/omnigent` gated behind `--purge-workspace` (or confirm)
 - [ ] `uv tool uninstall omnigent` runs last
 
 ## 7. Idempotency and exit codes
@@ -370,7 +381,7 @@ Exit codes:
       "gate": null, "detail": "installed_by=unknown; not removed" }
   ],
   "backups": ["~/.omnigent-backups/2026-07-14T18-40-02Z.tar.zst"],
-  "summary": { "done": 3, "skipped": 1, "failed": 0, "reported": 1 },
+  "summary": { "done": 1, "skipped": 1, "failed": 0, "reported": 1 },
   "exit_code": 0
 }
 ```
@@ -394,12 +405,14 @@ Checklist:
 | 6 | Live daemon running | stopped (SIGTERM->5s->`--force`); won't-stop aborts destructive steps |
 | 7 | `--dry-run` | prints exact paths/sizes/ranges; zero mutations; exit 0 |
 | 8 | `--purge` with backup | archive written OUTSIDE `~/.omnigent`; restore command printed; then delete |
-| 9 | `--purge --no-backup` | delete without archive; separate `~/omnigent` confirm honored |
+| 9 | `--purge --no-backup` | delete without archive; `~/omnigent` kept unless `--purge-workspace` |
 | 10 | Shared dep present (`installed_by:unknown`) | report-only, never removed, even with `--yes` |
 | 11 | Double ledger (real + backfill both present) | keep real; backfill copy left as `.backfill.json` for inspection |
 | 12 | Re-run after full uninstall (idempotency) | all already-absent; exit 0 |
 | 13 | Injected external config, marker vs inferred | marker gated by `--modify-external-config`; inferred also needs `--assume-inferred` |
 | 14 | uv tool uninstall runs last | earlier Python steps had the wheel available |
+| 15 | `--purge` on a box without `zstd` | backup written as `.tar.gz`; not skipped |
+| 16 | `--purge --yes` without `--purge-workspace` | `~/.omnigent` removed; `~/omnigent` kept + notice |
 
 Checklist:
 
@@ -474,7 +487,7 @@ Omnigent is a houseguest.
                           |  --yes --json --force        |
                           |  --modify-external-config    |
                           +--------------+--------------+
-|
+                                         |
                           +--------------v--------------+
                           |  Load install_ledger.json    |
                           +--------------+--------------+
