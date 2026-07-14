@@ -18,26 +18,87 @@ conversation row's ``agent_id`` column.
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import tarfile
-from dataclasses import dataclass
+from collections.abc import AsyncIterator
+from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any, NoReturn
 
 import httpx
 import pytest
+import pytest_asyncio
 import yaml
+from fastapi import FastAPI
 
+from omnigent.db.utils import builtin_agent_id
 from omnigent.entities import Conversation
 from omnigent.entities.conversation import MessageData, NewConversationItem
+from omnigent.runtime.agent_cache import AgentCache
+from omnigent.server.app import _ensure_default_cursor_agent, create_app
 from omnigent.server.routes import sessions as sessions_module
 from omnigent.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
+from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+from omnigent.stores.artifact_store.local import LocalArtifactStore
+from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
+)
+from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+from omnigent.stores.permission_store.sqlalchemy_store import (
+    SqlAlchemyPermissionStore,
 )
 from tests.server.helpers import build_agent_bundle, create_test_agent
 
 pytestmark = pytest.mark.asyncio
+
+
+@dataclass
+class _SpawnAuthContext:
+    client: httpx.AsyncClient
+    agent_store: SqlAlchemyAgentStore
+
+
+@pytest_asyncio.fixture()
+async def spawn_auth_context(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+    mock_llm: Any,
+) -> AsyncIterator[_SpawnAuthContext]:
+    """Auth-enabled client plus its agent store for named-spawn tests."""
+    from omnigent.runtime import set_harness_process_manager
+    from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
+    from omnigent.server.auth import UnifiedAuthProvider
+
+    artifact_store = LocalArtifactStore(str(tmp_path / "spawn-auth-artifacts"))
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    agent_cache = AgentCache(
+        artifact_store=artifact_store,
+        cache_dir=tmp_path / "spawn-auth-cache",
+    )
+    _ensure_default_cursor_agent(agent_store, artifact_store, agent_cache)
+    app: FastAPI = create_app(
+        agent_store=agent_store,
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifact_store,
+        agent_cache=agent_cache,
+        comment_store=SqlAlchemyCommentStore(db_uri),
+        permission_store=SqlAlchemyPermissionStore(db_uri),
+        auth_provider=UnifiedAuthProvider(source="header", local_single_user=False),
+    )
+    process_manager = HarnessProcessManager(tmp_parent=tmp_path / "spawn-auth-harnesses")
+    await process_manager.start()
+    set_harness_process_manager(process_manager)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        yield _SpawnAuthContext(client=client, agent_store=agent_store)
+    mock_llm.release_all()
+    set_harness_process_manager(None)
+    await process_manager.shutdown()
 
 
 @pytest.fixture(autouse=True)
@@ -1141,6 +1202,7 @@ async def _create_parent_with_subagents(
     client: httpx.AsyncClient,
     name: str,
     sub_agents: list[dict[str, Any]],
+    headers: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """
     Register a bundle with harnessed sub-agents and create a parent session.
@@ -1150,6 +1212,7 @@ async def _create_parent_with_subagents(
     :param sub_agents: Sub-agent dicts with ``name`` + ``harness`` and an
         optional ``config`` mapping (see
         :func:`_bundle_with_harnessed_subagents`).
+    :param headers: Optional request headers, e.g. an authenticated user.
     :returns: A dict with ``session_id`` (the parent session) and
         ``agent_id`` (the durable agent id resolved from the session).
     """
@@ -1158,12 +1221,129 @@ async def _create_parent_with_subagents(
         "/v1/sessions",
         data={"metadata": json.dumps({})},
         files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
+        headers=headers,
     )
     assert resp.status_code == 201, f"parent create failed: {resp.text}"
     session_id = resp.json()["session_id"]
-    agent_resp = await client.get(f"/v1/sessions/{session_id}/agent")
+    agent_resp = await client.get(f"/v1/sessions/{session_id}/agent", headers=headers)
     assert agent_resp.status_code == 200, f"parent agent lookup failed: {agent_resp.text}"
     return {"session_id": session_id, "agent_id": agent_resp.json()["id"]}
+
+
+def _named_child_body(parent: dict[str, Any], agent: str, title: str) -> dict[str, str]:
+    """Build the JSON body used by named-mode ``sys_session_send`` creates."""
+    return {
+        "agent_id": parent["agent_id"],
+        "parent_session_id": parent["session_id"],
+        "title": f"{agent}:{title}",
+        "sub_agent_name": agent,
+    }
+
+
+async def test_bundled_parent_creates_two_named_children_sequentially(
+    spawn_auth_context: _SpawnAuthContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second named child does not re-authorize an ambiguous agent owner."""
+    headers = {"X-Forwarded-Email": "owner@example.com"}
+    parent = await _create_parent_with_subagents(
+        spawn_auth_context.client,
+        name="sequential-named-spawn",
+        sub_agents=[
+            {"name": "researcher", "harness": "claude-sdk"},
+            {"name": "reviewer", "harness": "claude-sdk"},
+        ],
+        headers=headers,
+    )
+    first = await spawn_auth_context.client.post(
+        "/v1/sessions",
+        json=_named_child_body(parent, "researcher", "first"),
+        headers=headers,
+    )
+    assert first.status_code == 201, first.text
+
+    original_get = spawn_auth_context.agent_store.get
+
+    def _get_with_ambiguous_owner(agent_id: str) -> Any:
+        agent = original_get(agent_id)
+        if agent is not None and agent.id == parent["agent_id"]:
+            return replace(agent, session_id="conv_stale_named_child_owner")
+        return agent
+
+    monkeypatch.setattr(spawn_auth_context.agent_store, "get", _get_with_ambiguous_owner)
+    second = await spawn_auth_context.client.post(
+        "/v1/sessions",
+        json=_named_child_body(parent, "reviewer", "second"),
+        headers=headers,
+    )
+    assert second.status_code == 201, second.text
+    assert first.json()["parent_session_id"] == parent["session_id"]
+    assert second.json()["parent_session_id"] == parent["session_id"]
+
+
+async def test_bundled_parent_creates_two_named_children_concurrently(
+    spawn_auth_context: _SpawnAuthContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Parallel named children rely on the authorized parent, not owner selection."""
+    headers = {"X-Forwarded-Email": "owner@example.com"}
+    parent = await _create_parent_with_subagents(
+        spawn_auth_context.client,
+        name="parallel-named-spawn",
+        sub_agents=[
+            {"name": "researcher", "harness": "claude-sdk"},
+            {"name": "reviewer", "harness": "claude-sdk"},
+        ],
+        headers=headers,
+    )
+    original_get = spawn_auth_context.agent_store.get
+
+    def _get_with_ambiguous_owner(agent_id: str) -> Any:
+        agent = original_get(agent_id)
+        if agent is not None and agent.id == parent["agent_id"]:
+            return replace(agent, session_id="conv_stale_named_child_owner")
+        return agent
+
+    monkeypatch.setattr(spawn_auth_context.agent_store, "get", _get_with_ambiguous_owner)
+    responses = await asyncio.gather(
+        spawn_auth_context.client.post(
+            "/v1/sessions",
+            json=_named_child_body(parent, "researcher", "parallel-a"),
+            headers=headers,
+        ),
+        spawn_auth_context.client.post(
+            "/v1/sessions",
+            json=_named_child_body(parent, "reviewer", "parallel-b"),
+            headers=headers,
+        ),
+    )
+    assert [response.status_code for response in responses] == [201, 201], [
+        response.text for response in responses
+    ]
+
+
+async def test_builtin_agent_direct_child_create_is_unaffected(
+    spawn_auth_context: _SpawnAuthContext,
+) -> None:
+    """A direct child created from a builtin agent keeps the existing path."""
+    headers = {"X-Forwarded-Email": "owner@example.com"}
+    parent = await _create_parent_with_subagents(
+        spawn_auth_context.client,
+        name="builtin-direct-spawn-parent",
+        sub_agents=[{"name": "researcher", "harness": "claude-sdk"}],
+        headers=headers,
+    )
+    response = await spawn_auth_context.client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": builtin_agent_id("cursor-native-ui"),
+            "parent_session_id": parent["session_id"],
+            "title": "direct builtin child",
+        },
+        headers=headers,
+    )
+    assert response.status_code == 201, response.text
+    assert response.json()["parent_session_id"] == parent["session_id"]
 
 
 @pytest.mark.parametrize(

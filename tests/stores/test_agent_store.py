@@ -92,6 +92,65 @@ def test_get_by_name_and_list_hide_session_scoped_agents(
     assert template_agent.name in listed_names
 
 
+def test_get_session_scoped_agent_uses_earliest_conversation(
+    agent_store: SqlAlchemyAgentStore,
+    db_uri: str,
+) -> None:
+    """Session ownership is deterministic when named children share an agent."""
+    engine = get_or_create_engine(db_uri)
+    with engine.begin() as conn:
+        conn.execute(
+            sa.text(
+                "INSERT INTO agents "
+                "(id, created_at, name, bundle_location, version, kind) "
+                "VALUES (:id, :ts, :name, :loc, 1, 2)",
+            ),
+            {
+                "id": "ag_shared_session",
+                "ts": 100,
+                "name": "shared-session-agent",
+                "loc": "ag_shared_session/bundle",
+            },
+        )
+        conn.execute(
+            sa.text(
+                "INSERT INTO conversations "
+                "(id, created_at, updated_at, root_conversation_id) "
+                "VALUES (:id, :ts, :ts, :id)",
+            ),
+            {
+                "id": "conv_newer_reference",
+                "ts": 300,
+            },
+        )
+        conn.execute(
+            sa.text(
+                "INSERT INTO conversations "
+                "(id, created_at, updated_at, root_conversation_id) "
+                "VALUES (:id, :ts, :ts, :id)",
+            ),
+            {
+                "id": "conv_original_owner",
+                "ts": 200,
+            },
+        )
+        conn.execute(
+            sa.text(
+                "INSERT INTO agent_configuration (conversation_id, agent_id) "
+                "VALUES (:newer_id, :agent_id), (:owner_id, :agent_id)",
+            ),
+            {
+                "newer_id": "conv_newer_reference",
+                "owner_id": "conv_original_owner",
+                "agent_id": "ag_shared_session",
+            },
+        )
+
+    fetched = agent_store.get("ag_shared_session")
+    assert fetched is not None
+    assert fetched.session_id == "conv_original_owner"
+
+
 def test_create_with_description(agent_store: SqlAlchemyAgentStore) -> None:
     agent = agent_store.create(
         agent_id="ag_test_helper",
