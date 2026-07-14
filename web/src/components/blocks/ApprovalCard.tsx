@@ -75,31 +75,11 @@ function extractOptionLabels(schema: Record<string, unknown>): string[] {
   return enumValues.filter((v): v is string => typeof v === "string" && v.length > 0);
 }
 
-/**
- * Parse a policy-ASK tool-call preview into a renderable structure —
- * the generic path for EVERY policy-gated tool (Jira transitions, M365
- * sends, future consumers), with no tool-name branching:
- *
- * - ``context`` — the platform ``approval_context`` convention: a tool
- *   may accept an optional ``approval_context`` string argument that an
- *   agent fills with its human-facing summary/recommendation. When
- *   present it is promoted to prose at the top of the card and omitted
- *   from the argument block.
- * - ``args`` — the remaining call arguments, rendered as a labeled
- *   field block (see ``ToolArgEntries``) instead of a raw JSON dump.
- * - ``name`` — the gated tool's name (shown as the block caption).
- *
- * Handles the three producer shapes ``previewFormat.ts`` documents:
- * the ``{name, arguments}`` envelope, the bare arguments object the
- * runner policy gate emits, and the ``ToolName({...})`` permission-hook
- * form. Returns ``null`` for anything unparseable — including previews
- * cut mid-token by the server-side 1024-char ``content_preview`` cap —
- * and the card then falls back to the raw-preview render unchanged.
- */
+/** Parse a tool-call preview without hiding fields from malformed or bare payloads. */
 function parseToolCallPreview(
   raw: string,
 ): { name: string | null; context: string | null; args: Record<string, unknown> } | null {
-  // Shape 2: ``ToolName({...})`` — the native permission-hook preview.
+  // Shape 2: ``ToolName({...})``, used by native permission hooks.
   let name: string | null = null;
   let jsonText = raw;
   const hookMatch = raw.trim().match(/^([A-Za-z0-9_.:-]+)\((\{[\s\S]*\})\)$/);
@@ -115,34 +95,31 @@ function parseToolCallPreview(
   }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
   const record = parsed as Record<string, unknown>;
-  // Shape 1: the ``{name, arguments}`` envelope (MCP-style tool call).
-  // Shape 3: a bare arguments object (the runner policy-ASK preview).
+  // Only the exact MCP shape is an envelope. A bare policy payload may
+  // legitimately contain an object-valued `arguments` field.
   let args: Record<string, unknown>;
-  if (
-    record.arguments &&
+  const isEnvelope =
+    !hookMatch &&
+    typeof record.name === "string" &&
+    record.name !== "" &&
+    !!record.arguments &&
     typeof record.arguments === "object" &&
-    !Array.isArray(record.arguments)
-  ) {
+    !Array.isArray(record.arguments) &&
+    Object.keys(record).every((key) => key === "name" || key === "arguments");
+  if (isEnvelope) {
     args = { ...(record.arguments as Record<string, unknown>) };
-    if (typeof record.name === "string" && record.name) name = record.name;
+    name = record.name as string;
   } else {
     args = { ...record };
   }
   if (Object.keys(args).length === 0) return null;
   const rawContext = args.approval_context;
   const context = typeof rawContext === "string" && rawContext.trim() ? rawContext.trim() : null;
-  delete args.approval_context;
+  if (typeof rawContext === "string") delete args.approval_context;
   return { name, context, args };
 }
 
-/**
- * Labeled, type-aware render of a gated tool call's arguments —
- * derived from the argument values themselves (schema-agnostic; if the
- * card ever gains access to the tool's input JSON Schema, titles and
- * descriptions slot in here). Scalars render inline; long or multiline
- * strings (message bodies, justifications) render pre-wrapped;
- * objects/arrays render as compact pretty JSON.
- */
+/** Render tool arguments as labeled, type-aware fields. */
 function ToolArgEntries({ args }: { args: Record<string, unknown> }) {
   const entries = Object.entries(args);
   if (entries.length === 0) return null;
