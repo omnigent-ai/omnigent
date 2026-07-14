@@ -82,12 +82,12 @@ export function SharingPage() {
 
   if (!isSingleUser && meIsAdmin === false) {
     return (
-      <div className="mx-auto w-full max-w-2xl px-6 py-12">
+      <PageScroll contentClassName="px-8" extraBottom="2.5rem">
         <h1 className="mb-2 text-2xl font-semibold">Session sharing</h1>
         <p className="text-sm text-muted-foreground">
           You don't have permission to manage session sharing.
         </p>
-      </div>
+      </PageScroll>
     );
   }
 
@@ -109,8 +109,8 @@ export function SharingPage() {
   }
 
   return (
-    <PageScroll contentClassName="px-6">
-      <div className="mx-auto w-full max-w-2xl py-2">
+    <PageScroll contentClassName="px-8" extraBottom="2.5rem">
+      <div>
         <div className="mb-6">
           <h1 className="text-2xl font-semibold">Session sharing</h1>
           <p className="mt-1 text-sm text-muted-foreground">

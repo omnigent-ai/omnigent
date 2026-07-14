@@ -112,12 +112,12 @@ export function MembersPage() {
 
   if (isSingleUser) {
     return (
-      <div className="mx-auto w-full max-w-2xl px-6 py-12">
+      <PageScroll contentClassName="px-8" extraBottom="2.5rem">
         <h1 className="mb-2 text-2xl font-semibold">Members</h1>
         <p className="text-sm text-muted-foreground">
           Member management is not available in single-user mode.
         </p>
-      </div>
+      </PageScroll>
     );
   }
 
@@ -137,12 +137,12 @@ export function MembersPage() {
   // Non-admin: hard stop. Server would also 403, this is just UX.
   if (meIsAdmin === false) {
     return (
-      <div className="mx-auto w-full max-w-2xl px-6 py-12">
+      <PageScroll contentClassName="px-8" extraBottom="2.5rem">
         <h1 className="mb-2 text-2xl font-semibold">Members</h1>
         <p className="text-sm text-muted-foreground">
           You don't have permission to manage members.
         </p>
-      </div>
+      </PageScroll>
     );
   }
 
@@ -189,7 +189,7 @@ export function MembersPage() {
   }
 
   return (
-    <PageScroll contentClassName="px-6">
+    <PageScroll contentClassName="px-8" extraBottom="2.5rem">
       <div className="mb-6 flex items-center justify-between">
         <h1 className="text-2xl font-semibold">Members</h1>
         {/* Invite mints a password-backed account — accounts mode only.

@@ -476,12 +476,12 @@ export function PoliciesPage() {
 
   if (!isSingleUser && meIsAdmin === false) {
     return (
-      <div className="mx-auto w-full max-w-2xl px-6 py-12">
+      <PageScroll contentClassName="px-8" extraBottom="2.5rem">
         <h1 className="mb-2 text-2xl font-semibold">Global Policies</h1>
         <p className="text-sm text-muted-foreground">
           You don't have permission to manage global policies.
         </p>
-      </div>
+      </PageScroll>
     );
   }
 
@@ -502,7 +502,7 @@ export function PoliciesPage() {
   }
 
   return (
-    <PageScroll contentClassName="px-6">
+    <PageScroll contentClassName="px-8" extraBottom="2.5rem">
       <div className="mb-6 flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-semibold">Global Policies</h1>
