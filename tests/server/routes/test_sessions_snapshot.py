@@ -728,6 +728,7 @@ async def test_session_snapshot_serves_pi_model_options_from_extension_push(
 
     _mod._persist_external_model_options(
         "conv_pi_options",
+        conv,
         SessionEventInput(
             type="external_model_options",
             data={

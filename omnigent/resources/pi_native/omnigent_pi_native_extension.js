@@ -843,8 +843,19 @@ async function applyModelChange(pi, config, ctx, modelId) {
   const id = typeof modelId === "string" ? modelId.trim() : "";
   if (!id) return false;
   const registry = ctx ? ctx.modelRegistry : undefined;
-  const canResolve = registry && typeof registry.getAll === "function";
-  if (!pi || typeof pi.setModel !== "function" || !canResolve) {
+  // Resolve against whichever listing method exists. Accept EITHER getAll or
+  // getAvailable so the resolve path can never be narrower than the picker's:
+  // postModelOptions lists from getAvailable(), so gating apply on getAll alone
+  // would fail every switch on a hypothetical Pi build exposing only
+  // getAvailable. getAll (the full catalog) is a superset of getAvailable, so
+  // prefer it to resolve; fall back to getAvailable when getAll is absent.
+  const listModels =
+    registry && typeof registry.getAll === "function"
+      ? () => registry.getAll()
+      : registry && typeof registry.getAvailable === "function"
+        ? () => registry.getAvailable()
+        : null;
+  if (!pi || typeof pi.setModel !== "function" || !listModels) {
     await postModelChangeError(
       config,
       `Omnigent: could not switch to model "${id}" — this Pi session exposes ` +
@@ -854,7 +865,7 @@ async function applyModelChange(pi, config, ctx, modelId) {
   }
   let model;
   try {
-    model = registry.getAll().find((m) => m && m.id === id);
+    model = listModels().find((m) => m && m.id === id);
   } catch (_err) {
     model = undefined;
   }
@@ -1074,11 +1085,9 @@ function startInboxPoller(pi, config, handleInterrupt, handleCompact, handleMode
         // handleModelChange owns its visible-error item and posts nothing on
         // success — the paired model_select handler mirrors the applied model
         // back — so the returned promise is intentionally discarded.
-        if (typeof handleModelChange === "function") {
-          handleModelChange(
-            typeof payload.model === "string" ? payload.model : undefined,
-          );
-        }
+        handleModelChange(
+          typeof payload.model === "string" ? payload.model : undefined,
+        );
       }
       if (id !== null) rememberSeen(id);
       try {

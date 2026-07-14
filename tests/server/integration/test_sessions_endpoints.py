@@ -5334,6 +5334,32 @@ async def test_post_external_model_options_empty_evicts_cache(
     assert "external_model_options" in bad.text
 
 
+async def test_post_external_model_options_rejects_non_pi_native_session(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    ``external_model_options`` is only accepted for pi-native sessions.
+
+    Only ``_fetch_model_options`` serves this cache for the pi-native wrapper,
+    so accepting a push from any other session would just leave a stray cache
+    entry alive until teardown. The route rejects it at ingest (400) and writes
+    nothing, keeping the contract explicit.
+    """
+    from omnigent.server.routes import sessions as _mod
+
+    agent = await create_test_agent(client)
+    # A plain (non-native) session — no pi-native wrapper label.
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_model_options", "data": {"models": [{"id": "m-1"}]}},
+    )
+    assert resp.status_code == 400, resp.text
+    assert "external_model_options" in resp.text
+    assert session["id"] not in _mod._pushed_model_options_cache
+
+
 async def test_post_external_reasoning_effort_change_publishes_session_effort(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,

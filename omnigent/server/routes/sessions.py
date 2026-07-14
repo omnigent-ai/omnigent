@@ -3669,16 +3669,25 @@ async def _persist_external_model_change(
     session_stream.publish(session_id, event.model_dump())
 
 
-def _persist_external_model_options(session_id: str, body: SessionEventInput) -> None:
+def _persist_external_model_options(
+    session_id: str,
+    conv: Conversation,
+    body: SessionEventInput,
+) -> None:
     """
     Record the model catalog a native harness's extension reported.
 
     Sourced from the harness's live model registry (pi-native:
-    ``ctx.modelRegistry.getAll()``), so it reflects the models the harness
-    actually loaded no matter how it authenticated — an Omnigent-configured
-    provider OR the harness's own ``/login``. This is why the pi picker
-    populates even in the ``/login`` path, where no ``models.json`` is written
-    into the bridge dir for the runner file-read to find.
+    ``ctx.modelRegistry.getAvailable()``), so it reflects the models the
+    harness actually loaded no matter how it authenticated — an
+    Omnigent-configured provider OR the harness's own ``/login``. This is why
+    the pi picker populates even in the ``/login`` path, where no
+    ``models.json`` is written into the bridge dir for a file-read to find.
+
+    Gated to the pi-native wrapper: only :func:`_fetch_model_options` *serves*
+    this cache for pi-native, so accepting a push from any other session would
+    just leave a stray cache entry alive until teardown. Reject at ingest to
+    keep the contract explicit.
 
     Stores into :data:`_pushed_model_options_cache` (which a browser reload
     does NOT clear — the extension only pushes on session start) and publishes
@@ -3687,10 +3696,17 @@ def _persist_external_model_options(session_id: str, body: SessionEventInput) ->
 
     :param session_id: Session/conversation identifier, e.g.
         ``"conv_abc123"``.
+    :param conv: Conversation row whose labels identify the wrapper.
     :param body: External model-options event body. ``data.models`` must be a
         list of ``{"id": str, ...}`` objects.
-    :raises OmnigentError: If ``data.models`` is missing or malformed.
+    :raises OmnigentError: If the session is not pi-native, or ``data.models``
+        is missing or malformed.
     """
+    if conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY) != _PI_NATIVE_WRAPPER_LABEL_VALUE:
+        raise OmnigentError(
+            "external_model_options is only accepted for pi-native sessions",
+            code=ErrorCode.INVALID_INPUT,
+        )
     raw_models = body.data.get("models")
     if not isinstance(raw_models, list):
         raise OmnigentError(
@@ -19830,7 +19846,7 @@ def create_sessions_router(
             )
             return {"queued": False}
         if body.type == _EXTERNAL_MODEL_OPTIONS_TYPE:
-            _persist_external_model_options(session_id, body)
+            _persist_external_model_options(session_id, conv, body)
             return {"queued": False}
         if body.type == _EXTERNAL_REASONING_EFFORT_CHANGE_TYPE:
             await _persist_external_reasoning_effort_change(
