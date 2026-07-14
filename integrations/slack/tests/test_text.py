@@ -1,4 +1,24 @@
-from omnigent_slack.text import split_for_slack, strip_bot_mention, truncate_for_slack
+from omnigent_slack.text import (
+    split_for_slack,
+    strip_bot_mention,
+    to_mrkdwn,
+    truncate_for_slack,
+)
+
+
+def test_to_mrkdwn_converts_markdown_to_slack_dialect() -> None:
+    result = to_mrkdwn("# Title\n\n**bold** and [link](https://example.com)")
+    # Bold collapses to single asterisks, headings lose '#', links become <url|text>.
+    assert "**" not in result
+    assert "*bold*" in result
+    assert "<https://example.com|link>" in result
+    assert "#" not in result
+
+
+def test_to_mrkdwn_preserves_code_blocks() -> None:
+    result = to_mrkdwn("```python\nprint('hi')\n```")
+    assert "```" in result
+    assert "print('hi')" in result
 
 
 def test_strip_bot_mention_removes_target_mention() -> None:

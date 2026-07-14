@@ -2,8 +2,20 @@ from __future__ import annotations
 
 import re
 
+from markdown_to_mrkdwn import SlackMarkdownConverter
+
 MENTION_RE = re.compile(r"<@([A-Z0-9]+)(?:\|[^>]+)?>")
 WHITESPACE_RE = re.compile(r"\s+")
+
+# Slack renders its own `mrkdwn` dialect, not standard Markdown (e.g. *bold* is
+# single-asterisk, links are <url|text>). Reuse one converter instance — it
+# compiles regex patterns on init.
+_MRKDWN_CONVERTER = SlackMarkdownConverter()
+
+
+def to_mrkdwn(text: str) -> str:
+    """Convert standard Markdown to Slack's mrkdwn dialect for display."""
+    return str(_MRKDWN_CONVERTER.convert(text))
 
 
 def strip_bot_mention(text: str, bot_user_id: str | None) -> str:

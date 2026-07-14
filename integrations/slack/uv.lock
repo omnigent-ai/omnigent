@@ -491,6 +491,15 @@ wheels = [
 ]
 
 [[package]]
+name = "markdown-to-mrkdwn"
+version = "0.3.3"
+source = { registry = "https://pypi-proxy.cloud.databricks.com/simple" }
+sdist = { url = "https://pypi-proxy.cloud.databricks.com/packages/44/9a/701c308edbac6fed7d6b25101e2877729c839328ff172cb87d9ff49b05d2/markdown_to_mrkdwn-0.3.3.tar.gz", hash = "sha256:5a2c0c8b8b73eb1051fe82d1a2ae9864d72bf7f6877f8add9589d01de33defd4", upload-time = "2026-05-27T09:46:16.911Z" }
+wheels = [
+    { url = "https://pypi-proxy.cloud.databricks.com/packages/1d/16/1a1bf1ddfa5dd811e95faeacf29fd34907eaea1c4456c603adeee036b725/markdown_to_mrkdwn-0.3.3-py3-none-any.whl", hash = "sha256:4164538e370aea9a5b5e0ee688128b722c1d14d9f9fbd6014745273eca63032f", upload-time = "2026-05-27T09:46:15.78Z" },
+]
+
+[[package]]
 name = "multidict"
 version = "6.7.1"
 source = { registry = "https://pypi-proxy.cloud.databricks.com/simple" }
@@ -675,6 +684,7 @@ dependencies = [
     { name = "aiohttp" },
     { name = "aiosqlite" },
     { name = "httpx" },
+    { name = "markdown-to-mrkdwn" },
     { name = "pydantic-settings" },
     { name = "python-dotenv" },
     { name = "slack-bolt" },
@@ -694,6 +704,7 @@ requires-dist = [
     { name = "aiohttp", specifier = ">=3.12.0" },
     { name = "aiosqlite", specifier = ">=0.21.0" },
     { name = "httpx", specifier = ">=0.28.0" },
+    { name = "markdown-to-mrkdwn", specifier = ">=0.3.3" },
     { name = "pydantic-settings", specifier = ">=2.10.0" },
     { name = "python-dotenv", specifier = ">=1.1.0" },
     { name = "slack-bolt", specifier = ">=1.23.0" },

@@ -11,6 +11,7 @@ dependencies = [
     "pydantic-settings>=2.10.0",
     "python-dotenv>=1.1.0",
     "slack-bolt>=1.23.0",
+    "markdown-to-mrkdwn>=0.3.3",
 ]
 
 [project.scripts]
@@ -46,6 +47,7 @@ warn_unreachable = true
 module = [
     "slack_bolt.*",
     "slack_sdk.*",
+    "markdown_to_mrkdwn.*",
 ]
 ignore_missing_imports = true
 

@@ -17,6 +17,7 @@ from omnigent_slack.text import (
     normalize_whitespace,
     split_for_slack,
     strip_bot_mention,
+    to_mrkdwn,
     truncate_for_slack,
 )
 
@@ -275,10 +276,12 @@ class SlackOmnigentService:
         message_ts: str,
         text: str,
     ) -> None:
-        # A single Slack message can't hold a long assistant answer, so split it
-        # and edit the placeholder to the first chunk, posting the rest as thread
-        # replies. This delivers the full answer instead of truncating it.
-        chunks = split_for_slack(text)
+        # The server returns standard Markdown; convert it to Slack's mrkdwn
+        # dialect before display. A single Slack message can't hold a long
+        # answer, so split the converted text and edit the placeholder to the
+        # first chunk, posting the rest as thread replies — delivering the full
+        # answer instead of truncating it.
+        chunks = split_for_slack(to_mrkdwn(text))
         await self._update_slack(client, key, message_ts, chunks[0])
         for chunk in chunks[1:]:
             await client.chat_postMessage(
