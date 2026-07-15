@@ -1804,13 +1804,21 @@ def _parse_kubernetes_resources(raw: dict[str, object]) -> dict[str, object] | N
     return normalized
 
 
-# Path prefixes a pvc_mounts mount_path may not shadow: the runner's
-# writable-HOME emptyDir (mirrors the launcher's _HOME_DIR — pinned by test),
-# Kubernetes Secret projections, the image's OS / scratch directories, and
-# /opt (the host image's omnigent venv lives at /opt/venv).
+# Path prefixes a pvc_mounts mount_path may not overlap — neither sitting at
+# or under one, nor mounting over one from an ancestor (a PVC at /home would
+# shadow the /home/omnigent mountpoint): the runner's writable-HOME emptyDir
+# (mirrors the launcher's _HOME_DIR — pinned by test), Kubernetes Secret
+# projections, the image's OS / scratch directories, and /opt (the host
+# image's omnigent venv lives at /opt/venv).
 _KUBERNETES_RESERVED_MOUNT_PREFIXES: tuple[str, ...] = (
     "/home/omnigent",
-    "/var/run/secrets",
+    # Secret projections live under /var/run/secrets; the Debian-based host
+    # image symlinks /var/run -> /run and /var/lock -> /run/lock, so every
+    # spelling is reserved in full to keep the lexical check consistent
+    # across the aliases.
+    "/var/run",
+    "/var/lock",
+    "/run",
     "/tmp",
     "/etc",
     "/usr",
@@ -1879,12 +1887,13 @@ def _parse_kubernetes_pvc_mounts(raw: dict[str, object]) -> list[dict[str, objec
                 f"path (no '..', '.', doubled or trailing slashes): {mount!r}"
             )
         if mount == "/" or any(
-            mount == p or mount.startswith(p + "/") for p in _KUBERNETES_RESERVED_MOUNT_PREFIXES
+            mount == p or mount.startswith(p + "/") or p.startswith(mount + "/")
+            for p in _KUBERNETES_RESERVED_MOUNT_PREFIXES
         ):
             raise ValueError(
-                f"server config '{path_prefix}.mount_path' is a reserved path: "
-                f"{mount!r} (the runner's HOME, Secret projections, and OS "
-                "directories cannot be shadowed)"
+                f"server config '{path_prefix}.mount_path' overlaps a reserved "
+                f"path: {mount!r} (the runner's HOME, Secret projections, and OS "
+                "directories cannot be shadowed or mounted over)"
             )
         read_only = entry.get("read_only", True)
         if not isinstance(read_only, bool):

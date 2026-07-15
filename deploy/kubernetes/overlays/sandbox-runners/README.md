@@ -151,7 +151,9 @@ output directories) mount pre-created PersistentVolumeClaims:
    (NFS/SMB CSI drivers, SAN, cloud disks). Omnigent only references the claim;
    it never creates volumes, so the server RBAC stays unchanged.
 2. List the claims under `sandbox.kubernetes.pvc_mounts` (see
-   `sandbox-config.yaml`). Mount paths must sit outside `/home/omnigent`.
+   `sandbox-config.yaml`). Mount paths may not overlap `/home/omnigent`, the
+   OS directories, or their ancestors (e.g. `/home`, `/var`) — the server
+   rejects such config at startup.
 
 Caveats:
 

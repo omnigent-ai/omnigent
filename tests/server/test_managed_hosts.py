@@ -764,6 +764,8 @@ def test_parse_kubernetes_without_pvc_mounts_is_none(monkeypatch: pytest.MonkeyP
         ([{"claim_name": "c", "mount_path": "mnt/x"}], "absolute"),
         ([{"claim_name": "c", "mount_path": "/mnt/../etc"}], "normalized"),
         ([{"claim_name": "c", "mount_path": "/mnt/x/"}], "normalized"),
+        ([{"claim_name": "c", "mount_path": "/home//omnigent"}], "normalized"),
+        ([{"claim_name": "c", "mount_path": "/home/./omnigent"}], "normalized"),
         # Exactly two leading slashes survive posixpath.normpath (POSIX) but
         # the kernel collapses them, so '//home/omnigent' would shadow HOME.
         ([{"claim_name": "c", "mount_path": "//home/omnigent"}], "normalized"),
@@ -771,6 +773,21 @@ def test_parse_kubernetes_without_pvc_mounts_is_none(monkeypatch: pytest.MonkeyP
         ([{"claim_name": "c", "mount_path": "/"}], "reserved"),
         ([{"claim_name": "c", "mount_path": "/home/omnigent/data"}], "reserved"),
         ([{"claim_name": "c", "mount_path": "/var/run/secrets/x"}], "reserved"),
+        # Ancestors of reserved paths: a PVC at /home would mount over the
+        # HOME emptyDir's /home/omnigent mountpoint (likewise /var, /var/run
+        # over the Secret projections).
+        ([{"claim_name": "c", "mount_path": "/home"}], "reserved"),
+        ([{"claim_name": "c", "mount_path": "/var"}], "reserved"),
+        ([{"claim_name": "c", "mount_path": "/var/run"}], "reserved"),
+        # /var/run -> /run and /var/lock -> /run/lock on the Debian-based
+        # host image: every spelling of any path under them must be
+        # rejected, not just the secrets subtree.
+        ([{"claim_name": "c", "mount_path": "/run"}], "reserved"),
+        ([{"claim_name": "c", "mount_path": "/run/secrets"}], "reserved"),
+        ([{"claim_name": "c", "mount_path": "/run/cache"}], "reserved"),
+        ([{"claim_name": "c", "mount_path": "/var/run/cache"}], "reserved"),
+        ([{"claim_name": "c", "mount_path": "/var/lock"}], "reserved"),
+        ([{"claim_name": "c", "mount_path": "/var/lock/cache"}], "reserved"),
         ([{"claim_name": "c", "mount_path": "/tmp"}], "reserved"),
         ([{"claim_name": "c", "mount_path": "/etc"}], "reserved"),
         # /opt hosts the image's omnigent venv (/opt/venv).
@@ -807,6 +824,21 @@ def test_parse_kubernetes_pvc_mounts_invalid_fails_loud(
                 "kubernetes": {"pvc_mounts": pvc_mounts},
             }
         )
+
+
+@pytest.mark.parametrize(
+    "mount_path", ["/home/other", "/home/omnigent-data", "/var/lib", "/runway"]
+)
+def test_parse_kubernetes_pvc_mounts_reserved_check_is_segment_aware(mount_path: str) -> None:
+    """Siblings sharing a string prefix with a reserved path (or its parent) are allowed."""
+    cfg = parse_sandbox_config(
+        {
+            "provider": "kubernetes",
+            "server_url": "http://s.svc.cluster.local",
+            "kubernetes": {"pvc_mounts": [{"claim_name": "c", "mount_path": mount_path}]},
+        }
+    )
+    assert cfg is not None
 
 
 def test_parse_kubernetes_pvc_mounts_sibling_prefix_is_not_nested() -> None:
