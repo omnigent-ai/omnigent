@@ -289,6 +289,9 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
     from omnigent.stores.permission_store.sqlalchemy_store import (
         SqlAlchemyPermissionStore,
     )
+    from omnigent.stores.policy_store.sqlalchemy_store import (
+        SqlAlchemyPolicyStore,
+    )
 
     telemetry.init()
 
@@ -297,6 +300,7 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
     conversation_store = SqlAlchemyConversationStore(database_url)
     comment_store = SqlAlchemyCommentStore(database_url)
     permission_store = SqlAlchemyPermissionStore(database_url)
+    policy_store = SqlAlchemyPolicyStore(database_url)
     host_store = HostStore(database_url)
     # Fail startup loud on a malformed `sandbox:` section (an operator
     # typo should not surface as a runtime 502 on the first managed
@@ -343,6 +347,12 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
         agent_cache=agent_cache,
         comment_store=comment_store,
         permission_store=permission_store,
+        # Without this, create_app leaves policy_store=None, which disables the
+        # session-policy and default-policy CRUD endpoints for every Docker
+        # deploy — see the router guards in omnigent/server/app.py. The CLI
+        # (`omnigent server`) already wires this store; the Docker entrypoint
+        # is the odd one out.
+        policy_store=policy_store,
         host_store=host_store,
         auth_provider=auth_provider,
         account_store=account_store,
