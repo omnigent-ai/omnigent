@@ -40,10 +40,25 @@ import {
   monacoLanguageId,
   resolvedThemeToMonaco,
 } from "./monacoSetup";
+import type { monaco } from "./monacoSetup";
 import { useMonacoCommentLayer, type CodeEditorInstance } from "./useMonacoCommentLayer";
 import "./monacoCodeEditor.css";
 
 type EditorOptions = EditorProps["options"];
+
+// Monaco's find contribution isn't a public export, so we reach it by its
+// registered id and describe only the slice of its API we drive: read whether
+// the find widget is open, close it, and subscribe to open/close changes.
+const FIND_CONTROLLER_ID = "editor.contrib.findController";
+interface FindController extends monaco.editor.IEditorContribution {
+  getState(): {
+    readonly isRevealed: boolean;
+    onFindReplaceStateChange(listener: (e: { isRevealed: boolean }) => void): {
+      dispose(): void;
+    };
+  };
+  closeFindWidget(): void;
+}
 
 // How long the transient "Saved" badge stays up before the status chip clears
 // itself back to idle — long enough to register, short enough not to linger.
@@ -74,12 +89,16 @@ interface MonacoCodeEditorProps extends CommentProps {
   /** Reports the auto-save lifecycle up to FileViewer's toolbar status chip. */
   onSaveStatusChange?: (status: SaveStatus) => void;
   /**
-   * True when the FileViewer "Find in file" button wants Monaco's native find
-   * opened. The editor opens find once it has mounted (so a request made while
-   * the lazy chunk is still loading isn't dropped), then calls onSearchHandled.
+   * Toolbar "Find in file" toggle. The editor mirrors Monaco's native find
+   * widget to this flag once mounted (so a request made while the lazy chunk is
+   * still loading isn't dropped): true opens find, false closes it.
    */
   searchOpen?: boolean;
-  /** Called after the editor has opened find, so the parent can reset the flag. */
+  /**
+   * Called when the find widget is closed from within Monaco (Escape or the
+   * widget's ✕) so the parent can reset the toggle and keep the toolbar button
+   * in sync — otherwise the next click would no-op instead of re-opening.
+   */
   onSearchHandled?: () => void;
 }
 
@@ -320,16 +339,38 @@ function MonacoCodeEditorInner({
     [setContentRef],
   );
 
-  // Open Monaco's native find when the toolbar requests it. Gated on `mounted`
-  // so a Find pressed while the lazy chunk was still loading isn't dropped —
-  // when the editor mounts, `mounted` flips and this re-runs with searchOpen
-  // still true. Calling getAction before the find contribution loads would
-  // no-op, which is why we wait for the editor instance.
+  // Mirror Monaco's native find widget to the toolbar toggle. Gated on `mounted`
+  // so a Find pressed while the lazy chunk was still loading isn't dropped — when
+  // the editor mounts, `mounted` flips and this re-runs with the current flag.
+  // `searchOpen` true opens find; false closes it (so re-clicking the toolbar
+  // button, which toggles the flag, hides the widget). The controller drives the
+  // close directly rather than the open action so it's a real toggle, not a
+  // second open.
   useEffect(() => {
-    if (!mounted || !searchOpen) return;
-    editorInstanceRef.current?.getAction("actions.find")?.run();
-    onSearchHandled?.();
-  }, [mounted, searchOpen, onSearchHandled]);
+    if (!mounted) return;
+    const editor = editorInstanceRef.current;
+    if (!editor) return;
+    if (searchOpen) {
+      editor.getAction("actions.find")?.run();
+    } else {
+      const controller = editor.getContribution<FindController>(FIND_CONTROLLER_ID);
+      if (controller?.getState().isRevealed) controller.closeFindWidget();
+    }
+  }, [mounted, searchOpen]);
+
+  // Reflect a find close initiated inside Monaco (Escape or the widget's ✕) back
+  // to the toolbar toggle, so its state matches the visible widget and the next
+  // click re-opens instead of no-opping.
+  useEffect(() => {
+    if (!mounted) return;
+    const controller =
+      editorInstanceRef.current?.getContribution<FindController>(FIND_CONTROLLER_ID);
+    if (!controller) return;
+    const sub = controller.getState().onFindReplaceStateChange((e) => {
+      if (e.isRevealed && !controller.getState().isRevealed) onSearchHandled?.();
+    });
+    return () => sub.dispose();
+  }, [mounted, onSearchHandled]);
 
   const handleChange: OnChange = useCallback(
     (value) => {

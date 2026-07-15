@@ -36,3 +36,14 @@
   --vscode-editor-background: var(--card);
   --vscode-editorGutter-background: var(--card);
 }
+
+/* Suppress the keyboard-hint tooltips Monaco attaches to its widget buttons
+   (e.g. the find widget's "Close (Escape)"). They render detached on <body> and
+   overlap the small floating find widget, reading as flaky. Monaco is the only
+   source of .monaco-hover in this app (the rest of the UI uses its own tooltip),
+   and this editor ships no language services, so no useful content hovers are
+   lost. The pointer caret element is hidden alongside it. */
+.monaco-hover.workbench-hover,
+.workbench-hover-pointer {
+  display: none !important;
+}
