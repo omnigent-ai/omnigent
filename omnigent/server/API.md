@@ -1058,6 +1058,44 @@ which is what policy ASK gates rely on, so the verdict cannot be
 conflated with a generic session event. Any value other than
 `action: "accept"` denies.
 
+### Resolve Supervisor Session
+
+```
+POST /api/supervisor-sessions/{sessionId}/resolve
+Content-Type: application/json
+
+{
+  "decision": "approve",
+  "auditMetadata": {
+    "source": "teams",
+    "messageId": "19:abc123"
+  }
+}
+
+202 Accepted
+{"queued": false}
+
+404 Not Found — session missing, or the session has no visible pending
+    elicitation to resolve
+422 Unprocessable Entity — request body fails validation (for example,
+    `decision` is not `approve` or `deny`)
+```
+
+This is the stable adapter used by the Teams reply-bridge. The route is
+session-scoped and documented intentionally so callers do not depend on
+the internal elicitation id or on the internal `/v1/.../elicitations/...`
+path shape.
+
+Auth: same access gate as the internal resolve route, `LEVEL_EDIT` on the
+session. The adapter looks up the currently pending elicitation visible in
+that supervisor session snapshot, maps `decision: "approve"` to the
+internal `accept` action and `decision: "deny"` to `decline`, then
+delegates to the existing resolver. If the visible prompt is a mirrored
+child-session elicitation, the adapter follows `params.target_session_id`
+and resolves the owning child session.
+
+Example response is always the synchronous acknowledgement body above.
+
 ### Fork Session
 
 ```

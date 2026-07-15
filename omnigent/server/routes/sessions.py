@@ -265,6 +265,8 @@ from omnigent.server.schemas import (
     SessionTodosEvent,
     SessionUsageEvent,
     SkillSummary,
+    SupervisorSessionResolveRequest,
+    SupervisorSessionResolveResponse,
     UpdateSessionRequest,
 )
 from omnigent.session_lifecycle import (
@@ -19160,8 +19162,7 @@ def create_sessions_router(
 
     @router.post(
         "/sessions/{session_id}/elicitations/{elicitation_id}/resolve",
-        # Internal elicitation flow — hidden from the public API reference.
-        include_in_schema=False,
+        # Supported URL-based elicitation resolution for approval UIs.
         status_code=202,
         # response_model=None: the body is a small acknowledgement
         # dict, not a domain model.
@@ -21448,6 +21449,146 @@ def create_sessions_router(
             )
 
         return _mcp_error_response(rpc_id, -32601, f"Method not found: {method!r}")
+
+    return router
+
+
+def create_supervisor_sessions_router(
+    conversation_store: ConversationStore,
+    agent_store: AgentStore,
+    auth_provider: AuthProvider | None = None,
+    permission_store: PermissionStore | None = None,
+    runner_router: RunnerRouter | None = None,
+) -> APIRouter:
+    """
+    Factory for the supervisor-session resolve adapter.
+
+    The route exposed by this router is a thin, documented adapter over
+    the internal elicitation resolver. It resolves the currently pending
+    elicitation visible for a supervisor session, translates the stable
+    external ``decision`` field into the internal MCP verdict literal,
+    and forwards the request to the existing resolver.
+
+    :param conversation_store: Store used to load the supervisor session
+        and discover its pending elicitation snapshot.
+    :param agent_store: Store used to apply deferred policy writes when
+        the resolved elicitation belongs to a policy gate.
+    :param auth_provider: Auth provider for user identity extraction.
+    :param permission_store: Permission store for session-level access
+        control. ``None`` disables permission checks.
+    :param runner_router: Router used to forward the resolved verdict to
+        the bound runner, or ``None`` in runnerless test setups.
+    :returns: A router exposing ``POST /supervisor-sessions/{sessionId}/resolve``.
+    """
+    router = APIRouter()
+
+    @router.post(
+        "/supervisor-sessions/{sessionId}/resolve",
+        status_code=202,
+        response_model=SupervisorSessionResolveResponse,
+    )
+    async def resolve_supervisor_session(
+        request: Request,
+        sessionId: str,
+        body: SupervisorSessionResolveRequest,
+    ) -> SupervisorSessionResolveResponse:
+        """
+        Resolve the pending elicitation currently visible for a supervisor session.
+
+        The adapter is intentionally decoupled from the internal
+        elicitation path. Callers provide the stable external
+        ``decision`` label and any audit metadata; the route looks up the
+        pending prompt for the session, translates ``approve`` to the
+        internal ``accept`` action and ``deny`` to ``decline``, then
+        delegates to :func:`_resolve_elicitation`.
+
+        When the visible pending prompt is a mirrored child-session
+        elicitation, the adapter follows ``params.target_session_id`` and
+        resolves the child session that actually owns the parked future.
+
+        :param request: Inbound FastAPI request used for identity
+            extraction.
+        :param sessionId: Supervisor session identifier, e.g.
+            ``"conv_abc123"``.
+        :param body: Stable adapter payload containing ``decision`` and
+            opaque ``auditMetadata``.
+        :returns: ``{"queued": false}`` once the underlying elicitation
+            has been resolved.
+        :raises OmnigentError: 404 when the session does not exist or no
+            pending elicitation is visible for the session.
+        """
+        user_id = _get_user_id(request, auth_provider)
+        access = await _require_access_and_level(
+            user_id, sessionId, LEVEL_EDIT, permission_store, conversation_store
+        )
+        conv = access.conversation
+        if conv is None:
+            conv = await asyncio.to_thread(conversation_store.get_conversation, sessionId)
+            if conv is None:
+                raise OmnigentError(
+                    "Session not found",
+                    code=ErrorCode.NOT_FOUND,
+                )
+
+        pending_events = _pending_elicitation_snapshot_for_session(conversation_store, conv)
+        if not pending_events:
+            raise OmnigentError(
+                "No pending elicitation for session",
+                code=ErrorCode.NOT_FOUND,
+            )
+
+        pending_event = pending_events[0]
+        elicitation_id = pending_event.get("elicitation_id")
+        if not isinstance(elicitation_id, str) or not elicitation_id:
+            raise OmnigentError(
+                "No pending elicitation for session",
+                code=ErrorCode.NOT_FOUND,
+            )
+        params = pending_event.get("params")
+        if not isinstance(params, dict):
+            params = {}
+        target_session_id = sessionId
+        if isinstance(params, dict):
+            target = params.get("target_session_id")
+            if isinstance(target, str) and target:
+                target_session_id = target
+
+        resolve_conv = conv
+        if target_session_id != conv.id:
+            resolve_conv = await asyncio.to_thread(
+                conversation_store.get_conversation, target_session_id
+            )
+            if resolve_conv is None:
+                raise OmnigentError(
+                    "No pending elicitation for session",
+                    code=ErrorCode.NOT_FOUND,
+                )
+
+        action = "accept" if body.decision == "approve" else "decline"
+        resolve_data = {"elicitation_id": elicitation_id, "action": action}
+        if body.auditMetadata:
+            _logger.info(
+                "Supervisor-session resolve audit metadata "
+                "session=%s target=%s elicitation=%s keys=%s",
+                sessionId,
+                target_session_id,
+                elicitation_id,
+                sorted(body.auditMetadata.keys()),
+            )
+        await _resolve_elicitation(
+            target_session_id,
+            resolve_data,
+            runner_router,
+            conversation_store,
+        )
+        await _apply_pending_policy_ask_writes(
+            target_session_id,
+            resolve_conv,
+            conversation_store,
+            agent_store,
+            resolve_data,
+        )
+        return SupervisorSessionResolveResponse()
 
     return router
 

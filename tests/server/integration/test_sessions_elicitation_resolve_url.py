@@ -40,8 +40,9 @@ import httpx
 import pytest
 import pytest_asyncio
 from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
-from omnigent.runtime import get_caps, session_stream
+from omnigent.runtime import get_caps, pending_elicitations, session_stream
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.caps import RuntimeCaps
 from omnigent.server.app import create_app
@@ -528,6 +529,16 @@ async def test_resolve_url_allow_round_trip(client: httpx.AsyncClient) -> None:
             "decision": {"behavior": "allow"},
         }
     }
+
+
+def test_resolve_url_is_documented_in_openapi(app: FastAPI) -> None:
+    """The dedicated resolve endpoint is surfaced in the FastAPI schema."""
+    path = "/v1/sessions/{session_id}/elicitations/{elicitation_id}/resolve"
+    spec = app.openapi()
+    assert path in spec["paths"], spec["paths"].keys()
+    operation = spec["paths"][path]["post"]
+    assert operation["responses"]["202"]["description"]
+    assert operation["requestBody"]["content"]["application/json"]
 
 
 async def test_child_codex_elicitation_bubbles_to_parent_stream(
@@ -1357,6 +1368,126 @@ async def test_resolve_url_cross_user_forbidden(
     # Non-owner is denied (403 forbidden, or 404 to avoid leaking
     # existence — both are acceptable refusals).
     assert resp.status_code in (403, 404), resp.text
+
+
+@pytest.mark.parametrize(
+    ("decision", "expected_action", "expected_behavior"),
+    [
+        ("approve", "accept", "allow"),
+        ("deny", "decline", "deny"),
+    ],
+)
+def test_supervisor_resolve_adapter_round_trip(
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    decision: str,
+    expected_action: str,
+    expected_behavior: str,
+) -> None:
+    """
+    The supervisor-session adapter resolves the visible prompt and maps its decision.
+
+    This exercises the new documented ``/api/supervisor-sessions/{sessionId}/resolve``
+    route end-to-end:
+
+    - the parent session sees a mirrored child prompt,
+    - the adapter looks up that visible prompt,
+    - ``decision`` maps to the internal MCP action literal,
+    - the shared internal resolver wakes the parked Future, and
+    - the external hook returns the expected allow/deny outcome.
+    """
+    from omnigent.server.routes import sessions as sessions_route
+
+    orig_resolve = sessions_route._resolve_elicitation
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def _recording_resolve(
+        session_id: str,
+        data: dict[str, Any],
+        runner_router: Any,
+        conversation_store: Any = None,
+    ) -> None:
+        calls.append((session_id, dict(data)))
+        await orig_resolve(session_id, data, runner_router, conversation_store)
+
+    monkeypatch.setattr(sessions_route, "_resolve_elicitation", _recording_resolve)
+
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    conversation_store = SqlAlchemyConversationStore(db_uri)
+    agent_id = "ag_supervisor_resolve"
+    agent_store.create(agent_id, "supervisor-resolve-agent", "bundle://supervisor-resolve")
+    parent = conversation_store.create_conversation(kind="default", agent_id=agent_id)
+    child = conversation_store.create_conversation(
+        kind="sub_agent",
+        parent_conversation_id=parent.id,
+        agent_id=agent_id,
+        title="child:approval",
+    )
+    elicitation_id = "elicit_supervisor_resolve"
+    pending_elicitations.record_publish(
+        child.id,
+        {
+            "type": "response.elicitation_request",
+            "elicitation_id": elicitation_id,
+            "params": {
+                "message": "Approve the child action?",
+                "target_session_id": child.id,
+            },
+        },
+    )
+    try:
+        with TestClient(app) as client:
+            verdict = client.post(
+                f"/api/supervisor-sessions/{parent.id}/resolve",
+                json={
+                    "decision": decision,
+                    "auditMetadata": {
+                        "source": "teams",
+                        "messageId": f"msg-{decision}",
+                    },
+                },
+            )
+        assert verdict.status_code == 202, verdict.text
+        assert verdict.json() == {"queued": False}
+        assert calls == [(child.id, {"elicitation_id": elicitation_id, "action": expected_action})]
+    finally:
+        pending_elicitations.reset_for_tests()
+
+
+def test_supervisor_resolve_adapter_unknown_session_returns_404(
+    app: FastAPI,
+) -> None:
+    """
+    Resolving a supervisor session that does not exist returns 404.
+
+    The adapter still performs the normal session-level access check
+    before it looks up a pending elicitation.
+    """
+    with TestClient(app) as client:
+        resp = client.post(
+            "/api/supervisor-sessions/conv_does_not_exist/resolve",
+            json={"decision": "approve", "auditMetadata": {}},
+        )
+    assert resp.status_code == 404, resp.text
+
+
+def test_supervisor_resolve_adapter_rejects_invalid_decision(
+    app: FastAPI,
+) -> None:
+    """
+    An unrecognized decision value is rejected at the boundary with 422.
+
+    The adapter's request model only accepts ``approve`` or ``deny``;
+    callers must not be able to slip an internal action literal through
+    this decoupled surface.
+    """
+    with TestClient(app) as client:
+        resp = client.post(
+            "/api/supervisor-sessions/conv_anything/resolve",
+            json={"decision": "maybe", "auditMetadata": {}},
+        )
+    assert resp.status_code == 422, resp.text
 
 
 # ── GET /sessions/{id}/elicitations/{eid} (approval page) ────
