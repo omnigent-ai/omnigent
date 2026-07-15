@@ -84,9 +84,7 @@ function loadMainHarness({
     dialog: {
       showMessageBox: (dialogWin, options) => {
         calls.showMessageBox.push({ win: dialogWin, options });
-        return Promise.resolve(
-          dialogResponses.shift() ?? { response: 1, checkboxChecked: false },
-        );
+        return Promise.resolve(dialogResponses.shift() ?? { response: 1, checkboxChecked: false });
       },
     },
     ipcMain: {
@@ -176,8 +174,7 @@ function loadMainHarness({
       unpinned: { sender, senderFrame: { url: "https://evil.example/app" } },
     },
     ipcHandlers,
-    readSettings: () =>
-      JSON.parse(fs.readFileSync(path.join(userData, "settings.json"), "utf8")),
+    readSettings: () => JSON.parse(fs.readFileSync(path.join(userData, "settings.json"), "utf8")),
   };
 }
 

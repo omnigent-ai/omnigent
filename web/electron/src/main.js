@@ -709,8 +709,7 @@ let updateCheckTimer = null;
 let currentUpdateStatus = { state: "idle" };
 let installPending = false;
 let manualCheckInFlight = false;
-const UPDATES_UNAVAILABLE_IN_DEV =
-  "Desktop updates are unavailable in development builds.";
+const UPDATES_UNAVAILABLE_IN_DEV = "Desktop updates are unavailable in development builds.";
 
 // ---------------------------------------------------------------------------
 // Persisted settings (the saved server URL and the recently-connected server
