@@ -15,10 +15,20 @@ import type { ServerInfo } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 
 // Controllable rename mutation so the double-click test can assert the
-// committed title was forwarded to the PATCH. Declared via vi.hoisted so the
-// vi.mock factory (hoisted above imports) can reference it.
+// committed title was forwarded to the PATCH. `isMobile` toggles the mocked
+// `useIsMobileViewport` so a test can render the row on a mobile viewport (the
+// project flyout is disabled there). Declared via vi.hoisted so the vi.mock
+// factories (hoisted above imports) can reference them.
 const mocks = vi.hoisted(() => ({
   rename: { mutate: vi.fn() },
+  isMobile: false,
+}));
+
+// Mock the mobile-viewport hook — jsdom doesn't evaluate media queries, so
+// drive it explicitly. Defaults to desktop (false); the mobile flyout test
+// flips `mocks.isMobile` for the duration of that case.
+vi.mock("@/hooks/useIsMobileViewport", () => ({
+  useIsMobileViewport: () => mocks.isMobile,
 }));
 
 vi.mock("@/hooks/useConversations", () => ({
@@ -142,6 +152,8 @@ function renderSidebar(activeId?: string, info?: ServerInfo) {
 
 beforeEach(() => {
   mocks.rename.mutate.mockReset();
+  // Default every test to the desktop viewport; the mobile flyout test opts in.
+  mocks.isMobile = false;
   useConvMock.mockReset();
   // Pins persist to localStorage; clear it so a seeded pin doesn't leak into
   // the next test's row state.
@@ -316,6 +328,26 @@ describe("pinned row project flyout", () => {
 
     const row = screen.getByRole("link", { name: /My Session/ });
     expect(row).not.toHaveAttribute("data-slot", "hover-card-trigger");
+    fireEvent.focus(row);
+    expect(screen.queryByTestId("pinned-project-flyout")).toBeNull();
+  });
+
+  it("disables the flyout on a mobile viewport, keeping the native title", () => {
+    // Mobile has no real hover, so the flyout is gated off there: a tap that
+    // navigates must not also open (and strand) a HoverCard over the chat. The
+    // row falls back to the plain link path — no hover-card trigger, native
+    // title restored — even though it IS pinned + project-owned.
+    mocks.isMobile = true;
+    localStorage.setItem("omnigent:pinned-conversation-ids", JSON.stringify(["conv_1"]));
+    mockConversations([{ ...CONV, labels: { omni_project: "Moonshot" } }]);
+    renderSidebar();
+    expect(screen.getByText("Pinned")).toBeInTheDocument();
+
+    const row = screen.getByRole("link", { name: /My Session/ });
+    // No hover-card trigger is mounted, and the native title tooltip is kept.
+    expect(row).not.toHaveAttribute("data-slot", "hover-card-trigger");
+    expect(row).toHaveAttribute("title", "My Session");
+    // Focusing the row opens nothing — the flyout never mounts on mobile.
     fireEvent.focus(row);
     expect(screen.queryByTestId("pinned-project-flyout")).toBeNull();
   });

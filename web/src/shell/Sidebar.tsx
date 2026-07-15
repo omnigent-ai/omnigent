@@ -128,6 +128,7 @@ import {
   useUnseenTick,
 } from "@/hooks/useUnseenConversations";
 import { cn } from "@/lib/utils";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { useSessionSwitchHotkey } from "@/hooks/useSessionSwitchHotkey";
 import { usePinnedSessionHotkeys } from "@/hooks/usePinnedSessionHotkeys";
@@ -2298,6 +2299,10 @@ function ConversationRow({
   const activeRootId = useActiveRootSessionId(activeId ?? null);
   const isActive = (activeRootId ?? activeId) === conversation.id;
   const navigate = useNavigate();
+  // Mobile has no real hover, so a tap that navigates would also trip the
+  // project flyout's HoverCard and leave it lingering over the chat. Gate the
+  // flyout off below the `md` breakpoint (see `projectFlyoutName`).
+  const isMobile = useIsMobileViewport();
   // Track the *live* active conversation id. Delete is fire-and-forget,
   // so the user can navigate to another conversation before the mutation
   // resolves — the onSuccess redirect must key off where they are now,
@@ -2375,7 +2380,11 @@ function ConversationRow({
   // "Pinned" section, so the row no longer shows which project it belongs to.
   // For those rows only, surface the project in a hover flyout. Non-pinned
   // rows already sit inside their project folder, so they don't need it.
-  const projectFlyoutName = isPinned ? currentProject : null;
+  // Disabled on mobile: there's no hover, so a tap would open the HoverCard
+  // and leave it overlaying the chat after navigation. Forcing null there
+  // routes the row through the plain ContextMenu/link path and restores the
+  // native `title` tooltip.
+  const projectFlyoutName = !isMobile && isPinned ? currentProject : null;
 
   const label = conversationDisplayLabel(conversation);
   // Recompute unseen state the moment the last-seen map changes (e.g. the
