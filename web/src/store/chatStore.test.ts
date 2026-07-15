@@ -24,6 +24,7 @@ import type {
   ErrorBlock,
   NativeToolBlock,
   TextDone,
+  ToolGroup,
   UserMessageBlock,
 } from "@/lib/blocks";
 import type { ConversationItem } from "@/lib/conversationItems";
@@ -5752,6 +5753,48 @@ describe("chatStore — pumpStreamEvents frame batching", () => {
     const order = after.map(chunkText).filter((c): c is string => c !== null);
     // Exactly A,B,C in order — coalesced append preserved arrival order.
     expect(order).toEqual(["A", "B", "C"]);
+
+    controller.abort();
+  });
+
+  it("appends live command output to the running tool card", async () => {
+    useChatStore.setState({ conversationId: "conv_tool_delta", blocks: [] });
+    const sink = pushableStream();
+    const controller = new AbortController();
+    void pumpStreamEvents("conv_tool_delta", sink.stream, controller, setState, getState);
+
+    sink.push(sse("response.created", { id: "resp_tool", status: "in_progress", output: [] }));
+    sink.push(
+      sse("response.output_item.done", {
+        item: {
+          id: "item_call",
+          type: "function_call",
+          response_id: "resp_tool",
+          call_id: "call_123",
+          name: "shell",
+          arguments: '{"command":"pytest"}',
+          status: "in_progress",
+        },
+      }),
+    );
+    sink.push(
+      sse("response.function_call_output.delta", {
+        call_id: "call_123",
+        delta: "collecting ",
+      }),
+    );
+    sink.push(
+      sse("response.function_call_output.delta", {
+        call_id: "call_123",
+        delta: "tests...",
+      }),
+    );
+    await tick();
+
+    const group = useChatStore
+      .getState()
+      .blocks.find((b): b is ToolGroup => b.type === "tool_group");
+    expect(group?.executions[0]?.output).toBe("collecting tests...");
 
     controller.abort();
   });

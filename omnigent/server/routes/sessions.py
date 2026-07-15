@@ -265,6 +265,7 @@ from omnigent.server.schemas import (
     SessionTodosEvent,
     SessionUsageEvent,
     SkillSummary,
+    ToolOutputDeltaEvent,
     UpdateSessionRequest,
 )
 from omnigent.session_lifecycle import (
@@ -353,6 +354,10 @@ _EXTERNAL_CONVERSATION_ITEM_TYPE: str = "external_conversation_item"
 # corresponding completed message still arrives later via
 # ``external_conversation_item``.
 _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE: str = "external_output_text_delta"
+
+# Internal transient update for output produced by a terminal-observed
+# function call before its completed ``function_call_output`` item arrives.
+_EXTERNAL_TOOL_OUTPUT_DELTA_TYPE: str = "external_tool_output_delta"
 
 # Internal input used by terminal-backed integrations to publish a transient
 # reasoning (chain-of-thought) delta observed before the completed message is
@@ -899,6 +904,7 @@ _ALLOWED_EVENT_TYPES: frozenset[str] = frozenset(ITEM_TYPE_TO_DATA_CLS.keys()) |
     _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
     _EXTERNAL_CONVERSATION_ITEM_TYPE,
     _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE,
+    _EXTERNAL_TOOL_OUTPUT_DELTA_TYPE,
     _EXTERNAL_OUTPUT_REASONING_DELTA_TYPE,
     _EXTERNAL_SESSION_INTERRUPTED_TYPE,
     _EXTERNAL_SESSION_SUPERSEDED_TYPE,
@@ -4043,6 +4049,34 @@ def _publish_external_output_text_delta(session_id: str, body: SessionEventInput
         message_id=message_id,
         index=index,
         final=final,
+    )
+    session_stream.publish(session_id, event.model_dump(exclude_none=True))
+
+
+def _publish_external_tool_output_delta(session_id: str, body: SessionEventInput) -> None:
+    """Broadcast a terminal-observed function-call output delta.
+
+    :param session_id: Session/conversation identifier.
+    :param body: Event body containing string ``call_id`` and ``delta`` values.
+    :returns: None.
+    :raises OmnigentError: If either required value is missing or not a string.
+    """
+    call_id = body.data.get("call_id")
+    delta = body.data.get("delta")
+    if not isinstance(call_id, str) or not call_id:
+        raise OmnigentError(
+            "external_tool_output_delta requires non-empty string data.call_id",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if not isinstance(delta, str):
+        raise OmnigentError(
+            "external_tool_output_delta requires string data.delta",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    event = ToolOutputDeltaEvent(
+        type="response.function_call_output.delta",
+        call_id=call_id,
+        delta=delta,
     )
     session_stream.publish(session_id, event.model_dump(exclude_none=True))
 
@@ -19320,6 +19354,8 @@ def create_sessions_router(
           ``response.output_text.delta`` event observed outside the
           Omnigent task runtime, without persisting an item or starting /
           steering a task.
+        - ``"external_tool_output_delta"`` publishes transient output for
+          an in-progress function call without persisting an item.
         - ``"external_output_reasoning_delta"`` publishes a transient
           ``response.reasoning_text.delta`` event (preceded by one
           ``response.reasoning.started`` when ``data.started`` is true)
@@ -19416,6 +19452,7 @@ def create_sessions_router(
             _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
             _EXTERNAL_CONVERSATION_ITEM_TYPE,
             _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE,
+            _EXTERNAL_TOOL_OUTPUT_DELTA_TYPE,
             _EXTERNAL_OUTPUT_REASONING_DELTA_TYPE,
             _EXTERNAL_SESSION_INTERRUPTED_TYPE,
             _EXTERNAL_SESSION_SUPERSEDED_TYPE,
@@ -19803,6 +19840,9 @@ def create_sessions_router(
             return {"queued": False, "item_id": item_id}
         if body.type == _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE:
             _publish_external_output_text_delta(session_id, body)
+            return {"queued": False}
+        if body.type == _EXTERNAL_TOOL_OUTPUT_DELTA_TYPE:
+            _publish_external_tool_output_delta(session_id, body)
             return {"queued": False}
         if body.type == _EXTERNAL_OUTPUT_REASONING_DELTA_TYPE:
             _publish_external_output_reasoning_delta(session_id, body)
