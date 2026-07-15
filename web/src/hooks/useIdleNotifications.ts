@@ -43,7 +43,12 @@ import {
   requestNotificationPermission,
   showNotification,
 } from "@/lib/browserNotifications";
-import { isNativeShell, onNativeNotificationActivated, setBadgeCount } from "@/lib/nativeBridge";
+import {
+  type BadgeActivation,
+  isNativeShell,
+  onNativeNotificationActivated,
+  setBadgeCount,
+} from "@/lib/nativeBridge";
 import { fetchLastAssistantText } from "@/lib/lastAssistantText";
 import {
   buildElicitationMap,
@@ -118,12 +123,15 @@ export function useIdleNotifications(activeConversationId?: string): void {
   const { data } = useConversations();
   const prevStatus = useRef<Map<string, ConversationStatus>>(new Map());
   const prevElicitations = useRef<Map<string, number>>(new Map());
-  // Last badge count actually sent to the shell. `null` (nothing sent yet)
-  // makes the FIRST computation send unconditionally — including 0 — so a
-  // badge left over in the Electron main process from before a reload (it
-  // keeps a per-window count that survives in-window navigations) is
-  // corrected instead of sticking stale.
-  const lastSentBadge = useRef<number | null>(null);
+  // Last badge state sent to the shell, as a `count|navigatePath|title|body` key.
+  // `null` (nothing sent yet) makes the FIRST computation send unconditionally —
+  // including 0 — so a badge left over in the Electron main process from before
+  // a reload (it keeps a per-window count that survives in-window navigations)
+  // is corrected instead of sticking stale. Keying on the full activation
+  // (target + title + body), not just the count, re-sends when the single unread
+  // session changes — or is renamed — even if the count holds, so the Android
+  // badge notification's tap target and text stay current.
+  const lastSentBadge = useRef<string | null>(null);
   // Latest conversation list, so the focus listener (mounted once) can
   // recompute the badge without re-subscribing on data changes. `null` until
   // the first fetch resolves — the badge is never computed from a
@@ -185,12 +193,19 @@ export function useIdleNotifications(activeConversationId?: string): void {
     };
   }, []);
 
-  // Send the badge count when it differs from the last one sent. No-op in a
-  // plain browser (`setBadgeCount` is inert outside the desktop shell).
-  const pushBadge = (count: number) => {
-    if (count === lastSentBadge.current) return;
-    lastSentBadge.current = count;
-    void setBadgeCount(count);
+  // Send the badge count (with an Android tap target + descriptive text) when
+  // it differs from the last one sent. No-op in a plain browser (`setBadgeCount`
+  // is inert outside a native shell).
+  const pushBadge = (ids: Set<string>, conversations: Conversation[]) => {
+    const count = ids.size;
+    const activation = badgeActivationFor(ids, conversations);
+    const key = `${count}|${activation?.navigatePath ?? ""}|${activation?.title ?? ""}|${activation?.body ?? ""}`;
+    if (key === lastSentBadge.current) return;
+    lastSentBadge.current = key;
+    // Omit the second arg when there's nothing unread, so shells expecting the
+    // bare-count call (and its tests) keep matching.
+    if (activation) void setBadgeCount(count, activation);
+    else void setBadgeCount(count);
   };
 
   // Refocusing the window (focused on the open conversation) marks that
@@ -201,14 +216,10 @@ export function useIdleNotifications(activeConversationId?: string): void {
   useEffect(() => {
     const onFocus = () => {
       windowFocusedRef.current = true;
-      if (latestConversations.current === null) return;
-      const next = computeUnreadBadgeIds(
-        latestConversations.current,
-        activeIdRef.current,
-        true,
-        isConversationUnseen,
-      );
-      pushBadge(next.size);
+      const convs = latestConversations.current;
+      if (convs === null) return;
+      const next = computeUnreadBadgeIds(convs, activeIdRef.current, true, isConversationUnseen);
+      pushBadge(next, convs);
     };
     const onBlur = () => {
       windowFocusedRef.current = false;
@@ -238,14 +249,15 @@ export function useIdleNotifications(activeConversationId?: string): void {
   // dot immediately, without waiting for the next conversations poll.
   const unseenTick = useUnseenTick();
   useEffect(() => {
-    if (latestConversations.current === null) return;
+    const convs = latestConversations.current;
+    if (convs === null) return;
     const next = computeUnreadBadgeIds(
-      latestConversations.current,
+      convs,
       activeIdRef.current,
       windowFocusedRef.current,
       isConversationUnseen,
     );
-    pushBadge(next.size);
+    pushBadge(next, convs);
     // pushBadge and the focus state are refs; rerun only when the map changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [unseenTick]);
@@ -266,7 +278,7 @@ export function useIdleNotifications(activeConversationId?: string): void {
       windowFocusedRef.current,
       isConversationUnseen,
     );
-    pushBadge(unread.size);
+    pushBadge(unread, conversations);
 
     if (conversations.length === 0) return;
 
@@ -355,6 +367,46 @@ export function useIdleNotifications(activeConversationId?: string): void {
       }
     }
   }, [data, navigate, activeConversationId]);
+}
+
+/**
+ * Build the badge notification's tap target + descriptive text from the set of
+ * unread session ids. One unread session → open it; several → open the inbox
+ * when any awaits input, else the session list. `undefined` when nothing is
+ * unread — the badge clears and there's no notification to make actionable.
+ *
+ * The title is left unset (the shell falls back to the app name) so this ambient
+ * count summary stays visually distinct from the per-session event toast — which
+ * titles itself with the session label — instead of looking like a duplicate
+ * when both fire for the same finished session; the body carries the detail.
+ *
+ * Only the Android shell renders the badge as a tappable notification and reads
+ * these fields; Electron/iOS paint a real icon badge and ignore them.
+ */
+function badgeActivationFor(
+  ids: Set<string>,
+  conversations: Conversation[],
+): BadgeActivation | undefined {
+  if (ids.size === 0) return undefined;
+  if (ids.size === 1) {
+    const [id] = ids;
+    const conversation = conversations.find((c) => c.id === id);
+    const label = conversation ? conversationDisplayLabel(conversation) : "A session";
+    return { navigatePath: `/c/${id}`, body: `${label} needs your attention` };
+  }
+  // `/inbox` lists only sessions awaiting input, so route there only when at
+  // least one counted session actually has a pending prompt; a batch that just
+  // finished (unseen activity, no prompt) would otherwise land on an inbox that
+  // reads "Nothing waiting on you". Fall back to the session list —
+  // ?sidebar=open so phone-width shells (sidebar closed by default) actually
+  // show it instead of a bare composer (see AppShell).
+  const anyAwaiting = conversations.some(
+    (c) => ids.has(c.id) && (c.pending_elicitations_count ?? 0) > 0,
+  );
+  return {
+    navigatePath: anyAwaiting ? "/inbox" : "/?sidebar=open",
+    body: `${ids.size} sessions need your attention`,
+  };
 }
 
 /** Show one notification for a session transition; click opens the chat. */

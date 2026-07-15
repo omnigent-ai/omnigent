@@ -23,12 +23,28 @@ launched in the same cwd never mirror the same row into two conversations. We th
 poll ``messages`` past a high-water ``id`` and POST new user/assistant rows as
 ``external_conversation_item`` events (which also seeds the session title).
 
-The web-facing ``running``/``idle`` *spinner* edges are intentionally NOT posted
-here: the runner's PTY-activity watcher owns those ``session.status`` edges for
-hermes-native (see :mod:`omnigent.runner.app`), exactly as for goose-/cursor-native.
-That watcher drives only the web "Working…" spinner, though — it never wakes a
-parent orchestrator. So this forwarder additionally derives turn completion from
-the message log (an ``assistant`` row with no ``tool_calls`` is the agentic loop's
+To make the web render this harness's in-flight tool calls **live** (a spinner +
+ticking elapsed timer, matching claude-/codex-native), the forwarder assigns one
+``response_id`` per turn — ``hermes_turn_{opening-msg-id}`` shared across every row
+of the turn — POSTs a ``running`` ``external_session_status`` edge carrying that id
+at turn start, and stamps the turn's mirrored ``function_call`` items with the same
+id (see :func:`_annotate_turn_actions`). The server keys the live card off a
+``running`` edge whose ``response_id`` matches the items' ``response_id`` (#1874).
+
+The forwarder deliberately does NOT take ``idle`` ownership: the runner's
+PTY-activity watcher (see :mod:`omnigent.runner.app`) still emits the id-less
+``running``/``idle`` ``session.status`` edges for hermes-native (as for
+goose-/cursor-native), and the server pops the active response id on *any* ``idle``.
+A silent tool (e.g. ``sleep``) leaves the pane quiet, so that watcher's ~1s idle
+would settle a live card mid-turn — the forwarder therefore re-asserts the in-flight
+turn's ``running`` each poll. The trade-off: an aborted turn whose terminal row is
+never written is indistinguishable from a silent tool in the store, so its card
+stays live until a terminal row lands (an interrupt's empty-prose assistant row
+closes the turn) or the next user turn re-opens with a fresh id; the watcher's idle
+settles the card only once nothing re-arms the id (turn closed, or this forwarder
+died). That watcher drives only the web spinner, though — it never wakes a parent
+orchestrator. So this forwarder additionally derives turn completion from the
+message log (an ``assistant`` row with no ``tool_calls`` is the agentic loop's
 terminal step) and POSTs an ``external_session_status: idle`` event once per
 completed turn — the SAME server contract claude-/codex-/opencode-/cursor-native
 use to mark a sub-agent turn terminal and wake its parent's inbox. The post is
@@ -47,6 +63,7 @@ import re
 import sqlite3
 import time
 from dataclasses import dataclass
+from itertools import groupby
 from pathlib import Path
 
 import httpx
@@ -223,12 +240,18 @@ class _ForwardState:
     :param heartbeat_ms: Wall-clock ms of the last persist. A sibling reads this
         to tell a live owner from a dead session's leftover claim. Stamped by
         :func:`_write_state`.
+    :param active_turn_id: The per-turn ``response_id`` of the turn currently in
+        flight (``hermes_turn_{opening-msg-id}``), or ``None`` between turns.
+        Persisted so a turn that spans polls — or a forwarder restart mid-turn —
+        keeps its id and does not re-emit a ``running`` edge (see
+        :func:`_annotate_turn_actions`).
     """
 
     hermes_session_id: str | None = None
     last_id: int = 0
     launch_epoch_s: float = 0.0
     heartbeat_ms: int = 0
+    active_turn_id: str | None = None
 
 
 def _read_state(bridge_dir: Path) -> _ForwardState:
@@ -242,11 +265,15 @@ def _read_state(bridge_dir: Path) -> _ForwardState:
     last_id = data.get("last_id")
     launch_epoch_s = data.get("launch_epoch_s")
     heartbeat_ms = data.get("heartbeat_ms")
+    active_turn_id = data.get("active_turn_id")
     return _ForwardState(
         hermes_session_id=sid if isinstance(sid, str) else None,
         last_id=last_id if isinstance(last_id, int) else 0,
         launch_epoch_s=float(launch_epoch_s) if isinstance(launch_epoch_s, (int, float)) else 0.0,
         heartbeat_ms=heartbeat_ms if isinstance(heartbeat_ms, int) else 0,
+        active_turn_id=active_turn_id
+        if isinstance(active_turn_id, str) and active_turn_id
+        else None,
     )
 
 
@@ -265,6 +292,7 @@ def _write_state(bridge_dir: Path, state: _ForwardState) -> bool:
                     "hermes_session_id": state.hermes_session_id,
                     "last_id": state.last_id,
                     "launch_epoch_s": state.launch_epoch_s,
+                    "active_turn_id": state.active_turn_id,
                     # Stamp the heartbeat at persist time so every poll refreshes
                     # the session claim; a peer treats a claim older than
                     # ``_CLAIM_FRESH_MS`` as a dead session it may take over.
@@ -440,6 +468,11 @@ class _MirrorItem:
     item_type: str
     item_data: dict[str, object]
     response_id: str
+    #: The source ``messages`` row role ("user"/"assistant"/"tool"). Carried so a
+    #: row that yields no renderable item (a sentinel, ``item_type == ""``) still
+    #: exposes its role to turn detection — an empty-prose ``assistant`` terminal
+    #: row must still close the turn (see :func:`_mirror_item_role`).
+    role: str | None = None
 
 
 def _message_to_items(
@@ -483,6 +516,26 @@ def _message_to_items(
 
     if role == "assistant":
         items: list[_MirrorItem] = []
+        # Emit the prose FIRST, then the tool calls. An assistant row's text is
+        # the model's preamble ("I'll run X…") that precedes the calls it makes
+        # in the same step, so the natural order is message → function_call(s).
+        # It also matters for live rendering: the web only shows the running
+        # spinner on the TRAILING tool phase, so a message emitted AFTER the
+        # calls would leave the in-flight tool non-trailing (no spinner) until
+        # its output lands.
+        if text:
+            items.append(
+                _MirrorItem(
+                    msg_id=msg_id,
+                    item_type="message",
+                    item_data={
+                        "role": "assistant",
+                        "agent": agent_name,
+                        "content": [{"type": "output_text", "text": text}],
+                    },
+                    response_id=response_id,
+                )
+            )
         # Parse tool_calls JSON — assistant rows may include tool call requests.
         if isinstance(tool_calls, str) and tool_calls:
             try:
@@ -511,20 +564,6 @@ def _message_to_items(
                                 response_id=response_id,
                             )
                         )
-        # Also emit a message item if there's prose content.
-        if text:
-            items.append(
-                _MirrorItem(
-                    msg_id=msg_id,
-                    item_type="message",
-                    item_data={
-                        "role": "assistant",
-                        "agent": agent_name,
-                        "content": [{"type": "output_text", "text": text}],
-                    },
-                    response_id=response_id,
-                )
-            )
         return items
 
     if role == "tool":
@@ -575,8 +614,106 @@ def _read_new_items(
         if converted:
             items.extend(converted)
         else:
-            items.append(_MirrorItem(msg_id=msg_id, item_type="", item_data={}, response_id=""))
+            # A skipped row (empty/tool/system) still advances the cursor via a
+            # sentinel; carry its role so turn detection can still see, e.g., an
+            # empty-prose ``assistant`` terminal row and close the turn.
+            items.append(
+                _MirrorItem(
+                    msg_id=msg_id,
+                    item_type="",
+                    item_data={},
+                    response_id="",
+                    role=role if isinstance(role, str) else None,
+                )
+            )
     return items
+
+
+@dataclass
+class _TurnAction:
+    """One ordered step when mirroring a poll batch.
+
+    ``kind`` is ``"running"`` (POST a ``running`` status edge) or ``"item"`` (POST
+    a mirrored conversation item). ``turn_id_after`` is the turn id still active
+    once this step is applied — persisted after each step so a turn that spans
+    polls (or a forwarder restart mid-turn) keeps its id.
+    """
+
+    kind: str
+    msg_id: int
+    turn_id_after: str | None
+    response_id: str | None = None
+    item: _MirrorItem | None = None
+
+
+def _mirror_item_role(item: _MirrorItem) -> str | None:
+    """Return the source-row role of a mirror item for turn detection.
+
+    A ``message`` item reads it from ``item_data``; a sentinel (``item_type ==
+    ""``, produced for a row that yields no renderable item) reads the row role
+    carried on the item — so an empty-prose ``assistant`` terminal row is still
+    seen as an assistant row and closes the turn. Other item types (function
+    calls / outputs) return ``None``; ``has_function_call`` covers those.
+    """
+    if item.item_type == "message":
+        role = item.item_data.get("role")
+        return role if isinstance(role, str) else None
+    if item.item_type == "":
+        return item.role
+    return None
+
+
+def _annotate_turn_actions(
+    items: list[_MirrorItem], active_turn_id: str | None
+) -> tuple[list[_TurnAction], str | None]:
+    """Assign a per-turn ``response_id`` to a poll batch and interleave ``running``
+    edges at turn starts; return the ordered actions and the turn id still active
+    after the batch.
+
+    A Hermes turn is ``user -> (assistant+tool_calls -> tool)* ->
+    assistant-without-tool_calls``. Rows arrive append-only in ``id`` order and each
+    ``messages`` row is a single role, so items are grouped by ``msg_id``:
+
+    - a ``user`` group **opens** a turn → mint ``hermes_turn_{msg_id}`` and emit a
+      ``running`` edge before its items;
+    - assistant activity while no turn is active also mints one (missed-start
+      recovery — e.g. a forwarder that starts mid-turn), so its cards still go live;
+    - every mirrored item is re-stamped with the active turn id so the web renders
+      the turn's tool-call cards live against the ``running`` edge;
+    - an ``assistant`` group with **no** ``function_call`` item is the terminal step
+      → clear the id after it.
+
+    The ``idle`` edge is intentionally NOT emitted here: the completed-turn idle
+    post settles the card when the turn closes. A turn that never writes a terminal
+    row (some aborts) keeps its id active — the poll loop's ``running`` re-assert
+    holds the card live until the next turn replaces the id (see module docstring).
+    """
+    actions: list[_TurnAction] = []
+    for msg_id, group_iter in groupby(items, key=lambda it: it.msg_id):
+        group = list(group_iter)
+        has_function_call = any(it.item_type == "function_call" for it in group)
+        roles = {_mirror_item_role(it) for it in group}
+        opens = "user" in roles
+        is_assistant = "assistant" in roles
+        terminal = is_assistant and not has_function_call
+
+        if opens or (active_turn_id is None and (has_function_call or is_assistant)):
+            active_turn_id = f"hermes_turn_{msg_id}"
+            actions.append(
+                _TurnAction("running", msg_id, active_turn_id, response_id=active_turn_id)
+            )
+
+        for it in group:
+            if active_turn_id is not None:
+                it.response_id = active_turn_id
+            actions.append(_TurnAction("item", msg_id, active_turn_id, item=it))
+
+        if terminal:
+            active_turn_id = None
+            if actions:
+                actions[-1].turn_id_after = None
+
+    return actions, active_turn_id
 
 
 def _assistant_row_has_tool_calls(tool_calls: object) -> bool:
@@ -634,7 +771,11 @@ def _count_completed_turns(
 
 
 async def _post_external_session_status(
-    client: httpx.AsyncClient, *, session_id: str, status: str
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    status: str,
+    response_id: str | None = None,
 ) -> None:
     """POST one ``external_session_status`` event to the Sessions API.
 
@@ -644,11 +785,21 @@ async def _post_external_session_status(
     emits only a web-spinner ``session.status`` edge for hermes-native and never
     wakes a parent, which is why this explicit post is required.
 
+    When *response_id* is given (the turn's ``hermes_turn_{id}``), the edge carries
+    it: a ``running`` edge marks that response id active so the web renders the
+    turn's tool-call cards live, and a clean-close ``idle`` names the card to settle
+    (an id-less idle is a no-op on the web while a response is still streaming). An
+    ``idle`` with no id still resolves via the server popping the active id and the
+    snapshot refetch — the abort / turn-spanned-a-prior-batch path.
+
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     """
+    data: dict[str, object] = {"status": status}
+    if response_id is not None:
+        data["response_id"] = response_id
     resp = await client.post(
         f"/v1/sessions/{session_id}/events",
-        json={"type": "external_session_status", "data": {"status": status}},
+        json={"type": "external_session_status", "data": data},
     )
     resp.raise_for_status()
 
@@ -784,6 +935,12 @@ async def forward_hermes_store_to_session(
     persisted = _read_state(bridge_dir)
     hermes_session_id: str | None = persisted.hermes_session_id
     last_id = persisted.last_id if hermes_session_id is not None else 0
+    # The turn currently in flight (its shared ``response_id``), threaded through
+    # every ``_write_state`` so it survives polls / a restart. Reset whenever the
+    # tailed hermes session changes (discovery, claim-yield, compaction re-pin).
+    active_turn_id: str | None = (
+        persisted.active_turn_id if hermes_session_id is not None else None
+    )
     # Track whether we have already PATCHed the external_session_id to the
     # Omnigent server so we do it at most once per forwarder lifetime.
     _external_id_synced = False
@@ -806,12 +963,20 @@ async def forward_hermes_store_to_session(
                         last_id = (
                             persisted.last_id if persisted.hermes_session_id == resolved else 0
                         )
+                        # Discovery only (re)binds on a cold start or a
+                        # claim-yield / compaction re-pin reacquire — never the
+                        # mid-turn restart-resume case, which keeps its session
+                        # pinned and skips this block. So always start turn
+                        # tracking fresh here; restoring the one-shot ``persisted``
+                        # snapshot could resurrect a stale turn id on reacquire.
+                        active_turn_id = None
                         _write_state(
                             bridge_dir,
                             _ForwardState(
                                 hermes_session_id=resolved,
                                 last_id=last_id,
                                 launch_epoch_s=launch_epoch_s,
+                                active_turn_id=active_turn_id,
                             ),
                         )
                 # PATCH the external_session_id once so the server
@@ -845,22 +1010,73 @@ async def forward_hermes_store_to_session(
                             session_id,
                         )
                         hermes_session_id = None
+                        active_turn_id = None
                     else:
                         items = await asyncio.to_thread(
                             _read_new_items, db, hermes_session_id, last_id, agent_name
                         )
-                        for item in items:
-                            if item.item_type:
+                        # Assign a per-turn response_id and interleave ``running``
+                        # edges at turn starts; items are re-stamped in place so
+                        # the turn's tool-call cards render live on the web.
+                        turn_actions, active_turn_id = _annotate_turn_actions(
+                            items, active_turn_id
+                        )
+                        # The response_id of the last turn that closed in this
+                        # batch (its terminal step clears ``turn_id_after``). Fed
+                        # to the completed-turn ``idle`` post below so the web
+                        # settles that exact card deterministically — an id-less
+                        # idle is a no-op while a response is still streaming.
+                        closed_turn_id: str | None = None
+                        # Whether this batch already posted a ``running`` edge (turn
+                        # open), so the in-flight re-assert below doesn't duplicate it.
+                        running_posted_this_batch = False
+                        for action in turn_actions:
+                            if action.kind == "running":
+                                if action.response_id is not None:
+                                    running_posted_this_batch = True
+                                    # Best-effort: the running edge only makes the
+                                    # turn's cards render live. If it fails, mirroring
+                                    # (and the idle/PTY-watcher resolution) must still
+                                    # proceed — never abort the turn for a live-card post.
+                                    try:
+                                        await _post_external_session_status(
+                                            client,
+                                            session_id=session_id,
+                                            status="running",
+                                            response_id=action.response_id,
+                                        )
+                                    except Exception:  # noqa: BLE001 — live-card edge is best-effort
+                                        _logger.debug(
+                                            "hermes forwarder running-edge post failed; "
+                                            "cards may not go live; session=%s",
+                                            session_id,
+                                            exc_info=True,
+                                        )
+                                # A running edge mirrors no message row, so it must
+                                # NOT advance the ``last_id`` cursor. The opening
+                                # group's item action (same msg_id, next iteration)
+                                # advances it only AFTER its row is POSTed — so a
+                                # crash in the window re-reads the opening row on
+                                # restart instead of skipping it.
+                                continue
+                            if action.item is not None and action.item.item_type:
                                 await _post_conversation_item(
-                                    client, session_id=session_id, item=item
+                                    client, session_id=session_id, item=action.item
                                 )
-                            last_id = item.msg_id
+                            if (
+                                action.turn_id_after is None
+                                and action.item is not None
+                                and action.item.response_id
+                            ):
+                                closed_turn_id = action.item.response_id
+                            last_id = action.msg_id
                             _write_state(
                                 bridge_dir,
                                 _ForwardState(
                                     hermes_session_id=hermes_session_id,
                                     last_id=last_id,
                                     launch_epoch_s=launch_epoch_s,
+                                    active_turn_id=action.turn_id_after,
                                 ),
                             )
                         if not compaction_persisted and await asyncio.to_thread(
@@ -896,6 +1112,7 @@ async def forward_hermes_store_to_session(
                                 ):
                                     hermes_session_id = child
                                     last_id = 0
+                                    active_turn_id = None
                                     compaction_persisted = False
                                     _external_id_synced = False
                                     # The idle dedup baseline is per-terminal but
@@ -919,6 +1136,7 @@ async def forward_hermes_store_to_session(
                                             hermes_session_id=child,
                                             last_id=0,
                                             launch_epoch_s=launch_epoch_s,
+                                            active_turn_id=None,
                                         ),
                                     )
                                     continue
@@ -932,6 +1150,31 @@ async def forward_hermes_store_to_session(
                                 )
                         # Post model/usage data after mirroring messages.
                         await usage_tracker.flush()
+                        # Re-assert ``running`` for a turn still in flight that did
+                        # not open this batch. Hermes leaves the tmux pane quiet
+                        # during a silent tool (e.g. ``sleep``), so the runner's
+                        # PTY-activity watcher fires an id-less ``idle`` after ~1s
+                        # and the server pops the turn's active_response_id — which
+                        # would let a snapshot refetch settle the live card early.
+                        # Re-posting the turn's ``running`` each poll (0.4s) re-arms
+                        # that id well inside the 1s window, so the card stays live
+                        # until the real terminal step. Best-effort: a live-card edge
+                        # never blocks mirroring.
+                        if active_turn_id is not None and not running_posted_this_batch:
+                            try:
+                                await _post_external_session_status(
+                                    client,
+                                    session_id=session_id,
+                                    status="running",
+                                    response_id=active_turn_id,
+                                )
+                            except Exception:  # noqa: BLE001 — live-card edge is best-effort
+                                _logger.debug(
+                                    "hermes forwarder running re-assert failed; "
+                                    "card may settle early; session=%s",
+                                    session_id,
+                                    exc_info=True,
+                                )
                         # Refresh the claim heartbeat every poll (even with no new
                         # items) so an idle owner keeps its claim.
                         _write_state(
@@ -940,6 +1183,7 @@ async def forward_hermes_store_to_session(
                                 hermes_session_id=hermes_session_id,
                                 last_id=last_id,
                                 launch_epoch_s=launch_epoch_s,
+                                active_turn_id=active_turn_id,
                             ),
                         )
                         # Turn each newly-completed turn into an
@@ -962,8 +1206,18 @@ async def forward_hermes_store_to_session(
                         if completed_turns > await asyncio.to_thread(
                             hermes_native_status.read_posted_count, bridge_dir
                         ):
+                            # Carry the closed turn's response_id when this batch
+                            # observed the terminal step, so the web settles that
+                            # card deterministically (matching codex-native). A
+                            # retry where the terminal row landed in a prior batch
+                            # has no id here and posts id-less — the PTY watcher's
+                            # idle (which pops the active id server-side) plus the
+                            # snapshot refetch still resolve it, as on abort.
                             await _post_external_session_status(
-                                client, session_id=session_id, status="idle"
+                                client,
+                                session_id=session_id,
+                                status="idle",
+                                response_id=closed_turn_id,
                             )
                             await asyncio.to_thread(
                                 hermes_native_status.write_posted_count,

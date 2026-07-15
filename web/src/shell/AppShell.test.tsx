@@ -13,6 +13,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+import { writeWorkspacePanelDefault } from "@/lib/workspacePanelPreferences";
 
 vi.mock("@/hooks/useConversations", () => ({
   useConversations: vi.fn(),
@@ -309,6 +310,7 @@ function SessionNavButton({ to }: { to: string }) {
 function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
   return {
     accounts_enabled: false,
+    single_user: false,
     login_url: null,
     needs_setup: false,
     databricks_features: false,
@@ -1653,9 +1655,10 @@ describe("Right workspace card visibility", () => {
   });
 
   it("starts open for a fresh session (no stored open-state)", () => {
-    // A brand-new session has no persisted open-state, so the rail opens by
-    // default — the card is mounted and the header offers Collapse, not
-    // Expand.
+    // A brand-new session has no persisted open-state, so the Appearance
+    // Workspace panel default applies. With no preference stored that
+    // default is open — the card is mounted and the header offers Collapse,
+    // not Expand.
     useEnvironmentMock.mockReturnValue({
       data: { available: false, root: null, home: null },
       isLoading: false,
@@ -1667,6 +1670,38 @@ describe("Right workspace card visibility", () => {
     expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Collapse right panel" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Expand right panel" })).toBeNull();
+  });
+
+  it("starts collapsed for a fresh session when Appearance default is collapsed", () => {
+    // The Appearance setting only seeds sessions with no saved open-state.
+    writeWorkspacePanelDefault("collapsed");
+    useEnvironmentMock.mockReturnValue({
+      data: { available: false, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_fresh_collapsed", permission_level: null }]);
+
+    renderShell("/c/conv_fresh_collapsed");
+
+    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Expand right panel" })).toBeInTheDocument();
+  });
+
+  it("restores a saved open-state even when Appearance default is collapsed", () => {
+    // Per-chat persistence wins over the Appearance default once the user
+    // has toggled the rail in that session.
+    writeWorkspacePanelDefault("collapsed");
+    writeSessionWorkspaceState("conv_saved_open", { open: true });
+    useEnvironmentMock.mockReturnValue({
+      data: { available: false, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_saved_open", permission_level: null }]);
+
+    renderShell("/c/conv_saved_open");
+
+    expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Collapse right panel" })).toBeInTheDocument();
   });
 
   it("persists the open-state per session across remounts", () => {
@@ -2760,6 +2795,36 @@ describe("AppShell share action", () => {
         "title",
         "Sharing has been disabled for this Omnigent server.",
       );
+    });
+  });
+
+  it("hides the Share button entirely in single-user mode", () => {
+    // Non-local origin isolates the single-user gate from the local-server
+    // path. The explicit single_user marker (not just accounts-off/no-login,
+    // which a multi-user header deploy also reports) means no other users to
+    // share with, so the button is removed — not disabled like the
+    // local-server / sharing-off cases.
+    withWindowOrigin("https://app.example.com", () => {
+      mockConversations([{ id: "conv_top", permission_level: null }]);
+
+      renderShell("/c/conv_top", serverInfo({ single_user: true }));
+
+      expect(screen.queryByRole("button", { name: /share session/i })).toBeNull();
+    });
+  });
+
+  it("keeps the Share button on a multi-user header-auth deploy (not single_user)", () => {
+    // Header-auth multi-user (SSO proxy): accounts off AND no login_url, same
+    // shape as single-user, but single_user is false — the button must stay.
+    // This is the regression the single_user signal fixes.
+    withWindowOrigin("https://app.example.com", () => {
+      mockConversations([{ id: "conv_top", permission_level: null }]);
+
+      renderShell("/c/conv_top", serverInfo({ single_user: false }));
+
+      const shareButton = screen.getByRole("button", { name: /share session/i });
+      expect(shareButton).toBeInTheDocument();
+      expect(shareButton).toBeEnabled();
     });
   });
 

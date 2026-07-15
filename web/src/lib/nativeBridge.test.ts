@@ -364,6 +364,20 @@ describe("setBadgeCount", () => {
     expect(electronSetBadge).not.toHaveBeenCalled();
   });
 
+  it("forwards badge activation (tap target + text) to the Android bridge", async () => {
+    setAndroid(true);
+    const activation = { navigatePath: "/inbox", body: "2 sessions need your attention" };
+    await bridgeSetBadge(2, activation);
+    expect(androidSetBadge).toHaveBeenCalledWith(2, activation);
+  });
+
+  it("omits the activation arg when none is given (single-arg call preserved)", async () => {
+    setAndroid(true);
+    await bridgeSetBadge(3);
+    // Older shells expect the bare-count signature — no trailing undefined.
+    expect(androidSetBadge).toHaveBeenCalledWith(3);
+  });
+
   it("forwards a zero count (the bridge clears the badge for <= 0)", async () => {
     setElectron(true);
     await bridgeSetBadge(0);

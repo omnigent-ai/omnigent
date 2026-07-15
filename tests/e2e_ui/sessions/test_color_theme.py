@@ -3,7 +3,7 @@
 Alongside the light/dark **mode** tiles, ``AppearanceSection``
 (``pages/SettingsPage.tsx``) renders a "Color theme" dropdown (a shadcn
 ``Select``) — one option per palette (Omnigent, Dracula, GitHub, Catppuccin,
-Gruvbox). Choosing one calls ``applyThemePalette`` (``lib/themePalette.ts``),
+Gruvbox, Nord). Choosing one calls ``applyThemePalette`` (``lib/themePalette.ts``),
 which sets ``data-theme`` on ``<html>`` and persists the id to
 ``localStorage["omnigent:ui-theme-palette"]``. The default "Omnigent" palette
 carries no override, so choosing it removes the attribute and clears the key.

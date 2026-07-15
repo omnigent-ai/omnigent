@@ -611,6 +611,55 @@ async def test_child_sessions_busy_reflects_relay_status_cache(
         sessions_module._session_status_cache.pop(child.id, None)
 
 
+@pytest.mark.parametrize(
+    ("cached_status", "expected_task_status"),
+    [
+        ("running", "in_progress"),
+        ("waiting", "in_progress"),
+        ("idle", "completed"),
+        ("failed", "failed"),
+    ],
+)
+async def test_child_sessions_current_task_status_reflects_relay_status_cache(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    cached_status: str,
+    expected_task_status: str,
+) -> None:
+    """
+    ``current_task_status`` mirrors the child lifecycle cache.
+
+    The REST snapshot should use the same public task-status vocabulary as
+    live ``session.child_session.updated`` fan-out events: active children
+    are ``in_progress``, idle children are ``completed``, and failed children
+    are ``failed``.
+
+    :param client: The test HTTP client.
+    :param db_uri: Per-test SQLite database URI.
+    :param cached_status: Status value to inject into the cache.
+    :param expected_task_status: Expected ``current_task_status`` in the summary.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+
+    session = await _create_parent_session(client)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    child = _seed_child(
+        conv_store=conv_store,
+        parent_id=session["id"],
+        title="researcher:auth",
+        agent_id=session["agent_id"],
+    )
+
+    sessions_module._session_status_cache[child.id] = cached_status
+    try:
+        resp = await client.get(f"/v1/sessions/{session['id']}/child_sessions")
+        assert resp.status_code == 200
+        row = resp.json()["data"][0]
+        assert row["current_task_status"] == expected_task_status
+    finally:
+        sessions_module._session_status_cache.pop(child.id, None)
+
+
 async def test_child_sessions_truncates_long_message_preview(
     client: httpx.AsyncClient,
     db_uri: str,

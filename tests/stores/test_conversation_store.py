@@ -180,6 +180,62 @@ def test_list_latest_message_items_for_conversations(
     assert result["conv_missing"] == []
 
 
+def test_ranked_latest_message_items_omits_search_text(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """The ranked-message subquery must not select the heavy ``search_text``
+    column — the preview caller never reads it, and pulling it roughly doubles
+    the bytes transferred per row on a chatty child.
+
+    Guards the projection so a future refactor can't silently go back to
+    ``select(SqlConversationItem)`` (the whole row). Also seeds a message whose
+    ``search_text`` differs from its visible text and asserts the returned item
+    still carries the visible text, proving the preview reads ``data``.
+    """
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        _ranked_latest_message_items,
+    )
+
+    ranked = _ranked_latest_message_items(["conv_x"])
+    columns = {c.key for c in ranked.c}
+    assert "search_text" not in columns
+    # The columns _to_item + the preview actually consume must all be present.
+    assert {
+        "conversation_id",
+        "id",
+        "response_id",
+        "created_at",
+        "status",
+        "position",
+        "type",
+        "data",
+        "created_by",
+        "row_num",
+    } <= columns
+
+    conv = conversation_store.create_conversation(title="chatty")
+    conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_x",
+                data=MessageData(
+                    role="assistant",
+                    content=[{"type": "output_text", "text": "visible reply"}],
+                    agent="worker",
+                ),
+            )
+        ],
+    )
+    result = conversation_store.list_latest_message_items_for_conversations(
+        [conv.id], per_conversation_limit=1
+    )
+    item = result[conv.id][0]
+    assert isinstance(item.data, MessageData)
+    assert item.data.content[0]["text"] == "visible reply"
+
+
 def test_update_title(conversation_store: SqlAlchemyConversationStore) -> None:
     conv = conversation_store.create_conversation()
     updated = conversation_store.update_conversation(conv.id, title="Chat 1")
@@ -1247,6 +1303,54 @@ def test_list_conversations_excludes_archived_by_default(
     )
 
 
+def test_list_conversations_kind_filter_returns_only_matching(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    ``kind`` filtering (derived from ``parent_conversation_id``) returns exactly
+    the default rows or exactly the sub-agent rows.
+
+    A top-level and a sub-agent conversation must land in the right bucket,
+    ``kind=None`` must return both, and the sub-agent must never appear in the
+    default listing (the sidebar's view).
+    """
+    top = conversation_store.create_conversation(kind="default", title="top")
+    parent = conversation_store.create_conversation(kind="default", title="parent")
+    child = conversation_store.create_conversation(
+        kind="sub_agent", title="child", parent_conversation_id=parent.id
+    )
+
+    default_ids = {c.id for c in conversation_store.list_conversations(kind="default").data}
+    sub_ids = {c.id for c in conversation_store.list_conversations(kind="sub_agent").data}
+    any_ids = {c.id for c in conversation_store.list_conversations(kind=None).data}
+
+    assert default_ids == {top.id, parent.id}, (
+        f"kind=default must return only top-level rows; got {default_ids}"
+    )
+    assert sub_ids == {child.id}, f"kind=sub_agent must return only children; got {sub_ids}"
+    assert child.id not in default_ids, "sub-agent must never appear in the default listing"
+    assert any_ids >= {top.id, parent.id, child.id}, "kind=None must return every kind"
+
+
+def test_list_conversations_archive_toggle_round_trips(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    Archiving then unarchiving a session moves it out of and back into the
+    default listing — the AP-side ``archived`` column is the source of truth.
+    """
+    conv = conversation_store.create_conversation(title="toggle")
+    assert conv.id in {c.id for c in conversation_store.list_conversations().data}
+
+    archived = conversation_store.update_conversation(conv.id, archived=True)
+    assert archived is not None and archived.archived is True
+    assert conv.id not in {c.id for c in conversation_store.list_conversations().data}
+
+    unarchived = conversation_store.update_conversation(conv.id, archived=False)
+    assert unarchived is not None and unarchived.archived is False
+    assert conv.id in {c.id for c in conversation_store.list_conversations().data}
+
+
 # ── Delete ───────────────────────────────────────────
 
 
@@ -1495,8 +1599,16 @@ def test_subagent_conversations_are_isolated(
     in ``list_items`` is broken, which would cause sub-agents to
     see each other's messages and produce incoherent LLM prompts.
     """
-    conv_a = conversation_store.create_conversation(kind="sub_agent")
-    conv_b = conversation_store.create_conversation(kind="sub_agent")
+    # Sub-agents require a parent (kind="sub_agent" iff parent set). A shared
+    # parent is fine — the test only asserts the two children's items are
+    # isolated from each other.
+    parent = conversation_store.create_conversation(kind="default")
+    conv_a = conversation_store.create_conversation(
+        kind="sub_agent", parent_conversation_id=parent.id, title="alpha"
+    )
+    conv_b = conversation_store.create_conversation(
+        kind="sub_agent", parent_conversation_id=parent.id, title="bravo"
+    )
 
     # Append distinct items to each conversation.
     conversation_store.append(
@@ -1937,8 +2049,10 @@ def test_list_child_conversation_ids_by_parent_groups_direct_subagents(
     The sessions list uses this helper to roll child runner status onto
     parent rows without issuing one ``child_sessions`` query per sidebar
     row. This test proves the helper returns every requested parent key,
-    excludes other parents and non-sub-agent children, and does not widen
-    from direct children to nested descendants.
+    excludes other parents, and does not widen from direct children to
+    nested descendants. A conversation is a sub-agent iff it has a parent
+    (``kind`` is derived from parent-nullness), so every parented row here
+    is a direct child of its parent.
     """
     parent_a = conversation_store.create_conversation()
     parent_b = conversation_store.create_conversation()
@@ -1950,9 +2064,6 @@ def test_list_child_conversation_ids_by_parent_groups_direct_subagents(
     )
     child_b = conversation_store.create_conversation(
         kind="sub_agent", title="coder:other", parent_conversation_id=parent_b.id
-    )
-    default_child = conversation_store.create_conversation(
-        kind="default", title="default:child", parent_conversation_id=parent_a.id
     )
     nested = conversation_store.create_conversation(
         kind="sub_agent", title="reviewer:nested", parent_conversation_id=child_a1.id
@@ -1967,8 +2078,11 @@ def test_list_child_conversation_ids_by_parent_groups_direct_subagents(
     assert sorted(result[parent_a.id]) == sorted([child_a1.id, child_a2.id])
     assert result[parent_b.id] == [child_b.id]
     assert result["conv_missing"] == []
-    assert default_child.id not in result[parent_a.id]
+    # A grandchild is a direct child of child_a1, not of parent_a — the helper
+    # groups by the immediate parent and does not widen to nested descendants.
     assert nested.id not in result[parent_a.id]
+    nested_result = conversation_store.list_child_conversation_ids_by_parent([child_a1.id])
+    assert nested_result[child_a1.id] == [nested.id]
 
 
 # ── agent_id filter on list_conversations ──────────────

@@ -16,6 +16,7 @@ const serverInfoMocks = vi.hoisted(() => ({
   accountsEnabled: true,
   loginUrl: null as string | null,
   serverVersion: "0.3.0.dev0" as string | null,
+  singleUser: false,
 }));
 
 vi.mock("@/lib/CapabilitiesContext", () => ({
@@ -23,6 +24,7 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
     accounts_enabled: serverInfoMocks.accountsEnabled,
     login_url: serverInfoMocks.loginUrl,
     server_version: serverInfoMocks.serverVersion,
+    single_user: serverInfoMocks.singleUser,
   }),
 }));
 
@@ -67,6 +69,7 @@ beforeEach(() => {
   serverInfoMocks.accountsEnabled = true;
   serverInfoMocks.loginUrl = null;
   serverInfoMocks.serverVersion = "0.3.0.dev0";
+  serverInfoMocks.singleUser = false;
 });
 
 afterEach(cleanup);

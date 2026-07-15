@@ -216,8 +216,22 @@ Validated for presence and shape only: `Owner`, `Transport`, `Implementation`,
 
 Planned dimensions are steering, live queue, resume, images, and compaction.
 
+Their declarations already have a place in `HarnessCapabilities`: resume uses
+the `Resume` mechanism enum, while steering, live queue, images, and compaction
+are optional booleans. An unset optional value makes no claim and therefore
+stays `UNKNOWN` until the corresponding probe work establishes the harness's
+expected behavior.
+
 Every behavioral probe also reads the corresponding declared flag and returns
 `DRIFT` when observed disagrees with declared.
+
+The CLI can slice this catalog with repeatable or comma-separated
+`--dimension` values. A slice always includes `basic_turn` because it proves
+the harness is exercisable before interpreting another probe's result. Reports
+and the live Rich grid contain only the selected columns. Each repeated
+`--harness NAME[=MODEL]` binds an optional model override directly to that
+harness, avoiding both test model-pool environment variables and positional
+cross-family assignment. Omitting `=MODEL` keeps that profile's default.
 
 ### Illustrative probe shape
 
@@ -425,5 +439,5 @@ agree with it.
 - **Per-harness native provisioning** — some vendors require login or provider
   configuration that the bench deliberately cannot create. Improve diagnostics
   where possible while retaining clean skips.
-- **Additional dimensions** — steering, live queue, resume, reasoning,
-  images, and compaction.
+- **Additional dimensions** — steering, live queue, resume, images, and
+  compaction.

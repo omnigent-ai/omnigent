@@ -69,6 +69,7 @@ def _make_conversation(
     parent_conversation_id: str | None = None,
     root_conversation_id: str | None = None,
     title: str | None = None,
+    archived: bool = False,
 ) -> SqlConversation:
     return SqlConversation(
         id=id,
@@ -77,6 +78,7 @@ def _make_conversation(
         parent_conversation_id=parent_conversation_id,
         root_conversation_id=root_conversation_id or id,
         title=title,
+        archived=archived,
     )
 
 
@@ -94,7 +96,6 @@ def _make_metadata(
     return SqlConversationMetadata(
         id=id,
         kind=encode_conversation_kind(kind),
-        archived=False,
     )
 
 
@@ -380,7 +381,7 @@ class TestSqlConversation:
             assert loaded.agent_id is None
 
     def test_metadata_kind_and_archived(self, db_uri: str) -> None:
-        """kind and archived live on SqlConversationMetadata, not SqlConversation."""
+        """kind lives on SqlConversationMetadata; archived on SqlConversation."""
         engine = get_or_create_engine(db_uri)
         managed = make_managed_session_maker(engine)
 
@@ -391,10 +392,12 @@ class TestSqlConversation:
             session.add(meta)
 
         with managed() as session:
-            loaded = session.get(SqlConversationMetadata, (0, "conv_test1"))
-            assert loaded is not None
-            assert loaded.kind == encode_conversation_kind("default")
-            assert loaded.archived is False
+            loaded_meta = session.get(SqlConversationMetadata, (0, "conv_test1"))
+            assert loaded_meta is not None
+            assert loaded_meta.kind == encode_conversation_kind("default")
+            loaded_conv = session.get(SqlConversation, (0, "conv_test1"))
+            assert loaded_conv is not None
+            assert loaded_conv.archived is False
 
     def test_metadata_check_constraint_rejects_invalid_kind(self, db_uri: str) -> None:
         engine = get_or_create_engine(db_uri)

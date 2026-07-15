@@ -162,6 +162,71 @@ def test_list_conversations_archived_filter(store: SqlAlchemyConversationStore) 
     assert any(c.archived for c in all_.data)
 
 
+def test_kind_derived_from_parent_nullness_not_metadata(
+    omnigent_db: Path,
+    store: SqlAlchemyConversationStore,
+) -> None:
+    """``kind`` is read from parent-nullness, so it stays correct even when the
+    metadata row (the old source of the ``kind`` column) is missing.
+
+    Simulates a create that crashed after the AP conversation row landed but
+    before the Omnigent metadata row: deleting the metadata row must not flip a
+    child's kind back to ``"default"``.
+    """
+    parent = store.create_conversation(title="parent")
+    child = store.create_conversation(
+        kind="sub_agent", title="coder:child", parent_conversation_id=parent.id
+    )
+
+    # Drop the child's metadata row to mimic a crashed create (orphaned AP row).
+    with sqlite3.connect(str(omnigent_db)) as conn:
+        conn.execute("DELETE FROM omnigent_conversation_metadata WHERE id = ?", (child.id,))
+
+    fetched = store.get_conversation(child.id)
+    assert fetched is not None
+    assert fetched.kind == "sub_agent"
+    # And the parent-scoped listing still finds it despite the missing metadata.
+    page = store.list_conversations(kind="sub_agent", parent_conversation_id=parent.id)
+    assert [c.id for c in page.data] == [child.id]
+
+
+def test_child_listing_does_not_prefetch_workspace_wide(
+    monkeypatch: pytest.MonkeyPatch,
+    store: SqlAlchemyConversationStore,
+) -> None:
+    """The parent-scoped child listing must not open an Omnigent-pool session to
+    prefetch a workspace-wide id set — the post-split slowdown this fixes.
+
+    Fails the test if ``list_conversations(parent_conversation_id=...)`` touches
+    ``self._session`` (the Omnigent pool) for a kind/archived prefetch. It may
+    still use ``self._conv_session`` (the AP pool) freely, and it reads metadata
+    for the returned page via a separate, bounded ``self._session`` call — which
+    is why we only assert the *prefetch* path is gone by counting sessions: a
+    parent-scoped page fetch opens the Omnigent pool at most once (page-metadata
+    merge), never twice (prefetch + merge).
+    """
+    parent = store.create_conversation(title="parent")
+    for i in range(3):
+        store.create_conversation(
+            kind="sub_agent", title=f"coder:c{i}", parent_conversation_id=parent.id
+        )
+
+    calls = {"omnigent_sessions": 0}
+    real_session = store._session
+
+    def counting_session(*args: object, **kwargs: object) -> object:
+        calls["omnigent_sessions"] += 1
+        return real_session(*args, **kwargs)
+
+    monkeypatch.setattr(store, "_session", counting_session)
+    page = store.list_conversations(kind="sub_agent", parent_conversation_id=parent.id)
+
+    assert len(page.data) == 3
+    # One Omnigent-pool session for the page-metadata merge; the workspace-wide
+    # prefetch (a second, unbounded one) must be gone.
+    assert calls["omnigent_sessions"] <= 1
+
+
 # ── labels ─────────────────────────────────────────────
 
 
@@ -389,16 +454,17 @@ def test_agent_store_resolves_session_id_across_dbs(
 # ── Orphan repair: update with a missing metadata row ─────────────────
 
 
-def test_update_conversation_repairs_missing_metadata(
+def test_update_conversation_archives_without_metadata_row(
     omnigent_db: Path,
     conv_db: Path,
     store: SqlAlchemyConversationStore,
 ) -> None:
     """
-    A crash between the AP and metadata transactions during creation
-    leaves a conversation with no metadata row. An archive update must
-    recreate the row (deriving ``kind`` from the parent pointer) rather
-    than silently dropping the write and reporting ``archived=False``.
+    A crash between the AP and metadata transactions during creation leaves a
+    conversation with no metadata row. ``archived`` now lives on the AP
+    conversations row, so an archive update must persist and report correctly
+    even without a metadata row — and ``kind`` stays correct (derived from the
+    parent pointer), never silently reporting ``archived=False``.
     """
     parent = store.create_conversation(title="orphan parent")
     child = store.create_conversation(
@@ -418,17 +484,20 @@ def test_update_conversation_repairs_missing_metadata(
     updated = store.update_conversation(parent.id, archived=True)
     assert updated is not None
     assert updated.archived is True
+    assert updated.kind == "default"
 
     child_updated = store.update_conversation(child.id, archived=True)
     assert child_updated is not None
     assert child_updated.archived is True
-    # kind is rederived from the parent pointer during repair.
+    # kind is derived from the parent pointer, not the (missing) metadata row.
     assert child_updated.kind == "sub_agent"
 
-    # Both metadata rows were recreated in the Omnigent DB.
-    assert sorted(_col(omnigent_db, "omnigent_conversation_metadata", "id")) == sorted(
+    # archived is persisted on the AP conversations rows.
+    assert sorted(_col(conv_db, "conversations", "id", where="archived = 1")) == sorted(
         [parent.id, child.id]
     )
+    # The archive path does not resurrect metadata rows (archived is AP-side now).
+    assert _count(omnigent_db, "omnigent_conversation_metadata") == 0
 
 
 # ── Session-scoped agent cleanup on conversation delete ───────────────

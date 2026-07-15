@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from omnigent.harness_aliases import is_native_harness
-from omnigent.harness_capabilities import AuthModel, HarnessCapabilities, IntegrationMode
+from omnigent.harness_capabilities import AuthModel, HarnessCapabilities, IntegrationMode, Resume
 from omnigent.harness_plugins import (
     harness_aliases,
     harness_capabilities,
@@ -59,6 +59,15 @@ def _declared_from_capabilities(harness: str) -> dict[str, Verdict]:
     if caps is not None:
         declared["streaming"] = Verdict.SUPPORTED if caps.streaming else Verdict.UNSUPPORTED
         declared["interrupt"] = Verdict.SUPPORTED if caps.interrupt else Verdict.UNSUPPORTED
+        resume = getattr(caps, "resume", None)
+        if resume is not None:
+            declared["resume"] = (
+                Verdict.UNSUPPORTED if resume is Resume.NONE else Verdict.SUPPORTED
+            )
+        for dimension in ("steering", "live_queue", "images", "compaction"):
+            supported = getattr(caps, dimension, None)
+            if supported is not None:
+                declared[dimension] = Verdict.SUPPORTED if supported else Verdict.UNSUPPORTED
 
     if harness in model_env_keys() or is_native_harness(harness):
         declared["model_override"] = Verdict.SUPPORTED
