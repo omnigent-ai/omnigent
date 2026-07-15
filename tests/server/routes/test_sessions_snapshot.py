@@ -45,6 +45,14 @@ async def _drain_model_options(session_id: str) -> None:
         await asyncio.sleep(0)
 
 
+async def _drain_model_options_inflight(session_id: str) -> None:
+    """Pump the loop until a model-options background fetch finishes."""
+    for _ in range(100):
+        if session_id not in _sessions_mod._model_options_inflight:
+            return
+        await asyncio.sleep(0)
+
+
 class _ConversationStore:
     """Minimal store that records ``list_items`` calls.
 
@@ -925,6 +933,208 @@ async def test_session_snapshot_fetches_dynamic_kiro_model_options(
     ]
     assert snapshot.model_options[1]["displayName"] == "Claude Opus 4.8"
     assert published == ["conv_kiro_options"]
+
+
+@pytest.mark.asyncio
+async def test_kiro_unavailable_model_failure_uses_retry_cooldown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unavailable Kiro discovery retries automatically after its cooldown."""
+    from omnigent.server.routes import sessions as _mod
+
+    _mod._model_options_cache.clear()
+    _mod._model_options_inflight.clear()
+    _mod._model_options_generation.clear()
+    _mod._model_options_retry_after.clear()
+
+    class _FakeResponse:
+        def __init__(self, status_code: int, payload: dict[str, object] | None = None) -> None:
+            self.status_code = status_code
+            self._payload = payload or {}
+
+        def json(self) -> dict[str, object]:
+            return self._payload
+
+    class _FakeRunnerClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def get(self, url: str, timeout: float) -> _FakeResponse:
+            del url, timeout
+            self.calls += 1
+            if self.calls == 1:
+                return _FakeResponse(424)
+            return _FakeResponse(
+                200,
+                {"models": [{"id": "auto", "displayName": "Auto", "isDefault": True}]},
+            )
+
+    client = _FakeRunnerClient()
+    session_id = "conv_kiro_unavailable"
+    path = f"/v1/sessions/{session_id}/kiro-model-options"
+    generation = object()
+    _mod._model_options_generation[session_id] = generation
+
+    monkeypatch.setattr(_mod, "_MODEL_OPTIONS_UNAVAILABLE_COOLDOWN_S", 0.0)
+    await _mod._load_model_options(  # type: ignore[arg-type]
+        client,
+        session_id,
+        path,
+        generation=generation,
+    )
+
+    assert client.calls == 2
+    assert [model["id"] for model in _mod._model_options_cache[session_id]] == ["auto"]
+    assert session_id not in _mod._model_options_retry_after
+
+
+@pytest.mark.asyncio
+async def test_model_options_refresh_fences_stale_inflight_failure() -> None:
+    """A pre-refresh failure cannot restore cooldown state afterward."""
+    from omnigent.server.routes import sessions as _mod
+
+    _mod._model_options_cache.clear()
+    _mod._model_options_inflight.clear()
+    _mod._model_options_generation.clear()
+    _mod._model_options_retry_after.clear()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class _PermanentFailure:
+        status_code = 424
+
+    class _SlowRunnerClient:
+        async def get(self, url: str, timeout: float) -> _PermanentFailure:
+            del url, timeout
+            started.set()
+            await release.wait()
+            return _PermanentFailure()
+
+    session_id = "conv_kiro_stale_failure"
+    generation = object()
+    _mod._model_options_generation[session_id] = generation
+    task = asyncio.create_task(
+        _mod._load_model_options(  # type: ignore[arg-type]
+            _SlowRunnerClient(),
+            session_id,
+            f"/v1/sessions/{session_id}/kiro-model-options",
+            generation=generation,
+        )
+    )
+    _mod._model_options_inflight[session_id] = task
+    await started.wait()
+
+    _mod._invalidate_runner_backed_snapshot_state(session_id, cancel_inflight=False)
+    release.set()
+    await task
+
+    assert session_id not in _mod._model_options_inflight
+    assert session_id not in _mod._model_options_retry_after
+
+    _mod._invalidate_runner_backed_snapshot_state(session_id, cancel_inflight=True)
+    assert session_id not in _mod._model_options_generation
+
+
+@pytest.mark.asyncio
+async def test_kiro_unavailable_model_failure_has_bounded_retry_lifetime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repeated 424 responses stop, leaving next snapshot free to retry."""
+    from omnigent.server.routes import sessions as _mod
+
+    _mod._model_options_cache.clear()
+    _mod._model_options_inflight.clear()
+    _mod._model_options_generation.clear()
+    _mod._model_options_retry_after.clear()
+
+    class _Unavailable:
+        status_code = 424
+
+    class _RunnerClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def get(self, url: str, timeout: float) -> _Unavailable:
+            del url, timeout
+            self.calls += 1
+            return _Unavailable()
+
+    client = _RunnerClient()
+    session_id = "conv_kiro_bounded_unavailable"
+    generation = object()
+    _mod._model_options_generation[session_id] = generation
+    monkeypatch.setattr(_mod, "_MODEL_OPTIONS_UNAVAILABLE_COOLDOWN_S", 0.0)
+    monkeypatch.setattr(_mod, "_MODEL_OPTIONS_UNAVAILABLE_MAX_ATTEMPTS", 3)
+
+    await _mod._load_model_options(  # type: ignore[arg-type]
+        client,
+        session_id,
+        f"/v1/sessions/{session_id}/kiro-model-options",
+        generation=generation,
+    )
+
+    assert client.calls == 3
+    assert session_id not in _mod._model_options_cache
+    assert session_id not in _mod._model_options_retry_after
+
+
+@pytest.mark.asyncio
+async def test_cancelled_stale_model_fetch_cannot_overwrite_rebound_runner() -> None:
+    """Cancellation-resistant old fetch cannot win after delete/rebind."""
+    from omnigent.server.routes import sessions as _mod
+
+    _mod._model_options_cache.clear()
+    _mod._model_options_inflight.clear()
+    _mod._model_options_generation.clear()
+    old_started = asyncio.Event()
+    release_old = asyncio.Event()
+
+    class _Response:
+        status_code = 200
+
+        def __init__(self, model_id: str) -> None:
+            self.model_id = model_id
+
+        def json(self) -> dict[str, object]:
+            return {"models": [{"id": self.model_id, "displayName": self.model_id}]}
+
+    class _OldRunner:
+        async def get(self, url: str, timeout: float) -> _Response:
+            del url, timeout
+            old_started.set()
+            try:
+                await release_old.wait()
+            except asyncio.CancelledError:
+                await release_old.wait()
+            return _Response("stale")
+
+    class _NewRunner:
+        async def get(self, url: str, timeout: float) -> _Response:
+            del url, timeout
+            return _Response("fresh")
+
+    session_id = "conv_model_rebind_aba"
+    path = f"/v1/sessions/{session_id}/kiro-model-options"
+    old_generation = object()
+    _mod._model_options_generation[session_id] = old_generation
+    old_task = asyncio.create_task(
+        _mod._load_model_options(  # type: ignore[arg-type]
+            _OldRunner(), session_id, path, generation=old_generation
+        )
+    )
+    _mod._model_options_inflight[session_id] = old_task
+    await old_started.wait()
+
+    _mod._invalidate_runner_backed_snapshot_state(session_id, cancel_inflight=True)
+    new_generation = object()
+    _mod._model_options_generation[session_id] = new_generation
+    await _mod._load_model_options(  # type: ignore[arg-type]
+        _NewRunner(), session_id, path, generation=new_generation
+    )
+    release_old.set()
+    await old_task
+
+    assert [model["id"] for model in _mod._model_options_cache[session_id]] == ["fresh"]
 
 
 @pytest.mark.asyncio

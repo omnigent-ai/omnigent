@@ -630,6 +630,10 @@ def _kiro_session_workspace(session_workspace: str | None) -> Path:
     return Path(raw.strip()).expanduser().resolve()
 
 
+_KIRO_MODEL_OPTIONS_TOTAL_TIMEOUT_S = 20.0
+_KIRO_MODEL_OPTIONS_SUBPROCESS_MARGIN_S = 0.5
+
+
 async def _kiro_native_launch_config(
     *,
     session_id: str,
@@ -11125,21 +11129,36 @@ def create_runner_app(
             build_kiro_native_discovery_env,
         )
 
-        launch_config = await _kiro_native_launch_config(
-            session_id=conv_id,
-            server_client=server_client,
-        )
-        env = build_kiro_native_discovery_env()
-        for key in KIRO_NATIVE_ENV_UNSET:
-            env.pop(key, None)
-        env["KIRO_LOG_NO_COLOR"] = "true"
-        executable = resolve_kiro_executable()
-        return await asyncio.to_thread(
-            discover_kiro_model_options,
-            executable,
-            cwd=launch_config.workspace,
-            env=env,
-        )
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _KIRO_MODEL_OPTIONS_TOTAL_TIMEOUT_S
+        worker_deadline = time.monotonic() + _KIRO_MODEL_OPTIONS_TOTAL_TIMEOUT_S
+        async with asyncio.timeout_at(deadline):
+            launch_config = await _kiro_native_launch_config(
+                session_id=conv_id,
+                server_client=server_client,
+            )
+            env = build_kiro_native_discovery_env()
+            for key in KIRO_NATIVE_ENV_UNSET:
+                env.pop(key, None)
+            env["KIRO_LOG_NO_COLOR"] = "true"
+            executable = resolve_kiro_executable()
+
+            def _discover_before_deadline() -> list[dict[str, Any]]:
+                remaining_s = (
+                    worker_deadline - time.monotonic() - _KIRO_MODEL_OPTIONS_SUBPROCESS_MARGIN_S
+                )
+                if remaining_s <= 0:
+                    raise TimeoutError("Kiro model-options deadline exhausted before discovery")
+                return discover_kiro_model_options(
+                    executable,
+                    cwd=launch_config.workspace,
+                    env=env,
+                    timeout_s=min(10.0, remaining_s),
+                )
+
+            return await asyncio.to_thread(
+                _discover_before_deadline,
+            )
 
     async def _handle_pi_native_interrupt(conv_id: str) -> Response:
         """
@@ -17822,8 +17841,11 @@ def create_runner_app(
         :param session_id: Session/conversation identifier, e.g.
             ``"conv_abc123"``.
         :returns: JSON ``{"models": [...]}``. Wrong-harness sessions return an
-            empty list; discovery failures return retryable HTTP 503.
+            empty list. Failures requiring a retry cooldown return HTTP 424;
+            transient not-ready failures return HTTP 503.
         """
+        from omnigent.kiro_native import KiroModelDiscoveryUnavailable
+
         if _session_harness_name(session_id) != "kiro-native":
             return JSONResponse(status_code=200, content={"models": []})
         try:
@@ -17831,7 +17853,16 @@ def create_runner_app(
                 status_code=200,
                 content={"models": await _kiro_native_model_options(session_id)},
             )
-        except Exception as exc:  # noqa: BLE001 - surface runner-local CLI failures to AP.
+        except KiroModelDiscoveryUnavailable as exc:
+            _logger.info("Kiro model discovery unavailable for session=%s", session_id)
+            return JSONResponse(
+                status_code=424,
+                content={
+                    "error": "kiro_native_model_options_unavailable",
+                    "detail": _client_safe_error_detail(exc, context="kiro-native model options"),
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 - surface transient runner failures to AP.
             _logger.warning(
                 "Kiro model discovery failed for session=%s",
                 session_id,

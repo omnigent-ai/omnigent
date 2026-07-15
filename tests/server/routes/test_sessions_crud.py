@@ -8,9 +8,11 @@ the stores.
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, patch
 
 import httpx
+import pytest
 import pytest_asyncio
 
 from omnigent.db.utils import generate_agent_id
@@ -106,6 +108,46 @@ async def test_delete_session(
     assert resp.status_code == 200
     body = resp.json()
     assert body["deleted"] is True
+
+
+async def test_delete_session_cancels_model_options_recovery(
+    client: httpx.AsyncClient,
+    session_id: str,
+) -> None:
+    """Deleting a session cancels and clears runner-backed model discovery."""
+    started = asyncio.Event()
+
+    async def _wait_for_retry() -> None:
+        started.set()
+        await asyncio.Event().wait()
+
+    task = asyncio.create_task(_wait_for_retry())
+    await started.wait()
+    sessions_module._model_options_cache[session_id] = [{"id": "auto"}]
+    sessions_module._model_options_retry_after[session_id] = 123.0
+    sessions_module._model_options_generation[session_id] = 7
+    sessions_module._model_options_inflight[session_id] = task
+    sessions_module._pushed_model_options_cache[session_id] = [{"id": "pi-model"}]
+
+    try:
+        resp = await client.delete(f"/v1/sessions/{session_id}")
+
+        assert resp.status_code == 200
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert session_id not in sessions_module._model_options_cache
+        assert session_id not in sessions_module._model_options_retry_after
+        assert session_id not in sessions_module._model_options_generation
+        assert session_id not in sessions_module._model_options_inflight
+        assert session_id not in sessions_module._pushed_model_options_cache
+    finally:
+        sessions_module._model_options_cache.pop(session_id, None)
+        sessions_module._model_options_retry_after.pop(session_id, None)
+        sessions_module._model_options_generation.pop(session_id, None)
+        sessions_module._model_options_inflight.pop(session_id, None)
+        sessions_module._pushed_model_options_cache.pop(session_id, None)
+        if not task.done():
+            task.cancel()
 
 
 async def test_delete_session_not_found(client: httpx.AsyncClient) -> None:

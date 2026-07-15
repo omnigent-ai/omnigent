@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import subprocess
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -49,6 +50,14 @@ _AGENT_NAME = "kiro-native-ui"
 _KIRO_MODEL_DISCOVERY_TIMEOUT_S = 10.0
 
 
+class KiroModelDiscoveryUnavailable(RuntimeError):
+    """Kiro model discovery should pause before a later retry."""
+
+
+class KiroModelDiscoveryNotReady(RuntimeError):
+    """Kiro model discovery may succeed when retried shortly."""
+
+
 def normalize_kiro_model_options(payload: Any) -> list[dict[str, Any]]:
     """Normalize ``kiro-cli chat --list-models --format json`` output.
 
@@ -79,6 +88,7 @@ def normalize_kiro_model_options(payload: Any) -> list[dict[str, Any]]:
 
     options: list[dict[str, Any]] = []
     seen: set[str] = set()
+    supplied_default_ids: list[str] = []
     for raw in raw_models:
         if isinstance(raw, str):
             model_id = raw.strip()
@@ -108,6 +118,8 @@ def normalize_kiro_model_options(payload: Any) -> list[dict[str, Any]]:
             raise ValueError("Kiro model catalog entries must be strings or objects")
         if not model_id:
             raise ValueError("Kiro model catalog entry is missing an id")
+        if supplied_default and model_id not in supplied_default_ids:
+            supplied_default_ids.append(model_id)
         if model_id in seen:
             continue
         seen.add(model_id)
@@ -115,13 +127,20 @@ def normalize_kiro_model_options(payload: Any) -> list[dict[str, Any]]:
             {
                 "id": model_id,
                 "displayName": display_name,
-                "isDefault": supplied_default
-                or model_id == catalog_default
-                or (catalog_default is None and model_id == "auto"),
+                "isDefault": False,
             }
         )
     if not options:
         raise ValueError("Kiro model catalog is empty")
+    default_id = catalog_default if catalog_default in seen else None
+    if default_id is None:
+        default_id = next(
+            (model_id for model_id in supplied_default_ids if model_id in seen), None
+        )
+    if default_id is None and "auto" in seen:
+        default_id = "auto"
+    for option in options:
+        option["isDefault"] = option["id"] == default_id
     return options
 
 
@@ -137,32 +156,54 @@ def discover_kiro_model_options(
     :param executable: Resolved ``kiro-cli`` executable path.
     :param cwd: Session workspace, matching the live Kiro terminal.
     :param env: Sanitized Kiro child environment.
-    :param timeout_s: Maximum discovery runtime in seconds.
+    :param timeout_s: Maximum combined runtime for authentication and discovery.
     :returns: Normalized Web-picker model options.
-    :raises RuntimeError: If Kiro cannot run, times out, exits non-zero, or emits
-        invalid JSON/catalog data.
+    :raises KiroModelDiscoveryUnavailable: If Kiro is unauthenticated, cannot
+        run, exits non-zero, or emits invalid JSON/catalog data.
+    :raises KiroModelDiscoveryNotReady: If a bounded CLI check times out.
     """
-    argv = [executable, "chat", "--list-models", "--format", "json"]
-    try:
-        completed = subprocess.run(
-            argv,
-            cwd=cwd,
-            env=dict(env),
-            capture_output=True,
-            text=True,
-            timeout=timeout_s,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise RuntimeError(f"Kiro model discovery failed: {exc}") from exc
-    if completed.returncode != 0:
-        detail = completed.stderr.strip() or completed.stdout.strip() or "unknown error"
-        raise RuntimeError(f"Kiro model discovery exited {completed.returncode}: {detail}")
+
+    deadline = time.monotonic() + timeout_s
+
+    def _run(argv: list[str], *, action: str) -> subprocess.CompletedProcess[str]:
+        remaining_s = deadline - time.monotonic()
+        if remaining_s <= 0:
+            raise KiroModelDiscoveryNotReady(f"Kiro {action} timed out")
+        try:
+            completed = subprocess.run(
+                argv,
+                cwd=cwd,
+                env=dict(env),
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=remaining_s,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise KiroModelDiscoveryNotReady(f"Kiro {action} timed out") from exc
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise KiroModelDiscoveryUnavailable(f"Kiro {action} failed: {exc}") from exc
+        if completed.returncode != 0:
+            detail = completed.stderr.strip() or completed.stdout.strip() or "unknown error"
+            raise KiroModelDiscoveryUnavailable(
+                f"Kiro {action} exited {completed.returncode}: {detail}"
+            )
+        return completed
+
+    _run([executable, "whoami", "--format", "json"], action="authentication check")
+
+    completed = _run(
+        [executable, "chat", "--list-models", "--format", "json"],
+        action="model discovery",
+    )
     try:
         payload = json.loads(completed.stdout)
         return normalize_kiro_model_options(payload)
     except (json.JSONDecodeError, ValueError) as exc:
-        raise RuntimeError(f"Kiro model discovery returned invalid JSON: {exc}") from exc
+        raise KiroModelDiscoveryUnavailable(
+            f"Kiro model discovery returned invalid JSON: {exc}"
+        ) from exc
 
 
 _TERMINAL_NAME = "kiro"

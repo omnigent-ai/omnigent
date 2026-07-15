@@ -106,6 +106,34 @@ class _HeartbeatRunnerClient:
         return _HeartbeatStreamResponse(self._release)
 
 
+class _CatalogResponse:
+    """Minimal response for runner-backed snapshot catalogs."""
+
+    status_code = 200
+
+    def __init__(self, payload: dict[str, object]) -> None:
+        self._payload = payload
+
+    def json(self) -> dict[str, object]:
+        """Return configured JSON payload."""
+        return self._payload
+
+
+class _CatalogHeartbeatRunnerClient(_HeartbeatRunnerClient):
+    """Heartbeat runner that also serves replacement-runner catalogs."""
+
+    async def get(self, path: str, *, timeout: float) -> _CatalogResponse:
+        """Serve skills and model options discovered on replacement runner."""
+        del timeout
+        if path.endswith("/skills"):
+            return _CatalogResponse(
+                {"skills": [{"name": "new-skill", "description": "From new runner."}]}
+            )
+        if path.endswith("/kiro-model-options"):
+            return _CatalogResponse({"models": [{"id": "new-model", "displayName": "New Model"}]})
+        raise AssertionError(f"Unexpected path: {path}")
+
+
 @pytest.mark.asyncio
 async def test_runner_relay_ready_waits_for_runner_heartbeat() -> None:
     """
@@ -144,6 +172,94 @@ async def test_runner_relay_ready_waits_for_runner_heartbeat() -> None:
         if handle is not None:
             await asyncio.wait_for(handle.task, timeout=1.0)
         sessions_module._runner_relay_tasks.clear()
+
+
+@pytest.mark.asyncio
+async def test_replaced_relay_cannot_invalidate_new_runner_fetch() -> None:
+    """Rebind drops old catalogs; old finalizer cannot drop new catalogs."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    sessions_module._runner_relay_tasks.clear()
+    sessions_module._runner_skills_cache.clear()
+    sessions_module._runner_skills_inflight.clear()
+    sessions_module._runner_skills_generation.clear()
+    sessions_module._model_options_cache.clear()
+    sessions_module._model_options_inflight.clear()
+    sessions_module._model_options_generation.clear()
+    old_release = asyncio.Event()
+    new_release = asyncio.Event()
+    session_id = "conv_relay_rebind_models"
+
+    old_handle = sessions_module._ensure_runner_relay(
+        session_id,
+        "runner_old",
+        _HeartbeatRunnerClient(old_release),  # type: ignore[arg-type]
+    )
+    assert old_handle is not None
+    await old_handle.ready.wait()
+
+    old_skills_fetch = asyncio.create_task(asyncio.Event().wait())
+    old_model_fetch = asyncio.create_task(asyncio.Event().wait())
+    sessions_module._runner_skills_cache[session_id] = [
+        sessions_module.SkillSummary(name="old-skill", description="From old runner.")
+    ]
+    sessions_module._runner_skills_inflight[session_id] = old_skills_fetch  # type: ignore[assignment]
+    sessions_module._model_options_cache[session_id] = [{"id": "old-model"}]
+    sessions_module._model_options_inflight[session_id] = old_model_fetch  # type: ignore[assignment]
+
+    new_runner = _CatalogHeartbeatRunnerClient(new_release)
+    new_handle = sessions_module._ensure_runner_relay(
+        session_id,
+        "runner_new",
+        new_runner,  # type: ignore[arg-type]
+    )
+    assert new_handle is not None
+    assert session_id not in sessions_module._runner_skills_cache
+    assert session_id not in sessions_module._runner_skills_inflight
+    assert session_id not in sessions_module._model_options_cache
+    assert session_id not in sessions_module._model_options_inflight
+
+    conv = SimpleNamespace(
+        labels={
+            sessions_module._CLAUDE_NATIVE_WRAPPER_LABEL_KEY: (
+                sessions_module._KIRO_NATIVE_WRAPPER_LABEL_VALUE
+            )
+        }
+    )
+    assert await sessions_module._fetch_runner_skills(new_runner, session_id) == []  # type: ignore[arg-type]
+    assert (
+        await sessions_module._fetch_model_options(  # type: ignore[arg-type]
+            new_runner,
+            session_id,
+            conv,
+        )
+        == []
+    )
+    await asyncio.gather(
+        sessions_module._runner_skills_inflight[session_id],
+        sessions_module._model_options_inflight[session_id],
+    )
+
+    with contextlib.suppress(asyncio.CancelledError):
+        await old_handle.task
+
+    assert [skill.name for skill in sessions_module._runner_skills_cache[session_id]] == [
+        "new-skill"
+    ]
+    assert sessions_module._model_options_cache[session_id] == [
+        {"id": "new-model", "displayName": "New Model"}
+    ]
+
+    new_release.set()
+    with contextlib.suppress(asyncio.CancelledError):
+        await new_handle.task
+    sessions_module._runner_relay_tasks.clear()
+    sessions_module._runner_skills_cache.clear()
+    sessions_module._runner_skills_inflight.clear()
+    sessions_module._runner_skills_generation.clear()
+    sessions_module._model_options_cache.clear()
+    sessions_module._model_options_inflight.clear()
+    sessions_module._model_options_generation.clear()
 
 
 class _ScriptedStreamResponse:

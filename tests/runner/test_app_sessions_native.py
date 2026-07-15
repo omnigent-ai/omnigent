@@ -17,7 +17,7 @@ import shutil
 import sys
 import threading
 import uuid
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -9759,8 +9759,9 @@ async def test_kiro_native_model_options_discovers_on_runner(
         *,
         cwd: Path,
         env: dict[str, str],
+        timeout_s: float,
     ) -> list[dict[str, object]]:
-        recorded.update(executable=executable, cwd=cwd, env=env)
+        recorded.update(executable=executable, cwd=cwd, env=env, timeout_s=timeout_s)
         return [
             {"id": "auto", "displayName": "Auto", "isDefault": True},
             {"id": "claude-opus-4.8", "displayName": "Claude Opus 4.8"},
@@ -9812,6 +9813,7 @@ async def test_kiro_native_model_options_discovers_on_runner(
     }
     assert recorded["executable"] == "/opt/kiro-cli"
     assert recorded["cwd"] == workspace.resolve()
+    assert 0 < cast(float, recorded["timeout_s"]) <= 10.0
     env = cast(dict[str, str], recorded["env"])
     assert env["HOME"] == str(tmp_path / "home")
     assert env["KIRO_HOME"] == str(tmp_path / "kiro-home")
@@ -9823,19 +9825,164 @@ async def test_kiro_native_model_options_discovers_on_runner(
 
 
 @pytest.mark.asyncio
-async def test_kiro_native_model_options_failure_is_retryable(
+async def test_kiro_native_model_options_has_runner_side_total_deadline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Runner returns 503 when Kiro discovery fails, preventing empty caching."""
+    """Runner bounds workspace lookup and discovery under one deadline."""
+    from omnigent import kiro_native
+
+    conv_id = "conv_kiro_model_options_deadline"
+    monkeypatch.setattr("omnigent.runner.app._KIRO_MODEL_OPTIONS_TOTAL_TIMEOUT_S", 0.02)
+    monkeypatch.setattr("omnigent.runner.app._KIRO_MODEL_OPTIONS_SUBPROCESS_MARGIN_S", 0.005)
+    monkeypatch.setattr(
+        kiro_native,
+        "discover_kiro_model_options",
+        lambda *args, **kwargs: pytest.fail("discovery must not start after workspace timeout"),
+    )
+
+    class _SlowSnapshotClient(NullServerClient):
+        async def get(self, url: str, **kwargs: Any) -> httpx.Response:
+            del kwargs
+            if url == f"/v1/sessions/{conv_id}":
+                await asyncio.sleep(1.0)
+            return await super().get(url)
+
+    spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "kiro-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=_SlowSnapshotClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        assert (
+            await client.post(
+                "/v1/sessions",
+                json={"session_id": conv_id, "agent_id": "ag_1"},
+            )
+        ).status_code == 201
+        resp = await client.get(f"/v1/sessions/{conv_id}/kiro-model-options")
+
+    assert resp.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_kiro_native_model_options_rechecks_deadline_inside_worker(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A queued worker cannot start Kiro after the request deadline."""
+    from omnigent import kiro_native
+
+    conv_id = "conv_kiro_model_options_queued_worker"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    discovery_called = False
+
+    monkeypatch.setattr("omnigent.runner.app._KIRO_MODEL_OPTIONS_TOTAL_TIMEOUT_S", 0.02)
+    monkeypatch.setattr("omnigent.runner.app._KIRO_MODEL_OPTIONS_SUBPROCESS_MARGIN_S", 0.005)
+    monkeypatch.setattr(kiro_native, "resolve_kiro_executable", lambda: "/opt/kiro-cli")
+
+    def _discover(*args: Any, **kwargs: Any) -> list[dict[str, object]]:
+        nonlocal discovery_called
+        discovery_called = True
+        return []
+
+    monkeypatch.setattr(kiro_native, "discover_kiro_model_options", _discover)
+
+    async def _queued_to_thread(func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.sleep(1.0)
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", _queued_to_thread)
+
+    class _SnapshotClient(NullServerClient):
+        async def get(self, url: str, **kwargs: Any) -> httpx.Response:
+            del kwargs
+            if url == f"/v1/sessions/{conv_id}":
+                return httpx.Response(
+                    200,
+                    json={"workspace": str(workspace)},
+                    request=httpx.Request("GET", url),
+                )
+            return await super().get(url)
+
+    spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "kiro-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=_SnapshotClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        assert (
+            await client.post(
+                "/v1/sessions",
+                json={"session_id": conv_id, "agent_id": "ag_1"},
+            )
+        ).status_code == 201
+        resp = await client.get(f"/v1/sessions/{conv_id}/kiro-model-options")
+
+    assert resp.status_code == 503
+    assert not discovery_called
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "expected_status", "expected_error"),
+    [
+        (
+            "unavailable",
+            424,
+            "kiro_native_model_options_unavailable",
+        ),
+        (
+            "transient",
+            503,
+            "kiro_native_model_options_failed",
+        ),
+    ],
+)
+async def test_kiro_native_model_options_classifies_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+    expected_status: int,
+    expected_error: str,
+) -> None:
+    """Runner distinguishes cooldown-worthy Kiro failure from not-ready."""
     from omnigent import kiro_native
 
     conv_id = "conv_kiro_native_model_options_failed"
     monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(Path.cwd()))
     monkeypatch.setattr(kiro_native, "resolve_kiro_executable", lambda: "kiro-cli")
+    error = (
+        kiro_native.KiroModelDiscoveryUnavailable("not logged in")
+        if failure == "unavailable"
+        else kiro_native.KiroModelDiscoveryNotReady("timed out")
+    )
     monkeypatch.setattr(
         kiro_native,
         "discover_kiro_model_options",
-        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("not logged in")),
+        lambda *args, **kwargs: (_ for _ in ()).throw(error),
     )
     spec = AgentSpec(
         spec_version=1,
@@ -9861,9 +10008,9 @@ async def test_kiro_native_model_options_failure_is_retryable(
         assert create_resp.status_code == 201, create_resp.text
         resp = await client.get(f"/v1/sessions/{conv_id}/kiro-model-options")
 
-    assert resp.status_code == 503, resp.text
+    assert resp.status_code == expected_status, resp.text
     assert resp.json() == {
-        "error": "kiro_native_model_options_failed",
+        "error": expected_error,
         "detail": "Request failed on the runner; see runner logs for details.",
     }
 

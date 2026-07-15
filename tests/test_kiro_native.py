@@ -14,6 +14,7 @@ from click import ClickException
 from omnigent._wrapper_labels import KIRO_NATIVE_WRAPPER_VALUE, WRAPPER_LABEL_KEY
 from omnigent.kiro_native import (
     _KIRO_PATH_ENV,
+    KiroModelDiscoveryUnavailable,
     LaunchedKiroTerminal,
     PreparedKiroTerminal,
     _attach_terminal_resource,
@@ -578,6 +579,20 @@ def test_normalize_kiro_model_options_preserves_order_and_metadata() -> None:
     ]
 
 
+def test_normalize_kiro_model_options_selects_one_item_default() -> None:
+    """An explicit item default wins over Auto, including on a duplicate."""
+    assert normalize_kiro_model_options(
+        [
+            {"id": "auto", "displayName": "Auto"},
+            {"id": "sonnet-5", "displayName": "Sonnet 5"},
+            {"id": "sonnet-5", "isDefault": True},
+        ]
+    ) == [
+        {"id": "auto", "displayName": "Auto", "isDefault": False},
+        {"id": "sonnet-5", "displayName": "Sonnet 5", "isDefault": True},
+    ]
+
+
 @pytest.mark.parametrize(
     "payload",
     [None, {}, {"models": "not-a-list"}, {"models": []}, {"models": [{}]}, [123]],
@@ -593,14 +608,15 @@ def test_discover_kiro_model_options_runs_machine_readable_command(
     tmp_path: Path,
 ) -> None:
     """Discovery runs Kiro in the session workspace with the supplied environment."""
-    recorded: dict[str, object] = {}
+    recorded: list[dict[str, object]] = []
 
     def _run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        recorded.update({"argv": argv, **kwargs})
+        recorded.append({"argv": argv, **kwargs})
+        stdout = "logged in" if argv[1] == "whoami" else '[{"id":"auto","displayName":"Auto"}]'
         return subprocess.CompletedProcess(
             argv,
             0,
-            stdout='[{"id":"auto","displayName":"Auto"}]',
+            stdout=stdout,
             stderr="",
         )
 
@@ -614,15 +630,45 @@ def test_discover_kiro_model_options_runs_machine_readable_command(
     )
 
     assert options == [{"id": "auto", "displayName": "Auto", "isDefault": True}]
-    assert recorded == {
-        "argv": ["/opt/kiro-cli", "chat", "--list-models", "--format", "json"],
+    assert len(recorded) == 2
+    first_timeout = recorded[0].pop("timeout")
+    second_timeout = recorded[1].pop("timeout")
+    assert isinstance(first_timeout, float) and 0 < first_timeout <= 3.0
+    assert isinstance(second_timeout, float) and 0 < second_timeout <= first_timeout
+    common = {
         "cwd": tmp_path,
         "env": {"HOME": "/home/test", "KIRO_HOME": "/kiro"},
+        "stdin": subprocess.DEVNULL,
         "capture_output": True,
         "text": True,
-        "timeout": 3.0,
         "check": False,
     }
+    assert recorded == [
+        {"argv": ["/opt/kiro-cli", "whoami", "--format", "json"], **common},
+        {
+            "argv": ["/opt/kiro-cli", "chat", "--list-models", "--format", "json"],
+            **common,
+        },
+    ]
+
+
+def test_discover_kiro_model_options_stops_after_unauthenticated_check(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Unauthenticated discovery is non-interactive and never launches chat."""
+    calls: list[tuple[list[str], object]] = []
+
+    def _run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append((argv, kwargs.get("stdin")))
+        return subprocess.CompletedProcess(argv, 2, stdout="", stderr="not logged in")
+
+    monkeypatch.setattr(subprocess, "run", _run)
+
+    with pytest.raises(KiroModelDiscoveryUnavailable, match="authentication check exited 2"):
+        discover_kiro_model_options("kiro-cli", cwd=tmp_path, env={})
+
+    assert calls == [(["kiro-cli", "whoami", "--format", "json"], subprocess.DEVNULL)]
 
 
 @pytest.mark.parametrize(
@@ -640,7 +686,13 @@ def test_discover_kiro_model_options_rejects_command_failures(
     message: str,
 ) -> None:
     """Non-zero, invalid, and empty discovery results surface as failures."""
-    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: completed)
+    responses = iter(
+        [
+            subprocess.CompletedProcess([], 0, stdout="logged in", stderr=""),
+            completed,
+        ]
+    )
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: next(responses))
 
     with pytest.raises(RuntimeError, match=message):
         discover_kiro_model_options("kiro-cli", cwd=tmp_path, env={})
