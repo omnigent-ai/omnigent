@@ -17,6 +17,7 @@
 		B10000000000000000000008 /* NativeNotificationManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000008 /* NativeNotificationManager.swift */; };
 		B10000000000000000000009 /* WebShellView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000009 /* WebShellView.swift */; };
 		B1000000000000000000000A /* WebViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000000A /* WebViewModel.swift */; };
+		B100000000000000000000FF /* OidcLoginManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000FF /* OidcLoginManager.swift */; };
 		B1000000000000000000000B /* OmnigentWebView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000000B /* OmnigentWebView.swift */; };
 		B1000000000000000000000C /* URL+Omnigent.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000000C /* URL+Omnigent.swift */; };
 		B10000000000000000000011 /* ChatTerminalBar.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000011 /* ChatTerminalBar.swift */; };
@@ -25,6 +26,7 @@
 		B1000000000000000000000E /* AppIcon.icon in Resources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000000E /* AppIcon.icon */; };
 		B10000000000000000000013 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000013 /* PrivacyInfo.xcprivacy */; };
 		B20000000000000000000001 /* ServerURLTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000001 /* ServerURLTests.swift */; };
+		B200000000000000000000FF /* OidcLoginManagerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A200000000000000000000FF /* OidcLoginManagerTests.swift */; };
 		B20000000000000000000002 /* SettingsStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000002 /* SettingsStoreTests.swift */; };
 		B20000000000000000000003 /* WorkspaceURLExpanderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000003 /* WorkspaceURLExpanderTests.swift */; };
 		B40000000000000000000001 /* OmnigentUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A40000000000000000000001 /* OmnigentUITests.swift */; };
@@ -59,6 +61,7 @@
 		A10000000000000000000008 /* NativeNotificationManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeNotificationManager.swift; sourceTree = "<group>"; };
 		A10000000000000000000009 /* WebShellView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebShellView.swift; sourceTree = "<group>"; };
 		A1000000000000000000000A /* WebViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebViewModel.swift; sourceTree = "<group>"; };
+		A100000000000000000000FF /* OidcLoginManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OidcLoginManager.swift; sourceTree = "<group>"; };
 		A1000000000000000000000B /* OmnigentWebView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OmnigentWebView.swift; sourceTree = "<group>"; };
 		A1000000000000000000000C /* URL+Omnigent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "URL+Omnigent.swift"; sourceTree = "<group>"; };
 		A10000000000000000000011 /* ChatTerminalBar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatTerminalBar.swift; sourceTree = "<group>"; };
@@ -69,6 +72,7 @@
 		A10000000000000000000010 /* Info-Release.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "Info-Release.plist"; sourceTree = "<group>"; };
 		A10000000000000000000013 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; lastKnownFileType = text.xml; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
 		A20000000000000000000001 /* ServerURLTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerURLTests.swift; sourceTree = "<group>"; };
+		A200000000000000000000FF /* OidcLoginManagerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OidcLoginManagerTests.swift; sourceTree = "<group>"; };
 		A20000000000000000000002 /* SettingsStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsStoreTests.swift; sourceTree = "<group>"; };
 		A20000000000000000000003 /* WorkspaceURLExpanderTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceURLExpanderTests.swift; sourceTree = "<group>"; };
 		A30000000000000000000003 /* OmnigentUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = OmnigentUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -137,6 +141,7 @@
 				A10000000000000000000008 /* NativeNotificationManager.swift */,
 				A10000000000000000000009 /* WebShellView.swift */,
 				A1000000000000000000000A /* WebViewModel.swift */,
+				A100000000000000000000FF /* OidcLoginManager.swift */,
 				A1000000000000000000000B /* OmnigentWebView.swift */,
 				A1000000000000000000000C /* URL+Omnigent.swift */,
 				A10000000000000000000011 /* ChatTerminalBar.swift */,
@@ -153,6 +158,7 @@
 			isa = PBXGroup;
 			children = (
 				A20000000000000000000001 /* ServerURLTests.swift */,
+				A200000000000000000000FF /* OidcLoginManagerTests.swift */,
 				A20000000000000000000002 /* SettingsStoreTests.swift */,
 				A20000000000000000000003 /* WorkspaceURLExpanderTests.swift */,
 			);
@@ -317,6 +323,7 @@
 				B10000000000000000000008 /* NativeNotificationManager.swift in Sources */,
 				B10000000000000000000009 /* WebShellView.swift in Sources */,
 				B1000000000000000000000A /* WebViewModel.swift in Sources */,
+				B100000000000000000000FF /* OidcLoginManager.swift in Sources */,
 				B1000000000000000000000B /* OmnigentWebView.swift in Sources */,
 				B1000000000000000000000C /* URL+Omnigent.swift in Sources */,
 				B10000000000000000000011 /* ChatTerminalBar.swift in Sources */,
@@ -329,6 +336,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				B20000000000000000000001 /* ServerURLTests.swift in Sources */,
+				B200000000000000000000FF /* OidcLoginManagerTests.swift in Sources */,
 				B20000000000000000000002 /* SettingsStoreTests.swift in Sources */,
 				B20000000000000000000003 /* WorkspaceURLExpanderTests.swift in Sources */,
 			);

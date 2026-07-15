@@ -251,6 +251,13 @@ struct OmnigentWebView: UIViewRepresentable {
     private(set) var pinnedURL: URL?
     private var pinnedOrigin: String?
 
+    // Drives system-browser OIDC login (fix for #2549). Capped retries so a
+    // rejected/expired injected cookie can't relaunch the browser forever; the
+    // counter resets in didFinish once a pinned-origin page actually loads.
+    private let loginManager = OidcLoginManager()
+    private var loginAttempts = 0
+    private static let maxLoginAttempts = 3
+
     init(_ parent: OmnigentWebView) {
       self.parent = parent
     }
@@ -260,8 +267,50 @@ struct OmnigentWebView: UIViewRepresentable {
     }
 
     func detach() {
+      loginManager.shutdown()
       parent.model.cancelServerSwitcherWatchdog()
       webView = nil
+    }
+
+    /// Run the RFC 8252 login: authenticate in the system browser (Google
+    /// sign-in and passkeys work there, not in a `WKWebView`), then bridge the
+    /// session cookie back into this WebView and reload — authenticated.
+    /// Triggered when the server redirects the top-level frame to the IdP.
+    private func startLogin() {
+      guard let pinnedOrigin else { return }
+      guard loginAttempts < Self.maxLoginAttempts else {
+        authLog("login attempts exhausted (\(loginAttempts)) — not retrying")
+        return
+      }
+      // start() no-ops while a login is already in flight, so a multi-hop OIDC
+      // redirect that re-enters here can't burn the retry budget without ever
+      // relaunching the browser. Count only a call that actually starts a flow.
+      guard
+        loginManager.start(
+          origin: pinnedOrigin,
+          onSession: { [weak self] token in self?.applySession(token, origin: pinnedOrigin) }
+        )
+      else { return }
+      loginAttempts += 1
+    }
+
+    /// Bridge the browser session into the WebView: the polled JWT is exactly the
+    /// session-cookie value (the browser's cookie store is isolated from the
+    /// WebView's), so set it as the `__Host-ap_session` / `ap_session` cookie and
+    /// reload. `sessionCookie` re-validates the token is JWT-shaped, so a
+    /// malformed/hostile value can never smuggle in cookie attributes.
+    private func applySession(_ token: String, origin: String) {
+      guard let webView, let pinnedURL,
+        let cookie = OidcLoginManager.sessionCookie(forOrigin: origin, token: token)
+      else {
+        authLog("applySession: no cookie (bad token/origin) — skipping")
+        return
+      }
+      authLog("applySession: injecting \(cookie.name) (token len=\(token.count))")
+      webView.configuration.websiteDataStore.httpCookieStore.setCookie(cookie) {
+        [weak webView] in
+        webView?.load(URLRequest(url: pinnedURL))
+      }
     }
 
     // A left-edge swipe drives the web app's sidebar as an interactive drawer.
@@ -360,6 +409,20 @@ struct OmnigentWebView: UIViewRepresentable {
     }
 
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+      // Backstop for a cross-origin *server* redirect that commits without a
+      // fresh decidePolicyForNavigationAction: if the top frame has landed off
+      // the pinned origin, it's the OIDC bounce that slipped the gate — stop and
+      // run system-browser login rather than let the IdP (and its Google
+      // hand-off) render in the embedded WebView. Mirrors Android's onPageStarted.
+      if let pinnedOrigin, let committed = webView.url?.omnigentOrigin,
+        committed != pinnedOrigin,
+        let scheme = webView.url?.scheme?.lowercased(), scheme == "http" || scheme == "https"
+      {
+        authLog("off-origin landing -> login")
+        webView.stopLoading()
+        startLogin()
+        return
+      }
       parent.model.currentURL = webView.url ?? parent.model.currentURL
     }
 
@@ -370,6 +433,7 @@ struct OmnigentWebView: UIViewRepresentable {
         injectWorkspaceChromeCSS(webView)
       }
       if webView.url?.omnigentOrigin == pinnedOrigin, let pinnedURL {
+        loginAttempts = 0  // reached a pinned-origin page — past the login redirect
         parent.loadSucceeded(pinnedURL)
       }
     }
@@ -403,6 +467,27 @@ struct OmnigentWebView: UIViewRepresentable {
 
       if navigationAction.targetFrame == nil {
         openExternal(url)
+        decisionHandler(.cancel)
+        return
+      }
+
+      // Off-origin top-level navigation. A server redirect (no user gesture) is
+      // the OIDC flow bouncing to the IdP -> run system-browser login (RFC 8252:
+      // never authenticate in an embedded WebView; Google blocks it with
+      // `disallowed_useragent` and passkeys don't work). A user-activated link is
+      // an external link -> open it in the system browser. Either way the foreign
+      // page never loads in this WebView, which holds the native bridge.
+      // Subframes (cross-origin iframes: web previews, embeds) are excluded by
+      // the main-frame check and load inline. Mirrors Android's navigation gate.
+      if navigationAction.targetFrame?.isMainFrame == true,
+        scheme == "http" || scheme == "https",
+        let pinnedOrigin, let target = url.omnigentOrigin, target != pinnedOrigin
+      {
+        if navigationAction.navigationType == .linkActivated {
+          openExternal(url)
+        } else {
+          startLogin()
+        }
         decisionHandler(.cancel)
         return
       }
