@@ -32,10 +32,12 @@ drift (rename / deprecate / safeguard-fallback). Before relying on it, run ONE
 read-only probe (the dispatch layer fails loud on an invalid model/worker combo,
 so a clean boot IS the confirmation):
 
-    sys_session_send(agent="claude_code", title="pilot-claude-fable-5",
-      args={ purpose: "explore", model: "claude-fable-5",
-             input: "Read-only probe: confirm you respond, state your model id,
-                     and compute 17*23. 3-line report, change nothing." })
+```text
+sys_session_send(agent="claude_code", title="pilot-claude-fable-5",
+  args={ purpose: "explore", model: "claude-fable-5",
+         input: "Read-only probe: confirm you respond, state your model id,
+                 and compute 17*23. 3-line report, change nothing." })
+```
 
 If the dispatch errors on the model, or the worker boots on a fallback model
 (it self-reports something other than `claude-fable-5`), Fable is not available
