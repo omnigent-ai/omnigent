@@ -15,13 +15,13 @@ from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemySche
 
 
 # scheduled_tasks.id / scheduled_task_runs.id / scheduled_task_id are Uuid16
-# columns (16 raw bytes), so every id must be a canonical UUID string. ``_uid``
-# maps a readable seed to a deterministic UUID so tests stay legible while the
+# columns (16 raw bytes), read back as bare 32-char hex strings. ``_uid`` maps a
+# readable seed to a deterministic bare-hex UUID so tests stay legible while the
 # store still round-trips real UUIDs. agent_id / owner_user_id / conversation_id
 # stay plain strings — those columns are still ``String``.
 def _uid(seed: str) -> str:
-    """Deterministic canonical UUID string from a short readable seed."""
-    return str(uuid.uuid5(uuid.NAMESPACE_DNS, seed))
+    """Deterministic bare 32-char hex UUID string from a short readable seed."""
+    return uuid.uuid5(uuid.NAMESPACE_DNS, seed).hex
 
 
 @pytest.fixture()
@@ -272,10 +272,11 @@ def test_list_orders_by_created_at_then_id(store: SqlAlchemyScheduledTaskStore) 
 
     ``created_at`` is integer seconds, so two back-to-back creates tie on it and
     the tiebreak is ``id`` ASC. ``Uuid16`` orders by raw bytes, so pick two ids
-    whose byte order is deterministic (``…aa`` < ``…bb``).
+    whose byte order is deterministic (``…aa`` < ``…bb``). Ids are bare 32-char
+    hex, matching what the store reads back.
     """
-    id_a = "00000000-0000-0000-0000-0000000000aa"
-    id_b = "00000000-0000-0000-0000-0000000000bb"
+    id_a = "000000000000000000000000000000aa"
+    id_b = "000000000000000000000000000000bb"
     store.create(
         scheduled_task_id=id_a,
         name="a",

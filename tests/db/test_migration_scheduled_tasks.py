@@ -25,7 +25,7 @@ from omnigent.db.utils import (
     get_or_create_engine,
 )
 
-_PREVIOUS_HEAD = "z5a2b3c4d5e6"
+_PREVIOUS_HEAD = "9d820f91deef"
 
 
 @pytest.fixture
@@ -227,7 +227,7 @@ def test_state_check_rejects_bad_code(db_engine: Engine) -> None:
     """The ``scheduled_tasks.state`` CHECK rejects codes outside the closed set.
 
     State is stored as a stable int code (see enum_codecs SCHEDULED_TASK_STATE,
-    codes 1-4); a code outside that range must fail the CHECK.
+    codes 1-3); a code outside that range must fail the CHECK.
     """
     with pytest.raises(IntegrityError):
         with db_engine.begin() as conn:

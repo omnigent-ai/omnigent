@@ -40,15 +40,16 @@ _CKSUM32 = LargeBinary(32).with_variant(MySQLBinary(32), "mysql")
 class Uuid16(TypeDecorator[str]):
     """A UUID primary key stored as 16 raw bytes.
 
-    Python-side values are canonical UUID strings (e.g.
-    ``"a1b2c3d4-..."``); the database stores the 16-byte form —
+    Python-side values are bare 32-char hex strings (e.g.
+    ``"a1b2c3d4..."``, no dashes — matching the schema-wide UUID
+    convention); the database stores the 16-byte form —
     ``BINARY(16)`` on MySQL (fixed-length and fully indexable, the same
     reasoning as :data:`_CKSUM32`) and ``BLOB`` / ``BYTEA`` elsewhere.
     Halves the storage of a 32-char hex string and indexes tighter.
 
     ``process_bind_param`` accepts either a canonical/hex string or a
     :class:`uuid.UUID`; ``process_result_value`` always returns the
-    canonical string form.
+    bare 32-char hex string (``.hex``, no dashes).
     """
 
     impl = LargeBinary(16)
@@ -67,7 +68,7 @@ class Uuid16(TypeDecorator[str]):
     def process_result_value(self, value: bytes | None, dialect: Any) -> str | None:  # noqa: ARG002
         if value is None:
             return None
-        return str(uuid.UUID(bytes=bytes(value)))
+        return uuid.UUID(bytes=bytes(value)).hex
 
 
 class OmnigentBase(DeclarativeBase):

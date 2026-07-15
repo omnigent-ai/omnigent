@@ -20,8 +20,8 @@ class ScheduledTask:
 
     A task's trigger is a required recurring ``cron_expression``.
 
-    :param id: UUID primary key (canonical string form). On migration from
-        an external scheduler a fresh id is minted.
+    :param id: UUID primary key (bare 32-char hex string, no dashes). On
+        migration from an external scheduler a fresh id is minted.
     :param name: Human-readable task name, e.g. ``"nightly triage"``.
     :param prompt: The instruction dispatched to the agent on each firing.
     :param cron_expression: The required cron string for the recurring trigger,
@@ -81,8 +81,9 @@ class ScheduledTaskRun:
     A single firing of a scheduled task, persisted in the ``scheduled_task_runs``
     table.
 
-    :param id: UUID primary key (canonical string form).
-    :param scheduled_task_id: The task this run belongs to (a UUID string).
+    :param id: UUID primary key (bare 32-char hex string, no dashes).
+    :param scheduled_task_id: The task this run belongs to (a bare 32-char hex
+        UUID string).
     :param status: Lifecycle state — one of ``"scheduled"``, ``"running"``,
         ``"succeeded"``, ``"failed"``, ``"skipped"``.
     :param scheduled_at: Unix epoch seconds the firing was scheduled for.
