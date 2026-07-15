@@ -2976,7 +2976,10 @@ function PinnedProjectFlyoutContent({
       className="w-64"
       data-testid="pinned-project-flyout"
     >
-      <p className="truncate font-medium text-sm">{title}</p>
+      {/* Titles have no length cap (server + rename input are unbounded), so
+          clamp to 3 wrapped lines to keep the card tidy — full text stays in
+          the DOM. */}
+      <p className="line-clamp-3 font-medium text-sm">{title}</p>
       <p className="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground">
         <FolderIcon className="size-3.5 shrink-0" />
         <span className="truncate">{projectName}</span>
