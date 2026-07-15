@@ -1111,19 +1111,10 @@ class SqlScheduledTask(OmnigentBase):
     SQLAlchemy model for the ``scheduled_tasks`` table.
 
     A scheduled task is a saved, scheduled instruction that fires an agent
-    session on a recurring cron schedule (``cron_expression``). This PR persists
-    the definition only — no scheduler reads or dispatches these rows yet.
-
-    The entity mirrors an external scheduler's scheduled-task spec (fields
-    ``prompt``/``org``/``repo``/``base_branch``/``model``/``effort``; a required
-    recurring ``cron_expression`` trigger; a ``state`` enum
-    ``active``/``paused``/``deleted``) so a future merge is a
-    column mapping rather than a rewrite.
+    session on a recurring cron schedule (``cron_expression``).
 
     :param id: UUID primary key stored as 16 raw bytes (see :class:`Uuid16`),
-        surfaced as a canonical UUID string. On migration from an external
-        scheduler a fresh id is minted here (the source scheduler's id is not
-        reused as the PK).
+        surfaced as a canonical UUID string.
     :param name: Human-readable task name, e.g. ``"nightly triage"``.
     :param prompt: The instruction dispatched to the agent on each firing.
     :param cron_expression: The required cron string for the recurring trigger,
@@ -1131,7 +1122,7 @@ class SqlScheduledTask(OmnigentBase):
     :param owner_user_id: User the spawned session's ``LEVEL_OWNER`` grant is
         written for — who the run belongs to, e.g. ``"alice@example.com"``.
         ``None`` in single-user / OSS mode; the fire path resolves it to the
-        reserved ``"local"`` user (resolution lands in a later PR).
+        reserved ``"local"`` user.
     :param agent_id: The agent bound to this task (relates to
         ``agents.id``). Cascade cleanup on agent deletion is application-owned
         — there is no DB-level foreign key (schema Rule R032).
@@ -1161,7 +1152,7 @@ class SqlScheduledTask(OmnigentBase):
     :param timezone: IANA timezone the trigger is evaluated in, e.g.
         ``"America/Los_Angeles"``.
     :param state: Lifecycle state — ``active``/``paused``/``deleted``.
-        The (future) scheduler only considers ``active`` tasks.
+        The scheduler only dispatches ``active`` tasks.
         Stored as a stable int code (see omnigent.db.enum_codecs
         SCHEDULED_TASK_STATE); the store converts to/from the string name at the
         row↔entity boundary. Defaults to ``active``.
@@ -1194,10 +1185,9 @@ class SqlScheduledTask(OmnigentBase):
     cron_expression: Mapped[str] = mapped_column(String(255), nullable=False)
     # Session-owner identity: the spawned run's LEVEL_OWNER grant is written
     # for this user. Nullable — None in single-user/OSS mode (the fire path
-    # resolves null to the reserved "local" user in a later PR). String(128) to
-    # match session_permissions.user_id (the column the LEVEL_OWNER grant is
-    # written into) and every other user-identity column in this schema; 128 is
-    # well under the MySQL utf8mb4 indexed-key ceiling.
+    # resolves null to the reserved "local" user). String(128) to match
+    # session_permissions.user_id (the column the LEVEL_OWNER grant is
+    # written into) and every other user-identity column in this schema.
     owner_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     # Relates to agents.id. No DB foreign key (Rule R032); cascade is app-owned.
     agent_id: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -1239,7 +1229,7 @@ class SqlScheduledTask(OmnigentBase):
         CheckConstraint("execution_target IN (1, 2)", name="ck_scheduled_tasks_execution_target"),
         Index("ix_scheduled_tasks_created_at", "workspace_id", "created_at", "id"),
         Index("ix_scheduled_tasks_owner_user_id", "workspace_id", "owner_user_id", "id"),
-        # Covers the future scheduler's read path:
+        # Covers the scheduler's read path:
         # WHERE workspace_id + state ORDER BY created_at, id.
         Index("ix_scheduled_tasks_state", "workspace_id", "state", "created_at", "id"),
     )
@@ -1250,8 +1240,7 @@ class SqlScheduledTaskRun(OmnigentBase):
     SQLAlchemy model for the ``scheduled_task_runs`` table.
 
     One row per firing of a scheduled task — the run history. Recorded and
-    advanced by the (future) scheduler as a firing moves through its lifecycle;
-    this PR persists the shape only.
+    advanced by the scheduler as a firing moves through its lifecycle.
 
     :param id: UUID primary key stored as 16 raw bytes (see :class:`Uuid16`),
         surfaced as a canonical UUID string.

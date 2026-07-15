@@ -20,8 +20,7 @@ class ScheduledTask:
 
     A task's trigger is a required recurring ``cron_expression``.
 
-    :param id: UUID primary key (bare 32-char hex string, no dashes). On
-        migration from an external scheduler a fresh id is minted.
+    :param id: UUID primary key (bare 32-char hex string, no dashes).
     :param name: Human-readable task name, e.g. ``"nightly triage"``.
     :param prompt: The instruction dispatched to the agent on each firing.
     :param cron_expression: The required cron string for the recurring trigger,

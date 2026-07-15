@@ -2,8 +2,7 @@
 
 A scheduled task is a saved instruction that fires an agent session on a
 recurring cron schedule. This store owns the ``scheduled_tasks``
-table and its ``scheduled_task_runs`` history table. No scheduler consumes these
-rows yet — this is the persistence layer only.
+table and its ``scheduled_task_runs`` history table.
 """
 
 from __future__ import annotations
@@ -18,8 +17,7 @@ class ScheduledTaskStore(ABC):
     Abstract base for scheduled-task persistence.
 
     Manages the lifecycle of scheduled tasks (CRUD) and their run history. The
-    ``list_active`` read path — active tasks ordered by ``(created_at, id)`` —
-    is what the future scheduler polls.
+    ``list_active`` read path returns active tasks ordered by ``(created_at, id)``.
     """
 
     def __init__(self, storage_location: str) -> None:
@@ -105,7 +103,7 @@ class ScheduledTaskStore(ABC):
         """
         List active scheduled tasks ordered by ``created_at ASC, id ASC``.
 
-        This is the read path the future scheduler polls.
+        Returns only tasks in the ``active`` state.
 
         :returns: List of :class:`ScheduledTask` instances in state ``active``.
         """

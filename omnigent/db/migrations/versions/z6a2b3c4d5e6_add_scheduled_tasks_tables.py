@@ -5,12 +5,10 @@ Revises: 9d820f91deef
 Create Date: 2026-07-09 00:00:00.000000
 
 Adds the ``scheduled_tasks`` table (saved, scheduled agent instructions) and its
-``scheduled_task_runs`` history table (one row per firing). This is the
-persistence foundation only — no scheduler reads or dispatches these rows yet.
+``scheduled_task_runs`` history table (one row per firing).
 
-The task trigger is a required recurring ``cron_expression`` (matching the
-recurring-only shape of the reference platforms): every task fires on a cron
-schedule, so ``cron_expression`` is NOT NULL.
+The task trigger is a required recurring ``cron_expression``: every task fires
+on a cron schedule, so ``cron_expression`` is NOT NULL.
 
 Both tables are brand-new and are created at the current schema state, so each
 carries the tenant-partition ``workspace_id`` column as the leading primary-key
@@ -41,8 +39,7 @@ def upgrade() -> None:
         "scheduled_tasks",
         sa.Column("workspace_id", sa.BigInteger(), nullable=False, server_default="0"),
         # UUID PK stored as 16 raw bytes (Uuid16 → BINARY(16) on MySQL, BLOB/BYTEA
-        # elsewhere). On migration from an external scheduler a FRESH id is minted
-        # here (not the source id).
+        # elsewhere).
         sa.Column("id", Uuid16(), nullable=False),
         sa.Column("name", sa.String(256), nullable=False),
         # Opaque free text stored compressed (CompressedText → LargeBinary).
