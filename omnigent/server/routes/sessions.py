@@ -10899,9 +10899,29 @@ async def _ensure_runner_relay_ready(
     return handle
 
 
-# Per-session compaction locks so concurrent ``/compact`` POSTs
-# don't race.
-_COMPACT_LOCKS: dict[str, asyncio.Lock] = {}
+# Weak values bound the per-session lock registry without splitting waiters
+# across different lock objects during eviction.
+_COMPACT_LOCKS: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
+
+
+def _compact_lock(session_id: str) -> asyncio.Lock:
+    """
+    Return the lock serializing explicit compaction for one session.
+
+    Concurrent ``/compact`` events for the same session must not overlap;
+    different sessions get distinct locks so they may compact concurrently.
+    Get-or-create is race-free because there is no ``await`` between the
+    lookup and the insert (single event loop).
+
+    :param session_id: Session/conversation id being compacted.
+    :returns: A process-wide :class:`asyncio.Lock` shared by every concurrent
+        caller for the same ``session_id``.
+    """
+    lock = _COMPACT_LOCKS.get(session_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _COMPACT_LOCKS[session_id] = lock
+    return lock
 
 
 async def _run_compact_locked(
@@ -10918,67 +10938,71 @@ async def _run_compact_locked(
     :param agent_store: Agent store for spec lookup.
     :param agent_cache: Agent cache for bundle loading.
     """
-    if conv.agent_id is None:
-        raise OmnigentError("Session has no agent binding", code=ErrorCode.INTERNAL_ERROR)
-    if agent_cache is None:
-        raise OmnigentError(
-            "Compaction is unavailable: agent cache is not configured",
-            code=ErrorCode.INTERNAL_ERROR,
+    lock = _compact_lock(session_id)
+    async with lock:
+        if conv.agent_id is None:
+            raise OmnigentError("Session has no agent binding", code=ErrorCode.INTERNAL_ERROR)
+        if agent_cache is None:
+            raise OmnigentError(
+                "Compaction is unavailable: agent cache is not configured",
+                code=ErrorCode.INTERNAL_ERROR,
+            )
+        # Recheck after acquiring — a turn may have started while waiting.
+        if _session_status_cache.get(session_id) in ("running", "waiting"):
+            raise OmnigentError(
+                "Cannot compact while a turn is running; cancel or wait for it to finish first",
+                code=ErrorCode.CONFLICT,
+            )
+        agent = await asyncio.to_thread(agent_store.get, conv.agent_id)
+        if agent is None or agent.bundle_location is None:
+            raise OmnigentError(
+                f"Agent not found: {conv.agent_id!r}",
+                code=ErrorCode.NOT_FOUND,
+            )
+        loaded = agent_cache.load(
+            agent.id, agent.bundle_location, expand_env=agent.session_id is None
         )
-    # Check live status via cache; tasks table has been removed.
-    if _session_status_cache.get(session_id) in ("running", "waiting"):
-        raise OmnigentError(
-            "Cannot compact while a turn is running; cancel or wait for it to finish first",
-            code=ErrorCode.CONFLICT,
-        )
-    agent = await asyncio.to_thread(agent_store.get, conv.agent_id)
-    if agent is None or agent.bundle_location is None:
-        raise OmnigentError(
-            f"Agent not found: {conv.agent_id!r}",
-            code=ErrorCode.NOT_FOUND,
-        )
-    loaded = agent_cache.load(agent.id, agent.bundle_location, expand_env=agent.session_id is None)
-    spec = loaded.spec
-    if spec.llm is not None:
-        llm_config = spec.llm
-    elif spec.executor.model is not None:
-        from omnigent.spec.types import LLMConfig
+        spec = loaded.spec
+        if spec.llm is not None:
+            llm_config = spec.llm
+        elif spec.executor.model is not None:
+            from omnigent.spec.types import LLMConfig
 
-        llm_config = LLMConfig(model=spec.executor.model, connection=spec.executor.connection)
-    else:
-        harness = spec.executor.harness_kind
-        raise OmnigentError(
-            f"/compact is unavailable for this {harness} session because the agent "
-            "does not declare an LLM model for server-side compaction. Configure "
-            "`llm.model` or `executor.model`, or use a harness-native compaction "
-            "control when one is available.",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    task_id = f"compact_{int(time.time() * 1000)}"
-    _publish_status(session_id, "running")
-    # compact() publishes its own in_progress / completed SSE events
-    # when conversation_id is set — don't double-publish here.
-    from omnigent.runtime.workflow import compact_conversation_now
+            llm_config = LLMConfig(model=spec.executor.model, connection=spec.executor.connection)
+        else:
+            harness = spec.executor.harness_kind
+            raise OmnigentError(
+                f"/compact is unavailable for this {harness} session because the agent "
+                "does not declare an LLM model for server-side compaction. Configure "
+                "`llm.model` or `executor.model`, or use a harness-native compaction "
+                "control when one is available.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        task_id = f"compact_{int(time.time() * 1000)}"
+        _publish_status(session_id, "running")
+        # compact() publishes its own in_progress / completed SSE events
+        # when conversation_id is set — don't double-publish here.
+        from omnigent.runtime.workflow import compact_conversation_now
 
-    try:
-        await compact_conversation_now(
-            task_id=task_id,
-            conversation_id=session_id,
-            spec=spec,
-            llm_config=llm_config,
-            tool_schemas=[],
-            preserve_recent_window=1,
-        )
-    except Exception as exc:
-        _logger.exception("Explicit session compaction failed for %s", session_id)
-        detail = str(exc) or repr(exc)
-        _publish_compaction_failed(session_id)
+        try:
+            await compact_conversation_now(
+                task_id=task_id,
+                conversation_id=session_id,
+                spec=spec,
+                llm_config=llm_config,
+                tool_schemas=[],
+                preserve_recent_window=1,
+            )
+        except Exception as exc:
+            _logger.exception("Explicit session compaction failed for %s", session_id)
+            detail = str(exc) or repr(exc)
+            _publish_compaction_failed(session_id)
+            _publish_status(session_id, "idle")
+            raise OmnigentError(
+                f"Compaction failed while generating a summary: {detail}",
+                code=ErrorCode.INTERNAL_ERROR,
+            ) from exc
         _publish_status(session_id, "idle")
-        raise OmnigentError(
-            f"Compaction failed while generating a summary: {detail}",
-            code=ErrorCode.INTERNAL_ERROR,
-        ) from exc
-    _publish_status(session_id, "idle")
 
 
 def _agent_provider_family(agent: Agent) -> str | None:
