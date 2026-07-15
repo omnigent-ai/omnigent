@@ -272,14 +272,12 @@ def _register_configured_agents(
     if not root.is_dir():
         raise RuntimeError(f"OMNIGENT_AGENT_ROOT is not a directory: {root}")
 
+    logger.info("Scanning configured agent root %s", root)
     try:
-        sources = sorted(
-            child
-            for child in root.iterdir()
-            if child.is_dir() and (child / "config.yaml").is_file()
-        )
+        sources = sorted(config_path.parent for config_path in root.glob("*/config.yaml"))
     except OSError as exc:
         raise RuntimeError(f"Could not scan OMNIGENT_AGENT_ROOT {root}: {exc}") from exc
+    logger.info("Discovered %d configured agent bundle(s) under %s", len(sources), root)
 
     for source in sources:
         result = register_agent(source, agent_store, artifact_store, agent_cache)
