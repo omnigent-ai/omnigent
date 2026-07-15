@@ -39,6 +39,8 @@ interface MonacoDiffViewerProps {
   layout: "unified" | "split";
   /** Whether whitespace-only changes are hidden. */
   hideWhitespace: boolean;
+  /** Whether long lines soft-wrap (no horizontal scroll). */
+  wrapLines: boolean;
   conversationId: string;
   /** Saved comments — highlighted on the modified side. */
   comments: Comment[];
@@ -62,6 +64,7 @@ export function MonacoDiffViewer({
   path,
   layout,
   hideWhitespace,
+  wrapLines,
   conversationId,
   comments,
   activeSelection,
@@ -178,11 +181,14 @@ export function MonacoDiffViewer({
       automaticLayout: true,
       renderOverviewRuler: false,
       ignoreTrimWhitespace: hideWhitespace,
+      // Soft-wrap long lines in both panes so a narrow diff pane (2–3 side by
+      // side) reads top-to-bottom without horizontal scrolling.
+      diffWordWrap: wrapLines ? "on" : "off",
       // Collapse long unchanged runs into expandable bands (like the old pierre
       // diff / GitHub) so only changed hunks + a few context lines are shown.
       hideUnchangedRegions: { enabled: true, contextLineCount: 3 },
     }),
-    [layout, hideWhitespace],
+    [layout, hideWhitespace, wrapLines],
   );
 
   return (

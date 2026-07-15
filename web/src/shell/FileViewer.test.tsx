@@ -67,7 +67,21 @@ vi.mock("./CommentsPanel", () => ({
 }));
 
 vi.mock("./MonacoDiffViewer", () => ({
-  MonacoDiffViewer: () => <div data-testid="diff-viewer" />,
+  // Surface the toggle-driven props as data attributes so tests can assert the
+  // "⋯" menu wires wrap-lines / hide-whitespace through to the diff editor.
+  MonacoDiffViewer: ({
+    wrapLines,
+    hideWhitespace,
+  }: {
+    wrapLines?: boolean;
+    hideWhitespace?: boolean;
+  }) => (
+    <div
+      data-testid="diff-viewer"
+      data-wrap-lines={String(!!wrapLines)}
+      data-hide-whitespace={String(!!hideWhitespace)}
+    />
+  ),
 }));
 
 // ── Mock hooks ────────────────────────────────────────────────────────────────
@@ -1030,6 +1044,7 @@ describe("FileViewer markdown preview/edit/source modes", () => {
       diffLayout: "unified",
       previewableViewMode: "editor",
       hideWhitespace: false,
+      wrapLines: false,
     });
     renderViewer({ open: true, path: "page.html" });
     expect(viewModeOf()).toBe("preview");
@@ -1045,6 +1060,7 @@ describe("FileViewer markdown preview/edit/source modes", () => {
       diffLayout: "unified",
       previewableViewMode: "editor",
       hideWhitespace: false,
+      wrapLines: false,
     });
     renderViewer({ open: true, path: "page.html" });
     expect(viewModeOf()).toBe("preview");
@@ -1077,6 +1093,7 @@ describe("FileViewer markdown preview/edit/source modes", () => {
         diffLayout: "unified",
         previewableViewMode: pref,
         hideWhitespace: false,
+        wrapLines: false,
       });
       useCommentsMock.mockReturnValue(makeCommentsQuery([makeComment("c1")]));
       renderViewer({ open: true, path: "notes.md", initialSearch: "comment=c1" });
@@ -1097,6 +1114,7 @@ describe("FileViewer markdown preview/edit/source modes", () => {
       diffLayout: "unified",
       previewableViewMode: "preview",
       hideWhitespace: false,
+      wrapLines: false,
     });
     useCommentsMock.mockReturnValue(makeCommentsQuery([makeComment("c1")]));
     renderViewer({ open: true, path: "notes.md", initialSearch: "comment=c1" });
@@ -1137,6 +1155,73 @@ describe("FileViewer split-toggle width gating", () => {
     expect(await screen.findByTestId("diff-viewer")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Split view" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Unified view" })).toBeNull();
+  });
+});
+
+// ── View settings "⋯" menu ──────────────────────────────────────────────────
+//
+// Find, Download, and the diff-only toggles (wrap lines, hide whitespace) are
+// folded into one "View settings" overflow menu to save toolbar width. The
+// toggles keep the menu open and drive props on the diff viewer; the diff-only
+// items are hidden outside diff view. Radix menus open on pointerdown.
+
+describe("FileViewer view-settings menu", () => {
+  beforeEach(() => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+  });
+
+  const openSettingsMenu = () =>
+    fireEvent.pointerDown(screen.getByRole("button", { name: "View settings" }), { button: 0 });
+
+  it("offers Find and Download but no diff toggles outside diff view", () => {
+    render(viewerTree({ open: true }));
+    openSettingsMenu();
+    expect(screen.getByRole("menuitem", { name: "Find in file" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "Download file" })).toBeInTheDocument();
+    // Wrap / whitespace are diff-only — absent when the source view is showing.
+    expect(screen.queryByRole("menuitem", { name: "Wrap lines" })).toBeNull();
+    expect(screen.queryByRole("menuitem", { name: "Hide whitespace changes" })).toBeNull();
+  });
+
+  it("adds the wrap-lines and whitespace toggles in diff view", async () => {
+    render(viewerTree({ open: true, initialSearch: "diff=1" }));
+    expect(await screen.findByTestId("diff-viewer")).toBeInTheDocument();
+    openSettingsMenu();
+    expect(screen.getByRole("menuitem", { name: "Wrap lines" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "Hide whitespace changes" })).toBeInTheDocument();
+  });
+
+  it("toggling Wrap lines flips the diff viewer's wrapLines prop", async () => {
+    render(viewerTree({ open: true, initialSearch: "diff=1" }));
+    const diff = await screen.findByTestId("diff-viewer");
+    expect(diff).toHaveAttribute("data-wrap-lines", "false");
+    openSettingsMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Wrap lines" }));
+    // The prop flips without re-opening — the toggle drives the diff editor.
+    expect(screen.getByTestId("diff-viewer")).toHaveAttribute("data-wrap-lines", "true");
+  });
+
+  it("toggling Hide whitespace flips the diff viewer's hideWhitespace prop", async () => {
+    render(viewerTree({ open: true, initialSearch: "diff=1" }));
+    const diff = await screen.findByTestId("diff-viewer");
+    expect(diff).toHaveAttribute("data-hide-whitespace", "false");
+    openSettingsMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Hide whitespace changes" }));
+    expect(screen.getByTestId("diff-viewer")).toHaveAttribute("data-hide-whitespace", "true");
+  });
+
+  it("persists the wrap-lines choice across a refresh", async () => {
+    const first = render(viewerTree({ open: true, initialSearch: "diff=1" }));
+    expect(await screen.findByTestId("diff-viewer")).toBeInTheDocument();
+    openSettingsMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Wrap lines" }));
+    expect(screen.getByTestId("diff-viewer")).toHaveAttribute("data-wrap-lines", "true");
+
+    // A fresh mount (refresh) can only come up wrapped by reading the persisted
+    // preference — ?diff=1 restores diff view, wrap comes from localStorage.
+    first.unmount();
+    render(viewerTree({ open: true, initialSearch: "diff=1" }));
+    expect(await screen.findByTestId("diff-viewer")).toHaveAttribute("data-wrap-lines", "true");
   });
 });
 
