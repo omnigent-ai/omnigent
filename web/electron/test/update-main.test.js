@@ -2,6 +2,7 @@ const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
 const { EventEmitter } = require("node:events");
 const fs = require("node:fs");
+const { createRequire } = require("node:module");
 const os = require("node:os");
 const path = require("node:path");
 const vm = require("node:vm");
@@ -125,6 +126,7 @@ function loadMainHarness({
   };
 
   const mainPath = path.join(__dirname, "../src/main.js");
+  const mainRequire = createRequire(mainPath);
   const source =
     fs.readFileSync(mainPath, "utf8") +
     "\nmodule.exports.__test = { buildMenu, getUpdateConfig, setUpdateConfig, setupAutoUpdater, registerIpc, windows, get installPending() { return installPending; }, get currentUpdateStatus() { return currentUpdateStatus; } };";
@@ -151,7 +153,7 @@ function loadMainHarness({
       if (specifier === "electron") return electron;
       if (specifier === "electron-updater") return { autoUpdater };
       if (specifier in localRequires) return localRequires[specifier];
-      return require(specifier);
+      return mainRequire(specifier);
     },
     setInterval,
   };
