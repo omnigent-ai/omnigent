@@ -30,8 +30,9 @@ from omnigent.kiro_native import (
     _update_startup_progress,
     _wait_for_kiro_terminal_ready,
     build_kiro_launch,
-    kiro_base_model_options,
+    discover_kiro_model_options,
     kiro_terminal_resource_id,
+    normalize_kiro_model_options,
     resolve_kiro_executable,
     run_kiro_native,
 )
@@ -546,16 +547,115 @@ async def test_wait_for_kiro_terminal_ready_times_out() -> None:
         await _wait_for_kiro_terminal_ready(client, "conv", timeout_s=0.05)
 
 
-def test_kiro_base_model_options_shape_and_default() -> None:
-    """The curated kiro catalog exposes picker option dicts with one default."""
-    options = kiro_base_model_options()
-    ids = [o["id"] for o in options]
+def test_normalize_kiro_model_options_preserves_order_and_metadata() -> None:
+    """Kiro JSON becomes deduplicated Web-picker options in CLI order."""
+    options = normalize_kiro_model_options(
+        {
+            "defaultModel": "sonnet-5",
+            "models": [
+                {"id": "auto", "displayName": "Auto"},
+                {"modelId": "claude-opus-4.8", "name": "Claude Opus 4.8"},
+                {"model_id": "sonnet-5", "display_name": "Sonnet 5"},
+                {"id": "claude-opus-4.8", "displayName": "duplicate"},
+                "qwen3-coder-next",
+            ],
+        }
+    )
 
-    # Canonical ids confirmed against ``kiro-cli --list-models`` (2.10.0).
-    assert ids[0] == "auto"
-    assert "claude-haiku-4.5" in ids and "glm-5" in ids
-    # Exactly one default, and every option carries the picker fields.
-    assert [o["id"] for o in options if o["isDefault"]] == ["auto"]
-    for option in options:
-        assert set(option) == {"id", "displayName", "isDefault", "isCurrent"}
-        assert option["isCurrent"] is False
+    assert options == [
+        {"id": "auto", "displayName": "Auto", "isDefault": False},
+        {
+            "id": "claude-opus-4.8",
+            "displayName": "Claude Opus 4.8",
+            "isDefault": False,
+        },
+        {"id": "sonnet-5", "displayName": "Sonnet 5", "isDefault": True},
+        {
+            "id": "qwen3-coder-next",
+            "displayName": "qwen3-coder-next",
+            "isDefault": False,
+        },
+    ]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [None, {}, {"models": "not-a-list"}, {"models": []}, {"models": [{}]}, [123]],
+)
+def test_normalize_kiro_model_options_rejects_malformed_catalog(payload: object) -> None:
+    """Malformed or empty discovery output is never cached as a catalog."""
+    with pytest.raises(ValueError, match="Kiro model catalog"):
+        normalize_kiro_model_options(payload)
+
+
+def test_discover_kiro_model_options_runs_machine_readable_command(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Discovery runs Kiro in the session workspace with the supplied environment."""
+    recorded: dict[str, object] = {}
+
+    def _run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        recorded.update({"argv": argv, **kwargs})
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout='[{"id":"auto","displayName":"Auto"}]',
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", _run)
+
+    options = discover_kiro_model_options(
+        "/opt/kiro-cli",
+        cwd=tmp_path,
+        env={"HOME": "/home/test", "KIRO_HOME": "/kiro"},
+        timeout_s=3.0,
+    )
+
+    assert options == [{"id": "auto", "displayName": "Auto", "isDefault": True}]
+    assert recorded == {
+        "argv": ["/opt/kiro-cli", "chat", "--list-models", "--format", "json"],
+        "cwd": tmp_path,
+        "env": {"HOME": "/home/test", "KIRO_HOME": "/kiro"},
+        "capture_output": True,
+        "text": True,
+        "timeout": 3.0,
+        "check": False,
+    }
+
+
+@pytest.mark.parametrize(
+    ("completed", "message"),
+    [
+        (subprocess.CompletedProcess([], 2, stdout="", stderr="not logged in"), "exited 2"),
+        (subprocess.CompletedProcess([], 0, stdout="not-json", stderr=""), "invalid JSON"),
+        (subprocess.CompletedProcess([], 0, stdout='{"models":[]}', stderr=""), "invalid JSON"),
+    ],
+)
+def test_discover_kiro_model_options_rejects_command_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    completed: subprocess.CompletedProcess[str],
+    message: str,
+) -> None:
+    """Non-zero, invalid, and empty discovery results surface as failures."""
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: completed)
+
+    with pytest.raises(RuntimeError, match=message):
+        discover_kiro_model_options("kiro-cli", cwd=tmp_path, env={})
+
+
+def test_discover_kiro_model_options_wraps_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A wedged discovery process is bounded and reported to the runner route."""
+
+    def _timeout(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired("kiro-cli", 10)
+
+    monkeypatch.setattr(subprocess, "run", _timeout)
+
+    with pytest.raises(RuntimeError, match="timed out"):
+        discover_kiro_model_options("kiro-cli", cwd=tmp_path, env={})

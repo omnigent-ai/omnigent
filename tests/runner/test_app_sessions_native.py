@@ -9732,6 +9732,183 @@ async def test_codex_native_model_options_query_model_list(
 
 
 @pytest.mark.asyncio
+async def test_kiro_native_model_options_discovers_on_runner(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Kiro endpoint discovers models with session workspace and terminal env."""
+    from omnigent import kiro_native
+
+    conv_id = "conv_kiro_native_model_options"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("KIRO_HOME", str(tmp_path / "kiro-home"))
+    monkeypatch.setenv("KIRO_CONFIG_HOME", str(tmp_path / "kiro-config"))
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "must-not-leak")
+    recorded: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        kiro_native,
+        "resolve_kiro_executable",
+        lambda: "/opt/kiro-cli",
+    )
+
+    def _discover(
+        executable: str,
+        *,
+        cwd: Path,
+        env: dict[str, str],
+    ) -> list[dict[str, object]]:
+        recorded.update(executable=executable, cwd=cwd, env=env)
+        return [
+            {"id": "auto", "displayName": "Auto", "isDefault": True},
+            {"id": "claude-opus-4.8", "displayName": "Claude Opus 4.8"},
+        ]
+
+    monkeypatch.setattr(kiro_native, "discover_kiro_model_options", _discover)
+
+    class _SnapshotClient(NullServerClient):
+        async def get(self, url: str, **kwargs: Any) -> httpx.Response:
+            del kwargs
+            if url == f"/v1/sessions/{conv_id}":
+                return httpx.Response(
+                    200,
+                    json={"workspace": str(workspace)},
+                    request=httpx.Request("GET", url),
+                )
+            return await super().get(url)
+
+    spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "kiro-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=_SnapshotClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        resp = await client.get(f"/v1/sessions/{conv_id}/kiro-model-options")
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "models": [
+            {"id": "auto", "displayName": "Auto", "isDefault": True},
+            {"id": "claude-opus-4.8", "displayName": "Claude Opus 4.8"},
+        ]
+    }
+    assert recorded["executable"] == "/opt/kiro-cli"
+    assert recorded["cwd"] == workspace.resolve()
+    env = cast(dict[str, str], recorded["env"])
+    assert env["HOME"] == str(tmp_path / "home")
+    assert env["KIRO_HOME"] == str(tmp_path / "kiro-home")
+    assert env["KIRO_CONFIG_HOME"] == str(tmp_path / "kiro-config")
+    assert env["KIRO_LOG_NO_COLOR"] == "true"
+    assert "AWS_ACCESS_KEY_ID" not in env
+    assert kiro_native_bridge.KIRO_NATIVE_BRIDGE_DIR_ENV_VAR not in env
+    assert kiro_native_bridge.KIRO_ACP_RECORD_PATH_ENV_VAR not in env
+
+
+@pytest.mark.asyncio
+async def test_kiro_native_model_options_failure_is_retryable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Runner returns 503 when Kiro discovery fails, preventing empty caching."""
+    from omnigent import kiro_native
+
+    conv_id = "conv_kiro_native_model_options_failed"
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(Path.cwd()))
+    monkeypatch.setattr(kiro_native, "resolve_kiro_executable", lambda: "kiro-cli")
+    monkeypatch.setattr(
+        kiro_native,
+        "discover_kiro_model_options",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("not logged in")),
+    )
+    spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "kiro-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        resp = await client.get(f"/v1/sessions/{conv_id}/kiro-model-options")
+
+    assert resp.status_code == 503, resp.text
+    assert resp.json() == {
+        "error": "kiro_native_model_options_failed",
+        "detail": "Request failed on the runner; see runner logs for details.",
+    }
+
+
+@pytest.mark.asyncio
+async def test_kiro_model_options_wrong_harness_returns_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Kiro discovery cannot be invoked through another harness session."""
+    from omnigent import kiro_native
+
+    monkeypatch.setattr(
+        kiro_native,
+        "discover_kiro_model_options",
+        lambda *args, **kwargs: pytest.fail("discovery must not run"),
+    )
+    spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": "conv_not_kiro", "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        resp = await client.get("/v1/sessions/conv_not_kiro/kiro-model-options")
+
+    assert resp.status_code == 200
+    assert resp.json() == {"models": []}
+
+
+@pytest.mark.asyncio
 async def test_events_codex_native_plan_mode_requires_loaded_bridge(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

@@ -1166,12 +1166,16 @@ _session_mcp_startup_cache: dict[str, dict[str, McpServerStartup]] = {}
 # poll can't pin the runner's event loop and wedge a turn.
 _runner_skills_cache: dict[str, list[SkillSummary]] = {}
 _runner_skills_inflight: dict[str, asyncio.Task[None]] = {}
-# Per-session codex-native model catalog cache + in-flight fetch.
-# The snapshot warms this from the bound runner's live Codex app-server
-# (``model/list``) off the hot path, same shape as runner skills.
+# Per-session runner-owned native model catalog cache + in-flight fetch.
+# The snapshot warms this from the bound runner off the hot path, same shape as
+# runner skills. Codex queries app-server ``model/list``; Kiro invokes its CLI.
 _model_options_cache: dict[str, list[dict[str, Any]]] = {}
 _model_options_inflight: dict[str, asyncio.Task[None]] = {}
-_CODEX_MODEL_OPTIONS_RETRY_DELAYS_S = (0.25, 0.5, 1.0, 2.0, 2.0)
+_MODEL_OPTIONS_RETRY_DELAYS_S = (0.25, 0.5, 1.0, 2.0, 2.0)
+# Kiro discovery includes a session-workspace read plus a CLI call bounded at
+# 10s. Keep the AP→runner request budget above both bounds so a valid discovery
+# is not cancelled by the outer request first.
+_MODEL_OPTIONS_REQUEST_TIMEOUT_S = 25.0
 # Per-session model catalog PUSHED by a native harness's extension
 # (``external_model_options``), as opposed to the runner-fetched
 # ``_model_options_cache`` above. Kept in a separate cache that a browser
@@ -6063,9 +6067,9 @@ def _publish_model_options(session_id: str) -> None:
     """
     Publish a typed :class:`SessionModelOptionsEvent` to the live stream.
 
-    Fired when the background Codex ``model/list`` fetch populates the
-    per-session model-options cache. Connected clients re-read the session
-    snapshot and apply its cache-backed ``model_options`` field.
+    Fired when a background runner fetch populates the per-session
+    model-options cache. Connected clients re-read the session snapshot and
+    apply its cache-backed ``model_options`` field.
 
     :param session_id: Session/conversation identifier,
         e.g. ``"conv_abc123"``.
@@ -6085,8 +6089,8 @@ def _invalidate_runner_backed_snapshot_state(
     """
     Drop runner-derived session snapshot overlays for one session.
 
-    These fields are discovered from the bound runner (skills and the
-    codex-native ``model/list`` catalog), so browser reloads can ask the
+    These fields are discovered from the bound runner (skills and native model
+    catalogs), so browser reloads can ask the
     next snapshot to refresh them from the live session instead of serving
     stale AP-process memory. Runner teardown additionally cancels any
     in-flight fetch so a dead runner cannot land a late stale value.
@@ -6104,9 +6108,9 @@ def _invalidate_runner_backed_snapshot_state(
             inflight.cancel()
     _model_options_cache.pop(session_id, None)
     if cancel_inflight:
-        codex_inflight = _model_options_inflight.pop(session_id, None)
-        if codex_inflight is not None:
-            codex_inflight.cancel()
+        model_options_inflight = _model_options_inflight.pop(session_id, None)
+        if model_options_inflight is not None:
+            model_options_inflight.cancel()
 
 
 def _publish_changed_files_invalidated(session_id: str, environment_id: str = "default") -> None:
@@ -22003,28 +22007,29 @@ async def _load_runner_skills(
 
 def _model_options_from_wire(raw_models: Any) -> list[dict[str, Any]]:
     """
-    Validate runner-returned raw Codex ``model/list`` data.
+    Validate runner-returned native model-option data.
 
     :param raw_models: JSON value from the runner's
-        ``{"models": [...]}`` response, e.g. a list of Codex model dicts.
+        ``{"models": [...]}`` response, e.g. Codex or Kiro model dicts.
     :returns: Raw model options for the session snapshot.
     :raises ValueError: If the payload is not the expected list/dict
         shape.
     """
     if not isinstance(raw_models, list):
-        raise ValueError("Codex model options payload must be a list")
+        raise ValueError("Native model options payload must be a list")
     options: list[dict[str, Any]] = []
     for raw_model in raw_models:
         if not isinstance(raw_model, dict):
-            raise ValueError("Codex model option must be an object")
+            raise ValueError("Native model option must be an object")
         options.append(raw_model)
     return options
 
 
 # Native harnesses whose model picker is populated from a *live*, runner-owned
 # model-options endpoint, keyed by wrapper label -> the runner route segment.
-# Codex queries its live app-server ``model/list`` (account/session-scoped, so
-# it must come from the bound runner). Cursor is deliberately NOT here: its
+# Codex queries its live app-server ``model/list``; Kiro invokes its
+# account-scoped CLI discovery command. Both must run on the bound runner.
+# Cursor is deliberately NOT here: its
 # catalog is a curated *static* base list served directly (see
 # ``_fetch_model_options``), which keeps it off the runner-backed cache that
 # ``refresh_state`` invalidates — otherwise an effort/model change would blank
@@ -22032,6 +22037,7 @@ def _model_options_from_wire(raw_models: Any) -> list[dict[str, Any]]:
 _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER: dict[str, str] = {
     _CODEX_NATIVE_WRAPPER_LABEL_VALUE: "codex-model-options",
     _OPENCODE_NATIVE_WRAPPER_LABEL_VALUE: "codex-model-options",
+    _KIRO_NATIVE_WRAPPER_LABEL_VALUE: "kiro-model-options",
     # pi-native is deliberately NOT here: its catalog is PUSHED by the resident
     # extension (``external_model_options`` → ``_pushed_model_options_cache``),
     # not fetched from a runner route, so the picker works in every auth path
@@ -22055,10 +22061,11 @@ async def _fetch_model_options(
       cache below: the catalog never changes per session, and routing it
       through that cache would let a ``refresh_state`` snapshot (which pops the
       cache) blank the picker on an effort/model change.
-    * **codex-native** — a *live*, account-scoped catalog only the bound runner
-      can read (its app-server ``model/list``). Like skills, this stays off the
-      snapshot hot path: the first snapshot kicks a background fetch and returns
-      ``[]``; subsequent snapshots serve the cache.
+    * **codex-native / kiro-native** — a *live*, account-scoped catalog only the
+      bound runner can read (Codex app-server ``model/list`` or Kiro CLI model
+      discovery). Like skills, this stays off the snapshot hot path: the first
+      snapshot kicks a background fetch and returns ``[]``; subsequent snapshots
+      serve the cache.
 
     :param runner_client: HTTP client pointed at the bound runner, or
         ``None`` when no runner is bound.
@@ -22066,17 +22073,13 @@ async def _fetch_model_options(
         e.g. ``"conv_abc123"``.
     :param conv: Conversation row whose labels identify the wrapper.
     :returns: Model options, or ``[]`` when the session has no model picker or
-        the (codex) options are not yet available.
+        runner-owned options are not yet available.
     """
     wrapper = conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
     if wrapper == _CURSOR_NATIVE_WRAPPER_LABEL_VALUE:
         from omnigent.cursor_native import cursor_base_model_options
 
         return cursor_base_model_options()
-    if wrapper == _KIRO_NATIVE_WRAPPER_LABEL_VALUE:
-        from omnigent.kiro_native import kiro_base_model_options
-
-        return kiro_base_model_options()
     if wrapper == _PI_NATIVE_WRAPPER_LABEL_VALUE:
         # pi-native's catalog is PUSHED by its extension (its live
         # ``ctx.modelRegistry``), not fetched: that reflects the models pi
@@ -22112,20 +22115,20 @@ async def _load_model_options(
     :param runner_client: HTTP client pointed at the bound runner.
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
     :param path: Runner route to query, e.g.
-        ``"/v1/sessions/conv_abc/cursor-model-options"``.
+        ``"/v1/sessions/conv_abc/kiro-model-options"``.
     """
-    for attempt in range(len(_CODEX_MODEL_OPTIONS_RETRY_DELAYS_S) + 1):
+    for attempt in range(len(_MODEL_OPTIONS_RETRY_DELAYS_S) + 1):
         try:
-            resp = await runner_client.get(path, timeout=5.0)
+            resp = await runner_client.get(path, timeout=_MODEL_OPTIONS_REQUEST_TIMEOUT_S)
         except (httpx.HTTPError, ConnectionError):
             _logger.debug("Runner model-options query failed for %s", session_id)
             return
         if resp.status_code != 200:
-            # 503 means the native backend (Codex app-server bridge / cursor
-            # login) is still booting. Keep the background single-flight alive
-            # so the web picker fills without a second manual refresh.
-            if resp.status_code == 503 and attempt < len(_CODEX_MODEL_OPTIONS_RETRY_DELAYS_S):
-                await asyncio.sleep(_CODEX_MODEL_OPTIONS_RETRY_DELAYS_S[attempt])
+            # 503 means native model discovery is temporarily unavailable.
+            # Keep the background single-flight alive so the web picker fills
+            # without a second manual refresh.
+            if resp.status_code == 503 and attempt < len(_MODEL_OPTIONS_RETRY_DELAYS_S):
+                await asyncio.sleep(_MODEL_OPTIONS_RETRY_DELAYS_S[attempt])
                 continue
             return
         try:
@@ -22137,8 +22140,8 @@ async def _load_model_options(
             # Older runners returned 200 + [] for the same not-ready window.
             # Do not cache that empty catalog; retry, then leave the cache
             # cold so a later snapshot can try again.
-            if attempt < len(_CODEX_MODEL_OPTIONS_RETRY_DELAYS_S):
-                await asyncio.sleep(_CODEX_MODEL_OPTIONS_RETRY_DELAYS_S[attempt])
+            if attempt < len(_MODEL_OPTIONS_RETRY_DELAYS_S):
+                await asyncio.sleep(_MODEL_OPTIONS_RETRY_DELAYS_S[attempt])
                 continue
             return
         _model_options_cache[session_id] = options
@@ -22359,10 +22362,10 @@ async def _get_session_snapshot(
     # server only overlays the result; best-effort, empty when no runner
     # is bound or it can't be reached.
     skills = await _fetch_runner_skills(runner_client, session_id)
-    # Codex model options are also runner-owned: they come from the
-    # session's live Codex app-server ``model/list`` response. Best-effort
-    # and cache-backed like skills so a snapshot poll cannot wedge the
-    # runner while a turn is active.
+    # Native model options can also be runner-owned: Codex reads app-server
+    # ``model/list`` and Kiro invokes its authenticated CLI discovery command.
+    # Best-effort and cache-backed like skills so a snapshot poll cannot wedge
+    # the runner while a turn is active.
     model_options = await _fetch_model_options(runner_client, session_id, conv)
     # Dynamic override from the forwarder (real Claude Code window).
     # Only present after the first statusLine tick; before that the

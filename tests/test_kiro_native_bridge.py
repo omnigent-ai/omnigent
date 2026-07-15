@@ -16,6 +16,7 @@ from omnigent.kiro_native_bridge import (
     KIRO_ACP_RECORD_PATH_ENV_VAR,
     KIRO_NATIVE_BRIDGE_DIR_ENV_VAR,
     acp_record_path,
+    build_kiro_native_discovery_env,
     build_kiro_native_terminal_env,
     inject_user_message,
     send_kiro_permission_verdict,
@@ -110,6 +111,28 @@ def test_build_terminal_env_adds_bridge_dir_and_acp_record_path(
     assert env[KIRO_NATIVE_BRIDGE_DIR_ENV_VAR] == str(bridge_dir)
     assert env[KIRO_ACP_RECORD_PATH_ENV_VAR] == str(acp_record_path(bridge_dir))
     assert env["PATH"] == "/usr/bin"
+
+
+def test_build_discovery_env_omits_bridge_state_and_credentials() -> None:
+    """Standalone model discovery inherits Kiro homes but no session recorder."""
+    env = build_kiro_native_discovery_env(
+        source_env={
+            "HOME": "/home/test",
+            "KIRO_HOME": "/kiro",
+            "KIRO_CONFIG_HOME": "/kiro-config",
+            "PATH": "/usr/bin",
+            "AWS_ACCESS_KEY_ID": "secret",
+            KIRO_NATIVE_BRIDGE_DIR_ENV_VAR: "/tmp/bridge",
+            KIRO_ACP_RECORD_PATH_ENV_VAR: "/tmp/record.jsonl",
+        }
+    )
+
+    assert env == {
+        "HOME": "/home/test",
+        "KIRO_HOME": "/kiro",
+        "KIRO_CONFIG_HOME": "/kiro-config",
+        "PATH": "/usr/bin",
+    }
 
 
 def test_send_kiro_permission_verdict_accepts_default_option(

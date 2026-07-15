@@ -1341,7 +1341,7 @@ interface MainAgentSurfaceProps {
   showModels: boolean;
   /** Native model picker family, when present. */
   modelPickerKind: NativeModelPickerKind | null;
-  /** Codex app-server model options for codex-native sessions. */
+  /** Server-provided model options for native sessions. */
   codexModelOptions: readonly CodexModelOption[];
   /** Show the Codex Plan-mode toggle. */
   showCodexPlanMode: boolean;
@@ -3333,7 +3333,7 @@ interface ComposerProps {
   showModels: boolean;
   /** Native model picker family, when present. */
   modelPickerKind: NativeModelPickerKind | null;
-  /** Codex app-server model options for codex-native sessions. */
+  /** Server-provided model options for native sessions. */
   codexModelOptions: readonly CodexModelOption[];
   /** Show the Codex Plan-mode toggle. */
   showCodexPlanMode: boolean;
@@ -5322,7 +5322,7 @@ interface AgentPickerProps {
   showEffort: boolean;
   /** Native model picker family, when present. */
   modelPickerKind: NativeModelPickerKind | null;
-  /** Codex app-server model options for codex-native sessions. */
+  /** Server-provided model options for native sessions. */
   codexModelOptions: readonly CodexModelOption[];
   /**
    * Disables the picker trigger. The picker is purely a write
