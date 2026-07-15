@@ -1249,10 +1249,14 @@ function ConversationList({
   }, [activeId, allConversations]);
   // Auto-expand the project folder holding the selected session, so navigating
   // to a filed session reveals it instead of leaving it hidden in a collapsed
-  // folder. Fires on selection only; the user can still collapse it afterward.
+  // folder. Skipped for pinned sessions: they're already reachable from the
+  // Pinned section, so forcing their project open would undo a manual collapse
+  // every time the user clicks the pinned row.
   useEffect(() => {
-    if (activeProjectName) expandProject(activeProjectName);
-  }, [activeProjectName, expandProject]);
+    if (!activeId || !activeProjectName) return;
+    if (pinnedSet.has(activeId)) return;
+    expandProject(activeProjectName);
+  }, [activeId, activeProjectName, pinnedSet, expandProject]);
 
   // Visible rows in render order (collapsed sections excluded) for the Cmd+↑/↓
   // session hotkey. Titles must match the <ConversationSection> props below.
