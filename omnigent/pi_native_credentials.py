@@ -172,7 +172,15 @@ class PiProviderConfig:
             # Include all known models, ensuring the selected model is present.
             # The selected model may be a newer id not yet in the static list.
             models: list[dict[str, Any]] = list(self.extra_models)
-            if not any(m.get("id") == self.model for m in models):
+            # Only append to this (Anthropic) provider when the model is absent
+            # from ALL providers. Non-Claude models (GLM, GPT…) live in
+            # additional_providers (openai-completions); appending them here
+            # too would register them under the wrong wire protocol.
+            in_additional = any(
+                any(m.get("id") == self.model for m in prov.get("models", []))
+                for prov in self.additional_providers.values()
+            )
+            if not any(m.get("id") == self.model for m in models) and not in_additional:
                 models.append({"id": self.model, "input": ["text", "image"]})
         else:
             models = [{"id": self.model}]
@@ -801,5 +809,14 @@ def pi_native_provider_launch(
     """
     write_pi_models_config(agent_dir, provider)
     env = {PI_CODING_AGENT_DIR_ENV_VAR: str(agent_dir)}
-    args = ["--provider", provider.provider_id, "--model", provider.model]
+    # Resolve which provider the selected model lives in. Non-Claude models
+    # (GLM, GPT, Llama…) are in additional_providers (omnigent-openai);
+    # Claude models are in the primary provider (omnigent). Pass the correct
+    # --provider so Pi can resolve the model id.
+    model_provider_id = provider.provider_id
+    for extra_id, extra_cfg in provider.additional_providers.items():
+        if any(m.get("id") == provider.model for m in extra_cfg.get("models", [])):
+            model_provider_id = extra_id
+            break
+    args = ["--provider", model_provider_id, "--model", provider.model]
     return env, args

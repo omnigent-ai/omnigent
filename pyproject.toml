@@ -184,7 +184,7 @@ cursor = ["cursor-sdk>=0.1.7"]
 # Hindsight long-term memory built-in tools (hindsight_retain / _recall /
 # _reflect). The tools import the client lazily, so only users who enable a
 # Hindsight memory tool need this extra.
-memory = ["hindsight-client>=0.4.0"]
+hindsight = ["hindsight-client>=0.4.0"]
 databricks = [
     # Floor matches what core code was tested against when the SDK was a
     # default dependency (it moved here from `dependencies` above).
@@ -207,7 +207,7 @@ databricks = [
 ]
 dev = [
     "pytest>=7.0",
-    # hindsight-client is opt-in (the `memory` extra), but the Hindsight
+    # hindsight-client is opt-in (the `hindsight` extra), but the Hindsight
     # memory tool tests import + mock it, so keep it in the dev set.
     "hindsight-client>=0.4.0",
     "pytest-asyncio>=0.21",
@@ -578,8 +578,8 @@ ignore_missing_imports = true
 module = "daytona.*"
 ignore_missing_imports = true
 
-# hindsight-client is an optional dep (the `memory` extra); the memory
-# built-in tools import it lazily so the base install never needs it.
+# hindsight-client is an optional dep (the `hindsight` extra); the
+# hindsights tools import it lazily so the base install never needs it.
 [[tool.mypy.overrides]]
 module = "hindsight_client.*"
 ignore_missing_imports = true

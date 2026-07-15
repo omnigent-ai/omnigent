@@ -34,6 +34,14 @@
     "directories": {
       "output": "dist"
     },
+    "protocols": [
+      {
+        "name": "Omnigent session link",
+        "schemes": [
+          "omnigent"
+        ]
+      }
+    ],
     "publish": [
       {
         "provider": "github",

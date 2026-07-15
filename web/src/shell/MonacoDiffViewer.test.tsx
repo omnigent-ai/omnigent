@@ -16,6 +16,8 @@ const h = vi.hoisted(() => ({
       renderSideBySide?: boolean;
       readOnly?: boolean;
       hideUnchangedRegions?: { enabled?: boolean };
+      ignoreTrimWhitespace?: boolean;
+      diffWordWrap?: "on" | "off";
     };
   } | null,
   onMount: null as DiffOnMount | null,
@@ -58,6 +60,7 @@ function renderDiff(props: {
   after: string | null;
   layout: "unified" | "split";
   hideWhitespace?: boolean;
+  wrapLines?: boolean;
 }) {
   return render(
     <MonacoDiffViewer
@@ -66,6 +69,7 @@ function renderDiff(props: {
       path="src/a.ts"
       layout={props.layout}
       hideWhitespace={props.hideWhitespace ?? false}
+      wrapLines={props.wrapLines ?? false}
       conversationId="conv_1"
       comments={[]}
       activeSelection={null}
@@ -109,6 +113,27 @@ describe("MonacoDiffViewer", () => {
     await waitFor(() => expect(h.diffProps).not.toBeNull());
     expect(h.diffProps?.options?.renderSideBySide).toBe(sideBySide);
   });
+
+  it.each([
+    { wrapLines: true as const, diffWordWrap: "on" as const },
+    { wrapLines: false as const, diffWordWrap: "off" as const },
+  ])(
+    "maps wrapLines=$wrapLines to diffWordWrap=$diffWordWrap",
+    async ({ wrapLines, diffWordWrap }) => {
+      renderDiff({ before: "a", after: "b", layout: "unified", wrapLines });
+      await waitFor(() => expect(h.diffProps).not.toBeNull());
+      expect(h.diffProps?.options?.diffWordWrap).toBe(diffWordWrap);
+    },
+  );
+
+  it.each([{ hideWhitespace: true as const }, { hideWhitespace: false as const }])(
+    "maps hideWhitespace=$hideWhitespace to ignoreTrimWhitespace",
+    async ({ hideWhitespace }) => {
+      renderDiff({ before: "a", after: "b", layout: "unified", hideWhitespace });
+      await waitFor(() => expect(h.diffProps).not.toBeNull());
+      expect(h.diffProps?.options?.ignoreTrimWhitespace).toBe(hideWhitespace);
+    },
+  );
 
   it("treats a null side (new/deleted file) as empty content", async () => {
     renderDiff({ before: null, after: "created\n", layout: "unified" });

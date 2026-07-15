@@ -24,6 +24,9 @@ vi.mock("@/lib/nativeBridge", () => ({
   // Returns an unsubscribe fn; tests that exercise native click routing
   // capture the registered callback via this mock's calls.
   onNativeNotificationActivated: vi.fn().mockReturnValue(() => {}),
+  // Deep-link routing reuses the same navigate; tests don't assert on it,
+  // but the hook calls it on mount, so it must be a no-op fn (not undefined).
+  onOpenPath: vi.fn().mockReturnValue(() => {}),
 }));
 
 // The turn-end notification body is enriched by an async fetch of the agent's

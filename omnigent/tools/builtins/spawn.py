@@ -128,7 +128,8 @@ class SysSessionSendTool(Tool):
             "Returns the child's output when its turn completes. To run "
             "multiple sessions in parallel, emit multiple "
             "sys_session_send tool_calls in the same response — they "
-            "dispatch concurrently. To attach previously-uploaded files, "
+            "dispatch concurrently. "
+            "To attach previously-uploaded files, "
             "pass their file ids via the object args form's 'file_ids' "
             "list on the first named (agent, title) send only; file_ids "
             "cannot be used with session_id or when continuing an existing "
@@ -917,6 +918,16 @@ class SysSessionCreateTool(Tool):
                                 "for the child. Omit to create an idle "
                                 "session and drive it later via "
                                 "sys_session_send."
+                            ),
+                        },
+                        "model": {
+                            "type": "string",
+                            "description": (
+                                "Optional model override for the child "
+                                "session, e.g. 'databricks-glm-5-2' or "
+                                "'databricks-claude-opus-4-8'. Sets the "
+                                "harness model at session creation; "
+                                "omit to use the agent's default."
                             ),
                         },
                     },

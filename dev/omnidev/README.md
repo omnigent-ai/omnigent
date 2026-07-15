@@ -20,8 +20,11 @@ replaces the three-terminal local dev flow (`omnigent server`, `omnigent host`,
 - **supervises** the backend server, the host daemon, and the Vite frontend,
   restarting any that crash (with backoff);
 - **reloads the backend** (server → host) when you edit `omnigent/**/*.py`;
-  the frontend self-reloads through Vite HMR;
-- gives you **scrollable per-process log panes** plus a combined view.
+  gitignored files under `omnigent/` (e.g. the build-time `_build_info.py`) are
+  skipped so generated churn doesn't reload; the frontend self-reloads through
+  Vite HMR;
+- gives you **per-process log panes** plus a combined view, each a `less`-style
+  pager with wrap and search (see [Keys](#keys)).
 
 ## Build & run
 
@@ -85,6 +88,7 @@ canonical checkout path. Per-process logs are written through to
 --pod-dir <PATH>    Use a specific pod dir instead of the per-repo default
 --no-vite           Backend + host only (no frontend)
 --clean             Wipe the pod dir before starting
+--debug             Log each watched file change and whether it reloads
 ```
 
 `--vite-host 0.0.0.0` exposes the Vite dev server on all interfaces for device
@@ -114,12 +118,21 @@ not auto-trusted (add those to `OMNIGENT_WS_ALLOWED_ORIGINS` yourself).
 
 ## Keys
 
+The log pane is a `less`-style pager, so the movement and search keys should
+feel familiar.
+
 | Key | Action |
 |---|---|
 | `1` / `2` / `3` / `0` | Focus server / host / vite / combined pane |
 | `Tab` | Cycle panes |
-| `↑` `↓` `PgUp` `PgDn` | Scroll (detaches from tail) |
-| `f` | Toggle follow-tail |
+| `j` / `k` (or `↓` / `↑`) | Scroll one line |
+| `f` / `Space` / `PgDn` (or `b` / `PgUp`) | Page forward / back one window |
+| `d` / `u` | Half-page forward / back |
+| `g` / `G` | Jump to top / bottom (bottom re-follows the tail) |
+| `F` | Toggle follow-tail (like `less +F`) |
+| `w` | Toggle line wrap (on by default) |
+| `/` `?` | Search forward / back — type, `Enter` to jump, `Esc` to cancel |
+| `n` / `N` | Next / previous match |
 | `r` | Restart the focused process (server/host restart as a pair) |
 | `R` | Restart the backend (server then host) |
 | `c` | Clear the focused pane |

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import uuid
 from collections.abc import Iterator
 from contextvars import ContextVar
 from typing import Any
@@ -19,6 +20,7 @@ from sqlalchemy import (
     SmallInteger,
     String,
     Text,
+    TypeDecorator,
     UniqueConstraint,
     false,
     text,
@@ -33,6 +35,40 @@ from omnigent.db.compression import CompressedText
 # but MySQL cannot index a BLOB without a key-prefix length, so use fixed-length
 # BINARY(32) there — an exact fit for the digest and fully indexable.
 _CKSUM32 = LargeBinary(32).with_variant(MySQLBinary(32), "mysql")
+
+
+class Uuid16(TypeDecorator[str]):
+    """A UUID primary key stored as 16 raw bytes.
+
+    Python-side values are bare 32-char hex strings (e.g.
+    ``"a1b2c3d4..."``, no dashes — matching the schema-wide UUID
+    convention); the database stores the 16-byte form —
+    ``BINARY(16)`` on MySQL (fixed-length and fully indexable, the same
+    reasoning as :data:`_CKSUM32`) and ``BLOB`` / ``BYTEA`` elsewhere.
+    Halves the storage of a 32-char hex string and indexes tighter.
+
+    ``process_bind_param`` accepts either a canonical/hex string or a
+    :class:`uuid.UUID`; ``process_result_value`` always returns the
+    bare 32-char hex string (``.hex``, no dashes).
+    """
+
+    impl = LargeBinary(16)
+    cache_ok = True
+
+    def load_dialect_impl(self, dialect: Any) -> Any:
+        if dialect.name == "mysql":
+            return dialect.type_descriptor(MySQLBinary(16))
+        return dialect.type_descriptor(LargeBinary(16))
+
+    def process_bind_param(self, value: str | uuid.UUID | None, dialect: Any) -> bytes | None:  # noqa: ARG002
+        if value is None:
+            return None
+        return (value if isinstance(value, uuid.UUID) else uuid.UUID(value)).bytes
+
+    def process_result_value(self, value: bytes | None, dialect: Any) -> str | None:  # noqa: ARG002
+        if value is None:
+            return None
+        return uuid.UUID(bytes=bytes(value)).hex
 
 
 class OmnigentBase(DeclarativeBase):
@@ -1068,3 +1104,210 @@ class SqlUserDailyCost(OmnigentBase):
     cost_usd: Mapped[float] = mapped_column(Float, nullable=False)
     ask_approved_usd: Mapped[float] = mapped_column(Float, nullable=False, server_default="0")
     updated_at: Mapped[int] = mapped_column(Integer)
+
+
+class SqlScheduledTask(OmnigentBase):
+    """
+    SQLAlchemy model for the ``scheduled_tasks`` table.
+
+    A scheduled task is a saved, scheduled instruction that fires an agent
+    session on a recurring cron schedule (``cron_expression``).
+
+    :param id: UUID primary key stored as 16 raw bytes (see :class:`Uuid16`),
+        surfaced as a bare 32-char hex string (no dashes).
+    :param name: Human-readable task name, e.g. ``"nightly triage"``.
+    :param prompt: The instruction dispatched to the agent on each firing.
+    :param cron_expression: The required cron string for the recurring trigger,
+        e.g. ``"0 9 * * *"``.
+    :param owner_user_id: User the spawned session's ``LEVEL_OWNER`` grant is
+        written for — who the run belongs to, e.g. ``"alice@example.com"``.
+        ``None`` in single-user / OSS mode; the fire path resolves it to the
+        reserved ``"local"`` user.
+    :param agent_id: The agent bound to this task (relates to
+        ``agents.id``). Cascade cleanup on agent deletion is application-owned
+        — there is no DB-level foreign key (schema Rule R032).
+    :param model_override: Per-task LLM model override, e.g.
+        ``"claude-opus-4-7"``. ``None`` means use the agent default.
+    :param reasoning_effort: Per-task reasoning-effort hint, e.g. ``"high"``.
+        ``None`` means use the agent default.
+    :param workspace: Absolute path on disk where a fired session's runner
+        should start (the source repo / working dir). ``None`` when unset.
+    :param base_branch: Git base ref a firing branches FROM when it creates a
+        worktree at fire time (mirrors session-create's ``git.base_branch``
+        input). Pairs with ``workspace``:
+        ``workspace`` is where, ``base_branch`` is what to branch from. ``None``
+        when unset. The per-run *output* branch is not stored on the definition.
+    :param execution_target: Where a firing runs —
+        ``connected_host``/``managed_sandbox``. ``connected_host`` resolves the
+        owner's live host at fire time (see ``host_id``); ``managed_sandbox``
+        provisions/adopts a sandbox at fire time. Stored as a stable int code
+        (see omnigent.db.enum_codecs SCHEDULED_TASK_EXECUTION_TARGET); the store
+        converts to/from the string name at the row↔entity boundary. Defaults to
+        ``connected_host``.
+    :param host_id: For ``execution_target=connected_host``, the specific host
+        to run on (relates to ``hosts.host_id``; no DB foreign key, Rule R032).
+        ``None`` means "the owner's freshest online host". Always ``None`` for
+        ``managed_sandbox`` (the sandbox is provisioned/adopted under a
+        deterministic id at fire time, so there is nothing to pin).
+    :param timezone: IANA timezone the trigger is evaluated in, e.g.
+        ``"America/Los_Angeles"``.
+    :param state: Lifecycle state — ``active``/``paused``/``deleted``.
+        The scheduler only dispatches ``active`` tasks.
+        Stored as a stable int code (see omnigent.db.enum_codecs
+        SCHEDULED_TASK_STATE); the store converts to/from the string name at the
+        row↔entity boundary. Defaults to ``active``.
+    :param last_run_at: Unix epoch seconds of the most recent firing, or
+        ``None`` if it has never fired.
+    :param last_run_conversation_id: The conversation created by the most recent
+        firing (relates to ``conversations.id``). ``None`` if never fired or the
+        referenced conversation was deleted (application-owned SET-NULL cleanup;
+        no DB foreign key).
+    :param created_at: Unix epoch seconds at row creation.
+    :param updated_at: Unix epoch seconds of the last write, or ``None`` if the
+        row has never been updated.
+    """
+
+    __tablename__ = "scheduled_tasks"
+
+    # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    id: Mapped[str] = mapped_column(Uuid16, primary_key=True)
+    name: Mapped[str] = mapped_column(String(256), nullable=False)
+    # Opaque free text, never SQL-queried — stored compressed (CompressedText).
+    prompt: Mapped[str] = mapped_column(CompressedText, nullable=False)
+    # e.g. "0 9 * * *"
+    cron_expression: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Session-owner identity: the spawned run's LEVEL_OWNER grant is written
+    # for this user. Nullable — None in single-user/OSS mode (the fire path
+    # resolves null to the reserved "local" user). String(128) to match
+    # session_permissions.user_id (the column the LEVEL_OWNER grant is
+    # written into) and every other user-identity column in this schema.
+    owner_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # Relates to agents.id. No DB foreign key (Rule R032); cascade is app-owned.
+    agent_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    # Per-task overrides — None means fall back to the agent default. Widths
+    # mirror the matching conversations.* override columns.
+    model_override: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    reasoning_effort: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    workspace: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    # Git base ref a firing branches from when it creates a worktree at fire
+    # time (mirrors session-create's git.base_branch input). None when unset.
+    base_branch: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Where a firing runs, as a stable int code (see omnigent.db.enum_codecs
+    # SCHEDULED_TASK_EXECUTION_TARGET: connected_host=1, managed_sandbox=2).
+    # connected_host → resolve the owner's live host at fire time (see host_id);
+    # managed_sandbox → provision/adopt a sandbox at fire time. Defaults to
+    # connected_host so existing rows keep the V1 behavior. The store converts
+    # to/from the string name at the row↔entity boundary.
+    execution_target: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default="1")
+    # For execution_target=connected_host: the specific host to run on (relates
+    # to hosts.host_id; No DB foreign key, Rule R032). None = "the owner's
+    # freshest online host, whichever". Always None for managed_sandbox (the
+    # sandbox is provisioned/adopted under a deterministic id at fire time, so
+    # there is nothing to pin here).
+    host_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    timezone: Mapped[str] = mapped_column(String(64), nullable=False, server_default="UTC")
+    # Enum stored as a stable int code (see omnigent.db.enum_codecs
+    # SCHEDULED_TASK_STATE: active=1, paused=2, deleted=3). The
+    # store converts to/from the string name at the row↔entity boundary.
+    state: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default="1")
+    last_run_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Relates to conversations.id. No DB foreign key (Rule R032); the
+    # application nulls this out when the referenced conversation is deleted.
+    last_run_conversation_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[int] = mapped_column(Integer)
+    updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    __table_args__ = (
+        CheckConstraint("state IN (1, 2, 3)", name="ck_scheduled_tasks_state"),
+        CheckConstraint("execution_target IN (1, 2)", name="ck_scheduled_tasks_execution_target"),
+        Index("ix_scheduled_tasks_created_at", "workspace_id", "created_at", "id"),
+        Index("ix_scheduled_tasks_owner_user_id", "workspace_id", "owner_user_id", "id"),
+        # Covers the scheduler's read path:
+        # WHERE workspace_id + state ORDER BY created_at, id.
+        Index("ix_scheduled_tasks_state", "workspace_id", "state", "created_at", "id"),
+    )
+
+
+class SqlScheduledTaskRun(OmnigentBase):
+    """
+    SQLAlchemy model for the ``scheduled_task_runs`` table.
+
+    One row per firing of a scheduled task — the run history. Recorded and
+    advanced by the scheduler as a firing moves through its lifecycle.
+
+    :param id: UUID primary key stored as 16 raw bytes (see :class:`Uuid16`),
+        surfaced as a bare 32-char hex string (no dashes).
+    :param scheduled_task_id: The task this run belongs to (relates to
+        ``scheduled_tasks.id``; also a :class:`Uuid16`). Indexed for per-task
+        history listing. Cascade cleanup on task deletion is application-owned —
+        no DB foreign key (Rule R032).
+    :param conversation_id: The conversation created by this firing (relates to
+        ``conversations.id``). ``None`` before dispatch, or after the referenced
+        conversation is deleted (application-owned SET-NULL; no DB foreign key).
+    :param status: Lifecycle state —
+        ``scheduled``/``running``/``succeeded``/``failed``/``skipped``. Stored
+        as a stable int code (see omnigent.db.enum_codecs
+        SCHEDULED_TASK_RUN_STATUS); the store converts to/from the string name
+        at the row↔entity boundary.
+    :param scheduled_at: Unix epoch seconds the firing was scheduled for.
+    :param fired_at: Unix epoch seconds dispatch actually began, or ``None`` if
+        it has not fired yet.
+    :param finished_at: Unix epoch seconds the run reached a terminal state, or
+        ``None`` if still pending/running.
+    :param error: Failure detail when ``status = 'failed'``; ``None`` otherwise.
+    :param error_code: Short failure classification (e.g. ``"timeout"``,
+        ``"rate_limited"``) for future retryable-vs-terminal retry logic;
+        ``None`` unless ``status = 'failed'``.
+    """
+
+    __tablename__ = "scheduled_task_runs"
+
+    # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    id: Mapped[str] = mapped_column(Uuid16, primary_key=True)
+    # Relates to scheduled_tasks.id. No DB foreign key (Rule R032); cascade is
+    # app-owned.
+    scheduled_task_id: Mapped[str] = mapped_column(Uuid16, nullable=False)
+    # Relates to conversations.id. No DB foreign key; app nulls on delete.
+    conversation_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Enum stored as a stable int code (see omnigent.db.enum_codecs
+    # SCHEDULED_TASK_RUN_STATUS: scheduled=1, running=2, succeeded=3, failed=4,
+    # skipped=5). The store converts to/from the string name at the
+    # row↔entity boundary.
+    status: Mapped[int] = mapped_column(SmallInteger)
+    scheduled_at: Mapped[int] = mapped_column(Integer)
+    fired_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    finished_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Opaque free-text error blob, never SQL-queried — stored compressed.
+    error: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    # Short, queryable failure classification token (e.g. "timeout",
+    # "rate_limited") for future retry logic. Bounded plain string, not a blob;
+    # no CHECK constraint (no code taxonomy defined yet).
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN (1, 2, 3, 4, 5)",
+            name="ck_scheduled_task_runs_status",
+        ),
+        Index(
+            "ix_scheduled_task_runs_scheduled_task_id",
+            "workspace_id",
+            "scheduled_task_id",
+            "scheduled_at",
+            "id",
+        ),
+    )

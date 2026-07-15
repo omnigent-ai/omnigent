@@ -17,6 +17,7 @@ import {
   ArchiveRestoreIcon,
   CheckIcon,
   CheckIcon as CheckMarkIcon,
+  ChevronLeftIcon,
   ChevronRightIcon,
   CircleStopIcon,
   FolderIcon,
@@ -2043,6 +2044,77 @@ function ConversationMenuItems({
   setMenuOpen: (open: boolean) => void;
   runArchive: () => void;
 }) {
+  // Mobile lacks the horizontal room for a side-opening submenu, so the
+  // project picker replaces the menu body in place instead of flying out
+  // to the side. `view` swaps between the main actions and that sub-view;
+  // desktop always renders the native side-flyout submenu regardless.
+  const isMobile = useIsMobileViewport();
+  const [view, setView] = useState<"main" | "projects">("main");
+
+  // The project pick / create / remove flow — shared verbatim by the desktop
+  // side-flyout submenu and the mobile in-place sub-view so both behave
+  // identically (same moveToProject.mutate, confirmation, and menu close).
+  const handleProjectSelect = (project: string) => {
+    setMenuOpen(false);
+    // Moving to another project is harmless — apply it now, and expand that
+    // (possibly new) project so the session is visible in it rather than
+    // hidden in a collapsed folder.
+    if (project !== "") {
+      moveToProject.mutate({ id: conversation.id, project });
+      onProjectAssigned?.(project);
+      return;
+    }
+    // Removing: only confirm when this is the project's LAST session (removing
+    // it would delete the implicit project). Otherwise remove silently. The
+    // check is server-side so it's accurate regardless of the loaded window.
+    void (async () => {
+      let isLastSession = true;
+      if (currentProject) {
+        try {
+          const ids = await fetchProjectSessionIds(currentProject);
+          isLastSession = ids.every((id) => id === conversation.id);
+        } catch {
+          // If the check fails, fall back to confirming.
+          isLastSession = true;
+        }
+      }
+      if (isLastSession) {
+        setRemoveProjectOpen(true);
+      } else {
+        moveToProject.mutate({ id: conversation.id, project: "" });
+      }
+    })();
+  };
+
+  // Mobile project sub-view: replaces the entire menu body in place (the
+  // "Back" row flips `view` without closing the menu or navigating). Reachable
+  // only via the mobile project item below, which sits behind the same
+  // `canEdit && isOwner` gate.
+  if (isMobile && view === "projects") {
+    return (
+      <>
+        <C.Item
+          data-testid="project-picker-back"
+          className="whitespace-nowrap"
+          // Keep the menu open — just flip back to the main actions.
+          onSelect={(e) => {
+            e.preventDefault();
+            setView("main");
+          }}
+        >
+          <ChevronLeftIcon className="size-3.5" />
+          Back
+        </C.Item>
+        <C.Separator />
+        <ProjectPickerMenu
+          components={C}
+          currentProject={currentProject}
+          onSelect={handleProjectSelect}
+        />
+      </>
+    );
+  }
+
   return (
     <>
       {/* Pin/Unpin — mobile-only (md:hidden); desktop uses the
@@ -2122,56 +2194,42 @@ function ConversationMenuItems({
       )}
       {/* Projects are a My-sessions-only tool, so filing is owner-only — a
           shared session (even editable) shows no project affordance. */}
-      {canEdit && isOwner && (
-        <C.Sub>
-          <C.SubTrigger data-testid="move-to-project" className="whitespace-nowrap">
+      {canEdit &&
+        isOwner &&
+        (isMobile ? (
+          // Mobile: no room for a side flyout, so this item swaps the menu
+          // body to the project picker in place (see the `view === "projects"`
+          // branch above). `preventDefault` keeps the menu open on select.
+          <C.Item
+            data-testid="move-to-project"
+            className="whitespace-nowrap"
+            onSelect={(e) => {
+              e.preventDefault();
+              setView("projects");
+            }}
+          >
             <FolderInputIcon className="size-3.5" />
             {/* "Add to project" until the session is filed, then "Move
                 session" to switch or remove it. */}
             {currentProject ? "Move session" : "Add to project"}
-          </C.SubTrigger>
-          <C.SubContent className="w-56 p-1 [&_[role=menuitem]]:text-xs">
-            {/* A native submenu flyout — no separate popover layer, so no
-                open/dismiss race with the parent menu. */}
-            <ProjectPickerMenu
-              components={C}
-              currentProject={currentProject}
-              onSelect={(project) => {
-                setMenuOpen(false);
-                // Moving to another project is harmless — apply it now,
-                // and expand that (possibly new) project so the session
-                // is visible in it rather than hidden in a collapsed folder.
-                if (project !== "") {
-                  moveToProject.mutate({ id: conversation.id, project });
-                  onProjectAssigned?.(project);
-                  return;
-                }
-                // Removing: only confirm when this is the project's LAST
-                // session (removing it would delete the implicit project).
-                // Otherwise remove silently. The check is server-side so
-                // it's accurate regardless of the loaded window / pins.
-                void (async () => {
-                  let isLastSession = true;
-                  if (currentProject) {
-                    try {
-                      const ids = await fetchProjectSessionIds(currentProject);
-                      isLastSession = ids.every((id) => id === conversation.id);
-                    } catch {
-                      // If the check fails, fall back to confirming.
-                      isLastSession = true;
-                    }
-                  }
-                  if (isLastSession) {
-                    setRemoveProjectOpen(true);
-                  } else {
-                    moveToProject.mutate({ id: conversation.id, project: "" });
-                  }
-                })();
-              }}
-            />
-          </C.SubContent>
-        </C.Sub>
-      )}
+          </C.Item>
+        ) : (
+          <C.Sub>
+            <C.SubTrigger data-testid="move-to-project" className="whitespace-nowrap">
+              <FolderInputIcon className="size-3.5" />
+              {currentProject ? "Move session" : "Add to project"}
+            </C.SubTrigger>
+            <C.SubContent className="w-56 p-1 [&_[role=menuitem]]:text-xs">
+              {/* A native submenu flyout — no separate popover layer, so no
+                  open/dismiss race with the parent menu. */}
+              <ProjectPickerMenu
+                components={C}
+                currentProject={currentProject}
+                onSelect={handleProjectSelect}
+              />
+            </C.SubContent>
+          </C.Sub>
+        ))}
       {/* Stop / Archive / Delete are grouped at the bottom, below a
           divider: lifecycle-ending actions separated from the everyday
           ones above. */}

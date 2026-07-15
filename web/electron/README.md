@@ -653,6 +653,59 @@ windows get the same per-window origin pinning as regular ones. With windows
 on more than one server, the dock badge shows the sum of each server's unread
 count and notification titles are prefixed with the firing server's hostname.
 
+## Deep links
+
+An `omnigent://<hostname>/c/<session_id>` URL opens that session on that
+server in the desktop app — the way a browser deep link opens a page:
+
+```
+omnigent://localhost:8000/c/conv_abc              → http://localhost:8000/c/conv_abc
+omnigent://my-workspace.cloud.databricks.com/c/x → https://…/ml/omnigents/c/x
+```
+
+The link names a server by **host** (with port if non-default) and carries no
+`http`/`https` — the shell infers the scheme with the same rule the setup page
+uses (`http` for loopback, `https` for a remote host), so a deep link and a
+pasted URL can never disagree. The Databricks workspace mount (`/ml/omnigents`)
+is **not** in the link; it is server-determined and discovered the same way a
+pasted workspace URL is. v1 accepts only `/c/<session_id>`; other paths are
+ignored.
+
+**Window handling** (the careful part):
+
+- A window already open on that server and currently on its page is **reused
+  in place** — the shell tells the SPA's router to navigate to the conversation
+  without a reload, so the in-flight stream isn't dropped. (Same basename-less
+  `/c/<id>` path a notification click routes.)
+- A window pinned to that server but mid-SSO-redirect (off the server origin)
+  is **reused with a reload** to the conversation, since the SPA's listener
+  isn't reliably mounted on a foreign IdP page.
+- A server you've **previously connected to** (in the recent-servers list or
+  the saved default) but have no live window for opens in a **new window** —
+  no prompt, the way a second tab for a known site would.
+- A server you have **never connected to** prompts with a native confirmation
+  dialog (Cancel is the default). Pinning a new origin is a privilege grant
+  (notifications, badge, mic), so a clicked link never silently pins an
+  attacker-chosen origin; once you allow it, the server is remembered so the
+  next link is frictionless.
+
+**Cold start vs warm start.** On macOS, `open-url` fires for the link and can
+arrive **before** the app is ready, so pre-ready links are queued and drained
+once the windows exist. On Windows/Linux, a second launch carrying the URL is
+funneled to the running instance by the single-instance lock. Links are
+handled one at a time, so two arriving together can't race two consent
+dialogs. At cold start the deep link replaces the default launch window; if you
+cancel an unknown-server prompt, a normal launch window opens instead.
+
+**Registration.** The scheme is registered two ways: the build manifest
+(`build.protocols` in `package.json`, which writes `CFBundleURLSchemes` on
+macOS, a `.desktop` `MimeType` on Linux, and registry entries on Windows) for
+packaged installs, plus a runtime `app.setAsDefaultProtocolClient("omnigent")`
+call so `electron .` dev clicks route to the running dev instance.
+
+The decision logic (parse + window selection) is pure and unit-tested in
+`src/deepLink.js`; the orchestration lives in `src/main.js`.
+
 ## Implementation notes
 
 - **Runtime:** bundled Chromium (so the build is ~100+ MB, but the renderer
