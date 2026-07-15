@@ -143,7 +143,9 @@ import {
   COLLAPSED_SIDEBAR_SECTIONS_STORAGE_KEY,
   computeNextActiveOverride,
   conversationDisplayLabel,
+  dedupeConversationsById,
   EXPANDED_PROJECT_SECTIONS_STORAGE_KEY,
+  migratePinnedConversationIds,
   normalizePinnedConversationIds,
   orderByPinnedSequence,
   PINNED_CONVERSATION_IDS_STORAGE_KEY,
@@ -965,7 +967,9 @@ function ConversationList({
   // me"); a pinned-then-archived session shows under Archived, not Pinned.
   const pinnedSet = useMemo(() => new Set(pinnedConversationIds), [pinnedConversationIds]);
   const sections = useMemo(() => {
-    const allWithBackfill = [...allConversations, ...pinnedBackfill];
+    // Dedupe by id: the pinned-backfill can return a session already present in
+    // the paginated list, and merging both would render the row twice.
+    const allWithBackfill = dedupeConversationsById([...allConversations, ...pinnedBackfill]);
     const notArchived = allWithBackfill.filter((c) => c.archived !== true);
     // Each tab shows a disjoint slice — "mine" is the sessions the viewer owns,
     // "shared" is the ones others shared with them. The Pinned / Projects /
@@ -1329,7 +1333,7 @@ function ConversationList({
   const { fetchNextPage, isFetchingNextPage } = conversationsQuery;
   useEffect(() => {
     if (!conversationsQuery.data || hasMorePages || searchQuery) return;
-    const allLoaded = [...allConversations, ...pinnedBackfill];
+    const allLoaded = dedupeConversationsById([...allConversations, ...pinnedBackfill]);
     const normalized = normalizePinnedConversationIds(pinnedConversationIds, allLoaded);
     if (!sameStringArray(normalized, pinnedConversationIds)) {
       onPinnedConversationIdsChange(normalized);
@@ -3774,7 +3778,12 @@ function readPinnedConversationIds(): string[] {
     if (!raw) return [];
     const parsed: unknown = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
-    return parsed.filter((value): value is string => typeof value === "string");
+    // Migrate legacy prefixed ids (``conv_<hex>``) to the bare-hex form the API
+    // returns post id-to-binary migration; the write-back effect re-persists
+    // the migrated ids, so this one-time rewrite is durable across reloads.
+    return migratePinnedConversationIds(
+      parsed.filter((value): value is string => typeof value === "string"),
+    );
   } catch {
     // Browser storage is user-editable and can contain stale/corrupt values.
     // Treat bad pin state as "no pins" instead of breaking navigation.
