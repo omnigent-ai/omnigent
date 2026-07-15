@@ -19,9 +19,9 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 # Reject anything more frequent than this. Each fire spawns a real agent
-# session, so a tight cadence gets expensive fast. 5 minutes is a pragmatic
-# floor: a usable smoke-test cadence with a real ceiling on runaway cost.
-MIN_INTERVAL_SECONDS = 5 * 60
+# session, so a tight cadence gets expensive fast. One hour is the tightest
+# cadence we allow: hourly is a useful ceiling with a hard bound on runaway cost.
+MIN_INTERVAL_SECONDS = 60 * 60
 
 # Search horizon for the next fire. A year-and-a-day covers every annual
 # expression while bounding the walk on impossible ones (e.g. ``0 0 31 2 *``).
@@ -201,7 +201,7 @@ def get_next_fire_time(
         # All fields match. `local` is already aware in `tz`, so no fold
         # resolution happens here: a spring-forward "imaginary" wall-clock
         # time maps to some instant via zoneinfo, and a fall-back duplicated
-        # time picks the earlier of the two. Both are acceptable at a 5-minute
+        # time picks the earlier of the two. Both are acceptable at an hourly
         # floor — the schedule can slip by at most an hour across a DST edge.
         return local
 

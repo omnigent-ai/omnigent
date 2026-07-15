@@ -92,7 +92,7 @@ class FakeStore:
 
 def _task(
     task_id: str = "task-1",
-    cron_expression: str = "*/5 * * * *",
+    cron_expression: str = "0 * * * *",
     timezone: str = "UTC",
     state: str = "active",
 ) -> ScheduledTask:
@@ -159,7 +159,7 @@ async def test_start_skips_paused_tasks() -> None:
 
 async def test_start_skips_bad_cron_without_crashing() -> None:
     scheduler, _clock, _seam, _fired = _make(
-        [_task("good", "*/5 * * * *"), _task("bad", "not a cron")]
+        [_task("good", "0 * * * *"), _task("bad", "not a cron")]
     )
     await scheduler.start()
     assert scheduler.job_count == 1
@@ -220,8 +220,9 @@ async def test_overlapping_fire_is_skipped() -> None:
 async def test_misfire_beyond_grace_is_skipped() -> None:
     scheduler, clock, seam, fired = _make([_task("a")])
     await scheduler.start()
-    # Jump the clock far past the scheduled time + grace, then fire.
-    clock.advance(MISFIRE_GRACE_TIME_S + 3600)
+    # The first fire is armed an hour out; jump the clock well past that
+    # scheduled time + grace, then fire.
+    clock.advance(3600 + MISFIRE_GRACE_TIME_S + 60)
     await seam.fire_latest()
     assert fired.ids == []  # dropped as a misfire
     # Still re-arms for the future.
@@ -263,7 +264,7 @@ async def test_remove_cancels_timer() -> None:
 
 
 async def test_update_reschedules() -> None:
-    scheduler, _clock, _seam, _fired = _make([_task("a", "*/5 * * * *")])
+    scheduler, _clock, _seam, _fired = _make([_task("a", "0 * * * *")])
     await scheduler.start()
     before = scheduler.next_run_at("a")
     scheduler.update(replace(scheduler_task_of(scheduler, "a"), cron_expression="0 0 * * *"))

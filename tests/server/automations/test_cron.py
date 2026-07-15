@@ -3,7 +3,7 @@
 Exercises :func:`parse_cron`, :func:`get_next_fire_time`, and
 :func:`validate_cron` — including field-syntax variants, POSIX DOM/DOW union
 semantics, timezone evaluation, the never-fires / fires-once bail-outs, and the
-5-minute minimum-interval floor.
+one-hour minimum-interval floor.
 """
 
 from __future__ import annotations
@@ -176,11 +176,13 @@ def test_default_timezone_is_utc_semantics() -> None:
 # ── validate_cron: floor + never/once ────────────────────────────────────────
 
 
-def test_validate_accepts_5_minute_cadence() -> None:
-    trig = validate_cron("*/5 * * * *")
-    assert trig.expression == "*/5 * * * *"
+def test_validate_accepts_hourly_cadence() -> None:
+    # Top of every hour = exactly 3600s. The floor is a strict `<`, so a gap
+    # equal to the floor passes: `3600 < 3600` is False.
+    trig = validate_cron("0 * * * *")
+    assert trig.expression == "0 * * * *"
     # trigger can compute a next fire
-    assert trig.next_fire_after(_dt(2026, 1, 1, 0, 0), UTC) == _dt(2026, 1, 1, 0, 5)
+    assert trig.next_fire_after(_dt(2026, 1, 1, 0, 0), UTC) == _dt(2026, 1, 1, 1, 0)
 
 
 def test_validate_rejects_every_minute() -> None:
@@ -188,8 +190,20 @@ def test_validate_rejects_every_minute() -> None:
         validate_cron("* * * * *")
 
 
+def test_validate_rejects_five_minute_cadence() -> None:
+    # every 5 minutes = 300s < 3600s floor (the old accepted cadence).
+    with pytest.raises(CronValidationError):
+        validate_cron("*/5 * * * *")
+
+
+def test_validate_rejects_half_hour_cadence() -> None:
+    # every 30 minutes = 1800s < 3600s floor.
+    with pytest.raises(CronValidationError):
+        validate_cron("*/30 * * * *")
+
+
 def test_validate_rejects_sub_floor_step() -> None:
-    # every 4 minutes = 240s < 300s floor
+    # every 4 minutes = 240s < 3600s floor
     with pytest.raises(CronValidationError):
         validate_cron("*/4 * * * *")
 
@@ -197,7 +211,7 @@ def test_validate_rejects_sub_floor_step() -> None:
 def test_validate_rejects_irregular_sub_floor_pair() -> None:
     # Fires at :00 and :01 each hour -> consecutive gaps alternate
     # [3540s, 60s, 3540s, ...]. The tightest pair (60s) is well under the
-    # 300s floor, but it is never the *first* pair, so a validator that only
+    # 3600s floor, but it is never the *first* pair, so a validator that only
     # measures the first gap would wrongly accept this. Rejection must not
     # depend on the wall-clock minute validation happens to run at.
     with pytest.raises(CronValidationError):
@@ -216,4 +230,4 @@ def test_validate_rejects_fires_only_once_in_window() -> None:
 
 
 def test_min_interval_constant() -> None:
-    assert MIN_INTERVAL_SECONDS == 300
+    assert MIN_INTERVAL_SECONDS == 3600
