@@ -17,8 +17,6 @@ import {
 
 import "@xyflow/react/dist/style.css";
 
-const TREE_POLL_MS = 15_000;
-
 const ACTIVITY_COLORS: Record<AgentActivity, { border: string; bg: string; dot: string }> = {
   working: { border: "border-brand-accent", bg: "bg-brand-accent/5", dot: "" },
   awaiting: { border: "border-warning", bg: "bg-warning/5", dot: "" },
@@ -105,7 +103,7 @@ function ChildCollector({
   depth: number;
   onCollected: (parentId: string, children: ChildSessionInfo[]) => void;
 }) {
-  const { children } = useChildSessions(depth < MAX_TREE_DEPTH ? parentId : null, TREE_POLL_MS);
+  const { children } = useChildSessions(depth < MAX_TREE_DEPTH ? parentId : null);
 
   useEffect(() => {
     onCollected(parentId, children);
@@ -133,7 +131,7 @@ interface SubagentsGraphViewProps {
 
 export function SubagentsGraphView({ conversationId, rootSessionId }: SubagentsGraphViewProps) {
   const { session } = useSession(rootSessionId);
-  const { children: rootChildren } = useChildSessions(rootSessionId, TREE_POLL_MS);
+  const { children: rootChildren } = useChildSessions(rootSessionId);
 
   const [childrenMap, setChildrenMap] = useState<Map<string, ChildSessionInfo[]>>(() => new Map());
 

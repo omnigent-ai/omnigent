@@ -522,7 +522,8 @@ class _PiNativeLaunchConfig:
     A generic session-snapshot reader shared by the pi-native and
     cursor-native launch paths (workspace + terminal_launch_args +
     model_override). Each path consumes the subset it needs: pi-native
-    ignores ``model_override``; cursor-native applies it as ``--model``.
+    uses ``model_override`` as ``--model`` (overrides the spec's pinned
+    model); cursor-native does the same.
 
     :param workspace: Workspace cwd for the native TUI.
     :param server_url: Omnigent server URL for the extension/forwarder.
@@ -2008,7 +2009,9 @@ async def _auto_create_pi_terminal(
         # appended ``--model`` arg (see ``pi_native_provider_launch``) — select
         # it, reaching parity with claude-native / cursor-native. ``None``
         # (no model declared) keeps the provider's default model.
-        spec_model = _pi_native_model_from_spec(agent_spec)
+        # model_override (set by /model or sys_session_create's model arg)
+        # takes precedence over the spec's pinned executor.model.
+        spec_model = launch_config.model_override or _pi_native_model_from_spec(agent_spec)
         provider = resolve_pi_native_provider(model=spec_model)
         if provider is not None:
             cred_env, cred_args = pi_native_provider_launch(bridge_dir / "pi-agent", provider)
@@ -12167,6 +12170,42 @@ def create_runner_app(
             await client.aclose()
         return Response(status_code=200)
 
+    async def _opencode_native_model_options(conv_id: str) -> list[dict[str, Any]]:
+        """Return the OpenCode model catalog for the session picker."""
+        from omnigent.opencode_native_app_server import (
+            filtered_server_env,
+            list_opencode_cli_model_options,
+        )
+        from omnigent.opencode_native_bridge import bridge_dir_for_bridge_id, read_bridge_state
+        from omnigent.opencode_native_client import OpenCodeClient
+
+        bridge_dir = bridge_dir_for_bridge_id(conv_id)
+        state = read_bridge_state(bridge_dir)
+        if state is None or not state.server_base_url:
+            raise _CodexNativeModelOptionsNotReady("OpenCode-native app-server is not ready yet.")
+
+        # Run ``opencode models`` with the same per-session XDG dirs as the
+        # bound ``opencode serve`` (and therefore the native TUI). Without this
+        # isolation the CLI would read the user's global OpenCode config and
+        # could return a different catalog or no authenticated models.
+        cli_env = filtered_server_env(
+            bridge_dir=bridge_dir,
+            auth_secret=state.auth_secret or "",
+        )
+        try:
+            return await asyncio.to_thread(list_opencode_cli_model_options, env=cli_env)
+        except Exception as exc:  # noqa: BLE001 - fall back to the server catalog.
+            _logger.debug("OpenCode CLI model list failed for %s: %r", conv_id, exc)
+
+        client = OpenCodeClient(
+            base_url=state.server_base_url,
+            auth_secret=state.auth_secret,
+        )
+        try:
+            return await client.list_models()
+        finally:
+            await client.aclose()
+
     async def _handle_opencode_native_model_change(conv_id: str, model: str | None) -> Response:
         """
         Apply an Omnigent-initiated model switch to an opencode-native session.
@@ -17688,8 +17727,32 @@ def create_runner_app(
         :returns: JSON ``{"models": [...]}``, where each model is a raw
             Codex ``model/list`` object.
         """
-        if _session_harness_name(session_id) != "codex-native":
+        harness = _session_harness_name(session_id)
+        if harness not in ("codex-native", "opencode-native"):
             return JSONResponse(status_code=200, content={"models": []})
+        if harness == "opencode-native":
+            try:
+                models = await _opencode_native_model_options(session_id)
+                return JSONResponse(status_code=200, content={"models": models})
+            except _CodexNativeModelOptionsNotReady:
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": "opencode_native_model_options_failed",
+                        "detail": "OpenCode-native app-server is not ready yet.",
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001 - picker failures are retryable.
+                _logger.warning("OpenCode-native model list failed for %s: %s", session_id, exc)
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": "opencode_native_model_options_failed",
+                        "detail": _client_safe_error_detail(
+                            exc, context="opencode-native model options"
+                        ),
+                    },
+                )
         try:
             return JSONResponse(
                 status_code=200,

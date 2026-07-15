@@ -38,9 +38,9 @@ from omnigent.db.db_models import (
     SqlSessionPermission,
     SqlUserDailyCost,
     current_workspace_id,
+    uuid_to_bytes,
 )
 from omnigent.db.enum_codecs import (
-    decode_conversation_kind,
     decode_item_status,
     decode_item_type,
     encode_agent_kind,
@@ -126,7 +126,11 @@ def _to_conversation(
         created_at=row.created_at,
         updated_at=row.updated_at,
         title=row.title or None,  # empty string → None at entity layer
-        kind=decode_conversation_kind(meta.kind) if meta else "default",
+        # kind is derived from parent-nullness, not the stored metadata column:
+        # a conversation is a sub-agent iff it has a parent. This is the single
+        # source of truth (every writer couples them) and stays correct even for
+        # an orphaned row whose metadata write crashed (``meta is None``).
+        kind="sub_agent" if row.parent_conversation_id is not None else "default",
         parent_conversation_id=row.parent_conversation_id,
         root_conversation_id=row.root_conversation_id,
         agent_id=agent_config.agent_id if agent_config else None,
@@ -154,7 +158,7 @@ def _to_conversation(
         ),
         workspace=meta.workspace if meta else None,
         git_branch=meta.git_branch if meta else None,
-        archived=meta.archived if meta else False,
+        archived=row.archived,
     )
 
 
@@ -262,7 +266,6 @@ def _new_session_metadata_row(
         terminal_launch_args=(
             json.dumps(terminal_launch_args) if terminal_launch_args is not None else None
         ),
-        archived=False,
     )
 
 
@@ -597,20 +600,31 @@ def _ranked_latest_message_items(conversation_ids: list[str]) -> Subquery:
     """
     Build a ranked latest-message subquery for multiple conversations.
 
-    Selects all ``SqlConversationItem`` columns plus a per-conversation
-    ``row_num`` so the caller can filter to the top-N rows without a
-    join back to the base table. Avoiding the join is critical: the
-    primary key is ``(workspace_id, conversation_id, id)``, so a join
-    on ``id`` alone forces a full table scan.
+    Selects only the columns :func:`_to_item` needs (plus ``conversation_id``
+    and ``position`` for grouping/ordering) and a per-conversation ``row_num``
+    so the caller can filter to the top-N rows without a join back to the base
+    table. Avoiding the join is critical: the primary key is
+    ``(workspace_id, conversation_id, id)``, so a join on ``id`` alone forces a
+    full table scan. The heavy ``search_text`` column is deliberately omitted —
+    the message-preview caller never reads it, and it roughly doubles the bytes
+    pulled per row on a chatty conversation.
 
     :param conversation_ids: Conversation ids to fetch messages for,
         e.g. ``["conv_child1", "conv_child2"]``.
-    :returns: SQLAlchemy subquery with all item columns plus per-conversation
-        ``row_num``, newest message first.
+    :returns: SQLAlchemy subquery with the projected item columns plus
+        per-conversation ``row_num``, newest message first.
     """
     return (
         select(
-            SqlConversationItem,
+            SqlConversationItem.conversation_id,
+            SqlConversationItem.id,
+            SqlConversationItem.response_id,
+            SqlConversationItem.created_at,
+            SqlConversationItem.status,
+            SqlConversationItem.position,
+            SqlConversationItem.type,
+            SqlConversationItem.data,
+            SqlConversationItem.created_by,
             func.row_number()
             .over(
                 partition_by=SqlConversationItem.conversation_id,
@@ -787,7 +801,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             # want here.
             session.execute(
                 text("UPDATE conversations SET updated_at = updated_at WHERE id = :id"),
-                {"id": conversation_id},
+                # Raw SQL bypasses the Uuid16 decorator; bind the 16-byte form
+                # so the WHERE matches the binary id column.
+                {"id": uuid_to_bytes(conversation_id)},
             )
 
     def create_conversation(
@@ -903,7 +919,6 @@ class SqlAlchemyConversationStore(ConversationStore):
                 terminal_launch_args=(
                     json.dumps(terminal_launch_args) if terminal_launch_args is not None else None
                 ),
-                archived=False,
             )
             with self._session() as meta_sess:
                 meta_sess.add(meta)
@@ -936,13 +951,13 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         Fetch a conversation by its unique ID.
 
-        Populates ``Conversation.labels`` via a second query
-        against ``conversation_labels`` — separate from the
-        conversation row fetch because the label JOIN would
-        otherwise multiply the row count by the label count
-        and require post-processing. The two queries run in
-        the same session so they see a consistent snapshot
-        under serializable isolation.
+        Issues two queries inside one session:
+
+        1. A single LEFT OUTER JOIN of ``conversations`` +
+           ``agent_configuration`` (same PK, same DB) so both rows
+           arrive in one round-trip instead of two serial
+           ``session.get`` calls.
+        2. A label fetch on ``conversation_labels``.
 
         :param conversation_id: Unique conversation identifier,
             e.g. ``"conv_abc123"``.
@@ -950,12 +965,21 @@ class SqlAlchemyConversationStore(ConversationStore):
             ``None``.
         """
         with self._conv_session() as session:
-            row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
-            if row is None:
+            result = session.execute(
+                select(SqlConversation, SqlAgentConfiguration)
+                .outerjoin(
+                    SqlAgentConfiguration,
+                    (SqlAgentConfiguration.workspace_id == SqlConversation.workspace_id)
+                    & (SqlAgentConfiguration.conversation_id == SqlConversation.id),
+                )
+                .where(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.id == conversation_id,
+                )
+            ).first()
+            if result is None:
                 return None
-            agent_config = session.get(
-                SqlAgentConfiguration, (current_workspace_id(), conversation_id)
-            )
+            row, agent_config = result
             meta = self._get_meta(session, conversation_id)
             return _to_conversation(
                 row, meta, _fetch_labels(session, conversation_id), agent_config
@@ -1105,10 +1129,13 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         Return direct sub-agent child ids grouped by parent conversation.
 
-        Uses the partial ``idx_conversations_parent`` index by filtering on
-        ``kind="sub_agent"`` plus ``parent_conversation_id IN (...)``. This
-        gives sidebar session-list status roll-up one batched identity query
-        instead of one full child listing per visible parent row.
+        A conversation has a parent iff it is a sub-agent (``kind`` is fully
+        determined by parent nullness), so filtering on
+        ``parent_conversation_id IN (...)`` alone already yields exactly the
+        sub-agent children — no metadata ``kind`` lookup needed. This resolves
+        as one batched query on the AP ``idx_conversations_parent`` index,
+        giving sidebar session-list status roll-up one identity query instead
+        of one full child listing per visible parent row.
 
         :param parent_conversation_ids: Parent conversation ids to
             inspect, e.g. ``["conv_parent1", "conv_parent2"]``.
@@ -1122,26 +1149,11 @@ class SqlAlchemyConversationStore(ConversationStore):
         if not unique_ids:
             return result
 
-        # kind is in the Omnigent DB (metadata); get IDs of sub_agent conversations.
-        sub_agent_kind = encode_conversation_kind("sub_agent")
-        with self._session() as meta_sess:
-            sub_agent_ids = set(
-                meta_sess.execute(
-                    select(SqlConversationMetadata.id).where(
-                        SqlConversationMetadata.workspace_id == current_workspace_id(),
-                        SqlConversationMetadata.kind == sub_agent_kind,
-                    )
-                )
-                .scalars()
-                .all()
-            )
-
         with self._conv_session() as ap_sess:
             rows = ap_sess.execute(
                 select(SqlConversation.parent_conversation_id, SqlConversation.id)
                 .where(SqlConversation.workspace_id == current_workspace_id())
                 .where(SqlConversation.parent_conversation_id.in_(unique_ids))
-                .where(SqlConversation.id.in_(sub_agent_ids))
                 .order_by(
                     SqlConversation.parent_conversation_id,
                     desc(SqlConversation.created_at),
@@ -1594,14 +1606,20 @@ class SqlAlchemyConversationStore(ConversationStore):
                         f"ORDER BY ci.created_at DESC LIMIT :limit"
                     )
                 query = like_pattern
-            params: dict[str, str | int] = {
+            params: dict[str, str | int | bytes] = {
                 "query": query,
                 "limit": limit,
                 "ws": current_workspace_id(),
             }
             if conversation_id is not None:
-                params["cid"] = conversation_id
-            item_ids = [row[0] for row in session.execute(stmt, params).fetchall()]
+                # Raw SQL bypasses Uuid16: the FTS mirror stores hex text, but
+                # conversation_items.conversation_id is 16 raw bytes — bind the
+                # form each branch actually compares against.
+                params["cid"] = conversation_id if use_fts else uuid_to_bytes(conversation_id)
+            item_ids = [
+                item_id.hex() if isinstance(item_id, (bytes, memoryview)) else item_id
+                for item_id in (row[0] for row in session.execute(stmt, params).fetchall())
+            ]
             if not item_ids:
                 return []
             rows = (
@@ -1873,29 +1891,45 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         from omnigent.server.auth import LEVEL_OWNER
 
-        # Get non-archived IDs from Omnigent, then filter labels in AP.
-        with self._session() as meta_sess:
-            non_archived_q = select(SqlConversationMetadata.id).where(
-                SqlConversationMetadata.workspace_id == current_workspace_id(),
-                SqlConversationMetadata.archived.is_(False),
-            )
-            if accessible_by is not None:
-                accessible_ids = select(SqlSessionPermission.conversation_id).where(
-                    SqlSessionPermission.workspace_id == current_workspace_id(),
-                    SqlSessionPermission.user_id == accessible_by,
-                )
-                non_archived_q = non_archived_q.where(
-                    SqlConversationMetadata.id.in_(accessible_ids)
-                )
-            if owned_by is not None:
-                owned_ids = select(SqlSessionPermission.conversation_id).where(
-                    SqlSessionPermission.workspace_id == current_workspace_id(),
-                    SqlSessionPermission.user_id == owned_by,
-                    SqlSessionPermission.level >= LEVEL_OWNER,
-                )
-                non_archived_q = non_archived_q.where(SqlConversationMetadata.id.in_(owned_ids))
-            non_archived_ids = list(meta_sess.execute(non_archived_q).scalars().all())
+        # ACL (accessible_by/owned_by) resolves against session_permissions on
+        # the Omnigent DB, so it still needs a pre-fetch; archived now lives on
+        # the AP conversations table and is filtered inline below.
+        permission_ids: list[str] | None = None
+        if accessible_by is not None or owned_by is not None:
+            with self._session() as meta_sess:
+                accessible_set: set[str] | None = None
+                owned_set: set[str] | None = None
+                if accessible_by is not None:
+                    accessible_set = set(
+                        meta_sess.execute(
+                            select(SqlSessionPermission.conversation_id).where(
+                                SqlSessionPermission.workspace_id == current_workspace_id(),
+                                SqlSessionPermission.user_id == accessible_by,
+                            )
+                        ).scalars()
+                    )
+                if owned_by is not None:
+                    owned_set = set(
+                        meta_sess.execute(
+                            select(SqlSessionPermission.conversation_id).where(
+                                SqlSessionPermission.workspace_id == current_workspace_id(),
+                                SqlSessionPermission.user_id == owned_by,
+                                SqlSessionPermission.level >= LEVEL_OWNER,
+                            )
+                        ).scalars()
+                    )
+                if accessible_set is not None and owned_set is not None:
+                    permission_ids = list(accessible_set & owned_set)
+                else:
+                    permission_ids = list(
+                        accessible_set if accessible_set is not None else owned_set or set()
+                    )
         with self._conv_session() as ap_sess:
+            # Non-archived conversations, resolved on the AP table.
+            non_archived_ids = select(SqlConversation.id).where(
+                SqlConversation.workspace_id == current_workspace_id(),
+                SqlConversation.archived.is_(False),
+            )
             stmt = (
                 select(SqlConversationLabel.value)
                 .where(
@@ -1906,6 +1940,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                 .distinct()
                 .order_by(SqlConversationLabel.value)
             )
+            if permission_ids is not None:
+                stmt = stmt.where(SqlConversationLabel.conversation_id.in_(permission_ids))
             return [row[0] for row in ap_sess.execute(stmt).all()]
 
     def delete_label(
@@ -2016,41 +2052,56 @@ class SqlAlchemyConversationStore(ConversationStore):
         is_desc = order == "desc"
         sort_fn = desc if is_desc else asc
 
-        # Determine if we need Omnigent-side filtering (kind/archived/permissions).
-        needs_meta_filter = (
-            (kind is not None)
-            or (not include_archived)
-            or (accessible_by is not None)
-            or (owned_by is not None)
-        )
+        # ``kind`` is fully determined by ``parent_conversation_id`` nullness — a
+        # child always has a parent, a top-level session never does — so the kind
+        # filter is expressed directly on the AP ``conversations`` table below
+        # instead of prefetching the metadata ``kind`` column across the pool.
+        kind_requires_parent: bool | None = None
+        if kind == "sub_agent":
+            kind_requires_parent = True
+        elif kind == "default":
+            kind_requires_parent = False
+
+        # kind and archived both live on the AP ``conversations`` table now
+        # (kind derived from parent-nullness, archived a real column), so they
+        # are filtered directly on the AP query below. The only filters that
+        # still require an Omnigent-side prefetch are the permission scopes.
+        needs_meta_filter = (accessible_by is not None) or (owned_by is not None)
 
         qualifying_ids: list[str] | None = None
         if needs_meta_filter:
-            # Pre-fetch qualifying IDs from Omnigent DB, then filter the AP query.
+            # Pre-fetch permission-qualifying IDs from the Omnigent DB
+            # (session_permissions), then filter the AP query. accessible_by and
+            # owned_by are intersected (both applied) to match the prior
+            # behaviour. (ACL pushdown to a single AP query is a follow-up.)
             with self._session() as meta_sess:
-                meta_q = select(SqlConversationMetadata.id).where(
-                    SqlConversationMetadata.workspace_id == current_workspace_id()
-                )
-                if kind is not None:
-                    meta_q = meta_q.where(
-                        SqlConversationMetadata.kind == encode_conversation_kind(kind)
-                    )
-                if not include_archived:
-                    meta_q = meta_q.where(SqlConversationMetadata.archived.is_(False))
+                accessible_set: set[str] | None = None
+                owned_set: set[str] | None = None
                 if accessible_by is not None:
-                    accessible_ids = select(SqlSessionPermission.conversation_id).where(
-                        SqlSessionPermission.workspace_id == current_workspace_id(),
-                        SqlSessionPermission.user_id == accessible_by,
+                    accessible_set = set(
+                        meta_sess.execute(
+                            select(SqlSessionPermission.conversation_id).where(
+                                SqlSessionPermission.workspace_id == current_workspace_id(),
+                                SqlSessionPermission.user_id == accessible_by,
+                            )
+                        ).scalars()
                     )
-                    meta_q = meta_q.where(SqlConversationMetadata.id.in_(accessible_ids))
                 if owned_by is not None:
-                    owned_ids = select(SqlSessionPermission.conversation_id).where(
-                        SqlSessionPermission.workspace_id == current_workspace_id(),
-                        SqlSessionPermission.user_id == owned_by,
-                        SqlSessionPermission.level >= LEVEL_OWNER,
+                    owned_set = set(
+                        meta_sess.execute(
+                            select(SqlSessionPermission.conversation_id).where(
+                                SqlSessionPermission.workspace_id == current_workspace_id(),
+                                SqlSessionPermission.user_id == owned_by,
+                                SqlSessionPermission.level >= LEVEL_OWNER,
+                            )
+                        ).scalars()
                     )
-                    meta_q = meta_q.where(SqlConversationMetadata.id.in_(owned_ids))
-                qualifying_ids = list(meta_sess.execute(meta_q).scalars().all())
+                if accessible_set is not None and owned_set is not None:
+                    qualifying_ids = list(accessible_set & owned_set)
+                else:
+                    qualifying_ids = list(
+                        accessible_set if accessible_set is not None else owned_set or set()
+                    )
 
         with self._conv_session() as session:
             stmt = select(SqlConversation).where(
@@ -2059,6 +2110,17 @@ class SqlAlchemyConversationStore(ConversationStore):
 
             if qualifying_ids is not None:
                 stmt = stmt.where(SqlConversation.id.in_(qualifying_ids))
+
+            # Kind filter as parent-nullness (see above): sub_agent ⇔ parent set.
+            if kind_requires_parent is True:
+                stmt = stmt.where(SqlConversation.parent_conversation_id.is_not(None))
+            elif kind_requires_parent is False:
+                stmt = stmt.where(SqlConversation.parent_conversation_id.is_(None))
+
+            # archived lives on the AP conversations table, so exclude it inline
+            # (no metadata prefetch, no post-fetch filtering).
+            if not include_archived:
+                stmt = stmt.where(SqlConversation.archived.is_(False))
 
             if parent_conversation_id is not None:
                 stmt = stmt.where(
@@ -2407,10 +2469,12 @@ class SqlAlchemyConversationStore(ConversationStore):
                 agent_config.harness_override = harness_override
                 ap_changed = True
             if archived is not None:
-                ap_changed = True  # archived is a visible state change
+                # archived lives on the AP conversations row; a visible state change.
+                row.archived = archived
+                ap_changed = True
             if ap_changed:
                 row.updated_at = now
-        if archived is not None or terminal_launch_args is not None:
+        if terminal_launch_args is not None:
             with self._session() as meta_sess:
                 meta = meta_sess.get(
                     SqlConversationMetadata, (current_workspace_id(), conversation_id)
@@ -2430,10 +2494,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                         parent_conversation_id=row.parent_conversation_id,
                     )
                     meta_sess.add(meta)
-                if archived is not None:
-                    meta.archived = archived
-                if terminal_launch_args is not None:
-                    meta.terminal_launch_args = json.dumps(terminal_launch_args)
+                meta.terminal_launch_args = json.dumps(terminal_launch_args)
         return self.get_conversation(conversation_id)
 
     def set_runner_id(self, conversation_id: str, runner_id: str) -> bool:

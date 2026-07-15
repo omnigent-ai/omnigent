@@ -1868,6 +1868,20 @@ wheels = [
 ]
 
 [[package]]
+name = "islo"
+version = "0.3.8"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "httpx" },
+    { name = "pydantic" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/c5/ee/1fa948386e45772343664eee0a6f955787c2bfb9b4df1ca02d6d6edf8590/islo-0.3.8.tar.gz", hash = "sha256:50b5e0d8069a2c30e353d48afdf562baf5e567119bf150dd47e277a479a4135c", upload-time = "2026-06-24T13:06:30.488Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/96/2d/b0194c60181f3dc2662ce7937759fafafbf2ff73e712f0df1ef9d200262c/islo-0.3.8-py3-none-any.whl", hash = "sha256:35965bb5bf715d1df1cc36f5553ee81eab3f87a8fcca4334a653defff1785460", upload-time = "2026-06-24T13:06:28.878Z" },
+]
+
+[[package]]
 name = "itsdangerous"
 version = "2.2.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2906,6 +2920,7 @@ cwsandbox = [
     { name = "cwsandbox" },
 ]
 databricks = [
+    { name = "databricks-ai-bridge" },
     { name = "databricks-mcp" },
     { name = "databricks-sdk" },
     { name = "opentelemetry-distro" },
@@ -2941,11 +2956,14 @@ dev = [
 e2b = [
     { name = "e2b" },
 ]
+hindsight = [
+    { name = "hindsight-client" },
+]
+islo = [
+    { name = "islo" },
+]
 kubernetes = [
     { name = "kubernetes" },
-]
-memory = [
-    { name = "hindsight-client" },
 ]
 modal = [
     { name = "modal" },
@@ -2978,7 +2996,8 @@ requires-dist = [
     { name = "click", specifier = ">=8.0,<10" },
     { name = "cursor-sdk", marker = "extra == 'cursor'", specifier = ">=0.1.7" },
     { name = "cwsandbox", marker = "extra == 'cwsandbox'", specifier = ">=0.24,<1" },
-    { name = "databricks-mcp", marker = "extra == 'databricks'", specifier = ">=0.1.0" },
+    { name = "databricks-ai-bridge", marker = "extra == 'databricks'", specifier = ">=0.19" },
+    { name = "databricks-mcp", marker = "extra == 'databricks'", specifier = ">=0.9.0" },
     { name = "databricks-sdk", marker = "extra == 'all'", specifier = ">=0.56.0,<1" },
     { name = "databricks-sdk", marker = "extra == 'databricks'", specifier = ">=0.56.0,<1" },
     { name = "daytona", marker = "extra == 'daytona'", specifier = ">=0.180,<1" },
@@ -2991,8 +3010,9 @@ requires-dist = [
     { name = "google-auth", marker = "extra == 'vertex'", specifier = ">=2.0,<3" },
     { name = "grpcio-tools", marker = "extra == 'dev'", specifier = ">=1.68,<2" },
     { name = "hindsight-client", marker = "extra == 'dev'", specifier = ">=0.4.0" },
-    { name = "hindsight-client", marker = "extra == 'memory'", specifier = ">=0.4.0" },
+    { name = "hindsight-client", marker = "extra == 'hindsight'", specifier = ">=0.4.0" },
     { name = "httpx", specifier = ">=0.27,<1" },
+    { name = "islo", marker = "extra == 'islo'", specifier = ">=0.3.5,<0.4" },
     { name = "keyring", specifier = ">=24,<26" },
     { name = "kubernetes", marker = "extra == 'kubernetes'", specifier = ">=36,<37" },
     { name = "mcp", specifier = ">=1.0,<2" },
@@ -3047,7 +3067,7 @@ requires-dist = [
     { name = "websockets", specifier = ">=10.4,<15" },
     { name = "zstandard", specifier = ">=0.22,<1" },
 ]
-provides-extras = ["claude-sdk", "openai-agents", "all", "bedrock", "s3", "vertex", "modal", "daytona", "boxlite", "cwsandbox", "e2b", "openshell", "kubernetes", "tracing", "agents-sdk", "antigravity", "copilot", "cursor", "memory", "databricks", "dev"]
+provides-extras = ["claude-sdk", "openai-agents", "all", "bedrock", "s3", "vertex", "modal", "daytona", "boxlite", "cwsandbox", "e2b", "islo", "openshell", "kubernetes", "tracing", "agents-sdk", "antigravity", "copilot", "cursor", "hindsight", "databricks", "dev"]
 
 [[package]]
 name = "omnigent-client"

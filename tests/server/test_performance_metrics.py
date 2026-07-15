@@ -888,7 +888,11 @@ async def test_create_app_metrics_middleware_counts_http_requests(
 
     resp = await client.get(
         "/health",
-        params={"session_ids": "conv_one,conv_two"},
+        # Valid bare-hex ids: session_ids bind to Uuid16, so a non-uuid would
+        # now 404 the batch (InvalidUuidError) instead of returning 200-empty.
+        params={
+            "session_ids": "dbb8b733fdfaca2c150b42317d3829f6,f8fb0016d56510e7e6b3ee8618d78415"
+        },
     )
 
     after = app.state.server_metrics.snapshot()

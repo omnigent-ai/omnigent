@@ -276,3 +276,32 @@ def test_resolve_opencode_version_unparseable_raises(monkeypatch: pytest.MonkeyP
     )
     with pytest.raises(appsrv.OpenCodeVersionError):
         appsrv.resolve_opencode_version("/x/opencode")
+
+
+def test_list_opencode_cli_model_options(monkeypatch: pytest.MonkeyPatch) -> None:
+    import subprocess
+
+    monkeypatch.setattr(appsrv, "find_opencode_cli", lambda _path=None: "/x/opencode")
+
+    captured: dict[str, object] = {}
+
+    def _fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured["env"] = kwargs.get("env")
+        return subprocess.CompletedProcess(
+            args,
+            0,
+            stdout="\x1b[32mopencode-go/glm-5.2\x1b[0m\nopencode-go/kimi-k2.7-code\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(appsrv.subprocess, "run", _fake_run)
+
+    options = appsrv.list_opencode_cli_model_options(
+        env={"XDG_DATA_HOME": "/xdg/data", "XDG_CONFIG_HOME": "/xdg/config"},
+    )
+
+    assert [option["id"] for option in options] == [
+        "opencode-go/glm-5.2",
+        "opencode-go/kimi-k2.7-code",
+    ]
+    assert captured["env"] == {"XDG_DATA_HOME": "/xdg/data", "XDG_CONFIG_HOME": "/xdg/config"}

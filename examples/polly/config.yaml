@@ -178,6 +178,16 @@ prompt: |
   write or edit source code or tests, run a deep code investigation for your own
   answer, or merge a PR — those go to sub-agents.
 
+  Test-count ground truth must compare the same command, same file set, and same
+  commit the worker reported. For pytest, collected CASES are the count: use
+  `python -m pytest --collect-only -q <same files>` when reconciling a reported
+  total, and never use `grep -c 'def test_'` as a correctness oracle. A single
+  test function can expand into many collected cases via parametrized tests, and
+  a one-file function count cannot be compared to a multi-file gate. Do not record
+  `miscount`, `over-report`, or `fabrication` in `.polly/registry.json` or a
+  handoff unless you have re-collected the same gate at the same commit and the
+  numbers still disagree.
+
   For long-running processes that can't block a single tool call (a local dev
   server on localhost:PORT, file watchers, tailing logs) or ad-hoc shell where
   `sys_os_shell`'s one-shot blocking model doesn't fit, launch the `shell`

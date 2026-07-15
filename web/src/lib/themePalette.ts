@@ -22,7 +22,14 @@
 const STORAGE_KEY = "omnigent:ui-theme-palette";
 
 /** Selectable color palettes. The first entry is the default (brand) look. */
-export const themePalettes = ["omni", "dracula", "github", "catppuccin", "gruvbox"] as const;
+export const themePalettes = [
+  "omni",
+  "dracula",
+  "github",
+  "catppuccin",
+  "gruvbox",
+  "nord",
+] as const;
 
 export type ThemePalette = (typeof themePalettes)[number];
 
@@ -123,6 +130,19 @@ export const PALETTES: readonly PaletteMeta[] = [
       text: "#3c3836",
     },
     dark: { bg: "#282828", card: "#3c3836", accent: "#fe8019", border: "#504945", text: "#ebdbb2" },
+  },
+  {
+    id: "nord",
+    label: "Nord",
+    blurb: "Arctic frost blues over polar-night neutrals.",
+    light: {
+      bg: "#eceff4",
+      card: "#e5e9f0",
+      accent: "#5e81ac",
+      border: "#d8dee9",
+      text: "#2e3440",
+    },
+    dark: { bg: "#2e3440", card: "#3b4252", accent: "#88c0d0", border: "#4c566a", text: "#eceff4" },
   },
 ] as const;
 

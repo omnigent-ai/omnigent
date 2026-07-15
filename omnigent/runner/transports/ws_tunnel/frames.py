@@ -58,7 +58,7 @@ class HelloFrame:
     :param harnesses: Names of harness kinds the runner can spawn.
     :param envs: Names of OS env types the runner supports.
     :param telemetry_opt_out: ``True`` when the runner's host has
-        opted out of telemetry (``OMNIGENT_TELEMETRY=0``,
+        opted out of telemetry (``OMNIGENT_ANALYTICS=0``,
         ``DISABLE_TELEMETRY=true``, or ``telemetry: false`` in
         config.yaml).  The server honours this on a best-effort basis
         by skipping telemetry events for sessions on this runner.

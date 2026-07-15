@@ -220,7 +220,7 @@ def is_disabled() -> bool:
     per-request I/O overhead.
 
     Checks (in order):
-    1. ``OMNIGENT_TELEMETRY=0``
+    1. ``OMNIGENT_ANALYTICS=0``
     2. ``DISABLE_TELEMETRY=true`` or ``OMNIGENT_DISABLE_TELEMETRY=true``
     3. ``DO_NOT_TRACK=1``
     4. Any CI environment variable from :data:`_CI_ENV_VARS`
@@ -240,7 +240,7 @@ def is_disabled() -> bool:
 
 def _compute_is_disabled() -> bool:
     """Compute whether telemetry is disabled (uncached)."""
-    if os.environ.get("OMNIGENT_TELEMETRY", "").strip() == "0":
+    if os.environ.get("OMNIGENT_ANALYTICS", "").strip() == "0":
         return True
     for var in ("DISABLE_TELEMETRY", "OMNIGENT_DISABLE_TELEMETRY"):
         if os.environ.get(var, "").strip().lower() in ("1", "true", "yes"):

@@ -334,10 +334,12 @@ def test_elicitation_request_event_url_mode(monkeypatch: pytest.MonkeyPatch) -> 
         policy_names=["shell_gate"],
         content_preview="rm -rf /",
     )
-    event = _elicitation_request_event("elicit_abc", req, session_id="conv_123")
+    event = _elicitation_request_event(
+        "elicit_abc", req, session_id="0099dc8be6d82871e2e450424d46d1b7"
+    )
     params = event["params"]
     assert params["mode"] == "url"
-    assert params["url"] == "/approve/conv_123/elicit_abc"
+    assert params["url"] == "/approve/0099dc8be6d82871e2e450424d46d1b7/elicit_abc"
     # Message and extras are still present.
     assert params["message"] == "approve shell?"
 
@@ -354,7 +356,9 @@ def test_elicitation_request_event_form_mode_explicit(monkeypatch: pytest.Monkey
         policy_names=["gate"],
         content_preview="ls",
     )
-    event = _elicitation_request_event("elicit_abc", req, session_id="conv_123")
+    event = _elicitation_request_event(
+        "elicit_abc", req, session_id="0099dc8be6d82871e2e450424d46d1b7"
+    )
     params = event["params"]
     assert params["mode"] == "form"
     assert "url" not in params

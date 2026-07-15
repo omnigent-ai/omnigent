@@ -70,6 +70,14 @@ interface NativeShellApi {
    */
   onNotificationActivated?: (callback: (path: string) => void) => () => void;
   /**
+   * Subscribe to deep-link navigations from the desktop shell. When the user
+   * clicks an `omnigent://.../c/<id>` link for a server this window is already
+   * on, the main process sends the in-app path here so the SPA routes to it
+   * in-place (no reload). Same path shape as onNotificationActivated. Absent
+   * on older shells / outside Electron; returns an unsubscribe.
+   */
+  onOpenPath?: (callback: (path: string) => void) => () => void;
+  /**
    * Subscribe to native sidebar-drag events. The iOS shell streams a left-edge
    * swipe here (the gesture it repurposed from back-navigation) so the renderer
    * can drive its sidebar as an interactive drawer: `begin`/`move` carry a 0→1
@@ -332,6 +340,29 @@ export function onNativeNotificationActivated(callback: (path: string) => void):
     return native.onNotificationActivated(callback);
   } catch (err) {
     console.warn("[nativeBridge] native onNotificationActivated failed:", err);
+    return () => {};
+  }
+}
+
+/**
+ * Subscribe to deep-link navigations from the desktop shell. When the user
+ * clicks an `omnigent://.../c/<id>` link for a server this window is already
+ * on, the main process sends the in-app path here so the SPA can route to it
+ * in-place (no reload) — reusing the same router `navigate` a notification
+ * click uses. The path is basename-less (`/c/<id>`); the embedded build's
+ * `basenamedRouting` rebases it under the mount.
+ *
+ * Returns an unsubscribe function. A no-op (returning a no-op unsubscribe)
+ * outside the Electron shell or under a shell too old to support deep-link
+ * routing, so callers can register it unconditionally.
+ */
+export function onOpenPath(callback: (path: string) => void): () => void {
+  const native = nativeApi();
+  if (!native?.onOpenPath) return () => {};
+  try {
+    return native.onOpenPath(callback);
+  } catch (err) {
+    console.warn("[nativeBridge] native onOpenPath failed:", err);
     return () => {};
   }
 }

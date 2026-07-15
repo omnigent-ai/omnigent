@@ -42,6 +42,7 @@ import {
   SearchIcon,
   SquareArrowOutUpRightIcon,
   Trash2Icon,
+  WrapTextIcon,
 } from "lucide-react";
 import { useSearchParams } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
@@ -636,6 +637,7 @@ function FileViewerBody({
   const [hideWhitespace, setHideWhitespace] = useState(
     () => persistedPrefsRef.current.hideWhitespace,
   );
+  const [wrapLines, setWrapLines] = useState(() => persistedPrefsRef.current.wrapLines);
   const [previewableViewMode, setPreviewableViewMode] = useState<"editor" | "preview" | "source">(
     () => persistedPrefsRef.current.previewableViewMode,
   );
@@ -662,8 +664,14 @@ function FileViewerBody({
   // is intentionally excluded — it's contextual (per-open), not a sticky
   // preference. Idempotent on mount (writes back the seeded values).
   useEffect(() => {
-    writeFileViewPreferences({ diffActive, diffLayout, previewableViewMode, hideWhitespace });
-  }, [diffActive, diffLayout, previewableViewMode, hideWhitespace]);
+    writeFileViewPreferences({
+      diffActive,
+      diffLayout,
+      previewableViewMode,
+      hideWhitespace,
+      wrapLines,
+    });
+  }, [diffActive, diffLayout, previewableViewMode, hideWhitespace, wrapLines]);
   // Markdown supports all three previewable modes (preview / editor / source).
   // HTML and notebooks have no rich-text editor, so their "editor" preference
   // falls back to the rendered preview; "preview" / "source" pass through. The shared
@@ -748,6 +756,13 @@ function FileViewerBody({
     icon: ReactNode;
     onSelect: () => void;
     active: boolean;
+    /** Keep the menu open after selecting — for toggles the user may flip in a
+     * row (e.g. wrap + whitespace). Action items (Find) omit it so the menu
+     * closes as they hand off. */
+    keepOpen?: boolean;
+    /** Suppress the active check mark — for toggles whose icon already reflects
+     * state (e.g. the whitespace eye flips open/closed). */
+    noActiveCheck?: boolean;
   };
   type ToolbarAction = {
     key: string;
@@ -758,9 +773,13 @@ function FileViewerBody({
     icon: ReactNode;
     onSelect?: () => void;
     active?: boolean;
-    /** When set, render a picker (dropdown/submenu) over these choices instead
-     * of a single button. `onSelect` is ignored. */
+    /** When set, render a picker (dropdown/submenu) over these mutually
+     * exclusive choices instead of a single button. `onSelect` is ignored. */
     options?: ToolbarOption[];
+    /** When set, render a menu of independent items (toggles + actions) under a
+     * single trigger. Unlike `options`, these are not mutually exclusive and
+     * carry no "selected choice" semantics. `onSelect` is ignored. */
+    menu?: ToolbarOption[];
   };
   const toolbarActions: ToolbarAction[] = [];
   if (lang === "markdown" && viewMode !== "diff") {
@@ -884,32 +903,61 @@ function FileViewerBody({
       onSelect: () => setDiffLayout((l) => (l === "unified" ? "split" : "unified")),
     });
   }
-  if (viewMode === "diff") {
-    toolbarActions.push({
-      key: "hide-whitespace",
-      label: hideWhitespace ? "Show whitespace changes" : "Hide whitespace changes",
-      icon: hideWhitespace ? <EyeIcon className="size-4" /> : <EyeOffIcon className="size-4" />,
-      active: hideWhitespace,
-      onSelect: () => setHideWhitespace((prev) => !prev),
-    });
-  }
-  toolbarActions.push({
-    key: "search",
-    label: "Find in file",
-    icon: <SearchIcon className="size-4" />,
-    onSelect: openSearch,
-  });
+  // A single "⋯" menu folds the view controls that were previously separate
+  // top-level icons: Find in file and Download (all views), plus the diff-only
+  // toggles (wrap lines, whitespace changes). Grouping them frees toolbar width
+  // — handy when the viewer runs in a narrow pane — and mirrors GitHub's
+  // diff-settings menu. The toggles keep the menu open; actions close it as they
+  // hand off.
+  const settingsMenu: ToolbarOption[] = [
+    {
+      key: "search",
+      label: "Find in file",
+      icon: <SearchIcon className="size-4" />,
+      active: false,
+      onSelect: openSearch,
+    },
+  ];
   if (!isDeletedFile && fileQuery.data) {
-    toolbarActions.push({
+    settingsMenu.push({
       key: "download",
       label: "Download file",
       tooltip: fileQuery.data.truncated
         ? "Download (file was truncated — content may be incomplete)"
         : "Download",
       icon: <DownloadIcon className="size-4" />,
+      active: false,
       onSelect: downloadFile,
     });
   }
+  if (viewMode === "diff") {
+    settingsMenu.push({
+      key: "wrap-lines",
+      label: "Wrap lines",
+      tooltip: "Soft-wrap long lines (no horizontal scroll)",
+      icon: <WrapTextIcon className="size-4" />,
+      active: wrapLines,
+      keepOpen: true,
+      onSelect: () => setWrapLines((prev) => !prev),
+    });
+    settingsMenu.push({
+      key: "hide-whitespace",
+      label: "Hide whitespace changes",
+      icon: hideWhitespace ? <EyeIcon className="size-4" /> : <EyeOffIcon className="size-4" />,
+      active: hideWhitespace,
+      keepOpen: true,
+      // The eye icon already flips open/closed to show state — no check needed.
+      noActiveCheck: true,
+      onSelect: () => setHideWhitespace((prev) => !prev),
+    });
+  }
+  toolbarActions.push({
+    key: "view-settings",
+    label: "View settings",
+    tooltip: "View settings",
+    icon: <MoreHorizontalIcon className="size-4" />,
+    menu: settingsMenu,
+  });
   toolbarActions.push({
     key: "copy-link",
     label: "Copy link to file",
@@ -950,7 +998,51 @@ function FileViewerBody({
   // measurement clone so it stays out of the tab order / a11y tree.
   const renderActionButtons = (interactive: boolean) =>
     toolbarActions.map((action) =>
-      action.options ? (
+      action.menu ? (
+        // A settings menu: one trigger opening a list of independent items
+        // (toggles + actions). Toggles carry `keepOpen` so the menu stays open
+        // as the user flips them; actions close it on select.
+        <DropdownMenu key={action.key}>
+          <TooltipProvider>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon-sm"
+                    aria-label={action.label}
+                    tabIndex={interactive ? undefined : -1}
+                  >
+                    {action.icon}
+                  </Button>
+                </DropdownMenuTrigger>
+              </TooltipTrigger>
+              <TooltipContent>{action.tooltip ?? action.label}</TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
+          <DropdownMenuContent align="end" className="w-auto min-w-40">
+            {action.menu.map((item) => (
+              <DropdownMenuItem
+                key={item.key}
+                className="whitespace-nowrap"
+                onSelect={
+                  interactive
+                    ? (e) => {
+                        if (item.keepOpen) e.preventDefault();
+                        item.onSelect();
+                      }
+                    : undefined
+                }
+              >
+                {item.icon}
+                {item.label}
+                {item.active && !item.noActiveCheck && <CheckIcon className="ml-auto size-4" />}
+              </DropdownMenuItem>
+            ))}
+          </DropdownMenuContent>
+        </DropdownMenu>
+      ) : action.options ? (
         // A picker: one trigger opening a menu of mutually-exclusive choices.
         <DropdownMenu key={action.key}>
           <TooltipProvider>
@@ -1135,23 +1227,36 @@ function FileViewerBody({
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="end" className="w-auto min-w-40">
                   {toolbarActions.map((action) =>
-                    action.options ? (
-                      // A picker collapses to a nested submenu of its choices.
+                    action.options || action.menu ? (
+                      // Pickers and settings menus collapse to a nested submenu
+                      // of their items. Toggle items (keepOpen) prevent the
+                      // submenu from closing so several can be flipped in a row.
                       <DropdownMenuSub key={action.key}>
                         <DropdownMenuSubTrigger className="whitespace-nowrap">
                           {action.icon}
                           {action.tooltip ?? action.label}
                         </DropdownMenuSubTrigger>
                         <DropdownMenuSubContent>
-                          {action.options.map((option) => (
+                          {(action.options ?? action.menu ?? []).map((option) => (
                             <DropdownMenuItem
                               key={option.key}
-                              className={cn("whitespace-nowrap", option.active && "bg-accent")}
-                              onSelect={option.onSelect}
+                              // Settings-menu items lean on the check mark alone;
+                              // the mutually-exclusive picker also highlights the
+                              // active choice.
+                              className={cn(
+                                "whitespace-nowrap",
+                                action.options && option.active && "bg-accent",
+                              )}
+                              onSelect={(e) => {
+                                if (option.keepOpen) e.preventDefault();
+                                option.onSelect();
+                              }}
                             >
                               {option.icon}
                               {option.label}
-                              {option.active && <CheckIcon className="ml-auto size-4" />}
+                              {option.active && !option.noActiveCheck && (
+                                <CheckIcon className="ml-auto size-4" />
+                              )}
                             </DropdownMenuItem>
                           ))}
                         </DropdownMenuSubContent>
@@ -1247,6 +1352,7 @@ function FileViewerBody({
                   path={path}
                   layout={diffLayout}
                   hideWhitespace={hideWhitespace}
+                  wrapLines={wrapLines}
                   conversationId={conversationId}
                   comments={openComments}
                   activeSelection={activeSelection}

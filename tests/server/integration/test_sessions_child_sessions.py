@@ -98,7 +98,7 @@ def _seed_child(
     ``agent_name`` fields in the summary are always ``None``.
 
     :param conv_store: Store for the child conversation.
-    :param parent_id: Parent conversation id, e.g. ``"conv_parent1"``.
+    :param parent_id: Parent conversation id, e.g. ``"0c4b962f26d3fb76dce69d9dade142f5"``.
     :param title: Sub-agent title in the canonical
         ``"{agent_type}:{session_name}"`` format,
         e.g. ``"researcher:auth"``.
@@ -121,7 +121,7 @@ async def test_child_sessions_404_for_nonexistent_session(
     client: httpx.AsyncClient,
 ) -> None:
     """Route returns 404 when the parent session does not exist."""
-    resp = await client.get("/v1/sessions/conv_nonexistent/child_sessions")
+    resp = await client.get("/v1/sessions/ad563e906854634c49e1a6fd2fbb31d4/child_sessions")
     assert resp.status_code == 404
 
 
@@ -607,6 +607,55 @@ async def test_child_sessions_busy_reflects_relay_status_cache(
         assert resp.status_code == 200
         row = resp.json()["data"][0]
         assert row["busy"] is expected_busy
+    finally:
+        sessions_module._session_status_cache.pop(child.id, None)
+
+
+@pytest.mark.parametrize(
+    ("cached_status", "expected_task_status"),
+    [
+        ("running", "in_progress"),
+        ("waiting", "in_progress"),
+        ("idle", "completed"),
+        ("failed", "failed"),
+    ],
+)
+async def test_child_sessions_current_task_status_reflects_relay_status_cache(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    cached_status: str,
+    expected_task_status: str,
+) -> None:
+    """
+    ``current_task_status`` mirrors the child lifecycle cache.
+
+    The REST snapshot should use the same public task-status vocabulary as
+    live ``session.child_session.updated`` fan-out events: active children
+    are ``in_progress``, idle children are ``completed``, and failed children
+    are ``failed``.
+
+    :param client: The test HTTP client.
+    :param db_uri: Per-test SQLite database URI.
+    :param cached_status: Status value to inject into the cache.
+    :param expected_task_status: Expected ``current_task_status`` in the summary.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+
+    session = await _create_parent_session(client)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    child = _seed_child(
+        conv_store=conv_store,
+        parent_id=session["id"],
+        title="researcher:auth",
+        agent_id=session["agent_id"],
+    )
+
+    sessions_module._session_status_cache[child.id] = cached_status
+    try:
+        resp = await client.get(f"/v1/sessions/{session['id']}/child_sessions")
+        assert resp.status_code == 200
+        row = resp.json()["data"][0]
+        assert row["current_task_status"] == expected_task_status
     finally:
         sessions_module._session_status_cache.pop(child.id, None)
 
@@ -1442,7 +1491,7 @@ async def test_native_subagent_message_uses_native_terminal_forward(
         """
         Route the native child message to the fake runner.
 
-        :param session_id: Session being routed, e.g. ``"conv_child"``.
+        :param session_id: Session being routed, e.g. ``"ff5cac23d0beb79fad914046049f32ff"``.
         :param runner_router: Real runner router, unused.
         :returns: The fake runner client.
         """
@@ -1560,7 +1609,7 @@ async def test_multipart_create_with_parent_links_child(
     # The created agent identifiers prove the response contract the
     # runner's bundle-mode handle depends on; a missing/empty agent_id
     # would make sys_session_create fail loud on the runner side.
-    assert body["agent_id"].startswith("ag_")
+    assert len(body["agent_id"]) == 32
     assert body["agent_name"] == "bundle-child"
 
     snap = await client.get(f"/v1/sessions/{child_id}")
@@ -1591,7 +1640,7 @@ async def test_multipart_create_with_unknown_parent_404s(
     bundle = build_agent_bundle(name="bundle-orphan")
     resp = await client.post(
         "/v1/sessions",
-        data={"metadata": json.dumps({"parent_session_id": "conv_missing"})},
+        data={"metadata": json.dumps({"parent_session_id": "5eca720dc2bc6cdc3a99028d7bd0f917"})},
         files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
     )
     assert resp.status_code == 404, resp.text

@@ -80,21 +80,22 @@ describe("CommandPalette — sessions", () => {
       setSessions([conv("c1", "Fix the parser")]);
       renderPalette();
 
-      // Empty query on mount → shares AppShell's `["conversations","",false]` entry.
-      expect(useConversations).toHaveBeenCalledWith("", false);
+      // Empty query on mount → shares AppShell's `["conversations","",true]` entry.
+      expect(useConversations).toHaveBeenCalledWith("", true);
 
       fireEvent.change(screen.getByTestId("command-palette-input"), {
         target: { value: "deploy" },
       });
       // Before the debounce elapses the query has NOT yet reached the hook.
-      expect(useConversations).not.toHaveBeenCalledWith("deploy", false);
+      expect(useConversations).not.toHaveBeenCalledWith("deploy", true);
 
       act(() => {
         vi.advanceTimersByTime(300);
       });
       // After the 300ms debounce, the typed query drives a server search with
-      // archived excluded — proving the palette searches the server, not a page.
-      expect(useConversations).toHaveBeenCalledWith("deploy", false);
+      // archived rows included (filtered client-side) — proving the palette
+      // searches the server, not a page.
+      expect(useConversations).toHaveBeenCalledWith("deploy", true);
     } finally {
       vi.useRealTimers();
     }

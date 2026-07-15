@@ -809,11 +809,26 @@ def _build_models_json(
             # provider-side 400 on image turns — a deliberate trade (loud error
             # over silent loss), since most current gateway models are
             # multimodal and text-only turns are unaffected.
-            provider["models"] = [
-                *provider["models"],
-                {"id": model, "input": ["text", "image"]},
-            ]
+            entry: dict[str, Any] = {"id": model, "input": ["text", "image"]}  # type: ignore[explicit-any]
+            if _pi_model_is_reasoning(model):
+                entry["reasoning"] = True
+            provider["models"] = [*provider["models"], entry]
     return config
+
+
+# Model-id fragments of completions-gateway models that stream their output on
+# the ``reasoning_content`` channel (GLM, DeepSeek-R1, ...). Pi's
+# openai-completions parser only consumes that channel when the model entry
+# declares ``reasoning: true``; without it the stream carries no ``content``
+# and the turn dies with "Stream ended without finish_reason". Extend this
+# tuple when the gateway grows another reasoning-first model family.
+_PI_REASONING_MODEL_FRAGMENTS: tuple[str, ...] = ("glm", "deepseek")
+
+
+def _pi_model_is_reasoning(model: str) -> bool:
+    """Return whether *model* needs Pi's ``reasoning: true`` model flag."""
+    lower = model.lower()
+    return any(fragment in lower for fragment in _PI_REASONING_MODEL_FRAGMENTS)
 
 
 def _pi_provider_for_model(model: str) -> str:
@@ -2091,11 +2106,18 @@ class PiExecutor(Executor):
         # multi-step (tool-loop) turn bills for every call, not just the
         # last. Empty when pi reports no usage — cost tracking is skipped.
         message_usages: list[dict[str, Any]] = []  # type: ignore[explicit-any]
+        # Error reported by a ``message_end`` (stopReason=error); surfaced at
+        # ``agent_end`` so the terminal event is consumed off the RPC stream.
+        pending_error: str | None = None
 
         while True:
-            line = await rpc.read_line(timeout=120.0)
+            # After an errored message the only thing left to drain is the
+            # already-emitted agent_end, so don't wait the full idle budget.
+            line = await rpc.read_line(timeout=120.0 if pending_error is None else 10.0)
             if line is None:
-                if not streamed_any and not response_text:
+                if pending_error is not None:
+                    yield ExecutorError(message=pending_error)
+                elif not streamed_any and not response_text:
                     stderr = "\n".join(rpc._stderr_lines) if rpc._stderr_lines else ""
                     stderr_suffix = f" Stderr: {stderr}" if stderr else ""
                     yield ExecutorError(
@@ -2228,6 +2250,9 @@ class PiExecutor(Executor):
 
             # Agent ended — the turn is complete.
             if event_type == "agent_end":
+                if pending_error is not None:
+                    yield ExecutorError(message=pending_error)
+                    return
                 end_messages = event.get("messages", [])
                 if not response_text:
                     for m in reversed(end_messages):
@@ -2271,10 +2296,17 @@ class PiExecutor(Executor):
                         message_usages.append(captured)
                     raw_stop = msg.get("stopReason")
                     stop: str | None = raw_stop if isinstance(raw_stop, str) else None
-                    if stop in ("error", "aborted"):
+                    if stop == "aborted":
                         err = msg.get("errorMessage", stop)
                         yield ExecutorError(message=str(err))
                         return
+                    if stop == "error":
+                        # Pi emits the turn-terminal ``agent_end`` after an
+                        # errored LLM call; returning here would leave it
+                        # queued, so the next turn on this RPC session reads
+                        # the stale event as its own end. Record the error
+                        # and keep draining until ``agent_end``.
+                        pending_error = str(msg.get("errorMessage", stop))
                 continue
 
             logger.debug("PiExecutor: ignoring event type=%s", event_type)

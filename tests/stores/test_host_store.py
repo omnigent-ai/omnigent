@@ -54,13 +54,13 @@ def test_upsert_creates_host_on_first_connect(
     in upsert_on_connect is broken.
     """
     host = host_store.upsert_on_connect(
-        host_id="host_aaa",
+        host_id="bdda8ba7e34130318b54dd872eb160af",
         name="test-laptop",
         owner="alice@example.com",
     )
 
     # Upsert returns the entity with all fields populated.
-    assert host.host_id == "host_aaa"
+    assert host.host_id == "bdda8ba7e34130318b54dd872eb160af"
     assert host.name == "test-laptop"
     assert host.owner == "alice@example.com"
     # New host is marked online immediately.
@@ -69,9 +69,9 @@ def test_upsert_creates_host_on_first_connect(
     assert host.updated_at == host.created_at
 
     # Verify the row survives a fresh get.
-    fetched = host_store.get_host("host_aaa")
+    fetched = host_store.get_host("bdda8ba7e34130318b54dd872eb160af")
     assert fetched is not None
-    assert fetched.host_id == "host_aaa"
+    assert fetched.host_id == "bdda8ba7e34130318b54dd872eb160af"
     assert fetched.name == "test-laptop"
     assert fetched.status == "online"
 
@@ -88,18 +88,18 @@ def test_upsert_updates_existing_host_on_reconnect(
     path is broken.
     """
     host_store.upsert_on_connect(
-        host_id="host_bbb_old",
+        host_id="74d106ce261c29485a5dfb880a2cb15f",
         name="laptop",
         owner="bob@example.com",
     )
-    host_store.set_offline("host_bbb_old")
+    host_store.set_offline("74d106ce261c29485a5dfb880a2cb15f")
     updated = host_store.upsert_on_connect(
-        host_id="host_bbb_new",
+        host_id="ebfb0eac338c147444dc6dbf3f0503fc",
         name="laptop",
         owner="bob@example.com",
     )
 
-    assert updated.host_id == "host_bbb_new"
+    assert updated.host_id == "ebfb0eac338c147444dc6dbf3f0503fc"
     assert updated.status == "online"
 
 
@@ -112,13 +112,13 @@ def test_upsert_persists_configured_harnesses(host_store: HostStore) -> None:
     no readiness data and the web picker never warns.
     """
     host_store.upsert_on_connect(
-        host_id="host_ch1",
+        host_id="e8d515c60f315ca35b4109564e238669",
         name="laptop",
         owner="alice@example.com",
         configured_harnesses={"claude-sdk": True, "codex": "needs-auth"},
     )
 
-    fetched = host_store.get_host("host_ch1")
+    fetched = host_store.get_host("e8d515c60f315ca35b4109564e238669")
     assert fetched is not None
     # Exact equality: the False bit is the actionable "warn" value.
     assert fetched.configured_harnesses == {"claude-sdk": True, "codex": "needs-auth"}
@@ -135,29 +135,29 @@ def test_upsert_reconnect_overwrites_and_nulls_configured_harnesses(
     pre-readiness build would keep advertising obsolete bits forever.
     """
     host_store.upsert_on_connect(
-        host_id="host_ch2",
+        host_id="54e092213a38acc19cfd13ffb160a2b7",
         name="laptop2",
         owner="alice@example.com",
         configured_harnesses={"codex": False},
     )
     # Reconnect with fresh values — the user ran `omnigent setup`.
     host_store.upsert_on_connect(
-        host_id="host_ch2",
+        host_id="54e092213a38acc19cfd13ffb160a2b7",
         name="laptop2",
         owner="alice@example.com",
         configured_harnesses={"codex": True},
     )
-    fetched = host_store.get_host("host_ch2")
+    fetched = host_store.get_host("54e092213a38acc19cfd13ffb160a2b7")
     assert fetched is not None
     assert fetched.configured_harnesses == {"codex": True}
 
     # Reconnect without the map: back to unknown, not the stale value.
     host_store.upsert_on_connect(
-        host_id="host_ch2",
+        host_id="54e092213a38acc19cfd13ffb160a2b7",
         name="laptop2",
         owner="alice@example.com",
     )
-    fetched = host_store.get_host("host_ch2")
+    fetched = host_store.get_host("54e092213a38acc19cfd13ffb160a2b7")
     assert fetched is not None
     assert fetched.configured_harnesses is None
 
@@ -174,7 +174,7 @@ def test_malformed_configured_harnesses_column_reads_as_none(
     a JSONDecodeError here would take down GET /v1/hosts entirely.
     """
     host_store.upsert_on_connect(
-        host_id="host_ch3",
+        host_id="2da3abf4db79c0504dbda7b88dbf521d",
         name="laptop3",
         owner="alice@example.com",
         configured_harnesses={"codex": True},
@@ -183,12 +183,12 @@ def test_malformed_configured_harnesses_column_reads_as_none(
     with Session(engine) as session:
         session.execute(
             update(SqlHost)
-            .where(SqlHost.host_id == "host_ch3")
+            .where(SqlHost.host_id == "2da3abf4db79c0504dbda7b88dbf521d")
             .values(configured_harnesses="{not json")
         )
         session.commit()
 
-    fetched = host_store.get_host("host_ch3")
+    fetched = host_store.get_host("2da3abf4db79c0504dbda7b88dbf521d")
     assert fetched is not None
     assert fetched.configured_harnesses is None
 
@@ -220,31 +220,31 @@ def test_reconnect_with_rotated_host_id_repoints_bound_conversations(
     conversations = SqlAlchemyConversationStore(db_uri)
 
     host_store.upsert_on_connect(
-        host_id="host_rot_old",
+        host_id="a1ed1ab71de2311e20488a989e61701c",
         name="dev-laptop",
         owner="dana@example.com",
     )
     # Bind a conversation to the old host_id (workspace is required by
     # the ck_conversations_workspace_required_for_host check constraint).
     conv = conversations.create_conversation(
-        host_id="host_rot_old",
+        host_id="a1ed1ab71de2311e20488a989e61701c",
         workspace="/Users/dana/proj",
     )
 
     # Same (owner, name), rotated host_id — this used to raise.
     updated = host_store.upsert_on_connect(
-        host_id="host_rot_new",
+        host_id="b1b5efd7dfc33b5a6241f1866ffb00e6",
         name="dev-laptop",
         owner="dana@example.com",
     )
 
-    assert updated.host_id == "host_rot_new"
+    assert updated.host_id == "b1b5efd7dfc33b5a6241f1866ffb00e6"
     assert updated.status == "online"
     # The binding followed the rotation — the conversation now points at
     # the new host_id, not the old (dangling) one or NULL.
     rebound = conversations.get_conversation(conv.id)
     assert rebound is not None
-    assert rebound.host_id == "host_rot_new", (
+    assert rebound.host_id == "b1b5efd7dfc33b5a6241f1866ffb00e6", (
         "conversation must be repointed to the rotated host_id so the "
         "session stays bound to the reconnected host"
     )
@@ -270,31 +270,33 @@ def test_reown_host_id_across_owner_change_preserves_conversation_binding(
 
     conversations = SqlAlchemyConversationStore(db_uri)
     host_store.upsert_on_connect(
-        host_id="host_flip",
+        host_id="a0c8ab2431b35377abb4232febeded94",
         name="laptop",
         owner="admin@example.com",
         allow_host_id_reown=True,
     )
-    conv = conversations.create_conversation(host_id="host_flip", workspace="/home/me/proj")
+    conv = conversations.create_conversation(
+        host_id="a0c8ab2431b35377abb4232febeded94", workspace="/home/me/proj"
+    )
 
     # Auth flipped to header mode: same machine, same host_id, new owner.
     reowned = host_store.upsert_on_connect(
-        host_id="host_flip",
+        host_id="a0c8ab2431b35377abb4232febeded94",
         name="laptop",
         owner="local",
         allow_host_id_reown=True,
     )
 
-    assert reowned.host_id == "host_flip"
+    assert reowned.host_id == "a0c8ab2431b35377abb4232febeded94"
     assert reowned.owner == "local"
     assert reowned.status == "online"
     # The conversation binding survives the owner change (host_id unchanged).
     rebound = conversations.get_conversation(conv.id)
     assert rebound is not None
-    assert rebound.host_id == "host_flip"
+    assert rebound.host_id == "a0c8ab2431b35377abb4232febeded94"
     # Exactly one row for this host_id — re-owned, not duplicated.
     online = host_store.list_hosts(owner="local")
-    assert [h.host_id for h in online] == ["host_flip"]
+    assert [h.host_id for h in online] == ["a0c8ab2431b35377abb4232febeded94"]
     assert host_store.list_hosts(owner="admin@example.com") == []
 
 
@@ -312,11 +314,13 @@ def test_reown_disabled_rejects_foreign_owner_claiming_host_id(
     """
     from sqlalchemy.exc import IntegrityError
 
-    host_store.upsert_on_connect(host_id="host_x", name="alice-box", owner="alice@example.com")
+    host_store.upsert_on_connect(
+        host_id="5d23e459b50e20479abf5d3fa8e2f936", name="alice-box", owner="alice@example.com"
+    )
 
     with pytest.raises(IntegrityError):
         host_store.upsert_on_connect(
-            host_id="host_x",
+            host_id="5d23e459b50e20479abf5d3fa8e2f936",
             name="bob-box",
             owner="bob@example.com",
         )
@@ -336,13 +340,13 @@ def test_set_offline(host_store: HostStore) -> None:
     statement is not executing or not committing.
     """
     host_store.upsert_on_connect(
-        host_id="host_ccc",
+        host_id="7b463227e479b3a677307588a5d9e44f",
         name="laptop",
         owner="carol@example.com",
     )
-    host_store.set_offline("host_ccc")
+    host_store.set_offline("7b463227e479b3a677307588a5d9e44f")
 
-    fetched = host_store.get_host("host_ccc")
+    fetched = host_store.get_host("7b463227e479b3a677307588a5d9e44f")
     assert fetched is not None
     assert fetched.status == "offline"
 
@@ -356,7 +360,7 @@ def test_set_offline_noop_for_unknown_host(
     The disconnect callback may fire after a failed registration;
     it must not raise.
     """
-    host_store.set_offline("host_nonexistent")
+    host_store.set_offline("aababcc3941edb738172734a9ab7bb8c")
 
 
 def test_heartbeat_advances_updated_at_without_changing_status(
@@ -371,13 +375,13 @@ def test_heartbeat_advances_updated_at_without_changing_status(
     past the TTL and wrongly drop offline; if it flipped ``status``,
     it would fight the connect/disconnect writers.
     """
-    host_store.upsert_on_connect("host_hb", "laptop", "alice@example.com")
+    host_store.upsert_on_connect("12b05166b1e4ccd4dce299285b12442f", "laptop", "alice@example.com")
     # Stand last-seen well in the past, as if the last touch was long ago.
-    _set_updated_at(db_uri, "host_hb", now_epoch() - 10_000)
+    _set_updated_at(db_uri, "12b05166b1e4ccd4dce299285b12442f", now_epoch() - 10_000)
 
-    host_store.heartbeat("host_hb")
+    host_store.heartbeat("12b05166b1e4ccd4dce299285b12442f")
 
-    fetched = host_store.get_host("host_hb")
+    fetched = host_store.get_host("12b05166b1e4ccd4dce299285b12442f")
     assert fetched is not None
     # Last-seen jumped back to ~now (within a generous window for clock
     # granularity), proving the heartbeat wrote a fresh timestamp.
@@ -392,7 +396,7 @@ def test_heartbeat_noop_for_unknown_host(host_store: HostStore) -> None:
 
     A heartbeat can race a just-deregistered host; it must not raise.
     """
-    host_store.heartbeat("host_nonexistent")
+    host_store.heartbeat("aababcc3941edb738172734a9ab7bb8c")
 
 
 def test_is_online_true_for_fresh_online_host(host_store: HostStore) -> None:
@@ -402,8 +406,8 @@ def test_is_online_true_for_fresh_online_host(host_store: HostStore) -> None:
     This is the live-host happy path that keeps a connected session in
     the Connected group.
     """
-    host_store.upsert_on_connect("host_fresh", "laptop", "alice@example.com")
-    assert host_store.is_online("host_fresh") is True
+    host_store.upsert_on_connect("c077de8b7f1cdaa48fa9edde307f5105", "laptop", "alice@example.com")
+    assert host_store.is_online("c077de8b7f1cdaa48fa9edde307f5105") is True
 
 
 def test_is_online_false_for_stale_online_host(
@@ -418,11 +422,13 @@ def test_is_online_false_for_stale_online_host(
     older than the freshness window it must read as offline, even though
     ``set_offline`` never ran.
     """
-    host_store.upsert_on_connect("host_stale", "laptop", "alice@example.com")
+    host_store.upsert_on_connect("f5422856c5f2a0d1189fdd49de0c469c", "laptop", "alice@example.com")
     # One second past the window — unambiguously stale.
-    _set_updated_at(db_uri, "host_stale", now_epoch() - HOST_LIVENESS_TTL_S - 1)
+    _set_updated_at(
+        db_uri, "f5422856c5f2a0d1189fdd49de0c469c", now_epoch() - HOST_LIVENESS_TTL_S - 1
+    )
 
-    assert host_store.is_online("host_stale") is False
+    assert host_store.is_online("f5422856c5f2a0d1189fdd49de0c469c") is False
 
 
 def test_is_online_false_for_offline_and_unknown(host_store: HostStore) -> None:
@@ -432,10 +438,10 @@ def test_is_online_false_for_offline_and_unknown(host_store: HostStore) -> None:
     A clean disconnect (set_offline) and a never-seen host_id both must
     read as not-live regardless of timestamps.
     """
-    host_store.upsert_on_connect("host_off", "laptop", "alice@example.com")
-    host_store.set_offline("host_off")
-    assert host_store.is_online("host_off") is False
-    assert host_store.is_online("host_never_seen") is False
+    host_store.upsert_on_connect("ba0a675ffb72378982f8ef434478adc8", "laptop", "alice@example.com")
+    host_store.set_offline("ba0a675ffb72378982f8ef434478adc8")
+    assert host_store.is_online("ba0a675ffb72378982f8ef434478adc8") is False
+    assert host_store.is_online("d75a658a60c6bbad9c213a6e5cfbabf3") is False
 
 
 def test_online_host_ids_returns_only_live_hosts(
@@ -456,16 +462,29 @@ def test_online_host_ids_returns_only_live_hosts(
     """
     # Distinct (host_id, name) per row — the hosts unique constraint is
     # (workspace_id, owner, name), so reusing one name would collide.
-    host_store.upsert_on_connect("host_live", "laptop-live", "alice@example.com")
-    host_store.upsert_on_connect("host_stale2", "laptop-stale", "alice@example.com")
-    host_store.upsert_on_connect("host_offline", "laptop-off", "alice@example.com")
-    host_store.set_offline("host_offline")
-    _set_updated_at(db_uri, "host_stale2", now_epoch() - HOST_LIVENESS_TTL_S - 1)
+    host_store.upsert_on_connect(
+        "2fd786c75c03cfbbec099a6820c08b62", "laptop-live", "alice@example.com"
+    )
+    host_store.upsert_on_connect(
+        "1b82e794a2b66c37d902e663a89e0d91", "laptop-stale", "alice@example.com"
+    )
+    host_store.upsert_on_connect(
+        "3d9665477127e41f42de3f4109418173", "laptop-off", "alice@example.com"
+    )
+    host_store.set_offline("3d9665477127e41f42de3f4109418173")
+    _set_updated_at(
+        db_uri, "1b82e794a2b66c37d902e663a89e0d91", now_epoch() - HOST_LIVENESS_TTL_S - 1
+    )
 
     result = host_store.online_host_ids(
-        ["host_live", "host_stale2", "host_offline", "host_unknown"]
+        [
+            "2fd786c75c03cfbbec099a6820c08b62",
+            "1b82e794a2b66c37d902e663a89e0d91",
+            "3d9665477127e41f42de3f4109418173",
+            "5342cd866f93bf4bad2f138f44f3609b",
+        ]
     )
-    assert result == {"host_live"}
+    assert result == {"2fd786c75c03cfbbec099a6820c08b62"}
 
 
 def test_online_host_ids_empty_input_skips_query(host_store: HostStore) -> None:
@@ -491,7 +510,7 @@ def test_host_is_live_boundary_is_inclusive() -> None:
     """
     now = now_epoch()
     at_ttl = Host(
-        host_id="host_edge",
+        host_id="85816a8fc5fccd5874bf61da46a4c0ef",
         name="laptop",
         owner="a@example.com",
         status="online",
@@ -499,7 +518,7 @@ def test_host_is_live_boundary_is_inclusive() -> None:
         updated_at=now - HOST_LIVENESS_TTL_S,
     )
     just_past = Host(
-        host_id="host_edge",
+        host_id="85816a8fc5fccd5874bf61da46a4c0ef",
         name="laptop",
         owner="a@example.com",
         status="online",
@@ -519,9 +538,15 @@ def test_list_hosts_filters_by_owner(
     If alice sees bob's host, the WHERE clause on ``owner`` is missing
     or broken.
     """
-    host_store.upsert_on_connect("host_d1", "alice-laptop", "alice@example.com")
-    host_store.upsert_on_connect("host_d2", "bob-laptop", "bob@example.com")
-    host_store.upsert_on_connect("host_d3", "alice-arca", "alice@example.com")
+    host_store.upsert_on_connect(
+        "dd631c2a902eeead6632bb7a15d2a36d", "alice-laptop", "alice@example.com"
+    )
+    host_store.upsert_on_connect(
+        "af2aefbe4a416df7641bf8ca520f838f", "bob-laptop", "bob@example.com"
+    )
+    host_store.upsert_on_connect(
+        "58d8ac102d1d1b3db3f5056a7c8e196b", "alice-arca", "alice@example.com"
+    )
 
     alice_hosts = host_store.list_hosts("alice@example.com")
     bob_hosts = host_store.list_hosts("bob@example.com")
@@ -531,8 +556,8 @@ def test_list_hosts_filters_by_owner(
     assert len(bob_hosts) == 1
 
     alice_ids = {h.host_id for h in alice_hosts}
-    assert alice_ids == {"host_d1", "host_d3"}
-    assert bob_hosts[0].host_id == "host_d2"
+    assert alice_ids == {"dd631c2a902eeead6632bb7a15d2a36d", "58d8ac102d1d1b3db3f5056a7c8e196b"}
+    assert bob_hosts[0].host_id == "af2aefbe4a416df7641bf8ca520f838f"
 
 
 def test_list_hosts_empty_for_unknown_owner(
@@ -557,7 +582,7 @@ def test_get_host_returns_none_for_unknown(
     If it raises or returns a default, the None-return contract is
     violated.
     """
-    assert host_store.get_host("host_nonexistent") is None
+    assert host_store.get_host("aababcc3941edb738172734a9ab7bb8c") is None
 
 
 def test_upsert_replaces_host_id_on_owner_name_conflict(
@@ -572,18 +597,18 @@ def test_upsert_replaces_host_id_on_owner_name_conflict(
     on (owner, name) is missing or the IntegrityError fallback is
     broken.
     """
-    host_store.upsert_on_connect("host_old", "laptop", "eve@example.com")
-    host_store.upsert_on_connect("host_new", "laptop", "eve@example.com")
+    host_store.upsert_on_connect("660d14a93e762f508ff74112a7a81eea", "laptop", "eve@example.com")
+    host_store.upsert_on_connect("9b4beb1282718551dd43288ed246fdae", "laptop", "eve@example.com")
 
     hosts = host_store.list_hosts("eve@example.com")
     # Exactly one row — the old host_id was replaced, not duplicated.
     assert len(hosts) == 1
-    assert hosts[0].host_id == "host_new"
+    assert hosts[0].host_id == "9b4beb1282718551dd43288ed246fdae"
     assert hosts[0].name == "laptop"
     assert hosts[0].status == "online"
 
     # Old host_id is gone from the DB.
-    assert host_store.get_host("host_old") is None
+    assert host_store.get_host("660d14a93e762f508ff74112a7a81eea") is None
 
 
 def test_upsert_conflict_preserves_created_at(
@@ -597,21 +622,21 @@ def test_upsert_conflict_preserves_created_at(
     it with the current time instead of leaving it untouched.
     """
     original = host_store.upsert_on_connect(
-        "host_first",
+        "4a7dab2e281a9dc8db539e9f59919109",
         "arca",
         "frank@example.com",
     )
     original_created = original.created_at
 
     host_store.upsert_on_connect(
-        "host_second",
+        "a9dac0e66482a6e9ab8a4aae5135f59b",
         "arca",
         "frank@example.com",
     )
 
     fetched = host_store.list_hosts("frank@example.com")
     assert len(fetched) == 1
-    assert fetched[0].host_id == "host_second"
+    assert fetched[0].host_id == "a9dac0e66482a6e9ab8a4aae5135f59b"
     # created_at from the original registration is preserved.
     assert fetched[0].created_at == original_created
     # updated_at should be >= the original (reconnect bumps it).
@@ -631,7 +656,7 @@ def test_register_managed_host_and_resolve_token_roundtrip(db_uri: str) -> None:
     """
     store = HostStore(db_uri)
     store.register_managed_host(
-        host_id="host_managed_1",
+        host_id="e932ccae9eeb8f2a86f7ebfc5089c28d",
         name="managed-m1",
         owner="alice@example.com",
         token="raw-launch-token-1",
@@ -642,7 +667,7 @@ def test_register_managed_host_and_resolve_token_roundtrip(db_uri: str) -> None:
 
     resolved = store.resolve_launch_token("raw-launch-token-1")
     assert resolved is not None
-    assert resolved.host_id == "host_managed_1"
+    assert resolved.host_id == "e932ccae9eeb8f2a86f7ebfc5089c28d"
     assert resolved.name == "managed-m1"
     assert resolved.owner == "alice@example.com"
     assert resolved.sandbox_provider == "modal"
@@ -659,7 +684,7 @@ def test_resolve_launch_token_rejects_unknown_and_expired(db_uri: str) -> None:
     """
     store = HostStore(db_uri)
     store.register_managed_host(
-        host_id="host_managed_2",
+        host_id="e5e05ec590da46a0e27bb138d343ffe7",
         name="managed-m2",
         owner="alice@example.com",
         token="raw-launch-token-2",
@@ -683,7 +708,7 @@ def test_register_managed_host_relaunch_rotates_credential(db_uri: str) -> None:
     """
     store = HostStore(db_uri)
     first = store.register_managed_host(
-        host_id="host_managed_3",
+        host_id="a687a760841c785578a03f4677f8db3c",
         name="managed-m3",
         owner="alice@example.com",
         token="generation-1-token",
@@ -693,7 +718,7 @@ def test_register_managed_host_relaunch_rotates_credential(db_uri: str) -> None:
     )
 
     second = store.register_managed_host(
-        host_id="host_managed_3",
+        host_id="a687a760841c785578a03f4677f8db3c",
         name="managed-m3",
         owner="alice@example.com",
         token="generation-2-token",
@@ -711,7 +736,7 @@ def test_register_managed_host_relaunch_rotates_credential(db_uri: str) -> None:
     assert store.resolve_launch_token("generation-1-token") is None
     resolved = store.resolve_launch_token("generation-2-token")
     assert resolved is not None
-    assert resolved.host_id == "host_managed_3"
+    assert resolved.host_id == "a687a760841c785578a03f4677f8db3c"
     assert resolved.sandbox_id == "sb-gen2"
 
 
@@ -724,7 +749,7 @@ def test_managed_columns_survive_connect(db_uri: str) -> None:
     """
     store = HostStore(db_uri)
     store.register_managed_host(
-        host_id="host_managed_4",
+        host_id="d55a61010459cea88ed2af0fe916139b",
         name="managed-m4",
         owner="alice@example.com",
         token="raw-launch-token-4",
@@ -734,7 +759,7 @@ def test_managed_columns_survive_connect(db_uri: str) -> None:
     )
 
     connected = store.upsert_on_connect(
-        host_id="host_managed_4",
+        host_id="d55a61010459cea88ed2af0fe916139b",
         name="managed-m4",
         owner="alice@example.com",
     )
@@ -754,7 +779,7 @@ def test_delete_host_removes_row_and_revokes_token(db_uri: str) -> None:
     """
     store = HostStore(db_uri)
     store.register_managed_host(
-        host_id="host_managed_5",
+        host_id="dcf4eb5fc0b04985ec45f79cfda95566",
         name="managed-m5",
         owner="alice@example.com",
         token="raw-launch-token-5",
@@ -763,12 +788,12 @@ def test_delete_host_removes_row_and_revokes_token(db_uri: str) -> None:
         token_expires_at=now_epoch() + 3600,
     )
 
-    store.delete_host("host_managed_5")
-    assert store.get_host("host_managed_5") is None
+    store.delete_host("dcf4eb5fc0b04985ec45f79cfda95566")
+    assert store.get_host("dcf4eb5fc0b04985ec45f79cfda95566") is None
     assert store.resolve_launch_token("raw-launch-token-5") is None
     assert store.list_hosts("alice@example.com") == []
     # Second delete is a no-op, not an error.
-    store.delete_host("host_managed_5")
+    store.delete_host("dcf4eb5fc0b04985ec45f79cfda95566")
 
 
 def test_revoke_launch_token_keeps_row_but_stops_resolution(db_uri: str) -> None:
@@ -780,7 +805,7 @@ def test_revoke_launch_token_keeps_row_but_stops_resolution(db_uri: str) -> None
     """
     store = HostStore(db_uri)
     store.register_managed_host(
-        host_id="host_managed_revoke",
+        host_id="f59827fa9468170e62cf28104d2a5251",
         name="managed-revoke",
         owner="alice@example.com",
         token="raw-launch-token-revoke",
@@ -792,16 +817,16 @@ def test_revoke_launch_token_keeps_row_but_stops_resolution(db_uri: str) -> None
     # broken register would make the post-revoke assertion vacuous.
     assert store.resolve_launch_token("raw-launch-token-revoke") is not None
 
-    store.revoke_launch_token("host_managed_revoke")
+    store.revoke_launch_token("f59827fa9468170e62cf28104d2a5251")
 
     # The credential is dead but the row (and its managed binding)
     # survives — a deleted row here would null the session's host_id.
     assert store.resolve_launch_token("raw-launch-token-revoke") is None
-    host = store.get_host("host_managed_revoke")
+    host = store.get_host("f59827fa9468170e62cf28104d2a5251")
     assert host is not None
     assert host.sandbox_provider == "modal"
     # Unknown host: no-op, not an error.
-    store.revoke_launch_token("host_never_existed")
+    store.revoke_launch_token("b4cfac8495d21e1a300c27de5203e52d")
 
 
 def test_managed_host_raw_token_never_stored(db_uri: str) -> None:
@@ -815,7 +840,7 @@ def test_managed_host_raw_token_never_stored(db_uri: str) -> None:
 
     store = HostStore(db_uri)
     store.register_managed_host(
-        host_id="host_managed_6",
+        host_id="64c92d9b75006275f995c5041380a170",
         name="managed-m6",
         owner="alice@example.com",
         token="raw-launch-token-6",
@@ -827,7 +852,7 @@ def test_managed_host_raw_token_never_stored(db_uri: str) -> None:
     engine = get_or_create_engine(db_uri)
     with Session(engine) as session:
         row = session.execute(
-            select(SqlHost).where(SqlHost.host_id == "host_managed_6")
+            select(SqlHost).where(SqlHost.host_id == "64c92d9b75006275f995c5041380a170")
         ).scalar_one()
         assert row.token_hash == hash_host_launch_token("raw-launch-token-6")
         assert row.token_hash != "raw-launch-token-6"
@@ -843,7 +868,7 @@ def test_register_managed_host_refuses_cross_owner_recredential(db_uri: str) -> 
     """
     store = HostStore(db_uri)
     store.register_managed_host(
-        host_id="host_managed_7",
+        host_id="58f80f7592c6a72ba121eb5aedde8a82",
         name="managed-m7",
         owner="alice@example.com",
         token="alice-token-7",
@@ -854,7 +879,7 @@ def test_register_managed_host_refuses_cross_owner_recredential(db_uri: str) -> 
 
     with pytest.raises(ValueError, match="different owner"):
         store.register_managed_host(
-            host_id="host_managed_7",
+            host_id="58f80f7592c6a72ba121eb5aedde8a82",
             name="managed-m7-bob",
             owner="bob@example.com",
             token="bob-token-7",

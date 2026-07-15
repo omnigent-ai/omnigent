@@ -34,6 +34,7 @@ const { pathToFileURL } = require("node:url");
 const { execFile } = require("node:child_process");
 const { registerLocalhostCors } = require("./localhost_cors");
 const { normalizeUrl, expandDatabricksWorkspaceUrl } = require("./url");
+const { parseOmnigentDeepLink, chooseDeepLinkStrategy } = require("./deepLink");
 const { registerWorkspaceChromeHide } = require("./workspace-chrome");
 const { createBrowserViewRegistry } = require("./browserViewRegistry");
 const { createBrowserViewBoundsController } = require("./browserViewBounds");
@@ -975,19 +976,65 @@ function hardenOauthPopup(child) {
 }
 
 /**
+ * Join a basename-less SPA path (e.g. ``/c/conv_abc``) onto a server URL that
+ * may carry a workspace mount (e.g. ``https://host/ml/omnigents/``). The path
+ * is an ABSOLUTE in-app route, but it lives UNDER the server's mount —
+ * ``new URL("/c/x", serverUrl)`` would resolve against the ORIGIN and drop
+ * ``/ml/omnigents`` — so we string-concatenate: strip the server URL's trailing
+ * slash, append the path. The SPA's react-router basename then matches
+ * ``${mount}/c/:id``. Shared by createWindow (cold open) and loadServerUrl
+ * (re-pointing an existing window) so the mount-aware join is in one place.
+ *
+ * @param {string} serverUrl A normalized server URL (origin or origin+mount).
+ * @param {string} path An absolute in-app path beginning with ``/``.
+ * @returns {string}
+ */
+function resolveServerPath(serverUrl, path) {
+  return serverUrl.replace(/\/+$/, "") + (path.startsWith("/") ? path : "/" + path);
+}
+
+/**
+ * Pin an existing window to a server origin and load a (optionally
+ * path-suffixed) URL. Shared by the deep-link reuse/reload paths so the
+ * pin + identity + load sequence isn't duplicated. ``serverUrl`` is stored as
+ * the window's CLEAN server identity (no conversation path); ``path`` is joined
+ * onto it only for the load URL (see resolveServerPath).
+ *
+ * @param {BrowserWindow} win
+ * @param {string} serverUrl Clean server URL (origin or origin+mount).
+ * @param {string} [path] Optional basename-less in-app path (e.g. ``/c/<id>``).
+ * @returns {Promise<void>}
+ */
+function loadServerUrl(win, serverUrl, path) {
+  pinWindow(win, originOf(serverUrl));
+  setWindowServerUrl(win, serverUrl);
+  return win.loadURL(path ? resolveServerPath(serverUrl, path) : serverUrl);
+}
+
+/**
  * Create a shell window and load a destination, in priority order:
- *   1. `targetUrl`, when given (used by "New Window" to clone the current
+ *   1. `opts.path` joined onto `opts.serverUrl` (a deep link opening a
+ *      specific conversation on a specific server).
+ *   2. `targetUrl`, when given (used by "New Window" to clone the current
  *      window's exact URL — e.g. a specific conversation).
- *   2. the saved server URL (the normal launch path).
- *   3. the bundled setup page (first run / no server configured).
+ *   3. the saved server URL (the normal launch path).
+ *   4. the bundled setup page (first run / no server configured).
+ *
+ * `opts.serverUrl` and `opts.path` decouple the window's server IDENTITY
+ * (clean, no conversation path — used by host/server CLI commands) from the
+ * loaded URL: a deep link loads ``${serverUrl}${path}`` but stores
+ * ``serverUrl`` without the ``/c/<id>`` (see resolveServerPath). Without an
+ * explicit ``opts.serverUrl``, the identity is the loaded URL, preserving the
+ * behavior of the existing New Window / launch callers.
  *
  * @param {string} [targetUrl] Explicit http(s) URL to load instead of the
  *   saved server. Anything not http(s) is ignored (we never load file:// or
  *   internal URLs from an untrusted caller).
- * @param {{ephemeral?: boolean}} [opts] ``ephemeral: true`` creates a debug
- *   multi-server window: it opens on the setup page (ignoring the saved
- *   server) and a URL connected from it is pinned to this window only,
- *   never persisted to settings.
+ * @param {{ephemeral?: boolean, serverUrl?: string, path?: string}} [opts]
+ *   ``ephemeral: true`` creates a debug multi-server window: it opens on the
+ *   setup page (ignoring the saved server) and a URL connected from it is
+ *   pinned to this window only, never persisted to settings. ``serverUrl`` +
+ *   ``path`` open a deep-link conversation (server identity vs. load URL).
  * @returns {BrowserWindow}
  */
 function createWindow(targetUrl, opts = {}) {
@@ -1026,21 +1073,36 @@ function createWindow(targetUrl, opts = {}) {
   const explicit =
     typeof targetUrl === "string" && /^https?:\/\//i.test(targetUrl) ? targetUrl : undefined;
   const saved = loadSettings().server_url;
-  // An explicit target (New Window cloning a sibling) always wins. Otherwise
-  // ephemeral windows start on the setup page so the user can enter the
-  // alternate server, and normal windows fall back to the saved server.
-  const candidate =
-    explicit ?? (ephemeral ? null : typeof saved === "string" && saved.length > 0 ? saved : null);
-  // A candidate that doesn't parse (hand-edited/corrupt settings.json) is
+  // serverUrl: the window's server IDENTITY for host/server CLI commands
+  // (``omnigent host --server``, ``omnigent login``, ``serverAuthed``) — the
+  // origin or origin+mount, WITHOUT the conversation path. Prefer an explicit
+  // override (deep link); else the explicit target (New Window cloning a
+  // sibling — preserves prior behavior); else the saved default for normal
+  // windows; else null (ephemeral windows start on the setup page).
+  const serverUrl =
+    (typeof opts.serverUrl === "string" && opts.serverUrl.length > 0 ? opts.serverUrl : null) ??
+    explicit ??
+    (ephemeral ? null : typeof saved === "string" && saved.length > 0 ? saved : null);
+  // loadUrl: what the webContents actually loads. A deep-link path resolves
+  // under the server URL (mount-aware — see resolveServerPath); an explicit
+  // target (New Window) loads that exact URL; otherwise load the server URL.
+  const loadUrl =
+    (typeof opts.path === "string" && opts.path.length > 0 && serverUrl
+      ? resolveServerPath(serverUrl, opts.path)
+      : null) ??
+    explicit ??
+    serverUrl;
+  // A serverUrl that doesn't parse (hand-edited/corrupt settings.json) is
   // treated as "no server configured" rather than crashing window creation.
-  const destinationOrigin = candidate ? originOf(candidate) : null;
-  const destination = destinationOrigin ? candidate : null;
+  const destinationOrigin = serverUrl ? originOf(serverUrl) : null;
+  const destination = destinationOrigin ? loadUrl : null;
   windows.set(win, {
     // Pin to the destination's origin up front; setup-page windows stay
     // unpinned (null) until the user connects them.
     origin: destinationOrigin,
-    // Full connected URL (incl. any path) for host/server CLI commands.
-    serverUrl: destination,
+    // Clean server identity (no conversation path) for host/server CLI
+    // commands; ``loadUrl`` (possibly /c/<id>) is what gets loaded below.
+    serverUrl: destination ? serverUrl : null,
     ephemeral,
     badgeCount: 0,
     // Per-conversation embedded-browser view registry for this window.
@@ -1053,11 +1115,11 @@ function createWindow(targetUrl, opts = {}) {
     // WindowState is the source of truth for persistence behavior).
     const search = new URLSearchParams();
     if (ephemeral) search.set("ephemeral", "1");
-    if (candidate && !destinationOrigin) {
+    if (serverUrl && !destinationOrigin) {
       // Fail loud on a corrupt hand-edited settings.json: show WHY the
       // window landed on setup instead of silently presenting a blank form.
       search.set("error", "saved server URL in settings.json is not a valid URL");
-      search.set("url", candidate);
+      search.set("url", serverUrl);
     }
     void win.loadFile(SETUP_PAGE, search.size > 0 ? { search: search.toString() } : undefined);
   }
@@ -2357,6 +2419,307 @@ function registerIpc() {
 }
 
 // ---------------------------------------------------------------------------
+// Deep links (`omnigent://<hostname>/c/<session_id>`)
+//
+// An OS-clicked `omnigent://` URL opens the named session on the named server.
+// The decision logic (parse + window selection) is PURE in src/deepLink.js and
+// unit-tested there; this section owns ingestion, the queue, and the
+// orchestrator. See README "Deep links".
+//
+// Ingestion: macOS fires `open-url` (which can precede app.whenReady),
+// Windows/Linux funnel a second launch through `second-instance` (argv), and a
+// cold-start first instance also carries the URL in process.argv. All three
+// push onto one queue drained SERIALIZED (one link at a time) so two links
+// can't race two consent dialogs or two windows onto the same origin.
+// ---------------------------------------------------------------------------
+
+/**
+ * Full server URL (origin, or origin+mount) of a server the user previously
+ * connected to, whose origin matches `origin`; null when none. Reusing the
+ * recorded URL means a deep link to a KNOWN workspace server opens WITHOUT the
+ * network probe — the mount is already in the saved URL. Used both to detect
+ * "known" (for the consent gate) and to skip probe-based expansion.
+ *
+ * @param {string} origin e.g. ``"https://my-workspace.cloud.databricks.com"``.
+ * @returns {string | null}
+ */
+function findKnownServerUrl(origin) {
+  const settings = loadSettings();
+  /** @type {string[]} */
+  const candidates = [];
+  if (typeof settings.server_url === "string") candidates.push(settings.server_url);
+  if (Array.isArray(settings.recent_servers)) {
+    for (const u of settings.recent_servers) if (typeof u === "string") candidates.push(u);
+  }
+  for (const u of candidates) {
+    if (originOf(u) === origin) return u;
+  }
+  return null;
+}
+
+/**
+ * Origins of every server the user previously connected to (saved default +
+ * recent servers). The set used to tell a known server (open without consent)
+ * from a never-connected one (ask consent — pinning is a privilege grant).
+ *
+ * @returns {string[]}
+ */
+function knownOrigins() {
+  const settings = loadSettings();
+  /** @type {Set<string>} */
+  const origins = new Set();
+  if (typeof settings.server_url === "string") {
+    const o = originOf(settings.server_url);
+    if (o) origins.add(o);
+  }
+  if (Array.isArray(settings.recent_servers)) {
+    for (const u of settings.recent_servers) {
+      if (typeof u === "string") {
+        const o = originOf(u);
+        if (o) origins.add(o);
+      }
+    }
+  }
+  return [...origins];
+}
+
+/**
+ * Record a server URL at the head of the persisted recent-servers list (a
+ * user who just consented to a deep link to a new server should not have to
+ * consent again next time). Does NOT overwrite the saved default server — a
+ * clicked link never changes which server you land on at launch.
+ *
+ * @param {string} serverUrl
+ */
+function rememberServerUrl(serverUrl) {
+  const settings = loadSettings();
+  rememberRecentServer(settings, serverUrl);
+  saveSettings(settings);
+}
+
+/**
+ * Restore (if minimized) and focus a window. No-op when absent/destroyed.
+ *
+ * @param {BrowserWindow | null | undefined} win
+ */
+function focusAndRestore(win) {
+  if (!win || win.isDestroyed()) return;
+  if (win.isMinimized()) win.restore();
+  win.focus();
+}
+
+/**
+ * Tell a pinned window's SPA to navigate in-place to an in-app path
+ * (`/c/<id>`), without a reload — reuses the SPA's router, the same path a
+ * notification click routes (basename-less; the embedded build's
+ * `basenamedRouting` rebases it under the mount). Main→renderer only; the page
+ * cannot invoke it. The caller (reuse-inplace) only sends when the window's
+ * top-level page IS the pinned server (SPA listener mounted); this is
+ * defense-in-depth on top of that.
+ *
+ * @param {BrowserWindow | null | undefined} win
+ * @param {string} path
+ */
+function sendOpenPath(win, path) {
+  if (!win || win.isDestroyed()) return;
+  console.log(`[omnigent] deep-link: send open-path ${path}`);
+  try {
+    win.webContents.send("omnigent:open-path", path);
+  } catch {
+    // Window torn down between the check and the send; ignore.
+  }
+}
+
+/**
+ * Native, main-process confirmation before opening a deep link to a server
+ * the user has NEVER connected to — because pinning a new origin is a
+ * privilege grant (notifications, badge, mic), and a clicked link must not
+ * silently pin an attacker-chosen origin. Mirrors confirmHostEnrollment /
+ * confirmExternalProtocol: Cancel is the safe default, the full origin is
+ * shown so the user can see exactly what they'd connect to. The conversation
+ * id is NOT shown (it's an opaque server-owned identifier; the server is the
+ * trust decision, not the path).
+ *
+ * @param {BrowserWindow} parent The window to parent the dialog on.
+ * @param {string} targetOrigin The server origin to connect to.
+ * @returns {Promise<boolean>} True when the user chose Open.
+ */
+async function confirmOpenDeepLink(parent, targetOrigin) {
+  let host = targetOrigin;
+  try {
+    host = new URL(targetOrigin).host || targetOrigin;
+  } catch {
+    // Keep the full origin string if it somehow doesn't parse.
+  }
+  const icon = nativeImage.createFromPath(ICON_PNG);
+  const { response } = await dialog.showMessageBox(parent, {
+    type: "warning",
+    icon: icon.isEmpty() ? undefined : icon,
+    title: "Omnigent",
+    message: `Open this Omnigent link?`,
+    detail:
+      `This link will connect Omnigent to ${host} and open a conversation.\n\n` +
+      `Only open links from a server you trust — once connected, it can show ` +
+      `notifications and (when you allow it) manage this machine as a runner.`,
+    buttons: ["Cancel", "Open"],
+    defaultId: 0, // Cancel is the safe default
+    cancelId: 0,
+    noLink: true,
+  });
+  return response === 1;
+}
+
+/** Deep links awaiting handling, in arrival order. */
+const pendingDeepLinks = [];
+/** True while a deep link is being handled — the drain runs one at a time. */
+let deepLinkInFlight = false;
+
+/**
+ * Queue a deep link for handling. Unrecognized links (parseOmnigentDeepLink
+ * null) are dropped here so they never reach the queue. Draining is a no-op
+ * before app.whenReady (see drainPendingDeepLinks) — `open-url` can fire
+ * pre-ready on macOS, and the cold-start argv scan runs at lock time.
+ *
+ * @param {string} raw
+ */
+function enqueueDeepLink(raw) {
+  if (!parseOmnigentDeepLink(raw)) {
+    console.log(`[omnigent] deep-link: ignored unrecognized URL ${String(raw)}`);
+    return;
+  }
+  console.log(`[omnigent] deep-link: queued ${raw} (ready=${app.isReady()})`);
+  pendingDeepLinks.push(raw);
+  drainPendingDeepLinks();
+}
+
+/**
+ * Handle queued deep links one at a time. No-ops before app.isReady() (the
+ * whenReady block drains once setup is done). After a link is handled, if no
+ * window ended up open (e.g. consent was cancelled at cold start) it opens the
+ * default launch window so the app is never left windowless.
+ */
+function drainPendingDeepLinks() {
+  if (!app.isReady()) return; // queue until ready; whenReady drains
+  if (deepLinkInFlight) return;
+  const next = pendingDeepLinks.shift();
+  if (next === undefined) return;
+  deepLinkInFlight = true;
+  void handleDeepLink(next)
+    .catch((err) => console.warn("[omnigent] deep-link handling failed:", err))
+    .finally(() => {
+      deepLinkInFlight = false;
+      if (pendingDeepLinks.length > 0) {
+        drainPendingDeepLinks();
+      } else if (BrowserWindow.getAllWindows().length === 0) {
+        // A cancelled consent at cold start left no window — open the default.
+        createWindow();
+      }
+    });
+}
+
+/**
+ * Open an `omnigent://` deep link on the right window. The window-selection
+ * decision (reuse an existing window on that server in-place vs. reload it vs.
+ * open a new one vs. ask consent for an unknown server) is made by the PURE
+ * chooseDeepLinkStrategy(); this orchestrator snapshots the live windows and
+ * executes the decision. Serialized by drainPendingDeepLinks.
+ *
+ * No pre-consent network request. The decision runs on `parsed.origin`, which
+ * the link itself fixes (no fetch). A KNOWN server's recorded URL (already
+ * mount-bearing) is reused as-is. The workspace mount probe
+ * (expandDatabricksWorkspaceUrl) runs ONLY after the user consents to an
+ * UNKNOWN server — so clicking (or the OS dispatching) a link to an
+ * attacker-chosen host makes no HTTP request until the user has agreed. The
+ * probe is safe post-consent because it can only append a path (`/ml/omnigents`)
+ * under the SAME origin — it never changes the origin the user approved.
+ *
+ * @param {string} raw The raw `omnigent://...` URL.
+ * @returns {Promise<void>}
+ */
+async function handleDeepLink(raw) {
+  const parsed = parseOmnigentDeepLink(raw);
+  if (!parsed) return;
+
+  // The origin is fixed by the link itself — no network request needed for the
+  // decision. expandDatabricksWorkspaceUrl only appends a mount path under this
+  // same origin, so approving the origin is approving the server.
+  const targetOrigin = parsed.origin;
+  // A KNOWN server: reuse its recorded URL (already mount-bearing, e.g.
+  // `https://host/ml/omnigents`) so we SKIP the probe entirely. null for an
+  // unknown server — the mount is discovered AFTER consent (see consent-unknown).
+  const known = findKnownServerUrl(targetOrigin);
+
+  // Snapshot the live windows (creation order) for the pure decision.
+  const winList = [...windows.keys()];
+  const focused = BrowserWindow.getFocusedWindow();
+  const focusedIndex = focused && windows.has(focused) ? winList.indexOf(focused) : -1;
+  const decision = chooseDeepLinkStrategy({
+    targetOrigin,
+    windows: winList.map((win) => ({
+      origin: windows.get(win).origin,
+      currentOrigin: win.isDestroyed() ? null : originOf(win.webContents.getURL()),
+    })),
+    knownOrigins: knownOrigins(),
+    focusedIndex: focusedIndex < 0 ? null : focusedIndex,
+  });
+  console.log(
+    `[omnigent] deep-link: strategy=${decision.strategy} ` +
+      `target=${targetOrigin} known=${known ? "yes" : "no"} ` +
+      `windows=${winList.length}`,
+  );
+
+  switch (decision.strategy) {
+    case "reuse-inplace": {
+      const win = winList[decision.windowIndex];
+      focusAndRestore(win);
+      sendOpenPath(win, parsed.path);
+      return;
+    }
+    case "reuse-reload": {
+      const win = winList[decision.windowIndex];
+      // Reload against THIS window's own recorded server URL (authoritative for
+      // it, and correct for ephemeral windows whose origin isn't in settings —
+      // `known` would be null there). A pinned window always has a serverUrl.
+      const winServerUrl = windows.get(win).serverUrl;
+      focusAndRestore(win);
+      await loadServerUrl(win, winServerUrl, parsed.path).catch(() => {});
+      return;
+    }
+    case "open-known": {
+      const win = createWindow(undefined, { serverUrl: known, path: parsed.path });
+      focusAndRestore(win);
+      return;
+    }
+    case "consent-unknown": {
+      // Cold start to an unknown server may have no window to parent the dialog
+      // on — create the launch window first so the dialog has a parent and the
+      // app is never stranded windowless (it becomes the deep-link window on
+      // consent, or stays as the normal launch window on cancel).
+      let parent = activeWindow();
+      if (!parent) parent = createWindow();
+      if (!(await confirmOpenDeepLink(parent, targetOrigin))) return; // cancelled
+      // Consent given — NOW probe to discover the workspace mount. The origin
+      // is unchanged (the probe only appends a path under it), so the consent
+      // decision stands; the user approved connecting to this host.
+      const serverUrl = await expandDatabricksWorkspaceUrl(targetOrigin);
+      if (!originOf(serverUrl)) return; // expansion yielded an unparseable URL
+      // Reuse the just-created setup-page window instead of opening a second;
+      // if a window was already open (warm start), open a new one.
+      if (!pinnedOrigin(parent)) {
+        await loadServerUrl(parent, serverUrl, parsed.path).catch(() => {});
+        focusAndRestore(parent);
+      } else {
+        const win = createWindow(undefined, { serverUrl, path: parsed.path });
+        focusAndRestore(win);
+      }
+      // Record the newly-trusted server so the next link is frictionless.
+      rememberServerUrl(serverUrl);
+      return;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // App lifecycle
 // ---------------------------------------------------------------------------
 
@@ -2368,11 +2731,48 @@ const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
   app.quit();
 } else {
-  app.on("second-instance", () => {
-    const win = activeWindow();
-    if (win) {
-      if (win.isMinimized()) win.restore();
-      win.focus();
+  // Cold-start argv scan. Windows/Linux: the OS launches the app with the
+  // omnigent:// URL as a command-line arg. macOS packaged builds get URLs via
+  // `open-url` (Apple Events), never argv — but in DEV the generic Electron.app
+  // bundle that `setAsDefaultProtocolClient` registers can't be reliably
+  // targeted by `open` (it launches a fresh Electron window instead of the
+  // running `electron .` instance), so we scan argv on ALL platforms to let
+  // `npm start -- 'omnigent://...'` exercise the real code path on macOS too.
+  // Safe: a packaged macOS launch has no omnigent:// in argv, so no double-handling.
+  for (const arg of process.argv) {
+    if (typeof arg === "string" && arg.startsWith("omnigent://")) enqueueDeepLink(arg);
+  }
+
+  // macOS: `open-url` fires for omnigent:// links, including BEFORE
+  // app.whenReady (cold start). preventDefault stops the OS from also handing
+  // the URL to the default browser; enqueueDeepLink queues it and
+  // drainPendingDeepLinks no-ops until ready, so the pre-ready race can't
+  // touch windows that don't exist yet.
+  app.on("open-url", (event, url) => {
+    event.preventDefault();
+    enqueueDeepLink(url);
+  });
+
+  app.on("second-instance", (_event, argv) => {
+    // Deep-link warm start: the OS launched a second instance with the
+    // omnigent:// URL on its command line; the single-instance lock funnels
+    // it here. On Windows/Linux that's the OS dispatch; on macOS it's how a
+    // second `npm start -- 'omnigent://...'` reaches the running DEV instance
+    // (since `open` can't target the dev binary — see the cold-start argv
+    // scan above). A plain second launch (no URL) just focuses an existing window.
+    let handledUrl = false;
+    for (const arg of argv) {
+      if (typeof arg === "string" && arg.startsWith("omnigent://")) {
+        enqueueDeepLink(arg);
+        handledUrl = true;
+      }
+    }
+    if (!handledUrl) {
+      const win = activeWindow();
+      if (win) {
+        if (win.isMinimized()) win.restore();
+        win.focus();
+      }
     }
   });
 
@@ -2402,11 +2802,33 @@ if (!gotLock) {
     // instant (primes the in-memory cache in resolvedCliPath); also lets the
     // setup page / Local CLI settings pre-fill the resolved path immediately.
     resolvedCliPath();
-    createWindow();
+    // Register the omnigent:// scheme so OS clicks route to this app. The
+    // build manifest (package.json `build.protocols`) is the reliable
+    // per-install registration that survives reinstalls; this lets dev
+    // (`electron .`) clicks route to the running dev instance too. No-op
+    // (returns false) when another app is already the default handler.
+    app.setAsDefaultProtocolClient("omnigent");
+    // If a deep link arrived before ready (macOS open-url, or Windows/Linux
+    // argv), open it instead of the default launch window; the drain's
+    // fallback opens a default window if a consent is cancelled. Otherwise
+    // open the saved server (or setup page) as before.
+    if (pendingDeepLinks.length > 0) {
+      drainPendingDeepLinks();
+    } else {
+      createWindow();
+    }
 
     app.on("activate", () => {
-      // macOS: re-create the window when the dock icon is clicked and none open.
-      if (BrowserWindow.getAllWindows().length === 0) createWindow();
+      // macOS: re-create the window when the dock icon is clicked and none
+      // open. Skip while a deep link is being handled (or queued) — it opens
+      // its own window, and racing a default window here would double-open at
+      // cold start (whenReady skipped its own createWindow for the pending link).
+      if (
+        BrowserWindow.getAllWindows().length === 0 &&
+        !deepLinkInFlight &&
+        pendingDeepLinks.length === 0
+      )
+        createWindow();
     });
   });
 

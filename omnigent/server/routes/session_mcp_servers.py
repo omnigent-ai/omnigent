@@ -245,7 +245,9 @@ def create_session_mcp_servers_router(
                 )
 
         new_location = bundle_location(agent.id, new_bundle)
-        if new_location != agent.bundle_location:
+        # Sha-segment compare: legacy rows keep an ``ag_``-prefixed left
+        # segment (physical artifact key); only the sha encodes content.
+        if new_location.rsplit("/", 1)[-1] != agent.bundle_location.rsplit("/", 1)[-1]:
             artifact_store.put(new_location, new_bundle)
             updated = agent_store.update(agent.id, new_location)
             if updated is None:

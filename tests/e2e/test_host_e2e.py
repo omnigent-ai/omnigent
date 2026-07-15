@@ -92,7 +92,9 @@ def _spawn_host_daemon(
     """
     omni_dir = tmp_path / ".omnigent"
     omni_dir.mkdir(parents=True, exist_ok=True)
-    host_id = f"host_{uuid.uuid4().hex}"
+    # Bare 32-char hex — host_id is a Uuid16 column, and the API returns the
+    # bare form, so _wait_for_host_online's comparison must see the same.
+    host_id = uuid.uuid4().hex
     host_name = f"e2e-host-{uuid.uuid4().hex[:12]}"
     (omni_dir / "config.yaml").write_text(
         yaml.safe_dump(
@@ -682,7 +684,9 @@ def _spawn_host_daemon_for_mock_claude(
     """
     omni_dir = tmp_path / ".omnigent"
     omni_dir.mkdir(parents=True, exist_ok=True)
-    host_id = f"host_{uuid.uuid4().hex}"
+    # Bare 32-char hex — host_id is a Uuid16 column, and the API returns the
+    # bare form, so _wait_for_host_online's comparison must see the same.
+    host_id = uuid.uuid4().hex
     host_name = f"e2e-host-{uuid.uuid4().hex[:12]}"
     (omni_dir / "config.yaml").write_text(
         yaml.safe_dump(

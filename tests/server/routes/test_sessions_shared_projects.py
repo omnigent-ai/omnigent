@@ -67,9 +67,15 @@ def _seed_shared_project_session(db_uri: str) -> str:
     agent_store = SqlAlchemyAgentStore(db_uri)
     conv_store = SqlAlchemyConversationStore(db_uri)
     perms = SqlAlchemyPermissionStore(db_uri)
-    if agent_store.get("ag_test") is None:
-        agent_store.create(agent_id="ag_test", name="test-agent", bundle_location="ag_test/bundle")
-    conv = conv_store.create_conversation(title="Bob's session", agent_id="ag_test")
+    if agent_store.get("087b7cb7ac30abf4debfaa578d052ec6") is None:
+        agent_store.create(
+            agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+            name="test-agent",
+            bundle_location="087b7cb7ac30abf4debfaa578d052ec6/bundle",
+        )
+    conv = conv_store.create_conversation(
+        title="Bob's session", agent_id="087b7cb7ac30abf4debfaa578d052ec6"
+    )
     conv_store.set_labels(conv.id, {PROJECT_LABEL_KEY: "Bob Project"})
     for user in (ALICE, BOB):
         perms.ensure_user(user)

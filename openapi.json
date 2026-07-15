@@ -3902,6 +3902,17 @@
             "description": "The user_id of the session owner, or `None` when permissions are disabled. Included so the sidebar can display the owner without a separate API call.",
             "title": "Owner"
           },
+          "parent_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parent Session Id"
+          },
           "pending_elicitations_count": {
             "default": 0,
             "description": "Number of approval prompts currently waiting on this session. Powers the sidebar's \"needs attention\" badge so a user with several sessions running can tell which ones are blocked on them without opening each chat. Sourced from the Omnigent server's in-memory `omnigent.runtime.pending_elicitations` index, which mirrors every `response.elicitation_request` event passing through `session_stream` and decrements when a verdict is dispatched. `0` when the session has no outstanding elicitations.",

@@ -1,8 +1,12 @@
 # Omnigent Uninstaller Design
 
-Status: Proposed (ready for implementation)
+Status: Implemented in PR #2550
 Owner: Pat Sukprasert (@PattaraS)
 Related discussion: brainstormed and debated via Debby (claude + gpt partners)
+
+Implementation note: PR #2550 ships the OSS CLI/script implementation as one
+combined PR rather than the staged PR breakdown below. Checkboxes marked here
+reflect the current implementation and focused test coverage in that PR.
 
 This document specifies how Omnigent should be uninstalled. It is written to be
 handed to an implementer without further design decisions. Track delivery with
@@ -132,10 +136,10 @@ backfill may only write `unknown`), `confidence` (`none` whenever
 
 Checklist:
 
-- [ ] Schema documented and versioned (`schema_version = 1`)
-- [ ] Atomic writer (tmp + fsync + rename) with `0600` mode
-- [ ] Serializer / dataclass with round-trip unit tests
-- [ ] `omnigent _internal write-ledger --from-env` hidden subcommand
+- [x] Schema documented and versioned (`schema_version = 1`)
+- [x] Atomic writer (tmp + fsync + rename) with `0600` mode
+- [x] Serializer / dataclass with round-trip unit tests
+- [x] `omnigent _internal write-ledger --from-env` hidden subcommand
 
 ## 3. Install-side ledger writer
 
@@ -168,12 +172,12 @@ Upgrade / repair sync:
 
 Checklist:
 
-- [ ] `write_install_ledger` hooked into `scripts/install_oss.sh` (post
+- [x] `write_install_ledger` hooked into `scripts/install_oss.sh` (post
       side-effects, pre next-steps)
-- [ ] Records profiles, external config, wheel, deps, launch agents, state paths
-- [ ] Upgrade/repair merge logic (backfill superseded by installer; never
+- [x] Records profiles, external config, wheel, deps, launch agents, state paths
+- [x] Upgrade/repair merge logic (backfill superseded by installer; never
       downgrade `installed_by`)
-- [ ] Tests: fresh install, upgrade, backfill-superseded-by-installer
+- [x] Tests: fresh install, upgrade, backfill-superseded-by-installer
 
 ## 4. Back-fill routine
 
@@ -238,14 +242,14 @@ only with `--apply`.
 
 Checklist:
 
-- [ ] Fast reconstruction (<100ms, no package-manager subprocesses, in-process
+- [x] Fast reconstruction (<100ms, no package-manager subprocesses, in-process
       marker scan) on startup when missing
-- [ ] Deep reconstruction at uninstall / doctor
-- [ ] Anchor guard (refuse to fabricate without an install signal)
-- [ ] Per-field confidence assignment per table
-- [ ] Never-overwrite-real + `install_ledger.backfill.json` double-ledger handling
-- [ ] `omnigent doctor --migrate-ledger [--deep] [--apply]`
-- [ ] Read-only-except-the-ledger guarantee (tested)
+- [x] Deep reconstruction at uninstall / doctor
+- [x] Anchor guard (refuse to fabricate without an install signal)
+- [x] Per-field confidence assignment per table
+- [x] Never-overwrite-real + `install_ledger.backfill.json` double-ledger handling
+- [x] `omnigent doctor --migrate-ledger [--deep] [--apply]`
+- [x] Read-only-except-the-ledger guarantee (tested)
 
 ## 5. omnigent uninstall CLI
 
@@ -267,6 +271,9 @@ Flags:
   `--no-backup`.
 - `--dry-run` - print exact planned actions (paths, sizes, line ranges); make no
   changes.
+- With no destructive flag (`--yes`, `--purge`, `--force`,
+  `--modify-external-config`, `--no-backup`, `--assume-inferred`, or
+  `--purge-workspace`), uninstall defaults to dry-run preview mode.
 - `--yes` - non-interactive; suppresses prompts for auto-removable artifacts
   only. Does NOT imply `--purge`.
 - `--json` - machine-readable output.
@@ -287,10 +294,10 @@ Confidence (secondary, tighten-only): an `inferred`/low-confidence entry
 escalates one notch and won't auto-act under bare `--yes` - it can only add
 friction, never grant it.
 
-| Artifact | No flags (interactive) | `--yes` | Required gate |
+| Artifact | No destructive flags | `--yes` | Required gate |
 |---|---|---|---|
-| Wheel (`uv tool uninstall omnigent`) | prompt then remove | auto-remove | none |
-| Delimited PATH block (marker match) | prompt then remove | auto-remove | none; refuse if `block_sha256` mismatch (tampered) unless `--force` |
+| Wheel (`uv tool uninstall omnigent`) | dry-run preview | auto-remove | none |
+| Delimited PATH block (marker match) | dry-run preview | auto-remove | none; refuse if `block_sha256` mismatch (tampered) unless `--force` |
 | Injected external config, marker/observed | reported, skipped | reported, skipped | `--modify-external-config` |
 | Injected external config, inferred (no marker) | reported, skipped | reported, skipped | `--modify-external-config` AND `--assume-inferred` |
 | `~/.omnigent` state root | reported, skipped | removed only with `--purge` | `--purge` |
@@ -300,13 +307,13 @@ friction, never grant it.
 
 Checklist:
 
-- [ ] Python `omnigent uninstall` subcommand that execs the shell script
-- [ ] Targets: `cli`, `state`, `desktop-data`, `all`
-- [ ] Flags: `--purge`, `--purge-workspace`, `--dry-run`, `--yes`, `--json`,
+- [x] Python `omnigent uninstall` subcommand that execs the shell script
+- [x] Targets: `cli`, `state`, `desktop-data`, `all`
+- [x] Flags: `--purge`, `--purge-workspace`, `--dry-run`, `--yes`, `--json`,
       `--force`, `--modify-external-config`, `--no-backup`, `--assume-inferred`
-- [ ] Two-gate decision table implemented (intrinsic-risk + confidence
+- [x] Two-gate decision table implemented (intrinsic-risk + confidence
       tighten-only)
-- [ ] External-config stripping (marker/allowlist scoped only)
+- [x] External-config stripping (marker/allowlist scoped only)
 
 ## 6. Order of operations
 
@@ -341,14 +348,14 @@ execs the shell script for removal. Sequence:
 
 Checklist:
 
-- [ ] Process-shutdown protocol (pidfiles, SIGTERM->5s->`--force` SIGKILL,
+- [x] Process-shutdown protocol (pidfiles, SIGTERM->5s->`--force` SIGKILL,
       `omnigent:*` tmux, ledger LaunchAgents, abort-if-won't-stop)
-- [ ] Profile block removal across all shells incl. fish; profile backed up
+- [x] Profile block removal across all shells incl. fish; profile backed up
       first; tamper-refusal
-- [ ] `--purge` archives OUTSIDE the target (`.tar.zst`, gzip fallback; fail
+- [x] `--purge` archives OUTSIDE the target (`.tar.zst`, gzip fallback; fail
       closed if it can't write the backup), prints restore command, then
       deletes; `~/omnigent` gated behind `--purge-workspace` (or confirm)
-- [ ] `uv tool uninstall omnigent` runs last
+- [x] `uv tool uninstall omnigent` runs last
 
 ## 7. Idempotency and exit codes
 
@@ -388,10 +395,10 @@ Exit codes:
 
 Checklist:
 
-- [ ] State-check idempotency (already-absent = 0; tried-and-failed = nonzero +
+- [x] State-check idempotency (already-absent = 0; tried-and-failed = nonzero +
       continue + summarize)
-- [ ] Exit codes 0/1/2/3 as specified
-- [ ] `--json` output shape stable and tested
+- [x] Exit codes 0/1/2/3 as specified
+- [x] `--json` output shape stable and tested
 
 ## 8. Test matrix
 
@@ -416,28 +423,30 @@ Checklist:
 
 Checklist:
 
-- [ ] Rows 1-2, 6-7, 12, 14 covered by `uninstall_oss.sh` tests
-- [ ] Rows 3-5, 8-11, 13 covered by `omnigent uninstall` tests
+- [x] Rows 1-2, 6-7, 12, 14 covered by `uninstall_oss.sh` tests
+- [x] Rows 3-5, 8-11, 13 covered by focused CLI, ledger, and
+      `uninstall_oss.sh` tests
 
 ## 9. Delivery plan (PR breakdown)
 
-- [ ] PR 1 - Ledger schema + serializer. Schema, atomic-write + `0600` writer,
+- [x] PR 1 - Ledger schema + serializer. Schema, atomic-write + `0600` writer,
       `omnigent _internal write-ledger` hidden subcommand, round-trip unit
       tests. No behavior change.
-- [ ] PR 2 - Install-side writer. Hook `write_install_ledger` into
+- [x] PR 2 - Install-side writer. Hook `write_install_ledger` into
       `scripts/install_oss.sh` + upgrade/repair merge logic.
-- [ ] PR 3 - Back-fill routine. Fast + deep reconstruction, anchor guard,
+- [x] PR 3 - Back-fill routine. Fast + deep reconstruction, anchor guard,
       confidence assignment, never-overwrite-real + double-ledger,
       `doctor --migrate-ledger`.
-- [ ] PR 4 - `uninstall_oss.sh` core. Process shutdown, profile block removal
+- [x] PR 4 - `uninstall_oss.sh` core. Process shutdown, profile block removal
       (all shells), `uv tool uninstall`, idempotency + exit codes,
       `--dry-run`/`--json`.
-- [ ] PR 5 - `omnigent uninstall` subcommand + gates. Python front, targets/
+- [x] PR 5 - `omnigent uninstall` subcommand + gates. Python front, targets/
       flags, two-gate decision table, `--purge` backup-outside-target,
       external-config stripping.
-- [ ] PR 6 - Docs + discovery. Installer next-steps + `--help` mention
-      uninstall; app-store surfaces point back at `omnigent uninstall --purge`;
-      brew/apt detect-and-redirect note.
+- [x] PR 6 - Docs + discovery. Installer next-steps + `--help` mention
+      uninstall; README documents the standalone fallback and purge behavior.
+      App-store and brew/apt-specific surfaces remain out of scope for this OSS
+      CLI/script PR.
 
 ## Appendix A: ELI5
 
@@ -470,11 +479,12 @@ Omnigent is a houseguest.
   are ("coat on hook - definitely mine" vs "this drill - no idea who brought it,
   don't touch"). A reconstructed checklist never lets you auto-toss the risky
   stuff.
-- `--yes` = "don't keep asking, just do the safe moves." It grabs the coat and
-  box without nagging, but still stops to ask before erasing a roommate's
-  notebook or shredding your photos - no matter which checklist it is reading.
-  Risky actions are gated by what you are touching, not by which checklist you
-  have.
+- Bare uninstall = "show me what would happen first." Nothing changes until you
+  add a destructive flag such as `--yes` or `--purge`.
+- `--yes` = "apply the previewed safe moves." It grabs the coat, but it still
+  leaves the box unless you add `--purge`, and still will not erase a roommate's
+  notebook unless you add `--modify-external-config`. Risky actions are gated by
+  what you are touching, not by which checklist you have.
 
 ## Appendix B: Flowchart
 
@@ -515,16 +525,16 @@ Omnigent is a houseguest.
                               |
                               v
              =====================================
-             ||  1. STOP PROCESSES FIRST         ||
-             ||  pidfiles -> SIGTERM -> 5s ->     ||
-             ||  --force SIGKILL; kill omnigent:* ||
-             ||  tmux; unload ledger LaunchAgents ||
+             ||  1. PLAN/STOP PROCESSES FIRST    ||
+             ||  dry-run reports planned stops;   ||
+             ||  apply unloads LaunchAgents, then ||
+             ||  pidfiles/tmux -> SIGTERM/force   ||
              =================+===================
                              |  won't stop? --> ABORT destructive steps (exit 2)
                              v
              =====================================
              ||  2. --dry-run?  -- yes -> print   ||
-             ||  exact paths + sizes + ranges,    ||
+             ||  planned stops, paths, sizes,     ||
              ||  EXIT 0                            ||
              =================+===================
                              | no
@@ -559,8 +569,8 @@ Omnigent is a houseguest.
            |    scoped, ledger-recorded)                 |
            | 5. --purge? archive to backup tarball       |
            |    OUTSIDE target (~/.omnigent-backups/),  |
-           |    then delete state; separate confirm for |
-           |    ~/omnigent; note installation_id telem  |
+           |    then delete state; keep ~/omnigent       |
+           |    unless --purge-workspace or confirm      |
            | 6. uv tool uninstall omnigent  (LAST)       |
            +--------------------+----------------------+
                                 |
@@ -573,8 +583,9 @@ Omnigent is a houseguest.
              |  --json summary of what was done/kept |
              +--------------------------------------+
 
-   App-store surfaces (iOS / Android / Electron):
-   OS-native uninstall owns the bundle; point user back at
-   omnigent uninstall --purge for ~/.omnigent.  brew/apt:
-   detect-and-redirect to that package manager. No cross-domain reaper.
+   Other package surfaces:
+   OS/package-manager uninstall owns package files. The Omnigent
+   uninstaller handles local profile/state cleanup and uses
+   uv tool uninstall for uv-installed wheels; it does not remove
+   shared dependencies or act as a cross-domain reaper.
 ```

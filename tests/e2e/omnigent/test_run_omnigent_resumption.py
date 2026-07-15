@@ -80,6 +80,17 @@ def _make_nonce() -> str:
     return "nonce" + uuid.uuid4().hex[:12]
 
 
+def _row_id_to_hex(value: object) -> str:
+    """Render a conversation id read via raw sqlite3 as bare 32-char hex.
+
+    The ``id`` column is a Uuid16 (16-byte BLOB), so ``sqlite3`` hands it
+    back as ``bytes``; ``--resume`` expects the hex string form.
+    """
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return bytes(value).hex()
+    return str(value)
+
+
 def _argv_run_omnigent(
     *,
     omnigent_python: Path,
@@ -594,7 +605,7 @@ def test_run_omnigent_session_id_pins_the_specific_conversation(
         f"store. If >1, an unrelated test polluted the dir or the "
         f"HOME isolation broke."
     )
-    conv_a_id = rows[0][0]
+    conv_a_id = _row_id_to_hex(rows[0][0])
 
     # ── Run 2: plant nonce B, FRESH conversation (no
     # --continue / --session). A regression where -p mode
@@ -640,7 +651,7 @@ def test_run_omnigent_session_id_pins_the_specific_conversation(
         f"If 1, plant B threaded onto convA (the silent-resume "
         f"regression). If >2, leakage from another test."
     )
-    conv_b_id = rows[0][0]
+    conv_b_id = _row_id_to_hex(rows[0][0])
     assert conv_b_id != conv_a_id
 
     # ── Run 3: --resume convA_id must recover nonce A

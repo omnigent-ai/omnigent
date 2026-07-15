@@ -57,6 +57,7 @@ import { useTheme } from "next-themes";
 import { PageScroll } from "@/components/PageScroll";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Switch } from "@/components/ui/switch";
 import {
   Select,
   SelectContent,
@@ -79,6 +80,7 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import {
   type Conversation,
   useArchiveConversation,
+  useArchivedProjectNames,
   useConversations,
   useStopAndDeleteConversation,
 } from "@/hooks/useConversations";
@@ -125,6 +127,10 @@ import {
   type WorkspacePanelDefault,
 } from "@/lib/workspacePanelPreferences";
 import { readDefaultBaseBranch, writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
+import {
+  readHideUnconfiguredHarnesses,
+  writeHideUnconfiguredHarnesses,
+} from "@/lib/harnessVisibilityPreferences";
 import {
   applyThemePalette,
   isThemePalette,
@@ -625,6 +631,41 @@ function PaletteSwatchPreview({ swatch }: { swatch: PaletteSwatch }) {
   );
 }
 
+/**
+ * Opt-in filter for the new-chat harness picker: when on, harnesses that
+ * aren't set up on the selected host (missing CLI / auth) are hidden instead
+ * of badged. Off by default so the picker keeps surfacing harnesses to set up.
+ * Fails open — with no connected host or readiness info, nothing is hidden.
+ */
+function HideUnconfiguredHarnessesControl() {
+  const [value, setValue] = useState(() => readHideUnconfiguredHarnesses());
+  const labelId = useId();
+  const toggle = useCallback((next: boolean) => {
+    setValue(next);
+    writeHideUnconfiguredHarnesses(next);
+  }, []);
+  return (
+    <div className="flex items-start justify-between gap-6">
+      <div className="flex flex-col">
+        <span id={labelId} className="text-sm font-medium">
+          Hide unconfigured harnesses
+        </span>
+        <span className="text-sm text-muted-foreground">
+          Only show harnesses that are set up on the selected host in the new-chat picker. Harnesses
+          needing a CLI install or sign-in are hidden instead of badged.
+        </span>
+      </div>
+      <Switch
+        aria-labelledby={labelId}
+        checked={value}
+        onCheckedChange={toggle}
+        data-testid="hide-unconfigured-harnesses-toggle"
+        className="mt-0.5 shrink-0"
+      />
+    </div>
+  );
+}
+
 function AppearanceSection() {
   // Embedded: the host owns light/dark, so the Mode and Color theme pickers
   // would be no-ops — hide them and say so (matching ThemeModeMenu). Terminal
@@ -652,6 +693,8 @@ function AppearanceSection() {
         <TerminalThemeControl />
 
         <WorkspacePanelDefaultControl />
+
+        <HideUnconfiguredHarnessesControl />
 
         <UiFontSizeControl />
 
@@ -1382,30 +1425,147 @@ function AccountSection() {
   );
 }
 
+// Discriminated Select values so the "no filter" sentinel can never collide
+// with a real project name: the reset option is a fixed token that no project
+// value can equal, and every project is namespaced under a prefix so its name
+// carries through verbatim. A project literally named "all" (or "__all__")
+// therefore still filters correctly instead of clearing the filter.
+const ALL_PROJECTS_VALUE = "all";
+const PROJECT_VALUE_PREFIX = "project:";
+
+function projectToSelectValue(project: string | undefined): string {
+  return project === undefined ? ALL_PROJECTS_VALUE : PROJECT_VALUE_PREFIX + project;
+}
+
+function selectValueToProject(value: string): string | undefined {
+  if (value === ALL_PROJECTS_VALUE) return undefined;
+  return value.slice(PROJECT_VALUE_PREFIX.length);
+}
+
 function ArchivedSection() {
-  // includeArchived:true is the only way to load archived rows; the
-  // default sidebar query no longer surfaces them.
-  const query = useConversations("", true);
+  // `undefined` = all projects; a name scopes the list to that project.
+  const [project, setProject] = useState<string | undefined>(undefined);
+
+  // Picker options: every project that has an archived session. Sourced from a
+  // dedicated hook that pages through ALL archived sessions server-side —
+  // `useProjects()` omits all-archived projects, and deriving options from only
+  // the visible list's loaded first page would hide archived-only projects
+  // whose sessions sit on later pages.
+  const namesQuery = useArchivedProjectNames();
+  const projectNames = useMemo(() => namesQuery.data ?? [], [namesQuery.data]);
+
+  // A picked project can vanish from the option set for good (its last
+  // archived session deleted or restored, possibly by another client). Once
+  // the scan settles without it, fall back to "All projects" rather than
+  // pinning a defunct filter with a project-scoped empty state.
+  useEffect(() => {
+    if (
+      project !== undefined &&
+      namesQuery.isSuccess &&
+      !namesQuery.isFetching &&
+      !projectNames.includes(project)
+    ) {
+      setProject(undefined);
+    }
+  }, [project, projectNames, namesQuery.isSuccess, namesQuery.isFetching]);
+
+  // The visible list, filtered server-side via ?project= when one is picked.
+  const listQuery = useConversations("", true, undefined, project);
   const archived = useMemo(
-    () => (query.data?.pages ?? []).flatMap((p) => p.data).filter((c) => c.archived === true),
-    [query.data],
+    () => (listQuery.data?.pages ?? []).flatMap((p) => p.data).filter((c) => c.archived === true),
+    [listQuery.data],
   );
+
+  // Keep a picked project listed even if it drops out of the option set (its
+  // last archived session was just unarchived) so the trigger never shows a
+  // blank, orphaned value while the refetch settles.
+  const items =
+    project && !projectNames.includes(project) ? [project, ...projectNames] : projectNames;
 
   return (
     <Section
       title="Archived sessions"
       description="Sessions you've archived. Restore one to the sidebar, or delete it for good."
     >
-      {query.isLoading ? (
+      {items.length > 0 && (
+        <div className="mb-4 flex items-center gap-2">
+          <label htmlFor="archived-project-filter" className="text-sm text-muted-foreground">
+            Project
+          </label>
+          <Select
+            value={projectToSelectValue(project)}
+            onValueChange={(value) => setProject(selectValueToProject(value))}
+          >
+            <SelectTrigger
+              id="archived-project-filter"
+              aria-label="Filter archived sessions by project"
+              data-testid="archived-project-filter"
+              className="w-56"
+            >
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent position="popper" align="start">
+              <SelectItem value={ALL_PROJECTS_VALUE}>All projects</SelectItem>
+              {items.map((name) => (
+                <SelectItem
+                  key={name}
+                  value={projectToSelectValue(name)}
+                  data-testid={`archived-project-option-${name}`}
+                >
+                  {name}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+      )}
+
+      {listQuery.isLoading ? (
         <p className="text-sm text-muted-foreground">Loading…</p>
-      ) : archived.length === 0 ? (
-        <p className="text-sm text-muted-foreground">No archived sessions.</p>
+      ) : archived.length === 0 && !listQuery.hasNextPage ? (
+        // Definitive empty only when there are no archived rows AND no further
+        // pages to fetch.
+        <p className="text-sm text-muted-foreground">
+          {project ? "No archived sessions in this project." : "No archived sessions."}
+        </p>
       ) : (
-        <ul className="flex flex-col gap-0.5">
-          {archived.map((conv) => (
-            <ArchivedRow key={conv.id} conversation={conv} />
-          ))}
-        </ul>
+        <>
+          {archived.length > 0 && (
+            <ul className="flex flex-col gap-0.5">
+              {archived.map((conv) => (
+                <ArchivedRow key={conv.id} conversation={conv} />
+              ))}
+            </ul>
+          )}
+          {archived.length === 0 && (
+            // The list fetches a mixed page (active + archived rows) and filters
+            // to archived client-side; archived sessions are older and can sort
+            // onto later pages, so a page with none isn't the end. Offer to page
+            // forward instead of dead-ending on the definitive empty state.
+            <p className="text-sm text-muted-foreground">
+              {project
+                ? "No archived sessions in this project on this page."
+                : "No archived sessions on this page."}
+            </p>
+          )}
+          {/* Keep the pager visible whenever more pages exist, independent of the
+              current page's archived count — otherwise a first page of only
+              active rows would hide the archived rows on later pages. */}
+          {listQuery.hasNextPage && (
+            <div className="mt-3">
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                data-testid="archived-load-more"
+                disabled={listQuery.isFetchingNextPage}
+                onClick={() => void listQuery.fetchNextPage()}
+              >
+                {listQuery.isFetchingNextPage ? "Loading…" : "Load more"}
+              </Button>
+            </div>
+          )}
+        </>
       )}
     </Section>
   );

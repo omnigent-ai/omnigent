@@ -606,66 +606,71 @@ def make_managed_session_maker(
 
 # ── ID generation ──────────────────────────────────────
 
-_ITEM_TYPE_PREFIX: dict[str, str] = {
-    "message": "msg_",
-    "function_call": "fc_",
-    "function_call_output": "fco_",
-    "error": "err_",
-    "reasoning": "rs_",
-    "compaction": "cmp_",
-    "native_tool": "nt_",
-    "resource_event": "rse_",
-    "slash_command": "sc_",
-    "terminal_command": "tc_",
-    "routing_decision": "rd_",
-}
+# Recognised conversation-item types, validated at id generation. The item's
+# type lives in the ``conversation_items.type`` column, not in its id. Kept in
+# parity with ``ITEM_TYPE_TO_DATA_CLS`` (see the db util tests).
+_ITEM_TYPES: frozenset[str] = frozenset(
+    {
+        "message",
+        "function_call",
+        "function_call_output",
+        "error",
+        "reasoning",
+        "compaction",
+        "native_tool",
+        "resource_event",
+        "slash_command",
+        "terminal_command",
+        "routing_decision",
+    }
+)
 
 
 def generate_agent_id() -> str:
     """
     Generate a unique agent identifier.
 
-    :returns: A string of the form ``"ag_<32-char hex>"``,
-        e.g. ``"ag_0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c"``.
+    :returns: A bare 32-char hex uuid,
+        e.g. ``"0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c"``.
     """
-    return f"ag_{uuid.uuid4().hex}"
+    return uuid.uuid4().hex
 
 
 def builtin_agent_id(name: str) -> str:
     """
     Deterministic agent id for a built-in agent, derived from its name.
 
-    Same shape and length as :func:`generate_agent_id` (``ag_`` + 32 hex), but
+    Same shape and length as :func:`generate_agent_id` (bare 32-char hex), but
     stable across processes: a multi-tenant deployment reseeds the built-ins into
     an ephemeral per-pod store, where a random id would change each boot and
     dangle a persisted ``conversation.agent_id``. Do NOT revert built-in seeding
     to :func:`generate_agent_id` (guarded by the ``builtin_agent_id`` tests).
 
     :param name: The built-in agent's unique name, e.g. ``"polly"``.
-    :returns: A deterministic id of the form ``"ag_<32-char hex>"``.
+    :returns: A deterministic bare 32-char hex id.
     """
     digest = hashlib.sha256(f"builtin:{name}".encode()).hexdigest()
-    return f"ag_{digest[:32]}"
+    return digest[:32]
 
 
 def generate_file_id() -> str:
     """
     Generate a unique file identifier.
 
-    :returns: A string of the form ``"file_<32-char hex>"``,
-        e.g. ``"file_a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"``.
+    :returns: A bare 32-char hex uuid,
+        e.g. ``"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"``.
     """
-    return f"file_{uuid.uuid4().hex}"
+    return uuid.uuid4().hex
 
 
 def generate_conversation_id() -> str:
     """
     Generate a unique conversation identifier.
 
-    :returns: A string of the form ``"conv_<32-char hex>"``,
-        e.g. ``"conv_e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9"``.
+    :returns: A bare 32-char hex uuid,
+        e.g. ``"e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9"``.
     """
-    return f"conv_{uuid.uuid4().hex}"
+    return uuid.uuid4().hex
 
 
 def generate_task_id() -> str:
@@ -682,25 +687,16 @@ def generate_item_id(item_type: str) -> str:
     """
     Generate a unique conversation-item identifier.
 
-    The prefix is determined by the item type:
+    *item_type* is validated against :data:`_ITEM_TYPES` but no longer encoded
+    into the id — the type lives in the ``conversation_items.type`` column.
 
-    - ``"message"`` -> ``"msg_"``
-    - ``"function_call"`` -> ``"fc_"``
-    - ``"function_call_output"`` -> ``"fco_"``
-    - ``"error"`` -> ``"err_"``
-    - ``"reasoning"`` -> ``"rs_"``
-    - ``"compaction"`` -> ``"cmp_"``
-    - ``"native_tool"`` -> ``"nt_"``
-    - ``"slash_command"`` -> ``"sc_"``
-
-    :param item_type: One of the keys in :data:`_ITEM_TYPE_PREFIX`.
-    :returns: A prefixed identifier, e.g. ``"msg_a1b2c3d4..."``.
+    :param item_type: One of the members of :data:`_ITEM_TYPES`.
+    :returns: A bare 32-char hex uuid, e.g. ``"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"``.
     :raises ValueError: If *item_type* is not a recognised type.
     """
-    prefix = _ITEM_TYPE_PREFIX.get(item_type)
-    if prefix is None:
+    if item_type not in _ITEM_TYPES:
         raise ValueError(f"unknown item type: {item_type!r}")
-    return f"{prefix}{uuid.uuid4().hex}"
+    return uuid.uuid4().hex
 
 
 # ── FTS (SQLite FTS5) ─────────────────────────────────

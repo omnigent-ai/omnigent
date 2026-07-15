@@ -18,6 +18,7 @@ import {
   ArchiveRestoreIcon,
   CheckIcon,
   CheckIcon as CheckMarkIcon,
+  ChevronLeftIcon,
   ChevronRightIcon,
   CircleStopIcon,
   FolderIcon,
@@ -81,6 +82,7 @@ import {
   ContextMenuSubTrigger,
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
+import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -122,6 +124,7 @@ import { useCommentInbox } from "@/hooks/useCommentInbox";
 import { sumPendingApprovals } from "@/lib/inbox";
 import { isSessionStoppable } from "@/lib/sessionStop";
 import { isOwnerLevel } from "@/lib/permissionsApi";
+import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { getSessionState, type SessionState } from "@/hooks/useSessionState";
 import {
   isConversationUnseen,
@@ -130,6 +133,7 @@ import {
   useUnseenTick,
 } from "@/hooks/useUnseenConversations";
 import { cn } from "@/lib/utils";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { useSessionSwitchHotkey } from "@/hooks/useSessionSwitchHotkey";
 import { usePinnedSessionHotkeys } from "@/hooks/usePinnedSessionHotkeys";
@@ -551,7 +555,10 @@ export function Sidebar({ open, onClose, dragProgress = null }: SidebarProps) {
             <Button
               asChild
               className={cn(
-                "w-full justify-start gap-2 text-sm",
+                // px-2 + gap-1 puts the icon on the sidebar's left (red) column
+                // and the label on the label (blue) column — matching section
+                // headers and project folders.
+                "w-full justify-start gap-1 px-2 text-sm",
                 isNewChatPage && "bg-muted font-semibold",
               )}
               variant="ghost"
@@ -582,6 +589,7 @@ export function Sidebar({ open, onClose, dragProgress = null }: SidebarProps) {
                 onExit={exitSelectionMode}
               />
             ) : (
+<<<<<<< HEAD
               <>
                 <div className="relative mt-3 flex items-center gap-1.5">
                   <div className="relative flex-1">
@@ -647,6 +655,45 @@ export function Sidebar({ open, onClose, dragProgress = null }: SidebarProps) {
                   </div>
                 )}
               </>
+=======
+              <div className="relative mt-3 flex items-center gap-1.5">
+                {/* "Search" opens the command palette (⌘K), which searches both
+                    session titles and chat content. It replaces the old inline
+                    filter box — the palette is the single search surface now.
+                    The `group` scope reveals the ⌘K badge on hover/focus. */}
+                <button
+                  type="button"
+                  onClick={() => onOpenSearch?.()}
+                  aria-label="Search"
+                  data-testid="sidebar-search-button"
+                  className="group relative flex min-h-8 flex-1 items-center rounded-full border border-input pr-2 pl-7 text-left text-sm text-muted-foreground transition hover:bg-muted focus-visible:outline-1"
+                >
+                  <SearchIcon className="-translate-y-1/2 pointer-events-none absolute top-1/2 left-2 size-3.5" />
+                  <span className="flex-1 truncate">Search</span>
+                  {/* ⌘K hint — hidden until the button is hovered / focused,
+                      mirroring the sidebar's other hover-revealed affordances. */}
+                  <kbd className="ml-2 hidden shrink-0 items-center rounded-md border border-border bg-muted px-1.5 py-0.5 font-sans text-[10px] font-medium text-muted-foreground transition-opacity group-hover:inline-flex group-focus-visible:inline-flex">
+                    {MOD_KEY}K
+                  </kbd>
+                </button>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-sm"
+                      aria-label="Select sessions"
+                      data-testid="toggle-selection-mode"
+                      className="shrink-0 rounded-full"
+                      onClick={() => setSelectionMode(true)}
+                    >
+                      <ListChecksIcon className="size-3.5" />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent side="bottom">Select sessions</TooltipContent>
+                </Tooltip>
+              </div>
+>>>>>>> origin/main
             )}
           </div>
 
@@ -789,7 +836,7 @@ function InfiniteScrollSentinel({
       }}
       className={cn(
         "flex w-full cursor-pointer items-center justify-center gap-1.5 rounded-md px-2 py-1.5 text-muted-foreground text-xs hover:bg-muted disabled:pointer-events-none disabled:opacity-50",
-        indent && "pl-7",
+        indent && "pl-5",
       )}
     >
       {isFetching ? (
@@ -912,7 +959,7 @@ function ProjectFolder({
         headerAction={<ProjectFolderActions projectName={name} onNavigate={onRowClick} />}
         footer={
           loadingFirstPage ? (
-            <p className="px-2 py-1 pl-7 text-muted-foreground text-xs">Loading…</p>
+            <p className="px-2 py-1 pl-5 text-muted-foreground text-xs">Loading…</p>
           ) : (
             <InfiniteScrollSentinel
               hasMore={query.hasNextPage}
@@ -1790,16 +1837,35 @@ function SectionHeader({
         onClick={onToggleCollapsed}
         className="group flex w-full items-center gap-1 rounded-md px-2 py-1 text-left text-sm text-muted-foreground transition-colors hover:text-foreground"
       >
-        {icon}
+        {icon ? (
+          // Headers with a leading icon (project folders) swap the folder for a
+          // chevron on desktop hover/focus, so the caret takes the icon's place
+          // rather than trailing the name. Mobile (no hover) keeps the folder
+          // icon and shows the trailing chevron below.
+          <span className="relative flex size-4 shrink-0 items-center justify-center">
+            <span className="flex md:transition-opacity md:group-hover:opacity-0 md:group-focus-visible:opacity-0">
+              {icon}
+            </span>
+            <ChevronRightIcon
+              className={cn(
+                "absolute size-3.5 opacity-0 transition-[transform,opacity]",
+                !collapsed && "rotate-90",
+                "hidden md:flex md:group-hover:opacity-100 md:group-focus-visible:opacity-100",
+              )}
+            />
+          </span>
+        ) : null}
         <span className="min-w-0 truncate">{title}</span>
-        {/* Chevron sits right after the section name, rotating on expand.
-            Desktop: revealed only on hover/focus of the header; mobile (no
-            hover): always visible. */}
+        {/* Trailing chevron, rotating on expand. Headers without a leading icon
+            reveal it on desktop hover/focus; icon headers show it only on mobile
+            (no hover) since desktop swaps the folder for the chevron above. */}
         <ChevronRightIcon
           className={cn(
             "size-3.5 shrink-0 transition-[transform,opacity]",
             !collapsed && "rotate-90",
-            "md:opacity-0 md:group-hover:opacity-100 md:group-focus-visible:opacity-100",
+            icon
+              ? "md:hidden"
+              : "md:opacity-0 md:group-hover:opacity-100 md:group-focus-visible:opacity-100",
           )}
         />
         {/* A hidden row inside this collapsed section carries a marker — surface
@@ -1947,12 +2013,11 @@ function ConversationSection({
         <>
           {conversations.length === 0 && emptyMessage ? (
             // Expanded but empty (e.g. a project with no loaded chats).
-            <p className={cn("px-2 py-1 text-muted-foreground text-xs", indentRows && "pl-7")}>
+            <p className={cn("px-2 py-1 text-muted-foreground text-xs", indentRows && "pl-5")}>
               {emptyMessage}
             </p>
           ) : (
-            // Indent project chats so the row text (rows add their own px-4)
-            // lines up with the project-folder name above.
+            // Indent project chats a step under the project-folder name above.
             <ul className={cn("flex flex-col gap-0.5", indentRows && "pl-3")}>
               {conversations.map((conv) => (
                 <ConversationRow
@@ -2092,6 +2157,77 @@ function ConversationMenuItems({
   setMenuOpen: (open: boolean) => void;
   runArchive: () => void;
 }) {
+  // Mobile lacks the horizontal room for a side-opening submenu, so the
+  // project picker replaces the menu body in place instead of flying out
+  // to the side. `view` swaps between the main actions and that sub-view;
+  // desktop always renders the native side-flyout submenu regardless.
+  const isMobile = useIsMobileViewport();
+  const [view, setView] = useState<"main" | "projects">("main");
+
+  // The project pick / create / remove flow — shared verbatim by the desktop
+  // side-flyout submenu and the mobile in-place sub-view so both behave
+  // identically (same moveToProject.mutate, confirmation, and menu close).
+  const handleProjectSelect = (project: string) => {
+    setMenuOpen(false);
+    // Moving to another project is harmless — apply it now, and expand that
+    // (possibly new) project so the session is visible in it rather than
+    // hidden in a collapsed folder.
+    if (project !== "") {
+      moveToProject.mutate({ id: conversation.id, project });
+      onProjectAssigned?.(project);
+      return;
+    }
+    // Removing: only confirm when this is the project's LAST session (removing
+    // it would delete the implicit project). Otherwise remove silently. The
+    // check is server-side so it's accurate regardless of the loaded window.
+    void (async () => {
+      let isLastSession = true;
+      if (currentProject) {
+        try {
+          const ids = await fetchProjectSessionIds(currentProject);
+          isLastSession = ids.every((id) => id === conversation.id);
+        } catch {
+          // If the check fails, fall back to confirming.
+          isLastSession = true;
+        }
+      }
+      if (isLastSession) {
+        setRemoveProjectOpen(true);
+      } else {
+        moveToProject.mutate({ id: conversation.id, project: "" });
+      }
+    })();
+  };
+
+  // Mobile project sub-view: replaces the entire menu body in place (the
+  // "Back" row flips `view` without closing the menu or navigating). Reachable
+  // only via the mobile project item below, which sits behind the same
+  // `canEdit && isOwner` gate.
+  if (isMobile && view === "projects") {
+    return (
+      <>
+        <C.Item
+          data-testid="project-picker-back"
+          className="whitespace-nowrap"
+          // Keep the menu open — just flip back to the main actions.
+          onSelect={(e) => {
+            e.preventDefault();
+            setView("main");
+          }}
+        >
+          <ChevronLeftIcon className="size-3.5" />
+          Back
+        </C.Item>
+        <C.Separator />
+        <ProjectPickerMenu
+          components={C}
+          currentProject={currentProject}
+          onSelect={handleProjectSelect}
+        />
+      </>
+    );
+  }
+
   return (
     <>
       {/* Pin/Unpin — mobile-only (md:hidden); desktop uses the
@@ -2191,56 +2327,42 @@ function ConversationMenuItems({
       )}
       {/* Projects are a My-sessions-only tool, so filing is owner-only — a
           shared session (even editable) shows no project affordance. */}
-      {canEdit && isOwner && (
-        <C.Sub>
-          <C.SubTrigger data-testid="move-to-project" className="whitespace-nowrap">
+      {canEdit &&
+        isOwner &&
+        (isMobile ? (
+          // Mobile: no room for a side flyout, so this item swaps the menu
+          // body to the project picker in place (see the `view === "projects"`
+          // branch above). `preventDefault` keeps the menu open on select.
+          <C.Item
+            data-testid="move-to-project"
+            className="whitespace-nowrap"
+            onSelect={(e) => {
+              e.preventDefault();
+              setView("projects");
+            }}
+          >
             <FolderInputIcon className="size-3.5" />
             {/* "Add to project" until the session is filed, then "Move
                 session" to switch or remove it. */}
             {currentProject ? "Move session" : "Add to project"}
-          </C.SubTrigger>
-          <C.SubContent className="w-56 p-1 [&_[role=menuitem]]:text-xs">
-            {/* A native submenu flyout — no separate popover layer, so no
-                open/dismiss race with the parent menu. */}
-            <ProjectPickerMenu
-              components={C}
-              currentProject={currentProject}
-              onSelect={(project) => {
-                setMenuOpen(false);
-                // Moving to another project is harmless — apply it now,
-                // and expand that (possibly new) project so the session
-                // is visible in it rather than hidden in a collapsed folder.
-                if (project !== "") {
-                  moveToProject.mutate({ id: conversation.id, project });
-                  onProjectAssigned?.(project);
-                  return;
-                }
-                // Removing: only confirm when this is the project's LAST
-                // session (removing it would delete the implicit project).
-                // Otherwise remove silently. The check is server-side so
-                // it's accurate regardless of the loaded window / pins.
-                void (async () => {
-                  let isLastSession = true;
-                  if (currentProject) {
-                    try {
-                      const ids = await fetchProjectSessionIds(currentProject);
-                      isLastSession = ids.every((id) => id === conversation.id);
-                    } catch {
-                      // If the check fails, fall back to confirming.
-                      isLastSession = true;
-                    }
-                  }
-                  if (isLastSession) {
-                    setRemoveProjectOpen(true);
-                  } else {
-                    moveToProject.mutate({ id: conversation.id, project: "" });
-                  }
-                })();
-              }}
-            />
-          </C.SubContent>
-        </C.Sub>
-      )}
+          </C.Item>
+        ) : (
+          <C.Sub>
+            <C.SubTrigger data-testid="move-to-project" className="whitespace-nowrap">
+              <FolderInputIcon className="size-3.5" />
+              {currentProject ? "Move session" : "Add to project"}
+            </C.SubTrigger>
+            <C.SubContent className="w-56 p-1 [&_[role=menuitem]]:text-xs">
+              {/* A native submenu flyout — no separate popover layer, so no
+                  open/dismiss race with the parent menu. */}
+              <ProjectPickerMenu
+                components={C}
+                currentProject={currentProject}
+                onSelect={handleProjectSelect}
+              />
+            </C.SubContent>
+          </C.Sub>
+        ))}
       {/* Stop / Archive / Delete are grouped at the bottom, below a
           divider: lifecycle-ending actions separated from the everyday
           ones above. */}
@@ -2372,6 +2494,10 @@ function ConversationRow({
   const activeRootId = useActiveRootSessionId(activeId ?? null);
   const isActive = (activeRootId ?? activeId) === conversation.id;
   const navigate = useNavigate();
+  // Mobile has no real hover, so a tap that navigates would also trip the
+  // project flyout's HoverCard and leave it lingering over the chat. Gate the
+  // flyout off below the `md` breakpoint (see `projectFlyoutName`).
+  const isMobile = useIsMobileViewport();
   // Track the *live* active conversation id. Delete is fire-and-forget,
   // so the user can navigate to another conversation before the mutation
   // resolves — the onSuccess redirect must key off where they are now,
@@ -2447,6 +2573,15 @@ function ConversationRow({
   // The session's current project (reserved label), or null when unfiled —
   // drives the kebab submenu label ("Add to project" vs "Change project").
   const currentProject = conversation.labels?.[PROJECT_LABEL_KEY] ?? null;
+  // Pinned sessions are lifted OUT of their project folder into the flat
+  // "Pinned" section, so the row no longer shows which project it belongs to.
+  // For those rows only, surface the project in a hover flyout. Non-pinned
+  // rows already sit inside their project folder, so they don't need it.
+  // Disabled on mobile: there's no hover, so a tap would open the HoverCard
+  // and leave it overlaying the chat after navigation. Forcing null there
+  // routes the row through the plain ContextMenu/link path and restores the
+  // native `title` tooltip.
+  const projectFlyoutName = !isMobile && isPinned ? currentProject : null;
 
   const label = conversationDisplayLabel(conversation);
   // Recompute unseen state the moment the last-seen map changes (e.g. the
@@ -2657,7 +2792,7 @@ function ConversationRow({
     <Link
       to={selectionMode ? "#" : `/c/${conversation.id}`}
       className={cn(
-        "relative flex w-full flex-col gap-0.5 rounded-md px-4 py-2 text-left text-sm hover:bg-muted",
+        "relative flex w-full flex-col gap-0.5 rounded-md px-2 py-2 text-left text-sm hover:bg-muted",
         !selectionMode && (sessionState?.kind === "awaiting" ? "pr-48 md:pr-29" : "pr-28 md:pr-16"),
         selectionMode && "pr-10",
         isActive && "bg-muted",
@@ -2683,7 +2818,9 @@ function ConversationRow({
         e.preventDefault();
         setIsEditing(true);
       }}
-      title={conversation.title ?? conversation.id}
+      // The rich project flyout replaces the native tooltip on pinned,
+      // project-owned rows so the two don't stack; other rows keep it.
+      title={projectFlyoutName ? undefined : (conversation.title ?? conversation.id)}
     >
       {/* Row 1: the session name. Status markers (working, needs-approval,
           unseen) render in the trailing time-marker slot below, replacing
@@ -2738,9 +2875,42 @@ function ConversationRow({
           Suppressed in selection mode (bulk-select owns the row), where the
           bare link is rendered instead. ContextMenuTrigger preventDefaults the
           native contextmenu event, so right-click never navigates; asChild
-          merges its handler onto the Link, preserving left-click / double-click. */}
+          merges its handler onto the Link, preserving left-click / double-click.
+          Pinned, project-owned rows nest a HoverCardTrigger around the Link so
+          hovering surfaces the project flyout — the trigger sits innermost so
+          both the context menu and the hover card keep their handlers/refs on
+          the Link. */}
       {selectionMode ? (
-        rowLink
+        projectFlyoutName ? (
+          <HoverCard openDelay={150} closeDelay={0}>
+            <HoverCardTrigger asChild>{rowLink}</HoverCardTrigger>
+            <PinnedProjectFlyoutContent
+              title={conversation.title ?? conversation.id}
+              projectName={projectFlyoutName}
+            />
+          </HoverCard>
+        ) : (
+          rowLink
+        )
+      ) : projectFlyoutName ? (
+        <HoverCard openDelay={150} closeDelay={0}>
+          <ContextMenu>
+            <ContextMenuTrigger asChild>
+              <HoverCardTrigger asChild>{rowLink}</HoverCardTrigger>
+            </ContextMenuTrigger>
+            <ContextMenuContent className="min-w-44 [&_[role=menuitem]]:text-xs">
+              <ConversationMenuItems
+                components={contextBundle}
+                setMenuOpen={() => {}}
+                {...menuItemProps}
+              />
+            </ContextMenuContent>
+          </ContextMenu>
+          <PinnedProjectFlyoutContent
+            title={conversation.title ?? conversation.id}
+            projectName={projectFlyoutName}
+          />
+        </HoverCard>
       ) : (
         <ContextMenu>
           <ContextMenuTrigger asChild>{rowLink}</ContextMenuTrigger>
@@ -3117,6 +3287,42 @@ function LabelPopover({
 }
 
 /**
+ * Hover flyout body for a pinned, project-owned conversation row.
+ *
+ * Pinning lifts a session out of its project folder into the flat "Pinned"
+ * section, dropping the visual project cue the folder provided. Hovering the
+ * row surfaces it again: the session title, then a folder icon + project name.
+ * Mirrors {@link AgentHoverCard}'s Cursor-style placement (right / top-aligned)
+ * and the muted, small-icon foreground used elsewhere in the sidebar.
+ */
+function PinnedProjectFlyoutContent({
+  title,
+  projectName,
+}: {
+  title: string;
+  projectName: string;
+}) {
+  return (
+    <HoverCardContent
+      side="right"
+      align="start"
+      sideOffset={8}
+      className="w-64"
+      data-testid="pinned-project-flyout"
+    >
+      {/* Titles have no length cap (server + rename input are unbounded), so
+          clamp to 3 wrapped lines to keep the card tidy — full text stays in
+          the DOM. */}
+      <p className="line-clamp-3 font-medium text-sm">{title}</p>
+      <p className="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground">
+        <FolderIcon className="size-3.5 shrink-0" />
+        <span className="truncate">{projectName}</span>
+      </p>
+    </HoverCardContent>
+  );
+}
+
+/**
  * Status row shown in place of a conversation while its delete is in
  * flight (`isError === false`) or after it failed (`isError === true`).
  * Keeps the user un-blocked: the delete dialog closes immediately and
@@ -3480,6 +3686,10 @@ function ConversationEditRow({ initialTitle, onCommit, onCancel }: ConversationE
   // checks this so we don't double-fire onCommit with the unedited
   // value when the input loses focus as part of unmounting.
   const cancelledRef = useRef(false);
+  // Tracks an active IME composition (e.g. Japanese conversion) so the Enter
+  // that confirms a candidate doesn't commit the rename. Mirrors the chat
+  // composer guard (#132/#243).
+  const isComposingRef = useRef(false);
 
   useEffect(() => {
     inputRef.current?.focus();
@@ -3487,6 +3697,7 @@ function ConversationEditRow({ initialTitle, onCommit, onCancel }: ConversationE
   }, []);
 
   function handleKeyDown(e: KeyboardEvent<HTMLInputElement>) {
+    if (isImeCompositionKeyEvent(e, isComposingRef.current)) return;
     if (e.key === "Enter") {
       e.preventDefault();
       onCommit(value);
@@ -3505,14 +3716,20 @@ function ConversationEditRow({ initialTitle, onCommit, onCancel }: ConversationE
   }
 
   return (
-    // pl-3 + the input's px-1 line the text up with the row's px-4 title;
+    // pl-1 + the input's px-1 line the text up with the row's px-2 title;
     // py-1 around the size-7 buttons matches the 36px single-line row height.
-    <div className="flex items-center gap-1 rounded-md bg-muted py-1 pr-1 pl-3">
+    <div className="flex items-center gap-1 rounded-md bg-muted py-1 pr-1 pl-1">
       <input
         ref={inputRef}
         type="text"
         value={value}
         onChange={(e) => setValue(e.target.value)}
+        onCompositionStart={() => {
+          isComposingRef.current = true;
+        }}
+        onCompositionEnd={() => {
+          isComposingRef.current = false;
+        }}
         onKeyDown={handleKeyDown}
         onBlur={handleBlur}
         data-testid="rename-conversation-input"

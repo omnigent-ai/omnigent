@@ -84,10 +84,16 @@ def test_template_agent_kind_stored_and_read(db_engine: Engine) -> None:
                 "INSERT INTO agents (id, created_at, name, bundle_location, version, kind)"
                 " VALUES (:id, :ts, :name, :loc, 1, 1)"
             ),
-            {"id": "ag_tmpl", "ts": 1700000001, "name": "my-template", "loc": "ag_tmpl/bundle"},
+            {
+                "id": "23803e78ca1677e73a1d8c6275de4150",
+                "ts": 1700000001,
+                "name": "my-template",
+                "loc": "23803e78ca1677e73a1d8c6275de4150/bundle",
+            },
         )
         kind = conn.execute(
-            sa.text("SELECT kind FROM agents WHERE id = :id"), {"id": "ag_tmpl"}
+            sa.text("SELECT kind FROM agents WHERE id = :id"),
+            {"id": "23803e78ca1677e73a1d8c6275de4150"},
         ).scalar_one()
     assert kind == 1
 
@@ -101,10 +107,16 @@ def test_session_agent_kind_stored_and_read(db_engine: Engine) -> None:
                 "INSERT INTO agents (id, created_at, name, bundle_location, version, kind)"
                 " VALUES (:id, :ts, :name, :loc, 1, 2)"
             ),
-            {"id": "ag_sess", "ts": 1700000001, "name": "my-session", "loc": "ag_sess/bundle"},
+            {
+                "id": "372d0296768feff7262c605c5553d1da",
+                "ts": 1700000001,
+                "name": "my-session",
+                "loc": "372d0296768feff7262c605c5553d1da/bundle",
+            },
         )
         kind = conn.execute(
-            sa.text("SELECT kind FROM agents WHERE id = :id"), {"id": "ag_sess"}
+            sa.text("SELECT kind FROM agents WHERE id = :id"),
+            {"id": "372d0296768feff7262c605c5553d1da"},
         ).scalar_one()
     assert kind == 2
 
@@ -118,7 +130,12 @@ def test_agents_session_id_fk_accepts_existing_session(db_engine: Engine) -> Non
                 "INSERT INTO agents (id, created_at, name, bundle_location, version, kind)"
                 " VALUES (:id, :ts, :name, :loc, 1, 2)"
             ),
-            {"id": "ag_bound", "ts": 1700000001, "name": "bound-agent", "loc": "ag_bound/bundle"},
+            {
+                "id": "552f255351da28d9c68a67cc9758840d",
+                "ts": 1700000001,
+                "name": "bound-agent",
+                "loc": "552f255351da28d9c68a67cc9758840d/bundle",
+            },
         )
         # The agent binding lives on agent_configuration, paired 1:1 with
         # the conversations row.
@@ -128,20 +145,23 @@ def test_agents_session_id_fk_accepts_existing_session(db_engine: Engine) -> Non
                 " (id, created_at, updated_at, root_conversation_id)"
                 " VALUES (:id, :ts, :ts, :id)"
             ),
-            {"id": "conv_bound", "ts": 1700000002},
+            {"id": "e6c4a1ce71909cfba7d30a314c5f94ee", "ts": 1700000002},
         )
         conn.execute(
             sa.text(
                 "INSERT INTO agent_configuration (conversation_id, agent_id)"
                 " VALUES (:id, :agent_id)"
             ),
-            {"id": "conv_bound", "agent_id": "ag_bound"},
+            {
+                "id": "e6c4a1ce71909cfba7d30a314c5f94ee",
+                "agent_id": "552f255351da28d9c68a67cc9758840d",
+            },
         )
         stored = conn.execute(
             sa.text("SELECT agent_id FROM agent_configuration WHERE conversation_id = :id"),
-            {"id": "conv_bound"},
+            {"id": "e6c4a1ce71909cfba7d30a314c5f94ee"},
         ).scalar_one()
-    assert stored == "ag_bound"
+    assert stored == "552f255351da28d9c68a67cc9758840d"
 
 
 def test_agents_session_id_fk_rejects_missing_session(db_engine: Engine) -> None:
@@ -157,21 +177,29 @@ def test_agents_session_id_fk_rejects_missing_session(db_engine: Engine) -> None
                 " (id, created_at, updated_at, root_conversation_id)"
                 " VALUES (:id, :ts, :ts, :id)"
             ),
-            {"id": "conv_missing", "ts": 1700000002},
+            {"id": "5eca720dc2bc6cdc3a99028d7bd0f917", "ts": 1700000002},
         )
         conn.execute(
             sa.text(
                 "INSERT INTO agent_configuration (conversation_id, agent_id)"
                 " VALUES (:id, :agent_id)"
             ),
-            {"id": "conv_missing", "agent_id": "ag_nonexistent"},
+            {
+                "id": "5eca720dc2bc6cdc3a99028d7bd0f917",
+                "agent_id": "5ff5b2e31fe10beb80134394037b17b0",
+            },
         )
     # Clean up
     with db_engine.begin() as conn:
         conn.execute(
-            sa.text("DELETE FROM agent_configuration WHERE conversation_id = 'conv_missing'")
+            sa.text(
+                "DELETE FROM agent_configuration "
+                "WHERE conversation_id = '5eca720dc2bc6cdc3a99028d7bd0f917'"
+            )
         )
-        conn.execute(sa.text("DELETE FROM conversations WHERE id = 'conv_missing'"))
+        conn.execute(
+            sa.text("DELETE FROM conversations WHERE id = '5eca720dc2bc6cdc3a99028d7bd0f917'")
+        )
 
 
 def test_agents_allow_duplicate_template_names_at_db_layer(
@@ -191,11 +219,11 @@ def test_agents_allow_duplicate_template_names_at_db_layer(
                 "        (:id2, :ts, 'dup-template', :loc2, 1, 1)"
             ),
             {
-                "id1": "ag_dup1",
-                "id2": "ag_dup2",
+                "id1": "ef9a08aaf68eccf43b76051e6d818c5e",
+                "id2": "5cdc35664c8c12c1fe200de768af454b",
                 "ts": 1700000001,
-                "loc1": "ag_dup1/bundle",
-                "loc2": "ag_dup2/bundle",
+                "loc1": "ef9a08aaf68eccf43b76051e6d818c5e/bundle",
+                "loc2": "5cdc35664c8c12c1fe200de768af454b/bundle",
             },
         )
         count = conn.execute(
@@ -217,11 +245,11 @@ def test_agents_session_id_allows_duplicate_names_for_distinct_sessions(
                 "        (:id2, :ts, 'shared-name', :loc2, 1, 2)"
             ),
             {
-                "id1": "ag_s1",
-                "id2": "ag_s2",
+                "id1": "122d503fe436c3e819c4e481fc9e959b",
+                "id2": "2db4293f4feb844664bb1f50af9508a7",
                 "ts": 1700000001,
-                "loc1": "ag_s1/bundle",
-                "loc2": "ag_s2/bundle",
+                "loc1": "122d503fe436c3e819c4e481fc9e959b/bundle",
+                "loc2": "2db4293f4feb844664bb1f50af9508a7/bundle",
             },
         )
         count = conn.execute(
@@ -256,8 +284,10 @@ def test_upgrade_does_not_cascade_delete_conversations(tmp_path: Path) -> None:
         conn.execute(
             sa.text(
                 "INSERT INTO agents (id, created_at, name, bundle_location, version)"
-                " VALUES ('ag_tmpl', 1, 'my-template', 'ag_tmpl/b', 1),"
-                "        ('ag_sess', 2, 'my-session', 'ag_sess/b', 1)"
+                " VALUES ('23803e78ca1677e73a1d8c6275de4150', 1, 'my-template',"
+                " '23803e78ca1677e73a1d8c6275de4150/b', 1),"
+                "        ('372d0296768feff7262c605c5553d1da', 2, 'my-session',"
+                " '372d0296768feff7262c605c5553d1da/b', 1)"
             )
         )
         conn.execute(
@@ -266,10 +296,17 @@ def test_upgrade_does_not_cascade_delete_conversations(tmp_path: Path) -> None:
                 # SMALLINT migration (q1), so conversations.kind is still a string.
                 "INSERT INTO conversations"
                 " (id, created_at, updated_at, root_conversation_id, kind, agent_id)"
-                " VALUES ('conv_1', 3, 3, 'conv_1', 'default', 'ag_sess')"
+                " VALUES ('8e32600337d08f59ad381caf96a90659', 3, 3,"
+                " '8e32600337d08f59ad381caf96a90659', 'default',"
+                " '372d0296768feff7262c605c5553d1da')"
             )
         )
-        conn.execute(sa.text("UPDATE agents SET session_id = 'conv_1' WHERE id = 'ag_sess'"))
+        conn.execute(
+            sa.text(
+                "UPDATE agents SET session_id = '8e32600337d08f59ad381caf96a90659'"
+                " WHERE id = '372d0296768feff7262c605c5553d1da'"
+            )
+        )
 
     # Run our migration.
     config2 = _build_alembic_config(uri)
@@ -283,9 +320,11 @@ def test_upgrade_does_not_cascade_delete_conversations(tmp_path: Path) -> None:
             row[0]: row[1] for row in conn.execute(sa.text("SELECT id, kind FROM agents"))
         }
 
-    assert "conv_1" in conv_ids, "Upgrade must not cascade-delete bound conversations"
-    assert agent_kinds.get("ag_sess") == "session"
-    assert agent_kinds.get("ag_tmpl") == "template"
+    assert "8e32600337d08f59ad381caf96a90659" in conv_ids, (
+        "Upgrade must not cascade-delete bound conversations"
+    )
+    assert agent_kinds.get("372d0296768feff7262c605c5553d1da") == "session"
+    assert agent_kinds.get("23803e78ca1677e73a1d8c6275de4150") == "template"
 
     raw_engine.dispose()
     clear_engine_cache()
@@ -320,15 +359,18 @@ def test_agents_session_id_downgrade_round_trip(tmp_path: Path) -> None:
             sa.text(
                 "INSERT INTO agents"
                 " (workspace_id, id, created_at, name, bundle_location, version, kind)"
-                " VALUES (0, 'ag_tmpl', 1, 'my-template', 'ag_tmpl/b', 1, 1),"
-                "        (0, 'ag_sess', 2, 'my-session', 'ag_sess/b', 1, 2)"
+                " VALUES (0, '23803e78ca1677e73a1d8c6275de4150', 1,"
+                " 'my-template', '23803e78ca1677e73a1d8c6275de4150/b', 1, 1),"
+                "        (0, '372d0296768feff7262c605c5553d1da', 2,"
+                " 'my-session', '372d0296768feff7262c605c5553d1da/b', 1, 2)"
             )
         )
         conn.execute(
             sa.text(
                 "INSERT INTO conversations"
                 " (workspace_id, id, created_at, updated_at, root_conversation_id, title)"
-                " VALUES (0, 'conv_1', 3, 3, 'conv_1', '')"
+                " VALUES (0, '8e32600337d08f59ad381caf96a90659', 3, 3,"
+                " '8e32600337d08f59ad381caf96a90659', '')"
             )
         )
         # agent_id lives on agent_configuration at head; the bb2c3d4e5f6a
@@ -337,7 +379,8 @@ def test_agents_session_id_downgrade_round_trip(tmp_path: Path) -> None:
         conn.execute(
             sa.text(
                 "INSERT INTO agent_configuration (workspace_id, conversation_id, agent_id)"
-                " VALUES (0, 'conv_1', 'ag_sess')"
+                " VALUES (0, '8e32600337d08f59ad381caf96a90659',"
+                " '372d0296768feff7262c605c5553d1da')"
             )
         )
         # kind lives on omnigent_conversation_metadata at head; insert a
@@ -347,7 +390,7 @@ def test_agents_session_id_downgrade_round_trip(tmp_path: Path) -> None:
             sa.text(
                 "INSERT INTO omnigent_conversation_metadata"
                 " (workspace_id, id, kind)"
-                " VALUES (0, 'conv_1', 1)"
+                " VALUES (0, '8e32600337d08f59ad381caf96a90659', 1)"
             )
         )
 
@@ -369,8 +412,8 @@ def test_agents_session_id_downgrade_round_trip(tmp_path: Path) -> None:
             row[0]: row[1]
             for row in conn.execute(sa.text("SELECT id, session_id FROM agents ORDER BY id"))
         }
-    assert rows["ag_tmpl"] is None
-    assert rows["ag_sess"] == "conv_1"
+    assert rows["23803e78ca1677e73a1d8c6275de4150"] is None
+    assert rows["372d0296768feff7262c605c5553d1da"] == "8e32600337d08f59ad381caf96a90659"
 
     raw_engine.dispose()
     clear_engine_cache()

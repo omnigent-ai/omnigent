@@ -2219,6 +2219,7 @@ class SessionListItem(BaseModel):
     viewer_last_seen: int | None = None
     viewer_unread: bool = False
     search_snippet: str | None = None
+    parent_session_id: str | None = None
 
 
 class SessionList(BaseModel):

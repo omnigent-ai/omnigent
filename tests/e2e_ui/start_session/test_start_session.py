@@ -2194,3 +2194,145 @@ async def _drive_fork_of_fork_dedup(base_url: str, session_id: str) -> None:
             await expect(page.get_by_role("menuitem")).to_have_count(3)
         finally:
             await browser.close()
+
+
+def test_start_session_project_prefill(seeded_session: tuple[str, str]) -> None:
+    """The project pencil prefills the composer from the project's newest session.
+
+    Clicking a project folder's "new session" pencil must (a) seed the host,
+    agent, and source repo — resolved back to the main work tree when that
+    session ran in a linked worktree — from the project's newest session,
+    beating the host's recent-workspace default, (b) auto-generate a fresh
+    worktree branch, and (c) send it all on ``POST /v1/sessions``.
+    """
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_project_prefill(base_url, session_id))
+
+
+async def _drive_project_prefill(base_url: str, session_id: str) -> None:
+    project = "E2E Prefill"
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_bodies: list[dict[str, Any]] = []
+            await _register_common_routes(
+                page, created_session_id=session_id, create_bodies=create_bodies
+            )
+
+            async def handle_projects(route: Route) -> None:
+                # One project so exactly one folder (and pencil) renders.
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps([project]),
+                )
+
+            async def handle_worktrees(route: Route) -> None:
+                # The repo's worktree set: querying from the linked worktree
+                # resolves the ``is_main`` source repo, and the seeded repo's
+                # own listing proves git-ness for the branch auto-generation.
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps(
+                        {
+                            "object": "list",
+                            "data": [
+                                {
+                                    "path": "/work/repo",
+                                    "branch": "main",
+                                    "is_main": True,
+                                    "detached": False,
+                                },
+                                {
+                                    "path": "/work/repo-worktrees/feature-x",
+                                    "branch": "feature/x",
+                                    "is_main": False,
+                                    "detached": False,
+                                },
+                            ],
+                        }
+                    ),
+                )
+
+            async def handle_newest_session(route: Route) -> None:
+                # The prefill's newest-session lookup (``GET /v1/sessions``
+                # with ``?project=``): a session that ran in a linked worktree
+                # of /work/repo on the stubbed host. Everything else falls
+                # back to the common sessions handler.
+                if route.request.method == "GET" and "project=" in route.request.url:
+                    await route.fulfill(
+                        status=200,
+                        content_type="application/json",
+                        body=json.dumps(
+                            {
+                                "data": [
+                                    {
+                                        "id": "conv_prefill_seed",
+                                        "object": "conversation",
+                                        "title": "Previous project session",
+                                        "created_at": 0,
+                                        "updated_at": 9,
+                                        "labels": {"omni_project": project},
+                                        "host_id": _HOST_ID,
+                                        "workspace": "/work/repo-worktrees/feature-x",
+                                        "git_branch": "feature/x",
+                                        "agent_id": "ag_claude_e2e",
+                                    }
+                                ],
+                                "first_id": "conv_prefill_seed",
+                                "last_id": "conv_prefill_seed",
+                                "has_more": False,
+                            }
+                        ),
+                    )
+                else:
+                    await route.fallback()
+
+            # Registered after the common routes so they win for their URLs.
+            await page.route("**/v1/sessions/projects*", handle_projects)
+            await page.route(_WORKTREES_RE, handle_worktrees)
+            await page.route(_SESSIONS_RE, handle_newest_session)
+
+            # A recent workspace that would win under the generic seeding
+            # rules — the project prefill must replace it.
+            await page.add_init_script(
+                f"""window.localStorage.setItem(
+                    "omnigent:recent-workspaces",
+                    JSON.stringify({{ {_HOST_ID}: ["/work/other"] }})
+                );"""
+            )
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+
+            # The pencil is hover-revealed on the project folder's header.
+            header = page.get_by_role("button", name=project, exact=True)
+            await header.hover()
+            await page.get_by_test_id("project-new-session").click()
+
+            # Chips prefill from the newest session: the source repo (not the
+            # worktree dir, not the recent) and a fresh generated branch.
+            await expect(page.get_by_test_id("new-chat-landing-workspace-chip")).to_contain_text(
+                "repo"
+            )
+            await expect(page.get_by_test_id("new-chat-landing-branch-chip")).to_contain_text(
+                re.compile(r"worktree-[0-9a-f]{8}")
+            )
+
+            await page.get_by_test_id("new-chat-landing-input").fill("continue the project")
+            await page.get_by_test_id("new-chat-landing-submit").click()
+
+            await _wait_until(lambda: len(create_bodies) == 1)
+            body = create_bodies[0]
+            assert body["host_id"] == _HOST_ID, body
+            assert body["workspace"] == "/work/repo", body
+            assert body["agent_id"] == "ag_claude_e2e", body
+            git = body.get("git") or {}
+            assert re.fullmatch(r"worktree-[0-9a-f]{8}", git.get("branch_name", "")), body
+            assert git.get("base_branch") is None, body
+        finally:
+            await browser.close()

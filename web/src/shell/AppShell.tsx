@@ -281,7 +281,7 @@ export function AppShell() {
   });
 
   const debugMode = useDebugMode();
-  const { data: conversationsData } = useConversations();
+  const { data: conversationsData } = useConversations("", true);
   // Surface sessions needing attention as OS notifications + a dock badge.
   // Mounted here (inside the Router) so it can navigate on click and knows
   // the active conversation id, which suppresses the notification/badge for

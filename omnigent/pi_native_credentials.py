@@ -100,14 +100,18 @@ _DATABRICKS_AI_GATEWAY_LABEL = "ai-gateway"
 def _is_databricks_ai_gateway_url(base_url: str) -> bool:
     """Return ``True`` only for a genuine Databricks AI Gateway base URL.
 
-    Hardens the old substring scan over the whole base_url (scheme+host+path),
-    which look-alikes such as ``https://databricks-ai-gateway.evil.test/...``,
-    ``https://x.cloud.databricks.com.evil.test/...`` or
-    ``https://evil.test/databricks/ai-gateway/v1`` all defeated — leaking the
-    workspace bearer token to an attacker-controlled host. We parse the URL and
-    validate the *hostname* (not the raw string): require an ``https`` scheme, a
-    resolvable hostname carrying the ``ai-gateway`` DNS label, and a hostname
-    that ends with a trusted Databricks-owned parent domain suffix.
+    Two URL shapes are accepted:
+
+    1. **Dedicated AI Gateway subdomain** — ``ai-gateway`` is a full DNS label
+       in the hostname (e.g. ``<id>.ai-gateway.cloud.databricks.com``). Used by
+       the standard ``isaac configure codex`` setup.
+    2. **Workspace-hosted gateway** — the hostname is a plain Databricks
+       workspace (ends with a trusted suffix) and the path starts with
+       ``/ai-gateway/`` (e.g. ``<workspace>.cloud.databricks.com/ai-gateway/...``).
+       Used by ucode / Codex app profile setups.
+
+    Both cases require ``https`` and a hostname ending with a trusted
+    Databricks-owned domain suffix to prevent token-forwarding attacks.
 
     :param base_url: The codex provider table's ``base_url``.
     :returns: ``True`` iff the URL is an https Databricks AI Gateway endpoint.
@@ -119,12 +123,16 @@ def _is_databricks_ai_gateway_url(base_url: str) -> bool:
     if not hostname:
         return False
     hostname = hostname.lower()
-    # ``ai-gateway`` must be a full DNS label, not a substring of one (so
-    # ``databricks-ai-gateway.evil.test`` does not qualify on the label alone).
-    labels = hostname.split(".")
-    if _DATABRICKS_AI_GATEWAY_LABEL not in labels:
+    trusted = any(hostname.endswith(suffix) for suffix in _DATABRICKS_TRUSTED_HOST_SUFFIXES)
+    if not trusted:
         return False
-    return any(hostname.endswith(suffix) for suffix in _DATABRICKS_TRUSTED_HOST_SUFFIXES)
+    # Shape 1: ``ai-gateway`` is a full DNS label in the hostname.
+    labels = hostname.split(".")
+    if _DATABRICKS_AI_GATEWAY_LABEL in labels:
+        return True
+    # Shape 2: workspace hostname + /ai-gateway/ path prefix.
+    path = parsed.path or ""
+    return path.startswith("/ai-gateway/")
 
 
 @dataclass(frozen=True)
@@ -164,7 +172,15 @@ class PiProviderConfig:
             # Include all known models, ensuring the selected model is present.
             # The selected model may be a newer id not yet in the static list.
             models: list[dict[str, Any]] = list(self.extra_models)
-            if not any(m.get("id") == self.model for m in models):
+            # Only append to this (Anthropic) provider when the model is absent
+            # from ALL providers. Non-Claude models (GLM, GPT…) live in
+            # additional_providers (openai-completions); appending them here
+            # too would register them under the wrong wire protocol.
+            in_additional = any(
+                any(m.get("id") == self.model for m in prov.get("models", []))
+                for prov in self.additional_providers.values()
+            )
+            if not any(m.get("id") == self.model for m in models) and not in_additional:
                 models.append({"id": self.model, "input": ["text", "image"]})
         else:
             models = [{"id": self.model}]
@@ -428,9 +444,26 @@ def _cli_config_databricks_transport(entry: ProviderEntry) -> CodexConfigTranspo
 
     transport = codex_config_provider_transport(_codex_config_path(), entry.model_provider)
     if transport is None:
+        # The model_provider may live in a sibling config file (e.g. config1.toml
+        # used by ucode / Codex app profile switching). Scan other config*.toml
+        # files in ~/.codex/ for the matching model_provider table.
+        codex_dir = _codex_config_path().parent
+        for alt_config in sorted(codex_dir.glob("config*.toml")):
+            if alt_config == _codex_config_path():
+                continue
+            transport = codex_config_provider_transport(alt_config, entry.model_provider)
+            if transport is not None:
+                _LOGGER.info(
+                    "pi-native: cli-config provider %r (model_provider %r) found in %s",
+                    entry.name,
+                    entry.model_provider,
+                    alt_config.name,
+                )
+                break
+    if transport is None:
         _LOGGER.info(
             "pi-native: cli-config provider %r (model_provider %r) has no resolvable "
-            "[model_providers.%s] base_url in ~/.codex/config.toml; Pi will use its own login.",
+            "[model_providers.%s] base_url in ~/.codex/config*.toml; Pi will use its own login.",
             entry.name,
             entry.model_provider,
             entry.model_provider,
@@ -451,13 +484,32 @@ def _cli_config_databricks_transport(entry: ProviderEntry) -> CodexConfigTranspo
         )
         return None
     if not transport.auth_command:
-        _LOGGER.info(
-            "pi-native: Databricks cli-config provider %r carries no [model_providers.%s.auth] "
-            "token command; Pi will use its own login.",
-            entry.name,
-            entry.model_provider,
-        )
-        return None
+        # No explicit auth command (e.g. ucode config using ambient SDK auth).
+        # Try to build a !command using the SDK, same as the databricks-kind path.
+        try:
+            from omnigent.inner.codex_executor import _databricks_codex_auth_command
+            from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
+
+            ws = resolve_databricks_workspace(None)
+            auth_cmd = _databricks_codex_auth_command(ws.host, None)
+            transport = CodexConfigTransport(
+                base_url=transport.base_url,
+                auth_command=auth_cmd,
+            )
+            _LOGGER.info(
+                "pi-native: cli-config provider %r has no auth command; "
+                "using SDK-derived auth for %s",
+                entry.name,
+                ws.host,
+            )
+        except Exception:  # noqa: BLE001
+            _LOGGER.info(
+                "pi-native: Databricks cli-config provider %r (model_provider %r) "
+                "has no auth command and SDK auth is unavailable; Pi will use its own login.",
+                entry.name,
+                entry.model_provider,
+            )
+            return None
     return transport
 
 
@@ -516,16 +568,28 @@ def _cli_config_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
     # access on workspaces where access is controlled via the auth command.
     claude_models: list[dict[str, Any]] = []
     openai_models: list[dict[str, Any]] = []
-    real_workspace_url: str | None = None
-    try:
-        from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
+    # Derive the workspace URL for the serving-endpoints API call.
+    # For dedicated-subdomain URLs (ai-gateway.cloud.databricks.com), the
+    # real workspace hostname must come from ~/.databrickscfg. For
+    # workspace-hosted gateway URLs (workspace.cloud.databricks.com/ai-gateway/),
+    # the transport's own hostname IS the workspace.
+    parsed_gateway = urlparse(transport.base_url)
+    gateway_labels = (parsed_gateway.hostname or "").split(".")
+    if _DATABRICKS_AI_GATEWAY_LABEL in gateway_labels:
+        # Dedicated subdomain: derive workspace from ~/.databrickscfg DEFAULT.
+        real_workspace_url: str | None = None
+        try:
+            from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
 
-        real_workspace_url = resolve_databricks_workspace(None).host
-    except Exception:  # noqa: BLE001 — no .databrickscfg → skip listing
-        _LOGGER.info(
-            "pi-native: cli-config path could not resolve workspace URL "
-            "for model listing; Pi will show only the selected model"
-        )
+            real_workspace_url = resolve_databricks_workspace(None).host
+        except Exception:  # noqa: BLE001 — no .databrickscfg → skip listing
+            _LOGGER.info(
+                "pi-native: cli-config path could not resolve workspace URL "
+                "for model listing; Pi will show only the selected model"
+            )
+    else:
+        # Workspace-hosted gateway: the transport hostname is the workspace.
+        real_workspace_url = f"https://{parsed_gateway.hostname}"
     if real_workspace_url and transport.auth_command:
         token = _run_auth_command(transport.auth_command)
         if token:
@@ -745,5 +809,14 @@ def pi_native_provider_launch(
     """
     write_pi_models_config(agent_dir, provider)
     env = {PI_CODING_AGENT_DIR_ENV_VAR: str(agent_dir)}
-    args = ["--provider", provider.provider_id, "--model", provider.model]
+    # Resolve which provider the selected model lives in. Non-Claude models
+    # (GLM, GPT, Llama…) are in additional_providers (omnigent-openai);
+    # Claude models are in the primary provider (omnigent). Pass the correct
+    # --provider so Pi can resolve the model id.
+    model_provider_id = provider.provider_id
+    for extra_id, extra_cfg in provider.additional_providers.items():
+        if any(m.get("id") == provider.model for m in extra_cfg.get("models", [])):
+            model_provider_id = extra_id
+            break
+    args = ["--provider", model_provider_id, "--model", provider.model]
     return env, args

@@ -32,6 +32,7 @@ import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import type { Conversation } from "@/hooks/useConversations";
 import { setOmnigentHostConfig } from "@/lib/host";
+import { writeHideUnconfiguredHarnesses } from "@/lib/harnessVisibilityPreferences";
 import { setPendingInitialPrompt } from "@/store/chatStore";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
@@ -42,7 +43,10 @@ vi.mock("@/lib/identity", async (importOriginal) => ({
   authenticatedFetch: vi.fn(),
 }));
 vi.mock("@/hooks/useHosts", () => ({ useHosts: vi.fn() }));
-vi.mock("@/hooks/useAvailableAgents", () => ({ useAvailableAgents: vi.fn() }));
+vi.mock("@/hooks/useAvailableAgents", () => ({
+  useAvailableAgents: vi.fn(),
+  prefetchAvailableAgentDetails: vi.fn(),
+}));
 vi.mock("@/hooks/useHostFilesystem", () => ({
   useHostFilesystem: vi.fn(),
   // WorkspacePicker (rendered by the file browser) reads this on mount;
@@ -64,6 +68,9 @@ vi.mock("@/hooks/RunnerHealthProvider", () => ({
 vi.mock("@/hooks/useConversations", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/hooks/useConversations")>()),
   useProjects: () => ({ data: [] }),
+  // "No newest session" keeps the project prefill inert so the generic
+  // host/workspace defaults under test still apply on ?project= visits.
+  useNewestProjectSession: () => ({ data: null, isError: false }),
 }));
 // The harness-label catalog is not under test here. Keep it synchronous so
 // create-session fetch assertions only observe the POST/PATCH calls they own.
@@ -807,6 +814,93 @@ describe("NewChatLandingScreen", () => {
     expect(cursor.compareDocumentPosition(pi) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(pi.compareDocumentPosition(kiro) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(kiro.compareDocumentPosition(polly) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  // The default agents are claude-native (a1) and codex-native (a2); the host
+  // below reports codex-native as unconfigured on this machine.
+  function mockHostWithHarnessReadiness() {
+    mockHosts([
+      {
+        ...host("online"),
+        configured_harnesses: { "claude-native": true, "codex-native": false },
+      } as Host,
+    ]);
+  }
+
+  it("shows unconfigured harnesses by default (opt-in preference off)", () => {
+    // With the preference untouched the picker keeps listing harnesses that
+    // aren't set up on the host — they're badged, not hidden — so users can
+    // still discover and configure them.
+    mockHostWithHarnessReadiness();
+    renderLanding();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    expect(screen.getByTestId("new-chat-landing-agent-a1")).toBeTruthy();
+    expect(screen.getByTestId("new-chat-landing-agent-a2")).toBeTruthy();
+  });
+
+  it("hides harnesses unconfigured on the selected host when the preference is on", () => {
+    // Preference on → codex-native (reported unconfigured on host_1) drops out
+    // of the picker while claude-native (configured) stays.
+    writeHideUnconfiguredHarnesses(true);
+    mockHostWithHarnessReadiness();
+    renderLanding();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    expect(screen.getByTestId("new-chat-landing-agent-a1")).toBeTruthy();
+    expect(screen.queryByTestId("new-chat-landing-agent-a2")).toBeNull();
+  });
+
+  // Polly is a bundle agent whose brain harness (claude-sdk) is overridable, so
+  // its config submenu lists every brain harness — each badged when unconfigured.
+  function mockPollyWithBrainReadiness() {
+    mockHosts([
+      {
+        ...host("online"),
+        configured_harnesses: {
+          "claude-sdk": true,
+          codex: "binary-missing",
+          cursor: false,
+          pi: false,
+          antigravity: true,
+          copilot: false,
+        },
+      } as Host,
+    ]);
+    mockAgents([
+      {
+        id: "a_polly",
+        name: "polly",
+        display_name: "Polly",
+        description: null,
+        harness: "claude-sdk",
+        skills: [],
+      },
+    ]);
+  }
+
+  it("lists every brain harness in a bundle agent's override submenu by default", () => {
+    // Preference off → the brain override still offers unconfigured harnesses
+    // (badged), so they remain discoverable.
+    mockPollyWithBrainReadiness();
+    renderLanding();
+    openAgentConfig("a_polly");
+    expect(screen.getByTestId("new-chat-landing-harness-codex")).toBeTruthy();
+    expect(screen.getByTestId("new-chat-landing-harness-cursor")).toBeTruthy();
+    expect(screen.getByTestId("new-chat-landing-harness-copilot")).toBeTruthy();
+  });
+
+  it("hides unconfigured brain harnesses in the override submenu when the preference is on", () => {
+    // Preference on → only brains that can launch on the host remain, plus the
+    // selected default (claude-sdk) which always stays for radio coherence.
+    writeHideUnconfiguredHarnesses(true);
+    mockPollyWithBrainReadiness();
+    renderLanding();
+    openAgentConfig("a_polly");
+    expect(screen.getByTestId("new-chat-landing-harness-claude-sdk")).toBeTruthy();
+    expect(screen.getByTestId("new-chat-landing-harness-antigravity")).toBeTruthy();
+    expect(screen.queryByTestId("new-chat-landing-harness-codex")).toBeNull();
+    expect(screen.queryByTestId("new-chat-landing-harness-cursor")).toBeNull();
+    expect(screen.queryByTestId("new-chat-landing-harness-pi")).toBeNull();
+    expect(screen.queryByTestId("new-chat-landing-harness-copilot")).toBeNull();
   });
 
   it("seeds the working directory from the host's most-recent path", async () => {
