@@ -6682,6 +6682,41 @@
       }
     },
     "/v1/hosts/{host_id}": {
+      "delete": {
+        "description": "Delete a host row (owner only; offline hosts only).\n\nRemoves a host from the DB and the New Chat picker. The primary\nuse is pruning stale external host rows that never got cleaned\nup \u2014 e.g. a fleet of short-lived connect daemons (each a fresh\n`host_id`) that registered a durable row and then died, which\nnothing else deletes (no TTL, no reaper for external hosts).\n\nGuards, mirroring `get_host`: owner-scoped (403 for\nanother user's host), and refuses an ONLINE host (409) so a live\nmachine mid-session can't be deleted out from under it \u2014 the\ncaller should disconnect it first. Idempotent: a already-absent\nhost returns 204, so a best-effort cleanup client can DELETE\nwithout racing a check. `host_store.delete_host` nulls\n`conversations.host_id` for any bound sessions (the DB no\nlonger cascades this) and is itself a no-op on a missing row.\n\n**Returns:** 204 No Content.\n\n**Raises**\n\n- `HTTPException` \u2014 403 if the caller does not own the host, 409 if the host is currently online.",
+        "operationId": "delete_host_v1_hosts__host_id__delete",
+        "parameters": [
+          {
+            "description": "Host identifier, e.g. `\"host_a1b2c3d4...\"`.",
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Host",
+        "tags": [
+          "hosts"
+        ]
+      },
       "get": {
         "description": "Get details for a single host.\n\n**Returns:** Host details dict.\n\n**Raises**\n\n- `HTTPException` \u2014 404 if the host does not exist.",
         "operationId": "get_host_v1_hosts__host_id__get",

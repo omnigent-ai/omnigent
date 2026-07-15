@@ -1255,3 +1255,44 @@ async def test_runner_exited_invokes_callback_with_runner_and_error(
 
     # The callback got the exact runner id and error string off the frame.
     assert received == [("runner_x", "exited with code 1")]
+
+
+async def test_delete_offline_host_removes_it(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """DELETE prunes an offline host row; a stale picker entry disappears."""
+    app, registry, host_store, _cs = host_api_app
+    _comm = await _connect_host(app, registry)
+    # Mark offline in the DB (host_is_live -> False), the state a dead
+    # connect daemon would leave behind.
+    host_store.set_offline(_HOST_ID)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.delete(f"/v1/hosts/{_HOST_ID}")
+        assert resp.status_code == 204
+        # Gone from the store and the listing.
+        assert host_store.get_host(_HOST_ID) is None
+        listing = await client.get("/v1/hosts")
+        assert all(h["host_id"] != _HOST_ID for h in listing.json()["hosts"])
+
+
+async def test_delete_online_host_refused(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """DELETE refuses an ONLINE host (409) so a live machine is not pruned."""
+    app, registry, host_store, _cs = host_api_app
+    _comm = await _connect_host(app, registry)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.delete(f"/v1/hosts/{_HOST_ID}")
+    assert resp.status_code == 409
+    # Still present.
+    assert host_store.get_host(_HOST_ID) is not None
+
+
+async def test_delete_missing_host_is_idempotent(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """DELETE of an absent host returns 204 (best-effort cleanup, no race)."""
+    app, _reg, _hs, _cs = host_api_app
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.delete("/v1/hosts/host_never_existed_xyz")
+    assert resp.status_code == 204
