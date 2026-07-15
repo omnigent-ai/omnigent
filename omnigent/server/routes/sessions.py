@@ -10718,6 +10718,31 @@ async def _relay_runner_stream(
             session_id,
             exc_info=True,
         )
+        # A runner that dies AFTER the turn already settled to ``idle`` is
+        # benign, not a failure: the client already saw the turn complete.
+        # This is the norm for a headless one-shot ``omni run -p`` in a
+        # bwrap sandbox with ``--as-pid-1`` — when the CLI (PID 1) exits the
+        # kernel SIGKILLs the runner mid-tunnel, so this handler fires on
+        # every successful run. Overwriting the terminal ``idle`` with a
+        # spurious ``runner_disconnected`` mislabels a completed session as
+        # Failed. Only ``idle`` is suppressed: a close while the cache is
+        # ``running``/``waiting`` (mid-turn death) or unset (a setup-phase
+        # failure that never published a status — the #1114 case) is a REAL
+        # failure and must still surface.
+        #
+        # Checked BEFORE the intentional-stop branch below: a session that
+        # already reached the terminal ``idle`` needs no further publish
+        # either way, and a user Stop lands here while the cache is
+        # ``running``/``waiting``, so that branch keeps its own case. The
+        # ``finally`` block discards the stop marker unconditionally, so
+        # returning early cannot strand it.
+        if _session_status_cache.get(session_id) == "idle":
+            _logger.info(
+                "Relay: runner transport lost after turn completed for "
+                "session=%s; treating as benign (session already idle).",
+                session_id,
+            )
+            return
         if session_id in _intentional_stop_sessions:
             # User clicked Stop: the Stop handler brought this runner's tunnel
             # down on purpose (see _stop_session_host_runner), so the drop is

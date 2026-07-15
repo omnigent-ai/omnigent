@@ -2339,6 +2339,16 @@ def create_app(
             len(affected),
         )
         for session_id in affected:
+            # A session that already settled to ``idle`` completed its turn
+            # (the client saw it finish); a subsequent runner teardown is
+            # benign, not a failure. This is the norm for a headless one-shot
+            # ``omni run -p`` in a bwrap sandbox with ``--as-pid-1``: the CLI
+            # (PID 1) exit SIGKILLs the runner, dropping its tunnel right after
+            # a successful turn. Flipping the terminal ``idle`` to ``failed``
+            # here mislabels a completed session. A disconnect while
+            # running/waiting is a real mid-turn death and still fails.
+            if _session_status_cache.get(session_id) == "idle":
+                continue
             _session_status_cache[session_id] = "failed"
             _publish_status(session_id, "failed")
 

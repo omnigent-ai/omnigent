@@ -474,6 +474,67 @@ async def test_relay_publishes_failed_status_on_tunnel_close() -> None:
         session_stream.close(session_id)
 
 
+async def test_relay_tunnel_close_after_idle_is_benign() -> None:
+    """
+    A tunnel close AFTER the session settled to ``idle`` must NOT publish a
+    spurious ``runner_disconnected`` failure.
+
+    This is the norm for a headless one-shot ``omni run -p`` in a bwrap
+    sandbox with ``--as-pid-1``: the turn completes (status → ``idle``), the
+    CLI (PID 1) exits, and the kernel SIGKILLs the runner mid-tunnel — so the
+    relay's transport-lost handler fires on every SUCCESSFUL run. It must
+    leave the terminal ``idle`` intact rather than overwrite it with a red
+    ``Failed`` pill. Contrast with
+    ``test_relay_publishes_failed_status_on_tunnel_close`` (unset/running
+    cache → real failure still surfaces, #1114).
+    """
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+
+    sessions_module._runner_relay_tasks.clear()
+    gate = asyncio.Event()
+    fake_runner = _TunnelCloseRunnerClient(gate)
+    session_id = "conv_tunnel_close_after_idle"
+
+    # Simulate the completed turn: the relay published ``idle`` from the
+    # runner's session.status event before the tunnel dropped.
+    sessions_module._publish_status(session_id, "idle")
+
+    collector = None
+    try:
+        handle = await sessions_module._ensure_runner_relay_ready(
+            session_id,
+            "runner_tunnel_close_after_idle",
+            fake_runner,  # type: ignore[arg-type]
+            conversation_store=None,
+        )
+        assert handle is not None
+
+        collector = await start_session_stream_collector(session_id)
+        gate.set()
+
+        # The relay returns benignly on the ConnectionError.
+        await asyncio.wait_for(handle.task, timeout=2.0)
+
+        # No failed status should arrive; the session stays idle.
+        with pytest.raises(asyncio.TimeoutError):
+            event = await asyncio.wait_for(collector.queue.get(), timeout=0.5)
+            raise AssertionError(f"unexpected event after benign close: {event}")
+        assert sessions_module._session_status_cache.get(session_id) == "idle"
+    finally:
+        gate.set()
+        if collector is not None:
+            await collector.stop()
+        handle = sessions_module._runner_relay_tasks.get(session_id)
+        if handle is not None and not handle.task.done():
+            handle.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(handle.task, timeout=1.0)
+        sessions_module._runner_relay_tasks.clear()
+        sessions_module._session_status_cache.pop(session_id, None)
+        session_stream.close(session_id)
+
+
 class _RecordingLabelStore:
     """Minimal conversation store that records ``set_labels`` calls.
 
