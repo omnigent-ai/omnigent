@@ -4,10 +4,13 @@ import httpx
 import respx
 
 from omnigent_slack.omnigent import (
-    OmnigentAuth,
+    AuthRequiredError,
+    HostUnavailableError,
     OmnigentClient,
+    OmnigentClientPool,
     OmnigentError,
     RunnerUnavailableError,
+    ServerUnreachableError,
     extract_assistant_text,
     is_terminal_event,
     iter_sse_events,
@@ -85,10 +88,7 @@ async def test_client_create_and_submit_request_shapes() -> None:
     submit = respx.post("http://omnigent.test/v1/sessions/conv_1/events").mock(
         return_value=httpx.Response(200, json={})
     )
-    client = OmnigentClient(
-        "http://omnigent.test",
-        auth=OmnigentAuth(email="bot@example.com", session_cookie="cookie-value"),
-    )
+    client = OmnigentClient("http://omnigent.test")
 
     try:
         session_id = await client.create_session("ag_1", "Slack C/1")
@@ -97,8 +97,6 @@ async def test_client_create_and_submit_request_shapes() -> None:
         await client.aclose()
 
     assert session_id == "conv_1"
-    assert create.calls.last.request.headers["X-Forwarded-Email"] == "bot@example.com"
-    assert create.calls.last.request.headers["Cookie"] == "ap_session=cookie-value"
     assert create.calls.last.request.read() == b'{"agent_id":"ag_1","title":"Slack C/1"}'
     assert submit.calls.last.request.read() == (
         b'{"type":"message","data":{"role":"user","content":[{"type":"input_text",'
@@ -107,46 +105,137 @@ async def test_client_create_and_submit_request_shapes() -> None:
 
 
 @respx.mock
-async def test_client_binds_random_runner() -> None:
-    respx.get("http://omnigent.test/v1/hosts").mock(
-        return_value=httpx.Response(
-            200,
-            json={"hosts": [{"id": "host_1", "online": True, "runners": [{"id": "runner_a"}]}]},
-        )
-    )
-    bind = respx.patch("http://omnigent.test/v1/sessions/conv_1").mock(
-        return_value=httpx.Response(200, json={"id": "conv_1", "runner_id": "runner_a"})
+async def test_check_health_probes_health_endpoint() -> None:
+    health = respx.get("http://omnigent.test/health").mock(
+        return_value=httpx.Response(200, json={"status": "ok"})
     )
     client = OmnigentClient("http://omnigent.test")
 
     try:
-        runner_id = await client.bind_random_runner("conv_1")
+        await client.check_health()
     finally:
         await client.aclose()
 
-    assert runner_id == "runner_a"
-    assert bind.calls.last.request.read() == b'{"runner_id":"runner_a"}'
+    assert health.calls.call_count == 1
+    assert health.calls.last.request.url.path == "/health"
 
 
 @respx.mock
-async def test_client_launches_runner_when_no_online_runner_exists() -> None:
-    respx.get("http://omnigent.test/v1/hosts").mock(
-        return_value=httpx.Response(200, json={"hosts": []})
+async def test_validate_returns_agents_and_online_hosts() -> None:
+    respx.get("http://omnigent.test/health").mock(
+        return_value=httpx.Response(200, json={"status": "ok"})
     )
+    respx.get("http://omnigent.test/v1/agents").mock(
+        return_value=httpx.Response(200, json={"data": [{"id": "ag_1", "name": "Helper"}]})
+    )
+    respx.get("http://omnigent.test/v1/hosts").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "hosts": [
+                    {"host_id": "h_on", "name": "Online", "status": "online"},
+                    {"host_id": "h_off", "name": "Offline", "status": "offline"},
+                ]
+            },
+        )
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    try:
+        validated = await client.validate()
+    finally:
+        await client.aclose()
+
+    assert [a["id"] for a in validated.agents] == ["ag_1"]
+    assert [h["host_id"] for h in validated.online_hosts] == ["h_on"]
+
+
+@respx.mock
+async def test_validate_raises_auth_required_on_401() -> None:
+    respx.get("http://omnigent.test/health").mock(
+        return_value=httpx.Response(200, json={"status": "ok"})
+    )
+    respx.get("http://omnigent.test/v1/agents").mock(return_value=httpx.Response(401))
+    client = OmnigentClient("http://omnigent.test")
+
+    try:
+        raised = False
+        try:
+            await client.validate()
+        except AuthRequiredError:
+            raised = True
+    finally:
+        await client.aclose()
+
+    assert raised
+
+
+@respx.mock
+async def test_get_host_home_derives_home_from_filesystem_listing() -> None:
+    respx.get("http://omnigent.test/v1/hosts/host_1/filesystem").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "object": "list",
+                "data": [
+                    {"name": ".bashrc", "path": "/home/alice/.bashrc", "type": "file"},
+                    {"name": "projects", "path": "/home/alice/projects", "type": "directory"},
+                ],
+            },
+        )
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    try:
+        home = await client.get_host_home("host_1")
+    finally:
+        await client.aclose()
+
+    assert home == "/home/alice"
+
+
+@respx.mock
+async def test_get_host_home_returns_none_when_listing_empty() -> None:
+    respx.get("http://omnigent.test/v1/hosts/host_1/filesystem").mock(
+        return_value=httpx.Response(200, json={"object": "list", "data": []})
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    try:
+        home = await client.get_host_home("host_1")
+    finally:
+        await client.aclose()
+
+    assert home is None
+
+
+async def test_client_pool_reuses_client_per_server() -> None:
+    pool = OmnigentClientPool()
+    try:
+        first = await pool.get("http://omnigent.test/")
+        again = await pool.get("http://omnigent.test")
+        other = await pool.get("http://other.test")
+    finally:
+        await pool.aclose_all()
+
+    assert first is again
+    assert first is not other
+
+
+@respx.mock
+async def test_launch_runner_on_explicit_host() -> None:
     launch = respx.post("http://omnigent.test/v1/hosts/host_1/runners").mock(
         return_value=httpx.Response(200, json={"runner_id": "runner_launched"})
     )
     respx.get("http://omnigent.test/v1/runners/runner_launched/status").mock(
         return_value=httpx.Response(200, json={"runner_id": "runner_launched", "online": True})
     )
-    client = OmnigentClient(
-        "http://omnigent.test",
-        runner_workspace="/tmp/workspace",
-        runner_host_id="host_1",
-    )
+    client = OmnigentClient("http://omnigent.test")
 
     try:
-        runner_id = await client.bind_random_runner("conv_1")
+        runner_id = await client.launch_runner(
+            "conv_1", workspace="/tmp/workspace", host_id="host_1"
+        )
     finally:
         await client.aclose()
 
@@ -157,14 +246,14 @@ async def test_client_launches_runner_when_no_online_runner_exists() -> None:
 
 
 @respx.mock
-async def test_client_launches_runner_on_random_online_host() -> None:
+async def test_launch_runner_picks_random_online_host_when_unspecified() -> None:
     respx.get("http://omnigent.test/v1/hosts").mock(
         return_value=httpx.Response(
             200,
             json={
                 "hosts": [
                     {"id": "host_offline", "status": "offline"},
-                    {"id": "host_online", "online": True},
+                    {"id": "host_online", "status": "online"},
                 ]
             },
         )
@@ -175,10 +264,10 @@ async def test_client_launches_runner_on_random_online_host() -> None:
     respx.get("http://omnigent.test/v1/runners/runner_launched/status").mock(
         return_value=httpx.Response(200, json={"runner_id": "runner_launched", "online": True})
     )
-    client = OmnigentClient("http://omnigent.test", runner_workspace="/tmp/workspace")
+    client = OmnigentClient("http://omnigent.test")
 
     try:
-        runner_id = await client.bind_random_runner("conv_1")
+        runner_id = await client.launch_runner("conv_1", workspace="/tmp/workspace")
     finally:
         await client.aclose()
 
@@ -186,55 +275,96 @@ async def test_client_launches_runner_on_random_online_host() -> None:
     assert launch.called
 
 
-@respx.mock
-async def test_client_binds_runner_loaded_from_hosts() -> None:
-    respx.get("http://omnigent.test/v1/hosts").mock(
-        return_value=httpx.Response(
-            200,
-            json={
-                "hosts": [
-                    {"id": "host_offline", "online": False, "runners": [{"id": "runner_no"}]},
-                    {
-                        "id": "host_online",
-                        "online": True,
-                        "runners": [{"runner_id": "runner_from_host"}],
-                    },
-                ]
-            },
-        )
-    )
-    bind = respx.patch("http://omnigent.test/v1/sessions/conv_1").mock(
-        return_value=httpx.Response(200, json={"id": "conv_1"})
-    )
+async def test_launch_runner_requires_workspace() -> None:
     client = OmnigentClient("http://omnigent.test")
 
     try:
-        runner_id = await client.bind_random_runner("conv_1")
-    finally:
-        await client.aclose()
-
-    assert runner_id == "runner_from_host"
-    assert bind.calls.last.request.read() == b'{"runner_id":"runner_from_host"}'
-
-
-@respx.mock
-async def test_client_errors_when_no_runner_and_no_launch_workspace() -> None:
-    respx.get("http://omnigent.test/v1/hosts").mock(
-        return_value=httpx.Response(200, json={"hosts": []})
-    )
-    client = OmnigentClient("http://omnigent.test")
-
-    try:
+        message = ""
         try:
-            await client.bind_random_runner("conv_1")
+            await client.launch_runner("conv_1", workspace="")
         except OmnigentError as exc:
             message = str(exc)
-        else:
-            message = ""
     finally:
         await client.aclose()
 
-    assert "OMNIGENT_RUNNER_WORKSPACE" in message
+    assert "workspace" in message.lower()
+
+
+@respx.mock
+async def test_launch_runner_errors_when_no_online_host() -> None:
+    respx.get("http://omnigent.test/v1/hosts").mock(
+        return_value=httpx.Response(200, json={"hosts": [{"id": "h", "status": "offline"}]})
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    try:
+        raised: HostUnavailableError | None = None
+        try:
+            await client.launch_runner("conv_1", workspace="/tmp/workspace")
+        except HostUnavailableError as exc:
+            raised = exc
+    finally:
+        await client.aclose()
+
+    assert raised is not None
+    assert "No online Omnigent hosts" in str(raised)
+
+
+@respx.mock
+async def test_launch_runner_raises_host_unavailable_when_host_offline() -> None:
+    respx.post("http://omnigent.test/v1/hosts/host_1/runners").mock(
+        return_value=httpx.Response(409, json={"error": {"code": "host_offline"}})
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    try:
+        raised = False
+        try:
+            await client.launch_runner("conv_1", workspace="/ws", host_id="host_1")
+        except HostUnavailableError:
+            raised = True
+    finally:
+        await client.aclose()
+
+    assert raised
+
+
+@respx.mock
+async def test_launch_runner_raises_host_unavailable_when_runner_never_online() -> None:
+    respx.post("http://omnigent.test/v1/hosts/host_1/runners").mock(
+        return_value=httpx.Response(200, json={"runner_id": "runner_x"})
+    )
+    respx.get("http://omnigent.test/v1/runners/runner_x/status").mock(
+        return_value=httpx.Response(200, json={"online": False})
+    )
+    client = OmnigentClient("http://omnigent.test", runner_launch_timeout_seconds=0.01)
+
+    try:
+        raised = False
+        try:
+            await client.launch_runner("conv_1", workspace="/ws", host_id="host_1")
+        except HostUnavailableError:
+            raised = True
+    finally:
+        await client.aclose()
+
+    assert raised
+
+
+async def test_request_wraps_transport_failure_as_server_unreachable() -> None:
+    # Point at a port nothing is listening on so the connection is refused.
+    client = OmnigentClient("http://127.0.0.1:1")
+
+    try:
+        raised = False
+        try:
+            await client.check_health()
+        except ServerUnreachableError:
+            raised = True
+    finally:
+        await client.aclose()
+
+    assert raised
 
 
 @respx.mock

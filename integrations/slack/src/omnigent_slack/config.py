@@ -14,46 +14,26 @@ class Settings(BaseSettings):
         case_sensitive=False,
     )
 
-    slack_bot_token: str = Field(validation_alias="SLACK_BOT_TOKEN")
-    slack_app_token: str = Field(validation_alias="SLACK_APP_TOKEN")
-    omnigent_agent_name: str = Field(validation_alias="OMNIGENT_AGENT_NAME")
-
-    omnigent_base_url: str = Field(
-        default="http://127.0.0.1:6767",
-        validation_alias="OMNIGENT_BASE_URL",
-    )
-    omnigent_auth_email: str | None = Field(default=None, validation_alias="OMNIGENT_AUTH_EMAIL")
-    omnigent_auth_header_name: str = Field(
-        default="X-Forwarded-Email",
-        validation_alias="OMNIGENT_AUTH_HEADER_NAME",
-    )
-    omnigent_session_cookie: str | None = Field(
-        default=None,
-        validation_alias="OMNIGENT_SESSION_COOKIE",
-    )
-    omnigent_runner_workspace: str = Field(
-        default_factory=lambda: str(Path.cwd()),
-        validation_alias="OMNIGENT_RUNNER_WORKSPACE",
-    )
-    omnigent_runner_host_id: str | None = Field(
-        default=None,
-        validation_alias="OMNIGENT_RUNNER_HOST_ID",
-    )
-    omnigent_runner_launch_timeout_seconds: float = Field(
-        default=60.0,
-        ge=1.0,
-        validation_alias="OMNIGENT_RUNNER_LAUNCH_TIMEOUT_SECONDS",
-    )
+    slack_bot_token: str = Field(validation_alias="OMNIGENT_SLACK_BOT_TOKEN")
+    slack_app_token: str = Field(validation_alias="OMNIGENT_SLACK_APP_TOKEN")
 
     database_path: Path = Field(
         default=Path("data/omnigent_slack.sqlite3"),
         validation_alias="OMNIGENT_SLACK_DATABASE_PATH",
     )
     log_level: str = Field(default="INFO", validation_alias="LOG_LEVEL")
-    slack_update_interval_seconds: float = Field(
-        default=1.0,
-        ge=0.0,
-        validation_alias="SLACK_UPDATE_INTERVAL_SECONDS",
+
+    # Fernet key (urlsafe-base64, 32 bytes) that encrypts the delegated
+    # Omnigent access/refresh tokens at rest in the local SQLite store.
+    # Generate with ``python -c "from cryptography.fernet import Fernet;
+    # print(Fernet.generate_key().decode())"``. Set this so a stolen
+    # database file cannot be used to impersonate users — see
+    # designs/DEVICE_AUTH.md. If unset, tokens are kept in memory
+    # only (never written to disk) and lost on restart, so users
+    # re-authenticate; the integration still works either way.
+    token_encryption_key: str | None = Field(
+        default=None,
+        validation_alias="OMNIGENT_SLACK_TOKEN_ENCRYPTION_KEY",
     )
 
 

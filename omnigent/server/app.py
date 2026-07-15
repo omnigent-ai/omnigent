@@ -2444,6 +2444,28 @@ def create_app(
                 tags=["auth"],
             )
 
+        # Device Authorization Grant (RFC 8628) — a generic delegated
+        # per-user login (the Slack integration is the first consumer, but
+        # the mechanism is client-agnostic). Only available in oidc/accounts
+        # modes (header mode has no server-mintable identity). Reuses the
+        # shared DB; wires the revocation lookup into the auth provider so
+        # revoking a grant immediately rejects its delegated access tokens.
+        # See designs/DEVICE_AUTH.md.
+        if (
+            isinstance(auth_provider, UnifiedAuthProvider)
+            and auth_provider._source in ("oidc", "accounts")
+            and permission_store is not None
+        ):
+            from omnigent.server.device_grant_store import DeviceGrantStore
+            from omnigent.server.routes.device_auth import create_device_auth_router
+
+            device_grant_store = DeviceGrantStore(permission_store.storage_location)
+            auth_provider.set_grant_revocation_check(device_grant_store.is_revoked)
+            app.include_router(
+                create_device_auth_router(auth_provider, device_grant_store),
+                tags=["oauth"],
+            )
+
     # Mount the built web SPA at "/" if a build is present. The SPA is
     # built into ``omnigent/server/static/web-ui/`` by ``web/``'s Vite
     # build (see ``web/vite.config.ts`` ``build.outDir``). The mount is

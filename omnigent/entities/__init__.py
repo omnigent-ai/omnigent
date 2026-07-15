@@ -1,6 +1,6 @@
 """Core domain entities shared across runtime, server, and store layers."""
 
-from omnigent.entities.account import Account, AccountToken
+from omnigent.entities.account import Account, AccountToken, DeviceGrant
 from omnigent.entities.agent import Agent, LoadedAgent
 from omnigent.entities.comment import Comment, CommentsFingerprint
 from omnigent.entities.conversation import (
@@ -46,6 +46,7 @@ __all__ = [
     "CompactionData",
     "Conversation",
     "ConversationItem",
+    "DeviceGrant",
     "ErrorData",
     "FunctionCallData",
     "FunctionCallOutputData",
