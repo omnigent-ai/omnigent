@@ -229,15 +229,53 @@ def test_cancel_async_schema_uses_handle_id(
 
     The parameter rename from ``task_id`` (parent) to ``handle_id``
     is the one place the schema differs — pin it. A regression
-    that reverted to ``task_id`` would still work (since invoke
-    delegates with task_id JSON), but the LLM's mental model
-    breaks: ``sys_call_async`` returns a "handle", and the cancel
-    parameter should match that vocabulary.
+    that reverted to ``task_id`` would still work (cancel accepts
+    ``task_id`` as a legacy alias), but the LLM's mental model
+    breaks: ``sys_call_async`` returns ``handle_id``, and the
+    cancel parameter must match that vocabulary.
     """
     schema = cancel_tool.get_schema()["function"]["parameters"]
     assert schema["required"] == ["handle_id"]
     assert schema["additionalProperties"] is False
     assert set(schema["properties"].keys()) == {"handle_id"}
+    handle_desc = schema["properties"]["handle_id"]["description"]
+    assert "handle_id" in handle_desc
+    assert "task_id field" not in handle_desc
+
+
+def test_cancel_async_description_names_handle_id(
+    cancel_tool: SysCancelAsyncTool,
+) -> None:
+    """
+    LLM-facing description tells the model to pass ``handle_id``,
+    not the older ``task_id`` field name from the handle JSON.
+    """
+    desc = cancel_tool.description()
+    assert "handle_id" in desc
+    assert "task_id field" not in desc
+    # Keep sys_cancel_task's task_id contract visibly distinct.
+    assert "sys_cancel_task" in desc
+    assert "task_id" in desc
+
+
+def test_call_async_description_names_handle_id(tool: SysCallAsyncTool) -> None:
+    """
+    ``sys_call_async`` description names ``handle_id`` as the
+    canonical identifier for cancel round-trips.
+    """
+    desc = tool.description()
+    assert "handle_id" in desc
+    assert "sys_cancel_async" in desc
+
+
+def test_sys_cancel_task_schema_keeps_task_id_contract() -> None:
+    """
+    Generic ``sys_cancel_task`` stays on ``task_id`` — distinct
+    from ``sys_cancel_async``'s ``handle_id`` contract.
+    """
+    schema = SysCancelTaskTool().get_schema()["function"]["parameters"]
+    assert schema["required"] == ["task_id"]
+    assert set(schema["properties"].keys()) == {"task_id"}
 
 
 # ── Manager registration gating ───────────────────────────

@@ -7121,6 +7121,59 @@ async def test_approval_event_without_content_flattened() -> None:
 
 
 @pytest.mark.asyncio
+async def test_spawn_handle_round_trips_to_sys_cancel_async(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A spawned handle can be passed directly to ``sys_cancel_async``."""
+    from omnigent.runner import tool_dispatch
+
+    async def _slow(**_kw: Any) -> str:
+        await asyncio.sleep(30)
+        return "late"
+
+    monkeypatch.setattr(tool_dispatch, "execute_tool", _slow)
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    tasks: dict[str, tuple[asyncio.Task[str], asyncio.Event]] = {}
+    spawn_kw: dict[str, Any] = {
+        "server_client": None,
+        "terminal_registry": None,
+        "resource_registry": None,
+        "agent_spec": None,
+        "conversation_id": "conv_roundtrip",
+        "task_id": None,
+        "agent_id": None,
+        "agent_name": None,
+        "runner_workspace": None,
+        "mcp_manager": None,
+        "filesystem_registry": None,
+    }
+    handle_raw = tool_dispatch._spawn_async_tool(
+        {"tool": "slow", "args": "{}"},
+        session_inbox=inbox,
+        session_async_tasks=tasks,
+        **spawn_kw,
+    )
+    handle = json.loads(handle_raw)
+    assert handle["task_id"] == handle["handle_id"]
+    assert handle["status"] == "in_progress"
+    assert "sys_cancel_async" in handle["message"]
+    assert f"handle_id={handle['handle_id']!r}" in handle["message"]
+
+    bg_task, _evt = tasks[handle["handle_id"]]
+    cancel_raw = tool_dispatch._cancel_async_tool(
+        {"handle_id": handle["handle_id"]},
+        session_async_tasks=tasks,
+    )
+    assert json.loads(cancel_raw) == {
+        "cancelled": True,
+        "handle_id": handle["handle_id"],
+    }
+
+    await bg_task
+    assert inbox.get_nowait()["status"] == "cancelled"
+
+
+@pytest.mark.asyncio
 async def test_spawn_async_tool_cancels_losing_future_no_leak(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

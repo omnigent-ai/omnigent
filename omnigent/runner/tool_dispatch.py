@@ -5306,22 +5306,28 @@ async def _execute_rest_tool(
                     f"Error: sys_call_async event post returned "
                     f"{event_resp.status_code}: {event_resp.text[:200]}"
                 )
-            # Return session_id as the handle (replaces task_id).
-            return json.dumps({"task_id": session_id, "status": "running"})
+            return json.dumps(
+                {
+                    "handle_id": session_id,
+                    # Compatibility alias for older clients; remove in 0.8.0.
+                    "task_id": session_id,
+                    "status": "running",
+                }
+            )
         except Exception as exc:  # noqa: BLE001
             return f"Error: sys_call_async failed: {exc}"
 
     if tool_name == SysCancelAsyncTool.name():
-        # task_id from sys_call_async is now a session_id.
-        task_id = args.get("task_id", "")
+        # ``task_id`` fallback supports older clients; remove in 0.8.0.
+        handle_id = args.get("handle_id") or args.get("task_id", "")
         try:
             resp = await server_client.post(
-                f"/v1/sessions/{task_id}/events",
+                f"/v1/sessions/{handle_id}/events",
                 json={"type": "interrupt", "data": {}},
                 timeout=30.0,
             )
             if resp.status_code in (200, 201, 202):
-                return f"Cancelled task {task_id}"
+                return f"Cancelled async handle {handle_id}"
             return f"Error: sys_cancel_async returned {resp.status_code}"
         except Exception as exc:  # noqa: BLE001
             return f"Error: sys_cancel_async failed: {exc}"
@@ -6177,8 +6183,11 @@ def _spawn_async_tool(
         ``GET …/changes`` endpoint.
     :param resource_registry: Optional session-resource registry used by
         async terminal-tool launches.
-    :returns: JSON handle string with ``handle_id``, ``tool_name``,
-        ``status``.
+    :returns: JSON handle string with canonical ``handle_id``,
+        plus compatibility ``task_id`` (identical value; remove in 0.8.0),
+        ``tool_name``, ``status``, and ``message``. Prefer
+        ``handle_id``; ``task_id`` exists only so older clients
+        that still parse the pre-handle_id field keep working.
     """
     target_tool = args.get("tool")
     target_args = args.get("args", "{}")
@@ -6286,12 +6295,15 @@ def _spawn_async_tool(
     return json.dumps(
         {
             "handle_id": handle_id,
+            # Compatibility alias for older clients; remove in 0.8.0.
+            "task_id": handle_id,
             "tool_name": target_tool,
             "status": "in_progress",
             "message": (
                 f"[System: {target_tool} dispatched as background "
                 f"task {handle_id}. Result will appear in your "
-                f"inbox — call sys_read_inbox to check.]"
+                f"inbox — call sys_read_inbox to check. To abort, "
+                f"call sys_cancel_async with handle_id={handle_id!r}.]"
             ),
         }
     )
