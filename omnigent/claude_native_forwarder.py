@@ -215,6 +215,14 @@ def _hold_assistant_item_for_deltas(
 # hook signal and drop the heuristic.
 _SUBAGENT_IDLE_QUIESCENCE_S = 5.0
 
+# Maximum time to leave a claude-native sub-agent in background-task
+# ``waiting`` after a Stop hook reports live background shells. This is
+# intentionally much larger than short retry/backoff bounds such as
+# ``_HTTP_POST_RETRY_MAX_DELAY_S`` (30s) because shells like
+# ``codex exec ...`` routinely run for many minutes; 20 minutes bounds
+# genuinely lost/hung shell completion without racing normal work.
+_BACKGROUND_TASK_WAIT_MAX_S = 20 * 60.0
+
 # Meta-file glob inside ``~/.claude/projects/<encoded>/<session>/subagents/``.
 # One per Claude Task-tool subagent; appears alongside the matching
 # ``agent-<id>.jsonl`` transcript.
@@ -350,11 +358,49 @@ class HookForwardState:
     :param cursor_fingerprint: Hash of bytes immediately before
         ``byte_offset``. Used to detect truncation/replacement before
         seeking into a stale offset.
+    :param background_task_wait_started_at: Wall-clock timestamp when
+        the current session first posted ``waiting`` because a Stop hook
+        reported live background shells. ``None`` means no fallback
+        timer is pending.
     """
 
     event_cursor: int
     byte_offset: int | None = None
     cursor_fingerprint: str | None = None
+    background_task_wait_started_at: float | None = None
+
+
+def _background_wait_wall_time() -> float:
+    """Return the wall clock used for persisted background-wait deadlines."""
+    return time.time()
+
+
+def _hook_forward_state(
+    *,
+    bridge_dir: Path,
+    event_cursor: int,
+    byte_offset: int | None,
+    background_task_wait_started_at: float | None = None,
+) -> HookForwardState:
+    """
+    Build a hook cursor state, preserving the optional background-wait timer.
+
+    :param bridge_dir: Native Claude bridge directory.
+    :param event_cursor: One-based hook record index already consumed.
+    :param byte_offset: Hook JSONL byte offset already consumed.
+    :param background_task_wait_started_at: Pending fallback timer start.
+    :returns: Durable hook state for this cursor position.
+    """
+    return HookForwardState(
+        event_cursor=event_cursor,
+        byte_offset=byte_offset,
+        cursor_fingerprint=(
+            None
+            if byte_offset is None
+            else _jsonl_cursor_fingerprint(bridge_dir / _HOOKS_FILE, byte_offset)
+        ),
+        background_task_wait_started_at=background_task_wait_started_at,
+    )
 
 
 @dataclass(frozen=True)
@@ -930,6 +976,12 @@ async def forward_claude_transcript_to_session(
                         # ``state.current_response_id`` is the active turn's id
                         # (the user-message reset only fires on the next turn).
                         response_id=state.current_response_id,
+                    )
+                    hook_state = await _maybe_fire_background_task_wait_fallback(
+                        client=client,
+                        session_id=current_session_id,
+                        bridge_dir=bridge_dir,
+                        state=hook_state,
                     )
                     subagent_state = await _forward_available_subagents(
                         client=client,
@@ -1998,13 +2050,10 @@ async def _maybe_rotate_session_on_clear(
     # replacement session every poll, unbounded. A single /clear rotates at most
     # once; a failed rotation is logged and skipped (the old session simply
     # keeps running) rather than retried forever.
-    durable = HookForwardState(
+    durable = _hook_forward_state(
+        bridge_dir=bridge_dir,
         event_cursor=clear_record.event_cursor,
         byte_offset=clear_record.byte_offset,
-        cursor_fingerprint=_jsonl_cursor_fingerprint(
-            bridge_dir / _HOOKS_FILE,
-            clear_record.byte_offset,
-        ),
     )
     new_session_id: str | None = None
     try:
@@ -2184,13 +2233,10 @@ async def _maybe_rotate_session_on_fork(
     # terminal-transfer 400) must still advance the cursor so the next poll does
     # not re-read the same fork record and create another replacement session
     # without bound.
-    durable = HookForwardState(
+    durable = _hook_forward_state(
+        bridge_dir=bridge_dir,
         event_cursor=fork_record.event_cursor,
         byte_offset=fork_record.byte_offset,
-        cursor_fingerprint=_jsonl_cursor_fingerprint(
-            bridge_dir / _HOOKS_FILE,
-            fork_record.byte_offset,
-        ),
     )
     new_session_id: str | None = None
     try:
@@ -2477,10 +2523,10 @@ async def _ensure_hook_state(
     byte_offset = 0
     if start_at_end:
         byte_offset = await asyncio.to_thread(_hook_end_offset, bridge_dir)
-    state = HookForwardState(
+    state = _hook_forward_state(
+        bridge_dir=bridge_dir,
         event_cursor=0,
         byte_offset=byte_offset,
-        cursor_fingerprint=_jsonl_cursor_fingerprint(bridge_dir / _HOOKS_FILE, byte_offset),
     )
     await _write_hook_state_async(bridge_dir, state)
     return state
@@ -2574,24 +2620,22 @@ async def _forward_available_status_events(
             state.byte_offset or 0
         ):
             return state
-        durable = HookForwardState(
+        durable = _hook_forward_state(
+            bridge_dir=bridge_dir,
             event_cursor=result.event_cursor,
             byte_offset=result.byte_offset,
-            cursor_fingerprint=_jsonl_cursor_fingerprint(
-                bridge_dir / _HOOKS_FILE, result.byte_offset
-            ),
+            background_task_wait_started_at=state.background_task_wait_started_at,
         )
         await _write_hook_state_async(bridge_dir, durable)
         return durable
     durable = state
     for record in result.records:
         status = _HOOK_EVENT_TO_STATUS.get(record.event_name or "")
-        next_durable = HookForwardState(
+        next_durable = _hook_forward_state(
+            bridge_dir=bridge_dir,
             event_cursor=record.event_cursor,
             byte_offset=record.byte_offset,
-            cursor_fingerprint=_jsonl_cursor_fingerprint(
-                bridge_dir / _HOOKS_FILE, record.byte_offset
-            ),
+            background_task_wait_started_at=durable.background_task_wait_started_at,
         )
         # Subagent lifecycle hooks land in the same hooks.jsonl as parent
         # events because subagent processes inherit the parent's hook
@@ -2721,6 +2765,21 @@ async def _forward_available_status_events(
         effective_status = status
         if status == "idle" and record.background_task_count > 0:
             effective_status = "waiting"
+            wait_started_at = durable.background_task_wait_started_at
+            if wait_started_at is None:
+                wait_started_at = _background_wait_wall_time()
+            next_durable = _hook_forward_state(
+                bridge_dir=bridge_dir,
+                event_cursor=record.event_cursor,
+                byte_offset=record.byte_offset,
+                background_task_wait_started_at=wait_started_at,
+            )
+        elif status in {"idle", "failed"}:
+            next_durable = _hook_forward_state(
+                bridge_dir=bridge_dir,
+                event_cursor=record.event_cursor,
+                byte_offset=record.byte_offset,
+            )
         try:
             await post_external_session_status(
                 client,
@@ -2778,10 +2837,66 @@ async def _forward_available_status_events(
         retry_tracker.clear(retry_key)
         durable = next_durable
         await _write_hook_state_async(bridge_dir, durable)
-    durable = HookForwardState(
+    durable = _hook_forward_state(
+        bridge_dir=bridge_dir,
         event_cursor=result.event_cursor,
         byte_offset=result.byte_offset,
-        cursor_fingerprint=_jsonl_cursor_fingerprint(bridge_dir / _HOOKS_FILE, result.byte_offset),
+        background_task_wait_started_at=durable.background_task_wait_started_at,
+    )
+    await _write_hook_state_async(bridge_dir, durable)
+    return durable
+
+
+async def _maybe_fire_background_task_wait_fallback(
+    *,
+    client: httpx.AsyncClient,
+    session_id: str,
+    bridge_dir: Path,
+    state: HookForwardState,
+) -> HookForwardState:
+    """
+    Deliver ``idle`` after an overlong background-task ``waiting`` period.
+
+    :param client: Omnigent HTTP client.
+    :param session_id: Omnigent session/conversation id.
+    :param bridge_dir: Native Claude bridge directory.
+    :param state: Current durable hook cursor and optional wait timer.
+    :returns: Updated state. Failed fallback posts leave the timer armed so
+        the next poll can retry.
+    """
+    started_at = state.background_task_wait_started_at
+    if started_at is None:
+        return state
+    waited_s = max(0.0, _background_wait_wall_time() - started_at)
+    if waited_s < _BACKGROUND_TASK_WAIT_MAX_S:
+        return state
+    try:
+        await post_external_session_status(
+            client,
+            session_id=session_id,
+            status="idle",
+            background_task_count=0,
+        )
+    except httpx.HTTPError:
+        _logger.warning(
+            "Failed to post fallback idle after background-task wait timeout; "
+            "session=%s waited_s=%.1f",
+            session_id,
+            waited_s,
+            exc_info=True,
+        )
+        return state
+    _logger.warning(
+        "Posted fallback idle after background-task wait timeout; "
+        "session=%s waited_s=%.1f max_wait_s=%.1f",
+        session_id,
+        waited_s,
+        _BACKGROUND_TASK_WAIT_MAX_S,
+    )
+    durable = HookForwardState(
+        event_cursor=state.event_cursor,
+        byte_offset=state.byte_offset,
+        cursor_fingerprint=state.cursor_fingerprint,
     )
     await _write_hook_state_async(bridge_dir, durable)
     return durable
@@ -3229,10 +3344,10 @@ def _validated_hook_state(
             bridge_dir,
             state.byte_offset,
         )
-    return HookForwardState(
+    return _hook_forward_state(
+        bridge_dir=bridge_dir,
         event_cursor=0,
         byte_offset=0,
-        cursor_fingerprint=_jsonl_cursor_fingerprint(hooks_path, 0),
     )
 
 
@@ -4088,16 +4203,27 @@ def _read_hook_state(bridge_dir: Path) -> HookForwardState | None:
     event_cursor = raw.get("event_cursor")
     byte_offset = raw.get("byte_offset")
     cursor_fingerprint = raw.get("cursor_fingerprint")
+    background_task_wait_started_at = raw.get("background_task_wait_started_at")
     if not isinstance(event_cursor, int) or event_cursor < 0:
         return None
     if byte_offset is not None and (not isinstance(byte_offset, int) or byte_offset < 0):
         return None
     if cursor_fingerprint is not None and not isinstance(cursor_fingerprint, str):
         return None
+    if background_task_wait_started_at is not None and (
+        isinstance(background_task_wait_started_at, bool)
+        or not isinstance(background_task_wait_started_at, (int, float))
+    ):
+        return None
     return HookForwardState(
         event_cursor=event_cursor,
         byte_offset=byte_offset,
         cursor_fingerprint=cursor_fingerprint,
+        background_task_wait_started_at=(
+            None
+            if background_task_wait_started_at is None
+            else float(background_task_wait_started_at)
+        ),
     )
 
 
@@ -4118,6 +4244,8 @@ def _write_hook_state(bridge_dir: Path, state: HookForwardState) -> None:
         payload["byte_offset"] = state.byte_offset
     if state.cursor_fingerprint is not None:
         payload["cursor_fingerprint"] = state.cursor_fingerprint
+    if state.background_task_wait_started_at is not None:
+        payload["background_task_wait_started_at"] = state.background_task_wait_started_at
     _write_json_atomic(bridge_dir / _HOOK_STATE_FILE, payload)
 
 
