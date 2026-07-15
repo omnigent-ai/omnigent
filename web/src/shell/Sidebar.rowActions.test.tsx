@@ -143,6 +143,9 @@ function renderSidebar(activeId?: string, info?: ServerInfo) {
 beforeEach(() => {
   mocks.rename.mutate.mockReset();
   useConvMock.mockReset();
+  // Pins persist to localStorage; clear it so a seeded pin doesn't leak into
+  // the next test's row state.
+  localStorage.clear();
   // The read-state mirror is module-level (in-memory), so reset it between
   // tests to avoid a mark-unread leaking into later rows.
   __resetReadStateForTests();
@@ -278,6 +281,43 @@ describe("double-click to rename", () => {
 
     expect(screen.queryByTestId("rename-conversation-input")).toBeNull();
     expect(mocks.rename.mutate).not.toHaveBeenCalled();
+  });
+});
+
+describe("pinned row project flyout", () => {
+  // Pinning lifts a session out of its project folder into the flat "Pinned"
+  // section, so the folder no longer conveys which project it came from. The
+  // hover flyout restores that cue: title + folder icon + project name. It
+  // opens on focus/hover — fire focus on the row link and await the portal.
+
+  it("shows the project name in the flyout for a pinned, project-owned row", async () => {
+    // Seed the pin so the row lifts into the always-expanded Pinned section
+    // (a project-owned row otherwise sits inside a collapsed project folder).
+    localStorage.setItem("omnigent:pinned-conversation-ids", JSON.stringify(["conv_1"]));
+    mockConversations([{ ...CONV, labels: { omni_project: "Moonshot" } }]);
+    renderSidebar();
+    expect(screen.getByText("Pinned")).toBeInTheDocument();
+
+    // Focus opens the HoverCard (onFocus is one of its open triggers); the
+    // content is portalled, so query the whole document after the open delay.
+    fireEvent.focus(screen.getByRole("link", { name: /My Session/ }));
+    const flyout = await screen.findByTestId("pinned-project-flyout");
+    expect(within(flyout).getByText("Moonshot")).toBeInTheDocument();
+    expect(within(flyout).getByText("My Session")).toBeInTheDocument();
+  });
+
+  it("renders no project flyout for a pinned row with no project", () => {
+    // No project label → nothing to surface, so the row keeps its plain native
+    // title tooltip and never mounts a hover-card trigger.
+    localStorage.setItem("omnigent:pinned-conversation-ids", JSON.stringify(["conv_1"]));
+    mockConversations([{ ...CONV, labels: {} }]);
+    renderSidebar();
+    expect(screen.getByText("Pinned")).toBeInTheDocument();
+
+    const row = screen.getByRole("link", { name: /My Session/ });
+    expect(row).not.toHaveAttribute("data-slot", "hover-card-trigger");
+    fireEvent.focus(row);
+    expect(screen.queryByTestId("pinned-project-flyout")).toBeNull();
   });
 });
 

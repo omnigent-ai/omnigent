@@ -79,6 +79,7 @@ import {
   ContextMenuSubTrigger,
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
+import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -2370,6 +2371,11 @@ function ConversationRow({
   // The session's current project (reserved label), or null when unfiled —
   // drives the kebab submenu label ("Add to project" vs "Change project").
   const currentProject = conversation.labels?.[PROJECT_LABEL_KEY] ?? null;
+  // Pinned sessions are lifted OUT of their project folder into the flat
+  // "Pinned" section, so the row no longer shows which project it belongs to.
+  // For those rows only, surface the project in a hover flyout. Non-pinned
+  // rows already sit inside their project folder, so they don't need it.
+  const projectFlyoutName = isPinned ? currentProject : null;
 
   const label = conversationDisplayLabel(conversation);
   // Recompute unseen state the moment the last-seen map changes (e.g. the
@@ -2605,7 +2611,9 @@ function ConversationRow({
         e.preventDefault();
         setIsEditing(true);
       }}
-      title={conversation.title ?? conversation.id}
+      // The rich project flyout replaces the native tooltip on pinned,
+      // project-owned rows so the two don't stack; other rows keep it.
+      title={projectFlyoutName ? undefined : (conversation.title ?? conversation.id)}
     >
       {/* Row 1: the session name. Status markers (working, needs-approval,
           unseen) render in the trailing time-marker slot below, replacing
@@ -2643,9 +2651,42 @@ function ConversationRow({
           Suppressed in selection mode (bulk-select owns the row), where the
           bare link is rendered instead. ContextMenuTrigger preventDefaults the
           native contextmenu event, so right-click never navigates; asChild
-          merges its handler onto the Link, preserving left-click / double-click. */}
+          merges its handler onto the Link, preserving left-click / double-click.
+          Pinned, project-owned rows nest a HoverCardTrigger around the Link so
+          hovering surfaces the project flyout — the trigger sits innermost so
+          both the context menu and the hover card keep their handlers/refs on
+          the Link. */}
       {selectionMode ? (
-        rowLink
+        projectFlyoutName ? (
+          <HoverCard openDelay={150} closeDelay={0}>
+            <HoverCardTrigger asChild>{rowLink}</HoverCardTrigger>
+            <PinnedProjectFlyoutContent
+              title={conversation.title ?? conversation.id}
+              projectName={projectFlyoutName}
+            />
+          </HoverCard>
+        ) : (
+          rowLink
+        )
+      ) : projectFlyoutName ? (
+        <HoverCard openDelay={150} closeDelay={0}>
+          <ContextMenu>
+            <ContextMenuTrigger asChild>
+              <HoverCardTrigger asChild>{rowLink}</HoverCardTrigger>
+            </ContextMenuTrigger>
+            <ContextMenuContent className="min-w-44 [&_[role=menuitem]]:text-xs">
+              <ConversationMenuItems
+                components={contextBundle}
+                setMenuOpen={() => {}}
+                {...menuItemProps}
+              />
+            </ContextMenuContent>
+          </ContextMenu>
+          <PinnedProjectFlyoutContent
+            title={conversation.title ?? conversation.id}
+            projectName={projectFlyoutName}
+          />
+        </HoverCard>
       ) : (
         <ContextMenu>
           <ContextMenuTrigger asChild>{rowLink}</ContextMenuTrigger>
@@ -2908,6 +2949,39 @@ function ConversationRow({
         </DialogContent>
       </Dialog>
     </li>
+  );
+}
+
+/**
+ * Hover flyout body for a pinned, project-owned conversation row.
+ *
+ * Pinning lifts a session out of its project folder into the flat "Pinned"
+ * section, dropping the visual project cue the folder provided. Hovering the
+ * row surfaces it again: the session title, then a folder icon + project name.
+ * Mirrors {@link AgentHoverCard}'s Cursor-style placement (right / top-aligned)
+ * and the muted, small-icon foreground used elsewhere in the sidebar.
+ */
+function PinnedProjectFlyoutContent({
+  title,
+  projectName,
+}: {
+  title: string;
+  projectName: string;
+}) {
+  return (
+    <HoverCardContent
+      side="right"
+      align="start"
+      sideOffset={8}
+      className="w-64"
+      data-testid="pinned-project-flyout"
+    >
+      <p className="truncate font-medium text-sm">{title}</p>
+      <p className="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground">
+        <FolderIcon className="size-3.5 shrink-0" />
+        <span className="truncate">{projectName}</span>
+      </p>
+    </HoverCardContent>
   );
 }
 
