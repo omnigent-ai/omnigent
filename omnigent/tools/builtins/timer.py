@@ -81,6 +81,10 @@ def validate_timer_set_args(
     repeat = args.get("repeat", False)
     if not isinstance(repeat, bool):
         return "repeat must be a boolean"
+    # repeat=true with seconds=0 would busy-loop sleep(0) + POST forever.
+    # One-shot seconds=0 remains valid (immediate single firing).
+    if repeat and seconds == 0:
+        return "seconds must be > 0 when repeat is true"
     note = args.get("note")
     if note is not None and not isinstance(note, str):
         return "note must be a string"

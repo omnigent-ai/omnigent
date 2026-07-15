@@ -119,6 +119,8 @@ def test_tools_are_synchronous() -> None:
         ('{"seconds": 1, "repeat": "yes"}', "repeat must be a boolean"),
         # ``note`` MUST be a string when present.
         ('{"seconds": 1, "note": 5}', "note must be a string"),
+        # Zero-delay repeating timers would busy-loop sleep(0)+POST.
+        ('{"seconds": 0, "repeat": true}', "seconds must be > 0 when repeat is true"),
     ],
 )
 def test_set_invalid_args_return_error(args_json: str, expected_error_substring: str) -> None:
@@ -206,6 +208,9 @@ def test_validate_timer_set_args_accepts_valid_shapes() -> None:
         True,
         "x",
     )
+    # Immediate one-shot remains valid; only repeating timers reject 0.
+    assert validate_timer_set_args({"seconds": 0}) == (0.0, False, None)
+    assert validate_timer_set_args({"seconds": 0, "repeat": False}) == (0.0, False, None)
 
 
 @pytest.mark.parametrize(
@@ -217,6 +222,7 @@ def test_validate_timer_set_args_accepts_valid_shapes() -> None:
         ({"seconds": True}, "seconds must be a number"),
         ({"seconds": 1, "repeat": "yes"}, "repeat must be a boolean"),
         ({"seconds": 1, "note": 5}, "note must be a string"),
+        ({"seconds": 0, "repeat": True}, "seconds must be > 0 when repeat is true"),
     ],
 )
 def test_validate_timer_set_args_rejects_bad_shapes(
