@@ -124,10 +124,16 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[dict[str, object], bo
     # Any full-turn journey needs the runner + mock LLM. A full env is a
     # superset — HTTP journeys still run against it — so a mixed selection just
     # boots with_runner=True. The harness label reflects what drove the turns.
+    # A host-backed journey (session_cold_start) additionally needs a host
+    # daemon; with_host is a further superset (it implies with_runner) so a
+    # mixed selection that includes it boots the host too.
     with_runner = any(j.needs_runner for j in journeys)
+    with_host = any(j.needs_host for j in journeys)
     harness = _RUNNER_HARNESS if with_runner else _HTTP_HARNESS
 
-    async with BenchEnvironment(with_runner=with_runner, database_uri=args.database_uri) as env:
+    async with BenchEnvironment(
+        with_runner=with_runner, with_host=with_host, database_uri=args.database_uri
+    ) as env:
         for journey in journeys:
             console.print(f"\n[bold]Benchmarking[/bold] {journey.name} [dim]({backend})[/dim]")
             kind, results = await _run_journey(journey, env, args)

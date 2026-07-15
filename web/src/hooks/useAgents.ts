@@ -102,11 +102,12 @@ async function fetchAgents(): Promise<Agent[]> {
  * Refetches every 30 seconds so new agents from recently created
  * sessions appear without a manual refresh.
  */
-export function useAgents() {
+export function useAgents({ enabled = true }: { enabled?: boolean } = {}) {
   return useQuery({
     queryKey: ["agents"],
     queryFn: fetchAgents,
     staleTime: 30_000,
+    enabled,
   });
 }
 

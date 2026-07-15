@@ -19,9 +19,9 @@ import time
 import types
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
-from importlib import resources
+from importlib import import_module, resources
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, BinaryIO, TypeAlias, cast
+from typing import TYPE_CHECKING, Any, BinaryIO, Literal, TypeAlias, cast
 
 import click
 import yaml
@@ -1326,9 +1326,11 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "cursor",
         "debby",
         "debug",
+        "doctor",
         "goose",
         "hermes",
         "host",
+        "_internal",
         "kimi",
         "kiro",
         "lakebox",
@@ -1346,6 +1348,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "server",
         "setup",
         "stop",
+        "uninstall",
         "update",
         "upgrade",
         "version",
@@ -1462,6 +1465,8 @@ def main() -> None:
     if argv[0] in {"--help", "-h", "--version"}:
         cli(args=argv)
         return
+
+    _maybe_fast_backfill_install_ledger(argv)
 
     from omnigent.cli_diagnostics import (
         log_cli_error_hint,
@@ -3629,6 +3634,232 @@ def stop(force: bool) -> None:
         click.echo("Nothing to stop.")
     if failures:
         raise click.ClickException("; ".join(failures) + " — retry with --force.")
+
+
+def _uninstall_script_path() -> Path:
+    """Return an executable uninstall script path for source and wheel installs."""
+    repo_script = Path(__file__).resolve().parent.parent / "scripts" / "uninstall_oss.sh"
+    if repo_script.exists():
+        return repo_script
+    try:
+        resource = resources.files("omnigent.resources.scripts").joinpath("uninstall_oss.sh")
+    except ModuleNotFoundError as exc:
+        raise click.ClickException("uninstall script is missing from this installation") from exc
+    with resources.as_file(resource) as path:
+        if path.exists():
+            temp_dir = Path(tempfile.mkdtemp(prefix="omnigent-uninstall-"))
+            temp_path = temp_dir / "uninstall_oss.sh"
+            shutil.copy2(path, temp_path)
+            temp_path.chmod(0o700)
+            return temp_path
+    raise click.ClickException("uninstall script is missing from this installation")
+
+
+def _write_uninstall_manifest(ledger: Any) -> Path:
+    """Write the ledger fields the POSIX uninstaller needs as tab records."""
+    fd, manifest_name = tempfile.mkstemp(prefix="omnigent-uninstall-ledger-", suffix=".tsv")
+    manifest = Path(manifest_name)
+    with os.fdopen(fd, "w") as handle:
+        for profile in ledger.entries.profiles:
+            handle.write(
+                "\t".join(
+                    [
+                        "profile_block",
+                        profile.path,
+                        profile.block_sha256 or "",
+                        profile.source,
+                        profile.confidence,
+                    ]
+                )
+                + "\n"
+            )
+        for config in ledger.entries.injected_external_config:
+            handle.write(
+                "\t".join(
+                    [
+                        "external_config",
+                        config.path,
+                        config.marker,
+                        config.format,
+                        config.block_sha256 or "",
+                        config.source,
+                        config.confidence,
+                    ]
+                )
+                + "\n"
+            )
+        for launch_agent in ledger.entries.launch_agents:
+            handle.write(
+                "\t".join(
+                    [
+                        "launch_agent",
+                        launch_agent.kind,
+                        launch_agent.path,
+                        launch_agent.label,
+                        launch_agent.source,
+                        launch_agent.confidence,
+                    ]
+                )
+                + "\n"
+            )
+    manifest.chmod(0o600)
+    return manifest
+
+
+def _maybe_fast_backfill_install_ledger(argv: Sequence[str]) -> None:
+    """Create a cheap backfill ledger on first user-facing CLI run."""
+    if argv[0] in {"--help", "-h", "--version", "version", "_internal", "uninstall"}:
+        return
+    with contextlib.suppress(Exception):
+        from omnigent.install_ledger import backfill_install_ledger
+
+        backfill_install_ledger(deep=False, apply=True)
+
+
+@cli.group("_internal", hidden=True)
+def _internal() -> None:
+    """Hidden commands used by installer scripts."""
+
+
+@_internal.command("write-ledger")
+@click.option("--from-env", "from_env", is_flag=True, required=True)
+def _internal_write_ledger(from_env: bool) -> None:
+    """Write install_ledger.json from installer-observed environment."""
+    del from_env
+    from omnigent.install_ledger import ledger_path, write_install_ledger_from_env
+
+    ledger = write_install_ledger_from_env()
+    click.echo(json.dumps({"path": str(ledger_path()), "source": ledger.ledger_source}))
+
+
+@cli.command("doctor")
+@click.option("--migrate-ledger", is_flag=True, help="Backfill install_ledger metadata.")
+@click.option("--deep", is_flag=True, help="Use package-manager and PATH probes.")
+@click.option("--apply", "apply_changes", is_flag=True, help="Write the backfilled ledger.")
+@click.option("--json", "json_output", is_flag=True, help="Emit JSON.")
+def doctor(
+    migrate_ledger: bool,
+    deep: bool,
+    apply_changes: bool,
+    json_output: bool,
+) -> None:
+    """Run maintenance checks and one-off migrations."""
+    if not migrate_ledger:
+        raise click.UsageError("Pass --migrate-ledger to run the install ledger migration.")
+    from omnigent.install_ledger import backfill_install_ledger, backfill_ledger_path
+
+    ledger = backfill_install_ledger(deep=deep, apply=apply_changes)
+    payload = {
+        "applied": apply_changes and ledger is not None,
+        "path": str(backfill_ledger_path()),
+        "ledger": ledger.to_dict() if ledger is not None else None,
+    }
+    if json_output:
+        click.echo(json.dumps(payload, indent=2, sort_keys=True))
+    elif ledger is None:
+        click.echo("No Omnigent install detected; no ledger written.")
+    elif apply_changes:
+        click.echo(f"Wrote backfill ledger to {backfill_ledger_path()}.")
+    else:
+        click.echo(json.dumps(ledger.to_dict(), indent=2, sort_keys=True))
+
+
+@cli.command("uninstall")
+@click.argument(
+    "targets",
+    nargs=-1,
+    type=click.Choice(["cli", "state", "desktop-data", "all"]),
+)
+@click.option("--purge", is_flag=True, help="Remove state data after writing a backup.")
+@click.option("--purge-workspace", is_flag=True, help="Also remove ~/omnigent with --purge.")
+@click.option("--dry-run", is_flag=True, help="Print planned actions only.")
+@click.option("--yes", is_flag=True, help="Run non-interactively for auto-removable artifacts.")
+@click.option("--json", "json_output", is_flag=True, help="Emit JSON.")
+@click.option("--force", is_flag=True, help="Force stubborn processes and tamper refusals.")
+@click.option("--modify-external-config", is_flag=True, help="Allow third-party config edits.")
+@click.option("--no-backup", is_flag=True, help="Skip purge backup creation.")
+@click.option("--assume-inferred", is_flag=True, help="Act on inferred entries when gated.")
+def uninstall(
+    targets: tuple[str, ...],
+    purge: bool,
+    purge_workspace: bool,
+    dry_run: bool,
+    yes: bool,
+    json_output: bool,
+    force: bool,
+    modify_external_config: bool,
+    no_backup: bool,
+    assume_inferred: bool,
+) -> None:
+    """Uninstall Omnigent while preserving user data unless --purge is set."""
+    from omnigent.install_ledger import resolve_uninstall_ledger
+
+    ledger = resolve_uninstall_ledger()
+    destructive_flag = any(
+        (
+            purge,
+            purge_workspace,
+            yes,
+            force,
+            modify_external_config,
+            no_backup,
+            assume_inferred,
+        )
+    )
+    effective_dry_run = dry_run or not destructive_flag
+    if ledger is None:
+        if json_output:
+            click.echo(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "dry_run": effective_dry_run,
+                        "ledger_source": None,
+                        "actions": [],
+                        "backups": [],
+                        "summary": {"done": 0, "skipped": 0, "failed": 0, "reported": 0},
+                        "exit_code": 3,
+                        "error": "no Omnigent install detected",
+                    },
+                    indent=2,
+                )
+            )
+            raise SystemExit(3)
+        click.echo("No Omnigent install detected; nothing to uninstall.", err=True)
+        raise SystemExit(3)
+
+    script_path = _uninstall_script_path()
+    args = [str(script_path)]
+    args.extend(targets)
+    for enabled, flag in (
+        (purge, "--purge"),
+        (purge_workspace, "--purge-workspace"),
+        (effective_dry_run, "--dry-run"),
+        (yes, "--yes"),
+        (json_output, "--json"),
+        (force, "--force"),
+        (modify_external_config, "--modify-external-config"),
+        (no_backup, "--no-backup"),
+        (assume_inferred, "--assume-inferred"),
+    ):
+        if enabled:
+            args.append(flag)
+    env = os.environ.copy()
+    env["OMNIGENT_UNINSTALL_LEDGER_SOURCE"] = ledger.ledger_source
+    manifest = _write_uninstall_manifest(ledger)
+    env["OMNIGENT_UNINSTALL_LEDGER_MANIFEST"] = str(manifest)
+    try:
+        result = subprocess.run(args, env=env, check=False)
+    finally:
+        with contextlib.suppress(OSError):
+            manifest.unlink()
+        if (
+            script_path.name == "uninstall_oss.sh"
+            and script_path.parent.name.startswith("omnigent-uninstall-")
+            and script_path.parent.parent == Path(tempfile.gettempdir())
+        ):
+            shutil.rmtree(script_path.parent, ignore_errors=True)
+    raise SystemExit(result.returncode)
 
 
 def _count_running_sessions(base_url: str) -> int:
@@ -6087,11 +6318,88 @@ def _build_resume_parts() -> list[str]:
     return parts
 
 
+@dataclass(frozen=True)
+class _NativeTerminalDispatchSpec:
+    module: str
+    function: str
+    args_param: str
+    model_strategy: Literal["passthrough", "first_class", "explicit_passthrough"] = "passthrough"
+    prompt_param: str | None = None
+
+
+_NATIVE_TERMINAL_DISPATCH_SPECS: dict[str, _NativeTerminalDispatchSpec] = {
+    "claude": _NativeTerminalDispatchSpec(
+        module="omnigent.claude_native",
+        function="run_claude_native",
+        args_param="claude_args",
+    ),
+    "codex": _NativeTerminalDispatchSpec(
+        module="omnigent.codex_native",
+        function="run_codex_native",
+        args_param="codex_args",
+        model_strategy="first_class",
+    ),
+    "pi": _NativeTerminalDispatchSpec(
+        module="omnigent.pi_native",
+        function="run_pi_native",
+        args_param="pi_args",
+    ),
+    "opencode": _NativeTerminalDispatchSpec(
+        module="omnigent.opencode_native",
+        function="run_opencode_native",
+        args_param="opencode_args",
+        model_strategy="first_class",
+    ),
+    "cursor": _NativeTerminalDispatchSpec(
+        module="omnigent.cursor_native",
+        function="run_cursor_native",
+        args_param="cursor_args",
+    ),
+    "kimi": _NativeTerminalDispatchSpec(
+        module="omnigent.kimi_native",
+        function="run_kimi_native",
+        args_param="kimi_args",
+    ),
+    "kiro": _NativeTerminalDispatchSpec(
+        module="omnigent.kiro_native",
+        function="run_kiro_native",
+        args_param="kiro_args",
+        model_strategy="first_class",
+        prompt_param="prompt",
+    ),
+    "goose": _NativeTerminalDispatchSpec(
+        module="omnigent.goose_native",
+        function="run_goose_native",
+        args_param="goose_args",
+        model_strategy="explicit_passthrough",
+    ),
+    "antigravity": _NativeTerminalDispatchSpec(
+        module="omnigent.antigravity_native",
+        function="run_antigravity_native",
+        args_param="antigravity_args",
+        model_strategy="first_class",
+    ),
+    "qwen": _NativeTerminalDispatchSpec(
+        module="omnigent.qwen_native",
+        function="run_qwen_native",
+        args_param="qwen_args",
+        model_strategy="explicit_passthrough",
+    ),
+    "hermes": _NativeTerminalDispatchSpec(
+        module="omnigent.hermes_native",
+        function="run_hermes_native",
+        args_param="hermes_args",
+        model_strategy="explicit_passthrough",
+    ),
+}
+
+
 def _dispatch_native_terminal_harness(
     *,
     harness: str,
     server: str | None,
     model: str | None,
+    model_from_cli: bool,
     prompt: str | None,
     system_prompt: str | None,
     tools: str | None,
@@ -6115,7 +6423,9 @@ def _dispatch_native_terminal_harness(
     terminal-mirror sessions whose turns originate in the TUI, so dispatch
     straight to the native wrapper (the same code ``omnigent cursor`` /
     ``omnigent claude`` / etc. run), keeping the TUI the single source of
-    turns. A top-level ``--model`` is forwarded as a passthrough CLI flag.
+    turns. A top-level ``--model`` is forwarded in the shape each wrapper
+    expects; wrappers with their own config receive it only when explicitly
+    provided on the command line.
 
     ``--continue`` is honored (not rejected): it resolves to this harness's
     most-recent conversation and hands that off to the wrapper, matching the
@@ -6130,6 +6440,9 @@ def _dispatch_native_terminal_harness(
     native_agent = native_coding_agent_for_harness(harness)
     if native_agent is None:
         return False
+    spec = _NATIVE_TERMINAL_DISPATCH_SPECS.get(native_agent.key)
+    if spec is None:  # pragma: no cover - new native agent added without a dispatch spec
+        raise click.ClickException(f"No native terminal launcher wired for harness {harness!r}.")
 
     # The native TUI wrappers attach to a tmux pane and own their own turn
     # loop, so REPL-only options have no analog there. Reject them loudly
@@ -6139,7 +6452,7 @@ def _dispatch_native_terminal_harness(
     unsupported = [
         flag
         for flag, active in (
-            ("-p/--prompt", prompt is not None),
+            ("-p/--prompt", prompt is not None and spec.prompt_param is None),
             ("--system-prompt", system_prompt is not None),
             ("--tools", tools is not None),
             ("--log", log),
@@ -6189,35 +6502,19 @@ def _dispatch_native_terminal_harness(
         "resume_picker": resume_picker,
         "auto_open_conversation": auto_open_conversation,
     }
-    if native_agent.key == "claude":
-        from omnigent.claude_native import run_claude_native
+    launcher_kwargs = dict(common)
+    if spec.model_strategy == "first_class":
+        launcher_kwargs[spec.args_param] = ()
+        launcher_kwargs["model"] = model
+    elif spec.model_strategy == "explicit_passthrough":
+        launcher_kwargs[spec.args_param] = passthrough if model_from_cli else ()
+    else:
+        launcher_kwargs[spec.args_param] = passthrough
+    if spec.prompt_param is not None:
+        launcher_kwargs[spec.prompt_param] = prompt
 
-        run_claude_native(claude_args=passthrough, **common)
-    elif native_agent.key == "codex":
-        from omnigent.codex_native import run_codex_native
-
-        # Codex takes its model as a first-class arg, not a passthrough flag.
-        run_codex_native(codex_args=(), model=model, **common)
-    elif native_agent.key == "pi":
-        from omnigent.pi_native import run_pi_native
-
-        run_pi_native(pi_args=passthrough, **common)
-    elif native_agent.key == "cursor":
-        from omnigent.cursor_native import run_cursor_native
-
-        run_cursor_native(cursor_args=passthrough, **common)
-    elif native_agent.key == "opencode":
-        from omnigent.opencode_native import run_opencode_native
-
-        # OpenCode pins its model on the wrapper spec (like Codex), so it takes
-        # ``model`` first-class rather than via a ``--model`` passthrough arg.
-        run_opencode_native(opencode_args=(), model=model, **common)
-    elif native_agent.key == "kimi":
-        from omnigent.kimi_native import run_kimi_native
-
-        run_kimi_native(kimi_args=passthrough, **common)
-    else:  # pragma: no cover - new native agent added without a dispatch arm
-        raise click.ClickException(f"No native terminal launcher wired for harness {harness!r}.")
+    launcher = getattr(import_module(spec.module), spec.function)
+    launcher(**launcher_kwargs)
     return True
 
 
@@ -6265,6 +6562,7 @@ def _dispatch_run(
     resume_parts: list[str] | None = None,
     auto_open_conversation: bool = False,
     server_from_cli: bool = False,
+    model_from_cli: bool = False,
 ) -> None:
     """
     Route ``omnigent run`` to the right impl.
@@ -6307,6 +6605,8 @@ def _dispatch_run(
     :param server_from_cli: ``True`` when ``--server`` was explicitly
         provided on the command line. Used to distinguish direct-server
         mode from a configured default server.
+    :param model_from_cli: ``True`` when ``--model`` was explicitly provided
+        on the command line rather than loaded from config.
     """
     if target is not None and _is_server_url(target):
         raise click.ClickException(
@@ -6400,6 +6700,7 @@ def _dispatch_run(
             harness=harness,
             server=server,
             model=model,
+            model_from_cli=model_from_cli,
             prompt=prompt,
             system_prompt=system_prompt,
             tools=tools,
@@ -6782,6 +7083,8 @@ def run(
     # global config, which provides user-level defaults.
     server_source = click.get_current_context().get_parameter_source("server")
     server_from_cli = server_source is not None and server_source.name == "COMMANDLINE"
+    model_source = click.get_current_context().get_parameter_source("model")
+    model_from_cli = model_source is click.core.ParameterSource.COMMANDLINE
     harness_source = click.get_current_context().get_parameter_source("harness")
     harness_from_cli = harness_source is not None and harness_source.name == "COMMANDLINE"
     direct_server_cli = (
@@ -6852,6 +7155,7 @@ def run(
         resume_parts=resume_parts,
         auto_open_conversation=auto_open_conversation,
         server_from_cli=server_from_cli,
+        model_from_cli=model_from_cli,
     )
 
 
@@ -7841,12 +8145,14 @@ def _echo_daemon_payloads(payloads: list[_HostPayload]) -> None:
 @host.command("status")
 @click.option("--server", default=None, help="Inspect only this server target.")
 @click.option("--all", "all_targets", is_flag=True, help="Inspect all known daemon targets.")
+@click.option("--sessions", is_flag=True, help="Include session table.")
 @click.option("--json", "json_output", is_flag=True, help="Emit JSON.")
 @click.pass_context
 def host_status(
     ctx: click.Context,
     server: str | None,
     all_targets: bool,
+    sessions: bool,
     json_output: bool,
 ) -> None:
     """
@@ -7856,6 +8162,7 @@ def host_status(
     :param server: Optional server target to inspect, e.g.
         ``"https://example.databricksapps.com"``.
     :param all_targets: Whether to inspect every known daemon target.
+    :param sessions: Whether to include the session table.
     :param json_output: Whether to emit machine-readable JSON.
     """
     if server is None:
@@ -7864,7 +8171,7 @@ def host_status(
     payloads = [
         _daemon_status_payload(
             record,
-            include_sessions=True,
+            include_sessions=sessions,
             connected_sessions_only=True,
         )
         for record in records

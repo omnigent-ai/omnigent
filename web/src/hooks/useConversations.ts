@@ -29,6 +29,7 @@ import { authenticatedFetch } from "@/lib/identity";
 import {
   filtersFromConversationQueryKey,
   mergeItemsIntoPages,
+  PROJECT_LABEL_KEY,
   removeIdsFromPages,
   type ConversationsInfiniteData,
   type SessionListWireItem,
@@ -41,6 +42,18 @@ import { markConversationSeen } from "./useUnseenConversations";
 
 export const CONNECTED_STREAM_REFETCH_INTERVAL_MS = 60_000;
 export const DISCONNECTED_STREAM_REFETCH_INTERVAL_MS = 45_000;
+
+/**
+ * Query key for the archived-project-names scan (see `useArchivedProjectNames`).
+ *
+ * Deliberately NOT under the `["projects"]` prefix: that scan pages the whole
+ * archived session list, so a shared prefix would re-run it on every
+ * `invalidateQueries(["projects"])` — including project moves/deletes of
+ * *non-archived* sessions that can't change the archived-project set. The
+ * mutations that actually change archived membership or a project label
+ * invalidate this key explicitly instead.
+ */
+const ARCHIVED_PROJECT_NAMES_KEY = ["archived-project-names"] as const;
 
 export interface UseConversationsOptions {
   reconcileWhileConnected?: boolean;
@@ -140,6 +153,13 @@ export interface Conversation {
    * matched. Absent on non-search fetches and title-only matches.
    */
   search_snippet?: string | null;
+  /**
+   * For sub-agent sessions, the id of the direct parent session.
+   * `null` / absent for top-level sessions. Included in
+   * `WS /v1/sessions/updates` frames so `SessionUpdatesProvider` can
+   * invalidate the parent's child-sessions cache when the child changes.
+   */
+  parent_session_id?: string | null;
 }
 
 export interface ConversationsPage {
@@ -188,10 +208,12 @@ async function fetchConversationsPage({
   after,
   searchQuery,
   includeArchived,
+  project,
 }: {
   after?: string;
   searchQuery: string;
   includeArchived: boolean;
+  project?: string;
 }): Promise<ConversationsPage> {
   // `updated_at` matches the sidebar's sort, which keeps server
   // pagination consistent with the visible order as the user scrolls.
@@ -207,6 +229,11 @@ async function fetchConversationsPage({
   // sidebar never pays to fetch them. The server excludes archived
   // sessions unless include_archived=true.
   if (includeArchived) params.set("include_archived", "true");
+  // Scope to one project's sessions server-side. A falsy project (`undefined`
+  // or `""`) is the "all projects" list, so no param is sent — matching the
+  // query key (which drops `project`) and the cache-membership check. This
+  // list never requests the server's "unfiled" (`project=`) slice.
+  if (project) params.set("project", project);
   const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`);
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return (await res.json()) as ConversationsPage;
@@ -221,11 +248,19 @@ async function fetchConversationsPage({
  * debounce the value before passing it. `includeArchived` controls
  * whether archived sessions are fetched — it's part of the query key
  * so toggling it triggers a refetch.
+ *
+ * `project` optionally scopes the list to one project's sessions
+ * (`?project=`, filtered server-side). It's only woven into the query key
+ * when set, so the default sidebar / search callers keep their existing
+ * three-element key and cache entry; a non-empty `project` produces a
+ * distinct four-element key that refetches when the picker changes. Used by
+ * the Archived settings view's project filter.
  */
 export function useConversations(
   searchQuery: string = "",
   includeArchived: boolean = false,
   options: UseConversationsOptions = {},
+  project?: string,
 ) {
   // Live updates arrive over the `WS /v1/sessions/updates` push stream
   // (SessionUpdatesProvider), which patches this cache in place as watched
@@ -236,12 +271,19 @@ export function useConversations(
   // If the socket is down, all consumers use a safety poll.
   const streamConnected = useSessionUpdatesConnected();
   return useInfiniteQuery({
-    queryKey: ["conversations", searchQuery, includeArchived],
+    // Keep the base three-element key for the unfiltered callers (byte-for-byte
+    // unchanged, so the sidebar / rename / push-delta paths are untouched); only
+    // append `project` for a concrete name. A falsy project (`undefined` or `""`)
+    // is "all projects" and shares the base key — there is no distinct "" variant.
+    queryKey: project
+      ? ["conversations", searchQuery, includeArchived, project]
+      : ["conversations", searchQuery, includeArchived],
     queryFn: ({ pageParam }) =>
       fetchConversationsPage({
         after: pageParam as string | undefined,
         searchQuery,
         includeArchived,
+        project,
       }),
     initialPageParam: undefined as string | undefined,
     getNextPageParam: (lastPage) =>
@@ -382,6 +424,13 @@ export function useArchiveConversation() {
       // or drops it from that project folder's own paginated list.
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
       void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
+      // Archiving can change (or empty) a project's newest member, which the
+      // composer prefill reuses — refresh it so prefill never anchors on a
+      // session that just left the active list.
+      void queryClient.invalidateQueries({ queryKey: ["project-newest-session"] });
+      // Archive membership just changed, so the archived-view picker's option
+      // set may have gained/lost a project.
+      void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
     },
   });
 }
@@ -452,6 +501,11 @@ export function useStopAndDeleteConversation() {
       // list, /v1/sessions/projects reads the DB directly (no search-index
       // lag), so this can't resurrect the deleted row.
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
+      // The deleted session may have been a project's newest member, which
+      // the composer prefill anchors on — refresh it too.
+      void queryClient.invalidateQueries({ queryKey: ["project-newest-session"] });
+      // Deleting an archived session may empty its project of archived members.
+      void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
     },
   });
 }
@@ -512,6 +566,8 @@ export function useBulkArchiveConversations() {
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
       void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
+      void queryClient.invalidateQueries({ queryKey: ["project-newest-session"] });
+      void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
     },
   });
 }
@@ -566,6 +622,8 @@ export function useBulkDeleteConversations() {
       // Refresh the project list so a project emptied by these deletes drops
       // its now-empty folder (DB-direct read, no search-index lag).
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
+      void queryClient.invalidateQueries({ queryKey: ["project-newest-session"] });
+      void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
     },
     onError: (err: any) => {
       if (err?.succeeded) {
@@ -583,6 +641,8 @@ export function useBulkDeleteConversations() {
           queryClient.removeQueries({ queryKey: ["session", id] });
         }
         void queryClient.invalidateQueries({ queryKey: ["projects"] });
+        void queryClient.invalidateQueries({ queryKey: ["project-newest-session"] });
+        void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
       }
     },
   });
@@ -661,13 +721,10 @@ export function usePinnedConversationBackfill(
 
 // ── Project hooks ─────────────────────────────────────────────────────────────
 
-/**
- * The reserved `conversation_labels` key that stores a session's project
- * membership. Namespaced (`omni_*`) so it never collides with the user-facing
- * "project" term or other reserved keys, and is filtered out of generic label
- * surfaces.
- */
-export const PROJECT_LABEL_KEY = "omni_project";
+// The reserved `conversation_labels` project key lives in the leaf cache
+// module (see sessionListCache) so the cache membership checks can read it
+// without a value import cycle; re-exported here for the existing consumers.
+export { PROJECT_LABEL_KEY };
 
 /** Fetch all project names from `GET /v1/sessions/projects`. */
 export function useProjects() {
@@ -679,6 +736,70 @@ export function useProjects() {
       return (await res.json()) as string[];
     },
     staleTime: 30_000,
+  });
+}
+
+/**
+ * Fetch the names of every project that has at least one ARCHIVED session,
+ * paging through all archived sessions server-side.
+ *
+ * The Archived settings picker can't source options from `useProjects()`:
+ * `list_projects` (GET /v1/sessions/projects) omits projects whose every
+ * session is archived — exactly the population this page filters. And deriving
+ * options from only the archived list's loaded first page would miss
+ * archived-only projects whose sessions sit on later pages. So page through the
+ * whole archived set (a larger page size keeps the request count low) and
+ * collect the distinct `omni_project` labels present on archived rows.
+ *
+ * Exported for direct unit testing.
+ */
+export async function fetchAllArchivedProjectNames(): Promise<string[]> {
+  const names = new Set<string>();
+  let after: string | undefined;
+  for (;;) {
+    const params = new URLSearchParams({
+      order: "desc",
+      sort_by: "updated_at",
+      limit: "100",
+      include_archived: "true",
+    });
+    if (after) params.set("after", after);
+    // Sequential by necessity: each page's request needs the previous page's
+    // cursor (`after`), so these awaits can't be parallelized.
+    // eslint-disable-next-line no-await-in-loop
+    const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`);
+    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+    // eslint-disable-next-line no-await-in-loop
+    const page = (await res.json()) as ConversationsPage;
+    for (const conv of page.data) {
+      // include_archived returns archived AND active rows; only archived ones
+      // are filterable on this page, so collect labels from those.
+      if (conv.archived !== true) continue;
+      const name = conv.labels?.[PROJECT_LABEL_KEY];
+      if (name) names.add(name);
+    }
+    if (!page.has_more || !page.last_id) break;
+    after = page.last_id;
+  }
+  return [...names].sort((a, b) => a.localeCompare(b));
+}
+
+/**
+ * Project names that have archived sessions — the option set for the Archived
+ * view's project filter.
+ *
+ * Deliberately a standalone key (`ARCHIVED_PROJECT_NAMES_KEY`), NOT under the
+ * `["projects"]` prefix, so the expensive full-list scan isn't dragged along
+ * by unrelated `invalidateQueries(["projects"])` calls. The mutations that actually change
+ * archived membership or a project label invalidate this key explicitly to keep
+ * the picker in sync. Only fetched while the Archived settings view is mounted
+ * (its sole caller), so the scan never runs for users who don't open it.
+ */
+export function useArchivedProjectNames() {
+  return useQuery<string[]>({
+    queryKey: ARCHIVED_PROJECT_NAMES_KEY,
+    queryFn: fetchAllArchivedProjectNames,
+    staleTime: 60_000,
   });
 }
 
@@ -710,8 +831,13 @@ export function useMoveToProject() {
       markConversationSeen(updated.id, updated.updated_at);
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
-      // Moving into/out of a project changes both folders' paginated lists.
+      // Moving into/out of a project changes both folders' paginated lists,
+      // and can change either project's newest member the prefill anchors on.
       void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
+      void queryClient.invalidateQueries({ queryKey: ["project-newest-session"] });
+      // Moving an archived session relabels which project owns it, shifting the
+      // archived-view picker's option set.
+      void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
     },
   });
 }
@@ -772,11 +898,12 @@ export async function fetchProjectSessionIds(project: string, limit = 2): Promis
 async function fetchProjectSessionsPage(
   project: string,
   after?: string,
+  limit = 20,
 ): Promise<ConversationsPage> {
   const params = new URLSearchParams({
     order: "desc",
     sort_by: "updated_at",
-    limit: "20",
+    limit: String(limit),
     project,
   });
   if (after) params.set("after", after);
@@ -803,6 +930,24 @@ export function useProjectSessions(project: string, enabled: boolean) {
     getNextPageParam: (lastPage) =>
       lastPage.has_more ? (lastPage.last_id ?? undefined) : undefined,
     enabled,
+  });
+}
+
+/**
+ * The newest (non-archived) session filed under a project, or `null` when
+ * the project has no session the caller can read. Powers the new-session
+ * landing screen's project prefill: starting another session in a project
+ * reuses its most recent session's host, repo, and agent.
+ */
+export function useNewestProjectSession(project: string | null) {
+  return useQuery({
+    queryKey: ["project-newest-session", project],
+    queryFn: async () => {
+      const page = await fetchProjectSessionsPage(project as string, undefined, 1);
+      return page.data[0] ?? null;
+    },
+    enabled: project !== null && project !== "",
+    staleTime: 30_000,
   });
 }
 
@@ -843,6 +988,9 @@ export function useDeleteProject() {
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
       void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
+      void queryClient.invalidateQueries({ queryKey: ["project-newest-session"] });
+      // Deleting a project archives its members, growing the archived set.
+      void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
     },
   });
 }

@@ -412,9 +412,10 @@ export function CodeViewer({
     return () => window.removeEventListener("keydown", handler);
   }, [panelOpen, isMarkdownEditor, showMonaco, searchOpen, setSearchOpen, searchInputRef]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // In Monaco mode the custom search bar isn't rendered; the editor opens its
-  // native find when `searchOpen` is set (once it has mounted), then calls this
-  // to reset the flag so the next Find click re-triggers it.
+  // In Monaco mode the custom search bar isn't rendered; the editor mirrors its
+  // native find widget to `searchOpen` (open when set, close when cleared). This
+  // resets the flag when find is closed from within Monaco (Escape or the
+  // widget's ✕) so the toolbar toggle stays in sync with the visible widget.
   const handleSearchHandled = useCallback(() => setSearchOpen(false), [setSearchOpen]);
 
   // Show "Add Comment" button after the user finishes a text selection

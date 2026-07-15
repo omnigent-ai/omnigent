@@ -6301,8 +6301,15 @@ def test_claude_transcript_tool_use_result_is_json_parseable(
     record = records[0]
     # toolUseResult must parse without raising, and preserve the value.
     assert json.loads(record["toolUseResult"]) == expected_parsed
-    # The tool_result content block keeps the raw string unchanged.
-    assert record["message"]["content"][0]["content"] == output
+    # Plain-text results keep the raw string as the content block; a
+    # content-block array (e.g. images) is rehydrated into real blocks so
+    # ``claude --resume`` sends them as blocks, not text (see the dedicated
+    # rehydration test below).
+    content = record["message"]["content"][0]["content"]
+    if isinstance(expected_parsed, list):
+        assert content == expected_parsed
+    else:
+        assert content == output
 
 
 def test_json_safe_tool_use_result_wraps_non_json() -> None:
@@ -6314,6 +6321,75 @@ def test_json_safe_tool_use_result_wraps_non_json() -> None:
     assert claude_native._json_safe_tool_use_result("42") == "42"
     # A JSON object string passes through unchanged.
     assert claude_native._json_safe_tool_use_result('{"a":1}') == '{"a":1}'
+
+
+def test_claude_tool_result_content_blocks_rehydrates_only_block_arrays() -> None:
+    """Only a non-empty list of text/image block dicts rehydrates; else ``None``."""
+    fn = claude_native._claude_tool_result_content_blocks
+    # An image content-block array rehydrates to the parsed list.
+    assert fn('[{"type":"image","source":{"type":"base64","data":"AAA"}}]') == [
+        {"type": "image", "source": {"type": "base64", "data": "AAA"}}
+    ]
+    # A text block array rehydrates too.
+    assert fn('[{"type":"text","text":"hi"}]') == [{"type": "text", "text": "hi"}]
+    # Plain text is not JSON → keep the raw string.
+    assert fn("file written") is None
+    # A JSON string / number / object is not a block array → keep raw.
+    assert fn('"just a string"') is None
+    assert fn("42") is None
+    assert fn('{"type":"image"}') is None
+    # An empty array carries nothing to rehydrate.
+    assert fn("[]") is None
+    # A list whose entries are not typed block dicts is not a block array.
+    assert fn('["a","b"]') is None
+    assert fn('[{"no_type":1}]') is None
+    # A typed block the API does not accept in a tool_result stays a raw
+    # string, so resume keeps sending exactly what it sent before.
+    assert fn('[{"type":"file","path":"/x"}]') is None
+
+
+def test_claude_transcript_image_result_sent_as_blocks_not_text() -> None:
+    """
+    Image tool results resume as real content blocks, not base64 text.
+
+    A screenshot tool result is persisted as a stringified content-block
+    array. The old code dropped that string straight into the
+    ``tool_result`` content, so ``claude --resume`` re-sent ~250K tokens of
+    base64 as plain text and blew the context limit. The synthesizer must
+    rehydrate it into image blocks so the API tokenizes it as an image.
+    """
+    # ~4K chars of base64 stands in for a real screenshot payload.
+    big_b64 = "A" * 4096
+    output = json.dumps(
+        [
+            {
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": big_b64},
+            }
+        ]
+    )
+    items: list[dict[str, Any]] = [
+        {
+            "id": "fco_1",
+            "response_id": "resp_1",
+            "type": "function_call_output",
+            "call_id": "toolu_1",
+            "output": output,
+        }
+    ]
+    records = claude_native._claude_transcript_records_from_session_items(
+        items,
+        session_id="conv_test",
+        external_session_id="02857840-6362-408f-b41f-309e396ed7c6",
+        cwd=Path("/tmp/test"),
+    )
+    assert len(records) == 1
+    block = records[0]["message"]["content"][0]
+    assert block["type"] == "tool_result"
+    # content is a real content-block list — an image block, not a string.
+    assert isinstance(block["content"], list)
+    assert block["content"][0]["type"] == "image"
+    assert block["content"][0]["source"]["data"] == big_b64
 
 
 def test_tool_use_result_regression_old_flatten_would_crash_resume() -> None:

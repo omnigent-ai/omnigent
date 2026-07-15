@@ -18,6 +18,7 @@
 import { type ReactNode, useCallback, useEffect, useRef } from "react";
 import { type QueryClient, useQueryClient } from "@tanstack/react-query";
 import { useActiveConversationId } from "@/hooks/useActiveConversationId";
+import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
 import {
   type ConversationsInfiniteData,
   type SessionListWireItem,
@@ -175,6 +176,21 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
     // the open session even when it's off-sidebar.
     const active = activeIdRef.current;
     if (active && !ids.includes(active)) ids.push(active);
+    // Include all child session ids from the sub-agent tree caches so the
+    // server streams status changes for them. When a child's changed frame
+    // arrives below, we invalidate its parent's child_sessions query key,
+    // giving the tree views push-style freshness without polling.
+    const childEntries = queryClient.getQueriesData<ChildSessionInfo[]>({
+      queryKey: ["conversation"],
+    });
+    for (const [key, children] of childEntries) {
+      // Only ["conversation", <id>, "child_sessions"] entries carry child lists.
+      if (Array.isArray(key) && key[2] === "child_sessions" && Array.isArray(children)) {
+        for (const child of children) {
+          if (!ids.includes(child.id)) ids.push(child.id);
+        }
+      }
+    }
     sessionUpdatesSocket.setWatched(ids);
   }, [queryClient]);
 
@@ -198,6 +214,10 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
         // Converge each project folder's own list too (new/archived/relabeled
         // members the local field-patch can't place).
         void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
+        // Another client archiving/relabeling/deleting can add or remove a
+        // project from the Archived view's picker; only local mutations
+        // invalidate this scan otherwise.
+        void queryClient.invalidateQueries({ queryKey: ["archived-project-names"] });
       }, DEBOUNCE_MS);
     };
 
@@ -237,6 +257,17 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
               if (!watchedIds.has(id)) commentsFingerprintsRef.current.delete(id);
             }
           }
+          // For child sessions the server includes parent_session_id in the
+          // wire item. Invalidate the parent's child_sessions cache so tree
+          // views (SubagentsPanel, SubagentsGraphView) pick up status changes
+          // without polling.
+          const parentIds = new Set<string>();
+          for (const item of frame.items) {
+            if (item.parent_session_id) parentIds.add(item.parent_session_id);
+          }
+          for (const parentId of parentIds) {
+            void queryClient.invalidateQueries({ queryKey: childSessionsQueryKey(parentId) });
+          }
           const { missingIds, needsRefetch } = applyItemsToCache(
             queryClient,
             frame.items,
@@ -271,6 +302,11 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
       // folder's list changes (fetch, pagination, splice) so newly loaded
       // folder members join the stream's watch-set.
       if (Array.isArray(key) && (key[0] === "conversations" || key[0] === "project-sessions")) {
+        scheduleWatch();
+      }
+      // Also recompute when a child-sessions list loads so the tree nodes
+      // join the watch-set and the server starts streaming their status.
+      if (Array.isArray(key) && key[0] === "conversation" && key[2] === "child_sessions") {
         scheduleWatch();
       }
     });

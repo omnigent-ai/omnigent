@@ -17,7 +17,7 @@ import shutil
 import sys
 import threading
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -9279,6 +9279,72 @@ async def test_events_codex_native_settings_change_uses_thread_settings_update(
         f"codex-native {event_payload['type']} must call thread/settings/update "
         f"with next-turn settings; got {fake_client.requests!r}."
     )
+
+
+@pytest.mark.asyncio
+async def test_opencode_native_model_options_uses_cli_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from omnigent import opencode_native_app_server, opencode_native_bridge
+    from omnigent.opencode_native_bridge import OpenCodeNativeBridgeState
+    from omnigent.spec.types import ExecutorSpec
+
+    conv_id = "conv_opencode_native_model_options"
+    monkeypatch.setattr(opencode_native_bridge, "_BRIDGE_ROOT", tmp_path)
+    monkeypatch.setattr(
+        opencode_native_bridge,
+        "read_bridge_state",
+        lambda _dir: OpenCodeNativeBridgeState(
+            session_id=conv_id,
+            server_base_url="http://127.0.0.1:49231",
+            opencode_session_id="ses_1",
+        ),
+    )
+    captured_envs: list[Mapping[str, str] | None] = []
+
+    def _fake_list_options(*, env: Mapping[str, str] | None = None) -> list[dict[str, object]]:
+        captured_envs.append(env)
+        return [{"id": "opencode-go/glm-5.2", "displayName": "opencode-go/glm-5.2"}]
+
+    monkeypatch.setattr(
+        opencode_native_app_server,
+        "list_opencode_cli_model_options",
+        _fake_list_options,
+    )
+    spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "opencode-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        response = await client.get(f"/v1/sessions/{conv_id}/codex-model-options")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "models": [{"id": "opencode-go/glm-5.2", "displayName": "opencode-go/glm-5.2"}]
+    }
+    assert len(captured_envs) == 1
+    cli_env = captured_envs[0]
+    assert cli_env is not None
+    bridge_dir = opencode_native_bridge.bridge_dir_for_bridge_id(conv_id)
+    assert cli_env["XDG_DATA_HOME"] == str(bridge_dir / "xdg-data")
+    assert cli_env["XDG_CONFIG_HOME"] == str(bridge_dir / "xdg-config")
 
 
 @pytest.mark.asyncio

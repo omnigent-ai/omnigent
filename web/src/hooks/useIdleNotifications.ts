@@ -121,7 +121,7 @@ function isWindowFocused(): boolean {
  */
 export function useIdleNotifications(activeConversationId?: string): void {
   const navigate = useNavigate();
-  const { data } = useConversations();
+  const { data } = useConversations("", true);
   const prevStatus = useRef<Map<string, ConversationStatus>>(new Map());
   const prevElicitations = useRef<Map<string, number>>(new Map());
   // Last badge state sent to the shell, as a `count|navigatePath|title|body` key.

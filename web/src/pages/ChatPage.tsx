@@ -599,8 +599,8 @@ export function ChatPage() {
     isLoading: agentsLoading,
     error: agentsError,
     refetch: refetchAgents,
-  } = useAgents();
-  const { data: conversationsData } = useConversations();
+  } = useAgents({ enabled: !!urlConvId });
+  const { data: conversationsData } = useConversations("", true);
   const conversations = useMemo(
     () => conversationsData?.pages.flatMap((p) => p.data),
     [conversationsData],
@@ -4367,13 +4367,15 @@ export function Composer({
       // the user choose there. "/model <name>" takes the builtin route below to
       // setModel — the same write the picker makes.
       //
-      // opencode is excluded: it surfaces showModels (the pill mirrors its live
-      // TUI model) but ships no web model options, so intercepting bare "/model"
-      // would pop an empty dropdown and swallow the command. Fall through to the
-      // builtin "/model" handler below, which surfaces the current model as a
-      // read-only hint. ("/model <name>" still routes to setModel there —
-      // opencode reads model_override on the next web-injected turn.)
-      if (cmd === "/model" && !arg && showModels && modelPickerKind !== "opencode") {
+      // opencode-native now surfaces server-backed model options too, so bare
+      // "/model" opens the picker when options are loaded. When the options are
+      // still empty (e.g. the runner catalog hasn't arrived yet), fall through
+      // to the builtin "/model" handler, which surfaces the current model as a
+      // read-only hint instead of popping an empty dropdown. ("/model <name>"
+      // still routes to setModel there — opencode reads model_override on the
+      // next web-injected turn.)
+      const canOpenModelPicker = modelPickerKind !== "opencode" || codexModelOptions.length > 0;
+      if (cmd === "/model" && !arg && showModels && canOpenModelPicker) {
         dirtyRef.current = true;
         setValue("");
         setCommandError(null);
@@ -5370,14 +5372,15 @@ function AgentPicker({
   const sessionModelOverride = useChatStore((s) => s.sessionModelOverride);
   const llmModel = useChatStore((s) => s.llmModel);
 
-  // Codex, cursor, kiro, and pi all populate the picker from the
+  // Codex, cursor, kiro, pi, and opencode all populate the picker from the
   // server-provided ``codexModelOptions`` channel (the snapshot's
   // ``model_options`` field); claude uses the static local catalog.
   const usesServerModelOptions =
     modelPickerKind === "codex" ||
     modelPickerKind === "cursor" ||
     modelPickerKind === "kiro" ||
-    modelPickerKind === "pi";
+    modelPickerKind === "pi" ||
+    modelPickerKind === "opencode";
   const modelOptions: ReadonlyArray<{ id: string; label?: string; displayName?: string }> =
     modelPickerKind === "claude"
       ? CLAUDE_NATIVE_MODELS

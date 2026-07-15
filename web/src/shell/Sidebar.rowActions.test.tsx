@@ -297,6 +297,43 @@ describe("double-click to rename", () => {
     expect(mocks.rename.mutate).toHaveBeenCalledWith({ id: "conv_1", title: "Renamed Session" });
   });
 
+  it("does not commit the rename when Enter confirms an active IME composition", () => {
+    renderSidebar();
+
+    const row = screen.getByRole("link", { name: /My Session/ });
+    fireEvent.dblClick(row);
+
+    const input = screen.getByTestId("rename-conversation-input") as HTMLInputElement;
+    fireEvent.compositionStart(input);
+    fireEvent.change(input, { target: { value: "名前変更" } });
+
+    // The Enter that confirms the conversion candidate must NOT commit.
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(mocks.rename.mutate).not.toHaveBeenCalled();
+
+    // Once composition ends, a subsequent Enter commits as usual.
+    fireEvent.compositionEnd(input);
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(mocks.rename.mutate).toHaveBeenCalledTimes(1);
+    expect(mocks.rename.mutate).toHaveBeenCalledWith({ id: "conv_1", title: "名前変更" });
+  });
+
+  it("does not commit the rename when Enter carries the IME keyCode 229 fallback", () => {
+    renderSidebar();
+
+    const row = screen.getByRole("link", { name: /My Session/ });
+    fireEvent.dblClick(row);
+
+    const input = screen.getByTestId("rename-conversation-input") as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "Renamed" } });
+    fireEvent.keyDown(input, { key: "Enter", keyCode: 229 });
+    expect(mocks.rename.mutate).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(mocks.rename.mutate).toHaveBeenCalledTimes(1);
+    expect(mocks.rename.mutate).toHaveBeenCalledWith({ id: "conv_1", title: "Renamed" });
+  });
+
   it("does not enter rename on double-click for a viewer-only row", () => {
     // permission_level 1 is below the edit threshold (>= 2), so the kebab's
     // Rename item is disabled and double-click must be inert too. A viewer-only
