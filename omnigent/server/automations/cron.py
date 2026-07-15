@@ -29,6 +29,20 @@ _SEARCH_DAYS = 366
 
 _UTC = ZoneInfo("UTC")
 
+# Fixed anchor for the interval check. Using a constant UTC instant (rather
+# than ``datetime.now``) makes validation deterministic — the same expression
+# always passes or fails regardless of when it runs. UTC has no DST, so folds
+# can't perturb the sampled gaps. The anchor is a leap year (Jan 1, 2016) so a
+# ``… 29 2 *`` expression still reaches Feb 29 within the search horizon and is
+# rejected as "fires only once" rather than "never fires".
+_INTERVAL_ANCHOR = datetime(2016, 1, 1, tzinfo=_UTC)
+
+# How far past the anchor to sample consecutive fires when measuring the
+# minimum interval. A sub-floor gap can only occur between minute- or
+# hour-adjacent fires, both of which recur every hour, so a full 25-hour span
+# is guaranteed to contain any tight pair the expression can produce.
+_INTERVAL_WINDOW = timedelta(hours=25)
+
 
 class CronValidationError(ValueError):
     """Raised when a cron expression is malformed or violates a scheduler rule."""
@@ -184,8 +198,12 @@ def get_next_fire_time(
         if local.minute not in parsed.minute.values:
             local = local + timedelta(minutes=1)
             continue
-        # All fields match. Re-localize to resolve any DST wall-clock fold.
-        return local.replace(tzinfo=tz)
+        # All fields match. `local` is already aware in `tz`, so no fold
+        # resolution happens here: a spring-forward "imaginary" wall-clock
+        # time maps to some instant via zoneinfo, and a fall-back duplicated
+        # time picks the earlier of the two. Both are acceptable at a 5-minute
+        # floor — the schedule can slip by at most an hour across a DST edge.
+        return local
 
     return None
 
@@ -207,34 +225,50 @@ class CronTrigger:
         return get_next_fire_time(self.parsed, after, tz)
 
 
-def validate_cron(expression: str, tz: ZoneInfo | None = None) -> CronTrigger:
+def validate_cron(expression: str, tz: ZoneInfo | None = None) -> CronTrigger:  # noqa: ARG001
     """Parse and validate a cron expression for use as a recurring trigger.
 
     Beyond syntax, enforces that the expression (a) fires at least twice within
-    the search horizon and (b) has a gap of at least :data:`MIN_INTERVAL_SECONDS`
-    between two consecutive fires.
+    the search horizon and (b) has a minimum gap of at least
+    :data:`MIN_INTERVAL_SECONDS` between *any* two consecutive fires.
+
+    The interval check samples fires from a fixed UTC anchor, so the verdict is
+    deterministic (independent of the wall-clock instant it runs at) and immune
+    to DST folds.
 
     :param expression: The 5-field cron string.
-    :param tz: The timezone to sample fire times in; defaults to UTC. The
-        interval check is timezone-agnostic for the cadences we allow, so UTC
-        is a safe default here.
+    :param tz: Accepted for API compatibility but not used by the interval
+        check, which is timezone-agnostic for the cadences we allow.
     :returns: A :class:`CronTrigger`.
     :raises CronValidationError: On bad syntax, never-fires, fires-once, or a
         sub-minimum interval.
     """
-    zone = tz or _UTC
     parsed = parse_cron(expression)
-    now = datetime.now(zone)
-    t0 = get_next_fire_time(parsed, now, zone)
-    if t0 is None:
+    # Sample fires from a fixed UTC anchor so validation is deterministic and
+    # DST-agnostic — the `tz` parameter is retained for API compatibility but
+    # the interval check is timezone-agnostic for the cadences we allow.
+    prev = get_next_fire_time(parsed, _INTERVAL_ANCHOR, _UTC)
+    if prev is None:
         raise CronValidationError("Cron expression never fires")
-    t1 = get_next_fire_time(parsed, t0, zone)
-    if t1 is None:
+    cur = get_next_fire_time(parsed, prev, _UTC)
+    if cur is None:
         raise CronValidationError("Cron expression fires only once")
-    gap = (t1 - t0).total_seconds()
-    if gap < MIN_INTERVAL_SECONDS:
+
+    # Take the *minimum* gap across every consecutive pair in the window, not
+    # just the first pair: an expression like ``0,1 * * * *`` spaces fires
+    # irregularly, so the tightest (sub-floor) pair need not be the first one.
+    window_end = prev + _INTERVAL_WINDOW
+    min_gap = (cur - prev).total_seconds()
+    while cur < window_end:
+        nxt = get_next_fire_time(parsed, cur, _UTC)
+        if nxt is None:
+            break
+        min_gap = min(min_gap, (nxt - cur).total_seconds())
+        prev, cur = cur, nxt
+
+    if min_gap < MIN_INTERVAL_SECONDS:
         raise CronValidationError(
             f"Minimum interval is {MIN_INTERVAL_SECONDS // 60} minutes "
-            f"(this expression fires every {int(gap)}s)"
+            f"(this expression fires every {int(min_gap)}s)"
         )
     return CronTrigger(parsed=parsed, expression=expression)

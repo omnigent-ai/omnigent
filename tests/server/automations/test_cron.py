@@ -194,6 +194,16 @@ def test_validate_rejects_sub_floor_step() -> None:
         validate_cron("*/4 * * * *")
 
 
+def test_validate_rejects_irregular_sub_floor_pair() -> None:
+    # Fires at :00 and :01 each hour -> consecutive gaps alternate
+    # [3540s, 60s, 3540s, ...]. The tightest pair (60s) is well under the
+    # 300s floor, but it is never the *first* pair, so a validator that only
+    # measures the first gap would wrongly accept this. Rejection must not
+    # depend on the wall-clock minute validation happens to run at.
+    with pytest.raises(CronValidationError):
+        validate_cron("0,1 * * * *")
+
+
 def test_validate_rejects_never_fires() -> None:
     with pytest.raises(CronValidationError):
         validate_cron("0 0 31 2 *")

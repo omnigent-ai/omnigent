@@ -82,6 +82,30 @@ async def test_lifespan_starts_and_stops_scheduler(
     assert scheduler.job_count == 0
 
 
+async def test_lifespan_survives_scheduler_start_failure(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failure loading the schedule at boot (e.g. a DB error in
+    ``list_active()``) is logged and swallowed — server boot still completes."""
+    store = SqlAlchemyScheduledTaskStore(db_uri)
+
+    def _boom() -> list:
+        raise RuntimeError("db is down")
+
+    monkeypatch.setattr(store, "list_active", _boom)
+    app = _build_app(db_uri, tmp_path, scheduled_task_store=store)
+
+    # Entering the lifespan must not raise despite start() blowing up.
+    async with app.router.lifespan_context(app):
+        scheduler = app.state.automation_scheduler
+        assert scheduler is not None
+        assert not scheduler.is_started
+        assert scheduler.job_count == 0
+
+
 async def test_lifespan_without_store_has_no_scheduler(
     runtime_init: None,
     db_uri: str,

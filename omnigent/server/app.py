@@ -1390,7 +1390,17 @@ def create_app(
                 on_fire=_placeholder_on_fire,
             )
             app_inst.state.automation_scheduler = automation_scheduler
-            await automation_scheduler.start()
+            # Routines are a non-critical subsystem: a failure loading the
+            # schedule (e.g. a DB error in list_active()) must not take down
+            # server boot. Log and continue with the scheduler unstarted.
+            try:
+                await automation_scheduler.start()
+            except Exception as exc:
+                _logger.exception(
+                    "automation scheduler failed to start; continuing without "
+                    "recurring tasks (%s)",
+                    exc,
+                )
 
         try:
             yield
