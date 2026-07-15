@@ -2508,6 +2508,75 @@ async def test_runner_read_inbox_continues_after_malformed_terminal_idle_item() 
     assert session_inbox.empty()
 
 
+@pytest.mark.parametrize(
+    ("arguments", "expected_error"),
+    [
+        ("{", "malformed JSON arguments"),
+        ("", "malformed JSON arguments"),
+        ("   ", "malformed JSON arguments"),
+        ("[]", "arguments must be a JSON object"),
+        ("42", "arguments must be a JSON object"),
+        ("null", "arguments must be a JSON object"),
+        ('"scalar"', "arguments must be a JSON object"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_execute_tool_rejects_non_object_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+    arguments: str,
+    expected_error: str,
+) -> None:
+    """
+    Malformed or non-object argument payloads fail before tool dispatch.
+
+    A silent ``{}`` substitution would run a default/no-argument system
+    tool after bad input; the shared parser must reject these shapes and
+    the underlying OS-env handler must never be entered.
+    """
+    from omnigent.runner import tool_dispatch
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    calls: list[object] = []
+
+    async def _spy_os_env_tool(*args: object, **kwargs: object) -> str:
+        calls.append((args, kwargs))
+        return json.dumps({"ok": True})
+
+    monkeypatch.setattr(tool_dispatch, "_execute_os_env_tool", _spy_os_env_tool)
+
+    output = await execute_tool(tool_name="sys_os_read", arguments=arguments)
+
+    assert json.loads(output) == {"error": expected_error}
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_execute_tool_accepts_empty_object_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Valid ``{}`` still reaches the tool with an empty argument dict."""
+    from omnigent.runner import tool_dispatch
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    calls: list[dict[str, Any]] = []
+
+    async def _spy_os_env_tool(
+        tool_name: str,
+        args: dict[str, Any],
+        **_kwargs: object,
+    ) -> str:
+        del tool_name
+        calls.append(args)
+        return json.dumps({"ok": True})
+
+    monkeypatch.setattr(tool_dispatch, "_execute_os_env_tool", _spy_os_env_tool)
+
+    output = await execute_tool(tool_name="sys_os_read", arguments="{}")
+
+    assert json.loads(output) == {"ok": True}
+    assert calls == [{}]
+
+
 # ── End-to-end with real harness subprocess + real LLM ──
 
 

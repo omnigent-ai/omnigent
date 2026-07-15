@@ -59,6 +59,7 @@ from omnigent.session_lifecycle import (
 )
 from omnigent.tools import ToolManager
 from omnigent.tools.base import ToolContext
+from omnigent.tools.builtins._arguments import parse_json_object_arguments
 from omnigent.tools.builtins.async_inbox import (
     SysCallAsyncTool,
     SysCancelAsyncTool,
@@ -4603,10 +4604,12 @@ async def execute_tool(
         not tracked — shell side-effects cannot be attributed to a session.
     :returns: Tool output string.
     """
-    try:
-        args = json.loads(arguments)
-    except json.JSONDecodeError:
-        args = {}
+    if not arguments.strip():
+        return json.dumps({"error": "malformed JSON arguments"})
+    args, error = parse_json_object_arguments(arguments)
+    if error is not None:
+        return json.dumps({"error": error})
+    assert args is not None
 
     try:
         if mcp_manager is not None:
