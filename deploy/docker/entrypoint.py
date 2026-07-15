@@ -28,6 +28,8 @@ Configuration is via environment variables:
   ARTIFACT_DIR          Directory for the local artifact store.
                         Defaults to ``/data/artifacts`` (the volume
                         mount point used by docker-compose).
+  OMNIGENT_AGENT_ROOT   Optional directory whose immediate child
+                        directories contain managed agent bundles.
   HOST, PORT            Bind address. Default ``0.0.0.0:8000``.
 """
 
@@ -254,6 +256,45 @@ def _select_artifact_store(resolved_config: _ResolvedConfig) -> ArtifactStore:
     return LocalArtifactStore(str(resolved_config.artifact_dir))
 
 
+def _register_configured_agents(
+    root: Path,
+    agent_store: Any,
+    artifact_store: Any,
+    agent_cache: Any,
+) -> None:
+    """Register each agent bundle directly beneath ``root``.
+
+    :raises RuntimeError: If the configured root is missing, unreadable, or a
+        discovered bundle cannot be registered with a name.
+    """
+    from omnigent.runtime.agent_registration import register_agent
+
+    if not root.is_dir():
+        raise RuntimeError(f"OMNIGENT_AGENT_ROOT is not a directory: {root}")
+
+    try:
+        sources = sorted(
+            child
+            for child in root.iterdir()
+            if child.is_dir() and (child / "config.yaml").is_file()
+        )
+    except OSError as exc:
+        raise RuntimeError(f"Could not scan OMNIGENT_AGENT_ROOT {root}: {exc}") from exc
+
+    for source in sources:
+        result = register_agent(source, agent_store, artifact_store, agent_cache)
+        if result is None:
+            raise RuntimeError(f"Configured agent has no name: {source}")
+        action = "updated" if result.changed else "unchanged"
+        logger.info(
+            "Registered agent %s version %d (%s) from %s",
+            result.name,
+            result.version,
+            action,
+            source,
+        )
+
+
 def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
     """Resolve config if needed, wire the stores, and build the app.
 
@@ -308,6 +349,15 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
         artifact_store=artifact_store,
         cache_dir=artifact_dir / ".cache",
     )
+
+    agent_root = os.environ.get("OMNIGENT_AGENT_ROOT")
+    if agent_root:
+        _register_configured_agents(
+            Path(agent_root),
+            agent_store,
+            artifact_store,
+            agent_cache,
+        )
 
     init_runtime(
         agent_cache=agent_cache,

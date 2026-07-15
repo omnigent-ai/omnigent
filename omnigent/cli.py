@@ -1081,82 +1081,14 @@ def _preregister_agent(  # type: ignore[explicit-any]  # agent_store / artifact_
     :returns: The registered agent id, or ``None`` if the source
         spec has no name and is skipped.
     """
-    import gzip
-    import hashlib
-    import io
-    import tarfile
+    from omnigent.runtime.agent_registration import register_agent
 
-    from omnigent.db.utils import generate_agent_id
-    from omnigent.spec import load, materialize_bundle
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        bundle_dir = materialize_bundle(agent_source, Path(tmpdir) / "bundle")
-
-        # Build tarball in memory from the materialized bundle dir.
-        # ``arcname="."`` puts the contents at the tarball root so
-        # extraction produces the same shape ``spec.load`` expects.
-        # Pin gzip mtime so sha256(bundle_bytes) is deterministic across calls.
-        buf = io.BytesIO()
-        with (
-            gzip.GzipFile(fileobj=buf, mode="wb", mtime=0) as gz,
-            tarfile.open(fileobj=gz, mode="w") as tar,
-        ):
-            tar.add(str(bundle_dir), arcname=".")
-        bundle_bytes = buf.getvalue()
-
-        # Validate via the materialized directory directly — cheaper
-        # than round-tripping through extract.
-        spec = load(bundle_dir)
-
-    if spec.name is None:
+    result = register_agent(agent_source, agent_store, artifact_store, agent_cache)
+    if result is None:
         click.echo(f"  warning: {agent_source} has no name, skipping")
         return None
-
-    # Idempotent registration. Mirrors
-    # :func:`omnigent.inner.cli._omnigent_register_yaml_bundle` —
-    # see designs/RUN_OMNIGENT_SESSION_RESUMPTION.md. Reusing the
-    # existing ``agent_id`` (rather than delete + recreate)
-    # is load-bearing for ``--continue``: deleting the old
-    # row cascades through the ``tasks`` FK
-    # (``ondelete=CASCADE`` in
-    # :class:`omnigent.db.db_models.SqlTask`), wiping every
-    # prior task — which makes the next ``--continue``
-    # filter by ``agent_id`` return zero conversations and
-    # exit ``"No prior conversation for agent ..."``. Update
-    # the bundle in place and only refresh
-    # ``bundle_location`` when the content hash actually
-    # changed so the row stays stable across no-op restarts.
-    bundle_hash = hashlib.sha256(bundle_bytes).hexdigest()
-    existing = agent_store.get_by_name(spec.name)
-    if existing is not None:
-        new_loc = f"{existing.id}/{bundle_hash}"
-        if existing.bundle_location != new_loc:
-            artifact_store.put(new_loc, bundle_bytes)
-            agent_store.update(existing.id, bundle_location=new_loc)
-            # Swap the cache's extracted bundle in lockstep. Without
-            # this, ``AgentCache.load`` will hit Tier 2 (disk —
-            # ``cache_dir/<agent_id>/``) on the next request and
-            # return the OLD spec, even though the artifact store
-            # and the DB row both point at the new bundle.
-            # Mirrors what the HTTP PUT /agents/{id} route does at
-            # ``omnigent/server/routes/agents.py:248``.
-            # ``--agent`` registers operator-authored template agents,
-            # so ${VAR} may expand against the server env here.
-            agent_cache.replace(existing.id, new_loc, bundle_bytes, expand_env=True)
-        click.echo(f"  agent: {spec.name} (from {agent_source})")
-        return cast(str, existing.id)
-
-    agent_id = generate_agent_id()
-    loc = f"{agent_id}/{bundle_hash}"
-    artifact_store.put(loc, bundle_bytes)
-    agent_store.create(
-        agent_id=agent_id,
-        name=spec.name,
-        bundle_location=loc,
-        description=spec.description,
-    )
-    click.echo(f"  agent: {spec.name} (from {agent_source})")
-    return agent_id
+    click.echo(f"  agent: {result.name} v{result.version} (from {agent_source})")
+    return result.agent_id
 
 
 def _format_version() -> str:

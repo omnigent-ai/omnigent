@@ -153,3 +153,52 @@ def test_select_artifact_store(
         port=8000,
     )
     assert isinstance(_select_artifact_store(resolved), expected_type)
+
+
+def test_register_configured_agents_scans_children_and_logs_version(
+    db_uri: str, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    from deploy.docker.entrypoint import _register_configured_agents
+    from omnigent.runtime.agent_cache import AgentCache
+    from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+
+    root = tmp_path / "agents"
+    bundle = root / "jerry"
+    bundle.mkdir(parents=True)
+    (bundle / "config.yaml").write_text(
+        "spec_version: 1\n"
+        "name: jerry\n"
+        "executor:\n"
+        "  type: omnigent\n"
+        "  config:\n"
+        "    harness: codex-native\n",
+        encoding="utf-8",
+    )
+    (root / "not-an-agent").mkdir()
+    store = SqlAlchemyAgentStore(db_uri)
+    artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
+    cache = AgentCache(artifacts, tmp_path / "cache")
+
+    with caplog.at_level("INFO", logger="omnigent-docker"):
+        _register_configured_agents(root, store, artifacts, cache)
+
+    registered = store.get_by_name("jerry")
+    assert registered is not None
+    assert "Registered agent jerry version 1" in caplog.text
+
+
+def test_register_configured_agents_fails_on_invalid_bundle(db_uri: str, tmp_path: Path) -> None:
+    from deploy.docker.entrypoint import _register_configured_agents
+    from omnigent.runtime.agent_cache import AgentCache
+    from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+
+    root = tmp_path / "agents"
+    bundle = root / "broken"
+    bundle.mkdir(parents=True)
+    (bundle / "config.yaml").write_text("name: broken\n", encoding="utf-8")
+    store = SqlAlchemyAgentStore(db_uri)
+    artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
+    cache = AgentCache(artifacts, tmp_path / "cache")
+
+    with pytest.raises(Exception, match="spec_version"):
+        _register_configured_agents(root, store, artifacts, cache)
