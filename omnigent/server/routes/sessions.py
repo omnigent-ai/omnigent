@@ -12172,13 +12172,19 @@ async def _stream_live_events(
     reconcile pre-subscribe state via the snapshot endpoint
     (``GET /v1/sessions/{id}``) and dedupe by item id.
 
-    On client disconnect the subscribe loop breaks; the ``finally`` block
-    emits a ``[DONE]`` sentinel so well-behaved SSE consumers see a clean
-    stream termination. A subscriber-queue overflow instead ends without
-    ``[DONE]`` so clients treat it as a dropped transport, reconnect, and
-    reconcile from the persisted snapshot. The pub-sub layer auto-cleans
-    this generator's subscriber slot in its own ``finally`` when iteration
-    exits.
+    On normal completion (subscribe ends or the disconnect check
+    breaks the loop) this generator emits a ``[DONE]`` sentinel so
+    well-behaved SSE consumers see a clean stream termination. A
+    subscriber-queue overflow instead ends without ``[DONE]`` so clients
+    treat it as a dropped transport, reconnect, and reconcile from the
+    persisted snapshot.
+
+    ``finally`` is cleanup-only (presence deregistration): yielding
+    from ``finally`` during client ``aclose`` / ``GeneratorExit``
+    raises ``RuntimeError: async generator ignored GeneratorExit``.
+    The subscribe iterator is wrapped in ``contextlib.aclosing`` so
+    outer ``aclose`` tears down the pub-sub subscriber slot
+    immediately (a bare ``async for`` would defer that to GC).
 
     Each emitted dict is validated against
     :data:`ServerStreamEvent` at the wire boundary so a runtime
@@ -12238,35 +12244,42 @@ async def _stream_live_events(
         presence_token = presence.connect(
             presence_root_id, session_id, viewer_user_id, viewer_idle
         )
-    subscriber_overflowed = False
     try:
-        async for event in session_stream.subscribe(
-            session_id,
-            heartbeat_interval_s=_SESSION_STREAM_HEARTBEAT_INTERVAL_S,
-            ready_event={"type": "session.heartbeat"},
-            # In-flight text replay must be captured synchronously at slot
-            # registration (before ``ready_event`` suspends), not in the
-            # async ``on_subscribed`` hook, or window deltas double-render.
-            # Resource state stays in ``on_subscribed`` — it needs
-            # awaits and is not dedup-sensitive.
-            pre_ready_snapshot=lambda: inflight_text.snapshot_for(session_id),
-            on_subscribed=on_subscribed,
-        ):
-            if await request.is_disconnected():
-                break
-            event_type = event.get("type")
-            if not isinstance(event_type, str):
-                raise ValueError(
-                    f"session stream event missing string ``type`` field: {event!r}",
-                )
-            validated = _SERVER_STREAM_EVENT_ADAPTER.validate_python(event)
-            yield _format_sse(event_type, validated.model_dump())
+        # ``aclosing`` propagates outer ``aclose`` into ``subscribe``;
+        # a bare ``async for`` would leave the subscriber slot until GC.
+        async with contextlib.aclosing(
+            session_stream.subscribe(
+                session_id,
+                heartbeat_interval_s=_SESSION_STREAM_HEARTBEAT_INTERVAL_S,
+                ready_event={"type": "session.heartbeat"},
+                # In-flight text replay must be captured synchronously at slot
+                # registration (before ``ready_event`` suspends), not in the
+                # async ``on_subscribed`` hook, or window deltas double-render.
+                # Resource state stays in ``on_subscribed`` — it needs
+                # awaits and is not dedup-sensitive.
+                pre_ready_snapshot=lambda: inflight_text.snapshot_for(session_id),
+                on_subscribed=on_subscribed,
+            )
+        ) as live_events:
+            async for event in live_events:
+                if await request.is_disconnected():
+                    break
+                event_type = event.get("type")
+                if not isinstance(event_type, str):
+                    raise ValueError(
+                        f"session stream event missing string ``type`` field: {event!r}",
+                    )
+                validated = _SERVER_STREAM_EVENT_ADAPTER.validate_python(event)
+                yield _format_sse(event_type, validated.model_dump())
     except session_stream.SubscriberOverflowError:
-        subscriber_overflowed = True
         _logger.warning(
             "session stream subscriber overflowed for %s; closing for snapshot reconnect",
             session_id,
         )
+    else:
+        # Normal completion only — never yield from ``finally`` (aclose /
+        # GeneratorExit would raise ``async generator ignored GeneratorExit``).
+        yield "data: [DONE]\n\n"
     finally:
         # The non-None checks besides presence_token's are type
         # narrowing only: a minted token implies both were set above.
@@ -12276,8 +12289,6 @@ async def _stream_live_events(
             and presence_root_id is not None
         ):
             presence.disconnect(presence_root_id, viewer_user_id, presence_token)
-        if not subscriber_overflowed:
-            yield "data: [DONE]\n\n"
 
 
 # Bounds for per-session native-terminal pass-through args
@@ -21048,9 +21059,9 @@ def create_sessions_router(
         Subscribe to the session's live SSE event stream.
 
         Does NOT replay history; clients reconcile via the snapshot
-        endpoint. The generator handles disconnects via a
-        ``try/finally`` that emits the ``[DONE]`` sentinel in all
-        exit paths — see :func:`_stream_live_events`.
+        endpoint. The generator emits ``[DONE]`` on normal completion
+        and uses ``finally`` only for presence cleanup — see
+        :func:`_stream_live_events`.
 
         Holding this stream open registers the caller as a session
         *viewer* (presence): co-viewers' streams receive
