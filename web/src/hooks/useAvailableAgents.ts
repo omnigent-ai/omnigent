@@ -1,4 +1,4 @@
-import { useQuery, type QueryClient } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
 import { agentRootName } from "@/lib/forkHarness";
 import { capitalizeAgentName } from "@/lib/agentLabels";
@@ -39,10 +39,6 @@ export interface AvailableAgent {
   // immutable, so it is the stable signal. Omitted on older servers and on
   // session-derived agents (whose recency comes from the scanned session).
   created_at?: number | null;
-  // Session id used to fetch the full agent spec on hover. Only set on
-  // session-discovered agents (custom uploads); absent on catalog agents
-  // whose full data is already present from GET /v1/agents.
-  sessionId?: string;
 }
 
 const DISPLAY_NAMES: Record<string, string> = {
@@ -198,57 +194,42 @@ interface AgentObjectWire {
 }
 
 /**
- * Build an AvailableAgent from session scan data alone — no extra fetch.
- * description, harness, and skills are null/empty and filled in on hover
- * via prefetchAvailableAgentDetails.
+ * Enrich one scanned session agent into the picker's AvailableAgent
+ * shape via `GET /v1/sessions/{id}/agent` (description, harness,
+ * bundled skills). On failure the agent is still listed with the
+ * name-only fields from the scan — mirroring the server's own
+ * `_to_agent_object` degradation: one unloadable bundle must not
+ * break discovery.
  */
-function sessionAgentFromScan(scanned: ScannedSessionAgent): AvailableAgent {
-  return {
+async function enrichSessionAgent(scanned: ScannedSessionAgent): Promise<AvailableAgent> {
+  const fallback: AvailableAgent = {
     id: scanned.agentId,
     name: scanned.agentName,
     display_name: displayNameForAgent(scanned.agentName),
     description: null,
     harness: null,
     skills: [],
-    sessionId: scanned.sessionId,
     // builtin/created_at intentionally omitted: session-derived agents never
     // seed the catalog, and their recency comes from the scanned session's
     // createdAt (used directly in the dedup), not from this object.
   };
-}
-
-/**
- * Fetch harness, description, and skills for a session-discovered agent and
- * patch them into the ["available-agents"] cache. Call on hover so the data
- * is ready before the user clicks — zero cost for agents they never hover.
- */
-export async function prefetchAvailableAgentDetails(
-  agent: AvailableAgent,
-  queryClient: QueryClient,
-): Promise<void> {
-  if (!agent.sessionId || agent.harness !== null || agent.description !== null) return;
   try {
     const res = await authenticatedFetch(
-      `/v1/sessions/${encodeURIComponent(agent.sessionId)}/agent`,
+      `/v1/sessions/${encodeURIComponent(scanned.sessionId)}/agent`,
     );
-    if (!res.ok) return;
+    if (!res.ok) return fallback;
     const json = (await res.json()) as AgentObjectWire;
-    queryClient.setQueryData<AvailableAgent[]>(["available-agents"], (prev) => {
-      if (!prev) return prev;
-      return prev.map((a) =>
-        a.id !== agent.id
-          ? a
-          : {
-              ...a,
-              display_name: displayNameForAgent(json.name, json.harness),
-              description: json.description ?? null,
-              harness: json.harness ?? null,
-              skills: json.skills ?? [],
-            },
-      );
-    });
+    return {
+      ...fallback,
+      display_name: displayNameForAgent(json.name, json.harness),
+      description: json.description ?? null,
+      harness: json.harness ?? null,
+      skills: json.skills ?? [],
+    };
   } catch {
-    // Best-effort — agent stays name-only on failure.
+    // Network-level failure — same best-effort degradation as the
+    // non-ok branch above: list the agent from scan fields.
+    return fallback;
   }
 }
 
@@ -345,12 +326,16 @@ async function fetchAvailableAgents(): Promise<AvailableAgent[]> {
     }
   }
 
-  const resolved = Array.from(byName.values())
-    .map((c) => (c.template !== null ? c.template : sessionAgentFromScan(c.scanned!)))
-    .filter((agent) => {
-      const nativeKey = nativeCodingAgentForAvailableAgent(agent)?.key;
-      return nativeKey !== "kiro" || !hasKiroBuiltin;
-    });
+  const resolved = (
+    await Promise.all(
+      Array.from(byName.values()).map((c) =>
+        c.template !== null ? Promise.resolve(c.template) : enrichSessionAgent(c.scanned!),
+      ),
+    )
+  ).filter((agent) => {
+    const nativeKey = nativeCodingAgentForAvailableAgent(agent)?.key;
+    return nativeKey !== "kiro" || !hasKiroBuiltin;
+  });
   // Seeded built-ins first; user templates / custom uploads follow, newest
   // first. NewChatDialog's display-order sort is stable, so unranked names
   // keep this relative order.

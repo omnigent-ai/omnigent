@@ -198,6 +198,10 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
         // Converge each project folder's own list too (new/archived/relabeled
         // members the local field-patch can't place).
         void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
+        // Another client archiving/relabeling/deleting can add or remove a
+        // project from the Archived view's picker; only local mutations
+        // invalidate this scan otherwise.
+        void queryClient.invalidateQueries({ queryKey: ["archived-project-names"] });
       }, DEBOUNCE_MS);
     };
 

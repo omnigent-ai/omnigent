@@ -3,10 +3,10 @@
 // Covers the Appearance theme picker, the auth-gated Account section, and the
 // Archived sessions list (which moved here out of the sidebar).
 
+import { type ReactNode } from "react";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { ReactNode } from "react";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 
@@ -26,6 +26,14 @@ const mocks = vi.hoisted(() => ({
   // the id, getCurrentIsAdmin the flag). null → unauthenticated.
   me: { id: "alice", is_admin: false } as { id: string; is_admin: boolean } | null,
   conversations: [] as Conversation[],
+  // Optional multi-page dataset (array of per-page row arrays) for pagination
+  // tests. When unset the mock serves a single page of `conversations`.
+  pages: undefined as Conversation[][] | undefined,
+  // Picker options come from useArchivedProjectNames (a dedicated scan), not
+  // from the loaded rows — so tests set them independently of `conversations`.
+  projectNames: [] as string[],
+  hasNextPage: false,
+  fetchNextPage: vi.fn(),
 }));
 
 vi.mock("next-themes", () => ({
@@ -47,14 +55,89 @@ vi.mock("@/lib/identity", () => ({
   resolveIdentity: () => Promise.resolve(mocks.me?.id ?? null),
   getCurrentIsAdmin: () => mocks.me?.is_admin ?? false,
 }));
-vi.mock("@/hooks/useConversations", () => ({
-  useConversations: () => ({
-    data: { pages: [{ data: mocks.conversations }] },
-    isLoading: false,
-  }),
-  useArchiveConversation: () => ({ mutate: mocks.archiveMutate, isPending: false }),
-  useStopAndDeleteConversation: () => ({ mutate: mocks.deleteMutate, isPending: false }),
-}));
+vi.mock("@/hooks/useConversations", async () => {
+  // A stateful mock that emulates useInfiniteQuery pagination: it tracks how
+  // many pages are "loaded" and reveals the next on fetchNextPage, so a click
+  // on "Load more" re-renders with more rows (as the real hook would).
+  const { useState } = await import("react");
+  return {
+    PROJECT_LABEL_KEY: "omni_project",
+    // The Archived view drives the visible list from this hook; filter on the
+    // fourth (`project`) arg so the mock mirrors the server-side ?project=
+    // scoping.
+    useConversations: (
+      _searchQuery?: string,
+      _includeArchived?: boolean,
+      _options?: unknown,
+      project?: string,
+    ) => {
+      // `mocks.pages` (array of per-page row arrays) drives multi-page tests;
+      // otherwise serve a single page of `mocks.conversations`.
+      const source = mocks.pages ?? [mocks.conversations];
+      const [shown, setShown] = useState(1);
+      const pages = source.slice(0, shown).map((rows) => ({
+        data: project ? rows.filter((c) => c.labels?.["omni_project"] === project) : rows,
+      }));
+      return {
+        data: { pages },
+        isLoading: false,
+        hasNextPage: shown < source.length || mocks.hasNextPage,
+        isFetchingNextPage: false,
+        fetchNextPage: () => {
+          mocks.fetchNextPage();
+          setShown((n) => Math.min(n + 1, source.length));
+        },
+      };
+    },
+    // Picker options are sourced from this dedicated scan, decoupled from the
+    // loaded rows so archived-only projects on later pages still appear.
+    useArchivedProjectNames: () => ({ data: mocks.projectNames }),
+    useArchiveConversation: () => ({ mutate: mocks.archiveMutate, isPending: false }),
+    useStopAndDeleteConversation: () => ({ mutate: mocks.deleteMutate, isPending: false }),
+  };
+});
+// Radix Select uses a portal + pointer events jsdom can't drive; stub it to a
+// native <select> so tests can drive both the color-theme dropdown and the
+// archived project filter. The real page puts data-testid on SelectTrigger,
+// so the stub lifts it from the trigger child onto the native <select>.
+vi.mock("@/components/ui/select", async () => {
+  const { Children, isValidElement } = await import("react");
+  const SelectTrigger = ({ children }: { children?: ReactNode }) => <>{children}</>;
+  const Select = ({
+    value,
+    onValueChange,
+    children,
+  }: {
+    value: string;
+    onValueChange: (v: string) => void;
+    children: ReactNode;
+  }) => {
+    const kids = Children.toArray(children);
+    const trigger = kids.find((c) => isValidElement(c) && c.type === SelectTrigger);
+    const testId =
+      isValidElement(trigger) && trigger.props && typeof trigger.props === "object"
+        ? (trigger.props as Record<string, unknown>)["data-testid"]
+        : undefined;
+    return (
+      <select
+        data-testid={typeof testId === "string" ? testId : undefined}
+        value={value}
+        onChange={(e) => onValueChange(e.target.value)}
+      >
+        {kids.filter((c) => !(isValidElement(c) && c.type === SelectTrigger))}
+      </select>
+    );
+  };
+  return {
+    Select,
+    SelectTrigger,
+    SelectValue: () => null,
+    SelectContent: ({ children }: { children: ReactNode }) => <>{children}</>,
+    SelectItem: ({ value, children }: { value: string; children: ReactNode }) => (
+      <option value={value}>{children}</option>
+    ),
+  };
+});
 // The admin management surfaces are lazy-loaded and own heavy data layers of
 // their own; stub them so these tests only assert SettingsPage's section
 // routing (that /settings/members and /settings/policies render the right one).
@@ -63,33 +146,6 @@ vi.mock("@/pages/MembersPage", () => ({
 }));
 vi.mock("@/pages/PoliciesPage", () => ({
   PoliciesPage: () => <div>policies-page-stub</div>,
-}));
-// Radix Select uses a portal + pointer events jsdom can't drive, so stub it to
-// a native <select>; lets the color-theme dropdown be exercised via change.
-vi.mock("@/components/ui/select", () => ({
-  Select: ({
-    value,
-    onValueChange,
-    children,
-  }: {
-    value: string;
-    onValueChange: (v: string) => void;
-    children: ReactNode;
-  }) => (
-    <select
-      data-testid="color-theme-select"
-      value={value}
-      onChange={(e) => onValueChange(e.target.value)}
-    >
-      {children}
-    </select>
-  ),
-  SelectTrigger: ({ children }: { children: ReactNode }) => <>{children}</>,
-  SelectValue: () => null,
-  SelectContent: ({ children }: { children: ReactNode }) => <>{children}</>,
-  SelectItem: ({ value, children }: { value: string; children: ReactNode }) => (
-    <option value={value}>{children}</option>
-  ),
 }));
 
 import { SettingsPage } from "./SettingsPage";
@@ -121,11 +177,15 @@ beforeEach(() => {
   mocks.setTheme.mockReset();
   mocks.archiveMutate.mockReset();
   mocks.deleteMutate.mockReset();
+  mocks.fetchNextPage.mockReset();
   mocks.theme = "system";
   mocks.accountsEnabled = true;
   mocks.loginUrl = "/login";
   mocks.me = { id: "alice", is_admin: false };
   mocks.conversations = [];
+  mocks.pages = undefined;
+  mocks.projectNames = [];
+  mocks.hasNextPage = false;
 });
 afterEach(() => {
   cleanup();
@@ -537,5 +597,125 @@ describe("SettingsPage", () => {
     fireEvent.click(screen.getByTestId("delete-archived"));
     fireEvent.click(screen.getByRole("button", { name: "Delete" }));
     expect(mocks.deleteMutate).toHaveBeenCalledWith({ id: "conv_archived" });
+  });
+
+  it("scopes the archived list to the project picked in the filter", () => {
+    mocks.projectNames = ["Alpha", "Beta"];
+    mocks.conversations = [
+      conv("conv_a", { archived: true, title: "Alpha chat", labels: { omni_project: "Alpha" } }),
+      conv("conv_b", { archived: true, title: "Beta chat", labels: { omni_project: "Beta" } }),
+      conv("conv_active"),
+    ];
+    renderPage("/settings/archived");
+
+    // "All projects" (default) lists every archived session.
+    expect(screen.getAllByTestId("archived-row")).toHaveLength(2);
+    const select = screen.getByTestId("archived-project-filter");
+    expect(within(select).getByRole("option", { name: "All projects" })).toBeInTheDocument();
+    expect(within(select).getByRole("option", { name: "Alpha" })).toBeInTheDocument();
+    expect(within(select).getByRole("option", { name: "Beta" })).toBeInTheDocument();
+
+    // Picking a project narrows the list to that project's archived sessions.
+    // Select values are discriminated (`project:<name>`), never the raw name.
+    fireEvent.change(select, { target: { value: "project:Alpha" } });
+    const rows = screen.getAllByTestId("archived-row");
+    expect(rows).toHaveLength(1);
+    expect(within(rows[0]).getByText("Alpha chat")).toBeInTheDocument();
+
+    // Back to "All projects" restores the full list.
+    fireEvent.change(select, { target: { value: "all" } });
+    expect(screen.getAllByTestId("archived-row")).toHaveLength(2);
+  });
+
+  it("hides the project filter when no archived session belongs to a project", () => {
+    mocks.conversations = [conv("conv_archived", { archived: true, title: "Old chat" })];
+    renderPage("/settings/archived");
+
+    expect(screen.queryByTestId("archived-project-filter")).toBeNull();
+    expect(screen.getByTestId("archived-row")).toBeInTheDocument();
+  });
+
+  it("shows the empty state (and no filter) when there are no archived sessions", () => {
+    mocks.conversations = [conv("conv_active")];
+    renderPage("/settings/archived");
+
+    expect(screen.getByText("No archived sessions.")).toBeInTheDocument();
+    expect(screen.queryByTestId("archived-project-filter")).toBeNull();
+  });
+
+  it("shows a project-scoped empty state when the picked project has no rows", () => {
+    mocks.projectNames = ["Alpha"];
+    mocks.conversations = [
+      conv("conv_a", { archived: true, title: "Alpha chat", labels: { omni_project: "Alpha" } }),
+    ];
+    renderPage("/settings/archived");
+
+    const select = screen.getByTestId("archived-project-filter");
+    // Drop Alpha's only session so the filtered fetch returns nothing, then
+    // pick Alpha (still an option because it's in the scanned name set).
+    mocks.conversations = [];
+    fireEvent.change(select, { target: { value: "project:Alpha" } });
+    expect(screen.getByText("No archived sessions in this project.")).toBeInTheDocument();
+  });
+
+  it("offers archived-only projects whose sessions are beyond the first loaded page", () => {
+    // The visible list's first page has no Gamma row, but the option scan
+    // (useArchivedProjectNames, which pages through everything) found Gamma —
+    // this is the gotcha the feature exists for.
+    mocks.projectNames = ["Gamma"];
+    mocks.conversations = [conv("p1", { archived: true, title: "Page-one chat" })];
+    renderPage("/settings/archived");
+
+    const select = screen.getByTestId("archived-project-filter");
+    // Gamma is offered even though no Gamma row is in the loaded page.
+    expect(within(select).getByRole("option", { name: "Gamma" })).toBeInTheDocument();
+  });
+
+  it("treats a project literally named __all__ as a real project, not the clear-filter sentinel", () => {
+    mocks.projectNames = ["Other", "__all__"];
+    mocks.conversations = [
+      conv("x1", { archived: true, title: "Edge chat", labels: { omni_project: "__all__" } }),
+      conv("o1", { archived: true, title: "Other chat", labels: { omni_project: "Other" } }),
+    ];
+    renderPage("/settings/archived");
+
+    const select = screen.getByTestId("archived-project-filter");
+    // Picking the "__all__" project must FILTER to it (discriminated value
+    // `project:__all__`), not clear the filter.
+    fireEvent.change(select, { target: { value: "project:__all__" } });
+    const rows = screen.getAllByTestId("archived-row");
+    expect(rows).toHaveLength(1);
+    expect(within(rows[0]).getByText("Edge chat")).toBeInTheDocument();
+  });
+
+  it("loads the next page of archived sessions on demand", () => {
+    mocks.conversations = [conv("a1", { archived: true, title: "Old chat" })];
+    mocks.hasNextPage = true;
+    renderPage("/settings/archived");
+
+    fireEvent.click(screen.getByTestId("archived-load-more"));
+    expect(mocks.fetchNextPage).toHaveBeenCalled();
+  });
+
+  it("keeps Load more available when page 1 has only active rows, then pages to archived", () => {
+    // The first page holds only active sessions (archived ones sort onto a
+    // later page). This must NOT dead-end on the definitive empty state.
+    mocks.pages = [
+      [conv("act1", { title: "Active chat" })],
+      [conv("arch2", { archived: true, title: "Deep archive" })],
+    ];
+    renderPage("/settings/archived");
+
+    // No archived rows on page 1, but more pages exist → not the definitive
+    // empty state; a pager is offered instead.
+    expect(screen.queryByText("No archived sessions.")).toBeNull();
+    expect(screen.getByText("No archived sessions on this page.")).toBeInTheDocument();
+    expect(screen.getByTestId("archived-load-more")).toBeInTheDocument();
+
+    // Paging forward surfaces the archived row that lived on page 2.
+    fireEvent.click(screen.getByTestId("archived-load-more"));
+    expect(mocks.fetchNextPage).toHaveBeenCalled();
+    expect(screen.getByTestId("archived-row")).toBeInTheDocument();
+    expect(screen.getByText("Deep archive")).toBeInTheDocument();
   });
 });

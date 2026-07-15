@@ -37,6 +37,7 @@ from typing import IO
 import httpx
 import yaml
 
+from omnigent.host.identity import HOST_ID_ENV_VAR, HOST_NAME_ENV_VAR
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN, token_bound_runner_id
 from tests._helpers.compat import (
     apply_runner_env,
@@ -54,10 +55,10 @@ _HEALTH_TIMEOUT_S = 90.0
 _MOCK_TIMEOUT_S = 15.0
 _POLL_INTERVAL_S = 0.2
 _TURN_TIMEOUT_S = 180.0
-# Budget for a freshly-spawned runner (session_cold_start journey) to boot and
-# register its tunnel. Generous: it covers interpreter start + imports + the
-# reverse-tunnel handshake, the very cost the journey exists to measure.
-_RUNNER_ONLINE_TIMEOUT_S = 90.0
+# Budget for the host daemon (session_cold_start journey, with_host) to connect
+# its tunnel and register in the hosts table after being spawned. Covers
+# interpreter start + imports + the reverse-tunnel handshake.
+_HOST_ONLINE_TIMEOUT_S = 60.0
 
 # Terminal SSE events — if one arrives before any delta, the turn produced no
 # streamed text (a failure for the TTFT journey).
@@ -88,6 +89,19 @@ def _find_free_port() -> int:
         return int(sock.getsockname()[1])
 
 
+def _omni_executable() -> str:
+    """The ``omni`` console script beside the (compat-aware) interpreter.
+
+    ``server_executable()`` returns the interpreter the server/runner subprocess
+    should run under — ``sys.executable`` normally, or a pinned older build's
+    python in cross-version compat mode. The ``omni`` console script is
+    installed next to that interpreter (``[project.scripts]`` in pyproject), so
+    deriving it from the same directory launches the real user-facing command
+    (``omni server`` / ``omni host``) while still honoring the compat pin.
+    """
+    return str(Path(server_executable()).with_name("omni"))
+
+
 class BenchEnvironment:
     """Async context manager owning the benchmark's server (± runner + mock).
 
@@ -95,6 +109,12 @@ class BenchEnvironment:
         v1 HTTP-journey path. When ``True``, also spawn the mock LLM and a
         runner and wire the policy classifier at the mock — the phase-2
         full-turn path.
+    :param with_host: When ``True`` (implies ``with_runner``), additionally
+        spawn a real ``omnigent host`` daemon. Additive over ``with_runner``:
+        the boot runner still serves the warm journeys, while the daemon lets
+        the ``session_cold_start`` journey create host-bound sessions that fire
+        ``host.launch_runner`` and launch their OWN fresh runner — so the first
+        message races the runner's boot, reproducing the true UI cold path.
     :param database_uri: SQLAlchemy URI the server boots against. ``None``
         (default) uses a fresh throwaway SQLite file in the temp dir — the
         empty-DB path. Pass a pre-seeded URI (e.g. a seeded SQLite file, or a
@@ -110,30 +130,34 @@ class BenchEnvironment:
         self,
         *,
         with_runner: bool = False,
+        with_host: bool = False,
         database_uri: str | None = None,
         harness: str = _DEFAULT_HARNESS,
         model: str = _DEFAULT_MODEL,
     ) -> None:
-        self.with_runner = with_runner
+        # with_host is additive over with_runner: the boot runner still serves
+        # the warm journeys, and the host daemon additionally lets the cold-start
+        # journey create host-bound sessions that launch their own runners.
+        self.with_host = with_host
+        self.with_runner = with_runner or with_host
         self.database_uri = database_uri
         self.harness = harness
         self.model = model
         self.base_url = ""
         self.mock_url = ""
         self.runner_id = ""
+        self.host_id = ""
+        self.host_workspace = ""
         self.client: httpx.AsyncClient | None = None
 
         self._tmp = Path("/tmp") / f"omni-bench-{uuid.uuid4().hex[:8]}"
         self._mock_proc: subprocess.Popen[bytes] | None = None
         self._server_proc: subprocess.Popen[bytes] | None = None
         self._runner_proc: subprocess.Popen[bytes] | None = None
-        # Base env retained so the session_cold_start journey can spawn extra
-        # runners on demand, building each env identically to the boot runner's.
+        self._host_proc: subprocess.Popen[bytes] | None = None
+        # Base env retained so the host daemon is built identically to the boot
+        # runner's server-facing env (worktree source, mock LLM routing).
         self._runner_base_env: dict[str, str] = {}
-        # Runners spawned after boot (session_cold_start journey). Reaped on
-        # teardown in case a measure op failed before terminating its own runner.
-        self._extra_runners: list[subprocess.Popen[bytes]] = []
-        self._extra_runner_count = 0
         self._log_handles: list[IO[bytes]] = []
         self._agent_cache: dict[str, str] = {}
 
@@ -183,20 +207,33 @@ class BenchEnvironment:
             base_env["OPENAI_BASE_URL"] = f"{self.mock_url}/v1"
         # Prepend the worktree so subprocesses import this branch's source.
         apply_server_env(base_env, _REPO_ROOT)
-        # Retained so spawn_extra_runner (session_cold_start journey) can build
-        # a fresh runner's env identically to the boot runner's.
+        # Retained so the host daemon (with_host) is built with the same
+        # server-facing env as the boot runner.
         self._runner_base_env = base_env
 
         self._server_proc = self._spawn_server(port, base_env, binding_token, artifact_dir)
         if self.with_runner:
             self._runner_proc = self._spawn_runner(base_env, binding_token)
         self._wait_ready()
+        # The host daemon is ADDITIVE — the boot runner above still serves the
+        # warm journeys; the daemon exists so the cold-start journey can create
+        # host-bound sessions that launch their OWN fresh runners on demand
+        # (the race the cold path measures). The two never share a runner id.
+        if self.with_host:
+            self._host_proc = self._spawn_host(base_env)
+            self._wait_host_online()
 
     def _stop(self) -> None:
-        """Terminate runner, server, and mock; remove the temp dir."""
-        # Extra runners first (session_cold_start): a measure op normally reaps
-        # its own, but a mid-op failure can leak one, so drain the list here too.
-        for proc in (*self._extra_runners, self._runner_proc, self._server_proc, self._mock_proc):
+        """Terminate host, runner, server, and mock; remove the temp dir."""
+        # Host first: SIGTERM-ing the daemon reaps the runners IT spawned (they
+        # are daemon-owned children), so it must go before the server so those
+        # runners' tunnels close cleanly.
+        for proc in (
+            self._host_proc,
+            self._runner_proc,
+            self._server_proc,
+            self._mock_proc,
+        ):
             if proc is not None and proc.poll() is None:
                 proc.send_signal(signal.SIGTERM)
                 try:
@@ -237,9 +274,7 @@ class BenchEnvironment:
         # four slashes; the temp path is absolute.
         db_uri = self.database_uri or f"sqlite:///{self._tmp / 'bench.db'}"
         args = [
-            server_executable(),
-            "-m",
-            "omnigent.cli",
+            _omni_executable(),
             "server",
             "--port",
             str(port),
@@ -330,6 +365,37 @@ class BenchEnvironment:
             stderr=subprocess.STDOUT,
         )
 
+    def _spawn_host(self, base_env: dict[str, str]) -> subprocess.Popen[bytes]:
+        """Spawn a real ``omni host`` daemon against the bench server.
+
+        Runs the user-facing ``omni host --server`` command — the same daemon a
+        developer starts by hand. Identity comes from :data:`HOST_ID_ENV_VAR` /
+        :data:`HOST_NAME_ENV_VAR`: with both set, ``load_or_create_host_identity``
+        returns that identity WITHOUT reading or writing any ``config.yaml``, so
+        the daemon never touches the developer's real ``~/.omnigent`` (nor
+        collides with a sibling bench leg). ``--non-interactive`` keeps it from
+        ever launching a browser login (moot for the loopback server, which is
+        not Databricks-fronted, but explicit for CI). The daemon self-registers
+        over loopback (single-user ``RESERVED_USER_LOCAL`` owner, no token) and
+        launches runners on demand when the server sends ``host.launch_runner``.
+        """
+        self.host_id = f"host_bench_{uuid.uuid4().hex[:12]}"
+        workspace = self._tmp / "host-workspace"
+        workspace.mkdir(exist_ok=True)
+        self.host_workspace = str(workspace)
+        host_env = {
+            **base_env,
+            HOST_ID_ENV_VAR: self.host_id,
+            HOST_NAME_ENV_VAR: f"bench-host-{self.host_id[-8:]}",
+        }
+        return subprocess.Popen(
+            [_omni_executable(), "host", "--server", self.base_url, "--non-interactive"],
+            env=host_env,
+            cwd=str(workspace),
+            stdout=self._log("host-daemon.log"),
+            stderr=subprocess.STDOUT,
+        )
+
     # ── readiness ────────────────────────────────────────────
 
     def _wait_mock_ready(self) -> None:
@@ -357,11 +423,38 @@ class BenchEnvironment:
         raise RuntimeError(f"server not ready within {_HEALTH_TIMEOUT_S}s; logs in {self._tmp}")
 
     def _runner_ready(self) -> bool:
-        """Whether the runner reports online (always ``True`` server-only)."""
+        """Whether the boot runner reports online (always ``True`` server-only)."""
         if not self.with_runner:
             return True
         status = httpx.get(f"{self.base_url}/v1/runners/{self.runner_id}/status", timeout=2)
         return status.status_code == 200 and status.json().get("online") is True
+
+    def _wait_host_online(self) -> None:
+        """Block until the host daemon's row reads ``status=online``.
+
+        Polls ``GET /v1/hosts`` (the single-user owner is ``local``) until the
+        daemon we spawned has connected its tunnel and been upserted online, so
+        a host-bound session-create has a live launch target.
+        """
+        deadline = time.monotonic() + _HOST_ONLINE_TIMEOUT_S
+        while time.monotonic() < deadline:
+            if self._host_proc is not None and self._host_proc.poll() is not None:
+                raise RuntimeError(
+                    f"host daemon exited (code {self._host_proc.returncode}) before "
+                    f"coming online; logs in {self._tmp}"
+                )
+            try:
+                resp = httpx.get(f"{self.base_url}/v1/hosts", timeout=2)
+                if resp.status_code == 200:
+                    for host in resp.json().get("hosts", []):
+                        if host.get("host_id") == self.host_id and host.get("status") == "online":
+                            return
+            except httpx.HTTPError:
+                # Server not yet accepting requests, or a transient read error:
+                # keep polling until the deadline rather than failing the boot.
+                pass
+            time.sleep(_POLL_INTERVAL_S)
+        raise RuntimeError(f"host {self.host_id} not online within {_HOST_ONLINE_TIMEOUT_S}s")
 
     # ── mock control (runner mode only) ──────────────────────
 
@@ -469,6 +562,33 @@ class BenchEnvironment:
         created.raise_for_status()
         return str(created.json()["id"])
 
+    async def create_hosted_session(self, agent_id: str) -> str:
+        """Create a host-bound session that fires ``host.launch_runner``.
+
+        The inline-launch ``POST /v1/sessions`` shape the Web UI's New Chat
+        wizard sends: passing ``host_id`` + ``workspace`` makes the server bind a
+        runner id and dispatch a launch frame to the host daemon, then return
+        immediately (~tens of ms) WITHOUT waiting for the runner to connect.
+        Returned without any readiness poll on purpose — the caller's first
+        message then races the runner's boot, which is the cold path we measure.
+
+        :raises RuntimeError: If the env was not built with ``with_host=True``.
+        """
+        assert self.client is not None
+        if not self.with_host:
+            raise RuntimeError("create_hosted_session requires with_host=True")
+        created = await self.client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent_id,
+                "host_id": self.host_id,
+                "host_type": "external",
+                "workspace": self.host_workspace,
+            },
+        )
+        created.raise_for_status()
+        return str(created.json()["id"])
+
     async def seed_items(self, session_id: str, count: int) -> None:
         """Append *count* history items over HTTP, with no runner or LLM.
 
@@ -504,9 +624,9 @@ class BenchEnvironment:
     async def create_session_bound_to(self, agent_id: str, runner_id: str) -> str:
         """Create a session for *agent_id* and bind it to *runner_id*.
 
-        Unlike :meth:`create_bound_session` (which pins the boot runner), this
-        binds to an arbitrary runner — the session_cold_start journey uses it to
-        attach each session to the fresh runner it just spawned.
+        Binds a session to an already-online runner by patching its
+        ``runner_id`` — used by the warm journeys via :meth:`create_bound_session`
+        to pin the boot runner.
         """
         assert self.client is not None
         if not self.with_runner:
@@ -517,86 +637,6 @@ class BenchEnvironment:
         )
         bound.raise_for_status()
         return session_id
-
-    async def spawn_extra_runner(self) -> tuple[subprocess.Popen[bytes], str]:
-        """Spawn a fresh runner and wait for its tunnel to register.
-
-        The end-to-end cost a new conversation always pays: a runner process
-        start plus its reverse-tunnel handshake. Each call mints its own fresh
-        binding token and derives the ``runner_id`` from it (so tunnel, mint,
-        and session binding all agree on one id), then registers over loopback
-        via the tunnel's no-allow-list fallback — the same path the boot runner
-        takes, so the runner is a fully self-consistent independent runner.
-
-        The returned process is tracked for teardown and should be passed to
-        :meth:`terminate_runner` once the caller is done, so a long run doesn't
-        accumulate live runners.
-
-        :returns: ``(process, runner_id)`` for the online runner.
-        :raises RuntimeError: If not in runner mode, or the runner does not
-            come online within :data:`_RUNNER_ONLINE_TIMEOUT_S`.
-        """
-        if not self.with_runner:
-            raise RuntimeError("spawn_extra_runner requires with_runner=True")
-        self._extra_runner_count += 1
-        n = self._extra_runner_count
-        # A fresh binding token per spawn, with the id derived from it — the
-        # runner's tunnel path, its managed-mint URL, and the session binding
-        # must all agree on one id, and the runner derives its mint URL from
-        # ``token_bound_runner_id(binding_token)`` internally. Reusing the boot
-        # token but overriding the id would split those two apart (tunnel under
-        # the override, mint under the boot id → 401, spec resolve fails). A
-        # non-allow-listed token still registers over loopback via the tunnel's
-        # no-allow-list fallback, the same path the boot runner takes.
-        binding_token = uuid.uuid4().hex
-        runner_id = token_bound_runner_id(binding_token)
-        workspace = self._tmp / f"workspace-extra-{n}"
-        workspace.mkdir(exist_ok=True)
-        proc = self._spawn_runner_process(
-            self._runner_base_env,
-            binding_token,
-            runner_id=runner_id,
-            workspace=workspace,
-            log_name=f"runner-extra-{n}.log",
-        )
-        self._extra_runners.append(proc)
-        await self._wait_runner_online(runner_id, proc)
-        return proc, runner_id
-
-    async def _wait_runner_online(self, runner_id: str, proc: subprocess.Popen[bytes]) -> None:
-        """Poll ``/v1/runners/{id}/status`` until the runner reports online."""
-        assert self.client is not None
-        deadline = time.monotonic() + _RUNNER_ONLINE_TIMEOUT_S
-        while time.monotonic() < deadline:
-            if proc.poll() is not None:
-                raise RuntimeError(
-                    f"runner {runner_id} exited (code {proc.returncode}) before "
-                    f"coming online; logs in {self._tmp}"
-                )
-            resp = await self.client.get(f"/v1/runners/{runner_id}/status")
-            if resp.status_code == 200 and resp.json().get("online") is True:
-                return
-            await asyncio.sleep(_POLL_INTERVAL_S)
-        raise RuntimeError(
-            f"runner {runner_id} not online within {_RUNNER_ONLINE_TIMEOUT_S}s; "
-            f"logs in {self._tmp}"
-        )
-
-    def terminate_runner(self, proc: subprocess.Popen[bytes]) -> None:
-        """Terminate a runner spawned by :meth:`spawn_extra_runner`.
-
-        Best-effort and idempotent: an already-exited process is a no-op, and
-        teardown re-drains any survivor via :data:`_extra_runners`.
-        """
-        if proc.poll() is None:
-            proc.send_signal(signal.SIGTERM)
-            try:
-                proc.wait(timeout=8)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=5)
-        with contextlib.suppress(ValueError):
-            self._extra_runners.remove(proc)
 
     async def write_runner_file(self, session_id: str, relative_path: str, content: str) -> None:
         """Write a file into the runner's default environment over HTTP.
@@ -677,26 +717,42 @@ class BenchEnvironment:
             await asyncio.sleep(_POLL_INTERVAL_S)
         raise RuntimeError(f"session did not reach idle within {timeout}s ({session_id})")
 
-    async def time_to_first_delta(
-        self, session_id: str, text: str, *, timeout: float = _TURN_TIMEOUT_S
+    async def _post_and_await_first_delta(
+        self,
+        session_id: str,
+        text: str,
+        *,
+        wait_idle_first: bool,
+        timeout: float = _TURN_TIMEOUT_S,
     ) -> None:
-        """Post a turn and return once the first output-text delta streams back.
+        """Imitate the UI first-token path: attach SSE, then post, then await.
 
-        The session SSE stream (``GET …/stream``) is separate from the message
-        POST, so we subscribe first (as a concurrent task), post the turn, then
-        return when the first ``response.output_text.delta`` event arrives. This
-        times omnigent's streaming-pipeline overhead to first token — with the
-        zero-latency mock there is no model latency in the number.
+        The exact sequence the web client follows for a one-shot turn:
+        subscribe to ``GET …/stream``, wait for the stream's ready heartbeat (the
+        first SSE line — the server yields it right after registering the
+        live-tail slot, so no event can be missed), POST the message, and return
+        on the first response from the model — either a
+        ``response.output_text.delta`` (streamed text) or a
+        ``response.output_item.done`` (a completed output item, e.g. a tool call
+        for harnesses that don't stream text deltas). This measures time to *any*
+        first response, not just text. A terminal event before either arrives
+        means the turn produced no response at all (a failure).
 
-        :raises RuntimeError: If not in runner mode, or no delta / a terminal
+        :param wait_idle_first: When ``True``, wait for the session to be ``idle``
+            before subscribing so a prior turn's terminal event can't race this
+            turn's response (warm-session TTFT). ``False`` for a fresh session whose
+            first turn is the only one — the cold path, where the timed span must
+            include runner launch + connect, so we must NOT poll it warm first.
+        :raises RuntimeError: If not in runner mode, or no response / a terminal
             event arrives within *timeout*.
         """
         assert self.client is not None
         if not self.with_runner:
-            raise RuntimeError("time_to_first_delta requires with_runner=True")
+            raise RuntimeError("first-delta timing requires with_runner=True")
 
         connected = asyncio.Event()
         first_delta = asyncio.Event()
+        first_response = asyncio.Event()
         outcome: dict[str, str] = {}
 
         async def _read_stream() -> None:
@@ -705,9 +761,9 @@ class BenchEnvironment:
                     "GET", f"/v1/sessions/{session_id}/stream", timeout=timeout
                 ) as resp:
                     # Any first line means the SSE connection is live (the server
-                    # emits a heartbeat on connect). Signalling here lets us post
-                    # the turn only once subscribed — without a blind sleep that
-                    # would otherwise inflate the measured time-to-first-delta.
+                    # emits a ready heartbeat on connect). Signalling here lets us
+                    # post the turn only once subscribed — without a blind sleep
+                    # that would otherwise inflate the measured time-to-first-delta.
                     connected.set()
                     async for line in resp.aiter_lines():
                         if not line.startswith("event:"):
@@ -715,6 +771,9 @@ class BenchEnvironment:
                         etype = line[len("event:") :].strip()
                         if etype == "response.output_text.delta":
                             first_delta.set()
+                            return
+                        if etype == "response.output_item.done":
+                            first_response.set()
                             return
                         if etype in _STREAM_TERMINAL_EVENTS:
                             outcome["terminal"] = etype
@@ -725,15 +784,16 @@ class BenchEnvironment:
                 connected.set()
                 first_delta.set()
 
-        # Ensure any prior turn has settled so the fresh subscription's first
-        # terminal event can't be the previous turn completing (which would
-        # otherwise race ahead of this turn's delta).
-        await self._wait_idle(session_id, timeout=timeout)
+        if wait_idle_first:
+            # Warm path: ensure any prior turn has settled so the fresh
+            # subscription's first terminal event can't be the previous turn
+            # completing (which would otherwise race ahead of this turn's delta).
+            await self._wait_idle(session_id, timeout=timeout)
 
         reader = asyncio.create_task(_read_stream())
         try:
             # Wait until the stream is actually connected (not a fixed sleep) so
-            # the measured window is post → first delta, not subscription setup.
+            # the measured window is post → first response, not subscription setup.
             await asyncio.wait_for(connected.wait(), timeout=timeout)
             posted = await self.client.post(
                 f"/v1/sessions/{session_id}/events",
@@ -743,20 +803,70 @@ class BenchEnvironment:
                 },
             )
             posted.raise_for_status()
-            try:
-                await asyncio.wait_for(first_delta.wait(), timeout=timeout)
-            except TimeoutError as exc:
+            # Return on the first response, whichever comes first: a streamed text
+            # delta or a completed output item (e.g. a tool call for harnesses that
+            # don't stream text).
+            waiters = [
+                asyncio.create_task(first_delta.wait()),
+                asyncio.create_task(first_response.wait()),
+            ]
+            done, pending = await asyncio.wait(
+                waiters, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in pending:
+                task.cancel()
+            if not done:
                 raise RuntimeError(
-                    f"no output_text.delta within {timeout}s (session {session_id})"
-                ) from exc
+                    "no output_text.delta or output_item.done within "
+                    f"{timeout}s (session {session_id})"
+                )
             if "error" in outcome:
                 raise RuntimeError(f"stream error: {outcome['error']}")
             if "terminal" in outcome:
                 raise RuntimeError(
-                    f"turn reached {outcome['terminal']} before any delta (session {session_id})"
+                    f"turn reached {outcome['terminal']} before any response "
+                    f"(session {session_id})"
                 )
         finally:
             reader.cancel()
+
+    async def time_to_first_delta(
+        self, session_id: str, text: str, *, timeout: float = _TURN_TIMEOUT_S
+    ) -> None:
+        """Post a turn on a WARM session and return on the first output delta.
+
+        Times omnigent's streaming-pipeline overhead to first token against an
+        already-connected runner — with the zero-latency mock there is no model
+        latency in the number. See :meth:`_post_and_await_first_delta`.
+        """
+        await self._post_and_await_first_delta(
+            session_id, text, wait_idle_first=True, timeout=timeout
+        )
+
+    async def cold_start_first_delta(
+        self, agent_id: str, text: str, *, timeout: float = _TURN_TIMEOUT_S
+    ) -> None:
+        """Time the full UI cold path: create → attach SSE → send → first token.
+
+        Reproduces exactly what the Web UI does for a brand-new host-bound
+        session: create the session (which fires ``host.launch_runner`` and
+        returns before the runner connects), then run the standard first-token
+        sequence (attach the SSE stream, wait for its ready heartbeat, POST the
+        first message, await the first ``response.output_text.delta``). Because
+        the runner is still booting when the message posts, the server's
+        connect-grace wait is on the timed path — so the measured span captures
+        the real cold-start cost the ``session_cold_start`` journey exists for:
+        host launch + runner boot + reverse-tunnel connect + first-token
+        pipeline. No pre-warm and no ``GET /session`` status polling — the SSE
+        first-delta signal is the same one the UI renders on.
+
+        :raises RuntimeError: If not host-backed, or no delta / a terminal event
+            arrives within *timeout*.
+        """
+        session_id = await self.create_hosted_session(agent_id)
+        await self._post_and_await_first_delta(
+            session_id, text, wait_idle_first=False, timeout=timeout
+        )
 
     async def drive_and_interrupt(
         self, session_id: str, *, timeout: float = _TURN_TIMEOUT_S
