@@ -172,16 +172,7 @@ class PiProviderConfig:
             # Include all known models, ensuring the selected model is present.
             # The selected model may be a newer id not yet in the static list.
             models: list[dict[str, Any]] = list(self.extra_models)
-            # Only append to this (Anthropic) provider when the selected model
-            # is absent from ALL providers — not just this one. A non-Claude
-            # model (e.g. databricks-glm-5-2) lives in additional_providers
-            # (openai-completions); appending it here too would register it
-            # under the wrong wire protocol (anthropic-messages).
-            in_additional = any(
-                any(m.get("id") == self.model for m in prov.get("models", []))
-                for prov in self.additional_providers.values()
-            )
-            if not any(m.get("id") == self.model for m in models) and not in_additional:
+            if not any(m.get("id") == self.model for m in models):
                 models.append({"id": self.model, "input": ["text", "image"]})
         else:
             models = [{"id": self.model}]
