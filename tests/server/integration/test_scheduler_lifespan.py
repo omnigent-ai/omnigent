@@ -67,7 +67,7 @@ async def test_lifespan_starts_and_stops_scheduler(
         prompt="triage the queue",
         cron_expression="0 9 * * *",
         owner_user_id=None,
-        agent_id="ag-1",
+        agent_id=_uid("agent-1"),
         timezone="America/Los_Angeles",
     )
     app = _build_app(db_uri, tmp_path, scheduled_task_store=store)
@@ -130,7 +130,7 @@ async def test_lifespan_skips_paused_task(
         prompt="do nothing",
         cron_expression="0 9 * * *",
         owner_user_id=None,
-        agent_id="ag-1",
+        agent_id=_uid("agent-1"),
         timezone="UTC",
         state="paused",
     )
