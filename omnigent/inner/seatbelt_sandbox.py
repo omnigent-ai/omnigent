@@ -712,6 +712,19 @@ def _build_profile(
             "(allow ipc-posix-sem)",
             "(allow sysctl-read)",
             "(allow file-ioctl)",
+            # M7 (security 2026-07-15): Bun's WriteStream constructor calls fstat(2) on
+            # its inherited pipe file descriptors (stdout/stderr) at startup for ANSI
+            # color/TTY detection (internal:util/colors, fs/streams:244). Pipe fds have no
+            # filesystem vnode path, so they don't match any path-scoped file-read-metadata
+            # literal. Under deny-default this returns EPERM, crashing the Bun process
+            # before any stream-json output is produced — the root cause of the 60s connect
+            # timeout. Granting file-read-metadata globally (no path filter) allows fstat()
+            # on any fd including pipes. This does NOT grant file data access (file-read*),
+            # only inode metadata (stat/fstat/access/getattrlist). Risk: stat-oracle —
+            # sandboxed agent can confirm file existence on the whole filesystem without
+            # reading content. Acceptable for single-tenant developer use; flag for
+            # multi-tenant deployments. Analogous to the existing global (allow file-ioctl).
+            "(allow file-read-metadata)",
             "",
             ";; /dev access. Read-only for the whole tree (device-node",
             ";; metadata, /dev/null content, /dev/urandom, /dev/fd/N for",
