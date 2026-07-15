@@ -27,6 +27,8 @@ _SMOKE_JOURNEYS = [
     "get_session",
     "load_conversation_history",
     "search_sessions",
+    "fork_session",
+    "add_comment",
 ]
 
 
@@ -56,6 +58,14 @@ def _smoke_args(**overrides: object) -> argparse.Namespace:
 
 
 # ── pure-layer unit checks (no server) ───────────────────────
+
+
+def test_backend_of_classifies_uri_schemes() -> None:
+    """The report's backend label is derived from the URI scheme."""
+    assert bench_run._backend_of(None) == "sqlite"
+    assert bench_run._backend_of("sqlite:////abs/bench.db") == "sqlite"
+    assert bench_run._backend_of("postgresql+psycopg://u@h:5432/db") == "postgres"
+    assert bench_run._backend_of("mysql+mysqldb://u@h:3306/db") == "mysql"
 
 
 def test_percentile_and_throughput() -> None:
@@ -111,6 +121,34 @@ def test_build_report_shape() -> None:
     assert "list_sessions" in _d(report["journeys"])
 
 
+# ── per-journey iteration cap (no server) ────────────────────
+
+
+def test_effective_iterations_clamps_capped_journey() -> None:
+    """A journey with ``max_iterations`` clamps a larger request down, not up."""
+    capped = ALL_JOURNEYS["session_cold_start"]
+    assert capped.max_iterations is not None
+    # Requesting more than the cap is clamped to the cap; less is left alone.
+    assert bench_run._effective_iterations(capped, 200) == capped.max_iterations
+    assert bench_run._effective_iterations(capped, 1) == 1
+
+
+def test_effective_iterations_uncapped_journey_passthrough() -> None:
+    """An HTTP journey (no cap) uses the requested count verbatim."""
+    uncapped = ALL_JOURNEYS["list_sessions"]
+    assert uncapped.max_iterations is None
+    assert bench_run._effective_iterations(uncapped, 200) == 200
+
+
+def test_runner_journeys_are_capped() -> None:
+    """Every full-turn journey caps its iterations; HTTP journeys do not."""
+    for journey in ALL_JOURNEYS.values():
+        if journey.needs_runner:
+            assert journey.max_iterations is not None, journey.name
+        else:
+            assert journey.max_iterations is None, journey.name
+
+
 # ── end-to-end smoke (boots the server) ──────────────────────
 
 
@@ -131,6 +169,9 @@ async def test_benchmark_smoke_end_to_end() -> None:
         block = _d(journeys[name])
         assert block["kind"] == "latency"
         assert block["backend"] == "sqlite"
+        # Hardcoded per-journey flag: HTTP journeys are always False, even in a
+        # run whose config.with_runner is True because a runner journey rode along.
+        assert block["needs_runner"] is False
         run_rows = cast(list[dict[str, object]], block["runs"])
         assert run_rows, f"{name} produced no runs"
         # Zero failures — a failure here means the HTTP path itself broke.
@@ -149,7 +190,13 @@ async def test_benchmark_smoke_threshold_failure_exits_nonzero() -> None:
 
 # ── runner (full-turn) journeys ──────────────────────────────
 
-_RUNNER_JOURNEYS = ["session_cold_start", "warm_turn", "time_to_first_token", "interrupt"]
+_RUNNER_JOURNEYS = [
+    "session_cold_start",
+    "warm_turn",
+    "time_to_first_token",
+    "interrupt",
+    "read_runner_file",
+]
 
 
 @pytest.mark.timeout(300)
@@ -172,6 +219,8 @@ async def test_benchmark_smoke_runner_journeys() -> None:
     for name in _RUNNER_JOURNEYS:
         assert ALL_JOURNEYS[name].needs_runner
         block = _d(journeys[name])
+        # The hardcoded per-journey flag surfaces in the report block.
+        assert block["needs_runner"] is True
         run_rows = cast(list[dict[str, object]], block["runs"])
         assert run_rows, f"{name} produced no runs"
         # Zero failures — a failure here means the full-turn path broke.

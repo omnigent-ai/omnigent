@@ -18,7 +18,7 @@ It edits ONLY the ``[project].version`` line and the sibling ``==``
 pins, matched by package name — never a blind version-string replace —
 so unrelated version literals (host/runner wire-protocol versions,
 docstring examples, third-party dependency floors like
-``databricks-mcp>=0.1.0``) are left untouched.
+``databricks-mcp>=0.9.0``) are left untouched.
 
 ``web/package.json`` (a ``0.0.0`` sentinel for the private SPA) and
 ``web/electron/package.json`` (the desktop app's independent

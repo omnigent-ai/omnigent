@@ -11,9 +11,11 @@ import {
   ArchiveIcon,
   ArrowLeftIcon,
   DownloadIcon,
+  GitBranchIcon,
   KeyboardIcon,
   PaletteIcon,
   PanelRightOpenIcon,
+  Share2Icon,
   ShieldCheckIcon,
   TerminalIcon,
   UserCogIcon,
@@ -23,26 +25,31 @@ import { Link, useLocation } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isSingleUserMode } from "@/lib/capabilities";
 import { useIsAdmin } from "@/hooks/useIsAdmin";
 import { isElectronShell } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
 
 export type SettingsSectionId =
   | "appearance"
+  | "git"
   | "shortcuts"
   | "account"
   | "members"
   | "policies"
+  | "sharing"
   | "archived"
   | "cli"
   | "updates";
 
 const SECTION_IDS: readonly SettingsSectionId[] = [
   "appearance",
+  "git",
   "shortcuts",
   "account",
   "members",
   "policies",
+  "sharing",
   "archived",
   "cli",
   "updates",
@@ -74,9 +81,11 @@ export function settingsNavGroups(
   hasAuthSession: boolean,
   isDesktop: boolean,
   isAdmin = false,
+  isSingleUser = false,
 ): SettingsNavGroup[] {
   const general: SettingsNavItem[] = [
     { id: "appearance", label: "Appearance", icon: PaletteIcon },
+    { id: "git", label: "Git", icon: GitBranchIcon },
     { id: "shortcuts", label: "Keyboard shortcuts", icon: KeyboardIcon, hideOnMobile: true },
   ];
   if (hasAuthSession) {
@@ -105,13 +114,15 @@ export function settingsNavGroups(
   // mode where there's otherwise no admin chrome at all. Members runs
   // read-only under OIDC (no password actions); Policies is identical.
   if (isAdmin) {
-    groups.push({
-      title: "Admin",
-      items: [
-        { id: "members", label: "Members", icon: UsersIcon },
-        { id: "policies", label: "Policies", icon: ShieldCheckIcon },
-      ],
-    });
+    // Members (manage other accounts) and Sharing (grant sessions to other
+    // users) have no meaning in single-user mode — there are no other users —
+    // so drop both from the nav there. Policies stays: global policies apply
+    // to a solo user's own sessions too.
+    const adminItems: SettingsNavItem[] = [];
+    if (!isSingleUser) adminItems.push({ id: "members", label: "Members", icon: UsersIcon });
+    adminItems.push({ id: "policies", label: "Policies", icon: ShieldCheckIcon });
+    if (!isSingleUser) adminItems.push({ id: "sharing", label: "Sharing", icon: Share2Icon });
+    groups.push({ title: "Admin", items: adminItems });
   }
   groups.push({
     title: "Archived",
@@ -141,10 +152,15 @@ export function useSettingsRoute(): { inSettings: boolean; section: SettingsSect
   const idx = segments.lastIndexOf("settings");
   if (idx === -1) return { inSettings: false, section: defaultSection };
   const next = segments[idx + 1];
-  // Members / Policies are admin sections valid in ANY multi-user mode
-  // (accounts AND OIDC). They're gated in the nav on `is_admin` and the
+  // Members / Policies / Sharing are admin sections valid in ANY multi-user
+  // mode (accounts AND OIDC). They're gated in the nav on `is_admin` and the
   // pages self-gate + the server 403s, so no accounts-mode carve-out here.
-  const isValidSection = (SECTION_IDS as readonly string[]).includes(next);
+  // Members and Sharing are the exception: single-user mode has no other
+  // users, so a direct hit to either falls back to the default section.
+  const singleUser = isSingleUserMode(info);
+  const isValidSection =
+    (SECTION_IDS as readonly string[]).includes(next) &&
+    !(singleUser && (next === "members" || next === "sharing"));
   const section = isValidSection ? (next as SettingsSectionId) : defaultSection;
   return { inSettings: true, section };
 }
@@ -190,7 +206,12 @@ export function SettingsSidebarBody({
   // not just accounts deploys. Non-admins never see it.
   const isAdmin = useIsAdmin();
   const { section } = useSettingsRoute();
-  const groups = settingsNavGroups(hasAuthSession, isElectronShell(), isAdmin);
+  const groups = settingsNavGroups(
+    hasAuthSession,
+    isElectronShell(),
+    isAdmin,
+    isSingleUserMode(info),
+  );
 
   return (
     <>

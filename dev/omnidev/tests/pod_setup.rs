@@ -1,6 +1,7 @@
 //! Exercises the non-TUI setup path: repo detection, pod dir tree, ports.
 
 use std::fs;
+use std::sync::{Mutex, MutexGuard};
 
 // The crate is a binary, so pull in the modules under test directly. Each test
 // target uses only part of the included source, so allow dead code.
@@ -67,6 +68,8 @@ fn needs_npm_install_tracks_manifests() {
             server: 6767,
             vite: 5173,
         },
+        vite_host: "127.0.0.1".into(),
+        trusted_origins: Vec::new(),
     };
 
     // No node_modules yet → install needed.
@@ -136,6 +139,92 @@ fn pod_lock_is_exclusive() {
 
     drop(held);
     lock::acquire(&pod).expect("acquire succeeds again after release");
+}
+
+const ALLOWED_ORIGINS_ENV: &str = "OMNIGENT_WS_ALLOWED_ORIGINS";
+
+/// Tests that read/write the process-global allowlist env var; serialize them.
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+fn lock_env() -> MutexGuard<'static, ()> {
+    ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Run `body` with `OMNIGENT_WS_ALLOWED_ORIGINS` set to `value` (or unset when
+/// `None`), restoring the prior value afterward so tests don't leak env state.
+fn with_allowlist_env(value: Option<&str>, body: impl FnOnce()) {
+    let _guard = lock_env();
+    let prev = std::env::var(ALLOWED_ORIGINS_ENV).ok();
+    match value {
+        Some(v) => std::env::set_var(ALLOWED_ORIGINS_ENV, v),
+        None => std::env::remove_var(ALLOWED_ORIGINS_ENV),
+    }
+    body();
+    match prev {
+        Some(v) => std::env::set_var(ALLOWED_ORIGINS_ENV, v),
+        None => std::env::remove_var(ALLOWED_ORIGINS_ENV),
+    }
+}
+
+fn pod_with_trusted(trusted: Vec<String>) -> Pod {
+    Pod {
+        repo_root: std::path::PathBuf::from("/repo"),
+        dir: std::path::PathBuf::from("/pod"),
+        ports: Ports {
+            server: 6767,
+            vite: 5173,
+        },
+        vite_host: "0.0.0.0".into(),
+        trusted_origins: trusted,
+    }
+}
+
+fn allowlist_from_env(pod: &Pod) -> Option<String> {
+    pod.env()
+        .into_iter()
+        .find(|(k, _)| k == ALLOWED_ORIGINS_ENV)
+        .map(|(_, v)| v)
+}
+
+/// With no trusted origins, the pod leaves the allowlist var untouched — even
+/// when the developer's shell already exports one (it passes through inherited).
+#[test]
+fn no_trusted_origins_does_not_set_allowlist() {
+    with_allowlist_env(Some("https://dev.example.com"), || {
+        let pod = pod_with_trusted(Vec::new());
+        assert_eq!(allowlist_from_env(&pod), None);
+    });
+}
+
+/// Trusted origins with no inherited value produce exactly those origins.
+#[test]
+fn trusted_origins_populate_allowlist() {
+    with_allowlist_env(None, || {
+        let pod = pod_with_trusted(vec!["http://192.168.1.42:5173".into()]);
+        assert_eq!(
+            allowlist_from_env(&pod).as_deref(),
+            Some("http://192.168.1.42:5173")
+        );
+    });
+}
+
+/// A developer's inherited allowlist is preserved and the LAN origins are
+/// appended (order-preserving, deduped) rather than clobbered.
+#[test]
+fn trusted_origins_merge_with_inherited_allowlist() {
+    with_allowlist_env(
+        Some("https://dev.example.com, http://192.168.1.42:5173"),
+        || {
+            let pod = pod_with_trusted(vec![
+                "http://192.168.1.42:5173".into(), // already inherited → not duplicated
+                "http://10.0.0.9:5173".into(),
+            ]);
+            assert_eq!(
+                allowlist_from_env(&pod).as_deref(),
+                Some("https://dev.example.com,http://192.168.1.42:5173,http://10.0.0.9:5173")
+            );
+        },
+    );
 }
 
 /// Minimal unique temp dir without pulling a dev-dependency.

@@ -32,6 +32,7 @@ vi.mock("@tiptap/extension-table", () => ({
   TableHeader: {},
 }));
 vi.mock("@tiptap/extension-list", () => ({
+  ListItem: { extend: vi.fn().mockReturnValue({}) },
   TaskList: {},
   TaskItem: { configure: vi.fn().mockReturnValue({}) },
 }));

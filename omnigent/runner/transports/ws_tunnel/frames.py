@@ -57,12 +57,18 @@ class HelloFrame:
         on major mismatch (RUNNER.md §2 "Version skew").
     :param harnesses: Names of harness kinds the runner can spawn.
     :param envs: Names of OS env types the runner supports.
+    :param telemetry_opt_out: ``True`` when the runner's host has
+        opted out of telemetry (``OMNIGENT_TELEMETRY=0``,
+        ``DISABLE_TELEMETRY=true``, or ``telemetry: false`` in
+        config.yaml).  The server honours this on a best-effort basis
+        by skipping telemetry events for sessions on this runner.
     """
 
     runner_version: str
     frame_protocol_version: int
     harnesses: list[str] = field(default_factory=list)
     envs: list[str] = field(default_factory=list)
+    telemetry_opt_out: bool = False
 
 
 @dataclass
@@ -200,6 +206,7 @@ def encode_frame(frame: Frame) -> str:
                 "frame_protocol_version": frame.frame_protocol_version,
                 "harnesses": list(frame.harnesses),
                 "envs": list(frame.envs),
+                "telemetry_opt_out": frame.telemetry_opt_out,
             }
         )
     if isinstance(frame, RequestFrame):
@@ -367,6 +374,7 @@ def _decode_hello(msg: dict[str, Any]) -> HelloFrame:
         frame_protocol_version=_required_int(msg, "frame_protocol_version"),
         harnesses=_optional_str_list(msg, "harnesses"),
         envs=_optional_str_list(msg, "envs"),
+        telemetry_opt_out=_optional_bool(msg, "telemetry_opt_out", False),
     )
 
 

@@ -22,6 +22,8 @@ from opentelemetry import metrics as otel_metrics
 from opentelemetry.util.types import Attributes
 from uvicorn.logging import AccessFormatter
 
+from omnigent.process_logging import log_record_display_fields
+
 _DEFAULT_WINDOWS_SECONDS = (1.0, 10.0, 30.0)
 _BYTES_PER_MIB = 1024 * 1024
 _OTEL_METER_NAME = "omnigent.server.performance"
@@ -216,6 +218,16 @@ class RequestDurationAccessFormatter(AccessFormatter):
     """
 
     _MAX_USER_AGENT_LENGTH = 80
+
+    def format(self, record: logging.LogRecord) -> str:
+        """Apply Omnigent's standard source and level display fields."""
+        fmt = getattr(self._style, "_fmt", "")
+        with log_record_display_fields(
+            record,
+            use_colors=self.use_colors,
+            format_level="%(levelprefix)" not in fmt,
+        ):
+            return super().format(record)
 
     def formatMessage(self, record: logging.LogRecord) -> str:
         """

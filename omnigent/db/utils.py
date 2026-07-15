@@ -315,6 +315,39 @@ def get_or_create_engine(db_uri: str) -> Engine:
     return _engine_cache[db_uri]
 
 
+def get_or_create_conversation_engine(conv_uri: str) -> Engine:
+    """
+    Return a cached engine for the Agent Platform DB URI.
+
+    Unlike :func:`get_or_create_engine`, this does NOT run Alembic
+    migrations — the AP DB is expected to be a fresh database that
+    gets its tables created via ``ConversationBase.metadata.create_all()``.
+    For the common case where AP DB == Omnigent DB, callers should
+    use :func:`get_or_create_engine` directly and share the engine.
+
+    :param conv_uri: SQLAlchemy database URI for the AP DB.
+    :returns: A :class:`~sqlalchemy.engine.Engine` for the given URI.
+    """
+    if conv_uri not in _engine_cache:
+        with _engine_lock:
+            if conv_uri not in _engine_cache:
+                engine = _create_engine(conv_uri)
+                _ensure_conversation_tables(engine)
+                from omnigent.runtime.telemetry import instrument_sqlalchemy_engine
+
+                instrument_sqlalchemy_engine(engine)
+                _engine_cache[conv_uri] = engine
+    return _engine_cache[conv_uri]
+
+
+def _ensure_conversation_tables(engine: Engine) -> None:
+    """Create AP tables (conversations, conversation_items, conversation_labels) if absent."""
+    from omnigent.db.db_models import ConversationBase
+
+    ConversationBase.metadata.create_all(bind=engine, checkfirst=True)
+    ensure_fts_table(engine)
+
+
 def _build_alembic_config(db_uri: str) -> Config:
     """
     Build an Alembic ``Config`` pointed at our migrations directory.
@@ -362,7 +395,7 @@ def _run_migrations(engine: Engine, db_uri: str) -> None:
     """
     from alembic import command
 
-    from omnigent.db.db_models import Base
+    from omnigent.db.db_models import ConversationBase, OmnigentBase
 
     _logger.info("Running database migrations...")
     config = _build_alembic_config(db_uri)
@@ -377,8 +410,10 @@ def _run_migrations(engine: Engine, db_uri: str) -> None:
     # at least create any missing tables from ORM metadata so the
     # server still boots. Cannot rescue missing COLUMNS on existing
     # tables — those need a real migration, which is why the
-    # short-circuit above was removed.
-    Base.metadata.create_all(bind=engine, checkfirst=True)
+    # short-circuit above was removed. Both bases are created because
+    # in single-DB mode this engine hosts the AP tables too.
+    for base in (OmnigentBase, ConversationBase):
+        base.metadata.create_all(bind=engine, checkfirst=True)
 
 
 def _get_current_db_revision(engine: Engine) -> str | None:
@@ -529,7 +564,14 @@ def make_managed_session_maker(
     :returns: A callable that, when invoked, returns a context
         manager yielding a :class:`~sqlalchemy.orm.Session`.
     """
-    factory = sessionmaker(bind=engine)
+    # expire_on_commit=False keeps column attributes accessible on ORM
+    # instances after the session commits and closes. Without it, SQLAlchemy
+    # expires all attributes on commit, and any access outside the session
+    # context (e.g. after the ``with session:`` block exits) raises
+    # DetachedInstanceError. This is safe here because each managed session
+    # is short-lived and single-writer, so there is no cross-session stale
+    # data concern.
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
     is_sqlite = engine.dialect.name == "sqlite"
 
     @contextmanager
@@ -831,11 +873,9 @@ def extract_search_text(item: NewConversationItem) -> str:
             part for part in (data.get("input") or "", data.get("stdout") or "") if part
         )
     if item.type == "routing_decision":
-        # Index model + tier + rationale so FTS can find a router
-        # verdict by the model it picked or its one-line explanation.
-        return " ".join(
-            part for part in (data.get("model"), data.get("tier"), data.get("rationale")) if part
-        )
+        # Index model + rationale so FTS can find a router verdict by
+        # the model it picked or its one-line explanation.
+        return " ".join(part for part in (data.get("model"), data.get("rationale")) if part)
     raise ValueError(f"unknown item type: {item.type!r}")
 
 
@@ -858,6 +898,55 @@ def strip_nul_bytes(value: str) -> str:
         unchanged when no NUL bytes are present.
     """
     return value.replace("\x00", "")
+
+
+def build_search_snippet(
+    text: str,
+    query: str,
+    *,
+    context: int = 60,
+    max_len: int = 160,
+) -> str | None:
+    """
+    Build a short excerpt of ``text`` centered on the first ``query`` match.
+
+    Powers the session-search preview: the sidebar/palette matches on chat
+    content, so a hit is often invisible in the session title. This returns
+    the matching span plus a little surrounding context, with ``…`` marking
+    elided ends, so the UI can show *where* a session matched.
+
+    Matching is case-insensitive substring (mirrors the ``LIKE`` filter that
+    selected the row). Whitespace in ``text`` is collapsed first so a match
+    inside a multi-line tool output renders as one clean line.
+
+    :param text: The item's plain search text to excerpt from.
+    :param query: The user's search string, e.g. ``"deploy error"``.
+    :param context: Characters of context to keep on each side of the match.
+    :param max_len: Hard cap on the returned snippet length (excluding the
+        ``…`` markers) so a giant match term can't blow up the row.
+    :returns: The excerpt, or ``None`` when ``query`` is empty or does not
+        occur in ``text`` (caller then falls back to no preview).
+    """
+    if not query:
+        return None
+    collapsed = " ".join(text.split())
+    idx = collapsed.lower().find(query.lower())
+    if idx == -1:
+        return None
+    match_end = idx + len(query)
+    start = max(0, idx - context)
+    end = min(len(collapsed), match_end + context)
+    # Keep the total under max_len, but never clamp the matched term itself out
+    # of the window — otherwise the UI would highlight nothing. A pathologically
+    # long match term overflows max_len rather than being cut mid-term.
+    if end - start > max_len:
+        end = max(start + max_len, match_end)
+    snippet = collapsed[start:end]
+    if start > 0:
+        snippet = f"…{snippet}"
+    if end < len(collapsed):
+        snippet = f"{snippet}…"
+    return snippet
 
 
 # ── Timestamp ──────────────────────────────────────────

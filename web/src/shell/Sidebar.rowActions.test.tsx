@@ -11,12 +11,24 @@ import { cleanup, fireEvent, render, screen, within } from "@testing-library/rea
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import type { ServerInfo } from "@/lib/capabilities";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 
 // Controllable rename mutation so the double-click test can assert the
-// committed title was forwarded to the PATCH. Declared via vi.hoisted so the
-// vi.mock factory (hoisted above imports) can reference it.
+// committed title was forwarded to the PATCH. `isMobile` toggles the mocked
+// `useIsMobileViewport` so a test can render the row on a mobile viewport (the
+// project flyout is disabled there). Declared via vi.hoisted so the vi.mock
+// factories (hoisted above imports) can reference them.
 const mocks = vi.hoisted(() => ({
   rename: { mutate: vi.fn() },
+  isMobile: false,
+}));
+
+// Mock the mobile-viewport hook — jsdom doesn't evaluate media queries, so
+// drive it explicitly. Defaults to desktop (false); the mobile flyout test
+// flips `mocks.isMobile` for the duration of that case.
+vi.mock("@/hooks/useIsMobileViewport", () => ({
+  useIsMobileViewport: () => mocks.isMobile,
 }));
 
 vi.mock("@/hooks/useConversations", () => ({
@@ -93,13 +105,32 @@ function mockConversations(conversations: Conversation[]) {
   useConvMock.mockImplementation(() => dataResult);
 }
 
+/** Full ServerInfo with permissive defaults; override per test. */
+function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
+  return {
+    accounts_enabled: false,
+    single_user: false,
+    login_url: null,
+    needs_setup: false,
+    databricks_features: false,
+    managed_sandboxes_enabled: false,
+    sandbox_provider: null,
+    sharing_mode: "on",
+    public_sharing_enabled: true,
+    server_version: null,
+    smart_routing_enabled: false,
+    ...overrides,
+  };
+}
+
 // `activeId` mounts the sidebar at `/c/:conversationId` (via a matching
 // Route so `useParams` populates), making that row the active one — the
-// rest of the suite renders at `/` where no row is active.
-function renderSidebar(activeId?: string) {
+// rest of the suite renders at `/` where no row is active. `info` pins the
+// server sharing policy via CapabilitiesProvider (default "loading" → on).
+function renderSidebar(activeId?: string, info?: ServerInfo) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const sidebar = <Sidebar open={true} onClose={vi.fn()} />;
-  return render(
+  const tree = (
     <QueryClientProvider client={qc}>
       <TooltipProvider>
         <MemoryRouter initialEntries={[activeId ? `/c/${activeId}` : "/"]}>
@@ -112,13 +143,21 @@ function renderSidebar(activeId?: string) {
           )}
         </MemoryRouter>
       </TooltipProvider>
-    </QueryClientProvider>,
+    </QueryClientProvider>
   );
+  // No explicit info → CapabilitiesContext default ("loading"), matching every
+  // pre-existing test (sharing treated as on).
+  return render(info ? <CapabilitiesProvider info={info}>{tree}</CapabilitiesProvider> : tree);
 }
 
 beforeEach(() => {
   mocks.rename.mutate.mockReset();
+  // Default every test to the desktop viewport; the mobile flyout test opts in.
+  mocks.isMobile = false;
   useConvMock.mockReset();
+  // Pins persist to localStorage; clear it so a seeded pin doesn't leak into
+  // the next test's row state.
+  localStorage.clear();
   // The read-state mirror is module-level (in-memory), so reset it between
   // tests to avoid a mark-unread leaking into later rows.
   __resetReadStateForTests();
@@ -257,6 +296,63 @@ describe("double-click to rename", () => {
   });
 });
 
+describe("pinned row project flyout", () => {
+  // Pinning lifts a session out of its project folder into the flat "Pinned"
+  // section, so the folder no longer conveys which project it came from. The
+  // hover flyout restores that cue: title + folder icon + project name. It
+  // opens on focus/hover — fire focus on the row link and await the portal.
+
+  it("shows the project name in the flyout for a pinned, project-owned row", async () => {
+    // Seed the pin so the row lifts into the always-expanded Pinned section
+    // (a project-owned row otherwise sits inside a collapsed project folder).
+    localStorage.setItem("omnigent:pinned-conversation-ids", JSON.stringify(["conv_1"]));
+    mockConversations([{ ...CONV, labels: { omni_project: "Moonshot" } }]);
+    renderSidebar();
+    expect(screen.getByText("Pinned")).toBeInTheDocument();
+
+    // Focus opens the HoverCard (onFocus is one of its open triggers); the
+    // content is portalled, so query the whole document after the open delay.
+    fireEvent.focus(screen.getByRole("link", { name: /My Session/ }));
+    const flyout = await screen.findByTestId("pinned-project-flyout");
+    expect(within(flyout).getByText("Moonshot")).toBeInTheDocument();
+    expect(within(flyout).getByText("My Session")).toBeInTheDocument();
+  });
+
+  it("renders no project flyout for a pinned row with no project", () => {
+    // No project label → nothing to surface, so the row keeps its plain native
+    // title tooltip and never mounts a hover-card trigger.
+    localStorage.setItem("omnigent:pinned-conversation-ids", JSON.stringify(["conv_1"]));
+    mockConversations([{ ...CONV, labels: {} }]);
+    renderSidebar();
+    expect(screen.getByText("Pinned")).toBeInTheDocument();
+
+    const row = screen.getByRole("link", { name: /My Session/ });
+    expect(row).not.toHaveAttribute("data-slot", "hover-card-trigger");
+    fireEvent.focus(row);
+    expect(screen.queryByTestId("pinned-project-flyout")).toBeNull();
+  });
+
+  it("disables the flyout on a mobile viewport, keeping the native title", () => {
+    // Mobile has no real hover, so the flyout is gated off there: a tap that
+    // navigates must not also open (and strand) a HoverCard over the chat. The
+    // row falls back to the plain link path — no hover-card trigger, native
+    // title restored — even though it IS pinned + project-owned.
+    mocks.isMobile = true;
+    localStorage.setItem("omnigent:pinned-conversation-ids", JSON.stringify(["conv_1"]));
+    mockConversations([{ ...CONV, labels: { omni_project: "Moonshot" } }]);
+    renderSidebar();
+    expect(screen.getByText("Pinned")).toBeInTheDocument();
+
+    const row = screen.getByRole("link", { name: /My Session/ });
+    // No hover-card trigger is mounted, and the native title tooltip is kept.
+    expect(row).not.toHaveAttribute("data-slot", "hover-card-trigger");
+    expect(row).toHaveAttribute("title", "My Session");
+    // Focusing the row opens nothing — the flyout never mounts on mobile.
+    fireEvent.focus(row);
+    expect(screen.queryByTestId("pinned-project-flyout")).toBeNull();
+  });
+});
+
 describe("mark as unread", () => {
   it("re-lights the row's unread dot via an explicit mark-unread", () => {
     renderSidebar();
@@ -337,5 +433,56 @@ describe("right-click context menu", () => {
     // inline rename input appears.
     fireEvent.click(screen.getByTestId("rename-conversation"));
     expect(screen.getByTestId("rename-conversation-input")).toBeInTheDocument();
+  });
+});
+
+describe("sharing kill switch", () => {
+  it("disables the row's Share item for a manager when sharing_mode is off", () => {
+    // CONV is owner-level (permission_level null → canManage), yet a server
+    // reporting sharing_mode off must gray out Share for everyone.
+    mockConversations([CONV]);
+    renderSidebar(undefined, serverInfo({ sharing_mode: "off" }));
+
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+
+    // Radix marks a disabled menu item with data-disabled; the enabled
+    // (on / read_only) branch renders a plain selectable item without it.
+    expect(screen.getByTestId("share-conversation")).toHaveAttribute("data-disabled");
+  });
+
+  it("keeps the row's Share item enabled for a manager when sharing is on", () => {
+    mockConversations([CONV]);
+    renderSidebar(undefined, serverInfo({ sharing_mode: "on" }));
+
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+
+    expect(screen.getByTestId("share-conversation")).not.toHaveAttribute("data-disabled");
+  });
+
+  it("omits the row's Share item entirely in single-user mode", () => {
+    // Explicit single_user marker: no other users to share with, so the item
+    // is removed — not just disabled like the sharing-off case.
+    // isCurrentServerLocal is mocked false, so this exercises the single-user
+    // gate specifically (not the local-server path).
+    mockConversations([CONV]);
+    renderSidebar(undefined, serverInfo({ single_user: true }));
+
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+
+    expect(screen.queryByTestId("share-conversation")).toBeNull();
+    // Other row actions still render — only Share is gated on single-user.
+    expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
+  });
+
+  it("keeps the row's Share item on a multi-user header-auth deploy (not single_user)", () => {
+    // Header-auth multi-user (SSO proxy): accounts off AND no login_url, same
+    // shape as single-user, but single_user false — the item must stay.
+    mockConversations([CONV]);
+    renderSidebar(undefined, serverInfo({ single_user: false }));
+
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+
+    expect(screen.getByTestId("share-conversation")).toBeInTheDocument();
+    expect(screen.getByTestId("share-conversation")).not.toHaveAttribute("data-disabled");
   });
 });

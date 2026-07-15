@@ -50,8 +50,8 @@ def test_title_defaults_empty_string_on_insert(db_engine: Engine) -> None:
         conn.execute(
             sa.text(
                 "INSERT INTO conversations "
-                "(id, created_at, updated_at, kind, root_conversation_id) "
-                "VALUES (:id, :ts, :ts, 1, :id)"
+                "(id, created_at, updated_at, root_conversation_id) "
+                "VALUES (:id, :ts, :ts, :id)"
             ),
             {"id": "conv_title_default", "ts": 1700000000},
         )
@@ -77,8 +77,8 @@ def test_downgrade_restores_nullable_and_nullifies_empty_titles(tmp_path: Path) 
         conn.execute(
             sa.text(
                 "INSERT INTO conversations "
-                "(id, created_at, updated_at, kind, root_conversation_id, title) "
-                "VALUES (:id, :ts, :ts, 1, :id, '')"
+                "(id, created_at, updated_at, root_conversation_id, title) "
+                "VALUES (:id, :ts, :ts, :id, '')"
             ),
             {"id": "conv_downgrade_test", "ts": 1700000001},
         )
@@ -89,8 +89,8 @@ def test_downgrade_restores_nullable_and_nullifies_empty_titles(tmp_path: Path) 
         conn.execute(
             sa.text(
                 "INSERT INTO conversations "
-                "(id, created_at, updated_at, kind, root_conversation_id, title) "
-                "VALUES (:id, :ts, :ts, 1, :id, :title)"
+                "(id, created_at, updated_at, root_conversation_id, title) "
+                "VALUES (:id, :ts, :ts, :id, :title)"
             ),
             {"id": "conv_titled", "ts": 1700000002, "title": "My Session"},
         )

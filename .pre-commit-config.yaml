@@ -105,6 +105,16 @@ repos:
         files: ^uv\.lock$
         pass_filenames: true
 
+      # Fail if routing.proto changed without regenerating the committed
+      # bindings (or vice versa). Verify-only, not a fixer: regen needs
+      # grpcio-tools, so CI's `uv sync --extra dev` enforces it (like ktlint).
+      - id: routing-pb2-fresh
+        name: routing protobuf bindings are up to date
+        language: system
+        entry: .venv/bin/python scripts/gen_routing_pb2.py --check
+        files: ^omnigent/api/routing/v1/routing(\.proto|_pb2\.pyi?)$
+        pass_filenames: false
+
   # ── File hygiene ────────────────────────────────────────────────
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.6.0

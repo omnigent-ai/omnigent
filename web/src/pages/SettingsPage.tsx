@@ -9,8 +9,10 @@
  *
  * Sections:
  *
- * - **Appearance** — theme mode (System / Light / Dark). This is the new
- *   home of the theme control that used to sit in the sidebar header.
+ * - **Appearance** — theme mode (System / Light / Dark), terminal theme,
+ *   Workspace panel default for new chats, and UI/code font controls.
+ * - **Git** — Git behavior, e.g. the default base branch pre-filled when
+ *   naming a new worktree branch in the composer.
  * - **Keyboard shortcuts** — the full shortcuts reference, shown inline.
  * - **Account** — only when the accounts auth provider is active. Absorbs
  *   the old sidebar AccountMenu: signed-in identity, change password, and
@@ -38,19 +40,19 @@ import {
 import {
   ArchiveRestoreIcon,
   AlertTriangleIcon,
-  KeyRoundIcon,
-  LogOutIcon,
-  Trash2Icon,
-  UserCogIcon,
-} from "lucide-react";
-import {
   CheckIcon,
+  KeyRoundIcon,
   LaptopMinimalIcon,
+  LogOutIcon,
   MinusIcon,
   MonitorIcon,
   MoonIcon,
+  PanelRightCloseIcon,
+  PanelRightIcon,
   PlusIcon,
   SunIcon,
+  Trash2Icon,
+  UserCogIcon,
 } from "lucide-react";
 import { useTheme } from "next-themes";
 import { PageScroll } from "@/components/PageScroll";
@@ -120,6 +122,12 @@ import {
   type TerminalThemeMode,
 } from "@/lib/terminalThemePreferences";
 import {
+  readWorkspacePanelDefault,
+  writeWorkspacePanelDefault,
+  type WorkspacePanelDefault,
+} from "@/lib/workspacePanelPreferences";
+import { readDefaultBaseBranch, writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
+import {
   applyThemePalette,
   isThemePalette,
   PALETTES,
@@ -149,6 +157,9 @@ const MembersPage = lazy(() =>
 const PoliciesPage = lazy(() =>
   import("@/pages/PoliciesPage").then((m) => ({ default: m.PoliciesPage })),
 );
+const SharingPage = lazy(() =>
+  import("@/pages/SharingPage").then((m) => ({ default: m.SharingPage })),
+);
 
 /**
  * Settings content panel. The section nav lives in the sidebar card
@@ -171,10 +182,16 @@ export function SettingsPage() {
   // Rendered in ANY multi-user mode (accounts AND OIDC), not gated on
   // `accountsEnabled` — the nav + pages handle admin gating, and Members runs
   // read-only under OIDC (no password actions).
-  if (section === "members" || section === "policies") {
+  if (section === "members" || section === "policies" || section === "sharing") {
     return (
       <Suspense fallback={null}>
-        {section === "members" ? <MembersPage /> : <PoliciesPage />}
+        {section === "members" ? (
+          <MembersPage />
+        ) : section === "policies" ? (
+          <PoliciesPage />
+        ) : (
+          <SharingPage />
+        )}
       </Suspense>
     );
   }
@@ -182,6 +199,7 @@ export function SettingsPage() {
   return (
     <PageScroll contentClassName="px-8" extraBottom="2.5rem">
       {section === "appearance" && <AppearanceSection />}
+      {section === "git" && <GitSection />}
       {section === "shortcuts" && <ShortcutsSection />}
       {section === "account" && hasAuthSession && <AccountSection />}
       {section === "archived" && <ArchivedSection />}
@@ -220,6 +238,15 @@ const terminalThemeCards: { mode: TerminalThemeMode; label: string; icon: typeof
   { mode: "auto", label: "Match app", icon: MonitorIcon },
   { mode: "light", label: "Light", icon: SunIcon },
   { mode: "dark", label: "Dark", icon: MoonIcon },
+];
+
+const workspacePanelCards: {
+  value: WorkspacePanelDefault;
+  label: string;
+  icon: typeof PanelRightIcon;
+}[] = [
+  { value: "open", label: "Open", icon: PanelRightIcon },
+  { value: "collapsed", label: "Collapsed", icon: PanelRightCloseIcon },
 ];
 
 /**
@@ -476,6 +503,40 @@ function TerminalThemeControl() {
 }
 
 /**
+ * Default open/collapsed state for the right Workspace rail on brand-new chats.
+ * Only applies when a session has no saved per-chat open state — existing
+ * sessions keep restoring whatever the user last left them as.
+ */
+function WorkspacePanelDefaultControl() {
+  const [value, setValue] = useState(() => readWorkspacePanelDefault());
+  const labelId = useId();
+  const choose = useCallback((next: WorkspacePanelDefault) => {
+    setValue(next);
+    writeWorkspacePanelDefault(next);
+  }, []);
+  return (
+    <ThemeSubsection
+      labelId={labelId}
+      title="Workspace panel"
+      helper="Whether new chats open with the Files / Agents / Shells panel visible. Existing chats keep their last layout."
+    >
+      <CardRadioGroup<WorkspacePanelDefault>
+        labelledBy={labelId}
+        value={value}
+        onSelect={choose}
+        className="grid grid-cols-2 gap-3"
+        cardClassName="items-center gap-2 p-4"
+        items={workspacePanelCards.map((card) => ({
+          value: card.value,
+          testId: `workspace-panel-default-${card.value}`,
+          body: iconCardBody(card.icon, card.label),
+        }))}
+      />
+    </ThemeSubsection>
+  );
+}
+
+/**
  * Color-theme (palette) picker — a dropdown (à la Codex). Each option shows a
  * swatch chip + name and the trigger mirrors the current selection. Choosing
  * one applies it live to <html> via `data-theme`, persists it, and composes on
@@ -601,6 +662,8 @@ function AppearanceSection() {
 
         <TerminalThemeControl />
 
+        <WorkspacePanelDefaultControl />
+
         <UiFontSizeControl />
 
         <UiFontFamilyControl />
@@ -614,6 +677,55 @@ function AppearanceSection() {
         <UiCodeFontFamilyControl />
       </div>
     </Section>
+  );
+}
+
+/** Git behavior settings. */
+function GitSection() {
+  return (
+    <Section title="Git" description="Configure how Omnigent works with Git.">
+      <div className="flex flex-col gap-8">
+        <DefaultBaseBranchControl />
+      </div>
+    </Section>
+  );
+}
+
+/**
+ * Default base branch for new worktrees. When set, the new-session composer
+ * pre-fills the base-branch field as you name a new branch, so the worktree
+ * branches off it. Leave blank to keep the field empty (worktrees default to
+ * the current branch).
+ */
+function DefaultBaseBranchControl() {
+  const [branch, setBranch] = useState(() => readDefaultBaseBranch() ?? "");
+
+  const update = useCallback((next: string) => {
+    setBranch(next);
+    writeDefaultBaseBranch(next);
+  }, []);
+
+  return (
+    <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
+      <div className="flex min-w-0 flex-1 flex-col">
+        <span className="text-sm font-medium">Default base branch</span>
+        <span className="text-sm text-muted-foreground">
+          Auto-filled as the base when you name a new worktree branch. Leave blank to not auto-fill.
+        </span>
+      </div>
+      <Input
+        type="text"
+        aria-label="Default base branch"
+        data-testid="settings-default-base-branch-input"
+        placeholder="e.g. main"
+        spellCheck={false}
+        autoCapitalize="off"
+        autoCorrect="off"
+        className="h-9 w-56 shrink-0"
+        value={branch}
+        onChange={(e) => update(e.target.value)}
+      />
+    </div>
   );
 }
 
