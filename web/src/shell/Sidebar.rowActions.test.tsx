@@ -22,6 +22,10 @@ import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 const mocks = vi.hoisted(() => ({
   rename: { mutate: vi.fn() },
   isMobile: false,
+  // Projects surfaced by the picker + the move-to-project mutation, so the
+  // mobile in-place project view test can assert both the list and the pick.
+  projects: [] as string[],
+  moveToProject: { mutate: vi.fn() },
 }));
 
 // Mock the mobile-viewport hook — jsdom doesn't evaluate media queries, so
@@ -48,8 +52,20 @@ vi.mock("@/hooks/useConversations", () => ({
   useBulkDeleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useStopSession: () => ({ mutate: vi.fn() }),
-  useProjects: () => ({ data: [] }),
-  useMoveToProject: () => ({ mutate: vi.fn() }),
+  useProjects: () => ({ data: mocks.projects }),
+  // A non-empty `useProjects` renders a project folder, which queries its
+  // sessions — return the collapsed (disabled) shape so the folder is inert
+  // (this suite keeps its test row unfiled; the picker only needs the name).
+  useProjectSessions: () => ({
+    data: undefined,
+    isLoading: false,
+    isError: false,
+    error: null,
+    fetchNextPage: vi.fn(),
+    hasNextPage: false,
+    isFetchingNextPage: false,
+  }),
+  useMoveToProject: () => mocks.moveToProject,
   useDeleteProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   fetchProjectSessionIds: () => Promise.resolve([]),
   PROJECT_LABEL_KEY: "omni_project",
@@ -152,6 +168,8 @@ function renderSidebar(activeId?: string, info?: ServerInfo) {
 
 beforeEach(() => {
   mocks.rename.mutate.mockReset();
+  mocks.moveToProject.mutate.mockReset();
+  mocks.projects = [];
   // Default every test to the desktop viewport; the mobile flyout test opts in.
   mocks.isMobile = false;
   useConvMock.mockReset();
@@ -350,6 +368,80 @@ describe("pinned row project flyout", () => {
     // Focusing the row opens nothing — the flyout never mounts on mobile.
     fireEvent.focus(row);
     expect(screen.queryByTestId("pinned-project-flyout")).toBeNull();
+  });
+});
+
+describe("mobile in-place project picker", () => {
+  // Desktop opens the "Add to project" item as a side-flyout submenu, but a
+  // side flyout has no room on mobile. There the item instead swaps the kebab
+  // body in place: the main actions are replaced by the project picker (search
+  // + list + Create new project) plus a Back control that returns to the main
+  // menu — no submenu, no close/reopen. Desktop keeps the flyout untouched.
+
+  it("swaps the kebab body to the project picker in place, and Back returns", () => {
+    mocks.isMobile = true;
+    mocks.projects = ["Sprint 42"];
+    renderSidebar();
+
+    // Radix DropdownMenu opens on pointerdown, not click.
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+
+    // Main view shows the everyday actions and the (unfiled) project entry.
+    expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
+    expect(screen.getByTestId("delete-conversation")).toBeInTheDocument();
+    const moveItem = screen.getByTestId("move-to-project");
+    expect(moveItem).toHaveTextContent("Add to project");
+    // It's a plain item on mobile, NOT a side-flyout submenu trigger.
+    expect(moveItem).not.toHaveAttribute("aria-haspopup", "menu");
+
+    // Tapping it swaps the body in place to the project picker — the main
+    // actions are gone, and the picker (search + project + Create new project)
+    // plus a Back control are shown.
+    fireEvent.click(moveItem);
+    expect(screen.getByPlaceholderText("Search projects")).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: /Sprint 42/ })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: /Create new project/ })).toBeInTheDocument();
+    expect(screen.getByTestId("project-picker-back")).toBeInTheDocument();
+    // The main actions are no longer rendered — the body was replaced, not
+    // stacked beside a flyout.
+    expect(screen.queryByTestId("rename-conversation")).toBeNull();
+    expect(screen.queryByTestId("delete-conversation")).toBeNull();
+
+    // Back returns to the main menu without closing it: the everyday actions
+    // are visible again and the picker is gone.
+    fireEvent.click(screen.getByTestId("project-picker-back"));
+    expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
+    expect(screen.getByTestId("delete-conversation")).toBeInTheDocument();
+    expect(screen.queryByPlaceholderText("Search projects")).toBeNull();
+  });
+
+  it("moves the session into a picked project just like desktop", () => {
+    mocks.isMobile = true;
+    mocks.projects = ["Sprint 42"];
+    renderSidebar();
+
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+    fireEvent.click(screen.getByTestId("move-to-project"));
+    fireEvent.click(screen.getByRole("menuitem", { name: /Sprint 42/ }));
+
+    // Same mutation contract as the desktop submenu pick.
+    expect(mocks.moveToProject.mutate).toHaveBeenCalledWith({
+      id: "conv_1",
+      project: "Sprint 42",
+    });
+  });
+
+  it("keeps the desktop side-flyout submenu (no in-place swap)", () => {
+    // Desktop viewport (default). The project entry is a submenu trigger, and
+    // opening the kebab never renders the in-place Back control.
+    mocks.projects = ["Sprint 42"];
+    renderSidebar();
+
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+    const moveItem = screen.getByTestId("move-to-project");
+    // Radix SubTrigger advertises a submenu popup.
+    expect(moveItem).toHaveAttribute("aria-haspopup", "menu");
+    expect(screen.queryByTestId("project-picker-back")).toBeNull();
   });
 });
 
