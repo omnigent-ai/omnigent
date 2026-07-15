@@ -127,8 +127,18 @@
         font-weight: 500;
         color: var(--muted-foreground);
       }
-      .recent-btn {
+      /* Each recent server is a row: the quick-pick button (fill + connect on
+         click) and a rename control that swaps it for an inline field. */
+      .recent-row {
+        display: flex;
+        align-items: stretch;
+        gap: 6px;
         margin-top: 6px;
+      }
+      .recent-btn {
+        flex: 1 1 auto;
+        min-width: 0;
+        width: auto;
         padding: 8px 12px;
         text-align: left;
         border: 1px solid var(--border);
@@ -140,6 +150,41 @@
       }
       .recent-btn:hover {
         background: color-mix(in srgb, var(--foreground) 5%, transparent);
+      }
+      /* When a nickname is set the label leads; the host trails muted + small. */
+      .rb-label {
+        font-weight: 500;
+      }
+      .rb-url {
+        margin-left: 8px;
+        font-size: 12px;
+        color: var(--muted-foreground);
+      }
+      /* Rename control — the same quiet icon-button treatment as the gear. */
+      .recent-rename {
+        flex: 0 0 auto;
+        width: 34px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        padding: 0;
+        border: 1px solid var(--border);
+        background: transparent;
+        color: var(--muted-foreground);
+      }
+      .recent-rename:hover {
+        color: var(--foreground);
+        background: color-mix(in srgb, var(--foreground) 5%, transparent);
+      }
+      /* Inline edit: the label field replaces the button, sharing the row. */
+      .recent-edit {
+        flex: 1 1 auto;
+        min-width: 0;
+      }
+      .edit-hint {
+        margin: 4px 0 0;
+        font-size: 11px;
+        color: var(--muted-foreground);
       }
       .err {
         margin-top: 12px;
@@ -372,6 +417,25 @@
         <p class="recents-title">Recent servers</p>
         <div id="recents-list"></div>
       </div>
+
+      <!-- Cloned per row for the rename control (avoids innerHTML on the list). -->
+      <template id="rename-icon">
+        <svg
+          xmlns="http://www.w3.org/2000/svg"
+          width="15"
+          height="15"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          aria-hidden="true"
+        >
+          <path d="M12 20h9" />
+          <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z" />
+        </svg>
+      </template>
     </div>
 
     <!-- Omnigent CLI settings, opened from the gear. Hidden by default. -->
@@ -407,10 +471,15 @@
       </div>
     </div>
     <script src="../src/url.js"></script>
+    <script src="../src/recents.js"></script>
     <script>
       // Shared URL helpers (electron/src/url.js), exposed as window.omnigentUrl
       // — the same module the main process uses, so the two never drift.
       const { isPlainHttpRemote } = window.omnigentUrl;
+      // Shared recent-servers helpers (electron/src/recents.js) — hostOf here is
+      // the same one the main process uses, and MAX_LABEL_LENGTH keeps the
+      // field's cap in sync with the store's.
+      const { hostOf, MAX_LABEL_LENGTH } = window.omnigentRecents;
       // Uses the Electron preload bridge (electron/src/preload.js).
       const setup = window.omnigentSetup;
       const input = document.getElementById("url");
@@ -460,24 +529,126 @@
       // form works without it.
       const recentsSection = document.getElementById("recents");
       const recentsList = document.getElementById("recents-list");
+      const renameIcon = document.getElementById("rename-icon");
+      // Whether the shell supports renaming; older shells lack the IPC, in
+      // which case rows render read-only (no pencil).
+      const canRename = typeof setup.setRecentServerLabel === "function";
+      // Loaded { url, label } entries, and the url currently in inline edit.
+      let recentServers = [];
+      let editingUrl = null;
+
+      // The fill+connect button: nickname (bold) with the host trailing muted,
+      // or the bare URL when there's no nickname. textContent, never innerHTML —
+      // the values come from disk and must render as inert text.
+      function recentButton(entry) {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "recent-btn";
+        btn.title = entry.url; // full URL on hover, even when a nickname shows
+        if (entry.label) {
+          const label = document.createElement("span");
+          label.className = "rb-label";
+          label.textContent = entry.label;
+          const host = document.createElement("span");
+          host.className = "rb-url";
+          host.textContent = hostOf(entry.url);
+          btn.append(label, host);
+        } else {
+          btn.textContent = entry.url;
+        }
+        btn.addEventListener("click", () => {
+          input.value = entry.url;
+          connect();
+        });
+        return btn;
+      }
+
+      // The pencil that switches a row into inline-edit mode.
+      function renameButton(entry) {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "recent-rename";
+        btn.title = "Rename this server";
+        btn.setAttribute("aria-label", `Rename ${entry.label || hostOf(entry.url)}`);
+        btn.appendChild(renameIcon.content.cloneNode(true));
+        // Keep focus on any open editor so its blur→cancel doesn't tear this
+        // pencil down before the click lands and swallow a row switch.
+        btn.addEventListener("mousedown", (e) => e.preventDefault());
+        btn.addEventListener("click", () => {
+          editingUrl = entry.url;
+          renderRecents();
+        });
+        return btn;
+      }
+
+      // The inline label editor: Enter saves, Escape or blur cancels.
+      function recentEditor(entry) {
+        const wrap = document.createElement("div");
+        wrap.className = "recent-edit";
+        const field = document.createElement("input");
+        field.type = "text";
+        field.value = entry.label;
+        field.maxLength = MAX_LABEL_LENGTH;
+        field.placeholder = `${hostOf(entry.url)} — leave blank to clear`;
+        field.setAttribute("aria-label", "Server nickname");
+        const hint = document.createElement("p");
+        hint.className = "edit-hint";
+        hint.textContent = "Enter to save · Esc to cancel";
+
+        // Enter/Escape and blur can race; the first outcome wins.
+        let settled = false;
+        function cancel() {
+          if (settled) return;
+          settled = true;
+          // Don't clobber a switch to another row: only exit if still ours.
+          if (editingUrl === entry.url) editingUrl = null;
+          renderRecents();
+        }
+        async function save() {
+          if (settled) return;
+          settled = true;
+          const value = field.value;
+          editingUrl = null;
+          try {
+            recentServers = await setup.setRecentServerLabel(entry.url, value);
+          } catch {
+            // Keep the last-known list on failure; just leave edit mode.
+          }
+          renderRecents();
+        }
+        field.addEventListener("keydown", (e) => {
+          if (e.key === "Enter") save();
+          else if (e.key === "Escape") cancel();
+        });
+        field.addEventListener("blur", cancel);
+        wrap.append(field, hint);
+        // Focus once it's in the DOM (renderRecents appends synchronously).
+        setTimeout(() => field.focus(), 0);
+        return wrap;
+      }
+
+      function renderRecents() {
+        recentsList.textContent = "";
+        for (const entry of recentServers) {
+          const row = document.createElement("div");
+          row.className = "recent-row";
+          if (canRename && entry.url === editingUrl) {
+            row.appendChild(recentEditor(entry));
+          } else {
+            row.appendChild(recentButton(entry));
+            if (canRename) row.appendChild(renameButton(entry));
+          }
+          recentsList.appendChild(row);
+        }
+        recentsSection.hidden = recentServers.length === 0;
+      }
+
       setup
         .getRecentServers()
         .then((recents) => {
-          if (!Array.isArray(recents) || recents.length === 0) return;
-          for (const url of recents) {
-            const btn = document.createElement("button");
-            btn.type = "button";
-            btn.className = "recent-btn";
-            // textContent, never innerHTML: the URL comes from disk and must
-            // be rendered as inert text.
-            btn.textContent = url;
-            btn.addEventListener("click", () => {
-              input.value = url;
-              connect();
-            });
-            recentsList.appendChild(btn);
-          }
-          recentsSection.hidden = false;
+          if (!Array.isArray(recents)) return;
+          recentServers = recents;
+          renderRecents();
         })
         .catch(() => {});
 

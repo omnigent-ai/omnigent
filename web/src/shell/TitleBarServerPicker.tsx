@@ -74,7 +74,10 @@ export function TitleBarServerPicker({
 
   // The current server leads the list even when the recents file was edited
   // out from under us; recents matching the current origin collapse into it.
-  const others = info.recentServers.filter((url) => originOf(url) !== info.currentOrigin);
+  const others = info.recentServers.filter((s) => originOf(s.url) !== info.currentOrigin);
+  // Show the current server's nickname too when a recents entry carries one.
+  const current = info.recentServers.find((s) => originOf(s.url) === info.currentOrigin);
+  const currentName = current?.label || hostOf(info.currentOrigin);
 
   return (
     /* Sits over the drag strip; the button itself is no-drag via the blanket
@@ -90,20 +93,24 @@ export function TitleBarServerPicker({
           title="Switch server"
         >
           <span className="truncate font-medium">
-            {threadTitle || "Omnigent"} — {hostOf(info.currentOrigin)}
+            {threadTitle || "Omnigent"} — {currentName}
           </span>
           <ChevronDownIcon className="size-3 shrink-0" />
         </DropdownMenuTrigger>
         <DropdownMenuContent align="center" className="min-w-56">
           <DropdownMenuItem disabled className="gap-2 opacity-100">
             <CheckIcon className="size-4 shrink-0" />
-            <span className="truncate">{hostOf(info.currentOrigin)}</span>
+            <span className="truncate">{currentName}</span>
           </DropdownMenuItem>
-          {others.map((url) => (
-            <DropdownMenuItem key={url} className="gap-2" onSelect={() => void switchServer(url)}>
-              {/* Spacer aligns hosts under the current-server check. */}
+          {others.map((s) => (
+            <DropdownMenuItem
+              key={s.url}
+              className="gap-2"
+              onSelect={() => void switchServer(s.url)}
+            >
+              {/* Spacer aligns names under the current-server check. */}
               <span className="size-4 shrink-0" aria-hidden="true" />
-              <span className="truncate">{hostOf(url)}</span>
+              <span className="truncate">{s.label || hostOf(s.url)}</span>
             </DropdownMenuItem>
           ))}
           <DropdownMenuSeparator />
