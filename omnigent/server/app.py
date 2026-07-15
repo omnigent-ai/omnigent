@@ -1068,10 +1068,10 @@ def _ensure_default_polly_agent(
 
 
 async def _placeholder_on_fire(scheduled_task_id: str) -> None:
-    """Default scheduler fire callback for PR2.
+    """Default scheduler fire callback (no-op placeholder that logs).
 
-    Exercises the ``on_fire`` seam without side effects: a later PR replaces
-    this with the real fire path (create an agent session for the task).
+    Exercises the ``on_fire`` seam without side effects: the real fire path
+    (creating an agent session for the task) supplies its own callback.
     """
     _logger.info(
         "scheduler: task %s is due (no fire path wired yet — skipping)",
@@ -1380,9 +1380,9 @@ def create_app(
         )
 
         # Recurring-task (Routines) scheduler: arm a timer per active
-        # scheduled task and fire the injected callback on schedule.
-        # PR2 wires the timing engine with a placeholder ``on_fire``;
-        # a later PR supplies the real fire path (create a session).
+        # scheduled task and fire the injected ``on_fire`` callback on
+        # schedule. The default callback is a no-op that logs; a real fire
+        # path (creating a session) can be injected in its place.
         automation_scheduler: AutomationScheduler | None = None
         if scheduled_task_store is not None:
             automation_scheduler = AutomationScheduler(

@@ -4,7 +4,7 @@
 task. It is the timing engine only: when a task is due it invokes an injected
 ``on_fire`` callback and immediately re-arms for the next occurrence. Creating
 the agent session that actually runs the task is the callback's job — supplied
-by the caller (a later PR), never by this module.
+by the caller, never by this module.
 
 Design notes:
 
@@ -56,9 +56,8 @@ _MAX_TIMER_DELAY_S = 24 * 24 * 60 * 60
 # the scheduled time.
 _DUE_TOLERANCE_S = 1.0
 
-# ``on_fire(scheduled_task_id)`` — invoked when a task is due. Implemented by
-# the caller (a later PR creates the agent session); PR2 supplies a no-op/log
-# callback so the seam is exercised end to end.
+# ``on_fire(scheduled_task_id)`` — invoked when a task is due. The caller
+# creates the agent session; the default callback is a no-op that logs.
 OnFire = Callable[[str], Awaitable[None]]
 
 
