@@ -353,6 +353,17 @@ _LOCAL_DAEMON_ENV_ALLOWLIST: frozenset[str] = frozenset(
         "ANTHROPIC_BASE_URL",
         "ANTHROPIC_BEDROCK_BASE_URL",
         "AWS_BEARER_TOKEN_BEDROCK",
+        # M8 (security 2026-07-15): CLAUDE_CODE_OAUTH_TOKEN is listed in
+        # HARNESS_CREDENTIAL_ENV_VARS (connect.py) for forwarding host->runner,
+        # but _build_host_daemon_env (this file) only allows _RUNNER_ENV_ALLOWLIST
+        # + _LOCAL_DAEMON_ENV_ALLOWLIST. CLAUDE_CODE_OAUTH_TOKEN is in neither,
+        # so it is STRIPPED from the daemon env at launch. The daemon starts without it,
+        # so _build_runner_env has no token to forward even though HARNESS_CREDENTIAL_ENV_VARS
+        # includes it. Net effect: `claude setup-token` subscription auth never reaches
+        # the claude subprocess under the claude-sdk harness on macOS local (non-cloud) runs.
+        # Fix: add to the daemon allowlist so it survives the cli->daemon env strip.
+        # Security: it's a credential, same class as ANTHROPIC_API_KEY which is already here.
+        "CLAUDE_CODE_OAUTH_TOKEN",
         "CLAUDE_CODE_USE_BEDROCK",
         "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
         "COHERE_API_KEY",
