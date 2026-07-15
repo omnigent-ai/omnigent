@@ -522,7 +522,8 @@ class _PiNativeLaunchConfig:
     A generic session-snapshot reader shared by the pi-native and
     cursor-native launch paths (workspace + terminal_launch_args +
     model_override). Each path consumes the subset it needs: pi-native
-    ignores ``model_override``; cursor-native applies it as ``--model``.
+    uses ``model_override`` as ``--model`` (overrides the spec's pinned
+    model); cursor-native does the same.
 
     :param workspace: Workspace cwd for the native TUI.
     :param server_url: Omnigent server URL for the extension/forwarder.
@@ -2008,7 +2009,9 @@ async def _auto_create_pi_terminal(
         # appended ``--model`` arg (see ``pi_native_provider_launch``) — select
         # it, reaching parity with claude-native / cursor-native. ``None``
         # (no model declared) keeps the provider's default model.
-        spec_model = _pi_native_model_from_spec(agent_spec)
+        # model_override (set by /model or sys_session_create's model arg)
+        # takes precedence over the spec's pinned executor.model.
+        spec_model = launch_config.model_override or _pi_native_model_from_spec(agent_spec)
         provider = resolve_pi_native_provider(model=spec_model)
         if provider is not None:
             cred_env, cred_args = pi_native_provider_launch(bridge_dir / "pi-agent", provider)
