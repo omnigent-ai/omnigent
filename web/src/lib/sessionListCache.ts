@@ -22,6 +22,7 @@ export type ConversationsInfiniteData = InfiniteData<ConversationsPage, string |
  * for the existing consumers.
  */
 export const PROJECT_LABEL_KEY = "omni_project";
+export const USER_LABEL_KEY = "user.label";
 
 /** Filter dimensions encoded by a `["conversations", ...]` query key. */
 export interface ConversationListFilters {
@@ -34,6 +35,7 @@ export interface ConversationListFilters {
    * "all projects".
    */
   project?: string;
+  label?: string;
 }
 
 /**
@@ -100,34 +102,39 @@ function changedWireFields(conv: Conversation, wire: SessionListWireItem): Set<s
 /**
  * Decode the filter dimensions from a conversations query key.
  *
- * The base key is `["conversations", searchQuery, includeArchived]`. The
- * project-filtered variant appends a fourth element:
- * `["conversations", searchQuery, includeArchived, project]` (the Archived
- * settings picker is the only producer today). Both lengths are accepted so
- * the rename overlay and push-delta merge — which iterate *every* cached
- * `["conversations", ...]` query — never throw on the project variant. Query
- * membership decisions depend on these dimensions, so malformed keys fail
- * loudly instead of being guessed.
+ * The base key is `["conversations", searchQuery, includeArchived]`.
+ * Project-filtered variants append a fourth element:
+ * `["conversations", searchQuery, includeArchived, project]`.
+ * Label-filtered variants append both project and label:
+ * `["conversations", searchQuery, includeArchived, projectOrEmpty, label]`.
+ * All supported lengths are accepted so the rename overlay and push-delta
+ * merge — which iterate *every* cached `["conversations", ...]` query —
+ * never throw on filtered variants. Query membership decisions depend on
+ * these dimensions, so malformed keys fail loudly instead of being guessed.
  *
  * @param key - TanStack Query key for a conversations query.
  * @returns Parsed list filters.
  * @throws Error if the key is not a conversations list key.
  */
 export function filtersFromConversationQueryKey(key: readonly unknown[]): ConversationListFilters {
-  if ((key.length !== 3 && key.length !== 4) || key[0] !== "conversations") {
+  if ((key.length !== 3 && key.length !== 4 && key.length !== 5) || key[0] !== "conversations") {
     throw new Error("Invalid conversations query key");
   }
-  const [, searchQuery, includeArchived, project] = key;
+  const [, searchQuery, includeArchived, project, label] = key;
   if (typeof searchQuery !== "string" || typeof includeArchived !== "boolean") {
     throw new Error("Invalid conversations query key");
   }
   if (project !== undefined && typeof project !== "string") {
     throw new Error("Invalid conversations query key");
   }
+  if (label !== undefined && typeof label !== "string") {
+    throw new Error("Invalid conversations query key");
+  }
   return {
     searchQuery,
     includeArchived,
     project,
+    label,
   };
 }
 
@@ -150,6 +157,7 @@ export function filtersFromConversationQueryKey(key: readonly unknown[]): Conver
 function violatesKnownMembership(conv: Conversation, filters: ConversationListFilters): boolean {
   if (!filters.includeArchived && conv.archived === true) return true;
   if (filters.project && conv.labels?.[PROJECT_LABEL_KEY] !== filters.project) return true;
+  if (filters.label && conv.labels?.[USER_LABEL_KEY] !== filters.label) return true;
   return false;
 }
 

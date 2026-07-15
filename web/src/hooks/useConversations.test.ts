@@ -217,6 +217,39 @@ describe("useConversations project filter", () => {
   });
 });
 
+describe("useConversations label filter", () => {
+  function renderWithLabel(label?: string) {
+    fetchMock.mockResolvedValue(
+      mockResponse({ data: [], first_id: null, last_id: null, has_more: false }),
+    );
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    renderHook(() => useConversations("", true, {}, undefined, label), { wrapper });
+    return queryClient;
+  }
+
+  it("sends label= when a label filter is set", async () => {
+    renderWithLabel("urgent");
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+
+    const url = fetchMock.mock.calls[0][0] as string;
+    expect(url).toContain("include_archived=true");
+    expect(url).toContain("label=urgent");
+  });
+
+  it("uses a label-specific query key", () => {
+    const queryClient = renderWithLabel("urgent");
+    const keys = queryClient
+      .getQueryCache()
+      .getAll()
+      .map((q) => q.queryKey as unknown[]);
+    expect(keys).toContainEqual(["conversations", "", true, "", "urgent"]);
+  });
+});
+
 describe("fetchAllArchivedProjectNames", () => {
   it("pages through all archived sessions and returns distinct sorted project names", async () => {
     fetchMock

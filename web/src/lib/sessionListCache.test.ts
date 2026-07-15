@@ -356,12 +356,24 @@ describe("filtersFromConversationQueryKey", () => {
     });
   });
 
+  it("parses the label-filtered five-element key", () => {
+    expect(filtersFromConversationQueryKey(["conversations", "", true, "", "urgent"])).toEqual({
+      searchQuery: "",
+      includeArchived: true,
+      project: "",
+      label: "urgent",
+    });
+  });
+
   it("rejects non-canonical conversation query keys", () => {
     expect(() => filtersFromConversationQueryKey(["conversations", ""])).toThrow(
       "Invalid conversations query key",
     );
     // A non-string project element is malformed and must fail loudly.
     expect(() => filtersFromConversationQueryKey(["conversations", "", true, 5])).toThrow(
+      "Invalid conversations query key",
+    );
+    expect(() => filtersFromConversationQueryKey(["conversations", "", true, "", 5])).toThrow(
       "Invalid conversations query key",
     );
   });

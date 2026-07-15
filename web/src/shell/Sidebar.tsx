@@ -7,7 +7,6 @@ import {
   type RefObject,
   useCallback,
   useEffect,
-  useDeferredValue,
   useMemo,
   useRef,
   useState,
@@ -139,6 +138,7 @@ import { useSessionSwitchHotkey } from "@/hooks/useSessionSwitchHotkey";
 import { usePinnedSessionHotkeys } from "@/hooks/usePinnedSessionHotkeys";
 import { absoluteTime, relativeTime } from "@/lib/relativeTime";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
+import { MOD_KEY } from "@/components/KeyboardShortcutsDialog";
 import { SettingsSidebarBody, useSettingsRoute, useTrackSettingsReturn } from "./settingsNav";
 import {
   type ActiveChatOverride,
@@ -269,7 +269,7 @@ function showArchivedToast() {
   showToast(<ArchivedToast />);
 }
 
-export function Sidebar({ open, onClose, dragProgress = null }: SidebarProps) {
+export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: SidebarProps) {
   const [pinnedConversationIds, setPinnedConversationIds] = useState(readPinnedConversationIds);
   const [selectionMode, setSelectionMode] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
@@ -284,8 +284,7 @@ export function Sidebar({ open, onClose, dragProgress = null }: SidebarProps) {
   // and always show the viewer's own sessions there.
   const multiUser = !isCurrentServerLocal();
   const [labelFilter, setLabelFilter] = useState<string | undefined>(undefined);
-  const [searchQuery, setSearchQuery] = useState("");
-  const debouncedSearchQuery = useDeferredValue(searchQuery);
+  const searchQuery = "";
 
   const lastSelectedIdRef = useRef<string | null>(null);
   const getVisibleIdsRef = useRef<() => string[]>(() => []);
@@ -332,9 +331,10 @@ export function Sidebar({ open, onClose, dragProgress = null }: SidebarProps) {
   // list. Archived sessions are included (`includeArchived: true`) and
   // peeled into their own "Archived" section at the bottom of the list.
   const conversationsQuery = useConversations(
-    debouncedSearchQuery,
+    searchQuery,
     true,
     { reconcileWhileConnected: true },
+    undefined,
     labelFilter,
   );
 
@@ -589,20 +589,27 @@ export function Sidebar({ open, onClose, dragProgress = null }: SidebarProps) {
                 onExit={exitSelectionMode}
               />
             ) : (
-<<<<<<< HEAD
               <>
                 <div className="relative mt-3 flex items-center gap-1.5">
-                  <div className="relative flex-1">
-                    <SearchIcon className="-translate-y-1/2 pointer-events-none absolute top-1/2 left-2.5 size-3.5 text-muted-foreground" />
-                    <input
-                      type="search"
-                      value={searchQuery}
-                      onChange={(e) => setSearchQuery(e.target.value)}
-                      aria-label="Search sessions"
-                      placeholder="Search sessions"
-                      className="min-h-8 w-full rounded-full border border-input pr-3 pl-8 text-sm transition placeholder:text-muted-foreground focus-visible:outline-1 md:select-text"
-                    />
-                  </div>
+                  {/* "Search" opens the command palette (⌘K), which searches both
+                      session titles and chat content. It replaces the old inline
+                      filter box — the palette is the single search surface now.
+                      The `group` scope reveals the ⌘K badge on hover/focus. */}
+                  <button
+                    type="button"
+                    onClick={() => onOpenSearch?.()}
+                    aria-label="Search"
+                    data-testid="sidebar-search-button"
+                    className="group relative flex min-h-8 flex-1 items-center rounded-full border border-input pr-2 pl-7 text-left text-sm text-muted-foreground transition hover:bg-muted focus-visible:outline-1"
+                  >
+                    <SearchIcon className="-translate-y-1/2 pointer-events-none absolute top-1/2 left-2 size-3.5" />
+                    <span className="flex-1 truncate">Search</span>
+                    {/* ⌘K hint — hidden until the button is hovered / focused,
+                        mirroring the sidebar's other hover-revealed affordances. */}
+                    <kbd className="ml-2 hidden shrink-0 items-center rounded-md border border-border bg-muted px-1.5 py-0.5 font-sans text-[10px] font-medium text-muted-foreground transition-opacity group-hover:inline-flex group-focus-visible:inline-flex">
+                      {MOD_KEY}K
+                    </kbd>
+                  </button>
                   <Tooltip>
                     <TooltipTrigger asChild>
                       <Button
@@ -655,45 +662,6 @@ export function Sidebar({ open, onClose, dragProgress = null }: SidebarProps) {
                   </div>
                 )}
               </>
-=======
-              <div className="relative mt-3 flex items-center gap-1.5">
-                {/* "Search" opens the command palette (⌘K), which searches both
-                    session titles and chat content. It replaces the old inline
-                    filter box — the palette is the single search surface now.
-                    The `group` scope reveals the ⌘K badge on hover/focus. */}
-                <button
-                  type="button"
-                  onClick={() => onOpenSearch?.()}
-                  aria-label="Search"
-                  data-testid="sidebar-search-button"
-                  className="group relative flex min-h-8 flex-1 items-center rounded-full border border-input pr-2 pl-7 text-left text-sm text-muted-foreground transition hover:bg-muted focus-visible:outline-1"
-                >
-                  <SearchIcon className="-translate-y-1/2 pointer-events-none absolute top-1/2 left-2 size-3.5" />
-                  <span className="flex-1 truncate">Search</span>
-                  {/* ⌘K hint — hidden until the button is hovered / focused,
-                      mirroring the sidebar's other hover-revealed affordances. */}
-                  <kbd className="ml-2 hidden shrink-0 items-center rounded-md border border-border bg-muted px-1.5 py-0.5 font-sans text-[10px] font-medium text-muted-foreground transition-opacity group-hover:inline-flex group-focus-visible:inline-flex">
-                    {MOD_KEY}K
-                  </kbd>
-                </button>
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon-sm"
-                      aria-label="Select sessions"
-                      data-testid="toggle-selection-mode"
-                      className="shrink-0 rounded-full"
-                      onClick={() => setSelectionMode(true)}
-                    >
-                      <ListChecksIcon className="size-3.5" />
-                    </Button>
-                  </TooltipTrigger>
-                  <TooltipContent side="bottom">Select sessions</TooltipContent>
-                </Tooltip>
-              </div>
->>>>>>> origin/main
             )}
           </div>
 
