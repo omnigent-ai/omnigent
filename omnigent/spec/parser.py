@@ -48,6 +48,7 @@ from omnigent.spec.types import (
     SharePolicy,
     SkillSpec,
     ToolsConfig,
+    VerifySpec,
 )
 
 _log = logging.getLogger(__name__)
@@ -229,6 +230,7 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
         )
     compaction = _parse_compaction(raw.get("compaction"))
     guardrails = _parse_guardrails(raw.get("guardrails"), expand_env=expand_env)
+    verify = _parse_verify(raw.get("verify"))
     os_env = _parse_os_env(raw.get("os_env"))
     terminals = _parse_terminals(raw.get("terminals"))
     params = raw.get("params", {})
@@ -287,6 +289,7 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
         executor=executor,
         compaction=compaction,
         guardrails=guardrails,
+        verify=verify,
         params=params,
         instructions=instructions,
         skills=skills,
@@ -2697,6 +2700,82 @@ def _parse_guardrails(
         ask_timeout=_parse_guardrails_ask_timeout(
             raw.get("ask_timeout", DEFAULT_ASK_TIMEOUT),
         ),
+    )
+
+
+def _parse_str_tuple(raw: object, field_name: str) -> tuple[str, ...]:
+    """
+    Coerce a YAML scalar/list into a tuple of strings.
+
+    ``None`` is ``()``; a bare string becomes a single-element tuple; a
+    list is validated element-by-element. Used for ``verify:`` fields.
+
+    :param raw: The raw YAML value.
+    :param field_name: Dotted field name for error messages, e.g.
+        ``"verify.commands"``.
+    :returns: A tuple of strings.
+    :raises OmnigentError: If *raw* is not a string or list of strings.
+    """
+    if raw is None:
+        return ()
+    if isinstance(raw, str):
+        return (raw,)
+    if not isinstance(raw, list):
+        raise OmnigentError(
+            f"{field_name} must be a string or list of strings, got {type(raw).__name__}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    for item in raw:
+        if not isinstance(item, str):
+            raise OmnigentError(
+                f"{field_name} must contain only strings, got {type(item).__name__}",
+                code=ErrorCode.INVALID_INPUT,
+            )
+    return tuple(raw)
+
+
+def _parse_verify(raw: dict[str, Any] | None) -> VerifySpec | None:
+    """
+    Parse the ``verify:`` block into a :class:`VerifySpec`.
+
+    Returns ``None`` when the block is absent — the agent has no
+    verification gates and behaves exactly as before.
+
+    :param raw: The ``verify:`` mapping from config.yaml, or ``None``.
+    :returns: A populated :class:`VerifySpec`, or ``None`` when *raw* is
+        ``None``.
+    :raises OmnigentError: If the block is not a mapping, declares no
+        checks, pairs ``no_stubs`` with an empty ``paths`` list, or holds
+        non-string fields.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise OmnigentError(
+            f"verify: must be a mapping, got {type(raw).__name__}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    commands = _parse_str_tuple(raw.get("commands"), "verify.commands")
+    contains = _parse_str_tuple(raw.get("contains"), "verify.contains")
+    not_contains = _parse_str_tuple(raw.get("not_contains"), "verify.not_contains")
+    no_stubs = _parse_str_tuple(raw.get("no_stubs"), "verify.no_stubs")
+    paths = _parse_str_tuple(raw.get("paths"), "verify.paths")
+    if no_stubs and not paths:
+        raise OmnigentError(
+            "verify.no_stubs requires verify.paths to name files to scan",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if not (commands or no_stubs or contains or not_contains):
+        raise OmnigentError(
+            "verify: must declare at least one check (commands/no_stubs/contains/not_contains)",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    return VerifySpec(
+        commands=commands,
+        contains=contains,
+        not_contains=not_contains,
+        no_stubs=no_stubs,
+        paths=paths,
     )
 
 

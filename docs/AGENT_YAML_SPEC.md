@@ -319,6 +319,39 @@ policies:
         - example.cloud.databricks.com
 ```
 
+## Verification gates
+
+A `verify:` block declares deterministic quality checks that produce a hard
+PASS/FAIL verdict. This is distinct from `policies:` — the policy engine only
+emits allow/ask/deny and cannot run commands, so it cannot answer "did this
+work pass its gates?". Checks run through the agent's OS environment, inheriting
+the same sandbox and approval gating as `sys_os_shell`.
+
+```yaml
+verify:
+  commands: ["pytest -q", "ruff check ."]
+  contains: ["passed"]
+  not_contains: ["Traceback"]
+  no_stubs: ["TODO|FIXME|NotImplementedError"]
+  paths: ["src/app.py"]
+```
+
+- `commands` — shell commands; each must exit `0` (covers tests, lint,
+  typecheck, build — the caller authors the command, like a CI step).
+- `contains` / `not_contains` — substrings that must / must not appear in the
+  combined command stdout.
+- `no_stubs` — regex patterns; fail if any matches a file listed in `paths`
+  (e.g. a leftover `TODO` / `FIXME` / `NotImplementedError`).
+- `paths` — files (relative to the agent cwd) scanned by `no_stubs`.
+
+A block must declare at least one check, and `no_stubs` requires `paths`.
+Omitting the block changes nothing.
+
+The block parses into a `VerifySpec`; `omnigent.runtime.verify.run_verify` runs
+the checks against an `OSEnvironment` and returns a `VerifyResult`. Integrating
+that verdict into the agent turn loop (and driving retry or cross-vendor
+failover from a `FAIL`) is a separate, opt-in follow-up.
+
 ## Terminals
 
 Terminals are named interactive shell environments that the agent can launch.

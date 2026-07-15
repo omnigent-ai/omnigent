@@ -1363,6 +1363,38 @@ class GuardrailsSpec:
 
 
 @dataclass
+class VerifySpec:
+    """
+    Opt-in deterministic verification gates — a PASS/FAIL quality
+    verdict declared under a top-level ``verify:`` block.
+
+    The policy engine only emits ALLOW/ASK/DENY and structurally cannot
+    run subprocesses, so it cannot answer ``"did this work pass its
+    gates?"``. These checks run as code through the agent's
+    :class:`~omnigent.inner.os_env.OSEnvironment` (the same path
+    ``sys_os_shell`` uses), inheriting the existing sandbox and
+    ``ask_on_os_tools`` approval gating.
+
+    :param commands: Shell commands (run via ``os_env.shell``); each
+        must exit ``0``. Covers tests / lint / typecheck / build — the
+        caller authors the command, the way a CI step does.
+    :param contains: Literal substrings that must appear in the combined
+        ``stdout`` of ``commands``.
+    :param not_contains: Literal substrings that must not appear there.
+    :param no_stubs: Regex patterns; fail if any matches the contents of
+        a file listed in ``paths`` (e.g. ``TODO|FIXME|NotImplemented``).
+    :param paths: Files (relative to the agent cwd) scanned by
+        ``no_stubs``.
+    """
+
+    commands: tuple[str, ...] = ()
+    contains: tuple[str, ...] = ()
+    not_contains: tuple[str, ...] = ()
+    no_stubs: tuple[str, ...] = ()
+    paths: tuple[str, ...] = ()
+
+
+@dataclass
 class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (see below)
     """
     A fully parsed agent image.
@@ -1521,6 +1553,7 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
     executor: ExecutorSpec = field(default_factory=ExecutorSpec)
     compaction: CompactionConfig | None = None
     guardrails: GuardrailsSpec | None = None
+    verify: VerifySpec | None = None
     async_enabled: bool = True
     os_env: OSEnvSpec | None = None
     terminals: dict[str, TerminalEnvSpec] | None = None
