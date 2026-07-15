@@ -189,6 +189,7 @@ async def test_timer_delivery_logs_http_error_status(caplog: pytest.LogCaptureFi
 
     assert len(responder.posts) == 1
     assert any(
-        "firing persist failed" in record.getMessage() and result["timer_id"] in record.getMessage()
+        "firing persist failed" in record.getMessage()
+        and result["timer_id"] in record.getMessage()
         for record in caplog.records
     )
