@@ -8,8 +8,13 @@ table and its ``scheduled_task_runs`` history table.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from typing import Any
 
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
+
+# Sentinel meaning "caller did not supply this argument; leave the column unchanged."
+# Distinct from None, which means "set the column to NULL."
+_UNSET: Any = object()
 
 
 class ScheduledTaskStore(ABC):
@@ -123,13 +128,19 @@ class ScheduledTaskStore(ABC):
         workspace: str | None = None,
         base_branch: str | None = None,
         execution_target: str | None = None,
-        host_id: str | None = None,
+        host_id: str | None = _UNSET,
         state: str | None = None,
         last_run_at: int | None = None,
-        last_run_conversation_id: str | None = None,
+        last_run_conversation_id: str | None = _UNSET,
     ) -> ScheduledTask | None:
         """
-        Update mutable fields of a task. ``None`` leaves a field unchanged.
+        Update mutable fields of a task.
+
+        Most parameters use ``None`` to mean "leave unchanged". For ``host_id``
+        and ``last_run_conversation_id``, the sentinel default means "not
+        provided / leave unchanged"; passing ``None`` explicitly sets the column
+        to NULL (e.g. to clear a host binding or to null out the last-run
+        conversation after it is deleted).
 
         Passing ``cron_expression`` updates the recurring trigger; ``None``
         leaves it unchanged.

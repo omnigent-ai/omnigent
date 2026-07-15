@@ -516,3 +516,147 @@ def test_create_run_rejects_invalid_status_name(store: SqlAlchemyScheduledTaskSt
             status="bogus",
             scheduled_at=1,
         )
+
+
+# ── update: sentinel / NULL-clear behaviour (Finding 1) ──────────────────────
+
+
+def test_update_host_id_can_be_cleared_to_null(store: SqlAlchemyScheduledTaskStore) -> None:
+    """Passing ``host_id=None`` explicitly clears the column to NULL (set→NULL)."""
+    store.create(
+        scheduled_task_id=_uid("st_clear_host"),
+        name="n",
+        prompt="p",
+        cron_expression="* * * * *",
+        owner_user_id="u",
+        agent_id="ag",
+        timezone="UTC",
+        execution_target="connected_host",
+        host_id="host_abc",
+    )
+    updated = store.update(_uid("st_clear_host"), execution_target="managed_sandbox", host_id=None)
+    assert updated is not None
+    assert updated.execution_target == "managed_sandbox"
+    assert updated.host_id is None
+    fetched = store.get(_uid("st_clear_host"))
+    assert fetched is not None
+    assert fetched.host_id is None
+
+
+def test_update_last_run_conversation_id_can_be_cleared_to_null(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """Passing ``last_run_conversation_id=None`` explicitly nulls the column."""
+    store.create(
+        scheduled_task_id=_uid("st_clear_conv"),
+        name="n",
+        prompt="p",
+        cron_expression="* * * * *",
+        owner_user_id="u",
+        agent_id="ag",
+        timezone="UTC",
+    )
+    store.update(_uid("st_clear_conv"), last_run_conversation_id="conv_abc")
+    updated = store.update(_uid("st_clear_conv"), last_run_conversation_id=None)
+    assert updated is not None
+    assert updated.last_run_conversation_id is None
+    fetched = store.get(_uid("st_clear_conv"))
+    assert fetched is not None
+    assert fetched.last_run_conversation_id is None
+
+
+def test_update_omitting_nullable_param_leaves_field_unchanged(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """Omitting ``host_id`` / ``last_run_conversation_id`` does NOT change them."""
+    store.create(
+        scheduled_task_id=_uid("st_omit"),
+        name="n",
+        prompt="p",
+        cron_expression="* * * * *",
+        owner_user_id="u",
+        agent_id="ag",
+        timezone="UTC",
+        host_id="host_keep",
+    )
+    store.update(_uid("st_omit"), last_run_conversation_id="conv_keep")
+    # Update name only — host_id and last_run_conversation_id must be untouched.
+    updated = store.update(_uid("st_omit"), name="new_name")
+    assert updated is not None
+    assert updated.host_id == "host_keep"
+    assert updated.last_run_conversation_id == "conv_keep"
+
+
+def test_update_clearing_already_null_field_is_noop_for_updated_at(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """Clearing a field that is already NULL does not stamp ``updated_at``."""
+    store.create(
+        scheduled_task_id=_uid("st_null_noop"),
+        name="n",
+        prompt="p",
+        cron_expression="* * * * *",
+        owner_user_id="u",
+        agent_id="ag",
+        timezone="UTC",
+    )
+    # host_id starts NULL; passing None should be a no-op (no updated_at).
+    result = store.update(_uid("st_null_noop"), host_id=None)
+    assert result is not None
+    assert result.updated_at is None
+
+
+# ── delete: cascade cleanup of runs (Finding 2) ──────────────────────────────
+
+
+def test_delete_also_removes_associated_runs(store: SqlAlchemyScheduledTaskStore) -> None:
+    """Deleting a task removes all of its runs."""
+    store.create(
+        scheduled_task_id=_uid("st_del_runs"),
+        name="n",
+        prompt="p",
+        cron_expression="* * * * *",
+        owner_user_id="u",
+        agent_id="ag",
+        timezone="UTC",
+    )
+    store.create_run(
+        run_id=_uid("sr_del_1"),
+        scheduled_task_id=_uid("st_del_runs"),
+        status="succeeded",
+        scheduled_at=1,
+    )
+    store.create_run(
+        run_id=_uid("sr_del_2"),
+        scheduled_task_id=_uid("st_del_runs"),
+        status="failed",
+        scheduled_at=2,
+    )
+    assert len(store.list_runs(_uid("st_del_runs"))) == 2
+    store.delete(_uid("st_del_runs"))
+    assert store.list_runs(_uid("st_del_runs")) == []
+
+
+def test_delete_does_not_remove_other_tasks_runs(store: SqlAlchemyScheduledTaskStore) -> None:
+    """Deleting task A must not affect task B's runs."""
+    for tid in ("st_a_scope", "st_b_scope"):
+        store.create(
+            scheduled_task_id=_uid(tid),
+            name=tid,
+            prompt="p",
+            cron_expression="* * * * *",
+            owner_user_id="u",
+            agent_id="ag",
+            timezone="UTC",
+        )
+        store.create_run(
+            run_id=_uid(f"sr_{tid}"),
+            scheduled_task_id=_uid(tid),
+            status="scheduled",
+            scheduled_at=1,
+        )
+    store.delete(_uid("st_a_scope"))
+    assert store.list_runs(_uid("st_a_scope")) == []
+    remaining = store.list_runs(_uid("st_b_scope"))
+    assert len(remaining) == 1
+    assert remaining[0].id == _uid("sr_st_b_scope")

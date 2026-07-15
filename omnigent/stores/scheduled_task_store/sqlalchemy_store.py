@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from sqlalchemy import asc, desc, select
+from typing import Any
+
+from sqlalchemy import asc, delete, desc, select
 
 from omnigent.db.db_models import (
     SqlScheduledTask,
@@ -24,6 +26,10 @@ from omnigent.db.utils import (
 )
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
 from omnigent.stores.scheduled_task_store import ScheduledTaskStore
+
+# Sentinel meaning "caller did not supply this argument; leave the column unchanged."
+# Distinct from None, which means "set the column to NULL."
+_UNSET: Any = object()
 
 
 def _to_entity(row: SqlScheduledTask) -> ScheduledTask:
@@ -187,13 +193,16 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         workspace: str | None = None,
         base_branch: str | None = None,
         execution_target: str | None = None,
-        host_id: str | None = None,
+        host_id: str | None = _UNSET,
         state: str | None = None,
         last_run_at: int | None = None,
-        last_run_conversation_id: str | None = None,
+        last_run_conversation_id: str | None = _UNSET,
     ) -> ScheduledTask | None:
-        """Update mutable fields. ``None`` leaves a field unchanged.
+        """Update mutable fields.
 
+        ``None`` leaves most fields unchanged. For ``host_id`` and
+        ``last_run_conversation_id``, the sentinel default means "not provided
+        / leave unchanged"; passing ``None`` explicitly sets the column to NULL.
         Passing ``cron_expression`` updates the recurring trigger; ``None``
         leaves it unchanged.
         """
@@ -231,7 +240,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 if row.execution_target != encoded_target:
                     row.execution_target = encoded_target
                     changed = True
-            if host_id is not None and row.host_id != host_id:
+            if host_id is not _UNSET and row.host_id != host_id:
                 row.host_id = host_id
                 changed = True
             if state is not None:
@@ -242,9 +251,8 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             if last_run_at is not None and row.last_run_at != last_run_at:
                 row.last_run_at = last_run_at
                 changed = True
-            if (
-                last_run_conversation_id is not None
-                and row.last_run_conversation_id != last_run_conversation_id
+            if last_run_conversation_id is not _UNSET and (
+                row.last_run_conversation_id != last_run_conversation_id
             ):
                 row.last_run_conversation_id = last_run_conversation_id
                 changed = True
@@ -254,11 +262,18 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             return _to_entity(row)
 
     def delete(self, scheduled_task_id: str) -> bool:
-        """Delete a scheduled task. Idempotent: returns ``False`` if not found."""
+        """Delete a scheduled task and all of its runs. Idempotent: returns ``False`` if not
+        found."""
         with self._session() as session:
             row = session.get(SqlScheduledTask, (current_workspace_id(), scheduled_task_id))
             if row is None:
                 return False
+            session.execute(
+                delete(SqlScheduledTaskRun).where(
+                    SqlScheduledTaskRun.workspace_id == current_workspace_id(),
+                    SqlScheduledTaskRun.scheduled_task_id == scheduled_task_id,
+                )
+            )
             session.delete(row)
             return True
 

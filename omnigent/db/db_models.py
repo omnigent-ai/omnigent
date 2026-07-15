@@ -1114,7 +1114,7 @@ class SqlScheduledTask(OmnigentBase):
     session on a recurring cron schedule (``cron_expression``).
 
     :param id: UUID primary key stored as 16 raw bytes (see :class:`Uuid16`),
-        surfaced as a canonical UUID string.
+        surfaced as a bare 32-char hex string (no dashes).
     :param name: Human-readable task name, e.g. ``"nightly triage"``.
     :param prompt: The instruction dispatched to the agent on each firing.
     :param cron_expression: The required cron string for the recurring trigger,
@@ -1243,7 +1243,7 @@ class SqlScheduledTaskRun(OmnigentBase):
     advanced by the scheduler as a firing moves through its lifecycle.
 
     :param id: UUID primary key stored as 16 raw bytes (see :class:`Uuid16`),
-        surfaced as a canonical UUID string.
+        surfaced as a bare 32-char hex string (no dashes).
     :param scheduled_task_id: The task this run belongs to (relates to
         ``scheduled_tasks.id``; also a :class:`Uuid16`). Indexed for per-task
         history listing. Cascade cleanup on task deletion is application-owned —
