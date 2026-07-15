@@ -137,8 +137,8 @@ async def _run_inactivity_monitor(
         disables the monitor.
     :param get_last_activity: Callback returning the most recent real
         activity time from the event loop's monotonic clock.
-    :param has_active_work: Callback returning whether any agent turn is
-        currently running.
+    :param has_active_work: Callback returning whether delivery-critical
+        work is outstanding (turns, live async tools, timers, approvals).
     :param request_shutdown: Callback that requests graceful runner shutdown.
     :param poll_interval_s: Optional test override for the monitor cadence,
         e.g. ``0.01``. ``None`` derives a bounded production cadence from
