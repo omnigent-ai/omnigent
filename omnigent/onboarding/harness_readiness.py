@@ -5,11 +5,11 @@ web agent picker can warn) and re-checks the session's harness before
 spawning a runner (so an unconfigured launch fails with a clear,
 actionable error instead of dying inside the executor).
 
-"Configured" here is deliberately narrow: the **only** thing the daemon
-can reliably determine locally is whether a harness's wrapped CLI binary
-is on ``PATH``. That gates the native CLI harnesses (Claude Code / Codex
-via ``claude`` / ``codex``) and ``pi`` — the common "I picked Claude Code
-but never ran ``omnigent setup`` to install it" case.
+"Configured" here is deliberately narrow: the daemon reports whether the
+selected platform can launch a harness and whether its wrapped CLI binary is
+on ``PATH``. That gates native TUI harnesses on Windows, where tmux/PTY support
+is unavailable, and native CLI harnesses (Claude Code / Codex via ``claude`` /
+``codex``) and ``pi`` when their binaries are missing.
 
 In-process SDK harnesses (``claude-sdk``, ``openai-agents``) run without
 any CLI and resolve their model credentials at runtime from sources the
@@ -29,8 +29,9 @@ import shutil
 from collections.abc import Callable
 
 import omnigent.onboarding.gemini_auth as _gemini_auth
+from omnigent._platform import IS_WINDOWS
 from omnigent.harness_aliases import HARNESS_ALIASES, canonicalize_harness
-from omnigent.harness_plugins import harness_install_keys, valid_harnesses
+from omnigent.harness_plugins import harness_install_keys, native_harnesses, valid_harnesses
 from omnigent.onboarding.harness_install import (
     COPILOT_KEY,
     CURSOR_KEY,
@@ -289,6 +290,8 @@ def harness_is_configured(harness: str) -> bool:
 
 def _harness_availability(canonical: str) -> HarnessAvailability:
     """Return picker-facing availability for one canonical harness spelling."""
+    if IS_WINDOWS and canonical in native_harnesses():
+        return "platform-unsupported"
     if (
         canonical in {"codex", "codex-native", "native-codex"}
         and _HARNESS_FAMILY.get(canonical) == OPENAI_FAMILY
@@ -306,8 +309,10 @@ def configured_harness_map() -> dict[str, HarnessAvailability]:
     spelling it holds — canonical ids, executor-type spellings, the
     ``claude`` alias, and ``pi``. SDK and unknown harnesses map to
     ``True`` (never gated); CLI-wrapping harnesses map to whether their
-    binary is on ``PATH``. Codex entries use a structured string reason when
-    unavailable: ``"binary-missing"`` or ``"needs-auth"``.
+    binary is on ``PATH``. Native TUI harnesses report
+    ``"platform-unsupported"`` on Windows, where their tmux/PTY runtime cannot
+    launch. Codex entries use a structured string reason when unavailable:
+    ``"binary-missing"`` or ``"needs-auth"``.
 
     :returns: Mapping of harness spelling to readiness, e.g.
         ``{"claude-native": False, "codex-native": "needs-auth",

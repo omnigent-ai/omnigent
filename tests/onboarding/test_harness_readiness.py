@@ -8,6 +8,7 @@ import pytest
 import yaml
 
 import omnigent.onboarding.harness_install as hi
+import omnigent.onboarding.harness_readiness as hr
 from omnigent.onboarding.harness_readiness import (
     configured_harness_map,
     harness_is_configured,
@@ -244,6 +245,41 @@ def test_configured_harness_map_gates_only_cli_harnesses(
         assert result[cli] is False, f"{cli} should be gated on its CLI binary"
     for codex in ("codex", "codex-native", "native-codex"):
         assert result[codex] == "binary-missing", f"{codex} should name the missing Codex binary"
+
+
+def test_configured_harness_map_rejects_native_tuis_on_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Windows hosts report native TUI harnesses as impossible to launch.
+
+    Native wrappers require tmux/PTY support that the runner deliberately does
+    not provide on Windows. SDK and headless harnesses remain available so the
+    web picker can offer a working alternative on the same host.
+    """
+    monkeypatch.setattr(hr, "IS_WINDOWS", True)
+    _all_clis_installed(monkeypatch)
+
+    result = configured_harness_map()
+
+    for native in (
+        "claude-native",
+        "codex-native",
+        "opencode-native",
+        "pi-native",
+        "cursor-native",
+        "kiro-native",
+        "antigravity-native",
+        "goose-native",
+        "qwen-native",
+        "kimi-native",
+        "hermes-native",
+    ):
+        assert result[native] == "platform-unsupported"
+
+    for supported in ("claude-sdk", "openai-agents"):
+        assert result[supported] is True
+    for headless_cli in ("codex", "cursor"):
+        assert result[headless_cli] != "platform-unsupported"
 
 
 def test_configured_harness_map_all_true_with_clis(

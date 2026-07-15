@@ -119,6 +119,32 @@ def _codex_native_agents_body() -> str:
     )
 
 
+def _windows_agents_body() -> str:
+    """Stub one unsupported native agent and one runnable SDK alternative."""
+    return json.dumps(
+        {
+            "data": [
+                {
+                    "id": "ag_claude_native_e2e",
+                    "name": "claude-native-ui",
+                    "display_name": "Claude Code",
+                    "description": "Claude's native terminal",
+                    "harness": "claude-native",
+                    "skills": [],
+                },
+                {
+                    "id": "ag_claude_sdk_e2e",
+                    "name": "claude-sdk-e2e",
+                    "display_name": "Claude SDK",
+                    "description": "Claude through the SDK harness",
+                    "harness": "claude-sdk",
+                    "skills": [],
+                },
+            ]
+        }
+    )
+
+
 def _polly_codex_agents_body() -> str:
     """Stub body for ``GET /v1/agents``: a bundle agent on the codex brain harness.
 
@@ -290,6 +316,54 @@ async def _drive_codex_needs_auth(base_url: str) -> None:
             # leaves no warning. count()==0 (not "not visible") because the
             # element is conditionally rendered, never just hidden.
             await expect(page.get_by_test_id("new-chat-landing-harness-warning")).to_have_count(0)
+        finally:
+            await browser.close()
+
+
+def test_platform_unsupported_native_agent_cannot_be_selected(
+    seeded_session: tuple[str, str],
+) -> None:
+    """The new-session picker disables native agents unsupported by the host."""
+    base_url, session_id = seeded_session
+    del session_id
+    _run_in_fresh_loop(_drive_platform_unsupported_native_agent(base_url))
+
+
+async def _drive_platform_unsupported_native_agent(base_url: str) -> None:
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            await _register_routes(
+                page,
+                agents_body=_windows_agents_body(),
+                configured_harnesses={
+                    "claude-native": "platform-unsupported",
+                    "claude-sdk": True,
+                },
+            )
+            await page.add_init_script(
+                f"""window.localStorage.setItem(
+                    "omnigent:recent-workspaces",
+                    JSON.stringify({{ {_HOST_ID}: ["/work/repo"] }})
+                );"""
+            )
+
+            await page.goto(f"{base_url}/")
+            picker = page.get_by_test_id("new-chat-landing-agent-select")
+            await expect(picker).to_be_visible(timeout=30_000)
+            # The catalog's first row is native, but host readiness makes the
+            # runnable SDK sibling the automatic selection.
+            await expect(picker).to_contain_text("Claude-sdk-e2e")
+
+            await picker.click()
+            native_row = page.get_by_test_id("new-chat-landing-agent-ag_claude_native_e2e")
+            await expect(native_row).to_have_attribute("aria-disabled", "true")
+            await expect(native_row).to_be_disabled()
+            await expect(
+                page.get_by_test_id("new-chat-landing-agent-warning-ag_claude_native_e2e")
+            ).to_have_text("not supported")
+            await expect(picker).to_contain_text("Claude-sdk-e2e")
         finally:
             await browser.close()
 

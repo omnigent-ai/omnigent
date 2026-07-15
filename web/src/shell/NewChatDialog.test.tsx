@@ -474,6 +474,18 @@ describe("harnessUnconfiguredOnHost", () => {
     );
   });
 
+  it("surfaces platform-unsupported for native harnesses", () => {
+    const testHost = hostWith({ "claude-native": "platform-unsupported" });
+    const reason = harnessUnavailableReasonOnHost("claude-native", testHost);
+
+    expect(reason).toBe("platform-unsupported");
+    expect(harnessUnconfiguredOnHost("claude-native", testHost)).toBe(true);
+    expect(harnessWarningBadgeText(reason)).toBe("not supported");
+    expect(harnessWarningMessageText("Claude Code", "windows-host", reason)).toBe(
+      "Claude Code is not supported on windows-host. Choose an SDK-based agent or another host.",
+    );
+  });
+
   it("ignores unknown future reason strings", () => {
     expect(harnessUnavailableReasonOnHost("codex", hostWith({ codex: "future-reason" }))).toBe(
       null,
@@ -901,6 +913,55 @@ describe("NewChatLandingScreen", () => {
     expect(screen.queryByTestId("new-chat-landing-harness-cursor")).toBeNull();
     expect(screen.queryByTestId("new-chat-landing-harness-pi")).toBeNull();
     expect(screen.queryByTestId("new-chat-landing-harness-copilot")).toBeNull();
+  });
+
+  it("disables native agents unsupported by the selected host", async () => {
+    mockHosts([
+      {
+        ...host("online"),
+        configured_harnesses: {
+          "claude-native": "platform-unsupported",
+          "claude-sdk": true,
+        },
+      },
+    ]);
+    mockAgents([
+      {
+        id: "a_native",
+        name: "claude-native-ui",
+        display_name: "Claude Code",
+        description: null,
+        harness: "claude-native",
+        skills: [],
+      },
+      {
+        id: "a_sdk",
+        name: "sdk-agent",
+        display_name: "Claude SDK",
+        description: null,
+        harness: "claude-sdk",
+        skills: [],
+      },
+    ]);
+
+    renderLanding();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain(
+        "Claude SDK",
+      ),
+    );
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    const nativeRow = screen.getByTestId("new-chat-landing-agent-a_native");
+    expect(nativeRow.getAttribute("aria-disabled")).toBe("true");
+    expect(nativeRow.getAttribute("title")).toContain("not supported on machine-1");
+    expect(screen.getByTestId("new-chat-landing-agent-warning-a_native").textContent).toBe(
+      "not supported",
+    );
+
+    fireEvent.click(nativeRow);
+    expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain("Claude SDK");
+    expect(localStorage.getItem("omnigent:last-agent-id")).not.toBe("a_native");
   });
 
   it("seeds the working directory from the host's most-recent path", async () => {
