@@ -50,6 +50,9 @@ if TYPE_CHECKING:
 
 logging.basicConfig(level=logging.INFO, stream=sys.stderr, force=True)
 logger = logging.getLogger("omnigent-docker")
+# Alembic's logging config sets the root logger to WARN during migrations.
+# Keep startup registration and readiness messages visible afterward.
+logger.setLevel(logging.INFO)
 
 # Defaults live as module-level constants — the Dockerfile and
 # docker-compose.yaml both also set these, so the values here just

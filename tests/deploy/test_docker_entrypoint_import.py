@@ -156,7 +156,7 @@ def test_select_artifact_store(
 
 
 def test_register_configured_agents_scans_children_and_logs_version(
-    db_uri: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    db_uri: str, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     from deploy.docker.entrypoint import _register_configured_agents
     from omnigent.runtime.agent_cache import AgentCache
@@ -183,9 +183,8 @@ def test_register_configured_agents_scans_children_and_logs_version(
 
     registered = store.get_by_name("jerry")
     assert registered is not None
-    logs = capsys.readouterr().err
-    assert "Discovered 1 configured agent bundle(s)" in logs
-    assert "Registered agent jerry version 1" in logs
+    assert "Discovered 1 configured agent bundle(s)" in caplog.text
+    assert "Registered agent jerry version 1" in caplog.text
 
 
 def test_register_configured_agents_fails_on_invalid_bundle(db_uri: str, tmp_path: Path) -> None:
