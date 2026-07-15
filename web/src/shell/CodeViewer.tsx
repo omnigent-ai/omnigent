@@ -57,6 +57,7 @@ import {
   isBinaryPath,
   isImageFile,
   isNotebookPath,
+  isPdfFile,
   lineOverlapsSelection,
 } from "./codeViewerHelpers";
 import { NotebookPreview } from "./NotebookPreview";
@@ -72,6 +73,10 @@ import { getEmbedRoot } from "@/lib/host";
 const MonacoCodeEditor = lazy(() =>
   import("./MonacoCodeEditor").then((m) => ({ default: m.MonacoCodeEditor })),
 );
+
+// react-pdf + pdf.js (worker) is heavy; load it only when a PDF is actually
+// viewed so it never enters the initial bundle.
+const PdfViewer = lazy(() => import("./PdfViewer").then((m) => ({ default: m.PdfViewer })));
 
 // ---------------------------------------------------------------------------
 // MarkdownPreview — read-only render of Markdown content via react-markdown + GFM
@@ -546,6 +551,19 @@ export function CodeViewer({
   }
   if (fileQuery.data && isImageFile(path, fileQuery.data.content_type)) {
     return <ImageViewer data={fileQuery.data} path={path} />;
+  }
+  if (fileQuery.data && isPdfFile(path, fileQuery.data.content_type)) {
+    return (
+      <Suspense
+        fallback={
+          <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">
+            Loading…
+          </div>
+        }
+      >
+        <PdfViewer data={fileQuery.data} />
+      </Suspense>
+    );
   }
   if (fileQuery.data?.encoding === "base64" || isBinaryPath(path)) {
     return (

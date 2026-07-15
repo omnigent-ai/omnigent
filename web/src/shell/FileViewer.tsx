@@ -89,6 +89,7 @@ import {
   detectLang,
   isImageFile,
   isNotebookPath,
+  isPdfFile,
   openHtmlArtifactInNewTab,
 } from "./codeViewerHelpers";
 import { CommentsPanel, type ActiveSelection } from "./CommentsPanel";
@@ -606,13 +607,14 @@ function FileViewerBody({
   // notebooks to their rendered preview, and everything else to source.
   const lang = detectLang(path);
   const isPreviewable = lang === "markdown" || lang === "html" || isNotebookPath(path);
-  // Images render through CodeViewer's <ImageViewer> regardless of view mode;
-  // they have no source/diff representation, so diff is suppressed for them
-  // (Monaco would otherwise render the base64 payload as garbage text).
+  // Images and PDFs render through CodeViewer's own viewers regardless of view
+  // mode; they have no source/diff representation, so diff is suppressed for
+  // them (Monaco would otherwise render the base64 payload as garbage text).
   const isImage = isImageFile(path, fileQuery.data?.content_type);
+  const isPdf = isPdfFile(path, fileQuery.data?.content_type);
   // Show Δ button only when the file appears in the session's changed-files list.
   const isDiffAvailable =
-    !isImage && (changedFiles.data?.data.some((f) => f.path === path) ?? false);
+    !isImage && !isPdf && (changedFiles.data?.data.some((f) => f.path === path) ?? false);
   const isDeletedFile =
     changedFiles.data?.data.some((f) => f.path === path && f.status === "deleted") ?? false;
 
@@ -871,16 +873,20 @@ function FileViewerBody({
       onSelect: openHtmlInNewTab,
     });
   }
-  toolbarActions.push({
-    key: "comments",
-    label: commentsOpen ? "Hide comments" : "Show comments",
-    icon: <MessageSquareTextIcon className="size-4" />,
-    active: commentsOpen,
-    onSelect: () => {
-      commentsInitializedRef.current = true;
-      setCommentsOpen((prev) => !prev);
-    },
-  });
+  // PDFs render through PdfViewer, which has no text/selection surface to
+  // anchor comments to, so hide the comments toggle for them.
+  if (!isPdf) {
+    toolbarActions.push({
+      key: "comments",
+      label: commentsOpen ? "Hide comments" : "Show comments",
+      icon: <MessageSquareTextIcon className="size-4" />,
+      active: commentsOpen,
+      onSelect: () => {
+        commentsInitializedRef.current = true;
+        setCommentsOpen((prev) => !prev);
+      },
+    });
+  }
   if (isDiffAvailable) {
     toolbarActions.push({
       key: "diff",
