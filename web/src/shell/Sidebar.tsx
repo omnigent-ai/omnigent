@@ -1748,16 +1748,35 @@ function SectionHeader({
         onClick={onToggleCollapsed}
         className="group flex w-full items-center gap-1 rounded-md px-2 py-1 text-left text-sm text-muted-foreground transition-colors hover:text-foreground"
       >
-        {icon}
+        {icon ? (
+          // Headers with a leading icon (project folders) swap the folder for a
+          // chevron on desktop hover/focus, so the caret takes the icon's place
+          // rather than trailing the name. Mobile (no hover) keeps the folder
+          // icon and shows the trailing chevron below.
+          <span className="relative flex size-4 shrink-0 items-center justify-center">
+            <span className="flex md:transition-opacity md:group-hover:opacity-0 md:group-focus-visible:opacity-0">
+              {icon}
+            </span>
+            <ChevronRightIcon
+              className={cn(
+                "absolute size-3.5 opacity-0 transition-[transform,opacity]",
+                !collapsed && "rotate-90",
+                "hidden md:flex md:group-hover:opacity-100 md:group-focus-visible:opacity-100",
+              )}
+            />
+          </span>
+        ) : null}
         <span className="min-w-0 truncate">{title}</span>
-        {/* Chevron sits right after the section name, rotating on expand.
-            Desktop: revealed only on hover/focus of the header; mobile (no
-            hover): always visible. */}
+        {/* Trailing chevron, rotating on expand. Headers without a leading icon
+            reveal it on desktop hover/focus; icon headers show it only on mobile
+            (no hover) since desktop swaps the folder for the chevron above. */}
         <ChevronRightIcon
           className={cn(
             "size-3.5 shrink-0 transition-[transform,opacity]",
             !collapsed && "rotate-90",
-            "md:opacity-0 md:group-hover:opacity-100 md:group-focus-visible:opacity-100",
+            icon
+              ? "md:hidden"
+              : "md:opacity-0 md:group-hover:opacity-100 md:group-focus-visible:opacity-100",
           )}
         />
         {/* A hidden row inside this collapsed section carries a marker — surface
