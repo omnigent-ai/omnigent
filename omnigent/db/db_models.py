@@ -749,7 +749,10 @@ class SqlConversationItem(ConversationBase):
     )
     id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
     response_id: Mapped[str] = mapped_column(String(64))
-    created_at: Mapped[int] = mapped_column(Integer)
+    # In the PK so deployments can PARTITION BY (created_at) with pure DDL —
+    # both PostgreSQL and MySQL require the partition key in the PK and in
+    # every unique index. Immutable: items are insert/delete-only.
+    created_at: Mapped[int] = mapped_column(Integer, primary_key=True)
     # Enum stored as a stable int code (see omnigent.db.enum_codecs
     # ITEM_STATUS: completed=1). Only "completed" is written today, but the
     # CHECK admits the wider OpenAI-style status vocabulary reserved there.
@@ -764,11 +767,16 @@ class SqlConversationItem(ConversationBase):
     created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
     __table_args__ = (
+        # created_at trails for partition-readiness (unique indexes must
+        # contain the partition key). Position uniqueness is per-second at
+        # the DB level; the next_position counter under _lock_conversation
+        # is the real allocator and never reuses a position.
         Index(
             "ix_conversation_items_conversation_id_position",
             "workspace_id",
             "conversation_id",
             "position",
+            "created_at",
             unique=True,
         ),
         # Fork-truncation looks up by workspace_id + conversation_id +

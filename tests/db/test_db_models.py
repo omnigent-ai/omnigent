@@ -483,6 +483,7 @@ class TestSqlConversationItem:
 
         conv = _make_conversation()
         item = _make_item()
+        item_created_at = item.created_at
         with managed() as session:
             session.add(conv)
             session.add(item)
@@ -490,7 +491,12 @@ class TestSqlConversationItem:
         with managed() as session:
             loaded = session.get(
                 SqlConversationItem,
-                (0, "a9930027fd3e2e979e65844f7af7bf88", "a47da81d0587d7c42e53978d629c5ab8"),
+                (
+                    0,
+                    "a9930027fd3e2e979e65844f7af7bf88",
+                    "a47da81d0587d7c42e53978d629c5ab8",
+                    item_created_at,
+                ),
             )
             assert loaded is not None
             assert loaded.conversation_id == "a9930027fd3e2e979e65844f7af7bf88"
@@ -528,6 +534,7 @@ class TestSqlConversationItem:
             id="79770462a714e18289f416144611383e",
             conversation_id="553a265445caf1cdb034abe0b449485d",
         )
+        item_created_at = item.created_at
         with managed() as session:
             session.add(conv)
             session.add(item)
@@ -542,7 +549,12 @@ class TestSqlConversationItem:
             assert (
                 session.get(
                     SqlConversationItem,
-                    (0, "553a265445caf1cdb034abe0b449485d", "79770462a714e18289f416144611383e"),
+                    (
+                        0,
+                        "553a265445caf1cdb034abe0b449485d",
+                        "79770462a714e18289f416144611383e",
+                        item_created_at,
+                    ),
                 )
                 is not None
             )

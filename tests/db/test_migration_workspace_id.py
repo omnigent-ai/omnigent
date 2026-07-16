@@ -47,8 +47,9 @@ _LATER_PK_OVERRIDES: dict[str, list[str]] = {
     # (workspace_id, host_id) for the hosts table.
     "hosts": ["workspace_id", "host_id"],
     # y1a2b3c4d5e6 widened conversation_items to insert conversation_id
-    # between workspace_id and id.
-    "conversation_items": ["workspace_id", "conversation_id", "id"],
+    # between workspace_id and id; z8a2b3c4d5e6 appended created_at for
+    # partition-readiness.
+    "conversation_items": ["workspace_id", "conversation_id", "id", "created_at"],
 }
 
 

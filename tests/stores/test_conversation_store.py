@@ -622,10 +622,13 @@ def test_unique_position_constraint(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
     """
-    The (conversation_id, position) pair has a unique index.
+    The (conversation_id, position, created_at) tuple has a unique index.
 
-    Verify that manually inserting a duplicate position raises
-    IntegrityError, confirming the safety net is in place.
+    created_at joined the index for partition-readiness (unique indexes must
+    contain a partition key), so the DB safety net blocks duplicate positions
+    only within the same epoch second — which still covers the concurrent
+    double-append race. Slower duplicates are prevented by the next_position
+    allocator, not the index.
     """
     from sqlalchemy.exc import IntegrityError
 
@@ -647,23 +650,30 @@ def test_unique_position_constraint(
             ),
         ],
     )
-    # Directly insert a row at position 0 (already taken) to
-    # confirm the unique constraint rejects it.
+    existing_created_at = conversation_store.list_items(conv.id).data[0].created_at
+
+    def _duplicate_position_row(created_at: int) -> SqlConversationItem:
+        return SqlConversationItem(
+            id=generate_item_id("message"),
+            conversation_id=conv.id,
+            response_id="resp_dup",
+            created_at=created_at,
+            status=encode_item_status("completed"),
+            position=0,  # duplicate
+            type=encode_item_type("message"),
+            data='{"role":"user","content":[]}',
+            search_text="",
+        )
+
+    # Same second (the double-append race shape): the index rejects it.
     with pytest.raises(IntegrityError):
         with conversation_store._session() as session:
-            session.add(
-                SqlConversationItem(
-                    id=generate_item_id("message"),
-                    conversation_id=conv.id,
-                    response_id="resp_dup",
-                    created_at=0,
-                    status=encode_item_status("completed"),
-                    position=0,  # duplicate
-                    type=encode_item_type("message"),
-                    data='{"role":"user","content":[]}',
-                    search_text="",
-                )
-            )
+            session.add(_duplicate_position_row(existing_created_at))
+
+    # A different second slips past the index; only the next_position
+    # allocator prevents this in real appends.
+    with conversation_store._session() as session:
+        session.add(_duplicate_position_row(existing_created_at + 1))
 
 
 def test_concurrent_appends_do_not_collide_on_position(
