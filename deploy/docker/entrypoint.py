@@ -289,6 +289,9 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
     from omnigent.stores.permission_store.sqlalchemy_store import (
         SqlAlchemyPermissionStore,
     )
+    from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
+        SqlAlchemyScheduledTaskStore,
+    )
 
     telemetry.init()
 
@@ -298,6 +301,7 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
     comment_store = SqlAlchemyCommentStore(database_url)
     permission_store = SqlAlchemyPermissionStore(database_url)
     host_store = HostStore(database_url)
+    scheduled_task_store = SqlAlchemyScheduledTaskStore(database_url)
     # Fail startup loud on a malformed `sandbox:` section (an operator
     # typo should not surface as a runtime 502 on the first managed
     # session); the startup catch-all below logs it.
@@ -344,6 +348,7 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
         comment_store=comment_store,
         permission_store=permission_store,
         host_store=host_store,
+        scheduled_task_store=scheduled_task_store,
         auth_provider=auth_provider,
         account_store=account_store,
         # Non-secret auth settings from the config file (admins are the

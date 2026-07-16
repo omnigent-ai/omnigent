@@ -1067,18 +1067,6 @@ def _ensure_default_polly_agent(
     )
 
 
-async def _placeholder_on_fire(scheduled_task_id: str) -> None:
-    """Default scheduler fire callback (no-op placeholder that logs).
-
-    Exercises the ``on_fire`` seam without side effects: the real fire path
-    (creating an agent session for the task) supplies its own callback.
-    """
-    _logger.info(
-        "scheduler: task %s is due (no fire path wired yet — skipping)",
-        scheduled_task_id,
-    )
-
-
 def create_app(
     agent_store: AgentStore,
     file_store: FileStore,
@@ -1381,13 +1369,30 @@ def create_app(
 
         # Recurring-task scheduler: arm a timer per active
         # scheduled task and fire the injected ``on_fire`` callback on
-        # schedule. The default callback is a no-op that logs; a real fire
-        # path (creating a session) can be injected in its place.
+        # schedule. The callback (see scheduled.fire) re-reads the row,
+        # creates + owner-grants a session, launches its runner, and records
+        # the run — all fire-and-forget so the timer re-arms immediately.
         scheduled_task_scheduler: ScheduledTaskScheduler | None = None
         if scheduled_task_store is not None:
+            from omnigent.server.scheduled.fire import FireDeps, build_on_fire
+
+            on_fire = build_on_fire(
+                FireDeps(
+                    scheduled_task_store=scheduled_task_store,
+                    conversation_store=conversation_store,
+                    agent_store=agent_store,
+                    permission_store=permission_store,
+                    host_store=host_store,
+                    host_registry=host_registry,
+                    runner_router=runner_router,
+                    tunnel_registry=tunnel_registry,
+                    file_store=file_store,
+                    artifact_store=artifact_store,
+                )
+            )
             scheduled_task_scheduler = ScheduledTaskScheduler(
                 store=scheduled_task_store,
-                on_fire=_placeholder_on_fire,
+                on_fire=on_fire,
             )
             app_inst.state.scheduled_task_scheduler = scheduled_task_scheduler
             # Scheduled tasks are a non-critical subsystem: a failure loading the
