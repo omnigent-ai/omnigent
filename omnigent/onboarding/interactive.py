@@ -9,11 +9,12 @@ future configure noun). The look reproduces
 - one row per option (selected → ``❯  <label>`` in bold accent, others
   normal weight; non-selectable sub-lines dim italic and indented beneath),
 - a muted footer hint line (``↑/↓ move  ·  Enter select  ·  Esc back``),
-- a raw-termios keypress loop with in-place redraw (move up, clear,
-  reprint), and
+- a raw keypress loop with in-place redraw (move up, clear, reprint) —
+  ``termios``/``tty`` on POSIX, ``msvcrt`` on Windows, both decoded into
+  one platform-free key vocabulary, and
 - a non-TTY numbered fallback so pipes / CI / tests work.
 
-The raw-termios reading and redraw mechanics are deliberately ported
+The raw reading and redraw mechanics are deliberately ported
 from :mod:`omnigent.repl._theme_picker` rather than imported: that
 module exposes only private helpers, and this module is the generic,
 reusable version. The duplication is intentional for now — a future
@@ -27,8 +28,16 @@ from __future__ import annotations
 import io
 import os
 import sys
+
+# termios/tty are POSIX-only and drive the raw-key menu loop; Windows uses
+# msvcrt instead (imported inside the win32 branch). Guard the import
+# (special-cased by mypy, which type-checks on Linux) so importing this module
+# never crashes the CLI there.
+if sys.platform != "win32":
+    import termios
+    import tty
 from collections.abc import Callable
-from typing import Protocol, cast
+from typing import Literal, Protocol, cast
 
 import click
 from rich.cells import cell_len
@@ -103,7 +112,7 @@ def _render_menu(
     window_start: int = 0,
     compact: bool = False,
 ) -> str:
-    """Render the menu frame to an ANSI string for the termios redraw.
+    """Render the menu frame to an ANSI string for the in-place redraw.
 
     A bold accent header, one row per option (selected → bold accent with the
     ``❯`` pointer, others normal weight aligned under it), an optional dim
@@ -271,7 +280,7 @@ def _select_fallback(
 ) -> int:
     """Non-TTY numbered fallback for :func:`select`.
 
-    Gives pipes / CI / tests a numbered prompt instead of a raw-termios
+    Gives pipes / CI / tests a numbered prompt instead of a raw-keypress
     loop they cannot drive. Non-selectable rows are printed as plain
     section labels (no number); only selectable rows are numbered, and the
     returned value is the original index into *options*.
@@ -312,6 +321,158 @@ def _select_fallback(
         console.print("  [red]Invalid selection.[/red]")
 
 
+# The platform-free key vocabulary the menu loop consumes. Each platform's
+# reader decodes its own console bytes down to one of these.
+Key = Literal["up", "down", "enter", "cancel", "eof", "ignore"]
+
+
+def _posix_key_reader(fd: int) -> Callable[[], Key]:
+    """Build a reader that decodes one keypress from a cbreak-mode POSIX *fd*.
+
+    Arrows arrive as the ``ESC [ A`` / ``ESC [ B`` escape sequence, so a bare
+    Escape is told apart from an arrow by peeking for a follow-on byte.
+
+    :param fd: The raw file descriptor to read from, already in cbreak mode.
+    :returns: A callable returning one :data:`Key` per invocation.
+    """
+
+    def read_key() -> Key:
+        ch = os.read(fd, 1)
+        if not ch:
+            return "eof"
+        if ch in (b"\x03", b"\x04"):
+            # Ctrl-C / Ctrl-D — abort the menu.
+            return "cancel"
+        if ch == b"\x1b":
+            # Escape alone, or the start of an arrow sequence.
+            import select as _select
+
+            if _select.select([fd], [], [], 0.05)[0]:
+                nxt = os.read(fd, 1)
+                if nxt == b"[":
+                    arrow = os.read(fd, 1)
+                    if arrow == b"A":  # Up
+                        return "up"
+                    if arrow == b"B":  # Down
+                        return "down"
+                # Ignore other escape sequences.
+                return "ignore"
+            # Bare Escape — abort the menu.
+            return "cancel"
+        if ch in (b"\r", b"\n"):
+            return "enter"
+        if ch in (b"k", b"K"):  # vi-style up
+            return "up"
+        if ch in (b"j", b"J"):  # vi-style down
+            return "down"
+        return "ignore"
+
+    return read_key
+
+
+def _windows_key_reader(getch: Callable[[], bytes]) -> Callable[[], Key]:
+    """Build a reader that decodes one keypress from the Windows console.
+
+    ``msvcrt.getch`` reports arrows as a ``\\x00`` or ``\\xe0`` prefix byte
+    followed by a scan code (``H`` up, ``P`` down) — no escape sequence and so
+    no timeout needed to disambiguate a bare Escape.
+
+    :param getch: The blocking single-byte reader, normally ``msvcrt.getch``;
+        injectable so the decoding is testable off Windows.
+    :returns: A callable returning one :data:`Key` per invocation.
+    """
+
+    def read_key() -> Key:
+        ch = getch()
+        if not ch:
+            return "eof"
+        if ch in (b"\x00", b"\xe0"):
+            # Prefixed scan code: consume the second byte so it is never
+            # re-read as a literal key.
+            code = getch()
+            if code == b"H":  # Up
+                return "up"
+            if code == b"P":  # Down
+                return "down"
+            return "ignore"
+        if ch in (b"\x03", b"\x04"):
+            # Ctrl-C / Ctrl-D — abort the menu.
+            return "cancel"
+        if ch == b"\x1b":
+            # Escape — abort the menu.
+            return "cancel"
+        if ch in (b"\r", b"\n"):
+            return "enter"
+        if ch in (b"k", b"K"):  # vi-style up
+            return "up"
+        if ch in (b"j", b"J"):  # vi-style down
+            return "down"
+        return "ignore"
+
+    return read_key
+
+
+def _run_key_loop(
+    read_key: Callable[[], Key],
+    redraw: Callable[[], None],
+    selectable: list[bool],
+    selected: int,
+) -> tuple[int, bool]:
+    """Drive the menu cursor from decoded keys until confirm or abort.
+
+    Platform-free: every console difference is already resolved by the
+    reader, so this owns only the cursor arithmetic and the redraw.
+
+    :param read_key: Blocking source of the next :data:`Key`.
+    :param redraw: Reprints the menu frame in place after a cursor move.
+    :param selectable: The per-row selectable mask (at least one ``True``).
+    :param selected: The starting (selectable) cursor index.
+    :returns: ``(selected, cancelled)`` — the final index, and whether the
+        user aborted rather than confirmed.
+    """
+    while True:
+        key = read_key()
+        if key == "cancel":
+            return selected, True
+        if key in ("enter", "eof"):
+            return selected, False
+        if key == "up":
+            selected = _step_selectable(selectable, selected, -1)
+            redraw()
+        elif key == "down":
+            selected = _step_selectable(selectable, selected, +1)
+            redraw()
+
+
+def _enable_windows_vt() -> bool:
+    """Switch the Windows console into ANSI (virtual terminal) mode.
+
+    Windows Terminal enables this by default, but legacy conhost does not and
+    the in-place redraw is pure escape sequences — without VT the menu would
+    print as literal escape codes.
+
+    :returns: ``True`` when ANSI output is usable, ``False`` when the console
+        refuses (the caller then degrades to the numbered fallback).
+    """
+    import ctypes
+
+    enable_virtual_terminal_processing = 0x0004
+    std_output_handle = -11
+    try:
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        handle = kernel32.GetStdHandle(std_output_handle)
+        mode = ctypes.c_uint32()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False
+        if mode.value & enable_virtual_terminal_processing:
+            return True
+        return bool(
+            kernel32.SetConsoleMode(handle, mode.value | enable_virtual_terminal_processing)
+        )
+    except Exception:
+        return False
+
+
 def _term_width() -> int:
     """Return the terminal width clamped to a sane minimum.
 
@@ -338,8 +499,9 @@ def select(
 ) -> int:
     """Show a theme-picker-styled arrow-key menu and return the choice.
 
-    On a TTY this draws the menu via raw termios (accent ``❯`` pointer,
-    dimmed others, footer hints) and redraws in place on ↑/↓. Enter
+    On a TTY this draws the menu via a raw keypress loop (termios on POSIX,
+    msvcrt on Windows) with an accent ``❯`` pointer, dimmed others and footer
+    hints, and redraws in place on ↑/↓. Enter
     confirms the highlighted option. Esc (or Ctrl-C / Ctrl-D) **aborts**
     and returns ``-1`` so the caller can cancel / go back; callers must
     check for ``< 0`` before indexing ``options``.
@@ -401,12 +563,7 @@ def select(
     if not sys.stdin.isatty():
         return _select_fallback(title, options, default=default, selectable=mask)
 
-    import termios
-    import tty
-
-    fd = sys.stdin.fileno()
     selected = _first_selectable(mask, default)
-    cancelled = False
     width = _term_width()
     # Single-element list tracks how many lines the previous frame
     # occupied so the next redraw can move up and overwrite it
@@ -445,52 +602,30 @@ def select(
         sys.stdout.flush()
         prev_lines[0] = rendered.count("\n")
 
-    try:
-        old_attrs = termios.tcgetattr(fd)
-    except termios.error:
-        # Cannot enter raw mode — degrade to the numbered fallback.
-        return _select_fallback(title, options, default=default, selectable=mask)
+    if sys.platform == "win32":
+        import msvcrt
 
-    try:
+        if not _enable_windows_vt():
+            # An ANSI-less console would render the frame as escape garbage.
+            return _select_fallback(title, options, default=default, selectable=mask)
         _redraw()
-        tty.setcbreak(fd)
-        while True:
-            ch = os.read(fd, 1)
-            if not ch:
-                break
-            if ch in (b"\x03", b"\x04"):
-                # Ctrl-C / Ctrl-D — abort the menu.
-                cancelled = True
-                break
-            if ch == b"\x1b":
-                # Escape alone, or the start of an arrow sequence.
-                import select as _select
+        selected, cancelled = _run_key_loop(
+            _windows_key_reader(msvcrt.getch), _redraw, mask, selected
+        )
+    else:
+        fd = sys.stdin.fileno()
+        try:
+            old_attrs = termios.tcgetattr(fd)
+        except termios.error:
+            # Cannot enter raw mode — degrade to the numbered fallback.
+            return _select_fallback(title, options, default=default, selectable=mask)
 
-                if _select.select([fd], [], [], 0.05)[0]:
-                    nxt = os.read(fd, 1)
-                    if nxt == b"[":
-                        arrow = os.read(fd, 1)
-                        if arrow == b"A":  # Up
-                            selected = _step_selectable(mask, selected, -1)
-                            _redraw()
-                        elif arrow == b"B":  # Down
-                            selected = _step_selectable(mask, selected, +1)
-                            _redraw()
-                    # Ignore other escape sequences.
-                    continue
-                # Bare Escape — abort the menu.
-                cancelled = True
-                break
-            if ch in (b"\r", b"\n"):
-                break
-            if ch in (b"k", b"K"):  # vi-style up
-                selected = _step_selectable(mask, selected, -1)
-                _redraw()
-            elif ch in (b"j", b"J"):  # vi-style down
-                selected = _step_selectable(mask, selected, +1)
-                _redraw()
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+        try:
+            _redraw()
+            tty.setcbreak(fd)
+            selected, cancelled = _run_key_loop(_posix_key_reader(fd), _redraw, mask, selected)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
 
     if clear_on_exit and prev_lines[0] > 0:
         # Erase the rendered frame so a re-rendering loop doesn't leave a
