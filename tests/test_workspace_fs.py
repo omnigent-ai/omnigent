@@ -131,6 +131,43 @@ def test_read_oversize_file_is_capped_and_flagged(tmp_path: Path, monkeypatch) -
     assert result["bytes"] == 8
 
 
+def test_oversize_text_split_on_codepoint_stays_text(tmp_path: Path, monkeypatch) -> None:
+    """A text file truncated mid-codepoint still serves as UTF-8, not base64.
+
+    The byte cap can fall inside a multi-byte character; dropping the partial
+    trailing codepoint keeps the file classified as text (matching the runner's
+    boundary-safe truncation) instead of flipping it to base64.
+    """
+    monkeypatch.setattr("omnigent.workspace_fs._MAX_READ_BYTES", 4)
+    # "aé" → b"a\xc3\xa9"; cap 4 keeps "aé" whole, so pad so the cap lands
+    # inside the é: 3 ASCII + é = b"abc\xc3\xa9", cap 4 splits the é.
+    (tmp_path / "u.txt").write_text("abcé")
+    reader = WorkspaceReader(tmp_path)
+
+    result = reader.list_or_read("u.txt")
+
+    assert result["encoding"] == "utf-8"
+    assert result["truncated"] is True
+    assert result["content"] == "abc"  # partial é dropped, not corrupted
+
+
+def test_oversize_binary_still_serves_base64(tmp_path: Path, monkeypatch) -> None:
+    """A truncated genuinely-binary file stays base64, not rescued as text.
+
+    The codepoint-split rescue must only apply to a partial trailing sequence;
+    a binary file has invalid bytes earlier in the buffer and must fall through
+    to base64.
+    """
+    monkeypatch.setattr("omnigent.workspace_fs._MAX_READ_BYTES", 4)
+    (tmp_path / "b.bin").write_bytes(b"\xff\xfe\x00\x01\x02\x03")  # 6 bytes > cap 4
+    reader = WorkspaceReader(tmp_path)
+
+    result = reader.list_or_read("b.bin")
+
+    assert result["encoding"] == "base64"
+    assert result["truncated"] is True
+
+
 def test_list_dir_includes_broken_symlink_as_file(tmp_path: Path) -> None:
     """A broken symlink is listed as ``type="file"`` with no size, like the runner.
 

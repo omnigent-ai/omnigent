@@ -256,8 +256,21 @@ class WorkspaceReader:
         try:
             text = capped.decode("utf-8")
             is_text = True
-        except UnicodeDecodeError:
-            is_text = False
+        except UnicodeDecodeError as exc:
+            # A byte-cap truncation can split a multi-byte codepoint at the very
+            # end, which would otherwise flip an oversize *text* file to base64.
+            # When the only invalid bytes are a partial trailing codepoint (the
+            # error starts within the last 3 bytes of the truncated buffer),
+            # drop them and retry — matching the runner's boundary-safe
+            # truncation so the same file serves as text from either side. A
+            # genuinely binary file has invalid bytes earlier in the buffer, so
+            # this guard doesn't rescue it and it falls through to base64.
+            if truncated and exc.start >= len(capped) - 3:
+                capped = capped[: exc.start]
+                text = capped.decode("utf-8")
+                is_text = True
+            else:
+                is_text = False
 
         payload: dict[str, Any] = {
             "object": "session.environment.filesystem.file_content",
