@@ -155,6 +155,28 @@ async def test_start_arms_one_timer_per_active_task() -> None:
     assert len(seam.live()) == 2
 
 
+async def test_start_is_idempotent() -> None:
+    # A second start() while already started must be a no-op: no duplicate
+    # timers layered on top, and no re-load of the store.
+    scheduler, _clock, seam, _fired = _make([_task("a"), _task("b")])
+    await scheduler.start()
+    jobs_after_first = scheduler.job_count
+    timers_after_first = len(seam.timers)
+    live_after_first = len(seam.live())
+
+    await scheduler.start()  # second call — should do nothing
+
+    assert scheduler.job_count == jobs_after_first == 2
+    assert len(seam.timers) == timers_after_first  # no new timers armed
+    assert len(seam.live()) == live_after_first == 2
+
+    # stop() clears _started, so a subsequent start() re-arms cleanly.
+    scheduler.stop()
+    assert scheduler.job_count == 0
+    await scheduler.start()
+    assert scheduler.job_count == 2
+
+
 async def test_start_skips_paused_tasks() -> None:
     scheduler, _clock, _seam, _fired = _make(
         [_task("a", state="active"), _task("b", state="paused")]

@@ -132,9 +132,13 @@ class ScheduledTaskScheduler:
         """Load every active task and arm a timer for each.
 
         A persisted task with a bad RRULE is logged and skipped — it must never
-        abort server startup. Idempotent-ish: safe to call once per process; a
-        second call layers on top of existing jobs.
+        abort server startup. Idempotent: a second call while already started is
+        a no-op (the store is not re-read and no timers are re-armed); call
+        :meth:`stop` first if you need to reload.
         """
+        if self._started:
+            _logger.debug("scheduler: start() called but already started; ignoring")
+            return
         for task in self._store.list_active():
             try:
                 self._register(task)
