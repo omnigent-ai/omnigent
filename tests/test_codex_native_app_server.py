@@ -157,7 +157,7 @@ def test_build_codex_native_server_profile_error_names_profile(
         lambda: sys.executable,
     )
     monkeypatch.setattr(
-        "omnigent.codex_native_app_server._read_databrickscfg",
+        "omnigent.codex_native_app_server._databricks_gateway_host",
         lambda _profile: None,
     )
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(tmp_path / "missing-databrickscfg"))
@@ -183,18 +183,13 @@ def test_build_codex_native_server_uses_profile_host_without_static_token(
     Native Codex accepts Databricks CLI OAuth profiles without static tokens.
 
     A default Omnigent install may not include ``databricks-sdk`` in the
-    runner process. In that case ``_read_databrickscfg`` cannot mint a bearer
-    at startup, but the profile's host is still enough: Codex gets an
-    ``auth.command`` that runs ``databricks auth token --profile`` at request
-    time.
+    runner process. In that case a bearer cannot be minted at startup, but the
+    profile's host is still enough: Codex gets an ``auth.command`` that runs
+    ``databricks auth token --profile`` at request time.
     """
     monkeypatch.setattr(
         "omnigent.codex_native_app_server._find_codex_cli",
         lambda: sys.executable,
-    )
-    monkeypatch.setattr(
-        "omnigent.codex_native_app_server._read_databrickscfg",
-        lambda _profile: None,
     )
     cfg_path = tmp_path / "databrickscfg"
     cfg_path.write_text(
