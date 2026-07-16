@@ -231,17 +231,13 @@ def _create_engine(db_uri: str) -> Engine:
         engine = create_engine(
             db_uri,
             connect_args={"check_same_thread": False, "timeout": 20.0},
-            # SQLAlchemy's default QueuePool (size 5, overflow 10, 30s
-            # wait) exhausts on a server with a few dozen live sessions:
-            # every stream, event append, and policy evaluation checks
-            # out a connection, and once 15 are held, transcript loads
-            # queue for 30s and fail. WAL-mode SQLite is happy with many
-            # concurrent readers, so size the pool like the server
-            # workload instead of the library default. ``pool_timeout``
-            # stays short so true saturation surfaces as an error
-            # rather than a half-minute hang.
-            pool_size=50,
-            max_overflow=50,
+            # SQLAlchemy's default QueuePool (5 + 10 overflow, 30s wait)
+            # exhausts under server workloads; WAL-mode SQLite handles many
+            # concurrent readers, so keep a small resident pool with a ~50
+            # burst ceiling, and a short ``pool_timeout`` so true saturation
+            # errors fast instead of hanging.
+            pool_size=10,
+            max_overflow=40,
             pool_timeout=10,
         )
 
@@ -313,27 +309,21 @@ def _tune_sqlite_database(engine: Engine) -> None:
     connections, so the checkpoint usually succeeds; when another process
     is mid-read it degrades to a partial checkpoint rather than failing.
 
-    ``PRAGMA optimize=0x10002`` collects planner statistics for any table
-    that lacks (or has outgrown) them. Without ``sqlite_stat1`` the
+    When the database has no planner statistics at all (no ``sqlite_stat1``
+    table), run ``ANALYZE`` once to collect them. Without statistics the
     planner guesses row counts and can pick a full-table scan over an
     index for window-function joins - e.g. the latest-message-per-child
     query behind ``child_sessions`` - turning milliseconds into minutes
-    on a large ``chat.db``.
+    on a large ``chat.db``. ANALYZE runs before the checkpoint so its
+    ``sqlite_stat1`` write gets folded in rather than left behind as a
+    fresh WAL. Tradeoff: the first open of a large never-analyzed
+    database pays a one-time ANALYZE.
 
     Both statements are advisory: a locked or read-only database must not
     prevent the engine from being served.
     """
     try:
         with engine.connect() as conn:
-            # Optimize first: the ANALYZE it may run writes sqlite_stat1
-            # through the WAL, so checkpointing after folds that write in
-            # too instead of leaving a fresh WAL behind.
-            conn.exec_driver_sql("PRAGMA optimize=0x10002")
-            # Older SQLite builds only analyze tables this connection has
-            # already used, so on a fresh connection the optimize above
-            # can be a no-op. When the database has no statistics at all,
-            # collect them explicitly - that never-analyzed state is
-            # exactly the pathological one.
             has_stats = conn.exec_driver_sql(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sqlite_stat1'"
             ).fetchone()

@@ -84,18 +84,16 @@ def test_non_sqlite_engine_has_pool_settings(
     assert captured_kwargs.get("pool_recycle") == 1800
 
 
-def test_sqlite_engine_skips_server_pool_settings_and_enables_wal(
+def test_sqlite_engine_pool_capacity_and_wal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    SQLite engines must NOT receive server-DB pool settings
-    (``pool_pre_ping`` / ``pool_recycle``) — those are meaningful
-    only for multi-connection server databases. They must, however,
-    enable WAL journal mode and a 20s ``busy_timeout`` on every
-    connection so multi-process workloads (REPL + Omnigent server +
-    runner subprocess + DBOS scheduler all hitting the same
-    ``chat.db``) don't surface as ``disk I/O error`` /
+    SQLite engines must outgrow SQLAlchemy's default QueuePool ceiling
+    (5 + 10 overflow) and must enable WAL journal mode and a 20s
+    ``busy_timeout`` on every connection so multi-process workloads
+    (REPL + Omnigent server + runner subprocess + DBOS scheduler all
+    hitting the same ``chat.db``) don't surface as ``disk I/O error`` /
     ``database is locked`` under default ``journal_mode=DELETE``.
 
     Uses a real SQLite engine on a tempfile (rather than a
@@ -117,15 +115,17 @@ def test_sqlite_engine_skips_server_pool_settings_and_enables_wal(
     # carrying options meant for postgres/mysql.
     assert engine.url.get_backend_name() == "sqlite"
 
-    # The pool itself must be sized for the server workload, not
-    # SQLAlchemy's default (5 + 10 overflow, 30s wait): a server with a
-    # few dozen live sessions holds more than 15 connections across
-    # streams, event appends, and policy evaluations, and the default
-    # pool surfaces as 30s transcript loads that die with
-    # ``QueuePool limit ... reached`` errors.
-    assert engine.pool.size() == 50
-    assert engine.pool._max_overflow == 50
-    assert engine.pool._timeout == 10
+    # Behavioral check: more than 15 simultaneous checkouts must succeed,
+    # proving the default QueuePool ceiling (5 + 10 overflow, where the
+    # 16th checkout waits 30s and dies with ``QueuePool limit ... reached``)
+    # is gone. The exact pool geometry (size/overflow/timeout) is
+    # deliberately not pinned - it's an implementation detail.
+    checkouts = [engine.connect() for _ in range(16)]
+    try:
+        assert len(checkouts) == 16
+    finally:
+        for checkout in checkouts:
+            checkout.close()
 
     with engine.connect() as conn:
         # WAL is the entire point of this fix: it allows readers
@@ -204,12 +204,11 @@ def test_sqlite_engine_checkpoints_wal_and_collects_stats(
 
         engine = get_or_create_engine(f"sqlite:///{db_path}")
 
-        # The WAL was folded into the main file and truncated - a stat
-        # of zero bytes is exactly what wal_checkpoint(TRUNCATE)
-        # guarantees.
-        assert wal_path.stat().st_size == 0
-        # PRAGMA optimize collected planner statistics for the seeded
-        # table.
+        # The WAL was folded into the main file and truncated. Some
+        # platforms/builds remove the -wal file outright rather than
+        # leaving a zero-byte one - both mean the same thing.
+        assert not wal_path.exists() or wal_path.stat().st_size == 0
+        # ANALYZE collected planner statistics for the seeded table.
         with engine.connect() as conn:
             stat_row = conn.exec_driver_sql(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sqlite_stat1'"
