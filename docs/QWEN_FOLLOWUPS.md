@@ -126,6 +126,23 @@ comments; this is the *what*, not the *how*.)
     already done and the `control_response` just cleans up. Still worth a live
     E2E to confirm timing under a real `qwen --acp` turn.
 
+- [x] **Live tool-call cards (spinner + elapsed timer).** Implemented — the
+  forwarder now mirrors qwen's `tool_use` blocks as `function_call` items and its
+  `tool_result` blocks (which arrive as `user` events in the Anthropic envelope)
+  as `function_call_output` items, and brackets each turn with an id-bearing
+  `external_session_status` `running`/`idle`/`failed` edge. A prose-bearing `user`
+  event opens the turn and mints a per-turn `qwen:turn:{uuid}` response id stamped
+  on every item; a `tool_result`-only `user` event does **not** open a new turn
+  (that would flicker the spinner on the long tool calls the card exists for).
+  `result` closes it (`subtype != "success"` → `failed`), with a belt-and-braces
+  close on a prose-only assistant step and a minutes-scale stalled-turn backstop
+  for a turn killed by a TUI interrupt/crash. The open turn id + live flag ride in
+  the durable state file so a supervisor restart mid-turn keeps the cards in one
+  group and still closes an orphaned `running`. The runner's PTY-activity watcher
+  still owns the coarse id-less session badge (as for goose-/cursor-native); these
+  id-bearing edges drive only the tool-bubble streaming lifecycle. Server/web
+  shipped harness-agnostic in #1499.
+
 - [ ] **Composer status line: real model + context ring (Web UI).** For
   native-qwen the composer's model/effort chip is currently **hidden** (web UI
   flag `nativeVendorOwnsModel` in `chatStore.sessionBindingPatch` →
