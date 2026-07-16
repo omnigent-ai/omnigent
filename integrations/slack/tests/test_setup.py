@@ -327,6 +327,43 @@ async def test_setup_auth_required_but_login_disabled(tmp_path: Path) -> None:
 
 
 @respx.mock
+async def test_setup_reports_device_grant_disabled(tmp_path: Path) -> None:
+    """Accounts server with the device grant OFF (/oauth/* unmounted → 405):
+    the modal must tell the user to contact the admin, not "try again shortly"."""
+    from cryptography.fernet import Fernet
+
+    from omnigent_slack.auth_manager import AuthManager
+    from omnigent_slack.tokens import EncryptedTokenStore
+
+    respx.get(_SERVER + "/health").mock(return_value=httpx.Response(200, json={"status": "ok"}))
+    # /v1/me → accounts mode; the pre-login agents probe 401s so login starts.
+    respx.get(_SERVER + "/v1/me").mock(
+        return_value=httpx.Response(401, json={"login_url": "/login"})
+    )
+    respx.get(_SERVER + "/v1/agents").mock(return_value=httpx.Response(401))
+    # Device grant disabled → authorize falls through to the SPA catch-all (405).
+    respx.post(_SERVER + "/oauth/device/authorize").mock(return_value=httpx.Response(405))
+
+    token_store = EncryptedTokenStore(tmp_path / "tok.sqlite3", Fernet.generate_key().decode())
+    await token_store.initialize()
+    pool = OmnigentClientPool()
+    auth = AuthManager(token_store)
+    pool.set_auth_resolver(auth.resolve_auth)
+    flow = _flow(await _store(tmp_path), pool, auth)
+    client = FakeSetupClient()
+
+    try:
+        await flow._begin_setup(client, team_id="T1", user_id="U1", view_id="V1")
+    finally:
+        await pool.aclose_all()
+
+    body = _last_update(client)["blocks"][0]["text"]["text"].lower()
+    assert "device authorization grant" in body
+    assert "administrator" in body
+    assert "try again shortly" not in body
+
+
+@respx.mock
 async def test_unknown_argument_opens_setup_modal(tmp_path: Path) -> None:
     """Any non-`logout` argument opens the setup modal (connecting screen)."""
     # The server is unreachable here; setup still opens the connecting modal

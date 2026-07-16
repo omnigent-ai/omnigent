@@ -1,9 +1,26 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def _local_data_dir() -> Path:
+    """Return the local runtime data dir for the bot's SQLite store.
+
+    Honors ``OMNIGENT_DATA_DIR`` (the shared data-isolation knob, so a
+    checkout/worktree keeps its own state), else ``~/.omnigent``. Kept as a
+    local copy rather than an import so the standalone ``omnigent-slack``
+    package stays decoupled from omnigent core.
+
+    :returns: The data directory path (callers create it lazily).
+    """
+    value = os.environ.get("OMNIGENT_DATA_DIR")
+    if value:
+        return Path(value).expanduser()
+    return Path.home() / ".omnigent"
 
 
 class Settings(BaseSettings):
@@ -33,8 +50,12 @@ class Settings(BaseSettings):
         validation_alias="OMNIGENT_DEVICE_CLIENT_SECRET",
     )
 
+    # Bot SQLite store (thread→session map, user configs, encrypted tokens).
+    # Defaults under the runtime data dir (``OMNIGENT_DATA_DIR`` or
+    # ``~/.omnigent``) so the daemon doesn't depend on its launch cwd — set
+    # OMNIGENT_SLACK_DATABASE_PATH to override.
     database_path: Path = Field(
-        default=Path("data/omnigent_slack.sqlite3"),
+        default_factory=lambda: _local_data_dir() / "omnigent_slack.sqlite3",
         validation_alias="OMNIGENT_SLACK_DATABASE_PATH",
     )
     log_level: str = Field(default="INFO", validation_alias="LOG_LEVEL")

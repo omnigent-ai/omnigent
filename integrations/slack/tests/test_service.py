@@ -10,6 +10,7 @@ from omnigent_slack.models import ThreadKey, UserConfig
 from omnigent_slack.omnigent import (
     AuthRequiredError,
     HostUnavailableError,
+    OmnigentError,
     ServerUnreachableError,
 )
 from omnigent_slack.service import SlackOmnigentService
@@ -918,6 +919,13 @@ class AuthRequiredClient(FakeOmnigentClient):
         raise AuthRequiredError("401")
 
 
+class ServerErrorClient(FakeOmnigentClient):
+    async def create_session(self, agent_id: str, title: str) -> str:
+        # Mirrors a 500 from POST /v1/sessions: a bare OmnigentError, NOT one of
+        # the specifically-handled subclasses.
+        raise OmnigentError("Omnigent request failed with 500: internal_error")
+
+
 async def _wait_for_posts(client: FakeSlackClient, count: int) -> None:
     for _ in range(50):
         if len(client.posts) >= count:
@@ -976,6 +984,34 @@ async def test_auth_required_clears_ack_and_prompts_relogin(tmp_path: Path) -> N
     text = slack.posts[-1]["text"]
     assert "/omnigent" in text
     assert "log in" in text.lower() or "login" in text.lower()
+
+
+async def test_server_error_creating_session_clears_ack_and_reports(tmp_path: Path) -> None:
+    # A 500 from create_session raises a bare OmnigentError (not one of the
+    # specifically-handled subclasses). It must still clear the "Working on
+    # it…" placeholder and post a failure — never strand the thread.
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    omnigent = ServerErrorClient()
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1")
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> hi"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await _wait_for_posts(slack, 1)
+    await service.shutdown()
+
+    # Placeholder posted then deleted — nothing lingers on "Working on it…".
+    assert len(slack.acks) == 1
+    assert slack.acks[0]["ts"] in slack.deleted_ts
+    # A failure reply was posted, and no session was persisted.
+    assert await store.get_session(ThreadKey("T1", "C1", "100.1")) is None
+    text = slack.posts[-1]["text"]
+    assert "failed" in text.lower()
 
 
 async def test_no_online_host_prompts_omni_host_command(tmp_path: Path) -> None:

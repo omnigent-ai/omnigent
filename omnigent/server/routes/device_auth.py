@@ -21,8 +21,10 @@ Endpoints (all mounted at the app root):
   returns delegated access + refresh tokens.
 - ``POST /oauth/revoke`` — revoke a grant (backs client logout).
 
-The flow is only available in ``oidc`` / ``accounts`` modes: header
-mode has no server-mintable identity (mirrors ``mint_runner_token``).
+Mounted only in ``accounts`` auth mode (and only when
+``OMNIGENT_DEVICE_GRANT_ENABLED`` is set). OIDC deployments delegate login
+to the IdP via the cli-ticket flow (``/auth/cli-login``) and never use this
+grant; header mode has no server-mintable identity.
 
 See ``designs/DEVICE_AUTH.md`` for the full design + threat model.
 
@@ -260,22 +262,17 @@ def create_device_auth_router(
 ) -> APIRouter:
     """Build the ``/oauth/*`` device-grant router.
 
-    :param auth_provider: The active provider. Must be ``oidc`` or
-        ``accounts`` mode (header mode cannot mint tokens). Its
-        cookie config supplies the HMAC signing key and public base URL.
+    :param auth_provider: The active provider. Must be ``accounts`` mode;
+        its cookie config supplies the HMAC signing key and public base URL.
     :param device_grant_store: Persistence for device grants.
     :returns: APIRouter to mount at the app root.
     """
-    if auth_provider._source not in ("oidc", "accounts"):
+    if auth_provider._source != "accounts":
         raise RuntimeError(
-            "create_device_auth_router requires oidc or accounts auth "
-            f"(got {auth_provider._source!r})"
+            f"create_device_auth_router requires accounts auth (got {auth_provider._source!r})"
         )
-    cookie_config = (
-        auth_provider._oidc_config
-        if auth_provider._source == "oidc"
-        else auth_provider._accounts_config
-    )
+    cookie_config = auth_provider._accounts_config
+    assert cookie_config is not None, "accounts mode must have an accounts config"
     cookie_secret = cookie_config.cookie_secret
     base_url = cookie_config.base_url
     provider_name = auth_provider._source

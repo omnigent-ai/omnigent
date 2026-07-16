@@ -8,7 +8,7 @@ from slack_bolt.async_app import AsyncApp
 
 from omnigent_slack.auth_manager import AuthManager, pack_user_key, slack_client_id
 from omnigent_slack.models import UserConfig
-from omnigent_slack.oauth import OAuthError
+from omnigent_slack.oauth import DeviceGrantUnavailableError, OAuthError
 from omnigent_slack.omnigent import (
     AuthRequiredError,
     OmnigentClient,
@@ -307,6 +307,17 @@ class SetupFlow:
         client_id = slack_client_id(await self._team_name(client, team_id))
         try:
             pending = await self._auth.authorize(server_url=server_url, client_id=client_id)
+        except DeviceGrantUnavailableError as exc:
+            self._logger.info("Device grant unavailable server=%s error=%s", server_url, exc)
+            await client.views_update(
+                view_id=view_id,
+                view=login_failed_modal(
+                    server_url,
+                    "the Omnigent server doesn't support Device Authorization Grant. "
+                    "Please contact your Omnigent server administrator.",
+                ),
+            )
+            return
         except OAuthError as exc:
             self._logger.info("Login authorize failed server=%s error=%s", server_url, exc)
             await client.views_update(

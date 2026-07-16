@@ -8,6 +8,7 @@ from omnigent_slack.oauth import (
     AuthMode,
     AuthorizationExpiredError,
     DeviceFlowClient,
+    DeviceGrantUnavailableError,
     OAuthError,
     probe_auth_mode,
     start_login,
@@ -88,6 +89,18 @@ async def test_start_login_header_mode_unsupported() -> None:
         await start_login(_BASE, client_id="slack")
     assert me.called
     assert not authorize.called  # never attempts the device grant
+
+
+@pytest.mark.parametrize("status", [404, 405])
+@respx.mock
+async def test_start_login_device_grant_not_enabled(status: int) -> None:
+    """When /oauth/device/authorize isn't mounted (device grant disabled), the
+    request falls through to the SPA catch-all (404/405) — start_login must
+    raise DeviceGrantUnavailableError, not a generic transient OAuthError."""
+    respx.get(_ME).mock(return_value=httpx.Response(401, json={"login_url": "/login"}))
+    respx.post(_BASE + "/oauth/device/authorize").mock(return_value=httpx.Response(status))
+    with pytest.raises(DeviceGrantUnavailableError):
+        await start_login(_BASE, client_id="slack")
 
 
 @respx.mock

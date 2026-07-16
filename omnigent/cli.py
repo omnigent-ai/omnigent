@@ -51,6 +51,7 @@ from omnigent.host.local_server import (
     stop_untracked_local_server,
 )
 from omnigent.inner import _proc, ui
+from omnigent.integration_daemon import IntegrationDaemon
 from omnigent.onboarding.sandboxes import available_providers as _sandbox_providers
 from omnigent.onboarding.ucode_setup import (
     build_ucode_configure_command,
@@ -1333,6 +1334,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "hermes",
         "host",
         "import",
+        "integration",
         "_internal",
         "kimi",
         "kiro",
@@ -1484,8 +1486,10 @@ def main() -> None:
     # user to "run omnigent setup" would be circular. ``upgrade`` (and its
     # ``update`` alias) is excluded too: its failures (unreachable index,
     # dev checkout, install error) are never about a missing model
-    # credential, so the setup hint would only mislead.
-    suggest_setup = argv[0] not in {"setup", "update", "upgrade"}
+    # credential, so the setup hint would only mislead. ``integration``
+    # likewise: its errors (package not installed, daemon not running) have
+    # nothing to do with model credentials.
+    suggest_setup = argv[0] not in {"setup", "update", "upgrade", "integration"}
 
     # Lightweight update notice: only on an interactive terminal and only
     # for user-facing commands. Reads a cached "latest PyPI version" and
@@ -8633,6 +8637,191 @@ class _ConfigGroup(click.Group):
             if hint is not None:
                 raise click.UsageError(hint)
         return super().parse_args(ctx, args)
+
+
+# ── Integrations (Slack, …) ───────────────────────────────────────────
+
+# Slack socket-mode bot: a separate `omnigent-slack` package (heavy deps —
+# slack_bolt/aiohttp — kept out of the core CLI install). The CLI launches it
+# as a subprocess and never imports it.
+_SLACK_PACKAGE = "omnigent_slack"
+_SLACK_INSTALL_HINT = (
+    "The Slack integration (omnigent-slack) isn't installed in this "
+    "environment. Install it alongside omnigent with the `slack` extra:\n"
+    '  uv pip install "omnigent[slack]"\n'
+    "or, from a source checkout:\n"
+    "  uv sync --extra slack"
+)
+
+
+def _slack_installed() -> bool:
+    """Whether the ``omnigent_slack`` package is importable (not imported)."""
+    import importlib.util
+
+    return importlib.util.find_spec(_SLACK_PACKAGE) is not None
+
+
+def _slack_argv() -> list[str]:
+    """Argv that runs the Slack bot in the current interpreter."""
+    return [sys.executable, "-m", _SLACK_PACKAGE]
+
+
+def _slack_cwd() -> Path | None:
+    """Directory to run the Slack bot from, so its ``.env`` resolves.
+
+    The bot's ``Settings`` loads a CWD-relative ``.env``; a background daemon
+    otherwise inherits whatever directory ``omni`` was launched from and
+    silently misses config. For a source/editable install the package lives at
+    ``<integration>/src/omnigent_slack``, so the integration dir (holding the
+    ``.env``) is three parents up. Returns that dir only when it actually holds
+    a ``.env``; otherwise ``None`` (a wheel install has no such dir — config
+    then comes from real environment variables).
+    """
+    import importlib.util
+
+    spec = importlib.util.find_spec(_SLACK_PACKAGE)
+    if spec is None or not spec.origin:
+        return None
+    origin = Path(spec.origin)
+    if len(origin.parents) < 3:
+        return None
+    integration_dir = origin.parents[2]
+    return integration_dir if (integration_dir / ".env").is_file() else None
+
+
+def _integration_state_dir() -> Path:
+    """Runtime dir for integration daemon records (honors OMNIGENT_DATA_DIR)."""
+    from omnigent.host.local_server import _local_data_dir
+
+    return _local_data_dir()
+
+
+def _slack_daemon() -> IntegrationDaemon:
+    return IntegrationDaemon("slack", _integration_state_dir())
+
+
+@cli.group("integration", invoke_without_command=True)
+@click.pass_context
+def integration(ctx: click.Context) -> None:
+    """Run and manage Omnigent chat integrations.
+
+    \b
+    Available integrations:
+      slack   The @omnigent Slack socket-mode bot.
+
+    Run ``omni integration slack`` to start the Slack bot in the foreground,
+    or ``omni integration slack start`` to run it in the background.
+    """
+    if ctx.invoked_subcommand is None:
+        click.echo(ctx.get_help())
+
+
+@integration.group("slack", invoke_without_command=True)
+@click.pass_context
+def slack(ctx: click.Context) -> None:
+    """Run the @omnigent Slack socket-mode bot (foreground).
+
+    \b
+    Bare invocation runs in the FOREGROUND (Ctrl-C to stop):
+      omni integration slack
+    Manage a BACKGROUND daemon with the subcommands:
+      omni integration slack start    # spawn detached, return immediately
+      omni integration slack status   # is it running?
+      omni integration slack stop     # terminate the daemon
+      omni integration slack logs     # where the daemon logs (-f to tail)
+
+    Config (Slack tokens, OMNIGENT_SERVER_URL, …) comes from the environment
+    and the integration's .env file — see integrations/slack/.env.example.
+    """
+    if ctx.invoked_subcommand is not None:
+        return
+    if not _slack_installed():
+        raise click.ClickException(_SLACK_INSTALL_HINT)
+    # A background daemon already holds the Slack socket; a second foreground
+    # bot would contend on the same connection. Refuse rather than double-run.
+    existing = _slack_daemon().running_record()
+    if existing is not None:
+        raise click.ClickException(
+            f"A background Slack bot is already running (pid {existing.pid}). "
+            "Stop it first with `omni integration slack stop`, or view it with "
+            "`omni integration slack status`."
+        )
+    # Foreground: inherit stdio, block until the bot exits (Ctrl-C).
+    click.echo("Starting the Omnigent Slack bot (foreground). Press Ctrl-C to stop.")
+    result = subprocess.run(_slack_argv(), env=os.environ.copy(), cwd=_slack_cwd(), check=False)
+    raise SystemExit(result.returncode)
+
+
+@slack.command("start")
+def slack_start() -> None:
+    """Start the Slack bot as a background daemon."""
+    if not _slack_installed():
+        raise click.ClickException(_SLACK_INSTALL_HINT)
+    daemon = _slack_daemon()
+    existing = daemon.running_record()
+    if existing is not None:
+        click.echo(f"Slack bot already running (pid {existing.pid}).")
+        click.echo(f"Logs: {_display_path(Path(existing.log_path))}")
+        return
+    record = daemon.start(_slack_argv(), os.environ.copy(), cwd=_slack_cwd())
+    # A detached daemon that dies on startup (missing tokens, bad server URL)
+    # leaves nothing on the terminal — confirm it survives a short grace and
+    # surface the log tail if it didn't, instead of falsely reporting success.
+    if not daemon.confirm_alive(record, grace_seconds=2.0):
+        tail = daemon.read_log_tail()
+        message = "The Slack bot exited immediately after starting."
+        if tail:
+            message += f"\nLast log lines:\n{tail}"
+        message += f"\nFull log: {_display_path(Path(record.log_path))}"
+        raise click.ClickException(message)
+    click.echo(f"Started the Omnigent Slack bot in the background (pid {record.pid}).")
+    click.echo(f"Logs: {_display_path(Path(record.log_path))}")
+    click.echo("Stop it with: omni integration slack stop")
+
+
+@slack.command("status")
+def slack_status() -> None:
+    """Show whether the background Slack daemon is running."""
+    record = _slack_daemon().running_record()
+    if record is None:
+        click.echo("Slack bot: not running.")
+        return
+    started = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(record.started_at))
+    click.echo(f"Slack bot: running (pid {record.pid}, since {started}).")
+    click.echo(f"Logs: {_display_path(Path(record.log_path))}")
+
+
+@slack.command("stop")
+def slack_stop() -> None:
+    """Stop the background Slack daemon."""
+    record = _slack_daemon().stop()
+    if record is None:
+        click.echo("Slack bot: not running.")
+        return
+    click.echo(f"Stopped the Omnigent Slack bot (pid {record.pid}).")
+
+
+@slack.command("logs")
+@click.option("-f", "--follow", is_flag=True, help="Follow the log (like tail -f).")
+def slack_logs(follow: bool) -> None:
+    """Print the background Slack daemon's log path (or tail it)."""
+    record = _slack_daemon().read_record()
+    if record is None:
+        click.echo("No Slack daemon has been started yet.")
+        return
+    log_path = Path(record.log_path)
+    if not follow:
+        click.echo(str(log_path))
+        return
+    if not log_path.exists():
+        raise click.ClickException(f"Log file not found: {log_path}")
+    # Delegate to `tail -f` for a portable follow without reimplementing it.
+    try:
+        subprocess.run(["tail", "-f", str(log_path)], check=False)
+    except FileNotFoundError as exc:
+        raise click.ClickException(
+            f"`tail` not available to follow the log. Log file: {log_path}"
+        ) from exc
 
 
 @cli.group("config", cls=_ConfigGroup)

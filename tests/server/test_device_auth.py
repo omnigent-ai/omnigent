@@ -27,6 +27,24 @@ from omnigent.server.device_grant_store import DeviceGrantStore, hash_secret
 _KEY = b"k" * 32
 
 
+# ── Router mount guard (unit) ─────────────────────────────────────
+
+
+@pytest.mark.parametrize("source", ["oidc", "header"])
+def test_router_factory_rejects_non_accounts_mode(source: str, tmp_path: Path) -> None:
+    """The device grant is accounts-mode only. OIDC delegates login to the IdP
+    (cli-ticket flow) and never uses these routes; header can't mint identity.
+    ``create_device_auth_router`` must refuse to build for either."""
+    from types import SimpleNamespace
+
+    from omnigent.server.routes.device_auth import create_device_auth_router
+
+    provider = SimpleNamespace(_source=source)
+    store = DeviceGrantStore(f"sqlite:///{tmp_path}/dg.db")
+    with pytest.raises(RuntimeError, match="accounts"):
+        create_device_auth_router(provider, store)  # type: ignore[arg-type]
+
+
 # ── Store invariants (unit) ───────────────────────────────────────
 
 
@@ -185,7 +203,9 @@ def test_revoke_is_fail_closed(store: DeviceGrantStore) -> None:
 # ── Route flow (integration) ──────────────────────────────────────
 
 
-def _build_accounts_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
+def _build_accounts_app(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, device_grant_enabled: bool = True
+) -> Iterator[TestClient]:
     monkeypatch.delenv("OMNIGENT_OIDC_ISSUER", raising=False)
     monkeypatch.setenv("OMNIGENT_AUTH_PROVIDER", "accounts")
     monkeypatch.setenv("OMNIGENT_ACCOUNTS_COOKIE_SECRET", secrets.token_hex(32))
@@ -194,6 +214,11 @@ def _build_accounts_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iter
     monkeypatch.setenv("OMNIGENT_ACCOUNTS_INIT_ADMIN_USERNAME", "admin")
     monkeypatch.setenv("OMNIGENT_ADMIN_CREDENTIALS_PATH", str(tmp_path / "admin-creds"))
     monkeypatch.setenv("OMNIGENT_ACCOUNTS_AUTO_OPEN", "0")
+    # Device grant is opt-in / default-off; the route tests need it mounted.
+    if device_grant_enabled:
+        monkeypatch.setenv("OMNIGENT_DEVICE_GRANT_ENABLED", "1")
+    else:
+        monkeypatch.delenv("OMNIGENT_DEVICE_GRANT_ENABLED", raising=False)
 
     db_url = f"sqlite:///{tmp_path}/test.db"
     from omnigent.db.utils import get_or_create_engine
@@ -379,6 +404,51 @@ def test_authorize_is_rate_limited(app: TestClient) -> None:
 
 
 _SECRET = "s3cr3t-device-client"
+
+
+@pytest.fixture
+def disabled_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
+    """An accounts-mode app with the device grant left at its default (off)."""
+    yield from _build_accounts_app(tmp_path, monkeypatch, device_grant_enabled=False)
+
+
+def test_device_grant_routes_absent_by_default(disabled_app: TestClient) -> None:
+    """Default-off: the /oauth/* router is not mounted unless explicitly
+    enabled, so the device-grant POST handlers don't run.
+
+    The endpoints fall through to the SPA catch-all mount at ``/`` rather than
+    404 (that mount only serves GET, so the client POSTs get 405). The point is
+    that NO device-grant logic executes: no device_code is issued and no OAuth
+    error shape is returned — the handlers simply aren't there.
+    """
+    r = disabled_app.post("/oauth/device/authorize", json={"client_id": "slack"})
+    assert r.status_code == 405
+    assert "device_code" not in r.text
+    r = disabled_app.post(
+        "/oauth/token", data={"grant_type": "refresh_token", "refresh_token": "x"}
+    )
+    assert r.status_code == 405
+    r = disabled_app.post("/oauth/revoke", data={"refresh_token": "x"})
+    assert r.status_code == 405
+
+
+def test_account_auth_available_when_device_grant_disabled(disabled_app: TestClient) -> None:
+    """Disabling the device grant must NOT take down account/OIDC ``/auth``
+    routes — only the ``/oauth/*`` device surface is gated.
+
+    The flag gates a separate router mount; the accounts ``/auth`` router is
+    wired independently, so login/logout/user management keep working.
+    """
+    # The accounts auth router is mounted: /auth/login authenticates the admin
+    # (the device grant being off doesn't affect it).
+    r = disabled_app.post("/auth/login", json={"username": "admin", "password": "admin-pw-12345"})
+    assert r.status_code == 200, r.text
+    # And an authenticated account-management route works.
+    r = disabled_app.get("/auth/users")
+    assert r.status_code == 200, r.text
+    # Sanity: the device-grant surface is still absent (no /oauth handler).
+    r = disabled_app.post("/oauth/device/authorize", json={"client_id": "slack"})
+    assert r.status_code == 405
 
 
 @pytest.fixture

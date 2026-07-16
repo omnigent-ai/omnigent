@@ -387,6 +387,17 @@ class SlackOmnigentService:
                     turn.slack_client, turn.key, host_unavailable_text(self._server_url)
                 )
                 return
+            except Exception as exc:
+                # Any other failure spinning up the session (e.g. a 500 from
+                # create_session/launch_runner surfaced as OmnigentError) must
+                # still clear the placeholder and report — otherwise the thread
+                # is stranded showing "Working on it…".
+                self._logger.exception(
+                    "Failed to start Omnigent session thread=%s", turn.key.display()
+                )
+                await self._clear_ack(turn.slack_client, turn.key, ack_ts)
+                await self._post_failure_reply(turn.slack_client, turn.key, str(exc))
+                return
             await self._store.upsert_session(
                 turn.key,
                 session_id,

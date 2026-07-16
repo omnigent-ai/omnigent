@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
@@ -22,7 +24,12 @@ _REQUIRED = {
 def _set_env(monkeypatch: pytest.MonkeyPatch, **overrides: str) -> None:
     # Clear anything a developer's real .env / shell might inject, then set a
     # clean baseline plus the test's overrides.
-    for key in (*_REQUIRED, "OMNIGENT_DEVICE_CLIENT_SECRET"):
+    for key in (
+        *_REQUIRED,
+        "OMNIGENT_DEVICE_CLIENT_SECRET",
+        "OMNIGENT_DATA_DIR",
+        "OMNIGENT_SLACK_DATABASE_PATH",
+    ):
         monkeypatch.delenv(key, raising=False)
     env = {**_REQUIRED, **overrides}
     for key, value in env.items():
@@ -55,3 +62,24 @@ def test_device_client_secret_optional_defaults_none(monkeypatch: pytest.MonkeyP
 def test_device_client_secret_read_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     _set_env(monkeypatch, OMNIGENT_DEVICE_CLIENT_SECRET="sekret")
     assert _load().device_client_secret == "sekret"
+
+
+def test_database_path_defaults_under_data_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # With OMNIGENT_DATA_DIR set, the store defaults under it (not the cwd).
+    _set_env(monkeypatch, OMNIGENT_DATA_DIR=str(tmp_path))
+    assert _load().database_path == tmp_path / "omnigent_slack.sqlite3"
+
+
+def test_database_path_defaults_under_home_when_no_data_dir(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Without OMNIGENT_DATA_DIR, it falls back to ~/.omnigent — never the cwd.
+    _set_env(monkeypatch)
+    assert _load().database_path == Path.home() / ".omnigent" / "omnigent_slack.sqlite3"
+
+
+def test_database_path_env_override_wins(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_env(monkeypatch, OMNIGENT_SLACK_DATABASE_PATH="/custom/bot.sqlite3")
+    assert _load().database_path == Path("/custom/bot.sqlite3")

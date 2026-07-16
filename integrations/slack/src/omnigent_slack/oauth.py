@@ -71,6 +71,16 @@ class AuthorizationExpiredError(OAuthError):
     """The login link expired before the user finished."""
 
 
+class DeviceGrantUnavailableError(OAuthError):
+    """The server has no device-grant endpoints mounted.
+
+    Raised when ``/oauth/device/authorize`` responds as if the route does not
+    exist (the server has ``OMNIGENT_DEVICE_GRANT_ENABLED`` off, so the request
+    falls through to the SPA catch-all → 404/405). Distinct from a transient
+    failure: retrying won't help — an operator must enable the device grant.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class TokenResult:
     """A token obtained from a completed login.
@@ -216,6 +226,14 @@ async def _start_device_login(
     )
     try:
         resp = await client.post("/oauth/device/authorize", json={"client_id": client_id})
+        # 404/405 here means the /oauth/* router isn't mounted (the server has
+        # OMNIGENT_DEVICE_GRANT_ENABLED off), so the request fell through to the
+        # SPA catch-all. That's not transient — surface it as its own error.
+        if resp.status_code in (404, 405):
+            await client.aclose()
+            raise DeviceGrantUnavailableError(
+                f"Device grant not enabled on {server_url} (HTTP {resp.status_code})."
+            )
         resp.raise_for_status()
     except httpx.HTTPError as exc:
         await client.aclose()

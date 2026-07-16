@@ -15,8 +15,11 @@
 > `omnigent/server/device_grant_store.py`, `SqlDeviceGrant` +
 > `device_grants` migration (`d1e2f3a4b5c6`), and scope + revocation
 > enforcement in `omnigent/server/auth.py` (`delegated_path_allowed`,
-> `set_grant_revocation_check`). Wired in `omnigent/server/app.py`
-> (oidc/accounts modes only).
+> `set_grant_revocation_check`). Wired in `omnigent/server/app.py`,
+> **opt-in and default-off** via `OMNIGENT_DEVICE_GRANT_ENABLED` (the
+> `/oauth/*` routes are unmounted unless it is truthy), and then only in
+> **accounts** mode (OIDC delegates login to the IdP via the cli-ticket
+> flow and never mounts these routes).
 > Slack: `integrations/slack/src/omnigent_slack/oauth.py`,
 > `tokens.py` (Fernet-encrypted `oauth_tokens`), `auth_manager.py`, plus
 > the bearer/refresh wiring in `omnigent.py` (`ClientAuth`,
@@ -98,9 +101,10 @@ RFC 8628 primitives are absent (no `device_code` / `user_code` /
 - **Bearer validation** — `UnifiedAuthProvider._check_cookie` already accepts
   `Authorization: Bearer <jwt>` and validates the same claim shape
   (`auth.py:477`). Delegated access tokens validate through this path unchanged.
-- **Browser consent under the cookie providers** — the `oidc` / `accounts`
-  provider already establishes the browser identity; the consent page runs
-  behind it. (Header mode is excluded — see the mount restriction below.)
+- **Browser consent under accounts mode** — the `accounts` provider already
+  establishes the browser identity via its session cookie; the consent page
+  runs behind it. (This is why the grant mounts in accounts mode only — see
+  the mount restriction below.)
 - **Open-redirect hardening** — `_sanitize_return_to` (`routes/auth.py:150`) is
   reused for the post-login bounce back to the consent page.
 
@@ -150,7 +154,7 @@ RFC 8628 primitives are absent (no `device_code` / `user_code` /
        pair; only the user_code (in verification_uri_complete) does.
 
  4. User clicks → Omnigent consent page (verification_uri).
-       Browser authenticates via the server's provider (oidc/accounts).
+       Browser authenticates via the server's accounts provider.
        Page shows: "<client_id> is requesting permission to act as YOU
        (alice@example.com) on this Omnigent server.  [Approve] [Deny]"
        plus a warning to approve only a login the user personally started.
@@ -186,11 +190,16 @@ approved it.
 
 ### Router `omnigent/server/routes/device_auth.py`
 
-Mounted in `app.py` **only in `oidc` / `accounts` modes** (header mode has
-no server-mintable identity — see `create_device_auth_router`, which raises
-if constructed for any other source). This router also **owns**
-`mint_delegated_token` and `DELEGATED_SCOPE` (moved here from `oidc.py`, which
-retains only `mint_session_token` / `mint_session_cookie`).
+Mounted in `app.py` only when **`OMNIGENT_DEVICE_GRANT_ENABLED` is truthy**
+(opt-in, **default-off** — the `/oauth/*` routes are absent otherwise), and
+then **only in `accounts` mode** (OIDC delegates login to the IdP via the
+cli-ticket flow and never mounts these routes; header mode has no
+server-mintable identity — see `create_device_auth_router`, which raises if
+constructed for any other source). The `device_grants` table is created
+unconditionally by the migration regardless of the flag; only the router
+mount is gated. This router also **owns** `mint_delegated_token` and
+`DELEGATED_SCOPE` (moved here from `oidc.py`, which retains only
+`mint_session_token` / `mint_session_cookie`).
 
 - `POST /oauth/device/authorize` — **public** (rate-limited). Generates a
   high-entropy `device_code` (`secrets.token_urlsafe`, stored **hashed**), a
