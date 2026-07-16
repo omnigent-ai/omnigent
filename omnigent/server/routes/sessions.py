@@ -3913,7 +3913,11 @@ def _handle_external_session_todos(
     body: SessionEventInput,
 ) -> None:
     """
-    Cache and broadcast a todo-list update from the claude-native forwarder.
+    Cache and broadcast a todo-list update from a native forwarder.
+
+    Sent by the claude-native forwarder (from ``TodoWrite``) and the
+    codex-native forwarder (from Codex plan updates); the panel is
+    harness-agnostic.
 
     Updates the in-memory ``_session_todos_cache`` so subsequent
     ``GET /v1/sessions/{id}`` snapshot calls can populate the ``todos``

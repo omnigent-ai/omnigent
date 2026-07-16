@@ -152,6 +152,9 @@ _CODEX_APPLY_PATCH_APPROVAL_METHOD = "applyPatchApproval"
 _CODEX_SERVER_REQUEST_RESOLVED_METHOD = "serverRequest/resolved"
 _EXTERNAL_SESSION_INTERRUPTED_TYPE = "external_session_interrupted"
 _EXTERNAL_ELICITATION_RESOLVED_TYPE = "external_elicitation_resolved"
+# Sessions event carrying a Codex plan mapped to the todo-list schema so the
+# web TodoPanel renders it like Claude's TodoWrite output.
+_EXTERNAL_SESSION_TODOS_TYPE = "external_session_todos"
 # Codex AgentControl collab-agent spawn event fields.
 _CODEX_COLLAB_AGENT_ITEM_TYPE = "collabAgentToolCall"
 _CODEX_COLLAB_SPAWN_TOOL = "spawnAgent"
@@ -3009,18 +3012,26 @@ async def _handle_turn_plan_updated(
     params: dict[str, Any],
 ) -> None:
     """
-    Mirror a Codex plan update as a visible assistant message.
+    Mirror a Codex plan update in both the transcript and the todo panel.
 
     Codex emits plan changes as app-server notifications rather than
-    ordinary assistant text. Omnigent web currently renders persisted message
-    items, not a dedicated plan item type, so the native bridge converts
-    the structured plan into a compact assistant message.
+    ordinary assistant text. The forwarder posts the structured plan as an
+    ``external_session_todos`` event so the web ``TodoPanel`` renders it like
+    Claude's todo list, and also mirrors it as a compact assistant message so
+    the plan stays visible inline in the transcript.
 
     :param client: HTTP client for Omnigent event posts.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
     :param params: Codex ``turn/plan/updated`` params.
     :returns: None.
     """
+    todos = _plan_todos_from_update(params)
+    if todos is not None:
+        await _post_external_session_todos(
+            client,
+            session_id=session_id,
+            todos=todos,
+        )
     text = _plan_text_from_update(params)
     if not text:
         return
@@ -5571,6 +5582,35 @@ async def _post_external_elicitation_resolved(
     return response is not None and response.status_code < 400
 
 
+async def _post_external_session_todos(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    todos: list[dict[str, Any]],
+) -> None:
+    """
+    Post one ``external_session_todos`` event to the Sessions API.
+
+    Drives the web ``TodoPanel`` from a Codex plan update. The server caches
+    the list and broadcasts a ``session.todos`` SSE event, so the panel
+    replaces its contents with the full current plan.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param todos: Plan mapped to todo items, e.g.
+        ``[{"content": "Inspect", "status": "in_progress",
+        "activeForm": "Inspect"}]``.
+    :returns: None.
+    """
+    response = await _post_session_event(
+        client,
+        session_id,
+        event_type=_EXTERNAL_SESSION_TODOS_TYPE,
+        data={"todos": todos},
+    )
+    _log_failed_session_event_post(_EXTERNAL_SESSION_TODOS_TYPE, response)
+
+
 async def _post_output_text_delta(
     client: httpx.AsyncClient,
     session_id: str,
@@ -6720,6 +6760,52 @@ def _plan_text_from_update(params: dict[str, Any]) -> str | None:
     return "\n".join(lines)
 
 
+def _plan_todos_from_update(params: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """
+    Map a Codex ``turn/plan/updated`` payload to the todo-list schema.
+
+    Produces items shaped like Claude's ``TodoWrite`` output so the web
+    ``TodoPanel`` can render Codex plans through the same pipeline. Codex
+    steps have no gerund ``activeForm``, so the step text is reused there.
+
+    :param params: Codex plan update params.
+    :returns: List of ``{"content", "status", "activeForm"}`` items, or
+        ``None`` when no valid plan steps are present.
+    """
+    plan = params.get("plan")
+    if not isinstance(plan, list) or not plan:
+        return None
+    todos: list[dict[str, Any]] = []
+    for entry in plan:
+        if not isinstance(entry, dict):
+            continue
+        step = entry.get("step")
+        if not isinstance(step, str) or not step:
+            continue
+        todos.append(
+            {
+                "content": step,
+                "status": _plan_todo_status(entry.get("status")),
+                "activeForm": step,
+            }
+        )
+    return todos or None
+
+
+def _plan_todo_status(status: Any) -> str:
+    """
+    Normalize a Codex plan step status to the todo-list vocabulary.
+
+    :param status: Codex step status value.
+    :returns: One of ``"pending"``, ``"in_progress"``, ``"completed"``.
+    """
+    if status == "completed":
+        return "completed"
+    if status in {"inProgress", "in_progress"}:
+        return "in_progress"
+    return "pending"
+
+
 def _plan_status_marker(status: Any) -> str:
     """
     Return a readable Markdown marker for a Codex plan step status.
@@ -6727,11 +6813,11 @@ def _plan_status_marker(status: Any) -> str:
     :param status: Codex step status value.
     :returns: Markdown list marker.
     """
-    if status == "completed":
-        return "- [x]"
-    if status in {"inProgress", "in_progress"}:
-        return "- [~]"
-    return "- [ ]"
+    return {
+        "completed": "- [x]",
+        "in_progress": "- [~]",
+        "pending": "- [ ]",
+    }[_plan_todo_status(status)]
 
 
 def _response_id(params: dict[str, Any]) -> str:

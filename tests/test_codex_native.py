@@ -5261,9 +5261,29 @@ def test_forwarder_posts_codex_turn_plan_update(tmp_path: Path) -> None:
 
     asyncio.run(run())
 
-    assert len(posted) == 1
-    assert posted[0]["type"] == "external_conversation_item"
-    data = posted[0]["data"]
+    # The plan is mirrored to the todo panel and inline in the transcript.
+    assert len(posted) == 2
+    todos_post = next(p for p in posted if p["type"] == "external_session_todos")
+    assert todos_post["data"]["todos"] == [
+        {
+            "content": "Inspect Codex plan events",
+            "status": "completed",
+            "activeForm": "Inspect Codex plan events",
+        },
+        {
+            "content": "Mirror plans to web",
+            "status": "in_progress",
+            "activeForm": "Mirror plans to web",
+        },
+        {
+            "content": "Run checks",
+            "status": "pending",
+            "activeForm": "Run checks",
+        },
+    ]
+
+    message_post = next(p for p in posted if p["type"] == "external_conversation_item")
+    data = message_post["data"]
     assert data["item_type"] == "message"
     assert data["response_id"] == "codex_turn_123"
     assert data["item_data"] == {
@@ -5281,6 +5301,57 @@ def test_forwarder_posts_codex_turn_plan_update(tmp_path: Path) -> None:
             }
         ],
     }
+
+
+def test_plan_todos_from_update_maps_steps_and_statuses() -> None:
+    """
+    ``_plan_todos_from_update`` maps Codex plan steps to the todo schema.
+
+    Each step becomes ``{"content", "status", "activeForm"}`` with the
+    status vocabulary normalized (``inProgress`` -> ``in_progress``) and the
+    step text reused for ``activeForm`` since Codex has no gerund form.
+    """
+    todos = codex_native_forwarder._plan_todos_from_update(
+        {
+            "plan": [
+                {"step": "Inspect", "status": "completed"},
+                {"step": "Mirror", "status": "inProgress"},
+                {"step": "Verify", "status": "in_progress"},
+                {"step": "Ship", "status": "pending"},
+                {"step": "Unknown", "status": "weird"},
+            ]
+        }
+    )
+
+    assert todos == [
+        {"content": "Inspect", "status": "completed", "activeForm": "Inspect"},
+        {"content": "Mirror", "status": "in_progress", "activeForm": "Mirror"},
+        {"content": "Verify", "status": "in_progress", "activeForm": "Verify"},
+        {"content": "Ship", "status": "pending", "activeForm": "Ship"},
+        {"content": "Unknown", "status": "pending", "activeForm": "Unknown"},
+    ]
+
+
+def test_plan_todos_from_update_skips_malformed_and_empty() -> None:
+    """
+    ``_plan_todos_from_update`` drops malformed steps and empty plans.
+
+    Non-dict entries and steps without a usable ``step`` string are
+    skipped; a plan that is missing, not a list, or yields no valid
+    items returns ``None`` so the caller posts nothing.
+    """
+    assert codex_native_forwarder._plan_todos_from_update({}) is None
+    assert codex_native_forwarder._plan_todos_from_update({"plan": []}) is None
+    assert codex_native_forwarder._plan_todos_from_update({"plan": "nope"}) is None
+    assert (
+        codex_native_forwarder._plan_todos_from_update(
+            {"plan": ["bad", {"step": ""}, {"status": "pending"}]}
+        )
+        is None
+    )
+    assert codex_native_forwarder._plan_todos_from_update(
+        {"plan": ["bad", {"step": "Keep me", "status": "pending"}]}
+    ) == [{"content": "Keep me", "status": "pending", "activeForm": "Keep me"}]
 
 
 def test_forwarder_posts_completed_codex_plan_item() -> None:
