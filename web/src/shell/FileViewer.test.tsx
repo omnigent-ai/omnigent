@@ -279,7 +279,71 @@ function installContentWidth(width: number): void {
   } as DOMRect);
 }
 
+/**
+ * Simulate the iOS native shell and its live visual viewport. The keyboard
+ * "opens" by shrinking the visual viewport below the layout viewport
+ * (window.innerHeight); useIOSNativeKeyboardInset reads the delta. Pass
+ * visibleHeight === layoutHeight to model a closed keyboard (inset 0).
+ */
+function setIOSViewport(layoutHeight: number, visibleHeight: number): void {
+  (window as unknown as Record<string, unknown>).omnigentNative = { kind: "ios" };
+  vi.stubGlobal("innerHeight", layoutHeight);
+  vi.stubGlobal("visualViewport", {
+    offsetTop: 0,
+    height: visibleHeight,
+    addEventListener: vi.fn(),
+    removeEventListener: vi.fn(),
+  });
+}
+
+function clearIOSViewport(): void {
+  delete (window as unknown as Record<string, unknown>).omnigentNative;
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+// The mobile viewer is a `fixed inset-0` overlay that the iOS shell-lock (which
+// only resizes flow content inside .app-shell) can't lift above the soft
+// keyboard. It pads its own bottom by the keyboard inset so the comments panel
+// and its auto-focused textarea stay visible instead of hiding behind the
+// keyboard.
+describe("FileViewer mobile keyboard inset", () => {
+  afterEach(() => {
+    clearIOSViewport();
+  });
+
+  it("pads the overlay bottom by the keyboard inset when the iOS keyboard is open", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    setIOSViewport(800, 500); // keyboard covers 300px of the 800px layout
+    renderViewer({ open: true });
+
+    expect(screen.getByTestId("file-viewer")).toHaveStyle({ paddingBottom: "300px" });
+  });
+
+  it("applies no bottom padding when the keyboard is closed", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    setIOSViewport(800, 800); // visible viewport fills the layout — no keyboard
+    renderViewer({ open: true });
+
+    expect(screen.getByTestId("file-viewer").style.paddingBottom).toBe("");
+  });
+
+  it("applies no bottom padding off the iOS shell even when the viewport shrinks", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    // A shrunk visual viewport but no iOS shell marker: the browser/Electron
+    // keyboard is handled by normal layout, so the overlay must not pad itself.
+    vi.stubGlobal("innerHeight", 800);
+    vi.stubGlobal("visualViewport", {
+      offsetTop: 0,
+      height: 500,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    });
+    renderViewer({ open: true });
+
+    expect(screen.getByTestId("file-viewer").style.paddingBottom).toBe("");
+  });
+});
 
 describe("FileViewer comments panel open/close semantics", () => {
   it("keeps the panel closed on fresh open even when the file has comments", () => {
