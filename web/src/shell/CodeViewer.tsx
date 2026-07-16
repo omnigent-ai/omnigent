@@ -582,7 +582,13 @@ export function CodeViewer({
           </div>
         }
       >
-        <PdfViewer data={fileQuery.data} />
+        <PdfViewer
+          data={fileQuery.data}
+          conversationId={conversationId}
+          comments={comments}
+          activeSelection={activeSelection}
+          onSetActiveSelection={onSetActiveSelection}
+        />
       </Suspense>
     );
   }

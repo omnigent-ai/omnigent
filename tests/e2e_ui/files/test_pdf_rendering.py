@@ -6,8 +6,8 @@ A file the server classifies as ``application/pdf`` (via
 "Preview not available for binary files." placeholder.
 
 The new toolbar behaviour is also asserted here (it is user-facing and specific
-to PDFs): the diff (Δ) and comments buttons are hidden because a rendered PDF
-has no text surface to diff against or anchor comments to, and the zoom
+to PDFs): the diff (Δ) button is hidden because a rendered PDF has no text
+surface to diff against. Comments are supported via the pdf.js text layer.
 percentage doubles as the reset control.
 
 The fixture seeds a minimal but valid PDF. It is pure ASCII, so it round-trips
@@ -113,11 +113,11 @@ def test_pdf_file_renders_inline(
     expect(file_viewer.get_by_text(re.compile(r"^\d+ pages?$"))).to_be_visible()
 
 
-def test_pdf_toolbar_hides_diff_and_comments(
+def test_pdf_toolbar_hides_diff_but_shows_comments(
     page: Page,
     seeded_pdf_session: tuple[str, str, str],
 ) -> None:
-    """The diff and comments toggles are hidden for PDFs (no text surface)."""
+    """The diff toggle is hidden for PDFs; comments are available."""
     base_url, session_id, _file_path = seeded_pdf_session
     page.goto(f"{base_url}/c/{session_id}?view=explore")
 
@@ -130,10 +130,9 @@ def test_pdf_toolbar_hides_diff_and_comments(
     # Wait until the PDF has actually rendered so the toolbar is in its final state.
     expect(file_viewer.locator("canvas").first).to_be_visible(timeout=30_000)
 
-    # PDFs render through PdfViewer, which has no text/selection surface — so the
-    # diff (Δ) and comments toggles are suppressed. (Both appear for text files.)
+    # PDFs render through PdfViewer — no diff surface, but comments are supported.
     expect(file_viewer.get_by_role("button", name="Show diff")).to_have_count(0)
-    expect(file_viewer.get_by_role("button", name="Show comments")).to_have_count(0)
+    expect(file_viewer.get_by_role("button", name="Show comments")).to_be_visible()
 
 
 def test_pdf_zoom_percentage_resets(
