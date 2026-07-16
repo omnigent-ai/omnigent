@@ -613,6 +613,14 @@ export interface ChatState {
   ) => Promise<void>;
   stop: () => void;
   switchTo: (conversationId: string | null) => Promise<void>;
+  /**
+   * Re-run a stalled hydration for `conversationId`. `switchTo` alone
+   * cannot recover from a hung snapshot fetch: `bindStream` hydrates
+   * through `queryClient.fetchQuery(["session", id])`, and react-query
+   * joins the still-pending first fetch instead of issuing a new one.
+   * Cancels that query, detaches, and binds the conversation again.
+   */
+  retryHydration: (conversationId: string) => Promise<void>;
   submitApproval: (
     elicitationId: string,
     action: "accept" | "decline" | "cancel",
@@ -1533,6 +1541,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
         queryKey: childSessionsQueryKey(snapshot.parentSessionId),
       });
     }
+  },
+
+  retryHydration: async (conversationId) => {
+    // Drop the stuck in-flight snapshot query so the re-bind below
+    // issues a fresh request instead of joining the hung one.
+    await queryClient?.cancelQueries({ queryKey: ["session", conversationId] });
+    await get().switchTo(null);
+    await get().switchTo(conversationId);
   },
 
   switchTo: async (conversationId) => {

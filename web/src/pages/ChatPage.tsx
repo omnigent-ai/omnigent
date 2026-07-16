@@ -964,11 +964,7 @@ export function ChatPage() {
       return (
         <HydratingPlaceholder
           onRetry={() => {
-            // Re-run hydration through switchTo: detach from the stuck
-            // session (same-id guard would otherwise no-op), then bind
-            // the URL conversation again.
-            const store = useChatStore.getState();
-            void store.switchTo(null).then(() => store.switchTo(urlConvId));
+            void useChatStore.getState().retryHydration(urlConvId);
           }}
         />
       );

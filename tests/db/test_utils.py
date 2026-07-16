@@ -171,32 +171,32 @@ def test_sqlite_engine_checkpoints_wal_and_collects_stats(
     wal_path = tmp_path / "tuned.db-wal"
 
     # Seed a database with enough indexed rows that ANALYZE has
-    # something to record, leaving a non-empty WAL behind.
-    seed = create_engine(
-        f"sqlite:///{db_path}",
-        connect_args={"check_same_thread": False},
+    # something to record, leaving a non-empty WAL behind. Raw sqlite3
+    # in autocommit mode rather than a SQLAlchemy engine: the
+    # journal-mode PRAGMA must run outside any transaction, and the
+    # DBAPI's implicit BEGIN handling varies across SQLite builds
+    # enough to silently leave the database in rollback-journal mode
+    # (no -wal file at all).
+    import sqlite3
+
+    seed = sqlite3.connect(db_path, isolation_level=None)
+    assert seed.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    seed.execute("CREATE TABLE items (conversation_id INTEGER, body TEXT)")
+    seed.execute("CREATE INDEX ix_items_conversation_id ON items (conversation_id)")
+    seed.execute(
+        "WITH RECURSIVE seq(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM seq WHERE i < 500) "
+        "INSERT INTO items SELECT i, printf('%.100c', 'x') FROM seq"
     )
-    with seed.connect() as conn:
-        conn.exec_driver_sql("PRAGMA journal_mode=WAL")
-        conn.exec_driver_sql("CREATE TABLE items (conversation_id INTEGER, body TEXT)")
-        conn.exec_driver_sql("CREATE INDEX ix_items_conversation_id ON items (conversation_id)")
-        conn.exec_driver_sql(
-            "WITH RECURSIVE seq(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM seq WHERE i < 500) "
-            "INSERT INTO items SELECT i, printf('%.100c', 'x') FROM seq"
-        )
-        conn.commit()
     # SQLite checkpoints and deletes the WAL when the LAST connection
     # closes, which would leave nothing for the engine-creation
     # checkpoint to do. Hold a second, idle connection open across the
-    # dispose - like the other processes (runner, REPL) that share a
+    # close - like the other processes (runner, REPL) that share a
     # real chat.db - so the WAL survives. An idle connection holds no
     # read mark, so it does not block wal_checkpoint(TRUNCATE) either.
-    import sqlite3
-
     holder = sqlite3.connect(db_path)
     holder.execute("SELECT 1").fetchone()
     try:
-        seed.dispose()
+        seed.close()
         assert wal_path.stat().st_size > 0
 
         engine = get_or_create_engine(f"sqlite:///{db_path}")
