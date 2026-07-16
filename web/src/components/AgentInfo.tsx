@@ -1311,18 +1311,74 @@ export function AgentInfoContent({ agent, sessionId }: AgentInfoProps) {
 }
 
 /**
+ * Delay before a hover-opened popover closes once the pointer leaves both the
+ * icon and the panel. Long enough to cross the small gap between them without
+ * the panel flickering shut; re-entering either side cancels the pending close.
+ */
+export const HOVER_CLOSE_DELAY_MS = 150;
+
+/**
  * Header info icon revealing the active agent's tools & policies.
  *
- * Desktop-only: on mobile (`< md`) the same content is reached via the
- * header's three-dot menu, which opens {@link AgentInfoContent} in a
+ * Opens on hover over the (i) icon and stays open while the pointer is on the
+ * icon or the panel (a short close delay bridges the gap between them). Click
+ * and keyboard still toggle it, so touch devices and keyboard users are
+ * unaffected. Desktop-only: on mobile (`< md`) the same content is reached via
+ * the header's three-dot menu, which opens {@link AgentInfoContent} in a
  * dialog. Self-hides when the agent has neither tools nor policies.
  */
 export function AgentInfoButton({ agent, sessionId }: AgentInfoProps) {
+  const [open, setOpen] = useState(false);
+  // Tracks whether the current open came from hover, so we can suppress Radix's
+  // focus move into the panel on hover-open (which would steal focus and could
+  // scroll the page) while keeping it for click / keyboard access.
+  const openedByHoverRef = useRef(false);
+  const closeTimeoutRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (closeTimeoutRef.current !== null) window.clearTimeout(closeTimeoutRef.current);
+    };
+  }, []);
+
   if (!agentHasInfo(agent, sessionId)) return null;
 
+  function cancelClose() {
+    if (closeTimeoutRef.current !== null) {
+      window.clearTimeout(closeTimeoutRef.current);
+      closeTimeoutRef.current = null;
+    }
+  }
+
+  function openOnHover() {
+    cancelClose();
+    openedByHoverRef.current = true;
+    setOpen(true);
+  }
+
+  function scheduleClose() {
+    cancelClose();
+    closeTimeoutRef.current = window.setTimeout(() => {
+      closeTimeoutRef.current = null;
+      openedByHoverRef.current = false;
+      setOpen(false);
+    }, HOVER_CLOSE_DELAY_MS);
+  }
+
   return (
-    <Popover>
-      <Tooltip>
+    <Popover
+      open={open}
+      onOpenChange={(next) => {
+        // Click / keyboard / outside-dismiss path: honor Radix immediately and
+        // drop the hover flag so focus behaves normally.
+        cancelClose();
+        if (!next) openedByHoverRef.current = false;
+        setOpen(next);
+      }}
+    >
+      {/* Suppress the tooltip while the panel is open — the panel already names
+          the agent, so showing both on the same hover is redundant noise. */}
+      <Tooltip open={open ? false : undefined}>
         <TooltipTrigger asChild>
           <PopoverTrigger asChild>
             <Button
@@ -1332,6 +1388,11 @@ export function AgentInfoButton({ agent, sessionId }: AgentInfoProps) {
               aria-label="Agent tools and policies"
               data-testid="agent-info-trigger"
               className="hidden text-muted-foreground hover:text-foreground md:inline-flex"
+              onMouseEnter={openOnHover}
+              onMouseLeave={scheduleClose}
+              onFocus={() => {
+                openedByHoverRef.current = false;
+              }}
             >
               <InfoIcon className="size-4" />
             </Button>
@@ -1339,7 +1400,16 @@ export function AgentInfoButton({ agent, sessionId }: AgentInfoProps) {
         </TooltipTrigger>
         <TooltipContent>Agent tools &amp; policies</TooltipContent>
       </Tooltip>
-      <PopoverContent align="end" className="w-80">
+      <PopoverContent
+        align="end"
+        className="w-80"
+        data-testid="agent-info-panel"
+        onMouseEnter={cancelClose}
+        onMouseLeave={scheduleClose}
+        onOpenAutoFocus={(e) => {
+          if (openedByHoverRef.current) e.preventDefault();
+        }}
+      >
         <AgentInfoContent agent={agent} sessionId={sessionId} />
       </PopoverContent>
     </Popover>

@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Agent } from "@/hooks/useAgents";
@@ -76,7 +76,12 @@ vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useSessionHostVersion: () => versionEnv.hostVersion,
 }));
 
-import { AgentInfoButton, AgentInfoContent, agentDisplayLabel } from "./AgentInfo";
+import {
+  AgentInfoButton,
+  AgentInfoContent,
+  agentDisplayLabel,
+  HOVER_CLOSE_DELAY_MS,
+} from "./AgentInfo";
 
 afterEach(() => {
   cleanup();
@@ -177,6 +182,86 @@ describe("AgentInfoButton", () => {
     fireEvent.click(screen.getByTestId("agent-info-trigger"));
     expect(screen.getByText("Claude")).toBeInTheDocument();
     expect(screen.queryByText("claude-native-ui")).toBeNull();
+  });
+});
+
+describe("AgentInfoButton hover behavior", () => {
+  // The panel opens on hover over the (i) icon and stays open while the pointer
+  // is on the icon or the panel, closing after a short delay once it leaves
+  // both. Click continues to toggle it. Fake timers drive the close delay.
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    act(() => vi.runOnlyPendingTimers());
+    vi.useRealTimers();
+  });
+
+  it("opens the panel on hover over the (i) icon", () => {
+    renderButton(AGENT_WITH_BOTH);
+    // Closed on mount: nothing rendered yet.
+    expect(screen.queryByTestId("agent-info-panel")).toBeNull();
+
+    fireEvent.mouseEnter(screen.getByTestId("agent-info-trigger"));
+
+    // The panel is now open — the agent name proves the content mounted.
+    expect(screen.getByTestId("agent-info-panel")).toBeInTheDocument();
+    expect(screen.getByText("Databricks_coding_agent")).toBeInTheDocument();
+  });
+
+  it("stays open when the pointer moves from the icon onto the panel", () => {
+    renderButton(AGENT_WITH_BOTH);
+    const trigger = screen.getByTestId("agent-info-trigger");
+    fireEvent.mouseEnter(trigger);
+
+    // Leaving the icon schedules a close; entering the panel before the delay
+    // elapses must cancel it so the panel doesn't flicker shut mid-move.
+    fireEvent.mouseLeave(trigger);
+    fireEvent.mouseEnter(screen.getByTestId("agent-info-panel"));
+    act(() => vi.advanceTimersByTime(HOVER_CLOSE_DELAY_MS + 50));
+
+    expect(screen.getByTestId("agent-info-panel")).toBeInTheDocument();
+  });
+
+  it("closes after the delay once the pointer leaves both the icon and panel", () => {
+    renderButton(AGENT_WITH_BOTH);
+    const trigger = screen.getByTestId("agent-info-trigger");
+    fireEvent.mouseEnter(trigger);
+    const panel = screen.getByTestId("agent-info-panel");
+
+    fireEvent.mouseEnter(panel);
+    fireEvent.mouseLeave(panel);
+    // Still open right up to the delay boundary...
+    act(() => vi.advanceTimersByTime(HOVER_CLOSE_DELAY_MS - 1));
+    expect(screen.queryByTestId("agent-info-panel")).toBeInTheDocument();
+    // ...then closes once it elapses.
+    act(() => vi.advanceTimersByTime(2));
+    expect(screen.queryByTestId("agent-info-panel")).toBeNull();
+  });
+
+  it("re-entering the icon during the close delay keeps the panel open", () => {
+    renderButton(AGENT_WITH_BOTH);
+    const trigger = screen.getByTestId("agent-info-trigger");
+    fireEvent.mouseEnter(trigger);
+
+    fireEvent.mouseLeave(trigger);
+    fireEvent.mouseEnter(trigger);
+    act(() => vi.advanceTimersByTime(HOVER_CLOSE_DELAY_MS + 50));
+
+    expect(screen.getByTestId("agent-info-panel")).toBeInTheDocument();
+  });
+
+  it("still toggles open and closed on click", () => {
+    // Click/keyboard access must survive the hover wiring — touch devices and
+    // keyboard users rely on it since they never fire mouseenter.
+    renderButton(AGENT_WITH_BOTH);
+    const trigger = screen.getByTestId("agent-info-trigger");
+
+    fireEvent.click(trigger);
+    expect(screen.getByTestId("agent-info-panel")).toBeInTheDocument();
+
+    fireEvent.click(trigger);
+    expect(screen.queryByTestId("agent-info-panel")).toBeNull();
   });
 });
 
