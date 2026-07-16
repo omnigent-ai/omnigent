@@ -4786,3 +4786,130 @@ def test_list_conversations_owned_by_excludes_shared_sessions(
         ).data
     }
     assert ids == {mine.id}
+
+
+def test_live_state_columns_round_trip_without_bumping_updated_at(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """The live-state writes persist and never touch ``updated_at``.
+
+    ``updated_at`` drives sidebar ordering, so the tunnel replica's
+    per-tunnel liveness stamps and per-transition status/pending writes
+    must not reorder the list. Round-trips all three columns:
+    ``runner_last_seen`` (bulk by runner, cleared on disconnect),
+    ``live_status`` (enum round-trip), ``pending_elicitation_count``.
+    """
+    from omnigent.stores.conversation_store import runner_seen_is_fresh
+
+    conv_a = conversation_store.create_conversation(title="a")
+    conv_b = conversation_store.create_conversation(title="b")
+    other = conversation_store.create_conversation(title="other")
+    assert conversation_store.set_runner_id(conv_a.id, "runner_live")
+    assert conversation_store.set_runner_id(conv_b.id, "runner_live")
+    assert conversation_store.set_runner_id(other.id, "runner_other")
+    before = conversation_store.get_conversation(conv_a.id)
+    assert before is not None
+
+    # Bulk liveness stamp covers every session bound to the runner —
+    # and only those.
+    conversation_store.touch_runner_liveness(["runner_live"], now=1_000_000)
+    connectivity = conversation_store.get_session_connectivity([conv_a.id, conv_b.id, other.id])
+    assert connectivity[conv_a.id].runner_last_seen == 1_000_000
+    assert connectivity[conv_b.id].runner_last_seen == 1_000_000
+    assert connectivity[other.id].runner_last_seen is None
+
+    # Freshness derivation: inside the TTL reads live, past it stale.
+    assert runner_seen_is_fresh(1_000_000, now=1_000_089)
+    assert not runner_seen_is_fresh(1_000_000, now=1_000_091)
+    assert not runner_seen_is_fresh(None, now=1_000_000)
+
+    # Graceful disconnect clears the stamp immediately.
+    conversation_store.clear_runner_liveness("runner_live")
+    connectivity = conversation_store.get_session_connectivity([conv_a.id])
+    assert connectivity[conv_a.id].runner_last_seen is None
+
+    # Status + pending count round-trip through the entity.
+    conversation_store.set_session_live_status(conv_a.id, "running")
+    conversation_store.set_pending_elicitation_count(conv_a.id, 2)
+    updated = conversation_store.get_conversation(conv_a.id)
+    assert updated is not None
+    assert updated.live_status == "running"
+    assert updated.pending_elicitation_count == 2
+
+    # None of the live-state writes moved updated_at.
+    assert updated.updated_at == before.updated_at
+
+    # Empty runner list is a no-op (no query, no error).
+    conversation_store.touch_runner_liveness([], now=1)
+
+
+def test_live_state_writes_via_chokepoint_land_in_scoped_workspace(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Live-state writes reach the row under a NON-zero workspace scope.
+
+    Regression test for the cross-replica mirror silently no-oping on a
+    multi-tenant replica. The ``session_live_state`` chokepoint enqueues
+    each write on a background ``ThreadPoolExecutor``; the store filters
+    every write ``WHERE workspace_id == current_workspace_id()``. A bare
+    ``submit`` runs the worker at the default workspace (0), so on a
+    non-zero-workspace request every ``UPDATE`` matches no rows and
+    ``runner_last_seen`` / ``live_status`` / ``pending_elicitation_count``
+    are never persisted — even though the read path (``to_thread``) is
+    correctly scoped, so reads and writes disagree.
+
+    This drives the writes through the real chokepoint (executor +
+    ``copy_context``) inside ``workspace_scope(WS)`` and reads them back
+    under the same scope. On the pre-fix code the reads return ``None`` /
+    unchanged; with context propagation they observe the writes.
+    """
+    import time
+
+    from omnigent.db.db_models import workspace_scope
+    from omnigent.server import session_live_state
+
+    ws = 987654  # any non-default (non-zero) workspace
+    try:
+        with workspace_scope(ws):
+            conv = conversation_store.create_conversation(title="scoped")
+            assert conversation_store.set_runner_id(conv.id, "runner_scoped")
+
+            session_live_state.configure(conversation_store)
+            session_live_state.touch_runner_liveness(["runner_scoped"])
+            session_live_state.persist_live_status(conv.id, "running")
+            session_live_state.persist_pending_count(conv.id, 3)
+
+            # All three writes land on the chokepoint's ordered single-worker
+            # executor, so poll the row (under the SAME scope) until ALL of
+            # them are observed — not just the first. Waiting only on
+            # ``runner_last_seen`` (the first enqueued) races the later two:
+            # on a loaded runner the read can beat the ``live_status`` /
+            # ``pending`` writes still queued behind it. On the buggy path the
+            # writes land at workspace 0, so these stay None at workspace
+            # ``ws`` and the wait times out into the assertions below.
+            def _all_persisted() -> bool:
+                conn = conversation_store.get_session_connectivity([conv.id]).get(conv.id)
+                row = conversation_store.get_conversation(conv.id)
+                return (
+                    conn is not None
+                    and conn.runner_last_seen is not None
+                    and row is not None
+                    and row.live_status == "running"
+                    and row.pending_elicitation_count == 3
+                )
+
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline and not _all_persisted():
+                time.sleep(0.02)
+
+            connectivity = conversation_store.get_session_connectivity([conv.id])
+            assert connectivity[conv.id].runner_last_seen is not None, (
+                "runner_last_seen not persisted under non-zero workspace — "
+                "write ran at the default workspace (context not propagated)"
+            )
+            updated = conversation_store.get_conversation(conv.id)
+            assert updated is not None
+            assert updated.live_status == "running"
+            assert updated.pending_elicitation_count == 3
+    finally:
+        session_live_state.configure(None)

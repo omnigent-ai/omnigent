@@ -261,13 +261,11 @@ function ModelUsageBreakdown({ usageByModel }: { usageByModel: Record<string, Mo
 function AddPolicyDialog({
   sessionId,
   registry,
-  appliedHandlers,
   open,
   onOpenChange,
 }: {
   sessionId: string;
   registry: PolicyRegistryEntry[];
-  appliedHandlers: Set<string>;
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
@@ -389,15 +387,14 @@ function AddPolicyDialog({
         <div className="min-w-0 space-y-3 pt-1">
           {!selected &&
             (() => {
-              const available = registry.filter((r) => !appliedHandlers.has(r.handler));
               const lowerFilter = filter.toLowerCase();
               const filtered = lowerFilter
-                ? available.filter(
+                ? registry.filter(
                     (r) =>
                       r.name.toLowerCase().includes(lowerFilter) ||
                       r.description?.toLowerCase().includes(lowerFilter),
                   )
-                : available;
+                : registry;
               return (
                 <>
                   <input
@@ -427,9 +424,7 @@ function AddPolicyDialog({
                     ))}
                     {filtered.length === 0 && (
                       <p className="py-2 text-center text-xs text-muted-foreground">
-                        {available.length === 0
-                          ? "All available policies are already applied."
-                          : "No policies match your filter."}
+                        No policies match your filter.
                       </p>
                     )}
                   </div>
@@ -1067,9 +1062,6 @@ function SessionPoliciesSection({ sessionId }: { sessionId: string }) {
 
   const userPolicies = sessionPolicies.filter((p) => p.source === "session");
   const registryByHandler = new Map(registry.map((r) => [r.handler, r]));
-  const appliedHandlers = new Set(
-    sessionPolicies.map((p) => p.handler).filter((h): h is string => h != null),
-  );
 
   return (
     <div className="flex flex-col gap-1.5 py-3">
@@ -1136,7 +1128,6 @@ function SessionPoliciesSection({ sessionId }: { sessionId: string }) {
       <AddPolicyDialog
         sessionId={sessionId}
         registry={registry}
-        appliedHandlers={appliedHandlers}
         open={addOpen}
         onOpenChange={setAddOpen}
       />

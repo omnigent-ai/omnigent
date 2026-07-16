@@ -6,6 +6,7 @@ import mimetypes
 import os
 import re
 import tarfile
+import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
@@ -41,12 +42,14 @@ from omnigent.harness_plugins import (
 from omnigent.resources import examples as _examples_resources
 from omnigent.runtime import (
     get_terminal_registry,
+    pending_elicitations,
     set_harness_process_manager,
     set_runner_router,
     set_runner_ws_factory,
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
+from omnigent.server import session_live_state
 from omnigent.server.auth import AuthProvider, SharingMode
 from omnigent.server.managed_hosts import ManagedSandboxConfig
 from omnigent.server.mcp_pool import ServerMcpPool
@@ -70,11 +73,13 @@ from omnigent.server.routes.session_mcp_servers import create_session_mcp_server
 from omnigent.server.routes.session_policies import create_session_policies_router
 from omnigent.server.routes.sessions import (
     SessionLiveness,
+    announce_hosts_changed,
     create_sessions_router,
     set_server_runner_router,
 )
 from omnigent.server.routes.sharing import create_sharing_router
 from omnigent.server.routes.terminal_attach import create_terminal_attach_router
+from omnigent.server.scheduled import ScheduledTaskScheduler
 from omnigent.server.ws_origin import WebSocketOriginMiddleware
 from omnigent.stores import (
     AgentStore,
@@ -83,10 +88,11 @@ from omnigent.stores import (
     FileStore,
 )
 from omnigent.stores.comment_store import CommentStore
-from omnigent.stores.conversation_store import SessionConnectivity
+from omnigent.stores.conversation_store import SessionConnectivity, runner_seen_is_fresh
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.policy_store import PolicyStore
+from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 
 _logger = logging.getLogger(__name__)
 
@@ -1065,6 +1071,18 @@ def _ensure_default_polly_agent(
     )
 
 
+async def _placeholder_on_fire(scheduled_task_id: str) -> None:
+    """Default scheduler fire callback (no-op placeholder that logs).
+
+    Exercises the ``on_fire`` seam without side effects: the real fire path
+    (creating an agent session for the task) supplies its own callback.
+    """
+    _logger.info(
+        "scheduler: task %s is due (no fire path wired yet — skipping)",
+        scheduled_task_id,
+    )
+
+
 def create_app(
     agent_store: AgentStore,
     file_store: FileStore,
@@ -1075,6 +1093,7 @@ def create_app(
     comment_store: CommentStore | None = None,
     policy_store: PolicyStore | None = None,
     permission_store: PermissionStore | None = None,
+    scheduled_task_store: ScheduledTaskStore | None = None,
     auth_provider: AuthProvider | None = None,
     host_store: HostStore | None = None,
     account_store: Any | None = None,  # SqlAlchemyAccountStore — accounts mode only
@@ -1114,6 +1133,11 @@ def create_app(
         CRUD endpoints.
     :param permission_store: Store for session-level access grants.
         ``None`` disables permission checks (all access allowed).
+    :param scheduled_task_store: Store backing the recurring-task
+        scheduler. When provided, the FastAPI lifespan
+        starts an :class:`ScheduledTaskScheduler` that arms a timer per
+        active task and fires the injected ``on_fire`` callback on
+        schedule. ``None`` disables the scheduler entirely.
     :param auth_provider: Pre-constructed auth provider for
         identity resolution. ``None`` disables auth (anonymous
         access). **Required** when ``permission_store`` is
@@ -1358,9 +1382,40 @@ def create_app(
                 otel_publisher=server_metrics_otel,
             )
         )
+        # Runner ``runner_last_seen`` is refreshed per-tunnel from each
+        # runner tunnel's ping loop (``runner_tunnel._ping_loop``), inside
+        # that handler's ``workspace_scope`` — not from a lifespan sweep,
+        # which would run context-free (default workspace) over a
+        # workspace-blind registry and never stamp a multi-tenant row.
+
+        # Recurring-task scheduler: arm a timer per active
+        # scheduled task and fire the injected ``on_fire`` callback on
+        # schedule. The default callback is a no-op that logs; a real fire
+        # path (creating a session) can be injected in its place.
+        scheduled_task_scheduler: ScheduledTaskScheduler | None = None
+        if scheduled_task_store is not None:
+            scheduled_task_scheduler = ScheduledTaskScheduler(
+                store=scheduled_task_store,
+                on_fire=_placeholder_on_fire,
+            )
+            app_inst.state.scheduled_task_scheduler = scheduled_task_scheduler
+            # Scheduled tasks are a non-critical subsystem: a failure loading the
+            # schedule (e.g. a DB error in list_active()) must not take down
+            # server boot. Log and continue with the scheduler unstarted.
+            try:
+                await scheduled_task_scheduler.start()
+            except Exception as exc:
+                _logger.exception(
+                    "scheduled task scheduler failed to start; continuing "
+                    "without recurring tasks (%s)",
+                    exc,
+                )
+
         try:
             yield
         finally:
+            if scheduled_task_scheduler is not None:
+                scheduled_task_scheduler.stop()
             metrics_publish_task.cancel()
             with suppress(asyncio.CancelledError):
                 await metrics_publish_task
@@ -1485,6 +1540,11 @@ def create_app(
     # request/route closure) the runner router so it can reach the bound
     # runner.
     set_server_runner_router(runner_router)
+    # Mirror per-session live state (turn status, pending-approval count,
+    # runner liveness) onto the conversations row so replicas that don't
+    # hold a session's runner tunnel serve the same sidebar fields.
+    session_live_state.configure(conversation_store)
+    pending_elicitations.set_count_persist_hook(session_live_state.persist_pending_count)
 
     @app.middleware("http")
     async def _record_server_metrics(
@@ -1743,8 +1803,10 @@ def create_app(
         for the single-id wrapper.
 
         ``runner_online`` is **strict**: ``True`` iff a runner tunnel
-        is currently registered for the session
-        (:func:`_runner_up`). It deliberately does **not** fold in
+        is currently registered for the session — on THIS replica's
+        registry, or (when another replica holds the tunnel) per the
+        fresh ``runner_last_seen`` stamp that replica persists on the
+        row (:func:`_runner_up`). It deliberately does **not** fold in
         host-relaunch optimism — a dead runner on a live host reads
         ``runner_online=False`` here, paired with ``host_online=True``
         so the open-session view can offer "send a message to wake
@@ -1768,10 +1830,20 @@ def create_app(
             missing row as reachable).
         """
         connectivity = conversation_store.get_session_connectivity(ids)
+        # One consistent clock for the whole batch's freshness checks.
+        liveness_now = int(time.time())
 
         def _runner_up(conn: SessionConnectivity) -> bool:
-            """A bound runner whose tunnel is currently registered."""
-            return conn.runner_id is not None and tunnel_registry.get(conn.runner_id) is not None
+            """A bound runner whose tunnel is registered here or fresh on the row."""
+            if conn.runner_id is None:
+                return False
+            if tunnel_registry.get(conn.runner_id) is not None:
+                return True
+            # Another replica may hold the tunnel: it stamps
+            # ``runner_last_seen`` on connect + a periodic sweep, and
+            # clears it on graceful disconnect; an ungraceful death goes
+            # stale and self-corrects after the TTL.
+            return runner_seen_is_fresh(conn.runner_last_seen, now=liveness_now)
 
         # Resolve host liveness for every bound host in one query, so
         # ``host_online`` can be reported even when the runner tunnel is
@@ -2075,6 +2147,10 @@ def create_app(
             # (host.runner_exited) as last_task_error so a reload still
             # renders the error banner after the live push is gone.
             runner_exit_reports=runner_exit_reports,
+            # Lets the filesystem endpoints fall back to reading the
+            # workspace over the host tunnel when the runner is offline
+            # (the file panel stays live without waking the agent).
+            host_registry=host_registry,
         ),
         prefix="/v1",
         tags=["sessions"],
@@ -2213,6 +2289,9 @@ def create_app(
                 runner_id,
             )
             return
+        # Graceful disconnect: clear the persisted liveness stamp so other
+        # replicas flip offline immediately rather than after the TTL.
+        session_live_state.clear_runner_liveness(runner_id)
 
         # Direct by-runner lookup: read-after-write consistent (the
         # listing path may be served from an eventually-consistent
@@ -2290,6 +2369,10 @@ def create_app(
             _publish_runner_recovered_status,
         )
 
+        # Stamp liveness immediately so other replicas see the runner
+        # online before the first periodic sweep.
+        session_live_state.touch_runner_liveness([runner_id])
+
         # Direct by-runner lookup instead of list-everything-and-filter:
         # the listing path may be backed by an eventually-consistent
         # search index in alternate store backends, which cannot see a
@@ -2353,6 +2436,14 @@ def create_app(
                 routed.client,
                 conversation_store,
             )
+            # Reconcile the persisted pending-elicitation count with this
+            # pod's live index. A runner that crashed with prompts parked
+            # leaves a stale row (no decrement is ever written on a crash),
+            # which the fresh index corrects to 0 here; a tunnel flap on the
+            # same pod resyncs the still-parked truth unchanged.
+            session_live_state.persist_pending_count(
+                conv.id, pending_elicitations.count_for(conv.id)
+            )
             # A reconnect can land the runner back on an idle session with
             # no new turn (a transient WS blip; the runner process
             # survived). The disconnect left the session marked failed with
@@ -2412,6 +2503,12 @@ def create_app(
         from omnigent.server.routes.host_tunnel import create_host_tunnel_router
         from omnigent.server.routes.hosts import create_hosts_router
 
+        async def _on_host_connect(_host_id: str, owner: str | None) -> None:
+            announce_hosts_changed(owner)
+
+        async def _on_host_disconnect(_host_id: str, owner: str | None) -> None:
+            announce_hosts_changed(owner)
+
         app.include_router(
             create_host_tunnel_router(
                 host_registry,
@@ -2419,6 +2516,8 @@ def create_app(
                 auth_provider=auth_provider,
                 runner_exit_reports=runner_exit_reports,
                 on_runner_exited=_on_runner_exited,
+                on_host_connect=_on_host_connect,
+                on_host_disconnect=_on_host_disconnect,
             ),
             prefix="/v1",
             tags=["hosts"],

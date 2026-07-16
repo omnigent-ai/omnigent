@@ -3106,6 +3106,7 @@
             "response.elicitation_resolved": "#/components/schemas/ElicitationResolvedEvent",
             "response.error": "#/components/schemas/ErrorEvent",
             "response.failed": "#/components/schemas/FailedEvent",
+            "response.function_call_output.delta": "#/components/schemas/ToolOutputDeltaEvent",
             "response.heartbeat": "#/components/schemas/HeartbeatEvent",
             "response.in_progress": "#/components/schemas/InProgressEvent",
             "response.incomplete": "#/components/schemas/IncompleteEvent",
@@ -3217,6 +3218,9 @@
           },
           {
             "$ref": "#/components/schemas/OutputTextDeltaEvent"
+          },
+          {
+            "$ref": "#/components/schemas/ToolOutputDeltaEvent"
           },
           {
             "$ref": "#/components/schemas/ReasoningStartedEvent"
@@ -5662,6 +5666,46 @@
           "kind"
         ],
         "title": "TerminalCommandData",
+        "type": "object"
+      },
+      "ToolOutputDeltaEvent": {
+        "description": "Incremental output from an in-progress function call.",
+        "properties": {
+          "call_id": {
+            "description": "Function-call correlation id.",
+            "title": "Call Id",
+            "type": "string"
+          },
+          "delta": {
+            "description": "Command stdout/stderr fragment.",
+            "title": "Delta",
+            "type": "string"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "type": {
+            "const": "response.function_call_output.delta",
+            "description": "Always `\"response.function_call_output.delta\"`.",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "call_id",
+          "delta"
+        ],
+        "title": "ToolOutputDeltaEvent",
         "type": "object"
       },
       "TurnCancelledEvent": {

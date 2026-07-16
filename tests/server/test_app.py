@@ -1067,3 +1067,49 @@ async def test_api_only_root_does_not_shadow_real_routes(
         resp = await c.get("/health", headers={"accept": "text/html"})
     assert resp.status_code == 200
     assert resp.json() == {"status": "ok"}
+
+
+@pytest.mark.asyncio
+async def test_health_derives_runner_online_from_fresh_row_stamp(
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    """A runner whose tunnel lives on ANOTHER replica reads online here.
+
+    Under host_id replica sharding, the replica holding a runner's tunnel
+    stamps ``conversations.runner_last_seen`` (on connect + each ping-loop
+    tick of that tunnel) and clears it on graceful disconnect. A replica
+    serving ``/health`` with an EMPTY tunnel registry — this app — must
+    derive ``runner_online`` from that stamp's freshness: fresh reads
+    online, past the TTL reads offline (the self-correcting path for an
+    ungraceful host/replica death), cleared reads offline immediately.
+    """
+    import time
+
+    from omnigent.stores.conversation_store import RUNNER_LIVENESS_TTL_S
+
+    wired = _build_liveness_app(db_uri, tmp_path)
+    app = wired.app
+    conversation_store = wired.conversation_store
+
+    fresh = conversation_store.create_conversation(runner_id="rnr_remote_fresh")
+    stale = conversation_store.create_conversation(runner_id="rnr_remote_stale")
+    cleared = conversation_store.create_conversation(runner_id="rnr_remote_cleared")
+    now = int(time.time())
+    conversation_store.touch_runner_liveness(["rnr_remote_fresh"], now=now - 5)
+    conversation_store.touch_runner_liveness(
+        ["rnr_remote_stale"], now=now - RUNNER_LIVENESS_TTL_S - 5
+    )
+    conversation_store.touch_runner_liveness(["rnr_remote_cleared"], now=now - 5)
+    conversation_store.clear_runner_liveness("rnr_remote_cleared")
+
+    ids = ",".join([fresh.id, stale.id, cleared.id])
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.get(f"/health?session_ids={ids}")
+
+    assert resp.status_code == 200
+    sessions = resp.json()["sessions"]
+    assert sessions[fresh.id]["runner_online"] is True
+    assert sessions[stale.id]["runner_online"] is False
+    assert sessions[cleared.id]["runner_online"] is False

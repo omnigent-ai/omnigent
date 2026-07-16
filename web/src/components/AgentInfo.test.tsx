@@ -708,9 +708,7 @@ describe("SessionPoliciesSection", () => {
     expect(payload.factory_params).toEqual({ expensive_models: ["sonnet"] });
   });
 
-  it("shows the all-applied empty message when every registry policy is already added", () => {
-    // WHY: when appliedHandlers covers the whole registry the filtered list is
-    // empty AND available.length === 0, so the dialog says all are applied.
+  it("shows all registry policies even when already applied", () => {
     registryData.current = [
       { handler: "h.alpha", kind: "callable", name: "Alpha Guard", description: "blocks alpha" },
     ];
@@ -721,9 +719,7 @@ describe("SessionPoliciesSection", () => {
 
     fireEvent.click(screen.getByTitle("Add policy"));
     const dialog = screen.getByRole("dialog");
-    expect(
-      within(dialog).getByText("All available policies are already applied."),
-    ).toBeInTheDocument();
+    expect(within(dialog).getByText("Alpha Guard")).toBeInTheDocument();
   });
 });
 

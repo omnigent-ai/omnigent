@@ -64,6 +64,17 @@ COMMENT_STATUS: dict[str, int] = {
     "addressed": 2,
 }
 
+# Last relay-observed turn status persisted on the conversation's metadata
+# row (``omnigent_conversation_metadata.live_status``) so any server replica
+# can serve the sidebar's activity state, not just the pod holding the
+# runner tunnel.
+SESSION_LIVE_STATUS: dict[str, int] = {
+    "idle": 1,
+    "running": 2,
+    "waiting": 3,
+    "failed": 4,
+}
+
 ACCOUNT_TOKEN_KIND: dict[str, int] = {
     "invite": 1,
     "magic": 2,
@@ -227,6 +238,16 @@ def encode_comment_status(name: str) -> int:
 def decode_comment_status(code: int) -> str:
     """Decode a ``comments.status`` int code to its name."""
     return _decode(COMMENT_STATUS, code, field="comments.status")
+
+
+def encode_session_live_status(name: str) -> int:
+    """Encode an ``omnigent_conversation_metadata.live_status`` name to its int code."""
+    return _encode(SESSION_LIVE_STATUS, name, field="omnigent_conversation_metadata.live_status")
+
+
+def decode_session_live_status(code: int) -> str:
+    """Decode an ``omnigent_conversation_metadata.live_status`` int code to its name."""
+    return _decode(SESSION_LIVE_STATUS, code, field="omnigent_conversation_metadata.live_status")
 
 
 def encode_account_token_kind(name: str) -> int:

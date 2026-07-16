@@ -628,6 +628,18 @@ class SqlConversationMetadata(OmnigentBase):
     # Required when host_id is set; enforced by check constraint below.
     workspace: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     git_branch: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Live-state columns, written by the replica holding the runner
+    # tunnel so any replica can serve the sidebar's live fields.
+    # Writes must never bump conversations.updated_at (it drives
+    # sidebar ordering).
+    # Epoch seconds the bound runner's tunnel was last seen alive;
+    # runner_online is derived from freshness (like host_is_live).
+    runner_last_seen: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Last relay-observed turn status (enum_codecs.SESSION_LIVE_STATUS);
+    # NULL means no relay has ever reported on this session.
+    live_status: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    # Outstanding elicitation (approval-prompt) count; NULL = never written.
+    pending_elicitation_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     __table_args__ = (
         CheckConstraint("kind IN (1, 2)", name="ck_conversation_metadata_kind"),

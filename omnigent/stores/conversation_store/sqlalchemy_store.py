@@ -43,10 +43,12 @@ from omnigent.db.db_models import (
 from omnigent.db.enum_codecs import (
     decode_item_status,
     decode_item_type,
+    decode_session_live_status,
     encode_agent_kind,
     encode_conversation_kind,
     encode_item_status,
     encode_item_type,
+    encode_session_live_status,
 )
 from omnigent.db.utils import (
     _supports_fts5,
@@ -165,6 +167,12 @@ def _to_conversation(
         workspace=meta.workspace if meta else None,
         git_branch=meta.git_branch if meta else None,
         archived=row.archived,
+        live_status=(
+            decode_session_live_status(meta.live_status)
+            if meta and meta.live_status is not None
+            else None
+        ),
+        pending_elicitation_count=meta.pending_elicitation_count if meta else None,
     )
 
 
@@ -1105,6 +1113,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     SqlConversationMetadata.id,
                     SqlConversationMetadata.runner_id,
                     SqlConversationMetadata.host_id,
+                    SqlConversationMetadata.runner_last_seen,
                 ).where(
                     SqlConversationMetadata.workspace_id == current_workspace_id(),
                     SqlConversationMetadata.id.in_(unique_ids),
@@ -1133,6 +1142,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 runner_id=row.runner_id,
                 host_id=row.host_id,
                 needs_workspace=row.id in needs_workspace_ids,
+                runner_last_seen=row.runner_last_seen,
             )
             for row in meta_rows
         }
@@ -2592,6 +2602,96 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
             result = session.execute(stmt)
             return result.rowcount == 1
+
+    def touch_runner_liveness(self, runner_ids: list[str], now: int) -> None:
+        """
+        Stamp ``runner_last_seen`` for sessions bound to live runners.
+
+        One bulk ``UPDATE`` on ``omnigent_conversation_metadata``, so
+        ``conversations.updated_at`` (sidebar ordering) is untouched by
+        construction. See the abstract method.
+
+        :param runner_ids: Runner ids with a live tunnel. Empty = no-op.
+        :param now: Epoch seconds to stamp.
+        """
+        if not runner_ids:
+            return
+        from sqlalchemy import update
+
+        with self._session() as session:
+            session.execute(
+                update(SqlConversationMetadata)
+                .where(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.runner_id.in_(runner_ids),
+                )
+                .values(runner_last_seen=now)
+            )
+
+    def clear_runner_liveness(self, runner_id: str) -> None:
+        """
+        Clear ``runner_last_seen`` for sessions bound to a runner.
+
+        Lives on ``omnigent_conversation_metadata``, so ``conversations.updated_at``
+        (sidebar ordering) is untouched by construction. See the abstract method.
+
+        :param runner_id: The disconnected runner's id.
+        """
+        from sqlalchemy import update
+
+        with self._session() as session:
+            session.execute(
+                update(SqlConversationMetadata)
+                .where(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.runner_id == runner_id,
+                )
+                .values(runner_last_seen=None)
+            )
+
+    def set_session_live_status(self, conversation_id: str, status: str) -> None:
+        """
+        Persist the relay-observed turn status for one session.
+
+        Lives on ``omnigent_conversation_metadata``, so ``conversations.updated_at``
+        (sidebar ordering) is untouched by construction. See the abstract method.
+
+        :param conversation_id: Session/conversation identifier.
+        :param status: One of ``enum_codecs.SESSION_LIVE_STATUS``.
+        """
+        from sqlalchemy import update
+
+        with self._session() as session:
+            session.execute(
+                update(SqlConversationMetadata)
+                .where(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.id == conversation_id,
+                )
+                .values(live_status=encode_session_live_status(status))
+            )
+
+    def set_pending_elicitation_count(self, conversation_id: str, count: int) -> None:
+        """
+        Persist the outstanding elicitation count for one session.
+
+        Lives on ``omnigent_conversation_metadata``, so ``conversations.updated_at``
+        (sidebar ordering) is untouched by construction. See the abstract method.
+
+        :param conversation_id: Session/conversation identifier.
+        :param count: Outstanding elicitations, ``>= 0``.
+        """
+        from sqlalchemy import update
+
+        with self._session() as session:
+            session.execute(
+                update(SqlConversationMetadata)
+                .where(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.id == conversation_id,
+                )
+                .values(pending_elicitation_count=count)
+            )
 
     def replace_runner_id(self, conversation_id: str, runner_id: str) -> Conversation:
         """

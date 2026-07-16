@@ -31,7 +31,7 @@ from tests.e2e_ui.conftest import _build_hello_world_bundle
 _PROJECT_LABEL_KEY = "omni_project"
 
 # Server page size for ``GET /v1/sessions`` (see ``fetchConversationsPage``).
-_PAGE_SIZE = 20
+_PAGE_SIZE = 30
 
 
 def _seed_archived_session(base_url: str, *, title: str, project: str | None) -> str:
