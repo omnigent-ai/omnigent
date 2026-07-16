@@ -22,6 +22,7 @@ import httpx
 import pytest
 
 from omnigent import cursor_native_forwarder as fwd
+from omnigent import cursor_native_status
 from omnigent.cursor_native_forwarder import _persist_native_compaction_item
 
 # Real cursor chat ids are UUIDs. Use UUID-shaped ids in fixtures so the
@@ -61,6 +62,19 @@ def _user(text: str) -> dict:
 
 def _assistant(parts: list[dict]) -> dict:
     return {"role": "assistant", "content": parts}
+
+
+def _tool_call_part(call_id: str, name: str, args: dict) -> dict:
+    """One committed (auto-run / approved) cursor ``tool-call`` content part."""
+    return {"type": "tool-call", "toolCallId": call_id, "toolName": name, "args": args}
+
+
+def _tool_result(call_id: str, result: object = "ok") -> dict:
+    """A cursor ``role="tool"`` blob carrying one ``tool-result`` part."""
+    return {
+        "role": "tool",
+        "content": [{"type": "tool-result", "toolCallId": call_id, "result": result}],
+    }
 
 
 class TestUnwrapUserQuery:
@@ -143,38 +157,90 @@ class TestContentText:
         assert fwd._content_text({"weird": 1}) == ""
 
 
-class TestBlobToItem:
-    # _blob_to_item receives the raw blob payload (a JSON string, as stored).
+class TestExtractToolParts:
+    def test_extracts_each_tool_call_part(self) -> None:
+        content = [
+            {"type": "text", "text": "running it"},
+            _tool_call_part("call_1", "Shell", {"command": "ls"}),
+            _tool_call_part("call_2", "Read", {"path": "/x"}),
+        ]
+        assert fwd._extract_tool_calls(content) == [
+            ("call_1", "Shell", json.dumps({"command": "ls"})),
+            ("call_2", "Read", json.dumps({"path": "/x"})),
+        ]
+
+    def test_missing_args_become_empty_object(self) -> None:
+        content = [{"type": "tool-call", "toolCallId": "c", "toolName": "Read"}]
+        assert fwd._extract_tool_calls(content) == [("c", "Read", "{}")]
+
+    def test_missing_tool_name_falls_back(self) -> None:
+        content = [{"type": "tool-call", "toolCallId": "c", "args": {}}]
+        assert fwd._extract_tool_calls(content) == [("c", "tool", "{}")]
+
+    def test_non_dict_and_id_less_parts_are_ignored(self) -> None:
+        content = [
+            "junk",
+            {"type": "tool-call", "toolName": "Read"},
+            {"type": "text", "text": "x"},
+        ]
+        assert fwd._extract_tool_calls(content) == []
+
+    def test_string_content_has_no_tool_calls(self) -> None:
+        assert fwd._extract_tool_calls("just prose") == []
+
+    def test_extracts_tool_results(self) -> None:
+        content = [{"type": "tool-result", "toolCallId": "call_1", "result": "done"}]
+        assert fwd._extract_tool_results(content) == [("call_1", "done")]
+
+    def test_structured_tool_result_is_json_encoded(self) -> None:
+        content = [{"type": "tool-result", "toolCallId": "c", "result": {"exit": 0}}]
+        assert fwd._extract_tool_results(content) == [("c", json.dumps({"exit": 0}))]
+
+    def test_tool_result_without_payload_is_empty_text(self) -> None:
+        content = [{"type": "tool-result", "toolCallId": "c"}]
+        assert fwd._extract_tool_results(content) == [("c", "")]
+
+
+class TestBlobToItems:
+    # _blob_to_items receives the raw blob payload (a JSON string, as stored).
     @staticmethod
     def _blob(obj: object) -> str:
         return json.dumps(obj)
 
     def test_user_query_becomes_input_text_item(self) -> None:
-        item = fwd._blob_to_item(
+        items = fwd._blob_to_items(
             5, "bid", self._blob(_user("<user_query>\nhi\n</user_query>")), "cursor-native-ui"
         )
-        assert item is not None
-        assert item.item_type == "message"
-        assert item.item_data == {
+        assert len(items) == 1
+        assert items[0].item_type == "message"
+        assert items[0].item_data == {
             "role": "user",
             "content": [{"type": "input_text", "text": "hi"}],
         }
-        assert item.response_id == "cursor:bid"
+        assert items[0].response_id == "cursor:bid"
 
     def test_response_id_capped_at_column_width(self) -> None:
         # cursor's blob id is a 64-char content hash, so an un-capped
         # ``cursor:<blob_id>`` (71 chars) overflows the VARCHAR(64) column and
         # 500s the mirror POST. The response_id must stay within the column.
         blob_id = "b" * 64
-        item = fwd._blob_to_item(
+        items = fwd._blob_to_items(
             5, blob_id, self._blob(_user("<user_query>\nhi\n</user_query>")), "cursor-native-ui"
         )
-        assert item is not None
-        assert len(item.response_id) <= fwd._RESPONSE_ID_MAX_LEN
-        assert item.response_id == f"cursor:{blob_id}"[: fwd._RESPONSE_ID_MAX_LEN]
+        assert len(items) == 1
+        assert len(items[0].response_id) <= fwd._RESPONSE_ID_MAX_LEN
+        assert items[0].response_id == f"cursor:{blob_id}"[: fwd._RESPONSE_ID_MAX_LEN]
+
+    def test_turn_response_id_capped_at_column_width(self) -> None:
+        # ``cursor:turn:`` + a 64-char blob hash overflows the same column, so
+        # the per-turn id must be capped exactly like the per-blob one.
+        blob_id = "c" * 64
+        rid = fwd._turn_response_id(blob_id)
+        assert len(rid) <= fwd._RESPONSE_ID_MAX_LEN
+        assert rid == f"{fwd._TURN_ID_PREFIX}{blob_id}"[: fwd._RESPONSE_ID_MAX_LEN]
 
     def test_assistant_text_becomes_output_text_item(self) -> None:
-        item = fwd._blob_to_item(
+        items = fwd._blob_to_items(
             9,
             "bid",
             self._blob(
@@ -182,31 +248,89 @@ class TestBlobToItem:
             ),
             "agentx",
         )
-        assert item is not None
-        assert item.item_data == {
+        assert len(items) == 1
+        assert items[0].item_data == {
             "role": "assistant",
             "agent": "agentx",
             "content": [{"type": "output_text", "text": "answer"}],
         }
 
-    def test_assistant_without_prose_is_skipped(self) -> None:
-        # reasoning/tool-only turn with no text part → nothing to mirror
+    def test_tool_only_assistant_blob_yields_a_function_call(self) -> None:
+        # Regression guard: a tool-only assistant blob used to mirror NOTHING,
+        # so cursor tool calls never reached the web UI as cards at all.
+        items = fwd._blob_to_items(
+            9,
+            "bid",
+            self._blob(_assistant([_tool_call_part("call_1", "Shell", {"command": "ls"})])),
+            "agentx",
+        )
+        assert len(items) == 1
+        assert items[0].item_type == "function_call"
+        assert items[0].item_data == {
+            "agent": "agentx",
+            "name": "Shell",
+            "arguments": json.dumps({"command": "ls"}),
+            "call_id": "call_1",
+        }
+
+    def test_prose_then_tool_calls_are_emitted_in_order(self) -> None:
+        items = fwd._blob_to_items(
+            9,
+            "bid",
+            self._blob(
+                _assistant(
+                    [
+                        {"type": "text", "text": "let me look"},
+                        _tool_call_part("call_1", "Read", {"path": "/a"}),
+                        _tool_call_part("call_2", "Read", {"path": "/b"}),
+                    ]
+                )
+            ),
+            "agentx",
+            turn_response_id="cursor:turn:abc",
+        )
+        assert [it.item_type for it in items] == ["message", "function_call", "function_call"]
+        assert all(it.response_id == "cursor:turn:abc" for it in items)
+
+    def test_tool_result_blob_yields_function_call_output(self) -> None:
+        items = fwd._blob_to_items(
+            10,
+            "bid",
+            self._blob(_tool_result("call_1", "file contents")),
+            "agentx",
+            turn_response_id="cursor:turn:abc",
+        )
+        assert len(items) == 1
+        assert items[0].item_type == "function_call_output"
+        assert items[0].item_data == {"call_id": "call_1", "output": "file contents"}
+        assert items[0].response_id == "cursor:turn:abc"
+
+    def test_already_mirrored_call_id_is_not_re_emitted(self) -> None:
+        # cursor writes a gated call twice (framed pending, then committed).
+        # Only the committed row parses as clean JSON today, but dedupe on
+        # toolCallId so a schema change can't double-render the card.
+        seen: set[str] = set()
+        blob = self._blob(_assistant([_tool_call_part("call_1", "Shell", {})]))
+        assert len(fwd._blob_to_items(9, "b1", blob, "a", seen_call_ids=seen)) == 1
+        assert fwd._blob_to_items(10, "b2", blob, "a", seen_call_ids=seen) == []
+
+    def test_assistant_without_prose_or_tools_is_skipped(self) -> None:
+        # reasoning-only step with no text and no tool part → nothing to mirror
         assert (
-            fwd._blob_to_item(
+            fwd._blob_to_items(
                 9, "bid", self._blob(_assistant([{"type": "redacted-reasoning"}])), "a"
             )
-            is None
+            == []
         )
 
     def test_system_and_context_dump_are_skipped(self) -> None:
         assert (
-            fwd._blob_to_item(1, "bid", self._blob({"role": "system", "content": "x"}), "a")
-            is None
+            fwd._blob_to_items(1, "bid", self._blob({"role": "system", "content": "x"}), "a") == []
         )
-        assert fwd._blob_to_item(2, "bid", self._blob(_user("<user_info>\nbig dump")), "a") is None
+        assert fwd._blob_to_items(2, "bid", self._blob(_user("<user_info>\nbig dump")), "a") == []
 
     def test_binary_merkle_node_is_skipped(self) -> None:
-        assert fwd._blob_to_item(3, "bid", b"\n \x92\xc0\xa6w\xef&", "a") is None
+        assert fwd._blob_to_items(3, "bid", b"\n \x92\xc0\xa6w\xef&", "a") == []
 
     def test_summary_rollup_becomes_compaction_completed(self) -> None:
         # After /summarize finishes, cursor collapses the prior history into a
@@ -217,17 +341,78 @@ class TestBlobToItem:
         blob = self._blob(
             {"role": "user", "content": f"{fwd._COMPACTION_SUMMARY_PREFIX} Summary:\n1. ..."}
         )
-        item = fwd._blob_to_item(12, "bid", blob, "cursor-native-ui")
-        assert item is not None
-        assert item.item_type == "compaction_completed"
-        assert item.item_data == {}
+        items = fwd._blob_to_items(12, "bid", blob, "cursor-native-ui")
+        assert len(items) == 1
+        assert items[0].item_type == "compaction_completed"
+        assert items[0].item_data == {}
 
     def test_plain_string_user_without_marker_is_skipped(self) -> None:
         # A bare-string user content that ISN'T the summary rollup has no
         # <user_query> wrapper, so it is neither a chat bubble nor a compaction
         # signal — skipped, exactly as before.
         blob = self._blob({"role": "user", "content": "just some unwrapped context"})
-        assert fwd._blob_to_item(2, "bid", blob, "a") is None
+        assert fwd._blob_to_items(2, "bid", blob, "a") == []
+
+
+class TestTurnGrouping:
+    """``_read_new_items`` groups a turn's items under one ``response_id``."""
+
+    def test_turn_items_share_the_first_assistant_blobs_id(self, tmp_path: Path) -> None:
+        store = tmp_path / "store.db"
+        writer = _make_store(
+            store,
+            [
+                ("u1", _user("<user_query>\nlist files\n</user_query>")),
+                ("a1", _assistant([_tool_call_part("call_1", "Shell", {"command": "ls"})])),
+                ("t1", _tool_result("call_1", "a.txt")),
+                ("a2", _assistant([{"type": "text", "text": "there is a.txt"}])),
+            ],
+        )
+        try:
+            turn = fwd._TurnState()
+            items = fwd._read_new_items(store, 0, "agentx", turn)
+        finally:
+            writer.close()
+        posted = [it for it in items if it.item_type]
+        assert [it.item_type for it in posted] == [
+            "message",
+            "function_call",
+            "function_call_output",
+            "message",
+        ]
+        # The user bubble keeps its per-blob id; the turn's items share the id
+        # minted from the FIRST assistant blob.
+        assert posted[0].response_id == "cursor:u1"
+        assert {it.response_id for it in posted[1:]} == {"cursor:turn:a1"}
+        assert turn.response_id == "cursor:turn:a1"
+
+    def test_new_user_blob_starts_a_new_turn(self, tmp_path: Path) -> None:
+        store = tmp_path / "store.db"
+        writer = _make_store(
+            store,
+            [
+                ("u1", _user("<user_query>\none\n</user_query>")),
+                ("a1", _assistant([{"type": "text", "text": "first"}])),
+                ("u2", _user("<user_query>\ntwo\n</user_query>")),
+                ("a2", _assistant([{"type": "text", "text": "second"}])),
+            ],
+        )
+        try:
+            items = fwd._read_new_items(store, 0, "agentx", fwd._TurnState())
+        finally:
+            writer.close()
+        posted = [it for it in items if it.item_type]
+        assert posted[1].response_id == "cursor:turn:a1"
+        assert posted[3].response_id == "cursor:turn:a2"
+
+    def test_without_turn_state_ids_stay_per_blob(self, tmp_path: Path) -> None:
+        store = tmp_path / "store.db"
+        writer = _make_store(store, [("a1", _assistant([{"type": "text", "text": "hi"}]))])
+        try:
+            items = fwd._read_new_items(store, 0, "agentx")
+        finally:
+            writer.close()
+        assert items[0].response_id == "cursor:a1"
 
 
 class TestReadNewItems:
@@ -637,7 +822,7 @@ async def _drive_forwarder(
     condition is never reached within *max_ticks* — i.e. the loop wedged.
     """
     bridge_dir = tmp_path / "cursor-native" / "sess"
-    bridge_dir.mkdir(parents=True)
+    bridge_dir.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(fwd, "_discover_store", lambda workspace, launch_ms: store)
     monkeypatch.setattr(fwd, "_chat_claimed_by_other", lambda *a, **k: False)
     monkeypatch.setattr(fwd, "_post_conversation_item", poster)
@@ -1253,3 +1438,222 @@ async def test_persist_native_compaction_item_no_store_skips_messages() -> None:
     assert body["type"] == "compaction"
     assert body["data"]["last_item_id"] == "item_abc"
     assert "compacted_messages" not in body["data"]
+
+
+class _StatusRecorder:
+    """Records ``post_external_session_status`` calls made by the poll loop."""
+
+    def __init__(self) -> None:
+        self.edges: list[tuple[str, str | None]] = []
+
+    async def __call__(
+        self,
+        client: object,
+        *,
+        session_id: str,
+        status: str,
+        response_id: str | None = None,
+        **_kw,
+    ) -> None:
+        self.edges.append((status, response_id))
+
+
+class TestForwardLoopLiveToolCards:
+    """The id-bearing status edges that make mirrored tool cards render live.
+
+    ap-web renders a ``function_call`` as an in-flight card (spinner + ticking
+    timer) only while a ``running`` status edge carrying the SAME ``response_id``
+    is open. These drive the real poll loop to pin that contract.
+    """
+
+    @staticmethod
+    def _seed_tool_turn(store: Path) -> None:
+        writer = _make_store(
+            store,
+            [
+                ("u1", _user("<user_query>\nlist files\n</user_query>")),
+                ("a1", _assistant([_tool_call_part("call_1", "Shell", {"command": "ls"})])),
+                ("t1", _tool_result("call_1", "a.txt")),
+            ],
+        )
+        writer.close()
+
+    @pytest.mark.asyncio
+    async def test_running_precedes_the_turns_first_item_and_shares_its_id(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        store = tmp_path / "store.db"
+        self._seed_tool_turn(store)
+        status = _StatusRecorder()
+        monkeypatch.setattr(fwd, "post_external_session_status", status)
+        poster = _FakePoster(lambda item: None)
+        await _drive_forwarder(
+            monkeypatch,
+            tmp_path,
+            store,
+            poster,
+            until=lambda b: fwd._read_state(b).last_rowid >= 3,
+        )
+        calls = [it for it in poster.delivered if it.item_type == "function_call"]
+        assert len(calls) == 1
+        assert calls[0].item_data["name"] == "Shell"
+        # Exactly one running edge, carrying the turn id every mirrored tool
+        # item of that turn is stamped with.
+        assert status.edges == [("running", "cursor:turn:a1")]
+        assert calls[0].response_id == "cursor:turn:a1"
+        outputs = [it for it in poster.delivered if it.item_type == "function_call_output"]
+        assert outputs[0].response_id == "cursor:turn:a1"
+        # The running edge is posted before the item it makes live.
+        assert poster.calls[0].item_data["role"] == "user"
+
+    @pytest.mark.asyncio
+    async def test_stop_hook_idle_carries_the_turn_id(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        store = tmp_path / "store.db"
+        self._seed_tool_turn(store)
+        status = _StatusRecorder()
+        monkeypatch.setattr(fwd, "post_external_session_status", status)
+        poster = _FakePoster(lambda item: None)
+        marked: list[bool] = []
+
+        def until(bridge_dir: Path) -> bool:
+            # Fire the cursor stop hook's turn-end marker once the turn's items
+            # are mirrored — the authoritative close for a cursor turn.
+            if not marked and fwd._read_state(bridge_dir).last_rowid >= 3:
+                cursor_native_status.record_turn_end(bridge_dir)
+                marked.append(True)
+            return ("idle", "cursor:turn:a1") in status.edges
+
+        await _drive_forwarder(monkeypatch, tmp_path, store, poster, until=until)
+        assert status.edges == [("running", "cursor:turn:a1"), ("idle", "cursor:turn:a1")]
+
+    @pytest.mark.asyncio
+    async def test_failed_running_edge_does_not_consume_the_turn_end_marker(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Draining a turn whose stop-hook turn-end marker is already present
+        # (count=1, posted=0) while the running edge's first POST fails: the
+        # idle block must NOT settle the turn on that poll (no bare
+        # ``idle(None)``), or the next poll re-opens the running card with no
+        # idle left to close it and it spins forever. Once the running edge
+        # finally posts, its matching id-bearing idle must still fire.
+        store = tmp_path / "store.db"
+        self._seed_tool_turn(store)
+        bridge_dir = tmp_path / "cursor-native" / "sess"
+        bridge_dir.mkdir(parents=True)
+        # Turn-end marker already drained from a fully-completed backlog turn.
+        cursor_native_status.record_turn_end(bridge_dir)
+
+        class _FailFirstRunning:
+            def __init__(self) -> None:
+                self.edges: list[tuple[str, str | None]] = []
+                self._running_seen = 0
+
+            async def __call__(self, client, *, session_id, status, response_id=None, **_kw):
+                if status == "running":
+                    self._running_seen += 1
+                    if self._running_seen == 1:
+                        raise httpx.ConnectError(
+                            "server unreachable", request=httpx.Request("POST", "http://test")
+                        )
+                self.edges.append((status, response_id))
+
+        status = _FailFirstRunning()
+        monkeypatch.setattr(fwd, "post_external_session_status", status)
+        poster = _FakePoster(lambda item: None)
+
+        def until(bridge_dir: Path) -> bool:
+            return (
+                fwd._read_state(bridge_dir).last_rowid >= 3
+                and cursor_native_status.read_posted_count(bridge_dir) >= 1
+            )
+
+        # Reuse the caller's pre-created bridge_dir so the seeded marker survives.
+        monkeypatch.setattr(fwd, "_discover_store", lambda workspace, launch_ms: store)
+        monkeypatch.setattr(fwd, "_chat_claimed_by_other", lambda *a, **k: False)
+        monkeypatch.setattr(fwd, "_post_conversation_item", poster)
+        task = asyncio.create_task(
+            fwd.forward_cursor_store_to_session(
+                base_url="http://test",
+                headers={},
+                session_id="conv_1",
+                bridge_dir=bridge_dir,
+                agent_name="cursor-native-ui",
+                workspace="/ws",
+                launch_epoch_ms=1_000,
+                poll_interval_s=0.001,
+            )
+        )
+        try:
+            for _ in range(2000):
+                if until(bridge_dir):
+                    break
+                await asyncio.sleep(0.001)
+            else:
+                raise AssertionError("forwarder never settled the turn (wedged?)")
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        # The turn settled with the SAME id its running edge carried, and no
+        # premature turn-agnostic idle ever leaked.
+        assert ("idle", "cursor:turn:a1") in status.edges
+        assert ("idle", None) not in status.edges
+        assert status.edges.count(("running", "cursor:turn:a1")) == 1
+        assert status.edges.count(("idle", "cursor:turn:a1")) == 1
+
+    @pytest.mark.asyncio
+    async def test_running_is_not_reposted_across_polls(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        store = tmp_path / "store.db"
+        self._seed_tool_turn(store)
+        status = _StatusRecorder()
+        monkeypatch.setattr(fwd, "post_external_session_status", status)
+        poster = _FakePoster(lambda item: None)
+        # Idle past the last row for many polls; the loop must not re-open the turn.
+        ticks = [0]
+
+        def until(bridge_dir: Path) -> bool:
+            if fwd._read_state(bridge_dir).last_rowid >= 3:
+                ticks[0] += 1
+            return ticks[0] > 20
+
+        await _drive_forwarder(monkeypatch, tmp_path, store, poster, until=until)
+        assert status.edges.count(("running", "cursor:turn:a1")) == 1
+
+    @pytest.mark.asyncio
+    async def test_restart_mid_turn_rejoins_id_without_reposting_running(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Turn state is persisted, so a supervisor restart mid-turn must keep
+        # stamping the SAME id on the rest of the turn (one streaming group) and
+        # must not re-POST a running edge the previous run already opened.
+        store = tmp_path / "store.db"
+        self._seed_tool_turn(store)
+        bridge_dir = tmp_path / "cursor-native" / "sess"
+        bridge_dir.mkdir(parents=True)
+        fwd._write_state(
+            bridge_dir,
+            fwd._ForwardState(
+                store_path=str(store),
+                last_rowid=2,  # the assistant tool-call row was already mirrored
+                launch_epoch_ms=1_000,
+                turn_response_id="cursor:turn:a1",
+                turn_live=True,
+            ),
+        )
+        status = _StatusRecorder()
+        monkeypatch.setattr(fwd, "post_external_session_status", status)
+        poster = _FakePoster(lambda item: None)
+        await _drive_forwarder(
+            monkeypatch,
+            tmp_path,
+            store,
+            poster,
+            until=lambda b: fwd._read_state(b).last_rowid >= 3,
+        )
+        assert [it.item_type for it in poster.delivered] == ["function_call_output"]
+        assert poster.delivered[0].response_id == "cursor:turn:a1"
+        assert status.edges == []

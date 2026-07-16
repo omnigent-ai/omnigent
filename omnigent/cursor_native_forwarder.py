@@ -19,16 +19,26 @@ that store, extract new user/assistant messages, and POST them as
 ``external_conversation_item`` events — which also seeds the session title from
 the first user message (the same hook claude/codex rely on).
 
-The web-facing ``running``/``idle`` *spinner* edges are intentionally NOT posted
-here: the runner's PTY-activity watcher owns those ``session.status`` edges for
-cursor-native (see ``_publish_turn_status`` in :mod:`omnigent.runner.app`),
-exactly as for claude-native and pi-native. That watcher drives only the web
-"Working…" spinner, though — it never wakes a parent orchestrator. So this
-forwarder additionally POSTs an ``external_session_status: idle`` event once per
-completed turn (the cursor ``stop`` hook's turn-end markers, tailed via
+The generic, turn-agnostic "Working…" *spinner* badge is still owned by the
+runner's PTY-activity watcher for cursor-native (see ``_publish_turn_status`` in
+:mod:`omnigent.runner.app`), exactly as for claude-native and pi-native — that
+id-less edge never wakes a parent orchestrator, so this forwarder additionally
+POSTs an ``external_session_status: idle`` event once per completed turn (the
+cursor ``stop`` hook's turn-end markers, tailed via
 :mod:`omnigent.cursor_native_status`) — the SAME server contract
 claude-/codex-/opencode-native use to mark a sub-agent turn terminal and wake its
 parent's inbox.
+
+**Live tool-call cards**: the forwarder also mirrors cursor's committed
+``tool-call`` / ``tool-result`` content parts as ``function_call`` /
+``function_call_output`` items, stamps every item of one assistant turn with a
+shared per-turn ``response_id`` (``cursor:turn:<blob_id>``), and POSTs a
+``running`` status edge carrying that id before the turn's first item. That
+id-bearing edge is what makes the web UI render cursor's in-flight tool calls
+LIVE (spinner + ticking timer) instead of as static completed cards; the closing
+``idle`` edge (driven by the ``stop`` hook) carries the same id so the cards
+settle. The open turn is rebuilt from persisted state on a supervisor restart so
+a resumed turn rejoins its streaming group without re-posting ``running``.
 """
 
 from __future__ import annotations
@@ -42,13 +52,16 @@ import os
 import re
 import sqlite3
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import httpx
 
 from omnigent import cursor_native_status
-from omnigent._native_post_delivery import post_may_have_been_delivered
+from omnigent._native_post_delivery import (
+    post_external_session_status,
+    post_may_have_been_delivered,
+)
 from omnigent.cursor_native_bridge import FORK_HISTORY_CLOSE_TAG, FORK_HISTORY_OPEN_TAG
 
 _logger = logging.getLogger(__name__)
@@ -70,6 +83,16 @@ _POST_TIMEOUT_S = 30.0
 #: theory alias two blobs onto one id — that only groups two messages under one UI
 #: response, never data loss.
 _RESPONSE_ID_MAX_LEN = 64
+
+#: Prefix for the per-turn ``response_id`` shared by every item of one assistant
+#: turn (the user bubble keeps its own per-blob id). Stamping a turn's mirrored
+#: ``function_call`` items with this id — and posting a ``running`` status edge
+#: carrying the same id before the turn's first item — is what makes the web UI
+#: render cursor's in-flight tool calls LIVE (spinner + ticking timer) instead of
+#: as static, already-completed cards. ``cursor:turn:`` + a 64-char blob hash
+#: overflows the ``VARCHAR(64)`` column, so the id is capped exactly like the
+#: per-blob one (see :data:`_RESPONSE_ID_MAX_LEN`).
+_TURN_ID_PREFIX = "cursor:turn:"
 
 #: Consecutive server rejections (a 4xx, or a 5xx such as a failed DB insert) of
 #: a single mirror item the poll loop tolerates before it logs and skips past
@@ -156,12 +179,21 @@ class _ForwardState:
     :param heartbeat_ms: Wall-clock ms of the last persist. A sibling reads this
         to tell a live owner from a dead session's leftover claim (see
         :func:`_chat_claimed_by_other`). Stamped by :func:`_write_state`.
+    :param turn_response_id: The open assistant turn's shared ``response_id``
+        (``cursor:turn:<blob_id>``), or ``None`` when no turn is open. Persisted
+        so a supervisor restart rejoins the in-flight turn's streaming group and
+        keeps stamping the same id on its remaining items.
+    :param turn_live: Whether a ``running`` status edge for ``turn_response_id``
+        was posted and not yet closed. Persisted so a restart does not re-post a
+        ``running`` edge the previous run already opened.
     """
 
     store_path: str | None = None
     last_rowid: int = 0
     launch_epoch_ms: int = 0
     heartbeat_ms: int = 0
+    turn_response_id: str | None = None
+    turn_live: bool = False
 
 
 @dataclass
@@ -192,11 +224,15 @@ def _read_state(bridge_dir: Path) -> _ForwardState:
     last_rowid = data.get("last_rowid")
     launch_epoch_ms = data.get("launch_epoch_ms")
     heartbeat_ms = data.get("heartbeat_ms")
+    turn_response_id = data.get("turn_response_id")
+    turn_live = data.get("turn_live")
     return _ForwardState(
         store_path=store_path if isinstance(store_path, str) else None,
         last_rowid=last_rowid if isinstance(last_rowid, int) else 0,
         launch_epoch_ms=launch_epoch_ms if isinstance(launch_epoch_ms, int) else 0,
         heartbeat_ms=heartbeat_ms if isinstance(heartbeat_ms, int) else 0,
+        turn_response_id=turn_response_id if isinstance(turn_response_id, str) else None,
+        turn_live=bool(turn_live),
     )
 
 
@@ -217,6 +253,8 @@ def _write_state(bridge_dir: Path, state: _ForwardState) -> bool:
                     "store_path": state.store_path,
                     "last_rowid": state.last_rowid,
                     "launch_epoch_ms": state.launch_epoch_ms,
+                    "turn_response_id": state.turn_response_id,
+                    "turn_live": state.turn_live,
                     # Stamp the heartbeat at persist time so every poll refreshes
                     # the chat claim; a peer treats a claim older than
                     # ``_CLAIM_FRESH_MS`` as a dead session it may take over.
@@ -446,6 +484,85 @@ def _content_text(content: object) -> str:
     return ""
 
 
+def _extract_tool_calls(content: object) -> list[tuple[str, str, str]]:
+    """Extract committed tool calls from a cursor assistant blob's ``content``.
+
+    cursor records a tool call as a ``{"type": "tool-call", "toolCallId": …,
+    "toolName": …, "args": …}`` content part (verified against cursor-agent's
+    ``store.db``). An auto-run / approved call lands as clean JSON in a
+    ``blobs`` row, so the forwarder's existing ``json.loads`` already sees it.
+
+    :param content: The parsed ``content`` value (a part list, or anything else
+        which yields no calls).
+    :returns: ``(tool_call_id, tool_name, arguments_json)`` triples in order.
+    """
+    if not isinstance(content, list):
+        return []
+    calls: list[tuple[str, str, str]] = []
+    for part in content:
+        if not isinstance(part, dict) or part.get("type") != "tool-call":
+            continue
+        call_id = part.get("toolCallId")
+        if not isinstance(call_id, str) or not call_id:
+            continue
+        name = part.get("toolName")
+        if not isinstance(name, str) or not name:
+            name = "tool"
+        args = part.get("args")
+        if args is None:
+            args = {}
+        try:
+            args_json = args if isinstance(args, str) else json.dumps(args, ensure_ascii=True)
+        except (TypeError, ValueError):
+            args_json = "{}"
+        calls.append((call_id, name, args_json))
+    return calls
+
+
+def _extract_tool_results(content: object) -> list[tuple[str, str]]:
+    """Extract tool results from a cursor ``role="tool"`` blob's ``content``.
+
+    cursor records a result as a ``{"type": "tool-result", "toolCallId": …,
+    "result": …}`` content part; the ``toolCallId`` matches the originating
+    ``tool-call`` so the web UI can settle the right card.
+
+    :param content: The parsed ``content`` value.
+    :returns: ``(tool_call_id, output_text)`` pairs in order; a structured
+        ``result`` is JSON-encoded so the card always shows text.
+    """
+    if not isinstance(content, list):
+        return []
+    results: list[tuple[str, str]] = []
+    for part in content:
+        if not isinstance(part, dict) or part.get("type") != "tool-result":
+            continue
+        call_id = part.get("toolCallId")
+        if not isinstance(call_id, str) or not call_id:
+            continue
+        raw = part.get("result")
+        if raw is None:
+            output = ""
+        elif isinstance(raw, str):
+            output = raw
+        else:
+            try:
+                output = json.dumps(raw, ensure_ascii=True)
+            except (TypeError, ValueError):
+                output = str(raw)
+        results.append((call_id, output))
+    return results
+
+
+def _turn_response_id(blob_id: str) -> str:
+    """Return the per-turn ``response_id`` minted from a turn's first blob id.
+
+    Capped at the ``conversation_items.response_id`` column width, exactly as the
+    per-blob id is, so a 64-char content-hash blob id can't overflow it and wedge
+    the mirror POST (see :data:`_RESPONSE_ID_MAX_LEN`).
+    """
+    return f"{_TURN_ID_PREFIX}{blob_id}"[:_RESPONSE_ID_MAX_LEN]
+
+
 def _strip_control_chars(text: str) -> str:
     """Drop C0 control bytes cursor embeds in stored prompts (keep \\n and \\t)."""
     return "".join(ch for ch in text if ch >= " " or ch in "\n\t")
@@ -474,6 +591,31 @@ class _MirrorItem:
     item_type: str
     item_data: dict[str, object]
     response_id: str
+
+
+@dataclass
+class _TurnState:
+    """Per-turn grouping state, threaded through :func:`_read_new_items`.
+
+    A turn opens on the first assistant/tool blob after a user blob and closes on
+    the next user blob; every assistant/tool item in between is stamped with one
+    shared :data:`response_id`, so the web UI groups them (and drives their live
+    streaming lifecycle) as a single response.
+
+    :param response_id: The open turn's shared id (``cursor:turn:<blob_id>``), or
+        ``None`` when no turn is open.
+    :param seen_call_ids: ``toolCallId``s already mirrored this turn — cursor can
+        write a gated call twice (a framed pending frame, then a committed row),
+        so dedup on the id keeps one card per call.
+    """
+
+    response_id: str | None = None
+    seen_call_ids: set[str] = field(default_factory=set)
+
+    def reset(self) -> None:
+        """Forget the turn (a new user blob closed it)."""
+        self.response_id = None
+        self.seen_call_ids.clear()
 
 
 def _read_blob_rows(store_path: Path, last_rowid: int) -> list[tuple[int, str, object]]:
@@ -619,39 +761,17 @@ async def _post_model_change_if_new(
         )
 
 
-def _read_new_items(store_path: Path, last_rowid: int, agent_name: str) -> list[_MirrorItem]:
-    """Read role-bearing blobs with ``rowid > last_rowid`` as conversation items.
+def _blob_role(data: object) -> str | None:
+    """Peek a blob's ``role`` (``"user"`` / ``"assistant"`` / ``"tool"``) or ``None``.
 
-    Reads the latest WAL-committed state each call so new messages surface while
-    the TUI keeps writing.
-
-    :param store_path: The cursor chat store to read.
-    :param last_rowid: High-water rowid already processed.
-    :param agent_name: Agent label stamped on assistant items.
-    :returns: New items in conversation (rowid) order; the caller advances its
-        cursor to the max rowid returned even for skipped (system/context) rows.
+    Used to open/close a turn before mapping the blob to items; a binary Merkle
+    node or non-message row yields ``None``.
     """
-    items: list[_MirrorItem] = []
-    rows = _read_blob_rows(store_path, last_rowid)
-    for rowid, blob_id, data in rows:
-        item = _blob_to_item(rowid, blob_id, data, agent_name)
-        if item is not None:
-            items.append(item)
-        else:
-            # A skipped row (system prompt, context dump, non-JSON Merkle node)
-            # still advances the cursor so it is never reconsidered: emit a
-            # sentinel carrying just the rowid.
-            items.append(_MirrorItem(rowid=rowid, item_type="", item_data={}, response_id=""))
-    return items
-
-
-def _blob_to_item(rowid: int, blob_id: str, data: object, agent_name: str) -> _MirrorItem | None:
-    """Convert one ``blobs`` row to a mirror item, or ``None`` to skip it."""
     if isinstance(data, (bytes, bytearray)):
         try:
             data = data.decode("utf-8")
         except UnicodeDecodeError:
-            return None  # binary Merkle-tree node, not a message
+            return None
     if not isinstance(data, str):
         return None
     try:
@@ -661,7 +781,89 @@ def _blob_to_item(rowid: int, blob_id: str, data: object, agent_name: str) -> _M
     if not isinstance(obj, dict):
         return None
     role = obj.get("role")
-    response_id = f"cursor:{blob_id}"[:_RESPONSE_ID_MAX_LEN]
+    return role if isinstance(role, str) else None
+
+
+def _read_new_items(
+    store_path: Path,
+    last_rowid: int,
+    agent_name: str,
+    turn: _TurnState | None = None,
+) -> list[_MirrorItem]:
+    """Read role-bearing blobs with ``rowid > last_rowid`` as conversation items.
+
+    Reads the latest WAL-committed state each call so new messages surface while
+    the TUI keeps writing. When *turn* is provided its per-turn grouping id is
+    minted on the first assistant/tool blob of a turn and stamped on every
+    assistant/tool item until the next user blob closes it, so a turn's prose,
+    tool-call and tool-result items share one ``response_id`` (the id-bearing
+    edges that drive live tool-call cards). Without *turn* every item keeps its
+    per-blob id (the pre-live behaviour).
+
+    :param store_path: The cursor chat store to read.
+    :param last_rowid: High-water rowid already processed.
+    :param agent_name: Agent label stamped on assistant items.
+    :param turn: Mutable per-turn grouping state, or ``None`` for per-blob ids.
+    :returns: New items in conversation (rowid) order; the caller advances its
+        cursor to the max rowid returned even for skipped (system/context) rows.
+    """
+    items: list[_MirrorItem] = []
+    rows = _read_blob_rows(store_path, last_rowid)
+    for rowid, blob_id, data in rows:
+        turn_rid: str | None = None
+        seen: set[str] | None = None
+        if turn is not None:
+            role = _blob_role(data)
+            if role == "user":
+                turn.reset()
+            elif role in ("assistant", "tool") and turn.response_id is None:
+                turn.response_id = _turn_response_id(blob_id)
+            turn_rid = turn.response_id
+            seen = turn.seen_call_ids
+        blob_items = _blob_to_items(rowid, blob_id, data, agent_name, turn_rid, seen)
+        if blob_items:
+            items.extend(blob_items)
+        else:
+            # A skipped row (system prompt, context dump, non-JSON Merkle node)
+            # still advances the cursor so it is never reconsidered: emit a
+            # sentinel carrying just the rowid.
+            items.append(_MirrorItem(rowid=rowid, item_type="", item_data={}, response_id=""))
+    return items
+
+
+def _blob_to_items(
+    rowid: int,
+    blob_id: str,
+    data: object,
+    agent_name: str,
+    turn_response_id: str | None = None,
+    seen_call_ids: set[str] | None = None,
+) -> list[_MirrorItem]:
+    """Convert one ``blobs`` row to zero or more mirror items.
+
+    A user blob yields at most one bubble (or a compaction-completed signal); an
+    assistant blob yields its prose bubble (if any) followed by one
+    ``function_call`` per committed ``tool-call`` part; a ``tool`` blob yields a
+    ``function_call_output`` per ``tool-result`` part. ``turn_response_id`` (when
+    set) is stamped on the assistant/tool items so a turn's cards stream live;
+    the user bubble always keeps its own per-blob id.
+    """
+    if isinstance(data, (bytes, bytearray)):
+        try:
+            data = data.decode("utf-8")
+        except UnicodeDecodeError:
+            return []  # binary Merkle-tree node, not a message
+    if not isinstance(data, str):
+        return []
+    try:
+        obj = json.loads(data)
+    except ValueError:
+        return []
+    if not isinstance(obj, dict):
+        return []
+    role = obj.get("role")
+    per_blob_id = f"cursor:{blob_id}"[:_RESPONSE_ID_MAX_LEN]
+    rid = turn_response_id or per_blob_id
     if role == "user":
         content = obj.get("content")
         # cursor writes the post-/summarize history rollup as a user blob with a
@@ -669,36 +871,72 @@ def _blob_to_item(rowid: int, blob_id: str, data: object, agent_name: str) -> _M
         # Surface it as a compaction-completed signal, not a chat bubble, so the
         # forwarder can tell the web UI the compaction actually finished.
         if isinstance(content, str) and content.startswith(_COMPACTION_SUMMARY_PREFIX):
-            return _MirrorItem(
-                rowid=rowid,
-                item_type="compaction_completed",
-                item_data={},
-                response_id=response_id,
-            )
+            return [
+                _MirrorItem(
+                    rowid=rowid,
+                    item_type="compaction_completed",
+                    item_data={},
+                    response_id=per_blob_id,
+                )
+            ]
         prompt = _unwrap_user_query(_content_text(content))
         if not prompt:
-            return None
-        return _MirrorItem(
-            rowid=rowid,
-            item_type="message",
-            item_data={"role": "user", "content": [{"type": "input_text", "text": prompt}]},
-            response_id=response_id,
-        )
+            return []
+        return [
+            _MirrorItem(
+                rowid=rowid,
+                item_type="message",
+                item_data={"role": "user", "content": [{"type": "input_text", "text": prompt}]},
+                response_id=per_blob_id,
+            )
+        ]
     if role == "assistant":
-        text = _content_text(obj.get("content")).strip()
-        if not text:
-            return None  # reasoning-only / tool-only turn with no prose
-        return _MirrorItem(
-            rowid=rowid,
-            item_type="message",
-            item_data={
-                "role": "assistant",
-                "agent": agent_name,
-                "content": [{"type": "output_text", "text": text}],
-            },
-            response_id=response_id,
-        )
-    return None  # system or other scaffolding
+        content = obj.get("content")
+        items: list[_MirrorItem] = []
+        text = _content_text(content).strip()
+        if text:
+            items.append(
+                _MirrorItem(
+                    rowid=rowid,
+                    item_type="message",
+                    item_data={
+                        "role": "assistant",
+                        "agent": agent_name,
+                        "content": [{"type": "output_text", "text": text}],
+                    },
+                    response_id=rid,
+                )
+            )
+        for call_id, name, args_json in _extract_tool_calls(content):
+            if seen_call_ids is not None:
+                if call_id in seen_call_ids:
+                    continue
+                seen_call_ids.add(call_id)
+            items.append(
+                _MirrorItem(
+                    rowid=rowid,
+                    item_type="function_call",
+                    item_data={
+                        "agent": agent_name,
+                        "name": name,
+                        "arguments": args_json,
+                        "call_id": call_id,
+                    },
+                    response_id=rid,
+                )
+            )
+        return items
+    if role == "tool":
+        return [
+            _MirrorItem(
+                rowid=rowid,
+                item_type="function_call_output",
+                item_data={"call_id": call_id, "output": output},
+                response_id=rid,
+            )
+            for call_id, output in _extract_tool_results(obj.get("content"))
+        ]
+    return []  # system or other scaffolding
 
 
 async def _patch_external_session_id(
@@ -726,30 +964,6 @@ async def _patch_external_session_id(
             "Transient error PATCHing external_session_id; session=%s — will not retry",
             session_id,
         )
-
-
-async def _post_external_session_status(
-    client: httpx.AsyncClient, *, session_id: str, status: str
-) -> None:
-    """POST one ``external_session_status`` event to the Sessions API.
-
-    For a sub-agent conversation the server maps an ``idle`` edge to a terminal
-    completion that wakes the parent orchestrator's inbox — the SAME contract
-    claude-/codex-/opencode-native use (see their ``_post_external_session_status``
-    / ``_post_status``). cursor-agent exposes turn completion only through its
-    ``stop`` hook, which records a marker
-    (:func:`omnigent.cursor_native_status.record_turn_end`); this turns that
-    marker into the authoritative wake signal. The PTY-activity watcher's
-    ``session.status: idle`` edge only drives the web spinner and never wakes a
-    parent, which is why this explicit post is required.
-
-    :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
-    """
-    resp = await client.post(
-        f"/v1/sessions/{session_id}/events",
-        json={"type": "external_session_status", "data": {"status": status}},
-    )
-    resp.raise_for_status()
 
 
 async def _post_conversation_item(
@@ -918,12 +1132,37 @@ async def forward_cursor_store_to_session(
     # so the cold-resume path can pass ``--resume <chatId>`` to cursor-agent.
     chat_id_patched = False
     model_state = _ModelMirrorState()
+    # Per-turn grouping + live-card lifecycle. ``turn`` mints/stamps the shared
+    # ``response_id``; ``running_posted_for`` is the turn id whose ``running``
+    # status edge is already open, so the edge posts once per turn and a restart
+    # mid-turn rejoins it without re-posting. Both are rebuilt from persisted
+    # state so a supervisor restart resumes the open turn.
+    turn = _TurnState()
+    turn.response_id = persisted.turn_response_id
+    running_posted_for: str | None = persisted.turn_response_id if persisted.turn_live else None
+
+    def _turn_state(rowid: int) -> _ForwardState:
+        """Build the persistable state for *rowid*, carrying the open-turn fields."""
+        return _ForwardState(
+            store_path=str(store_path),
+            last_rowid=rowid,
+            launch_epoch_ms=launch_epoch_ms,
+            turn_response_id=turn.response_id,
+            turn_live=running_posted_for is not None and running_posted_for == turn.response_id,
+        )
+
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
     async with httpx.AsyncClient(
         base_url=base_url, headers=headers, auth=auth, timeout=timeout
     ) as client:
         while True:
             try:
+                # Whether this poll drained every owed item (running edge +
+                # each chat item). A ``break`` out of the mirror loop leaves the
+                # turn half-posted; the idle block below must not then consume
+                # the turn-end marker, or the still-open running card never gets
+                # its matching idle and spins forever.
+                drained_cleanly = True
                 if store_path is None or not store_path.exists():
                     # On cold resume the runner pre-seeds the bridge state with
                     # the known store path (see ``preseed_resume_state``), so we
@@ -934,14 +1173,7 @@ async def forward_cursor_store_to_session(
                     if persisted.store_path and Path(persisted.store_path).exists():
                         store_path = Path(persisted.store_path)
                         last_rowid = persisted.last_rowid
-                        _write_state(
-                            bridge_dir,
-                            _ForwardState(
-                                store_path=str(store_path),
-                                last_rowid=last_rowid,
-                                launch_epoch_ms=launch_epoch_ms,
-                            ),
-                        )
+                        _write_state(bridge_dir, _turn_state(last_rowid))
                         persisted = _ForwardState()  # consumed
                         if not chat_id_patched:
                             chat_id_val = store_path.parent.name
@@ -964,16 +1196,12 @@ async def forward_cursor_store_to_session(
                                 # A fresh store (cold resume) is a new chat:
                                 # reset the model dedupe so the new chat's
                                 # current model is re-posted (server no-ops if
-                                # unchanged).
+                                # unchanged), and drop any open-turn state left
+                                # over from the prior store.
                                 model_state = _ModelMirrorState()
-                            _write_state(
-                                bridge_dir,
-                                _ForwardState(
-                                    store_path=str(resolved),
-                                    last_rowid=last_rowid,
-                                    launch_epoch_ms=launch_epoch_ms,
-                                ),
-                            )
+                                turn.reset()
+                                running_posted_for = None
+                            _write_state(bridge_dir, _turn_state(last_rowid))
                             persisted = _ForwardState()  # consumed
                             # Persist the cursor chat id as external_session_id so
                             # a later cold resume can pass ``--resume <chatId>``
@@ -1002,7 +1230,7 @@ async def forward_cursor_store_to_session(
                         store_path = None
                     else:
                         items = await asyncio.to_thread(
-                            _read_new_items, store_path, last_rowid, agent_name
+                            _read_new_items, store_path, last_rowid, agent_name, turn
                         )
                         for item in items:
                             if item.item_type == "compaction_completed":
@@ -1048,16 +1276,41 @@ async def forward_cursor_store_to_session(
                                     )
                                 failed_rowid = failed_attempts = 0
                                 last_rowid = item.rowid
-                                _write_state(
-                                    bridge_dir,
-                                    _ForwardState(
-                                        store_path=str(store_path),
-                                        last_rowid=last_rowid,
-                                        launch_epoch_ms=launch_epoch_ms,
-                                    ),
-                                )
+                                _write_state(bridge_dir, _turn_state(last_rowid))
                                 continue
                             if item.item_type:
+                                # Open the turn's live card once, before its first
+                                # mirrored item: a ``running`` status edge carrying
+                                # the turn id makes the web UI stream that turn's
+                                # tool cards live (spinner + timer) instead of
+                                # rendering them already-completed. Only turn items
+                                # (assistant/tool) carry the ``cursor:turn:`` id; the
+                                # user bubble and compaction signal do not.
+                                if (
+                                    item.response_id.startswith(_TURN_ID_PREFIX)
+                                    and item.response_id != running_posted_for
+                                ):
+                                    try:
+                                        await post_external_session_status(
+                                            client,
+                                            session_id=session_id,
+                                            status="running",
+                                            response_id=item.response_id,
+                                        )
+                                        running_posted_for = item.response_id
+                                    except httpx.HTTPError:
+                                        # Best-effort: retry the whole item (and its
+                                        # running edge) next poll rather than mirror
+                                        # the card without the edge that makes it live.
+                                        _logger.warning(
+                                            "cursor forwarder could not post running "
+                                            "edge; retrying; session=%s rowid=%s",
+                                            session_id,
+                                            item.rowid,
+                                            exc_info=True,
+                                        )
+                                        drained_cleanly = False
+                                        break
                                 try:
                                     await _post_conversation_item(
                                         client, session_id=session_id, item=item
@@ -1097,6 +1350,7 @@ async def forward_cursor_store_to_session(
                                                 item.rowid,
                                                 failed_attempts,
                                             )
+                                            drained_cleanly = False
                                             break  # retry this item before any after it
                                         _logger.error(
                                             "cursor forwarder dropping item after %s "
@@ -1120,31 +1374,18 @@ async def forward_cursor_store_to_session(
                                             item.rowid,
                                             exc_info=True,
                                         )
+                                        drained_cleanly = False
                                         break
                             # Reached on a successful post, an ambiguous-delivery
                             # skip, a quarantine, or a non-posted sentinel row:
                             # advance past this item and reset the failure counter.
                             failed_rowid = failed_attempts = 0
                             last_rowid = item.rowid
-                            _write_state(
-                                bridge_dir,
-                                _ForwardState(
-                                    store_path=str(store_path),
-                                    last_rowid=last_rowid,
-                                    launch_epoch_ms=launch_epoch_ms,
-                                ),
-                            )
+                            _write_state(bridge_dir, _turn_state(last_rowid))
                         # Refresh the claim heartbeat every poll (even with no new
                         # items) so an idle owner keeps its claim and a peer can
                         # detect a dead session.
-                        _write_state(
-                            bridge_dir,
-                            _ForwardState(
-                                store_path=str(store_path),
-                                last_rowid=last_rowid,
-                                launch_epoch_ms=launch_epoch_ms,
-                            ),
-                        )
+                        _write_state(bridge_dir, _turn_state(last_rowid))
                         # Mirror a terminal-side model switch (TUI ``/model``)
                         # back to the web picker. Polled alongside messages so
                         # the pill tracks the same cadence as the chat view.
@@ -1169,15 +1410,23 @@ async def forward_cursor_store_to_session(
                 total_turn_ends = await asyncio.to_thread(
                     cursor_native_status.count_turn_ends, bridge_dir
                 )
-                if total_turn_ends > await asyncio.to_thread(
+                if drained_cleanly and total_turn_ends > await asyncio.to_thread(
                     cursor_native_status.read_posted_count, bridge_dir
                 ):
-                    await _post_external_session_status(
-                        client, session_id=session_id, status="idle"
+                    # Close the open turn's live card with the SAME id its running
+                    # edge carried, so the web UI settles that turn's tool cards
+                    # (spinner → done) rather than leaving them spinning; a bare
+                    # turn-agnostic edge (no open turn) still wakes the parent inbox.
+                    await post_external_session_status(
+                        client,
+                        session_id=session_id,
+                        status="idle",
+                        response_id=running_posted_for,
                     )
                     await asyncio.to_thread(
                         cursor_native_status.write_posted_count, bridge_dir, total_turn_ends
                     )
+                    running_posted_for = None
             except asyncio.CancelledError:
                 raise
             except Exception:

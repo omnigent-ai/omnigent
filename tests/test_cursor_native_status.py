@@ -96,12 +96,20 @@ def test_cli_record_usage_records_turn_end_on_empty_stdin(tmp_path: Path, monkey
 
 
 class _StatusRecorder:
-    """Async stub for ``_post_external_session_status`` capturing posted statuses."""
+    """Async stub for ``post_external_session_status`` capturing posted statuses."""
 
     def __init__(self) -> None:
         self.statuses: list[str] = []
 
-    async def __call__(self, client: object, *, session_id: str, status: str) -> None:
+    async def __call__(
+        self,
+        client: object,
+        *,
+        session_id: str,
+        status: str,
+        response_id: str | None = None,
+        **_kwargs: object,
+    ) -> None:
         self.statuses.append(status)
 
 
@@ -124,7 +132,7 @@ async def _drive_idle_loop(
 ) -> None:
     """Run the real poll loop with store discovery disabled so only the idle path runs."""
     monkeypatch.setattr(fwd, "_discover_store", lambda *a, **k: None)
-    monkeypatch.setattr(fwd, "_post_external_session_status", recorder)
+    monkeypatch.setattr(fwd, "post_external_session_status", recorder)
     task = asyncio.create_task(
         fwd.forward_cursor_store_to_session(
             base_url="http://test",
@@ -171,7 +179,7 @@ async def test_idle_dedupes_and_posts_per_new_turn(tmp_path: Path, monkeypatch) 
     bridge.mkdir(parents=True)
     recorder = _StatusRecorder()
     monkeypatch.setattr(fwd, "_discover_store", lambda *a, **k: None)
-    monkeypatch.setattr(fwd, "_post_external_session_status", recorder)
+    monkeypatch.setattr(fwd, "post_external_session_status", recorder)
     status.record_turn_end(bridge)  # turn 1 completes
     task = asyncio.create_task(
         fwd.forward_cursor_store_to_session(
@@ -208,7 +216,7 @@ async def test_idle_restart_safe_does_not_rewake(tmp_path: Path, monkeypatch) ->
     status.write_posted_count(bridge, 1)  # already reported this turn before the "restart"
     recorder = _StatusRecorder()
     monkeypatch.setattr(fwd, "_discover_store", lambda *a, **k: None)
-    monkeypatch.setattr(fwd, "_post_external_session_status", recorder)
+    monkeypatch.setattr(fwd, "post_external_session_status", recorder)
     task = asyncio.create_task(
         fwd.forward_cursor_store_to_session(
             base_url="http://test",
