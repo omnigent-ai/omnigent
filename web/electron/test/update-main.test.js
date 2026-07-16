@@ -125,9 +125,14 @@ function loadMainHarness({
 
   const mainPath = path.join(__dirname, "../src/main.js");
   const mainRequire = createRequire(mainPath);
+  // Expose only the composed pieces main.js still owns: the `updater` instance
+  // it constructs from ./desktop_updater, plus the menu / IPC / window
+  // registries. The updater's own behavior is unit-tested directly in
+  // test/desktop_updater.test.js; this file proves main.js wires that instance
+  // into the menu, the IPC surface, and the before-quit install handoff.
   const source =
     fs.readFileSync(mainPath, "utf8") +
-    "\nmodule.exports.__test = { buildMenu, getUpdateConfig, setUpdateConfig, setupAutoUpdater, registerIpc, windows, get installPending() { return installPending; }, get currentUpdateStatus() { return currentUpdateStatus; } };";
+    "\nmodule.exports.__test = { buildMenu, registerIpc, windows, updater };";
 
   const module = { exports: {} };
   const sandbox = {
@@ -209,7 +214,7 @@ describe("auto-update main-process wiring", () => {
 
     assert.deepEqual(
       plain(
-        harness.api.setUpdateConfig({
+        harness.api.updater.setConfig({
           mode: "manual",
           autoInstall: false,
           skippedVersion: "0.4.0",
@@ -228,7 +233,7 @@ describe("auto-update main-process wiring", () => {
     assert.equal(saved.update_skipped_version, "0.4.0");
     assert.equal(saved.mode, undefined);
 
-    harness.api.setUpdateConfig({ mode: "bogus" });
+    harness.api.updater.setConfig({ mode: "bogus" });
     assert.equal(harness.readSettings().update_mode, "manual");
   });
 
@@ -273,7 +278,7 @@ describe("auto-update main-process wiring", () => {
           harness.autoUpdater.emit("update-downloaded", { version: "0.4.0" });
         },
         assertRan: (harness) => {
-          assert.equal(harness.api.installPending, true);
+          assert.equal(harness.api.updater.installPending, true);
           assert.equal(harness.calls.appQuit, 1);
         },
       },
@@ -294,7 +299,7 @@ describe("auto-update main-process wiring", () => {
         settings: { update_mode: "manual" },
       });
       t.after(harness.cleanup);
-      harness.api.setupAutoUpdater();
+      harness.api.updater.init();
       harness.api.registerIpc();
       item.prepare(harness);
 
@@ -329,7 +334,7 @@ describe("auto-update main-process wiring", () => {
           harness.autoUpdater.emit("update-downloaded", { version: "0.4.0" });
         },
         assertBlocked: (harness) => {
-          assert.equal(harness.api.installPending, false);
+          assert.equal(harness.api.updater.installPending, false);
           assert.equal(harness.calls.appQuit, 0);
         },
       },
@@ -353,7 +358,7 @@ describe("auto-update main-process wiring", () => {
         dialogResponses: [{ response: 0, checkboxChecked: false }],
       });
       t.after(harness.cleanup);
-      harness.api.setupAutoUpdater();
+      harness.api.updater.init();
       harness.api.registerIpc();
       item.prepare(harness);
 
@@ -373,14 +378,14 @@ describe("auto-update main-process wiring", () => {
       settings: { allowed_hosting_origins: ["https://server.example"], update_mode: "manual" },
     });
     t.after(harness.cleanup);
-    harness.api.setupAutoUpdater();
+    harness.api.updater.init();
     harness.autoUpdater.emit("update-downloaded", { version: "0.4.0" });
     harness.api.registerIpc();
 
     await harness.ipcHandlers.get("omnigent:update-install")(harness.events.pinned);
 
     assert.equal(harness.calls.showMessageBox.length, 1);
-    assert.equal(harness.api.installPending, true);
+    assert.equal(harness.api.updater.installPending, true);
     assert.equal(harness.calls.appQuit, 1);
 
     let prevented = 0;
@@ -398,7 +403,7 @@ describe("auto-update main-process wiring", () => {
       settings: { update_mode: "manual" },
     });
     t.after(harness.cleanup);
-    harness.api.setupAutoUpdater();
+    harness.api.updater.init();
     harness.api.registerIpc();
 
     await assert.rejects(
@@ -406,14 +411,14 @@ describe("auto-update main-process wiring", () => {
       /No downloaded update/,
     );
     assert.equal(harness.calls.showMessageBox.length, 1);
-    assert.equal(harness.api.installPending, false);
+    assert.equal(harness.api.updater.installPending, false);
     assert.equal(harness.calls.appQuit, 0);
 
     harness.api.buildMenu();
     const restartItem = findMenuItem(harness.calls.setApplicationMenu.at(-1), "restart_to_update");
     assert.ok(restartItem);
     restartItem.click();
-    assert.equal(harness.api.installPending, false);
+    assert.equal(harness.api.updater.installPending, false);
     assert.equal(harness.calls.appQuit, 0);
   });
 
@@ -423,7 +428,7 @@ describe("auto-update main-process wiring", () => {
       settings: { update_mode: "manual" },
     });
     t.after(harness.cleanup);
-    harness.api.setupAutoUpdater();
+    harness.api.updater.init();
     harness.autoUpdater.checkForUpdates = () => {
       harness.calls.checkForUpdates += 1;
       const err = new Error("Cannot find latest.yml: 404");
@@ -438,7 +443,7 @@ describe("auto-update main-process wiring", () => {
     );
 
     assert.equal(harness.calls.checkForUpdates, 1);
-    assert.deepEqual(plain(harness.api.currentUpdateStatus), {
+    assert.deepEqual(plain(harness.api.updater.getStatus()), {
       state: "idle",
       lastError: "Cannot find latest.yml: 404",
     });
@@ -471,7 +476,7 @@ describe("auto-update main-process wiring", () => {
     assert.equal(harness.calls.showMessageBox.length, 0);
     assert.equal(harness.calls.checkForUpdates, 0);
     assert.equal(harness.calls.downloadUpdate, 0);
-    assert.equal(harness.api.installPending, false);
+    assert.equal(harness.api.updater.installPending, false);
   });
 
   it("supports forceDevUpdateConfig and broadcasts updater events", (t) => {
@@ -481,11 +486,11 @@ describe("auto-update main-process wiring", () => {
     });
     t.after(harness.cleanup);
 
-    harness.api.setupAutoUpdater();
+    harness.api.updater.init();
     harness.autoUpdater.emit("update-available", { version: "0.4.0" });
 
     assert.equal(harness.autoUpdater.forceDevUpdateConfig, true);
-    assert.deepEqual(plain(harness.api.currentUpdateStatus), {
+    assert.deepEqual(plain(harness.api.updater.getStatus()), {
       state: "available",
       info: { version: "0.4.0" },
     });

@@ -29,6 +29,7 @@ const {
   systemPreferences,
 } = require("electron");
 const { autoUpdater } = require("electron-updater");
+const { createDesktopUpdater } = require("./desktop_updater");
 const fs = require("node:fs");
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
@@ -704,12 +705,26 @@ function activeWindow() {
   return null;
 }
 
-const UPDATE_MODES = new Set(["none", "manual", "start", "default"]);
-let updateCheckTimer = null;
-let currentUpdateStatus = { state: "idle" };
-let installPending = false;
-let manualCheckInFlight = false;
-const UPDATES_UNAVAILABLE_IN_DEV = "Desktop updates are unavailable in development builds.";
+// Desktop auto-update orchestration lives in its own module; the main process
+// only composes it with its main-process dependencies and wires the four thin
+// seams below (startup init, the Updates menu, the update IPC surface, and the
+// before-quit install handoff). Dependencies passed here are function
+// declarations (hoisted) or already-initialized bindings, so constructing at
+// module load is safe — the module never calls into them until a seam fires.
+const updater = createDesktopUpdater({
+  app,
+  BrowserWindow,
+  ipcMain,
+  dialog,
+  nativeImage,
+  autoUpdater,
+  loadSettings,
+  saveSettings,
+  isPinnedOriginSender,
+  pinnedOrigin,
+  iconPath: ICON_PNG,
+  forceDevUpdateConfig: process.env.OMNIGENT_FORCE_DEV_UPDATE_CONFIG === "1",
+});
 
 // ---------------------------------------------------------------------------
 // Persisted settings (the saved server URL and the recently-connected server
@@ -733,154 +748,6 @@ function loadSettings() {
 function saveSettings(settings) {
   fs.mkdirSync(app.getPath("userData"), { recursive: true });
   fs.writeFileSync(settingsPath(), JSON.stringify(settings, null, 2), "utf8");
-}
-
-function getUpdateConfig() {
-  const settings = loadSettings();
-  const mode = UPDATE_MODES.has(settings.update_mode) ? settings.update_mode : "default";
-  return {
-    mode,
-    autoInstall:
-      typeof settings.update_auto_install === "boolean" ? settings.update_auto_install : true,
-    skippedVersion:
-      typeof settings.update_skipped_version === "string" ? settings.update_skipped_version : null,
-  };
-}
-
-function setUpdateConfig(patch = {}) {
-  const settings = loadSettings();
-  const next = { ...settings };
-  if (Object.prototype.hasOwnProperty.call(patch, "mode") && UPDATE_MODES.has(patch.mode)) {
-    next.update_mode = patch.mode;
-  }
-  if (
-    Object.prototype.hasOwnProperty.call(patch, "autoInstall") &&
-    typeof patch.autoInstall === "boolean"
-  ) {
-    next.update_auto_install = patch.autoInstall;
-  }
-  if (Object.prototype.hasOwnProperty.call(patch, "skippedVersion")) {
-    next.update_skipped_version =
-      typeof patch.skippedVersion === "string" ? patch.skippedVersion : null;
-  }
-  saveSettings(next);
-  return getUpdateConfig();
-}
-
-function broadcastUpdateStatus(status) {
-  currentUpdateStatus = status;
-  for (const win of BrowserWindow.getAllWindows()) {
-    if (win.isDestroyed()) continue;
-    try {
-      win.webContents.send("omnigent:update-status", status);
-    } catch {
-      // Window torn down between enumeration and send; ignore.
-    }
-  }
-}
-
-function canUseUpdaterFeed() {
-  return app.isPackaged || autoUpdater.forceDevUpdateConfig === true;
-}
-
-function isUpdateSecurityError(message) {
-  return /signature|sha512|checksum|not signed|code sign/i.test(message);
-}
-
-function reportUpdatesUnavailableInDev() {
-  broadcastUpdateStatus({ state: "idle", lastError: UPDATES_UNAVAILABLE_IN_DEV });
-}
-
-function updatesUnavailableInDevError() {
-  return new Error(UPDATES_UNAVAILABLE_IN_DEV);
-}
-
-function applyUpdateConfig(cfg) {
-  if (updateCheckTimer) {
-    clearInterval(updateCheckTimer);
-    updateCheckTimer = null;
-  }
-  autoUpdater.autoDownload = false;
-  autoUpdater.autoInstallOnAppQuit = cfg.autoInstall;
-  // v1 is stable-only and rides electron-updater's default "latest" channel.
-  if (!canUseUpdaterFeed() || cfg.mode === "none") return;
-  if (cfg.mode === "manual") return;
-  autoUpdater.checkForUpdates().catch(() => {});
-  if (cfg.mode === "default") {
-    updateCheckTimer = setInterval(
-      () => autoUpdater.checkForUpdates().catch(() => {}),
-      6 * 60 * 60 * 1000,
-    );
-  }
-}
-
-function setupAutoUpdater() {
-  const cfg = getUpdateConfig();
-  if (process.env.OMNIGENT_FORCE_DEV_UPDATE_CONFIG === "1") {
-    autoUpdater.forceDevUpdateConfig = true;
-  }
-  autoUpdater.on("checking-for-update", () => broadcastUpdateStatus({ state: "checking" }));
-  autoUpdater.on("update-available", (info) => {
-    manualCheckInFlight = false;
-    broadcastUpdateStatus({ state: "available", info });
-  });
-  autoUpdater.on("update-not-available", () => {
-    manualCheckInFlight = false;
-    broadcastUpdateStatus({ state: "none" });
-  });
-  autoUpdater.on("download-progress", (progress) =>
-    broadcastUpdateStatus({ state: "downloading", progress }),
-  );
-  autoUpdater.on("update-downloaded", (info) =>
-    broadcastUpdateStatus({ state: "downloaded", info }),
-  );
-  autoUpdater.on("error", (err) => {
-    const msg = String(err?.message ?? err);
-    const isSecurity = isUpdateSecurityError(msg);
-    const wasManualCheck = manualCheckInFlight;
-    manualCheckInFlight = false;
-    console[isSecurity ? "error" : "warn"]("[omnigent] update error:", msg);
-    if (isSecurity || wasManualCheck) {
-      broadcastUpdateStatus({ state: isSecurity ? "error-security" : "idle", lastError: msg });
-    }
-  });
-  applyUpdateConfig(cfg);
-}
-
-function checkForUpdates({ manual = false } = {}) {
-  if (!canUseUpdaterFeed()) {
-    if (manual) reportUpdatesUnavailableInDev();
-    return Promise.reject(updatesUnavailableInDevError());
-  }
-  if (manual) manualCheckInFlight = true;
-  return autoUpdater
-    .checkForUpdates()
-    .then(() => {
-      if (manual) manualCheckInFlight = false;
-      return undefined;
-    })
-    .catch((err) => {
-      const msg = String(err?.message ?? err);
-      if (manualCheckInFlight) {
-        manualCheckInFlight = false;
-        broadcastUpdateStatus({
-          state: isUpdateSecurityError(msg) ? "error-security" : "idle",
-          lastError: msg,
-        });
-      }
-      throw err;
-    });
-}
-
-function installUpdateNow() {
-  if (!canUseUpdaterFeed()) {
-    reportUpdatesUnavailableInDev();
-    return false;
-  }
-  if (currentUpdateStatus.state !== "downloaded") return false;
-  installPending = true;
-  app.quit();
-  return true;
 }
 
 /**
@@ -1740,65 +1607,6 @@ async function confirmHostEnrollment(win) {
 }
 
 /**
- * Native confirmation for update controls invoked by the pinned server page.
- * This intentionally does NOT reuse the persisted hosting grant: enrolling a
- * host authorizes local agent execution, not downloading or installing a new
- * desktop binary.
- *
- * @param {BrowserWindow | null | undefined} win The window requesting control.
- * @param {"download" | "install" | "config"} action The update operation.
- * @returns {Promise<boolean>} True when the user approved this one action.
- */
-async function confirmUpdateControl(win, action) {
-  if (!win) return false;
-  const pinned = pinnedOrigin(win);
-  if (!pinned) return false;
-
-  let host = pinned;
-  try {
-    host = new URL(pinned).host;
-  } catch {
-    // Keep the full origin string if it somehow doesn't parse.
-  }
-
-  const copy = {
-    download: {
-      message: "Download an Omnigent update?",
-      detail:
-        `${host} wants to download a desktop update for this Omnigent app.\n\n` +
-        `Only allow servers you trust.`,
-    },
-    install: {
-      message: "Restart Omnigent to install an update?",
-      detail:
-        `${host} wants to restart Omnigent and install the downloaded desktop update.\n\n` +
-        `Only allow servers you trust.`,
-    },
-    config: {
-      message: "Change Omnigent update settings?",
-      detail:
-        `${host} wants to change how this Omnigent app checks for and installs updates.\n\n` +
-        `Only allow servers you trust.`,
-    },
-  }[action];
-  if (!copy) return false;
-
-  const icon = nativeImage.createFromPath(ICON_PNG);
-  const { response } = await dialog.showMessageBox(win, {
-    type: "warning",
-    icon: icon.isEmpty() ? undefined : icon,
-    title: "Omnigent",
-    message: copy.message,
-    detail: copy.detail,
-    buttons: ["Don't Allow", "Allow Once"],
-    defaultId: 0,
-    cancelId: 0,
-    noLink: true,
-  });
-  return response === 1;
-}
-
-/**
  * OS-level attention cue for a notification fired while the app is frontmost,
  * where the banner is suppressed by the OS. On macOS we bounce the dock icon
  * (`informational` = a single gentle bounce); on Windows/Linux we flash the
@@ -2022,14 +1830,14 @@ function buildMenu() {
         id: "check_for_updates",
         label: "Check for Updates…",
         click: () => {
-          checkForUpdates({ manual: true }).catch(() => {});
+          updater.checkForUpdates({ manual: true }).catch(() => {});
         },
       },
       {
         id: "restart_to_update",
         label: "Restart to Update",
         click: () => {
-          if (currentUpdateStatus.state === "downloaded") installUpdateNow();
+          if (updater.getStatus().state === "downloaded") updater.installUpdateNow();
         },
       },
     ],
@@ -2598,75 +2406,9 @@ function registerIpc() {
     return clearCliPath();
   });
 
-  ipcMain.handle("omnigent:get-update-config", (event) => {
-    if (!isPinnedOriginSender(event)) {
-      throw new Error("get-update-config is only available to a connected server page");
-    }
-    return getUpdateConfig();
-  });
-
-  ipcMain.handle("omnigent:get-update-status", (event) => {
-    if (!isPinnedOriginSender(event)) {
-      throw new Error("get-update-status is only available to a connected server page");
-    }
-    return currentUpdateStatus;
-  });
-
-  ipcMain.handle("omnigent:update-check", async (event) => {
-    if (!isPinnedOriginSender(event)) {
-      throw new Error("update-check is only available to a connected server page");
-    }
-    await checkForUpdates({ manual: true });
-  });
-
-  ipcMain.handle("omnigent:update-download", async (event) => {
-    if (!isPinnedOriginSender(event)) {
-      throw new Error("update-download is only available to a connected server page");
-    }
-    if (!canUseUpdaterFeed()) {
-      reportUpdatesUnavailableInDev();
-      throw updatesUnavailableInDevError();
-    }
-    const win = BrowserWindow.fromWebContents(event.sender);
-    if (!(await confirmUpdateControl(win, "download"))) {
-      throw new Error("Update download wasn't approved for this server.");
-    }
-    await autoUpdater.downloadUpdate();
-  });
-
-  ipcMain.handle("omnigent:update-install", async (event) => {
-    if (!isPinnedOriginSender(event)) {
-      throw new Error("update-install is only available to a connected server page");
-    }
-    if (!canUseUpdaterFeed()) {
-      reportUpdatesUnavailableInDev();
-      throw updatesUnavailableInDevError();
-    }
-    const win = BrowserWindow.fromWebContents(event.sender);
-    if (!(await confirmUpdateControl(win, "install"))) {
-      throw new Error("Update install wasn't approved for this server.");
-    }
-    if (!installUpdateNow()) {
-      throw new Error("No downloaded update is ready to install.");
-    }
-  });
-
-  ipcMain.handle("omnigent:set-update-config", async (event, patch) => {
-    if (!isPinnedOriginSender(event)) {
-      throw new Error("set-update-config is only available to a connected server page");
-    }
-    if (!canUseUpdaterFeed()) {
-      reportUpdatesUnavailableInDev();
-      throw updatesUnavailableInDevError();
-    }
-    const win = BrowserWindow.fromWebContents(event.sender);
-    if (!(await confirmUpdateControl(win, "config"))) {
-      throw new Error("Update settings change wasn't approved for this server.");
-    }
-    const cfg = setUpdateConfig(patch);
-    applyUpdateConfig(cfg);
-    return cfg;
-  });
+  // Updater IPC surface (get/set config, get status, check/download/install).
+  // The module owns the handlers and their trusted-sender + consent gates.
+  updater.registerIpc();
 
   // SPA → start / stop / restart this machine's host daemon for the window's
   // own server (the host selection menu's "connect this machine" action).
@@ -3122,7 +2864,7 @@ if (!gotLock) {
     } else {
       createWindow();
     }
-    setupAutoUpdater();
+    updater.init();
 
     app.on("activate", () => {
       // macOS: re-create the window when the dock icon is clicked and none
@@ -3162,8 +2904,9 @@ if (!gotLock) {
       .catch(() => {})
       .finally(() => {
         quitCleanupDone = true;
-        if (installPending) autoUpdater.quitAndInstall(false, true);
-        else app.quit();
+        // Hand off to a user-approved install if one is pending; otherwise
+        // complete the deferred quit.
+        if (!updater.quitAndInstallIfPending()) app.quit();
       });
   });
 }
