@@ -319,7 +319,7 @@ def _tune_sqlite_database(engine: Engine) -> None:
     fresh WAL. Tradeoff: the first open of a large never-analyzed
     database pays a one-time ANALYZE.
 
-    Both statements are advisory: a locked or read-only database must not
+    These tuning steps are advisory: a locked or read-only database must not
     prevent the engine from being served.
     """
     try:
