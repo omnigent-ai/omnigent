@@ -43,7 +43,7 @@ that's governed end to end.
 Amazon Bedrock is a supported provider for Databricks
 [external model endpoints](https://docs.databricks.com/aws/en/generative-ai/external-models/)
 (`amazon-bedrock`). Serve a Bedrock-hosted Anthropic Claude model as a Databricks
-serving endpoint, enable AI Gateway on it, then point this agent at that endpoint via
+serving endpoint, enable [AI Gateway](https://docs.databricks.com/aws/en/ai-gateway/) on it, then point this agent at that endpoint via
 the `claude-sdk` harness:
 
 ```yaml
