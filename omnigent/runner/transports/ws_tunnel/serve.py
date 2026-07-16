@@ -17,7 +17,9 @@ import base64
 import binascii
 import contextlib
 import logging
+import os
 import random
+import ssl
 from collections.abc import Awaitable, Callable
 from typing import Any
 from urllib.parse import quote, urlsplit, urlunsplit
@@ -49,6 +51,12 @@ from omnigent.runner.transports.ws_tunnel.limits import (
     RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
     TUNNEL_KEEPALIVE_PING_INTERVAL_S,
     TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
+)
+from omnigent.runner.transports.ws_tunnel.tls import (
+    TunnelTLSError,
+    ca_bundle_fix_hint,
+    is_tls_verification_failure,
+    tunnel_ssl_context,
 )
 
 _logger = logging.getLogger(__name__)
@@ -309,6 +317,24 @@ async def serve_tunnel(
             delay_s = _INITIAL_RECONNECT_DELAY_S
         except asyncio.CancelledError:
             raise
+        except TunnelTLSError as exc:
+            # A configured-but-broken CA bundle (missing path, not a PEM) can
+            # never be fixed by retrying — fail loud with the clean message
+            # instead of crashing the runner with a raw traceback.
+            raise RuntimeError(str(exc)) from exc
+        except ssl.SSLError as exc:
+            # A certificate-verification failure is permanent: reconnecting can
+            # never teach the process to trust the cert, so fail loud with the
+            # bundle hint. Other TLS errors (a mid-handshake EOF from a bounced
+            # ingress) stay on the retry path below.
+            if is_tls_verification_failure(exc):
+                raise RuntimeError(
+                    f"TLS verification failed for {tunnel_url}: {exc}. This usually "
+                    "means a TLS-inspecting corporate proxy (Zscaler/Netskope) or a "
+                    "private CA is re-signing the connection with a certificate your "
+                    f"system trust store doesn't know. {ca_bundle_fix_hint()}"
+                ) from exc
+            retry_reason = str(exc)
         except WebSocketException as exc:
             redirect_url = _websocket_auth_redirect_url(exc)
             if redirect_url is not None:
@@ -544,6 +570,10 @@ async def _serve_tunnel_once(
     headers.update(databricks_request_headers(server_url, bearer_token=auth_token))
     if tunnel_token:
         headers[RUNNER_TUNNEL_TOKEN_HEADER] = tunnel_token
+    # Omit ``ssl`` entirely when no CA bundle is configured so websockets
+    # keeps its own default handling (and never sees ssl= on a ws:// URL).
+    ssl_context = tunnel_ssl_context(tunnel_url, os.environ)
+    tls_kwargs = {"ssl": ssl_context} if ssl_context is not None else {}
     async with websockets.connect(
         tunnel_url,
         additional_headers=headers,
@@ -554,6 +584,9 @@ async def _serve_tunnel_once(
         # Also the runner's only liveness probe for a silently-dead server.
         ping_interval=TUNNEL_KEEPALIVE_PING_INTERVAL_S,
         ping_timeout=TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
+        # Only carries ``ssl`` when a CA bundle override is set; the default
+        # path passes nothing so websockets keeps its own default handling.
+        **tls_kwargs,  # type: ignore[arg-type]
     ) as ws:
         await _send_hello(ws.send, runner_version)
         _logger.info("runner %s connected to %s", runner_id, tunnel_url)

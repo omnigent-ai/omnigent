@@ -612,6 +612,7 @@ explicit consent and PII handling in place.
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | Workspace URL (same as `DATABRICKS_HOST`) | Apps env |
 | `OTEL_EXPORTER_OTLP_HEADERS` | `Authorization=Bearer $DATABRICKS_TOKEN` | Apps env |
 | `OMNIGENT_OTEL_CAPTURE_CONTENT` | `true` to include message bodies in traces | Apps env (default off) |
+| `OMNIGENT_CA_BUNDLE` | PEM CA bundle the host/runner tunnel trusts, for a TLS-inspecting proxy or private CA | Local shell where you run `omnigent host` |
 
 ---
 
@@ -672,6 +673,22 @@ fresh Lakebase project per omnigent app rather than sharing one.
 The External Model's underlying provider key (stored in workspace
 secrets) has expired or rotated. Update the secret value, then update
 the endpoint config via `databricks serving-endpoints update`.
+
+### `omnigent host` loops on "CERTIFICATE_VERIFY_FAILED"
+
+The host tunnel is a `wss://` connection. When a corporate
+TLS-inspecting proxy (Zscaler / Netskope) or a private CA re-signs it,
+the certificate isn't in your system trust store and the handshake
+fails to verify. Export your organisation's CA bundle as a PEM file and
+point `OMNIGENT_CA_BUNDLE` at it:
+
+```bash
+OMNIGENT_CA_BUNDLE=/path/to/corp-ca.pem omnigent host --server https://<workspace>.databricks.com
+```
+
+`SSL_CERT_FILE` and `REQUESTS_CA_BUNDLE` are honoured too if already
+set. The bundle is forwarded to spawned runners so their tunnels trust
+the same CA.
 
 ---
 
