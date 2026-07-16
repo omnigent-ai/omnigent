@@ -643,6 +643,67 @@ async def test_watch_runner_silent_on_intentional_stop(
     assert host._unreported_exits == {}
 
 
+async def test_watch_runner_silent_on_clean_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A runner that exits 0 on its own is NOT reported as a crash.
+
+    A runner shuts itself down with exit code 0 when its idle timeout
+    fires ("runner idle timeout reached ... with no active work") while
+    still tracked by the daemon — no ``host.stop_runner`` ever pops the
+    handle. Reporting that exit as ``host.runner_exited`` makes the
+    server mark the runner's idle sessions failed with
+    ``runner_failed_to_start`` even though nothing failed; the runner's
+    tunnel disconnect already drives the server-side transition.
+    """
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
+    monkeypatch.setattr("omnigent.host.connect._RUNNER_WATCH_INTERVAL_S", 0.01)
+    host = _make_host_process()
+    tunnel = _FakeTunnel()
+    host._ws = tunnel  # type: ignore[assignment] — duck-typed send
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+
+    original_popen = subprocess.Popen
+
+    def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        """Spawn a runner that lives briefly, then exits cleanly (code 0).
+
+        The initial sleep keeps ``poll()`` None at launch time so the
+        launch itself succeeds; the process then exits 0 of its own
+        accord, like a runner hitting its idle timeout.
+
+        :param args: Command args (ignored).
+        :param kwargs: Popen kwargs from production, including the log
+            file handles.
+        :returns: A live subprocess handle.
+        """
+        return original_popen(
+            ["sh", "-c", "sleep 0.2; exit 0"],
+            stdin=subprocess.DEVNULL,
+            stdout=kwargs["stdout"],
+            stderr=kwargs["stderr"],
+        )
+
+    launch = HostLaunchRunnerFrame(
+        request_id="req_clean",
+        binding_token="tok_clean",
+        workspace=str(workspace),
+    )
+    with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
+        result = await host._handle_launch(launch)
+    assert result.status == "launched", result.error
+
+    # Let the watcher observe the clean self-exit and finish.
+    await asyncio.wait_for(asyncio.gather(*host._watcher_tasks), timeout=5.0)
+
+    # No runner_exited report and nothing parked for a reconnect —
+    # either would fail idle sessions on a graceful shutdown.
+    assert tunnel.sent == []
+    assert host._unreported_exits == {}
+
+
 async def test_unreported_exit_flushes_after_reconnect(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

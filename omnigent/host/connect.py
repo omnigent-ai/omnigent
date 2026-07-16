@@ -1204,7 +1204,9 @@ class HostProcess:
 
         :param runner_id: The runner to watch, e.g.
             ``"runner_abc123..."``.
-        :returns: None. Returns silently for intentional stops.
+        :returns: None. Returns silently for intentional stops and for
+            clean (code 0) exits such as the runner's own idle-timeout
+            shutdown.
         """
         handle = self._runners.get(runner_id)
         if handle is None:  # pragma: no cover — spawned just before us
@@ -1214,6 +1216,18 @@ class HostProcess:
         if self._runners.get(runner_id) is not handle:
             # _handle_stop (or _cleanup_runners) removed it first —
             # an intentional termination, not a crash to report.
+            return
+        if handle.proc.returncode == 0:
+            # A zero exit is a deliberate shutdown — e.g. the runner's own
+            # idle timeout ("runner idle timeout reached ... with no active
+            # work") — not a crash. Its tunnel disconnect already drives the
+            # server-side session transition; a host.runner_exited report
+            # here would mark those idle sessions failed with
+            # "runner_failed_to_start" even though nothing failed.
+            _logger.info(
+                "Runner %s exited cleanly (code 0); not reporting as a crash",
+                runner_id,
+            )
             return
         error = _runner_exit_error(handle.proc.returncode, handle.log_path)
         _logger.warning("Runner %s died unexpectedly: %s", runner_id, error)
