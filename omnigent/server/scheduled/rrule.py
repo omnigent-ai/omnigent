@@ -67,7 +67,7 @@ def _anchor_dtstart(after: datetime, tz: ZoneInfo) -> datetime:
     different weekday can slip such a rule by one period. ``INTERVAL=1`` rules
     (hourly/daily/simple-weekly) are unaffected. This is acceptable for the
     current preset set; a proper fix — persisting a stable per-task ``dtstart``
-    — belongs to a later PR if unbounded-interval rules become user-facing.
+    — is deferred to future work if unbounded-interval rules become user-facing.
     """
     local = after.astimezone(tz)
     return local.replace(hour=0, minute=0, second=0, microsecond=0)

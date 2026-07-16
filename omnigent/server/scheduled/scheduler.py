@@ -160,7 +160,7 @@ class ScheduledTaskScheduler:
         self._jobs.clear()
         self._started = False
 
-    # ── CRUD sync (for a later API PR to keep timers in sync with rows) ───────
+    # ── CRUD sync (keeps timers in sync with row changes) ─────────────────────
 
     def add(self, task: ScheduledTask) -> None:
         """Register a task if it is active. No-op for paused/deleted tasks."""
