@@ -785,6 +785,11 @@ export function initChatStore(client: QueryClient): void {
   workspaceInvalidationTimers.clear();
   backgroundFlushInFlight.clear();
   backgroundFlushCooldownUntil.clear();
+  // Abort every keep-alive pump and drop the registry. Production calls this
+  // once at boot (nothing live yet); tests call it per case so a warm pump from
+  // one case can't be reused (or leak an open stream) into the next.
+  for (const entry of pumpRegistry.values()) entry.controller?.abort();
+  pumpRegistry.clear();
   // Reset the POST-ordering chain so a prior run's unresolved send can't block
   // the next one (production calls this once at boot; tests call it per case).
   sendChain = Promise.resolve();
@@ -1538,10 +1543,19 @@ export const useChatStore = create<ChatState>((set, get) => ({
   switchTo: async (conversationId) => {
     if (get().conversationId === conversationId) return;
 
-    // Abort the prior session's stream. The reader loop in
-    // bindStream's pump unwinds via AbortError and stops applying
-    // events to state.blocks.
-    get().abortController?.abort();
+    // Stash the OUTGOING conversation's live runtime into its pump entry so it
+    // keeps rendering off live SSE while backgrounded. The pump is NOT aborted
+    // (keep-alive) — the global store's `abortController` is only the currently
+    // foreground pump's, so nulling it below just detaches the handle.
+    const prevId = get().conversationId;
+    if (prevId !== null) {
+      const prevEntry = pumpRegistry.get(prevId);
+      if (prevEntry && !prevEntry.settled) prevEntry.runtime = extractRuntime(get());
+    }
+    // The incoming pump: reuse a warm one (instant repaint) or create a cold one.
+    const entry = conversationId !== null ? getOrCreatePump(conversationId) : null;
+    if (entry) entry.lastViewedAt = Date.now();
+    const warm = entry != null && !entry.settled && (entry.runtime.blocks?.length ?? 0) > 0;
 
     set((s) => {
       // Stash the OUTGOING conversation's still-in-flight optimistic
@@ -1582,7 +1596,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
           delete pendingByConversation[s.conversationId];
         }
       }
-      return {
+      const base: Partial<ChatState> = {
         pendingByConversation,
         conversationId,
         // Clear any pending supersession redirect: we've now switched
@@ -1634,18 +1648,36 @@ export const useChatStore = create<ChatState>((set, get) => ({
         pendingComposerAttachments: [],
         sandboxStatus: null,
         mcpStartup: null,
-        abortController: null,
+        // Publish the incoming pump's controller as the foreground handle so
+        // `send`'s "pump is gone" rebind guard (`abortController === null`)
+        // sees the live stream. Null only when switching to no conversation.
+        abortController: entry?.controller ?? null,
         historyGeneration: s.historyGeneration + 1,
       };
+      // Warm switch: the incoming pump is already live, so repaint instantly
+      // from its runtime shadow instead of blanking + showing the loader.
+      // `entry.controller` is re-published so `send`'s "pump is gone" rebind
+      // guard sees the live stream.
+      if (warm && entry) {
+        return {
+          ...base,
+          ...entry.runtime,
+          conversationId,
+          pendingByConversation,
+          redirectToConversationId: null,
+          pendingComposerAttachments: [],
+          abortController: entry.controller,
+        };
+      }
+      return base;
     });
 
-    if (conversationId === null) return;
-    // hydratePending: this is a cold load / navigation. When no bubble was
-    // restored from the stash above, replay the snapshot's un-consumed
-    // native messages; when one was, bindStream dedupes it against the
-    // committed snapshot. Reconnect/rebind paths pass false so they never
-    // overwrite the live optimistic bubbles (which would flink).
-    await bindStream(conversationId, set, get, true);
+    // Cold switch: `getOrCreatePump` kicked off `bindStream` on a scoped
+    // set/get, which hydrates and mirrors into the store (this conversation is
+    // now foreground). Await its first hydration so callers that `await
+    // switchTo(...)` observe the loaded transcript. A warm reuse's `hydration`
+    // already resolved, so this is instant and the view is already painted.
+    if (entry) await entry.hydration;
   },
 
   submitApproval: async (elicitationId, action, content) => {
@@ -1959,6 +1991,173 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
 type Setter = (partial: Partial<ChatState> | ((state: ChatState) => Partial<ChatState>)) => void;
 type Getter = () => ChatState;
+
+// ── Keep-alive pump registry (issue #2557) ──────────────────
+// Switching chats used to abort the SSE stream and blank the view. Instead we
+// keep a bounded set of pumps alive, one per recently-viewed conversation. Each
+// backgrounded pump keeps writing into its own runtime shadow, so returning to
+// it repaints instantly from live state — no teardown, no refetch. The active
+// conversation's runtime is mirrored into the global store the UI selects.
+
+// The session-scoped fields owned per-conversation. Mirrors the reset block in
+// `switchTo` (the authoritative "these belong to one conversation" list) plus
+// the pump-written defaults. Global/sticky fields (`selectedEffort`,
+// `selectedModel`, `pendingByConversation`, `queuedMessages`,
+// `redirectToConversationId`, `abortController`) are deliberately excluded.
+const SESSION_SCOPED_KEYS = [
+  "blocks",
+  "pendingUserMessages",
+  "activeResponse",
+  "interruptedResponseIds",
+  "status",
+  "sessionStatus",
+  "backgroundTaskCount",
+  "isNativeTerminalSession",
+  "nativeVendorOwnsModel",
+  "boundAgentId",
+  "boundAgentName",
+  "loadingConversation",
+  "conversationLoadError",
+  "hasMoreHistory",
+  "loadingMoreHistory",
+  "oldestItemId",
+  "flashItemId",
+  "llmModel",
+  "sessionHarness",
+  "subAgentName",
+  "sessionModelOverride",
+  "costControlModeOverride",
+  "codexPlanMode",
+  "contextWindow",
+  "tokensUsed",
+  "sessionCostUsd",
+  "sessionUsageByModel",
+  "gitBranch",
+  "todos",
+  "skills",
+  "codexModelOptions",
+  "terminalPending",
+  "viewers",
+  "pendingComposerAttachments",
+  "sandboxStatus",
+  "mcpStartup",
+  "historyGeneration",
+] as const satisfies readonly (keyof ChatState)[];
+
+type ConversationRuntime = Partial<Pick<ChatState, (typeof SESSION_SCOPED_KEYS)[number]>>;
+
+const SESSION_SCOPED_SET: ReadonlySet<string> = new Set(SESSION_SCOPED_KEYS);
+
+/** Snapshot the session-scoped subset of a full store state into a runtime. */
+function extractRuntime(s: ChatState): ConversationRuntime {
+  const rt: ConversationRuntime = {};
+  for (const k of SESSION_SCOPED_KEYS) {
+    (rt as Record<string, unknown>)[k] = s[k];
+  }
+  return rt;
+}
+
+/** Bound on simultaneously-live pumps (each holds an open SSE stream, which is
+ * the presence uplink — see `startStreamPump`). Keeps the current + last 2. */
+const MAX_LIVE_PUMPS = 3;
+
+interface PumpEntry {
+  /** Per-conversation shadow: source of truth for this chat while backgrounded. */
+  runtime: ConversationRuntime;
+  /** The pump's AbortController, captured from its `bindStream` scopedSet so the
+   * registry can evict it. Null until the pump sets it (synchronously, in
+   * `bindStream`'s prefix before its first await). */
+  controller: AbortController | null;
+  /** Resolves after the first snapshot hydration (NOT when the stream ends — the
+   * keep-alive `startStreamPump` runs fire-and-forget inside `bindStream`). The
+   * cold-load path awaits this so `switchTo` still settles once painted. */
+  hydration: Promise<void>;
+  /** True once the pump has been aborted (evicted / torn down); a settled entry
+   * is not reusable. Driven by the controller's abort, the real "pump dead"
+   * signal — `bindStream` resolving does not settle the pump. */
+  settled: boolean;
+  /** For idle eviction — bumped on every `switchTo` into this conversation. */
+  lastViewedAt: number;
+}
+
+const pumpRegistry = new Map<string, PumpEntry>();
+
+/**
+ * Scoped `set`/`get` for a keep-alive pump, so the pump/bindStream bodies stay
+ * unchanged while their writes are redirected per-conversation.
+ *
+ * - `get` reports the conversation as always-active (`conversationId === id`),
+ *   so the pump/loop never self-terminate on a foreground switch — only an
+ *   explicit `abort()` (eviction / teardown) ends them.
+ * - When foreground, reads/writes pass straight through to the real store (the
+ *   UI paints live). When backgrounded, reads layer the runtime shadow over
+ *   globals and writes accrue into the shadow only.
+ */
+function scopedIO(id: string, entry: PumpEntry): { set: Setter; get: Getter } {
+  const isForeground = (): boolean => useChatStore.getState().conversationId === id;
+  const scopedGet: Getter = () =>
+    isForeground()
+      ? useChatStore.getState()
+      : ({ ...useChatStore.getState(), ...entry.runtime, conversationId: id } as ChatState);
+  const scopedSet: Setter = (partial) => {
+    const resolved = typeof partial === "function" ? partial(scopedGet()) : partial;
+    // Capture the pump's AbortController so the registry can evict this pump.
+    // Its abort is the authoritative "pump dead" signal → settle + drop the slot.
+    if (resolved.abortController != null) {
+      entry.controller = resolved.abortController;
+      resolved.abortController.signal.addEventListener("abort", () => {
+        entry.settled = true;
+        if (pumpRegistry.get(id) === entry) pumpRegistry.delete(id);
+      });
+    }
+    // Accrue only session-scoped keys into the shadow so a backgrounded pump's
+    // state survives until return; global/sticky fields are never shadowed.
+    for (const [k, v] of Object.entries(resolved)) {
+      if (SESSION_SCOPED_SET.has(k)) (entry.runtime as Record<string, unknown>)[k] = v;
+    }
+    // Mirror to the global store only while this conversation is foreground.
+    if (isForeground()) useChatStore.setState(resolved);
+  };
+  return { set: scopedSet, get: scopedGet };
+}
+
+/**
+ * Return the live pump for `id`, creating (and hydrating via `bindStream`) one
+ * if none exists or the previous one has settled. A running pump — including one
+ * mid-reconnect — is reused as-is.
+ */
+function getOrCreatePump(id: string): PumpEntry {
+  const existing = pumpRegistry.get(id);
+  if (existing && !existing.settled) return existing;
+
+  const entry: PumpEntry = {
+    runtime: {},
+    controller: null,
+    hydration: Promise.resolve(),
+    settled: false,
+    lastViewedAt: Date.now(),
+  };
+  pumpRegistry.set(id, entry);
+  const { set: scopedSet, get: scopedGet } = scopedIO(id, entry);
+  // hydratePending=true: this is a cold load for the conversation. bindStream
+  // resolves after the first snapshot hydration; the keep-alive stream pump it
+  // spawns keeps running until the controller aborts (see scopedSet).
+  entry.hydration = bindStream(id, scopedSet, scopedGet, true);
+  evictIdlePumps(id);
+  return entry;
+}
+
+/** Abort the oldest background pumps beyond `MAX_LIVE_PUMPS`. Aborting unwinds
+ * the loop, which clears its own registry slot — so a later return cold-reloads. */
+function evictIdlePumps(activeId: string): void {
+  const live = [...pumpRegistry.entries()].filter(([, e]) => !e.settled);
+  if (live.length <= MAX_LIVE_PUMPS) return;
+  live
+    .filter(([cid]) => cid !== activeId)
+    .sort(([, a], [, b]) => a.lastViewedAt - b.lastViewedAt)
+    .slice(0, live.length - MAX_LIVE_PUMPS)
+    .forEach(([, e]) => e.controller?.abort());
+}
 
 type NativeModelFamily = "claude" | "codex";
 
