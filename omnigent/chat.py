@@ -601,9 +601,51 @@ def _is_url(target: str) -> bool:
 # Server URL client helpers
 # ---------------------------------------------------------------------------
 
+# Client-side ``session_id → host_id`` tracking, for routing a session's
+# tunnel-bound traffic to the right server replica when the server runs
+# multiple.
+#
+# A host's control tunnel and its runners' tunnels register on a single
+# replica, so the turn / resource / stream calls for a session running on that
+# host must name the host or they can reach a different replica than the runner
+# tunnel they need. The host_id is the routing key; it's populated when the CLI
+# learns a session's host (session GETs, daemon launch) and read once when a
+# client for that session is built — callers pass the session_id they already
+# have to ``_server_auth`` rather than the auth re-deriving it per request. This
+# is the Python peer of the web UI's ``sessionHost.ts``. (The host_id is
+# translated into the managed server's Dicer slice-key header inside
+# ``cli_auth.databricks_request_headers``; OSS only ever threads a host_id.)
+_session_hosts: dict[str, str] = {}
+
+
+def set_session_host(session_id: str, host_id: str | None) -> None:
+    """Record (or clear) the host a session is bound to.
+
+    A ``None``/empty host clears any stale mapping so a session that loses its
+    host binding stops routing to the old replica.
+
+    :param session_id: Session id, e.g. ``"conv_abc123"``.
+    :param host_id: The bound host id, e.g. ``"host_abc123"``, or ``None``.
+    """
+    if host_id:
+        _session_hosts[session_id] = host_id
+    else:
+        _session_hosts.pop(session_id, None)
+
+
+def get_session_host(session_id: str) -> str | None:
+    """Return a session's bound host id, or ``None`` when unknown.
+
+    :param session_id: Session id, e.g. ``"conv_abc123"``.
+    :returns: The host id, or ``None`` (session not seen yet, or hostless).
+    """
+    return _session_hosts.get(session_id)
+
 
 def _remote_headers(
     server_url: str | None = None,
+    *,
+    host_id: str | None = None,
 ) -> dict[str, str]:
     """
     Build headers for remote AP-server requests.
@@ -652,11 +694,14 @@ def _remote_headers(
             headers["Authorization"] = f"Bearer {creds.token}"
     # Workspace routing: when a ?o= selector was recorded at login, name the
     # workspace or the request routes to the account. Merged onto the result
-    # because these ad-hoc requests carry no httpx Auth.
+    # because these ad-hoc requests carry no httpx Auth. ``host_id`` pins a
+    # host-scoped request to the server replica holding that host's tunnel
+    # (translated to the Dicer slice-key header inside the builder); callers
+    # derive it from the request path.
     if server_url:
         from omnigent.cli_auth import databricks_request_headers
 
-        headers.update(databricks_request_headers(server_url))
+        headers.update(databricks_request_headers(server_url, host_id=host_id))
     return headers
 
 
@@ -706,12 +751,18 @@ class _DatabricksTokenAuth(httpx.Auth):
     def __init__(
         self,
         server_url: str | None = None,
+        *,
+        session_id: str | None = None,
     ) -> None:
         """
         :param server_url: Remote server URL for looking up stored
             OIDC tokens, e.g. ``"http://localhost:6767"``.
+        :param session_id: The single session this client drives; its
+            requests are pinned to that session's host replica. ``None``
+            for a hostless / local client.
         """
         self._server_url = server_url
+        self._session_id = session_id
         raw = os.environ.get(_REMOTE_AUTH_TOKEN_ENV)
         self._static_token = raw.strip() if raw else None
         # Lazily-resolved, then reused, SDK auth (one Config → one token
@@ -775,11 +826,18 @@ class _DatabricksTokenAuth(httpx.Auth):
         :yields: The request with auth header set.
         """
         # Workspace routing (empty when none recorded); independent of the
-        # credential branch below.
+        # credential branch below. On the workspace-hosted server, also pin the
+        # turn/resource/stream traffic for this client's session to the replica
+        # holding its runner tunnel — the slice key is the session's host_id,
+        # from the session→host map. Local / self-hosted servers have no Dicer,
+        # so no key.
         if self._server_url:
             from omnigent.cli_auth import databricks_request_headers
 
-            request.headers.update(databricks_request_headers(self._server_url))
+            session_host = get_session_host(self._session_id) if self._session_id else None
+            request.headers.update(
+                databricks_request_headers(self._server_url, host_id=session_host)
+            )
         if self._static_token:
             request.headers["Authorization"] = f"Bearer {self._static_token}"
             yield request
@@ -823,6 +881,8 @@ def _server_headers(
 
 def _server_auth(
     server_url: str | None = None,
+    *,
+    session_id: str | None = None,
 ) -> httpx.Auth | None:
     """
     Build an httpx Auth for a remote Omnigent server client.
@@ -835,21 +895,26 @@ def _server_auth(
 
     :param server_url: Optional remote server URL for looking up
         stored OIDC tokens.
+    :param session_id: The single session this client drives, e.g.
+        ``"conv_abc123"``. When set, the auth pins every request to the
+        replica holding that session's runner tunnel (its host, looked up
+        in the session→host map). Callers pass the session they already
+        know instead of the auth parsing it back out of each URL.
     :returns: Auth instance, or ``None``.
     """
     raw = os.environ.get(_REMOTE_AUTH_TOKEN_ENV)
     if raw and raw.strip():
-        return _DatabricksTokenAuth(server_url=server_url)
+        return _DatabricksTokenAuth(server_url=server_url, session_id=session_id)
     # Check stored `omnigent login` records: a session JWT or a
     # Databricks Apps pointer record.
     if server_url:
         from omnigent.cli_auth import load_databricks_workspace_host, load_token
 
         if load_token(server_url) or load_databricks_workspace_host(server_url):
-            return _DatabricksTokenAuth(server_url=server_url)
+            return _DatabricksTokenAuth(server_url=server_url, session_id=session_id)
     creds = _read_databrickscfg(None)
     if creds is not None and creds.token:
-        return _DatabricksTokenAuth(server_url=server_url)
+        return _DatabricksTokenAuth(server_url=server_url, session_id=session_id)
     return None
 
 
@@ -1460,6 +1525,11 @@ def _attach_session_info(
         return empty
     if not isinstance(body, dict):
         return empty
+    # Record the session's host so host-scoped requests (turn dispatch,
+    # resource, stream) can reach the replica holding that host's runner tunnel.
+    session_host = body.get("host_id")
+    if isinstance(session_host, str) and session_host:
+        set_session_host(conversation_id, session_host)
     runner_id = body.get("runner_id")
     snapshot_online = body.get("runner_online")
     if not isinstance(runner_id, str) or not runner_id:
@@ -1682,6 +1752,7 @@ async def _prepare_chat_session_via_daemon(
     )
     from omnigent.host.daemon_launch import (
         launch_or_reuse_daemon_runner,
+        open_daemon_client,
         wait_for_host_online,
         wait_for_runner_online,
     )
@@ -1700,16 +1771,19 @@ async def _prepare_chat_session_via_daemon(
             session_id = created.id
 
     # A separate raw httpx client for the host-runner protocol (the daemon
-    # launch helpers operate on httpx, not the SDK).
+    # launch helpers operate on httpx, not the SDK), pinned to the host's replica.
     timeout = httpx.Timeout(30.0, read=120.0)
-    async with httpx.AsyncClient(
-        base_url=base_url, headers=headers, auth=auth, timeout=timeout
+    async with open_daemon_client(
+        base_url, headers, host_id, auth=auth, timeout=timeout
     ) as client:
         if progress is not None:
             progress.update(STARTUP_PHASE_CONNECTING)
         await wait_for_host_online(client, host_id, timeout_s=_DAEMON_CHAT_HOST_ONLINE_TIMEOUT_S)
         if progress is not None:
             progress.update(STARTUP_PHASE_LAUNCHING_AGENT)
+        # Record the session's host so its turn/resource/stream traffic reaches
+        # the replica holding the host's runner tunnel.
+        set_session_host(session_id, host_id)
         runner_id = await launch_or_reuse_daemon_runner(
             client, host_id=host_id, session_id=session_id, workspace=workspace
         )
@@ -3977,7 +4051,7 @@ def _run_repl(
         async with OmnigentClient(
             base_url=base_url,
             headers=_server_headers(runner_id=runner_id),
-            auth=_server_auth(server_url=base_url),
+            auth=_server_auth(server_url=base_url, session_id=resume_conversation_id),
         ) as client:
             # When --fork is set, call the fork endpoint before
             # entering the REPL so the user lands in the fork.
@@ -4068,7 +4142,7 @@ def _run_one_shot(
         async with OmnigentClient(
             base_url=base_url,
             headers=_server_headers(runner_id=runner_id),
-            auth=_server_auth(server_url=base_url),
+            auth=_server_auth(server_url=base_url, session_id=resume_conversation_id),
         ) as client:
             if session_bundle is not None:
                 text = await _query_sessions_once(

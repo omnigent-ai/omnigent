@@ -17,6 +17,7 @@ import base64
 import binascii
 import contextlib
 import logging
+import os
 import random
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -26,6 +27,7 @@ from websockets.exceptions import InvalidURI, WebSocketException
 
 from omnigent.runner.identity import (
     OMNIGENT_INTERNAL_WS_ORIGIN,
+    RUNNER_SLICE_KEY_ENV_VAR,
     RUNNER_TUNNEL_TOKEN_HEADER,
 )
 from omnigent.runner.transports.ws_tunnel.frames import (
@@ -541,7 +543,13 @@ async def _serve_tunnel_once(
     from omnigent.cli_auth import databricks_request_headers
 
     headers: dict[str, str] = {"Origin": OMNIGENT_INTERNAL_WS_ORIGIN}
-    headers.update(databricks_request_headers(server_url, bearer_token=auth_token))
+    # Co-locate this runner's tunnel with its host's on one server replica: the
+    # host injects its id at launch. Absent for CLI-local runners (no host), and
+    # the builder only emits the routing header on the workspace-hosted server.
+    host_id = os.environ.get(RUNNER_SLICE_KEY_ENV_VAR)
+    headers.update(
+        databricks_request_headers(server_url, bearer_token=auth_token, host_id=host_id)
+    )
     if tunnel_token:
         headers[RUNNER_TUNNEL_TOKEN_HEADER] = tunnel_token
     async with websockets.connect(

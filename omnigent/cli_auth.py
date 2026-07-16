@@ -23,6 +23,7 @@ import logging
 import os
 import stat
 import time
+import urllib.parse
 from pathlib import Path
 
 _logger = logging.getLogger(__name__)
@@ -225,6 +226,34 @@ def load_databricks_org_id(server_url: str) -> str | None:
 # workspace request by this header (equivalently to the ``?o=`` query param).
 DATABRICKS_ORG_ID_HEADER = "X-Databricks-Org-Id"
 
+# Dicer replica-routing header for the managed (MAS) server. Its API-proxy
+# sidecar shards the service by this value — else a workspace-id fallback — so
+# a host's control tunnel, its runners' tunnels, and their session traffic all
+# land on one replica when they carry the same key (the host_id). Omitted for
+# local / single-workspace callers, who need no sticky routing.
+OMNIGENT_SLICE_KEY_HEADER = "X-Databricks-Omnigent-Slice-Key"
+
+# Databricks workspace-hosted omnigent is mounted on the workspace at this API
+# path (behind the api-proxy); a local / self-hosted server mounts elsewhere
+# (usually the root). This is the routing-relevant shape of a server URL, so it
+# lives here next to the request-header builder that keys off it (rather than in
+# the browser-link helpers, which only borrow it).
+WORKSPACE_API_PATH = "/api/2.0/omnigent"
+
+
+def is_workspace_hosted_url(base_url: str) -> bool:
+    """Whether *base_url* is the Databricks workspace-hosted omnigent mount.
+
+    True for the api-proxy mount (``https://<ws>/api/2.0/omnigent``), which is
+    the only deployment fronted by the multi-replica sharding layer. Used to
+    gate behavior that only applies there (see :func:`databricks_request_headers`).
+
+    :param base_url: Omnigent server base URL, e.g.
+        ``"https://example.databricks.com/api/2.0/omnigent"``.
+    :returns: ``True`` when the URL path is the workspace API mount.
+    """
+    return urllib.parse.urlsplit(base_url.rstrip("/")).path == WORKSPACE_API_PATH
+
 
 # Opaque extra request headers for dev/test: a JSON object of header name→value
 # in :data:`DATABRICKS_EXTRA_HEADERS_ENV_VAR`. Databricks deployments use it to
@@ -258,7 +287,10 @@ def _databricks_extra_headers() -> dict[str, str]:
 
 
 def databricks_request_headers(
-    server_url: str, *, bearer_token: str | None = None
+    server_url: str,
+    *,
+    bearer_token: str | None = None,
+    host_id: str | None = None,
 ) -> dict[str, str]:
     """Build the headers for a request to a Databricks-fronted server.
 
@@ -283,8 +315,17 @@ def databricks_request_headers(
         ``"https://example.databricks.com/api/2.0/omnigent"``.
     :param bearer_token: The workspace bearer token, or ``None`` when the
         credential is supplied by a separate mechanism (or there is none).
+    :param host_id: The host a request is scoped to (its control tunnel, its
+        runners, and their session traffic all name it so they co-locate on one
+        replica). Pass it unconditionally: it is emitted (as the
+        :data:`OMNIGENT_SLICE_KEY_HEADER` routing header) only when *server_url*
+        is the workspace-hosted mount, since that is the only deployment with
+        the sharding layer that reads it. ``None`` defaults to the runner's own
+        host_id inside a runner process (via ``OMNIGENT_RUNNER_SLICE_KEY``) and
+        otherwise leaves routing to the default fallback.
     :returns: A header dict carrying ``Authorization``, ``X-Databricks-Org-Id``,
-        and/or the configured extra headers as available, possibly empty.
+        ``X-Databricks-Omnigent-Slice-Key``, and/or the configured extra headers
+        as available, possibly empty.
     """
     headers: dict[str, str] = {}
     if bearer_token:
@@ -292,6 +333,25 @@ def databricks_request_headers(
     org_id = load_databricks_org_id(server_url)
     if org_id:
         headers[DATABRICKS_ORG_ID_HEADER] = org_id
+    # In a runner process, default to the runner's own host_id (exported at
+    # launch as OMNIGENT_RUNNER_SLICE_KEY) when the caller names no host. This
+    # keys the runner's server traffic — transcript posts, uploads, policy
+    # checks — by host_id so it lands on the host's replica: it spreads across
+    # replicas instead of piling every runner's posts onto the single
+    # workspace-key pod, and co-locates with the runner's tunnel. The env is
+    # set only inside a runner, so CLI / daemon callers are unaffected.
+    if host_id is None:
+        from omnigent.runner.identity import RUNNER_SLICE_KEY_ENV_VAR
+
+        host_id = os.environ.get(RUNNER_SLICE_KEY_ENV_VAR)
+    # Emit the host routing header here, in one place, rather than gating at
+    # every call site: only the workspace-hosted server runs the replica-
+    # sharding layer that reads it; a local / self-hosted server is single-
+    # replica and would just log a header it ignores. Callers pass the host_id
+    # and never have to reason about the deployment — a new RPC that routes
+    # through this builder is gated automatically.
+    if host_id and is_workspace_hosted_url(server_url):
+        headers[OMNIGENT_SLICE_KEY_HEADER] = host_id
     # Opaque dev/test extra headers (request-routing selectors); no-op in prod
     # (env unset).
     headers.update(_databricks_extra_headers())

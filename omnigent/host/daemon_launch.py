@@ -51,6 +51,39 @@ def _json_body(resp: httpx.Response) -> dict[str, object]:
     return body if isinstance(body, dict) else {}
 
 
+def open_daemon_client(
+    base_url: str,
+    headers: dict[str, str],
+    host_id: str | None,
+    *,
+    auth: httpx.Auth | None = None,
+    timeout: httpx.Timeout | float | None = None,
+) -> httpx.AsyncClient:
+    """Open an httpx client for the host-runner protocol, pinned to *host_id*.
+
+    Every request a caller makes on this client — the launch, runner-status
+    polls, and the session / terminal calls (including a resume-time reattach
+    check) — is scoped to one host, whose control and runner tunnels register
+    on a single server replica. Baking the host_id routing header into the
+    client's headers at construction pins all of them to that replica, ahead
+    of the first request regardless of the caller's call order. The builder
+    emits the header only on the workspace-hosted mount, so local /
+    self-hosted servers are unaffected.
+
+    :param base_url: Omnigent server base URL, e.g. the workspace API mount.
+    :param headers: Base HTTP headers (auth bearer, workspace routing).
+    :param host_id: The host to pin to, e.g. ``"host_abc123"``; ``None`` (a
+        hostless / local session) leaves routing to the default fallback.
+    :param auth: Optional per-request ``httpx.Auth`` (e.g. token refresh).
+    :param timeout: Optional httpx timeout for the client.
+    :returns: An ``httpx.AsyncClient`` whose requests all name *host_id*.
+    """
+    from omnigent.cli_auth import databricks_request_headers
+
+    pinned = {**headers, **databricks_request_headers(base_url, host_id=host_id)}
+    return httpx.AsyncClient(base_url=base_url, headers=pinned, auth=auth, timeout=timeout)
+
+
 async def wait_for_host_online(
     client: httpx.AsyncClient,
     host_id: str,

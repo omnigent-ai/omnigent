@@ -121,6 +121,7 @@ from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.host.daemon_launch import (
     error_text,
     launch_or_reuse_daemon_runner,
+    open_daemon_client,
     wait_for_host_online,
     wait_for_runner_online,
 )
@@ -462,7 +463,11 @@ def _run_with_remote_server(
     from omnigent.cli import _ensure_host_daemon
     from omnigent.host.identity import load_or_create_host_identity
 
-    headers = _remote_headers(server_url=base_url)
+    # This machine's host id keys the WebSocket attach handshake (and its
+    # reconnects) to the replica holding the runner's tunnel; the CLI can set WS
+    # headers, so it rides the header (emitted only on the workspace server).
+    host_id = load_or_create_host_identity().host_id
+    headers = _remote_headers(server_url=base_url, host_id=host_id)
     try:
         resolved_session_id = _resolve_session_id_for_resume(
             base_url=base_url,
@@ -482,7 +487,6 @@ def _run_with_remote_server(
             with runner_startup_progress(initial_message="Preparing Antigravity...") as progress:
                 progress.update("Connecting to local daemon...")
                 _ensure_host_daemon(base_url)
-                host_id = load_or_create_host_identity().host_id
                 bundle = None if resolved_session_id is not None else _bundle_agent(spec_path)
                 prepared = await _prepare_antigravity_terminal_via_daemon(
                     base_url=base_url,
@@ -512,7 +516,7 @@ def _run_with_remote_server(
 
                 :returns: None.
                 """
-                new_headers = _remote_headers(server_url=base_url)
+                new_headers = _remote_headers(server_url=base_url, host_id=host_id)
                 headers.clear()
                 headers.update(new_headers)
 
@@ -765,7 +769,7 @@ async def _prepare_antigravity_terminal_via_daemon(
     :raises click.ClickException: If setup fails.
     """
     timeout = httpx.Timeout(30.0, read=120.0)
-    async with httpx.AsyncClient(base_url=base_url, headers=headers, timeout=timeout) as client:
+    async with open_daemon_client(base_url, headers, host_id, timeout=timeout) as client:
         bridge_id: str
         conversation_id: str
         resume = False
