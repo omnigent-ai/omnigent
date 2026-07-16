@@ -8,15 +8,29 @@ import tempfile
 from pathlib import Path
 from typing import Literal
 
-from omnigent.server.admin_list import resolve_data_dir
+from omnigent.server.admin_list import resolve_data_dir as resolve_admin_data_dir
 
 SkillTrust = Literal["current", "all-host"]
 _FILENAME = "skill_trust"
 
 
+def resolve_skill_data_dir() -> Path:
+    """Resolve the server data directory for persisted skill settings.
+
+    ``OMNIGENT_DATA_DIR`` is the runtime isolation boundary for the server
+    database, artifacts, and logs, so skill trust must follow it as well.
+    When it is absent, retain the admin-credentials volume fallback used by
+    container deployments before falling back to ``~/.omnigent``.
+    """
+    explicit = os.environ.get("OMNIGENT_DATA_DIR", "").strip()
+    if explicit:
+        return Path(explicit).expanduser()
+    return resolve_admin_data_dir()
+
+
 def skill_trust_path() -> Path:
     """Return the persisted trust-setting path."""
-    return resolve_data_dir() / _FILENAME
+    return resolve_skill_data_dir() / _FILENAME
 
 
 def read_skill_trust() -> SkillTrust:
