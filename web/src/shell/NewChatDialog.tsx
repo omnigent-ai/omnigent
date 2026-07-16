@@ -520,9 +520,9 @@ export async function describeCreateError(res: Response): Promise<string> {
 /**
  * Whether an agent's harness is known to be unconfigured on a host.
  *
- * Warning-only signal for the agent picker: `true` only when the host
- * explicitly reported the harness as not ready (CLI missing or no
- * default credential — see `omnigent setup`). A missing readiness map
+ * Host-readiness signal for the agent picker: `true` only when the host
+ * explicitly reported the harness as not ready (unsupported platform, CLI
+ * missing, or no default credential — see `omnigent setup`). A missing readiness map
  * (older host build) or an unknown harness yields `false`, so unknown
  * never warns; the host re-checks authoritatively at launch time.
  *
@@ -550,6 +550,7 @@ export function harnessUnavailableReasonOnHost(
 ): string | null {
   if (!harness || !host?.configured_harnesses) return null;
   const availability = host.configured_harnesses[harness];
+  if (availability === "platform-unsupported") return availability;
   if (availability === false) return isCodexHarness(harness) ? "binary-missing" : "unconfigured";
   if (
     isCodexHarness(harness) &&
@@ -562,6 +563,7 @@ export function harnessUnavailableReasonOnHost(
 }
 
 export function harnessWarningBadgeText(reason: string | null): string {
+  if (reason === "platform-unsupported") return "not supported";
   if (reason === "binary-missing") return "binary missing";
   if (reason === "needs-auth") return "needs auth";
   return "needs setup";
@@ -572,6 +574,9 @@ export function harnessWarningMessageText(
   hostName: string | undefined,
   reason: string | null,
 ): string {
+  if (reason === "platform-unsupported") {
+    return `${agentName} is not supported on ${hostName}. Choose an SDK-based agent or another host.`;
+  }
   if (reason === "needs-auth") {
     return `${agentName} needs Codex authentication on ${hostName} — run codex login on that machine.`;
   }
@@ -586,6 +591,13 @@ function harnessWarningMessage(
   hostName: string | undefined,
   reason: string | null,
 ): ReactNode {
+  if (reason === "platform-unsupported") {
+    return (
+      <>
+        {agentName} is not supported on {hostName}. Choose an SDK-based agent or another host.
+      </>
+    );
+  }
   if (reason === "needs-auth") {
     return (
       <>
@@ -1378,16 +1390,23 @@ function AgentHarnessPicker({
     return withTooltip ? <AgentRowTooltip agent={agent}>{inner}</AgentRowTooltip> : inner;
   };
 
-  const renderBadge = (agent: AvailableAgent) =>
-    harnessUnconfiguredOnHost(agent.harness, host) ? (
+  const renderBadge = (agent: AvailableAgent) => {
+    const reason = harnessUnavailableReasonOnHost(agent.harness, host);
+    return reason ? (
       <Badge
         variant="outline"
-        className="ml-auto self-center border-amber-300 bg-amber-50 text-[11px] text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-400"
+        className={cn(
+          "ml-auto self-center text-[11px]",
+          reason === "platform-unsupported"
+            ? "border-border bg-muted text-muted-foreground"
+            : "border-amber-300 bg-amber-50 text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-400",
+        )}
         data-testid={`new-chat-landing-agent-warning-${agent.id}`}
       >
-        {harnessWarningBadgeText(harnessUnavailableReasonOnHost(agent.harness, host))}
+        {harnessWarningBadgeText(reason)}
       </Badge>
     ) : null;
+  };
 
   // The knob sections for one entry, keyed off that entry's OWN capabilities
   // (so e.g. Codex's submenu shows Codex knobs even while Claude is selected).
@@ -1520,6 +1539,27 @@ function AgentHarnessPicker({
 
   const renderEntry = (agent: AvailableAgent): ReactNode => {
     const active = agent.id === effectiveAgentId;
+    const hostReadinessReason = harnessUnavailableReasonOnHost(agent.harness, host);
+    const unavailableReason =
+      isNativeCodingAgent(agent) && hostReadinessReason === "platform-unsupported"
+        ? hostReadinessReason
+        : null;
+    if (unavailableReason) {
+      return (
+        <DropdownMenuItem
+          key={agent.id}
+          data-testid={`new-chat-landing-agent-${agent.id}`}
+          data-unavailable="true"
+          aria-disabled="true"
+          title={harnessWarningMessageText(agent.display_name, host?.name, unavailableReason)}
+          onSelect={(event) => event.preventDefault()}
+          className="items-start gap-2 rounded-sm px-2 py-1.5 text-13 text-muted-foreground opacity-60 focus:bg-transparent focus:text-muted-foreground"
+        >
+          {renderRowInner(agent, false)}
+          {renderBadge(agent)}
+        </DropdownMenuItem>
+      );
+    }
     if (!hasKnobs(agent)) {
       return (
         <DropdownMenuItem
@@ -2210,14 +2250,24 @@ export function NewChatLandingScreen() {
     setWorkspace((cur) => (cur === "" ? candidate : cur));
   }, [selectedHostId, recent, derivedHome, prefillSettled]);
 
-  // A pick only wins while it exists in the list — a persisted id whose
-  // agent has since been unregistered (or hidden) falls back to the default.
-  // The pending custom agent sentinel also wins when set.
+  const selectedHost = allHosts.find((h) => h.host_id === selectedHostId);
+  // Host readiness applies only to connected hosts. Managed sandboxes
+  // provision their own tooling and do not use the selected host's map.
+  const harnessWarningHost = !sandboxSelected ? selectedHost : undefined;
+  const agentUnavailableOnHost = (agent: AvailableAgent): boolean =>
+    isNativeCodingAgent(agent) &&
+    harnessUnavailableReasonOnHost(agent.harness, harnessWarningHost) === "platform-unsupported";
+
+  // A pick only wins while it exists and can launch on the target host. A
+  // persisted id whose agent disappeared or became unavailable falls back to
+  // the first runnable entry. The pending custom agent sentinel still wins.
+  const pickedAgent = agentList.find((agent) => agent.id === pickedAgentId);
   const effectiveAgentId =
     pickedAgentId === PENDING_AGENT_ID
       ? PENDING_AGENT_ID
-      : ((agentList.some((a) => a.id === pickedAgentId) ? pickedAgentId : agentList[0]?.id) ??
-        null);
+      : ((pickedAgent && !agentUnavailableOnHost(pickedAgent)
+          ? pickedAgent.id
+          : agentList.find((agent) => !agentUnavailableOnHost(agent))?.id) ?? null);
   const selectedAgent = useMemo(
     () =>
       effectiveAgentId === PENDING_AGENT_ID && pendingAgent
@@ -2297,12 +2347,6 @@ export function NewChatLandingScreen() {
   // (the runner injects the text verbatim), so the landing composer must
   // not intercept them — no skills menu, no slash_command routing.
   const isNativeTerminalAgent = isNativeCodingAgent(selectedAgent);
-  const selectedHost = allHosts.find((h) => h.host_id === selectedHostId);
-  // Warn-only readiness signal for the agent picker: only meaningful when
-  // a connected host is selected (a sandbox provisions its own tooling).
-  // Selection stays allowed — the host re-checks at launch and the create
-  // call surfaces a specific error if the harness really can't run.
-  const harnessWarningHost = !sandboxSelected ? selectedHost : undefined;
   const selectedAgentUnconfigured = harnessUnconfiguredOnHost(
     selectedAgent?.harness,
     harnessWarningHost,
@@ -2656,9 +2700,11 @@ export function NewChatLandingScreen() {
       ? "Please enter a valid repository URL"
       : !sandboxSelected && (!selectedHostId || !workspaceValid)
         ? "Please choose a host and working directory"
-        : message.trim().length === 0
-          ? "Enter a message to get started"
-          : null;
+        : selectedAgent == null
+          ? "Select an agent available on this host"
+          : message.trim().length === 0
+            ? "Enter a message to get started"
+            : null;
 
   // Chip display labels.
   const workspaceLabel = workspaceTrimmed
@@ -2703,6 +2749,7 @@ export function NewChatLandingScreen() {
   // returning user lands on the harness they used last); explicit picks
   // persist via localStorage.
   const handleSelectAgent = (agent: AvailableAgent) => {
+    if (agentUnavailableOnHost(agent)) return;
     if (agent.id !== effectiveAgentId) setPickedHarness(readLastHarness(agent.id));
     setPickedAgentId(agent.id);
     writeLastAgentId(agent.id);
