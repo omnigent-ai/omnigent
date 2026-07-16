@@ -28,7 +28,7 @@ vi.mock("@/hooks/useConversations", () => ({
   useConversations: vi.fn(),
   useConnectedConversations: () => [],
   useStopAndDeleteConversation: () => mocks.del,
-  usePinnedConversationBackfill: () => [],
+  usePinnedConversationBackfill: () => ({ conversations: [], settledIds: new Set() }),
   // Rename/archive are wired on the row but not exercised here; minimal
   // stubs keep the row from crashing on mount.
   useRenameConversation: () => ({ mutate: vi.fn() }),

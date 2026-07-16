@@ -2469,6 +2469,24 @@
         "title": "PresenceViewer",
         "type": "object"
       },
+      "PutPreferenceRequest": {
+        "description": "Body for `PUT /v1/preferences/{key}`.",
+        "properties": {
+          "value": {
+            "description": "The preference value \u2014 a JSON array of strings the sidebar owns, e.g. `[\"conv_a\", \"conv_b\"]`.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Value",
+            "type": "array"
+          }
+        },
+        "required": [
+          "value"
+        ],
+        "title": "PutPreferenceRequest",
+        "type": "object"
+      },
       "QueuedEvent": {
         "description": "Optional event emitted between `created` and `in_progress`\nfor background tasks that are queued before they start.\n\nForeground streaming responses skip this event.",
         "properties": {
@@ -7296,6 +7314,85 @@
         "summary": "List Registry",
         "tags": [
           "policy_registry"
+        ]
+      }
+    },
+    "/v1/preferences": {
+      "get": {
+        "description": "Return every stored preference for the caller, JSON-decoded.",
+        "operationId": "get_preferences_v1_preferences_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Preferences V1 Preferences Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get Preferences",
+        "tags": [
+          "preferences"
+        ]
+      }
+    },
+    "/v1/preferences/{key}": {
+      "put": {
+        "description": "Upsert one preference for the caller.\n\nRejects an unknown key (400) so the endpoint stays an allow-list, and a\nvalue beyond the size cap (400) so the column can't be stuffed.",
+        "operationId": "put_preference_v1_preferences__key__put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "key",
+            "required": true,
+            "schema": {
+              "title": "Key",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PutPreferenceRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Put Preference V1 Preferences  Key  Put",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Put Preference",
+        "tags": [
+          "preferences"
         ]
       }
     },

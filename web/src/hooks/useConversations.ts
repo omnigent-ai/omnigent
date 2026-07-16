@@ -674,10 +674,23 @@ export function useBulkStopSessions() {
   });
 }
 
+export interface PinnedConversationBackfill {
+  /** Backfilled sessions that resolved with a row, to merge into the list. */
+  conversations: Conversation[];
+  /**
+   * Missing pinned ids whose backfill query has finished — resolved with a row,
+   * 404'd (deleted session; data null), or errored. A deleted pin lands here so
+   * the caller can prune it instead of waiting forever for a row that never
+   * arrives.
+   */
+  settledIds: Set<string>;
+}
+
 /**
  * Fetch pinned sessions that aren't present in the loaded paginated
  * data. Returns the backfilled conversations so the caller can merge
- * them into the list before grouping.
+ * them into the list before grouping, plus the set of missing ids whose
+ * backfill query has settled (so a deleted pin can be pruned).
  *
  * Each missing pinned ID fires an individual ``GET /v1/sessions/{id}``
  * via ``fetchConversationById``. Results are cached with a long stale
@@ -691,7 +704,7 @@ export function useBulkStopSessions() {
 export function usePinnedConversationBackfill(
   pinnedIds: readonly string[],
   loadedIds: Set<string>,
-): Conversation[] {
+): PinnedConversationBackfill {
   const missingIds = pinnedIds.filter((id) => !loadedIds.has(id));
   const results = useQueries({
     queries: missingIds.map((id) => ({
@@ -701,22 +714,28 @@ export function usePinnedConversationBackfill(
       retry: false,
     })),
   });
-  // Stabilize the returned array: only produce a new reference when
-  // the set of resolved IDs actually changes. Without this, useQueries
-  // returns a new array object on every render → downstream memos and
-  // effects re-fire → infinite re-render loop.
+  // Stabilize both returned collections: only produce new references when the
+  // resolved rows or the settled-id set actually change. useQueries returns a
+  // new array object every render → downstream memos and effects would re-fire
+  // into an infinite loop without this.
   const resolvedIds = results
     .filter((r) => r.data != null)
     .map((r) => r.data!.id)
     .join(",");
+  const settledKey = missingIds
+    .filter((_, i) => results[i].isFetched && !results[i].isFetching)
+    .join(",");
   return useMemo(() => {
-    const backfilled: Conversation[] = [];
+    const conversations: Conversation[] = [];
     for (const result of results) {
-      if (result.data) backfilled.push(result.data);
+      if (result.data) conversations.push(result.data);
     }
-    return backfilled;
+    const settledIds = new Set(
+      missingIds.filter((_, i) => results[i].isFetched && !results[i].isFetching),
+    );
+    return { conversations, settledIds };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [resolvedIds]);
+  }, [resolvedIds, settledKey]);
 }
 
 // ── Project hooks ─────────────────────────────────────────────────────────────

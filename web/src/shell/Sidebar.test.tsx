@@ -50,7 +50,7 @@ vi.mock("@/hooks/useConversations", () => ({
   useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useConnectedConversations: () => [],
   useStopAndDeleteConversation: () => ({ mutate: vi.fn() }),
-  usePinnedConversationBackfill: () => [],
+  usePinnedConversationBackfill: () => ({ conversations: [], settledIds: new Set() }),
   useRenameConversation: () => ({ mutate: vi.fn() }),
   useStopSession: () => ({ mutate: vi.fn() }),
   // Project feature: the sidebar reads the project list to build project

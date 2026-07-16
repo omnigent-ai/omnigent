@@ -505,6 +505,40 @@ class SqlSessionPermission(OmnigentBase):
     )
 
 
+class SqlUserPreference(OmnigentBase):
+    """
+    SQLAlchemy model for the ``user_preferences`` table.
+
+    Per-user client UI state that should follow the account rather than
+    live in one browser's ``localStorage`` — sidebar pins and the
+    collapse/expand sets. A generic ``key`` → JSON-``value`` KV so each
+    preference is its own row and adding one needs no migration. PK is
+    ``(user_id, key)`` — optimized for the hot path ("all my
+    preferences" = prefix scan on ``user_id``).
+
+    :param user_id: The owner, e.g. ``"alice@example.com"``.
+    :param key: The preference name, e.g. ``"pinned_conversation_ids"``.
+    :param value: The preference value as an opaque JSON string, e.g.
+        ``'["conv_a", "conv_b"]'``.
+    :param updated_at: Unix epoch seconds of the most recent write.
+    """
+
+    __tablename__ = "user_preferences"
+
+    # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    user_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    value: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_at: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
 class SqlConversationMetadata(OmnigentBase):
     """
     SQLAlchemy model for the ``omnigent_conversation_metadata`` table.

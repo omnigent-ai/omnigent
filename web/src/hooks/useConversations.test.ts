@@ -22,6 +22,7 @@ import {
   useNewestProjectSession,
   useProjectSessions,
   useMoveToProject,
+  usePinnedConversationBackfill,
   useRenameConversation,
   useStopAndDeleteConversation,
   useStopSession,
@@ -1095,5 +1096,25 @@ describe("useDeleteProject", () => {
     expect(err.failed).toEqual(["conv_b"]);
     expect(err.succeeded).toEqual(["conv_a"]);
     expect(err.total).toBe(2);
+  });
+});
+
+describe("usePinnedConversationBackfill", () => {
+  it("reports a deleted (404) pin as settled without a returned row", async () => {
+    // A pin whose session was deleted 404s: its query settles with no row.
+    // It must land in settledIds so the caller can prune it, and never in
+    // conversations — otherwise the prune waits forever for a row that's gone.
+    fetchMock.mockResolvedValue(mockResponse(null, { ok: false, status: 404 }));
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+
+    const { result } = renderHook(
+      () => usePinnedConversationBackfill(["gone"], new Set<string>()),
+      { wrapper },
+    );
+
+    await waitFor(() => expect(result.current.settledIds.has("gone")).toBe(true));
+    expect(result.current.conversations).toEqual([]);
   });
 });

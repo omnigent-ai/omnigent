@@ -320,6 +320,7 @@ def _build_app_with_stub_stores() -> Any:
 
     from omnigent.runtime.agent_cache import AgentCache
     from omnigent.server.app import create_app
+    from omnigent.server.auth import UnifiedAuthProvider
     from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
     from omnigent.stores.artifact_store.local import LocalArtifactStore
     from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
@@ -328,6 +329,7 @@ def _build_app_with_stub_stores() -> Any:
     )
     from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
     from omnigent.stores.host_store import HostStore
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
     from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
 
     # On-disk SQLite (mkdtemp ensures uniqueness so concurrent
@@ -349,6 +351,10 @@ def _build_app_with_stub_stores() -> Any:
         # Pass stores so conditionally-mounted routes stay in the spec.
         host_store=HostStore(db_uri),
         policy_store=SqlAlchemyPolicyStore(db_uri),
+        # A permission store (+ its required auth provider) keeps the
+        # per-user preferences routes in the spec.
+        permission_store=SqlAlchemyPermissionStore(db_uri),
+        auth_provider=UnifiedAuthProvider(source="header"),
     )
 
 

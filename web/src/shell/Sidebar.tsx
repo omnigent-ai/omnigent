@@ -134,6 +134,7 @@ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { useSessionSwitchHotkey } from "@/hooks/useSessionSwitchHotkey";
 import { usePinnedSessionHotkeys } from "@/hooks/usePinnedSessionHotkeys";
+import { type SidebarPreferencesSync, useSidebarPreferences } from "@/hooks/useSidebarPreferences";
 import { absoluteTime, relativeTime } from "@/lib/relativeTime";
 import { MOD_KEY } from "@/components/KeyboardShortcutsDialog";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
@@ -281,6 +282,14 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
   // and always show the viewer's own sessions there.
   const multiUser = !isCurrentServerLocal();
 
+  // Server-backed sidebar preferences (pins + collapse/expand state), so they
+  // survive a fresh browser and follow the user across devices. Only a
+  // multi-user server has a per-user store to sync with; a loopback-only local
+  // server stays purely localStorage. localStorage remains the fast local
+  // cache — the initial state above is seeded from it synchronously (no flash),
+  // then reconciled below once the server copy resolves.
+  const sidebarPrefs = useSidebarPreferences(multiUser);
+
   const lastSelectedIdRef = useRef<string | null>(null);
   const getVisibleIdsRef = useRef<() => string[]>(() => []);
   const getVisibleConversationsRef = useRef<() => Conversation[]>(() => []);
@@ -381,9 +390,36 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
     writePinnedConversationIds(pinnedConversationIds);
   }, [pinnedConversationIds]);
 
-  const togglePinnedConversation = useCallback((conversationId: string) => {
-    setPinnedConversationIds((prev) => togglePinnedConversationId(prev, conversationId));
-  }, []);
+  // Reconcile with the server once its copy resolves: it's the source of
+  // truth, so adopt its pin set (migrating legacy ids) — including an explicit
+  // empty set, which means another device unpinned everything. Only an absent
+  // key (undefined) is the first sync after upgrade, where we seed the local
+  // pins onto the server so they start following the account. Runs once.
+  const { writePreference: writeSidebarPreference } = sidebarPrefs;
+  const pinnedHydratedRef = useRef(false);
+  useEffect(() => {
+    if (pinnedHydratedRef.current || !sidebarPrefs.isResolved) return;
+    pinnedHydratedRef.current = true;
+    const serverPinned = sidebarPrefs.serverPreferences?.pinned_conversation_ids;
+    if (serverPinned != null) {
+      setPinnedConversationIds(migratePinnedConversationIds(serverPinned));
+    } else if (pinnedConversationIds.length > 0) {
+      writeSidebarPreference("pinned_conversation_ids", pinnedConversationIds);
+    }
+  }, [sidebarPrefs, pinnedConversationIds, writeSidebarPreference]);
+
+  const togglePinnedConversation = useCallback(
+    (conversationId: string) => {
+      const next = togglePinnedConversationId(pinnedConversationIds, conversationId);
+      setPinnedConversationIds(next);
+      // Write-through: the toggle is the source of a user-intended change, so
+      // it propagates to the server (localStorage is handled by the effect
+      // above). The prune path deliberately stays local-only — see the
+      // normalize effect in ConversationList.
+      writeSidebarPreference("pinned_conversation_ids", next);
+    },
+    [pinnedConversationIds, writeSidebarPreference],
+  );
 
   // Desktop-only drag-to-resize, mirroring the right rail. The width is
   // exposed as a CSS variable consumed by the ``md:w-[var(--sidebar-width)]``
@@ -656,6 +692,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
               pinnedConversationIds={pinnedConversationIds}
               onPinnedConversationIdsChange={setPinnedConversationIds}
               onTogglePinned={togglePinnedConversation}
+              preferencesSync={sidebarPrefs}
               selectionMode={selectionMode}
               selectedIds={selectedIds}
               onToggleSelected={toggleSelected}
@@ -903,6 +940,7 @@ interface ConversationListProps {
   pinnedConversationIds: string[];
   onPinnedConversationIdsChange: (ids: string[]) => void;
   onTogglePinned: (conversationId: string) => void;
+  preferencesSync: SidebarPreferencesSync;
   selectionMode: boolean;
   selectedIds: Set<string>;
   onToggleSelected: (conversationId: string, shiftKey?: boolean) => void;
@@ -925,6 +963,7 @@ function ConversationList({
   pinnedConversationIds,
   onPinnedConversationIdsChange,
   onTogglePinned,
+  preferencesSync,
   selectionMode,
   selectedIds,
   onToggleSelected,
@@ -949,7 +988,8 @@ function ConversationList({
 
   // Backfill pinned sessions that aren't in the loaded set.
   const loadedIds = useMemo(() => new Set(allConversations.map((c) => c.id)), [allConversations]);
-  const pinnedBackfill = usePinnedConversationBackfill(pinnedConversationIds, loadedIds);
+  const { conversations: pinnedBackfill, settledIds: backfillSettledIds } =
+    usePinnedConversationBackfill(pinnedConversationIds, loadedIds);
 
   // Freeze the active chat's sort key while you're inside it so an
   // updated_at bump from sending a message doesn't reorder the row
@@ -1037,18 +1077,41 @@ function ConversationList({
   // Collapsed section titles — persisted like pins so the preference
   // survives reloads. Lifted here (not per-section state) because the
   // baseline group's "Recent" title comes and goes with its siblings.
+  // Persist a collapse/expand set to both the localStorage cache and (when
+  // multi-user) the server, so the section layout follows the account like the
+  // pins do. All the collapse/expand mutators below route their writes through
+  // these two helpers.
+  const { writePreference: writePreferenceSync } = preferencesSync;
+  const persistCollapsedSections = useCallback(
+    (next: string[]) => {
+      writeCollapsedSidebarSections(next);
+      writePreferenceSync("collapsed_sidebar_sections", next);
+    },
+    [writePreferenceSync],
+  );
+  const persistExpandedProjects = useCallback(
+    (next: string[]) => {
+      writeExpandedProjectSections(next);
+      writePreferenceSync("expanded_project_sections", next);
+    },
+    [writePreferenceSync],
+  );
+
   const [collapsedSections, setCollapsedSections] = useState<string[]>(
     readCollapsedSidebarSections,
   );
-  const toggleSectionCollapsed = useCallback((sectionTitle: string) => {
-    setCollapsedSections((prev) => {
-      const next = prev.includes(sectionTitle)
-        ? prev.filter((t) => t !== sectionTitle)
-        : [...prev, sectionTitle];
-      writeCollapsedSidebarSections(next);
-      return next;
-    });
-  }, []);
+  const toggleSectionCollapsed = useCallback(
+    (sectionTitle: string) => {
+      setCollapsedSections((prev) => {
+        const next = prev.includes(sectionTitle)
+          ? prev.filter((t) => t !== sectionTitle)
+          : [...prev, sectionTitle];
+        persistCollapsedSections(next);
+        return next;
+      });
+    },
+    [persistCollapsedSections],
+  );
 
   // Auto-expand the Pinned section when a session is newly pinned, so a
   // freshly-pinned chat can't hide inside a collapsed group. Only reacts to
@@ -1063,11 +1126,11 @@ function ConversationList({
       setCollapsedSections((prevCollapsed) => {
         if (!prevCollapsed.includes("Pinned")) return prevCollapsed;
         const next = prevCollapsed.filter((t) => t !== "Pinned");
-        writeCollapsedSidebarSections(next);
+        persistCollapsedSections(next);
         return next;
       });
     }
-  }, [pinnedConversationIds]);
+  }, [pinnedConversationIds, persistCollapsedSections]);
 
   // When a search query appears, auto-expand all sections so results
   // in collapsed groups are visible. The user can still manually collapse
@@ -1104,28 +1167,57 @@ function ConversationList({
   // a single project) never sees a "Revert to last state" button backed by an
   // empty snapshot that would destructively collapse everything.
   const [expandedViaButton, setExpandedViaButton] = useState(false);
-  const toggleProjectExpanded = useCallback((projectName: string) => {
-    setExpandedViaButton(false);
-    setExpandedProjects((prev) => {
-      const next = prev.includes(projectName)
-        ? prev.filter((n) => n !== projectName)
-        : [...prev, projectName];
-      writeExpandedProjectSections(next);
-      return next;
-    });
-  }, []);
+  const toggleProjectExpanded = useCallback(
+    (projectName: string) => {
+      setExpandedViaButton(false);
+      setExpandedProjects((prev) => {
+        const next = prev.includes(projectName)
+          ? prev.filter((n) => n !== projectName)
+          : [...prev, projectName];
+        persistExpandedProjects(next);
+        return next;
+      });
+    },
+    [persistExpandedProjects],
+  );
   // Expand a project (idempotent). Called right after a session is filed into
   // one, so the freshly populated folder — especially a brand-new project —
   // opens to reveal the session instead of appearing collapsed.
-  const expandProject = useCallback((projectName: string) => {
-    setExpandedProjects((prev) => {
-      if (prev.includes(projectName)) return prev;
-      setExpandedViaButton(false);
-      const next = [...prev, projectName];
-      writeExpandedProjectSections(next);
-      return next;
-    });
-  }, []);
+  const expandProject = useCallback(
+    (projectName: string) => {
+      setExpandedProjects((prev) => {
+        if (prev.includes(projectName)) return prev;
+        setExpandedViaButton(false);
+        const next = [...prev, projectName];
+        persistExpandedProjects(next);
+        return next;
+      });
+    },
+    [persistExpandedProjects],
+  );
+
+  // Reconcile the section layout with the server once its copy resolves: adopt
+  // the server sets (source of truth), or seed the local ones onto the server
+  // on the first sync after upgrade. Runs once, mirroring the pin reconciliation
+  // in the parent Sidebar.
+  const sectionsHydratedRef = useRef(false);
+  useEffect(() => {
+    if (sectionsHydratedRef.current || !preferencesSync.isResolved) return;
+    sectionsHydratedRef.current = true;
+    const server = preferencesSync.serverPreferences;
+    const serverCollapsed = server?.collapsed_sidebar_sections;
+    if (serverCollapsed != null) {
+      setCollapsedSections(serverCollapsed);
+    } else if (collapsedSections.length > 0) {
+      writePreferenceSync("collapsed_sidebar_sections", collapsedSections);
+    }
+    const serverExpanded = server?.expanded_project_sections;
+    if (serverExpanded != null) {
+      setExpandedProjects(serverExpanded);
+    } else if (expandedProjects.length > 0) {
+      writePreferenceSync("expanded_project_sections", expandedProjects);
+    }
+  }, [preferencesSync, collapsedSections, expandedProjects, writePreferenceSync]);
 
   // ── Drag-and-drop: file sessions into / out of projects ────────────────────
   // A session row can be dragged onto a project folder (file it there), onto the
@@ -1228,14 +1320,17 @@ function ConversationList({
   // what was open (not collapse-everything). The snapshot is session-only — not
   // persisted.
   const [revertSnapshot, setRevertSnapshot] = useState<string[]>([]);
-  const expandAllProjects = useCallback((allNames: string[]) => {
-    setExpandedProjects((prev) => {
-      setRevertSnapshot(prev);
-      setExpandedViaButton(true);
-      writeExpandedProjectSections(allNames);
-      return allNames;
-    });
-  }, []);
+  const expandAllProjects = useCallback(
+    (allNames: string[]) => {
+      setExpandedProjects((prev) => {
+        setRevertSnapshot(prev);
+        setExpandedViaButton(true);
+        persistExpandedProjects(allNames);
+        return allNames;
+      });
+    },
+    [persistExpandedProjects],
+  );
   // "Revert to last state" restores the set that was open before "Expand all".
   // When there's no real last state — folders were opened by hand, not via the
   // button (expandedViaButton is false, so any leftover snapshot is stale) — it
@@ -1244,10 +1339,10 @@ function ConversationList({
     setExpandedProjects(() => {
       const target = expandedViaButton ? revertSnapshot : [];
       setExpandedViaButton(false);
-      writeExpandedProjectSections(target);
+      persistExpandedProjects(target);
       return target;
     });
-  }, [expandedViaButton, revertSnapshot]);
+  }, [expandedViaButton, revertSnapshot, persistExpandedProjects]);
 
   // The project the currently-selected session is filed under, if any. Derived
   // as a primitive so the auto-expand effect below only fires when the
@@ -1335,8 +1430,20 @@ function ConversationList({
   // (the backfill covers it in the meantime).
   const hasMorePages = conversationsQuery.hasNextPage;
   const { fetchNextPage, isFetchingNextPage } = conversationsQuery;
+  // With server-backed pins, a pin can belong to another device's session that
+  // this page hasn't loaded yet; its backfill fetch may still be in flight.
+  // Pruning then would drop a valid pin (and, once other-device pins are the
+  // norm, silently churn the shared set). Wait until every not-yet-loaded pin's
+  // backfill has settled — resolved, 404'd, or errored — before pruning. A
+  // deleted pin 404s (no row), so keying off settled rather than a returned row
+  // lets it be dropped instead of blocking the prune forever.
+  const backfillSettled = useMemo(
+    () => pinnedConversationIds.every((id) => loadedIds.has(id) || backfillSettledIds.has(id)),
+    [pinnedConversationIds, loadedIds, backfillSettledIds],
+  );
   useEffect(() => {
     if (!conversationsQuery.data || hasMorePages || searchQuery) return;
+    if (preferencesSync.enabled && !backfillSettled) return;
     const allLoaded = dedupeConversationsById([...allConversations, ...pinnedBackfill]);
     const normalized = normalizePinnedConversationIds(pinnedConversationIds, allLoaded);
     if (!sameStringArray(normalized, pinnedConversationIds)) {
@@ -1350,6 +1457,8 @@ function ConversationList({
     pinnedBackfill,
     pinnedConversationIds,
     onPinnedConversationIdsChange,
+    preferencesSync.enabled,
+    backfillSettled,
   ]);
 
   if (conversationsQuery.isLoading) {

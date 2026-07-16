@@ -32,7 +32,7 @@ vi.mock("@/hooks/useConversations", () => ({
     isPending: false,
     isError: false,
   }),
-  usePinnedConversationBackfill: () => [],
+  usePinnedConversationBackfill: () => ({ conversations: [], settledIds: new Set() }),
   useRenameConversation: () => ({ mutate: vi.fn() }),
   useArchiveConversation: () => mocks.archive,
   useBulkArchiveConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
