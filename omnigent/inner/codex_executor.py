@@ -2029,6 +2029,7 @@ class CodexExecutor(Executor):
         base_url_override: str | None = None,
         gateway_auth_command: str | None = None,
         gateway_auth_refresh_interval_ms: str | None = None,
+        wire_api: str | None = None,
         enable_web_search: bool = True,
         disable_native_tools: bool = False,
         retry_policy: RetryPolicy | None = None,
@@ -2079,6 +2080,8 @@ class CodexExecutor(Executor):
         :param gateway_auth_refresh_interval_ms: Refresh cadence as a string,
             e.g. ``"900000"``. Set from
             ``HARNESS_CODEX_GATEWAY_AUTH_REFRESH_INTERVAL_MS``.
+        :param wire_api: Wire protocol for a directly supplied generic gateway.
+            Set from ``HARNESS_CODEX_WIRE_API``; defaults to ``"responses"``.
         :param enable_web_search: Leave Codex's built-in ``web_search`` tool
             enabled.  Set ``False`` to force the model to use only
             Omnigent-bridged tools.
@@ -2219,14 +2222,21 @@ class CodexExecutor(Executor):
             # token`` fallback auth command; harmless for a generic gateway
             # whose auth command is a static ``printf %s <key>``.
             self._env["DATABRICKS_HOST"] = host
-            self._codex_config_overrides.extend(
-                _databricks_codex_config_overrides(
+            if self._gateway_uses_databricks_profile:
+                overrides = _databricks_codex_config_overrides(
                     model=effective_model,
                     base_url=base_url,
                     auth_command=auth_command,
                     auth_refresh_interval_ms=self._gateway_auth_refresh_interval_ms,
                 )
-            )
+            else:
+                overrides = _provider_codex_config_overrides(
+                    model=effective_model,
+                    base_url=base_url,
+                    auth_command=auth_command,
+                    wire_api=wire_api or "responses",
+                )
+            self._codex_config_overrides.extend(overrides)
         if not enable_web_search:
             # Disable Codex's built-in web_search tool so the model can only reach
             # tools exposed by Omnigent as dynamicTools. The top-level web_search

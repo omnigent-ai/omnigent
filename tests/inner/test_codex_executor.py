@@ -279,6 +279,13 @@ class TestCodexExecutor(unittest.TestCase):
                 "databricks auth token --host" in item for item in executor._codex_config_overrides
             )
         )
+        self.assertIn('model_provider="omnigent_provider"', executor._codex_config_overrides)
+        self.assertTrue(
+            any('wire_api="responses"' in item for item in executor._codex_config_overrides)
+        )
+        self.assertFalse(
+            any("omnigent_databricks" in item for item in executor._codex_config_overrides)
+        )
 
     def test_constructor_databricks_flag_with_host_override_requires_base_url(self):
         with (

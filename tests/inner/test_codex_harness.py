@@ -72,6 +72,7 @@ def test_executor_factory_reads_env_vars(
     )
     monkeypatch.setenv("HARNESS_CODEX_GATEWAY_AUTH_COMMAND", "printf token")
     monkeypatch.setenv("HARNESS_CODEX_GATEWAY_AUTH_REFRESH_INTERVAL_MS", "900000")
+    monkeypatch.setenv("HARNESS_CODEX_WIRE_API", "chat")
     monkeypatch.setenv("HARNESS_CODEX_CWD", "/tmp/test-cwd")
     monkeypatch.setenv("HARNESS_CODEX_PATH", "/usr/local/bin/codex")
     monkeypatch.setenv("HARNESS_CODEX_ENABLE_WEB_SEARCH", "false")
@@ -92,6 +93,7 @@ def test_executor_factory_reads_env_vars(
         base_url_override: str | None,
         gateway_auth_command: str | None,
         gateway_auth_refresh_interval_ms: str | None,
+        wire_api: str | None,
         enable_web_search: bool,
         disable_native_tools: bool,
         **_kwargs: Any,
@@ -106,6 +108,7 @@ def test_executor_factory_reads_env_vars(
         captured["base_url_override"] = base_url_override
         captured["gateway_auth_command"] = gateway_auth_command
         captured["gateway_auth_refresh_interval_ms"] = gateway_auth_refresh_interval_ms
+        captured["wire_api"] = wire_api
         captured["enable_web_search"] = enable_web_search
         captured["disable_native_tools"] = disable_native_tools
 
@@ -124,6 +127,7 @@ def test_executor_factory_reads_env_vars(
     assert captured["base_url_override"] == "https://example.databricks.com/ai-gateway/codex/v1"
     assert captured["gateway_auth_command"] == "printf token"
     assert captured["gateway_auth_refresh_interval_ms"] == "900000"
+    assert captured["wire_api"] == "chat"
     assert captured["cwd"] == "/tmp/test-cwd"
     assert captured["codex_path"] == "/usr/local/bin/codex"
     # Inverted defaults verify the truthy parser is consulted
