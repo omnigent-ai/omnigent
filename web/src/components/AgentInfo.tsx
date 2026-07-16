@@ -1320,12 +1320,13 @@ export const HOVER_CLOSE_DELAY_MS = 150;
 /**
  * Header info icon revealing the active agent's tools & policies.
  *
- * Opens on hover over the (i) icon and stays open while the pointer is on the
- * icon or the panel (a short close delay bridges the gap between them). Click
- * and keyboard still toggle it, so touch devices and keyboard users are
- * unaffected. Desktop-only: on mobile (`< md`) the same content is reached via
- * the header's three-dot menu, which opens {@link AgentInfoContent} in a
- * dialog. Self-hides when the agent has neither tools nor policies.
+ * Opens on mouse hover over the (i) icon and stays open while the pointer is on
+ * the icon or the panel (a short close delay bridges the gap between them).
+ * Hover is gated to a real mouse pointer, so touch/pen taps fall through to
+ * Radix's native click-to-open; click and keyboard still toggle it. Desktop-only:
+ * on mobile (`< md`) the same content is reached via the header's three-dot menu,
+ * which opens {@link AgentInfoContent} in a dialog. Self-hides when the agent has
+ * neither tools nor policies.
  */
 export function AgentInfoButton({ agent, sessionId }: AgentInfoProps) {
   const [open, setOpen] = useState(false);
@@ -1350,12 +1351,6 @@ export function AgentInfoButton({ agent, sessionId }: AgentInfoProps) {
     }
   }
 
-  function openOnHover() {
-    cancelClose();
-    openedByHoverRef.current = true;
-    setOpen(true);
-  }
-
   function scheduleClose() {
     cancelClose();
     closeTimeoutRef.current = window.setTimeout(() => {
@@ -1363,6 +1358,28 @@ export function AgentInfoButton({ agent, sessionId }: AgentInfoProps) {
       openedByHoverRef.current = false;
       setOpen(false);
     }, HOVER_CLOSE_DELAY_MS);
+  }
+
+  // Hover only applies to a real mouse. Touch/pen synthesize a mouseenter that
+  // would open the panel, only for the follow-up synthetic click to toggle it
+  // straight back shut — so a tap could never open it. Gating on pointerType
+  // lets touch fall through to Radix's native tap-to-open (and keeps the hover
+  // bridge from auto-closing a tap-opened panel).
+  function openOnHover(e: React.PointerEvent) {
+    if (e.pointerType !== "mouse") return;
+    cancelClose();
+    openedByHoverRef.current = true;
+    setOpen(true);
+  }
+
+  function scheduleCloseOnLeave(e: React.PointerEvent) {
+    if (e.pointerType !== "mouse") return;
+    scheduleClose();
+  }
+
+  function cancelCloseOnEnter(e: React.PointerEvent) {
+    if (e.pointerType !== "mouse") return;
+    cancelClose();
   }
 
   return (
@@ -1388,8 +1405,8 @@ export function AgentInfoButton({ agent, sessionId }: AgentInfoProps) {
               aria-label="Agent tools and policies"
               data-testid="agent-info-trigger"
               className="hidden text-muted-foreground hover:text-foreground md:inline-flex"
-              onMouseEnter={openOnHover}
-              onMouseLeave={scheduleClose}
+              onPointerEnter={openOnHover}
+              onPointerLeave={scheduleCloseOnLeave}
               onFocus={() => {
                 openedByHoverRef.current = false;
               }}
@@ -1404,8 +1421,8 @@ export function AgentInfoButton({ agent, sessionId }: AgentInfoProps) {
         align="end"
         className="w-80"
         data-testid="agent-info-panel"
-        onMouseEnter={cancelClose}
-        onMouseLeave={scheduleClose}
+        onPointerEnter={cancelCloseOnEnter}
+        onPointerLeave={scheduleCloseOnLeave}
         onOpenAutoFocus={(e) => {
           if (openedByHoverRef.current) e.preventDefault();
         }}

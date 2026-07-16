@@ -185,10 +185,20 @@ describe("AgentInfoButton", () => {
   });
 });
 
+// Mouse pointer enter/leave. Hover-open is gated to `pointerType === "mouse"`
+// so touch/pen fall through to click-to-open; these helpers exercise the mouse
+// path. `pointerEnter`/`pointerLeave` don't bubble, matching the real events.
+function mousePointerEnter(el: Element) {
+  fireEvent.pointerEnter(el, { pointerType: "mouse" });
+}
+function mousePointerLeave(el: Element) {
+  fireEvent.pointerLeave(el, { pointerType: "mouse" });
+}
+
 describe("AgentInfoButton hover behavior", () => {
-  // The panel opens on hover over the (i) icon and stays open while the pointer
-  // is on the icon or the panel, closing after a short delay once it leaves
-  // both. Click continues to toggle it. Fake timers drive the close delay.
+  // The panel opens on mouse hover over the (i) icon and stays open while the
+  // pointer is on the icon or the panel, closing after a short delay once it
+  // leaves both. Click continues to toggle it. Fake timers drive the delay.
   beforeEach(() => {
     vi.useFakeTimers();
   });
@@ -197,12 +207,12 @@ describe("AgentInfoButton hover behavior", () => {
     vi.useRealTimers();
   });
 
-  it("opens the panel on hover over the (i) icon", () => {
+  it("opens the panel on mouse hover over the (i) icon", () => {
     renderButton(AGENT_WITH_BOTH);
     // Closed on mount: nothing rendered yet.
     expect(screen.queryByTestId("agent-info-panel")).toBeNull();
 
-    fireEvent.mouseEnter(screen.getByTestId("agent-info-trigger"));
+    mousePointerEnter(screen.getByTestId("agent-info-trigger"));
 
     // The panel is now open — the agent name proves the content mounted.
     expect(screen.getByTestId("agent-info-panel")).toBeInTheDocument();
@@ -212,12 +222,12 @@ describe("AgentInfoButton hover behavior", () => {
   it("stays open when the pointer moves from the icon onto the panel", () => {
     renderButton(AGENT_WITH_BOTH);
     const trigger = screen.getByTestId("agent-info-trigger");
-    fireEvent.mouseEnter(trigger);
+    mousePointerEnter(trigger);
 
     // Leaving the icon schedules a close; entering the panel before the delay
     // elapses must cancel it so the panel doesn't flicker shut mid-move.
-    fireEvent.mouseLeave(trigger);
-    fireEvent.mouseEnter(screen.getByTestId("agent-info-panel"));
+    mousePointerLeave(trigger);
+    mousePointerEnter(screen.getByTestId("agent-info-panel"));
     act(() => vi.advanceTimersByTime(HOVER_CLOSE_DELAY_MS + 50));
 
     expect(screen.getByTestId("agent-info-panel")).toBeInTheDocument();
@@ -226,11 +236,11 @@ describe("AgentInfoButton hover behavior", () => {
   it("closes after the delay once the pointer leaves both the icon and panel", () => {
     renderButton(AGENT_WITH_BOTH);
     const trigger = screen.getByTestId("agent-info-trigger");
-    fireEvent.mouseEnter(trigger);
+    mousePointerEnter(trigger);
     const panel = screen.getByTestId("agent-info-panel");
 
-    fireEvent.mouseEnter(panel);
-    fireEvent.mouseLeave(panel);
+    mousePointerEnter(panel);
+    mousePointerLeave(panel);
     // Still open right up to the delay boundary...
     act(() => vi.advanceTimersByTime(HOVER_CLOSE_DELAY_MS - 1));
     expect(screen.queryByTestId("agent-info-panel")).toBeInTheDocument();
@@ -242,22 +252,53 @@ describe("AgentInfoButton hover behavior", () => {
   it("re-entering the icon during the close delay keeps the panel open", () => {
     renderButton(AGENT_WITH_BOTH);
     const trigger = screen.getByTestId("agent-info-trigger");
-    fireEvent.mouseEnter(trigger);
+    mousePointerEnter(trigger);
 
-    fireEvent.mouseLeave(trigger);
-    fireEvent.mouseEnter(trigger);
+    mousePointerLeave(trigger);
+    mousePointerEnter(trigger);
     act(() => vi.advanceTimersByTime(HOVER_CLOSE_DELAY_MS + 50));
 
     expect(screen.getByTestId("agent-info-panel")).toBeInTheDocument();
   });
 
   it("still toggles open and closed on click", () => {
-    // Click/keyboard access must survive the hover wiring — touch devices and
-    // keyboard users rely on it since they never fire mouseenter.
+    // Click/keyboard access must survive the hover wiring — keyboard users rely
+    // on it since they never fire a pointer enter.
     renderButton(AGENT_WITH_BOTH);
     const trigger = screen.getByTestId("agent-info-trigger");
 
     fireEvent.click(trigger);
+    expect(screen.getByTestId("agent-info-panel")).toBeInTheDocument();
+
+    fireEvent.click(trigger);
+    expect(screen.queryByTestId("agent-info-panel")).toBeNull();
+  });
+
+  it("ignores a touch pointer so a tap falls through to click-to-open", () => {
+    // A touch tap synthesizes pointerenter+click. If hover-open fired on touch,
+    // it would open on pointerenter only for the synthetic click to toggle it
+    // straight back shut — so a tap could never open the panel. The touch
+    // pointerenter must be a no-op, leaving the panel closed for the click to
+    // open. (Verified in a real browser via CDP touch events.)
+    renderButton(AGENT_WITH_BOTH);
+    const trigger = screen.getByTestId("agent-info-trigger");
+
+    fireEvent.pointerEnter(trigger, { pointerType: "touch" });
+    // Touch hover did nothing — the panel stays closed.
+    expect(screen.queryByTestId("agent-info-panel")).toBeNull();
+
+    // The tap's click then opens it (Radix's native toggle).
+    fireEvent.click(trigger);
+    expect(screen.getByTestId("agent-info-panel")).toBeInTheDocument();
+  });
+
+  it("a mouse hover that then clicks lands closed (no double-open)", () => {
+    // Mouse users can hover (opens) then click the icon; the click must toggle
+    // relative to the hover-open state, ending closed rather than reopening.
+    renderButton(AGENT_WITH_BOTH);
+    const trigger = screen.getByTestId("agent-info-trigger");
+
+    mousePointerEnter(trigger);
     expect(screen.getByTestId("agent-info-panel")).toBeInTheDocument();
 
     fireEvent.click(trigger);
