@@ -131,6 +131,42 @@ async def test_delete_running_session_attempts_stop(
         sessions_module._session_status_cache.pop(session_id, None)
 
 
+async def test_delete_idle_parent_stops_running_child(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+) -> None:
+    """Deleting an idle parent with a running child stops the child.
+
+    Regression test: ``_best_effort_stop`` previously used the child
+    rollup only to decide whether to act, then always issued the stop
+    against the parent's own session id. A parent that has already gone
+    idle while its sub-agent child keeps running would get a no-op stop,
+    then the recursive subtree delete would remove the child's row while
+    its runner process kept running, orphaning it.
+    """
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    child = conv_store.create_conversation(
+        kind="sub_agent",
+        title="researcher:auth",
+        parent_conversation_id=session_id,
+    )
+
+    mock_stop = AsyncMock(return_value=True)
+    sessions_module._session_status_cache[child.id] = "running"
+    try:
+        with patch.object(sessions_module, "_stop_session_via_runner", mock_stop):
+            resp = await client.delete(f"/v1/sessions/{session_id}")
+        assert resp.status_code == 200
+        assert resp.json()["deleted"] is True
+        # The child must be the one stopped, not the (idle) parent.
+        mock_stop.assert_awaited_once()
+        assert mock_stop.await_args is not None
+        assert mock_stop.await_args.args[0] == child.id
+    finally:
+        sessions_module._session_status_cache.pop(child.id, None)
+
+
 async def test_delete_proceeds_when_stop_fails(
     client: httpx.AsyncClient,
     session_id: str,

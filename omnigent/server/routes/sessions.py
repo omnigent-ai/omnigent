@@ -2090,11 +2090,15 @@ async def _best_effort_stop(
 ) -> None:
     """Stop a running session before a destructive lifecycle action.
 
-    Mirrors the client-side stop-then-archive/delete pattern: if the
-    session (or any direct sub-agent child) is still running, attempt to
-    stop it via the runner. Failures are swallowed so the caller can
-    always proceed — the session must remain deletable/archivable even
-    when the runner is offline or unreachable.
+    Mirrors the client-side stop-then-archive/delete pattern. A session
+    reads as "running" here if it is itself running, has live background
+    tasks, or has a direct sub-agent child still running or waiting, but
+    each of those must be stopped on its own session id: a child executes
+    on its own runner, separate from the parent's, so stopping the parent
+    never reaches it. Every stop attempt is independently best-effort, so
+    one runner being unreachable does not skip stopping the others, and
+    none of this may block the caller from archiving or deleting the
+    session.
 
     :param session_id: Session/conversation identifier.
     :param conversation_store: Store for child-id lookup.
@@ -2108,15 +2112,36 @@ async def _best_effort_stop(
         )
         child_ids = child_ids_map.get(session_id, [])
         status = _session_status_with_child_rollup(session_id, child_ids)
-        if status != "running":
-            return
-        await _stop_session_via_runner(session_id, runner_router)
-    except Exception:  # noqa: BLE001 — best-effort; must not block archive/delete
+    except Exception:  # noqa: BLE001 (best-effort; must not block archive/delete)
         _logger.debug(
             "Best-effort stop failed for %s; proceeding anyway",
             session_id,
             exc_info=True,
         )
+        return
+
+    if status != "running":
+        return
+
+    async def _stop(target_id: str) -> None:
+        try:
+            await _stop_session_via_runner(target_id, runner_router)
+        except Exception:  # noqa: BLE001 (best-effort; must not block archive/delete)
+            _logger.debug(
+                "Best-effort stop failed for %s; proceeding anyway",
+                target_id,
+                exc_info=True,
+            )
+
+    own_status = _session_status_from_cache(session_id)
+    has_background_tasks = (
+        own_status != "failed" and _session_background_task_count_cache.get(session_id, 0) > 0
+    )
+    if own_status == "running" or has_background_tasks:
+        await _stop(session_id)
+    for child_id in child_ids:
+        if _session_status_cache.get(child_id) in ("running", "waiting"):
+            await _stop(child_id)
 
 
 @dataclass(frozen=True)
