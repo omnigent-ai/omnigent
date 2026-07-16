@@ -122,7 +122,9 @@ def test_pdf_text_selection_add_comment_and_highlight(
 
     # Wait for pdf.js to render the canvas and text layer.
     expect(file_viewer.locator("canvas").first).to_be_visible(timeout=30_000)
-    expect(file_viewer.locator(".pdf-viewer").get_by_text(_ANCHOR_TEXT)).to_be_visible(timeout=30_000)
+    expect(file_viewer.locator(".pdf-viewer").get_by_text(_ANCHOR_TEXT)).to_be_visible(
+        timeout=30_000
+    )
     _select_pdf_text(page, file_viewer, _ANCHOR_TEXT)
 
     add_comment_btn = page.get_by_role("button", name=re.compile("Add comment", re.IGNORECASE))
