@@ -16,6 +16,7 @@ import type { MessageContentBlock } from "./blocks";
 import type { McpServerStartup } from "./events";
 import { authenticatedFetch } from "./identity";
 import { isAndroidShell, isElectronShell, isIOSShell } from "@/lib/nativeBridge";
+import { setSessionHost } from "./sessionHost";
 import type {
   CodexModelOption,
   ModelUsage,
@@ -275,6 +276,9 @@ function usageByModelFromWire(
 }
 
 function sessionFromWire(wire: SessionResponseWire): Session {
+  // Record the session's host so slice-key routing (turn dispatch, terminal
+  // attach) can pin to the replica holding that host's runner tunnel.
+  setSessionHost(wire.id, wire.host_id);
   return {
     id: wire.id,
     agentId: wire.agent_id,

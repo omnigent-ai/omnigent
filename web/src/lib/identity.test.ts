@@ -207,6 +207,93 @@ describe("authenticatedFetch", () => {
     expect(init.method).toBe("DELETE");
     expect(init.signal).toBe(controller.signal);
   });
+
+  // The slice key only rides on the workspace-embedded (managed) UI, which
+  // installs a host fetcher; a standalone/self-hosted server has none. The
+  // embedded cases install a fetcher that delegates to the mocked global fetch,
+  // so assertions still read `fetchMock`.
+  const embedFetcher = (path: string, init?: RequestInit) => fetch(path, init);
+
+  it("stamps the omnigent slice-key header with the host_id on /v1/hosts routes", async () => {
+    // Host-control requests carry the host in the path, so the slice key
+    // (the host_id) is derived from the URL directly.
+    const { setOmnigentHostConfig } = await import("./host");
+    setOmnigentHostConfig({ fetcher: embedFetcher });
+    const { authenticatedFetch } = await import("./identity");
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({}));
+    await authenticatedFetch("/v1/hosts/host_abc/runners", { method: "POST" });
+
+    const headers = new Headers((fetchMock.mock.calls[0][1] as RequestInit).headers);
+    expect(headers.get("X-Databricks-Omnigent-Slice-Key")).toBe("host_abc");
+  });
+
+  it("stamps a session route's host_id from the session→host map", async () => {
+    // A session's requests must reach the replica holding its runner tunnel,
+    // keyed by the session's host_id — recorded when the session was parsed.
+    const { setSessionHost } = await import("./sessionHost");
+    setSessionHost("conv_sess1", "host_xyz");
+    const { setOmnigentHostConfig } = await import("./host");
+    setOmnigentHostConfig({ fetcher: embedFetcher });
+    const { authenticatedFetch } = await import("./identity");
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({}));
+    await authenticatedFetch("/v1/sessions/conv_sess1/events", { method: "POST" });
+
+    const headers = new Headers((fetchMock.mock.calls[0][1] as RequestInit).headers);
+    expect(headers.get("X-Databricks-Omnigent-Slice-Key")).toBe("host_xyz");
+  });
+
+  it("omits the slice-key header on a standalone (non-embedded) UI", async () => {
+    // No host fetcher installed = standalone/self-hosted server (no Dicer);
+    // the key must not ride, even on a host-scoped route.
+    const { authenticatedFetch } = await import("./identity");
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({}));
+    await authenticatedFetch("/v1/hosts/host_abc/runners", { method: "POST" });
+
+    const init = fetchMock.mock.calls[0][1] as RequestInit | undefined;
+    if (init?.headers) {
+      expect(new Headers(init.headers).has("X-Databricks-Omnigent-Slice-Key")).toBe(false);
+    }
+  });
+
+  it("omits the slice-key header when the session's host is unknown", async () => {
+    const { setOmnigentHostConfig } = await import("./host");
+    setOmnigentHostConfig({ fetcher: embedFetcher });
+    const { authenticatedFetch } = await import("./identity");
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({}));
+    await authenticatedFetch("/v1/sessions/conv_unregistered/events", { method: "POST" });
+
+    const init = fetchMock.mock.calls[0][1] as RequestInit | undefined;
+    if (init?.headers) {
+      expect(new Headers(init.headers).has("X-Databricks-Omnigent-Slice-Key")).toBe(false);
+    }
+  });
+
+  it("omits the slice-key header on non-host-scoped routes (session list)", async () => {
+    const { setOmnigentHostConfig } = await import("./host");
+    setOmnigentHostConfig({ fetcher: embedFetcher });
+    const { authenticatedFetch } = await import("./identity");
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({}));
+    await authenticatedFetch("/v1/sessions");
+
+    const init = fetchMock.mock.calls[0][1] as RequestInit | undefined;
+    if (init?.headers) {
+      expect(new Headers(init.headers).has("X-Databricks-Omnigent-Slice-Key")).toBe(false);
+    }
+  });
+
+  it("does not overwrite a slice-key header the caller set explicitly", async () => {
+    const { setOmnigentHostConfig } = await import("./host");
+    setOmnigentHostConfig({ fetcher: embedFetcher });
+    const { authenticatedFetch } = await import("./identity");
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({}));
+    await authenticatedFetch("/v1/hosts/host_abc/runners", {
+      method: "POST",
+      headers: { "X-Databricks-Omnigent-Slice-Key": "explicit" },
+    });
+
+    const headers = new Headers((fetchMock.mock.calls[0][1] as RequestInit).headers);
+    expect(headers.get("X-Databricks-Omnigent-Slice-Key")).toBe("explicit");
+  });
 });
 
 describe("getCurrentAuthorId", () => {
