@@ -156,13 +156,23 @@ def _install_fake_sdk(
             self.description = description
             self.input_schema = input_schema
 
+    class _FakeSandboxOptions:
+        def __init__(self, enabled: Any = None, **_kw: Any) -> None:
+            self.enabled = enabled
+
     class _FakeLocalAgentOptions:
         def __init__(
-            self, cwd: Any = None, custom_tools: Any = None, auto_review: Any = None, **_kw: Any
+            self,
+            cwd: Any = None,
+            custom_tools: Any = None,
+            auto_review: Any = None,
+            sandbox_options: Any = None,
+            **_kw: Any,
         ) -> None:
             self.cwd = cwd
             self.custom_tools = custom_tools
             self.auto_review = auto_review
+            self.sandbox_options = sandbox_options
             state.setdefault("local_options", []).append(self)
 
     class _FakeSendOptions:
@@ -174,6 +184,7 @@ def _install_fake_sdk(
     fake.AsyncAgent = _FakeAsyncAgent  # type: ignore[attr-defined]
     fake.CustomTool = _FakeCustomTool  # type: ignore[attr-defined]
     fake.LocalAgentOptions = _FakeLocalAgentOptions  # type: ignore[attr-defined]
+    fake.SandboxOptions = _FakeSandboxOptions  # type: ignore[attr-defined]
     fake.SendOptions = _FakeSendOptions  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "cursor_sdk", fake)
     return state
@@ -1556,6 +1567,63 @@ async def test_run_turn_native_tool_auto_mode_skips_elicitation(
 
 
 # ---------------------------------------------------------------------------
+# permission_mode -> SDK LocalAgentOptions approval stance
+# ---------------------------------------------------------------------------
+
+
+async def _local_options_for(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+    **executor_kwargs: Any,
+) -> Any:
+    """Run one turn and return the LocalAgentOptions the SDK was handed."""
+    sdk_state = _install_fake_sdk(monkeypatch, [{"messages": [_assistant("ok")], "result": "ok"}])
+    monkeypatch.delenv("RUNNER_SERVER_URL", raising=False)
+    executor = CursorExecutor(api_key="crsr_x", cwd=str(tmp_path), **executor_kwargs)
+    try:
+        _ = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
+    finally:
+        await executor.close()
+    local_opts = sdk_state.get("local_options", [])
+    assert local_opts, "LocalAgentOptions was never constructed"
+    return local_opts[0]
+
+
+async def test_auto_mode_disables_sdk_auto_review_and_sandbox(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    """Default auto mode must not arm cursor's approval provider: with auto_review
+    (or a sandbox policy) on, headless SDK runs auto-reject every shell call."""
+    local = await _local_options_for(monkeypatch, tmp_path)
+    assert local.auto_review is None
+    assert local.sandbox_options is not None
+    assert local.sandbox_options.enabled is False
+
+
+async def test_bypass_permissions_disables_sdk_auto_review_and_sandbox(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    """bypassPermissions takes the same headless stance as auto."""
+    local = await _local_options_for(monkeypatch, tmp_path, permission_mode="bypassPermissions")
+    assert local.auto_review is None
+    assert local.sandbox_options is not None
+    assert local.sandbox_options.enabled is False
+
+
+async def test_default_mode_keeps_sdk_auto_review(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    """Interactive mode keeps auto_review so cursor's own TUI prompts stay
+    bypassed in favour of the executor's web-UI elicitation card."""
+    local = await _local_options_for(monkeypatch, tmp_path, permission_mode="default")
+    assert local.auto_review is True
+    assert local.sandbox_options is None
+
+
+# ---------------------------------------------------------------------------
 # preToolUse hook: .cursor/hooks.json writing and cleanup
 # ---------------------------------------------------------------------------
 
@@ -1600,11 +1668,11 @@ async def test_ensure_session_writes_hooks_json(
     # ...so it must be owner-only (the baked token is never world-readable).
     assert wrapper.stat().st_mode & 0o777 == 0o700
 
-    # auto_review=True must be passed so cursor's own TUI approval prompts
-    # are bypassed in favour of the executor's native elicitation card.
+    # The hooks wiring must not disturb the permission stance: this executor
+    # uses the default auto mode, which stays out of cursor's approval flow.
     local_opts = sdk_state.get("local_options", [])
     assert local_opts, "LocalAgentOptions was never constructed"
-    assert local_opts[0].auto_review is True
+    assert local_opts[0].auto_review is None
 
     await executor.close()
     # Both files are cleaned up on close.

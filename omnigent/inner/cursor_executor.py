@@ -489,8 +489,10 @@ class CursorExecutor(Executor):
         :param skills_filter: Accepted for parity; cursor has no skill mechanism here.
         :param permission_mode: Omnigent permission stance. ``"auto"`` (default)
             and ``"bypassPermissions"`` skip web-UI elicitation for native
-            tools (policy DENY still blocks). Any other value keeps the
-            interactive per-tool approval card.
+            tools (policy DENY still blocks) and select the SDK's headless
+            approval stance (no auto_review, sandbox disabled) so native shell
+            /edit calls run without an interactive approval. Any other value
+            keeps ``auto_review`` on and the interactive per-tool approval card.
         """
         self._cwd = cwd or (os_env.cwd if os_env is not None else None)
         self._os_env_spec = os_env
@@ -685,7 +687,12 @@ class CursorExecutor(Executor):
         if state.agent is not None:
             return
         try:
-            from cursor_sdk import AsyncAgent, AsyncClient, LocalAgentOptions
+            from cursor_sdk import (
+                AsyncAgent,
+                AsyncClient,
+                LocalAgentOptions,
+                SandboxOptions,
+            )
         except ImportError as exc:
             from omnigent.onboarding.cursor_auth import CURSOR_EXTRA
             from omnigent.onboarding.extra_install import extra_install_display
@@ -715,13 +722,18 @@ class CursorExecutor(Executor):
             local_kwargs: dict[str, Any] = {
                 "cwd": cwd,
                 "custom_tools": self._make_custom_tools(tools, loop) or None,
-                # Bypass cursor's own TUI approval prompts so native tool calls
-                # reach the executor's event stream and can be gated via the
-                # web-UI elicitation card (see _evaluate_native_tool_policy).
-                # Without this cursor may pause internally for its own approval
-                # before emitting a ToolCallRequest event.
-                "auto_review": True,
             }
+            if self._permission_mode in ("auto", "bypassPermissions"):
+                # Headless stance: cursor's Local SDK cannot answer an interactive
+                # approval, so auto_review (and any host sandbox policy) makes every
+                # native shell/edit self-reject. Disable the sandbox and leave
+                # auto_review off so native tools execute; policy gates via hooks.
+                local_kwargs["sandbox_options"] = SandboxOptions(enabled=False)
+            else:
+                # Interactive stance: keep cursor's own TUI approval bypassed so
+                # native tool calls surface on the executor's event stream and are
+                # gated via the web-UI elicitation card (_evaluate_native_tool_policy).
+                local_kwargs["auto_review"] = True
             # Tell the SDK to read project-level settings (including hooks.json).
             if state.hooks_file is not None:
                 local_kwargs["setting_sources"] = ["project"]
