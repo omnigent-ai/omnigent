@@ -1726,8 +1726,8 @@ def test_cursor_policy_hook_deny(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "Bash" in result["agent_message"]
 
 
-def test_cursor_policy_hook_network_error_fails_open(monkeypatch: pytest.MonkeyPatch) -> None:
-    """post_evaluate_with_retry returning None (network error) causes the hook to fail open."""
+def test_cursor_policy_hook_network_error_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """None from post_evaluate_with_retry (network error) fails closed with deny."""
     import io
     from unittest.mock import patch
 
@@ -1750,7 +1750,44 @@ def test_cursor_policy_hook_network_error_fails_open(monkeypatch: pytest.MonkeyP
         cursor_policy_hook.main()
 
     result = json.loads(stdout.getvalue())
-    assert result["permission"] == "allow"
+    assert result["permission"] == "deny"
+    assert "unavailable" in result["agent_message"]
+    assert "connection error: simulated" in result["agent_message"]
+
+
+def test_cursor_policy_hook_malformed_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A policy response whose body isn't valid JSON fails closed with deny."""
+    import io
+    from unittest.mock import patch
+
+    monkeypatch.setenv("_OMNIGENT_SERVER_URL", "http://localhost:6767")
+    monkeypatch.setenv("_OMNIGENT_SESSION_ID", "conv_test")
+
+    stdin_data = json.dumps({"tool_name": "Bash", "tool_input": {"command": "ls"}})
+
+    from omnigent.inner import cursor_policy_hook
+
+    def _raise() -> dict[str, object]:
+        raise ValueError("not json")
+
+    resp = SimpleNamespace()
+    resp.json = _raise
+
+    stdout = io.StringIO()
+    with (
+        patch.object(sys, "stdin", io.StringIO(stdin_data)),
+        patch.object(sys, "stdout", stdout),
+        patch(
+            "omnigent.native_policy_hook.post_evaluate_with_retry",
+            return_value=(resp, None),
+        ),
+    ):
+        cursor_policy_hook.main()
+
+    result = json.loads(stdout.getvalue())
+    assert result["permission"] == "deny"
+    assert "malformed" in result["agent_message"]
+    assert "Bash" in result["agent_message"]
 
 
 def test_cursor_policy_hook_no_env_fails_open(monkeypatch: pytest.MonkeyPatch) -> None:
