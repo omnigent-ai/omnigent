@@ -17,6 +17,10 @@ on:
     - cron: "37 7 * * *" # 07:37 UTC nightly (off-peak, off the :00 mark)
   workflow_dispatch:
     inputs:
+      checkout_sha:
+        description: "Commit SHA to benchmark (blank = branch HEAD)"
+        required: false
+        default: ""
       iterations:
         description: "Requests per run"
         required: false
@@ -49,9 +53,10 @@ env:
   ITEMS: ${{ github.event_name == 'workflow_dispatch' && inputs.items_per_session || '200' }}
 
 concurrency:
-  # Never cancel a scheduled run mid-flight (each is a distinct data point);
-  # coalesce manual dispatches per ref.
-  group: benchmark-${{ github.event_name }}-${{ github.ref }}
+  # Never cancel a scheduled run mid-flight (each is a distinct data point).
+  # Manual dispatches get a per-run group (unique run_id) so repeated ad-hoc
+  # runs — even on the same ref and same pinned sha — never cancel each other.
+  group: benchmark-${{ github.event_name }}-${{ github.ref }}-${{ github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' }}
 
 jobs:
@@ -98,6 +103,10 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
+          # Pin the benchmarked code to a specific commit when dispatched with
+          # checkout_sha; the workflow definition still comes from the trusted
+          # dispatch ref. Blank falls back to the ref's HEAD (schedule/default).
+          ref: ${{ inputs.checkout_sha || github.sha }}
 
       - name: Set up Python
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0

@@ -3311,6 +3311,48 @@ async def test_post_external_output_text_delta_rejects_malformed_delta(
     assert published == []
 
 
+async def test_post_external_tool_output_delta_publishes_transient_delta(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Command output deltas publish without changing session history."""
+    published: list[tuple[str, dict[str, Any]]] = []
+
+    def capture_publish(session_id: str, event: dict[str, Any]) -> None:
+        published.append((session_id, event))
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        capture_publish,
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_tool_output_delta",
+            "data": {"call_id": "call_123", "delta": "collecting..."},
+        },
+    )
+    assert resp.status_code == 202, resp.text
+    assert resp.json() == {"queued": False}
+    assert published == [
+        (
+            session["id"],
+            {
+                "type": "response.function_call_output.delta",
+                "call_id": "call_123",
+                "delta": "collecting...",
+            },
+        )
+    ]
+
+    snap = await client.get(f"/v1/sessions/{session['id']}")
+    assert snap.status_code == 200, snap.text
+    assert snap.json()["items"] == []
+
+
 async def test_post_external_output_reasoning_delta_started_publishes_started_then_delta(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,

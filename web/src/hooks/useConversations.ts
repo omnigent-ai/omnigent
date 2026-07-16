@@ -221,7 +221,7 @@ async function fetchConversationsPage({
   const params = new URLSearchParams({
     order: "desc",
     sort_by: "updated_at",
-    limit: "20",
+    limit: "30",
   });
   if (after) params.set("after", after);
   if (searchQuery) params.set("search_query", searchQuery);
@@ -288,6 +288,11 @@ export function useConversations(
     initialPageParam: undefined as string | undefined,
     getNextPageParam: (lastPage) =>
       lastPage.has_more ? (lastPage.last_id ?? undefined) : undefined,
+    // Data is kept fresh for 30 s so components that mount in quick
+    // succession after the initial fetch (AppShell, Sidebar, ChatPage)
+    // share the cache instead of each triggering a background refetch.
+    // The WS stream handles real-time updates within that window.
+    staleTime: 30_000,
     refetchInterval: streamConnected
       ? options.reconcileWhileConnected
         ? CONNECTED_STREAM_REFETCH_INTERVAL_MS
