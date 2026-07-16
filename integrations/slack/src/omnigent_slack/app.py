@@ -25,7 +25,8 @@ async def run() -> None:
     )
     logger = logging.getLogger(__name__)
     logger.info(
-        "Starting Omnigent Slack bot database=%s",
+        "Starting Omnigent Slack bot server=%s database=%s",
+        settings.server_url,
         settings.database_path,
     )
 
@@ -49,23 +50,30 @@ async def run() -> None:
         token_store = InMemoryTokenStore()
     await token_store.initialize()
 
-    # The bot is not tied to any Omnigent server: each Slack user configures
-    # their own via the setup flow, and the pool holds one client per
-    # (server, packed-user) carrying that user's delegated bearer token.
-    # The pool is created first so the auth manager can invalidate a cached
-    # client the moment a token is stored/removed (login/logout).
+    # The bot talks to one operator-configured Omnigent server
+    # (settings.server_url) — never a user-supplied URL. The pool holds one
+    # client per (server, packed-user) carrying that user's delegated bearer
+    # token. Created first so the auth manager can invalidate a cached client
+    # the moment a token is stored/removed (login/logout).
     pool = OmnigentClientPool()
 
     async def _on_token_changed(team_id: str, user_id: str, server_url: str) -> None:
         await pool.invalidate(server_url, pack_user_key(team_id, user_id))
 
-    auth_manager = AuthManager(token_store, on_token_changed=_on_token_changed)
+    auth_manager = AuthManager(
+        token_store,
+        on_token_changed=_on_token_changed,
+        client_secret=settings.device_client_secret,
+    )
     pool.set_auth_resolver(auth_manager.resolve_auth)
-    setup = SetupFlow(store=store, pool=pool, auth_manager=auth_manager)
+    setup = SetupFlow(
+        store=store, pool=pool, server_url=settings.server_url, auth_manager=auth_manager
+    )
     service = SlackOmnigentService(
         store=store,
         pool=pool,
         setup=setup,
+        server_url=settings.server_url,
     )
 
     app = AsyncApp(token=settings.slack_bot_token)

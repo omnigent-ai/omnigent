@@ -22,14 +22,15 @@ from omnigent_slack.store import SQLiteStore
 # handlers. Keeping them in one place avoids drift between what a modal renders
 # and what its handler reads back out of the ``view.state`` payload.
 ACTION_SETUP_START = "omnigent_setup_start"
-CALLBACK_URL_MODAL = "omnigent_setup_url"
+# Info-only setup screens (connecting / login / no-host / failed). They have
+# no submit, so no view-submission handler is registered for this callback;
+# it exists only to give those modals a stable identifier.
+CALLBACK_SETUP_INFO = "omnigent_setup_info"
 CALLBACK_SELECT_MODAL = "omnigent_setup_select"
 
-# Slash command that lets a user (re)configure their Omnigent server.
+# Slash command that lets a user (re)configure their Omnigent setup.
 COMMAND_NAME = "/omnigent"
 
-URL_BLOCK = "server_url_block"
-URL_ACTION = "server_url_input"
 AGENT_BLOCK = "agent_block"
 AGENT_ACTION = "agent_select"
 HOST_BLOCK = "host_block"
@@ -72,37 +73,41 @@ class _ViewUpdateAck:
 
 
 class SetupFlow:
-    """Per-user Omnigent setup: a DM button opens a two-step modal.
+    """Per-user Omnigent setup for the operator-configured server.
 
-    Step one asks for the server URL and validates connectivity; step two lets
-    the user pick an agent and preferred host from menus populated by that
-    server. The result is persisted per ``(team_id, user_id)``.
+    The bot talks to one fixed Omnigent server (``server_url``, set by the
+    operator — never entered by a user), so setup no longer asks for a URL.
+    Opening ``/omnigent`` validates connectivity against that server,
+    logging the user in (in-modal) if it requires auth, then lets them pick
+    an agent, host, and workspace. The result is persisted per
+    ``(team_id, user_id)``.
     """
 
     def __init__(
         self,
         store: SQLiteStore,
         pool: OmnigentClientPool,
+        server_url: str,
         auth_manager: AuthManager | None = None,
     ) -> None:
         self._store = store
         self._pool = pool
+        self._server_url = server_url
         self._auth = auth_manager
         self._logger = logging.getLogger(__name__)
 
     def register(self, app: AsyncApp) -> None:
         app.command(COMMAND_NAME)(self._handle_config_command)
         app.action(ACTION_SETUP_START)(self._handle_setup_start)
-        app.view(CALLBACK_URL_MODAL)(self._handle_url_submit)
         app.view(CALLBACK_SELECT_MODAL)(self._handle_select_submit)
 
     async def _handle_config_command(self, ack: Any, command: dict[str, Any], client: Any) -> None:
-        # Two commands: ``/omnigent`` (or ``/omnigent config``) opens the setup
-        # modal — login is folded into that flow, an auth-enabled server shows
-        # the login link in the modal and advances once approved. ``/omnigent
-        # logout`` revokes every server token and clears all saved settings for
-        # the user. Any other argument opens setup. Prefill the setup URL with
-        # the current config so a reconfigure starts from what they have.
+        # ``/omnigent`` (or ``/omnigent config``) opens setup against the fixed
+        # server — connectivity is validated immediately, login is folded in
+        # (an auth-enabled server shows the login link in the modal and
+        # advances once approved), then the agent/host/workspace picker.
+        # ``/omnigent logout`` revokes every server token and clears all saved
+        # settings for the user.
         await ack()
         team_id = str(command.get("team_id") or "")
         user_id = str(command.get("user_id") or "")
@@ -116,16 +121,16 @@ class SetupFlow:
         if not trigger_id:
             self._logger.warning("Config command missing trigger_id")
             return
-        existing = await self._store.get_user_config(team_id, user_id)
-        current_url = existing.server_url if existing else None
-        await client.views_open(trigger_id=trigger_id, view=url_modal(server_url=current_url))
+        view_id = await self._open_connecting_modal(client, trigger_id)
+        if view_id:
+            await self._begin_setup(client, team_id=team_id, user_id=user_id, view_id=view_id)
 
     async def _handle_logout(self, *, team_id: str, user_id: str, client: Any) -> None:
         """Handle ``/omnigent logout`` — full reset for the user.
 
-        Revokes every delegated token the user holds (across all servers)
-        and clears all their saved settings (server/agent/host/workspace
-        plus thread→session mappings), then DMs a confirmation.
+        Revokes every delegated token the user holds and clears all their
+        saved settings (agent/host/workspace plus thread→session mappings),
+        then DMs a confirmation.
         """
         opened = await client.conversations_open(users=user_id)
         dm_channel = _dm_channel_id(opened)
@@ -188,28 +193,32 @@ class SetupFlow:
         if not trigger_id:
             self._logger.warning("Setup start action missing trigger_id")
             return
-        await client.views_open(trigger_id=trigger_id, view=url_modal())
-
-    async def _handle_url_submit(
-        self, ack: Any, body: dict[str, Any], view: dict[str, Any], client: Any
-    ) -> None:
-        server_url = _input_value(view, URL_BLOCK, URL_ACTION).strip()
-        if not server_url:
-            await ack(
-                response_action="errors",
-                errors={URL_BLOCK: "Enter your Omnigent server URL."},
-            )
-            return
-        if not server_url.startswith(("http://", "https://")):
-            await ack(
-                response_action="errors",
-                errors={URL_BLOCK: "URL must start with http:// or https://."},
-            )
-            return
-
         team_id = str((body.get("team") or {}).get("id") or body.get("team_id") or "")
         user_id = str((body.get("user") or {}).get("id") or "")
-        view_id = str((body.get("view") or {}).get("id") or "")
+        view_id = await self._open_connecting_modal(client, trigger_id)
+        if view_id:
+            await self._begin_setup(client, team_id=team_id, user_id=user_id, view_id=view_id)
+
+    async def _open_connecting_modal(self, client: Any, trigger_id: str) -> str | None:
+        """Open the initial "connecting…" modal and return its ``view_id``.
+
+        There's no URL step any more, so setup opens a placeholder modal and
+        immediately drives validation/login/selection into it via
+        ``views_update`` (using the returned ``view_id``).
+        """
+        try:
+            resp = await client.views_open(trigger_id=trigger_id, view=connecting_modal())
+        except Exception as exc:  # noqa: BLE001 — surface as a no-op; nothing opened
+            self._logger.warning("Could not open setup modal: %s", exc)
+            return None
+        view = resp.get("view") if hasattr(resp, "get") else None
+        view_id = view.get("id") if isinstance(view, dict) else None
+        return str(view_id) if view_id else None
+
+    async def _begin_setup(self, client: Any, *, team_id: str, user_id: str, view_id: str) -> None:
+        """Validate the fixed server, logging in first if it requires auth."""
+        server_url = self._server_url
+        ack = _ViewUpdateAck(client, view_id)
         # Validate as the authenticated user when a token exists — the
         # agent/host listing endpoints are auth-gated.
         omnigent = await self._pool.get(server_url, pack_user_key(team_id, user_id))
@@ -221,18 +230,16 @@ class SetupFlow:
             # in the background, and advance the modal to agent/host selection
             # the moment the user approves — no DM, no re-running /omnigent.
             if self._auth is None or not self._auth.enabled:
-                await ack(
-                    response_action="errors",
-                    errors={
-                        URL_BLOCK: (
-                            "This server requires login, which this bot isn't "
-                            "configured for. Ask the bot operator to enable it."
-                        )
-                    },
+                await client.views_update(
+                    view_id=view_id,
+                    view=login_failed_modal(
+                        server_url,
+                        "This server requires login, which this bot isn't "
+                        "configured for. Ask the bot operator to enable it.",
+                    ),
                 )
                 return
             await self._begin_in_modal_login(
-                ack,
                 client,
                 team_id=team_id,
                 user_id=user_id,
@@ -242,9 +249,11 @@ class SetupFlow:
             return
         except OmnigentError as exc:
             self._logger.info("Setup validation failed url=%s error=%s", server_url, exc)
-            await ack(
-                response_action="errors",
-                errors={URL_BLOCK: "Could not reach that Omnigent server. Check the URL."},
+            await client.views_update(
+                view_id=view_id,
+                view=login_failed_modal(
+                    server_url, "Could not reach the Omnigent server. Try again shortly."
+                ),
             )
             return
 
@@ -257,17 +266,17 @@ class SetupFlow:
         server_url: str,
         validated: ValidatedServer,
     ) -> None:
-        """Move the modal from URL entry to agent/host/workspace selection.
+        """Advance the modal to agent/host/workspace selection.
 
-        ``ack`` may be a real Slack ``ack`` (initial submit) or an
-        :class:`_ViewUpdateAck` that pushes a ``views_update`` for the
-        post-login continuation — both take ``response_action='update'``.
+        ``ack`` is always an :class:`_ViewUpdateAck` (setup is driven via
+        ``views_update`` now that there's no URL-submit event), taking
+        ``response_action='update'`` / ``'errors'``.
         """
         if not validated.agents:
-            await ack(
-                response_action="errors",
-                errors={URL_BLOCK: "That server has no agents available."},
-            )
+            # Not a form-validation error (there's no live submission here —
+            # ack is a _ViewUpdateAck), so show a plain info screen rather than
+            # routing through the login-framed errors branch.
+            await ack(response_action="update", view=no_agents_modal(server_url))
             return
         if not validated.online_hosts:
             # A session needs a host to run on, so setup can't finish without
@@ -286,7 +295,6 @@ class SetupFlow:
 
     async def _begin_in_modal_login(
         self,
-        ack: Any,
         client: Any,
         *,
         team_id: str,
@@ -301,15 +309,15 @@ class SetupFlow:
             pending = await self._auth.authorize(server_url=server_url, client_id=client_id)
         except OAuthError as exc:
             self._logger.info("Login authorize failed server=%s error=%s", server_url, exc)
-            await ack(
-                response_action="errors",
-                errors={URL_BLOCK: f"Could not start login on {server_url}. Check the URL."},
+            await client.views_update(
+                view_id=view_id,
+                view=login_failed_modal(server_url, "Could not start login. Try again shortly."),
             )
             return
 
         # Swap the modal to the "open the link and approve" screen.
-        await ack(
-            response_action="update",
+        await client.views_update(
+            view_id=view_id,
             view=login_waiting_modal(server_url, pending.verification_url, pending.user_code),
         )
 
@@ -379,9 +387,9 @@ class SetupFlow:
     async def _handle_select_submit(
         self, ack: Any, body: dict[str, Any], view: dict[str, Any], client: Any
     ) -> None:
-        server_url = str(view.get("private_metadata") or "")
+        server_url = self._server_url
         agent_option = _selected_option(view, AGENT_BLOCK, AGENT_ACTION)
-        if not server_url or agent_option is None:
+        if agent_option is None:
             await ack(
                 response_action="errors",
                 errors={AGENT_BLOCK: "Select an agent to finish setup."},
@@ -407,7 +415,6 @@ class SetupFlow:
         host_name = _option_text(host_option)
 
         config = UserConfig(
-            server_url=server_url,
             agent_id=str(agent_option.get("value")),
             agent_name=_option_text(agent_option) or str(agent_option.get("value")),
             workspace=workspace,
@@ -466,8 +473,7 @@ def setup_prompt_blocks() -> list[dict[str, Any]]:
             "text": {
                 "type": "mrkdwn",
                 "text": (
-                    "*Set up Omnigent*\nPoint me at your Omnigent server so I can run "
-                    "sessions for you."
+                    "*Set up Omnigent*\nPick an agent and host so I can run sessions for you."
                 ),
             },
         },
@@ -485,26 +491,19 @@ def setup_prompt_blocks() -> list[dict[str, Any]]:
     ]
 
 
-def url_modal(server_url: str | None = None) -> dict[str, Any]:
-    element: dict[str, Any] = {
-        "type": "plain_text_input",
-        "action_id": URL_ACTION,
-        "placeholder": {"type": "plain_text", "text": "https://omnigent.example.com"},
-    }
-    if server_url:
-        element["initial_value"] = server_url
+def connecting_modal() -> dict[str, Any]:
+    # Placeholder shown the instant setup opens, before the fixed server is
+    # probed. Setup then drives validation/login/selection into this view via
+    # views_update. No submit — it just shows progress.
     return {
         "type": "modal",
-        "callback_id": CALLBACK_URL_MODAL,
+        "callback_id": CALLBACK_SETUP_INFO,
         "title": {"type": "plain_text", "text": "Set up Omnigent"},
-        "submit": {"type": "plain_text", "text": "Connect"},
         "close": {"type": "plain_text", "text": "Cancel"},
         "blocks": [
             {
-                "type": "input",
-                "block_id": URL_BLOCK,
-                "label": {"type": "plain_text", "text": "Omnigent server URL"},
-                "element": element,
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": "Connecting to Omnigent…"},
             }
         ],
     }
@@ -513,13 +512,36 @@ def url_modal(server_url: str | None = None) -> dict[str, Any]:
 def no_host_modal(server_url: str) -> dict[str, Any]:
     return {
         "type": "modal",
-        "callback_id": CALLBACK_URL_MODAL,
+        "callback_id": CALLBACK_SETUP_INFO,
         "title": {"type": "plain_text", "text": "Set up Omnigent"},
         "close": {"type": "plain_text", "text": "Close"},
         "blocks": [
             {
                 "type": "section",
                 "text": {"type": "mrkdwn", "text": host_unavailable_text(server_url)},
+            }
+        ],
+    }
+
+
+def no_agents_modal(server_url: str) -> dict[str, Any]:
+    # Shown when the connected server exposes no agents to choose from — setup
+    # can't finish without one. Distinct from the login-failure screen.
+    return {
+        "type": "modal",
+        "callback_id": CALLBACK_SETUP_INFO,
+        "title": {"type": "plain_text", "text": "Set up Omnigent"},
+        "close": {"type": "plain_text", "text": "Close"},
+        "blocks": [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        f":warning: *{server_url}* has no agents available.\n"
+                        "Add an agent on the server, then run `/omnigent` again."
+                    ),
+                },
             }
         ],
     }
@@ -535,7 +557,7 @@ def login_waiting_modal(server_url: str, verification_url: str, user_code: str) 
     code_hint = f" (code `{user_code}`)" if user_code else ""
     return {
         "type": "modal",
-        "callback_id": CALLBACK_URL_MODAL,
+        "callback_id": CALLBACK_SETUP_INFO,
         "title": {"type": "plain_text", "text": "Set up Omnigent"},
         "close": {"type": "plain_text", "text": "Cancel"},
         "blocks": [
@@ -567,7 +589,7 @@ def login_failed_modal(server_url: str, reason: str) -> dict[str, Any]:
     where = f" to *{server_url}*" if server_url else ""
     return {
         "type": "modal",
-        "callback_id": CALLBACK_URL_MODAL,
+        "callback_id": CALLBACK_SETUP_INFO,
         "title": {"type": "plain_text", "text": "Set up Omnigent"},
         "close": {"type": "plain_text", "text": "Close"},
         "blocks": [
@@ -641,7 +663,6 @@ def select_modal(
     return {
         "type": "modal",
         "callback_id": CALLBACK_SELECT_MODAL,
-        "private_metadata": server_url,
         "title": {"type": "plain_text", "text": "Set up Omnigent"},
         "submit": {"type": "plain_text", "text": "Save"},
         "close": {"type": "plain_text", "text": "Cancel"},

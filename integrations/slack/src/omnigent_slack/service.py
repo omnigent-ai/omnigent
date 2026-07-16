@@ -150,11 +150,16 @@ class SlackOmnigentService:
         store: SQLiteStore,
         pool: OmnigentClientPool,
         setup: SetupFlow,
+        server_url: str,
         bot_user_id: str | None = None,
     ) -> None:
         self._store = store
         self._pool = pool
         self._setup = setup
+        # The one operator-configured Omnigent server. Always the routing
+        # target — any server_url persisted on an older config/session row is
+        # ignored, so a config change points every thread at the new server.
+        self._server_url = server_url
         self._bot_user_id = bot_user_id
         self._dispatcher = ThreadTurnDispatcher(self._run_turn)
         self._logger = logging.getLogger(__name__)
@@ -290,12 +295,6 @@ class SlackOmnigentService:
                     requester,
                 )
                 return
-            if not record.server_url:
-                self._logger.warning(
-                    "Existing session missing server_url thread=%s; ignoring",
-                    key.display(),
-                )
-                return
             await self._dispatcher.enqueue(
                 SlackTurn(
                     key=key,
@@ -304,7 +303,6 @@ class SlackOmnigentService:
                     create_if_missing=False,
                     title=_session_title(event, text),
                     slack_client=client,
-                    server_url=record.server_url,
                     agent_id="",
                     owner_user_id=record.owner_user_id or requester,
                     workspace=record.workspace,
@@ -337,7 +335,6 @@ class SlackOmnigentService:
                 create_if_missing=True,
                 title=_session_title(event, text),
                 slack_client=client,
-                server_url=config.server_url,
                 agent_id=config.agent_id,
                 owner_user_id=requester,
                 workspace=config.workspace,
@@ -348,7 +345,7 @@ class SlackOmnigentService:
     async def _run_turn(self, turn: SlackTurn) -> None:
         self._logger.info("Starting turn thread=%s chars=%s", turn.key.display(), len(turn.text))
         omnigent = await self._pool.get(
-            turn.server_url, pack_user_key(turn.key.team_id, turn.user_id)
+            self._server_url, pack_user_key(turn.key.team_id, turn.user_id)
         )
 
         # Acknowledge immediately: a new session's create + runner launch can take
@@ -387,7 +384,7 @@ class SlackOmnigentService:
                 self._logger.info("Host unavailable thread=%s", turn.key.display())
                 await self._clear_ack(turn.slack_client, turn.key, ack_ts)
                 await self._post_reply(
-                    turn.slack_client, turn.key, host_unavailable_text(turn.server_url)
+                    turn.slack_client, turn.key, host_unavailable_text(self._server_url)
                 )
                 return
             await self._store.upsert_session(
@@ -395,7 +392,6 @@ class SlackOmnigentService:
                 session_id,
                 turn.title,
                 owner_user_id=turn.owner_user_id,
-                server_url=turn.server_url,
                 host_id=turn.host_id,
                 workspace=turn.workspace,
             )
@@ -461,7 +457,7 @@ class SlackOmnigentService:
         except HostUnavailableError:
             self._logger.info("Host unavailable mid-turn thread=%s", turn.key.display())
             await self._clear_ack(slack_client, turn.key, ack_ts)
-            await reply.stop(host_unavailable_text(turn.server_url))
+            await reply.stop(host_unavailable_text(self._server_url))
             return
         except Exception as exc:
             self._logger.exception("Omnigent turn failed for %s", turn.key.display())

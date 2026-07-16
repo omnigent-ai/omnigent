@@ -1,7 +1,7 @@
 """Add device_grants table for the OAuth device authorization grant.
 
 Revision ID: d1e2f3a4b5c6
-Revises: 9d820f91deef
+Revises: a7b3c4d5e6f7
 Create Date: 2026-07-15
 
 Backs the generic device-authorization grant (RFC 8628) — not tied to any
@@ -16,7 +16,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "d1e2f3a4b5c6"
-down_revision: str | None = "9d820f91deef"
+down_revision: str | None = "a7b3c4d5e6f7"
 branch_labels: tuple[str, ...] | None = None
 depends_on: tuple[str, ...] | None = None
 

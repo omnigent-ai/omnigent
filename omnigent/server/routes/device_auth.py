@@ -26,20 +26,29 @@ mode has no server-mintable identity (mirrors ``mint_runner_token``).
 
 See ``designs/DEVICE_AUTH.md`` for the full design + threat model.
 
-This is a **public** OAuth client (no client secret). The security
-boundary is the secret ``device_code`` the client holds, the ephemeral
-verification link, and the authenticated in-browser consent step —
-backed by a short device_code TTL, a 30-day absolute grant lifetime,
+The security boundary is the secret ``device_code`` the client holds, the
+ephemeral verification link, and the authenticated in-browser consent step
+— backed by a short device_code TTL, a 30-day absolute grant lifetime,
 per-IP rate limiting on authorize, and the consent-page warning against
 approving an unexpected login.
+
+Optionally, setting ``OMNIGENT_DEVICE_CLIENT_SECRET`` on the server gates
+the CLIENT-facing endpoints (authorize / token / revoke) behind a shared
+secret header, so only an authorized client (e.g. the Slack socket server,
+which holds the matching secret and a fixed server URL) can drive the flow.
+When unset the endpoints stay public. This is safe to ship to the client
+now that its server target is a fixed operator config rather than a
+user-supplied URL (which is why the secret was previously removed).
 
 Refresh tokens: short access tokens + rotating, revocable refresh tokens.
 """
 
 from __future__ import annotations
 
+import hmac
 import html
 import logging
+import os
 import secrets
 import time
 
@@ -52,6 +61,17 @@ from omnigent.server.device_grant_store import DeviceGrantStore, hash_secret
 from omnigent.server.routes._origin import require_trusted_origin
 
 _logger = logging.getLogger(__name__)
+
+# Optional shared secret gating the CLIENT-facing device endpoints
+# (authorize / token / revoke). When ``OMNIGENT_DEVICE_CLIENT_SECRET`` is
+# set on the server, a client (e.g. the Slack socket server) must present
+# it in this header or the request is rejected 401 — so only an authorized
+# client can drive the device flow. Unset ⇒ the endpoints stay public
+# (backward compatible). The BROWSER endpoints (consent GET / approve /
+# deny) are NOT gated by this: they run in the user's browser, which never
+# holds the secret; their trust comes from the session cookie + Origin.
+_CLIENT_SECRET_ENV = "OMNIGENT_DEVICE_CLIENT_SECRET"
+_CLIENT_SECRET_HEADER = "X-Omnigent-Client-Secret"
 
 # Scope granted to delegated (device-grant) access tokens. Restricts them
 # to the session-facing APIs a delegated client needs; the auth layer
@@ -260,6 +280,29 @@ def create_device_auth_router(
     base_url = cookie_config.base_url
     provider_name = auth_provider._source
 
+    # Read the optional client secret once at mount. When set, the
+    # client-facing endpoints require a matching header; when unset they
+    # stay public. Captured here (not per-request) so toggling it needs a
+    # restart — consistent with the other auth env vars.
+    client_secret = os.environ.get(_CLIENT_SECRET_ENV, "").strip() or None
+    if client_secret is not None:
+        _logger.info("device-auth: client-secret enforcement enabled")
+
+    def _client_secret_ok(request: Request) -> bool:
+        """Return True if the request may use the client-facing endpoints.
+
+        Open when no secret is configured; otherwise requires the presented
+        header to match, compared in constant time to avoid leaking the
+        secret through timing.
+        """
+        if client_secret is None:
+            return True
+        # Compare on bytes: compare_digest raises TypeError on non-ASCII str
+        # operands, and ASGI decodes header bytes as latin-1, so a crafted
+        # non-ASCII header would otherwise 500 instead of cleanly failing.
+        presented = request.headers.get(_CLIENT_SECRET_HEADER, "")
+        return hmac.compare_digest(presented.encode("utf-8"), client_secret.encode("utf-8"))
+
     router = APIRouter()
     _rate_limiter = _SlidingWindowRateLimiter(
         _AUTHORIZE_RATE_MAX, _AUTHORIZE_RATE_WINDOW_SECONDS, _RATE_LIMITER_MAX_KEYS
@@ -293,6 +336,8 @@ def create_device_auth_router(
         Rate-limited per client IP, and opportunistically purges expired
         grants so the table stays bounded.
         """
+        if not _client_secret_ok(request):
+            return _oauth_error("invalid_client", status_code=401)
         now_wall = time.time()
         client_ip = request.client.host if request.client else "unknown"
         if not _rate_limiter.allow(client_ip, now_wall):
@@ -453,6 +498,8 @@ def create_device_auth_router(
         ``slow_down``, ``expired_token``, ``access_denied``,
         ``invalid_grant``, ``unsupported_grant_type``.
         """
+        if not _client_secret_ok(request):
+            return _oauth_error("invalid_client", status_code=401)
         form = await request.form()
         grant_type = str(form.get("grant_type") or "")
 
@@ -577,6 +624,8 @@ def create_device_auth_router(
         delegated access token so a client with only its access token
         can still log out.
         """
+        if not _client_secret_ok(request):
+            return _oauth_error("invalid_client", status_code=401)
         form = await request.form()
         refresh_token = str(form.get("refresh_token") or "")
         grant = None

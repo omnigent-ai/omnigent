@@ -1,9 +1,10 @@
 # Omnigent Slack Bot
 
 Slack Socket Mode bot that maps one Slack thread to one Omnigent session. The
-bot is **not** tied to a single Omnigent server: each Slack user points it at
-their own server through an in-Slack setup flow, so the process config holds
-only Slack credentials.
+bot talks to **one** Omnigent server, set by the operator via
+`OMNIGENT_SERVER_URL` — Slack users never enter a URL, so the bot only ever
+issues requests to that fixed host. Each user still authenticates as their own
+Omnigent identity against it.
 
 ## Setup
 
@@ -17,7 +18,10 @@ only Slack credentials.
    the request URL is ignored, so any placeholder works.
 4. Install the app into the workspace.
 5. Copy `.env.example` to `.env` and fill in the two Slack tokens
-   (`OMNIGENT_SLACK_BOT_TOKEN`, `OMNIGENT_SLACK_APP_TOKEN`).
+   (`OMNIGENT_SLACK_BOT_TOKEN`, `OMNIGENT_SLACK_APP_TOKEN`) and your Omnigent
+   server URL (`OMNIGENT_SERVER_URL`). If your server sets
+   `OMNIGENT_DEVICE_CLIENT_SECRET`, set the same value here so the bot is
+   accepted as an authorized device-grant client.
 6. Run the bot:
 
 ```bash
@@ -29,25 +33,26 @@ Set `LOG_LEVEL=DEBUG` in `.env` when diagnosing why Slack events are not produci
 ## Per-user setup flow
 
 The first time a user interacts with the bot (a channel `@mention` or a DM)
-without having configured a server, the bot DMs them a **Set up Omnigent**
-button and, for channel mentions, drops an ephemeral pointer in the thread.
+without having configured, the bot DMs them a **Set up Omnigent** button and,
+for channel mentions, drops an ephemeral pointer in the thread.
 
-The button opens a two-step modal:
+The button opens a modal that connects to the operator-configured server (no
+URL to enter):
 
-1. Enter the Omnigent **server URL**. The bot validates connectivity. If the
-   server has authentication enabled, the modal shows a login link; once the
-   user approves it in their browser the **same modal advances automatically**
-   to step 2 (see **Authentication** below). If the server has no online host,
-   setup shows how to start one (see below) instead of continuing — a session
-   needs a host to run on.
-2. Pick the **agent** and **host** (both required) from menus populated by that
+1. The bot validates connectivity to `OMNIGENT_SERVER_URL`. If the server has
+   authentication enabled, the modal shows a login link; once the user approves
+   it in their browser the **same modal advances automatically** (see
+   **Authentication** below). If the server has no online host, setup shows how
+   to start one (see below) instead of continuing — a session needs a host to
+   run on.
+2. Pick the **agent** and **host** (both required) from menus populated by the
    server, and set the **workspace path** — an absolute directory on the host
    where each session's runner starts. It defaults to the selected host's home
    directory (resolved from the server), falling back to the bot's working
    directory only if the host can't be probed.
 
-The choice is saved per `(workspace, user)`. After that, mentioning the bot (or
-DMing it) starts a session on the user's server.
+The choice is saved per `(Slack workspace, user)`. After that, mentioning the
+bot (or DMing it) starts a session on the configured server.
 
 ## Authentication
 
@@ -63,7 +68,10 @@ The bot **auto-detects the server's auth mode** (an unauthenticated `GET
   The modal shows a verification link + code; the user approves a consent page
   in their browser. The server issues a short-lived, session-scoped delegated
   token plus a rotating refresh token, so the bot silently refreshes and the
-  token can't reach admin endpoints.
+  token can't reach admin endpoints. If the server sets
+  `OMNIGENT_DEVICE_CLIENT_SECRET`, set the same value as the bot's
+  `OMNIGENT_DEVICE_CLIENT_SECRET` so only this authorized socket server can
+  drive the device flow.
 - **`oidc` mode** → the server's **cli-login ticket flow** (`/auth/cli-login` +
   `/auth/cli-poll`). The modal shows a login link; the user signs in at *your
   IdP* in their browser. The server hands back its session JWT — the same token
@@ -93,17 +101,16 @@ Set `OMNIGENT_SLACK_TOKEN_ENCRYPTION_KEY` (see `.env.example`) to persist tokens
 encrypted at rest; without it tokens are kept in memory only and lost on restart
 (users simply re-authenticate) — the integration works either way.
 
-`/omnigent logout` fully resets you: it revokes your delegated token on **every**
-Omnigent server and clears all your saved settings (server, agent, host,
-workspace, and thread→session mappings). Run `/omnigent` afterwards to set up
-again.
+`/omnigent logout` fully resets you: it revokes your delegated token and clears
+all your saved settings (agent, host, workspace, and thread→session mappings).
+Run `/omnigent` afterwards to set up again.
 
 See `designs/DEVICE_AUTH.md` in the main repo for the full design and
 threat model.
 
-Run `/omnigent` (or `/omnigent config`) any time to reopen this modal and point
-the bot at a different server or change your agent, host, or workspace. The URL
-field is prefilled with your current server.
+Run `/omnigent` (or `/omnigent config`) any time to reopen this modal and change
+your agent, host, or workspace. The server is fixed by the operator, so there's
+no URL to change.
 
 Each new session **launches a fresh runner** on the chosen host rooted at the
 configured workspace — the server keeps no standing runners.

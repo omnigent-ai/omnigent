@@ -70,15 +70,20 @@ class AuthManager:
         self,
         token_store: TokenStore | None,
         on_token_changed: TokenChangedHook | None = None,
+        *,
+        client_secret: str | None = None,
     ) -> None:
         self._tokens = token_store
         self._on_token_changed = on_token_changed
+        # Optional device-grant client secret, sent on every client-facing
+        # call (authorize / token / revoke) when the server requires it.
+        self._client_secret = client_secret
         # Track in-flight login poll tasks so they aren't garbage collected.
         self._login_tasks: set[asyncio.Task[Any]] = set()
 
     def _new_client(self, server_url: str) -> DeviceFlowClient:
         """Construct a device-flow client for a server."""
-        return DeviceFlowClient(server_url)
+        return DeviceFlowClient(server_url, client_secret=self._client_secret)
 
     @property
     def enabled(self) -> bool:
@@ -154,7 +159,7 @@ class AuthManager:
             OIDC mode, which has no client identifier.
         """
         assert self._tokens is not None, "delegated auth not enabled"
-        return await start_login(server_url, client_id=client_id)
+        return await start_login(server_url, client_id=client_id, client_secret=self._client_secret)
 
     def await_authorization_in_background(
         self,

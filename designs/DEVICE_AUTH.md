@@ -6,8 +6,9 @@
 > consumer (`integrations/slack/`), but the server side carries no
 > Slack-specific concepts — the requesting application names itself with the
 > RFC 8628 `client_id` (a public string like `"slack"`; display/audit only).
-> It is a **public** OAuth client (no client secret) — see the phishing
-> mitigations below.
+> It is a public OAuth client by default (no client secret), with an
+> **optional** shared secret (`OMNIGENT_DEVICE_CLIENT_SECRET`) that gates the
+> client-facing endpoints when set — see the phishing mitigations below.
 >
 > Server: `omnigent/server/routes/device_auth.py` (endpoints + the
 > `mint_delegated_token` / `DELEGATED_SCOPE` it owns),
@@ -105,14 +106,24 @@ RFC 8628 primitives are absent (no `device_code` / `user_code` /
 
 ## Design decisions (agreed)
 
-1. **Public client** — no client secret. The boundary is the secret
-   `device_code` the client holds, the ephemeral verification link, and
-   authenticated in-browser consent; initiation is per-IP rate-limited and
-   nothing is granted until a real user approves. (A confidential-client
-   secret was considered and removed: the Slack socket server accepts a
-   user-supplied server URL, so shipping a shared secret to it created a
-   secret-exfiltration/SSRF path that outweighed the anti-phishing benefit —
-   the consent warning + short TTL + absolute lifetime carry that instead.)
+1. **Public by default, optional client secret.** The baseline boundary is
+   the secret `device_code` the client holds, the ephemeral verification
+   link, and authenticated in-browser consent; initiation is per-IP
+   rate-limited and nothing is granted until a real user approves. On top of
+   that, setting `OMNIGENT_DEVICE_CLIENT_SECRET` on the server gates the
+   **client-facing** endpoints (authorize / token / revoke) behind a shared
+   secret header (`X-Omnigent-Client-Secret`, constant-time compared), so
+   only an authorized client can drive the flow. The **browser** endpoints
+   (consent GET / approve / deny) are never gated by it — the user's browser
+   doesn't hold the secret; their trust is the session cookie + Origin check.
+   Unset ⇒ endpoints stay public (backward compatible).
+
+   *History:* the secret was implemented, removed, then reintroduced as
+   opt-in. It was removed when the Slack client accepted a **user-supplied**
+   server URL — shipping a shared secret to an arbitrary user-typed host was a
+   secret-exfiltration/SSRF path. That objection is now gone: the Slack socket
+   server's target is a **fixed operator config** (`OMNIGENT_SERVER_URL`), not
+   a user-supplied URL, so the secret only ever travels to the trusted server.
 2. **Refresh tokens** — short-lived access tokens (≤ 1 h) plus a rotating,
    revocable refresh token, with a 30-day absolute grant lifetime. The Slack
    server refreshes silently; a stolen access token expires quickly and a grant
@@ -292,8 +303,8 @@ Omnigent user into approving the verification link, binding the grant to the
 *victim's* identity while the attacker (holding the `device_code`) polls for the
 token.
 
-This is a **public** client, so initiation is open — the defense is layered,
-not a gate:
+When no client secret is configured the endpoints are **public**, so
+initiation is open — the defense is layered, not a gate:
 
 - The consent page prominently **warns** the user to approve only a login they
   personally started and to match the code shown by the application.
@@ -303,13 +314,14 @@ not a gate:
 - Initiation is rate-limited per IP; nothing is granted until a real user
   authenticates and approves in their own browser.
 
-A confidential-client secret (`X-Omnigent-Client-Secret`) was implemented and
-then **removed**: the Slack socket server accepts a user-supplied server URL,
-so it would send the shared secret to whatever host a user typed — a
-secret-exfiltration + SSRF path that outweighed the phishing benefit. If a
-future consumer has a fixed, trusted server target, a per-client secret could
-be reintroduced there. Another option is binding identity out-of-band via an
-account-link table rather than trusting a caller-supplied principal.
+Setting `OMNIGENT_DEVICE_CLIENT_SECRET` closes initiation entirely to
+unauthorized callers: without the matching `X-Omnigent-Client-Secret` header,
+authorize / token / revoke return `401 invalid_client` before anything is
+created, so only the operator's own client (which holds the secret) can even
+start a flow. This is now shippable to the Slack client because its server
+target is a fixed operator config, not a user-supplied URL — the secret only
+ever travels to the trusted server. The consent-page warning, short TTL, and
+absolute lifetime remain the defenses when the secret is left unset.
 
 ### Deliberate deviation from the current model
 

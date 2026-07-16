@@ -413,11 +413,13 @@ AuthResolver = Callable[[str, str], Awaitable["ClientAuth | None"]]
 class OmnigentClientPool:
     """Caches one client per ``(server_url, slack_user_id)``.
 
-    The Slack bot talks to a different Omnigent server per user *and*
-    carries a per-user delegated token, so clients are keyed by both.
-    An optional ``auth_resolver`` supplies each user's bearer token; when
-    it is absent (or returns ``None``) the client is unauthenticated —
-    used by the setup/login probes before a token exists.
+    The bot targets one operator-fixed server, but each Slack user carries
+    their own delegated token, so clients are keyed per user (the server_url
+    is part of the key mainly so cached clients are dropped cleanly if the
+    operator repoints the bot). An optional ``auth_resolver`` supplies each
+    user's bearer token; when it is absent (or returns ``None``) the client
+    is unauthenticated — used by the setup/login probes before a token
+    exists.
     """
 
     def __init__(
@@ -465,10 +467,10 @@ class OmnigentClientPool:
             await client.aclose()
 
     async def invalidate_user(self, user_id: str) -> None:
-        """Drop every cached client for a user across all servers.
+        """Drop every cached client for a user.
 
-        Backs a full logout, where the user's tokens on every server are
-        revoked at once.
+        Backs a full logout, dropping any client holding the user's
+        now-revoked token.
         """
         async with self._lock:
             keys = [k for k in self._clients if k[1] == user_id]

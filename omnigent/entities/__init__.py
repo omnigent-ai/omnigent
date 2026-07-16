@@ -1,6 +1,6 @@
 """Core domain entities shared across runtime, server, and store layers."""
 
-from omnigent.entities.account import Account, AccountToken, DeviceGrant
+from omnigent.entities.account import Account, AccountToken
 from omnigent.entities.agent import Agent, LoadedAgent
 from omnigent.entities.comment import Comment, CommentsFingerprint
 from omnigent.entities.conversation import (
@@ -23,6 +23,7 @@ from omnigent.entities.conversation import (
     parse_item_data,
     synthesize_conversation_title,
 )
+from omnigent.entities.device_grant import DeviceGrant
 from omnigent.entities.file import StoredFile
 from omnigent.entities.pagination import PagedList
 from omnigent.entities.permission import ResolvedAccess, SessionPermission

@@ -376,3 +376,59 @@ def test_authorize_is_rate_limited(app: TestClient) -> None:
     # The default cap is 10/60s; the 11th+ within the window is throttled.
     assert last is not None and last.status_code == 429
     assert last.json()["error"] == "slow_down"
+
+
+_SECRET = "s3cr3t-device-client"
+
+
+@pytest.fixture
+def secret_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
+    """An accounts-mode app with OMNIGENT_DEVICE_CLIENT_SECRET enforced."""
+    monkeypatch.setenv("OMNIGENT_DEVICE_CLIENT_SECRET", _SECRET)
+    yield from _build_accounts_app(tmp_path, monkeypatch)
+
+
+def test_client_secret_required_when_configured(secret_app: TestClient) -> None:
+    """With the secret set, the client-facing endpoints reject a missing/wrong
+    header and accept the matching one."""
+    hdr = {"X-Omnigent-Client-Secret": _SECRET}
+
+    # authorize: no header → 401 invalid_client; wrong → 401; correct → 200.
+    r = secret_app.post("/oauth/device/authorize", json={"client_id": "slack"})
+    assert r.status_code == 401 and r.json()["error"] == "invalid_client"
+    r = secret_app.post(
+        "/oauth/device/authorize",
+        json={"client_id": "slack"},
+        headers={"X-Omnigent-Client-Secret": "wrong"},
+    )
+    assert r.status_code == 401
+    r = secret_app.post("/oauth/device/authorize", json={"client_id": "slack"}, headers=hdr)
+    assert r.status_code == 200, r.text
+
+    # token + revoke are gated the same way (checked before any body parsing).
+    r = secret_app.post("/oauth/token", data={"grant_type": "refresh_token", "refresh_token": "x"})
+    assert r.status_code == 401 and r.json()["error"] == "invalid_client"
+    r = secret_app.post("/oauth/revoke", data={"refresh_token": "x"})
+    assert r.status_code == 401 and r.json()["error"] == "invalid_client"
+    # With the header, token reaches normal error handling (bad token, not 401).
+    r = secret_app.post(
+        "/oauth/token",
+        data={"grant_type": "refresh_token", "refresh_token": "x"},
+        headers=hdr,
+    )
+    assert r.status_code == 400 and r.json()["error"] == "invalid_grant"
+
+
+def test_browser_consent_not_gated_by_client_secret(secret_app: TestClient) -> None:
+    """The browser consent GET must NOT require the client secret — the user's
+    browser never holds it."""
+    r = secret_app.get("/oauth/device?user_code=ABCD-2345", follow_redirects=False)
+    # Bounces to login (unauthenticated), NOT a 401 invalid_client.
+    assert r.status_code == 302
+    assert "/login" in r.headers["location"]
+
+
+def test_no_secret_configured_stays_public(app: TestClient) -> None:
+    """Without the env var, authorize stays open (backward compatible)."""
+    r = app.post("/oauth/device/authorize", json={"client_id": "slack"})
+    assert r.status_code == 200, r.text

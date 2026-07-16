@@ -1,7 +1,5 @@
 from pathlib import Path
 
-import aiosqlite
-
 from omnigent_slack.models import ThreadKey, UserConfig
 from omnigent_slack.store import SQLiteStore
 
@@ -18,14 +16,12 @@ async def test_store_persists_thread_session(tmp_path: Path) -> None:
         "conv_1",
         "title",
         owner_user_id="U1",
-        server_url="http://omnigent.test",
         host_id="host_a",
     )
     record = await store.get_session(key)
     assert record is not None
     assert record.session_id == "conv_1"
     assert record.owner_user_id == "U1"
-    assert record.server_url == "http://omnigent.test"
     assert record.host_id == "host_a"
 
     await store.upsert_session(key, "conv_2", "title", owner_user_id="U1")
@@ -41,7 +37,6 @@ async def test_store_user_config_round_trip(tmp_path: Path) -> None:
     assert await store.get_user_config("T1", "U1") is None
 
     config = UserConfig(
-        server_url="http://omnigent.test",
         agent_id="ag_1",
         agent_name="Helper",
         workspace="/home/me/project",
@@ -53,7 +48,6 @@ async def test_store_user_config_round_trip(tmp_path: Path) -> None:
 
     # Upsert overwrites and host may be cleared back to "any".
     updated = UserConfig(
-        server_url="http://new.test",
         agent_id="ag_2",
         agent_name="Other",
         workspace="/tmp/ws",
@@ -62,49 +56,6 @@ async def test_store_user_config_round_trip(tmp_path: Path) -> None:
     assert await store.get_user_config("T1", "U1") == updated
     # A different user in the same workspace is isolated.
     assert await store.get_user_config("T1", "U2") is None
-
-
-async def test_store_upgrades_legacy_thread_sessions_schema(tmp_path: Path) -> None:
-    # A database written before the per-user server columns existed must upgrade
-    # in place: initialize() adds the missing columns without dropping rows.
-    db_path = tmp_path / "store.sqlite3"
-    async with aiosqlite.connect(db_path) as db:
-        await db.execute(
-            """
-            CREATE TABLE thread_sessions (
-                team_id TEXT NOT NULL,
-                channel_id TEXT NOT NULL,
-                thread_ts TEXT NOT NULL,
-                omnigent_session_id TEXT NOT NULL,
-                title TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL,
-                PRIMARY KEY (team_id, channel_id, thread_ts)
-            )
-            """
-        )
-        await db.execute(
-            """
-            INSERT INTO thread_sessions (
-                team_id, channel_id, thread_ts, omnigent_session_id,
-                title, created_at, updated_at
-            ) VALUES ('T1', 'C1', '100.1', 'conv_old', 'title', 0, 0)
-            """
-        )
-        await db.commit()
-
-    store = SQLiteStore(db_path)
-    await store.initialize()
-
-    key = ThreadKey(team_id="T1", channel_id="C1", thread_ts="100.1")
-    record = await store.get_session(key)
-    assert record is not None
-    assert record.session_id == "conv_old"
-    # New columns exist but are unset for the legacy row.
-    assert record.owner_user_id is None
-    assert record.server_url is None
-    assert record.host_id is None
-    assert record.workspace is None
 
 
 async def test_store_claim_event_dedupes(tmp_path: Path) -> None:

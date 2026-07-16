@@ -248,6 +248,7 @@ def _service(
         store=store,
         pool=pool,  # type: ignore[arg-type]
         setup=setup,  # type: ignore[arg-type]
+        server_url="http://omnigent.test",
     )
     return service, pool, setup
 
@@ -257,7 +258,6 @@ async def _configure_user(
     team_id: str,
     user_id: str,
     *,
-    server_url: str = "http://omnigent.test",
     agent_id: str = "ag_1",
     workspace: str = "/tmp/workspace",
     host_id: str | None = None,
@@ -266,7 +266,6 @@ async def _configure_user(
         team_id,
         user_id,
         UserConfig(
-            server_url=server_url,
             agent_id=agent_id,
             agent_name="Helper",
             workspace=workspace,
@@ -330,7 +329,7 @@ async def test_ack_is_posted_and_cleared_on_host_unavailable(tmp_path: Path) -> 
     slack = FakeSlackClient()
     omnigent = HostUnavailableClient()
     service, _pool, _setup = _service(store, omnigent)
-    await _configure_user(store, "T1", "U1", server_url="http://my-server.test")
+    await _configure_user(store, "T1", "U1")
 
     await service.handle_app_mention(
         body={"team_id": "T1", "event_id": "Ev1"},
@@ -345,7 +344,7 @@ async def test_ack_is_posted_and_cleared_on_host_unavailable(tmp_path: Path) -> 
     assert slack.acks[0]["ts"] in slack.deleted_ts
     # The only durable post is the guidance, not the ack.
     assert len(slack.posts) == 1
-    assert "omni host --server http://my-server.test" in slack.posts[-1]["text"]
+    assert "omni host --server http://omnigent.test" in slack.posts[-1]["text"]
 
 
 async def test_channel_stream_passes_recipient_ids(tmp_path: Path) -> None:
@@ -688,7 +687,6 @@ async def test_direct_message_reply_reuses_existing_session(tmp_path: Path) -> N
         "conv_existing",
         "title",
         owner_user_id="U1",
-        server_url="http://omnigent.test",
     )
     slack = FakeSlackClient()
     omnigent = FakeOmnigentClient()
@@ -853,7 +851,6 @@ async def test_channel_followup_from_other_user_is_ignored(tmp_path: Path) -> No
         "conv_existing",
         "title",
         owner_user_id="U1",
-        server_url="http://omnigent.test",
     )
     slack = FakeSlackClient()
     omnigent = FakeOmnigentClient()
@@ -878,14 +875,14 @@ async def test_channel_followup_from_other_user_is_ignored(tmp_path: Path) -> No
     assert slack.posts == []
 
 
-async def test_turn_runs_against_configured_users_server(tmp_path: Path) -> None:
+async def test_turn_runs_against_the_fixed_operator_server(tmp_path: Path) -> None:
+    # The bot always routes to the operator-configured server; the user's saved
+    # config only carries the agent/host/workspace choice.
     store = await _store(tmp_path)
     slack = FakeSlackClient()
     omnigent = FakeOmnigentClient()
     service, pool, _setup = _service(store, omnigent)
-    await _configure_user(
-        store, "T1", "U1", server_url="http://my-server.test", agent_id="ag_custom"
-    )
+    await _configure_user(store, "T1", "U1", agent_id="ag_custom")
 
     await service.handle_app_mention(
         body={"team_id": "T1", "event_id": "Ev1"},
@@ -896,11 +893,11 @@ async def test_turn_runs_against_configured_users_server(tmp_path: Path) -> None
     await _wait_for_stream_stop(slack)
     await service.shutdown()
 
-    assert "http://my-server.test" in pool.requested
+    # Routed to the operator-fixed server (the only URL the pool is asked for).
+    assert pool.requested == ["http://omnigent.test"]
     assert omnigent.created[0][0] == "ag_custom"
     record = await store.get_session(ThreadKey("T1", "C1", "100.1"))
     assert record is not None
-    assert record.server_url == "http://my-server.test"
     assert record.owner_user_id == "U1"
 
 
@@ -934,7 +931,7 @@ async def test_unreachable_server_prompts_config_command(tmp_path: Path) -> None
     slack = FakeSlackClient()
     omnigent = ServerUnreachableClient()
     service, _pool, _setup = _service(store, omnigent)
-    await _configure_user(store, "T1", "U1", server_url="http://down.test")
+    await _configure_user(store, "T1", "U1")
 
     await service.handle_app_mention(
         body={"team_id": "T1", "event_id": "Ev1"},
@@ -960,7 +957,7 @@ async def test_auth_required_clears_ack_and_prompts_relogin(tmp_path: Path) -> N
     slack = FakeSlackClient()
     omnigent = AuthRequiredClient()
     service, _pool, _setup = _service(store, omnigent)
-    await _configure_user(store, "T1", "U1", server_url="http://secure.test")
+    await _configure_user(store, "T1", "U1")
 
     await service.handle_app_mention(
         body={"team_id": "T1", "event_id": "Ev1"},
@@ -986,7 +983,7 @@ async def test_no_online_host_prompts_omni_host_command(tmp_path: Path) -> None:
     slack = FakeSlackClient()
     omnigent = HostUnavailableClient()
     service, _pool, _setup = _service(store, omnigent)
-    await _configure_user(store, "T1", "U1", server_url="http://my-server.test")
+    await _configure_user(store, "T1", "U1")
 
     await service.handle_app_mention(
         body={"team_id": "T1", "event_id": "Ev1"},
@@ -999,5 +996,5 @@ async def test_no_online_host_prompts_omni_host_command(tmp_path: Path) -> None:
 
     assert await store.get_session(ThreadKey("T1", "C1", "100.1")) is None
     text = slack.posts[-1]["text"]
-    assert "omni host --server http://my-server.test" in text
+    assert "omni host --server http://omnigent.test" in text
     assert "/omnigent" in text

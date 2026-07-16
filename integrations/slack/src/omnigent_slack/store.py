@@ -24,6 +24,9 @@ class SQLiteStore:
                     thread_ts TEXT NOT NULL,
                     omnigent_session_id TEXT NOT NULL,
                     title TEXT NOT NULL,
+                    owner_user_id TEXT,
+                    host_id TEXT,
+                    workspace TEXT,
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL,
                     PRIMARY KEY (team_id, channel_id, thread_ts)
@@ -43,7 +46,6 @@ class SQLiteStore:
                 CREATE TABLE IF NOT EXISTS user_configs (
                     team_id TEXT NOT NULL,
                     user_id TEXT NOT NULL,
-                    server_url TEXT NOT NULL,
                     agent_id TEXT NOT NULL,
                     agent_name TEXT NOT NULL,
                     workspace TEXT,
@@ -55,41 +57,13 @@ class SQLiteStore:
                 )
                 """
             )
-            # Both tables have gained columns over time; add any a pre-existing
-            # database is missing so old local stores upgrade in place without a
-            # destructive migration.
-            await self._add_missing_columns(
-                db,
-                "thread_sessions",
-                {
-                    "owner_user_id": "TEXT",
-                    "server_url": "TEXT",
-                    "host_id": "TEXT",
-                    "workspace": "TEXT",
-                },
-            )
-            await self._add_missing_columns(db, "user_configs", {"workspace": "TEXT"})
             await db.commit()
-
-    @staticmethod
-    async def _add_missing_columns(
-        db: aiosqlite.Connection,
-        table: str,
-        columns: dict[str, str],
-    ) -> None:
-        cursor = await db.execute(f"PRAGMA table_info({table})")
-        rows = await cursor.fetchall()
-        await cursor.close()
-        existing = {str(row[1]) for row in rows}
-        for name, column_type in columns.items():
-            if name not in existing:
-                await db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {column_type}")
 
     async def get_session(self, key: ThreadKey) -> SessionRecord | None:
         async with aiosqlite.connect(self._path) as db:
             cursor = await db.execute(
                 """
-                SELECT omnigent_session_id, owner_user_id, server_url, host_id, workspace
+                SELECT omnigent_session_id, owner_user_id, host_id, workspace
                 FROM thread_sessions
                 WHERE team_id = ? AND channel_id = ? AND thread_ts = ?
                 """,
@@ -102,9 +76,8 @@ class SQLiteStore:
         return SessionRecord(
             session_id=str(row[0]),
             owner_user_id=str(row[1]) if row[1] is not None else None,
-            server_url=str(row[2]) if row[2] is not None else None,
-            host_id=str(row[3]) if row[3] is not None else None,
-            workspace=str(row[4]) if row[4] is not None else None,
+            host_id=str(row[2]) if row[2] is not None else None,
+            workspace=str(row[3]) if row[3] is not None else None,
         )
 
     async def upsert_session(
@@ -114,7 +87,6 @@ class SQLiteStore:
         title: str,
         *,
         owner_user_id: str | None = None,
-        server_url: str | None = None,
         host_id: str | None = None,
         workspace: str | None = None,
     ) -> None:
@@ -124,15 +96,14 @@ class SQLiteStore:
                 """
                 INSERT INTO thread_sessions (
                     team_id, channel_id, thread_ts, omnigent_session_id,
-                    title, owner_user_id, server_url, host_id, workspace,
+                    title, owner_user_id, host_id, workspace,
                     created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(team_id, channel_id, thread_ts) DO UPDATE SET
                     omnigent_session_id = excluded.omnigent_session_id,
                     title = excluded.title,
                     owner_user_id = excluded.owner_user_id,
-                    server_url = excluded.server_url,
                     host_id = excluded.host_id,
                     workspace = excluded.workspace,
                     updated_at = excluded.updated_at
@@ -144,7 +115,6 @@ class SQLiteStore:
                     session_id,
                     title,
                     owner_user_id,
-                    server_url,
                     host_id,
                     workspace,
                     now,
@@ -157,7 +127,7 @@ class SQLiteStore:
         async with aiosqlite.connect(self._path) as db:
             cursor = await db.execute(
                 """
-                SELECT server_url, agent_id, agent_name, workspace, host_id, host_name
+                SELECT agent_id, agent_name, workspace, host_id, host_name
                 FROM user_configs
                 WHERE team_id = ? AND user_id = ?
                 """,
@@ -168,12 +138,11 @@ class SQLiteStore:
         if row is None:
             return None
         return UserConfig(
-            server_url=str(row[0]),
-            agent_id=str(row[1]),
-            agent_name=str(row[2]),
-            workspace=str(row[3]) if row[3] is not None else "",
-            host_id=str(row[4]) if row[4] is not None else None,
-            host_name=str(row[5]) if row[5] is not None else None,
+            agent_id=str(row[0]),
+            agent_name=str(row[1]),
+            workspace=str(row[2]) if row[2] is not None else "",
+            host_id=str(row[3]) if row[3] is not None else None,
+            host_name=str(row[4]) if row[4] is not None else None,
         )
 
     async def upsert_user_config(self, team_id: str, user_id: str, config: UserConfig) -> None:
@@ -182,12 +151,11 @@ class SQLiteStore:
             await db.execute(
                 """
                 INSERT INTO user_configs (
-                    team_id, user_id, server_url, agent_id, agent_name,
+                    team_id, user_id, agent_id, agent_name,
                     workspace, host_id, host_name, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(team_id, user_id) DO UPDATE SET
-                    server_url = excluded.server_url,
                     agent_id = excluded.agent_id,
                     agent_name = excluded.agent_name,
                     workspace = excluded.workspace,
@@ -198,7 +166,6 @@ class SQLiteStore:
                 (
                     team_id,
                     user_id,
-                    config.server_url,
                     config.agent_id,
                     config.agent_name,
                     config.workspace,
@@ -214,9 +181,9 @@ class SQLiteStore:
         """Delete a user's saved config and every session thread they own.
 
         Backs ``/omnigent logout``: after this the user is fully reset —
-        their server/agent/host/workspace choice is gone and their
-        channel/DM threads no longer map to any Omnigent session, so a
-        later message starts fresh (once they reconfigure).
+        their agent/host/workspace choice is gone and their channel/DM
+        threads no longer map to any Omnigent session, so a later message
+        starts fresh (once they reconfigure).
         """
         async with aiosqlite.connect(self._path) as db:
             await db.execute(

@@ -22,9 +22,12 @@ class ThreadKey:
 
 @dataclass(frozen=True, slots=True)
 class UserConfig:
-    """A Slack user's chosen Omnigent server, agent, and host."""
+    """A Slack user's chosen agent, host, and workspace.
 
-    server_url: str
+    The Omnigent server is operator-fixed (``OMNIGENT_SERVER_URL``), so it
+    is not part of a user's config.
+    """
+
     agent_id: str
     agent_name: str
     workspace: str
@@ -34,11 +37,10 @@ class UserConfig:
 
 @dataclass(frozen=True, slots=True)
 class SessionRecord:
-    """A Slack thread's Omnigent session and the server it lives on."""
+    """A Slack thread's Omnigent session and where it runs."""
 
     session_id: str
     owner_user_id: str | None
-    server_url: str | None
     host_id: str | None
     workspace: str | None
 
@@ -51,7 +53,6 @@ class SlackTurn:
     create_if_missing: bool
     title: str
     slack_client: Any
-    server_url: str
     agent_id: str
     owner_user_id: str
     workspace: str | None = None

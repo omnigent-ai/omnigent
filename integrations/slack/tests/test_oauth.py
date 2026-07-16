@@ -253,3 +253,82 @@ async def test_refresh_rotates() -> None:
         await client.aclose()
     assert pair.access_token == "at2"
     assert pair.refresh_token == "rt2"
+
+
+# ── Device-grant client secret (X-Omnigent-Client-Secret header) ─────
+
+_HEADER = "X-Omnigent-Client-Secret"
+
+
+@respx.mock
+async def test_client_secret_sent_on_device_authorize_and_poll() -> None:
+    """When a client secret is configured, it rides the authorize AND the
+    token-poll calls (same httpx client) — and only those."""
+    respx.get(_ME).mock(return_value=httpx.Response(401, json={"login_url": "/login"}))
+    authorize = respx.post(_BASE + "/oauth/device/authorize").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "device_code": "dc",
+                "user_code": "ABCD-2345",
+                "verification_uri": _BASE + "/oauth/device",
+                "verification_uri_complete": _BASE + "/oauth/device?user_code=ABCD-2345",
+                "expires_in": 600,
+                "interval": 0,
+            },
+        )
+    )
+    token = respx.post(_TOKEN).mock(
+        return_value=httpx.Response(
+            200, json={"access_token": "at", "refresh_token": "rt", "expires_in": 3600}
+        )
+    )
+    pending = await start_login(_BASE, client_id="slack", client_secret="s3cr3t")
+    try:
+        assert authorize.calls.last.request.headers.get(_HEADER) == "s3cr3t"
+        result = await pending.poll()
+        assert result.access_token == "at"
+        assert token.calls.last.request.headers.get(_HEADER) == "s3cr3t"
+    finally:
+        await pending.close()
+
+
+@respx.mock
+async def test_no_client_secret_sends_no_header() -> None:
+    respx.get(_ME).mock(return_value=httpx.Response(401, json={"login_url": "/login"}))
+    authorize = respx.post(_BASE + "/oauth/device/authorize").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "device_code": "dc",
+                "user_code": "ABCD-2345",
+                "verification_uri": _BASE + "/oauth/device",
+                "verification_uri_complete": _BASE + "/oauth/device?user_code=ABCD-2345",
+                "expires_in": 600,
+                "interval": 5,
+            },
+        )
+    )
+    pending = await start_login(_BASE, client_id="slack")
+    try:
+        assert _HEADER not in authorize.calls.last.request.headers
+    finally:
+        await pending.close()
+
+
+@respx.mock
+async def test_client_secret_sent_on_refresh_and_revoke() -> None:
+    refresh = respx.post(_TOKEN).mock(
+        return_value=httpx.Response(
+            200, json={"access_token": "at2", "refresh_token": "rt2", "expires_in": 3600}
+        )
+    )
+    revoke = respx.post(_BASE + "/oauth/revoke").mock(return_value=httpx.Response(200))
+    client = DeviceFlowClient(_BASE, client_secret="s3cr3t")
+    try:
+        await client.refresh("rt1")
+        await client.revoke("rt1")
+    finally:
+        await client.aclose()
+    assert refresh.calls.last.request.headers.get(_HEADER) == "s3cr3t"
+    assert revoke.calls.last.request.headers.get(_HEADER) == "s3cr3t"

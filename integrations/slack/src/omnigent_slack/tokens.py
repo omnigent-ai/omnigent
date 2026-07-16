@@ -16,9 +16,10 @@ Two backends implement the same :class:`TokenStore` protocol:
   encryption key is set: we never write bearer credentials to disk in
   the clear, but the integration still works.
 
-Both are keyed by ``(team_id, user_id, server_url)``: a user may point
-the bot at more than one server, and tokens are strictly scoped to the
-server that issued them.
+Both are keyed by ``(team_id, user_id, server_url)``: the bot targets one
+operator-fixed server, but keying on it keeps tokens strictly scoped to the
+server that issued them (and cleanly separated if the operator ever
+repoints the bot).
 """
 
 from __future__ import annotations

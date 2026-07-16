@@ -36,6 +36,16 @@ import httpx
 
 _DEVICE_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:device_code"
 
+# Header carrying the optional device-grant client secret. Sent on the
+# client-facing endpoints (authorize / token / revoke) so a server with
+# OMNIGENT_DEVICE_CLIENT_SECRET set only accepts this authorized client.
+_CLIENT_SECRET_HEADER = "X-Omnigent-Client-Secret"
+
+
+def _secret_headers(client_secret: str | None) -> dict[str, str]:
+    """Header dict carrying the client secret, or empty when unset."""
+    return {_CLIENT_SECRET_HEADER: client_secret} if client_secret else {}
+
 
 class AuthMode(enum.Enum):
     """The Omnigent server's auth posture, as probed from ``/v1/me``."""
@@ -158,7 +168,9 @@ async def probe_auth_mode(server_url: str, http_timeout: float = 10.0) -> AuthMo
     return AuthMode.OIDC
 
 
-async def start_login(server_url: str, *, client_id: str) -> PendingLogin:
+async def start_login(
+    server_url: str, *, client_id: str, client_secret: str | None = None
+) -> PendingLogin:
     """Begin the login flow matching the server's auth mode.
 
     Probes the mode, then starts the device grant (accounts) or the
@@ -173,6 +185,9 @@ async def start_login(server_url: str, *, client_id: str) -> PendingLogin:
 
     :param client_id: RFC 8628 client id to present (device grant only;
         ignored by the OIDC ticket flow, which has no client identifier).
+    :param client_secret: Optional device-grant client secret; sent on the
+        device authorize/token calls when the server requires it. The OIDC
+        ticket flow doesn't use it.
     """
     mode = await probe_auth_mode(server_url)
     if mode is AuthMode.OIDC:
@@ -183,14 +198,22 @@ async def start_login(server_url: str, *, client_id: str) -> PendingLogin:
             "can't log in to per user. Put the bot behind the same identity "
             "proxy, or run the server in accounts or OIDC mode."
         )
-    return await _start_device_login(server_url, client_id=client_id)
+    return await _start_device_login(server_url, client_id=client_id, client_secret=client_secret)
 
 
 # ── Device Authorization Grant (accounts mode) ───────────────────────
 
 
-async def _start_device_login(server_url: str, *, client_id: str) -> PendingLogin:
-    client = httpx.AsyncClient(base_url=server_url.rstrip("/"), timeout=httpx.Timeout(30.0))
+async def _start_device_login(
+    server_url: str, *, client_id: str, client_secret: str | None = None
+) -> PendingLogin:
+    # The secret rides on the client's default headers so it's sent on both
+    # the authorize call here and every token poll on the same client.
+    client = httpx.AsyncClient(
+        base_url=server_url.rstrip("/"),
+        timeout=httpx.Timeout(30.0),
+        headers=_secret_headers(client_secret),
+    )
     try:
         resp = await client.post("/oauth/device/authorize", json={"client_id": client_id})
         resp.raise_for_status()
@@ -299,15 +322,18 @@ class DeviceFlowClient:
     """Talks to a single Omnigent server's ``/oauth/*`` endpoints.
 
     Used for token refresh and revocation of device-grant tokens (the
-    login start/poll now lives in :func:`start_login`). A public OAuth
-    client: the security boundary is the secret ``device_code`` plus
-    in-browser user consent, not a client secret.
+    login start/poll now lives in :func:`start_login`). Sends the optional
+    device-grant client secret (when configured) on every call, since the
+    ``/oauth/token`` and ``/oauth/revoke`` endpoints may be secret-gated.
     """
 
-    def __init__(self, base_url: str, timeout: float = 30.0) -> None:
+    def __init__(
+        self, base_url: str, timeout: float = 30.0, *, client_secret: str | None = None
+    ) -> None:
         self._client = httpx.AsyncClient(
             base_url=base_url.rstrip("/"),
             timeout=httpx.Timeout(timeout),
+            headers=_secret_headers(client_secret),
         )
 
     async def aclose(self) -> None:
