@@ -6,7 +6,7 @@
 // content changes, and scrolls the active match into view. Its UI matches the
 // source-view and editor find bars.
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useState } from "react";
 import { ChevronDownIcon, ChevronUpIcon, SearchIcon, XIcon } from "lucide-react";
 import type { ReactElement, RefObject } from "react";
 import { clearPreviewHighlights, findTextRanges, paintPreviewHighlights } from "./previewSearch";
@@ -31,14 +31,20 @@ export function PreviewSearchBar({
 }: PreviewSearchBarProps): ReactElement | null {
   const [query, setQuery] = useState("");
   const [currentIndex, setCurrentIndex] = useState(0);
+  const [ranges, setRanges] = useState<Range[]>([]);
 
   // Recompute match ranges when the query, the open state, or the rendered
-  // content changes. Ranges are DOM Ranges into the live preview nodes, so they
-  // must be rebuilt after a re-render replaces those nodes.
-  const ranges = useMemo(() => {
+  // content changes. Ranges are DOM Ranges into the live preview nodes, so this
+  // runs in useLayoutEffect (post-commit) rather than during render: on a
+  // content change the new react-markdown/notebook DOM must be committed first,
+  // otherwise the walker would build Ranges into nodes about to be replaced.
+  useLayoutEffect(() => {
     const container = containerRef.current;
-    if (!open || !container || !query.trim()) return [];
-    return findTextRanges(container, query.trim());
+    if (!open || !container || !query.trim()) {
+      setRanges([]);
+      return;
+    }
+    setRanges(findTextRanges(container, query.trim()));
     // contentVersion forces a rebuild after the preview re-renders.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [containerRef, open, query, contentVersion]);

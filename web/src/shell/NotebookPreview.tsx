@@ -1,3 +1,4 @@
+import type { RefObject } from "react";
 import type { BundledLanguage } from "shiki";
 import AnsiDefault from "ansi-to-react";
 import ReactMarkdown from "react-markdown";
@@ -214,7 +215,7 @@ export function NotebookPreview({
   rootRef,
 }: {
   content: string;
-  rootRef?: React.RefObject<HTMLDivElement | null>;
+  rootRef?: RefObject<HTMLDivElement | null>;
 }) {
   const { notebook, error } = parseNotebook(content);
 

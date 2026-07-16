@@ -69,6 +69,27 @@ function type(value: string) {
   return input;
 }
 
+// Harness whose preview text + contentVersion can be updated, to exercise the
+// "rendered content changes while the bar is open" recompute path.
+function Harness({ text, version }: { text: string; version: string }) {
+  const containerRef = createRef<HTMLDivElement>();
+  const inputRef = createRef<HTMLInputElement>();
+  return (
+    <div>
+      <div ref={containerRef}>
+        <p>{text}</p>
+      </div>
+      <PreviewSearchBar
+        containerRef={containerRef}
+        contentVersion={version}
+        open
+        onClose={vi.fn()}
+        inputRef={inputRef}
+      />
+    </div>
+  );
+}
+
 describe("PreviewSearchBar", () => {
   it("renders nothing when closed", () => {
     renderBar({ open: false });
@@ -139,5 +160,23 @@ describe("PreviewSearchBar", () => {
       fireEvent.click(screen.getByLabelText("Close search"));
     });
     expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("recomputes matches against the new DOM when content changes while open", async () => {
+    // One "cat" initially.
+    const { rerender } = render(<Harness text="cat" version="v1" />);
+    await act(async () => {
+      type("cat");
+    });
+    expect(screen.getByText("1 / 1")).toBeDefined();
+
+    // The rendered content changes while the bar stays open (new version). The
+    // recompute must walk the committed DOM, not the replaced nodes — so the
+    // count reflects the new text ("cat cat" → 2), proving ranges rebuilt
+    // post-commit rather than during render against stale nodes.
+    await act(async () => {
+      rerender(<Harness text="cat cat" version="v2" />);
+    });
+    expect(screen.getByText("1 / 2")).toBeDefined();
   });
 });
