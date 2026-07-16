@@ -37,6 +37,15 @@ recording, or paste a link. Expected for UI / frontend changes (check the
 use `N/A` for non-visual changes.
 -->
 
+## Project health
+
+<!--
+For substantial or cross-cutting work, name the architecture/diagram, glossary,
+invariant, contract, or runbook updates included in this PR. Note any files over
+the guideposts in docs/PROJECT_HEALTH.md and explain the boundary decision. Use
+N/A for small/local changes with no durable project-health impact.
+-->
+
 ## Type of change
 
 - [ ] Bug fix

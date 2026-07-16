@@ -6,6 +6,15 @@ welcome. For larger changes, open an issue first so we can discuss the approach.
 Please don't include secrets, internal URLs, customer data, or private
 configuration in issues, tests, examples, or logs.
 
+## Planning sustainable changes
+
+Before planning a substantial change or working in an unfamiliar subsystem,
+follow the [project-health workflow](docs/PROJECT_HEALTH.md). It explains how to
+map a project without repeatedly reading large files, when architecture
+diagrams or dependency graphs are expected, and how project-local glossaries
+and invariants become required planning inputs. Update those artifacts in the
+same pull request when a change makes them incomplete or inaccurate.
+
 ## Development setup
 
 This is a Python package with an optional frontend under `web/`. Use

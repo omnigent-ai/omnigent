@@ -3,6 +3,14 @@
 Guidance for AI agents (Claude Code, Copilot, Cursor, etc.) working in this
 repository. See `CONTRIBUTING.md` for the full contributor workflow.
 
+## Before project work
+
+Read [`docs/PROJECT_HEALTH.md`](docs/PROJECT_HEALTH.md) before planning a
+substantial change or exploring an unfamiliar subsystem. It defines the
+required workflow for context-efficient large-file reads and for locating or
+maintaining architecture, glossary, invariant, graph, and operational
+artifacts. Include applicable project-health work in the plan before editing.
+
 ## Committing
 
 Run the `pre-commit` hook before committing (`pre-commit run --all-files`, or
@@ -21,6 +29,8 @@ filename). Keep every section and checkbox row so reviewers can skim them.
   PRs for UI / frontend changes (check the "UI / frontend change" box under
   *Type of change*) so reviewers can see the new behaviour without checking out
   the branch. Use `N/A` for non-visual changes.
+- **Project health** — name applicable health-artifact updates and large-file
+  decisions, or use `N/A` for small/local changes.
 - **Type of change** / **Test coverage** — check all that apply (at least one
   each).
 - **Coverage notes** — required if you checked "Manual verification completed"
