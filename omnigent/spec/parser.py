@@ -279,6 +279,7 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
     instructions = _resolve_instructions(root, raw_instructions)
     skills = _discover_skills(root / "skills")
     skills_filter = _parse_skills_filter(raw.get("skills"))
+    skill_trust = _parse_skill_trust(raw.get("skill_trust"))
     mcp_servers = _discover_mcp_servers(root / "tools" / "mcp", expand_env=expand_env)
     mcp_servers = mcp_servers + _parse_inline_mcp_servers(raw_tools, expand_env=expand_env)
     local_tools = _discover_local_tools(root / "tools")
@@ -298,6 +299,7 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
         instructions=instructions,
         skills=skills,
         skills_filter=skills_filter,
+        skill_trust=skill_trust,
         mcp_servers=mcp_servers,
         local_tools=local_tools,
         sub_agents=sub_agents,
@@ -1941,6 +1943,18 @@ def _parse_skills_filter(raw: object) -> str | list[str]:
     raise OmnigentError(
         f'top-level skills: must be "all", "none", or a list of skill '
         f"names; got {type(raw).__name__}",
+        code=ErrorCode.INVALID_INPUT,
+    )
+
+
+def _parse_skill_trust(raw: object) -> str:
+    """Parse the cross-provider skill trust boundary."""
+    if raw is None:
+        return "current"
+    if raw in ("current", "all-host"):
+        return str(raw)
+    raise OmnigentError(
+        f"top-level skill_trust: must be 'current' or 'all-host'; got {raw!r}",
         code=ErrorCode.INVALID_INPUT,
     )
 

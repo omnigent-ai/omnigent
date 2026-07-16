@@ -12,15 +12,18 @@ per-family provider. Unknown harnesses fall back to the generic host walk
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
+import os
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
 from omnigent.errors import OmnigentError
-from omnigent.spec.parser import _discover_skills, _parse_skill, discover_host_skills
+from omnigent.spec.parser import _discover_skills, _parse_skill
+from omnigent.spec.skill_registry import SkillCandidate, SkillRegistry, tree_digest
 from omnigent.spec.types import SkillSpec
 
 _log = logging.getLogger(__name__)
@@ -54,6 +57,11 @@ def _harness_family(harness: str | None) -> str | None:
     return base if base in _SKILL_FAMILIES else None
 
 
+def effective_skill_provider_family(harness: str | None) -> str:
+    """Return the provider family used by today's fallback behavior."""
+    return _harness_family(harness) or "claude"
+
+
 @dataclass(frozen=True)
 class SkillSourceContext:
     """
@@ -78,6 +86,117 @@ class SkillSourceContext:
 SkillSource = Callable[[SkillSourceContext], list[SkillSpec]]
 
 
+def _candidate_scope(skill_dir: Path, ctx: SkillSourceContext) -> str:
+    resolved = skill_dir.resolve()
+    for root in ctx.roots:
+        try:
+            resolved.relative_to(root.resolve())
+            return "workspace"
+        except ValueError:
+            continue
+    return "personal"
+
+
+def _candidate_kind(skill_dir: Path, provider: str) -> str:
+    parts = skill_dir.resolve().parts
+    if ".agents" in parts:
+        return "generic"
+    if provider == "claude" and "plugins" in parts:
+        return "plugin"
+    return "vendor"
+
+
+def _source_coords(skill_dir: Path, ctx: SkillSourceContext, provider: str) -> str:
+    resolved = skill_dir.resolve()
+    roots = [*ctx.roots, ctx.home]
+    for root in roots:
+        try:
+            relative = resolved.relative_to(root.resolve())
+        except ValueError:
+            continue
+        root_label = "home" if root == ctx.home else f"workspace:{roots.index(root)}"
+        return f"{provider}:{root_label}:{relative.as_posix()}"
+    return f"{provider}:path:{os.path.normcase(resolved.as_posix())}"
+
+
+def resolve_all_candidates(ctx: SkillSourceContext) -> list[SkillCandidate]:
+    """Discover structured candidates from every provider independently."""
+    candidates: list[SkillCandidate] = []
+    for provider, source in sorted(
+        ((name, source) for name, source in _SKILL_SOURCES.items() if name is not None),
+        key=lambda item: item[0],
+    ):
+        try:
+            skills = source(ctx)
+        except Exception:  # noqa: BLE001 - one provider must not hide the catalog
+            _log.warning("Skill provider %s failed", provider, exc_info=True)
+            continue
+        for skill in skills:
+            if not skill.user_invocable or skill.skill_dir is None:
+                continue
+            skill_dir = skill.skill_dir.resolve()
+            candidates.append(
+                SkillCandidate(
+                    provider=provider,
+                    location_scope=_candidate_scope(skill_dir, ctx),
+                    source_kind=_candidate_kind(skill_dir, provider),
+                    origin_path=skill_dir,
+                    source_coords=_source_coords(skill_dir, ctx, provider),
+                    namespace=provider,
+                    invocation_name=skill.name,
+                    managed=False,
+                    tree_digest=tree_digest(skill_dir),
+                    skill=skill,
+                )
+            )
+    return candidates
+
+
+def registry_for_spec(
+    spec: object,
+    *,
+    roots: tuple[Path, ...],
+    home: Path,
+    bundle_dir: Path | None,
+    harness: str | None,
+) -> SkillRegistry:
+    """Build the canonical registry snapshot for an AgentSpec-like object."""
+    ctx = SkillSourceContext(
+        roots=roots,
+        home=home,
+        skills_filter="all",
+        bundle_dir=bundle_dir,
+    )
+    spec_name = getattr(spec, "name", None)
+    candidates: list[SkillCandidate] = []
+    for skill in getattr(spec, "skills", None) or []:
+        relative = skill.name
+        if skill.skill_dir is not None and bundle_dir is not None:
+            with contextlib.suppress(ValueError):
+                relative = skill.skill_dir.resolve().relative_to(bundle_dir.resolve()).as_posix()
+        candidates.append(
+            SkillCandidate(
+                provider="bundle",
+                location_scope="bundle",
+                source_kind="bundled",
+                origin_path=skill.skill_dir or bundle_dir or Path.cwd(),
+                source_coords=f"bundle:{spec_name or 'agent'}:{relative}",
+                namespace=spec_name or "bundle",
+                invocation_name=skill.name,
+                managed=True,
+                tree_digest=tree_digest(skill.skill_dir),
+                skill=skill,
+            )
+        )
+    candidates.extend(resolve_all_candidates(ctx))
+    return SkillRegistry.from_candidates(
+        candidates,
+        active_provider=effective_skill_provider_family(harness),
+        skill_trust=getattr(spec, "skill_trust", "current"),
+        skills_filter=getattr(spec, "skills_filter", "all"),
+    )
+
+
 def _dedup(specs: list[SkillSpec]) -> list[SkillSpec]:
     """Return *specs* with later same-name entries dropped (first wins)."""
     seen: set[str] = set()
@@ -91,10 +210,32 @@ def _dedup(specs: list[SkillSpec]) -> list[SkillSpec]:
 
 
 def _generic_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
-    """Today's behavior: ``discover_host_skills`` over each root."""
+    """Today's generic walk using the context's injected home."""
+    if ctx.skills_filter == "none":
+        return []
+    allowed = set(ctx.skills_filter) if isinstance(ctx.skills_filter, list) else None
     out: list[SkillSpec] = []
+    seen_dirs: set[Path] = set()
+
+    def _scan(skills_dir: Path) -> None:
+        resolved = skills_dir.resolve()
+        if resolved in seen_dirs or not resolved.is_dir():
+            return
+        seen_dirs.add(resolved)
+        for skill in _discover_skills(resolved, skipped=[]):
+            if allowed is None or skill.name in allowed:
+                out.append(skill)
+
     for root in ctx.roots:
-        out.extend(discover_host_skills(root, ctx.skills_filter))
+        current = root.resolve()
+        while True:
+            for dotdir in (".claude", ".agents"):
+                _scan(current / dotdir / "skills")
+            if current.parent == current:
+                break
+            current = current.parent
+    for dotdir in (".claude", ".agents"):
+        _scan(ctx.home / dotdir / "skills")
     return _dedup(out)
 
 

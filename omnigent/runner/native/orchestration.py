@@ -3359,6 +3359,30 @@ async def _auto_create_codex_terminal(
     bridge_dir = prepare_bridge_dir(session_id)
     socket_path = socket_path_for_bridge_dir(bridge_dir)
     codex_home = codex_home_for_bridge_dir(bridge_dir)
+    resolved_agent_spec = _unwrap_resolved_spec(agent_spec) if agent_spec is not None else None
+    if resolved_agent_spec is not None:
+        from omnigent.spec.skill_materialize import materialize_for_harness
+        from omnigent.spec.skill_registry import write_registry_manifest
+        from omnigent.spec.skill_sources import registry_for_spec
+
+        registry = registry_for_spec(
+            resolved_agent_spec,
+            roots=(Path(workspace).resolve(),),
+            home=Path.home(),
+            bundle_dir=bundle_dir,
+            harness="codex-native",
+        )
+        await asyncio.to_thread(
+            materialize_for_harness,
+            registry.list(),
+            "codex-native",
+            bridge_dir,
+        )
+        await asyncio.to_thread(
+            write_registry_manifest,
+            bridge_dir / "skill_registry.json",
+            registry,
+        )
     # Route across all offerings: a configured provider (omnigent setup),
     # a Databricks ucode profile from provider config, or Codex's own
     # login — parity with the in-process codex harness and the CLI path.
@@ -3531,16 +3555,17 @@ async def _auto_create_codex_terminal(
     # executor's skill population; the native CLI otherwise sees zero
     # bundled skills. Best-effort: a skill-link failure must not break
     # the terminal launch.
-    from omnigent.inner.codex_executor import populate_codex_skills_from_bundle
+    if resolved_agent_spec is None:
+        from omnigent.inner.codex_executor import populate_codex_skills_from_bundle
 
-    try:
-        populate_codex_skills_from_bundle(codex_home, bundle_dir, skills_filter)
-    except OSError:
-        _logger.warning(
-            "Could not populate codex skills for %s; native Codex will see no bundled skills",
-            session_id,
-            exc_info=True,
-        )
+        try:
+            populate_codex_skills_from_bundle(codex_home, bundle_dir, skills_filter)
+        except OSError:
+            _logger.warning(
+                "Could not populate codex skills for %s; native Codex will see no bundled skills",
+                session_id,
+                exc_info=True,
+            )
 
     with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
@@ -5473,6 +5498,34 @@ async def _auto_create_claude_terminal(
 
     _pre_wipe_claude_sid = _read_csid_pre_wipe(_bridge_dir_for_bridge_id(bridge_id))
     bridge_dir = prepare_bridge_dir(session_id, bridge_id=bridge_id, workspace=Path(workspace))
+    resolved_agent_spec = _unwrap_resolved_spec(agent_spec) if agent_spec is not None else None
+    if resolved_agent_spec is not None:
+        from omnigent.spec.skill_materialize import (
+            materialize_for_harness,
+            projection_root_for_harness,
+        )
+        from omnigent.spec.skill_registry import write_registry_manifest
+        from omnigent.spec.skill_sources import registry_for_spec
+
+        registry = registry_for_spec(
+            resolved_agent_spec,
+            roots=(Path(workspace).resolve(),),
+            home=Path.home(),
+            bundle_dir=bundle_dir,
+            harness="claude-native",
+        )
+        await asyncio.to_thread(
+            materialize_for_harness,
+            registry.list(),
+            "claude-native",
+            bridge_dir,
+        )
+        await asyncio.to_thread(
+            write_registry_manifest,
+            bridge_dir / "skill_registry.json",
+            registry,
+        )
+        bundle_dir = projection_root_for_harness("claude-native", bridge_dir).parent
     # Cancel any surviving forwarder BEFORE wiping its cursor/seen state, else it
     # re-posts with fresh dedup state alongside the forwarder spawned below.
     await _cancel_auto_forwarder_task(session_id)

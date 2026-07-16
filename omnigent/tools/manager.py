@@ -15,6 +15,8 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.inner.os_env import OSEnvironment
 from omnigent.runtime import get_caps
 from omnigent.spec import AgentSpec
+from omnigent.spec.skill_registry import SkillRegistry
+from omnigent.spec.skill_sources import registry_for_spec
 from omnigent.spec.types import SharePolicy, ToolRuntime
 from omnigent.tools._srt import is_srt_available
 from omnigent.tools.base import Tool, ToolContext, is_valid_tool_name
@@ -115,6 +117,7 @@ class ToolManager:
         workdir: Path | None = None,
         sandbox_enabled: bool = True,
         os_env: OSEnvironment | None = None,
+        skill_registry: SkillRegistry | None = None,
     ) -> None:
         """
         Initialize the tool manager and register built-in,
@@ -146,6 +149,13 @@ class ToolManager:
         self._workdir = workdir
         self._sandbox_enabled = sandbox_enabled
         self._pre_resolved_os_env = os_env
+        self._skill_registry = skill_registry or registry_for_spec(
+            spec,
+            roots=((workdir or Path.cwd()).resolve(),),
+            home=Path.home(),
+            bundle_dir=workdir,
+            harness=getattr(spec.executor, "harness_kind", None),
+        )
         self._started = False
         self._tools: dict[str, Tool] = {}
         self._srt_available = is_srt_available()
@@ -308,6 +318,7 @@ class ToolManager:
             self._spec.skills,
             agent_root=self._workdir,
             skills_filter=self._spec.skills_filter,
+            registry=self._skill_registry,
         )
         self._tools[load_tool.name()] = load_tool
         # Combine bundled + discovered skills for resource check.

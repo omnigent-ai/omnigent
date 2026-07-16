@@ -86,6 +86,7 @@ _RECENT_LOCAL_COMMAND_LINE_LIMIT = 200
 _RECENT_LOCAL_COMMAND_WINDOW_S = 10.0
 _FORKED_FROM_LINE_LIMIT = 200
 _TOOL_RELAY_FILE = "tool_relay.json"
+_SKILL_REGISTRY_FILE = "skill_registry.json"
 _TMUX_FILE = "tmux.json"
 _PERMISSION_HOOK_FILE = "permission_hook.json"
 _CONTEXT_FILE = "context.json"
@@ -3793,6 +3794,16 @@ def _combined_mcp_tool_schemas(
         appear in the Omnigent event stream during web turns.
     """
     schemas = {name: _mcp_tool_schema(tool) for name, tool in local_tools.items()}
+    if _read_skill_registry_manifest(bridge_dir):
+        schemas["load_skill"] = {
+            "name": "load_skill",
+            "description": "Load a skill's full instructions by name.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"],
+            },
+        }
     for tool_spec in _read_relay_tool_specs(bridge_dir):
         name = tool_spec.get("name")
         if not isinstance(name, str) or not name:
@@ -3844,6 +3855,16 @@ def _call_mcp_tool(
         arguments = {}
     if name in _read_relay_tool_names(bridge_dir):
         return _call_relay_tool(bridge_dir, name, arguments)
+    if name == "load_skill":
+        manifest = _read_skill_registry_manifest(bridge_dir)
+        skill_name = arguments.get("name")
+        entry = manifest.get(skill_name) if isinstance(skill_name, str) else None
+        if entry is None:
+            return _mcp_error(f"skill {skill_name!r} not found")
+        content = entry.get("content")
+        if not isinstance(content, str):
+            return _mcp_error(f"skill {skill_name!r} has invalid content")
+        return {"content": [{"type": "text", "text": content}]}
     if name not in tools:
         return _mcp_error(f"unknown tool: {name!r}")
     bridge_config = _read_json_file(bridge_dir / _CONFIG_FILE)
@@ -3889,6 +3910,18 @@ def _read_relay_tool_specs(bridge_dir: Path) -> list[dict[str, Any]]:
     if not isinstance(raw_tools, list):
         return []
     return [tool for tool in raw_tools if isinstance(tool, dict)]
+
+
+def _read_skill_registry_manifest(bridge_dir: Path) -> dict[str, dict[str, Any]]:
+    """Read the immutable per-session skill manifest."""
+    payload = _read_json_file(bridge_dir / _SKILL_REGISTRY_FILE)
+    if not isinstance(payload, dict):
+        return {}
+    return {
+        name: value
+        for name, value in payload.items()
+        if isinstance(name, str) and isinstance(value, dict)
+    }
 
 
 def _call_relay_tool(

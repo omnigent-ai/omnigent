@@ -76,6 +76,14 @@ class AuthModel(str, Enum):
     SESSION_SCOPED_CONFIG = "session-scoped-config"  # per-session synthesized vendor config
 
 
+class SkillDelivery(str, Enum):
+    """How a harness receives reconciled skills."""
+
+    TOOL = "tool"
+    NATIVE_MATERIALIZE = "native-materialize"
+    UNSUPPORTED = "unsupported"
+
+
 @dataclass(frozen=True)
 class HarnessCapabilities:
     """The declared feature set one harness supports.
@@ -116,6 +124,7 @@ class HarnessCapabilities:
     live_queue: bool | None = None
     images: bool | None = None
     compaction: bool | None = None
+    skill_delivery: frozenset[SkillDelivery] = frozenset({SkillDelivery.TOOL})
 
     def as_dict(self) -> dict[str, str | bool | None]:
         """Return a JSON-serializable view for the ``/v1/harnesses`` catalog."""

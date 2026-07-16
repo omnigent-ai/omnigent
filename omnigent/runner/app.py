@@ -129,8 +129,11 @@ from omnigent.server.schemas import (
     BackgroundSessionTitleRequest,
     BackgroundSessionTitleResponse,
 )
-from omnigent.spec.skill_sources import SkillSourceContext, resolve_harness_skills
-from omnigent.spec.types import LocalToolInfo, SkillSpec
+from omnigent.spec.skill_registry import SkillRegistry
+from omnigent.spec.skill_sources import (
+    registry_for_spec,
+)
+from omnigent.spec.types import AgentSpec, LocalToolInfo, SkillSpec
 from omnigent.terminals.control_bridge import bridge_tmux_control_to_websocket
 from omnigent.terminals.ws_bridge import (
     WS_CLOSE_TERMINAL_NOT_FOUND,
@@ -1837,7 +1840,12 @@ def create_runner_app(
     _session_spec_locks: dict[str, asyncio.Lock] = {}  # session_id → spec resolution lock
     _session_init_tasks: dict[tuple[str, str, str | None], asyncio.Task[JSONResponse]] = {}
     _session_init_envelopes: dict[str, tuple[float, RunnerSessionInitEnvelope]] = {}
-    _session_skills_cache: dict[str, tuple[float, list[SkillSpec]]] = {}
+    # session_id → (monotonic expiry, merged bundled + host skills),
+    # discovered against this runner's filesystem. Skills are runner-owned:
+    # the walk reruns at most once per ``_SESSION_SKILLS_CACHE_TTL_SECONDS``
+    # (so a mid-session skill/plugin install surfaces) and the entry is
+    # dropped in ``delete_session``.
+    _session_skills_cache: dict[str, tuple[float, SkillRegistry]] = {}
     _session_workspace_cache: dict[str, str | None] = {}  # session_id → workspace path
     _session_claude_launch_configs: dict[str, ClaudeNativeUcodeConfig | None] = {}
     _session_claude_launch_config_tasks: dict[
@@ -2846,6 +2854,33 @@ def create_runner_app(
                 _has_terminal = (
                     _tr is not None and _tr.get(session_id, "claude", "main") is not None
                 )
+                if _has_terminal:
+                    from omnigent.claude_native_bridge import bridge_dir_for_session_id
+                    from omnigent.spec.skill_materialize import materialize_for_harness
+
+                    _registry = await _resolve_session_skill_registry(session_id)
+                    _changed = await asyncio.to_thread(
+                        materialize_for_harness,
+                        _registry.list(),
+                        "claude-native",
+                        bridge_dir_for_session_id(session_id),
+                    )
+                    if _changed and _tr is not None:
+                        await _tr.cleanup_conversation(session_id)
+                        _has_terminal = False
+                # An in-place agent switch BACK into claude-native (ran
+                # claude-native, switched to another agent where turns were
+                # added, then switched back) leaves the ORIGINAL claude
+                # terminal registered — an open terminal tab keeps it alive.
+                # Auto-create is skipped while a terminal exists, so the
+                # re-synthesis from current AP items never runs and the agent
+                # keeps its original on-disk transcript, missing the turns
+                # added on the other agent. Confirmed in production: a switched-
+                # back session showed external_session_id=None (rebuild never
+                # ran) + the carry-history label set, resuming a transcript
+                # without the away-agent's turns. When a post-switch rebuild is
+                # pending (external_session_id cleared + carry-history stamped),
+                # tear the stale terminal down so auto-create re-synthesizes.
                 if _has_terminal and await _claude_native_session_wants_rebuild(
                     server_client,
                     session_id,
@@ -2964,6 +2999,22 @@ def create_runner_app(
                 _has_codex_terminal = (
                     _tr is not None and _tr.get(session_id, "codex", "main") is not None
                 )
+                if _has_codex_terminal:
+                    from omnigent.codex_native_bridge import bridge_dir_for_session_id
+                    from omnigent.spec.skill_materialize import materialize_for_harness
+
+                    _registry = await _resolve_session_skill_registry(session_id)
+                    _changed = await asyncio.to_thread(
+                        materialize_for_harness,
+                        _registry.list(),
+                        "codex-native",
+                        bridge_dir_for_session_id(session_id),
+                    )
+                    if _changed and _tr is not None:
+                        await _tr.cleanup_conversation(session_id)
+                        _has_codex_terminal = False
+                # Codex-native sessions use runner-owned app-server/TUI/forwarder
+                # setup. The CLI now attaches to the resulting tmux terminal only.
                 _needs_terminal = await _codex_session_needs_runner_terminal(
                     server_client, session_id
                 )
@@ -6027,6 +6078,7 @@ def create_runner_app(
                     _tmgr = ToolManager(
                         cached_spec,
                         workdir=cached_spec_workdir or runner_workspace,
+                        skill_registry=await _resolve_session_skill_registry(conv),
                     )
                     all_tools.extend(_tmgr.get_tool_schemas())
                 except (
@@ -8694,7 +8746,44 @@ def create_runner_app(
         entry = await _resolve_session_spec_entry(session_id)
         return _unwrap_resolved_spec(entry) if entry is not None else None
 
-    async def _resolve_session_skills(session_id: str) -> list[SkillSpec]:
+    async def _resolve_session_skill_registry(session_id: str) -> SkillRegistry:
+        """
+        Resolve the merged (bundled + host) skills for a session.
+
+        Skills are runner-owned and combine every source the agent can
+        load, discovered against *this runner's* filesystem and honoring
+        the spec's ``skills_filter``:
+
+        * the spec's bundled ``skills`` (the bundle's ``skills/`` dir);
+        * host skills under the **session's workspace** — the agent's
+          working directory on this runner (the claude-native TUI's cwd,
+          the in-process harness workspace, a git worktree), where a
+          project's ``.claude/skills/`` live;
+        * host skills under the **agent bundle workdir**;
+        * user-global host skills (``~/.claude/skills`` etc., scanned by
+          :func:`discover_host_skills`).
+
+        The workspace is the primary root because that is where the
+        harness actually loads project skills; the bundle workdir is
+        unioned in for completeness (it is a throwaway temp dir for
+        single-YAML agents like ``claude-native-ui``, so usually
+        contributes nothing). Falls back to the runner's global workspace,
+        then the process cwd, when no workspace is known. Deduplicated by
+        name with bundled winning, then earlier roots winning. Cached per
+        session with a short TTL (``_SESSION_SKILLS_CACHE_TTL_SECONDS``) so the
+        walk reruns at most once per window — fresh enough to surface a
+        skill/plugin installed mid-session, while still collapsing the bursty
+        menu-open + per-invocation resolve calls (dropped in
+        ``delete_session``).
+
+        :param session_id: Session/conversation identifier,
+            e.g. ``"conv_abc123"``.
+        :returns: Bundled skills followed by host skills, deduplicated
+            by name. Empty when no spec resolver is configured or the
+            spec exposes no skills.
+        :raises OmnigentError: If the session's spec cannot be
+            resolved.
+        """
         cached = _session_skills_cache.get(session_id)
         if cached is not None:
             expires_at, cached_skills = cached
@@ -8703,7 +8792,7 @@ def create_runner_app(
         entry = await _resolve_session_spec_entry(session_id)
         spec = _unwrap_resolved_spec(entry) if entry is not None else None
         if spec is None:
-            return []
+            return SkillRegistry()
         workspace = await _session_workspace_value(session_id)
         candidate_roots = [
             Path(workspace).resolve()
@@ -8721,34 +8810,51 @@ def create_runner_app(
         if not roots:
             roots.append(Path.cwd())
 
-        def _discover() -> list[SkillSpec]:
-            merged: list[SkillSpec] = [s for s in spec.skills if s.user_invocable]
-            seen = {s.name for s in spec.skills}
-            seen_dirs = {s.skill_dir.resolve() for s in spec.skills if s.skill_dir is not None}
-            ctx = SkillSourceContext(
+        effective_skill_trust = getattr(spec, "skill_trust", "current")
+        if effective_skill_trust == "current":
+            try:
+                trust_response = await server_client.get("/v1/skills/trust", timeout=5.0)
+                if trust_response.status_code == 200:
+                    trust_value = trust_response.json().get("value")
+                    if trust_value in ("current", "all-host"):
+                        effective_skill_trust = trust_value
+            except (httpx.HTTPError, ValueError):
+                _logger.debug("Could not read server skill trust; using current")
+
+        def _discover() -> SkillRegistry:
+            """Build one trust-filtered immutable registry off the event loop."""
+            harness = canonicalize_harness(spec.executor.harness_kind)
+            bundle_root = _resolved_spec_workdir(entry)
+            discovery_spec = spec
+            if getattr(spec, "skill_trust", "current") != effective_skill_trust:
+                with contextlib.suppress(TypeError):
+                    discovery_spec = dataclasses.replace(
+                        spec,
+                        skill_trust=effective_skill_trust,
+                    )
+            return registry_for_spec(
+                discovery_spec,
                 roots=tuple(roots),
                 home=Path.home(),
-                skills_filter=spec.skills_filter,
-                bundle_dir=_resolved_spec_workdir(entry),
+                bundle_dir=bundle_root,
+                harness=harness,
             )
-            harness = canonicalize_harness(spec.executor.harness_kind)
-            for hs in resolve_harness_skills(ctx, harness):
-                if hs.name in seen:
-                    continue
-                if hs.skill_dir is not None and hs.skill_dir.resolve() in seen_dirs:
-                    continue
-                seen.add(hs.name)
-                if hs.skill_dir is not None:
-                    seen_dirs.add(hs.skill_dir.resolve())
-                merged.append(hs)
-            return merged
 
-        skills = await asyncio.to_thread(_discover)
+        registry = await asyncio.to_thread(_discover)
+        previous = _session_skills_cache.get(session_id)
         _session_skills_cache[session_id] = (
             time.monotonic() + _SESSION_SKILLS_CACHE_TTL_SECONDS,
-            skills,
+            registry,
         )
-        return skills
+        if previous is None or [e.winner.tree_digest for e in previous[1].list()] != [
+            e.winner.tree_digest for e in registry.list()
+        ]:
+            _session_tool_schemas.pop(session_id, None)
+        return registry
+
+    async def _resolve_session_skills(session_id: str) -> list[SkillSpec]:
+        """Return selected skills from the session registry snapshot."""
+        return (await _resolve_session_skill_registry(session_id)).skills()
 
     @app.get("/v1/sessions/{session_id}/skills")
     async def get_session_skills(session_id: str) -> JSONResponse:
