@@ -2083,6 +2083,41 @@ def _session_status_with_child_rollup(
     return own_status
 
 
+async def _collect_descendant_conversation_ids(
+    conversation_store: ConversationStore,
+    root_id: str,
+) -> list[str]:
+    """
+    Return every sub-agent descendant of ``root_id``, at any depth.
+
+    Walks the tree one level at a time (child, grandchild, and so on),
+    batching each level into a single ``list_child_conversation_ids_by_parent``
+    call so an N-level tree costs N queries rather than one per node.
+
+    :param conversation_store: Store for child-id lookup.
+    :param root_id: Root session/conversation identifier.
+    :returns: Descendant ids in breadth-first order. Empty if ``root_id``
+        has no sub-agent descendants.
+    """
+    descendant_ids: list[str] = []
+    seen = {root_id}
+    frontier = [root_id]
+    while frontier:
+        child_ids_map = await asyncio.to_thread(
+            conversation_store.list_child_conversation_ids_by_parent,
+            frontier,
+        )
+        next_frontier: list[str] = []
+        for parent_id in frontier:
+            for child_id in child_ids_map.get(parent_id, []):
+                if child_id not in seen:
+                    seen.add(child_id)
+                    descendant_ids.append(child_id)
+                    next_frontier.append(child_id)
+        frontier = next_frontier
+    return descendant_ids
+
+
 async def _best_effort_stop(
     session_id: str,
     conversation_store: ConversationStore,
@@ -2092,26 +2127,24 @@ async def _best_effort_stop(
 
     Mirrors the client-side stop-then-archive/delete pattern. A session
     reads as "running" here if it is itself running, has live background
-    tasks, or has a direct sub-agent child still running or waiting, but
-    each of those must be stopped on its own session id: a child executes
-    on its own runner, separate from the parent's, so stopping the parent
-    never reaches it. Every stop attempt is independently best-effort, so
-    one runner being unreachable does not skip stopping the others, and
-    none of this may block the caller from archiving or deleting the
-    session.
+    tasks, or has any sub-agent descendant (child, grandchild, and so on)
+    still running or waiting, matching the unbounded depth that
+    ``delete_conversation``'s recursive subtree delete already covers.
+    Each running descendant must be stopped on its own session id: it
+    executes on its own runner, separate from its ancestors', so stopping
+    a parent never reaches it. Every stop attempt is independently
+    best-effort, so one runner being unreachable does not skip stopping
+    the others, and none of this may block the caller from archiving or
+    deleting the session.
 
     :param session_id: Session/conversation identifier.
-    :param conversation_store: Store for child-id lookup.
+    :param conversation_store: Store for descendant-id lookup.
     :param runner_router: The ``RunnerRouter`` for runner-client
         resolution, or ``None`` in tests / in-process setups.
     """
     try:
-        child_ids_map = await asyncio.to_thread(
-            conversation_store.list_child_conversation_ids_by_parent,
-            [session_id],
-        )
-        child_ids = child_ids_map.get(session_id, [])
-        status = _session_status_with_child_rollup(session_id, child_ids)
+        descendant_ids = await _collect_descendant_conversation_ids(conversation_store, session_id)
+        status = _session_status_with_child_rollup(session_id, descendant_ids)
     except Exception:  # noqa: BLE001 (best-effort; must not block archive/delete)
         _logger.debug(
             "Best-effort stop failed for %s; proceeding anyway",
@@ -2139,9 +2172,9 @@ async def _best_effort_stop(
     )
     if own_status == "running" or has_background_tasks:
         await _stop(session_id)
-    for child_id in child_ids:
-        if _session_status_cache.get(child_id) in ("running", "waiting"):
-            await _stop(child_id)
+    for descendant_id in descendant_ids:
+        if _session_status_cache.get(descendant_id) in ("running", "waiting"):
+            await _stop(descendant_id)
 
 
 @dataclass(frozen=True)
