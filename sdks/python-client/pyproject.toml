@@ -23,3 +23,19 @@ dependencies = [
 
 [tool.uv.sources]
 omnigent = { path = "../..", editable = true }
+
+[dependency-groups]
+dev = [
+    "basedpyright>=1.39.9",
+]
+
+
+[tool.basedpyright]
+# Standard mode found 100 pre-existing diagnostics in dynamic event and JSON
+# boundaries. Baseline those during the checker migration; new diagnostics fail.
+typeCheckingMode = "standard"
+failOnWarnings = true
+baselineFile = ".basedpyright/baseline.json"
+pythonVersion = "3.12"
+include = ["omnigent_client"]
+extraPaths = ["../.."]

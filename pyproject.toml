@@ -250,12 +250,11 @@ dev = [
     "pytest-rerunfailures==16.3",
     "filelock>=3.0",
     "ruff>=0.6",
-    "mypy>=1.10",
     "pre-commit>=3.5",
     "types-PyYAML>=6.0",
     "filelock>=3.0",
     # gitwildmatch glob matching for repo tooling manifests. Declared
-    # explicitly rather than relied on transitively (via mypy).
+    # explicitly rather than relying on a transitive dependency.
     "pathspec>=0.12",
     # Cloud-service mocks for the artifact-store / Cloudflare integration
     # tests: moto is the standard S3-compatible mock (used for R2), respx is
@@ -277,6 +276,7 @@ dev = [
     "grpcio-tools>=1.68,<2",
 ]
 
+
 [project.scripts]
 # Unified entry point. `omnigent` is the click-based CLI that absorbs
 # the legacy argparse commands from `omnigent/inner/cli.py` plus the
@@ -287,10 +287,12 @@ dev = [
 omnigent = "omnigent.cli:main"
 omni = "omnigent.cli:main"
 
+
 # uv path-deps for the sibling SDK packages (renamed in Stage 3).
 [tool.uv.sources]
 omnigent-client = { path = "sdks/python-client", editable = true }
 omnigent-ui-sdk = { path = "sdks/ui", editable = true }
+
 
 [tool.setuptools]
 include-package-data = true
@@ -402,10 +404,20 @@ target-version = "py310"
 extend-exclude = [
     "omnigent/inner/databricks_mcps/google",
     "assistant-ui",
+    # Independent uv project with its own Ruff target/rules; root `just`
+    # recipes invoke that configuration explicitly.
+    "integrations/slack",
+    # Shell-rendering notebook fixtures include intentionally malformed input
+    # and exact source snapshots; linting or formatting would invalidate them.
+    "web/src/shell/__fixtures__",
     # Protobuf-generated code (DO NOT EDIT); not ours to restyle.
     "omnigent/api/**/*_pb2.py",
     "omnigent/api/**/*_pb2.pyi",
 ]
+# The Python client targets 3.12 and uses PEP 695 type aliases. Keep the root
+# py310 lint baseline (which avoids an unrelated UP041 rewrite) while parsing
+# that independently versioned package with its declared runtime.
+per-file-target-version = { "sdks/python-client/**/*.py" = "py312" }
 
 [tool.ruff.lint]
 # ``E``/``F``  — pycodestyle + pyflakes baseline
@@ -508,207 +520,42 @@ known-first-party = ["omnigent"]
 # Telemetry modules intentionally catch all exceptions at every boundary —
 # telemetry must never disrupt the application under any circumstances.
 "omnigent/telemetry/*.py" = ["BLE001", "SIM105"]
+# SDKs are versioned independently. Keep their existing asyncio exception and
+# ParamSpec decorator spellings; migrating those public helpers is unrelated to
+# the repository type-checker cutover.
 "sdks/**/*.py" = [
-    "ARG001", "ARG002", "BLE001", "B008", "RUF012",
+    "ARG001", "ARG002", "BLE001", "B008", "RUF012", "UP041", "UP047",
 ]
 
-[tool.mypy]
-python_version = "3.12"
-strict = true
-# Ban explicit `Any` in annotations. `Any` defeats static typing; prefer
-# real types, Protocols, TypedDicts, or `object` with runtime checks. When
-# a genuine boundary needs it (opaque JSON shapes, foreign SDKs) annotate
-# with `# type: ignore[explicit-any]` *and a comment explaining why*.
-disallow_any_explicit = true
-# Vendored Google MCP server code — upstream code, not ours to type.
-# setup.py — build-time scaffolding that imports the (untyped) setuptools
-# build_py and subclasses it; not application code, so excluded from mypy
-# rather than pulling in types-setuptools just for one shim file.
-exclude = ["^omnigent/inner/databricks_mcps/google/", "^setup\\.py$", "_pb2\\.pyi?$"]
-# Incremental rollout: load imported modules for type info but don't
-# report their errors. Remove once every omnigent/ module is clean.
-follow_imports = "silent"
-
-[[tool.mypy.overrides]]
-module = "mcp.*"
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = "databricks.*"
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = "databricks_mcp.*"
-ignore_missing_imports = true
-
-# psycopg is an optional dep (only declared in the ``databricks``
-# extra, used by ``deploy/databricks/grant_sp_perms.py``). Previously installed
-# transitively via ``dbos``; after the DBOS removal, ``uv sync
-# --extra dev`` no longer pulls it, so the lint workflow can't
-# import it. Treat the missing module as silent — runtime use still
-# requires installing the ``databricks`` extra.
-[[tool.mypy.overrides]]
-module = "psycopg.*"
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = "openai.*"
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = "claude_agent_sdk.*"
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = "agents.*"
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = "ftfy"
-ignore_missing_imports = true
-
-# modal is an optional dep (the `modal` extra); the sandbox launcher
-# imports it lazily so the base install never needs it.
-[[tool.mypy.overrides]]
-module = "modal.*"
-ignore_missing_imports = true
-
-# daytona is an optional dep (the `daytona` extra); same lazy-import
-# posture as modal above.
-[[tool.mypy.overrides]]
-module = "daytona.*"
-ignore_missing_imports = true
-
-# hindsight-client is an optional dep (the `hindsight` extra); the
-# hindsights tools import it lazily so the base install never needs it.
-[[tool.mypy.overrides]]
-module = "hindsight_client.*"
-ignore_missing_imports = true
-
-# cwsandbox is an optional dep (the `cwsandbox` extra); same lazy-import
-# posture as modal above.
-[[tool.mypy.overrides]]
-module = "cwsandbox.*"
-ignore_missing_imports = true
-
-# e2b is an optional dep (the `e2b` extra); same lazy-import posture as
-# modal above.
-[[tool.mypy.overrides]]
-module = "e2b.*"
-ignore_missing_imports = true
-
-# openshell is an optional dep (the `openshell` extra); same lazy-import
-# posture as modal above. grpc rides in via the openshell SDK and is not
-# a base dependency, so its imports are unresolved in the default env too.
-[[tool.mypy.overrides]]
-module = "openshell.*"
-ignore_missing_imports = true
-
-# boxlite is an optional dep (the `boxlite` extra); same lazy-import posture
-# as modal above.
-[[tool.mypy.overrides]]
-module = "boxlite.*"
-ignore_missing_imports = true
-
-# kubernetes is an optional dep (the `kubernetes` extra); same lazy-import
-# posture as modal above. urllib3 rides in via the kubernetes client.
-[[tool.mypy.overrides]]
-module = "kubernetes.*"
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = "grpc.*"
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = "prompt_toolkit.*"
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = "yaml"
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = "pexpect"
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = "cachetools"
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = "httpx"
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = "boto3"
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = "botocore.*"
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = "google.*"
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = "opentelemetry.instrumentation.*"
-ignore_missing_imports = true
-
-# The Modal deploy glue (deploy/modal/modal_app.py) decorates with the
-# optional `modal` extra, which the lint env doesn't install — under the
-# modal.* ignore-missing-imports override above its decorators type as
-# Any and trip disallow_untyped_decorators. Relax just that flag.
-[[tool.mypy.overrides]]
-module = "modal_app"
-disallow_untyped_decorators = false
-
-# omnigent-derived repl code has its own relaxed typing config.
-[[tool.mypy.overrides]]
-module = "omnigent.repl.*"
-disallow_untyped_defs = false
-disallow_untyped_decorators = false
-warn_return_any = false
-check_untyped_defs = false
-
-# omnigent-derived code that pre-unification omnigent never
-# subjected to ``disallow_any_explicit`` (its pyproject.toml didn't
-# set that flag). Keep the rest of strict mypy on — just relax the
-# explicit-Any ban until these modules can be graduated.
-[[tool.mypy.overrides]]
-module = [
-    "omnigent.runtime.*",
-    "omnigent.server.*",
-    "omnigent.tools.*",
-    "omnigent.entities.*",
-    "omnigent.stores.*",
-    "omnigent.db.*",
-    "omnigent.llms.*",
-    "omnigent.onboarding.*",
-    "omnigent.terminals.*",
-    "omnigent.client_tools.*",
-    "omnigent.spec.omnigent",
-    "omnigent.spec._omnigent_compat",
-    "dump_openapi",
+[tool.basedpyright]
+# A recommended-mode audit produced 7,954 errors and 145,663 warnings; even
+# standard mode found 3,685 pre-existing errors across 1,820 files. Keep the
+# migration focused by baselining that legacy debt while making every new
+# standard-mode diagnostic merge-blocking.
+typeCheckingMode = "standard"
+failOnWarnings = true
+baselineFile = ".basedpyright/baseline.json"
+pythonVersion = "3.12"
+include = [
+    "omnigent",
+    "tests",
+    "scripts",
+    "dev",
+    "deploy",
+    ".github/scripts",
+    ".github/ui-preview/app.py",
+    ".claude/skills",
+    "setup.py",
 ]
-disallow_any_explicit = false
-
-[[tool.mypy.overrides]]
-module = "omnigent_ui_sdk.*"
-ignore_missing_imports = true
-follow_imports = "skip"
-
-# SDK shim aliases — ignore their own import resolution issues. These
-# are re-exports of omnigent_client/omnigent_ui_sdk (post-Stage-3)
-# via sys.modules aliasing.
-[[tool.mypy.overrides]]
-module = "omnigent_client.*"
-ignore_missing_imports = true
-disallow_any_explicit = false
-
-# Tests in the mypy allowlist predate the stricter omnigent
-# Any rule.
-[[tool.mypy.overrides]]
-module = "tests.*"
-disallow_any_explicit = false
+# Generated protobuf bindings and the vendored Google MCP snapshot are not
+# first-party editable sources. Their hand-written callers remain checked.
+exclude = [
+    "omnigent/api/routing/v1/routing_pb2.py",
+    "omnigent/api/routing/v1/routing_pb2.pyi",
+    "omnigent/inner/databricks_mcps/google",
+]
+extraPaths = ["sdks/python-client", "sdks/ui", ".github/scripts/pr-template"]
+[dependency-groups]
+dev = [
+    "basedpyright>=1.39.9",
+]
