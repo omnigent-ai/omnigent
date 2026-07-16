@@ -14,11 +14,27 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field, replace
 
-from omnigent.entities import ScheduledTask
 from omnigent.server.scheduled.scheduler import (
     MISFIRE_GRACE_TIME_S,
     ScheduledTaskScheduler,
 )
+
+
+@dataclass
+class _FakeTask:
+    """The slice of ``ScheduledTask`` the scheduler reads.
+
+    The scheduler only touches ``id``, ``rrule``, ``timezone``, and ``state``,
+    so the tests drive it with this local stand-in rather than the full
+    persisted entity — keeping the scheduler unit tests independent of the
+    entity's field set.
+    """
+
+    id: str
+    rrule: str
+    timezone: str
+    state: str
+
 
 # ── Fakes ────────────────────────────────────────────────────────────────────
 
@@ -80,10 +96,10 @@ class FakeScheduleSeam:
 class FakeStore:
     """Minimal stand-in exposing only ``list_active`` and ``get``."""
 
-    def __init__(self, tasks: list[ScheduledTask]) -> None:
+    def __init__(self, tasks: list[_FakeTask]) -> None:
         self._tasks = {t.id: t for t in tasks}
 
-    def list_active(self) -> list[ScheduledTask]:
+    def list_active(self) -> list[_FakeTask]:
         return [t for t in self._tasks.values() if t.state == "active"]
 
     def get(self, task_id: str):
@@ -92,21 +108,11 @@ class FakeStore:
 
 def _task(
     task_id: str = "task-1",
-    cron_expression: str = "0 * * * *",
+    rrule: str = "FREQ=HOURLY",
     timezone: str = "UTC",
     state: str = "active",
-) -> ScheduledTask:
-    return ScheduledTask(
-        id=task_id,
-        name=f"name-{task_id}",
-        prompt="do the thing",
-        cron_expression=cron_expression,
-        owner_user_id=None,
-        agent_id="ag-1",
-        timezone=timezone,
-        created_at=1_800_000_000,
-        state=state,
-    )
+) -> _FakeTask:
+    return _FakeTask(id=task_id, rrule=rrule, timezone=timezone, state=state)
 
 
 @dataclass
@@ -120,7 +126,7 @@ class FiredRecord:
 
 
 def _make(
-    tasks: list[ScheduledTask],
+    tasks: list[_FakeTask],
     fired: FiredRecord | None = None,
     clock: FakeClock | None = None,
     seam: FakeScheduleSeam | None = None,
@@ -157,9 +163,9 @@ async def test_start_skips_paused_tasks() -> None:
     assert scheduler.job_count == 1
 
 
-async def test_start_skips_bad_cron_without_crashing() -> None:
+async def test_start_skips_bad_rrule_without_crashing() -> None:
     scheduler, _clock, _seam, _fired = _make(
-        [_task("good", "0 * * * *"), _task("bad", "not a cron")]
+        [_task("good", "FREQ=HOURLY"), _task("bad", "not an rrule")]
     )
     await scheduler.start()
     assert scheduler.job_count == 1
@@ -264,10 +270,10 @@ async def test_remove_cancels_timer() -> None:
 
 
 async def test_update_reschedules() -> None:
-    scheduler, _clock, _seam, _fired = _make([_task("a", "0 * * * *")])
+    scheduler, _clock, _seam, _fired = _make([_task("a", "FREQ=HOURLY")])
     await scheduler.start()
     before = scheduler.next_run_at("a")
-    scheduler.update(replace(scheduler_task_of(scheduler, "a"), cron_expression="0 0 * * *"))
+    scheduler.update(replace(scheduler_task_of(scheduler, "a"), rrule="FREQ=DAILY;BYHOUR=0"))
     after = scheduler.next_run_at("a")
     assert before != after
     assert scheduler.job_count == 1
@@ -311,6 +317,6 @@ async def _fire_timer(timer) -> None:
         await result
 
 
-def scheduler_task_of(scheduler: ScheduledTaskScheduler, task_id: str) -> ScheduledTask:
+def scheduler_task_of(scheduler: ScheduledTaskScheduler, task_id: str) -> _FakeTask:
     """Reach into the fake store to get the seed task for update tests."""
     return scheduler._store.get(task_id)  # type: ignore[attr-defined]

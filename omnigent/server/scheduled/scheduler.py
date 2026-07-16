@@ -1,4 +1,4 @@
-"""In-process cron scheduler for recurring scheduled tasks.
+"""In-process RRULE scheduler for recurring scheduled tasks.
 
 :class:`ScheduledTaskScheduler` owns one self-rearming timer per active scheduled
 task. It is the timing engine only: when a task is due it invokes an injected
@@ -34,10 +34,10 @@ from typing import Any, Protocol
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from omnigent.entities import ScheduledTask
-from omnigent.server.scheduled.cron import (
-    CronTrigger,
-    CronValidationError,
-    validate_cron,
+from omnigent.server.scheduled.rrule import (
+    RRuleTrigger,
+    RRuleValidationError,
+    validate_rrule,
 )
 
 _logger = logging.getLogger(__name__)
@@ -72,7 +72,7 @@ class _Job:
     """One registered task's live scheduling state."""
 
     task_id: str
-    trigger: CronTrigger
+    trigger: RRuleTrigger
     tz: ZoneInfo
     next_run: datetime | None = None
     next_run_epoch: float | None = None
@@ -131,18 +131,18 @@ class ScheduledTaskScheduler:
     async def start(self) -> None:
         """Load every active task and arm a timer for each.
 
-        A persisted task with a bad cron expression is logged and skipped — it
-        must never abort server startup. Idempotent-ish: safe to call once per
-        process; a second call layers on top of existing jobs.
+        A persisted task with a bad RRULE is logged and skipped — it must never
+        abort server startup. Idempotent-ish: safe to call once per process; a
+        second call layers on top of existing jobs.
         """
         for task in self._store.list_active():
             try:
                 self._register(task)
-            except CronValidationError as exc:
+            except RRuleValidationError as exc:
                 _logger.warning(
-                    "scheduler: skipping task %s with invalid cron %r: %s",
+                    "scheduler: skipping task %s with invalid rrule %r: %s",
                     task.id,
-                    task.cron_expression,
+                    task.rrule,
                     exc,
                 )
         self._started = True
@@ -164,11 +164,11 @@ class ScheduledTaskScheduler:
             return
         try:
             self._register(task)
-        except CronValidationError as exc:
+        except RRuleValidationError as exc:
             _logger.warning(
-                "scheduler: cannot add task %s with invalid cron %r: %s",
+                "scheduler: cannot add task %s with invalid rrule %r: %s",
                 task.id,
-                task.cron_expression,
+                task.rrule,
                 exc,
             )
 
@@ -221,8 +221,8 @@ class ScheduledTaskScheduler:
     # ── internals ────────────────────────────────────────────────────────────
 
     def _register(self, task: ScheduledTask) -> None:
-        """Validate the task's cron and arm its timer, replacing any existing."""
-        trigger = validate_cron(task.cron_expression)
+        """Validate the task's rrule and arm its timer, replacing any existing."""
+        trigger = validate_rrule(task.rrule)
         self.remove(task.id)  # replace_existing semantics
         job = _Job(task_id=task.id, trigger=trigger, tz=_resolve_tz(task.timezone))
         self._jobs[task.id] = job
