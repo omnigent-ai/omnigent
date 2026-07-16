@@ -327,11 +327,12 @@ describe("FilesPanel scope switch (Changed | All) visibility", () => {
     );
 
     // Both segments present; All is selected (flatView=false), Changed is not.
-    expect(screen.getByRole("radio", { name: /^changed$/i })).toHaveAttribute(
-      "aria-checked",
-      "false",
-    );
-    expect(screen.getByRole("radio", { name: /^all$/i })).toHaveAttribute("aria-checked", "true");
+    const changed = screen.getByRole("radio", { name: /^changed$/i });
+    const all = screen.getByRole("radio", { name: /^all$/i });
+    expect(changed).toHaveAttribute("aria-checked", "false");
+    expect(all).toHaveAttribute("aria-checked", "true");
+    expect(changed).not.toHaveClass("bg-muted");
+    expect(all).toHaveClass("bg-muted");
   });
 
   it("shows the scope switch in full-screen drawer mode (onClose)", () => {

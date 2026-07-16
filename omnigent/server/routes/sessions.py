@@ -90,6 +90,7 @@ from omnigent.harness_plugins import (
     CODEX_NATIVE_CODING_AGENT,
     CURSOR_NATIVE_CODING_AGENT,
     KIRO_NATIVE_CODING_AGENT,
+    OPENCODE_NATIVE_CODING_AGENT,
     PI_NATIVE_CODING_AGENT,
     NativeCodingAgent,
 )
@@ -591,6 +592,7 @@ _CLAUDE_NATIVE_MODEL = CLAUDE_NATIVE_CODING_AGENT.agent_name
 _CODEX_NATIVE_WRAPPER_LABEL_VALUE = CODEX_NATIVE_CODING_AGENT.wrapper_label
 _CODEX_NATIVE_HARNESS = CODEX_NATIVE_CODING_AGENT.harness
 _CODEX_NATIVE_MODEL = CODEX_NATIVE_CODING_AGENT.agent_name
+_OPENCODE_NATIVE_WRAPPER_LABEL_VALUE = OPENCODE_NATIVE_CODING_AGENT.wrapper_label
 _CURSOR_NATIVE_WRAPPER_LABEL_VALUE = CURSOR_NATIVE_CODING_AGENT.wrapper_label
 _CURSOR_NATIVE_HARNESS = CURSOR_NATIVE_CODING_AGENT.harness
 _KIRO_NATIVE_WRAPPER_LABEL_VALUE = KIRO_NATIVE_CODING_AGENT.wrapper_label
@@ -2251,6 +2253,7 @@ def _build_session_list_item(
         # Transient; set by the store only on a content search. The WS
         # push-stream path leaves it None (no query in flight there).
         search_snippet=conv.search_snippet,
+        parent_session_id=conv.parent_conversation_id,
     )
 
 
@@ -12867,12 +12870,18 @@ async def _create_session_from_existing_agent(
             if user_id is not None:
                 _salt = f"{_install_id}:{user_id}" if _install_id else user_id
                 _anon_uid = _hashlib.sha256(_salt.encode()).hexdigest()[:16]
+            _client_header = request.headers.get("x-omnigent-client")
+            _surface = (
+                _client_header
+                if _client_header in ("web", "desktop", "ios", "android", "cli")
+                else _classify_surface(request.headers.get("user-agent"))
+            )
             _tel_emit(
                 _TelSessionCreatedEvent(
                     session_id=conv.id,
                     agent_id=agent.id,
                     harness=native_agent.harness if native_agent is not None else None,
-                    surface=_classify_surface(request.headers.get("user-agent")),
+                    surface=_surface,
                     installation_id=_install_id,
                     anon_user_id=_anon_uid,
                     is_fork=body.parent_session_id is not None,
@@ -20506,26 +20515,27 @@ def create_sessions_router(
                     )
             except Exception:  # noqa: BLE001 -- best-effort snapshot; never block live tail
                 _logger.debug("snapshot: child sessions failed for %s", session_id, exc_info=True)
-            try:
-                resp = await asyncio.wait_for(
-                    # order=asc: the web cache appends each replayed
-                    # ``created`` event, so the replay must arrive in
-                    # creation order or the session's own terminal (always
-                    # created first) lands behind later agent-launched
-                    # ones. limit=1000 (the runner endpoint max) keeps the
-                    # oldest-first window from dropping the newest
-                    # terminals past the default page of 20.
-                    runner_client.get(
-                        f"/v1/sessions/{session_id}/resources/terminals",
-                        params={"order": "asc", "limit": "1000"},
-                    ),
-                    timeout=_SNAPSHOT_RUNNER_TIMEOUT_S,
-                )
-                if resp.status_code == 200:
-                    for item in resp.json().get("data", []):
-                        events.append({"type": "session.resource.created", "resource": item})
-            except Exception:  # noqa: BLE001 -- best-effort snapshot; never block live tail
-                _logger.debug("snapshot: terminals failed for %s", session_id, exc_info=True)
+            if runner_client is not None:
+                try:
+                    resp = await asyncio.wait_for(
+                        # order=asc: the web cache appends each replayed
+                        # ``created`` event, so the replay must arrive in
+                        # creation order or the session's own terminal (always
+                        # created first) lands behind later agent-launched
+                        # ones. limit=1000 (the runner endpoint max) keeps the
+                        # oldest-first window from dropping the newest
+                        # terminals past the default page of 20.
+                        runner_client.get(
+                            f"/v1/sessions/{session_id}/resources/terminals",
+                            params={"order": "asc", "limit": "1000"},
+                        ),
+                        timeout=_SNAPSHOT_RUNNER_TIMEOUT_S,
+                    )
+                    if resp.status_code == 200:
+                        for item in resp.json().get("data", []):
+                            events.append({"type": "session.resource.created", "resource": item})
+                except Exception:  # noqa: BLE001 -- best-effort snapshot; never block live tail
+                    _logger.debug("snapshot: terminals failed for %s", session_id, exc_info=True)
             # Tell the client to (re)fetch the changed-files list rather
             # than fetching it here (avoids a second runner round-trip).
             events.append(
@@ -21548,6 +21558,7 @@ def _model_options_from_wire(raw_models: Any) -> list[dict[str, Any]]:
 # the cursor picker mid-session.
 _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER: dict[str, str] = {
     _CODEX_NATIVE_WRAPPER_LABEL_VALUE: "codex-model-options",
+    _OPENCODE_NATIVE_WRAPPER_LABEL_VALUE: "codex-model-options",
     # pi-native is deliberately NOT here: its catalog is PUSHED by the resident
     # extension (``external_model_options`` → ``_pushed_model_options_cache``),
     # not fetched from a runner route, so the picker works in every auth path

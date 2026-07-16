@@ -2,9 +2,11 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   applyThemePalette,
   DEFAULT_PALETTE,
+  isThemeSelection,
   isThemePalette,
   PALETTES,
   readThemePalette,
+  themeSelections,
   themePalettes,
   writeThemePalette,
 } from "./themePalette";
@@ -26,6 +28,12 @@ describe("themePalette", () => {
     writeThemePalette("github");
     expect(readThemePalette()).toBe("github");
     expect(localStorage.getItem(STORAGE_KEY)).toBe(JSON.stringify("github"));
+  });
+
+  it("round-trips the custom theme selection", () => {
+    writeThemePalette("custom");
+    expect(readThemePalette()).toBe("custom");
+    expect(localStorage.getItem(STORAGE_KEY)).toBe(JSON.stringify("custom"));
   });
 
   it("clears the key when the default is written (nothing to persist)", () => {
@@ -55,11 +63,20 @@ describe("themePalette", () => {
     expect(isThemePalette("nope")).toBe(false);
     expect(isThemePalette(undefined)).toBe(false);
     expect(isThemePalette(42)).toBe(false);
+    expect(isThemePalette("custom")).toBe(false);
+    expect(isThemeSelection("custom")).toBe(true);
+    expect(isThemeSelection("github")).toBe(true);
+    expect(isThemeSelection("nope")).toBe(false);
   });
 
   it("sets data-theme on the document root for a non-default palette", () => {
     applyThemePalette("catppuccin");
     expect(document.documentElement.getAttribute("data-theme")).toBe("catppuccin");
+  });
+
+  it("sets the custom data-theme when the custom configuration is selected", () => {
+    applyThemePalette("custom");
+    expect(document.documentElement.getAttribute("data-theme")).toBe("custom");
   });
 
   it("removes data-theme for the default palette so the base tokens take over", () => {
@@ -73,6 +90,7 @@ describe("themePalette", () => {
     // The picker renders one card per palette, so the metadata list and the id
     // union must stay in lockstep.
     expect(PALETTES.map((p) => p.id)).toEqual([...themePalettes]);
+    expect(themeSelections).toEqual([...themePalettes, "custom"]);
     expect(PALETTES[0].id).toBe(DEFAULT_PALETTE);
     for (const palette of PALETTES) {
       expect(palette.label.length).toBeGreaterThan(0);

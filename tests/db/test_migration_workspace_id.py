@@ -47,8 +47,9 @@ _LATER_PK_OVERRIDES: dict[str, list[str]] = {
     # (workspace_id, host_id) for the hosts table.
     "hosts": ["workspace_id", "host_id"],
     # y1a2b3c4d5e6 widened conversation_items to insert conversation_id
-    # between workspace_id and id.
-    "conversation_items": ["workspace_id", "conversation_id", "id"],
+    # between workspace_id and id; z8a2b3c4d5e6 appended created_at for
+    # partition-readiness.
+    "conversation_items": ["workspace_id", "conversation_id", "id", "created_at"],
 }
 
 
@@ -93,11 +94,14 @@ def test_existing_rows_and_omitted_inserts_default_to_zero(db_engine: Engine) ->
             sa.text(
                 "INSERT INTO agents"
                 " (id, created_at, name, bundle_location, version, kind)"
-                " VALUES ('ag_ws', 1, 'n', 'loc', 1, 1)"  # kind=1 → 'template'
+                # kind=1 → 'template'
+                " VALUES ('465b23e9d6a8efc606433caadd4a96d7', 1, 'n', 'loc', 1, 1)"
             )
         )
         workspace_id = conn.execute(
-            sa.text("SELECT workspace_id FROM agents WHERE id = 'ag_ws'")
+            sa.text(
+                "SELECT workspace_id FROM agents WHERE id = '465b23e9d6a8efc606433caadd4a96d7'"
+            )
         ).scalar_one()
     assert workspace_id == DEFAULT_WORKSPACE_ID
 
@@ -108,13 +112,13 @@ def test_agent_round_trip_via_store(db_engine: Engine) -> None:
 
     store = SqlAlchemyAgentStore(str(db_engine.url))
     created = store.create(
-        agent_id="ag_rt",
+        agent_id="c8596df60b081551fdd8e352e7aef4ea",
         name="round-trip",
         bundle_location="loc",
     )
     fetched = store.get(created.id)
     assert fetched is not None
-    assert fetched.id == "ag_rt"
+    assert fetched.id == "c8596df60b081551fdd8e352e7aef4ea"
 
 
 def test_downgrade_removes_workspace_id_and_restores_pk(tmp_path: Path) -> None:

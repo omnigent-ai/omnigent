@@ -246,7 +246,7 @@ def _register_online_host(app: FastAPI, host_id: str, owner: str) -> None:
     exposing ``send_text``/``receive_text``.
 
     :param app: The app whose ``host_store``/``host_registry`` to use.
-    :param host_id: Host id to register, e.g. ``"host_alice"``.
+    :param host_id: Host id to register, e.g. ``"f54bb9272002938a3a934bfcb6bb228a"``.
     :param owner: Owning user, e.g. ``"alice@example.com"``.
     """
     app.state.host_store.upsert_on_connect(host_id, f"{owner}-laptop", owner)
@@ -2460,8 +2460,8 @@ async def test_create_session_rejects_other_users_host(
     would have enqueued the stat frame to Alice's connection.
     """
     # Alice owns an online host.
-    _register_online_host(host_perm_app, "host_alice", "alice@example.com")
-    alice_conn = host_perm_app.state.host_registry.get("host_alice")
+    _register_online_host(host_perm_app, "f54bb9272002938a3a934bfcb6bb228a", "alice@example.com")
+    alice_conn = host_perm_app.state.host_registry.get("f54bb9272002938a3a934bfcb6bb228a")
     assert alice_conn is not None
 
     # A bindable BUILT-IN (template) agent: session_id IS NULL, so any
@@ -2470,15 +2470,17 @@ async def test_create_session_rejects_other_users_host(
     # check (see designs/BUILTIN_AGENTS.md); creating a template here
     # isolates the host-owner check.
     SqlAlchemyAgentStore(db_uri).create(
-        "ag_builtin_xuser", "builtin-xuser-agent", "ag_builtin_xuser/bundle"
+        "f2b40a7cc3eaec4ee8cbb151e1021c75",
+        "builtin-xuser-agent",
+        "f2b40a7cc3eaec4ee8cbb151e1021c75/bundle",
     )
 
     # Bob targets Alice's host.
     resp = await host_perm_client.post(
         "/v1/sessions",
         json={
-            "agent_id": "ag_builtin_xuser",
-            "host_id": "host_alice",
+            "agent_id": "f2b40a7cc3eaec4ee8cbb151e1021c75",
+            "host_id": "f54bb9272002938a3a934bfcb6bb228a",
             "workspace": "/tmp",
         },
         headers={"X-Forwarded-Email": "bob@example.com"},
@@ -2561,8 +2563,8 @@ async def test_bob_cannot_create_worktree_session_on_alice_host(
     reach Alice's host and the empty-queue assertion below would fail —
     a regression the workspace-only test can't catch.
     """
-    _register_online_host(host_perm_app, "host_alice", "alice@example.com")
-    alice_conn = host_perm_app.state.host_registry.get("host_alice")
+    _register_online_host(host_perm_app, "f54bb9272002938a3a934bfcb6bb228a", "alice@example.com")
+    alice_conn = host_perm_app.state.host_registry.get("f54bb9272002938a3a934bfcb6bb228a")
     assert alice_conn is not None
 
     # Bob owns an agent he is allowed to bind (passes the agent
@@ -2575,7 +2577,7 @@ async def test_bob_cannot_create_worktree_session_on_alice_host(
         "/v1/sessions",
         json={
             "agent_id": bob_agent["id"],
-            "host_id": "host_alice",
+            "host_id": "f54bb9272002938a3a934bfcb6bb228a",
             "workspace": "/Users/alice/repo",
             "git": {"branch_name": "feature/x"},
         },
@@ -2609,8 +2611,8 @@ async def test_bob_cannot_clean_up_alice_worktree_via_delete(
     ``host.remove_worktree`` frame reaches Alice's host. Alice's
     session (and its worktree) survive.
     """
-    _register_online_host(host_perm_app, "host_alice", "alice@example.com")
-    alice_conn = host_perm_app.state.host_registry.get("host_alice")
+    _register_online_host(host_perm_app, "f54bb9272002938a3a934bfcb6bb228a", "alice@example.com")
+    alice_conn = host_perm_app.state.host_registry.get("f54bb9272002938a3a934bfcb6bb228a")
     assert alice_conn is not None
 
     # Alice owns a worktree session. Built via the store + an explicit
@@ -2618,7 +2620,7 @@ async def test_bob_cannot_clean_up_alice_worktree_via_delete(
     conv_store = SqlAlchemyConversationStore(db_uri)
     conv = conv_store.create_conversation(
         agent_id=None,
-        host_id="host_alice",
+        host_id="f54bb9272002938a3a934bfcb6bb228a",
         workspace="/Users/alice/repo-worktrees/feature-x",
         git_branch="feature/x",
     )
@@ -2770,7 +2772,7 @@ async def _end_stream_via_close(session_id: str, task: asyncio.Task[Any]) -> htt
     subscribers whose slot is already registered, and the stream task
     may not have subscribed yet — until the request task completes.
 
-    :param session_id: The streamed session, e.g. ``"conv_abc123"``.
+    :param session_id: The streamed session, e.g. ``"d1f9214d74c38b9f9a9db17ed8352dc4"``.
     :param task: The background ``client.get(...)`` request task.
     :returns: The completed (fully buffered) SSE response.
     """

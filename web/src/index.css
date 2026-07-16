@@ -1486,6 +1486,98 @@
  * gradient is overridden per palette + mode.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
+/* Custom themes keep one user configuration and map its derived light/dark
+ * values onto the same semantic tokens as built-in palettes. */
+:root:not(.dark)[data-theme="custom"] {
+  --background: var(--custom-light-background);
+  --foreground: var(--custom-light-foreground);
+  --card: var(--custom-light-card);
+  --card-solid: var(--custom-light-card-solid);
+  --card-foreground: var(--custom-light-foreground);
+  --tray: var(--custom-light-card);
+  --popover: var(--custom-light-card-solid);
+  --popover-foreground: var(--custom-light-foreground);
+  --primary: var(--custom-light-primary);
+  --primary-foreground: var(--custom-light-primary-foreground);
+  --secondary: var(--custom-light-secondary);
+  --secondary-foreground: var(--custom-light-foreground);
+  --muted: var(--custom-light-muted);
+  --muted-foreground: var(--custom-light-muted-foreground);
+  --code-bg: var(--custom-light-code-bg);
+  --accent: var(--custom-light-accent);
+  --accent-foreground: var(--custom-light-foreground);
+  --border: var(--custom-light-border);
+  --border-strong: var(--custom-light-border-strong);
+  --button-border: var(--custom-light-border);
+  --input: var(--custom-light-border);
+  --ring: var(--custom-light-primary);
+  --brand-accent: var(--custom-light-primary);
+  --sidebar: var(--custom-light-sidebar);
+  --sidebar-foreground: var(--custom-light-foreground);
+  --sidebar-primary: var(--custom-light-primary);
+  --sidebar-primary-foreground: var(--custom-light-primary-foreground);
+  --sidebar-accent: var(--custom-light-accent);
+  --sidebar-accent-foreground: var(--custom-light-foreground);
+  --sidebar-border: var(--custom-light-border);
+  --sidebar-ring: var(--custom-light-primary);
+}
+.dark[data-theme="custom"] {
+  --background: var(--custom-dark-background);
+  --foreground: var(--custom-dark-foreground);
+  --card: var(--custom-dark-card);
+  --card-solid: var(--custom-dark-card-solid);
+  --card-foreground: var(--custom-dark-foreground);
+  --tray: var(--custom-dark-card);
+  --popover: var(--custom-dark-card-solid);
+  --popover-foreground: var(--custom-dark-foreground);
+  --primary: var(--custom-dark-primary);
+  --primary-foreground: var(--custom-dark-primary-foreground);
+  --secondary: var(--custom-dark-secondary);
+  --secondary-foreground: var(--custom-dark-foreground);
+  --muted: var(--custom-dark-muted);
+  --muted-foreground: var(--custom-dark-muted-foreground);
+  --code-bg: var(--custom-dark-code-bg);
+  --accent: var(--custom-dark-accent);
+  --accent-foreground: var(--custom-dark-foreground);
+  --border: var(--custom-dark-border);
+  --border-strong: var(--custom-dark-border-strong);
+  --button-border: var(--custom-dark-border);
+  --input: var(--custom-dark-border);
+  --ring: var(--custom-dark-primary);
+  --brand-accent: var(--custom-dark-primary);
+  --sidebar: var(--custom-dark-sidebar);
+  --sidebar-foreground: var(--custom-dark-foreground);
+  --sidebar-primary: var(--custom-dark-primary);
+  --sidebar-primary-foreground: var(--custom-dark-primary-foreground);
+  --sidebar-accent: var(--custom-dark-accent);
+  --sidebar-accent-foreground: var(--custom-dark-foreground);
+  --sidebar-border: var(--custom-dark-border);
+  --sidebar-ring: var(--custom-dark-primary);
+}
+:root:not(.dark)[data-theme="custom"] .app-shell {
+  background: var(--custom-light-shell-background);
+}
+.dark[data-theme="custom"] .app-shell {
+  background: var(--custom-dark-shell-background);
+}
+@media (min-width: 48rem) {
+  :root:not(.dark)[data-theme="custom"][data-custom-translucent-sidebar]
+    :is(.conversations-sidebar, aside[aria-label="Workspace"]) {
+    background-color: var(--custom-light-sidebar);
+    backdrop-filter: blur(20px) saturate(1.12);
+  }
+  .dark[data-theme="custom"][data-custom-translucent-sidebar]
+    :is(.conversations-sidebar, aside[aria-label="Workspace"]) {
+    background-color: var(--custom-dark-sidebar);
+    backdrop-filter: blur(20px) saturate(1.12);
+  }
+  :root[data-theme="custom"][data-custom-translucent-sidebar]
+    aside[aria-label="Workspace"]
+    :is([data-workspace-panel-content] > *, [data-workspace-panel-surface]) {
+    background-color: transparent;
+  }
+}
+
 /* ── GitHub — clean neutrals, signal blue, green primary ──────────────────── */
 :root:not(.dark)[data-theme="github"] {
   --background: #f6f8fa;

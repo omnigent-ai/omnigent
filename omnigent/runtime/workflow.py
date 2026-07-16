@@ -1574,6 +1574,13 @@ def _load_global_auth() -> ApiKeyAuth | DatabricksAuth | None:
     return None
 
 
+def _config_flag_is_true(value: object) -> bool:
+    """Interpret a free-form executor config value as a boolean flag."""
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes"}
+
+
 def _build_openai_agents_sdk_spawn_env(spec: AgentSpec) -> dict[str, str]:
     """
     Build the env-var dict the openai-agents harness wrap reads.
@@ -1625,7 +1632,9 @@ def _build_openai_agents_sdk_spawn_env(spec: AgentSpec) -> dict[str, str]:
         configure_agent_harness_with_provider(env, provider, harness_type="openai-agents-sdk")
         use_responses = spec.executor.config.get("use_responses")
         if use_responses is not None:
-            env["HARNESS_OPENAI_AGENTS_USE_RESPONSES"] = "true" if use_responses else "false"
+            env["HARNESS_OPENAI_AGENTS_USE_RESPONSES"] = (
+                "true" if _config_flag_is_true(use_responses) else "false"
+            )
         return env
 
     # Global config auth is only consulted when the spec declares NO
@@ -1681,7 +1690,9 @@ def _build_openai_agents_sdk_spawn_env(spec: AgentSpec) -> dict[str, str]:
 
     use_responses = spec.executor.config.get("use_responses")
     if use_responses is not None:
-        env["HARNESS_OPENAI_AGENTS_USE_RESPONSES"] = "true" if use_responses else "false"
+        env["HARNESS_OPENAI_AGENTS_USE_RESPONSES"] = (
+            "true" if _config_flag_is_true(use_responses) else "false"
+        )
     configure_agent_harness_with_ucode(
         env,
         ucode_profile,

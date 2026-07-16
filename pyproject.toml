@@ -306,6 +306,7 @@ include = ["omnigent*"]
 "omnigent.db.migrations" = ["script.py.mako"]
 "omnigent.resources.examples" = ["*.yaml", "*.sh", "debby/**/*", "polly/**/*"]
 "omnigent.resources.pi_native" = ["*.js"]
+"omnigent.resources.scripts" = ["*.sh"]
 # include UI assets in build, plus the static API-only landing page served
 # at "/" when no web UI bundle is present
 "omnigent.server" = ["static/web-ui/**/*", "static/api_only_landing.html"]

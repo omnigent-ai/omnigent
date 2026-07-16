@@ -11,6 +11,7 @@ from sqlalchemy.exc import IntegrityError
 from omnigent.db.db_models import (
     SqlPolicy,
     current_workspace_id,
+    normalize_uuid,
     policy_name_cksum,
 )
 from omnigent.db.enum_codecs import (
@@ -110,7 +111,7 @@ class SqlAlchemyPolicyStore(PolicyStore):
         """Return the policy if it belongs to the given session."""
         with self._session() as session:
             row = session.get(SqlPolicy, (current_workspace_id(), policy_id))
-            if row is None or row.session_id != session_id:
+            if row is None or row.session_id != normalize_uuid(session_id):
                 return None
             return _to_entity(row)
 
@@ -141,7 +142,7 @@ class SqlAlchemyPolicyStore(PolicyStore):
         """
         with self._session() as session:
             row = session.get(SqlPolicy, (current_workspace_id(), policy_id))
-            if row is None or row.session_id != session_id:
+            if row is None or row.session_id != normalize_uuid(session_id):
                 return None
             changed = False
             if name is not None and row.name != name:
@@ -164,7 +165,7 @@ class SqlAlchemyPolicyStore(PolicyStore):
         """Delete a policy. Idempotent: returns ``False`` if not found."""
         with self._session() as session:
             row = session.get(SqlPolicy, (current_workspace_id(), policy_id))
-            if row is None or row.session_id != session_id:
+            if row is None or row.session_id != normalize_uuid(session_id):
                 return False
             session.delete(row)
             return True

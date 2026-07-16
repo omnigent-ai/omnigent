@@ -73,9 +73,9 @@ def _reset_is_disabled_cache():
     _mod._IS_DISABLED_CACHE[0] = None
 
 
-def test_is_disabled_omnigent_telemetry_zero(monkeypatch: pytest.MonkeyPatch) -> None:
-    """``OMNIGENT_TELEMETRY=0`` disables telemetry."""
-    monkeypatch.setenv("OMNIGENT_TELEMETRY", "0")
+def test_is_disabled_omnigent_analytics_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``OMNIGENT_ANALYTICS=0`` disables telemetry."""
+    monkeypatch.setenv("OMNIGENT_ANALYTICS", "0")
     monkeypatch.delenv("CI", raising=False)
     monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
     monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
@@ -86,7 +86,7 @@ def test_is_disabled_omnigent_telemetry_zero(monkeypatch: pytest.MonkeyPatch) ->
 
 def test_is_disabled_do_not_track(monkeypatch: pytest.MonkeyPatch) -> None:
     """``DO_NOT_TRACK=1`` disables telemetry."""
-    monkeypatch.delenv("OMNIGENT_TELEMETRY", raising=False)
+    monkeypatch.delenv("OMNIGENT_ANALYTICS", raising=False)
     monkeypatch.delenv("OMNIGENT_DISABLE_TELEMETRY", raising=False)
     monkeypatch.setenv("DO_NOT_TRACK", "1")
     monkeypatch.delenv("CI", raising=False)
@@ -99,7 +99,7 @@ def test_is_disabled_do_not_track(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_is_disabled_ci_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """``CI=true`` disables telemetry."""
-    monkeypatch.delenv("OMNIGENT_TELEMETRY", raising=False)
+    monkeypatch.delenv("OMNIGENT_ANALYTICS", raising=False)
     monkeypatch.delenv("OMNIGENT_DISABLE_TELEMETRY", raising=False)
     monkeypatch.delenv("DO_NOT_TRACK", raising=False)
     monkeypatch.setenv("CI", "true")
@@ -112,7 +112,7 @@ def test_is_disabled_ci_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_is_disabled_github_actions(monkeypatch: pytest.MonkeyPatch) -> None:
     """``GITHUB_ACTIONS=true`` disables telemetry."""
-    monkeypatch.delenv("OMNIGENT_TELEMETRY", raising=False)
+    monkeypatch.delenv("OMNIGENT_ANALYTICS", raising=False)
     monkeypatch.delenv("OMNIGENT_DISABLE_TELEMETRY", raising=False)
     monkeypatch.delenv("DO_NOT_TRACK", raising=False)
     monkeypatch.delenv("CI", raising=False)
@@ -126,7 +126,7 @@ def test_is_disabled_github_actions(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_is_disabled_none_set(monkeypatch: pytest.MonkeyPatch) -> None:
     """When none of the opt-out vars are set, telemetry is enabled."""
     _ci_vars = [
-        "OMNIGENT_TELEMETRY",
+        "OMNIGENT_ANALYTICS",
         "OMNIGENT_DISABLE_TELEMETRY",
         "DO_NOT_TRACK",
         "CI",
@@ -154,7 +154,7 @@ def test_is_disabled_none_set(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_is_disabled_disable_telemetry(monkeypatch: pytest.MonkeyPatch) -> None:
     """``DISABLE_TELEMETRY=true`` disables telemetry."""
-    monkeypatch.delenv("OMNIGENT_TELEMETRY", raising=False)
+    monkeypatch.delenv("OMNIGENT_ANALYTICS", raising=False)
     monkeypatch.setenv("DISABLE_TELEMETRY", "true")
     monkeypatch.delenv("CI", raising=False)
     monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
@@ -166,7 +166,7 @@ def test_is_disabled_disable_telemetry(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_is_disabled_omnigent_disable_telemetry(monkeypatch: pytest.MonkeyPatch) -> None:
     """``OMNIGENT_DISABLE_TELEMETRY=1`` disables telemetry."""
-    monkeypatch.delenv("OMNIGENT_TELEMETRY", raising=False)
+    monkeypatch.delenv("OMNIGENT_ANALYTICS", raising=False)
     monkeypatch.setenv("OMNIGENT_DISABLE_TELEMETRY", "1")
     monkeypatch.delenv("CI", raising=False)
     monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
@@ -180,7 +180,7 @@ def test_is_disabled_omnigent_disable_telemetry(monkeypatch: pytest.MonkeyPatch)
 
 
 _ALL_OPT_OUT_VARS = [
-    "OMNIGENT_TELEMETRY",
+    "OMNIGENT_ANALYTICS",
     "DISABLE_TELEMETRY",
     "OMNIGENT_DISABLE_TELEMETRY",
     "DO_NOT_TRACK",
@@ -233,7 +233,7 @@ def test_init_client_server_config_disabled(monkeypatch: pytest.MonkeyPatch) -> 
     import omnigent.telemetry.client as _mod
 
     for var in [
-        "OMNIGENT_TELEMETRY",
+        "OMNIGENT_ANALYTICS",
         "DISABLE_TELEMETRY",
         "OMNIGENT_DISABLE_TELEMETRY",
         "DO_NOT_TRACK",

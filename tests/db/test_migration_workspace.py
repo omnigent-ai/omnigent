@@ -93,15 +93,15 @@ def test_workspace_round_trip_null_and_value(db_engine: Engine) -> None:
                 "(id, created_at, updated_at, root_conversation_id) "
                 "VALUES (:id, :ts, :ts, :id)"
             ),
-            {"id": "conv_ws_null", "ts": 1700000000},
+            {"id": "5221a3ae03d21ff063a9255347dde591", "ts": 1700000000},
         )
         conn.execute(
             sa.text("INSERT INTO omnigent_conversation_metadata (id, kind) VALUES (:id, 1)"),
-            {"id": "conv_ws_null"},
+            {"id": "5221a3ae03d21ff063a9255347dde591"},
         )
         result = conn.execute(
             sa.text("SELECT workspace FROM omnigent_conversation_metadata WHERE id = :id"),
-            {"id": "conv_ws_null"},
+            {"id": "5221a3ae03d21ff063a9255347dde591"},
         ).scalar_one()
         assert result is None, f"Expected NULL workspace on default insert; got {result!r}."
 
@@ -112,7 +112,7 @@ def test_workspace_round_trip_null_and_value(db_engine: Engine) -> None:
                 "(id, created_at, updated_at, root_conversation_id) "
                 "VALUES (:id, :ts, :ts, :id)"
             ),
-            {"id": "conv_ws_cli", "ts": 1700000000},
+            {"id": "36d62d2d69c0f58390b4d2c17633053e", "ts": 1700000000},
         )
         conn.execute(
             sa.text(
@@ -121,13 +121,13 @@ def test_workspace_round_trip_null_and_value(db_engine: Engine) -> None:
                 "VALUES (:id, 1, :ws)"
             ),
             {
-                "id": "conv_ws_cli",
+                "id": "36d62d2d69c0f58390b4d2c17633053e",
                 "ws": "/Users/corey/projects/myapp",
             },
         )
         result = conn.execute(
             sa.text("SELECT workspace FROM omnigent_conversation_metadata WHERE id = :id"),
-            {"id": "conv_ws_cli"},
+            {"id": "36d62d2d69c0f58390b4d2c17633053e"},
         ).scalar_one()
         assert result == "/Users/corey/projects/myapp", (
             f"Round-trip mismatch: stored '/Users/corey/projects/myapp', got {result!r}."
@@ -155,7 +155,7 @@ def test_check_constraint_blocks_host_id_without_workspace(
                 "(id, created_at, updated_at, root_conversation_id) "
                 "VALUES (:id, :ts, :ts, :id)"
             ),
-            {"id": "conv_ws_host_no_ws", "ts": 1700000000},
+            {"id": "565b00780d56b2fdaeb275f4013906dc", "ts": 1700000000},
         )
         with pytest.raises(IntegrityError) as exc_info:
             conn.execute(
@@ -165,8 +165,8 @@ def test_check_constraint_blocks_host_id_without_workspace(
                     "VALUES (:id, 1, :hid)"
                 ),
                 {
-                    "id": "conv_ws_host_no_ws",
-                    "hid": "host_abc",
+                    "id": "565b00780d56b2fdaeb275f4013906dc",
+                    "hid": "abb32306b80732bdfa6153b2f5f6eb92",
                 },
             )
         # The constraint name should appear in the error so failures
@@ -197,7 +197,12 @@ def test_check_constraint_allows_host_id_with_workspace(
                 "(owner, name, host_id, status, created_at, updated_at) "
                 "VALUES (:o, :n, :hid, 1, :ts, :ts)"
             ),
-            {"o": "alice@test.com", "n": "laptop", "hid": "host_abc", "ts": 1700000000},
+            {
+                "o": "alice@test.com",
+                "n": "laptop",
+                "hid": "abb32306b80732bdfa6153b2f5f6eb92",
+                "ts": 1700000000,
+            },
         )
         conn.execute(
             sa.text(
@@ -205,7 +210,7 @@ def test_check_constraint_allows_host_id_with_workspace(
                 "(id, created_at, updated_at, root_conversation_id) "
                 "VALUES (:id, :ts, :ts, :id)"
             ),
-            {"id": "conv_ws_host_ok", "ts": 1700000000},
+            {"id": "8ebb129f4017d3388ddf25bd4d2d731c", "ts": 1700000000},
         )
         conn.execute(
             sa.text(
@@ -214,8 +219,8 @@ def test_check_constraint_allows_host_id_with_workspace(
                 "VALUES (:id, 1, :hid, :ws)"
             ),
             {
-                "id": "conv_ws_host_ok",
-                "hid": "host_abc",
+                "id": "8ebb129f4017d3388ddf25bd4d2d731c",
+                "hid": "abb32306b80732bdfa6153b2f5f6eb92",
                 "ws": "/Users/corey/universe/src/foo",
             },
         )
@@ -225,9 +230,9 @@ def test_check_constraint_allows_host_id_with_workspace(
             sa.text(
                 "SELECT host_id, workspace FROM omnigent_conversation_metadata WHERE id = :id"
             ),
-            {"id": "conv_ws_host_ok"},
+            {"id": "8ebb129f4017d3388ddf25bd4d2d731c"},
         ).one()
-        assert result.host_id == "host_abc"
+        assert result.host_id == "abb32306b80732bdfa6153b2f5f6eb92"
         assert result.workspace == "/Users/corey/universe/src/foo"
 
 
@@ -278,7 +283,12 @@ def test_host_id_fk_sets_null_when_host_deleted(db_engine: Engine) -> None:
                 "(owner, name, host_id, status, created_at, updated_at) "
                 "VALUES (:o, :n, :hid, 1, :ts, :ts)"
             ),
-            {"o": "alice@test.com", "n": "laptop", "hid": "host_del", "ts": 1700000000},
+            {
+                "o": "alice@test.com",
+                "n": "laptop",
+                "hid": "3b3efe73c63e0259558065798f210e5d",
+                "ts": 1700000000,
+            },
         )
         conn.execute(
             sa.text(
@@ -286,7 +296,7 @@ def test_host_id_fk_sets_null_when_host_deleted(db_engine: Engine) -> None:
                 "(id, created_at, updated_at, root_conversation_id) "
                 "VALUES (:id, :ts, :ts, :id)"
             ),
-            {"id": "conv_fk", "ts": 1700000000},
+            {"id": "d6d79856e6b3f398cfd001d84952622e", "ts": 1700000000},
         )
         conn.execute(
             sa.text(
@@ -294,23 +304,30 @@ def test_host_id_fk_sets_null_when_host_deleted(db_engine: Engine) -> None:
                 "(id, kind, host_id, workspace) "
                 "VALUES (:id, 1, :hid, :ws)"
             ),
-            {"id": "conv_fk", "hid": "host_del", "ws": "/ws/foo"},
+            {
+                "id": "d6d79856e6b3f398cfd001d84952622e",
+                "hid": "3b3efe73c63e0259558065798f210e5d",
+                "ws": "/ws/foo",
+            },
         )
         conn.commit()
 
-        conn.execute(sa.text("DELETE FROM hosts WHERE host_id = :hid"), {"hid": "host_del"})
+        conn.execute(
+            sa.text("DELETE FROM hosts WHERE host_id = :hid"),
+            {"hid": "3b3efe73c63e0259558065798f210e5d"},
+        )
         conn.commit()
 
         row = conn.execute(
             sa.text(
                 "SELECT host_id, workspace FROM omnigent_conversation_metadata WHERE id = :id"
             ),
-            {"id": "conv_fk"},
+            {"id": "d6d79856e6b3f398cfd001d84952622e"},
         ).one()
         # No FK cascade: host_id is left dangling after host deletion.
         # The application (host store / disconnect handler) is responsible
         # for nulling host_id when a host is removed.
-        assert row.host_id == "host_del", (
+        assert row.host_id == "3b3efe73c63e0259558065798f210e5d", (
             "Without a DB FK, host deletion must not auto-null host_id."
         )
         assert row.workspace == "/ws/foo", "workspace must be untouched."
@@ -335,7 +352,7 @@ def test_check_constraint_allows_cli_session_workspace_no_host(
                 "(id, created_at, updated_at, root_conversation_id) "
                 "VALUES (:id, :ts, :ts, :id)"
             ),
-            {"id": "conv_cli_ws_only", "ts": 1700000000},
+            {"id": "77049ba7474822eaa4e24c45c2c24999", "ts": 1700000000},
         )
         conn.execute(
             sa.text(
@@ -344,7 +361,7 @@ def test_check_constraint_allows_cli_session_workspace_no_host(
                 "VALUES (:id, 1, :ws)"
             ),
             {
-                "id": "conv_cli_ws_only",
+                "id": "77049ba7474822eaa4e24c45c2c24999",
                 "ws": "/Users/corey/projects/cli-launched",
             },
         )
@@ -355,7 +372,7 @@ def test_check_constraint_allows_cli_session_workspace_no_host(
             sa.text(
                 "SELECT host_id, workspace FROM omnigent_conversation_metadata WHERE id = :id"
             ),
-            {"id": "conv_cli_ws_only"},
+            {"id": "77049ba7474822eaa4e24c45c2c24999"},
         ).one()
         assert result.host_id is None
         assert result.workspace == "/Users/corey/projects/cli-launched"

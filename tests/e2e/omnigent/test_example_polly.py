@@ -208,6 +208,43 @@ def test_orchestrator_keeps_timer_tool_but_forbids_worker_polling(
     assert "not for polling workers that already auto-wake you" in compact
 
 
+def test_polly_test_count_ground_truth_guidance() -> None:
+    """
+    Polly prevents pytest count reconciliation from using source-function counts.
+
+    Regression guard for #949: a prior orchestration handoff compared a worker's
+    multi-file pytest total against ``grep -c 'def test_'`` from a single file,
+    which misses parametrized case expansion and falsely labels accurate reports
+    as over-counts. The contract must be present at the orchestrator layer, the
+    cross-review workflow, while workers supply enough exact test context for
+    Polly to verify the same gate.
+    """
+    config = (_POLLY_BUNDLE / "config.yaml").read_text(encoding="utf-8")
+    cross_review = (_POLLY_BUNDLE / "skills" / "cross-review" / "SKILL.md").read_text(
+        encoding="utf-8"
+    )
+
+    config_compact = " ".join(config.split())
+    cross_review_compact = " ".join(cross_review.split())
+    for text in (config_compact, cross_review_compact):
+        assert "python -m pytest --collect-only -q <same files>" in text
+        assert "grep -c 'def test_'" in text
+        assert "collected cases" in text
+        assert "parametrized" in text
+
+    assert "same command, same file set, and same commit" in config_compact
+    assert "miscount`, `over-report`, or `fabrication`" in config_compact
+    assert "exact file set/command/commit" in cross_review_compact
+
+    for name in ("claude_code", "codex", "opencode", "cursor", "hermes", "pi"):
+        worker = (_POLLY_BUNDLE / "agents" / name / "config.yaml").read_text(encoding="utf-8")
+        worker_compact = " ".join(worker.split())
+        assert "When you report test results, include the exact command and file set" in (
+            worker_compact
+        ), name
+        assert "distinguish collected test cases from test functions" in worker_compact, name
+
+
 def test_orchestrator_forbids_premature_idle_after_announcing_intent() -> None:
     """
     The base prompt forbids ending a turn after only announcing intent.

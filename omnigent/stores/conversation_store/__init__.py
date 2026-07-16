@@ -11,6 +11,7 @@ from omnigent.entities import (
     NewConversationItem,
     PagedList,
 )
+from omnigent.session_import import IMPORT_PROVENANCE_LABEL_KEYS
 
 # Label set on a fork of a session that had a working directory. Its
 # value is the source session id. Presence marks the (unbound) clone as
@@ -112,6 +113,10 @@ _INSTANCE_SCOPED_LABEL_KEYS = frozenset(
     }
 )
 
+# Source identity belongs only to the original imported session. Unlike runtime
+# instance labels, these survive an in-place agent switch but never a fork.
+_FORK_ONLY_DROPPED_LABEL_KEYS = IMPORT_PROVENANCE_LABEL_KEYS
+
 
 @dataclass(frozen=True)
 class CreatedSession:
@@ -162,6 +167,10 @@ class ConversationNotFoundError(Exception):
     Store methods use this when absence is not a benign
     no-op and the route layer must return a typed 404.
     """
+
+
+class ConversationAlreadyExistsError(Exception):
+    """Raised when a caller-supplied conversation id is already in use."""
 
 
 class NameAlreadyExistsError(Exception):
@@ -238,6 +247,7 @@ class ConversationStore(ABC):
         workspace: str | None = None,
         git_branch: str | None = None,
         terminal_launch_args: list[str] | None = None,
+        conversation_id: str | None = None,
     ) -> Conversation:
         """
         Create a new conversation. Generates a unique
@@ -290,6 +300,9 @@ class ConversationStore(ABC):
             the column NULL; a list (including ``[]``) is persisted
             so the runner applies it when it auto-launches the
             terminal.
+        :param conversation_id: Optional caller-supplied identifier.
+            ``None`` generates a new random id. Reserved for flows that
+            require database-enforced idempotency.
         :returns: The newly created :class:`Conversation`.
         :raises NameAlreadyExistsError: If
             ``parent_conversation_id`` is not ``None`` and a
@@ -298,6 +311,8 @@ class ConversationStore(ABC):
         :raises ConversationNotFoundError: If
             ``parent_conversation_id`` is set but the parent
             row does not exist (root id can't be inherited).
+        :raises ConversationAlreadyExistsError: If a caller-supplied
+            ``conversation_id`` is already in use.
         """
         ...
 
@@ -310,6 +325,20 @@ class ConversationStore(ABC):
             e.g. ``"conv_abc123"``.
         :returns: The :class:`Conversation` if found, otherwise
             ``None``.
+        """
+        ...
+
+    @abstractmethod
+    def find_imported_conversation(
+        self,
+        source: str,
+        external_session_id: str,
+    ) -> Conversation | None:
+        """Find the original session imported from one external transcript.
+
+        :param source: Import source key, e.g. ``"claude"``.
+        :param external_session_id: Source harness session id.
+        :returns: The matching conversation, or ``None``.
         """
         ...
 

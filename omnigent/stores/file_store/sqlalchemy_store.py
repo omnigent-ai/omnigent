@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from sqlalchemy import and_, asc, desc, or_, select
 
-from omnigent.db.db_models import SqlFile, current_workspace_id
+from omnigent.db.db_models import SqlFile, current_workspace_id, normalize_uuid
 from omnigent.db.utils import (
     generate_file_id,
     get_or_create_engine,
@@ -100,7 +100,7 @@ class SqlAlchemyFileStore(FileStore):
             row = session.get(SqlFile, (current_workspace_id(), file_id))
             if row is None:
                 return None
-            if session_id is not None and row.session_id != session_id:
+            if session_id is not None and row.session_id != normalize_uuid(session_id):
                 return None
             return _to_entity(row)
 
@@ -196,7 +196,7 @@ class SqlAlchemyFileStore(FileStore):
             row = session.get(SqlFile, (current_workspace_id(), file_id))
             if not row:
                 return False
-            if session_id is not None and row.session_id != session_id:
+            if session_id is not None and row.session_id != normalize_uuid(session_id):
                 return False
             session.delete(row)
             return True

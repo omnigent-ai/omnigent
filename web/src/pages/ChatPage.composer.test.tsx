@@ -403,16 +403,12 @@ describe("Composer slash-command submit routing", () => {
     expect(screen.getAllByTestId("model-picker-item").length).toBeGreaterThan(0);
   });
 
-  it("shows the read-only model hint for bare /model on opencode-native", () => {
-    // opencode surfaces showModels (its pill mirrors the live TUI model) but
-    // has no web model options to populate a dropdown. The bare-/model intercept
-    // must NOT fire — opening an empty picker and swallowing the command was the
-    // regression. Instead it falls through to the builtin /model handler, which
-    // surfaces the current model as a read-only hint. ("/model <name>" still
-    // routes to setModel below — opencode reads model_override on the next turn,
-    // so a web switch is functional even though the picker list is empty.)
+  it("opens the server-backed model picker for bare /model on opencode-native", () => {
     const setModel = vi.fn().mockResolvedValue(undefined);
-    useChatStore.setState({ setModel, llmModel: "openrouter/nemotron" });
+    useChatStore.setState({
+      setModel,
+      llmModel: "opencode-go/glm-5.2",
+    });
     const onSend = vi.fn();
     render(
       <Composer
@@ -422,6 +418,7 @@ describe("Composer slash-command submit routing", () => {
           isNativeWrapper: true,
           showModels: true,
           modelPickerKind: "opencode",
+          codexModelOptions: [{ id: "opencode-go/glm-5.2", displayName: "opencode-go/glm-5.2" }],
         })}
       />,
     );
@@ -429,12 +426,11 @@ describe("Composer slash-command submit routing", () => {
     fireEvent.change(ta, { target: { value: "/model " } });
     fireEvent.keyDown(ta, { key: "Enter" });
 
-    // Not sent as plaintext, not a switch, and the (empty) web picker stays shut.
+    // Bare /model opens the picker without sending text or changing the model.
     expect(onSend).not.toHaveBeenCalled();
     expect(setModel).not.toHaveBeenCalled();
-    expect(screen.queryAllByTestId("model-picker-item")).toHaveLength(0);
-    // The builtin handler surfaced the current model as a read-only hint.
-    expect(screen.getByText(/openrouter\/nemotron/)).toBeTruthy();
+    expect(screen.getAllByTestId("model-picker-item")).toHaveLength(1);
+    expect(screen.getByText("opencode-go/glm-5.2")).toBeTruthy();
   });
 
   it("routes /model <name> to setModel on opencode-native (functional switch)", () => {

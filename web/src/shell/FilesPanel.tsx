@@ -162,8 +162,8 @@ function SortSelector({
 // tree (All). One control replaces the old separate Files / Changes rail tabs.
 // ---------------------------------------------------------------------------
 
-// Leading cell in the search toolbar. Rounded-full pills (matching the rail
-// tabs' pill chip) — the active scope fills with the same muted/card mix.
+// Leading cell in the search toolbar. Rounded-full pills match the rail tabs;
+// the active scope uses the same theme selection surface as the sidebar.
 function FileScopeSwitch({
   flatView,
   onChange,
@@ -177,8 +177,7 @@ function FileScopeSwitch({
   const allSelected = !flatView;
   const pill =
     "flex cursor-pointer items-center gap-[6px] rounded-full px-[14px] py-[2px] text-[13px] font-medium leading-5 transition-colors";
-  const activePill =
-    "bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] text-foreground";
+  const activePill = "bg-muted text-foreground";
   const idlePill = "text-muted-foreground hover:text-foreground";
   return (
     <div role="radiogroup" aria-label="File scope" className="flex shrink-0 items-center gap-1">

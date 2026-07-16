@@ -121,6 +121,7 @@ import { useCommentInbox } from "@/hooks/useCommentInbox";
 import { sumPendingApprovals } from "@/lib/inbox";
 import { isSessionStoppable } from "@/lib/sessionStop";
 import { isOwnerLevel } from "@/lib/permissionsApi";
+import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { getSessionState, type SessionState } from "@/hooks/useSessionState";
 import {
   isConversationUnseen,
@@ -142,7 +143,9 @@ import {
   COLLAPSED_SIDEBAR_SECTIONS_STORAGE_KEY,
   computeNextActiveOverride,
   conversationDisplayLabel,
+  dedupeConversationsById,
   EXPANDED_PROJECT_SECTIONS_STORAGE_KEY,
+  migratePinnedConversationIds,
   normalizePinnedConversationIds,
   orderByPinnedSequence,
   PINNED_CONVERSATION_IDS_STORAGE_KEY,
@@ -964,7 +967,9 @@ function ConversationList({
   // me"); a pinned-then-archived session shows under Archived, not Pinned.
   const pinnedSet = useMemo(() => new Set(pinnedConversationIds), [pinnedConversationIds]);
   const sections = useMemo(() => {
-    const allWithBackfill = [...allConversations, ...pinnedBackfill];
+    // Dedupe by id: the pinned-backfill can return a session already present in
+    // the paginated list, and merging both would render the row twice.
+    const allWithBackfill = dedupeConversationsById([...allConversations, ...pinnedBackfill]);
     const notArchived = allWithBackfill.filter((c) => c.archived !== true);
     // Each tab shows a disjoint slice — "mine" is the sessions the viewer owns,
     // "shared" is the ones others shared with them. The Pinned / Projects /
@@ -1255,10 +1260,14 @@ function ConversationList({
   }, [activeId, allConversations]);
   // Auto-expand the project folder holding the selected session, so navigating
   // to a filed session reveals it instead of leaving it hidden in a collapsed
-  // folder. Fires on selection only; the user can still collapse it afterward.
+  // folder. Skipped for pinned sessions: they're already reachable from the
+  // Pinned section, so forcing their project open would undo a manual collapse
+  // every time the user clicks the pinned row.
   useEffect(() => {
-    if (activeProjectName) expandProject(activeProjectName);
-  }, [activeProjectName, expandProject]);
+    if (!activeId || !activeProjectName) return;
+    if (pinnedSet.has(activeId)) return;
+    expandProject(activeProjectName);
+  }, [activeId, activeProjectName, pinnedSet, expandProject]);
 
   // Visible rows in render order (collapsed sections excluded) for the Cmd+↑/↓
   // session hotkey. Titles must match the <ConversationSection> props below.
@@ -1328,7 +1337,7 @@ function ConversationList({
   const { fetchNextPage, isFetchingNextPage } = conversationsQuery;
   useEffect(() => {
     if (!conversationsQuery.data || hasMorePages || searchQuery) return;
-    const allLoaded = [...allConversations, ...pinnedBackfill];
+    const allLoaded = dedupeConversationsById([...allConversations, ...pinnedBackfill]);
     const normalized = normalizePinnedConversationIds(pinnedConversationIds, allLoaded);
     if (!sameStringArray(normalized, pinnedConversationIds)) {
       onPinnedConversationIdsChange(normalized);
@@ -1748,16 +1757,35 @@ function SectionHeader({
         onClick={onToggleCollapsed}
         className="group flex w-full items-center gap-1 rounded-md px-2 py-1 text-left text-sm text-muted-foreground transition-colors hover:text-foreground"
       >
-        {icon}
+        {icon ? (
+          // Headers with a leading icon (project folders) swap the folder for a
+          // chevron on desktop hover/focus, so the caret takes the icon's place
+          // rather than trailing the name. Mobile (no hover) keeps the folder
+          // icon and shows the trailing chevron below.
+          <span className="relative flex size-4 shrink-0 items-center justify-center">
+            <span className="flex md:transition-opacity md:group-hover:opacity-0 md:group-focus-visible:opacity-0">
+              {icon}
+            </span>
+            <ChevronRightIcon
+              className={cn(
+                "absolute size-3.5 opacity-0 transition-[transform,opacity]",
+                !collapsed && "rotate-90",
+                "hidden md:flex md:group-hover:opacity-100 md:group-focus-visible:opacity-100",
+              )}
+            />
+          </span>
+        ) : null}
         <span className="min-w-0 truncate">{title}</span>
-        {/* Chevron sits right after the section name, rotating on expand.
-            Desktop: revealed only on hover/focus of the header; mobile (no
-            hover): always visible. */}
+        {/* Trailing chevron, rotating on expand. Headers without a leading icon
+            reveal it on desktop hover/focus; icon headers show it only on mobile
+            (no hover) since desktop swaps the folder for the chevron above. */}
         <ChevronRightIcon
           className={cn(
             "size-3.5 shrink-0 transition-[transform,opacity]",
             !collapsed && "rotate-90",
-            "md:opacity-0 md:group-hover:opacity-100 md:group-focus-visible:opacity-100",
+            icon
+              ? "md:hidden"
+              : "md:opacity-0 md:group-hover:opacity-100 md:group-focus-visible:opacity-100",
           )}
         />
         {/* A hidden row inside this collapsed section carries a marker — surface
@@ -3421,6 +3449,10 @@ function ConversationEditRow({ initialTitle, onCommit, onCancel }: ConversationE
   // checks this so we don't double-fire onCommit with the unedited
   // value when the input loses focus as part of unmounting.
   const cancelledRef = useRef(false);
+  // Tracks an active IME composition (e.g. Japanese conversion) so the Enter
+  // that confirms a candidate doesn't commit the rename. Mirrors the chat
+  // composer guard (#132/#243).
+  const isComposingRef = useRef(false);
 
   useEffect(() => {
     inputRef.current?.focus();
@@ -3428,6 +3460,7 @@ function ConversationEditRow({ initialTitle, onCommit, onCancel }: ConversationE
   }, []);
 
   function handleKeyDown(e: KeyboardEvent<HTMLInputElement>) {
+    if (isImeCompositionKeyEvent(e, isComposingRef.current)) return;
     if (e.key === "Enter") {
       e.preventDefault();
       onCommit(value);
@@ -3454,6 +3487,12 @@ function ConversationEditRow({ initialTitle, onCommit, onCancel }: ConversationE
         type="text"
         value={value}
         onChange={(e) => setValue(e.target.value)}
+        onCompositionStart={() => {
+          isComposingRef.current = true;
+        }}
+        onCompositionEnd={() => {
+          isComposingRef.current = false;
+        }}
         onKeyDown={handleKeyDown}
         onBlur={handleBlur}
         data-testid="rename-conversation-input"
@@ -3743,7 +3782,12 @@ function readPinnedConversationIds(): string[] {
     if (!raw) return [];
     const parsed: unknown = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
-    return parsed.filter((value): value is string => typeof value === "string");
+    // Migrate legacy prefixed ids (``conv_<hex>``) to the bare-hex form the API
+    // returns post id-to-binary migration; the write-back effect re-persists
+    // the migrated ids, so this one-time rewrite is durable across reloads.
+    return migratePinnedConversationIds(
+      parsed.filter((value): value is string => typeof value === "string"),
+    );
   } catch {
     // Browser storage is user-editable and can contain stale/corrupt values.
     // Treat bad pin state as "no pins" instead of breaking navigation.
