@@ -337,7 +337,9 @@ jobs:
           set -euo pipefail
           SITE="${GITHUB_WORKSPACE}/site"
           VERSION="${TAG#v}"
-          DATE="$(cd "$SITE" && git log -1 --format=%cs 2>/dev/null || date +%F)"
+          # Release date = the tag's commit date in the omnigent checkout (workspace
+          # root, full history + tags), NOT the site checkout's last-commit date.
+          DATE="$(git -C "${GITHUB_WORKSPACE}" log -1 --format=%cs "$TAG" 2>/dev/null || git -C "${GITHUB_WORKSPACE}" log -1 --format=%cs)"
 
           # Build a per-feature material file (contributing PRs' entries + diffs),
           # commit each post to its own LOCAL branch (no push, no token needed).
@@ -352,13 +354,17 @@ jobs:
             category=$(python3 -c "import json;print(json.load(open('/tmp/candidates.json'))[$i].get('category',''))")
 
             # Assemble the per-feature material: changelog entries for the
-            # candidate's PRs plus each PR's diff (capped).
-            python3 -u <<PYEOF
-          import json, pathlib, subprocess
-          repo = "${SOURCE_REPO}"
-          cand = json.load(open("/tmp/candidates.json"))[$i]
+            # candidate's PRs plus each PR's diff (capped). Quoted heredoc so the
+            # markdown code fences aren't shell-evaluated — index and repo come in
+            # via env (CAND_INDEX / SOURCE_REPO), never interpolated into the body.
+            CAND_INDEX="$i" python3 -u <<'PYEOF'
+          import json, os, pathlib, subprocess
+          repo = os.environ["SOURCE_REPO"]
+          idx = int(os.environ["CAND_INDEX"])
+          cand = json.load(open("/tmp/candidates.json"))[idx]
           refs = [int(r) for r in cand.get("pr_refs", [])]
           pr_list = pathlib.Path("/tmp/pr_list.txt").read_text(encoding="utf-8", errors="replace")
+          fence = "```"
           parts = [f"# Feature: {cand.get('headline','')}", "",
                    f"Contributing PRs: {refs}", "",
                    "## Changelog entries (from the release harvest)", pr_list, "",
@@ -371,8 +377,8 @@ jobs:
                       capture_output=True, text=True, timeout=60).stdout
               except Exception as e:
                   diff = f"(diff unavailable: {e})"
-              parts += [f"### PR #{pr}", "```diff", diff[:BUDGET], "```"]
-          pathlib.Path("/tmp/material_${i}.txt").write_text("\n".join(parts))
+              parts += [f"### PR #{pr}", f"{fence}diff", diff[:BUDGET], fence]
+          pathlib.Path(f"/tmp/material_{idx}.txt").write_text("\n".join(parts))
           PYEOF
 
             branch="auto/blog/${VERSION}-${slug}"
@@ -395,9 +401,26 @@ jobs:
               2>>drafter-stderr.log | tee "/tmp/drafter_out_${i}.txt" \
               || { echo "::warning::drafter failed for ${slug} — skipping"; continue; }
 
+            # Secret-scan the drafter output BEFORE it feeds the PR body. The
+            # drafter runs with LLM_API_KEY in env and its stdout is embedded in
+            # the PR description, so a hit must abort the whole step (the PR would
+            # otherwise leak it — artifact redaction runs only after PRs are open).
+            if [ -n "${LLM_API_KEY:-}" ] && grep -qF "$LLM_API_KEY" "/tmp/drafter_out_${i}.txt" 2>/dev/null; then
+              echo "::error::Drafter output for ${slug} contains LLM_API_KEY — aborting."
+              exit 1
+            fi
+
             if [ -z "$(git -C "$SITE" status --porcelain)" ]; then
               echo "::warning::drafter produced no edits for ${slug} — skipping"
               continue
+            fi
+
+            # Also scan the drafted files (they get committed + pushed) for the
+            # key. --untracked covers the newly-created post, which git grep would
+            # otherwise skip.
+            if [ -n "${LLM_API_KEY:-}" ] && git -C "$SITE" grep --untracked -qF "$LLM_API_KEY" 2>/dev/null; then
+              echo "::error::Drafted content for ${slug} contains LLM_API_KEY — aborting."
+              exit 1
             fi
 
             # Append the fixed CTA footer to the drafted post (LLM never writes it).
@@ -432,6 +455,14 @@ jobs:
           private-key: ${{ secrets.OMNIGENT_BOT_APP_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: omnigent-site
+
+      # Make a misconfigured run (posts drafted but no App to push them) loud, so
+      # it isn't mistaken for a clean "no candidates" outcome.
+      - name: Warn if drafts can't be published
+        if: steps.guard.outputs.proceed == 'true' && steps.guard.outputs.dry_run != 'true' && steps.draftposts.outputs.drafted != '0' && steps.app-token.outputs.token == ''
+        run: |
+          echo "::warning::Drafted ${{ steps.draftposts.outputs.drafted }} post(s) but no omnigent-site App token (OMNIGENT_BOT_APP_ID unset?) — no PRs opened; drafts discarded." \
+            | tee -a "$GITHUB_STEP_SUMMARY"
 
       # --- 4) Push each drafted branch and open a DRAFT PR ---
       - name: Open draft PRs (omnigent-site)
