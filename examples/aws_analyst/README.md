@@ -33,3 +33,38 @@ AWS_PROFILE=my-profile AWS_REGION=us-east-1 omnigent run examples/aws_analyst
   a good default for a governed analytics agent.
 - Pairs naturally with a Databricks Genie connector for a Databricks-on-AWS
   "better together" analyst that reasons across both platforms.
+
+## Run the brain on Amazon Bedrock (governed by Databricks AI Gateway)
+
+The connectors above govern the *data*. You can also run the agent's *reasoning* on
+**Amazon Bedrock**, governed by **Databricks AI Gateway** — a fully AWS-native setup
+that's governed end to end.
+
+Amazon Bedrock is a supported provider for Databricks
+[external model endpoints](https://docs.databricks.com/aws/en/generative-ai/external-models/)
+(`amazon-bedrock`). Serve a Bedrock-hosted Anthropic Claude model as a Databricks
+serving endpoint, enable AI Gateway on it, then point this agent at that endpoint via
+the `claude-sdk` harness:
+
+```yaml
+executor:
+  type: omnigent
+  config:
+    harness: claude-sdk
+  # Name of YOUR Databricks external-model serving endpoint (backed by Bedrock).
+  model: databricks-claude-bedrock
+  auth:
+    type: databricks
+    profile: my-databricks-profile
+```
+
+The `claude-sdk` harness runs any Claude model; here the endpoint is served by
+Amazon Bedrock and fronted by Databricks AI Gateway, so every LLM call picks up rate
+limiting, usage/cost tracking, payload logging, and guardrails — while the Redshift
+and S3 Tables connectors keep the *data* access read-only. Reasoning on Bedrock, data
+governed in AWS, all model calls governed through Databricks.
+
+> Not validated end-to-end in this repo — this documents a supported configuration
+> path (Bedrock external model + AI Gateway on Databricks Model Serving), verified
+> against the Databricks docs linked above. Substitute your own endpoint name and
+> profile.
