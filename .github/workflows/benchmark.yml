@@ -54,9 +54,9 @@ env:
 
 concurrency:
   # Never cancel a scheduled run mid-flight (each is a distinct data point).
-  # Manual dispatches get a per-run group (run_id, or the pinned sha) so
-  # repeated ad-hoc runs on the same ref never cancel each other.
-  group: benchmark-${{ github.event_name }}-${{ github.ref }}-${{ inputs.checkout_sha || github.run_id }}
+  # Manual dispatches get a per-run group (unique run_id) so repeated ad-hoc
+  # runs — even on the same ref and same pinned sha — never cancel each other.
+  group: benchmark-${{ github.event_name }}-${{ github.ref }}-${{ github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' }}
 
 jobs:
