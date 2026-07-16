@@ -1,6 +1,6 @@
 """Tests for the host launch authorization helpers.
 
-Tests ``resolve_host_owner`` and ``resolve_host_launch`` directly
+Tests ``resolve_host_access`` and ``resolve_host_launch`` directly
 (pure function tests, no HTTP).
 """
 
@@ -12,9 +12,10 @@ import pytest
 from fastapi import HTTPException
 
 from omnigent.entities import Conversation
+from omnigent.server.host_permissions import HOST_LEVEL_USE, HOST_LEVEL_VIEW
 from omnigent.server.routes._host_launch import (
+    resolve_host_access,
     resolve_host_launch,
-    resolve_host_owner,
 )
 
 
@@ -34,6 +35,24 @@ class _FakeHostStore:
 
 
 @dataclass
+class _FakeHostPermissionStore:
+    """Grant lookup keyed on (user_id, host_id) → level."""
+
+    grants: dict[tuple[str, str], int] = field(default_factory=dict)
+
+    def check_access(self, user_id: str | None, host_id: str, required_level: int) -> bool:
+        if user_id is None:
+            return False
+        level = self.grants.get((user_id, host_id))
+        return level is not None and level >= required_level
+
+    def get_permission_level(self, user_id: str | None, host_id: str) -> int | None:
+        if user_id is None:
+            return None
+        return self.grants.get((user_id, host_id))
+
+
+@dataclass
 class _FakeHostRegistry:
     conns: dict[str, object] = field(default_factory=dict)
 
@@ -49,33 +68,86 @@ class _FakeConversationStore:
         return self.convs.get(conversation_id)
 
 
-# ── resolve_host_owner ───────────────────────────────────────────────
+# ── resolve_host_access ──────────────────────────────────────────────
 
 
-class TestResolveHostOwner:
+class TestResolveHostAccess:
     def test_unknown_host_404(self) -> None:
         store = _FakeHostStore()
         with pytest.raises(HTTPException) as exc_info:
-            resolve_host_owner(user_id="alice", host_id="host_x", host_store=store)
+            resolve_host_access(
+                user_id="alice",
+                host_id="host_x",
+                host_store=store,
+                host_permission_store=_FakeHostPermissionStore(),
+                permission_store=None,
+            )
         assert exc_info.value.status_code == 404
 
-    def test_wrong_owner_403(self) -> None:
+    def test_wrong_owner_no_grant_403(self) -> None:
         host = _FakeHost(host_id="host_1", owner="bob")
         store = _FakeHostStore(hosts={"host_1": host})
         with pytest.raises(HTTPException) as exc_info:
-            resolve_host_owner(user_id="alice", host_id="host_1", host_store=store)
+            resolve_host_access(
+                user_id="alice",
+                host_id="host_1",
+                host_store=store,
+                host_permission_store=_FakeHostPermissionStore(),
+                permission_store=None,
+            )
         assert exc_info.value.status_code == 403
 
     def test_correct_owner(self) -> None:
         host = _FakeHost(host_id="host_1", owner="alice")
         store = _FakeHostStore(hosts={"host_1": host})
-        result = resolve_host_owner(user_id="alice", host_id="host_1", host_store=store)
+        result = resolve_host_access(
+            user_id="alice",
+            host_id="host_1",
+            host_store=store,
+            host_permission_store=_FakeHostPermissionStore(),
+            permission_store=None,
+        )
         assert result.host_id == "host_1"
 
-    def test_no_auth_skips_owner_check(self) -> None:
+    def test_use_grantee_allowed(self) -> None:
         host = _FakeHost(host_id="host_1", owner="bob")
         store = _FakeHostStore(hosts={"host_1": host})
-        result = resolve_host_owner(user_id=None, host_id="host_1", host_store=store)
+        grants = _FakeHostPermissionStore(grants={("alice", "host_1"): HOST_LEVEL_USE})
+        result = resolve_host_access(
+            user_id="alice",
+            host_id="host_1",
+            host_store=store,
+            host_permission_store=grants,
+            permission_store=None,
+        )
+        assert result.host_id == "host_1"
+
+    def test_view_grantee_403_at_use_level(self) -> None:
+        # `view` shows the host in listings but must not authorize the
+        # default `use`-level access (browse/launch).
+        host = _FakeHost(host_id="host_1", owner="bob")
+        store = _FakeHostStore(hosts={"host_1": host})
+        grants = _FakeHostPermissionStore(grants={("alice", "host_1"): HOST_LEVEL_VIEW})
+        with pytest.raises(HTTPException) as exc_info:
+            resolve_host_access(
+                user_id="alice",
+                host_id="host_1",
+                host_store=store,
+                host_permission_store=grants,
+                permission_store=None,
+            )
+        assert exc_info.value.status_code == 403
+
+    def test_no_auth_skips_access_check(self) -> None:
+        host = _FakeHost(host_id="host_1", owner="bob")
+        store = _FakeHostStore(hosts={"host_1": host})
+        result = resolve_host_access(
+            user_id=None,
+            host_id="host_1",
+            host_store=store,
+            host_permission_store=_FakeHostPermissionStore(),
+            permission_store=None,
+        )
         assert result.host_id == "host_1"
 
 
@@ -97,6 +169,7 @@ class TestResolveHostLaunch:
                 host_registry=registry,
                 conversation_store=conv_store,
                 permission_store=None,
+                host_permission_store=_FakeHostPermissionStore(),
             )
         assert exc_info.value.status_code == 409
 
@@ -115,6 +188,7 @@ class TestResolveHostLaunch:
                 host_registry=registry,
                 conversation_store=conv_store,
                 permission_store=None,
+                host_permission_store=_FakeHostPermissionStore(),
             )
         assert exc_info.value.status_code == 404
 
@@ -139,6 +213,7 @@ class TestResolveHostLaunch:
             host_registry=registry,
             conversation_store=conv_store,
             permission_store=None,
+            host_permission_store=_FakeHostPermissionStore(),
         )
         assert result.host.host_id == "host_1"
         assert result.conv.id == "s1"

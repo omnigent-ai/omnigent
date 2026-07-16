@@ -275,6 +275,41 @@ def test_refresh_config_auth_headers_replaces_only_auth(tmp_path: Path) -> None:
     assert payload["tools"] == [{"name": "t"}]
 
 
+def test_refresh_config_auth_headers_preserves_launch_headers(tmp_path: Path) -> None:
+    """A bearer refresh must NOT clobber other launch-time headers.
+
+    The guest-on-shared-host X-Omnigent-Runner-Tunnel-Token is written at
+    launch (in the runner-main process, which has the binding token) but the
+    per-turn refresh runs in a harness worker whose env has the token scrubbed,
+    so it can only supply the bearer. The refresh must merge the fresh bearer
+    over the existing headers, keeping the tunnel token — otherwise the
+    extension's POST /events chat-mirror loses self-access and 404-masks.
+    """
+    bridge_dir = tmp_path / "bridge"
+    pi_native_bridge.write_extension_files(
+        bridge_dir,
+        session_id="conv_abc",
+        server_url="http://omnigent.test",
+        conversation_url="http://omnigent.test/c/conv_abc",
+        auth_headers={
+            "Authorization": "Bearer stale",
+            "X-Omnigent-Runner-Tunnel-Token": "bind-token",
+        },
+    )
+
+    # Refresh supplies ONLY the rotated bearer (worker can't re-derive the token).
+    assert (
+        pi_native_bridge.refresh_config_auth_headers(bridge_dir, {"Authorization": "Bearer fresh"})
+        is True
+    )
+    payload = json.loads(pi_native_bridge.config_path(bridge_dir).read_text(encoding="utf-8"))
+    # Bearer rotated AND the tunnel token preserved via the merge.
+    assert payload["authHeaders"] == {
+        "Authorization": "Bearer fresh",
+        "X-Omnigent-Runner-Tunnel-Token": "bind-token",
+    }
+
+
 def test_refresh_config_auth_headers_noops(tmp_path: Path) -> None:
     """No-op (returns False) on empty headers, a missing config, or no change."""
     bridge_dir = tmp_path / "bridge"

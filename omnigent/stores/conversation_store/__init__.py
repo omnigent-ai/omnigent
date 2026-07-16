@@ -1092,6 +1092,21 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def count_conversations_by_host_id(self, host_id: str) -> int:
+        """
+        Return the number of conversations bound to the given ``host_id``.
+
+        Backs the admin fleet view's per-host session count
+        (``GET /v1/hosts?all=true``). A count rather than a list: the
+        caller only needs the size, so implementations should avoid
+        materializing rows.
+
+        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :returns: Count of conversations whose ``host_id`` matches.
+        """
+        ...
+
+    @abstractmethod
     def set_host_id(
         self,
         conversation_id: str,

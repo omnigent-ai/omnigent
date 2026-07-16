@@ -59,6 +59,7 @@ from omnigent.runner.app import (
     _auto_create_claude_terminal,
     _auto_create_codex_terminal,
     _auto_create_cursor_terminal,
+    _auto_create_hermes_terminal,
     _auto_create_kiro_terminal,
     _auto_create_pi_terminal,
     _auto_create_repl_terminal,
@@ -18375,3 +18376,150 @@ async def test_events_stop_session_on_kiro_native_503_when_kill_fails(
         f"No session.status: idle should be enqueued when kill_session failed; "
         f"got {status_idle!r}."
     )
+
+
+@pytest.mark.parametrize(
+    ("prefer_binding_mint", "binding_token", "expect_tunnel_header"),
+    [
+        # Guest-on-shared-host: flag set + token present -> attach the header so
+        # the forwarder's POST /events is authorized against THIS session.
+        (True, "tok-binding-123", True),
+        # Own-host run: flag unset -> no tunnel header (SP bearer suffices).
+        (False, "tok-binding-123", False),
+        # Flag set but no binding token (e.g. header/proxy auth) -> nothing to attach.
+        (True, None, False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_auto_create_hermes_terminal_attaches_tunnel_token_on_shared_host(
+    prefer_binding_mint: bool,
+    binding_token: str | None,
+    expect_tunnel_header: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Hermes transcript forwarder + approval mirror get the tunnel binding
+    token as ``X-Omnigent-Runner-Tunnel-Token`` when the server flags the runner
+    guest-on-shared-host, and NOT on ordinary own-host runs.
+
+    Without the header, a shared/externally-owned host (e.g. a CoDA Databricks
+    App serving another user's session) sends only the SP bearer, which has no
+    user grant on the human's conversation, so the POST /v1/sessions/{id}/events
+    is 404-masked and the Hermes transcript never reaches Chat.
+    """
+    import omnigent.hermes_native as hermes_native_mod
+    import omnigent.hermes_native_bridge as hermes_bridge_mod
+    import omnigent.hermes_native_forwarder as hermes_forwarder_mod
+    import omnigent.hermes_native_permissions as hermes_perms_mod
+    import omnigent.runner._entry as entry_mod
+    import omnigent.runner.app as runner_app_mod
+    from omnigent.runner.identity import (
+        RUNNER_PREFER_BINDING_TOKEN_MINT_ENV_VAR,
+        RUNNER_TUNNEL_TOKEN_HEADER,
+    )
+    from omnigent.runner.resource_registry import HERMES_NATIVE_TERMINAL_ROLE
+
+    session_id = "conv_hermes_shared_host"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    bridge_dir = tmp_path / "hermes-bridge"
+    bridge_dir.mkdir()
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
+    if prefer_binding_mint:
+        monkeypatch.setenv(RUNNER_PREFER_BINDING_TOKEN_MINT_ENV_VAR, "1")
+    else:
+        monkeypatch.delenv(RUNNER_PREFER_BINDING_TOKEN_MINT_ENV_VAR, raising=False)
+
+    # Stub the bridge/native helpers the auto-create path imports at runtime.
+    monkeypatch.setattr(hermes_bridge_mod, "bridge_dir_for_session_id", lambda _sid: bridge_dir)
+    monkeypatch.setattr(hermes_bridge_mod, "write_policy_hook_config", lambda *a, **k: None)
+    monkeypatch.setattr(hermes_bridge_mod, "read_hermes_home", lambda _bd: hermes_home)
+    monkeypatch.setattr(hermes_bridge_mod, "write_tmux_target", lambda *a, **k: None)
+    monkeypatch.setattr(hermes_forwarder_mod, "clear_hermes_bridge_state", lambda _bd: None)
+    monkeypatch.setattr(
+        runner_app_mod, "clear_hermes_status_state", lambda _bd: None, raising=False
+    )
+    import omnigent.hermes_native_status as hermes_status_mod
+
+    monkeypatch.setattr(hermes_status_mod, "clear_hermes_status_state", lambda _bd: None)
+    monkeypatch.setattr(hermes_native_mod, "resolve_hermes_executable", lambda: "/bin/hermes")
+
+    # Resolve the binding token from the (cached) runner entry helper.
+    monkeypatch.setattr(entry_mod, "_runner_tunnel_binding_token_from_env", lambda: binding_token)
+    monkeypatch.setattr(entry_mod, "_make_auth_token_factory", lambda *a, **k: None)
+
+    # Session snapshot (workspace + no fork).
+    async def _fake_launch_config(**_kwargs: Any) -> _PiNativeLaunchConfig:
+        return _PiNativeLaunchConfig(
+            workspace=workspace,
+            server_url="http://ap.example",
+            terminal_launch_args=[],
+            external_session_id=None,
+        )
+
+    monkeypatch.setattr(runner_app_mod, "_pi_native_launch_config", _fake_launch_config)
+
+    # Capture the headers passed to both runner-owned supervisors.
+    captured: dict[str, dict[str, str]] = {}
+
+    async def _fake_forwarder(*, headers: dict[str, str], **_k: Any) -> None:
+        captured["forwarder"] = headers
+
+    async def _fake_approval(*, headers: dict[str, str], **_k: Any) -> None:
+        captured["approval"] = headers
+
+    monkeypatch.setattr(hermes_forwarder_mod, "supervise_hermes_forwarder", _fake_forwarder)
+    monkeypatch.setattr(hermes_perms_mod, "supervise_hermes_approval_mirror", _fake_approval)
+
+    class _FakeResourceRegistry:
+        """Resource registry that records the required-terminal launch."""
+
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            *,
+            resource_role: str | None = None,
+            **_kwargs: Any,
+        ) -> SessionResourceView:
+            assert terminal_name == "hermes"
+            assert session_key == "main"
+            assert resource_role == HERMES_NATIVE_TERMINAL_ROLE
+            return SessionResourceView(
+                id="terminal_hermes_main",
+                type="terminal",
+                session_id=session_id,
+                name="Hermes",
+            )
+
+    try:
+        await _auto_create_hermes_terminal(
+            session_id,
+            cast(SessionResourceRegistry, _FakeResourceRegistry()),
+            lambda _sid, _event: None,
+            server_client=cast(httpx.AsyncClient, NullServerClient()),
+        )
+        # Let the supervisor task run so it captures the headers.
+        for _ in range(10):
+            await asyncio.sleep(0)
+            if "forwarder" in captured and "approval" in captured:
+                break
+    finally:
+        await runner_app_mod._cancel_auto_forwarder_task(session_id)
+
+    assert "forwarder" in captured, "forwarder supervisor was not started"
+    assert "approval" in captured, "approval mirror supervisor was not started"
+
+    if expect_tunnel_header:
+        assert captured["forwarder"].get(RUNNER_TUNNEL_TOKEN_HEADER) == binding_token
+        assert captured["approval"].get(RUNNER_TUNNEL_TOKEN_HEADER) == binding_token
+    else:
+        assert RUNNER_TUNNEL_TOKEN_HEADER not in captured["forwarder"]
+        assert RUNNER_TUNNEL_TOKEN_HEADER not in captured["approval"]

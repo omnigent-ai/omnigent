@@ -24,9 +24,11 @@ from fastapi import HTTPException
 
 from omnigent.entities import Conversation
 from omnigent.server.auth import LEVEL_OWNER
+from omnigent.server.host_permissions import HOST_LEVEL_USE, check_host_access
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.permissions import check_session_access
 from omnigent.stores import ConversationStore
+from omnigent.stores.host_permission_store import HostPermissionStore
 from omnigent.stores.host_store import Host, HostStore
 from omnigent.stores.permission_store import PermissionStore
 
@@ -46,35 +48,56 @@ class HostLaunchTarget:
     conv: Conversation
 
 
-def resolve_host_owner(
+def resolve_host_access(
     *,
     user_id: str | None,
     host_id: str,
     host_store: HostStore,
+    host_permission_store: HostPermissionStore,
+    permission_store: PermissionStore | None,
+    required_level: int = HOST_LEVEL_USE,
 ) -> Host:
     """
-    Authorize that the caller owns a known host.
+    Authorize that the caller may reach a host at *required_level*.
 
     Every route that reaches a host on the caller's behalf must pass
-    this first so the owner check can't drift between them: the runner
+    this first so the access check can't drift between them: the runner
     launch (via :func:`resolve_host_launch`) AND the session-create
     workspace probe, which sends a ``host.stat`` to the host. The
     original bug had that probe contacting another user's host before
-    any ownership check. When ``user_id`` is ``None`` (auth disabled)
-    the check is skipped, consistent with single-user/local behavior.
+    any ownership check.
+
+    Access is owner OR a sufficient host grant OR admin (see
+    :func:`omnigent.server.host_permissions.check_host_access`). Both
+    callers need ``use`` (the default): the workspace probe browses the
+    host filesystem and the launch runs code on it. When ``user_id`` is
+    ``None`` (auth disabled) the check is skipped, consistent with
+    single-user/local behavior.
 
     :param user_id: Authenticated caller, e.g. ``"alice@example.com"``,
         or ``None`` when auth is disabled.
     :param host_id: Target host id, e.g. ``"host_a1b2c3d4..."``.
     :param host_store: Persistent host registrations.
-    :returns: The host record owned by the caller.
-    :raises HTTPException: 404 if the host is unknown; 403 if it is
-        owned by a different user.
+    :param host_permission_store: Host grant store for the access check.
+    :param permission_store: Session permission store, for the admin
+        bypass. ``None`` skips it.
+    :param required_level: Minimum host level needed; defaults to
+        ``use``.
+    :returns: The host record the caller may reach.
+    :raises HTTPException: 404 if the host is unknown; 403 if the caller
+        lacks sufficient access.
     """
     host = host_store.get_host(host_id)
     if host is None:
         raise HTTPException(status_code=404, detail="host not found")
-    if user_id is not None and host.owner != user_id:
+    if not check_host_access(
+        user_id,
+        host_id,
+        required_level,
+        host_permission_store,
+        host_store,
+        permission_store,
+    ):
         raise HTTPException(status_code=403, detail="not your host")
     return host
 
@@ -88,6 +111,7 @@ def resolve_host_launch(
     host_registry: HostRegistry,
     conversation_store: ConversationStore,
     permission_store: PermissionStore | None,
+    host_permission_store: HostPermissionStore,
 ) -> HostLaunchTarget:
     """
     Resolve and authorize a host runner launch.
@@ -109,18 +133,28 @@ def resolve_host_launch(
     :param conversation_store: Conversation lookups (also used by the
         session-access check for sub-agent parent delegation).
     :param permission_store: Session permission store, or ``None`` to
-        skip the session-owner check (auth disabled).
+        skip the session-owner check (auth disabled). Also consulted for
+        the admin bypass in the host access check.
+    :param host_permission_store: Host grant store for the host access
+        check (owner / ``use`` grant / admin).
     :returns: A :class:`HostLaunchTarget` with the validated host,
         connection, and conversation.
     :raises HTTPException: 404 if the host or session is missing (or the
         session is not owned by the caller — 404, not 403, so other
-        users' sessions aren't enumerable); 403 if the host is owned by
-        a different user; 409 if the host is offline.
+        users' sessions aren't enumerable); 403 if the caller lacks
+        ``use`` on the host; 409 if the host is offline.
     """
-    host = resolve_host_owner(
+    # Host side: owner OR a `use` grant OR admin. A host grant alone is
+    # never enough to launch — the session-owner check below still gates
+    # which session the runner binds to (sharing a host must not widen
+    # session reach).
+    host = resolve_host_access(
         user_id=user_id,
         host_id=host_id,
         host_store=host_store,
+        host_permission_store=host_permission_store,
+        permission_store=permission_store,
+        required_level=HOST_LEVEL_USE,
     )
 
     conn = host_registry.get(host_id)

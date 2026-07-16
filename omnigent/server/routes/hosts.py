@@ -33,16 +33,27 @@ from omnigent.host.frames import (
     HostCreateDirFrame,
     HostLaunchRunnerFrame,
     HostListDirFrame,
+    HostShutdownFrame,
     encode_host_frame,
 )
 from omnigent.runner.identity import token_bound_runner_id
 from omnigent.runtime.agent_cache import AgentCache
+from omnigent.server.admin_list import AdminList
+from omnigent.server.audit import audit_event
 from omnigent.server.auth import AuthProvider
+from omnigent.server.host_permissions import (
+    HOST_LEVEL_MANAGE,
+    HOST_LEVEL_USE,
+    HOST_LEVEL_VIEW,
+    check_host_access,
+    get_host_permission_level,
+)
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._host_launch import resolve_host_launch
 from omnigent.server.schemas import SessionGitOptions
 from omnigent.stores import AgentStore, ConversationStore
+from omnigent.stores.host_permission_store import HostPermissionStore
 from omnigent.stores.host_store import HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
 
@@ -59,6 +70,24 @@ _LIST_DIR_MAX_LIMIT = 1000
 # fast syscall on the host side; 5s matches list_dir and is generous
 # for transient network slowness without making the picker feel hung.
 _CREATE_DIR_TIMEOUT_S = 5.0
+
+# Host permission level → API string. Owner/admin resolve to "owner".
+_HOST_LEVEL_NAMES = {
+    HOST_LEVEL_VIEW: "view",
+    HOST_LEVEL_USE: "use",
+    HOST_LEVEL_MANAGE: "manage",
+    4: "owner",  # HOST_LEVEL_OWNER, effective-only (never stored)
+}
+
+
+def _permission_level_name(level: int | None) -> str | None:
+    """Map a numeric host level to its API string, or ``None``.
+
+    :param level: Numeric host level (1/2/3/4), or ``None`` for no access.
+    :returns: ``"view"`` / ``"use"`` / ``"manage"`` / ``"owner"``, or
+        ``None``.
+    """
+    return _HOST_LEVEL_NAMES.get(level) if level is not None else None
 
 
 async def _proxy_list_dir(
@@ -231,6 +260,25 @@ class LaunchRunnerRequest(BaseModel):
     git: SessionGitOptions | None = None
 
 
+class SetHostPermissionRequest(BaseModel):
+    """Request body for ``PUT /v1/hosts/{host_id}/permissions/{user_id}``.
+
+    :param level: Grant level to set: ``"view"``, ``"use"``, or
+        ``"manage"``. ``"owner"`` is not grantable — ownership comes
+        from the host tunnel identity, not a grant.
+    """
+
+    level: str
+
+
+# Grantable host levels (owner is effective-only, never written).
+_HOST_GRANT_LEVELS = {
+    "view": HOST_LEVEL_VIEW,
+    "use": HOST_LEVEL_USE,
+    "manage": HOST_LEVEL_MANAGE,
+}
+
+
 async def _resolve_agent_spec_cwd(
     conv: Conversation,
     agent_store: AgentStore,
@@ -290,10 +338,12 @@ def create_hosts_router(
     host_store: HostStore,
     conversation_store: ConversationStore,
     *,
+    host_permission_store: HostPermissionStore,
     auth_provider: AuthProvider | None = None,
     permission_store: PermissionStore | None = None,
     agent_store: AgentStore | None = None,
     agent_cache: AgentCache | None = None,
+    admin_list: AdminList | None = None,
 ) -> APIRouter:
     """Build the router for host REST endpoints.
 
@@ -304,10 +354,16 @@ def create_hosts_router(
     :param host_store: Persistent store for host registrations.
     :param conversation_store: Conversation store for reading and
         updating session rows (runner_id, host_id).
+    :param host_permission_store: Host grant store backing shared-host
+        visibility and access checks.
     :param auth_provider: Optional auth provider for user identity.
     :param permission_store: Session permission store, used to verify
         the caller owns the session a runner is launched for. ``None``
         disables the session-owner check (single-user/local).
+    :param admin_list: File/config admin roster, unioned with the
+        ``users.is_admin`` flag for the admin fleet view — the same
+        union ``/v1/me`` reports, so the UI's admin chrome and this
+        gate never disagree. ``None`` checks the DB flag only.
     :param agent_store: Agent store used to resolve a session's agent
         for workspace-boundary validation on runner launch (W6). When
         ``None`` (non-production wiring), the boundary check is skipped;
@@ -318,30 +374,100 @@ def create_hosts_router(
     """
     router = APIRouter()
 
-    @router.get("/hosts")
-    async def list_hosts(request: Request) -> dict[str, list[dict[str, Any]]]:
-        """List all hosts owned by the authenticated user.
+    def _is_admin_caller(user_id: str | None) -> bool:
+        """Whether the caller may use admin-scoped host reads/actions.
 
-        Returns both online and offline hosts, with live runner
-        information for online hosts.
+        Mirrors ``/v1/me``'s admin computation — the DB ``users.is_admin``
+        flag unioned with the admin-list file/config roster — so the gate
+        here never under-reports relative to the admin chrome the SPA
+        shows. Single-user mode (no permission store) is always allowed:
+        every host on such a server belongs to the sole local user.
+
+        :param user_id: The authenticated caller, or ``None`` when auth
+            is disabled (single-user).
+        :returns: ``True`` when admin-scoped access is allowed.
+        """
+        if permission_store is None:
+            return True
+        if user_id is None:
+            return False
+        if permission_store.is_admin(user_id):
+            return True
+        return admin_list is not None and admin_list.is_admin(user_id)
+
+    @router.get("/hosts")
+    async def list_hosts(
+        request: Request,
+        all: bool = Query(default=False),
+    ) -> dict[str, list[dict[str, Any]]]:
+        """List hosts the authenticated user owns or has been shared.
+
+        Returns both online and offline hosts, owned plus any with at
+        least a ``view`` grant. Each host carries the caller's effective
+        ``permission_level`` and an ``owned_by_current_user`` flag so the
+        UI can label shared hosts without parsing the opaque ``owner``.
+
+        With ``?all=true`` (admin only) the owner filter is dropped and
+        every registered host is returned, each with the extra fleet
+        fields ``created_at``, ``last_seen``, and ``session_count`` —
+        the admin Hosts page's data source.
 
         :param request: The incoming request (for auth).
+        :param all: When ``True``, return every host across all owners
+            (requires admin).
         :returns: ``{"hosts": [...]}`` with host details.
+        :raises HTTPException: 401 unauthenticated; 403 when ``all=true``
+            and the caller is not an admin.
         """
         # require_user: unauthenticated callers 401. user_id is None
         # only when auth is disabled entirely — there the single-user
         # server's hosts are owned by the reserved "local" user.
         user_id = require_user(request, auth_provider)
-        if user_id is None:
-            hosts = await asyncio.to_thread(host_store.list_hosts, "local")
+        viewer = user_id if user_id is not None else "local"
+        if all:
+            # Fail closed: the unfiltered fleet view exposes every
+            # owner's hosts, so a non-admin gets 403 rather than a
+            # silently owner-filtered response they might mistake for
+            # the full fleet.
+            if not await asyncio.to_thread(_is_admin_caller, user_id):
+                raise HTTPException(status_code=403, detail="admin privileges required")
+            hosts = await asyncio.to_thread(host_store.list_all_hosts)
+            # Enumerating every owner's hosts (owner emails, names, load)
+            # is a security-relevant read, not just a mutation — audit it
+            # so an admin sweeping the fleet leaves a trail. Target is the
+            # fleet itself; count lets a reviewer size the disclosure.
+            audit_event("host.fleet.list", actor=user_id, target="*", host_count=len(hosts))
         else:
-            hosts = await asyncio.to_thread(host_store.list_hosts, user_id)
+            hosts = await asyncio.to_thread(host_store.list_hosts_for, viewer)
+
+        # Sessions bound per host — the "what would a shutdown affect"
+        # signal on the admin page. Only computed for the fleet view;
+        # the picker payload stays unchanged (additive/opt-in).
+        session_counts: dict[str, int] = {}
+        if all:
+
+            def _count_sessions() -> dict[str, int]:
+                return {
+                    h.host_id: conversation_store.count_conversations_by_host_id(h.host_id)
+                    for h in hosts
+                }
+
+            session_counts = await asyncio.to_thread(_count_sessions)
 
         # One clock for the whole batch so every host is classified
         # against a consistent "now" (host_is_live's documented idiom).
         now = now_epoch()
         result: list[dict[str, Any]] = []
         for host in hosts:
+            owned = host.owner == viewer
+            level = await asyncio.to_thread(
+                get_host_permission_level,
+                user_id,
+                host.host_id,
+                host_permission_store,
+                host_store,
+                permission_store,
+            )
             # Status comes from the DB, not host_registry. The registry
             # is per-replica; if a host is connected to replica B and
             # this request lands on replica A, A's registry won't know
@@ -351,21 +477,31 @@ def create_hosts_router(
             # A stored "online" is only trusted if the host was seen
             # recently: a crashed host never runs set_offline and would
             # otherwise show as online forever in the picker.
-            result.append(
-                {
-                    "host_id": host.host_id,
-                    "name": host.name,
-                    "owner": host.owner,
-                    "status": "online" if host_is_live(host, now=now) else "offline",
-                    # Non-None marks a server-managed sandbox host (e.g.
-                    # "modal"). Clients use it to hide sandbox-backed
-                    # hosts from manual host pickers — they are launch
-                    # targets the server creates on demand, not
-                    # user-connectable machines.
-                    "sandbox_provider": host.sandbox_provider,
-                    "configured_harnesses": host.configured_harnesses,
-                }
-            )
+            entry: dict[str, Any] = {
+                "host_id": host.host_id,
+                "name": host.name,
+                "owner": host.owner,
+                "status": "online" if host_is_live(host, now=now) else "offline",
+                # Non-None marks a server-managed sandbox host (e.g.
+                # "modal"). Clients use it to hide sandbox-backed
+                # hosts from manual host pickers — they are launch
+                # targets the server creates on demand, not
+                # user-connectable machines.
+                "sandbox_provider": host.sandbox_provider,
+                "configured_harnesses": host.configured_harnesses,
+                # Shared-host fields: the UI labels a row "Shared"
+                # when not owned, and disables view-only rows as
+                # launch targets (a launch needs `use`).
+                "owned_by_current_user": owned,
+                "permission_level": _permission_level_name(level),
+            }
+            if all:
+                # updated_at doubles as last-seen: written on connect,
+                # disconnect, and every tunnel heartbeat tick.
+                entry["created_at"] = host.created_at
+                entry["last_seen"] = host.updated_at
+                entry["session_count"] = session_counts.get(host.host_id, 0)
+            result.append(entry)
         return {"hosts": result}
 
     @router.get("/hosts/{host_id}")
@@ -387,9 +523,28 @@ def create_hosts_router(
         host = await asyncio.to_thread(host_store.get_host, host_id)
         if host is None:
             raise HTTPException(status_code=404, detail="host not found")
-        if user_id is not None and host.owner != user_id:
+        # Reading host metadata requires at least `view` — owner, a
+        # `view`+ grantee, or admin. 403 (not 404) for a known host the
+        # caller can't see matches the prior behavior for owned hosts.
+        if not await asyncio.to_thread(
+            check_host_access,
+            user_id,
+            host_id,
+            HOST_LEVEL_VIEW,
+            host_permission_store,
+            host_store,
+            permission_store,
+        ):
             raise HTTPException(status_code=403, detail="not your host")
 
+        level = await asyncio.to_thread(
+            get_host_permission_level,
+            user_id,
+            host_id,
+            host_permission_store,
+            host_store,
+            permission_store,
+        )
         # Status comes from the DB so the answer is consistent across
         # replicas, gated on the liveness freshness window — see
         # list_hosts above for the full rationale.
@@ -402,6 +557,8 @@ def create_hosts_router(
             # server-managed sandbox host (e.g. "modal").
             "sandbox_provider": host.sandbox_provider,
             "configured_harnesses": host.configured_harnesses,
+            "owned_by_current_user": host.owner == (user_id if user_id is not None else "local"),
+            "permission_level": _permission_level_name(level),
             "runners": [],
         }
 
@@ -423,10 +580,10 @@ def create_hosts_router(
             ``workspace``.
         :returns: ``{"runner_id": ..., "status": "launching"}``.
         :raises HTTPException: 404 if host not found, 409 if host
-            offline, 403 if caller doesn't own the host, 400 if
+            offline, 403 if caller lacks `use` on the host, 400 if
             session already has a runner.
         """
-        # require_user: resolve_host_launch skips its ownership checks
+        # require_user: resolve_host_launch skips its access checks
         # for user_id=None (the auth-disabled single-user case), so an
         # unauthenticated caller slipping through as None could launch
         # a runner on another user's host. 401 instead.
@@ -443,6 +600,7 @@ def create_hosts_router(
             host_registry=host_registry,
             conversation_store=conversation_store,
             permission_store=permission_store,
+            host_permission_store=host_permission_store,
         )
         conn = target.conn
 
@@ -629,6 +787,16 @@ def create_hosts_router(
         harness: str | None = None
         if agent_store is not None and agent_cache is not None:
             harness = await _resolve_agent_harness(target.conv, agent_store, agent_cache)
+        # When the launching user (the session owner) is not the host owner —
+        # a shared / externally-owned host, e.g. a service-principal-owned
+        # Databricks App host serving another user's session — tell the runner
+        # to authenticate its server callbacks with its tunnel binding token
+        # (matched against the session's runner_id) instead of the host-owner
+        # credential, which can't read a guest session's spec (404). Equal
+        # owners (own-host, the common case) leave this False → unchanged.
+        prefer_binding_token_mint = (
+            user_id is not None and conn.owner is not None and user_id != conn.owner
+        )
         launch_frame = encode_host_frame(
             HostLaunchRunnerFrame(
                 request_id=request_id,
@@ -636,6 +804,7 @@ def create_hosts_router(
                 workspace=workspace,
                 session_id=body.session_id,
                 harness=harness,
+                prefer_binding_token_mint=prefer_binding_token_mint,
             )
         )
         try:
@@ -681,6 +850,69 @@ def create_hosts_router(
             "runner_id": runner_id,
             "status": "launching",
         }
+
+    @router.post("/hosts/{host_id}/shutdown")
+    async def shutdown_host(request: Request, host_id: str) -> dict[str, str]:
+        """Shut down a host: terminate its runners and exit the daemon.
+
+        Owner-or-admin gated. Sends ``host.shutdown`` over the tunnel;
+        the daemon terminates its runners and exits instead of
+        reconnecting, and the tunnel's existing disconnect path then
+        deregisters the connection and marks the host offline in the DB.
+        Fire-and-forget: the offline flip lands via that disconnect
+        path, so callers observe it on their next poll.
+
+        :param request: The incoming request (for auth).
+        :param host_id: Host to shut down, e.g. ``"host_a1b2c3d4..."``.
+        :returns: ``{"status": "shutting_down"}``.
+        :raises HTTPException: 404 unknown host, 403 when the caller is
+            neither the owner nor an admin, 400 for server-managed
+            sandbox hosts, 409 when the host has no live connection.
+        """
+        # require_user: unauthenticated callers 401 instead of slipping
+        # past the owner/admin check below as None.
+        user_id = require_user(request, auth_provider)
+        host = await asyncio.to_thread(host_store.get_host, host_id)
+        if host is None:
+            raise HTTPException(status_code=404, detail="host not found")
+        if (
+            user_id is not None
+            and host.owner != user_id
+            and not await asyncio.to_thread(_is_admin_caller, user_id)
+        ):
+            raise HTTPException(status_code=403, detail="not your host")
+        # Managed sandbox hosts are created/terminated by the server's
+        # own lifecycle (provider API, not the tunnel); routing them
+        # through a daemon-exit frame would leave the provider-side
+        # sandbox running. Out of scope here.
+        if host.sandbox_provider is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="managed sandbox hosts are terminated by the server automatically",
+            )
+
+        conn = host_registry.get(host_id)
+        if conn is None:
+            raise HTTPException(status_code=409, detail="host is offline")
+
+        actor_label = user_id if user_id is not None else "server operator"
+        frame = encode_host_frame(HostShutdownFrame(reason=f"shut down by {actor_label}"))
+        try:
+            host_registry.send_text(conn, frame)
+        except ConnectionError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="host connection was replaced",
+            ) from exc
+
+        audit_event(
+            "host.shutdown",
+            actor=user_id,
+            target=host_id,
+            host_name=host.name,
+            host_owner=host.owner,
+        )
+        return {"status": "shutting_down"}
 
     @router.get("/hosts/{host_id}/filesystem")
     async def list_host_filesystem_root(
@@ -795,16 +1027,26 @@ def create_hosts_router(
         :raises HTTPException: See per-route docstrings for codes.
         """
         # require_user: unauthenticated callers 401 instead of slipping
-        # past the owner check below as None (see get_host above).
+        # past the access check below as None (see get_host above).
         user_id = require_user(request, auth_provider)
 
-        # Owner check: load the host record, fail with 404 if it
-        # doesn't exist (don't leak existence to non-owners), fail
-        # with 403 only when an authenticated caller doesn't own it.
+        # Access check: load the host record, fail with 404 if it
+        # doesn't exist (don't leak existence to non-owners), fail with
+        # 403 unless the caller has `use` — browsing the filesystem
+        # exposes the host process user's files, so `view` is not enough
+        # (a `view` grantee can see the host but not its contents).
         host = await asyncio.to_thread(host_store.get_host, host_id)
         if host is None:
             raise HTTPException(status_code=404, detail="host not found")
-        if user_id is not None and host.owner != user_id:
+        if not await asyncio.to_thread(
+            check_host_access,
+            user_id,
+            host_id,
+            HOST_LEVEL_USE,
+            host_permission_store,
+            host_store,
+            permission_store,
+        ):
             raise HTTPException(status_code=403, detail="not your host")
 
         if "\x00" in path:
@@ -861,31 +1103,40 @@ def create_hosts_router(
 
         Backs the Web UI workspace picker's "New folder" action so a
         user can make a fresh directory to start a session in without
-        dropping to a terminal. Owner-scoped exactly like the
+        dropping to a terminal. Access-scoped exactly like the
         filesystem browse endpoints (``GET /v1/hosts/{id}/filesystem``):
-        only the host owner can create directories, and — like browse —
-        this is NOT scoped to a session. The workspace-boundary check
-        still runs at session-create time, so creating a directory here
-        does not by itself grant an agent access to it.
+        creating a directory mutates the host filesystem, so it needs
+        ``use`` (owner, admin, or a ``use``+ grantee), and — like
+        browse — this is NOT scoped to a session. The workspace-boundary
+        check still runs at session-create time, so creating a directory
+        here does not by itself grant an agent access to it.
 
         :param request: FastAPI request (for auth).
         :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
         :param body: Request body carrying the absolute (or
             tilde-prefixed) ``path`` to create.
         :returns: ``{"object": "directory", "path": "<created abs path>"}``.
-        :raises HTTPException: 404 if host not found, 403 if not owned
-            by caller, 409 if host is offline or the directory could not
-            be created (already exists / permission denied), 400 on path
-            validation, 504 on host timeout, 502 on host I/O failure.
+        :raises HTTPException: 404 if host not found, 403 if the caller
+            lacks ``use``, 409 if host is offline or the directory could
+            not be created (already exists / permission denied), 400 on
+            path validation, 504 on host timeout, 502 on host I/O failure.
         """
         # require_user: unauthenticated callers 401 instead of slipping
-        # past the owner check below as None.
+        # past the access check below as None.
         user_id = require_user(request, auth_provider)
 
         host = await asyncio.to_thread(host_store.get_host, host_id)
         if host is None:
             raise HTTPException(status_code=404, detail="host not found")
-        if user_id is not None and host.owner != user_id:
+        if not await asyncio.to_thread(
+            check_host_access,
+            user_id,
+            host_id,
+            HOST_LEVEL_USE,
+            host_permission_store,
+            host_store,
+            permission_store,
+        ):
             raise HTTPException(status_code=403, detail="not your host")
 
         path = body.path
@@ -998,5 +1249,164 @@ def create_hosts_router(
             raise HTTPException(status_code=400, detail=exc.message) from exc
 
         return {"object": "list", "data": worktrees}
+
+    # ── Host sharing (permissions) ────────────────────────────────
+    # Owner / admin / a `manage` grantee may view and mutate grants. An
+    # app-SP-owned CoDA host can't use the UI, so its first grant is
+    # bootstrapped by an admin (whose is_admin flag bypasses the manage
+    # check). A `manage` grant created that way then lets a human
+    # administer further grants without admin involvement (FR-016a).
+
+    async def _require_host_manage(request: Request, host_id: str) -> str | None:
+        """Authorize a host-permission mutation/read; return the caller id.
+
+        Requires owner / admin / ``manage`` on the host. 404 when the
+        host is unknown (don't leak existence), 403 when known but the
+        caller lacks ``manage``.
+
+        :param request: The incoming request (for auth).
+        :param host_id: Target host id.
+        :returns: The authenticated caller's user id (or ``None`` when
+            auth is disabled).
+        :raises HTTPException: 404 host unknown, 403 insufficient access.
+        """
+        user_id = require_user(request, auth_provider)
+        host = await asyncio.to_thread(host_store.get_host, host_id)
+        if host is None:
+            raise HTTPException(status_code=404, detail="host not found")
+        # Admin first, via the same roster union every other admin gate
+        # on this router uses (_is_admin_caller). check_host_access's own
+        # admin bypass reads only the DB flag, which the admin-list file
+        # can't flip in header mode (no login event runs the promotion).
+        if await asyncio.to_thread(_is_admin_caller, user_id):
+            return user_id
+        if not await asyncio.to_thread(
+            check_host_access,
+            user_id,
+            host_id,
+            HOST_LEVEL_MANAGE,
+            host_permission_store,
+            host_store,
+            permission_store,
+        ):
+            raise HTTPException(status_code=403, detail="not your host")
+        return user_id
+
+    @router.get("/hosts/{host_id}/permissions")
+    async def list_host_permissions(
+        request: Request,
+        host_id: str,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """List the grants on a host.
+
+        Requires owner / admin / ``manage`` access.
+
+        :param request: The incoming request (for auth).
+        :param host_id: Host identifier.
+        :returns: ``{"permissions": [{"user_id", "level"}, ...]}``.
+        :raises HTTPException: 404 unknown host, 403 insufficient access.
+        """
+        await _require_host_manage(request, host_id)
+        grants = await asyncio.to_thread(host_permission_store.list_for_host, host_id)
+        return {
+            "permissions": [
+                {
+                    "user_id": g.user_id,
+                    "level": _permission_level_name(g.level),
+                    "created_at": g.created_at,
+                    "updated_at": g.updated_at,
+                    "created_by": g.created_by,
+                }
+                for g in grants
+            ]
+        }
+
+    @router.put("/hosts/{host_id}/permissions/{user_id}")
+    async def set_host_permission(
+        request: Request,
+        host_id: str,
+        user_id: str,
+        body: SetHostPermissionRequest,
+    ) -> dict[str, Any]:
+        """Grant or update a user's access to a host.
+
+        Requires owner / admin / ``manage`` access. The grantee gets the
+        requested ``view`` / ``use`` / ``manage`` level (an existing
+        grant is upgraded or downgraded in place).
+
+        :param request: The incoming request (for auth).
+        :param host_id: Host identifier.
+        :param user_id: The grantee to set access for.
+        :param body: The level to set.
+        :returns: ``{"user_id", "host_id", "level"}`` for the grant.
+        :raises HTTPException: 404 unknown host, 403 insufficient access,
+            400 invalid level or granting to the host owner.
+        """
+        actor = await _require_host_manage(request, host_id)
+        level = _HOST_GRANT_LEVELS.get(body.level)
+        if level is None:
+            raise HTTPException(
+                status_code=400,
+                detail="level must be one of: view, use, manage",
+            )
+        host = await asyncio.to_thread(host_store.get_host, host_id)
+        # host is non-None (the manage check 404s otherwise), but the
+        # owner can't be a grantee — ownership already grants everything.
+        if host is not None and host.owner == user_id:
+            raise HTTPException(
+                status_code=400,
+                detail="host owner already has full access; cannot grant",
+            )
+        # The grantee must exist as a user row for the FK to hold. The
+        # session permission store owns the users table; ensure the row.
+        if permission_store is not None:
+            await asyncio.to_thread(permission_store.ensure_user, user_id)
+        grant = await asyncio.to_thread(
+            host_permission_store.grant,
+            user_id,
+            host_id,
+            level,
+            created_by=actor,
+        )
+        audit_event(
+            "host.permission.grant",
+            actor=actor,
+            target=host_id,
+            principal=user_id,
+            level=_permission_level_name(level),
+        )
+        return {
+            "user_id": grant.user_id,
+            "host_id": grant.host_id,
+            "level": _permission_level_name(grant.level),
+        }
+
+    @router.delete("/hosts/{host_id}/permissions/{user_id}")
+    async def delete_host_permission(
+        request: Request,
+        host_id: str,
+        user_id: str,
+    ) -> dict[str, bool]:
+        """Revoke a user's access to a host.
+
+        Requires owner / admin / ``manage`` access. Idempotent: revoking
+        a non-existent grant returns ``{"revoked": false}``.
+
+        :param request: The incoming request (for auth).
+        :param host_id: Host identifier.
+        :param user_id: The grantee to revoke.
+        :returns: ``{"revoked": bool}``.
+        :raises HTTPException: 404 unknown host, 403 insufficient access.
+        """
+        actor = await _require_host_manage(request, host_id)
+        revoked = await asyncio.to_thread(host_permission_store.revoke, user_id, host_id)
+        if revoked:
+            audit_event(
+                "host.permission.revoke",
+                actor=actor,
+                target=host_id,
+                principal=user_id,
+            )
+        return {"revoked": revoked}
 
     return router

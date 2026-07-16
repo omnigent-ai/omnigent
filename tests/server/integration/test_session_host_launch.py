@@ -48,6 +48,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+from omnigent.stores.host_permission_store.sqlalchemy_store import SqlAlchemyHostPermissionStore
 from omnigent.stores.host_store import HostStore
 from tests.server.helpers import create_test_agent
 
@@ -55,6 +56,93 @@ pytestmark = pytest.mark.asyncio
 
 _HOST_ID = "c2d81b1a6812ae1cf32221c5a2a70ba0"
 _WORKSPACE = "/work/repo"
+
+
+async def _capture_launch_frame_flag(*, session_owner: str | None, host_owner: str | None) -> bool:
+    """Call ``_launch_runner_on_host`` with stubbed owners; return the
+    ``prefer_binding_token_mint`` flag on the frame it builds.
+
+    Stubs the host registry's ``send_text`` to raise ``ConnectionError``,
+    which makes ``_launch_runner_on_host`` return early *after* it has
+    built and attempted to send the launch frame — so the flag decision
+    is captured without needing a launch-result future.
+    """
+    from types import SimpleNamespace
+
+    from omnigent.host.frames import HostLaunchRunnerFrame, decode_host_frame
+    from omnigent.server.auth import LEVEL_OWNER
+    from omnigent.server.routes.sessions import _launch_runner_on_host
+    from omnigent.stores.permission_store import SessionPermission
+
+    # _launch_runner_on_host reads conv.id / host_id / workspace, and
+    # _resolve_harness(conv) reads harness_override + agent_id (None →
+    # fail-open, no harness in the frame).
+    conv = SimpleNamespace(
+        id="conv_flag_test",
+        host_id=_HOST_ID,
+        workspace=_WORKSPACE,
+        harness_override=None,
+        agent_id=None,
+    )
+    conversation_store = SimpleNamespace(replace_runner_id=lambda *a, **k: None)
+    permission_store = SimpleNamespace(
+        list_for_session=lambda _cid: (
+            [
+                SessionPermission(
+                    user_id=session_owner, conversation_id="conv_flag_test", level=LEVEL_OWNER
+                )
+            ]
+            if session_owner is not None
+            else []
+        )
+    )
+    host_conn = SimpleNamespace(owner=host_owner, pending_launches={})
+
+    captured: dict[str, bool] = {}
+
+    def _send_text(_conn: object, text: str) -> None:
+        frame = decode_host_frame(text)
+        assert isinstance(frame, HostLaunchRunnerFrame)
+        captured["flag"] = frame.prefer_binding_token_mint
+        raise ConnectionError("stub: capture then early-return")
+
+    host_registry = SimpleNamespace(send_text=_send_text)
+
+    await _launch_runner_on_host(
+        conv,  # type: ignore[arg-type]
+        conversation_store,  # type: ignore[arg-type]
+        host_registry,  # type: ignore[arg-type]
+        host_conn,  # type: ignore[arg-type]
+        permission_store=permission_store,  # type: ignore[arg-type]
+    )
+    return captured["flag"]
+
+
+async def test_launch_frame_prefers_mint_when_session_owner_differs() -> None:
+    """Guest-on-shared-host (US1): session owner != host owner → flag True.
+
+    A service-principal-owned host serving another user's session must
+    tell the runner to authenticate as the session owner; otherwise the
+    host-owner credential can't read the guest session's spec (404).
+    """
+    flag = await _capture_launch_frame_flag(
+        session_owner="guest@example.com",
+        host_owner="sp-host-owner@example.com",
+    )
+    assert flag is True
+
+
+async def test_launch_frame_no_mint_when_owner_equals_host() -> None:
+    """Owner-on-own-host (US2 regression): equal owners → flag False.
+
+    The common case (a user's own host serving their own session) must
+    keep today's inherited-credential behavior — no mint preference.
+    """
+    flag = await _capture_launch_frame_flag(
+        session_owner="alice@example.com",
+        host_owner="alice@example.com",
+    )
+    assert flag is False
 
 
 class _NoopRunnerWS:
@@ -115,6 +203,7 @@ def app(runtime_init: None, db_uri: str, tmp_path) -> FastAPI:
         ),
         comment_store=SqlAlchemyCommentStore(db_uri),
         host_store=HostStore(db_uri),
+        host_permission_store=SqlAlchemyHostPermissionStore(db_uri),
     )
 
 
@@ -1440,6 +1529,7 @@ async def test_health_reports_online_for_host_on_other_replica(
         ),
         comment_store=SqlAlchemyCommentStore(db_uri),
         host_store=HostStore(db_uri),
+        host_permission_store=SqlAlchemyHostPermissionStore(db_uri),
     )
     assert app_b.state.host_registry.get(_HOST_ID) is None, (
         "test setup is broken: replica B's host registry should be empty."

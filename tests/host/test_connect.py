@@ -23,6 +23,7 @@ from omnigent.host.connect import (
 )
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    HOST_AT_CAPACITY_ERROR_CODE,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
     HostHelloFrame,
@@ -41,6 +42,7 @@ from omnigent.host.identity import HostIdentity
 from omnigent.runner.identity import (
     RUNNER_ID_ENV_VAR,
     RUNNER_PARENT_PID_ENV_VAR,
+    RUNNER_PREFER_BINDING_TOKEN_MINT_ENV_VAR,
     RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
     RUNNER_WORKSPACE_ENV_VAR,
     token_bound_runner_id,
@@ -223,6 +225,143 @@ async def test_handle_launch_refuses_unconfigured_harness(
     assert result.runner_id is None
     # No runner subprocess may exist after a refusal.
     assert host._runners == {}
+
+
+async def test_handle_launch_refuses_when_at_capacity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    With OMNIGENT_HOST_MAX_RUNNERS set, a launch past the cap is refused
+    with the structured host_at_capacity code and no runner is spawned.
+
+    If this regresses, an unbounded fan-out of launch frames spawns a full
+    agent process each, which can OOM a fixed-resource host and kill every
+    session on it — the exact backpressure this cap exists to provide.
+    """
+    monkeypatch.setenv("OMNIGENT_HOST_MAX_RUNNERS", "1")
+    host = _make_host_process()
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    # One live runner already occupies the single slot.
+    alive_proc = subprocess.Popen(
+        ["sleep", "60"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    host._runners["runner_existing"] = _RunnerHandle(
+        proc=alive_proc, log_path=tmp_path / "runner-existing.log"
+    )
+    # Harness check would pass — isolate the capacity refusal.
+    monkeypatch.setattr(
+        "omnigent.host.connect.harness_is_configured",
+        lambda harness: True,
+    )
+
+    frame = HostLaunchRunnerFrame(
+        request_id="req_capacity",
+        binding_token="token_over",
+        workspace=str(workspace),
+        harness="codex",
+    )
+    try:
+        result = await host._handle_launch(frame)
+
+        assert isinstance(result, HostLaunchRunnerResultFrame)
+        assert result.status == "failed"
+        assert result.error_code == HOST_AT_CAPACITY_ERROR_CODE
+        assert "capacity" in (result.error or "").lower()
+        assert result.runner_id is None
+        # No NEW runner spawned; only the pre-existing one remains.
+        assert set(host._runners) == {"runner_existing"}
+    finally:
+        alive_proc.terminate()
+        alive_proc.wait()
+        _cleanup_host(host)
+
+
+async def test_handle_launch_unlimited_when_cap_unset(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    With OMNIGENT_HOST_MAX_RUNNERS unset, the capacity gate is a no-op:
+    a launch proceeds to the harness check (original behavior preserved).
+    """
+    monkeypatch.delenv("OMNIGENT_HOST_MAX_RUNNERS", raising=False)
+    host = _make_host_process()
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    # Pre-load several live runners; without a cap none of them block a launch.
+    procs = []
+    for name in ("r_a", "r_b", "r_c"):
+        p = subprocess.Popen(["sleep", "60"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        host._runners[name] = _RunnerHandle(proc=p, log_path=tmp_path / f"{name}.log")
+        procs.append(p)
+    # Fail the harness check so we prove the launch got PAST the capacity gate
+    # (a capacity refusal would carry a different error_code) without spawning.
+    monkeypatch.setattr(
+        "omnigent.host.connect.harness_is_configured",
+        lambda harness: False,
+    )
+
+    frame = HostLaunchRunnerFrame(
+        request_id="req_unlimited",
+        binding_token="token_ok",
+        workspace=str(workspace),
+        harness="codex",
+    )
+    try:
+        result = await host._handle_launch(frame)
+        # Reached the harness check — not stopped by capacity.
+        assert result.status == "failed"
+        assert result.error_code == HARNESS_NOT_CONFIGURED_ERROR_CODE
+    finally:
+        for p in procs:
+            p.terminate()
+            p.wait()
+        _cleanup_host(host)
+
+
+async def test_handle_launch_capacity_counts_only_live_runners(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The cap counts only LIVE runners: a dead handle occupying the dict must
+    not consume a slot (``_alive_runner_ids`` prunes it first), so a launch
+    under a cap of 1 with only a dead runner present proceeds.
+    """
+    monkeypatch.setenv("OMNIGENT_HOST_MAX_RUNNERS", "1")
+    host = _make_host_process()
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    dead_proc = subprocess.Popen(["true"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    dead_proc.wait()
+    host._runners["runner_dead"] = _RunnerHandle(
+        proc=dead_proc, log_path=tmp_path / "runner-dead.log"
+    )
+    # Harness check fails so the launch stops cleanly right after the capacity
+    # gate without spawning a real runner — proving the gate did NOT refuse.
+    monkeypatch.setattr(
+        "omnigent.host.connect.harness_is_configured",
+        lambda harness: False,
+    )
+
+    frame = HostLaunchRunnerFrame(
+        request_id="req_dead_slot",
+        binding_token="token_x",
+        workspace=str(workspace),
+        harness="codex",
+    )
+    try:
+        result = await host._handle_launch(frame)
+        # Not a capacity refusal (dead runner was pruned, slot free).
+        assert result.error_code == HARNESS_NOT_CONFIGURED_ERROR_CODE
+        # And the dead handle was cleaned up as a side effect of the count.
+        assert "runner_dead" not in host._runners
+    finally:
+        _cleanup_host(host)
 
 
 async def test_handle_launch_native_cursor_message_points_at_cursor_installer(
@@ -1304,6 +1443,40 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
     assert env[RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR] == "tok"
     assert env[RUNNER_WORKSPACE_ENV_VAR] == "/ws"
     assert env[RUNNER_PARENT_PID_ENV_VAR] == "42"
+    # The prefer-mint flag is NOT set unless explicitly requested.
+    assert RUNNER_PREFER_BINDING_TOKEN_MINT_ENV_VAR not in env
+
+
+def test_build_runner_env_sets_prefer_mint_flag_when_requested() -> None:
+    """
+    ``prefer_binding_token_mint=True`` stamps the runner env flag so the
+    runner authenticates its server callbacks as the session owner (the
+    guest-on-shared-host case); ``False`` (the default) leaves it unset so
+    the runner keeps today's inherited-credential behavior.
+    """
+    base = {"PATH": "/usr/bin", "HOME": "/home/alice"}
+
+    on = _build_runner_env(
+        base,
+        server_url="http://server",
+        runner_id="runner_abc",
+        binding_token="tok",
+        workspace="/ws",
+        parent_pid=42,
+        prefer_binding_token_mint=True,
+    )
+    assert on[RUNNER_PREFER_BINDING_TOKEN_MINT_ENV_VAR] == "1"
+
+    off = _build_runner_env(
+        base,
+        server_url="http://server",
+        runner_id="runner_abc",
+        binding_token="tok",
+        workspace="/ws",
+        parent_pid=42,
+        prefer_binding_token_mint=False,
+    )
+    assert RUNNER_PREFER_BINDING_TOKEN_MINT_ENV_VAR not in off
 
 
 def test_build_runner_env_forwards_harness_credentials_and_endpoints() -> None:
@@ -2382,3 +2555,27 @@ def test_run_host_process_announces_session_log_dir_on_start(
     out = capsys.readouterr().out
     assert "Session logs: ~/.omnigent/logs/runner/" in out
     assert "This host's log: ~/.omnigent/logs/host/host-" in out
+
+
+async def test_dispatch_shutdown_terminates_runners_and_raises(tmp_path: Path) -> None:
+    """
+    Verify a host.shutdown frame terminates every tracked runner and
+    raises HostShutdownRequested so the reconnect loop exits instead
+    of treating the disconnect as transient.
+    """
+    from omnigent.host.connect import HostShutdownRequested
+    from omnigent.host.frames import HostShutdownFrame
+
+    host = _make_host_process()
+    proc = subprocess.Popen(
+        ["sleep", "60"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    host._runners["runner_shut"] = _RunnerHandle(proc=proc, log_path=tmp_path / "runner-s.log")
+
+    with pytest.raises(HostShutdownRequested, match="maintenance"):
+        await host._dispatch_host_frame(object(), HostShutdownFrame(reason="maintenance"))
+
+    assert proc.poll() is not None, "Runner must be terminated on shutdown"
+    assert host._runners == {}

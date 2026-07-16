@@ -48,6 +48,9 @@ from omnigent.server.passwords import (
     needs_rehash,
     verify_password,
 )
+from omnigent.stores.host_permission_store.sqlalchemy_store import (
+    SqlAlchemyHostPermissionStore,
+)
 from omnigent.stores.permission_store.sqlalchemy_store import (
     SqlAlchemyPermissionStore,
 )
@@ -1076,6 +1079,7 @@ def _build_accounts_app(
         comment_store=comment_store,
         permission_store=permission_store,
         host_store=host_store,
+        host_permission_store=SqlAlchemyHostPermissionStore(db_url),
         auth_provider=auth_provider,
         account_store=account_store,
     )
@@ -1167,6 +1171,7 @@ def header_mode_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator
         comment_store=comment_store,
         permission_store=permission_store,
         host_store=host_store,
+        host_permission_store=SqlAlchemyHostPermissionStore(db_url),
         auth_provider=auth_provider,
         account_store=None,
     )

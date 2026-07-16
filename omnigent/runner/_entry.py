@@ -396,6 +396,24 @@ def _make_auth_token_factory(
                 return oidc_token
         return _sdk_token()
 
+    # Guest-on-shared-host: the server set OMNIGENT_RUNNER_PREFER_BINDING_TOKEN_MINT
+    # because this session's owner differs from the host owner. Prefer the
+    # binding-token mint (acting as the SESSION owner) OVER the inherited
+    # host-owner credential — the host-owner credential can't read the guest
+    # session's spec, so its callbacks 404. This is the only case where the
+    # mint is chosen ahead of an available user credential; every other path
+    # keeps the historical order (user credential first, mint as fallback).
+    # Falls through to that order if the binding token is somehow absent
+    # (safe degrade — never abort the launch here).
+    # NOTE: the prefer-flag does NOT force the owner-JWT mint here. In header
+    # mode the mint endpoint 302s/400s (no cookie secret), which would break
+    # the tunnel bearer this factory also feeds → runner_failed_to_start. The
+    # flag instead drives the binding-token HEADER on the callback client (see
+    # create_app's server_client), which the server matches to conv.runner_id
+    # to grant read — no minted credential, no auth-mode dependency. The tunnel
+    # keeps authenticating with the host owner's credential (below), which the
+    # server accepts for the tunnel.
+
     # Probe once to check if a user credential is available.
     try:
         if _factory() is not None:
@@ -577,22 +595,40 @@ def _mint_managed_owner_token(
     return payload["token"], float(payload["expires_at"])
 
 
+# Captured at first read (runner startup, before any scrub). The binding
+# token is popped from os.environ at every child-spawn / sandbox boundary
+# (strip_runner_auth_secrets / sandbox launcher), so a later reader —
+# e.g. _auto_create_pi_terminal building the pi extension config after a
+# terminal launch scrubbed the env — would otherwise see None. Caching it
+# in the runner's own process memory keeps it available to all in-process
+# callbacks without re-exposing it to any child environment (the scrub
+# boundary is child process env, not in-process memory).
+_CAPTURED_BINDING_TOKEN: str | None = None
+
+
 def _runner_tunnel_binding_token_from_env() -> str | None:
-    """Return the optional tunnel binding token from the environment.
+    """Return the optional tunnel binding token.
+
+    Reads the env var on first call (runner startup, before the env is
+    scrubbed) and caches it, so later callers still get it after the
+    sandbox / child-spawn scrubbers pop it from ``os.environ``.
 
     :returns: Secret token used to bind the WebSocket tunnel to its
         runner id, or ``None`` when the runner was started without
         per-tunnel binding.
     :raises RuntimeError: If the token env var is set but empty.
     """
+    global _CAPTURED_BINDING_TOKEN
     from omnigent.runner.identity import RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR
 
     token = os.environ.get(RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR)
     if token is None:
-        return None
+        # Env was scrubbed after startup; fall back to the captured value.
+        return _CAPTURED_BINDING_TOKEN
     if not token.strip():
         raise RuntimeError(f"{RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR} must not be empty")
-    return token.strip()
+    _CAPTURED_BINDING_TOKEN = token.strip()
+    return _CAPTURED_BINDING_TOKEN
 
 
 def _runner_parent_pid_from_env() -> int | None:
@@ -904,6 +940,25 @@ def create_app(
     # token cache); otherwise build our own.
     if auth_token_factory is None:
         auth_token_factory = _make_auth_token_factory()
+    _callback_headers = {
+        "Origin": OMNIGENT_INTERNAL_WS_ORIGIN,
+        **databricks_request_headers(server_url),
+    }
+    # Guest-on-shared-host: when the server flagged this runner as serving a
+    # session it doesn't own the host of, attach the tunnel binding token so the
+    # server can grant read on THIS session by matching the token-derived runner
+    # id against the session's runner_id. Works in header/proxy auth mode, where
+    # no owner token can be minted. Gated by the flag so the token isn't sent on
+    # ordinary own-host runs.
+    from omnigent.runner.identity import (
+        RUNNER_PREFER_BINDING_TOKEN_MINT_ENV_VAR,
+        RUNNER_TUNNEL_TOKEN_HEADER,
+    )
+
+    if os.environ.get(RUNNER_PREFER_BINDING_TOKEN_MINT_ENV_VAR):
+        _binding_token = _runner_tunnel_binding_token_from_env()
+        if _binding_token:
+            _callback_headers[RUNNER_TUNNEL_TOKEN_HEADER] = _binding_token
     server_client = httpx.AsyncClient(
         base_url=server_url,
         auth=_RunnerDatabricksAuth(auth_token_factory),
@@ -916,7 +971,7 @@ def create_app(
         #
         # The workspace-routing header (empty unless a ?o= selector was
         # recorded for this server) routes these callbacks to the workspace.
-        headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN, **databricks_request_headers(server_url)},
+        headers=_callback_headers,
         timeout=httpx.Timeout(5.0, read=None),
         # NOTE: ``follow_redirects`` deliberately stays False.
         # ``_RunnerDatabricksAuth.auth_flow`` needs to *see* the

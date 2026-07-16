@@ -46,6 +46,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+from omnigent.stores.host_permission_store.sqlalchemy_store import SqlAlchemyHostPermissionStore
 from omnigent.stores.host_store import HostStore
 from tests.server.helpers import create_test_agent
 
@@ -81,6 +82,7 @@ def app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
         ),
         comment_store=SqlAlchemyCommentStore(db_uri),
         host_store=HostStore(db_uri),
+        host_permission_store=SqlAlchemyHostPermissionStore(db_uri),
     )
 
 

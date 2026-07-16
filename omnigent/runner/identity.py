@@ -34,6 +34,16 @@ OMNIGENT_INTERNAL_WS_ORIGIN = "omnigent://internal"
 # CLI flows leave it unset (agent sees the project root directly).
 RUNNER_ISOLATE_SESSION_ENV_VAR = "OMNIGENT_RUNNER_ISOLATE_SESSION"
 
+# "1" tells a host-launched runner to authenticate its server callbacks
+# with the binding-token owner mint (acting as the SESSION owner) instead
+# of the inherited host-owner credential. Set by the server (via the
+# host.launch_runner frame → host runner env) only when the session owner
+# differs from the host owner — the shared / externally-owned-host case
+# (e.g. a Databricks App host serving another user's session). Unset keeps
+# the default order (inherited credential first, mint as fallback). Not a
+# secret — a plain flag — so it is NOT in RUNNER_AUTH_SECRET_ENV_VARS.
+RUNNER_PREFER_BINDING_TOKEN_MINT_ENV_VAR = "OMNIGENT_RUNNER_PREFER_BINDING_TOKEN_MINT"
+
 # Marker env var stamped into every agent-facing environment so any
 # process launched inside an Omnigent agent session can detect it is
 # running under Omnigent. This is the analog of Claude Code's

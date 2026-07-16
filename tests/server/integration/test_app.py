@@ -15,6 +15,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+from omnigent.stores.host_permission_store.sqlalchemy_store import SqlAlchemyHostPermissionStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 
 pytestmark = pytest.mark.asyncio
@@ -211,6 +212,7 @@ async def test_host_routes_mounted_with_host_store(
             cache_dir=tmp_path / "cache",
         ),
         host_store=HostStore(db_uri),
+        host_permission_store=SqlAlchemyHostPermissionStore(db_uri),
     )
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:

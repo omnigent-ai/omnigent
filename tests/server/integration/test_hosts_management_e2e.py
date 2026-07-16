@@ -28,6 +28,9 @@ from omnigent.server.routes.runner_tunnel import create_runner_tunnel_router
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
+from omnigent.stores.host_permission_store.sqlalchemy_store import (
+    SqlAlchemyHostPermissionStore,
+)
 from omnigent.stores.host_store import HostStore
 
 pytestmark = pytest.mark.asyncio
@@ -49,7 +52,12 @@ def management_app(
     reports = RunnerExitReports()
     app = FastAPI()
     app.include_router(
-        create_hosts_router(host_registry, host_store, conv_store),
+        create_hosts_router(
+            host_registry,
+            host_store,
+            conv_store,
+            host_permission_store=SqlAlchemyHostPermissionStore(db_uri),
+        ),
         prefix="/v1",
     )
     app.include_router(

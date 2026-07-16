@@ -86,6 +86,7 @@ from omnigent.stores import (
 )
 from omnigent.stores.comment_store import CommentStore
 from omnigent.stores.conversation_store import SessionConnectivity
+from omnigent.stores.host_permission_store import HostPermissionStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.policy_store import PolicyStore
@@ -1093,6 +1094,7 @@ def create_app(
     scheduled_task_store: ScheduledTaskStore | None = None,
     auth_provider: AuthProvider | None = None,
     host_store: HostStore | None = None,
+    host_permission_store: HostPermissionStore | None = None,
     account_store: Any | None = None,  # SqlAlchemyAccountStore — accounts mode only
     extra_routers: list[tuple[Any, str, list[str]]] | None = None,
     policy_modules: list[str] | None = None,
@@ -1144,6 +1146,10 @@ def create_app(
     :param host_store: Store for host registrations. ``None``
         disables host connectivity features (list hosts, launch
         runners on remote hosts).
+    :param host_permission_store: Store for host-sharing grants.
+        Required when ``host_store`` is provided — the host routes
+        resolve owned-or-shared visibility and per-host access through
+        it. ``None`` is allowed only when host support is disabled.
     :param policy_modules: Additional dotted module paths to
         scan for ``POLICY_REGISTRY`` lists at startup, e.g.
         ``["myorg.policies.safety"]``. Sourced from the server
@@ -1443,6 +1449,8 @@ def create_app(
     app.state.runner_router = runner_router
     app.state.host_registry = host_registry
     app.state.host_store = host_store
+    app.state.host_permission_store = host_permission_store
+    app.state.permission_store = permission_store
     app.state.sandbox_config = sandbox_config
     # Admin roster: the config ``admins:`` list (canonical) union'd with the
     # runtime-editable ``<data_dir>/admins`` file. Built once here so BOTH the
@@ -2460,6 +2468,13 @@ def create_app(
     # except (a hidden failure). No host_store = host support is simply
     # not enabled (host connects get 404), rather than silently broken.
     if host_store is not None:
+        if host_permission_store is None:
+            # Host routes resolve owned-or-shared visibility and per-host
+            # access through the host permission store; mounting them
+            # without it would 500 on every host request. Fail loud at
+            # wiring time instead.
+            raise ValueError("host_permission_store is required when host_store is provided")
+
         from omnigent.server.routes.host_tunnel import create_host_tunnel_router
         from omnigent.server.routes.hosts import create_hosts_router
 
@@ -2487,10 +2502,14 @@ def create_app(
                 host_registry,
                 host_store,
                 conversation_store,
+                host_permission_store=host_permission_store,
                 auth_provider=auth_provider,
                 permission_store=permission_store,
                 agent_store=agent_store,
                 agent_cache=agent_cache,
+                # Same roster /v1/me consults, so the admin fleet view
+                # authorizes exactly the users the SPA shows it to.
+                admin_list=admin_list,
             ),
             prefix="/v1",
             tags=["hosts"],

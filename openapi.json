@@ -5511,6 +5511,21 @@
         "title": "SetCodexGoalRequest",
         "type": "object"
       },
+      "SetHostPermissionRequest": {
+        "description": "Request body for `PUT /v1/hosts/{host_id}/permissions/{user_id}`.",
+        "properties": {
+          "level": {
+            "description": "Grant level to set: `\"view\"`, `\"use\"`, or `\"manage\"`. `\"owner\"` is not grantable \u2014 ownership comes from the host tunnel identity, not a grant.",
+            "title": "Level",
+            "type": "string"
+          }
+        },
+        "required": [
+          "level"
+        ],
+        "title": "SetHostPermissionRequest",
+        "type": "object"
+      },
       "SetSharingRequest": {
         "description": "Body for `PUT /v1/sharing`.\n\nBoth fields are optional so an admin can update either setting\nindependently; at least one must be present.",
         "properties": {
@@ -6529,8 +6544,21 @@
     },
     "/v1/hosts": {
       "get": {
-        "description": "List all hosts owned by the authenticated user.\n\nReturns both online and offline hosts, with live runner\ninformation for online hosts.\n\n**Returns:** `{\"hosts\": [...]}` with host details.",
+        "description": "List hosts the authenticated user owns or has been shared.\n\nReturns both online and offline hosts, owned plus any with at\nleast a `view` grant. Each host carries the caller's effective\n`permission_level` and an `owned_by_current_user` flag so the\nUI can label shared hosts without parsing the opaque `owner`.\n\nWith `?all=true` (admin only) the owner filter is dropped and\nevery registered host is returned, each with the extra fleet\nfields `created_at`, `last_seen`, and `session_count` \u2014\nthe admin Hosts page's data source.\n\n**Returns:** `{\"hosts\": [...]}` with host details.\n\n**Raises**\n\n- `HTTPException` \u2014 401 unauthenticated; 403 when `all=true` and the caller is not an admin.",
         "operationId": "list_hosts_v1_hosts_get",
+        "parameters": [
+          {
+            "description": "When `True`, return every host across all owners (requires admin).",
+            "in": "query",
+            "name": "all",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "All",
+              "type": "boolean"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -6549,6 +6577,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
           }
         },
         "summary": "List Hosts",
@@ -6605,7 +6643,7 @@
     },
     "/v1/hosts/{host_id}/directories": {
       "post": {
-        "description": "Create a new directory on a host.\n\nBacks the Web UI workspace picker's \"New folder\" action so a\nuser can make a fresh directory to start a session in without\ndropping to a terminal. Owner-scoped exactly like the\nfilesystem browse endpoints (`GET /v1/hosts/{id}/filesystem`):\nonly the host owner can create directories, and \u2014 like browse \u2014\nthis is NOT scoped to a session. The workspace-boundary check\nstill runs at session-create time, so creating a directory here\ndoes not by itself grant an agent access to it.\n\n**Parameters**\n\n- `body` \u2014 Request body carrying the absolute (or tilde-prefixed) `path` to create.\n\n**Returns:** `{\"object\": \"directory\", \"path\": \"<created abs path>\"}`.\n\n**Raises**\n\n- `HTTPException` \u2014 404 if host not found, 403 if not owned by caller, 409 if host is offline or the directory could not be created (already exists / permission denied), 400 on path validation, 504 on host timeout, 502 on host I/O failure.",
+        "description": "Create a new directory on a host.\n\nBacks the Web UI workspace picker's \"New folder\" action so a\nuser can make a fresh directory to start a session in without\ndropping to a terminal. Access-scoped exactly like the\nfilesystem browse endpoints (`GET /v1/hosts/{id}/filesystem`):\ncreating a directory mutates the host filesystem, so it needs\n`use` (owner, admin, or a `use`+ grantee), and \u2014 like\nbrowse \u2014 this is NOT scoped to a session. The workspace-boundary\ncheck still runs at session-create time, so creating a directory\nhere does not by itself grant an agent access to it.\n\n**Parameters**\n\n- `body` \u2014 Request body carrying the absolute (or tilde-prefixed) `path` to create.\n\n**Returns:** `{\"object\": \"directory\", \"path\": \"<created abs path>\"}`.\n\n**Raises**\n\n- `HTTPException` \u2014 404 if host not found, 403 if the caller lacks `use`, 409 if host is offline or the directory could not be created (already exists / permission denied), 400 on path validation, 504 on host timeout, 502 on host I/O failure.",
         "operationId": "create_host_directory_v1_hosts__host_id__directories_post",
         "parameters": [
           {
@@ -6855,9 +6893,183 @@
         ]
       }
     },
+    "/v1/hosts/{host_id}/permissions": {
+      "get": {
+        "description": "List the grants on a host.\n\nRequires owner / admin / `manage` access.\n\n**Returns:** `{\"permissions\": [{\"user_id\", \"level\"}, ...]}`.\n\n**Raises**\n\n- `HTTPException` \u2014 404 unknown host, 403 insufficient access.",
+        "operationId": "list_host_permissions_v1_hosts__host_id__permissions_get",
+        "parameters": [
+          {
+            "description": "Host identifier.",
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "items": {
+                      "additionalProperties": true,
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "title": "Response List Host Permissions V1 Hosts  Host Id  Permissions Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Host Permissions",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
+    "/v1/hosts/{host_id}/permissions/{user_id}": {
+      "delete": {
+        "description": "Revoke a user's access to a host.\n\nRequires owner / admin / `manage` access. Idempotent: revoking\na non-existent grant returns `{\"revoked\": false}`.\n\n**Returns:** `{\"revoked\": bool}`.\n\n**Raises**\n\n- `HTTPException` \u2014 404 unknown host, 403 insufficient access.",
+        "operationId": "delete_host_permission_v1_hosts__host_id__permissions__user_id__delete",
+        "parameters": [
+          {
+            "description": "Host identifier.",
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "The grantee to revoke.",
+            "in": "path",
+            "name": "user_id",
+            "required": true,
+            "schema": {
+              "title": "User Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "boolean"
+                  },
+                  "title": "Response Delete Host Permission V1 Hosts  Host Id  Permissions  User Id  Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Host Permission",
+        "tags": [
+          "hosts"
+        ]
+      },
+      "put": {
+        "description": "Grant or update a user's access to a host.\n\nRequires owner / admin / `manage` access. The grantee gets the\nrequested `view` / `use` / `manage` level (an existing\ngrant is upgraded or downgraded in place).\n\n**Parameters**\n\n- `body` \u2014 The level to set.\n\n**Returns:** `{\"user_id\", \"host_id\", \"level\"}` for the grant.\n\n**Raises**\n\n- `HTTPException` \u2014 404 unknown host, 403 insufficient access, 400 invalid level or granting to the host owner.",
+        "operationId": "set_host_permission_v1_hosts__host_id__permissions__user_id__put",
+        "parameters": [
+          {
+            "description": "Host identifier.",
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "The grantee to set access for.",
+            "in": "path",
+            "name": "user_id",
+            "required": true,
+            "schema": {
+              "title": "User Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetHostPermissionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Set Host Permission V1 Hosts  Host Id  Permissions  User Id  Put",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Host Permission",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
     "/v1/hosts/{host_id}/runners": {
       "post": {
-        "description": "Launch a runner on a host for a session.\n\nGenerates a binding token, writes the expected runner_id\nto the session row, sends the launch command to the host,\nand waits for the host's acknowledgement.\n\n**Parameters**\n\n- `body` \u2014 Launch request with `session_id` and `workspace`.\n\n**Returns:** `{\"runner_id\": ..., \"status\": \"launching\"}`.\n\n**Raises**\n\n- `HTTPException` \u2014 404 if host not found, 409 if host offline, 403 if caller doesn't own the host, 400 if session already has a runner.",
+        "description": "Launch a runner on a host for a session.\n\nGenerates a binding token, writes the expected runner_id\nto the session row, sends the launch command to the host,\nand waits for the host's acknowledgement.\n\n**Parameters**\n\n- `body` \u2014 Launch request with `session_id` and `workspace`.\n\n**Returns:** `{\"runner_id\": ..., \"status\": \"launching\"}`.\n\n**Raises**\n\n- `HTTPException` \u2014 404 if host not found, 409 if host offline, 403 if caller lacks `use` on the host, 400 if session already has a runner.",
         "operationId": "launch_runner_v1_hosts__host_id__runners_post",
         "parameters": [
           {
@@ -6906,6 +7118,54 @@
           }
         },
         "summary": "Launch Runner",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
+    "/v1/hosts/{host_id}/shutdown": {
+      "post": {
+        "description": "Shut down a host: terminate its runners and exit the daemon.\n\nOwner-or-admin gated. Sends `host.shutdown` over the tunnel;\nthe daemon terminates its runners and exits instead of\nreconnecting, and the tunnel's existing disconnect path then\nderegisters the connection and marks the host offline in the DB.\nFire-and-forget: the offline flip lands via that disconnect\npath, so callers observe it on their next poll.\n\n**Returns:** `{\"status\": \"shutting_down\"}`.\n\n**Raises**\n\n- `HTTPException` \u2014 404 unknown host, 403 when the caller is neither the owner nor an admin, 400 for server-managed sandbox hosts, 409 when the host has no live connection.",
+        "operationId": "shutdown_host_v1_hosts__host_id__shutdown_post",
+        "parameters": [
+          {
+            "description": "Host to shut down, e.g. `\"host_a1b2c3d4...\"`.",
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "title": "Response Shutdown Host V1 Hosts  Host Id  Shutdown Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Shutdown Host",
         "tags": [
           "hosts"
         ]
@@ -7441,7 +7701,7 @@
     },
     "/v1/sessions": {
       "get": {
-        "description": "List sessions with cursor-based pagination.\n\nSessions are conversations with a non-`None` `agent_id`\n\u2014 i.e. those created via `POST /v1/sessions`.\nConversations without an agent binding are excluded.\n\n**Returns:** A `PaginatedList` of `SessionListItem`.",
+        "description": "List sessions with cursor-based pagination.\n\nSessions are conversations with a non-`None` `agent_id`\n\u2014 i.e. those created via `POST /v1/sessions`.\nConversations without an agent binding are excluded.\n\nWith `?all=true` (admin only) the per-user ACL filter is\ndropped and sessions across **every** owner are returned \u2014 the\nadmin fleet view, mirroring `GET /v1/hosts?all=true`. Each item\nalready carries `host_id`, `runner_id`, and `owner` so an\nadmin can see which host/owner every session belongs to. Fails\nclosed: a non-admin passing `all=true` gets 403 rather than a\nsilently owner-filtered response they might mistake for the fleet.\nThe read is audited (`session.fleet.list`) since it discloses\nevery owner's sessions.\n\n**Returns:** A `PaginatedList` of `SessionListItem`.\n\n**Raises**\n\n- `HTTPException` \u2014 403 when `all=true` and the caller is not an admin.",
         "operationId": "list_sessions_v1_sessions_get",
         "parameters": [
           {
@@ -7603,6 +7863,17 @@
                 }
               ],
               "title": "Project"
+            }
+          },
+          {
+            "description": "When `True`, return sessions across every owner (requires admin) \u2014 the admin fleet view. `False` (default) scopes to the caller's own/shared sessions.",
+            "in": "query",
+            "name": "all",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "All",
+              "type": "boolean"
             }
           }
         ],

@@ -24,6 +24,7 @@ from sqlalchemy.orm import Session
 from omnigent.db.db_models import (
     SqlConversationMetadata,
     SqlHost,
+    SqlHostPermission,
     current_workspace_id,
 )
 from omnigent.db.enum_codecs import decode_host_status, encode_host_status
@@ -597,6 +598,51 @@ class HostStore:
             )
             return [_row_to_host(row) for row in rows]
 
+    def list_all_hosts(self) -> list[Host]:
+        """
+        List every registered host across all owners.
+
+        Backs the admin fleet view (``GET /v1/hosts?all=true``) — the
+        caller is responsible for admin-gating; this read has no
+        authorization of its own. Ordered like :meth:`list_hosts`
+        (``updated_at`` descending, most recently active first).
+
+        :returns: List of :class:`Host` entities for every owner.
+        """
+        with self._session() as session:
+            rows = session.query(SqlHost).order_by(SqlHost.updated_at.desc()).all()
+            return [_row_to_host(row) for row in rows]
+
+    def list_hosts_for(self, user_id: str) -> list[Host]:
+        """
+        List hosts the user owns OR has been granted access to.
+
+        Returns owned hosts plus every host with a row in
+        ``host_permissions`` for *user_id* (any level — the lowest,
+        ``view``, already grants visibility). One query: an owner match
+        OR a ``host_id`` in the user's grant set. Ordered by
+        ``updated_at`` descending, same as :meth:`list_hosts`. Admin
+        visibility is NOT expanded here — an admin sees their own hosts
+        in the picker; admin bypass applies to per-host access checks,
+        not to enumerating every user's host (the fleet view,
+        :meth:`list_all_hosts`, is the explicit admin read).
+
+        :param user_id: The viewing user, e.g.
+            ``"alice@example.com"``.
+        :returns: List of :class:`Host` entities the user may see.
+        """
+        with self._session() as session:
+            granted_host_ids = select(SqlHostPermission.host_id).where(
+                SqlHostPermission.user_id == user_id
+            )
+            rows = (
+                session.query(SqlHost)
+                .filter((SqlHost.owner == user_id) | (SqlHost.host_id.in_(granted_host_ids)))
+                .order_by(SqlHost.updated_at.desc())
+                .all()
+            )
+            return [_row_to_host(row) for row in rows]
+
     def get_host(self, host_id: str) -> Host | None:
         """
         Fetch a single host by ID.
@@ -740,9 +786,10 @@ class HostStore:
         Managed-host teardown: removes the host from the picker AND
         revokes its launch token in one operation (the row IS the
         credential). Explicitly nulls ``conversations.host_id`` for any
-        sessions still bound to this host — the DB no longer cascades
-        this via FK. No-op when the row does not exist — deletion is
-        invoked from best-effort cleanup paths that may race.
+        sessions still bound to this host and deletes the host's sharing
+        grants — the DB no longer cascades either via FK. No-op when the
+        row does not exist — deletion is invoked from best-effort cleanup
+        paths that may race.
 
         :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
         """
@@ -754,6 +801,11 @@ class HostStore:
                     SqlConversationMetadata.host_id == host_id,
                 )
                 .values(host_id=None)
+            )
+            session.execute(
+                sql_delete(SqlHostPermission).where(
+                    SqlHostPermission.host_id == host_id,
+                )
             )
             session.execute(
                 sql_delete(SqlHost).where(

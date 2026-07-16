@@ -37,6 +37,9 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+from omnigent.stores.host_permission_store.sqlalchemy_store import (
+    SqlAlchemyHostPermissionStore,
+)
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import (
     SqlAlchemyPermissionStore,
@@ -208,6 +211,7 @@ def host_perm_app(
         permission_store=SqlAlchemyPermissionStore(db_uri),
         auth_provider=create_auth_provider(),
         host_store=HostStore(db_uri),
+        host_permission_store=SqlAlchemyHostPermissionStore(db_uri),
     )
 
 
@@ -1116,6 +1120,69 @@ async def test_admin_user_bypasses_permission_checks(
     )
     assert resp.status_code == 200, (
         f"admin user should be able to list permissions, got {resp.status_code}."
+    )
+
+
+# ── Admin fleet view: GET /v1/sessions?all=true ──────────────────
+
+
+async def test_fleet_view_admin_sees_all_owners_sessions(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """``?all=true`` as admin returns sessions across every owner.
+
+    Without the fleet view an admin's plain list is still ACL-scoped to
+    their own/shared sessions; this proves the flag drops that filter so
+    the admin sees the whole fleet, with each item carrying its owner.
+    """
+    agent = await create_test_agent(auth_client, user="bryan")
+    # Two sessions owned by two different, unrelated users.
+    await _create_session_as(auth_client, agent["id"], "user-a", title="a-session")
+    await _create_session_as(auth_client, agent["id"], "user-b", title="b-session")
+
+    perm_store = SqlAlchemyPermissionStore(db_uri)
+    perm_store.ensure_user("admin-user", is_admin=True)
+
+    # Plain list as admin-user: no grants, so it sees none of the two.
+    scoped = await _list_sessions_as(auth_client, "admin-user")
+    scoped_titles = {s.get("title") for s in scoped}
+    assert "a-session" not in scoped_titles
+    assert "b-session" not in scoped_titles
+
+    # Fleet view: both owners' sessions appear.
+    resp = await auth_client.get(
+        "/v1/sessions?all=true",
+        headers={"X-Forwarded-Email": "admin-user"},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()["data"]
+    titles = {s.get("title") for s in data}
+    assert "a-session" in titles
+    assert "b-session" in titles
+    # Owner is surfaced so an admin can attribute each session.
+    owners = {s.get("owner") for s in data}
+    assert "user-a" in owners
+    assert "user-b" in owners
+
+
+async def test_fleet_view_non_admin_forbidden(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    """``?all=true`` from a non-admin fails closed with 403.
+
+    A regression here would silently return an owner-scoped list the
+    caller might mistake for the full fleet.
+    """
+    agent = await create_test_agent(auth_client, user="bryan")
+    await _create_session_as(auth_client, agent["id"], "user-a")
+
+    resp = await auth_client.get(
+        "/v1/sessions?all=true",
+        headers={"X-Forwarded-Email": "user-a"},
+    )
+    assert resp.status_code == 403, (
+        f"non-admin all=true must be 403, got {resp.status_code}: {resp.text}"
     )
 
 

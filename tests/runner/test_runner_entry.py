@@ -44,6 +44,20 @@ from omnigent.runner.transports.ws_tunnel.serve import RUNNER_TUNNEL_REJECTION_P
 importlib.import_module("mcp.client.streamable_http")
 
 
+@pytest.fixture(autouse=True)
+def _reset_captured_binding_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Clear the process-global binding-token cache before each test.
+
+    ``_runner_tunnel_binding_token_from_env`` caches the token on first read so
+    it survives the post-startup env scrub. That cache is module-global, so a
+    test that sets a token would otherwise leak it into a later test asserting
+    "no token". Reset it per test for isolation.
+    """
+    import omnigent.runner._entry as _entry
+
+    monkeypatch.setattr(_entry, "_CAPTURED_BINDING_TOKEN", None)
+
+
 class _TrackingTerminalRegistry:
     """TerminalRegistry stand-in that records shutdown calls."""
 
@@ -220,6 +234,109 @@ def test_make_auth_token_factory_uses_managed_mint_when_only_binding_token(
 
     assert factory is not None
     assert factory() == "managed-jwt"
+
+
+def test_make_auth_token_factory_flag_does_not_force_mint_over_user_cred(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Flag set does NOT force the owner-JWT mint for the tunnel/callback bearer.
+
+    The prefer flag drives the binding-token HEADER on the callback client
+    (feature 002), NOT a token mint here. Forcing the mint would break the
+    tunnel bearer in header mode (the mint 302s/400s → runner_failed_to_start).
+    So even with the flag set, an available inherited credential still wins in
+    _make_auth_token_factory; the header path grants read separately.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :returns: None.
+    """
+    from omnigent.inner.databricks_executor import _DatabricksBearerAuth
+
+    class _Cfg:
+        def authenticate(self) -> dict[str, str]:
+            return {"Authorization": "Bearer inherited-host-owner-token"}
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "https://omnigent.example.com")
+    monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "binding-token")
+    monkeypatch.setenv("OMNIGENT_RUNNER_PREFER_BINDING_TOKEN_MINT", "1")
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    monkeypatch.setattr(
+        "omnigent.inner.databricks_executor._resolve_databricks_auth",
+        lambda profile=None: (_DatabricksBearerAuth(_Cfg(), profile_name=None), "https://ex.test"),
+    )
+
+    factory = _make_auth_token_factory()
+
+    assert factory is not None
+    # Inherited credential still wins — the flag did NOT force a mint.
+    assert factory() == "inherited-host-owner-token"
+
+
+def test_make_auth_token_factory_flag_unset_keeps_user_cred_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Flag UNSET keeps today's order (user credential first), even with a token.
+
+    Owner-on-own-host (US2 regression guard): the server never sets the
+    flag when session owner == host owner, so the runner must use its
+    inherited credential exactly as before — not mint.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :returns: None.
+    """
+    from omnigent.inner.databricks_executor import _DatabricksBearerAuth
+
+    class _Cfg:
+        def authenticate(self) -> dict[str, str]:
+            return {"Authorization": "Bearer inherited-token"}
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "https://omnigent.example.com")
+    monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "binding-token")
+    monkeypatch.delenv("OMNIGENT_RUNNER_PREFER_BINDING_TOKEN_MINT", raising=False)
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    monkeypatch.setattr(
+        "omnigent.inner.databricks_executor._resolve_databricks_auth",
+        lambda profile=None: (_DatabricksBearerAuth(_Cfg(), profile_name=None), "https://ex.test"),
+    )
+
+    factory = _make_auth_token_factory()
+
+    assert factory is not None
+    assert factory() == "inherited-token"
+
+
+def test_make_auth_token_factory_flag_set_no_binding_token_safe_degrade(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Flag set but NO binding token → fall through, do not crash (FR-007).
+
+    Safe degrade: if the runner is told to prefer the mint but has no
+    binding token to mint against, it must fall back to the normal order
+    (here, the inherited credential) rather than raising and aborting the
+    launch.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :returns: None.
+    """
+    from omnigent.inner.databricks_executor import _DatabricksBearerAuth
+
+    class _Cfg:
+        def authenticate(self) -> dict[str, str]:
+            return {"Authorization": "Bearer fallback-token"}
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "https://omnigent.example.com")
+    monkeypatch.delenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", raising=False)
+    monkeypatch.setenv("OMNIGENT_RUNNER_PREFER_BINDING_TOKEN_MINT", "1")
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    monkeypatch.setattr(
+        "omnigent.inner.databricks_executor._resolve_databricks_auth",
+        lambda profile=None: (_DatabricksBearerAuth(_Cfg(), profile_name=None), "https://ex.test"),
+    )
+
+    factory = _make_auth_token_factory()
+
+    assert factory is not None
+    assert factory() == "fallback-token"
 
 
 def test_make_auth_token_factory_none_without_creds_or_binding_token(
@@ -798,6 +915,9 @@ def test_runner_tunnel_binding_token_from_env_returns_none_without_token(
     :param monkeypatch: Pytest environment patch fixture.
     :returns: None.
     """
+    import omnigent.runner._entry as _entry
+
+    monkeypatch.setattr(_entry, "_CAPTURED_BINDING_TOKEN", None)
     monkeypatch.delenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", raising=False)
 
     assert _runner_tunnel_binding_token_from_env() is None
@@ -811,6 +931,9 @@ def test_runner_tunnel_binding_token_from_env_rejects_empty_token(
     :param monkeypatch: Pytest environment patch fixture.
     :returns: None.
     """
+    import omnigent.runner._entry as _entry
+
+    monkeypatch.setattr(_entry, "_CAPTURED_BINDING_TOKEN", None)
     monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "  ")
 
     with pytest.raises(RuntimeError, match="must not be empty"):
@@ -825,8 +948,32 @@ def test_runner_tunnel_binding_token_from_env_strips_value(
     :param monkeypatch: Pytest environment patch fixture.
     :returns: None.
     """
+    import omnigent.runner._entry as _entry
+
+    monkeypatch.setattr(_entry, "_CAPTURED_BINDING_TOKEN", None)
     monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", " bind-token ")
 
+    assert _runner_tunnel_binding_token_from_env() == "bind-token"
+
+
+def test_runner_tunnel_binding_token_survives_env_scrub(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The token, captured on first read, survives a later os.environ scrub.
+
+    The sandbox launcher / child-spawn scrubbers pop the binding token from
+    ``os.environ`` after startup. A later in-process reader (e.g. the pi
+    terminal auto-create building the extension config) must still get it from
+    the captured value, or the extension's POST /events self-access 404-masks.
+    """
+    import omnigent.runner._entry as _entry
+
+    monkeypatch.setattr(_entry, "_CAPTURED_BINDING_TOKEN", None)
+    # First read at startup, before any scrub — populates the cache.
+    monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "bind-token")
+    assert _runner_tunnel_binding_token_from_env() == "bind-token"
+    # Env scrubbed (token popped) — the reader must fall back to the capture.
+    monkeypatch.delenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", raising=False)
     assert _runner_tunnel_binding_token_from_env() == "bind-token"
 
 
@@ -1641,3 +1788,75 @@ def test_agent_cache_dest_normal_id_round_trips(tmp_path: Path) -> None:
     dest = _agent_cache_dest(cache_root, "ag_abc123", "3")
 
     assert dest == cache_root / "ag_abc123-v3"
+
+
+def _run_create_app_capturing_client_headers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict[str, str]:
+    """Drive create_app() with fakes and return the server_client headers.
+
+    Monkeypatches httpx.AsyncClient to capture the headers kwarg the runner's
+    callback client is built with, plus the minimal set of runner dependencies
+    so create_app() constructs without real I/O.
+    """
+    import omnigent.runner._entry as entry_mod
+
+    captured: dict[str, dict[str, str]] = {}
+
+    class _CapturingAsyncClient:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            del args
+            captured["headers"] = dict(kwargs.get("headers") or {})
+
+        async def aclose(self) -> None:
+            pass
+
+    class _FakePM:
+        def __init__(self) -> None: ...
+        async def start(self) -> None: ...
+        async def shutdown(self) -> None: ...
+
+    def _tr_factory(*, conversation_link_base_url: str | None = None) -> _TrackingTerminalRegistry:
+        return _TrackingTerminalRegistry(conversation_link_base_url=conversation_link_base_url)
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://runner.test")
+    monkeypatch.setattr(entry_mod.httpx, "AsyncClient", _CapturingAsyncClient)
+    monkeypatch.setattr(entry_mod.httpx, "Client", _TrackingSyncClient)
+    monkeypatch.setattr(entry_mod, "_make_auth_token_factory", lambda: None)
+    monkeypatch.setattr(
+        "omnigent.runtime.harnesses.process_manager.HarnessProcessManager", _FakePM
+    )
+    monkeypatch.setattr("omnigent.terminals.TerminalRegistry", _tr_factory)
+    monkeypatch.setattr("omnigent.runner.identity.get_stable_runner_id", lambda: "runner-test-id")
+    entry_mod.create_app()
+    return captured["headers"]
+
+
+def test_server_client_attaches_binding_token_when_prefer_flag_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the prefer flag + a binding token, the callback client sends the
+    tunnel-token header (feature 002 — header-mode guest access)."""
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER
+
+    monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "bind-tok-123")
+    monkeypatch.setenv("OMNIGENT_RUNNER_PREFER_BINDING_TOKEN_MINT", "1")
+
+    headers = _run_create_app_capturing_client_headers(monkeypatch)
+
+    assert headers.get(RUNNER_TUNNEL_TOKEN_HEADER) == "bind-tok-123"
+
+
+def test_server_client_omits_binding_token_without_prefer_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without the prefer flag, the callback client does NOT send the tunnel
+    token (own-host / ordinary runs are unchanged)."""
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER
+
+    monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "bind-tok-123")
+    monkeypatch.delenv("OMNIGENT_RUNNER_PREFER_BINDING_TOKEN_MINT", raising=False)
+
+    headers = _run_create_app_capturing_client_headers(monkeypatch)
+
+    assert RUNNER_TUNNEL_TOKEN_HEADER not in headers

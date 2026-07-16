@@ -130,6 +130,10 @@ class PiNativeExecutor(Executor):
                 # per-turn refresh preserves the workspace / deployment routing
                 # selectors baked at launch (see runner/app.py). A bearer-only
                 # refresh would drop them and re-break routing after the first turn.
+                # refresh_config_auth_headers MERGES over the existing authHeaders,
+                # so the guest-on-shared-host X-Omnigent-Runner-Tunnel-Token written
+                # at launch also survives (this worker's env has the token scrubbed,
+                # so we can't re-supply it â the merge keeps the chat-mirror grant).
                 refresh_config_auth_headers(
                     self._bridge_dir,
                     databricks_request_headers(

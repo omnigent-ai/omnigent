@@ -121,6 +121,30 @@ def policy_hook_wrapper_script(server_url: str, session_id: str, hook_script_pat
     factory = _make_auth_token_factory(server_url=server_url)
     token = factory() if factory is not None else None
     auth_headers = databricks_request_headers(server_url, bearer_token=token)
+    # Guest-on-shared-host: when the server flagged this runner as serving a
+    # session whose host it doesn't own (a shared/externally-owned host such as
+    # a CoDA Databricks App), the baked SP bearer clears the ingress but has no
+    # user grant on the guest's conversation, so the hook's POST to
+    # /v1/sessions/{id}/policies/evaluate 404s. post_evaluate_with_retry then
+    # returns no response and the hook FAILS CLOSED — blocking every tool call
+    # ("tools don't work in Hermes"). Attach the tunnel binding token so the
+    # server's runner self-access check matches the token-derived runner id
+    # against the session's runner_id and authorizes the evaluate. Gated on the
+    # same flag the transcript forwarder uses, so it isn't sent on own-host runs.
+    # Mirrors the pi-/claude-/hermes-native forwarder auth.
+    try:
+        from omnigent.runner._entry import _runner_tunnel_binding_token_from_env
+        from omnigent.runner.identity import (
+            RUNNER_PREFER_BINDING_TOKEN_MINT_ENV_VAR,
+            RUNNER_TUNNEL_TOKEN_HEADER,
+        )
+
+        if os.environ.get(RUNNER_PREFER_BINDING_TOKEN_MINT_ENV_VAR):
+            _binding_token = _runner_tunnel_binding_token_from_env()
+            if _binding_token:
+                auth_headers[RUNNER_TUNNEL_TOKEN_HEADER] = _binding_token
+    except Exception:  # noqa: BLE001 — best effort; own-host / import failure = no header
+        pass
     return (
         "#!/bin/sh\n"
         f"export _OMNIGENT_SERVER_URL={shlex.quote(server_url)}\n"

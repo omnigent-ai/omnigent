@@ -1158,6 +1158,53 @@ class SqlHost(OmnigentBase):
     )
 
 
+class SqlHostPermission(OmnigentBase):
+    """
+    SQLAlchemy model for the ``host_permissions`` table.
+
+    Junction table mapping ``(user_id, host_id)`` to a numeric
+    permission level, sharing a host the user does not own with them.
+    PK is ``(user_id, host_id)`` — optimized for the hot path ("list
+    hosts I can access" = prefix scan on ``user_id``). The host owner
+    (``hosts.owner``) and admins need no row — owner/admin access is
+    resolved by :func:`omnigent.server.host_permissions.check_host_access`,
+    not stored here.
+
+    The FK targets the durable ``hosts.host_id`` UNIQUE column (not the
+    ``(owner, name)`` primary key), so a grant survives an ``(owner,
+    name)`` change across host identity rotation / re-owning. Unlike
+    ``session_permissions`` there is no ``"__public__"`` sentinel: host
+    sharing is explicit per-user opt-in (see ``spec`` SR-007).
+
+    :param user_id: The grantee, e.g. ``"alice@example.com"``.
+    :param host_id: The host being shared, e.g. ``"host_a1b2c3d4..."``.
+    :param level: Numeric permission level: ``1`` = view, ``2`` = use,
+        ``3`` = manage. Each level subsumes the ones below it
+        (comparison is ``>=``).
+    :param created_at: Unix epoch seconds the grant was created.
+    :param updated_at: Unix epoch seconds the grant was last changed.
+    :param created_by: User ID that created the grant (admin or a
+        manage-level grantee), or ``None`` when unattributed.
+    """
+
+    __tablename__ = "host_permissions"
+
+    # No DB foreign keys (Rule R032): the application owns referential
+    # cleanup — HostStore.delete_host removes a host's grants, mirroring
+    # how it nulls conversations.host_id.
+    user_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    host_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    level: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint("level IN (1, 2, 3)", name="ck_host_permissions_level"),
+        Index("ix_host_permissions_host_id", "host_id"),
+    )
+
+
 class SqlUserDailyCost(OmnigentBase):
     """
     SQLAlchemy model for the ``user_daily_cost`` table.

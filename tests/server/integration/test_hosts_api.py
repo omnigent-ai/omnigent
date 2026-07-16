@@ -13,6 +13,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from httpx import ASGITransport, AsyncClient
 
+from omnigent.db.utils import now_epoch
 from omnigent.host.frames import (
     HostHelloFrame,
     HostLaunchRunnerResultFrame,
@@ -25,6 +26,9 @@ from omnigent.server.routes.host_tunnel import create_host_tunnel_router
 from omnigent.server.routes.hosts import create_hosts_router
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
+)
+from omnigent.stores.host_permission_store.sqlalchemy_store import (
+    SqlAlchemyHostPermissionStore,
 )
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
@@ -88,13 +92,20 @@ def host_api_app(
     registry = HostRegistry()
     host_store = HostStore(db_uri)
     conv_store = SqlAlchemyConversationStore(db_uri)
+    host_permission_store = SqlAlchemyHostPermissionStore(db_uri)
     app = FastAPI()
+    app.state.host_permission_store = host_permission_store
     app.include_router(
         create_host_tunnel_router(registry, host_store),
         prefix="/v1",
     )
     app.include_router(
-        create_hosts_router(registry, host_store, conv_store),
+        create_hosts_router(
+            registry,
+            host_store,
+            conv_store,
+            host_permission_store=host_permission_store,
+        ),
         prefix="/v1",
     )
     return app, registry, host_store, conv_store
@@ -335,9 +346,15 @@ async def test_list_and_get_host_report_online_from_other_replica(
     registry_a = HostRegistry()
     host_store_a = HostStore(db_uri)
     conv_store_a = SqlAlchemyConversationStore(db_uri)
+    host_permission_store_a = SqlAlchemyHostPermissionStore(db_uri)
     app_a = FastAPI()
     app_a.include_router(
-        create_hosts_router(registry_a, host_store_a, conv_store_a),
+        create_hosts_router(
+            registry_a,
+            host_store_a,
+            conv_store_a,
+            host_permission_store=host_permission_store_a,
+        ),
         prefix="/v1",
     )
     assert registry_a.get(_HOST_ID) is None, (
@@ -661,10 +678,32 @@ def multi_user_app(
     host_store = HostStore(db_uri)
     conv_store = SqlAlchemyConversationStore(db_uri)
     permission_store = SqlAlchemyPermissionStore(db_uri)
+    host_permission_store = SqlAlchemyHostPermissionStore(db_uri)
     auth = _StubAuthProvider()
     app = FastAPI()
-    # Stash the permission store so tests can set up session grants.
+    # Stash the stores so tests can set up session and host grants.
     app.state.permission_store = permission_store
+    app.state.host_permission_store = host_permission_store
+
+    # Same OmnigentError → JSON handler create_app installs, so auth
+    # failures (require_user raises OmnigentError, not HTTPException)
+    # surface as 401 responses instead of raising through the client.
+    from omnigent.errors import OmnigentError
+
+    @app.exception_handler(OmnigentError)
+    async def _handle_omnigent_error(request: object, exc: OmnigentError) -> JSONResponse:
+        """Convert OmnigentError to the production JSON error shape.
+
+        :param request: The incoming request (unused).
+        :param exc: The application error raised by the route.
+        :returns: The same JSON body create_app's handler produces.
+        """
+        del request
+        return JSONResponse(
+            status_code=exc.http_status,
+            content={"error": {"code": exc.code, "message": exc.message}},
+        )
+
     app.include_router(
         # local_single_user=False: this fixture models a deployed
         # multi-user server, so host_id re-own must be refused (the
@@ -683,6 +722,7 @@ def multi_user_app(
             conv_store,
             auth_provider=auth,
             permission_store=permission_store,
+            host_permission_store=host_permission_store,
         ),
         prefix="/v1",
     )
@@ -823,6 +863,7 @@ async def test_launch_runner_validates_workspace_boundary(
     registry = HostRegistry()
     host_store = HostStore(db_uri)
     conv_store = SqlAlchemyConversationStore(db_uri)
+    host_permission_store = SqlAlchemyHostPermissionStore(db_uri)
     agent_store = SqlAlchemyAgentStore(db_uri)
     artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
     agent_cache = AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache")
@@ -835,6 +876,7 @@ async def test_launch_runner_validates_workspace_boundary(
             registry,
             host_store,
             conv_store,
+            host_permission_store=host_permission_store,
             agent_store=agent_store,
             agent_cache=agent_cache,
         ),
@@ -986,6 +1028,7 @@ async def test_resolve_host_launch_enforces_host_and_session_ownership(
     host_store = HostStore(db_uri)
     conv_store = SqlAlchemyConversationStore(db_uri)
     perm = SqlAlchemyPermissionStore(db_uri)
+    host_perm = SqlAlchemyHostPermissionStore(db_uri)
 
     # Alice owns an online host and a session.
     host_store.upsert_on_connect(
@@ -1001,6 +1044,7 @@ async def test_resolve_host_launch_enforces_host_and_session_ownership(
         "host_registry": registry,
         "conversation_store": conv_store,
         "permission_store": perm,
+        "host_permission_store": host_perm,
     }
 
     # Happy path: Alice owns both → returns the resolved target.
@@ -1255,3 +1299,581 @@ async def test_runner_exited_invokes_callback_with_runner_and_error(
 
     # The callback got the exact runner id and error string off the frame.
     assert received == [("runner_x", "exited with code 1")]
+
+
+# ── Admin fleet view (?all=true) ────────────────────────
+
+
+async def test_list_all_hosts_admin_sees_every_owner(
+    multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """
+    Verify GET /v1/hosts?all=true returns every owner's hosts to an
+    admin, with the fleet-only fields (created_at, last_seen,
+    session_count) present.
+    """
+    app, _reg, host_store, conv_store = multi_user_app
+    perm_store: SqlAlchemyPermissionStore = app.state.permission_store
+    perm_store.ensure_user("admin@test.com", is_admin=True)
+    host_store.upsert_on_connect("host_fleet_a", "alice-laptop", "alice@test.com")
+    host_store.upsert_on_connect("host_fleet_b", "bob-laptop", "bob@test.com")
+    # Two sessions bound to alice's host so session_count has signal.
+    for _ in range(2):
+        conv = conv_store.create_conversation(agent_id=None)
+        conv_store.set_host_id(conv.id, "host_fleet_a", "/tmp/ws")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get(
+            "/v1/hosts",
+            params={"all": "true"},
+            headers={"x-test-user": "admin@test.com"},
+        )
+    assert resp.status_code == 200
+    hosts = {h["host_id"]: h for h in resp.json()["hosts"]}
+    assert {"host_fleet_a", "host_fleet_b"} <= set(hosts), (
+        f"Admin should see every owner's hosts, got {set(hosts)}."
+    )
+    fleet_a = hosts["host_fleet_a"]
+    assert fleet_a["owner"] == "alice@test.com"
+    assert fleet_a["session_count"] == 2
+    assert isinstance(fleet_a["created_at"], int)
+    assert isinstance(fleet_a["last_seen"], int)
+
+
+async def test_list_all_hosts_403_non_admin(
+    multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """
+    Verify GET /v1/hosts?all=true fails closed (403) for a non-admin —
+    NOT a silently owner-filtered 200 they could mistake for the fleet.
+    """
+    app, _reg, host_store, _cs = multi_user_app
+    host_store.upsert_on_connect("host_fleet_c", "alice-laptop", "alice@test.com")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get(
+            "/v1/hosts",
+            params={"all": "true"},
+            headers={"x-test-user": "bob@test.com"},
+        )
+    assert resp.status_code == 403, (
+        f"Expected 403 for non-admin ?all=true, got {resp.status_code}. "
+        "The admin fleet view must fail closed."
+    )
+
+
+async def test_list_all_hosts_plain_list_unchanged_for_admin(
+    multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """
+    Verify the default (no ?all) listing stays owner-scoped even for
+    an admin, and carries none of the fleet-only fields — the picker
+    payload is unchanged by the admin feature (additive/opt-in).
+    """
+    app, _reg, host_store, _cs = multi_user_app
+    perm_store: SqlAlchemyPermissionStore = app.state.permission_store
+    perm_store.ensure_user("admin@test.com", is_admin=True)
+    host_store.upsert_on_connect("host_fleet_d", "alice-laptop", "alice@test.com")
+    host_store.upsert_on_connect("host_fleet_e", "admin-laptop", "admin@test.com")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get(
+            "/v1/hosts",
+            headers={"x-test-user": "admin@test.com"},
+        )
+    assert resp.status_code == 200
+    hosts = resp.json()["hosts"]
+    assert {h["host_id"] for h in hosts} == {"host_fleet_e"}
+    assert "session_count" not in hosts[0]
+    assert "last_seen" not in hosts[0]
+
+
+# ── Host shutdown (POST /v1/hosts/{id}/shutdown) ────────────────────────
+
+
+def _register_live_conn(registry: HostRegistry, host_id: str, owner: str) -> object:
+    """Register a fake live connection so send_text enqueues frames.
+
+    :param registry: The registry under test.
+    :param host_id: Host identifier to register.
+    :param owner: Owner identity for the connection.
+    :returns: The registered HostConnection (queue readable by tests).
+    """
+    hello = HostHelloFrame(version="0", frame_protocol_version=1, name=host_id)
+    return registry.register(host_id, ws=object(), hello=hello, owner=owner)
+
+
+async def test_shutdown_host_owner_sends_frame(
+    multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """
+    Verify the owner can shut their host down: 200, and a
+    host.shutdown frame is enqueued on the host's tunnel.
+    """
+    import json as _json
+
+    app, registry, host_store, _cs = multi_user_app
+    host_store.upsert_on_connect("host_shut_a", "alice-laptop", "alice@test.com")
+    conn = _register_live_conn(registry, "host_shut_a", "alice@test.com")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            "/v1/hosts/host_shut_a/shutdown",
+            headers={"x-test-user": "alice@test.com"},
+        )
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "shutting_down"}
+    frame = _json.loads(conn.outbound_queue.get_nowait())
+    assert frame["kind"] == "host.shutdown"
+    assert "alice@test.com" in frame["reason"]
+
+
+async def test_shutdown_host_admin_non_owner_allowed(
+    multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """
+    Verify an admin who does NOT own the host can still shut it down
+    (the operator reclaim path).
+    """
+    app, registry, host_store, _cs = multi_user_app
+    perm_store: SqlAlchemyPermissionStore = app.state.permission_store
+    perm_store.ensure_user("admin@test.com", is_admin=True)
+    host_store.upsert_on_connect("host_shut_b", "alice-laptop", "alice@test.com")
+    _register_live_conn(registry, "host_shut_b", "alice@test.com")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            "/v1/hosts/host_shut_b/shutdown",
+            headers={"x-test-user": "admin@test.com"},
+        )
+    assert resp.status_code == 200
+
+
+async def test_shutdown_host_403_non_owner_non_admin(
+    multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """
+    Verify shutdown fails closed for a caller who is neither the owner
+    nor an admin — and no frame reaches the host.
+    """
+    app, registry, host_store, _cs = multi_user_app
+    host_store.upsert_on_connect("host_shut_c", "alice-laptop", "alice@test.com")
+    conn = _register_live_conn(registry, "host_shut_c", "alice@test.com")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            "/v1/hosts/host_shut_c/shutdown",
+            headers={"x-test-user": "bob@test.com"},
+        )
+    assert resp.status_code == 403
+    assert conn.outbound_queue.empty(), "No shutdown frame may be sent on a refused request"
+
+
+async def test_shutdown_host_409_offline(
+    multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """
+    Verify shutdown returns 409 when the host has no live tunnel —
+    there is nothing to signal.
+    """
+    app, _reg, host_store, _cs = multi_user_app
+    host_store.upsert_on_connect("host_shut_d", "alice-laptop", "alice@test.com")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            "/v1/hosts/host_shut_d/shutdown",
+            headers={"x-test-user": "alice@test.com"},
+        )
+    assert resp.status_code == 409
+
+
+async def test_shutdown_host_404_unknown(
+    multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """Verify shutdown returns 404 for an unknown host id."""
+    app, _reg, _hs, _cs = multi_user_app
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            "/v1/hosts/host_nonexistent/shutdown",
+            headers={"x-test-user": "alice@test.com"},
+        )
+    assert resp.status_code == 404
+
+
+async def test_shutdown_host_400_managed_sandbox(
+    multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """
+    Verify shutdown refuses managed sandbox hosts (400) — they are
+    torn down via the provider API, not a daemon-exit frame.
+    """
+    app, registry, host_store, _cs = multi_user_app
+    host_store.register_managed_host(
+        host_id="host_shut_e",
+        name="sandbox-e",
+        owner="alice@test.com",
+        token="tok-shut-e",
+        provider="modal",
+        sandbox_id="sb-1",
+        token_expires_at=now_epoch() + 3600,
+    )
+    _register_live_conn(registry, "host_shut_e", "alice@test.com")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            "/v1/hosts/host_shut_e/shutdown",
+            headers={"x-test-user": "alice@test.com"},
+        )
+    assert resp.status_code == 400
+
+
+# ── Host sharing (shared visibility for SP-owned hosts) ───────────
+# Covers the feature spec acceptance criteria AC-002..AC-007: shared
+# hosts appear in /v1/hosts, a `view` grantee can read but not browse
+# or launch, a `use` grantee can, non-granted users are blocked, and
+# only owner/admin/manage can mutate grants.
+
+
+def _grant_host(app: FastAPI, user_id: str, host_id: str, level: int) -> None:
+    """Seed a host grant directly via the app's host permission store.
+
+    :param app: The multi_user_app FastAPI instance.
+    :param user_id: Grantee user id.
+    :param host_id: Host to share.
+    :param level: Host level (1=view, 2=use, 3=manage).
+    """
+    # The grantee must exist as a users row for the FK to hold.
+    app.state.permission_store.ensure_user(user_id)
+    app.state.host_permission_store.grant(user_id, host_id, level)
+
+
+async def test_shared_host_appears_in_list_for_grantee(
+    multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """AC-002: /v1/hosts returns owned + shared, excludes unshared third-party.
+
+    Alice owns one host and is granted `use` on the SP-owned host; she
+    sees both. Bob's unrelated host stays hidden from her.
+    """
+    app, _reg, host_store, _cs = multi_user_app
+    host_store.upsert_on_connect("host_alice", "alice-laptop", "alice@test.com")
+    host_store.upsert_on_connect("host_sp", "coda-app", "app-sp@example")
+    host_store.upsert_on_connect("host_bob", "bob-laptop", "bob@test.com")
+    _grant_host(app, "alice@test.com", "host_sp", 2)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get("/v1/hosts", headers={"x-test-user": "alice@test.com"})
+    assert resp.status_code == 200
+    hosts = {h["host_id"]: h for h in resp.json()["hosts"]}
+    assert set(hosts) == {"host_alice", "host_sp"}, (
+        f"Alice should see her host plus the shared SP host, got {set(hosts)}."
+    )
+    # The owned host is flagged owned; the shared host is flagged shared
+    # with a `use` level so the UI can label and gate it.
+    assert hosts["host_alice"]["owned_by_current_user"] is True
+    assert hosts["host_alice"]["permission_level"] == "owner"
+    assert hosts["host_sp"]["owned_by_current_user"] is False
+    assert hosts["host_sp"]["permission_level"] == "use"
+
+
+async def test_view_grantee_can_read_host(
+    multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """AC-003: GET /v1/hosts/{id} allows a `view` grantee."""
+    app, _reg, host_store, _cs = multi_user_app
+    host_store.upsert_on_connect("host_sp", "coda-app", "app-sp@example")
+    _grant_host(app, "alice@test.com", "host_sp", 1)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get("/v1/hosts/host_sp", headers={"x-test-user": "alice@test.com"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["host_id"] == "host_sp"
+    assert body["owned_by_current_user"] is False
+    assert body["permission_level"] == "view"
+
+
+async def test_filesystem_rejects_view_allows_use(
+    multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """AC-004: filesystem browsing rejects `view`, allows `use`.
+
+    A `view` grantee is 403 on the filesystem endpoint. A `use`
+    grantee gets past the access check (the host is offline here, so
+    the call then 409s — proving auth passed, not the browse itself).
+    """
+    app, _reg, host_store, _cs = multi_user_app
+    host_store.upsert_on_connect("host_sp", "coda-app", "app-sp@example")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        # view grantee → 403
+        _grant_host(app, "viewer@test.com", "host_sp", 1)
+        resp = await client.get(
+            "/v1/hosts/host_sp/filesystem", headers={"x-test-user": "viewer@test.com"}
+        )
+        assert resp.status_code == 403, (
+            "A view-only grantee must not browse the host filesystem (SR-002)."
+        )
+
+        # use grantee → passes the access check; host offline → 409.
+        _grant_host(app, "user@test.com", "host_sp", 2)
+        resp = await client.get(
+            "/v1/hosts/host_sp/filesystem", headers={"x-test-user": "user@test.com"}
+        )
+        assert resp.status_code == 409, (
+            f"A use grantee should pass auth and hit 'host offline' (409); got {resp.status_code}."
+        )
+
+
+async def test_nongranted_user_blocked_everywhere(
+    multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """AC-006: a non-granted user cannot list, read, or browse another's host."""
+    app, _reg, host_store, _cs = multi_user_app
+    host_store.upsert_on_connect("host_sp", "coda-app", "app-sp@example")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        # Not in the list.
+        resp = await client.get("/v1/hosts", headers={"x-test-user": "stranger@test.com"})
+        assert resp.json()["hosts"] == []
+        # Read → 403.
+        resp = await client.get("/v1/hosts/host_sp", headers={"x-test-user": "stranger@test.com"})
+        assert resp.status_code == 403
+        # Browse → 403.
+        resp = await client.get(
+            "/v1/hosts/host_sp/filesystem", headers={"x-test-user": "stranger@test.com"}
+        )
+        assert resp.status_code == 403
+
+
+async def test_only_owner_or_manage_can_grant(
+    multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """AC-007: only owner/admin/manage may grant or revoke host access."""
+    app, _reg, host_store, _cs = multi_user_app
+    host_store.upsert_on_connect("host_sp", "coda-app", "app-sp@example")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        # A `use` grantee cannot grant to others.
+        _grant_host(app, "user@test.com", "host_sp", 2)
+        resp = await client.put(
+            "/v1/hosts/host_sp/permissions/victim@test.com",
+            json={"level": "view"},
+            headers={"x-test-user": "user@test.com"},
+        )
+        assert resp.status_code == 403, "A `use` grantee must not be able to grant."
+
+        # The owner can grant.
+        resp = await client.put(
+            "/v1/hosts/host_sp/permissions/alice@test.com",
+            json={"level": "manage"},
+            headers={"x-test-user": "app-sp@example"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["level"] == "manage"
+
+        # The `manage` grantee can now grant further (FR-016a chain).
+        resp = await client.put(
+            "/v1/hosts/host_sp/permissions/bob@test.com",
+            json={"level": "use"},
+            headers={"x-test-user": "alice@test.com"},
+        )
+        assert resp.status_code == 200
+
+        # The grant is visible in the permissions listing.
+        resp = await client.get(
+            "/v1/hosts/host_sp/permissions", headers={"x-test-user": "app-sp@example"}
+        )
+        assert resp.status_code == 200
+        levels = {p["user_id"]: p["level"] for p in resp.json()["permissions"]}
+        # user@test.com was seeded `use` at the top of the test; alice and
+        # bob were granted above. All three legitimate grants are listed.
+        assert levels == {
+            "user@test.com": "use",
+            "alice@test.com": "manage",
+            "bob@test.com": "use",
+        }
+
+        # Revoke works and is reflected.
+        resp = await client.delete(
+            "/v1/hosts/host_sp/permissions/bob@test.com",
+            headers={"x-test-user": "app-sp@example"},
+        )
+        assert resp.status_code == 200 and resp.json()["revoked"] is True
+
+
+async def test_cannot_grant_to_owner_or_unknown_level(
+    multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """Granting to the owner, or an invalid level, is a 400."""
+    app, _reg, host_store, _cs = multi_user_app
+    host_store.upsert_on_connect("host_sp", "coda-app", "app-sp@example")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.put(
+            "/v1/hosts/host_sp/permissions/app-sp@example",
+            json={"level": "view"},
+            headers={"x-test-user": "app-sp@example"},
+        )
+        assert resp.status_code == 400, "Granting to the host owner is meaningless."
+
+        resp = await client.put(
+            "/v1/hosts/host_sp/permissions/alice@test.com",
+            json={"level": "owner"},
+            headers={"x-test-user": "app-sp@example"},
+        )
+        assert resp.status_code == 400, "`owner` is not a grantable level."
+
+
+async def test_private_hosts_stay_private_with_no_grants(
+    multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """AC-001 semantics: with no grants, each user sees only their own host."""
+    app, _reg, host_store, _cs = multi_user_app
+    host_store.upsert_on_connect("host_alice", "alice-laptop", "alice@test.com")
+    host_store.upsert_on_connect("host_bob", "bob-laptop", "bob@test.com")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get("/v1/hosts", headers={"x-test-user": "alice@test.com"})
+        assert {h["host_id"] for h in resp.json()["hosts"]} == {"host_alice"}
+
+
+# ── M6 hardening: unauthenticated fail-closed + audit trail ─────────
+
+
+async def test_new_endpoints_401_unauthenticated(
+    multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """
+    Every new endpoint fails closed with 401 when the caller presents
+    no identity at all (auth provider configured, header absent) — an
+    anonymous caller must never fall through to the single-user path.
+    """
+    app, registry, host_store, _cs = multi_user_app
+    host_store.upsert_on_connect("host_hard_a", "alice-laptop", "alice@test.com")
+    _register_live_conn(registry, "host_hard_a", "alice@test.com")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        for method, url, kwargs in [
+            ("GET", "/v1/hosts?all=true", {}),
+            ("POST", "/v1/hosts/host_hard_a/shutdown", {}),
+            ("GET", "/v1/hosts/host_hard_a/permissions", {}),
+            ("PUT", "/v1/hosts/host_hard_a/permissions/bob@test.com", {"json": {"level": "use"}}),
+            ("DELETE", "/v1/hosts/host_hard_a/permissions/bob@test.com", {}),
+        ]:
+            resp = await client.request(method, url, **kwargs)
+            assert resp.status_code == 401, (
+                f"{method} {url} must 401 for an unauthenticated caller, got {resp.status_code}"
+            )
+
+
+async def test_stranger_cannot_read_grant_list(
+    multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """
+    GET /v1/hosts/{id}/permissions fails closed (403) for a caller with
+    no manage-level access — the grant list names principals and must
+    not be enumerable by a mere `use` grantee or a stranger.
+    """
+    app, _reg, host_store, _cs = multi_user_app
+    host_store.upsert_on_connect("host_hard_b", "alice-laptop", "alice@test.com")
+    _grant_host(app, "user@test.com", "host_hard_b", 2)  # use, not manage
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        for caller in ("stranger@test.com", "user@test.com"):
+            resp = await client.get(
+                "/v1/hosts/host_hard_b/permissions",
+                headers={"x-test-user": caller},
+            )
+            assert resp.status_code == 403, f"{caller} must not read the grant list"
+
+
+async def test_audit_trail_for_shutdown_grant_revoke(
+    multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    Shutdown, grant, and revoke each emit an omnigent.audit entry
+    carrying actor + target (C-N3), so an operator can reconstruct who
+    did what from the server log alone.
+    """
+    import json as _json
+
+    app, registry, host_store, _cs = multi_user_app
+    host_store.upsert_on_connect("host_hard_c", "alice-laptop", "alice@test.com")
+    _register_live_conn(registry, "host_hard_c", "alice@test.com")
+
+    with caplog.at_level("INFO", logger="omnigent.audit"):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            await client.put(
+                "/v1/hosts/host_hard_c/permissions/bob@test.com",
+                json={"level": "use"},
+                headers={"x-test-user": "alice@test.com"},
+            )
+            await client.delete(
+                "/v1/hosts/host_hard_c/permissions/bob@test.com",
+                headers={"x-test-user": "alice@test.com"},
+            )
+            await client.post(
+                "/v1/hosts/host_hard_c/shutdown",
+                headers={"x-test-user": "alice@test.com"},
+            )
+
+    entries = [
+        _json.loads(r.message.removeprefix("audit: "))
+        for r in caplog.records
+        if r.name == "omnigent.audit"
+    ]
+    by_action = {e["action"]: e for e in entries}
+    assert set(by_action) == {
+        "host.permission.grant",
+        "host.permission.revoke",
+        "host.shutdown",
+    }
+    for entry in entries:
+        assert entry["actor"] == "alice@test.com"
+        assert entry["target"] == "host_hard_c"
+    assert by_action["host.permission.grant"]["principal"] == "bob@test.com"
+    assert by_action["host.permission.grant"]["level"] == "use"
+    assert by_action["host.permission.revoke"]["principal"] == "bob@test.com"
+
+
+async def test_audit_trail_for_fleet_view(
+    multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    The admin fleet enumeration (?all=true) is a security-relevant read
+    across every owner, so it emits an omnigent.audit entry with the
+    actor and a host count — an owner-scoped listing does NOT.
+    """
+    import json as _json
+
+    app, _reg, host_store, _cs = multi_user_app
+    perm_store: SqlAlchemyPermissionStore = app.state.permission_store
+    perm_store.ensure_user("admin@test.com", is_admin=True)
+    host_store.upsert_on_connect("host_fleet_audit_a", "alice-laptop", "alice@test.com")
+    host_store.upsert_on_connect("host_fleet_audit_b", "bob-laptop", "bob@test.com")
+
+    with caplog.at_level("INFO", logger="omnigent.audit"):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            # Owner-scoped read: no audit.
+            await client.get("/v1/hosts", headers={"x-test-user": "alice@test.com"})
+            # Fleet read: audited.
+            await client.get(
+                "/v1/hosts",
+                params={"all": "true"},
+                headers={"x-test-user": "admin@test.com"},
+            )
+
+    entries = [
+        _json.loads(r.message.removeprefix("audit: "))
+        for r in caplog.records
+        if r.name == "omnigent.audit"
+    ]
+    fleet_entries = [e for e in entries if e["action"] == "host.fleet.list"]
+    assert len(fleet_entries) == 1, (
+        f"expected exactly one fleet-list audit entry, got {[e['action'] for e in entries]}"
+    )
+    assert fleet_entries[0]["actor"] == "admin@test.com"
+    assert fleet_entries[0]["host_count"] >= 2

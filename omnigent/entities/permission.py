@@ -22,6 +22,32 @@ class SessionPermission:
     level: int
 
 
+@dataclasses.dataclass
+class HostPermission:
+    """A single permission grant on a host.
+
+    Shares a host the grantee does not own with them. The host owner
+    and admins need no grant — their access is resolved by
+    :func:`omnigent.server.host_permissions.check_host_access`.
+
+    :param user_id: The grantee, e.g. ``"alice@example.com"``.
+    :param host_id: The host this grant applies to, e.g.
+        ``"host_a1b2c3d4..."``.
+    :param level: Numeric permission level: ``1`` = view, ``2`` = use,
+        ``3`` = manage. Comparison is ``>=``.
+    :param created_at: Unix epoch seconds the grant was created.
+    :param updated_at: Unix epoch seconds the grant was last changed.
+    :param created_by: User ID that created the grant, or ``None``.
+    """
+
+    user_id: str
+    host_id: str
+    level: int
+    created_at: int
+    updated_at: int
+    created_by: str | None = None
+
+
 @dataclasses.dataclass(frozen=True)
 class ResolvedAccess:
     """The raw permission inputs for one ``(user, conversation)`` pair.

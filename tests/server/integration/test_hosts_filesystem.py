@@ -35,6 +35,9 @@ from omnigent.server.routes.hosts import create_hosts_router
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
+from omnigent.stores.host_permission_store.sqlalchemy_store import (
+    SqlAlchemyHostPermissionStore,
+)
 from omnigent.stores.host_store import HostStore
 
 # Interim: any test using the ``fs_setup`` mock host tunnel can flake
@@ -99,13 +102,19 @@ def fs_app(
     registry = HostRegistry()
     host_store = HostStore(db_uri)
     conv_store = SqlAlchemyConversationStore(db_uri)
+    host_permission_store = SqlAlchemyHostPermissionStore(db_uri)
     app = FastAPI()
     app.include_router(
         create_host_tunnel_router(registry, host_store),
         prefix="/v1",
     )
     app.include_router(
-        create_hosts_router(registry, host_store, conv_store),
+        create_hosts_router(
+            registry,
+            host_store,
+            conv_store,
+            host_permission_store=host_permission_store,
+        ),
         prefix="/v1",
     )
     return app, registry, host_store, conv_store
@@ -469,6 +478,7 @@ async def test_list_filesystem_nul_byte_in_path_returns_400(
 
 async def test_list_filesystem_owner_check_blocks_other_users(
     fs_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    db_uri: str,
 ) -> None:
     """
     Verify the owner check returns 403 when an authenticated caller
@@ -503,6 +513,7 @@ async def test_list_filesystem_owner_check_blocks_other_users(
     auth = _Stub()
     auth_app = FastAPI()
     registry = HostRegistry()
+    host_permission_store = SqlAlchemyHostPermissionStore(db_uri)
     auth_app.include_router(
         create_host_tunnel_router(registry, host_store, auth_provider=auth),
         prefix="/v1",
@@ -513,6 +524,7 @@ async def test_list_filesystem_owner_check_blocks_other_users(
             host_store,
             conv_store,
             auth_provider=auth,
+            host_permission_store=host_permission_store,
         ),
         prefix="/v1",
     )

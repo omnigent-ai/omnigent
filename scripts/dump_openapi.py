@@ -327,6 +327,9 @@ def _build_app_with_stub_stores() -> Any:
         SqlAlchemyConversationStore,
     )
     from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+    from omnigent.stores.host_permission_store.sqlalchemy_store import (
+        SqlAlchemyHostPermissionStore,
+    )
     from omnigent.stores.host_store import HostStore
     from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
 
@@ -348,6 +351,7 @@ def _build_app_with_stub_stores() -> Any:
         ),
         # Pass stores so conditionally-mounted routes stay in the spec.
         host_store=HostStore(db_uri),
+        host_permission_store=SqlAlchemyHostPermissionStore(db_uri),
         policy_store=SqlAlchemyPolicyStore(db_uri),
     )
 
