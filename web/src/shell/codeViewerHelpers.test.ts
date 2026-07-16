@@ -7,6 +7,7 @@ import {
   isBinaryPath,
   isImageFile,
   isNotebookPath,
+  isPdfFile,
   lineOverlapsSelection,
   openHtmlArtifactInNewTab,
   prepareHtmlPreviewDoc,
@@ -175,6 +176,42 @@ describe("isImageFile", () => {
 
   it("treats extension-less paths with no content type as non-image", () => {
     expect(isImageFile("Dockerfile")).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// isPdfFile — PDF-preview detection (MIME-first, extension fallback)
+// ---------------------------------------------------------------------------
+
+describe("isPdfFile", () => {
+  it("classifies a .pdf by extension", () => {
+    expect(isPdfFile("report.pdf")).toBe(true);
+  });
+
+  it.each(["app.py", "logo.png", "notes.txt", "archive.zip"])(
+    "classifies %s as non-pdf by extension",
+    (path) => {
+      expect(isPdfFile(path)).toBe(false);
+    },
+  );
+
+  it("is case-insensitive on the extension", () => {
+    expect(isPdfFile("REPORT.PDF")).toBe(true);
+  });
+
+  it("treats a content type as authoritative over the extension", () => {
+    // A misleading/extension-less name still previews when the server says PDF.
+    expect(isPdfFile("blob", "application/pdf")).toBe(true);
+    expect(isPdfFile("data.bin", "application/pdf")).toBe(true);
+    // ...and a .pdf extension is overridden by a non-pdf content type.
+    expect(isPdfFile("report.pdf", "text/plain")).toBe(false);
+    expect(isPdfFile("report.pdf", "application/octet-stream")).toBe(false);
+  });
+
+  it("falls back to the extension when content type is null/undefined", () => {
+    expect(isPdfFile("report.pdf", null)).toBe(true);
+    expect(isPdfFile("report.pdf", undefined)).toBe(true);
+    expect(isPdfFile("notes.txt", null)).toBe(false);
   });
 });
 

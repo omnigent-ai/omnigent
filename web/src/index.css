@@ -1122,6 +1122,15 @@
   border-radius: 2px;
 }
 
+/* Find-in-file matches in the markdown editor — all matches dim, current match strong */
+.md-search-match {
+  background-color: color-mix(in oklch, var(--warning) 30%, transparent);
+  border-radius: 2px;
+}
+.md-search-match-current {
+  background-color: color-mix(in oklch, var(--warning) 70%, transparent);
+}
+
 /* TipTap editor prose styling */
 .tiptap-md-content .ProseMirror {
   outline: none;
