@@ -3083,3 +3083,111 @@ def test_credential_label_bedrock_not_duplicated() -> None:
 
     assert credential_label(BEDROCK_KIND, "bedrock") == "AWS Bedrock"
     assert credential_label(BEDROCK_KIND, "nexus") == "AWS Bedrock (nexus)"
+
+
+def _cp1252_console():
+    """Build a Rich console whose file encodes as cp1252, like a legacy Windows shell.
+
+    :returns: A ``(console, buffer)`` pair; decode *buffer* as cp1252 after
+        flushing the console's file to read what was rendered.
+    """
+    import io
+
+    from rich.console import Console
+
+    buffer = io.BytesIO()
+    stream = io.TextIOWrapper(buffer, encoding="cp1252", newline="")
+    return Console(file=stream, force_terminal=True, width=100), buffer
+
+
+@pytest.mark.parametrize(
+    "kind", ["key", "subscription", "gateway", "local", "databricks", "cli-config", "bedrock"]
+)
+def test_kind_glyph_falls_back_to_ascii_on_non_utf8_console(
+    kind: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On a cp1252 console every kind glyph degrades to an encodable 2-cell token.
+
+    A legacy-codepage Windows console cannot encode the emoji glyphs, and the
+    raw write raises UnicodeEncodeError. The fallback must both survive the
+    encode and keep the listing's columns aligned (2 display cells, same as
+    the emoji it replaces).
+    """
+    from omnigent.inner.banner import _display_width
+
+    legacy, _ = _cp1252_console()
+    monkeypatch.setattr("omnigent.onboarding.configure_models.console", legacy)
+
+    glyph = kind_glyph(kind)
+    glyph.encode("cp1252")  # raises UnicodeEncodeError if the fallback didn't kick in
+    assert _display_width(glyph) == 2, f"fallback for {kind!r} must stay 2 cells; got {glyph!r}"
+
+
+def test_kind_glyph_keeps_emoji_on_utf8_console(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A UTF-8 console still gets the real emoji — the fallback is Windows-only fallout."""
+    import io
+
+    from rich.console import Console
+
+    from omnigent.onboarding.configure_models import _KIND_GLYPH
+
+    utf8 = Console(file=io.TextIOWrapper(io.BytesIO(), encoding="utf-8"), force_terminal=True)
+    monkeypatch.setattr("omnigent.onboarding.configure_models.console", utf8)
+
+    for kind, expected in _KIND_GLYPH.items():
+        assert kind_glyph(kind) == expected
+
+
+def test_render_listing_by_harness_survives_non_utf8_console(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``config list`` renders on a cp1252 console instead of dying on the glyph.
+
+    Reproduces the Windows crash: the shared console's file encodes with the
+    legacy ANSI codepage, so writing the emoji kind glyph raised
+    UnicodeEncodeError and aborted the whole command.
+    """
+    from omnigent.onboarding.configure_models import render_provider_listing_by_harness
+    from omnigent.onboarding.provider_config import load_providers
+
+    legacy, buffer = _cp1252_console()
+    monkeypatch.setattr("omnigent.onboarding.configure_models.console", legacy)
+
+    config: dict[str, object] = {
+        "providers": {"claude-subscription": {"kind": "subscription", "cli": "claude"}}
+    }
+    render_provider_listing_by_harness(config, load_providers(config))
+
+    legacy.file.flush()
+    out = buffer.getvalue().decode("cp1252")
+    assert "claude-subscription" in out
+    assert "subscription" in out
+
+
+def test_render_listing_survives_non_utf8_console(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The flat provider listing survives a legacy-codepage console too."""
+    from omnigent.onboarding.configure_models import render_provider_listing
+    from omnigent.onboarding.provider_config import load_providers
+
+    legacy, buffer = _cp1252_console()
+    monkeypatch.setattr("omnigent.onboarding.configure_models.console", legacy)
+
+    config: dict[str, object] = {
+        "providers": {"claude-subscription": {"kind": "subscription", "cli": "claude"}}
+    }
+    render_provider_listing(config, load_providers(config), [])
+
+    legacy.file.flush()
+    out = buffer.getvalue().decode("cp1252")
+    assert "claude-subscription" in out
+
+
+def test_add_menu_labels_survive_non_utf8_console(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The ``+ Add a credential`` menu labels are cp1252-encodable as well."""
+    from omnigent.onboarding.configure_models import add_menu_options
+
+    legacy, _ = _cp1252_console()
+    monkeypatch.setattr("omnigent.onboarding.configure_models.console", legacy)
+
+    for option in add_menu_options():
+        option.label.encode("cp1252")

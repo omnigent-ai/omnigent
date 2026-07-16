@@ -1386,6 +1386,30 @@ def _should_skip_update_check(argv: list[str]) -> bool:
     }
 
 
+def _ensure_utf8_stdio() -> None:
+    """Force UTF-8 on Windows stdio so emoji output can't abort a command.
+
+    A Windows shell on a legacy ANSI codepage (e.g. cp1252) hands Python
+    stdio streams that can't encode the provider-kind glyphs, so a plain
+    ``print`` raises ``UnicodeEncodeError`` mid-command. Reconfiguring the
+    already-open streams to UTF-8 with ``errors="replace"`` keeps output
+    flowing; ``PYTHONUTF8`` can't help here since PEP 540 reads it only at
+    interpreter startup.
+    """
+    if sys.platform != "win32":
+        return
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        if (getattr(stream, "encoding", "") or "").lower() in {"utf-8", "utf8"}:
+            continue
+        # Detached/replaced streams (or a test's capture object) can't be
+        # reconfigured; the glyph fallback still guards the actual writes.
+        with contextlib.suppress(ValueError, OSError):
+            reconfigure(encoding="utf-8", errors="replace")
+
+
 def main() -> None:
     """
     Console-script entry point for ``omnigent``.
@@ -1410,6 +1434,10 @@ def main() -> None:
     cwd = os.getcwd()
     if cwd not in sys.path:
         sys.path.insert(0, cwd)
+
+    # Legacy-codepage Windows stdio can't encode the provider glyphs; force
+    # UTF-8 before any command renders so the write doesn't abort.
+    _ensure_utf8_stdio()
 
     # Relocate pre-rename ~/.omniagents state before anything reads ~/.omnigent
     # (update-check cache, diagnostics logs, config). No-op once migrated.

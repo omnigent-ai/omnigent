@@ -30,7 +30,7 @@ from dataclasses import dataclass
 
 from omnigent.onboarding.ambient import DetectedProvider
 from omnigent.onboarding.databricks_config import databricks_sdk_installed
-from omnigent.onboarding.interactive import ACCENT, console
+from omnigent.onboarding.interactive import ACCENT, console, encodable
 from omnigent.onboarding.provider_config import (
     ANTHROPIC_FAMILY,
     BEDROCK_KIND,
@@ -48,9 +48,9 @@ from omnigent.onboarding.provider_config import (
     surface_default_provider,
 )
 
-# A short glyph per kind for the grouped listing. ASCII-safe fallbacks are
-# not needed — the rest of the REPL/CLI already emits emoji freely — but
-# the glyph is purely decorative: the kind word follows it.
+# A short glyph per kind for the grouped listing. The glyph is purely
+# decorative — the kind word follows it — and degrades to an ASCII stand-in
+# (see _KIND_ASCII_GLYPH) on a console that can't encode emoji.
 # The ADMISSION TICKETS glyph (subscription) carries a VARIATION SELECTOR-16 so
 # terminals render it as a 2-cell emoji (matching 🔑 / 🌐 / 🧱 and the 🎟️ in
 # README.oss.md) instead of a cramped 1-cell text glyph — that VS16, not extra
@@ -68,6 +68,21 @@ _KIND_GLYPH: dict[str, str] = {
     CLI_CONFIG_KIND: "\N{GEAR}\N{VARIATION SELECTOR-16}",
     # CLOUD for Bedrock-style gateways (AWS Bedrock, corporate AI gateways)
     BEDROCK_KIND: "\N{CLOUD}",
+}
+
+
+# Stand-ins for a console whose encoding can't carry the emoji above — a
+# Windows shell on a legacy ANSI codepage (cp1252) raises UnicodeEncodeError
+# on the write instead of rendering it. Each token is 2 ASCII cells, matching
+# the emoji's display width so the listing's columns stay aligned.
+_KIND_ASCII_GLYPH: dict[str, str] = {
+    KEY_KIND: "Ky",
+    SUBSCRIPTION_KIND: "Sb",
+    GATEWAY_KIND: "Gw",
+    LOCAL_KIND: "Lc",
+    DATABRICKS_KIND: "Db",
+    CLI_CONFIG_KIND: "Cf",
+    BEDROCK_KIND: "Cl",
 }
 
 
@@ -290,12 +305,19 @@ def kind_glyph(kind: str) -> str:
     subscription ticket via its VARIATION SELECTOR-16), so a single space
     separates it from the following label.
 
+    A console that can't encode the emoji — a Windows shell on a legacy
+    ANSI codepage — gets the kind's 2-cell ASCII stand-in instead, so the
+    listing degrades rather than dying on the write.
+
     :param kind: A provider kind, e.g. ``"key"``, ``"subscription"``,
         ``"gateway"``, ``"local"``, or ``"databricks"``.
     :returns: The kind's glyph (e.g. ``"🔑"`` for ``"key"``), or an
         empty string for an unknown kind.
     """
-    return _KIND_GLYPH.get(kind, "")
+    glyph = _KIND_GLYPH.get(kind, "")
+    if glyph and not encodable(glyph, console):
+        return _KIND_ASCII_GLYPH.get(kind, "")
+    return glyph
 
 
 def credential_label(
@@ -417,7 +439,7 @@ def add_menu_options() -> list[AddOption]:
     def _opt(text: str, description: str, kind: str, **kw: object) -> AddOption:
         """Build an :class:`AddOption` whose label is glyph-prefixed for *kind*."""
         return AddOption(
-            label=f"{_KIND_GLYPH[kind]} {text}",
+            label=f"{kind_glyph(kind)} {text}",
             description=description,
             kind=kind,
             **kw,  # type: ignore[arg-type]  # provider/cli/other forwarded to AddOption
@@ -618,7 +640,7 @@ def render_provider_listing_by_harness(
             console.print("    [dim](none configured)[/dim]")
             continue
         for name, entry in serving:
-            glyph = _KIND_GLYPH.get(entry.kind, "")
+            glyph = kind_glyph(entry.kind)
             kind_style = _KIND_STYLE.get(entry.kind, "white")
             summary = _entry_models_summary(entry)
             line = (
@@ -715,7 +737,7 @@ def render_provider_listing(
     if providers:
         console.print(f"[{ACCENT}]Configured providers[/]")
         for name, entry in providers.items():
-            glyph = _KIND_GLYPH.get(entry.kind, "")
+            glyph = kind_glyph(entry.kind)
             kind_style = _KIND_STYLE.get(entry.kind, "white")
             summary = _entry_models_summary(entry)
             default_families = _provider_default_families(entry, config)
