@@ -45,7 +45,7 @@ def test_create_returns_scheduled_task_with_all_fields(
         scheduled_task_id=_uid("st_1"),
         name="nightly triage",
         prompt="Triage the inbox",
-        cron_expression="0 9 * * *",
+        rrule="FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
         owner_user_id="alice@example.com",
         agent_id=_uid("ag_abc"),
         timezone="America/Los_Angeles",
@@ -59,7 +59,7 @@ def test_create_returns_scheduled_task_with_all_fields(
     assert task.id == _uid("st_1")
     assert task.name == "nightly triage"
     assert task.prompt == "Triage the inbox"
-    assert task.cron_expression == "0 9 * * *"
+    assert task.rrule == "FREQ=DAILY;BYHOUR=9;BYMINUTE=0"
     assert task.owner_user_id == "alice@example.com"
     assert task.agent_id == _uid("ag_abc")
     assert task.timezone == "America/Los_Angeles"
@@ -82,7 +82,7 @@ def test_create_minimal_defaults(store: SqlAlchemyScheduledTaskStore) -> None:
         scheduled_task_id=_uid("st_min"),
         name="minimal",
         prompt="do a thing",
-        cron_expression="* * * * *",
+        rrule="FREQ=MINUTELY",
         owner_user_id="bob@example.com",
         agent_id=_uid("ag_min"),
         timezone="UTC",
@@ -109,7 +109,7 @@ def test_state_round_trips_as_string(store: SqlAlchemyScheduledTaskStore) -> Non
             scheduled_task_id=_uid(f"st_state_{i}"),
             name="n",
             prompt="p",
-            cron_expression="* * * * *",
+            rrule="FREQ=MINUTELY",
             owner_user_id="u",
             agent_id=_uid("ag"),
             timezone="UTC",
@@ -126,7 +126,7 @@ def test_create_rejects_invalid_state(store: SqlAlchemyScheduledTaskStore) -> No
             scheduled_task_id=_uid("st_badstate"),
             name="n",
             prompt="p",
-            cron_expression="* * * * *",
+            rrule="FREQ=MINUTELY",
             owner_user_id="u",
             agent_id=_uid("ag"),
             timezone="UTC",
@@ -148,7 +148,7 @@ def test_execution_target_round_trips_as_string(store: SqlAlchemyScheduledTaskSt
             scheduled_task_id=_uid(f"st_target_{i}"),
             name="n",
             prompt="p",
-            cron_expression="* * * * *",
+            rrule="FREQ=MINUTELY",
             owner_user_id="u",
             agent_id=_uid("ag"),
             timezone="UTC",
@@ -165,7 +165,7 @@ def test_create_rejects_invalid_execution_target(store: SqlAlchemyScheduledTaskS
             scheduled_task_id=_uid("st_badtarget"),
             name="n",
             prompt="p",
-            cron_expression="* * * * *",
+            rrule="FREQ=MINUTELY",
             owner_user_id="u",
             agent_id=_uid("ag"),
             timezone="UTC",
@@ -181,7 +181,7 @@ def test_update_execution_target_and_host_id_read_back(
         scheduled_task_id=_uid("st_upd_target"),
         name="n",
         prompt="p",
-        cron_expression="* * * * *",
+        rrule="FREQ=MINUTELY",
         owner_user_id="u",
         agent_id=_uid("ag"),
         timezone="UTC",
@@ -200,7 +200,7 @@ def test_update_state_reads_back(store: SqlAlchemyScheduledTaskStore) -> None:
         scheduled_task_id=_uid("st_upd_state"),
         name="n",
         prompt="p",
-        cron_expression="* * * * *",
+        rrule="FREQ=MINUTELY",
         owner_user_id="u",
         agent_id=_uid("ag"),
         timezone="UTC",
@@ -210,37 +210,37 @@ def test_update_state_reads_back(store: SqlAlchemyScheduledTaskStore) -> None:
     assert updated.state == "paused"
 
 
-# ── recurring trigger (cron_expression) ───────────────────────────────────────
+# ── recurring trigger (rrule) ─────────────────────────────────────────────────
 
 
 def test_create_recurring_task(store: SqlAlchemyScheduledTaskStore) -> None:
-    """A recurring task sets ``cron_expression``."""
+    """A recurring task sets ``rrule``."""
     task = store.create(
         scheduled_task_id=_uid("st_recur"),
         name="recurring",
         prompt="p",
-        cron_expression="0 9 * * *",
+        rrule="FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
         owner_user_id="u",
         agent_id=_uid("ag"),
         timezone="UTC",
     )
-    assert task.cron_expression == "0 9 * * *"
+    assert task.rrule == "FREQ=DAILY;BYHOUR=9;BYMINUTE=0"
 
 
-def test_update_changes_cron_expression(store: SqlAlchemyScheduledTaskStore) -> None:
-    """Updating with a new ``cron_expression`` reschedules the recurring trigger."""
+def test_update_changes_rrule(store: SqlAlchemyScheduledTaskStore) -> None:
+    """Updating with a new ``rrule`` reschedules the recurring trigger."""
     store.create(
         scheduled_task_id=_uid("st_recron"),
         name="n",
         prompt="p",
-        cron_expression="0 9 * * *",
+        rrule="FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
         owner_user_id="u",
         agent_id=_uid("ag"),
         timezone="UTC",
     )
-    updated = store.update(_uid("st_recron"), cron_expression="0 0 * * *")
+    updated = store.update(_uid("st_recron"), rrule="FREQ=DAILY;BYHOUR=0;BYMINUTE=0")
     assert updated is not None
-    assert updated.cron_expression == "0 0 * * *"
+    assert updated.rrule == "FREQ=DAILY;BYHOUR=0;BYMINUTE=0"
 
 
 def test_get_returns_created_task(store: SqlAlchemyScheduledTaskStore) -> None:
@@ -249,7 +249,7 @@ def test_get_returns_created_task(store: SqlAlchemyScheduledTaskStore) -> None:
         scheduled_task_id=_uid("st_get"),
         name="n",
         prompt="p",
-        cron_expression="* * * * *",
+        rrule="FREQ=MINUTELY",
         owner_user_id="u",
         agent_id=_uid("ag_1"),
         timezone="UTC",
@@ -281,7 +281,7 @@ def test_list_orders_by_created_at_then_id(store: SqlAlchemyScheduledTaskStore) 
         scheduled_task_id=id_a,
         name="a",
         prompt="p",
-        cron_expression="* * * * *",
+        rrule="FREQ=MINUTELY",
         owner_user_id="u",
         agent_id=_uid("ag"),
         timezone="UTC",
@@ -290,7 +290,7 @@ def test_list_orders_by_created_at_then_id(store: SqlAlchemyScheduledTaskStore) 
         scheduled_task_id=id_b,
         name="b",
         prompt="p",
-        cron_expression="* * * * *",
+        rrule="FREQ=MINUTELY",
         owner_user_id="u",
         agent_id=_uid("ag"),
         timezone="UTC",
@@ -305,7 +305,7 @@ def test_list_active_excludes_non_active(store: SqlAlchemyScheduledTaskStore) ->
         scheduled_task_id=_uid("st_active"),
         name="active",
         prompt="p",
-        cron_expression="* * * * *",
+        rrule="FREQ=MINUTELY",
         owner_user_id="u",
         agent_id=_uid("ag"),
         timezone="UTC",
@@ -316,7 +316,7 @@ def test_list_active_excludes_non_active(store: SqlAlchemyScheduledTaskStore) ->
             scheduled_task_id=_uid(f"st_{other_state}"),
             name=other_state,
             prompt="p",
-            cron_expression="* * * * *",
+            rrule="FREQ=MINUTELY",
             owner_user_id="u",
             agent_id=_uid("ag"),
             timezone="UTC",
@@ -335,7 +335,7 @@ def test_update_changes_fields_and_stamps_updated_at(store: SqlAlchemyScheduledT
         scheduled_task_id=_uid("st_u"),
         name="before",
         prompt="p",
-        cron_expression="* * * * *",
+        rrule="FREQ=MINUTELY",
         owner_user_id="u",
         agent_id=_uid("ag"),
         timezone="UTC",
@@ -343,7 +343,7 @@ def test_update_changes_fields_and_stamps_updated_at(store: SqlAlchemyScheduledT
     updated = store.update(
         _uid("st_u"),
         name="after",
-        cron_expression="0 0 * * *",
+        rrule="FREQ=DAILY;BYHOUR=0;BYMINUTE=0",
         base_branch="develop",
         state="paused",
         last_run_at=1700000000,
@@ -351,7 +351,7 @@ def test_update_changes_fields_and_stamps_updated_at(store: SqlAlchemyScheduledT
     )
     assert updated is not None
     assert updated.name == "after"
-    assert updated.cron_expression == "0 0 * * *"
+    assert updated.rrule == "FREQ=DAILY;BYHOUR=0;BYMINUTE=0"
     assert updated.base_branch == "develop"
     assert updated.state == "paused"
     assert updated.last_run_at == 1700000000
@@ -365,7 +365,7 @@ def test_update_noop_leaves_updated_at_none(store: SqlAlchemyScheduledTaskStore)
         scheduled_task_id=_uid("st_noop"),
         name="n",
         prompt="p",
-        cron_expression="* * * * *",
+        rrule="FREQ=MINUTELY",
         owner_user_id="u",
         agent_id=_uid("ag"),
         timezone="UTC",
@@ -389,7 +389,7 @@ def test_delete_removes_task(store: SqlAlchemyScheduledTaskStore) -> None:
         scheduled_task_id=_uid("st_del"),
         name="n",
         prompt="p",
-        cron_expression="* * * * *",
+        rrule="FREQ=MINUTELY",
         owner_user_id="u",
         agent_id=_uid("ag"),
         timezone="UTC",
@@ -412,7 +412,7 @@ def test_create_run_and_list_runs(store: SqlAlchemyScheduledTaskStore) -> None:
         scheduled_task_id=_uid("st_runs"),
         name="n",
         prompt="p",
-        cron_expression="* * * * *",
+        rrule="FREQ=MINUTELY",
         owner_user_id="u",
         agent_id=_uid("ag"),
         timezone="UTC",
@@ -452,7 +452,7 @@ def test_list_runs_scoped_to_task(store: SqlAlchemyScheduledTaskStore) -> None:
             scheduled_task_id=_uid(rid),
             name=rid,
             prompt="p",
-            cron_expression="* * * * *",
+            rrule="FREQ=MINUTELY",
             owner_user_id="u",
             agent_id=_uid("ag"),
             timezone="UTC",
@@ -482,7 +482,7 @@ def test_run_status_round_trips_as_string(store: SqlAlchemyScheduledTaskStore) -
         scheduled_task_id=_uid("st_rt"),
         name="n",
         prompt="p",
-        cron_expression="* * * * *",
+        rrule="FREQ=MINUTELY",
         owner_user_id="u",
         agent_id=_uid("ag"),
         timezone="UTC",
@@ -504,7 +504,7 @@ def test_create_run_rejects_invalid_status_name(store: SqlAlchemyScheduledTaskSt
         scheduled_task_id=_uid("st_bad"),
         name="n",
         prompt="p",
-        cron_expression="* * * * *",
+        rrule="FREQ=MINUTELY",
         owner_user_id="u",
         agent_id=_uid("ag"),
         timezone="UTC",
@@ -527,7 +527,7 @@ def test_update_host_id_can_be_cleared_to_null(store: SqlAlchemyScheduledTaskSto
         scheduled_task_id=_uid("st_clear_host"),
         name="n",
         prompt="p",
-        cron_expression="* * * * *",
+        rrule="FREQ=MINUTELY",
         owner_user_id="u",
         agent_id=_uid("ag"),
         timezone="UTC",
@@ -551,7 +551,7 @@ def test_update_last_run_conversation_id_can_be_cleared_to_null(
         scheduled_task_id=_uid("st_clear_conv"),
         name="n",
         prompt="p",
-        cron_expression="* * * * *",
+        rrule="FREQ=MINUTELY",
         owner_user_id="u",
         agent_id=_uid("ag"),
         timezone="UTC",
@@ -573,7 +573,7 @@ def test_update_omitting_nullable_param_leaves_field_unchanged(
         scheduled_task_id=_uid("st_omit"),
         name="n",
         prompt="p",
-        cron_expression="* * * * *",
+        rrule="FREQ=MINUTELY",
         owner_user_id="u",
         agent_id=_uid("ag"),
         timezone="UTC",
@@ -595,7 +595,7 @@ def test_update_clearing_already_null_field_is_noop_for_updated_at(
         scheduled_task_id=_uid("st_null_noop"),
         name="n",
         prompt="p",
-        cron_expression="* * * * *",
+        rrule="FREQ=MINUTELY",
         owner_user_id="u",
         agent_id=_uid("ag"),
         timezone="UTC",
@@ -615,7 +615,7 @@ def test_delete_also_removes_associated_runs(store: SqlAlchemyScheduledTaskStore
         scheduled_task_id=_uid("st_del_runs"),
         name="n",
         prompt="p",
-        cron_expression="* * * * *",
+        rrule="FREQ=MINUTELY",
         owner_user_id="u",
         agent_id=_uid("ag"),
         timezone="UTC",
@@ -644,7 +644,7 @@ def test_delete_does_not_remove_other_tasks_runs(store: SqlAlchemyScheduledTaskS
             scheduled_task_id=_uid(tid),
             name=tid,
             prompt="p",
-            cron_expression="* * * * *",
+            rrule="FREQ=MINUTELY",
             owner_user_id="u",
             agent_id=_uid("ag"),
             timezone="UTC",

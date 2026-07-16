@@ -1217,14 +1217,15 @@ class SqlScheduledTask(OmnigentBase):
     SQLAlchemy model for the ``scheduled_tasks`` table.
 
     A scheduled task is a saved, scheduled instruction that fires an agent
-    session on a recurring cron schedule (``cron_expression``).
+    session on a recurring schedule (``rrule``).
 
     :param id: UUID primary key stored as 16 raw bytes (see :class:`Uuid16`),
         surfaced as a bare 32-char hex string (no dashes).
     :param name: Human-readable task name, e.g. ``"nightly triage"``.
     :param prompt: The instruction dispatched to the agent on each firing.
-    :param cron_expression: The required cron string for the recurring trigger,
-        e.g. ``"0 9 * * *"``.
+    :param rrule: The required RFC 5545 recurrence rule for the recurring
+        trigger, e.g. ``"FREQ=DAILY;BYHOUR=9;BYMINUTE=0"``. Evaluated in
+        ``timezone``.
     :param owner_user_id: User the spawned session's ``LEVEL_OWNER`` grant is
         written for — who the run belongs to, e.g. ``"alice@example.com"``.
         ``None`` in single-user / OSS mode; the fire path resolves it to the
@@ -1287,8 +1288,8 @@ class SqlScheduledTask(OmnigentBase):
     name: Mapped[str] = mapped_column(String(256), nullable=False)
     # Opaque free text, never SQL-queried — stored compressed (CompressedText).
     prompt: Mapped[str] = mapped_column(CompressedText, nullable=False)
-    # e.g. "0 9 * * *"
-    cron_expression: Mapped[str] = mapped_column(String(255), nullable=False)
+    # RFC 5545 recurrence rule, e.g. "FREQ=DAILY;BYHOUR=9;BYMINUTE=0".
+    rrule: Mapped[str] = mapped_column(String(512), nullable=False)
     # Session-owner identity: the spawned run's LEVEL_OWNER grant is written
     # for this user. Nullable — None in single-user/OSS mode (the fire path
     # resolves null to the reserved "local" user). String(128) to match

@@ -1,7 +1,7 @@
 """Scheduled-task store — persists scheduled tasks and their run history.
 
 A scheduled task is a saved instruction that fires an agent session on a
-recurring cron schedule. This store owns the ``scheduled_tasks``
+recurring schedule. This store owns the ``scheduled_tasks``
 table and its ``scheduled_task_runs`` history table.
 """
 
@@ -42,7 +42,7 @@ class ScheduledTaskStore(ABC):
         scheduled_task_id: str,
         name: str,
         prompt: str,
-        cron_expression: str,
+        rrule: str,
         owner_user_id: str | None,
         agent_id: str,
         timezone: str,
@@ -61,8 +61,8 @@ class ScheduledTaskStore(ABC):
         :param scheduled_task_id: Pre-generated unique task id (a UUID string).
         :param name: Human-readable task name.
         :param prompt: The instruction dispatched to the agent on each firing.
-        :param cron_expression: The required cron string for the recurring
-            trigger, e.g. ``"0 9 * * *"``.
+        :param rrule: The required RFC 5545 recurrence rule for the recurring
+            trigger, e.g. ``"FREQ=DAILY;BYHOUR=9;BYMINUTE=0"``.
         :param owner_user_id: User the spawned session's ``LEVEL_OWNER`` grant
             is written for; ``None`` in single-user mode.
         :param agent_id: The agent bound to this task.
@@ -121,7 +121,7 @@ class ScheduledTaskStore(ABC):
         *,
         name: str | None = None,
         prompt: str | None = None,
-        cron_expression: str | None = None,
+        rrule: str | None = None,
         timezone: str | None = None,
         model_override: str | None = None,
         reasoning_effort: str | None = None,
@@ -142,7 +142,7 @@ class ScheduledTaskStore(ABC):
         to NULL (e.g. to clear a host binding or to null out the last-run
         conversation after it is deleted).
 
-        Passing ``cron_expression`` updates the recurring trigger; ``None``
+        Passing ``rrule`` updates the recurring trigger; ``None``
         leaves it unchanged.
 
         Returns ``None`` if the task does not exist.

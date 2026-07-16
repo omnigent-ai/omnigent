@@ -2,7 +2,7 @@
 ``scheduled_task_runs`` tables.
 
 A :class:`ScheduledTask` is a saved, scheduled instruction that fires an agent
-session on a recurring cron schedule (``cron_expression``). A
+session on a recurring schedule (``rrule``). A
 :class:`ScheduledTaskRun` records one firing of a task (its run history). This
 module holds the plain dataclasses the store converts ORM rows into; the store
 owns the JSON (de)serialization of the Text-backed columns.
@@ -18,13 +18,14 @@ class ScheduledTask:
     """
     A scheduled task persisted in the ``scheduled_tasks`` table.
 
-    A task's trigger is a required recurring ``cron_expression``.
+    A task's trigger is a required recurring ``rrule``.
 
     :param id: UUID primary key (bare 32-char hex string, no dashes).
     :param name: Human-readable task name, e.g. ``"nightly triage"``.
     :param prompt: The instruction dispatched to the agent on each firing.
-    :param cron_expression: The required cron string for the recurring trigger,
-        e.g. ``"0 9 * * *"``.
+    :param rrule: The required RFC 5545 recurrence rule for the recurring
+        trigger, e.g. ``"FREQ=DAILY;BYHOUR=9;BYMINUTE=0"``. Evaluated in
+        ``timezone``.
     :param owner_user_id: User the spawned session's ``LEVEL_OWNER`` grant is
         written for, e.g. ``"alice@example.com"``. ``None`` in single-user mode.
     :param agent_id: The agent bound to this task, e.g. ``"ag_..."``.
@@ -57,7 +58,7 @@ class ScheduledTask:
     id: str
     name: str
     prompt: str
-    cron_expression: str
+    rrule: str
     owner_user_id: str | None
     agent_id: str
     timezone: str

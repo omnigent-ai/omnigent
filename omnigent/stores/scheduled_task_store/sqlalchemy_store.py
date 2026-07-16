@@ -47,7 +47,7 @@ def _to_entity(row: SqlScheduledTask) -> ScheduledTask:
         agent_id=row.agent_id,
         timezone=row.timezone,
         created_at=row.created_at,
-        cron_expression=row.cron_expression,
+        rrule=row.rrule,
         model_override=row.model_override,
         reasoning_effort=row.reasoning_effort,
         workspace=row.workspace,
@@ -110,7 +110,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         scheduled_task_id: str,
         name: str,
         prompt: str,
-        cron_expression: str,
+        rrule: str,
         owner_user_id: str | None,
         agent_id: str,
         timezone: str,
@@ -123,12 +123,12 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         host_id: str | None = None,
         state: str = "active",
     ) -> ScheduledTask:
-        """Insert a new scheduled task with a required recurring ``cron_expression``."""
+        """Insert a new scheduled task with a required recurring ``rrule``."""
         row = SqlScheduledTask(
             id=scheduled_task_id,
             name=name,
             prompt=prompt,
-            cron_expression=cron_expression,
+            rrule=rrule,
             owner_user_id=owner_user_id,
             agent_id=agent_id,
             timezone=timezone,
@@ -186,7 +186,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         *,
         name: str | None = None,
         prompt: str | None = None,
-        cron_expression: str | None = None,
+        rrule: str | None = None,
         timezone: str | None = None,
         model_override: str | None = None,
         reasoning_effort: str | None = None,
@@ -203,7 +203,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         ``None`` leaves most fields unchanged. For ``host_id`` and
         ``last_run_conversation_id``, the sentinel default means "not provided
         / leave unchanged"; passing ``None`` explicitly sets the column to NULL.
-        Passing ``cron_expression`` updates the recurring trigger; ``None``
+        Passing ``rrule`` updates the recurring trigger; ``None``
         leaves it unchanged.
         """
         with self._session() as session:
@@ -217,8 +217,8 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             if prompt is not None and row.prompt != prompt:
                 row.prompt = prompt
                 changed = True
-            if cron_expression is not None and row.cron_expression != cron_expression:
-                row.cron_expression = cron_expression
+            if rrule is not None and row.rrule != rrule:
+                row.rrule = rrule
                 changed = True
             if timezone is not None and row.timezone != timezone:
                 row.timezone = timezone
