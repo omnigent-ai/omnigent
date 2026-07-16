@@ -102,6 +102,12 @@ async def read_workspace_from_host(
         try:
             result = await asyncio.wait_for(future, timeout=_FS_TIMEOUT_S)
         except asyncio.TimeoutError as exc:
+            _logger.warning(
+                "host '%s' did not answer fs op %r within %.0fs",
+                host_conn.host_id,
+                op,
+                _FS_TIMEOUT_S,
+            )
             raise HostFsUnavailableError(
                 f"host '{host_conn.host_id}' did not respond to fs read within "
                 f"{_FS_TIMEOUT_S:.0f}s (it may be running an older version)"

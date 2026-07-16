@@ -17810,7 +17810,13 @@ def create_sessions_router(
         except HostFsError as exc:
             if exc.status == 404:
                 raise OmnigentError(exc.message, code=ErrorCode.NOT_FOUND) from exc
-            raise HTTPException(status_code=exc.status, detail=exc.message) from exc
+            if exc.status == 400:
+                # Invalid path is a client error; surface it verbatim like the
+                # runner's 400 rather than collapsing it to a 502.
+                raise HTTPException(status_code=400, detail=exc.message) from exc
+            # Any other host FS failure (e.g. git_status_failed 500) mirrors the
+            # runner proxy, which wraps non-200/404 responses as a 502.
+            raise HTTPException(status_code=502, detail=exc.message) from exc
 
     async def _proxy_post_to_runner(
         session_id: str,

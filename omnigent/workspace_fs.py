@@ -169,9 +169,20 @@ class WorkspaceReader:
             try:
                 st = full.stat()  # follows symlinks, like the runner
                 is_dir = full.is_dir()
+                entry_type = "directory" if is_dir else "file"
+                size = st.st_size if entry_type == "file" else None
+                mtime = int(st.st_mtime)
             except OSError:
-                continue
-            entry_type = "directory" if is_dir else "file"
+                # Broken symlink (target gone): fall back to lstat and list it
+                # as a file with no size, matching the runner's list_dir rather
+                # than dropping the entry.
+                try:
+                    ls = full.lstat()
+                except OSError:
+                    continue
+                entry_type = "file"
+                size = None
+                mtime = int(ls.st_mtime)
             entries.append(
                 {
                     "id": child_rel,
@@ -179,8 +190,8 @@ class WorkspaceReader:
                     "name": name,
                     "path": child_rel,
                     "type": entry_type,
-                    "bytes": st.st_size if entry_type == "file" else None,
-                    "modified_at": int(st.st_mtime),
+                    "bytes": size,
+                    "modified_at": mtime,
                 }
             )
         page = paginate_in_memory(
@@ -212,13 +223,20 @@ class WorkspaceReader:
         files are base64-encoded.  Both are byte-capped at
         :data:`_MAX_READ_BYTES`.  Shape matches the runner's file-content
         response, including the mimetype guess.
+
+        Reads at most ``_MAX_READ_BYTES`` from disk (like the runner's
+        bounded read) rather than slurping the whole file, so opening a
+        multi-GB file in the viewer can't OOM the host process.
         """
         try:
-            raw = resolved.read_bytes()
+            with resolved.open("rb") as fh:
+                # One extra byte lets us detect (and flag) truncation
+                # without loading the rest of a large file into memory.
+                capped = fh.read(_MAX_READ_BYTES + 1)
         except OSError as exc:
             raise WorkspaceReaderError(404, "not_found", f"Path {rel!r} not found") from exc
 
-        return self._file_content_payload(rel, raw, limit=limit)
+        return self._file_content_payload(rel, capped, limit=limit)
 
     def _file_content_payload(
         self,
@@ -240,7 +258,6 @@ class WorkspaceReader:
             is_text = True
         except UnicodeDecodeError:
             is_text = False
-            text = ""
 
         payload: dict[str, Any] = {
             "object": "session.environment.filesystem.file_content",
@@ -401,7 +418,10 @@ class WorkspaceReader:
         if not is_deleted:
             resolved = self._resolve(relative_path)
             try:
-                raw = resolved.read_bytes()
+                # Bounded read (like _read_file) so a huge changed file can't
+                # OOM the host; the diff view caps at _MAX_READ_BYTES anyway.
+                with resolved.open("rb") as fh:
+                    raw = fh.read(_MAX_READ_BYTES)
                 after = raw.decode("utf-8", errors="replace")
             except OSError:
                 after = None

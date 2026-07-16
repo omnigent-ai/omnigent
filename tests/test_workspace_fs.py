@@ -113,6 +113,42 @@ def test_read_missing_file_raises_not_found(tmp_path: Path) -> None:
     assert excinfo.value.status == 404
 
 
+def test_read_oversize_file_is_capped_and_flagged(tmp_path: Path, monkeypatch) -> None:
+    """A file larger than the byte cap is truncated and marked ``truncated``.
+
+    The reader reads at most the cap (+1 sentinel byte) from disk rather than
+    slurping the whole file, so a huge file can't OOM the host. Uses a tiny cap
+    so the test writes only a few bytes.
+    """
+    monkeypatch.setattr("omnigent.workspace_fs._MAX_READ_BYTES", 8)
+    (tmp_path / "big.txt").write_text("0123456789abcdef")  # 16 bytes > cap 8
+    reader = WorkspaceReader(tmp_path)
+
+    result = reader.list_or_read("big.txt")
+
+    assert result["truncated"] is True
+    assert result["content"] == "01234567"  # exactly the first cap bytes
+    assert result["bytes"] == 8
+
+
+def test_list_dir_includes_broken_symlink_as_file(tmp_path: Path) -> None:
+    """A broken symlink is listed as ``type="file"`` with no size, like the runner.
+
+    ``stat`` (follows the link) raises for a dangling target; the reader falls
+    back to ``lstat`` and still lists the entry rather than silently dropping
+    it — matching the runner's ``list_dir``.
+    """
+    (tmp_path / "dangling").symlink_to(tmp_path / "does_not_exist")
+    reader = WorkspaceReader(tmp_path)
+
+    result = reader.list_or_read("", limit=100, order="asc")
+
+    by_path = {e["path"]: e for e in result["data"]}
+    assert "dangling" in by_path, "broken symlink must still appear in the listing"
+    assert by_path["dangling"]["type"] == "file"
+    assert by_path["dangling"]["bytes"] is None
+
+
 # ── Path confinement (read-only, workspace-root only) ─────────────────
 
 
