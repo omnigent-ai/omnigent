@@ -317,6 +317,17 @@ _AGENT_TOOLS = frozenset({"sys_agent_get", "sys_agent_download", "sys_agent_list
 # The runner proxies the Omnigent server's session policy REST endpoint.
 _POLICY_TOOLS = frozenset({"sys_add_policy", "sys_policy_registry"})
 
+# Priority 5l.1: Scheduled-task management — the runner proxies the Omnigent
+# server's /v1/scheduled-tasks REST endpoints (same posture as _POLICY_TOOLS).
+_SCHEDULED_TASK_TOOLS = frozenset(
+    {
+        "sys_scheduled_task_create",
+        "sys_scheduled_task_list",
+        "sys_scheduled_task_update",
+        "sys_scheduled_task_delete",
+    }
+)
+
 # Priority 5m: Embedded-browser tools.
 # Runner dispatch POSTs a blocking action request to the server, which parks a
 # Future + publishes ``browser.action_request`` on the session stream; the
@@ -374,6 +385,7 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     | _TASK_LIFECYCLE_TOOLS
     | _AGENT_TOOLS
     | _POLICY_TOOLS
+    | _SCHEDULED_TASK_TOOLS
     | _TERMINAL_TOOLS
     # ``browser_*`` must ride the native relay: the Omnigent desktop app
     # runs native (claude/codex/pi) sessions, which ignore ``request.tools``
@@ -522,6 +534,7 @@ _ALL_LOCAL_TOOLS = (
     | _COMMENT_TOOLS
     | _AGENT_TOOLS
     | _POLICY_TOOLS
+    | _SCHEDULED_TASK_TOOLS
 )
 _PLACEHOLDER_CWDS = (None, "", ".", "./")
 
@@ -3110,6 +3123,92 @@ async def _execute_add_policy(
         return json.dumps({"error": f"sys_add_policy failed: {exc}"})
 
 
+# Fields the create tool forwards to POST /v1/scheduled-tasks.
+_SCHEDULED_TASK_CREATE_FIELDS = (
+    "name",
+    "prompt",
+    "rrule",
+    "agent_id",
+    "timezone",
+    "model_override",
+    "reasoning_effort",
+    "workspace",
+    "base_branch",
+    "host_id",
+)
+# Fields the update tool forwards to PATCH /v1/scheduled-tasks/{id}.
+_SCHEDULED_TASK_UPDATE_FIELDS = (
+    "name",
+    "prompt",
+    "rrule",
+    "timezone",
+    "model_override",
+    "reasoning_effort",
+    "state",
+)
+
+
+async def _execute_scheduled_task_tool(
+    tool_name: str,
+    arguments: str,
+    *,
+    server_client: httpx.AsyncClient | None,
+) -> str:
+    """
+    Runner-local handler for the ``sys_scheduled_task_*`` family.
+
+    The runner has no in-process ScheduledTaskStore, so these tools proxy the
+    Omnigent server's ``/v1/scheduled-tasks`` REST endpoints over
+    ``server_client`` — same posture as :func:`_execute_policy_tool` /
+    :func:`_execute_session_query_tool`. Ownership + RRULE validation are
+    enforced server-side.
+
+    :param tool_name: One of the ``sys_scheduled_task_*`` names.
+    :param arguments: JSON-encoded arguments string from the LLM.
+    :param server_client: HTTP client pointed at the Omnigent server; ``None``
+        returns an error string.
+    :returns: Tool output JSON string.
+    """
+    if server_client is None:
+        return json.dumps({"error": f"{tool_name} requires server access"})
+    try:
+        args: dict[str, Any] = json.loads(arguments) if arguments.strip() else {}
+    except json.JSONDecodeError:
+        return json.dumps({"error": f"{tool_name}: malformed JSON arguments"})
+
+    try:
+        if tool_name == "sys_scheduled_task_list":
+            resp = await server_client.get("/v1/scheduled-tasks", timeout=30.0)
+        elif tool_name == "sys_scheduled_task_create":
+            payload = {k: args[k] for k in _SCHEDULED_TASK_CREATE_FIELDS if k in args}
+            resp = await server_client.post(
+                "/v1/scheduled-tasks", json=payload, timeout=30.0
+            )
+        elif tool_name in ("sys_scheduled_task_update", "sys_scheduled_task_delete"):
+            task_id = args.get("scheduled_task_id")
+            if not task_id:
+                return json.dumps({"error": f"{tool_name} requires 'scheduled_task_id'"})
+            if tool_name == "sys_scheduled_task_delete":
+                resp = await server_client.delete(
+                    f"/v1/scheduled-tasks/{task_id}", timeout=30.0
+                )
+            else:
+                payload = {k: args[k] for k in _SCHEDULED_TASK_UPDATE_FIELDS if k in args}
+                resp = await server_client.patch(
+                    f"/v1/scheduled-tasks/{task_id}", json=payload, timeout=30.0
+                )
+        else:  # pragma: no cover — routing guarantees a known name
+            return json.dumps({"error": f"unknown scheduled-task tool {tool_name!r}"})
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"{tool_name} failed: {exc}"})
+
+    if resp.status_code >= 400:
+        return json.dumps(
+            {"error": f"server returned {resp.status_code}", "details": resp.text[:500]}
+        )
+    return json.dumps(resp.json())
+
+
 @dataclass
 class _ParsedTitle:
     """
@@ -4615,6 +4714,12 @@ async def execute_tool(
                 tool_name,
                 arguments,
                 conversation_id=conversation_id,
+                server_client=server_client,
+            )
+        elif tool_name in _SCHEDULED_TASK_TOOLS:
+            output = await _execute_scheduled_task_tool(
+                tool_name,
+                arguments,
                 server_client=server_client,
             )
         elif tool_name in _BROWSER_TOOLS:
