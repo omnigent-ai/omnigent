@@ -1,10 +1,12 @@
 """Tests for omnigent.onboarding.ambient — machine credential detection.
 
-Detection reads the environment, two CLI-login files under ``$HOME``, a single
-localhost TCP probe for Ollama, and — on macOS only — a ``claude auth status``
-fallback for the Keychain-stored Claude credential. These tests redirect
-``$HOME`` to a tmp dir, control the environment explicitly, and monkeypatch
-both :func:`omnigent.onboarding.ambient._ollama_reachable` and
+Detection reads the environment, two CLI-login files under ``$HOME``, a
+localhost TCP probe per local model server (Ollama, llama-server), and — on
+macOS only — a ``claude auth status`` fallback for the Keychain-stored Claude
+credential. These tests redirect ``$HOME`` to a tmp dir, control the
+environment explicitly, and monkeypatch
+:func:`omnigent.onboarding.ambient._ollama_reachable`,
+:func:`omnigent.onboarding.ambient._llama_server_reachable` and
 :func:`omnigent.onboarding.harness_install.harness_cli_logged_in` so no real
 network or subprocess I/O occurs. Each test asserts the exact
 :class:`DetectedProvider` fields (name / kind / family / source), not just the
@@ -12,6 +14,11 @@ count, so a wrong field turns the test red.
 """
 
 from __future__ import annotations
+
+import contextlib
+import http.server
+import socket
+import threading
 
 import pytest
 
@@ -39,11 +46,13 @@ _PROVIDER_ENV_VARS = [
 
 @pytest.fixture
 def clean_env(tmp_path, monkeypatch: pytest.MonkeyPatch):
-    """Isolate detection: empty HOME, no provider keys, Ollama unreachable.
+    """Isolate detection: empty HOME, no provider keys, local servers unreachable.
 
     Redirects ``$HOME`` to a tmp dir (so the CLI-login path checks see no
     credential files), clears every provider env var, stubs
-    ``_ollama_reachable`` to ``False``, and stubs the macOS Keychain fallback
+    ``_ollama_reachable`` / ``_llama_server_reachable`` to ``False`` (a real
+    listener on either default port would otherwise fabricate a detection), and
+    stubs the macOS Keychain fallback
     (``harness_cli_logged_in``) to ``False`` so the suite never shells out to a
     real ``claude auth status`` — keeping detection deterministic and free of
     real I/O even when the suite runs on a macOS host with a logged-in CLI.
@@ -59,6 +68,7 @@ def clean_env(tmp_path, monkeypatch: pytest.MonkeyPatch):
     for var in _PROVIDER_ENV_VARS:
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(ambient, "_ollama_reachable", lambda: False)
+    monkeypatch.setattr(ambient, "_llama_server_reachable", lambda: False)
     # Neutralize the macOS Keychain fallback by default (the file check already
     # sees no creds under the tmp HOME). The detected/absent tests override this.
     monkeypatch.setattr(harness_install, "harness_cli_logged_in", lambda key: False)
@@ -398,8 +408,53 @@ def test_ollama_detected_when_reachable(clean_env, monkeypatch: pytest.MonkeyPat
     ]
 
 
+def test_llama_server_detected_when_reachable(clean_env, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A reachable local llama-server is detected as a local openai provider.
+
+    Uses the monkeypatched ``_llama_server_reachable`` so no real socket is
+    opened. Failure means a running llama.cpp server would not be offered.
+    """
+    monkeypatch.setattr(ambient, "_llama_server_reachable", lambda: True)
+    detected = detect_providers()
+    assert detected == [
+        DetectedProvider(
+            name="llama-server",
+            kind="local",
+            family="openai",
+            source="http://localhost:8080",
+        )
+    ]
+
+
+def test_ollama_and_llama_server_detected_together(
+    clean_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both local servers are reported when both are up — neither is a fallback.
+
+    Ollama and llama-server listen on different default ports, so they can run
+    side by side. Failure means one detection shadowed the other.
+    """
+    monkeypatch.setattr(ambient, "_ollama_reachable", lambda: True)
+    monkeypatch.setattr(ambient, "_llama_server_reachable", lambda: True)
+    detected = detect_providers()
+    assert detected == [
+        DetectedProvider(
+            name="ollama",
+            kind="local",
+            family="openai",
+            source="http://localhost:11434",
+        ),
+        DetectedProvider(
+            name="llama-server",
+            kind="local",
+            family="openai",
+            source="http://localhost:8080",
+        ),
+    ]
+
+
 def test_detection_priority_order(clean_env, monkeypatch: pytest.MonkeyPatch) -> None:
-    """All signals together are returned in env → claude → codex → ollama order.
+    """All signals together are returned in env → claude → codex → local order.
 
     Failure means the stable ordering broke, so the setup UI would present
     detected providers in a non-deterministic / surprising order.
@@ -420,11 +475,19 @@ def test_detection_priority_order(clean_env, monkeypatch: pytest.MonkeyPatch) ->
         '{"auth_mode": "apikey", "OPENAI_API_KEY": "sk-codex-real"}', encoding="utf-8"
     )
     monkeypatch.setattr(ambient, "_ollama_reachable", lambda: True)
+    monkeypatch.setattr(ambient, "_llama_server_reachable", lambda: True)
 
     detected = detect_providers()
     # Env keys first, in PROVIDER_ENV_VARS iteration order (openai precedes
-    # anthropic in that dict), then claude login, codex login, ollama.
-    assert [d.name for d in detected] == ["openai", "anthropic", "claude", "codex", "ollama"]
+    # anthropic in that dict), then claude login, codex login, local servers.
+    assert [d.name for d in detected] == [
+        "openai",
+        "anthropic",
+        "claude",
+        "codex",
+        "ollama",
+        "llama-server",
+    ]
 
 
 # ── Codex config.toml custom provider (cli-config) detection ───────────────
@@ -747,3 +810,118 @@ def test_vertex_claude_not_detected_when_incomplete(
     for var, val in env.items():
         monkeypatch.setenv(var, val)
     assert detect_providers() == []
+
+
+# ── llama-server HTTP probe validation (_llama_server_reachable) ────────────
+#
+# Port 8080 is a heavily contested dev port, so detection must confirm it is
+# actually talking to a llama.cpp server rather than an unrelated listener.
+# These drive the real ``_llama_server_reachable`` against throwaway localhost
+# servers (no monkeypatched stub) to prove the HTTP validation, not a bare TCP
+# accept, gates the detection.
+
+
+@contextlib.contextmanager
+def _local_http_server(handler_cls):
+    """Run ``handler_cls`` on an ephemeral localhost port, yielding the port."""
+    server = http.server.HTTPServer(("127.0.0.1", 0), handler_cls)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server.server_address[1]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def _make_handler(status: int, body: str, content_type: str = "application/json"):
+    """Build a GET handler that answers every path with a fixed status/body."""
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            payload = body.encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *args) -> None:  # silence test-server logging
+            pass
+
+    return _Handler
+
+
+def test_llama_probe_true_for_health_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A server answering GET /health with a JSON object is a real llama-server.
+
+    Failure means a genuine llama.cpp server would no longer be detected.
+    """
+    with _local_http_server(_make_handler(200, '{"status": "ok"}')) as port:
+        monkeypatch.setattr(ambient, "_LLAMA_SERVER_URL", f"http://127.0.0.1:{port}")
+        assert ambient._llama_server_reachable() is True
+
+
+def test_llama_probe_false_for_html_dev_server(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An HTML listener on the port is not a llama-server, despite a 200.
+
+    A webpack/Vite/Tomcat dev server answers 200 with HTML on any path; the old
+    bare-TCP probe misreported it as an LLM endpoint. Failure means the false
+    positive is back.
+    """
+    handler = _make_handler(200, "<!doctype html><html></html>", "text/html")
+    with _local_http_server(handler) as port:
+        monkeypatch.setattr(ambient, "_LLAMA_SERVER_URL", f"http://127.0.0.1:{port}")
+        assert ambient._llama_server_reachable() is False
+
+
+def test_llama_probe_false_for_404(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A listener without a /health endpoint (404) is not a llama-server."""
+    handler = _make_handler(404, "not found", "text/plain")
+    with _local_http_server(handler) as port:
+        monkeypatch.setattr(ambient, "_LLAMA_SERVER_URL", f"http://127.0.0.1:{port}")
+        assert ambient._llama_server_reachable() is False
+
+
+def test_llama_probe_false_for_bare_tcp_listener(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A socket that accepts TCP but speaks no HTTP is not a llama-server.
+
+    This is exactly what the old bare-connect probe accepted. Failure means the
+    probe again reports any raw listener on 8080 as an LLM endpoint.
+    """
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+    try:
+        monkeypatch.setattr(ambient, "_LLAMA_SERVER_URL", f"http://127.0.0.1:{port}")
+        assert ambient._llama_server_reachable() is False
+    finally:
+        listener.close()
+
+
+def test_llama_probe_ignores_http_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A live local /health server is detected even with http_proxy set.
+
+    The probe targets localhost, so an ambient proxy that does not exempt
+    localhost must not route the GET away from the local server. Failure means
+    a genuine llama-server is misreported as unreachable on any machine with
+    http_proxy exported (common in corp/dev environments).
+    """
+    # Point every proxy var at a dead port; a proxy-honoring probe would fail.
+    for var in ("http_proxy", "HTTP_PROXY", "all_proxy", "ALL_PROXY"):
+        monkeypatch.setenv(var, "http://127.0.0.1:9")
+    with _local_http_server(_make_handler(200, '{"status": "ok"}')) as port:
+        monkeypatch.setattr(ambient, "_LLAMA_SERVER_URL", f"http://127.0.0.1:{port}")
+        assert ambient._llama_server_reachable() is True
+
+
+def test_llama_probe_false_when_nothing_listening(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Nothing listening on the port → no detection (connection refused)."""
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()
+    monkeypatch.setattr(ambient, "_LLAMA_SERVER_URL", f"http://127.0.0.1:{port}")
+    assert ambient._llama_server_reachable() is False

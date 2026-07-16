@@ -2,13 +2,15 @@
 
 For the ``omnigent setup --no-internal-beta`` first-run experience, this module
 discovers credentials a user already has — vendor API keys in the
-environment, a logged-in ``claude`` / ``codex`` CLI, or a local Ollama
-server — so the setup flow can offer them as one-tap choices instead of
-asking the user to paste keys they already have.
+environment, a logged-in ``claude`` / ``codex`` CLI, or a local model server
+(Ollama, llama.cpp's ``llama-server``) — so the setup flow can offer them as
+one-tap choices instead of asking the user to paste keys they already have.
 
 Detection is almost entirely pure standard library (``os``, ``socket``,
-``pathlib``) and performs no network I/O beyond a single non-blocking
-localhost TCP probe for Ollama. The one exception is macOS Claude detection:
+``urllib``, ``pathlib``) and performs no network I/O beyond short localhost
+probes for the local model servers (a TCP probe for Ollama on its near-unique
+port; an HTTP ``/health`` probe for llama-server, whose port 8080 is shared
+with common dev servers). The one exception is macOS Claude detection:
 Claude Code stores its subscription OAuth in the macOS Keychain (not a file),
 so on macOS — and only when the file check comes up empty — Claude detection
 falls back to a ``claude auth status`` subprocess (see
@@ -29,6 +31,7 @@ import shlex
 import socket
 import sys
 import time
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -69,6 +72,21 @@ _OLLAMA_URL = f"http://{_OLLAMA_HOST}:{_OLLAMA_PORT}"
 # Timeout (seconds) for the Ollama TCP probe — short so setup stays snappy
 # when nothing is listening.
 _OLLAMA_PROBE_TIMEOUT = 0.25
+
+# llama.cpp's ``llama-server`` default OpenAI-compatible endpoint. A separate
+# self-hosted server on its own default port, so it is detected independently
+# of Ollama rather than as a fallback — both can be up at once.
+_LLAMA_SERVER_HOST = "localhost"
+_LLAMA_SERVER_PORT = 8080
+_LLAMA_SERVER_URL = f"http://{_LLAMA_SERVER_HOST}:{_LLAMA_SERVER_PORT}"
+
+# Timeout (seconds) for the llama-server HTTP probe — short so setup stays
+# snappy when nothing is listening.
+_LLAMA_SERVER_PROBE_TIMEOUT = 0.25
+
+# Cap on bytes read from the probe response — a health payload is tiny, and a
+# cap keeps an unrelated listener from streaming a large body into the probe.
+_LLAMA_SERVER_PROBE_MAX_BYTES = 65536
 
 # Maps each provider whose env key we surface to the served model family.
 # Providers absent here (or mapped to ``None``) are reported with
@@ -617,6 +635,45 @@ def _ollama_reachable() -> bool:
         return False
 
 
+def _llama_server_reachable() -> bool:
+    """Return whether a local llama.cpp ``llama-server`` is responding.
+
+    Port 8080 is one of the most contested dev ports — Tomcat, Jenkins, a
+    webpack/Vite dev server, or a published Docker container commonly hold it —
+    so a bare TCP accept there does not distinguish a real llama-server from an
+    unrelated listener. This issues a short HTTP ``GET /health`` (llama-server's
+    readiness endpoint) and requires an HTTP ``200`` carrying a JSON object, the
+    shape llama.cpp answers with. A non-HTTP listener, an HTML dev server, or a
+    ``404`` fails the check, so those no longer masquerade as an LLM endpoint.
+
+    Isolated in its own helper so tests can monkeypatch it without real I/O.
+
+    :returns: ``True`` when ``localhost:8080`` answers ``GET /health`` with a
+        ``200`` and a JSON object body, ``False`` on refusal, timeout, a
+        non-200/non-JSON response, or any error.
+    """
+    request = urllib.request.Request(f"{_LLAMA_SERVER_URL}/health", method="GET")
+    # Bypass any ambient http_proxy/HTTP_PROXY: the probe targets localhost, and
+    # a proxy that does not exempt localhost would route the GET away from the
+    # local server and report a live llama-server as unreachable.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(request, timeout=_LLAMA_SERVER_PROBE_TIMEOUT) as response:
+            if response.status != 200:
+                return False
+            body = response.read(_LLAMA_SERVER_PROBE_MAX_BYTES)
+    except (OSError, ValueError):
+        # Connection refused/timeout, an HTTP error status, or a malformed URL.
+        return False
+    try:
+        parsed = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        # A listener that answers 200 but not with JSON (e.g. an HTML dev
+        # server) is not a llama-server.
+        return False
+    return isinstance(parsed, dict)
+
+
 def detect_providers() -> list[DetectedProvider]:
     """Detect credentials already present on the machine.
 
@@ -638,9 +695,15 @@ def detect_providers() -> list[DetectedProvider]:
     4. A logged-in Codex CLI (``~/.codex/auth.json`` exists *and* carries a
        usable credential — see :func:`codex_auth_has_credential`).
     5. A reachable local Ollama (``localhost:11434`` TCP-connectable).
+    6. A reachable local llama.cpp ``llama-server`` (``localhost:8080``
+       answering ``GET /health`` with a JSON object — port 8080 is shared with
+       common dev servers, so a bare TCP accept is not enough). Detected
+       independently of Ollama — both run on their own default port, so both
+       can be reported at once.
 
-    No network I/O is performed except the single Ollama probe (see
-    :func:`_ollama_reachable`). On macOS, a ``claude auth status`` subprocess
+    No network I/O is performed except the local-server probes (see
+    :func:`_ollama_reachable`, :func:`_llama_server_reachable`). On macOS, a
+    ``claude auth status`` subprocess
     may run as the Claude Keychain fallback (see :func:`_claude_login_detected`).
 
     :returns: One :class:`DetectedProvider` per credential found, in the
@@ -735,6 +798,18 @@ def detect_providers() -> list[DetectedProvider]:
                 kind=LOCAL_KIND,
                 family=OPENAI_FAMILY,
                 source=_OLLAMA_URL,
+            )
+        )
+
+    # 6. Local llama.cpp llama-server. Independent of Ollama (own default
+    #    port), so both can be reported when both are up.
+    if _llama_server_reachable():
+        detected.append(
+            DetectedProvider(
+                name="llama-server",
+                kind=LOCAL_KIND,
+                family=OPENAI_FAMILY,
+                source=_LLAMA_SERVER_URL,
             )
         )
 
