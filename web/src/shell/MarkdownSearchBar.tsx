@@ -49,8 +49,11 @@ export function MarkdownSearchBar({
   }, [editor]);
 
   const matchCount = useMemo(() => {
-    if (!editor || !editor.state || !query.trim()) return 0;
-    return findMatches(editor.state.doc, query).length;
+    const trimmed = query.trim();
+    if (!editor || !editor.state || !trimmed) return 0;
+    // Match the trimmed query the plugin highlights against (searchStateRef
+    // below), so the "n / m" count and the highlighted spans never disagree.
+    return findMatches(editor.state.doc, trimmed).length;
     // docVersion forces a recount after edits.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editor, query, docVersion]);

@@ -78,6 +78,18 @@ describe("MarkdownSearchBar", () => {
     expect(editor!.view.dom.querySelectorAll(".md-search-match-current")).toHaveLength(1);
   });
 
+  it("keeps the count and highlights consistent when the query has surrounding whitespace", async () => {
+    renderBar();
+    // The plugin highlights against the trimmed query, so the count must trim
+    // too — otherwise "the " would count differently than it highlights.
+    await act(async () => {
+      type("the ");
+    });
+    const highlighted = editor!.view.dom.querySelectorAll(".md-search-match").length;
+    expect(highlighted).toBe(2);
+    expect(screen.getByText(`1 / ${highlighted}`)).toBeDefined();
+  });
+
   it("shows 'No results' when nothing matches", async () => {
     renderBar();
     await act(async () => {
