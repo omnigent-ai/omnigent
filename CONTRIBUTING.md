@@ -8,8 +8,9 @@ configuration in issues, tests, examples, or logs.
 
 ## Development setup
 
-This is a Python package with an optional frontend under `web/`. Use
-[`uv`](https://docs.astral.sh/uv/) for local development:
+This is a Python package with a frontend under `web/`. Python environments are
+managed by [`uv`](https://docs.astral.sh/uv/); recurring project tasks use
+[`just`](https://just.systems/).
 
 **Supported dev OS: macOS or Linux.** Native Windows is not supported for
 development — some test dependencies are POSIX-only (`pexpect`/`pyte` are
@@ -23,36 +24,33 @@ Install local prerequisites first:
 
 - [`uv`](https://docs.astral.sh/uv/getting-started/installation/) for Python
   environments and dependency management.
+- [`just`](https://just.systems/man/en/packages.html) for the repository's
+  canonical setup, check, test, run, format, and cleanup commands.
 - `tmux`, required for native Claude/Codex terminals launched by the local host
   (`brew install tmux` on macOS, or `apt install tmux` on Debian/Ubuntu).
 - `bubblewrap` (`bwrap`), **Linux only**, used to OS-sandbox those native
   Claude/Codex/Pi terminals (`apt install bubblewrap` on Debian/Ubuntu). macOS
   uses the built-in `seatbelt` sandbox and needs nothing extra.
-- Node.js 22 LTS or newer with `npm` when working on `web/`.
+- Node.js 22 LTS or newer with `npm` for the frontend checks.
 
 ```bash
 git clone https://github.com/omnigent-ai/omnigent.git
 cd omnigent
 
 uv python install
-uv venv --python "$(cat .python-version)"
-uv sync --extra all --extra dev
-source .venv/bin/activate    # or prefix commands with `uv run`
+just setup
 ```
 
-Common checks:
+The recurring command surface is intentionally small:
 
 ```bash
-uv run pytest                      # Python tests (e2e/live skipped by default)
-uv run ruff check . && uv run ruff format --check .
-uv run pre-commit run --all-files
+just check  # full merge-blocking repository check, including Basedpyright
+just test   # canonical Python, Slack integration, and frontend unit suites
+just run    # primary Omnigent CLI
 ```
 
-When touching `web/`:
-
-```bash
-cd web && npm install && npm run lint && npm run build
-```
+Run `just --list` for formatting and cleanup commands. Coding agents should run
+`just check` before yielding changes.
 
 ## Running locally
 

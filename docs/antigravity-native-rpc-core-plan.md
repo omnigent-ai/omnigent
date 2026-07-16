@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - Python deps via `uv` only (never pip); JS/TS via `bun`. Latest stable deps.
-- Pre-commit gate (must pass): `uv run ruff check --fix && uv run ruff format && uv run mypy --strict . && uv run pytest`. Never disable a lint/type rule — fix the root cause.
+- Pre-commit gate (must pass): `just check && just test`. Never disable a lint/type rule — fix the root cause.
 - agy pinned: `AGY_EXPECTED_VERSION=1.0.10` (Docker build fails on mismatch). All RPC shapes are version-sensitive.
 - connect-RPC: JSON (`Content-Type: application/json`), `verify=False`, every URL passes `_assert_loopback_url`. Reuse `antigravity_native_rpc.py` discovery (`discover_language_server_port` / `_candidate_agy_rpc_ports` / `_conversation_matches`).
 - Identity: `cascadeId == conversationId == brain-dir UUID` (no separate id lookup).
@@ -241,7 +241,7 @@ def test_handle_user_interaction_raises_on_500(monkeypatch):
 
 - [ ] **Step 1:** Grep for `antigravity_native_forwarder` / `forwarded_steps` / `update_forwarded_steps` references; confirm only the reader path remains.
 - [ ] **Step 2:** Delete the forwarder module + its tests; remove the cursor fields/methods from the bridge; relocate the shared types.
-- [ ] **Step 3:** Run the full gate: `uv run ruff check --fix && uv run ruff format && uv run mypy --strict . && uv run pytest` (targeted antigravity suites + server).
+- [ ] **Step 3:** Run the full gate: `just check && just test` (targeted antigravity suites + server).
 - [ ] **Step 4:** Commit (`refactor(antigravity-native): retire transcript forwarder + durable cursor (RPC reader supersedes)`).
 
 ---
