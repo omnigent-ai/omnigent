@@ -185,6 +185,12 @@ class HostConnection:
         host sends ``host.create_dir_result``. Values carry the
         result fields (``status``, ``path``, ``error``). Same
         ``Any`` typing rationale as ``pending_stats``.
+    :param pending_fs_requests: Per-``request_id`` futures for
+        in-flight ``host.fs_request`` reads (the workspace file
+        panel served from the host while the runner is offline).
+        Resolved when the host sends ``host.fs_result``. Values
+        carry ``status``, ``payload``, ``error_status``,
+        ``error_code``, and ``error``.
     """
 
     host_id: str
@@ -216,6 +222,9 @@ class HostConnection:
         default_factory=dict,
     )
     pending_create_dirs: dict[str, asyncio.Future[dict[str, Any]]] = field(
+        default_factory=dict,
+    )
+    pending_fs_requests: dict[str, asyncio.Future[dict[str, Any]]] = field(
         default_factory=dict,
     )
 

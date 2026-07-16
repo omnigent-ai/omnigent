@@ -2075,6 +2075,10 @@ def create_app(
             # (host.runner_exited) as last_task_error so a reload still
             # renders the error banner after the live push is gone.
             runner_exit_reports=runner_exit_reports,
+            # Lets the filesystem endpoints fall back to reading the
+            # workspace over the host tunnel when the runner is offline
+            # (the file panel stays live without waking the agent).
+            host_registry=host_registry,
         ),
         prefix="/v1",
         tags=["sessions"],

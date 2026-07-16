@@ -7,12 +7,14 @@ import {
   FileTypeIcon,
   FolderTreeIcon,
   ListIcon,
+  MoonIcon,
   SearchIcon,
   SlidersHorizontalIcon,
   XIcon,
 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useParams } from "@/lib/routing";
+import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useChatStore } from "@/store/chatStore";
 import {
   useWorkspaceChangedFiles,
@@ -283,6 +285,15 @@ export function FilesPanel({
   const runnerWentOffline = useChatStore(
     (s) => s.conversationId === conversationId && s.sessionStatus === "failed",
   );
+  // The runner is offline but the host still holds the workspace on disk,
+  // so the server serves the panel by reading the workspace over the host
+  // tunnel. Show a passive "served from host" badge — the panel keeps
+  // working and no message/agent wake-up is triggered. Only when the host
+  // is also down (or the session isn't host-bound) do the file queries
+  // surface RunnerOfflineError and fall back to the reconnect hint.
+  const runnerOnline = useSessionRunnerOnline(conversationId);
+  const hostOnline = useSessionHostOnline(conversationId);
+  const servedFromHost = runnerOnline === false && hostOnline === true;
   const [changedSearch, setChangedSearch] = useState("");
   const [treeSearch, setTreeSearch] = useState("");
   const [debouncedTreeSearch, setDebouncedTreeSearch] = useState("");
@@ -359,6 +370,24 @@ export function FilesPanel({
       <div className="flex shrink-0 items-center gap-2 px-3 py-2">
         <span className="shrink-0 font-medium text-sm">Working folder</span>
         {workingDir && <WorkingDirLabel dir={workingDir} />}
+        {servedFromHost && (
+          <TooltipProvider>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <span
+                  data-testid="files-host-served-badge"
+                  className="flex shrink-0 items-center gap-1 rounded-full bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground"
+                >
+                  <MoonIcon className="size-3 shrink-0" />
+                  Asleep
+                </span>
+              </TooltipTrigger>
+              <TooltipContent>
+                Agent is asleep — files shown live from the host. Send a message to wake it.
+              </TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
+        )}
         <div className="ml-auto flex items-center gap-1">
           <HiddenFilesToggle
             showHidden={showHidden}

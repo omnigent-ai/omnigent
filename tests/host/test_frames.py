@@ -12,6 +12,8 @@ from omnigent.host.frames import (
     HostCreateDirResultFrame,
     HostCreateWorktreeFrame,
     HostCreateWorktreeResultFrame,
+    HostFsRequestFrame,
+    HostFsResultFrame,
     HostHelloFrame,
     HostLaunchRunnerFrame,
     HostLaunchRunnerResultFrame,
@@ -986,3 +988,117 @@ def test_create_dir_result_error_round_trip() -> None:
     assert decoded.status == "ok"
     assert decoded.path is None
     assert decoded.error == "directory already exists"
+
+
+def test_fs_request_round_trip() -> None:
+    """
+    Verify an fs request round-trips with op, workspace, session, and params.
+
+    The host reads a session's workspace from disk to serve the file panel
+    when the runner is offline; a dropped ``params`` would silently read the
+    root / default page instead of what the client asked for.
+    """
+    original = HostFsRequestFrame(
+        request_id="req_fs_1",
+        op="list_or_read",
+        workspace="/Users/corey/project",
+        session_id="conv_abc123",
+        params={"path": "src", "limit": 100, "order": "asc"},
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostFsRequestFrame)
+    assert decoded == original
+
+
+def test_fs_request_defaults_empty_params() -> None:
+    """
+    Verify an fs request with no ``params`` decodes to an empty dict.
+
+    The ``changes`` op carries no params; it must not fail to decode nor
+    surface ``None`` where the handler expects a dict.
+    """
+    decoded = decode_host_frame(
+        '{"kind": "host.fs_request", "request_id": "r", "op": "changes", '
+        '"workspace": "/w", "session_id": "s"}'
+    )
+    assert isinstance(decoded, HostFsRequestFrame)
+    assert decoded.params == {}
+
+
+def test_fs_request_missing_op_raises() -> None:
+    """
+    Verify decoding an fs request without ``op`` raises ValueError.
+
+    Without an op the host cannot route the read; failing loud beats
+    guessing an operation.
+    """
+    with pytest.raises(ValueError, match="missing required string field"):
+        decode_host_frame(
+            '{"kind": "host.fs_request", "request_id": "r", "workspace": "/w", "session_id": "s"}'
+        )
+
+
+def test_fs_request_non_object_params_raises() -> None:
+    """
+    Verify a non-object ``params`` is rejected rather than silently dropped.
+
+    A malformed peer sending ``params: []`` should fail decode instead of
+    reaching the handler as the wrong type.
+    """
+    with pytest.raises(ValueError, match="must be a JSON object: 'params'"):
+        decode_host_frame(
+            '{"kind": "host.fs_request", "request_id": "r", "op": "changes", '
+            '"workspace": "/w", "session_id": "s", "params": []}'
+        )
+
+
+def test_fs_result_success_round_trip() -> None:
+    """
+    Verify a successful fs result round-trips with the payload intact.
+
+    The payload is the runner-shaped JSON the panel renders; a dropped
+    field would blank the viewer even though the host read succeeded.
+    """
+    original = HostFsResultFrame(
+        request_id="req_fs_2",
+        status="ok",
+        payload={"object": "list", "data": [], "has_more": False},
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostFsResultFrame)
+    assert decoded == original
+
+
+def test_fs_result_error_round_trip() -> None:
+    """
+    Verify an fs error result round-trips with the status/code/message.
+
+    The server reproduces the runner's HTTP response from these fields; a
+    404 that arrived as a 500 would mislead the client's error handling.
+    """
+    original = HostFsResultFrame(
+        request_id="req_fs_3",
+        status="error",
+        error_status=404,
+        error_code="not_found",
+        error="Path 'missing.py' not found",
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostFsResultFrame)
+    assert decoded == original
+
+
+def test_fs_result_null_payload_round_trip() -> None:
+    """
+    Verify an fs result with a null payload decodes cleanly.
+
+    Error results carry no payload; ``null`` must not be coerced into a
+    dict nor raise during decode.
+    """
+    decoded = decode_host_frame(
+        '{"kind": "host.fs_result", "request_id": "r", "status": "error", '
+        '"payload": null, "error_status": 500, "error_code": "boom", "error": "x"}'
+    )
+    assert isinstance(decoded, HostFsResultFrame)
+    assert decoded.payload is None
+    assert decoded.error_status == 500

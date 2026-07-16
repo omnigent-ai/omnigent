@@ -1469,3 +1469,206 @@ async def test_health_reports_online_for_host_on_other_replica(
         "registry instead of the hosts DB."
     )
     assert batch.json()["sessions"][session_id]["runner_online"] is False
+
+
+async def _serve_fs_requests(
+    comm: ApplicationCommunicator,
+    workspace_root: str,
+    *,
+    max_frames: int = 60,
+) -> None:
+    """Answer the host's ``host.fs_request`` round-trips from a real dir.
+
+    Runs the production :class:`omnigent.workspace_fs.WorkspaceReader`
+    against ``workspace_root`` — a real on-disk directory the test
+    controls — for each fs request the server proxies, replying with the
+    same ``host.fs_result`` shape the real host daemon sends. This is the
+    fake host standing in for a machine that still holds the workspace on
+    disk after its runner died.
+
+    Runs until cancelled; drive it as a background task while issuing the
+    filesystem requests, then cancel it.
+
+    :param comm: The connected host communicator.
+    :param workspace_root: Absolute path to a real directory to read.
+    :param max_frames: Frame budget so a routing bug fails fast.
+    """
+    from pathlib import Path
+
+    from omnigent.host.frames import HostFsRequestFrame, HostFsResultFrame
+    from omnigent.workspace_fs import WorkspaceReader, WorkspaceReaderError
+
+    reader = WorkspaceReader(Path(workspace_root))
+    for _ in range(max_frames):
+        output = await comm.receive_output(timeout=3.0)
+        if output["type"] != "websocket.send":
+            continue
+        frame = decode_host_frame(output["text"])
+        if not isinstance(frame, HostFsRequestFrame):
+            continue
+        params = frame.params or {}
+        try:
+            if frame.op == "list_or_read":
+                payload = reader.list_or_read(
+                    str(params.get("path", "")),
+                    limit=int(params.get("limit", 20)),
+                    after=params.get("after"),
+                    before=params.get("before"),
+                    order=str(params.get("order", "desc")),
+                )
+            elif frame.op == "changes":
+                payload = reader.changes(frame.session_id)
+            elif frame.op == "diff":
+                payload = reader.diff(frame.session_id, str(params.get("path", "")))
+            elif frame.op == "search":
+                payload = reader.search(
+                    str(params.get("q", "")),
+                    include=params.get("include"),
+                    exclude=params.get("exclude"),
+                    limit=int(params.get("limit", 500)),
+                )
+            else:  # pragma: no cover - defensive
+                raise AssertionError(f"unexpected fs op {frame.op!r}")
+        except WorkspaceReaderError as exc:
+            result = HostFsResultFrame(
+                request_id=frame.request_id,
+                status="error",
+                error_status=exc.status,
+                error_code=exc.code,
+                error=exc.message,
+            )
+        else:
+            result = HostFsResultFrame(request_id=frame.request_id, status="ok", payload=payload)
+        await comm.send_input({"type": "websocket.receive", "text": encode_host_frame(result)})
+
+
+async def test_offline_runner_serves_file_content_and_changes_from_host(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    tmp_path,
+) -> None:
+    """With the runner offline but the host alive, the filesystem panel
+    is served from the host over the tunnel — no runner, no wake-up.
+
+    End-to-end: a real host over the WS tunnel, a real inline-launched
+    session (host_id + a token-bound runner_id that never connects, so
+    resource access raises ``RUNNER_UNAVAILABLE``), and a real git
+    workspace on disk. Asserts that ``/changes``, the file-content read,
+    and ``/diff`` all return host-served data with the same shapes the
+    runner would return — the passive "agent asleep, files from host"
+    experience. Mutation check: drop the host fallback in
+    ``_fs_get_with_host_fallback`` and every request 503s.
+    """
+    import subprocess
+
+    # A real git workspace on disk: committed baseline + a modification,
+    # so git-mode changes/diff have something to report from disk alone.
+    ws = tmp_path / "hostws"
+    ws.mkdir()
+    env = {
+        **__import__("os").environ,
+        "GIT_AUTHOR_NAME": "T",
+        "GIT_AUTHOR_EMAIL": "t@e.com",
+        "GIT_COMMITTER_NAME": "T",
+        "GIT_COMMITTER_EMAIL": "t@e.com",
+    }
+    subprocess.run(["git", "init"], cwd=ws, check=True, capture_output=True, env=env)
+    (ws / "hello.txt").write_text("original\n")
+    subprocess.run(["git", "add", "."], cwd=ws, check=True, capture_output=True, env=env)
+    subprocess.run(
+        ["git", "commit", "-m", "init"], cwd=ws, check=True, capture_output=True, env=env
+    )
+    (ws / "hello.txt").write_text("changed on disk\n")
+    (ws / "new.txt").write_text("brand new\n")
+
+    from omnigent.errors import ErrorCode, OmnigentError
+    from omnigent.runtime import _globals, set_runner_router
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+
+    # The inline-launched runner never connected, so its RunnerRouter would
+    # raise RUNNER_UNAVAILABLE (the host-fallback trigger). The test client
+    # runs no lifespan, so install a router that reproduces that signal.
+    class _OfflineRunnerRouter:
+        def client_for_session_resources(self, session_id: str) -> object:
+            del session_id
+            raise OmnigentError("runner is offline", code=ErrorCode.RUNNER_UNAVAILABLE)
+
+    prior_router = _globals._runner_router
+    set_runner_router(_OfflineRunnerRouter())  # type: ignore[arg-type]
+
+    # The server must fall back to reading the workspace over the still-open
+    # host tunnel.
+    responder = asyncio.create_task(_serve_fs_requests(comm, str(ws)))
+    try:
+        env_id = "default"
+        base = f"/v1/sessions/{session_id}/resources/environments/{env_id}"
+
+        # 1. Changed files: the git working-tree diff, served from disk.
+        changes = await client.get(f"{base}/changes")
+        assert changes.status_code == 200, changes.text
+        by_path = {e["path"]: e for e in changes.json()["data"]}
+        assert by_path["hello.txt"]["status"] == "modified"
+        assert by_path["new.txt"]["status"] == "created"
+
+        # 2. File content: the actual bytes on disk (the bug we fixed —
+        #    an offline runner used to leave this blank).
+        content = await client.get(f"{base}/filesystem/hello.txt")
+        assert content.status_code == 200, content.text
+        body = content.json()
+        assert body["encoding"] == "utf-8"
+        assert body["content"] == "changed on disk\n"
+
+        # 3. Diff: committed baseline vs current on-disk content.
+        diff = await client.get(f"{base}/diff/hello.txt")
+        assert diff.status_code == 200, diff.text
+        assert diff.json()["before"] == "original\n"
+        assert diff.json()["after"] == "changed on disk\n"
+    finally:
+        set_runner_router(prior_router)
+        responder.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await responder
+
+
+async def test_offline_runner_no_host_still_returns_503(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+) -> None:
+    """With the runner offline AND no host connected, the panel 503s.
+
+    The resolver's last link: when neither the runner nor a host can read
+    the workspace, the original runner-offline error surfaces (503) so the
+    client shows its reconnect affordance rather than a blank success.
+    Guards against the fallback masking a genuinely unreachable workspace.
+    """
+    from omnigent.errors import ErrorCode, OmnigentError
+    from omnigent.runtime import _globals, set_runner_router
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+
+    class _OfflineRunnerRouter:
+        def client_for_session_resources(self, session_id: str) -> object:
+            del session_id
+            raise OmnigentError("runner is offline", code=ErrorCode.RUNNER_UNAVAILABLE)
+
+    prior_router = _globals._runner_router
+    set_runner_router(_OfflineRunnerRouter())  # type: ignore[arg-type]
+
+    # Drop the host tunnel so no fallback source remains.
+    await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+    registry = app.state.host_registry
+    while registry.get(_HOST_ID) is not None:
+        await asyncio.sleep(0.01)
+
+    try:
+        resp = await client.get(
+            f"/v1/sessions/{session_id}/resources/environments/default/changes"
+        )
+    finally:
+        set_runner_router(prior_router)
+    assert resp.status_code == 503, resp.text

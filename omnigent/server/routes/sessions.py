@@ -14359,6 +14359,7 @@ def create_sessions_router(
     comment_store: CommentStore | None = None,
     runner_tunnel_tokens: frozenset[str] | None = None,
     runner_exit_reports: RunnerExitReports | None = None,
+    host_registry: HostRegistry | None = None,
 ) -> APIRouter:
     """
     Factory that builds the sessions router.
@@ -14414,6 +14415,11 @@ def create_sessions_router(
         labels on ``PATCH /v1/sessions/{id}``. ``None`` when the
         server has no allow-list (token-bound runner ids are then the
         only accepted proof).
+    :param host_registry: Live host tunnels. Lets the filesystem
+        endpoints read a session's workspace over its host tunnel when
+        the runner is offline, so the file panel stays live without
+        waking the agent. ``None`` disables the fallback (the endpoints
+        then 503 on an offline runner, as before).
     :returns: A configured :class:`APIRouter` exposing the
         ``/sessions`` endpoints.
     """
@@ -17715,6 +17721,97 @@ def create_sessions_router(
             raise HTTPException(status_code=502, detail=msg)
         return resp.json()
 
+    async def _fs_get_with_host_fallback(
+        session_id: str,
+        *,
+        op: str,
+        host_params: dict[str, Any],
+        runner_path: str,
+        runner_params: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Serve a filesystem read, falling back to the host when offline.
+
+        Proxies the read to the session's runner as usual. When the
+        runner is offline (``RUNNER_UNAVAILABLE``) but the session's host
+        is still connected, the read is served from the workspace over
+        the host tunnel instead — the file panel stays live without
+        waking the agent. The host runs
+        :class:`omnigent.workspace_fs.WorkspaceReader` and returns the
+        same JSON the runner would, so the response shape is identical.
+
+        :param session_id: Session/conversation identifier.
+        :param op: Host-side op name — ``"list_or_read"`` / ``"changes"``
+            / ``"diff"`` / ``"search"``.
+        :param host_params: Op-specific args for the host reader.
+        :param runner_path: Runner-relative URL for the live path.
+        :param runner_params: Optional query params for the runner path.
+        :returns: The runner-shaped filesystem result.
+        :raises OmnigentError: Re-raised runner-offline error when the
+            host cannot serve the read either.
+        :raises HTTPException: On host-reported filesystem failures.
+        """
+        try:
+            return await _proxy_get_to_runner(session_id, runner_path, params=runner_params)
+        except OmnigentError as exc:
+            # Only the runner-offline case is a candidate for the host
+            # fallback; a real 404 / git error from a live runner must
+            # surface unchanged.
+            if exc.code != ErrorCode.RUNNER_UNAVAILABLE:
+                raise
+            runner_offline = exc
+
+        payload = await _read_workspace_via_host(session_id, op, host_params)
+        if payload is None:
+            # No reachable host either — surface the original offline
+            # error (503) so the client shows its reconnect affordance.
+            raise runner_offline
+        return payload
+
+    async def _read_workspace_via_host(
+        session_id: str,
+        op: str,
+        host_params: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Read the session's workspace over its host tunnel.
+
+        :param session_id: Session/conversation identifier.
+        :param op: Host-side op name.
+        :param host_params: Op-specific args for the host reader.
+        :returns: The runner-shaped result, or ``None`` when no host is
+            bound / connected / reachable (caller falls back to 503).
+        :raises HTTPException: On host-reported filesystem failures,
+            reproducing the runner's status.
+        """
+        from omnigent.server.routes._host_filesystem import (
+            HostFsError,
+            HostFsUnavailableError,
+            read_workspace_from_host,
+        )
+
+        if host_registry is None:
+            return None
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None or not conv.host_id or not conv.workspace:
+            return None
+        host_conn = host_registry.get(conv.host_id)
+        if host_conn is None:
+            return None
+        try:
+            return await read_workspace_from_host(
+                host_registry=host_registry,
+                host_conn=host_conn,
+                op=op,
+                workspace=conv.workspace,
+                session_id=session_id,
+                params=host_params,
+            )
+        except HostFsUnavailableError:
+            return None
+        except HostFsError as exc:
+            if exc.status == 404:
+                raise OmnigentError(exc.message, code=ErrorCode.NOT_FOUND) from exc
+            raise HTTPException(status_code=exc.status, detail=exc.message) from exc
+
     async def _proxy_post_to_runner(
         session_id: str,
         path: str,
@@ -17887,7 +17984,49 @@ def create_sessions_router(
         """
         await _validate_session(session_id, request, LEVEL_READ)
         path = f"/v1/sessions/{session_id}/resources/environments/{environment_id}"
-        return await _proxy_get_to_runner(session_id, path)
+        try:
+            return await _proxy_get_to_runner(session_id, path)
+        except OmnigentError as exc:
+            if exc.code != ErrorCode.RUNNER_UNAVAILABLE:
+                raise
+            # Runner offline but host-bound: synthesize the default
+            # environment so the file panel (which gates on this metadata)
+            # keeps browsing the host-served workspace at ``conv.workspace``.
+            synthesized = await _synthesize_offline_environment(session_id, environment_id)
+            if synthesized is None:
+                raise
+            return synthesized
+
+    async def _synthesize_offline_environment(
+        session_id: str,
+        environment_id: str,
+    ) -> dict[str, Any] | None:
+        """Build a default-environment resource from the bound workspace.
+
+        Used when the runner is offline but the session is host-bound, so
+        the file panel's environment probe resolves and browsing can
+        proceed against the host-served workspace.
+
+        :param session_id: Session/conversation identifier.
+        :param environment_id: Requested environment id; only the default
+            environment is synthesized.
+        :returns: A minimal environment resource dict with
+            ``metadata.root`` set to the workspace path, or ``None`` when
+            not applicable (non-default env, no host, no workspace).
+        """
+        if environment_id != "default" or host_registry is None:
+            return None
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None or not conv.host_id or not conv.workspace:
+            return None
+        if host_registry.get(conv.host_id) is None:
+            return None
+        return {
+            "id": environment_id,
+            "object": "session.resource",
+            "type": "environment",
+            "metadata": {"root": conv.workspace},
+        }
 
     @router.get(
         "/sessions/{session_id}/resources/terminals",
@@ -18686,7 +18825,18 @@ def create_sessions_router(
         qs = urllib.parse.urlencode(params)
         path = f"/v1/sessions/{session_id}/resources/environments/{environment_id}/filesystem?{qs}"
         await _validate_session(session_id, request, LEVEL_READ)
-        return await _proxy_get_to_runner(session_id, path)
+        return await _fs_get_with_host_fallback(
+            session_id,
+            op="list_or_read",
+            host_params={
+                "path": "",
+                "limit": limit,
+                "after": after,
+                "before": before,
+                "order": order,
+            },
+            runner_path=path,
+        )
 
     @router.get(
         "/sessions/{session_id}/resources/environments/{environment_id}/search",
@@ -18732,7 +18882,12 @@ def create_sessions_router(
         qs = urllib.parse.urlencode(params)
         path = f"/v1/sessions/{session_id}/resources/environments/{environment_id}/search?{qs}"
         await _validate_session(session_id, request, LEVEL_READ)
-        return await _proxy_get_to_runner(session_id, path)
+        return await _fs_get_with_host_fallback(
+            session_id,
+            op="search",
+            host_params={"q": q, "include": include, "exclude": exclude, "limit": limit},
+            runner_path=path,
+        )
 
     @router.get(
         "/sessions/{session_id}/resources/environments/{environment_id}/changes",
@@ -18757,7 +18912,12 @@ def create_sessions_router(
         """
         path = f"/v1/sessions/{session_id}/resources/environments/{environment_id}/changes"
         await _validate_session(session_id, request, LEVEL_READ)
-        return await _proxy_get_to_runner(session_id, path)
+        return await _fs_get_with_host_fallback(
+            session_id,
+            op="changes",
+            host_params={},
+            runner_path=path,
+        )
 
     @router.get(
         "/sessions/{session_id}/resources/environments/{environment_id}/diff/{relative_path:path}",
@@ -18789,7 +18949,12 @@ def create_sessions_router(
             f"/{environment_id}/diff/{relative_path}"
         )
         await _validate_session(session_id, request, LEVEL_READ)
-        return await _proxy_get_to_runner(session_id, path)
+        return await _fs_get_with_host_fallback(
+            session_id,
+            op="diff",
+            host_params={"path": relative_path},
+            runner_path=path,
+        )
 
     @router.get(
         "/sessions/{session_id}/resources/environments"
@@ -18831,7 +18996,18 @@ def create_sessions_router(
             f"/{environment_id}/filesystem/{relative_path}?{qs}"
         )
         await _validate_session(session_id, request, LEVEL_READ)
-        return await _proxy_get_to_runner(session_id, path)
+        return await _fs_get_with_host_fallback(
+            session_id,
+            op="list_or_read",
+            host_params={
+                "path": relative_path,
+                "limit": limit,
+                "after": after,
+                "before": before,
+                "order": order,
+            },
+            runner_path=path,
+        )
 
     @router.put(
         "/sessions/{session_id}/resources/environments"
