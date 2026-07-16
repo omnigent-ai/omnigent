@@ -59,6 +59,15 @@ def _anchor_dtstart(after: datetime, tz: ZoneInfo) -> datetime:
     Anchoring at midnight gives occurrences a deterministic phase regardless of
     the instant we happen to query at: an hourly rule lands on the hour and a
     daily rule at its ``BYHOUR``/``BYMINUTE``.
+
+    Caveat for ``INTERVAL>1`` recurrences (e.g. biweekly
+    ``FREQ=WEEKLY;INTERVAL=2`` or interval-monthly): dateutil counts active
+    periods relative to ``dtstart``, so re-anchoring to midnight of the query
+    day ties the phase to whichever day the timer last re-armed. A restart on a
+    different weekday can slip such a rule by one period. ``INTERVAL=1`` rules
+    (hourly/daily/simple-weekly) are unaffected. This is acceptable for the
+    current preset set; a proper fix — persisting a stable per-task ``dtstart``
+    — belongs to a later PR if unbounded-interval rules become user-facing.
     """
     local = after.astimezone(tz)
     return local.replace(hour=0, minute=0, second=0, microsecond=0)

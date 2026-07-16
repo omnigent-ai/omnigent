@@ -104,6 +104,11 @@ dependencies = [
     # (omnigent/api/routing/v1/routing.proto).
     # Previously only a transitive dep; declared directly now that we ship a proto.
     "protobuf>=6,<7",
+    # RFC 5545 recurrence rules for the scheduled-task scheduler
+    # (omnigent/server/scheduled/rrule.py). Imported at module top and pulled
+    # onto the core server boot path via app.py; previously only a transitive
+    # dep, declared directly now that we import it.
+    "python-dateutil>=2.8,<3",
 ]
 
 [project.optional-dependencies]
