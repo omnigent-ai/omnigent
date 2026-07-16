@@ -42,10 +42,10 @@ from omnigent.stores.policy_store import PolicyStore
 def _generate_policy_id() -> str:
     """Generate a unique policy identifier.
 
-    :returns: A string of the form ``"pol_<32-char hex>"``,
-        e.g. ``"pol_a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"``.
+    :returns: A bare 32-char hex uuid,
+        e.g. ``"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"``.
     """
-    return f"pol_{uuid.uuid4().hex}"
+    return uuid.uuid4().hex
 
 
 def _entity_to_response(policy: Policy) -> dict[str, Any]:

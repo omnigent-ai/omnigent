@@ -1653,6 +1653,105 @@
         "title": "HeartbeatEvent",
         "type": "object"
       },
+      "ImportItemInput": {
+        "description": "One normalized existing Omnigent item received from the CLI.",
+        "properties": {
+          "data": {
+            "additionalProperties": true,
+            "title": "Data",
+            "type": "object"
+          },
+          "response_id": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Response Id",
+            "type": "string"
+          },
+          "type": {
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "response_id",
+          "data"
+        ],
+        "title": "ImportItemInput",
+        "type": "object"
+      },
+      "ImportSessionRequest": {
+        "description": "Request body for importing one local harness session.",
+        "properties": {
+          "external_session_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "External Session Id",
+            "type": "string"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/ImportItemInput"
+            },
+            "maxItems": 100000,
+            "minItems": 1,
+            "title": "Items",
+            "type": "array"
+          },
+          "source": {
+            "enum": [
+              "claude",
+              "codex"
+            ],
+            "title": "Source",
+            "type": "string"
+          },
+          "workspace": {
+            "anyOf": [
+              {
+                "maxLength": 2048,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workspace"
+          }
+        },
+        "required": [
+          "source",
+          "external_session_id",
+          "items"
+        ],
+        "title": "ImportSessionRequest",
+        "type": "object"
+      },
+      "ImportSessionResponse": {
+        "description": "Result of importing or locating one source session.",
+        "properties": {
+          "item_count": {
+            "title": "Item Count",
+            "type": "integer"
+          },
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "status": {
+            "const": "imported",
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "status",
+          "item_count"
+        ],
+        "title": "ImportSessionResponse",
+        "type": "object"
+      },
       "InProgressEvent": {
         "description": "Event emitted once the task transitions to in-progress.\n\nAlways follows `response.created` (and `response.queued`\nfor background tasks).",
         "properties": {
@@ -6865,6 +6964,48 @@
         "summary": "List Host Worktrees",
         "tags": [
           "hosts"
+        ]
+      }
+    },
+    "/v1/imports": {
+      "post": {
+        "description": "Import one normalized transcript, rejecting duplicate sources.",
+        "operationId": "import_session_v1_imports_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ImportSessionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ImportSessionResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Import Session",
+        "tags": [
+          "imports"
         ]
       }
     },

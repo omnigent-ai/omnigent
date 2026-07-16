@@ -31,7 +31,7 @@ from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissi
 
 pytestmark = pytest.mark.asyncio
 
-_HOST_ID = "host_api_test"
+_HOST_ID = "33296f9b15e02671c34e013dd711407e"
 
 
 def _websocket_scope(path: str) -> dict[str, object]:
@@ -192,7 +192,7 @@ async def test_list_hosts_reports_sandbox_provider_for_managed_host(
     """
     app, _reg, host_store, _cs = host_api_app
     host_store.register_managed_host(
-        host_id="host_managed_sb",
+        host_id="b8a8862c405a01143b4373e2b155b02a",
         name="sandbox-host",
         # Auth is disabled in this fixture, so list_hosts resolves the
         # caller to the reserved "local" owner — the managed host must
@@ -214,7 +214,7 @@ async def test_list_hosts_reports_sandbox_provider_for_managed_host(
         "Either register_managed_host didn't persist or the owner "
         "filter excluded it."
     )
-    assert hosts[0]["host_id"] == "host_managed_sb"
+    assert hosts[0]["host_id"] == "b8a8862c405a01143b4373e2b155b02a"
     # Pre-registered managed hosts start offline until the in-sandbox
     # host process dials the tunnel.
     assert hosts[0]["status"] == "offline"
@@ -306,7 +306,7 @@ async def test_get_host_404(
     """
     app, _reg, _hs, _cs = host_api_app
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        resp = await client.get("/v1/hosts/host_nonexistent")
+        resp = await client.get("/v1/hosts/aababcc3941edb738172734a9ab7bb8c")
     assert resp.status_code == 404
 
 
@@ -614,7 +614,7 @@ async def test_launch_runner_404_unknown_host(
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.post(
-            "/v1/hosts/host_nonexistent/runners",
+            "/v1/hosts/aababcc3941edb738172734a9ab7bb8c/runners",
             json={"session_id": conv.id, "workspace": "/tmp"},
         )
     assert resp.status_code == 404
@@ -700,8 +700,10 @@ async def test_list_hosts_filters_by_owner(
     host enumeration is possible across users.
     """
     _app, _reg, host_store, _cs = multi_user_app
-    host_store.upsert_on_connect("host_alice", "alice-laptop", "alice@test.com")
-    host_store.upsert_on_connect("host_bob", "bob-laptop", "bob@test.com")
+    host_store.upsert_on_connect(
+        "f54bb9272002938a3a934bfcb6bb228a", "alice-laptop", "alice@test.com"
+    )
+    host_store.upsert_on_connect("774d8c150c0060ddb61a91b23b64a0d0", "bob-laptop", "bob@test.com")
 
     async with AsyncClient(transport=ASGITransport(app=_app), base_url="http://test") as client:
         # Alice sees only her host.
@@ -711,8 +713,8 @@ async def test_list_hosts_filters_by_owner(
         )
         assert resp.status_code == 200
         host_ids = {h["host_id"] for h in resp.json()["hosts"]}
-        assert host_ids == {"host_alice"}, (
-            f"Alice should only see host_alice, got {host_ids}. "
+        assert host_ids == {"f54bb9272002938a3a934bfcb6bb228a"}, (
+            f"Alice should only see f54bb9272002938a3a934bfcb6bb228a, got {host_ids}. "
             "Owner filtering on GET /v1/hosts is broken."
         )
 
@@ -722,7 +724,9 @@ async def test_list_hosts_filters_by_owner(
             headers={"x-test-user": "bob@test.com"},
         )
         host_ids = {h["host_id"] for h in resp.json()["hosts"]}
-        assert host_ids == {"host_bob"}, f"Bob should only see host_bob, got {host_ids}."
+        assert host_ids == {"774d8c150c0060ddb61a91b23b64a0d0"}, (
+            f"Bob should only see 774d8c150c0060ddb61a91b23b64a0d0, got {host_ids}."
+        )
 
 
 async def test_get_host_403_wrong_owner(
@@ -736,11 +740,13 @@ async def test_get_host_403_wrong_owner(
     which is an information leak.
     """
     _app, _reg, host_store, _cs = multi_user_app
-    host_store.upsert_on_connect("host_alice2", "alice-laptop", "alice@test.com")
+    host_store.upsert_on_connect(
+        "294391bc835cde1130ef2a02dcd2b7b3", "alice-laptop", "alice@test.com"
+    )
 
     async with AsyncClient(transport=ASGITransport(app=_app), base_url="http://test") as client:
         resp = await client.get(
-            "/v1/hosts/host_alice2",
+            "/v1/hosts/294391bc835cde1130ef2a02dcd2b7b3",
             headers={"x-test-user": "bob@test.com"},
         )
     assert resp.status_code == 403, (
@@ -760,11 +766,13 @@ async def test_launch_runner_403_wrong_owner(
     machine — a critical security violation.
     """
     _app, registry, host_store, conv_store = multi_user_app
-    host_store.upsert_on_connect("host_alice3", "alice-laptop", "alice@test.com")
+    host_store.upsert_on_connect(
+        "a20f57f124c33161e2e17a8998af5b1f", "alice-laptop", "alice@test.com"
+    )
     from omnigent.host.frames import HostHelloFrame
 
     registry.register(
-        "host_alice3",
+        "a20f57f124c33161e2e17a8998af5b1f",
         type(
             "FakeWS",
             (),
@@ -780,7 +788,7 @@ async def test_launch_runner_403_wrong_owner(
 
     async with AsyncClient(transport=ASGITransport(app=_app), base_url="http://test") as client:
         resp = await client.post(
-            "/v1/hosts/host_alice3/runners",
+            "/v1/hosts/a20f57f124c33161e2e17a8998af5b1f/runners",
             json={"session_id": conv.id, "workspace": "/tmp"},
             headers={"x-test-user": "bob@test.com"},
         )
@@ -895,7 +903,7 @@ async def test_tunnel_rejects_unauthenticated_when_auth_enabled(
     hijack or enumerate other users' hosts.
     """
     app, registry, host_store, _cs = multi_user_app
-    host_id = "host_unauth"
+    host_id = "3eeb18892635b9ed8ba2d060c8f58dd4"
     path = f"/v1/hosts/{host_id}/tunnel"
     # No x-test-user header -> stub auth returns None -> unauthenticated.
     comm = ApplicationCommunicator(app, _websocket_scope(path))
@@ -924,7 +932,7 @@ async def test_tunnel_accepts_authenticated_owner(
     the authenticated happy path.
     """
     app, registry, host_store, _cs = multi_user_app
-    host_id = "host_alice_ws"
+    host_id = "d66146fe4cc6b0dc1d342f6a89475046"
     path = f"/v1/hosts/{host_id}/tunnel"
     scope = _websocket_scope(path)
     # Authenticated as alice via the stub's x-test-user header.
@@ -980,8 +988,10 @@ async def test_resolve_host_launch_enforces_host_and_session_ownership(
     perm = SqlAlchemyPermissionStore(db_uri)
 
     # Alice owns an online host and a session.
-    host_store.upsert_on_connect("host_alice", "alice-laptop", "alice@test.com")
-    _register_fake_host(registry, "host_alice", "alice@test.com")
+    host_store.upsert_on_connect(
+        "f54bb9272002938a3a934bfcb6bb228a", "alice-laptop", "alice@test.com"
+    )
+    _register_fake_host(registry, "f54bb9272002938a3a934bfcb6bb228a", "alice@test.com")
     conv = conv_store.create_conversation(agent_id=None)
     perm.ensure_user("alice@test.com")
     perm.grant("alice@test.com", conv.id, LEVEL_OWNER)
@@ -996,7 +1006,7 @@ async def test_resolve_host_launch_enforces_host_and_session_ownership(
     # Happy path: Alice owns both → returns the resolved target.
     target = resolve_host_launch(
         user_id="alice@test.com",
-        host_id="host_alice",
+        host_id="f54bb9272002938a3a934bfcb6bb228a",
         session_id=conv.id,
         **stores,
     )
@@ -1009,7 +1019,7 @@ async def test_resolve_host_launch_enforces_host_and_session_ownership(
     with pytest.raises(HTTPException) as exc:
         resolve_host_launch(
             user_id="bob@test.com",
-            host_id="host_alice",
+            host_id="f54bb9272002938a3a934bfcb6bb228a",
             session_id=conv.id,
             **stores,
         )
@@ -1017,12 +1027,12 @@ async def test_resolve_host_launch_enforces_host_and_session_ownership(
 
     # Bob owns his own host but targets Alice's SESSION → 404. Blocks
     # the launch_runner session-hijack (binding her session to his runner).
-    host_store.upsert_on_connect("host_bob", "bob-laptop", "bob@test.com")
-    _register_fake_host(registry, "host_bob", "bob@test.com")
+    host_store.upsert_on_connect("774d8c150c0060ddb61a91b23b64a0d0", "bob-laptop", "bob@test.com")
+    _register_fake_host(registry, "774d8c150c0060ddb61a91b23b64a0d0", "bob@test.com")
     with pytest.raises(HTTPException) as exc:
         resolve_host_launch(
             user_id="bob@test.com",
-            host_id="host_bob",
+            host_id="774d8c150c0060ddb61a91b23b64a0d0",
             session_id=conv.id,
             **stores,
         )
@@ -1033,18 +1043,18 @@ async def test_resolve_host_launch_enforces_host_and_session_ownership(
     with pytest.raises(HTTPException) as exc:
         resolve_host_launch(
             user_id="alice@test.com",
-            host_id="host_missing",
+            host_id="b76b800b737d646b3ae8e06071d622c3",
             session_id=conv.id,
             **stores,
         )
     assert exc.value.status_code == 404
 
     # Host known but offline (in the store, no live connection) → 409.
-    host_store.upsert_on_connect("host_offline", "alice-old", "alice@test.com")
+    host_store.upsert_on_connect("3d9665477127e41f42de3f4109418173", "alice-old", "alice@test.com")
     with pytest.raises(HTTPException) as exc:
         resolve_host_launch(
             user_id="alice@test.com",
-            host_id="host_offline",
+            host_id="3d9665477127e41f42de3f4109418173",
             session_id=conv.id,
             **stores,
         )
@@ -1063,8 +1073,8 @@ async def test_launch_runner_rejects_other_users_session(
     perm = app.state.permission_store
 
     # Bob's own, online host.
-    host_store.upsert_on_connect("host_bob", "bob-laptop", "bob@test.com")
-    _register_fake_host(registry, "host_bob", "bob@test.com")
+    host_store.upsert_on_connect("774d8c150c0060ddb61a91b23b64a0d0", "bob-laptop", "bob@test.com")
+    _register_fake_host(registry, "774d8c150c0060ddb61a91b23b64a0d0", "bob@test.com")
 
     # Alice's session (owned by Alice).
     conv = conv_store.create_conversation(agent_id=None)
@@ -1073,7 +1083,7 @@ async def test_launch_runner_rejects_other_users_session(
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.post(
-            "/v1/hosts/host_bob/runners",
+            "/v1/hosts/774d8c150c0060ddb61a91b23b64a0d0/runners",
             json={"session_id": conv.id, "workspace": "/tmp"},
             headers={"x-test-user": "bob@test.com"},
         )
@@ -1104,13 +1114,15 @@ async def test_failed_connect_does_not_offline_another_users_host(
     app, _registry, host_store, _cs = multi_user_app
 
     # Alice's host is registered and online.
-    host_store.upsert_on_connect("host_dos", "alice-laptop", "alice@test.com")
-    before = host_store.get_host("host_dos")
+    host_store.upsert_on_connect(
+        "be2a05c6f9530d33276f7c4b34bc39ad", "alice-laptop", "alice@test.com"
+    )
+    before = host_store.get_host("be2a05c6f9530d33276f7c4b34bc39ad")
     assert before is not None
     assert before.status == "online"
 
     # Bob (a different authenticated user) connects to Alice's host_id.
-    scope = _websocket_scope("/v1/hosts/host_dos/tunnel")
+    scope = _websocket_scope("/v1/hosts/be2a05c6f9530d33276f7c4b34bc39ad/tunnel")
     scope["headers"] = [(b"x-test-user", b"bob@test.com")]
     comm = ApplicationCommunicator(app, scope)
     await comm.send_input({"type": "websocket.connect"})
@@ -1122,7 +1134,7 @@ async def test_failed_connect_does_not_offline_another_users_host(
     with contextlib.suppress(Exception):
         await comm.wait(timeout=2.0)
 
-    after = host_store.get_host("host_dos")
+    after = host_store.get_host("be2a05c6f9530d33276f7c4b34bc39ad")
     assert after is not None
     # Bob never claimed the host_id...
     assert after.owner == "alice@test.com"

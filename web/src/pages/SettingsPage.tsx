@@ -56,6 +56,7 @@ import {
 } from "lucide-react";
 import { useTheme } from "next-themes";
 import { PageScroll } from "@/components/PageScroll";
+import { ThemeColorPicker } from "@/components/theme/ThemeColorPicker";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
@@ -134,13 +135,21 @@ import {
 } from "@/lib/harnessVisibilityPreferences";
 import {
   applyThemePalette,
-  isThemePalette,
+  isThemeSelection,
   PALETTES,
   type PaletteSwatch,
   readThemePalette,
-  type ThemePalette,
+  type ThemeSelection,
   writeThemePalette,
 } from "@/lib/themePalette";
+import {
+  applyCustomTheme,
+  createCustomThemeFromPalette,
+  customThemeSwatches,
+  readCustomTheme,
+  type CustomTheme,
+  writeCustomTheme,
+} from "@/lib/customTheme";
 import { useIsEmbedded } from "@/lib/embedded";
 import {
   type CliStatus,
@@ -541,58 +550,174 @@ function WorkspacePanelDefaultControl() {
   );
 }
 
-/**
- * Color-theme (palette) picker — a dropdown (à la Codex). Each option shows a
- * swatch chip + name and the trigger mirrors the current selection. Choosing
- * one applies it live to <html> via `data-theme`, persists it, and composes on
- * top of the chosen light/dark mode.
- */
 function ColorThemeControl() {
   // Render each chip in the currently-resolved mode so it matches the app now.
   const { resolvedTheme } = useTheme();
   const isDark = normalizeResolvedTheme(resolvedTheme) === "dark";
-  const [palette, setPalette] = useState<ThemePalette>(() => readThemePalette());
+  const [selection, setSelection] = useState<ThemeSelection>(() => readThemePalette());
+  const [customTheme, setCustomTheme] = useState<CustomTheme>(() => readCustomTheme());
   const labelId = useId();
 
-  const choose = useCallback((next: ThemePalette) => {
-    setPalette(next);
-    writeThemePalette(next);
-    applyThemePalette(next);
-  }, []);
+  const choose = useCallback(
+    (next: ThemeSelection) => {
+      if (next === "custom") applyCustomTheme(customTheme);
+      setSelection(next);
+      writeThemePalette(next);
+      applyThemePalette(next);
+    },
+    [customTheme],
+  );
 
-  const selected = PALETTES.find((p) => p.id === palette) ?? PALETTES[0];
+  const selectedPalette =
+    selection === "custom"
+      ? null
+      : (PALETTES.find((palette) => palette.id === selection) ?? PALETTES[0]);
+  const editableTheme = selectedPalette
+    ? createCustomThemeFromPalette(selectedPalette)
+    : customTheme;
+  const customSwatches = customThemeSwatches(customTheme);
+
+  const updateCustomTheme = useCallback(
+    (patch: Partial<CustomTheme>) => {
+      const source =
+        selection === "custom"
+          ? customTheme
+          : createCustomThemeFromPalette(
+              PALETTES.find((palette) => palette.id === selection) ?? PALETTES[0],
+            );
+      const next = { ...source, ...patch };
+      setCustomTheme(next);
+      writeCustomTheme(next);
+      applyCustomTheme(next);
+      setSelection("custom");
+      writeThemePalette("custom");
+      applyThemePalette("custom");
+    },
+    [customTheme, selection],
+  );
+
+  const selected =
+    selection === "custom"
+      ? {
+          label: "Custom",
+          light: customSwatches.light,
+          dark: customSwatches.dark,
+        }
+      : selectedPalette!;
 
   return (
     <ThemeSubsection
       labelId={labelId}
       title="Color theme"
-      helper="Applies on top of your chosen mode."
+      helper="Choose a preset, then tune it across light and dark mode."
     >
-      <Select
-        value={palette}
-        onValueChange={(next) => {
-          if (isThemePalette(next)) choose(next);
-        }}
-      >
-        <SelectTrigger
-          aria-labelledby={labelId}
-          data-testid="color-theme-select"
-          className="w-full max-w-xs gap-2"
-        >
-          <SelectValue>
-            <PaletteChip swatch={isDark ? selected.dark : selected.light} />
-            <span>{selected.label}</span>
-          </SelectValue>
-        </SelectTrigger>
-        <SelectContent>
-          {PALETTES.map((p) => (
-            <SelectItem key={p.id} value={p.id} data-testid={`palette-${p.id}`}>
-              <PaletteChip swatch={isDark ? p.dark : p.light} />
-              <span>{p.label}</span>
-            </SelectItem>
-          ))}
-        </SelectContent>
-      </Select>
+      <div className="overflow-hidden rounded-xl border bg-card/55 shadow-xs">
+        <div className="flex flex-col gap-3 border-b bg-muted/30 p-4 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex min-w-0 items-center gap-3">
+            <div className="w-28 shrink-0 overflow-hidden rounded-lg shadow-sm">
+              <PaletteSwatchPreview swatch={isDark ? selected.dark : selected.light} />
+            </div>
+            <div className="min-w-0">
+              <div className="text-sm font-medium">Theme palette</div>
+              <div className="truncate text-xs text-muted-foreground">
+                {selection === "custom"
+                  ? `Based on ${PALETTES.find((palette) => palette.id === customTheme.basePalette)?.label ?? "Omnigent"}`
+                  : selectedPalette?.blurb}
+              </div>
+            </div>
+          </div>
+          <Select
+            value={selection}
+            onValueChange={(next) => {
+              if (isThemeSelection(next)) choose(next);
+            }}
+          >
+            <SelectTrigger
+              aria-labelledby={labelId}
+              data-testid="color-theme-select"
+              className="w-full gap-2 sm:w-48"
+            >
+              <SelectValue>
+                <PaletteChip swatch={isDark ? selected.dark : selected.light} />
+                <span>{selected.label}</span>
+              </SelectValue>
+            </SelectTrigger>
+            <SelectContent>
+              {PALETTES.map((palette) => (
+                <SelectItem
+                  key={palette.id}
+                  value={palette.id}
+                  data-testid={`palette-${palette.id}`}
+                >
+                  <PaletteChip swatch={isDark ? palette.dark : palette.light} />
+                  <span>{palette.label}</span>
+                </SelectItem>
+              ))}
+              <SelectItem value="custom" data-testid="palette-custom">
+                <PaletteChip swatch={isDark ? customSwatches.dark : customSwatches.light} />
+                <span>Custom</span>
+              </SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+
+        <div className="px-4">
+          <ThemeColorPicker
+            label="Accent"
+            value={editableTheme.accent}
+            testId="custom-theme-accent"
+            onChange={(accent) => updateCustomTheme({ accent })}
+          />
+          <ThemeColorPicker
+            label="Background tint"
+            value={editableTheme.tint}
+            testId="custom-theme-tint"
+            onChange={(tint) => updateCustomTheme({ tint })}
+          />
+          <div className="flex items-center justify-between gap-4 border-b border-border/70 py-4">
+            <div>
+              <div className="text-sm font-medium">Contrast</div>
+              <div className="text-xs text-muted-foreground">
+                Separates text, borders, and surfaces.
+              </div>
+            </div>
+            <div className="flex w-52 items-center gap-3">
+              <input
+                id="custom-theme-contrast"
+                type="range"
+                min="0"
+                max="100"
+                value={editableTheme.contrast}
+                aria-label="Theme contrast"
+                data-testid="custom-theme-contrast"
+                onChange={(event) => updateCustomTheme({ contrast: Number(event.target.value) })}
+                className="h-1.5 min-w-0 flex-1 cursor-pointer accent-primary"
+              />
+              <output
+                htmlFor="custom-theme-contrast"
+                data-testid="custom-theme-contrast-value"
+                className="w-7 text-right text-xs font-medium tabular-nums"
+              >
+                {editableTheme.contrast}
+              </output>
+            </div>
+          </div>
+          <div className="flex items-center justify-between gap-4 py-4">
+            <div>
+              <div className="text-sm font-medium">Translucent sidebars</div>
+              <div className="text-xs text-muted-foreground">
+                Lets the canvas show through the conversation and workspace rails.
+              </div>
+            </div>
+            <Switch
+              aria-label="Translucent sidebars"
+              checked={editableTheme.translucentSidebar}
+              onCheckedChange={(translucentSidebar) => updateCustomTheme({ translucentSidebar })}
+              data-testid="custom-theme-translucent-sidebar"
+            />
+          </div>
+        </div>
+      </div>
     </ThemeSubsection>
   );
 }
@@ -694,13 +819,12 @@ function AppearanceSection() {
             </p>
           </div>
         ) : (
-          <>
-            <ModeControl />
-            <ColorThemeControl />
-          </>
+          <ModeControl />
         )}
 
         <TerminalThemeControl />
+
+        {!isEmbedded && <ColorThemeControl />}
 
         <WorkspacePanelDefaultControl />
 

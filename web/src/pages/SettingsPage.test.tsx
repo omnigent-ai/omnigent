@@ -198,6 +198,10 @@ afterEach(() => {
   // The palette picker sets data-theme on <html>; clear it so a palette
   // selected in one test doesn't leak into the next.
   document.documentElement.removeAttribute("data-theme");
+  document.documentElement.removeAttribute("data-custom-translucent-sidebar");
+  for (const property of Array.from(document.documentElement.style)) {
+    if (property.startsWith("--custom-")) document.documentElement.style.removeProperty(property);
+  }
   delete (window as unknown as Record<string, unknown>).omnigentDesktop;
 });
 
@@ -259,6 +263,13 @@ describe("SettingsPage", () => {
     expect(localStorage.getItem("omnigent:terminal-theme")).toBeNull();
   });
 
+  it("renders Terminal theme before Color theme", () => {
+    renderPage("/settings/appearance");
+    const terminal = screen.getByText("Terminal theme");
+    const color = screen.getByText("Color theme");
+    expect(terminal.compareDocumentPosition(color) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
   it("persists dark and light terminal theme choices on card click", () => {
     renderPage("/settings/appearance");
 
@@ -295,6 +306,48 @@ describe("SettingsPage", () => {
     expect(select.value).toBe("github");
     expect(document.documentElement.getAttribute("data-theme")).toBe("github");
     expect(localStorage.getItem("omnigent:ui-theme-palette")).toBe(JSON.stringify("github"));
+  });
+
+  it("creates and applies a custom theme when a guided color control changes", () => {
+    renderPage("/settings/appearance");
+    const select = screen.getByTestId("color-theme-select") as HTMLSelectElement;
+    fireEvent.change(select, { target: { value: "github" } });
+
+    fireEvent.click(screen.getByTestId("custom-theme-accent-trigger"));
+    const accent = screen.getByTestId("custom-theme-accent-input") as HTMLInputElement;
+    expect(accent.value).toBe("#0969DA");
+    fireEvent.change(accent, { target: { value: "#2563eb" } });
+
+    expect(select.value).toBe("custom");
+    expect(document.documentElement.getAttribute("data-theme")).toBe("custom");
+    expect(localStorage.getItem("omnigent:ui-theme-palette")).toBe(JSON.stringify("custom"));
+    expect(JSON.parse(localStorage.getItem("omnigent:custom-theme") ?? "null")).toMatchObject({
+      basePalette: "github",
+      accent: "#2563eb",
+    });
+    expect(document.documentElement.style.getPropertyValue("--custom-light-primary")).toBe(
+      "#2563eb",
+    );
+  });
+
+  it("persists the shared contrast and translucent-sidebar controls", () => {
+    renderPage("/settings/appearance");
+
+    fireEvent.change(screen.getByTestId("custom-theme-contrast"), {
+      target: { value: "68" },
+    });
+    fireEvent.click(screen.getByTestId("custom-theme-translucent-sidebar"));
+
+    expect(screen.getByTestId("color-theme-select")).toHaveValue("custom");
+    expect(screen.getByTestId("custom-theme-contrast-value")).toHaveTextContent("68");
+    expect(JSON.parse(localStorage.getItem("omnigent:custom-theme") ?? "null")).toMatchObject({
+      contrast: 68,
+      translucentSidebar: true,
+    });
+    expect(document.documentElement.style.getPropertyValue("--custom-light-sidebar")).toMatch(
+      /^rgba\(/,
+    );
+    expect(document.documentElement).toHaveAttribute("data-custom-translucent-sidebar");
   });
 
   it("moves the mode selection with arrow keys (radiogroup keyboard nav)", () => {

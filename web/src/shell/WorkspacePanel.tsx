@@ -423,7 +423,7 @@ export function WorkspacePanel({
           The Shells branch is unreachable when its tab is hidden —
           native wrappers, claude-native sub-agents, or no shell
           attached. */}
-      <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+      <div data-workspace-panel-content className="flex min-h-0 flex-1 flex-col overflow-hidden">
         {selectedFilePath !== null ? (
           <FileViewer
             frameless

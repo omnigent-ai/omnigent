@@ -42,7 +42,7 @@ pytestmark = [
     pytest.mark.flaky(reruns=2, reruns_delay=1),
 ]
 
-_HOST_ID = "host_mkdir_test"
+_HOST_ID = "f28abbfd54a8b22204184b69d9bfd49f"
 _HOST_NAME = "mkdir-test-laptop"
 
 
@@ -296,7 +296,7 @@ async def test_create_directory_unknown_host_returns_404(
     app, _reg, _hs, _cs = mkdir_app
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.post(
-            "/v1/hosts/host_does_not_exist/directories",
+            "/v1/hosts/7139b7e896ef9478abca6480107d1677/directories",
             json={"path": "/tmp/x"},
         )
 

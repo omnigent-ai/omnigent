@@ -52,7 +52,7 @@ from tests.server.helpers import (
 
 pytestmark = pytest.mark.asyncio
 
-_HOST_ID = "host_binding_test"
+_HOST_ID = "3f866cafac81246fb60ae6ceb1a738da"
 
 
 def _websocket_scope(path: str) -> dict[str, object]:
@@ -570,7 +570,11 @@ async def test_managed_session_create_validator_errors_serialize_as_422(
     """
     resp = await managed_session_env.client.post(
         "/v1/sessions",
-        json={"agent_id": "ag_x", "host_type": "managed", "workspace": "/tmp/w"},
+        json={
+            "agent_id": "d7a89f58205a70539a16fa4b7bd06270",
+            "host_type": "managed",
+            "workspace": "/tmp/w",
+        },
     )
     assert resp.status_code == 422, resp.text
     detail = resp.json()["detail"]
@@ -1062,7 +1066,7 @@ async def test_resumable_managed_wake_ignores_stale_db_liveness(
     host_store = HostStore(db_uri)
     conv_store = SqlAlchemyConversationStore(db_uri)
     host_store.register_managed_host(
-        host_id="host_stale_live_islo",
+        host_id="40bb7200abc8ed27d5b2fcbfad8e89d2",
         name="managed-stale-live-islo",
         owner=RESERVED_USER_LOCAL,
         token="tok-stale-live-islo",
@@ -1071,13 +1075,13 @@ async def test_resumable_managed_wake_ignores_stale_db_liveness(
         token_expires_at=9_999_999_999,
     )
     host_store.upsert_on_connect(
-        host_id="host_stale_live_islo",
+        host_id="40bb7200abc8ed27d5b2fcbfad8e89d2",
         name="managed-stale-live-islo",
         owner=RESERVED_USER_LOCAL,
     )
     conv = conv_store.create_conversation(
         agent_id=None,
-        host_id="host_stale_live_islo",
+        host_id="40bb7200abc8ed27d5b2fcbfad8e89d2",
         workspace="/root/workspace",
     )
     fake = FakeSandboxLauncher(can_resume=True)
@@ -1105,7 +1109,7 @@ async def test_resumable_managed_wake_ignores_stale_db_liveness(
         host_registry=SimpleNamespace(get=lambda _host_id: None),
     )
 
-    assert host_store.is_online("host_stale_live_islo") is True
+    assert host_store.is_online("40bb7200abc8ed27d5b2fcbfad8e89d2") is True
     assert (
         await sessions_module._maybe_relaunch_managed_sandbox(
             session_id=conv.id,
@@ -1128,7 +1132,7 @@ async def test_resumable_managed_wake_drops_fresh_local_tunnels_when_provider_pa
     host_store = HostStore(db_uri)
     conv_store = SqlAlchemyConversationStore(db_uri)
     host_store.register_managed_host(
-        host_id="host_stale_tunnel_islo",
+        host_id="055e31f38d07908f171ebad4ff5cbe9c",
         name="managed-stale-tunnel-islo",
         owner=RESERVED_USER_LOCAL,
         token="tok-stale-tunnel-islo",
@@ -1137,19 +1141,19 @@ async def test_resumable_managed_wake_drops_fresh_local_tunnels_when_provider_pa
         token_expires_at=9_999_999_999,
     )
     host_store.upsert_on_connect(
-        host_id="host_stale_tunnel_islo",
+        host_id="055e31f38d07908f171ebad4ff5cbe9c",
         name="managed-stale-tunnel-islo",
         owner=RESERVED_USER_LOCAL,
     )
     conv = conv_store.create_conversation(
         agent_id=None,
-        host_id="host_stale_tunnel_islo",
+        host_id="055e31f38d07908f171ebad4ff5cbe9c",
         workspace="/root/workspace",
     )
     conv_store.set_runner_id(conv.id, "runner_stale_tunnel")
     conv = conv_store.get_conversation(conv.id)
     assert conv is not None
-    assert host_store.is_online("host_stale_tunnel_islo") is True
+    assert host_store.is_online("055e31f38d07908f171ebad4ff5cbe9c") is True
 
     fake = FakeSandboxLauncher(can_resume=True)
     fake.provider = "islo"  # type: ignore[misc]
@@ -1204,7 +1208,7 @@ async def test_resumable_managed_wake_drops_fresh_local_tunnels_when_provider_pa
         is True
     )
     assert calls == ["wake"]
-    assert host_deregistered == ["host_stale_tunnel_islo"]
+    assert host_deregistered == ["055e31f38d07908f171ebad4ff5cbe9c"]
     assert runner_deregistered == ["runner_stale_tunnel"]
 
 
@@ -1214,10 +1218,10 @@ async def test_managed_wake_fails_when_runner_never_reconnects(
     """A wake cannot publish ready if the launched runner tunnel times out."""
     from omnigent.server.routes import sessions as sessions_module
 
-    session_id = "conv_wake_runner_timeout"
+    session_id = "1a9de2e74d453be7cd665c5290b481b9"
     conv = SimpleNamespace(
         id=session_id,
-        host_id="host_wake_runner_timeout",
+        host_id="cae8b33eab0bd659c87b00dd29946ade",
         workspace="/root/workspace",
         agent_id=None,
         sub_agent_name=None,
@@ -1276,7 +1280,7 @@ async def test_managed_launch_fails_when_runner_never_connects(
     """Initial managed launch settlement also depends on the runner tunnel."""
     from omnigent.server.routes import sessions as sessions_module
 
-    session_id = "conv_launch_runner_timeout"
+    session_id = "1a41e11887aca4570e42c0be40f24833"
     conv = SimpleNamespace(id=session_id)
     tracker = ManagedLaunchTracker()
     tracker.begin(session_id)
@@ -1303,7 +1307,7 @@ async def test_managed_launch_fails_when_runner_never_connects(
     await sessions_module._bind_and_launch_managed_runner(
         session_id=session_id,
         managed=ManagedHostLaunch(
-            host_id="host_launch_runner_timeout",
+            host_id="3c8cdcdb61903904849174c864620a5c",
             workspace="/root/workspace",
         ),
         sandbox_config=ManagedSandboxConfig(

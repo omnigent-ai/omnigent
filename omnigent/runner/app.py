@@ -3524,9 +3524,9 @@ async def _auto_create_codex_terminal(
     # ``codex resume <our_thread_id>``. The app-server boots from this
     # CODEX_HOME just below, so the rollout must be written first. Only
     # viable when the source rollout exists on THIS host (same-host fork —
-    # CUJ 1 same-user); else fall through and launch fresh. This mirrors the
-    # claude-native fork-resume branch in _auto_create_claude_terminal. See
-    # designs/FORK_SESSION_UX.md.
+    # CUJ 1 same-user); otherwise the item-history fallback below runs. This
+    # mirrors the claude-native fork-resume branch in
+    # _auto_create_claude_terminal. See designs/FORK_SESSION_UX.md.
     if (
         launch_config.external_session_id is None
         and launch_config.fork_source_external_id is not None
@@ -3544,10 +3544,11 @@ async def _auto_create_codex_terminal(
                 clone_codex_home=codex_home,
                 clone_workspace=clone_workspace,
             )
-        except Exception:  # noqa: BLE001 — best-effort; launch fresh on failure
+        except Exception:  # noqa: BLE001 — best-effort; fall back to stored items
             cloned_rollout = None
             _logger.warning(
-                "Could not clone source rollout for forked codex clone %s; launching fresh",
+                "Could not clone source rollout for forked codex clone %s; "
+                "trying item-history fallback",
                 session_id,
                 exc_info=True,
             )
@@ -3589,19 +3590,17 @@ async def _auto_create_codex_terminal(
                         session_id,
                         exc_info=True,
                     )
-    elif (
+    if (
         launch_config.external_session_id is None
         and launch_config.fork_carry_history
-        and launch_config.fork_source_external_id is None
         and server_client is not None
     ):
-        # Forked clone bound to a codex-native target with NO source
-        # rollout to clone (an SDK or cross-family source): build the clone's
-        # rollout from its OWN copied Omnigent items under a thread id we mint, then flip
-        # launch_config so the resume path below launches ``codex resume
-        # <our_thread_id>``. Reuses the same server-items→rollout converter
-        # the cross-machine cold resume uses, so the clone opens with the
-        # prior conversation (messages + tool history) as Codex context.
+        # Forked clone bound to a codex-native target with no source rollout
+        # available: build the clone's rollout from its own copied Omnigent
+        # items under a thread id we mint, then flip launch_config so the
+        # resume path below launches ``codex resume <our_thread_id>``. Reuses
+        # the same server-items→rollout converter the cross-machine cold resume
+        # uses, so the clone opens with the prior conversation as Codex context.
         # Best-effort: launch fresh on failure. See designs/FORK_SESSION_UX.md.
         from omnigent.codex_native import (
             _ensure_local_codex_resume_rollout,

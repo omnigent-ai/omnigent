@@ -379,7 +379,9 @@ class BenchEnvironment:
         over loopback (single-user ``RESERVED_USER_LOCAL`` owner, no token) and
         launches runners on demand when the server sends ``host.launch_runner``.
         """
-        self.host_id = f"host_bench_{uuid.uuid4().hex[:12]}"
+        # Bare 32-char hex uuid — host_id is a Uuid16 (binary) column, so it
+        # must be a valid uuid (a synthetic "host_bench_…" string no longer fits).
+        self.host_id = uuid.uuid4().hex
         workspace = self._tmp / "host-workspace"
         workspace.mkdir(exist_ok=True)
         self.host_workspace = str(workspace)

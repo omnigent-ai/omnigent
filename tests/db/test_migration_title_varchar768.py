@@ -58,12 +58,12 @@ def test_title_defaults_empty_string_on_insert(db_engine: Engine) -> None:
                 "(id, created_at, updated_at, root_conversation_id) "
                 "VALUES (:id, :ts, :ts, :id)"
             ),
-            {"id": "conv_varchar768_default", "ts": 1700000000},
+            {"id": "a1adcf5b39ef2505cd38547a126f515c", "ts": 1700000000},
         )
         conn.commit()
         value = conn.execute(
             sa.text("SELECT title FROM conversations WHERE id = :id"),
-            {"id": "conv_varchar768_default"},
+            {"id": "a1adcf5b39ef2505cd38547a126f515c"},
         ).scalar_one()
     assert value == "", f"Expected title to default to '' (empty string); got {value!r}."
 
@@ -78,12 +78,12 @@ def test_existing_title_survives_upgrade(db_engine: Engine) -> None:
                 "(id, created_at, updated_at, root_conversation_id, title) "
                 "VALUES (:id, :ts, :ts, :id, :title)"
             ),
-            {"id": "conv_long_title", "ts": 1700000001, "title": long_title},
+            {"id": "812666757ac2b1a2797f39e488744ad4", "ts": 1700000001, "title": long_title},
         )
         conn.commit()
         value = conn.execute(
             sa.text("SELECT title FROM conversations WHERE id = :id"),
-            {"id": "conv_long_title"},
+            {"id": "812666757ac2b1a2797f39e488744ad4"},
         ).scalar_one()
     assert value == long_title, f"Long title should survive upgrade; got {value!r}"
 
@@ -102,7 +102,7 @@ def test_downgrade_restores_text_type(tmp_path: Path) -> None:
                 "(id, created_at, updated_at, root_conversation_id, title) "
                 "VALUES (:id, :ts, :ts, :id, :title)"
             ),
-            {"id": "conv_downgrade_varchar", "ts": 1700000002, "title": "My Session"},
+            {"id": "0b80bd3a209bdc9d986651e997302b1f", "ts": 1700000002, "title": "My Session"},
         )
         conn.commit()
 
@@ -125,7 +125,7 @@ def test_downgrade_restores_text_type(tmp_path: Path) -> None:
     with engine.connect() as conn:
         value = conn.execute(
             sa.text("SELECT title FROM conversations WHERE id = :id"),
-            {"id": "conv_downgrade_varchar"},
+            {"id": "0b80bd3a209bdc9d986651e997302b1f"},
         ).scalar_one_or_none()
     assert value == "My Session", f"Title should survive downgrade; got {value!r}"
 

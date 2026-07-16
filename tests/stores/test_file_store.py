@@ -14,7 +14,7 @@ def file_store(db_uri: str) -> SqlAlchemyFileStore:
 
 def test_create_and_get(file_store: SqlAlchemyFileStore) -> None:
     f = file_store.create(filename="data.csv", bytes=1024)
-    assert f.id.startswith("file_")
+    assert len(f.id) == 32
     assert f.filename == "data.csv"
     assert f.bytes == 1024
 
@@ -24,7 +24,7 @@ def test_create_and_get(file_store: SqlAlchemyFileStore) -> None:
 
 
 def test_get_nonexistent(file_store: SqlAlchemyFileStore) -> None:
-    assert file_store.get("file_nonexistent") is None
+    assert file_store.get("0017bdafc0b60ad65aff5ea44c8e294d") is None
 
 
 def test_create_with_content_type(file_store: SqlAlchemyFileStore) -> None:
@@ -83,13 +83,13 @@ def test_list_asc_with_after_cursor(file_store: SqlAlchemyFileStore) -> None:
 def test_create_for_session(file_store: SqlAlchemyFileStore) -> None:
     """Session-scoped create records session_id on the file."""
     f = file_store.create(
-        session_id="conv_abc",
+        session_id="4e92b5a0c0ee6db3f874f9c4a3f855a5",
         filename="report.pdf",
         bytes=5000,
         content_type="application/pdf",
     )
-    assert f.id.startswith("file_")
-    assert f.session_id == "conv_abc"
+    assert len(f.id) == 32
+    assert f.session_id == "4e92b5a0c0ee6db3f874f9c4a3f855a5"
     assert f.filename == "report.pdf"
     assert f.bytes == 5000
 
@@ -99,28 +99,28 @@ def test_get_for_session_validates_ownership(
 ) -> None:
     """get_for_session returns None if file belongs to another session."""
     f = file_store.create(
-        session_id="conv_abc",
+        session_id="4e92b5a0c0ee6db3f874f9c4a3f855a5",
         filename="owned.txt",
         bytes=10,
     )
-    assert file_store.get(f.id, session_id="conv_abc") is not None
-    assert file_store.get(f.id, session_id="conv_other") is None
+    assert file_store.get(f.id, session_id="4e92b5a0c0ee6db3f874f9c4a3f855a5") is not None
+    assert file_store.get(f.id, session_id="aef8aa8b6e9cf6eda406cb88cf33708c") is None
 
 
 def test_list_for_session_scopes_to_session(
     file_store: SqlAlchemyFileStore,
 ) -> None:
     """list_for_session only returns files owned by that session."""
-    file_store.create("a1.txt", 1, session_id="conv_a")
-    file_store.create("a2.txt", 2, session_id="conv_a")
-    file_store.create("b1.txt", 3, session_id="conv_b")
+    file_store.create("a1.txt", 1, session_id="94c349190e241f85a984b3df8f129696")
+    file_store.create("a2.txt", 2, session_id="94c349190e241f85a984b3df8f129696")
+    file_store.create("b1.txt", 3, session_id="bfcc6c068875253adf2f20bf30a19015")
     file_store.create("global.txt", 4)
 
-    page_a = file_store.list(session_id="conv_a")
+    page_a = file_store.list(session_id="94c349190e241f85a984b3df8f129696")
     assert len(page_a.data) == 2
-    assert all(f.session_id == "conv_a" for f in page_a.data)
+    assert all(f.session_id == "94c349190e241f85a984b3df8f129696" for f in page_a.data)
 
-    page_b = file_store.list(session_id="conv_b")
+    page_b = file_store.list(session_id="bfcc6c068875253adf2f20bf30a19015")
     assert len(page_b.data) == 1
     assert page_b.data[0].filename == "b1.txt"
 
@@ -129,10 +129,10 @@ def test_delete_for_session_validates_ownership(
     file_store: SqlAlchemyFileStore,
 ) -> None:
     """delete_for_session refuses to delete a file from another session."""
-    f = file_store.create("mine.txt", 10, session_id="conv_abc")
-    assert file_store.delete(f.id, session_id="conv_other") is False
+    f = file_store.create("mine.txt", 10, session_id="4e92b5a0c0ee6db3f874f9c4a3f855a5")
+    assert file_store.delete(f.id, session_id="aef8aa8b6e9cf6eda406cb88cf33708c") is False
     assert file_store.get(f.id) is not None
-    assert file_store.delete(f.id, session_id="conv_abc") is True
+    assert file_store.delete(f.id, session_id="4e92b5a0c0ee6db3f874f9c4a3f855a5") is True
     assert file_store.get(f.id) is None
 
 
@@ -140,17 +140,20 @@ def test_delete_all_for_session(
     file_store: SqlAlchemyFileStore,
 ) -> None:
     """delete_all_for_session removes all session files and returns ids."""
-    f1 = file_store.create("a.txt", 1, session_id="conv_abc")
-    f2 = file_store.create("b.txt", 2, session_id="conv_abc")
-    file_store.create("c.txt", 3, session_id="conv_other")
+    f1 = file_store.create("a.txt", 1, session_id="4e92b5a0c0ee6db3f874f9c4a3f855a5")
+    f2 = file_store.create("b.txt", 2, session_id="4e92b5a0c0ee6db3f874f9c4a3f855a5")
+    file_store.create("c.txt", 3, session_id="aef8aa8b6e9cf6eda406cb88cf33708c")
     global_f = file_store.create("global.txt", 4)
 
-    deleted_ids = file_store.delete_all_for_session("conv_abc")
+    deleted_ids = file_store.delete_all_for_session("4e92b5a0c0ee6db3f874f9c4a3f855a5")
     assert set(deleted_ids) == {f1.id, f2.id}
     assert file_store.get(f1.id) is None
     assert file_store.get(f2.id) is None
-    other_page = file_store.list(session_id="conv_other")
-    assert file_store.get(other_page.data[0].id, session_id="conv_other") is not None
+    other_page = file_store.list(session_id="aef8aa8b6e9cf6eda406cb88cf33708c")
+    assert (
+        file_store.get(other_page.data[0].id, session_id="aef8aa8b6e9cf6eda406cb88cf33708c")
+        is not None
+    )
     assert file_store.get(global_f.id) is not None
 
 
@@ -161,11 +164,11 @@ def test_list_include_unscoped_returns_session_and_global_files(
     file_store: SqlAlchemyFileStore,
 ) -> None:
     """list with include_unscoped=True includes global (session_id=NULL) files."""
-    file_store.create("session.txt", 10, session_id="conv_x")
+    file_store.create("session.txt", 10, session_id="8af356d908005a65f872c246158c6293")
     file_store.create("global.txt", 20)
-    file_store.create("other.txt", 30, session_id="conv_y")
+    file_store.create("other.txt", 30, session_id="1dacb16c401901ed250049177f59e84e")
 
-    page = file_store.list(session_id="conv_x", include_unscoped=True)
+    page = file_store.list(session_id="8af356d908005a65f872c246158c6293", include_unscoped=True)
     filenames = {f.filename for f in page.data}
     assert "session.txt" in filenames
     assert "global.txt" in filenames
@@ -176,10 +179,10 @@ def test_list_include_unscoped_false_excludes_global_files(
     file_store: SqlAlchemyFileStore,
 ) -> None:
     """list with include_unscoped=False (default) excludes global files."""
-    file_store.create("session.txt", 10, session_id="conv_x")
+    file_store.create("session.txt", 10, session_id="8af356d908005a65f872c246158c6293")
     file_store.create("global.txt", 20)
 
-    page = file_store.list(session_id="conv_x", include_unscoped=False)
+    page = file_store.list(session_id="8af356d908005a65f872c246158c6293", include_unscoped=False)
     filenames = {f.filename for f in page.data}
     assert "session.txt" in filenames
     assert "global.txt" not in filenames
@@ -199,5 +202,5 @@ def test_list_empty(file_store: SqlAlchemyFileStore) -> None:
 
 def test_delete_nonexistent_returns_false(file_store: SqlAlchemyFileStore) -> None:
     """delete returns False for an ID that was never created."""
-    result = file_store.delete("file_never_existed")
+    result = file_store.delete("e36b9de8c847c2a002707eaf64724dbf")
     assert result is False

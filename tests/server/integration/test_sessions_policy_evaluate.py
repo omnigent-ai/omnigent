@@ -712,15 +712,20 @@ def test_native_ask_gate_lock_keys_by_session_and_policy() -> None:
     """
     from omnigent.server.routes.sessions import _native_ask_gate_lock
 
-    lock_a = _native_ask_gate_lock("conv_1", "session_cost_guard")
+    lock_a = _native_ask_gate_lock("8e32600337d08f59ad381caf96a90659", "session_cost_guard")
     # Same key → same lock: this is what makes parallel tool calls that
     # all trip one checkpoint share a single gate.
-    assert _native_ask_gate_lock("conv_1", "session_cost_guard") is lock_a
+    assert (
+        _native_ask_gate_lock("8e32600337d08f59ad381caf96a90659", "session_cost_guard") is lock_a
+    )
     # Different policy on the same session → different lock, so a cost ask
     # and (say) a destructive-file ask can prompt concurrently.
-    assert _native_ask_gate_lock("conv_1", "other_policy") is not lock_a
+    assert _native_ask_gate_lock("8e32600337d08f59ad381caf96a90659", "other_policy") is not lock_a
     # Different session → different lock, so sessions stay independent.
-    assert _native_ask_gate_lock("conv_2", "session_cost_guard") is not lock_a
+    assert (
+        _native_ask_gate_lock("19b2d8e5c4e1733f25034907cb7d05ed", "session_cost_guard")
+        is not lock_a
+    )
 
 
 async def test_concurrent_cost_asks_serialize_and_collapse_sibling(

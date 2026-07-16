@@ -1764,11 +1764,11 @@ async def launch_managed_host(
         startup, or registration fails.
     """
     launcher = config.launcher_factory()
-    host_id = f"host_{uuid.uuid4().hex}"
+    host_id = uuid.uuid4().hex
     # Visible label in the host picker; (owner, name) is the hosts
     # table PK, so embed the host_id's leading hex for uniqueness
     # across a user's managed sandboxes.
-    host_name = f"managed-{host_id[len('host_') : len('host_') + 8]}"
+    host_name = f"managed-{host_id[:8]}"
     try:
         await asyncio.to_thread(launcher.prepare)
         sandbox_id = await asyncio.to_thread(launcher.provision, host_name)

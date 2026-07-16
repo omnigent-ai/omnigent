@@ -175,7 +175,10 @@ export function SubagentsGraphView({ conversationId, rootSessionId }: SubagentsG
   );
 
   return (
-    <div className="flex h-full min-h-0 flex-1 flex-col overflow-hidden bg-card">
+    <div
+      data-workspace-panel-surface
+      className="flex h-full min-h-0 flex-1 flex-col overflow-hidden bg-card"
+    >
       <div className="h-full w-full" style={{ minHeight: 200 }}>
         <ReactFlow
           nodes={layoutNodes}

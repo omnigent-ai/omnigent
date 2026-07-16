@@ -53,7 +53,7 @@ from tests.server.helpers import create_test_agent
 
 pytestmark = pytest.mark.asyncio
 
-_HOST_ID = "host_weblaunch_test"
+_HOST_ID = "c2d81b1a6812ae1cf32221c5a2a70ba0"
 _WORKSPACE = "/work/repo"
 
 
@@ -674,7 +674,7 @@ async def _stop_host_session(
 
     :param client: Test HTTP client.
     :param comm: Connected host communicator.
-    :param session_id: Session to stop, e.g. ``"conv_abc123"``.
+    :param session_id: Session to stop, e.g. ``"d1f9214d74c38b9f9a9db17ed8352dc4"``.
     :returns: The ``runner_id`` the host was told to stop.
     """
     from omnigent.runtime import set_runner_client
@@ -999,7 +999,7 @@ async def test_host_session_message_waits_for_bound_runner_before_relaunch(
     async def _staged_get_runner_client(sid: str, router: object) -> httpx.AsyncClient | None:
         """Simulate the pinned runner becoming routable during grace.
 
-        :param sid: Session id being routed, e.g. ``"conv_abc123"``.
+        :param sid: Session id being routed, e.g. ``"d1f9214d74c38b9f9a9db17ed8352dc4"``.
         :param router: Real app runner router (unused in this staged
             resolver).
         :returns: ``None`` first, then the fake runner client.
@@ -1162,7 +1162,7 @@ async def test_relaunch_posts_session_init_before_forwarding_message(
         """Return the fake runner after the relaunch helper runs.
 
         :param session_id_arg: Session id being routed, e.g.
-            ``"conv_abc123"``.
+            ``"d1f9214d74c38b9f9a9db17ed8352dc4"``.
         :param runner_router_arg: Real app runner router (unused here).
         :param tunnel_registry_arg: Real app tunnel registry (unused here).
         :param runner_id: Relaunched runner id expected to connect.

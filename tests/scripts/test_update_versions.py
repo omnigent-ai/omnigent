@@ -141,10 +141,10 @@ def test_set_version_fails_loud_when_line_absent(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("released", "expected"),
     [
-        ("0.1.2", "0.1.3.dev0"),
-        ("1.0.0", "1.0.1.dev0"),
-        ("0.1.2rc1", "0.1.3.dev0"),
-        ("2.5.9", "2.5.10.dev0"),
+        ("0.1.2", "0.2.0.dev0"),
+        ("1.0.0", "1.1.0.dev0"),
+        ("0.6.0rc1", "0.7.0.dev0"),
+        ("2.5.9", "2.6.0.dev0"),
     ],
 )
 def test_next_dev_version(released: str, expected: str) -> None:
