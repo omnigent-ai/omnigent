@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import pytest
@@ -28,7 +28,6 @@ from omnigent.entities import ScheduledTask
 from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL
 from omnigent.server.scheduled import fire as fire_mod
 from omnigent.server.scheduled.fire import FireDeps, build_on_fire
-
 
 # ── Fakes ──────────────────────────────────────────────────────────────────
 
@@ -57,15 +56,18 @@ class FakeScheduledTaskStore:
         self.updates.append({"id": scheduled_task_id, **kwargs})
         return self._rows.get(scheduled_task_id)
 
-    def create_run(self, run_id: str, scheduled_task_id: str, status: str,
-                   scheduled_at: int, **kwargs: Any) -> Any:
-        self.runs.append({
-            "run_id": run_id,
-            "scheduled_task_id": scheduled_task_id,
-            "status": status,
-            "scheduled_at": scheduled_at,
-            **kwargs,
-        })
+    def create_run(
+        self, run_id: str, scheduled_task_id: str, status: str, scheduled_at: int, **kwargs: Any
+    ) -> Any:
+        self.runs.append(
+            {
+                "run_id": run_id,
+                "scheduled_task_id": scheduled_task_id,
+                "status": status,
+                "scheduled_at": scheduled_at,
+                **kwargs,
+            }
+        )
         return None
 
 
@@ -111,26 +113,26 @@ def _deps(sched_store: FakeScheduledTaskStore, **overrides: Any) -> FireDeps:
         permission_store=overrides.get("permission_store", FakePermissionStore()),
         host_store=overrides.get("host_store", object()),
         host_registry=overrides.get("host_registry", object()),
-        runner_router=overrides.get("runner_router", None),
-        tunnel_registry=overrides.get("tunnel_registry", None),
-        file_store=overrides.get("file_store", None),
-        artifact_store=overrides.get("artifact_store", None),
+        runner_router=overrides.get("runner_router"),
+        tunnel_registry=overrides.get("tunnel_registry"),
+        file_store=overrides.get("file_store"),
+        artifact_store=overrides.get("artifact_store"),
     )
 
 
 def _task(**overrides: Any) -> ScheduledTask:
-    base: dict[str, Any] = dict(
-        id="task_1",
-        name="nightly",
-        prompt="do the thing",
-        rrule="FREQ=HOURLY",
-        owner_user_id=None,
-        agent_id="ag_1",
-        timezone="UTC",
-        created_at=1_800_000_000,
-        state="active",
-        execution_target="connected_host",
-    )
+    base: dict[str, Any] = {
+        "id": "task_1",
+        "name": "nightly",
+        "prompt": "do the thing",
+        "rrule": "FREQ=HOURLY",
+        "owner_user_id": None,
+        "agent_id": "ag_1",
+        "timezone": "UTC",
+        "created_at": 1_800_000_000,
+        "state": "active",
+        "execution_target": "connected_host",
+    }
     base.update(overrides)
     return ScheduledTask(**base)
 
@@ -268,9 +270,7 @@ async def test_launch_failure_is_swallowed() -> None:
 @pytest.mark.asyncio
 async def test_managed_sandbox_is_skipped_and_recorded() -> None:
     """v1: managed_sandbox target logs + records a skipped run, does not launch."""
-    store = FakeScheduledTaskStore(
-        rows={"task_1": _task(execution_target="managed_sandbox")}
-    )
+    store = FakeScheduledTaskStore(rows={"task_1": _task(execution_target="managed_sandbox")})
     launched: list[Any] = []
 
     async def _launch(conv: Any, task: Any) -> None:

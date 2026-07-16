@@ -59,7 +59,9 @@ class SysScheduledTaskCreateTool(Tool):
                         },
                         "prompt": {
                             "type": "string",
-                            "description": "The instruction dispatched to the agent on each firing.",
+                            "description": (
+                                "The instruction dispatched to the agent on each firing."
+                            ),
                         },
                         "rrule": {"type": "string", "description": _RRULE_DESC},
                         "agent_id": {
@@ -78,7 +80,9 @@ class SysScheduledTaskCreateTool(Tool):
                         },
                         "model_override": {
                             "type": "string",
-                            "description": "Optional per-run model override. Omit for the agent default.",
+                            "description": (
+                                "Optional per-run model override. Omit for the agent default."
+                            ),
                         },
                         "reasoning_effort": {
                             "type": "string",

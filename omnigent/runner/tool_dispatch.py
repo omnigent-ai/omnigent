@@ -3181,17 +3181,13 @@ async def _execute_scheduled_task_tool(
             resp = await server_client.get("/v1/scheduled-tasks", timeout=30.0)
         elif tool_name == "sys_scheduled_task_create":
             payload = {k: args[k] for k in _SCHEDULED_TASK_CREATE_FIELDS if k in args}
-            resp = await server_client.post(
-                "/v1/scheduled-tasks", json=payload, timeout=30.0
-            )
+            resp = await server_client.post("/v1/scheduled-tasks", json=payload, timeout=30.0)
         elif tool_name in ("sys_scheduled_task_update", "sys_scheduled_task_delete"):
             task_id = args.get("scheduled_task_id")
             if not task_id:
                 return json.dumps({"error": f"{tool_name} requires 'scheduled_task_id'"})
             if tool_name == "sys_scheduled_task_delete":
-                resp = await server_client.delete(
-                    f"/v1/scheduled-tasks/{task_id}", timeout=30.0
-                )
+                resp = await server_client.delete(f"/v1/scheduled-tasks/{task_id}", timeout=30.0)
             else:
                 payload = {k: args[k] for k in _SCHEDULED_TASK_UPDATE_FIELDS if k in args}
                 resp = await server_client.patch(

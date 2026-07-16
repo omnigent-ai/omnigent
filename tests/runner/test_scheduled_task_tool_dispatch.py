@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import json
 
-import httpx
 import pytest
 
 from omnigent.runner.tool_dispatch import (
@@ -100,9 +99,7 @@ async def test_create_posts_payload() -> None:
 @pytest.mark.asyncio
 async def test_list_gets() -> None:
     client = _RecordingClient(_Resp(body={"scheduled_tasks": []}))
-    out = await _execute_scheduled_task_tool(
-        "sys_scheduled_task_list", "", server_client=client
-    )
+    out = await _execute_scheduled_task_tool("sys_scheduled_task_list", "", server_client=client)
     assert client.calls[0] == ("GET", "/v1/scheduled-tasks", None)
     assert json.loads(out) == {"scheduled_tasks": []}
 
@@ -154,9 +151,7 @@ async def test_server_error_becomes_clean_json() -> None:
 
 @pytest.mark.asyncio
 async def test_no_server_client_errors() -> None:
-    out = await _execute_scheduled_task_tool(
-        "sys_scheduled_task_list", "", server_client=None
-    )
+    out = await _execute_scheduled_task_tool("sys_scheduled_task_list", "", server_client=None)
     assert "requires server access" in json.loads(out)["error"]
 
 
@@ -167,7 +162,7 @@ def test_tools_registered_without_spec_optin() -> None:
 
     mgr = ToolManager(AgentSpec(spec_version=1))
     names = {s["function"]["name"] for s in mgr.get_tool_schemas()}
-    assert _ALL_NAMES <= names
+    assert names >= _ALL_NAMES
 
 
 def test_tools_in_dispatch_and_relay_sets() -> None:

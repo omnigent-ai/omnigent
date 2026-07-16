@@ -35,7 +35,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import secrets
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -115,9 +114,7 @@ def build_on_fire(
         # non-active row is a logged no-op done synchronously.
         task = await asyncio.to_thread(deps.scheduled_task_store.get, scheduled_task_id)
         if task is None:
-            _logger.info(
-                "scheduled fire: task %s no longer exists — skipping", scheduled_task_id
-            )
+            _logger.info("scheduled fire: task %s no longer exists — skipping", scheduled_task_id)
             return
         if task.state != "active":
             _logger.info(
@@ -183,8 +180,14 @@ async def _run_fire(
                 task.id,
                 conv.id,
             )
-            await _record_run(deps, task, conv.id, scheduled_at, status="failed",
-                              error="runner launch/dispatch failed")
+            await _record_run(
+                deps,
+                task,
+                conv.id,
+                scheduled_at,
+                status="failed",
+                error="runner launch/dispatch failed",
+            )
             return
 
         await _record_run(deps, task, conv.id, scheduled_at, status="running")
@@ -334,9 +337,7 @@ def _make_connected_host_dispatch(deps: FireDeps) -> LaunchDispatch:
 
         # Re-read the row: the launch wrote runner_id, and the session-init
         # handshake wants the current agent binding.
-        fresh = await asyncio.to_thread(
-            deps.conversation_store.get_conversation, conv.id
-        )
+        fresh = await asyncio.to_thread(deps.conversation_store.get_conversation, conv.id)
         conv_for_dispatch = fresh or conv
 
         await _ensure_runner_session_initialized(

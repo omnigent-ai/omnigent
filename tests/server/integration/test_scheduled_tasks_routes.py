@@ -115,9 +115,7 @@ async def test_create_lists_and_gets(auth_client: httpx.AsyncClient, db_uri: str
     assert got.json()["id"] == task_id
 
 
-async def test_create_rejects_invalid_rrule(
-    auth_client: httpx.AsyncClient, db_uri: str
-) -> None:
+async def test_create_rejects_invalid_rrule(auth_client: httpx.AsyncClient, db_uri: str) -> None:
     _make_user(db_uri)
     # FREQ=SECONDLY fires far below the 1-hour floor.
     resp = await auth_client.post(
