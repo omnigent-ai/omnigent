@@ -56,6 +56,73 @@ logger = logging.getLogger(__name__)
 _TMUX_CONFIG_PATH = os.devnull
 _TMUX_CONVERSATION_LINK_OPTION = "@omnigent-conversation-link"
 
+# Fallback UTF-8 locale forced into a terminal's env when the inherited
+# environment carries no UTF-8 locale signal. ``C.UTF-8`` is glibc's and
+# musl's locale-independent UTF-8 codeset; it needs no locale archive so it
+# is present on minimal container images where ``en_US.UTF-8`` is not.
+_FALLBACK_UTF8_LOCALE = "C.UTF-8"
+
+
+def _is_utf8_locale_value(value: str | None) -> bool:
+    """Return whether a locale env value names the UTF-8 codeset.
+
+    Matches ``en_US.UTF-8``, ``C.UTF-8``, ``utf8``, etc. case- and
+    punctuation-insensitively.
+
+    :param value: A locale env value, or ``None`` when the var is unset.
+    :returns: ``True`` when *value* selects the UTF-8 codeset.
+    """
+    if not value:
+        return False
+    return value.replace("-", "").replace("_", "").lower().endswith("utf8")
+
+
+def _has_utf8_locale(env: dict[str, str]) -> bool:
+    """Return whether *env* selects UTF-8 in a var the pane CLIs actually read.
+
+    The affected native TUIs read ``LC_ALL`` / ``LANG`` directly rather than
+    calling ``setlocale``, so a UTF-8 ``LC_CTYPE`` alone does NOT save them:
+    with ``LANG`` empty and ``LC_ALL`` unset they still fall back to
+    ASCII/Latin-1. Treat the env as safe only when the codeset-deciding vars
+    the CLIs consult carry UTF-8:
+
+    - ``LC_ALL`` set to UTF-8 makes the env safe (it overrides everything).
+    - ``LC_ALL`` set to a non-UTF-8 value is unsafe (it pins non-UTF-8;
+      ``LANG`` cannot rescue it).
+    - otherwise ``LANG`` set to UTF-8 makes the env safe.
+
+    :param env: The environment about to be handed to the terminal's tmux
+        server (and, through it, the native CLI in the pane).
+    :returns: ``True`` when no locale fix is needed.
+    """
+    lc_all = env.get("LC_ALL")
+    if lc_all:
+        return _is_utf8_locale_value(lc_all)
+    return _is_utf8_locale_value(env.get("LANG"))
+
+
+def _apply_utf8_locale_default(env: dict[str, str]) -> None:
+    """Force a UTF-8 locale into *env* when it lacks one, in place.
+
+    Native TUI CLIs (opencode, pi, hermes, and friends) run in the terminal's
+    pane. Several read ``LC_ALL`` / ``LANG`` directly (rather than calling
+    ``setlocale``) to pick their output codeset; when neither names UTF-8 they
+    fall back to ASCII/Latin-1 and re-encode their internal UTF-8 as single
+    bytes, producing cascading mojibake (a UTF-8 arrow renders as a run of
+    accented Latin-1 glyphs) in both the chat and the raw terminal view.
+    Setting ``LC_ALL`` and ``LANG`` to a UTF-8 codeset removes that ambiguity.
+    Only applied when the inherited env has no UTF-8 signal, so an
+    operator-provided locale always wins.
+
+    :param env: The terminal spawn environment, mutated in place.
+    :returns: None.
+    """
+    if IS_WINDOWS or _has_utf8_locale(env):
+        return
+    env["LANG"] = _FALLBACK_UTF8_LOCALE
+    env["LC_ALL"] = _FALLBACK_UTF8_LOCALE
+
+
 # Web-terminal attach transports. ``pty`` forks a full ``tmux attach`` client
 # and streams the rendered screen (see terminals/ws_bridge.py); ``control``
 # attaches a ``tmux -C`` control-mode client and streams per-pane ``%output``
@@ -1059,6 +1126,11 @@ class TerminalInstance:
         # this tmux pane, so the binding token must never reach it.
         # After ``env.update`` so ``self.env`` can't re-admit it.
         env = strip_runner_auth_secrets(env)
+        # Force a UTF-8 locale when the inherited env carries none. Native
+        # TUI CLIs that read LC_ALL / LANG directly otherwise fall back to
+        # ASCII/Latin-1 and mangle multibyte output into mojibake. No-op when
+        # a UTF-8 locale is already set (operator config wins) or on Windows.
+        _apply_utf8_locale_default(env)
 
         # Build the command to run inside tmux. If a sandbox policy
         # is configured, wrap the command in the sandbox launcher so
