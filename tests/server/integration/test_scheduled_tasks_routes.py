@@ -90,6 +90,8 @@ def _create_body(**overrides: object) -> dict[str, object]:
         "rrule": _VALID_RRULE,
         "agent_id": "c2447dd0f8d25acc896bf10409fecf36",
         "timezone": "America/Los_Angeles",
+        "workspace": "/repo",
+        "host_id": "4b653f6031f35d168cc0b37caa1306d1",
     }
     body.update(overrides)
     return body
@@ -103,6 +105,10 @@ async def test_create_lists_and_gets(auth_client: httpx.AsyncClient, db_uri: str
     assert created["name"] == "nightly triage"
     assert created["rrule"] == _VALID_RRULE
     assert created["owner_user_id"] == "alice@example.com"
+    assert created["workspace"] == "/repo"
+    assert created["host_id"] == "4b653f6031f35d168cc0b37caa1306d1"
+    assert "base_branch" not in created
+    assert "execution_target" not in created
     task_id = created["id"]
 
     listed = await auth_client.get("/v1/scheduled-tasks", headers=_headers())
@@ -124,6 +130,30 @@ async def test_create_rejects_invalid_rrule(auth_client: httpx.AsyncClient, db_u
         headers=_headers(),
     )
     assert resp.status_code == 400, resp.text
+
+
+async def test_create_rejects_missing_v1_execution_inputs(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    _make_user(db_uri)
+    resp = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(host_id=None),
+        headers=_headers(),
+    )
+    assert resp.status_code == 422, resp.text
+
+
+async def test_create_rejects_unsupported_public_fields(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    _make_user(db_uri)
+    resp = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(base_branch="main", execution_target="managed_sandbox"),
+        headers=_headers(),
+    )
+    assert resp.status_code == 422, resp.text
 
 
 async def test_update_changes_fields_and_validates_rrule(
@@ -152,6 +182,14 @@ async def test_update_changes_fields_and_validates_rrule(
         headers=_headers(),
     )
     assert bad.status_code == 400, bad.text
+
+    # Deletion is a DELETE operation, not an arbitrary PATCH state.
+    deleted_state = await auth_client.patch(
+        f"/v1/scheduled-tasks/{task_id}",
+        json={"state": "deleted"},
+        headers=_headers(),
+    )
+    assert deleted_state.status_code == 422, deleted_state.text
 
 
 async def test_delete_removes_task(auth_client: httpx.AsyncClient, db_uri: str) -> None:

@@ -105,14 +105,38 @@ class FakePermissionStore:
         return None
 
 
+@dataclass
+class _FakeHost:
+    host_id: str
+    owner: str
+
+
+class FakeHostStore:
+    def __init__(self, hosts: dict[str, _FakeHost] | None = None) -> None:
+        self.hosts = hosts or {}
+
+    def get_host(self, host_id: str) -> _FakeHost | None:
+        return self.hosts.get(host_id)
+
+
+class FakeHostRegistry:
+    def __init__(self, online: set[str] | None = None) -> None:
+        self.online = online or set()
+
+    def get(self, host_id: str) -> object | None:
+        if host_id in self.online:
+            return object()
+        return None
+
+
 def _deps(sched_store: FakeScheduledTaskStore, **overrides: Any) -> FireDeps:
     return FireDeps(
         scheduled_task_store=sched_store,
         conversation_store=overrides.get("conversation_store", FakeConversationStore()),
         agent_store=overrides.get("agent_store", object()),
         permission_store=overrides.get("permission_store", FakePermissionStore()),
-        host_store=overrides.get("host_store", object()),
-        host_registry=overrides.get("host_registry", object()),
+        host_store=overrides.get("host_store", FakeHostStore()),
+        host_registry=overrides.get("host_registry", FakeHostRegistry()),
         runner_router=overrides.get("runner_router"),
         tunnel_registry=overrides.get("tunnel_registry"),
         file_store=overrides.get("file_store"),
@@ -132,6 +156,8 @@ def _task(**overrides: Any) -> ScheduledTask:
         "created_at": 1_800_000_000,
         "state": "active",
         "execution_target": "connected_host",
+        "workspace": "/repo",
+        "host_id": "host_1",
     }
     base.update(overrides)
     return ScheduledTask(**base)
@@ -265,6 +291,73 @@ async def test_launch_failure_is_swallowed() -> None:
     # Must not raise, even though the background launch throws.
     await on_fire("task_1")
     await _drain()
+    assert store.runs[0]["status"] == "failed"
+    assert store.runs[0]["error_code"] == "launch_failed"
+
+
+@pytest.mark.asyncio
+async def test_missing_execution_inputs_record_failed_without_session() -> None:
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(host_id=None, workspace=None)})
+    launched: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        launched.append(conv)
+
+    on_fire = build_on_fire(
+        _deps(store, conversation_store=conv_store),
+        launch_dispatch=_launch,
+    )
+    await on_fire("task_1")
+    await _drain()
+
+    assert launched == []
+    assert conv_store.created == []
+    assert len(store.runs) == 1
+    assert store.runs[0]["status"] == "failed"
+    assert store.runs[0]["error_code"] == "missing_host_id"
+    assert store.runs[0]["conversation_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_no_host_registry_records_failed_without_session() -> None:
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task()})
+
+    on_fire = build_on_fire(
+        _deps(store, conversation_store=conv_store, host_store=None, host_registry=None)
+    )
+    await on_fire("task_1")
+    await _drain()
+
+    assert conv_store.created == []
+    assert len(store.runs) == 1
+    assert store.runs[0]["status"] == "failed"
+    assert store.runs[0]["error_code"] == "host_registry_unavailable"
+    assert store.runs[0]["conversation_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_offline_connected_host_records_failed_without_session() -> None:
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(owner_user_id="alice@example.com")})
+
+    on_fire = build_on_fire(
+        _deps(
+            store,
+            conversation_store=conv_store,
+            host_store=FakeHostStore({"host_1": _FakeHost("host_1", "alice@example.com")}),
+            host_registry=FakeHostRegistry(online=set()),
+        )
+    )
+    await on_fire("task_1")
+    await _drain()
+
+    assert conv_store.created == []
+    assert len(store.runs) == 1
+    assert store.runs[0]["status"] == "failed"
+    assert store.runs[0]["error_code"] == "host_offline"
+    assert store.runs[0]["conversation_id"] is None
 
 
 @pytest.mark.asyncio

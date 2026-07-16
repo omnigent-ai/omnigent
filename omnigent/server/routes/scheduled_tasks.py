@@ -18,7 +18,7 @@ import uuid
 from typing import Any
 
 from fastapi import APIRouter, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from omnigent.entities import ScheduledTask
 from omnigent.errors import ErrorCode, OmnigentError
@@ -33,6 +33,8 @@ _logger = logging.getLogger(__name__)
 class CreateScheduledTaskRequest(BaseModel):
     """Body for ``POST /v1/scheduled-tasks``."""
 
+    model_config = ConfigDict(extra="forbid")
+
     name: str
     prompt: str
     rrule: str
@@ -40,14 +42,14 @@ class CreateScheduledTaskRequest(BaseModel):
     timezone: str = "UTC"
     model_override: str | None = None
     reasoning_effort: str | None = None
-    workspace: str | None = None
-    base_branch: str | None = None
-    execution_target: str = "connected_host"
-    host_id: str | None = None
+    workspace: str = Field(min_length=1)
+    host_id: str = Field(min_length=1)
 
 
 class UpdateScheduledTaskRequest(BaseModel):
     """Body for ``PATCH /v1/scheduled-tasks/{id}``. Unset fields are unchanged."""
+
+    model_config = ConfigDict(extra="forbid")
 
     name: str | None = None
     prompt: str | None = None
@@ -55,12 +57,20 @@ class UpdateScheduledTaskRequest(BaseModel):
     timezone: str | None = None
     model_override: str | None = None
     reasoning_effort: str | None = None
-    workspace: str | None = None
-    base_branch: str | None = None
-    execution_target: str | None = None
+    workspace: str | None = Field(default=None, min_length=1)
+    host_id: str | None = Field(default=None, min_length=1)
     state: str | None = None
-    # Distinguishes "field omitted" (unchanged) from an explicit null on host_id.
-    host_id: str | None = Field(default=None)
+
+    @model_validator(mode="after")
+    def _validate_patch(self) -> UpdateScheduledTaskRequest:
+        """Keep the public v1 update surface to active/paused connected-host runs."""
+        if self.state is not None and self.state not in {"active", "paused"}:
+            raise ValueError("state must be 'active' or 'paused'; use DELETE to delete a task")
+        if "workspace" in self.model_fields_set and self.workspace is None:
+            raise ValueError("workspace cannot be null")
+        if "host_id" in self.model_fields_set and self.host_id is None:
+            raise ValueError("host_id cannot be null")
+        return self
 
 
 def _to_response(task: ScheduledTask) -> dict[str, Any]:
@@ -77,8 +87,6 @@ def _to_response(task: ScheduledTask) -> dict[str, Any]:
         "model_override": task.model_override,
         "reasoning_effort": task.reasoning_effort,
         "workspace": task.workspace,
-        "base_branch": task.base_branch,
-        "execution_target": task.execution_target,
         "host_id": task.host_id,
         "state": task.state,
         "last_run_at": task.last_run_at,
@@ -151,8 +159,6 @@ def create_scheduled_tasks_router(
             model_override=body.model_override,
             reasoning_effort=body.reasoning_effort,
             workspace=body.workspace,
-            base_branch=body.base_branch,
-            execution_target=body.execution_target,
             host_id=body.host_id,
         )
         scheduler = _scheduler(request)

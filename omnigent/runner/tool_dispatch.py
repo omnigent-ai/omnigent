@@ -3133,7 +3133,6 @@ _SCHEDULED_TASK_CREATE_FIELDS = (
     "model_override",
     "reasoning_effort",
     "workspace",
-    "base_branch",
     "host_id",
 )
 # Fields the update tool forwards to PATCH /v1/scheduled-tasks/{id}.

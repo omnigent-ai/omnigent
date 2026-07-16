@@ -118,8 +118,6 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         model_override: str | None = None,
         reasoning_effort: str | None = None,
         workspace: str | None = None,
-        base_branch: str | None = None,
-        execution_target: str = "connected_host",
         host_id: str | None = None,
         state: str = "active",
     ) -> ScheduledTask:
@@ -135,8 +133,8 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             model_override=model_override,
             reasoning_effort=reasoning_effort,
             workspace=workspace,
-            base_branch=base_branch,
-            execution_target=encode_scheduled_task_execution_target(execution_target),
+            base_branch=None,
+            execution_target=encode_scheduled_task_execution_target("connected_host"),
             host_id=host_id,
             state=encode_scheduled_task_state(state),
             last_run_at=None,
@@ -191,8 +189,6 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         model_override: str | None = None,
         reasoning_effort: str | None = None,
         workspace: str | None = None,
-        base_branch: str | None = None,
-        execution_target: str | None = None,
         host_id: str | None = _UNSET,
         state: str | None = None,
         last_run_at: int | None = None,
@@ -232,14 +228,6 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             if workspace is not None and row.workspace != workspace:
                 row.workspace = workspace
                 changed = True
-            if base_branch is not None and row.base_branch != base_branch:
-                row.base_branch = base_branch
-                changed = True
-            if execution_target is not None:
-                encoded_target = encode_scheduled_task_execution_target(execution_target)
-                if row.execution_target != encoded_target:
-                    row.execution_target = encoded_target
-                    changed = True
             if host_id is not _UNSET and row.host_id != host_id:
                 row.host_id = host_id
                 changed = True

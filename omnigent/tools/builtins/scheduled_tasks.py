@@ -39,8 +39,9 @@ class SysScheduledTaskCreateTool(Tool):
         return (
             "Create a scheduled task: a saved prompt that runs an agent session "
             "on a recurring schedule (RRULE). Provide the agent to run, the "
-            "prompt to send it, and the recurrence rule. The task fires "
-            "automatically on its schedule until deleted."
+            "prompt to send it, the recurrence rule, a connected host, and an "
+            "existing workspace on that host. The task fires automatically on "
+            "its schedule until deleted."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -90,21 +91,16 @@ class SysScheduledTaskCreateTool(Tool):
                         },
                         "workspace": {
                             "type": "string",
-                            "description": "Optional absolute path the run's runner starts in.",
-                        },
-                        "base_branch": {
-                            "type": "string",
-                            "description": "Optional git base ref to branch from at fire time.",
+                            "description": "Existing absolute path where the run's runner starts.",
                         },
                         "host_id": {
                             "type": "string",
                             "description": (
-                                "Optional host to pin the run to. Omit to use the "
-                                "owner's freshest online host."
+                                "Connected host to run on, from the current workspace's host list."
                             ),
                         },
                     },
-                    "required": ["name", "prompt", "rrule", "agent_id"],
+                    "required": ["name", "prompt", "rrule", "agent_id", "workspace", "host_id"],
                     "additionalProperties": False,
                 },
             },

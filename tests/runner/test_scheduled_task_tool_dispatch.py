@@ -80,6 +80,9 @@ async def test_create_posts_payload() -> None:
                 "prompt": "go",
                 "rrule": "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
                 "agent_id": "ag_1",
+                "workspace": "/repo",
+                "host_id": "host_1",
+                "base_branch": "main",
                 "unexpected": "dropped",
             }
         ),
@@ -92,6 +95,8 @@ async def test_create_posts_payload() -> None:
         "prompt": "go",
         "rrule": "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
         "agent_id": "ag_1",
+        "workspace": "/repo",
+        "host_id": "host_1",
     }  # unknown fields filtered out
     assert json.loads(out)["id"] == "t1"
 
@@ -163,6 +168,17 @@ def test_tools_registered_without_spec_optin() -> None:
     mgr = ToolManager(AgentSpec(spec_version=1))
     names = {s["function"]["name"] for s in mgr.get_tool_schemas()}
     assert names >= _ALL_NAMES
+
+
+def test_create_tool_schema_matches_connected_host_v1_scope() -> None:
+    from omnigent.tools.builtins.scheduled_tasks import SysScheduledTaskCreateTool
+
+    schema = SysScheduledTaskCreateTool().get_schema()["function"]["parameters"]
+    properties = schema["properties"]
+    assert "workspace" in properties
+    assert "host_id" in properties
+    assert "base_branch" not in properties
+    assert set(schema["required"]) >= {"workspace", "host_id"}
 
 
 def test_tools_in_dispatch_and_relay_sets() -> None:

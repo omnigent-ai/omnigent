@@ -36,15 +36,14 @@ class ScheduledTask:
         ``"claude-opus-4-7"``. ``None`` means use the agent default.
     :param reasoning_effort: Per-task reasoning-effort hint, e.g. ``"high"``.
         ``None`` means use the agent default.
-    :param workspace: Absolute path where a fired session's runner should
-        start (the source repo / working dir). ``None`` when unset.
-    :param base_branch: Git base ref a firing branches from when it creates a
-        worktree at fire time. Pairs with ``workspace``. ``None`` when unset.
-    :param execution_target: Where a firing runs — one of ``"connected_host"``,
-        ``"managed_sandbox"``. Defaults to ``"connected_host"``.
-    :param host_id: For ``connected_host``, the specific host to run on;
-        ``None`` means the owner's freshest online host. Always ``None`` for
-        ``managed_sandbox``.
+    :param workspace: Absolute existing path where a fired session's connected
+        host runner should start. ``None`` only for legacy or invalid rows.
+    :param base_branch: Reserved legacy column; scheduled tasks v1 does not
+        create git worktrees at fire time.
+    :param execution_target: Reserved legacy column; scheduled tasks v1 runs
+        only on ``"connected_host"``.
+    :param host_id: Specific connected host to run on. ``None`` only for legacy
+        or invalid rows.
     :param state: Lifecycle state — one of ``"active"``, ``"paused"``,
         ``"deleted"``. Defaults to ``"active"``.
     :param last_run_at: Unix epoch seconds of the most recent firing, or

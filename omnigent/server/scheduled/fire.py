@@ -7,6 +7,9 @@ real callback (the scheduler ships only a no-op placeholder). A firing:
 #. **Re-reads the row.** The armed timer is never trusted: the row is re-read by
    id, and a row that vanished (deleted between arming and firing) or is no
    longer ``active`` (paused/deleted) is a logged no-op.
+#. **Validates the v1 launch target.** Scheduled tasks v1 is connected host +
+   existing workspace only; missing host/workspace or an unreachable host is
+   recorded as a failed/skipped run instead of a running run.
 #. **Creates a session** bound to the task's agent, carrying the stored
    ``workspace`` / ``host_id`` / ``model_override`` / ``reasoning_effort``.
 #. **Grants ownership.** The spawned session gets a ``LEVEL_OWNER`` grant for the
@@ -26,9 +29,10 @@ it completes (``loop.create_task`` only keeps a weak one). Any failure in the
 background work is caught and logged: a failed fire must never crash the
 scheduler, and v1's retry policy is simply "the next occurrence fires normally".
 
-**Execution target.** Only ``connected_host`` runs in v1. A ``managed_sandbox``
-row is logged and recorded as a ``skipped`` run — provisioning a sandbox from the
-fire path is a follow-up; the ``resolve_sandbox`` seam is intentionally left open.
+**Execution target.** Only connected-host, existing-workspace runs are supported
+in v1. Sandbox provisioning, branch selection, worktree creation, replay/backfill,
+completion tracking, and multi-replica leasing are follow-ups for shared
+session-create orchestration rather than this direct fire path.
 """
 
 from __future__ import annotations
@@ -62,6 +66,15 @@ _PENDING_FIRES: set[asyncio.Task[None]] = set()
 # session and dispatch the task's prompt so the agent runs. Injectable so the
 # orchestration can be unit-tested without a live host/runner.
 LaunchDispatch = Callable[[Conversation, ScheduledTask], Awaitable[None]]
+ConnectedHostPreflight = Callable[[ScheduledTask], Awaitable[None]]
+
+
+class _CannotLaunchScheduledFire(RuntimeError):
+    """A fire cannot start because the connected-host target is not usable."""
+
+    def __init__(self, message: str, *, error_code: str) -> None:
+        super().__init__(message)
+        self.error_code = error_code
 
 
 @dataclass
@@ -107,7 +120,12 @@ def build_on_fire(
     :returns: An ``async on_fire(scheduled_task_id)`` suitable for
         :class:`ScheduledTaskScheduler`.
     """
-    dispatch = launch_dispatch or _make_connected_host_dispatch(deps)
+    preflight: ConnectedHostPreflight | None = None
+    if launch_dispatch is None:
+        dispatch = _make_connected_host_dispatch(deps)
+        preflight = _make_connected_host_preflight(deps)
+    else:
+        dispatch = launch_dispatch
 
     async def on_fire(scheduled_task_id: str) -> None:
         # Re-read the row: never trust the armed timer. A deleted or
@@ -127,7 +145,7 @@ def build_on_fire(
         # Fire-and-forget: the session create + launch runs in the background so
         # on_fire returns immediately and the scheduler re-arms the timer now.
         fire_task = asyncio.create_task(
-            _run_fire(deps, task, dispatch),
+            _run_fire(deps, task, dispatch, preflight),
             name=f"scheduled-fire-{scheduled_task_id}",
         )
         _PENDING_FIRES.add(fire_task)
@@ -140,6 +158,7 @@ async def _run_fire(
     deps: FireDeps,
     task: ScheduledTask,
     dispatch: LaunchDispatch,
+    preflight: ConnectedHostPreflight | None,
 ) -> None:
     """Background body of a firing: create session, grant, launch, record run.
 
@@ -148,8 +167,6 @@ async def _run_fire(
     """
     scheduled_at = int(time.time())
     try:
-        # v1 only runs connected_host. A managed_sandbox row is recorded as a
-        # skipped run; provisioning from the fire path is a follow-up.
         if task.execution_target != "connected_host":
             _logger.info(
                 "scheduled fire: task %s target %r not supported in v1 — skipping",
@@ -157,15 +174,47 @@ async def _run_fire(
                 task.execution_target,
             )
             await asyncio.to_thread(
-                deps.scheduled_task_store.create_run,
-                _new_id(),
-                task.id,
-                "skipped",
+                _record_run_sync,
+                deps,
+                task,
+                None,
                 scheduled_at,
+                "skipped",
                 error=f"execution_target {task.execution_target!r} not supported yet",
                 error_code="unsupported_target",
             )
             return
+
+        input_error = _validate_v1_execution_inputs(task)
+        if input_error is not None:
+            error, error_code = input_error
+            _logger.warning("scheduled fire: task %s cannot run: %s", task.id, error)
+            await _record_run(
+                deps,
+                task,
+                None,
+                scheduled_at,
+                status="failed",
+                error=error,
+                error_code=error_code,
+            )
+            return
+
+        if preflight is not None:
+            try:
+                await preflight(task)
+            except _CannotLaunchScheduledFire as exc:
+                _logger.warning("scheduled fire: task %s cannot launch: %s", task.id, exc)
+                await _record_run(
+                    deps,
+                    task,
+                    None,
+                    scheduled_at,
+                    status="failed",
+                    error=str(exc),
+                    error_code=exc.error_code,
+                )
+                return
 
         conv = await _create_session(deps, task)
         await _grant_owner(deps, task, conv.id)
@@ -187,6 +236,7 @@ async def _run_fire(
                 scheduled_at,
                 status="failed",
                 error="runner launch/dispatch failed",
+                error_code="launch_failed",
             )
             return
 
@@ -198,6 +248,9 @@ async def _run_fire(
 
 async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:
     """Create a conversation bound to the task's agent, carrying the stored spec."""
+    # v1 creates the conversation directly for connected-host, existing-workspace
+    # runs; sandbox, branch, and worktree support must use shared session-create
+    # orchestration when those modes are added.
     conv = await asyncio.to_thread(
         deps.conversation_store.create_conversation,
         agent_id=task.agent_id,
@@ -234,22 +287,43 @@ async def _grant_owner(deps: FireDeps, task: ScheduledTask, conversation_id: str
 async def _record_run(
     deps: FireDeps,
     task: ScheduledTask,
-    conversation_id: str,
+    conversation_id: str | None,
     scheduled_at: int,
     *,
     status: str,
     error: str | None = None,
+    error_code: str | None = None,
 ) -> None:
     """Stamp last_run_* on the task and write a scheduled_task_runs row."""
-    now = int(time.time())
     await asyncio.to_thread(
-        deps.scheduled_task_store.update,
-        task.id,
-        last_run_at=now,
-        last_run_conversation_id=conversation_id,
+        _record_run_sync,
+        deps,
+        task,
+        conversation_id,
+        scheduled_at,
+        status,
+        error=error,
+        error_code=error_code,
     )
-    await asyncio.to_thread(
-        deps.scheduled_task_store.create_run,
+
+
+def _record_run_sync(
+    deps: FireDeps,
+    task: ScheduledTask,
+    conversation_id: str | None,
+    scheduled_at: int,
+    status: str,
+    *,
+    error: str | None = None,
+    error_code: str | None = None,
+) -> None:
+    """Synchronous run recording body for ``asyncio.to_thread`` callers."""
+    now = int(time.time())
+    update_fields: dict[str, Any] = {"last_run_at": now}
+    if conversation_id is not None:
+        update_fields["last_run_conversation_id"] = conversation_id
+    deps.scheduled_task_store.update(task.id, **update_fields)
+    deps.scheduled_task_store.create_run(
         _new_id(),
         task.id,
         status,
@@ -257,7 +331,49 @@ async def _record_run(
         conversation_id=conversation_id,
         fired_at=now,
         error=error,
+        error_code=error_code,
     )
+
+
+def _validate_v1_execution_inputs(task: ScheduledTask) -> tuple[str, str] | None:
+    """Return a failure reason/code when a task lacks v1 execution inputs."""
+    if not isinstance(task.host_id, str) or not task.host_id.strip():
+        return "scheduled tasks v1 requires a connected host_id", "missing_host_id"
+    if not isinstance(task.workspace, str) or not task.workspace.strip():
+        return "scheduled tasks v1 requires an existing host workspace", "missing_workspace"
+    return None
+
+
+def _make_connected_host_preflight(deps: FireDeps) -> ConnectedHostPreflight:
+    """Build a preflight check for the connected-host execution target."""
+
+    async def _preflight(task: ScheduledTask) -> None:
+        if deps.host_registry is None or deps.host_store is None:
+            raise _CannotLaunchScheduledFire(
+                "connected host registry/store is not configured",
+                error_code="host_registry_unavailable",
+            )
+
+        host_id = task.host_id
+        assert host_id is not None  # guarded by _validate_v1_execution_inputs
+        host = await asyncio.to_thread(deps.host_store.get_host, host_id)
+        if host is None:
+            raise _CannotLaunchScheduledFire(
+                f"connected host {host_id!r} was not found",
+                error_code="host_not_found",
+            )
+        if task.owner_user_id is not None and host.owner != task.owner_user_id:
+            raise _CannotLaunchScheduledFire(
+                f"connected host {host_id!r} is not owned by the scheduled task owner",
+                error_code="host_not_owned",
+            )
+        if deps.host_registry.get(host_id) is None:
+            raise _CannotLaunchScheduledFire(
+                f"connected host {host_id!r} is not online on this server",
+                error_code="host_offline",
+            )
+
+    return _preflight
 
 
 def _new_id() -> str:
@@ -268,9 +384,8 @@ def _new_id() -> str:
 def _make_connected_host_dispatch(deps: FireDeps) -> LaunchDispatch:
     """Build the real connected-host launch+dispatch seam.
 
-    Resolves the target host (the task's pinned ``host_id`` or the owner's
-    freshest online host), launches a runner on it, waits for the runner to
-    connect, and dispatches the task's prompt so the agent runs.
+    Uses the task's pinned ``host_id``, launches a runner on it, waits for the
+    runner to connect, and dispatches the task's prompt so the agent runs.
     """
 
     async def _dispatch(conv: Conversation, task: ScheduledTask) -> None:
@@ -283,25 +398,12 @@ def _make_connected_host_dispatch(deps: FireDeps) -> LaunchDispatch:
         )
 
         if deps.host_registry is None or deps.host_store is None:
-            _logger.warning(
-                "scheduled fire: no host registry/store configured — cannot launch "
-                "runner for task %s (session %s)",
-                task.id,
-                conv.id,
-            )
-            return
+            raise RuntimeError("connected host registry/store is not configured")
 
         owner = task.owner_user_id or RESERVED_USER_LOCAL
-        host_id = _resolve_host_id(deps, task, owner)
-        if host_id is None:
-            _logger.warning(
-                "scheduled fire: no online host for task %s (owner %s) — session %s "
-                "created but not launched",
-                task.id,
-                owner,
-                conv.id,
-            )
-            return
+        host_id = task.host_id
+        if host_id is None or deps.host_registry.get(host_id) is None:
+            raise RuntimeError(f"connected host {host_id!r} is not online")
 
         # Authorize + resolve the live host connection (owner check skipped when
         # auth is disabled, consistent with single-user behavior).
@@ -357,16 +459,3 @@ def _make_connected_host_dispatch(deps: FireDeps) -> LaunchDispatch:
         )
 
     return _dispatch
-
-
-def _resolve_host_id(deps: FireDeps, task: ScheduledTask, owner: str) -> str | None:
-    """Pick the host to launch on: the pinned ``host_id`` or the owner's
-    freshest online host. Returns ``None`` when none is online."""
-    online = set(deps.host_registry.online_host_ids())
-    if task.host_id is not None:
-        return task.host_id if task.host_id in online else None
-    # list_hosts is ordered updated_at desc (freshest first).
-    for host in deps.host_store.list_hosts(owner):
-        if host.host_id in online:
-            return host.host_id
-    return None
