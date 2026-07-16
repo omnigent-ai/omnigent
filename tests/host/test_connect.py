@@ -31,6 +31,8 @@ from omnigent.host.frames import (
     HostListDirFrame,
     HostListDirResultFrame,
     HostRunnerExitedFrame,
+    HostRunnerStatusFrame,
+    HostRunnerStatusResultFrame,
     HostStatFrame,
     HostStatResultFrame,
     HostStopRunnerFrame,
@@ -744,6 +746,77 @@ def test_handle_stop_unknown_runner() -> None:
     assert isinstance(result, HostStopRunnerResultFrame)
     assert result.status == "failed"
     assert "unknown runner" in (result.error or "")
+
+
+def test_handle_runner_status_alive_for_running_process(tmp_path: Path) -> None:
+    """
+    Verify ``_handle_runner_status`` reports ``alive`` for a tracked
+    runner whose process is still running.
+
+    This is the still-booting / still-serving case: the server must wait
+    for this runner's tunnel rather than relaunch a healthy process.
+    """
+    host = _make_host_process()
+    proc = subprocess.Popen(
+        ["sleep", "60"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        host._runners["runner_live"] = _RunnerHandle(
+            proc=proc, log_path=tmp_path / "runner-live.log"
+        )
+        result = host._handle_runner_status(
+            HostRunnerStatusFrame(request_id="req_rs", runner_id="runner_live")
+        )
+        assert isinstance(result, HostRunnerStatusResultFrame)
+        assert result.request_id == "req_rs"
+        assert result.status == "alive"
+    finally:
+        proc.terminate()
+        proc.wait()
+
+
+def test_handle_runner_status_dead_for_exited_process(tmp_path: Path) -> None:
+    """
+    Verify ``_handle_runner_status`` reports ``dead`` for a tracked
+    runner whose process has exited.
+
+    A tracked-but-exited runner will never connect its tunnel, so the
+    server must relaunch immediately instead of burning the connect
+    grace on it.
+    """
+    host = _make_host_process()
+    proc = subprocess.Popen(
+        ["true"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    proc.wait()  # ensure the process has exited before we query
+    host._runners["runner_gone"] = _RunnerHandle(proc=proc, log_path=tmp_path / "runner-gone.log")
+    result = host._handle_runner_status(
+        HostRunnerStatusFrame(request_id="req_rs", runner_id="runner_gone")
+    )
+    assert isinstance(result, HostRunnerStatusResultFrame)
+    assert result.status == "dead"
+
+
+def test_handle_runner_status_unknown_for_untracked_runner() -> None:
+    """
+    Verify ``_handle_runner_status`` reports ``unknown`` for a runner
+    this host has no record of.
+
+    Covers a runner that was stopped (``_handle_stop`` popped it) and a
+    fresh post-restart host that never spawned it — the exact
+    host-restart case that used to strand the server on a full connect
+    grace. Both must read ``unknown`` so the server relaunches at once.
+    """
+    host = _make_host_process()
+    result = host._handle_runner_status(
+        HostRunnerStatusFrame(request_id="req_rs", runner_id="runner_never_seen")
+    )
+    assert isinstance(result, HostRunnerStatusResultFrame)
+    assert result.status == "unknown"
 
 
 def test_alive_runner_ids_cleans_dead(tmp_path: Path) -> None:

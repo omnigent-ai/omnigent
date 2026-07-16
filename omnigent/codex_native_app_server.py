@@ -43,7 +43,7 @@ from omnigent.inner.codex_executor import (
     _populate_codex_home_config,
     _provider_codex_config_overrides,
 )
-from omnigent.inner.databricks_executor import _read_databrickscfg, _read_databrickscfg_host
+from omnigent.inner.databricks_executor import _databricks_gateway_host
 
 _logger = logging.getLogger(__name__)
 
@@ -1115,8 +1115,10 @@ def build_codex_native_server(
     env = _clean_codex_env()
     config_overrides: list[str] = []
     if profile is not None:
-        creds = _read_databrickscfg(profile)
-        host = creds.host if creds is not None else _read_databrickscfg_host(profile)
+        # Use the profile's own host so the gateway base URL matches the token
+        # the profile-pinned auth command mints; a DATABRICKS_HOST override in
+        # the runner env must not point the base URL at another workspace.
+        host = _databricks_gateway_host(profile)
         if not host:
             raise OSError(
                 f"Native Codex with Databricks profile {profile!r} (from your "

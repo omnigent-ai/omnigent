@@ -59,6 +59,7 @@ import {
 } from "@/hooks/useWorkspaceChangedFiles";
 import { cn } from "@/lib/utils";
 import { isNativeWrapper as isNativeWrapperLabel } from "@/lib/nativeCodingAgents";
+import { isCodexNativeSession } from "@/lib/codexPlanMode";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isSingleUserMode } from "@/lib/capabilities";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
@@ -345,6 +346,10 @@ export function AppShell() {
   const sessionLabels = { ...activeConv?.labels, ...activeSession?.labels };
   const terminalFirst = sessionLabels["omnigent.ui"] === "terminal";
   const isClaudeNative = sessionLabels["omnigent.wrapper"] === "claude-code-native-ui";
+  // Harnesses that publish a todo list to the TodoPanel: Claude via
+  // TodoWrite, and Codex which maps its plan updates to the same schema.
+  const isCodexNative = isCodexNativeSession({ labels: sessionLabels });
+  const todosSupported = isClaudeNative || isCodexNative;
   // Native-CLI wrapper of either family. Keys harness behavior gates
   // (composer slash commands, `/model`); terminal-first SDK sessions
   // (embedded Omnigent REPL terminal) have NO wrapper label and must
@@ -513,14 +518,14 @@ export function AppShell() {
         // empty and ``agentSupportsShells`` starts false while the agent
         // loads, so native sessions don't flash the tab.
         terminals: !hideTerminalsTab && (railTerminals.length > 0 || agentSupportsShells),
-        todos: isClaudeNative && todos.length > 0,
+        todos: todosSupported && todos.length > 0,
       }) as const,
     [
       showFilesPanel,
       hideTerminalsTab,
       railTerminals.length,
       agentSupportsShells,
-      isClaudeNative,
+      todosSupported,
       todos.length,
     ],
   );
@@ -1298,7 +1303,7 @@ export function AppShell() {
                     hideTerminalsTab,
                     showShellsTab: railTabsAvailable.terminals,
                     terminalsLength: railTerminals.length,
-                    isClaudeNative,
+                    todosSupported,
                     todosCompleted,
                     todosTotal: todos.length,
                     debugMode,
@@ -1347,7 +1352,7 @@ export function AppShell() {
                       terminalsLength={railTerminals.length}
                       subagentsWorking={subagentsWorking}
                       agentCount={agentCount}
-                      isClaudeNative={isClaudeNative}
+                      todosSupported={todosSupported}
                       todosCompleted={todosCompleted}
                       todosTotal={todos.length}
                       rootSessionId={rootSessionId}

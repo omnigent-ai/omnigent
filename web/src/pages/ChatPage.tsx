@@ -599,7 +599,7 @@ export function ChatPage() {
     isLoading: agentsLoading,
     error: agentsError,
     refetch: refetchAgents,
-  } = useAgents({ enabled: !!urlConvId });
+  } = useAgents({ enabled: !urlConvId });
   const { data: conversationsData } = useConversations("", true);
   const conversations = useMemo(
     () => conversationsData?.pages.flatMap((p) => p.data),
@@ -739,10 +739,9 @@ export function ChatPage() {
   // for legacy conversations without an agent binding — leave the
   // picker alone in those cases.
   //
-  // If the bound agent isn't in the cached list (e.g. a new agent was
-  // registered by a fresh `omnigent run` after the page loaded),
-  // refetch so the list stays current. staleTime: Infinity means the
-  // query won't self-update, so we do it manually on demand.
+  // On the landing page, if the bound agent isn't in the cached list
+  // (e.g. a new agent registered by a fresh `omnigent run` after load),
+  // refetch on demand — useAgents is only enabled there.
   useEffect(() => {
     if (boundAgentId === null) return;
     setSelectedAgentId(boundAgentId);

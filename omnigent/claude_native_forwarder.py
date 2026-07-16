@@ -527,6 +527,11 @@ class _ForwardDedupeState:
     # ``state.current_response_id`` unadvanced). ``None`` until the first
     # turn-start edge. Reset on /clear and /fork like the other baselines.
     posted_running_response_id: str | None = None
+    # Failed cost posts are retried by this long-running poll loop. Without a
+    # retry gate, an edge 429 turns the poll interval into a request storm and
+    # prevents the limiter from recovering.
+    cost_retry_not_before: float = 0.0
+    cost_retry_failures: int = 0
 
 
 @dataclass(frozen=True)
@@ -1764,6 +1769,8 @@ async def _forward_session_cost(
         mutated in place.
     :returns: None.
     """
+    if time.monotonic() < dedupe.cost_retry_not_before:
+        return
     status_state = await asyncio.to_thread(read_claude_context_state, bridge_dir)
     status_cost = _cumulative_cost_from_status_state(status_state)
     active_subagents = [
@@ -1818,14 +1825,25 @@ async def _forward_session_cost(
             usage=payload,
         )
     except httpx.HTTPError as exc:
+        dedupe.cost_retry_failures += 1
+        delay = min(30.0, float(2 ** min(dedupe.cost_retry_failures - 1, 5)))
+        if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 429:
+            raw_retry_after = exc.response.headers.get("retry-after")
+            with contextlib.suppress(ValueError):
+                delay = max(delay, float(raw_retry_after)) if raw_retry_after else delay
+        dedupe.cost_retry_not_before = time.monotonic() + delay
         _logger.warning(
-            "Failed to forward Claude session cost; session=%s bridge_dir=%s http_status=%s",
+            "Failed to forward Claude session cost; session=%s bridge_dir=%s "
+            "http_status=%s retry_in=%.1fs",
             session_id,
             bridge_dir,
             _http_status_for_log(exc),
+            delay,
             exc_info=True,
         )
         return
+    dedupe.cost_retry_failures = 0
+    dedupe.cost_retry_not_before = 0.0
     if "cumulative_cost_usd" in payload:
         dedupe.posted_cost = display_cost
     if "policy_cost_usd" in payload:

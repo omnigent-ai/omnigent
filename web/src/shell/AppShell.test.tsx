@@ -2645,6 +2645,40 @@ describe("Mobile session menu", () => {
     expect(screen.getByTestId("todo-panel")).toBeInTheDocument();
   });
 
+  it("opens the Tasks drawer for a codex-native session with todos", () => {
+    // Codex-native maps its plan updates to the same todo schema, so the
+    // Tasks entry must gate on codex-native too — not just claude-native.
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([
+      {
+        id: "conv_codex",
+        permission_level: null,
+        labels: { "omnigent.wrapper": "codex-native-ui" },
+      },
+    ]);
+    useChatStore.setState({
+      todos: [
+        { content: "Locate CLI parser", status: "in_progress", activeForm: "Locate CLI parser" },
+      ],
+    });
+
+    renderShell("/c/conv_codex");
+
+    expect(screen.getByTestId("todos-panel-drawer")).toHaveAttribute("data-state", "closed");
+    expect(screen.queryByTestId("todo-panel")).toBeNull();
+
+    openSessionMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: /Tasks/i }));
+
+    // A codex-native session with a non-empty plan opens the Tasks drawer,
+    // the same as a claude-native session with todos.
+    expect(screen.getByTestId("todos-panel-drawer")).toHaveAttribute("data-state", "open");
+    expect(screen.getByTestId("todo-panel")).toBeInTheDocument();
+  });
+
   it("keeps the FAB with only the Agents entry for a minimal agent", () => {
     // available:false → no files; no shells, no todos, no debug. The
     // Agents entry is unconditional (badge = 1, the main agent), so the

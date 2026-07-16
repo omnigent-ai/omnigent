@@ -6070,6 +6070,57 @@ async def test_forward_session_cost_posts_status_when_no_subagents(
     assert dedupe.posted_policy_cost == pytest.approx(0.25)
 
 
+@pytest.mark.asyncio
+async def test_forward_session_cost_backs_off_after_rate_limit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    parent = tmp_path / "sess.jsonl"
+    parent.write_text("parent", encoding="utf-8")
+    monkeypatch.setattr(
+        forwarder, "read_claude_context_state", lambda _bridge: {"total_cost_usd": 0.25}
+    )
+    now = {"value": 100.0}
+    monkeypatch.setattr(forwarder.time, "monotonic", lambda: now["value"])
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(429, headers={"retry-after": "5"}, request=request)
+        return httpx.Response(200, json={}, request=request)
+
+    dedupe = forwarder._ForwardDedupeState()
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+        kwargs = {
+            "client": client,
+            "session_id": "conv_parent",
+            "bridge_dir": bridge_dir,
+            "parent_transcript_path": parent,
+            "subagent_state": forwarder.SubagentForwardState(subagents={}),
+            "dedupe": dedupe,
+            "cost_cache": {},
+        }
+        await forwarder._forward_session_cost(**kwargs)
+        assert calls == 1
+        assert dedupe.cost_retry_failures == 1
+        assert dedupe.cost_retry_not_before == pytest.approx(105.0)
+
+        await forwarder._forward_session_cost(**kwargs)
+        assert calls == 1
+
+        now["value"] = 105.0
+        await forwarder._forward_session_cost(**kwargs)
+
+    assert calls == 2
+    assert dedupe.cost_retry_failures == 0
+    assert dedupe.cost_retry_not_before == 0.0
+    assert dedupe.posted_cost == pytest.approx(0.25)
+
+
 def test_parse_json_response_returns_value_on_valid_json() -> None:
     """
     A normal JSON body parses through ``_parse_json_response`` unchanged.

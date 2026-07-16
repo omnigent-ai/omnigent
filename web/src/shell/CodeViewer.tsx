@@ -61,6 +61,7 @@ import {
   lineOverlapsSelection,
 } from "./codeViewerHelpers";
 import { NotebookPreview } from "./NotebookPreview";
+import { PreviewSearchBar } from "./PreviewSearchBar";
 import { renderLineTokens } from "./codeViewerRendering";
 import { HtmlCommentViewer } from "./HtmlCommentViewer";
 import { TruncatedBanner } from "./TruncatedBanner";
@@ -145,9 +146,19 @@ const MARKDOWN_COMPONENTS: Components = {
   },
 };
 
-function MarkdownPreview({ content }: { content: string }) {
+function MarkdownPreview({
+  content,
+  rootRef,
+}: {
+  content: string;
+  rootRef?: RefObject<HTMLDivElement | null>;
+}) {
   return (
-    <div className="markdown-preview px-6 py-4 overflow-auto h-full prose dark:prose-invert prose-sm max-w-none">
+    <div
+      ref={rootRef}
+      data-preview-scroll
+      className="markdown-preview px-6 py-4 overflow-auto h-full prose dark:prose-invert prose-sm max-w-none"
+    >
       <ReactMarkdown
         remarkPlugins={MARKDOWN_REMARK_PLUGINS}
         rehypePlugins={MARKDOWN_REHYPE_PLUGINS}
@@ -155,6 +166,51 @@ function MarkdownPreview({ content }: { content: string }) {
       >
         {content}
       </ReactMarkdown>
+    </div>
+  );
+}
+
+// Markdown / notebook preview with find-in-file. The preview is React-owned
+// DOM, so PreviewSearchBar highlights matches via the CSS Custom Highlight API
+// (no node mutation). `contentVersion` = content string, so the match ranges
+// recompute when the rendered document changes.
+function PreviewWithSearch({
+  content,
+  isNotebook,
+  truncated,
+  searchOpen,
+  onSearchHandled,
+  searchInputRef,
+}: {
+  content: string;
+  isNotebook: boolean;
+  truncated: boolean;
+  searchOpen: boolean;
+  onSearchHandled: () => void;
+  searchInputRef: RefObject<HTMLInputElement | null>;
+}) {
+  const previewRef = useRef<HTMLDivElement>(null);
+  const bar = (
+    <PreviewSearchBar
+      containerRef={previewRef}
+      contentVersion={content}
+      open={searchOpen}
+      onClose={onSearchHandled}
+      inputRef={searchInputRef}
+    />
+  );
+  const preview = isNotebook ? (
+    <NotebookPreview content={content} rootRef={previewRef} />
+  ) : (
+    <MarkdownPreview content={content} rootRef={previewRef} />
+  );
+  // The find bar sits above the preview; a truncated preview also shows the
+  // banner. The bar renders nothing when closed, so layout is unchanged then.
+  return (
+    <div className="flex h-full flex-col">
+      {bar}
+      {truncated && <TruncatedBanner />}
+      <div className="min-h-0 flex-1">{preview}</div>
     </div>
   );
 }
@@ -631,19 +687,15 @@ export function CodeViewer({
   }
 
   if (viewMode === "preview" && (lang === "markdown" || isNotebookPath(path))) {
-    const preview = isNotebookPath(path) ? (
-      <NotebookPreview content={content} />
-    ) : (
-      <MarkdownPreview content={content} />
-    );
-    // A truncated preview renders incomplete content; warn the user (the editor
-    // and source surfaces already do). No layout change when not truncated.
-    if (!truncated) return preview;
     return (
-      <div className="flex h-full flex-col">
-        <TruncatedBanner />
-        <div className="min-h-0 flex-1">{preview}</div>
-      </div>
+      <PreviewWithSearch
+        content={content}
+        isNotebook={isNotebookPath(path)}
+        truncated={truncated}
+        searchOpen={searchOpen}
+        onSearchHandled={handleSearchHandled}
+        searchInputRef={searchInputRef}
+      />
     );
   }
 

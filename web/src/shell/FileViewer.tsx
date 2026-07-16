@@ -78,6 +78,7 @@ import { CommentSenderProvider, useOptionalCommentSender } from "@/hooks/Comment
 import { markCommentsSeen } from "@/hooks/useSeenComments";
 import { useChatStore } from "@/store/chatStore";
 import { useResizablePanel } from "@/hooks/useResizablePanel";
+import { useIOSNativeKeyboardInset } from "@/hooks/useIOSNativeKeyboardInset";
 import { useWorkspaceChangedFiles } from "@/hooks/useWorkspaceChangedFiles";
 import { cn } from "@/lib/utils";
 import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileViewPreferences";
@@ -353,6 +354,13 @@ function FileViewerBody({
     50,
     frameless ? undefined : minWidthPx,
   );
+  // The mobile viewer is a `fixed inset-0` overlay, so the iOS shell-lock
+  // (useIOSViewportLock) — which only resizes flow content inside .app-shell —
+  // doesn't lift it above the soft keyboard. Pad the overlay's bottom by the
+  // keyboard inset so the comments panel and its (auto-focused) textarea stay
+  // visible. No-op off iOS / with the keyboard closed. Not needed frameless
+  // (embedded in the desktop aside, never a fixed overlay).
+  const keyboardInset = useIOSNativeKeyboardInset(!frameless && open);
   const fileQuery = useFileContent(conversationId, path);
   const diffQuery = useFileDiff(conversationId, path);
   const changedFiles = useWorkspaceChangedFiles(conversationId);
@@ -1493,7 +1501,7 @@ function FileViewerBody({
   return (
     <aside
       data-testid="file-viewer"
-      style={{ width: panelWidth }}
+      style={{ width: panelWidth, paddingBottom: keyboardInset || undefined }}
       className={cn(
         "flex flex-col overflow-hidden bg-card transition-[translate,border-color,border-width] duration-150 ease-out",
         // Mobile (default): fixed full-screen overlay, slide via translate-x.
