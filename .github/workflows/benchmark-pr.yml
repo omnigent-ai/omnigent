@@ -1,0 +1,177 @@
+name: Benchmark (PR)
+
+# Runs a lightweight SQLite benchmark when a PR touches migration files or
+# store-layer code and compares against the latest nightly benchmark artifact
+# as a baseline. Posts results as a PR comment and blocks the PR if a
+# regression is detected.
+#
+# Only runs on PRs to the main repo (not forks without secrets). Skips
+# comparison if no nightly baseline artifact is available — the benchmark still
+# runs and reports results, it just won't block.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - "omnigent/db/migrations/**"
+      - "omnigent/stores/**"
+      - ".github/workflows/benchmark-pr.yml"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  OMNIGENT_SKIP_WEB_UI: "true"
+  UV_INDEX_URL: https://pypi.org/simple
+  PIP_INDEX_URL: https://pypi.org/simple
+
+concurrency:
+  group: benchmark-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  benchmark-pr:
+    name: Benchmark regression check (sqlite)
+    if: github.repository == 'omnigent-ai/omnigent' && !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version-file: ".python-version"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v3
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --extra dev --extra databricks
+
+      # Use the same corpus size as the nightly so baseline numbers are
+      # directly comparable. Cache the seeded DB on the schema head + seed
+      # script hash to avoid re-seeding on every push (same contract as
+      # benchmark.yml).
+      - name: Resolve seed cache key
+        id: seedkey
+        run: |
+          HEAD="$(uv run --no-sync dev/benchmarks/omnigent/seed.py --print-head)"
+          echo "key=benchdb-sqlite-${HEAD}-5000x200-${{ hashFiles('dev/benchmarks/omnigent/seed.py') }}" \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Restore seeded SQLite corpus
+        id: seedcache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v4
+        with:
+          path: bench.db
+          key: ${{ steps.seedkey.outputs.key }}
+
+      - name: Seed SQLite corpus
+        if: steps.seedcache.outputs.cache-hit != 'true'
+        run: |
+          uv run --no-sync dev/benchmarks/omnigent/seed.py \
+            --database-uri "sqlite:///bench.db" \
+            --sessions 5000 --items-per-session 200
+
+      - name: Run benchmark (candidate)
+        run: |
+          uv run --no-sync dev/benchmarks/omnigent/run.py \
+            --database-uri "sqlite:///bench.db" \
+            --iterations 100 \
+            --runs 3 \
+            --output candidate.json
+
+      - name: Download latest nightly baseline (sqlite)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+          RUN_ID=$(gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/benchmark.yml/runs?status=success&branch=main&per_page=10" \
+            --jq '.workflow_runs[0].id // empty')
+          if [ -z "$RUN_ID" ]; then
+            echo "No successful nightly benchmark run found — skipping comparison."
+            echo "BASELINE_FOUND=false" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          ARTIFACT_ID=$(gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/artifacts" \
+            --jq '.artifacts[] | select(.name | startswith("benchmark-results-sqlite-")) | .id' \
+            | head -1)
+          if [ -z "$ARTIFACT_ID" ]; then
+            echo "No sqlite artifact found on run ${RUN_ID} — skipping comparison."
+            echo "BASELINE_FOUND=false" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}/zip" \
+            > baseline.zip && \
+          unzip -q baseline.zip -d baseline_dir && \
+          mv baseline_dir/*.json baseline.json && \
+          echo "BASELINE_FOUND=true" >> "$GITHUB_ENV" || \
+          (echo "BASELINE_FOUND=false" >> "$GITHUB_ENV"; echo "Artifact download failed — skipping comparison.")
+
+      - name: Compare baseline vs candidate
+        if: env.BASELINE_FOUND == 'true'
+        id: compare
+        run: |
+          set +e
+          uv run --no-sync dev/benchmarks/omnigent/compare.py \
+            --baseline baseline.json \
+            --candidate candidate.json \
+            --backend sqlite \
+            --threshold 1.0 \
+            --output-markdown comparison.md
+          echo "EXIT_CODE=$?" >> "$GITHUB_ENV"
+
+      - name: Build PR comment body
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          {
+            echo "<!-- benchmark-pr-comment -->"
+            echo "## Benchmark results (SQLite, PR #${{ github.event.pull_request.number }})"
+            echo ""
+            echo "Commit: \`${{ github.event.pull_request.head.sha }}\`"
+            echo ""
+            if [ "$BASELINE_FOUND" = "true" ]; then
+              cat comparison.md
+            else
+              echo "No nightly baseline artifact found — comparison skipped."
+              echo ""
+              echo "Candidate results recorded in \`candidate.json\` artifact."
+            fi
+          } > comment_body.md
+
+      - name: Post PR comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr comment "${{ github.event.pull_request.number }}" \
+            --edit-last \
+            --body-file comment_body.md || \
+          gh pr comment "${{ github.event.pull_request.number }}" \
+            --body-file comment_body.md
+
+      - name: Upload candidate results
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: benchmark-results-sqlite-pr-${{ github.event.pull_request.number }}-${{ github.run_id }}
+          path: candidate.json
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Fail on regression
+        if: env.BASELINE_FOUND == 'true' && env.EXIT_CODE == '1'
+        run: |
+          echo "Benchmark regression detected. See the PR comment for details."
+          exit 1

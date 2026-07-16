@@ -50,6 +50,7 @@ import type {
   ErrorBlock,
   MessageContentBlock,
   TextDone,
+  ToolGroup,
   UserMessageBlock,
 } from "@/lib/blocks";
 import { BlockStream } from "@/lib/blockStream";
@@ -3477,6 +3478,26 @@ function applyLiveDelta(
   });
 }
 
+/** Append live output to the matching in-progress tool execution. */
+function applyLiveToolOutputDelta(set: Setter, callId: string, delta: string): void {
+  set((s) => {
+    const at = s.blocks.findIndex(
+      (b): b is ToolGroup =>
+        b.type === "tool_group" && b.executions.some((execution) => execution.callId === callId),
+    );
+    if (at === -1) return {};
+    const group = s.blocks[at] as ToolGroup;
+    const executions = group.executions.map((execution) =>
+      execution.callId === callId
+        ? { ...execution, output: (execution.output ?? "") + delta }
+        : execution,
+    );
+    const next = s.blocks.slice();
+    next[at] = { ...group, executions };
+    return { blocks: next };
+  });
+}
+
 /**
  * Wrap a parsed event stream, diverting terminal-observed live deltas.
  *
@@ -3519,6 +3540,10 @@ async function* tapLiveDeltas(
       if (get().conversationId === id && !retired.has(ev.messageId)) {
         applyLiveDelta(set, ev.messageId, ev.index ?? 0, ev.delta, lastIndex);
       }
+      continue;
+    }
+    if (ev.type === "tool_output_delta") {
+      if (get().conversationId === id) applyLiveToolOutputDelta(set, ev.callId, ev.delta);
       continue;
     }
     yield ev;
@@ -4365,6 +4390,28 @@ export function handleSessionEvent(event: StreamEvent): void {
           if (!s.isNativeTerminalSession && s.pendingUserMessages.length > 0) {
             patch.pendingUserMessages = [];
           }
+        }
+        // Surface the error inline when the harness reports a terminal failure
+        // with a structured error payload (e.g. token expiration on startup).
+        // `response.failed` / `response.error` handle mid-turn failures, but
+        // startup failures only emit `session.status: failed` — nothing
+        // converts that into a visible ErrorBlock. Synthesize one here so the
+        // user sees the message without having to reload.
+        if (
+          event.status === "failed" &&
+          event.error != null &&
+          !s.blocks.some((b) => b.type === "error")
+        ) {
+          patch.blocks = [
+            ...s.blocks,
+            {
+              type: "error",
+              ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "", itemId: null },
+              message: event.error.message,
+              source: "",
+              code: event.error.code,
+            } satisfies ErrorBlock,
+          ];
         }
         return patch;
       });
