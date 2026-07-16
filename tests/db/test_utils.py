@@ -187,17 +187,20 @@ def test_sqlite_engine_checkpoints_wal_and_collects_stats(
         "WITH RECURSIVE seq(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM seq WHERE i < 500) "
         "INSERT INTO items SELECT i, printf('%.100c', 'x') FROM seq"
     )
-    # SQLite checkpoints and deletes the WAL when the LAST connection
-    # closes, which would leave nothing for the engine-creation
-    # checkpoint to do. Hold a second, idle connection open across the
-    # close - like the other processes (runner, REPL) that share a
-    # real chat.db - so the WAL survives. An idle connection holds no
-    # read mark, so it does not block wal_checkpoint(TRUNCATE) either.
-    holder = sqlite3.connect(db_path)
-    holder.execute("SELECT 1").fetchone()
+    # A closing connection checkpoints and deletes the WAL whenever it
+    # can take the database exclusively - an idle second connection is
+    # not enough to stop that on every platform. Pin an open read
+    # transaction across the close (like the runner/REPL readers that
+    # share a real chat.db): a held read mark makes WAL deletion
+    # impossible. Released right after, so it cannot block the
+    # engine-creation wal_checkpoint(TRUNCATE) under test.
+    holder = sqlite3.connect(db_path, isolation_level=None)
+    holder.execute("BEGIN")
+    holder.execute("SELECT count(*) FROM items").fetchone()
     try:
         seed.close()
         assert wal_path.stat().st_size > 0
+        holder.execute("COMMIT")
 
         engine = get_or_create_engine(f"sqlite:///{db_path}")
 

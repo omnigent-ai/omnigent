@@ -329,6 +329,16 @@ def _tune_sqlite_database(engine: Engine) -> None:
             # through the WAL, so checkpointing after folds that write in
             # too instead of leaving a fresh WAL behind.
             conn.exec_driver_sql("PRAGMA optimize=0x10002")
+            # Older SQLite builds only analyze tables this connection has
+            # already used, so on a fresh connection the optimize above
+            # can be a no-op. When the database has no statistics at all,
+            # collect them explicitly - that never-analyzed state is
+            # exactly the pathological one.
+            has_stats = conn.exec_driver_sql(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sqlite_stat1'"
+            ).fetchone()
+            if has_stats is None:
+                conn.exec_driver_sql("ANALYZE")
             conn.exec_driver_sql("PRAGMA wal_checkpoint(TRUNCATE)")
     except Exception:  # noqa: BLE001 - maintenance must never block startup
         _logger.debug("SQLite maintenance skipped", exc_info=True)
