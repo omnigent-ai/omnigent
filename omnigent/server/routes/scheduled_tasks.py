@@ -1,0 +1,218 @@
+"""REST CRUD for scheduled tasks (``/v1/scheduled-tasks``).
+
+A scheduled task is a saved instruction that fires an agent session on a
+recurring RRULE schedule. These endpoints let a client create, list, read,
+update, and delete tasks; the live :class:`ScheduledTaskScheduler` is kept in
+sync on every mutation so a change takes effect without a restart.
+
+Ownership mirrors hosts: tasks are scoped to the calling user (``"local"`` when
+auth is disabled). The RRULE is validated on create/update with
+:func:`validate_rrule` — an invalid rule (bad syntax, never-fires, fires-once, or
+below the minimum-interval floor) is a 400.
+"""
+
+from __future__ import annotations
+
+import logging
+import uuid
+from typing import Any
+
+from fastapi import APIRouter, Request
+from pydantic import BaseModel, Field
+
+from omnigent.entities import ScheduledTask
+from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
+from omnigent.server.routes._auth_helpers import require_user
+from omnigent.server.scheduled.rrule import RRuleValidationError, validate_rrule
+from omnigent.stores.scheduled_task_store import ScheduledTaskStore
+
+_logger = logging.getLogger(__name__)
+
+
+class CreateScheduledTaskRequest(BaseModel):
+    """Body for ``POST /v1/scheduled-tasks``."""
+
+    name: str
+    prompt: str
+    rrule: str
+    agent_id: str
+    timezone: str = "UTC"
+    model_override: str | None = None
+    reasoning_effort: str | None = None
+    workspace: str | None = None
+    base_branch: str | None = None
+    execution_target: str = "connected_host"
+    host_id: str | None = None
+
+
+class UpdateScheduledTaskRequest(BaseModel):
+    """Body for ``PATCH /v1/scheduled-tasks/{id}``. Unset fields are unchanged."""
+
+    name: str | None = None
+    prompt: str | None = None
+    rrule: str | None = None
+    timezone: str | None = None
+    model_override: str | None = None
+    reasoning_effort: str | None = None
+    workspace: str | None = None
+    base_branch: str | None = None
+    execution_target: str | None = None
+    state: str | None = None
+    # Distinguishes "field omitted" (unchanged) from an explicit null on host_id.
+    host_id: str | None = Field(default=None)
+
+
+def _to_response(task: ScheduledTask) -> dict[str, Any]:
+    """Serialize a :class:`ScheduledTask` to a JSON-safe dict."""
+    return {
+        "id": task.id,
+        "name": task.name,
+        "prompt": task.prompt,
+        "rrule": task.rrule,
+        "owner_user_id": task.owner_user_id,
+        "agent_id": task.agent_id,
+        "timezone": task.timezone,
+        "created_at": task.created_at,
+        "model_override": task.model_override,
+        "reasoning_effort": task.reasoning_effort,
+        "workspace": task.workspace,
+        "base_branch": task.base_branch,
+        "execution_target": task.execution_target,
+        "host_id": task.host_id,
+        "state": task.state,
+        "last_run_at": task.last_run_at,
+        "last_run_conversation_id": task.last_run_conversation_id,
+        "updated_at": task.updated_at,
+    }
+
+
+def _validate_rrule_or_400(rrule: str) -> None:
+    """Raise a 400 ``OmnigentError`` if the RRULE is invalid."""
+    try:
+        validate_rrule(rrule)
+    except RRuleValidationError as exc:
+        raise OmnigentError(f"invalid rrule: {exc}", code=ErrorCode.INVALID_INPUT) from exc
+
+
+def create_scheduled_tasks_router(
+    store: ScheduledTaskStore,
+    *,
+    auth_provider: AuthProvider | None = None,
+) -> APIRouter:
+    """Build the scheduled-tasks router.
+
+    Mounted with ``prefix="/v1"`` so paths are ``/v1/scheduled-tasks[/{id}]``.
+
+    :param store: The shared :class:`ScheduledTaskStore`.
+    :param auth_provider: Auth provider used to identify the requesting user.
+        ``None`` disables auth (owner resolves to ``"local"``).
+    :returns: A configured :class:`APIRouter`.
+    """
+    router = APIRouter()
+
+    def _owner(request: Request) -> str:
+        """Resolve the calling user, mapping the auth-disabled case to
+        ``RESERVED_USER_LOCAL`` so single-user rows are always owned."""
+        user_id = require_user(request, auth_provider)
+        return user_id if user_id is not None else RESERVED_USER_LOCAL
+
+    def _scheduler(request: Request) -> Any | None:
+        """The live scheduler off app state, or ``None`` if not running."""
+        return getattr(request.app.state, "scheduled_task_scheduler", None)
+
+    def _require_owned(scheduled_task_id: str, owner: str) -> ScheduledTask:
+        """Load a task the caller owns, or raise 404.
+
+        A task owned by someone else 404s (not 403) so tasks aren't
+        enumerable across users.
+        """
+        task = store.get(scheduled_task_id)
+        if task is None or task.owner_user_id != owner:
+            raise OmnigentError("Scheduled task not found", code=ErrorCode.NOT_FOUND)
+        return task
+
+    @router.post("/scheduled-tasks")
+    async def create_scheduled_task(
+        request: Request,
+        body: CreateScheduledTaskRequest,
+    ) -> dict[str, Any]:
+        """Create a scheduled task and arm it on the live scheduler."""
+        owner = _owner(request)
+        _validate_rrule_or_400(body.rrule)
+        task = store.create(
+            scheduled_task_id=uuid.uuid4().hex,
+            name=body.name,
+            prompt=body.prompt,
+            rrule=body.rrule,
+            owner_user_id=None if owner == RESERVED_USER_LOCAL else owner,
+            agent_id=body.agent_id,
+            timezone=body.timezone,
+            model_override=body.model_override,
+            reasoning_effort=body.reasoning_effort,
+            workspace=body.workspace,
+            base_branch=body.base_branch,
+            execution_target=body.execution_target,
+            host_id=body.host_id,
+        )
+        scheduler = _scheduler(request)
+        if scheduler is not None:
+            scheduler.add(task)
+        return _to_response(task)
+
+    @router.get("/scheduled-tasks")
+    async def list_scheduled_tasks(request: Request) -> dict[str, list[dict[str, Any]]]:
+        """List the caller's scheduled tasks."""
+        owner = _owner(request)
+        owner_id = None if owner == RESERVED_USER_LOCAL else owner
+        tasks = [t for t in store.list() if t.owner_user_id == owner_id]
+        return {"scheduled_tasks": [_to_response(t) for t in tasks]}
+
+    @router.get("/scheduled-tasks/{scheduled_task_id}")
+    async def get_scheduled_task(
+        request: Request,
+        scheduled_task_id: str,
+    ) -> dict[str, Any]:
+        """Fetch one of the caller's scheduled tasks."""
+        owner = _owner(request)
+        owner_id = None if owner == RESERVED_USER_LOCAL else owner
+        task = _require_owned(scheduled_task_id, owner_id)
+        return _to_response(task)
+
+    @router.patch("/scheduled-tasks/{scheduled_task_id}")
+    async def update_scheduled_task(
+        request: Request,
+        scheduled_task_id: str,
+        body: UpdateScheduledTaskRequest,
+    ) -> dict[str, Any]:
+        """Update mutable fields of a task and re-sync the scheduler."""
+        owner = _owner(request)
+        owner_id = None if owner == RESERVED_USER_LOCAL else owner
+        _require_owned(scheduled_task_id, owner_id)
+        if body.rrule is not None:
+            _validate_rrule_or_400(body.rrule)
+        fields = body.model_dump(exclude_unset=True)
+        updated = store.update(scheduled_task_id, **fields)
+        if updated is None:
+            raise OmnigentError("Scheduled task not found", code=ErrorCode.NOT_FOUND)
+        scheduler = _scheduler(request)
+        if scheduler is not None:
+            scheduler.update(updated)
+        return _to_response(updated)
+
+    @router.delete("/scheduled-tasks/{scheduled_task_id}")
+    async def delete_scheduled_task(
+        request: Request,
+        scheduled_task_id: str,
+    ) -> dict[str, Any]:
+        """Delete a task and drop its timer from the scheduler."""
+        owner = _owner(request)
+        owner_id = None if owner == RESERVED_USER_LOCAL else owner
+        _require_owned(scheduled_task_id, owner_id)
+        store.delete(scheduled_task_id)
+        scheduler = _scheduler(request)
+        if scheduler is not None:
+            scheduler.remove(scheduled_task_id)
+        return {"deleted": True, "id": scheduled_task_id}
+
+    return router
