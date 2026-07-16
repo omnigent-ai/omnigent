@@ -1,4 +1,4 @@
-"""Server-process cron scheduler for recurring scheduled tasks (Routines).
+"""Server-process cron scheduler for recurring scheduled tasks.
 
 Two pieces live here:
 

@@ -1130,7 +1130,7 @@ def create_app(
     :param permission_store: Store for session-level access grants.
         ``None`` disables permission checks (all access allowed).
     :param scheduled_task_store: Store backing the recurring-task
-        (Routines) scheduler. When provided, the FastAPI lifespan
+        scheduler. When provided, the FastAPI lifespan
         starts an :class:`ScheduledTaskScheduler` that arms a timer per
         active task and fires the injected ``on_fire`` callback on
         schedule. ``None`` disables the scheduler entirely.
@@ -1379,7 +1379,7 @@ def create_app(
             )
         )
 
-        # Recurring-task (Routines) scheduler: arm a timer per active
+        # Recurring-task scheduler: arm a timer per active
         # scheduled task and fire the injected ``on_fire`` callback on
         # schedule. The default callback is a no-op that logs; a real fire
         # path (creating a session) can be injected in its place.
@@ -1390,7 +1390,7 @@ def create_app(
                 on_fire=_placeholder_on_fire,
             )
             app_inst.state.scheduled_task_scheduler = scheduled_task_scheduler
-            # Routines are a non-critical subsystem: a failure loading the
+            # Scheduled tasks are a non-critical subsystem: a failure loading the
             # schedule (e.g. a DB error in list_active()) must not take down
             # server boot. Log and continue with the scheduler unstarted.
             try:

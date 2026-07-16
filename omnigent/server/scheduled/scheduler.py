@@ -1,4 +1,4 @@
-"""In-process cron scheduler for recurring scheduled tasks (Routines).
+"""In-process cron scheduler for recurring scheduled tasks.
 
 :class:`ScheduledTaskScheduler` owns one self-rearming timer per active scheduled
 task. It is the timing engine only: when a task is due it invokes an injected
