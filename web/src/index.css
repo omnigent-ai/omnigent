@@ -1131,6 +1131,16 @@
   background-color: color-mix(in oklch, var(--warning) 70%, transparent);
 }
 
+/* Find-in-file matches in the rendered markdown / notebook preview. The preview
+   is React-owned DOM, so matches are painted with the CSS Custom Highlight API
+   (Range-based, no node mutation) rather than wrapper spans. */
+::highlight(md-preview-search) {
+  background-color: color-mix(in oklch, var(--warning) 30%, transparent);
+}
+::highlight(md-preview-search-current) {
+  background-color: color-mix(in oklch, var(--warning) 70%, transparent);
+}
+
 /* TipTap editor prose styling */
 .tiptap-md-content .ProseMirror {
   outline: none;

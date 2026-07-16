@@ -209,7 +209,13 @@ function CodeCell({ cell, language }: { cell: NotebookCell; language: BundledLan
   );
 }
 
-export function NotebookPreview({ content }: { content: string }) {
+export function NotebookPreview({
+  content,
+  rootRef,
+}: {
+  content: string;
+  rootRef?: React.RefObject<HTMLDivElement | null>;
+}) {
   const { notebook, error } = parseNotebook(content);
 
   if (error || !notebook) {
@@ -227,7 +233,7 @@ export function NotebookPreview({ content }: { content: string }) {
   const language = langName as BundledLanguage;
 
   return (
-    <div className="h-full space-y-4 overflow-auto px-6 py-4">
+    <div ref={rootRef} data-preview-scroll className="h-full space-y-4 overflow-auto px-6 py-4">
       {(notebook.cells ?? []).map((cell, i) => {
         if (cell.cell_type === "markdown") {
           return (
