@@ -98,11 +98,11 @@ describe("highlightRectsForPage", () => {
 
 describe("commentsMatchOffsets", () => {
   it("matches on start and end indices", () => {
-    expect(commentsMatchOffsets({ start_index: 1, end_index: 5 }, { start_index: 1, end_index: 5 })).toBe(
-      true,
-    );
-    expect(commentsMatchOffsets({ start_index: 1, end_index: 5 }, { start_index: 2, end_index: 5 })).toBe(
-      false,
-    );
+    expect(
+      commentsMatchOffsets({ start_index: 1, end_index: 5 }, { start_index: 1, end_index: 5 }),
+    ).toBe(true);
+    expect(
+      commentsMatchOffsets({ start_index: 1, end_index: 5 }, { start_index: 2, end_index: 5 }),
+    ).toBe(false);
   });
 });

@@ -66,7 +66,10 @@ export function encodePdfAnchor(
   };
 }
 
-export function getSelectionNormalizedRects(range: Range, pageEl: HTMLElement): PdfNormalizedRect[] {
+export function getSelectionNormalizedRects(
+  range: Range,
+  pageEl: HTMLElement,
+): PdfNormalizedRect[] {
   const pageRect = pageEl.getBoundingClientRect();
   if (pageRect.width <= 0 || pageRect.height <= 0) return [];
   const rects: PdfNormalizedRect[] = [];
@@ -120,8 +123,7 @@ export function highlightRectsForPage(
   for (const c of comments) {
     const anchor = decodePdfAnchor(c.anchor_content);
     if (!anchor || anchor.page !== page) continue;
-    const active =
-      activeSelection != null && commentsMatchOffsets(activeSelection, c);
+    const active = activeSelection != null && commentsMatchOffsets(activeSelection, c);
     out.push({ key: c.id, rects: anchor.rects, active, comment: c });
   }
 
