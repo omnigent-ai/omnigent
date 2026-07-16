@@ -78,15 +78,15 @@ def test_runner_id_round_trip_null_and_value(db_engine: Engine) -> None:
                 "(id, created_at, updated_at, root_conversation_id) "
                 "VALUES (:id, :ts, :ts, :id)"
             ),
-            {"id": "conv_null_test", "ts": 1700000000},
+            {"id": "0d42a93a625e91d8b607d375fbd860ad", "ts": 1700000000},
         )
         conn.execute(
             sa.text("INSERT INTO omnigent_conversation_metadata (id, kind) VALUES (:id, 1)"),
-            {"id": "conv_null_test"},
+            {"id": "0d42a93a625e91d8b607d375fbd860ad"},
         )
         result = conn.execute(
             sa.text("SELECT runner_id FROM omnigent_conversation_metadata WHERE id = :id"),
-            {"id": "conv_null_test"},
+            {"id": "0d42a93a625e91d8b607d375fbd860ad"},
         ).scalar_one()
         assert result is None, f"Expected NULL on default-insert; got {result!r}"
 
@@ -97,18 +97,18 @@ def test_runner_id_round_trip_null_and_value(db_engine: Engine) -> None:
                 "(id, created_at, updated_at, root_conversation_id) "
                 "VALUES (:id, :ts, :ts, :id)"
             ),
-            {"id": "conv_value_test", "ts": 1700000000},
+            {"id": "ee91e92728c76ca2647ad5459b008754", "ts": 1700000000},
         )
         conn.execute(
             sa.text(
                 "INSERT INTO omnigent_conversation_metadata (id, kind, runner_id) "
                 "VALUES (:id, 1, :rid)"
             ),
-            {"id": "conv_value_test", "rid": "runner-uuid-abc"},
+            {"id": "ee91e92728c76ca2647ad5459b008754", "rid": "runner-uuid-abc"},
         )
         result = conn.execute(
             sa.text("SELECT runner_id FROM omnigent_conversation_metadata WHERE id = :id"),
-            {"id": "conv_value_test"},
+            {"id": "ee91e92728c76ca2647ad5459b008754"},
         ).scalar_one()
         assert result == "runner-uuid-abc", (
             f"Round-trip mismatch: stored 'runner-uuid-abc', got {result!r}. "

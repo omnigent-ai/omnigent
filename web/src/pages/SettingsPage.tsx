@@ -39,6 +39,7 @@ import {
 } from "react";
 import {
   ArchiveRestoreIcon,
+  AlertTriangleIcon,
   CheckIcon,
   KeyRoundIcon,
   LaptopMinimalIcon,
@@ -55,8 +56,10 @@ import {
 } from "lucide-react";
 import { useTheme } from "next-themes";
 import { PageScroll } from "@/components/PageScroll";
+import { ThemeColorPicker } from "@/components/theme/ThemeColorPicker";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Switch } from "@/components/ui/switch";
 import {
   Select,
   SelectContent,
@@ -79,6 +82,7 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import {
   type Conversation,
   useArchiveConversation,
+  useArchivedProjectNames,
   useConversations,
   useStopAndDeleteConversation,
 } from "@/hooks/useConversations";
@@ -126,16 +130,36 @@ import {
 } from "@/lib/workspacePanelPreferences";
 import { readDefaultBaseBranch, writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 import {
+  readHideUnconfiguredHarnesses,
+  writeHideUnconfiguredHarnesses,
+} from "@/lib/harnessVisibilityPreferences";
+import {
   applyThemePalette,
-  isThemePalette,
+  isThemeSelection,
   PALETTES,
   type PaletteSwatch,
   readThemePalette,
-  type ThemePalette,
+  type ThemeSelection,
   writeThemePalette,
 } from "@/lib/themePalette";
+import {
+  applyCustomTheme,
+  createCustomThemeFromPalette,
+  customThemeSwatches,
+  readCustomTheme,
+  type CustomTheme,
+  writeCustomTheme,
+} from "@/lib/customTheme";
 import { useIsEmbedded } from "@/lib/embedded";
-import { type CliStatus, getCliStatus, isElectronShell, resetCliPath } from "@/lib/nativeBridge";
+import {
+  type CliStatus,
+  getCliStatus,
+  isElectronShell,
+  resetCliPath,
+  type UpdateConfig,
+  type UpdateMode,
+  updateBridge,
+} from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
 
 // Admin-only management surfaces, rendered as the Members / Policies settings
@@ -194,6 +218,7 @@ export function SettingsPage() {
       {section === "account" && hasAuthSession && <AccountSection />}
       {section === "archived" && <ArchivedSection />}
       {section === "cli" && isElectronShell() && <LocalCliSection />}
+      {section === "updates" && isElectronShell() && <UpdatesSection />}
     </PageScroll>
   );
 }
@@ -525,58 +550,174 @@ function WorkspacePanelDefaultControl() {
   );
 }
 
-/**
- * Color-theme (palette) picker — a dropdown (à la Codex). Each option shows a
- * swatch chip + name and the trigger mirrors the current selection. Choosing
- * one applies it live to <html> via `data-theme`, persists it, and composes on
- * top of the chosen light/dark mode.
- */
 function ColorThemeControl() {
   // Render each chip in the currently-resolved mode so it matches the app now.
   const { resolvedTheme } = useTheme();
   const isDark = normalizeResolvedTheme(resolvedTheme) === "dark";
-  const [palette, setPalette] = useState<ThemePalette>(() => readThemePalette());
+  const [selection, setSelection] = useState<ThemeSelection>(() => readThemePalette());
+  const [customTheme, setCustomTheme] = useState<CustomTheme>(() => readCustomTheme());
   const labelId = useId();
 
-  const choose = useCallback((next: ThemePalette) => {
-    setPalette(next);
-    writeThemePalette(next);
-    applyThemePalette(next);
-  }, []);
+  const choose = useCallback(
+    (next: ThemeSelection) => {
+      if (next === "custom") applyCustomTheme(customTheme);
+      setSelection(next);
+      writeThemePalette(next);
+      applyThemePalette(next);
+    },
+    [customTheme],
+  );
 
-  const selected = PALETTES.find((p) => p.id === palette) ?? PALETTES[0];
+  const selectedPalette =
+    selection === "custom"
+      ? null
+      : (PALETTES.find((palette) => palette.id === selection) ?? PALETTES[0]);
+  const editableTheme = selectedPalette
+    ? createCustomThemeFromPalette(selectedPalette)
+    : customTheme;
+  const customSwatches = customThemeSwatches(customTheme);
+
+  const updateCustomTheme = useCallback(
+    (patch: Partial<CustomTheme>) => {
+      const source =
+        selection === "custom"
+          ? customTheme
+          : createCustomThemeFromPalette(
+              PALETTES.find((palette) => palette.id === selection) ?? PALETTES[0],
+            );
+      const next = { ...source, ...patch };
+      setCustomTheme(next);
+      writeCustomTheme(next);
+      applyCustomTheme(next);
+      setSelection("custom");
+      writeThemePalette("custom");
+      applyThemePalette("custom");
+    },
+    [customTheme, selection],
+  );
+
+  const selected =
+    selection === "custom"
+      ? {
+          label: "Custom",
+          light: customSwatches.light,
+          dark: customSwatches.dark,
+        }
+      : selectedPalette!;
 
   return (
     <ThemeSubsection
       labelId={labelId}
       title="Color theme"
-      helper="Applies on top of your chosen mode."
+      helper="Choose a preset, then tune it across light and dark mode."
     >
-      <Select
-        value={palette}
-        onValueChange={(next) => {
-          if (isThemePalette(next)) choose(next);
-        }}
-      >
-        <SelectTrigger
-          aria-labelledby={labelId}
-          data-testid="color-theme-select"
-          className="w-full max-w-xs gap-2"
-        >
-          <SelectValue>
-            <PaletteChip swatch={isDark ? selected.dark : selected.light} />
-            <span>{selected.label}</span>
-          </SelectValue>
-        </SelectTrigger>
-        <SelectContent>
-          {PALETTES.map((p) => (
-            <SelectItem key={p.id} value={p.id} data-testid={`palette-${p.id}`}>
-              <PaletteChip swatch={isDark ? p.dark : p.light} />
-              <span>{p.label}</span>
-            </SelectItem>
-          ))}
-        </SelectContent>
-      </Select>
+      <div className="overflow-hidden rounded-xl border bg-card/55 shadow-xs">
+        <div className="flex flex-col gap-3 border-b bg-muted/30 p-4 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex min-w-0 items-center gap-3">
+            <div className="w-28 shrink-0 overflow-hidden rounded-lg shadow-sm">
+              <PaletteSwatchPreview swatch={isDark ? selected.dark : selected.light} />
+            </div>
+            <div className="min-w-0">
+              <div className="text-sm font-medium">Theme palette</div>
+              <div className="truncate text-xs text-muted-foreground">
+                {selection === "custom"
+                  ? `Based on ${PALETTES.find((palette) => palette.id === customTheme.basePalette)?.label ?? "Omnigent"}`
+                  : selectedPalette?.blurb}
+              </div>
+            </div>
+          </div>
+          <Select
+            value={selection}
+            onValueChange={(next) => {
+              if (isThemeSelection(next)) choose(next);
+            }}
+          >
+            <SelectTrigger
+              aria-labelledby={labelId}
+              data-testid="color-theme-select"
+              className="w-full gap-2 sm:w-48"
+            >
+              <SelectValue>
+                <PaletteChip swatch={isDark ? selected.dark : selected.light} />
+                <span>{selected.label}</span>
+              </SelectValue>
+            </SelectTrigger>
+            <SelectContent>
+              {PALETTES.map((palette) => (
+                <SelectItem
+                  key={palette.id}
+                  value={palette.id}
+                  data-testid={`palette-${palette.id}`}
+                >
+                  <PaletteChip swatch={isDark ? palette.dark : palette.light} />
+                  <span>{palette.label}</span>
+                </SelectItem>
+              ))}
+              <SelectItem value="custom" data-testid="palette-custom">
+                <PaletteChip swatch={isDark ? customSwatches.dark : customSwatches.light} />
+                <span>Custom</span>
+              </SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+
+        <div className="px-4">
+          <ThemeColorPicker
+            label="Accent"
+            value={editableTheme.accent}
+            testId="custom-theme-accent"
+            onChange={(accent) => updateCustomTheme({ accent })}
+          />
+          <ThemeColorPicker
+            label="Background tint"
+            value={editableTheme.tint}
+            testId="custom-theme-tint"
+            onChange={(tint) => updateCustomTheme({ tint })}
+          />
+          <div className="flex items-center justify-between gap-4 border-b border-border/70 py-4">
+            <div>
+              <div className="text-sm font-medium">Contrast</div>
+              <div className="text-xs text-muted-foreground">
+                Separates text, borders, and surfaces.
+              </div>
+            </div>
+            <div className="flex w-52 items-center gap-3">
+              <input
+                id="custom-theme-contrast"
+                type="range"
+                min="0"
+                max="100"
+                value={editableTheme.contrast}
+                aria-label="Theme contrast"
+                data-testid="custom-theme-contrast"
+                onChange={(event) => updateCustomTheme({ contrast: Number(event.target.value) })}
+                className="h-1.5 min-w-0 flex-1 cursor-pointer accent-primary"
+              />
+              <output
+                htmlFor="custom-theme-contrast"
+                data-testid="custom-theme-contrast-value"
+                className="w-7 text-right text-xs font-medium tabular-nums"
+              >
+                {editableTheme.contrast}
+              </output>
+            </div>
+          </div>
+          <div className="flex items-center justify-between gap-4 py-4">
+            <div>
+              <div className="text-sm font-medium">Translucent sidebars</div>
+              <div className="text-xs text-muted-foreground">
+                Lets the canvas show through the conversation and workspace rails.
+              </div>
+            </div>
+            <Switch
+              aria-label="Translucent sidebars"
+              checked={editableTheme.translucentSidebar}
+              onCheckedChange={(translucentSidebar) => updateCustomTheme({ translucentSidebar })}
+              data-testid="custom-theme-translucent-sidebar"
+            />
+          </div>
+        </div>
+      </div>
     </ThemeSubsection>
   );
 }
@@ -625,6 +766,41 @@ function PaletteSwatchPreview({ swatch }: { swatch: PaletteSwatch }) {
   );
 }
 
+/**
+ * Opt-in filter for the new-chat harness picker: when on, harnesses that
+ * aren't set up on the selected host (missing CLI / auth) are hidden instead
+ * of badged. Off by default so the picker keeps surfacing harnesses to set up.
+ * Fails open — with no connected host or readiness info, nothing is hidden.
+ */
+function HideUnconfiguredHarnessesControl() {
+  const [value, setValue] = useState(() => readHideUnconfiguredHarnesses());
+  const labelId = useId();
+  const toggle = useCallback((next: boolean) => {
+    setValue(next);
+    writeHideUnconfiguredHarnesses(next);
+  }, []);
+  return (
+    <div className="flex items-start justify-between gap-6">
+      <div className="flex flex-col">
+        <span id={labelId} className="text-sm font-medium">
+          Hide unconfigured harnesses
+        </span>
+        <span className="text-sm text-muted-foreground">
+          Only show harnesses that are set up on the selected host in the new-chat picker. Harnesses
+          needing a CLI install or sign-in are hidden instead of badged.
+        </span>
+      </div>
+      <Switch
+        aria-labelledby={labelId}
+        checked={value}
+        onCheckedChange={toggle}
+        data-testid="hide-unconfigured-harnesses-toggle"
+        className="mt-0.5 shrink-0"
+      />
+    </div>
+  );
+}
+
 function AppearanceSection() {
   // Embedded: the host owns light/dark, so the Mode and Color theme pickers
   // would be no-ops — hide them and say so (matching ThemeModeMenu). Terminal
@@ -643,15 +819,16 @@ function AppearanceSection() {
             </p>
           </div>
         ) : (
-          <>
-            <ModeControl />
-            <ColorThemeControl />
-          </>
+          <ModeControl />
         )}
 
         <TerminalThemeControl />
 
+        {!isEmbedded && <ColorThemeControl />}
+
         <WorkspacePanelDefaultControl />
+
+        <HideUnconfiguredHarnessesControl />
 
         <UiFontSizeControl />
 
@@ -1179,6 +1356,155 @@ function LocalCliSection() {
   );
 }
 
+const UPDATE_MODE_LABELS: Record<UpdateMode, string> = {
+  default: "Automatic (check periodically, ask before installing)",
+  start: "Check when Omnigent starts",
+  manual: "Manual only",
+  none: "Off",
+};
+
+function UpdatesSection() {
+  const bridge = updateBridge();
+  const [config, setConfig] = useState<UpdateConfig | null | "loading">("loading");
+  const [saving, setSaving] = useState(false);
+  const [checking, setChecking] = useState(false);
+  const [lastCheckError, setLastCheckError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!bridge) {
+      setConfig(null);
+      return undefined;
+    }
+    let alive = true;
+    void bridge
+      .getConfig()
+      .then((nextConfig) => {
+        if (alive) setConfig(nextConfig);
+      })
+      .catch((err) => {
+        console.warn("[SettingsPage] update config read failed:", err);
+        if (alive) setConfig(null);
+      });
+    const unsubscribe = bridge.onStatus((status) => {
+      if (status.state === "error-security") {
+        setLastCheckError(status.lastError ?? "Security verification failed.");
+      } else if (status.state === "idle" && status.lastError) {
+        setLastCheckError(status.lastError);
+      } else if (
+        status.state === "checking" ||
+        status.state === "available" ||
+        status.state === "none"
+      ) {
+        setLastCheckError(null);
+      }
+    });
+    return () => {
+      alive = false;
+      unsubscribe();
+    };
+  }, [bridge]);
+
+  const persistConfig = useCallback(
+    async (patch: Partial<UpdateConfig>) => {
+      if (!bridge) return;
+      setSaving(true);
+      try {
+        const next = await bridge.setConfig(patch);
+        setConfig(next);
+      } finally {
+        setSaving(false);
+      }
+    },
+    [bridge],
+  );
+
+  const onCheck = useCallback(async () => {
+    if (!bridge) return;
+    setChecking(true);
+    setLastCheckError(null);
+    try {
+      await bridge.check();
+    } catch (err) {
+      setLastCheckError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setChecking(false);
+    }
+  }, [bridge]);
+
+  if (config === "loading") {
+    return (
+      <Section title="Updates">
+        <p className="text-sm text-muted-foreground">Checking…</p>
+      </Section>
+    );
+  }
+
+  return (
+    <Section
+      title="Updates"
+      description="Desktop app update preferences for this installed Omnigent shell."
+    >
+      {config === null ? (
+        <p className="text-sm text-muted-foreground">Update settings are unavailable.</p>
+      ) : (
+        <div className="flex max-w-2xl flex-col gap-5">
+          <label className="flex flex-col gap-2">
+            <span className="text-sm font-medium">Update mode</span>
+            <Select
+              value={config.mode}
+              onValueChange={(value) => void persistConfig({ mode: value as UpdateMode })}
+              disabled={saving}
+            >
+              <SelectTrigger className="w-full max-w-md" data-testid="update-mode-select">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {(Object.keys(UPDATE_MODE_LABELS) as UpdateMode[]).map((mode) => (
+                  <SelectItem key={mode} value={mode}>
+                    {UPDATE_MODE_LABELS[mode]}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </label>
+
+          <div className="flex items-center justify-between gap-4 rounded-lg border border-border px-4 py-3">
+            <div className="flex flex-col gap-1">
+              <span className="text-sm font-medium">Install downloaded updates on next quit</span>
+              <span className="text-xs text-muted-foreground">
+                Applies only after you choose to download an update.
+              </span>
+            </div>
+            <Switch
+              checked={config.autoInstall}
+              onCheckedChange={(checked) => void persistConfig({ autoInstall: checked })}
+              disabled={saving}
+              aria-label="Install downloaded updates on next quit"
+            />
+          </div>
+
+          <div className="flex flex-wrap items-center gap-3">
+            <Button onClick={() => void onCheck()} loading={checking}>
+              Check for updates now
+            </Button>
+            {saving && <span className="text-xs text-muted-foreground">Saving…</span>}
+          </div>
+
+          {lastCheckError && (
+            <div className="flex items-start gap-2 rounded-lg border border-border bg-muted/50 px-3 py-2 text-sm">
+              <AlertTriangleIcon className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
+              <div>
+                <div className="font-medium">Last check failed</div>
+                <div className="text-muted-foreground">{lastCheckError}</div>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </Section>
+  );
+}
+
 function AccountSection() {
   const info = useServerInfo();
   const accountsEnabled = info !== "loading" && info.accounts_enabled;
@@ -1382,30 +1708,147 @@ function AccountSection() {
   );
 }
 
+// Discriminated Select values so the "no filter" sentinel can never collide
+// with a real project name: the reset option is a fixed token that no project
+// value can equal, and every project is namespaced under a prefix so its name
+// carries through verbatim. A project literally named "all" (or "__all__")
+// therefore still filters correctly instead of clearing the filter.
+const ALL_PROJECTS_VALUE = "all";
+const PROJECT_VALUE_PREFIX = "project:";
+
+function projectToSelectValue(project: string | undefined): string {
+  return project === undefined ? ALL_PROJECTS_VALUE : PROJECT_VALUE_PREFIX + project;
+}
+
+function selectValueToProject(value: string): string | undefined {
+  if (value === ALL_PROJECTS_VALUE) return undefined;
+  return value.slice(PROJECT_VALUE_PREFIX.length);
+}
+
 function ArchivedSection() {
-  // includeArchived:true is the only way to load archived rows; the
-  // default sidebar query no longer surfaces them.
-  const query = useConversations("", true);
+  // `undefined` = all projects; a name scopes the list to that project.
+  const [project, setProject] = useState<string | undefined>(undefined);
+
+  // Picker options: every project that has an archived session. Sourced from a
+  // dedicated hook that pages through ALL archived sessions server-side —
+  // `useProjects()` omits all-archived projects, and deriving options from only
+  // the visible list's loaded first page would hide archived-only projects
+  // whose sessions sit on later pages.
+  const namesQuery = useArchivedProjectNames();
+  const projectNames = useMemo(() => namesQuery.data ?? [], [namesQuery.data]);
+
+  // A picked project can vanish from the option set for good (its last
+  // archived session deleted or restored, possibly by another client). Once
+  // the scan settles without it, fall back to "All projects" rather than
+  // pinning a defunct filter with a project-scoped empty state.
+  useEffect(() => {
+    if (
+      project !== undefined &&
+      namesQuery.isSuccess &&
+      !namesQuery.isFetching &&
+      !projectNames.includes(project)
+    ) {
+      setProject(undefined);
+    }
+  }, [project, projectNames, namesQuery.isSuccess, namesQuery.isFetching]);
+
+  // The visible list, filtered server-side via ?project= when one is picked.
+  const listQuery = useConversations("", true, undefined, project);
   const archived = useMemo(
-    () => (query.data?.pages ?? []).flatMap((p) => p.data).filter((c) => c.archived === true),
-    [query.data],
+    () => (listQuery.data?.pages ?? []).flatMap((p) => p.data).filter((c) => c.archived === true),
+    [listQuery.data],
   );
+
+  // Keep a picked project listed even if it drops out of the option set (its
+  // last archived session was just unarchived) so the trigger never shows a
+  // blank, orphaned value while the refetch settles.
+  const items =
+    project && !projectNames.includes(project) ? [project, ...projectNames] : projectNames;
 
   return (
     <Section
       title="Archived sessions"
       description="Sessions you've archived. Restore one to the sidebar, or delete it for good."
     >
-      {query.isLoading ? (
+      {items.length > 0 && (
+        <div className="mb-4 flex items-center gap-2">
+          <label htmlFor="archived-project-filter" className="text-sm text-muted-foreground">
+            Project
+          </label>
+          <Select
+            value={projectToSelectValue(project)}
+            onValueChange={(value) => setProject(selectValueToProject(value))}
+          >
+            <SelectTrigger
+              id="archived-project-filter"
+              aria-label="Filter archived sessions by project"
+              data-testid="archived-project-filter"
+              className="w-56"
+            >
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent position="popper" align="start">
+              <SelectItem value={ALL_PROJECTS_VALUE}>All projects</SelectItem>
+              {items.map((name) => (
+                <SelectItem
+                  key={name}
+                  value={projectToSelectValue(name)}
+                  data-testid={`archived-project-option-${name}`}
+                >
+                  {name}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+      )}
+
+      {listQuery.isLoading ? (
         <p className="text-sm text-muted-foreground">Loading…</p>
-      ) : archived.length === 0 ? (
-        <p className="text-sm text-muted-foreground">No archived sessions.</p>
+      ) : archived.length === 0 && !listQuery.hasNextPage ? (
+        // Definitive empty only when there are no archived rows AND no further
+        // pages to fetch.
+        <p className="text-sm text-muted-foreground">
+          {project ? "No archived sessions in this project." : "No archived sessions."}
+        </p>
       ) : (
-        <ul className="flex flex-col gap-0.5">
-          {archived.map((conv) => (
-            <ArchivedRow key={conv.id} conversation={conv} />
-          ))}
-        </ul>
+        <>
+          {archived.length > 0 && (
+            <ul className="flex flex-col gap-0.5">
+              {archived.map((conv) => (
+                <ArchivedRow key={conv.id} conversation={conv} />
+              ))}
+            </ul>
+          )}
+          {archived.length === 0 && (
+            // The list fetches a mixed page (active + archived rows) and filters
+            // to archived client-side; archived sessions are older and can sort
+            // onto later pages, so a page with none isn't the end. Offer to page
+            // forward instead of dead-ending on the definitive empty state.
+            <p className="text-sm text-muted-foreground">
+              {project
+                ? "No archived sessions in this project on this page."
+                : "No archived sessions on this page."}
+            </p>
+          )}
+          {/* Keep the pager visible whenever more pages exist, independent of the
+              current page's archived count — otherwise a first page of only
+              active rows would hide the archived rows on later pages. */}
+          {listQuery.hasNextPage && (
+            <div className="mt-3">
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                data-testid="archived-load-more"
+                disabled={listQuery.isFetchingNextPage}
+                onClick={() => void listQuery.fetchNextPage()}
+              >
+                {listQuery.isFetchingNextPage ? "Loading…" : "Load more"}
+              </Button>
+            </div>
+          )}
+        </>
       )}
     </Section>
   );

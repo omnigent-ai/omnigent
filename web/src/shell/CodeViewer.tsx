@@ -57,6 +57,7 @@ import {
   isBinaryPath,
   isImageFile,
   isNotebookPath,
+  isPdfFile,
   lineOverlapsSelection,
 } from "./codeViewerHelpers";
 import { NotebookPreview } from "./NotebookPreview";
@@ -72,6 +73,10 @@ import { getEmbedRoot } from "@/lib/host";
 const MonacoCodeEditor = lazy(() =>
   import("./MonacoCodeEditor").then((m) => ({ default: m.MonacoCodeEditor })),
 );
+
+// react-pdf + pdf.js (worker) is heavy; load it only when a PDF is actually
+// viewed so it never enters the initial bundle.
+const PdfViewer = lazy(() => import("./PdfViewer").then((m) => ({ default: m.PdfViewer })));
 
 // ---------------------------------------------------------------------------
 // MarkdownPreview — read-only render of Markdown content via react-markdown + GFM
@@ -376,12 +381,32 @@ export function CodeViewer({
     matchLineRefs.current.get(idx)?.scrollIntoView({ block: "center", behavior: "smooth" });
   }, [searchQuery, currentMatchIdx]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Open search on Cmd+F / Ctrl+F.
-  // Don't intercept in markdown editor mode — the custom search bar isn't
-  // available there, so let the browser's native find handle it instead.
   const isMarkdownEditor = viewMode === "editor" && lang === "markdown";
+
+  // Markdown editor mode has its own find bar (MarkdownSearchBar), driven by the
+  // shared `searchOpen` toggle. Cmd+F opens it and Escape closes it; the bar
+  // also handles Escape while its input is focused, but this covers the case
+  // where focus is in the editor body.
   useEffect(() => {
-    // Skip in Monaco mode too — Monaco owns Cmd+F (native find).
+    if (!panelOpen || !isMarkdownEditor) return;
+    const handler = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "f") {
+        e.preventDefault();
+        setSearchOpen(true);
+        setTimeout(() => searchInputRef.current?.focus(), 0);
+      } else if (e.key === "Escape" && searchOpen) {
+        e.preventDefault();
+        setSearchOpen(false);
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [panelOpen, isMarkdownEditor, searchOpen, setSearchOpen, searchInputRef]);
+
+  // Open search on Cmd+F / Ctrl+F in the Shiki source view.
+  useEffect(() => {
+    // Skip in Monaco mode (Monaco owns Cmd+F) and markdown editor mode (handled
+    // above with its own find bar).
     if (!panelOpen || isMarkdownEditor || showMonaco) return;
     const handler = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key === "f") {
@@ -412,9 +437,10 @@ export function CodeViewer({
     return () => window.removeEventListener("keydown", handler);
   }, [panelOpen, isMarkdownEditor, showMonaco, searchOpen, setSearchOpen, searchInputRef]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // In Monaco mode the custom search bar isn't rendered; the editor opens its
-  // native find when `searchOpen` is set (once it has mounted), then calls this
-  // to reset the flag so the next Find click re-triggers it.
+  // In Monaco mode the custom search bar isn't rendered; the editor mirrors its
+  // native find widget to `searchOpen` (open when set, close when cleared). This
+  // resets the flag when find is closed from within Monaco (Escape or the
+  // widget's ✕) so the toolbar toggle stays in sync with the visible widget.
   const handleSearchHandled = useCallback(() => setSearchOpen(false), [setSearchOpen]);
 
   // Show "Add Comment" button after the user finishes a text selection
@@ -547,6 +573,19 @@ export function CodeViewer({
   if (fileQuery.data && isImageFile(path, fileQuery.data.content_type)) {
     return <ImageViewer data={fileQuery.data} path={path} />;
   }
+  if (fileQuery.data && isPdfFile(path, fileQuery.data.content_type)) {
+    return (
+      <Suspense
+        fallback={
+          <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">
+            Loading…
+          </div>
+        }
+      >
+        <PdfViewer data={fileQuery.data} />
+      </Suspense>
+    );
+  }
   if (fileQuery.data?.encoding === "base64" || isBinaryPath(path)) {
     return (
       <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">
@@ -568,6 +607,9 @@ export function CodeViewer({
         activeSelection={activeSelection}
         onSetActiveSelection={onSetActiveSelection}
         pendingBodyRef={pendingBodyRef}
+        searchOpen={searchOpen}
+        onSearchHandled={handleSearchHandled}
+        searchInputRef={searchInputRef}
       />
     );
   }

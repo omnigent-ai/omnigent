@@ -1,0 +1,206 @@
+# Publish a FINAL release's GitHub draft as Latest — the last release step,
+# run after the prod PyPI publish succeeded and the draft notes are curated
+# (designs/RELEASE-AUTOMATION.md).
+#
+# Deterministic gates first (all fail with actionable links):
+#   * the tag is a final vX.Y.Z with an unpublished draft release,
+#   * PyPI serves all three lockstep packages at the version (never advertise
+#     a release that isn't installable),
+#   * the auto/changelog/vX.Y.Z CHANGELOG PR isn't sitting open,
+#   * the docs sweep: no open PRs against omnigent-site's X.Y-docs staging
+#     branch (every doc staged this cycle is reviewed + merged/closed).
+#
+# The publish job binds the `publish-release` environment (one-time setup:
+# create it in repo settings with required reviewers). Approving it is the
+# human attestation "I reviewed the draft notes". The publish itself uses the
+# App token — GITHUB_TOKEN-published releases emit no `release: published`
+# event, and publish-changelog.yml + update-homebrew.yml hang off it — and
+# sets make_latest explicitly, which API publishes don't do on their own.
+#
+# rc tags never finalize: their drafts deliberately stay unpublished.
+name: Finalize release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Final release tag to publish as Latest, e.g. v0.6.0."
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: finalize-release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  # Maintainer-only, same gate as release.yml.
+  authorize:
+    if: github.repository == 'omnigent-ai/omnigent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require admin/maintain role
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          role="$(gh api "repos/${GITHUB_REPOSITORY}/collaborators/${ACTOR}/permission" --jq .role_name)"
+          case "$role" in
+            admin|maintain)
+              echo "Dispatcher ${ACTOR} has role ${role} — authorized." | tee -a "$GITHUB_STEP_SUMMARY" ;;
+            *)
+              echo "::error::Release workflows require the admin or maintain role (dispatcher ${ACTOR} has '${role}')."
+              exit 1 ;;
+          esac
+
+  checks:
+    needs: authorize
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      release_id: ${{ steps.draft.outputs.release_id }}
+      already_published: ${{ steps.draft.outputs.already_published }}
+    steps:
+      - name: Require a final vX.Y.Z tag
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::${TAG} is not a final vX.Y.Z tag — rc/dev/alpha/beta releases never finalize."
+            exit 1
+          fi
+
+      # Drafts are invisible to read-only tokens and unaddressable by tag
+      # (the get-by-tag endpoint 404s on drafts) — resolve by listing with the
+      # App token, same as draft-release-notes.yml. Scoped to BOTH repos: an
+      # installation token cannot reach outside its grant, and the docs sweep
+      # below queries omnigent-site.
+      - name: Mint App token (omnigent + omnigent-site)
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.OMNIGENT_BOT_APP_ID }}
+          private-key: ${{ secrets.OMNIGENT_BOT_APP_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: omnigent,omnigent-site
+
+      - name: Resolve the draft release
+        id: draft
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          match="$(gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate \
+            --jq 'map(select(.tag_name == env.TAG)) | first // empty')"
+          if [ -z "$match" ]; then
+            echo "::error::No GitHub release found for ${TAG}. Did the tag push run github-release.yml?"
+            exit 1
+          fi
+          is_draft="$(printf '%s' "$match" | jq -r '.draft')"
+          release_id="$(printf '%s' "$match" | jq -r '.id')"
+          already_published=false
+          if [ "$is_draft" != "true" ]; then
+            already_published=true
+            echo "Release ${TAG} is already published — nothing to do (idempotent no-op)." \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+          {
+            echo "release_id=${release_id}"
+            echo "already_published=${already_published}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Assert PyPI serves all three packages
+        if: steps.draft.outputs.already_published != 'true'
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          for pkg in omnigent omnigent-client omnigent-ui-sdk; do
+            if ! curl -fsS "https://pypi.org/pypi/${pkg}/${version}/json" >/dev/null; then
+              echo "::error::${pkg}==${version} is not on PyPI — run the secure-repo publish first (never advertise an uninstallable release)."
+              exit 1
+            fi
+            echo "PyPI OK: ${pkg}==${version}"
+          done
+
+      - name: Assert the CHANGELOG PR is not open
+        if: steps.draft.outputs.already_published != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          open_pr="$(gh pr list --repo "$GITHUB_REPOSITORY" --head "auto/changelog/${TAG}" \
+            --state open --json url --jq '.[0].url // empty')"
+          if [ -n "$open_pr" ]; then
+            echo "::error::The CHANGELOG PR for ${TAG} is still open — merge it first: ${open_pr}"
+            exit 1
+          fi
+          echo "CHANGELOG PR for ${TAG}: merged or not needed."
+
+      - name: Docs sweep — no open PRs against the X.Y-docs staging branch
+        if: steps.draft.outputs.already_published != 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TAG: ${{ inputs.tag }}
+          SITE_REPO: ${{ github.repository_owner }}/omnigent-site
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          docs_branch="${version%.*}-docs"
+          open="$(gh pr list --repo "$SITE_REPO" --base "$docs_branch" --state open \
+            --json url,title --jq '.[] | "- \(.url)  \(.title)"')"
+          if [ -n "$open" ]; then
+            {
+              echo "## Docs sweep failed for ${TAG}"
+              echo ""
+              echo "Open PRs still target \`${docs_branch}\` on ${SITE_REPO} — review and merge/close them, then re-dispatch:"
+              echo "$open"
+            } | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "::error::Open doc PRs still target ${docs_branch} — see the run summary."
+            exit 1
+          fi
+          echo "Docs sweep clean: no open PRs against ${docs_branch}." | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # Approving this environment attests "I reviewed the curated draft notes".
+  publish:
+    needs: [authorize, checks]
+    if: needs.checks.outputs.already_published != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: publish-release
+    steps:
+      - name: Mint App token (omnigent)
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.OMNIGENT_BOT_APP_ID }}
+          private-key: ${{ secrets.OMNIGENT_BOT_APP_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: omnigent
+
+      - name: Publish the draft as Latest
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TAG: ${{ inputs.tag }}
+          RELEASE_ID: ${{ needs.checks.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          # Edit by id (drafts 404 by tag). -F sends real booleans; make_latest
+          # must be explicit — API publishes don't set it.
+          gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
+            -F draft=false -f make_latest=true > /dev/null
+          {
+            echo "## Published ${TAG} as Latest"
+            echo ""
+            echo "The \`release: published\` event now fires (App-token publish):"
+            echo "- **publish-changelog.yml** opens the omnigent-site release-post PR and the docs-publish PR — review and merge both."
+            echo "- **update-homebrew.yml** opens the homebrew-tap bump PR — review the resource diff, then apply the \`pr-pull\` label."
+          } >> "$GITHUB_STEP_SUMMARY"

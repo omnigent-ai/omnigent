@@ -73,9 +73,9 @@ def _reset_is_disabled_cache():
     _mod._IS_DISABLED_CACHE[0] = None
 
 
-def test_is_disabled_omnigent_telemetry_zero(monkeypatch: pytest.MonkeyPatch) -> None:
-    """``OMNIGENT_TELEMETRY=0`` disables telemetry."""
-    monkeypatch.setenv("OMNIGENT_TELEMETRY", "0")
+def test_is_disabled_omnigent_analytics_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``OMNIGENT_ANALYTICS=0`` disables telemetry."""
+    monkeypatch.setenv("OMNIGENT_ANALYTICS", "0")
     monkeypatch.delenv("CI", raising=False)
     monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
     monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
@@ -86,7 +86,7 @@ def test_is_disabled_omnigent_telemetry_zero(monkeypatch: pytest.MonkeyPatch) ->
 
 def test_is_disabled_do_not_track(monkeypatch: pytest.MonkeyPatch) -> None:
     """``DO_NOT_TRACK=1`` disables telemetry."""
-    monkeypatch.delenv("OMNIGENT_TELEMETRY", raising=False)
+    monkeypatch.delenv("OMNIGENT_ANALYTICS", raising=False)
     monkeypatch.delenv("OMNIGENT_DISABLE_TELEMETRY", raising=False)
     monkeypatch.setenv("DO_NOT_TRACK", "1")
     monkeypatch.delenv("CI", raising=False)
@@ -99,7 +99,7 @@ def test_is_disabled_do_not_track(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_is_disabled_ci_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """``CI=true`` disables telemetry."""
-    monkeypatch.delenv("OMNIGENT_TELEMETRY", raising=False)
+    monkeypatch.delenv("OMNIGENT_ANALYTICS", raising=False)
     monkeypatch.delenv("OMNIGENT_DISABLE_TELEMETRY", raising=False)
     monkeypatch.delenv("DO_NOT_TRACK", raising=False)
     monkeypatch.setenv("CI", "true")
@@ -112,7 +112,7 @@ def test_is_disabled_ci_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_is_disabled_github_actions(monkeypatch: pytest.MonkeyPatch) -> None:
     """``GITHUB_ACTIONS=true`` disables telemetry."""
-    monkeypatch.delenv("OMNIGENT_TELEMETRY", raising=False)
+    monkeypatch.delenv("OMNIGENT_ANALYTICS", raising=False)
     monkeypatch.delenv("OMNIGENT_DISABLE_TELEMETRY", raising=False)
     monkeypatch.delenv("DO_NOT_TRACK", raising=False)
     monkeypatch.delenv("CI", raising=False)
@@ -126,7 +126,7 @@ def test_is_disabled_github_actions(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_is_disabled_none_set(monkeypatch: pytest.MonkeyPatch) -> None:
     """When none of the opt-out vars are set, telemetry is enabled."""
     _ci_vars = [
-        "OMNIGENT_TELEMETRY",
+        "OMNIGENT_ANALYTICS",
         "OMNIGENT_DISABLE_TELEMETRY",
         "DO_NOT_TRACK",
         "CI",
@@ -154,7 +154,7 @@ def test_is_disabled_none_set(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_is_disabled_disable_telemetry(monkeypatch: pytest.MonkeyPatch) -> None:
     """``DISABLE_TELEMETRY=true`` disables telemetry."""
-    monkeypatch.delenv("OMNIGENT_TELEMETRY", raising=False)
+    monkeypatch.delenv("OMNIGENT_ANALYTICS", raising=False)
     monkeypatch.setenv("DISABLE_TELEMETRY", "true")
     monkeypatch.delenv("CI", raising=False)
     monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
@@ -166,7 +166,7 @@ def test_is_disabled_disable_telemetry(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_is_disabled_omnigent_disable_telemetry(monkeypatch: pytest.MonkeyPatch) -> None:
     """``OMNIGENT_DISABLE_TELEMETRY=1`` disables telemetry."""
-    monkeypatch.delenv("OMNIGENT_TELEMETRY", raising=False)
+    monkeypatch.delenv("OMNIGENT_ANALYTICS", raising=False)
     monkeypatch.setenv("OMNIGENT_DISABLE_TELEMETRY", "1")
     monkeypatch.delenv("CI", raising=False)
     monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
@@ -180,7 +180,7 @@ def test_is_disabled_omnigent_disable_telemetry(monkeypatch: pytest.MonkeyPatch)
 
 
 _ALL_OPT_OUT_VARS = [
-    "OMNIGENT_TELEMETRY",
+    "OMNIGENT_ANALYTICS",
     "DISABLE_TELEMETRY",
     "OMNIGENT_DISABLE_TELEMETRY",
     "DO_NOT_TRACK",
@@ -233,7 +233,7 @@ def test_init_client_server_config_disabled(monkeypatch: pytest.MonkeyPatch) -> 
     import omnigent.telemetry.client as _mod
 
     for var in [
-        "OMNIGENT_TELEMETRY",
+        "OMNIGENT_ANALYTICS",
         "DISABLE_TELEMETRY",
         "OMNIGENT_DISABLE_TELEMETRY",
         "DO_NOT_TRACK",
@@ -393,3 +393,105 @@ def test_get_installation_id_corrupted_file(tmp_path: Path) -> None:
     # Corruption + write failure: either None or a freshly generated UUID.
     # What must NOT happen is an exception propagating to the caller.
     assert result is None or (isinstance(result, str) and len(result) > 0)
+
+
+# ── host_installation_id ──────────────────────────────────────────────────────
+
+
+def test_host_hello_frame_roundtrip_with_installation_id() -> None:
+    """``HostHelloFrame`` with ``installation_id`` survives encode/decode."""
+    from unittest.mock import patch
+
+    from omnigent.host.frames import HostHelloFrame, decode_host_frame, encode_host_frame
+    from omnigent.runtime import telemetry as _telemetry_mod
+
+    frame = HostHelloFrame(
+        version="0.1.0",
+        frame_protocol_version=1,
+        name="test-host",
+        installation_id="abc-123",
+    )
+    with (
+        patch.object(_telemetry_mod, "record_message_payload"),
+        patch.object(_telemetry_mod, "inject_trace_context"),
+    ):
+        wire = encode_host_frame(frame)
+    decoded = decode_host_frame(wire)
+    assert isinstance(decoded, HostHelloFrame)
+    assert decoded.installation_id == "abc-123"
+
+
+def test_host_hello_frame_roundtrip_none_installation_id() -> None:
+    """``HostHelloFrame`` with ``installation_id=None`` survives encode/decode."""
+    from unittest.mock import patch
+
+    from omnigent.host.frames import HostHelloFrame, decode_host_frame, encode_host_frame
+    from omnigent.runtime import telemetry as _telemetry_mod
+
+    frame = HostHelloFrame(
+        version="0.1.0",
+        frame_protocol_version=1,
+        name="test-host",
+        installation_id=None,
+    )
+    with (
+        patch.object(_telemetry_mod, "record_message_payload"),
+        patch.object(_telemetry_mod, "inject_trace_context"),
+    ):
+        wire = encode_host_frame(frame)
+    decoded = decode_host_frame(wire)
+    assert isinstance(decoded, HostHelloFrame)
+    assert decoded.installation_id is None
+
+
+def test_host_registry_get_host_installation_id_unregistered() -> None:
+    """``get_host_installation_id`` returns ``None`` when host is not registered."""
+    from omnigent.server.host_registry import HostRegistry
+
+    registry = HostRegistry()
+    assert registry.get_host_installation_id("host_nonexistent") is None
+
+
+def test_host_registry_get_host_installation_id_registered() -> None:
+    """``get_host_installation_id`` returns the ID from the hello frame."""
+    from unittest.mock import AsyncMock
+
+    from omnigent.host.frames import HostHelloFrame
+    from omnigent.server.host_registry import HostRegistry
+
+    registry = HostRegistry()
+    hello = HostHelloFrame(
+        version="0.1.0",
+        frame_protocol_version=1,
+        name="test-host",
+        installation_id="inst-xyz",
+    )
+    ws = AsyncMock()
+
+    # Use register() directly — it doesn't need an event loop.
+    conn = registry.register(host_id="host_abc", ws=ws, hello=hello, owner=None)
+    assert conn is not None
+    assert registry.get_host_installation_id("host_abc") == "inst-xyz"
+
+
+def test_build_record_promotes_host_installation_id() -> None:
+    """``_build_record`` lifts ``host_installation_id`` to top-level data."""
+    import omnigent.telemetry.client as _mod
+    from omnigent.telemetry.events import SessionCreatedEvent
+
+    event = SessionCreatedEvent(
+        installation_id="server-inst-id",
+        session_id="sess_001",
+        agent_id=None,
+        harness="claude-native",
+        surface="web",
+        anon_user_id=None,
+        host_installation_id="host-inst-abc",
+        is_fork=False,
+        is_sub_agent=False,
+    )
+    record = _mod._build_record(event)
+    data = record["data"]
+    assert data["host_installation_id"] == "host-inst-abc"
+    params = json.loads(data["params"]) if data["params"] else {}
+    assert "host_installation_id" not in params

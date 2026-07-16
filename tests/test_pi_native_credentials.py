@@ -845,19 +845,31 @@ def test_databricks_profile_registers_gpt_provider(monkeypatch: pytest.MonkeyPat
         "resolve_databricks_workspace",
         lambda profile: db_creds_mod.WorkspaceCreds(host="https://wkspc.example.com", token="tok"),
     )
-    live_gpt = [{"id": "databricks-gpt-5-4", "input": ["text", "image"]}]
+    # gpt-5-5 needs the Responses API; gpt-5-4 uses Completions
+    live_gpt_responses = [{"id": "databricks-gpt-5-5", "input": ["text", "image"]}]
+    live_gpt_completions = [{"id": "databricks-gpt-5-4", "input": ["text", "image"]}]
     live_claude = [{"id": "databricks-claude-sonnet-4-6", "input": ["text", "image"]}]
-    monkeypatch.setattr(creds, "_fetch_pi_model_lists", lambda *_: (live_claude, live_gpt))
+    monkeypatch.setattr(
+        creds,
+        "_fetch_pi_model_lists",
+        lambda *_: (live_claude, live_gpt_responses, live_gpt_completions),
+    )
 
     provider = creds.resolve_pi_native_provider(config_loader=_databricks_config)
     assert provider is not None
 
     cfg = provider.to_models_config()
     openai_entry = cfg["providers"].get("omnigent-openai")
-    assert openai_entry is not None, "omnigent-openai provider missing from models.json"
-    assert openai_entry["baseUrl"] == "https://wkspc.example.com/serving-endpoints"
-    assert openai_entry["api"] == "openai-completions"
-    assert any(m["id"] == "databricks-gpt-5-4" for m in openai_entry["models"])
+    assert openai_entry is not None, (
+        "omnigent-openai (responses) provider missing from models.json"
+    )
+    assert openai_entry["baseUrl"] == "https://wkspc.example.com/ai-gateway/codex/v1"
+    assert openai_entry["api"] == "openai-responses"
+    assert any(m["id"] == "databricks-gpt-5-5" for m in openai_entry["models"])
+    completions_entry = cfg["providers"].get("omnigent-completions")
+    assert completions_entry is not None, "omnigent-completions provider missing from models.json"
+    assert completions_entry["api"] == "openai-completions"
+    assert any(m["id"] == "databricks-gpt-5-4" for m in completions_entry["models"])
 
 
 def test_cli_config_databricks_registers_gpt_provider(
@@ -893,7 +905,7 @@ def test_cli_config_databricks_registers_gpt_provider(
         # Assert the auth_command token is used, not the SDK token
         assert token == "cmd-tok", f"expected auth_command token, got {token!r}"
         assert "dbc-a5d4177a" in workspace_url
-        return live_claude, live_gpt
+        return live_claude, live_gpt, []
 
     monkeypatch.setattr(creds, "_fetch_pi_model_lists", _mock_fetch)
 
@@ -903,13 +915,13 @@ def test_cli_config_databricks_registers_gpt_provider(
     cfg = provider.to_models_config()
     openai_entry = cfg["providers"].get("omnigent-openai")
     assert openai_entry is not None, "omnigent-openai provider missing from models.json"
-    # The serving-endpoints URL uses the REAL workspace hostname from databrickscfg,
-    # not a derived gateway hostname (which would be NXDOMAIN).
+    # Uses the AI Gateway codex URL (supports tools); the REAL workspace hostname
+    # from databrickscfg fixes the NXDOMAIN issue for dedicated-subdomain gateways.
     assert (
         openai_entry["baseUrl"]
-        == "https://dbc-a5d4177a-49dc.cloud.databricks.com/serving-endpoints"
+        == "https://1965859176160743.ai-gateway.cloud.databricks.com/codex/v1"
     )
-    assert openai_entry["api"] == "openai-completions"
+    assert openai_entry["api"] == "openai-responses"
     assert any(m["id"] == "databricks-gpt-5-4" for m in openai_entry["models"])
 
 
@@ -943,7 +955,13 @@ def test_fetch_pi_model_lists_parses_serving_endpoints() -> None:
             # GLM without task field — falls back to name token "glm"
             {"name": "databricks-glm-4-7", "state": {"ready": "READY"}},
             {"name": "my-embedding-model", "task": "llm/v1/embeddings"},
-            {"name": "databricks-gpt-5-5", "task": "llm/v1/chat", "state": {"ready": "NOT_READY"}},
+            {"name": "databricks-gpt-5-5", "task": "llm/v1/chat", "state": {"ready": "READY"}},
+            # NOT_READY — excluded regardless of API type
+            {
+                "name": "databricks-gpt-5-5-pro",
+                "task": "llm/v1/chat",
+                "state": {"ready": "NOT_READY"},
+            },
         ]
     }
 
@@ -958,22 +976,25 @@ def test_fetch_pi_model_lists_parses_serving_endpoints() -> None:
         "httpx.Client",
         lambda **kw: _real_client(transport=_MockTransport()),
     ):
-        claude, openai = creds._fetch_pi_model_lists("https://wkspc.example.com", "tok")
+        claude, gpt, completions = creds._fetch_pi_model_lists("https://wkspc.example.com", "tok")
 
     assert [m["id"] for m in claude] == [
         "databricks-claude-sonnet-4-6",
         "databricks-claude-opus-4-8",
     ]
-    # GPT, Llama, and GLM (both task-detected and name-detected) all go to openai
-    openai_ids = [m["id"] for m in openai]
-    assert "databricks-gpt-5-4" in openai_ids
-    assert "databricks-llama-3-70b" in openai_ids
-    assert "databricks-zai-org-glm-4-7" in openai_ids
-    assert "databricks-glm-4-7" in openai_ids
+    # Newer GPT needing Responses API
+    gpt_ids = [m["id"] for m in gpt]
+    assert "databricks-gpt-5-5" in gpt_ids  # needs responses API
+    assert "databricks-gpt-5-4" not in gpt_ids  # works with completions
+    # Llama and GLM go to completions (work with /chat/completions + tools)
+    completions_ids = [m["id"] for m in completions]
+    assert "databricks-gpt-5-4" in completions_ids
+    assert "databricks-llama-3-70b" in completions_ids
+    assert "databricks-zai-org-glm-4-7" in completions_ids
+    assert "databricks-glm-4-7" in completions_ids
     # Embeddings and not-ready endpoints excluded
-    assert "my-embedding-model" not in openai_ids
-    assert "databricks-gpt-5-5" not in openai_ids
-    assert all(m.get("input") == ["text", "image"] for m in claude + openai)
+    assert "my-embedding-model" not in gpt_ids + completions_ids
+    assert all(m.get("input") == ["text", "image"] for m in claude + gpt + completions)
 
 
 def test_fetch_pi_model_lists_falls_back_on_http_error() -> None:
@@ -995,7 +1016,10 @@ def test_fetch_pi_model_lists_falls_back_on_http_error() -> None:
         "httpx.Client",
         lambda **kw: _real_client(transport=_ErrorTransport()),
     ):
-        claude, openai = creds._fetch_pi_model_lists("https://wkspc.example.com", "bad-tok")
+        claude, gpt, completions = creds._fetch_pi_model_lists(
+            "https://wkspc.example.com", "bad-tok"
+        )
 
     assert claude == []
-    assert openai == []
+    assert gpt == []
+    assert completions == []

@@ -53,12 +53,12 @@ def test_title_defaults_empty_string_on_insert(db_engine: Engine) -> None:
                 "(id, created_at, updated_at, root_conversation_id) "
                 "VALUES (:id, :ts, :ts, :id)"
             ),
-            {"id": "conv_title_default", "ts": 1700000000},
+            {"id": "8d75d48b8389fad0b52fbe8d8befc274", "ts": 1700000000},
         )
         conn.commit()
         value = conn.execute(
             sa.text("SELECT title FROM conversations WHERE id = :id"),
-            {"id": "conv_title_default"},
+            {"id": "8d75d48b8389fad0b52fbe8d8befc274"},
         ).scalar_one()
     assert value == "", f"Expected title to default to '' (empty string); got {value!r}."
 
@@ -80,7 +80,7 @@ def test_downgrade_restores_nullable_and_nullifies_empty_titles(tmp_path: Path) 
                 "(id, created_at, updated_at, root_conversation_id, title) "
                 "VALUES (:id, :ts, :ts, :id, '')"
             ),
-            {"id": "conv_downgrade_test", "ts": 1700000001},
+            {"id": "c53e320807888eb5da3a3395ef5382df", "ts": 1700000001},
         )
         conn.commit()
 
@@ -92,7 +92,7 @@ def test_downgrade_restores_nullable_and_nullifies_empty_titles(tmp_path: Path) 
                 "(id, created_at, updated_at, root_conversation_id, title) "
                 "VALUES (:id, :ts, :ts, :id, :title)"
             ),
-            {"id": "conv_titled", "ts": 1700000002, "title": "My Session"},
+            {"id": "4b6eaa7b9f9ea8f43b9407d4702c3838", "ts": 1700000002, "title": "My Session"},
         )
         conn.commit()
 
@@ -111,7 +111,7 @@ def test_downgrade_restores_nullable_and_nullifies_empty_titles(tmp_path: Path) 
     with engine.connect() as conn:
         value = conn.execute(
             sa.text("SELECT title FROM conversations WHERE id = :id"),
-            {"id": "conv_downgrade_test"},
+            {"id": "c53e320807888eb5da3a3395ef5382df"},
         ).scalar_one_or_none()
     assert value is None, (
         f"Expected empty-string title to be restored to NULL after downgrade; got {value!r}"
@@ -121,7 +121,7 @@ def test_downgrade_restores_nullable_and_nullifies_empty_titles(tmp_path: Path) 
     with engine.connect() as conn:
         value = conn.execute(
             sa.text("SELECT title FROM conversations WHERE id = :id"),
-            {"id": "conv_titled"},
+            {"id": "4b6eaa7b9f9ea8f43b9407d4702c3838"},
         ).scalar_one_or_none()
     assert value == "My Session", f"Real title should be unchanged after downgrade; got {value!r}"
 

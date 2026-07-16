@@ -175,7 +175,7 @@ async def _attach_deny_policy(
     )
     assert resp.status_code == 200, f"policy create failed: {resp.status_code} {resp.text}"
     body = resp.json()
-    assert body["id"].startswith("pol_")
+    assert len(body["id"]) == 32
     return body["id"]
 
 

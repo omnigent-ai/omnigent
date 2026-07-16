@@ -50,7 +50,7 @@ async def _create_session(
     Create a session and return the response JSON.
 
     :param client: The test HTTP client.
-    :param agent_id: Agent to bind, e.g. ``"ag_abc123"``.
+    :param agent_id: Agent to bind, e.g. ``"104c4932179e16161e9ed9298fd5a3e2"``.
     :param initial_message: When set, seed the session with a
         user message.
     :param title: Optional session title.
@@ -311,7 +311,9 @@ async def test_list_sessions_includes_workspace_and_host_id(
 
     # Register the host first — conversations.host_id is an FK to the
     # hosts table, so binding a non-existent host_id would fail the FK.
-    host = HostStore(db_uri).upsert_on_connect("host_test", "test-laptop", "owner@example.com")
+    host = HostStore(db_uri).upsert_on_connect(
+        "6b9c07bfb42f687d53af44f018adebec", "test-laptop", "owner@example.com"
+    )
     # set_host_id writes host_id + workspace together (the
     # ck_conversations_workspace_required_for_host constraint forbids a
     # host_id with a NULL workspace).
@@ -531,7 +533,7 @@ async def test_external_session_superseded_publishes_redirect_event(
         f"/v1/sessions/{session['id']}/events",
         json={
             "type": "external_session_superseded",
-            "data": {"target_conversation_id": "conv_new"},
+            "data": {"target_conversation_id": "2d1b1a96e3e08f2cd43c0cc4b695ac5d"},
         },
     )
     assert resp.status_code in (200, 202)
@@ -540,7 +542,7 @@ async def test_external_session_superseded_publishes_redirect_event(
     assert len(superseded) == 1
     event = superseded[0]
     assert event["conversation_id"] == session["id"]
-    assert event["target_conversation_id"] == "conv_new"
+    assert event["target_conversation_id"] == "2d1b1a96e3e08f2cd43c0cc4b695ac5d"
     assert event["reason"] == "clear"
 
 
@@ -583,7 +585,7 @@ async def test_external_session_superseded_drains_pending_inputs(
             f"/v1/sessions/{session['id']}/events",
             json={
                 "type": "external_session_superseded",
-                "data": {"target_conversation_id": "conv_new"},
+                "data": {"target_conversation_id": "2d1b1a96e3e08f2cd43c0cc4b695ac5d"},
             },
         )
         assert resp.status_code in (200, 202)
@@ -636,7 +638,7 @@ async def test_external_subagent_start_mints_child_session(
     assert resp.status_code in (200, 202), f"unexpected status {resp.status_code}: {resp.text}"
     body = resp.json()
     child_id = body["child_session_id"]
-    assert child_id.startswith("conv_")
+    assert len(child_id) == 32
     assert body["queued"] is False
 
     # The child should appear under the parent in child_sessions.
@@ -1031,7 +1033,7 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
         await fake_runner.aclose()
 
     assert resp.json()["queued"] is True
-    assert resp.json()["item_id"].startswith("sc_")
+    assert len(resp.json()["item_id"]) == 32
 
     items_resp = await client.get(f"/v1/sessions/{session['id']}/items")
     assert items_resp.status_code == 200, items_resp.text
@@ -1289,7 +1291,11 @@ async def test_external_user_message_folds_pending_image_into_durable_item(
     pending_inputs.record(
         session["id"],
         [
-            {"type": "input_image", "file_id": "file_real_99", "filename": "diagram.png"},
+            {
+                "type": "input_image",
+                "file_id": "b08c893483887826e2b9f67165106700",
+                "filename": "diagram.png",
+            },
             {"type": "input_text", "text": "explain this diagram"},
         ],
     )
@@ -1322,7 +1328,7 @@ async def test_external_user_message_folds_pending_image_into_durable_item(
         # — so reloading history shows the image, not just the caption.
         assert user_msg["content"][0] == {
             "type": "input_image",
-            "file_id": "file_real_99",
+            "file_id": "b08c893483887826e2b9f67165106700",
             "filename": "diagram.png",
         }
         expected_text = "[Attached: /tmp/diagram.png]\n\nexplain this diagram"
@@ -1737,7 +1743,7 @@ async def test_patch_session_404_for_nonexistent(
 ) -> None:
     """PATCH returns 404 for a session that doesn't exist."""
     resp = await client.patch(
-        "/v1/sessions/conv_nonexistent",
+        "/v1/sessions/ad563e906854634c49e1a6fd2fbb31d4",
         json={"title": "nope"},
     )
     assert resp.status_code == 404
@@ -1948,7 +1954,7 @@ async def test_get_session_agent_name_is_spec_name_after_switch(
     target_row = agent_store.get(target_agent["id"])
     assert target_row is not None and target_row.bundle_location is not None
     builtin = agent_store.create(
-        "ag_builtin_claude_test",
+        "35316537082e723a63887635649d702d",
         "claude-native-ui",
         target_row.bundle_location,
     )
@@ -2248,7 +2254,7 @@ async def test_list_session_items_404_for_nonexistent(
     client: httpx.AsyncClient,
 ) -> None:
     """Items endpoint returns 404 for a session that doesn't exist."""
-    resp = await client.get("/v1/sessions/conv_nonexistent/items")
+    resp = await client.get("/v1/sessions/ad563e906854634c49e1a6fd2fbb31d4/items")
     assert resp.status_code == 404
 
 
@@ -2830,7 +2836,7 @@ async def test_publish_status_keeps_failed_sticky_against_trailing_idle(
         "omnigent.server.routes.sessions.session_stream.publish",
         lambda _session_id, event: published.append(event),
     )
-    sid = "conv_sticky_failed"
+    sid = "ee38ff3453b8ccac61b85acb8c670b59"
     sessions_module._session_status_cache.pop(sid, None)
     try:
         sessions_module._publish_status(sid, "failed")
@@ -2871,7 +2877,7 @@ async def test_publish_status_tracks_in_flight_response_id(
         "omnigent.server.routes.sessions.session_stream.publish",
         lambda _session_id, _event: None,
     )
-    sid = "conv_active_resp"
+    sid = "dcc9f70cf10c73bb49c3b465b929747c"
     sessions_module._session_status_cache.pop(sid, None)
     sessions_module._session_active_response_cache.pop(sid, None)
     try:
@@ -2952,7 +2958,7 @@ async def test_patch_runner_rebind_clears_stale_failed_status(
         """
         Return the recovering runner client for the patched session.
 
-        :param _session_id: Session id being rebound, e.g. ``"conv_abc123"``.
+        :param _session_id: Session id being rebound, e.g. ``"d1f9214d74c38b9f9a9db17ed8352dc4"``.
         :param _runner_router: Ignored runner router placeholder.
         :returns: Runner client stub.
         """
@@ -2967,7 +2973,7 @@ async def test_patch_runner_rebind_clears_stale_failed_status(
         """
         Skip relay startup; this test targets the PATCH init branch.
 
-        :param _session_id: Session id, e.g. ``"conv_abc123"``.
+        :param _session_id: Session id, e.g. ``"d1f9214d74c38b9f9a9db17ed8352dc4"``.
         :param _runner_id: Runner id, e.g. ``"runner_recovered"``.
         :param _runner_client: Runner client stub.
         :param _conversation_store: Conversation store from the route.
@@ -7173,9 +7179,7 @@ async def test_external_codex_subagent_start_mints_child_session(
 
     assert resp.status_code == 202, f"unexpected status {resp.status_code}: {resp.text}"
     child_id = resp.json()["child_session_id"]
-    assert child_id.startswith("conv_"), (
-        f"child_session_id must start with conv_; got {child_id!r}"
-    )
+    assert len(child_id) == 32, f"child_session_id must start with conv_; got {child_id!r}"
 
     children_resp = await client.get(f"/v1/sessions/{parent['id']}/child_sessions")
     assert children_resp.status_code == 200

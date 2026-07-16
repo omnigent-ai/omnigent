@@ -11,6 +11,9 @@ on:
   push:
     branches:
       - main
+      # Release branches: release.yml's green-CI gate reads check runs off the
+      # branch head, so cherry-picks and release-bump commits must run checks.
+      - 'release/v[0-9]*'
 
 permissions:
   contents: read
@@ -125,3 +128,26 @@ jobs:
       - name: Type-check web
         working-directory: web
         run: npm run type-check
+
+  # The three packages release in lockstep (identical versions + `==` sibling
+  # pins). Assert agreement on every change so drift from a bad merge or
+  # cherry-pick — however it happened — is caught before it reaches a release.
+  version-lockstep:
+    name: Version lockstep check
+    needs: gate
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version-file: ".python-version"
+
+      - name: All version locations agree
+        run: |
+          python -m pip install --quiet --disable-pip-version-check packaging
+          python scripts/update_versions.py check

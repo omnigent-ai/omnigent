@@ -70,6 +70,14 @@ interface NativeShellApi {
    */
   onNotificationActivated?: (callback: (path: string) => void) => () => void;
   /**
+   * Subscribe to deep-link navigations from the desktop shell. When the user
+   * clicks an `omnigent://.../c/<id>` link for a server this window is already
+   * on, the main process sends the in-app path here so the SPA routes to it
+   * in-place (no reload). Same path shape as onNotificationActivated. Absent
+   * on older shells / outside Electron; returns an unsubscribe.
+   */
+  onOpenPath?: (callback: (path: string) => void) => () => void;
+  /**
    * Subscribe to native sidebar-drag events. The iOS shell streams a left-edge
    * swipe here (the gesture it repurposed from back-navigation) so the renderer
    * can drive its sidebar as an interactive drawer: `begin`/`move` carry a 0→1
@@ -135,6 +143,8 @@ export interface NativeViewModeParams {
  */
 interface ElectronDesktopApi extends NativeShellApi {
   kind: "electron";
+  /** Desktop auto-update bridge, absent on shells older than the updater work. */
+  updates?: ElectronUpdateBridge;
   /** Current server origin + recent servers, or null on a foreign page. */
   getServerPicker?: () => Promise<ServerPickerInfo | null>;
   /** Re-point this window to a previously-connected server URL. */
@@ -197,6 +207,50 @@ export interface HostActionResult {
   error?: string;
 }
 
+export type UpdateMode = "none" | "manual" | "start" | "default";
+
+export interface UpdateConfig {
+  mode: UpdateMode;
+  autoInstall: boolean;
+  skippedVersion: string | null;
+}
+
+export type UpdateStatus =
+  | {
+      state: "idle" | "checking" | "none";
+      info?: undefined;
+      progress?: undefined;
+      lastError?: string;
+    }
+  | {
+      state: "available" | "downloaded";
+      info?: { version: string; releaseNotes?: string };
+      progress?: undefined;
+      lastError?: string;
+    }
+  | {
+      state: "downloading";
+      info?: { version: string; releaseNotes?: string };
+      progress?: { percent: number };
+      lastError?: string;
+    }
+  | {
+      state: "error-security";
+      info?: { version: string; releaseNotes?: string };
+      progress?: undefined;
+      lastError?: string;
+    };
+
+export interface ElectronUpdateBridge {
+  getConfig: () => Promise<UpdateConfig>;
+  getStatus: () => Promise<UpdateStatus>;
+  check: () => Promise<void>;
+  download: () => Promise<void>;
+  installNow: () => Promise<void>;
+  setConfig: (patch: Partial<UpdateConfig>) => Promise<UpdateConfig>;
+  onStatus: (callback: (status: UpdateStatus) => void) => () => void;
+}
+
 /** Data backing the title-bar server picker, from the Electron shell. */
 export interface ServerPickerInfo {
   /** Origin this window is connected to, e.g. `"http://localhost:8000"`. */
@@ -223,6 +277,11 @@ function nativeApi(): NativeShellApi | undefined {
 /** True when running inside the Electron desktop shell. */
 export function isElectronShell(): boolean {
   return electronApi() !== undefined;
+}
+
+/** Desktop auto-update bridge, or undefined outside Electron / older shells. */
+export function updateBridge(): ElectronUpdateBridge | undefined {
+  return electronApi()?.updates;
 }
 
 /**
@@ -332,6 +391,29 @@ export function onNativeNotificationActivated(callback: (path: string) => void):
     return native.onNotificationActivated(callback);
   } catch (err) {
     console.warn("[nativeBridge] native onNotificationActivated failed:", err);
+    return () => {};
+  }
+}
+
+/**
+ * Subscribe to deep-link navigations from the desktop shell. When the user
+ * clicks an `omnigent://.../c/<id>` link for a server this window is already
+ * on, the main process sends the in-app path here so the SPA can route to it
+ * in-place (no reload) — reusing the same router `navigate` a notification
+ * click uses. The path is basename-less (`/c/<id>`); the embedded build's
+ * `basenamedRouting` rebases it under the mount.
+ *
+ * Returns an unsubscribe function. A no-op (returning a no-op unsubscribe)
+ * outside the Electron shell or under a shell too old to support deep-link
+ * routing, so callers can register it unconditionally.
+ */
+export function onOpenPath(callback: (path: string) => void): () => void {
+  const native = nativeApi();
+  if (!native?.onOpenPath) return () => {};
+  try {
+    return native.onOpenPath(callback);
+  } catch (err) {
+    console.warn("[nativeBridge] native onOpenPath failed:", err);
     return () => {};
   }
 }

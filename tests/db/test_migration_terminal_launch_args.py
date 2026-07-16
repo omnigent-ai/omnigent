@@ -94,17 +94,17 @@ def test_terminal_launch_args_round_trip_null_and_json(db_engine: Engine) -> Non
                 "(id, created_at, updated_at, root_conversation_id) "
                 "VALUES (:id, :ts, :ts, :id)"
             ),
-            {"id": "conv_tla_null", "ts": 1700000000},
+            {"id": "8c2ab1547c91fcc61ae8226f37d07400", "ts": 1700000000},
         )
         conn.execute(
             sa.text("INSERT INTO omnigent_conversation_metadata (id, kind) VALUES (:id, 1)"),
-            {"id": "conv_tla_null"},
+            {"id": "8c2ab1547c91fcc61ae8226f37d07400"},
         )
         result = conn.execute(
             sa.text(
                 "SELECT terminal_launch_args FROM omnigent_conversation_metadata WHERE id = :id"
             ),
-            {"id": "conv_tla_null"},
+            {"id": "8c2ab1547c91fcc61ae8226f37d07400"},
         ).scalar_one()
         assert result is None, (
             f"Expected NULL terminal_launch_args on default insert; got {result!r}."
@@ -117,7 +117,7 @@ def test_terminal_launch_args_round_trip_null_and_json(db_engine: Engine) -> Non
                 "(id, created_at, updated_at, root_conversation_id) "
                 "VALUES (:id, :ts, :ts, :id)"
             ),
-            {"id": "conv_tla_value", "ts": 1700000000},
+            {"id": "d7d570908f410a452a2d6b912bc6f97a", "ts": 1700000000},
         )
         conn.execute(
             sa.text(
@@ -126,7 +126,7 @@ def test_terminal_launch_args_round_trip_null_and_json(db_engine: Engine) -> Non
                 "VALUES (:id, 1, :tla)"
             ),
             {
-                "id": "conv_tla_value",
+                "id": "d7d570908f410a452a2d6b912bc6f97a",
                 "tla": '["--dangerously-skip-permissions", "--model", "opus"]',
             },
         )
@@ -134,7 +134,7 @@ def test_terminal_launch_args_round_trip_null_and_json(db_engine: Engine) -> Non
             sa.text(
                 "SELECT terminal_launch_args FROM omnigent_conversation_metadata WHERE id = :id"
             ),
-            {"id": "conv_tla_value"},
+            {"id": "d7d570908f410a452a2d6b912bc6f97a"},
         ).scalar_one()
         assert result == '["--dangerously-skip-permissions", "--model", "opus"]', (
             f"Round-trip mismatch on terminal_launch_args; got {result!r}."

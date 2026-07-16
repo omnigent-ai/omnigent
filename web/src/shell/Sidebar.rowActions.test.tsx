@@ -15,10 +15,24 @@ import type { ServerInfo } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 
 // Controllable rename mutation so the double-click test can assert the
-// committed title was forwarded to the PATCH. Declared via vi.hoisted so the
-// vi.mock factory (hoisted above imports) can reference it.
+// committed title was forwarded to the PATCH. `isMobile` toggles the mocked
+// `useIsMobileViewport` so a test can render the row on a mobile viewport (the
+// project flyout is disabled there). Declared via vi.hoisted so the vi.mock
+// factories (hoisted above imports) can reference them.
 const mocks = vi.hoisted(() => ({
   rename: { mutate: vi.fn() },
+  isMobile: false,
+  // Projects surfaced by the picker + the move-to-project mutation, so the
+  // mobile in-place project view test can assert both the list and the pick.
+  projects: [] as string[],
+  moveToProject: { mutate: vi.fn() },
+}));
+
+// Mock the mobile-viewport hook — jsdom doesn't evaluate media queries, so
+// drive it explicitly. Defaults to desktop (false); the mobile flyout test
+// flips `mocks.isMobile` for the duration of that case.
+vi.mock("@/hooks/useIsMobileViewport", () => ({
+  useIsMobileViewport: () => mocks.isMobile,
 }));
 
 vi.mock("@/hooks/useConversations", () => ({
@@ -38,8 +52,20 @@ vi.mock("@/hooks/useConversations", () => ({
   useBulkDeleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useStopSession: () => ({ mutate: vi.fn() }),
-  useProjects: () => ({ data: [] }),
-  useMoveToProject: () => ({ mutate: vi.fn() }),
+  useProjects: () => ({ data: mocks.projects }),
+  // A non-empty `useProjects` renders a project folder, which queries its
+  // sessions — return the collapsed (disabled) shape so the folder is inert
+  // (this suite keeps its test row unfiled; the picker only needs the name).
+  useProjectSessions: () => ({
+    data: undefined,
+    isLoading: false,
+    isError: false,
+    error: null,
+    fetchNextPage: vi.fn(),
+    hasNextPage: false,
+    isFetchingNextPage: false,
+  }),
+  useMoveToProject: () => mocks.moveToProject,
   useDeleteProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   fetchProjectSessionIds: () => Promise.resolve([]),
   PROJECT_LABEL_KEY: "omni_project",
@@ -142,7 +168,14 @@ function renderSidebar(activeId?: string, info?: ServerInfo) {
 
 beforeEach(() => {
   mocks.rename.mutate.mockReset();
+  mocks.moveToProject.mutate.mockReset();
+  mocks.projects = [];
+  // Default every test to the desktop viewport; the mobile flyout test opts in.
+  mocks.isMobile = false;
   useConvMock.mockReset();
+  // Pins persist to localStorage; clear it so a seeded pin doesn't leak into
+  // the next test's row state.
+  localStorage.clear();
   // The read-state mirror is module-level (in-memory), so reset it between
   // tests to avoid a mark-unread leaking into later rows.
   __resetReadStateForTests();
@@ -264,6 +297,43 @@ describe("double-click to rename", () => {
     expect(mocks.rename.mutate).toHaveBeenCalledWith({ id: "conv_1", title: "Renamed Session" });
   });
 
+  it("does not commit the rename when Enter confirms an active IME composition", () => {
+    renderSidebar();
+
+    const row = screen.getByRole("link", { name: /My Session/ });
+    fireEvent.dblClick(row);
+
+    const input = screen.getByTestId("rename-conversation-input") as HTMLInputElement;
+    fireEvent.compositionStart(input);
+    fireEvent.change(input, { target: { value: "名前変更" } });
+
+    // The Enter that confirms the conversion candidate must NOT commit.
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(mocks.rename.mutate).not.toHaveBeenCalled();
+
+    // Once composition ends, a subsequent Enter commits as usual.
+    fireEvent.compositionEnd(input);
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(mocks.rename.mutate).toHaveBeenCalledTimes(1);
+    expect(mocks.rename.mutate).toHaveBeenCalledWith({ id: "conv_1", title: "名前変更" });
+  });
+
+  it("does not commit the rename when Enter carries the IME keyCode 229 fallback", () => {
+    renderSidebar();
+
+    const row = screen.getByRole("link", { name: /My Session/ });
+    fireEvent.dblClick(row);
+
+    const input = screen.getByTestId("rename-conversation-input") as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "Renamed" } });
+    fireEvent.keyDown(input, { key: "Enter", keyCode: 229 });
+    expect(mocks.rename.mutate).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(mocks.rename.mutate).toHaveBeenCalledTimes(1);
+    expect(mocks.rename.mutate).toHaveBeenCalledWith({ id: "conv_1", title: "Renamed" });
+  });
+
   it("does not enter rename on double-click for a viewer-only row", () => {
     // permission_level 1 is below the edit threshold (>= 2), so the kebab's
     // Rename item is disabled and double-click must be inert too. A viewer-only
@@ -278,6 +348,137 @@ describe("double-click to rename", () => {
 
     expect(screen.queryByTestId("rename-conversation-input")).toBeNull();
     expect(mocks.rename.mutate).not.toHaveBeenCalled();
+  });
+});
+
+describe("pinned row project flyout", () => {
+  // Pinning lifts a session out of its project folder into the flat "Pinned"
+  // section, so the folder no longer conveys which project it came from. The
+  // hover flyout restores that cue: title + folder icon + project name. It
+  // opens on focus/hover — fire focus on the row link and await the portal.
+
+  it("shows the project name in the flyout for a pinned, project-owned row", async () => {
+    // Seed the pin so the row lifts into the always-expanded Pinned section
+    // (a project-owned row otherwise sits inside a collapsed project folder).
+    localStorage.setItem("omnigent:pinned-conversation-ids", JSON.stringify(["conv_1"]));
+    mockConversations([{ ...CONV, labels: { omni_project: "Moonshot" } }]);
+    renderSidebar();
+    expect(screen.getByText("Pinned")).toBeInTheDocument();
+
+    // Focus opens the HoverCard (onFocus is one of its open triggers); the
+    // content is portalled, so query the whole document after the open delay.
+    fireEvent.focus(screen.getByRole("link", { name: /My Session/ }));
+    const flyout = await screen.findByTestId("pinned-project-flyout");
+    expect(within(flyout).getByText("Moonshot")).toBeInTheDocument();
+    expect(within(flyout).getByText("My Session")).toBeInTheDocument();
+  });
+
+  it("renders no project flyout for a pinned row with no project", () => {
+    // No project label → nothing to surface, so the row keeps its plain native
+    // title tooltip and never mounts a hover-card trigger.
+    localStorage.setItem("omnigent:pinned-conversation-ids", JSON.stringify(["conv_1"]));
+    mockConversations([{ ...CONV, labels: {} }]);
+    renderSidebar();
+    expect(screen.getByText("Pinned")).toBeInTheDocument();
+
+    const row = screen.getByRole("link", { name: /My Session/ });
+    expect(row).not.toHaveAttribute("data-slot", "hover-card-trigger");
+    fireEvent.focus(row);
+    expect(screen.queryByTestId("pinned-project-flyout")).toBeNull();
+  });
+
+  it("disables the flyout on a mobile viewport, keeping the native title", () => {
+    // Mobile has no real hover, so the flyout is gated off there: a tap that
+    // navigates must not also open (and strand) a HoverCard over the chat. The
+    // row falls back to the plain link path — no hover-card trigger, native
+    // title restored — even though it IS pinned + project-owned.
+    mocks.isMobile = true;
+    localStorage.setItem("omnigent:pinned-conversation-ids", JSON.stringify(["conv_1"]));
+    mockConversations([{ ...CONV, labels: { omni_project: "Moonshot" } }]);
+    renderSidebar();
+    expect(screen.getByText("Pinned")).toBeInTheDocument();
+
+    const row = screen.getByRole("link", { name: /My Session/ });
+    // No hover-card trigger is mounted, and the native title tooltip is kept.
+    expect(row).not.toHaveAttribute("data-slot", "hover-card-trigger");
+    expect(row).toHaveAttribute("title", "My Session");
+    // Focusing the row opens nothing — the flyout never mounts on mobile.
+    fireEvent.focus(row);
+    expect(screen.queryByTestId("pinned-project-flyout")).toBeNull();
+  });
+});
+
+describe("mobile in-place project picker", () => {
+  // Desktop opens the "Add to project" item as a side-flyout submenu, but a
+  // side flyout has no room on mobile. There the item instead swaps the kebab
+  // body in place: the main actions are replaced by the project picker (search
+  // + list + Create new project) plus a Back control that returns to the main
+  // menu — no submenu, no close/reopen. Desktop keeps the flyout untouched.
+
+  it("swaps the kebab body to the project picker in place, and Back returns", () => {
+    mocks.isMobile = true;
+    mocks.projects = ["Sprint 42"];
+    renderSidebar();
+
+    // Radix DropdownMenu opens on pointerdown, not click.
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+
+    // Main view shows the everyday actions and the (unfiled) project entry.
+    expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
+    expect(screen.getByTestId("delete-conversation")).toBeInTheDocument();
+    const moveItem = screen.getByTestId("move-to-project");
+    expect(moveItem).toHaveTextContent("Add to project");
+    // It's a plain item on mobile, NOT a side-flyout submenu trigger.
+    expect(moveItem).not.toHaveAttribute("aria-haspopup", "menu");
+
+    // Tapping it swaps the body in place to the project picker — the main
+    // actions are gone, and the picker (search + project + Create new project)
+    // plus a Back control are shown.
+    fireEvent.click(moveItem);
+    expect(screen.getByPlaceholderText("Search projects")).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: /Sprint 42/ })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: /Create new project/ })).toBeInTheDocument();
+    expect(screen.getByTestId("project-picker-back")).toBeInTheDocument();
+    // The main actions are no longer rendered — the body was replaced, not
+    // stacked beside a flyout.
+    expect(screen.queryByTestId("rename-conversation")).toBeNull();
+    expect(screen.queryByTestId("delete-conversation")).toBeNull();
+
+    // Back returns to the main menu without closing it: the everyday actions
+    // are visible again and the picker is gone.
+    fireEvent.click(screen.getByTestId("project-picker-back"));
+    expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
+    expect(screen.getByTestId("delete-conversation")).toBeInTheDocument();
+    expect(screen.queryByPlaceholderText("Search projects")).toBeNull();
+  });
+
+  it("moves the session into a picked project just like desktop", () => {
+    mocks.isMobile = true;
+    mocks.projects = ["Sprint 42"];
+    renderSidebar();
+
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+    fireEvent.click(screen.getByTestId("move-to-project"));
+    fireEvent.click(screen.getByRole("menuitem", { name: /Sprint 42/ }));
+
+    // Same mutation contract as the desktop submenu pick.
+    expect(mocks.moveToProject.mutate).toHaveBeenCalledWith({
+      id: "conv_1",
+      project: "Sprint 42",
+    });
+  });
+
+  it("keeps the desktop side-flyout submenu (no in-place swap)", () => {
+    // Desktop viewport (default). The project entry is a submenu trigger, and
+    // opening the kebab never renders the in-place Back control.
+    mocks.projects = ["Sprint 42"];
+    renderSidebar();
+
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+    const moveItem = screen.getByTestId("move-to-project");
+    // Radix SubTrigger advertises a submenu popup.
+    expect(moveItem).toHaveAttribute("aria-haspopup", "menu");
+    expect(screen.queryByTestId("project-picker-back")).toBeNull();
   });
 });
 

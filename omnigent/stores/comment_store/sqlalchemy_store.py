@@ -6,7 +6,7 @@ import uuid
 
 from sqlalchemy import delete, func, select
 
-from omnigent.db.db_models import SqlComment, current_workspace_id
+from omnigent.db.db_models import SqlComment, current_workspace_id, normalize_uuid
 from omnigent.db.enum_codecs import decode_comment_status, encode_comment_status
 from omnigent.db.utils import (
     get_or_create_engine,
@@ -60,7 +60,7 @@ class SqlAlchemyCommentStore(CommentStore):
         """Fetch a single comment by id, scoped to a conversation. See base class for contract."""
         with self._session() as session:
             row = session.get(SqlComment, (current_workspace_id(), comment_id))
-            if row is None or row.conversation_id != conversation_id:
+            if row is None or row.conversation_id != normalize_uuid(conversation_id):
                 return None
             return _to_entity(row)
 
@@ -81,7 +81,7 @@ class SqlAlchemyCommentStore(CommentStore):
         # backfill (created_at * 1e6) and docs rely on.
         created_us = now_epoch_us()
         row = SqlComment(
-            id=str(uuid.uuid4()),
+            id=uuid.uuid4().hex,
             conversation_id=conversation_id,
             path=path,
             start_index=start_index,
@@ -127,7 +127,7 @@ class SqlAlchemyCommentStore(CommentStore):
         """Update a comment's fields, scoped to a conversation. See base class for contract."""
         with self._session() as session:
             row = session.get(SqlComment, (current_workspace_id(), comment_id))
-            if row is None or row.conversation_id != conversation_id:
+            if row is None or row.conversation_id != normalize_uuid(conversation_id):
                 return None
             if status is not None:
                 row.status = encode_comment_status(status)
@@ -141,7 +141,7 @@ class SqlAlchemyCommentStore(CommentStore):
         """Delete a single comment by id, scoped to a conversation. See base class for contract."""
         with self._session() as session:
             row = session.get(SqlComment, (current_workspace_id(), comment_id))
-            if row is None or row.conversation_id != conversation_id:
+            if row is None or row.conversation_id != normalize_uuid(conversation_id):
                 return None
             entity = _to_entity(row)
             session.delete(row)

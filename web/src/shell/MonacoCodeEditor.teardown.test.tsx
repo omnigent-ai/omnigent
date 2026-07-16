@@ -37,6 +37,7 @@ interface FakeEditor {
   saveViewState: () => null;
   restoreViewState: () => void;
   getAction: () => { run: () => void };
+  getContribution: () => null;
   __set: (v: string) => void;
 }
 
@@ -54,6 +55,7 @@ function makeFakeEditor(initial: string): FakeEditor {
     saveViewState: () => null,
     restoreViewState: () => {},
     getAction: () => ({ run: () => {} }),
+    getContribution: () => null,
     __set: (v) => {
       value = v;
     },

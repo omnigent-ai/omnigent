@@ -188,6 +188,52 @@ def test_resolve_provider_subscription_default(
     assert provider.cli == "claude"
 
 
+def test_resolve_provider_cli_config_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A cli-config default resolves as usable, never "no credentials".
+
+    The entry's credential lives in the codex CLI's own ``config.toml``
+    (an auth command / env key codex runs at launch), so the catalog has
+    nothing to resolve statically — falling into the inline-family loop
+    used to misreport the worker as having no resolvable credentials.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp dir.
+    """
+    _isolate_config(
+        monkeypatch,
+        tmp_path,
+        "providers:\n  codex-gateway:\n    kind: cli-config\n    cli: codex\n"
+        "    model_provider: Databricks\n    default: true\n",
+    )
+    provider = resolve_model_provider(_worker_spec("codex-native"), "codex-native")
+    assert provider.kind == "cli-config"
+    assert provider.cli == "codex"
+    assert "codex-gateway" in provider.detail
+    assert "Databricks" in provider.detail
+
+
+@pytest.mark.parametrize("harness", ["cursor", "cursor-native", "native-cursor"])
+def test_resolve_provider_cursor_is_cli_login(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, harness: str
+) -> None:
+    """Cursor harnesses resolve to cursor-agent's own login, not ``none``.
+
+    cursor-agent has no omnigent-side provider config — it always brings
+    its own stored login — so the resolution must not fall through to the
+    "harness has no model-provider resolution" dead-worker note.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp dir.
+    :param harness: The cursor harness spelling under test.
+    """
+    _isolate_config(monkeypatch, tmp_path, "")
+    provider = resolve_model_provider(_worker_spec(harness), harness)
+    assert provider.kind == "subscription"
+    assert provider.cli == "cursor-agent"
+
+
 def test_resolve_provider_spec_databricks_auth_wins(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -732,6 +778,49 @@ def test_subscription_listing_is_static_and_unverified(
         "claude-haiku-4-5",
     ]
     assert "CLI login" in listing.note
+
+
+def test_cli_config_listing_is_static_and_unverified(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A cli-config provider yields the codex curated list, not a dead row.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp dir.
+    """
+    _isolate_config(
+        monkeypatch,
+        tmp_path,
+        "providers:\n  codex-gateway:\n    kind: cli-config\n    cli: codex\n"
+        "    model_provider: Databricks\n    default: true\n",
+    )
+    listing = list_models_for_worker(_worker_spec("codex-native"), "codex-native")
+    assert listing.source == "static"
+    assert listing.verified is False
+    assert [m.id for m in listing.models] == ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"]
+    # The note must say the CLI resolves the credential itself — this row
+    # is a working worker, not a credentials preflight failure.
+    assert "resolved by the CLI at launch" in listing.note
+    assert "cannot run here" not in listing.note
+
+
+def test_cursor_listing_is_static_with_curated_base_models(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A cursor worker lists the curated cursor-agent base models.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp dir.
+    """
+    _isolate_config(monkeypatch, tmp_path, "")
+    listing = list_models_for_worker(_worker_spec("cursor-native"), "cursor-native")
+    assert listing.source == "static"
+    assert listing.verified is False
+    ids = [m.id for m in listing.models]
+    # Spot-check the picker catalog rather than pinning the whole list —
+    # it is regenerated when cursor ships models.
+    assert "composer-2.5" in ids
+    assert "cannot run here" not in listing.note
 
 
 def test_none_listing_explains_dead_worker(

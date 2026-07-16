@@ -29,12 +29,12 @@ async def test_health_returns_ok(client: httpx.AsyncClient) -> None:
 
 async def test_health_with_session_id(client: httpx.AsyncClient) -> None:
     """Health with a session_id query param includes a session object."""
-    resp = await client.get("/health", params={"session_id": "conv_fake"})
+    resp = await client.get("/health", params={"session_id": "5ab79713d8c7904f4f4bf10b2da5df62"})
     assert resp.status_code == 200
     data = resp.json()
     assert data["status"] == "ok"
     assert "session" in data
-    assert data["session"]["id"] == "conv_fake"
+    assert data["session"]["id"] == "5ab79713d8c7904f4f4bf10b2da5df62"
     assert "runner_online" in data["session"]
 
 
@@ -42,13 +42,15 @@ async def test_health_with_batch_session_ids(client: httpx.AsyncClient) -> None:
     """Health with comma-separated session_ids returns a sessions dict."""
     resp = await client.get(
         "/health",
-        params={"session_ids": "conv_a,conv_b"},
+        params={
+            "session_ids": "94c349190e241f85a984b3df8f129696,bfcc6c068875253adf2f20bf30a19015"
+        },
     )
     assert resp.status_code == 200
     data = resp.json()
     assert "sessions" in data
-    assert "conv_a" in data["sessions"]
-    assert "conv_b" in data["sessions"]
+    assert "94c349190e241f85a984b3df8f129696" in data["sessions"]
+    assert "bfcc6c068875253adf2f20bf30a19015" in data["sessions"]
 
 
 # ── GET /api/version ─────────────────────────────────────

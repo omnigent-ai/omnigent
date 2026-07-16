@@ -1844,6 +1844,14 @@ class HostProcess:
             _tel_opt_out = _tel_disabled()
         except Exception:  # noqa: BLE001 — telemetry errors must not abort hello
             pass
+        _tel_install_id: str | None = None
+        try:
+            from omnigent.telemetry.installation_id import get_installation_id as _get_install_id
+
+            if not _tel_opt_out:
+                _tel_install_id = _get_install_id()
+        except Exception:  # noqa: BLE001
+            pass
         hello = HostHelloFrame(
             version=VERSION,
             frame_protocol_version=1,
@@ -1855,6 +1863,7 @@ class HostProcess:
             # launch-time check above stays the authoritative gate.
             configured_harnesses=await asyncio.to_thread(configured_harness_map),
             telemetry_opt_out=_tel_opt_out,
+            installation_id=_tel_install_id,
         )
         await ws.send(encode_host_frame(hello))
         self._ws = ws

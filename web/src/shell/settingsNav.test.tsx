@@ -97,7 +97,9 @@ describe("settingsNavGroups", () => {
         .flatMap((g) => g.items)
         .map((i) => i.id);
     expect(ids(false)).not.toContain("cli");
+    expect(ids(false)).not.toContain("updates");
     expect(ids(true)).toContain("cli");
+    expect(ids(true)).toContain("updates");
   });
 
   it("includes the Admin group (Members / Policies / Sharing) for any admin, in accounts OR OIDC mode", () => {
@@ -298,6 +300,10 @@ describe("useSettingsRoute", () => {
     expect(routeHook("/settings/appearance")).toEqual({
       inSettings: true,
       section: "appearance",
+    });
+    expect(routeHook("/settings/updates")).toEqual({
+      inSettings: true,
+      section: "updates",
     });
     // Bare /settings: in-settings, defaulting to Appearance in header mode
     // (no login session — loginUrl null per beforeEach).

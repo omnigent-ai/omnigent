@@ -10,6 +10,7 @@ import { useEffect } from "react";
 import {
   ArchiveIcon,
   ArrowLeftIcon,
+  DownloadIcon,
   GitBranchIcon,
   KeyboardIcon,
   PaletteIcon,
@@ -38,7 +39,8 @@ export type SettingsSectionId =
   | "policies"
   | "sharing"
   | "archived"
-  | "cli";
+  | "cli"
+  | "updates";
 
 const SECTION_IDS: readonly SettingsSectionId[] = [
   "appearance",
@@ -50,6 +52,7 @@ const SECTION_IDS: readonly SettingsSectionId[] = [
   "sharing",
   "archived",
   "cli",
+  "updates",
 ];
 
 interface SettingsNavItem {
@@ -96,7 +99,10 @@ export function settingsNavGroups(
   if (isDesktop) {
     groups.push({
       title: "Desktop",
-      items: [{ id: "cli", label: "Local CLI", icon: TerminalIcon }],
+      items: [
+        { id: "cli", label: "Local CLI", icon: TerminalIcon },
+        { id: "updates", label: "Updates", icon: DownloadIcon },
+      ],
     });
   }
   groups.push({ title: "General", items: general });

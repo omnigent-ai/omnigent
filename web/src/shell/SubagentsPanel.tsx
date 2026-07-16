@@ -99,21 +99,12 @@ interface SubagentsPanelProps {
 type ViewMode = "list" | "graph";
 
 export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanelProps) {
-  // Every list in the tree polls at TREE_POLL_MS as a staleness floor;
-  // stream pushes remain the fast path. The stream only carries
-  // ``session.child_session.updated`` for the *streamed* (active)
-  // session's direct children — deeper levels, and the whole tree when
-  // the user is viewing a descendant, have no live channel, so without
-  // the poll their status would freeze at the snapshot. A child can be
-  // busy even when its parent is "idle" (parent parked awaiting the
-  // child); the poll + stream together surface that.
-  const { children, isLoading, error } = useChildSessions(rootSessionId, TREE_POLL_MS);
+  const { children, isLoading, error } = useChildSessions(rootSessionId);
   const [addOpen, setAddOpen] = useState(false);
   const [viewMode, setViewMode] = useState<ViewMode>("list");
 
   // Loading/error states only surface when there's no cached data to
-  // show alongside the "main" row. Once any data is available we
-  // render the list and let polling refresh it transparently.
+  // show alongside the "main" row.
   if (isLoading && children.length === 0) {
     return (
       <div className="flex h-full flex-1 items-center justify-center px-4 py-8 text-center text-xs text-muted-foreground bg-card">
@@ -688,11 +679,6 @@ function MainRow({ rootSessionId, isActive }: { rootSessionId: string; isActive:
   );
 }
 
-// Staleness-floor poll interval for every child list in the tree. See
-// the comment in SubagentsPanel — only the streamed session's direct
-// children get live pushes, so the rest of the tree relies on this.
-const TREE_POLL_MS = 15_000;
-
 // Indentation: depth 1 keeps the original 24px gutter (pl-6); each
 // further level steps in by another 14px so the connector glyphs read
 // as a tree.
@@ -718,13 +704,9 @@ function SubagentRow({
   // De-emphasize settled rows (done/idle) so working/failed agents dominate
   // — but never the row the user is currently viewing.
   const dim = !isActive && SETTLED_STATE[status.activity];
-  // This child's own sub-agents, rendered as the next tree level.
-  // Disabled (null id) at the depth cap so the fan-out of fetches is
-  // bounded; ``useChildSessions`` skips the query entirely for null.
-  const { children: grandchildren } = useChildSessions(
-    depth < MAX_TREE_DEPTH ? child.id : null,
-    TREE_POLL_MS,
-  );
+  // Disabled (null id) at the depth cap so the fan-out is bounded;
+  // ``useChildSessions`` skips the query entirely for null.
+  const { children: grandchildren } = useChildSessions(depth < MAX_TREE_DEPTH ? child.id : null);
   return (
     <>
       <li>

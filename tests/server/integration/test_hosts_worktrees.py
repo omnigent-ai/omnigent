@@ -42,7 +42,7 @@ pytestmark = [
     pytest.mark.flaky(reruns=2, reruns_delay=1),
 ]
 
-_HOST_ID = "host_wt_test"
+_HOST_ID = "7f6bda8f5e302e51cee65f7094f3d49e"
 _HOST_NAME = "wt-test-laptop"
 
 
@@ -240,7 +240,7 @@ async def test_list_worktrees_unknown_host_404(
     """An unknown host id yields 404 (existence is gated before the offline check)."""
     app, _reg, _hs, _cs = wt_app
     # Use a host id that no other test or tunnel registers — never "offline", just absent.
-    unknown_id = "host_wt_does_not_exist"
+    unknown_id = "1e498b8cd21815434fca9278770ff1d1"
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.get(
             f"/v1/hosts/{unknown_id}/worktrees",

@@ -59,7 +59,7 @@ class _AgentStore:
         """
         Record the create call and store the new agent.
 
-        :param agent_id: New agent ID, e.g. ``"ag_abc123"``.
+        :param agent_id: New agent ID, e.g. ``"104c4932179e16161e9ed9298fd5a3e2"``.
         :param name: Agent name.
         :param bundle_location: Bundle location string.
         :param description: Optional description.
@@ -138,7 +138,7 @@ class _ConversationStore:
         """
         Record the fork call and return a fixed new conversation.
 
-        :param source_conversation_id: Source ID, e.g. ``"conv_src"``.
+        :param source_conversation_id: Source ID, e.g. ``"e9f8f58523cec9a57d3bdf93be543e8c"``.
         :param title: Optional title for the fork.
         :param agent_id: Agent ID override. When ``None``, inherits
             the source's ``agent_id``.
@@ -196,7 +196,7 @@ class _ConversationStore:
         # Also store items under the fork ID so list_items returns
         # the copied items (mirrors real store behavior, including the
         # up-to-and-including-last-item-of-the-response truncation).
-        fork_id = "conv_forked"
+        fork_id = "c538360473d41c84c1eee13918fbeca0"
         source_items = list(self._items.get(source_conversation_id, []))
         if up_to_response_id is not None:
             cutoff_index = max(
@@ -248,8 +248,8 @@ class _ConversationStore:
 
 
 def _make_conversation(
-    conv_id: str = "conv_src",
-    agent_id: str | None = "ag_test",
+    conv_id: str = "e9f8f58523cec9a57d3bdf93be543e8c",
+    agent_id: str | None = "087b7cb7ac30abf4debfaa578d052ec6",
     title: str = "Source Chat",
     kind: str = "default",
 ) -> Conversation:
@@ -309,17 +309,17 @@ def _build_app(
 
     :param store: The conversation store stub.
     :param agent_store: The agent store stub. Defaults to a
-        pre-populated stub with ``ag_test``.
+        pre-populated stub with ``087b7cb7ac30abf4debfaa578d052ec6``.
     :returns: A configured FastAPI app ready for TestClient.
     """
     if agent_store is None:
         agent_store = _AgentStore(
             agents={
-                "ag_test": Agent(
-                    id="ag_test",
+                "087b7cb7ac30abf4debfaa578d052ec6": Agent(
+                    id="087b7cb7ac30abf4debfaa578d052ec6",
                     created_at=1,
                     name="test-agent",
-                    bundle_location="ag_test/fakehash",
+                    bundle_location="087b7cb7ac30abf4debfaa578d052ec6/fakehash",
                     version=1,
                 ),
             }
@@ -361,18 +361,21 @@ async def test_fork_session_happy_path() -> None:
     reconfigure the forked agent independently.
     """
     conv = _make_conversation()
-    items = [_make_item("msg_1", "Hello"), _make_item("msg_2", "World")]
+    items = [
+        _make_item("9980c8a9248139f14f4165e5d53088aa", "Hello"),
+        _make_item("0fd4e86b2daa009cd9929641dbd7dab6", "World"),
+    ]
     conv_store = _ConversationStore(
-        conversations={"conv_src": conv},
-        items_by_conv={"conv_src": items},
+        conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv},
+        items_by_conv={"e9f8f58523cec9a57d3bdf93be543e8c": items},
     )
     agent_store = _AgentStore(
         agents={
-            "ag_test": Agent(
-                id="ag_test",
+            "087b7cb7ac30abf4debfaa578d052ec6": Agent(
+                id="087b7cb7ac30abf4debfaa578d052ec6",
                 created_at=1,
                 name="test-agent",
-                bundle_location="ag_test/fakehash",
+                bundle_location="087b7cb7ac30abf4debfaa578d052ec6/fakehash",
                 version=1,
                 description="A test agent",
             ),
@@ -380,16 +383,18 @@ async def test_fork_session_happy_path() -> None:
     )
     client = TestClient(_build_app(conv_store, agent_store=agent_store))
 
-    resp = client.post("/v1/sessions/conv_src/fork", json={"title": "My Fork"})
+    resp = client.post(
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork", json={"title": "My Fork"}
+    )
 
     assert resp.status_code == 201, f"Expected 201 Created, got {resp.status_code}: {resp.text}"
     body = resp.json()
-    assert body["id"] == "conv_forked"
+    assert body["id"] == "c538360473d41c84c1eee13918fbeca0"
     # The agent_id should be the cloned agent, NOT the original.
-    assert body["agent_id"] != "ag_test", (
+    assert body["agent_id"] != "087b7cb7ac30abf4debfaa578d052ec6", (
         "Fork should be bound to a cloned agent, not the source's agent"
     )
-    assert body["agent_id"].startswith("ag_"), "Cloned agent ID must use the ag_ prefix"
+    assert len(body["agent_id"]) == 32, "Cloned agent ID must use the ag_ prefix"
     assert body["status"] == "idle", "Freshly forked session should be idle"
     # 2 items copied from the source — proves the store's items were
     # included in the response, not an empty list.
@@ -419,11 +424,11 @@ async def test_fork_session_happy_path() -> None:
     # multiple times; 0 means it never forked.
     assert len(conv_store.fork_calls) == 1
     fork_call = conv_store.fork_calls[0]
-    assert fork_call["source"] == "conv_src"
+    assert fork_call["source"] == "e9f8f58523cec9a57d3bdf93be543e8c"
     assert fork_call["title"] == "My Fork"
     # The store receives the clone's bundle/name/description so it can mint
     # the session-scoped agent row in the same transaction.
-    assert fork_call["cloned_agent_bundle_location"] == "ag_test/fakehash"
+    assert fork_call["cloned_agent_bundle_location"] == "087b7cb7ac30abf4debfaa578d052ec6/fakehash"
     assert fork_call["cloned_agent_description"] == "A test agent"
     # The clone keeps the source's ROOT name — no "(fork …)" suffix. Being
     # session-scoped it's exempt from the unique built-in-name index, so no
@@ -447,18 +452,18 @@ async def test_fork_session_up_to_response_id_passes_through_and_truncates() -> 
     """
     conv = _make_conversation()
     items = [
-        _make_item("msg_1", "Q1", response_id="resp_001"),
-        _make_item("msg_2", "A1", response_id="resp_001"),
-        _make_item("msg_3", "Q2", response_id="resp_002"),
+        _make_item("9980c8a9248139f14f4165e5d53088aa", "Q1", response_id="resp_001"),
+        _make_item("0fd4e86b2daa009cd9929641dbd7dab6", "A1", response_id="resp_001"),
+        _make_item("8b30166735242c192258d4974f662a5f", "Q2", response_id="resp_002"),
     ]
     conv_store = _ConversationStore(
-        conversations={"conv_src": conv},
-        items_by_conv={"conv_src": items},
+        conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv},
+        items_by_conv={"e9f8f58523cec9a57d3bdf93be543e8c": items},
     )
     client = TestClient(_build_app(conv_store))
 
     resp = client.post(
-        "/v1/sessions/conv_src/fork",
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
         json={"up_to_response_id": "resp_001"},
     )
 
@@ -484,13 +489,17 @@ async def test_fork_session_400_unknown_up_to_response_id() -> None:
     """
     conv = _make_conversation()
     conv_store = _ConversationStore(
-        conversations={"conv_src": conv},
-        items_by_conv={"conv_src": [_make_item("msg_1", "Q1")]},
+        conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv},
+        items_by_conv={
+            "e9f8f58523cec9a57d3bdf93be543e8c": [
+                _make_item("9980c8a9248139f14f4165e5d53088aa", "Q1")
+            ]
+        },
     )
     client = TestClient(_build_app(conv_store))
 
     resp = client.post(
-        "/v1/sessions/conv_src/fork",
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
         json={"up_to_response_id": "resp_nope"},
     )
 
@@ -511,7 +520,7 @@ async def test_fork_session_404_missing_source() -> None:
     store = _ConversationStore(conversations={})
     client = TestClient(_build_app(store))
 
-    resp = client.post("/v1/sessions/conv_missing/fork", json={})
+    resp = client.post("/v1/sessions/5eca720dc2bc6cdc3a99028d7bd0f917/fork", json={})
 
     # The route should return 404, not 500 or 201.
     assert resp.status_code == 404, (
@@ -534,10 +543,10 @@ async def test_fork_session_400_sub_agent() -> None:
     endpoint must reject them.
     """
     conv = _make_conversation(kind="sub_agent")
-    store = _ConversationStore(conversations={"conv_src": conv})
+    store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
     client = TestClient(_build_app(store))
 
-    resp = client.post("/v1/sessions/conv_src/fork", json={})
+    resp = client.post("/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork", json={})
 
     assert resp.status_code == 400, (
         f"Expected 400 for sub-agent source, got {resp.status_code}: {resp.text}"
@@ -557,10 +566,10 @@ async def test_fork_session_400_no_agent_binding() -> None:
     orphaned fork.
     """
     conv = _make_conversation(agent_id=None)
-    store = _ConversationStore(conversations={"conv_src": conv})
+    store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
     client = TestClient(_build_app(store))
 
-    resp = client.post("/v1/sessions/conv_src/fork", json={})
+    resp = client.post("/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork", json={})
 
     # 400 for invalid request (no agent binding).
     assert resp.status_code == 400, (
@@ -609,7 +618,7 @@ class _StubAgentCache:
     """Agent cache stub mapping agent_id → harness_kind.
 
     :param harness_by_id: Map of agent_id → harness_kind to return from
-        ``load``, e.g. ``{"ag_test": "claude_sdk"}``.
+        ``load``, e.g. ``{"087b7cb7ac30abf4debfaa578d052ec6": "claude_sdk"}``.
     """
 
     def __init__(self, harness_by_id: dict[str, str]) -> None:
@@ -626,7 +635,7 @@ class _StubAgentCache:
         """
         Return a loaded-agent stub for *agent_id*.
 
-        :param agent_id: Agent id to resolve, e.g. ``"ag_codex"``.
+        :param agent_id: Agent id to resolve, e.g. ``"12c8c7631b209d1027416b4bf7604999"``.
         :param bundle_location: Ignored — the stub keys on agent_id.
         :param expand_env: Ignored — accepted to match the real
             ``AgentCache.load`` signature (this kwarg exists;
@@ -646,41 +655,41 @@ class _StubAgentCache:
 def _switch_agent_store() -> _AgentStore:
     """Build an agent store with a source agent and switchable targets.
 
-    :returns: A store holding ``ag_test`` (source), ``ag_claude_native``
-        and ``ag_codex_native`` (bindable built-ins), and
-        ``ag_session_scoped`` (a session-scoped agent that must be
+    :returns: A store holding ``087b7cb7…`` (source), ``280d725b…``
+        and ``44b4151dd6cdfed6ee19430832398e05`` (bindable built-ins), and
+        ``a98bb825ebd41391c19637c58fe3c0b7`` (a session-scoped agent that must be
         rejected as a switch target).
     """
     return _AgentStore(
         agents={
-            "ag_test": Agent(
-                id="ag_test",
+            "087b7cb7ac30abf4debfaa578d052ec6": Agent(
+                id="087b7cb7ac30abf4debfaa578d052ec6",
                 created_at=1,
                 name="source-agent",
-                bundle_location="ag_test/hash",
+                bundle_location="087b7cb7ac30abf4debfaa578d052ec6/hash",
                 version=1,
             ),
-            "ag_claude_native": Agent(
-                id="ag_claude_native",
+            "280d725b404d2915f9e9d6cccce91303": Agent(
+                id="280d725b404d2915f9e9d6cccce91303",
                 created_at=1,
                 name="claude-code",
-                bundle_location="ag_claude_native/hash",
+                bundle_location="280d725b404d2915f9e9d6cccce91303/hash",
                 version=1,
             ),
-            "ag_codex_native": Agent(
-                id="ag_codex_native",
+            "44b4151dd6cdfed6ee19430832398e05": Agent(
+                id="44b4151dd6cdfed6ee19430832398e05",
                 created_at=1,
                 name="codex",
-                bundle_location="ag_codex_native/hash",
+                bundle_location="44b4151dd6cdfed6ee19430832398e05/hash",
                 version=1,
             ),
-            "ag_session_scoped": Agent(
-                id="ag_session_scoped",
+            "a98bb825ebd41391c19637c58fe3c0b7": Agent(
+                id="a98bb825ebd41391c19637c58fe3c0b7",
                 created_at=1,
                 name="scoped",
-                bundle_location="ag_session_scoped/hash",
+                bundle_location="a98bb825ebd41391c19637c58fe3c0b7/hash",
                 version=1,
-                session_id="conv_other",
+                session_id="aef8aa8b6e9cf6eda406cb88cf33708c",
             ),
         }
     )
@@ -697,15 +706,19 @@ async def test_fork_switch_binds_target_agent_bundle() -> None:
     """
     conv = _make_conversation()
     conv_store = _ConversationStore(
-        conversations={"conv_src": conv},
-        items_by_conv={"conv_src": [_make_item("msg_1", "Hello")]},
+        conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv},
+        items_by_conv={
+            "e9f8f58523cec9a57d3bdf93be543e8c": [
+                _make_item("9980c8a9248139f14f4165e5d53088aa", "Hello")
+            ]
+        },
     )
     agent_store = _switch_agent_store()
     client = TestClient(_build_app(conv_store, agent_store=agent_store))
 
     resp = client.post(
-        "/v1/sessions/conv_src/fork",
-        json={"agent_id": "ag_codex_native"},
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        json={"agent_id": "44b4151dd6cdfed6ee19430832398e05"},
     )
 
     assert resp.status_code == 201, f"Expected 201, got {resp.status_code}: {resp.text}"
@@ -713,7 +726,7 @@ async def test_fork_switch_binds_target_agent_bundle() -> None:
     # TARGET agent's bundle (not ag_test/hash) — not a separate create call.
     assert len(agent_store.create_calls) == 0
     fork_call = conv_store.fork_calls[0]
-    assert fork_call["cloned_agent_bundle_location"] == "ag_codex_native/hash", (
+    assert fork_call["cloned_agent_bundle_location"] == "44b4151dd6cdfed6ee19430832398e05/hash", (
         "Switch must clone the target agent's bundle; cloning the source's "
         "bundle would launch the wrong harness."
     )
@@ -722,7 +735,7 @@ async def test_fork_switch_binds_target_agent_bundle() -> None:
     assert fork_call["cloned_agent_name"] == "codex"
     # The fork binds the cloned agent id it asked the store to create.
     assert fork_call["agent_id"] is not None
-    assert fork_call["agent_id"] != "ag_test"
+    assert fork_call["agent_id"] != "087b7cb7ac30abf4debfaa578d052ec6"
 
 
 @pytest.mark.asyncio
@@ -734,12 +747,12 @@ async def test_fork_switch_404_session_scoped_target() -> None:
     leak/alias it across sessions, so only built-in agents are bindable.
     """
     conv = _make_conversation()
-    conv_store = _ConversationStore(conversations={"conv_src": conv})
+    conv_store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
     client = TestClient(_build_app(conv_store, agent_store=_switch_agent_store()))
 
     resp = client.post(
-        "/v1/sessions/conv_src/fork",
-        json={"agent_id": "ag_session_scoped"},
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        json={"agent_id": "a98bb825ebd41391c19637c58fe3c0b7"},
     )
 
     assert resp.status_code == 404, (
@@ -753,12 +766,12 @@ async def test_fork_switch_404_session_scoped_target() -> None:
 async def test_fork_switch_404_unknown_target() -> None:
     """Switching to a non-existent agent id is rejected with 404."""
     conv = _make_conversation()
-    conv_store = _ConversationStore(conversations={"conv_src": conv})
+    conv_store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
     client = TestClient(_build_app(conv_store, agent_store=_switch_agent_store()))
 
     resp = client.post(
-        "/v1/sessions/conv_src/fork",
-        json={"agent_id": "ag_does_not_exist"},
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        json={"agent_id": "566230693b3591362a085cffdb224484"},
     )
 
     assert resp.status_code == 404, (
@@ -880,21 +893,30 @@ async def test_fork_switch_model_and_carry_gating(
     """
     conv = _make_conversation()
     conv_store = _ConversationStore(
-        conversations={"conv_src": conv},
-        items_by_conv={"conv_src": [_make_item("msg_1", "Hi")]},
+        conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv},
+        items_by_conv={
+            "e9f8f58523cec9a57d3bdf93be543e8c": [
+                _make_item("9980c8a9248139f14f4165e5d53088aa", "Hi")
+            ]
+        },
     )
     agent_store = _switch_agent_store()
     # Target every switch at ag_claude_native; the stub cache, not the
     # bundle, dictates the harness each agent reports.
     monkeypatch.setattr(
         "omnigent.server.routes.sessions.get_agent_cache",
-        lambda: _StubAgentCache({"ag_test": source_harness, "ag_claude_native": target_harness}),
+        lambda: _StubAgentCache(
+            {
+                "087b7cb7ac30abf4debfaa578d052ec6": source_harness,
+                "280d725b404d2915f9e9d6cccce91303": target_harness,
+            }
+        ),
     )
     client = TestClient(_build_app(conv_store, agent_store=agent_store))
 
     resp = client.post(
-        "/v1/sessions/conv_src/fork",
-        json={"agent_id": "ag_claude_native"},
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        json={"agent_id": "280d725b404d2915f9e9d6cccce91303"},
     )
 
     assert resp.status_code == 201, f"Expected 201, got {resp.status_code}: {resp.text}"
@@ -932,16 +954,20 @@ async def test_fork_no_switch_native_source_carries_history(
     """
     conv = _make_conversation()
     conv_store = _ConversationStore(
-        conversations={"conv_src": conv},
-        items_by_conv={"conv_src": [_make_item("msg_1", "Hi")]},
+        conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv},
+        items_by_conv={
+            "e9f8f58523cec9a57d3bdf93be543e8c": [
+                _make_item("9980c8a9248139f14f4165e5d53088aa", "Hi")
+            ]
+        },
     )
     monkeypatch.setattr(
         "omnigent.server.routes.sessions.get_agent_cache",
-        lambda: _StubAgentCache({"ag_test": "claude-native"}),
+        lambda: _StubAgentCache({"087b7cb7ac30abf4debfaa578d052ec6": "claude-native"}),
     )
     client = TestClient(_build_app(conv_store))
 
-    resp = client.post("/v1/sessions/conv_src/fork", json={})
+    resp = client.post("/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork", json={})
 
     assert resp.status_code == 201, f"Expected 201, got {resp.status_code}: {resp.text}"
     fork_call = conv_store.fork_calls[0]
@@ -985,16 +1011,20 @@ async def test_fork_cursor_pi_native_carry_gating(
     """
     conv = _make_conversation()
     conv_store = _ConversationStore(
-        conversations={"conv_src": conv},
-        items_by_conv={"conv_src": [_make_item("msg_1", "Hi")]},
+        conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv},
+        items_by_conv={
+            "e9f8f58523cec9a57d3bdf93be543e8c": [
+                _make_item("9980c8a9248139f14f4165e5d53088aa", "Hi")
+            ]
+        },
     )
     monkeypatch.setattr(
         "omnigent.server.routes.sessions.get_agent_cache",
-        lambda: _StubAgentCache({"ag_test": harness}),
+        lambda: _StubAgentCache({"087b7cb7ac30abf4debfaa578d052ec6": harness}),
     )
     client = TestClient(_build_app(conv_store))
 
-    resp = client.post("/v1/sessions/conv_src/fork", json={})
+    resp = client.post("/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork", json={})
 
     assert resp.status_code == 201, f"Expected 201, got {resp.status_code}: {resp.text}"
     fork_call = conv_store.fork_calls[0]
@@ -1033,16 +1063,20 @@ async def test_fork_reversed_native_spelling_carry_gating(
     """
     conv = _make_conversation()
     conv_store = _ConversationStore(
-        conversations={"conv_src": conv},
-        items_by_conv={"conv_src": [_make_item("msg_1", "Hi")]},
+        conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv},
+        items_by_conv={
+            "e9f8f58523cec9a57d3bdf93be543e8c": [
+                _make_item("9980c8a9248139f14f4165e5d53088aa", "Hi")
+            ]
+        },
     )
     monkeypatch.setattr(
         "omnigent.server.routes.sessions.get_agent_cache",
-        lambda: _StubAgentCache({"ag_test": harness}),
+        lambda: _StubAgentCache({"087b7cb7ac30abf4debfaa578d052ec6": harness}),
     )
     client = TestClient(_build_app(conv_store))
 
-    resp = client.post("/v1/sessions/conv_src/fork", json={})
+    resp = client.post("/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork", json={})
 
     assert resp.status_code == 201, f"Expected 201, got {resp.status_code}: {resp.text}"
     fork_call = conv_store.fork_calls[0]
@@ -1055,25 +1089,29 @@ async def test_fork_reversed_native_spelling_carry_gating(
 @pytest.mark.asyncio
 async def test_fork_clone_reuses_source_agent_name_verbatim() -> None:
     """The fork clone reuses the source agent's name as-is — no suffix added."""
-    conv = _make_conversation(agent_id="ag_src")
+    conv = _make_conversation(agent_id="30f9aa4d441e344d3eb273f8cc13e4a5")
     conv_store = _ConversationStore(
-        conversations={"conv_src": conv},
-        items_by_conv={"conv_src": [_make_item("msg_1", "Hi")]},
+        conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv},
+        items_by_conv={
+            "e9f8f58523cec9a57d3bdf93be543e8c": [
+                _make_item("9980c8a9248139f14f4165e5d53088aa", "Hi")
+            ]
+        },
     )
     agent_store = _AgentStore(
         agents={
-            "ag_src": Agent(
-                id="ag_src",
+            "30f9aa4d441e344d3eb273f8cc13e4a5": Agent(
+                id="30f9aa4d441e344d3eb273f8cc13e4a5",
                 created_at=1,
                 name="claude-native-ui",
-                bundle_location="ag_claude/hash",
+                bundle_location="3a9725fd4de1720e83e53a632da41da8/hash",
                 version=1,
             ),
         }
     )
     client = TestClient(_build_app(conv_store, agent_store=agent_store))
 
-    resp = client.post("/v1/sessions/conv_src/fork", json={})
+    resp = client.post("/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork", json={})
 
     assert resp.status_code == 201, f"Expected 201, got {resp.status_code}: {resp.text}"
     assert conv_store.fork_calls[0]["cloned_agent_name"] == "claude-native-ui", (

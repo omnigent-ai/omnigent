@@ -168,25 +168,17 @@ def _create_export_agent(config: dict[str, str]) -> Tool:
     return ExportAgentTool()
 
 
-def _require_hindsight() -> None:
+def _hindsight_available() -> bool:
     """
-    Validate that the Hindsight client SDK is installed.
+    Return ``True`` if the optional ``hindsight-client`` SDK is installed.
 
-    ``hindsight-client`` is an optional dependency (the ``memory`` extra),
-    so the memory tools probe for it at construction time and fail with an
-    actionable message rather than an opaque ImportError mid-run. Mirrors the
-    Modal sandbox launcher's ``_ensure_sdk``.
-
-    :raises ImportError: When ``hindsight-client`` is not installed.
+    Probes via :func:`importlib.util.find_spec` (not ``import``) so the check
+    never loads the SDK or its transitive deps — they stay lazy until a
+    Hindsight tool is actually constructed.
     """
-    try:
-        import hindsight_client  # noqa: F401  # presence probe only
-    except ImportError as exc:
-        raise ImportError(
-            "The 'hindsight-client' SDK is required for the Hindsight memory "
-            "tools (hindsight_retain / hindsight_recall / hindsight_reflect). "
-            "Install it with `pip install 'omnigent[memory]'`."
-        ) from exc
+    import importlib.util
+
+    return importlib.util.find_spec("hindsight_client") is not None
 
 
 def _create_hindsight_retain(config: dict[str, str]) -> Tool:
@@ -196,7 +188,6 @@ def _create_hindsight_retain(config: dict[str, str]) -> Tool:
     :param config: Tool config (Hindsight api_key, bank_id, etc.).
     :returns: A HindsightRetainTool instance.
     """
-    _require_hindsight()
     from omnigent.tools.builtins.hindsight import HindsightRetainTool
 
     return HindsightRetainTool(config=config)
@@ -209,7 +200,6 @@ def _create_hindsight_recall(config: dict[str, str]) -> Tool:
     :param config: Tool config (Hindsight api_key, bank_id, etc.).
     :returns: A HindsightRecallTool instance.
     """
-    _require_hindsight()
     from omnigent.tools.builtins.hindsight import HindsightRecallTool
 
     return HindsightRecallTool(config=config)
@@ -222,7 +212,6 @@ def _create_hindsight_reflect(config: dict[str, str]) -> Tool:
     :param config: Tool config (Hindsight api_key, bank_id, etc.).
     :returns: A HindsightReflectTool instance.
     """
-    _require_hindsight()
     from omnigent.tools.builtins.hindsight import HindsightReflectTool
 
     return HindsightReflectTool(config=config)
@@ -250,11 +239,6 @@ _BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
     "download_file": _create_download_file,
     "search_conversations": _create_search_conversations,
     "export_agent": _create_export_agent,
-    # Hindsight long-term memory (optional ``memory`` extra). Each factory
-    # probes for ``hindsight-client`` and fails with an install hint if absent.
-    "hindsight_retain": _create_hindsight_retain,
-    "hindsight_recall": _create_hindsight_recall,
-    "hindsight_reflect": _create_hindsight_reflect,
     # Framework-owned: need runtime context. ``web_fetch`` is
     # constructed by ToolManager before reaching this registry.
     # ``list_comments`` and ``update_comment`` are auto-registered by
@@ -290,6 +274,18 @@ _BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
     "browser_type": None,
     "browser_screenshot": None,
 }
+
+# Hindsight long-term memory (optional ``hindsight`` extra). Registered only
+# when ``hindsight-client`` is installed, so the tools are absent from the
+# builtin list on installs without the extra.
+if _hindsight_available():
+    _BUILTIN_REGISTRY.update(
+        {
+            "hindsight_retain": _create_hindsight_retain,
+            "hindsight_recall": _create_hindsight_recall,
+            "hindsight_reflect": _create_hindsight_reflect,
+        }
+    )
 
 # Canonical set of every reserved builtin name. Derived from
 # the registry so there is a single source of truth — no drift

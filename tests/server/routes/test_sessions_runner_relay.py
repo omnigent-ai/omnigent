@@ -98,7 +98,7 @@ class _HeartbeatRunnerClient:
 
         :param method: HTTP method, e.g. ``"GET"``.
         :param path: Request path, e.g.
-            ``"/v1/sessions/conv_abc/stream"``.
+            ``"/v1/sessions/4e92b5a0c0ee6db3f874f9c4a3f855a5/stream"``.
         :param timeout: Timeout object passed by the relay.
         :returns: Fake streaming response.
         """
@@ -125,7 +125,7 @@ async def test_runner_relay_ready_waits_for_runner_heartbeat() -> None:
 
     try:
         handle = await sessions_module._ensure_runner_relay_ready(
-            "conv_ready",
+            "a7f039e9f1311474878eb7d4699c1013",
             "runner_ready",
             fake_runner,  # type: ignore[arg-type]
             conversation_store=None,
@@ -134,10 +134,13 @@ async def test_runner_relay_ready_waits_for_runner_heartbeat() -> None:
         assert handle is not None
         assert handle.ready.is_set()
         assert fake_runner.stream_calls[0][0] == "GET"
-        assert fake_runner.stream_calls[0][1] == "/v1/sessions/conv_ready/stream"
+        assert (
+            fake_runner.stream_calls[0][1]
+            == "/v1/sessions/a7f039e9f1311474878eb7d4699c1013/stream"
+        )
     finally:
         release.set()
-        handle = sessions_module._runner_relay_tasks.get("conv_ready")
+        handle = sessions_module._runner_relay_tasks.get("a7f039e9f1311474878eb7d4699c1013")
         if handle is not None:
             await asyncio.wait_for(handle.task, timeout=1.0)
         sessions_module._runner_relay_tasks.clear()
@@ -237,7 +240,7 @@ class _ScriptedRunnerClient:
 
         :param method: HTTP method, e.g. ``"GET"``.
         :param path: Request path, e.g.
-            ``"/v1/sessions/conv_abc/stream"``.
+            ``"/v1/sessions/4e92b5a0c0ee6db3f874f9c4a3f855a5/stream"``.
         :param timeout: Timeout object passed by the relay.
         :returns: Fake streaming response.
         """
@@ -433,7 +436,7 @@ async def test_relay_publishes_failed_status_on_tunnel_close() -> None:
     sessions_module._runner_relay_tasks.clear()
     gate = asyncio.Event()
     fake_runner = _TunnelCloseRunnerClient(gate)
-    session_id = "conv_tunnel_close"
+    session_id = "03048a276e8a91fab748c87a77d638bf"
 
     collector = None
     try:
@@ -517,7 +520,7 @@ async def test_relay_persists_disconnect_error_labels_on_tunnel_close() -> None:
     gate = asyncio.Event()
     fake_runner = _TunnelCloseRunnerClient(gate)
     store = _RecordingLabelStore()
-    session_id = "conv_tunnel_close_labels"
+    session_id = "82fe36b7ca1bfb567bfbcce4eaa487a1"
 
     try:
         handle = await sessions_module._ensure_runner_relay_ready(
@@ -580,7 +583,7 @@ async def test_runner_recovery_clears_persisted_disconnect_error_labels() -> Non
     gate = asyncio.Event()
     fake_runner = _TunnelCloseRunnerClient(gate)
     store = _RecordingLabelStore()
-    session_id = "conv_runner_recovery_labels"
+    session_id = "51af098ee822b1a024acb911f3cdf297"
 
     try:
         # Disconnect first: the relay persists the runner_disconnected

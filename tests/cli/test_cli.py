@@ -23,6 +23,7 @@ from click.testing import CliRunner, Result
 from omnigent.cli import (
     _CLICK_SUBCOMMANDS,
     _GLOBAL_CONFIG_KEYS,
+    _NATIVE_TERMINAL_DISPATCH_SPECS,
     _adopt_ambient_credentials,
     _announce_auto_configured_credentials,
     _bundle,
@@ -4846,6 +4847,7 @@ def _native_dispatch_kwargs(**overrides: object) -> dict[str, object]:
         "harness": "cursor-native",
         "server": None,
         "model": None,
+        "model_from_cli": True,
         "prompt": None,
         "system_prompt": None,
         "tools": None,
@@ -4860,6 +4862,104 @@ def _native_dispatch_kwargs(**overrides: object) -> dict[str, object]:
     }
     base.update(overrides)
     return base
+
+
+def test_native_terminal_dispatch_specs_cover_registered_native_agents() -> None:
+    from omnigent.harness_plugins import native_agents
+
+    registered_keys = {agent.key for agent in native_agents()}
+
+    assert set(_NATIVE_TERMINAL_DISPATCH_SPECS) == registered_keys
+
+
+@pytest.mark.parametrize(
+    ("harness", "target", "expected_extra"),
+    [
+        (
+            "claude-native",
+            "omnigent.claude_native.run_claude_native",
+            {"claude_args": ("--model", "native-model")},
+        ),
+        (
+            "codex-native",
+            "omnigent.codex_native.run_codex_native",
+            {"codex_args": (), "model": "native-model"},
+        ),
+        (
+            "pi-native",
+            "omnigent.pi_native.run_pi_native",
+            {"pi_args": ("--model", "native-model")},
+        ),
+        (
+            "opencode-native",
+            "omnigent.opencode_native.run_opencode_native",
+            {"opencode_args": (), "model": "native-model"},
+        ),
+        (
+            "cursor-native",
+            "omnigent.cursor_native.run_cursor_native",
+            {"cursor_args": ("--model", "native-model")},
+        ),
+        (
+            "kimi-native",
+            "omnigent.kimi_native.run_kimi_native",
+            {"kimi_args": ("--model", "native-model")},
+        ),
+        (
+            "kiro-native",
+            "omnigent.kiro_native.run_kiro_native",
+            {"kiro_args": (), "model": "native-model", "prompt": None},
+        ),
+        (
+            "goose-native",
+            "omnigent.goose_native.run_goose_native",
+            {"goose_args": ("--model", "native-model")},
+        ),
+        (
+            "antigravity-native",
+            "omnigent.antigravity_native.run_antigravity_native",
+            {"antigravity_args": (), "model": "native-model"},
+        ),
+        (
+            "qwen-native",
+            "omnigent.qwen_native.run_qwen_native",
+            {"qwen_args": ("--model", "native-model")},
+        ),
+        (
+            "hermes-native",
+            "omnigent.hermes_native.run_hermes_native",
+            {"hermes_args": ("--model", "native-model")},
+        ),
+    ],
+)
+def test_dispatch_native_terminal_harness_launches_registered_wrapper(
+    monkeypatch: pytest.MonkeyPatch,
+    harness: str,
+    target: str,
+    expected_extra: dict[str, object],
+) -> None:
+    """Every registered native harness launches through the generic run dispatcher."""
+    monkeypatch.setattr("omnigent.cli._ensure_backend", lambda _s: "http://localhost:0")
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(target, lambda **kwargs: captured.update(kwargs))
+
+    handled = _dispatch_native_terminal_harness(
+        **_native_dispatch_kwargs(
+            harness=harness,
+            model="native-model",
+            resume_conversation_id="conv_abc123",
+            auto_open_conversation=True,
+        )
+    )
+
+    assert handled is True
+    assert captured == {
+        "server": "http://localhost:0",
+        "session_id": "conv_abc123",
+        "resume_picker": False,
+        "auto_open_conversation": True,
+        **expected_extra,
+    }
 
 
 def test_dispatch_native_terminal_harness_cursor_launches_wrapper(
@@ -4897,6 +4997,97 @@ def test_dispatch_native_terminal_harness_cursor_launches_wrapper(
         "auto_open_conversation": True,
         "cursor_args": ("--model", "composer-2.5"),
     }
+
+
+def test_dispatch_native_terminal_harness_kiro_launches_wrapper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``run --harness kiro-native`` dispatches to the Kiro TUI wrapper."""
+    monkeypatch.setattr("omnigent.cli._ensure_backend", lambda _s: "http://localhost:0")
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        "omnigent.kiro_native.run_kiro_native",
+        lambda **kwargs: captured.update(kwargs),
+    )
+
+    handled = _dispatch_native_terminal_harness(
+        **_native_dispatch_kwargs(
+            harness="kiro-native",
+            model="auto",
+            resume_picker=True,
+            auto_open_conversation=True,
+        )
+    )
+
+    assert handled is True
+    assert captured == {
+        "server": "http://localhost:0",
+        "session_id": None,
+        "resume_picker": True,
+        "auto_open_conversation": True,
+        "kiro_args": (),
+        "model": "auto",
+        "prompt": None,
+    }
+
+
+def test_dispatch_native_terminal_harness_kiro_forwards_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Kiro's native wrapper supports an initial prompt from generic run."""
+    monkeypatch.setattr("omnigent.cli._ensure_backend", lambda _s: "http://localhost:0")
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        "omnigent.kiro_native.run_kiro_native",
+        lambda **kwargs: captured.update(kwargs),
+    )
+
+    handled = _dispatch_native_terminal_harness(
+        **_native_dispatch_kwargs(harness="kiro-native", prompt="review repo")
+    )
+
+    assert handled is True
+    assert captured["prompt"] == "review repo"
+
+
+@pytest.mark.parametrize(
+    ("harness", "target", "args_param"),
+    [
+        ("goose-native", "omnigent.goose_native.run_goose_native", "goose_args"),
+        ("qwen-native", "omnigent.qwen_native.run_qwen_native", "qwen_args"),
+        ("hermes-native", "omnigent.hermes_native.run_hermes_native", "hermes_args"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("model_from_cli", "expected_args"),
+    [
+        (False, ()),
+        (True, ("--model", "native-model")),
+    ],
+)
+def test_dispatch_native_terminal_harness_own_config_model_policy(
+    monkeypatch: pytest.MonkeyPatch,
+    harness: str,
+    target: str,
+    args_param: str,
+    model_from_cli: bool,
+    expected_args: tuple[str, ...],
+) -> None:
+    """Own-config wrappers receive only models explicitly requested by users."""
+    monkeypatch.setattr("omnigent.cli._ensure_backend", lambda _s: "http://localhost:0")
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(target, lambda **kwargs: captured.update(kwargs))
+
+    handled = _dispatch_native_terminal_harness(
+        **_native_dispatch_kwargs(
+            harness=harness,
+            model="native-model",
+            model_from_cli=model_from_cli,
+        )
+    )
+
+    assert handled is True
+    assert captured[args_param] == expected_args
 
 
 def test_dispatch_native_terminal_harness_ignores_non_native(

@@ -3671,13 +3671,21 @@ def _claude_transcript_record_from_session_item(
         if not isinstance(output, str):
             output = "" if output is None else json.dumps(output, separators=(",", ":"))
         record_type = "user"
+        # Image (and other structured) tool results are persisted as a
+        # stringified content-block array. Rehydrate them into real blocks
+        # so ``claude --resume`` sends screenshots as images — not as ~250K
+        # tokens of base64 text — and the model actually sees them again.
+        content_blocks = _claude_tool_result_content_blocks(output)
+        content: str | list[dict[str, Any]] = (
+            content_blocks if content_blocks is not None else output
+        )
         message = {
             "role": "user",
             "content": [
                 {
                     "type": "tool_result",
                     "tool_use_id": call_id,
-                    "content": output,
+                    "content": content,
                 }
             ],
         }
@@ -3829,6 +3837,42 @@ def _json_safe_tool_use_result(output: str) -> str:
     except (json.JSONDecodeError, ValueError):
         return json.dumps(output)
     return output
+
+
+def _claude_tool_result_content_blocks(output: str) -> list[dict[str, Any]] | None:
+    """
+    Rehydrate a stringified content-block array into real blocks.
+
+    Tool results that return image content are persisted as a JSON *string*
+    like ``'[{"type":"image","source":{...}}]'``. Passing that string
+    straight into a ``tool_result`` content block makes ``claude --resume``
+    send the base64 to the API as plain text — a single screenshot balloons
+    to ~250K text tokens instead of the ~1.5K an image block costs, which is
+    what pushes a resumed conversation over the context limit.
+
+    Only ``text`` and ``image`` blocks are rehydrated: those are the block
+    types the API accepts inside a ``tool_result``. Anything else (plain
+    text, or a JSON array of some other shape) stays a raw string so the
+    resume request keeps sending exactly what it did before.
+
+    :param output: The persisted tool-result string, e.g.
+        ``'[{"type":"image","source":{"type":"base64","data":"..."}}]'``
+        or plain text like ``"file written"``.
+    :returns: A list of content blocks when *output* parses to a non-empty
+        list of ``text``/``image`` block dicts; ``None`` otherwise, so the
+        caller keeps the raw string as the block content.
+    """
+    try:
+        parsed = json.loads(output)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(parsed, list) or not parsed:
+        return None
+    if not all(
+        isinstance(block, dict) and block.get("type") in ("text", "image") for block in parsed
+    ):
+        return None
+    return parsed
 
 
 def _preflight_local_tools(command: str) -> None:

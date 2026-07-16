@@ -81,7 +81,7 @@ async def test_create_default_policy(policy_client: httpx.AsyncClient) -> None:
     assert body["handler"] == _REGISTERED_HANDLER
     assert body["object"] == "default_policy"
     assert body["enabled"] is True
-    assert body["id"].startswith("pol_")
+    assert len(body["id"]) == 32
 
 
 async def test_create_url_policy_rejected(policy_client: httpx.AsyncClient) -> None:
@@ -155,7 +155,7 @@ async def test_get_default_policy(policy_client: httpx.AsyncClient) -> None:
 
 async def test_get_default_policy_not_found(policy_client: httpx.AsyncClient) -> None:
     """Getting a nonexistent policy returns 404."""
-    resp = await policy_client.get("/v1/policies/pol_nonexistent")
+    resp = await policy_client.get("/v1/policies/087a5ba1a5c50583fc5bd2e3f035d3df")
     assert resp.status_code == 404
 
 
@@ -178,7 +178,7 @@ async def test_update_default_policy(policy_client: httpx.AsyncClient) -> None:
 async def test_update_default_policy_not_found(policy_client: httpx.AsyncClient) -> None:
     """Patching a nonexistent policy returns 404."""
     resp = await policy_client.patch(
-        "/v1/policies/pol_nonexistent",
+        "/v1/policies/087a5ba1a5c50583fc5bd2e3f035d3df",
         json={"name": "renamed"},
     )
     assert resp.status_code == 404
@@ -213,6 +213,6 @@ async def test_delete_default_policy(policy_client: httpx.AsyncClient) -> None:
 
 async def test_delete_default_policy_idempotent(policy_client: httpx.AsyncClient) -> None:
     """Deleting a nonexistent policy still returns deleted: true."""
-    resp = await policy_client.delete("/v1/policies/pol_nonexistent")
+    resp = await policy_client.delete("/v1/policies/087a5ba1a5c50583fc5bd2e3f035d3df")
     assert resp.status_code == 200
     assert resp.json()["deleted"] is True

@@ -15,6 +15,7 @@ from typing import Any, Protocol
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy.exc import StatementError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.gzip import GZipMiddleware
 from starlette.responses import Response
@@ -22,6 +23,7 @@ from starlette.routing import Mount, Route
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from omnigent._platform import resolve_repo_symlink
+from omnigent.db.db_models import InvalidUuidError
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_plugins import (
     ANTIGRAVITY_NATIVE_CODING_AGENT,
@@ -61,6 +63,7 @@ from omnigent.server.routes.builtin_agents import create_builtin_agents_router
 from omnigent.server.routes.comments import create_comments_router
 from omnigent.server.routes.default_policies import create_default_policies_router
 from omnigent.server.routes.harnesses import create_harnesses_router
+from omnigent.server.routes.imports import create_imports_router
 from omnigent.server.routes.policy_registry import create_policy_registry_router
 from omnigent.server.routes.runner_tunnel import create_runner_tunnel_router
 from omnigent.server.routes.session_mcp_servers import create_session_mcp_servers_router
@@ -385,7 +388,9 @@ def _ensure_builtin_agent(
     existing = agent_store.get_by_name(name)
     if existing is not None:
         new_loc = f"{existing.id}/{bundle_hash}"
-        if existing.bundle_location == new_loc:
+        # Sha-segment compare: legacy rows keep an ``ag_``-prefixed left
+        # segment (physical artifact key); only the sha encodes content.
+        if existing.bundle_location.rsplit("/", 1)[-1] == bundle_hash:
             # Row current; evict so a lagging replica's stale cache reloads the bundle.
             agent_cache.evict(existing.id)
             return
@@ -1563,6 +1568,45 @@ def create_app(
             content={"error": {"code": exc.code, "message": exc.message}},
         )
 
+    @app.exception_handler(StatementError)
+    async def _handle_statement_error(
+        request: Request,  # noqa: ARG001 — FastAPI exception-handler signature requires (request, exc); we only use exc
+        exc: StatementError,
+    ) -> JSONResponse:
+        """
+        Map a malformed-id bind failure to 404; everything else stays a 500.
+
+        A ``Uuid16`` column rejects an id that is not a 32-char hex uuid (after
+        stripping any legacy prefix), raising :class:`InvalidUuidError` wrapped
+        in ``StatementError``. Such an id cannot address any row, so — like the
+        pre-binary varchar behaviour, where it simply didn't match — treat it as
+        not-found instead of an internal error. Any other statement error (real
+        DB failure) falls through to the standard 500 shape.
+
+        :param request: The incoming request (unused — FastAPI signature requirement).
+        :param exc: The SQLAlchemy statement error.
+        :returns: 404 for a malformed id, otherwise a 500 JSON response.
+        """
+        if isinstance(exc.orig, InvalidUuidError):
+            # Keep a trace: a malformed id is usually a client bug, but this
+            # branch would otherwise mask a server-side id-generation defect
+            # as a routine 404.
+            _logger.debug("Malformed id mapped to 404: %s", exc.orig)
+            return JSONResponse(
+                status_code=404,
+                content={"error": {"code": ErrorCode.NOT_FOUND, "message": "Not found."}},
+            )
+        _logger.error("Database error: %s", exc, exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": {
+                    "code": ErrorCode.INTERNAL_ERROR,
+                    "message": "An internal error occurred.",
+                },
+            },
+        )
+
     @app.exception_handler(Exception)
     async def _handle_unhandled_exception(
         request: Request,  # noqa: ARG001 — FastAPI exception-handler signature requires (request, exc); we only use exc
@@ -2034,6 +2078,16 @@ def create_app(
         ),
         prefix="/v1",
         tags=["sessions"],
+    )
+    app.include_router(
+        create_imports_router(
+            conversation_store,
+            agent_store,
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+        ),
+        prefix="/v1",
+        tags=["imports"],
     )
     # Read-only built-in agent discovery (designs/BUILTIN_AGENTS.md).
     # Successor to the removed GET /api/agents list; lists only

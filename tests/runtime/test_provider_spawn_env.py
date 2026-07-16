@@ -94,6 +94,7 @@ def _make_spec(
     harness: str,
     model: str | None = None,
     profile: str | None = None,
+    use_responses: object | None = None,
     auth: ApiKeyAuth | DatabricksAuth | ProviderAuth | None = None,
     os_env: object | None = None,
 ) -> AgentSpec:
@@ -105,6 +106,8 @@ def _make_spec(
     :param model: Spec-level model, e.g. ``"my-model"``. ``None`` omits it
         so the provider family's ``models.default`` supplies the model.
     :param profile: Legacy ``executor.config["profile"]``. ``None`` omits it.
+    :param use_responses: ``executor.config["use_responses"]``. ``None`` omits
+        it; strings model values produced by standard bundle parsing.
     :param auth: Typed auth on ``spec.executor.auth``. ``None`` omits it, so
         the no-auth global-default provider path applies.
     :returns: A populated :class:`AgentSpec`.
@@ -114,6 +117,8 @@ def _make_spec(
         config["model"] = model
     if profile is not None:
         config["profile"] = profile
+    if use_responses is not None:
+        config["use_responses"] = use_responses
     return AgentSpec(
         spec_version=1,
         name=f"test-{harness}",
@@ -424,6 +429,26 @@ def test_openai_agents_uses_openai_global_default(config_home: Path) -> None:
     assert env["HARNESS_OPENAI_AGENTS_MODEL"] == "gpt-default-model"
     # No DATABRICKS enable flag for this harness (executor takes key directly).
     assert "HARNESS_OPENAI_AGENTS_DATABRICKS" not in env
+
+
+@pytest.mark.parametrize(
+    ("use_responses", "expected"),
+    [("False", "false"), ("True", "true")],
+)
+def test_openai_agents_provider_preserves_use_responses_flag(
+    config_home: Path, use_responses: str, expected: str
+) -> None:
+    """The provider early-return path also interprets stringified flags."""
+    _write_config(config_home, _openai_default_config())
+    spec = _make_spec(
+        harness="openai-agents",
+        model="gpt-test",
+        use_responses=use_responses,
+    )
+
+    env = _build_openai_agents_sdk_spawn_env(spec)
+
+    assert env["HARNESS_OPENAI_AGENTS_USE_RESPONSES"] == expected
 
 
 def test_pi_uses_anthropic_global_default(config_home: Path) -> None:

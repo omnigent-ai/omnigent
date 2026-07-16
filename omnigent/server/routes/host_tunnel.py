@@ -25,6 +25,7 @@ from collections.abc import Awaitable, Callable
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
+from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
 from omnigent.host.frames import (
     HostCreateDirResultFrame,
     HostCreateWorktreeResultFrame,
@@ -132,6 +133,16 @@ def create_host_tunnel_router(
         7. Start sender, receiver, and ping loops.
         8. On disconnect: deregister, set offline in DB.
         """
+        # Legacy hosts dial in with ``host_<hex>`` — normalise to the stored
+        # bare form. Malformed ids are refused here because WebSocket routes
+        # bypass the app's StatementError→404 handler.
+        try:
+            host_id = uuid_to_bytes(host_id).hex()
+        except InvalidUuidError:
+            _logger.warning("Refusing host tunnel: malformed host id %r", host_id)
+            await ws.close(code=4003, reason="invalid host id")
+            return
+
         # Authenticate from the handshake BEFORE accepting the upgrade,
         # so an unauthenticated peer never completes the WS handshake — no
         # acceptance oracle and no pre-auth protocol I/O. ``get_user_id`` reads

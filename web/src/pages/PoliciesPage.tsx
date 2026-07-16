@@ -45,12 +45,10 @@ import { coercePolicyParams } from "@/lib/policyParams";
 
 function AddDefaultPolicyDialog({
   registry,
-  appliedHandlers,
   open,
   onOpenChange,
 }: {
   registry: PolicyRegistryEntry[];
-  appliedHandlers: Set<string>;
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
@@ -158,15 +156,14 @@ function AddDefaultPolicyDialog({
         <div className="min-w-0 space-y-3 pt-1">
           {!selected &&
             (() => {
-              const available = registry.filter((r) => !appliedHandlers.has(r.handler));
               const lowerFilter = filter.toLowerCase();
               const filtered = lowerFilter
-                ? available.filter(
+                ? registry.filter(
                     (r) =>
                       r.name.toLowerCase().includes(lowerFilter) ||
                       r.description?.toLowerCase().includes(lowerFilter),
                   )
-                : available;
+                : registry;
               return (
                 <>
                   <input
@@ -196,9 +193,7 @@ function AddDefaultPolicyDialog({
                     ))}
                     {filtered.length === 0 && (
                       <p className="py-2 text-center text-xs text-muted-foreground">
-                        {available.length === 0
-                          ? "All available policies are already applied."
-                          : "No policies match your filter."}
+                        No policies match your filter.
                       </p>
                     )}
                   </div>
@@ -445,7 +440,6 @@ export function PoliciesPage() {
   const [actionError, setActionError] = useState<string | null>(null);
 
   const registryByHandler = new Map(registry.map((r) => [r.handler, r]));
-  const appliedHandlers = new Set(policies.map((p) => p.handler));
 
   const refresh = useCallback(() => {
     void refetch();
@@ -600,12 +594,7 @@ export function PoliciesPage() {
         </Button>
       </div>
 
-      <AddDefaultPolicyDialog
-        registry={registry}
-        appliedHandlers={appliedHandlers}
-        open={addOpen}
-        onOpenChange={setAddOpen}
-      />
+      <AddDefaultPolicyDialog registry={registry} open={addOpen} onOpenChange={setAddOpen} />
 
       {/* Delete confirmation */}
       <Dialog

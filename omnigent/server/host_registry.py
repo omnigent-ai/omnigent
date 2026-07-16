@@ -316,6 +316,18 @@ class HostRegistry:
             return False
         return conn.hello.telemetry_opt_out
 
+    def get_host_installation_id(self, host_id: str) -> str | None:
+        """Return the installation ID the host advertised in its hello frame.
+
+        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :returns: The host's installation ID, or ``None`` when offline or
+            not set.
+        """
+        conn = self.get(host_id)
+        if conn is None:
+            return None
+        return conn.hello.installation_id
+
     def send_text(self, conn: HostConnection, data: str) -> None:
         """Enqueue a text frame for sending to the host.
 

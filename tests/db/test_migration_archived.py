@@ -103,12 +103,12 @@ def test_archived_defaults_false_on_insert(db_engine: Engine) -> None:
                 "(id, created_at, updated_at, root_conversation_id) "
                 "VALUES (:id, :ts, :ts, :id)"
             ),
-            {"id": "conv_arch_default", "ts": 1700000000},
+            {"id": "a286a63f38f8f5fdf8ccf8486ade862a", "ts": 1700000000},
         )
         conn.commit()
         value = conn.execute(
             sa.text("SELECT archived FROM conversations WHERE id = :id"),
-            {"id": "conv_arch_default"},
+            {"id": "a286a63f38f8f5fdf8ccf8486ade862a"},
         ).scalar_one()
         assert value == 0, f"Expected archived to default to 0 (false); got {value!r}."
 
@@ -125,6 +125,8 @@ def test_archived_backfilled_from_metadata(tmp_path: Path) -> None:
     cfg = _build_alembic_config(uri)
     raw_engine = sa.create_engine(uri)
     try:
+        id_a = "94c349190e241f85a984b3df8f129696"
+        id_b = "bfcc6c068875253adf2f20bf30a19015"
         with raw_engine.begin() as conn:
             cfg.attributes["connection"] = conn
             command.upgrade(cfg, _PRE_MOVE_REVISION)
@@ -132,14 +134,16 @@ def test_archived_backfilled_from_metadata(tmp_path: Path) -> None:
                 sa.text(
                     "INSERT INTO conversations "
                     "(id, created_at, updated_at, root_conversation_id) "
-                    "VALUES ('conv_a', 1, 1, 'conv_a'), ('conv_b', 2, 2, 'conv_b')"
-                )
+                    "VALUES (:a, 1, 1, :a), (:b, 2, 2, :b)"
+                ),
+                {"a": id_a, "b": id_b},
             )
             conn.execute(
                 sa.text(
                     "INSERT INTO omnigent_conversation_metadata (id, kind, archived) "
-                    "VALUES ('conv_a', 1, 1), ('conv_b', 1, 0)"
-                )
+                    "VALUES (:a, 1, 1), (:b, 1, 0)"
+                ),
+                {"a": id_a, "b": id_b},
             )
         with raw_engine.begin() as conn:
             cfg.attributes["connection"] = conn
@@ -148,7 +152,7 @@ def test_archived_backfilled_from_metadata(tmp_path: Path) -> None:
             rows = dict(
                 conn.execute(sa.text("SELECT id, archived FROM conversations ORDER BY id")).all()
             )
-        assert rows == {"conv_a": 1, "conv_b": 0}
+        assert rows == {id_a: 1, id_b: 0}
     finally:
         raw_engine.dispose()
         clear_engine_cache()
