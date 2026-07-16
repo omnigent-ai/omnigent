@@ -428,7 +428,10 @@ via `OMNIGENT_ISLO_SANDBOX_ENV` / `sandbox.islo.env`. The host image's git
 credential helper answers HTTPS auth from it for both the launch-time
 clone and the agent's later `fetch` / `push`, writing nothing to disk. Use
 HTTPS repository URLs. Details by provider match the [Modal git
-guide](../modal/README.md#git-credentials-private-repositories).
+guide](../modal/README.md#git-credentials-private-repositories). For a
+second host with its own token, add a host-scoped
+`GIT_TOKEN_GIT_EXAMPLE_COM` — see [multiple git
+hosts](../modal/README.md#multiple-git-hosts).
 
 ## Security considerations
 

@@ -86,8 +86,10 @@ USER 0
 RUN dnf install -y --nodocs git tmux unzip \
  && dnf clean all
 
-RUN git config --system credential.helper \
-      '!f() { [ "$1" = get ] || return 0; [ -n "$GIT_TOKEN" ] || return 0; printf "username=%s\npassword=%s\n" "${GIT_USERNAME:-x-access-token}" "$GIT_TOKEN"; }; f'
+# Git credential helper for private HTTPS remotes — see the note in
+# deploy/docker/Dockerfile. Per-host GIT_TOKEN_<HOST> overrides GIT_TOKEN.
+COPY --chmod=0755 deploy/docker/git-credential-omnigent /usr/local/bin/git-credential-omnigent
+RUN git config --system credential.helper omnigent
 
 # Node runtime from the UBI Node image.
 COPY --from=node-runtime /usr/bin/node /usr/local/bin/node

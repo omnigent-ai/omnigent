@@ -426,7 +426,9 @@ _RUNNER_ENV_ALLOWLIST_PREFIXES: tuple[str, ...] = ("LC_", "MLFLOW_", "OTEL_", "O
 # gemini family. GIT_TOKEN / GIT_USERNAME feed the sandbox host
 # image's git credential helper (deploy/docker/Dockerfile `host`
 # target) so the agent's own fetch/push against a private repository
-# authenticates, not just the launch-time clone. Unlike the rest of
+# authenticates, not just the launch-time clone — their host-scoped
+# GIT_TOKEN_<HOST> forms ride _HARNESS_CREDENTIAL_ENV_PREFIXES below.
+# Unlike the rest of
 # the host's environment, these are credentials the host owner sets
 # PRECISELY so their runners can use them (on a laptop: exported keys;
 # on a server-managed sandbox: the deployment's injected provider
@@ -452,6 +454,17 @@ _BASE_HARNESS_CREDENTIAL_ENV_VARS: frozenset[str] = frozenset(
 HARNESS_CREDENTIAL_ENV_VARS: frozenset[str] = frozenset(
     name
     for canonical in _BASE_HARNESS_CREDENTIAL_ENV_VARS
+    for name in env_names_with_omnigent_prefix(canonical)
+)
+
+# Host-scoped git credentials the sandbox image's credential helper reads
+# per remote host (GIT_TOKEN_GIT_EXAMPLE_COM and friends — see
+# deploy/docker/git-credential-omnigent). The host suffix is open-ended, so
+# these forward by prefix rather than by name; the prefixes stay narrow so
+# the allowlist doesn't become a hole for unrelated GIT_* secrets.
+_HARNESS_CREDENTIAL_ENV_PREFIXES: tuple[str, ...] = tuple(
+    name
+    for canonical in ("GIT_TOKEN_", "GIT_USERNAME_")
     for name in env_names_with_omnigent_prefix(canonical)
 )
 
@@ -541,6 +554,7 @@ def _build_runner_env(
         if key in _RUNNER_ENV_ALLOWLIST
         or key.startswith(_RUNNER_ENV_ALLOWLIST_PREFIXES)
         or key in forwarded
+        or key.startswith(_HARNESS_CREDENTIAL_ENV_PREFIXES)
     }
     env["RUNNER_SERVER_URL"] = server_url
     env[RUNNER_ID_ENV_VAR] = runner_id

@@ -214,16 +214,14 @@ RUN groupadd -g 1000660000 sandbox \
  && useradd -m -d /sandbox -u 1000660000 -g sandbox sandbox
 
 # Git credential helper for private repositories over HTTPS: answers
-# `git credential get` from GIT_TOKEN / GIT_USERNAME in the
-# environment (injected via Modal secrets — see deploy/modal/README.md
-# "Git credentials"), so the managed launch's repository clone AND the
-# agent's later fetch/push authenticate without writing credentials to
-# disk. Emits nothing when GIT_TOKEN is unset, leaving anonymous
-# clones of public repositories untouched. GIT_USERNAME defaults to
-# x-access-token (GitHub's token-auth username; GitLab users set
-# GIT_USERNAME=oauth2). --system so it applies to any sandbox user.
-RUN git config --system credential.helper \
-      '!f() { [ "$1" = get ] || return 0; [ -n "$GIT_TOKEN" ] || return 0; printf "username=%s\npassword=%s\n" "${GIT_USERNAME:-x-access-token}" "$GIT_TOKEN"; }; f'
+# `git credential get` from GIT_TOKEN / GIT_USERNAME in the environment
+# (injected via Modal secrets — see deploy/modal/README.md "Git
+# credentials"), with per-host GIT_TOKEN_<HOST> / GIT_USERNAME_<HOST>
+# overrides so remotes on different hosts each get their own token. The
+# script documents the lookup. --system so it applies to any sandbox
+# user; 0755 so the non-root OpenShell user can exec it.
+COPY --chmod=0755 deploy/docker/git-credential-omnigent /usr/local/bin/git-credential-omnigent
+RUN git config --system credential.helper omnigent
 
 # Node runtime for the harness CLIs, copied from the official image
 # (same Debian base as python-slim, so the binary is ABI-compatible)

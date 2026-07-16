@@ -122,6 +122,9 @@ Inject an HTTPS token as `GIT_TOKEN` (GitLab: add `GIT_USERNAME=oauth2`) into th
 from it for both the launch-time clone and the agent's later `fetch` / `push`,
 writing nothing to disk — use HTTPS repository URLs. Details by provider match the
 [Modal git guide](../../../modal/README.md#git-credentials-private-repositories).
+For a second host with its own token, add a host-scoped
+`GIT_TOKEN_GIT_EXAMPLE_COM` key to the same Secret — see [multiple git
+hosts](../../../modal/README.md#multiple-git-hosts).
 
 ## Configuration (`sandbox-config.yaml`)
 

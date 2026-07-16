@@ -1392,6 +1392,42 @@ def test_build_runner_env_forwards_omnigent_prefixed_harness_credentials() -> No
     assert "ANTHROPIC_API_KEY" not in env
 
 
+def test_build_runner_env_forwards_host_scoped_git_credentials() -> None:
+    """
+    Host-scoped git credential vars forward without the operator naming
+    each one in OMNIGENT_RUNNER_ENV_PASSTHROUGH — the sandbox image's
+    credential helper resolves them per remote host. The prefix stays
+    narrow so unrelated GIT_* secrets keep sitting behind the allowlist.
+    """
+    base = {
+        "PATH": "/usr/bin",
+        "HOME": "/root",
+        "GIT_TOKEN": "default-pat",
+        "GIT_TOKEN_GIT_EXAMPLE_COM": "forgejo-token",
+        "GIT_USERNAME_GIT_EXAMPLE_COM": "oauth2",
+        "OMNIGENT_GIT_TOKEN_GIT_EXAMPLE_COM": "prefixed-forgejo-token",
+        "OMNIGENT_GIT_USERNAME_GIT_EXAMPLE_COM": "prefixed-oauth2",
+        # Neither a scoped credential nor on the allowlist.
+        "GIT_SECRET_STUFF": "leak-me-not",
+    }
+
+    env = _build_runner_env(
+        base,
+        server_url="http://server",
+        runner_id="runner_abc",
+        binding_token="tok",
+        workspace="/ws",
+        parent_pid=42,
+    )
+
+    assert env["GIT_TOKEN"] == "default-pat"
+    assert env["GIT_TOKEN_GIT_EXAMPLE_COM"] == "forgejo-token"
+    assert env["GIT_USERNAME_GIT_EXAMPLE_COM"] == "oauth2"
+    assert env["OMNIGENT_GIT_TOKEN_GIT_EXAMPLE_COM"] == "prefixed-forgejo-token"
+    assert env["OMNIGENT_GIT_USERNAME_GIT_EXAMPLE_COM"] == "prefixed-oauth2"
+    assert "GIT_SECRET_STUFF" not in env
+
+
 def test_build_runner_env_passthrough_extends_forwarded_set() -> None:
     """
     OMNIGENT_RUNNER_ENV_PASSTHROUGH names EXTRA vars to forward (for

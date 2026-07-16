@@ -349,7 +349,9 @@ secret to name the extra vars the host should forward to runners.
 session workspace; for private ones, store an HTTPS token as `GIT_TOKEN` in
 a Modal secret (GitLab: add `GIT_USERNAME=oauth2`). The host image's git
 credential helper picks it up for the clone and for the agent's later
-fetch/push.
+fetch/push. Remotes on a second host take their own host-scoped
+`GIT_TOKEN_GIT_EXAMPLE_COM` — see [multiple git
+hosts](modal/README.md#multiple-git-hosts).
 
 The full Modal guide (CLI sandboxes, custom images, LLM and git credentials,
 troubleshooting) lives at [`modal/README.md`](modal/README.md); the Daytona

@@ -411,6 +411,30 @@ URL ever embeds the token. Details by provider:
 - **Other HTTPS remotes** — any server accepting basic auth works;
   set `GIT_USERNAME` if it requires a specific username.
 
+#### Multiple git hosts
+
+`GIT_TOKEN` answers every host, which breaks down as soon as an agent
+needs two remotes with different credentials (github.com plus a
+self-hosted Forgejo/Gitea/GitLab). Add a **host-scoped** key alongside
+it and the helper prefers it for that host, falling back to `GIT_TOKEN`
+everywhere else:
+
+```bash
+modal secret create omnigent-git \
+  GIT_TOKEN=github_pat_… \
+  GIT_TOKEN_GIT_EXAMPLE_COM=forgejo_token_… \
+  GIT_USERNAME_GIT_EXAMPLE_COM=oauth2
+```
+
+The suffix is the remote's host uppercased with every non-alphanumeric
+character replaced by `_` — `git.example.com` → `GIT_EXAMPLE_COM`, and a
+non-default port is part of it (`git.example.com:8443` →
+`GIT_EXAMPLE_COM_8443`). Hosts that differ only in punctuation
+(`git-example.com` vs `git.example.com`) therefore map to the same key.
+`GIT_USERNAME_<HOST>` is optional; without it the scoped token pairs with
+`GIT_USERNAME` (or `x-access-token`). The extra keys ride the same secret
+and forward host→runner like `GIT_TOKEN` does — no new plumbing.
+
 Use HTTPS repository URLs (`https://github.com/org/repo`) for private
 workspaces — SSH URLs (`git@github.com:…`) would need a key and
 known-hosts setup inside the sandbox, which the managed flow does not
@@ -433,6 +457,7 @@ or a custom image.
 | `OMNIGENT_RUNNER_ENV_PASSTHROUGH` | inside the sandbox (set via a Modal secret) | Extra env var names the host forwards to runners |
 | `GIT_TOKEN` | inside the sandbox (set via a Modal secret) | HTTPS token for private repository clone / fetch / push |
 | `GIT_USERNAME` | inside the sandbox (set via a Modal secret) | Auth username paired with `GIT_TOKEN` (default `x-access-token`; GitLab uses `oauth2`) |
+| `GIT_TOKEN_<HOST>` / `GIT_USERNAME_<HOST>` | inside the sandbox (set via a Modal secret) | Host-scoped overrides of the pair above, e.g. `GIT_TOKEN_GIT_EXAMPLE_COM` (see "Multiple git hosts") |
 
 All of the above are supported public configuration. The variables the
 managed launcher itself sets inside the sandbox —
