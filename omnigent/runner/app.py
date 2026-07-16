@@ -1840,12 +1840,12 @@ def create_runner_app(
     _session_spec_locks: dict[str, asyncio.Lock] = {}  # session_id → spec resolution lock
     _session_init_tasks: dict[tuple[str, str, str | None], asyncio.Task[JSONResponse]] = {}
     _session_init_envelopes: dict[str, tuple[float, RunnerSessionInitEnvelope]] = {}
-    # session_id → (monotonic expiry, merged bundled + host skills),
+    # session_id → (monotonic expiry, effective trust, merged bundled + host skills),
     # discovered against this runner's filesystem. Skills are runner-owned:
     # the walk reruns at most once per ``_SESSION_SKILLS_CACHE_TTL_SECONDS``
     # (so a mid-session skill/plugin install surfaces) and the entry is
     # dropped in ``delete_session``.
-    _session_skills_cache: dict[str, tuple[float, SkillRegistry]] = {}
+    _session_skills_cache: dict[str, tuple[float, str, SkillRegistry]] = {}
     _session_workspace_cache: dict[str, str | None] = {}  # session_id → workspace path
     _session_claude_launch_configs: dict[str, ClaudeNativeUcodeConfig | None] = {}
     _session_claude_launch_config_tasks: dict[
@@ -8746,7 +8746,10 @@ def create_runner_app(
         entry = await _resolve_session_spec_entry(session_id)
         return _unwrap_resolved_spec(entry) if entry is not None else None
 
-    async def _resolve_session_skill_registry(session_id: str) -> SkillRegistry:
+    async def _resolve_session_skill_registry(
+        session_id: str,
+        include_other_tools: bool | None = None,
+    ) -> tuple[SkillRegistry, str]:
         """
         Resolve the merged (bundled + host) skills for a session.
 
@@ -8778,21 +8781,25 @@ def create_runner_app(
 
         :param session_id: Session/conversation identifier,
             e.g. ``"conv_abc123"``.
-        :returns: Bundled skills followed by host skills, deduplicated
-            by name. Empty when no spec resolver is configured or the
+        :param include_other_tools: Explicit trust override from the catalog
+            API, or ``None`` to use the session/server default.
+        :returns: The deduplicated registry plus its effective trust value.
+            The registry is empty when no spec resolver is configured or the
             spec exposes no skills.
         :raises OmnigentError: If the session's spec cannot be
             resolved.
         """
-        cached = _session_skills_cache.get(session_id)
+        cached = _session_skills_cache.get(session_id) if include_other_tools is None else None
         if cached is not None:
-            expires_at, cached_skills = cached
+            expires_at, cached_trust, cached_skills = cached
             if time.monotonic() < expires_at:
-                return cached_skills
+                return cached_skills, cached_trust
+            # TTL elapsed — fall through to re-walk so a skill or plugin
+            # installed mid-session surfaces without a session restart.
         entry = await _resolve_session_spec_entry(session_id)
         spec = _unwrap_resolved_spec(entry) if entry is not None else None
         if spec is None:
-            return SkillRegistry()
+            return SkillRegistry(), "all-host" if include_other_tools else "current"
         workspace = await _session_workspace_value(session_id)
         candidate_roots = [
             Path(workspace).resolve()
@@ -8810,8 +8817,12 @@ def create_runner_app(
         if not roots:
             roots.append(Path.cwd())
 
-        effective_skill_trust = getattr(spec, "skill_trust", "current")
-        if effective_skill_trust == "current":
+        effective_skill_trust = (
+            ("all-host" if include_other_tools else "current")
+            if include_other_tools is not None
+            else getattr(spec, "skill_trust", "current")
+        )
+        if include_other_tools is None and effective_skill_trust == "current":
             try:
                 trust_response = await server_client.get("/v1/skills/trust", timeout=5.0)
                 if trust_response.status_code == 200:
@@ -8825,36 +8836,114 @@ def create_runner_app(
             """Build one trust-filtered immutable registry off the event loop."""
             harness = canonicalize_harness(spec.executor.harness_kind)
             bundle_root = _resolved_spec_workdir(entry)
-            discovery_spec = spec
-            if getattr(spec, "skill_trust", "current") != effective_skill_trust:
-                with contextlib.suppress(TypeError):
-                    discovery_spec = dataclasses.replace(
-                        spec,
-                        skill_trust=effective_skill_trust,
-                    )
             return registry_for_spec(
-                discovery_spec,
+                spec,
                 roots=tuple(roots),
                 home=Path.home(),
                 bundle_dir=bundle_root,
                 harness=harness,
+                skill_trust=effective_skill_trust,
             )
 
         registry = await asyncio.to_thread(_discover)
-        previous = _session_skills_cache.get(session_id)
-        _session_skills_cache[session_id] = (
-            time.monotonic() + _SESSION_SKILLS_CACHE_TTL_SECONDS,
-            registry,
-        )
-        if previous is None or [e.winner.tree_digest for e in previous[1].list()] != [
-            e.winner.tree_digest for e in registry.list()
-        ]:
-            _session_tool_schemas.pop(session_id, None)
-        return registry
+        if include_other_tools is None:
+            previous = _session_skills_cache.get(session_id)
+            _session_skills_cache[session_id] = (
+                time.monotonic() + _SESSION_SKILLS_CACHE_TTL_SECONDS,
+                effective_skill_trust,
+                registry,
+            )
+            if previous is None or [e.winner.tree_digest for e in previous[2].list()] != [
+                e.winner.tree_digest for e in registry.list()
+            ]:
+                _session_tool_schemas.pop(session_id, None)
+        return registry, effective_skill_trust
 
     async def _resolve_session_skills(session_id: str) -> list[SkillSpec]:
         """Return selected skills from the session registry snapshot."""
-        return (await _resolve_session_skill_registry(session_id)).skills()
+        registry, _skill_trust = await _resolve_session_skill_registry(session_id)
+        return registry.skills()
+
+    def _skill_catalog_summary(entry: Any) -> dict[str, Any]:
+        """Serialize one reconciled registry entry for the catalog API."""
+        candidate = entry.winner
+        return {
+            "id": entry.canonical_id,
+            "name": candidate.invocation_name,
+            "description": candidate.skill.description,
+            "origin": (
+                "built_in" if candidate.location_scope == "bundle" else candidate.location_scope
+            ),
+            "enabled": True,
+            "available": True,
+            "has_conflict": bool(entry.shadowed),
+            "updated_at": None,
+        }
+
+    def _skill_catalog_detail(entry: Any) -> dict[str, Any]:
+        """Serialize full skill content and runner-local provenance."""
+        candidate = entry.winner
+        result = _skill_catalog_summary(entry)
+        result.update(
+            {
+                "content": candidate.skill.content,
+                "provenance": {
+                    "provider": candidate.provider,
+                    "original_path": str(candidate.origin_path),
+                    "source_kind": candidate.source_kind,
+                    "source_coords": candidate.source_coords,
+                    "digest": candidate.tree_digest,
+                },
+                "selected_winner": candidate.source_coords,
+                "conflict_candidates": [item.source_coords for item in entry.shadowed],
+                "delivery": {"mode": "automatic"},
+            }
+        )
+        return result
+
+    @app.get("/v1/sessions/{session_id}/skills/catalog")
+    async def get_session_skill_catalog(
+        session_id: str,
+        include_other_tools: bool | None = Query(default=None),
+    ) -> JSONResponse:
+        """Return the runner-owned catalog for one explicit session context."""
+        registry, effective_trust = await _resolve_session_skill_registry(
+            session_id,
+            include_other_tools,
+        )
+        visible = registry.list()
+        hidden_count = 0
+        if effective_trust == "current":
+            all_registry, _ = await _resolve_session_skill_registry(session_id, True)
+            hidden_count = max(0, len(all_registry.list()) - len(visible))
+        return JSONResponse(
+            status_code=200,
+            content={
+                "object": "list",
+                "data": [_skill_catalog_summary(entry) for entry in visible],
+                "include_other_tools": effective_trust == "all-host",
+                "hidden_count": hidden_count,
+            },
+        )
+
+    @app.get("/v1/sessions/{session_id}/skills/catalog/{skill_id}")
+    async def get_session_skill_catalog_detail(
+        session_id: str,
+        skill_id: str,
+        include_other_tools: bool | None = Query(default=None),
+    ) -> JSONResponse:
+        """Return detail from the same session visibility context as the list."""
+        registry, _effective_trust = await _resolve_session_skill_registry(
+            session_id,
+            include_other_tools,
+        )
+        entry = registry.get_entry(skill_id)
+        if entry is None:
+            return JSONResponse(
+                status_code=404,
+                content={"error": "skill_not_found", "detail": "Skill not found"},
+            )
+        return JSONResponse(status_code=200, content=_skill_catalog_detail(entry))
 
     @app.get("/v1/sessions/{session_id}/skills")
     async def get_session_skills(session_id: str) -> JSONResponse:

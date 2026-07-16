@@ -2416,7 +2416,12 @@ def create_app(
         tags=["sharing"],
     )
     app.include_router(
-        create_skills_router(),
+        create_skills_router(
+            conversation_store,
+            runner_router=runner_router,
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+        ),
         prefix="/v1",
         tags=["skills"],
     )

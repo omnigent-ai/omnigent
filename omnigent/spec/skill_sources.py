@@ -23,7 +23,7 @@ from typing import Any
 
 from omnigent.errors import OmnigentError
 from omnigent.spec.parser import _discover_skills, _parse_skill
-from omnigent.spec.skill_registry import SkillCandidate, SkillRegistry, tree_digest
+from omnigent.spec.skill_registry import SkillCandidate, SkillRegistry, SkillTrust, tree_digest
 from omnigent.spec.types import SkillSpec
 
 _log = logging.getLogger(__name__)
@@ -159,6 +159,7 @@ def registry_for_spec(
     home: Path,
     bundle_dir: Path | None,
     harness: str | None,
+    skill_trust: SkillTrust | None = None,
 ) -> SkillRegistry:
     """Build the canonical registry snapshot for an AgentSpec-like object."""
     ctx = SkillSourceContext(
@@ -192,7 +193,7 @@ def registry_for_spec(
     return SkillRegistry.from_candidates(
         candidates,
         active_provider=effective_skill_provider_family(harness),
-        skill_trust=getattr(spec, "skill_trust", "current"),
+        skill_trust=skill_trust or getattr(spec, "skill_trust", "current"),
         skills_filter=getattr(spec, "skills_filter", "all"),
     )
 

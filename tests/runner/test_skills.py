@@ -548,6 +548,98 @@ async def test_codex_session_does_not_list_claude_plugin_skills(
 
 
 @pytest.mark.asyncio
+async def test_catalog_uses_runner_session_context_and_includes_bundle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catalog discovery uses runner home/workspace and the effective harness family."""
+    home = tmp_path / "runner-home"
+    claude_dir = home / ".claude" / "skills" / "claude-only"
+    claude_dir.mkdir(parents=True)
+    (claude_dir / "SKILL.md").write_text(_skill_md("claude-only", "Claude only."))
+    codex_dir = home / ".codex" / "skills" / "codex-only"
+    codex_dir.mkdir(parents=True)
+    (codex_dir / "SKILL.md").write_text(_skill_md("codex-only", "Codex only."))
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    workspace = tmp_path / "runner-workspace"
+    workspace_skill_dir = workspace / ".claude" / "skills" / "workspace-claude"
+    workspace_skill_dir.mkdir(parents=True)
+    (workspace_skill_dir / "SKILL.md").write_text(
+        _skill_md("workspace-claude", "Workspace Claude.")
+    )
+    bundle = tmp_path / "runner-bundle"
+    bundle_skill_dir = bundle / "skills" / "built-in"
+    bundle_skill_dir.mkdir(parents=True)
+    (bundle_skill_dir / "SKILL.md").write_text(_skill_md("built-in", "Built in."))
+    bundled = [
+        SkillSpec(
+            name="built-in",
+            description="Built in.",
+            content="built-in body",
+            skill_dir=bundle_skill_dir,
+        )
+    ]
+    app = _make_app(
+        bundle,
+        bundled,
+        "all",
+        workspace=workspace,
+        harness="claude-native",
+    )
+
+    async for c in _client(app):
+        response = await c.get("/v1/sessions/conv_catalog/skills/catalog")
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    by_name = {item["name"]: item for item in payload["data"]}
+    assert set(by_name) == {"built-in", "claude-only", "workspace-claude"}
+    assert by_name["built-in"]["origin"] == "built_in"
+    assert by_name["workspace-claude"]["origin"] == "workspace"
+    assert by_name["claude-only"]["origin"] == "personal"
+    assert payload["include_other_tools"] is False
+    assert payload["hidden_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_catalog_include_other_tools_list_detail_visibility_matches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A list override is accepted unchanged by detail for the same session context."""
+    home = tmp_path / "runner-home"
+    claude_dir = home / ".claude" / "skills" / "claude-only"
+    claude_dir.mkdir(parents=True)
+    (claude_dir / "SKILL.md").write_text(_skill_md("claude-only", "Claude only."))
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    bundle = tmp_path / "runner-bundle"
+    bundle.mkdir()
+    workspace = tmp_path / "runner-workspace"
+    workspace.mkdir()
+    app = _make_app(bundle, [], "all", workspace=workspace, harness="codex-native")
+
+    async for c in _client(app):
+        listing = await c.get(
+            "/v1/sessions/conv_visibility/skills/catalog",
+            params={"include_other_tools": "true"},
+        )
+        assert listing.status_code == 200, listing.text
+        listed = next(item for item in listing.json()["data"] if item["name"] == "claude-only")
+        detail = await c.get(
+            f"/v1/sessions/conv_visibility/skills/catalog/{listed['id']}",
+            params={"include_other_tools": "true"},
+        )
+        hidden_detail = await c.get(f"/v1/sessions/conv_visibility/skills/catalog/{listed['id']}")
+
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["provenance"]["provider"] == "claude"
+    assert detail.json()["provenance"]["original_path"] == str(claude_dir.resolve())
+    assert hidden_detail.status_code == 404
+
+
+@pytest.mark.asyncio
 async def test_resolve_finds_a_surfaced_plugin_skill(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
