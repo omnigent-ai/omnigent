@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from omnigent.server.automations.cron import (
+from omnigent.server.scheduled.cron import (
     MIN_INTERVAL_SECONDS,
     CronValidationError,
     get_next_fire_time,

@@ -1,7 +1,7 @@
 """Tests for the recurring-task scheduler's FastAPI lifespan wiring.
 
 Verifies that :func:`omnigent.server.app.create_app`, when given a
-``scheduled_task_store``, starts an :class:`AutomationScheduler` on lifespan
+``scheduled_task_store``, starts an :class:`ScheduledTaskScheduler` on lifespan
 entry (arming a timer per active task) and stops it on exit. When no store is
 supplied the scheduler is absent entirely.
 """
@@ -73,7 +73,7 @@ async def test_lifespan_starts_and_stops_scheduler(
     app = _build_app(db_uri, tmp_path, scheduled_task_store=store)
 
     async with app.router.lifespan_context(app):
-        scheduler = app.state.automation_scheduler
+        scheduler = app.state.scheduled_task_scheduler
         assert scheduler.is_started
         assert scheduler.job_count == 1
 
@@ -100,7 +100,7 @@ async def test_lifespan_survives_scheduler_start_failure(
 
     # Entering the lifespan must not raise despite start() blowing up.
     async with app.router.lifespan_context(app):
-        scheduler = app.state.automation_scheduler
+        scheduler = app.state.scheduled_task_scheduler
         assert scheduler is not None
         assert not scheduler.is_started
         assert scheduler.job_count == 0
@@ -114,7 +114,7 @@ async def test_lifespan_without_store_has_no_scheduler(
     """When no ``scheduled_task_store`` is supplied, no scheduler is attached."""
     app = _build_app(db_uri, tmp_path, scheduled_task_store=None)
     async with app.router.lifespan_context(app):
-        assert getattr(app.state, "automation_scheduler", None) is None
+        assert getattr(app.state, "scheduled_task_scheduler", None) is None
 
 
 async def test_lifespan_skips_paused_task(
@@ -136,4 +136,4 @@ async def test_lifespan_skips_paused_task(
     )
     app = _build_app(db_uri, tmp_path, scheduled_task_store=store)
     async with app.router.lifespan_context(app):
-        assert app.state.automation_scheduler.job_count == 0
+        assert app.state.scheduled_task_scheduler.job_count == 0

@@ -1,4 +1,4 @@
-"""Tests for :class:`AutomationScheduler`.
+"""Tests for :class:`ScheduledTaskScheduler`.
 
 Exercises boot-load from ``list_active()``, per-task arming, the injected
 ``on_fire`` seam, SKIP overlap policy, the misfire grace window, and the
@@ -15,9 +15,9 @@ import asyncio
 from dataclasses import dataclass, field, replace
 
 from omnigent.entities import ScheduledTask
-from omnigent.server.automations.scheduler import (
+from omnigent.server.scheduled.scheduler import (
     MISFIRE_GRACE_TIME_S,
-    AutomationScheduler,
+    ScheduledTaskScheduler,
 )
 
 # ── Fakes ────────────────────────────────────────────────────────────────────
@@ -125,11 +125,11 @@ def _make(
     clock: FakeClock | None = None,
     seam: FakeScheduleSeam | None = None,
     on_fire=None,
-) -> tuple[AutomationScheduler, FakeClock, FakeScheduleSeam, FiredRecord]:
+) -> tuple[ScheduledTaskScheduler, FakeClock, FakeScheduleSeam, FiredRecord]:
     fired = fired or FiredRecord()
     clock = clock or FakeClock()
     seam = seam or FakeScheduleSeam()
-    scheduler = AutomationScheduler(
+    scheduler = ScheduledTaskScheduler(
         store=FakeStore(tasks),
         on_fire=on_fire or fired.on_fire,
         now=clock.now,
@@ -311,6 +311,6 @@ async def _fire_timer(timer) -> None:
         await result
 
 
-def scheduler_task_of(scheduler: AutomationScheduler, task_id: str) -> ScheduledTask:
+def scheduler_task_of(scheduler: ScheduledTaskScheduler, task_id: str) -> ScheduledTask:
     """Reach into the fake store to get the seed task for update tests."""
     return scheduler._store.get(task_id)  # type: ignore[attr-defined]

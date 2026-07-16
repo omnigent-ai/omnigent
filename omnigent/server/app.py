@@ -48,7 +48,6 @@ from omnigent.runtime import (
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 from omnigent.server.auth import AuthProvider, SharingMode
-from omnigent.server.automations import AutomationScheduler
 from omnigent.server.managed_hosts import ManagedSandboxConfig
 from omnigent.server.mcp_pool import ServerMcpPool
 from omnigent.server.performance_metrics import (
@@ -76,6 +75,7 @@ from omnigent.server.routes.sessions import (
 )
 from omnigent.server.routes.sharing import create_sharing_router
 from omnigent.server.routes.terminal_attach import create_terminal_attach_router
+from omnigent.server.scheduled import ScheduledTaskScheduler
 from omnigent.server.ws_origin import WebSocketOriginMiddleware
 from omnigent.stores import (
     AgentStore,
@@ -1131,7 +1131,7 @@ def create_app(
         ``None`` disables permission checks (all access allowed).
     :param scheduled_task_store: Store backing the recurring-task
         (Routines) scheduler. When provided, the FastAPI lifespan
-        starts an :class:`AutomationScheduler` that arms a timer per
+        starts an :class:`ScheduledTaskScheduler` that arms a timer per
         active task and fires the injected ``on_fire`` callback on
         schedule. ``None`` disables the scheduler entirely.
     :param auth_provider: Pre-constructed auth provider for
@@ -1383,30 +1383,30 @@ def create_app(
         # scheduled task and fire the injected ``on_fire`` callback on
         # schedule. The default callback is a no-op that logs; a real fire
         # path (creating a session) can be injected in its place.
-        automation_scheduler: AutomationScheduler | None = None
+        scheduled_task_scheduler: ScheduledTaskScheduler | None = None
         if scheduled_task_store is not None:
-            automation_scheduler = AutomationScheduler(
+            scheduled_task_scheduler = ScheduledTaskScheduler(
                 store=scheduled_task_store,
                 on_fire=_placeholder_on_fire,
             )
-            app_inst.state.automation_scheduler = automation_scheduler
+            app_inst.state.scheduled_task_scheduler = scheduled_task_scheduler
             # Routines are a non-critical subsystem: a failure loading the
             # schedule (e.g. a DB error in list_active()) must not take down
             # server boot. Log and continue with the scheduler unstarted.
             try:
-                await automation_scheduler.start()
+                await scheduled_task_scheduler.start()
             except Exception as exc:
                 _logger.exception(
-                    "automation scheduler failed to start; continuing without "
-                    "recurring tasks (%s)",
+                    "scheduled task scheduler failed to start; continuing "
+                    "without recurring tasks (%s)",
                     exc,
                 )
 
         try:
             yield
         finally:
-            if automation_scheduler is not None:
-                automation_scheduler.stop()
+            if scheduled_task_scheduler is not None:
+                scheduled_task_scheduler.stop()
             metrics_publish_task.cancel()
             with suppress(asyncio.CancelledError):
                 await metrics_publish_task

@@ -1,6 +1,6 @@
 """In-process cron scheduler for recurring scheduled tasks (Routines).
 
-:class:`AutomationScheduler` owns one self-rearming timer per active scheduled
+:class:`ScheduledTaskScheduler` owns one self-rearming timer per active scheduled
 task. It is the timing engine only: when a task is due it invokes an injected
 ``on_fire`` callback and immediately re-arms for the next occurrence. Creating
 the agent session that actually runs the task is the callback's job — supplied
@@ -8,7 +8,7 @@ by the caller, never by this module.
 
 Design notes:
 
-* **Source of truth is the DB.** :meth:`AutomationScheduler.start` loads every
+* **Source of truth is the DB.** :meth:`ScheduledTaskScheduler.start` loads every
   active task via ``store.list_active()`` and arms a timer for each. There is no
   in-memory schedule state beyond the live timers. Missed fires (server was
   down) are **not** replayed — only the next future occurrence is armed.
@@ -34,7 +34,7 @@ from typing import Any, Protocol
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from omnigent.entities import ScheduledTask
-from omnigent.server.automations.cron import (
+from omnigent.server.scheduled.cron import (
     CronTrigger,
     CronValidationError,
     validate_cron,
@@ -92,7 +92,7 @@ def _resolve_tz(name: str | None) -> ZoneInfo:
         return _UTC
 
 
-class AutomationScheduler:
+class ScheduledTaskScheduler:
     """Arms one self-rearming timer per active scheduled task and fires the
     injected ``on_fire`` callback when each is due.
 
@@ -146,7 +146,7 @@ class AutomationScheduler:
                     exc,
                 )
         self._started = True
-        _logger.info("AutomationScheduler started with %d job(s)", len(self._jobs))
+        _logger.info("ScheduledTaskScheduler started with %d job(s)", len(self._jobs))
 
     def stop(self) -> None:
         """Cancel every armed timer and drop all jobs."""
