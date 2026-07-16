@@ -286,14 +286,46 @@ jobs:
           raw = pathlib.Path("/tmp/scout_out.txt").read_text(encoding="utf-8", errors="replace") \
               if pathlib.Path("/tmp/scout_out.txt").is_file() else ""
           m = re.search(r"<!--\s*BLOG_CANDIDATES\s*-->(.*?)<!--\s*/BLOG_CANDIDATES\s*-->", raw, re.DOTALL)
-          cands = []
+          parsed = []
           if m:
               try:
-                  parsed = json.loads(m.group(1).strip())
-                  if isinstance(parsed, list):
-                      cands = parsed
+                  obj = json.loads(m.group(1).strip())
+                  if isinstance(obj, list):
+                      parsed = obj
               except json.JSONDecodeError as e:
                   print(f"::warning::Could not parse BLOG_CANDIDATES JSON — treating as none: {e}")
+
+          # The scout is an LLM fed author-written PR prose (an injection surface),
+          # so validate its output before any value becomes a path, branch name, or
+          # PR fetch. `slug` becomes a filesystem path and git branch → must be a
+          # strict kebab-case token (blocks `../`, slashes, spaces). `pr_refs` must
+          # intersect the PRs we actually harvested (blocks arbitrary `gh pr diff`).
+          harvested = set(int(n) for n in re.findall(r"(?m)^#(\d+):",
+              pathlib.Path("/tmp/pr_list.txt").read_text(encoding="utf-8", errors="replace")))
+          slug_re = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+          cands = []
+          for c in parsed:
+              if not isinstance(c, dict):
+                  continue
+              slug = str(c.get("slug", ""))
+              if not slug_re.match(slug) or len(slug) > 80:
+                  print(f"::warning::Dropping candidate with invalid slug {slug!r}.")
+                  continue
+              refs = []
+              for r in c.get("pr_refs", []):
+                  try:
+                      n = int(r)
+                  except (TypeError, ValueError):
+                      continue
+                  if n in harvested:
+                      refs.append(n)
+              if not refs:
+                  print(f"::warning::Dropping candidate {slug!r} — no pr_refs in the harvested range.")
+                  continue
+              c["slug"] = slug
+              c["pr_refs"] = refs
+              cands.append(c)
+
           # Cap at 3 defensively (the scout is instructed to, but enforce it here).
           cands = cands[:3]
           pathlib.Path("/tmp/candidates.json").write_text(json.dumps(cands))
@@ -381,6 +413,12 @@ jobs:
           pathlib.Path(f"/tmp/material_{idx}.txt").write_text("\n".join(parts))
           PYEOF
 
+            # Start each candidate from a pristine tree: a prior candidate that
+            # failed AFTER writing its post would otherwise leave an untracked
+            # file that `switch -C` preserves and the next `add -A` would sweep
+            # into the wrong PR.
+            git -C "$SITE" reset --hard >/dev/null
+            git -C "$SITE" clean -fdx >/dev/null
             branch="auto/blog/${VERSION}-${slug}"
             git -C "$SITE" switch -C "$branch" origin/main
 
@@ -394,20 +432,28 @@ jobs:
           Draft the feature-blog post per your instructions."
 
             # cwd = workspace root: the drafter reads MATERIAL_FILE (/tmp) and
-            # writes into SITE_REPO.
+            # writes into SITE_REPO. Capture the exit status without aborting so
+            # the secret-scan below runs regardless of whether the drafter failed
+            # (tee already wrote its stdout to the file either way).
+            drafter_rc=0
             uv run --project "${GITHUB_WORKSPACE}" omnigent run \
               "${GITHUB_WORKSPACE}/.github/agents/feature-blog-drafter" \
               -p "$prompt" --no-session \
-              2>>drafter-stderr.log | tee "/tmp/drafter_out_${i}.txt" \
-              || { echo "::warning::drafter failed for ${slug} — skipping"; continue; }
+              2>>drafter-stderr.log | tee "/tmp/drafter_out_${i}.txt" || drafter_rc=$?
 
-            # Secret-scan the drafter output BEFORE it feeds the PR body. The
-            # drafter runs with LLM_API_KEY in env and its stdout is embedded in
-            # the PR description, so a hit must abort the whole step (the PR would
-            # otherwise leak it — artifact redaction runs only after PRs are open).
+            # Secret-scan the drafter output BEFORE it feeds the PR body, and
+            # fail-closed EVEN ON drafter failure — the drafter runs with
+            # LLM_API_KEY in env and its stdout is embedded in the PR description,
+            # so a hit must abort the whole step (artifact redaction runs only
+            # after PRs are open, too late to un-leak it).
             if [ -n "${LLM_API_KEY:-}" ] && grep -qF "$LLM_API_KEY" "/tmp/drafter_out_${i}.txt" 2>/dev/null; then
               echo "::error::Drafter output for ${slug} contains LLM_API_KEY — aborting."
               exit 1
+            fi
+
+            if [ "$drafter_rc" -ne 0 ]; then
+              echo "::warning::drafter failed for ${slug} — skipping"
+              continue
             fi
 
             if [ -z "$(git -C "$SITE" status --porcelain)" ]; then
@@ -448,7 +494,7 @@ jobs:
       # --- 3) Mint the write-token — ONLY now, after the agents have run ---
       - name: Mint App token (omnigent-site)
         id: app-token
-        if: steps.guard.outputs.proceed == 'true' && steps.guard.outputs.dry_run != 'true' && steps.draftposts.outputs.drafted != '0' && vars.OMNIGENT_BOT_APP_ID != ''
+        if: steps.guard.outputs.proceed == 'true' && steps.guard.outputs.dry_run != 'true' && steps.draftposts.outcome == 'success' && steps.draftposts.outputs.drafted != '' && steps.draftposts.outputs.drafted != '0' && vars.OMNIGENT_BOT_APP_ID != ''
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           app-id: ${{ vars.OMNIGENT_BOT_APP_ID }}
@@ -459,14 +505,14 @@ jobs:
       # Make a misconfigured run (posts drafted but no App to push them) loud, so
       # it isn't mistaken for a clean "no candidates" outcome.
       - name: Warn if drafts can't be published
-        if: steps.guard.outputs.proceed == 'true' && steps.guard.outputs.dry_run != 'true' && steps.draftposts.outputs.drafted != '0' && steps.app-token.outputs.token == ''
+        if: steps.guard.outputs.proceed == 'true' && steps.guard.outputs.dry_run != 'true' && steps.draftposts.outcome == 'success' && steps.draftposts.outputs.drafted != '' && steps.draftposts.outputs.drafted != '0' && steps.app-token.outputs.token == ''
         run: |
           echo "::warning::Drafted ${{ steps.draftposts.outputs.drafted }} post(s) but no omnigent-site App token (OMNIGENT_BOT_APP_ID unset?) — no PRs opened; drafts discarded." \
             | tee -a "$GITHUB_STEP_SUMMARY"
 
       # --- 4) Push each drafted branch and open a DRAFT PR ---
       - name: Open draft PRs (omnigent-site)
-        if: steps.guard.outputs.proceed == 'true' && steps.guard.outputs.dry_run != 'true' && steps.draftposts.outputs.drafted != '0' && steps.app-token.outputs.token != ''
+        if: steps.guard.outputs.proceed == 'true' && steps.guard.outputs.dry_run != 'true' && steps.draftposts.outcome == 'success' && steps.draftposts.outputs.drafted != '' && steps.draftposts.outputs.drafted != '0' && steps.app-token.outputs.token != ''
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           SITE_TOKEN: ${{ steps.app-token.outputs.token }}
