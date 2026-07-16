@@ -612,13 +612,20 @@ export interface ChatState {
     opts?: SendOptions,
   ) => Promise<void>;
   stop: () => void;
-  switchTo: (conversationId: string | null) => Promise<void>;
+  /**
+   * Bind the store to `conversationId` (or detach on `null`). A no-op
+   * when the id is already active unless `options.force` is set, which
+   * tears the current binding down and re-binds the same id (the
+   * hydration-retry path).
+   */
+  switchTo: (conversationId: string | null, options?: { force?: boolean }) => Promise<void>;
   /**
    * Re-run a stalled hydration for `conversationId`. `switchTo` alone
    * cannot recover from a hung snapshot fetch: `bindStream` hydrates
    * through `queryClient.fetchQuery(["session", id])`, and react-query
    * joins the still-pending first fetch instead of issuing a new one.
-   * Cancels that query, detaches, and binds the conversation again.
+   * Cancels that query, drops it from the cache, and force re-runs
+   * `switchTo` on the same id so the re-bind issues a fresh request.
    */
   retryHydration: (conversationId: string) => Promise<void>;
   submitApproval: (
@@ -1547,12 +1554,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // Drop the stuck in-flight snapshot query so the re-bind below
     // issues a fresh request instead of joining the hung one.
     await queryClient?.cancelQueries({ queryKey: ["session", conversationId] });
-    await get().switchTo(null);
-    await get().switchTo(conversationId);
+    queryClient?.removeQueries({ queryKey: ["session", conversationId] });
+    await get().switchTo(conversationId, { force: true });
   },
 
-  switchTo: async (conversationId) => {
-    if (get().conversationId === conversationId) return;
+  switchTo: async (conversationId, options) => {
+    if (!options?.force && get().conversationId === conversationId) return;
 
     // Abort the prior session's stream. The reader loop in
     // bindStream's pump unwinds via AbortError and stops applying
@@ -2333,7 +2340,10 @@ async function bindStream(
       }),
       fetchInitialHistoryWindow(id),
     ]);
-    if (get().conversationId !== id) return;
+    // `signal.aborted` covers what the id check can't: a force re-bind of
+    // the SAME conversation (retryHydration) aborts this controller before
+    // binding anew, and this stale binding must not write state over it.
+    if (controller.signal.aborted || get().conversationId !== id) return;
     const items = page.items;
 
     // Sticky-pref handoff for CLI-created sessions with no override.
@@ -2574,7 +2584,10 @@ async function bindStream(
       };
     });
   } catch (err) {
-    if (get().conversationId !== id) return;
+    // Same discrimination as the success path: after a force re-bind of
+    // the same id, the cancelled first fetch rejects here - its error
+    // belongs to a torn-down binding, not the fresh loading state.
+    if (controller.signal.aborted || get().conversationId !== id) return;
     set({
       loadingConversation: false,
       conversationLoadError: err instanceof Error ? err : new Error(String(err)),

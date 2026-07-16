@@ -1680,6 +1680,47 @@ describe("chatStore — switchTo", () => {
   });
 });
 
+describe("chatStore — retryHydration", () => {
+  it("cancels the hung snapshot fetch and force re-binds the same conversation", async () => {
+    seedSession("conv_stuck", [
+      userMessage("resp_1", "hello"),
+      assistantMessage("resp_1", "hi there"),
+    ]);
+
+    // First snapshot GET hangs forever (a stalled proxy / dead server
+    // response). react-query would join this fetch on a plain re-switch,
+    // so the retry path must cancel it and issue a genuinely new request.
+    let snapshotCalls = 0;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.split("?")[0]!;
+      if (path === "/v1/sessions/conv_stuck" && (init?.method ?? "GET") === "GET") {
+        snapshotCalls += 1;
+        if (snapshotCalls === 1) return new Promise<Response>(() => {});
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const cancelSpy = vi.spyOn(client, "cancelQueries");
+
+    const firstSwitch = useChatStore.getState().switchTo("conv_stuck");
+    await tick();
+    expect(useChatStore.getState().loadingConversation).toBe(true);
+
+    await useChatStore.getState().retryHydration("conv_stuck");
+    // The cancelled first bind must unwind without touching the retried
+    // binding's state (its controller was aborted by the force re-switch).
+    await firstSwitch;
+
+    expect(cancelSpy).toHaveBeenCalledWith({ queryKey: ["session", "conv_stuck"] });
+    expect(snapshotCalls).toBe(2);
+    const state = useChatStore.getState();
+    expect(state.conversationId).toBe("conv_stuck");
+    expect(state.loadingConversation).toBe(false);
+    expect(state.conversationLoadError).toBeNull();
+    expect(state.blocks.length).toBe(2);
+  });
+});
+
 describe("chatStore — send (first-send ordering)", () => {
   it("creates session → binds stream → posts message (in order)", async () => {
     seedSession("conv_new");
