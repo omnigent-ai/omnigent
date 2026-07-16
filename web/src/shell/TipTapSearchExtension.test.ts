@@ -118,6 +118,19 @@ describe("findMatches", () => {
     expect(findMatches(editor.state.doc, "foo")).toHaveLength(1);
     expect(findMatches(editor.state.doc, "bar")).toHaveLength(1);
   });
+
+  it("keeps positions aligned after a length-changing case-fold character", () => {
+    const stateRef = makeStateRef(null);
+    // "İ" (U+0130) lowercases to two UTF-16 units ("i" + combining U+0307).
+    // A plain toLowerCase() haystack would desync from the original-text
+    // coordinate map and shift/invalidate the match after it. The word
+    // following it must still map to its exact original range.
+    editor = makeEditor(stateRef, "İstanbul word");
+    const matches = findMatches(editor.state.doc, "word");
+    expect(matches).toHaveLength(1);
+    const { from, to } = matches[0];
+    expect(editor.state.doc.textBetween(from, to)).toBe("word");
+  });
 });
 
 // ---------------------------------------------------------------------------

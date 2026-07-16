@@ -68,15 +68,34 @@ function buildVisibleTextMap(doc: ProseMirrorNode): { text: string; segments: Vi
 }
 
 /**
+ * Lowercase without changing string length: fold each character, but keep the
+ * original whenever its lowercase form has a different UTF-16 length (e.g. `İ`
+ * U+0130 → `i` + combining U+0307). A plain `toLowerCase()` would desync the
+ * haystack from the original-text coordinate map, shifting or invalidating the
+ * mapped PM positions; preserving length keeps every offset aligned. Such
+ * length-changing characters simply don't case-fold (a rare, acceptable
+ * trade-off); applying the same fold to both haystack and query keeps matching
+ * symmetric.
+ */
+function lowerPreservingLength(s: string): string {
+  let out = "";
+  for (const ch of s) {
+    const lower = ch.toLowerCase();
+    out += lower.length === ch.length ? lower : ch;
+  }
+  return out;
+}
+
+/**
  * Case-insensitive plain-text matches of `query` across the doc, as absolute PM
  * ranges. Matches span adjacent inline nodes within a block (e.g. across a bold
  * boundary) via the visible-text map, but never cross a block boundary.
  */
 export function findMatches(doc: ProseMirrorNode, query: string): { from: number; to: number }[] {
-  const q = query.toLowerCase();
+  const q = lowerPreservingLength(query);
   if (!q) return [];
   const { text, segments } = buildVisibleTextMap(doc);
-  const haystack = text.toLowerCase();
+  const haystack = lowerPreservingLength(text);
 
   const matches: { from: number; to: number }[] = [];
   let idx = haystack.indexOf(q);
