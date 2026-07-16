@@ -960,7 +960,19 @@ export function ChatPage() {
 
   // Loading + error gates for `/c/:id` hydration.
   if (urlConvId) {
-    if (loadingConversation) return <HydratingPlaceholder />;
+    if (loadingConversation) {
+      return (
+        <HydratingPlaceholder
+          onRetry={() => {
+            // Re-run hydration through switchTo: detach from the stuck
+            // session (same-id guard would otherwise no-op), then bind
+            // the URL conversation again.
+            const store = useChatStore.getState();
+            void store.switchTo(null).then(() => store.switchTo(urlConvId));
+          }}
+        />
+      );
+    }
     if (conversationLoadError) {
       return <ConversationLoadError conversationId={urlConvId} error={conversationLoadError} />;
     }
@@ -1856,11 +1868,37 @@ function MainAgentSurface({
   );
 }
 
-function HydratingPlaceholder() {
+/** Hydration time after which the spinner admits something is wrong. */
+const HYDRATION_SLOW_AFTER_MS = 12_000;
+
+function HydratingPlaceholder({ onRetry }: { onRetry?: () => void }) {
+  // A hydration fetch that errors gets ConversationLoadError, but one
+  // that merely stalls (saturated server, dead intermediary) would spin
+  // forever with no affordance. Past the threshold, say so and offer a
+  // retry that re-runs hydration.
+  const [slow, setSlow] = useState(false);
+  useEffect(() => {
+    const timer = window.setTimeout(() => setSlow(true), HYDRATION_SLOW_AFTER_MS);
+    return () => window.clearTimeout(timer);
+  }, []);
   return (
-    <div className="flex flex-1 items-center justify-center gap-2 text-muted-foreground text-sm">
-      <Loader2Icon className="size-4 animate-spin" />
-      Loading conversation…
+    <div className="flex flex-1 flex-col items-center justify-center gap-3 px-6">
+      <div className="flex items-center gap-2 text-muted-foreground text-sm">
+        <Loader2Icon className="size-4 animate-spin" />
+        Loading conversation…
+      </div>
+      {slow && (
+        <div className="flex max-w-md flex-col items-center gap-3 text-center">
+          <p className="text-muted-foreground text-sm">
+            This is taking longer than expected. The server may be busy.
+          </p>
+          {onRetry && (
+            <Button type="button" variant="outline" onClick={onRetry}>
+              Retry
+            </Button>
+          )}
+        </div>
+      )}
     </div>
   );
 }

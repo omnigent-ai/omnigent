@@ -117,6 +117,16 @@ def test_sqlite_engine_skips_server_pool_settings_and_enables_wal(
     # carrying options meant for postgres/mysql.
     assert engine.url.get_backend_name() == "sqlite"
 
+    # The pool itself must be sized for the server workload, not
+    # SQLAlchemy's default (5 + 10 overflow, 30s wait): a server with a
+    # few dozen live sessions holds more than 15 connections across
+    # streams, event appends, and policy evaluations, and the default
+    # pool surfaces as 30s transcript loads that die with
+    # ``QueuePool limit ... reached`` errors.
+    assert engine.pool.size() == 50
+    assert engine.pool._max_overflow == 50
+    assert engine.pool._timeout == 10
+
     with engine.connect() as conn:
         # WAL is the entire point of this fix: it allows readers
         # and a single writer to coexist, where DELETE serializes
@@ -133,6 +143,77 @@ def test_sqlite_engine_skips_server_pool_settings_and_enables_wal(
         # synchronous=NORMAL is the WAL-recommended mode — durable
         # at commit, much faster than FULL.
         assert conn.exec_driver_sql("PRAGMA synchronous").scalar() == 1
+
+
+def test_sqlite_engine_checkpoints_wal_and_collects_stats(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Opening a SQLite database through ``get_or_create_engine`` must fold
+    an accumulated WAL back into the main file and give the query
+    planner statistics.
+
+    Long-lived readers (session event streams) starve SQLite's automatic
+    checkpoint, so on a busy server the WAL grows without bound and
+    every read pays to consult it. And without ``sqlite_stat1`` the
+    planner guesses row counts, which can turn indexed window-function
+    joins (the ``child_sessions`` latest-message query) into full-table
+    scans. Both are cheap to fix at engine creation, when this process
+    holds no other connections.
+    """
+    monkeypatch.setattr(
+        "omnigent.db.utils._run_migrations",
+        lambda engine, db_uri: None,
+    )
+
+    db_path = tmp_path / "tuned.db"
+    wal_path = tmp_path / "tuned.db-wal"
+
+    # Seed a database with enough indexed rows that ANALYZE has
+    # something to record, leaving a non-empty WAL behind.
+    seed = create_engine(
+        f"sqlite:///{db_path}",
+        connect_args={"check_same_thread": False},
+    )
+    with seed.connect() as conn:
+        conn.exec_driver_sql("PRAGMA journal_mode=WAL")
+        conn.exec_driver_sql("CREATE TABLE items (conversation_id INTEGER, body TEXT)")
+        conn.exec_driver_sql("CREATE INDEX ix_items_conversation_id ON items (conversation_id)")
+        conn.exec_driver_sql(
+            "WITH RECURSIVE seq(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM seq WHERE i < 500) "
+            "INSERT INTO items SELECT i, printf('%.100c', 'x') FROM seq"
+        )
+        conn.commit()
+    # SQLite checkpoints and deletes the WAL when the LAST connection
+    # closes, which would leave nothing for the engine-creation
+    # checkpoint to do. Hold a second, idle connection open across the
+    # dispose - like the other processes (runner, REPL) that share a
+    # real chat.db - so the WAL survives. An idle connection holds no
+    # read mark, so it does not block wal_checkpoint(TRUNCATE) either.
+    import sqlite3
+
+    holder = sqlite3.connect(db_path)
+    holder.execute("SELECT 1").fetchone()
+    try:
+        seed.dispose()
+        assert wal_path.stat().st_size > 0
+
+        engine = get_or_create_engine(f"sqlite:///{db_path}")
+
+        # The WAL was folded into the main file and truncated - a stat
+        # of zero bytes is exactly what wal_checkpoint(TRUNCATE)
+        # guarantees.
+        assert wal_path.stat().st_size == 0
+        # PRAGMA optimize collected planner statistics for the seeded
+        # table.
+        with engine.connect() as conn:
+            stat_row = conn.exec_driver_sql(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sqlite_stat1'"
+            ).fetchone()
+            assert stat_row is not None
+    finally:
+        holder.close()
 
 
 # ── Lakebase token-aware engine ─────────────────────────

@@ -231,6 +231,18 @@ def _create_engine(db_uri: str) -> Engine:
         engine = create_engine(
             db_uri,
             connect_args={"check_same_thread": False, "timeout": 20.0},
+            # SQLAlchemy's default QueuePool (size 5, overflow 10, 30s
+            # wait) exhausts on a server with a few dozen live sessions:
+            # every stream, event append, and policy evaluation checks
+            # out a connection, and once 15 are held, transcript loads
+            # queue for 30s and fail. WAL-mode SQLite is happy with many
+            # concurrent readers, so size the pool like the server
+            # workload instead of the library default. ``pool_timeout``
+            # stays short so true saturation surfaces as an error
+            # rather than a half-minute hang.
+            pool_size=50,
+            max_overflow=50,
+            pool_timeout=10,
         )
 
         # Apply WAL + busy_timeout on every fresh DBAPI connection
@@ -289,6 +301,39 @@ def _create_engine(db_uri: str) -> Engine:
     return engine
 
 
+def _tune_sqlite_database(engine: Engine) -> None:
+    """
+    Best-effort maintenance for a freshly opened SQLite database.
+
+    ``PRAGMA wal_checkpoint(TRUNCATE)`` folds an oversized WAL back into
+    the main file. Long-lived readers (session event streams) can starve
+    the automatic checkpoint indefinitely, so the WAL grows without bound
+    - hundreds of MB on a busy server - and every read pays to consult it.
+    Engine creation is the one moment this process holds no other
+    connections, so the checkpoint usually succeeds; when another process
+    is mid-read it degrades to a partial checkpoint rather than failing.
+
+    ``PRAGMA optimize=0x10002`` collects planner statistics for any table
+    that lacks (or has outgrown) them. Without ``sqlite_stat1`` the
+    planner guesses row counts and can pick a full-table scan over an
+    index for window-function joins - e.g. the latest-message-per-child
+    query behind ``child_sessions`` - turning milliseconds into minutes
+    on a large ``chat.db``.
+
+    Both statements are advisory: a locked or read-only database must not
+    prevent the engine from being served.
+    """
+    try:
+        with engine.connect() as conn:
+            # Optimize first: the ANALYZE it may run writes sqlite_stat1
+            # through the WAL, so checkpointing after folds that write in
+            # too instead of leaving a fresh WAL behind.
+            conn.exec_driver_sql("PRAGMA optimize=0x10002")
+            conn.exec_driver_sql("PRAGMA wal_checkpoint(TRUNCATE)")
+    except Exception:  # noqa: BLE001 - maintenance must never block startup
+        _logger.debug("SQLite maintenance skipped", exc_info=True)
+
+
 def get_or_create_engine(db_uri: str) -> Engine:
     """
     Return a cached engine for the given URI, creating one if needed.
@@ -308,6 +353,8 @@ def get_or_create_engine(db_uri: str) -> Engine:
             if db_uri not in _engine_cache:
                 engine = _create_engine(db_uri)
                 _initialize_or_verify_schema(engine, db_uri)
+                if db_uri.startswith("sqlite"):
+                    _tune_sqlite_database(engine)
                 from omnigent.runtime.telemetry import instrument_sqlalchemy_engine
 
                 instrument_sqlalchemy_engine(engine)
