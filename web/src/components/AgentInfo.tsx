@@ -46,7 +46,6 @@ import {
 } from "@/components/ui/dialog";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { ModelValueCombobox } from "@/components/ModelValueCombobox";
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { capitalizeAgentName } from "@/lib/agentLabels";
 import { coercePolicyParams } from "@/lib/policyParams";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
@@ -1313,33 +1312,90 @@ export function AgentInfoContent({ agent, sessionId }: AgentInfoProps) {
 /**
  * Header info icon revealing the active agent's tools & policies.
  *
+ * The panel opens on hover of the icon and stays open while the pointer is
+ * over the icon or the panel, so a quick peek (e.g. the session cost) needs
+ * no click. A deliberate click — or any click inside the panel — "pins" it
+ * open so the interactive tools/policies controls stay usable without the
+ * panel dismissing on mouse-leave; an outside click or Escape unpins it.
+ *
  * Desktop-only: on mobile (`< md`) the same content is reached via the
  * header's three-dot menu, which opens {@link AgentInfoContent} in a
  * dialog. Self-hides when the agent has neither tools nor policies.
  */
 export function AgentInfoButton({ agent, sessionId }: AgentInfoProps) {
+  const [open, setOpen] = useState(false);
+  // A click pins the panel open; hover-leave only dismisses an unpinned
+  // (hover-opened) panel. Outside click / Escape clears the pin via onOpenChange.
+  const pinnedRef = useRef(false);
+  const closeTimerRef = useRef<number | null>(null);
+
+  const cancelClose = () => {
+    if (closeTimerRef.current !== null) {
+      window.clearTimeout(closeTimerRef.current);
+      closeTimerRef.current = null;
+    }
+  };
+  // Short grace period so moving the pointer across the gap between the icon
+  // and the panel doesn't dismiss it mid-travel.
+  const scheduleClose = () => {
+    if (pinnedRef.current) return;
+    cancelClose();
+    closeTimerRef.current = window.setTimeout(() => setOpen(false), 150);
+  };
+  useEffect(() => {
+    return () => {
+      if (closeTimerRef.current !== null) window.clearTimeout(closeTimerRef.current);
+    };
+  }, []);
+
   if (!agentHasInfo(agent, sessionId)) return null;
 
   return (
-    <Popover>
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <PopoverTrigger asChild>
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon"
-              aria-label="Agent tools and policies"
-              data-testid="agent-info-trigger"
-              className="hidden text-muted-foreground hover:text-foreground md:inline-flex"
-            >
-              <InfoIcon className="size-4" />
-            </Button>
-          </PopoverTrigger>
-        </TooltipTrigger>
-        <TooltipContent>Agent tools &amp; policies</TooltipContent>
-      </Tooltip>
-      <PopoverContent align="end" className="w-80">
+    <Popover
+      open={open}
+      onOpenChange={(next) => {
+        cancelClose();
+        if (!next) pinnedRef.current = false;
+        setOpen(next);
+      }}
+    >
+      <PopoverTrigger
+        asChild
+        onClick={(e) => {
+          // Pin on click. When already open (via hover) suppress Radix's
+          // default toggle so the click keeps the panel open instead of closing it.
+          if (open) e.preventDefault();
+          pinnedRef.current = true;
+          setOpen(true);
+        }}
+      >
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon"
+          aria-label="Agent tools and policies"
+          data-testid="agent-info-trigger"
+          className="hidden text-muted-foreground hover:text-foreground md:inline-flex"
+          onMouseEnter={() => {
+            cancelClose();
+            setOpen(true);
+          }}
+          onMouseLeave={scheduleClose}
+        >
+          <InfoIcon className="size-4" />
+        </Button>
+      </PopoverTrigger>
+      <PopoverContent
+        align="end"
+        className="w-80"
+        // Hover-opened: don't yank focus into the panel on a mere peek.
+        onOpenAutoFocus={(e) => e.preventDefault()}
+        onMouseEnter={cancelClose}
+        onMouseLeave={scheduleClose}
+        onPointerDownCapture={() => {
+          pinnedRef.current = true;
+        }}
+      >
         <AgentInfoContent agent={agent} sessionId={sessionId} />
       </PopoverContent>
     </Popover>

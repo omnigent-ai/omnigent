@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Agent } from "@/hooks/useAgents";
@@ -177,6 +177,83 @@ describe("AgentInfoButton", () => {
     fireEvent.click(screen.getByTestId("agent-info-trigger"));
     expect(screen.getByText("Claude")).toBeInTheDocument();
     expect(screen.queryByText("claude-native-ui")).toBeNull();
+  });
+});
+
+describe("AgentInfoButton hover behavior", () => {
+  // The panel now reveals on hover of the info icon (no click needed) and
+  // dismisses shortly after the pointer leaves both the icon and the panel.
+
+  function popoverContent(): HTMLElement | null {
+    // The rendered agent name only lives inside the popover body.
+    return (
+      screen.queryByText("Databricks_coding_agent")?.closest("[data-slot='popover-content']") ??
+      null
+    );
+  }
+
+  it("opens on hover over the info icon and dismisses after the pointer leaves", () => {
+    vi.useFakeTimers();
+    try {
+      renderButton(AGENT_WITH_BOTH);
+      const trigger = screen.getByTestId("agent-info-trigger");
+      // Closed: nothing rendered until hover.
+      expect(popoverContent()).toBeNull();
+
+      fireEvent.mouseEnter(trigger);
+      expect(popoverContent()).not.toBeNull();
+
+      fireEvent.mouseLeave(trigger);
+      // A short grace period keeps it up so the pointer can reach the panel.
+      expect(popoverContent()).not.toBeNull();
+      act(() => {
+        vi.advanceTimersByTime(300);
+      });
+      expect(popoverContent()).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stays open while the pointer moves from the icon onto the panel", () => {
+    vi.useFakeTimers();
+    try {
+      renderButton(AGENT_WITH_BOTH);
+      const trigger = screen.getByTestId("agent-info-trigger");
+      fireEvent.mouseEnter(trigger);
+      const panel = popoverContent();
+      expect(panel).not.toBeNull();
+
+      // Leaving the icon starts the dismiss timer; entering the panel cancels it.
+      fireEvent.mouseLeave(trigger);
+      fireEvent.mouseEnter(panel!);
+      act(() => {
+        vi.advanceTimersByTime(300);
+      });
+      expect(popoverContent()).not.toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a clicked (pinned) panel open after the pointer leaves", () => {
+    vi.useFakeTimers();
+    try {
+      renderButton(AGENT_WITH_BOTH);
+      const trigger = screen.getByTestId("agent-info-trigger");
+      // Open via hover, then pin with a click.
+      fireEvent.mouseEnter(trigger);
+      fireEvent.click(trigger);
+
+      fireEvent.mouseLeave(trigger);
+      act(() => {
+        vi.advanceTimersByTime(300);
+      });
+      // Pinned: a mouse-leave no longer dismisses it.
+      expect(popoverContent()).not.toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
