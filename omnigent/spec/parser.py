@@ -238,6 +238,7 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
     guardrails = _parse_guardrails(raw.get("guardrails"), expand_env=expand_env)
     os_env = _parse_os_env(raw.get("os_env"))
     terminals = _parse_terminals(raw.get("terminals"))
+    context_providers = _parse_context_providers(raw.get("context_providers"))
     params = raw.get("params", {})
     # Top-level ``async:`` flag gates the LLM-callable async-dispatch
     # builtins (``sys_call_async``, ``sys_read_inbox``,
@@ -307,6 +308,7 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
         timers=timers,
         spawn=spawn,
         agent_session_sharing=agent_session_sharing,
+        context_providers=context_providers,
     )
 
 
@@ -3304,6 +3306,64 @@ def _parse_function_ref(
             code=ErrorCode.INVALID_INPUT,
         )
     return FunctionRef(path=path, arguments=args)
+
+
+def _parse_context_providers(raw: Any) -> list[FunctionRef] | None:
+    """
+    Parse the top-level ``context_providers:`` block into FunctionRefs.
+
+    Each entry is a function reference — the same shape as a function
+    policy's ``function:`` — accepted as a bare dotted-path string, a
+    ``{path, arguments}`` mapping, or a ``{type: function, function:
+    {path, arguments}}`` mapping (so the block reads like ``policies``).
+    Providers are resolved once at load and invoked on every turn; each
+    returns text appended to the system instructions.
+
+    :param raw: The raw ``context_providers:`` value from YAML.
+    :returns: A list of :class:`FunctionRef`, or ``None`` when the block
+        is absent or an empty list.
+    :raises OmnigentError: If the value isn't a list, or an entry is
+        malformed (non-string path, bad ``arguments``, wrong type).
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, list):
+        raise OmnigentError(
+            f"context_providers: must be a list, got {type(raw).__name__}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    providers: list[FunctionRef] = []
+    for i, item in enumerate(raw):
+        label = f"context_providers[{i}]"
+        ref = item.get("function", item) if isinstance(item, dict) else item
+        if isinstance(ref, str):
+            if not ref:
+                raise OmnigentError(
+                    f"{label}: provider path must be a non-empty dotted-path string",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            providers.append(FunctionRef(path=ref, arguments=None))
+            continue
+        if not isinstance(ref, dict):
+            raise OmnigentError(
+                f"{label}: must be a dotted-path string or a mapping with "
+                f"{{path, arguments}}, got {type(ref).__name__}",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        path = ref.get("path")
+        if not isinstance(path, str) or not path:
+            raise OmnigentError(
+                f"{label}: `path` must be a non-empty dotted-path string",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        args = ref.get("arguments")
+        if args is not None and not isinstance(args, dict):
+            raise OmnigentError(
+                f"{label}: `arguments` must be a mapping (or omitted), got {type(args).__name__}",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        providers.append(FunctionRef(path=path, arguments=args))
+    return providers or None
 
 
 def _parse_policy_ask_timeout(
