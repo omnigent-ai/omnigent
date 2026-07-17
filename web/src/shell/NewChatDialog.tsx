@@ -1327,9 +1327,6 @@ function AgentHarnessPicker({
   pendingAgentId: string;
   onSelectPending: () => void;
   onCreateCustomAgent: () => void;
-  // When a managed sandbox is the target, custom-agent creation isn't
-  // available (the sandbox create path doesn't provision a runner for a
-  // bundled agent), so the "Create custom agent" item is hidden.
   sandboxSelected: boolean;
   permissionMode: string;
   approvalMode: string;
