@@ -123,6 +123,21 @@ const AGENT_BUNDLED = summary({
   displayPath: "Included with agent",
 });
 
+// N local skills named local-0..local-(N-1), for the per-group cap tests.
+function localSkills(n: number): SkillSummary[] {
+  return Array.from({ length: n }, (_, i) =>
+    summary({
+      id: `personal:claude:local-${i}`,
+      name: `local-${i}`,
+      description: `Local skill ${i}.`,
+      origin: "personal",
+      ownership: "local",
+      agentName: null,
+      displayPath: `~/.claude/skills/local-${i}`,
+    }),
+  );
+}
+
 function renderPage() {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
@@ -956,5 +971,128 @@ describe("SkillsPage — instructions layout + progressive disclosure", () => {
     fireEvent.click(screen.getByRole("button", { name: "Source" }));
     expect(screen.getByTestId("skill-copy")).toBeInTheDocument();
     expect(screen.getByTestId("skill-instructions-toggle")).toBeInTheDocument();
+  });
+});
+
+describe("SkillsPage — per-group 6-item cap", () => {
+  it("shows no control when a group has 6 or fewer skills", async () => {
+    vi.mocked(skillsApi.getSkillCatalog).mockResolvedValue({
+      skills: localSkills(6),
+      includeOtherTools: true,
+      hiddenCount: 0,
+    });
+    renderPage();
+    await screen.findByTestId("skill-row-local-0");
+    // All six visible, no See all control.
+    expect(screen.getByTestId("skill-row-local-5")).toBeInTheDocument();
+    expect(screen.queryByTestId("skills-group-more-local")).toBeNull();
+  });
+
+  it("caps at 6 with a See all control that expands and collapses", async () => {
+    vi.mocked(skillsApi.getSkillCatalog).mockResolvedValue({
+      skills: localSkills(7),
+      includeOtherTools: true,
+      hiddenCount: 0,
+    });
+    renderPage();
+    await screen.findByTestId("skill-row-local-0");
+
+    // 7th hidden behind the cap.
+    expect(screen.queryByTestId("skill-row-local-6")).toBeNull();
+    const more = screen.getByTestId("skills-group-more-local");
+    expect(more).toHaveTextContent("See all 7");
+
+    // Expand → 7th visible; label flips to Show fewer.
+    fireEvent.click(more);
+    expect(await screen.findByTestId("skill-row-local-6")).toBeInTheDocument();
+    expect(screen.getByTestId("skills-group-more-local")).toHaveTextContent("Show fewer");
+
+    // Collapse back.
+    fireEvent.click(screen.getByTestId("skills-group-more-local"));
+    await waitFor(() => expect(screen.queryByTestId("skill-row-local-6")).toBeNull());
+  });
+
+  it("caps each ownership group independently", async () => {
+    // 7 local + 7 omnigent → each capped on its own, one control per group.
+    const omni = Array.from({ length: 7 }, (_, i) =>
+      summary({
+        id: `bundle:omni-${i}`,
+        name: `omni-${i}`,
+        origin: "built_in",
+        ownership: "omnigent",
+        agentName: null,
+        displayPath: "Included with agent",
+      }),
+    );
+    vi.mocked(skillsApi.getSkillCatalog).mockResolvedValue({
+      skills: [...omni, ...localSkills(7)],
+      includeOtherTools: true,
+      hiddenCount: 0,
+    });
+    renderPage();
+    await screen.findByTestId("skill-row-omni-0");
+
+    // Both groups show their own control; each hides its 7th row.
+    expect(screen.getByTestId("skills-group-more-omnigent")).toBeInTheDocument();
+    expect(screen.getByTestId("skills-group-more-local")).toBeInTheDocument();
+    expect(screen.queryByTestId("skill-row-omni-6")).toBeNull();
+    expect(screen.queryByTestId("skill-row-local-6")).toBeNull();
+
+    // Expanding Local does not expand Omnigent.
+    fireEvent.click(screen.getByTestId("skills-group-more-local"));
+    expect(await screen.findByTestId("skill-row-local-6")).toBeInTheDocument();
+    expect(screen.queryByTestId("skill-row-omni-6")).toBeNull();
+  });
+
+  it("bypasses the cap while a search filter is active", async () => {
+    vi.mocked(skillsApi.getSkillCatalog).mockResolvedValue({
+      skills: localSkills(7),
+      includeOtherTools: true,
+      hiddenCount: 0,
+    });
+    renderPage();
+    await screen.findByTestId("skill-row-local-0");
+
+    // A search matching all 7 (shared "local" substring) shows every match and
+    // no cap control.
+    fireEvent.change(screen.getByTestId("skills-search"), { target: { value: "local-" } });
+    expect(await screen.findByTestId("skill-row-local-6")).toBeInTheDocument();
+    expect(screen.queryByTestId("skills-group-more-local")).toBeNull();
+  });
+
+  it("keeps a selected skill visible even when it sorts beyond the cap", async () => {
+    vi.mocked(skillsApi.getSkillCatalog).mockResolvedValue({
+      skills: localSkills(8),
+      includeOtherTools: true,
+      hiddenCount: 0,
+    });
+    renderPage();
+    // Select the 8th (past the cap) by searching to it, clicking, then clearing.
+    fireEvent.change(screen.getByTestId("skills-search"), { target: { value: "local-7" } });
+    fireEvent.click(await screen.findByTestId("skill-row-local-7"));
+    fireEvent.change(screen.getByTestId("skills-search"), { target: { value: "" } });
+
+    // Back in the capped view, the selected 7th-index row stays visible (added
+    // to the preview set) even though it's beyond the first six.
+    expect(await screen.findByTestId("skill-row-local-7")).toBeInTheDocument();
+    expect(screen.getByTestId("skill-detail")).toHaveAttribute(
+      "data-skill-id",
+      "personal:claude:local-7",
+    );
+  });
+
+  it("hides capped rows when the section is collapsed (collapse takes precedence)", async () => {
+    vi.mocked(skillsApi.getSkillCatalog).mockResolvedValue({
+      skills: localSkills(7),
+      includeOtherTools: true,
+      hiddenCount: 0,
+    });
+    renderPage();
+    await screen.findByTestId("skill-row-local-0");
+
+    fireEvent.click(screen.getByTestId("skills-section-header-local"));
+    await waitFor(() => expect(screen.queryByTestId("skill-row-local-0")).toBeNull());
+    // The cap control is gone too while collapsed.
+    expect(screen.queryByTestId("skills-group-more-local")).toBeNull();
   });
 });

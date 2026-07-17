@@ -488,25 +488,108 @@ function SkillList({
                     {rows.length}
                   </span>
                 </button>
-                {!collapsed &&
-                  rows.map((skill) => (
-                    <SkillRow
-                      key={skill.id}
-                      skill={skill}
-                      selected={selectedId === skill.id}
-                      selectedFile={selectedId === skill.id ? selectedFile : null}
-                      onSelectSkill={() => onSelectSkill(skill.id)}
-                      onSelectFile={(path) => onSelectFile(skill.id, path)}
-                      sessionId={sessionId}
-                      includeOtherTools={includeOtherTools}
-                    />
-                  ))}
+                {!collapsed && (
+                  <SkillGroupRows
+                    groupKey={ownership}
+                    rows={rows}
+                    capBypassed={filtersActive}
+                    selectedId={selectedId}
+                    selectedFile={selectedFile}
+                    onSelectSkill={onSelectSkill}
+                    onSelectFile={onSelectFile}
+                    sessionId={sessionId}
+                    includeOtherTools={includeOtherTools}
+                  />
+                )}
               </section>
             );
           })
         )}
       </div>
     </div>
+  );
+}
+
+// A group shows at most this many skill rows before offering "See all N".
+const SKILL_GROUP_CAP = 6;
+
+/**
+ * The rows for ONE group, with a per-group 6-item cap + See all / Show fewer.
+ * Each group instance owns its own capped state, so capping is independent
+ * across groups (and reused verbatim for per-agent subgroups). Rules:
+ *   - ≤ CAP rows → no control, all shown.
+ *   - A search / source filter (`capBypassed`) shows every match — no cap.
+ *   - The selected skill is always kept visible even if it sorts past the cap,
+ *     so collapsing to the preview set never hides the current selection.
+ */
+function SkillGroupRows({
+  groupKey,
+  rows,
+  capBypassed,
+  selectedId,
+  selectedFile,
+  onSelectSkill,
+  onSelectFile,
+  sessionId,
+  includeOtherTools,
+}: {
+  groupKey: string;
+  rows: SkillSummary[];
+  capBypassed: boolean;
+  selectedId: string | null;
+  selectedFile: string | null;
+  onSelectSkill: (id: string) => void;
+  onSelectFile: (skillId: string, path: string) => void;
+  sessionId: string;
+  includeOtherTools: boolean;
+}) {
+  const [showAll, setShowAll] = useState(false);
+
+  const overCap = rows.length > SKILL_GROUP_CAP;
+  // Show everything when filtering, when the user expanded this group, or when
+  // it fits. Otherwise show the first CAP — but always include the selected row
+  // even if it sorts beyond the cap, so selection is never silently hidden.
+  const expanded = capBypassed || showAll || !overCap;
+  const visible = useMemo(() => {
+    if (expanded) return rows;
+    const head = rows.slice(0, SKILL_GROUP_CAP);
+    const sel = rows.find((s) => s.id === selectedId);
+    if (sel && !head.some((s) => s.id === sel.id)) return [...head, sel];
+    return head;
+  }, [expanded, rows, selectedId]);
+
+  return (
+    <>
+      {visible.map((skill) => (
+        <SkillRow
+          key={skill.id}
+          skill={skill}
+          selected={selectedId === skill.id}
+          selectedFile={selectedId === skill.id ? selectedFile : null}
+          onSelectSkill={() => onSelectSkill(skill.id)}
+          onSelectFile={(path) => onSelectFile(skill.id, path)}
+          sessionId={sessionId}
+          includeOtherTools={includeOtherTools}
+        />
+      ))}
+      {/* The cap control is hidden while filtering (every match is already
+          shown) and when the group fits under the cap. */}
+      {overCap && !capBypassed && (
+        <button
+          type="button"
+          onClick={() => setShowAll((v) => !v)}
+          aria-expanded={showAll}
+          data-testid={`skills-group-more-${groupKey}`}
+          className="flex w-full items-center gap-1 rounded-md px-3 py-1 text-left text-[11px] font-medium text-muted-foreground transition-colors hover:bg-foreground/5 hover:text-foreground"
+        >
+          {showAll ? "Show fewer" : `See all ${rows.length}`}
+          <ChevronDownIcon
+            aria-hidden
+            className={cn("size-3 transition-transform", showAll && "rotate-180")}
+          />
+        </button>
+      )}
+    </>
   );
 }
 
