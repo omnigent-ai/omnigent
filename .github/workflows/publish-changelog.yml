@@ -158,6 +158,44 @@ jobs:
             echo "available=true" >> "$GITHUB_OUTPUT"
           fi
 
+      # Build a docs index (URL + title, one per line) from the live site so the
+      # formatter can link each feature to a real /docs page — or omit the link
+      # when nothing fits. omnigent-site is public; a blobless partial + sparse
+      # checkout of app/docs pulls only the page.mdx tree, no token needed. Best
+      # effort: on any failure the index is empty and every "Learn more" is dropped.
+      - name: Build docs index
+        if: steps.creds.outputs.available == 'true'
+        env:
+          SITE_REPO: ${{ env.SITE_REPO }}
+        run: |
+          set -euo pipefail
+          : > /tmp/docs_index.txt
+          tmp="$(mktemp -d)"
+          if git clone --depth 1 --filter=blob:none --sparse \
+              "https://github.com/${SITE_REPO}.git" "$tmp" 2>/dev/null \
+             && git -C "$tmp" sparse-checkout set app/docs 2>/dev/null; then
+            python3 -u - "$tmp" <<'PYEOF'
+          import pathlib, re, sys
+          root = pathlib.Path(sys.argv[1])
+          docs = root / "app" / "docs"
+          lines = []
+          for page in sorted(docs.rglob("page.mdx")):
+              url = "/" + page.relative_to(root).parent.as_posix().removeprefix("app/")
+              title = ""
+              for ln in page.read_text(encoding="utf-8", errors="replace").splitlines():
+                  m = re.match(r"#\s+(.*\S)", ln)  # first H1
+                  if m:
+                      title = m.group(1).strip()
+                      break
+              lines.append(f"{url}\t{title}" if title else url)
+          pathlib.Path("/tmp/docs_index.txt").write_text("\n".join(lines) + ("\n" if lines else ""))
+          print(f"Indexed {len(lines)} docs pages.")
+          PYEOF
+          else
+            echo "::warning::Could not fetch omnigent-site docs — 'Learn more' links will be omitted."
+          fi
+          rm -rf "$tmp"
+
       - name: Build formatter prompt
         if: steps.creds.outputs.available == 'true'
         env:
@@ -172,10 +210,16 @@ jobs:
           # cap defensively; the raw body is the fallback if the agent can't run.
           MAX = 100_000
           body = pathlib.Path("/tmp/release_body.md").read_text(encoding="utf-8", errors="replace")[:MAX]
+          docs = pathlib.Path("/tmp/docs_index.txt")
+          docs_index = docs.read_text(encoding="utf-8", errors="replace").strip() if docs.is_file() else ""
+          docs_block = docs_index if docs_index else "(none available — omit every \"Learn more\" line)"
           prompt = f"""Reformat the {tag} release notes into the website post.
 
           ## Curated GitHub Release body (rewrite this — do not add or drop facts)
           {body}
+
+          ## Available docs pages (URL <TAB> title) — link features to these only
+          {docs_block}
 
           Produce the RELEASE_POST block per your instructions."""
           pathlib.Path("/tmp/format_prompt.txt").write_text(prompt)
