@@ -281,12 +281,14 @@ class KimiExecutor(Executor):
             if not sandbox.active:
                 return self._binary_path
             # kimi is a curl-installed single binary: it must read its own
-            # install dir and write its config dir (~/.kimi) and /tmp, or it
+            # install dir and write its config dir (~/.kimi-code) and /tmp, or it
             # can't start inside the jail.
             resolved_bin = shutil.which(self._binary_path) or self._binary_path
             bin_dir = Path(resolved_bin).resolve(strict=False).parent
             sandbox = with_additional_read_roots(sandbox, [bin_dir])
-            sandbox = with_additional_write_roots(sandbox, [Path.home() / ".kimi", Path("/tmp")])
+            sandbox = with_additional_write_roots(
+                sandbox, [Path.home() / ".kimi-code", Path("/tmp")]
+            )
             sandbox = with_spawn_env_allowlist(sandbox, spawn_env_names)
             return create_exec_launcher(resolved_bin, sandbox)
         except (OSError, ImportError, NotImplementedError) as exc:

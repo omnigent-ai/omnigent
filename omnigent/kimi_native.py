@@ -7,7 +7,7 @@ spawns the process (see :func:`omnigent.runner.app._auto_create_kimi_terminal`);
 this module owns the CLI-side orchestration: session create/resume, daemon
 runner bind, terminal-ready poll, and the direct tmux attach.
 
-Auth is the ambient ``kimi login`` (``$HOME/.kimi``); no API key is
+Auth is the ambient ``kimi login`` (``$HOME/.kimi-code``); no API key is
 required. Unlike Pi there is no extension bridge — the runner sets up the
 terminal environment directly.
 """
