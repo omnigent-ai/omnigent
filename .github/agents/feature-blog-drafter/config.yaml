@@ -17,9 +17,9 @@ name: feature-blog-drafter
 description: >-
   Drafts a single feature-blog post on omnigent-site for a scout-selected
   feature. Inspects the live site to match conventions, confirms facts against
-  the omnigent code, writes a short one-screen post following the 5-part
-  skeleton, and marks the mandatory demo for a human. Writes blog prose only —
-  never product code — and never commits or pushes (the workflow does that).
+  the omnigent code, and writes a short one-screen user-facing post, marking the
+  mandatory demo for a human. Writes blog prose only (never product code) and
+  never commits or pushes (the workflow does that).
 
 executor:
   type: omnigent
@@ -103,32 +103,59 @@ prompt: |
   it.
 
   ## Step 3 — Write the post (short, one-screen, in-style)
-  Create `app/blog/<SLUG>/page.mdx` — this is the ONLY file you write. Follow
-  this 5-part skeleton — keep the whole post to roughly one screen; it is a
-  changelog-blog entry, NOT a long-form article:
+  Create `app/blog/<SLUG>/page.mdx` — this is the ONLY file you write. Keep the
+  whole post to roughly one screen; it is a changelog-blog entry, NOT a long-form
+  article.
 
-  1. **What's new + who it's for** — the benefit `HEADLINE` as the title/H1, plus
-     a one-line "who it's for". Frontmatter carries `date: DATE`,
-     `category: CATEGORY`, and `author: "omnigent"` (default; a human may
-     overwrite it during review).
-  2. **The problem it solves** — 2–3 sentences. Benefit before mechanism: lead
-     with the user outcome, then the how. Keep our wedge as the through-line
-     (Omnigent is the orchestration layer over many agents, any device, with
-     governance) — imply it, don't sloganeer.
-  3. **Demo** — you CANNOT produce the screenshot/recording. Emit EXACTLY this
-     marker where the demo belongs, with a one-line suggestion of what to show.
-     It MUST be an MDX comment (`{/* ... */}`), NOT an HTML comment (`<!-- ... -->`)
-     — HTML comments are invalid in MDX and break the site build:
+  The five items below are the SHAPE of the post, in order — they are NOT section
+  headings and NOT sentence lead-ins. Write flowing prose. Do NOT emit label text
+  like "Who it's for:", "The problem it solves", "How to use", or "What's next" —
+  neither as headings nor at the start of a sentence. The only heading in the
+  post is the H1 title.
+
+  1. Open with the benefit `HEADLINE` as the H1 title, then a short opening
+     paragraph. Say who it helps and what they can now do as a natural sentence
+     ("If you drive long agent runs in the web UI, you can now line up your next
+     few messages instead of waiting for each turn to finish."), NOT as a
+     "Who it's for:" label. Frontmatter carries `date: DATE`, `category: CATEGORY`,
+     and `author: "omnigent"` (default; a human may overwrite it during review).
+  2. In 2–3 sentences, describe the problem this removes and the outcome, in the
+     user's terms. Lead with what the user gets, then just enough of how it works
+     to be concrete. Let the "orchestration layer over many agents, any device,
+     with governance" wedge show through the framing; never sloganeer it.
+  3. The demo. You CANNOT produce the screenshot/recording, so emit EXACTLY this
+     marker where it belongs, with a one-line suggestion of what to show. It MUST
+     be an MDX comment (`{/* ... */}`), NOT an HTML comment (`<!-- ... -->`);
+     HTML comments are invalid in MDX and break the site build:
      `{/* DEMO REQUIRED: 15–30s recording or light/dark screenshot pair, realistic data. No sanitized mockups. Suggested: <what to show> */}`
-  4. **How to use** — a copy-pasteable fenced command block (only commands/flags
-     grounded in `MATERIAL_FILE`) and a link to the relevant docs page.
-  5. **What's next** — an optional one-line forward look ONLY if the material
-     supports it; otherwise omit the line. Do NOT write the closing CTA / star
-     ask — the workflow appends a fixed footer.
+  4. Show how to use it: a short prose sentence plus, when the feature has one, a
+     copy-pasteable fenced command block (only commands/flags grounded in
+     `MATERIAL_FILE`), and a link to the relevant docs page. If it is a UI feature
+     with no command, describe the click path in one or two sentences instead.
+  5. Optionally close with one plain sentence on what is coming next, ONLY if the
+     material clearly supports it; otherwise stop. Do NOT write the closing CTA /
+     star ask — the workflow appends a fixed footer.
+
+  ## Voice and content rules (IMPORTANT — the last drafts failed these)
+  - **User-facing, not implementation.** Write about what the reader can now DO,
+    never about how it is built or verified. Do NOT list harness ids, internal
+    component names, per-harness verification status, PR numbers, flags, or
+    "verified for X, still being verified for Y" caveats. If a capability works
+    across harnesses, say "works with any agent you run in Omnigent" — not a list
+    of `claude-sdk, codex-sdk, ...`. When the material is full of engineering
+    detail, translate it into the one user outcome that matters and drop the rest.
+  - **Few dashes.** Do NOT use " — " (spaced em/en dashes) as a sentence
+    connector; it reads as AI-generated. Write separate sentences, or use a comma,
+    "and", parentheses, or a colon. At most ONE dash in the whole post, and only
+    if nothing else fits. Do not use "not X but Y" or "It's not just … it's …"
+    constructions.
+  - **Plain and concrete.** Short sentences, active voice, no marketing adjectives
+    ("powerful", "seamless", "effortless", "game-changing"), no hype. Prefer a
+    real example over an abstraction.
 
   Do not add a hero image — leave any `heroArt` frontmatter blank for a human.
-  Be accurate and concise — no marketing fluff. Ground every fact in the
-  material; if unsure, omit it and note it under "Manual review needed".
+  Ground every fact in the material; if unsure, omit it and note it under
+  "Manual review needed".
 
   ## Output contract (your final assistant text)
   On the line IMMEDIATELY BEFORE `<!-- BLOG_DRAFT_SUMMARY -->`, emit a single
