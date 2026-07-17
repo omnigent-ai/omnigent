@@ -109,6 +109,9 @@ async def validate_existing_host_workspace(
             code=ErrorCode.INVALID_INPUT,
         )
     if agent_cache is None:
+        # Should never happen in production — the route factory always wires
+        # an agent cache. Fail loud rather than silently skipping validation,
+        # which would let bad workspaces through.
         raise OmnigentError(
             "workspace validation requires an agent cache",
             code=ErrorCode.INTERNAL_ERROR,
@@ -121,6 +124,11 @@ async def validate_existing_host_workspace(
 
     from omnigent.server.routes._host_launch import resolve_host_owner
 
+    # Authorize host ownership FIRST — before loading the agent spec or the
+    # host.stat round-trip below. A non-owner must be rejected (403/404 via the
+    # shared resolve_host_owner) before we touch the host or even read the agent
+    # bundle (cross-user host probe). The returned host also gives the display
+    # name for error messages.
     host_name: str | None = None
     if host_store is not None:
         host = await asyncio.to_thread(
@@ -131,6 +139,10 @@ async def validate_existing_host_workspace(
         )
         host_name = host.name
 
+    # Read the agent's os_env.cwd — None when the spec has no os_env block
+    # (headless agents). Headless agents have no filesystem access at all but
+    # still get launched on hosts for sessions that don't need it; treat their
+    # cwd as relative-equivalent so the boundary is unrestricted.
     spec_cwd: str | None = None
     if agent.bundle_location is not None:
         try:
