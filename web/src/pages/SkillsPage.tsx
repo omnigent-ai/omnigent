@@ -64,13 +64,15 @@ import {
 } from "@/lib/skillsApi";
 import { cn } from "@/lib/utils";
 
-// Per-origin accent token, used only for the small dot/glyph tint. `origin`
-// stays INTERNAL — it's never shown as a provenance word and never sections the
-// list; it only tints the accent dot. The catalog is a flat, harness-neutral
-// list; the concrete source path lives in the detail's Source row and the
-// optional source filter, never in the list's information architecture.
+// Per-origin accent token, used only for the small glyph tint in the detail
+// head. `origin` stays INTERNAL — it's never shown as a provenance word and
+// never sections the list; it only tints the glyph. The catalog is a flat,
+// harness-neutral list; the concrete source path lives in the detail's Source
+// row, never in the list's information architecture. Omnigent/`built_in` uses a
+// NEUTRAL foreground tint (not the blue `info` token) — the Skills page carries
+// no blue interaction/ownership accent (per the neutral-palette ruling).
 const ORIGIN_ACCENT: Record<SkillOrigin, string> = {
-  built_in: "var(--color-info)",
+  built_in: "var(--color-muted-foreground)",
   workspace: "var(--color-brand-accent)",
   personal: "var(--color-success)",
 };
@@ -688,7 +690,7 @@ function SkillRow({
         className={cn(
           "flex h-12 w-full items-center rounded-lg px-3 text-left transition-colors",
           "hover:bg-foreground/5",
-          selected && "bg-info/10 shadow-[inset_2px_0_var(--color-info)]",
+          selected && "bg-foreground/10 shadow-[inset_2px_0_var(--color-border-strong)]",
           !skill.enabled && "opacity-60",
         )}
       >
@@ -1056,7 +1058,7 @@ function IconToggle({
           className={cn(
             "grid size-6 place-items-center rounded-md transition-colors",
             active
-              ? "bg-info/12 text-info"
+              ? "bg-foreground/10 text-foreground"
               : "text-muted-foreground hover:bg-foreground/8 hover:text-foreground",
           )}
         >
@@ -1198,7 +1200,7 @@ function FileTreeNodeRow({
       data-testid={`skill-file-${node.path}`}
       className={cn(
         "flex w-full items-center gap-1.5 rounded-md py-1 pr-2 text-left text-[12px] transition-colors",
-        selected ? "bg-info/12 text-info" : "text-foreground hover:bg-foreground/5",
+        selected ? "bg-foreground/10 text-foreground" : "text-foreground hover:bg-foreground/5",
       )}
     >
       <span className="w-3 shrink-0" aria-hidden />
