@@ -425,6 +425,18 @@ jobs:
                 >> "${SITE}/${post}"
             fi
 
+            # Prettier the drafter's changed files so they pass the site's
+            # `fmt:check` gate — LLM-generated MDX/JS (and the CTA footer appended
+            # above) are rarely prettier-clean. Run from inside $SITE so prettier
+            # discovers the site's .prettierrc.json + .prettierignore, and pin the
+            # site's major version. Formatting failures are non-fatal: a human
+            # reviews the draft PR and CI still reports any residual issue.
+            mapfile -t changed < <(git -C "$SITE" status --porcelain | awk '{print $NF}')
+            if [ "${#changed[@]}" -gt 0 ]; then
+              ( cd "$SITE" && npx --yes prettier@3 --write --ignore-unknown "${changed[@]}" ) \
+                || echo "::warning::prettier --write failed for ${slug}; committing unformatted (CI will flag)"
+            fi
+
             title=$(sed -n 's/^BLOG_PR_TITLE:[[:space:]]*//p' "/tmp/drafter_out_${i}.txt" | head -n1)
             [ -z "$title" ] && title="add feature blog: ${headline}"
 
