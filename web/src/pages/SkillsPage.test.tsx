@@ -1,10 +1,10 @@
 // Tests for the Skills page (`/skills`) — the harness-neutral cross-harness
 // Skill Registry catalog rendered as a master-detail.
 //
-// The page composes three data seams (catalog list, per-skill detail, trust
-// setting), so we mock the API module `@/lib/skillsApi` and let the real
-// `useSkills` TanStack Query hooks + the real page run. This exercises the
-// projected browser shapes and the include-other-tools gate without a server.
+// The page composes catalog-list + per-skill-detail + file seams, so we mock
+// the API module `@/lib/skillsApi` and let the real `useSkills` TanStack Query
+// hooks + the real page run. The page is a GLOBAL INVENTORY: it always browses
+// all sources and never reads/mutates the persisted execution-trust setting.
 
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
@@ -17,10 +17,11 @@ vi.mock("@/lib/skillsApi", async (importActual) => ({
   ...(await importActual<typeof import("@/lib/skillsApi")>()),
   getSkillCatalog: vi.fn(),
   getSkillDetail: vi.fn(),
-  getSkillTrust: vi.fn(),
-  setSkillTrust: vi.fn(),
   getSkillFileTree: vi.fn(),
   getSkillFile: vi.fn(),
+  // Spied so tests can assert the page NEVER reads/writes execution trust.
+  getSkillTrust: vi.fn(),
+  setSkillTrust: vi.fn(),
 }));
 
 // Keep the real query hooks; override only the session resolver so the tests
@@ -119,8 +120,6 @@ function renderPage() {
 beforeEach(() => {
   vi.clearAllMocks();
   activeSession.mockReturnValue("sess_active");
-  vi.mocked(skillsApi.getSkillTrust).mockResolvedValue(false);
-  vi.mocked(skillsApi.setSkillTrust).mockImplementation(async (v) => v);
   vi.mocked(skillsApi.getSkillDetail).mockImplementation(async (id) => {
     // Derive origin + a matching display path from the canonical-id prefix so
     // the default detail matches the summary the catalog fixtures use
@@ -168,21 +167,40 @@ describe("SkillsPage", () => {
     expect(screen.getByText("A running session is required")).toBeInTheDocument();
     // No bound session → the session-scoped catalog is never queried.
     expect(skillsApi.getSkillCatalog).not.toHaveBeenCalled();
-    // The trust switch is disabled with no session to widen.
-    expect(screen.getByTestId("include-other-tools")).toBeDisabled();
   });
 
-  it("queries the catalog scoped to the active session", async () => {
+  it("has no visibility toggle and never reads/writes execution trust", async () => {
     vi.mocked(skillsApi.getSkillCatalog).mockResolvedValue({
       skills: [BUILTIN],
-      includeOtherTools: false,
+      includeOtherTools: true,
       hiddenCount: 0,
     });
 
     renderPage();
     await screen.findByTestId("skill-row-ship");
 
-    expect(skillsApi.getSkillCatalog).toHaveBeenCalledWith("sess_active", false);
+    // The "Include skills from other tools" switch + copy are gone.
+    expect(screen.queryByTestId("include-other-tools")).toBeNull();
+    expect(screen.queryByText(/Include skills from other tools/i)).toBeNull();
+    expect(screen.queryByText(/Off by default/i)).toBeNull();
+    // The page never touches the persisted execution-trust setting.
+    expect(skillsApi.getSkillTrust).not.toHaveBeenCalled();
+    expect(skillsApi.setSkillTrust).not.toHaveBeenCalled();
+  });
+
+  it("always browses the all-source (global) catalog for the active session", async () => {
+    vi.mocked(skillsApi.getSkillCatalog).mockResolvedValue({
+      skills: [BUILTIN],
+      includeOtherTools: true,
+      hiddenCount: 0,
+    });
+
+    renderPage();
+    await screen.findByTestId("skill-row-ship");
+
+    // include_other_tools is forced true — the global inventory, not the
+    // narrowed current-session view.
+    expect(skillsApi.getSkillCatalog).toHaveBeenCalledWith("sess_active", true);
   });
 
   it("renders a flat, harness-neutral list with NO source/scope section headings", async () => {
@@ -333,35 +351,6 @@ describe("SkillsPage", () => {
         "workspace:test-generator",
       );
     });
-  });
-
-  it("toggling include-other-tools persists the trust setting and refetches", async () => {
-    // Off: 3 skills, one hidden. On: 4 skills, none hidden.
-    vi.mocked(skillsApi.getSkillCatalog).mockImplementation(async (_sessionId, include) =>
-      include
-        ? {
-            skills: [BUILTIN, WORKSPACE, PERSONAL_NATIVE, PERSONAL_OTHER],
-            includeOtherTools: true,
-            hiddenCount: 0,
-          }
-        : {
-            skills: [BUILTIN, WORKSPACE, PERSONAL_NATIVE],
-            includeOtherTools: false,
-            hiddenCount: 1,
-          },
-    );
-
-    renderPage();
-    await screen.findByTestId("skill-row-ship");
-    expect(screen.queryByTestId("skill-row-migrate")).toBeNull();
-
-    fireEvent.click(screen.getByTestId("include-other-tools"));
-
-    // The other-tool skill appears and the trust setting is persisted.
-    expect(await screen.findByTestId("skill-row-migrate")).toBeInTheDocument();
-    // useMutation invokes mutationFn as (variable, context); assert the first arg.
-    expect(vi.mocked(skillsApi.setSkillTrust).mock.calls[0][0]).toBe(true);
-    expect(skillsApi.getSkillCatalog).toHaveBeenCalledWith("sess_active", true);
   });
 
   it("filters the list by search query", async () => {
@@ -519,7 +508,7 @@ describe("SkillsPage — left sidebar file explorer", () => {
     renderWithTwoSkills();
     // `ship` auto-selects first → its tree shows; the tree fetch is scoped to it.
     await waitFor(() =>
-      expect(skillsApi.getSkillFileTree).toHaveBeenCalledWith("bundle:ship", "sess_active", false),
+      expect(skillsApi.getSkillFileTree).toHaveBeenCalledWith("bundle:ship", "sess_active", true),
     );
     expect(await screen.findByTestId("skill-file-SKILL.md")).toBeInTheDocument();
     expect(screen.getByTestId("skill-file-dir-references")).toBeInTheDocument();
@@ -573,13 +562,13 @@ describe("SkillsPage — left sidebar file explorer", () => {
         "bundle:ship",
         "references/guide.md",
         "sess_active",
-        false,
+        true,
       ),
     );
     // Preview renders in the right detail pane.
-    const detail = await screen.findByTestId("skill-detail");
-    expect(detail).toHaveAttribute("data-selected-file", "references/guide.md");
-    expect(within(detail).getByText("Hello preview")).toBeInTheDocument();
+    const detailPane = await screen.findByTestId("skill-detail");
+    expect(detailPane).toHaveAttribute("data-selected-file", "references/guide.md");
+    expect(within(detailPane).getByText("Hello preview")).toBeInTheDocument();
     // Exactly one file tree exists (the left one) — no duplicate right-pane tree.
     expect(screen.getAllByTestId("skill-files")).toHaveLength(1);
   });
@@ -598,8 +587,8 @@ describe("SkillsPage — left sidebar file explorer", () => {
 
     renderWithTwoSkills();
     fireEvent.click(await screen.findByTestId("skill-file-references/guide.md"));
-    const detail = await screen.findByTestId("skill-detail");
-    await waitFor(() => expect(detail).toHaveAttribute("data-selected-file"));
+    const detailPane = await screen.findByTestId("skill-detail");
+    await waitFor(() => expect(detailPane).toHaveAttribute("data-selected-file"));
 
     // Clicking the skill row again clears the file selection → overview returns.
     fireEvent.click(screen.getByTestId("skill-row-ship"));
@@ -685,7 +674,7 @@ describe("SkillsPage — left sidebar file explorer", () => {
     fireEvent.click(await screen.findByTestId("skill-file-references/guide.md"));
 
     expect(await screen.findByText(/Couldn't load references\/guide\.md/)).toBeInTheDocument();
-    const detail = screen.getByTestId("skill-detail");
-    expect(within(detail).getByRole("button", { name: "Try again" })).toBeInTheDocument();
+    const detailPane = screen.getByTestId("skill-detail");
+    expect(within(detailPane).getByRole("button", { name: "Try again" })).toBeInTheDocument();
   });
 });

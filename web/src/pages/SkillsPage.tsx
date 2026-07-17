@@ -45,16 +45,13 @@ import {
   SparklesIcon,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { Switch } from "@/components/ui/switch";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import {
   useActiveSkillSession,
   useSkillCatalog,
-  useSetSkillTrust,
   useSkillDetail,
   useSkillFile,
   useSkillFileTree,
-  useSkillTrust,
 } from "@/hooks/useSkills";
 import { Link } from "@/lib/routing";
 import { copyText } from "@/lib/clipboard";
@@ -158,23 +155,19 @@ function isMarkdownPath(path: string): boolean {
 }
 
 export function SkillsPage() {
-  // The include-other-tools switch. Seeded from the persisted trust setting
-  // once it loads, then owned locally so the toggle is instant.
-  const trustQuery = useSkillTrust();
-  const setTrust = useSetSkillTrust();
-  const [includeOtherTools, setIncludeOtherTools] = useState(false);
-  const [trustSeeded, setTrustSeeded] = useState(false);
-  useEffect(() => {
-    if (!trustSeeded && trustQuery.data !== undefined) {
-      setIncludeOtherTools(trustQuery.data);
-      setTrustSeeded(true);
-    }
-  }, [trustSeeded, trustQuery.data]);
+  // The Skills page is a GLOBAL INVENTORY: it always browses every discovered
+  // local tool/harness source, so all catalog/detail/file requests use the
+  // all-source visibility context. This is a BROWSE concern only — it never
+  // reads or mutates the persisted `/v1/skills/trust` execution-trust setting,
+  // which continues to gate what a session auto-loads/executes. The optional
+  // Source filter provides narrowing; a skill the current session can't use is
+  // surfaced via availability metadata, never hidden from the catalog.
+  const ALL_SOURCE_BROWSE = true;
 
   // The catalog is scoped to a bound session (bundle/workspace/provider skills
   // resolve on that session's runner). Resolve it before querying.
   const sessionId = useActiveSkillSession();
-  const catalogQuery = useSkillCatalog(sessionId, includeOtherTools);
+  const catalogQuery = useSkillCatalog(sessionId, ALL_SOURCE_BROWSE);
   const [query, setQuery] = useState("");
   const [sourceFilter, setSourceFilter] = useState<string>(ALL_SOURCES);
   // Selection model for the left tree:
@@ -225,12 +218,6 @@ export function SkillsPage() {
     }
   }, [shown, selectedId, selectedFile]);
 
-  const handleToggleInclude = () => {
-    const next = !includeOtherTools;
-    setIncludeOtherTools(next);
-    setTrust.mutate(next);
-  };
-
   // Click a skill row: select it (its tree shows inline beneath the row) and
   // drop any file selection so the right pane returns to the skill overview.
   // Selecting a different skill moves the open tree to it — there is no separate
@@ -252,14 +239,7 @@ export function SkillsPage() {
       className="flex min-h-0 w-full flex-1 flex-col"
       style={{ paddingTop: "var(--omnigent-header-height)" }}
     >
-      <SkillsHeader
-        includeOtherTools={includeOtherTools}
-        onToggleInclude={handleToggleInclude}
-        hiddenCount={catalogQuery.data?.hiddenCount ?? 0}
-        // The trust switch acts on a session's catalog; disable it with no
-        // bound session (there's nothing to widen).
-        disabled={sessionId === null}
-      />
+      <SkillsHeader />
       {sessionId === null ? (
         <NoSessionEmptyState />
       ) : (
@@ -277,7 +257,7 @@ export function SkillsPage() {
             onSelectSkill={handleSelectSkill}
             onSelectFile={handleSelectFile}
             sessionId={sessionId}
-            includeOtherTools={includeOtherTools}
+            includeOtherTools={ALL_SOURCE_BROWSE}
             loading={catalogQuery.isLoading}
             error={catalogQuery.isError}
             onRetry={() => void catalogQuery.refetch()}
@@ -285,7 +265,7 @@ export function SkillsPage() {
           <SkillDetailPane
             skillId={selectedId}
             sessionId={sessionId}
-            includeOtherTools={includeOtherTools}
+            includeOtherTools={ALL_SOURCE_BROWSE}
             selectedFile={selectedFile}
           />
         </div>
@@ -320,45 +300,17 @@ function NoSessionEmptyState() {
 
 // ── Header ────────────────────────────────────────────────────────────────────
 
-function SkillsHeader({
-  includeOtherTools,
-  onToggleInclude,
-  hiddenCount,
-  disabled,
-}: {
-  includeOtherTools: boolean;
-  onToggleInclude: () => void;
-  hiddenCount: number;
-  disabled?: boolean;
-}) {
+function SkillsHeader() {
+  // The page is a global inventory — no visibility toggle. It always shows every
+  // discovered source; the Source filter (in the list) does optional narrowing.
   return (
     <header className="flex shrink-0 items-center gap-5 border-b border-border px-5 py-3">
       <div className="min-w-0">
         <h1 className="font-heading text-lg font-semibold leading-tight tracking-tight">Skills</h1>
         <p className="mt-0.5 truncate text-xs text-muted-foreground">
-          Reusable instructions your agents run — available automatically wherever you work.
+          Every skill discovered across your tools — available automatically wherever you work.
         </p>
       </div>
-      <div className="flex-1" />
-      <label className="flex max-w-xs shrink-0 items-center gap-3">
-        <span className="text-right">
-          <span className="block text-[12.5px] font-semibold leading-tight">
-            Include skills from other tools
-          </span>
-          <span className="mt-0.5 block text-[11px] leading-tight text-muted-foreground">
-            {includeOtherTools && hiddenCount === 0
-              ? "Skills from other tools are included."
-              : "Off by default. Review unfamiliar ones first."}
-          </span>
-        </span>
-        <Switch
-          checked={includeOtherTools}
-          onCheckedChange={onToggleInclude}
-          disabled={disabled}
-          aria-label="Include skills from other tools"
-          data-testid="include-other-tools"
-        />
-      </label>
     </header>
   );
 }
