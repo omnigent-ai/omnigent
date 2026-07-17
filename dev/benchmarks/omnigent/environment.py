@@ -29,6 +29,7 @@ import socket
 import subprocess
 import sys
 import tarfile
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -161,6 +162,9 @@ class BenchEnvironment:
         self._runner_base_env: dict[str, str] = {}
         self._log_handles: list[IO[bytes]] = []
         self._agent_cache: dict[str, str] = {}
+        self._resource_samples: list[dict[str, float]] = []
+        self._sampler_stop: threading.Event = threading.Event()
+        self._sampler_thread: threading.Thread | None = None
 
     # ── lifecycle ────────────────────────────────────────────
 
@@ -171,6 +175,9 @@ class BenchEnvironment:
             timeout=300.0,
             headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
         )
+        # Start background resource sampler (server CPU + memory).
+        self._sampler_thread = threading.Thread(target=self._sample_resources, daemon=True)
+        self._sampler_thread.start()
         if self.with_runner:
             # ALLOW fallback so a server-side classifier call resolves against
             # the mock (never api.openai.com) and returns a valid verdict.
@@ -182,6 +189,9 @@ class BenchEnvironment:
     async def __aexit__(self, *exc: object) -> None:
         if self.client is not None:
             await self.client.aclose()
+        self._sampler_stop.set()
+        if self._sampler_thread is not None:
+            self._sampler_thread.join(timeout=5)
         await asyncio.to_thread(self._stop)
 
     def _start(self) -> None:
@@ -246,6 +256,63 @@ class BenchEnvironment:
         import shutil
 
         shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _sample_resources(self, interval: float = 1.0) -> None:
+        """Sample the server process's CPU and RSS memory at *interval*-second intervals.
+
+        Runs in a daemon thread; exits when ``_sampler_stop`` is set or the
+        process terminates. The first ``cpu_percent`` call always returns 0.0
+        (psutil baseline) — we discard it so only real measurements accumulate.
+        """
+        try:
+            import psutil
+        except ImportError:
+            return
+        if self._server_proc is None:
+            return
+        try:
+            proc = psutil.Process(self._server_proc.pid)
+            proc.cpu_percent()  # baseline; discard
+        except psutil.NoSuchProcess:
+            return
+        while not self._sampler_stop.is_set():
+            try:
+                cpu = proc.cpu_percent()
+                mem = proc.memory_info().rss
+                self._resource_samples.append({"cpu_pct": cpu, "rss_bytes": mem})
+            except psutil.NoSuchProcess:
+                break
+            self._sampler_stop.wait(timeout=interval)
+
+    @property
+    def resource_usage(self) -> dict[str, object]:
+        """Summarise sampled CPU% and RSS across the benchmark run.
+
+        :returns: A dict with ``cpu_pct`` and ``rss_bytes`` sub-dicts each
+            containing ``mean``, ``min``, ``max``, ``samples``. Empty dicts
+            when no samples were collected (psutil unavailable or server never
+            started).
+        """
+        if not self._resource_samples:
+            return {"cpu_pct": {}, "rss_bytes": {}}
+        cpu = [s["cpu_pct"] for s in self._resource_samples]
+        rss = [s["rss_bytes"] for s in self._resource_samples]
+        import statistics as _stats
+
+        return {
+            "cpu_pct": {
+                "mean": _stats.mean(cpu),
+                "min": min(cpu),
+                "max": max(cpu),
+                "samples": len(cpu),
+            },
+            "rss_bytes": {
+                "mean": _stats.mean(rss),
+                "min": min(rss),
+                "max": max(rss),
+                "samples": len(rss),
+            },
+        }
 
     # ── spawns ───────────────────────────────────────────────
 
