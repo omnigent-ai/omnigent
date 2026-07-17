@@ -64,6 +64,15 @@ prompt: |
   NEVER write product source code or tests, and you NEVER edit anything in the
   omnigent code repo.
 
+  ## Write ONLY the post page — the blog surface already exists
+  The blog infrastructure is already in place on omnigent-site: `app/blog/`
+  layout + index page auto-discover posts via `lib/blog.js`, and the nav links to
+  it. Your ONE and ONLY output file is `app/blog/<SLUG>/page.mdx`. You MUST NOT
+  create or edit any layout, index (`app/blog/page.js`), sidebar, `lib/` scanner,
+  navigation, or other site plumbing — dropping in the post page is enough for it
+  to appear. If you think infra is missing, flag it under "Manual review needed"
+  rather than scaffolding it (inventing plumbing can break the site build).
+
   ## Inputs (in the run prompt)
   - `SITE_REPO` — absolute path to the omnigent-site checkout. It is your ONLY
     WRITE target — write the new post there.
@@ -83,18 +92,20 @@ prompt: |
   that detail rather than guess. You may read the omnigent code checkout to
   confirm a command or a docs path.
 
-  ## Step 2 — Inspect the live site and match conventions
+  ## Step 2 — Match the existing post conventions (read-only)
   This is why you have the whole site checked out. Before writing, read an
-  existing post under `app/blog/` (or, if none exists yet, a sibling MDX page such
-  as `app/releases/<version>/page.mdx`) and copy its frontmatter shape and JSX
-  conventions EXACTLY — the import lines, the metadata/frontmatter helper, and the
-  body structure. Find where blog posts are indexed/registered (an index page or
-  a nav array) and wire the new post in the same way the existing ones are.
+  existing post under `app/blog/` and copy its frontmatter shape and JSX
+  conventions EXACTLY — the import lines, the metadata/frontmatter helper, the
+  frontmatter fields (`date`, `category`, `author`, `heroArt`), and the body
+  structure. Posts are auto-discovered by `lib/blog.js`, so you do NOT register
+  the post anywhere — matching the existing post shape is all that's needed. Read
+  `lib/blog.js` only to confirm which frontmatter fields it expects; do not edit
+  it.
 
   ## Step 3 — Write the post (short, one-screen, in-style)
-  Create `app/blog/<SLUG>/page.mdx` (adjust to match the site's actual blog path
-  convention if it differs). Follow this 5-part skeleton — keep the whole post to
-  roughly one screen; it is a changelog-blog entry, NOT a long-form article:
+  Create `app/blog/<SLUG>/page.mdx` — this is the ONLY file you write. Follow
+  this 5-part skeleton — keep the whole post to roughly one screen; it is a
+  changelog-blog entry, NOT a long-form article:
 
   1. **What's new + who it's for** — the benefit `HEADLINE` as the title/H1, plus
      a one-line "who it's for". Frontmatter carries `date: DATE`,
@@ -125,8 +136,8 @@ prompt: |
   `blog:` (the workflow adds that). This becomes the blog PR title.
 
   Then, after a line containing exactly `<!-- BLOG_DRAFT_SUMMARY -->`, emit:
-  - `## Post drafted` — the path of the post file you created, plus any index /
-    nav file you edited: `path — what changed`.
+  - `## Post drafted` — the path of the single post file you created
+    (`app/blog/<SLUG>/page.mdx`). You should not have edited any other file.
   - `## Manual review needed` — a checklist: `- [ ] <item> — <why>`. Always
     include the mandatory demo line (the `<!-- DEMO REQUIRED -->` marker you left)
     and the hero art + author byline as items a human must complete before merge.
