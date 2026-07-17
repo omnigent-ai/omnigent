@@ -202,7 +202,9 @@ class SlackOmnigentService:
             )
             return
 
-        self._logger.info("Accepted Slack app_mention thread=%s chars=%s", key.display(), len(text))
+        self._logger.info(
+            "Accepted Slack app_mention thread=%s chars=%s", key.display(), len(text)
+        )
         await self._route_turn(
             key=key,
             event=event,
@@ -371,7 +373,9 @@ class SlackOmnigentService:
                     host_id=turn.host_id,
                 )
             except AuthRequiredError:
-                self._logger.info("Auth required thread=%s; prompting re-login", turn.key.display())
+                self._logger.info(
+                    "Auth required thread=%s; prompting re-login", turn.key.display()
+                )
                 await self._clear_ack(turn.slack_client, turn.key, ack_ts)
                 await self._post_reply(turn.slack_client, turn.key, _AUTH_REQUIRED_TEXT)
                 return
@@ -506,7 +510,7 @@ class SlackOmnigentService:
         ack_ts = None
 
         self._logger.info(
-            "Completed Slack turn thread=%s session_id=%s streamed_chars=%s segments=%s errored=%s",
+            "Completed Slack turn thread=%s session=%s streamed_chars=%s segments=%s errored=%s",
             turn.key.display(),
             session_id,
             len(streamed_text),

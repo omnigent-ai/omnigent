@@ -286,7 +286,9 @@ class OmnigentClient:
             if _is_host_online(host) and (host_id := _host_id(host)) is not None
         ]
         if not host_ids:
-            raise HostUnavailableError("No online Omnigent hosts are available to launch a runner.")
+            raise HostUnavailableError(
+                "No online Omnigent hosts are available to launch a runner."
+            )
         host_id = random.choice(host_ids)
         self._logger.info(
             "Selected random Omnigent host host_id=%s candidates=%s",
@@ -606,7 +608,9 @@ def extract_assistant_text(event_or_item: dict[str, Any]) -> str | None:
     return "".join(parts).strip() or None
 
 
-def _decode_sse_event(event_name: str | None, data_lines: list[str]) -> dict[str, Any] | str | None:
+def _decode_sse_event(
+    event_name: str | None, data_lines: list[str]
+) -> dict[str, Any] | str | None:
     if not data_lines:
         return None
     data = "\n".join(data_lines)

@@ -2,7 +2,6 @@ from collections.abc import AsyncIterator
 
 import httpx
 import respx
-
 from omnigent_slack.omnigent import (
     AuthRequiredError,
     HostUnavailableError,

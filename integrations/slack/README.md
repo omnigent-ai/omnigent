@@ -10,10 +10,8 @@ Omnigent identity against it.
 
 1. Create a Slack app with Socket Mode **and** Interactivity enabled (Socket
   Mode delivers the interactive button/modal payloads — no request URL needed).
-2. Add bot scopes for `app_mentions:read`, `chat:write`, `im:write` (to DM users
-  the setup button), `commands` (for the `/omnigent` slash command),
-   `team:read` (to label the login request with the workspace name), and the
-   history scopes for the channel types where the bot will run.
+2. Add the OAuth scopes and event subscriptions listed under **Required scopes**
+   below.
 3. Add a slash command `/omnigent` (Features → Slash Commands). In Socket Mode
   the request URL is ignored, so any placeholder works.
 4. Install the app into the workspace.
@@ -23,6 +21,51 @@ Omnigent identity against it.
    `OMNIGENT_DEVICE_CLIENT_SECRET`, set the same value here so the bot is
    accepted as an authorized device-grant client.
 6. Run the bot — see **Running the bot** below.
+
+## Required scopes
+
+The bot uses two tokens, each carrying different scopes.
+
+### Bot token scopes (`OMNIGENT_SLACK_BOT_TOKEN`, `xoxb-…`)
+
+Add these under **OAuth & Permissions → Scopes → Bot Token Scopes**. All are
+required for the bot's core behaviour:
+
+| Scope | Why it's needed |
+| --- | --- |
+| `app_mentions:read` | Receive `app_mention` events — the only way the bot joins a channel thread. |
+| `chat:write` | Post, delete, and stream replies (`chat.postMessage`, `chat.delete`, `chat.startStream`), including ephemeral setup nudges (`chat.postEphemeral`). |
+| `im:write` | Open a DM with the user (`conversations.open`) to send the setup button and logout confirmation. |
+| `im:history` | Read direct messages. DMs are a first-class entry point and do **not** fire `app_mention`, so without this the bot can't respond in DMs. |
+| `commands` | Register and receive the `/omnigent` slash command. |
+| `team:read` | Read the workspace name (`team.info`) to label the delegated-login request. |
+
+**Channel history — add per channel type where the bot will run.** These back
+the plain-`message` event; add only the ones matching where you'll use the bot:
+
+| Scope | Channel type |
+| --- | --- |
+| `channels:history` | Public channels |
+| `groups:history` | Private channels |
+| `mpim:history` | Group DMs |
+
+If you only use the bot via DMs and channel `@mention`s, `im:history` alone is
+enough and the three channel-history scopes can be omitted.
+
+### App-level token scope (`OMNIGENT_SLACK_APP_TOKEN`, `xapp-…`)
+
+| Scope | Why it's needed |
+| --- | --- |
+| `connections:write` | Open the Socket Mode connection. Socket Mode fails to connect without it. |
+
+### Event subscriptions
+
+Under **Event Subscriptions → Subscribe to bot events**, add:
+
+- `app_mention`
+- `message.im` (DMs)
+- `message.channels` / `message.groups` / `message.mpim` — only for the channel
+  types whose history scope you added above.
 
 
 
@@ -56,10 +99,10 @@ uv pip install "omnigent[slack]"     # or, from a source checkout: uv sync --ext
 ```
 
 If it isn't installed, the command prints this hint. From a source checkout you
-can also run the entry point directly, without the `omni` CLI:
+can also run the bot module directly, without the `omni` CLI:
 
 ```bash
-uv run omnigent-slack
+uv run python -m omnigent_slack
 ```
 
 Set `LOG_LEVEL=DEBUG` in `.env` when diagnosing why Slack events are not producing replies.
@@ -180,33 +223,14 @@ user is not added to that session.
 ## Development
 
 This integration is a **separate package** (`omnigent-slack`) with heavy deps
-(slack_bolt, aiohttp) kept out of the core `omnigent` install. Working on the
-integration in isolation uses its own env:
+(slack_bolt, aiohttp) kept out of the core `omnigent` install. It resolves as an
+editable path dep of the root `omnigent` package via the `slack` extra (see
+`[tool.uv.sources]` in the root `pyproject.toml`), and shares the root's dev
+tooling (ruff, mypy, pytest) and config rather than carrying its own. Work on it
+from the repo-root env:
 
 ```bash
-# From integrations/slack/ — the integration's own env (slack_bolt, etc.):
-uv run pytest
-uv run ruff check
-uv run mypy src
-uv run omnigent-slack   # run the bot directly
+# From the repo root — add the slack extra to your existing extras:
+uv sync --extra slack       # e.g. --extra all --extra dev --extra slack
+uv run omni integration slack
 ```
-
-To drive the bot through the `omni integration slack` CLI, install it **into the
-same environment as** `omni` via the `slack` extra — the CLI shells out to
-`python -m omnigent_slack` and only finds it on the `omni` interpreter's path.
-In a source checkout the extra resolves `omnigent-slack` from
-`integrations/slack` as an editable path dep (see `[tool.uv.sources]` in the
-root `pyproject.toml`):
-
-```bash
-# From the repo root (the omnigent core env):
-uv sync --extra slack       # add to your existing extras, e.g. --extra all --extra dev --extra slack
-
-# Then, from anywhere:
-omni integration slack status
-omni integration slack start
-```
-
-Without the extra, `omni integration slack …` prints an install hint rather  
-than launching. The editable path dep means source edits are picked up on the  
-next daemon (re)start — no reinstall needed.

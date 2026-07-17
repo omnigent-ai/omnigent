@@ -148,7 +148,9 @@ class EncryptedTokenStore:
             out.append(
                 (
                     str(row[0]),
-                    TokenRecord(access_token=access, refresh_token=refresh, updated_at=int(row[3])),
+                    TokenRecord(
+                        access_token=access, refresh_token=refresh, updated_at=int(row[3])
+                    ),
                 )
             )
         return out

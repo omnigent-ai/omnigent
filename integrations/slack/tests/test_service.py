@@ -3,9 +3,6 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
-from slack_sdk.errors import SlackApiError
-from slack_sdk.web.async_slack_response import AsyncSlackResponse
-
 from omnigent_slack.models import ThreadKey, UserConfig
 from omnigent_slack.omnigent import (
     AuthRequiredError,
@@ -15,6 +12,8 @@ from omnigent_slack.omnigent import (
 )
 from omnigent_slack.service import SlackOmnigentService
 from omnigent_slack.store import SQLiteStore
+from slack_sdk.errors import SlackApiError
+from slack_sdk.web.async_slack_response import AsyncSlackResponse
 
 
 class FakeStream:
