@@ -23,7 +23,9 @@ def append_framework_instructions(
 
     Keeps framework policy out of harness adapters while preserving a single
     ordering rule: user-authored agent/request instructions first, framework
-    metadata instructions last.
+    metadata instructions last. If framework instructions grow beyond a small
+    ordered string list, introduce a structured ``FrameworkInstructions`` value
+    here rather than adding lifecycle policy to ``AgentSpec`` or harness adapters.
 
     :param instructions: Existing composed system prompt, or ``None``.
     :param framework_instructions: Additive framework instructions.
