@@ -509,6 +509,105 @@ def test_ucode_config_for_profile_defaults_model_when_ucode_omits_it(
     assert config.model == "databricks-claude-opus-4-8"
 
 
+def test_ucode_config_for_profile_provider_models_override_tiers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    Provider-config ``models:`` tiers outrank ucode ``claude_models``.
+
+    A per-tier override on the profile's ``kind: databricks`` provider
+    entry wins for its tier (opus) and for the launch default, while a
+    tier the config leaves unset (sonnet) still resolves from ucode state
+    — config > ucode > hardcoded default, per tier.
+    """
+    from omnigent.onboarding.ucode_state import UcodeAgentState, UcodeWorkspaceState
+
+    (tmp_path / "config.yaml").write_text(
+        "providers:\n"
+        "  databricks:\n"
+        "    kind: databricks\n"
+        "    profile: test-profile\n"
+        "    models:\n"
+        "      default: main.agents.opus-endpoint\n"
+        "      opus: main.agents.opus-endpoint\n"
+    )
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    workspace_state = UcodeWorkspaceState(
+        workspace_url="https://example.databricks.com",
+        claude_models={
+            "opus": "databricks-claude-opus-4-7",
+            "sonnet": "databricks-claude-sonnet-4-6",
+        },
+        agents={
+            "claude": UcodeAgentState(
+                model="databricks-claude-opus-4-7",
+                base_url="https://example.databricks.com/ai-gateway/anthropic",
+                auth_command="printf token",
+            )
+        },
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.databricks_config.get_workspace_url_for_profile",
+        lambda profile: "https://example.databricks.com",
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.ucode_state.read_ucode_state",
+        lambda workspace_url: workspace_state,
+    )
+
+    config = claude_native._ucode_config_for_profile("test-profile")
+
+    assert config is not None
+    # The overridden tier and the launch default come from the provider config.
+    assert config.env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "main.agents.opus-endpoint"
+    assert config.model == "main.agents.opus-endpoint"
+    # A tier the config leaves unset still resolves from ucode state.
+    assert config.env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "databricks-claude-sonnet-4-6"
+
+
+def test_ucode_config_for_profile_without_provider_models_is_unchanged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    Regression guard: a databricks entry without ``models:`` changes nothing.
+
+    With the profile's provider entry declaring no ``models:`` map, the
+    tier env vars and the launch model must resolve exactly as before the
+    override existed (ucode ``claude_models`` + the per-agent model).
+    """
+    from omnigent.onboarding.ucode_state import UcodeAgentState, UcodeWorkspaceState
+
+    (tmp_path / "config.yaml").write_text(
+        "providers:\n  databricks:\n    kind: databricks\n    profile: test-profile\n"
+    )
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    workspace_state = UcodeWorkspaceState(
+        workspace_url="https://example.databricks.com",
+        claude_models={"opus": "databricks-claude-opus-4-7"},
+        agents={
+            "claude": UcodeAgentState(
+                model="databricks-claude-opus-4-7",
+                base_url="https://example.databricks.com/ai-gateway/anthropic",
+                auth_command="printf token",
+            )
+        },
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.databricks_config.get_workspace_url_for_profile",
+        lambda profile: "https://example.databricks.com",
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.ucode_state.read_ucode_state",
+        lambda workspace_url: workspace_state,
+    )
+
+    config = claude_native._ucode_config_for_profile("test-profile")
+
+    assert config is not None
+    assert config.env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "databricks-claude-opus-4-7"
+    assert config.model == "databricks-claude-opus-4-7"
+
+
 def test_ucode_config_for_profile_fails_loud_on_malformed_claude_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

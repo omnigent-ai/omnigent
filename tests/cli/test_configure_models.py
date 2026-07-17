@@ -889,9 +889,9 @@ def test_remove_databricks_cleans_ucode_wiring_without_asking(isolated_config) -
     (codex_dir / "ucode.config.toml").write_text(
         'model_provider = "ucode-databricks"\n', encoding="utf-8"
     )
-    # L1 1=Claude → L2 1=select databricks → L3 2=Remove (acts immediately)
-    # → L2 q → L1 q.
-    stdin = "\n".join(["1", "1", "2", "q", "q"]) + "\n"
+    # L1 1=Claude → L2 1=select databricks → L3 (1=Make default, 2=Choose
+    # model endpoints) 3=Remove (acts immediately) → L2 q → L1 q.
+    stdin = "\n".join(["1", "1", "3", "q", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
     assert result.exit_code == 0, result.output
     cfg = _config_yaml(isolated_config)
@@ -917,8 +917,9 @@ def test_remove_databricks_without_ucode_wiring_still_removes(isolated_config) -
     entry removal.
     """
     _write_databricks_provider(isolated_config)
-    # L1 1=Claude → L2 1=select databricks → L3 2=Remove → L2 q → L1 q.
-    stdin = "\n".join(["1", "1", "2", "q", "q"]) + "\n"
+    # L1 1=Claude → L2 1=select databricks → L3 3=Remove (after Make default
+    # and Choose model endpoints) → L2 q → L1 q.
+    stdin = "\n".join(["1", "1", "3", "q", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
     assert result.exit_code == 0, result.output
     cfg = _config_yaml(isolated_config)
@@ -1403,8 +1404,9 @@ def test_configure_harnesses_add_databricks_normalizes_url_and_persists(
 
     db = _databricks_add_menu_index()
     # L1 1=Claude → L2 1=+Add → add menu <db>=Databricks → workspace URL (no
-    # scheme + trailing slash, to exercise normalization) → L2 q=back → L1 q=exit.
-    stdin = "\n".join(["1", "1", str(db), "example.cloud.databricks.com/", "q", "q"]) + "\n"
+    # scheme + trailing slash, to exercise normalization) → endpoints
+    # 1=workspace defaults → L2 q=back → L1 q=exit.
+    stdin = "\n".join(["1", "1", str(db), "example.cloud.databricks.com/", "1", "q", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
     assert result.exit_code == 0, result.output
 
@@ -1497,8 +1499,10 @@ def test_configure_harnesses_add_databricks_under_codex_scopes_to_codex(
     # Databricks position within the Codex (openai) add menu, computed live.
     codex_opts = add_menu_options_for_family(OPENAI_FAMILY)
     db = next(i for i, o in enumerate(codex_opts) if o.kind == DATABRICKS_KIND) + 1
-    # L1 2=Codex → L2 1=+Add → add menu <db>=Databricks → URL → q → q.
-    stdin = "\n".join(["2", "1", str(db), "https://example.cloud.databricks.com", "q", "q"]) + "\n"
+    # L1 2=Codex → L2 1=+Add → add menu <db>=Databricks → URL → q → q. No
+    # endpoint gate on the Codex page: the models: map never feeds codex.
+    inputs = ["2", "1", str(db), "https://example.cloud.databricks.com", "q", "q"]
+    stdin = "\n".join(inputs) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
     assert result.exit_code == 0, result.output
 
@@ -1506,6 +1510,304 @@ def test_configure_harnesses_add_databricks_under_codex_scopes_to_codex(
     cfg = _config_yaml(isolated_config)
     assert get_default_provider(cfg, "openai").name == "databricks"
     assert get_default_provider(cfg, "anthropic") is None
+
+
+# ── Databricks per-tier model endpoint picker ────────────────────────────────
+
+
+def _stub_databricks_add_boundaries(monkeypatch) -> None:
+    """Stub the databricks add branch's shell-out boundaries.
+
+    Same three stubs as the add-flow tests above (login → profile ``my-ws``,
+    ucode configure → no-op, ucode state exists → True), for tests focused on
+    the endpoint picker rather than the login/ucode wiring.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    monkeypatch.setattr(
+        "omnigent.onboarding.setup.login_databricks_workspace",
+        lambda url, *, console=None: "my-ws",
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.ucode_setup.configure_ucode_for_workspace",
+        lambda url, *, agents=None: None,
+    )
+    monkeypatch.setattr("omnigent.onboarding.ucode_setup.ucode_workspace_exists", lambda url: True)
+
+
+def test_add_databricks_with_custom_endpoints_writes_models_map(
+    isolated_config, monkeypatch
+) -> None:
+    """Choosing custom endpoints in the add flow writes the ``models:`` map.
+
+    Drives the add flow into the per-tier picker with a stubbed endpoint
+    listing: the ``default`` tier picks a listed serving endpoint, the
+    ``opus`` tier types a UC model service FQN via the free-text row, and
+    the ``sonnet`` / ``haiku`` tiers are skipped.
+    Asserts exactly those two tiers persist on the entry — the picker's
+    whole contract: it writes the ``models:`` map and nothing else.
+    """
+    _stub_databricks_add_boundaries(monkeypatch)
+    monkeypatch.setattr(
+        "omnigent.onboarding.databricks_config.list_claude_endpoints",
+        lambda profile: (["databricks-claude-opus-4-8", "databricks-claude-sonnet-4-6"], []),
+    )
+
+    db = _databricks_add_menu_index()
+    # L1 1=Claude → L2 1=+Add → <db>=Databricks → URL → endpoints 2=custom →
+    # default tier: 2=first listed endpoint (1=Skip) → opus tier: 4=free text
+    # (1=Skip, 2-3=endpoints) → FQN → sonnet tier: 1=Skip → haiku tier:
+    # 1=Skip → L2 q → L1 q.
+    stdin = (
+        "\n".join(
+            [
+                "1",
+                "1",
+                str(db),
+                "https://example.cloud.databricks.com",
+                "2",
+                "2",
+                "4",
+                "main.agents.my-opus-endpoint",
+                "1",
+                "1",
+                "q",
+                "q",
+            ]
+        )
+        + "\n"
+    )
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    assert result.exit_code == 0, result.output
+
+    cfg = _config_yaml(isolated_config)
+    # The picked 1M-family endpoint is auto-pinned with the [1m] suffix; the
+    # typed FQN stays verbatim (free text is never auto-pinned).
+    assert cfg["providers"]["databricks"] == {
+        "kind": "databricks",
+        "profile": "my-ws",
+        "models": {
+            "default": "databricks-claude-opus-4-8[1m]",
+            "opus": "main.agents.my-opus-endpoint",
+        },
+        "default": "anthropic",
+    }
+    # The entry round-trips through the parser with the overrides intact.
+    assert load_providers(cfg)["databricks"].models == {
+        "default": "databricks-claude-opus-4-8[1m]",
+        "opus": "main.agents.my-opus-endpoint",
+    }
+
+
+def test_add_databricks_default_endpoints_writes_no_models_key(
+    isolated_config, monkeypatch
+) -> None:
+    """Keeping the workspace defaults writes the pre-picker entry shape.
+
+    Regression guard: answering "Use the workspace defaults" at the add
+    flow's endpoint gate must persist an entry with NO ``models:`` key —
+    byte-for-byte what the add wrote before the picker existed — so ucode
+    state keeps driving the models.
+    """
+    _stub_databricks_add_boundaries(monkeypatch)
+
+    def _listing_must_not_run(profile: str) -> list[str]:
+        raise AssertionError("endpoint listing ran despite declining the picker")
+
+    monkeypatch.setattr(
+        "omnigent.onboarding.databricks_config.list_claude_endpoints",
+        _listing_must_not_run,
+    )
+
+    db = _databricks_add_menu_index()
+    # L1 1=Claude → L2 1=+Add → <db>=Databricks → URL → endpoints
+    # 1=workspace defaults → L2 q → L1 q.
+    stdin = "\n".join(["1", "1", str(db), "https://example.cloud.databricks.com", "1", "q", "q"])
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin + "\n")
+    assert result.exit_code == 0, result.output
+
+    cfg = _config_yaml(isolated_config)
+    assert cfg["providers"]["databricks"] == {
+        "kind": "databricks",
+        "profile": "my-ws",
+        "default": "anthropic",
+    }
+
+
+def test_manage_databricks_choose_endpoints_persists_models(isolated_config, monkeypatch) -> None:
+    """The credential menu's ``Choose model endpoints`` edits an existing entry.
+
+    Seeds a databricks provider, opens its level-3 menu, picks an endpoint
+    for the ``default`` tier and skips the rest (Esc via ``q``). The entry
+    must gain exactly that override while keeping its profile — and the
+    level-2 status line must confirm the write.
+    """
+    _write_databricks_provider(isolated_config)
+    monkeypatch.setattr(
+        "omnigent.onboarding.databricks_config.list_claude_endpoints",
+        lambda profile: (["databricks-claude-opus-4-8"], []),
+    )
+
+    # L1 1=Claude → L2 1=databricks → L3 2=Choose model endpoints → default
+    # tier: 2=listed endpoint (1=Skip; section headers are unnumbered) →
+    # opus: q=Esc exits the picker (sonnet never prompts) → L2 q → L1 q.
+    stdin = "\n".join(["1", "1", "2", "2", "q", "q", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    assert result.exit_code == 0, result.output
+
+    cfg = _config_yaml(isolated_config)
+    # Picked endpoints are auto-pinned at their max context window: opus-4-8
+    # is a 1M-family model, so the stored id carries Claude Code's [1m]
+    # long-context suffix.
+    assert cfg["providers"]["databricks"] == {
+        "kind": "databricks",
+        "profile": "myws",
+        "models": {"default": "databricks-claude-opus-4-8[1m]"},
+    }
+
+
+def test_manage_databricks_clear_override_drops_models_key(isolated_config, monkeypatch) -> None:
+    """Clearing the last override removes the ``models:`` key entirely.
+
+    Seeds an entry with one ``default`` override. In the picker that tier
+    now leads with ``Keep …`` and a ``Clear override`` row — choosing the
+    latter (and skipping the other tiers) must drop the whole ``models:``
+    key so the entry round-trips to its pre-override shape.
+    """
+    config_path = os.path.join(isolated_config, "config.yaml")
+    with open(config_path, "w") as f:
+        yaml.safe_dump(
+            {
+                "providers": {
+                    "databricks": {
+                        "kind": "databricks",
+                        "profile": "myws",
+                        "models": {"default": "main.agents.my-opus-endpoint"},
+                    }
+                }
+            },
+            f,
+        )
+    monkeypatch.setattr(
+        "omnigent.onboarding.databricks_config.list_claude_endpoints",
+        lambda profile: (["databricks-claude-opus-4-8"], []),
+    )
+
+    # L1 1=Claude → L2 1=databricks → L3 2=Choose model endpoints → default
+    # tier: 2=Clear override (1=Keep) → opus: q=Esc exits the picker → L2 q →
+    # L1 q.
+    stdin = "\n".join(["1", "1", "2", "2", "q", "q", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    assert result.exit_code == 0, result.output
+
+    cfg = _config_yaml(isolated_config)
+    assert cfg["providers"]["databricks"] == {"kind": "databricks", "profile": "myws"}
+
+
+def test_manage_databricks_pick_custom_uc_endpoint(isolated_config, monkeypatch) -> None:
+    """A Unity Catalog model service is pickable from the custom section.
+
+    The picker's second section lists the caller's Claude-capable UC model
+    services (Beta securables) so a custom endpoint no longer has to be
+    typed. Section headers are unnumbered in the fallback, so the custom
+    FQN is the third selectable row (Skip, hosted endpoint, FQN).
+    """
+    _write_databricks_provider(isolated_config)
+    monkeypatch.setattr(
+        "omnigent.onboarding.databricks_config.list_claude_endpoints",
+        lambda profile: (["databricks-claude-opus-4-8"], ["main.agents.my-opus-endpoint"]),
+    )
+
+    # L1 1=Claude → L2 1=databricks → L3 2=Choose model endpoints → default
+    # tier: 3=the UC model service (1=Skip, 2=hosted endpoint) → opus: q=Esc
+    # exits the picker → L2 q → L1 q.
+    stdin = "\n".join(["1", "1", "2", "3", "q", "q", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    assert result.exit_code == 0, result.output
+
+    cfg = _config_yaml(isolated_config)
+    assert cfg["providers"]["databricks"]["models"] == {"default": "main.agents.my-opus-endpoint"}
+
+
+def test_manage_databricks_esc_exits_picker_immediately(isolated_config, monkeypatch) -> None:
+    """Esc on the first tier leaves the picker at once — no forced tier cycle.
+
+    Esc must return to the credential screen without prompting the
+    remaining tiers. The stdin carries exactly enough input for an
+    immediate exit (one Esc + the two menu-level backs); if the picker
+    still cycled through opus/sonnet, those prompts would exhaust stdin
+    and the run would abort non-zero on EOF.
+    """
+    _write_databricks_provider(isolated_config)
+    monkeypatch.setattr(
+        "omnigent.onboarding.databricks_config.list_claude_endpoints",
+        lambda profile: (["databricks-claude-opus-4-8"], []),
+    )
+
+    # L1 1=Claude → L2 1=databricks → L3 2=Choose model endpoints → default
+    # tier: q=Esc exits the picker immediately → L2 q → L1 q.
+    stdin = "\n".join(["1", "1", "2", "q", "q", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    assert result.exit_code == 0, result.output
+
+    # Nothing changed — no models key was written.
+    cfg = _config_yaml(isolated_config)
+    assert cfg["providers"]["databricks"] == {"kind": "databricks", "profile": "myws"}
+
+
+def test_manage_databricks_200k_endpoint_not_pinned(isolated_config, monkeypatch) -> None:
+    """A 200K-family endpoint is stored without the ``[1m]`` suffix.
+
+    Auto-pinning applies only to 1M-capable model families; suffixing a
+    200K model (e.g. haiku-4-5) would make Claude Code assume a context
+    window the model does not have.
+    """
+    _write_databricks_provider(isolated_config)
+    monkeypatch.setattr(
+        "omnigent.onboarding.databricks_config.list_claude_endpoints",
+        lambda profile: (["databricks-claude-haiku-4-5"], []),
+    )
+
+    # L1 1=Claude → L2 1=databricks → L3 2=Choose model endpoints → default
+    # tier: 2=the haiku endpoint (1=Skip) → opus: q=Esc exits → L2 q → L1 q.
+    stdin = "\n".join(["1", "1", "2", "2", "q", "q", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    assert result.exit_code == 0, result.output
+
+    cfg = _config_yaml(isolated_config)
+    assert cfg["providers"]["databricks"]["models"] == {"default": "databricks-claude-haiku-4-5"}
+
+
+def test_manage_databricks_codex_page_offers_no_endpoint_picker(
+    isolated_config, monkeypatch
+) -> None:
+    """The Codex page's databricks credential menu has no endpoint picker.
+
+    The ``models:`` map feeds the gateway's Anthropic surface only — codex
+    resolves its models from ucode's ``codex_models`` — so offering Claude
+    endpoints under Codex would pin models codex cannot use. The L3 menu
+    must go straight from ``Make default`` to ``Remove``: selecting row 2
+    removes the provider (it would open the picker if the row leaked in,
+    tripping the raising listing stub and failing the removal assertion).
+    """
+    _write_databricks_provider(isolated_config)
+
+    def _listing_must_not_run(profile: str) -> tuple[list[str], list[str]]:
+        raise AssertionError("the endpoint picker ran from the Codex page")
+
+    monkeypatch.setattr(
+        "omnigent.onboarding.databricks_config.list_claude_endpoints",
+        _listing_must_not_run,
+    )
+
+    # L1 2=Codex → L2 1=databricks → L3 (1=Make default) 2=Remove → L2 q → L1 q.
+    stdin = "\n".join(["2", "1", "2", "q", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    assert result.exit_code == 0, result.output
+
+    assert "Choose model endpoints" not in result.output
+    cfg = _config_yaml(isolated_config)
+    assert "databricks" not in cfg.get("providers", {})
 
 
 def test_uninstalled_harness_shows_x_and_not_installed(isolated_config, monkeypatch) -> None:
@@ -2246,8 +2548,10 @@ def test_configure_harnesses_add_databricks_under_pi_scopes_to_pi(
     # Databricks position within the Pi add menu, computed live.
     pi_opts = add_menu_options_for_family(PI_SURFACE)
     db = next(i for i, o in enumerate(pi_opts) if o.kind == DATABRICKS_KIND) + 1
-    # L1 6=Pi → L2 1=+Add → add menu <db>=Databricks → URL → q → q.
-    stdin = "\n".join(["6", "1", str(db), "https://example.cloud.databricks.com", "q", "q"]) + "\n"
+    # L1 6=Pi → L2 1=+Add → add menu <db>=Databricks → URL → endpoints
+    # 1=workspace defaults → q → q.
+    inputs = ["6", "1", str(db), "https://example.cloud.databricks.com", "1", "q", "q"]
+    stdin = "\n".join(inputs) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
     assert result.exit_code == 0, result.output
 

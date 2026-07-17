@@ -7,7 +7,8 @@ future configure noun). The look reproduces
 
 - a bold accent header line,
 - one row per option (selected → ``❯  <label>`` in bold accent, others
-  normal weight; non-selectable sub-lines dim italic and indented beneath),
+  normal weight; non-selectable section headers dim, blank-separated
+  above the rows they label),
 - a muted footer hint line (``↑/↓ move  ·  Enter select  ·  Esc back``),
 - a raw-termios keypress loop with in-place redraw (move up, clear,
   reprint), and
@@ -110,10 +111,10 @@ def _render_menu(
     description line for the selected option (the generic analogue of the theme
     preview), and a muted footer of key hints.
 
-    Non-selectable rows (``selectable[i]`` is ``False``) render as dim italic
-    sub-lines indented beneath the preceding choice (e.g. a harness's
-    ``default: …`` summary) with a blank line after — no ``❯`` pointer, and
-    ↑/↓ skip them so the cursor only lands on real choices.
+    Non-selectable rows (``selectable[i]`` is ``False``) render as dim
+    section headers: a group label a notch left of the choice column,
+    blank-separated from the previous group — no ``❯`` pointer, and ↑/↓
+    skip them so the cursor only lands on real choices.
 
     :param title: The header shown above the options, e.g.
         ``"What kind of provider?"``.
@@ -158,34 +159,23 @@ def _render_menu(
     if win_start > 0:
         render_console.print(Text.from_markup(f"       [{MUTED}]↑ {win_start} more[/]"))
 
-    last_choice = -1  # index of the most recent selectable (group-owning) row
     for i in range(win_start, win_end):
         label = options[i]
         if not selectable[i]:
-            # Sub-line(s) under the preceding choice (a harness's default +
-            # "+N more" summary): indented, no pointer. ↑/↓ skip them. Their
-            # styling follows the cursor — the label's own emphasis (e.g. a
-            # bold-green default) shows only under the SELECTED choice; under an
-            # unselected choice the same sub-line is muted to dim so the
-            # highlight tracks where you are.
-            if last_choice == selected:
-                render_console.print(Text.from_markup(f"        {label}"))
-            else:
-                plain = Text.from_markup(label).plain  # drop the label's own color
-                render_console.print(Text(f"        {plain}", style="dim"))
-            # One blank line after the LAST sub-line of a group (next row is a
-            # real choice, or the menu ends) — so consecutive sub-lines stay
-            # together and the gap separates one choice's block from the next.
-            if i + 1 >= len(options) or selectable[i + 1]:
+            # Section header/separator: a dim group label a notch left of the
+            # choice column, blank-separated from the previous group so each
+            # section reads as its own block. ↑/↓ skip it, and its style never
+            # follows the cursor — it labels the rows below, not a choice.
+            if i > win_start:
                 render_console.print()
+            plain = Text.from_markup(label).plain  # structural: always dim
+            render_console.print(Text(f"     {plain}", style="dim"))
         elif i == selected:
             # Highlighted choice: bold accent with the ❯ pointer.
-            last_choice = i
             render_console.print(Text.from_markup(f"    [bold {ACCENT}]❯  {label}[/]"))
         else:
             # Unselected choice: normal weight (readable), aligned under the
             # pointer so the column doesn't shift as the cursor moves.
-            last_choice = i
             render_console.print(Text.from_markup(f"       {label}"))
 
     if win_end < n_options:

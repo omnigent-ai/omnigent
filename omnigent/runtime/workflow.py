@@ -52,6 +52,7 @@ from omnigent.onboarding.provider_config import (
     SUBSCRIPTION_KIND,
     FamilyConfig,
     ProviderEntry,
+    databricks_provider_models,
     default_provider_for_harness,
     first_available_provider,
     harness_family,
@@ -304,7 +305,10 @@ def configure_agent_harness_with_ucode(
 
     The harness-specific constants live here so callers only declare which
     agent harness they are configuring. ucode's per-agent ``agents`` entries
-    are the source of truth for gateway URLs and auth commands.
+    are the source of truth for gateway URLs and auth commands. The model
+    resolves as spec (pre-set ``env`` key) > provider-config ``models:``
+    overrides (:func:`databricks_provider_models`) > ucode state > the
+    harness's hardcoded Databricks default.
 
     :param env: Mutable spawn-env dict, modified in place.
     :param profile: The ``executor.profile`` / provider-config value,
@@ -313,13 +317,30 @@ def configure_agent_harness_with_ucode(
     """
     if not profile:
         return
+    config = _UCODE_HARNESS_CONFIGS[harness_type]
+    # Provider-config model overrides (the ``models:`` map on the ``kind:
+    # databricks`` entry) outrank ucode state: config > ucode > hardcoded
+    # default. Scoped to the Claude-gateway harnesses — the map is
+    # Claude-tier-shaped, which is exactly the harnesses that carry a
+    # Databricks Claude default model. Applied before the ucode-state
+    # checks so the override also lands on the profile-derived gateway
+    # path (no ucode state cached).
+    if config.databricks_default_model is not None and config.model_key not in env:
+        override_model = databricks_provider_models(profile).get("default")
+        if override_model:
+            if harness_type == "pi":
+                # Claude Code's ``[1m]`` long-context suffix is a client-side
+                # convention: the claude CLI strips it before calling the API,
+                # but pi passes model ids through verbatim and the gateway
+                # rejects suffixed names — strip it for pi's spawn env.
+                override_model = override_model.removesuffix("[1m]")
+            env[config.model_key] = override_model
     workspace_url = get_workspace_url_for_profile(profile)
     if workspace_url is None:
         return
     state = read_ucode_state(workspace_url)
     if state is None:
         return
-    config = _UCODE_HARNESS_CONFIGS[harness_type]
     agent_state = state.agent(config.agent_name)
     if agent_state is None:
         return
