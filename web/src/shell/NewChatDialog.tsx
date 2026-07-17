@@ -588,7 +588,7 @@ export function harnessWarningMessageText(
     return `${agentName} needs Codex authentication on ${hostName} — run codex login on that machine.`;
   }
   if (reason === "binary-missing") {
-    return `${agentName} is missing the Codex binary on ${hostName} — run omnigent setup on that machine.`;
+    return `${agentName} can't find the Codex binary on ${hostName} — if codex is installed, restart the host with omnigent host so it picks up your PATH, or set OMNIGENT_CODEX_PATH. Otherwise run omnigent setup.`;
   }
   return `${agentName} isn't configured on ${hostName} — run omnigent setup on that machine.`;
 }
@@ -618,8 +618,9 @@ function harnessWarningMessage(
   if (reason === "binary-missing") {
     return (
       <>
-        {agentName} is missing the Codex binary on {hostName} — run <code>omnigent setup</code> on
-        that machine.
+        {agentName} can&apos;t find the Codex binary on {hostName} — if codex is installed, restart
+        the host with <code>omnigent host</code> so it picks up your PATH, or set{" "}
+        <code>OMNIGENT_CODEX_PATH</code>. Otherwise run <code>omnigent setup</code>.
       </>
     );
   }

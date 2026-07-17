@@ -4018,3 +4018,22 @@ def test_no_precompact_no_compaction_event() -> None:
         assert len(compaction_events) == 0
 
     _run(_t())
+
+
+def test_find_system_claude_delegates_to_shared_resolver(monkeypatch) -> None:
+    """``_find_system_claude`` resolves claude via the shared resolver with the
+    OMNIGENT_CLAUDE_PATH override, so an nvm/npm-installed claude off the host
+    daemon's frozen PATH is still found. (The resolver's PATH/override/fallback
+    behavior is covered in tests/inner/test_proc_and_platform.py.)"""
+    from omnigent.inner import claude_sdk_executor as cse
+
+    captured = {}
+
+    def fake_resolve(name, *, env_var=None):
+        captured["name"] = name
+        captured["env_var"] = env_var
+        return "/opt/homebrew/bin/claude"
+
+    monkeypatch.setattr(cse, "resolve_cli_binary", fake_resolve)
+    assert cse._find_system_claude() == "/opt/homebrew/bin/claude"
+    assert captured == {"name": "claude", "env_var": "OMNIGENT_CLAUDE_PATH"}
