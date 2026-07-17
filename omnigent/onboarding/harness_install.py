@@ -257,8 +257,10 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     # ``native-opencode`` reversed spelling gates on the same binary.
     "opencode-native": OPENCODE_KEY,
     "native-opencode": OPENCODE_KEY,
-    # Hermes Agent (``harness: hermes``) wraps the ``hermes`` CLI.
+    # Hermes Agent (``harness: hermes``) wraps the ``hermes`` CLI; the
+    # streaming ``hermes-acp`` harness wraps the same binary in ACP mode.
     HERMES_KEY: HERMES_KEY,
+    "hermes-acp": HERMES_KEY,
     # Native Hermes TUI (``hermes-native``, via ``omni hermes``) wraps the same
     # ``hermes`` CLI as the headless harness; ``native-hermes`` reversed spelling
     # gates on the same binary.

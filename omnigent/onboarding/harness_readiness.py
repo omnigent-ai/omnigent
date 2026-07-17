@@ -219,12 +219,13 @@ def harness_is_configured(harness: str) -> bool:
         # Auth/provider state surfaces at run time via Goose's own config; the
         # daemon gates only on binary presence.
         return harness_cli_installed(GOOSE_KEY)
-    if canonical in _HERMES_NATIVE_HARNESSES or canonical == HERMES_KEY:
-        # Hermes — both the native TUI (``hermes-native`` / ``native-hermes``,
-        # via ``omni hermes``) and the headless subprocess harness (``hermes``)
-        # — wraps the ``hermes`` CLI (installed via a curl script from Nous
-        # Research). Auth/provider config surfaces at run time via Hermes' own
-        # ``hermes model`` flow; gate only on binary presence.
+    if canonical in _HERMES_NATIVE_HARNESSES or canonical in (HERMES_KEY, "hermes-acp"):
+        # Hermes — the native TUI (``hermes-native`` / ``native-hermes``, via
+        # ``omni hermes``), the headless subprocess harness (``hermes``), and
+        # the streaming ACP harness (``hermes-acp``) — all wrap the ``hermes``
+        # CLI (installed via a curl script from Nous Research). Auth/provider
+        # config surfaces at run time via Hermes' own ``hermes model`` flow;
+        # gate only on binary presence.
         return harness_cli_installed(HERMES_KEY)
     if canonical == CURSOR_KEY:
         # Cursor runs in-process via ``cursor-sdk`` and authenticates with a

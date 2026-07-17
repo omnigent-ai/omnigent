@@ -475,6 +475,20 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         interrupt=True,
         streaming=True,
     ),
+    # ACP subprocess like qwen/goose; the pre_tool_call hook stays the policy
+    # gate (permission requests are allow-selected beneath it), so elicitation
+    # is HOOK rather than SSE_PERMISSION.
+    "hermes-acp": _C(
+        _IM.ACP_SUBPROCESS,
+        _EL.HOOK,
+        _RS.COLD_ONLY,
+        _EF.NONE,
+        _MF.MULTI,
+        _AU.OWN_AUTH,
+        subagents=False,
+        interrupt=True,
+        streaming=True,
+    ),
     "copilot": _C(
         _IM.SDK_IN_PROCESS,
         _EL.NONE,
@@ -522,6 +536,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
             "goose",
             "goose-native",
             "hermes",
+            "hermes-acp",
             "hermes-native",
             "kimi",
             "kimi-native",
@@ -549,6 +564,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "goose": "omnigent.inner.goose_harness",
         "goose-native": "omnigent.inner.goose_native_harness",
         "hermes": "omnigent.inner.hermes_harness",
+        "hermes-acp": "omnigent.inner.hermes_acp_harness",
         "hermes-native": "omnigent.inner.hermes_native_harness",
         "kimi": "omnigent.inner.kimi_harness",
         "kimi-native": "omnigent.inner.kimi_native_harness",
@@ -625,6 +641,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "copilot": "HARNESS_COPILOT_MODEL",
         "cursor": "HARNESS_CURSOR_MODEL",
         "goose": "HARNESS_GOOSE_MODEL",
+        "hermes-acp": "HARNESS_HERMES_MODEL",
         "kimi": "HARNESS_KIMI_MODEL",
         "openai-agents": "HARNESS_OPENAI_AGENTS_MODEL",
         "pi": "HARNESS_PI_MODEL",

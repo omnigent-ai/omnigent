@@ -1217,6 +1217,102 @@ def test_translate_event_request_without_tool_use_id_does_not_queue() -> None:
     )
 
 
+def test_self_executed_request_renders_without_entering_correlation_queue() -> None:
+    from omnigent.inner.executor import ToolCallRequest
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = _RecordingTurnContext()
+
+    adapter._translate_event(
+        ToolCallRequest(
+            name="terminal: date",
+            args={"command": "date"},
+            metadata={"call_id": "native-1", "self_executed": True},
+        ),
+        ctx,  # type: ignore[arg-type]
+    )
+
+    calls = [event.item for event in ctx.emitted if event.item["type"] == "function_call"]
+    assert list(adapter._pending_mcp_call_ids) == []
+    assert [call["call_id"] for call in calls] == ["native-1"]
+
+
+def test_self_executed_completion_emits_durable_call_and_output() -> None:
+    from omnigent.inner.executor import ToolCallComplete, ToolCallStatus
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    adapter._current_agent = "test-model"
+    ctx = _RecordingTurnContext()
+
+    adapter._translate_event(
+        ToolCallComplete(
+            name="terminal: date",
+            status=ToolCallStatus.SUCCESS,
+            result="Thu Jul 10",
+            metadata={
+                "call_id": "native-1",
+                "arguments": {"command": "date"},
+                "self_executed": True,
+            },
+        ),
+        ctx,  # type: ignore[arg-type]
+    )
+
+    items = [event.item for event in ctx.emitted]
+    assert [item["type"] for item in items] == ["function_call", "function_call_output"]
+    assert {item["call_id"] for item in items} == {"native-1"}
+    assert items[0]["status"] == "completed"
+    assert items[0]["arguments"] == '{"command": "date"}'
+    assert items[0]["agent"] == "test-model"
+
+
+@pytest.mark.asyncio
+async def test_native_then_bridged_dispatch_keeps_each_call_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import omnigent.runtime.harnesses._executor_adapter as adapter_module
+    from omnigent.inner.executor import ToolCallRequest
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = _RecordingTurnContext()
+    adapter._current_ctx = ctx  # type: ignore[assignment]
+    adapter._current_agent = "test-model"
+
+    for name, call_id, self_executed in (
+        ("terminal: date", "native-1", True),
+        ("sys_session_get_info", "bridge-1", False),
+    ):
+        metadata: dict[str, Any] = {"call_id": call_id}
+        if self_executed:
+            metadata["self_executed"] = True
+        adapter._translate_event(
+            ToolCallRequest(name=name, args={}, metadata=metadata),
+            ctx,  # type: ignore[arg-type]
+        )
+
+    dispatched: dict[str, str] = {}
+
+    async def fake_bridge(
+        _ctx: object,
+        _agent: object,
+        _tool_name: str,
+        _args: dict[str, Any],
+        *,
+        call_id: str,
+    ) -> dict[str, Any]:
+        dispatched["call_id"] = call_id
+        return {"ok": True}
+
+    monkeypatch.setattr(adapter_module, "_bridge_one_dispatch", fake_bridge)
+    await adapter._stable_tool_executor("sys_session_get_info", {})
+
+    assert dispatched["call_id"] == "bridge-1"
+    assert list(adapter._pending_mcp_call_ids) == []
+
+
 def test_run_turn_clears_mcp_queue_at_turn_start() -> None:
     """
     Each ``run_turn`` call clears ``_pending_mcp_call_ids`` so
