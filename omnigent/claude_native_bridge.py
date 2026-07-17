@@ -3790,29 +3790,58 @@ def _stdio_jsonrpc_loop(
         method = message.get("method")
         if request_id is None or not isinstance(method, str):
             continue
-        # Per-request guard: a failure handling ONE request must never tear
-        # down the long-lived MCP server (which would surface to Claude Code
-        # as ``-32000: Connection closed`` and drop every tool until respawn).
-        # Convert any handler exception into a JSON-RPC error response so the
-        # offending call fails cleanly and the stdio loop keeps serving. The
-        # individual handlers already return ``_mcp_error`` content for
-        # expected failures; this catches the unexpected (e.g. a bug in a
-        # tool, or an OSError that slipped a narrower except).
-        try:
-            result = _handle_mcp_request(method, message.get("params"), tools, bridge_dir)
-            response: _JsonObject = {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "result": result,
-            }
-        except Exception as exc:  # noqa: BLE001 - top-level loop guard keeps the server alive.
-            response = {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                # -32603 is the JSON-RPC 2.0 "Internal error" code.
-                "error": {"code": -32603, "message": f"internal error: {exc}"},
-            }
-        _write_jsonrpc(response, stdout_lock, framed=use_content_length)
+        threading.Thread(
+            target=_handle_and_write_mcp_request,
+            args=(
+                request_id,
+                method,
+                message.get("params"),
+                tools,
+                bridge_dir,
+                stdout_lock,
+                use_content_length,
+            ),
+            name="claude-native-mcp-request",
+            daemon=True,
+        ).start()
+
+
+def _handle_and_write_mcp_request(
+    request_id: object,
+    method: str,
+    params: object,
+    tools: dict[str, Tool],
+    bridge_dir: Path,
+    stdout_lock: threading.Lock,
+    framed: bool,
+) -> None:
+    """
+    Handle one request without blocking the stdio reader.
+
+    :param request_id: JSON-RPC request identifier returned to the client.
+    :param method: JSON-RPC method name.
+    :param params: Method parameters from the request.
+    :param tools: Omnigent tools exposed over MCP.
+    :param bridge_dir: Bridge directory used to resolve the active relay.
+    :param stdout_lock: Lock serializing responses and notifications.
+    :param framed: Whether to emit a Content-Length framed response.
+    :returns: None after the response is written.
+    """
+    # A request failure must not tear down the long-lived MCP server.
+    try:
+        result = _handle_mcp_request(method, params, tools, bridge_dir)
+        response: _JsonObject = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": result,
+        }
+    except Exception as exc:  # noqa: BLE001 - request failure must not stop the server.
+        response = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {"code": -32603, "message": f"internal error: {exc}"},
+        }
+    _write_jsonrpc(response, stdout_lock, framed=framed)
 
 
 def _handle_mcp_request(
