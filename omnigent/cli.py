@@ -1519,6 +1519,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "uninstall",
         "update",
         "upgrade",
+        "usage",
         "version",
     }
 )
@@ -5022,6 +5023,149 @@ def import_session_command(
         click.echo(f"Failed: {failed_count}")
         if failed_count:
             raise click.ClickException(f"{failed_count} session(s) failed to import")
+
+
+def _render_usage(report: dict[str, Any], limit: int) -> None:  # type: ignore[explicit-any]
+    """
+    Print the usage report: a rolling-window cost summary plus a per-session table.
+
+    Styling routes through :mod:`omnigent.inner.ui` — the CLI palette SOT —
+    so headers/borders use the brand semantic tokens (``omni.accent`` /
+    ``omni.muted``) and adapt to light / dark terminals (no hard-coded colors).
+
+    :param report: The decoded ``GET /v1/usage`` JSON body.
+    :param limit: Maximum number of sessions to show in the table.
+    """
+    from rich.markup import escape
+    from rich.style import Style
+    from rich.text import Text
+
+    from omnigent.inner import ui
+
+    # rich resolves a theme token combined with an attribute only via a Style
+    # object or inline single-token markup, not a "bold omni.accent" style
+    # string — so build the accent header style explicitly.
+    accent_bold = ui.console.get_style("omni.accent") + Style(bold=True)
+
+    def money(value: float) -> str:
+        return f"${value:,.2f}"
+
+    def model_cell(model: str | None) -> str:
+        # Base model in the default fg, the "+N" (extra distinct models) in
+        # accent. Escaped in case a raw model id carries markup characters.
+        if not model:
+            return "[omni.muted]—[/omni.muted]"
+        base, sep, extra = model.partition(" +")
+        if sep:
+            return f"{escape(base)} [omni.accent]+{escape(extra)}[/omni.accent]"
+        return escape(model)
+
+    ui.console.print()
+    ui.console.print(
+        "[omni.muted]Costs are best-effort estimates; consult your provider for "
+        "actual billing.[/omni.muted]"
+    )
+    ui.console.print()
+    ui.console.print(Text("Summary", style=accent_bold))
+    ui.kv("  Last 24h", money(report.get("cost_last_24h", 0.0)), label_width=12)
+    ui.kv("  Last 7d", money(report.get("cost_last_7d", 0.0)), label_width=12)
+    ui.kv("  Last 30d", money(report.get("cost_last_30d", 0.0)), label_width=12)
+    ui.console.print()
+
+    all_sessions = report.get("sessions", [])
+    shown = all_sessions[:limit]
+    # Empty base Text so the muted count hint doesn't inherit the accent.
+    header = Text()
+    header.append("Per session", style=accent_bold)
+    header.append(f" (last {len(shown)})", style="omni.muted")
+    ui.console.print(header)
+    # Bold default-fg headers (accent is reserved for the section headers);
+    # the border uses the shared muted token so it adapts to light / dark.
+    tbl = Table(
+        box=box.SIMPLE_HEAVY,
+        show_edge=False,
+        header_style="bold",
+        border_style="omni.muted",
+    )
+    tbl.add_column("Session ID", style="omni.muted", no_wrap=True)
+    tbl.add_column("Model", no_wrap=True)
+    tbl.add_column("Cost", justify="right", no_wrap=True)
+    for s in shown:
+        tbl.add_row(
+            str(s.get("id", "")),
+            model_cell(s.get("model")),
+            f"[bold]{money(s.get('cost_usd', 0.0))}[/bold]",
+        )
+    ui.console.print(tbl)
+    if not all_sessions:
+        ui.console.print("  [omni.muted]No usage recorded yet.[/omni.muted]")
+
+
+@cli.command("usage")
+@click.option(
+    "--limit",
+    default=10,
+    show_default=True,
+    help="Number of most-recent sessions to show in the per-session table.",
+)
+@click.option(
+    "--server",
+    default=None,
+    help=(
+        "Omnigent server URL. "
+        "Defaults to the configured server, or a local server already running."
+    ),
+)
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    default=False,
+    help="Emit the raw usage report as JSON instead of the table.",
+)
+def usage(limit: int, server: str | None, as_json: bool) -> None:
+    """Show your Omnigent LLM cost over the last 24h / 7 days / 30 days.
+
+    Sums spend across all your sessions (each rolled up over its
+    sub-agents) into rolling 24h / 7d / 30d cost totals, then lists a
+    per-session breakdown of model and cost.
+
+    \b
+    A session is counted in a window when its last-activity time falls
+    inside it. Because a session carries one cumulative usage total with a
+    single timestamp, a session active across a window edge is attributed
+    wholly to the window its last activity falls in — approximate at the
+    edges.
+
+    \b
+    Examples:
+      omnigent usage
+      omnigent usage --limit 25
+      omnigent usage --json
+    """
+    import httpx
+
+    from omnigent.chat import _remote_headers
+
+    cfg = _load_effective_config()
+    base_url = _resolve_attach_server(server, cfg.get("server"))
+    if base_url is None:
+        startup = ensure_local_omnigent_server()
+        base_url = startup.url
+    base_url = base_url.rstrip("/")
+
+    with httpx.Client(
+        base_url=base_url, headers=_remote_headers(server_url=base_url), timeout=60.0
+    ) as client:
+        resp = client.get("/v1/usage")
+        resp.raise_for_status()
+        report = resp.json()
+
+    if as_json:
+        click.echo(json.dumps(report, indent=2))
+        return
+
+    _render_usage(report, limit)
 
 
 @cli.group("session", invoke_without_command=True)

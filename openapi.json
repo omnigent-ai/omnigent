@@ -6445,6 +6445,108 @@
         "title": "UsageDetails",
         "type": "object"
       },
+      "UsageReport": {
+        "description": "Aggregated LLM usage for the calling user, powering `omni usage`.\n\nCost buckets are rolling trailing windows measured back from now:\n`cost_last_24h` / `cost_last_7d` / `cost_last_30d`. A session is\ncounted in a window when its `updated_at` (last activity) falls inside\nit. Because a session carries a single cumulative `session_usage` blob\n(no per-turn timestamps), one whose activity straddled a window edge is\nattributed wholly to the window its last activity falls in.",
+        "properties": {
+          "cost_last_24h": {
+            "default": 0.0,
+            "description": "Total spend for sessions active in the last 24h.",
+            "title": "Cost Last 24H",
+            "type": "number"
+          },
+          "cost_last_30d": {
+            "default": 0.0,
+            "description": "Total spend for sessions active in the last 30 days.",
+            "title": "Cost Last 30D",
+            "type": "number"
+          },
+          "cost_last_7d": {
+            "default": 0.0,
+            "description": "Total spend for sessions active in the last 7 days.",
+            "title": "Cost Last 7D",
+            "type": "number"
+          },
+          "object": {
+            "const": "usage_report",
+            "default": "usage_report",
+            "title": "Object",
+            "type": "string"
+          },
+          "sessions": {
+            "description": "Per-session breakdown, newest activity first.",
+            "items": {
+              "$ref": "#/components/schemas/UsageSession"
+            },
+            "title": "Sessions",
+            "type": "array"
+          },
+          "total_cost_usd": {
+            "default": 0.0,
+            "description": "All-time total spend across the user's sessions.",
+            "title": "Total Cost Usd",
+            "type": "number"
+          }
+        },
+        "title": "UsageReport",
+        "type": "object"
+      },
+      "UsageSession": {
+        "description": "One session's rolled-up LLM spend for the `GET /v1/usage` report.\n\n`cost_usd` is the subtree total \u2014 the session plus every sub-agent it\nspawned \u2014 read from `session_usage` via\n`omnigent.runtime.policies.builder.load_session_usage`.",
+        "properties": {
+          "cost_usd": {
+            "default": 0.0,
+            "description": "Cumulative USD spend for this session's subtree.",
+            "title": "Cost Usd",
+            "type": "number"
+          },
+          "created_at": {
+            "description": "Unix epoch seconds of creation.",
+            "title": "Created At",
+            "type": "integer"
+          },
+          "id": {
+            "description": "Session/conversation identifier, e.g. `\"conv_abc123\"`.",
+            "title": "Id",
+            "type": "string"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Primary model id (the highest-cost model, verbatim), suffixed `\" +N\"` when the subtree spanned several distinct models. `None` when no model was recorded.",
+            "title": "Model"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional human-readable title.",
+            "title": "Title"
+          },
+          "updated_at": {
+            "description": "Unix epoch seconds of last activity; the timestamp the report buckets this session's cost by.",
+            "title": "Updated At",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "UsageSession",
+        "type": "object"
+      },
       "ValidationError": {
         "properties": {
           "ctx": {
@@ -11665,6 +11767,28 @@
         "summary": "Set Sharing",
         "tags": [
           "sharing"
+        ]
+      }
+    },
+    "/v1/usage": {
+      "get": {
+        "description": "Aggregate the calling user's LLM spend across their sessions.\n\nSums the `session_usage` of every top-level session the user can\naccess (each rolled up over its sub-agent subtree) into rolling\n24h / 7d / 30d and all-time cost totals plus a per-session breakdown.\nPowers the `omni usage` CLI command.\n\nrequire_user, not get_user_id: the aggregation scopes to\n`accessible_by=user_id`, so a request slipping through as `None`\nwould sum EVERY user's spend. Fail closed with 401 instead\n(`user_id` is `None` only when auth is disabled \u2014 the\nsingle-user / local case).",
+        "operationId": "get_usage_v1_usage_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UsageReport"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get Usage",
+        "tags": [
+          "sessions"
         ]
       }
     }

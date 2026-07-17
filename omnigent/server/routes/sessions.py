@@ -287,6 +287,8 @@ from omnigent.server.schemas import (
     SkillSummary,
     ToolOutputDeltaEvent,
     UpdateSessionRequest,
+    UsageReport,
+    UsageSession,
 )
 from omnigent.session_lifecycle import (
     is_session_closed,
@@ -3223,6 +3225,124 @@ def _record_daily_cost(
     from omnigent.db.utils import now_epoch
 
     conversation_store.add_daily_cost(owner, _utc_day(now_epoch()), delta_usd)
+
+
+def _usage_window_starts(now_epoch_s: int) -> tuple[int, int, int]:
+    """
+    Return the rolling window start boundaries for the usage report.
+
+    :param now_epoch_s: Current time as Unix epoch seconds.
+    :returns: ``(since_24h, since_7d, since_30d)`` as Unix epoch seconds —
+        24 hours, 7 days, and 30 days before now.
+    """
+    day = 86_400
+    return now_epoch_s - day, now_epoch_s - 7 * day, now_epoch_s - 30 * day
+
+
+def _primary_model(by_model: object) -> str | None:
+    """
+    Pick a session's primary model id from its ``by_model`` map.
+
+    Returns the full id of the highest-cost model, verbatim. Some native
+    harnesses record the same spend under several aliases (identical
+    buckets), so buckets with identical contents collapse to one entry and
+    a single-model session isn't mislabeled ``" +N"``. When genuinely
+    distinct models were used, the primary is suffixed ``" +N"``.
+
+    :param by_model: The ``session_usage["by_model"]`` value (expected to
+        be a ``dict`` keyed by model id); anything else yields ``None``.
+    :returns: The primary model id, optionally ``" +N"`` suffixed, or
+        ``None`` when no model was recorded.
+    """
+    if not isinstance(by_model, dict) or not by_model:
+        return None
+    # Group by bucket contents so aliases (the same spend under several
+    # names) collapse; the representative is the shortest of the duplicate
+    # ids, picked verbatim — no prefix/suffix rewriting.
+    reps: dict[tuple[tuple[str, float], ...], tuple[str, float]] = {}
+    for name, bucket in by_model.items():
+        if not isinstance(bucket, dict):
+            continue
+        sig = tuple(sorted((str(k), float(v)) for k, v in bucket.items()))
+        cost = float(bucket.get("total_cost_usd") or 0.0)
+        current = reps.get(sig)
+        if current is None or len(str(name)) < len(current[0]):
+            reps[sig] = (str(name), cost)
+    if not reps:
+        return None
+    ordered = [n for n, _ in sorted(reps.values(), key=lambda nc: nc[1], reverse=True)]
+    if len(ordered) == 1:
+        return ordered[0]
+    return f"{ordered[0]} +{len(ordered) - 1}"
+
+
+def _build_usage_report(
+    conversation_store: ConversationStore,
+    user_id: str | None,
+) -> UsageReport:
+    """
+    Aggregate a user's LLM spend across all their top-level sessions.
+
+    Walks the caller's ``kind="default"`` sessions (newest activity first)
+    and rolls each one's subtree usage in via :func:`load_session_usage`, so
+    a session's cost includes its sub-agents. Sub-agent sessions are never
+    iterated directly, so their spend is counted once, through their parent.
+    Cost is bucketed by each session's ``updated_at`` against rolling
+    24h / 7d / 30d windows.
+
+    :param conversation_store: Store to read sessions and usage from.
+    :param user_id: The caller, used as the ACL scope (``accessible_by``);
+        ``None`` in single-user / local mode returns every local session.
+    :returns: The populated :class:`UsageReport`.
+    """
+    from omnigent.db.utils import now_epoch
+
+    since_24h, since_7d, since_30d = _usage_window_starts(now_epoch())
+    sessions: list[UsageSession] = []
+    cost_24h = cost_7d = cost_30d = total = 0.0
+    after: str | None = None
+    while True:
+        page = conversation_store.list_conversations(
+            limit=200,
+            after=after,
+            accessible_by=user_id,
+            has_agent_id=True,
+            kind="default",
+            order="desc",
+            sort_by="updated_at",
+        )
+        for conv in page.data:
+            if conv.agent_id is None:
+                continue
+            usage = load_session_usage(conv.id, conversation_store)
+            cost = _priced_cost_for_display(usage) or 0.0
+            sessions.append(
+                UsageSession(
+                    id=conv.id,
+                    created_at=conv.created_at,
+                    updated_at=conv.updated_at,
+                    title=conv.title,
+                    model=_primary_model(usage.get("by_model")),
+                    cost_usd=cost,
+                )
+            )
+            total += cost
+            if conv.updated_at >= since_30d:
+                cost_30d += cost
+            if conv.updated_at >= since_7d:
+                cost_7d += cost
+            if conv.updated_at >= since_24h:
+                cost_24h += cost
+        if not page.has_more:
+            break
+        after = page.last_id
+    return UsageReport(
+        cost_last_24h=cost_24h,
+        cost_last_7d=cost_7d,
+        cost_last_30d=cost_30d,
+        total_cost_usd=total,
+        sessions=sessions,
+    )
 
 
 def _priced_cost_for_display(usage: dict[str, Any]) -> float | None:
@@ -15508,6 +15628,30 @@ def create_sessions_router(
             id=conv.id,
             labels=labels_with_closed_status(conv.labels, conv.title),
         )
+
+    # ── GET /usage ───────────────────────────────────────────────
+
+    @router.get(
+        "/usage",
+        response_model=UsageReport,
+    )
+    async def get_usage(request: Request) -> UsageReport:
+        """
+        Aggregate the calling user's LLM spend across their sessions.
+
+        Sums the ``session_usage`` of every top-level session the user can
+        access (each rolled up over its sub-agent subtree) into rolling
+        24h / 7d / 30d and all-time cost totals plus a per-session breakdown.
+        Powers the ``omni usage`` CLI command.
+
+        require_user, not get_user_id: the aggregation scopes to
+        ``accessible_by=user_id``, so a request slipping through as ``None``
+        would sum EVERY user's spend. Fail closed with 401 instead
+        (``user_id`` is ``None`` only when auth is disabled — the
+        single-user / local case).
+        """
+        user_id = _require_user(request, auth_provider)
+        return await asyncio.to_thread(_build_usage_report, conversation_store, user_id)
 
     # ── GET /sessions ───────────────────────────────────────────
 

@@ -2298,6 +2298,59 @@ class ChildSessionList(BaseModel):
     has_more: bool = False
 
 
+class UsageSession(BaseModel):
+    """
+    One session's rolled-up LLM spend for the ``GET /v1/usage`` report.
+
+    ``cost_usd`` is the subtree total — the session plus every sub-agent it
+    spawned — read from ``session_usage`` via
+    :func:`omnigent.runtime.policies.builder.load_session_usage`.
+
+    :param id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :param created_at: Unix epoch seconds of creation.
+    :param updated_at: Unix epoch seconds of last activity; the timestamp the
+        report buckets this session's cost by.
+    :param title: Optional human-readable title.
+    :param model: Primary model id (the highest-cost model, verbatim),
+        suffixed ``" +N"`` when the subtree spanned several distinct models.
+        ``None`` when no model was recorded.
+    :param cost_usd: Cumulative USD spend for this session's subtree.
+    """
+
+    id: str
+    created_at: int
+    updated_at: int
+    title: str | None = None
+    model: str | None = None
+    cost_usd: float = 0.0
+
+
+class UsageReport(BaseModel):
+    """
+    Aggregated LLM usage for the calling user, powering ``omni usage``.
+
+    Cost buckets are rolling trailing windows measured back from now:
+    ``cost_last_24h`` / ``cost_last_7d`` / ``cost_last_30d``. A session is
+    counted in a window when its ``updated_at`` (last activity) falls inside
+    it. Because a session carries a single cumulative ``session_usage`` blob
+    (no per-turn timestamps), one whose activity straddled a window edge is
+    attributed wholly to the window its last activity falls in.
+
+    :param cost_last_24h: Total spend for sessions active in the last 24h.
+    :param cost_last_7d: Total spend for sessions active in the last 7 days.
+    :param cost_last_30d: Total spend for sessions active in the last 30 days.
+    :param total_cost_usd: All-time total spend across the user's sessions.
+    :param sessions: Per-session breakdown, newest activity first.
+    """
+
+    object: Literal["usage_report"] = "usage_report"
+    cost_last_24h: float = 0.0
+    cost_last_7d: float = 0.0
+    cost_last_30d: float = 0.0
+    total_cost_usd: float = 0.0
+    sessions: list[UsageSession] = Field(default_factory=list)
+
+
 # ── Permissions ────────────────────────────────────────────────────
 
 
