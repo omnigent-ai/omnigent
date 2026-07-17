@@ -470,6 +470,21 @@ jobs:
                 || echo "::warning::prettier --write failed for ${slug}; committing unformatted (CI will flag)"
             fi
 
+            # Surface the drafted post itself: copy it to /tmp (uploaded as an
+            # artifact) and, on a dry run, render it into the job summary so the
+            # post body can be reviewed without opening a PR.
+            if [ -n "$post" ] && [ -f "${SITE}/${post}" ]; then
+              cp "${SITE}/${post}" "/tmp/post_${i}.mdx"
+              {
+                echo "<details><summary>Drafted post: ${slug}</summary>"
+                echo
+                echo '```mdx'
+                cat "${SITE}/${post}"
+                echo '```'
+                echo "</details>"
+              } >> "$GITHUB_STEP_SUMMARY"
+            fi
+
             title=$(sed -n 's/^BLOG_PR_TITLE:[[:space:]]*//p' "/tmp/drafter_out_${i}.txt" | head -n1)
             [ -z "$title" ] && title="add feature blog: ${headline}"
 
@@ -556,6 +571,7 @@ jobs:
           files = ["scout-stderr.log", "drafter-stderr.log", "/tmp/scout_out.txt",
                    "/tmp/scout_prompt.txt"]
           files += glob.glob("/tmp/drafter_out_*.txt") + glob.glob("/tmp/material_*.txt")
+          files += glob.glob("/tmp/post_*.mdx")
           for f in files:
               p = pathlib.Path(f)
               if not p.is_file() or not key:
@@ -566,7 +582,7 @@ jobs:
                   print(f"redacted key from {f}")
           PYEOF
 
-      - name: Upload logs on failure
+      - name: Upload logs and drafted posts
         if: always() && steps.guard.outputs.proceed == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -577,5 +593,6 @@ jobs:
             /tmp/scout_out.txt
             /tmp/candidates.json
             /tmp/drafter_out_*.txt
+            /tmp/post_*.mdx
           retention-days: 7
           if-no-files-found: ignore
