@@ -441,9 +441,11 @@ jobs:
 
             # Append the fixed CTA footer to the drafted post (LLM never writes it).
             # The post is a new, untracked file — find it via status (git diff
-            # can't see untracked paths). Porcelain lines are "XY path"; take the
-            # path field of the first added/modified page.mdx.
-            post="$(git -C "$SITE" status --porcelain | grep -m1 'page.mdx' | awk '{print $NF}' || true)"
+            # can't see untracked paths). Use -uall: plain porcelain collapses a
+            # brand-new directory to "app/blog/<slug>/" and never names the file
+            # inside it, so grep 'page.mdx' would miss it. Porcelain lines are
+            # "XY path"; take the path field of the first added/modified page.mdx.
+            post="$(git -C "$SITE" status --porcelain -uall | grep -m1 'page.mdx' | awk '{print $NF}' || true)"
 
             # Fail fast on HTML comments in the MDX: `<!-- ... -->` is invalid in
             # MDX (only `{/* ... */}` works) and would break the site's `next build`
@@ -464,7 +466,7 @@ jobs:
             # discovers the site's .prettierrc.json + .prettierignore, and pin the
             # site's major version. Formatting failures are non-fatal: a human
             # reviews the draft PR and CI still reports any residual issue.
-            mapfile -t changed < <(git -C "$SITE" status --porcelain | awk '{print $NF}')
+            mapfile -t changed < <(git -C "$SITE" status --porcelain -uall | awk '{print $NF}')
             if [ "${#changed[@]}" -gt 0 ]; then
               ( cd "$SITE" && npx --yes prettier@3 --write --ignore-unknown "${changed[@]}" ) \
                 || echo "::warning::prettier --write failed for ${slug}; committing unformatted (CI will flag)"
