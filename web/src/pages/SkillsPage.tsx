@@ -54,10 +54,8 @@ import { useResizableColumn } from "@/hooks/useResizableColumn";
 import { Link } from "@/lib/routing";
 import { copyText } from "@/lib/clipboard";
 import {
-  catalogSourceRoots,
   OWNERSHIP_ORDER,
   ownershipLabel,
-  sourceRootKey,
   type SkillDetail,
   type SkillFileNode,
   type SkillOrigin,
@@ -77,20 +75,12 @@ const ORIGIN_ACCENT: Record<SkillOrigin, string> = {
   personal: "var(--color-success)",
 };
 
-/** The source-filter sentinel meaning "don't filter by source". */
-const ALL_SOURCES = "__all__";
-
 function matchesQuery(skill: SkillSummary, query: string): boolean {
   if (!query) return true;
   const q = query.toLocaleLowerCase();
   return (
     skill.name.toLocaleLowerCase().includes(q) || skill.description.toLocaleLowerCase().includes(q)
   );
-}
-
-/** True when a skill passes the active source-root filter (or it's disabled). */
-function matchesSource(skill: SkillSummary, sourceFilter: string): boolean {
-  return sourceFilter === ALL_SOURCES || sourceRootKey(skill) === sourceFilter;
 }
 
 // ── Skill file tree ────────────────────────────────────────────────────────────
@@ -170,7 +160,6 @@ export function SkillsPage() {
   const sessionId = useActiveSkillSession();
   const catalogQuery = useSkillCatalog(sessionId, ALL_SOURCE_BROWSE);
   const [query, setQuery] = useState("");
-  const [sourceFilter, setSourceFilter] = useState<string>(ALL_SOURCES);
   // Selection model for the left tree:
   //  - selectedId : the skill whose resource tree shows inline beneath its row
   //    AND whose detail the right pane shows. Selection IS expansion — there is
@@ -190,35 +179,20 @@ export function SkillsPage() {
 
   const skills = useMemo(() => catalogQuery.data?.skills ?? [], [catalogQuery.data]);
 
-  // While a search query or source filter is active, matching sections are
-  // force-expanded so results are never hidden behind a collapsed header — the
-  // user's stored collapse prefs are untouched and restored when filters clear.
-  const filtersActive = query.trim() !== "" || sourceFilter !== ALL_SOURCES;
+  // While a text search is active, matching sections are force-expanded so
+  // results are never hidden behind a collapsed header (and the per-group cap
+  // is bypassed) — the user's stored collapse prefs are untouched and restored
+  // when the search clears.
+  const filtersActive = query.trim() !== "";
 
-  // The distinct source roots present in this catalog — the dynamic filter
-  // options behind the "All sources" default.
-  const sourceRoots = useMemo(() => catalogSourceRoots(skills), [skills]);
-
-  // If the catalog no longer contains the selected source (switch toggled, new
-  // session), fall back to "All sources" so the filter never strands the list.
-  useEffect(() => {
-    if (sourceFilter !== ALL_SOURCES && !sourceRoots.includes(sourceFilter)) {
-      setSourceFilter(ALL_SOURCES);
-    }
-  }, [sourceRoots, sourceFilter]);
-
-  // The flat, harness-neutral list: text search AND the optional source filter
-  // compose. Ordering is the backend's deterministic catalog order (no
-  // client-side grouping or re-sort).
-  const shown = useMemo(
-    () => skills.filter((s) => matchesQuery(s, query) && matchesSource(s, sourceFilter)),
-    [skills, query, sourceFilter],
-  );
+  // The harness-neutral list, filtered by text search only. Ordering is the
+  // backend's deterministic catalog order (no client-side re-sort).
+  const shown = useMemo(() => skills.filter((s) => matchesQuery(s, query)), [skills, query]);
 
   // Keep the selection valid: auto-select the first VISIBLE row, and if the
-  // current selection is filtered out (by search or source), move to the first
-  // still-visible row and drop any file selection so the right pane never
-  // previews a file from a now-hidden skill.
+  // current selection is filtered out by search, move to the first still-visible
+  // row and drop any file selection so the right pane never previews a file from
+  // a now-hidden skill.
   useEffect(() => {
     if (!shown.length) {
       if (selectedId !== null) setSelectedId(null);
@@ -275,9 +249,6 @@ export function SkillsPage() {
             totalVisible={skills.length}
             query={query}
             onQueryChange={setQuery}
-            sourceRoots={sourceRoots}
-            sourceFilter={sourceFilter}
-            onSourceChange={setSourceFilter}
             selectedId={selectedId}
             selectedFile={selectedFile}
             onSelectSkill={handleSelectSkill}
@@ -352,9 +323,6 @@ function SkillList({
   totalVisible,
   query,
   onQueryChange,
-  sourceRoots,
-  sourceFilter,
-  onSourceChange,
   selectedId,
   selectedFile,
   onSelectSkill,
@@ -374,9 +342,6 @@ function SkillList({
   totalVisible: number;
   query: string;
   onQueryChange: (q: string) => void;
-  sourceRoots: string[];
-  sourceFilter: string;
-  onSourceChange: (value: string) => void;
   selectedId: string | null;
   selectedFile: string | null;
   onSelectSkill: (id: string) => void;
@@ -422,11 +387,6 @@ function SkillList({
             {loading ? "—" : totalVisible}
           </span>
         </div>
-        {/* Optional source filter — the concrete path lives here, not in the
-            list's structure. Hidden until the catalog has >1 distinct root. */}
-        {sourceRoots.length > 1 && (
-          <SourceFilter sourceRoots={sourceRoots} value={sourceFilter} onChange={onSourceChange} />
-        )}
       </div>
 
       <div
@@ -449,17 +409,15 @@ function SkillList({
           </div>
         ) : skills.length === 0 ? (
           <p className="px-4 py-10 text-center text-[12.5px] text-muted-foreground">
-            {query || sourceFilter !== ALL_SOURCES
-              ? "No skills match your filters."
-              : "No skills available."}
+            {query ? `No skills match "${query}".` : "No skills available."}
           </p>
         ) : (
           // Grouped by harness-neutral OWNERSHIP (Omnigent → Agent → Local).
           // These headings express ownership, never a vendor/source-path detail.
           // Empty sections are hidden; each header is a collapsible disclosure
-          // (skill ROWS stay chevron-free). While a search/source filter is
-          // active, matching sections are force-open so results are never hidden
-          // behind a collapsed header — the stored collapse prefs are untouched.
+          // (skill ROWS stay chevron-free). While a text search is active,
+          // matching sections are force-open so results are never hidden behind
+          // a collapsed header — the stored collapse prefs are untouched.
           OWNERSHIP_ORDER.map((ownership) => {
             const rows = skills.filter((s) => s.ownership === ownership);
             if (rows.length === 0) return null;
@@ -518,7 +476,7 @@ const SKILL_GROUP_CAP = 6;
  * Each group instance owns its own capped state, so capping is independent
  * across groups (and reused verbatim for per-agent subgroups). Rules:
  *   - ≤ CAP rows → no control, all shown.
- *   - A search / source filter (`capBypassed`) shows every match — no cap.
+ *   - An active text search (`capBypassed`) shows every match — no cap.
  *   - The selected skill is always kept visible even if it sorts past the cap,
  *     so collapsing to the preview set never hides the current selection.
  */
@@ -590,42 +548,6 @@ function SkillGroupRows({
         </button>
       )}
     </>
-  );
-}
-
-/**
- * The optional source filter. Options are the catalog's distinct source roots
- * (`.claude/skills`, `~/.codex/skills`, `Included with agent`, …) plus an
- * "All sources" default. A native <select> keeps it keyboard- and
- * screen-reader-accessible for free.
- */
-function SourceFilter({
-  sourceRoots,
-  value,
-  onChange,
-}: {
-  sourceRoots: string[];
-  value: string;
-  onChange: (value: string) => void;
-}) {
-  return (
-    <label className="flex items-center gap-2 text-[11px] text-muted-foreground">
-      <span className="shrink-0">Source</span>
-      <select
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        aria-label="Filter skills by source"
-        data-testid="skills-source-filter"
-        className="min-w-0 flex-1 truncate rounded-md border border-border bg-muted px-2 py-1 font-mono text-[11.5px] text-foreground outline-none focus:ring-2 focus:ring-ring/40"
-      >
-        <option value={ALL_SOURCES}>All sources</option>
-        {sourceRoots.map((root) => (
-          <option key={root} value={root}>
-            {root}
-          </option>
-        ))}
-      </select>
-    </label>
   );
 }
 

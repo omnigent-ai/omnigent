@@ -339,54 +339,24 @@ describe("SkillsPage", () => {
     expect(screen.queryByTestId("skills-section-agent")).toBeNull();
   });
 
-  it("offers dynamic source-filter options (distinct roots + All sources)", async () => {
+  it("has no source filter control (ownership groups are the only IA)", async () => {
     vi.mocked(skillsApi.getSkillCatalog).mockResolvedValue({
       skills: [BUILTIN, WORKSPACE, PERSONAL_NATIVE, PERSONAL_OTHER],
-      includeOtherTools: false,
-      hiddenCount: 0,
-    });
-
-    renderPage();
-    const filter = (await screen.findByTestId("skills-source-filter")) as HTMLSelectElement;
-    const options = [...filter.options].map((o) => o.textContent);
-    // "All sources" default, then the distinct roots present in the catalog.
-    expect(options).toEqual([
-      "All sources",
-      "Included with agent",
-      ".claude/skills",
-      "~/.claude/skills",
-      "~/.codex/skills",
-    ]);
-  });
-
-  it("filters the list by source, composing with text search", async () => {
-    vi.mocked(skillsApi.getSkillCatalog).mockResolvedValue({
-      skills: [BUILTIN, WORKSPACE, PERSONAL_NATIVE, PERSONAL_OTHER],
-      includeOtherTools: false,
+      includeOtherTools: true,
       hiddenCount: 0,
     });
 
     renderPage();
     await screen.findByTestId("skill-row-ship");
-
-    // Pick the ~/.codex/skills source → only `migrate` remains.
-    fireEvent.change(screen.getByTestId("skills-source-filter"), {
-      target: { value: "~/.codex/skills" },
-    });
-    expect(screen.getByTestId("skill-row-migrate")).toBeInTheDocument();
-    expect(screen.queryByTestId("skill-row-ship")).toBeNull();
-    expect(screen.queryByTestId("skill-row-data-story")).toBeNull();
-
-    // A search that excludes `migrate` composes with the source filter → empty.
-    fireEvent.change(screen.getByTestId("skills-search"), { target: { value: "ship" } });
-    expect(screen.queryByTestId("skill-row-migrate")).toBeNull();
-    expect(screen.getByText("No skills match your filters.")).toBeInTheDocument();
+    // The Source / All-sources dropdown is gone; text search remains.
+    expect(screen.queryByTestId("skills-source-filter")).toBeNull();
+    expect(screen.getByTestId("skills-search")).toBeInTheDocument();
   });
 
-  it("keeps the selection valid when the selected skill is filtered out", async () => {
+  it("keeps the selection valid when the selected skill is filtered out by search", async () => {
     vi.mocked(skillsApi.getSkillCatalog).mockResolvedValue({
       skills: [BUILTIN, WORKSPACE, PERSONAL_NATIVE, PERSONAL_OTHER],
-      includeOtherTools: false,
+      includeOtherTools: true,
       hiddenCount: 0,
     });
 
@@ -395,10 +365,8 @@ describe("SkillsPage", () => {
     const detailPane = await screen.findByTestId("skill-detail");
     expect(detailPane).toHaveAttribute("data-skill-id", "bundle:ship");
 
-    // Filter to a source that excludes `ship` → selection moves to a visible row.
-    fireEvent.change(screen.getByTestId("skills-source-filter"), {
-      target: { value: "~/.codex/skills" },
-    });
+    // Search excludes `ship` → selection moves to the first still-visible row.
+    fireEvent.change(screen.getByTestId("skills-search"), { target: { value: "migrate" } });
     await waitFor(() => {
       expect(screen.getByTestId("skill-detail")).toHaveAttribute(
         "data-skill-id",
@@ -476,27 +444,6 @@ describe("SkillsPage", () => {
     expect(screen.getByTestId("skill-row-test-generator")).toBeInTheDocument();
     expect(screen.queryByTestId("skill-row-ship")).toBeNull();
     expect(screen.queryByTestId("skill-row-data-story")).toBeNull();
-  });
-
-  it("hides the source filter when the catalog has a single source root", async () => {
-    // Two skills, both from the same `.claude/skills` root → nothing to filter.
-    vi.mocked(skillsApi.getSkillCatalog).mockResolvedValue({
-      skills: [
-        WORKSPACE,
-        summary({
-          id: "workspace:another",
-          name: "another",
-          origin: "workspace",
-          displayPath: ".claude/skills/another",
-        }),
-      ],
-      includeOtherTools: false,
-      hiddenCount: 0,
-    });
-
-    renderPage();
-    await screen.findByTestId("skill-row-another");
-    expect(screen.queryByTestId("skills-source-filter")).toBeNull();
   });
 
   it("shows a conflict warning + resolution stack under Advanced only", async () => {
