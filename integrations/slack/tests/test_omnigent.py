@@ -536,6 +536,57 @@ async def test_run_turn_ends_when_idle_grace_elapses_and_snapshot_idle() -> None
     assert deltas == ["Answer."]
 
 
+@respx.mock
+async def test_run_turn_does_not_hang_after_elicitation_when_stream_silent() -> None:
+    # Incident 10f1d893: after an elicitation, the consumer parks to handle it,
+    # leaving the SSE connection unread. When it resumes, the (now stale) stream
+    # delivers nothing more and never closes — a bare read would hang forever,
+    # wedging the thread. The loop must treat the elicitation like a soft idle:
+    # settle-wait, then poll the snapshot, and END when the session is idle.
+    async def _stalls_after_elicitation() -> AsyncIterator[bytes]:
+        yield b'data: {"type":"response.output_text.delta","delta":"Before deleting."}\n\n'
+        yield (
+            b'data: {"type":"response.elicitation_request",'
+            b'"elicitation_id":"e1","params":{"message":"Approve?"}}\n\n'
+        )
+        # Then nothing: no more events, no [DONE]. A bare read here hangs.
+        await asyncio.sleep(30)
+
+    respx.get("http://omnigent.test/v1/sessions/conv_1/stream").mock(
+        return_value=httpx.Response(200, stream=_stalls_after_elicitation())
+    )
+    respx.post("http://omnigent.test/v1/sessions/conv_1/events").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    # The server has gone idle (the turn actually finished server-side).
+    respx.get("http://omnigent.test/v1/sessions/conv_1").mock(
+        return_value=httpx.Response(200, json={"status": "idle"})
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    async def _drain() -> list[str]:
+        return [
+            event.get("type")
+            async for event in client.run_turn(
+                "conv_1",
+                "go",
+                idle_grace_seconds=5.0,
+                idle_poll_seconds=0.05,
+                idle_settle_seconds=0.05,
+            )
+        ]
+
+    try:
+        # Must complete well within the stream's 30s stall — bounded by the poll,
+        # not hanging on the read.
+        types = await asyncio.wait_for(_drain(), timeout=5.0)
+    finally:
+        await client.aclose()
+
+    # The elicitation event was surfaced, then the turn ended cleanly (no hang).
+    assert "response.elicitation_request" in types
+
+
 async def test_await_within_grace_waits_while_snapshot_running() -> None:
     # The idle-disambiguation helper: each quiet poll consults the snapshot.
     # While the rolled-up status is `running` (a sub-agent child is still
@@ -589,6 +640,38 @@ async def test_await_within_grace_ends_when_snapshot_not_running() -> None:
 
     # First quiet poll + snapshot idle → the turn is genuinely over.
     assert result is _NO_RESUMPTION
+
+
+async def test_await_within_grace_keeps_waiting_on_transient_status_none() -> None:
+    # A None status is a best-effort snapshot failure (transient blip), NOT a
+    # confirmed end. Treating it as "done" would truncate a still-live fan-out on
+    # a momentary hiccup. The loop must keep waiting until the grace cap instead.
+    from omnigent_slack.omnigent import _NO_RESUMPTION
+
+    async def _never_read() -> dict[str, object]:
+        await asyncio.sleep(60.0)
+        return {"type": "response.output_text.delta", "delta": "never"}
+
+    client = OmnigentClient("http://omnigent.test")
+    calls = 0
+
+    async def _flaky_status(session_id: str) -> str | None:
+        nonlocal calls
+        calls += 1
+        return None  # snapshot fetch keeps failing
+
+    client.get_session_status = _flaky_status  # type: ignore[method-assign]
+    pending = asyncio.ensure_future(_never_read())
+    try:
+        # Cap 0.08s, poll 0.02s → several polls; each returns None but must not
+        # end early — only the cap ends it.
+        result = await client._await_within_grace(pending, "conv_1", 0.08, 0.02, 0.02)
+    finally:
+        pending.cancel()
+        await client.aclose()
+
+    assert result is _NO_RESUMPTION  # ended by the cap, not the first None
+    assert calls >= 2  # kept polling through the transient failures
 
 
 async def test_await_within_grace_cap_ends_even_while_running() -> None:
@@ -712,6 +795,50 @@ async def test_resolve_elicitation_decline_and_benign_statuses() -> None:
         await client.aclose()
 
 
+@respx.mock
+async def test_get_session_activity_maps_server_state() -> None:
+    # The server snapshot is the authoritative "is this session busy?" signal.
+    def snap(status: str, pending: list[dict[str, object]]) -> httpx.Response:
+        return httpx.Response(200, json={"status": status, "pending_elicitations": pending})
+
+    client = OmnigentClient("http://omnigent.test")
+    try:
+        route = respx.get("http://omnigent.test/v1/sessions/conv_1")
+
+        route.mock(return_value=snap("running", []))
+        a = await client.get_session_activity("conv_1")
+        assert a.is_busy and not a.needs_user_action
+
+        route.mock(return_value=snap("waiting", [{"elicitation_id": "e1"}]))
+        a = await client.get_session_activity("conv_1")
+        assert a.is_busy and a.needs_user_action
+
+        route.mock(return_value=snap("idle", []))
+        a = await client.get_session_activity("conv_1")
+        assert not a.is_busy and not a.needs_user_action
+
+        # An idle session that still has a pending elicitation needs action.
+        route.mock(return_value=snap("idle", [{"elicitation_id": "e2"}]))
+        a = await client.get_session_activity("conv_1")
+        assert not a.is_busy and a.needs_user_action
+    finally:
+        await client.aclose()
+
+
+@respx.mock
+async def test_get_session_activity_unreadable_snapshot_is_not_busy() -> None:
+    # A best-effort read failure must not report busy — the server safely buffers
+    # a message that races a turn, so "go ahead" is the safe conservative default.
+    respx.get("http://omnigent.test/v1/sessions/conv_1").mock(return_value=httpx.Response(500))
+    client = OmnigentClient("http://omnigent.test")
+    try:
+        a = await client.get_session_activity("conv_1")
+    finally:
+        await client.aclose()
+    assert a.status is None
+    assert not a.is_busy and not a.needs_user_action
+
+
 def test_extract_policy_denied() -> None:
     assert (
         extract_policy_denied(
@@ -830,40 +957,3 @@ def test_elicitation_binary_and_form_are_supported() -> None:
     )
     # Even with a schema present, an AskUserQuestion is a supported form.
     assert form is not None and form.is_form and form.is_supported is True
-
-
-@respx.mock
-async def test_get_pending_elicitation_returns_parsed_request() -> None:
-    respx.get("http://omnigent.test/v1/sessions/conv_1").mock(
-        return_value=httpx.Response(
-            200,
-            json={
-                "status": "running",
-                "pending_elicitations": [
-                    {
-                        "type": "response.elicitation_request",
-                        "elicitation_id": "elicit_x",
-                        "params": {"message": "Approve?", "policy_name": "p"},
-                    }
-                ],
-            },
-        )
-    )
-    client = OmnigentClient("http://omnigent.test")
-    try:
-        req = await client.get_pending_elicitation("conv_1")
-    finally:
-        await client.aclose()
-    assert req is not None and req.elicitation_id == "elicit_x"
-
-
-@respx.mock
-async def test_get_pending_elicitation_none_when_empty() -> None:
-    respx.get("http://omnigent.test/v1/sessions/conv_1").mock(
-        return_value=httpx.Response(200, json={"status": "idle", "pending_elicitations": []})
-    )
-    client = OmnigentClient("http://omnigent.test")
-    try:
-        assert await client.get_pending_elicitation("conv_1") is None
-    finally:
-        await client.aclose()

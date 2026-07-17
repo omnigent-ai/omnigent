@@ -275,18 +275,23 @@ This mirrors the web UI and CLI — the bot consumes `response.elicitation_reque
 and posts the verdict (with any selections as `content`) back to the session's
 resolve endpoint.
 
-While a request is outstanding, the session can't take new input. If the user
-sends another `@mention` (or DM) to that thread before answering, the bot
-privately ("Only visible to you") nudges them to respond to the pending request
-first, rather than silently queueing the message behind it. If they answer the
-request in the web UI instead of clicking the Slack card, the bot notices (it
-polls for external resolution) and continues without waiting. An unanswered
-card gives up after a few minutes so it can't wedge the thread — the user can
-just re-send.
+While a request is outstanding the turn stays open, so a message sent to that
+thread meanwhile is deflected like any other mid-turn message (see below). If the
+user answers the request in the web UI instead of clicking the Slack card, the
+bot notices (it polls for external resolution) and continues without waiting. An
+unanswered card gives up after a few minutes so it can't hold the thread open
+indefinitely — the user can just re-send.
 
-**One at a time per thread.** The bot processes a thread's turns serially. A
-message sent while an earlier turn is still running gets a private "still
-working on your previous message" note, then runs when the prior turn finishes.
+**One turn at a time per thread.** Each turn opens its own event stream, so the
+bot runs one turn per thread at a time — a second concurrent stream would render
+into Slack twice. There is no queue. A message that arrives *while a thread is
+still streaming* is not run: the bot privately ("Only visible to you") tells the
+user it's still working and to re-send once it has replied, or to continue right
+now in the web UI (which accepts concurrent input and shows any pending actions).
+A message to a thread that is idle again runs normally — Slack stays a full
+conversational surface, not just a way to kick a session off. Messages that race
+the check are safe regardless: the server buffers a message that lands mid-turn
+and runs it as a continuation.
 
 **Ordering.** A streamed reply is a single Slack message anchored to the moment
 it opened, so text kept flowing into it would sort *before* any card or notice

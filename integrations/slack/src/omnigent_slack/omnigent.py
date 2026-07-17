@@ -21,6 +21,7 @@ from omnigent_slack.events import (
     ElicitationRequest,
     OmnigentError,
     OutputFile,
+    SessionActivity,
     _extract_list,
     _extract_runner_id,
     _extract_session_id,
@@ -33,6 +34,7 @@ from omnigent_slack.events import (
     extract_output_file,
     extract_policy_denied,
     extract_todos,
+    is_elicitation_request,
     is_soft_idle_event,
     is_terminal_event,
     iter_sse_events,
@@ -52,6 +54,7 @@ __all__ = [
     "OutputFile",
     "RunnerUnavailableError",
     "ServerUnreachableError",
+    "SessionActivity",
     "ValidatedServer",
     "extract_assistant_text",
     "extract_delta",
@@ -60,10 +63,13 @@ __all__ = [
     "extract_output_file",
     "extract_policy_denied",
     "extract_todos",
+    "is_elicitation_request",
     "is_soft_idle_event",
     "is_terminal_event",
     "iter_sse_events",
 ]
+
+_logger = logging.getLogger(__name__)
 
 # Sentinels for the idle-grace disambiguation. ``_NO_RESUMPTION``: the grace
 # window elapsed and the snapshot confirms the turn is over. ``_RESUMED``: the
@@ -151,9 +157,15 @@ class OmnigentClient:
         runner_launch_timeout_seconds: float = 60.0,
         auth: ClientAuth | None = None,
     ) -> None:
+        # Bounded read timeout for ordinary requests so a stalled server can't
+        # hang a call indefinitely and wedge the per-thread turn queue. The
+        # long-lived SSE stream overrides this with ``read=None`` at its call
+        # site (see ``stream_session_events``), since a live tail legitimately
+        # blocks between events.
+        self._timeout = timeout
         self._client = httpx.AsyncClient(
             base_url=base_url.rstrip("/"),
-            timeout=httpx.Timeout(timeout, read=None),
+            timeout=httpx.Timeout(timeout),
         )
         self._runner_launch_timeout_seconds = runner_launch_timeout_seconds
         self._auth = auth
@@ -172,7 +184,10 @@ class OmnigentClient:
         # server itself is unreachable — distinct from an HTTP error response,
         # which ``_raise_for_status`` classifies.
         used_token = self._auth.access_token if self._auth is not None else None
-        headers = {**self._auth_headers(), **(kwargs.pop("headers", None) or {})}
+        # Pop caller headers once — a second pop would return None and silently
+        # drop them on the 401 retry below.
+        custom_headers = kwargs.pop("headers", None) or {}
+        headers = {**self._auth_headers(), **custom_headers}
         try:
             response = await self._client.request(method, url, headers=headers, **kwargs)
         except httpx.HTTPError as exc:
@@ -184,7 +199,7 @@ class OmnigentClient:
         if response.status_code == 401 and self._auth is not None:
             new_token = await self._auth.refresh(used_token)
             if new_token:
-                retry_headers = {**self._auth_headers(), **(kwargs.pop("headers", None) or {})}
+                retry_headers = {**self._auth_headers(), **custom_headers}
                 try:
                     response = await self._client.request(
                         method, url, headers=retry_headers, **kwargs
@@ -215,7 +230,9 @@ class OmnigentClient:
         return ValidatedServer(agents=agents, online_hosts=online_hosts)
 
     async def create_session(self, agent_id: str, title: str) -> str:
-        self._logger.info("Creating Omnigent session agent_id=%s title=%r", agent_id, title)
+        # Don't log the title — it embeds the user's message text; log only the
+        # agent id (everywhere else we log lengths, not content).
+        self._logger.info("Creating Omnigent session agent_id=%s", agent_id)
         response = await self._request(
             "POST",
             "/v1/sessions",
@@ -318,9 +335,13 @@ class OmnigentClient:
         # the chosen host can't serve the session — surface it as host-unavailable
         # so the caller can tell the user to start a host.
         if response.status_code in (404, 409):
-            raise HostUnavailableError(
-                f"Omnigent host {target_host} is not available: {response.text}"
+            self._logger.warning(
+                "Omnigent host unavailable host=%s status=%s body=%r",
+                target_host,
+                response.status_code,
+                response.text,
             )
+            raise HostUnavailableError(f"Omnigent host {target_host} is not available.")
         await _raise_for_status(response)
         payload = response.json()
         runner_id = _extract_runner_id(payload)
@@ -431,6 +452,9 @@ class OmnigentClient:
                 f"/v1/sessions/{session_id}/stream",
                 params={"idle": "false"},
                 headers=self._auth_headers(),
+                # A live tail blocks between events — disable the read timeout
+                # for the stream only (ordinary requests keep the bounded one).
+                timeout=httpx.Timeout(self._timeout, read=None),
             ) as response:
                 await _raise_for_status(response)
                 self._logger.debug("Connected to Omnigent SSE stream session_id=%s", session_id)
@@ -531,7 +555,14 @@ class OmnigentClient:
                     )
                     yield event
 
-                    if is_soft_idle_event(event):
+                    if is_soft_idle_event(event) or is_elicitation_request(event):
+                        # A soft idle OR an elicitation request: the consumer
+                        # parks while handling it, leaving the SSE connection
+                        # unread. Don't resume into an unbounded read — the stale
+                        # connection may never deliver the post-resolve events and
+                        # would hang the turn forever. Disambiguate via the grace
+                        # window (settle-wait + status poll), which ends cleanly
+                        # when the server has gone idle.
                         awaiting_resumption = True
                         continue
                     if is_terminal_event(event):
@@ -594,7 +625,16 @@ class OmnigentClient:
             # Still quiet — is the session genuinely done, or a fan-out parent
             # waiting on a sub-agent (rolled-up status still `running`)?
             status = await self.get_session_status(session_id)
-            if status != "running":
+            # The status fetch is a network round-trip; the next event may have
+            # arrived during it. Re-check before ending, or we'd cancel a
+            # completed read and truncate the reply.
+            if pending.done():
+                return _RESUMED
+            # Only a DEFINITIVE not-running status ends the turn. A ``None`` here
+            # is a best-effort snapshot failure (transient network/server blip) —
+            # treating it as "done" would truncate a still-live fan-out on a
+            # momentary hiccup, so keep waiting until the grace cap instead.
+            if status is not None and status != "running":
                 return _NO_RESUMPTION
             if asyncio.get_running_loop().time() >= deadline:
                 self._logger.info(
@@ -614,6 +654,23 @@ class OmnigentClient:
                 session_id,
             )
 
+    async def _get_json(self, url: str, **kwargs: Any) -> dict[str, Any] | None:
+        """Best-effort GET returning the JSON body as a dict, else ``None``.
+
+        Shared by the read-only status/elicitation/items probes, all of which
+        must degrade gracefully (a transient failure must never abort or wedge a
+        turn). Swallows transport/HTTP errors AND a non-JSON body — callers get
+        ``None`` and apply their own conservative default.
+        """
+        try:
+            response = await self._request("GET", url, **kwargs)
+            await _raise_for_status(response)
+            payload = response.json()
+        except (OmnigentError, ValueError):
+            # ValueError covers json.JSONDecodeError (non-JSON 200 body).
+            return None
+        return payload if isinstance(payload, dict) else None
+
     async def get_session_status(self, session_id: str) -> str | None:
         """Fetch the session's rolled-up status from the snapshot.
 
@@ -624,46 +681,35 @@ class OmnigentClient:
         turn really over?" check when a stream ``idle`` is ambiguous. Best-effort
         — returns ``None`` on any failure so the caller falls back to the timer.
         """
-        try:
-            response = await self._request("GET", f"/v1/sessions/{session_id}")
-            await _raise_for_status(response)
-            status = response.json().get("status")
-            return status if isinstance(status, str) else None
-        except OmnigentError:
-            return None
+        snapshot = await self._get_json(f"/v1/sessions/{session_id}")
+        status = snapshot.get("status") if snapshot else None
+        return status if isinstance(status, str) else None
 
-    async def _pending_elicitations(self, session_id: str) -> list[ElicitationRequest]:
-        """Parse the session snapshot's outstanding elicitations.
+    async def get_session_activity(self, session_id: str) -> SessionActivity:
+        """Snapshot of whether the SERVER considers this session busy.
 
-        Best-effort — returns ``[]`` on any failure. ``None`` snapshot status
-        (an auth/transport hiccup) is indistinguishable from "empty" here; both
-        yield ``[]``, so callers must treat "no pending" conservatively.
+        Mirrors the web UI's send-gating (``computeIsWorking`` +
+        pending-elicitation): a session is busy when its rolled-up ``status`` is
+        ``running``/``waiting``, and needs user action when it has a pending
+        elicitation. Both are SERVER-derived — the authoritative "can I submit a
+        new prompt now?" signal — unlike any local connection bookkeeping. One
+        GET. Best-effort: an unreadable snapshot returns ``unknown`` so the caller
+        can decide conservatively (we treat unknown as "go ahead", since the
+        server itself safely buffers a message that races a turn).
         """
-        try:
-            response = await self._request("GET", f"/v1/sessions/{session_id}")
-            await _raise_for_status(response)
-        except OmnigentError:
-            return []
-        pending = response.json().get("pending_elicitations")
-        if not isinstance(pending, list):
-            return []
-        out: list[ElicitationRequest] = []
-        for entry in pending:
-            if isinstance(entry, dict):
-                request = extract_elicitation_request(entry, session_id)
-                if request is not None:
-                    out.append(request)
-        return out
+        snapshot = await self._get_json(f"/v1/sessions/{session_id}")
+        if snapshot is None:
+            return SessionActivity(status=None, pending_elicitation=False)
+        status = snapshot.get("status")
+        return SessionActivity(
+            status=status if isinstance(status, str) else None,
+            pending_elicitation=bool(self._parse_pending(snapshot)),
+        )
 
-    async def get_pending_elicitation(self, session_id: str) -> ElicitationRequest | None:
-        """Return the session's first outstanding elicitation, if any.
-
-        Used to detect that a session is parked awaiting the user before a new
-        message is submitted — the bot tells the user to answer the pending
-        request first. Best-effort — ``None`` when nothing is pending or on error.
-        """
-        pending = await self._pending_elicitations(session_id)
-        return pending[0] if pending else None
+    @staticmethod
+    def _parse_pending(snapshot: dict[str, Any] | None) -> list[dict[str, Any]]:
+        pending = snapshot.get("pending_elicitations") if snapshot else None
+        return [e for e in pending if isinstance(e, dict)] if isinstance(pending, list) else []
 
     async def is_elicitation_pending(self, session_id: str, elicitation_id: str) -> bool:
         """Whether ``elicitation_id`` is still outstanding on the server.
@@ -673,34 +719,29 @@ class OmnigentClient:
         on a read failure returns ``True`` (assume still pending) so a transient
         hiccup doesn't spuriously abandon the wait.
         """
-        try:
-            response = await self._request("GET", f"/v1/sessions/{session_id}")
-            await _raise_for_status(response)
-        except OmnigentError:
-            return True
-        pending = response.json().get("pending_elicitations")
-        if not isinstance(pending, list):
-            return False
+        snapshot = await self._get_json(f"/v1/sessions/{session_id}")
+        if snapshot is None:
+            return True  # read failed — assume still pending, don't abandon.
         return any(
-            isinstance(e, dict) and e.get("elicitation_id") == elicitation_id for e in pending
+            e.get("elicitation_id") == elicitation_id for e in self._parse_pending(snapshot)
         )
 
-    async def latest_assistant_message(self, session_id: str) -> tuple[str, str] | None:
+    async def latest_assistant_message(self, session_id: str) -> tuple[str | None, str] | None:
         """Return ``(item_id, text)`` of the newest assistant message, or None.
 
         The id lets a caller tell *this* turn's message from a prior turn's — a
         blind "latest text" fetch would otherwise resurrect the previous answer
-        when the current turn produced none (e.g. a denied approval).
+        when the current turn produced none (e.g. a denied approval). ``item_id``
+        is ``None`` when the message carries no id, so a caller can't mistake two
+        id-less messages for the same one. Best-effort: the outer ``None`` on any
+        read failure (the caller must not be left mid-turn if the snapshot fetch
+        fails).
         """
         self._logger.debug("Fetching latest Omnigent assistant item session_id=%s", session_id)
-        response = await self._request(
-            "GET",
-            f"/v1/sessions/{session_id}/items",
-            params={"limit": 100, "order": "desc"},
+        payload = await self._get_json(
+            f"/v1/sessions/{session_id}/items", params={"limit": 100, "order": "desc"}
         )
-        await _raise_for_status(response)
-        payload = response.json()
-        items = payload.get("data", [])
+        items = payload.get("data") if payload else None
         if not isinstance(items, list):
             return None
         for item in items:
@@ -709,7 +750,7 @@ class OmnigentClient:
             text = extract_assistant_text(item)
             if text:
                 item_id = item.get("id")
-                return (item_id if isinstance(item_id, str) else "", text)
+                return (item_id if isinstance(item_id, str) and item_id else None, text)
         return None
 
 
@@ -799,16 +840,23 @@ async def _raise_for_status(response: httpx.Response) -> None:
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:
         error_code = _extract_error_code(response)
+        # The raw server body can carry internal paths/stack traces; log it for
+        # operators but keep it out of the exception message, which surfaces to
+        # the Slack channel (visible to everyone in the thread).
+        _logger.warning(
+            "Omnigent request failed status=%s url=%s body=%r",
+            response.status_code,
+            response.request.url,
+            response.text,
+        )
         if response.status_code == 503 and error_code == "runner_unavailable":
-            raise RunnerUnavailableError(
-                f"Omnigent runner unavailable for {response.request.url}: {response.text}"
-            ) from exc
+            raise RunnerUnavailableError("Omnigent runner is unavailable.") from exc
         if response.status_code == 401:
             raise AuthRequiredError(
                 f"Omnigent server requires authentication for {response.request.url}"
             ) from exc
         raise OmnigentError(
-            f"Omnigent request failed with {response.status_code}: {response.text}"
+            f"Omnigent request failed with status {response.status_code}."
         ) from exc
 
 

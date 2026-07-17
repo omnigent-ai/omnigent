@@ -9,13 +9,14 @@ from typing import Any, Protocol
 from slack_sdk.errors import SlackApiError
 
 from omnigent_slack.approvals import (
+    ClickTarget,
     ElicitationCoordinator,
     Verdict,
     elicitation_card_blocks,
+    resolve_form_answers,
     resolved_card_blocks,
 )
 from omnigent_slack.auth_manager import pack_user_key
-from omnigent_slack.dispatcher import ThreadTurnDispatcher
 from omnigent_slack.models import SlackTurn, ThreadKey
 from omnigent_slack.notifications import (
     format_output_file,
@@ -272,6 +273,14 @@ class _AnswerReply:
         self._logger = logger
         self._streamed = ""
         self._final: str | None = None
+        # Text put on screen in each sealed segment this turn. Unlike
+        # ``_streamed``/``_final`` (which reset at each seal), this survives
+        # interruptions, so the no-delta fallback can tell whether the server's
+        # newest assistant message is one we ALREADY showed (a trailing notice
+        # sealed off an answer we streamed → don't re-post) from a genuinely new
+        # message that never streamed (e.g. the post-elicitation answer arrived
+        # only committed → DO recover it).
+        self._delivered_texts: list[str] = []
 
     @property
     def segments(self) -> int:
@@ -297,7 +306,12 @@ class _AnswerReply:
         # Before an out-of-band message: drop the placeholder (it would sit
         # stale above the interruption for the whole wait), finalize the current
         # segment so the interruption sorts after it, and forget the accumulated
-        # text so the next segment reconciles independently.
+        # text so the next segment reconciles independently. Record what this
+        # segment delivered BEFORE resetting, so the fallback can recognize an
+        # already-shown message and not re-post it.
+        shown = self._streamed + self._tail()
+        if shown:
+            self._delivered_texts.append(shown)
         await self._clear_ack()
         await self._reply.seal()
         self._streamed, self._final = "", None
@@ -329,9 +343,22 @@ class _AnswerReply:
         return ""
 
     def needs_fallback_text(self) -> bool:
-        # True when nothing streamed and no final item — the caller should fetch
-        # the latest assistant text from the server as a last resort.
+        # True when the current (final) segment has no answer to deliver — the
+        # caller may then recover the server's newest committed message. This is
+        # a per-segment check; ``already_delivered`` guards against re-posting a
+        # message an earlier sealed segment already showed.
         return not self._streamed and not self._tail()
+
+    def already_delivered(self, text: str) -> bool:
+        # Whether ``text`` matches something already put on screen this turn (a
+        # sealed segment, or the current one). Lets the fallback distinguish a
+        # message that already streamed but was sealed off by a trailing notice
+        # (don't re-post) from one that never streamed (recover it).
+        candidate = text.strip()
+        if not candidate:
+            return True
+        shown = [*self._delivered_texts, self._streamed + self._tail()]
+        return any(candidate == s.strip() for s in shown if s)
 
     def set_fallback_text(self, text: str) -> None:
         self._final = text
@@ -385,7 +412,19 @@ class SlackOmnigentService:
         # How often, while awaiting a Slack click, to poll for external
         # resolution (overridable in tests to avoid real-time waits).
         self._external_resolve_poll_seconds = _EXTERNAL_RESOLVE_POLL_SECONDS
-        self._dispatcher = ThreadTurnDispatcher(self._run_turn)
+        # Threads with a turn actively streaming IN THIS PROCESS. Each turn opens
+        # its own SSE stream; two at once would render the same events into Slack
+        # twice. This is a LOCAL concurrency guard (reserved synchronously, before
+        # any await, so two racing messages can't both pass) — necessary because
+        # the server-activity check alone races: claude-native flips to `idle`
+        # between streaming bursts, so a snapshot mid-turn can read "not busy"
+        # while a local stream is still live. The guard is safe from stale-wedge
+        # because every turn is bounded (the elicitation grace fix guarantees it
+        # ends and releases). The server-activity check (see _route_turn) is the
+        # SEPARATE cross-surface signal (web-UI busy / pending action).
+        self._active_threads: set[ThreadKey] = set()
+        # In-flight turn tasks, tracked so shutdown can cancel them.
+        self._turn_tasks: set[asyncio.Task[None]] = set()
         self._logger = logging.getLogger(__name__)
 
     @property
@@ -393,7 +432,10 @@ class SlackOmnigentService:
         return self._elicitations
 
     async def shutdown(self) -> None:
-        await self._dispatcher.shutdown()
+        tasks = list(self._turn_tasks)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     async def handle_app_mention(
         self,
@@ -511,75 +553,144 @@ class SlackOmnigentService:
         in_channel: bool,
     ) -> None:
         requester = str(event.get("user") or "")
-        record = await self._store.get_session(key)
+        if not requester:
+            # No authenticated Slack user on the event — we can't attribute the
+            # message to an owner, so we refuse to route it. Never fall through to
+            # an owner-less turn (that would be an unguarded, adoptable session).
+            self._logger.warning("Dropping Slack event with no user thread=%s", key.display())
+            return
 
-        if record is not None:
-            # An existing thread belongs to whoever started it. A follow-up from
-            # a different user (only possible in a channel) is not added to the
-            # session. Tell that user — privately, so the thread isn't cluttered
-            # — why nothing happened and how to get their own session.
-            if record.owner_user_id and record.owner_user_id != requester:
+        # LOCAL concurrency guard: reserve the thread SYNCHRONOUSLY here (no await
+        # before this add) so two near-simultaneous messages can't both open a
+        # stream and double-render. If already reserved, a turn is streaming in
+        # this process → deflect. This is distinct from the server-activity check
+        # below: claude-native reads `idle` between bursts, so the server snapshot
+        # alone would let a 2nd turn slip in mid-stream. The reservation is held
+        # until either a spawned turn's finally releases it, or we release it
+        # below on any path that does NOT spawn.
+        if key in self._active_threads:
+            self._logger.info(
+                "Thread already streaming in-process thread=%s; deflecting", key.display()
+            )
+            record = await self._store.get_session(key)
+            if record is not None and record.owner_user_id != requester:
+                await self._notify_non_owner(client, key, requester)
+            else:
+                await self._notify_thread_busy(client, key, requester, needs_action=False)
+            return
+        self._active_threads.add(key)
+        spawned = False
+        try:
+            record = await self._store.get_session(key)
+
+            if record is not None:
+                # An existing thread belongs to whoever started it. A follow-up
+                # from a different user (only possible in a channel) is not added
+                # to the session. Tell that user — privately — why nothing
+                # happened. A record with no stored owner is treated as locked
+                # (fail closed): only match when owner is known AND == requester.
+                if record.owner_user_id != requester:
+                    self._logger.info(
+                        "Ignoring follow-up from non-owner thread=%s owner=%s requester=%s",
+                        key.display(),
+                        record.owner_user_id,
+                        requester,
+                    )
+                    await self._notify_non_owner(client, key, requester)
+                    return
+                # Cross-surface check: the SERVER decides busy/awaiting-action
+                # (web UI or another client may be driving the session), mirroring
+                # the web UI's send gate. The local guard above already prevents a
+                # concurrent Slack stream; this catches activity elsewhere.
+                omnigent = await self._pool.get(
+                    self._server_url, pack_user_key(key.team_id, requester)
+                )
+                activity = await omnigent.get_session_activity(record.session_id)
+                if activity.needs_user_action or activity.is_busy:
+                    self._logger.info(
+                        "Server busy thread=%s status=%s pending=%s; deflecting",
+                        key.display(),
+                        activity.status,
+                        activity.pending_elicitation,
+                    )
+                    await self._notify_thread_busy(
+                        client, key, requester, needs_action=activity.needs_user_action
+                    )
+                    return
+                self._spawn_turn(
+                    SlackTurn(
+                        key=key,
+                        text=text,
+                        user_id=requester,
+                        create_if_missing=False,
+                        title=_session_title(event, text),
+                        slack_client=client,
+                        agent_id="",
+                        owner_user_id=record.owner_user_id or requester,
+                        workspace=record.workspace,
+                        host_id=record.host_id,
+                    )
+                )
+                spawned = True
+                return
+
+            config = await self._store.get_user_config(key.team_id, requester)
+            if config is None:
                 self._logger.info(
-                    "Ignoring follow-up from non-owner thread=%s owner=%s requester=%s",
+                    "Unconfigured user thread=%s user=%s; prompting setup",
                     key.display(),
-                    record.owner_user_id,
                     requester,
                 )
-                await self._notify_non_owner(client, key, requester)
+                await self._setup.prompt_unconfigured(
+                    client,
+                    requester,
+                    channel=key.channel_id,
+                    thread_ts=key.thread_ts,
+                    in_channel=in_channel,
+                )
                 return
-            # If the session is parked awaiting a decision, a new message can't
-            # proceed until that's answered. Nudge the user (privately) to
-            # resolve the pending request rather than silently queueing behind it.
-            if await self._notify_if_awaiting_input(client, key, requester):
-                return
-            will_wait = await self._dispatcher.enqueue(
+
+            self._spawn_turn(
                 SlackTurn(
                     key=key,
                     text=text,
                     user_id=requester,
-                    create_if_missing=False,
+                    create_if_missing=True,
                     title=_session_title(event, text),
                     slack_client=client,
-                    agent_id="",
-                    owner_user_id=record.owner_user_id or requester,
-                    workspace=record.workspace,
-                    host_id=record.host_id,
+                    agent_id=config.agent_id,
+                    owner_user_id=requester,
+                    workspace=config.workspace,
+                    host_id=config.host_id,
                 )
             )
-            if will_wait:
-                await self._notify_queued(client, key, requester)
-            return
+            spawned = True
+        finally:
+            # Release the reservation unless a turn was spawned — the spawned
+            # turn's ``_run_turn_tracked`` finally owns the release from here on.
+            if not spawned:
+                self._active_threads.discard(key)
 
-        config = await self._store.get_user_config(key.team_id, requester)
-        if config is None:
-            self._logger.info(
-                "Unconfigured user thread=%s user=%s; prompting setup",
-                key.display(),
-                requester,
-            )
-            await self._setup.prompt_unconfigured(
-                client,
-                requester,
-                channel=key.channel_id,
-                thread_ts=key.thread_ts,
-                in_channel=in_channel,
-            )
-            return
+    def _spawn_turn(self, turn: SlackTurn) -> None:
+        """Run a reserved turn as a background task, tracked for shutdown.
 
-        await self._dispatcher.enqueue(
-            SlackTurn(
-                key=key,
-                text=text,
-                user_id=requester,
-                create_if_missing=True,
-                title=_session_title(event, text),
-                slack_client=client,
-                agent_id=config.agent_id,
-                owner_user_id=requester,
-                workspace=config.workspace,
-                host_id=config.host_id,
-            )
-        )
+        The thread is already reserved in ``_active_threads`` by ``_route_turn``
+        (synchronously, before any await); ``_run_turn_tracked`` releases it when
+        the turn ends.
+        """
+        task = asyncio.create_task(self._run_turn_tracked(turn))
+        self._turn_tasks.add(task)
+        task.add_done_callback(self._turn_tasks.discard)
+
+    async def _run_turn_tracked(self, turn: SlackTurn) -> None:
+        try:
+            await self._run_turn(turn)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._logger.exception("Slack turn failed for %s", turn.key.display())
+        finally:
+            self._active_threads.discard(turn.key)
 
     async def _run_turn(self, turn: SlackTurn) -> None:
         self._logger.info("Starting turn thread=%s chars=%s", turn.key.display(), len(turn.text))
@@ -613,7 +724,6 @@ class SlackOmnigentService:
         # Baseline the newest assistant message BEFORE the turn runs, so the
         # no-delta fallback below can tell this turn's answer from a prior one.
         baseline = await omnigent.latest_assistant_message(session_id)
-        baseline_id = baseline[0] if baseline else None
 
         try:
             error_text = await self._stream_turn(turn, omnigent, session_id, reply)
@@ -623,12 +733,21 @@ class SlackOmnigentService:
             return
 
         if reply.needs_fallback_text():
-            # The answer may have arrived only as a committed item we didn't see
-            # streamed. Recover it — but ONLY if it's newer than the baseline, so
-            # a turn that produced no answer (e.g. a denied approval) doesn't
-            # resurrect the previous turn's message.
+            # The current segment delivered nothing (e.g. a post-elicitation
+            # answer that arrived only as a committed item, never streamed).
+            # Recover the server's newest assistant message, but only when it's
+            # genuinely new: it must differ from the pre-turn baseline (else a
+            # no-answer turn like a denied approval would resurrect the PREVIOUS
+            # turn's message) AND not be something an earlier sealed segment this
+            # turn already showed (else a trailing notice would re-post the answer
+            # we just streamed). Compare the whole (id, text) tuple so an id-less
+            # message is judged by its text, not a blank id.
             latest = await omnigent.latest_assistant_message(session_id)
-            if latest is not None and latest[0] != baseline_id:
+            if (
+                latest is not None
+                and latest != baseline
+                and not reply.already_delivered(latest[1])
+            ):
                 reply.set_fallback_text(latest[1])
         delivered_answer = await reply.finalize(error_text=error_text)
         if error_text and delivered_answer:
@@ -762,7 +881,9 @@ class SlackOmnigentService:
             # stays open (session sits in `waiting`), and resumed text opens a
             # fresh segment after the card.
             await reply.seal_for_interruption()
-            await self._handle_elicitation(omnigent, client, turn.key, elicitation)
+            await self._handle_elicitation(
+                omnigent, client, turn.key, turn.owner_user_id, elicitation
+            )
             return
 
         denied_reason = extract_policy_denied(event)
@@ -862,97 +983,70 @@ class SlackOmnigentService:
             text=f":warning: Omnigent request failed: {error_text}",
         )
 
+    async def _post_ephemeral(
+        self,
+        client: SlackClientProtocol,
+        key: ThreadKey,
+        user_id: str,
+        text: str,
+    ) -> None:
+        # Best-effort "Only visible to you" note, anchored in-thread. Used to
+        # explain privately why a message wasn't acted on, without cluttering the
+        # thread. A failed post must never abort handling.
+        try:
+            await client.chat_postEphemeral(
+                channel=key.channel_id,
+                user=user_id,
+                thread_ts=key.thread_ts,
+                text=text,
+            )
+        except Exception:
+            self._logger.warning("Ephemeral notice failed thread=%s; continuing", key.display())
+
     async def _notify_non_owner(
-        self,
-        client: SlackClientProtocol,
-        key: ThreadKey,
-        user_id: str,
+        self, client: SlackClientProtocol, key: ThreadKey, user_id: str
     ) -> None:
-        # Best-effort ephemeral ("Only visible to you") note so the follow-up
-        # author isn't left wondering why the bot went silent. Posted in-thread
-        # so Slack anchors it to where they typed. A failed post is non-fatal.
-        try:
-            await client.chat_postEphemeral(
-                channel=key.channel_id,
-                user=user_id,
-                thread_ts=key.thread_ts,
-                text=(
-                    "This Omnigent thread belongs to whoever started it, so I can't "
-                    "add your message to it. Start a new thread by mentioning me "
-                    "(or DM me) to get your own session."
-                ),
-            )
-        except Exception:
-            self._logger.warning(
-                "Non-owner ephemeral notice failed thread=%s; continuing", key.display()
-            )
+        await self._post_ephemeral(
+            client,
+            key,
+            user_id,
+            "This Omnigent thread belongs to whoever started it, so I can't "
+            "add your message to it. Start a new thread by mentioning me "
+            "(or DM me) to get your own session.",
+        )
 
-    async def _notify_queued(
+    async def _notify_thread_busy(
         self,
         client: SlackClientProtocol,
         key: ThreadKey,
         user_id: str,
+        *,
+        needs_action: bool,
     ) -> None:
-        # Best-effort ephemeral: the thread is already handling an earlier turn,
-        # so this message waits its turn (the bot processes one at a time per
-        # thread). Tells the user privately rather than leaving them wondering
-        # why there's no immediate reply.
-        try:
-            await client.chat_postEphemeral(
-                channel=key.channel_id,
-                user=user_id,
-                thread_ts=key.thread_ts,
-                text=(
-                    ":hourglass: I'm still working on your previous message in this "
-                    "thread — I'll get to this one right after."
-                ),
-            )
-        except Exception:
-            self._logger.warning(
-                "Queued ephemeral notice failed thread=%s; continuing", key.display()
-            )
+        """Tell the owner their message can't run because the server is busy.
 
-    async def _notify_if_awaiting_input(
-        self,
-        client: SlackClientProtocol,
-        key: ThreadKey,
-        user_id: str,
-    ) -> bool:
-        """If the session is parked on a pending elicitation, nudge the user.
-
-        Returns ``True`` when a pending request was found and the user was told
-        (privately) to answer it first — the caller then skips enqueuing, since
-        a new message can't proceed until the decision is made. Best-effort: any
-        failure resolving the session or posting falls through to ``False`` so
-        the message is handled normally rather than dropped.
+        Mirrors the web UI's two "can't send now" states: (a) ``needs_action`` —
+        the session is parked awaiting a decision, so the user must answer the
+        pending request (in Slack above, or the web UI); (b) otherwise the server
+        is running/waiting, so wait for the reply or interrupt in the web UI. The
+        message was NOT run and is NOT queued — a message to an idle thread runs
+        normally, so re-sending once the session frees works.
         """
         record = await self._store.get_session(key)
-        if record is None:
-            return False
-        omnigent = await self._pool.get(self._server_url, pack_user_key(key.team_id, user_id))
-        pending = await omnigent.get_pending_elicitation(record.session_id)
-        if pending is None:
-            return False
-        self._logger.info(
-            "Message while awaiting input thread=%s elicitation_id=%s; nudging user",
-            key.display(),
-            pending.elicitation_id,
-        )
-        try:
-            await client.chat_postEphemeral(
-                channel=key.channel_id,
-                user=user_id,
-                thread_ts=key.thread_ts,
-                text=(
-                    ":hourglass: I'm waiting on your response to the request above "
-                    "before I can continue. Answer that first, then send your message again."
-                ),
+        link = self._session_web_link(record.session_id) if record is not None else None
+        if needs_action:
+            text = (
+                ":hourglass: I'm waiting on your response to the request above before I can "
+                "continue. Answer it here"
             )
-        except Exception:
-            self._logger.warning(
-                "Awaiting-input ephemeral failed thread=%s; continuing", key.display()
+            text += f", or in the <{link}|web UI>." if link else "."
+        else:
+            text = (
+                ":hourglass: I'm still working on your previous message in this thread — "
+                "I handle one at a time here, so send this again once I've replied"
             )
-        return True
+            text += f", or wait / interrupt in the <{link}|web UI>." if link else "."
+        await self._post_ephemeral(client, key, user_id, text)
 
     async def handle_elicitation_action(self, *, elicitation_id: str, verdict: Verdict) -> bool:
         """Deliver a button/form verdict to the waiting turn worker.
@@ -960,7 +1054,35 @@ class SlackOmnigentService:
         Returns whether a live waiter received it — ``False`` means the request
         already expired or was answered, so the caller can tell the user.
         """
-        return await self._elicitations.resolve(elicitation_id, verdict)
+        return self._elicitations.resolve(elicitation_id, verdict)
+
+    async def reject_non_owner_click(
+        self, client: SlackClientProtocol, body: dict[str, Any], target: ClickTarget
+    ) -> None:
+        """Privately tell a non-owner their click on someone else's card was ignored.
+
+        The verdict is NOT delivered (the owner check already blocked it); this
+        is just feedback so the clicker isn't left wondering. Channel/thread come
+        from the interaction body (a Block Kit action payload).
+        """
+        channel = (body.get("channel") or {}).get("id")
+        clicker = (body.get("user") or {}).get("id")
+        message = body.get("message") or {}
+        thread_ts = message.get("thread_ts") or message.get("ts")
+        if not isinstance(channel, str) or not isinstance(clicker, str):
+            return
+        try:
+            await client.chat_postEphemeral(
+                channel=channel,
+                user=clicker,
+                thread_ts=thread_ts if isinstance(thread_ts, str) else None,
+                text=(
+                    "This request belongs to whoever started the thread — only they "
+                    "can answer it. Start your own thread by mentioning me (or DM me)."
+                ),
+            )
+        except Exception:
+            self._logger.warning("Non-owner click ephemeral failed; continuing")
 
     def _session_link(self, session_id: str, elicitation_id: str) -> str:
         # Deep link to the elicitation's approve page in the Omnigent web UI, so
@@ -968,11 +1090,19 @@ class SlackOmnigentService:
         base = self._server_url.rstrip("/")
         return f"{base}/approve/{session_id}/{elicitation_id}"
 
+    def _session_web_link(self, session_id: str) -> str:
+        # Link to the session's conversation page in the Omnigent web UI, where a
+        # user can continue a thread that's mid-turn in Slack (the web UI accepts
+        # concurrent input and shows any pending actions).
+        base = self._server_url.rstrip("/")
+        return f"{base}/c/{session_id}"
+
     async def _handle_elicitation(
         self,
         omnigent: OmnigentClient,
         client: SlackClientProtocol,
         key: ThreadKey,
+        owner_user_id: str,
         request: ElicitationRequest,
     ) -> None:
         """Post the elicitation card, wait for the answer, and resolve it.
@@ -1013,11 +1143,15 @@ class SlackOmnigentService:
             request.policy_name,
             request.is_form,
         )
+        # Register the waiter BEFORE posting the card: a fast click could
+        # otherwise reach the action handler before the awaiter exists and be
+        # dropped (silent timeout-deny). Registering first closes that window.
+        self._elicitations.register(request.elicitation_id)
         posted = await client.chat_postMessage(
             channel=key.channel_id,
             thread_ts=key.thread_ts,
             text="Omnigent needs your input to continue.",
-            blocks=elicitation_card_blocks(request),
+            blocks=elicitation_card_blocks(request, owner_user_id),
         )
         card_ts = posted.get("ts")
 
@@ -1029,12 +1163,16 @@ class SlackOmnigentService:
             outcome = "Answered elsewhere"
         else:
             assert verdict is None or isinstance(verdict, Verdict)
+            content: dict[str, Any] | None = None
             if verdict is None:
                 # Nobody answered in time — decline so the server park releases.
                 verdict = Verdict(accepted=False)
                 outcome = "Timed out"
             elif request.is_form:
                 # A form Submit is an accept with selections; Cancel is a decline.
+                # Selections arrive as option indices — map them back to the full
+                # labels the agent expects (labels can exceed Slack's value cap).
+                content = resolve_form_answers(request, verdict.content)
                 outcome = "Answered" if verdict.accepted else "Cancelled"
             else:
                 outcome = "Approved" if verdict.accepted else "Denied"
@@ -1042,7 +1180,7 @@ class SlackOmnigentService:
                 request.session_id,
                 request.elicitation_id,
                 accepted=verdict.accepted,
-                content=verdict.content,
+                content=content,
             )
         self._logger.info(
             "Elicitation resolved thread=%s elicitation_id=%s outcome=%s",
@@ -1080,7 +1218,8 @@ class SlackOmnigentService:
         returns the :class:`Verdict` from the click, or ``None`` on timeout.
 
         Without this, a web-UI answer would leave the worker blocked until the
-        coordinator timeout — wedging the whole thread's serial queue.
+        coordinator timeout — holding the thread's turn open (and deflecting its
+        follow-ups) the whole time.
         """
         verdict_task = asyncio.ensure_future(
             self._elicitations.await_verdict(request.elicitation_id)

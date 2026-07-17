@@ -138,6 +138,19 @@ def is_terminal_event(event: dict[str, Any]) -> bool:
     }
 
 
+def is_elicitation_request(event: dict[str, Any]) -> bool:
+    """True for a ``response.elicitation_request`` event.
+
+    Like a soft idle, this is an AMBIGUOUS boundary for the read loop: the
+    consumer parks (posts a card, blocks for the verdict) while it's handled, so
+    the SSE connection goes unread for as long as the user takes to answer. When
+    the loop resumes it must NOT go straight into an unbounded read — the stale
+    connection may never deliver the post-resolve events. The caller routes the
+    next read through the grace disambiguation (poll status) instead.
+    """
+    return event.get("type") == "response.elicitation_request"
+
+
 def is_soft_idle_event(event: dict[str, Any]) -> bool:
     """True for a ``session.status: idle`` edge — an AMBIGUOUS turn boundary.
 
@@ -262,6 +275,29 @@ class OutputFile:
 
     file_id: str
     filename: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SessionActivity:
+    """The server's view of whether a session is busy right now.
+
+    ``status`` is the rolled-up session status (``running``/``waiting`` = busy,
+    ``idle``/``failed`` = free, ``None`` = snapshot unreadable). ``pending_elicitation``
+    is ``True`` when the session is parked awaiting a decision. Mirrors the web
+    UI's send-gating: these are the two states where a new prompt should wait.
+    """
+
+    status: str | None
+    pending_elicitation: bool
+
+    @property
+    def is_busy(self) -> bool:
+        # Matches the web UI's computeIsWorking: the server is actively working.
+        return self.status in ("running", "waiting", "launching")
+
+    @property
+    def needs_user_action(self) -> bool:
+        return self.pending_elicitation
 
 
 def extract_output_file(event: dict[str, Any]) -> OutputFile | None:

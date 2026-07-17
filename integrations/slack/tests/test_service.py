@@ -3,11 +3,10 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
-from omnigent_slack.approvals import Verdict
+from omnigent_slack.approvals import Verdict, parse_action_value
 from omnigent_slack.models import ThreadKey, UserConfig
 from omnigent_slack.omnigent import (
     AuthRequiredError,
-    ElicitationRequest,
     HostUnavailableError,
     OmnigentError,
     ServerUnreachableError,
@@ -189,9 +188,6 @@ class FakeOmnigentClient:
         # Rolled-up status the grace window polls at a soft idle; default idle so
         # a turn ends promptly unless a test sets it to "running".
         self.status = "idle"
-        # A pending elicitation the session is parked on, or None. When set, a
-        # new message should be nudged rather than enqueued.
-        self.pending_elicitation: Any = None
         # Newest assistant message the server would return, for the no-delta
         # fallback. ``latest_message_id`` pins the id (else each call gets a
         # fresh id, so the fallback treats it as new relative to the baseline).
@@ -202,12 +198,23 @@ class FakeOmnigentClient:
         # True so the Slack-click path is exercised; a test sets it False to
         # simulate the user answering elsewhere (web UI).
         self.elicitation_pending = True
+        # Server activity reported at ROUTE time (before a turn) — the gate that
+        # decides whether a new message runs or is deflected. Defaults to free
+        # (idle, no pending) so a follow-up runs; a test sets these to simulate a
+        # busy or awaiting-input session. Kept separate from ``status`` (which the
+        # in-turn grace window polls) so the two don't collide.
+        self.route_status: str | None = "idle"
+        self.route_pending_elicitation = False
 
     async def get_session_status(self, session_id: str) -> str | None:
         return self.status
 
-    async def get_pending_elicitation(self, session_id: str) -> Any:
-        return self.pending_elicitation
+    async def get_session_activity(self, session_id: str) -> Any:
+        from omnigent_slack.omnigent import SessionActivity
+
+        return SessionActivity(
+            status=self.route_status, pending_elicitation=self.route_pending_elicitation
+        )
 
     async def is_elicitation_pending(self, session_id: str, elicitation_id: str) -> bool:
         return self.elicitation_pending
@@ -842,18 +849,17 @@ async def test_direct_message_reply_reuses_existing_session(tmp_path: Path) -> N
     assert omnigent.turns == [("conv_existing", "follow up")]
 
 
-async def test_message_while_awaiting_input_nudges_and_does_not_run(tmp_path: Path) -> None:
-    # The session is parked on a pending elicitation. A new message can't
-    # proceed until it's answered, so the bot privately nudges the user to
-    # respond to the pending request first and does NOT submit the message.
+async def test_message_while_server_busy_is_deflected(tmp_path: Path) -> None:
+    # The decision to accept is the SERVER's: if the snapshot reports the session
+    # running/waiting, a new message is NOT run and NOT queued — the user is
+    # privately told to wait or interrupt in the web UI. (Local connection state
+    # is not consulted, so a stale reservation can't wrongly report busy.)
     store = await _store(tmp_path)
     key = ThreadKey(team_id="T1", channel_id="D1", thread_ts="100.1")
     await store.upsert_session(key, "conv_existing", "title", owner_user_id="U1")
     slack = FakeSlackClient()
     omnigent = FakeOmnigentClient()
-    omnigent.pending_elicitation = ElicitationRequest(
-        elicitation_id="elicit_pending", message="Approve?", session_id="conv_existing"
-    )
+    omnigent.route_status = "running"  # server is busy at route time
     service, _pool, _setup = _service(store, omnigent)
 
     await service.handle_message(
@@ -864,25 +870,28 @@ async def test_message_while_awaiting_input_nudges_and_does_not_run(tmp_path: Pa
             "thread_ts": "100.1",
             "ts": "101.1",
             "user": "U1",
-            "text": "another request",
+            "text": "second while busy",
         },
         client=slack,
         context={"bot_user_id": "B1"},
     )
     await service.shutdown()
 
-    # The message was not submitted; the user got a private nudge.
+    # Deflected (not run) with a busy notice pointing at the web UI.
     assert omnigent.turns == []
-    assert len(slack.ephemerals) == 1
-    notice = slack.ephemerals[0]
-    assert notice["user"] == "U1"
-    assert "waiting on your response" in notice["text"].lower()
+    busy = [e for e in slack.ephemerals if "still working on your previous" in e["text"].lower()]
+    assert len(busy) == 1
+    assert busy[0]["user"] == "U1"
+    # The web UI is a Slack mrkdwn hyperlink (<url|text>), not a bare URL.
+    assert "/c/conv_existing|web UI>" in busy[0]["text"]
 
 
-async def test_second_message_while_turn_running_is_notified_as_queued(tmp_path: Path) -> None:
-    # A message arriving while an earlier turn is still running (not parked on an
-    # elicitation) queues behind it. The bot privately tells the user it's queued
-    # rather than leaving them with no feedback.
+async def test_second_message_while_local_stream_active_is_deflected(tmp_path: Path) -> None:
+    # Even when the SERVER snapshot momentarily reads idle (claude-native flips to
+    # idle between streaming bursts), a turn already streaming IN THIS PROCESS
+    # must block a second turn — a 2nd stream would render every event twice
+    # (the duplicate-responses bug). The local reservation catches this before
+    # the server-activity check.
     store = await _store(tmp_path)
     key = ThreadKey(team_id="T1", channel_id="D1", thread_ts="100.1")
     await store.upsert_session(key, "conv_existing", "title", owner_user_id="U1")
@@ -900,10 +909,11 @@ async def test_second_message_while_turn_running_is_notified_as_queued(tmp_path:
             host_id: str | None = None,
         ) -> AsyncIterator[dict[str, Any]]:
             self.turns.append((session_id, text))
-            await release.wait()  # hold the first turn open
+            await release.wait()  # hold the first turn streaming locally
             yield {"type": "session.status", "status": "idle"}
 
     omnigent = BlockingClient()
+    omnigent.route_status = "idle"  # server LOOKS idle (the race window)
     service, _pool, _setup = _service(store, omnigent)
 
     async def _send(text: str, ts: str, event_id: str) -> None:
@@ -922,19 +932,85 @@ async def test_second_message_while_turn_running_is_notified_as_queued(tmp_path:
         )
 
     await _send("first", "101.1", "Ev1")
-    # Wait until the first turn is actually running (worker busy).
-    for _ in range(100):
+    for _ in range(100):  # wait until the first turn is actually streaming
         if omnigent.turns:
             break
         await asyncio.sleep(0.02)
     await _send("second", "102.1", "Ev2")
 
-    # The second message got a "queued" ephemeral; let the first turn finish.
-    queued = [e for e in slack.ephemerals if "still working on your previous" in e["text"].lower()]
-    assert len(queued) == 1
-    assert queued[0]["user"] == "U1"
+    # Only the first turn ran; the second was deflected despite the idle snapshot.
+    assert omnigent.turns == [("conv_existing", "first")]
+    busy = [e for e in slack.ephemerals if "still working on your previous" in e["text"].lower()]
+    assert len(busy) == 1
     release.set()
     await service.shutdown()
+
+
+async def test_message_while_awaiting_action_points_to_pending_request(tmp_path: Path) -> None:
+    # A session parked on a pending elicitation: a new message can't proceed. The
+    # user is told to answer the pending request (here or in the web UI), matching
+    # the web UI's "action required" state — distinct from the "still working" one.
+    store = await _store(tmp_path)
+    key = ThreadKey(team_id="T1", channel_id="D1", thread_ts="100.1")
+    await store.upsert_session(key, "conv_existing", "title", owner_user_id="U1")
+    slack = FakeSlackClient()
+    omnigent = FakeOmnigentClient()
+    omnigent.route_status = "waiting"
+    omnigent.route_pending_elicitation = True
+    service, _pool, _setup = _service(store, omnigent)
+
+    await service.handle_message(
+        body={"team_id": "T1", "event_id": "Ev2"},
+        event={
+            "channel": "D1",
+            "channel_type": "im",
+            "thread_ts": "100.1",
+            "ts": "101.1",
+            "user": "U1",
+            "text": "another request",
+        },
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await service.shutdown()
+
+    assert omnigent.turns == []
+    notices = [e for e in slack.ephemerals if "waiting on your response" in e["text"].lower()]
+    assert len(notices) == 1
+    assert notices[0]["user"] == "U1"
+
+
+async def test_idle_follow_up_message_runs_in_thread(tmp_path: Path) -> None:
+    # A follow-up to an existing thread that is NOT currently streaming runs
+    # normally in Slack (run-when-idle) — Slack stays a full conversational
+    # surface, not kickoff-only.
+    store = await _store(tmp_path)
+    key = ThreadKey(team_id="T1", channel_id="D1", thread_ts="100.1")
+    await store.upsert_session(key, "conv_existing", "title", owner_user_id="U1")
+    slack = FakeSlackClient()
+    omnigent = FakeOmnigentClient()
+    service, _pool, _setup = _service(store, omnigent)
+
+    await service.handle_message(
+        body={"team_id": "T1", "event_id": "Ev2"},
+        event={
+            "channel": "D1",
+            "channel_type": "im",
+            "thread_ts": "100.1",
+            "ts": "101.1",
+            "user": "U1",
+            "text": "follow up while idle",
+        },
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await _wait_for_stream_stop(slack)
+    await service.shutdown()
+
+    # The follow-up ran against the existing session (no new session created).
+    assert omnigent.created == []
+    assert omnigent.turns == [("conv_existing", "follow up while idle")]
+    assert slack.ephemerals == []
 
 
 async def test_direct_message_with_bot_mention_is_handled(tmp_path: Path) -> None:
@@ -1400,8 +1476,9 @@ async def _wait_for_card(client: FakeSlackClient) -> dict[str, Any]:
 def _card_elicitation_id(card: dict[str, Any]) -> str:
     for block in card.get("blocks", []):
         if block.get("type") == "actions":
-            _sid, eid = block["elements"][0]["value"].split(" ", 1)
-            return eid
+            target = parse_action_value(block["elements"][0]["value"])
+            assert target is not None
+            return target.elicitation_id
     raise AssertionError("Card has no actions block")
 
 
@@ -1483,7 +1560,8 @@ async def test_elicitation_resolved_externally_unblocks_without_verdict(tmp_path
     # The user answers the request in the web UI instead of clicking the Slack
     # card. The worker must stop waiting (once the server shows it no longer
     # pending) and NOT post its own verdict — otherwise it blocks to the
-    # coordinator timeout and wedges the thread's serial queue.
+    # coordinator timeout, holding the thread's turn open and deflecting its
+    # follow-ups the whole time.
     store = await _store(tmp_path)
     slack = FakeSlackClient()
     omnigent = ApprovalClient()
@@ -1583,9 +1661,12 @@ async def test_tool_approval_timeout_declines(tmp_path: Path) -> None:
     await _wait_for_resolved(omnigent)
     await service.shutdown()
 
-    # Timed out → declined to the server so the parked turn doesn't hang.
+    # Timed out → declined to the server so the parked turn doesn't hang, and the
+    # card tells the user it was dropped and how to retry.
     assert omnigent.resolved == [("conv_1", "elicit_1", False)]
-    assert "Timed out" in slack.updates[-1]["blocks"][0]["text"]["text"]
+    outcome_text = slack.updates[-1]["blocks"][0]["text"]["text"]
+    assert "Timed out" in outcome_text
+    assert "again to retry" in outcome_text
 
 
 async def test_stale_approval_click_is_reported_as_not_delivered(tmp_path: Path) -> None:
@@ -1618,8 +1699,10 @@ async def test_form_elicitation_forwards_selections_as_content(tmp_path: Path) -
     )
     card = await _wait_for_card(slack)
     eid = _card_elicitation_id(card)
+    # Answers arrive as option indices ("Redis" is index 0); the service maps
+    # them back to the full labels before forwarding to the server.
     await service.handle_elicitation_action(
-        elicitation_id=eid, verdict=Verdict(accepted=True, content={"store": "Redis"})
+        elicitation_id=eid, verdict=Verdict(accepted=True, content={"store": "0"})
     )
     await _wait_for_resolved(omnigent)
     await service.shutdown()
@@ -1749,6 +1832,71 @@ async def test_post_answer_message_only_committed_is_not_dropped(tmp_path: Path)
     assert any("You picked A. Full summary here." in s.text for s in slack.streams)
 
 
+class PreambleThenSilentAfterElicitationClient(FakeOmnigentClient):
+    """Models the stale-connection incident: a preamble streams, the elicitation
+    is handled, then the SSE connection goes SILENT — the post-answer message
+    never arrives on the stream (only the terminal idle does). The final answer
+    lives solely in the server's latest_assistant_message, recovered by the
+    no-delta fallback. Regression for a turn that hung + dropped the answer.
+    """
+
+    def __init__(self, event: dict[str, Any]) -> None:
+        super().__init__(final_text="")
+        self._event = event
+
+    async def run_turn(
+        self,
+        session_id: str,
+        text: str,
+        *,
+        workspace: str | None = None,
+        host_id: str | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        self.turns.append((session_id, text))
+        yield {"type": "response.output_text.delta", "delta": "Before deleting, let me look."}
+        yield self._event
+        # After the verdict resolves, the connection is stale — no post-answer
+        # event arrives, only the eventual terminal idle. The answer is recovered
+        # from the server snapshot (latest_message), not the stream.
+        yield {"type": "session.status", "status": "idle"}
+
+
+async def test_post_elicitation_answer_recovered_when_stream_silent(tmp_path: Path) -> None:
+    # Incident: after an AskUserQuestion resolved, the server produced a final
+    # message but the stale SSE connection never delivered it, so the turn hung
+    # and the answer was dropped. The turn must end (via the idle status poll)
+    # and recover the committed final message from the snapshot — exactly once.
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    omnigent = PreambleThenSilentAfterElicitationClient(_form_elicitation_event())
+    # The server's newest assistant message is the answer that never streamed.
+    # Leaving the id unpinned gives each snapshot a fresh id, so the post-turn
+    # final message is correctly seen as newer than the pre-turn baseline.
+    omnigent.latest_message = "Understood — leaving the file in place."
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1")
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> demo"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    card = await _wait_for_card(slack)
+    eid = _card_elicitation_id(card)
+    await service.handle_elicitation_action(
+        elicitation_id=eid, verdict=Verdict(accepted=True, content={"store": "A"})
+    )
+    await _wait_for_turn_end(slack)
+    await service.shutdown()
+
+    # The final answer was recovered and delivered exactly once; the turn task
+    # finished (no lingering in-flight turn), so follow-ups aren't wedged.
+    delivered = [s for s in slack.streams if "Understood — leaving the file in place." in s.text]
+    assert len(delivered) == 1
+    assert service._turn_tasks == set()  # type: ignore[attr-defined]
+
+
 async def test_elicitation_clears_working_placeholder(tmp_path: Path) -> None:
     # Parking on an elicitation must drop the "Working on it…" ack so it doesn't
     # sit stale above the card for the whole (possibly long) wait.
@@ -1855,6 +2003,40 @@ async def test_output_file_is_posted_as_reply(tmp_path: Path) -> None:
     )
     files = [p for p in slack.posts if "Produced a file" in str(p.get("text"))]
     assert files and "out.csv" in files[0]["text"]
+
+
+async def test_answer_then_trailing_notice_is_not_duplicated(tmp_path: Path) -> None:
+    # Regression: an answer streams, THEN a trailing out-of-band notice (a
+    # produced file) seals the segment. The seal resets the per-segment text, so
+    # the end-of-turn no-delta fallback would look "empty" and re-fetch the
+    # server's latest message — re-posting the answer a second time. The
+    # turn-level "delivered anything" guard must suppress that.
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    client = EventScriptClient(
+        [
+            {"type": "response.output_text.delta", "delta": "The full answer."},
+            {"type": "response.output_file.done", "file_id": "f1", "filename": "out.csv"},
+        ]
+    )
+    # The server committed the streamed answer as its newest assistant message —
+    # exactly what the (buggy) fallback would resurrect.
+    client.latest_message = "The full answer."
+    service, _pool, _setup = _service(store, client)
+    await _configure_user(store, "T1", "U1")
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> go"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await _wait_for_turn_end(slack)
+    await service.shutdown()
+
+    # The answer appears exactly once across all stream segments — not duplicated
+    # into a fresh post-notice segment by the fallback.
+    answer_segments = [s for s in slack.streams if "The full answer." in s.text]
+    assert len(answer_segments) == 1
 
 
 async def test_todos_posted_once_then_updated_in_place(tmp_path: Path) -> None:

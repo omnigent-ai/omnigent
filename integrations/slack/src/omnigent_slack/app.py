@@ -120,24 +120,24 @@ def register_handlers(app: AsyncApp, service: SlackOmnigentService) -> None:
         await service.handle_message(body=body, event=event, client=client, context=context)
 
     @app.action(ACTION_APPROVE)
-    async def handle_approve(ack: Any, body: dict[str, Any]) -> None:
+    async def handle_approve(ack: Any, body: dict[str, Any], client: Any) -> None:
         await ack()
-        await route_elicitation_click(service, body, accepted=True)
+        await route_elicitation_click(service, client, body, accepted=True)
 
     @app.action(ACTION_DENY)
-    async def handle_deny(ack: Any, body: dict[str, Any]) -> None:
+    async def handle_deny(ack: Any, body: dict[str, Any], client: Any) -> None:
         await ack()
-        await route_elicitation_click(service, body, accepted=False)
+        await route_elicitation_click(service, client, body, accepted=False)
 
     @app.action(ACTION_FORM_SUBMIT)
-    async def handle_form_submit(ack: Any, body: dict[str, Any]) -> None:
+    async def handle_form_submit(ack: Any, body: dict[str, Any], client: Any) -> None:
         await ack()
-        await route_elicitation_click(service, body, accepted=True, is_form_submit=True)
+        await route_elicitation_click(service, client, body, accepted=True, is_form_submit=True)
 
     @app.action(ACTION_FORM_CANCEL)
-    async def handle_form_cancel(ack: Any, body: dict[str, Any]) -> None:
+    async def handle_form_cancel(ack: Any, body: dict[str, Any], client: Any) -> None:
         await ack()
-        await route_elicitation_click(service, body, accepted=False, is_form_submit=True)
+        await route_elicitation_click(service, client, body, accepted=False, is_form_submit=True)
 
     @app.action(ACTION_FORM_ANSWER)
     async def handle_form_answer(ack: Any) -> None:
