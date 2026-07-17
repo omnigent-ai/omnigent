@@ -421,6 +421,23 @@ describe("SkillsPage", () => {
     expect(within(detailPane).queryByText(/makes this skill available automatically/i)).toBeNull();
   });
 
+  it("renders no decorative status dot in the status chip or Source chip", async () => {
+    vi.mocked(skillsApi.getSkillCatalog).mockResolvedValue({
+      skills: [BUILTIN],
+      includeOtherTools: true,
+      hiddenCount: 0,
+    });
+
+    renderPage();
+    // The status chip shows text only (no decorative dot span).
+    const status = await screen.findByTestId("skill-status");
+    expect(status).toHaveTextContent("Enabled");
+    expect(status.querySelector("span")).toBeNull();
+    // The Source chip's leading accent dot is gone (text + provider only).
+    const source = screen.getByTestId("skill-source");
+    expect(source.querySelector("span[aria-hidden]")).toBeNull();
+  });
+
   it("selecting a row swaps the detail pane", async () => {
     vi.mocked(skillsApi.getSkillCatalog).mockResolvedValue({
       skills: [BUILTIN, WORKSPACE],

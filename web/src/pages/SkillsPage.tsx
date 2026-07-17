@@ -823,21 +823,14 @@ function SkillDetailBody({ skill }: { skill: SkillDetail }) {
           </p>
         </div>
         <div className="ml-auto flex shrink-0 items-center gap-2">
-          {/* Availability is read-only status (no per-skill mutation exists). */}
+          {/* Read-only status text — no decorative dot (per the UX ruling). */}
           <span
             className={cn(
-              "inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-semibold",
+              "inline-flex items-center rounded-full px-2.5 py-1 text-[11px] font-semibold",
               skill.enabled ? "bg-success/12 text-success" : "bg-muted text-muted-foreground",
             )}
             data-testid="skill-status"
           >
-            <span
-              aria-hidden
-              className={cn(
-                "size-1.5 rounded-full",
-                skill.enabled ? "bg-success" : "bg-muted-foreground/50",
-              )}
-            />
             {skill.enabled ? "Enabled" : "Available"}
           </span>
         </div>
@@ -857,11 +850,6 @@ function SkillDetailBody({ skill }: { skill: SkillDetail }) {
           className="inline-flex max-w-full items-center gap-2.5 rounded-lg border border-border bg-muted px-3 py-2"
           data-testid="skill-source"
         >
-          <span
-            aria-hidden
-            className="size-2 shrink-0 rounded-full"
-            style={{ background: accent }}
-          />
           <span className="truncate font-mono text-[13px] font-semibold text-foreground">
             {skill.ownership === "agent" && skill.agentName
               ? `Bundled with ${skill.agentName}`

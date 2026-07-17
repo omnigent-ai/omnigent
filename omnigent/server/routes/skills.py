@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import urllib.parse
+from collections import OrderedDict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
 
@@ -28,6 +29,11 @@ _logger = logging.getLogger(__name__)
 # generous bound that keeps a pathological roster from ballooning the catalog.
 _MAX_AGGREGATED_AGENTS = 200
 
+# Max distinct (agent_id, bundle_location) entries kept in the aggregator's LRU
+# cache. Comfortably above a normal roster, but bounds lifetime memory as agents
+# publish new bundle revisions over a long-lived server.
+_AGGREGATION_CACHE_CAPACITY = 512
+
 
 class SkillTrustRequest(BaseModel):
     """Body for updating the default discovery trust boundary."""
@@ -45,17 +51,25 @@ class _AgentBundleAggregator:
     untouched). It resolves each agent's spec + extracted bundle dir via the
     two-tier ``AgentCache`` and enumerates bundle candidates with
     ``registry_for_spec`` (bundle-only: no host/local discovery). Serialized
-    entries are cached per ``bundle_location`` (which embeds the content
-    revision) so a catalog build never re-serializes an unchanged bundle.
+    entries are cached in a bounded LRU keyed by ``(agent_id, bundle_location)``
+    (the location embeds the content revision) so a catalog build never
+    re-serializes an unchanged bundle, and two agents sharing a bundle artifact
+    still get distinct, correctly-identified entries.
     """
 
     def __init__(self, agent_store: Any, agent_cache: Any) -> None:
         self._agent_store = agent_store
         self._agent_cache = agent_cache
-        # bundle_location -> (summaries, {skill_id: bundle_dir}, {skill_id: detail}).
-        self._cache: dict[
-            str, tuple[list[dict[str, Any]], dict[str, str], dict[str, dict[str, Any]]]
-        ] = {}
+        # (agent_id, bundle_location) -> (summaries, {skill_id: bundle_dir},
+        # {skill_id: detail}). Keyed by agent id AND bundle location: the
+        # serialized entries embed the agent's id + name, so two agents that
+        # legitimately share one bundle artifact must NOT share a cache slot
+        # (else the second would inherit the first's browse ids/name). Bounded
+        # LRU (insertion-ordered dict) so lifetime memory can't grow with the
+        # number of distinct bundle revisions seen.
+        self._cache: OrderedDict[
+            tuple[str, str], tuple[list[dict[str, Any]], dict[str, str], dict[str, dict[str, Any]]]
+        ] = OrderedDict()
 
     def _agents(self) -> list[Any]:
         """The registered template agents (built-ins) to aggregate, bounded."""
@@ -71,16 +85,22 @@ class _AgentBundleAggregator:
     ) -> tuple[list[dict[str, Any]], dict[str, str], dict[str, dict[str, Any]]]:
         """
         Serialized browse summaries + {skill_id: bundle_dir} + {skill_id: detail}
-        for one agent's bundle skills. Cached by bundle_location; best-effort.
+        for one agent's bundle skills. Cached by (agent_id, bundle_location) with
+        bounded LRU eviction; best-effort (never raises).
         """
         loc = getattr(agent, "bundle_location", None)
         if not loc:
             return [], {}, {}
-        cached = self._cache.get(loc)
+        key = (agent.id, loc)
+        cached = self._cache.get(key)
         if cached is not None:
+            self._cache.move_to_end(key)  # LRU touch
             return cached
         result = self._build_bundle_entries(agent, loc)
-        self._cache[loc] = result
+        self._cache[key] = result
+        self._cache.move_to_end(key)
+        while len(self._cache) > _AGGREGATION_CACHE_CAPACITY:
+            self._cache.popitem(last=False)  # evict least-recently-used
         return result
 
     def _build_bundle_entries(
@@ -208,13 +228,24 @@ class _AgentBundleAggregator:
         return payload
 
     def agent_for(self, skill_id: str) -> Any | None:
-        """Resolve the owning agent of an aggregated ``agent:<id>:…`` browse id."""
+        """
+        Resolve the owning agent of an aggregated ``agent:<id>:…`` browse id.
+
+        A crafted/unknown id or a store-lookup failure resolves to ``None`` (the
+        route maps that to a 404) — never a 500.
+        """
         if not skill_id.startswith("agent:") or self._agent_store is None:
             return None
         parts = skill_id.split(":", 2)  # agent:<agent_id>:<canonical_skill_id>
-        if len(parts) != 3:
+        if len(parts) != 3 or not parts[1]:
             return None
-        return self._agent_store.get(parts[1])
+        try:
+            return self._agent_store.get(parts[1])
+        except Exception:  # noqa: BLE001 - unknown/crafted id must not 500
+            _logger.warning(
+                "Skill aggregation: agent lookup failed for %s", skill_id, exc_info=True
+            )
+            return None
 
     def bundle_dir_for(self, skill_id: str) -> str | None:
         """Resolve a non-bound aggregated browse id to its bundle skill dir."""
@@ -409,12 +440,23 @@ def create_skills_router(
             return detail
         quoted_session_id = urllib.parse.quote(session_id, safe="")
         quoted_skill_id = urllib.parse.quote(skill_id, safe="")
-        return await _runner_payload(
+        detail = await _runner_payload(
             request,
             session_id,
             f"/v1/sessions/{quoted_session_id}/skills/catalog/{quoted_skill_id}",
             include_other_tools=include_other_tools,
         )
+        # A runner-served skill (bound agent / local / Omnigent) is usable in
+        # this session. Stamp the availability metadata explicitly rather than
+        # relying on the browser's default, and resolve the bound agent id for
+        # its own bundle rows so the detail matches the catalog row.
+        if isinstance(detail, dict):
+            detail.setdefault("invokable_in_current_session", True)
+            detail.setdefault("required_agent_id", None)
+            detail.setdefault("required_agent_name", None)
+            if detail.get("ownership") == "agent" and detail.get("agent_id") in (None, ""):
+                detail["agent_id"] = _bound_agent_id(session_id)
+        return detail
 
     @router.get("/skills/{skill_id}/files")
     async def list_skill_files(

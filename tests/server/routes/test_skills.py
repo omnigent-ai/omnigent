@@ -374,3 +374,137 @@ def test_aggregated_detail_and_bundle_dir_resolve(tmp_path: Path) -> None:
     bundle_dir = agg.bundle_dir_for(skill_id)
     assert bundle_dir is not None
     assert (Path(bundle_dir) / "SKILL.md").is_file()
+
+
+def test_two_agents_sharing_a_bundle_location_stay_distinct(tmp_path: Path) -> None:
+    # Two agents whose bundle_location is IDENTICAL (legit: same artifact) must
+    # still yield distinct agent:<id>: browse entries + their own names.
+    shared_dir = tmp_path / "shared_bundle"
+    sdir = shared_dir / "skills" / "review"
+    sdir.mkdir(parents=True)
+    (sdir / "SKILL.md").write_text("---\nname: review\ndescription: shared\n---\nbody\n")
+    skill = SkillSpec(name="review", description="shared", content="body", skill_dir=sdir)
+
+    def _mk(agent_id: str, name: str):
+        spec = SimpleNamespace(
+            name=name,
+            skills=[skill],
+            skills_filter="all",
+            skill_trust="all-host",
+            executor=SimpleNamespace(harness_kind="claude-sdk"),
+        )
+        agent = SimpleNamespace(id=agent_id, name=name, bundle_location="SHARED/rev1")
+        return agent, SimpleNamespace(spec=spec, workdir=shared_dir)
+
+    a = _mk("ag_a", "alpha")
+    b = _mk("ag_b", "beta")
+    agg = _aggregator({"ag_a": a, "ag_b": b})
+
+    out = agg.aggregate_into(
+        {"object": "list", "data": [], "include_other_tools": True, "hidden_count": 0},
+        bound_agent_id=None,
+    )
+    review = [r for r in out["data"] if r["name"] == "review"]
+    assert len(review) == 2
+    assert {r["agent_name"] for r in review} == {"alpha", "beta"}
+    # Distinct browse ids namespaced by agent id despite the shared bundle.
+    assert {r["id"] for r in review} == {
+        r["id"] for r in review if r["id"].startswith(("agent:ag_a:", "agent:ag_b:"))
+    }
+    assert len({r["id"] for r in review}) == 2
+
+
+def test_aggregator_cache_is_bounded_lru(tmp_path: Path) -> None:
+    from omnigent.server.routes import skills as skills_mod
+
+    # Build more distinct (agent_id, bundle_location) entries than the cap.
+    cap = skills_mod._AGGREGATION_CACHE_CAPACITY
+    agents_and_loaded: dict[str, tuple[Any, Any]] = {}
+    for i in range(cap + 5):
+        aid = f"ag_{i}"
+        sdir = tmp_path / aid / "skills" / "s"
+        sdir.mkdir(parents=True)
+        (sdir / "SKILL.md").write_text(f"---\nname: s\ndescription: d{i}\n---\nb\n")
+        skill = SkillSpec(name="s", description=f"d{i}", content="b", skill_dir=sdir)
+        spec = SimpleNamespace(
+            name=aid,
+            skills=[skill],
+            skills_filter="all",
+            skill_trust="all-host",
+            executor=SimpleNamespace(harness_kind="claude-sdk"),
+        )
+        agent = SimpleNamespace(id=aid, name=aid, bundle_location=f"{aid}/rev1")
+        agents_and_loaded[aid] = (agent, SimpleNamespace(spec=spec, workdir=tmp_path / aid))
+
+    agg = _aggregator(agents_and_loaded)
+    agg.aggregate_into(
+        {"object": "list", "data": [], "include_other_tools": True, "hidden_count": 0},
+        bound_agent_id=None,
+    )
+    # The LRU never exceeds its capacity even though more agents were serialized.
+    assert len(agg._cache) <= cap
+
+
+def test_agent_for_unknown_or_erroring_id_is_none(tmp_path: Path) -> None:
+    polly = _bundle_agent(tmp_path, "ag_polly", "polly", "cross-review")
+    agg = _aggregator({"ag_polly": polly})
+    # Malformed / unknown ids resolve to None (route → 404), never raise.
+    assert agg.agent_for("not-an-agent-id") is None
+    assert agg.agent_for("agent:") is None
+    assert agg.agent_for("agent:ag_missing:hash") is None
+
+    # A store that raises on get() is swallowed to None, not a 500.
+    def _boom(_aid):
+        raise RuntimeError("store down")
+
+    agg_err = _AgentBundleAggregator(
+        SimpleNamespace(list=lambda limit=200: SimpleNamespace(data=[]), get=_boom),
+        SimpleNamespace(load=lambda *a: None),
+    )
+    assert agg_err.agent_for("agent:ag_x:hash") is None
+
+
+def test_runner_detail_stamped_with_availability_metadata() -> None:
+    # A runner-served (bound/local) detail must carry invokable + null required
+    # agent explicitly, and resolve the bound agent id for its own bundle rows.
+    runner_client = _RunnerClient()
+
+    class _AgentDetailRunner(_RunnerClient):
+        async def get(self, path, *, params, timeout):  # type: ignore[override]
+            self.requests.append((path, params))
+            if path.endswith("/skills/catalog/codex-only%3Aabc"):
+                return _Response(
+                    200,
+                    {
+                        "id": "codex-only:abc",
+                        "name": "codex-only",
+                        "ownership": "agent",
+                        "agent_name": "boundagent",
+                        "content": "body",
+                        "provenance": {"original_path": "/x"},
+                    },
+                )
+            return _Response(404, {"detail": "Skill not found"})
+
+    conv_store = SimpleNamespace(get=lambda sid: SimpleNamespace(agent_id="ag_bound"))
+    app = FastAPI()
+    app.include_router(
+        create_skills_router(
+            conv_store,  # type: ignore[arg-type]
+            runner_router=_RunnerRouter(_AgentDetailRunner()),
+        ),
+        prefix="/v1",
+    )
+    client = TestClient(app)
+
+    resp = client.get(
+        "/v1/skills/codex-only:abc",
+        params={"session_id": "conv_bound", "include_other_tools": "true"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["invokable_in_current_session"] is True
+    assert body["required_agent_id"] is None
+    assert body["required_agent_name"] is None
+    # The bound agent id is resolved onto its own agent-owned detail row.
+    assert body["agent_id"] == "ag_bound"
