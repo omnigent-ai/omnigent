@@ -54,6 +54,12 @@ interface SkillSummaryWire {
   name: string;
   description: string;
   origin: SkillOrigin;
+  /**
+   * Concise, root-anchored source path — the user-facing provenance
+   * (`.claude/skills/foo`, `~/.codex/skills/foo`, `Included with agent`).
+   * The backend derives it from the winner's canonical coords.
+   */
+  display_path: string;
   enabled: boolean;
   available: boolean;
   has_conflict: boolean;
@@ -100,7 +106,17 @@ export interface SkillSummary {
   id: string;
   name: string;
   description: string;
+  /**
+   * Internal scope, kept for winner precedence + stable ordering. NOT shown as
+   * provenance — the user-facing source is `displayPath`.
+   */
   origin: SkillOrigin;
+  /**
+   * The user-facing source of truth: a concise, root-anchored path such as
+   * `.claude/skills/foo`, `~/.codex/skills/foo`, or the literal
+   * `Included with agent` for bundled skills.
+   */
+  displayPath: string;
   /** Whether the skill is active in-session. Rendered read-only. */
   enabled: boolean;
   /** Whether the skill is available (discovered + trusted). Rendered read-only. */
@@ -152,30 +168,50 @@ export interface SkillDetail extends SkillSummary {
   advanced: SkillAdvanced;
 }
 
-// ── Origin display helpers (client-derived) ──────────────────────────────────
+// ── Source-path display helpers (client-derived) ──────────────────────────────
+//
+// The list groups by SOURCE ROOT (the directory a reader can locate), not the
+// ambiguous origin scope word. `origin` is retained only to order the groups by
+// precedence (built in > workspace > personal). Nothing renders "Workspace" /
+// "Personal" as the meaningful source anymore — the path is the source of truth.
 
-/** Short user-facing label for an origin group. */
-export function originLabel(origin: SkillOrigin): string {
-  switch (origin) {
-    case "built_in":
-      return "Built in";
-    case "workspace":
-      return "Workspace";
-    case "personal":
-      return "Personal";
+/** The literal `display_path` the backend emits for a bundled skill. */
+export const BUNDLED_DISPLAY_PATH = "Included with agent";
+
+/**
+ * Derive the source-root group key for a skill from its `displayPath`.
+ *
+ * Groups skills by the skill-root directory that contains them, so every
+ * `.claude/skills/*` lands together, every `~/.codex/skills/*` together, etc.
+ * The key is also the heading shown for the group.
+ *
+ * Examples:
+ *   `.claude/skills/foo`            → `.claude/skills`
+ *   `~/.codex/skills/foo`           → `~/.codex/skills`
+ *   `omnigent/onboarding/a/skills/b`→ `omnigent/onboarding/a/skills`
+ *   `Included with agent`           → `Included with agent`
+ *   `/abs/unrooted/foo`             → `/abs/unrooted` (last-resort)
+ */
+export function sourceRootKey(skill: Pick<SkillSummary, "displayPath" | "origin">): string {
+  const path = skill.displayPath;
+  if (skill.origin === "built_in" || path === BUNDLED_DISPLAY_PATH) {
+    return BUNDLED_DISPLAY_PATH;
   }
+  // Prefer grouping at the conventional `skills/` boundary when present, so the
+  // group is the skill root rather than one directory per skill.
+  const marker = "/skills/";
+  const at = path.indexOf(marker);
+  if (at !== -1) return path.slice(0, at + marker.length - 1); // include ".../skills"
+  // Otherwise group by the parent directory of the leaf.
+  const slash = path.lastIndexOf("/");
+  return slash > 0 ? path.slice(0, slash) : path;
 }
 
-/** One-line explainer for an origin group, shown in the detail's Origin row. */
-export function originExplainer(origin: SkillOrigin): string {
-  switch (origin) {
-    case "built_in":
-      return "Ships with Omnigent.";
-    case "workspace":
-      return "Defined in this project.";
-    case "personal":
-      return "From your personal skill library.";
-  }
+/** Order source-root groups: bundled first, then workspace, then personal (home). */
+export function sourceRootRank(key: string): number {
+  if (key === BUNDLED_DISPLAY_PATH) return 0;
+  if (key.startsWith("~") || key.startsWith("/")) return 2; // home / absolute → personal-ish
+  return 1; // project-relative → workspace-ish
 }
 
 // ── Wire → browser projection ────────────────────────────────────────────────
@@ -186,6 +222,7 @@ function toSummary(w: SkillSummaryWire): SkillSummary {
     name: w.name,
     description: w.description,
     origin: w.origin,
+    displayPath: w.display_path,
     enabled: w.enabled,
     available: w.available,
     hasConflict: w.has_conflict,

@@ -129,7 +129,7 @@ from omnigent.server.schemas import (
     BackgroundSessionTitleRequest,
     BackgroundSessionTitleResponse,
 )
-from omnigent.spec.skill_registry import SkillRegistry
+from omnigent.spec.skill_registry import SkillRegistry, display_path
 from omnigent.spec.skill_sources import (
     registry_for_spec,
 )
@@ -8874,6 +8874,12 @@ def create_runner_app(
             "origin": (
                 "built_in" if candidate.location_scope == "bundle" else candidate.location_scope
             ),
+            # A concise, root-anchored source path (e.g. ``.claude/skills/foo``,
+            # ``~/.codex/skills/foo``, ``Included with agent``). This is the
+            # user-facing provenance the catalog renders as the source of truth,
+            # so the list needs it without a per-skill detail fetch. ``origin``
+            # above stays for grouping/precedence, not display.
+            "display_path": display_path(candidate),
             "enabled": True,
             "available": True,
             "has_conflict": bool(entry.shadowed),

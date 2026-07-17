@@ -5,7 +5,15 @@
 // error state.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { getSkillCatalog, getSkillDetail, getSkillTrust, setSkillTrust } from "./skillsApi";
+import {
+  BUNDLED_DISPLAY_PATH,
+  getSkillCatalog,
+  getSkillDetail,
+  getSkillTrust,
+  setSkillTrust,
+  sourceRootKey,
+  sourceRootRank,
+} from "./skillsApi";
 import { ApiError } from "./sessionsApi";
 import * as identity from "./identity";
 
@@ -36,6 +44,7 @@ describe("getSkillCatalog", () => {
             name: "ship",
             description: "Commit and PR.",
             origin: "built_in",
+            display_path: "Included with agent",
             enabled: true,
             available: true,
             has_conflict: false,
@@ -56,6 +65,8 @@ describe("getSkillCatalog", () => {
       id: "bundle:ship",
       name: "ship",
       origin: "built_in",
+      // The wire `display_path` is projected to camelCase `displayPath`.
+      displayPath: "Included with agent",
       hasConflict: false,
     });
   });
@@ -196,5 +207,49 @@ describe("trust setting", () => {
   it("propagates a 404 on set instead of echoing the requested value", async () => {
     fetchMock.mockResolvedValue(jsonResponse({}, false, 404));
     await expect(setSkillTrust(true)).rejects.toBeInstanceOf(ApiError);
+  });
+});
+
+describe("sourceRootKey", () => {
+  const row = (displayPath: string, origin: "built_in" | "workspace" | "personal") => ({
+    displayPath,
+    origin,
+  });
+
+  it("groups a workspace skill at its `.../skills` root", () => {
+    expect(sourceRootKey(row(".claude/skills/foo", "workspace"))).toBe(".claude/skills");
+  });
+
+  it("groups a home skill at its `~/.../skills` root, preserving the tilde", () => {
+    expect(sourceRootKey(row("~/.codex/skills/migrate", "personal"))).toBe("~/.codex/skills");
+    expect(sourceRootKey(row("~/.claude/skills/data-story", "personal"))).toBe("~/.claude/skills");
+  });
+
+  it("groups a deep workspace root at the `skills` boundary", () => {
+    expect(sourceRootKey(row("omnigent/onboarding/agent/skills/build", "workspace"))).toBe(
+      "omnigent/onboarding/agent/skills",
+    );
+  });
+
+  it("collapses every bundled skill into one 'Included with agent' group", () => {
+    expect(sourceRootKey(row(BUNDLED_DISPLAY_PATH, "built_in"))).toBe(BUNDLED_DISPLAY_PATH);
+    // Origin wins even if a bundled path were somehow shaped like a real path.
+    expect(sourceRootKey(row("anything", "built_in"))).toBe(BUNDLED_DISPLAY_PATH);
+  });
+
+  it("falls back to the parent dir for an unrooted path without a `skills/` marker", () => {
+    expect(sourceRootKey(row("/abs/unrooted/foo", "personal"))).toBe("/abs/unrooted");
+  });
+});
+
+describe("sourceRootRank", () => {
+  it("orders bundled first, then workspace-relative, then home/absolute", () => {
+    expect(sourceRootRank(BUNDLED_DISPLAY_PATH)).toBe(0);
+    expect(sourceRootRank(".claude/skills")).toBe(1);
+    expect(sourceRootRank("~/.codex/skills")).toBe(2);
+    expect(sourceRootRank("/abs/unrooted")).toBe(2);
+    // A concrete precedence chain the list relies on.
+    expect(sourceRootRank(BUNDLED_DISPLAY_PATH)).toBeLessThan(sourceRootRank(".agents/skills"));
+    expect(sourceRootRank(".agents/skills")).toBeLessThan(sourceRootRank("~/.claude/skills"));
   });
 });

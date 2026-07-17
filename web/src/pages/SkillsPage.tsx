@@ -6,14 +6,16 @@
  *  - A minimal header: title + one-line subtitle, and a right-aligned
  *    "Include skills from other tools" switch (the trust widening).
  *  - A compact ~292px single-column master list: a tight search box, then
- *    collapsible Built in / Workspace / Personal groups of ~48px rows. Each
- *    row shows an enabled/available dot, the `/name`, and a one-line
- *    description.
- *  - A persistent detail pane: overview, origin explainer, the SKILL.md
+ *    collapsible groups of ~48px rows keyed by SOURCE ROOT path
+ *    (`.claude/skills`, `~/.codex/skills`, `Included with agent`) — never the
+ *    ambiguous origin scope word. Each row shows an enabled/available dot, the
+ *    `/name`, and a one-line description.
+ *  - A persistent detail pane: overview, a Source row showing the concise
+ *    root-anchored path (provider as secondary text), the SKILL.md
  *    instructions (rendered / source toggle + copy), a "ready to use" line,
  *    and a single collapsed Advanced details disclosure holding ALL
- *    harness/vendor provenance (provider, path, source kind, delivery,
- *    canonical id, digest, conflict resolution).
+ *    harness/vendor provenance (provider, full absolute path, source kind,
+ *    delivery, canonical id, digest, conflict resolution).
  *
  * Data comes from `useSkills` (TanStack Query over `/v1/skills`). The include
  * switch drives the catalog query key so flipping it refetches for that trust
@@ -51,23 +53,51 @@ import {
 import { Link } from "@/lib/routing";
 import { copyText } from "@/lib/clipboard";
 import {
-  originExplainer,
-  originLabel,
+  sourceRootKey,
+  sourceRootRank,
   type SkillDetail,
   type SkillOrigin,
   type SkillSummary,
 } from "@/lib/skillsApi";
 import { cn } from "@/lib/utils";
 
-// Group order + per-origin accent token. Accents map onto the brand palette:
-// built-in → primary blue-ish, workspace → brand pink, personal → success green.
-const GROUP_ORDER: readonly SkillOrigin[] = ["built_in", "workspace", "personal"];
-
+// Per-origin accent token, used only for the small dot/glyph tint. Accents map
+// onto the brand palette: built-in → info blue, workspace → brand pink,
+// personal → success green. `origin` never renders as a provenance *word* — the
+// source path is the source of truth — it only tints the accent + orders groups.
 const ORIGIN_ACCENT: Record<SkillOrigin, string> = {
   built_in: "var(--color-info)",
   workspace: "var(--color-brand-accent)",
   personal: "var(--color-success)",
 };
+
+/** One source-root group: its heading key + the rows under it. */
+interface SkillGroup {
+  key: string;
+  skills: SkillSummary[];
+}
+
+/**
+ * Group rows by source-root path (`.claude/skills`, `~/.codex/skills`, …) and
+ * order them by precedence (bundled → workspace → home), then alphabetically by
+ * root, with each group's skills sorted by name. This replaces the old
+ * origin-word grouping so the path is what the user navigates by.
+ */
+function groupBySourceRoot(skills: SkillSummary[]): SkillGroup[] {
+  const byKey = new Map<string, SkillSummary[]>();
+  for (const skill of skills) {
+    const key = sourceRootKey(skill);
+    const bucket = byKey.get(key);
+    if (bucket) bucket.push(skill);
+    else byKey.set(key, [skill]);
+  }
+  return [...byKey.entries()]
+    .map(([key, rows]) => ({
+      key,
+      skills: [...rows].sort((a, b) => a.name.localeCompare(b.name)),
+    }))
+    .sort((a, b) => sourceRootRank(a.key) - sourceRootRank(b.key) || a.key.localeCompare(b.key));
+}
 
 function matchesQuery(skill: SkillSummary, query: string): boolean {
   if (!query) return true;
@@ -96,7 +126,7 @@ export function SkillsPage() {
   const sessionId = useActiveSkillSession();
   const catalogQuery = useSkillCatalog(sessionId, includeOtherTools);
   const [query, setQuery] = useState("");
-  const [collapsed, setCollapsed] = useState<Set<SkillOrigin>>(new Set());
+  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const [selectedId, setSelectedId] = useState<string | null>(null);
 
   const skills = useMemo(() => catalogQuery.data?.skills ?? [], [catalogQuery.data]);
@@ -121,11 +151,11 @@ export function SkillsPage() {
     setTrust.mutate(next);
   };
 
-  const toggleGroup = (origin: SkillOrigin) => {
+  const toggleGroup = (groupKey: string) => {
     setCollapsed((prev) => {
       const next = new Set(prev);
-      if (next.has(origin)) next.delete(origin);
-      else next.add(origin);
+      if (next.has(groupKey)) next.delete(groupKey);
+      else next.add(groupKey);
       return next;
     });
   };
@@ -260,14 +290,15 @@ function SkillList({
   totalVisible: number;
   query: string;
   onQueryChange: (q: string) => void;
-  collapsed: Set<SkillOrigin>;
-  onToggleGroup: (origin: SkillOrigin) => void;
+  collapsed: Set<string>;
+  onToggleGroup: (groupKey: string) => void;
   selectedId: string | null;
   onSelect: (id: string) => void;
   loading: boolean;
   error: boolean;
   onRetry: () => void;
 }) {
+  const groups = groupBySourceRoot(skills);
   return (
     <div className="flex w-[292px] shrink-0 flex-col border-r border-border">
       <div className="flex shrink-0 items-center gap-2 border-b border-border px-3 py-2">
@@ -306,29 +337,31 @@ function SkillList({
             {query ? `No skills match "${query}".` : "No skills available."}
           </p>
         ) : (
-          GROUP_ORDER.map((origin) => {
-            const items = skills.filter((s) => s.origin === origin);
-            if (!items.length) return null;
-            const isCollapsed = collapsed.has(origin);
+          groups.map((group) => {
+            const isCollapsed = collapsed.has(group.key);
             return (
-              <section key={origin} className="mb-1">
+              <section key={group.key} className="mb-1">
                 <button
                   type="button"
-                  onClick={() => onToggleGroup(origin)}
+                  onClick={() => onToggleGroup(group.key)}
                   aria-expanded={!isCollapsed}
-                  data-testid={`skills-group-${origin}`}
-                  className="mt-2 flex w-full items-center gap-1.5 px-2 py-1.5 text-left text-[11px] font-bold uppercase tracking-wide text-muted-foreground transition-colors first:mt-0 hover:text-foreground"
+                  data-testid={`skills-group-${group.key}`}
+                  title={group.key}
+                  className="mt-2 flex w-full items-center gap-1.5 px-2 py-1.5 text-left text-[11px] font-semibold text-muted-foreground transition-colors first:mt-0 hover:text-foreground"
                 >
                   <ChevronRightIcon
-                    className={cn("size-3 transition-transform", !isCollapsed && "rotate-90")}
+                    className={cn(
+                      "size-3 shrink-0 transition-transform",
+                      !isCollapsed && "rotate-90",
+                    )}
                   />
-                  <span>{originLabel(origin)}</span>
-                  <span className="ml-auto rounded-full bg-muted px-1.5 text-[10.5px] font-semibold text-muted-foreground">
-                    {items.length}
+                  <span className="truncate font-mono tracking-tight">{group.key}</span>
+                  <span className="ml-auto shrink-0 rounded-full bg-muted px-1.5 text-[10.5px] font-semibold text-muted-foreground">
+                    {group.skills.length}
                   </span>
                 </button>
                 {!isCollapsed &&
-                  items.map((skill) => (
+                  group.skills.map((skill) => (
                     <SkillRow
                       key={skill.id}
                       skill={skill}
@@ -488,15 +521,22 @@ function SkillDetailBody({ skill }: { skill: SkillDetail }) {
         </p>
       </Section>
 
-      {/* Origin */}
-      <Section label="Origin">
-        <div className="inline-flex items-center gap-2.5 rounded-lg border border-border bg-muted px-3 py-2">
-          <span className="inline-flex items-center gap-2 text-[13px] font-semibold text-foreground">
-            <span aria-hidden className="size-2 rounded-full" style={{ background: accent }} />
-            {originLabel(skill.origin)}
+      {/* Source — the path is the provenance source of truth (not a scope word). */}
+      <Section label="Source">
+        <div
+          className="inline-flex max-w-full items-center gap-2.5 rounded-lg border border-border bg-muted px-3 py-2"
+          data-testid="skill-source"
+        >
+          <span
+            aria-hidden
+            className="size-2 shrink-0 rounded-full"
+            style={{ background: accent }}
+          />
+          <span className="truncate font-mono text-[13px] font-semibold text-foreground">
+            {skill.displayPath}
           </span>
-          <span className="border-l border-border pl-2.5 text-[11.5px] text-muted-foreground">
-            {originExplainer(skill.origin)}
+          <span className="shrink-0 border-l border-border pl-2.5 text-[11.5px] text-muted-foreground">
+            {providerLabel(skill.advanced.discoveryProvider)}
           </span>
         </div>
       </Section>
@@ -630,7 +670,7 @@ function AdvancedDetails({ skill }: { skill: SkillDetail }) {
     ["Discovered in", providerLabel(advanced.discoveryProvider), false],
     ["Source kind", advanced.sourceKind, false],
     ["Delivery", advanced.delivery, false],
-    ["Vendor directory", advanced.originPath, true],
+    ["Full path", advanced.originPath, true],
     ["Canonical id", advanced.canonicalId, true],
     ["Content digest", advanced.digest, true],
   ];

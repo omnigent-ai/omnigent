@@ -96,6 +96,46 @@ def canonical_skill_id(candidate: SkillCandidate) -> str:
     return f"{candidate.invocation_name}:{suffix}"
 
 
+def display_path(candidate: SkillCandidate) -> str:
+    """
+    Return a concise, root-anchored source path for a skill candidate.
+
+    This is the *user-facing* provenance shown in the catalog — the path a
+    reader can actually locate, not the ambiguous ``Workspace`` / ``Personal``
+    scope word. It is derived purely from ``source_coords`` (already root-aware:
+    see ``omnigent.spec.skill_sources._source_coords``), so it stays stable and
+    testable without touching the filesystem:
+
+    - ``bundle:<agent>:<rel>``            → ``"Included with agent"``
+    - ``<provider>:home:<rel>``           → ``"~/<rel>"``     (e.g. ``~/.codex/skills/foo``)
+    - ``<provider>:workspace:<idx>:<rel>``→ ``"<rel>"``       (e.g. ``.claude/skills/foo``)
+    - ``<provider>:path:<abs>``           → the absolute path (last-resort, unrooted)
+
+    The absolute ``origin_path`` remains available for the detail's Advanced
+    section; this helper is what the list + the detail headline render.
+    """
+    coords = candidate.source_coords
+    if candidate.location_scope == "bundle":
+        return "Included with agent"
+    parts = coords.split(":")
+    # parts[0] is the provider; the root label is parts[1] (with an extra index
+    # segment for the workspace form).
+    if len(parts) >= 2:
+        root = parts[1]
+        if root == "home":
+            rel = ":".join(parts[2:])
+            return f"~/{rel}" if rel else "~"
+        if root == "workspace":
+            # <provider>:workspace:<idx>:<rel> — the rel is everything past idx.
+            return ":".join(parts[3:]) if len(parts) >= 4 else coords
+        if root == "path":
+            # Unrooted: the coords carry the absolute path verbatim.
+            return ":".join(parts[2:]) if len(parts) >= 3 else coords
+    # Unrecognized shape — fall back to the absolute path so we never render a
+    # bare scope word as the source.
+    return candidate.origin_path.as_posix()
+
+
 class SkillRegistry:
     """Immutable-snapshot registry for one session or catalog request."""
 

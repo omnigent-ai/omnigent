@@ -1,7 +1,12 @@
 from pathlib import Path
 
 from omnigent.spec.parser import parse
-from omnigent.spec.skill_registry import SkillCandidate, SkillRegistry, tree_digest
+from omnigent.spec.skill_registry import (
+    SkillCandidate,
+    SkillRegistry,
+    display_path,
+    tree_digest,
+)
 from omnigent.spec.types import AgentSpec, ExecutorSpec, SkillSpec
 from omnigent.tools.base import ToolContext
 from omnigent.tools.manager import ToolManager
@@ -30,6 +35,58 @@ def _candidate(
         tree_digest=tree_digest(skill_dir),
         skill=skill,
     )
+
+
+def _coords_candidate(location_scope: str, source_coords: str, origin_path: str) -> SkillCandidate:
+    """A minimal candidate for exercising the pure display_path() derivation."""
+    return SkillCandidate(
+        provider="claude",
+        location_scope=location_scope,  # type: ignore[arg-type]
+        source_kind="bundled" if location_scope == "bundle" else "vendor",
+        origin_path=Path(origin_path),
+        source_coords=source_coords,
+        namespace="claude",
+        invocation_name="foo",
+        managed=location_scope == "bundle",
+        tree_digest="",
+        skill=SkillSpec(name="foo", description="d", content="", skill_dir=None),
+    )
+
+
+def test_display_path_is_root_anchored_and_scope_word_free() -> None:
+    # Workspace: drop the workspace root, keep the project-relative path.
+    assert (
+        display_path(
+            _coords_candidate(
+                "workspace", "claude:workspace:0:.claude/skills/foo", "/ws/.claude/skills/foo"
+            )
+        )
+        == ".claude/skills/foo"
+    )
+    # Home: render with a leading "~/" so the source is unambiguous.
+    assert (
+        display_path(
+            _coords_candidate(
+                "personal", "codex:home:.codex/skills/foo", "/home/u/.codex/skills/foo"
+            )
+        )
+        == "~/.codex/skills/foo"
+    )
+    # Bundle: never a path — a human phrase.
+    assert (
+        display_path(_coords_candidate("bundle", "bundle:agent:skills/ship", "/b/skills/ship"))
+        == "Included with agent"
+    )
+    # Unrooted "path" coords carry the absolute path verbatim.
+    assert (
+        display_path(_coords_candidate("personal", "claude:path:/abs/weird/foo", "/abs/weird/foo"))
+        == "/abs/weird/foo"
+    )
+    # Unrecognized coords fall back to the absolute origin_path — never a bare
+    # "workspace"/"personal" scope word.
+    fallback = display_path(_coords_candidate("personal", "weird-coords", "/fallback/abs"))
+    assert fallback == "/fallback/abs"
+    assert "workspace" not in fallback.lower() and "personal" not in fallback.lower()
 
 
 def test_precedence_trust_and_shadowing(tmp_path: Path) -> None:

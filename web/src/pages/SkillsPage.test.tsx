@@ -44,6 +44,7 @@ function summary(overrides: Partial<SkillSummary> = {}): SkillSummary {
     name: "ship",
     description: "Commit, push, and open a PR.",
     origin: "built_in",
+    displayPath: "Included with agent",
     enabled: true,
     available: true,
     hasConflict: false,
@@ -71,12 +72,18 @@ function detail(overrides: Partial<SkillDetail> = {}): SkillDetail {
   };
 }
 
-const BUILTIN = summary({ id: "bundle:ship", name: "ship", origin: "built_in" });
+const BUILTIN = summary({
+  id: "bundle:ship",
+  name: "ship",
+  origin: "built_in",
+  displayPath: "Included with agent",
+});
 const WORKSPACE = summary({
   id: "workspace:test-generator",
   name: "test-generator",
   description: "Generate unit tests.",
   origin: "workspace",
+  displayPath: ".claude/skills/test-generator",
   hasConflict: true,
 });
 const PERSONAL_NATIVE = summary({
@@ -84,12 +91,14 @@ const PERSONAL_NATIVE = summary({
   name: "data-story",
   description: "Shape analysis into a narrative.",
   origin: "personal",
+  displayPath: "~/.claude/skills/data-story",
 });
 const PERSONAL_OTHER = summary({
   id: "personal:codex:migrate",
   name: "migrate",
   description: "Plan and execute a migration.",
   origin: "personal",
+  displayPath: "~/.codex/skills/migrate",
 });
 
 function renderPage() {
@@ -111,14 +120,22 @@ beforeEach(() => {
   vi.mocked(skillsApi.getSkillTrust).mockResolvedValue(false);
   vi.mocked(skillsApi.setSkillTrust).mockImplementation(async (v) => v);
   vi.mocked(skillsApi.getSkillDetail).mockImplementation(async (id) => {
-    // Derive origin from the canonical-id prefix so the default detail matches
-    // the summary the catalog fixtures use (bundle: / workspace: / personal:).
+    // Derive origin + a matching display path from the canonical-id prefix so
+    // the default detail matches the summary the catalog fixtures use
+    // (bundle: / workspace: / personal:).
     const origin: SkillDetail["origin"] = id.startsWith("bundle:")
       ? "built_in"
       : id.startsWith("workspace:")
         ? "workspace"
         : "personal";
-    return detail({ id, name: id.split(":").pop(), origin });
+    const name = id.split(":").pop() ?? id;
+    const displayPath =
+      origin === "built_in"
+        ? "Included with agent"
+        : origin === "workspace"
+          ? `.claude/skills/${name}`
+          : `~/.claude/skills/${name}`;
+    return detail({ id, name, origin, displayPath });
   });
 });
 
@@ -165,13 +182,19 @@ describe("SkillsPage", () => {
 
     renderPage();
 
-    // Rows appear, grouped by origin.
+    // Rows appear, grouped by SOURCE ROOT path (not origin scope words).
     expect(await screen.findByTestId("skill-row-ship")).toBeInTheDocument();
     expect(screen.getByTestId("skill-row-test-generator")).toBeInTheDocument();
     expect(screen.getByTestId("skill-row-data-story")).toBeInTheDocument();
-    expect(screen.getByTestId("skills-group-built_in")).toBeInTheDocument();
-    expect(screen.getByTestId("skills-group-workspace")).toBeInTheDocument();
-    expect(screen.getByTestId("skills-group-personal")).toBeInTheDocument();
+    expect(screen.getByTestId("skills-group-Included with agent")).toBeInTheDocument();
+    expect(screen.getByTestId("skills-group-.claude/skills")).toBeInTheDocument();
+    expect(screen.getByTestId("skills-group-~/.claude/skills")).toBeInTheDocument();
+
+    // The list groups by path, so it must NOT render the ambiguous scope words
+    // "Workspace" / "Personal" as group headings.
+    const list = screen.getByTestId("skills-list");
+    expect(within(list).queryByText("Workspace")).toBeNull();
+    expect(within(list).queryByText("Personal")).toBeNull();
 
     // First skill auto-selected → detail shows its heading.
     const detailPane = await screen.findByTestId("skill-detail");
@@ -191,10 +214,15 @@ describe("SkillsPage", () => {
     const detailPane = await screen.findByTestId("skill-detail");
 
     // "Claude" / "Codex" / "Cursor" must not appear until Advanced is opened.
-    // The detail fixture's provider is omnigent; assert the vendor labels are
-    // absent from the always-visible detail region (Origin shows "Personal").
+    // The detail fixture's provider is omnigent, so the Source row's secondary
+    // provider text reads "Omnigent" — the vendor labels stay hidden.
     expect(within(detailPane).queryByText(/Claude Code|Codex|Cursor/)).toBeNull();
-    expect(within(detailPane).getByText("Personal")).toBeInTheDocument();
+    // The ambiguous scope word "Personal" is NOT shown as provenance; the Source
+    // section shows the concrete path instead.
+    expect(within(detailPane).queryByText("Personal")).toBeNull();
+    expect(within(detailPane).getByTestId("skill-source")).toHaveTextContent(
+      "~/.claude/skills/data-story",
+    );
   });
 
   it("selecting a row swaps the detail pane", async () => {
@@ -271,7 +299,7 @@ describe("SkillsPage", () => {
     renderPage();
     await screen.findByTestId("skill-row-ship");
 
-    fireEvent.click(screen.getByTestId("skills-group-built_in"));
+    fireEvent.click(screen.getByTestId("skills-group-Included with agent"));
     await waitFor(() => expect(screen.queryByTestId("skill-row-ship")).toBeNull());
     // The other group's row is untouched.
     expect(screen.getByTestId("skill-row-test-generator")).toBeInTheDocument();

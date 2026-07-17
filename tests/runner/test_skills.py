@@ -598,6 +598,13 @@ async def test_catalog_uses_runner_session_context_and_includes_bundle(
     assert by_name["built-in"]["origin"] == "built_in"
     assert by_name["workspace-claude"]["origin"] == "workspace"
     assert by_name["claude-only"]["origin"] == "personal"
+    # The catalog summary carries a concise, root-anchored `display_path` — the
+    # user-facing source of truth — so the list needs no per-skill detail fetch.
+    # A bundled skill reads as "Included with agent"; a workspace skill as a
+    # project-relative path; a home skill with a leading "~/".
+    assert by_name["built-in"]["display_path"] == "Included with agent"
+    assert by_name["workspace-claude"]["display_path"] == ".claude/skills/workspace-claude"
+    assert by_name["claude-only"]["display_path"] == "~/.claude/skills/claude-only"
     assert payload["include_other_tools"] is False
     assert payload["hidden_count"] == 1
 
