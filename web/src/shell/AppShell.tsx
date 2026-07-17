@@ -375,17 +375,20 @@ export function AppShell() {
   // three-dot menu render the exact same set (they can't drift apart).
   // Stop session is not a header action — it lives in the sidebar row's
   // kebab menu (see Sidebar's ConversationRow).
-  // Read-write or higher can manage sharing; top-level only. Sharing a
+  // Only the owner can manage sharing; top-level only. Sharing a
   // sub-agent is a no-op anyway — children inherit the parent's grants via
   // the server's parent-delegation path — so we hide the affordance.
   // Also hidden in single-user mode: with no other users to grant to, the
   // affordance is meaningless (unlike the local-server / sharing-off cases
   // below, which stay present-but-disabled with an explanatory tooltip).
+  // ``isOwnerLevel`` is permissive on a null level (single-user / still
+  // loading), matching the sidebar's owner-only Share gate and the terminal
+  // ``readOnly`` gate below; the authoritative snapshot level resolves it.
   const serverInfo = useServerInfo();
   const canShare =
     !!conversationId &&
     isKnownTopLevel &&
-    (permissionLevel === null || permissionLevel >= 3) &&
+    isOwnerLevel(permissionLevel) &&
     !isSingleUserMode(serverInfo);
   // Two independent reasons the Share affordance is present-but-disabled: a
   // local server can't produce openable links, and a deployed server whose
