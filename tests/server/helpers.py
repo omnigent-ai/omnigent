@@ -172,6 +172,8 @@ class FakeSandboxLauncher(SandboxLauncher):
         fail_on_command: str | None = None,
         home: str = "/root",
         can_resume: bool = False,
+        resume_preserves_host: bool = False,
+        started_sandbox_id: str | None = None,
         fail_on_resume: bool = False,
         provision_gate: threading.Event | None = None,
     ) -> None:
@@ -182,6 +184,11 @@ class FakeSandboxLauncher(SandboxLauncher):
         self._fail_on_command = fail_on_command
         self._home = home
         self.can_resume = can_resume
+        self.resume_preserves_host = resume_preserves_host
+        # When set, start_host surfaces this as the provider-assigned id (the
+        # Lambda MicroVMs shape: a real id only known at start, which the
+        # framework must persist over the reserved provision name).
+        self._started_sandbox_id = started_sandbox_id
         self.fail_on_resume = fail_on_resume
         self._provision_gate = provision_gate
         # Image reference / secret names / env names the production code
@@ -220,6 +227,7 @@ class FakeSandboxLauncher(SandboxLauncher):
         self.image_identifier: str | None = None
         self.image_version: str | None = None
         self.execution_role_arn: str | None = None
+        self.egress_network_connectors: list[str] | None = None
         self.prepared = False
         self.provisioned_names: list[str] = []
         self.commands: list[str] = []
@@ -265,6 +273,10 @@ class FakeSandboxLauncher(SandboxLauncher):
                 raise click.ClickException("simulated in-sandbox host start failure")
             invocation = _parse_host_start(command)
             self.host_starts.append(invocation)
+            # Surface a provider-assigned id (known only at start) for the
+            # framework's write-back, mirroring Lambda MicroVMs' run-microvm.
+            if self._started_sandbox_id is not None:
+                self.started_sandbox_id = self._started_sandbox_id
             if self._on_host_start is not None:
                 self._on_host_start(invocation)
         return RemoteCommandResult(returncode=0, stdout="", stderr="")
@@ -595,6 +607,7 @@ def install_fake_lambda_microvm_launcher(
         image_version: str | None = None,
         execution_role_arn: str | None = None,
         env: list[str] | None = None,
+        egress_network_connectors: list[str] | None = None,
     ) -> FakeSandboxLauncher:
         """Stand-in constructor recording the construction wiring."""
         fake.region = region
@@ -602,6 +615,7 @@ def install_fake_lambda_microvm_launcher(
         fake.image_version = image_version
         fake.execution_role_arn = execution_role_arn
         fake.env = env
+        fake.egress_network_connectors = egress_network_connectors
         # Report the lambda_microvm provider so managed-host teardown's provider
         # match (launcher.provider vs host.sandbox_provider) exercises the real
         # path instead of the FakeSandboxLauncher default ("modal").

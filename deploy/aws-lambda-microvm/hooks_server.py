@@ -214,6 +214,12 @@ class _HookHandler(BaseHTTPRequestHandler):
 
 def main() -> None:
     """Serve the hooks port until the process is terminated."""
+    # Binds all interfaces and starts the host from an unauthenticated /run body
+    # (whose payload becomes the host's env, including the dial-back target).
+    # This is safe only because the platform reaches the hooks port over the
+    # MicroVM's ingress connector — it is NOT exposed to the guest workload or
+    # the public internet. The isolation boundary is the auth; do not expose
+    # this port to any less-trusted network.
     server = ThreadingHTTPServer(("0.0.0.0", _HOOKS_PORT), _HookHandler)
     server.serve_forever()
 

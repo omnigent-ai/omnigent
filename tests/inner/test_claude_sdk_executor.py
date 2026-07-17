@@ -1810,6 +1810,65 @@ class TestStreamEventStreaming(unittest.TestCase):
 
         _run(_t())
 
+    def test_terminal_control_request_timeout_surfaces_attempt_count(self):
+        """A control-request timeout that persists to the LAST attempt is routed
+        to the timeout handler (as TimeoutError), so the surfaced message carries
+        the attempt count — not the generic 'connect failed' message that drops
+        it."""
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        connect_attempts = []
+
+        class _FakeSDK:
+            AssistantMessage = type("AssistantMessage", (), {})
+            UserMessage = type("UserMessage", (), {})
+            SystemMessage = type("SystemMessage", (), {})
+            ResultMessage = type("ResultMessage", (), {})
+            StreamEvent = type("StreamEvent", (), {})
+            ClaudeAgentOptions = type(
+                "ClaudeAgentOptions",
+                (),
+                {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
+            )
+            messages = []
+
+            class ClaudeSDKClient:
+                def __init__(self, options):
+                    self.options = options
+
+                async def connect(self):
+                    connect_attempts.append(self)
+                    # Fails on every attempt, including the last.
+                    raise Exception("Control request timeout: initialize")
+
+                async def query(self, prompt, session_id="default"):
+                    return None
+
+                async def receive_response(self):
+                    return
+                    yield  # pragma: no cover — never reached
+
+                async def disconnect(self):
+                    return None
+
+        captured: dict[str, BaseException] = {}
+
+        async def _t():
+            executor = ClaudeSDKExecutor()
+            with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
+                session = [{"role": "user", "content": "hi", "session_id": "ctlfail"}]
+                try:
+                    [e async for e in executor.run_turn(session, [], "")]
+                except Exception as exc:
+                    captured["exc"] = exc
+            # Retried up to the cap, then surfaced.
+            self.assertGreaterEqual(len(connect_attempts), 2)
+            exc = captured.get("exc")
+            self.assertIsInstance(exc, TimeoutError)
+            self.assertIn("attempts", str(exc))
+
+        _run(_t())
+
     def test_non_timeout_connect_error_is_not_retried(self):
         """A hard connect failure (not a timeout) fails immediately — the retry
         must not mask real errors like a bad CLI option or missing binary."""
@@ -4666,3 +4725,38 @@ async def test_enqueue_session_message_returns_false_without_queuing() -> None:
 
     assert result is False
     assert not query_called, "query() must not be called during enqueue"
+
+def test_env_non_negative_int_allows_zero(monkeypatch) -> None:
+    """``_env_non_negative_int`` accepts 0 so the connect-retry count can be
+    disabled via env (0 is a valid count, unlike ``_env_float``'s positive-only
+    guard which would fall back to the default)."""
+    from omnigent.inner import claude_sdk_executor as cse
+
+    monkeypatch.setenv("OMNIGENT_TEST_RETRIES", "0")
+    assert cse._env_non_negative_int("OMNIGENT_TEST_RETRIES", 1) == 0
+
+    monkeypatch.setenv("OMNIGENT_TEST_RETRIES", "3")
+    assert cse._env_non_negative_int("OMNIGENT_TEST_RETRIES", 1) == 3
+
+    # Negative and unparseable values fall back to the default.
+    monkeypatch.setenv("OMNIGENT_TEST_RETRIES", "-2")
+    assert cse._env_non_negative_int("OMNIGENT_TEST_RETRIES", 1) == 1
+    monkeypatch.setenv("OMNIGENT_TEST_RETRIES", "notanint")
+    assert cse._env_non_negative_int("OMNIGENT_TEST_RETRIES", 1) == 1
+
+    # Absent falls back to the default.
+    monkeypatch.delenv("OMNIGENT_TEST_RETRIES", raising=False)
+    assert cse._env_non_negative_int("OMNIGENT_TEST_RETRIES", 1) == 1
+
+
+def test_env_float_rejects_non_finite_and_non_positive(monkeypatch) -> None:
+    """``_env_float`` falls back on inf/nan/<=0 — a non-finite timeout would
+    never fire or blow up downstream (e.g. int(inf * 1000) → OverflowError)."""
+    from omnigent.inner import claude_sdk_executor as cse
+
+    for bad in ("inf", "-inf", "nan", "0", "-5", "notafloat"):
+        monkeypatch.setenv("OMNIGENT_TEST_TIMEOUT", bad)
+        assert cse._env_float("OMNIGENT_TEST_TIMEOUT", 60.0) == 60.0
+
+    monkeypatch.setenv("OMNIGENT_TEST_TIMEOUT", "90.5")
+    assert cse._env_float("OMNIGENT_TEST_TIMEOUT", 60.0) == 90.5

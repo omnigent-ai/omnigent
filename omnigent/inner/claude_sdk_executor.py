@@ -31,6 +31,7 @@ import asyncio
 import base64
 import json
 import logging
+import math
 import os
 import pathlib
 import sys
@@ -343,7 +344,12 @@ class _ClaudeSDK(Protocol):
 
 
 def _env_float(name: str, default: float) -> float:
-    """Read a positive float from the environment, falling back on default."""
+    """Read a positive, finite float from the environment, falling back on default.
+
+    Rejects ``inf``/``nan`` (which ``float()`` parses without error): a non-finite
+    timeout would either never fire or blow up downstream (e.g. ``int(value * 1000)``
+    raises ``OverflowError`` on ``inf``).
+    """
     raw = os.environ.get(name)
     if raw is None:
         return default
@@ -351,7 +357,23 @@ def _env_float(name: str, default: float) -> float:
         value = float(raw)
     except ValueError:
         return default
-    return value if value > 0 else default
+    return value if math.isfinite(value) and value > 0 else default
+
+
+def _env_non_negative_int(name: str, default: int) -> int:
+    """Read a non-negative int from the environment, falling back on default.
+
+    Unlike :func:`_env_float`, ``0`` is a valid value here (e.g. a retry count
+    of 0 disables retries) — only a negative or unparseable value falls back.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value >= 0 else default
 
 
 # First `claude` CLI connect on a cold host (fresh sandbox: IMDS credential
@@ -363,7 +385,7 @@ _CONNECT_TIMEOUT_SECONDS = _env_float("OMNIGENT_CLAUDE_SDK_CONNECT_TIMEOUT_S", 6
 # One automatic retry when the FIRST connect times out: the SDK leaves a warmed
 # CLI process/credential cache behind, so the retry connects fast. Prevents a
 # cold-start timeout from failing the whole first turn. Set to 0 to disable.
-_CONNECT_TIMEOUT_RETRIES = int(_env_float("OMNIGENT_CLAUDE_SDK_CONNECT_RETRIES", 1))
+_CONNECT_TIMEOUT_RETRIES = _env_non_negative_int("OMNIGENT_CLAUDE_SDK_CONNECT_RETRIES", 1)
 _QUERY_START_TIMEOUT_SECONDS = 30.0
 # When the response stream is quiet for this long we emit a warning,
 # but keep waiting — a long-running native tool can legitimately block
@@ -1733,6 +1755,13 @@ class ClaudeSDKExecutor(Executor):
                             if not _is_wait_timeout and not _is_control_timeout:
                                 raise
                             if _attempt >= _CONNECT_TIMEOUT_RETRIES:
+                                if _is_control_timeout:
+                                    # A terminal control-request timeout is not an
+                                    # asyncio.TimeoutError, so re-raising as-is would
+                                    # land in the generic handler and drop the attempt
+                                    # count. Route it to the timeout handler instead so
+                                    # the surfaced message matches a connect timeout.
+                                    raise TimeoutError(str(_connect_exc)) from _connect_exc
                                 raise
                             connect_stderr.clear()
                             logger.warning(

@@ -23,6 +23,7 @@ from omnigent.host.identity import (
 )
 from omnigent.onboarding.sandboxes.base import SandboxCapabilityError
 from omnigent.onboarding.sandboxes.lambda_microvm import (
+    DEBUG_INGRESS_CONNECTORS_ENV_VAR,
     IMAGE_IDENTIFIER_ENV_VAR,
     MAX_LIFETIME_ENV_VAR,
     LambdaMicroVMSandboxLauncher,
@@ -214,8 +215,29 @@ def test_start_host_runs_microvm_and_returns_workspace_path(
     assert call["imageIdentifier"] == "omnigent-host"
     assert json.loads(call["runHookPayload"])[HOST_TOKEN_ENV_VAR] == "tok"
     # run_microvm's returned microvmId is not the return value (see docstring
-    # above) — it is only echoed to the operator via click.echo.
-    assert client._run_id == "microvm-run-42"
+    # above) — it is surfaced on started_sandbox_id for the framework to persist
+    # as the host row's sandbox_id, so terminate/resume key off the real id.
+    assert launcher.started_sandbox_id == "microvm-run-42"
+
+
+def test_start_host_records_real_microvm_id_for_framework(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The provider-assigned microvmId lands on started_sandbox_id (not the
+    reserved provision name), so the managed-launch framework can persist the id
+    AWS actually knows for later terminate / resume."""
+    client = _FakeMicroVMClient(run_id="microvm-real-99")
+    launcher = _launcher_with_fake(monkeypatch, client)
+    assert launcher.started_sandbox_id is None
+    launcher.start_host(
+        "managed-reserved",
+        token="tok",
+        host_id="host_x",
+        host_name="managed-x",
+        server_url="https://srv.example.com",
+    )
+    assert launcher.started_sandbox_id == "microvm-real-99"
+    assert launcher.started_sandbox_id != "managed-reserved"
 
 
 def test_start_host_returns_clone_dir_when_repo_name_set(
@@ -268,6 +290,12 @@ def test_resume_calls_resume_microvm(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_can_resume_flag_is_true() -> None:
     """The launcher advertises resume support so the wake path engages it."""
     assert LambdaMicroVMSandboxLauncher.can_resume is True
+
+
+def test_resume_preserves_host_flag_is_true() -> None:
+    """A snapshot thaw restores the running host + its token, so the wake path
+    must NOT restart the host (that would start a second host / fresh VM)."""
+    assert LambdaMicroVMSandboxLauncher.resume_preserves_host is True
 
 
 def test_terminate_calls_terminate_microvm(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -394,3 +422,28 @@ def test_build_run_microvm_kwargs_attaches_egress_connectors() -> None:
     assert kwargs["egressNetworkConnectors"] == arns
     # Omitted by default (account-default public egress).
     assert "egressNetworkConnectors" not in build_run_microvm_kwargs(**_RUN_KW)
+
+
+def test_debug_ingress_attaches_parsed_arns(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A real DEBUG_INGRESS value attaches the parsed connector ARNs."""
+    monkeypatch.setenv(
+        DEBUG_INGRESS_CONNECTORS_ENV_VAR,
+        "arn:aws:lambda:us-east-1:123456789012:network-connector:shell , arn:...:nc2",
+    )
+    kwargs = build_run_microvm_kwargs(**_RUN_KW)
+    assert kwargs["ingressNetworkConnectors"] == [
+        "arn:aws:lambda:us-east-1:123456789012:network-connector:shell",
+        "arn:...:nc2",
+    ]
+
+
+@pytest.mark.parametrize("blank", [",", " ", ", ,", ""])
+def test_debug_ingress_separators_only_omits_key(
+    monkeypatch: pytest.MonkeyPatch, blank: str
+) -> None:
+    """A DEBUG_INGRESS value of only separators/whitespace is truthy but parses
+    to [] — the key must be OMITTED (an explicit empty ingressNetworkConnectors
+    is rejected by the run-microvm API), not sent as an empty list."""
+    monkeypatch.setenv(DEBUG_INGRESS_CONNECTORS_ENV_VAR, blank)
+    kwargs = build_run_microvm_kwargs(**_RUN_KW)
+    assert "ingressNetworkConnectors" not in kwargs

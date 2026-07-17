@@ -37,8 +37,10 @@ Platform notes that shape this launcher:
   model). The image identifier is operator-supplied config; building it is a
   deploy-time step (see ``deploy/aws-lambda-microvm/README.md``).
 - **Idle policy drives suspend/resume.** ``run-microvm`` is given an idle policy
-  so an idle VM auto-suspends and auto-resumes on the next request; the managed
-  wake path re-arms the token and restarts the host on resume.
+  so an idle VM auto-suspends and auto-resumes on the next request. A snapshot
+  thaw restores the whole guest — the running ``omnigent host`` and its still-
+  valid token — so the host reconnects on its own; the wake path does not
+  restart it (``resume_preserves_host = True``).
 - **No CLI bootstrap / port forward.** Like Modal/Daytona/Kubernetes, the
   launcher exists for server-managed hosts only.
 """
@@ -215,9 +217,11 @@ def build_idle_policy() -> dict[str, object]:
     Build the ``idlePolicy`` for ``run-microvm``.
 
     Auto-suspend on idle and auto-resume on the next request are what let a
-    between-turns session sleep to a snapshot and wake cheaply; the managed wake
-    path (:func:`omnigent.server.managed_hosts.resume_managed_host`) restarts the
-    host when the VM resumes.
+    between-turns session sleep to a snapshot and wake cheaply. The snapshot
+    thaw restores the running ``omnigent host`` process with its still-valid
+    launch token (this provider sets ``resume_preserves_host = True``), so the
+    managed wake path (:func:`omnigent.server.managed_hosts.resume_managed_host`)
+    resumes the VM WITHOUT restarting the host — the host reconnects on its own.
 
     :returns: The idle-policy mapping.
     """
@@ -298,9 +302,12 @@ def build_run_microvm_kwargs(
     # a managed VM to diagnose in-guest issues. Not for production.
     _dbg_ingress = os.environ.get(DEBUG_INGRESS_CONNECTORS_ENV_VAR)
     if _dbg_ingress:
-        kwargs["ingressNetworkConnectors"] = [
-            a.strip() for a in _dbg_ingress.split(",") if a.strip()
-        ]
+        _dbg_arns = [a.strip() for a in _dbg_ingress.split(",") if a.strip()]
+        # Only attach the key when the parse yields real ARNs — a value of just
+        # separators/whitespace (e.g. ",") is truthy but parses to [], and an
+        # explicit empty ingressNetworkConnectors is rejected by the API.
+        if _dbg_arns:
+            kwargs["ingressNetworkConnectors"] = _dbg_arns
     return kwargs
 
 
@@ -341,6 +348,10 @@ class LambdaMicroVMSandboxLauncher(SandboxLauncher):
     # Lambda MicroVMs snapshot-suspend an idle VM and thaw it in place with the
     # workspace intact — the reattachable-volume lifecycle the wake path needs.
     can_resume: ClassVar[bool] = True
+    # A snapshot thaw restores the whole guest, including the running
+    # ``omnigent host`` process and its still-valid launch token, so the host
+    # reconnects on its own after resume — the wake path must not restart it.
+    resume_preserves_host: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -557,12 +568,18 @@ class LambdaMicroVMSandboxLauncher(SandboxLauncher):
         (e.g. the MicroVM id) makes every launch fail with "workspace path does
         not exist" and the runner never starts.
 
-        :param sandbox_id: The reserved name from :meth:`provision`. Unused here
-            (kept for the base signature): logged only, since ``run-microvm``
-            has no field for a caller-supplied name and the resulting
-            ``microvmId`` cannot be persisted back onto the host row (no
-            id-remapping exists in the managed-launch framework — see the
-            module-level TODO in :meth:`terminate` / :meth:`resume`).
+        The real ``microvmId`` AWS assigns at ``run-microvm`` is surfaced to the
+        managed-launch framework through :attr:`started_sandbox_id` (not the
+        return value): ``provision`` can only RESERVE a name before the VM
+        exists, and ``run-microvm`` accepts no caller-supplied name, so the id is
+        unknown until here. The framework reads :attr:`started_sandbox_id` after
+        this returns and overwrites the host row's ``sandbox_id`` with it, so
+        later :meth:`terminate` / :meth:`resume` key off the id AWS knows.
+
+        :param sandbox_id: The reserved name from :meth:`provision` — used only
+            for logging (``run-microvm`` has no caller-supplied-name field). The
+            real id is recorded on :attr:`started_sandbox_id` for the framework
+            to persist.
         :param token: The raw launch token, delivered via the /run payload.
         :param host_id: Server-chosen host identity.
         :param host_name: Server-chosen host display name.
@@ -616,6 +633,10 @@ class LambdaMicroVMSandboxLauncher(SandboxLauncher):
             raise click.ClickException(
                 f"Lambda MicroVM run for '{sandbox_id}' returned no microvmId"
             )
+        # Surface the provider-assigned id so the managed-launch framework can
+        # persist it as the host row's sandbox_id — terminate/resume need the
+        # real microvmId, not the reserved name passed in as sandbox_id.
+        self.started_sandbox_id = microvm_id
         click.echo(f"  → running {microvm_id}")
         # The real workspace path — a known constant since this launcher
         # controls the image's HOME (see start_host.sh), not the run's return
@@ -634,27 +655,17 @@ class LambdaMicroVMSandboxLauncher(SandboxLauncher):
         The first real consumer of the base class's :meth:`resume` contract:
         Lambda MicroVMs thaw a suspended VM with memory + disk state intact, so a
         dormant managed host wakes under the SAME MicroVM id with its workspace
-        preserved. The managed wake path re-arms the launch token and restarts
-        the host separately (resume only brings the compute + snapshot back).
+        preserved. Because the thaw restores the whole guest — including the
+        running ``omnigent host`` process and its still-valid launch token — the
+        host reconnects on its own; the wake path does NOT restart it (see
+        :attr:`resume_preserves_host`).
+
+        *sandbox_id* is the real ``microvmId`` the framework persisted from
+        :attr:`started_sandbox_id` after :meth:`start_host`, so ``resume-microvm``
+        resolves it.
 
         Idempotent from the caller's perspective: a MicroVM already running is
         treated as success.
-
-        .. warning::
-           **Known limitation, not fixed in this change.** *sandbox_id* here is
-           whatever the managed-launch framework's host row carries — the name
-           :meth:`provision` reserved, e.g. ``"managed-a1b2c3d4"`` — NOT the
-           ``microvmId`` :meth:`start_host` obtained from ``run-microvm``. The
-           managed-launch framework (``omnigent/server/managed_hosts.py``) has
-           no mechanism to persist a launcher-returned id back onto the host
-           row after ``start_host`` returns (its return value is stored only as
-           the session workspace); ``RunMicrovm`` also accepts no caller-supplied
-           name/tag to look the real id up by later. So this call — and
-           :meth:`terminate` — pass the reserved name to an API that expects the
-           real ``microvmId``, which will not resolve. Fixing this needs either
-           an AWS-side way to name/tag a MicroVM at run time, or a
-           managed_hosts.py change to persist the launcher's returned id. Until
-           then, resume/terminate are unverified against a real running MicroVM.
 
         :param sandbox_id: The suspended MicroVM id to resume.
         :raises click.ClickException: When the resume fails.
@@ -679,9 +690,9 @@ class LambdaMicroVMSandboxLauncher(SandboxLauncher):
         (already terminated or aged past the 8 h cap) is treated as success — the
         desired end state holds.
 
-        .. warning::
-           Same known limitation as :meth:`resume`: *sandbox_id* is the reserved
-           name, not the ``microvmId`` this needs. See :meth:`resume`'s docstring.
+        *sandbox_id* is the real ``microvmId`` the framework persisted from
+        :attr:`started_sandbox_id` after :meth:`start_host`, so
+        ``terminate-microvm`` resolves it and the VM is actually released.
 
         :param sandbox_id: The MicroVM id to terminate.
         :raises click.ClickException: When termination fails for a MicroVM that
