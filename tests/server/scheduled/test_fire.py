@@ -41,6 +41,21 @@ class _FakeConversation:
     git_branch: str | None = None
 
 
+@dataclass
+class _FakeAgent:
+    id: str
+    bundle_location: str | None = None
+    session_id: str | None = None
+
+
+class FakeAgentStore:
+    def __init__(self, agents: dict[str, _FakeAgent] | None = None) -> None:
+        self.agents = agents or {"ag_1": _FakeAgent("ag_1")}
+
+    def get(self, agent_id: str) -> _FakeAgent | None:
+        return self.agents.get(agent_id)
+
+
 class FakeScheduledTaskStore:
     """Records update/create_run calls and serves get() from a dict."""
 
@@ -72,11 +87,14 @@ class FakeScheduledTaskStore:
 
 
 class FakeConversationStore:
-    def __init__(self) -> None:
+    def __init__(self, *, fail_create: bool = False) -> None:
         self.created: list[dict[str, Any]] = []
         self._seq = 0
+        self.fail_create = fail_create
 
     def create_conversation(self, **kwargs: Any) -> _FakeConversation:
+        if self.fail_create:
+            raise RuntimeError("create failed")
         self._seq += 1
         conv = _FakeConversation(
             id=f"conv_{self._seq}",
@@ -93,14 +111,17 @@ class FakeConversationStore:
 
 
 class FakePermissionStore:
-    def __init__(self) -> None:
+    def __init__(self, *, fail_grant: bool = False) -> None:
         self.ensured: list[str] = []
         self.grants: list[tuple[str, str, int]] = []
+        self.fail_grant = fail_grant
 
     def ensure_user(self, user_id: str, *, is_admin: bool = False) -> None:
         self.ensured.append(user_id)
 
     def grant(self, user_id: str, conversation_id: str, level: int) -> Any:
+        if self.fail_grant:
+            raise RuntimeError("grant failed")
         self.grants.append((user_id, conversation_id, level))
         return None
 
@@ -132,10 +153,12 @@ class FakeHostRegistry:
 def _deps(sched_store: FakeScheduledTaskStore, **overrides: Any) -> FireDeps:
     return FireDeps(
         scheduled_task_store=sched_store,
+        agent_store=overrides.get("agent_store", FakeAgentStore()),
         conversation_store=overrides.get("conversation_store", FakeConversationStore()),
         permission_store=overrides.get("permission_store", FakePermissionStore()),
         host_store=overrides.get("host_store", FakeHostStore()),
         host_registry=overrides.get("host_registry", FakeHostRegistry()),
+        agent_cache=overrides.get("agent_cache"),
         runner_router=overrides.get("runner_router"),
         tunnel_registry=overrides.get("tunnel_registry"),
         file_store=overrides.get("file_store"),
@@ -292,6 +315,66 @@ async def test_launch_failure_is_swallowed() -> None:
     await _drain()
     assert store.runs[0]["status"] == "failed"
     assert store.runs[0]["error_code"] == "launch_failed"
+
+
+@pytest.mark.asyncio
+async def test_validation_failure_records_failed_without_session() -> None:
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(model_override="--danger")})
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(
+        _deps(store, conversation_store=conv_store),
+        launch_dispatch=_launch,
+    )
+    await on_fire("task_1")
+    await _drain()
+
+    assert conv_store.created == []
+    assert len(store.runs) == 1
+    assert store.runs[0]["status"] == "failed"
+    assert store.runs[0]["error_code"] == "invalid_input"
+    assert store.runs[0]["conversation_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_create_failure_records_failed_without_session() -> None:
+    store = FakeScheduledTaskStore(rows={"task_1": _task()})
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(
+        _deps(store, conversation_store=FakeConversationStore(fail_create=True)),
+        launch_dispatch=_launch,
+    )
+    await on_fire("task_1")
+    await _drain()
+
+    assert len(store.runs) == 1
+    assert store.runs[0]["status"] == "failed"
+    assert store.runs[0]["error_code"] == "session_create_failed"
+    assert store.runs[0]["conversation_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_grant_failure_records_failed_with_session() -> None:
+    store = FakeScheduledTaskStore(rows={"task_1": _task()})
+    perm = FakePermissionStore(fail_grant=True)
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(_deps(store, permission_store=perm), launch_dispatch=_launch)
+    await on_fire("task_1")
+    await _drain()
+
+    assert len(store.runs) == 1
+    assert store.runs[0]["status"] == "failed"
+    assert store.runs[0]["error_code"] == "owner_grant_failed"
+    assert store.runs[0]["conversation_id"] == "conv_1"
 
 
 @pytest.mark.asyncio

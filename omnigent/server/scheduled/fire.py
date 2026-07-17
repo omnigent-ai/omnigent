@@ -46,7 +46,13 @@ from dataclasses import dataclass
 from typing import Any
 
 from omnigent.entities import Conversation, ScheduledTask
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL
+from omnigent.server.routes._session_create_validation import (
+    validate_existing_host_workspace,
+    validate_session_agent,
+    validate_session_model_metadata,
+)
 from omnigent.server.schemas import SessionEventInput
 
 _logger = logging.getLogger(__name__)
@@ -87,10 +93,12 @@ class FireDeps:
     """
 
     scheduled_task_store: Any
+    agent_store: Any
     conversation_store: Any
     permission_store: Any | None
     host_store: Any | None
     host_registry: Any | None
+    agent_cache: Any | None = None
     runner_router: Any | None = None
     tunnel_registry: Any | None = None
     file_store: Any | None = None
@@ -215,8 +223,56 @@ async def _run_fire(
                 )
                 return
 
-        conv = await _create_session(deps, task)
-        await _grant_owner(deps, task, conv.id)
+        validation_error = await _validate_fire_session_inputs(
+            deps, task, validate_workspace=preflight is not None
+        )
+        if validation_error is not None:
+            error, error_code = validation_error
+            _logger.warning("scheduled fire: task %s failed validation: %s", task.id, error)
+            await _record_run(
+                deps,
+                task,
+                None,
+                scheduled_at,
+                status="failed",
+                error=error,
+                error_code=error_code,
+            )
+            return
+
+        try:
+            conv = await _create_session(deps, task)
+        except Exception:
+            _logger.exception("scheduled fire: failed to create session for task %s", task.id)
+            await _record_run(
+                deps,
+                task,
+                None,
+                scheduled_at,
+                status="failed",
+                error="session creation failed",
+                error_code="session_create_failed",
+            )
+            return
+
+        try:
+            await _grant_owner(deps, task, conv.id)
+        except Exception:
+            _logger.exception(
+                "scheduled fire: owner grant failed for task %s (session %s)",
+                task.id,
+                conv.id,
+            )
+            await _record_run(
+                deps,
+                task,
+                conv.id,
+                scheduled_at,
+                status="failed",
+                error="owner grant failed",
+                error_code="owner_grant_failed",
+            )
+            return
 
         try:
             await dispatch(conv, task)
@@ -333,6 +389,49 @@ def _record_run_sync(
         error=error,
         error_code=error_code,
     )
+
+
+async def _validate_fire_session_inputs(
+    deps: FireDeps,
+    task: ScheduledTask,
+    *,
+    validate_workspace: bool,
+) -> tuple[str, str] | None:
+    """Validate stored task fields before creating a conversation."""
+    try:
+        owner = task.owner_user_id
+        agent = await validate_session_agent(
+            user_id=owner,
+            agent_id=task.agent_id,
+            agent_store=deps.agent_store,
+            permission_store=deps.permission_store,
+            conversation_store=deps.conversation_store,
+        )
+        validate_session_model_metadata(
+            model_override=task.model_override,
+            reasoning_effort=task.reasoning_effort,
+        )
+        if validate_workspace:
+            if task.host_id is None or task.workspace is None:
+                return (
+                    "scheduled tasks v1 requires host_id and workspace",
+                    "missing_execution_input",
+                )
+            await validate_existing_host_workspace(
+                user_id=owner,
+                host_id=task.host_id,
+                workspace=task.workspace,
+                agent=agent,
+                agent_cache=deps.agent_cache,
+                host_store=deps.host_store,
+                host_registry=deps.host_registry,
+            )
+    except OmnigentError as exc:
+        return exc.message, exc.code
+    except Exception:
+        _logger.exception("scheduled fire: unexpected validation failure for task %s", task.id)
+        return "scheduled task validation failed", ErrorCode.INTERNAL_ERROR
+    return None
 
 
 def _validate_v1_execution_inputs(task: ScheduledTask) -> tuple[str, str] | None:

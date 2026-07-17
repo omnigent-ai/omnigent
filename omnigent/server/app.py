@@ -1389,10 +1389,12 @@ def create_app(
             on_fire = build_on_fire(
                 FireDeps(
                     scheduled_task_store=scheduled_task_store,
+                    agent_store=agent_store,
                     conversation_store=conversation_store,
                     permission_store=permission_store,
                     host_store=host_store,
                     host_registry=host_registry,
+                    agent_cache=agent_cache,
                     runner_router=runner_router,
                     tunnel_registry=tunnel_registry,
                     file_store=file_store,
@@ -2249,6 +2251,10 @@ def create_app(
         app.include_router(
             create_scheduled_tasks_router(
                 scheduled_task_store,
+                agent_store=agent_store,
+                conversation_store=conversation_store,
+                permission_store=permission_store,
+                agent_cache=agent_cache,
                 auth_provider=auth_provider,
             ),
             prefix="/v1",

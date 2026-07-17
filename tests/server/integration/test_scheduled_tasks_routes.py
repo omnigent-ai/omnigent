@@ -15,8 +15,11 @@ import pytest
 import pytest_asyncio
 from fastapi import FastAPI
 
+from omnigent.db.utils import builtin_agent_id
 from omnigent.runtime.agent_cache import AgentCache
+from omnigent.server import app as server_app
 from omnigent.server.app import create_app
+from omnigent.server.routes import scheduled_tasks as scheduled_tasks_routes
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -28,6 +31,26 @@ from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
 from tests.server.conftest import ControllableMockClient
 
 pytestmark = pytest.mark.asyncio
+
+
+@pytest.fixture(autouse=True)
+def _stub_host_workspace_validation(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def _validate_workspace(**kwargs: object) -> str:
+        workspace = kwargs["workspace"]
+        if not isinstance(workspace, str) or not workspace.startswith("/"):
+            from omnigent.errors import ErrorCode, OmnigentError
+
+            raise OmnigentError(
+                "workspace must be an absolute path starting with /",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        return workspace
+
+    monkeypatch.setattr(
+        scheduled_tasks_routes,
+        "validate_existing_host_workspace",
+        _validate_workspace,
+    )
 
 
 @pytest.fixture()
@@ -88,7 +111,7 @@ def _create_body(**overrides: object) -> dict[str, object]:
         "name": "nightly triage",
         "prompt": "triage the queue",
         "rrule": _VALID_RRULE,
-        "agent_id": "c2447dd0f8d25acc896bf10409fecf36",
+        "agent_id": builtin_agent_id(server_app._CLAUDE_NATIVE_AGENT_NAME),
         "timezone": "America/Los_Angeles",
         "workspace": "/repo",
         "host_id": "4b653f6031f35d168cc0b37caa1306d1",
@@ -127,6 +150,53 @@ async def test_create_rejects_invalid_rrule(auth_client: httpx.AsyncClient, db_u
     resp = await auth_client.post(
         "/v1/scheduled-tasks",
         json=_create_body(rrule="FREQ=SECONDLY"),
+        headers=_headers(),
+    )
+    assert resp.status_code == 400, resp.text
+
+
+async def test_create_rejects_unknown_agent(auth_client: httpx.AsyncClient, db_uri: str) -> None:
+    _make_user(db_uri)
+    resp = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(agent_id="missing_agent"),
+        headers=_headers(),
+    )
+    assert resp.status_code == 404, resp.text
+
+
+@pytest.mark.parametrize("model_override", ["--danger", "bad model"])
+async def test_create_rejects_invalid_model_override(
+    auth_client: httpx.AsyncClient, db_uri: str, model_override: str
+) -> None:
+    _make_user(db_uri)
+    resp = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(model_override=model_override),
+        headers=_headers(),
+    )
+    assert resp.status_code == 400, resp.text
+
+
+async def test_create_rejects_invalid_reasoning_effort(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    _make_user(db_uri)
+    resp = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(reasoning_effort="extreme"),
+        headers=_headers(),
+    )
+    assert resp.status_code == 400, resp.text
+
+
+async def test_create_rejects_relative_workspace(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    _make_user(db_uri)
+    resp = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(workspace="relative/path"),
         headers=_headers(),
     )
     assert resp.status_code == 400, resp.text
@@ -190,6 +260,38 @@ async def test_update_changes_fields_and_validates_rrule(
         headers=_headers(),
     )
     assert deleted_state.status_code == 422, deleted_state.text
+
+
+async def test_update_rejects_invalid_model_override(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+
+    bad = await auth_client.patch(
+        f"/v1/scheduled-tasks/{created['id']}",
+        json={"model_override": "--danger"},
+        headers=_headers(),
+    )
+    assert bad.status_code == 400, bad.text
+
+
+async def test_update_rejects_invalid_reasoning_effort(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+
+    bad = await auth_client.patch(
+        f"/v1/scheduled-tasks/{created['id']}",
+        json={"reasoning_effort": "extreme"},
+        headers=_headers(),
+    )
+    assert bad.status_code == 400, bad.text
 
 
 async def test_delete_removes_task(auth_client: httpx.AsyncClient, db_uri: str) -> None:
