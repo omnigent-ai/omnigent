@@ -190,6 +190,12 @@ def _format_paste_placeholder(block_id: int, text: str) -> str:
 # app instead of dispatching to the input handler.
 _OVERLAY_REQUEST_SENTINEL: str = "\x00__omnigent_ui_sdk.overlay_trigger__\x00"
 
+# Width fraction of the terminal a modal overlay's box occupies, with floors
+# so it stays usable on small windows. Height is fit-to-content, not a fraction.
+_MODAL_WIDTH_FRAC: float = 0.7
+_MODAL_MIN_WIDTH: int = 40
+_MODAL_MIN_HEIGHT: int = 8
+
 # Sentinel returned by the main prompt when the user picks a sub-agent
 # from the inline ``↓`` menu (sentinel + chosen session id). ``host.run``
 # decodes the id and invokes ``on_subagent_select`` between prompt
@@ -459,6 +465,23 @@ class Overlay:
     targets_builder: Callable[[], Awaitable[list[OverlayTarget]]] | None = None
     sidebar_width: int = 24
     actions: tuple[OverlayAction, ...] = ()
+    bind_trigger: bool = True
+    """Whether *trigger* is also wired as a prompt keybinding.
+
+    ``True`` (default) makes *trigger* a hotkey that opens the overlay.
+    Set ``False`` for a command-only overlay opened solely via
+    :meth:`TerminalHost.request_overlay` (e.g. ``/status``); *trigger* is
+    then just the registry id and need not be a valid key name.
+    """
+    modal: bool = False
+    """Render as a centered box on a cleared screen instead of full-bleed.
+
+    ``False`` (default) fills the screen edge-to-edge — good for long,
+    scrollable content. ``True`` still runs a full-screen app (so the
+    screen restores cleanly on close), but lays the pane out as a centered
+    bordered box, matching a floating ``/status`` card. A sidebar
+    (``targets_builder``) is not supported in modal mode.
+    """
 
 
 # Map prompt-toolkit key names to short forms used in footer hints.
@@ -557,12 +580,14 @@ def _build_close_hint(overlay: Overlay) -> str:
     if overlay.close_hint is not None:
         return overlay.close_hint
     keys = [_abbreviate_key(k) for k in overlay.close_keys]
-    trigger = _abbreviate_key(overlay.trigger)
     # ``trigger`` already closes by convention (the host treats
-    # it as a close-key alongside the explicit close_keys).
-    # Include it in the hint so users learn that.
-    key_part = "/".join([*keys, trigger])
-    return f"{key_part} close"
+    # it as a close-key alongside the explicit close_keys), so
+    # include it in the hint — but only when it's a real key
+    # binding. A command-only overlay (``bind_trigger=False``)
+    # has no trigger key, so its trigger is just a registry id.
+    if overlay.bind_trigger:
+        keys.append(_abbreviate_key(overlay.trigger))
+    return f"{'/'.join(keys)} close"
 
 
 def _extract_file_paths(text: str) -> list[PendingAttachment]:
@@ -954,6 +979,9 @@ class TerminalHost:
         self._exit_confirm_deadline: float | None = None
         # Set by handlers like /quit to exit the prompt loop cleanly.
         self._exit_requested: bool = False
+        # Overlay a background handler asked to open (e.g. /status); the run
+        # loop shows it after the prompt exits. ``None`` when nothing pending.
+        self._pending_overlay_trigger: str | None = None
         # Optional pipeline debug counters. Set by the REPL when
         # ``--debug-events`` is active; ``None`` (the default) means
         # the toolbar omits the counter segment entirely.
@@ -1460,6 +1488,11 @@ class TerminalHost:
             seen_action_keys.add(action.key)
         self._overlays_by_trigger[overlay.trigger] = overlay
 
+        # Command-only overlays (bind_trigger=False) open via request_overlay,
+        # so their trigger is just a registry id — no keybinding to register.
+        if not overlay.bind_trigger:
+            return
+
         # When the trigger fires, tear down the current prompt by
         # exiting the app with the sentinel as the "result" value.
         # prompt-toolkit's ``PromptSession.prompt_async`` returns
@@ -1720,6 +1753,22 @@ class TerminalHost:
                     if self._exit_requested:
                         break
 
+                    # Backstop for request_overlay when ``app`` was ``None`` at
+                    # request time (no live prompt to fire the sentinel exit):
+                    # the trigger lands here on the next prompt return instead.
+                    pending_trigger = self._pending_overlay_trigger
+                    if pending_trigger is not None and not (
+                        isinstance(line, str) and line.startswith(_OVERLAY_REQUEST_SENTINEL)
+                    ):
+                        self._pending_overlay_trigger = None
+                        overlay = self._overlays_by_trigger.get(pending_trigger)
+                        if overlay is not None:
+                            try:
+                                await self._show_overlay(overlay)
+                            except KeyboardInterrupt:
+                                break
+                        continue
+
                     if line is None:
                         continue
 
@@ -1741,6 +1790,9 @@ class TerminalHost:
                     if isinstance(line, str) and line.startswith(
                         _OVERLAY_REQUEST_SENTINEL,
                     ):
+                        # A background handler's request_overlay set this too;
+                        # clear it so the backstop above can't re-open.
+                        self._pending_overlay_trigger = None
                         trigger = line[len(_OVERLAY_REQUEST_SENTINEL) :]
                         overlay = self._overlays_by_trigger.get(trigger)
                         if overlay is not None:
@@ -1945,6 +1997,18 @@ class TerminalHost:
         # Populated below, just before ``run_async()``.
         app_holder: list[Application[None] | None] = [None]
 
+        def _modal_box_width() -> int:
+            """Column width of the centered modal box (border-inclusive).
+
+            The builder's Rich renderable (a bordered Panel) is rendered
+            to this width so it wraps to fit; the box is then centered
+            with blank margins filling the rest of the cleared screen.
+            Defined before :func:`_rebuild_content` because that runs
+            once at open (``force=True``) and reads this width eagerly.
+            """
+            w = max(_MODAL_MIN_WIDTH, int(_term_width() * _MODAL_WIDTH_FRAC))
+            return min(w, _term_width())
+
         async def _rebuild_content(
             *,
             force: bool = False,
@@ -1991,7 +2055,10 @@ class TerminalHost:
             rebuild_generation[0] = generation
             target = targets[selected_index[0]] if has_sidebar else None
             target_key = target.key if target is not None else None
-            content_raw = await self._render_overlay_content(overlay, target=target)
+            render_width = _modal_box_width() if overlay.modal else None
+            content_raw = await self._render_overlay_content(
+                overlay, target=target, width=render_width
+            )
             # Drop stale result — a newer rebuild has started
             # since ours kicked off.
             if rebuild_generation[0] != generation:
@@ -1999,7 +2066,12 @@ class TerminalHost:
             signature = (target_key, content_raw)
             if not force and signature == last_signature[0]:
                 return
-            content_lines_holder[0] = content_raw.split("\n")
+            # Drop Rich's trailing newline: a phantom last line makes a card
+            # that otherwise fits report as scrollable via ``_max_scroll``.
+            lines = content_raw.split("\n")
+            while lines and not lines[-1].strip():
+                lines.pop()
+            content_lines_holder[0] = lines
             if reset_scroll and current_target_key[0] != target_key:
                 scroll_offset[0] = 0
                 cursor_anchor[0] = "top"
@@ -2033,6 +2105,41 @@ class TerminalHost:
 
         refresh_task: asyncio.Task[None] = asyncio.create_task(_refresh_loop())
 
+        def _modal_content_rows() -> int:
+            """Rows the modal's content card occupies — fit to content.
+
+            The card is a self-bordered Rich renderable, so the box hugs its
+            line count (clamped to what fits above the footer) to keep the
+            footer pinned directly beneath it. Trailing blank lines aren't
+            counted, or the box gains a phantom row and the footer drifts.
+
+            :returns: Content-row count (>= ``_MODAL_MIN_HEIGHT`` - 1).
+            """
+            lines = content_lines_holder[0]
+            n = len(lines)
+            while n > 0 and not lines[n - 1].strip():
+                n -= 1
+            n = n or _MODAL_MIN_HEIGHT
+            # Leave the footer (1 row) + a small top/bottom margin (2 rows).
+            avail = max(_MODAL_MIN_HEIGHT, _term_height() - 3)
+            return max(_MODAL_MIN_HEIGHT - 1, min(n, avail))
+
+        def _view_height() -> int:
+            """
+            Rows the content pane can show at once.
+
+            Full-screen overlays fill the terminal minus chrome (optional
+            title + dividers + footer). Modal overlays fit the content
+            card exactly (see :func:`_modal_content_rows`), so the visible
+            pane is that row count.
+
+            :returns: Visible content-row count (>= 3).
+            """
+            if overlay.modal:
+                return max(3, _modal_content_rows())
+            chrome = 3 + (2 if overlay.title else 0)
+            return max(5, _term_height() - chrome)
+
         def _max_scroll() -> int:
             """
             Return the largest scroll offset that still leaves
@@ -2049,8 +2156,7 @@ class TerminalHost:
 
             :returns: Clamped maximum for ``scroll_offset[0]``.
             """
-            chrome = 3 + (2 if overlay.title else 0)
-            view_height = max(5, _term_height() - chrome)
+            view_height = _view_height()
             lines = content_lines_holder[0]
             return max(0, len(lines) - view_height)
 
@@ -2107,10 +2213,7 @@ class TerminalHost:
             reverse-video — the "yellow highlight" users expect
             from less / vim / grep pagers.
             """
-            # Subtract chrome: optional title (2 lines) + divider +
-            # footer (2 lines).
-            chrome = 3 + (2 if overlay.title else 0)
-            view_height = max(5, _term_height() - chrome)
+            view_height = _view_height()
             lines = content_lines_holder[0]
             if not lines:
                 return ANSI("")
@@ -2147,8 +2250,7 @@ class TerminalHost:
             """
             if cursor_anchor[0] != "bottom":
                 return Point(x=0, y=0)
-            chrome = 3 + (2 if overlay.title else 0)
-            view_height = max(5, _term_height() - chrome)
+            view_height = _view_height()
             lines = content_lines_holder[0]
             if not lines:
                 return Point(x=0, y=0)
@@ -2379,8 +2481,16 @@ class TerminalHost:
             Flips between the idle hint line and the live search
             status. Called on every render tick so mode changes
             appear immediately without a layout rebuild.
+
+            A modal that fits (nothing to scroll) shows only the close
+            hint — advertising scroll / page / search for a short card is
+            misleading. Scroll hints reappear if the content ever overflows.
             """
             if not search_active[0]:
+                if overlay.modal:
+                    if _max_scroll() > 0:
+                        return f"↑↓ scroll · pgup/pgdn page · {close_hint}"
+                    return close_hint
                 return idle_footer
             hits = _find_matches(search_query[0])
             if not search_query[0]:
@@ -2431,16 +2541,30 @@ class TerminalHost:
         else:
             layout_children.append(content_window)
 
+        footer_window = Window(
+            content=FormattedTextControl(text=_build_footer, focusable=False),
+            height=1,
+            style=self.theme.muted,
+        )
         layout_children.append(
             Window(height=1, char="─", style="class:bar"),
         )
-        layout_children.append(
-            Window(
-                content=FormattedTextControl(text=_build_footer, focusable=False),
-                height=1,
-                style=self.theme.muted,
+        layout_children.append(footer_window)
+
+        # Modal body: the content card (its Rich renderable draws its own
+        # border) pinned to its content height, with the footer flush beneath.
+        modal_content_window = Window(
+            content=FormattedTextControl(
+                text=_get_visible_ansi,
+                focusable=True,
+                get_cursor_position=_get_cursor_position,
             ),
+            wrap_lines=True,
+            height=lambda: Dimension.exact(_modal_content_rows()),
+            # Read-only card — suppress the blinking cursor.
+            always_hide_cursor=True,
         )
+        modal_body_children: list[Any] = [modal_content_window, footer_window]
 
         overlay_kb = KeyBindings()
         # ``not_searching`` / ``searching`` gate every navigation
@@ -2458,7 +2582,11 @@ class TerminalHost:
         # hotkey toggles open/close. ``escape`` is overridden
         # separately below so it cancels active searches instead
         # of closing the overlay (vim/less muscle memory).
-        for key in (*overlay.close_keys, overlay.trigger):
+        # Command-only overlays have no trigger key, so skip it.
+        close_keys = overlay.close_keys
+        if overlay.bind_trigger:
+            close_keys = (*close_keys, overlay.trigger)
+        for key in close_keys:
             if key == "escape":
                 continue
 
@@ -2701,8 +2829,35 @@ class TerminalHost:
                 event.app.invalidate()
                 event.app.create_background_task(_rebuild_content())
 
+        # Modal overlays render a centered box with blank margins. The
+        # builder's Rich renderable draws its own border, so the content
+        # window IS the box — no prompt-toolkit Frame.
+        if overlay.modal:
+            from prompt_toolkit.layout import VSplit
+            from prompt_toolkit.layout.dimension import Dimension
+
+            def _modal_width() -> Dimension:
+                return Dimension.exact(_modal_box_width())
+
+            def _modal_height() -> Dimension:
+                # Card + 1-row footer, so the footer sits flush beneath it.
+                return Dimension.exact(min(_modal_content_rows() + 1, _term_height()))
+
+            box = HSplit(modal_body_children, width=_modal_width, height=_modal_height)
+            # Center: blank fillers left/right (VSplit) and top/bottom (HSplit).
+            centered = HSplit(
+                [
+                    Window(),
+                    VSplit([Window(), box, Window()]),
+                    Window(),
+                ]
+            )
+            root: Any = centered
+        else:
+            root = HSplit(layout_children)
+
         app: Application[None] = Application(
-            layout=Layout(HSplit(layout_children)),
+            layout=Layout(root),
             key_bindings=overlay_kb,
             full_screen=True,
             mouse_support=False,
@@ -2731,6 +2886,7 @@ class TerminalHost:
         overlay: Overlay,
         *,
         target: OverlayTarget | None,
+        width: int | None = None,
     ) -> str:
         """
         Call *overlay.builder* and convert its output to an
@@ -2747,16 +2903,20 @@ class TerminalHost:
         the overlay rather than propagating; the main prompt stays
         usable even if the overlay code has a bug.
 
-        The console width is reduced by the sidebar width + 1 (for
-        the separator column) when the overlay has a sidebar, so
-        wrap-heavy renderables (tables, panels) fit the remaining
-        content pane instead of bleeding under the sidebar.
+        The console width defaults to the terminal width, reduced by
+        the sidebar width + 1 (for the separator column) when the
+        overlay has a sidebar, so wrap-heavy renderables (tables,
+        panels) fit the remaining content pane. A caller may pass an
+        explicit *width* (e.g. a modal's centered box width) to render
+        the card narrower than the full terminal.
 
         :param overlay: The registered overlay.
         :param target: Currently-selected sidebar target, or
             ``None`` when the overlay has no sidebar. Passed
             through to ``builder`` so it can render the right
             data for the selection.
+        :param width: Explicit render width in columns, or ``None``
+            to derive it from the terminal (and sidebar) width.
         :returns: ANSI-coloured text ready to be line-split and
             windowed by the caller.
         """
@@ -2768,8 +2928,8 @@ class TerminalHost:
         if isinstance(result, str):
             return result
         buf = io.StringIO()
-        pane_width = _term_width()
-        if overlay.targets_builder is not None:
+        pane_width = width if width is not None else _term_width()
+        if width is None and overlay.targets_builder is not None:
             pane_width = max(20, pane_width - overlay.sidebar_width - 1)
         temp = Console(
             file=buf,
@@ -3564,6 +3724,27 @@ class TerminalHost:
         app = self._prompt.app
         if app is not None:
             app.exit(exception=EOFError())
+
+    def request_overlay(self, trigger: str) -> bool:
+        """Open a registered overlay from a background handler.
+
+        Lets a slash command open an overlay the same way its hotkey would
+        — e.g. ``/status`` opening a modal registered with
+        ``bind_trigger=False``. Records the trigger and exits the prompt
+        with the overlay sentinel so the run loop shows it as a keypress
+        would.
+
+        :param trigger: The registered overlay's trigger id.
+        :returns: ``True`` if an overlay with *trigger* is registered
+            and an open was requested; ``False`` otherwise.
+        """
+        if trigger not in self._overlays_by_trigger:
+            return False
+        self._pending_overlay_trigger = trigger
+        app = self._prompt.app
+        if app is not None:
+            app.exit(result=_OVERLAY_REQUEST_SENTINEL + trigger)
+        return True
 
     async def _read_input(self) -> str | None:
         # Pass ``build_prompt`` as a CALLABLE, not its result.

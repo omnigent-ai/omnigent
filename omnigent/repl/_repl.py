@@ -4133,6 +4133,39 @@ async def run_repl(
         ),
     )
 
+    # Command-only /status modal, opened via ``host.request_overlay``. The
+    # builder closes over the live session/client; everything that would cost
+    # disk/HTTP per render — server version, credential config, CLI version —
+    # is resolved once here so the 500 ms refresh loop stays cheap.
+    import time as _time
+
+    _status_started_at = _time.monotonic()
+    _status_server_version = await _fetch_server_version(client)
+    _status_config = _resolve_status_credential_config()
+    _status_cli_version = _resolve_status_cli_version()
+
+    async def _status_builder(target: OverlayTarget | None) -> RenderableType:  # noqa: ARG001 — single-pane modal has no sidebar targets
+        return _build_status_overview(
+            session=session,
+            client=client,
+            host=host,
+            fmt=fmt,
+            server_version=_status_server_version,
+            started_at=_status_started_at,
+            credential_config=_status_config,
+            cli_version=_status_cli_version,
+        )
+
+    host.add_overlay(
+        Overlay(
+            trigger=_STATUS_OVERLAY_TRIGGER,
+            builder=_status_builder,
+            title="Status",
+            bind_trigger=False,
+            modal=True,
+        ),
+    )
+
     # ── ↓ Sub-agents menu ──────────────────────────────────────
     # While sub-agents are running, the toolbar reads ``state: N agents
     # running`` instead of ``sleeping`` (see ``build_toolbar``) and a
@@ -4604,7 +4637,7 @@ async def _cmd_help(
         ("Chat", ["/new", "/clear", "/switch", "/fork", "/history", "/cancel"]),
         ("Context", ["/compact", "/context", "/model", "/effort"]),
         ("Display", ["/theme"]),
-        ("Diagnostics", ["/logs", "/report"]),
+        ("Diagnostics", ["/status", "/logs", "/report"]),
         ("Help", ["/help", "/quit"]),
     ]
     visible = {n: d for n, (d, _) in COMMANDS.items() if n not in ("/?", "/exit")}
@@ -6068,6 +6101,386 @@ def _build_github_issue_url(
         f"?title={quote('[Bug] TUI issue')}"
         f"&body={quote(body)}"
         f"&labels={quote('bug,area/harnesses')}"
+    )
+
+
+def _status_runner_line(session: Session) -> str:
+    """Describe the bound runner and this REPL's drive mode for ``/status``.
+
+    Combines the bound runner id with the connection mode so a user can
+    tell at a glance whether this REPL owns the turn or is only observing
+    (``--attach``, a read-only view, or an interactive child).
+
+    :param session: Current REPL session.
+    :returns: A one-line description, e.g. ``"runner_abc123 (driving)"`` or
+        ``"(none bound) · read-only view"``.
+    """
+    runner_id = getattr(session, "_bound_runner_id", None)
+    base = runner_id or "(none bound)"
+    if getattr(session, "_readonly_view", False):
+        return f"{base} · read-only view"
+    if getattr(session, "_interactive_child", False):
+        return f"{base} · interactive child"
+    if getattr(session, "_attach_only", False):
+        return f"{base} · attached"
+    return f"{base} · driving"
+
+
+# Registry id for the /status modal overlay. Not a key binding — opened
+# only via ``host.request_overlay`` from the /status slash command
+# (``bind_trigger=False``), so this string never has to be a valid key name.
+_STATUS_OVERLAY_TRIGGER = "status"
+
+# Status indicator glyph and the health-tier colors it renders in.
+_STATUS_DOT: str = "●"
+_STATUS_GREEN: str = "green"
+_STATUS_YELLOW: str = "yellow"
+_STATUS_RED: str = "red"
+
+
+def _status_connection_health(session: Session) -> tuple[str, str]:
+    """Classify connection health into a status color + state label.
+
+    Derived entirely from in-process signals so it can tick live without
+    an HTTP round-trip: green when a runner is bound and this REPL is
+    driving; yellow when connected but only observing (attach / read-only)
+    or no runner is bound yet; red when the runner-recovery watchdog has
+    recorded a bind/transport error (the server is unreachable or failing).
+
+    :param session: Current REPL session.
+    :returns: ``(color, state)`` — e.g. ``("green", "Connected")``.
+    """
+    if getattr(session, "_last_runner_recovery_error_key", None) is not None:
+        return _STATUS_RED, "Disconnected"
+    bound = getattr(session, "_bound_runner_id", None)
+    observing = (
+        getattr(session, "_readonly_view", False)
+        or getattr(session, "_interactive_child", False)
+        or getattr(session, "_attach_only", False)
+    )
+    if observing:
+        return _STATUS_YELLOW, "Observing"
+    if bound:
+        return _STATUS_GREEN, "Connected"
+    return _STATUS_YELLOW, "Connecting…"
+
+
+def _format_uptime(seconds: float) -> str:
+    """Format an elapsed duration compactly, e.g. ``"1h 23m"`` / ``"45s"``.
+
+    :param seconds: Elapsed seconds since the session started.
+    :returns: A short human string; ``"<1s"`` for sub-second values.
+    """
+    secs = int(seconds)
+    if secs < 1:
+        return "<1s"
+    if secs < 60:
+        return f"{secs}s"
+    mins, s = divmod(secs, 60)
+    if mins < 60:
+        return f"{mins}m {s}s" if s else f"{mins}m"
+    hours, m = divmod(mins, 60)
+    return f"{hours}h {m}m" if m else f"{hours}h"
+
+
+def _status_context_bar(tokens_used: int, context_window: int, accent: str, muted: str) -> str:
+    """Render a context-load bar for the *current* turn, plus a caption.
+
+    ``tokens_used`` is the input-token count of the most recent turn — the
+    context the model is carrying right now, not a session total — so the
+    caption says "context" to name what the fill measures. A straightforward
+    fill bar (used ``█`` in the accent / free ``░`` in muted); the used
+    segment turns yellow then red as it fills, so context pressure is visible
+    at a glance. Deliberately simpler than ``/context``'s three-zone coin bar —
+    no compaction-buffer segment, which reads as noise out of context.
+
+    :param tokens_used: Provider-reported input tokens on the last turn.
+    :param context_window: Model context window in tokens.
+    :param accent: Brand accent color for the used segment when healthy.
+    :param muted: Muted color for the free segment and caption.
+    :returns: Rich markup: a filled bar plus a caption naming the load.
+    """
+    used_frac = min(tokens_used / context_window, 1.0)
+    used_coins = min(round(used_frac * _STATUS_CONTEXT_BAR_W), _STATUS_CONTEXT_BAR_W)
+    free_coins = _STATUS_CONTEXT_BAR_W - used_coins
+    if used_frac >= 0.9:
+        used_color = _STATUS_RED
+    elif used_frac >= 0.7:
+        used_color = _STATUS_YELLOW
+    else:
+        used_color = accent
+    bar = (
+        f"[{used_color}]{_CONTEXT_COIN_USED * used_coins}[/{used_color}]"
+        f"[{muted}]{_CONTEXT_COIN_FREE * free_coins}[/{muted}]"
+    )
+    free_tokens = max(context_window - tokens_used, 0)
+    caption = f"[{muted}]{used_frac * 100:.0f}% context · {free_tokens // 1000}k free[/{muted}]"
+    return f"{bar}  {caption}"
+
+
+# Width of the left label column in the status card, so every value
+# starts at the same column (start-aligned). Sized to the longest label.
+_STATUS_LABEL_W: int = 12
+
+# Width of the /status context bar. Wider than /context's coin bar since it
+# has a whole value column to itself, so the fill reads at a glance.
+_STATUS_CONTEXT_BAR_W: int = 20
+
+
+def _resolve_status_credential_config() -> dict[str, object] | None:
+    """Resolve the merged credential config for ``/status``, once.
+
+    Reads ``~/.omnigent/config.yaml`` and probes ambient providers (disk +
+    a localhost socket, and a subprocess on macOS), so it must be called at
+    registration — never inside the modal's 500 ms refresh loop. Returns
+    ``None`` when the config can't be read; the readout omits Account.
+    """
+    try:
+        from omnigent.onboarding.detected import effective_config_with_detected
+        from omnigent.onboarding.provider_config import load_config
+
+        return effective_config_with_detected(load_config())
+    except Exception:  # noqa: BLE001 — status is best-effort; a config read failure must not fail it
+        return None
+
+
+def _resolve_status_cli_version() -> str | None:
+    """Resolve the installed ``omnigent`` version once, for ``/status``.
+
+    ``importlib.metadata.version`` walks ``sys.path`` for dist metadata, so
+    it is resolved at registration rather than per render. ``None`` when the
+    distribution metadata is unavailable.
+    """
+    try:
+        from importlib.metadata import version as _pkg_version
+
+        return _pkg_version("omnigent")
+    except Exception:  # noqa: BLE001 — status is best-effort; missing dist metadata must not fail it
+        return None
+
+
+def _build_status_overview(
+    *,
+    session: Session,
+    client: OmnigentClient,
+    host: TerminalHost,
+    fmt: RichBlockFormatter,
+    server_version: str | None,
+    started_at: float,
+    credential_config: dict[str, object] | None,
+    cli_version: str | None,
+) -> RenderableType:
+    """Assemble the ``/status`` readout shown in the centered modal.
+
+    Groups state otherwise scattered across ``/model``, ``/context``, and
+    the Ctrl+O debug overview: session identity, connection, context usage,
+    credential, and local environment. Every field is best-effort — a
+    missing value renders as a placeholder rather than failing.
+
+    Fully synchronous (no HTTP), so the overlay's 500 ms refresh loop
+    re-renders it live — the connection dot and uptime tick on their own.
+    The server version is fetched once at registration and passed in.
+
+    :param session: Current REPL session (identity, model, context).
+    :param client: Connected client (for the server base URL + web link).
+    :param host: Terminal host (live token usage).
+    :param fmt: Formatter supplying the REPL palette.
+    :param server_version: Server version resolved once at registration,
+        or ``None`` when it couldn't be probed.
+    :param started_at: ``time.monotonic()`` captured when the session
+        started, for the uptime row.
+    :param credential_config: Merged credential config resolved once at
+        registration (see :func:`_resolve_status_credential_config`), or
+        ``None`` when it couldn't be read — the Account section is omitted.
+    :param cli_version: Installed ``omnigent`` version resolved once at
+        registration, or ``None`` when unavailable.
+    :returns: A Rich :class:`Panel` wrapping the grouped readout lines.
+    """
+    import time
+
+    from rich.box import ROUNDED
+    from rich.console import Group
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+
+    accent = fmt.accent
+
+    def _section(title: str, rows: list[tuple[str, str]]) -> RenderableType:
+        """Render a titled section as a header + aligned two-column grid.
+
+        Three visual tiers so structure reads at a glance: accent-bold
+        section HEADERS, muted row LABELS, default-fg VALUES. A value may
+        carry its own markup (the State dot, the context bar), which wins.
+        The value column folds and hangs under itself, so a long value like
+        the session URL stays aligned beneath the others.
+
+        :param title: Section heading, e.g. ``"Connection"``.
+        :param rows: ``(label, value)`` pairs; value is Rich markup.
+        :returns: A renderable: the heading above the aligned grid.
+        """
+        grid = Table.grid(padding=(0, 1))
+        grid.add_column(style=fmt.muted, no_wrap=True, justify="left", width=_STATUS_LABEL_W)
+        grid.add_column(overflow="fold")
+        for label, value in rows:
+            grid.add_row(label, Text.from_markup(value))
+        return Group(Text.from_markup(f"[bold {accent}]{title}[/bold {accent}]"), grid)
+
+    sections: list[RenderableType] = []
+
+    # Session identity.
+    override = getattr(session, "model_override", None)
+    model = override if override is not None else getattr(session, "llm_model", None)
+    model_label = model or "(agent default)"
+    if override is not None:
+        model_label = f"{model_label} (override)"
+    session_rows = [
+        ("Session ID", getattr(session, "session_id", None) or "(no conversation yet)"),
+        ("Agent", _humanize_agent_name(session.model)),
+    ]
+    harness = getattr(session, "harness", None)
+    if harness:
+        session_rows.append(("Harness", harness))
+    session_rows.append(("Model", model_label))
+    session_rows.append(
+        ("Effort", getattr(session, "reasoning_effort", None) or "(agent default)")
+    )
+    session_rows.append(("Uptime", _format_uptime(time.monotonic() - started_at)))
+    sections.append(_section("Session", session_rows))
+
+    # Connection: lead with a live State row (colored dot + label), then the
+    # server / runner / CLI details and a web link to open the session.
+    color, state = _status_connection_health(session)
+    server_url = getattr(client, "_base_url", None)
+    server_label = server_url or "(unknown)"
+    if server_version:
+        server_label = f"{server_label} · v{server_version}"
+    conn_rows = [
+        ("State", f"[{color}]{_STATUS_DOT}[/{color}] {state}"),
+        ("Server", server_label),
+        ("Runner", _status_runner_line(session)),
+        ("CLI", f"v{cli_version}" if cli_version else "(unknown)"),
+    ]
+    # Web link — the full bare URL. Terminals auto-linkify a raw URL (making
+    # it clickable) and it survives tmux, unlike an OSC-8 hyperlink which tmux
+    # drops. The value column hangs the wrap aligned under the URL.
+    session_id = getattr(session, "session_id", None)
+    if server_url and session_id:
+        try:
+            from omnigent.conversation_browser import conversation_url
+
+            conn_rows.append(("Web", conversation_url(server_url, session_id)))
+        except Exception:  # noqa: BLE001 — status is best-effort; a URL build failure must not fail it
+            pass
+    sections.append(_section("Connection", conn_rows))
+
+    # Context-window usage — mirror /context's live-token source, with a
+    # simple usage bar when both the window and a token count are known.
+    context_window = getattr(session, "context_window", None)
+    tokens_used = getattr(host, "tokens_used", None)
+    if tokens_used is None:
+        ctx_value = "(no turn yet)"
+    elif context_window:
+        ctx_value = _status_context_bar(tokens_used, context_window, accent, fmt.muted)
+    else:
+        ctx_value = f"{tokens_used:,} tokens (window unknown)"
+    sections.append(_section("Context", [("Load", ctx_value)]))
+
+    # Active credential — structured provider / source rows from the same
+    # ``describe_active_credential`` the /model readout uses so the two agree.
+    # ``credential_config`` is resolved once at registration (the disk/socket
+    # cost stays off the refresh loop); the mapping itself is pure, so the row
+    # still reflects the live ``/model`` override per render.
+    cred = None
+    if credential_config is not None:
+        try:
+            from omnigent.onboarding.configure_models import provider_display_name
+            from omnigent.onboarding.provider_config import describe_active_credential
+
+            cred = describe_active_credential(
+                credential_config, _session_readout_harness(session), model_override=override
+            )
+        except Exception:  # noqa: BLE001 — status is best-effort; a config read failure must not fail it
+            cred = None
+    if cred is not None:
+        # Friendly vendor name, not the kind word — "Provider: Subscription"
+        # reads oddly. Strip ``-subscription`` so it reads as "Claude", not
+        # "Claude-Subscription"; ``Source`` already conveys how you're authed.
+        vendor = provider_display_name(cred.provider_name.removesuffix("-subscription"))
+        sections.append(_section("Account", [("Provider", vendor), ("Source", cred.source)]))
+
+    # Local environment.
+    env_rows = [("Working dir", _display_cwd())]
+    log_labels = (
+        ("_server_log_path", "Server log"),
+        ("_runner_log_path", "Runner log"),
+        ("_event_log_path", "Event log"),
+    )
+    for attr, label in log_labels:
+        value = getattr(session, attr, None)
+        if isinstance(value, pathlib.Path):
+            env_rows.append((label, str(value)))
+    from omnigent.cli_diagnostics import current_cli_log_path
+
+    cli_log = current_cli_log_path()
+    if cli_log is not None:
+        env_rows.append(("CLI log", str(cli_log)))
+    sections.append(_section("Environment", env_rows))
+
+    # Blank spacer between sections.
+    spaced: list[RenderableType] = []
+    for i, sec in enumerate(sections):
+        if i:
+            spaced.append(Text(""))
+        spaced.append(sec)
+
+    return Panel(
+        Group(*spaced),
+        title=f"[bold {accent}]Status[/bold {accent}]",
+        title_align="left",
+        box=ROUNDED,
+        border_style=accent,
+        padding=(0, 1),
+    )
+
+
+@_cmd("/status", "Show session, connection, and context status")
+async def _cmd_status(
+    arg: str,  # noqa: ARG001 — dispatch-contract params
+    session: Session,
+    client: OmnigentClient,
+    host: TerminalHost,
+    fmt: RichBlockFormatter,
+) -> None:
+    """Open the status card as a centered modal.
+
+    The modal overlay is registered in :func:`run_repl` (its builder
+    closes over the live session/client); this handler just asks the
+    host to open it. A cleared screen with a floating bordered box that
+    restores exactly on Esc — never leaves scrollback clutter, never
+    moves the prompt. Falls back to a printed panel when the host has no
+    overlay support (e.g. an older host).
+    """
+    if host.request_overlay(_STATUS_OVERLAY_TRIGGER):
+        return
+    # Fallback for a host without overlay support: print the same rounded,
+    # accent-bordered card into the scrollback. One-shot, so probe the
+    # server version inline; uptime anchors to now (no session start to
+    # reference on this path).
+    import time
+
+    server_version = await _fetch_server_version(client)
+    host.output(
+        _build_status_overview(
+            session=session,
+            client=client,
+            host=host,
+            fmt=fmt,
+            server_version=server_version,
+            started_at=time.monotonic(),
+            credential_config=_resolve_status_credential_config(),
+            cli_version=_resolve_status_cli_version(),
+        )
     )
 
 
