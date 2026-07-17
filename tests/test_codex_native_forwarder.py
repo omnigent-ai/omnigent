@@ -1216,6 +1216,36 @@ async def test_completed_context_compaction_item_clears_spinner() -> None:
 
 
 @pytest.mark.asyncio
+async def test_agent_message_strips_unresolvable_codex_citations() -> None:
+    """Codex citation control tokens do not leak into persisted chat text."""
+    client = _RecordingClient()
+
+    await fwd._post_agent_message(
+        client,
+        "conv_x",
+        {"turnId": "turn_1"},
+        {
+            "type": "agentMessage",
+            "id": "item_1",
+            "text": (
+                "Hooks can return additional model context. citeturn211492view0turn5search2"
+            ),
+        },
+    )
+
+    assert client.posts[0][1]["data"]["item_data"]["content"] == [
+        {"type": "output_text", "text": "Hooks can return additional model context."}
+    ]
+
+
+def test_strip_codex_citation_markers_preserves_non_citation_text() -> None:
+    """Only complete Codex citation markers are removed."""
+    text = "Keep turn12view3 and the literal word cite."
+
+    assert fwd._strip_codex_citation_markers(text) == text
+
+
+@pytest.mark.asyncio
 async def test_reasoning_delta_opens_block_then_continues() -> None:
     """
     Codex reasoning deltas mirror as external_output_reasoning_delta (#1254).

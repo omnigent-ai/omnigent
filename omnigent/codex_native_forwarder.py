@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import re
 from collections.abc import Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -60,6 +61,7 @@ from omnigent.entities.session_resources import terminal_resource_id
 _logger = logging.getLogger(__name__)
 
 _AGENT_NAME = "codex-native-ui"
+_CODEX_CITATION_MARKER_RE = re.compile(r"[ \t]*citeturn\d+[a-z_]+\d+(?:turn\d+[a-z_]+\d+)*")
 _SUBSCRIBE_RETRY_DELAY_SECONDS = 0.2
 # How long to wait for a freshly launched Codex TUI to create its
 # app-server thread (emit ``thread/started``) before giving up. Generous
@@ -4212,6 +4214,9 @@ async def _post_interrupted_partial_agent_message(
     :param text: Partial assistant text, e.g. ``"The answer is"``.
     :returns: None.
     """
+    text = _strip_codex_citation_markers(text)
+    if not text:
+        return
     await _post_external_item(
         client,
         session_id,
@@ -4224,6 +4229,11 @@ async def _post_interrupted_partial_agent_message(
         },
         response_id=_response_id(params),
     )
+
+
+def _strip_codex_citation_markers(text: str) -> str:
+    """Remove Codex web-search citation tokens that Omnigent cannot resolve."""
+    return _CODEX_CITATION_MARKER_RE.sub("", text)
 
 
 async def _flush_turn_diff(
@@ -5032,6 +5042,9 @@ async def _post_agent_message(
     """
     text = item.get("text")
     if not isinstance(text, str) or not text:
+        return
+    text = _strip_codex_citation_markers(text)
+    if not text:
         return
     await _post_external_item(
         client,
