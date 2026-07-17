@@ -47,7 +47,7 @@ import {
 import { isOwnerLevel } from "@/lib/permissionsApi";
 import { absoluteTime } from "@/lib/relativeTime";
 import { cn } from "@/lib/utils";
-import { conversationDisplayLabel } from "@/shell/sidebarNav";
+import { conversationDisplayLabel, filterConversations } from "@/shell/sidebarNav";
 import { computeShiftSelectRange } from "@/lib/shiftSelect";
 
 const SEARCH_DEBOUNCE_MS = 300;
@@ -107,10 +107,16 @@ export function SessionManagementSection() {
   }, [project, projectNames, projectsQuery.isSuccess, projectsQuery.isFetching]);
 
   const listQuery = useConversations(debouncedSearch, false, undefined, project);
-  const sessions = useMemo(
-    () => (listQuery.data?.pages ?? []).flatMap((p) => p.data).filter((c) => c.archived !== true),
-    [listQuery.data],
-  );
+  // Server `search_query` also matches message bodies (command-palette
+  // behaviour). Session management is a cleanup surface, so keep only
+  // title / id hits — otherwise a chat that once said "Hi" keeps a
+  // differently-titled session in the filtered list.
+  const sessions = useMemo(() => {
+    const active = (listQuery.data?.pages ?? [])
+      .flatMap((p) => p.data)
+      .filter((c) => c.archived !== true);
+    return filterConversations(active, debouncedSearch);
+  }, [listQuery.data, debouncedSearch]);
 
   // Keep a just-cleared project listed while the refetch settles.
   const projectItems =
@@ -299,8 +305,8 @@ export function SessionManagementSection() {
     <section>
       <h1 className="text-2xl font-semibold">Session management</h1>
       <p className="mt-1 text-sm text-muted-foreground">
-        Archive or permanently delete active sessions in bulk. Shared sessions you don’t own stay
-        visible but can’t be selected.
+        Archive or permanently delete active sessions in bulk. Search matches session titles.
+        Shared sessions you don’t own stay visible but can’t be selected.
       </p>
 
       <div className="mt-6 flex flex-col gap-3 sm:flex-row sm:items-end">
@@ -315,7 +321,7 @@ export function SessionManagementSection() {
             id="session-mgmt-search"
             data-testid="session-mgmt-search"
             type="search"
-            placeholder="Search sessions…"
+            placeholder="Search by title…"
             value={searchInput}
             onChange={(e) => setSearchInput(e.target.value)}
           />

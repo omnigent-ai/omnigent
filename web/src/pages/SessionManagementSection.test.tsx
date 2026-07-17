@@ -188,6 +188,27 @@ describe("SessionManagementSection", () => {
     await waitFor(() => expect(mocks.lastSearch).toBe("alp"), { timeout: 1000 });
   });
 
+  it("filters the list by session title, not chat content matches", async () => {
+    // The server search also hits message bodies; Session management must
+    // drop those so a transcript containing "Hi" doesn't keep "My Session".
+    mocks.conversations = [
+      conv("hi", { title: "Hi", permission_level: 4 }),
+      conv("other", { title: "My Session", permission_level: 4 }),
+    ];
+    renderSection();
+    expect(screen.getAllByTestId("session-mgmt-row")).toHaveLength(2);
+
+    fireEvent.change(screen.getByTestId("session-mgmt-search"), {
+      target: { value: "Hi" },
+    });
+    await waitFor(() => {
+      const rows = screen.getAllByTestId("session-mgmt-row");
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toHaveAttribute("data-session-id", "hi");
+    });
+    expect(screen.queryByText("My Session")).toBeNull();
+  });
+
   it("filters by project via the project picker", () => {
     mocks.projectNames = ["Alpha", "Beta"];
     mocks.conversations = [
