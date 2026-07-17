@@ -320,6 +320,10 @@ def _first_turn_collaboration_mode(
     """Build a first-turn developer-instruction override for session renaming."""
     from omnigent.tools.builtins.session_rename import SESSION_RENAME_INSTRUCTION
 
+    # First-turn detection intentionally lives in the shared runner, which appends
+    # this instruction only for the initial user turn. This Codex-specific helper
+    # merely translates that canonical signal into the collaborationMode protocol;
+    # the server-side compare-and-swap remains the final stale-call guard.
     model = (config.model if config is not None else None) or read_codex_config_model(bridge_dir)
     if not model or SESSION_RENAME_INSTRUCTION not in system_prompt:
         return None
