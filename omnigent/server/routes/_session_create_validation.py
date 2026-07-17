@@ -29,6 +29,9 @@ def validate_session_model_metadata(
     reasoning_effort: str | None,
 ) -> tuple[str | None, str | None]:
     """Validate persisted model metadata shared by sessions and schedules."""
+    # The persisted override reaches native CLIs as a ``--model`` argv element
+    # at terminal launch, so reject shell-/flag-shaped values before any
+    # session row or scheduled task row persists it.
     validated_model: str | None = None
     if model_override is not None:
         try:
@@ -39,6 +42,11 @@ def validate_session_model_metadata(
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
 
+    # Persisted effort reaches native CLIs as a ``--effort`` argv element at
+    # terminal launch (and SDK harnesses via the spawn env). Validate against
+    # the shared vocabulary before any row persists it; provider-specific
+    # support is enforced downstream at launch, mirroring the multipart
+    # metadata create path.
     validated_effort: str | None = None
     if reasoning_effort is not None:
         try:
@@ -71,6 +79,9 @@ async def validate_session_agent(
             code=ErrorCode.NOT_FOUND,
         )
 
+    # Session-scoped agents belong to a specific session. The caller must have
+    # at least READ access to that owning session — otherwise they can execute
+    # another user's private agent by guessing the raw agent id.
     if agent.session_id is not None:
         await require_access(
             user_id,
