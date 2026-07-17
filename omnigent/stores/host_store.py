@@ -491,6 +491,29 @@ class HostStore:
                 row.status = encode_host_status("offline")
                 row.updated_at = now_epoch()
 
+    def update_harness_readiness(
+        self,
+        host_id: str,
+        configured_harnesses: dict[str, HarnessAvailability],
+    ) -> None:
+        """Replace a connected host's live per-harness readiness map.
+
+        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :param configured_harnesses: Current readiness keyed by harness spelling.
+        """
+        with self._session() as session:
+            session.execute(
+                update(SqlHost)
+                .where(
+                    SqlHost.workspace_id == current_workspace_id(),
+                    SqlHost.host_id == host_id,
+                )
+                .values(
+                    configured_harnesses=json.dumps(configured_harnesses),
+                    updated_at=now_epoch(),
+                )
+            )
+
     def heartbeat(self, host_id: str) -> None:
         """
         Refresh a host's last-seen timestamp while its tunnel is alive.

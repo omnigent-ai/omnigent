@@ -38,6 +38,7 @@ class HostFrameKind(str, Enum):
     """All host frame kinds; the value is the JSON wire string."""
 
     HELLO = "host.hello"
+    HARNESS_READINESS = "host.harness_readiness"
     LAUNCH_RUNNER = "host.launch_runner"
     LAUNCH_RUNNER_RESULT = "host.launch_runner_result"
     STOP_RUNNER = "host.stop_runner"
@@ -81,8 +82,8 @@ class HostHelloFrame:
         (see ``omnigent.onboarding.harness_readiness``). Keys
         cover every accepted harness spelling. ``None`` means
         unknown (an older host that doesn't report it) — never
-        treat ``None`` as "nothing is configured". Recomputed on
-        each (re)connect; the launch-time check is authoritative.
+        treat ``None`` as "nothing is configured". Refreshed while
+        connected; the launch-time check is authoritative.
     """
 
     version: str
@@ -92,6 +93,17 @@ class HostHelloFrame:
     configured_harnesses: dict[str, HarnessAvailability] | None = None
     telemetry_opt_out: bool = False
     installation_id: str | None = None
+
+
+@dataclass
+class HostHarnessReadinessFrame:
+    """Host's refreshed per-harness readiness while the tunnel stays open.
+
+    :param configured_harnesses: Current launch readiness keyed by every
+        accepted harness spelling. Sent only when the map changes.
+    """
+
+    configured_harnesses: dict[str, HarnessAvailability]
 
 
 @dataclass
@@ -621,6 +633,7 @@ class HostFsResultFrame:
 
 HostFrame = (
     HostHelloFrame
+    | HostHarnessReadinessFrame
     | HostLaunchRunnerFrame
     | HostLaunchRunnerResultFrame
     | HostStopRunnerFrame
@@ -690,6 +703,13 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "configured_harnesses": frame.configured_harnesses,
                 "telemetry_opt_out": frame.telemetry_opt_out,
                 "installation_id": frame.installation_id,
+            }
+        )
+    if isinstance(frame, HostHarnessReadinessFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.HARNESS_READINESS.value,
+                "configured_harnesses": frame.configured_harnesses,
             }
         )
     if isinstance(frame, HostLaunchRunnerFrame):
@@ -967,6 +987,8 @@ def _decode_known_host_frame(
     match kind:
         case HostFrameKind.HELLO:
             return _decode_host_hello(msg)
+        case HostFrameKind.HARNESS_READINESS:
+            return _decode_harness_readiness(msg)
         case HostFrameKind.LAUNCH_RUNNER:
             return _decode_launch_runner(msg)
         case HostFrameKind.LAUNCH_RUNNER_RESULT:
@@ -1027,6 +1049,14 @@ def _decode_host_hello(msg: dict[str, Any]) -> HostHelloFrame:
         telemetry_opt_out=bool(msg.get("telemetry_opt_out", False)),
         installation_id=_optional_nullable_str(msg, "installation_id"),
     )
+
+
+def _decode_harness_readiness(msg: dict[str, Any]) -> HostHarnessReadinessFrame:
+    """Decode a live harness-readiness refresh frame."""
+    configured_harnesses = _optional_str_availability_map(msg, "configured_harnesses")
+    if configured_harnesses is None:
+        raise ValueError("harness readiness frame requires a configured_harnesses object")
+    return HostHarnessReadinessFrame(configured_harnesses=configured_harnesses)
 
 
 def _decode_launch_runner(msg: dict[str, Any]) -> HostLaunchRunnerFrame:

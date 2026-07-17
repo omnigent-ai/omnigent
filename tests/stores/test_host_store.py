@@ -162,6 +162,24 @@ def test_upsert_reconnect_overwrites_and_nulls_configured_harnesses(
     assert fetched.configured_harnesses is None
 
 
+def test_update_harness_readiness_replaces_live_map(host_store: HostStore) -> None:
+    """A live tunnel refresh replaces readiness without reconnecting."""
+    host_id = "6d86ee544f1d5b7068ac56f5927a5b5c"
+    host_store.upsert_on_connect(
+        host_id=host_id,
+        name="laptop-live",
+        owner="alice@example.com",
+        configured_harnesses={"pi": False},
+    )
+
+    host_store.update_harness_readiness(host_id, {"pi": True})
+
+    fetched = host_store.get_host(host_id)
+    assert fetched is not None
+    assert fetched.configured_harnesses == {"pi": True}
+    assert fetched.status == "online"
+
+
 def test_malformed_configured_harnesses_column_reads_as_none(
     host_store: HostStore,
     db_uri: str,

@@ -1,9 +1,9 @@
 """Harness readiness checks used by the host daemon.
 
-The daemon reports a per-harness readiness map in its hello frame (so the
-web agent picker can warn) and re-checks the session's harness before
-spawning a runner (so an unconfigured launch fails with a clear,
-actionable error instead of dying inside the executor).
+The daemon reports a per-harness readiness map in its hello frame, refreshes
+it while connected (so the web agent picker can warn accurately), and
+re-checks the session's harness before spawning a runner (so an unconfigured
+launch fails clearly instead of dying inside the executor).
 
 "Configured" here is deliberately narrow: the **only** thing the daemon
 can reliably determine locally is whether a harness's wrapped CLI binary
@@ -331,6 +331,16 @@ def configured_harness_map() -> dict[str, HarnessAvailability]:
     spellings.add(GOOSE_KEY)  # headless Goose (``goose acp``) gates on the goose binary
     spellings.add(HERMES_KEY)  # Hermes Agent wraps the ``hermes`` CLI
     spellings.add(COPILOT_KEY)
-    return {
-        spelling: _harness_availability(_canonical_harness(spelling)) for spelling in spellings
-    }
+    availability_cache: dict[tuple[str, ...], HarnessAvailability] = {}
+    result: dict[str, HarnessAvailability] = {}
+    for spelling in spellings:
+        canonical = _canonical_harness(spelling)
+        cache_key = (
+            ("codex",)
+            if canonical in {"codex", "codex-native", "native-codex"}
+            else ("harness", canonical)
+        )
+        if cache_key not in availability_cache:
+            availability_cache[cache_key] = _harness_availability(canonical)
+        result[spelling] = availability_cache[cache_key]
+    return result

@@ -14,6 +14,7 @@ from omnigent.host.frames import (
     HostCreateWorktreeResultFrame,
     HostFsRequestFrame,
     HostFsResultFrame,
+    HostHarnessReadinessFrame,
     HostHelloFrame,
     HostLaunchRunnerFrame,
     HostLaunchRunnerResultFrame,
@@ -194,6 +195,16 @@ def test_hello_frame_configured_harnesses_round_trip() -> None:
     # Exact map equality: both the True and the False must survive —
     # False is the actionable "warn the user" value.
     assert decoded.configured_harnesses == {"claude-sdk": True, "codex": "needs-auth"}
+
+
+def test_harness_readiness_frame_round_trip() -> None:
+    """Verify a live readiness refresh survives encode and decode."""
+    original = HostHarnessReadinessFrame(
+        configured_harnesses={"pi": True, "codex": "needs-auth"},
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostHarnessReadinessFrame)
+    assert decoded.configured_harnesses == {"pi": True, "codex": "needs-auth"}
 
 
 def test_hello_frame_legacy_payload_decodes_unknown_harnesses() -> None:
