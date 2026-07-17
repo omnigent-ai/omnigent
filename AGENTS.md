@@ -30,6 +30,20 @@ Generate the description from the actual diff and this session's context — lea
 with the motivation, then the change. Don't pass a `--body` that skips these
 sections.
 
+## Finishing a task
+
+When you finish a task, print instructions to the user on how to test it: the
+commands to run, the inputs to provide, or the steps to reproduce so they can
+verify the result themselves. Don't leave the user guessing how to confirm the
+work — tell them exactly what to do.
+
+## Deprecating features
+
+When deprecating a feature, note the version in which it is expected to be
+removed so we can clean it up when that version ships. Call out the deprecation
+version in code (e.g. a `@deprecated` tag or comment naming the target release)
+and in the PR/commit description, so there's a clear marker to act on later.
+
 ## Code comments
 
 Keep comments short and focused on the code, not on the change history.
