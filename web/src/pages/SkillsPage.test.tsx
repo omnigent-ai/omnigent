@@ -772,6 +772,25 @@ describe("SkillsPage — left sidebar file explorer", () => {
   });
 });
 
+describe("SkillsPage — resizable sidebar", () => {
+  it("renders an accessible drag-resize handle between the panes", async () => {
+    vi.mocked(skillsApi.getSkillCatalog).mockResolvedValue({
+      skills: [BUILTIN],
+      includeOtherTools: true,
+      hiddenCount: 0,
+    });
+
+    renderPage();
+    const handle = await screen.findByTestId("skills-resize-handle");
+    // Uses the shared separator primitive: vertical separator, labelled,
+    // keyboard-focusable.
+    expect(handle).toHaveAttribute("role", "separator");
+    expect(handle).toHaveAttribute("aria-orientation", "vertical");
+    expect(handle).toHaveAttribute("aria-label", "Resize skills list");
+    expect(handle).toHaveAttribute("tabindex", "0");
+  });
+});
+
 describe("SkillsPage — collapsible ownership sections", () => {
   function renderThreeCategories() {
     vi.mocked(skillsApi.getSkillCatalog).mockResolvedValue({

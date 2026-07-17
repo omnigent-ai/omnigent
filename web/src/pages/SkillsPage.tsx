@@ -2,27 +2,23 @@
  * Skills page (`/skills`) — the harness-neutral cross-harness Skill Registry
  * catalog, rendered as a compact master-detail.
  *
- * Layout (from the final hybrid UX):
- *  - A minimal header: title + one-line subtitle, and a right-aligned
- *    "Include skills from other tools" switch (the trust widening).
- *  - A compact ~292px single-column master list: a tight search box, an
- *    optional source filter (a dropdown of the catalog's distinct source roots
- *    with an "All sources" default), then a FLAT, harness-neutral list of ~48px
- *    rows. The list is NOT grouped/sectioned by path, provider, or scope — the
- *    concrete source path is an optional filter + a detail field, not the
- *    information architecture. Each row shows an enabled/available dot, the
- *    `/name`, and a one-line description.
- *  - A persistent detail pane: overview, a Source row showing the concise
- *    root-anchored path (provider as secondary text), the SKILL.md
- *    instructions (rendered / source toggle + copy), a "ready to use" line,
- *    and a single collapsed Advanced details disclosure holding ALL
- *    harness/vendor provenance (provider, full absolute path, source kind,
- *    delivery, canonical id, digest, conflict resolution).
+ * Layout (a global inventory master-detail):
+ *  - A minimal header: title + one-line neutral inventory subtitle (no trust
+ *    toggle — the page always browses every discovered source).
+ *  - A drag-resizable left explorer (default ~320px, min ~248, max ~560): a
+ *    search box, an optional source-path filter, then skills grouped into
+ *    collapsible OWNERSHIP sections (Omnigent → Agent · <name> → Local). Skill
+ *    rows are chevron-free selection controls; the selected skill's on-disk
+ *    resource tree expands inline beneath its row (folder chevrons live inside
+ *    that tree). Source paths appear only in the filter + detail, never as the
+ *    list's information architecture.
+ *  - A persistent detail pane: overview, a Source row (concise path, provider
+ *    secondary), a collapsed Advanced details disclosure, then the SKILL.md
+ *    Instructions with a measured, always-scrollable Show more / Show less
+ *    disclosure. Selecting a file in the left tree previews it here instead.
  *
- * Data comes from `useSkills` (TanStack Query over `/v1/skills`). The include
- * switch drives the catalog query key so flipping it refetches for that trust
- * mode. Enable/available is READ-ONLY — the backend invented no per-skill
- * mutation, so the dot + label are status, never a toggle.
+ * Data comes from `useSkills` (TanStack Query over `/v1/skills`), always in the
+ * all-source browse context. The page never reads/mutates execution trust.
  *
  * The page renders inside the AppShell outlet, so it uses `PageScroll`'s
  * header/inset clearing and fills the available height as a master-detail.
@@ -54,6 +50,7 @@ import {
   useSkillFile,
   useSkillFileTree,
 } from "@/hooks/useSkills";
+import { useResizableColumn } from "@/hooks/useResizableColumn";
 import { Link } from "@/lib/routing";
 import { copyText } from "@/lib/clipboard";
 import {
@@ -187,6 +184,10 @@ export function SkillsPage() {
   // Sections default expanded; this holds only the ones explicitly collapsed.
   const [collapsedSections, setCollapsedSections] = useState<Set<SkillOwnership>>(new Set());
 
+  // Draggable width for the left explorer column (default 320, kept usable at
+  // the low end and bounded at the high end so the detail pane keeps room).
+  const { width: listWidth, containerRef, handleProps } = useResizableColumn(320, 248, 560);
+
   const skills = useMemo(() => catalogQuery.data?.skills ?? [], [catalogQuery.data]);
 
   // While a search query or source filter is active, matching sections are
@@ -266,8 +267,10 @@ export function SkillsPage() {
       {sessionId === null ? (
         <NoSessionEmptyState />
       ) : (
-        <div className="flex min-h-0 flex-1">
+        <div className="flex min-h-0 flex-1" ref={containerRef as React.RefObject<HTMLDivElement>}>
           <SkillList
+            width={listWidth}
+            handleProps={handleProps}
             skills={shown}
             totalVisible={skills.length}
             query={query}
@@ -343,6 +346,8 @@ function SkillsHeader() {
 // ── Master list ────────────────────────────────────────────────────────────────
 
 function SkillList({
+  width,
+  handleProps,
   skills,
   totalVisible,
   query,
@@ -363,6 +368,8 @@ function SkillList({
   error,
   onRetry,
 }: {
+  width: number;
+  handleProps: React.HTMLAttributes<HTMLDivElement> & { role: "separator" };
   skills: SkillSummary[];
   totalVisible: number;
   query: string;
@@ -384,7 +391,19 @@ function SkillList({
   onRetry: () => void;
 }) {
   return (
-    <div className="flex w-[320px] shrink-0 flex-col border-r border-border">
+    <div
+      className="relative flex shrink-0 flex-col border-r border-border"
+      style={{ width: `${width}px` }}
+    >
+      {/* Drag-to-resize handle at the right edge (shared useResizableColumn
+          primitive). Sits over the border with a subtle hover/active cue. */}
+      <div
+        {...handleProps}
+        aria-label="Resize skills list"
+        tabIndex={0}
+        data-testid="skills-resize-handle"
+        className="absolute inset-y-0 -right-0.5 z-10 w-1 cursor-col-resize transition-colors hover:bg-primary/30 focus-visible:bg-primary/50 active:bg-primary/50"
+      />
       <div className="flex shrink-0 flex-col gap-2 border-b border-border px-3 py-2">
         <div className="flex items-center gap-2">
           <div className="flex flex-1 items-center gap-2 rounded-lg bg-muted px-2.5 py-1.5 focus-within:ring-2 focus-within:ring-ring/40">
