@@ -22,6 +22,20 @@ change. If the tool is unavailable after discovery or declines the rename, conti
 """.strip()
 
 
+def session_rename_instruction(*, initial_session: bool) -> str | None:
+    """Return the rename directive when the caller identifies an initial session.
+
+    The shared runner derives ``initial_session`` from persisted message history.
+    Native launchers derive it from the absence of a resumed external session or
+    carried fork history. Keeping the selection here gives both layers one
+    canonical gate while allowing each to use the state it owns.
+
+    :param initial_session: Whether this is the session's initial model context.
+    :returns: The rename instruction for an initial session, otherwise ``None``.
+    """
+    return SESSION_RENAME_INSTRUCTION if initial_session else None
+
+
 class SysSessionRenameTool(Tool):
     """Schema-only tool that renames the calling session."""
 

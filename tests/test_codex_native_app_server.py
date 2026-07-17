@@ -23,6 +23,7 @@ from omnigent.codex_native_app_server import (
     trust_native_policy_hooks,
 )
 from omnigent.codex_native_hook import _EVALUATE_POLICY_TIMEOUT_S
+from omnigent.inner.codex_executor import _populate_codex_home_config
 
 
 def test_sync_developer_instructions_preserves_and_restores_user_config(tmp_path: Path) -> None:
@@ -46,6 +47,56 @@ def test_sync_developer_instructions_preserves_and_restores_user_config(tmp_path
 
     resumed_config = tomllib.loads(config_path.read_text(encoding="utf-8"))
     assert resumed_config["developer_instructions"] == "Keep user guidance."
+
+
+def test_sync_developer_instructions_survives_reseeded_config(tmp_path: Path) -> None:
+    """A persisted sidecar restores the original base after config reseeding."""
+    codex_home = tmp_path / "codex-home"
+    source_home = tmp_path / "source-home"
+    codex_home.mkdir()
+    source_home.mkdir()
+    config_path = codex_home / "config.toml"
+    config_path.write_text(
+        'developer_instructions = "Keep original guidance."\n',
+        encoding="utf-8",
+    )
+    (source_home / "config.toml").write_text(
+        'developer_instructions = "New shared guidance."\n',
+        encoding="utf-8",
+    )
+
+    _sync_codex_developer_instructions(codex_home, "Rename the session.")
+    config_path.unlink()
+    _populate_codex_home_config(codex_home, source_home)
+
+    reseeded = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    assert reseeded["developer_instructions"] == "New shared guidance."
+
+    _sync_codex_developer_instructions(codex_home, None)
+
+    resumed = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    assert resumed["developer_instructions"] == "Keep original guidance."
+
+
+def test_sync_developer_instructions_recovers_legacy_augmented_config(tmp_path: Path) -> None:
+    """A missing sidecar does not capture an existing framework suffix as user base."""
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    config_path = codex_home / "config.toml"
+    config_path.write_text(
+        'developer_instructions = "Keep user guidance.\\n\\nRename the session."\n',
+        encoding="utf-8",
+    )
+
+    _sync_codex_developer_instructions(codex_home, "Rename the session.")
+
+    active = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    assert active["developer_instructions"] == "Keep user guidance.\n\nRename the session."
+
+    _sync_codex_developer_instructions(codex_home, None)
+
+    resumed = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    assert resumed["developer_instructions"] == "Keep user guidance."
 
 
 def test_sync_developer_instructions_skips_invalid_config(tmp_path: Path) -> None:

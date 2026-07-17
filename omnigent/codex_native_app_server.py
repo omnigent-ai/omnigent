@@ -277,6 +277,13 @@ def _sync_codex_developer_instructions(
         base = base_path.read_text(encoding="utf-8")
     else:
         base = current.strip() if isinstance(current, str) else ""
+        # A previous Omnigent build may have appended the same framework
+        # directive without writing the sidecar. Recover the user-authored
+        # prefix instead of permanently capturing the combined value as base.
+        if addition and base == addition:
+            base = ""
+        elif addition and base.endswith(f"\n\n{addition}"):
+            base = base[: -len(addition)].rstrip()
         base_path.write_text(base, encoding="utf-8")
     active = f"{base}\n\n{addition}" if base and addition else base or addition
     if active:

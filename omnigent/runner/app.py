@@ -91,7 +91,7 @@ from omnigent.tools.builtins.load_skill import (
     find_skill_by_name,
     format_skill_meta_text,
 )
-from omnigent.tools.builtins.session_rename import SESSION_RENAME_INSTRUCTION
+from omnigent.tools.builtins.session_rename import session_rename_instruction
 
 _logger = logging.getLogger(__name__)
 
@@ -3744,10 +3744,10 @@ async def _auto_create_codex_terminal(
         profile=_codex_launch.profile,
         extra_config_overrides=[*_codex_launch.config_overrides, *mcp_overrides],
         bridge_dir=bridge_dir,
-        developer_instructions=(
-            SESSION_RENAME_INSTRUCTION
-            if launch_config.external_session_id is None and not launch_config.fork_carry_history
-            else None
+        developer_instructions=session_rename_instruction(
+            initial_session=(
+                launch_config.external_session_id is None and not launch_config.fork_carry_history
+            )
         ),
         ap_server_url=launch_config.policy_server_url,
         ap_auth_headers=policy_headers,
@@ -5802,10 +5802,8 @@ async def _auto_create_claude_terminal(
         agent_name=agent_name,
         skills_filter=skills_filter,
         api_key_helper=claude_config.api_key_helper if claude_config is not None else None,
-        append_system_prompt=(
-            SESSION_RENAME_INSTRUCTION
-            if session_external_id is None and not fork_carry_history
-            else None
+        append_system_prompt=session_rename_instruction(
+            initial_session=session_external_id is None and not fork_carry_history
         ),
     )
 
@@ -13760,9 +13758,10 @@ def create_runner_app(
 
         if conv not in _session_histories:
             _session_histories[conv] = await _load_history_as_input(conv)
-        framework_instructions = (
-            (SESSION_RENAME_INSTRUCTION,) if _is_first_user_turn(_session_histories[conv]) else ()
+        rename_instruction = session_rename_instruction(
+            initial_session=_is_first_user_turn(_session_histories[conv])
         )
+        framework_instructions = (rename_instruction,) if rename_instruction else ()
 
         harness_name: str | None = None
         spawn_env: dict[str, str] | None = None

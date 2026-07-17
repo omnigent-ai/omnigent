@@ -1,7 +1,10 @@
 """Tests for first-turn automatic-title instruction gating."""
 
 from omnigent.runner.app import _is_first_user_turn
-from omnigent.tools.builtins.session_rename import SESSION_RENAME_INSTRUCTION
+from omnigent.tools.builtins.session_rename import (
+    SESSION_RENAME_INSTRUCTION,
+    session_rename_instruction,
+)
 
 
 def test_first_user_turn_requires_one_user_message_and_no_assistant() -> None:
@@ -25,3 +28,9 @@ def test_first_user_turn_requires_one_user_message_and_no_assistant() -> None:
     assert "Strip filler; keep the noun + verb" in SESSION_RENAME_INSTRUCTION
     assert 'title:  "Debug double React re-render"' in SESSION_RENAME_INSTRUCTION
     assert "ToolSearch" in SESSION_RENAME_INSTRUCTION
+
+
+def test_session_rename_instruction_uses_shared_initial_session_gate() -> None:
+    """History and native launch paths share one instruction selector."""
+    assert session_rename_instruction(initial_session=True) == SESSION_RENAME_INSTRUCTION
+    assert session_rename_instruction(initial_session=False) is None
