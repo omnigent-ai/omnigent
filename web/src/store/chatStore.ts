@@ -181,35 +181,6 @@ export interface QueuedMessage {
 }
 
 /**
- * How many conversations keep a cached transcript. Bounds the memory a long
- * browsing session can accrete; the least-recently-viewed entry is evicted.
- */
-export const CONVERSATION_BLOCK_CACHE_LIMIT = 10;
-
-/** Monotonic recency stamp for {@link CachedConversation}, immune to clock stubs. */
-let blockCacheSeq = 0;
-
-/**
- * A conversation's last rendered transcript, kept so switching back to it
- * paints from memory instead of blanking behind the network.
- * See {@link ChatState.blocksByConversation}.
- */
-export interface CachedConversation {
-  /** Committed blocks only — in-flight `live:*` previews are never cached. */
-  blocks: AnyBlock[];
-  /**
-   * The window cursor and flag that were live alongside `blocks`. Cached
-   * atomically with them, or a restored transcript loses scroll-up paging.
-   */
-  oldestItemId: string | null;
-  hasMoreHistory: boolean;
-  /** Last known lifecycle, so the restored header doesn't flash "idle". */
-  sessionStatus: SessionStatus;
-  /** Recency for eviction; higher is more recent. */
-  seq: number;
-}
-
-/**
  * A conversation's in-flight optimistic bubbles, stashed so they survive
  * in-app navigation. See {@link ChatState.pendingByConversation}.
  */
@@ -316,21 +287,6 @@ export interface ChatState {
    * {@link StashedPending.committedTexts}). Pruned to non-empty entries.
    */
   pendingByConversation: Record<string, StashedPending>;
-  /**
-   * Stale-while-revalidate cache of previously-viewed transcripts, keyed by
-   * conversation id. `switchTo` stashes the outgoing conversation here and
-   * paints the incoming one from it, so a switch-back renders instantly;
-   * `bindStream` still refetches and reconciles by item id behind it.
-   * Capped at {@link CONVERSATION_BLOCK_CACHE_LIMIT}.
-   */
-  blocksByConversation: Record<string, CachedConversation>;
-  /**
-   * The block identities `switchTo` restored from the cache for the current
-   * conversation, or `null` on a cold load. They are a placeholder for the
-   * fresh snapshot, so `bindStream`'s reconcile excludes them and merges
-   * against the live pump's blocks alone — exactly as a cold load does.
-   */
-  restoredCacheBlocks: Set<AnyBlock> | null;
   /** Lifecycle of the most recent send. `null` when idle pre-send. */
   activeResponse: ActiveResponse | null;
   /**
@@ -943,8 +899,6 @@ export const useChatStore = create<ChatState>((set, get) => ({
   pendingUserMessages: [],
   queuedMessages: [],
   pendingByConversation: {},
-  blocksByConversation: {},
-  restoredCacheBlocks: null,
   activeResponse: null,
   interruptedResponseIds: [],
   status: "idle",
@@ -1629,61 +1583,32 @@ export const useChatStore = create<ChatState>((set, get) => ({
           delete pendingByConversation[s.conversationId];
         }
       }
-      // Stash the outgoing conversation's rendered transcript so switching
-      // back to it paints from memory instead of blanking on the network.
-      // In-flight ``live:*`` previews are dropped: they belong to a turn
-      // that is still streaming, and re-serving them later would bleed a
-      // half-written bubble into the restored view. A conversation still
-      // loading has nothing worth keeping.
-      const blocksByConversation = { ...s.blocksByConversation };
-      if (s.conversationId !== null && !s.loadingConversation) {
-        const committed = s.blocks.filter((b) => !isLiveProvisionalBlock(b));
-        if (committed.length > 0) {
-          blockCacheSeq += 1;
-          blocksByConversation[s.conversationId] = {
-            blocks: committed,
-            oldestItemId: s.oldestItemId,
-            hasMoreHistory: s.hasMoreHistory,
-            sessionStatus: s.sessionStatus,
-            seq: blockCacheSeq,
-          };
-        }
-      }
-      const cached = conversationId !== null ? blocksByConversation[conversationId] : undefined;
       return {
         pendingByConversation,
-        blocksByConversation: evictColdestConversations(blocksByConversation),
         conversationId,
         // Clear any pending supersession redirect: we've now switched
         // sessions, so a leftover target (e.g. already consumed by the
         // navigate that brought us here) must not fire again.
         redirectToConversationId: null,
-        // Paint the cached transcript when we have one (bindStream still
-        // refetches and reconciles behind it), else start empty. Either way
-        // the outgoing session's in-flight preview blocks (``live:*``) are
-        // gone, so they never bleed across.
-        blocks: cached?.blocks ?? [],
-        restoredCacheBlocks: cached !== undefined ? new Set(cached.blocks) : null,
+        // Cleared here, so a different session's in-flight preview blocks
+        // (``live:*``) never bleed across.
+        blocks: [],
         pendingUserMessages:
           conversationId !== null ? (pendingByConversation[conversationId]?.messages ?? []) : [],
         activeResponse: null,
         interruptedResponseIds: [],
         status: "idle",
-        sessionStatus: cached?.sessionStatus ?? "idle",
+        sessionStatus: "idle",
         backgroundTaskCount: 0,
         isNativeTerminalSession: false,
         nativeVendorOwnsModel: false,
         boundAgentId: null,
         boundAgentName: null,
-        // A cached transcript is already on screen: revalidate silently
-        // rather than blanking it behind the loading state.
-        loadingConversation: conversationId !== null && cached === undefined,
+        loadingConversation: conversationId !== null,
         conversationLoadError: null,
-        // Restored atomically with the cached blocks, or scroll-up paging
-        // would silently break on the instant render.
-        hasMoreHistory: cached?.hasMoreHistory ?? false,
+        hasMoreHistory: false,
         loadingMoreHistory: false,
-        oldestItemId: cached?.oldestItemId ?? null,
+        oldestItemId: null,
         llmModel: null,
         sessionHarness: null,
         // ``selectedEffort`` / ``selectedModel`` are sticky user picks —
@@ -2470,40 +2395,15 @@ async function bindStream(
     const pendingElicitationBlocks = pendingElicitationBlocksFromSnapshot(session);
     const oldestItemId = items[0]?.id ?? null;
     set((state) => {
-      // The fresh initial window is the newest page. It still connects to a
-      // restored transcript when the two share an item id: the cache then
-      // extends contiguously from that overlap (older pages above, newer items
-      // to append), so keep the full restored transcript as the base and fold
-      // the window in — otherwise a scrolled-up multi-page transcript would
-      // collapse back to its last page. With NO shared id the cache is stale
-      // or disconnected from the current tail (e.g. many items committed while
-      // away), so drop it and rebuild from the window, as a cold load does.
-      const restored = state.restoredCacheBlocks;
-      const restoredItemIds =
-        restored === null
-          ? null
-          : new Set(
-              [...restored].map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
-            );
-      const overlapsRestored =
-        restoredItemIds !== null &&
-        snapshotBlocks.some((b) => b.ctx.itemId != null && restoredItemIds.has(b.ctx.itemId));
-      // On a cold load / dropped cache, ``priorBlocks`` is the live pump's
-      // blocks alone; on a kept cache it is the full restored transcript.
-      const priorBlocks = overlapsRestored
-        ? state.blocks
-        : restored === null
-          ? state.blocks
-          : state.blocks.filter((b) => !restored.has(b));
       const seenItemIds = new Set(
-        priorBlocks.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
+        state.blocks.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
       );
       const unique = snapshotBlocks.filter((b) => !b.ctx.itemId || !seenItemIds.has(b.ctx.itemId));
-      // Dedupe against any elicitation blocks already present — from the live
-      // pump or the restored transcript (the snapshot may race ahead of or
-      // behind the SSE event, so match by elicitationId).
+      // Dedupe against any elicitation blocks already produced by
+      // the live pump (the snapshot may race ahead of or behind
+      // the SSE event — match by elicitationId).
       const seenElicitationIds = new Set(
-        priorBlocks
+        state.blocks
           .filter((b): b is typeof b & { type: "elicitation" } => b.type === "elicitation")
           .map((b) => b.elicitationId),
       );
@@ -2521,14 +2421,7 @@ async function bindStream(
       // live blocks the pump already inserted) so the ApprovalCard
       // appears at the bottom of the chat — same position the live
       // stream would have given it.
-      // In-flight ``live:*`` previews belong to the turn streaming NOW, so
-      // any item committed while away (``unique``) is older and must land
-      // above them — matching the cold branch's committed-before-live order.
-      const priorLive = priorBlocks.filter(isLiveProvisionalBlock);
-      const priorCommitted = priorBlocks.filter((b) => !isLiveProvisionalBlock(b));
-      const allBlocks = overlapsRestored
-        ? [...priorCommitted, ...unique, ...priorLive, ...uniquePendingElicitations]
-        : [...unique, ...priorBlocks, ...uniquePendingElicitations];
+      const allBlocks = [...unique, ...state.blocks, ...uniquePendingElicitations];
       const hasErrorBlock = allBlocks.some((b) => b.type === "error");
       // Decide the optimistic user bubbles to render after this bind, and
       // (on cold load) keep the per-conversation stash consistent.
@@ -2635,19 +2528,12 @@ async function bindStream(
       return {
         ...bindingPatch,
         blocks: syntheticError !== null ? [...allBlocks, syntheticError] : allBlocks,
-        // The snapshot has superseded whatever the cache painted.
-        restoredCacheBlocks: null,
         pendingUserMessages: snapshotPending,
         pendingByConversation: prunedStash,
         loadingConversation: false,
-        // A kept restored transcript already holds pages older than the fresh
-        // initial window, so preserve its deeper cursor/flag — overwriting them
-        // with the shallow window would strand the paged-in history and break
-        // scroll-up. A cold load or dropped cache takes the fresh window.
-        hasMoreHistory: overlapsRestored ? state.hasMoreHistory : page.hasMore,
-        oldestItemId: overlapsRestored ? state.oldestItemId : oldestItemId,
-        // The window cursor moved: void any in-flight loadMoreHistory so a
-        // cursor-relative page can't prepend out of order.
+        hasMoreHistory: page.hasMore,
+        oldestItemId,
+        // The window cursor was reset: void any in-flight loadMoreHistory.
         historyGeneration: state.historyGeneration + 1,
         // The voided page's stale early-return skips its own flag clear.
         loadingMoreHistory: false,
@@ -4063,25 +3949,6 @@ function contentKeyOf(content: MessageContentBlock[]): string {
     return v;
   };
   return JSON.stringify(canonical(content));
-}
-
-/**
- * Trim the transcript cache back to {@link CONVERSATION_BLOCK_CACHE_LIMIT},
- * dropping the least-recently-viewed conversations first. Without a cap a
- * long browsing session would hold every transcript it ever opened.
- */
-function evictColdestConversations(
-  cache: Record<string, CachedConversation>,
-): Record<string, CachedConversation> {
-  const ids = Object.keys(cache);
-  if (ids.length <= CONVERSATION_BLOCK_CACHE_LIMIT) return cache;
-  const next = { ...cache };
-  for (const id of ids
-    .sort((a, b) => cache[a]!.seq - cache[b]!.seq)
-    .slice(0, ids.length - CONVERSATION_BLOCK_CACHE_LIMIT)) {
-    delete next[id];
-  }
-  return next;
 }
 
 /**
