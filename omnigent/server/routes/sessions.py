@@ -121,6 +121,7 @@ from omnigent.runner.identity import (
     token_bound_runner_id,
 )
 from omnigent.runner.routing import RunnerRouter
+from omnigent.runner.session_init_protocol import build_runner_session_init_payload
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
 from omnigent.runtime import (
     get_agent_cache,
@@ -213,6 +214,7 @@ from omnigent.server.routes._session_create_validation import (
     validate_session_agent,
     validate_session_model_metadata,
 )
+from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.server.schemas import (
     AgentObject,
     AutomaticSessionRenameRequest,
@@ -7489,7 +7491,8 @@ async def _ensure_runner_session_initialized(
     conv: Conversation,
     runner_client: httpx.AsyncClient,
     conversation_store: ConversationStore,
-) -> None:
+    initializer: RunnerSessionInitializer | None = None,
+) -> bool:
     """
     Drive — and wait for — the runner's session-init handshake.
 
@@ -7510,11 +7513,10 @@ async def _ensure_runner_session_initialized(
     message (``create_session`` endpoint) or against a from-offset-0
     forwarder.
 
-    The runner's ``create_session`` is idempotent (it skips terminal
-    auto-create under a per-session lock when one already exists), so
-    this is safe even though ``_on_runner_connect`` (server/app.py)
-    also posts ``/v1/sessions`` on the same connection — whichever
-    lands first creates the terminal; the other no-ops.
+    Current servers route this and ``_on_runner_connect`` through one
+    generation-aware initializer, so both callers await the same response.
+    The runner retains its own single-flight as the compatibility backstop for
+    older servers and cross-replica delivery.
 
     Best-effort and matching the create / PATCH handshakes: a transport
     error is logged and swallowed (the relay + ``_on_runner_connect``
@@ -7529,24 +7531,42 @@ async def _ensure_runner_session_initialized(
         *session_id* (its tunnel is up).
     :param conversation_store: Store used to clear persisted disconnect
         error labels once the handshake proves the runner recovered.
-    :returns: None.
+    :returns: ``True`` when a current runner explicitly confirmed its native
+        terminal is ready; ``False`` for legacy or non-native responses.
     """
     try:
-        resp = await runner_client.post(
-            "/v1/sessions",
-            json={
-                "session_id": session_id,
-                "agent_id": conv.agent_id,
-                "sub_agent_name": conv.sub_agent_name,
-            },
-            timeout=_RUNNER_SESSION_INIT_TIMEOUT_S,
-        )
+        if initializer is not None:
+            resp = await initializer.initialize(
+                conv,
+                runner_client,
+                timeout=_RUNNER_SESSION_INIT_TIMEOUT_S,
+            )
+        else:
+            from omnigent.version import VERSION
+
+            resp = await runner_client.post(
+                "/v1/sessions",
+                json=build_runner_session_init_payload(
+                    conv,
+                    server_version=VERSION,
+                ),
+                timeout=_RUNNER_SESSION_INIT_TIMEOUT_S,
+            )
         # httpx only raises on transport errors; a 4xx/5xx means create_session
         # likely didn't run (terminal + forwarder not set up), so surface it
         # via the same warning path rather than silently forwarding into a
         # half-initialized runner.
         resp.raise_for_status()
         await _publish_runner_recovered_status(session_id, conversation_store)
+        try:
+            payload = resp.json()
+        except ValueError:
+            return False
+        return bool(
+            isinstance(payload, dict)
+            and payload.get("session_init_protocol_version") == 2
+            and payload.get("terminal_ready") is True
+        )
     except (httpx.HTTPError, ConnectionError):
         _logger.warning(
             "Session-init handshake to runner failed for session %s; "
@@ -7554,6 +7574,7 @@ async def _ensure_runner_session_initialized(
             session_id,
             exc_info=True,
         )
+        return False
 
 
 async def _get_runner_client_for_resource_access(
@@ -9573,6 +9594,7 @@ async def _dispatch_session_event_to_runner(
     has_mcp_servers: bool = False,
     created_by: str | None = None,
     runner_router: RunnerRouter | None = None,
+    native_terminal_ready: bool = False,
 ) -> _SessionEventDispatchResult:
     """
     Forward an item-event to the runner with harness-aware dispatch.
@@ -9638,6 +9660,9 @@ async def _dispatch_session_event_to_runner(
         native-terminal parent-wake forward when a sub-agent fails to
         boot (see :func:`_persist_native_terminal_failure`). ``None``
         in in-process / test setups where the global client is used.
+    :param native_terminal_ready: A current initialization response already
+        proved the terminal and forwarder ready, so the immediate duplicate
+        ensure can be skipped.
     :returns: A :class:`_SessionEventDispatchResult` carrying the
         persisted item id (non-native) or the pending-input id
         (claude-native message bypass).
@@ -9647,10 +9672,14 @@ async def _dispatch_session_event_to_runner(
         # for syntactically valid user messages; assistant/system-shaped
         # inputs should still fail locally without creating terminals.
         _build_native_terminal_message_event(conv, body)
-        ensure_outcome = await _ensure_native_terminal_ready(
-            runner_client,
-            session_id,
-            conv,
+        ensure_outcome = (
+            _NativeTerminalEnsureOutcome(error=None, policy_notice=None)
+            if native_terminal_ready
+            else await _ensure_native_terminal_ready(
+                runner_client,
+                session_id,
+                conv,
+            )
         )
         if ensure_outcome.error is not None:
             item_id = await _persist_native_terminal_failure(
@@ -20894,6 +20923,7 @@ def create_sessions_router(
         if refreshed_conv is None:
             raise _session_not_found()
         conv = refreshed_conv
+        native_terminal_ready = False
         if _runner_needs_session_init:
             # The runner was unavailable when this request began, so its
             # connect callback may still be racing us. Await the handshake
@@ -20902,8 +20932,12 @@ def create_sessions_router(
             # forwarded into a TUI whose forwarder isn't attached, the
             # round-trip never mirrors back, and the optimistic bubble
             # sticks with no reply (host-restart bug).
-            await _ensure_runner_session_initialized(
-                session_id, conv, runner_client, conversation_store
+            native_terminal_ready = await _ensure_runner_session_initialized(
+                session_id,
+                conv,
+                runner_client,
+                conversation_store,
+                initializer=getattr(request.app.state, "runner_session_initializer", None),
             )
         await _ensure_runner_relay_ready(
             session_id,
@@ -20961,6 +20995,7 @@ def create_sessions_router(
             has_mcp_servers=_has_mcp_servers,
             created_by=_attribution_user(user_id),
             runner_router=runner_router,
+            native_terminal_ready=native_terminal_ready,
         )
         response: dict[str, Any] = {"queued": True}
         if dispatch.item_id is not None:

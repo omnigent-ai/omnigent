@@ -80,6 +80,7 @@ from omnigent.server.routes.sessions import (
 )
 from omnigent.server.routes.sharing import create_sharing_router
 from omnigent.server.routes.terminal_attach import create_terminal_attach_router
+from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.server.scheduled import ScheduledTaskScheduler
 from omnigent.server.ws_origin import WebSocketOriginMiddleware
 from omnigent.stores import (
@@ -1230,6 +1231,10 @@ def create_app(
         registry=tunnel_registry,
         conversation_store=conversation_store,
     )
+    runner_session_initializer = RunnerSessionInitializer(
+        tunnel_registry,
+        server_version=_server_version(),
+    )
     host_registry = HostRegistry()
     # Shared between the host tunnel (which records ``host.runner_exited``
     # reports from daemons) and the runner status endpoint (which surfaces
@@ -1456,6 +1461,7 @@ def create_app(
     # and WSTunnelTransport to the same session registry.
     app.state.tunnel_registry = tunnel_registry
     app.state.runner_router = runner_router
+    app.state.runner_session_initializer = runner_session_initializer
     app.state.host_registry = host_registry
     app.state.host_store = host_store
     app.state.sandbox_config = sandbox_config
@@ -2309,6 +2315,7 @@ def create_app(
                 runner_id,
             )
             return
+        runner_session_initializer.invalidate_runner(runner_id)
         # Graceful disconnect: clear the persisted liveness stamp so other
         # replicas flip offline immediately rather than after the TTL.
         session_live_state.clear_runner_liveness(runner_id)
@@ -2437,12 +2444,9 @@ def create_app(
                 )
             else:
                 try:
-                    await routed.client.post(
-                        "/v1/sessions",
-                        json={
-                            "session_id": conv.id,
-                            "agent_id": conv.agent_id,
-                        },
+                    await runner_session_initializer.initialize(
+                        conv,
+                        routed.client,
                         timeout=10.0,
                     )
                 except Exception:

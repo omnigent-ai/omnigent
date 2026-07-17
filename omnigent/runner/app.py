@@ -79,6 +79,10 @@ from omnigent.runner.resource_registry import (
     TerminalExitEvent,
     TerminalLifecycle,
 )
+from omnigent.runner.session_init_protocol import (
+    RunnerSessionInitEnvelope,
+    parse_runner_session_init_envelope,
+)
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, NoLiveHarnessError
 from omnigent.spec.skill_sources import SkillSourceContext, resolve_harness_skills
 from omnigent.spec.types import AgentSpec, LocalToolInfo, SkillSpec
@@ -5404,6 +5408,129 @@ def _ensure_orchestrator_skills_in_bundle(
         )
 
 
+@dataclasses.dataclass(frozen=True)
+class _ClaudeSessionLaunchMetadata:
+    """Persisted values consumed by Claude terminal launch."""
+
+    reasoning_effort: str | None = None
+    model_override: str | None = None
+    terminal_launch_args: list[str] | None = None
+    external_session_id: str | None = None
+    fork_source_external_id: str | None = None
+    fork_carry_history: bool = False
+
+
+def _claude_launch_metadata_from_envelope(
+    session_init: RunnerSessionInitEnvelope,
+) -> _ClaudeSessionLaunchMetadata:
+    """Project Claude launch metadata without server callbacks."""
+    from omnigent.stores.conversation_store import (
+        FORK_CARRY_HISTORY_LABEL_KEY,
+        FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
+    )
+
+    snapshot = session_init.snapshot
+    fork_source = snapshot.labels.get(FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY)
+    return _ClaudeSessionLaunchMetadata(
+        reasoning_effort=snapshot.reasoning_effort,
+        model_override=snapshot.model_override,
+        terminal_launch_args=snapshot.terminal_launch_args,
+        external_session_id=snapshot.external_session_id,
+        fork_source_external_id=(
+            fork_source if isinstance(fork_source, str) and fork_source else None
+        ),
+        fork_carry_history=snapshot.labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1",
+    )
+
+
+async def _load_legacy_claude_launch_metadata(
+    server_client: httpx.AsyncClient,
+    session_id: str,
+) -> _ClaudeSessionLaunchMetadata:
+    """Fetch Claude launch metadata for servers predating the init envelope."""
+    from omnigent.stores.conversation_store import (
+        FORK_CARRY_HISTORY_LABEL_KEY,
+        FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
+    )
+
+    try:
+        response = await server_client.get(
+            f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
+            timeout=10.0,
+        )
+    except httpx.HTTPError:
+        _logger.debug(
+            "Could not fetch session launch config for %s; terminal will use Claude's defaults",
+            session_id,
+        )
+        return _ClaudeSessionLaunchMetadata()
+    if response.status_code != 200:
+        return _ClaudeSessionLaunchMetadata()
+
+    snapshot = response.json()
+    effort = snapshot.get("reasoning_effort")
+    model_override = snapshot.get("model_override")
+    launch_args = snapshot.get("terminal_launch_args")
+    external_session_id = snapshot.get("external_session_id")
+    labels = snapshot.get("labels")
+    labels = labels if isinstance(labels, dict) else {}
+    fork_source = labels.get(FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY)
+    metadata = _ClaudeSessionLaunchMetadata(
+        reasoning_effort=effort if isinstance(effort, str) and effort else None,
+        model_override=(
+            model_override if isinstance(model_override, str) and model_override else None
+        ),
+        terminal_launch_args=(
+            launch_args
+            if isinstance(launch_args, list) and all(isinstance(arg, str) for arg in launch_args)
+            else None
+        ),
+        external_session_id=(
+            external_session_id
+            if isinstance(external_session_id, str) and external_session_id
+            else None
+        ),
+        fork_source_external_id=(
+            fork_source if isinstance(fork_source, str) and fork_source else None
+        ),
+        fork_carry_history=labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1",
+    )
+    _logger.info(
+        "Claude terminal launch config fetched: session=%s status=%s effort_set=%s "
+        "model_override_set=%s launch_args_count=%d external_session_id_set=%s",
+        session_id,
+        response.status_code,
+        metadata.reasoning_effort is not None,
+        metadata.model_override is not None,
+        len(metadata.terminal_launch_args or []),
+        metadata.external_session_id is not None,
+    )
+    return metadata
+
+
+async def _load_claude_launch_metadata(
+    *,
+    server_client: httpx.AsyncClient,
+    session_id: str,
+    session_init: RunnerSessionInitEnvelope | None,
+) -> _ClaudeSessionLaunchMetadata:
+    """Dispatch between the removable legacy and callback-free loaders."""
+    if session_init is None:
+        return await _load_legacy_claude_launch_metadata(server_client, session_id)
+    metadata = _claude_launch_metadata_from_envelope(session_init)
+    _logger.info(
+        "Claude terminal launch config loaded from init envelope: session=%s "
+        "effort_set=%s model_override_set=%s launch_args_count=%d "
+        "external_session_id_set=%s",
+        session_id,
+        metadata.reasoning_effort is not None,
+        metadata.model_override is not None,
+        len(metadata.terminal_launch_args or []),
+        metadata.external_session_id is not None,
+    )
+    return metadata
+
+
 async def _auto_create_claude_terminal(
     session_id: str,
     resource_registry: SessionResourceRegistry,
@@ -5414,6 +5541,7 @@ async def _auto_create_claude_terminal(
     agent_name: str | None = None,
     agent_spec: AgentSpec | ResolvedSpec | None = None,
     skills_filter: str | list[str] = "all",
+    session_init: RunnerSessionInitEnvelope | None = None,
     auth_token_factory: Callable[[], str | None] | None = None,
 ) -> SessionResourceView:
     """
@@ -5451,6 +5579,8 @@ async def _auto_create_claude_terminal(
     :param skills_filter: The agent spec's ``skills_filter`` (``"all"``
         / ``"none"`` / list of skill names), threaded to
         :func:`augment_claude_args`. Defaults to ``"all"``.
+    :param session_init: Versioned server snapshot. ``None`` selects the
+        isolated legacy callback path.
     :param auth_token_factory: Runner-owned refreshable bearer factory.
         ``None`` preserves direct-call behavior by resolving one locally.
     :returns: The launched terminal's :class:`SessionResourceView`, so
@@ -5467,7 +5597,11 @@ async def _auto_create_claude_terminal(
     from omnigent.claude_native_forwarder import reset_transcript_forward_state
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 
-    workspace = os.environ.get("OMNIGENT_RUNNER_WORKSPACE", str(Path.cwd()))
+    workspace = (
+        session_init.snapshot.workspace
+        if session_init is not None and session_init.snapshot.workspace
+        else os.environ.get("OMNIGENT_RUNNER_WORKSPACE", str(Path.cwd()))
+    )
     started_at = time.monotonic()
     _logger.info(
         "Claude terminal auto-create starting: session=%s workspace=%s bundle_dir=%s "
@@ -5491,21 +5625,28 @@ async def _auto_create_claude_terminal(
     # marker, honour it and resume in the session's own isolated dir. The
     # executor spawn_env already resolves the same label, so the two agree.
     cleared_bridge_id = f"{session_id}-cleared"
-    existing_bridge_id = await _claude_native_bridge_id_for_session(
+    existing_bridge_id = await _claude_native_bridge_id_with_optional_labels(
         server_client=server_client,
         session_id=session_id,
+        session_labels=session_init.snapshot.labels if session_init is not None else None,
     )
     bridge_id = cleared_bridge_id if existing_bridge_id == cleared_bridge_id else session_id
-    try:
-        await server_client.patch(
-            f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
-            json={"labels": {BRIDGE_ID_LABEL_KEY: bridge_id}},
-        )
-    except httpx.HTTPError:
-        _logger.debug(
-            "Could not set bridge_id label for %s; relay may target wrong dir",
-            session_id,
-        )
+    if session_init is not None:
+        # The transfer-inbound guard has already consumed the original label.
+        # From this point this terminal owns the bridge, so later first-turn
+        # helpers must observe the normalized id selected here.
+        session_init.snapshot.labels[BRIDGE_ID_LABEL_KEY] = bridge_id
+    else:
+        try:
+            await server_client.patch(
+                f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
+                json={"labels": {BRIDGE_ID_LABEL_KEY: bridge_id}},
+            )
+        except httpx.HTTPError:
+            _logger.debug(
+                "Could not set bridge_id label for %s; relay may target wrong dir",
+                session_id,
+            )
     # Capture the previous claude_session_id from the bridge state file BEFORE
     # prepare_bridge_dir unlinks it. read_claude_session_id reads _STATE_FILE,
     # which prepare_bridge_dir removes as part of its refresh; reading it here
@@ -5567,72 +5708,17 @@ async def _auto_create_claude_terminal(
         resolve_native_claude_config,
     )
 
-    # Fetch the session's persisted launch config (reasoning_effort,
-    # model_override, terminal_launch_args) so a web-UI / daemon-spawned
-    # launch honours the same flags the CLI would have passed. Best-effort
-    # — a failed lookup means Claude starts at its settings.json defaults
-    # with no extra args. See designs/NATIVE_RUNNER_SERVER_LAUNCH.md.
-    from omnigent.stores.conversation_store import (
-        FORK_CARRY_HISTORY_LABEL_KEY,
-        FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
+    launch_metadata = await _load_claude_launch_metadata(
+        server_client=server_client,
+        session_id=session_id,
+        session_init=session_init,
     )
-
-    session_effort: str | None = None
-    session_model_override: str | None = None
-    session_launch_args: list[str] | None = None
-    session_external_id: str | None = None
-    # Source native session id stamped on a forked clone (one-shot): when
-    # the clone has no native session of its own yet, resume + branch the
-    # source's local transcript so it opens with prior history.
-    fork_source_external_id: str | None = None
-    # Set on a forked clone bound to a native target: when no source
-    # native transcript exists to clone (an SDK or cross-family source),
-    # build the clone's native transcript from the copied Omnigent items
-    # instead (see FORK_CARRY_HISTORY_LABEL_KEY / native_replay design notes).
-    fork_carry_history: bool = False
-    if server_client is not None:
-        try:
-            _resp = await server_client.get(
-                f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
-                timeout=10.0,
-            )
-            if _resp.status_code == 200:
-                _snap = _resp.json()
-                _re = _snap.get("reasoning_effort")
-                if isinstance(_re, str) and _re:
-                    session_effort = _re
-                _mo = _snap.get("model_override")
-                if isinstance(_mo, str) and _mo:
-                    session_model_override = _mo
-                _tla = _snap.get("terminal_launch_args")
-                if isinstance(_tla, list) and all(isinstance(a, str) for a in _tla):
-                    session_launch_args = _tla
-                _ext = _snap.get("external_session_id")
-                if isinstance(_ext, str) and _ext:
-                    session_external_id = _ext
-                _labels = _snap.get("labels")
-                if isinstance(_labels, dict):
-                    _fse = _labels.get(FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY)
-                    if isinstance(_fse, str) and _fse:
-                        fork_source_external_id = _fse
-                    fork_carry_history = _labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1"
-            _logger.info(
-                "Claude terminal launch config fetched: session=%s status=%s "
-                "effort_set=%s model_override_set=%s launch_args_count=%d "
-                "external_session_id_set=%s",
-                session_id,
-                _resp.status_code,
-                session_effort is not None,
-                session_model_override is not None,
-                len(session_launch_args or []),
-                session_external_id is not None,
-            )
-        except httpx.HTTPError:
-            _logger.debug(
-                "Could not fetch session launch config for %s; terminal will "
-                "use Claude's defaults",
-                session_id,
-            )
+    session_effort = launch_metadata.reasoning_effort
+    session_model_override = launch_metadata.model_override
+    session_launch_args = launch_metadata.terminal_launch_args
+    session_external_id = launch_metadata.external_session_id
+    fork_source_external_id = launch_metadata.fork_source_external_id
+    fork_carry_history = launch_metadata.fork_carry_history
 
     # The server GET may miss the external_session_id binding when the
     # reconnect request arrives without a workspace-scoped context (the
@@ -6296,6 +6382,7 @@ async def _claude_native_bridge_id_for_session(
     *,
     server_client: httpx.AsyncClient,
     session_id: str,
+    session_labels: Mapping[str, str] | None = None,
 ) -> str:
     """Resolve the bridge id label for a Claude-native session.
 
@@ -6303,15 +6390,21 @@ async def _claude_native_bridge_id_for_session(
         snapshot.
     :param session_id: Omnigent session/conversation id, e.g.
         ``"conv_abc123"``.
+    :param session_labels: Labels supplied by the initialization envelope.
+        ``None`` selects the legacy labels callback.
     :returns: Opaque bridge id from
         ``omnigent.claude_native.bridge_id`` when present, otherwise
         *session_id* for legacy single-session bridges.
     """
     from omnigent.claude_native_bridge import BRIDGE_ID_LABEL_KEY
 
-    labels = await _session_labels_for_runner_spawn(
-        server_client=server_client,
-        session_id=session_id,
+    labels = (
+        session_labels
+        if session_labels is not None
+        else await _session_labels_for_runner_spawn(
+            server_client=server_client,
+            session_id=session_id,
+        )
     )
     bridge_id = labels.get(BRIDGE_ID_LABEL_KEY)
     if isinstance(bridge_id, str) and bridge_id:
@@ -6319,9 +6412,29 @@ async def _claude_native_bridge_id_for_session(
     return session_id
 
 
+async def _claude_native_bridge_id_with_optional_labels(
+    *,
+    server_client: httpx.AsyncClient,
+    session_id: str,
+    session_labels: Mapping[str, str] | None,
+) -> str:
+    """Preserve the exact legacy helper call when no envelope labels exist."""
+    if session_labels is None:
+        return await _claude_native_bridge_id_for_session(
+            server_client=server_client,
+            session_id=session_id,
+        )
+    return await _claude_native_bridge_id_for_session(
+        server_client=server_client,
+        session_id=session_id,
+        session_labels=session_labels,
+    )
+
+
 async def _claude_native_session_wants_rebuild(
     server_client: httpx.AsyncClient | None,
     session_id: str,
+    session_init: RunnerSessionInitEnvelope | None = None,
 ) -> bool:
     """
     Return whether a claude-native session is pending a post-switch rebuild.
@@ -6340,12 +6453,20 @@ async def _claude_native_session_wants_rebuild(
 
     :param server_client: AP client; ``None`` can't confirm, returns ``False``.
     :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
+    :param session_init: Versioned server snapshot. ``None`` selects the
+        legacy session callback.
     :returns: ``True`` when ``external_session_id`` is unset AND the
         carry-history label is set (a pending rebuild), else ``False``.
     """
     if server_client is None:
         return False
     from omnigent.stores.conversation_store import FORK_CARRY_HISTORY_LABEL_KEY
+
+    if session_init is not None:
+        return (
+            session_init.snapshot.external_session_id is None
+            and session_init.snapshot.labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1"
+        )
 
     try:
         resp = await server_client.get(
@@ -6369,6 +6490,7 @@ async def _claude_native_terminal_arrives_via_transfer(
     server_client: httpx.AsyncClient | None,
     session_id: str,
     resource_registry: SessionResourceRegistry,
+    session_labels: Mapping[str, str] | None = None,
 ) -> bool:
     """
     Return whether a live Claude terminal will be transferred into a session.
@@ -6385,6 +6507,8 @@ async def _claude_native_terminal_arrives_via_transfer(
     :param session_id: Newly-bound session id, e.g. ``"conv_new"``.
     :param resource_registry: Registry probed for the original session's
         live ``claude:main`` terminal.
+    :param session_labels: Labels supplied by the initialization envelope.
+        ``None`` selects the legacy labels callback.
     :returns: ``True`` when a different session on the same bridge owns a
         live ``claude:main`` terminal (transfer inbound), else ``False``.
     """
@@ -6397,9 +6521,10 @@ async def _claude_native_terminal_arrives_via_transfer(
         read_active_session_id,
     )
 
-    bridge_id = await _claude_native_bridge_id_for_session(
+    bridge_id = await _claude_native_bridge_id_with_optional_labels(
         server_client=server_client,
         session_id=session_id,
+        session_labels=session_labels,
     )
     active_session_id = read_active_session_id(bridge_dir_for_bridge_id(bridge_id))
     # Fresh bridge, or the new session is already active — nothing transfers in.
@@ -6802,6 +6927,18 @@ class _SessionSnapshot:
     sub_agent_name: str | None = None
     parent_session_id: str | None = None
     agent_name: str | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class _SessionInitContext:
+    """Metadata source selected before shared session initialization runs."""
+
+    envelope: RunnerSessionInitEnvelope | None
+
+    @property
+    def labels(self) -> Mapping[str, str] | None:
+        """Return server-supplied labels, or ``None`` on the legacy path."""
+        return self.envelope.snapshot.labels if self.envelope is not None else None
 
 
 # Language constant the omnigent YAML translator stamps on callable-backed
@@ -7923,6 +8060,7 @@ def get_session_agent_id(session_id: str) -> str | None:
 # enough to collapse the bursty menu-open + per-invocation resolve calls onto
 # a single walk. Module-level so it can be tuned/patched in one place.
 _SESSION_SKILLS_CACHE_TTL_SECONDS = 60.0
+_SESSION_INIT_ENVELOPE_TTL_SECONDS = 60.0
 
 
 class _BodyRequest:
@@ -8059,6 +8197,13 @@ def create_runner_app(
     _session_snapshot_cache: dict[str, _SessionSnapshot] = {}  # session_id → snapshot
     _session_snapshot_locks: dict[str, asyncio.Lock] = {}  # session_id → snapshot fetch lock
     _session_spec_locks: dict[str, asyncio.Lock] = {}  # session_id → spec resolution lock
+    # Full session initialization is single-flight. The key includes the
+    # assignment identity so a legacy reconnect request that omits a child
+    # name cannot hide a later, correctly identified sub-agent assignment.
+    _session_init_tasks: dict[tuple[str, str, str | None], asyncio.Task[JSONResponse]] = {}
+    # Envelope metadata may be reused by the immediate first turn, then is
+    # discarded so later label mutations (/clear, rotation) are read live.
+    _session_init_envelopes: dict[str, tuple[float, RunnerSessionInitEnvelope]] = {}
     # session_id → (monotonic expiry, merged bundled + host skills),
     # discovered against this runner's filesystem. Skills are runner-owned:
     # the walk reruns at most once per ``_SESSION_SKILLS_CACHE_TTL_SECONDS``
@@ -8749,6 +8894,72 @@ def create_runner_app(
             return Path(workspace.strip()).expanduser().resolve()
         return runner_workspace.resolve() if runner_workspace is not None else None
 
+    async def _load_legacy_session_init_context() -> _SessionInitContext:
+        """Load metadata omitted by servers predating the init envelope."""
+        await _get_server_version(server_client)
+        return _SessionInitContext(envelope=None)
+
+    def _load_envelope_session_init_context(
+        envelope: RunnerSessionInitEnvelope,
+        *,
+        session_id: str,
+        agent_id: str,
+    ) -> _SessionInitContext:
+        """Seed runner caches from a current server's callback-free snapshot."""
+        if envelope.session_id != session_id or envelope.agent_id != agent_id:
+            raise ValueError("session initialization envelope identity mismatch")
+
+        global _server_version
+        _server_version = envelope.server_version
+        snapshot = envelope.snapshot
+        _session_snapshot_cache[session_id] = _SessionSnapshot(
+            ok=True,
+            status_code=200,
+            created_at=float(snapshot.created_at),
+            workspace=snapshot.workspace,
+            agent_id=agent_id,
+            sub_agent_name=envelope.sub_agent_name,
+            parent_session_id=snapshot.parent_session_id,
+        )
+        _session_start_cache[session_id] = float(snapshot.created_at)
+        _session_workspace_cache[session_id] = snapshot.workspace
+        if envelope.sub_agent_name:
+            _session_sub_agent_names[session_id] = envelope.sub_agent_name
+        _session_init_envelopes[session_id] = (time.monotonic(), envelope)
+        return _SessionInitContext(envelope=envelope)
+
+    def _fresh_session_init_envelope(session_id: str) -> RunnerSessionInitEnvelope | None:
+        """Return startup metadata only during its short first-turn window."""
+        cached = _session_init_envelopes.get(session_id)
+        if cached is None:
+            return None
+        cached_at, envelope = cached
+        if time.monotonic() - cached_at <= _SESSION_INIT_ENVELOPE_TTL_SECONDS:
+            return envelope
+        _session_init_envelopes.pop(session_id, None)
+        return None
+
+    async def _load_session_init_context(
+        body: dict[str, Any],
+        *,
+        session_id: str,
+        agent_id: str,
+    ) -> _SessionInitContext:
+        """Dispatch once between the isolated legacy and envelope loaders."""
+        envelope = parse_runner_session_init_envelope(body)
+        if envelope is None:
+            return await _load_legacy_session_init_context()
+        body_sub_agent = body.get("sub_agent_name")
+        if envelope.sub_agent_name != (
+            body_sub_agent if isinstance(body_sub_agent, str) else None
+        ):
+            raise ValueError("session initialization envelope sub-agent mismatch")
+        return _load_envelope_session_init_context(
+            envelope,
+            session_id=session_id,
+            agent_id=agent_id,
+        )
+
     async def _resolve_session_fs_registry(
         session_id: str,
     ) -> FilesystemRegistry | None:
@@ -8877,10 +9088,9 @@ def create_runner_app(
         """
         return {"status": "ok"}
 
-    @app.post("/v1/sessions")
-    async def create_session(request: Request) -> JSONResponse:
+    async def _initialize_session(body: dict[str, Any]) -> JSONResponse:
         """
-        Assign a session to this runner.
+        Run the shared session initialization core once.
 
         The server calls this after creating the conversation in
         the conversation store. The runner eagerly spawns a harness
@@ -8889,8 +9099,8 @@ def create_runner_app(
 
         Per ``designs/SESSION_REARCHITECTURE.md`` §4 step 3.
 
-        :param request: JSON body with ``session_id`` and
-            ``agent_id``.
+        :param body: Parsed JSON body with ``session_id`` and
+            ``agent_id`` plus an optional versioned initialization envelope.
         :returns: :class:`SessionResponse`-shaped JSON (201) on
             success; 400 for missing fields; 501 in scaffold mode.
         """
@@ -8902,7 +9112,6 @@ def create_runner_app(
                     "detail": ("Runner POST /v1/sessions needs a HarnessProcessManager."),
                 },
             )
-        body = await request.json()
         session_id = body.get("session_id")
         agent_id = body.get("agent_id")
         if not session_id or not agent_id:
@@ -8914,11 +9123,20 @@ def create_runner_app(
                 },
             )
 
-        # Resolve the server version once so _publish_turn_status can downgrade
-        # session.status "waiting"->"running" for servers too old to accept it
-        # (< 0.3.0) — they'd otherwise 500 on GET /v1/sessions. Memoized; only
-        # the first session-create on this runner pays the cheap GET.
-        await _get_server_version(server_client)
+        try:
+            init_context = await _load_session_init_context(
+                body,
+                session_id=session_id,
+                agent_id=agent_id,
+            )
+        except ValueError:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "invalid_request",
+                    "detail": "Invalid session initialization envelope.",
+                },
+            )
 
         # Resolve the spec once — derive harness config from it and
         # cache it for resource endpoints (filesystem, terminals)
@@ -9000,9 +9218,10 @@ def create_runner_app(
                     build_claude_native_spawn_env,
                 )
 
-                bridge_id = await _claude_native_bridge_id_for_session(
+                bridge_id = await _claude_native_bridge_id_with_optional_labels(
                     server_client=server_client,
                     session_id=session_id,
+                    session_labels=init_context.labels,
                 )
                 spawn_env = build_claude_native_spawn_env(session_id, bridge_id=bridge_id)
             if harness_name == "codex-native" and spawn_env is None:
@@ -9101,7 +9320,7 @@ def create_runner_app(
                 },
             )
 
-        _session_start_cache[session_id] = time.time()
+        _session_start_cache.setdefault(session_id, time.time())
         _session_agent_ids[session_id] = agent_id
         # Don't replace a queue ``stream_session`` may have already lazily
         # created: the Omnigent relay's ``GET /stream`` can race ahead of this
@@ -9119,11 +9338,14 @@ def create_runner_app(
         if _sa_name:
             _session_sub_agent_names[session_id] = _sa_name
 
+        terminal_ready: bool | None = None
+
         # Auto-bootstrap: if this is a claude-native session and no
         # terminal exists yet, create one. This handles the case
         # where a host-spawned runner receives a session assignment
         # without the CLI having created the terminal.
         if harness_name == "claude-native":
+            terminal_ready = False
             # Serialize the check-and-create: a concurrent POST /v1/sessions
             # (from _on_runner_connect and the message path's relaunch
             # handshake both firing on the same connection) must not both
@@ -9149,7 +9371,9 @@ def create_runner_app(
                 # pending (external_session_id cleared + carry-history stamped),
                 # tear the stale terminal down so auto-create re-synthesizes.
                 if _has_terminal and await _claude_native_session_wants_rebuild(
-                    server_client, session_id
+                    server_client,
+                    session_id,
+                    init_context.envelope,
                 ):
                     _logger.info(
                         "Claude terminal stale after agent switch; tearing it down to "
@@ -9180,6 +9404,7 @@ def create_runner_app(
                         server_client=server_client,
                         session_id=session_id,
                         resource_registry=resource_registry,
+                        session_labels=init_context.labels,
                     )
                     _logger.info(
                         "Claude terminal transfer-inbound check: session=%s terminal_inbound=%s",
@@ -9251,8 +9476,10 @@ def create_runner_app(
                             agent_name=_native_agent_name,
                             agent_spec=_native_spec,
                             skills_filter=_native_skills_filter,
+                            session_init=init_context.envelope,
                             auth_token_factory=auth_token_factory,
                         )
+                        terminal_ready = True
                     except Exception as exc:
                         _logger.exception(
                             "Failed to auto-create claude terminal for %s",
@@ -9266,6 +9493,8 @@ def create_runner_app(
                         )
                     finally:
                         _publish_terminal_pending(_publish_event, session_id, False)
+                elif _has_terminal:
+                    terminal_ready = True
                 elif _terminal_inbound:
                     _logger.info(
                         "Skipping claude terminal auto-create for %s; a sibling "
@@ -9765,7 +9994,9 @@ def create_runner_app(
         # Crash recovery (Step 8.5 Scenario A): if the session
         # has existing history, check whether the last item
         # indicates an incomplete turn that needs restarting.
-        history = await _load_history_as_input(session_id)
+        history = (
+            [] if is_native_harness(harness_name) else await _load_history_as_input(session_id)
+        )
         # Native terminal transcripts are mirrored from the underlying
         # runtime. A trailing user item can be a real failed/errored native
         # turn with no assistant item, not an unanswered Omnigent task to replay.
@@ -9810,7 +10041,54 @@ def create_runner_app(
                 "reasoning_effort": None,
                 "items": [],
                 "permission_level": None,
+                "session_init_protocol_version": (
+                    init_context.envelope.protocol_version
+                    if init_context.envelope is not None
+                    else None
+                ),
+                "terminal_ready": terminal_ready,
             },
+        )
+
+    @app.post("/v1/sessions")
+    async def create_session(request: Request) -> JSONResponse:
+        """Assign a session, sharing one initialization across concurrent callers."""
+        body = await request.json()
+        if not isinstance(body, dict):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "invalid_request",
+                    "detail": "Session initialization body must be a JSON object.",
+                },
+            )
+        session_id = body.get("session_id")
+        agent_id = body.get("agent_id")
+        if not isinstance(session_id, str) or not isinstance(agent_id, str):
+            return await _initialize_session(body)
+        sub_agent_name = body.get("sub_agent_name")
+        key = (
+            session_id,
+            agent_id,
+            sub_agent_name if isinstance(sub_agent_name, str) else None,
+        )
+        task = _session_init_tasks.get(key)
+        if task is None:
+            task = asyncio.create_task(
+                _initialize_session(body),
+                name=f"session-init-{session_id}",
+            )
+            _session_init_tasks[key] = task
+
+            def _drop_completed_init(done: asyncio.Task[JSONResponse]) -> None:
+                if _session_init_tasks.get(key) is done:
+                    _session_init_tasks.pop(key, None)
+
+            task.add_done_callback(_drop_completed_init)
+        response = await asyncio.shield(task)
+        return JSONResponse(
+            status_code=response.status_code,
+            content=json.loads(response.body),
         )
 
     @app.get("/v1/sessions/{session_id}/stream")
@@ -10024,6 +10302,7 @@ def create_runner_app(
         _session_workspace_cache.pop(session_id, None)
         _session_snapshot_cache.pop(session_id, None)
         _session_snapshot_locks.pop(session_id, None)
+        _session_init_envelopes.pop(session_id, None)
         _session_spec_locks.pop(session_id, None)
         _session_fs_registries.pop(session_id, None)
         _session_agent_ids.pop(session_id, None)
@@ -13446,6 +13725,7 @@ def create_runner_app(
         bridge_id: str | None = None,
         explicit_bridge_dir: Path | None = None,
         await_notify: bool = False,
+        session_labels: Mapping[str, str] | None = None,
     ) -> None:
         """
         Ensure the comment-tool relay is running for a ``claude-native`` session.
@@ -13485,6 +13765,8 @@ def create_runner_app(
         :param bridge_id: Opaque bridge id resolved by the caller, e.g.
             ``"bridge_abc123"``. ``None`` resolves it from the session labels
             via :func:`_claude_native_bridge_id_for_session`.
+        :param session_labels: Labels supplied by the initialization envelope.
+            ``None`` selects the legacy labels callback.
         :param await_notify: When ``True``, await the
             ``notifications/tools/list_changed`` delivery before returning
             (warm-bridge fallback path); when ``False``, fire it in the
@@ -13521,9 +13803,10 @@ def create_runner_app(
             # atomically: a concurrent delete or a second starter
             # can't interleave mid-setup and strand a relay.
             if bridge_id is None:
-                bridge_id = await _claude_native_bridge_id_for_session(
+                bridge_id = await _claude_native_bridge_id_with_optional_labels(
                     server_client=server_client,
                     session_id=session_id,
+                    session_labels=session_labels,
                 )
 
             # Re-check: another starter may have published the relay
@@ -13845,13 +14128,6 @@ def create_runner_app(
                 else cached_spec
             )
 
-        if conv not in _session_histories:
-            _session_histories[conv] = await _load_history_as_input(conv)
-        rename_instruction = session_rename_instruction(
-            initial_session=_is_first_user_turn(_session_histories[conv])
-        )
-        framework_instructions = (rename_instruction,) if rename_instruction else ()
-
         harness_name: str | None = None
         spawn_env: dict[str, str] | None = None
         instructions: str | None = None
@@ -13865,6 +14141,17 @@ def create_runner_app(
                 or cached_spec.executor.type
             )
             harness_name = canonicalize_harness(h) or h
+
+        if conv not in _session_histories:
+            _session_histories[conv] = (
+                [] if is_native_harness(harness_name) else await _load_history_as_input(conv)
+            )
+        rename_instruction = session_rename_instruction(
+            initial_session=_is_first_user_turn(_session_histories[conv])
+        )
+        framework_instructions = (rename_instruction,) if rename_instruction else ()
+
+        if cached_spec is not None:
             spawn_env = _build_spawn_env_from_spec(
                 cached_spec,
                 harness_name,
@@ -14028,6 +14315,9 @@ def create_runner_app(
         # and when the pane is already live; resumes via the vendor ``--resume``.
         await _ensure_native_terminal_for_turn(conv, harness_name)
 
+        startup_envelope = _fresh_session_init_envelope(conv)
+        startup_labels = startup_envelope.snapshot.labels if startup_envelope is not None else None
+
         # Fallback for native sessions whose terminal was launched
         # outside the runner terminal route (e.g. tests, UI-launched
         # terminals): make sure the comment-tool relay is running before the
@@ -14042,7 +14332,11 @@ def create_runner_app(
         # background instead — the relay tools land a beat later, which is
         # harmless on the first turn (nobody reads comments before sending).
         if harness_name == "claude-native":
-            await _ensure_comment_relay_started(conv, await_notify=False)
+            await _ensure_comment_relay_started(
+                conv,
+                await_notify=False,
+                session_labels=startup_labels,
+            )
         elif harness_name == "codex-native":
             from omnigent.codex_native_bridge import (
                 CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
@@ -14105,11 +14399,14 @@ def create_runner_app(
                 await_notify=False,
             )
 
-        response = await _stream_message_to_harness(
-            harness_body,
-            conv,
-            dispatch=ctx,
-        )
+        try:
+            response = await _stream_message_to_harness(
+                harness_body,
+                conv,
+                dispatch=ctx,
+            )
+        finally:
+            _session_init_envelopes.pop(conv, None)
         if isinstance(response, StreamingResponse):
             await _drain_streaming_response(response, conv)
         else:
@@ -14195,6 +14492,8 @@ def create_runner_app(
         # to body fields for legacy callers.
         harness_name = dispatch.harness if dispatch else body.get("harness")
         spawn_env = dispatch.spawn_env if dispatch else body.get("spawn_env")
+        startup_envelope = _fresh_session_init_envelope(conv_id)
+        startup_labels = startup_envelope.snapshot.labels if startup_envelope is not None else None
         if not harness_name:
             _agent_id = dispatch.agent_id if dispatch else body.get("agent_id")
             # Recover the sub-agent name (server snapshot if the in-memory
@@ -14224,9 +14523,10 @@ def create_runner_app(
         if harness_name == "claude-native" and spawn_env is None:
             from omnigent.claude_native_bridge import build_claude_native_spawn_env
 
-            bridge_id = await _claude_native_bridge_id_for_session(
+            bridge_id = await _claude_native_bridge_id_with_optional_labels(
                 server_client=server_client,
                 session_id=conv_id,
+                session_labels=startup_labels,
             )
             spawn_env = build_claude_native_spawn_env(conv_id, bridge_id=bridge_id)
         if harness_name == "codex-native" and spawn_env is None:
