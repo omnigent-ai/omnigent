@@ -444,6 +444,15 @@ jobs:
             # can't see untracked paths). Porcelain lines are "XY path"; take the
             # path field of the first added/modified page.mdx.
             post="$(git -C "$SITE" status --porcelain | grep -m1 'page.mdx' | awk '{print $NF}' || true)"
+
+            # Fail fast on HTML comments in the MDX: `<!-- ... -->` is invalid in
+            # MDX (only `{/* ... */}` works) and would break the site's `next build`
+            # only after the PR is opened. Catch it here so we never ship a red PR.
+            if [ -n "$post" ] && grep -qF '<!--' "${SITE}/${post}"; then
+              echo "::error::Drafted ${post} contains an HTML comment (<!-- -->); MDX requires {/* */}. Aborting."
+              exit 1
+            fi
+
             if [ -n "$post" ]; then
               printf '\n---\n\n**Enjoying Omnigent?** If this is useful to you, [give us a star on GitHub ⭐](https://github.com/omnigent-ai/omnigent). Come say hi on [Discord](https://discord.gg/omnigent), or [download the latest release](https://omnigent.ai/download).\n' \
                 >> "${SITE}/${post}"

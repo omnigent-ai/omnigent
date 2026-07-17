@@ -116,8 +116,10 @@ prompt: |
      (Omnigent is the orchestration layer over many agents, any device, with
      governance) — imply it, don't sloganeer.
   3. **Demo** — you CANNOT produce the screenshot/recording. Emit EXACTLY this
-     marker where the demo belongs, with a one-line suggestion of what to show:
-     `<!-- DEMO REQUIRED: 15–30s recording or light/dark screenshot pair, realistic data. No sanitized mockups. Suggested: <what to show> -->`
+     marker where the demo belongs, with a one-line suggestion of what to show.
+     It MUST be an MDX comment (`{/* ... */}`), NOT an HTML comment (`<!-- ... -->`)
+     — HTML comments are invalid in MDX and break the site build:
+     `{/* DEMO REQUIRED: 15–30s recording or light/dark screenshot pair, realistic data. No sanitized mockups. Suggested: <what to show> */}`
   4. **How to use** — a copy-pasteable fenced command block (only commands/flags
      grounded in `MATERIAL_FILE`) and a link to the relevant docs page.
   5. **What's next** — an optional one-line forward look ONLY if the material
@@ -139,7 +141,7 @@ prompt: |
   - `## Post drafted` — the path of the single post file you created
     (`app/blog/<SLUG>/page.mdx`). You should not have edited any other file.
   - `## Manual review needed` — a checklist: `- [ ] <item> — <why>`. Always
-    include the mandatory demo line (the `<!-- DEMO REQUIRED -->` marker you left)
+    include the mandatory demo line (the `{/* DEMO REQUIRED */}` marker you left)
     and the hero art + author byline as items a human must complete before merge.
     Add any fact you had to omit for lack of grounding.
   Then STOP. Do NOT `git commit`, push, or open a PR — the workflow does that.
