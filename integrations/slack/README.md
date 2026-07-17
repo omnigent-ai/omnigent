@@ -30,10 +30,12 @@ Replies in that Slack thread continue the same Omnigent session.
 
 ## Development
 
+From the repository root, use the canonical task surface:
+
 ```bash
-UV_CACHE_DIR=.uv-cache uv run pytest
-UV_CACHE_DIR=.uv-cache uv run ruff check
-UV_CACHE_DIR=.uv-cache uv run mypy src
+just setup
+just check
+just test
 ```
 
 The Omnigent API reference used for implementation is stored at `docs/api-1.yaml`.

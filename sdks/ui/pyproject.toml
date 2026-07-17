@@ -18,3 +18,22 @@ dependencies = [
     "prompt_toolkit>=3",
     "pyyaml>=6.0,<7",
 ]
+
+[tool.uv.sources]
+omnigent-client = { path = "../python-client", editable = true }
+
+[dependency-groups]
+dev = [
+    "basedpyright>=1.39.9",
+]
+
+
+[tool.basedpyright]
+# Standard mode found three pre-existing diagnostics at prompt-toolkit and Rich
+# boundaries. Baseline those during the checker migration; new diagnostics fail.
+typeCheckingMode = "standard"
+failOnWarnings = true
+baselineFile = ".basedpyright/baseline.json"
+pythonVersion = "3.12"
+include = ["omnigent_ui_sdk"]
+extraPaths = ["../..", "../python-client"]

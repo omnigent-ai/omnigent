@@ -19,7 +19,7 @@ omnigent-slack = "omnigent_slack.__main__:main"
 
 [dependency-groups]
 dev = [
-    "mypy>=1.16.0",
+    "basedpyright>=1.39.9",
     "pytest>=8.4.0",
     "pytest-asyncio>=1.0.0",
     "respx>=0.22.0",
@@ -35,21 +35,23 @@ line-length = 100
 target-version = "py311"
 exclude = [".uv-cache", ".venv", "docs"]
 
+
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "ASYNC"]
 
-[tool.mypy]
-python_version = "3.11"
-strict = true
-warn_unreachable = true
-
-[[tool.mypy.overrides]]
-module = [
-    "slack_bolt.*",
-    "slack_sdk.*",
-    "markdown_to_mrkdwn.*",
+[tool.basedpyright]
+# Recommended mode is dominated by unknown types from Slack's dynamic SDK
+# decorators and payload objects. Standard mode still enforces concrete type
+# safety while allowedUntypedLibraries scopes that boundary to known packages.
+typeCheckingMode = "standard"
+failOnWarnings = true
+pythonVersion = "3.11"
+include = ["src", "tests"]
+allowedUntypedLibraries = [
+    "slack_bolt",
+    "slack_sdk",
+    "markdown_to_mrkdwn",
 ]
-ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

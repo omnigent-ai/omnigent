@@ -1,0 +1,32 @@
+{
+    "files": {
+        "./omnigent_ui_sdk/terminal/_host.py": [
+            {
+                "code": "reportPrivateImportUsage",
+                "range": {
+                    "startColumn": 12,
+                    "endColumn": 26,
+                    "lineCount": 1
+                }
+            },
+            {
+                "code": "reportArgumentType",
+                "range": {
+                    "startColumn": 47,
+                    "endColumn": 67,
+                    "lineCount": 1
+                }
+            }
+        ],
+        "./omnigent_ui_sdk/terminal/_tool_renderers.py": [
+            {
+                "code": "reportArgumentType",
+                "range": {
+                    "startColumn": 41,
+                    "endColumn": 54,
+                    "lineCount": 1
+                }
+            }
+        ]
+    }
+}

@@ -24,6 +24,12 @@ omnigent/_build_info.py
 # Exception: track .github/ (CI workflows).
 !.github/
 
+# Exception: commit Basedpyright migration baselines; they suppress only
+# diagnostics that existed at the checker cutover, while new diagnostics fail.
+!.basedpyright/
+!sdks/python-client/.basedpyright/
+!sdks/ui/.basedpyright/
+
 # Exception: track .claude/skills/ (project-wide dev-time skills for Claude Code).
 # The .*/ rule above would otherwise exclude everything under .claude/.
 !.claude/

@@ -1,7 +1,7 @@
 name: Lint
 
-# Runs the project's pre-commit hooks (ruff, mypy, custom anti-pattern grep
-# hooks, etc.) on every non-draft PR and on push to main. Surfaces as the
+# Runs the project's pre-commit hooks plus all Basedpyright projects on every
+# non-draft PR and push to main. Surfaces as the
 # `Pre-commit checks` check, a REQUIRED gate entry in merge-ready.yml. Draft PRs
 # are skipped; `ready_for_review` refires so the check doesn't strand pending.
 
@@ -122,8 +122,15 @@ jobs:
           chmod +x /tmp/ktlint
           sudo mv /tmp/ktlint /usr/local/bin/ktlint
 
-      - name: Run formatting, lint, and typing checks
+      - name: Run pre-commit checks
         run: uv run pre-commit run --all-files --show-diff-on-failure
+
+      - name: Type-check Python projects
+        run: |
+          uv run --locked basedpyright
+          uv run --project integrations/slack --locked basedpyright --project integrations/slack/pyproject.toml
+          uv run --project sdks/python-client --locked basedpyright --project sdks/python-client/pyproject.toml
+          uv run --project sdks/ui --locked basedpyright --project sdks/ui/pyproject.toml
 
       - name: Type-check web
         working-directory: web
