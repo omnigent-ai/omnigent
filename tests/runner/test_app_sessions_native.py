@@ -541,6 +541,8 @@ class _FakeFileServerClient:
         payload like any other non-content URL.
     :param fail_file_fetch: When ``True``, file resource GETs raise,
         simulating an unreachable file endpoint.
+    :param malformed_meta: When ``True``, the file metadata GET returns
+        a 200 whose body is not JSON (a proxy serving an HTML error page).
     """
 
     def __init__(
@@ -548,10 +550,12 @@ class _FakeFileServerClient:
         *,
         items_payload: dict[str, Any] | None = None,
         fail_file_fetch: bool = False,
+        malformed_meta: bool = False,
     ) -> None:
         self.get_calls: list[str] = []
         self._items_payload = items_payload
         self._fail_file_fetch = fail_file_fetch
+        self._malformed_meta = malformed_meta
 
     async def get(self, url: str, **kwargs: Any) -> Any:
         del kwargs
@@ -578,6 +582,16 @@ class _FakeFileServerClient:
             raise httpx.ConnectError("file resource endpoint unreachable")
         if url.endswith("/content"):
             return _Response(body=b"png-bytes")
+        if self._malformed_meta and "/resources/files/" in url:
+
+            class _MalformedMetaResponse(_Response):
+                def __init__(self) -> None:
+                    super().__init__(body=b"<html>gateway error</html>")
+
+                def json(self) -> dict[str, Any]:
+                    raise ValueError("body is not JSON")
+
+            return _MalformedMetaResponse()
         return _Response(
             payload={
                 "id": "07b38328508bae2010c8b9933a310846",
@@ -634,6 +648,59 @@ async def test_sessions_native_resolves_file_id_before_harness() -> None:
         await asyncio.sleep(0.05)
     posted = harness_client.posted_bodies[0]
     image_block = posted["content"][0]["content"][0]
+    assert image_block == {
+        "type": "input_image",
+        "filename": "photo.png",
+        "image_url": "data:image/png;base64,cG5nLWJ5dGVz",
+    }
+    assert "file_id" not in image_block
+
+
+@pytest.mark.asyncio
+async def test_sessions_native_malformed_file_metadata_is_nonfatal() -> None:
+    """A 200-but-unparseable metadata body must not break attachment resolution.
+
+    The metadata fetch only supplies the media-type hint; when a proxy
+    answers 200 with an HTML error page, the resolver falls back to the
+    content response's Content-Type and the attachment still inlines.
+    """
+    harness_client = _ScriptedHarnessClient(
+        [_sse({"type": "response.completed", "response": {"id": "resp_1"}})]
+    )
+    pm = _FakeProcessManager(harness_client)
+    server_client = _FakeFileServerClient(malformed_meta=True)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions/e54fa4d331772eeb0314b74c56161415/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "0e36e3219954d2deaef06b8e2a936f38",
+                "model": "test-agent",
+                "content": [
+                    {
+                        "type": "input_image",
+                        "file_id": "07b38328508bae2010c8b9933a310846",
+                        "filename": "photo.png",
+                    },
+                    {"type": "input_text", "text": "what is this?"},
+                ],
+            },
+        )
+
+    assert resp.status_code == 202
+    for _ in range(20):
+        if harness_client.posted_bodies:
+            break
+        await asyncio.sleep(0.05)
+    image_block = harness_client.posted_bodies[0]["content"][0]["content"][0]
+    # Bytes came from the content response; the media type came from its
+    # Content-Type header, not the unparseable metadata body.
     assert image_block == {
         "type": "input_image",
         "filename": "photo.png",
@@ -18659,3 +18726,122 @@ async def test_events_stop_session_on_kiro_native_503_when_kill_fails(
         f"No session.status: idle should be enqueued when kill_session failed; "
         f"got {status_idle!r}."
     )
+
+
+class _NativeSeedServerClient(NullServerClient):
+    """Server client with one stored item; records item listings and event posts."""
+
+    def __init__(self) -> None:
+        self.items_params: list[Any] = []
+        self.file_calls: list[str] = []
+        self.posted_events: list[dict[str, Any]] = []
+
+    async def get(self, url: str, **kwargs: Any) -> Any:
+        if url.endswith("/items"):
+            self.items_params.append(kwargs.get("params"))
+
+            class _ItemsResponse(NullServerClient._Response):
+                def json(self) -> dict[str, Any]:
+                    return {"data": [{"id": "item_latest"}], "has_more": False}
+
+            return _ItemsResponse()
+        if "/resources/files/" in url:
+            self.file_calls.append(url)
+        return await super().get(url, **kwargs)
+
+    async def post(self, url: str, **kwargs: Any) -> Any:
+        body = kwargs.get("json")
+        if isinstance(body, dict):
+            self.posted_events.append(body)
+        return await super().post(url, **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_native_session_create_seeds_harness_compaction_anchor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Native session assignment must seed the harness-compaction anchor.
+
+    Native harnesses skip the history load entirely (their transcripts are
+    mirrored from the underlying runtime, and reloading would re-download
+    attachments), but harness compaction persistence still anchors on the
+    latest server item ID. Session create must fetch just that ID —
+    newest-first, single item, no attachment downloads — so a later
+    ``response.compaction.completed`` persists instead of silently bailing
+    on the missing anchor.
+    """
+    import omnigent.runner.app as runner_app_mod
+
+    async def _noop_terminal(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+
+    monkeypatch.setattr(runner_app_mod, "_auto_create_claude_terminal", _noop_terminal)
+    # No bridge dir exists in this test; keep the lazy comment-relay start
+    # from parking on the cold-bridge tools/list_changed wait.
+    monkeypatch.setattr(
+        "omnigent.claude_native_bridge.post_tools_changed",
+        lambda *args, **kwargs: None,
+    )
+
+    spec = AgentSpec(
+        spec_version=1,
+        name="claude",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    harness_client = _ScriptedHarnessClient(
+        [
+            _sse(
+                {
+                    "type": "response.compaction.completed",
+                    "summary": "squashed prior turns",
+                    "total_tokens": 5,
+                }
+            ),
+            _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
+        ]
+    )
+    pm = _FakeProcessManager(harness_client)
+    server_client = _NativeSeedServerClient()
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+
+    session_id = uuid.uuid4().hex
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": session_id, "agent_id": "0e36e3219954d2deaef06b8e2a936f38"},
+        )
+        assert resp.status_code == 201, resp.text
+        # The seed fetches only the newest item ID — no history conversion,
+        # no attachment fetch-backs.
+        assert {"limit": "1", "order": "desc"} in server_client.items_params
+        assert server_client.file_calls == []
+
+        turn = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "0e36e3219954d2deaef06b8e2a936f38",
+                "model": "claude-agent",
+                "content": [{"type": "input_text", "text": "hi"}],
+            },
+        )
+        assert turn.status_code == 202
+        compactions: list[dict[str, Any]] = []
+        for _ in range(100):
+            compactions = [b for b in server_client.posted_events if b.get("type") == "compaction"]
+            if compactions:
+                break
+            await asyncio.sleep(0.05)
+
+    assert compactions, "harness compaction was never persisted to the server"
+    assert compactions[0]["data"]["last_item_id"] == "item_latest"

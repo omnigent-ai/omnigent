@@ -6986,7 +6986,20 @@ async def _resolve_forwarded_message_content(
             resolved.append(block)
             continue
 
-        meta = meta_resp.json()
+        try:
+            parsed = meta_resp.json() if meta_resp.content else {}
+        except ValueError:
+            parsed = None
+        meta = parsed if isinstance(parsed, dict) else {}
+        if meta_resp.content and not meta:
+            # Unusable metadata only costs the media-type hint; the content
+            # response's Content-Type header still provides it.
+            _logger.warning(
+                "runner got unusable file metadata for file_id=%s in session=%s; "
+                "falling back to the content headers",
+                file_id,
+                session_id,
+            )
         content_type = (
             meta.get("content_type")
             or content_resp.headers.get("content-type")
@@ -9711,9 +9724,12 @@ def create_runner_app(
         # Native terminal transcripts are mirrored from the underlying
         # runtime — a trailing user item can be a real failed native turn —
         # so skip the history load (and its attachment downloads) entirely.
-        history = (
-            [] if is_native_harness(harness_name) else await _load_history_as_input(session_id)
-        )
+        history: list[dict[str, Any]]
+        if is_native_harness(harness_name):
+            await _seed_last_server_item_id(session_id)
+            history = []
+        else:
+            history = await _load_history_as_input(session_id)
         if history:
             _session_histories[session_id] = history
             last = history[-1]
@@ -10010,6 +10026,43 @@ def create_runner_app(
                 "deleted": True,
             },
         )
+
+    async def _seed_last_server_item_id(session_id: str) -> None:
+        """
+        Record the newest server item ID without loading history.
+
+        Native-harness sessions never call ``_load_history_as_input``
+        (their transcripts are mirrored from the underlying runtime), but
+        harness compaction persistence still needs the latest server item
+        ID as its anchor — fetch just that ID.
+
+        :param session_id: Session/conversation identifier,
+            e.g. ``"conv_abc123"``.
+        """
+        try:
+            resp = await server_client.get(
+                f"/v1/sessions/{session_id}/items",
+                params={"limit": "1", "order": "desc"},
+                timeout=10.0,
+            )
+            if resp.status_code != 200:
+                _logger.warning(
+                    "Last-item seed returned %d for session=%s",
+                    resp.status_code,
+                    session_id,
+                )
+                return
+            page_items = resp.json().get("data", [])
+        except (httpx.HTTPError, ValueError):
+            _logger.warning(
+                "Last-item seed failed for session=%s",
+                session_id,
+                exc_info=True,
+            )
+            return
+        last_id = page_items[0].get("id") if page_items else None
+        if last_id:
+            _last_server_item_id[session_id] = last_id
 
     async def _load_history_as_input(
         session_id: str,

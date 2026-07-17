@@ -2033,7 +2033,11 @@ async def test_ensure_local_claude_resume_transcript_returns_none_when_no_record
     assert not expected.exists()
 
 
-def _resume_rebuild_handler(*, fail_file_fetch: bool = False) -> Any:
+def _resume_rebuild_handler(
+    *,
+    fail_file_fetch: bool = False,
+    malformed_meta: bool = False,
+) -> Any:
     """Mock server for resume-rebuild tests: history with a file_id image."""
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -2045,6 +2049,13 @@ def _resume_rebuild_handler(*, fail_file_fetch: bool = False) -> Any:
         if path.endswith("/resources/files/file_img"):
             if fail_file_fetch:
                 return httpx.Response(404)
+            if malformed_meta:
+                # A proxy/gateway answering 200 with an HTML error page.
+                return httpx.Response(
+                    200,
+                    content=b"<html>gateway error</html>",
+                    headers={"content-type": "text/html"},
+                )
             return httpx.Response(
                 200,
                 json={"id": "file_img", "filename": "photo.png", "content_type": "image/png"},
@@ -2167,6 +2178,56 @@ async def test_ensure_local_claude_resume_transcript_marks_unresolvable_attachme
         else [block["text"] for block in user_content]
     )
     assert "[Attachment photo.png could not be loaded]" in texts
+    assert "look at this image" in " ".join(texts)
+
+
+@pytest.mark.asyncio
+async def test_ensure_local_claude_resume_transcript_survives_malformed_file_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A 200-but-unparseable metadata response must not abort the rebuild.
+
+    Metadata only supplies the media-type hint; when its body is garbage
+    (a proxy answering 200 with an HTML error page), the resolver falls
+    back to the content response's ``Content-Type`` and the attachment
+    still re-materializes — the whole transcript rebuild must not die on
+    one bad metadata body.
+    """
+    from omnigent import claude_native_bridge
+
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
+    bridge_dir = tmp_path / "bridge"
+    monkeypatch.setattr(
+        claude_native_bridge, "bridge_dir_for_conversation_id", lambda _conv: bridge_dir
+    )
+    workspace = Path("/work/some-repo")
+
+    transport = httpx.MockTransport(_resume_rebuild_handler(malformed_meta=True))
+    async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
+        written = await claude_native._ensure_local_claude_resume_transcript(
+            client,
+            session_id="conv_abc",
+            external_session_id="sid123",
+            workspace=workspace,
+        )
+
+    assert written is not None
+    records = [json.loads(line) for line in written.read_text(encoding="utf-8").splitlines()]
+    user_content = records[0]["message"]["content"]
+    texts = (
+        [user_content]
+        if isinstance(user_content, str)
+        else [block["text"] for block in user_content]
+    )
+    attached_lines = [t for t in texts if t.startswith("[Attached: ")]
+    assert attached_lines, f"attachment was dropped on malformed metadata: {texts}"
+    attached_path = Path(attached_lines[0].removeprefix("[Attached: ").removesuffix("]"))
+    # Bytes came from the content response; the media type came from its
+    # Content-Type header, not the unparseable metadata body.
+    assert attached_path.read_bytes() == b"png-bytes"
     assert "look at this image" in " ".join(texts)
 
 

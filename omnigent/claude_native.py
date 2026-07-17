@@ -3562,7 +3562,16 @@ async def _resolve_session_item_file_references(
                 )
                 resolved.append(block)
                 continue
-            meta = meta_resp.json() if meta_resp.content else {}
+            meta = _json_object_from_string(meta_resp.text)
+            if meta_resp.content and not meta:
+                # Unusable metadata only costs the media-type hint; the
+                # content response's Content-Type header still provides it.
+                _logger.warning(
+                    "transcript rebuild got unusable metadata for file_id=%s "
+                    "in session=%s; falling back to the content headers",
+                    file_id,
+                    session_id,
+                )
             content_type = (
                 meta.get("content_type")
                 or content_resp.headers.get("content-type")
