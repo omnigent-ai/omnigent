@@ -61,11 +61,8 @@ describe("FlatFileList runner-offline state", () => {
   });
 });
 
-describe("FlatFileList file size / download alignment", () => {
-  it("overlays the download button on the file size so both share one slot", () => {
-    // The size label and the hover download button must occupy the same
-    // relative container: the size reserves the width and the button overlays
-    // it (absolute inset-0), so the button appears exactly where the size was.
+describe("FlatFileList status / download alignment", () => {
+  it("does not show a file-size label", () => {
     renderList({
       files: [
         {
@@ -80,11 +77,32 @@ describe("FlatFileList file size / download alignment", () => {
       ],
     });
 
-    const size = screen.getByText("2.0 KB");
-    const slot = size.parentElement;
+    expect(screen.queryByText(/\bKB\b/)).not.toBeInTheDocument();
+  });
+
+  it("overlays the download button on the status letter so both share one slot", () => {
+    // The status letter and the hover download button occupy the same relative
+    // container: the letter reserves the width and the button overlays it
+    // (absolute inset-0), so the button appears exactly where the letter was.
+    renderList({
+      files: [
+        {
+          path: "src/app.ts",
+          name: "app.ts",
+          status: "modified",
+          bytes: 2048,
+          modified_at: null,
+          lines_added: null,
+          lines_removed: null,
+        },
+      ],
+    });
+
+    const letter = screen.getByText("M");
+    const slot = letter.parentElement;
     expect(slot).toHaveClass("relative");
-    // Size hides on hover but keeps its width to avoid a layout shift.
-    expect(size).toHaveClass("group-hover:invisible");
+    // The letter hides on hover but keeps its width to avoid a layout shift.
+    expect(letter).toHaveClass("group-hover:invisible");
 
     const download = screen.getByRole("button", { name: /download app\.ts/i });
     const overlay = download.closest("span.absolute") as HTMLElement | null;

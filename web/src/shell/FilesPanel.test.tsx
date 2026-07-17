@@ -386,17 +386,15 @@ describe("FilesPanel scope switch (Changed | All) visibility", () => {
   });
 });
 
-describe("FilesPanel Changed pill line totals", () => {
-  // The Changed pill's aria-label is the fixed "Changed"; the totals live in a
-  // nested span. Query within the pill so we assert on the totals, not
-  // per-file counters elsewhere. "−" is U+2212 (the &minus; glyph rendered).
+describe("FilesPanel Changed pill", () => {
+  // The Changed pill shows the file count only — no +/− line totals.
   function changedPill() {
     return screen.getByRole("radio", { name: /^changed$/i });
   }
 
-  it("sums lines_added/lines_removed across files (+15 −3, count 2)", () => {
+  it("shows the file count but no +/− line totals", () => {
     renderPanel({
-      conversationId: "conv_totals_sum",
+      conversationId: "conv_pill_count",
       flatView: true,
       files: [],
       changedFiles: [
@@ -407,81 +405,8 @@ describe("FilesPanel Changed pill line totals", () => {
 
     const pill = changedPill();
     expect(within(pill).getByText("2")).toBeInTheDocument(); // file count
-    expect(within(pill).getByText("+15")).toBeInTheDocument();
-    expect(within(pill).getByText("−3")).toBeInTheDocument();
-  });
-
-  it("omits the +/− totals when every file's counts are null (count still shows)", () => {
-    renderPanel({
-      conversationId: "conv_totals_allnull",
-      flatView: true,
-      files: [],
-      changedFiles: [changedFile("a.bin"), changedFile("b.bin")], // null/null
-    });
-
-    const pill = changedPill();
-    expect(within(pill).getByText("2")).toBeInTheDocument();
     expect(within(pill).queryByText(/^\+/)).not.toBeInTheDocument();
     expect(within(pill).queryByText(/^−/)).not.toBeInTheDocument();
-  });
-
-  it("folds a deleted file (0/7) in with a modified (+4/−1) → +4 −8", () => {
-    renderPanel({
-      conversationId: "conv_totals_delete",
-      flatView: true,
-      files: [],
-      changedFiles: [
-        changedFile("del.ts", "deleted", 0, 7),
-        changedFile("mod.ts", "modified", 4, 1),
-      ],
-    });
-
-    const pill = changedPill();
-    expect(within(pill).getByText("+4")).toBeInTheDocument();
-    expect(within(pill).getByText("−8")).toBeInTheDocument();
-  });
-
-  it("skips a binary (null/null) but still sums the text file (+3 −2)", () => {
-    renderPanel({
-      conversationId: "conv_totals_binary",
-      flatView: true,
-      files: [],
-      changedFiles: [
-        changedFile("img.png", "modified"), // null/null binary
-        changedFile("code.ts", "modified", 3, 2),
-      ],
-    });
-
-    const pill = changedPill();
-    expect(within(pill).getByText("+3")).toBeInTheDocument();
-    expect(within(pill).getByText("−2")).toBeInTheDocument();
-  });
-
-  it("totals reflect the full fetched set, unchanged by a search filter", () => {
-    renderPanel({
-      conversationId: "conv_totals_search",
-      flatView: true,
-      files: [],
-      changedFiles: [
-        changedFile("keepme.ts", "modified", 10, 2),
-        changedFile("other.ts", "modified", 5, 1),
-      ],
-    });
-
-    // Before search: pill sums both files.
-    expect(within(changedPill()).getByText("+15")).toBeInTheDocument();
-    expect(within(changedPill()).getByText("−3")).toBeInTheDocument();
-    expect(within(changedPill()).getByText("2")).toBeInTheDocument();
-
-    // Type a query matching only one file — filtering happens inside
-    // FlatFileList, so the pill total (full fetched set) must not change.
-    fireEvent.change(screen.getByRole("searchbox", { name: "Search changed files" }), {
-      target: { value: "keepme" },
-    });
-
-    expect(within(changedPill()).getByText("+15")).toBeInTheDocument();
-    expect(within(changedPill()).getByText("−3")).toBeInTheDocument();
-    expect(within(changedPill()).getByText("2")).toBeInTheDocument();
   });
 });
 
@@ -530,14 +455,14 @@ describe("FilesPanel changed files search", () => {
     });
 
     expect(screen.getByText((text) => text.includes("Button.tsx"))).toBeInTheDocument();
-    expect(screen.queryByText("docs/Guide.md")).toBeNull();
+    expect(screen.queryByText("Guide.md")).toBeNull();
 
     fireEvent.change(screen.getByRole("searchbox", { name: "Search changed files" }), {
       target: { value: "" },
     });
 
     expect(screen.getByText((text) => text.includes("Button.tsx"))).toBeInTheDocument();
-    expect(screen.getByText("docs/Guide.md")).toBeInTheDocument();
+    expect(screen.getByText("Guide.md")).toBeInTheDocument();
   });
 
   it("clears the search query when switching from Changed to Explore view", () => {

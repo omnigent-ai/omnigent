@@ -955,10 +955,29 @@ def test_git_line_counts_modified(tmp_path: Path) -> None:
     assert rec["lines_removed"] == 1, rec
 
 
-def test_git_line_counts_untracked_added_only(tmp_path: Path) -> None:
-    """An untracked new file (absent from `git diff HEAD`) reports adds only."""
+def test_git_line_counts_untracked_is_none(tmp_path: Path) -> None:
+    """An untracked new file (absent from `git diff HEAD`) reports no counts.
+
+    Counts come only from numstat; git doesn't diff untracked files, so the UI
+    omits the counter for them — matching VS Code / Cursor's source-control view.
+    """
     _init_git_with_commit(tmp_path, "committed.py", "x\n")
     (tmp_path / "new.py").write_text("one\ntwo\nthree\n")
+
+    reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+    rec = next(r for r in reg.list_changed_files("any-conv", limit=100) if r["path"] == "new.py")
+    assert rec["status"] == "created"
+    assert rec["lines_added"] is None, rec
+    assert rec["lines_removed"] is None, rec
+
+
+def test_git_line_counts_staged_new_file_added_only(tmp_path: Path) -> None:
+    """A staged new file IS in `git diff HEAD`, so it reports adds from numstat."""
+    _init_git_with_commit(tmp_path, "committed.py", "x\n")
+    (tmp_path / "new.py").write_text("one\ntwo\nthree\n")
+    subprocess.run(
+        ["git", "add", "new.py"], cwd=tmp_path, check=True, capture_output=True, env=_git_env()
+    )
 
     reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
     rec = next(r for r in reg.list_changed_files("any-conv", limit=100) if r["path"] == "new.py")
@@ -993,44 +1012,6 @@ def test_git_line_counts_binary_is_none(tmp_path: Path) -> None:
     assert rec["lines_removed"] is None, rec
 
 
-def test_git_line_counts_untracked_binary_is_none(tmp_path: Path) -> None:
-    """An untracked binary file (NUL bytes, never git-add'd) reports (None, None).
-
-    Regression guard: the untracked-`created` branch reads the file to count
-    lines; without a NUL check it returned a bogus count for binaries (a
-    downloaded PNG rendered "+N"). The tracked-binary case is covered by
-    numstat's `-\\t-`; this covers the untracked case that bypasses numstat.
-    """
-    _init_git_with_commit(tmp_path, "keep.txt", "hi\n")
-    # Fake PNG header with an embedded NUL — untracked (not git-add'd).
-    (tmp_path / "fake.png").write_bytes(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR")
-
-    reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
-    rec = next(r for r in reg.list_changed_files("any-conv", limit=100) if r["path"] == "fake.png")
-    assert rec["status"] == "created"
-    assert rec["lines_added"] is None, rec
-    assert rec["lines_removed"] is None, rec
-
-
-def test_git_line_counts_untracked_large_file_is_none(tmp_path: Path, monkeypatch) -> None:
-    """An untracked file over the read cap reports (None, None), not a full read.
-
-    Regression guard: the untracked-`created` branch used to slurp the whole
-    file into memory to count lines (a 22 MB file rendered "+220000"). The cap
-    is monkeypatched tiny so the test stays fast rather than writing 10 MiB.
-    """
-    monkeypatch.setattr("omnigent.runtime.filesystem_registry._MAX_READ_BYTES", 16)
-    _init_git_with_commit(tmp_path, "keep.txt", "hi\n")
-    # Untracked text file larger than the (patched) 16-byte cap.
-    (tmp_path / "big.txt").write_text("line\n" * 100)
-
-    reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
-    rec = next(r for r in reg.list_changed_files("any-conv", limit=100) if r["path"] == "big.txt")
-    assert rec["status"] == "created"
-    assert rec["lines_added"] is None, rec
-    assert rec["lines_removed"] is None, rec
-
-
 def test_git_line_counts_numstat_failure_degrades_but_status_intact(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -1051,9 +1032,7 @@ def test_git_line_counts_numstat_failure_degrades_but_status_intact(
             raise subprocess.TimeoutExpired(cmd="git diff --numstat", timeout=5)
         return real_run(argv, *args, **kwargs)
 
-    monkeypatch.setattr(
-        "omnigent.runtime.filesystem_registry.subprocess.run", _fail_numstat
-    )
+    monkeypatch.setattr("omnigent.runtime.filesystem_registry.subprocess.run", _fail_numstat)
 
     [rec] = reg.list_changed_files("any-conv", limit=100)
     assert rec["status"] == "modified"
