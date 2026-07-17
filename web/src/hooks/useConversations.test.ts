@@ -10,6 +10,7 @@ import type { Session } from "@/lib/types";
 import { useSessionUpdatesConnected } from "./useSessionUpdatesConnected";
 import {
   deleteConversation,
+  fetchAllArchivedProjectNames,
   renameConversation,
   useArchiveConversation,
   useBulkArchiveConversations,
@@ -18,6 +19,7 @@ import {
   useConversations,
   useDeleteProject,
   useProjects,
+  useNewestProjectSession,
   useProjectSessions,
   useMoveToProject,
   useRenameConversation,
@@ -144,6 +146,130 @@ describe("useConversations refetch interval", () => {
 
     // The disconnected path keeps the prior safety-poll cadence.
     expect(interval).toBe(45_000);
+  });
+});
+
+describe("useConversations project filter", () => {
+  function renderWithProject(project?: string) {
+    fetchMock.mockResolvedValue(
+      mockResponse({ data: [], first_id: null, last_id: null, has_more: false }),
+    );
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    renderHook(() => useConversations("", true, {}, project), { wrapper });
+    return queryClient;
+  }
+
+  it("sends project= alongside include_archived=true when a project is set", async () => {
+    renderWithProject("Design");
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+
+    // The archived list must scope server-side, so both params reach the request.
+    const url = fetchMock.mock.calls[0][0] as string;
+    expect(url).toContain("include_archived=true");
+    expect(url).toContain("project=Design");
+  });
+
+  it("url-encodes a project name with spaces", async () => {
+    renderWithProject("My Project");
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+
+    const url = fetchMock.mock.calls[0][0] as string;
+    expect(url).toContain("project=My+Project");
+  });
+
+  it("omits project= when no project is set (all projects)", async () => {
+    renderWithProject(undefined);
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+
+    // "All projects" must not send an empty project= (the server would read
+    // that as "unfiled sessions only").
+    const url = fetchMock.mock.calls[0][0] as string;
+    expect(url).toContain("include_archived=true");
+    expect(url).not.toContain("project=");
+  });
+
+  it("coalesces an empty-string project into 'all projects' (base key, no project= param)", async () => {
+    const queryClient = renderWithProject("");
+
+    // No distinct four-element "" variant: it shares the base three-element key,
+    // so key, request, and cache-membership all agree "all projects".
+    const keys = queryClient
+      .getQueryCache()
+      .getAll()
+      .map((q) => q.queryKey as unknown[]);
+    expect(keys).toContainEqual(["conversations", "", true]);
+    expect(keys.every((k) => k.length === 3)).toBe(true);
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    expect(fetchMock.mock.calls[0][0] as string).not.toContain("project=");
+  });
+
+  it("forwards a project literally named __all__ as project=__all__", async () => {
+    renderWithProject("__all__");
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+
+    const url = fetchMock.mock.calls[0][0] as string;
+    expect(url).toContain("project=__all__");
+  });
+});
+
+describe("fetchAllArchivedProjectNames", () => {
+  it("pages through all archived sessions and returns distinct sorted project names", async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        mockResponse({
+          data: [
+            { id: "a", archived: true, labels: { omni_project: "Beta" } },
+            // Active row — include_archived returns it, but it's not filterable here.
+            { id: "b", archived: false, labels: { omni_project: "Zeta" } },
+            // Archived but unfiled — no project label to collect.
+            { id: "c", archived: true, labels: {} },
+          ],
+          first_id: "a",
+          last_id: "c",
+          has_more: true,
+        }),
+      )
+      .mockResolvedValueOnce(
+        mockResponse({
+          data: [
+            { id: "d", archived: true, labels: { omni_project: "Alpha" } },
+            // Duplicate project across pages collapses to one entry.
+            { id: "e", archived: true, labels: { omni_project: "Beta" } },
+          ],
+          first_id: "d",
+          last_id: "e",
+          has_more: false,
+        }),
+      );
+
+    const names = await fetchAllArchivedProjectNames();
+
+    // Distinct + sorted; active and unfiled rows contribute nothing.
+    expect(names).toEqual(["Alpha", "Beta"]);
+    // Page 1: archived, large page size, no project filter, no cursor.
+    const url1 = fetchMock.mock.calls[0][0] as string;
+    expect(url1).toContain("include_archived=true");
+    expect(url1).toContain("limit=100");
+    expect(url1).not.toContain("project=");
+    expect(url1).not.toContain("after=");
+    // Page 2 follows the previous page's last_id cursor.
+    expect(fetchMock.mock.calls[1][0]).toContain("after=c");
+  });
+
+  it("stops after one request when the first page has no more", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ data: [], first_id: null, last_id: null, has_more: false }),
+    );
+
+    const names = await fetchAllArchivedProjectNames();
+
+    expect(names).toEqual([]);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -739,6 +865,54 @@ describe("useProjectSessions", () => {
     // Folders show active sessions only — archived ones leave the sidebar.
     expect(url).not.toContain("include_archived");
     expect(result.current.data?.pages[0]?.data[0]?.id).toBe("conv_a");
+  });
+});
+
+describe("useNewestProjectSession", () => {
+  it("does not fetch without a project", () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    renderHook(() => useNewestProjectSession(null), { wrapper });
+    renderHook(() => useNewestProjectSession(""), { wrapper });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("fetches one newest session and unwraps it from the page", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        data: [{ id: "conv_a", object: "conversation", title: "A", created_at: 0, updated_at: 9 }],
+        first_id: "conv_a",
+        last_id: "conv_a",
+        has_more: true,
+      }),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useNewestProjectSession("Sprint 42"), { wrapper });
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    const url = fetchMock.mock.calls[0][0] as string;
+    expect(url).toContain("/v1/sessions?");
+    expect(url).toContain("project=Sprint+42");
+    expect(url).toContain("order=desc");
+    expect(url).toContain("sort_by=updated_at");
+    expect(url).toContain("limit=1");
+    expect(result.current.data?.id).toBe("conv_a");
+  });
+
+  it("resolves null for a project with no sessions", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ data: [], first_id: null, last_id: null, has_more: false }),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useNewestProjectSession("Empty"), { wrapper });
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data).toBeNull();
   });
 });
 

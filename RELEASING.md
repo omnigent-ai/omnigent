@@ -13,6 +13,11 @@ omnigent ships **three PyPI packages that version-lock together**:
 pin each other with `==`), so every release builds and publishes **all three at
 one identical version**.
 
+Releases are driven by **workflow dispatches, not by hand** (design:
+`designs/RELEASE-AUTOMATION.md`). Every workflow below is idempotent —
+re-dispatch with identical inputs after any failure and it converges — and
+every dispatch requires the **admin or maintain** role on this repo.
+
 ## Where things run
 
 - **Source of truth** (versions, tags, GitHub Releases): **`omnigent-ai/omnigent`**
@@ -20,31 +25,31 @@ one identical version**.
   on the public repo).
 - **Publishing to PyPI**: the central **secure-release repo**
   **`databricks/secure-public-registry-releases-eng`**, `omnigent` workflow —
-  use the **Databricks EMU account**. Publishing runs on hardened runner
+  use whichever account has access to that repo. Publishing runs on hardened runner
   groups with **OIDC Trusted Publishing (no stored secrets)** and a **mandatory
-  dependency scan**. This is why we don't publish from `omnigent-ai/omnigent`.
+  dependency scan**. This is why we don't publish from `omnigent-ai/omnigent`,
+  and why the pipeline is two dispatches per phase rather than one.
 
 > The exact account handles — and how to request publish access — live in the
 > internal release wiki; this public runbook refers to them only by role.
-> Substitute your own handles for `<oss-account>` / `<emu-account>` in the
-> `gh auth switch --user …` commands below.
 
 The legacy `.github/workflows/release-omnigent.yml` in this repo is a
 **deprecated manual fallback only** — its tag-push trigger was removed so a tag
 never double-publishes. Use the secure repo for real releases.
 
-> The secure `omnigent` workflow is **manual `workflow_dispatch`** — it can't see
-> this repo's tag pushes. You bump + tag here, then dispatch it with that tag.
-
 ## Versioning model
 
 - `main` always carries the **next** version with a `.dev0` suffix
-  (e.g. `0.2.0.dev0`) — never a clean released number. This matches
+  (e.g. `0.6.0.dev0`) — never a clean released number. This matches
   MLflow / Delta / Unity Catalog and keeps every `main` build PEP 440-ordered as
   "ahead of the last release, not yet the next one".
-- Releases are cut on **per-minor release branches** (`branch-X.Y`) and tagged
-  there (`vX.Y.Z`); patches (`vX.Y.1`, `vX.Y.2`, …) are cherry-picked onto the
-  same `branch-X.Y`. `main` is never tagged.
+- Releases are cut on **per-minor release branches** (`release/vX.Y.0`) and tagged
+  there (`vX.Y.Z`, rc tags `vX.Y.ZrcN`); patches (`vX.Y.1`, `vX.Y.2`, …) are
+  cherry-picked onto the same `release/vX.Y.0`. `main` is never tagged.
+- Every release ships as an **rc first** (`0.6.0rc1` → … → `0.6.0`). rcs go to
+  **real PyPI** as PEP 440 pre-releases — a default `pip install omnigent`
+  never resolves them, and testers install with exact pins. TestPyPI is no
+  longer part of the standard flow.
 
 ## Docs staging
 
@@ -56,221 +61,247 @@ branch** on `omnigent-site` instead of `main`:
 - **`doc-sync.yml`** — drafts prose docs for each merged PR that needs them.
 - **`sync-openapi-to-site.yml`** — syncs the API reference (`openapi.json`).
 
-Both derive the branch name from `omnigent/version.py` (`0.5.0.dev0` → `0.5-docs`)
+Both derive the branch name from `omnigent/version.py` (`0.6.0.dev0` → `0.6-docs`)
 and create it off site `main` the first time a doc PR lands in the cycle. All docs
-for the `0.5` line — including patches — accumulate on `0.5-docs`. Each PR still
+for the `0.6` line — including patches — accumulate on `0.6-docs`. Each PR still
 gets its own review, but merging one only lands it on the staging branch, not the
-live site.
-
-At release, publishing the GitHub Release fires `publish-changelog.yml`, which
-opens the **`0.5-docs → main`** PR (see step 5). Merging that publishes the whole
-cycle's docs at once. Nothing to create or retarget by hand — the branch name
-tracks `main`'s version automatically.
+live site. At finalize time, the whole batch goes live at once (step 4 below).
 
 ---
 
-## Release steps (example: `v0.2.0`)
+## Standard flow
 
-### 1. Cut the release branch + tag — `omnigent-ai/omnigent` (OSS account)
+### rc phase (example: `0.6.0rc1`)
 
-Only tag a commit that already has **green CI** — verify `main` is green before
-branching:
+**1. Cut + tag — dispatch `Release` (`release.yml`), OSS account.**
 
 ```bash
-gh auth switch --user <oss-account>
-git fetch origin
-gh run list --repo omnigent-ai/omnigent --branch main --status success --limit 1
-git checkout -b branch-0.2 origin/main
+gh workflow run release.yml --repo omnigent-ai/omnigent \
+  -f version=0.6.0rc1 -f dry_run=false
+# optional: -f ref=<sha> to cut release/v0.6.0 from a specific commit (rc1 only);
+# dry_run defaults to true — run once without -f dry_run to preview the plan.
 ```
 
-Set the release version in **all three** `pyproject.toml` files — the
-`version` field **and** the cross-package `==` pins — plus `uv.lock`
-(`0.2.0.dev0` → `0.2.0`):
+What it does (all idempotent):
 
-- `pyproject.toml` (`version`, `omnigent-client==`, `omnigent-ui-sdk==`)
-- `sdks/python-client/pyproject.toml` (`version`, `omnigent==`)
-- `sdks/ui/pyproject.toml` (`version`, `omnigent-client==`)
-- `uv.lock` — **hand-edit** the three `version = "…"` lines (omnigent,
-  omnigent-client, omnigent-ui-sdk) and the one cross-pin `specifier = "==…"`
-  (`omnigent-ui-sdk`'s dep on `omnigent-client`). The three packages are
-  **editable workspace members** (`source = { editable = … }`), so uv records
-  **no wheel `hash` entries** for them, and the other two cross-deps appear as
-  `editable = "…"` with no `==` specifier — so only those version/specifier
-  strings change, nothing else (no hashes to touch).
-  **Do not run `uv lock`** locally: it rewrites every registry URL to the
-  internal proxy and that leaks into the lockfile (breaks CI). The published
-  lock must use `https://pypi.org/simple`.
+- asserts green CI on the base commit (escape hatch: `-f skip_ci_check=true`,
+  use deliberately — needed for a flaky check, or when the base commit ran no
+  checks at all, e.g. a cherry-pick that only touched `paths-ignore`d files);
+- creates `release/v0.6.0` from `ref` (rc1) or reuses the existing branch head
+  (rc2+, final, patches — `ref` is ignored then);
+- stamps the lockstep version via `scripts/update_versions.py` and regenerates
+  `uv.lock` with a clean public-PyPI resolution — **never hand-edit `uv.lock`
+  or run `uv lock` behind a proxy**; the workflow owns this now;
+- commits `release: v0.6.0rc1`, tags, and pushes branch + tag with the
+  omnigent-ci App token, which fires the downstream automation:
+  `github-release.yml` (draft GH release, pre-release flagged),
+  `draft-release-notes.yml`, and `oss-publish-images.yml` (Docker);
+- on the **first** cut of a cycle (rc1), dispatches `bump-version.yml`
+  (post-release) — **review and merge the `main → 0.7.0.dev0` bump PR
+  promptly**, so `doc-sync` keeps staging to the right docs branch.
 
-Stage exactly the version files (don't `-a`, which would sweep in any stray
-local edits), then commit, tag, and push **the branch + only this tag**:
-
-```bash
-git add pyproject.toml sdks/python-client/pyproject.toml sdks/ui/pyproject.toml uv.lock
-git commit -m "release: v0.2.0"
-git tag v0.2.0
-git push -u origin branch-0.2 v0.2.0        # explicit tag, NOT --tags; pushing the tag drafts the GitHub Release (step 5)
-```
-
-> Pushing the tag also kicks off the **changelog automation** (see step 5):
-> `github-release.yml` drafts the Release, then `draft-release-notes.yml` opens a
-> `CHANGELOG.md` PR and fills the draft with curated notes — both ready by the time
-> you get to step 5.
-
-Keep `main` from re-freezing — bump it to the next dev marker and push:
+**2. Publish to PyPI — dispatch the secure repo (EMU account).**
 
 ```bash
-git checkout main
-# set 0.2.0.dev0 -> 0.3.0.dev0 in the 3 pyprojects (+ pins) and uv.lock.
-# Hand-edit uv.lock here too — same rule, do NOT run `uv lock` (it leaks the proxy URL).
-git add pyproject.toml sdks/python-client/pyproject.toml sdks/ui/pyproject.toml uv.lock
-git commit -m "chore: bump main to 0.3.0.dev0"
-git push
-```
-
-### 2. Dry-run the gates — secure repo (EMU account)
-
-```bash
-gh auth switch --user <emu-account>
+gh auth switch --user <secure-repo-account>
 gh workflow run omnigent.yml --repo databricks/secure-public-registry-releases-eng \
-  -f ref=v0.2.0 -f destination=test-pypi -f dry-run=true
-```
-
-Runs build + dependency scan + the gates (lockstep version/pins, web-UI-in-wheel,
-`twine check`, smoke-install) and the OIDC token exchange — **without uploading**.
-
-### 3. Publish to TestPyPI + validate
-
-```bash
+  -f ref=v0.6.0rc1 -f destination=pypi -f dry-run=true    # gates rehearsal
 gh workflow run omnigent.yml --repo databricks/secure-public-registry-releases-eng \
-  -f ref=v0.2.0 -f destination=test-pypi -f dry-run=false
+  -f ref=v0.6.0rc1 -f destination=pypi -f dry-run=false   # real publish
 ```
 
-Validate in a clean venv. **Don't** use `--extra-index-url` with TestPyPI: pip
-resolves each name across *both* indexes and picks the highest version, so anyone
-squatting `omnigent` / `omnigent-client` / `omnigent-ui-sdk` on real PyPI at a
-higher version wins the resolution (dependency confusion). Instead, take **deps
-from real PyPI only** and the **candidates from TestPyPI only**, exact-pinned with
-`--no-deps`:
+The dry run exercises build + dependency scan + the gates (lockstep
+version/pins, web-UI-in-wheel, `twine check`, smoke-install) and the OIDC
+token exchange without uploading. The real run binds the per-package
+Trusted-Publisher environments (may gate on reviewer approval) and re-verifies
+that `ref` is exactly the tag and points at the built commit.
+
+**3. Validate from PyPI** (clean venv; exact pins resolve pre-releases;
+behind a corporate network, point `--index-url` at your PyPI mirror
+instead — this is a manual step on purpose: the secure repo's runners
+cannot see a fresh index view, so no CI job can do it):
 
 ```bash
-python -m venv /tmp/omni-rc
-# 1) seed the dependency closure from REAL PyPI (the last released omnigent):
-/tmp/omni-rc/bin/pip install --index-url https://pypi.org/simple/ omnigent
-# 2) overlay the candidates from TestPyPI ONLY, exact-pinned, no deps:
-/tmp/omni-rc/bin/pip install --index-url https://test.pypi.org/simple/ --no-deps \
-  omnigent==0.2.0 omnigent-client==0.2.0 omnigent-ui-sdk==0.2.0
-/tmp/omni-rc/bin/omnigent --version    # expect 0.2.0
+python -m venv /tmp/omni-rc && /tmp/omni-rc/bin/pip install \
+  --index-url https://pypi.org/simple/ \
+  omnigent==0.6.0rc1 omnigent-client==0.6.0rc1 omnigent-ui-sdk==0.6.0rc1
+/tmp/omni-rc/bin/omnigent --version    # expect 0.6.0rc1
 ```
 
-> If this release **adds a new runtime dependency** the previous release didn't
-> have, install it explicitly from real PyPI first
-> (`/tmp/omni-rc/bin/pip install --index-url https://pypi.org/simple/ <dep>`) —
-> never let a `--no-deps` TestPyPI install pull third-party deps from TestPyPI.
+The rc's GitHub draft stays **unpublished** — rc drafts are never published.
+Need another candidate? Repeat with `0.6.0rc2` (fixes land on `release/v0.6.0`
+first, via cherry-pick PRs or direct pushes; CI runs on `release/v*` pushes).
 
-### 4. Publish to PyPI (prod)
+### Final phase (example: `0.6.0`)
 
-Requires **admin/maintain** on the secure repo (if you hit a 403, request access
-via the secure-release owning team / internal release wiki before proceeding);
-binds the per-package `pypi-omnigent`, `pypi-omnigent-client`,
-`pypi-omnigent-ui-sdk` Trusted-Publisher environments (may gate on reviewer
-approval). The prod path also re-verifies that
-`ref` is exactly the `vX.Y.Z` tag and that the tag points at the built commit.
+1. **Cut + tag**: `gh workflow run release.yml -f version=0.6.0 -f dry_run=false`
+   — same as above; builds from the `release/v0.6.0` head.
+2. **Publish to PyPI**: same secure-repo dispatches on `ref=v0.6.0`.
+3. **Curate**: merge the `CHANGELOG.md` PR that `draft-release-notes.yml`
+   opened, and review/trim the curated notes in the `v0.6.0` draft on the
+   Releases page — whatever you leave becomes the website post.
+4. **Finalize — dispatch `Finalize release` (`finalize-release.yml`)**:
 
-```bash
-gh workflow run omnigent.yml --repo databricks/secure-public-registry-releases-eng \
-  -f ref=v0.2.0 -f destination=pypi -f dry-run=false
+   ```bash
+   gh workflow run finalize-release.yml --repo omnigent-ai/omnigent -f tag=v0.6.0
+   ```
 
-uv tool install omnigent==0.2.0        # final sanity from real PyPI
-```
+   It verifies PyPI serves all three packages, the CHANGELOG PR isn't open,
+   and the **docs sweep**: no open PRs against `0.6-docs` on `omnigent-site`
+   (it lists any stragglers — get them reviewed and merged/closed, then
+   re-dispatch). Then it pauses on the **`publish-release` environment**;
+   approving it attests "I reviewed the draft notes". It publishes the release
+   as **Latest**, which fires:
+   - `publish-changelog.yml` → the site **release-post PR** and the
+     **`0.6-docs → main` docs-publish PR** — review and merge both;
+   - `update-homebrew.yml` → the **homebrew-tap bump PR** (new sdist pin +
+     regenerated resources; test-bot builds the bottles on it) — review the
+     resource diff, then apply the **`pr-pull`** label to bottle + merge.
 
-> Note: the dispatch's `-f ref=v0.2.0` is the **omnigent source ref**; it is
-> distinct from `gh workflow run --ref`, which selects the branch the *workflow
-> definition* runs from (the secure repo's default).
+### Patch release (example: `0.6.1`)
 
-### 5. Publish the GitHub Release — `omnigent-ai/omnigent` (OSS account)
-
-Pushing the `v0.2.0` tag (step 1) set the **changelog automation** in motion —
-two workflows have already done the prep for you:
-
-- `github-release.yml` created a **draft** release.
-- `draft-release-notes.yml` (fires right after) then:
-  1. opened a **`CHANGELOG.md` PR to `main`** — the granular, feature-level log,
-     harvested mechanically from each merged PR's `## Changelog` section; and
-  2. **filled the draft's body** with concise, curated notes (Major new features /
-     Breaking changes / Bug fixes — user-facing only), synthesized by an agent from
-     the merged PRs, with the original auto-notes tucked into a collapsed
-     `<details>` for reference. Security and CI/internal fixes are deliberately left
-     out of the highlights.
-
-Now:
-
-1. **Merge the `CHANGELOG.md` PR** as part of cutting the release, so the draft's
-   `Full Changelog` link (which points at `CHANGELOG.md` on `main`) resolves.
-2. Open <https://github.com/omnigent-ai/omnigent/releases>, find the `v0.2.0`
-   draft, and **review/trim the curated notes** — they're a strong starting point,
-   not the final word. Lead with user-facing highlights; call out breaking changes.
-   Whatever you leave here becomes the website post, so curate it well.
-3. **Publish the release** (ideally only after the prod PyPI publish in step 4 has
-   succeeded, so you never advertise a version that isn't installable).
-
-Publishing a **final** release fires `.github/workflows/publish-changelog.yml`,
-which opens **two** PRs to review and merge (pre-releases are skipped):
-
-- **`omnigent-site` `/releases/<version>`** — a per-version post mirroring the
-  notes you just curated (PR refs and angle/brace characters are made MDX-safe for
-  you). Targets `main`.
-- **`omnigent-site` `X.Y-docs → main`** — publishes the docs staged this cycle
-  (see [Docs staging](#docs-staging) below). Skipped if that branch doesn't exist
-  or has nothing beyond `main`. Review the batch and merge to take the version's
-  docs live.
-
-To re-run either half for an already-cut tag: dispatch `draft-release-notes.yml`
-with the `tag` (re-opens the CHANGELOG PR; it leaves the notes alone once the
-release is published), or `publish-changelog.yml` with the `tag` (re-opens the
-site post PR).
-
-If the draft wasn't created (e.g. the workflow was disabled), do it manually:
-
-```bash
-gh auth switch --user <oss-account>
-gh release create v0.2.0 --repo omnigent-ai/omnigent \
-  --draft --verify-tag --generate-notes --title "v0.2.0"
-# review/edit, then publish from the Releases page (or `gh release edit v0.2.0 --draft=false`)
-```
+Cherry-pick the fixes onto `release/v0.6.0` (CI runs on the push), then run the
+same flow with `version=0.6.1` — an rc first if the patch warrants one. `main`
+does not change for a patch, and a patch never needs a new branch.
 
 ---
 
-## Patch release (e.g. `v0.2.1`)
+## One-time setup (repo admin)
 
-Cherry-pick the fix onto the existing `branch-0.2`, then:
-
-1. Confirm CI is green on `branch-0.2` after the cherry-pick
-   (`gh run list --repo omnigent-ai/omnigent --branch branch-0.2 --status success --limit 1`).
-2. Bump the three versions/pins + `uv.lock` to `0.2.1` (same hand-edit rules as above).
-3. Stage explicitly, commit, and tag **on `branch-0.2`**:
-   `git add <version files> && git commit -m "release: v0.2.1" && git tag v0.2.1 && git push origin branch-0.2 v0.2.1`.
-4. Repeat steps 2–5.
-
-`main` does **not** change for a patch, and a patch never needs a new
-`branch-0.Y` — patches always ship from the existing minor branch.
-
----
+- **`publish-release` environment** on `omnigent-ai/omnigent` with required
+  reviewers = the release managers. Without it the finalize publish job runs
+  ungated.
+- **omnigent-ci App** installed on `omnigent-ai/homebrew-tap` (it already
+  covers `omnigent` and `omnigent-site`).
+- **Tag ruleset** (recommended): restrict `v[0-9]*` create/update/delete to
+  the omnigent-ci App + admins, so no write-access account can start the
+  tag-push automation by hand.
 
 ## If a publish goes wrong (recovery)
 
 **PyPI releases can't be deleted, only _yanked_**, and a version number once used
 can never be reused. So:
 
-- **TestPyPI failed / candidate is bad:** bump to the next number (don't reuse the
-  version) and re-run — TestPyPI is disposable.
+- **Any workflow failed mid-run:** fix the cause and **re-dispatch with the
+  same inputs** — every step converges (branch exists → reused; version
+  stamped → no new commit; tag at the converged commit → no-op) or fails
+  loudly (tag elsewhere) rather than duplicating work.
+- **Wrong commit tagged, nothing published yet:** delete the tag and draft
+  (`gh release delete vX.Y.Z`, `git push origin :refs/tags/vX.Y.Z`), then
+  re-dispatch `release.yml`.
+- **rc is bad:** just cut the next rc — rcs are cheap and invisible to
+  default installs.
 - **Prod publish partially succeeded** (e.g. two of three packages uploaded):
   **yank** the published version(s) on PyPI (each affected project → *Manage* →
-  *Releases* → *Yank*) so installs don't resolve a half-published set, then cut the
-  next patch with the fix. Don't try to overwrite — Trusted Publishing / `twine`
-  rejects re-uploading an existing version.
-- **GitHub Release** for a version you abandoned:
-  `gh release delete vX.Y.Z --repo omnigent-ai/omnigent`, and drop the tag if it
-  shouldn't exist (`git push origin :refs/tags/vX.Y.Z`); re-tag only the corrected
-  commit.
-- Publishing uses **OIDC Trusted Publishing (no stored secrets)**, so a failed run
-  leaks nothing — just fix forward to the next version.
+  *Releases* → *Yank*) so installs don't resolve a half-published set, then cut
+  the next version with the fix. Don't try to overwrite — Trusted Publishing /
+  `twine` rejects re-uploading an existing version.
+- Publishing uses **OIDC Trusted Publishing (no stored secrets)**, so a failed
+  run leaks nothing — fix forward to the next version.
+
+---
+
+## Rehearsing the pipeline (throwaway rc release)
+
+To exercise the whole flow end to end without touching users, release a
+deliberately **below-latest** rc on the dead `0.0` line. A below-latest rc is
+inert everywhere that matters: the GitHub draft stays unpublished, Docker
+publishes only the immutable version image tag (`:latest` / `:latest-rc` only
+move for the highest version), the notes/site/homebrew workflows ignore rc
+tags, `bump-main` skips itself (the version sorts below main's), and a
+PEP 440 pre-release is never resolved by a default `pip install` — on real
+PyPI or TestPyPI alike.
+
+**Pick a version that has never touched the destination index.** PyPI
+filenames are burned forever — even for yanked releases — so reusing a number
+fails the upload with "File already exists". (`0.0.1rc1` itself is spent: it
+reserved the PyPI project names in June 2026.) Confirm before starting; a 404
+means the version is free:
+
+```bash
+curl -fsS https://pypi.org/pypi/omnigent/0.0.1rc2/json   # expect 404
+```
+
+The examples below use `0.0.1rc2`; substitute the next free number.
+
+1. **Plan (read-only)** — dry run is the default:
+
+   ```bash
+   gh workflow run release.yml --repo omnigent-ai/omnigent -f version=0.0.1rc2
+   ```
+
+2. **Execute**: re-run with `-f dry_run=false`. Expect `release/v0.0.0` + tag
+   `v0.0.1rc2` pushed, the tag firing the draft-release and image workflows,
+   and CI running on the branch push. If the CI gate rejects main's head
+   (failing or still-pending checks), that's the gate working — wait, or
+   re-dispatch with `-f ref=<green sha>` / `-f skip_ci_check=true`.
+   Cancelled (superseded) runs only warn.
+3. **Idempotency**: dispatch the exact same command again — it must no-op
+   ("already at the converged release commit").
+4. **Secure-repo publish.** Real PyPI is safe for a below-latest rc and
+   exercises the full prod path (the tag gate + the per-package reviewer
+   environments; approve all three) — so rehearse against
+   `destination=pypi`. `destination=test-pypi` also works, but skips the
+   prod tag gate and needs TestPyPI Trusted Publishers configured. Then
+   validate the published rc manually, exactly like a real release (step 3
+   of the standard flow).
+
+   ```bash
+   gh workflow run omnigent.yml --repo databricks/secure-public-registry-releases-eng \
+     -f ref=v0.0.1rc2 -f destination=pypi -f dry-run=true    # gates only
+   gh workflow run omnigent.yml --repo databricks/secure-public-registry-releases-eng \
+     -f ref=v0.0.1rc2 -f destination=pypi -f dry-run=false   # real publish
+   ```
+
+5. **No-double-publish check** (optional): re-dispatching step 4's second
+   command must FAIL every leg with "File already exists" — PyPI
+   immutability doing its job. The publish is deliberately **write-only**:
+   the release runners cannot read the index, so there is no
+   already-published skip (a curl probe and twine's `--skip-existing` both
+   failed live for exactly that reason). A real partial publish is recovered
+   by yank + next version (see "If a publish goes wrong").
+6. **Finalize gates (no side effects)**:
+   `gh workflow run finalize-release.yml -f tag=v0.0.1rc2` must fail fast
+   ("not a final tag"), and `-f tag=v0.5.1` (any already-published release)
+   must no-op as already published.
+
+Cleanup — delete everything the rehearsal minted on GitHub:
+
+```bash
+gh release delete v0.0.1rc2 --repo omnigent-ai/omnigent --cleanup-tag --yes
+gh api -X DELETE 'repos/omnigent-ai/omnigent/git/refs/heads/release/v0.0.0'
+```
+
+Optionally delete the rehearsal image versions from GHCR. The PyPI side needs
+no cleanup: the rc is invisible to default installs and only the version
+number is spent — optionally yank it (*Manage → Releases → Yank*) for
+tidiness.
+
+---
+
+## Break-glass appendix (manual fallback)
+
+If the workflows are unavailable, the flow can be driven by hand — but keep two
+rules even then:
+
+1. **Never hand-edit `uv.lock` and never run `uv lock` behind a proxy.** Use
+   `bump-version.yml` (mode `pre-release`, `base_branch=release/vX.Y.0`) to
+   produce the bump as a PR with a cleanly regenerated lockfile, and merge it.
+2. **Push tags from an account, not automation you improvised** — the tag push
+   must fire `github-release.yml` et al., which a `GITHUB_TOKEN`-authored push
+   would not.
+
+```bash
+gh auth switch --user <oss-account>
+git fetch origin && git checkout -b release/v0.6.0 origin/main   # rc1 only
+gh workflow run bump-version.yml -f mode=pre-release -f new_version=0.6.0rc1 \
+  -f base_branch=release/v0.6.0                                  # then merge the PR
+git fetch origin && git checkout release/v0.6.0 && git pull
+git tag v0.6.0rc1 && git push origin release/v0.6.0 v0.6.0rc1    # explicit tag, NOT --tags
+```
+
+Then continue from step 2 of the standard flow (secure-repo dispatches). If the
+GH draft wasn't created, `gh release create vX.Y.Z --draft --verify-tag
+--title vX.Y.Z` recreates it. To re-run the notes/site halves for an existing
+tag, dispatch `draft-release-notes.yml` or `publish-changelog.yml` with the
+`tag` input; for the tap, dispatch `update-homebrew.yml`.

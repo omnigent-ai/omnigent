@@ -22,9 +22,35 @@ from typing import Any, Protocol
 
 from cachetools import TTLCache
 
+from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
 from omnigent.host.frames import HostHelloFrame
 
 _logger = logging.getLogger(__name__)
+
+
+def _canonical_host_id(host_id: str) -> str:
+    """Reduce a host id to the canonical bare-hex form used as the key.
+
+    Host ids reach the registry in every spelling ``uuid_to_bytes``
+    accepts: the bare 32-char hex the tunnel route registers under,
+    the legacy ``host_<hex>`` form that pre-migration clients still
+    send in REST paths, and the dashed uuid form. The DB layer
+    normalizes all of them (``Uuid16``), so the registry must key on
+    the same canonical form — otherwise a legacy-form lookup misses a
+    live tunnel and runner launches 409 "host is offline" while
+    ``GET /v1/hosts`` reports the host online. Ids that aren't
+    uuid-shaped at all are keyed verbatim so they simply miss.
+
+    :param host_id: A host id in any accepted spelling, e.g.
+        ``"host_a1b2..."``, ``"a1b2..."``, or the dashed uuid.
+    :returns: The bare-hex form, or *host_id* unchanged when it is
+        not uuid-shaped.
+    """
+    try:
+        return uuid_to_bytes(host_id).hex()
+    except InvalidUuidError:
+        return host_id
+
 
 # How long a runner exit report stays answerable, and how many are kept.
 # Reports only matter while a client is still waiting for the runner to
@@ -157,6 +183,11 @@ class HostConnection:
     :param pending_stops: Per-``request_id`` futures for
         in-flight ``host.stop_runner`` requests. Resolved when
         the host sends ``host.stop_runner_result``.
+    :param pending_runner_status: Per-``request_id`` futures for
+        in-flight ``host.runner_status`` queries. Resolved when the
+        host sends ``host.runner_status_result``. Values carry the
+        single ``status`` field (``"alive"`` / ``"dead"`` /
+        ``"unknown"``).
     :param pending_stats: Per-``request_id`` futures for in-flight
         ``host.stat`` requests. Resolved when the host sends
         ``host.stat_result``. The dict values carry the full
@@ -185,6 +216,12 @@ class HostConnection:
         host sends ``host.create_dir_result``. Values carry the
         result fields (``status``, ``path``, ``error``). Same
         ``Any`` typing rationale as ``pending_stats``.
+    :param pending_fs_requests: Per-``request_id`` futures for
+        in-flight ``host.fs_request`` reads (the workspace file
+        panel served from the host while the runner is offline).
+        Resolved when the host sends ``host.fs_result``. Values
+        carry ``status``, ``payload``, ``error_status``,
+        ``error_code``, and ``error``.
     """
 
     host_id: str
@@ -198,6 +235,9 @@ class HostConnection:
         default_factory=dict,
     )
     pending_stops: dict[str, asyncio.Future[dict[str, str | None]]] = field(
+        default_factory=dict,
+    )
+    pending_runner_status: dict[str, asyncio.Future[dict[str, str | None]]] = field(
         default_factory=dict,
     )
     pending_stats: dict[str, asyncio.Future[dict[str, Any]]] = field(
@@ -216,6 +256,9 @@ class HostConnection:
         default_factory=dict,
     )
     pending_create_dirs: dict[str, asyncio.Future[dict[str, Any]]] = field(
+        default_factory=dict,
+    )
+    pending_fs_requests: dict[str, asyncio.Future[dict[str, Any]]] = field(
         default_factory=dict,
     )
 
@@ -251,8 +294,10 @@ class HostRegistry:
         :param ws: The live WebSocket.
         :param hello: The hello frame from the host.
         :param owner: Authenticated user ID, or ``None``.
-        :returns: The new :class:`HostConnection`.
+        :returns: The new :class:`HostConnection`. Its ``host_id`` is
+            the canonical form (see :func:`_canonical_host_id`).
         """
+        host_id = _canonical_host_id(host_id)
         now = time.time()
         conn = HostConnection(
             host_id=host_id,
@@ -279,21 +324,22 @@ class HostRegistry:
 
         No-op if ``host_id`` is not registered.
 
-        :param host_id: Host identifier to remove.
+        :param host_id: Host identifier to remove, in any accepted
+            spelling (see :func:`_canonical_host_id`).
         """
         with self._lock:
-            self._hosts.pop(host_id, None)
+            self._hosts.pop(_canonical_host_id(host_id), None)
 
     def get(self, host_id: str) -> HostConnection | None:
         """Look up a live host connection.
 
-        :param host_id: Host identifier, e.g.
-            ``"host_a1b2c3d4..."``.
+        :param host_id: Host identifier, in any accepted spelling
+            (see :func:`_canonical_host_id`).
         :returns: The :class:`HostConnection` if online,
             otherwise ``None``.
         """
         with self._lock:
-            return self._hosts.get(host_id)
+            return self._hosts.get(_canonical_host_id(host_id))
 
     def online_host_ids(self) -> list[str]:
         """Return IDs of all currently connected hosts.
@@ -302,6 +348,31 @@ class HostRegistry:
         """
         with self._lock:
             return list(self._hosts.keys())
+
+    def is_host_telemetry_opted_out(self, host_id: str) -> bool:
+        """Return whether the host has opted out of telemetry.
+
+        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :returns: ``True`` when the host sent ``telemetry_opt_out=True``
+            in its hello frame.  Defaults to ``False`` when the host is
+            offline or unknown.
+        """
+        conn = self.get(host_id)
+        if conn is None:
+            return False
+        return conn.hello.telemetry_opt_out
+
+    def get_host_installation_id(self, host_id: str) -> str | None:
+        """Return the installation ID the host advertised in its hello frame.
+
+        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :returns: The host's installation ID, or ``None`` when offline or
+            not set.
+        """
+        conn = self.get(host_id)
+        if conn is None:
+            return None
+        return conn.hello.installation_id
 
     def send_text(self, conn: HostConnection, data: str) -> None:
         """Enqueue a text frame for sending to the host.

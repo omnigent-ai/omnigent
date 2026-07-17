@@ -101,9 +101,9 @@ def test_set_version_preserves_unrelated_version_literals(repo_copy: Path) -> No
     before = root_pyproject.read_text()
     # Real third-party floor that shares the old version digits — must
     # survive a bump untouched (anchored-on-name replacement, not blind).
-    assert '"databricks-mcp>=0.1.0",' in before
+    assert '"databricks-mcp>=0.9.0",' in before
     update_versions.set_version(repo_copy, "9.9.9")
-    assert '"databricks-mcp>=0.1.0",' in root_pyproject.read_text()
+    assert '"databricks-mcp>=0.9.0",' in root_pyproject.read_text()
 
 
 def test_check_detects_version_drift(repo_copy: Path) -> None:
@@ -141,10 +141,10 @@ def test_set_version_fails_loud_when_line_absent(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("released", "expected"),
     [
-        ("0.1.2", "0.1.3.dev0"),
-        ("1.0.0", "1.0.1.dev0"),
-        ("0.1.2rc1", "0.1.3.dev0"),
-        ("2.5.9", "2.5.10.dev0"),
+        ("0.1.2", "0.2.0.dev0"),
+        ("1.0.0", "1.1.0.dev0"),
+        ("0.6.0rc1", "0.7.0.dev0"),
+        ("2.5.9", "2.6.0.dev0"),
     ],
 )
 def test_next_dev_version(released: str, expected: str) -> None:

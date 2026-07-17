@@ -3229,6 +3229,16 @@ def _apply_overrides_to_raw(raw: _YamlMapping, overrides: ChatOverrides) -> None
         executor_block["model"] = overrides.model
     if overrides.harness is not None:
         _apply_harness_override_to_executor(raw, executor_block, overrides.harness)
+        # A harness-only override drops any prior model pin so the new
+        # harness resolves its provider default — e.g. ``omnigent run
+        # examples/polly --harness pi`` must not keep Polly's Claude-only
+        # a Claude-only ``executor.model``. An explicit ``--model``
+        # (applied above) wins and is left alone.
+        if overrides.model is None:
+            executor_block.pop("model", None)
+            llm_block = raw.get("llm")
+            if isinstance(llm_block, dict):
+                llm_block.pop("model", None)
     # When neither harness nor model is declared — after overrides —
     # inject the ad-hoc default. Gated on harness absence so a YAML
     # like ``claude_code_agent.yaml`` (declares harness, no model)

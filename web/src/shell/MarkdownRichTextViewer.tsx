@@ -32,10 +32,15 @@ import { TruncatedBanner } from "./TruncatedBanner";
 import { useMarkdownEditorSync } from "./useMarkdownEditorSync";
 import { useEditorAutoSave } from "./useEditorAutoSave";
 import { MarkdownCommentPlugin } from "./MarkdownCommentPlugin";
+import { MarkdownSearchBar } from "./MarkdownSearchBar";
 import {
   createCommentDecorationExtension,
   type CommentDecorationState,
 } from "./TipTapCommentExtension";
+import {
+  createSearchDecorationExtension,
+  type SearchDecorationState,
+} from "./TipTapSearchExtension";
 import { createWorkspaceImageExtension, ImageAwareLink } from "./TipTapWorkspaceImage";
 import { GitHubAlertBlockquote } from "./TipTapGitHubAlert";
 import { HtmlPassthrough } from "./TipTapHtmlPassthrough";
@@ -81,6 +86,11 @@ interface MarkdownRichTextViewerProps {
   onSetActiveSelection: (sel: ActiveSelection | null) => void;
   /** Ref to the in-progress comment body; forwarded to MarkdownCommentPlugin. */
   pendingBodyRef?: React.RefObject<string>;
+  /** True when the toolbar "Find in file" toggle wants the search bar open. */
+  searchOpen?: boolean;
+  /** Called when the search bar is closed (Escape / ✕) so the parent can reset the toggle. */
+  onSearchHandled?: () => void;
+  searchInputRef?: React.RefObject<HTMLInputElement | null>;
 }
 
 export function MarkdownRichTextViewer({
@@ -94,6 +104,9 @@ export function MarkdownRichTextViewer({
   activeSelection,
   onSetActiveSelection,
   pendingBodyRef,
+  searchOpen,
+  onSearchHandled,
+  searchInputRef,
 }: MarkdownRichTextViewerProps) {
   // A truncated buffer must never be editable, regardless of permission.
   const canEdit = useCanEdit(conversationId) && !truncated;
@@ -123,6 +136,8 @@ export function MarkdownRichTextViewer({
 
   // This ref is shared across remounts — the ProseMirror plugin reads it.
   const commentStateRef = useRef<CommentDecorationState | null>(null);
+  // Shared with the search plugin (find-in-file highlights).
+  const searchStateRef = useRef<SearchDecorationState | null>(null);
 
   return (
     <MarkdownRichTextViewerInner
@@ -148,6 +163,10 @@ export function MarkdownRichTextViewer({
       onSetActiveSelection={onSetActiveSelection}
       pendingBodyRef={pendingBodyRef}
       commentStateRef={commentStateRef}
+      searchStateRef={searchStateRef}
+      searchOpen={searchOpen ?? false}
+      onSearchHandled={onSearchHandled}
+      searchInputRef={searchInputRef}
       setContentRef={setContentRef}
     />
   );
@@ -175,6 +194,10 @@ interface InnerProps {
   onSetActiveSelection: (sel: ActiveSelection | null) => void;
   pendingBodyRef?: React.RefObject<string>;
   commentStateRef: React.RefObject<CommentDecorationState | null>;
+  searchStateRef: React.RefObject<SearchDecorationState | null>;
+  searchOpen: boolean;
+  onSearchHandled?: () => void;
+  searchInputRef?: React.RefObject<HTMLInputElement | null>;
   setContentRef: React.RefObject<((content: string) => void) | null>;
 }
 
@@ -196,6 +219,10 @@ function MarkdownRichTextViewerInner({
   onSetActiveSelection,
   pendingBodyRef,
   commentStateRef,
+  searchStateRef,
+  searchOpen,
+  onSearchHandled,
+  searchInputRef,
   setContentRef,
 }: InnerProps) {
   const [isCopied, setIsCopied] = useState(false);
@@ -207,6 +234,10 @@ function MarkdownRichTextViewerInner({
     [],
   );
   const scrollContainerRef = useRef<HTMLDivElement>(null);
+  // Fall back to a local ref when the parent doesn't pass one (the toolbar
+  // path always does; this keeps the bar usable in isolation/tests).
+  const fallbackSearchInputRef = useRef<HTMLInputElement>(null);
+  const localSearchInputRef = searchInputRef ?? fallbackSearchInputRef;
 
   const handleCopyContent = useCallback(() => {
     if (!navigator?.clipboard?.writeText) return;
@@ -303,6 +334,7 @@ function MarkdownRichTextViewerInner({
       Markdown,
       createWorkspaceImageExtension(conversationId, path),
       createCommentDecorationExtension(commentStateRef),
+      createSearchDecorationExtension(searchStateRef),
     ],
     // commentStateRef is stable and a path change remounts this component
     // (editorKey), so the closed-over conversationId/path can't go stale;
@@ -398,6 +430,13 @@ function MarkdownRichTextViewerInner({
   return (
     <div className="relative flex flex-col h-full">
       {truncated && <TruncatedBanner />}
+      <MarkdownSearchBar
+        editor={editor}
+        searchStateRef={searchStateRef}
+        open={searchOpen}
+        onClose={() => onSearchHandled?.()}
+        inputRef={localSearchInputRef}
+      />
       {canEdit && (
         <ToolbarPlugin
           editor={editor}

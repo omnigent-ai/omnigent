@@ -7,6 +7,7 @@ import { getCurrentAuthorId } from "@/lib/identity";
 import { cn } from "@/lib/utils";
 import type { Comment } from "@/hooks/useComments";
 import type { ActiveSelection } from "./codeViewerHelpers";
+import { displayAnchorContent } from "./pdfCommentHelpers";
 
 function avatarStyle(name: string): { backgroundColor: string; color: string } {
   let hash = 0;
@@ -223,7 +224,7 @@ export function CommentsPanel({
               {activeSelection.anchor_content && (
                 <div className="truncate rounded bg-muted/40 px-2 py-1 font-mono text-[10px] text-muted-foreground">
                   <span className="text-foreground/60">Selection: </span>
-                  {activeSelection.anchor_content.trim().split("\n")[0]}
+                  {displayAnchorContent(activeSelection.anchor_content).split("\n")[0]}
                 </div>
               )}
               <textarea
@@ -409,7 +410,7 @@ function CommentCard({
       {/* Anchor */}
       {c.anchor_content && (
         <p className="truncate font-mono text-[11px] text-muted-foreground">
-          {c.anchor_content.trim()}
+          {displayAnchorContent(c.anchor_content)}
         </p>
       )}
 

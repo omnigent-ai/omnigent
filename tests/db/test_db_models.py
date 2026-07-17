@@ -16,10 +16,12 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 from omnigent.db.db_models import (
     SqlAccountToken,
     SqlAgent,
+    SqlAgentConfiguration,
     SqlComment,
     SqlConversation,
     SqlConversationItem,
     SqlConversationLabel,
+    SqlConversationMetadata,
     SqlFile,
     SqlHost,
     SqlPolicy,
@@ -48,7 +50,7 @@ def _now() -> int:
 
 
 def _make_agent(
-    id: str = "ag_test1",
+    id: str = "0ecf75a6ff1ff86bcc1902eb0951ef45",
     name: str = "test-agent",
     kind: str = "template",
 ) -> SqlAgent:
@@ -56,35 +58,50 @@ def _make_agent(
         id=id,
         created_at=_now(),
         name=name,
-        bundle_location="ag_test1/abc123",
+        bundle_location="0ecf75a6ff1ff86bcc1902eb0951ef45/abc123",
         version=1,
         kind=encode_agent_kind(kind),
     )
 
 
 def _make_conversation(
-    id: str = "conv_test1",
-    agent_id: str | None = None,
+    id: str = "a9930027fd3e2e979e65844f7af7bf88",
     parent_conversation_id: str | None = None,
     root_conversation_id: str | None = None,
-    kind: str = "default",
     title: str | None = None,
+    archived: bool = False,
 ) -> SqlConversation:
     return SqlConversation(
         id=id,
         created_at=_now(),
         updated_at=_now(),
-        kind=encode_conversation_kind(kind),
-        agent_id=agent_id,
         parent_conversation_id=parent_conversation_id,
         root_conversation_id=root_conversation_id or id,
         title=title,
+        archived=archived,
+    )
+
+
+def _make_agent_configuration(
+    conversation_id: str = "a9930027fd3e2e979e65844f7af7bf88",
+    agent_id: str | None = None,
+) -> SqlAgentConfiguration:
+    return SqlAgentConfiguration(conversation_id=conversation_id, agent_id=agent_id)
+
+
+def _make_metadata(
+    id: str = "a9930027fd3e2e979e65844f7af7bf88",
+    kind: str = "default",
+) -> SqlConversationMetadata:
+    return SqlConversationMetadata(
+        id=id,
+        kind=encode_conversation_kind(kind),
     )
 
 
 def _make_item(
-    id: str = "msg_test1",
-    conversation_id: str = "conv_test1",
+    id: str = "a47da81d0587d7c42e53978d629c5ab8",
+    conversation_id: str = "a9930027fd3e2e979e65844f7af7bf88",
     position: int = 0,
 ) -> SqlConversationItem:
     return SqlConversationItem(
@@ -113,7 +130,7 @@ class TestSqlAgent:
             session.add(agent)
 
         with managed() as session:
-            loaded = session.get(SqlAgent, (0, "ag_test1"))
+            loaded = session.get(SqlAgent, (0, "0ecf75a6ff1ff86bcc1902eb0951ef45"))
             assert loaded is not None
             assert loaded.name == "test-agent"
             assert loaded.version == 1
@@ -132,7 +149,7 @@ class TestSqlAgent:
             session.add(agent)
 
         with managed() as session:
-            loaded = session.get(SqlAgent, (0, "ag_test1"))
+            loaded = session.get(SqlAgent, (0, "0ecf75a6ff1ff86bcc1902eb0951ef45"))
             assert loaded is not None
             assert loaded.description == "A test agent"
             assert loaded.updated_at is not None
@@ -147,7 +164,7 @@ class TestSqlAgent:
             session.add(agent)
 
         with managed() as session:
-            loaded = session.get(SqlAgent, (0, "ag_test1"))
+            loaded = session.get(SqlAgent, (0, "0ecf75a6ff1ff86bcc1902eb0951ef45"))
             assert loaded is not None
             assert loaded.kind == encode_agent_kind("session")
 
@@ -156,8 +173,8 @@ class TestSqlAgent:
         engine = get_or_create_engine(db_uri)
         managed = make_managed_session_maker(engine)
 
-        a1 = _make_agent(id="ag_1", name="agent-1", kind="session")
-        a2 = _make_agent(id="ag_2", name="agent-2", kind="session")
+        a1 = _make_agent(id="880b5afda28ad55ff74cbeb9b5fc67fb", name="agent-1", kind="session")
+        a2 = _make_agent(id="0fa804039e209a10554da55135751438", name="agent-2", kind="session")
 
         with managed() as session:
             session.add(a1)
@@ -173,7 +190,7 @@ class TestSqlFile:
         managed = make_managed_session_maker(engine)
 
         f = SqlFile(
-            id="file_test1",
+            id="c9b7bd37959cc093d2b9e9ebf4d9b35b",
             created_at=_now(),
             filename="report.pdf",
             bytes=12345,
@@ -183,7 +200,7 @@ class TestSqlFile:
             session.add(f)
 
         with managed() as session:
-            loaded = session.get(SqlFile, (0, "file_test1"))
+            loaded = session.get(SqlFile, (0, "c9b7bd37959cc093d2b9e9ebf4d9b35b"))
             assert loaded is not None
             assert loaded.filename == "report.pdf"
             assert loaded.bytes == 12345
@@ -194,7 +211,7 @@ class TestSqlFile:
         managed = make_managed_session_maker(engine)
 
         f = SqlFile(
-            id="file_test2",
+            id="aa87c404604d8dda9990e960edcd06b4",
             created_at=_now(),
             filename="data.bin",
             bytes=100,
@@ -203,7 +220,7 @@ class TestSqlFile:
             session.add(f)
 
         with managed() as session:
-            loaded = session.get(SqlFile, (0, "file_test2"))
+            loaded = session.get(SqlFile, (0, "aa87c404604d8dda9990e960edcd06b4"))
             assert loaded is not None
             assert loaded.content_type is None
 
@@ -337,66 +354,92 @@ class TestSqlConversation:
             session.add(conv)
 
         with managed() as session:
-            loaded = session.get(SqlConversation, (0, "conv_test1"))
+            loaded = session.get(SqlConversation, (0, "a9930027fd3e2e979e65844f7af7bf88"))
             assert loaded is not None
             assert loaded.title == "Hello World"
-            assert loaded.kind == encode_conversation_kind("default")
-            assert loaded.archived is False
+            # Identity/hierarchy columns only; kind/archived live on
+            # SqlConversationMetadata, agent binding + overrides on
+            # SqlAgentConfiguration.
+            assert loaded.root_conversation_id == "a9930027fd3e2e979e65844f7af7bf88"
+            assert loaded.next_position == 0
 
     def test_defaults(self, db_uri: str) -> None:
         engine = get_or_create_engine(db_uri)
         managed = make_managed_session_maker(engine)
 
         conv = _make_conversation()
+        agent_config = _make_agent_configuration()
         with managed() as session:
             session.add(conv)
+            session.add(agent_config)
 
         with managed() as session:
-            loaded = session.get(SqlConversation, (0, "conv_test1"))
+            loaded = session.get(SqlAgentConfiguration, (0, "a9930027fd3e2e979e65844f7af7bf88"))
             assert loaded is not None
-            assert loaded.runner_id is None
-            assert loaded.host_id is None
             assert loaded.reasoning_effort is None
             assert loaded.model_override is None
-            assert loaded.external_session_id is None
-            assert loaded.workspace is None
-            assert loaded.git_branch is None
-            assert loaded.session_state is None
-            assert loaded.session_usage is None
+            assert loaded.agent_id is None
 
-    def test_check_constraint_rejects_invalid_kind(self, db_uri: str) -> None:
+    def test_metadata_kind_and_archived(self, db_uri: str) -> None:
+        """kind lives on SqlConversationMetadata; archived on SqlConversation."""
         engine = get_or_create_engine(db_uri)
         managed = make_managed_session_maker(engine)
 
         conv = _make_conversation()
-        # An out-of-range int code must be rejected by ck_conversations_kind.
-        conv.kind = 99
+        meta = _make_metadata(kind="default")
+        with managed() as session:
+            session.add(conv)
+            session.add(meta)
+
+        with managed() as session:
+            loaded_meta = session.get(
+                SqlConversationMetadata, (0, "a9930027fd3e2e979e65844f7af7bf88")
+            )
+            assert loaded_meta is not None
+            assert loaded_meta.kind == encode_conversation_kind("default")
+            loaded_conv = session.get(SqlConversation, (0, "a9930027fd3e2e979e65844f7af7bf88"))
+            assert loaded_conv is not None
+            assert loaded_conv.archived is False
+
+    def test_metadata_check_constraint_rejects_invalid_kind(self, db_uri: str) -> None:
+        engine = get_or_create_engine(db_uri)
+        managed = make_managed_session_maker(engine)
+
+        meta = _make_metadata()
+        meta.kind = 99  # out-of-range — rejected by ck_conversation_metadata_kind
         with pytest.raises((IntegrityError, OperationalError)):
             with managed() as session:
-                session.add(conv)
+                session.add(meta)
 
     def test_sub_agent_kind(self, db_uri: str) -> None:
         engine = get_or_create_engine(db_uri)
         managed = make_managed_session_maker(engine)
 
-        parent = _make_conversation(id="conv_parent")
+        parent = _make_conversation(id="ead6d59a6b650d19dbdf61ec32426f4e")
+        parent_meta = _make_metadata(id="ead6d59a6b650d19dbdf61ec32426f4e", kind="default")
         child = _make_conversation(
-            id="conv_child",
-            kind="sub_agent",
-            parent_conversation_id="conv_parent",
-            root_conversation_id="conv_parent",
+            id="ff5cac23d0beb79fad914046049f32ff",
+            parent_conversation_id="ead6d59a6b650d19dbdf61ec32426f4e",
+            root_conversation_id="ead6d59a6b650d19dbdf61ec32426f4e",
             title="summarizer",
         )
+        child_meta = _make_metadata(id="ff5cac23d0beb79fad914046049f32ff", kind="sub_agent")
         with managed() as session:
             session.add(parent)
+            session.add(parent_meta)
             session.add(child)
+            session.add(child_meta)
 
         with managed() as session:
-            loaded = session.get(SqlConversation, (0, "conv_child"))
+            loaded = session.get(SqlConversation, (0, "ff5cac23d0beb79fad914046049f32ff"))
             assert loaded is not None
-            assert loaded.kind == encode_conversation_kind("sub_agent")
-            assert loaded.parent_conversation_id == "conv_parent"
-            assert loaded.root_conversation_id == "conv_parent"
+            assert loaded.parent_conversation_id == "ead6d59a6b650d19dbdf61ec32426f4e"
+            assert loaded.root_conversation_id == "ead6d59a6b650d19dbdf61ec32426f4e"
+            loaded_meta = session.get(
+                SqlConversationMetadata, (0, "ff5cac23d0beb79fad914046049f32ff")
+            )
+            assert loaded_meta is not None
+            assert loaded_meta.kind == encode_conversation_kind("sub_agent")
 
     def test_delete_parent_leaves_children_without_fk(self, db_uri: str) -> None:
         """Without DB-level FK cascade, deleting a parent leaves child rows intact.
@@ -407,12 +450,11 @@ class TestSqlConversation:
         engine = get_or_create_engine(db_uri)
         managed = make_managed_session_maker(engine)
 
-        parent = _make_conversation(id="conv_parent2")
+        parent = _make_conversation(id="14e0b0bdc49cbf48b2f92ba938beadb9")
         child = _make_conversation(
-            id="conv_child2",
-            kind="sub_agent",
-            parent_conversation_id="conv_parent2",
-            root_conversation_id="conv_parent2",
+            id="6dbb0cf5f866fe63f24768195cc85646",
+            parent_conversation_id="14e0b0bdc49cbf48b2f92ba938beadb9",
+            root_conversation_id="14e0b0bdc49cbf48b2f92ba938beadb9",
             title="child",
         )
         with managed() as session:
@@ -420,13 +462,15 @@ class TestSqlConversation:
             session.add(child)
 
         with managed() as session:
-            p = session.get(SqlConversation, (0, "conv_parent2"))
+            p = session.get(SqlConversation, (0, "14e0b0bdc49cbf48b2f92ba938beadb9"))
             assert p is not None
             session.delete(p)
 
         # Without FK cascade the child is NOT automatically deleted.
         with managed() as session:
-            assert session.get(SqlConversation, (0, "conv_child2")) is not None
+            assert (
+                session.get(SqlConversation, (0, "6dbb0cf5f866fe63f24768195cc85646")) is not None
+            )
 
 
 # ── SqlConversationItem ───────────────────────────────
@@ -439,14 +483,23 @@ class TestSqlConversationItem:
 
         conv = _make_conversation()
         item = _make_item()
+        item_created_at = item.created_at
         with managed() as session:
             session.add(conv)
             session.add(item)
 
         with managed() as session:
-            loaded = session.get(SqlConversationItem, (0, "conv_test1", "msg_test1"))
+            loaded = session.get(
+                SqlConversationItem,
+                (
+                    0,
+                    "a9930027fd3e2e979e65844f7af7bf88",
+                    "a47da81d0587d7c42e53978d629c5ab8",
+                    item_created_at,
+                ),
+            )
             assert loaded is not None
-            assert loaded.conversation_id == "conv_test1"
+            assert loaded.conversation_id == "a9930027fd3e2e979e65844f7af7bf88"
             assert loaded.type == encode_item_type("message")
             assert loaded.position == 0
             assert loaded.status == encode_item_status("completed")
@@ -458,8 +511,8 @@ class TestSqlConversationItem:
         managed = make_managed_session_maker(engine)
 
         conv = _make_conversation()
-        item1 = _make_item(id="msg_1", position=0)
-        item2 = _make_item(id="msg_2", position=0)
+        item1 = _make_item(id="9980c8a9248139f14f4165e5d53088aa", position=0)
+        item2 = _make_item(id="0fd4e86b2daa009cd9929641dbd7dab6", position=0)
 
         with pytest.raises(IntegrityError):
             with managed() as session:
@@ -476,20 +529,35 @@ class TestSqlConversationItem:
         engine = get_or_create_engine(db_uri)
         managed = make_managed_session_maker(engine)
 
-        conv = _make_conversation(id="conv_del")
-        item = _make_item(id="msg_del", conversation_id="conv_del")
+        conv = _make_conversation(id="553a265445caf1cdb034abe0b449485d")
+        item = _make_item(
+            id="79770462a714e18289f416144611383e",
+            conversation_id="553a265445caf1cdb034abe0b449485d",
+        )
+        item_created_at = item.created_at
         with managed() as session:
             session.add(conv)
             session.add(item)
 
         with managed() as session:
-            c = session.get(SqlConversation, (0, "conv_del"))
+            c = session.get(SqlConversation, (0, "553a265445caf1cdb034abe0b449485d"))
             assert c is not None
             session.delete(c)
 
         # Without FK cascade the item is NOT automatically deleted.
         with managed() as session:
-            assert session.get(SqlConversationItem, (0, "conv_del", "msg_del")) is not None
+            assert (
+                session.get(
+                    SqlConversationItem,
+                    (
+                        0,
+                        "553a265445caf1cdb034abe0b449485d",
+                        "79770462a714e18289f416144611383e",
+                        item_created_at,
+                    ),
+                )
+                is not None
+            )
 
     def test_multiple_items_ordered_by_position(self, db_uri: str) -> None:
         engine = get_or_create_engine(db_uri)
@@ -499,12 +567,12 @@ class TestSqlConversationItem:
         with managed() as session:
             session.add(conv)
             for i in range(5):
-                session.add(_make_item(id=f"msg_{i}", position=i))
+                session.add(_make_item(id=f"{i:032x}", position=i))
 
         with managed() as session:
             items = (
                 session.query(SqlConversationItem)
-                .filter_by(conversation_id="conv_test1")
+                .filter_by(conversation_id="a9930027fd3e2e979e65844f7af7bf88")
                 .order_by(SqlConversationItem.position)
                 .all()
             )
@@ -522,7 +590,7 @@ class TestSqlConversationLabel:
 
         conv = _make_conversation()
         label = SqlConversationLabel(
-            conversation_id="conv_test1",
+            conversation_id="a9930027fd3e2e979e65844f7af7bf88",
             key="sensitivity",
             value="confidential",
             updated_at=_now(),
@@ -534,7 +602,7 @@ class TestSqlConversationLabel:
         with managed() as session:
             loaded = (
                 session.query(SqlConversationLabel)
-                .filter_by(conversation_id="conv_test1", key="sensitivity")
+                .filter_by(conversation_id="a9930027fd3e2e979e65844f7af7bf88", key="sensitivity")
                 .one()
             )
             assert loaded.value == "confidential"
@@ -548,18 +616,26 @@ class TestSqlConversationLabel:
             session.add(conv)
             session.add(
                 SqlConversationLabel(
-                    conversation_id="conv_test1", key="k1", value="v1", updated_at=_now()
+                    conversation_id="a9930027fd3e2e979e65844f7af7bf88",
+                    key="k1",
+                    value="v1",
+                    updated_at=_now(),
                 )
             )
             session.add(
                 SqlConversationLabel(
-                    conversation_id="conv_test1", key="k2", value="v2", updated_at=_now()
+                    conversation_id="a9930027fd3e2e979e65844f7af7bf88",
+                    key="k2",
+                    value="v2",
+                    updated_at=_now(),
                 )
             )
 
         with managed() as session:
             labels = (
-                session.query(SqlConversationLabel).filter_by(conversation_id="conv_test1").all()
+                session.query(SqlConversationLabel)
+                .filter_by(conversation_id="a9930027fd3e2e979e65844f7af7bf88")
+                .all()
             )
             assert len(labels) == 2
 
@@ -578,14 +654,16 @@ class TestSqlSessionPermission:
 
         perm = SqlSessionPermission(
             user_id="alice@example.com",
-            conversation_id="conv_test1",
+            conversation_id="a9930027fd3e2e979e65844f7af7bf88",
             level=2,
         )
         with managed() as session:
             session.add(perm)
 
         with managed() as session:
-            loaded = session.get(SqlSessionPermission, (0, "alice@example.com", "conv_test1"))
+            loaded = session.get(
+                SqlSessionPermission, (0, "alice@example.com", "a9930027fd3e2e979e65844f7af7bf88")
+            )
             assert loaded is not None
             assert loaded.level == 2
 
@@ -599,7 +677,7 @@ class TestSqlSessionPermission:
 
         perm = SqlSessionPermission(
             user_id="bob@example.com",
-            conversation_id="conv_test1",
+            conversation_id="a9930027fd3e2e979e65844f7af7bf88",
             level=99,
         )
         with pytest.raises((IntegrityError, OperationalError)):
@@ -617,8 +695,8 @@ class TestSqlComment:
 
         now = _now()
         comment = SqlComment(
-            id="cmt_test1",
-            conversation_id="conv_test1",
+            id="cccccccccccccccccccccccccccccc01",
+            conversation_id="a9930027fd3e2e979e65844f7af7bf88",
             path="src/App.tsx",
             start_index=10,
             end_index=20,
@@ -635,7 +713,7 @@ class TestSqlComment:
             session.add(comment)
 
         with managed() as session:
-            loaded = session.get(SqlComment, (0, "cmt_test1"))
+            loaded = session.get(SqlComment, (0, "cccccccccccccccccccccccccccccc01"))
             assert loaded is not None
             assert loaded.path == "src/App.tsx"
             assert loaded.body == "Looks good!"
@@ -649,8 +727,8 @@ class TestSqlComment:
 
         now = _now()
         comment = SqlComment(
-            id="cmt_test2",
-            conversation_id="conv_test1",
+            id="cccccccccccccccccccccccccccccc02",
+            conversation_id="a9930027fd3e2e979e65844f7af7bf88",
             path="README.md",
             start_index=0,
             end_index=5,
@@ -665,7 +743,7 @@ class TestSqlComment:
             session.add(comment)
 
         with managed() as session:
-            loaded = session.get(SqlComment, (0, "cmt_test2"))
+            loaded = session.get(SqlComment, (0, "cccccccccccccccccccccccccccccc02"))
             assert loaded is not None
             assert loaded.anchor_content is None
             assert loaded.created_by is None
@@ -680,7 +758,7 @@ class TestSqlPolicy:
         managed = make_managed_session_maker(engine)
 
         policy = SqlPolicy(
-            id="pol_test1",
+            id="21cbc70e914e5189cd9a57cf7d91eaba",
             name="cost-guard",
             scope=encode_policy_scope("default"),
             created_at=_now(),
@@ -692,7 +770,7 @@ class TestSqlPolicy:
             session.add(policy)
 
         with managed() as session:
-            loaded = session.get(SqlPolicy, (0, "pol_test1"))
+            loaded = session.get(SqlPolicy, (0, "21cbc70e914e5189cd9a57cf7d91eaba"))
             assert loaded is not None
             assert loaded.name == "cost-guard"
             # The column default stamps sha256(name) on INSERT.
@@ -708,18 +786,18 @@ class TestSqlPolicy:
 
         conv = _make_conversation()
         p1 = SqlPolicy(
-            id="pol_1",
+            id="12a6858438cb1aa1b9e00dc79bb04dd9",
             name="guard",
-            session_id="conv_test1",
+            session_id="a9930027fd3e2e979e65844f7af7bf88",
             scope=encode_policy_scope("session"),
             created_at=_now(),
             type=encode_policy_type("python"),
             handler="mod:fn",
         )
         p2 = SqlPolicy(
-            id="pol_2",
+            id="532212bcd2f88d1ad1a0072b5a78a740",
             name="guard",
-            session_id="conv_test1",
+            session_id="a9930027fd3e2e979e65844f7af7bf88",
             scope=encode_policy_scope("session"),
             created_at=_now(),
             type=encode_policy_type("python"),
@@ -744,7 +822,7 @@ class TestSqlHost:
         host = SqlHost(
             owner="corey@example.com",
             name="corey-laptop",
-            host_id="host_abc123",
+            host_id="4f64b6ee625f4e8259185c35c6e63f3d",
             status=encode_host_status("online"),
             created_at=now,
             updated_at=now,
@@ -753,9 +831,9 @@ class TestSqlHost:
             session.add(host)
 
         with managed() as session:
-            loaded = session.get(SqlHost, (0, "host_abc123"))
+            loaded = session.get(SqlHost, (0, "4f64b6ee625f4e8259185c35c6e63f3d"))
             assert loaded is not None
-            assert loaded.host_id == "host_abc123"
+            assert loaded.host_id == "4f64b6ee625f4e8259185c35c6e63f3d"
             assert loaded.status == encode_host_status("online")
             assert loaded.token_hash is None
             assert loaded.sandbox_provider is None
@@ -783,7 +861,7 @@ class TestSqlHost:
         h1 = SqlHost(
             owner="a@x.com",
             name="h1",
-            host_id="host_dup",
+            host_id="2690ed5ead1b05791d642d85e6847680",
             status=encode_host_status("online"),
             created_at=now,
             updated_at=now,
@@ -795,7 +873,7 @@ class TestSqlHost:
         h2 = SqlHost(
             owner="b@x.com",
             name="h2",
-            host_id="host_dup",
+            host_id="2690ed5ead1b05791d642d85e6847680",
             status=encode_host_status("offline"),
             created_at=now,
             updated_at=now,

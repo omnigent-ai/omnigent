@@ -688,7 +688,9 @@ def test_repl_full_session_lifecycle(
     try:
         _wait_ready(child)
         result = _drive_turn(child, "SESSION_LIFECYCLE_OK", mock_llm_server_url)
-        assert result.session_id.startswith("conv_")
+        # Conversation ids are bare 32-char hex (stored in a Uuid16 column);
+        # runner ids keep their runtime ``runner_`` prefix (not a DB id).
+        assert re.fullmatch(r"[0-9a-f]{32}", result.session_id)
         assert result.runner_id.startswith("runner_")
 
         submit_prompt(child, "/history")

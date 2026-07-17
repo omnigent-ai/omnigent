@@ -32,4 +32,6 @@ ALL_PROBES: list[CapabilityProbe] = [
     InterruptProbe(),
 ]
 
-__all__ = ["ALL_PROBES", "CapabilityProbe"]
+PROBES_BY_NAME: dict[str, CapabilityProbe] = {probe.name: probe for probe in ALL_PROBES}
+
+__all__ = ["ALL_PROBES", "PROBES_BY_NAME", "CapabilityProbe"]

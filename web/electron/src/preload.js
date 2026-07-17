@@ -53,6 +53,25 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
     return () => ipcRenderer.removeListener("omnigent:notification-activated", listener);
   },
   /**
+   * Subscribe to deep-link navigations. When the user clicks an
+   * `omnigent://.../c/<id>` link for a server this window is already on, the
+   * main process sends the in-app path here so the SPA routes to it in-place
+   * (no reload) — same path shape as onNotificationActivated. Returns an
+   * unsubscribe function.
+   * @param {(path: string) => void} callback
+   * @returns {() => void}
+   */
+  onOpenPath: (callback) => {
+    const listener = (_event, path) => {
+      // Defense-in-depth: only forward in-app, same-origin paths. A leading
+      // "/" rejects absolute/cross-origin URLs and `javascript:` shapes before
+      // the renderer routes on the value, even if main ever sends junk.
+      if (typeof path === "string" && path.startsWith("/")) callback(path);
+    };
+    ipcRenderer.on("omnigent:open-path", listener);
+    return () => ipcRenderer.removeListener("omnigent:open-path", listener);
+  },
+  /**
    * Title-bar server picker data: the window's current server origin and the
    * recently-connected server URLs (most recent first). Resolves null on
    * pages that aren't a connected server.
@@ -104,6 +123,26 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * setup page, so a connected server can't repoint the CLI at an arbitrary one.
    */
   resetCliPath: () => ipcRenderer.invoke("omnigent:cli-reset-path"),
+  updates: {
+    getConfig: () => ipcRenderer.invoke("omnigent:get-update-config"),
+    getStatus: () => ipcRenderer.invoke("omnigent:get-update-status"),
+    check: () => ipcRenderer.invoke("omnigent:update-check"),
+    download: () => ipcRenderer.invoke("omnigent:update-download"),
+    installNow: () => ipcRenderer.invoke("omnigent:update-install"),
+    setConfig: (patch) => ipcRenderer.invoke("omnigent:set-update-config", patch),
+    /**
+     * Subscribe to update status changes. The renderer should read getStatus()
+     * first to replay any startup event that fired before subscription.
+     * Returns an unsubscribe function.
+     * @param {(status: unknown) => void} callback
+     * @returns {() => void}
+     */
+    onStatus: (callback) => {
+      const listener = (_event, status) => callback(status);
+      ipcRenderer.on("omnigent:update-status", listener);
+      return () => ipcRenderer.removeListener("omnigent:update-status", listener);
+    },
+  },
 
   // ── Embedded browser pane ──────────────────────────────────────────────
   // The relay hook (web/src/hooks/useBrowserAgentRelay.ts) drives a native

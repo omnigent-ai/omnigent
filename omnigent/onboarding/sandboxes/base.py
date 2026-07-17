@@ -14,6 +14,7 @@ App OAuth dance, host registration) lives in ``bootstrap``.
 
 from __future__ import annotations
 
+import secrets
 import shlex
 from abc import ABC, abstractmethod
 from contextlib import AbstractContextManager
@@ -73,6 +74,81 @@ def host_image_wheel_install_command(remote_tgz_path: str) -> str:
         f"tar xzf {remote_tgz_path} -C oa-wheels --warning=no-unknown-keyword && "
         "pip install --quiet --force-reinstall --no-deps "
         "--no-warn-script-location oa-wheels/*.whl"
+    )
+
+
+# Prefix for the private dir a launcher creates under world-writable ``/tmp``
+# to record the pid of an exec'd foreground process (several providers' SDKs
+# expose no kill handle for exec'd processes, so the pid is recorded and a
+# second exec signals it on detach). The dir carries an unpredictable random
+# suffix and is created mode 700 with a bare ``mkdir`` that fails closed if
+# the path already exists, so a co-tenant on the sandbox can't pre-create,
+# symlink-redirect, or read the pidfile in ``/tmp``.
+_FOREGROUND_RUNDIR_PREFIX: str = "/tmp/oa-foreground-"
+
+
+def foreground_pidfile() -> tuple[str, str]:
+    """Allocate a private, unpredictably-named pidfile under ``/tmp``.
+
+    Used by :meth:`SandboxLauncher.exec_foreground` implementations whose
+    SDK cannot kill an exec'd process through its handle (Modal,
+    CoreWeave, OpenShell). The caller records the remote pid with
+    :func:`foreground_record_prefix` and tears it down with
+    :func:`foreground_kill_command`, both of which operate on the paths
+    returned here.
+
+    The pidfile lives in a fresh dir created ``mode 700`` with a bare
+    ``mkdir`` (no ``-p``) so it **fails closed** if the path already
+    exists — a co-tenant can't pre-seed a symlink we'd write through, nor
+    read our pid back, in the world-writable ``/tmp`` it lives under.
+
+    :returns: A ``(run_dir, pidfile)`` pair of absolute ``/tmp`` paths.
+        ``run_dir`` is ``/tmp/oa-foreground-<32 hex chars>`` and
+        ``pidfile`` is ``<run_dir>/pid``.
+    """
+    run_dir = f"{_FOREGROUND_RUNDIR_PREFIX}{secrets.token_hex(16)}"
+    return run_dir, f"{run_dir}/pid"
+
+
+def foreground_record_prefix(pidfile: str) -> str:
+    """Shell prefix that creates the run dir and records the shell pid.
+
+    ``mkdir -m 700`` (no ``-p``) fails closed if the path exists, and
+    ``echo $$`` writes the shell pid before the caller swaps in the real
+    command via ``exec`` (which keeps the pid across the swap). Both
+    paths are :func:`shlex.quote`-d before interpolation so the function
+    stays safe even if a future caller passes a non-hex path; the
+    standard hex paths from :func:`foreground_pidfile` quote harmlessly.
+
+    :param pidfile: The pidfile path returned by :func:`foreground_pidfile`.
+    :returns: A shell fragment such as ``"mkdir -m 700 /tmp/… && echo $$ > /tmp/…/pid && "``
+        to prepend before the foreground command.
+    """
+    run_dir = pidfile.rsplit("/", 1)[0]
+    q_dir = shlex.quote(run_dir)
+    q_pid = shlex.quote(pidfile)
+    return f"mkdir -m 700 {q_dir} && echo $$ > {q_pid} && "
+
+
+def foreground_kill_command(pidfile: str) -> str:
+    """Shell command that signals the recorded pid and drops the run dir.
+
+    Only a fully-numeric pid read back from the private pidfile is ever
+    signalled — the ``case`` rejects empty and non-numeric content, so
+    unvalidated file contents never reach ``kill``. The run dir is then
+    removed so a successful foreground run leaves nothing behind in
+    ``/tmp``.
+
+    :param pidfile: The pidfile path returned by :func:`foreground_pidfile`.
+    :returns: A self-contained shell command string for a second exec.
+    """
+    run_dir = pidfile.rsplit("/", 1)[0]
+    q_dir = shlex.quote(run_dir)
+    q_pid = shlex.quote(pidfile)
+    return (
+        f"pid=$(cat {q_pid} 2>/dev/null); "
+        f'case "$pid" in ""|*[!0-9]*) ;; *) kill "$pid" 2>/dev/null ;; esac; '
+        f"rm -rf {q_dir}"
     )
 
 
@@ -244,12 +320,16 @@ class SandboxLauncher(ABC):
         Start ``omnigent host`` in the sandbox and return the workspace path.
 
         The default is the EXEC model: probe ``$HOME``, create
-        ``<HOME>/workspace``, optionally clone the repository into it, and start
-        the host detached (``setsid``-backgrounded, identity + token in the
-        process environment) — all driven through :meth:`run` /
-        :meth:`run_background`. It is shared by every provider whose sandbox is a
-        bare box the server execs into (Modal, Daytona, …); entrypoint-as-host
-        providers (e.g. Kubernetes, whose Pod boots running the host) override it.
+        ``<HOME>/workspace``, optionally materialize the repository into it (via
+        :meth:`materialize_workspace`, which clones by default), and start the
+        host detached (``setsid``-backgrounded, identity + token in the process
+        environment) — all driven through :meth:`run` / :meth:`run_background`.
+        It is shared by every provider whose sandbox is a bare box the server
+        execs into (Modal, Daytona, …); entrypoint-as-host providers (e.g.
+        Kubernetes, whose Pod boots running the host) override it. A provider
+        that only needs to change how the repository is obtained (resolve a local
+        checkout instead of cloning) overrides :meth:`materialize_workspace`
+        alone.
 
         The launch token is registered before this call, so the host
         authenticates the moment it dials back. The ``repo_*`` arguments arrive
@@ -287,28 +367,14 @@ class SandboxLauncher(ABC):
         workspace = f"{home}/workspace"
         self.run(sandbox_id, f"mkdir -p {shlex.quote(workspace)}")
         if repo_url is not None:
-            if on_stage is not None:
-                on_stage("cloning")
-            clone_dir = f"{workspace}/{repo_name}"
-            branch_args = (
-                f"--branch {shlex.quote(repo_branch)} --single-branch "
-                if repo_branch is not None
-                else ""
+            workspace = self.materialize_workspace(
+                sandbox_id,
+                workspace=workspace,
+                repo_url=repo_url,
+                repo_branch=repo_branch,
+                repo_name=repo_name,
+                on_stage=on_stage,
             )
-            try:
-                self.run(
-                    sandbox_id,
-                    f"git clone {branch_args}-- {shlex.quote(repo_url)} {shlex.quote(clone_dir)}",
-                )
-            except click.ClickException as exc:
-                # Provider boundary: re-raise with the repository named so the
-                # create-session 502 says WHAT failed to clone, not just that a
-                # sandbox command exited non-zero.
-                raise click.ClickException(
-                    f"failed to clone repository '{repo_url}'"
-                    f"{f' (branch {repo_branch!r})' if repo_branch else ''}: {exc.message}"
-                ) from exc
-            workspace = clone_dir
         # "starting" covers from here through host registration — the caller's
         # online poll resolves it.
         if on_stage is not None:
@@ -326,6 +392,77 @@ class SandboxLauncher(ABC):
             f"{env_prefix} omnigent host --server {shlex.quote(server_url)}",
         )
         return workspace
+
+    def materialize_workspace(
+        self,
+        sandbox_id: str,
+        *,
+        workspace: str,
+        repo_url: str,
+        repo_branch: str | None,
+        repo_name: str | None,
+        on_stage: Callable[[str], None] | None = None,
+    ) -> str:
+        """
+        Materialize the requested repository into the sandbox and return the
+        working directory the host should start in.
+
+        Override point for how a repository *identity* becomes an on-disk
+        checkout. The default is the EXEC model — ``git clone`` the URL into
+        ``<workspace>/<repo_name>`` via :meth:`run` — shared by every provider
+        whose sandbox is a bare box with outbound git access (Modal, Daytona,
+        E2B, …). Providers whose sandbox already carries the repository (a
+        pre-provisioned checkout, a local mirror, a cached worktree) override
+        this to *resolve* the identity to that local path instead of cloning,
+        without having to reimplement :meth:`start_host`. Called by
+        :meth:`start_host` only when ``repo_url`` is set, after ``<workspace>``
+        has been created and before the host launches.
+
+        The ``repo_*`` arguments are the same repository identity
+        :meth:`start_host` received (the server's ``RepoWorkspace`` unpacked into
+        primitives, so this onboarding-layer method carries no server
+        dependency). An override is free to interpret ``repo_url`` as an identity
+        to map to a local checkout rather than a URL to fetch.
+
+        :param sandbox_id: The sandbox from :meth:`provision`.
+        :param workspace: The already-created workspace root, e.g.
+            ``"/root/workspace"``.
+        :param repo_url: Repository clone URL (or, for a resolving override, the
+            repository identity), e.g. ``"https://github.com/org/repo"``.
+        :param repo_branch: Branch to check out, or ``None`` for the default
+            branch.
+        :param repo_name: Directory the checkout lands in under *workspace*, or
+            ``None``.
+        :param on_stage: Progress observer; the default invokes it with
+            ``"cloning"`` before the clone. Runs on this (worker) thread, so it
+            must be thread-safe. ``None`` disables progress reporting.
+        :returns: The absolute in-sandbox path the host should start in (the
+            checkout directory).
+        :raises click.ClickException: If materialization fails (e.g. the clone
+            fails).
+        """
+        if on_stage is not None:
+            on_stage("cloning")
+        clone_dir = f"{workspace}/{repo_name}"
+        branch_args = (
+            f"--branch {shlex.quote(repo_branch)} --single-branch "
+            if repo_branch is not None
+            else ""
+        )
+        try:
+            self.run(
+                sandbox_id,
+                f"git clone {branch_args}-- {shlex.quote(repo_url)} {shlex.quote(clone_dir)}",
+            )
+        except click.ClickException as exc:
+            # Provider boundary: re-raise with the repository named so the
+            # create-session 502 says WHAT failed to clone, not just that a
+            # sandbox command exited non-zero.
+            raise click.ClickException(
+                f"failed to clone repository '{repo_url}'"
+                f"{f' (branch {repo_branch!r})' if repo_branch else ''}: {exc.message}"
+            ) from exc
+        return clone_dir
 
     def attach(self, sandbox_id: str) -> None:
         """
@@ -523,6 +660,20 @@ class SandboxLauncher(ABC):
         :raises click.ClickException: If the resume fails.
         """
         raise self._capability_error("resume a stopped sandbox")
+
+    def is_running(self, sandbox_id: str) -> bool | None:
+        """
+        Return whether the provider reports this sandbox as running.
+
+        Optional capability: ``None`` means the launcher cannot cheaply answer
+        and callers should preserve their existing liveness behavior.
+
+        :param sandbox_id: The sandbox to inspect, e.g. ``"sb-a1b2c3"``.
+        :returns: ``True`` when running, ``False`` when not running, or ``None``
+            when the provider status is unknown.
+        """
+        del sandbox_id
+        return None
 
     def exec_foreground(self, sandbox_id: str, command: str) -> int:
         """

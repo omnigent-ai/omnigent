@@ -39,7 +39,6 @@ Env vars read at construction:
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import re
@@ -170,125 +169,6 @@ def _get_conversation_id() -> str | None:
     return None
 
 
-# Keys from the user's ``~/.hermes/config.yaml`` that the per-session
-# HERMES_HOME needs in order to authenticate with the inference provider.
-# Everything else (secrets, security, agent tuning, terminal, etc.) is
-# either irrelevant to a headless Omnigent turn or actively harmful
-# (e.g. ``secrets.bitwarden`` referencing an unset ``BWS_ACCESS_TOKEN``).
-_USER_CONFIG_KEYS = frozenset(
-    {
-        "model",
-        "providers",
-        "fallback_providers",
-        "credential_pool_strategies",
-    }
-)
-
-
-def _load_user_hermes_config() -> dict:
-    """Load inference-relevant keys from the user's ``~/.hermes/config.yaml``.
-
-    Returns a dict containing only the keys Hermes needs to resolve a
-    model and authenticate (see :data:`_USER_CONFIG_KEYS`), or ``{}``
-    when the file is missing or malformed.
-    """
-    user_config = Path.home() / ".hermes" / "config.yaml"
-    if not user_config.is_file():
-        return {}
-    try:
-        import yaml
-
-        full = yaml.safe_load(user_config.read_text()) or {}
-        return {k: v for k, v in full.items() if k in _USER_CONFIG_KEYS}
-    except Exception:  # noqa: BLE001 — catch YAML parse errors, permission errors, etc.
-        _logger.debug("Failed to load user Hermes config at %s", user_config, exc_info=True)
-        return {}
-
-
-def _populate_hermes_home(
-    hermes_home: Path,
-    hook_script_path: str,
-    server_url: str,
-    session_id: str,
-) -> None:
-    """Populate a per-session ``HERMES_HOME`` with policy hook config.
-
-    Creates a ``config.yaml`` that registers the Omnigent policy hook
-    as a ``pre_tool_call`` shell hook, and writes a wrapper script
-    that exports the server env vars before exec-ing the Python hook.
-
-    The user's ``~/.hermes/config.yaml`` model/provider settings are
-    merged into the per-session config so Hermes can authenticate with
-    the inference provider the user configured via ``hermes model``.
-
-    This mirrors how Codex creates a per-session ``CODEX_HOME`` with
-    its own ``config.toml`` — Hermes scopes all state (config, sessions,
-    hooks, allowlist) to ``HERMES_HOME``.
-
-    :param hermes_home: The per-session HERMES_HOME directory.
-    :param hook_script_path: Absolute path to ``hermes_policy_hook.py``.
-    :param server_url: Omnigent server URL.
-    :param session_id: Conversation / session ID for policy evaluation.
-    """
-    hermes_home.mkdir(parents=True, exist_ok=True)
-
-    # Write the wrapper shell script that sets env vars and execs the hook. It
-    # bakes a one-shot auth token + workspace-routing header, so it is
-    # owner-only (0o700) — the secret is never world-readable.
-    from omnigent.native_policy_hook import policy_hook_wrapper_script
-
-    wrapper = hermes_home / "omnigent-policy-hook.sh"
-    wrapper.write_text(policy_hook_wrapper_script(server_url, session_id, hook_script_path))
-    wrapper.chmod(0o700)
-
-    # Start from the user's config so model/provider/auth settings carry over.
-    # Hermes scopes everything to HERMES_HOME, so without this merge it won't
-    # find the inference provider the user configured via ``hermes model``.
-    user_cfg = _load_user_hermes_config()
-    config: dict = {**user_cfg}
-
-    # Layer Omnigent's policy hook config on top.
-    config["hooks_auto_accept"] = True
-    config["hooks"] = {
-        **config.get("hooks", {}),
-        "pre_tool_call": [
-            {
-                "command": str(wrapper),
-                # One day: must match the server's ``ask_timeout`` so
-                # the hook stays alive while the human responds to the
-                # web-UI approval card (ASK policy).
-                "timeout": 86400,
-            },
-        ],
-    }
-
-    config_path = hermes_home / "config.yaml"
-    # Use JSON for YAML-compatible output (JSON is valid YAML).
-    config_path.write_text(json.dumps(config, indent=2) + "\n")
-
-    # Copy the user's .env file if present (carries API keys like
-    # OPENROUTER_API_KEY, OPENAI_API_KEY, etc.).
-    user_env = Path.home() / ".hermes" / ".env"
-    if user_env.is_file():
-        shutil.copy2(user_env, hermes_home / ".env")
-
-    # Copy the user's auth.json if present (carries provider credentials
-    # stored by ``hermes auth`` / ``hermes model``).
-    user_auth = Path.home() / ".hermes" / "auth.json"
-    if user_auth.is_file():
-        shutil.copy2(user_auth, hermes_home / "auth.json")
-
-    # Pre-populate the allowlist so Hermes never prompts for consent.
-    # Hermes' allowlist format is {"approvals": [{"event": ..., "command": ...}]}.
-    allowlist_path = hermes_home / "shell-hooks-allowlist.json"
-    allowlist_data = {
-        "approvals": [
-            {"event": "pre_tool_call", "command": str(wrapper)},
-        ],
-    }
-    allowlist_path.write_text(json.dumps(allowlist_data, indent=2) + "\n")
-
-
 def _build_hermes_args(
     hermes_path: str,
     message: str,
@@ -390,15 +270,19 @@ class HermesExecutor(Executor):
         self._setup_hermes_home()
 
     def _setup_hermes_home(self) -> None:
-        """Create a per-session ``HERMES_HOME`` with Omnigent policy hooks.
+        """Create a per-session ``HERMES_HOME`` with policy hooks and MCP config.
 
         When the Omnigent server URL and conversation ID are available,
-        creates a temp directory with a ``config.yaml`` that registers the
-        Omnigent policy hook as a Hermes ``pre_tool_call`` shell hook.
+        writes a ``config.yaml`` that registers the Omnigent policy hook as a
+        Hermes ``pre_tool_call`` shell hook and an ``mcp_servers.omnigent``
+        entry (``serve-mcp``) exposing Omnigent builtin tools to the model.
         The ``HERMES_HOME`` env var is passed to the subprocess so Hermes
         reads this config instead of the user's ``~/.hermes/``.
 
-        Mirrors how Codex creates a per-session ``CODEX_HOME``.
+        The home stays a private ``mkdtemp`` (0700) so the copied ``.env`` /
+        ``auth.json`` credentials are never on a predictable path. Only the
+        runner<->serve-mcp coordination files live in the deterministic bridge
+        dir, which ``config.yaml`` points ``serve-mcp`` at.
         """
         server_url = os.environ.get("RUNNER_SERVER_URL", "")
         conv_id = _get_conversation_id()
@@ -409,9 +293,18 @@ class HermesExecutor(Executor):
                 conv_id or "(unset)",
             )
             return
+        from omnigent.hermes_native_bridge import (
+            bridge_dir_for_session_id,
+            write_policy_hook_config,
+        )
+
         self._hermes_home = Path(tempfile.mkdtemp(prefix="hermes_home_"))
-        hook_script = str(Path(__file__).with_name("hermes_policy_hook.py"))
-        _populate_hermes_home(self._hermes_home, hook_script, server_url, conv_id)
+        write_policy_hook_config(
+            bridge_dir_for_session_id(conv_id),
+            server_url,
+            conv_id,
+            hermes_home=self._hermes_home,
+        )
         _logger.debug("Hermes per-session home: %s", self._hermes_home)
 
     def _hermes_session_id(self, session_key: str) -> str | None:
@@ -588,7 +481,9 @@ class HermesExecutor(Executor):
     async def close(self) -> None:
         """Release executor-wide resources."""
         self._session_map.clear()
-        # Best-effort cleanup of the per-session HERMES_HOME.
+        # Best-effort cleanup of the HERMES_HOME subdir only; the parent bridge
+        # dir (tool_relay.json, bridge.json) belongs to the runner-hosted relay
+        # and is cleaned up on session delete.
         if self._hermes_home is not None:
             shutil.rmtree(self._hermes_home, ignore_errors=True)
             self._hermes_home = None

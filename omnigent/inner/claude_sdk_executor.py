@@ -71,6 +71,7 @@ from .executor import (
 )
 from .sandbox import (
     create_exec_launcher,
+    get_backend,
     resolve_sandbox,
     with_additional_read_roots,
     with_additional_write_files,
@@ -889,11 +890,45 @@ def _claude_internal_write_files() -> list[pathlib.Path]:
     return [path for path in candidates if path.exists()]
 
 
+def _resolve_sandbox_cwd(spec_cwd: str | None) -> pathlib.Path:
+    """Resolve the sandbox root, rooting relative paths at the session
+    working folder rather than the runner daemon's process cwd.
+
+    A relative ``os_env.cwd`` — notably the default ``"."`` — resolved
+    against ``os.getcwd()`` lands on the runner daemon's ``$HOME`` when
+    no workspace is selected. That both roots the sandbox at the whole
+    home dir and disagrees with the tmux terminal, which uses
+    ``OMNIGENT_RUNNER_WORKSPACE``. Prefer that workspace as the base so
+    the two agree; fall back to the process cwd only when it is unset.
+    An absolute ``spec_cwd`` is honored verbatim.
+
+    :param spec_cwd: The spec's ``os_env.cwd``, or ``None``.
+    :returns: The resolved, absolute sandbox root.
+    """
+    base = os.environ.get("OMNIGENT_RUNNER_WORKSPACE") or os.getcwd()
+    if spec_cwd:
+        path = pathlib.Path(spec_cwd)
+        if not path.is_absolute():
+            path = pathlib.Path(base) / path
+    else:
+        path = pathlib.Path(base)
+    return path.resolve(strict=False)
+
+
 def prepare_claude_cli_path(
     real_cli_path: str | None,
     spec: OSEnvSpec | None,
 ) -> PreparedClaudeCli:
     """Wrap the Claude CLI in the agent's configured sandbox when possible.
+
+    Degrades instead of crashing: when the sandbox can't be resolved or
+    the wrap can't be built (unsupported platform, un-grantable
+    interpreter layout, profile-size overflow), the CLI is returned
+    unwrapped with native tools disabled — the same confinement story
+    as ``OMNIGENT_CLAUDE_SDK_NO_SANDBOX``: file/shell access still goes
+    through the independently sandboxed ``sys_os_*`` helpers (which
+    fail closed on their own), and only the CLI supervisor process
+    runs unwrapped.
 
     :param real_cli_path: Absolute path to the system-installed Claude CLI
         binary, or ``None`` when no CLI is available.
@@ -913,8 +948,18 @@ def prepare_claude_cli_path(
     if sandbox_spec.type == "none":
         return PreparedClaudeCli(cli_path=real_cli_path, enable_native_tools=True)
 
-    cwd = pathlib.Path(spec.cwd or os.getcwd()).resolve(strict=False)
-    sandbox = resolve_sandbox(spec, cwd)
+    cwd = _resolve_sandbox_cwd(spec.cwd)
+    try:
+        sandbox = resolve_sandbox(spec, cwd)
+    except (OSError, NotImplementedError) as exc:
+        logger.warning(
+            "Cannot resolve the configured sandbox for the Claude CLI wrap; "
+            "running the CLI unwrapped with native tools disabled "
+            "(file/shell access stays confined to the sandboxed sys_os_* "
+            "tools): %s",
+            exc,
+        )
+        return PreparedClaudeCli(cli_path=real_cli_path, enable_native_tools=False)
     if not sandbox.active:
         return PreparedClaudeCli(cli_path=real_cli_path, enable_native_tools=False)
     if not sandbox.allow_network:
@@ -925,6 +970,26 @@ def prepare_claude_cli_path(
     sandbox = with_additional_read_roots(sandbox, _claude_internal_write_roots())
     sandbox = with_additional_write_roots(sandbox, _claude_internal_write_roots())
     sandbox = with_additional_write_files(sandbox, _claude_internal_write_files())
+    # Dry-run the spawn-time wrap now, while degrading is still possible.
+    # The real wrap happens later inside run_launcher, where an OSError
+    # (un-grantable interpreter layout, profile-size cap, cwd-scan
+    # overflow) kills the launcher and surfaces as an opaque connect
+    # timeout. By run time native tools are already enabled, so this is
+    # the last point where "skip the wrap" is still safe.
+    try:
+        get_backend(sandbox.backend_type).wrap_launcher_argv(
+            [sys.executable, "-c", "pass"], sandbox, cwd, target=real_cli_path
+        )
+    except OSError as exc:
+        logger.warning(
+            "The configured sandbox cannot wrap the Claude CLI at %s; "
+            "running it unwrapped with native tools disabled (file/shell "
+            "access stays confined to the sandboxed sys_os_* tools). "
+            "Remediation hints in the underlying error: %s",
+            real_cli_path,
+            exc,
+        )
+        return PreparedClaudeCli(cli_path=real_cli_path, enable_native_tools=False)
     return PreparedClaudeCli(
         cli_path=create_exec_launcher(real_cli_path, sandbox),
         enable_native_tools=True,
@@ -965,7 +1030,7 @@ def prepare_tight_cli_process_path(
         ),
     )
     try:
-        resolved_cwd = pathlib.Path(cwd or os.getcwd()).resolve(strict=False)
+        resolved_cwd = _resolve_sandbox_cwd(cwd)
         sandbox = resolve_sandbox(spec, resolved_cwd)
     except (OSError, NotImplementedError) as exc:
         logger.warning(
@@ -1223,6 +1288,9 @@ class ClaudeSDKExecutor(Executor):
         self._clients: dict[str, _ClaudeClientState] = {}
         # Session keys whose Claude harness process crashed and must not be reused.
         self._crashed_sessions: dict[str, str] = {}
+        # Force-close tasks for clients evicted on turn cancellation, kept
+        # referenced so they are not GC'd mid-close.
+        self._cancel_close_tasks: set[asyncio.Task[None]] = set()
 
         # Prefer system-installed claude over the SDK's bundled CLI.
         # The bundled CLI may be older and send beta flags that the
@@ -1469,6 +1537,16 @@ class ClaudeSDKExecutor(Executor):
         # call _force_close_client to flip transport._closed before
         # the loop tears down.
         await self._force_close_client(state.client)
+
+    def _evict_client_on_cancel(self, session_key: str) -> None:
+        state = self._clients.pop(session_key, None)
+        if state is None:
+            return
+        # Close in the background: an await here runs under an in-flight
+        # cancellation and could itself be cancelled, leaking the CLI process.
+        task = asyncio.create_task(self._force_close_client(state.client))
+        self._cancel_close_tasks.add(task)
+        task.add_done_callback(self._cancel_close_tasks.discard)
 
     async def close(self) -> None:
         session_keys = list(self._clients)
@@ -2495,6 +2573,13 @@ class ClaudeSDKExecutor(Executor):
                 if aclose is not None:
                     await aclose()
 
+        except asyncio.CancelledError:
+            # CancelledError is a BaseException, so a watchdog-cancelled turn
+            # skips the boundary below. Evict the wedged client (no crash
+            # mark) so the next turn rebuilds a fresh one and replays history
+            # instead of reusing it and re-tripping the watchdog (#2109).
+            self._evict_client_on_cancel(session_key)
+            raise
         except Exception as exc:  # noqa: BLE001 — top-level executor error boundary; records crash and surfaces to caller
             self._crashed_sessions[session_key] = str(exc)
             await self._close_live_client(session_key)

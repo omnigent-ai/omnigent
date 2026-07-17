@@ -192,3 +192,46 @@ def test_read_skill_file_missing_arguments(
         tool_ctx,
     )
     assert "missing required 'path'" in result_no_path
+
+
+@pytest.mark.parametrize("arguments", ["not-json", "[]"])
+def test_read_skill_file_rejects_invalid_arguments(
+    arguments: str,
+    skill_with_resources: SkillSpec,
+    tool_ctx: ToolContext,
+) -> None:
+    """
+    Malformed or non-object arguments return an error string.
+    """
+    tool = ReadSkillFileTool([skill_with_resources])
+    result = tool.invoke(arguments, tool_ctx)
+
+    assert result.startswith("Error:")
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        (
+            {"skill_name": 123, "path": "references/style-guide.md"},
+            "Error: 'skill_name' must be a string",
+        ),
+        (
+            {"skill_name": "code-review", "path": 123},
+            "Error: 'path' must be a string",
+        ),
+    ],
+)
+def test_read_skill_file_rejects_non_string_arguments(
+    payload: dict[str, object],
+    expected: str,
+    skill_with_resources: SkillSpec,
+    tool_ctx: ToolContext,
+) -> None:
+    """
+    Resource lookup fields must be strings before path handling.
+    """
+    tool = ReadSkillFileTool([skill_with_resources])
+    result = tool.invoke(json.dumps(payload), tool_ctx)
+
+    assert result == expected

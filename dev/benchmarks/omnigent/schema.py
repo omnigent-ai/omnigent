@@ -13,7 +13,7 @@ import platform
 import subprocess
 
 # Incremented on any breaking change to the report document shape below.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def _git(*args: str) -> str:
@@ -63,6 +63,7 @@ def build_report(
     generated_at: str,
     config: dict[str, object],
     harness: str,
+    resource_usage: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """Assemble the full benchmark report document.
 
@@ -75,6 +76,8 @@ def build_report(
         mock_llm) for provenance.
     :param harness: Harness driving full-turn journeys, e.g.
         ``"openai-agents"``.
+    :param resource_usage: Optional server-process CPU/memory stats collected
+        during the run (see :meth:`BenchEnvironment.resource_usage`).
     :returns: The JSON-serializable report document.
     """
     return {
@@ -85,5 +88,6 @@ def build_report(
         "host": host_info(),
         "harness": harness,
         "config": config,
+        "resource_usage": resource_usage or {},
         "journeys": journey_results,
     }

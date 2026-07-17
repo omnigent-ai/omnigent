@@ -632,9 +632,14 @@ describe("computeShowsWorking", () => {
     expect(computeShowsWorking("running", opts({ hasPendingElicitation: true }))).toBe(false);
   });
 
-  it("a known-offline runner suppresses stale working status", () => {
-    expect(computeShowsWorking("running", opts({ runnerOnline: false }))).toBe(false);
-    expect(computeShowsWorking("waiting", opts({ runnerOnline: false }))).toBe(false);
+  it("live running/waiting status wins over a stale offline poll", () => {
+    // The `/health` poll reads stale-offline during the runner's connect
+    // window on a fresh session's first turn (10s poll cadence). A session
+    // actively reporting running/waiting cannot have an offline runner, so its
+    // live status must keep the indicator lit rather than being suppressed by
+    // the lagging poll.
+    expect(computeShowsWorking("running", opts({ runnerOnline: false }))).toBe(true);
+    expect(computeShowsWorking("waiting", opts({ runnerOnline: false }))).toBe(true);
   });
 
   it("unresolved runner health does not suppress active parent work", () => {
@@ -653,9 +658,11 @@ describe("computeShowsWorking", () => {
     expect(computeShowsWorking("idle", opts({ backgroundTaskCount: 0 }))).toBe(false);
   });
 
-  it("a known-offline runner suppresses the indicator even with background shells", () => {
-    // Offline beats every other signal: a stale shell count must not keep a
-    // dead session spinning.
+  it("a known-offline runner suppresses the indicator for an idle session with background shells", () => {
+    // For a session that is NOT actively working, known-offline beats a stale
+    // shell count: a dead session must not keep spinning on a background tally.
+    // (An actively running/waiting session is handled above — its live status
+    // wins over the offline poll.)
     expect(computeShowsWorking("idle", opts({ runnerOnline: false, backgroundTaskCount: 2 }))).toBe(
       false,
     );

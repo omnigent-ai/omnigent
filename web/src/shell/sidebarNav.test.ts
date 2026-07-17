@@ -2,11 +2,14 @@ import { describe, expect, it } from "vitest";
 import type { Conversation } from "@/hooks/useConversations";
 import {
   type ActiveChatOverride,
+  bareConversationId,
   computeNextActiveOverride,
   conversationDisplayLabel,
+  dedupeConversationsById,
   filterConversations,
   getConversationIconKind,
   getConversationAgentType,
+  migratePinnedConversationIds,
   normalizePinnedConversationIds,
   orderByPinnedSequence,
   resolveSidebarDrop,
@@ -115,6 +118,55 @@ describe("pin helpers", () => {
     expect(
       normalizePinnedConversationIds(["conv_a", "missing", "conv_a", "conv_b"], conversations),
     ).toEqual(["conv_a", "conv_b"]);
+  });
+});
+
+describe("bareConversationId", () => {
+  const hex = "0123456789abcdef0123456789abcdef";
+
+  it("strips a legacy prefix down to the bare hex tail", () => {
+    expect(bareConversationId(`conv_${hex}`)).toBe(hex);
+    expect(bareConversationId(`ag_${hex}`)).toBe(hex);
+  });
+
+  it("strips dashes from a canonical uuid and lowercases", () => {
+    expect(bareConversationId("01234567-89AB-CDEF-0123-456789ABCDEF")).toBe(hex);
+  });
+
+  it("is idempotent on an already-bare id", () => {
+    expect(bareConversationId(hex)).toBe(hex);
+  });
+
+  it("leaves a non-uuid value unchanged", () => {
+    expect(bareConversationId("not-a-uuid")).toBe("not-a-uuid");
+  });
+});
+
+describe("migratePinnedConversationIds", () => {
+  const hex = "0123456789abcdef0123456789abcdef";
+
+  it("rewrites legacy prefixed pins to bare hex", () => {
+    expect(migratePinnedConversationIds([`conv_${hex}`])).toEqual([hex]);
+  });
+
+  it("collapses a legacy id and its bare twin into one, keeping order", () => {
+    const other = "fedcba9876543210fedcba9876543210";
+    expect(migratePinnedConversationIds([`conv_${other}`, `conv_${hex}`, hex])).toEqual([
+      other,
+      hex,
+    ]);
+  });
+});
+
+describe("dedupeConversationsById", () => {
+  it("keeps the first occurrence of each id", () => {
+    const first = conversation("conv_a", "list copy", new Date(2026, 4, 14, 9));
+    const dup = conversation("conv_a", "backfill copy", new Date(2026, 4, 14, 8));
+    const other = conversation("conv_b", "B", new Date(2026, 4, 14, 7));
+
+    const deduped = dedupeConversationsById([first, other, dup]);
+    expect(deduped.map((c) => c.id)).toEqual(["conv_a", "conv_b"]);
+    expect(deduped[0].title).toBe("list copy");
   });
 });
 

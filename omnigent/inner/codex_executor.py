@@ -30,8 +30,7 @@ from omnigent.spec.types import RetryPolicy
 from . import _proc
 from ._subprocess_lifecycle import close_subprocess_transport
 from .databricks_executor import (
-    _read_databrickscfg,
-    _read_databrickscfg_host,
+    _databricks_gateway_host,
 )
 from .datamodel import OSEnvSandboxSpec, OSEnvSpec
 from .executor import (
@@ -1209,9 +1208,16 @@ class _CodexAppServerSession:
             return
         self._loop = asyncio.get_running_loop()
         codex_home_root = Path(tempfile.gettempdir())
-        if self._cwd:
-            codex_home_root = Path(self._cwd) / ".codex-tmp"
-            codex_home_root.mkdir(parents=True, exist_ok=True)
+        if self._cwd and self._cwd != "/":
+            try:
+                codex_home_root = Path(self._cwd) / ".codex-tmp"
+                codex_home_root.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                # The cwd may be on a read-only filesystem — e.g. macOS
+                # root ``/`` inherited from a runner whose working
+                # directory was never explicitly set.  Fall back to the
+                # system temp directory so the codex home is still writable.
+                codex_home_root = Path(tempfile.gettempdir())
         self._codex_home_dir = Path(
             tempfile.mkdtemp(prefix="omnigent-codex-home-", dir=str(codex_home_root))
         )
@@ -2173,12 +2179,10 @@ class CodexExecutor(Executor):
             if host is None:
                 # No gateway host supplied directly: derive the transport from
                 # a Databricks profile (the Databricks producer's fallback).
-                creds = _read_databrickscfg(databricks_profile)
-                host = (
-                    creds.host
-                    if creds is not None
-                    else _read_databrickscfg_host(databricks_profile)
-                )
+                # Use the profile's own host so the base URL matches the token
+                # the profile-pinned auth command mints (not a DATABRICKS_HOST
+                # override that would point the base URL at another workspace).
+                host = _databricks_gateway_host(databricks_profile)
                 if not host:
                     raise OSError(
                         "CodexExecutor(gateway=True) requires gateway credentials via "

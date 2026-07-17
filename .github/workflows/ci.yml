@@ -16,6 +16,9 @@ on:
   push:
     branches:
       - main
+      # Release branches: release.yml's green-CI gate reads check runs off the
+      # branch head, so cherry-picks and release-bump commits must run CI.
+      - 'release/v[0-9]*'
     paths-ignore: ['web/**', 'tests/e2e_ui/**', 'CHANGELOG.md']
 
 permissions:

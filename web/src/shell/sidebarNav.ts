@@ -136,6 +136,52 @@ export function togglePinnedConversationId(
   return [conversationId, ...pinnedIds];
 }
 
+// A bare 32-char lowercase-hex conversation id — the shape the API returns now
+// that ids are stored as 16-byte binary uuids (legacy prefixes dropped).
+const BARE_CONVERSATION_ID_RE = /^[0-9a-f]{32}$/i;
+
+// Reduce a possibly-legacy conversation id to the bare hex form the server now
+// emits: drop dashes and any legacy prefix (``conv_``/``ag_``/…) and keep the
+// trailing 32 hex chars, mirroring the id-to-binary DB migration's transform.
+// A value that isn't a uuid tail (hand-crafted junk) is returned unchanged.
+export function bareConversationId(id: string): string {
+  const tail = id.replace(/-/g, "").slice(-32);
+  return BARE_CONVERSATION_ID_RE.test(tail) ? tail.toLowerCase() : id;
+}
+
+// Migrate stored pin ids to the bare-hex form, dropping duplicates that collapse
+// together (a legacy ``conv_<hex>`` and its bare twin). Pins are persisted in
+// localStorage keyed by the conversation id, so ids pinned before the migration
+// still carry the old prefix. Without this, a returning user's pins no longer
+// match the ids the API returns: the pinned session loses its Pinned slot, and
+// the pinned-backfill re-fetches it under the bare id — surfacing a duplicate
+// row alongside the copy already in the loaded list.
+export function migratePinnedConversationIds(ids: readonly string[]): string[] {
+  const seen = new Set<string>();
+  const migrated: string[] = [];
+  for (const id of ids) {
+    const bare = bareConversationId(id);
+    if (seen.has(bare)) continue;
+    seen.add(bare);
+    migrated.push(bare);
+  }
+  return migrated;
+}
+
+// Drop conversations whose id already appeared, keeping the first occurrence.
+// The pinned-backfill fetches a session by id and can return a copy that is
+// also present in the paginated list; merging both would render the row twice.
+export function dedupeConversationsById(conversations: readonly Conversation[]): Conversation[] {
+  const seen = new Set<string>();
+  const deduped: Conversation[] = [];
+  for (const conversation of conversations) {
+    if (seen.has(conversation.id)) continue;
+    seen.add(conversation.id);
+    deduped.push(conversation);
+  }
+  return deduped;
+}
+
 // Order pinned conversations by when they were pinned, not by `updated_at` —
 // a pinned session holds its slot even when a new message bumps its
 // `updated_at`. `pinnedIds` is kept most-recently-pinned-first (see
