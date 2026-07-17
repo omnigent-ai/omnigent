@@ -31,6 +31,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import math
 import os
 import queue
 import re
@@ -101,7 +102,16 @@ _TOOLS_CHANGED_READY_TIMEOUT_S = 30.0
 _TOOLS_CHANGED_POST_TIMEOUT_S = 10.0
 # Ceiling the relay HTTP handler (``_run_relay_tool``) waits for a single
 # tool dispatch to complete on the harness event loop.
-_TOOL_CALL_TIMEOUT_S = 300.0
+_TOOL_CALL_TIMEOUT_ENV = "HARNESS_TOOL_RELAY_TIMEOUT_S"
+# Parsing is import-time and fail-loud so a malformed value aborts the child.
+try:
+    _TOOL_CALL_TIMEOUT_S = float(os.environ.get(_TOOL_CALL_TIMEOUT_ENV, "300"))
+except ValueError as exc:
+    raise ValueError(
+        f"{_TOOL_CALL_TIMEOUT_ENV} must be a positive finite number of seconds"
+    ) from exc
+if not math.isfinite(_TOOL_CALL_TIMEOUT_S) or _TOOL_CALL_TIMEOUT_S <= 0:
+    raise ValueError(f"{_TOOL_CALL_TIMEOUT_ENV} must be a positive finite number of seconds")
 # Timeout for the bridge's POST to the active-turn relay server
 # (``_call_relay_tool``). This is the OUTER hop: it waits for the relay
 # handler's entire ``_TOOL_CALL_TIMEOUT_S`` dispatch, which itself fans out
@@ -1084,6 +1094,10 @@ def build_mcp_config(bridge_dir: Path, *, python_executable: str | None = None) 
     :returns: JSON-serializable Claude MCP config.
     """
     python = python_executable or sys.executable
+    mcp_env = {"PYTHONUNBUFFERED": "1"}
+    # MCP launchers may filter ambient env, so carry an explicit resolved override.
+    if _TOOL_CALL_TIMEOUT_ENV in os.environ:
+        mcp_env[_TOOL_CALL_TIMEOUT_ENV] = str(_TOOL_CALL_TIMEOUT_S)
     return {
         "mcpServers": {
             _MCP_SERVER_NAME: {
@@ -1096,9 +1110,7 @@ def build_mcp_config(bridge_dir: Path, *, python_executable: str | None = None) 
                     "--bridge-dir",
                     str(bridge_dir),
                 ],
-                "env": {
-                    "PYTHONUNBUFFERED": "1",
-                },
+                "env": mcp_env,
             }
         }
     }
