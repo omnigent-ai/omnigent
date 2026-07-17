@@ -256,11 +256,16 @@ the server's `response.elicitation_request` in one of three ways:
   as radio buttons (or checkboxes for multi-select) with a **Submit** — the
   selected labels are sent back to the agent as its answer, exactly like the
   web UI.
-- **Anything else** (an out-of-band `url`-mode page, or a request for free-form
-  typed input the bot can't collect with buttons): the bot posts a link to
-  resolve the request in the Omnigent web UI, rather than mishandling it. The
-  turn stays alive (via the idle grace window) so it resumes once you answer
-  there.
+- **Free-form input** (a request for typed values the bot can't collect with
+  buttons): the bot posts a link to resolve the request in the Omnigent web UI,
+  rather than mishandling it. The turn stays alive (via the idle grace window)
+  so it resumes once you answer there.
+
+The classification is by the *decision shape*, not the server's delivery mode.
+The server defaults to `url`-mode elicitations (carrying a suggested standalone
+approve page), but the bot still renders a `url`-mode approval or question
+natively and posts the verdict to the resolve endpoint — only genuinely
+uncollectable typed input falls back to the link.
 
 The card is updated in place with the outcome once answered, and the "Working
 on it…" placeholder is cleared while parked so it doesn't sit stale. Multiple
@@ -269,6 +274,19 @@ requests in one turn are handled in order.
 This mirrors the web UI and CLI — the bot consumes `response.elicitation_request`
 and posts the verdict (with any selections as `content`) back to the session's
 resolve endpoint.
+
+While a request is outstanding, the session can't take new input. If the user
+sends another `@mention` (or DM) to that thread before answering, the bot
+privately ("Only visible to you") nudges them to respond to the pending request
+first, rather than silently queueing the message behind it. If they answer the
+request in the web UI instead of clicking the Slack card, the bot notices (it
+polls for external resolution) and continues without waiting. An unanswered
+card gives up after a few minutes so it can't wedge the thread — the user can
+just re-send.
+
+**One at a time per thread.** The bot processes a thread's turns serially. A
+message sent while an earlier turn is still running gets a private "still
+working on your previous message" note, then runs when the prior turn finishes.
 
 **Ordering.** A streamed reply is a single Slack message anchored to the moment
 it opened, so text kept flowing into it would sort *before* any card or notice

@@ -26,9 +26,13 @@ ACTION_FORM_ANSWER = "omnigent_form_answer"
 # submit handler can map each answer back to its question without extra state.
 _QUESTION_BLOCK_PREFIX = "omnigent_q::"
 
-# How long the turn worker waits for a click before giving up. Bounded so a
-# thread's worker can't park forever if the user never answers.
-DEFAULT_ELICITATION_TIMEOUT_SECONDS = 15 * 60
+# How long the turn worker waits for a click before giving up (and declining, so
+# the server-side park releases). Bounded so an unanswered request can't wedge a
+# thread's serial queue for long — later messages wait behind it. Kept short: a
+# user who's engaging answers within a couple of minutes; if they've walked away,
+# failing fast frees the thread (they can re-send). Note this is only the cap —
+# an answer via the web UI unblocks immediately (external-resolution poll).
+DEFAULT_ELICITATION_TIMEOUT_SECONDS = 3 * 60
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,6 +209,7 @@ def resolved_card_blocks(request: ElicitationRequest, *, outcome: str) -> list[d
     icon = {
         "Approved": ":white_check_mark:",
         "Answered": ":white_check_mark:",
+        "Answered elsewhere": ":white_check_mark:",
         "Denied": ":no_entry:",
         "Cancelled": ":no_entry:",
     }.get(outcome, ":hourglass:")

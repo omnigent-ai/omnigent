@@ -7,6 +7,7 @@ from omnigent_slack.approvals import Verdict
 from omnigent_slack.models import ThreadKey, UserConfig
 from omnigent_slack.omnigent import (
     AuthRequiredError,
+    ElicitationRequest,
     HostUnavailableError,
     OmnigentError,
     ServerUnreachableError,
@@ -188,9 +189,28 @@ class FakeOmnigentClient:
         # Rolled-up status the grace window polls at a soft idle; default idle so
         # a turn ends promptly unless a test sets it to "running".
         self.status = "idle"
+        # A pending elicitation the session is parked on, or None. When set, a
+        # new message should be nudged rather than enqueued.
+        self.pending_elicitation: Any = None
+        # Newest assistant message the server would return, for the no-delta
+        # fallback. ``latest_message_id`` pins the id (else each call gets a
+        # fresh id, so the fallback treats it as new relative to the baseline).
+        self.latest_message: str | None = None
+        self.latest_message_id: str | None = None
+        self._latest_calls = 0
+        # Whether an outstanding elicitation is still pending server-side. Default
+        # True so the Slack-click path is exercised; a test sets it False to
+        # simulate the user answering elsewhere (web UI).
+        self.elicitation_pending = True
 
     async def get_session_status(self, session_id: str) -> str | None:
         return self.status
+
+    async def get_pending_elicitation(self, session_id: str) -> Any:
+        return self.pending_elicitation
+
+    async def is_elicitation_pending(self, session_id: str, elicitation_id: str) -> bool:
+        return self.elicitation_pending
 
     async def create_session(self, agent_id: str, title: str) -> str:
         self.created.append((agent_id, title))
@@ -224,8 +244,16 @@ class FakeOmnigentClient:
         }
         yield {"type": "response.completed", "response": {"status": "completed"}}
 
-    async def latest_assistant_text(self, session_id: str) -> str | None:
-        return None
+    async def latest_assistant_message(self, session_id: str) -> tuple[str, str] | None:
+        # (item_id, text) of the newest assistant message, or None. Tests that
+        # exercise the no-delta fallback set ``latest_message``; the id must
+        # differ from the pre-turn baseline for the fallback to fire, so a
+        # counter makes each call's id unique unless a test pins it.
+        if self.latest_message is None:
+            return None
+        self._latest_calls += 1
+        item_id = self.latest_message_id or f"msg-{self._latest_calls}"
+        return (item_id, self.latest_message)
 
     async def resolve_elicitation(
         self,
@@ -609,9 +637,6 @@ async def test_turn_error_without_answer_finalizes_with_error(tmp_path: Path) ->
                 "response": {"error": {"message": "boom"}},
             }
 
-        async def latest_assistant_text(self, session_id: str) -> str | None:
-            return None
-
     omnigent = ErroringNoAnswerClient()
     service, _pool, _setup = _service(store, omnigent)
     await _configure_user(store, "T1", "U1")
@@ -815,6 +840,101 @@ async def test_direct_message_reply_reuses_existing_session(tmp_path: Path) -> N
     assert omnigent.created == []
     assert omnigent.bound == []
     assert omnigent.turns == [("conv_existing", "follow up")]
+
+
+async def test_message_while_awaiting_input_nudges_and_does_not_run(tmp_path: Path) -> None:
+    # The session is parked on a pending elicitation. A new message can't
+    # proceed until it's answered, so the bot privately nudges the user to
+    # respond to the pending request first and does NOT submit the message.
+    store = await _store(tmp_path)
+    key = ThreadKey(team_id="T1", channel_id="D1", thread_ts="100.1")
+    await store.upsert_session(key, "conv_existing", "title", owner_user_id="U1")
+    slack = FakeSlackClient()
+    omnigent = FakeOmnigentClient()
+    omnigent.pending_elicitation = ElicitationRequest(
+        elicitation_id="elicit_pending", message="Approve?", session_id="conv_existing"
+    )
+    service, _pool, _setup = _service(store, omnigent)
+
+    await service.handle_message(
+        body={"team_id": "T1", "event_id": "Ev2"},
+        event={
+            "channel": "D1",
+            "channel_type": "im",
+            "thread_ts": "100.1",
+            "ts": "101.1",
+            "user": "U1",
+            "text": "another request",
+        },
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await service.shutdown()
+
+    # The message was not submitted; the user got a private nudge.
+    assert omnigent.turns == []
+    assert len(slack.ephemerals) == 1
+    notice = slack.ephemerals[0]
+    assert notice["user"] == "U1"
+    assert "waiting on your response" in notice["text"].lower()
+
+
+async def test_second_message_while_turn_running_is_notified_as_queued(tmp_path: Path) -> None:
+    # A message arriving while an earlier turn is still running (not parked on an
+    # elicitation) queues behind it. The bot privately tells the user it's queued
+    # rather than leaving them with no feedback.
+    store = await _store(tmp_path)
+    key = ThreadKey(team_id="T1", channel_id="D1", thread_ts="100.1")
+    await store.upsert_session(key, "conv_existing", "title", owner_user_id="U1")
+    slack = FakeSlackClient()
+
+    release = asyncio.Event()
+
+    class BlockingClient(FakeOmnigentClient):
+        async def run_turn(
+            self,
+            session_id: str,
+            text: str,
+            *,
+            workspace: str | None = None,
+            host_id: str | None = None,
+        ) -> AsyncIterator[dict[str, Any]]:
+            self.turns.append((session_id, text))
+            await release.wait()  # hold the first turn open
+            yield {"type": "session.status", "status": "idle"}
+
+    omnigent = BlockingClient()
+    service, _pool, _setup = _service(store, omnigent)
+
+    async def _send(text: str, ts: str, event_id: str) -> None:
+        await service.handle_message(
+            body={"team_id": "T1", "event_id": event_id},
+            event={
+                "channel": "D1",
+                "channel_type": "im",
+                "thread_ts": "100.1",
+                "ts": ts,
+                "user": "U1",
+                "text": text,
+            },
+            client=slack,
+            context={"bot_user_id": "B1"},
+        )
+
+    await _send("first", "101.1", "Ev1")
+    # Wait until the first turn is actually running (worker busy).
+    for _ in range(100):
+        if omnigent.turns:
+            break
+        await asyncio.sleep(0.02)
+    await _send("second", "102.1", "Ev2")
+
+    # The second message got a "queued" ephemeral; let the first turn finish.
+    queued = [e for e in slack.ephemerals if "still working on your previous" in e["text"].lower()]
+    assert len(queued) == 1
+    assert queued[0]["user"] == "U1"
+    release.set()
+    await service.shutdown()
 
 
 async def test_direct_message_with_bot_mention_is_handled(tmp_path: Path) -> None:
@@ -1359,6 +1479,92 @@ async def test_tool_approval_deny_forwards_decline(tmp_path: Path) -> None:
     assert "Denied" in slack.updates[-1]["blocks"][0]["text"]["text"]
 
 
+async def test_elicitation_resolved_externally_unblocks_without_verdict(tmp_path: Path) -> None:
+    # The user answers the request in the web UI instead of clicking the Slack
+    # card. The worker must stop waiting (once the server shows it no longer
+    # pending) and NOT post its own verdict — otherwise it blocks to the
+    # coordinator timeout and wedges the thread's serial queue.
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    omnigent = ApprovalClient()
+    service, _pool, _setup = _service(store, omnigent)
+    service._external_resolve_poll_seconds = 0.02  # type: ignore[attr-defined]
+    await _configure_user(store, "T1", "U1")
+
+    # User will answer elsewhere; the card click never comes.
+    omnigent.elicitation_pending = False
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> edit"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    # Wait for the card to be updated with the outcome (the external-resolve path).
+    for _ in range(100):
+        if slack.updates:
+            break
+        await asyncio.sleep(0.02)
+    await service.shutdown()
+
+    # The bot did not post its own verdict (the server already has it), and the
+    # card was updated to reflect the external resolution.
+    assert omnigent.resolved == []
+    assert slack.updates
+    assert "Answered elsewhere" in slack.updates[-1]["blocks"][0]["text"]["text"]
+
+
+async def test_denied_approval_does_not_resurrect_prior_answer(tmp_path: Path) -> None:
+    # Regression: a turn that produces no new answer (the only action was a
+    # denied approval) must NOT deliver the previous turn's message via the
+    # no-delta fallback. The fallback only fires for a message newer than the
+    # pre-turn baseline.
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+
+    class DeniedNoAnswerClient(FakeOmnigentClient):
+        async def run_turn(
+            self,
+            session_id: str,
+            text: str,
+            *,
+            workspace: str | None = None,
+            host_id: str | None = None,
+        ) -> AsyncIterator[dict[str, Any]]:
+            self.turns.append((session_id, text))
+            # Only a gated tool call, no answer text; ends on idle.
+            yield _elicitation_event("elicit_rm")
+            yield {"type": "session.status", "status": "idle"}
+
+    omnigent = DeniedNoAnswerClient()
+    # A stale prior-turn answer exists on the server, pinned to a fixed id so it
+    # equals the pre-turn baseline (i.e. it is NOT new this turn).
+    omnigent.latest_message = "PRIOR TURN SUMMARY — should not be re-sent"
+    omnigent.latest_message_id = "prior-msg"
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1")
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> rm file"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    card = await _wait_for_card(slack)
+    eid = _card_elicitation_id(card)
+    await service.handle_elicitation_action(elicitation_id=eid, verdict=Verdict(accepted=False))
+    for _ in range(100):
+        if slack.streams and all(s.stopped for s in slack.streams):
+            break
+        await asyncio.sleep(0.02)
+    await service.shutdown()
+
+    # The stale prior summary was NOT delivered anywhere.
+    all_text = "".join(s.text for s in slack.streams) + "".join(
+        str(p.get("text", "")) for p in slack.posts
+    )
+    assert "PRIOR TURN SUMMARY" not in all_text
+
+
 async def test_tool_approval_timeout_declines(tmp_path: Path) -> None:
     store = await _store(tmp_path)
     slack = FakeSlackClient()
@@ -1424,28 +1630,52 @@ async def test_form_elicitation_forwards_selections_as_content(tmp_path: Path) -
     assert "Answered" in slack.updates[-1]["blocks"][0]["text"]["text"]
 
 
-def _url_elicitation_event(elicitation_id: str = "elicit_url") -> dict[str, Any]:
+def _typed_input_elicitation_event(elicitation_id: str = "elicit_typed") -> dict[str, Any]:
+    # A request for free-form typed input (non-empty schema, not AskUserQuestion)
+    # — genuinely uncollectable with Slack buttons.
     return {
         "type": "response.elicitation_request",
         "elicitation_id": elicitation_id,
         "method": "elicitation/create",
-        "params": {"mode": "url", "message": "Sign in to continue", "url": "https://idp/authz"},
+        "params": {
+            "mode": "url",
+            "message": "Enter your name to continue",
+            "requestedSchema": {"type": "object", "properties": {"name": {"type": "string"}}},
+            "url": "/approve/conv_1/elicit_typed",
+        },
     }
 
 
-async def test_unsupported_elicitation_links_to_web_ui(tmp_path: Path) -> None:
-    # A url-mode elicitation can't be rendered in Slack: the bot posts a link to
-    # resolve it in the Omnigent web UI and does NOT block or auto-resolve — the
-    # user completes it there and the stream resumes.
+def _url_binary_elicitation_event(elicitation_id: str = "elicit_url") -> dict[str, Any]:
+    # A plain binary approval delivered in `url` mode (the default server mode).
+    return {
+        "type": "response.elicitation_request",
+        "elicitation_id": elicitation_id,
+        "method": "elicitation/create",
+        "params": {
+            "mode": "url",
+            "message": "Agent wants to run a shell command. Approve?",
+            "phase": "tool_call",
+            "requestedSchema": {},
+            "url": "/approve/conv_1/elicit_url",
+        },
+    }
+
+
+async def test_unsupported_typed_input_links_to_web_ui(tmp_path: Path) -> None:
+    # A request for free-form typed input can't be rendered in Slack: the bot
+    # posts a link to resolve it in the web UI and does NOT block or auto-resolve.
     store = await _store(tmp_path)
     slack = FakeSlackClient()
-    omnigent = ApprovalClient(elicitation_id="elicit_url", event=_url_elicitation_event())
+    omnigent = ApprovalClient(
+        elicitation_id="elicit_typed", event=_typed_input_elicitation_event()
+    )
     service, _pool, _setup = _service(store, omnigent)
     await _configure_user(store, "T1", "U1")
 
     await service.handle_app_mention(
         body={"team_id": "T1", "event_id": "Ev1"},
-        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> login"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> go"},
         client=slack,
         context={"bot_user_id": "B1"},
     )
@@ -1453,14 +1683,40 @@ async def test_unsupported_elicitation_links_to_web_ui(tmp_path: Path) -> None:
     await service.shutdown()
 
     # A link to the approve page was posted; no approval card, no auto-resolve.
-    links = [p for p in slack.posts if "/approve/conv_1/elicit_url" in str(p.get("text"))]
+    links = [p for p in slack.posts if "/approve/conv_1/elicit_typed" in str(p.get("text"))]
     assert links, "expected a web-UI link for the unsupported elicitation"
-    assert "http://omnigent.test/approve/conv_1/elicit_url" in links[0]["text"]
+    assert "http://omnigent.test/approve/conv_1/elicit_typed" in links[0]["text"]
     assert omnigent.resolved == []
-    # No approval card (actions block) was posted.
     assert not any(
         any(b.get("type") == "actions" for b in (p.get("blocks") or [])) for p in slack.posts
     )
+
+
+async def test_url_mode_binary_renders_approval_card(tmp_path: Path) -> None:
+    # The default server elicitation mode is `url`, but a binary approval must
+    # still render a native Approve/Deny card (not the web link) — the verdict
+    # posts to the resolve endpoint regardless of mode.
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    omnigent = ApprovalClient(elicitation_id="elicit_url", event=_url_binary_elicitation_event())
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1")
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> run"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    card = await _wait_for_card(slack)
+    eid = _card_elicitation_id(card)
+    await service.handle_elicitation_action(elicitation_id=eid, verdict=Verdict(accepted=True))
+    await _wait_for_resolved(omnigent)
+    await service.shutdown()
+
+    # Rendered as an Approve/Deny card and resolved via the endpoint — no web link.
+    assert omnigent.resolved == [("conv_1", "elicit_url", True)]
+    assert not any("/approve/" in str(p.get("text")) for p in slack.posts)
 
 
 async def test_post_answer_message_only_committed_is_not_dropped(tmp_path: Path) -> None:

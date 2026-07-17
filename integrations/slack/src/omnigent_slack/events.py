@@ -68,13 +68,15 @@ class ElicitationRequest:
     def is_supported(self) -> bool:
         """Whether the bot can render this elicitation natively in Slack.
 
-        Supported: a binary approve/deny, or an ``AskUserQuestion`` multiple-
-        choice form. Unsupported: ``url`` mode (out-of-band page) and any
-        request for typed/structured input — those are surfaced with a link to
-        resolve in the Omnigent web UI instead.
+        Classified by the *decision shape*, NOT the delivery ``mode``. A
+        ``url``-mode elicitation just carries a suggested out-of-band approve
+        page; the verdict can still be posted to the resolve endpoint, so a
+        ``url``-mode binary approval or ``AskUserQuestion`` renders natively
+        (Approve/Deny card, or option buttons) exactly like a ``form``-mode one.
+        Only a request for free-form typed input we can't collect with buttons
+        (a non-empty ``requestedSchema`` that isn't an ``AskUserQuestion``) is
+        unsupported — that's surfaced with a link to resolve in the web UI.
         """
-        if self.mode == "url":
-            return False
         if self.is_form:
             return True
         return not self.needs_typed_input

@@ -755,37 +755,52 @@ def test_extract_todos() -> None:
     assert extract_todos({"type": "session.status"}) is None
 
 
-def test_elicitation_url_mode_is_unsupported() -> None:
-    req = extract_elicitation_request(
-        {
-            "type": "response.elicitation_request",
-            "elicitation_id": "e1",
-            "params": {"mode": "url", "message": "Sign in", "url": "https://idp/authorize"},
-        },
-        "conv_1",
-    )
-    assert req is not None
-    assert req.mode == "url"
-    assert req.is_supported is False
-
-
-def test_elicitation_typed_schema_is_unsupported() -> None:
-    # A requestedSchema with fields (and no AskUserQuestion) needs typed input.
+def test_elicitation_url_mode_binary_is_supported() -> None:
+    # `url` mode only carries a suggested approve page; a binary approval (empty
+    # requestedSchema) is still rendered natively as Approve/Deny, not fobbed
+    # off to the web link. This is the default server mode.
     req = extract_elicitation_request(
         {
             "type": "response.elicitation_request",
             "elicitation_id": "e1",
             "params": {
-                "mode": "form",
-                "message": "Enter a value",
-                "requestedSchema": {"type": "object", "properties": {"name": {"type": "string"}}},
+                "mode": "url",
+                "message": "Agent wants to run a shell command. Approve?",
+                "phase": "tool_call",
+                "requestedSchema": {},
+                "url": "/approve/conv_1/e1",
             },
         },
         "conv_1",
     )
     assert req is not None
-    assert req.needs_typed_input is True
-    assert req.is_supported is False
+    assert req.mode == "url"
+    assert not req.is_form
+    assert req.is_supported is True
+
+
+def test_elicitation_typed_schema_is_unsupported() -> None:
+    # A requestedSchema with fields (and no AskUserQuestion) needs typed input we
+    # can't collect with buttons — unsupported regardless of mode.
+    for mode in ("form", "url"):
+        req = extract_elicitation_request(
+            {
+                "type": "response.elicitation_request",
+                "elicitation_id": "e1",
+                "params": {
+                    "mode": mode,
+                    "message": "Enter a value",
+                    "requestedSchema": {
+                        "type": "object",
+                        "properties": {"name": {"type": "string"}},
+                    },
+                },
+            },
+            "conv_1",
+        )
+        assert req is not None
+        assert req.needs_typed_input is True
+        assert req.is_supported is False
 
 
 def test_elicitation_binary_and_form_are_supported() -> None:
@@ -815,3 +830,40 @@ def test_elicitation_binary_and_form_are_supported() -> None:
     )
     # Even with a schema present, an AskUserQuestion is a supported form.
     assert form is not None and form.is_form and form.is_supported is True
+
+
+@respx.mock
+async def test_get_pending_elicitation_returns_parsed_request() -> None:
+    respx.get("http://omnigent.test/v1/sessions/conv_1").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "status": "running",
+                "pending_elicitations": [
+                    {
+                        "type": "response.elicitation_request",
+                        "elicitation_id": "elicit_x",
+                        "params": {"message": "Approve?", "policy_name": "p"},
+                    }
+                ],
+            },
+        )
+    )
+    client = OmnigentClient("http://omnigent.test")
+    try:
+        req = await client.get_pending_elicitation("conv_1")
+    finally:
+        await client.aclose()
+    assert req is not None and req.elicitation_id == "elicit_x"
+
+
+@respx.mock
+async def test_get_pending_elicitation_none_when_empty() -> None:
+    respx.get("http://omnigent.test/v1/sessions/conv_1").mock(
+        return_value=httpx.Response(200, json={"status": "idle", "pending_elicitations": []})
+    )
+    client = OmnigentClient("http://omnigent.test")
+    try:
+        assert await client.get_pending_elicitation("conv_1") is None
+    finally:
+        await client.aclose()

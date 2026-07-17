@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -83,6 +85,15 @@ _AUTH_REQUIRED_TEXT = (
 # tool) can outlast that window, so the bot opens a fresh streaming reply and
 # continues into it rather than treating this as a turn failure.
 _STREAM_CLOSED_ERROR = "message_not_in_streaming_state"
+
+# How often, while awaiting a Slack Approve/Deny click, to check whether the
+# elicitation was resolved elsewhere (web UI, another client) so the turn can
+# stop waiting and continue instead of blocking to the coordinator timeout.
+_EXTERNAL_RESOLVE_POLL_SECONDS = 3.0
+
+# Sentinel: the elicitation was resolved outside Slack, so the bot must NOT post
+# its own verdict — just continue the turn.
+_RESOLVED_EXTERNALLY = object()
 
 
 class _TurnAborted(Exception):
@@ -371,6 +382,9 @@ class SlackOmnigentService:
         # Bridges a parked turn (blocked awaiting the user) to the button/form
         # interaction that answers it. Shared with the block-action handler.
         self._elicitations = elicitations or ElicitationCoordinator()
+        # How often, while awaiting a Slack click, to poll for external
+        # resolution (overridable in tests to avoid real-time waits).
+        self._external_resolve_poll_seconds = _EXTERNAL_RESOLVE_POLL_SECONDS
         self._dispatcher = ThreadTurnDispatcher(self._run_turn)
         self._logger = logging.getLogger(__name__)
 
@@ -513,7 +527,12 @@ class SlackOmnigentService:
                 )
                 await self._notify_non_owner(client, key, requester)
                 return
-            await self._dispatcher.enqueue(
+            # If the session is parked awaiting a decision, a new message can't
+            # proceed until that's answered. Nudge the user (privately) to
+            # resolve the pending request rather than silently queueing behind it.
+            if await self._notify_if_awaiting_input(client, key, requester):
+                return
+            will_wait = await self._dispatcher.enqueue(
                 SlackTurn(
                     key=key,
                     text=text,
@@ -527,6 +546,8 @@ class SlackOmnigentService:
                     host_id=record.host_id,
                 )
             )
+            if will_wait:
+                await self._notify_queued(client, key, requester)
             return
 
         config = await self._store.get_user_config(key.team_id, requester)
@@ -589,6 +610,11 @@ class SlackOmnigentService:
             await reply.stop_with("")
             return
 
+        # Baseline the newest assistant message BEFORE the turn runs, so the
+        # no-delta fallback below can tell this turn's answer from a prior one.
+        baseline = await omnigent.latest_assistant_message(session_id)
+        baseline_id = baseline[0] if baseline else None
+
         try:
             error_text = await self._stream_turn(turn, omnigent, session_id, reply)
         except _TurnAborted:
@@ -597,7 +623,13 @@ class SlackOmnigentService:
             return
 
         if reply.needs_fallback_text():
-            reply.set_fallback_text((await omnigent.latest_assistant_text(session_id)) or "")
+            # The answer may have arrived only as a committed item we didn't see
+            # streamed. Recover it — but ONLY if it's newer than the baseline, so
+            # a turn that produced no answer (e.g. a denied approval) doesn't
+            # resurrect the previous turn's message.
+            latest = await omnigent.latest_assistant_message(session_id)
+            if latest is not None and latest[0] != baseline_id:
+                reply.set_fallback_text(latest[1])
         delivered_answer = await reply.finalize(error_text=error_text)
         if error_text and delivered_answer:
             await self._post_failure_reply(turn.slack_client, turn.key, error_text)
@@ -855,6 +887,73 @@ class SlackOmnigentService:
                 "Non-owner ephemeral notice failed thread=%s; continuing", key.display()
             )
 
+    async def _notify_queued(
+        self,
+        client: SlackClientProtocol,
+        key: ThreadKey,
+        user_id: str,
+    ) -> None:
+        # Best-effort ephemeral: the thread is already handling an earlier turn,
+        # so this message waits its turn (the bot processes one at a time per
+        # thread). Tells the user privately rather than leaving them wondering
+        # why there's no immediate reply.
+        try:
+            await client.chat_postEphemeral(
+                channel=key.channel_id,
+                user=user_id,
+                thread_ts=key.thread_ts,
+                text=(
+                    ":hourglass: I'm still working on your previous message in this "
+                    "thread — I'll get to this one right after."
+                ),
+            )
+        except Exception:
+            self._logger.warning(
+                "Queued ephemeral notice failed thread=%s; continuing", key.display()
+            )
+
+    async def _notify_if_awaiting_input(
+        self,
+        client: SlackClientProtocol,
+        key: ThreadKey,
+        user_id: str,
+    ) -> bool:
+        """If the session is parked on a pending elicitation, nudge the user.
+
+        Returns ``True`` when a pending request was found and the user was told
+        (privately) to answer it first — the caller then skips enqueuing, since
+        a new message can't proceed until the decision is made. Best-effort: any
+        failure resolving the session or posting falls through to ``False`` so
+        the message is handled normally rather than dropped.
+        """
+        record = await self._store.get_session(key)
+        if record is None:
+            return False
+        omnigent = await self._pool.get(self._server_url, pack_user_key(key.team_id, user_id))
+        pending = await omnigent.get_pending_elicitation(record.session_id)
+        if pending is None:
+            return False
+        self._logger.info(
+            "Message while awaiting input thread=%s elicitation_id=%s; nudging user",
+            key.display(),
+            pending.elicitation_id,
+        )
+        try:
+            await client.chat_postEphemeral(
+                channel=key.channel_id,
+                user=user_id,
+                thread_ts=key.thread_ts,
+                text=(
+                    ":hourglass: I'm waiting on your response to the request above "
+                    "before I can continue. Answer that first, then send your message again."
+                ),
+            )
+        except Exception:
+            self._logger.warning(
+                "Awaiting-input ephemeral failed thread=%s; continuing", key.display()
+            )
+        return True
+
     async def handle_elicitation_action(self, *, elicitation_id: str, verdict: Verdict) -> bool:
         """Deliver a button/form verdict to the waiting turn worker.
 
@@ -922,23 +1021,29 @@ class SlackOmnigentService:
         )
         card_ts = posted.get("ts")
 
-        verdict = await self._elicitations.await_verdict(request.elicitation_id)
-        if verdict is None:
-            # Nobody answered in time — decline so the server-side park releases.
-            verdict = Verdict(accepted=False)
-            outcome = "Timed out"
-        elif request.is_form:
-            # A form Submit is an "accept" with selections; Cancel is a decline.
-            outcome = "Answered" if verdict.accepted else "Cancelled"
+        verdict = await self._await_verdict_or_external(omnigent, request)
+        if verdict is _RESOLVED_EXTERNALLY:
+            # The user answered elsewhere (web UI, another client). The server
+            # already has the verdict; don't post our own. Just clear the card
+            # and let the turn continue.
+            outcome = "Answered elsewhere"
         else:
-            outcome = "Approved" if verdict.accepted else "Denied"
-
-        await omnigent.resolve_elicitation(
-            request.session_id,
-            request.elicitation_id,
-            accepted=verdict.accepted,
-            content=verdict.content,
-        )
+            assert verdict is None or isinstance(verdict, Verdict)
+            if verdict is None:
+                # Nobody answered in time — decline so the server park releases.
+                verdict = Verdict(accepted=False)
+                outcome = "Timed out"
+            elif request.is_form:
+                # A form Submit is an accept with selections; Cancel is a decline.
+                outcome = "Answered" if verdict.accepted else "Cancelled"
+            else:
+                outcome = "Approved" if verdict.accepted else "Denied"
+            await omnigent.resolve_elicitation(
+                request.session_id,
+                request.elicitation_id,
+                accepted=verdict.accepted,
+                content=verdict.content,
+            )
         self._logger.info(
             "Elicitation resolved thread=%s elicitation_id=%s outcome=%s",
             key.display(),
@@ -960,6 +1065,44 @@ class SlackOmnigentService:
                 self._logger.warning(
                     "Elicitation card update failed thread=%s; continuing", key.display()
                 )
+
+    async def _await_verdict_or_external(
+        self, omnigent: OmnigentClient, request: ElicitationRequest
+    ) -> Verdict | None | object:
+        """Wait for a Slack button verdict OR external resolution.
+
+        The turn worker blocks here on the Slack card, but the user may instead
+        answer in the web UI (or another client). Since this worker isn't
+        reading the stream while blocked, it can't see ``elicitation_resolved`` —
+        so it also polls the server, and if the elicitation is no longer pending
+        it returns ``_RESOLVED_EXTERNALLY`` to stop waiting (the verdict is
+        already recorded server-side; posting our own would be wrong). Otherwise
+        returns the :class:`Verdict` from the click, or ``None`` on timeout.
+
+        Without this, a web-UI answer would leave the worker blocked until the
+        coordinator timeout — wedging the whole thread's serial queue.
+        """
+        verdict_task = asyncio.ensure_future(
+            self._elicitations.await_verdict(request.elicitation_id)
+        )
+        try:
+            while True:
+                done, _ = await asyncio.wait(
+                    {verdict_task}, timeout=self._external_resolve_poll_seconds
+                )
+                if verdict_task in done:
+                    return verdict_task.result()
+                if not await omnigent.is_elicitation_pending(
+                    request.session_id, request.elicitation_id
+                ):
+                    return _RESOLVED_EXTERNALLY
+        finally:
+            # Stop the coordinator waiter if we returned on the external path, so
+            # a later stray click doesn't resolve a dead future.
+            if not verdict_task.done():
+                verdict_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await verdict_task
 
     async def _accept_event(
         self,

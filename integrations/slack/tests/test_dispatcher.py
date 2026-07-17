@@ -17,6 +17,29 @@ def _turn(key: ThreadKey, text: str) -> SlackTurn:
     )
 
 
+async def test_enqueue_reports_whether_turn_will_wait() -> None:
+    # The first turn runs immediately (will_wait=False); a turn enqueued while
+    # one is still processing waits behind it (will_wait=True).
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def worker(turn: SlackTurn) -> None:
+        started.set()
+        await release.wait()
+
+    dispatcher = ThreadTurnDispatcher(worker, idle_timeout_seconds=1)
+    key = ThreadKey(team_id="T", channel_id="C", thread_ts="1")
+
+    first_waits = await dispatcher.enqueue(_turn(key, "first"))
+    await asyncio.wait_for(started.wait(), timeout=1)  # worker is now busy
+    second_waits = await dispatcher.enqueue(_turn(key, "second"))
+    release.set()
+    await dispatcher.shutdown()
+
+    assert first_waits is False
+    assert second_waits is True
+
+
 async def test_dispatcher_runs_turns_in_thread_order() -> None:
     seen: list[str] = []
     done = asyncio.Event()

@@ -632,7 +632,66 @@ class OmnigentClient:
         except OmnigentError:
             return None
 
-    async def latest_assistant_text(self, session_id: str) -> str | None:
+    async def _pending_elicitations(self, session_id: str) -> list[ElicitationRequest]:
+        """Parse the session snapshot's outstanding elicitations.
+
+        Best-effort — returns ``[]`` on any failure. ``None`` snapshot status
+        (an auth/transport hiccup) is indistinguishable from "empty" here; both
+        yield ``[]``, so callers must treat "no pending" conservatively.
+        """
+        try:
+            response = await self._request("GET", f"/v1/sessions/{session_id}")
+            await _raise_for_status(response)
+        except OmnigentError:
+            return []
+        pending = response.json().get("pending_elicitations")
+        if not isinstance(pending, list):
+            return []
+        out: list[ElicitationRequest] = []
+        for entry in pending:
+            if isinstance(entry, dict):
+                request = extract_elicitation_request(entry, session_id)
+                if request is not None:
+                    out.append(request)
+        return out
+
+    async def get_pending_elicitation(self, session_id: str) -> ElicitationRequest | None:
+        """Return the session's first outstanding elicitation, if any.
+
+        Used to detect that a session is parked awaiting the user before a new
+        message is submitted — the bot tells the user to answer the pending
+        request first. Best-effort — ``None`` when nothing is pending or on error.
+        """
+        pending = await self._pending_elicitations(session_id)
+        return pending[0] if pending else None
+
+    async def is_elicitation_pending(self, session_id: str, elicitation_id: str) -> bool:
+        """Whether ``elicitation_id`` is still outstanding on the server.
+
+        Lets a Slack-side waiter detect that the elicitation was resolved
+        *elsewhere* (the web UI, another client) and stop waiting. Best-effort:
+        on a read failure returns ``True`` (assume still pending) so a transient
+        hiccup doesn't spuriously abandon the wait.
+        """
+        try:
+            response = await self._request("GET", f"/v1/sessions/{session_id}")
+            await _raise_for_status(response)
+        except OmnigentError:
+            return True
+        pending = response.json().get("pending_elicitations")
+        if not isinstance(pending, list):
+            return False
+        return any(
+            isinstance(e, dict) and e.get("elicitation_id") == elicitation_id for e in pending
+        )
+
+    async def latest_assistant_message(self, session_id: str) -> tuple[str, str] | None:
+        """Return ``(item_id, text)`` of the newest assistant message, or None.
+
+        The id lets a caller tell *this* turn's message from a prior turn's — a
+        blind "latest text" fetch would otherwise resurrect the previous answer
+        when the current turn produced none (e.g. a denied approval).
+        """
         self._logger.debug("Fetching latest Omnigent assistant item session_id=%s", session_id)
         response = await self._request(
             "GET",
@@ -645,10 +704,12 @@ class OmnigentClient:
         if not isinstance(items, list):
             return None
         for item in items:
-            if isinstance(item, dict):
-                text = extract_assistant_text(item)
-                if text:
-                    return text
+            if not isinstance(item, dict):
+                continue
+            text = extract_assistant_text(item)
+            if text:
+                item_id = item.get("id")
+                return (item_id if isinstance(item_id, str) else "", text)
         return None
 
 
