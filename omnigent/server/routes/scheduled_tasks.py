@@ -70,7 +70,7 @@ class UpdateScheduledTaskRequest(BaseModel):
 
     @model_validator(mode="after")
     def _validate_patch(self) -> UpdateScheduledTaskRequest:
-        """Keep the public v1 update surface to active/paused connected-host runs."""
+        """Keep the public update surface to active/paused connected-host runs."""
         if self.state is not None and self.state not in {"active", "paused"}:
             raise ValueError("state must be 'active' or 'paused'; use DELETE to delete a task")
         if "workspace" in self.model_fields_set and self.workspace is None:

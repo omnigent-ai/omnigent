@@ -202,7 +202,7 @@ async def test_create_rejects_relative_workspace(
     assert resp.status_code == 400, resp.text
 
 
-async def test_create_rejects_missing_v1_execution_inputs(
+async def test_create_rejects_missing_connected_host_inputs(
     auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:
     _make_user(db_uri)

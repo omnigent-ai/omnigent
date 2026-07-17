@@ -444,7 +444,7 @@ async def test_offline_connected_host_records_failed_without_session() -> None:
 
 @pytest.mark.asyncio
 async def test_managed_sandbox_is_skipped_and_recorded() -> None:
-    """v1: managed_sandbox target logs + records a skipped run, does not launch."""
+    """Managed-sandbox targets are recorded as skipped and do not launch."""
     store = FakeScheduledTaskStore(rows={"task_1": _task(execution_target="managed_sandbox")})
     launched: list[Any] = []
 

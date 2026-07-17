@@ -7,9 +7,9 @@ real callback (the scheduler ships only a no-op placeholder). A firing:
 #. **Re-reads the row.** The armed timer is never trusted: the row is re-read by
    id, and a row that vanished (deleted between arming and firing) or is no
    longer ``active`` (paused/deleted) is a logged no-op.
-#. **Validates the v1 launch target.** Scheduled tasks v1 is connected host +
-   existing workspace only; missing host/workspace or an unreachable host is
-   recorded as a failed/skipped run instead of a running run.
+#. **Validates the launch target.** Scheduled tasks currently support
+   connected-host execution only; missing host/workspace or an unreachable host
+   is recorded as a failed/skipped run instead of a running run.
 #. **Creates a session** bound to the task's agent, carrying the stored
    ``workspace`` / ``host_id`` / ``model_override`` / ``reasoning_effort``.
 #. **Grants ownership.** The spawned session gets a ``LEVEL_OWNER`` grant for the
@@ -27,12 +27,14 @@ blocked on full session startup the scheduler could not re-arm the task's timer
 for the fire's duration. A strong reference to each in-flight task is held until
 it completes (``loop.create_task`` only keeps a weak one). Any failure in the
 background work is caught and logged: a failed fire must never crash the
-scheduler, and v1's retry policy is simply "the next occurrence fires normally".
+scheduler, and the current retry policy is simply "the next occurrence fires
+normally".
 
-**Execution target.** Only connected-host, existing-workspace runs are supported
-in v1. Sandbox provisioning, branch selection, worktree creation, replay/backfill,
-completion tracking, and multi-replica leasing are follow-ups for shared
-session-create orchestration rather than this direct fire path.
+**Execution target.** Scheduled tasks currently support connected-host,
+existing-workspace runs only. Future execution modes include managed sandbox,
+branch selection, replay/backfill, completion tracking, and multi-replica
+leasing through shared session-create orchestration rather than this direct
+fire path.
 """
 
 from __future__ import annotations
@@ -176,7 +178,7 @@ async def _run_fire(
     try:
         if task.execution_target != "connected_host":
             _logger.info(
-                "scheduled fire: task %s target %r not supported in v1 — skipping",
+                "scheduled fire: task %s target %r is not supported — skipping",
                 task.id,
                 task.execution_target,
             )
@@ -192,7 +194,7 @@ async def _run_fire(
             )
             return
 
-        input_error = _validate_v1_execution_inputs(task)
+        input_error = _validate_connected_host_inputs(task)
         if input_error is not None:
             error, error_code = input_error
             _logger.warning("scheduled fire: task %s cannot run: %s", task.id, error)
@@ -303,9 +305,9 @@ async def _run_fire(
 
 async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:
     """Create a conversation bound to the task's agent, carrying the stored spec."""
-    # v1 creates the conversation directly for connected-host, existing-workspace
-    # runs; sandbox, branch, and worktree support must use shared session-create
-    # orchestration when those modes are added.
+    # Connected-host, existing-workspace runs create the conversation directly.
+    # Future execution modes such as managed sandbox, branch selection, and
+    # replay/backfill must use shared session-create orchestration.
     conv = await asyncio.to_thread(
         deps.conversation_store.create_conversation,
         agent_id=task.agent_id,
@@ -414,7 +416,7 @@ async def _validate_fire_session_inputs(
         if validate_workspace:
             if task.host_id is None or task.workspace is None:
                 return (
-                    "scheduled tasks v1 requires host_id and workspace",
+                    "scheduled tasks connected-host execution requires host_id and workspace",
                     "missing_execution_input",
                 )
             await validate_existing_host_workspace(
@@ -434,12 +436,15 @@ async def _validate_fire_session_inputs(
     return None
 
 
-def _validate_v1_execution_inputs(task: ScheduledTask) -> tuple[str, str] | None:
-    """Return a failure reason/code when a task lacks v1 execution inputs."""
+def _validate_connected_host_inputs(task: ScheduledTask) -> tuple[str, str] | None:
+    """Return a failure reason/code when a task lacks connected-host inputs."""
     if not isinstance(task.host_id, str) or not task.host_id.strip():
-        return "scheduled tasks v1 requires a connected host_id", "missing_host_id"
+        return "scheduled tasks connected-host execution requires host_id", "missing_host_id"
     if not isinstance(task.workspace, str) or not task.workspace.strip():
-        return "scheduled tasks v1 requires an existing host workspace", "missing_workspace"
+        return (
+            "scheduled tasks connected-host execution requires an existing workspace",
+            "missing_workspace",
+        )
     return None
 
 
@@ -454,7 +459,7 @@ def _make_connected_host_preflight(deps: FireDeps) -> ConnectedHostPreflight:
             )
 
         host_id = task.host_id
-        assert host_id is not None  # guarded by _validate_v1_execution_inputs
+        assert host_id is not None  # guarded by _validate_connected_host_inputs
         host = await asyncio.to_thread(deps.host_store.get_host, host_id)
         if host is None:
             raise _CannotLaunchScheduledFire(
