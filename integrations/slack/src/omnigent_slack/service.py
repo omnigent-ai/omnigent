@@ -44,7 +44,7 @@ from omnigent_slack.text import strip_bot_mention, truncate_for_slack
 
 
 class SlackStreamProtocol(Protocol):
-    async def append(self, *, markdown_text: str) -> Any: ...
+    async def append(self, *, markdown_text: str | None = ..., chunks: Any = ...) -> Any: ...
 
     async def stop(self, *, markdown_text: str | None = ...) -> Any: ...
 
@@ -164,6 +164,9 @@ class _LiveReply:
         # Number of streaming messages opened; >1 means the reply was split
         # because Slack closed an earlier segment mid-turn.
         self.segments = 0
+        # Whether text has been appended but not yet flushed to Slack (the SDK
+        # buffers until buffer_size). Lets ``flush`` skip an empty API call.
+        self._pending_unflushed = False
 
     async def _open(self) -> SlackStreamProtocol:
         self._stream = await self._client.chat_stream(
@@ -189,7 +192,27 @@ class _LiveReply:
             # Slack finalized the message out from under us; continue the answer
             # in a fresh streaming reply so nothing stalls or is lost.
             flushed = await (await self._open()).append(markdown_text=markdown_text)
+        # Track buffered-but-unflushed text so ``flush`` can force it visible.
+        self._pending_unflushed = flushed is None
         return flushed is not None
+
+    async def flush(self) -> None:
+        # Force any buffered-but-unflushed text onto the screen NOW, without
+        # finalizing the segment. The SDK flushes its buffer when ``append`` is
+        # called with ``chunks`` set (even an empty list), so a short answer
+        # doesn't stay invisible until the segment is stopped. Used before an
+        # out-of-band post so streamed text appears BEFORE the card/notice, not
+        # coincident with it (matches the web UI's live reveal). No-op when
+        # nothing is buffered or no stream is open.
+        if self._stream is None or not self._pending_unflushed:
+            return
+        try:
+            await self._stream.append(chunks=[])
+        except SlackApiError as exc:
+            if not _is_stream_closed_error(exc):
+                raise
+            # Segment was finalized under us; the buffered text already landed.
+        self._pending_unflushed = False
 
     async def stop(self, markdown_text: str | None = None) -> None:
         # chat.stopStream rejects empty text, so only pass markdown_text when
@@ -224,6 +247,7 @@ class _LiveReply:
         # Drop the reference first so the next append opens a fresh segment even
         # if the stop below races a Slack-side finalize.
         self._stream = None
+        self._pending_unflushed = False
         try:
             await stream.stop()
         except SlackApiError as exc:
@@ -303,12 +327,15 @@ class _AnswerReply:
         self._final = text
 
     async def seal_for_interruption(self) -> None:
-        # Before an out-of-band message: drop the placeholder (it would sit
-        # stale above the interruption for the whole wait), finalize the current
-        # segment so the interruption sorts after it, and forget the accumulated
-        # text so the next segment reconciles independently. Record what this
-        # segment delivered BEFORE resetting, so the fallback can recognize an
+        # Before an out-of-band message: reveal any buffered streamed text FIRST
+        # (so it appears above the interruption as it did on screen in the web UI,
+        # not coincident with the card), drop the placeholder (it would sit stale
+        # above the interruption for the whole wait), finalize the current segment
+        # so the interruption sorts after it, and forget the accumulated text so
+        # the next segment reconciles independently. Record what this segment
+        # delivered BEFORE resetting, so the fallback can recognize an
         # already-shown message and not re-post it.
+        await self._reply.flush()
         shown = self._streamed + self._tail()
         if shown:
             self._delivered_texts.append(shown)

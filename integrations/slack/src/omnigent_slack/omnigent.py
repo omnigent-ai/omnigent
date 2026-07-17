@@ -512,20 +512,30 @@ class OmnigentClient:
             # (that would terminate the async generator), so we keep the task
             # alive with asyncio.wait and only await it again next window.
             pending: asyncio.Task[dict[str, Any]] | None = None
-            awaiting_resumption = False
+            # The FIRST read is unbounded — the turn hasn't started producing yet,
+            # so a bare wait is correct (the server may be `idle` for a beat right
+            # after submit before it goes `running`). Every read AFTER the first
+            # event is disambiguated via the grace window: this makes the turn
+            # ALWAYS bounded — it can only stay alive while the server reports
+            # `running`. A stream that goes silent without a terminal/idle event
+            # (half-open connection, or an `idle` edge missed because the consumer
+            # was parked on an elicitation) would otherwise block this read
+            # forever and wedge the thread. Active streaming pays NO latency: the
+            # settle-wait returns immediately when events are flowing, so the
+            # status poll only fires after a genuine quiet gap.
+            disambiguate = False
             try:
                 while True:
                     if pending is None:
                         pending = asyncio.ensure_future(iterator.__anext__())
 
-                    if awaiting_resumption:
-                        # Previous event was a soft `idle`. Disambiguate park vs
-                        # end without cancelling the in-flight read (that would
-                        # kill the generator): time out the wait, and on a quiet
-                        # window consult the rolled-up snapshot — while a
+                    if disambiguate:
+                        # Time out the wait WITHOUT cancelling the in-flight read
+                        # (cancelling __anext__ would kill the generator); on a
+                        # quiet window consult the rolled-up snapshot — while a
                         # sub-agent child is still running the parent reads
-                        # `running`, so keep waiting (a slow child can outlast
-                        # the grace window).
+                        # `running`, so keep waiting (a slow child can outlast the
+                        # grace window). Ends only when the snapshot is not running.
                         resumed = await self._await_within_grace(
                             pending,
                             session_id,
@@ -540,7 +550,6 @@ class OmnigentClient:
                                 session_id,
                             )
                             break
-                        awaiting_resumption = False
 
                     try:
                         event = await pending
@@ -555,17 +564,15 @@ class OmnigentClient:
                     )
                     yield event
 
-                    if is_soft_idle_event(event) or is_elicitation_request(event):
-                        # A soft idle OR an elicitation request: the consumer
-                        # parks while handling it, leaving the SSE connection
-                        # unread. Don't resume into an unbounded read — the stale
-                        # connection may never deliver the post-resolve events and
-                        # would hang the turn forever. Disambiguate via the grace
-                        # window (settle-wait + status poll), which ends cleanly
-                        # when the server has gone idle.
-                        awaiting_resumption = True
-                        continue
-                    if is_terminal_event(event):
+                    # Every subsequent read is bounded by the grace disambiguation.
+                    disambiguate = True
+
+                    # A HARD terminal (failed/cancelled) ends the turn now. A soft
+                    # `idle` is NOT terminal here: a fan-out orchestrator settles
+                    # idle between wake cycles, so we DON'T break — the next
+                    # (bounded) read either resumes when more arrives or ends via
+                    # the status poll when the server is genuinely done.
+                    if is_terminal_event(event) and not is_soft_idle_event(event):
                         self._logger.info(
                             "Omnigent turn reached terminal event session_id=%s type=%s",
                             session_id,

@@ -494,6 +494,52 @@ async def test_run_turn_transient_idle_midstream_does_not_truncate() -> None:
 
 
 @respx.mock
+async def test_run_turn_ends_when_stream_goes_silent_without_idle_event() -> None:
+    # Incident 3cca0d8d: the stream produces output then goes SILENT with NO
+    # terminal/idle event ever arriving (half-open connection, or the `idle` edge
+    # was missed while the consumer was parked). A bare read would block forever,
+    # holding the thread's reservation and deflecting every follow-up. Every read
+    # after the first event is now grace-bounded, so the turn ends when the
+    # snapshot shows the server is idle.
+    async def _silent_after_output() -> AsyncIterator[bytes]:
+        yield b'data: {"type":"response.output_text.delta","delta":"Some answer."}\n\n'
+        await asyncio.sleep(30)  # then nothing: no idle, no [DONE] — a bare read hangs
+
+    respx.get("http://omnigent.test/v1/sessions/conv_1/stream").mock(
+        return_value=httpx.Response(200, stream=_silent_after_output())
+    )
+    respx.post("http://omnigent.test/v1/sessions/conv_1/events").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    # The server is actually done (idle) — the stream just never told us.
+    respx.get("http://omnigent.test/v1/sessions/conv_1").mock(
+        return_value=httpx.Response(200, json={"status": "idle"})
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    async def _drain() -> list[str | None]:
+        return [
+            event.get("delta")
+            async for event in client.run_turn(
+                "conv_1",
+                "go",
+                idle_grace_seconds=5.0,
+                idle_poll_seconds=0.05,
+                idle_settle_seconds=0.05,
+            )
+            if event.get("type") == "response.output_text.delta"
+        ]
+
+    try:
+        # Must finish well within the 30s silent stall — bounded by the poll.
+        deltas = await asyncio.wait_for(_drain(), timeout=5.0)
+    finally:
+        await client.aclose()
+
+    assert deltas == ["Some answer."]  # delivered, then the turn ended cleanly
+
+
+@respx.mock
 async def test_run_turn_ends_when_idle_grace_elapses_and_snapshot_idle() -> None:
     # A truly-final idle: the stream stays open briefly (no `[DONE]`) but nothing
     # more arrives within the grace window, and the snapshot confirms the session

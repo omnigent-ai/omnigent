@@ -52,10 +52,19 @@ class FakeStream:
         # put content on screen (a mid-stream flush, or the finalizing stop for a
         # short answer that never filled the buffer).
         self.ack_live_when_visible: bool | None = None
+        # Monotonic rank of when this stream's text first became visible (first
+        # flush/stop). Lets a test assert content was revealed before a later
+        # out-of-band post (e.g. an approval card), not coincident with it.
+        self.first_visible_order: int | None = None
+        # Rank of a FORCED flush (append with chunks — our _LiveReply.flush),
+        # None if the buffer was only ever revealed by the finalizing stop.
+        self.forced_flush_order: int | None = None
         self._buffer_size = buffer_size
         self._pending = 0
 
     def _record_ack_state(self) -> None:
+        if self.first_visible_order is None:
+            self.first_visible_order = self._client._tick()
         if self.ack_live_when_visible is None:
             self.ack_live_when_visible = any(
                 ack["ts"] not in self._client.deleted_ts for ack in self._client.acks
@@ -75,16 +84,28 @@ class FakeStream:
             ),
         )
 
-    async def append(self, *, markdown_text: str) -> dict[str, Any] | None:
+    async def append(
+        self, *, markdown_text: str | None = None, chunks: Any = None
+    ) -> dict[str, Any] | None:
         if self.closed:
             self._raise_closed()
-        self.appended.append(markdown_text)
+        if markdown_text is not None:
+            self.appended.append(markdown_text)
+            self._pending += len(markdown_text)
         if self._close_after is not None and len(self.appended) >= self._close_after:
             self.closed = True
-        # Buffer until the SDK's threshold, then "flush" to Slack.
-        self._pending += len(markdown_text)
-        if self._pending < self._buffer_size:
+        # The SDK flushes when the buffer crosses the threshold OR when called
+        # with ``chunks`` set (a forced flush, even chunks=[]). Otherwise buffer.
+        if chunks is None and self._pending < self._buffer_size:
             return None
+        if chunks is not None and self._pending == 0:
+            # Forced flush with nothing buffered → no-op (matches an empty flush).
+            return None
+        if chunks is not None:
+            # A forced flush (our _LiveReply.flush) — record its position so a
+            # test can assert buffered text was revealed via flush, before a
+            # later out-of-band post, rather than only at the finalizing stop.
+            self.forced_flush_order = self._client._tick()
         self._pending = 0
         self._record_ack_state()
         return {"ok": True}
@@ -1531,6 +1552,39 @@ async def test_tool_approval_approve_resumes_turn(tmp_path: Path) -> None:
     updated_blocks = slack.updates[-1]["blocks"]
     assert not any(b.get("type") == "actions" for b in updated_blocks)
     assert "Approved" in updated_blocks[0]["text"]["text"]
+
+
+async def test_short_pre_card_text_is_flushed_before_the_card(tmp_path: Path) -> None:
+    # The pre-card answer text ("work", well under the SDK buffer size) must be
+    # revealed BEFORE the approval card is posted — not left buffered until the
+    # seal, which would make it appear coincident with the card (the web UI shows
+    # it live as it streams). We assert the stream's first-visible tick precedes
+    # the card post's order tick.
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    omnigent = ApprovalClient()
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1")
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> edit"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    card = await _wait_for_card(slack)
+    eid = _card_elicitation_id(card)
+    await service.handle_elicitation_action(elicitation_id=eid, verdict=Verdict(accepted=True))
+    await _wait_for_resolved(omnigent)
+    await service.shutdown()
+
+    # The first (pre-card) segment carried "work" and was FORCE-flushed to screen
+    # (via _LiveReply.flush) — not left buffered until the finalizing stop.
+    pre_card = slack.streams[0]
+    assert pre_card.text == "work"
+    assert pre_card.forced_flush_order is not None, "pre-card text was not force-flushed"
+    # The forced flush happened strictly before the card message was posted.
+    assert pre_card.forced_flush_order < card["order"]
 
 
 async def test_tool_approval_deny_forwards_decline(tmp_path: Path) -> None:
