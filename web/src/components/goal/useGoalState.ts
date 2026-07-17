@@ -1,22 +1,19 @@
 import { useEffect, useState } from "react";
-import { getCodexGoal, type CodexGoal } from "@/lib/codexGoalApi";
+import { getGoal, type Goal } from "@/lib/goalApi";
 
-interface UseCodexGoalStateResult {
-  goal: CodexGoal | null;
-  setGoal: (goal: CodexGoal | null) => void;
+interface UseGoalStateResult {
+  goal: Goal | null;
+  setGoal: (goal: Goal | null) => void;
 }
 
 /**
- * Keep the current Codex goal snapshot for a composer session.
+ * Keep the current goal snapshot for a composer session.
  *
  * The hook intentionally fails closed to ``null`` on read errors: the dialog
  * performs its own read and surfaces the error text when the user opens it.
  */
-export function useCodexGoalState(
-  conversationId: string | null,
-  enabled: boolean,
-): UseCodexGoalStateResult {
-  const [goal, setGoal] = useState<CodexGoal | null>(null);
+export function useGoalState(conversationId: string | null, enabled: boolean): UseGoalStateResult {
+  const [goal, setGoal] = useState<Goal | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -24,7 +21,7 @@ export function useCodexGoalState(
       setGoal(null);
       return;
     }
-    void getCodexGoal(conversationId)
+    void getGoal(conversationId)
       .then((response) => {
         if (!cancelled) setGoal(response.goal);
       })

@@ -23,6 +23,7 @@ from omnigent.entities.conversation import (
     parse_item_data,
     synthesize_conversation_title,
 )
+from omnigent.entities.device_grant import DeviceGrant
 from omnigent.entities.file import StoredFile
 from omnigent.entities.pagination import PagedList
 from omnigent.entities.permission import ResolvedAccess, SessionPermission
@@ -47,6 +48,7 @@ __all__ = [
     "CompactionData",
     "Conversation",
     "ConversationItem",
+    "DeviceGrant",
     "ErrorData",
     "FunctionCallData",
     "FunctionCallOutputData",

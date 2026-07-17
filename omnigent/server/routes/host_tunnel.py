@@ -29,12 +29,14 @@ from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
 from omnigent.host.frames import (
     HostCreateDirResultFrame,
     HostCreateWorktreeResultFrame,
+    HostFsResultFrame,
     HostHelloFrame,
     HostLaunchRunnerResultFrame,
     HostListDirResultFrame,
     HostListWorktreesResultFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
+    HostRunnerStatusResultFrame,
     HostStatResultFrame,
     HostStopRunnerResultFrame,
     decode_host_frame,
@@ -66,8 +68,8 @@ def create_host_tunnel_router(
     host_store: HostStore,
     *,
     auth_provider: AuthProvider | None = None,
-    on_host_connect: Callable[[str], Awaitable[None]] | None = None,
-    on_host_disconnect: Callable[[str], Awaitable[None]] | None = None,
+    on_host_connect: Callable[[str, str | None], Awaitable[None]] | None = None,
+    on_host_disconnect: Callable[[str, str | None], Awaitable[None]] | None = None,
     on_runner_exited: Callable[[str, str], Awaitable[None]] | None = None,
     local_single_user: bool | None = None,
     runner_exit_reports: RunnerExitReports | None = None,
@@ -273,7 +275,7 @@ def create_host_tunnel_router(
             if on_host_connect is not None:
                 try:
                     await asyncio.wait_for(
-                        on_host_connect(host_id),
+                        on_host_connect(host_id, tunnel_owner),
                         timeout=30.0,
                     )
                 except asyncio.TimeoutError:
@@ -309,7 +311,7 @@ def create_host_tunnel_router(
                 await asyncio.to_thread(host_store.set_offline, host_id)
                 if on_host_disconnect is not None:
                     try:
-                        await on_host_disconnect(host_id)
+                        await on_host_disconnect(host_id, tunnel_owner)
                     except Exception:
                         _logger.exception(
                             "on_host_disconnect callback failed for %s",
@@ -328,7 +330,7 @@ def create_host_tunnel_router(
                 await asyncio.to_thread(host_store.set_offline, host_id)
                 if on_host_disconnect is not None:
                     try:
-                        await on_host_disconnect(host_id)
+                        await on_host_disconnect(host_id, tunnel_owner)
                     except Exception:
                         _logger.exception(
                             "on_host_disconnect callback failed for %s",
@@ -482,6 +484,12 @@ async def _receive_loop(
                 await on_runner_exited(frame.runner_id, frame.error)
             continue
 
+        if isinstance(frame, HostRunnerStatusResultFrame):
+            status_future = conn.pending_runner_status.pop(frame.request_id, None)
+            if status_future is not None and not status_future.done():
+                status_future.set_result({"status": frame.status})
+            continue
+
         if isinstance(frame, HostStatResultFrame):
             stat_future = conn.pending_stats.pop(frame.request_id, None)
             if stat_future is not None and not stat_future.done():
@@ -561,6 +569,20 @@ async def _receive_loop(
                     {
                         "status": frame.status,
                         "path": frame.path,
+                        "error": frame.error,
+                    }
+                )
+            continue
+
+        if isinstance(frame, HostFsResultFrame):
+            fs_future = conn.pending_fs_requests.pop(frame.request_id, None)
+            if fs_future is not None and not fs_future.done():
+                fs_future.set_result(
+                    {
+                        "status": frame.status,
+                        "payload": frame.payload,
+                        "error_status": frame.error_status,
+                        "error_code": frame.error_code,
                         "error": frame.error,
                     }
                 )

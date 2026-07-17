@@ -459,6 +459,16 @@ describe("harnessUnconfiguredOnHost", () => {
     );
   });
 
+  it("shows native Cursor's install and login steps before launch", () => {
+    const testHost = hostWith({ "cursor-native": false });
+    const reason = harnessUnavailableReasonOnHost("cursor-native", testHost);
+    expect(reason).toBe("cursor-cli-missing");
+    expect(harnessWarningBadgeText(reason)).toBe("install & login");
+    expect(harnessWarningMessageText("Cursor", "laptop", reason)).toBe(
+      "Cursor needs cursor-agent on laptop — install it with `curl https://cursor.com/install -fsS | bash`, then run `cursor-agent login`.",
+    );
+  });
+
   it("surfaces structured codex unavailable reasons", () => {
     const testHost = hostWith({ codex: "needs-auth", "codex-native": "binary-missing" });
     expect(harnessUnconfiguredOnHost("codex", testHost)).toBe(true);

@@ -70,7 +70,6 @@
       "icon": "icons/icon.icns",
       "artifactName": "${productName}-${version}-${arch}-mac.${ext}",
       "identity": "Databricks, Inc. (8RMX4WU6F8)",
-      "provisioningProfile": "signing/omnigent.provisionprofile",
       "hardenedRuntime": true,
       "entitlements": "signing/entitlements.mac.plist",
       "entitlementsInherit": "signing/entitlements.mac.inherit.plist",

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
 
 from omnigent.session_import.local import (
+    list_recent_local_session_ids,
     load_claude_session,
     load_codex_session,
 )
@@ -98,6 +100,32 @@ def test_load_claude_session_rejects_empty_history(tmp_path: Path) -> None:
 
     with pytest.raises(SessionImportNotFoundError, match="no importable history"):
         load_claude_session(session_id, claude_home=tmp_path)
+
+
+def test_list_recent_claude_sessions_orders_parents_and_applies_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Claude batch discovery returns only the newest parent transcripts."""
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    project = tmp_path / "projects" / "-repo"
+    project.mkdir(parents=True)
+    transcripts = [
+        (project / "old.jsonl", 1),
+        (project / "middle.jsonl", 2),
+        (project / "new.jsonl", 3),
+    ]
+    for path, modified_at in transcripts:
+        path.touch()
+        os.utime(path, (modified_at, modified_at))
+    subagent = project / "subagents" / "subagent.jsonl"
+    subagent.parent.mkdir()
+    subagent.touch()
+    os.utime(subagent, (4, 4))
+
+    recent = list_recent_local_session_ids("claude", limit=2)
+
+    assert recent == ("new", "middle")
 
 
 def test_load_codex_session_normalizes_response_items(tmp_path: Path) -> None:
@@ -283,3 +311,30 @@ def test_load_codex_session_rejects_empty_history(tmp_path: Path) -> None:
 
     with pytest.raises(SessionImportNotFoundError, match="no importable history"):
         load_codex_session(session_id, codex_home=tmp_path)
+
+
+def test_list_recent_codex_sessions_includes_archived_and_deduplicates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex batch discovery combines active and archived rollout identities."""
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    first_id = "019e96aa-0be2-7343-8d3b-6f914d60936b"
+    second_id = "019f680e-3edc-7fa3-9d50-1c4be395fa27"
+    active_dir = tmp_path / "sessions" / "2026" / "07" / "16"
+    archived_dir = tmp_path / "archived_sessions"
+    active_dir.mkdir(parents=True)
+    archived_dir.mkdir()
+    rollouts = [
+        (active_dir / f"rollout-old-{first_id}.jsonl", 1),
+        (active_dir / f"rollout-new-{second_id}.jsonl", 3),
+        (archived_dir / f"rollout-archived-{first_id}.jsonl", 4),
+        (active_dir / "rollout-malformed.jsonl", 5),
+    ]
+    for path, modified_at in rollouts:
+        path.touch()
+        os.utime(path, (modified_at, modified_at))
+
+    recent = list_recent_local_session_ids("codex", limit=10)
+
+    assert recent == (first_id, second_id)

@@ -1,19 +1,18 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import type { CodexGoal } from "@/lib/codexGoalApi";
-import { CodexGoalControl, CodexGoalStatusPill } from "./CodexGoalControl";
+import type { Goal } from "@/lib/goalApi";
+import { GoalControl, GoalStatusPill } from "./GoalControl";
 
-vi.mock("./CodexGoalDialog", () => ({
-  CodexGoalDialog: ({ open, conversationId }: { open: boolean; conversationId: string | null }) => (
+vi.mock("./GoalDialog", () => ({
+  GoalDialog: ({ open, conversationId }: { open: boolean; conversationId: string | null }) => (
     <div data-testid="mock-goal-dialog" data-open={open ? "true" : "false"}>
       {conversationId}
     </div>
   ),
 }));
 
-const GOAL: CodexGoal = {
-  threadId: "thread-1",
+const GOAL: Goal = {
   objective: "Ship goal mode",
   status: "active",
   tokenBudget: 40000,
@@ -26,7 +25,7 @@ const GOAL: CodexGoal = {
 function renderControl(conversationId: string | null = "conv") {
   return render(
     <TooltipProvider>
-      <CodexGoalControl
+      <GoalControl
         conversationId={conversationId}
         readOnly={false}
         goal={GOAL}
@@ -38,24 +37,24 @@ function renderControl(conversationId: string | null = "conv") {
 
 afterEach(cleanup);
 
-describe("CodexGoalControl", () => {
+describe("GoalControl", () => {
   it("opens the dialog from the toolbar button", () => {
     renderControl();
 
     expect(screen.getByTestId("mock-goal-dialog")).toHaveAttribute("data-open", "false");
-    fireEvent.click(screen.getByTestId("codex-goal-toggle"));
+    fireEvent.click(screen.getByTestId("goal-toggle"));
     expect(screen.getByTestId("mock-goal-dialog")).toHaveAttribute("data-open", "true");
-    expect(screen.getByTestId("codex-goal-toggle")).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByTestId("goal-toggle")).toHaveAttribute("aria-pressed", "true");
   });
 
   it("disables the button without a conversation", () => {
     renderControl(null);
 
-    expect(screen.getByTestId("codex-goal-toggle")).toBeDisabled();
+    expect(screen.getByTestId("goal-toggle")).toBeDisabled();
   });
 
   it("renders the status pill", () => {
-    render(<CodexGoalStatusPill goal={{ ...GOAL, status: "blocked" }} />);
+    render(<GoalStatusPill goal={{ ...GOAL, status: "blocked" }} />);
 
     expect(screen.getByTestId("composer-goal-mode")).toHaveTextContent("Goal blocked");
   });

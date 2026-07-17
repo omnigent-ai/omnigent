@@ -11,47 +11,47 @@ import {
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import {
-  clearCodexGoal,
-  getCodexGoal,
-  setCodexGoal,
-  updateCodexGoalStatus,
-  type CodexGoal,
-  type CodexGoalStatusUpdate,
-} from "@/lib/codexGoalApi";
+  clearGoal,
+  getGoal,
+  setGoal,
+  updateGoalStatus,
+  type Goal,
+  type GoalStatusUpdate,
+} from "@/lib/goalApi";
 import { cn } from "@/lib/utils";
 import {
-  canPauseCodexGoal,
-  canResumeCodexGoal,
-  codexGoalModeDraftForGoal,
-  formatCodexGoalStatus,
-  formatCodexGoalUsage,
-  isCodexGoalUserMode,
-  type CodexGoalModeDraft,
-} from "./codexGoalUtils";
+  canPauseGoal,
+  canResumeGoal,
+  formatGoalStatus,
+  formatGoalUsage,
+  goalModeDraftForGoal,
+  isGoalUserMode,
+  type GoalModeDraft,
+} from "./goalUtils";
 
-export interface CodexGoalDialogProps {
+export interface GoalDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   conversationId: string | null;
   readOnly: boolean;
-  goal: CodexGoal | null;
-  onGoalChange: (goal: CodexGoal | null) => void;
+  goal: Goal | null;
+  onGoalChange: (goal: Goal | null) => void;
 }
 
-interface CodexGoalSummaryProps {
+interface GoalSummaryProps {
   loading: boolean;
-  goal: CodexGoal | null;
+  goal: Goal | null;
 }
 
 /**
- * Render the current Codex goal state inside the dialog.
+ * Render the current goal state inside the dialog.
  *
  * @param props - Current loading and goal state.
  * @param props.loading - ``true`` while the goal GET request is in flight.
  * @param props.goal - Current goal, or ``null`` when no goal is set.
  * @returns Current-goal summary element.
  */
-function CodexGoalSummary({ loading, goal }: CodexGoalSummaryProps) {
+function GoalSummary({ loading, goal }: GoalSummaryProps) {
   if (loading) {
     return (
       <div className="flex items-center gap-2 text-sm text-muted-foreground">
@@ -62,40 +62,40 @@ function CodexGoalSummary({ loading, goal }: CodexGoalSummaryProps) {
   }
   if (!goal) {
     return (
-      <p data-testid="codex-goal-empty" className="text-sm text-muted-foreground">
+      <p data-testid="goal-empty" className="text-sm text-muted-foreground">
         No goal set.
       </p>
     );
   }
   return (
     <div
-      data-testid="codex-goal-current"
+      data-testid="goal-current"
       className="space-y-1 rounded-lg border border-border bg-muted/30 p-3"
     >
       <div className="flex items-center justify-between gap-3 text-xs">
-        <span className="font-medium text-foreground">{formatCodexGoalStatus(goal.status)}</span>
-        <span className="shrink-0 text-muted-foreground">{formatCodexGoalUsage(goal)}</span>
+        <span className="font-medium text-foreground">{formatGoalStatus(goal.status)}</span>
+        <span className="shrink-0 text-muted-foreground">{formatGoalUsage(goal)}</span>
       </div>
       <p className="text-sm leading-5 whitespace-pre-wrap">{goal.objective}</p>
     </div>
   );
 }
 
-interface CodexGoalEditorProps {
+interface GoalEditorProps {
   objective: string;
   tokenBudget: string;
-  modeDraft: CodexGoalModeDraft;
-  goal: CodexGoal | null;
+  modeDraft: GoalModeDraft;
+  goal: Goal | null;
   readOnly: boolean;
   busy: boolean;
   error: string | null;
   onObjectiveChange: (value: string) => void;
   onTokenBudgetChange: (value: string) => void;
-  onModeChange: (value: CodexGoalModeDraft) => void;
+  onModeChange: (value: GoalModeDraft) => void;
 }
 
 /**
- * Render editable Codex goal fields.
+ * Render editable goal fields.
  *
  * @param props - Field values, disabled state, and change handlers.
  * @param props.objective - Draft goal objective text.
@@ -110,7 +110,7 @@ interface CodexGoalEditorProps {
  * @param props.onModeChange - Called with updated mode draft.
  * @returns Editor fields for the dialog.
  */
-function CodexGoalEditor({
+function GoalEditor({
   objective,
   tokenBudget,
   modeDraft,
@@ -121,8 +121,8 @@ function CodexGoalEditor({
   onObjectiveChange,
   onTokenBudgetChange,
   onModeChange,
-}: CodexGoalEditorProps) {
-  const showKeepCurrentMode = goal != null && !isCodexGoalUserMode(goal.status);
+}: GoalEditorProps) {
+  const showKeepCurrentMode = goal != null && !isGoalUserMode(goal.status);
   const modeButtonClass = (selected: boolean) =>
     cn(
       "inline-flex min-h-9 flex-1 items-center justify-center gap-2 rounded-md px-3 text-sm font-medium transition-colors",
@@ -135,17 +135,17 @@ function CodexGoalEditor({
   return (
     <>
       <div className="space-y-1.5">
-        <label className="text-xs font-medium text-muted-foreground" htmlFor="codex-goal">
+        <label className="text-xs font-medium text-muted-foreground" htmlFor="goal-objective">
           Objective
         </label>
         <Textarea
-          id="codex-goal"
+          id="goal-objective"
           value={objective}
           onChange={(event) => onObjectiveChange(event.currentTarget.value)}
           disabled={readOnly || busy}
           maxLength={4000}
           className="min-h-28 resize-y"
-          data-testid="codex-goal-objective"
+          data-testid="goal-objective"
         />
       </div>
 
@@ -155,7 +155,7 @@ function CodexGoalEditor({
           role="radiogroup"
           aria-label="Goal mode"
           className="flex w-full gap-1 rounded-lg border border-border bg-muted/30 p-1"
-          data-testid="codex-goal-mode"
+          data-testid="goal-mode"
         >
           {showKeepCurrentMode && (
             <button
@@ -165,7 +165,7 @@ function CodexGoalEditor({
               className={modeButtonClass(modeDraft === "keep")}
               disabled={readOnly || busy}
               onClick={() => onModeChange("keep")}
-              data-testid="codex-goal-mode-keep"
+              data-testid="goal-mode-keep"
             >
               <CheckIcon className="size-3.5" />
               <span>Keep current</span>
@@ -178,7 +178,7 @@ function CodexGoalEditor({
             className={modeButtonClass(modeDraft === "active")}
             disabled={readOnly || busy}
             onClick={() => onModeChange("active")}
-            data-testid="codex-goal-mode-active"
+            data-testid="goal-mode-active"
           >
             <PlayCircleIcon className="size-3.5" />
             <span>Active</span>
@@ -190,7 +190,7 @@ function CodexGoalEditor({
             className={modeButtonClass(modeDraft === "paused")}
             disabled={readOnly || busy}
             onClick={() => onModeChange("paused")}
-            data-testid="codex-goal-mode-paused"
+            data-testid="goal-mode-paused"
           >
             <PauseCircleIcon className="size-3.5" />
             <span>Paused</span>
@@ -199,14 +199,11 @@ function CodexGoalEditor({
       </div>
 
       <div className="space-y-1.5">
-        <label
-          className="text-xs font-medium text-muted-foreground"
-          htmlFor="codex-goal-token-budget"
-        >
+        <label className="text-xs font-medium text-muted-foreground" htmlFor="goal-token-budget">
           Token budget
         </label>
         <Input
-          id="codex-goal-token-budget"
+          id="goal-token-budget"
           type="number"
           inputMode="numeric"
           min={1}
@@ -215,7 +212,7 @@ function CodexGoalEditor({
           onChange={(event) => onTokenBudgetChange(event.currentTarget.value)}
           disabled={readOnly || busy}
           placeholder="Optional"
-          data-testid="codex-goal-token-budget"
+          data-testid="goal-token-budget"
         />
       </div>
 
@@ -224,32 +221,32 @@ function CodexGoalEditor({
   );
 }
 
-interface CodexGoalActionsProps {
+interface GoalActionsProps {
   readOnly: boolean;
   busy: boolean;
   saving: boolean;
   clearing: boolean;
-  statusUpdating: CodexGoalStatusUpdate | null;
+  statusUpdating: GoalStatusUpdate | null;
   hasGoal: boolean;
-  goal: CodexGoal | null;
+  goal: Goal | null;
   onSave: () => void;
   onClear: () => void;
   onPause: () => void;
   onResume: () => void;
 }
 
-interface CodexGoalDialogState {
+interface GoalDialogState {
   objective: string;
   tokenBudget: string;
-  modeDraft: CodexGoalModeDraft;
+  modeDraft: GoalModeDraft;
   loading: boolean;
   saving: boolean;
   clearing: boolean;
-  statusUpdating: CodexGoalStatusUpdate | null;
+  statusUpdating: GoalStatusUpdate | null;
   error: string | null;
   setObjectiveDraft: (value: string) => void;
   setTokenBudgetDraft: (value: string) => void;
-  setModeDraft: (value: CodexGoalModeDraft) => void;
+  setModeDraft: (value: GoalModeDraft) => void;
   saveGoal: () => Promise<void>;
   clearGoal: () => Promise<void>;
   pauseGoal: () => Promise<void>;
@@ -257,13 +254,13 @@ interface CodexGoalDialogState {
 }
 
 /**
- * Build a user-facing Codex goal error message.
+ * Build a user-facing goal error message.
  *
  * @param prefix - Operation label, e.g. ``"Could not read goal"``.
  * @param err - Thrown value from the API call.
  * @returns Error text for the dialog.
  */
-function codexGoalError(prefix: string, err: unknown): string {
+function goalError(prefix: string, err: unknown): string {
   const message = err instanceof Error ? err.message : String(err);
   return `${prefix}: ${message}`;
 }
@@ -275,7 +272,7 @@ function codexGoalError(prefix: string, err: unknown): string {
  * @returns Positive integer budget, or ``null`` when the field is blank.
  * @throws Error when the value is not a positive whole number.
  */
-export function parseCodexGoalBudget(value: string): number | null {
+export function parseGoalBudget(value: string): number | null {
   const trimmedBudget = value.trim();
   if (!trimmedBudget) return null;
   const parsed = Number(trimmedBudget);
@@ -286,7 +283,7 @@ export function parseCodexGoalBudget(value: string): number | null {
 }
 
 /**
- * Render Codex goal dialog action buttons.
+ * Render goal dialog action buttons.
  *
  * @param props - Button state and callbacks.
  * @param props.readOnly - ``true`` when write actions must be disabled.
@@ -302,7 +299,7 @@ export function parseCodexGoalBudget(value: string): number | null {
  * @param props.onResume - Called to resume a paused/blocked/limited goal.
  * @returns Dialog footer actions.
  */
-function CodexGoalActions({
+function GoalActions({
   readOnly,
   busy,
   saving,
@@ -314,9 +311,9 @@ function CodexGoalActions({
   onClear,
   onPause,
   onResume,
-}: CodexGoalActionsProps) {
-  const showPause = canPauseCodexGoal(goal);
-  const showResume = canResumeCodexGoal(goal);
+}: GoalActionsProps) {
+  const showPause = canPauseGoal(goal);
+  const showResume = canResumeGoal(goal);
   return (
     <DialogFooter>
       <Button
@@ -325,7 +322,7 @@ function CodexGoalActions({
         onClick={onClear}
         disabled={readOnly || busy || !hasGoal}
         loading={clearing}
-        data-testid="codex-goal-clear"
+        data-testid="goal-clear"
       >
         Clear
       </Button>
@@ -336,7 +333,7 @@ function CodexGoalActions({
           onClick={onPause}
           disabled={readOnly || busy}
           loading={statusUpdating === "paused"}
-          data-testid="codex-goal-pause"
+          data-testid="goal-pause"
         >
           <PauseCircleIcon className="size-3.5" />
           Pause
@@ -349,7 +346,7 @@ function CodexGoalActions({
           onClick={onResume}
           disabled={readOnly || busy}
           loading={statusUpdating === "active"}
-          data-testid="codex-goal-resume"
+          data-testid="goal-resume"
         >
           <PlayCircleIcon className="size-3.5" />
           Resume
@@ -360,7 +357,7 @@ function CodexGoalActions({
         onClick={onSave}
         disabled={readOnly || busy}
         loading={saving}
-        data-testid="codex-goal-save"
+        data-testid="goal-save"
       >
         {hasGoal ? "Update goal" : "Set goal"}
       </Button>
@@ -369,29 +366,24 @@ function CodexGoalActions({
 }
 
 /**
- * Own Codex goal dialog state and API operations.
+ * Own goal dialog state and API operations.
  *
- * @param props - Session and goal bindings from ``CodexGoalDialog``.
+ * @param props - Session and goal bindings from ``GoalDialog``.
  * @returns Dialog state, field setters, and async goal operations.
  */
-function useCodexGoalDialogState({
+function useGoalDialogState({
   open,
   conversationId,
   goal,
   onGoalChange,
-}: Pick<
-  CodexGoalDialogProps,
-  "open" | "conversationId" | "goal" | "onGoalChange"
->): CodexGoalDialogState {
+}: Pick<GoalDialogProps, "open" | "conversationId" | "goal" | "onGoalChange">): GoalDialogState {
   const [objective, setObjective] = useState(goal?.objective ?? "");
   const [tokenBudget, setTokenBudget] = useState(goal?.tokenBudget?.toString() ?? "");
-  const [modeDraft, setModeDraftState] = useState<CodexGoalModeDraft>(
-    codexGoalModeDraftForGoal(goal),
-  );
+  const [modeDraft, setModeDraftState] = useState<GoalModeDraft>(goalModeDraftForGoal(goal));
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [clearing, setClearing] = useState(false);
-  const [statusUpdating, setStatusUpdating] = useState<CodexGoalStatusUpdate | null>(null);
+  const [statusUpdating, setStatusUpdating] = useState<GoalStatusUpdate | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const refreshGoal = useCallback(async () => {
@@ -399,13 +391,13 @@ function useCodexGoalDialogState({
     setLoading(true);
     setError(null);
     try {
-      const response = await getCodexGoal(conversationId);
+      const response = await getGoal(conversationId);
       onGoalChange(response.goal);
       setObjective(response.goal?.objective ?? "");
       setTokenBudget(response.goal?.tokenBudget?.toString() ?? "");
-      setModeDraftState(codexGoalModeDraftForGoal(response.goal));
+      setModeDraftState(goalModeDraftForGoal(response.goal));
     } catch (err) {
-      setError(codexGoalError("Could not read goal", err));
+      setError(goalError("Could not read goal", err));
     } finally {
       setLoading(false);
     }
@@ -420,7 +412,7 @@ function useCodexGoalDialogState({
     if (!open) return;
     setObjective(goal?.objective ?? "");
     setTokenBudget(goal?.tokenBudget?.toString() ?? "");
-    setModeDraftState(codexGoalModeDraftForGoal(goal));
+    setModeDraftState(goalModeDraftForGoal(goal));
   }, [goal, open]);
 
   const setObjectiveDraft = (value: string) => {
@@ -431,7 +423,7 @@ function useCodexGoalDialogState({
     setTokenBudget(value);
     if (error !== null) setError(null);
   };
-  const setModeDraft = (value: CodexGoalModeDraft) => {
+  const setModeDraft = (value: GoalModeDraft) => {
     setModeDraftState(value);
     if (error !== null) setError(null);
   };
@@ -445,7 +437,7 @@ function useCodexGoalDialogState({
     }
     let parsedBudget: number | null;
     try {
-      parsedBudget = parseCodexGoalBudget(tokenBudget);
+      parsedBudget = parseGoalBudget(tokenBudget);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       return;
@@ -453,7 +445,7 @@ function useCodexGoalDialogState({
     setSaving(true);
     setError(null);
     try {
-      const response = await setCodexGoal(conversationId, {
+      const response = await setGoal(conversationId, {
         objective: trimmedObjective,
         tokenBudget: parsedBudget,
         status: modeDraft === "keep" ? undefined : modeDraft,
@@ -461,44 +453,44 @@ function useCodexGoalDialogState({
       onGoalChange(response.goal);
       setObjective(response.goal?.objective ?? trimmedObjective);
       setTokenBudget(response.goal?.tokenBudget?.toString() ?? tokenBudget.trim());
-      setModeDraftState(codexGoalModeDraftForGoal(response.goal));
+      setModeDraftState(goalModeDraftForGoal(response.goal));
     } catch (err) {
-      setError(codexGoalError("Could not set goal", err));
+      setError(goalError("Could not set goal", err));
     } finally {
       setSaving(false);
     }
   };
 
-  const clearGoal = async () => {
+  const clearCurrentGoal = async () => {
     if (!conversationId) return;
     setClearing(true);
     setError(null);
     try {
-      await clearCodexGoal(conversationId);
+      await clearGoal(conversationId);
       onGoalChange(null);
       setObjective("");
       setTokenBudget("");
       setModeDraftState("active");
     } catch (err) {
-      setError(codexGoalError("Could not clear goal", err));
+      setError(goalError("Could not clear goal", err));
     } finally {
       setClearing(false);
     }
   };
 
-  const updateGoalStatus = async (status: CodexGoalStatusUpdate) => {
+  const updateStatus = async (status: GoalStatusUpdate) => {
     if (!conversationId) return;
     setStatusUpdating(status);
     setError(null);
     try {
-      const response = await updateCodexGoalStatus(conversationId, status);
+      const response = await updateGoalStatus(conversationId, status);
       onGoalChange(response.goal);
       setObjective(response.goal?.objective ?? "");
       setTokenBudget(response.goal?.tokenBudget?.toString() ?? "");
-      setModeDraftState(codexGoalModeDraftForGoal(response.goal));
+      setModeDraftState(goalModeDraftForGoal(response.goal));
     } catch (err) {
       const action = status === "paused" ? "pause" : "resume";
-      setError(codexGoalError(`Could not ${action} goal`, err));
+      setError(goalError(`Could not ${action} goal`, err));
     } finally {
       setStatusUpdating(null);
     }
@@ -517,14 +509,14 @@ function useCodexGoalDialogState({
     setTokenBudgetDraft,
     setModeDraft,
     saveGoal,
-    clearGoal,
-    pauseGoal: () => updateGoalStatus("paused"),
-    resumeGoal: () => updateGoalStatus("active"),
+    clearGoal: clearCurrentGoal,
+    pauseGoal: () => updateStatus("paused"),
+    resumeGoal: () => updateStatus("active"),
   };
 }
 
 /**
- * Dialog for viewing, setting, and clearing a Codex-native thread goal.
+ * Dialog for viewing, setting, and clearing a session goal.
  *
  * @param props - Dialog state and session goal bindings.
  * @param props.open - Whether the dialog is open.
@@ -533,17 +525,17 @@ function useCodexGoalDialogState({
  * @param props.readOnly - ``true`` when write actions must be disabled.
  * @param props.goal - Current goal state, or ``null`` when none is set.
  * @param props.onGoalChange - Called after successful read, set, or clear.
- * @returns Codex goal dialog.
+ * @returns Goal dialog.
  */
-export function CodexGoalDialog({
+export function GoalDialog({
   open,
   onOpenChange,
   conversationId,
   readOnly,
   goal,
   onGoalChange,
-}: CodexGoalDialogProps) {
-  const state = useCodexGoalDialogState({
+}: GoalDialogProps) {
+  const state = useGoalDialogState({
     open,
     conversationId,
     goal,
@@ -563,8 +555,8 @@ export function CodexGoalDialog({
         </DialogHeader>
 
         <div className="space-y-3">
-          <CodexGoalSummary loading={loading} goal={goal} />
-          <CodexGoalEditor
+          <GoalSummary loading={loading} goal={goal} />
+          <GoalEditor
             objective={state.objective}
             tokenBudget={state.tokenBudget}
             modeDraft={state.modeDraft}
@@ -578,7 +570,7 @@ export function CodexGoalDialog({
           />
         </div>
 
-        <CodexGoalActions
+        <GoalActions
           readOnly={readOnly}
           busy={busy}
           saving={saving}

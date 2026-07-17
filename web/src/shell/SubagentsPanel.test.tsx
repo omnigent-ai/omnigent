@@ -1,4 +1,4 @@
-import { cleanup, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import {
   BookOpenIcon,
   Code2Icon,
@@ -92,6 +92,15 @@ function childRow(container: HTMLElement, childId: string): HTMLElement {
   const el = container.querySelector<HTMLElement>(`[data-child-session-id="${childId}"]`);
   if (!el) throw new Error(`subagent row ${childId} not rendered`);
   return el;
+}
+
+function collapseToggleFor(container: HTMLElement, childId: string): HTMLElement {
+  const row = childRow(container, childId);
+  const toggle = row
+    .closest("li")
+    ?.querySelector<HTMLElement>('[data-testid="subagent-collapse-toggle"]');
+  if (!toggle) throw new Error(`collapse toggle for ${childId} not rendered`);
+  return toggle;
 }
 
 /** Point useChildSessions at an id-keyed tree of children. The panel
@@ -1369,6 +1378,66 @@ describe("SubagentsPanel", () => {
     const pad = (id: string) => parseInt(childRow(container, id).style.paddingLeft, 10);
     expect(pad("conv_grandchild")).toBeGreaterThan(pad("conv_child"));
     expect(pad("conv_ggchild")).toBeGreaterThan(pad("conv_grandchild"));
+  });
+
+  it("collapses and expands a row's nested subagents", () => {
+    mockChildTree({
+      conv_root: [
+        childInfo({ id: "conv_child", tool: "researcher", session_name: "auth" }),
+        childInfo({ id: "conv_leaf", tool: "Explore", session_name: "leaf" }),
+      ],
+      conv_child: [childInfo({ id: "conv_grandchild", tool: "Explore", session_name: "files" })],
+    });
+
+    const { container } = renderPanel({ rootSessionId: "conv_root" });
+
+    expect(childRow(container, "conv_grandchild")).toBeInTheDocument();
+    expect(screen.getAllByTestId("subagent-collapse-toggle")).toHaveLength(1);
+
+    const toggle = screen.getByTestId("subagent-collapse-toggle");
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    expect(toggle).toHaveAttribute("aria-label", "Collapse subagents");
+
+    fireEvent.click(toggle);
+
+    expect(container.querySelector('[data-child-session-id="conv_grandchild"]')).toBeNull();
+    expect(childRow(container, "conv_leaf")).toBeInTheDocument();
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(toggle).toHaveAttribute("aria-label", "Expand subagents");
+
+    fireEvent.click(toggle);
+
+    expect(childRow(container, "conv_grandchild")).toBeInTheDocument();
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    expect(toggle).toHaveAttribute("aria-label", "Collapse subagents");
+  });
+
+  it("preserves a nested row's collapsed state when its parent unmounts it", () => {
+    mockChildTree({
+      conv_root: [childInfo({ id: "conv_child", tool: "researcher", session_name: "auth" })],
+      conv_child: [childInfo({ id: "conv_grandchild", tool: "Explore", session_name: "files" })],
+      conv_grandchild: [childInfo({ id: "conv_ggchild", tool: "Explore", session_name: "deep" })],
+    });
+
+    const { container } = renderPanel({ rootSessionId: "conv_root" });
+
+    const childToggle = collapseToggleFor(container, "conv_child");
+    const grandchildToggle = collapseToggleFor(container, "conv_grandchild");
+
+    fireEvent.click(grandchildToggle);
+    expect(container.querySelector('[data-child-session-id="conv_ggchild"]')).toBeNull();
+    expect(grandchildToggle).toHaveAttribute("aria-expanded", "false");
+
+    fireEvent.click(childToggle);
+    expect(container.querySelector('[data-child-session-id="conv_grandchild"]')).toBeNull();
+
+    fireEvent.click(childToggle);
+    expect(childRow(container, "conv_grandchild")).toBeInTheDocument();
+    expect(container.querySelector('[data-child-session-id="conv_ggchild"]')).toBeNull();
+    expect(collapseToggleFor(container, "conv_grandchild")).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
   });
 
   it("stops fetching and rendering below the depth cap", () => {

@@ -63,6 +63,7 @@ import type {
   StreamEvent,
   TextDelta,
   ToolCall,
+  ToolOutputDelta,
   ToolResult,
 } from "./events";
 import { NATIVE_TOOL_TYPES } from "./events";
@@ -321,6 +322,12 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     const index = typeof data.index === "number" ? data.index : undefined;
     const final = typeof data.final === "boolean" ? data.final : undefined;
     return { type: "text_delta", delta, messageId, index, final } satisfies TextDelta;
+  }
+  if (eventType === "response.function_call_output.delta") {
+    const callId = data.call_id;
+    const delta = data.delta;
+    if (typeof callId !== "string" || !callId || typeof delta !== "string") return null;
+    return { type: "tool_output_delta", callId, delta } satisfies ToolOutputDelta;
   }
 
   // Reasoning.

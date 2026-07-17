@@ -141,6 +141,13 @@ export interface ToolResult {
   responseId: string;
 }
 
+/** `response.function_call_output.delta` — live output from a running tool. */
+export interface ToolOutputDelta {
+  type: "tool_output_delta";
+  callId: string;
+  delta: string;
+}
+
 /**
  * A server-initiated elicitation, MCP shape.
  *
@@ -864,6 +871,7 @@ export type StreamEvent =
   | ReasoningSummaryDelta
   | ToolCall
   | ToolResult
+  | ToolOutputDelta
   | NativeToolCall
   | SlashCommand
   | RoutingDecision

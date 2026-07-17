@@ -544,13 +544,21 @@ function isCodexHarness(harness: string): boolean {
   return harness === "codex" || harness === "codex-native" || harness === "native-codex";
 }
 
+function isNativeCursorHarness(harness: string): boolean {
+  return harness === "cursor-native" || harness === "native-cursor";
+}
+
 export function harnessUnavailableReasonOnHost(
   harness: string | null | undefined,
   host: Host | undefined | null,
 ): string | null {
   if (!harness || !host?.configured_harnesses) return null;
   const availability = host.configured_harnesses[harness];
-  if (availability === false) return isCodexHarness(harness) ? "binary-missing" : "unconfigured";
+  if (availability === false) {
+    if (isCodexHarness(harness)) return "binary-missing";
+    if (isNativeCursorHarness(harness)) return "cursor-cli-missing";
+    return "unconfigured";
+  }
   if (
     isCodexHarness(harness) &&
     (availability === "binary-missing" || availability === "needs-auth")
@@ -564,6 +572,7 @@ export function harnessUnavailableReasonOnHost(
 export function harnessWarningBadgeText(reason: string | null): string {
   if (reason === "binary-missing") return "binary missing";
   if (reason === "needs-auth") return "needs auth";
+  if (reason === "cursor-cli-missing") return "install & login";
   return "needs setup";
 }
 
@@ -572,6 +581,9 @@ export function harnessWarningMessageText(
   hostName: string | undefined,
   reason: string | null,
 ): string {
+  if (reason === "cursor-cli-missing") {
+    return `${agentName} needs cursor-agent on ${hostName} — install it with \`curl https://cursor.com/install -fsS | bash\`, then run \`cursor-agent login\`.`;
+  }
   if (reason === "needs-auth") {
     return `${agentName} needs Codex authentication on ${hostName} — run codex login on that machine.`;
   }
@@ -586,6 +598,15 @@ function harnessWarningMessage(
   hostName: string | undefined,
   reason: string | null,
 ): ReactNode {
+  if (reason === "cursor-cli-missing") {
+    return (
+      <>
+        {agentName} needs cursor-agent on {hostName} — install it with{" "}
+        <code>curl https://cursor.com/install -fsS | bash</code>, then run{" "}
+        <code>cursor-agent login</code>.
+      </>
+    );
+  }
   if (reason === "needs-auth") {
     return (
       <>

@@ -5506,6 +5506,117 @@ def test_forwarder_posts_codex_command_execution_tool_call() -> None:
     ]
 
 
+def test_forwarder_streams_codex_command_output_before_completed_item(tmp_path: Path) -> None:
+    """Command output deltas update the live tool before its final result."""
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_123",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_123",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id="turn_123",
+        ),
+    )
+    posted: list[dict[str, Any]] = []
+    state = codex_native_forwarder._CodexForwarderState()
+    started_item = {
+        "type": "commandExecution",
+        "id": "call_abc123",
+        "command": "pytest -q",
+        "cwd": "/repo",
+        "status": "inProgress",
+    }
+    completed_item = {
+        **started_item,
+        "status": "completed",
+        "aggregatedOutput": "collecting tests...\n1 passed\n",
+        "exitCode": 0,
+    }
+
+    async def run() -> None:
+        """Replay command start, output chunks, and completion."""
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=httpx.MockTransport(_capture_handler(posted)),
+        ) as client:
+            coalescer = codex_native_forwarder._OutputTextDeltaCoalescer(
+                client,
+                "conv_123",
+                flush_interval_seconds=60.0,
+                flush_char_threshold=1000,
+            )
+            events = [
+                {
+                    "method": "item/started",
+                    "params": {
+                        "threadId": "thread_123",
+                        "turnId": "turn_123",
+                        "item": started_item,
+                    },
+                },
+                {
+                    "method": "item/commandExecution/outputDelta",
+                    "params": {
+                        "threadId": "thread_123",
+                        "turnId": "turn_123",
+                        "itemId": "call_abc123",
+                        "delta": "collecting ",
+                    },
+                },
+                {
+                    "method": "item/commandExecution/outputDelta",
+                    "params": {
+                        "threadId": "thread_123",
+                        "turnId": "turn_123",
+                        "itemId": "call_abc123",
+                        "delta": "tests...",
+                    },
+                },
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": "thread_123",
+                        "turnId": "turn_123",
+                        "item": completed_item,
+                    },
+                },
+            ]
+            for event in events:
+                await codex_native_forwarder._handle_event(
+                    client,
+                    session_id="conv_123",
+                    bridge_dir=tmp_path,
+                    usage_coalescer=_usage_coalescer(client),
+                    elicitation_tracker=_elicitation_tracker(),
+                    event=event,
+                    delta_coalescer=coalescer,
+                    forwarder_state=state,
+                )
+            await coalescer.close()
+
+    asyncio.run(run())
+
+    assert [payload["type"] for payload in posted] == [
+        "external_conversation_item",
+        "external_tool_output_delta",
+        "external_conversation_item",
+    ]
+    assert posted[0]["data"]["item_type"] == "function_call"
+    assert posted[1] == {
+        "type": "external_tool_output_delta",
+        "data": {"call_id": "call_abc123", "delta": "collecting tests..."},
+    }
+    assert posted[2]["data"] == {
+        "item_type": "function_call_output",
+        "item_data": {
+            "call_id": "call_abc123",
+            "output": "collecting tests...\n1 passed\n",
+        },
+        "response_id": "codex_turn_123",
+    }
+
+
 def test_forwarder_surfaces_failed_command_exit_code() -> None:
     """
     A non-zero command exit is surfaced in the mirrored output.

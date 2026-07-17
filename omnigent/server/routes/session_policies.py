@@ -28,6 +28,7 @@ from omnigent.runtime import get_caps
 from omnigent.runtime.policies.builder import invalidate_session_policy_specs_cache
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, AuthProvider
 from omnigent.server.routes._auth_helpers import get_user_id, require_access
+from omnigent.server.routes._errors import session_not_found
 from omnigent.server.schemas import (
     _DOTTED_PATH_RE,
     CreateSessionPolicyRequest,
@@ -144,7 +145,7 @@ def create_session_policies_router(
         """
         conv = conversation_store.get_conversation(session_id)
         if conv is None:
-            raise OmnigentError("Session not found", code=ErrorCode.NOT_FOUND)
+            raise session_not_found()
 
     @router.post("/sessions/{session_id}/policies")
     async def create_policy(

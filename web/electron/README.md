@@ -562,47 +562,22 @@ _invisible_ — the passkey sheet you see in Chrome/Safari is browser chrome,
 which Electron doesn't ship. Touching the key completes the ceremony with no
 UI.
 
-For a visual flow, the shell enables Electron's **Touch ID platform
-authenticator** (`app.configureWebAuthn`, Electron ≥ 42, macOS only):
-registering or signing in with a platform passkey then shows the native
-macOS Touch ID / keychain dialog, and a native chooser appears when several
-saved passkeys match. Three pieces must agree before this activates:
+The shell intentionally does **not** enable Electron's Touch ID platform
+authenticator (`app.configureWebAuthn`). Doing so routes the entire WebAuthn
+ceremony through Apple's AuthenticationServices provider, which cannot
+complete a roaming USB security-key request (e.g. YubiKey) against a
+third-party SSO relying party — the ceremony dies with an opaque
+`NotAllowedError` ("The operation either timed out or was not allowed").
+Leaving it off keeps security keys on Chromium's built-in CTAP path, which
+handles both roaming keys and Touch-ID-as-security-key. The native Touch ID
+platform passkey served no supported sign-in path: Databricks Touch ID
+sign-in goes through Okta FastPass (Okta Verify over the localhost loopback),
+not WebAuthn, and browser-registered passkeys are invisible to the app's
+keychain-access group anyway.
 
-1. `WEBAUTHN_KEYCHAIN_ACCESS_GROUP` in `src/main.js` —
-   `"<TEAM_ID>.ai.omnigent.desktop"`.
-2. The same string in the `keychain-access-groups` entitlement in
-   `signing/entitlements.mac.plist`.
-3. An **embedded Developer ID provisioning profile**
-   (`signing/omnigent.provisionprofile`, wired via `provisioningProfile`
-   in `package.json`). `keychain-access-groups` is a _restricted_
-   entitlement: a Developer ID signature alone doesn't authorize it, and
-   AMFI SIGKILLs the app at launch ("Launchd job spawn failed", POSIX
-   error 163). Create the profile in the Apple Developer portal: an App ID
-   for `ai.omnigent.desktop` (no extra capabilities — every profile
-   automatically authorizes keychain groups under `<TEAM_ID>.*`), then
-   Profiles → Distribution → Developer ID for that App ID. Verify with
-   `security cms -D -i signing/omnigent.provisionprofile`.
-
-The signing identity's team must match the group prefix —
-`package.json` pins `"identity"` for this reason (with several certs in
-the keychain, electron-builder's auto-discovery can pick the wrong one).
-Helpers must NOT inherit the keychain entitlement
-(`entitlementsInherit` points at the minimal
-`signing/entitlements.mac.inherit.plist`; a restricted entitlement on a
-helper shows up as a "GPU process exited unexpectedly" crash loop).
-
-It only works in a **code-signed** build, on Macs with a Secure Enclave.
-Until all three are set — and always in unsigned `npm start` dev runs —
-the platform authenticator stays off and security keys remain the
-(working, silent) path.
-
-Caveats: these passkeys are device-bound in the app's own keychain access
-group — they are **not** synced via iCloud Keychain, and passkeys you saved
-in Safari/Chrome are not visible to the app (and vice versa). Showing the
-full system passkey sheet (iCloud Keychain, cross-device QR) for arbitrary
-user-chosen servers would require Apple's browser-only
-`web-browser.public-key-credential` entitlement, or per-domain associated
-domains — neither fits an app whose servers are user-deployed.
+Because no restricted entitlements are used, a Developer ID certificate
+alone is sufficient for signing — no embedded provisioning profile is
+needed.
 
 ## Localhost access (auth flows)
 

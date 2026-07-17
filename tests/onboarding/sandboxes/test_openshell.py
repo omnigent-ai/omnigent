@@ -311,8 +311,16 @@ def test_exec_foreground_returns_exit_code(monkeypatch: pytest.MonkeyPatch) -> N
     [(name, command)] = fake.foreground_calls
     assert name == "sb-1"
     assert command[:2] == ["bash", "-lc"]
-    assert command[2].startswith("echo $$ >")
+    # The pidfile lives in a private, unpredictably-named dir created mode 700
+    # (fails closed if it already exists) so /tmp can't be pre-seeded.
+    assert command[2].startswith("mkdir -m 700 /tmp/oa-foreground-")
+    assert "echo $$ > /tmp/oa-foreground-" in command[2] and "/pid" in command[2]
     assert "exec omnigent host --server https://s" in command[2]
+    # A normal exit cleans up the run dir so it isn't orphaned in /tmp.
+    assert len(fake.exec_calls) == 1
+    cleanup = fake.exec_calls[0][1]
+    assert cleanup[:2] == ["bash", "-c"]
+    assert cleanup[2].startswith("rm -rf /tmp/oa-foreground-")
 
 
 def test_exec_foreground_ctrl_c_kills_remote(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -324,8 +332,12 @@ def test_exec_foreground_ctrl_c_kills_remote(monkeypatch: pytest.MonkeyPatch) ->
     with pytest.raises(KeyboardInterrupt):
         launcher.exec_foreground("sb-1", "omnigent host --server https://s")
 
-    # The interrupt handler issued a best-effort kill of the recorded pid.
-    assert any("kill $(cat" in command[2] for _name, command, _stdin in fake.exec_calls)
+    # The interrupt handler signals only a numeric pid read back from the
+    # private pidfile, then drops the dir.
+    assert len(fake.exec_calls) == 1
+    kill = fake.exec_calls[0][1][2]
+    assert 'case "$pid" in' in kill and 'kill "$pid"' in kill
+    assert "rm -rf /tmp/oa-foreground-" in kill
 
 
 # ── _OpenShellClient wrapper against a faked SDK ────────────

@@ -211,6 +211,13 @@ class Conversation:
     workspace: str | None = None
     git_branch: str | None = None
     archived: bool = False
+    # Live-state fields written by the replica holding the runner tunnel
+    # so any replica's session list can serve them. ``live_status`` is the
+    # last relay-observed turn status ("idle"/"running"/"waiting"/"failed",
+    # None = never reported); ``pending_elicitation_count`` is the
+    # outstanding approval-prompt count (None = never written).
+    live_status: str | None = None
+    pending_elicitation_count: int | None = None
     # Transient: populated only by list_conversations on a content search;
     # never read from or written to the DB.
     search_snippet: str | None = None

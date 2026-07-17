@@ -55,10 +55,12 @@ _HEALTH_TIMEOUT_S = 90.0
 _MOCK_TIMEOUT_S = 15.0
 _POLL_INTERVAL_S = 0.2
 _TURN_TIMEOUT_S = 180.0
-# Budget for the host daemon (session_cold_start journey, with_host) to connect
-# its tunnel and register in the hosts table after being spawned. Covers
+# Budget for the host daemon (host-backed cold journeys) to connect its tunnel
+# and register in the hosts table after being spawned. Covers
 # interpreter start + imports + the reverse-tunnel handshake.
 _HOST_ONLINE_TIMEOUT_S = 60.0
+# Budget for a host-owned runner tunnel to disappear after ``stop_session``.
+_RUNNER_OFFLINE_TIMEOUT_S = 30.0
 
 # Terminal SSE events — if one arrives before any delta, the turn produced no
 # streamed text (a failure for the TTFT journey).
@@ -112,9 +114,8 @@ class BenchEnvironment:
     :param with_host: When ``True`` (implies ``with_runner``), additionally
         spawn a real ``omnigent host`` daemon. Additive over ``with_runner``:
         the boot runner still serves the warm journeys, while the daemon lets
-        the ``session_cold_start`` journey create host-bound sessions that fire
-        ``host.launch_runner`` and launch their OWN fresh runner — so the first
-        message races the runner's boot, reproducing the true UI cold path.
+        the cold-start and cold-restart journeys use host-bound sessions that
+        fire ``host.launch_runner`` and launch their own fresh runners.
     :param database_uri: SQLAlchemy URI the server boots against. ``None``
         (default) uses a fresh throwaway SQLite file in the temp dir — the
         empty-DB path. Pass a pre-seeded URI (e.g. a seeded SQLite file, or a
@@ -216,9 +217,8 @@ class BenchEnvironment:
             self._runner_proc = self._spawn_runner(base_env, binding_token)
         self._wait_ready()
         # The host daemon is ADDITIVE — the boot runner above still serves the
-        # warm journeys; the daemon exists so the cold-start journey can create
-        # host-bound sessions that launch their OWN fresh runners on demand
-        # (the race the cold path measures). The two never share a runner id.
+        # warm journeys; the daemon exists so host-backed cold journeys can
+        # launch their own runners on demand. The two never share a runner id.
         if self.with_host:
             self._host_proc = self._spawn_host(base_env)
             self._wait_host_online()
@@ -340,10 +340,8 @@ class BenchEnvironment:
     ) -> subprocess.Popen[bytes]:
         """Spawn one runner subprocess under *runner_id* + *binding_token*.
 
-        Factored out of :meth:`_spawn_runner` so the ``session_cold_start``
-        journey can spawn additional runners on demand, each under its own id,
-        binding token, and workspace. The caller must pair *runner_id* with the token
-        it derives from (``token_bound_runner_id(binding_token)``): the runner
+        The caller must pair *runner_id* with the token it derives from
+        (``token_bound_runner_id(binding_token)``): the runner
         derives its managed-mint URL from the token internally, so a mismatch
         would register the tunnel under one id but mint under another (→ 401).
         """
@@ -640,6 +638,33 @@ class BenchEnvironment:
         bound.raise_for_status()
         return session_id
 
+    async def stop_session_runner(
+        self, session_id: str, *, timeout: float = _RUNNER_OFFLINE_TIMEOUT_S
+    ) -> None:
+        """Stop a host-backed session's runner and wait until it is offline.
+
+        ``stop_session`` preserves the conversation and its host binding. The
+        next user message therefore exercises the production auto-relaunch
+        path instead of starting a new conversation.
+        """
+        assert self.client is not None
+        if not self.with_host:
+            raise RuntimeError("stop_session_runner requires with_host=True")
+        stopped = await self.client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={"type": "stop_session", "data": {}},
+        )
+        stopped.raise_for_status()
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            snap = await self.client.get(f"/v1/sessions/{session_id}")
+            snap.raise_for_status()
+            if snap.json().get("runner_online") is False:
+                return
+            await asyncio.sleep(_POLL_INTERVAL_S)
+        raise RuntimeError(f"runner did not stop within {timeout}s (session {session_id})")
+
     async def write_runner_file(self, session_id: str, relative_path: str, content: str) -> None:
         """Write a file into the runner's default environment over HTTP.
 
@@ -742,9 +767,9 @@ class BenchEnvironment:
 
         :param wait_idle_first: When ``True``, wait for the session to be ``idle``
             before subscribing so a prior turn's terminal event can't race this
-            turn's response (warm-session TTFT). ``False`` for a fresh session whose
-            first turn is the only one — the cold path, where the timed span must
-            include runner launch + connect, so we must NOT poll it warm first.
+            turn's response (warm-session TTFT). ``False`` for a fresh session or
+            a stopped existing session — cold paths where polling for ``idle``
+            would either warm the runner or wait forever on its disconnected state.
         :raises RuntimeError: If not in runner mode, or no response / a terminal
             event arrives within *timeout*.
         """
@@ -843,6 +868,19 @@ class BenchEnvironment:
         """
         await self._post_and_await_first_delta(
             session_id, text, wait_idle_first=True, timeout=timeout
+        )
+
+    async def cold_restart_first_delta(
+        self, session_id: str, text: str, *, timeout: float = _TURN_TIMEOUT_S
+    ) -> None:
+        """Post to a stopped existing session and await its first response.
+
+        A stopped session is marked failed rather than idle, so this deliberately
+        skips the warm-session idle poll. The POST itself triggers the host runner
+        relaunch whose latency this path measures.
+        """
+        await self._post_and_await_first_delta(
+            session_id, text, wait_idle_first=False, timeout=timeout
         )
 
     async def cold_start_first_delta(

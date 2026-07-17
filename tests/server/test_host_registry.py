@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 from dataclasses import dataclass, field
 
 import pytest
@@ -256,3 +257,36 @@ def test_exit_reports_get_is_unscoped() -> None:
     assert reports.get("runner_abc") == "runner process exited with code 1"
     # Missing runner still reads None (snapshot then leaves last_task_error unset).
     assert reports.get("runner_unknown") is None
+
+
+def test_legacy_prefixed_id_resolves_to_bare_registration() -> None:
+    """
+    Every ``uuid_to_bytes``-accepted spelling of a host id must key
+    the same registry entry (regression: #2740).
+
+    The tunnel route registers under the bare-hex form, but
+    pre-migration clients still send ``host_<hex>`` in REST paths.
+    Before the fix, ``get`` was exact-string: launches 409'd "host
+    is offline" while ``GET /v1/hosts`` (DB-normalized) reported the
+    host online.
+    """
+    bare = "00112233445566778899aabbccddeeff"
+    prefixed = f"host_{bare}"
+    dashed = str(uuid.UUID(bare))
+
+    registry = HostRegistry()
+    conn = registry.register(bare, FakeWebSocket(), _make_hello(), owner="alice")
+
+    assert registry.get(prefixed) is conn
+    assert registry.get(dashed) is conn
+
+    # Registering under a legacy spelling replaces the same entry, and
+    # the stored connection carries the canonical id (send_text's
+    # replaced-connection check keys on conn.host_id).
+    replacement = registry.register(prefixed, FakeWebSocket(), _make_hello(), owner="alice")
+    assert replacement.host_id == bare
+    assert registry.get(bare) is replacement
+
+    # Deregistering by any spelling removes the entry.
+    registry.deregister(prefixed)
+    assert registry.get(bare) is None
