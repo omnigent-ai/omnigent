@@ -421,9 +421,6 @@ function SkillList({
           OWNERSHIP_ORDER.map((ownership) => {
             const rows = skills.filter((s) => s.ownership === ownership);
             if (rows.length === 0) return null;
-            // The Agent heading carries the bound agent's name (all agent-owned
-            // rows in one session share it).
-            const agentName = ownership === "agent" ? (rows[0].agentName ?? null) : null;
             const collapsed = collapsedSections.has(ownership) && !filtersActive;
             return (
               <section key={ownership} className="mb-2" data-testid={`skills-section-${ownership}`}>
@@ -441,29 +438,138 @@ function SkillList({
                       !collapsed && "rotate-90",
                     )}
                   />
-                  <span className="truncate">{ownershipLabel(ownership, agentName)}</span>
+                  <span className="truncate">{ownershipLabel(ownership)}</span>
                   <span className="ml-auto rounded-full bg-muted px-1.5 text-[10px] font-semibold tabular-nums text-muted-foreground">
                     {rows.length}
                   </span>
                 </button>
-                {!collapsed && (
-                  <SkillGroupRows
-                    groupKey={ownership}
-                    rows={rows}
-                    capBypassed={filtersActive}
-                    selectedId={selectedId}
-                    selectedFile={selectedFile}
-                    onSelectSkill={onSelectSkill}
-                    onSelectFile={onSelectFile}
-                    sessionId={sessionId}
-                    includeOtherTools={includeOtherTools}
-                  />
-                )}
+                {!collapsed &&
+                  (ownership === "agent" ? (
+                    // The Agent section nests per-agent subgroups so multiple
+                    // registered agents (Polly, Debby, …) never blur together;
+                    // each subgroup reuses the 6-item cap independently.
+                    agentSubgroups(rows).map((sub) => (
+                      <AgentSubgroup
+                        key={sub.key}
+                        agentName={sub.agentName}
+                        invokable={sub.invokable}
+                        rows={sub.rows}
+                        capBypassed={filtersActive}
+                        selectedId={selectedId}
+                        selectedFile={selectedFile}
+                        onSelectSkill={onSelectSkill}
+                        onSelectFile={onSelectFile}
+                        sessionId={sessionId}
+                        includeOtherTools={includeOtherTools}
+                      />
+                    ))
+                  ) : (
+                    <SkillGroupRows
+                      groupKey={ownership}
+                      rows={rows}
+                      capBypassed={filtersActive}
+                      selectedId={selectedId}
+                      selectedFile={selectedFile}
+                      onSelectSkill={onSelectSkill}
+                      onSelectFile={onSelectFile}
+                      sessionId={sessionId}
+                      includeOtherTools={includeOtherTools}
+                    />
+                  ))}
               </section>
             );
           })
         )}
       </div>
+    </div>
+  );
+}
+
+/** One per-agent subgroup within the Agent ownership section. */
+interface AgentSubgroupData {
+  key: string;
+  agentName: string;
+  invokable: boolean;
+  rows: SkillSummary[];
+}
+
+/**
+ * Split the Agent section's rows into per-agent subgroups (keyed by agent id,
+ * falling back to name), ordering the CURRENT session's agent first, then the
+ * rest alphabetically. Each subgroup carries whether it's invokable here.
+ */
+function agentSubgroups(rows: SkillSummary[]): AgentSubgroupData[] {
+  const byAgent = new Map<string, AgentSubgroupData>();
+  for (const row of rows) {
+    const key = row.agentId ?? row.agentName ?? "agent";
+    let group = byAgent.get(key);
+    if (!group) {
+      group = {
+        key,
+        agentName: row.agentName ?? "Agent",
+        invokable: row.invokableInCurrentSession,
+        rows: [],
+      };
+      byAgent.set(key, group);
+    }
+    // A subgroup is invokable iff its skills are usable in this session (the
+    // bound agent). All rows for one agent share this flag.
+    group.invokable = group.invokable || row.invokableInCurrentSession;
+    group.rows.push(row);
+  }
+  return [...byAgent.values()].sort((a, b) => {
+    if (a.invokable !== b.invokable) return a.invokable ? -1 : 1;
+    return a.agentName.localeCompare(b.agentName);
+  });
+}
+
+/**
+ * A per-agent subgroup: a small agent-name label with an availability hint
+ * ("Available in this session" for the bound agent, "Use with <Agent>" for
+ * others), then that agent's capped rows.
+ */
+function AgentSubgroup({
+  agentName,
+  invokable,
+  rows,
+  capBypassed,
+  selectedId,
+  selectedFile,
+  onSelectSkill,
+  onSelectFile,
+  sessionId,
+  includeOtherTools,
+}: {
+  agentName: string;
+  invokable: boolean;
+  rows: SkillSummary[];
+  capBypassed: boolean;
+  selectedId: string | null;
+  selectedFile: string | null;
+  onSelectSkill: (id: string) => void;
+  onSelectFile: (skillId: string, path: string) => void;
+  sessionId: string;
+  includeOtherTools: boolean;
+}) {
+  return (
+    <div className="mb-1" data-testid={`skills-agent-subgroup-${agentName}`}>
+      <div className="flex items-baseline gap-2 px-2 pb-0.5 pt-1">
+        <span className="truncate text-[11px] font-semibold text-foreground">{agentName}</span>
+        <span className="shrink-0 text-[10px] text-muted-foreground">
+          {invokable ? "Available in this session" : `Use with ${agentName}`}
+        </span>
+      </div>
+      <SkillGroupRows
+        groupKey={`agent:${agentName}`}
+        rows={rows}
+        capBypassed={capBypassed}
+        selectedId={selectedId}
+        selectedFile={selectedFile}
+        onSelectSkill={onSelectSkill}
+        onSelectFile={onSelectFile}
+        sessionId={sessionId}
+        includeOtherTools={includeOtherTools}
+      />
     </div>
   );
 }
@@ -744,7 +850,8 @@ function SkillDetailBody({ skill }: { skill: SkillDetail }) {
         </p>
       </Section>
 
-      {/* Source — the path is the provenance source of truth (not a scope word). */}
+      {/* Source — the path is the provenance source of truth (not a scope word).
+          For an agent-bundled skill the headline reads "Bundled with <Agent>". */}
       <Section label="Source">
         <div
           className="inline-flex max-w-full items-center gap-2.5 rounded-lg border border-border bg-muted px-3 py-2"
@@ -756,12 +863,23 @@ function SkillDetailBody({ skill }: { skill: SkillDetail }) {
             style={{ background: accent }}
           />
           <span className="truncate font-mono text-[13px] font-semibold text-foreground">
-            {skill.displayPath}
+            {skill.ownership === "agent" && skill.agentName
+              ? `Bundled with ${skill.agentName}`
+              : skill.displayPath}
           </span>
           <span className="shrink-0 border-l border-border pl-2.5 text-[11.5px] text-muted-foreground">
             {providerLabel(skill.advanced.discoveryProvider)}
           </span>
         </div>
+        {/* Execution scope — browse visibility is global, but usability is
+            per-session. Say so explicitly for agent-bundled skills. */}
+        {skill.ownership === "agent" && (
+          <p className="mt-1.5 text-[11.5px] text-muted-foreground" data-testid="skill-exec-scope">
+            {skill.invokableInCurrentSession
+              ? "Available in this session."
+              : `Only available with ${skill.requiredAgentName ?? skill.agentName ?? "its agent"}. Browsing here does not load it into the current session.`}
+          </p>
+        )}
       </Section>
 
       {/* Advanced details — kept above the (long) instructions so the compact

@@ -71,6 +71,13 @@ interface SkillSummaryWire {
   ownership: SkillOwnership;
   /** The owning agent's name — present only when `ownership === "agent"`. */
   agent_name: string | null;
+  /** The owning agent's id — present for aggregated agent-bundle entries. */
+  agent_id?: string | null;
+  /** True when the skill is usable in the CURRENT session (browse vs execute). */
+  invokable_in_current_session?: boolean;
+  /** For a non-invokable agent skill: the agent it must be used with. */
+  required_agent_id?: string | null;
+  required_agent_name?: string | null;
   /**
    * Concise, root-anchored source path — the user-facing provenance
    * (`.claude/skills/foo`, `~/.codex/skills/foo`, `Included with agent`).
@@ -154,6 +161,16 @@ export interface SkillSummary {
   ownership: SkillOwnership;
   /** The owning agent's name — present only when `ownership === "agent"`. */
   agentName: string | null;
+  /** The owning agent's id — present for aggregated agent-bundle entries. */
+  agentId: string | null;
+  /**
+   * Whether the skill is usable in the CURRENT session. Browse-only entries
+   * (another agent's bundle) are `false`; everything the bound session resolves
+   * is `true`. Governs the "Available in this session" vs "Use with X" label.
+   */
+  invokableInCurrentSession: boolean;
+  /** For a non-invokable agent skill: the agent it must be used with. */
+  requiredAgentName: string | null;
   /**
    * The user-facing source of truth: a concise, root-anchored path such as
    * `.claude/skills/foo`, `~/.codex/skills/foo`, or the literal
@@ -320,6 +337,11 @@ function toSummary(w: SkillSummaryWire): SkillSummary {
     origin: w.origin,
     ownership: w.ownership,
     agentName: w.agent_name ?? null,
+    agentId: w.agent_id ?? null,
+    // Browse entries default to invokable unless the server marks them
+    // browse-only (another agent's bundle).
+    invokableInCurrentSession: w.invokable_in_current_session ?? true,
+    requiredAgentName: w.required_agent_name ?? null,
     displayPath: w.display_path,
     enabled: w.enabled,
     available: w.available,

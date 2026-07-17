@@ -2421,6 +2421,8 @@ def create_app(
             runner_router=runner_router,
             auth_provider=auth_provider,
             permission_store=permission_store,
+            agent_store=agent_store,
+            agent_cache=agent_cache,
         ),
         prefix="/v1",
         tags=["skills"],

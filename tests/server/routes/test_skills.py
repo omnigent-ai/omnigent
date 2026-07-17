@@ -236,3 +236,141 @@ def test_trust_routes_remain_server_persisted(tmp_path, monkeypatch) -> None:  #
         "value": "all-host",
         "include_other_tools": True,
     }
+
+
+# ── all-agent browse aggregation (_AgentBundleAggregator) ─────────────────────
+
+from pathlib import Path  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
+
+from omnigent.server.routes.skills import _AgentBundleAggregator  # noqa: E402
+from omnigent.spec.types import SkillSpec  # noqa: E402
+
+
+def _bundle_agent(tmp_path: Path, agent_id: str, name: str, skill_name: str):
+    """A fake registered agent + AgentCache pair backed by a real bundle dir."""
+    sdir = tmp_path / agent_id / "skills" / skill_name
+    sdir.mkdir(parents=True)
+    (sdir / "SKILL.md").write_text(f"---\nname: {skill_name}\ndescription: {name} skill\n---\nbody\n")
+    skill = SkillSpec(name=skill_name, description=f"{name} skill", content="body", skill_dir=sdir)
+    spec = SimpleNamespace(
+        name=name,
+        skills=[skill],
+        skills_filter="all",
+        skill_trust="all-host",
+        executor=SimpleNamespace(harness_kind="claude-sdk"),
+    )
+    workdir = tmp_path / agent_id
+    agent = SimpleNamespace(id=agent_id, name=name, bundle_location=f"{agent_id}/rev1")
+    return agent, SimpleNamespace(spec=spec, workdir=workdir)
+
+
+def _aggregator(agents_and_loaded: dict[str, tuple[Any, Any]]) -> _AgentBundleAggregator:
+    agents = [a for a, _ in agents_and_loaded.values()]
+    loaded_by_id = {aid: loaded for aid, (_, loaded) in agents_and_loaded.items()}
+
+    store = SimpleNamespace(
+        list=lambda limit=200: SimpleNamespace(data=agents),
+        get=lambda aid: next((a for a in agents if a.id == aid), None),
+    )
+
+    def _load(agent_id: str, loc: str):
+        return loaded_by_id[agent_id]
+
+    cache = SimpleNamespace(load=_load)
+    return _AgentBundleAggregator(store, cache)
+
+
+def test_aggregates_all_agents_with_availability(tmp_path: Path) -> None:
+    polly = _bundle_agent(tmp_path, "ag_polly", "polly", "cross-review")
+    debby = _bundle_agent(tmp_path, "ag_debby", "debby", "debate")
+    agg = _aggregator({"ag_polly": polly, "ag_debby": debby})
+
+    # Bound to polly: a runner payload already lists polly's bundled skill.
+    payload = {
+        "object": "list",
+        "data": [
+            {
+                "id": "cross-review:hash",
+                "name": "cross-review",
+                "ownership": "agent",
+                "agent_name": "polly",
+                "display_path": "Included with agent",
+            }
+        ],
+        "include_other_tools": True,
+        "hidden_count": 0,
+    }
+    out = agg.aggregate_into(payload, bound_agent_id="ag_polly")
+    rows = out["data"]
+    by_name = {r["name"]: r for r in rows}
+
+    # Debby's bundle skill now appears (from a polly session), marked not
+    # invokable + required agent.
+    assert "debate" in by_name
+    assert by_name["debate"]["ownership"] == "agent"
+    assert by_name["debate"]["agent_name"] == "debby"
+    assert by_name["debate"]["invokable_in_current_session"] is False
+    assert by_name["debate"]["required_agent_name"] == "debby"
+
+    # Polly's own row stays invokable and is NOT duplicated.
+    assert by_name["cross-review"]["invokable_in_current_session"] is True
+    assert by_name["cross-review"]["agent_id"] == "ag_polly"
+    assert sum(1 for r in rows if r["name"] == "cross-review") == 1
+
+
+def test_same_name_skills_across_agents_are_distinct_entries(tmp_path: Path) -> None:
+    a = _bundle_agent(tmp_path, "ag_a", "alpha", "review")
+    b = _bundle_agent(tmp_path, "ag_b", "beta", "review")
+    agg = _aggregator({"ag_a": a, "ag_b": b})
+
+    payload = {"object": "list", "data": [], "include_other_tools": True, "hidden_count": 0}
+    out = agg.aggregate_into(payload, bound_agent_id=None)
+    review_ids = [r["id"] for r in out["data"] if r["name"] == "review"]
+    # Two same-named skills from different agents → two DISTINCT browse ids.
+    assert len(review_ids) == 2
+    assert len(set(review_ids)) == 2
+    assert all(rid.startswith("agent:ag_") for rid in review_ids)
+
+
+def test_bundle_entries_cached_by_bundle_location(tmp_path: Path) -> None:
+    polly = _bundle_agent(tmp_path, "ag_polly", "polly", "cross-review")
+    calls = {"n": 0}
+    agent, loaded = polly
+
+    def _load(agent_id: str, loc: str):
+        calls["n"] += 1
+        return loaded
+
+    store = SimpleNamespace(
+        list=lambda limit=200: SimpleNamespace(data=[agent]),
+        get=lambda aid: agent if aid == agent.id else None,
+    )
+    agg = _AgentBundleAggregator(store, SimpleNamespace(load=_load))
+
+    base = {"object": "list", "data": [], "include_other_tools": True, "hidden_count": 0}
+    agg.aggregate_into(dict(base, data=[]), bound_agent_id=None)
+    agg.aggregate_into(dict(base, data=[]), bound_agent_id=None)
+    # The bundle is loaded/serialized once and reused (cached by bundle_location).
+    assert calls["n"] == 1
+
+
+def test_aggregated_detail_and_bundle_dir_resolve(tmp_path: Path) -> None:
+    debby = _bundle_agent(tmp_path, "ag_debby", "debby", "debate")
+    agg = _aggregator({"ag_debby": debby})
+    # Discover the aggregated browse id.
+    out = agg.aggregate_into(
+        {"object": "list", "data": [], "include_other_tools": True, "hidden_count": 0},
+        bound_agent_id=None,
+    )
+    skill_id = next(r["id"] for r in out["data"] if r["name"] == "debate")
+
+    detail = agg.detail_for(skill_id, required_agent_id="ag_debby", agent_name="debby")
+    assert detail is not None
+    assert detail["invokable_in_current_session"] is False
+    assert detail["required_agent_name"] == "debby"
+    assert "content" in detail and "provenance" in detail
+
+    bundle_dir = agg.bundle_dir_for(skill_id)
+    assert bundle_dir is not None
+    assert (Path(bundle_dir) / "SKILL.md").is_file()

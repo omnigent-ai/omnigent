@@ -49,6 +49,9 @@ function summary(overrides: Partial<SkillSummary> = {}): SkillSummary {
     origin: "built_in",
     ownership: "omnigent",
     agentName: null,
+    agentId: null,
+    invokableInCurrentSession: true,
+    requiredAgentName: null,
     displayPath: "Included with agent",
     enabled: true,
     available: true,
@@ -120,6 +123,8 @@ const AGENT_BUNDLED = summary({
   origin: "built_in",
   ownership: "agent",
   agentName: "polly",
+  agentId: "ag_polly",
+  invokableInCurrentSession: true,
   displayPath: "Included with agent",
 });
 
@@ -311,9 +316,14 @@ describe("SkillsPage", () => {
       "skills-section-agent",
       "skills-section-local",
     ]);
-    // Agent heading carries the bound agent's name.
+    // The Agent section header is neutral ("Agent"); the agent NAME lives in the
+    // nested per-agent subgroup.
+    const agentSection = screen.getByTestId("skills-section-agent");
+    expect(within(agentSection).getByTestId("skills-section-header-agent")).toHaveTextContent(
+      "Agent",
+    );
     expect(
-      within(screen.getByTestId("skills-section-agent")).getByText("Agent · polly"),
+      within(screen.getByTestId("skills-agent-subgroup-polly")).getByText("polly"),
     ).toBeInTheDocument();
     expect(
       within(screen.getByTestId("skills-section-omnigent")).getByText("Omnigent"),
@@ -1041,5 +1051,89 @@ describe("SkillsPage — per-group 6-item cap", () => {
     await waitFor(() => expect(screen.queryByTestId("skill-row-local-0")).toBeNull());
     // The cap control is gone too while collapsed.
     expect(screen.queryByTestId("skills-group-more-local")).toBeNull();
+  });
+});
+
+describe("SkillsPage — per-agent subgroups + availability", () => {
+  const POLLY_SKILL = summary({
+    id: "agent:ag_polly:cross-review",
+    name: "cross-review",
+    description: "Cross-review.",
+    ownership: "agent",
+    agentName: "polly",
+    agentId: "ag_polly",
+    invokableInCurrentSession: true,
+    displayPath: "Included with agent",
+  });
+  const DEBBY_SKILL = summary({
+    id: "agent:ag_debby:debate",
+    name: "debate",
+    description: "Debate a plan.",
+    ownership: "agent",
+    agentName: "debby",
+    agentId: "ag_debby",
+    invokableInCurrentSession: false,
+    requiredAgentName: "debby",
+    displayPath: "Included with agent",
+  });
+
+  it("nests per-agent subgroups under the Agent section (Polly + Debby)", async () => {
+    vi.mocked(skillsApi.getSkillCatalog).mockResolvedValue({
+      skills: [POLLY_SKILL, DEBBY_SKILL],
+      includeOtherTools: true,
+      hiddenCount: 0,
+    });
+    renderPage();
+    await screen.findByTestId("skill-row-cross-review");
+
+    // Both agents get their own subgroup — one never hides the other.
+    const polly = screen.getByTestId("skills-agent-subgroup-polly");
+    const debby = screen.getByTestId("skills-agent-subgroup-debby");
+    expect(within(polly).getByText("Available in this session")).toBeInTheDocument();
+    expect(within(debby).getByText("Use with debby")).toBeInTheDocument();
+    // Same skills live in the right subgroups.
+    expect(within(polly).getByTestId("skill-row-cross-review")).toBeInTheDocument();
+    expect(within(debby).getByTestId("skill-row-debate")).toBeInTheDocument();
+  });
+
+  it("orders the invokable (current) agent subgroup first", async () => {
+    vi.mocked(skillsApi.getSkillCatalog).mockResolvedValue({
+      skills: [DEBBY_SKILL, POLLY_SKILL],
+      includeOtherTools: true,
+      hiddenCount: 0,
+    });
+    renderPage();
+    await screen.findByTestId("skill-row-cross-review");
+    const subs = screen
+      .getAllByTestId(/^skills-agent-subgroup-/)
+      .map((el) => el.getAttribute("data-testid"));
+    // Polly (invokable) before Debby (browse-only) regardless of catalog order.
+    expect(subs).toEqual(["skills-agent-subgroup-polly", "skills-agent-subgroup-debby"]);
+  });
+
+  it("shows 'Bundled with <Agent>' + execution scope in the detail for another agent", async () => {
+    vi.mocked(skillsApi.getSkillCatalog).mockResolvedValue({
+      skills: [DEBBY_SKILL],
+      includeOtherTools: true,
+      hiddenCount: 0,
+    });
+    vi.mocked(skillsApi.getSkillDetail).mockResolvedValue(
+      detail({
+        id: "agent:ag_debby:debate",
+        name: "debate",
+        ownership: "agent",
+        agentName: "debby",
+        agentId: "ag_debby",
+        invokableInCurrentSession: false,
+        requiredAgentName: "debby",
+        displayPath: "Included with agent",
+      }),
+    );
+    renderPage();
+    const detailPane = await screen.findByTestId("skill-detail");
+    expect(within(detailPane).getByTestId("skill-source")).toHaveTextContent("Bundled with debby");
+    expect(within(detailPane).getByTestId("skill-exec-scope")).toHaveTextContent(
+      /Only available with debby/i,
+    );
   });
 });
