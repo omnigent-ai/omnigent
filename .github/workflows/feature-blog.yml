@@ -52,6 +52,13 @@ on:
         type: choice
         options: [auto, "true", "false"]
         default: auto
+      max_posts:
+        description: >-
+          Maximum number of blog posts to draft (the scout still only picks
+          features that clear the bar, so it may pick fewer). Default 3.
+        required: false
+        type: string
+        default: "3"
 
 permissions:
   contents: read
@@ -86,11 +93,20 @@ jobs:
           INPUT_TAG: ${{ inputs.tag }}
           INPUT_BASE: ${{ inputs.base }}
           INPUT_DRY_RUN: ${{ inputs.dry_run }}
+          INPUT_MAX_POSTS: ${{ inputs.max_posts }}
         run: |
           set -euo pipefail
           tag="${INPUT_TAG:-$RUN_BRANCH}"
           base="${INPUT_BASE:-}"
           proceed=false; dry_run=false
+
+          # How many posts to draft at most. Only settable via manual dispatch;
+          # a real release cut (workflow_run) uses the default. Must be a positive
+          # integer, else fall back to the default.
+          max_posts="${INPUT_MAX_POSTS:-3}"
+          case "$max_posts" in
+            ""|*[!0-9]*|0) max_posts=3 ;;
+          esac
 
           # Does the tag look like a final release (vX.Y.Z, not rc/dev/alpha/beta)?
           is_version=true
@@ -122,7 +138,8 @@ jobs:
           echo "base=${base}" >> "$GITHUB_OUTPUT"
           echo "proceed=${proceed}" >> "$GITHUB_OUTPUT"
           echo "dry_run=${dry_run}" >> "$GITHUB_OUTPUT"
-          echo "Resolved tag=${tag} base=${base:-<none>} proceed=${proceed} dry_run=${dry_run}" \
+          echo "max_posts=${max_posts}" >> "$GITHUB_OUTPUT"
+          echo "Resolved tag=${tag} base=${base:-<none>} proceed=${proceed} dry_run=${dry_run} max_posts=${max_posts}" \
             | tee -a "$GITHUB_STEP_SUMMARY"
 
       # Trusted default branch, full history + tags for the range computation.
@@ -179,11 +196,13 @@ jobs:
         if: steps.guard.outputs.proceed == 'true' && steps.creds.outputs.available == 'true'
         env:
           TAG: ${{ steps.guard.outputs.tag }}
+          MAX_POSTS: ${{ steps.guard.outputs.max_posts }}
         run: |
           set -euo pipefail
           python3 -u <<'PYEOF'
           import os, pathlib
           tag = os.environ["TAG"]
+          max_posts = int(os.environ.get("MAX_POSTS", "3"))
           # `omnigent run -p` passes the whole prompt as one argv string, capped at
           # ~128 KiB on Linux. Cap the PR list well under that.
           MAX = 100_000
@@ -194,6 +213,8 @@ jobs:
           note = ("\n> NOTE: the PR list was truncated — select from what's visible.\n"
                   if truncated else "")
           prompt = f"""Select the blog-worthy features (if any) from {tag}.
+          Return AT MOST {max_posts} feature(s), ranked strongest-first — pick fewer
+          if fewer clear the bar. This overrides any other cap in your instructions.
           {note}
           ## Merged PRs (number, title, and author changelog entries)
           {pr_list}
@@ -225,6 +246,8 @@ jobs:
       - name: Parse candidates
         id: candidates
         if: steps.guard.outputs.proceed == 'true' && steps.creds.outputs.available == 'true'
+        env:
+          MAX_POSTS: ${{ steps.guard.outputs.max_posts }}
         run: |
           set -euo pipefail
           python3 -u <<'PYEOF'
@@ -272,8 +295,9 @@ jobs:
               c["pr_refs"] = refs
               cands.append(c)
 
-          # Cap at 3 defensively (the scout is instructed to, but enforce it here).
-          cands = cands[:3]
+          # Enforce the post cap defensively (the scout is told the limit too).
+          max_posts = int(os.environ.get("MAX_POSTS", "3"))
+          cands = cands[:max_posts]
           pathlib.Path("/tmp/candidates.json").write_text(json.dumps(cands))
           out = os.environ["GITHUB_OUTPUT"]
           with open(out, "a") as f:
