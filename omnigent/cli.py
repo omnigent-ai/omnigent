@@ -11301,7 +11301,7 @@ def _print_kimi_auth_help() -> None:
     credential: ``kimi login`` (OAuth or a Moonshot API key) for the default
     provider, and ``kimi provider add`` to register any other provider (an
     OpenAI-compatible endpoint, a Databricks gateway, …) in
-    ``~/.kimi/config.toml``. Omnigent has no per-spawn provider override for
+    ``~/.kimi-code/config.toml``. Omnigent has no per-spawn provider override for
     upstream kimi, so all of this lives in the kimi CLI's own config —
     Omnigent-side injection remains a deferred follow-up.
     """
@@ -11309,7 +11309,7 @@ def _print_kimi_auth_help() -> None:
 
     console.print(
         "\n  [bold]Authenticate Kimi Code[/bold] (kimi manages its own config in "
-        "~/.kimi/config.toml):\n"
+        "~/.kimi-code/config.toml):\n"
         "    • Default provider: run [bold]kimi login[/bold] "
         "(Moonshot OAuth, or paste a Moonshot API key)\n"
         "    • Other providers: run [bold]kimi provider add[/bold] "
@@ -12189,7 +12189,7 @@ def _run_configure_harnesses_interactive() -> None:
     _KIRO = "\x00kiro"
     # Sentinel marking the Kimi Code row — like Cursor/Antigravity/Qwen it is
     # not a provider family. Auth lives entirely in the kimi CLI (``kimi login``
-    # / ``kimi provider add`` → ~/.kimi/config.toml), so it dispatches to its
+    # / ``kimi provider add`` → ~/.kimi-code/config.toml), so it dispatches to its
     # own drill-in rather than ``_manage_harness_providers``.
     _KIMI = "\x00kimi"
     # Sentinels for the generic-ACP rows. Each configured agent gets its own row

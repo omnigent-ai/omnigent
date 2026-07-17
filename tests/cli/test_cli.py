@@ -46,6 +46,7 @@ from omnigent.cli import (
     _node_version,
     _pick_first_run_harness,
     _preregister_agent,
+    _print_kimi_auth_help,
     _qwen_auth_configured,
     _resolve_auto_open_conversation_from_config,
     _resolve_auto_open_conversation_setting,
@@ -5445,6 +5446,22 @@ def test_manage_goose_harness_configure_launches(
 
 
 # ── omnigent setup: Kimi Code drill-in (_manage_kimi_harness) ────────────
+
+
+def test_print_kimi_auth_help_uses_current_config_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Kimi setup points users at Kimi Code's current config directory."""
+    import omnigent.onboarding.interactive as it
+
+    console = Mock()
+    monkeypatch.setattr(it, "console", console)
+
+    _print_kimi_auth_help()
+
+    printed = " ".join(str(call.args[0]) for call in console.print.call_args_list)
+    assert "~/.kimi-code/config.toml" in printed
+    assert "~/.kimi" + "/config.toml" not in printed
 
 
 def test_manage_kimi_harness_not_installed_shows_hint_returns(

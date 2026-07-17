@@ -46,7 +46,7 @@ Env-var contract (read once at construction by
 
 Per-invocation provider routing (``--config-file`` / ``--mcp-config-file``
 / gateway env vars) is **not** wired: upstream kimi has no per-spawn
-config override. Provider configuration lives in ``~/.kimi/config.toml``
+config override. Provider configuration lives in ``~/.kimi-code/config.toml``
 and is managed out-of-band via ``kimi provider add`` (Omnigent-side
 provider injection is a deferred follow-up).
 """
