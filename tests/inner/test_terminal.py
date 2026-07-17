@@ -19,6 +19,8 @@ from omnigent.inner.terminal import (
     TERMINAL_TRANSPORT_CONTROL,
     TERMINAL_TRANSPORT_PTY,
     TerminalInstance,
+    _apply_utf8_locale_default,
+    _has_utf8_locale,
     create_terminal_instance,
     resolve_terminal_transport,
 )
@@ -1320,3 +1322,77 @@ def test_create_terminal_instance_denies_control_socket_but_keeps_private_dir_wr
         )
     finally:
         shutil.rmtree(instance.private_dir, ignore_errors=True)
+
+
+@pytest.mark.parametrize(
+    ("env", "expected"),
+    [
+        # LC_ALL wins outright when set.
+        ({"LC_ALL": "en_US.UTF-8"}, True),
+        ({"LC_ALL": "C.UTF-8"}, True),
+        ({"LC_ALL": "C"}, False),
+        # A UTF-8 LC_ALL overrides even a non-UTF-8 LANG, and vice versa.
+        ({"LC_ALL": "en_US.UTF-8", "LANG": "C"}, True),
+        ({"LC_ALL": "C", "LANG": "en_US.UTF-8"}, False),
+        # No LC_ALL: LANG decides.
+        ({"LANG": "en_US.UTF-8"}, True),
+        ({"LANG": "C"}, False),
+        ({"LANG": ""}, False),
+        ({}, False),
+        # A UTF-8 LC_CTYPE alone does NOT count: the affected TUIs read
+        # LC_ALL / LANG directly, so LANG empty + LC_CTYPE=C.UTF-8 (the
+        # deployed-container config that triggered the mojibake) is unsafe.
+        ({"LC_CTYPE": "C.UTF-8"}, False),
+        # Case / punctuation insensitivity.
+        ({"LANG": "en_US.utf8"}, True),
+        ({"LANG": "en_US.Utf-8"}, True),
+    ],
+)
+def test_has_utf8_locale(env: dict[str, str], expected: bool) -> None:
+    """UTF-8 detection follows POSIX precedence and only trusts LC_ALL/LANG."""
+    assert _has_utf8_locale(env) is expected
+
+
+def test_apply_utf8_locale_default_fixes_bare_env() -> None:
+    """A bare env gets LANG and LC_ALL forced to the fallback UTF-8 locale."""
+    env: dict[str, str] = {"PATH": "/usr/bin"}
+    _apply_utf8_locale_default(env)
+    assert env["LANG"] == "C.UTF-8"
+    assert env["LC_ALL"] == "C.UTF-8"
+
+
+def test_apply_utf8_locale_default_fixes_ctype_only_container_env() -> None:
+    """LC_CTYPE=C.UTF-8 with empty LANG (the repro config) still gets fixed."""
+    env = {"PATH": "/usr/bin", "LC_CTYPE": "C.UTF-8"}
+    _apply_utf8_locale_default(env)
+    assert env["LANG"] == "C.UTF-8"
+    assert env["LC_ALL"] == "C.UTF-8"
+    # The pre-existing LC_CTYPE is left as-is.
+    assert env["LC_CTYPE"] == "C.UTF-8"
+
+
+def test_apply_utf8_locale_default_preserves_operator_locale() -> None:
+    """An operator-provided UTF-8 locale is never overridden."""
+    env = {"LANG": "en_US.UTF-8"}
+    _apply_utf8_locale_default(env)
+    assert env["LANG"] == "en_US.UTF-8"
+    assert "LC_ALL" not in env
+
+
+def test_apply_utf8_locale_default_corrects_non_utf8_lc_all() -> None:
+    """A pinned non-UTF-8 LC_ALL is corrected to the fallback UTF-8 locale."""
+    env = {"LC_ALL": "C", "LANG": "en_US.UTF-8"}
+    _apply_utf8_locale_default(env)
+    assert env["LANG"] == "C.UTF-8"
+    assert env["LC_ALL"] == "C.UTF-8"
+
+
+def test_apply_utf8_locale_default_noop_on_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On Windows the locale default is skipped (no POSIX locale env)."""
+    monkeypatch.setattr(terminal_mod, "IS_WINDOWS", True)
+    env: dict[str, str] = {"PATH": "C:\\Windows"}
+    _apply_utf8_locale_default(env)
+    assert "LANG" not in env
+    assert "LC_ALL" not in env
