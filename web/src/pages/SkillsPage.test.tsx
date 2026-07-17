@@ -173,7 +173,7 @@ describe("SkillsPage", () => {
     expect(skillsApi.getSkillCatalog).toHaveBeenCalledWith("sess_active", false);
   });
 
-  it("renders grouped skills and auto-selects the first", async () => {
+  it("renders a flat, harness-neutral list with NO source/scope section headings", async () => {
     vi.mocked(skillsApi.getSkillCatalog).mockResolvedValue({
       skills: [BUILTIN, WORKSPACE, PERSONAL_NATIVE],
       includeOtherTools: false,
@@ -182,24 +182,91 @@ describe("SkillsPage", () => {
 
     renderPage();
 
-    // Rows appear, grouped by SOURCE ROOT path (not origin scope words).
+    // Every skill appears in one flat list.
     expect(await screen.findByTestId("skill-row-ship")).toBeInTheDocument();
     expect(screen.getByTestId("skill-row-test-generator")).toBeInTheDocument();
     expect(screen.getByTestId("skill-row-data-story")).toBeInTheDocument();
-    expect(screen.getByTestId("skills-group-Included with agent")).toBeInTheDocument();
-    expect(screen.getByTestId("skills-group-.claude/skills")).toBeInTheDocument();
-    expect(screen.getByTestId("skills-group-~/.claude/skills")).toBeInTheDocument();
 
-    // The list groups by path, so it must NOT render the ambiguous scope words
-    // "Workspace" / "Personal" as group headings.
+    // No source-root / scope section headings anywhere.
+    expect(screen.queryByTestId(/^skills-group-/)).toBeNull();
     const list = screen.getByTestId("skills-list");
     expect(within(list).queryByText("Workspace")).toBeNull();
     expect(within(list).queryByText("Personal")).toBeNull();
+    expect(within(list).queryByText(".claude/skills")).toBeNull();
+    expect(within(list).queryByText("Included with agent")).toBeNull();
 
     // First skill auto-selected → detail shows its heading.
     const detailPane = await screen.findByTestId("skill-detail");
     expect(detailPane).toHaveAttribute("data-skill-id", "bundle:ship");
     expect(within(detailPane).getByRole("heading", { name: "/ship" })).toBeInTheDocument();
+  });
+
+  it("offers dynamic source-filter options (distinct roots + All sources)", async () => {
+    vi.mocked(skillsApi.getSkillCatalog).mockResolvedValue({
+      skills: [BUILTIN, WORKSPACE, PERSONAL_NATIVE, PERSONAL_OTHER],
+      includeOtherTools: false,
+      hiddenCount: 0,
+    });
+
+    renderPage();
+    const filter = (await screen.findByTestId("skills-source-filter")) as HTMLSelectElement;
+    const options = [...filter.options].map((o) => o.textContent);
+    // "All sources" default, then the distinct roots present in the catalog.
+    expect(options).toEqual([
+      "All sources",
+      "Included with agent",
+      ".claude/skills",
+      "~/.claude/skills",
+      "~/.codex/skills",
+    ]);
+  });
+
+  it("filters the list by source, composing with text search", async () => {
+    vi.mocked(skillsApi.getSkillCatalog).mockResolvedValue({
+      skills: [BUILTIN, WORKSPACE, PERSONAL_NATIVE, PERSONAL_OTHER],
+      includeOtherTools: false,
+      hiddenCount: 0,
+    });
+
+    renderPage();
+    await screen.findByTestId("skill-row-ship");
+
+    // Pick the ~/.codex/skills source → only `migrate` remains.
+    fireEvent.change(screen.getByTestId("skills-source-filter"), {
+      target: { value: "~/.codex/skills" },
+    });
+    expect(screen.getByTestId("skill-row-migrate")).toBeInTheDocument();
+    expect(screen.queryByTestId("skill-row-ship")).toBeNull();
+    expect(screen.queryByTestId("skill-row-data-story")).toBeNull();
+
+    // A search that excludes `migrate` composes with the source filter → empty.
+    fireEvent.change(screen.getByTestId("skills-search"), { target: { value: "ship" } });
+    expect(screen.queryByTestId("skill-row-migrate")).toBeNull();
+    expect(screen.getByText("No skills match your filters.")).toBeInTheDocument();
+  });
+
+  it("keeps the selection valid when the selected skill is filtered out", async () => {
+    vi.mocked(skillsApi.getSkillCatalog).mockResolvedValue({
+      skills: [BUILTIN, WORKSPACE, PERSONAL_NATIVE, PERSONAL_OTHER],
+      includeOtherTools: false,
+      hiddenCount: 0,
+    });
+
+    renderPage();
+    // `ship` (bundled) auto-selected first.
+    const detailPane = await screen.findByTestId("skill-detail");
+    expect(detailPane).toHaveAttribute("data-skill-id", "bundle:ship");
+
+    // Filter to a source that excludes `ship` → selection moves to a visible row.
+    fireEvent.change(screen.getByTestId("skills-source-filter"), {
+      target: { value: "~/.codex/skills" },
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId("skill-detail")).toHaveAttribute(
+        "data-skill-id",
+        "personal:codex:migrate",
+      );
+    });
   });
 
   it("does NOT surface harness/vendor names in the primary UI", async () => {
@@ -289,20 +356,25 @@ describe("SkillsPage", () => {
     expect(screen.queryByTestId("skill-row-data-story")).toBeNull();
   });
 
-  it("collapsing a group hides its rows", async () => {
+  it("hides the source filter when the catalog has a single source root", async () => {
+    // Two skills, both from the same `.claude/skills` root → nothing to filter.
     vi.mocked(skillsApi.getSkillCatalog).mockResolvedValue({
-      skills: [BUILTIN, WORKSPACE],
+      skills: [
+        WORKSPACE,
+        summary({
+          id: "workspace:another",
+          name: "another",
+          origin: "workspace",
+          displayPath: ".claude/skills/another",
+        }),
+      ],
       includeOtherTools: false,
       hiddenCount: 0,
     });
 
     renderPage();
-    await screen.findByTestId("skill-row-ship");
-
-    fireEvent.click(screen.getByTestId("skills-group-Included with agent"));
-    await waitFor(() => expect(screen.queryByTestId("skill-row-ship")).toBeNull());
-    // The other group's row is untouched.
-    expect(screen.getByTestId("skill-row-test-generator")).toBeInTheDocument();
+    await screen.findByTestId("skill-row-another");
+    expect(screen.queryByTestId("skills-source-filter")).toBeNull();
   });
 
   it("shows a conflict warning + resolution stack under Advanced only", async () => {

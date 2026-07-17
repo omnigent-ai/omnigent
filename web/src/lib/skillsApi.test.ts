@@ -7,12 +7,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   BUNDLED_DISPLAY_PATH,
+  catalogSourceRoots,
   getSkillCatalog,
   getSkillDetail,
   getSkillTrust,
   setSkillTrust,
   sourceRootKey,
   sourceRootRank,
+  type SkillSummary,
 } from "./skillsApi";
 import { ApiError } from "./sessionsApi";
 import * as identity from "./identity";
@@ -248,8 +250,42 @@ describe("sourceRootRank", () => {
     expect(sourceRootRank(".claude/skills")).toBe(1);
     expect(sourceRootRank("~/.codex/skills")).toBe(2);
     expect(sourceRootRank("/abs/unrooted")).toBe(2);
-    // A concrete precedence chain the list relies on.
+    // A concrete precedence chain the filter options rely on.
     expect(sourceRootRank(BUNDLED_DISPLAY_PATH)).toBeLessThan(sourceRootRank(".agents/skills"));
     expect(sourceRootRank(".agents/skills")).toBeLessThan(sourceRootRank("~/.claude/skills"));
+  });
+});
+
+describe("catalogSourceRoots", () => {
+  const sk = (displayPath: string, origin: SkillSummary["origin"]): SkillSummary => ({
+    id: displayPath,
+    name: "x",
+    description: "",
+    origin,
+    displayPath,
+    enabled: true,
+    available: true,
+    hasConflict: false,
+    updatedAt: null,
+  });
+
+  it("returns the DISTINCT roots present, ordered bundled→workspace→home", () => {
+    const roots = catalogSourceRoots([
+      sk("~/.codex/skills/a", "personal"),
+      sk(".claude/skills/b", "workspace"),
+      sk(".claude/skills/c", "workspace"), // same root as b → deduped
+      sk(BUNDLED_DISPLAY_PATH, "built_in"),
+      sk("~/.claude/skills/d", "personal"),
+    ]);
+    expect(roots).toEqual([
+      BUNDLED_DISPLAY_PATH,
+      ".claude/skills",
+      "~/.claude/skills",
+      "~/.codex/skills",
+    ]);
+  });
+
+  it("returns an empty list for an empty catalog", () => {
+    expect(catalogSourceRoots([])).toEqual([]);
   });
 });

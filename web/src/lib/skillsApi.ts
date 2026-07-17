@@ -168,22 +168,23 @@ export interface SkillDetail extends SkillSummary {
   advanced: SkillAdvanced;
 }
 
-// ── Source-path display helpers (client-derived) ──────────────────────────────
+// ── Source-path helpers (client-derived) ──────────────────────────────────────
 //
-// The list groups by SOURCE ROOT (the directory a reader can locate), not the
-// ambiguous origin scope word. `origin` is retained only to order the groups by
-// precedence (built in > workspace > personal). Nothing renders "Workspace" /
-// "Personal" as the meaningful source anymore — the path is the source of truth.
+// The master catalog is a FLAT, harness-neutral list — it is NOT grouped by
+// path, provider, or origin scope word. The concrete source path surfaces in
+// two optional places only: the detail pane's Source row, and an optional
+// source FILTER whose options are the distinct source ROOTS present in the
+// catalog. These helpers derive that root + order the filter options; `origin`
+// stays internal (precedence only) and is never shown as provenance.
 
 /** The literal `display_path` the backend emits for a bundled skill. */
 export const BUNDLED_DISPLAY_PATH = "Included with agent";
 
 /**
- * Derive the source-root group key for a skill from its `displayPath`.
- *
- * Groups skills by the skill-root directory that contains them, so every
- * `.claude/skills/*` lands together, every `~/.codex/skills/*` together, etc.
- * The key is also the heading shown for the group.
+ * Derive the source-ROOT of a skill from its `displayPath` — the directory a
+ * reader can locate it in. This is the value the source filter offers as an
+ * option (e.g. `.claude/skills`, `~/.codex/skills`, `Included with agent`); it
+ * is NOT used to section the list.
  *
  * Examples:
  *   `.claude/skills/foo`            → `.claude/skills`
@@ -197,21 +198,35 @@ export function sourceRootKey(skill: Pick<SkillSummary, "displayPath" | "origin"
   if (skill.origin === "built_in" || path === BUNDLED_DISPLAY_PATH) {
     return BUNDLED_DISPLAY_PATH;
   }
-  // Prefer grouping at the conventional `skills/` boundary when present, so the
-  // group is the skill root rather than one directory per skill.
+  // Prefer the conventional `skills/` boundary when present, so the root is the
+  // skill collection (e.g. `.claude/skills`) rather than one dir per skill.
   const marker = "/skills/";
   const at = path.indexOf(marker);
   if (at !== -1) return path.slice(0, at + marker.length - 1); // include ".../skills"
-  // Otherwise group by the parent directory of the leaf.
+  // Otherwise the parent directory of the leaf.
   const slash = path.lastIndexOf("/");
   return slash > 0 ? path.slice(0, slash) : path;
 }
 
-/** Order source-root groups: bundled first, then workspace, then personal (home). */
+/**
+ * Rank a source root for the filter's option order: bundled first, then
+ * project-relative (workspace) roots, then home/absolute (personal) roots.
+ */
 export function sourceRootRank(key: string): number {
   if (key === BUNDLED_DISPLAY_PATH) return 0;
   if (key.startsWith("~") || key.startsWith("/")) return 2; // home / absolute → personal-ish
   return 1; // project-relative → workspace-ish
+}
+
+/**
+ * Distinct source roots present in a catalog, ordered for the filter dropdown
+ * (bundled → workspace → home), each alphabetical within its rank. This is the
+ * dynamic option set behind the "All sources" default.
+ */
+export function catalogSourceRoots(skills: SkillSummary[]): string[] {
+  const roots = new Set<string>();
+  for (const skill of skills) roots.add(sourceRootKey(skill));
+  return [...roots].sort((a, b) => sourceRootRank(a) - sourceRootRank(b) || a.localeCompare(b));
 }
 
 // ── Wire → browser projection ────────────────────────────────────────────────

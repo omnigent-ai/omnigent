@@ -5,10 +5,12 @@
  * Layout (from the final hybrid UX):
  *  - A minimal header: title + one-line subtitle, and a right-aligned
  *    "Include skills from other tools" switch (the trust widening).
- *  - A compact ~292px single-column master list: a tight search box, then
- *    collapsible groups of ~48px rows keyed by SOURCE ROOT path
- *    (`.claude/skills`, `~/.codex/skills`, `Included with agent`) — never the
- *    ambiguous origin scope word. Each row shows an enabled/available dot, the
+ *  - A compact ~292px single-column master list: a tight search box, an
+ *    optional source filter (a dropdown of the catalog's distinct source roots
+ *    with an "All sources" default), then a FLAT, harness-neutral list of ~48px
+ *    rows. The list is NOT grouped/sectioned by path, provider, or scope — the
+ *    concrete source path is an optional filter + a detail field, not the
+ *    information architecture. Each row shows an enabled/available dot, the
  *    `/name`, and a one-line description.
  *  - A persistent detail pane: overview, a Source row showing the concise
  *    root-anchored path (provider as secondary text), the SKILL.md
@@ -53,51 +55,27 @@ import {
 import { Link } from "@/lib/routing";
 import { copyText } from "@/lib/clipboard";
 import {
+  catalogSourceRoots,
   sourceRootKey,
-  sourceRootRank,
   type SkillDetail,
   type SkillOrigin,
   type SkillSummary,
 } from "@/lib/skillsApi";
 import { cn } from "@/lib/utils";
 
-// Per-origin accent token, used only for the small dot/glyph tint. Accents map
-// onto the brand palette: built-in → info blue, workspace → brand pink,
-// personal → success green. `origin` never renders as a provenance *word* — the
-// source path is the source of truth — it only tints the accent + orders groups.
+// Per-origin accent token, used only for the small dot/glyph tint. `origin`
+// stays INTERNAL — it's never shown as a provenance word and never sections the
+// list; it only tints the accent dot. The catalog is a flat, harness-neutral
+// list; the concrete source path lives in the detail's Source row and the
+// optional source filter, never in the list's information architecture.
 const ORIGIN_ACCENT: Record<SkillOrigin, string> = {
   built_in: "var(--color-info)",
   workspace: "var(--color-brand-accent)",
   personal: "var(--color-success)",
 };
 
-/** One source-root group: its heading key + the rows under it. */
-interface SkillGroup {
-  key: string;
-  skills: SkillSummary[];
-}
-
-/**
- * Group rows by source-root path (`.claude/skills`, `~/.codex/skills`, …) and
- * order them by precedence (bundled → workspace → home), then alphabetically by
- * root, with each group's skills sorted by name. This replaces the old
- * origin-word grouping so the path is what the user navigates by.
- */
-function groupBySourceRoot(skills: SkillSummary[]): SkillGroup[] {
-  const byKey = new Map<string, SkillSummary[]>();
-  for (const skill of skills) {
-    const key = sourceRootKey(skill);
-    const bucket = byKey.get(key);
-    if (bucket) bucket.push(skill);
-    else byKey.set(key, [skill]);
-  }
-  return [...byKey.entries()]
-    .map(([key, rows]) => ({
-      key,
-      skills: [...rows].sort((a, b) => a.name.localeCompare(b.name)),
-    }))
-    .sort((a, b) => sourceRootRank(a.key) - sourceRootRank(b.key) || a.key.localeCompare(b.key));
-}
+/** The source-filter sentinel meaning "don't filter by source". */
+const ALL_SOURCES = "__all__";
 
 function matchesQuery(skill: SkillSummary, query: string): boolean {
   if (!query) return true;
@@ -105,6 +83,11 @@ function matchesQuery(skill: SkillSummary, query: string): boolean {
   return (
     skill.name.toLocaleLowerCase().includes(q) || skill.description.toLocaleLowerCase().includes(q)
   );
+}
+
+/** True when a skill passes the active source-root filter (or it's disabled). */
+function matchesSource(skill: SkillSummary, sourceFilter: string): boolean {
+  return sourceFilter === ALL_SOURCES || sourceRootKey(skill) === sourceFilter;
 }
 
 export function SkillsPage() {
@@ -126,38 +109,48 @@ export function SkillsPage() {
   const sessionId = useActiveSkillSession();
   const catalogQuery = useSkillCatalog(sessionId, includeOtherTools);
   const [query, setQuery] = useState("");
-  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+  const [sourceFilter, setSourceFilter] = useState<string>(ALL_SOURCES);
   const [selectedId, setSelectedId] = useState<string | null>(null);
 
   const skills = useMemo(() => catalogQuery.data?.skills ?? [], [catalogQuery.data]);
 
-  // Auto-select the first visible skill once the catalog loads (or when the
-  // current selection drops out of scope, e.g. after toggling the switch off).
+  // The distinct source roots present in this catalog — the dynamic filter
+  // options behind the "All sources" default.
+  const sourceRoots = useMemo(() => catalogSourceRoots(skills), [skills]);
+
+  // If the catalog no longer contains the selected source (switch toggled, new
+  // session), fall back to "All sources" so the filter never strands the list.
   useEffect(() => {
-    if (!skills.length) {
+    if (sourceFilter !== ALL_SOURCES && !sourceRoots.includes(sourceFilter)) {
+      setSourceFilter(ALL_SOURCES);
+    }
+  }, [sourceRoots, sourceFilter]);
+
+  // The flat, harness-neutral list: text search AND the optional source filter
+  // compose. Ordering is the backend's deterministic catalog order (no
+  // client-side grouping or re-sort).
+  const shown = useMemo(
+    () => skills.filter((s) => matchesQuery(s, query) && matchesSource(s, sourceFilter)),
+    [skills, query, sourceFilter],
+  );
+
+  // Keep the selection valid: auto-select the first VISIBLE row, and if the
+  // current selection is filtered out (by search or source), move to the first
+  // still-visible row rather than showing a detail pane for a hidden item.
+  useEffect(() => {
+    if (!shown.length) {
       if (selectedId !== null) setSelectedId(null);
       return;
     }
-    if (selectedId === null || !skills.some((s) => s.id === selectedId)) {
-      setSelectedId(skills[0].id);
+    if (selectedId === null || !shown.some((s) => s.id === selectedId)) {
+      setSelectedId(shown[0].id);
     }
-  }, [skills, selectedId]);
-
-  const shown = useMemo(() => skills.filter((s) => matchesQuery(s, query)), [skills, query]);
+  }, [shown, selectedId]);
 
   const handleToggleInclude = () => {
     const next = !includeOtherTools;
     setIncludeOtherTools(next);
     setTrust.mutate(next);
-  };
-
-  const toggleGroup = (groupKey: string) => {
-    setCollapsed((prev) => {
-      const next = new Set(prev);
-      if (next.has(groupKey)) next.delete(groupKey);
-      else next.add(groupKey);
-      return next;
-    });
   };
 
   return (
@@ -183,8 +176,9 @@ export function SkillsPage() {
             totalVisible={skills.length}
             query={query}
             onQueryChange={setQuery}
-            collapsed={collapsed}
-            onToggleGroup={toggleGroup}
+            sourceRoots={sourceRoots}
+            sourceFilter={sourceFilter}
+            onSourceChange={setSourceFilter}
             selectedId={selectedId}
             onSelect={setSelectedId}
             loading={catalogQuery.isLoading}
@@ -217,7 +211,7 @@ function NoSessionEmptyState() {
       <p className="max-w-md text-sm text-muted-foreground">
         Skills are resolved from the bound session's runner — its bundle, this project's workspace
         skills, and your personal library. Start or open a session, then come back to browse the
-        Built in, Workspace, and Personal skills available to it.
+        skills available to it.
       </p>
       <Button asChild variant="outline" size="sm" className="mt-1">
         <Link to="/">Start a session</Link>
@@ -278,8 +272,9 @@ function SkillList({
   totalVisible,
   query,
   onQueryChange,
-  collapsed,
-  onToggleGroup,
+  sourceRoots,
+  sourceFilter,
+  onSourceChange,
   selectedId,
   onSelect,
   loading,
@@ -290,33 +285,40 @@ function SkillList({
   totalVisible: number;
   query: string;
   onQueryChange: (q: string) => void;
-  collapsed: Set<string>;
-  onToggleGroup: (groupKey: string) => void;
+  sourceRoots: string[];
+  sourceFilter: string;
+  onSourceChange: (value: string) => void;
   selectedId: string | null;
   onSelect: (id: string) => void;
   loading: boolean;
   error: boolean;
   onRetry: () => void;
 }) {
-  const groups = groupBySourceRoot(skills);
   return (
     <div className="flex w-[292px] shrink-0 flex-col border-r border-border">
-      <div className="flex shrink-0 items-center gap-2 border-b border-border px-3 py-2">
-        <div className="flex flex-1 items-center gap-2 rounded-lg bg-muted px-2.5 py-1.5 focus-within:ring-2 focus-within:ring-ring/40">
-          <SearchIcon className="size-3.5 shrink-0 text-muted-foreground" />
-          <input
-            value={query}
-            onChange={(e) => onQueryChange(e.target.value)}
-            placeholder="Search skills…"
-            autoComplete="off"
-            aria-label="Search skills"
-            data-testid="skills-search"
-            className="w-full min-w-0 bg-transparent text-[13px] outline-none placeholder:text-muted-foreground"
-          />
+      <div className="flex shrink-0 flex-col gap-2 border-b border-border px-3 py-2">
+        <div className="flex items-center gap-2">
+          <div className="flex flex-1 items-center gap-2 rounded-lg bg-muted px-2.5 py-1.5 focus-within:ring-2 focus-within:ring-ring/40">
+            <SearchIcon className="size-3.5 shrink-0 text-muted-foreground" />
+            <input
+              value={query}
+              onChange={(e) => onQueryChange(e.target.value)}
+              placeholder="Search skills…"
+              autoComplete="off"
+              aria-label="Search skills"
+              data-testid="skills-search"
+              className="w-full min-w-0 bg-transparent text-[13px] outline-none placeholder:text-muted-foreground"
+            />
+          </div>
+          <span className="shrink-0 rounded-full bg-muted px-2 py-0.5 text-[11px] tabular-nums text-muted-foreground">
+            {loading ? "—" : totalVisible}
+          </span>
         </div>
-        <span className="shrink-0 rounded-full bg-muted px-2 py-0.5 text-[11px] tabular-nums text-muted-foreground">
-          {loading ? "—" : totalVisible}
-        </span>
+        {/* Optional source filter — the concrete path lives here, not in the
+            list's structure. Hidden until the catalog has >1 distinct root. */}
+        {sourceRoots.length > 1 && (
+          <SourceFilter sourceRoots={sourceRoots} value={sourceFilter} onChange={onSourceChange} />
+        )}
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto p-1.5" data-testid="skills-list">
@@ -334,47 +336,59 @@ function SkillList({
           </div>
         ) : skills.length === 0 ? (
           <p className="px-4 py-10 text-center text-[12.5px] text-muted-foreground">
-            {query ? `No skills match "${query}".` : "No skills available."}
+            {query || sourceFilter !== ALL_SOURCES
+              ? "No skills match your filters."
+              : "No skills available."}
           </p>
         ) : (
-          groups.map((group) => {
-            const isCollapsed = collapsed.has(group.key);
-            return (
-              <section key={group.key} className="mb-1">
-                <button
-                  type="button"
-                  onClick={() => onToggleGroup(group.key)}
-                  aria-expanded={!isCollapsed}
-                  data-testid={`skills-group-${group.key}`}
-                  title={group.key}
-                  className="mt-2 flex w-full items-center gap-1.5 px-2 py-1.5 text-left text-[11px] font-semibold text-muted-foreground transition-colors first:mt-0 hover:text-foreground"
-                >
-                  <ChevronRightIcon
-                    className={cn(
-                      "size-3 shrink-0 transition-transform",
-                      !isCollapsed && "rotate-90",
-                    )}
-                  />
-                  <span className="truncate font-mono tracking-tight">{group.key}</span>
-                  <span className="ml-auto shrink-0 rounded-full bg-muted px-1.5 text-[10.5px] font-semibold text-muted-foreground">
-                    {group.skills.length}
-                  </span>
-                </button>
-                {!isCollapsed &&
-                  group.skills.map((skill) => (
-                    <SkillRow
-                      key={skill.id}
-                      skill={skill}
-                      selected={selectedId === skill.id}
-                      onSelect={() => onSelect(skill.id)}
-                    />
-                  ))}
-              </section>
-            );
-          })
+          // One flat, harness-neutral list — no source/provider/scope sections.
+          skills.map((skill) => (
+            <SkillRow
+              key={skill.id}
+              skill={skill}
+              selected={selectedId === skill.id}
+              onSelect={() => onSelect(skill.id)}
+            />
+          ))
         )}
       </div>
     </div>
+  );
+}
+
+/**
+ * The optional source filter. Options are the catalog's distinct source roots
+ * (`.claude/skills`, `~/.codex/skills`, `Included with agent`, …) plus an
+ * "All sources" default. A native <select> keeps it keyboard- and
+ * screen-reader-accessible for free.
+ */
+function SourceFilter({
+  sourceRoots,
+  value,
+  onChange,
+}: {
+  sourceRoots: string[];
+  value: string;
+  onChange: (value: string) => void;
+}) {
+  return (
+    <label className="flex items-center gap-2 text-[11px] text-muted-foreground">
+      <span className="shrink-0">Source</span>
+      <select
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        aria-label="Filter skills by source"
+        data-testid="skills-source-filter"
+        className="min-w-0 flex-1 truncate rounded-md border border-border bg-muted px-2 py-1 font-mono text-[11.5px] text-foreground outline-none focus:ring-2 focus:ring-ring/40"
+      >
+        <option value={ALL_SOURCES}>All sources</option>
+        {sourceRoots.map((root) => (
+          <option key={root} value={root}>
+            {root}
+          </option>
+        ))}
+      </select>
+    </label>
   );
 }
 
