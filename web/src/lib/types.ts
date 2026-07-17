@@ -507,11 +507,11 @@ export interface CodexReasoningEffortOption {
 }
 
 export interface CodexModelOption {
-  /** Codex picker id to pass back to ``thread/settings/update``. */
+  /** Native picker id (a Claude alias or Codex model id). */
   id: string;
-  /** Provider-facing model id Codex will run. */
+  /** Provider-facing model id the native harness will run. */
   model?: string;
-  /** Codex display label. */
+  /** User-facing model label. */
   displayName?: string;
   /** Default reasoning effort for this model. */
   defaultReasoningEffort?: string;

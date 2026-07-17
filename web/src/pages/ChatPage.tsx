@@ -5384,21 +5384,18 @@ function AgentPicker({
   const sessionModelOverride = useChatStore((s) => s.sessionModelOverride);
   const llmModel = useChatStore((s) => s.llmModel);
 
-  // Codex, cursor, kiro, pi, and opencode all populate the picker from the
-  // server-provided ``codexModelOptions`` channel (the snapshot's
-  // ``model_options`` field); claude uses the static local catalog.
+  // Native model pickers populate from the snapshot's runner-backed
+  // ``model_options`` field. Claude's rows are the aliases pinned to the
+  // launch-time Databricks catalog; Codex carries richer effort metadata.
   const usesServerModelOptions =
+    modelPickerKind === "claude" ||
     modelPickerKind === "codex" ||
     modelPickerKind === "cursor" ||
     modelPickerKind === "kiro" ||
     modelPickerKind === "pi" ||
     modelPickerKind === "opencode";
   const modelOptions: ReadonlyArray<{ id: string; label?: string; displayName?: string }> =
-    modelPickerKind === "claude"
-      ? CLAUDE_NATIVE_MODELS
-      : usesServerModelOptions
-        ? codexModelOptions
-        : [];
+    usesServerModelOptions ? codexModelOptions : [];
   const isNativeModelPicker = modelPickerKind !== null;
   // Only offer the agent list when there's an actual choice. Inside a
   // session the picker is scoped to the single bound agent (the runner is

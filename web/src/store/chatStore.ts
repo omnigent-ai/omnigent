@@ -1993,8 +1993,13 @@ function isNativeModelCompatible(
   session: Session,
 ): boolean {
   switch (family) {
-    case "claude":
-      return isClaudeNativeModel(model);
+    case "claude": {
+      const options = session.codexModelOptions ?? [];
+      return (
+        isClaudeNativeModel(model) &&
+        options.some((option) => option.id === model || option.model === model)
+      );
+    }
     case "codex":
       return isCodexNativeModel(session.codexModelOptions ?? [], model);
   }

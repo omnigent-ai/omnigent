@@ -283,7 +283,7 @@ def test_ucode_config_for_profile_reads_allowlisted_claude_state(
         lambda workspace_url: workspace_state,
     )
 
-    config = claude_native._ucode_config_for_profile("test-profile")
+    config = claude_native._ucode_config_for_profile("test-profile", refresh_models=False)
 
     assert config == claude_native.ClaudeNativeUcodeConfig(
         env={
@@ -336,7 +336,7 @@ def test_ucode_config_for_profile_sets_model_tier_env_vars(
         lambda workspace_url: workspace_state,
     )
 
-    config = claude_native._ucode_config_for_profile("test-profile")
+    config = claude_native._ucode_config_for_profile("test-profile", refresh_models=False)
 
     assert config is not None
     assert config.env["ANTHROPIC_DEFAULT_FABLE_MODEL"] == "databricks-claude-fable-5"
@@ -376,7 +376,7 @@ def test_ucode_config_for_profile_sets_only_present_tier_env_vars(
         lambda workspace_url: workspace_state,
     )
 
-    config = claude_native._ucode_config_for_profile("test-profile")
+    config = claude_native._ucode_config_for_profile("test-profile", refresh_models=False)
 
     assert config is not None
     assert config.env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "databricks-claude-sonnet-4-6"
@@ -420,7 +420,7 @@ def test_ucode_config_for_profile_sets_custom_model_option_for_second_sonnet(
         lambda workspace_url: workspace_state,
     )
 
-    config = claude_native._ucode_config_for_profile("test-profile")
+    config = claude_native._ucode_config_for_profile("test-profile", refresh_models=False)
 
     assert config is not None
     assert config.env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "databricks-claude-sonnet-4-6"
@@ -459,7 +459,7 @@ def test_ucode_config_for_profile_omits_model_tier_vars_when_no_claude_models(
         lambda workspace_url: workspace_state,
     )
 
-    config = claude_native._ucode_config_for_profile("test-profile")
+    config = claude_native._ucode_config_for_profile("test-profile", refresh_models=False)
 
     assert config is not None
     for key in config.env:
@@ -502,11 +502,174 @@ def test_ucode_config_for_profile_defaults_model_when_ucode_omits_it(
         lambda workspace_url: workspace_state,
     )
 
-    config = claude_native._ucode_config_for_profile("test-profile")
+    config = claude_native._ucode_config_for_profile("test-profile", refresh_models=False)
 
     assert config is not None
     # The verified routable gateway endpoint name, not the CLI's own default.
     assert config.model == "databricks-claude-opus-4-8"
+
+
+def test_ucode_config_refreshes_live_models_and_builds_picker_options(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each launch replaces stale ucode versions with the live workspace catalog."""
+    from omnigent.onboarding.ucode_state import UcodeAgentState, UcodeWorkspaceState
+
+    workspace_state = UcodeWorkspaceState(
+        workspace_url="https://example.databricks.com",
+        claude_models={
+            "fable": "system.ai.claude-fable-5",
+            "opus": "system.ai.claude-opus-4-7",
+            "sonnet": "system.ai.claude-sonnet-4-6",
+        },
+        fable_enabled=False,
+        agents={
+            "claude": UcodeAgentState(
+                model="system.ai.claude-opus-4-7",
+                base_url="https://example.databricks.com/ai-gateway/anthropic",
+                auth_command="printf token",
+            )
+        },
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.databricks_config.get_workspace_url_for_profile",
+        lambda profile: "https://example.databricks.com",
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.ucode_state.read_ucode_state",
+        lambda workspace_url: workspace_state,
+    )
+    monkeypatch.setattr(
+        "omnigent.runtime.credentials.databricks.resolve_databricks_workspace",
+        lambda profile: SimpleNamespace(host="https://example.databricks.com", token="token"),
+    )
+    calls: list[tuple[str, str]] = []
+
+    def _discover(host: str, token: str) -> dict[str, str]:
+        calls.append((host, token))
+        opus_version = "4-9" if len(calls) == 1 else "4-10"
+        return {
+            "fable": "system.ai.claude-fable-5",
+            "opus": f"system.ai.claude-opus-{opus_version}",
+            "sonnet": "system.ai.claude-sonnet-5",
+        }
+
+    monkeypatch.setattr(
+        "omnigent.databricks_model_discovery.discover_databricks_claude_models",
+        _discover,
+    )
+
+    first_config = claude_native._ucode_config_for_profile("test-profile")
+    config = claude_native._ucode_config_for_profile("test-profile")
+
+    assert config is not None
+    assert first_config is not None
+    assert first_config.model == "system.ai.claude-opus-4-9"
+    assert calls == [
+        ("https://example.databricks.com", "token"),
+        ("https://example.databricks.com", "token"),
+    ]
+    assert config.model == "system.ai.claude-opus-4-10"
+    assert config.env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "system.ai.claude-opus-4-10"
+    assert config.env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "system.ai.claude-sonnet-5"
+    assert "ANTHROPIC_DEFAULT_FABLE_MODEL" not in config.env
+    assert claude_native.claude_native_model_options(config) == [
+        {
+            "id": "opus",
+            "model": "system.ai.claude-opus-4-10",
+            "displayName": "Opus 4.10",
+            "isDefault": True,
+        },
+        {
+            "id": "sonnet",
+            "model": "system.ai.claude-sonnet-5",
+            "displayName": "Sonnet 5",
+            "isDefault": False,
+        },
+    ]
+
+
+def test_ucode_config_uses_cached_models_when_live_refresh_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A network failure preserves the previously working ucode mapping."""
+    from omnigent.onboarding.ucode_state import UcodeAgentState, UcodeWorkspaceState
+
+    workspace_state = UcodeWorkspaceState(
+        workspace_url="https://example.databricks.com",
+        claude_models={"opus": "system.ai.claude-opus-4-8"},
+        agents={
+            "claude": UcodeAgentState(
+                model="system.ai.claude-opus-4-8",
+                base_url="https://example.databricks.com/ai-gateway/anthropic",
+                auth_command="printf token",
+            )
+        },
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.databricks_config.get_workspace_url_for_profile",
+        lambda profile: "https://example.databricks.com",
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.ucode_state.read_ucode_state",
+        lambda workspace_url: workspace_state,
+    )
+    monkeypatch.setattr(
+        "omnigent.runtime.credentials.databricks.resolve_databricks_workspace",
+        lambda profile: SimpleNamespace(host="https://example.databricks.com", token="token"),
+    )
+
+    def _fail(host: str, token: str) -> dict[str, str]:
+        raise httpx.ConnectError("offline")
+
+    monkeypatch.setattr(
+        "omnigent.databricks_model_discovery.discover_databricks_claude_models",
+        _fail,
+    )
+
+    config = claude_native._ucode_config_for_profile("test-profile")
+
+    assert config is not None
+    assert config.model == "system.ai.claude-opus-4-8"
+    assert config.env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "system.ai.claude-opus-4-8"
+
+
+def test_ucode_config_rejects_authoritative_empty_live_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful empty listing removes stale models instead of launching them."""
+    from omnigent.onboarding.ucode_state import UcodeAgentState, UcodeWorkspaceState
+
+    workspace_state = UcodeWorkspaceState(
+        workspace_url="https://example.databricks.com",
+        claude_models={"opus": "system.ai.claude-opus-4-8"},
+        agents={
+            "claude": UcodeAgentState(
+                model="system.ai.claude-opus-4-8",
+                base_url="https://example.databricks.com/ai-gateway/anthropic",
+                auth_command="printf token",
+            )
+        },
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.databricks_config.get_workspace_url_for_profile",
+        lambda profile: "https://example.databricks.com",
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.ucode_state.read_ucode_state",
+        lambda workspace_url: workspace_state,
+    )
+    monkeypatch.setattr(
+        "omnigent.runtime.credentials.databricks.resolve_databricks_workspace",
+        lambda profile: SimpleNamespace(host="https://example.databricks.com", token="token"),
+    )
+    monkeypatch.setattr(
+        "omnigent.databricks_model_discovery.discover_databricks_claude_models",
+        lambda host, token: {},
+    )
+
+    with pytest.raises(click.ClickException, match="exposes no Claude model services"):
+        claude_native._ucode_config_for_profile("test-profile")
 
 
 def test_ucode_config_for_profile_fails_loud_on_malformed_claude_state(
@@ -529,7 +692,7 @@ def test_ucode_config_for_profile_fails_loud_on_malformed_claude_state(
     )
 
     with pytest.raises(click.ClickException, match="missing Claude base URL"):
-        claude_native._ucode_config_for_profile("test-profile")
+        claude_native._ucode_config_for_profile("test-profile", refresh_models=False)
 
 
 def test_attach_url_encodes_path_components() -> None:

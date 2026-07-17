@@ -1194,7 +1194,7 @@ _runner_skills_inflight: dict[str, asyncio.Task[None]] = {}
 # (``model/list``) off the hot path, same shape as runner skills.
 _model_options_cache: dict[str, list[dict[str, Any]]] = {}
 _model_options_inflight: dict[str, asyncio.Task[None]] = {}
-_CODEX_MODEL_OPTIONS_RETRY_DELAYS_S = (0.25, 0.5, 1.0, 2.0, 2.0)
+_MODEL_OPTIONS_RETRY_DELAYS_S = (0.25, 0.5, 1.0, 2.0, 2.0)
 # Per-session model catalog PUSHED by a native harness's extension
 # (``external_model_options``), as opposed to the runner-fetched
 # ``_model_options_cache`` above. Kept in a separate cache that a browser
@@ -6150,9 +6150,9 @@ def _publish_model_options(session_id: str) -> None:
     """
     Publish a typed :class:`SessionModelOptionsEvent` to the live stream.
 
-    Fired when the background Codex ``model/list`` fetch populates the
-    per-session model-options cache. Connected clients re-read the session
-    snapshot and apply its cache-backed ``model_options`` field.
+    Fired when a background runner catalog fetch populates the per-session
+    model-options cache. Connected clients re-read the session snapshot and
+    apply its cache-backed ``model_options`` field.
 
     :param session_id: Session/conversation identifier,
         e.g. ``"conv_abc123"``.
@@ -22183,33 +22183,33 @@ async def _load_runner_skills(
 
 def _model_options_from_wire(raw_models: Any) -> list[dict[str, Any]]:
     """
-    Validate runner-returned raw Codex ``model/list`` data.
+    Validate runner-returned native model picker data.
 
     :param raw_models: JSON value from the runner's
-        ``{"models": [...]}`` response, e.g. a list of Codex model dicts.
+        ``{"models": [...]}`` response.
     :returns: Raw model options for the session snapshot.
     :raises ValueError: If the payload is not the expected list/dict
         shape.
     """
     if not isinstance(raw_models, list):
-        raise ValueError("Codex model options payload must be a list")
+        raise ValueError("Native model options payload must be a list")
     options: list[dict[str, Any]] = []
     for raw_model in raw_models:
         if not isinstance(raw_model, dict):
-            raise ValueError("Codex model option must be an object")
+            raise ValueError("Native model option must be an object")
         options.append(raw_model)
     return options
 
 
 # Native harnesses whose model picker is populated from a *live*, runner-owned
 # model-options endpoint, keyed by wrapper label -> the runner route segment.
-# Codex queries its live app-server ``model/list`` (account/session-scoped, so
-# it must come from the bound runner). Cursor is deliberately NOT here: its
-# catalog is a curated *static* base list served directly (see
-# ``_fetch_model_options``), which keeps it off the runner-backed cache that
-# ``refresh_state`` invalidates — otherwise an effort/model change would blank
-# the cursor picker mid-session.
+# Claude returns its launch-time Databricks/ucode alias mapping; Codex queries
+# its live app-server ``model/list``. Both are runner-owned. Cursor is
+# deliberately NOT here: its catalog is a curated *static* base list served
+# directly (see ``_fetch_model_options``). Keeping it off the runner-backed
+# cache prevents ``refresh_state`` from blanking the picker mid-session.
 _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER: dict[str, str] = {
+    _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE: "claude-model-options",
     _CODEX_NATIVE_WRAPPER_LABEL_VALUE: "codex-model-options",
     _OPENCODE_NATIVE_WRAPPER_LABEL_VALUE: "codex-model-options",
     # pi-native is deliberately NOT here: its catalog is PUSHED by the resident
@@ -22227,7 +22227,7 @@ async def _fetch_model_options(
     """
     Resolve the Web UI model-picker options for a native session.
 
-    Two shapes:
+    Three shapes:
 
     * **cursor-native** — a curated *static* base catalog
       (:func:`omnigent.cursor_native.cursor_base_model_options`), returned
@@ -22239,6 +22239,8 @@ async def _fetch_model_options(
       can read (its app-server ``model/list``). Like skills, this stays off the
       snapshot hot path: the first snapshot kicks a background fetch and returns
       ``[]``; subsequent snapshots serve the cache.
+    * **claude-native** — the provider-neutral aliases from the exact launch
+      config, refreshed from Databricks before each new terminal starts.
 
     :param runner_client: HTTP client pointed at the bound runner, or
         ``None`` when no runner is bound.
@@ -22246,7 +22248,7 @@ async def _fetch_model_options(
         e.g. ``"conv_abc123"``.
     :param conv: Conversation row whose labels identify the wrapper.
     :returns: Model options, or ``[]`` when the session has no model picker or
-        the (codex) options are not yet available.
+        the runner-owned options are not yet available.
     """
     wrapper = conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
     if wrapper == _CURSOR_NATIVE_WRAPPER_LABEL_VALUE:
@@ -22294,7 +22296,7 @@ async def _load_model_options(
     :param path: Runner route to query, e.g.
         ``"/v1/sessions/conv_abc/cursor-model-options"``.
     """
-    for attempt in range(len(_CODEX_MODEL_OPTIONS_RETRY_DELAYS_S) + 1):
+    for attempt in range(len(_MODEL_OPTIONS_RETRY_DELAYS_S) + 1):
         try:
             resp = await runner_client.get(path, timeout=5.0)
         except (httpx.HTTPError, ConnectionError):
@@ -22304,8 +22306,8 @@ async def _load_model_options(
             # 503 means the native backend (Codex app-server bridge / cursor
             # login) is still booting. Keep the background single-flight alive
             # so the web picker fills without a second manual refresh.
-            if resp.status_code == 503 and attempt < len(_CODEX_MODEL_OPTIONS_RETRY_DELAYS_S):
-                await asyncio.sleep(_CODEX_MODEL_OPTIONS_RETRY_DELAYS_S[attempt])
+            if resp.status_code == 503 and attempt < len(_MODEL_OPTIONS_RETRY_DELAYS_S):
+                await asyncio.sleep(_MODEL_OPTIONS_RETRY_DELAYS_S[attempt])
                 continue
             return
         try:
@@ -22317,8 +22319,8 @@ async def _load_model_options(
             # Older runners returned 200 + [] for the same not-ready window.
             # Do not cache that empty catalog; retry, then leave the cache
             # cold so a later snapshot can try again.
-            if attempt < len(_CODEX_MODEL_OPTIONS_RETRY_DELAYS_S):
-                await asyncio.sleep(_CODEX_MODEL_OPTIONS_RETRY_DELAYS_S[attempt])
+            if attempt < len(_MODEL_OPTIONS_RETRY_DELAYS_S):
+                await asyncio.sleep(_MODEL_OPTIONS_RETRY_DELAYS_S[attempt])
                 continue
             return
         _model_options_cache[session_id] = options

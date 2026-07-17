@@ -209,6 +209,7 @@ interface SessionResponseWire {
    * description. Surfaced in the web composer's slash-command menu.
    */
   skills?: SkillSummary[];
+  /** Runner-owned model picker rows for native sessions. */
   model_options?: CodexModelOption[];
   /**
    * True while the runner is auto-creating a terminal-first session's

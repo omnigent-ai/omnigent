@@ -80,6 +80,14 @@ function composerProps(overrides: Partial<Parameters<typeof Composer>[0]> = {}) 
   };
 }
 
+const CLAUDE_MODEL_OPTIONS = [
+  { id: "fable", displayName: "Fable" },
+  { id: "opus", displayName: "Opus" },
+  { id: "sonnet", displayName: "Sonnet 4.6" },
+  { id: "sonnet_5", displayName: "Sonnet 5" },
+  { id: "haiku", displayName: "Haiku" },
+];
+
 /** The composer textarea, located by its aria-label. */
 function textarea() {
   return screen.getByLabelText("Message the agent") as HTMLTextAreaElement;
@@ -390,6 +398,7 @@ describe("Composer slash-command submit routing", () => {
           isNativeWrapper: true,
           showModels: true,
           modelPickerKind: "claude",
+          codexModelOptions: CLAUDE_MODEL_OPTIONS,
         })}
       />,
     );
@@ -476,6 +485,7 @@ describe("Composer slash-command submit routing", () => {
           isNativeWrapper: true,
           showModels: true,
           modelPickerKind: "claude",
+          codexModelOptions: CLAUDE_MODEL_OPTIONS,
         })}
       />,
     );
@@ -545,6 +555,7 @@ describe("AgentPicker trigger label", () => {
           selectedAgentId: "a1",
           modelPickerKind: "claude",
           showModels: true,
+          codexModelOptions: CLAUDE_MODEL_OPTIONS,
         })}
       />,
     );
@@ -574,6 +585,7 @@ describe("AgentPicker trigger label", () => {
           modelPickerKind: "claude",
           showModels: true,
           showEffort: false,
+          codexModelOptions: CLAUDE_MODEL_OPTIONS,
         })}
       />,
     );
@@ -615,6 +627,7 @@ describe("AgentPicker trigger label", () => {
           modelPickerKind: "claude",
           showModels: true,
           showEffort: false,
+          codexModelOptions: CLAUDE_MODEL_OPTIONS,
         })}
       />,
     );
@@ -777,6 +790,7 @@ describe("Composer effort slash-command visibility", () => {
           isNativeWrapper: true,
           showModels: true,
           modelPickerKind: "claude",
+          codexModelOptions: CLAUDE_MODEL_OPTIONS,
         })}
       />,
     );

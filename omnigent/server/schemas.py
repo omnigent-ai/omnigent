@@ -1754,10 +1754,9 @@ class SessionResponse(BaseModel):
         runner at startup. Empty list when the agent spec
         cannot be loaded, or when bundled + host discovery
         yields nothing.
-    :param model_options: Codex app-server ``model/list`` options
-        for codex-native sessions, including each model's supported
-        reasoning efforts. Empty for non-codex-native sessions or while
-        the bound runner / Codex app-server cannot answer yet.
+    :param model_options: Runner-owned model-picker options for native
+        sessions. Claude supplies launch-time gateway aliases; Codex includes
+        each model's supported reasoning efforts. Empty while unavailable.
     :param terminal_pending: ``True`` while the runner is auto-creating
         a terminal-first session's terminal (claude-native /
         codex-native), so the Web UI shows a spinner on the Terminal
@@ -2772,14 +2771,12 @@ class SessionSkillsEvent(_SSEEventBase):
 
 class SessionModelOptionsEvent(_SSEEventBase):
     """
-    Signal that a codex-native session's model catalog has resolved.
+    Signal that a native session's model catalog has resolved.
 
-    Model options are fetched from the bound runner's live
-    Codex app-server via ``model/list`` and cached on the session
-    snapshot. The initial snapshot can return an empty list while
-    this background fetch is in flight; this event tells connected
-    clients to re-read the snapshot and apply its now-populated
-    ``model_options``.
+    Model options are fetched from the bound runner and cached on the session
+    snapshot. The initial snapshot can return an empty list while this
+    background fetch is in flight; this event tells connected clients to
+    re-read the snapshot and apply its now-populated ``model_options``.
 
     Carries no payload beyond the conversation id. The snapshot's
     ``model_options`` field remains the source of truth.
@@ -2789,7 +2786,7 @@ class SessionModelOptionsEvent(_SSEEventBase):
         e.g. ``"conv_abc123"``.
 
     Category: **transient** (SSE-only). On reconnect, clients seed
-    Codex model / effort controls from the session snapshot.
+    Native model / effort controls from the session snapshot.
     """
 
     type: Literal["session.model_options"]
