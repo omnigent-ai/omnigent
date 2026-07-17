@@ -29,7 +29,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.mysql import BINARY as MySQLBinary
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
-from omnigent.db.compression import CompressedText
+from omnigent.db.compression import CompressedText, EncryptedText
 
 # 32-byte sha256 digest column. LargeBinary → BYTEA (Postgres) / BLOB (SQLite),
 # but MySQL cannot index a BLOB without a key-prefix length, so use fixed-length
@@ -623,8 +623,9 @@ class SqlConversationMetadata(OmnigentBase):
     external_session_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     session_state: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     session_usage: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
-    # JSON-encoded list of strings. NULL for non-native sessions.
-    terminal_launch_args: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    # JSON-encoded list of strings. NULL for non-native sessions. Compressed,
+    # and encrypted at rest when a column encryptor is installed.
+    terminal_launch_args: Mapped[str | None] = mapped_column(EncryptedText, nullable=True)
     # Required when host_id is set; enforced by check constraint below.
     workspace: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     git_branch: Mapped[str | None] = mapped_column(String(255), nullable=True)
@@ -863,7 +864,9 @@ class SqlConversationItem(ConversationBase):
     # ITEM_TYPE). The store converts to/from the string name at the
     # row↔entity boundary.
     type: Mapped[int] = mapped_column(SmallInteger)
-    data: Mapped[str] = mapped_column(Text)
+    # Item payload: compressed, and encrypted at rest when a column encryptor is
+    # installed. Opaque bytes to the database — content search uses search_text.
+    data: Mapped[str] = mapped_column(EncryptedText)
     search_text: Mapped[str] = mapped_column(Text)
     created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
@@ -1021,7 +1024,8 @@ class SqlComment(OmnigentBase):
     status: Mapped[int] = mapped_column(SmallInteger)
     created_at: Mapped[int] = mapped_column(Integer)
     updated_at: Mapped[int] = mapped_column(BigInteger)
-    anchor_content: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    # Compressed, and encrypted at rest when a column encryptor is installed.
+    anchor_content: Mapped[str | None] = mapped_column(EncryptedText, nullable=True)
     created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
     __table_args__ = (

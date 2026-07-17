@@ -1662,31 +1662,26 @@ class SqlAlchemyConversationStore(ConversationStore):
                         "ORDER BY rank LIMIT :limit"
                     )
             else:
-                # Non-SQLite fallback: LIKE/ILIKE on the data column.
-                # PostgreSQL: cast MEDIUMBLOB/JSONB to text and use ILIKE.
-                # MySQL: CONVERT(data USING utf8mb4) + LIKE (case-insensitive
-                #        by default with utf8mb4_unicode_ci collation).
+                # Non-SQLite fallback: LIKE/ILIKE on search_text — the same
+                # plain-text column the FTS path searches. The data column is a
+                # compressed (and optionally encrypted) BLOB, so it can't be
+                # pattern-matched as text. MySQL LIKE is case-insensitive under
+                # the default utf8mb4 collation; PostgreSQL needs ILIKE.
                 like_pattern = f"%{query}%"
-                is_mysql = self._conv_engine.dialect.name == "mysql"
-                if is_mysql:
-                    data_expr = "CONVERT(ci.data USING utf8mb4)"
-                    like_op = "LIKE"
-                else:
-                    data_expr = "ci.data::text"
-                    like_op = "ILIKE"
+                like_op = "LIKE" if self._conv_engine.dialect.name == "mysql" else "ILIKE"
                 if conversation_id is not None:
                     stmt = text(
                         f"SELECT ci.id FROM conversation_items ci "
                         f"WHERE ci.workspace_id = :ws "
                         f"AND ci.conversation_id = :cid "
-                        f"AND {data_expr} {like_op} :query "
+                        f"AND ci.search_text {like_op} :query "
                         f"ORDER BY ci.created_at DESC LIMIT :limit"
                     )
                 else:
                     stmt = text(
                         f"SELECT ci.id FROM conversation_items ci "
                         f"WHERE ci.workspace_id = :ws "
-                        f"AND {data_expr} {like_op} :query "
+                        f"AND ci.search_text {like_op} :query "
                         f"ORDER BY ci.created_at DESC LIMIT :limit"
                     )
                 query = like_pattern
