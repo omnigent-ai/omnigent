@@ -19,7 +19,6 @@ from omnigent.codex_native_bridge import (
     mcp_startup_waiting_detail,
     read_bridge_startup_error,
     read_bridge_state,
-    read_codex_config_model,
     read_mcp_startup,
     update_active_turn_id,
 )
@@ -189,9 +188,8 @@ class CodexNativeExecutor(Executor):
             shape. The latest user message is delivered to Codex.
         :param tools: Tool schemas from Omnigent. Ignored here;
             native Codex owns its own tool surface.
-        :param system_prompt: System prompt from the agent spec. The
-            first-turn session-rename instruction is forwarded through
-            Codex collaboration-mode developer instructions.
+        :param system_prompt: System prompt from the agent spec. Native
+            startup instructions are configured before the app-server launches.
         :param config: Per-turn executor config. Its ``model`` and
             ``extra["reasoning_effort"]`` (carrying the Omnigent web
             ``/model`` pick) are applied via a ``thread/settings/update``
@@ -199,7 +197,7 @@ class CodexNativeExecutor(Executor):
             by this bridge.
         :returns: Async iterator yielding one terminal event.
         """
-        del tools
+        del tools, system_prompt
         settings_overrides = _model_effort_overrides(config)
         input_items = _latest_user_input_items(messages, self._bridge_dir)
         if not input_items:
@@ -284,13 +282,6 @@ class CodexNativeExecutor(Executor):
                             "threadId": state.thread_id,
                             "input": input_items,
                         }
-                        collaboration_mode = _first_turn_collaboration_mode(
-                            system_prompt,
-                            config,
-                            self._bridge_dir,
-                        )
-                        if collaboration_mode is not None:
-                            turn_params["collaborationMode"] = collaboration_mode
                         response = await client.request("turn/start", turn_params)
                         turn_id = response.get("result", {}).get("turn", {}).get("id")
                         if isinstance(turn_id, str) and turn_id:
@@ -310,31 +301,6 @@ class CodexNativeExecutor(Executor):
             yield ExecutorError(message=error_msg)
         else:
             yield TurnComplete(response=None)
-
-
-def _first_turn_collaboration_mode(
-    system_prompt: str,
-    config: ExecutorConfig | None,
-    bridge_dir: Path,
-) -> dict[str, Any] | None:
-    """Build a first-turn developer-instruction override for session renaming."""
-    from omnigent.tools.builtins.session_rename import SESSION_RENAME_INSTRUCTION
-
-    # First-turn detection intentionally lives in the shared runner, which appends
-    # this instruction only for the initial user turn. This Codex-specific helper
-    # merely translates that canonical signal into the collaborationMode protocol;
-    # the server-side compare-and-swap remains the final stale-call guard.
-    model = (config.model if config is not None else None) or read_codex_config_model(bridge_dir)
-    if not model or SESSION_RENAME_INSTRUCTION not in system_prompt:
-        return None
-    return {
-        "mode": "default",
-        "settings": {
-            "model": model,
-            "reasoning_effort": None,
-            "developer_instructions": SESSION_RENAME_INSTRUCTION,
-        },
-    }
 
 
 def _model_effort_overrides(config: ExecutorConfig | None) -> dict[str, Any]:

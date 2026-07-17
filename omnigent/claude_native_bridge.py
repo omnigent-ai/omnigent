@@ -1367,6 +1367,7 @@ def augment_claude_args(
     bundle_dir: Path | None = None,
     agent_name: str | None = None,
     skills_filter: str | list[str] = "all",
+    append_system_prompt: str | None = None,
 ) -> list[str]:
     """
     Return Claude CLI args with Omnigent MCP/hook/skill injection.
@@ -1399,6 +1400,8 @@ def augment_claude_args(
         / ``"none"`` / list of skill names), mapped to
         ``--setting-sources`` exactly as the SDK executor maps it onto
         ``setting_sources``. Defaults to ``"all"``.
+    :param append_system_prompt: Optional framework-owned instructions to
+        append through Claude Code's native ``--append-system-prompt`` flag.
     :returns: Augmented argument list for the terminal resource.
     """
     mcp_config = build_mcp_config(bridge_dir, python_executable=python_executable)
@@ -1413,18 +1416,16 @@ def augment_claude_args(
         launch_effort=_arg_value(claude_args, "--effort"),
     )
     args = _merge_disallowed_tools(list(claude_args), _OMNIGENT_DISALLOWED_TOOLS)
-    from omnigent.tools.builtins.session_rename import SESSION_RENAME_INSTRUCTION
-
     args.extend(
         [
             "--mcp-config",
             json.dumps(mcp_config, separators=(",", ":")),
             "--settings",
             json.dumps(hook_settings, separators=(",", ":")),
-            "--append-system-prompt",
-            SESSION_RENAME_INSTRUCTION,
         ]
     )
+    if append_system_prompt:
+        args.extend(["--append-system-prompt", append_system_prompt])
     args.extend(
         claude_native_skill_args(
             bundle_dir,

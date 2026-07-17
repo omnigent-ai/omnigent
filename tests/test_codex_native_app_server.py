@@ -18,10 +18,47 @@ from omnigent.codex_native_app_server import (
     _POLICY_HOOK_TIMEOUT_SECONDS,
     CodexNativeAppServer,
     _codex_policy_hooks_settings,
+    _sync_codex_developer_instructions,
     build_codex_native_server,
     trust_native_policy_hooks,
 )
 from omnigent.codex_native_hook import _EVALUATE_POLICY_TIMEOUT_S
+
+
+def test_sync_developer_instructions_preserves_and_restores_user_config(tmp_path: Path) -> None:
+    """Framework instructions append without replacing the user's Codex guidance."""
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    config_path = codex_home / "config.toml"
+    config_path.write_text(
+        'model = "gpt-5.5"\ndeveloper_instructions = "Keep user guidance."\n',
+        encoding="utf-8",
+    )
+
+    _sync_codex_developer_instructions(codex_home, "Rename the session.")
+    _sync_codex_developer_instructions(codex_home, "Rename the session.")
+
+    config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    assert config["model"] == "gpt-5.5"
+    assert config["developer_instructions"] == ("Keep user guidance.\n\nRename the session.")
+
+    _sync_codex_developer_instructions(codex_home, None)
+
+    resumed_config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    assert resumed_config["developer_instructions"] == "Keep user guidance."
+
+
+def test_sync_developer_instructions_skips_invalid_config(tmp_path: Path) -> None:
+    """Optional title metadata never blocks Codex startup on malformed config."""
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    config_path = codex_home / "config.toml"
+    config_path.write_text("invalid = [", encoding="utf-8")
+
+    _sync_codex_developer_instructions(codex_home, "Rename the session.")
+
+    assert config_path.read_text(encoding="utf-8") == "invalid = ["
+
 
 _CWD = "/home/user/repo"
 _OUR_COMMAND = "/venv/bin/python -m omnigent.codex_native_hook evaluate-policy --bridge-dir /b"

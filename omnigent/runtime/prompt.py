@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 from omnigent.entities import (
@@ -14,10 +15,33 @@ from omnigent.entities import (
 from omnigent.spec import AgentSpec
 
 
+def append_framework_instructions(
+    instructions: str | None,
+    framework_instructions: Sequence[str],
+) -> str | None:
+    """Append framework-owned instructions to an existing system prompt.
+
+    Keeps framework policy out of harness adapters while preserving a single
+    ordering rule: user-authored agent/request instructions first, framework
+    metadata instructions last.
+
+    :param instructions: Existing composed system prompt, or ``None``.
+    :param framework_instructions: Additive framework instructions.
+    :returns: The combined prompt, or ``None`` when every input is empty.
+    """
+    parts = [instructions] if instructions else []
+    parts.extend(
+        instruction.strip() for instruction in framework_instructions if instruction.strip()
+    )
+    return "\n\n".join(parts) if parts else None
+
+
 def build_instructions(
     spec: AgentSpec,
     per_request_instructions: str | None,
     tool_schemas: list[dict[str, Any]],
+    *,
+    framework_instructions: Sequence[str] = (),
 ) -> str:
     """
     Build the system instructions string from the agent's
@@ -33,6 +57,8 @@ def build_instructions(
     :param tool_schemas: OpenAI-format tool schemas (used
         only for future skill-awareness hinting; currently
         not included in the instructions body).
+    :param framework_instructions: Framework-owned additive instructions
+        for this turn, appended after user-authored agent/request instructions.
     :returns: The assembled instructions string.
     """
     parts: list[str] = []
@@ -56,7 +82,11 @@ def build_instructions(
             skill_lines.append(f"- {skill.name}: {skill.description}")
         parts.append("\n".join(skill_lines))
 
-    return "\n\n".join(parts) if parts else "You are a helpful assistant."
+    base_instructions = "\n\n".join(parts) if parts else "You are a helpful assistant."
+    return (
+        append_framework_instructions(base_instructions, framework_instructions)
+        or base_instructions
+    )
 
 
 def _strip_output_annotations(

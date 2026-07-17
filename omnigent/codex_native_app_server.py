@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import tomlkit
 import websockets
 
 if TYPE_CHECKING:
@@ -227,6 +228,62 @@ def _pin_codex_config_model(codex_home: Path, model: str) -> None:
     if not replaced:
         lines.insert(0, pin_line)
     config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _sync_codex_developer_instructions(
+    codex_home: Path,
+    instructions: str | None,
+) -> None:
+    """Synchronize framework instructions in the private Codex config.
+
+    Codex's top-level ``developer_instructions`` setting is additive to its
+    built-in operating instructions. The collaboration-mode field is not: a
+    non-null value replaces the mode's defaults. The private session config
+    therefore stores the user's original value in a sidecar, then derives the
+    active value from that base on every launch. Fresh sessions append the
+    framework directive; resumed sessions restore the unmodified base.
+
+    :param codex_home: Private per-session ``CODEX_HOME`` directory.
+    :param instructions: Framework instructions for this launch, or ``None``.
+    :returns: None.
+    """
+    addition = instructions.strip() if instructions else ""
+    config_path = codex_home / "config.toml"
+    base_path = codex_home / ".omnigent-developer-instructions-base"
+    if config_path.is_symlink():
+        target = config_path.resolve()
+        config_path.unlink()
+        if target.is_file():
+            import shutil
+
+            shutil.copy2(target, config_path)
+    existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+    try:
+        document = tomlkit.parse(existing) if existing else tomlkit.document()
+    except Exception:  # noqa: BLE001 - title metadata must never block Codex startup.
+        _logger.warning(
+            "Could not synchronize native Codex framework instructions: invalid private config",
+            exc_info=True,
+        )
+        return
+    current = document.get("developer_instructions")
+    if current is not None and not isinstance(current, str):
+        _logger.warning(
+            "Could not synchronize native Codex framework instructions: "
+            "developer_instructions is not a string"
+        )
+        return
+    if base_path.exists():
+        base = base_path.read_text(encoding="utf-8")
+    else:
+        base = current.strip() if isinstance(current, str) else ""
+        base_path.write_text(base, encoding="utf-8")
+    active = f"{base}\n\n{addition}" if base and addition else base or addition
+    if active:
+        document["developer_instructions"] = active
+    elif "developer_instructions" in document:
+        del document["developer_instructions"]
+    config_path.write_text(tomlkit.dumps(document), encoding="utf-8")
 
 
 def _inject_mcp_server_config(
@@ -469,6 +526,8 @@ class CodexNativeAppServer:
     :param codex_home: Private per-session ``CODEX_HOME`` path.
     :param env: Environment for the app-server subprocess.
     :param config_overrides: Codex ``-c`` config override values.
+    :param developer_instructions: Optional framework-owned instructions
+        appended to the private session config before app-server startup.
     :param cwd: Working directory for the app-server process.
     :param bridge_dir: Native Codex bridge directory, e.g.
         ``Path("~/.omnigent/codex-native/<hash>")``. The policy hook
@@ -509,6 +568,7 @@ class CodexNativeAppServer:
     config_overrides: list[str]
     cwd: Path
     bridge_dir: Path
+    developer_instructions: str | None = None
     ap_server_url: str | None = None
     ap_auth_headers: dict[str, str] | None = None
     python_executable: str | None = None
@@ -543,6 +603,10 @@ class CodexNativeAppServer:
         _inject_mcp_server_config(self.codex_home, self.bridge_dir, self.python_executable)
         if self.pinned_model:
             _pin_codex_config_model(self.codex_home, self.pinned_model)
+        _sync_codex_developer_instructions(
+            self.codex_home,
+            self.developer_instructions,
+        )
         # Native policy enforcement needs codex's hook-trust protocol
         # (``currentHash`` / ``trustStatus`` in ``hooks/list``), added in
         # codex 0.129. Below that the hook can never be trusted, so
@@ -1078,6 +1142,7 @@ def build_codex_native_server(
     python_executable: str | None = None,
     codex_path: str | None = None,
     extra_config_overrides: list[str] | None = None,
+    developer_instructions: str | None = None,
     bypass_sandbox: bool = False,
 ) -> CodexNativeAppServer:
     """
@@ -1103,6 +1168,8 @@ def build_codex_native_server(
     :param extra_config_overrides: Additional ``-c`` config overrides
         appended after Databricks routing overrides, e.g. MCP server
         registration for the Omnigent tool relay.
+    :param developer_instructions: Optional framework-owned instructions
+        appended to Codex's private per-session config.
     :param bypass_sandbox: When ``True``, append config overrides that put
         the app-server's threads into the full-bypass stance
         (``approval_policy="never"`` + ``sandbox_mode="danger-full-access"``)
@@ -1162,6 +1229,7 @@ def build_codex_native_server(
         config_overrides=config_overrides,
         cwd=cwd,
         bridge_dir=bridge_dir,
+        developer_instructions=developer_instructions,
         ap_server_url=ap_server_url,
         ap_auth_headers=ap_auth_headers,
         python_executable=python_executable,

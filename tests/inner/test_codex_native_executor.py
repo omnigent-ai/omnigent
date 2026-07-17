@@ -193,11 +193,11 @@ def test_web_started_codex_turn_returns_without_waiting_for_terminal_event(
     ]
 
 
-def test_first_turn_rename_instruction_uses_developer_instructions(
+def test_system_prompt_does_not_override_collaboration_mode(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """The native first turn gives session renaming developer priority."""
+    """Native startup config owns system prompts; turns preserve Codex defaults."""
     from omnigent.tools.builtins.session_rename import SESSION_RENAME_INSTRUCTION
 
     _FakeCodexNativeClient.requests = []
@@ -207,16 +207,13 @@ def test_first_turn_rename_instruction_uses_developer_instructions(
         "omnigent.codex_native_app_server.CodexAppServerClient",
         _FakeCodexNativeClient,
     )
-    codex_home = tmp_path / "codex-home"
-    codex_home.mkdir()
-    (codex_home / "config.toml").write_text('model = "gpt-5.4-mini"\n')
     write_bridge_state(
         tmp_path,
         CodexNativeBridgeState(
             session_id="conv_123",
             socket_path=str(tmp_path / "app-server.sock"),
             thread_id="thread_123",
-            codex_home=str(codex_home),
+            codex_home=str(tmp_path / "codex-home"),
             active_turn_id=None,
         ),
     )
@@ -239,14 +236,6 @@ def test_first_turn_rename_instruction_uses_developer_instructions(
             {
                 "threadId": "thread_123",
                 "input": [{"type": "text", "text": "hello"}],
-                "collaborationMode": {
-                    "mode": "default",
-                    "settings": {
-                        "model": "gpt-5.4-mini",
-                        "reasoning_effort": None,
-                        "developer_instructions": SESSION_RENAME_INSTRUCTION,
-                    },
-                },
             },
         ),
     ]

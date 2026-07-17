@@ -4250,6 +4250,7 @@ async def test_prepare_claude_terminal_cold_resume_injects_external_session_id(
         command: str,
         bridge_dir: Path,
         claude_config: claude_native.ClaudeNativeUcodeConfig | None = None,
+        append_system_prompt: str | None = None,
     ) -> str:
         """
         Capture the launch args without invoking the real runner.
@@ -4266,6 +4267,7 @@ async def test_prepare_claude_terminal_cold_resume_injects_external_session_id(
         """
         captured_terminal_args["session_id"] = session_id
         captured_terminal_args["claude_args"] = claude_args
+        captured_terminal_args["append_system_prompt"] = append_system_prompt
         del command, bridge_dir, claude_config
         return "terminal_claude_main"
 
@@ -4333,6 +4335,7 @@ async def test_prepare_claude_terminal_cold_resume_injects_external_session_id(
         "--print",
         "hello",
     )
+    assert captured_terminal_args["append_system_prompt"] is None
 
     # Load-bearing for the duplicate-message bug: cold resume
     # MUST set ``cold_resumed=True`` so the transcript forwarder seeks
@@ -4393,8 +4396,12 @@ async def test_prepare_claude_terminal_fresh_session_is_not_cold_resumed(
         command: str,
         bridge_dir: Path,
         claude_config: claude_native.ClaudeNativeUcodeConfig | None = None,
+        append_system_prompt: str | None = None,
     ) -> str:
         """Return a fixed terminal id without spawning anything."""
+        from omnigent.tools.builtins.session_rename import SESSION_RENAME_INSTRUCTION
+
+        assert append_system_prompt == SESSION_RENAME_INSTRUCTION
         del _client, _session_id, _claude_args, command, bridge_dir, claude_config
         return "terminal_claude_main"
 
