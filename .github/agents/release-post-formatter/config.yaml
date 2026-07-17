@@ -115,14 +115,20 @@ prompt: |
   Use the literal token `TODO` so a reviewer can grep for it. Never fabricate a
   real-looking image path.
 
-  ## Docs links (link to a real page, or omit the line)
-  The "## Available docs pages" input lists every real docs URL and its title. For
-  each feature, add the "Learn more" line ONLY when a listed page is clearly about
-  that feature; use that page's exact URL and title:
-    `_Learn more in the [<that page's title>](<that page's URL>)._`
-  If no listed page clearly matches — or the list is empty / says none available —
-  OMIT the "Learn more" line for that feature entirely. Do NOT emit a `TODO` link,
-  do NOT guess a URL, and do NOT link a loosely-related page just to have a link.
+  ## Docs links (link to the most specific real page/section, or omit the line)
+  The "## Available docs pages and sections" input lists every real docs URL and
+  its title; INDENTED lines below a page are `#section` anchors within that page
+  (URL already includes the `#slug`). For each feature, add the "Learn more" line
+  ONLY when a listed entry is clearly about that feature:
+    `_Learn more in the [<that entry's title>](<that entry's URL>)._`
+  Prefer the MOST SPECIFIC match: if an indented `#section` anchor is about the
+  feature, link that anchor rather than the whole page (e.g. link
+  `/docs/build/harnesses#custom-acp-agents` for an ACP-harness feature, not the
+  bare `/docs/build/harnesses`). Fall back to the page URL only when no section
+  fits better.
+  If nothing clearly matches — or the list is empty / says none available — OMIT
+  the "Learn more" line for that feature entirely. Do NOT emit a `TODO` link, do
+  NOT guess a URL, and do NOT link a loosely-related page just to have a link.
 
   ## Fidelity rules
   - NO PR references. Drop every `(#123)` / `#123` — do not carry them into the

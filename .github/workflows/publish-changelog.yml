@@ -178,18 +178,41 @@ jobs:
           import pathlib, re, sys
           root = pathlib.Path(sys.argv[1])
           docs = root / "app" / "docs"
-          lines = []
+
+          def slugify(text):
+              # Mirror components/HeadingAnchors.js so #anchors resolve on the site.
+              text = text.lower()
+              text = re.sub(r"[^a-z0-9\s-]", "", text)
+              text = re.sub(r"\s+", "-", text)
+              text = re.sub(r"-+", "-", text)
+              return text.strip()
+
+          lines, pages = [], 0
           for page in sorted(docs.rglob("page.mdx")):
               url = "/" + page.relative_to(root).parent.as_posix().removeprefix("app/")
-              title = ""
+              title, sections, in_fence = "", [], False
               for ln in page.read_text(encoding="utf-8", errors="replace").splitlines():
-                  m = re.match(r"#\s+(.*\S)", ln)  # first H1
-                  if m:
-                      title = m.group(1).strip()
-                      break
+                  if ln.lstrip().startswith("```"):  # skip fenced code blocks
+                      in_fence = not in_fence
+                      continue
+                  if in_fence:
+                      continue
+                  m = re.match(r"(#{1,3})\s+(.*\S)", ln)  # only h1-h3 get anchors
+                  if not m:
+                      continue
+                  level, text = len(m.group(1)), m.group(2).strip()
+                  # Reduce `[label](url)` to `label`: the site slugs rendered text.
+                  text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
+                  if level == 1 and not title:
+                      title = text
+                  elif level > 1:
+                      sections.append((slugify(text), text))
+              pages += 1
               lines.append(f"{url}\t{title}" if title else url)
+              for slug, text in sections:
+                  lines.append(f"  {url}#{slug}\t{text}")
           pathlib.Path("/tmp/docs_index.txt").write_text("\n".join(lines) + ("\n" if lines else ""))
-          print(f"Indexed {len(lines)} docs pages.")
+          print(f"Indexed {pages} docs pages, {len(lines) - pages} sections.")
           PYEOF
           else
             echo "::warning::Could not fetch omnigent-site docs — 'Learn more' links will be omitted."
@@ -218,7 +241,8 @@ jobs:
           ## Curated GitHub Release body (rewrite this — do not add or drop facts)
           {body}
 
-          ## Available docs pages (URL <TAB> title) — link features to these only
+          ## Available docs pages and sections (URL <TAB> title; indented = a
+          ## #section anchor within the page above) — link features to these only
           {docs_block}
 
           Produce the RELEASE_POST block per your instructions."""
