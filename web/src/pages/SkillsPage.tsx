@@ -177,7 +177,15 @@ export function SkillsPage() {
   const catalogQuery = useSkillCatalog(sessionId, includeOtherTools);
   const [query, setQuery] = useState("");
   const [sourceFilter, setSourceFilter] = useState<string>(ALL_SOURCES);
+  // Selection model for the left tree:
+  //  - selectedId : the skill whose resource tree shows inline beneath its row
+  //    AND whose detail the right pane shows. Selection IS expansion — there is
+  //    no separate collapse state, and only the selected skill fetches a tree,
+  //    so a 100+ catalog never preloads every tree.
+  //  - selectedFile : a file picked under the selected skill; when set the right
+  //    pane previews it, else it shows the skill overview/instructions.
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [selectedFile, setSelectedFile] = useState<string | null>(null);
 
   const skills = useMemo(() => catalogQuery.data?.skills ?? [], [catalogQuery.data]);
 
@@ -203,21 +211,39 @@ export function SkillsPage() {
 
   // Keep the selection valid: auto-select the first VISIBLE row, and if the
   // current selection is filtered out (by search or source), move to the first
-  // still-visible row rather than showing a detail pane for a hidden item.
+  // still-visible row and drop any file selection so the right pane never
+  // previews a file from a now-hidden skill.
   useEffect(() => {
     if (!shown.length) {
       if (selectedId !== null) setSelectedId(null);
+      if (selectedFile !== null) setSelectedFile(null);
       return;
     }
     if (selectedId === null || !shown.some((s) => s.id === selectedId)) {
       setSelectedId(shown[0].id);
+      setSelectedFile(null);
     }
-  }, [shown, selectedId]);
+  }, [shown, selectedId, selectedFile]);
 
   const handleToggleInclude = () => {
     const next = !includeOtherTools;
     setIncludeOtherTools(next);
     setTrust.mutate(next);
+  };
+
+  // Click a skill row: select it (its tree shows inline beneath the row) and
+  // drop any file selection so the right pane returns to the skill overview.
+  // Selecting a different skill moves the open tree to it — there is no separate
+  // collapse; selection is expansion.
+  const handleSelectSkill = (id: string) => {
+    setSelectedId(id);
+    setSelectedFile(null);
+  };
+
+  // Click a file under the selected skill: select it for right-pane preview.
+  const handleSelectFile = (skillId: string, path: string) => {
+    setSelectedId(skillId);
+    setSelectedFile(path);
   };
 
   return (
@@ -247,7 +273,11 @@ export function SkillsPage() {
             sourceFilter={sourceFilter}
             onSourceChange={setSourceFilter}
             selectedId={selectedId}
-            onSelect={setSelectedId}
+            selectedFile={selectedFile}
+            onSelectSkill={handleSelectSkill}
+            onSelectFile={handleSelectFile}
+            sessionId={sessionId}
+            includeOtherTools={includeOtherTools}
             loading={catalogQuery.isLoading}
             error={catalogQuery.isError}
             onRetry={() => void catalogQuery.refetch()}
@@ -256,6 +286,7 @@ export function SkillsPage() {
             skillId={selectedId}
             sessionId={sessionId}
             includeOtherTools={includeOtherTools}
+            selectedFile={selectedFile}
           />
         </div>
       )}
@@ -343,7 +374,11 @@ function SkillList({
   sourceFilter,
   onSourceChange,
   selectedId,
-  onSelect,
+  selectedFile,
+  onSelectSkill,
+  onSelectFile,
+  sessionId,
+  includeOtherTools,
   loading,
   error,
   onRetry,
@@ -356,13 +391,17 @@ function SkillList({
   sourceFilter: string;
   onSourceChange: (value: string) => void;
   selectedId: string | null;
-  onSelect: (id: string) => void;
+  selectedFile: string | null;
+  onSelectSkill: (id: string) => void;
+  onSelectFile: (skillId: string, path: string) => void;
+  sessionId: string;
+  includeOtherTools: boolean;
   loading: boolean;
   error: boolean;
   onRetry: () => void;
 }) {
   return (
-    <div className="flex w-[292px] shrink-0 flex-col border-r border-border">
+    <div className="flex w-[320px] shrink-0 flex-col border-r border-border">
       <div className="flex shrink-0 flex-col gap-2 border-b border-border px-3 py-2">
         <div className="flex items-center gap-2">
           <div className="flex flex-1 items-center gap-2 rounded-lg bg-muted px-2.5 py-1.5 focus-within:ring-2 focus-within:ring-ring/40">
@@ -388,7 +427,12 @@ function SkillList({
         )}
       </div>
 
-      <div className="min-h-0 flex-1 overflow-y-auto p-1.5" data-testid="skills-list">
+      <div
+        className="min-h-0 flex-1 overflow-y-auto p-1.5"
+        data-testid="skills-list"
+        role="tree"
+        aria-label="Skills"
+      >
         {loading ? (
           <div className="flex items-center justify-center gap-2 px-4 py-10 text-sm text-muted-foreground">
             <Loader2Icon className="size-4 animate-spin" />
@@ -409,12 +453,18 @@ function SkillList({
           </p>
         ) : (
           // One flat, harness-neutral list — no source/provider/scope sections.
+          // Each row is a collapsible folder-like node; only the expanded skill
+          // fetches + renders its resource tree inline beneath the row.
           skills.map((skill) => (
             <SkillRow
               key={skill.id}
               skill={skill}
               selected={selectedId === skill.id}
-              onSelect={() => onSelect(skill.id)}
+              selectedFile={selectedId === skill.id ? selectedFile : null}
+              onSelectSkill={() => onSelectSkill(skill.id)}
+              onSelectFile={(path) => onSelectFile(skill.id, path)}
+              sessionId={sessionId}
+              includeOtherTools={includeOtherTools}
             />
           ))
         )}
@@ -462,46 +512,64 @@ function SourceFilter({
 function SkillRow({
   skill,
   selected,
-  onSelect,
+  selectedFile,
+  onSelectSkill,
+  onSelectFile,
+  sessionId,
+  includeOtherTools,
 }: {
   skill: SkillSummary;
   selected: boolean;
-  onSelect: () => void;
+  selectedFile: string | null;
+  onSelectSkill: () => void;
+  onSelectFile: (path: string) => void;
+  sessionId: string;
+  includeOtherTools: boolean;
 }) {
+  // A skill row is a SELECTION control (not a disclosure): clicking it selects
+  // the skill, and the selected skill's resource tree renders inline beneath it.
+  // No chevron, no status dot — selection alone drives the visible tree, which
+  // fetches lazily only for the selected skill.
   return (
-    <button
-      type="button"
-      onClick={onSelect}
-      aria-current={selected ? "true" : undefined}
-      data-testid={`skill-row-${skill.name}`}
-      className={cn(
-        "flex h-12 w-full items-center gap-2.5 rounded-lg px-2.5 text-left transition-colors",
-        "hover:bg-foreground/5",
-        selected && "bg-info/10 shadow-[inset_2px_0_var(--color-info)]",
-        !skill.enabled && "opacity-60",
-      )}
-    >
-      <span
-        aria-hidden
+    <div role="treeitem" aria-selected={selected}>
+      <button
+        type="button"
+        onClick={onSelectSkill}
+        title={`/${skill.name}`}
+        data-testid={`skill-row-${skill.name}`}
         className={cn(
-          "size-1.5 shrink-0 rounded-full",
-          skill.enabled ? "bg-success" : "bg-muted-foreground/40",
+          "flex h-12 w-full items-center rounded-lg px-3 text-left transition-colors",
+          "hover:bg-foreground/5",
+          selected && "bg-info/10 shadow-[inset_2px_0_var(--color-info)]",
+          !skill.enabled && "opacity-60",
         )}
-      />
-      <span className="min-w-0 flex-1">
-        <span className="block truncate font-mono text-[13px] font-semibold text-foreground">
-          /{skill.name}
+      >
+        <span className="min-w-0 flex-1">
+          <span className="block truncate font-mono text-[13px] font-semibold text-foreground">
+            /{skill.name}
+          </span>
+          <span className="mt-px block truncate text-[11px] text-muted-foreground">
+            {skill.description}
+          </span>
         </span>
-        <span className="mt-px block truncate text-[11px] text-muted-foreground">
-          {skill.description}
-        </span>
-      </span>
-      {!skill.enabled && (
-        <span className="shrink-0 text-[9.5px] font-bold uppercase tracking-wide text-muted-foreground">
-          available
-        </span>
+        {!skill.enabled && (
+          <span className="ml-2 shrink-0 text-[9.5px] font-bold uppercase tracking-wide text-muted-foreground">
+            available
+          </span>
+        )}
+      </button>
+      {selected && (
+        <div role="group">
+          <SkillFileTree
+            skillId={skill.id}
+            sessionId={sessionId}
+            includeOtherTools={includeOtherTools}
+            selectedFile={selectedFile}
+            onSelectFile={onSelectFile}
+          />
+        </div>
       )}
-    </button>
+    </div>
   );
 }
 
@@ -511,10 +579,12 @@ function SkillDetailPane({
   skillId,
   sessionId,
   includeOtherTools,
+  selectedFile,
 }: {
   skillId: string | null;
   sessionId: string;
   includeOtherTools: boolean;
+  selectedFile: string | null;
 }) {
   const detailQuery = useSkillDetail(skillId, sessionId, includeOtherTools);
 
@@ -522,6 +592,36 @@ function SkillDetailPane({
     return (
       <div className="flex flex-1 items-center justify-center text-sm text-muted-foreground">
         Select a skill to view details
+      </div>
+    );
+  }
+
+  // A file picked in the left tree takes over the right pane as a preview; the
+  // skill's own detail loads underneath (so the header/Source still resolve),
+  // but we short-circuit to the preview to keep it responsive.
+  if (selectedFile !== null) {
+    return (
+      <div
+        className="flex-1 overflow-y-auto px-6 pb-10 pt-5"
+        data-testid="skill-detail"
+        data-skill-id={skillId}
+        data-selected-file={selectedFile}
+      >
+        <div className="flex items-center gap-2">
+          <FileIcon className="size-4 shrink-0 text-muted-foreground" />
+          <h2 className="min-w-0 truncate font-mono text-[15px] font-semibold" title={selectedFile}>
+            {selectedFile}
+          </h2>
+        </div>
+        <p className="mt-0.5 text-[11px] text-muted-foreground">Skill resource file</p>
+        <div className="mt-4">
+          <FilePreview
+            skillId={skillId}
+            sessionId={sessionId}
+            includeOtherTools={includeOtherTools}
+            filePath={selectedFile}
+          />
+        </div>
       </div>
     );
   }
@@ -546,24 +646,10 @@ function SkillDetailPane({
     );
   }
 
-  return (
-    <SkillDetailBody
-      skill={detailQuery.data}
-      sessionId={sessionId}
-      includeOtherTools={includeOtherTools}
-    />
-  );
+  return <SkillDetailBody skill={detailQuery.data} />;
 }
 
-function SkillDetailBody({
-  skill,
-  sessionId,
-  includeOtherTools,
-}: {
-  skill: SkillDetail;
-  sessionId: string;
-  includeOtherTools: boolean;
-}) {
+function SkillDetailBody({ skill }: { skill: SkillDetail }) {
   const accent = ORIGIN_ACCENT[skill.origin];
   const glyph = skill.name.slice(0, 2).toUpperCase();
 
@@ -640,24 +726,6 @@ function SkillDetailBody({
       <Section label="Instructions">
         <InstructionsBlock skill={skill} />
       </Section>
-
-      {/* Files — browse the skill's on-disk resource tree (references/, etc.). */}
-      <Section label="Files">
-        <SkillFilesBrowser
-          skillId={skill.id}
-          sessionId={sessionId}
-          includeOtherTools={includeOtherTools}
-        />
-      </Section>
-
-      {/* Ready line */}
-      <div className="mt-4 flex items-start gap-2 rounded-lg bg-success/10 px-3 py-2.5 text-[11.5px] leading-snug text-success">
-        <CheckIcon className="mt-px size-3.5 shrink-0" />
-        <span>
-          Ready to use. Omnigent makes this skill available automatically when it matches your
-          request.
-        </span>
-      </div>
 
       {/* Advanced details */}
       <AdvancedDetails skill={skill} />
@@ -768,38 +836,37 @@ function IconToggle({
   );
 }
 
-// ── Files browser ──────────────────────────────────────────────────────────────
+// ── Inline skill file tree (left sidebar) ───────────────────────────────────────
 
 /**
- * Browse the selected skill's on-disk resource tree (SKILL.md +
- * `references/` / `scripts/` / `assets/`). The tree is lazily fetched when the
- * detail mounts; a file's content is fetched only when the user picks it. This
- * lives inside the neutral detail pane — it never re-introduces path/provider
- * grouping into the master list.
+ * The expanded skill's on-disk resource tree, rendered INLINE in the left
+ * master sidebar beneath its skill row. Fetched lazily — only mounted while its
+ * skill is expanded, so a 100+ catalog never preloads every tree. Picking a
+ * file calls `onSelectFile`; the right pane renders the preview. Directory
+ * nodes nest one indent level under the skill row (depth starts at 1).
  */
-function SkillFilesBrowser({
+function SkillFileTree({
   skillId,
   sessionId,
   includeOtherTools,
+  selectedFile,
+  onSelectFile,
 }: {
   skillId: string;
   sessionId: string;
   includeOtherTools: boolean;
+  selectedFile: string | null;
+  onSelectFile: (path: string) => void;
 }) {
   const treeQuery = useSkillFileTree(skillId, sessionId, includeOtherTools);
-  const [selectedPath, setSelectedPath] = useState<string | null>(null);
-
   const tree = useMemo(() => buildFileTree(treeQuery.data ?? []), [treeQuery.data]);
-  const fileCount = (treeQuery.data ?? []).filter((n) => n.kind === "file").length;
-
-  // Reset the picked file when the skill changes (the id is the query input).
-  useEffect(() => {
-    setSelectedPath(null);
-  }, [skillId]);
 
   if (treeQuery.isLoading) {
     return (
-      <div className="flex items-center gap-2 rounded-lg border border-border bg-muted px-3 py-2.5 text-[12px] text-muted-foreground">
+      <div
+        className="flex items-center gap-2 py-1.5 pl-8 pr-2 text-[11.5px] text-muted-foreground"
+        data-testid="skill-files"
+      >
         <Loader2Icon className="size-3.5 animate-spin" />
         Loading files…
       </div>
@@ -807,8 +874,11 @@ function SkillFilesBrowser({
   }
   if (treeQuery.isError) {
     return (
-      <div className="flex items-center justify-between gap-2 rounded-lg border border-border bg-muted px-3 py-2.5 text-[12px] text-muted-foreground">
-        <span>Couldn't load this skill's files.</span>
+      <div
+        className="flex items-center justify-between gap-2 py-1.5 pl-8 pr-2 text-[11.5px] text-muted-foreground"
+        data-testid="skill-files"
+      >
+        <span>Couldn't load files.</span>
         <Button variant="outline" size="sm" onClick={() => void treeQuery.refetch()}>
           Try again
         </Button>
@@ -817,50 +887,28 @@ function SkillFilesBrowser({
   }
   if (!tree.length) {
     return (
-      <p className="rounded-lg border border-dashed border-border px-3 py-2.5 text-[12px] text-muted-foreground">
-        This skill has no bundled files.
+      <p className="py-1.5 pl-8 pr-2 text-[11.5px] text-muted-foreground" data-testid="skill-files">
+        No bundled files.
       </p>
     );
   }
 
   return (
-    <div className="overflow-hidden rounded-lg border border-border" data-testid="skill-files">
-      <div
-        className="max-h-56 overflow-y-auto bg-muted/50 p-1.5"
-        role="tree"
-        aria-label="Skill files"
-      >
-        {tree.map((node) => (
-          <FileTreeNodeRow
-            key={node.path}
-            node={node}
-            depth={0}
-            selectedPath={selectedPath}
-            onSelectFile={setSelectedPath}
-          />
-        ))}
-      </div>
-      <div className="border-t border-border">
-        {selectedPath === null ? (
-          <p className="px-3 py-3 text-[11.5px] text-muted-foreground">
-            {fileCount === 1
-              ? "Select the file to preview it."
-              : `Select a file to preview it. ${fileCount} files.`}
-          </p>
-        ) : (
-          <FilePreview
-            skillId={skillId}
-            sessionId={sessionId}
-            includeOtherTools={includeOtherTools}
-            filePath={selectedPath}
-          />
-        )}
-      </div>
+    <div className="pb-1" data-testid="skill-files">
+      {tree.map((node) => (
+        <FileTreeNodeRow
+          key={node.path}
+          node={node}
+          depth={1}
+          selectedPath={selectedFile}
+          onSelectFile={onSelectFile}
+        />
+      ))}
     </div>
   );
 }
 
-/** One row in the file tree — a directory (always expanded) or a file button. */
+/** One row in the file tree — a directory (collapsible) or a file button. */
 function FileTreeNodeRow({
   node,
   depth,
@@ -873,7 +921,7 @@ function FileTreeNodeRow({
   onSelectFile: (path: string) => void;
 }) {
   const [open, setOpen] = useState(true);
-  const indent = { paddingLeft: `${depth * 14 + 8}px` };
+  const indent = { paddingLeft: `${depth * 16 + 8}px` };
 
   if (node.kind === "dir") {
     return (
@@ -882,6 +930,7 @@ function FileTreeNodeRow({
           type="button"
           onClick={() => setOpen((v) => !v)}
           style={indent}
+          title={node.path}
           data-testid={`skill-file-dir-${node.path}`}
           className="flex w-full items-center gap-1.5 rounded-md py-1 pr-2 text-left text-[12px] text-foreground transition-colors hover:bg-foreground/5"
         >
@@ -913,6 +962,7 @@ function FileTreeNodeRow({
       aria-selected={selected}
       onClick={() => onSelectFile(node.path)}
       style={indent}
+      title={node.path}
       data-testid={`skill-file-${node.path}`}
       className={cn(
         "flex w-full items-center gap-1.5 rounded-md py-1 pr-2 text-left text-[12px] transition-colors",

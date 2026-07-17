@@ -304,6 +304,19 @@ describe("SkillsPage", () => {
     );
   });
 
+  it("does NOT show a 'Ready to use' readiness banner", async () => {
+    vi.mocked(skillsApi.getSkillCatalog).mockResolvedValue({
+      skills: [BUILTIN],
+      includeOtherTools: false,
+      hiddenCount: 0,
+    });
+
+    renderPage();
+    const detailPane = await screen.findByTestId("skill-detail");
+    expect(within(detailPane).queryByText(/Ready to use/i)).toBeNull();
+    expect(within(detailPane).queryByText(/makes this skill available automatically/i)).toBeNull();
+  });
+
   it("selecting a row swaps the detail pane", async () => {
     vi.mocked(skillsApi.getSkillCatalog).mockResolvedValue({
       skills: [BUILTIN, WORKSPACE],
@@ -466,43 +479,81 @@ describe("SkillsPage", () => {
   });
 });
 
-describe("SkillsPage — Files browser", () => {
-  // A skill selected by default (bundle:ship) so the detail's Files area mounts.
-  function renderWithFiles() {
+describe("SkillsPage — left sidebar file explorer", () => {
+  // Two skills so we can prove only the SELECTED skill renders a tree.
+  function renderWithTwoSkills() {
     vi.mocked(skillsApi.getSkillCatalog).mockResolvedValue({
-      skills: [BUILTIN],
+      skills: [BUILTIN, WORKSPACE],
       includeOtherTools: false,
       hiddenCount: 0,
     });
     return renderPage();
   }
 
-  it("lazily lists a nested file tree with dirs expanded", async () => {
-    vi.mocked(skillsApi.getSkillFileTree).mockResolvedValue([
-      { path: "SKILL.md", kind: "file", size: 120 },
-      { path: "references", kind: "dir", size: null },
-      { path: "references/guide.md", kind: "file", size: 42 },
-      { path: "assets", kind: "dir", size: null },
-      { path: "assets/logo.png", kind: "file", size: 2048 },
-    ]);
+  it("has no top-level chevron or status dot on skill rows", async () => {
+    vi.mocked(skillsApi.getSkillFileTree).mockResolvedValue([]);
+    renderWithTwoSkills();
 
-    renderWithFiles();
-    await screen.findByTestId("skill-detail");
+    const row = await screen.findByTestId("skill-row-ship");
+    // The row is a selection control, not a disclosure button.
+    expect(row).not.toHaveAttribute("aria-expanded");
+    // No decorative SVG (chevron / status dot) inside the row button.
+    expect(row.querySelector("svg")).toBeNull();
+    // The treeitem wrapper reflects selection, not expansion.
+    const treeitem = row.closest('[role="treeitem"]');
+    expect(treeitem).toHaveAttribute("aria-selected", "true");
+    expect(treeitem).not.toHaveAttribute("aria-expanded");
+  });
 
-    // The tree fetch is scoped to the selected skill + session context.
+  it("renders the tree only for the selected skill, fetched lazily", async () => {
+    vi.mocked(skillsApi.getSkillFileTree).mockImplementation(async (id) =>
+      id === "bundle:ship"
+        ? [
+            { path: "SKILL.md", kind: "file", size: 120 },
+            { path: "references", kind: "dir", size: null },
+            { path: "references/guide.md", kind: "file", size: 42 },
+          ]
+        : [{ path: "OTHER.md", kind: "file", size: 10 }],
+    );
+
+    renderWithTwoSkills();
+    // `ship` auto-selects first → its tree shows; the tree fetch is scoped to it.
     await waitFor(() =>
       expect(skillsApi.getSkillFileTree).toHaveBeenCalledWith("bundle:ship", "sess_active", false),
     );
-    // Files + nested dir contents render (dirs default open).
     expect(await screen.findByTestId("skill-file-SKILL.md")).toBeInTheDocument();
     expect(screen.getByTestId("skill-file-dir-references")).toBeInTheDocument();
     expect(screen.getByTestId("skill-file-references/guide.md")).toBeInTheDocument();
-    expect(screen.getByTestId("skill-file-assets/logo.png")).toBeInTheDocument();
-    // No file content is fetched until the user picks one.
+
+    // The OTHER skill's tree is NOT rendered or fetched (only the selected one).
+    expect(screen.queryByTestId("skill-file-OTHER.md")).toBeNull();
+    expect(skillsApi.getSkillFileTree).not.toHaveBeenCalledWith(
+      "workspace:test-generator",
+      "sess_active",
+      true,
+    );
+    // No file content fetched until a file is picked.
     expect(skillsApi.getSkillFile).not.toHaveBeenCalled();
   });
 
-  it("fetches + previews a text file only when picked", async () => {
+  it("moves the open tree when a different skill is selected", async () => {
+    vi.mocked(skillsApi.getSkillFileTree).mockImplementation(async (id) =>
+      id === "bundle:ship"
+        ? [{ path: "SKILL.md", kind: "file", size: 120 }]
+        : [{ path: "GEN.md", kind: "file", size: 10 }],
+    );
+
+    renderWithTwoSkills();
+    expect(await screen.findByTestId("skill-file-SKILL.md")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("skill-row-test-generator"));
+
+    // The new skill's tree renders; the previous skill's is gone.
+    expect(await screen.findByTestId("skill-file-GEN.md")).toBeInTheDocument();
+    expect(screen.queryByTestId("skill-file-SKILL.md")).toBeNull();
+  });
+
+  it("previews a picked file in the RIGHT pane, not a left/right duplicate tree", async () => {
     vi.mocked(skillsApi.getSkillFileTree).mockResolvedValue([
       { path: "references/guide.md", kind: "file", size: 42 },
     ]);
@@ -514,10 +565,9 @@ describe("SkillsPage — Files browser", () => {
       text: "# Guide\n\nHello preview",
     });
 
-    renderWithFiles();
+    renderWithTwoSkills();
     fireEvent.click(await screen.findByTestId("skill-file-references/guide.md"));
 
-    // The file read carries the same skill + session + trust context.
     await waitFor(() =>
       expect(skillsApi.getSkillFile).toHaveBeenCalledWith(
         "bundle:ship",
@@ -526,8 +576,63 @@ describe("SkillsPage — Files browser", () => {
         false,
       ),
     );
-    const preview = await screen.findByTestId("skill-file-preview");
-    expect(within(preview).getByText("Hello preview")).toBeInTheDocument();
+    // Preview renders in the right detail pane.
+    const detail = await screen.findByTestId("skill-detail");
+    expect(detail).toHaveAttribute("data-selected-file", "references/guide.md");
+    expect(within(detail).getByText("Hello preview")).toBeInTheDocument();
+    // Exactly one file tree exists (the left one) — no duplicate right-pane tree.
+    expect(screen.getAllByTestId("skill-files")).toHaveLength(1);
+  });
+
+  it("returns the right pane to the skill overview when the skill row is reselected", async () => {
+    vi.mocked(skillsApi.getSkillFileTree).mockResolvedValue([
+      { path: "references/guide.md", kind: "file", size: 42 },
+    ]);
+    vi.mocked(skillsApi.getSkillFile).mockResolvedValue({
+      path: "references/guide.md",
+      size: 42,
+      isText: true,
+      tooLarge: false,
+      text: "Hello preview",
+    });
+
+    renderWithTwoSkills();
+    fireEvent.click(await screen.findByTestId("skill-file-references/guide.md"));
+    const detail = await screen.findByTestId("skill-detail");
+    await waitFor(() => expect(detail).toHaveAttribute("data-selected-file"));
+
+    // Clicking the skill row again clears the file selection → overview returns.
+    fireEvent.click(screen.getByTestId("skill-row-ship"));
+    await waitFor(() =>
+      expect(screen.getByTestId("skill-detail")).not.toHaveAttribute("data-selected-file"),
+    );
+  });
+
+  it("clears file selection + tree when the selected skill is filtered out", async () => {
+    vi.mocked(skillsApi.getSkillFileTree).mockResolvedValue([
+      { path: "references/guide.md", kind: "file", size: 42 },
+    ]);
+    vi.mocked(skillsApi.getSkillFile).mockResolvedValue({
+      path: "references/guide.md",
+      size: 42,
+      isText: true,
+      tooLarge: false,
+      text: "Hello preview",
+    });
+
+    renderWithTwoSkills();
+    fireEvent.click(await screen.findByTestId("skill-file-references/guide.md"));
+    await waitFor(() =>
+      expect(screen.getByTestId("skill-detail")).toHaveAttribute("data-selected-file"),
+    );
+
+    // Search out `ship` → selection moves to `test-generator`, file cleared.
+    fireEvent.change(screen.getByTestId("skills-search"), { target: { value: "test-gen" } });
+    await waitFor(() => {
+      const d = screen.getByTestId("skill-detail");
+      expect(d).toHaveAttribute("data-skill-id", "workspace:test-generator");
+      expect(d).not.toHaveAttribute("data-selected-file");
+    });
   });
 
   it("shows a non-preview state for a too-large file", async () => {
@@ -542,9 +647,8 @@ describe("SkillsPage — Files browser", () => {
       text: null,
     });
 
-    renderWithFiles();
+    renderWithTwoSkills();
     fireEvent.click(await screen.findByTestId("skill-file-big.bin"));
-
     expect(await screen.findByText(/too large to preview/i)).toBeInTheDocument();
   });
 
@@ -560,18 +664,15 @@ describe("SkillsPage — Files browser", () => {
       text: null,
     });
 
-    renderWithFiles();
+    renderWithTwoSkills();
     fireEvent.click(await screen.findByTestId("skill-file-logo.png"));
-
     expect(await screen.findByText(/isn't previewable as text/i)).toBeInTheDocument();
   });
 
-  it("renders an empty-tree state when the skill has no files", async () => {
+  it("renders an empty-tree state under the selected skill", async () => {
     vi.mocked(skillsApi.getSkillFileTree).mockResolvedValue([]);
-
-    renderWithFiles();
-    await screen.findByTestId("skill-detail");
-    expect(await screen.findByText("This skill has no bundled files.")).toBeInTheDocument();
+    renderWithTwoSkills();
+    expect(await screen.findByText("No bundled files.")).toBeInTheDocument();
   });
 
   it("shows a retry when the file read errors", async () => {
@@ -580,11 +681,11 @@ describe("SkillsPage — Files browser", () => {
     ]);
     vi.mocked(skillsApi.getSkillFile).mockRejectedValue(new Error("boom"));
 
-    renderWithFiles();
+    renderWithTwoSkills();
     fireEvent.click(await screen.findByTestId("skill-file-references/guide.md"));
 
     expect(await screen.findByText(/Couldn't load references\/guide\.md/)).toBeInTheDocument();
-    const preview = screen.getByTestId("skill-file-preview");
-    expect(within(preview).getByRole("button", { name: "Try again" })).toBeInTheDocument();
+    const detail = screen.getByTestId("skill-detail");
+    expect(within(detail).getByRole("button", { name: "Try again" })).toBeInTheDocument();
   });
 });
