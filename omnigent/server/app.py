@@ -1407,8 +1407,8 @@ def create_app(
             )
             app_inst.state.scheduled_task_scheduler = scheduled_task_scheduler
             # Scheduled tasks are a non-critical subsystem: a failure loading the
-            # schedule (e.g. a DB error in list_active()) must not take down
-            # server boot. Log and continue with the scheduler unstarted.
+            # schedule (e.g. a DB error listing active tasks) must not take
+            # down server boot. Log and continue with the scheduler unstarted.
             try:
                 await scheduled_task_scheduler.start()
             except Exception as exc:

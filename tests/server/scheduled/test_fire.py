@@ -24,6 +24,7 @@ from typing import Any
 
 import pytest
 
+from omnigent.db.db_models import current_workspace_id
 from omnigent.entities import ScheduledTask
 from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL
 from omnigent.server.scheduled import fire as fire_mod
@@ -63,17 +64,23 @@ class FakeScheduledTaskStore:
         self._rows = rows or {}
         self.updates: list[dict[str, Any]] = []
         self.runs: list[dict[str, Any]] = []
+        self.get_workspace_ids: list[int] = []
+        self.update_workspace_ids: list[int] = []
+        self.run_workspace_ids: list[int] = []
 
     def get(self, scheduled_task_id: str) -> ScheduledTask | None:
+        self.get_workspace_ids.append(current_workspace_id())
         return self._rows.get(scheduled_task_id)
 
     def update(self, scheduled_task_id: str, **kwargs: Any) -> ScheduledTask | None:
+        self.update_workspace_ids.append(current_workspace_id())
         self.updates.append({"id": scheduled_task_id, **kwargs})
         return self._rows.get(scheduled_task_id)
 
     def create_run(
         self, run_id: str, scheduled_task_id: str, status: str, scheduled_at: int, **kwargs: Any
     ) -> Any:
+        self.run_workspace_ids.append(current_workspace_id())
         self.runs.append(
             {
                 "run_id": run_id,
@@ -86,13 +93,29 @@ class FakeScheduledTaskStore:
         return None
 
 
+class SequencedScheduledTaskStore(FakeScheduledTaskStore):
+    """Returns scripted rows for consecutive get() calls."""
+
+    def __init__(self, sequence: list[ScheduledTask | None]) -> None:
+        super().__init__()
+        self._sequence = sequence
+
+    def get(self, scheduled_task_id: str) -> ScheduledTask | None:
+        self.get_workspace_ids.append(current_workspace_id())
+        if self._sequence:
+            return self._sequence.pop(0)
+        return None
+
+
 class FakeConversationStore:
     def __init__(self, *, fail_create: bool = False) -> None:
         self.created: list[dict[str, Any]] = []
+        self.create_workspace_ids: list[int] = []
         self._seq = 0
         self.fail_create = fail_create
 
     def create_conversation(self, **kwargs: Any) -> _FakeConversation:
+        self.create_workspace_ids.append(current_workspace_id())
         if self.fail_create:
             raise RuntimeError("create failed")
         self._seq += 1
@@ -109,17 +132,22 @@ class FakeConversationStore:
     def update_conversation(self, conversation_id: str, **kwargs: Any) -> _FakeConversation:
         return _FakeConversation(id=conversation_id, agent_id="")
 
+    def get_conversation(self, conversation_id: str) -> _FakeConversation | None:
+        return _FakeConversation(id=conversation_id, agent_id="ag_1")
+
 
 class FakePermissionStore:
     def __init__(self, *, fail_grant: bool = False) -> None:
         self.ensured: list[str] = []
         self.grants: list[tuple[str, str, int]] = []
+        self.grant_workspace_ids: list[int] = []
         self.fail_grant = fail_grant
 
     def ensure_user(self, user_id: str, *, is_admin: bool = False) -> None:
         self.ensured.append(user_id)
 
     def grant(self, user_id: str, conversation_id: str, level: int) -> Any:
+        self.grant_workspace_ids.append(current_workspace_id())
         if self.fail_grant:
             raise RuntimeError("grant failed")
         self.grants.append((user_id, conversation_id, level))
@@ -176,6 +204,7 @@ def _task(**overrides: Any) -> ScheduledTask:
         "agent_id": "ag_1",
         "timezone": "UTC",
         "created_at": 1_800_000_000,
+        "workspace_id": 0,
         "state": "active",
         "execution_target": "connected_host",
         "workspace": "/repo",
@@ -212,7 +241,7 @@ async def test_missing_row_is_noop() -> None:
         launches.append(conv)
 
     on_fire = build_on_fire(_deps(store), launch_dispatch=_launch)
-    await on_fire("task_1")
+    await on_fire(0, "task_1")
     await _drain()
 
     assert launches == []
@@ -228,10 +257,46 @@ async def test_inactive_row_is_noop() -> None:
         launches.append(conv)
 
     on_fire = build_on_fire(_deps(store), launch_dispatch=_launch)
-    await on_fire("task_1")
+    await on_fire(0, "task_1")
     await _drain()
 
     assert launches == []
+    assert store.runs == []
+
+
+@pytest.mark.asyncio
+async def test_pause_between_on_fire_and_run_fire_is_noop() -> None:
+    store = SequencedScheduledTaskStore([_task(), _task(state="paused")])
+    conv_store = FakeConversationStore()
+    launches: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        launches.append(conv)
+
+    on_fire = build_on_fire(_deps(store, conversation_store=conv_store), launch_dispatch=_launch)
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert launches == []
+    assert conv_store.created == []
+    assert store.runs == []
+
+
+@pytest.mark.asyncio
+async def test_delete_between_on_fire_and_run_fire_is_noop() -> None:
+    store = SequencedScheduledTaskStore([_task(), None])
+    conv_store = FakeConversationStore()
+    launches: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        launches.append(conv)
+
+    on_fire = build_on_fire(_deps(store, conversation_store=conv_store), launch_dispatch=_launch)
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert launches == []
+    assert conv_store.created == []
     assert store.runs == []
 
 
@@ -249,7 +314,7 @@ async def test_active_creates_session_grant_and_run() -> None:
         _deps(store, permission_store=perm, conversation_store=conv_store),
         launch_dispatch=_launch,
     )
-    await on_fire("task_1")
+    await on_fire(0, "task_1")
     await _drain()
 
     # A conversation was created bound to the task's agent.
@@ -267,6 +332,56 @@ async def test_active_creates_session_grant_and_run() -> None:
 
 
 @pytest.mark.asyncio
+async def test_fire_runs_under_task_workspace_scope() -> None:
+    perm = FakePermissionStore()
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(workspace_id=42)})
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(
+        _deps(store, permission_store=perm, conversation_store=conv_store),
+        launch_dispatch=_launch,
+    )
+    await on_fire(42, "task_1")
+    await _drain()
+
+    assert store.get_workspace_ids == [42, 42]
+    assert conv_store.create_workspace_ids == [42]
+    assert perm.grant_workspace_ids == [42]
+    assert store.update_workspace_ids == [42]
+    assert store.run_workspace_ids == [42]
+
+
+@pytest.mark.asyncio
+async def test_overlapping_fire_skips_second_launch() -> None:
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task()})
+    release = asyncio.Event()
+
+    async def _slow_launch(conv: Any, task: Any) -> None:
+        await release.wait()
+
+    on_fire = build_on_fire(
+        _deps(store, conversation_store=conv_store),
+        launch_dispatch=_slow_launch,
+    )
+    await on_fire(0, "task_1")
+    await on_fire(0, "task_1")
+
+    for _ in range(100):
+        if conv_store.created:
+            break
+        await asyncio.sleep(0.01)
+    assert len(conv_store.created) == 1
+    release.set()
+    await _drain()
+    assert len(conv_store.created) == 1
+    assert len(store.runs) == 1
+
+
+@pytest.mark.asyncio
 async def test_explicit_owner_is_granted() -> None:
     perm = FakePermissionStore()
     store = FakeScheduledTaskStore(rows={"task_1": _task(owner_user_id="alice@example.com")})
@@ -275,10 +390,70 @@ async def test_explicit_owner_is_granted() -> None:
         return None
 
     on_fire = build_on_fire(_deps(store, permission_store=perm), launch_dispatch=_launch)
-    await on_fire("task_1")
+    await on_fire(0, "task_1")
     await _drain()
 
     assert perm.grants and perm.grants[0][0] == "alice@example.com"
+
+
+@pytest.mark.asyncio
+async def test_connected_host_dispatch_uses_resolved_local_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import omnigent.server.routes._host_launch as host_launch
+    import omnigent.server.routes.sessions as sessions_routes
+
+    captured: dict[str, Any] = {}
+
+    def _resolve_host_launch(**kwargs: Any) -> Any:
+        captured["user_id"] = kwargs["user_id"]
+        return type(
+            "Target",
+            (),
+            {"conv": kwargs["conversation_store"].get_conversation("conv_1"), "conn": object()},
+        )()
+
+    async def _launch_runner_on_host(
+        conv: Any, conversation_store: Any, host_registry: Any, conn: Any
+    ) -> Any:
+        return type("Attempt", (), {"error": None, "runner_id": "runner_1"})()
+
+    async def _wait_for_runner_client(*args: Any, **kwargs: Any) -> object:
+        return object()
+
+    async def _ensure_runner_session_initialized(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    async def _dispatch_session_event_to_runner(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(host_launch, "resolve_host_launch", _resolve_host_launch)
+    monkeypatch.setattr(sessions_routes, "_launch_runner_on_host", _launch_runner_on_host)
+    monkeypatch.setattr(sessions_routes, "_wait_for_runner_client", _wait_for_runner_client)
+    monkeypatch.setattr(
+        sessions_routes,
+        "_ensure_runner_session_initialized",
+        _ensure_runner_session_initialized,
+    )
+    monkeypatch.setattr(
+        sessions_routes,
+        "_dispatch_session_event_to_runner",
+        _dispatch_session_event_to_runner,
+    )
+
+    store = FakeScheduledTaskStore(rows={"task_1": _task()})
+    dispatch = fire_mod._make_connected_host_dispatch(
+        _deps(
+            store,
+            conversation_store=FakeConversationStore(),
+            host_store=FakeHostStore({"host_1": _FakeHost("host_1", RESERVED_USER_LOCAL)}),
+            host_registry=FakeHostRegistry(online={"host_1"}),
+        )
+    )
+
+    await dispatch(_FakeConversation(id="conv_1", agent_id="ag_1"), _task(owner_user_id=None))
+
+    assert captured["user_id"] == RESERVED_USER_LOCAL
 
 
 @pytest.mark.asyncio
@@ -293,7 +468,7 @@ async def test_on_fire_returns_before_launch_completes() -> None:
     on_fire = build_on_fire(_deps(store), launch_dispatch=_slow_launch)
 
     t0 = time.monotonic()
-    await on_fire("task_1")
+    await on_fire(0, "task_1")
     elapsed = time.monotonic() - t0
 
     # Returned without waiting on the (still-blocked) launch.
@@ -311,7 +486,7 @@ async def test_launch_failure_is_swallowed() -> None:
 
     on_fire = build_on_fire(_deps(store), launch_dispatch=_boom)
     # Must not raise, even though the background launch throws.
-    await on_fire("task_1")
+    await on_fire(0, "task_1")
     await _drain()
     assert store.runs[0]["status"] == "failed"
     assert store.runs[0]["error_code"] == "launch_failed"
@@ -329,7 +504,7 @@ async def test_validation_failure_records_failed_without_session() -> None:
         _deps(store, conversation_store=conv_store),
         launch_dispatch=_launch,
     )
-    await on_fire("task_1")
+    await on_fire(0, "task_1")
     await _drain()
 
     assert conv_store.created == []
@@ -350,7 +525,7 @@ async def test_create_failure_records_failed_without_session() -> None:
         _deps(store, conversation_store=FakeConversationStore(fail_create=True)),
         launch_dispatch=_launch,
     )
-    await on_fire("task_1")
+    await on_fire(0, "task_1")
     await _drain()
 
     assert len(store.runs) == 1
@@ -368,7 +543,7 @@ async def test_grant_failure_records_failed_with_session() -> None:
         return None
 
     on_fire = build_on_fire(_deps(store, permission_store=perm), launch_dispatch=_launch)
-    await on_fire("task_1")
+    await on_fire(0, "task_1")
     await _drain()
 
     assert len(store.runs) == 1
@@ -390,7 +565,7 @@ async def test_missing_execution_inputs_record_failed_without_session() -> None:
         _deps(store, conversation_store=conv_store),
         launch_dispatch=_launch,
     )
-    await on_fire("task_1")
+    await on_fire(0, "task_1")
     await _drain()
 
     assert launched == []
@@ -409,7 +584,7 @@ async def test_no_host_registry_records_failed_without_session() -> None:
     on_fire = build_on_fire(
         _deps(store, conversation_store=conv_store, host_store=None, host_registry=None)
     )
-    await on_fire("task_1")
+    await on_fire(0, "task_1")
     await _drain()
 
     assert conv_store.created == []
@@ -432,7 +607,7 @@ async def test_offline_connected_host_records_failed_without_session() -> None:
             host_registry=FakeHostRegistry(online=set()),
         )
     )
-    await on_fire("task_1")
+    await on_fire(0, "task_1")
     await _drain()
 
     assert conv_store.created == []
@@ -452,7 +627,7 @@ async def test_managed_sandbox_is_skipped_and_recorded() -> None:
         launched.append(conv)
 
     on_fire = build_on_fire(_deps(store), launch_dispatch=_launch)
-    await on_fire("task_1")
+    await on_fire(0, "task_1")
     await _drain()
 
     assert launched == []

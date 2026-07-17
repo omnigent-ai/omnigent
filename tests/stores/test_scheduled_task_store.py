@@ -11,6 +11,7 @@ import uuid
 
 import pytest
 
+from omnigent.db.db_models import workspace_scope
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 
 
@@ -55,6 +56,7 @@ def test_create_returns_scheduled_task_with_all_fields(
         host_id=_uid("host_abc123"),
     )
     assert task.id == _uid("st_1")
+    assert task.workspace_id == 0
     assert task.name == "nightly triage"
     assert task.prompt == "Triage the inbox"
     assert task.rrule == "FREQ=DAILY;BYHOUR=9;BYMINUTE=0"
@@ -279,6 +281,37 @@ def test_list_active_excludes_non_active(store: SqlAlchemyScheduledTaskStore) ->
         )
     active_ids = [r.id for r in store.list_active()]
     assert active_ids == [_uid("st_active")]
+
+
+def test_list_active_all_workspaces_includes_tenant_tasks(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """Scheduler startup can discover active tasks outside ambient workspace 0."""
+    with workspace_scope(42):
+        task_42 = store.create(
+            scheduled_task_id=_uid("st_active_ws42"),
+            name="tenant",
+            prompt="p",
+            rrule="FREQ=MINUTELY",
+            owner_user_id="u",
+            agent_id=_uid("ag"),
+            timezone="UTC",
+        )
+    with workspace_scope(7):
+        store.create(
+            scheduled_task_id=_uid("st_paused_ws7"),
+            name="paused",
+            prompt="p",
+            rrule="FREQ=MINUTELY",
+            owner_user_id="u",
+            agent_id=_uid("ag"),
+            timezone="UTC",
+            state="paused",
+        )
+
+    tasks = store.list_active_all_workspaces()
+
+    assert [(t.workspace_id, t.id) for t in tasks] == [(42, task_42.id)]
 
 
 # ── update ────────────────────────────────────────────────────────────────────

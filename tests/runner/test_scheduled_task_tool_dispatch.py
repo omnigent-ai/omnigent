@@ -30,6 +30,7 @@ _ALL_NAMES = {
     "sys_scheduled_task_update",
     "sys_scheduled_task_delete",
 }
+_TASK_ID = "0123456789abcdef0123456789abcdef"
 
 
 class _Resp:
@@ -114,12 +115,23 @@ async def test_update_patches_by_id() -> None:
     client = _RecordingClient(_Resp(body={"id": "t1", "state": "paused"}))
     await _execute_scheduled_task_tool(
         "sys_scheduled_task_update",
-        json.dumps({"scheduled_task_id": "t1", "state": "paused"}),
+        json.dumps(
+            {
+                "scheduled_task_id": _TASK_ID,
+                "state": "paused",
+                "workspace": "/repo2",
+                "host_id": "fedcba9876543210fedcba9876543210",
+            }
+        ),
         server_client=client,
     )
     verb, url, body = client.calls[0]
-    assert (verb, url) == ("PATCH", "/v1/scheduled-tasks/t1")
-    assert body == {"state": "paused"}
+    assert (verb, url) == ("PATCH", f"/v1/scheduled-tasks/{_TASK_ID}")
+    assert body == {
+        "state": "paused",
+        "workspace": "/repo2",
+        "host_id": "fedcba9876543210fedcba9876543210",
+    }
 
 
 @pytest.mark.asyncio
@@ -127,10 +139,24 @@ async def test_delete_by_id() -> None:
     client = _RecordingClient(_Resp(body={"deleted": True, "id": "t1"}))
     await _execute_scheduled_task_tool(
         "sys_scheduled_task_delete",
-        json.dumps({"scheduled_task_id": "t1"}),
+        json.dumps({"scheduled_task_id": _TASK_ID.upper()}),
         server_client=client,
     )
-    assert client.calls[0] == ("DELETE", "/v1/scheduled-tasks/t1", None)
+    assert client.calls[0] == ("DELETE", f"/v1/scheduled-tasks/{_TASK_ID}", None)
+
+
+@pytest.mark.asyncio
+async def test_update_rejects_path_confusion_task_id() -> None:
+    client = _RecordingClient()
+    out = await _execute_scheduled_task_tool(
+        "sys_scheduled_task_update",
+        json.dumps(
+            {"scheduled_task_id": "../0123456789abcdef0123456789abcdef", "state": "paused"}
+        ),
+        server_client=client,
+    )
+    assert "canonical 32-character hex" in json.loads(out)["error"]
+    assert client.calls == []
 
 
 @pytest.mark.asyncio
@@ -170,7 +196,7 @@ def test_tools_registered_without_spec_optin() -> None:
     assert names >= _ALL_NAMES
 
 
-def test_create_tool_schema_matches_connected_host_v1_scope() -> None:
+def test_create_tool_schema_matches_connected_host_scope() -> None:
     from omnigent.tools.builtins.scheduled_tasks import SysScheduledTaskCreateTool
 
     schema = SysScheduledTaskCreateTool().get_schema()["function"]["parameters"]
@@ -179,6 +205,15 @@ def test_create_tool_schema_matches_connected_host_v1_scope() -> None:
     assert "host_id" in properties
     assert "base_branch" not in properties
     assert set(schema["required"]) >= {"workspace", "host_id"}
+
+
+def test_update_tool_schema_allows_connected_host_changes() -> None:
+    from omnigent.tools.builtins.scheduled_tasks import SysScheduledTaskUpdateTool
+
+    schema = SysScheduledTaskUpdateTool().get_schema()["function"]["parameters"]
+    properties = schema["properties"]
+    assert "workspace" in properties
+    assert "host_id" in properties
 
 
 def test_tools_in_dispatch_and_relay_sets() -> None:

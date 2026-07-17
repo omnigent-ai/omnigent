@@ -25,6 +25,7 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import tempfile
 import uuid
 from collections.abc import Callable
@@ -3143,8 +3144,18 @@ _SCHEDULED_TASK_UPDATE_FIELDS = (
     "timezone",
     "model_override",
     "reasoning_effort",
+    "workspace",
+    "host_id",
     "state",
 )
+_SCHEDULED_TASK_ID_RE = re.compile(r"^[0-9a-fA-F]{32}$")
+
+
+def _scheduled_task_url(task_id: object) -> str | None:
+    """Return a safe scheduled-task URL path for a canonical id."""
+    if not isinstance(task_id, str) or not _SCHEDULED_TASK_ID_RE.fullmatch(task_id):
+        return None
+    return f"/v1/scheduled-tasks/{task_id.lower()}"
 
 
 async def _execute_scheduled_task_tool(
@@ -3185,13 +3196,16 @@ async def _execute_scheduled_task_tool(
             task_id = args.get("scheduled_task_id")
             if not task_id:
                 return json.dumps({"error": f"{tool_name} requires 'scheduled_task_id'"})
+            task_url = _scheduled_task_url(task_id)
+            if task_url is None:
+                return json.dumps(
+                    {"error": f"{tool_name} requires canonical 32-character hex scheduled_task_id"}
+                )
             if tool_name == "sys_scheduled_task_delete":
-                resp = await server_client.delete(f"/v1/scheduled-tasks/{task_id}", timeout=30.0)
+                resp = await server_client.delete(task_url, timeout=30.0)
             else:
                 payload = {k: args[k] for k in _SCHEDULED_TASK_UPDATE_FIELDS if k in args}
-                resp = await server_client.patch(
-                    f"/v1/scheduled-tasks/{task_id}", json=payload, timeout=30.0
-                )
+                resp = await server_client.patch(task_url, json=payload, timeout=30.0)
         else:  # pragma: no cover — routing guarantees a known name
             return json.dumps({"error": f"unknown scheduled-task tool {tool_name!r}"})
     except Exception as exc:  # noqa: BLE001

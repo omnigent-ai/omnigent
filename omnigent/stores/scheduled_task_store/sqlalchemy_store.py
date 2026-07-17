@@ -7,6 +7,7 @@ from typing import Any
 from sqlalchemy import asc, delete, desc, select
 
 from omnigent.db.db_models import (
+    DEFAULT_WORKSPACE_ID,
     SqlScheduledTask,
     SqlScheduledTaskRun,
     current_workspace_id,
@@ -47,6 +48,7 @@ def _to_entity(row: SqlScheduledTask) -> ScheduledTask:
         agent_id=row.agent_id,
         timezone=row.timezone,
         created_at=row.created_at,
+        workspace_id=row.workspace_id or DEFAULT_WORKSPACE_ID,
         rrule=row.rrule,
         model_override=row.model_override,
         reasoning_effort=row.reasoning_effort,
@@ -174,6 +176,21 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 .where(SqlScheduledTask.workspace_id == current_workspace_id())
                 .where(SqlScheduledTask.state == encode_scheduled_task_state("active"))
                 .order_by(asc(SqlScheduledTask.created_at), asc(SqlScheduledTask.id))
+            )
+            rows = session.execute(stmt).scalars().all()
+            return [_to_entity(r) for r in rows]
+
+    def list_active_all_workspaces(self) -> list[ScheduledTask]:
+        """List active scheduled tasks across every workspace for scheduler boot."""
+        with self._session() as session:
+            stmt = (
+                select(SqlScheduledTask)
+                .where(SqlScheduledTask.state == encode_scheduled_task_state("active"))
+                .order_by(
+                    asc(SqlScheduledTask.workspace_id),
+                    asc(SqlScheduledTask.created_at),
+                    asc(SqlScheduledTask.id),
+                )
             )
             rows = session.execute(stmt).scalars().all()
             return [_to_entity(r) for r in rows]

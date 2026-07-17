@@ -1,8 +1,9 @@
 """The scheduled-task fire path — the real ``on_fire`` the scheduler invokes.
 
 When :class:`~omnigent.server.scheduled.scheduler.ScheduledTaskScheduler` decides
-a task is due it calls ``on_fire(scheduled_task_id)``. This module supplies the
-real callback (the scheduler ships only a no-op placeholder). A firing:
+a task is due it calls ``on_fire(workspace_id, scheduled_task_id)``. This module
+supplies the real callback (the scheduler ships only a no-op placeholder). A
+firing:
 
 #. **Re-reads the row.** The armed timer is never trusted: the row is re-read by
    id, and a row that vanished (deleted between arming and firing) or is no
@@ -47,6 +48,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
+from omnigent.db.db_models import workspace_scope
 from omnigent.entities import Conversation, ScheduledTask
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL
@@ -68,6 +70,11 @@ _RUNNER_CONNECT_TIMEOUT_S = 30.0
 # only a weak reference, so without this a fire could be garbage-collected
 # mid-flight; each task is discarded from the set when it completes.
 _PENDING_FIRES: set[asyncio.Task[None]] = set()
+
+# Fire path overlap guard keyed by tenant + task. The scheduler's job.running
+# only covers its short on_fire callback; this covers the background
+# create/grant/dispatch work that continues after on_fire returns.
+_IN_FLIGHT_TASKS: set[tuple[int, str]] = set()
 
 
 # ``launch_dispatch(conv, task)`` — launch the runner for a freshly created
@@ -119,14 +126,14 @@ def build_on_fire(
     deps: FireDeps,
     *,
     launch_dispatch: LaunchDispatch | None = None,
-) -> Callable[[str], Awaitable[None]]:
+) -> Callable[[int, str], Awaitable[None]]:
     """Build the real ``on_fire`` callback bound to server ``deps``.
 
     :param deps: Server stores/registries the fire path operates on.
     :param launch_dispatch: Seam that launches the runner and dispatches the
         prompt for a created session. Defaults to the real connected-host
         implementation; tests inject a fake.
-    :returns: An ``async on_fire(scheduled_task_id)`` suitable for
+    :returns: An ``async on_fire(workspace_id, scheduled_task_id)`` suitable for
         :class:`ScheduledTaskScheduler`.
     """
     preflight: ConnectedHostPreflight | None = None
@@ -136,9 +143,56 @@ def build_on_fire(
     else:
         dispatch = launch_dispatch
 
-    async def on_fire(scheduled_task_id: str) -> None:
+    async def on_fire(workspace_id: int, scheduled_task_id: str) -> None:
         # Re-read the row: never trust the armed timer. A deleted or
         # non-active row is a logged no-op done synchronously.
+        with workspace_scope(workspace_id):
+            task = await asyncio.to_thread(deps.scheduled_task_store.get, scheduled_task_id)
+            if task is None:
+                _logger.info(
+                    "scheduled fire: task %s no longer exists — skipping", scheduled_task_id
+                )
+                return
+            if task.state != "active":
+                _logger.info(
+                    "scheduled fire: task %s is %s (not active) — skipping",
+                    scheduled_task_id,
+                    task.state,
+                )
+                return
+
+        key = (workspace_id, scheduled_task_id)
+        if key in _IN_FLIGHT_TASKS:
+            _logger.info("scheduled fire: task %s already in flight — skipping", scheduled_task_id)
+            return
+        _IN_FLIGHT_TASKS.add(key)
+
+        # Fire-and-forget: the session create + launch runs in the background so
+        # on_fire returns immediately and the scheduler re-arms the timer now.
+        fire_task = asyncio.create_task(
+            _run_fire(deps, workspace_id, scheduled_task_id, dispatch, preflight),
+            name=f"scheduled-fire-{scheduled_task_id}",
+        )
+        _PENDING_FIRES.add(fire_task)
+        fire_task.add_done_callback(_PENDING_FIRES.discard)
+        fire_task.add_done_callback(lambda _task: _IN_FLIGHT_TASKS.discard(key))
+
+    return on_fire
+
+
+async def _run_fire(
+    deps: FireDeps,
+    workspace_id: int,
+    scheduled_task_id: str,
+    dispatch: LaunchDispatch,
+    preflight: ConnectedHostPreflight | None,
+) -> None:
+    """Background body of a firing: create session, grant, launch, record run.
+
+    Wrapped so any failure is logged rather than propagated — a failed fire must
+    not crash the scheduler.
+    """
+    with workspace_scope(workspace_id):
         task = await asyncio.to_thread(deps.scheduled_task_store.get, scheduled_task_id)
         if task is None:
             _logger.info("scheduled fire: task %s no longer exists — skipping", scheduled_task_id)
@@ -151,30 +205,21 @@ def build_on_fire(
             )
             return
 
-        # Fire-and-forget: the session create + launch runs in the background so
-        # on_fire returns immediately and the scheduler re-arms the timer now.
-        fire_task = asyncio.create_task(
-            _run_fire(deps, task, dispatch, preflight),
-            name=f"scheduled-fire-{scheduled_task_id}",
-        )
-        _PENDING_FIRES.add(fire_task)
-        fire_task.add_done_callback(_PENDING_FIRES.discard)
-
-    return on_fire
+        scheduled_at = int(time.time())
+        try:
+            await _run_fire_for_task(deps, task, dispatch, preflight, scheduled_at)
+        except Exception:
+            _logger.exception("scheduled fire: task %s failed", task.id)
 
 
-async def _run_fire(
+async def _run_fire_for_task(
     deps: FireDeps,
     task: ScheduledTask,
     dispatch: LaunchDispatch,
     preflight: ConnectedHostPreflight | None,
+    scheduled_at: int,
 ) -> None:
-    """Background body of a firing: create session, grant, launch, record run.
-
-    Wrapped so any failure is logged rather than propagated — a failed fire must
-    not crash the scheduler.
-    """
-    scheduled_at = int(time.time())
+    """Run a freshly re-read active task inside its workspace scope."""
     try:
         if task.execution_target != "connected_host":
             _logger.info(
@@ -513,7 +558,7 @@ def _make_connected_host_dispatch(deps: FireDeps) -> LaunchDispatch:
         # auth is disabled, consistent with single-user behavior).
         target = await asyncio.to_thread(
             resolve_host_launch,
-            user_id=task.owner_user_id,
+            user_id=owner,
             host_id=host_id,
             session_id=conv.id,
             host_store=deps.host_store,

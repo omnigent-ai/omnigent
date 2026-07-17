@@ -177,6 +177,14 @@ class SysScheduledTaskUpdateTool(Tool):
                             "type": "string",
                             "description": "New reasoning-effort hint.",
                         },
+                        "workspace": {
+                            "type": "string",
+                            "description": "New existing absolute runner start path.",
+                        },
+                        "host_id": {
+                            "type": "string",
+                            "description": "New connected host to run on.",
+                        },
                         "state": {
                             "type": "string",
                             "description": "'active' or 'paused'.",

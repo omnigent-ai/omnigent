@@ -21,6 +21,7 @@ class ScheduledTask:
     A task's trigger is a required recurring ``rrule``.
 
     :param id: UUID primary key (bare 32-char hex string, no dashes).
+    :param workspace_id: Tenant partition key that owns this row.
     :param name: Human-readable task name, e.g. ``"nightly triage"``.
     :param prompt: The instruction dispatched to the agent on each firing.
     :param rrule: The required RFC 5545 recurrence rule for the recurring
@@ -38,10 +39,10 @@ class ScheduledTask:
         ``None`` means use the agent default.
     :param workspace: Absolute existing path where a fired session's connected
         host runner should start. ``None`` only for legacy or invalid rows.
-    :param base_branch: Reserved legacy column; scheduled tasks v1 does not
-        create git worktrees at fire time.
-    :param execution_target: Reserved legacy column; scheduled tasks v1 runs
-        only on ``"connected_host"``.
+    :param base_branch: Reserved legacy column; scheduled tasks currently do
+        not create git worktrees at fire time.
+    :param execution_target: Reserved legacy column; scheduled tasks currently
+        run only on ``"connected_host"``.
     :param host_id: Specific connected host to run on. ``None`` only for legacy
         or invalid rows.
     :param state: Lifecycle state — one of ``"active"``, ``"paused"``,
@@ -62,6 +63,7 @@ class ScheduledTask:
     agent_id: str
     timezone: str
     created_at: int
+    workspace_id: int = 0
     model_override: str | None = None
     reasoning_effort: str | None = None
     workspace: str | None = None

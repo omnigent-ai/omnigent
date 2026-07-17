@@ -107,6 +107,18 @@ class ScheduledTaskStore(ABC):
         ...
 
     @abstractmethod
+    def list_active_all_workspaces(self) -> list[ScheduledTask]:
+        """
+        List active scheduled tasks across every workspace.
+
+        Scheduler startup runs outside a request workspace scope, so it cannot
+        rely on ``current_workspace_id()`` without missing tenant-scoped rows.
+
+        :returns: Active tasks ordered by ``workspace_id, created_at, id``.
+        """
+        ...
+
+    @abstractmethod
     def update(
         self,
         scheduled_task_id: str,

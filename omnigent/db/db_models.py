@@ -1411,8 +1411,8 @@ class SqlScheduledTask(OmnigentBase):
     # SCHEDULED_TASK_EXECUTION_TARGET: connected_host=1, managed_sandbox=2).
     # connected_host → resolve the owner's live host at fire time (see host_id);
     # managed_sandbox → provision/adopt a sandbox at fire time. Defaults to
-    # connected_host so existing rows keep the V1 behavior. The store converts
-    # to/from the string name at the row↔entity boundary.
+    # connected_host so existing rows keep connected-host behavior. The store
+    # converts to/from the string name at the row↔entity boundary.
     execution_target: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default="1")
     # For execution_target=connected_host: the specific host to run on (relates
     # to hosts.host_id; No DB foreign key, Rule R032). None = "the owner's
