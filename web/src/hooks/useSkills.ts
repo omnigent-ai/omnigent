@@ -21,6 +21,18 @@ import { useMemo } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useConversations } from "@/hooks/useConversations";
 import { useChatStore } from "@/store/chatStore";
+import { ApiError } from "@/lib/sessionsApi";
+
+// Explicit retry policy for skill file browsing: a 4xx (missing skill, path
+// traversal, oversized) is a definitive answer — never retry it. Any other
+// failure (a transient runner blip) retries ONCE with a short fixed delay, so a
+// blip self-heals without the default 3-retry exponential backoff leaving a
+// multi-second unexplained spinner.
+function fileBrowseRetry(failureCount: number, error: unknown): boolean {
+  if (error instanceof ApiError && error.status >= 400 && error.status < 500) return false;
+  return failureCount < 1;
+}
+const FILE_BROWSE_RETRY_DELAY_MS = 400;
 import {
   getSkillCatalog,
   getSkillDetail,
@@ -133,6 +145,8 @@ export function useSkillFileTree(
     enabled: id != null && sessionId != null,
     // The tree is stable for the life of a catalog snapshot (same as detail).
     staleTime: 5 * 60_000,
+    retry: fileBrowseRetry,
+    retryDelay: FILE_BROWSE_RETRY_DELAY_MS,
   });
 }
 
@@ -149,6 +163,8 @@ export function useSkillFile(
       getSkillFile(id as string, filePath as string, sessionId as string, includeOtherTools),
     enabled: id != null && sessionId != null && filePath != null,
     staleTime: 5 * 60_000,
+    retry: fileBrowseRetry,
+    retryDelay: FILE_BROWSE_RETRY_DELAY_MS,
   });
 }
 

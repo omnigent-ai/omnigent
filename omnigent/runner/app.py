@@ -1845,12 +1845,22 @@ def create_runner_app(
     _session_spec_locks: dict[str, asyncio.Lock] = {}  # session_id → spec resolution lock
     _session_init_tasks: dict[tuple[str, str, str | None], asyncio.Task[JSONResponse]] = {}
     _session_init_envelopes: dict[str, tuple[float, RunnerSessionInitEnvelope]] = {}
-    # session_id → (monotonic expiry, effective trust, merged bundled + host skills),
-    # discovered against this runner's filesystem. Skills are runner-owned:
-    # the walk reruns at most once per ``_SESSION_SKILLS_CACHE_TTL_SECONDS``
-    # (so a mid-session skill/plugin install surfaces) and the entry is
-    # dropped in ``delete_session``.
-    _session_skills_cache: dict[str, tuple[float, str, SkillRegistry]] = {}
+    # (session_id, include_other_tools) → (monotonic expiry, effective trust,
+    # merged bundled + host skills), discovered against this runner's filesystem.
+    # Keyed by the visibility mode too so EACH request shape is cached — the
+    # Skills page always browses all-source (include_other_tools=True), which
+    # otherwise bypassed this cache and rebuilt the whole registry (walk +
+    # tree_digest of every skill dir) on every catalog/detail/files/file call.
+    # Skills are runner-owned: the walk reruns at most once per
+    # ``_SESSION_SKILLS_CACHE_TTL_SECONDS`` (so a mid-session skill/plugin
+    # install surfaces) and a session's entries are dropped in ``delete_session``.
+    _session_skills_cache: dict[tuple[str, bool | None], tuple[float, str, SkillRegistry]] = {}
+
+    def _evict_session_skills_cache(session_id: str) -> None:
+        """Drop every visibility-mode entry for a session (all cache_key modes)."""
+        for mode in (None, True, False):
+            _session_skills_cache.pop((session_id, mode), None)
+
     _session_workspace_cache: dict[str, str | None] = {}  # session_id → workspace path
     _session_claude_launch_configs: dict[str, ClaudeNativeUcodeConfig | None] = {}
     _session_claude_launch_config_tasks: dict[
@@ -3682,7 +3692,7 @@ def create_runner_app(
         )
 
         _session_spec_cache.pop(session_id, None)
-        _session_skills_cache.pop(session_id, None)
+        _evict_session_skills_cache(session_id)
         _drop_session_claude_launch_config(session_id)
         _session_start_cache.pop(session_id, None)
         _session_workspace_cache.pop(session_id, None)
@@ -5939,7 +5949,7 @@ def create_runner_app(
                 _dispatched_agent_id,
             )
             _session_spec_cache.pop(conv, None)
-            _session_skills_cache.pop(conv, None)
+            _evict_session_skills_cache(conv)
             _drop_session_claude_launch_config(conv)
             _session_tool_schemas.pop(conv, None)
             _session_snapshot_cache.pop(conv, None)
@@ -8794,7 +8804,13 @@ def create_runner_app(
         :raises OmnigentError: If the session's spec cannot be
             resolved.
         """
-        cached = _session_skills_cache.get(session_id) if include_other_tools is None else None
+        # Cache key includes the visibility mode so EVERY request shape is cached
+        # — not just the session default. The Skills page always browses
+        # all-source (include_other_tools=true), which previously bypassed the
+        # cache entirely and rebuilt the full registry (walk + tree_digest of
+        # every skill dir) on every catalog/detail/files/file call.
+        cache_key = (session_id, include_other_tools)
+        cached = _session_skills_cache.get(cache_key)
         if cached is not None:
             expires_at, cached_trust, cached_skills = cached
             if time.monotonic() < expires_at:
@@ -8851,17 +8867,20 @@ def create_runner_app(
             )
 
         registry = await asyncio.to_thread(_discover)
-        if include_other_tools is None:
-            previous = _session_skills_cache.get(session_id)
-            _session_skills_cache[session_id] = (
-                time.monotonic() + _SESSION_SKILLS_CACHE_TTL_SECONDS,
-                effective_skill_trust,
-                registry,
-            )
-            if previous is None or [e.winner.tree_digest for e in previous[2].list()] != [
-                e.winner.tree_digest for e in registry.list()
-            ]:
-                _session_tool_schemas.pop(session_id, None)
+        previous = _session_skills_cache.get(cache_key)
+        _session_skills_cache[cache_key] = (
+            time.monotonic() + _SESSION_SKILLS_CACHE_TTL_SECONDS,
+            effective_skill_trust,
+            registry,
+        )
+        # Tool-schema invalidation is only meaningful for the session-default
+        # (execution) view, so gate it on that mode as before.
+        if include_other_tools is None and (
+            previous is None
+            or [e.winner.tree_digest for e in previous[2].list()]
+            != [e.winner.tree_digest for e in registry.list()]
+        ):
+            _session_tool_schemas.pop(session_id, None)
         return registry, effective_skill_trust
 
     async def _resolve_session_skills(session_id: str) -> list[SkillSpec]:
@@ -9372,7 +9391,7 @@ def create_runner_app(
 
     def _clear_session_agent_caches(session_id: str, agent_id: str | None = None) -> None:
         _session_spec_cache.pop(session_id, None)
-        _session_skills_cache.pop(session_id, None)
+        _evict_session_skills_cache(session_id)
         _drop_session_claude_launch_config(session_id)
         _session_tool_schemas.pop(session_id, None)
         _session_mcp_spec_hash.pop(session_id, None)

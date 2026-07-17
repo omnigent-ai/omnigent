@@ -23,6 +23,7 @@ from typing import Any
 import httpx
 import pytest
 
+from omnigent.runner import app as runner_app
 from omnigent.runner import create_runner_app
 from omnigent.runner.app import ResolvedSpec
 from omnigent.spec.types import SkillSpec
@@ -433,6 +434,63 @@ async def test_session_skills_cached_per_session(tmp_path: Path) -> None:
     # was not consulted (a walk per request); zero would mean discovery
     # never ran at all.
     assert resolver_calls == ["ag_x"]
+
+
+@pytest.mark.asyncio
+async def test_all_source_catalog_cached_per_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The all-source catalog view (``include_other_tools=true``) is cached
+    per session, exactly like the session-default view.
+
+    This is the Skills-page browse path: it always requests
+    ``include_other_tools=true``. Before the fix this mode was keyed only
+    by ``session_id`` and effectively bypassed the cache, so every
+    catalog / detail / files / file call rebuilt the full registry — a
+    ``registry_for_spec`` filesystem walk + ``tree_digest`` of every
+    skill dir (~1.2s live with 354 skills). Keying the cache by
+    ``(session_id, include_other_tools)`` makes the second all-source
+    request a cache hit.
+
+    We count ``registry_for_spec`` invocations directly: the spec
+    *resolver* is cached upstream regardless, so the walk is the only
+    signal that distinguishes a cache hit from a rebuild. Exactly one
+    walk across two identical all-source requests proves the second hit
+    the cache; two would be the pre-fix regression.
+    """
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    bundled = [SkillSpec(name="grill-me", description="d", content="c")]
+    app = _make_app(bundle, bundled, "none")
+
+    walk_calls = 0
+    real_registry_for_spec = runner_app.registry_for_spec
+
+    def _counting_registry_for_spec(*args: Any, **kwargs: Any) -> Any:
+        nonlocal walk_calls
+        walk_calls += 1
+        return real_registry_for_spec(*args, **kwargs)
+
+    monkeypatch.setattr(runner_app, "registry_for_spec", _counting_registry_for_spec)
+
+    async for c in _client(app):
+        first = await c.get(
+            "/v1/sessions/conv_all/skills/catalog",
+            params={"include_other_tools": "true"},
+        )
+        second = await c.get(
+            "/v1/sessions/conv_all/skills/catalog",
+            params={"include_other_tools": "true"},
+        )
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    # One registry walk across both all-source requests: the first
+    # populates the cache under (session, True), the second serves it.
+    # Two walks would mean the non-default mode bypassed the cache.
+    assert walk_calls == 1
 
 
 @pytest.mark.asyncio
