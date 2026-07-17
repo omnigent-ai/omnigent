@@ -28,12 +28,13 @@
  * header/inset clearing and fills the available height as a master-detail.
  */
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
   AlertTriangleIcon,
   CheckIcon,
+  ChevronDownIcon,
   ChevronRightIcon,
   CodeIcon,
   CopyIcon,
@@ -63,6 +64,7 @@ import {
   type SkillDetail,
   type SkillFileNode,
   type SkillOrigin,
+  type SkillOwnership,
   type SkillSummary,
 } from "@/lib/skillsApi";
 import { cn } from "@/lib/utils";
@@ -181,8 +183,16 @@ export function SkillsPage() {
   //    pane previews it, else it shows the skill overview/instructions.
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
+  // The user's collapsed ownership sections (stable keys: omnigent/agent/local).
+  // Sections default expanded; this holds only the ones explicitly collapsed.
+  const [collapsedSections, setCollapsedSections] = useState<Set<SkillOwnership>>(new Set());
 
   const skills = useMemo(() => catalogQuery.data?.skills ?? [], [catalogQuery.data]);
+
+  // While a search query or source filter is active, matching sections are
+  // force-expanded so results are never hidden behind a collapsed header — the
+  // user's stored collapse prefs are untouched and restored when filters clear.
+  const filtersActive = query.trim() !== "" || sourceFilter !== ALL_SOURCES;
 
   // The distinct source roots present in this catalog — the dynamic filter
   // options behind the "All sources" default.
@@ -235,6 +245,17 @@ export function SkillsPage() {
     setSelectedFile(path);
   };
 
+  // Toggle a section's collapsed state. Collapsing hides its rows but never
+  // changes the selection / right-pane detail.
+  const handleToggleSection = (ownership: SkillOwnership) => {
+    setCollapsedSections((prev) => {
+      const next = new Set(prev);
+      if (next.has(ownership)) next.delete(ownership);
+      else next.add(ownership);
+      return next;
+    });
+  };
+
   return (
     <div
       data-testid="skills-page"
@@ -258,6 +279,9 @@ export function SkillsPage() {
             selectedFile={selectedFile}
             onSelectSkill={handleSelectSkill}
             onSelectFile={handleSelectFile}
+            collapsedSections={collapsedSections}
+            onToggleSection={handleToggleSection}
+            filtersActive={filtersActive}
             sessionId={sessionId}
             includeOtherTools={ALL_SOURCE_BROWSE}
             loading={catalogQuery.isLoading}
@@ -330,6 +354,9 @@ function SkillList({
   selectedFile,
   onSelectSkill,
   onSelectFile,
+  collapsedSections,
+  onToggleSection,
+  filtersActive,
   sessionId,
   includeOtherTools,
   loading,
@@ -347,6 +374,9 @@ function SkillList({
   selectedFile: string | null;
   onSelectSkill: (id: string) => void;
   onSelectFile: (skillId: string, path: string) => void;
+  collapsedSections: Set<SkillOwnership>;
+  onToggleSection: (ownership: SkillOwnership) => void;
+  filtersActive: boolean;
   sessionId: string;
   includeOtherTools: boolean;
   loading: boolean;
@@ -407,31 +437,51 @@ function SkillList({
         ) : (
           // Grouped by harness-neutral OWNERSHIP (Omnigent → Agent → Local).
           // These headings express ownership, never a vendor/source-path detail.
-          // Empty sections are hidden; each skill row is a selectable node whose
-          // resource tree expands inline only while selected.
+          // Empty sections are hidden; each header is a collapsible disclosure
+          // (skill ROWS stay chevron-free). While a search/source filter is
+          // active, matching sections are force-open so results are never hidden
+          // behind a collapsed header — the stored collapse prefs are untouched.
           OWNERSHIP_ORDER.map((ownership) => {
             const rows = skills.filter((s) => s.ownership === ownership);
             if (rows.length === 0) return null;
             // The Agent heading carries the bound agent's name (all agent-owned
             // rows in one session share it).
             const agentName = ownership === "agent" ? (rows[0].agentName ?? null) : null;
+            const collapsed = collapsedSections.has(ownership) && !filtersActive;
             return (
               <section key={ownership} className="mb-2" data-testid={`skills-section-${ownership}`}>
-                <h2 className="px-2 pb-1 pt-2 text-[10.5px] font-bold uppercase tracking-wider text-muted-foreground">
-                  {ownershipLabel(ownership, agentName)}
-                </h2>
-                {rows.map((skill) => (
-                  <SkillRow
-                    key={skill.id}
-                    skill={skill}
-                    selected={selectedId === skill.id}
-                    selectedFile={selectedId === skill.id ? selectedFile : null}
-                    onSelectSkill={() => onSelectSkill(skill.id)}
-                    onSelectFile={(path) => onSelectFile(skill.id, path)}
-                    sessionId={sessionId}
-                    includeOtherTools={includeOtherTools}
+                <button
+                  type="button"
+                  onClick={() => onToggleSection(ownership)}
+                  aria-expanded={!collapsed}
+                  data-testid={`skills-section-header-${ownership}`}
+                  className="flex w-full items-center gap-1.5 px-2 pb-1 pt-2 text-left text-[10.5px] font-bold uppercase tracking-wider text-muted-foreground transition-colors hover:text-foreground"
+                >
+                  <ChevronRightIcon
+                    aria-hidden
+                    className={cn(
+                      "size-3 shrink-0 transition-transform",
+                      !collapsed && "rotate-90",
+                    )}
                   />
-                ))}
+                  <span className="truncate">{ownershipLabel(ownership, agentName)}</span>
+                  <span className="ml-auto rounded-full bg-muted px-1.5 text-[10px] font-semibold tabular-nums text-muted-foreground">
+                    {rows.length}
+                  </span>
+                </button>
+                {!collapsed &&
+                  rows.map((skill) => (
+                    <SkillRow
+                      key={skill.id}
+                      skill={skill}
+                      selected={selectedId === skill.id}
+                      selectedFile={selectedId === skill.id ? selectedFile : null}
+                      onSelectSkill={() => onSelectSkill(skill.id)}
+                      onSelectFile={(path) => onSelectFile(skill.id, path)}
+                      sessionId={sessionId}
+                      includeOtherTools={includeOtherTools}
+                    />
+                  ))}
               </section>
             );
           })
@@ -690,13 +740,14 @@ function SkillDetailBody({ skill }: { skill: SkillDetail }) {
         </div>
       </Section>
 
-      {/* Instructions */}
+      {/* Advanced details — kept above the (long) instructions so the compact
+          metadata stays reachable without scrolling past the SKILL.md body. */}
+      <AdvancedDetails skill={skill} />
+
+      {/* Instructions — the tall, progressively-disclosed SKILL.md body. */}
       <Section label="Instructions">
         <InstructionsBlock skill={skill} />
       </Section>
-
-      {/* Advanced details */}
-      <AdvancedDetails skill={skill} />
     </div>
   );
 }
@@ -712,15 +763,55 @@ function Section({ label, children }: { label: string; children: React.ReactNode
   );
 }
 
+// Collapsed instructions get a generous but bounded height; expanded is capped
+// at a viewport-relative height with internal scroll so the page never grows
+// unbounded on an extreme SKILL.md.
+const INSTRUCTIONS_COLLAPSED_MAX_PX = 480;
+
 function InstructionsBlock({ skill }: { skill: SkillDetail }) {
   const [mode, setMode] = useState<"rendered" | "source">("rendered");
   const [copied, setCopied] = useState(false);
+  const [expanded, setExpanded] = useState(false);
+  // Whether the collapsed content actually overflows its max-height — measured,
+  // so short instructions get no fade and no Show more control.
+  const [overflowing, setOverflowing] = useState(false);
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+
+  // Reset expansion when the skill (or render mode) changes — a new skill
+  // should always start collapsed.
+  useEffect(() => {
+    setExpanded(false);
+  }, [skill.id]);
+
+  // Measure real overflow against the COLLAPSED cap (compare full content height
+  // to the collapsed max), re-running on content/size changes via ResizeObserver.
+  const measure = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    setOverflowing(el.scrollHeight > INSTRUCTIONS_COLLAPSED_MAX_PX + 1);
+  }, []);
+  useLayoutEffect(() => {
+    measure();
+    const el = scrollRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(() => measure());
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [measure, skill.instructions, mode]);
 
   const handleCopy = async () => {
     await copyText(skill.instructions);
     setCopied(true);
     setTimeout(() => setCopied(false), 1400);
   };
+
+  // The pane is ALWAYS scrollable when it overflows — collapsed just uses a
+  // smaller max-height than expanded, so hidden content is reachable by wheel/
+  // touch/scrollbar even before pressing Show more (which merely enlarges the
+  // viewport). Short instructions size to content with no cap, fade, or button.
+  const bounded = overflowing;
+  const collapsedAndOverflowing = bounded && !expanded;
+  const showControl = overflowing;
 
   return (
     <TooltipProvider>
@@ -754,7 +845,17 @@ function InstructionsBlock({ skill }: { skill: SkillDetail }) {
             <TooltipContent side="left">{copied ? "Copied" : "Copy"}</TooltipContent>
           </Tooltip>
         </div>
-        <div className="max-h-72 overflow-y-auto px-4 py-3.5" data-testid="skill-instructions">
+        <div
+          ref={scrollRef}
+          id={`skill-instructions-${skill.id}`}
+          data-testid="skill-instructions"
+          className={cn("px-4 py-3.5", bounded && "overflow-y-auto")}
+          style={
+            bounded
+              ? { maxHeight: expanded ? "70vh" : `${INSTRUCTIONS_COLLAPSED_MAX_PX}px` }
+              : undefined
+          }
+        >
           {mode === "rendered" ? (
             <div className="prose prose-sm max-w-none dark:prose-invert prose-headings:font-heading prose-pre:bg-background">
               <ReactMarkdown remarkPlugins={[remarkGfm]}>{skill.instructions}</ReactMarkdown>
@@ -765,6 +866,39 @@ function InstructionsBlock({ skill }: { skill: SkillDetail }) {
             </pre>
           )}
         </div>
+        {/* Fade cue — shown while collapsed-and-overflowing to hint there's more
+            below the smaller viewport. It is purely decorative and
+            pointer-events-none, so wheel / touch / scrollbar all still scroll
+            the content beneath it. Works in light + dark via the muted gradient.
+            Sits above the scroll area but below the Show more control (which is
+            in normal flow underneath). */}
+        {collapsedAndOverflowing && (
+          <div
+            aria-hidden
+            data-testid="skill-instructions-scrim"
+            className="pointer-events-none absolute inset-x-0 bottom-0 h-16 bg-gradient-to-t from-muted via-muted/85 to-transparent"
+          />
+        )}
+        {/* Show more / less — in normal flow below the scroll area (collapsed or
+            expanded), so it never obscures instructions. Only shown when the
+            content actually overflows the collapsed cap. */}
+        {showControl && (
+          <div className="flex justify-center border-t border-border/60 bg-muted/40 py-1.5">
+            <button
+              type="button"
+              onClick={() => setExpanded((v) => !v)}
+              aria-expanded={expanded}
+              aria-controls={`skill-instructions-${skill.id}`}
+              data-testid="skill-instructions-toggle"
+              className="inline-flex items-center gap-1 rounded-full px-3 py-1 text-[11.5px] font-semibold text-foreground transition-colors hover:bg-foreground/8"
+            >
+              {expanded ? "Show less" : "Show more"}
+              <ChevronDownIcon
+                className={cn("size-3.5 transition-transform", expanded && "rotate-180")}
+              />
+            </button>
+          </div>
+        )}
       </div>
     </TooltipProvider>
   );

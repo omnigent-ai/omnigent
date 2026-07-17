@@ -289,7 +289,7 @@ describe("SkillsPage", () => {
     await screen.findByTestId("skill-row-ship");
 
     const sections = screen
-      .getAllByTestId(/^skills-section-/)
+      .getAllByTestId(/^skills-section-(omnigent|agent|local)$/)
       .map((el) => el.getAttribute("data-testid"));
     expect(sections).toEqual([
       "skills-section-omnigent",
@@ -769,5 +769,173 @@ describe("SkillsPage — left sidebar file explorer", () => {
     expect(await screen.findByText(/Couldn't load references\/guide\.md/)).toBeInTheDocument();
     const detailPane = screen.getByTestId("skill-detail");
     expect(within(detailPane).getByRole("button", { name: "Try again" })).toBeInTheDocument();
+  });
+});
+
+describe("SkillsPage — collapsible ownership sections", () => {
+  function renderThreeCategories() {
+    vi.mocked(skillsApi.getSkillCatalog).mockResolvedValue({
+      skills: [BUILTIN, AGENT_BUNDLED, WORKSPACE, PERSONAL_NATIVE],
+      includeOtherTools: true,
+      hiddenCount: 0,
+    });
+    return renderPage();
+  }
+
+  it("renders section headers as expanded disclosure buttons with counts", async () => {
+    renderThreeCategories();
+    const header = await screen.findByTestId("skills-section-header-local");
+    expect(header).toHaveAttribute("aria-expanded", "true");
+    // Count badge (2 local skills: test-generator + data-story).
+    expect(within(header).getByText("2")).toBeInTheDocument();
+    // Rows visible by default.
+    expect(screen.getByTestId("skill-row-test-generator")).toBeInTheDocument();
+  });
+
+  it("keeps individual skill rows chevron-free (only headers have chevrons)", async () => {
+    renderThreeCategories();
+    const row = await screen.findByTestId("skill-row-test-generator");
+    expect(row).not.toHaveAttribute("aria-expanded");
+    expect(row.querySelector("svg")).toBeNull();
+  });
+
+  it("collapsing a section hides its rows but preserves the selection/detail", async () => {
+    renderThreeCategories();
+    // `ship` (Omnigent) auto-selected first.
+    const detailPane = await screen.findByTestId("skill-detail");
+    expect(detailPane).toHaveAttribute("data-skill-id", "bundle:ship");
+
+    // Collapse the Local section → its rows hide.
+    fireEvent.click(screen.getByTestId("skills-section-header-local"));
+    await waitFor(() => expect(screen.queryByTestId("skill-row-test-generator")).toBeNull());
+    expect(screen.getByTestId("skills-section-header-local")).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+    // Selection + right-pane detail are untouched.
+    expect(screen.getByTestId("skill-detail")).toHaveAttribute("data-skill-id", "bundle:ship");
+    // Other sections stay expanded.
+    expect(screen.getByTestId("skill-row-cross-review")).toBeInTheDocument();
+  });
+
+  it("force-opens matching sections during search, then restores collapse state", async () => {
+    renderThreeCategories();
+    await screen.findByTestId("skill-row-test-generator");
+
+    // Collapse Local.
+    fireEvent.click(screen.getByTestId("skills-section-header-local"));
+    await waitFor(() => expect(screen.queryByTestId("skill-row-test-generator")).toBeNull());
+
+    // A search matching a Local skill force-opens the section despite the
+    // stored collapse preference.
+    fireEvent.change(screen.getByTestId("skills-search"), { target: { value: "test-gen" } });
+    expect(await screen.findByTestId("skill-row-test-generator")).toBeInTheDocument();
+    expect(screen.getByTestId("skills-section-header-local")).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
+
+    // Clearing the search restores the user's collapsed preference.
+    fireEvent.change(screen.getByTestId("skills-search"), { target: { value: "" } });
+    await waitFor(() =>
+      expect(screen.getByTestId("skills-section-header-local")).toHaveAttribute(
+        "aria-expanded",
+        "false",
+      ),
+    );
+  });
+});
+
+describe("SkillsPage — instructions layout + progressive disclosure", () => {
+  // jsdom doesn't lay out, so drive the overflow measurement by stubbing
+  // scrollHeight on the instructions container.
+  function stubInstructionsScrollHeight(px: number) {
+    Object.defineProperty(HTMLElement.prototype, "scrollHeight", {
+      configurable: true,
+      get() {
+        return (this as HTMLElement).getAttribute("data-testid") === "skill-instructions" ? px : 0;
+      },
+    });
+  }
+  afterEach(() => {
+    // Drop the stub so it doesn't leak into other suites.
+    delete (HTMLElement.prototype as { scrollHeight?: unknown }).scrollHeight;
+  });
+
+  function renderOneSkill() {
+    vi.mocked(skillsApi.getSkillCatalog).mockResolvedValue({
+      skills: [BUILTIN],
+      includeOtherTools: true,
+      hiddenCount: 0,
+    });
+    return renderPage();
+  }
+
+  it("orders the detail pane Advanced details BEFORE Instructions", async () => {
+    stubInstructionsScrollHeight(50);
+    renderOneSkill();
+    const detailPane = await screen.findByTestId("skill-detail");
+    const html = detailPane.innerHTML;
+    expect(html.indexOf("Advanced details")).toBeGreaterThan(-1);
+    expect(html.indexOf("Instructions")).toBeGreaterThan(-1);
+    // Advanced details appears earlier in the DOM than the Instructions section.
+    expect(html.indexOf("Advanced details")).toBeLessThan(html.indexOf("Instructions"));
+  });
+
+  it("shows no Show more control when instructions are short", async () => {
+    stubInstructionsScrollHeight(120); // < collapsed cap → no overflow
+    renderOneSkill();
+    await screen.findByTestId("skill-instructions");
+    expect(screen.queryByTestId("skill-instructions-toggle")).toBeNull();
+    expect(screen.queryByTestId("skill-instructions-scrim")).toBeNull();
+  });
+
+  it("shows a fade + Show more when instructions overflow, expanding to Show less", async () => {
+    stubInstructionsScrollHeight(2000); // >> collapsed cap → overflow
+    renderOneSkill();
+    await screen.findByTestId("skill-instructions");
+
+    const toggle = await screen.findByTestId("skill-instructions-toggle");
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(toggle).toHaveTextContent("Show more");
+    expect(screen.getByTestId("skill-instructions-scrim")).toBeInTheDocument();
+
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    expect(toggle).toHaveTextContent("Show less");
+    // Expanded → the collapse scrim is gone (content no longer clipped).
+    expect(screen.queryByTestId("skill-instructions-scrim")).toBeNull();
+    // Expanded container caps at a viewport-relative height with internal scroll.
+    expect(screen.getByTestId("skill-instructions")).toHaveStyle({ maxHeight: "70vh" });
+  });
+
+  it("resets expansion when switching skills", async () => {
+    stubInstructionsScrollHeight(2000);
+    vi.mocked(skillsApi.getSkillCatalog).mockResolvedValue({
+      skills: [BUILTIN, WORKSPACE],
+      includeOtherTools: true,
+      hiddenCount: 0,
+    });
+    renderPage();
+
+    fireEvent.click(await screen.findByTestId("skill-instructions-toggle"));
+    expect(screen.getByTestId("skill-instructions-toggle")).toHaveTextContent("Show less");
+
+    // Switch to another skill → its instructions start collapsed again.
+    fireEvent.click(screen.getByTestId("skill-row-test-generator"));
+    await waitFor(() =>
+      expect(screen.getByTestId("skill-instructions-toggle")).toHaveTextContent("Show more"),
+    );
+  });
+
+  it("keeps the Rendered/Source toggle + copy working alongside disclosure", async () => {
+    stubInstructionsScrollHeight(2000);
+    renderOneSkill();
+    await screen.findByTestId("skill-instructions");
+
+    // Source mode still available with the disclosure present.
+    fireEvent.click(screen.getByRole("button", { name: "Source" }));
+    expect(screen.getByTestId("skill-copy")).toBeInTheDocument();
+    expect(screen.getByTestId("skill-instructions-toggle")).toBeInTheDocument();
   });
 });
