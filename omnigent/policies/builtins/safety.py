@@ -435,7 +435,7 @@ def enforce_sandbox(
 _PII_CATEGORY_PATTERNS: dict[str, _re.Pattern[str]] = {
     "ssn": _re.compile(r"\b\d{3}-\d{2}-\d{4}\b"),
     "credit_card": _re.compile(r"\b(?:\d[ -]*?){13,19}\b"),
-    "email": _re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b"),
+    "email": _re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"),
     # Phone: international (+cc ...) and common local formats
     # (US, UK, JP, DE, etc.) in a single pattern.
     "phone": _re.compile(
