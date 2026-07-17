@@ -84,6 +84,71 @@ class TestPromptExtraction(unittest.TestCase):
         self.assertIn("ZEBRA-99", prompt)
         self.assertIn("Summarize our conversation.", prompt)
 
+    def test_historical_image_data_uri_is_replaced_with_compact_placeholder(self):
+        executor = self._make_executor()
+        image_payload = base64.b64encode(b"synthetic png bytes").decode("ascii")
+        image_data_uri = f"data:image/png;base64,{image_payload}"
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_image",
+                        "image_url": image_data_uri,
+                        "filename": "screenshot.png",
+                    },
+                    {"type": "input_text", "text": "What is shown here?"},
+                ],
+            },
+            {"role": "assistant", "content": "It shows a test image."},
+            {"role": "user", "content": "Summarize our conversation."},
+        ]
+
+        prompt = executor._build_prompt(messages, resume_session=False)
+
+        self.assertIsInstance(prompt, str)
+        self.assertNotIn("data:", prompt)
+        self.assertNotIn(image_payload, prompt)
+        self.assertIn(
+            "[image: screenshot.png, image/png, 28 base64 chars]",
+            prompt,
+        )
+        self.assertIn("What is shown here?", prompt)
+
+    def test_historical_file_data_uri_is_replaced_with_compact_placeholder(self):
+        # The blowup hits ALL attachments, not just images: the runner resolves a
+        # non-image file_id block to ``file_data = data:...;base64,...`` too. This
+        # locks in the field-name-independent redaction fallback for file_data.
+        executor = self._make_executor()
+        file_payload = base64.b64encode(b"synthetic pdf bytes").decode("ascii")
+        file_data_uri = f"data:application/pdf;base64,{file_payload}"
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_file",
+                        "file_data": file_data_uri,
+                        "filename": "doc.pdf",
+                    },
+                    {"type": "input_text", "text": "What does this document say?"},
+                ],
+            },
+            {"role": "assistant", "content": "It is a test document."},
+            {"role": "user", "content": "Summarize our conversation."},
+        ]
+
+        prompt = executor._build_prompt(messages, resume_session=False)
+
+        self.assertIsInstance(prompt, str)
+        self.assertNotIn("data:", prompt)
+        self.assertNotIn(file_payload, prompt)
+        self.assertIn(
+            f"[attachment: doc.pdf, application/pdf, {len(file_payload)} base64 chars]",
+            prompt,
+        )
+        self.assertIn("What does this document say?", prompt)
+
 
 # ---------------------------------------------------------------------------
 # Tests: Constructor and properties
