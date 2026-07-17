@@ -8,11 +8,13 @@ file runs on both Linux CI and a Windows box.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import subprocess
 import time
 from pathlib import Path
 
+import psutil
 import pytest
 
 from omnigent import _platform
@@ -166,6 +168,10 @@ def test_spawn_kwargs_shape_matches_platform() -> None:
 
 def test_process_alive_is_a_nondestructive_probe() -> None:
     proc = subprocess.Popen(_spin_cmd(), **_proc.spawn_kwargs())
+    # Bind to the live PID so psutil pins its creation time; a recycled PID
+    # after teardown can't masquerade as the reaped child, so the final
+    # liveness check is free of the process_alive(pid) TOCTOU race.
+    handle = psutil.Process(proc.pid)
     try:
         assert _proc.process_alive(proc.pid) is True
         # Probing repeatedly must NOT kill the process (the os.kill(pid, 0)
@@ -175,7 +181,9 @@ def test_process_alive_is_a_nondestructive_probe() -> None:
     finally:
         _proc.kill_tree(proc)
         proc.wait(timeout=5)
-    assert _proc.process_alive(proc.pid) is False
+    # A reaped PID raises NoSuchProcess, which also means it isn't running.
+    with contextlib.suppress(psutil.NoSuchProcess):
+        assert not handle.is_running() or handle.status() == psutil.STATUS_ZOMBIE
 
 
 def test_process_alive_false_for_bogus_pid() -> None:
@@ -185,9 +193,15 @@ def test_process_alive_false_for_bogus_pid() -> None:
 
 def test_terminate_tree_stops_the_process() -> None:
     proc = subprocess.Popen(_spin_cmd(), **_proc.spawn_kwargs())
+    # Bind to the live PID so psutil pins its creation time; a recycled PID
+    # after teardown can't masquerade as the reaped child, so the final
+    # liveness check is free of the process_alive(pid) TOCTOU race.
+    handle = psutil.Process(proc.pid)
     _proc.terminate_tree(proc, grace=5)
     proc.wait(timeout=5)
-    assert _proc.process_alive(proc.pid) is False
+    # A reaped PID raises NoSuchProcess, which also means it isn't running.
+    with contextlib.suppress(psutil.NoSuchProcess):
+        assert not handle.is_running() or handle.status() == psutil.STATUS_ZOMBIE
 
 
 # --------------------------------------------------------------------------

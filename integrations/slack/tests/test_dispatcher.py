@@ -12,6 +12,8 @@ def _turn(key: ThreadKey, text: str) -> SlackTurn:
         create_if_missing=False,
         title="title",
         slack_client=object(),
+        agent_id="ag_1",
+        owner_user_id="U",
     )
 
 

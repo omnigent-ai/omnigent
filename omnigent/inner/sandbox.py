@@ -34,6 +34,14 @@ _SANDBOX_STRACE_ENV = "OMNIGENT_SANDBOX_STRACE"
 # and inherited by the wrapped process.
 _LAUNCHER_WRAPPED_ENV = "OMNIGENT_LAUNCHER_SPAWN_WRAPPED"
 
+# Hand-off marker for the spawn-time re-exec: the host pass mints the
+# private scratch tmpdir, grants it in the profile, and names it here
+# so the in-wrap pass adopts that exact dir (instead of minting a
+# second, un-granted one) and owns its cleanup on exit. Names the one
+# dir the host pass created, so cleanup can never touch a spec-supplied
+# write root that merely happens to sit under the system tempdir.
+_LAUNCHER_PRIVATE_TMPDIR_ENV = "OMNIGENT_LAUNCHER_SPAWN_PRIVATE_TMPDIR"
+
 # Backends that need a spawn-time wrap (parent-side ``bwrap`` /
 # ``sandbox-exec`` invocation) in addition to whatever in-process
 # work ``activate_sandbox`` does. ``none`` is a no-op backend so it
@@ -614,11 +622,18 @@ def _prune_environ_to_spawn_allowlist(sandbox: SandboxPolicy) -> None:
     :param sandbox: The decoded launcher policy. No-op when its
         ``spawn_env_allowlist`` is ``None``. The internal launcher
         markers (:data:`_LAUNCHER_WRAPPED_ENV`,
-        :data:`_SANDBOX_STRACE_ENV`) are always retained.
+        :data:`_SANDBOX_STRACE_ENV`,
+        :data:`_LAUNCHER_PRIVATE_TMPDIR_ENV`) are always retained —
+        dropping the tmpdir marker would make the in-wrap pass mint a
+        second scratch dir the profile never granted.
     """
     if sandbox.spawn_env_allowlist is None:
         return
-    allowed = set(sandbox.spawn_env_allowlist) | {_LAUNCHER_WRAPPED_ENV, _SANDBOX_STRACE_ENV}
+    allowed = set(sandbox.spawn_env_allowlist) | {
+        _LAUNCHER_WRAPPED_ENV,
+        _SANDBOX_STRACE_ENV,
+        _LAUNCHER_PRIVATE_TMPDIR_ENV,
+    }
     for name in list(os.environ):
         if name not in allowed:
             del os.environ[name]
@@ -699,50 +714,88 @@ def run_launcher(encoded_sandbox: str, target_path: str, argv: list[str]) -> int
         and os.environ.get(_LAUNCHER_WRAPPED_ENV) != "1"
     ):
         backend = get_backend(sandbox.backend_type)
-        # Re-invoke run_launcher via an INLINE python -c script
-        # rather than re-running the launcher tempfile. Reason:
-        # bwrap mounts ``/tmp`` as a fresh tmpfs, so the host's
-        # ``/tmp/omnigent-sandbox-*.py`` written by
-        # ``create_exec_launcher`` is invisible inside the wrap.
-        # ``python -c '<inline>'`` doesn't need a script file in
-        # the sandbox view — the inline string travels through
-        # argv. Bwrap's ``_ensure_executable_visible`` already
-        # ensures ``sys.executable`` is reachable. The project
-        # root is added to sys.path inside the inline so
-        # ``omnigent.inner.sandbox`` imports succeed even when
-        # the cwd is outside the project tree (terminal case).
-        project_root = repr(str(_project_root()))
-        inline = (
-            "import sys; "
-            f"sys.path.insert(0, {project_root}); "
-            "from omnigent.inner.sandbox import run_launcher; "
-            f"raise SystemExit(run_launcher({encoded_sandbox!r}, "
-            f"{target_path!r}, sys.argv[1:]))"
-        )
-        launcher_argv = [sys.executable, "-c", inline, *argv]
-        wrapped = list(
-            backend.wrap_launcher_argv(
-                launcher_argv,
-                sandbox,
-                Path(os.getcwd()),
-                target=target_path,
+        # Mint the private scratch tmpdir HERE, on the host, before the
+        # wrap is built — the reference pattern from
+        # ``_HelperProcessClient._start_locked``. The wrap bakes the
+        # sandbox profile (seatbelt SBPL / bwrap binds) from ``sandbox``
+        # right now, so the scratch dir has to be a write root *before*
+        # that snapshot or the profile never grants it. Deferring the
+        # ``create_private_tmpdir`` to the in-wrap pass (as before) left
+        # the in-jail ``mkdtemp`` targeting ``$TMPDIR`` = the system
+        # tempdir root, which the profile only granted a subpath of —
+        # ``FileNotFoundError: No usable temporary directory`` on
+        # seatbelt (bwrap masked it via its ``--tmpfs /tmp`` fallback).
+        tmpdir = create_private_tmpdir()
+        try:
+            sandbox = with_additional_write_roots(sandbox, [tmpdir])
+            set_temp_env(os.environ, tmpdir)
+            encoded_sandbox = _encode_json_arg(sandbox.to_jsonable())
+            # Name the dir for the in-wrap pass: it adopts this exact
+            # path (no second mint) and owns the cleanup on exit.
+            os.environ[_LAUNCHER_PRIVATE_TMPDIR_ENV] = str(tmpdir)
+            # Re-invoke run_launcher via an INLINE python -c script
+            # rather than re-running the launcher tempfile. Reason:
+            # bwrap mounts ``/tmp`` as a fresh tmpfs, so the host's
+            # ``/tmp/omnigent-sandbox-*.py`` written by
+            # ``create_exec_launcher`` is invisible inside the wrap.
+            # ``python -c '<inline>'`` doesn't need a script file in
+            # the sandbox view — the inline string travels through
+            # argv. Bwrap's ``_ensure_executable_visible`` already
+            # ensures ``sys.executable`` is reachable. The project
+            # root is added to sys.path inside the inline so
+            # ``omnigent.inner.sandbox`` imports succeed even when
+            # the cwd is outside the project tree (terminal case).
+            # The inline carries the RE-ENCODED policy so the in-wrap
+            # pass decodes the same granted scratch root the profile
+            # was built from.
+            project_root = repr(str(_project_root()))
+            inline = (
+                "import sys; "
+                f"sys.path.insert(0, {project_root}); "
+                "from omnigent.inner.sandbox import run_launcher; "
+                f"raise SystemExit(run_launcher({encoded_sandbox!r}, "
+                f"{target_path!r}, sys.argv[1:]))"
             )
-        )
-        os.environ[_LAUNCHER_WRAPPED_ENV] = "1"
-        logger.info(
-            "[omnigent-sandbox] spawn-time wrap re-exec backend=%s wrap_head=%s",
-            sandbox.backend_type,
-            wrapped[:3],
-        )
-        # ``os.execvp`` replaces the process; nothing after this
-        # line runs unless the exec fails (which raises).
-        os.execvp(wrapped[0], wrapped)
+            launcher_argv = [sys.executable, "-c", inline, *argv]
+            wrapped = list(
+                backend.wrap_launcher_argv(
+                    launcher_argv,
+                    sandbox,
+                    Path(os.getcwd()),
+                    target=target_path,
+                )
+            )
+            os.environ[_LAUNCHER_WRAPPED_ENV] = "1"
+            logger.info(
+                "[omnigent-sandbox] spawn-time wrap re-exec backend=%s wrap_head=%s",
+                sandbox.backend_type,
+                wrapped[:3],
+            )
+            # ``os.execvp`` replaces the process; nothing after this
+            # line runs unless the exec fails (which raises). On success
+            # the in-wrap pass adopts ``tmpdir`` and cleans it up; this
+            # ``except`` only fires if the wrap/exec never handed off.
+            os.execvp(wrapped[0], wrapped)
+        except BaseException:
+            cleanup_private_tmpdir(tmpdir)
+            raise
 
     tmpdir: Path | None = None
     if sandbox.active:
-        tmpdir = create_private_tmpdir()
-        sandbox = with_additional_write_roots(sandbox, [tmpdir])
-        set_temp_env(os.environ, tmpdir)
+        inherited = os.environ.get(_LAUNCHER_PRIVATE_TMPDIR_ENV)
+        if inherited:
+            # In-wrap pass of a spawn-time-wrap backend: adopt the dir
+            # the host pass minted and granted. Re-assert ``$TMPDIR`` in
+            # case the env prune stripped it; do NOT mint a second dir
+            # (that one wouldn't be in the baked profile).
+            tmpdir = Path(inherited)
+            set_temp_env(os.environ, tmpdir)
+        else:
+            # Single-pass active backends (no spawn-time re-exec, e.g.
+            # ``windows_jobobject``): mint + grant + surface here.
+            tmpdir = create_private_tmpdir()
+            sandbox = with_additional_write_roots(sandbox, [tmpdir])
+            set_temp_env(os.environ, tmpdir)
     # Checkpoints around activate + spawn so a hang in either step is
     # visible in the wrapper's stderr (the wrapper template enables INFO).
     logger.info(

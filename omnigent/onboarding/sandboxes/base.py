@@ -14,6 +14,7 @@ App OAuth dance, host registration) lives in ``bootstrap``.
 
 from __future__ import annotations
 
+import secrets
 import shlex
 from abc import ABC, abstractmethod
 from contextlib import AbstractContextManager
@@ -73,6 +74,81 @@ def host_image_wheel_install_command(remote_tgz_path: str) -> str:
         f"tar xzf {remote_tgz_path} -C oa-wheels --warning=no-unknown-keyword && "
         "pip install --quiet --force-reinstall --no-deps "
         "--no-warn-script-location oa-wheels/*.whl"
+    )
+
+
+# Prefix for the private dir a launcher creates under world-writable ``/tmp``
+# to record the pid of an exec'd foreground process (several providers' SDKs
+# expose no kill handle for exec'd processes, so the pid is recorded and a
+# second exec signals it on detach). The dir carries an unpredictable random
+# suffix and is created mode 700 with a bare ``mkdir`` that fails closed if
+# the path already exists, so a co-tenant on the sandbox can't pre-create,
+# symlink-redirect, or read the pidfile in ``/tmp``.
+_FOREGROUND_RUNDIR_PREFIX: str = "/tmp/oa-foreground-"
+
+
+def foreground_pidfile() -> tuple[str, str]:
+    """Allocate a private, unpredictably-named pidfile under ``/tmp``.
+
+    Used by :meth:`SandboxLauncher.exec_foreground` implementations whose
+    SDK cannot kill an exec'd process through its handle (Modal,
+    CoreWeave, OpenShell). The caller records the remote pid with
+    :func:`foreground_record_prefix` and tears it down with
+    :func:`foreground_kill_command`, both of which operate on the paths
+    returned here.
+
+    The pidfile lives in a fresh dir created ``mode 700`` with a bare
+    ``mkdir`` (no ``-p``) so it **fails closed** if the path already
+    exists — a co-tenant can't pre-seed a symlink we'd write through, nor
+    read our pid back, in the world-writable ``/tmp`` it lives under.
+
+    :returns: A ``(run_dir, pidfile)`` pair of absolute ``/tmp`` paths.
+        ``run_dir`` is ``/tmp/oa-foreground-<32 hex chars>`` and
+        ``pidfile`` is ``<run_dir>/pid``.
+    """
+    run_dir = f"{_FOREGROUND_RUNDIR_PREFIX}{secrets.token_hex(16)}"
+    return run_dir, f"{run_dir}/pid"
+
+
+def foreground_record_prefix(pidfile: str) -> str:
+    """Shell prefix that creates the run dir and records the shell pid.
+
+    ``mkdir -m 700`` (no ``-p``) fails closed if the path exists, and
+    ``echo $$`` writes the shell pid before the caller swaps in the real
+    command via ``exec`` (which keeps the pid across the swap). Both
+    paths are :func:`shlex.quote`-d before interpolation so the function
+    stays safe even if a future caller passes a non-hex path; the
+    standard hex paths from :func:`foreground_pidfile` quote harmlessly.
+
+    :param pidfile: The pidfile path returned by :func:`foreground_pidfile`.
+    :returns: A shell fragment such as ``"mkdir -m 700 /tmp/… && echo $$ > /tmp/…/pid && "``
+        to prepend before the foreground command.
+    """
+    run_dir = pidfile.rsplit("/", 1)[0]
+    q_dir = shlex.quote(run_dir)
+    q_pid = shlex.quote(pidfile)
+    return f"mkdir -m 700 {q_dir} && echo $$ > {q_pid} && "
+
+
+def foreground_kill_command(pidfile: str) -> str:
+    """Shell command that signals the recorded pid and drops the run dir.
+
+    Only a fully-numeric pid read back from the private pidfile is ever
+    signalled — the ``case`` rejects empty and non-numeric content, so
+    unvalidated file contents never reach ``kill``. The run dir is then
+    removed so a successful foreground run leaves nothing behind in
+    ``/tmp``.
+
+    :param pidfile: The pidfile path returned by :func:`foreground_pidfile`.
+    :returns: A self-contained shell command string for a second exec.
+    """
+    run_dir = pidfile.rsplit("/", 1)[0]
+    q_dir = shlex.quote(run_dir)
+    q_pid = shlex.quote(pidfile)
+    return (
+        f"pid=$(cat {q_pid} 2>/dev/null); "
+        f'case "$pid" in ""|*[!0-9]*) ;; *) kill "$pid" 2>/dev/null ;; esac; '
+        f"rm -rf {q_dir}"
     )
 
 

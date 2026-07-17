@@ -2597,6 +2597,31 @@ def create_app(
                 tags=["auth"],
             )
 
+        # Device Authorization Grant (RFC 8628): opt-in, default-off via
+        # OMNIGENT_DEVICE_GRANT_ENABLED, and accounts-mode only. OIDC delegates
+        # login to the IdP (cli-ticket flow), so it neither needs nor mounts
+        # these routes. Wires the revocation lookup into the auth provider so
+        # revoking a grant immediately rejects its delegated access tokens.
+        # See designs/DEVICE_AUTH.md.
+        from omnigent.server.auth import env_var_is_truthy
+
+        if (
+            env_var_is_truthy("OMNIGENT_DEVICE_GRANT_ENABLED", default=False)
+            and isinstance(auth_provider, UnifiedAuthProvider)
+            and auth_provider._source == "accounts"
+            and permission_store is not None
+        ):
+            from omnigent.server.device_grant_store import DeviceGrantStore
+            from omnigent.server.routes.device_auth import create_device_auth_router
+
+            device_grant_store = DeviceGrantStore(permission_store.storage_location)
+            auth_provider.set_grant_revocation_check(device_grant_store.is_revoked)
+            app.include_router(
+                create_device_auth_router(auth_provider, device_grant_store),
+                tags=["oauth"],
+            )
+            _logger.info("device-grant: /oauth/* routes enabled")
+
     # Mount the built web SPA at "/" if a build is present. The SPA is
     # built into ``omnigent/server/static/web-ui/`` by ``web/``'s Vite
     # build (see ``web/vite.config.ts`` ``build.outDir``). The mount is

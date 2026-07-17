@@ -94,6 +94,7 @@ import {
   openHtmlArtifactInNewTab,
 } from "./codeViewerHelpers";
 import { CommentsPanel, type ActiveSelection } from "./CommentsPanel";
+import { isPdfAnchor } from "./pdfCommentHelpers";
 
 // Monaco diff is heavy (~MBs + worker); load it only when the diff view is
 // actually shown.
@@ -128,6 +129,12 @@ export function classifyAndRemapComments(
     }
     // Draft with no anchor — keep as-is.
     if (!c.anchor_content) {
+      open.push(c);
+      continue;
+    }
+    // PDF anchors store geometry in anchor_content; byte-offset remapping does
+    // not apply to binary PDF content.
+    if (isPdfAnchor(c.anchor_content)) {
       open.push(c);
       continue;
     }
@@ -881,21 +888,18 @@ function FileViewerBody({
       onSelect: openHtmlInNewTab,
     });
   }
-  // PDFs render through PdfViewer, which has no text/selection surface to
-  // anchor comments to, so hide the comments toggle for them.
-  if (!isPdf) {
-    toolbarActions.push({
-      key: "comments",
-      label: commentsOpen ? "Hide comments" : "Show comments",
-      icon: <MessageSquareTextIcon className="size-4" />,
-      active: commentsOpen,
-      onSelect: () => {
-        commentsInitializedRef.current = true;
-        setCommentsOpen((prev) => !prev);
-      },
-    });
-  }
-  if (isDiffAvailable) {
+  // PDFs render through PdfViewer with text-layer comment anchors.
+  toolbarActions.push({
+    key: "comments",
+    label: commentsOpen ? "Hide comments" : "Show comments",
+    icon: <MessageSquareTextIcon className="size-4" />,
+    active: commentsOpen,
+    onSelect: () => {
+      commentsInitializedRef.current = true;
+      setCommentsOpen((prev) => !prev);
+    },
+  });
+  if (!isPdf && isDiffAvailable) {
     toolbarActions.push({
       key: "diff",
       label: viewMode === "diff" ? "Exit diff view" : "Show diff",

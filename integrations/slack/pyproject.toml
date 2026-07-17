@@ -7,11 +7,12 @@ requires-python = ">=3.11"
 dependencies = [
     "aiosqlite>=0.21.0",
     "aiohttp>=3.12.0",
+    "cryptography>=42.0.0",
     "httpx>=0.28.0",
     "pydantic-settings>=2.10.0",
     "python-dotenv>=1.1.0",
-    "slack-bolt>=1.23.0",
-    "markdown-to-mrkdwn>=0.3.3",
+    "slack-bolt>=1.29.0",
+    "slack-sdk>=3.43.0",
 ]
 
 [project.scripts]
@@ -47,7 +48,6 @@ warn_unreachable = true
 module = [
     "slack_bolt.*",
     "slack_sdk.*",
-    "markdown_to_mrkdwn.*",
 ]
 ignore_missing_imports = true
 

@@ -19105,27 +19105,27 @@ def _build_spawn_env_from_spec(
         )
 
         if harness == "claude-sdk":
-            env = _build_claude_sdk_spawn_env(spec, workdir=workdir)
+            env = _build_claude_sdk_spawn_env(spec, cwd=cwd, workdir=workdir)
         elif harness == "codex":
-            env = _build_codex_spawn_env(spec, workdir=workdir)
+            env = _build_codex_spawn_env(spec, cwd=cwd, workdir=workdir)
         elif harness == "pi":
             env = _build_pi_spawn_env(spec, cwd=cwd, workdir=workdir)
         elif harness == "openai-agents":
             env = _build_openai_agents_sdk_spawn_env(spec)
         elif harness == "cursor":
-            env = _build_cursor_spawn_env(spec, workdir=workdir)
+            env = _build_cursor_spawn_env(spec, cwd=cwd, workdir=workdir)
         elif harness == "antigravity":
             env = _build_antigravity_spawn_env(spec)
         elif harness == "kimi":
             env = _build_kimi_spawn_env(spec, cwd=cwd)
         elif harness == "qwen":
-            env = _build_qwen_spawn_env(spec, workdir=workdir)
+            env = _build_qwen_spawn_env(spec, cwd=cwd, workdir=workdir)
         elif harness == "goose":
-            env = _build_goose_spawn_env(spec, workdir=workdir)
+            env = _build_goose_spawn_env(spec, cwd=cwd, workdir=workdir)
         elif harness == "acp":
-            env = _build_acp_spawn_env(spec, workdir=workdir)
+            env = _build_acp_spawn_env(spec, cwd=cwd, workdir=workdir)
         elif harness == "copilot":
-            env = _build_copilot_spawn_env(spec, workdir=workdir)
+            env = _build_copilot_spawn_env(spec, cwd=cwd, workdir=workdir)
         else:
             builder_path = spawn_env_builders().get(harness)
             if builder_path is not None:

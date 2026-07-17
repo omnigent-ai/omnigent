@@ -22,9 +22,35 @@ from typing import Any, Protocol
 
 from cachetools import TTLCache
 
+from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
 from omnigent.host.frames import HostHelloFrame
 
 _logger = logging.getLogger(__name__)
+
+
+def _canonical_host_id(host_id: str) -> str:
+    """Reduce a host id to the canonical bare-hex form used as the key.
+
+    Host ids reach the registry in every spelling ``uuid_to_bytes``
+    accepts: the bare 32-char hex the tunnel route registers under,
+    the legacy ``host_<hex>`` form that pre-migration clients still
+    send in REST paths, and the dashed uuid form. The DB layer
+    normalizes all of them (``Uuid16``), so the registry must key on
+    the same canonical form — otherwise a legacy-form lookup misses a
+    live tunnel and runner launches 409 "host is offline" while
+    ``GET /v1/hosts`` reports the host online. Ids that aren't
+    uuid-shaped at all are keyed verbatim so they simply miss.
+
+    :param host_id: A host id in any accepted spelling, e.g.
+        ``"host_a1b2..."``, ``"a1b2..."``, or the dashed uuid.
+    :returns: The bare-hex form, or *host_id* unchanged when it is
+        not uuid-shaped.
+    """
+    try:
+        return uuid_to_bytes(host_id).hex()
+    except InvalidUuidError:
+        return host_id
+
 
 # How long a runner exit report stays answerable, and how many are kept.
 # Reports only matter while a client is still waiting for the runner to
@@ -268,8 +294,10 @@ class HostRegistry:
         :param ws: The live WebSocket.
         :param hello: The hello frame from the host.
         :param owner: Authenticated user ID, or ``None``.
-        :returns: The new :class:`HostConnection`.
+        :returns: The new :class:`HostConnection`. Its ``host_id`` is
+            the canonical form (see :func:`_canonical_host_id`).
         """
+        host_id = _canonical_host_id(host_id)
         now = time.time()
         conn = HostConnection(
             host_id=host_id,
@@ -296,21 +324,22 @@ class HostRegistry:
 
         No-op if ``host_id`` is not registered.
 
-        :param host_id: Host identifier to remove.
+        :param host_id: Host identifier to remove, in any accepted
+            spelling (see :func:`_canonical_host_id`).
         """
         with self._lock:
-            self._hosts.pop(host_id, None)
+            self._hosts.pop(_canonical_host_id(host_id), None)
 
     def get(self, host_id: str) -> HostConnection | None:
         """Look up a live host connection.
 
-        :param host_id: Host identifier, e.g.
-            ``"host_a1b2c3d4..."``.
+        :param host_id: Host identifier, in any accepted spelling
+            (see :func:`_canonical_host_id`).
         :returns: The :class:`HostConnection` if online,
             otherwise ``None``.
         """
         with self._lock:
-            return self._hosts.get(host_id)
+            return self._hosts.get(_canonical_host_id(host_id))
 
     def online_host_ids(self) -> list[str]:
         """Return IDs of all currently connected hosts.
