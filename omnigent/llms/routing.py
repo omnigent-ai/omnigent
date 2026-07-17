@@ -28,6 +28,7 @@ PROVIDER_CONFIGS: dict[str, str | None] = {
     "xai": "https://api.x.ai/v1",
     "openrouter": "https://openrouter.ai/api/v1",
     "ollama": "http://localhost:11434/v1",
+    "llama-server": "http://localhost:8080/v1",
     "moonshot": "https://api.moonshot.cn/v1",
 }
 

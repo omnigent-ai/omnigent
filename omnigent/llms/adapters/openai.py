@@ -1,8 +1,8 @@
 """
 OpenAI and OpenAI-compatible provider adapter.
 
-Handles OpenAI, Groq, DeepSeek, xAI, OpenRouter, and Ollama — any
-provider that speaks the OpenAI Chat Completions API format.
+Handles OpenAI, Groq, DeepSeek, xAI, OpenRouter, Ollama, and llama.cpp's
+llama-server — any provider that speaks the OpenAI Chat Completions API format.
 """
 
 from __future__ import annotations

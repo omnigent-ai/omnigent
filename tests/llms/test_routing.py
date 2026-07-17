@@ -60,6 +60,10 @@ from omnigent.llms.routing import RoutedModel, infer_harness_from_model, parse_m
             "moonshot/kimi-k2-instruct",
             RoutedModel(provider="moonshot", model="kimi-k2-instruct"),
         ),
+        (
+            "llama-server/qwen2.5-coder",
+            RoutedModel(provider="llama-server", model="qwen2.5-coder"),
+        ),
     ],
 )
 def test_parse_with_provider_prefix(

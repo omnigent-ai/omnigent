@@ -730,6 +730,7 @@ _PROVIDER_DISPLAY_NAMES: dict[str, str] = {
     "deepseek": "DeepSeek",
     "openrouter": "OpenRouter",
     "ollama": "Ollama",
+    "llama-server": "llama.cpp server",
 }
 
 

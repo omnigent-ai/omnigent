@@ -216,8 +216,9 @@ def _codex_auth_unavailable_reason() -> str | None:
         return _CODEX_AUTH_UNAVAILABLE_BINARY_MISSING
     # ponytail: resolve_native_codex_launch runs once per codex spelling
     # (codex / codex-native / native-codex → 3×) per hello frame; on a host with
-    # NO configured provider it also runs ambient detection (a localhost ollama
-    # probe + a `claude auth status` subprocess). It's off the event loop and
+    # NO configured provider it also runs ambient detection (localhost ollama
+    # and llama-server probes + a `claude auth status` subprocess). It's off the
+    # event loop and
     # only bites unconfigured hosts — memoize the launch across the map build in
     # configured_harness_map if that cost ever shows up.
     try:

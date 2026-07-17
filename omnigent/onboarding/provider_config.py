@@ -108,7 +108,8 @@ _VALID_WIRE_API = (RESPONSES_WIRE_API, CHAT_WIRE_API)
 # - ``subscription``: a logged-in CLI (``claude`` / ``codex``) — no families,
 #   no base_url; the CLI carries its own auth.
 # - ``gateway``: an OpenAI/Anthropic-compatible proxy (OpenRouter, LiteLLM).
-# - ``local``: a self-hosted endpoint (Ollama, vLLM) reached via families.
+# - ``local``: a self-hosted endpoint (Ollama, llama.cpp's llama-server,
+#   vLLM) reached via families.
 # - ``databricks``: a Databricks profile from ``~/.databrickscfg``.
 # - ``cli-config``: a custom model provider the harness CLI's own config
 #   file defines and authenticates (today: a ``[model_providers.X]`` table
