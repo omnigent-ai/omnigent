@@ -32,17 +32,23 @@ def test_install_spec_and_command(key: str, binary: str, package: str) -> None:
     assert hi.harness_install_command(key) == ["npm", "install", "-g", package]
 
 
-def test_kimi_install_spec_is_login_only_no_npm() -> None:
-    """Kimi ships via a curl installer (no npm package) and authenticates
-    through its own ``kimi login`` (OAuth or Moonshot API key), so it carries
-    an ``install_hint`` instead of a ``package`` and intentionally has no
+def test_kimi_install_spec_is_login_only_npm() -> None:
+    """Kimi ships as the ``@moonshot-ai/kimi-code`` npm package and
+    authenticates through its own ``kimi login`` (OAuth or Moonshot API key),
+    so it carries a ``package`` (no ``install_hint``) and intentionally has no
     ``status_args`` (no exit-code "am I logged in?" probe to read).
     """
     spec = hi.harness_install_spec(hi.KIMI_KEY)
     assert spec is not None
     assert spec.binary == "kimi"
-    assert spec.package is None
-    assert spec.install_hint is not None and "code.kimi.com" in spec.install_hint
+    assert spec.package == "@moonshot-ai/kimi-code"
+    assert spec.install_hint is None
+    assert hi.harness_install_command(hi.KIMI_KEY) == [
+        "npm",
+        "install",
+        "-g",
+        "@moonshot-ai/kimi-code",
+    ]
     assert spec.login_args == ("login",)
     assert spec.logout_args == ("logout",)
     assert spec.status_args is None
@@ -226,10 +232,11 @@ def test_setup_hint_for_native_kiro_points_at_vendor_installer(harness: str) -> 
     assert "omnigent setup" not in hint
 
 
-@pytest.mark.parametrize("harness", ["claude-native", "codex", "pi", "claude-sdk", None])
+@pytest.mark.parametrize("harness", ["claude-native", "codex", "pi", "kimi", "claude-sdk", None])
 def test_setup_hint_defaults_to_omnigent_setup(harness: str | None) -> None:
-    """Harnesses whose CLI ``omnigent setup`` installs (npm CLIs) — and the
-    SDK / unknown / ``None`` cases — route to the ``omnigent setup`` hint."""
+    """Harnesses whose CLI ``omnigent setup`` installs (npm CLIs, incl. kimi
+    via ``@moonshot-ai/kimi-code``) — and the SDK / unknown / ``None`` cases —
+    route to the ``omnigent setup`` hint."""
     hint = hi.harness_setup_hint(harness)
     assert "omnigent setup" in hint
 

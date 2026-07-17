@@ -10133,19 +10133,18 @@ def _manage_kimi_harness() -> None:
     from omnigent.onboarding.harness_install import (
         KIMI_KEY,
         harness_cli_installed,
-        harness_install_spec,
+        harness_install_command,
         harness_login,
         harness_logout,
     )
     from omnigent.onboarding.interactive import console, select
 
-    # Gate on the CLI. Kimi ships a single binary via a curl installer (not
-    # npm), so there's no in-process auto-install — name the command and let
-    # the user run it, then re-open. Mirrors how ``harness_setup_hint`` treats
-    # the other curl-installed CLI (cursor-agent).
+    # Gate on the CLI. Kimi ships as the ``@moonshot-ai/kimi-code`` npm
+    # package, so name its install command and let the user run it, then
+    # re-open. Mirrors how the other npm-installed CLIs surface their
+    # install command (e.g. ``harness_install_command`` in the picker rows).
     if not harness_cli_installed(KIMI_KEY):
-        spec = harness_install_spec(KIMI_KEY)
-        hint = (spec.install_hint if spec else None) or "see Kimi Code docs"
+        hint = " ".join(harness_install_command(KIMI_KEY))
         console.print(
             "  Kimi Code's CLI isn't installed. Install it with:\n"
             f"    [bold]{hint}[/bold]\n"
@@ -11244,15 +11243,15 @@ def _run_configure_harnesses_interactive() -> None:
             rows.append((_KIRO, "Kiro", "Not installed", "missing", _install_hint(kiro_hint)))
 
         # Kimi Code — native CLI, own auth via `kimi login`; there is no local
-        # login status probe yet. Curl-installed (no npm package), so use its
-        # install_hint when absent and show "not configured" when present.
+        # login status probe yet. npm-installed (``@moonshot-ai/kimi-code``),
+        # so show the npm install command when absent and "not configured"
+        # when present.
         if harness_cli_installed(KIMI_KEY):
             rows.append(
                 (_KIMI, "Kimi Code", "Not configured", "warn", "Sign in with `kimi login`.")
             )
         else:
-            kimi_spec = harness_install_spec(KIMI_KEY)
-            kimi_hint = (kimi_spec.install_hint if kimi_spec else None) or "see Kimi Code docs"
+            kimi_hint = " ".join(harness_install_command(KIMI_KEY))
             rows.append((_KIMI, "Kimi Code", "Not installed", "missing", _install_hint(kimi_hint)))
         return rows
 

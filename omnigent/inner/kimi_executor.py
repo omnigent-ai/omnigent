@@ -1,8 +1,8 @@
 """Kimi Code CLI executor.
 
 Drives Moonshot AI's upstream ``kimi`` CLI from
-https://github.com/MoonshotAI/Kimi-Code (the curl-installed
-single-binary build at https://code.kimi.com/kimi-code/install.sh).
+https://github.com/MoonshotAI/Kimi-Code (the ``@moonshot-ai/kimi-code``
+npm package).
 The legacy pypi ``kimi-cli`` package is **not** supported — its
 command-line surface (``--print``, list-of-blocks content, etc.) is
 incompatible with the upstream binary the issue (#271) targets.
@@ -423,7 +423,7 @@ class KimiExecutor(Executor):
             yield ExecutorError(
                 message=(
                     f"kimi harness: binary {self._binary_path!r} not found on PATH. "
-                    "Install via `curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash` "
+                    "Install via `npm install -g @moonshot-ai/kimi-code` "
                     "or set HARNESS_KIMI_PATH to its absolute location."
                 ),
                 retryable=False,

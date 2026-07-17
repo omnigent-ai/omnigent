@@ -200,9 +200,10 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
     forwarder unit tests plus the ``test_native_kiro_render_parity`` e2e_ui suite.
 
     ``kimi`` is excluded for the same reason as ``hermes``: it requires the
-    ``kimi`` CLI binary (installed via Moonshot's curl installer) and
-    authenticates through ``kimi login`` (OAuth or a Moonshot API key), not the
-    shared Databricks gateway/profile probe wiring this matrix drives.
+    ``kimi`` CLI binary (installed via the ``@moonshot-ai/kimi-code`` npm
+    package) and authenticates through ``kimi login`` (OAuth or a Moonshot
+    API key), not the shared Databricks gateway/profile probe wiring this
+    matrix drives.
 
     ``kimi-native`` is excluded for the same reason as ``goose-native`` /
     ``qwen-native`` / ``kiro-native``: it is a terminal-first TUI launched via

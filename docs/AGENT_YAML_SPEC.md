@@ -124,7 +124,7 @@ For Databricks, use `auth: {type: databricks, profile: …}`.
 `harness: kimi` runs the agent through Moonshot AI's
 [Kimi Code CLI](https://github.com/MoonshotAI/Kimi-Code) headlessly via
 `kimi --print --output-format stream-json` per turn. Install the binary
-with `curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash`
+with `npm install -g @moonshot-ai/kimi-code`
 and authenticate once with `kimi login` (OAuth or a Moonshot API key).
 
 ```yaml

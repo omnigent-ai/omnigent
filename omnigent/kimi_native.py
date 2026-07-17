@@ -135,7 +135,7 @@ def resolve_kimi_executable(
     if resolved is None:
         raise click.ClickException(
             "Native Kimi requires the 'kimi' CLI on PATH. Install it with: "
-            "curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash, then "
+            "npm install -g @moonshot-ai/kimi-code, then "
             f"run 'kimi login'. You can also set {_KIMI_PATH_ENV}=/path/to/kimi."
         )
     return resolved

@@ -4957,10 +4957,10 @@ def test_manage_goose_harness_configure_launches(
 def test_manage_kimi_harness_not_installed_shows_hint_returns(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A missing kimi CLI shows the curl install_hint and returns.
+    """A missing kimi CLI shows the npm install command and returns.
 
-    Kimi is curl-installed (no npm ``package``), so the drill-in can't
-    auto-install it — it must surface the install_hint and bail without
+    The drill-in gates on the CLI: it must surface the
+    ``@moonshot-ai/kimi-code`` npm install command and bail without
     touching login / logout.
     """
     import omnigent.onboarding.harness_install as hi
@@ -4980,9 +4980,9 @@ def test_manage_kimi_harness_not_installed_shows_hint_returns(
 
     login.assert_not_called()
     logout.assert_not_called()
-    # The curl install command was surfaced to the user.
+    # The npm install command was surfaced to the user.
     printed = " ".join(str(c.args[0]) for c in console.print.call_args_list if c.args)
-    assert "code.kimi.com/kimi-code/install.sh" in printed
+    assert "npm install -g @moonshot-ai/kimi-code" in printed
 
 
 def test_manage_kimi_harness_back_does_not_login(

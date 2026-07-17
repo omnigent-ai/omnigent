@@ -38,7 +38,7 @@ pytestmark = pytest.mark.skipif(
     reason=(
         "Real-binary e2e: requires OMNIGENT_E2E_KIMI=1 and the ``kimi`` (or "
         "HARNESS_KIMI_PATH) binary on PATH. Install via "
-        "`curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash` and "
+        "`npm install -g @moonshot-ai/kimi-code` and "
         "run ``kimi login`` once, then re-run with OMNIGENT_E2E_KIMI=1."
     ),
 )
