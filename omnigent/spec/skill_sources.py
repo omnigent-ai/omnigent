@@ -23,7 +23,13 @@ from typing import Any
 
 from omnigent.errors import OmnigentError
 from omnigent.spec.parser import _discover_skills, _parse_skill
-from omnigent.spec.skill_registry import SkillCandidate, SkillRegistry, SkillTrust, tree_digest
+from omnigent.spec.skill_registry import (
+    SkillCandidate,
+    SkillRegistry,
+    SkillTrust,
+    is_platform_skill_path,
+    tree_digest,
+)
 from omnigent.spec.types import SkillSpec
 
 _log = logging.getLogger(__name__)
@@ -135,6 +141,10 @@ def resolve_all_candidates(ctx: SkillSourceContext) -> list[SkillCandidate]:
             if not skill.user_invocable or skill.skill_dir is None:
                 continue
             skill_dir = skill.skill_dir.resolve()
+            # Host-discovered skills are "local" unless they resolve into the
+            # Omnigent platform skills dir (the universal build-omnigent shows
+            # up here too in a source checkout) — then they are platform-owned.
+            ownership = "omnigent" if is_platform_skill_path(skill_dir) else "local"
             candidates.append(
                 SkillCandidate(
                     provider=provider,
@@ -147,6 +157,8 @@ def resolve_all_candidates(ctx: SkillSourceContext) -> list[SkillCandidate]:
                     managed=False,
                     tree_digest=tree_digest(skill_dir),
                     skill=skill,
+                    ownership=ownership,
+                    agent_name=None,
                 )
             )
     return candidates
@@ -175,18 +187,33 @@ def registry_for_spec(
         if skill.skill_dir is not None and bundle_dir is not None:
             with contextlib.suppress(ValueError):
                 relative = skill.skill_dir.resolve().relative_to(bundle_dir.resolve()).as_posix()
+        # A bundled skill is owned by the agent spec (rendered under the agent's
+        # name) UNLESS it is the universal platform skill injected into every
+        # bundle (build-omnigent) — that stays platform-owned regardless of
+        # which agent's bundle it currently rides in. Detect the platform skill
+        # by its resolved path (the bundle symlink resolves back to the package
+        # dir), never by name alone.
+        origin_path = skill.skill_dir or bundle_dir or Path.cwd()
+        if skill.skill_dir is not None and is_platform_skill_path(skill.skill_dir):
+            ownership: str = "omnigent"
+            agent_name: str | None = None
+        else:
+            ownership = "agent"
+            agent_name = spec_name
         candidates.append(
             SkillCandidate(
                 provider="bundle",
                 location_scope="bundle",
                 source_kind="bundled",
-                origin_path=skill.skill_dir or bundle_dir or Path.cwd(),
+                origin_path=origin_path,
                 source_coords=f"bundle:{spec_name or 'agent'}:{relative}",
                 namespace=spec_name or "bundle",
                 invocation_name=skill.name,
                 managed=True,
                 tree_digest=tree_digest(skill.skill_dir),
                 skill=skill,
+                ownership=ownership,  # type: ignore[arg-type]
+                agent_name=agent_name,
             )
         )
     candidates.extend(resolve_all_candidates(ctx))

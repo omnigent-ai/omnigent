@@ -8879,11 +8879,16 @@ def create_runner_app(
             "origin": (
                 "built_in" if candidate.location_scope == "bundle" else candidate.location_scope
             ),
+            # First-class, harness-neutral OWNERSHIP category + the owning
+            # agent's name (only for ``ownership == "agent"``). This is what the
+            # catalog groups by — Omnigent / Agent / Local — so the UI never has
+            # to parse ``source_coords``/paths to classify a skill.
+            "ownership": candidate.ownership,
+            "agent_name": candidate.agent_name,
             # A concise, root-anchored source path (e.g. ``.claude/skills/foo``,
             # ``~/.codex/skills/foo``, ``Included with agent``). This is the
-            # user-facing provenance the catalog renders as the source of truth,
-            # so the list needs it without a per-skill detail fetch. ``origin``
-            # above stays for grouping/precedence, not display.
+            # user-facing provenance the detail + the optional Source filter
+            # render; the list needs it without a per-skill detail fetch.
             "display_path": display_path(candidate),
             "enabled": True,
             "available": True,

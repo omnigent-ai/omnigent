@@ -11,6 +11,8 @@ import {
   getSkillCatalog,
   getSkillDetail,
   getSkillTrust,
+  OWNERSHIP_ORDER,
+  ownershipLabel,
   setSkillTrust,
   sourceRootKey,
   sourceRootRank,
@@ -42,10 +44,12 @@ describe("getSkillCatalog", () => {
         object: "list",
         data: [
           {
-            id: "bundle:ship",
-            name: "ship",
-            description: "Commit and PR.",
+            id: "bundle:polly:cross-review",
+            name: "cross-review",
+            description: "Cross-review with peers.",
             origin: "built_in",
+            ownership: "agent",
+            agent_name: "polly",
             display_path: "Included with agent",
             enabled: true,
             available: true,
@@ -64,9 +68,12 @@ describe("getSkillCatalog", () => {
     expect(catalog.includeOtherTools).toBe(true);
     expect(catalog.hiddenCount).toBe(2);
     expect(catalog.skills[0]).toMatchObject({
-      id: "bundle:ship",
-      name: "ship",
+      id: "bundle:polly:cross-review",
+      name: "cross-review",
       origin: "built_in",
+      // First-class ownership + agent name are projected to camelCase.
+      ownership: "agent",
+      agentName: "polly",
       // The wire `display_path` is projected to camelCase `displayPath`.
       displayPath: "Included with agent",
       hasConflict: false,
@@ -262,6 +269,8 @@ describe("catalogSourceRoots", () => {
     name: "x",
     description: "",
     origin,
+    ownership: origin === "built_in" ? "omnigent" : "local",
+    agentName: null,
     displayPath,
     enabled: true,
     available: true,
@@ -287,5 +296,20 @@ describe("catalogSourceRoots", () => {
 
   it("returns an empty list for an empty catalog", () => {
     expect(catalogSourceRoots([])).toEqual([]);
+  });
+});
+
+describe("ownership grouping", () => {
+  it("orders the sections Omnigent → Agent → Local", () => {
+    expect(OWNERSHIP_ORDER).toEqual(["omnigent", "agent", "local"]);
+  });
+
+  it("labels each ownership category, folding the agent name into the Agent heading", () => {
+    expect(ownershipLabel("omnigent")).toBe("Omnigent");
+    expect(ownershipLabel("local")).toBe("Local");
+    expect(ownershipLabel("agent", "polly")).toBe("Agent · polly");
+    // No agent name → the bare "Agent" heading (never a vendor/path detail).
+    expect(ownershipLabel("agent", null)).toBe("Agent");
+    expect(ownershipLabel("agent")).toBe("Agent");
   });
 });

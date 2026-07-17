@@ -57,6 +57,8 @@ import { Link } from "@/lib/routing";
 import { copyText } from "@/lib/clipboard";
 import {
   catalogSourceRoots,
+  OWNERSHIP_ORDER,
+  ownershipLabel,
   sourceRootKey,
   type SkillDetail,
   type SkillFileNode,
@@ -403,21 +405,36 @@ function SkillList({
               : "No skills available."}
           </p>
         ) : (
-          // One flat, harness-neutral list — no source/provider/scope sections.
-          // Each row is a collapsible folder-like node; only the expanded skill
-          // fetches + renders its resource tree inline beneath the row.
-          skills.map((skill) => (
-            <SkillRow
-              key={skill.id}
-              skill={skill}
-              selected={selectedId === skill.id}
-              selectedFile={selectedId === skill.id ? selectedFile : null}
-              onSelectSkill={() => onSelectSkill(skill.id)}
-              onSelectFile={(path) => onSelectFile(skill.id, path)}
-              sessionId={sessionId}
-              includeOtherTools={includeOtherTools}
-            />
-          ))
+          // Grouped by harness-neutral OWNERSHIP (Omnigent → Agent → Local).
+          // These headings express ownership, never a vendor/source-path detail.
+          // Empty sections are hidden; each skill row is a selectable node whose
+          // resource tree expands inline only while selected.
+          OWNERSHIP_ORDER.map((ownership) => {
+            const rows = skills.filter((s) => s.ownership === ownership);
+            if (rows.length === 0) return null;
+            // The Agent heading carries the bound agent's name (all agent-owned
+            // rows in one session share it).
+            const agentName = ownership === "agent" ? (rows[0].agentName ?? null) : null;
+            return (
+              <section key={ownership} className="mb-2" data-testid={`skills-section-${ownership}`}>
+                <h2 className="px-2 pb-1 pt-2 text-[10.5px] font-bold uppercase tracking-wider text-muted-foreground">
+                  {ownershipLabel(ownership, agentName)}
+                </h2>
+                {rows.map((skill) => (
+                  <SkillRow
+                    key={skill.id}
+                    skill={skill}
+                    selected={selectedId === skill.id}
+                    selectedFile={selectedId === skill.id ? selectedFile : null}
+                    onSelectSkill={() => onSelectSkill(skill.id)}
+                    onSelectFile={(path) => onSelectFile(skill.id, path)}
+                    sessionId={sessionId}
+                    includeOtherTools={includeOtherTools}
+                  />
+                ))}
+              </section>
+            );
+          })
         )}
       </div>
     </div>

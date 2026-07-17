@@ -47,6 +47,8 @@ function summary(overrides: Partial<SkillSummary> = {}): SkillSummary {
     name: "ship",
     description: "Commit, push, and open a PR.",
     origin: "built_in",
+    ownership: "omnigent",
+    agentName: null,
     displayPath: "Included with agent",
     enabled: true,
     available: true,
@@ -79,6 +81,8 @@ const BUILTIN = summary({
   id: "bundle:ship",
   name: "ship",
   origin: "built_in",
+  ownership: "omnigent",
+  agentName: null,
   displayPath: "Included with agent",
 });
 const WORKSPACE = summary({
@@ -86,6 +90,8 @@ const WORKSPACE = summary({
   name: "test-generator",
   description: "Generate unit tests.",
   origin: "workspace",
+  ownership: "local",
+  agentName: null,
   displayPath: ".claude/skills/test-generator",
   hasConflict: true,
 });
@@ -94,6 +100,8 @@ const PERSONAL_NATIVE = summary({
   name: "data-story",
   description: "Shape analysis into a narrative.",
   origin: "personal",
+  ownership: "local",
+  agentName: null,
   displayPath: "~/.claude/skills/data-story",
 });
 const PERSONAL_OTHER = summary({
@@ -101,7 +109,18 @@ const PERSONAL_OTHER = summary({
   name: "migrate",
   description: "Plan and execute a migration.",
   origin: "personal",
+  ownership: "local",
+  agentName: null,
   displayPath: "~/.codex/skills/migrate",
+});
+const AGENT_BUNDLED = summary({
+  id: "bundle:polly:cross-review",
+  name: "cross-review",
+  description: "Cross-review with peers.",
+  origin: "built_in",
+  ownership: "agent",
+  agentName: "polly",
+  displayPath: "Included with agent",
 });
 
 function renderPage() {
@@ -226,32 +245,83 @@ describe("SkillsPage", () => {
     expect(skillsApi.getSkillCatalog).toHaveBeenCalledWith("sess_active", true);
   });
 
-  it("renders a flat, harness-neutral list with NO source/scope section headings", async () => {
+  it("groups by OWNERSHIP (Omnigent/Agent/Local), never by vendor/source path", async () => {
     vi.mocked(skillsApi.getSkillCatalog).mockResolvedValue({
-      skills: [BUILTIN, WORKSPACE, PERSONAL_NATIVE],
-      includeOtherTools: false,
-      hiddenCount: 1,
+      skills: [BUILTIN, AGENT_BUNDLED, WORKSPACE, PERSONAL_NATIVE],
+      includeOtherTools: true,
+      hiddenCount: 0,
     } satisfies SkillCatalog);
 
     renderPage();
 
-    // Every skill appears in one flat list.
+    // Every skill appears.
     expect(await screen.findByTestId("skill-row-ship")).toBeInTheDocument();
+    expect(screen.getByTestId("skill-row-cross-review")).toBeInTheDocument();
     expect(screen.getByTestId("skill-row-test-generator")).toBeInTheDocument();
     expect(screen.getByTestId("skill-row-data-story")).toBeInTheDocument();
 
-    // No source-root / scope section headings anywhere.
-    expect(screen.queryByTestId(/^skills-group-/)).toBeNull();
+    // Ownership sections render (Omnigent + Agent + Local present here).
+    expect(screen.getByTestId("skills-section-omnigent")).toBeInTheDocument();
+    expect(screen.getByTestId("skills-section-agent")).toBeInTheDocument();
+    expect(screen.getByTestId("skills-section-local")).toBeInTheDocument();
+
+    // No vendor / source-path / origin-scope headings.
     const list = screen.getByTestId("skills-list");
     expect(within(list).queryByText("Workspace")).toBeNull();
     expect(within(list).queryByText("Personal")).toBeNull();
     expect(within(list).queryByText(".claude/skills")).toBeNull();
-    expect(within(list).queryByText("Included with agent")).toBeNull();
+    expect(within(list).queryByText(/Claude Code|Codex|Cursor/)).toBeNull();
 
     // First skill auto-selected → detail shows its heading.
     const detailPane = await screen.findByTestId("skill-detail");
     expect(detailPane).toHaveAttribute("data-skill-id", "bundle:ship");
     expect(within(detailPane).getByRole("heading", { name: "/ship" })).toBeInTheDocument();
+  });
+
+  it("orders sections Omnigent → Agent → Local and shows the agent name", async () => {
+    vi.mocked(skillsApi.getSkillCatalog).mockResolvedValue({
+      skills: [WORKSPACE, AGENT_BUNDLED, BUILTIN],
+      includeOtherTools: true,
+      hiddenCount: 0,
+    } satisfies SkillCatalog);
+
+    renderPage();
+    await screen.findByTestId("skill-row-ship");
+
+    const sections = screen
+      .getAllByTestId(/^skills-section-/)
+      .map((el) => el.getAttribute("data-testid"));
+    expect(sections).toEqual([
+      "skills-section-omnigent",
+      "skills-section-agent",
+      "skills-section-local",
+    ]);
+    // Agent heading carries the bound agent's name.
+    expect(
+      within(screen.getByTestId("skills-section-agent")).getByText("Agent · polly"),
+    ).toBeInTheDocument();
+    expect(
+      within(screen.getByTestId("skills-section-omnigent")).getByText("Omnigent"),
+    ).toBeInTheDocument();
+    expect(
+      within(screen.getByTestId("skills-section-local")).getByText("Local"),
+    ).toBeInTheDocument();
+  });
+
+  it("hides empty ownership sections", async () => {
+    // Only local skills → no Omnigent / Agent sections.
+    vi.mocked(skillsApi.getSkillCatalog).mockResolvedValue({
+      skills: [WORKSPACE, PERSONAL_NATIVE],
+      includeOtherTools: true,
+      hiddenCount: 0,
+    } satisfies SkillCatalog);
+
+    renderPage();
+    await screen.findByTestId("skill-row-test-generator");
+
+    expect(screen.getByTestId("skills-section-local")).toBeInTheDocument();
+    expect(screen.queryByTestId("skills-section-omnigent")).toBeNull();
+    expect(screen.queryByTestId("skills-section-agent")).toBeNull();
   });
 
   it("offers dynamic source-filter options (distinct roots + All sources)", async () => {

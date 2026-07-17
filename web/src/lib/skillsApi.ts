@@ -38,8 +38,18 @@
 import { authenticatedFetch } from "./identity";
 import { ApiError } from "./sessionsApi";
 
-/** The three user-facing origin groups. Never a harness/vendor name. */
+/** Internal scope kept for precedence only — NOT a user-facing category. */
 export type SkillOrigin = "built_in" | "workspace" | "personal";
+
+/**
+ * Harness-neutral OWNERSHIP category — the user-facing grouping:
+ *   - `omnigent` : universal, platform-owned skills shipped by Omnigent.
+ *   - `agent`    : bundled by a specific agent spec (carries `agentName`).
+ *   - `local`    : discovered from a local provider / generic / plugin dir.
+ * This is provenance about ownership, deliberately distinct from the vendor
+ * (claude/codex/…) and the source path.
+ */
+export type SkillOwnership = "omnigent" | "agent" | "local";
 
 /** Discovery provider — provenance only, shown under Advanced details. */
 export type SkillDiscoveryProvider = "omnigent" | "claude" | "codex" | "cursor" | string;
@@ -54,6 +64,13 @@ interface SkillSummaryWire {
   name: string;
   description: string;
   origin: SkillOrigin;
+  /**
+   * First-class, harness-neutral ownership category — what the catalog groups
+   * by (Omnigent / Agent / Local). Never derived from a path in the UI.
+   */
+  ownership: SkillOwnership;
+  /** The owning agent's name — present only when `ownership === "agent"`. */
+  agent_name: string | null;
   /**
    * Concise, root-anchored source path — the user-facing provenance
    * (`.claude/skills/foo`, `~/.codex/skills/foo`, `Included with agent`).
@@ -130,6 +147,13 @@ export interface SkillSummary {
    * provenance — the user-facing source is `displayPath`.
    */
   origin: SkillOrigin;
+  /**
+   * Harness-neutral ownership category — the section the catalog groups this
+   * skill under (Omnigent / Agent / Local). First-class from the backend.
+   */
+  ownership: SkillOwnership;
+  /** The owning agent's name — present only when `ownership === "agent"`. */
+  agentName: string | null;
   /**
    * The user-facing source of truth: a concise, root-anchored path such as
    * `.claude/skills/foo`, `~/.codex/skills/foo`, or the literal
@@ -269,6 +293,23 @@ export function catalogSourceRoots(skills: SkillSummary[]): string[] {
   return [...roots].sort((a, b) => sourceRootRank(a) - sourceRootRank(b) || a.localeCompare(b));
 }
 
+// ── Ownership category helpers (the top-level grouping) ───────────────────────
+
+/** The fixed display order of the ownership sections. */
+export const OWNERSHIP_ORDER: readonly SkillOwnership[] = ["omnigent", "agent", "local"];
+
+/** Section heading for an ownership category (the Agent heading adds the name). */
+export function ownershipLabel(ownership: SkillOwnership, agentName?: string | null): string {
+  switch (ownership) {
+    case "omnigent":
+      return "Omnigent";
+    case "agent":
+      return agentName ? `Agent · ${agentName}` : "Agent";
+    case "local":
+      return "Local";
+  }
+}
+
 // ── Wire → browser projection ────────────────────────────────────────────────
 
 function toSummary(w: SkillSummaryWire): SkillSummary {
@@ -277,6 +318,8 @@ function toSummary(w: SkillSummaryWire): SkillSummary {
     name: w.name,
     description: w.description,
     origin: w.origin,
+    ownership: w.ownership,
+    agentName: w.agent_name ?? null,
     displayPath: w.display_path,
     enabled: w.enabled,
     available: w.available,

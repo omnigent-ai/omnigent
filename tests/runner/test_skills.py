@@ -605,6 +605,14 @@ async def test_catalog_uses_runner_session_context_and_includes_bundle(
     assert by_name["built-in"]["display_path"] == "Included with agent"
     assert by_name["workspace-claude"]["display_path"] == ".claude/skills/workspace-claude"
     assert by_name["claude-only"]["display_path"] == "~/.claude/skills/claude-only"
+    # First-class ownership: an ordinary bundled skill is agent-owned (this stub
+    # spec has no name, so agent_name is None); host-discovered skills are local.
+    # Neither is the universal platform skill, so none is "omnigent" here.
+    assert by_name["built-in"]["ownership"] == "agent"
+    assert by_name["workspace-claude"]["ownership"] == "local"
+    assert by_name["claude-only"]["ownership"] == "local"
+    assert by_name["built-in"]["agent_name"] is None
+    assert by_name["claude-only"]["agent_name"] is None
     assert payload["include_other_tools"] is False
     assert payload["hidden_count"] == 1
 

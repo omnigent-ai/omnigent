@@ -16,12 +16,37 @@ from omnigent.spec.types import SkillSpec
 LocationScope = Literal["bundle", "workspace", "personal"]
 SkillTrust = Literal["current", "all-host"]
 
+# Harness-neutral OWNERSHIP of a skill — the user-facing category. This is
+# provenance about *who owns* the skill, deliberately distinct from the
+# vendor/provider (claude/codex/…) or the source path:
+#   - "omnigent" : universal, platform-owned, shipped by Omnigent and available
+#                  across agents (e.g. the auto-injected ``build-omnigent``).
+#   - "agent"    : bundled by a specific agent spec (carries ``agent_name``).
+#   - "local"    : discovered from a local provider / generic / plugin dir.
+Ownership = Literal["omnigent", "agent", "local"]
+
 _LOCATION_RANK: dict[LocationScope, int] = {
     "bundle": 0,
     "workspace": 1,
     "personal": 2,
 }
 _SOURCE_KIND_RANK = {"bundled": 0, "generic": 1, "vendor": 2, "plugin": 3}
+
+# The canonical on-disk home of Omnigent's universal, platform-owned skills.
+# The universal ``build-omnigent`` skill is injected into an agent bundle by
+# symlinking it out of this package dir (see runner ``_ensure_orchestrator_
+# skills_in_bundle``), and in a source checkout it is discovered directly here.
+# Either way its RESOLVED path lives under this dir, so a resolved-path check is
+# a reliable platform marker — not a fragile name match.
+_PLATFORM_SKILLS_DIR = Path(__file__).resolve().parent.parent / "onboarding" / "agent" / "skills"
+
+
+def is_platform_skill_path(origin_path: Path) -> bool:
+    """Return True when a skill's resolved dir is an Omnigent platform skill."""
+    try:
+        return origin_path.resolve().is_relative_to(_PLATFORM_SKILLS_DIR)
+    except (OSError, ValueError):
+        return False
 
 
 @dataclass(frozen=True)
@@ -38,6 +63,11 @@ class SkillCandidate:
     managed: bool
     tree_digest: str
     skill: SkillSpec
+    # Harness-neutral ownership category + the owning agent's name (only for
+    # ``ownership == "agent"``). Defaulted so callers that don't classify still
+    # construct; the discovery sites in ``skill_sources`` set them explicitly.
+    ownership: Ownership = "local"
+    agent_name: str | None = None
 
     @property
     def precedence_key(self) -> tuple[int, int, str, str, str]:
