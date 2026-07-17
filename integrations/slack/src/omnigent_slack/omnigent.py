@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import random
@@ -11,9 +12,64 @@ from typing import Any
 
 import httpx
 
+# Pure event parsing, DTOs, and the base error live in ``events``; the client
+# and pool here build on them. Re-exported below so existing
+# ``from omnigent_slack.omnigent import extract_delta`` sites keep working.
+from omnigent_slack.events import (
+    ElicitationOption,
+    ElicitationQuestion,
+    ElicitationRequest,
+    OmnigentError,
+    OutputFile,
+    _extract_list,
+    _extract_runner_id,
+    _extract_session_id,
+    _host_id,
+    _is_host_online,
+    extract_assistant_text,
+    extract_delta,
+    extract_elicitation_request,
+    extract_error_text,
+    extract_output_file,
+    extract_policy_denied,
+    extract_todos,
+    is_soft_idle_event,
+    is_terminal_event,
+    iter_sse_events,
+)
 
-class OmnigentError(RuntimeError):
-    pass
+__all__ = [
+    "AuthRequiredError",
+    "AuthResolver",
+    "ClientAuth",
+    "ElicitationOption",
+    "ElicitationQuestion",
+    "ElicitationRequest",
+    "HostUnavailableError",
+    "OmnigentClient",
+    "OmnigentClientPool",
+    "OmnigentError",
+    "OutputFile",
+    "RunnerUnavailableError",
+    "ServerUnreachableError",
+    "ValidatedServer",
+    "extract_assistant_text",
+    "extract_delta",
+    "extract_elicitation_request",
+    "extract_error_text",
+    "extract_output_file",
+    "extract_policy_denied",
+    "extract_todos",
+    "is_soft_idle_event",
+    "is_terminal_event",
+    "iter_sse_events",
+]
+
+# Sentinels for the idle-grace disambiguation. ``_NO_RESUMPTION``: the grace
+# window elapsed and the snapshot confirms the turn is over. ``_RESUMED``: the
+# stream produced another event (or ended), so the turn continues.
+_NO_RESUMPTION = object()
+_RESUMED = object()
 
 
 class RunnerUnavailableError(OmnigentError):
@@ -190,6 +246,46 @@ class OmnigentClient:
         await _raise_for_status(response)
         self._logger.debug("Submitted Omnigent message session_id=%s", session_id)
 
+    async def resolve_elicitation(
+        self,
+        session_id: str,
+        elicitation_id: str,
+        *,
+        accepted: bool,
+        content: dict[str, Any] | None = None,
+    ) -> None:
+        """Deliver a verdict for a parked elicitation.
+
+        ``accepted`` picks the MCP action (``accept``/``decline``). ``content``
+        carries form answers for a form-mode elicitation (e.g. AskUserQuestion's
+        ``{question: selected_label}`` map, which the server forwards to the
+        agent as the tool result) — omitted for a binary approve/deny.
+
+        Posts to the dedicated resolve endpoint (the id rides in the URL). The
+        server returns 202 on delivery and 404/409 when the elicitation is
+        already gone (cancel race / already resolved) — all benign, so only an
+        unexpected status is surfaced.
+        """
+        self._logger.info(
+            "Resolving Omnigent elicitation session_id=%s elicitation_id=%s accepted=%s "
+            "has_content=%s",
+            session_id,
+            elicitation_id,
+            accepted,
+            content is not None,
+        )
+        body: dict[str, Any] = {"action": "accept" if accepted else "decline"}
+        if content:
+            body["content"] = content
+        response = await self._request(
+            "POST",
+            f"/v1/sessions/{session_id}/elicitations/{elicitation_id}/resolve",
+            json=body,
+        )
+        if response.status_code in (200, 202, 404, 409):
+            return
+        await _raise_for_status(response)
+
     async def launch_runner(
         self,
         session_id: str,
@@ -351,9 +447,14 @@ class OmnigentClient:
         *,
         workspace: str | None = None,
         host_id: str | None = None,
+        idle_grace_seconds: float = 600.0,
+        idle_poll_seconds: float = 5.0,
+        idle_settle_seconds: float = 2.0,
     ) -> AsyncIterator[dict[str, Any]]:
         try:
-            async for event in self._run_turn_once(session_id, text):
+            async for event in self._run_turn_once(
+                session_id, text, idle_grace_seconds, idle_poll_seconds, idle_settle_seconds
+            ):
                 yield event
             return
         except RunnerUnavailableError:
@@ -366,26 +467,170 @@ class OmnigentClient:
             )
             await self.launch_runner(session_id, workspace=workspace, host_id=host_id)
 
-        async for event in self._run_turn_once(session_id, text):
+        async for event in self._run_turn_once(
+            session_id, text, idle_grace_seconds, idle_poll_seconds, idle_settle_seconds
+        ):
             yield event
 
-    async def _run_turn_once(self, session_id: str, text: str) -> AsyncIterator[dict[str, Any]]:
+    async def _run_turn_once(
+        self,
+        session_id: str,
+        text: str,
+        idle_grace_seconds: float,
+        idle_poll_seconds: float,
+        idle_settle_seconds: float,
+    ) -> AsyncIterator[dict[str, Any]]:
         async with self.stream_session_events(session_id) as events:
             await self.submit_message(session_id, text)
-            async for event in events:
-                self._logger.debug(
-                    "Received Omnigent event session_id=%s type=%s",
-                    session_id,
-                    event.get("type"),
-                )
-                yield event
-                if is_terminal_event(event):
-                    self._logger.info(
-                        "Omnigent turn reached terminal event session_id=%s type=%s",
+            iterator = events.__aiter__()
+            # A single in-flight "next event" task, reused across idle grace
+            # windows. Timing it out must NOT cancel the underlying __anext__
+            # (that would terminate the async generator), so we keep the task
+            # alive with asyncio.wait and only await it again next window.
+            pending: asyncio.Task[dict[str, Any]] | None = None
+            awaiting_resumption = False
+            try:
+                while True:
+                    if pending is None:
+                        pending = asyncio.ensure_future(iterator.__anext__())
+
+                    if awaiting_resumption:
+                        # Previous event was a soft `idle`. Disambiguate park vs
+                        # end without cancelling the in-flight read (that would
+                        # kill the generator): time out the wait, and on a quiet
+                        # window consult the rolled-up snapshot — while a
+                        # sub-agent child is still running the parent reads
+                        # `running`, so keep waiting (a slow child can outlast
+                        # the grace window).
+                        resumed = await self._await_within_grace(
+                            pending,
+                            session_id,
+                            idle_grace_seconds,
+                            idle_poll_seconds,
+                            idle_settle_seconds,
+                        )
+                        if resumed is _NO_RESUMPTION:
+                            pending.cancel()
+                            self._logger.info(
+                                "Omnigent turn settled idle with no resumption session_id=%s",
+                                session_id,
+                            )
+                            break
+                        awaiting_resumption = False
+
+                    try:
+                        event = await pending
+                    except StopAsyncIteration:
+                        break
+                    pending = None
+
+                    self._logger.debug(
+                        "Received Omnigent event session_id=%s type=%s",
                         session_id,
                         event.get("type"),
                     )
-                    break
+                    yield event
+
+                    if is_soft_idle_event(event):
+                        awaiting_resumption = True
+                        continue
+                    if is_terminal_event(event):
+                        self._logger.info(
+                            "Omnigent turn reached terminal event session_id=%s type=%s",
+                            session_id,
+                            event.get("type"),
+                        )
+                        break
+            finally:
+                # Cancel and AWAIT the in-flight read so the underlying httpx
+                # stream isn't still running when the context manager closes it
+                # (aclose on a mid-flight async generator raises "already
+                # running"). Swallow the cancellation/stop that surfaces here.
+                if pending is not None:
+                    pending.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await pending
+
+    async def _await_within_grace(
+        self,
+        pending: asyncio.Task[dict[str, Any]],
+        session_id: str,
+        grace_seconds: float,
+        poll_seconds: float,
+        settle_seconds: float,
+    ) -> object:
+        """After a soft ``idle``, wait for the stream to resume or confirm it ended.
+
+        Waits on the in-flight read WITHOUT cancelling it (``asyncio.wait``
+        leaves the task pending, so the async generator survives to be awaited
+        again). Returns ``_RESUMED`` when the stream produced another event (or
+        ended — the caller's ``await`` then surfaces ``StopAsyncIteration``), or
+        ``_NO_RESUMPTION`` once the turn is genuinely over.
+
+        Two timescales, because ``idle`` is doubly ambiguous:
+
+        1. **Settle wait** (``settle_seconds``, short): a claude-native turn
+           oscillates ``running``/``idle`` *while still streaming* its answer,
+           with sub-second gaps between bursts. So EVERY idle first waits a short
+           settle window for the next burst — ending here would truncate the
+           reply mid-answer. Bounded and small so a genuinely-final idle adds
+           only a brief tail.
+        2. **Snapshot + poll** (``poll_seconds``, coarse): if still quiet after
+           the settle, consult the rolled-up status. A fan-out orchestrator
+           parked between wake cycles reads ``running`` (a sub-agent is working),
+           so keep polling — a slow child can take many seconds. Only when the
+           snapshot is no longer ``running`` is the turn over.
+
+        ``grace_seconds`` caps the total wait so a stuck session can't park the
+        turn forever.
+        """
+        deadline = asyncio.get_running_loop().time() + grace_seconds
+        while True:
+            # Settle: wait briefly for the next streaming burst. Handles the
+            # mid-answer running/idle oscillation without truncating.
+            done, _ = await asyncio.wait({pending}, timeout=settle_seconds)
+            if done:
+                return _RESUMED
+            # Still quiet — is the session genuinely done, or a fan-out parent
+            # waiting on a sub-agent (rolled-up status still `running`)?
+            status = await self.get_session_status(session_id)
+            if status != "running":
+                return _NO_RESUMPTION
+            if asyncio.get_running_loop().time() >= deadline:
+                self._logger.info(
+                    "Idle grace cap (%ss) elapsed while still running session_id=%s; "
+                    "ending turn to avoid parking forever",
+                    grace_seconds,
+                    session_id,
+                )
+                return _NO_RESUMPTION
+            # Fan-out parent still working — wait a coarser poll for resumption.
+            done, _ = await asyncio.wait({pending}, timeout=poll_seconds)
+            if done:
+                return _RESUMED
+            self._logger.debug(
+                "Idle poll quiet but session still running (sub-agent "
+                "outstanding) session_id=%s; continuing to wait",
+                session_id,
+            )
+
+    async def get_session_status(self, session_id: str) -> str | None:
+        """Fetch the session's rolled-up status from the snapshot.
+
+        The snapshot's ``status`` rolls direct sub-agent child activity into the
+        parent: a fan-out orchestrator parked between wake cycles reads
+        ``running`` here (a child is still working) even though its own runner
+        emitted ``idle`` on the stream. That makes this the authoritative "is the
+        turn really over?" check when a stream ``idle`` is ambiguous. Best-effort
+        — returns ``None`` on any failure so the caller falls back to the timer.
+        """
+        try:
+            response = await self._request("GET", f"/v1/sessions/{session_id}")
+            await _raise_for_status(response)
+            status = response.json().get("status")
+            return status if isinstance(status, str) else None
+        except OmnigentError:
+            return None
 
     async def latest_assistant_text(self, session_id: str) -> str | None:
         self._logger.debug("Fetching latest Omnigent assistant item session_id=%s", session_id)
@@ -486,200 +731,6 @@ class OmnigentClientPool:
             self._clients.clear()
         for client in clients:
             await client.aclose()
-
-
-async def iter_sse_events(lines: AsyncIterator[str]) -> AsyncIterator[dict[str, Any]]:
-    event_name: str | None = None
-    data_lines: list[str] = []
-
-    async for raw_line in lines:
-        line = raw_line.rstrip("\r")
-        if line == "":
-            event = _decode_sse_event(event_name, data_lines)
-            event_name = None
-            data_lines = []
-            if event is None:
-                continue
-            if event == "[DONE]":
-                break
-            if isinstance(event, str):
-                continue
-            yield event
-            continue
-
-        if line.startswith(":"):
-            continue
-
-        field, separator, value = line.partition(":")
-        if separator and value.startswith(" "):
-            value = value[1:]
-        if field == "event":
-            event_name = value
-        elif field == "data":
-            data_lines.append(value)
-
-    event = _decode_sse_event(event_name, data_lines)
-    if isinstance(event, dict):
-        yield event
-
-
-def is_terminal_event(event: dict[str, Any]) -> bool:
-    # A turn ends at the SESSION level, not the response level. Orchestrator
-    # agents emit a `response.completed`/`turn.completed` every time they end a
-    # turn to wait on a background sub-agent, then resume with more responses in
-    # the same turn — so treating those as terminal cuts the stream off at the
-    # first sub-agent dispatch. `session.status` is the authoritative signal:
-    # `running` -> `waiting` (parked on async work) -> `running` -> `idle`, and
-    # only `idle`/`failed` mean the turn is truly over.
-    event_type = str(event.get("type"))
-    if event_type == "session.status":
-        return str(event.get("status")) in {"idle", "failed"}
-    # Explicit turn/response failure and cancellation still end the turn; keep
-    # them as a fallback in case the session settles without an `idle` edge.
-    return event_type in {
-        "response.failed",
-        "response.cancelled",
-        "turn.failed",
-        "turn.cancelled",
-    }
-
-
-def extract_delta(event: dict[str, Any]) -> str | None:
-    if event.get("type") != "response.output_text.delta":
-        return None
-    delta = event.get("delta")
-    return delta if isinstance(delta, str) else None
-
-
-def extract_error_text(event: dict[str, Any]) -> str | None:
-    event_type = str(event.get("type"))
-    if event_type == "response.error":
-        error = event.get("error")
-        if isinstance(error, dict):
-            message = error.get("message")
-            if isinstance(message, str):
-                return message
-        message = event.get("message")
-        if isinstance(message, str):
-            return message
-    if event_type in {"response.failed", "turn.failed"}:
-        response = event.get("response")
-        if isinstance(response, dict):
-            last_error = response.get("error") or response.get("last_error")
-            if isinstance(last_error, dict):
-                message = last_error.get("message")
-                if isinstance(message, str):
-                    return message
-        error = event.get("error")
-        if isinstance(error, dict):
-            message = error.get("message")
-            if isinstance(message, str):
-                return message
-        if isinstance(error, str):
-            return error
-    return None
-
-
-def extract_assistant_text(event_or_item: dict[str, Any]) -> str | None:
-    if event_or_item.get("type") == "response.output_item.done":
-        item = event_or_item.get("item")
-        return extract_assistant_text(item) if isinstance(item, dict) else None
-
-    item_type = event_or_item.get("type")
-    if item_type != "message":
-        return None
-
-    data = event_or_item.get("data")
-    message = data if isinstance(data, dict) else event_or_item
-    if message.get("role") != "assistant":
-        return None
-
-    content = message.get("content")
-    if not isinstance(content, list):
-        return None
-
-    parts: list[str] = []
-    for block in content:
-        if not isinstance(block, dict):
-            continue
-        text = block.get("text")
-        if isinstance(text, str):
-            parts.append(text)
-    return "".join(parts).strip() or None
-
-
-def _decode_sse_event(
-    event_name: str | None, data_lines: list[str]
-) -> dict[str, Any] | str | None:
-    if not data_lines:
-        return None
-    data = "\n".join(data_lines)
-    if data == "[DONE]":
-        return data
-    try:
-        payload = json.loads(data)
-    except json.JSONDecodeError as exc:
-        raise OmnigentError(f"Invalid SSE JSON payload: {data}") from exc
-    if not isinstance(payload, dict):
-        return None
-    if event_name and "type" not in payload:
-        payload["type"] = event_name
-    return payload
-
-
-def _extract_session_id(payload: Any) -> str | None:
-    if isinstance(payload, dict):
-        for key in ("id", "session_id", "conversation_id"):
-            value = payload.get(key)
-            if isinstance(value, str):
-                return value
-        for key in ("session", "data"):
-            value = _extract_session_id(payload.get(key))
-            if value:
-                return value
-    return None
-
-
-def _extract_list(payload: Any, key: str) -> list[Any] | None:
-    if not isinstance(payload, dict):
-        return None
-    value = payload.get(key)
-    return value if isinstance(value, list) else None
-
-
-def _runner_id(runner: dict[str, Any]) -> str | None:
-    for key in ("id", "runner_id"):
-        value = runner.get(key)
-        if isinstance(value, str):
-            return value
-    return None
-
-
-def _extract_runner_id(payload: Any) -> str | None:
-    if isinstance(payload, dict):
-        value = _runner_id(payload)
-        if value:
-            return value
-        for key in ("runner", "data"):
-            value = _extract_runner_id(payload.get(key))
-            if value:
-                return value
-    return None
-
-
-def _host_id(host: dict[str, Any]) -> str | None:
-    for key in ("id", "host_id"):
-        value = host.get(key)
-        if isinstance(value, str):
-            return value
-    return None
-
-
-def _is_host_online(host: dict[str, Any]) -> bool:
-    if host.get("online") is True or host.get("host_online") is True:
-        return True
-    status = host.get("status")
-    return isinstance(status, str) and status.lower() == "online"
 
 
 async def _raise_for_status(response: httpx.Response) -> None:

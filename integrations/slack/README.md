@@ -218,7 +218,81 @@ message, the bot opens a fresh streaming reply in the same thread and keeps
 going, so a long answer arrives live across as many messages as it needs.
 Replies in that Slack thread continue the same Omnigent session. A channel
 thread belongs to whoever started it; a follow-up `@mention` from a different
-user is not added to that session.
+user is not added to that session — that user instead gets a private
+("Only visible to you") note explaining why, and pointing them to start their
+own thread.
+
+### Multi-agent turns
+
+`session.status: idle` is an ambiguous turn boundary, so at each idle the bot
+waits before deciding the turn is over — on two timescales:
+
+- **Settle (short, ~2s).** A single agent oscillates `running`/`idle` *while
+  still streaming* its answer, with sub-second gaps between bursts. Every idle
+  first waits a brief settle window for the next burst, so a reply is never
+  truncated mid-answer. A genuinely final idle adds only this small tail.
+- **Snapshot + poll (coarse).** If still quiet after the settle, the bot checks
+  the session's rolled-up status, which reads `running` while any sub-agent
+  child is still working (a fan-out orchestrator like `debby` parked between
+  wake cycles). While running it polls (every 5s, up to a 10-minute cap) so a
+  slow sub-agent keeps the turn alive; otherwise the turn ends.
+
+While the agent works before the first tokens arrive, the thread shows a
+"Working on it…" placeholder. It's removed only once the reply is actually on
+screen — on the first streamed chunk, or after the finalizing flush for a
+buffered answer — so there's never an empty gap between the placeholder
+disappearing and the reply appearing.
+
+### Approvals & questions
+
+When the agent needs the user — a tool-call approval, or a multiple-choice
+question — the turn pauses and the bot surfaces it in the thread. It renders
+the server's `response.elicitation_request` in one of three ways:
+
+- **Approval** (a gated tool call): an **Approve / Deny** card with a preview of
+  the pending action. Click to resume; deny (or let it sit past the wait
+  window) to refuse.
+- **Question** (Claude's `AskUserQuestion` and equivalents): the choices render
+  as radio buttons (or checkboxes for multi-select) with a **Submit** — the
+  selected labels are sent back to the agent as its answer, exactly like the
+  web UI.
+- **Anything else** (an out-of-band `url`-mode page, or a request for free-form
+  typed input the bot can't collect with buttons): the bot posts a link to
+  resolve the request in the Omnigent web UI, rather than mishandling it. The
+  turn stays alive (via the idle grace window) so it resumes once you answer
+  there.
+
+The card is updated in place with the outcome once answered, and the "Working
+on it…" placeholder is cleared while parked so it doesn't sit stale. Multiple
+requests in one turn are handled in order.
+
+This mirrors the web UI and CLI — the bot consumes `response.elicitation_request`
+and posts the verdict (with any selections as `content`) back to the session's
+resolve endpoint.
+
+**Ordering.** A streamed reply is a single Slack message anchored to the moment
+it opened, so text kept flowing into it would sort *before* any card or notice
+posted mid-turn — inverting cause and effect. The bot avoids this by *sealing*
+the current reply at each interruption (approval card, policy/file notice): the
+answer so far ends there, the out-of-band message sorts after it, and anything
+the agent says next opens a fresh reply below. So the thread reads in true
+order — reply, card, continued reply — even across several approvals in one turn.
+
+### Turn progress
+
+Beyond the streamed answer, the bot surfaces a few other signals when the
+harness emits them:
+
+- **Thinking** — while the agent reasons before producing output, the
+  placeholder switches to a "Thinking…" indicator so a long think isn't silent.
+- **Plan / todos** — a task list (from harnesses that report one, e.g. Claude
+  Code's `TodoWrite`) is posted once and edited in place as items progress.
+- **Blocked by policy** — when a tool call is hard-blocked by policy (a DENY,
+  with no approval offered), the bot posts why, so an absent action is
+  explained rather than silent.
+- **Produced files** — a note naming any file artifact the agent generated.
+
+All are best-effort and never interrupt the answer stream.
 
 ## Development
 

@@ -3,6 +3,7 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
+from omnigent_slack.approvals import Verdict
 from omnigent_slack.models import ThreadKey, UserConfig
 from omnigent_slack.omnigent import (
     AuthRequiredError,
@@ -10,7 +11,7 @@ from omnigent_slack.omnigent import (
     OmnigentError,
     ServerUnreachableError,
 )
-from omnigent_slack.service import SlackOmnigentService
+from omnigent_slack.service import _ACK_TEXT, SlackOmnigentService
 from omnigent_slack.store import SQLiteStore
 from slack_sdk.errors import SlackApiError
 from slack_sdk.web.async_slack_response import AsyncSlackResponse
@@ -41,6 +42,10 @@ class FakeStream:
         self.appended: list[str] = []
         self.stopped = False
         self.stop_text: str | None = None
+        # Monotonic rank of when this stream's message opened, relative to other
+        # posts/streams on the same client. Slack orders by the timestamp fixed
+        # at open time, so this models a segment's position in the thread.
+        self.open_order = client._tick()
         self._close_after = close_after
         self.closed = False
         # Whether the placeholder ack was still live the moment this stream first
@@ -108,26 +113,48 @@ class FakeSlackClient:
         self.posts: list[dict[str, Any]] = []
         self.acks: list[dict[str, Any]] = []
         self.deleted_ts: list[str] = []
+        self.updates: list[dict[str, Any]] = []
+        # Ephemeral ("Only visible to you") notices — private, not durable posts.
+        self.ephemerals: list[dict[str, Any]] = []
         self.streams: list[FakeStream] = []
         self._next_ts = 0
+        self._order = 0
         # When set, every stream this client opens auto-closes after this many
         # appended deltas — simulating Slack finalizing the message mid-turn.
         self.stream_close_after: int | None = None
 
+    def _tick(self) -> int:
+        # Monotonic rank stamped on each post/stream-open so tests can assert
+        # the thread's chronological order (Slack sorts by creation timestamp).
+        self._order += 1
+        return self._order
+
     async def chat_postMessage(self, **kwargs: Any) -> dict[str, Any]:
         self._next_ts += 1
         ts = f"bot-{self._next_ts}"
-        entry = {**kwargs, "ts": ts}
+        entry = {**kwargs, "ts": ts, "order": self._tick()}
         self.posts.append(entry)
-        if kwargs.get("text") == "_Working on it…_":
+        if kwargs.get("text") == _ACK_TEXT:
             self.acks.append(entry)
         return {"ok": True, "ts": ts}
+
+    async def chat_postEphemeral(self, **kwargs: Any) -> dict[str, Any]:
+        self.ephemerals.append({**kwargs})
+        return {"ok": True, "message_ts": "ephemeral"}
 
     async def chat_delete(self, **kwargs: Any) -> dict[str, Any]:
         ts = kwargs.get("ts")
         self.deleted_ts.append(str(ts))
         self.posts = [p for p in self.posts if p.get("ts") != ts]
         return {"ok": True}
+
+    async def chat_update(self, **kwargs: Any) -> dict[str, Any]:
+        ts = kwargs.get("ts")
+        self.updates.append({**kwargs})
+        for post in self.posts:
+            if post.get("ts") == ts:
+                post.update(kwargs)
+        return {"ok": True, "ts": ts}
 
     async def chat_stream(self, **kwargs: Any) -> FakeStream:
         # Only the first stream auto-closes (Slack finalizes the idle message);
@@ -154,8 +181,16 @@ class FakeOmnigentClient:
         self.bound: list[str] = []
         self.launched: list[tuple[str, str, str | None]] = []
         self.turns: list[tuple[str, str]] = []
+        self.resolved: list[tuple[str, str, bool]] = []
+        self.resolved_content: list[dict[str, Any] | None] = []
         self.next_session_id = "conv_1"
         self.final_text = final_text
+        # Rolled-up status the grace window polls at a soft idle; default idle so
+        # a turn ends promptly unless a test sets it to "running".
+        self.status = "idle"
+
+    async def get_session_status(self, session_id: str) -> str | None:
+        return self.status
 
     async def create_session(self, agent_id: str, title: str) -> str:
         self.created.append((agent_id, title))
@@ -191,6 +226,17 @@ class FakeOmnigentClient:
 
     async def latest_assistant_text(self, session_id: str) -> str | None:
         return None
+
+    async def resolve_elicitation(
+        self,
+        session_id: str,
+        elicitation_id: str,
+        *,
+        accepted: bool,
+        content: dict[str, Any] | None = None,
+    ) -> None:
+        self.resolved.append((session_id, elicitation_id, accepted))
+        self.resolved_content.append(content)
 
 
 class FakePool:
@@ -400,6 +446,64 @@ class StreamingClient(FakeOmnigentClient):
             },
         }
         yield {"type": "response.completed", "response": {"status": "completed"}}
+
+
+class NoDeltaIdleClient(FakeOmnigentClient):
+    """Mirrors a real claude-native short answer: NO text deltas — the answer
+    arrives only as a committed ``output_item.done`` — and the turn ends on
+    ``session.status: idle`` (not ``response.completed``), exercising the grace
+    window. The ack must stay live until the buffered answer is on screen.
+    """
+
+    async def run_turn(
+        self,
+        session_id: str,
+        text: str,
+        *,
+        workspace: str | None = None,
+        host_id: str | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        self.turns.append((session_id, text))
+        yield {"type": "session.status", "status": "running"}
+        yield {
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": self.final_text}],
+            },
+        }
+        yield {"type": "session.status", "status": "idle"}
+
+
+async def test_no_delta_idle_answer_keeps_ack_until_visible(tmp_path: Path) -> None:
+    # Regression guard for the real claude-native shape: no deltas, answer only
+    # in output_item.done, turn ends on session.status idle. The "Working on it…"
+    # placeholder must remain live until the buffered answer is delivered at
+    # stop() — never deleted early leaving the thread momentarily empty.
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    omnigent = NoDeltaIdleClient(final_text="Here is the answer.")
+    service, _pool, _setup = _service(store, omnigent)
+    # Snapshot idle so the grace window ends promptly.
+    omnigent.status = "idle"  # type: ignore[attr-defined]
+    await _configure_user(store, "T1", "U1")
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> hi"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    stream = await _wait_for_stream_stop(slack)
+    await service.shutdown()
+
+    assert stream.text == "Here is the answer."
+    # The ack was live when the answer became visible, and cleared afterward —
+    # so the thread never showed an empty gap.
+    assert stream.ack_live_when_visible is True
+    assert len(slack.acks) == 1
+    assert slack.acks[0]["ts"] in slack.deleted_ts
 
 
 async def test_long_answer_streams_in_full(tmp_path: Path) -> None:
@@ -843,7 +947,8 @@ async def test_unconfigured_user_is_prompted_and_no_turn_runs(tmp_path: Path) ->
 
 async def test_channel_followup_from_other_user_is_ignored(tmp_path: Path) -> None:
     # A thread's session belongs to its creator; a different user's @mention in
-    # that thread is not added to the session for now.
+    # that thread is not added to the session, but that user gets a private
+    # ("Only visible to you") note explaining why and how to get their own.
     store = await _store(tmp_path)
     key = ThreadKey(team_id="T1", channel_id="C1", thread_ts="100.1")
     await store.upsert_session(
@@ -872,7 +977,14 @@ async def test_channel_followup_from_other_user_is_ignored(tmp_path: Path) -> No
 
     assert omnigent.turns == []
     assert setup.prompted == []
+    # No durable post clutters the thread — the notice is ephemeral, aimed at U2.
     assert slack.posts == []
+    assert len(slack.ephemerals) == 1
+    notice = slack.ephemerals[0]
+    assert notice["user"] == "U2"
+    assert notice["channel"] == "C1"
+    assert notice["thread_ts"] == "100.1"
+    assert "start a new thread" in notice["text"].lower()
 
 
 async def test_turn_runs_against_the_fixed_operator_server(tmp_path: Path) -> None:
@@ -1033,3 +1145,503 @@ async def test_no_online_host_prompts_omni_host_command(tmp_path: Path) -> None:
     text = slack.posts[-1]["text"]
     assert "omni host --server http://omnigent.test" in text
     assert "/omnigent" in text
+
+
+# ── Tool-approval (elicitation) flow ─────────────────────────────────
+
+
+def _elicitation_event(
+    elicitation_id: str = "elicit_1",
+    message: str = "Agent wants to call Edit(). Approve?",
+    content_preview: str = '{"name": "Edit"}',
+) -> dict[str, Any]:
+    return {
+        "type": "response.elicitation_request",
+        "elicitation_id": elicitation_id,
+        "method": "elicitation/create",
+        "params": {
+            "mode": "form",
+            "message": message,
+            "policy_name": "require_approval",
+            "content_preview": content_preview,
+        },
+    }
+
+
+def _form_elicitation_event(elicitation_id: str = "elicit_form") -> dict[str, Any]:
+    return {
+        "type": "response.elicitation_request",
+        "elicitation_id": elicitation_id,
+        "method": "elicitation/create",
+        "params": {
+            "mode": "form",
+            "message": "Pick options",
+            "ask_user_question": {
+                "questions": [
+                    {
+                        "id": "store",
+                        "question": "Where to store?",
+                        "options": [{"label": "Redis"}, {"label": "Memory"}],
+                        "multiSelect": False,
+                    }
+                ]
+            },
+        },
+    }
+
+
+class ApprovalClient(FakeOmnigentClient):
+    """A turn that streams, parks on an elicitation, then streams a tail.
+
+    The generator yields the elicitation event and then blocks until the worker
+    resolves it (the worker awaits the verdict before pulling the next event).
+    This mirrors the server keeping the stream open across the park.
+    """
+
+    def __init__(
+        self, elicitation_id: str = "elicit_1", event: dict[str, Any] | None = None
+    ) -> None:
+        super().__init__(final_text="done")
+        self._elicitation_id = elicitation_id
+        self._event = event or _elicitation_event(elicitation_id)
+
+    async def run_turn(
+        self,
+        session_id: str,
+        text: str,
+        *,
+        workspace: str | None = None,
+        host_id: str | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        self.turns.append((session_id, text))
+        yield {"type": "response.output_text.delta", "delta": "work"}
+        yield self._event
+        # The worker resolves the elicitation before requesting more events;
+        # by the time control returns here the verdict has been delivered.
+        yield {"type": "response.output_text.delta", "delta": "ing"}
+        yield {"type": "session.status", "status": "idle"}
+
+
+class PreambleThenCommittedAnswerClient(FakeOmnigentClient):
+    """Mirrors the real AskUserQuestion shape: a preamble message (delta +
+    committed), the elicitation, then a post-answer message delivered ONLY as a
+    committed ``output_item.done`` (no deltas) — the deltas-race-behind-commit
+    case. Exercises the tail recovery across the seal boundary.
+    """
+
+    def __init__(self, event: dict[str, Any]) -> None:
+        super().__init__(final_text="")
+        self._event = event
+
+    async def run_turn(
+        self,
+        session_id: str,
+        text: str,
+        *,
+        workspace: str | None = None,
+        host_id: str | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        self.turns.append((session_id, text))
+        # Preamble: streamed as a delta AND committed as an item.
+        yield {"type": "response.output_text.delta", "delta": "Here's a demo."}
+        yield {
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Here's a demo."}],
+            },
+        }
+        yield self._event
+        # Post-answer message arrives ONLY as a committed item (no deltas) — the
+        # tail must be recovered and delivered, not dropped.
+        yield {
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "You picked A. Full summary here."}],
+            },
+        }
+        yield {"type": "session.status", "status": "idle"}
+
+
+async def _wait_for_card(client: FakeSlackClient) -> dict[str, Any]:
+    """Wait for the approval card (a post carrying an actions block)."""
+    for _ in range(100):
+        for post in client.posts:
+            blocks = post.get("blocks") or []
+            if any(b.get("type") == "actions" for b in blocks):
+                return post
+        await asyncio.sleep(0.02)
+    raise AssertionError("Timed out waiting for an approval card")
+
+
+def _card_elicitation_id(card: dict[str, Any]) -> str:
+    for block in card.get("blocks", []):
+        if block.get("type") == "actions":
+            _sid, eid = block["elements"][0]["value"].split(" ", 1)
+            return eid
+    raise AssertionError("Card has no actions block")
+
+
+async def _wait_for_resolved(omnigent: "FakeOmnigentClient", count: int = 1) -> None:
+    """Wait until the turn has forwarded ``count`` approval verdicts to the server.
+
+    The answer is now split across stream segments by an approval seal, so
+    "first stream stopped" no longer marks turn completion — wait on the
+    server-visible verdict instead.
+    """
+    for _ in range(100):
+        if len(omnigent.resolved) >= count:
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError(f"Timed out waiting for {count} resolved elicitation(s)")
+
+
+async def test_tool_approval_approve_resumes_turn(tmp_path: Path) -> None:
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    omnigent = ApprovalClient()
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1")
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> edit"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    card = await _wait_for_card(slack)
+    eid = _card_elicitation_id(card)
+    delivered = await service.handle_elicitation_action(
+        elicitation_id=eid, verdict=Verdict(accepted=True)
+    )
+    await _wait_for_resolved(omnigent)
+    await service.shutdown()
+
+    assert delivered is True
+    # Verdict forwarded to the server as accept, then the turn resumed.
+    assert omnigent.resolved == [("conv_1", "elicit_1", True)]
+    # The answer is split by the approval seal: "work" streamed before the card,
+    # "ing" after it — two separate stream segments in chronological order,
+    # with the card posted between them.
+    assert len(slack.streams) == 2
+    assert slack.streams[0].text == "work"
+    assert slack.streams[1].text == "ing"
+    # The card was updated in place to its outcome and lost its buttons.
+    assert slack.updates, "expected the card to be updated after resolution"
+    updated_blocks = slack.updates[-1]["blocks"]
+    assert not any(b.get("type") == "actions" for b in updated_blocks)
+    assert "Approved" in updated_blocks[0]["text"]["text"]
+
+
+async def test_tool_approval_deny_forwards_decline(tmp_path: Path) -> None:
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    omnigent = ApprovalClient()
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1")
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> edit"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    card = await _wait_for_card(slack)
+    eid = _card_elicitation_id(card)
+    await service.handle_elicitation_action(elicitation_id=eid, verdict=Verdict(accepted=False))
+    await _wait_for_resolved(omnigent)
+    await service.shutdown()
+
+    assert omnigent.resolved == [("conv_1", "elicit_1", False)]
+    assert "Denied" in slack.updates[-1]["blocks"][0]["text"]["text"]
+
+
+async def test_tool_approval_timeout_declines(tmp_path: Path) -> None:
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    omnigent = ApprovalClient()
+    # Zero timeout: no click arrives, so the worker gives up and declines.
+    service, _pool, _setup = _service(store, omnigent)
+    service.elicitations._timeout = 0.05  # type: ignore[attr-defined]
+    await _configure_user(store, "T1", "U1")
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> edit"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await _wait_for_resolved(omnigent)
+    await service.shutdown()
+
+    # Timed out → declined to the server so the parked turn doesn't hang.
+    assert omnigent.resolved == [("conv_1", "elicit_1", False)]
+    assert "Timed out" in slack.updates[-1]["blocks"][0]["text"]["text"]
+
+
+async def test_stale_approval_click_is_reported_as_not_delivered(tmp_path: Path) -> None:
+    store = await _store(tmp_path)
+    service, _pool, _setup = _service(store, FakeOmnigentClient())
+
+    # No turn is parked on this id, so the click finds no waiter.
+    delivered = await service.handle_elicitation_action(
+        elicitation_id="elicit_gone", verdict=Verdict(accepted=True)
+    )
+    await service.shutdown()
+    assert delivered is False
+
+
+async def test_form_elicitation_forwards_selections_as_content(tmp_path: Path) -> None:
+    # An AskUserQuestion (form) elicitation renders a selectable card; the
+    # submitted answers are forwarded to the server as `content`, not a bare
+    # accept — so the agent actually receives the user's choice.
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    omnigent = ApprovalClient(elicitation_id="elicit_form", event=_form_elicitation_event())
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1")
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> ask"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    card = await _wait_for_card(slack)
+    eid = _card_elicitation_id(card)
+    await service.handle_elicitation_action(
+        elicitation_id=eid, verdict=Verdict(accepted=True, content={"store": "Redis"})
+    )
+    await _wait_for_resolved(omnigent)
+    await service.shutdown()
+
+    assert omnigent.resolved == [("conv_1", "elicit_form", True)]
+    assert omnigent.resolved_content == [{"store": "Redis"}]
+    # Card outcome reads "Answered" for a form, not "Approved".
+    assert "Answered" in slack.updates[-1]["blocks"][0]["text"]["text"]
+
+
+def _url_elicitation_event(elicitation_id: str = "elicit_url") -> dict[str, Any]:
+    return {
+        "type": "response.elicitation_request",
+        "elicitation_id": elicitation_id,
+        "method": "elicitation/create",
+        "params": {"mode": "url", "message": "Sign in to continue", "url": "https://idp/authz"},
+    }
+
+
+async def test_unsupported_elicitation_links_to_web_ui(tmp_path: Path) -> None:
+    # A url-mode elicitation can't be rendered in Slack: the bot posts a link to
+    # resolve it in the Omnigent web UI and does NOT block or auto-resolve — the
+    # user completes it there and the stream resumes.
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    omnigent = ApprovalClient(elicitation_id="elicit_url", event=_url_elicitation_event())
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1")
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> login"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await _wait_for_turn_end(slack)
+    await service.shutdown()
+
+    # A link to the approve page was posted; no approval card, no auto-resolve.
+    links = [p for p in slack.posts if "/approve/conv_1/elicit_url" in str(p.get("text"))]
+    assert links, "expected a web-UI link for the unsupported elicitation"
+    assert "http://omnigent.test/approve/conv_1/elicit_url" in links[0]["text"]
+    assert omnigent.resolved == []
+    # No approval card (actions block) was posted.
+    assert not any(
+        any(b.get("type") == "actions" for b in (p.get("blocks") or [])) for p in slack.posts
+    )
+
+
+async def test_post_answer_message_only_committed_is_not_dropped(tmp_path: Path) -> None:
+    # Regression: after a form elicitation, the answer message arrived only as a
+    # committed output_item.done (no deltas). The seal must reset the per-segment
+    # streamed_text so the tail reconciliation delivers that post-answer text,
+    # rather than the pre-seal preamble polluting streamed_text and suppressing
+    # the recovery (which silently truncated the reply in the thread).
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    omnigent = PreambleThenCommittedAnswerClient(_form_elicitation_event())
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1")
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> demo"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    card = await _wait_for_card(slack)
+    eid = _card_elicitation_id(card)
+    await service.handle_elicitation_action(
+        elicitation_id=eid, verdict=Verdict(accepted=True, content={"store": "A"})
+    )
+    await _wait_for_resolved(omnigent)
+    await service.shutdown()
+
+    # The post-answer text was delivered (in the post-seal segment), not dropped.
+    assert any("You picked A. Full summary here." in s.text for s in slack.streams)
+
+
+async def test_elicitation_clears_working_placeholder(tmp_path: Path) -> None:
+    # Parking on an elicitation must drop the "Working on it…" ack so it doesn't
+    # sit stale above the card for the whole (possibly long) wait.
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    # No preamble text before the elicitation, so only the ack could be showing.
+    omnigent = ApprovalClient(elicitation_id="elicit_1")
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1")
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> edit"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    card = await _wait_for_card(slack)
+    # By the time the card is up, the ack has been deleted (not left dangling).
+    assert slack.acks, "expected an ack to have been posted"
+    assert all(a["ts"] in slack.deleted_ts for a in slack.acks)
+    eid = _card_elicitation_id(card)
+    await service.handle_elicitation_action(elicitation_id=eid, verdict=Verdict(accepted=True))
+    await _wait_for_resolved(omnigent)
+    await service.shutdown()
+
+
+# ── Stream enhancements: reasoning, policy-deny, files, todos ─────────
+
+
+class EventScriptClient(FakeOmnigentClient):
+    """Streams a fixed list of events, then settles idle.
+
+    Lets a test assert how the service surfaces reasoning / policy-deny /
+    output-file / todo events without a real server.
+    """
+
+    def __init__(self, events: list[dict[str, Any]]) -> None:
+        super().__init__(final_text="")
+        self._events = events
+
+    async def run_turn(
+        self,
+        session_id: str,
+        text: str,
+        *,
+        workspace: str | None = None,
+        host_id: str | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        self.turns.append((session_id, text))
+        for event in self._events:
+            yield event
+        yield {"type": "session.status", "status": "idle"}
+
+
+async def _wait_for_turn_end(slack: FakeSlackClient) -> None:
+    """Wait until the turn finished: its final stream segment is stopped.
+
+    An interruption seal splits the answer, so "any stream stopped" is not a
+    completion signal. The turn ends only once its last-opened segment stops
+    with no further append pending, which is stable once the loop settles.
+    """
+    for _ in range(100):
+        if slack.streams and all(s.stopped for s in slack.streams):
+            # Give the loop a beat to open a follow-on segment if more is coming.
+            await asyncio.sleep(0.02)
+            if slack.streams and all(s.stopped for s in slack.streams):
+                return
+        await asyncio.sleep(0.02)
+    raise AssertionError("Timed out waiting for the turn to end")
+
+
+async def _run_scripted_turn(tmp_path: Path, events: list[dict[str, Any]]) -> "FakeSlackClient":
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    service, _pool, _setup = _service(store, EventScriptClient(events))
+    await _configure_user(store, "T1", "U1")
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> go"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await _wait_for_turn_end(slack)
+    await service.shutdown()
+    return slack
+
+
+async def test_policy_denied_is_posted_as_reply(tmp_path: Path) -> None:
+    slack = await _run_scripted_turn(
+        tmp_path,
+        [
+            {"type": "response.output_text.delta", "delta": "ok"},
+            {"type": "response.policy_denied", "conversation_id": "conv_1", "reason": "No rm."},
+        ],
+    )
+    denials = [p for p in slack.posts if "Blocked by policy" in str(p.get("text"))]
+    assert denials and "No rm." in denials[0]["text"]
+
+
+async def test_output_file_is_posted_as_reply(tmp_path: Path) -> None:
+    slack = await _run_scripted_turn(
+        tmp_path,
+        [{"type": "response.output_file.done", "file_id": "file_1", "filename": "out.csv"}],
+    )
+    files = [p for p in slack.posts if "Produced a file" in str(p.get("text"))]
+    assert files and "out.csv" in files[0]["text"]
+
+
+async def test_todos_posted_once_then_updated_in_place(tmp_path: Path) -> None:
+    slack = await _run_scripted_turn(
+        tmp_path,
+        [
+            {
+                "type": "session.todos",
+                "conversation_id": "conv_1",
+                "todos": [{"content": "Step 1", "status": "in_progress", "activeForm": "Doing 1"}],
+            },
+            {
+                "type": "session.todos",
+                "conversation_id": "conv_1",
+                "todos": [{"content": "Step 1", "status": "completed", "activeForm": "Doing 1"}],
+            },
+        ],
+    )
+    plan_posts = [p for p in slack.posts if str(p.get("text", "")).startswith("*Plan*")]
+    plan_updates = [u for u in slack.updates if str(u.get("text", "")).startswith("*Plan*")]
+    # One message posted, then edited in place for the second update.
+    assert len(plan_posts) == 1
+    assert len(plan_updates) == 1
+    assert ":white_check_mark: Step 1" in plan_updates[-1]["text"]
+
+
+async def test_interruption_preserves_chronological_order(tmp_path: Path) -> None:
+    # Text before an out-of-band notice, the notice, then text after it must
+    # appear in that order in the thread. The bot seals the streaming segment at
+    # the notice so the answer doesn't stay anchored to its open-time timestamp
+    # and float above the notice it depends on.
+    slack = await _run_scripted_turn(
+        tmp_path,
+        [
+            {"type": "response.output_text.delta", "delta": "before"},
+            {"type": "response.policy_denied", "conversation_id": "conv_1", "reason": "No rm."},
+            {"type": "response.output_text.delta", "delta": "after"},
+        ],
+    )
+    # Two answer segments straddling the deny post.
+    assert len(slack.streams) == 2
+    assert slack.streams[0].text == "before"
+    assert slack.streams[1].text == "after"
+    deny = next(p for p in slack.posts if "Blocked by policy" in str(p.get("text")))
+    # Chronological: segment-1 opened, then the deny posted, then segment-2 opened.
+    assert slack.streams[0].open_order < deny["order"] < slack.streams[1].open_order
