@@ -80,6 +80,7 @@ import {
   AgentInfoButton,
   AgentInfoContent,
   agentDisplayLabel,
+  HOVER_CLICK_GRACE_MS,
   HOVER_CLOSE_DELAY_MS,
 } from "./AgentInfo";
 
@@ -295,14 +296,35 @@ describe("AgentInfoButton hover behavior", () => {
   it("a mouse hover that then clicks lands closed (no double-open)", () => {
     // Mouse users can hover (opens) then click the icon; the click must toggle
     // relative to the hover-open state, ending closed rather than reopening.
+    // A deliberate click dwells past the grace window (a real hover-then-click
+    // is tens of ms apart), so the toggle-shut is honored.
     renderButton(AGENT_WITH_BOTH);
     const trigger = screen.getByTestId("agent-info-trigger");
 
     mousePointerEnter(trigger);
     expect(screen.getByTestId("agent-info-panel")).toBeInTheDocument();
 
+    act(() => vi.advanceTimersByTime(HOVER_CLICK_GRACE_MS + 10));
     fireEvent.click(trigger);
     expect(screen.queryByTestId("agent-info-panel")).toBeNull();
+  });
+
+  it("a click within the grace window of hover-open keeps the panel open", () => {
+    // A mouse click's own pointer arrival hover-opens the panel, then the
+    // click's Radix toggle fires within the same gesture. If the hover-open has
+    // already committed open=true, that toggle asks to close — but both halves
+    // land within the grace window, so the close is swallowed and the panel
+    // stays open (the click-to-open path the popover e2e drives). Model that as
+    // a pointerenter immediately followed by a click, with no time advanced.
+    renderButton(AGENT_WITH_BOTH);
+    const trigger = screen.getByTestId("agent-info-trigger");
+
+    mousePointerEnter(trigger);
+    expect(screen.getByTestId("agent-info-panel")).toBeInTheDocument();
+
+    // No timers advanced: the click lands inside HOVER_CLICK_GRACE_MS.
+    fireEvent.click(trigger);
+    expect(screen.getByTestId("agent-info-panel")).toBeInTheDocument();
   });
 });
 

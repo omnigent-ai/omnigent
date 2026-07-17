@@ -1318,6 +1318,21 @@ export function AgentInfoContent({ agent, sessionId }: AgentInfoProps) {
 export const HOVER_CLOSE_DELAY_MS = 150;
 
 /**
+ * Grace window after a hover-open during which a Radix click-toggle to *closed*
+ * is treated as the opening half of a single click gesture, not a dismiss.
+ *
+ * A mouse `click()` first moves the pointer onto the icon — firing
+ * `pointerenter` → hover-open (`setOpen(true)`) — and then dispatches the click,
+ * whose Radix trigger toggles `open`. On a slow render the hover-open commits
+ * `open = true` before the click's toggle runs, so the toggle reads `true` and
+ * flips it back to `false`, and the panel never opens. Both halves of that one
+ * gesture land within a few milliseconds; a deliberate hover-then-click dismiss
+ * dwells far longer. Swallowing a close inside this window keeps click-to-open
+ * reliable without weakening the real click-to-dismiss (see AgentInfoButton).
+ */
+export const HOVER_CLICK_GRACE_MS = 30;
+
+/**
  * Header info icon revealing the active agent's tools & policies.
  *
  * Opens on mouse hover over the (i) icon and stays open while the pointer is on
@@ -1335,6 +1350,10 @@ export function AgentInfoButton({ agent, sessionId }: AgentInfoProps) {
   // scroll the page) while keeping it for click / keyboard access.
   const openedByHoverRef = useRef(false);
   const closeTimeoutRef = useRef<number | null>(null);
+  // Timestamp of the last hover-open, used to recognize the click that lands in
+  // the same gesture (pointer arrival + click) and would otherwise toggle the
+  // just-hover-opened panel straight back shut. See HOVER_CLICK_GRACE_MS.
+  const hoverOpenedAtRef = useRef(0);
 
   useEffect(() => {
     return () => {
@@ -1369,6 +1388,7 @@ export function AgentInfoButton({ agent, sessionId }: AgentInfoProps) {
     if (e.pointerType !== "mouse") return;
     cancelClose();
     openedByHoverRef.current = true;
+    hoverOpenedAtRef.current = performance.now();
     setOpen(true);
   }
 
@@ -1386,6 +1406,18 @@ export function AgentInfoButton({ agent, sessionId }: AgentInfoProps) {
     <Popover
       open={open}
       onOpenChange={(next) => {
+        // A mouse click's own pointer-arrival hover-opens the panel; if that
+        // open commits before the click's Radix toggle runs, the toggle sees
+        // open=true and asks to close within the same gesture. Swallow that
+        // close so click-to-open stays reliable (a real click-to-dismiss dwells
+        // far past the grace window). Only guards the hover-opened case.
+        if (
+          !next &&
+          openedByHoverRef.current &&
+          performance.now() - hoverOpenedAtRef.current < HOVER_CLICK_GRACE_MS
+        ) {
+          return;
+        }
         // Click / keyboard / outside-dismiss path: honor Radix immediately and
         // drop the hover flag so focus behaves normally.
         cancelClose();
