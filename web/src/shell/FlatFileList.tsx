@@ -103,7 +103,7 @@ function FileListItem({
           </span>
           {dir && <span className="truncate text-muted-foreground text-[11px]">{dir}</span>}
         </button>
-        {(file.lines_added !== null || file.lines_removed !== null) && (
+        {((file.lines_added ?? 0) !== 0 || (file.lines_removed ?? 0) !== 0) && (
           <span
             className="shrink-0 font-mono text-[10px]"
             aria-label={[

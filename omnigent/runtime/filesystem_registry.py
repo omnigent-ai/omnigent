@@ -945,10 +945,12 @@ class GitFilesystemRegistry(FilesystemRegistry):
     def _run_git_numstat(self) -> dict[str, tuple[int | None, int | None]]:
         """Return per-file line counts from ``git diff --numstat HEAD``.
 
-        ``--no-renames`` splits renames into delete+add so the paths line up
-        with ``git status``'s destination-only entries rather than an
-        ``old -> new`` pair. Binary files report ``-\\t-`` → ``(None, None)``.
-        Paths are keyed cwd-relative via :meth:`_git_to_rel`.
+        ``--no-renames`` splits a rename into two independent entries — a full
+        add on the destination path and a full delete on the old path — so the
+        paths line up with ``git status``'s destination-only entries rather than
+        an ``old -> new`` pair. (A pure rename therefore shows ``+N`` on the
+        moved file, not ``(None, None)``.) Binary files report ``-\\t-`` →
+        ``(None, None)``. Paths are keyed cwd-relative via :meth:`_git_to_rel`.
 
         Never raises: a numstat failure (timeout, spawn error, non-zero exit)
         returns ``{}`` so the changed-files list still renders with counts

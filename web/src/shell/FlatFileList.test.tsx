@@ -152,7 +152,7 @@ describe("FlatFileList line-change counter", () => {
     expect(screen.getByText("+0")).toBeInTheDocument();
   });
 
-  it("omits the counter entirely when both counts are null (binary/rename/unavailable)", () => {
+  it("omits the counter entirely when both counts are null (binary/untracked/unavailable)", () => {
     renderList({
       files: [
         {
@@ -163,6 +163,27 @@ describe("FlatFileList line-change counter", () => {
           modified_at: null,
           lines_added: null,
           lines_removed: null,
+        },
+      ],
+    });
+
+    expect(screen.queryByText(/^\+/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/^−/)).not.toBeInTheDocument();
+  });
+
+  it("omits the counter for a mode-only change (both counts 0)", () => {
+    // A chmod-only edit shows in numstat as 0/0; a "+0 −0" badge is noise, so
+    // suppress it while still rendering a real deletion's −N.
+    renderList({
+      files: [
+        {
+          path: "script.sh",
+          name: "script.sh",
+          status: "modified",
+          bytes: 512,
+          modified_at: null,
+          lines_added: 0,
+          lines_removed: 0,
         },
       ],
     });
