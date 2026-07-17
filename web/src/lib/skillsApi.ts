@@ -99,6 +99,25 @@ interface SkillTrustWire {
   include_other_tools: boolean;
 }
 
+interface SkillFileNodeWire {
+  path: string;
+  kind: "file" | "dir";
+  size: number | null;
+}
+
+interface SkillFileTreeWire {
+  object: "list";
+  data: SkillFileNodeWire[];
+}
+
+interface SkillFileContentWire {
+  path: string;
+  size: number;
+  is_text: boolean;
+  too_large: boolean;
+  text: string | null;
+}
+
 // ── Browser-facing shapes (camelCase) ────────────────────────────────────────
 
 /** A catalog row — the shape the master list renders. */
@@ -166,6 +185,27 @@ export interface SkillDetail extends SkillSummary {
    */
   overview: string | null;
   advanced: SkillAdvanced;
+}
+
+/** One node in a skill's resource tree (file or directory). */
+export interface SkillFileNode {
+  /** POSIX path relative to the skill root, e.g. `references/x.md`. */
+  path: string;
+  kind: "file" | "dir";
+  /** Byte size for files; `null` for directories. */
+  size: number | null;
+}
+
+/** A safely-read skill resource file for preview. */
+export interface SkillFileContent {
+  path: string;
+  size: number;
+  /** True when the bytes decode as UTF-8 text (previewable). */
+  isText: boolean;
+  /** True when the file exceeds the preview cap (download-only). */
+  tooLarge: boolean;
+  /** UTF-8 text, present only when `isText && !tooLarge`. */
+  text: string | null;
 }
 
 // ── Source-path helpers (client-derived) ──────────────────────────────────────
@@ -331,6 +371,57 @@ export async function getSkillDetail(
   const res = await authenticatedFetch(`/v1/skills/${encodeURIComponent(id)}?${params.toString()}`);
   const wire = await readJsonOrThrow<SkillDetailWire>(res);
   return toDetail(wire);
+}
+
+/**
+ * List a skill's on-disk resource tree (files + directories) in the same
+ * session + trust context as the catalog. Used to lazily populate the detail
+ * pane's Files browser. Any request failure propagates to the caller.
+ */
+export async function getSkillFileTree(
+  id: string,
+  sessionId: string,
+  includeOtherTools: boolean,
+): Promise<SkillFileNode[]> {
+  const params = new URLSearchParams({
+    session_id: sessionId,
+    include_other_tools: includeOtherTools ? "true" : "false",
+  });
+  const res = await authenticatedFetch(
+    `/v1/skills/${encodeURIComponent(id)}/files?${params.toString()}`,
+  );
+  const wire = await readJsonOrThrow<SkillFileTreeWire>(res);
+  return wire.data.map((n) => ({ path: n.path, kind: n.kind, size: n.size }));
+}
+
+/**
+ * Read one resource file from a skill's directory (safely, server-side). The
+ * backend caps size and reports binary/oversized files as metadata only, so
+ * `text` may be `null` even on success. Same session + trust context as the
+ * tree. A 400 (bad/traversal path) or 404 (missing) propagates as an ApiError.
+ */
+export async function getSkillFile(
+  id: string,
+  filePath: string,
+  sessionId: string,
+  includeOtherTools: boolean,
+): Promise<SkillFileContent> {
+  const params = new URLSearchParams({
+    session_id: sessionId,
+    include_other_tools: includeOtherTools ? "true" : "false",
+    path: filePath,
+  });
+  const res = await authenticatedFetch(
+    `/v1/skills/${encodeURIComponent(id)}/file?${params.toString()}`,
+  );
+  const wire = await readJsonOrThrow<SkillFileContentWire>(res);
+  return {
+    path: wire.path,
+    size: wire.size,
+    isText: wire.is_text,
+    tooLarge: wire.too_large,
+    text: wire.text,
+  };
 }
 
 /** Read the persisted include-other-tools trust setting. */

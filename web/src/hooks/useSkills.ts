@@ -24,10 +24,14 @@ import { useChatStore } from "@/store/chatStore";
 import {
   getSkillCatalog,
   getSkillDetail,
+  getSkillFile,
+  getSkillFileTree,
   getSkillTrust,
   setSkillTrust,
   type SkillCatalog,
   type SkillDetail,
+  type SkillFileContent,
+  type SkillFileNode,
 } from "@/lib/skillsApi";
 
 const SKILLS_KEY = ["skills"] as const;
@@ -46,6 +50,23 @@ export function skillDetailKey(
 
 export function skillTrustKey() {
   return [...SKILLS_KEY, "trust"] as const;
+}
+
+export function skillFilesKey(
+  id: string | null,
+  sessionId: string | null,
+  includeOtherTools: boolean,
+) {
+  return [...SKILLS_KEY, "files", sessionId, includeOtherTools, id] as const;
+}
+
+export function skillFileKey(
+  id: string | null,
+  sessionId: string | null,
+  includeOtherTools: boolean,
+  filePath: string | null,
+) {
+  return [...SKILLS_KEY, "file", sessionId, includeOtherTools, id, filePath] as const;
 }
 
 /**
@@ -96,6 +117,37 @@ export function useSkillDetail(
     enabled: id != null && sessionId != null,
     // Detail (instructions + provenance) is immutable for the life of a
     // catalog snapshot, so hold it for the session to keep selection instant.
+    staleTime: 5 * 60_000,
+  });
+}
+
+/** The selected skill's resource tree; idle until an id + session exist. */
+export function useSkillFileTree(
+  id: string | null,
+  sessionId: string | null,
+  includeOtherTools: boolean,
+) {
+  return useQuery<SkillFileNode[]>({
+    queryKey: skillFilesKey(id, sessionId, includeOtherTools),
+    queryFn: () => getSkillFileTree(id as string, sessionId as string, includeOtherTools),
+    enabled: id != null && sessionId != null,
+    // The tree is stable for the life of a catalog snapshot (same as detail).
+    staleTime: 5 * 60_000,
+  });
+}
+
+/** One resource file's content; idle until a file is picked. */
+export function useSkillFile(
+  id: string | null,
+  sessionId: string | null,
+  includeOtherTools: boolean,
+  filePath: string | null,
+) {
+  return useQuery<SkillFileContent>({
+    queryKey: skillFileKey(id, sessionId, includeOtherTools, filePath),
+    queryFn: () =>
+      getSkillFile(id as string, filePath as string, sessionId as string, includeOtherTools),
+    enabled: id != null && sessionId != null && filePath != null,
     staleTime: 5 * 60_000,
   });
 }

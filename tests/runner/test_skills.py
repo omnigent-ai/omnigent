@@ -647,6 +647,64 @@ async def test_catalog_include_other_tools_list_detail_visibility_matches(
 
 
 @pytest.mark.asyncio
+async def test_skill_files_lists_tree_and_reads_file_in_session_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The file endpoints browse the winner's dir in the list's session context."""
+    home = tmp_path / "runner-home"
+    skill_dir = home / ".claude" / "skills" / "with-files"
+    (skill_dir / "references").mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(_skill_md("with-files", "Has resources."))
+    (skill_dir / "references" / "guide.md").write_text("## guide body")
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    app = _make_app(bundle, [], "all", workspace=workspace, harness="claude-native")
+
+    async for c in _client(app):
+        listing = await c.get("/v1/sessions/conv_files/skills/catalog")
+        skill_id = next(
+            item["id"] for item in listing.json()["data"] if item["name"] == "with-files"
+        )
+        tree = await c.get(f"/v1/sessions/conv_files/skills/catalog/{skill_id}/files")
+        file_ok = await c.get(
+            f"/v1/sessions/conv_files/skills/catalog/{skill_id}/file",
+            params={"path": "references/guide.md"},
+        )
+        traversal = await c.get(
+            f"/v1/sessions/conv_files/skills/catalog/{skill_id}/file",
+            params={"path": "../../../etc/passwd"},
+        )
+        missing = await c.get(
+            f"/v1/sessions/conv_files/skills/catalog/{skill_id}/file",
+            params={"path": "references/nope.md"},
+        )
+        unknown = await c.get(
+            "/v1/sessions/conv_files/skills/catalog/does-not-exist/files",
+        )
+
+    assert tree.status_code == 200, tree.text
+    tree_paths = {(n["kind"], n["path"]) for n in tree.json()["data"]}
+    assert ("file", "SKILL.md") in tree_paths
+    assert ("dir", "references") in tree_paths
+    assert ("file", "references/guide.md") in tree_paths
+
+    assert file_ok.status_code == 200, file_ok.text
+    body = file_ok.json()
+    assert body["is_text"] is True and body["too_large"] is False
+    assert body["text"] == "## guide body"
+
+    # Traversal is refused (400); a missing file is 404; an unknown skill is 404.
+    assert traversal.status_code == 400
+    assert missing.status_code == 404
+    assert unknown.status_code == 404
+
+
+@pytest.mark.asyncio
 async def test_resolve_finds_a_surfaced_plugin_skill(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

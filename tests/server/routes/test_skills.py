@@ -62,6 +62,32 @@ class _RunnerClient:
                     "provenance": {"original_path": "/runner/home/.codex/skills/codex-only"},
                 },
             )
+        if path.endswith("/skills/catalog/codex-only%3Aabc/files"):
+            return _Response(
+                200,
+                {
+                    "object": "list",
+                    "data": [
+                        {"path": "SKILL.md", "kind": "file", "size": 12},
+                        {"path": "references", "kind": "dir", "size": None},
+                    ],
+                },
+            )
+        if path.endswith("/skills/catalog/codex-only%3Aabc/file"):
+            # A traversal path is refused by the runner with a 400; the proxy
+            # must preserve that status rather than masking it as a 500.
+            if (params or {}).get("path", "").startswith(".."):
+                return _Response(400, {"detail": "path traversal not allowed"})
+            return _Response(
+                200,
+                {
+                    "path": "SKILL.md",
+                    "size": 12,
+                    "is_text": True,
+                    "too_large": False,
+                    "text": "runner body",
+                },
+            )
         return _Response(404, {"detail": "Skill not found"})
 
 
@@ -144,6 +170,53 @@ def test_catalog_detail_uses_persisted_visibility_when_override_is_omitted() -> 
     assert runner_client.requests == [
         ("/v1/sessions/conv_remote/skills/catalog/codex-only%3Aabc", None)
     ]
+
+
+def test_skill_files_proxy_lists_tree_and_reads_file() -> None:
+    runner_client = _RunnerClient()
+    runner_router = _RunnerRouter(runner_client)
+    app = FastAPI()
+    app.include_router(
+        create_skills_router(object(), runner_router=runner_router),  # type: ignore[arg-type]
+        prefix="/v1",
+    )
+    client = TestClient(app)
+
+    tree = client.get(
+        "/v1/skills/codex-only:abc/files",
+        params={"session_id": "conv_remote", "include_other_tools": "true"},
+    )
+    assert tree.status_code == 200
+    assert {n["path"] for n in tree.json()["data"]} == {"SKILL.md", "references"}
+
+    file_resp = client.get(
+        "/v1/skills/codex-only:abc/file",
+        params={"session_id": "conv_remote", "path": "SKILL.md", "include_other_tools": "true"},
+    )
+    assert file_resp.status_code == 200
+    assert file_resp.json()["text"] == "runner body"
+    # The file read forwards the path param (plus the visibility flag) verbatim.
+    assert (
+        "/v1/sessions/conv_remote/skills/catalog/codex-only%3Aabc/file",
+        {"path": "SKILL.md", "include_other_tools": "true"},
+    ) in runner_client.requests
+
+
+def test_skill_file_proxy_preserves_runner_400_for_traversal() -> None:
+    runner_client = _RunnerClient()
+    app = FastAPI()
+    app.include_router(
+        create_skills_router(object(), runner_router=_RunnerRouter(runner_client)),  # type: ignore[arg-type]
+        prefix="/v1",
+    )
+    client = TestClient(app)
+
+    resp = client.get(
+        "/v1/skills/codex-only:abc/file",
+        params={"session_id": "conv_remote", "path": "../../etc/passwd"},
+    )
+    # A runner 400 (traversal refusal) must surface as a 400, not a masked 500.
+    assert resp.status_code == 400
 
 
 def test_trust_routes_remain_server_persisted(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]

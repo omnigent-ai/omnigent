@@ -41,6 +41,7 @@ def create_skills_router(
         path: str,
         *,
         include_other_tools: bool | None,
+        extra_params: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """Authorize and proxy one catalog request to the bound runner."""
         user_id = get_user_id(request, auth_provider)
@@ -63,11 +64,12 @@ def create_skills_router(
                 f"No runner is available for session {session_id!r}",
                 code=ErrorCode.RUNNER_UNAVAILABLE,
             )
-        params = (
-            None
-            if include_other_tools is None
-            else {"include_other_tools": str(include_other_tools).lower()}
-        )
+        merged: dict[str, str] = {} if extra_params is None else dict(extra_params)
+        if include_other_tools is not None:
+            merged["include_other_tools"] = str(include_other_tools).lower()
+        # Preserve the "no query string" contract (params=None) when there is
+        # nothing to send, so existing catalog/detail proxying is byte-identical.
+        params = merged or None
         try:
             response = await runner_client.get(path, params=params, timeout=10.0)
             payload = response.json()
@@ -83,6 +85,15 @@ def create_skills_router(
             )
         if response.status_code == 404:
             raise HTTPException(status_code=404, detail=payload.get("detail", "Skill not found"))
+        # Preserve the runner's client-error status (e.g. a 400 path-traversal
+        # refusal or a 413 oversized-file rejection from the file endpoints)
+        # rather than masking every non-200 as a 500 — the client needs the real
+        # reason to render the right non-preview / error state.
+        if 400 <= response.status_code < 500:
+            raise HTTPException(
+                status_code=response.status_code,
+                detail=payload.get("detail", "Skill request rejected"),
+            )
         if response.status_code != 200:
             raise OmnigentError(
                 f"Runner failed to resolve skills for session {session_id!r}: "
@@ -129,6 +140,43 @@ def create_skills_router(
             session_id,
             f"/v1/sessions/{quoted_session_id}/skills/catalog/{quoted_skill_id}",
             include_other_tools=include_other_tools,
+        )
+
+    @router.get("/skills/{skill_id}/files")
+    async def list_skill_files(
+        request: Request,
+        skill_id: str,
+        session_id: str = Query(),
+        include_other_tools: bool | None = Query(default=None),
+    ) -> dict[str, Any]:
+        """Proxy the winner skill's resource-tree listing from the bound runner."""
+        quoted_session_id = urllib.parse.quote(session_id, safe="")
+        quoted_skill_id = urllib.parse.quote(skill_id, safe="")
+        return await _runner_payload(
+            request,
+            session_id,
+            f"/v1/sessions/{quoted_session_id}/skills/catalog/{quoted_skill_id}/files",
+            include_other_tools=include_other_tools,
+        )
+
+    @router.get("/skills/{skill_id}/file")
+    async def read_skill_file_route(
+        request: Request,
+        skill_id: str,
+        path: str = Query(),
+        session_id: str = Query(),
+        include_other_tools: bool | None = Query(default=None),
+    ) -> dict[str, Any]:
+        """Proxy a single safe skill-file read from the bound runner."""
+        quoted_session_id = urllib.parse.quote(session_id, safe="")
+        quoted_skill_id = urllib.parse.quote(skill_id, safe="")
+        extra = {"path": path}
+        return await _runner_payload(
+            request,
+            session_id,
+            f"/v1/sessions/{quoted_session_id}/skills/catalog/{quoted_skill_id}/file",
+            include_other_tools=include_other_tools,
+            extra_params=extra,
         )
 
     return router

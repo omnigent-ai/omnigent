@@ -129,6 +129,11 @@ from omnigent.server.schemas import (
     BackgroundSessionTitleRequest,
     BackgroundSessionTitleResponse,
 )
+from omnigent.spec.skill_files import (
+    SkillFileError,
+    list_skill_tree,
+    read_skill_file,
+)
 from omnigent.spec.skill_registry import SkillRegistry, display_path
 from omnigent.spec.skill_sources import (
     registry_for_spec,
@@ -8950,6 +8955,94 @@ def create_runner_app(
                 content={"error": "skill_not_found", "detail": "Skill not found"},
             )
         return JSONResponse(status_code=200, content=_skill_catalog_detail(entry))
+
+    async def _resolve_catalog_skill_dir(
+        session_id: str,
+        skill_id: str,
+        include_other_tools: bool | None,
+    ) -> tuple[Path | None, JSONResponse | None]:
+        """
+        Resolve the winner's on-disk ``skill_dir`` for a catalog skill.
+
+        Uses the SAME session + trust visibility context as the list/detail so
+        file browsing can only reach a skill the catalog actually surfaced.
+
+        :returns: ``(skill_dir, None)`` on success, or ``(None, error_response)``
+            with a 404 when the skill isn't in this context or has no directory.
+        """
+        registry, _trust = await _resolve_session_skill_registry(
+            session_id,
+            include_other_tools,
+        )
+        entry = registry.get_entry(skill_id)
+        if entry is None:
+            return None, JSONResponse(
+                status_code=404,
+                content={"error": "skill_not_found", "detail": "Skill not found"},
+            )
+        skill_dir = entry.winner.origin_path
+        if skill_dir is None or not Path(skill_dir).is_dir():
+            return None, JSONResponse(
+                status_code=404,
+                content={"error": "skill_dir_missing", "detail": "Skill has no directory on disk"},
+            )
+        return Path(skill_dir), None
+
+    @app.get("/v1/sessions/{session_id}/skills/catalog/{skill_id}/files")
+    async def get_session_skill_files(
+        session_id: str,
+        skill_id: str,
+        include_other_tools: bool | None = Query(default=None),
+    ) -> JSONResponse:
+        """List the winner skill's on-disk resource tree (read-only browsing)."""
+        skill_dir, error = await _resolve_catalog_skill_dir(
+            session_id, skill_id, include_other_tools
+        )
+        if error is not None:
+            return error
+        assert skill_dir is not None
+        nodes = list_skill_tree(skill_dir)
+        return JSONResponse(
+            status_code=200,
+            content={
+                "object": "list",
+                "data": [
+                    {"path": node.path, "kind": node.kind, "size": node.size} for node in nodes
+                ],
+            },
+        )
+
+    @app.get("/v1/sessions/{session_id}/skills/catalog/{skill_id}/file")
+    async def get_session_skill_file(
+        session_id: str,
+        skill_id: str,
+        path: str = Query(),
+        include_other_tools: bool | None = Query(default=None),
+    ) -> JSONResponse:
+        """Read one resource file from the winner skill's directory, safely."""
+        skill_dir, error = await _resolve_catalog_skill_dir(
+            session_id, skill_id, include_other_tools
+        )
+        if error is not None:
+            return error
+        assert skill_dir is not None
+        try:
+            content = read_skill_file(skill_dir, path)
+        except SkillFileError as exc:
+            return JSONResponse(
+                status_code=exc.status,
+                content={"error": "skill_file_error", "detail": exc.message},
+            )
+        return JSONResponse(
+            status_code=200,
+            content={
+                "path": content.path,
+                "size": content.size,
+                "is_text": content.is_text,
+                "too_large": content.too_large,
+                "text": content.text,
+            },
+        )
 
     @app.get("/v1/sessions/{session_id}/skills")
     async def get_session_skills(session_id: str) -> JSONResponse:

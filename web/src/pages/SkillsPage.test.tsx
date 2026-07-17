@@ -19,6 +19,8 @@ vi.mock("@/lib/skillsApi", async (importActual) => ({
   getSkillDetail: vi.fn(),
   getSkillTrust: vi.fn(),
   setSkillTrust: vi.fn(),
+  getSkillFileTree: vi.fn(),
+  getSkillFile: vi.fn(),
 }));
 
 // Keep the real query hooks; override only the session resolver so the tests
@@ -136,6 +138,16 @@ beforeEach(() => {
           ? `.claude/skills/${name}`
           : `~/.claude/skills/${name}`;
     return detail({ id, name, origin, displayPath });
+  });
+  // Default the Files browser to an empty tree so unrelated tests don't need to
+  // stub it; the Files describe block overrides these per-test.
+  vi.mocked(skillsApi.getSkillFileTree).mockResolvedValue([]);
+  vi.mocked(skillsApi.getSkillFile).mockResolvedValue({
+    path: "SKILL.md",
+    size: 0,
+    isText: true,
+    tooLarge: false,
+    text: "",
   });
 });
 
@@ -451,5 +463,128 @@ describe("SkillsPage", () => {
     renderPage();
     expect(await screen.findByText("Couldn't load skills.")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Try again" })).toBeInTheDocument();
+  });
+});
+
+describe("SkillsPage — Files browser", () => {
+  // A skill selected by default (bundle:ship) so the detail's Files area mounts.
+  function renderWithFiles() {
+    vi.mocked(skillsApi.getSkillCatalog).mockResolvedValue({
+      skills: [BUILTIN],
+      includeOtherTools: false,
+      hiddenCount: 0,
+    });
+    return renderPage();
+  }
+
+  it("lazily lists a nested file tree with dirs expanded", async () => {
+    vi.mocked(skillsApi.getSkillFileTree).mockResolvedValue([
+      { path: "SKILL.md", kind: "file", size: 120 },
+      { path: "references", kind: "dir", size: null },
+      { path: "references/guide.md", kind: "file", size: 42 },
+      { path: "assets", kind: "dir", size: null },
+      { path: "assets/logo.png", kind: "file", size: 2048 },
+    ]);
+
+    renderWithFiles();
+    await screen.findByTestId("skill-detail");
+
+    // The tree fetch is scoped to the selected skill + session context.
+    await waitFor(() =>
+      expect(skillsApi.getSkillFileTree).toHaveBeenCalledWith("bundle:ship", "sess_active", false),
+    );
+    // Files + nested dir contents render (dirs default open).
+    expect(await screen.findByTestId("skill-file-SKILL.md")).toBeInTheDocument();
+    expect(screen.getByTestId("skill-file-dir-references")).toBeInTheDocument();
+    expect(screen.getByTestId("skill-file-references/guide.md")).toBeInTheDocument();
+    expect(screen.getByTestId("skill-file-assets/logo.png")).toBeInTheDocument();
+    // No file content is fetched until the user picks one.
+    expect(skillsApi.getSkillFile).not.toHaveBeenCalled();
+  });
+
+  it("fetches + previews a text file only when picked", async () => {
+    vi.mocked(skillsApi.getSkillFileTree).mockResolvedValue([
+      { path: "references/guide.md", kind: "file", size: 42 },
+    ]);
+    vi.mocked(skillsApi.getSkillFile).mockResolvedValue({
+      path: "references/guide.md",
+      size: 42,
+      isText: true,
+      tooLarge: false,
+      text: "# Guide\n\nHello preview",
+    });
+
+    renderWithFiles();
+    fireEvent.click(await screen.findByTestId("skill-file-references/guide.md"));
+
+    // The file read carries the same skill + session + trust context.
+    await waitFor(() =>
+      expect(skillsApi.getSkillFile).toHaveBeenCalledWith(
+        "bundle:ship",
+        "references/guide.md",
+        "sess_active",
+        false,
+      ),
+    );
+    const preview = await screen.findByTestId("skill-file-preview");
+    expect(within(preview).getByText("Hello preview")).toBeInTheDocument();
+  });
+
+  it("shows a non-preview state for a too-large file", async () => {
+    vi.mocked(skillsApi.getSkillFileTree).mockResolvedValue([
+      { path: "big.bin", kind: "file", size: 999999 },
+    ]);
+    vi.mocked(skillsApi.getSkillFile).mockResolvedValue({
+      path: "big.bin",
+      size: 999999,
+      isText: false,
+      tooLarge: true,
+      text: null,
+    });
+
+    renderWithFiles();
+    fireEvent.click(await screen.findByTestId("skill-file-big.bin"));
+
+    expect(await screen.findByText(/too large to preview/i)).toBeInTheDocument();
+  });
+
+  it("shows a non-preview state for a binary file", async () => {
+    vi.mocked(skillsApi.getSkillFileTree).mockResolvedValue([
+      { path: "logo.png", kind: "file", size: 2048 },
+    ]);
+    vi.mocked(skillsApi.getSkillFile).mockResolvedValue({
+      path: "logo.png",
+      size: 2048,
+      isText: false,
+      tooLarge: false,
+      text: null,
+    });
+
+    renderWithFiles();
+    fireEvent.click(await screen.findByTestId("skill-file-logo.png"));
+
+    expect(await screen.findByText(/isn't previewable as text/i)).toBeInTheDocument();
+  });
+
+  it("renders an empty-tree state when the skill has no files", async () => {
+    vi.mocked(skillsApi.getSkillFileTree).mockResolvedValue([]);
+
+    renderWithFiles();
+    await screen.findByTestId("skill-detail");
+    expect(await screen.findByText("This skill has no bundled files.")).toBeInTheDocument();
+  });
+
+  it("shows a retry when the file read errors", async () => {
+    vi.mocked(skillsApi.getSkillFileTree).mockResolvedValue([
+      { path: "references/guide.md", kind: "file", size: 42 },
+    ]);
+    vi.mocked(skillsApi.getSkillFile).mockRejectedValue(new Error("boom"));
+
+    renderWithFiles();
+    fireEvent.click(await screen.findByTestId("skill-file-references/guide.md"));
+
+    expect(await screen.findByText(/Couldn't load references\/guide\.md/)).toBeInTheDocument();
+    const preview = screen.getByTestId("skill-file-preview");
+    expect(within(preview).getByRole("button", { name: "Try again" })).toBeInTheDocument();
   });
 });

@@ -38,6 +38,8 @@ import {
   CodeIcon,
   CopyIcon,
   EyeIcon,
+  FileIcon,
+  FolderIcon,
   Loader2Icon,
   SearchIcon,
   SparklesIcon,
@@ -50,6 +52,8 @@ import {
   useSkillCatalog,
   useSetSkillTrust,
   useSkillDetail,
+  useSkillFile,
+  useSkillFileTree,
   useSkillTrust,
 } from "@/hooks/useSkills";
 import { Link } from "@/lib/routing";
@@ -58,6 +62,7 @@ import {
   catalogSourceRoots,
   sourceRootKey,
   type SkillDetail,
+  type SkillFileNode,
   type SkillOrigin,
   type SkillSummary,
 } from "@/lib/skillsApi";
@@ -88,6 +93,68 @@ function matchesQuery(skill: SkillSummary, query: string): boolean {
 /** True when a skill passes the active source-root filter (or it's disabled). */
 function matchesSource(skill: SkillSummary, sourceFilter: string): boolean {
   return sourceFilter === ALL_SOURCES || sourceRootKey(skill) === sourceFilter;
+}
+
+// ── Skill file tree ────────────────────────────────────────────────────────────
+
+/** A node in the nested tree built from the flat backend node list. */
+interface FileTreeNode {
+  name: string;
+  path: string;
+  kind: "file" | "dir";
+  size: number | null;
+  children: FileTreeNode[];
+}
+
+/**
+ * Fold the backend's flat, pre-sorted node list into a nested tree. The backend
+ * already emits parents before children and dirs-before-files alphabetically,
+ * so we can insert in order and preserve it without re-sorting.
+ */
+function buildFileTree(nodes: SkillFileNode[]): FileTreeNode[] {
+  const roots: FileTreeNode[] = [];
+  const byPath = new Map<string, FileTreeNode>();
+  for (const node of nodes) {
+    const treeNode: FileTreeNode = {
+      name: node.path.split("/").pop() ?? node.path,
+      path: node.path,
+      kind: node.kind,
+      size: node.size,
+      children: [],
+    };
+    byPath.set(node.path, treeNode);
+    const slash = node.path.lastIndexOf("/");
+    if (slash === -1) {
+      roots.push(treeNode);
+    } else {
+      const parent = byPath.get(node.path.slice(0, slash));
+      // A well-formed list always has the parent already; fall back to root if
+      // an intermediate dir is somehow absent so nothing silently disappears.
+      if (parent) parent.children.push(treeNode);
+      else roots.push(treeNode);
+    }
+  }
+  return roots;
+}
+
+/** Human-readable byte size, e.g. `1.2 KB`. */
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  const kb = bytes / 1024;
+  if (kb < 1024) return `${kb.toFixed(kb < 10 ? 1 : 0)} KB`;
+  return `${(kb / 1024).toFixed(1)} MB`;
+}
+
+function fileExtension(path: string): string {
+  const name = path.split("/").pop() ?? path;
+  const dot = name.lastIndexOf(".");
+  return dot > 0 ? name.slice(dot + 1).toLowerCase() : name.toLowerCase();
+}
+
+/** True when a markdown file should render as formatted markdown. */
+function isMarkdownPath(path: string): boolean {
+  const ext = fileExtension(path);
+  return ext === "md" || ext === "markdown";
 }
 
 export function SkillsPage() {
@@ -479,10 +546,24 @@ function SkillDetailPane({
     );
   }
 
-  return <SkillDetailBody skill={detailQuery.data} />;
+  return (
+    <SkillDetailBody
+      skill={detailQuery.data}
+      sessionId={sessionId}
+      includeOtherTools={includeOtherTools}
+    />
+  );
 }
 
-function SkillDetailBody({ skill }: { skill: SkillDetail }) {
+function SkillDetailBody({
+  skill,
+  sessionId,
+  includeOtherTools,
+}: {
+  skill: SkillDetail;
+  sessionId: string;
+  includeOtherTools: boolean;
+}) {
   const accent = ORIGIN_ACCENT[skill.origin];
   const glyph = skill.name.slice(0, 2).toUpperCase();
 
@@ -558,6 +639,15 @@ function SkillDetailBody({ skill }: { skill: SkillDetail }) {
       {/* Instructions */}
       <Section label="Instructions">
         <InstructionsBlock skill={skill} />
+      </Section>
+
+      {/* Files — browse the skill's on-disk resource tree (references/, etc.). */}
+      <Section label="Files">
+        <SkillFilesBrowser
+          skillId={skill.id}
+          sessionId={sessionId}
+          includeOtherTools={includeOtherTools}
+        />
       </Section>
 
       {/* Ready line */}
@@ -675,6 +765,243 @@ function IconToggle({
       </TooltipTrigger>
       <TooltipContent side="left">{label}</TooltipContent>
     </Tooltip>
+  );
+}
+
+// ── Files browser ──────────────────────────────────────────────────────────────
+
+/**
+ * Browse the selected skill's on-disk resource tree (SKILL.md +
+ * `references/` / `scripts/` / `assets/`). The tree is lazily fetched when the
+ * detail mounts; a file's content is fetched only when the user picks it. This
+ * lives inside the neutral detail pane — it never re-introduces path/provider
+ * grouping into the master list.
+ */
+function SkillFilesBrowser({
+  skillId,
+  sessionId,
+  includeOtherTools,
+}: {
+  skillId: string;
+  sessionId: string;
+  includeOtherTools: boolean;
+}) {
+  const treeQuery = useSkillFileTree(skillId, sessionId, includeOtherTools);
+  const [selectedPath, setSelectedPath] = useState<string | null>(null);
+
+  const tree = useMemo(() => buildFileTree(treeQuery.data ?? []), [treeQuery.data]);
+  const fileCount = (treeQuery.data ?? []).filter((n) => n.kind === "file").length;
+
+  // Reset the picked file when the skill changes (the id is the query input).
+  useEffect(() => {
+    setSelectedPath(null);
+  }, [skillId]);
+
+  if (treeQuery.isLoading) {
+    return (
+      <div className="flex items-center gap-2 rounded-lg border border-border bg-muted px-3 py-2.5 text-[12px] text-muted-foreground">
+        <Loader2Icon className="size-3.5 animate-spin" />
+        Loading files…
+      </div>
+    );
+  }
+  if (treeQuery.isError) {
+    return (
+      <div className="flex items-center justify-between gap-2 rounded-lg border border-border bg-muted px-3 py-2.5 text-[12px] text-muted-foreground">
+        <span>Couldn't load this skill's files.</span>
+        <Button variant="outline" size="sm" onClick={() => void treeQuery.refetch()}>
+          Try again
+        </Button>
+      </div>
+    );
+  }
+  if (!tree.length) {
+    return (
+      <p className="rounded-lg border border-dashed border-border px-3 py-2.5 text-[12px] text-muted-foreground">
+        This skill has no bundled files.
+      </p>
+    );
+  }
+
+  return (
+    <div className="overflow-hidden rounded-lg border border-border" data-testid="skill-files">
+      <div
+        className="max-h-56 overflow-y-auto bg-muted/50 p-1.5"
+        role="tree"
+        aria-label="Skill files"
+      >
+        {tree.map((node) => (
+          <FileTreeNodeRow
+            key={node.path}
+            node={node}
+            depth={0}
+            selectedPath={selectedPath}
+            onSelectFile={setSelectedPath}
+          />
+        ))}
+      </div>
+      <div className="border-t border-border">
+        {selectedPath === null ? (
+          <p className="px-3 py-3 text-[11.5px] text-muted-foreground">
+            {fileCount === 1
+              ? "Select the file to preview it."
+              : `Select a file to preview it. ${fileCount} files.`}
+          </p>
+        ) : (
+          <FilePreview
+            skillId={skillId}
+            sessionId={sessionId}
+            includeOtherTools={includeOtherTools}
+            filePath={selectedPath}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+/** One row in the file tree — a directory (always expanded) or a file button. */
+function FileTreeNodeRow({
+  node,
+  depth,
+  selectedPath,
+  onSelectFile,
+}: {
+  node: FileTreeNode;
+  depth: number;
+  selectedPath: string | null;
+  onSelectFile: (path: string) => void;
+}) {
+  const [open, setOpen] = useState(true);
+  const indent = { paddingLeft: `${depth * 14 + 8}px` };
+
+  if (node.kind === "dir") {
+    return (
+      <div role="treeitem" aria-expanded={open}>
+        <button
+          type="button"
+          onClick={() => setOpen((v) => !v)}
+          style={indent}
+          data-testid={`skill-file-dir-${node.path}`}
+          className="flex w-full items-center gap-1.5 rounded-md py-1 pr-2 text-left text-[12px] text-foreground transition-colors hover:bg-foreground/5"
+        >
+          <ChevronRightIcon
+            className={cn("size-3 shrink-0 transition-transform", open && "rotate-90")}
+          />
+          <FolderIcon className="size-3.5 shrink-0 text-muted-foreground" />
+          <span className="truncate font-mono">{node.name}</span>
+        </button>
+        {open &&
+          node.children.map((child) => (
+            <FileTreeNodeRow
+              key={child.path}
+              node={child}
+              depth={depth + 1}
+              selectedPath={selectedPath}
+              onSelectFile={onSelectFile}
+            />
+          ))}
+      </div>
+    );
+  }
+
+  const selected = selectedPath === node.path;
+  return (
+    <button
+      type="button"
+      role="treeitem"
+      aria-selected={selected}
+      onClick={() => onSelectFile(node.path)}
+      style={indent}
+      data-testid={`skill-file-${node.path}`}
+      className={cn(
+        "flex w-full items-center gap-1.5 rounded-md py-1 pr-2 text-left text-[12px] transition-colors",
+        selected ? "bg-info/12 text-info" : "text-foreground hover:bg-foreground/5",
+      )}
+    >
+      <span className="w-3 shrink-0" aria-hidden />
+      <FileIcon className="size-3.5 shrink-0 text-muted-foreground" />
+      <span className="min-w-0 flex-1 truncate font-mono">{node.name}</span>
+      {node.size != null && (
+        <span className="shrink-0 text-[10px] tabular-nums text-muted-foreground">
+          {formatBytes(node.size)}
+        </span>
+      )}
+    </button>
+  );
+}
+
+/** Preview one picked file: markdown/text/code, or a non-preview state. */
+function FilePreview({
+  skillId,
+  sessionId,
+  includeOtherTools,
+  filePath,
+}: {
+  skillId: string;
+  sessionId: string;
+  includeOtherTools: boolean;
+  filePath: string;
+}) {
+  const fileQuery = useSkillFile(skillId, sessionId, includeOtherTools, filePath);
+
+  if (fileQuery.isLoading) {
+    return (
+      <div
+        className="flex items-center gap-2 px-3 py-3 text-[11.5px] text-muted-foreground"
+        data-testid="skill-file-preview"
+      >
+        <Loader2Icon className="size-3.5 animate-spin" />
+        Loading {filePath}…
+      </div>
+    );
+  }
+  if (fileQuery.isError || !fileQuery.data) {
+    return (
+      <div
+        className="flex items-center justify-between gap-2 px-3 py-3 text-[11.5px] text-muted-foreground"
+        data-testid="skill-file-preview"
+      >
+        <span>Couldn't load {filePath}.</span>
+        <Button variant="outline" size="sm" onClick={() => void fileQuery.refetch()}>
+          Try again
+        </Button>
+      </div>
+    );
+  }
+
+  const file = fileQuery.data;
+  // Previewable = the backend decoded it as UTF-8 text within the size cap.
+  // Extension only tunes markdown-vs-plain rendering (see isMarkdownPath); any
+  // decodable text file is shown, so there's no extension allowlist gate.
+  if (file.tooLarge || !file.isText || file.text === null) {
+    return (
+      <div
+        className="px-3 py-3 text-[11.5px] text-muted-foreground"
+        data-testid="skill-file-preview"
+      >
+        <p className="font-mono text-foreground">{filePath}</p>
+        <p className="mt-1">
+          {file.tooLarge
+            ? `This file is ${formatBytes(file.size)} — too large to preview here.`
+            : "This file isn't previewable as text."}
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="max-h-72 overflow-y-auto px-3 py-3" data-testid="skill-file-preview">
+      {isMarkdownPath(filePath) ? (
+        <div className="prose prose-sm max-w-none dark:prose-invert prose-headings:font-heading prose-pre:bg-background">
+          <ReactMarkdown remarkPlugins={[remarkGfm]}>{file.text}</ReactMarkdown>
+        </div>
+      ) : (
+        <pre className="whitespace-pre-wrap font-mono text-[11.5px] leading-relaxed text-muted-foreground">
+          {file.text}
+        </pre>
+      )}
+    </div>
   );
 }
 
