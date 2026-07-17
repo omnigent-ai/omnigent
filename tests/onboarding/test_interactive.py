@@ -464,3 +464,35 @@ def test_render_menu_compact_truncates_long_description_to_one_line() -> None:
     assert len(hint_lines) == 1
     assert "…" in hint_lines[0]
     assert len(hint_lines[0]) <= 40
+
+
+def _console_with_encoding(encoding: str | None):
+    """Build a Rich console whose file reports *encoding* (or lacks the attr)."""
+    from rich.console import Console
+
+    if encoding is None:
+        buffer = io.BytesIO()  # a raw binary stream has no ``encoding`` attribute
+        return Console(file=buffer, force_terminal=True)  # type: ignore[arg-type]
+    stream = io.TextIOWrapper(io.BytesIO(), encoding=encoding)
+    return Console(file=stream, force_terminal=True)
+
+
+@pytest.mark.parametrize(
+    "encoding,expected",
+    [
+        ("utf-8", True),
+        ("utf-16", True),
+        ("cp1252", False),
+        ("ascii", False),
+        (None, True),  # unknown encoding: nothing to check against, assume ok
+    ],
+)
+def test_encodable_probes_console_encoding(encoding: str | None, expected: bool) -> None:
+    """``encodable`` reports whether the emoji glyph survives the console's encoding."""
+    glyph = "\N{ADMISSION TICKETS}\N{VARIATION SELECTOR-16}"
+    assert interactive.encodable(glyph, _console_with_encoding(encoding)) is expected
+
+
+def test_encodable_ascii_text_always_true() -> None:
+    """Plain ASCII text is encodable even on a legacy codepage console."""
+    assert interactive.encodable("subscription", _console_with_encoding("cp1252")) is True

@@ -44,6 +44,34 @@ MUTED = "#6a6a6a"
 # singleton so all callers render through one surface.
 console = Console()
 
+# Text encodings that cover every codepoint, so the probe below can
+# short-circuit instead of round-tripping the string.
+_UNIVERSAL_ENCODINGS = frozenset({"utf-8", "utf8", "utf-16", "utf16", "utf-32", "utf32"})
+
+
+def encodable(text: str, target: Console | None = None) -> bool:
+    """Report whether *text* can be written to a console without blowing up.
+
+    A Windows shell on a legacy ANSI codepage (e.g. cp1252) hands Python a
+    stdio stream that cannot encode emoji, and the write raises
+    ``UnicodeEncodeError`` mid-render, aborting the command. Callers probe
+    with this first and substitute an ASCII stand-in when it returns False.
+
+    :param text: The string about to be printed.
+    :param target: The console to probe; defaults to the module singleton.
+    :returns: True when the console's encoding covers *text* — including when
+        the encoding is unknown, since there is nothing to check against.
+    """
+    file = (target if target is not None else console).file
+    encoding = getattr(file, "encoding", None)
+    if not encoding or encoding.lower().replace("_", "-") in _UNIVERSAL_ENCODINGS:
+        return True
+    try:
+        text.encode(encoding)
+    except (UnicodeEncodeError, LookupError):
+        return False
+    return True
+
 
 class _TermUIWithHiddenPrompt(Protocol):
     hidden_prompt_func: Callable[[str], str]

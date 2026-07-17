@@ -31,6 +31,7 @@ from omnigent.cli import (
     _dispatch_native_terminal_harness,
     _dispatch_run,
     _ensure_sqlite_parent_dir,
+    _ensure_utf8_stdio,
     _expand_config_env_vars,
     _extract_global_logging_flags,
     _HostHttpResult,
@@ -4158,6 +4159,70 @@ def test_run_bare_omnigent_with_harness_only_config(
     # harness default must be forwarded; no target was set
     assert dispatched["harness"] == "claude-sdk"
     assert dispatched["target"] is None
+
+
+class _FakeStream:
+    """A stdio stub recording ``reconfigure`` calls for the stdio-hardening test."""
+
+    def __init__(self, encoding: str, *, raises: bool = False) -> None:
+        self.encoding = encoding
+        self.raises = raises
+        self.reconfigured: dict[str, object] | None = None
+
+    def reconfigure(self, **kwargs: object) -> None:
+        if self.raises:
+            raise ValueError("stream detached")
+        self.reconfigured = kwargs
+        self.encoding = str(kwargs.get("encoding", self.encoding))
+
+
+def test_ensure_utf8_stdio_reconfigures_legacy_windows_streams(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On Windows, non-UTF-8 stdio is reconfigured to utf-8/replace."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    out, err = _FakeStream("cp1252"), _FakeStream("cp1252")
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(sys, "stderr", err)
+
+    _ensure_utf8_stdio()
+
+    assert out.reconfigured == {"encoding": "utf-8", "errors": "replace"}
+    assert err.reconfigured == {"encoding": "utf-8", "errors": "replace"}
+
+
+def test_ensure_utf8_stdio_noop_on_posix(monkeypatch: pytest.MonkeyPatch) -> None:
+    """On non-Windows platforms the streams are left untouched."""
+    monkeypatch.setattr(sys, "platform", "linux")
+    out = _FakeStream("cp1252")
+    monkeypatch.setattr(sys, "stdout", out)
+
+    _ensure_utf8_stdio()
+
+    assert out.reconfigured is None
+
+
+def test_ensure_utf8_stdio_skips_already_utf8(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A UTF-8 stream is not reconfigured again."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    out = _FakeStream("utf-8")
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(sys, "stderr", _FakeStream("utf-8"))
+
+    _ensure_utf8_stdio()
+
+    assert out.reconfigured is None
+
+
+def test_ensure_utf8_stdio_tolerates_reconfigure_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stream whose ``reconfigure`` raises does not abort startup."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(sys, "stdout", _FakeStream("cp1252", raises=True))
+    monkeypatch.setattr(sys, "stderr", _FakeStream("cp1252", raises=True))
+
+    _ensure_utf8_stdio()  # must not raise
 
 
 def test_bare_omnigent_harness_flag_dispatches_to_run(
