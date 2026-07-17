@@ -163,10 +163,33 @@ describe("SkillsPage", () => {
 
     renderPage();
 
-    expect(await screen.findByTestId("skills-no-session")).toBeInTheDocument();
-    expect(screen.getByText("A running session is required")).toBeInTheDocument();
+    const empty = await screen.findByTestId("skills-no-session");
+    expect(within(empty).getByText("A running session is required")).toBeInTheDocument();
+    // Neutral, discovery-only copy — does not imply the listed skills execute
+    // automatically in the current session.
+    expect(
+      within(empty).getByText(/Start or open a session to browse the skill inventory/i),
+    ).toBeInTheDocument();
+    expect(within(empty).queryByText(/available to it/i)).toBeNull();
+    expect(within(empty).queryByText(/personal library/i)).toBeNull();
     // No bound session → the session-scoped catalog is never queried.
     expect(skillsApi.getSkillCatalog).not.toHaveBeenCalled();
+  });
+
+  it("uses neutral inventory copy in the header (no auto-availability claim)", async () => {
+    vi.mocked(skillsApi.getSkillCatalog).mockResolvedValue({
+      skills: [BUILTIN],
+      includeOtherTools: true,
+      hiddenCount: 0,
+    });
+
+    renderPage();
+    await screen.findByTestId("skill-row-ship");
+
+    expect(
+      screen.getByText("Browse reusable skills discovered across your local agent tools."),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/available automatically wherever you work/i)).toBeNull();
   });
 
   it("has no visibility toggle and never reads/writes execution trust", async () => {

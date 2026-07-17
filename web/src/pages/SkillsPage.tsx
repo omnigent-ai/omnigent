@@ -287,9 +287,8 @@ function NoSessionEmptyState() {
       </div>
       <h2 className="text-base font-semibold">A running session is required</h2>
       <p className="max-w-md text-sm text-muted-foreground">
-        Skills are resolved from the bound session's runner — its bundle, this project's workspace
-        skills, and your personal library. Start or open a session, then come back to browse the
-        skills available to it.
+        Skills are discovered on a runner. Start or open a session to browse the skill inventory
+        available on that machine.
       </p>
       <Button asChild variant="outline" size="sm" className="mt-1">
         <Link to="/">Start a session</Link>
@@ -308,7 +307,7 @@ function SkillsHeader() {
       <div className="min-w-0">
         <h1 className="font-heading text-lg font-semibold leading-tight tracking-tight">Skills</h1>
         <p className="mt-0.5 truncate text-xs text-muted-foreground">
-          Every skill discovered across your tools — available automatically wherever you work.
+          Browse reusable skills discovered across your local agent tools.
         </p>
       </div>
     </header>
