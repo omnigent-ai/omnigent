@@ -91,8 +91,8 @@ import {
 } from "@/hooks/useTerminals";
 import type {
   ContentBlock,
-  CodexModelOption,
   ModelUsage,
+  NativeModelOption,
   PendingInput,
   SandboxStatus,
   Session,
@@ -488,12 +488,8 @@ export interface ChatState {
    * suggest ``/skill-name``.
    */
   skills: SkillSummary[];
-  /**
-   * Codex app-server model options for the active codex-native session.
-   * Populated from the session snapshot and updated when the server's
-   * background Codex ``model/list`` fetch lands.
-   */
-  codexModelOptions: CodexModelOption[];
+  /** Runner-owned model picker rows for the active native session. */
+  codexModelOptions: NativeModelOption[];
   /**
    * True while the runner is auto-creating the terminal for a
    * terminal-first session (claude-native / codex-native). Seeded from
@@ -681,6 +677,9 @@ export interface ChatState {
 }
 
 let queryClient: QueryClient | null = null;
+
+// Catalogs that resolved while their bind snapshot was still hydrating.
+const racedNativeModelOptions = new Map<string, NativeModelOption[]>();
 let pendingSeq = 0;
 let queueSeq = 0;
 // Tail of the send chain. Each `send` waits on the previous send's network
@@ -2006,6 +2005,31 @@ function isNativeModelCompatible(
 }
 
 /**
+ * Recover a persisted native-model preference once its live catalog arrives.
+ *
+ * Bind snapshots deliberately invalidate runner-backed catalogs, so an empty
+ * option list at bind time means "loading," not "removed." The in-memory
+ * selection is cleared until compatibility can be checked; local storage keeps
+ * the preference available for this delayed handoff.
+ */
+function deferredNativeStickyModel(session: Session): string | null {
+  const family = nativeModelFamilyForSession(session);
+  if (
+    family === null ||
+    session.parentSessionId != null ||
+    session.costControlModeOverride === "on" ||
+    session.modelOverride != null
+  ) {
+    return null;
+  }
+  const stickyModel =
+    useChatStore.getState().selectedModel ?? loadPickerPref(PICKER_PREF_MODEL_KEY);
+  return stickyModel != null && isNativeModelCompatible(family, stickyModel, session)
+    ? stickyModel
+    : null;
+}
+
+/**
  * Ensure the store has a bound session with a live SSE stream, creating
  * one if there is no conversation yet. Returns the session id. Shared by
  * `send` and `sendSlashCommand` so the two POST entry points can't drift
@@ -2277,6 +2301,7 @@ async function bindStream(
   get: Getter,
   hydratePending = false,
 ): Promise<void> {
+  racedNativeModelOptions.delete(id);
   const controller = new AbortController();
   set({ abortController: controller });
 
@@ -2400,6 +2425,12 @@ async function bindStream(
     const pendingElicitationBlocks = pendingElicitationBlocksFromSnapshot(session);
     const oldestItemId = items[0]?.id ?? null;
     set((state) => {
+      const racedOptions = racedNativeModelOptions.get(id);
+      const catalogWonBindRace =
+        bindingPatch.codexModelOptions.length === 0 && (racedOptions?.length ?? 0) > 0;
+      const effectiveBindingPatch = catalogWonBindRace
+        ? { ...bindingPatch, codexModelOptions: racedOptions! }
+        : bindingPatch;
       const seenItemIds = new Set(
         state.blocks.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
       );
@@ -2531,7 +2562,7 @@ async function bindStream(
             }
           : null;
       return {
-        ...bindingPatch,
+        ...effectiveBindingPatch,
         blocks: syntheticError !== null ? [...allBlocks, syntheticError] : allBlocks,
         pendingUserMessages: snapshotPending,
         pendingByConversation: prunedStash,
@@ -2548,11 +2579,13 @@ async function bindStream(
         // the snapshot (server keeps it sticky past the trailing PTY `idle`).
         backgroundTaskCount: session.backgroundTaskCount ?? 0,
         selectedEffort: effectiveEffort,
-        selectedModel: effectiveModel,
+        selectedModel: catalogWonBindRace ? state.selectedModel : effectiveModel,
         // Session truth for the `/model` readout — overrides the snapshot
         // value spread via `...bindingPatch` so the claude-native sticky
         // handoff (fired above, silent) shows immediately.
-        sessionModelOverride: effectiveSessionOverride,
+        sessionModelOverride: catalogWonBindRace
+          ? state.sessionModelOverride
+          : effectiveSessionOverride,
         tokensUsed: session.lastTotalTokens ?? null,
         sessionCostUsd: session.totalCostUsd ?? null,
         sessionUsageByModel: session.usageByModel ?? null,
@@ -2563,6 +2596,7 @@ async function bindStream(
         }>,
       };
     });
+    racedNativeModelOptions.delete(id);
   } catch (err) {
     if (get().conversationId !== id) return;
     set({
@@ -3845,12 +3879,14 @@ interface RefetchRunnerBackedSessionStateOptions {
   refreshState?: boolean;
   /** Apply the broader binding metadata patch in addition to capabilities. */
   applyBindingPatch?: boolean;
+  /** The server has signalled that its model-options cache is populated. */
+  modelOptionsResolved?: boolean;
 }
 
 /**
  * Refetch runner-backed session state and apply it to the store.
  *
- * Skills and codex-native model options are runner-owned. When a session
+ * Skills and native model options are runner-owned. When a session
  * binds before those background fetches land, the snapshot carries empty
  * lists. The server later sends a bare nudge; refetching the snapshot is
  * how the store pulls the cache-warmed fields without clobbering live chat
@@ -3883,6 +3919,12 @@ async function refetchRunnerBackedSessionState(
     } else {
       session = await getSessionSlim(conversationId, { refreshState: options.refreshState });
     }
+    if (options.modelOptionsResolved === true && (session.codexModelOptions ?? []).length === 0) {
+      // The event can race the bind snapshot's in-flight query. Once that
+      // request settles, issue a second read instead of accepting its stale [].
+      session = await getSessionSlim(conversationId);
+      queryClient?.setQueryData(["session", conversationId], session);
+    }
   } catch {
     // The runner may have dropped again before the fetch landed. Keep
     // the existing state rather than wiping it on a transient error.
@@ -3892,14 +3934,34 @@ async function refetchRunnerBackedSessionState(
   // while the request was in flight; applying now would leak another
   // session's capabilities into the open composer.
   if (useChatStore.getState().conversationId !== conversationId) return;
-  useChatStore.setState(
+  if (options.modelOptionsResolved === true && (session.codexModelOptions ?? []).length > 0) {
+    racedNativeModelOptions.set(conversationId, session.codexModelOptions ?? []);
+  }
+  const currentState = useChatStore.getState();
+  const stickyModel = deferredNativeStickyModel(session);
+  const alreadyApplied = stickyModel != null && currentState.sessionModelOverride === stickyModel;
+  const statePatch: Partial<ChatState> =
     options.applyBindingPatch === true
       ? sessionBindingPatch(session)
       : {
           skills: session.skills ?? [],
           codexModelOptions: session.codexModelOptions ?? [],
-        },
-  );
+        };
+  if (stickyModel != null) {
+    statePatch.selectedModel = stickyModel;
+    statePatch.sessionModelOverride = stickyModel;
+  }
+  useChatStore.setState(statePatch);
+  if (stickyModel != null && !alreadyApplied) {
+    updateSession(conversationId, { modelOverride: stickyModel, silent: true }).catch(
+      (err: unknown) => {
+        console.warn(
+          `Failed to apply delayed sticky model=${stickyModel} to session ${conversationId}:`,
+          err,
+        );
+      },
+    );
+  }
 }
 
 /**
@@ -4538,10 +4600,12 @@ export function handleSessionEvent(event: StreamEvent): void {
       void refetchRunnerBackedSessionState(event.conversationId);
       return;
     case "session_model_options":
-      // Codex app-server `model/list` just resolved. Refetch the
-      // cache-warmed snapshot and apply `codexModelOptions`; the picker
-      // derives both model rows and effort levels from that catalog.
-      void refetchRunnerBackedSessionState(event.conversationId);
+      // A runner-owned native model catalog just resolved. Refetch the
+      // cache-warmed snapshot so the picker and any delayed sticky handoff
+      // use the same authoritative options.
+      void refetchRunnerBackedSessionState(event.conversationId, {
+        modelOptionsResolved: true,
+      });
       return;
     case "tool_result":
       // Tool results are not a reliable correlation signal for

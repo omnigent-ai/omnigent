@@ -237,6 +237,7 @@ from omnigent.server.schemas import (
     McpServerStartup,
     MCPServerSummary,
     ModelUsage,
+    NativeModelOption,
     OutputItemDoneEvent,
     OutputTextDeltaEvent,
     PaginatedList,
@@ -2736,8 +2737,8 @@ def _build_session_response(
         ``None`` falls back to this conversation's own ``session_usage``
         (correct for childless sessions). Passed by the snapshot path;
         other callers omit it.
-    :param model_options: Raw Codex app-server ``model/list``
-        options for this session, e.g. ``[{"id": "gpt-5.5"}]``.
+    :param model_options: Runner-owned native model picker options,
+        e.g. ``[{"id": "gpt-5.5", "displayName": "GPT-5.5"}]``.
         ``None`` is treated as ``[]``.
     :returns: The :class:`SessionResponse` for the API.
     :raises OmnigentError: If ``conv.agent_id`` is ``None``.
@@ -22197,17 +22198,13 @@ def _model_options_from_wire(raw_models: Any) -> list[dict[str, Any]]:
     for raw_model in raw_models:
         if not isinstance(raw_model, dict):
             raise ValueError("Native model option must be an object")
-        options.append(raw_model)
+        option = NativeModelOption.model_validate(raw_model)
+        options.append(option.model_dump(exclude_defaults=True, exclude_none=True))
     return options
 
 
-# Native harnesses whose model picker is populated from a *live*, runner-owned
-# model-options endpoint, keyed by wrapper label -> the runner route segment.
-# Claude returns its launch-time Databricks/ucode alias mapping; Codex queries
-# its live app-server ``model/list``. Both are runner-owned. Cursor is
-# deliberately NOT here: its catalog is a curated *static* base list served
-# directly (see ``_fetch_model_options``). Keeping it off the runner-backed
-# cache prevents ``refresh_state`` from blanking the picker mid-session.
+# Live runner-owned model catalogs, keyed by wrapper label to route segment.
+# Static catalogs bypass this cache so ``refresh_state`` cannot blank them.
 _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER: dict[str, str] = {
     _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE: "claude-model-options",
     _CODEX_NATIVE_WRAPPER_LABEL_VALUE: "codex-model-options",

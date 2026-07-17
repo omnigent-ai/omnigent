@@ -4,24 +4,27 @@ Research snapshot: 2026-07-17. This note covers the Databricks-authenticated,
 `ucode`-configured Claude Code path. Sources are first-party Databricks,
 Anthropic, and `databricks/ucode` documentation or code.
 
-## Bottom line
+## What Omnigent implements
 
-The desired behavior is already implemented in current `ucode`:
+For every new Databricks-authenticated Claude-native session, Omnigent queries
+the workspace before launching Claude Code. The terminal launch and the
+runner's model-options endpoint share one per-session resolution task, so the
+UI and terminal use the same catalog. When the catalog lands, the server emits
+`session.model_options`; connected browsers refetch the snapshot and replace
+the picker rows without a page reload.
 
-- It dynamically lists the user's Unity Catalog model services.
-- It maps the newest discovered Claude model in each family to Claude Code's
-  `fable`, `opus`, `sonnet`, and `haiku` aliases.
-- It writes those mappings through Claude Code's
-  `ANTHROPIC_DEFAULT_*_MODEL` variables and deliberately does **not** set
-  `ANTHROPIC_MODEL`.
-- Therefore `/model opus` can remain provider-neutral; the user does not need
-  to type a `system.ai.*` or `databricks-*` identifier.
-- A normal `ucode claude` launch refreshes discovery before launching Claude,
-  unless the caller explicitly skips preflight.
+Omnigent maps the discovered provider IDs to Claude Code's `fable`, `opus`,
+`sonnet`, and `haiku` aliases through `ANTHROPIC_DEFAULT_*_MODEL`. Users select
+friendly aliases such as `/model opus`; the Databricks `system.ai.*` or
+`databricks-*` ID stays an implementation detail. A cached `ucode` mapping is
+used only when live discovery fails. A successful empty catalog is
+authoritative and blocks launch instead of reviving removed models. The Fable
+row remains opt-in, following the persisted `ucode` preference.
 
-The most direct Omnigent design is consequently to reuse the model bundle that
-`ucode` already discovers, or mirror the same authenticated API call. It should
-not maintain a second hard-coded Databricks-to-Claude mapping.
+Unlike upstream `ucode`, Omnigent compares numeric version components
+naturally. For example, `4-10` wins over `4-9`, and Sonnet 5 wins over Sonnet
+4.6. The sections below document the upstream APIs and behavior that motivated
+the implementation.
 
 ## The discovery API
 
@@ -45,9 +48,7 @@ and follows `next_page_token`. From each response it uses only:
 
 ```json
 {
-  "model_services": [
-    { "name": "model-services/system.ai.<model-name>" }
-  ],
+  "model_services": [{ "name": "model-services/system.ai.<model-name>" }],
   "next_page_token": "..."
 }
 ```
@@ -68,12 +69,15 @@ restrict the `system.ai` schema, including future services.
 
 ### How `ucode` decides "latest"
 
-For every Claude family, `ucode` sorts matching service names in reverse
+For every Claude family, upstream `ucode` sorts matching service names in reverse
 lexicographic order and picks the first. This is a local naming heuristic, not
 a `latest` alias or version flag supplied by Databricks. It works for current
 single-digit versions, but it is not semantic-version comparison: for example,
 `4-9` would sort ahead of `4-10`. Databricks itself documents versioned endpoint
 names, not a general "latest Anthropic model" discovery field.
+
+Omnigent intentionally does not copy that ordering rule; its discovery module
+uses natural numeric ordering as described above.
 [[ucode family selection](https://github.com/databricks/ucode/blob/eea5ffbfd013e6a2e7c77bf17d266cd6daa6883d/src/ucode/databricks.py#L1228-L1276)]
 [[Databricks supported models](https://docs.databricks.com/aws/en/machine-learning/foundation-model-apis/supported-models)]
 

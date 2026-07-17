@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import httpx
+import pytest
 
 from omnigent.databricks_model_discovery import discover_databricks_claude_models
 
@@ -33,6 +34,7 @@ def test_model_services_are_paginated_filtered_and_version_sorted() -> None:
             json={
                 "model_services": [
                     {"name": "model-services/system.ai.claude-opus-4-10"},
+                    {"name": "model-services/system.ai.claude-sonnet-4-6"},
                     {"name": "model-services/system.ai.claude-sonnet-5"},
                     {"name": "system.ai.claude-haiku-4-5"},
                 ]
@@ -141,3 +143,31 @@ def test_successful_primary_empty_is_authoritative_when_legacy_is_unavailable() 
         )
         == {}
     )
+
+
+def test_both_discovery_endpoints_failing_raises() -> None:
+    """A total discovery outage is distinct from an authoritative empty list."""
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, request=request)
+
+    with pytest.raises(httpx.HTTPStatusError):
+        discover_databricks_claude_models(
+            "https://workspace.example.com",
+            "token",
+            transport=httpx.MockTransport(_handler),
+        )
+
+
+def test_both_discovery_endpoints_malformed_raises() -> None:
+    """Malformed success payloads cannot be mistaken for removed models."""
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=["not", "an", "object"], request=request)
+
+    with pytest.raises(ValueError, match="must be an object"):
+        discover_databricks_claude_models(
+            "https://workspace.example.com",
+            "token",
+            transport=httpx.MockTransport(_handler),
+        )

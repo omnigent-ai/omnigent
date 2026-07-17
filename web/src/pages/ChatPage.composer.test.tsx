@@ -412,6 +412,29 @@ describe("Composer slash-command submit routing", () => {
     expect(screen.getAllByTestId("model-picker-item").length).toBeGreaterThan(0);
   });
 
+  it("does not open an empty Claude model picker while the live catalog loads", () => {
+    const onSend = vi.fn();
+    render(
+      <Composer
+        {...composerProps({
+          onSend,
+          isTerminalFirst: true,
+          isNativeWrapper: true,
+          showModels: true,
+          modelPickerKind: "claude",
+          codexModelOptions: [],
+        })}
+      />,
+    );
+    const ta = textarea();
+    fireEvent.change(ta, { target: { value: "/model " } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+
+    expect(onSend).not.toHaveBeenCalled();
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(screen.getByText(/Usage: \/model <name>/)).toBeVisible();
+  });
+
   it("opens the server-backed model picker for bare /model on opencode-native", () => {
     const setModel = vi.fn().mockResolvedValue(undefined);
     useChatStore.setState({
@@ -609,6 +632,84 @@ describe("AgentPicker trigger label", () => {
     // cross-session sticky ("opus").
     expect(sonnetRow).toHaveAttribute("data-active", "true");
     expect(opusRow).not.toHaveAttribute("data-active", "true");
+  });
+
+  it("maps a Claude concrete model to its friendly active alias", () => {
+    useChatStore.setState({
+      selectedModel: null,
+      sessionModelOverride: null,
+      llmModel: "system.ai.claude-sonnet-5",
+    });
+    const liveOptions = [
+      {
+        id: "opus",
+        model: "system.ai.claude-opus-4-10",
+        displayName: "Opus 4.10",
+        isDefault: false,
+      },
+      {
+        id: "sonnet",
+        model: "system.ai.claude-sonnet-5",
+        displayName: "Sonnet 5",
+        isDefault: true,
+      },
+    ];
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          agents: [{ id: "a1", name: "claude" }],
+          selectedAgentId: "a1",
+          modelPickerKind: "claude",
+          showModels: true,
+          showEffort: false,
+          codexModelOptions: liveOptions,
+        })}
+      />,
+    );
+
+    expect(screen.getByTestId("agent-picker-trigger")).toHaveTextContent("Sonnet 5");
+    fireEvent.change(textarea(), { target: { value: "/model " } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(
+      document.querySelector('[data-testid="model-picker-item"][data-model-id="sonnet"]'),
+    ).toHaveAttribute("data-active", "true");
+  });
+
+  it("uses the catalog default when a Claude session has no concrete model", () => {
+    useChatStore.setState({ selectedModel: null, sessionModelOverride: null, llmModel: null });
+    const liveOptions = [
+      {
+        id: "opus",
+        model: "system.ai.claude-opus-4-10",
+        displayName: "Opus 4.10",
+        isDefault: false,
+      },
+      {
+        id: "sonnet",
+        model: "system.ai.claude-sonnet-5",
+        displayName: "Sonnet 5",
+        isDefault: true,
+      },
+    ];
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          agents: [{ id: "a1", name: "claude" }],
+          selectedAgentId: "a1",
+          modelPickerKind: "claude",
+          showModels: true,
+          showEffort: false,
+          codexModelOptions: liveOptions,
+        })}
+      />,
+    );
+
+    expect(screen.getByTestId("agent-picker-trigger")).toHaveTextContent("Sonnet 5");
+    fireEvent.change(textarea(), { target: { value: "/model " } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(
+      document.querySelector('[data-testid="model-picker-item"][data-model-id="sonnet"]'),
+    ).toHaveAttribute("data-active", "true");
   });
 
   it("still renders an enabled trigger when the model/effort label is unresolved", () => {

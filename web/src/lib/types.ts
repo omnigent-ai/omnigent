@@ -409,13 +409,8 @@ export interface Session {
    * users can fire ``/skill-name``.
    */
   skills?: SkillSummary[];
-  /**
-   * Codex app-server model options for codex-native sessions. Each option
-   * comes from Codex ``model/list`` and carries the model-specific reasoning
-   * efforts the picker should offer. Empty for non-codex-native sessions or
-   * while the runner has not answered yet.
-   */
-  codexModelOptions?: CodexModelOption[];
+  /** Runner-owned model picker rows for the active native session. */
+  codexModelOptions?: NativeModelOption[];
   /**
    * True while the runner is auto-creating the terminal for a
    * terminal-first session (claude-native / codex-native). Sourced
@@ -494,31 +489,26 @@ export interface SkillSummary {
   description: string;
 }
 
-/**
- * One raw Codex model option from app-server ``model/list``.
- */
-export interface CodexReasoningEffortOption {
-  /** Codex effort id, e.g. ``"xhigh"``. */
+/** Reasoning-effort metadata advertised for a native model. */
+export interface NativeReasoningEffortOption {
+  /** Effort id, e.g. ``"xhigh"``. */
   reasoningEffort: string;
-  /** Codex-provided description, when present. */
+  /** User-facing description, when present. */
   description?: string;
-  /** Additional Codex metadata. */
-  [key: string]: unknown;
 }
 
-export interface CodexModelOption {
+/** One runner-owned native model-picker row. */
+export interface NativeModelOption {
   /** Native picker id (a Claude alias or Codex model id). */
   id: string;
   /** Provider-facing model id the native harness will run. */
   model?: string;
   /** User-facing model label. */
-  displayName?: string;
+  displayName: string;
   /** Default reasoning effort for this model. */
   defaultReasoningEffort?: string;
-  /** Raw effort objects Codex advertises for this model. */
-  supportedReasoningEfforts?: CodexReasoningEffortOption[];
-  /** Whether Codex marks this as the default model. */
+  /** Reasoning efforts advertised for this model. */
+  supportedReasoningEfforts?: NativeReasoningEffortOption[];
+  /** Whether the native catalog marks this as the default model. */
   isDefault?: boolean;
-  /** Additional Codex metadata. */
-  [key: string]: unknown;
 }

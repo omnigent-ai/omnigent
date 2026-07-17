@@ -3,13 +3,13 @@ import { describe, expect, it } from "vitest";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import {
   codexEffortLevelsForModel,
-  findCodexModelOption,
+  findNativeModelOption,
   isCodexNativeModel,
 } from "@/lib/codexNativeModels";
-import type { CodexModelOption } from "@/lib/types";
+import type { NativeModelOption } from "@/lib/types";
 import { isModelImplicitlySelected } from "./ChatPage";
 
-const CODEX_MODEL_OPTIONS: CodexModelOption[] = [
+const CODEX_MODEL_OPTIONS: NativeModelOption[] = [
   {
     id: "gpt-5.5",
     model: "databricks-gpt-5-5",
@@ -68,11 +68,11 @@ describe("CLAUDE_NATIVE_MODELS", () => {
 });
 
 describe("Codex model-list helpers", () => {
-  it("matches only raw Codex picker ids from the Codex catalog", () => {
-    expect(findCodexModelOption(CODEX_MODEL_OPTIONS, "gpt-5.5")?.id).toBe("gpt-5.5");
-    expect(findCodexModelOption(CODEX_MODEL_OPTIONS, "databricks-gpt-5-5")).toBeNull();
+  it("matches Codex picker aliases and provider-facing model ids", () => {
+    expect(findNativeModelOption(CODEX_MODEL_OPTIONS, "gpt-5.5")?.id).toBe("gpt-5.5");
+    expect(findNativeModelOption(CODEX_MODEL_OPTIONS, "databricks-gpt-5-5")?.id).toBe("gpt-5.5");
     expect(isCodexNativeModel(CODEX_MODEL_OPTIONS, "gpt-5.4-mini")).toBe(true);
-    expect(isCodexNativeModel(CODEX_MODEL_OPTIONS, "databricks-gpt-5-4-mini")).toBe(false);
+    expect(isCodexNativeModel(CODEX_MODEL_OPTIONS, "databricks-gpt-5-4-mini")).toBe(true);
     expect(isCodexNativeModel(CODEX_MODEL_OPTIONS, "opus")).toBe(false);
   });
 

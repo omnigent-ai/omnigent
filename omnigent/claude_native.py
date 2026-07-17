@@ -328,6 +328,11 @@ def resolve_claude_native_model_selection(
         custom_model = claude_config.env.get(_ANTHROPIC_CUSTOM_MODEL_OPTION_ENV)
         if custom_model:
             return custom_model
+        provider_fallback = claude_config.env.get(_UCODE_CLAUDE_TIER_TO_ENV["sonnet"])
+        if provider_fallback:
+            return provider_fallback
+        if claude_config.model:
+            return claude_config.model
     return "claude-sonnet-5"
 
 
@@ -391,7 +396,12 @@ def claude_native_model_options(
     if options:
         return options
     return [
-        {"id": model_id, "displayName": label, "isDefault": False}
+        {
+            "id": model_id,
+            "model": model_id,
+            "displayName": label,
+            "isDefault": False,
+        }
         for model_id, label in _CLAUDE_NATIVE_STATIC_MODEL_OPTIONS
     ]
 

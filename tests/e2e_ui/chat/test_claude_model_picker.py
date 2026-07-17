@@ -38,6 +38,7 @@ def _patch_session_as_claude_native(
     page: Page,
     session_id: str,
     model_override: str | None = None,
+    catalog_state: dict[str, bool] | None = None,
 ) -> list[dict]:
     """Patch the browser's session snapshot into a claude-native response.
 
@@ -50,6 +51,7 @@ def _patch_session_as_claude_native(
     :param page: Playwright page before navigation.
     :param session_id: Session id to patch, e.g. ``"conv_abc123"``.
     :param model_override: Optional session-scoped model override to expose.
+    :param catalog_state: Optional mutable readiness gate for delayed options.
     :returns: Captured PATCH request bodies.
     """
     latest_payload: dict | None = None
@@ -84,7 +86,9 @@ def _patch_session_as_claude_native(
         }
         payload["harness"] = "claude"
         payload["llm_model"] = "system.ai.claude-sonnet-5"
-        payload["model_options"] = _MODEL_OPTIONS
+        payload["model_options"] = (
+            _MODEL_OPTIONS if catalog_state is None or catalog_state["ready"] else []
+        )
         if model_override is not None:
             payload["model_override"] = model_override
         latest_payload = dict(payload)
@@ -110,7 +114,7 @@ def test_claude_native_picker_lists_only_live_databricks_models(
     :returns: None.
     """
     base_url, session_id = seeded_session
-    _patch_session_as_claude_native(page, session_id, model_override="sonnet")
+    _patch_session_as_claude_native(page, session_id)
 
     page.goto(f"{base_url}/c/{session_id}")
 
@@ -133,6 +137,70 @@ def test_claude_native_picker_lists_only_live_databricks_models(
     expect(
         page.locator('[data-testid="model-picker-item"][data-model-id="sonnet_5"]')
     ).to_have_count(0)
+
+
+def test_claude_native_picker_updates_after_delayed_catalog(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """A live catalog event fills the UI and applies a compatible sticky alias."""
+    base_url, session_id = seeded_session
+    catalog_state = {"ready": False}
+    patch_bodies = _patch_session_as_claude_native(
+        page,
+        session_id,
+        catalog_state=catalog_state,
+    )
+    stream_script = """
+        (() => {
+          const sessionId = __SESSION_ID__;
+          const originalFetch = window.fetch.bind(window);
+          window.fetch = (input, init) => {
+            const url = typeof input === "string" ? input : input.url;
+            const streamPath = `/v1/sessions/${sessionId}/stream`;
+            if (new URL(url, window.location.origin).pathname === streamPath) {
+              const body = new ReadableStream({
+                start(controller) {
+                  window.__claudeModelStreamController = controller;
+                },
+              });
+              return Promise.resolve(new Response(body, {
+                status: 200,
+                headers: { "content-type": "text/event-stream" },
+              }));
+            }
+            return originalFetch(input, init);
+          };
+        })()
+        """.replace("__SESSION_ID__", json.dumps(session_id))
+    page.add_init_script(
+        stream_script,
+    )
+    page.add_init_script("window.localStorage.setItem('omnigent.picker.model', 'opus')")
+
+    page.goto(f"{base_url}/c/{session_id}")
+
+    trigger = page.get_by_test_id("agent-picker-trigger")
+    expect(trigger).to_contain_text("system.ai.claude-sonnet-5", timeout=15_000)
+    page.wait_for_function("window.__claudeModelStreamController !== undefined")
+
+    catalog_state["ready"] = True
+    page.evaluate(
+        """
+        ({ sessionId }) => {
+          const frame = `event: session.model_options\ndata: ${JSON.stringify({
+            conversation_id: sessionId,
+          })}\n\n`;
+          window.__claudeModelStreamController.enqueue(new TextEncoder().encode(frame));
+        }
+        """,
+        {"sessionId": session_id},
+    )
+
+    expect(trigger).to_contain_text("Opus 4.10", timeout=10_000)
+    assert {"model_override": "opus", "silent": True} in patch_bodies
+    trigger.click()
+    expect(page.locator('[data-testid="model-picker-item"]')).to_have_count(len(_EXPECTED_ROWS))
 
 
 def test_claude_native_alias_selection_persists(

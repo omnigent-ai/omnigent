@@ -5375,6 +5375,167 @@ describe("chatStore — bindStream sticky-pref handoff", () => {
     expect(state.selectedEffort).toBe("high");
   });
 
+  it("applies a persisted Claude model after delayed model options arrive", async () => {
+    seedSession("conv_cn_delayed", []);
+    window.localStorage.setItem("omnigent.picker.model", "opus");
+    let snapshotCount = 0;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (
+        url.split("?")[0] === "/v1/sessions/conv_cn_delayed" &&
+        (init?.method ?? "GET") === "GET"
+      ) {
+        snapshotCount += 1;
+        return mockResponse({
+          id: "conv_cn_delayed",
+          agent_id: "agent_xyz",
+          status: "idle",
+          created_at: 0,
+          items: [],
+          labels: { "omnigent.wrapper": "claude-code-native-ui" },
+          model_override: null,
+          model_options: snapshotCount === 1 ? [] : CLAUDE_MODEL_OPTIONS,
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    useChatStore.setState({ selectedEffort: null, selectedModel: "opus" });
+    await useChatStore.getState().switchTo("conv_cn_delayed");
+
+    expect(patchCallsFor("conv_cn_delayed").some((p) => "model_override" in p)).toBe(false);
+
+    handleSessionEvent({
+      type: "session_model_options",
+      conversationId: "conv_cn_delayed",
+    });
+    await tick();
+
+    expect(patchCallsFor("conv_cn_delayed")).toEqual(
+      expect.arrayContaining([{ model_override: "opus", silent: true }]),
+    );
+    expect(useChatStore.getState()).toMatchObject({
+      selectedModel: "opus",
+      sessionModelOverride: "opus",
+      codexModelOptions: CLAUDE_MODEL_OPTIONS,
+    });
+    window.localStorage.removeItem("omnigent.picker.model");
+  });
+
+  it("refetches a resolved Claude catalog when its event races the bind snapshot", async () => {
+    seedSession("conv_cn_race", []);
+    window.localStorage.setItem("omnigent.picker.model", "opus");
+    let resolveInitialSnapshot: ((response: Response) => void) | null = null;
+    let resolveItems: ((response: Response) => void) | null = null;
+    let snapshotCount = 0;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.startsWith("/v1/sessions/conv_cn_race/items")) {
+        const response = defaultFetchHandler(input, init);
+        return new Promise<Response>((resolve) => {
+          resolveItems = resolve;
+        }).then(() => response);
+      }
+      if (url.split("?")[0] === "/v1/sessions/conv_cn_race" && (init?.method ?? "GET") === "GET") {
+        snapshotCount += 1;
+        const response = mockResponse({
+          id: "conv_cn_race",
+          agent_id: "agent_xyz",
+          status: "idle",
+          created_at: 0,
+          items: [],
+          labels: { "omnigent.wrapper": "claude-code-native-ui" },
+          model_override: null,
+          model_options: snapshotCount === 1 ? [] : CLAUDE_MODEL_OPTIONS,
+        });
+        if (snapshotCount === 1) {
+          return new Promise<Response>((resolve) => {
+            resolveInitialSnapshot = resolve;
+          });
+        }
+        return response;
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    useChatStore.setState({ selectedEffort: null, selectedModel: "opus" });
+    const switchPromise = useChatStore.getState().switchTo("conv_cn_race");
+    await tick();
+    expect(resolveInitialSnapshot).not.toBeNull();
+
+    handleSessionEvent({
+      type: "session_model_options",
+      conversationId: "conv_cn_race",
+    });
+    resolveInitialSnapshot!(
+      mockResponse({
+        id: "conv_cn_race",
+        agent_id: "agent_xyz",
+        status: "idle",
+        created_at: 0,
+        items: [],
+        labels: { "omnigent.wrapper": "claude-code-native-ui" },
+        model_override: null,
+        model_options: [],
+      }),
+    );
+    await tick();
+    expect(snapshotCount).toBe(2);
+    resolveItems!(mockResponse({}));
+    await switchPromise;
+    await tick();
+
+    expect(patchCallsFor("conv_cn_race")).toEqual(
+      expect.arrayContaining([{ model_override: "opus", silent: true }]),
+    );
+    expect(useChatStore.getState()).toMatchObject({
+      selectedModel: "opus",
+      sessionModelOverride: "opus",
+      codexModelOptions: CLAUDE_MODEL_OPTIONS,
+    });
+    window.localStorage.removeItem("omnigent.picker.model");
+  });
+
+  it("does not apply a persisted Claude alias removed from the delayed catalog", async () => {
+    seedSession("conv_cn_delayed_removed", []);
+    window.localStorage.setItem("omnigent.picker.model", "fable");
+    let snapshotCount = 0;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (
+        url.split("?")[0] === "/v1/sessions/conv_cn_delayed_removed" &&
+        (init?.method ?? "GET") === "GET"
+      ) {
+        snapshotCount += 1;
+        return mockResponse({
+          id: "conv_cn_delayed_removed",
+          agent_id: "agent_xyz",
+          status: "idle",
+          created_at: 0,
+          items: [],
+          labels: { "omnigent.wrapper": "claude-code-native-ui" },
+          model_override: null,
+          model_options: snapshotCount === 1 ? [] : CLAUDE_MODEL_OPTIONS,
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    useChatStore.setState({ selectedEffort: null, selectedModel: "fable" });
+    await useChatStore.getState().switchTo("conv_cn_delayed_removed");
+    handleSessionEvent({
+      type: "session_model_options",
+      conversationId: "conv_cn_delayed_removed",
+    });
+    await tick();
+
+    expect(
+      patchCallsFor("conv_cn_delayed_removed").some((patch) => "model_override" in patch),
+    ).toBe(false);
+    expect(useChatStore.getState().sessionModelOverride).toBeNull();
+    window.localStorage.removeItem("omnigent.picker.model");
+  });
+
   it("does NOT apply a sticky model to a routing-enabled session", async () => {
     // Intelligent routing owns model selection: the bind-time sticky handoff
     // must NOT silently re-pin the last-used model, or the server's

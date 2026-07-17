@@ -589,6 +589,85 @@ def test_ucode_config_refreshes_live_models_and_builds_picker_options(
     ]
 
 
+def test_claude_native_static_model_options_keep_alias_as_model() -> None:
+    """Direct Claude auth rows preserve the alias/model/label contract."""
+    options = claude_native.claude_native_model_options(None)
+
+    assert options
+    assert all(option["model"] == option["id"] for option in options)
+
+
+def test_sonnet_5_selection_resolves_to_the_configured_custom_model() -> None:
+    """The friendly Sonnet 5 row launches the provider's routable model id."""
+    config = claude_native.ClaudeNativeUcodeConfig(
+        env={
+            "ANTHROPIC_CUSTOM_MODEL_OPTION": "system.ai.claude-sonnet-5[1m]",
+        }
+    )
+    assert (
+        claude_native.resolve_claude_native_model_selection("sonnet_5", config)
+        == "system.ai.claude-sonnet-5[1m]"
+    )
+
+
+def test_removed_sonnet_5_selection_falls_back_to_routable_databricks_sonnet() -> None:
+    """A stale Sonnet 5 override cannot launch a non-gateway Anthropic id."""
+    config = claude_native.ClaudeNativeUcodeConfig(
+        env={
+            "ANTHROPIC_DEFAULT_SONNET_MODEL": "system.ai.claude-sonnet-4-6",
+        }
+    )
+
+    assert (
+        claude_native.resolve_claude_native_model_selection("sonnet_5", config)
+        == "system.ai.claude-sonnet-4-6"
+    )
+
+
+def test_ucode_config_retains_live_fable_when_opted_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Live discovery preserves Fable when the persisted opt-in is enabled."""
+    from omnigent.onboarding.ucode_state import UcodeAgentState, UcodeWorkspaceState
+
+    workspace_state = UcodeWorkspaceState(
+        workspace_url="https://example.databricks.com",
+        claude_models={},
+        fable_enabled=True,
+        agents={
+            "claude": UcodeAgentState(
+                model="system.ai.claude-opus-4-10",
+                base_url="https://example.databricks.com/ai-gateway/anthropic",
+                auth_command="printf token",
+            )
+        },
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.databricks_config.get_workspace_url_for_profile",
+        lambda profile: "https://example.databricks.com",
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.ucode_state.read_ucode_state",
+        lambda workspace_url: workspace_state,
+    )
+    monkeypatch.setattr(
+        "omnigent.runtime.credentials.databricks.resolve_databricks_workspace",
+        lambda profile: SimpleNamespace(host="https://example.databricks.com", token="token"),
+    )
+    monkeypatch.setattr(
+        "omnigent.databricks_model_discovery.discover_databricks_claude_models",
+        lambda host, token: {
+            "fable": "system.ai.claude-fable-5",
+            "opus": "system.ai.claude-opus-4-10",
+        },
+    )
+
+    config = claude_native._ucode_config_for_profile("test-profile")
+
+    assert config is not None
+    assert config.env["ANTHROPIC_DEFAULT_FABLE_MODEL"] == "system.ai.claude-fable-5"
+
+
 def test_ucode_config_uses_cached_models_when_live_refresh_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

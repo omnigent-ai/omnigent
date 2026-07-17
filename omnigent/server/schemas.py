@@ -160,6 +160,28 @@ class SkillSummary(BaseModel):
     description: str
 
 
+class NativeReasoningEffortOption(BaseModel):
+    """Reasoning-effort metadata advertised by a native model catalog."""
+
+    model_config = ConfigDict(extra="allow")
+
+    reasoningEffort: str
+    description: str | None = None
+
+
+class NativeModelOption(BaseModel):
+    """One runner-owned native model-picker row."""
+
+    model_config = ConfigDict(extra="allow")
+
+    id: str
+    model: str | None = None
+    displayName: str
+    defaultReasoningEffort: str | None = None
+    supportedReasoningEfforts: list[NativeReasoningEffortOption] = Field(default_factory=list)
+    isDefault: bool | None = None
+
+
 class PolicySummary(BaseModel):
     """
     Safe subset of a policy's spec for API exposure.
@@ -1829,7 +1851,7 @@ class SessionResponse(BaseModel):
     archived: bool = False
     todos: list[dict[str, Any]] = Field(default_factory=list)
     skills: list[SkillSummary] = Field(default_factory=list)
-    model_options: list[dict[str, Any]] = Field(default_factory=list)
+    model_options: list[NativeModelOption] = Field(default_factory=list)
     terminal_pending: bool = False
     sandbox_status: SandboxStatus | None = None
     # Per-MCP-server startup state for native harness sessions

@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
 from omnigent.entities import Conversation, ConversationItem, MessageData, PagedList
 from omnigent.server.routes import sessions as _sessions_mod
@@ -44,6 +45,12 @@ async def _drain_model_options(session_id: str) -> None:
         if session_id in _sessions_mod._model_options_cache:
             return
         await asyncio.sleep(0)
+
+
+def test_model_options_wire_rejects_snake_case_display_name() -> None:
+    """The API boundary enforces the camelCase model-option contract."""
+    with pytest.raises(ValidationError):
+        _sessions_mod._model_options_from_wire([{"id": "opus", "display_name": "Opus 4.10"}])
 
 
 class _ConversationStore:
@@ -745,9 +752,12 @@ async def test_session_snapshot_includes_model_options_from_runner(
     )
 
     assert f"/v1/sessions/{session_id}/codex-model-options" in fake_client.get_calls
-    assert [m["id"] for m in snapshot.model_options] == ["gpt-5.5"]
-    assert snapshot.model_options[0]["displayName"] == "GPT-5.5"
-    assert snapshot.model_options[0]["supportedReasoningEfforts"] == [
+    assert [m.id for m in snapshot.model_options] == ["gpt-5.5"]
+    assert snapshot.model_options[0].displayName == "GPT-5.5"
+    assert [
+        effort.model_dump(exclude_none=True)
+        for effort in snapshot.model_options[0].supportedReasoningEfforts
+    ] == [
         {"reasoningEffort": "low", "description": "Low"},
         {"reasoningEffort": "medium", "description": "Medium"},
         {"reasoningEffort": "high", "description": "High"},
@@ -831,7 +841,7 @@ async def test_claude_session_snapshot_loads_launch_time_model_aliases(
     snapshot = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
 
     assert f"/v1/sessions/{session_id}/claude-model-options" in fake_client.get_calls
-    assert [(m["id"], m["displayName"]) for m in snapshot.model_options] == [
+    assert [(m.id, m.displayName) for m in snapshot.model_options] == [
         ("opus", "Opus 4.10"),
         ("haiku", "Haiku 4.5"),
     ]
@@ -928,11 +938,11 @@ async def test_session_snapshot_serves_pi_model_options_from_extension_push(
 
     # Served straight from the pushed cache — no runner model-options fetch.
     assert not any("model-options" in url for url in fake_client.get_calls)
-    assert [m["id"] for m in snapshot.model_options] == [
+    assert [m.id for m in snapshot.model_options] == [
         "databricks-claude-sonnet-4-6",
         "anthropic-claude-opus-4-1",
     ]
-    assert snapshot.model_options[0]["displayName"] == "Sonnet 4.6"
+    assert snapshot.model_options[0].displayName == "Sonnet 4.6"
 
 
 @pytest.mark.asyncio
@@ -1001,7 +1011,7 @@ async def test_session_snapshot_serves_static_cursor_model_options(
 
     # No runner round-trip for cursor model options (served statically).
     assert not any("model-options" in url for url in fake_client.get_calls)
-    ids = [m["id"] for m in snapshot.model_options]
+    ids = [m.id for m in snapshot.model_options]
     assert "claude-opus-4-6" in ids and "gpt-5.2" in ids and "composer-2.5" in ids
     # base-id namespace only — no flattened effort variants leak through.
     assert not any("-high" in i or "-xhigh" in i for i in ids)
@@ -1101,7 +1111,7 @@ async def test_session_snapshot_refresh_state_reloads_model_options(
     )
     # Refresh must not echo the stale cached row. If this is "stale-model",
     # browser reloads would not recover after the server-side cache shape is fixed.
-    assert [m["id"] for m in refreshed.model_options] == []
+    assert [m.id for m in refreshed.model_options] == []
     await _drain_model_options("3626053dfa9668a8604cc06e0b590ae0")
     snapshot = await _get_session_snapshot(
         conv_store,  # type: ignore[arg-type]
@@ -1112,8 +1122,8 @@ async def test_session_snapshot_refresh_state_reloads_model_options(
         "/v1/sessions/3626053dfa9668a8604cc06e0b590ae0/codex-model-options"
         in fake_client.get_calls
     )
-    assert [m["id"] for m in snapshot.model_options] == ["fresh-model"]
-    assert snapshot.model_options[0]["displayName"] == "Fresh Model"
+    assert [m.id for m in snapshot.model_options] == ["fresh-model"]
+    assert snapshot.model_options[0].displayName == "Fresh Model"
 
 
 @pytest.mark.asyncio
@@ -1213,8 +1223,8 @@ async def test_session_snapshot_retries_empty_model_options(
         )
         == 2
     )
-    assert [m["id"] for m in snapshot.model_options] == ["gpt-5.5"]
-    assert snapshot.model_options[0]["defaultReasoningEffort"] == "xhigh"
+    assert [m.id for m in snapshot.model_options] == ["gpt-5.5"]
+    assert snapshot.model_options[0].defaultReasoningEffort == "xhigh"
 
 
 @pytest.mark.asyncio
@@ -1327,8 +1337,8 @@ async def test_session_snapshot_retries_503_model_options(
         )
         == 2
     )
-    assert [m["id"] for m in snapshot.model_options] == ["gpt-5.4"]
-    assert snapshot.model_options[0]["defaultReasoningEffort"] == "medium"
+    assert [m.id for m in snapshot.model_options] == ["gpt-5.4"]
+    assert snapshot.model_options[0].defaultReasoningEffort == "medium"
 
 
 @pytest.mark.asyncio
