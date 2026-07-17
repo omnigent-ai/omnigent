@@ -2084,6 +2084,23 @@ def test_augment_claude_args_uses_last_repeated_launch_override(
     assert settings["effortLevel"] == "high"
 
 
+def test_augment_claude_args_appends_session_rename_system_prompt(
+    tmp_path: Path,
+) -> None:
+    """Claude native receives the rename directive at system priority."""
+    from omnigent.tools.builtins.session_rename import SESSION_RENAME_INSTRUCTION
+
+    args = augment_claude_args(
+        (),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+    )
+
+    assert args.count("--append-system-prompt") == 1
+    index = args.index("--append-system-prompt")
+    assert args[index + 1] == SESSION_RENAME_INSTRUCTION
+
+
 def test_augment_claude_args_merges_user_disallowed_tools(tmp_path: Path) -> None:
     """
     A user-supplied ``--disallowedTools`` passes through unchanged.

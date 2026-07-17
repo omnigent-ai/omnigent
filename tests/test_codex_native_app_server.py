@@ -341,6 +341,9 @@ args = ["old"]
 [mcp_servers.omnigent.env] # stale generated env
 OLD = "1"
 
+[mcp_servers.omnigent.tools.sys_session_rename] # stale generated approval
+approval_mode = "prompt"
+
 [mcp_servers.other]
 command = "other"
 args = []
@@ -378,6 +381,9 @@ args = []
             "--bridge-dir",
             str(bridge_dir),
         ],
+        "tools": {
+            "sys_session_rename": {"approval_mode": "approve"},
+        },
     }
 
 
@@ -417,6 +423,9 @@ async def test_start_writes_fresh_mcp_config_without_leading_blanks(
             "--bridge-dir",
             str(bridge_dir),
         ],
+        "tools": {
+            "sys_session_rename": {"approval_mode": "approve"},
+        },
     }
 
 

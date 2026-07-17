@@ -91,8 +91,23 @@ from omnigent.tools.builtins.load_skill import (
     find_skill_by_name,
     format_skill_meta_text,
 )
+from omnigent.tools.builtins.session_rename import SESSION_RENAME_INSTRUCTION
 
 _logger = logging.getLogger(__name__)
+
+
+def _is_first_user_turn(history: list[dict[str, Any]]) -> bool:
+    """Return whether history contains one user message and no assistant reply."""
+    user_messages = 0
+    for item in history:
+        if item.get("type") != "message":
+            continue
+        role = item.get("role")
+        if role == "assistant":
+            return False
+        if role == "user":
+            user_messages += 1
+    return user_messages == 1
 
 
 # ── session.status "waiting" backwards-compat (new runner ↔ old server) ──
@@ -13779,6 +13794,14 @@ def create_runner_app(
 
         if conv not in _session_histories:
             _session_histories[conv] = await _load_history_as_input(conv)
+
+        if _is_first_user_turn(_session_histories[conv]):
+            instructions = (
+                f"{instructions}\n\n{SESSION_RENAME_INSTRUCTION}"
+                if instructions
+                else SESSION_RENAME_INSTRUCTION
+            )
+            ctx = dataclasses.replace(ctx, instructions=instructions)
 
         harness_body: dict[str, Any] = {
             "type": "message",

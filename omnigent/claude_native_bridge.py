@@ -1413,12 +1413,16 @@ def augment_claude_args(
         launch_effort=_arg_value(claude_args, "--effort"),
     )
     args = _merge_disallowed_tools(list(claude_args), _OMNIGENT_DISALLOWED_TOOLS)
+    from omnigent.tools.builtins.session_rename import SESSION_RENAME_INSTRUCTION
+
     args.extend(
         [
             "--mcp-config",
             json.dumps(mcp_config, separators=(",", ":")),
             "--settings",
             json.dumps(hook_settings, separators=(",", ":")),
+            "--append-system-prompt",
+            SESSION_RENAME_INSTRUCTION,
         ]
     )
     args.extend(

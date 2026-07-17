@@ -193,6 +193,65 @@ def test_web_started_codex_turn_returns_without_waiting_for_terminal_event(
     ]
 
 
+def test_first_turn_rename_instruction_uses_developer_instructions(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The native first turn gives session renaming developer priority."""
+    from omnigent.tools.builtins.session_rename import SESSION_RENAME_INSTRUCTION
+
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.created = []
+    _FakeCodexNativeClient.next_turn = 1
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text('model = "gpt-5.4-mini"\n')
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_123",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_123",
+            codex_home=str(codex_home),
+            active_turn_id=None,
+        ),
+    )
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    async def run() -> None:
+        async for _event in executor.run_turn(
+            [{"role": "user", "content": [{"type": "input_text", "text": "hello"}]}],
+            [],
+            SESSION_RENAME_INSTRUCTION,
+            None,
+        ):
+            pass
+
+    asyncio.run(run())
+
+    assert _FakeCodexNativeClient.requests == [
+        (
+            "turn/start",
+            {
+                "threadId": "thread_123",
+                "input": [{"type": "text", "text": "hello"}],
+                "collaborationMode": {
+                    "mode": "default",
+                    "settings": {
+                        "model": "gpt-5.4-mini",
+                        "reasoning_effort": None,
+                        "developer_instructions": SESSION_RENAME_INSTRUCTION,
+                    },
+                },
+            },
+        ),
+    ]
+
+
 def test_image_block_is_sent_as_local_image_not_inline_base64(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

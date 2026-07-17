@@ -165,7 +165,8 @@ def _codex_mcp_server_config_section(
     :param python_executable: Python executable for serve-mcp, e.g.
         ``"/path/to/.venv/bin/python"``. ``None`` uses
         :data:`sys.executable`.
-    :returns: TOML text for ``[mcp_servers.omnigent]``.
+    :returns: TOML text for ``[mcp_servers.omnigent]`` and its
+        framework-managed rename-tool approval.
     """
     python = python_executable or sys.executable
     args = [
@@ -177,7 +178,13 @@ def _codex_mcp_server_config_section(
         str(bridge_dir),
     ]
     args_toml = ", ".join(json.dumps(a) for a in args)
-    return f"[mcp_servers.omnigent]\ncommand = {json.dumps(python)}\nargs = [{args_toml}]\n"
+    return (
+        f"[mcp_servers.omnigent]\n"
+        f"command = {json.dumps(python)}\n"
+        f"args = [{args_toml}]\n\n"
+        "[mcp_servers.omnigent.tools.sys_session_rename]\n"
+        'approval_mode = "approve"\n'
+    )
 
 
 def _pin_codex_config_model(codex_home: Path, model: str) -> None:

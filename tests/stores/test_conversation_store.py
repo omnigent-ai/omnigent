@@ -76,6 +76,28 @@ def test_get_nonexistent(conversation_store: SqlAlchemyConversationStore) -> Non
     assert conversation_store.get_conversation("c55a64c3f6f954fe0fc8738ba3f45f26") is None
 
 
+def test_rename_conversation_if_title_matches_is_atomic(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    conv = conversation_store.create_conversation(title="original request title")
+
+    renamed = conversation_store.rename_conversation_if_title_matches(
+        conv.id,
+        "original request title",
+        "Debug request timeout",
+    )
+    stale = conversation_store.rename_conversation_if_title_matches(
+        conv.id,
+        "original request title",
+        "Overwrite manual title",
+    )
+
+    assert renamed is not None
+    assert renamed.title == "Debug request timeout"
+    assert stale is None
+    assert conversation_store.get_conversation(conv.id).title == "Debug request timeout"  # type: ignore[union-attr]
+
+
 def test_get_conversations_bulk(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:

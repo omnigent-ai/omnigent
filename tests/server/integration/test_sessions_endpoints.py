@@ -1431,6 +1431,154 @@ async def test_patch_session_updates_labels(
     assert labels["b"] == "2"
 
 
+async def test_auto_title_replaces_only_the_deterministic_seed(
+    client: httpx.AsyncClient,
+) -> None:
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    seeded = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "item_data": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "please investigate the authentication timeout in production",
+                        }
+                    ],
+                },
+            },
+        },
+    )
+    assert seeded.status_code == 202, seeded.text
+
+    renamed = await client.post(
+        f"/v1/sessions/{session['id']}/auto-title",
+        json={"title": "Debug authentication timeout"},
+    )
+    assert renamed.status_code == 200, renamed.text
+    assert renamed.json() == {
+        "renamed": True,
+        "title": "Debug authentication timeout",
+        "reason": None,
+    }
+
+    manual = await client.patch(
+        f"/v1/sessions/{session['id']}",
+        json={"title": "My manual title"},
+    )
+    assert manual.status_code == 200, manual.text
+    declined = await client.post(
+        f"/v1/sessions/{session['id']}/auto-title",
+        json={"title": "Overwrite manual title"},
+    )
+    assert declined.status_code == 200, declined.text
+    assert declined.json() == {
+        "renamed": False,
+        "title": None,
+        "reason": "title_changed",
+    }
+
+
+async def test_auto_title_does_not_replace_explicit_title(
+    client: httpx.AsyncClient,
+) -> None:
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"], title="Keep this title")
+    seeded = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "item_data": {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "investigate the authentication timeout"}
+                    ],
+                },
+            },
+        },
+    )
+    assert seeded.status_code == 202, seeded.text
+
+    response = await client.post(
+        f"/v1/sessions/{session['id']}/auto-title",
+        json={"title": "Debug authentication timeout"},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["renamed"] is False
+    assert response.json()["reason"] == "title_changed"
+
+
+async def test_auto_title_declines_when_no_seed_exists(
+    client: httpx.AsyncClient,
+) -> None:
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    response = await client.post(
+        f"/v1/sessions/{session['id']}/auto-title",
+        json={"title": "Debug authentication timeout"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "renamed": False,
+        "title": None,
+        "reason": "no_seed",
+    }
+
+
+async def test_auto_title_declines_child_sessions(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    agent = await create_test_agent(client)
+    parent = await _create_session(client, agent["id"])
+    store = SqlAlchemyConversationStore(db_uri)
+    child = store.create_conversation(
+        kind="sub_agent",
+        title="coder:debug-auth",
+        parent_conversation_id=parent["id"],
+        agent_id=agent["id"],
+    )
+
+    response = await client.post(
+        f"/v1/sessions/{child.id}/auto-title",
+        json={"title": "Debug authentication timeout"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "renamed": False,
+        "title": None,
+        "reason": "not_top_level",
+    }
+
+
+async def test_auto_title_rejects_multiline_titles(
+    client: httpx.AsyncClient,
+) -> None:
+    agent = await create_test_agent(client)
+    session = await _create_session(
+        client,
+        agent["id"],
+        initial_message="investigate the authentication timeout",
+    )
+
+    response = await client.post(
+        f"/v1/sessions/{session['id']}/auto-title",
+        json={"title": "Debug authentication\ntimeout"},
+    )
+
+    assert response.status_code == 400, response.text
+
+
 async def test_patch_session_archive_hides_from_default_list(
     client: httpx.AsyncClient,
 ) -> None:
