@@ -43,40 +43,47 @@ docker compose down -v
 
 Built-in accounts auth: no IdP to register, no proxy to host.
 This is the default — `docker compose up -d` brings it up with no
-extra env wiring. First boot creates an admin user (named after the
-operator's OS user, falling back to `admin` in headless containers)
-with a random password that lands in the container logs and on the
-persistent volume at `/data/admin-credentials`.
+extra env wiring. No credentials are auto-generated. On first boot,
+when no admin exists yet and none was pre-seeded, the server creates
+nothing and prints:
+
+```
+→ No admin yet. Open <base_url> to create the first admin account (choose a username + password).
+```
+
+You then open the web UI's **Create admin** form (it appears while no
+admin exists) and pick your own username + password.
 
 For any deploy reachable through a public domain, also set the
-external URL so invite links resolve correctly:
+external URL so the printed link and invite links resolve correctly:
 
 ```bash
 # Add to .env (bootstrap.sh already minted the cookie secret for you):
 OMNIGENT_ACCOUNTS_BASE_URL=https://omnigent.example.com
 
 docker compose up -d
-docker compose logs omnigent | grep -A4 "Created initial admin"
+docker compose logs omnigent      # shows the "No admin yet" line with your base URL
 ```
 
-Copy the random `password` from the log line into the web UI's
-login form, then:
+Once you've created the admin and signed in:
 
 - Click your username in the top-right → **Members** → **Invite member**.
 - Share the single-use URL with the teammate; they pick their own
   username and password when they redeem it.
 - Sign-out lives in the same account menu.
 
-Headless deploy (CI, Cloud Run, etc.) where you can't read the
-logs? Pre-seed the password:
+Headless deploy (CI, Cloud Run, etc.) where you can't reach the
+Create-admin form? Pre-seed the admin password so first boot creates
+the admin directly:
 
 ```bash
 OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD=<your-strong-password>
 ```
 
-The persistent password file is at `/data/admin-credentials` on
-the `artifact-data` volume — survives `docker compose restart`,
-deleted by `docker compose down -v`.
+`OMNIGENT_ADMIN_CREDENTIALS_PATH` (set to `/data/admin-credentials`
+in `docker-compose.yaml`) anchors the persistent state directory on
+the `artifact-data` volume — it survives `docker compose restart` and
+is deleted by `docker compose down -v`.
 
 ## Multi-user mode (OIDC)
 
