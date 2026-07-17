@@ -35,6 +35,11 @@ from typing import Any
 
 _logger = logging.getLogger(__name__)
 
+# Wall-clock cap for git subprocesses backing the changed-files view. Kept
+# short so a slow/hung repo can't block the panel; each call degrades cleanly
+# on timeout rather than raising. Bump if very large repos need more headroom.
+_GIT_TIMEOUT_SECONDS = 5
+
 
 class GitStatusUnavailable(RuntimeError):
     """A ``git`` invocation backing the changed-files view could not complete.
@@ -711,7 +716,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
                 argv,
                 cwd=str(self._git_root),
                 capture_output=True,
-                timeout=5,
+                timeout=_GIT_TIMEOUT_SECONDS,
             )
         except subprocess.TimeoutExpired as exc:
             elapsed = time.monotonic() - started
@@ -806,7 +811,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
                 argv,
                 cwd=str(self._git_root),
                 capture_output=True,
-                timeout=5,
+                timeout=_GIT_TIMEOUT_SECONDS,
             )
         except subprocess.TimeoutExpired as exc:
             elapsed = time.monotonic() - started
@@ -874,7 +879,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
                 ["git", "show", f"HEAD:{git_path}"],
                 cwd=str(self._git_root),
                 capture_output=True,
-                timeout=5,
+                timeout=_GIT_TIMEOUT_SECONDS,
             )
             if result.returncode == 0:
                 return result.stdout.decode("utf-8", errors="replace")
@@ -957,7 +962,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
                 argv,
                 cwd=str(self._git_root),
                 capture_output=True,
-                timeout=5,
+                timeout=_GIT_TIMEOUT_SECONDS,
             )
         except (subprocess.TimeoutExpired, OSError):
             _logger.warning(
