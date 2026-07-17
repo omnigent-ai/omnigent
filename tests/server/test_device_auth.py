@@ -416,20 +416,20 @@ def test_device_grant_routes_absent_by_default(disabled_app: TestClient) -> None
     """Default-off: the /oauth/* router is not mounted unless explicitly
     enabled, so the device-grant POST handlers don't run.
 
-    The endpoints fall through to the SPA catch-all mount at ``/`` rather than
-    404 (that mount only serves GET, so the client POSTs get 405). The point is
-    that NO device-grant logic executes: no device_code is issued and no OAuth
-    error shape is returned — the handlers simply aren't there.
+    With no mounted handler the POST is not routed: it 404s when nothing else
+    claims the path, or 405s when a built web SPA is mounted at ``/`` (its
+    catch-all serves GET only). Either way NO device-grant logic executes —
+    no device_code is issued and no OAuth error shape is returned.
     """
     r = disabled_app.post("/oauth/device/authorize", json={"client_id": "slack"})
-    assert r.status_code == 405
+    assert r.status_code in (404, 405)
     assert "device_code" not in r.text
     r = disabled_app.post(
         "/oauth/token", data={"grant_type": "refresh_token", "refresh_token": "x"}
     )
-    assert r.status_code == 405
+    assert r.status_code in (404, 405)
     r = disabled_app.post("/oauth/revoke", data={"refresh_token": "x"})
-    assert r.status_code == 405
+    assert r.status_code in (404, 405)
 
 
 def test_account_auth_available_when_device_grant_disabled(disabled_app: TestClient) -> None:
@@ -446,9 +446,10 @@ def test_account_auth_available_when_device_grant_disabled(disabled_app: TestCli
     # And an authenticated account-management route works.
     r = disabled_app.get("/auth/users")
     assert r.status_code == 200, r.text
-    # Sanity: the device-grant surface is still absent (no /oauth handler).
+    # Sanity: the device-grant surface is still absent (no /oauth handler) —
+    # 404 with no SPA catch-all, 405 when a built SPA is mounted at "/".
     r = disabled_app.post("/oauth/device/authorize", json={"client_id": "slack"})
-    assert r.status_code == 405
+    assert r.status_code in (404, 405)
 
 
 @pytest.fixture
