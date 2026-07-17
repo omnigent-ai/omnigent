@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from omnigent.runtime.filesystem_registry import (
+    _GIT_STATUS_TIMEOUT_ENV,
     AgentEditFilesystemRegistry,
     GitFilesystemRegistry,
     GitStatusUnavailable,
@@ -542,6 +543,13 @@ def test_git_list_changed_files_raises_on_timeout(tmp_path: Path, monkeypatch) -
     reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
     with pytest.raises(GitStatusUnavailable, match="timed out"):
         reg.list_changed_files("any-conv", limit=100)
+
+
+def test_git_status_timeout_env_override(tmp_path: Path, monkeypatch) -> None:
+    """The git status timeout can be overridden for large repositories."""
+    monkeypatch.setenv(_GIT_STATUS_TIMEOUT_ENV, "50")
+    reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+    assert reg._git_status_timeout_s == 50
 
 
 def test_git_list_changed_files_raises_on_nonzero_exit(tmp_path: Path, monkeypatch) -> None:

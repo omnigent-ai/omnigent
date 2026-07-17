@@ -26,6 +26,7 @@ from __future__ import annotations
 import dataclasses
 import fnmatch
 import logging
+import os
 import subprocess
 import threading
 import time
@@ -34,6 +35,8 @@ from pathlib import Path
 from typing import Any
 
 _logger = logging.getLogger(__name__)
+
+_GIT_STATUS_TIMEOUT_ENV = "OMNIGENT_GIT_STATUS_TIMEOUT_S"
 
 
 class GitStatusUnavailable(RuntimeError):
@@ -677,6 +680,10 @@ class GitFilesystemRegistry(FilesystemRegistry):
         ``Path("/home/user/project")``.
     :param git_root: The repository root (directory containing ``.git/``),
         as returned by :func:`_find_git_root`.
+
+    ``git status`` calls time out after five seconds by default. Set
+    :envvar:`OMNIGENT_GIT_STATUS_TIMEOUT_S` to a positive integer of seconds for
+    repositories that need a larger budget.
     """
 
     def __init__(self, watch_path: Path, git_root: Path) -> None:
@@ -687,6 +694,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
         """
         super().__init__(watch_path)
         self._git_root = git_root
+        self._git_status_timeout_s = int(os.environ.get(_GIT_STATUS_TIMEOUT_ENV, 5))
 
     def list_changed_files(self, conversation_id: str, *, limit: int) -> list[dict[str, Any]]:
         """Return all uncommitted changes in the working tree, newest first.
@@ -711,7 +719,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
                 argv,
                 cwd=str(self._git_root),
                 capture_output=True,
-                timeout=5,
+                timeout=self._git_status_timeout_s,
             )
         except subprocess.TimeoutExpired as exc:
             elapsed = time.monotonic() - started
@@ -802,7 +810,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
                 argv,
                 cwd=str(self._git_root),
                 capture_output=True,
-                timeout=5,
+                timeout=self._git_status_timeout_s,
             )
         except subprocess.TimeoutExpired as exc:
             elapsed = time.monotonic() - started
@@ -870,7 +878,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
                 ["git", "show", f"HEAD:{git_path}"],
                 cwd=str(self._git_root),
                 capture_output=True,
-                timeout=5,
+                timeout=self._git_status_timeout_s,
             )
             if result.returncode == 0:
                 return result.stdout.decode("utf-8", errors="replace")
