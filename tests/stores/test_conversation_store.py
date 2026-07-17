@@ -3187,6 +3187,43 @@ def test_fork_conversation_copies_items(
         assert fork_item.data == src_item.data
 
 
+def test_fork_copies_terminal_launch_args_by_default(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A same-agent fork inherits the source's launch args.
+
+    A plain fork keeps the same CLI, so its launch flags stay valid and must
+    carry over (e.g. a Claude Code fork keeps ``--permission-mode``).
+    """
+    source = conversation_store.create_conversation(
+        terminal_launch_args=["--permission-mode", "auto"],
+    )
+    fork = conversation_store.fork_conversation(source.id)
+    fetched = conversation_store.get_conversation(fork.id)
+    assert fetched is not None
+    assert fetched.terminal_launch_args == ["--permission-mode", "auto"]
+
+
+def test_fork_drops_terminal_launch_args_when_switching_agent(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A CLI-switching fork must NOT inherit the source's launch args.
+
+    Forking a Claude Code session onto ``pi`` carried the source's
+    ``--permission-mode auto`` into the pi argv; pi rejects the unknown option
+    and exits 1 at launch, surfacing as ``required_terminal_exited``. With
+    ``copy_terminal_launch_args=False`` the fork starts with clean args so the
+    new CLI launches with its own defaults.
+    """
+    source = conversation_store.create_conversation(
+        terminal_launch_args=["--permission-mode", "auto"],
+    )
+    fork = conversation_store.fork_conversation(source.id, copy_terminal_launch_args=False)
+    fetched = conversation_store.get_conversation(fork.id)
+    assert fetched is not None
+    assert fetched.terminal_launch_args is None
+
+
 def test_fork_conversation_preserves_created_by(
     conversation_store: SqlAlchemyConversationStore,
     agent_store: SqlAlchemyAgentStore,

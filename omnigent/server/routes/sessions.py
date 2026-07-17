@@ -16354,6 +16354,12 @@ def create_sessions_router(
                 cloned_agent_bundle_location=base_agent.bundle_location,
                 cloned_agent_description=base_agent.description,
                 copy_model_settings=copy_model_settings,
+                # Launch flags are CLI-specific. On an agent switch the fork may
+                # bind a different CLI (e.g. claude-code → pi), whose flag set
+                # differs — Claude Code's ``--permission-mode`` makes pi exit at
+                # launch (unknown option → ``required_terminal_exited``). Only
+                # carry the source's launch args on a same-agent fork.
+                copy_terminal_launch_args=not switching_agent,
                 carry_history_into_native=carry_history_into_native,
                 resume_source_native_session=resume_source_native_session,
                 presentation_labels=presentation_labels,
