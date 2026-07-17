@@ -227,6 +227,37 @@ async def test_other_users_task_is_not_visible(
     assert listed.json()["scheduled_tasks"] == []
 
 
+@pytest.mark.parametrize("tz", ["Not/A_Timezone", "", "../UTC"])
+async def test_create_rejects_invalid_timezone(
+    auth_client: httpx.AsyncClient, db_uri: str, tz: str
+) -> None:
+    _make_user(db_uri)
+    resp = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(timezone=tz),
+        headers=_headers(),
+    )
+    assert resp.status_code == 400, resp.text
+
+
+@pytest.mark.parametrize("tz", ["Bogus/Zone", "", "../UTC"])
+async def test_update_rejects_invalid_timezone(
+    auth_client: httpx.AsyncClient, db_uri: str, tz: str
+) -> None:
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    task_id = created["id"]
+
+    bad = await auth_client.patch(
+        f"/v1/scheduled-tasks/{task_id}",
+        json={"timezone": tz},
+        headers=_headers(),
+    )
+    assert bad.status_code == 400, bad.text
+
+
 async def test_scheduler_synced_on_create_and_delete(
     auth_client: httpx.AsyncClient, auth_app: FastAPI, db_uri: str
 ) -> None:

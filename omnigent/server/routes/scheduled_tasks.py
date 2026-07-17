@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 import uuid
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -103,6 +104,17 @@ def _validate_rrule_or_400(rrule: str) -> None:
         raise OmnigentError(f"invalid rrule: {exc}", code=ErrorCode.INVALID_INPUT) from exc
 
 
+def _validate_timezone_or_400(timezone: str) -> None:
+    """Raise a 400 ``OmnigentError`` if *timezone* is not a valid IANA timezone."""
+    try:
+        ZoneInfo(timezone)
+    except (ZoneInfoNotFoundError, KeyError, ValueError) as exc:
+        raise OmnigentError(
+            f"invalid timezone {timezone!r}: must be a valid IANA timezone name",
+            code=ErrorCode.INVALID_INPUT,
+        ) from exc
+
+
 def create_scheduled_tasks_router(
     store: ScheduledTaskStore,
     *,
@@ -148,6 +160,7 @@ def create_scheduled_tasks_router(
         """Create a scheduled task and arm it on the live scheduler."""
         owner = _owner(request)
         _validate_rrule_or_400(body.rrule)
+        _validate_timezone_or_400(body.timezone)
         task = store.create(
             scheduled_task_id=uuid.uuid4().hex,
             name=body.name,
@@ -197,6 +210,8 @@ def create_scheduled_tasks_router(
         _require_owned(scheduled_task_id, owner_id)
         if body.rrule is not None:
             _validate_rrule_or_400(body.rrule)
+        if body.timezone is not None:
+            _validate_timezone_or_400(body.timezone)
         fields = body.model_dump(exclude_unset=True)
         updated = store.update(scheduled_task_id, **fields)
         if updated is None:

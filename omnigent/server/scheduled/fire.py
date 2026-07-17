@@ -88,7 +88,6 @@ class FireDeps:
 
     scheduled_task_store: Any
     conversation_store: Any
-    agent_store: Any
     permission_store: Any | None
     host_store: Any | None
     host_registry: Any | None
@@ -274,8 +273,9 @@ async def _grant_owner(deps: FireDeps, task: ScheduledTask, conversation_id: str
     """Write the LEVEL_OWNER grant so the run is visible to its owner.
 
     A NULL ``owner_user_id`` (single-user / OSS) resolves to
-    :data:`RESERVED_USER_LOCAL`. The grant is NEVER skipped — without it the
-    session has no owner and is invisible in every list path.
+    :data:`RESERVED_USER_LOCAL`. When ``permission_store`` is ``None`` (no auth
+    configured) this is a no-op — the session is still accessible because auth
+    is disabled system-wide.
     """
     if deps.permission_store is None:
         return

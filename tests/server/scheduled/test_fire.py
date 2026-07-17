@@ -133,7 +133,6 @@ def _deps(sched_store: FakeScheduledTaskStore, **overrides: Any) -> FireDeps:
     return FireDeps(
         scheduled_task_store=sched_store,
         conversation_store=overrides.get("conversation_store", FakeConversationStore()),
-        agent_store=overrides.get("agent_store", object()),
         permission_store=overrides.get("permission_store", FakePermissionStore()),
         host_store=overrides.get("host_store", FakeHostStore()),
         host_registry=overrides.get("host_registry", FakeHostRegistry()),

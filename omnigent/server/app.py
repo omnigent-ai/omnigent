@@ -1381,7 +1381,6 @@ def create_app(
                 FireDeps(
                     scheduled_task_store=scheduled_task_store,
                     conversation_store=conversation_store,
-                    agent_store=agent_store,
                     permission_store=permission_store,
                     host_store=host_store,
                     host_registry=host_registry,
