@@ -2361,4 +2361,48 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
     fireEvent.click(createItem);
     await waitFor(() => expect(screen.getByTestId("create-agent-dialog")).toBeTruthy());
   });
+
+  // Switch the target to the connected host, then create + submit a pending
+  // custom agent from the dialog so it becomes the selected agent.
+  async function createAndSelectPendingAgentOnHost(): Promise<void> {
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("Sandbox"),
+    );
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    const hostItem = screen
+      .getAllByText("machine-1")
+      .find((el) => el.closest('[role="menuitem"]') !== null);
+    fireEvent.click(hostItem!);
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("machine-1"),
+    );
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-create-agent"));
+    await waitFor(() => expect(screen.getByTestId("create-agent-dialog")).toBeTruthy());
+    fireEvent.change(screen.getByTestId("create-agent-name"), { target: { value: "my-agent" } });
+    fireEvent.change(screen.getByTestId("create-agent-model"), {
+      target: { value: "claude-sonnet-4-20250514" },
+    });
+    fireEvent.click(screen.getByTestId("create-agent-submit"));
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain("my-agent"),
+    );
+  }
+
+  it("drops a selected pending custom agent when the target switches to a sandbox", async () => {
+    renderLanding({ managed_sandboxes_enabled: true });
+    await createAndSelectPendingAgentOnHost();
+    // Switch back to the sandbox: the pending pick can't run there, so the
+    // selection falls back to a real agent and the pending row disappears.
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("Sandbox"),
+    );
+    expect(screen.getByTestId("new-chat-landing-agent-select").textContent).not.toContain(
+      "my-agent",
+    );
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    expect(screen.queryByTestId("new-chat-landing-agent-pending")).toBeNull();
+  });
 });

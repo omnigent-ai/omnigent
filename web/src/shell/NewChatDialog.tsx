@@ -2242,8 +2242,13 @@ export function NewChatLandingScreen() {
   // A pick only wins while it exists in the list — a persisted id whose
   // agent has since been unregistered (or hidden) falls back to the default.
   // The pending custom agent sentinel also wins when set.
+  // A pending (just-created, not-yet-submitted) custom agent can't run on a
+  // managed sandbox — the sandbox create path doesn't provision a runner for a
+  // bundled agent. So a pending pick made before switching to a sandbox is
+  // dropped there, falling back to a real agent; off the sandbox it's kept.
+  const pendingAgentAllowedOnTarget = !sandboxSelected;
   const effectiveAgentId =
-    pickedAgentId === PENDING_AGENT_ID
+    pickedAgentId === PENDING_AGENT_ID && pendingAgentAllowedOnTarget
       ? PENDING_AGENT_ID
       : ((agentList.some((a) => a.id === pickedAgentId) ? pickedAgentId : agentList[0]?.id) ??
         null);
@@ -3297,7 +3302,11 @@ export function NewChatLandingScreen() {
                   hasAgents={agentList.length > 0}
                   host={harnessWarningHost}
                   onSelectAgent={handleSelectAgent}
-                  pendingAgent={pendingAgent}
+                  // Hide the pending (just-created, unsubmitted) custom agent
+                  // row on a sandbox — it can't run there, so it would linger
+                  // as an unselectable entry. Pending state is in-memory only,
+                  // so it's cleared on reload regardless.
+                  pendingAgent={pendingAgentAllowedOnTarget ? pendingAgent : null}
                   pendingAgentId={PENDING_AGENT_ID}
                   onSelectPending={handleSelectPending}
                   onCreateCustomAgent={() => setCreateAgentOpen(true)}

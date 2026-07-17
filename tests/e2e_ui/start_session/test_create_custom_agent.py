@@ -458,3 +458,63 @@ async def _drive_hidden_on_sandbox(base_url: str, session_id: str) -> None:
             await expect(page.get_by_test_id("create-agent-dialog")).to_be_visible(timeout=5_000)
         finally:
             await browser.close()
+
+
+def test_pending_agent_dropped_when_switching_to_sandbox(
+    seeded_session: tuple[str, str],
+) -> None:
+    """A pending custom agent picked on a host is dropped on switch to sandbox.
+
+    Creating a custom agent selects it as the pending pick. Since a pending
+    bundle can't run on a managed sandbox, switching the target to the sandbox
+    must fall the selection back to a real agent and drop the pending row.
+    """
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_pending_dropped_on_sandbox(base_url, session_id))
+
+
+async def _drive_pending_dropped_on_sandbox(base_url: str, session_id: str) -> None:
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_requests: list[dict[str, Any]] = []
+            await _register_routes(
+                page,
+                created_session_id=session_id,
+                create_requests=create_requests,
+                managed=True,
+            )
+            await _seed_workspace(page)
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+
+            # Switch to the connected host, then create + submit a pending agent.
+            await page.get_by_test_id("new-chat-landing-host-chip").click()
+            await page.get_by_test_id(f"new-chat-landing-host-{_HOST_ID}").click()
+            await page.get_by_test_id("new-chat-landing-agent-select").click()
+            await page.get_by_test_id("new-chat-landing-create-agent").click()
+            await expect(page.get_by_test_id("create-agent-dialog")).to_be_visible(timeout=5_000)
+            await page.get_by_test_id("create-agent-name").fill("pending-agent")
+            await page.get_by_test_id("create-agent-model").fill("claude-sonnet-4-20250514")
+            await page.get_by_test_id("create-agent-submit").click()
+            await expect(page.get_by_test_id("new-chat-landing-agent-select")).to_contain_text(
+                "pending-agent"
+            )
+
+            # Switch the target back to the sandbox: the pending pick is dropped.
+            await page.get_by_test_id("new-chat-landing-host-chip").click()
+            await page.get_by_test_id("new-chat-landing-sandbox-option").click()
+            await expect(page.get_by_test_id("new-chat-landing-host-chip")).to_contain_text(
+                "Databricks Sandbox"
+            )
+            await expect(page.get_by_test_id("new-chat-landing-agent-select")).not_to_contain_text(
+                "pending-agent"
+            )
+            await page.get_by_test_id("new-chat-landing-agent-select").click()
+            await expect(page.get_by_test_id("new-chat-landing-agent-pending")).to_have_count(0)
+        finally:
+            await browser.close()
