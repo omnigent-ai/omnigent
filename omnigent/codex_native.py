@@ -37,6 +37,7 @@ from omnigent.claude_native_bridge import url_component
 from omnigent.codex_native_app_server import (
     CodexAppServerClient,
     CodexNativeAppServer,
+    _find_codex_cli,
     build_codex_native_server,
     build_codex_remote_args,
     client_for_transport,
@@ -212,7 +213,7 @@ def _codex_auth_unavailable_reason() -> str | None:
         Token *validity* (revoked/expired refresh, an unreachable gateway) is
         not judged locally — it surfaces at the first turn via the executor.
     """
-    if shutil.which(_DEFAULT_CODEX_COMMAND) is None:
+    if _find_codex_cli() is None:
         return _CODEX_AUTH_UNAVAILABLE_BINARY_MISSING
     # ponytail: resolve_native_codex_launch runs once per codex spelling
     # (codex / codex-native / native-codex → 3×) per hello frame; on a host with

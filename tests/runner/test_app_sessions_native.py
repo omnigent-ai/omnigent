@@ -15377,6 +15377,129 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
         assert synth_calls == [snapshot_external_id]
 
 
+@pytest.mark.asyncio
+async def test_auto_create_claude_terminal_cold_resume_fallback_uses_pre_wipe_bridge_sid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fallback fires when server GET omits external_session_id but local bridge has it.
+
+    Simulates the workspace-scope miss (ES-2065116): the server snapshot
+    returns no external_session_id, but the bridge state.json from the
+    previous launch holds a claude_session_id. The runner must read it
+    *before* prepare_bridge_dir wipes the file and use it as the resume
+    hint, so _ensure_local_claude_resume_transcript is called with the
+    local sid and --resume is passed.
+    """
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path / "workspace"))
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+
+    # Write the previous claude_session_id into the bridge state.json *before*
+    # auto-create runs so the pre-wipe read can find it.
+    import json
+
+    session_id = "5cdbea97a2fb0c659bc09605401e2bb2"
+    prior_claude_sid = "3d10247d-c3c0-4689-8cbd-862d7453bf70"
+    pre_bridge_dir = bridge_dir_for_bridge_id(session_id)
+    pre_bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    (pre_bridge_dir / "state.json").write_text(
+        json.dumps({"claude_session_id": prior_claude_sid}), encoding="utf-8"
+    )
+
+    synth_calls: list[str] = []
+
+    async def _fake_synth(
+        client: Any,
+        *,
+        session_id: str,
+        external_session_id: str,
+        workspace: Path,
+    ) -> Path:
+        del client, session_id, workspace
+        synth_calls.append(external_session_id)
+        return tmp_path / f"{external_session_id}.jsonl"
+
+    monkeypatch.setattr(
+        "omnigent.claude_native._ensure_local_claude_resume_transcript",
+        _fake_synth,
+    )
+
+    forwarder_kwargs: dict[str, Any] = {}
+
+    async def _capture_forwarder(**kwargs: Any) -> None:
+        forwarder_kwargs.update(kwargs)
+
+    monkeypatch.setattr(
+        "omnigent.claude_native_forwarder.supervise_forwarder",
+        _capture_forwarder,
+    )
+
+    class _NullBindingServerClient(NullServerClient):
+        """Server client whose session snapshot omits external_session_id."""
+
+        async def get(self, url: str, **kwargs: Any) -> NullServerClient._Response:
+            del kwargs
+            if url.endswith("/labels"):
+
+                class _LabelsResponse(NullServerClient._Response):
+                    def json(self) -> dict[str, Any]:
+                        return {"labels": {}}
+
+                return _LabelsResponse()
+
+            # Session snapshot has no external_session_id (workspace-scope miss).
+            class _SnapResponse(NullServerClient._Response):
+                def json(self) -> dict[str, Any]:
+                    return {}
+
+            return _SnapResponse()
+
+    class _FakeResourceRegistry:
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self,
+            *,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            resource_role: str | None = None,
+            parent_os_env: Any = None,
+        ) -> SessionResourceView:
+            del terminal_name, session_key, spec
+            return SessionResourceView(
+                id="terminal_claude_main",
+                type="terminal",
+                session_id=session_id,
+                name="claude:main",
+                metadata={"terminal_name": "claude", "session_key": "main", "running": True},
+            )
+
+    await _auto_create_claude_terminal(
+        session_id,
+        _FakeResourceRegistry(),
+        lambda _sid, _evt: None,
+        server_client=_NullBindingServerClient(),  # type: ignore[arg-type]
+    )
+
+    await asyncio.sleep(0)
+
+    # The fallback must have fired: synthesis is called with the local bridge
+    # sid, not skipped (which would leave the user with no context).
+    assert synth_calls == [prior_claude_sid], (
+        f"Expected synthesis with prior claude sid {prior_claude_sid!r}; "
+        f"got {synth_calls!r}. The fallback may be reading the bridge dir "
+        "after prepare_bridge_dir already wiped state.json."
+    )
+    # The forwarder must start past the replayed transcript (same as a
+    # normal cold resume where the server returned the binding directly).
+    assert forwarder_kwargs.get("start_at_end") is True
+
+
 def _drain_session_event_queue(queue: asyncio.Queue[Any] | None) -> list[dict[str, Any]]:
     """
     Drain and return every dict item currently on a runner session queue.
