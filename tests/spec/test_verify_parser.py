@@ -97,3 +97,14 @@ def test_verify_non_string_command_rejected(tmp_path: Path) -> None:
                 {"spec_version": 1, "name": "a", "verify": {"commands": [123]}},
             )
         )
+
+
+def test_verify_unknown_key_rejected(tmp_path: Path) -> None:
+    """An unknown verify key (e.g. a typo like ``command:`` vs ``commands:``) is rejected."""
+    with pytest.raises(OmnigentError, match=r"verify: unknown key"):
+        parse(
+            _agent_dir(
+                tmp_path,
+                {"spec_version": 1, "name": "a", "verify": {"command": ["pytest"]}},
+            )
+        )

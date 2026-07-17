@@ -2744,15 +2744,21 @@ def _parse_verify(raw: dict[str, Any] | None) -> VerifySpec | None:
     :param raw: The ``verify:`` mapping from config.yaml, or ``None``.
     :returns: A populated :class:`VerifySpec`, or ``None`` when *raw* is
         ``None``.
-    :raises OmnigentError: If the block is not a mapping, declares no
-        checks, pairs ``no_stubs`` with an empty ``paths`` list, or holds
-        non-string fields.
+    :raises OmnigentError: If the block is not a mapping, holds an unknown
+        key, declares no checks, pairs ``no_stubs`` with an empty ``paths``
+        list, or holds non-string fields.
     """
     if raw is None:
         return None
     if not isinstance(raw, dict):
         raise OmnigentError(
             f"verify: must be a mapping, got {type(raw).__name__}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    unknown = set(raw) - {"commands", "contains", "not_contains", "no_stubs", "paths"}
+    if unknown:
+        raise OmnigentError(
+            f"verify: unknown key(s): {', '.join(sorted(unknown))}",
             code=ErrorCode.INVALID_INPUT,
         )
     commands = _parse_str_tuple(raw.get("commands"), "verify.commands")

@@ -51,7 +51,15 @@ async def test_command_non_zero_fails() -> None:
     """A command exiting non-zero fails and surfaces stderr."""
     spec = VerifySpec(commands=("pytest",))
     os_env = _FakeOSEnv(
-        shell={"pytest": {"exit_code": 1, "stdout": "", "stderr": "1 failed", "timed_out": False}},
+        shell={
+            "pytest": {
+                "exit_code": 1,
+                "stdout": "",
+                "stderr": "1 failed",
+                "timed_out": False,
+                "error": "Command exited with status 1: 1 failed",
+            }
+        },
     )
 
     result = await run_verify(spec, os_env)
@@ -66,7 +74,15 @@ async def test_command_timeout_fails() -> None:
     """A timed-out command (exit_code None) fails as timed out."""
     spec = VerifySpec(commands=("slow",))
     os_env = _FakeOSEnv(
-        shell={"slow": {"exit_code": None, "stdout": "", "stderr": "", "timed_out": True}},
+        shell={
+            "slow": {
+                "exit_code": None,
+                "stdout": "partial output",
+                "stderr": "",
+                "timed_out": True,
+                "error": "Command timed out after 120 seconds",
+            }
+        },
     )
 
     result = await run_verify(spec, os_env)
@@ -84,6 +100,35 @@ async def test_command_shell_error_fails() -> None:
 
     assert result.passed is False
     assert "sandbox denied" in result.checks[0].detail
+
+
+async def test_failed_command_stdout_still_feeds_content_checks() -> None:
+    """A failing command's stdout must still feed contains/not_contains.
+
+    The real OSEnvironment.shell sets ``error`` on non-zero exit but still
+    returns stdout; run_verify must capture it, so a ``not_contains`` gate on
+    a failing pytest's "failed" summary fails rather than silently passing.
+    """
+    spec = VerifySpec(commands=("pytest",), not_contains=("failed",))
+    os_env = _FakeOSEnv(
+        shell={
+            "pytest": {
+                "exit_code": 1,
+                "stdout": "3 failed, 5 passed",
+                "stderr": "",
+                "timed_out": False,
+                "error": "Command exited with status 1: 3 failed, 5 passed",
+            }
+        },
+    )
+
+    result = await run_verify(spec, os_env)
+
+    by_name = {c.name: c for c in result.checks}
+    assert result.passed is False
+    assert by_name["command[0]"].passed is False
+    # "failed" IS in the captured stdout, so the gate must fail (not pass silently).
+    assert by_name["not_contains[0]"].passed is False
 
 
 async def test_contains_is_case_sensitive() -> None:

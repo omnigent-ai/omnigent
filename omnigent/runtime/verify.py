@@ -66,7 +66,15 @@ async def run_verify(spec: VerifySpec, os_env: OSEnvironment) -> VerifyResult:
 
     for index, command in enumerate(spec.commands):
         result = await os_env.shell(command)
-        if result.get("error") is not None:
+        stdout = result.get("stdout") or ""
+        stderr = result.get("stderr") or ""
+        exit_code = result.get("exit_code")
+        timed_out = bool(result.get("timed_out"))
+        # The real OSEnvironment.shell sets ``error`` on non-zero exit and
+        # timeout but still returns stdout — fall through so stdout feeds the
+        # content checks. Only error-without-completion (bad input, OSError) is fatal.
+        completed = exit_code is not None or timed_out
+        if result.get("error") is not None and not completed:
             checks.append(
                 CheckResult(
                     name=f"command[{index}]",
@@ -75,11 +83,7 @@ async def run_verify(spec: VerifySpec, os_env: OSEnvironment) -> VerifyResult:
                 )
             )
             continue
-        stdout = result.get("stdout") or ""
-        stderr = result.get("stderr") or ""
         combined_stdout.append(stdout)
-        exit_code = result.get("exit_code")
-        timed_out = bool(result.get("timed_out"))
         passed = exit_code == 0 and not timed_out
         status = "timed out" if timed_out else f"exit {exit_code}"
         checks.append(
