@@ -168,6 +168,55 @@ def _create_export_agent(config: dict[str, str]) -> Tool:
     return ExportAgentTool()
 
 
+def _hindsight_available() -> bool:
+    """
+    Return ``True`` if the optional ``hindsight-client`` SDK is installed.
+
+    Probes via :func:`importlib.util.find_spec` (not ``import``) so the check
+    never loads the SDK or its transitive deps — they stay lazy until a
+    Hindsight tool is actually constructed.
+    """
+    import importlib.util
+
+    return importlib.util.find_spec("hindsight_client") is not None
+
+
+def _create_hindsight_retain(config: dict[str, str]) -> Tool:
+    """
+    Lazy factory for HindsightRetainTool.
+
+    :param config: Tool config (Hindsight api_key, bank_id, etc.).
+    :returns: A HindsightRetainTool instance.
+    """
+    from omnigent.tools.builtins.hindsight import HindsightRetainTool
+
+    return HindsightRetainTool(config=config)
+
+
+def _create_hindsight_recall(config: dict[str, str]) -> Tool:
+    """
+    Lazy factory for HindsightRecallTool.
+
+    :param config: Tool config (Hindsight api_key, bank_id, etc.).
+    :returns: A HindsightRecallTool instance.
+    """
+    from omnigent.tools.builtins.hindsight import HindsightRecallTool
+
+    return HindsightRecallTool(config=config)
+
+
+def _create_hindsight_reflect(config: dict[str, str]) -> Tool:
+    """
+    Lazy factory for HindsightReflectTool.
+
+    :param config: Tool config (Hindsight api_key, bank_id, etc.).
+    :returns: A HindsightReflectTool instance.
+    """
+    from omnigent.tools.builtins.hindsight import HindsightReflectTool
+
+    return HindsightReflectTool(config=config)
+
+
 # Unified registry for every reserved builtin name. The value
 # is either a factory callable (for user-enablable tools) or
 # ``None`` for framework-owned names that occupy the name-space
@@ -210,7 +259,33 @@ _BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
     # name in the runner's tool dispatch — reserved here so user specs
     # cannot shadow it.
     "sys_advise_models": None,
+    # ``browser_*`` embedded-browser tools are framework-owned: always
+    # auto-registered by ``ToolManager._register_browser_tools`` (the
+    # single source of truth for registration), so any agent can drive
+    # the desktop app's browser without the spec opting in. Reserved
+    # here with ``None`` — exactly like ``list_comments`` /
+    # ``update_comment`` — so user specs cannot shadow the names and
+    # ``get_builtin_tool`` returns ``None`` for them (they are not
+    # instantiated via this registry). Execution is runner-dispatched
+    # (``_BROWSER_TOOLS`` in omnigent/runner/tool_dispatch.py).
+    "browser_navigate": None,
+    "browser_snapshot": None,
+    "browser_click": None,
+    "browser_type": None,
+    "browser_screenshot": None,
 }
+
+# Hindsight long-term memory (optional ``hindsight`` extra). Registered only
+# when ``hindsight-client`` is installed, so the tools are absent from the
+# builtin list on installs without the extra.
+if _hindsight_available():
+    _BUILTIN_REGISTRY.update(
+        {
+            "hindsight_retain": _create_hindsight_retain,
+            "hindsight_recall": _create_hindsight_recall,
+            "hindsight_reflect": _create_hindsight_reflect,
+        }
+    )
 
 # Canonical set of every reserved builtin name. Derived from
 # the registry so there is a single source of truth — no drift

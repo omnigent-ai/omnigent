@@ -36,7 +36,6 @@ from omnigent.inner.codex_executor import (
     _clean_codex_env,
     _codex_cli_version,
     _codex_home_config_source_from_env,
-    _create_subprocess_exec,
     _databricks_codex_auth_command,
     _databricks_codex_base_url,
     _databricks_codex_config_overrides,
@@ -44,7 +43,7 @@ from omnigent.inner.codex_executor import (
     _populate_codex_home_config,
     _provider_codex_config_overrides,
 )
-from omnigent.inner.databricks_executor import _read_databrickscfg, _read_databrickscfg_host
+from omnigent.inner.databricks_executor import _databricks_gateway_host
 
 _logger = logging.getLogger(__name__)
 
@@ -87,84 +86,6 @@ _TRUSTED_HOOK_STATUSES = frozenset({"trusted", "managed"})
 # — we detect the old version up front and skip registration with a loud
 # warning rather than crash startup on an un-trustable hook.
 _MIN_POLICY_HOOK_CODEX_VERSION = (0, 129, 0)
-
-# Opt-in flag for the explicit ``--model`` launch flag. Off by default: the
-# per-session ``config.toml`` ``model =`` pin (``_pin_codex_config_model``)
-# already routes the override today, so the explicit flag is a parallel,
-# additive path the operator turns on per deployment. Truthy values mirror
-# the ``_TRUE_VALUES`` convention used across the codebase
-# (``omnigent/_startup_profile.py``, ``omnigent/cli.py``).
-_MODEL_FLAG_ENV_VAR = "OMNIGENT_CODEX_NATIVE_MODEL_FLAG"
-_MODEL_FLAG_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
-# Timeout for the one-shot ``codex --help`` capability probe. Matches the
-# ``codex --version`` probe budget -- a hung help invocation must never block
-# app-server startup.
-_CODEX_HELP_PROBE_TIMEOUT_SECONDS = 5.0
-
-
-def _model_flag_enabled(env: dict[str, str] | None = None) -> bool:
-    """
-    Return whether the explicit ``--model`` launch flag is opted in.
-
-    The flag is parallel to the always-on ``config.toml`` model pin, so it
-    defaults OFF: a deployment enables it by setting
-    :data:`_MODEL_FLAG_ENV_VAR` to a truthy value.
-
-    :param env: Environment mapping to inspect; defaults to ``os.environ``.
-    :returns: ``True`` when the override should also be passed as an
-        explicit ``--model`` launch flag.
-    """
-    source = os.environ if env is None else env
-    return source.get(_MODEL_FLAG_ENV_VAR, "").strip().lower() in _MODEL_FLAG_TRUE_VALUES
-
-
-async def _codex_supports_model_flag(codex_path: str) -> bool:
-    """
-    Detect whether the codex CLI accepts a global ``--model`` flag.
-
-    Runs ``codex --help`` and looks for the ``--model`` long option in the
-    top-level options. Codex exposes ``-m/--model`` as a global flag that
-    precedes the ``app-server`` subcommand; builds that predate it omit the
-    option from ``--help``, so the caller skips the flag (passing an unknown
-    flag would error) and relies on the always-on ``config.toml`` pin.
-
-    :param codex_path: Path to the codex CLI, e.g.
-        ``"/usr/local/bin/codex"``.
-    :returns: ``True`` when ``--model`` appears in ``codex --help`` output;
-        ``False`` when it does not, or the probe cannot be run / times out
-        (treated conservatively as "unsupported" so the flag is not passed).
-    """
-    try:
-        proc = await _create_subprocess_exec(
-            codex_path,
-            "--help",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-    except OSError:
-        return False
-    try:
-        stdout, _ = await asyncio.wait_for(
-            proc.communicate(), timeout=_CODEX_HELP_PROBE_TIMEOUT_SECONDS
-        )
-    except asyncio.TimeoutError:
-        # A hung ``codex --help`` must not block startup: kill it and treat
-        # the flag as unsupported (the config.toml pin still carries the model).
-        with contextlib.suppress(ProcessLookupError):
-            proc.kill()
-        with contextlib.suppress(Exception):
-            await proc.wait()
-        return False
-    # Match ``--model`` only as an option *definition* line, not anywhere the
-    # word appears in help prose. Clap renders options as an indented line
-    # whose first token is the option, e.g. ``  -m, --model <MODEL>`` (or a
-    # long-only ``      --model <MODEL>``). Anchor to the start of such a line
-    # — optional indent, an optional short alias (``-m, ``), then ``--model``
-    # at an option boundary. This rejects lookalikes (``--model-provider``)
-    # and descriptions that merely mention ``--model`` mid-sentence, either of
-    # which would otherwise pass an unsupported flag to the launch.
-    help_text = stdout.decode("utf-8", errors="replace")
-    return re.search(r"^\s*(?:-\S+,\s+)?--model(?=[\s=<]|$)", help_text, re.MULTILINE) is not None
 
 
 def _format_codex_version(version: tuple[int, int, int] | None) -> str:
@@ -649,30 +570,6 @@ class CodexNativeAppServer:
                 )
         reconcile_codex_native_process_registry()
         resolved_listen = self.listen_url or f"unix://{self.socket_path}"
-        proc_env = {**self.env, "CODEX_HOME": str(self.codex_home)}
-        # Opt-in, additive to the config.toml ``model =`` pin above: when the
-        # operator enables the flag and a model is pinned, ALSO pass it
-        # explicitly. ``-m/--model`` is a codex *global* option, so it must
-        # precede the ``app-server`` subcommand. A codex build that lacks the
-        # flag simply doesn't get it (passing an unknown flag would error) --
-        # the config.toml pin remains the primary route, so the session still
-        # launches on the right model regardless.
-        # Read the opt-in from the omnigent server's OWN process environment
-        # (``os.environ``, the default), NOT ``self.env``: ``self.env`` is the
-        # cleaned codex spawn env from ``_clean_codex_env``, whose prefix
-        # allowlist strips ``OMNIGENT_*`` keys -- so the flag would never be
-        # visible there. The flag is an operator knob for omnigent, not
-        # something codex itself consumes.
-        model_global_args: list[str] = []
-        if (
-            self.pinned_model
-            and _model_flag_enabled()
-            and await _codex_supports_model_flag(self.codex_path)
-        ):
-            model_global_args = ["--model", self.pinned_model]
-        # argv[0] carries the inert crash-reap marker (the real binary is passed
-        # via ``executable=`` below); the model global option rides after it so
-        # codex still parses it ahead of the ``app-server`` subcommand.
         self.process_registry_tag = f"codex-native-{uuid.uuid4().hex}"
         tagged_argv0 = (
             f"{Path(self.codex_path).name} "
@@ -680,22 +577,16 @@ class CodexNativeAppServer:
         )
         argv = [
             tagged_argv0,
-            *model_global_args,
             "app-server",
             "--listen",
             resolved_listen,
         ]
         for override in self.config_overrides:
             argv.extend(["-c", override])
+        proc_env = {**self.env, "CODEX_HOME": str(self.codex_home)}
         self.process_owner_lock = acquire_codex_native_process_owner_lock()
         try:
-            # Spawn through the module-level ``_create_subprocess_exec``
-            # indirection (a transparent passthrough to
-            # ``asyncio.create_subprocess_exec``) so tests can stub the spawn
-            # by patching that name — patching ``…app_server.asyncio.\
-            # create_subprocess_exec`` would walk into the real asyncio
-            # singleton and leak the mock across the process.
-            self.proc = await _create_subprocess_exec(
+            self.proc = await asyncio.create_subprocess_exec(
                 *argv,
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.DEVNULL,
@@ -1220,12 +1111,18 @@ def build_codex_native_server(
     """
     resolved_codex = codex_path or _find_codex_cli()
     if not resolved_codex:
-        raise ImportError("Native Codex requires the 'codex' CLI on PATH.")
+        raise ImportError(
+            "Native Codex requires the 'codex' CLI on PATH. If codex is "
+            "installed on a PATH the host daemon didn't inherit (e.g. an "
+            "nvm-managed bin dir), set OMNIGENT_CODEX_PATH=/path/to/codex."
+        )
     env = _clean_codex_env()
     config_overrides: list[str] = []
     if profile is not None:
-        creds = _read_databrickscfg(profile)
-        host = creds.host if creds is not None else _read_databrickscfg_host(profile)
+        # Use the profile's own host so the gateway base URL matches the token
+        # the profile-pinned auth command mints; a DATABRICKS_HOST override in
+        # the runner env must not point the base URL at another workspace.
+        host = _databricks_gateway_host(profile)
         if not host:
             raise OSError(
                 f"Native Codex with Databricks profile {profile!r} (from your "
@@ -1684,7 +1581,7 @@ def codex_terminal_env(app_server: CodexNativeAppServer) -> dict[str, str]:
 # conflict (the bypass already implies ``danger-full-access``), so leaving
 # them in is harmless. We strip BOTH anyway when bypass is on — the approval
 # flag because it MUST go, the sandbox flag for hygiene so the launched arg
-# list reflects a single coherent stance. See issue #657.
+# list reflects a single coherent stance.
 _CODEX_BYPASS_SANDBOX_FLAG = "--dangerously-bypass-approvals-and-sandbox"
 # Granular approval/sandbox flags to drop when bypass is on. The "Full
 # access" / "Read only" approval presets emit the long ``--flag value`` form

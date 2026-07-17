@@ -16,12 +16,13 @@ import re
 import shutil
 import tempfile
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, TypeAlias
 
+from omnigent._platform import resolve_cli_binary
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.reasoning_effort import CODEX_EFFORTS, validate_effort
 from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
@@ -30,8 +31,7 @@ from omnigent.spec.types import RetryPolicy
 from . import _proc
 from ._subprocess_lifecycle import close_subprocess_transport
 from .databricks_executor import (
-    _read_databrickscfg,
-    _read_databrickscfg_host,
+    _databricks_gateway_host,
 )
 from .datamodel import OSEnvSandboxSpec, OSEnvSpec
 from .executor import (
@@ -281,8 +281,15 @@ def _kill_process_tree(process: _Process | None) -> None:
     _proc.kill_tree(process)
 
 
+# Env override for an explicit codex binary, mirroring goose's
+# OMNIGENT_GOOSE_PATH. Set this when codex lives on a PATH the host
+# daemon doesn't inherit (e.g. an nvm-managed global bin dir).
+_CODEX_PATH_ENV = "OMNIGENT_CODEX_PATH"
+
+
 def _find_codex_cli() -> str | None:
-    return shutil.which("codex")
+    """Resolve the ``codex`` CLI binary (override → ``PATH`` → global dirs)."""
+    return resolve_cli_binary("codex", env_var=_CODEX_PATH_ENV)
 
 
 async def _codex_cli_version(codex_path: str) -> tuple[int, int, int] | None:
@@ -348,7 +355,7 @@ async def _create_subprocess_exec(*args: Any, **kwargs: Any) -> asyncio.subproce
     return await asyncio.create_subprocess_exec(*args, **kwargs)
 
 
-def _clean_codex_env() -> dict[str, str]:
+def _clean_codex_env(extra_allow: Iterable[str] = ()) -> dict[str, str]:
     """
     Build a filtered copy of ``os.environ`` for the codex subprocess.
 
@@ -386,13 +393,25 @@ def _clean_codex_env() -> dict[str, str]:
         "DATABRICKS_BEARER",  # explicit CI/integration bearer used by auth.command
         "DATABRICKS_CODEX_TOKEN",  # env_key referenced by ~/.codex/config.toml's DB provider
         OMNIGENT_SESSION_ENV_VAR,  # "inside Omnigent" marker (CLAUDE_CODE/CODEX analog)
-    }
+    } | set(extra_allow)
     for key, value in os.environ.items():
         if key in _CODEX_ENV_DENY_EXACT:
             continue
         if key in allow_exact or key.startswith(allow_prefixes):
             env[key] = value
     return env
+
+
+def _declared_passthrough(os_env: OSEnvSpec | None) -> tuple[str, ...]:
+    """Env-var names an agent declared for tool passthrough.
+
+    Lives on ``os_env.sandbox.env_passthrough`` (an
+    :class:`OSEnvSandboxSpec` field), not on ``OSEnvSpec`` directly.
+    Returns an empty tuple when any link in that chain is absent.
+    """
+    if os_env is not None and os_env.sandbox is not None and os_env.sandbox.env_passthrough:
+        return tuple(os_env.sandbox.env_passthrough)
+    return ()
 
 
 def codex_skill_sources(bundle_dir: Path | None, home: Path) -> list[Path]:
@@ -784,6 +803,7 @@ def _databricks_codex_config_overrides(
     return [
         f"model={json.dumps(model)}",
         f'model_provider="{provider_name}"',
+        "model_supports_reasoning_summaries=true",
         (
             "model_providers.omnigent_databricks="
             '{name="Omnigent Databricks",'
@@ -1196,9 +1216,16 @@ class _CodexAppServerSession:
             return
         self._loop = asyncio.get_running_loop()
         codex_home_root = Path(tempfile.gettempdir())
-        if self._cwd:
-            codex_home_root = Path(self._cwd) / ".codex-tmp"
-            codex_home_root.mkdir(parents=True, exist_ok=True)
+        if self._cwd and self._cwd != "/":
+            try:
+                codex_home_root = Path(self._cwd) / ".codex-tmp"
+                codex_home_root.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                # The cwd may be on a read-only filesystem — e.g. macOS
+                # root ``/`` inherited from a runner whose working
+                # directory was never explicitly set.  Fall back to the
+                # system temp directory so the codex home is still writable.
+                codex_home_root = Path(tempfile.gettempdir())
         self._codex_home_dir = Path(
             tempfile.mkdtemp(prefix="omnigent-codex-home-", dir=str(codex_home_root))
         )
@@ -1459,12 +1486,18 @@ class _CodexAppServerSession:
         # ``TurnStartParams`` has no ``effort`` field, so an ``effort`` set on
         # ``turn/start`` is silently dropped by serde and never takes effect.
         # ``ThreadSettingsUpdateParams`` is where ``model``/``effort`` live —
-        # the same path the TUI ``/model`` picker uses. Deduped against the
+        # the same path the TUI ``/model`` picker uses. Request a detailed
+        # summary too; effort controls internal work, while summary controls
+        # whether observable reasoning events are emitted. Deduped against the
         # last value applied on this thread to avoid a redundant per-turn RPC.
         if reasoning_effort and reasoning_effort != self._applied_effort:
             await self._request(
                 "thread/settings/update",
-                {"threadId": self.thread_id, "effort": reasoning_effort},
+                {
+                    "threadId": self.thread_id,
+                    "effort": reasoning_effort,
+                    "summary": "detailed",
+                },
             )
             self._applied_effort = reasoning_effort
         turn_params: CodexParams = {
@@ -2114,9 +2147,13 @@ class CodexExecutor(Executor):
         self._skills_filter = skills_filter
         resolved_codex = codex_path or _find_codex_cli()
         if not resolved_codex:
-            raise ImportError("CodexExecutor requires the 'codex' CLI on PATH.")
+            raise ImportError(
+                "CodexExecutor requires the 'codex' CLI on PATH. If codex is "
+                "installed on a PATH the host daemon didn't inherit (e.g. an "
+                f"nvm-managed bin dir), set {_CODEX_PATH_ENV}=/path/to/codex."
+            )
         self._codex_path = resolved_codex
-        self._env = _clean_codex_env()
+        self._env = _clean_codex_env(_declared_passthrough(self._os_env_spec))
         # Retry policy → OpenAI SDK env vars (Codex uses the OpenAI
         # SDK internally). Speculative — empirical audit pending.
         self._retry_policy = retry_policy if retry_policy is not None else RetryPolicy()
@@ -2154,12 +2191,10 @@ class CodexExecutor(Executor):
             if host is None:
                 # No gateway host supplied directly: derive the transport from
                 # a Databricks profile (the Databricks producer's fallback).
-                creds = _read_databrickscfg(databricks_profile)
-                host = (
-                    creds.host
-                    if creds is not None
-                    else _read_databrickscfg_host(databricks_profile)
-                )
+                # Use the profile's own host so the base URL matches the token
+                # the profile-pinned auth command mints (not a DATABRICKS_HOST
+                # override that would point the base URL at another workspace).
+                host = _databricks_gateway_host(databricks_profile)
                 if not host:
                     raise OSError(
                         "CodexExecutor(gateway=True) requires gateway credentials via "

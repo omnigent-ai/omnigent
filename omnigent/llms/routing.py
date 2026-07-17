@@ -84,6 +84,8 @@ _HARNESS_FOR_MODEL_PREFIX: dict[str, str] = {
     "databricks-gpt-": "openai-agents",
     "openai/gpt-": "openai-agents",
     "gpt-": "openai-agents",
+    # xAI is OpenAI-compatible; provider prefix required (bare grok- defaults to openai).
+    "xai/grok-": "openai-agents",
 }
 
 

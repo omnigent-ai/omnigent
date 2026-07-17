@@ -17,6 +17,7 @@ import {
   matchSkillInvocation,
   normalizeWorkspacePath,
   sessionsSharingDirectory,
+  worktreePathTail,
   NewChatLandingScreen,
   resetLandingDraft,
 } from "./NewChatDialog";
@@ -26,10 +27,12 @@ import { authenticatedFetch } from "@/lib/identity";
 import { useHosts, type Host } from "@/hooks/useHosts";
 import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useHostFilesystem, type HostFilesystemEntry } from "@/hooks/useHostFilesystem";
+import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import type { Conversation } from "@/hooks/useConversations";
 import { setOmnigentHostConfig } from "@/lib/host";
+import { writeHideUnconfiguredHarnesses } from "@/lib/harnessVisibilityPreferences";
 import { setPendingInitialPrompt } from "@/store/chatStore";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
@@ -40,13 +43,19 @@ vi.mock("@/lib/identity", async (importOriginal) => ({
   authenticatedFetch: vi.fn(),
 }));
 vi.mock("@/hooks/useHosts", () => ({ useHosts: vi.fn() }));
-vi.mock("@/hooks/useAvailableAgents", () => ({ useAvailableAgents: vi.fn() }));
+vi.mock("@/hooks/useAvailableAgents", () => ({
+  useAvailableAgents: vi.fn(),
+  prefetchAvailableAgentDetails: vi.fn(),
+}));
 vi.mock("@/hooks/useHostFilesystem", () => ({
   useHostFilesystem: vi.fn(),
   // WorkspacePicker (rendered by the file browser) reads this on mount;
   // an idle mutation keeps it inert for these tests.
   useCreateHostDirectory: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
 }));
+// Mocked so it doesn't hit authenticatedFetch (which would pollute the
+// call list the create-flow assertions index into positionally).
+vi.mock("@/hooks/useHostWorktrees", () => ({ useHostWorktrees: vi.fn() }));
 vi.mock("@/hooks/useDirectorySessions", () => ({
   useDirectorySessions: vi.fn(),
 }));
@@ -59,6 +68,22 @@ vi.mock("@/hooks/RunnerHealthProvider", () => ({
 vi.mock("@/hooks/useConversations", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/hooks/useConversations")>()),
   useProjects: () => ({ data: [] }),
+  // "No newest session" keeps the project prefill inert so the generic
+  // host/workspace defaults under test still apply on ?project= visits.
+  useNewestProjectSession: () => ({ data: null, isError: false }),
+}));
+// The harness-label catalog is not under test here. Keep it synchronous so
+// create-session fetch assertions only observe the POST/PATCH calls they own.
+vi.mock("@/lib/agentLabels", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/agentLabels")>()),
+  useBrainHarnessLabels: () => ({
+    "claude-sdk": "Claude SDK",
+    codex: "Codex",
+    cursor: "Cursor",
+    pi: "Pi",
+    antigravity: "Antigravity",
+    copilot: "Copilot",
+  }),
 }));
 // Partial mock: only spy on the first-message handoff so the "@"-mention
 // tests can assert the prepended attachment marker. Everything else
@@ -72,6 +97,7 @@ const authenticatedFetchMock = vi.mocked(authenticatedFetch);
 const useHostsMock = vi.mocked(useHosts);
 const useAvailableAgentsMock = vi.mocked(useAvailableAgents);
 const useHostFilesystemMock = vi.mocked(useHostFilesystem);
+const useHostWorktreesMock = vi.mocked(useHostWorktrees);
 const useDirectorySessionsMock = vi.mocked(useDirectorySessions);
 const useRunnerHealthMock = vi.mocked(useRunnerHealthRegistration);
 const setPendingInitialPromptMock = vi.mocked(setPendingInitialPrompt);
@@ -335,6 +361,18 @@ describe("sandbox repository helpers", () => {
   ])("deriveRepoName(%j) === %j", (url, expected) => {
     expect(deriveRepoName(url)).toBe(expected);
   });
+
+  it.each<[string, string]>([
+    // Deep path → leading ellipsis + last two segments (the disambiguating tail).
+    ["/Users/me/myrepo-worktrees/feature-x", "…/myrepo-worktrees/feature-x"],
+    // Two-or-fewer segments → returned unchanged (nothing useful to trim).
+    ["/Users", "/Users"],
+    ["/a/b", "/a/b"],
+    // Trailing slash doesn't create an empty tail segment.
+    ["/Users/me/myrepo-worktrees/feature-x/", "…/myrepo-worktrees/feature-x"],
+  ])("worktreePathTail(%j) === %j", (path, expected) => {
+    expect(worktreePathTail(path)).toBe(expected);
+  });
 });
 
 // deriveHomeDir resolves the working-directory default for a first-ever
@@ -421,6 +459,16 @@ describe("harnessUnconfiguredOnHost", () => {
     );
   });
 
+  it("shows native Cursor's install and login steps before launch", () => {
+    const testHost = hostWith({ "cursor-native": false });
+    const reason = harnessUnavailableReasonOnHost("cursor-native", testHost);
+    expect(reason).toBe("cursor-cli-missing");
+    expect(harnessWarningBadgeText(reason)).toBe("install & login");
+    expect(harnessWarningMessageText("Cursor", "laptop", reason)).toBe(
+      "Cursor needs cursor-agent on laptop — install it with `curl https://cursor.com/install -fsS | bash`, then run `cursor-agent login`.",
+    );
+  });
+
   it("surfaces structured codex unavailable reasons", () => {
     const testHost = hostWith({ codex: "needs-auth", "codex-native": "binary-missing" });
     expect(harnessUnconfiguredOnHost("codex", testHost)).toBe(true);
@@ -432,7 +480,7 @@ describe("harnessUnconfiguredOnHost", () => {
     );
     expect(harnessWarningBadgeText("binary-missing")).toBe("binary missing");
     expect(harnessWarningMessageText("Codex", "laptop", "binary-missing")).toBe(
-      "Codex is missing the Codex binary on laptop — run omnigent setup on that machine.",
+      "Codex can't find the Codex binary on laptop — if codex is installed, restart the host with omnigent host so it picks up your PATH, or set OMNIGENT_CODEX_PATH. Otherwise run omnigent setup.",
     );
   });
 
@@ -546,6 +594,7 @@ function setupLandingMocks() {
   useHostsMock.mockReset();
   useAvailableAgentsMock.mockReset();
   useHostFilesystemMock.mockReset();
+  useHostWorktreesMock.mockReset();
   useDirectorySessionsMock.mockReset();
   useRunnerHealthMock.mockReset();
   setOmnigentHostConfig({});
@@ -564,6 +613,9 @@ function setupLandingMocks() {
     error: null,
     isPlaceholderData: false,
   } as unknown as ReturnType<typeof useHostFilesystem>);
+  useHostWorktreesMock.mockReturnValue({
+    data: undefined,
+  } as unknown as ReturnType<typeof useHostWorktrees>);
   mockHosts([host("online")]);
   mockAgents([
     {
@@ -591,11 +643,14 @@ function renderLanding(infoOverrides: Partial<ServerInfo> = {}, route = "/") {
   });
   const info: ServerInfo = {
     accounts_enabled: false,
+    single_user: false,
     login_url: null,
     needs_setup: false,
     databricks_features: false,
     managed_sandboxes_enabled: false,
     sandbox_provider: null,
+    sharing_mode: "on",
+    public_sharing_enabled: true,
     server_version: null,
     smart_routing_enabled: false,
     ...infoOverrides,
@@ -769,6 +824,93 @@ describe("NewChatLandingScreen", () => {
     expect(cursor.compareDocumentPosition(pi) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(pi.compareDocumentPosition(kiro) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(kiro.compareDocumentPosition(polly) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  // The default agents are claude-native (a1) and codex-native (a2); the host
+  // below reports codex-native as unconfigured on this machine.
+  function mockHostWithHarnessReadiness() {
+    mockHosts([
+      {
+        ...host("online"),
+        configured_harnesses: { "claude-native": true, "codex-native": false },
+      } as Host,
+    ]);
+  }
+
+  it("shows unconfigured harnesses by default (opt-in preference off)", () => {
+    // With the preference untouched the picker keeps listing harnesses that
+    // aren't set up on the host — they're badged, not hidden — so users can
+    // still discover and configure them.
+    mockHostWithHarnessReadiness();
+    renderLanding();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    expect(screen.getByTestId("new-chat-landing-agent-a1")).toBeTruthy();
+    expect(screen.getByTestId("new-chat-landing-agent-a2")).toBeTruthy();
+  });
+
+  it("hides harnesses unconfigured on the selected host when the preference is on", () => {
+    // Preference on → codex-native (reported unconfigured on host_1) drops out
+    // of the picker while claude-native (configured) stays.
+    writeHideUnconfiguredHarnesses(true);
+    mockHostWithHarnessReadiness();
+    renderLanding();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    expect(screen.getByTestId("new-chat-landing-agent-a1")).toBeTruthy();
+    expect(screen.queryByTestId("new-chat-landing-agent-a2")).toBeNull();
+  });
+
+  // Polly is a bundle agent whose brain harness (claude-sdk) is overridable, so
+  // its config submenu lists every brain harness — each badged when unconfigured.
+  function mockPollyWithBrainReadiness() {
+    mockHosts([
+      {
+        ...host("online"),
+        configured_harnesses: {
+          "claude-sdk": true,
+          codex: "binary-missing",
+          cursor: false,
+          pi: false,
+          antigravity: true,
+          copilot: false,
+        },
+      } as Host,
+    ]);
+    mockAgents([
+      {
+        id: "a_polly",
+        name: "polly",
+        display_name: "Polly",
+        description: null,
+        harness: "claude-sdk",
+        skills: [],
+      },
+    ]);
+  }
+
+  it("lists every brain harness in a bundle agent's override submenu by default", () => {
+    // Preference off → the brain override still offers unconfigured harnesses
+    // (badged), so they remain discoverable.
+    mockPollyWithBrainReadiness();
+    renderLanding();
+    openAgentConfig("a_polly");
+    expect(screen.getByTestId("new-chat-landing-harness-codex")).toBeTruthy();
+    expect(screen.getByTestId("new-chat-landing-harness-cursor")).toBeTruthy();
+    expect(screen.getByTestId("new-chat-landing-harness-copilot")).toBeTruthy();
+  });
+
+  it("hides unconfigured brain harnesses in the override submenu when the preference is on", () => {
+    // Preference on → only brains that can launch on the host remain, plus the
+    // selected default (claude-sdk) which always stays for radio coherence.
+    writeHideUnconfiguredHarnesses(true);
+    mockPollyWithBrainReadiness();
+    renderLanding();
+    openAgentConfig("a_polly");
+    expect(screen.getByTestId("new-chat-landing-harness-claude-sdk")).toBeTruthy();
+    expect(screen.getByTestId("new-chat-landing-harness-antigravity")).toBeTruthy();
+    expect(screen.queryByTestId("new-chat-landing-harness-codex")).toBeNull();
+    expect(screen.queryByTestId("new-chat-landing-harness-cursor")).toBeNull();
+    expect(screen.queryByTestId("new-chat-landing-harness-pi")).toBeNull();
+    expect(screen.queryByTestId("new-chat-landing-harness-copilot")).toBeNull();
   });
 
   it("seeds the working directory from the host's most-recent path", async () => {
@@ -1016,6 +1158,196 @@ describe("NewChatLandingScreen", () => {
     });
     fireEvent.click(screen.getByTestId("new-chat-landing-workspace-chip"));
     expect(screen.queryByTestId("workspace-picker-conflict")).toBeNull();
+  });
+
+  it("lists existing worktrees and starts directly in a selected one (git bind mode)", async () => {
+    // The seeded repo has one linked worktree; the main tree is filtered out.
+    useHostWorktreesMock.mockReturnValue({
+      data: [
+        { path: "/Users/corey/repo", branch: "main", is_main: true, detached: false },
+        {
+          path: "/Users/corey/repo-worktrees/feature-x",
+          branch: "feature/x",
+          is_main: false,
+          detached: false,
+        },
+      ],
+    } as unknown as ReturnType<typeof useHostWorktrees>);
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+
+    // Open the worktree popover, focus the branch combobox to reveal the
+    // existing-worktree dropdown, and select the one linked worktree.
+    fireEvent.click(screen.getByTestId("new-chat-landing-branch-chip"));
+    fireEvent.focus(screen.getByTestId("new-chat-landing-branch-input"));
+    const options = screen.getAllByTestId("new-chat-landing-worktree-option");
+    expect(options).toHaveLength(1); // main tree excluded
+    expect(options[0].textContent).toContain("feature/x");
+    // onMouseDown (fires before the input's blur) drives selection.
+    fireEvent.mouseDown(options[0]);
+
+    // Selecting a worktree auto-closes the popover.
+    await waitFor(() => expect(screen.queryByTestId("new-chat-landing-branch-input")).toBeNull());
+
+    // Reopen the chip: the warning shows and the branch field is prefilled with
+    // the selected worktree's branch.
+    fireEvent.click(screen.getByTestId("new-chat-landing-branch-chip"));
+    await screen.findByTestId("new-chat-landing-existing-worktree-warning");
+    expect((screen.getByTestId("new-chat-landing-branch-input") as HTMLInputElement).value).toBe(
+      "feature/x",
+    );
+
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "work in the worktree" },
+    });
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+    const [, init] = authenticatedFetchMock.mock.calls[0];
+    const body = JSON.parse((init as RequestInit).body as string) as {
+      workspace?: string;
+      git?: { branch_name: string; existing_worktree?: boolean; base_branch?: string };
+    };
+    // Workspace is bound straight to the worktree dir. The git block is in
+    // bind mode (`existing_worktree`): no worktree is created, but the
+    // worktree's branch rides along as `branch_name` so the sidebar shows it
+    // and the delete flow can offer to remove it. No base_branch on a bind.
+    expect(body.workspace).toBe("/Users/corey/repo-worktrees/feature-x");
+    expect(body.git?.existing_worktree).toBe(true);
+    expect(body.git?.branch_name).toBe("feature/x");
+    expect(body.git?.base_branch).toBeUndefined();
+  });
+
+  it("creates a new worktree when the prefilled branch name is edited", async () => {
+    useHostWorktreesMock.mockReturnValue({
+      data: [
+        {
+          path: "/Users/corey/repo-worktrees/feature-x",
+          branch: "feature/x",
+          is_main: false,
+          detached: false,
+        },
+      ],
+    } as unknown as ReturnType<typeof useHostWorktrees>);
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+
+    fireEvent.click(screen.getByTestId("new-chat-landing-branch-chip"));
+    fireEvent.focus(screen.getByTestId("new-chat-landing-branch-input"));
+    fireEvent.mouseDown(screen.getByTestId("new-chat-landing-worktree-option"));
+    // Selection auto-closes the popover — reopen to edit the prefilled branch.
+    await waitFor(() => expect(screen.queryByTestId("new-chat-landing-branch-input")).toBeNull());
+    fireEvent.click(screen.getByTestId("new-chat-landing-branch-chip"));
+    await screen.findByTestId("new-chat-landing-existing-worktree-warning");
+
+    // Edit the branch away from the prefill: now it's a NEW worktree request.
+    fireEvent.change(screen.getByTestId("new-chat-landing-branch-input"), {
+      target: { value: "feature/y" },
+    });
+    // Warning gone once the name diverges from the existing worktree's branch.
+    expect(screen.queryByTestId("new-chat-landing-existing-worktree-warning")).toBeNull();
+
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "branch off" },
+    });
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+    const [, init] = authenticatedFetchMock.mock.calls[0];
+    const body = JSON.parse((init as RequestInit).body as string) as {
+      git?: { branch_name: string; existing_worktree?: boolean };
+    };
+    // A new worktree for the edited branch name is requested — this is a
+    // create, not a bind, so `existing_worktree` is not set.
+    expect(body.git?.branch_name).toBe("feature/y");
+    expect(body.git?.existing_worktree).toBeUndefined();
+  });
+
+  it("filters the worktree dropdown as you type in the branch combobox", async () => {
+    useHostWorktreesMock.mockReturnValue({
+      data: [
+        {
+          path: "/Users/corey/repo-worktrees/feature-x",
+          branch: "feature/x",
+          is_main: false,
+          detached: false,
+        },
+        {
+          path: "/Users/corey/repo-worktrees/bugfix-login",
+          branch: "bugfix/login",
+          is_main: false,
+          detached: false,
+        },
+      ],
+    } as unknown as ReturnType<typeof useHostWorktrees>);
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+
+    fireEvent.click(screen.getByTestId("new-chat-landing-branch-chip"));
+    // Radix autofocuses the branch combobox on open, so the dropdown of both
+    // worktrees shows immediately (a focus event keeps it open in jsdom too).
+    fireEvent.focus(screen.getByTestId("new-chat-landing-branch-input"));
+    expect(screen.getAllByTestId("new-chat-landing-worktree-option")).toHaveLength(2);
+
+    // Typing in the branch field narrows to matching branch/path substrings.
+    fireEvent.change(screen.getByTestId("new-chat-landing-branch-input"), {
+      target: { value: "bugfix" },
+    });
+    const options = screen.getAllByTestId("new-chat-landing-worktree-option");
+    expect(options).toHaveLength(1);
+    expect(options[0].textContent).toContain("bugfix/login");
+
+    // A name matching nothing hides the dropdown entirely — that name becomes
+    // a NEW worktree on submit rather than selecting an existing one.
+    fireEvent.change(screen.getByTestId("new-chat-landing-branch-input"), {
+      target: { value: "brand-new-branch" },
+    });
+    expect(screen.queryByTestId("new-chat-landing-worktree-dropdown")).toBeNull();
+    expect(screen.queryByTestId("new-chat-landing-worktree-option")).toBeNull();
+  });
+
+  it("generates a unique worktree branch name and sends it on create", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+
+    fireEvent.click(screen.getByTestId("new-chat-landing-branch-chip"));
+    // Clicking the generate button fills a "worktree-<hex>" name.
+    fireEvent.mouseDown(screen.getByTestId("new-chat-landing-branch-generate"));
+    const branchInput = screen.getByTestId("new-chat-landing-branch-input") as HTMLInputElement;
+    expect(branchInput.value).toMatch(/^worktree-[0-9a-f]{8}$/);
+
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "spin up a scratch worktree" },
+    });
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+    const [, init] = authenticatedFetchMock.mock.calls[0];
+    const body = JSON.parse((init as RequestInit).body as string) as {
+      git?: { branch_name: string };
+    };
+    // The generated name rides through as a new-worktree create.
+    expect(body.git?.branch_name).toMatch(/^worktree-[0-9a-f]{8}$/);
   });
 
   it("shows no conflict banner when no live session shares the directory", async () => {

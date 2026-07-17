@@ -143,7 +143,7 @@ def session_fixture(
     # reads ctx.conversation_id directly (tasks table removed).
     ctx = ToolContext(
         task_id="task_placeholder",
-        agent_id="ag_parent",
+        agent_id="2759f8a97fd91216cb3e0d7a1f60c7f6",
         conversation_id=parent_conv.id,
     )
 
@@ -188,7 +188,13 @@ def test_send_schema_advertises_plain_string_and_purpose_object_args() -> None:
     # required, or plain-string sends would break.
     assert object_schema["required"] == ["input"]
     assert object_schema["additionalProperties"] is False
-    assert set(object_schema["properties"]) == {"input", "purpose", "model", "cost_budget"}
+    assert set(object_schema["properties"]) == {
+        "input",
+        "purpose",
+        "model",
+        "file_ids",
+        "cost_budget",
+    }
     assert "dispatch metadata" in object_schema["properties"]["purpose"]["description"]
     # The model property must say it is create-time-only and optional,
     # so the LLM doesn't attach it to continuation sends.
@@ -214,8 +220,8 @@ def test_send_schema_gates_harness_field_behind_allowlist_opt_in() -> None:
     Per design D.4 the runtime harness override is allowlist-gated: the
     schema exposes ``harness`` only when at least one declared sub-agent
     declares a non-empty ``executor.config.allowed_harnesses``. A sub-agent
-    without that opt-in keeps the base ``{input, purpose, model}`` args
-    object, so the orchestrator never sees a harness knob it cannot use.
+    without that opt-in keeps the base ``{input, purpose, model, file_ids}``
+    args object, so the orchestrator never sees a harness knob it cannot use.
     This mirrors the per-child dispatch guard in tool_dispatch.py — the two
     gates must agree on what "opted in" means.
     """
@@ -223,7 +229,13 @@ def test_send_schema_gates_harness_field_behind_allowlist_opt_in() -> None:
     plain = SysSessionSendTool(
         {"claude": AgentSpec(spec_version=1, name="claude", description="Review helper.")}
     )
-    assert _object_branch_props(plain) == {"input", "purpose", "model", "cost_budget"}
+    assert _object_branch_props(plain) == {
+        "input",
+        "purpose",
+        "model",
+        "file_ids",
+        "cost_budget",
+    }
 
     # Opted in: a sub-agent whose executor.config.allowed_harnesses declares a
     # non-empty allowlist (the polly/debby `codex`/`opencode` worker shape) →
@@ -245,6 +257,7 @@ def test_send_schema_gates_harness_field_behind_allowlist_opt_in() -> None:
         "input",
         "purpose",
         "model",
+        "file_ids",
         "harness",
         "cost_budget",
     }
@@ -266,7 +279,14 @@ def test_send_schema_gates_harness_field_behind_allowlist_opt_in() -> None:
             "codex": opted_in_spec,
         }
     )
-    assert _object_branch_props(mixed) == {"input", "purpose", "model", "harness", "cost_budget"}
+    assert _object_branch_props(mixed) == {
+        "input",
+        "purpose",
+        "model",
+        "file_ids",
+        "harness",
+        "cost_budget",
+    }
 
 
 def test_peek_schema_required_fields_and_no_extra_props() -> None:
@@ -547,12 +567,12 @@ def test_peek_unknown_conversation_id_returns_not_found(
     """
     tool = SysSessionGetHistoryTool()
     raw = tool.invoke(
-        json.dumps({"conversation_id": "conv_does_not_exist"}),
+        json.dumps({"conversation_id": "1d0b12236c77f69f5073a53583de1a3f"}),
         session_fixture.ctx,
     )
     payload = json.loads(raw)
     assert payload["error"] == "session_not_found"
-    assert payload["conversation_id"] == "conv_does_not_exist"
+    assert payload["conversation_id"] == "1d0b12236c77f69f5073a53583de1a3f"
 
 
 def test_peek_out_of_tree_conversation_is_rejected(
@@ -791,12 +811,12 @@ def test_close_unknown_conversation_id_returns_not_found(
     ``session_not_found`` (no DB mutation).
     """
     raw = SysSessionCloseTool().invoke(
-        json.dumps({"conversation_id": "conv_ghost"}),
+        json.dumps({"conversation_id": "761ec01d1fb0a45d2e3159d0d47a5e70"}),
         session_fixture.ctx,
     )
     payload = json.loads(raw)
     assert payload["error"] == "session_not_found"
-    assert payload["conversation_id"] == "conv_ghost"
+    assert payload["conversation_id"] == "761ec01d1fb0a45d2e3159d0d47a5e70"
 
 
 def test_close_out_of_tree_conversation_is_rejected(

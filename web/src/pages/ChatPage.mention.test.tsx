@@ -62,6 +62,17 @@ vi.mock("@/hooks/RunnerHealthProvider", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/hooks/RunnerHealthProvider")>()),
   useSessionHostOnline: () => undefined,
 }));
+vi.mock("@/lib/agentLabels", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/agentLabels")>()),
+  useBrainHarnessLabels: () => ({
+    "claude-sdk": "Claude SDK",
+    codex: "Codex",
+    cursor: "Cursor",
+    pi: "Pi",
+    antigravity: "Antigravity",
+    copilot: "Copilot",
+  }),
+}));
 
 import { Composer, detectMentionAt, mentionMarkerFor } from "./ChatPage";
 

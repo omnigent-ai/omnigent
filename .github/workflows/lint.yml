@@ -11,6 +11,9 @@ on:
   push:
     branches:
       - main
+      # Release branches: release.yml's green-CI gate reads check runs off the
+      # branch head, so cherry-picks and release-bump commits must run checks.
+      - 'release/v[0-9]*'
 
 permissions:
   contents: read
@@ -102,9 +105,49 @@ jobs:
             exit 1
           }
 
+      # ktlint is invoked by the android-ktlint-* pre-commit hooks. The wrapper
+      # script (web/android/bin/ktlint.sh) exits 0 if ktlint is absent, so we
+      # install it here before pre-commit runs to ensure the check is enforced.
+      # The binary is verified against a pinned SHA-256 so a corrupted or spoofed
+      # download is caught before the binary is made executable.
+      - name: Install ktlint
+        env:
+          KTLINT_VERSION: "1.8.0"
+          KTLINT_SHA256: "a3fd620207d5c40da6ca789b95e7f823c54e854b7fade7f613e91096a3706d75"
+        run: |
+          curl -sSLf \
+            "https://github.com/ktlint/ktlint/releases/download/${KTLINT_VERSION}/ktlint" \
+            -o /tmp/ktlint
+          echo "${KTLINT_SHA256}  /tmp/ktlint" | sha256sum -c
+          chmod +x /tmp/ktlint
+          sudo mv /tmp/ktlint /usr/local/bin/ktlint
+
       - name: Run formatting, lint, and typing checks
         run: uv run pre-commit run --all-files --show-diff-on-failure
 
       - name: Type-check web
         working-directory: web
         run: npm run type-check
+
+  # The three packages release in lockstep (identical versions + `==` sibling
+  # pins). Assert agreement on every change so drift from a bad merge or
+  # cherry-pick — however it happened — is caught before it reaches a release.
+  version-lockstep:
+    name: Version lockstep check
+    needs: gate
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version-file: ".python-version"
+
+      - name: All version locations agree
+        run: |
+          python -m pip install --quiet --disable-pip-version-check packaging
+          python scripts/update_versions.py check

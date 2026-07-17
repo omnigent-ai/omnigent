@@ -23,7 +23,21 @@ import type { Comment } from "@/hooks/useComments";
 // ── Mock heavy child components ───────────────────────────────────────────────
 
 vi.mock("./CodeViewer", () => ({
-  CodeViewer: () => <div data-testid="code-viewer" />,
+  // Expose the resolved viewMode so tests can assert which surface FileViewer
+  // routed to (preview / editor / source) without mounting the real viewer.
+  // The "make dirty" button lets a test drive the editor's unsaved-edits signal
+  // (onDirtyChange) so the mode-switch / navigation guard can be exercised.
+  CodeViewer: ({
+    viewMode,
+    onDirtyChange,
+  }: {
+    viewMode: string;
+    onDirtyChange?: (dirty: boolean) => void;
+  }) => (
+    <div data-testid="code-viewer" data-view-mode={viewMode}>
+      <button type="button" aria-label="make dirty" onClick={() => onDirtyChange?.(true)} />
+    </div>
+  ),
 }));
 
 vi.mock("./CommentsPanel", () => ({
@@ -53,7 +67,21 @@ vi.mock("./CommentsPanel", () => ({
 }));
 
 vi.mock("./MonacoDiffViewer", () => ({
-  MonacoDiffViewer: () => <div data-testid="diff-viewer" />,
+  // Surface the toggle-driven props as data attributes so tests can assert the
+  // "⋯" menu wires wrap-lines / hide-whitespace through to the diff editor.
+  MonacoDiffViewer: ({
+    wrapLines,
+    hideWhitespace,
+  }: {
+    wrapLines?: boolean;
+    hideWhitespace?: boolean;
+  }) => (
+    <div
+      data-testid="diff-viewer"
+      data-wrap-lines={String(!!wrapLines)}
+      data-hide-whitespace={String(!!hideWhitespace)}
+    />
+  ),
 }));
 
 // ── Mock hooks ────────────────────────────────────────────────────────────────
@@ -118,6 +146,8 @@ import { useFileDiff } from "@/hooks/useFileDiff";
 import { getSeenCommentIds } from "@/hooks/useSeenComments";
 import { useWorkspaceChangedFiles } from "@/hooks/useWorkspaceChangedFiles";
 import { classifyAndRemapComments, FileViewer } from "./FileViewer";
+import { encodePdfAnchor } from "./pdfCommentHelpers";
+import { writeFileViewPreferences } from "@/lib/fileViewPreferences";
 import type { ChangedSort } from "./FlatFileList";
 
 const useCommentsMock = vi.mocked(useComments);
@@ -250,7 +280,71 @@ function installContentWidth(width: number): void {
   } as DOMRect);
 }
 
+/**
+ * Simulate the iOS native shell and its live visual viewport. The keyboard
+ * "opens" by shrinking the visual viewport below the layout viewport
+ * (window.innerHeight); useIOSNativeKeyboardInset reads the delta. Pass
+ * visibleHeight === layoutHeight to model a closed keyboard (inset 0).
+ */
+function setIOSViewport(layoutHeight: number, visibleHeight: number): void {
+  (window as unknown as Record<string, unknown>).omnigentNative = { kind: "ios" };
+  vi.stubGlobal("innerHeight", layoutHeight);
+  vi.stubGlobal("visualViewport", {
+    offsetTop: 0,
+    height: visibleHeight,
+    addEventListener: vi.fn(),
+    removeEventListener: vi.fn(),
+  });
+}
+
+function clearIOSViewport(): void {
+  delete (window as unknown as Record<string, unknown>).omnigentNative;
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+// The mobile viewer is a `fixed inset-0` overlay that the iOS shell-lock (which
+// only resizes flow content inside .app-shell) can't lift above the soft
+// keyboard. It pads its own bottom by the keyboard inset so the comments panel
+// and its auto-focused textarea stay visible instead of hiding behind the
+// keyboard.
+describe("FileViewer mobile keyboard inset", () => {
+  afterEach(() => {
+    clearIOSViewport();
+  });
+
+  it("pads the overlay bottom by the keyboard inset when the iOS keyboard is open", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    setIOSViewport(800, 500); // keyboard covers 300px of the 800px layout
+    renderViewer({ open: true });
+
+    expect(screen.getByTestId("file-viewer")).toHaveStyle({ paddingBottom: "300px" });
+  });
+
+  it("applies no bottom padding when the keyboard is closed", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    setIOSViewport(800, 800); // visible viewport fills the layout — no keyboard
+    renderViewer({ open: true });
+
+    expect(screen.getByTestId("file-viewer").style.paddingBottom).toBe("");
+  });
+
+  it("applies no bottom padding off the iOS shell even when the viewport shrinks", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    // A shrunk visual viewport but no iOS shell marker: the browser/Electron
+    // keyboard is handled by normal layout, so the overlay must not pad itself.
+    vi.stubGlobal("innerHeight", 800);
+    vi.stubGlobal("visualViewport", {
+      offsetTop: 0,
+      height: 500,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    });
+    renderViewer({ open: true });
+
+    expect(screen.getByTestId("file-viewer").style.paddingBottom).toBe("");
+  });
+});
 
 describe("FileViewer comments panel open/close semantics", () => {
   it("keeps the panel closed on fresh open even when the file has comments", () => {
@@ -762,6 +856,21 @@ describe("classifyAndRemapComments", () => {
     expect(result.open[0].id).toBe("c6");
   });
 
+  it("skips remapping for PDF geometry anchors", () => {
+    const anchor = encodePdfAnchor(1, [{ x: 0.1, y: 0.2, w: 0.3, h: 0.04 }], "Hello PDF");
+    const c = makeAnchoredComment({
+      id: "c_pdf",
+      start_index: anchor.start_index,
+      end_index: anchor.end_index,
+      anchor_content: anchor.anchor_content,
+    });
+
+    const result = classifyAndRemapComments([c], "%PDF-1.4 binary bytes");
+
+    expect(result.open).toHaveLength(1);
+    expect(result.open[0]).toEqual(c);
+  });
+
   // Spec/xfail: a draft comment whose anchor can no longer be found
   // is currently returned in `open` at its stale stored offsets with no marker,
   // so the UI shows it as if still attached. The desired behavior is a
@@ -893,6 +1002,210 @@ describe("FileViewer view-preference persistence across refresh", () => {
   });
 });
 
+// ── Markdown preview / edit / source modes ──────────────────────────────────
+//
+// HTML has always had a rendered "preview" pane; markdown had editor ↔ source.
+// A read-only rendered preview was added for markdown as a third mode: markdown
+// opens in the rich-text editor by default, with the preview and raw source one
+// tap away in the "View mode" dropdown.
+
+describe("FileViewer markdown preview/edit/source modes", () => {
+  beforeEach(() => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+  });
+
+  const viewModeOf = () => screen.getByTestId("code-viewer").getAttribute("data-view-mode");
+
+  // Markdown's three modes live behind a single "View mode" dropdown (the
+  // toolbar was too full for three side-by-side buttons). Open it, then click
+  // the wanted option. Radix menus open on pointerdown, not click.
+  const openModeMenu = () =>
+    fireEvent.pointerDown(screen.getByRole("button", { name: /^View mode/ }), { button: 0 });
+  const selectMode = (mode: "Preview" | "Edit" | "Source") => {
+    openModeMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: mode }));
+  };
+
+  it("opens a markdown file in the rich-text editor by default", () => {
+    // notes.md is not a changed file, so no diff view competes — the default
+    // previewable mode ("editor") must reach CodeViewer for markdown. Preview
+    // and source are reachable from the toolbar dropdown, not the default.
+    renderViewer({ open: true, path: "notes.md" });
+    expect(viewModeOf()).toBe("editor");
+  });
+
+  it("offers Preview, Edit, and Source options in the view-mode menu", () => {
+    renderViewer({ open: true, path: "notes.md" });
+    openModeMenu();
+    expect(screen.getByRole("menuitem", { name: "Preview" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "Edit" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "Source" })).toBeInTheDocument();
+  });
+
+  it("switches markdown to the rich-text editor when Edit is chosen", () => {
+    renderViewer({ open: true, path: "notes.md" });
+    selectMode("Edit");
+    expect(viewModeOf()).toBe("editor");
+  });
+
+  it("switches markdown to raw source when Source is chosen", () => {
+    renderViewer({ open: true, path: "notes.md" });
+    selectMode("Source");
+    expect(viewModeOf()).toBe("source");
+  });
+
+  it("returns markdown to the preview from another mode", () => {
+    renderViewer({ open: true, path: "notes.md" });
+    selectMode("Source");
+    expect(viewModeOf()).toBe("source");
+    selectMode("Preview");
+    expect(viewModeOf()).toBe("preview");
+  });
+
+  it("does not offer the markdown view-mode menu for HTML files", () => {
+    // HTML has no rich-text editor — only a single preview ↔ source toggle, not
+    // the markdown tri-state picker. The "View mode" dropdown must not appear.
+    renderViewer({ open: true, path: "page.html" });
+    expect(screen.queryByRole("button", { name: /^View mode/ })).toBeNull();
+  });
+
+  it("keeps HTML's preview-default and preview ↔ source toggle intact", () => {
+    renderViewer({ open: true, path: "page.html" });
+    expect(viewModeOf()).toBe("preview");
+    // In preview, the single toggle switches to source (existing behavior).
+    fireEvent.click(screen.getByRole("button", { name: "View source" }));
+    expect(viewModeOf()).toBe("source");
+  });
+
+  it("guards unsaved edits when leaving the markdown editor, switching only after Discard", () => {
+    renderViewer({ open: true, path: "notes.md" });
+    selectMode("Edit");
+    expect(viewModeOf()).toBe("editor");
+    // Mark the editor dirty (the mock forwards onDirtyChange).
+    fireEvent.click(screen.getByRole("button", { name: "make dirty" }));
+    // Leaving the editor with unsaved edits must NOT switch immediately — it
+    // pops the discard confirmation and stays in the editor.
+    selectMode("Source");
+    expect(screen.getByText("Unsaved changes")).toBeInTheDocument();
+    expect(viewModeOf()).toBe("editor");
+    // Confirming the discard performs the deferred switch.
+    fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+    expect(viewModeOf()).toBe("source");
+  });
+
+  it("switches out of a clean markdown editor immediately, with no discard dialog", () => {
+    renderViewer({ open: true, path: "notes.md" });
+    selectMode("Edit");
+    expect(viewModeOf()).toBe("editor");
+    // No dirty signal — switching is immediate and raises no dialog.
+    selectMode("Preview");
+    expect(screen.queryByText("Unsaved changes")).toBeNull();
+    expect(viewModeOf()).toBe("preview");
+  });
+
+  it("does not pop a discard dialog when re-selecting the active markdown mode while dirty", () => {
+    renderViewer({ open: true, path: "notes.md" });
+    selectMode("Edit");
+    fireEvent.click(screen.getByRole("button", { name: "make dirty" }));
+    // Choosing the mode you are already on is a no-op — it must not run the
+    // dirty guard (which would otherwise confusingly offer to discard edits).
+    selectMode("Edit");
+    expect(screen.queryByText("Unsaved changes")).toBeNull();
+    expect(viewModeOf()).toBe("editor");
+  });
+
+  it("reaches HTML source in a single click even when the shared preference is 'editor'", () => {
+    // A user who picked the markdown rich-text editor leaves "editor" in the
+    // shared preference. Opening an HTML file resolves that to preview (HTML has
+    // no editor); the source toggle must reach source on the FIRST click, not
+    // no-op because the raw stored value isn't "preview".
+    writeFileViewPreferences({
+      diffActive: false,
+      diffLayout: "unified",
+      previewableViewMode: "editor",
+      hideWhitespace: false,
+      wrapLines: false,
+    });
+    renderViewer({ open: true, path: "page.html" });
+    expect(viewModeOf()).toBe("preview");
+    fireEvent.click(screen.getByRole("button", { name: "View source" }));
+    expect(viewModeOf()).toBe("source");
+  });
+
+  it("falls back to preview (not editor) for HTML when the shared preference is 'editor'", () => {
+    // HTML has no rich-text editor, so a carried-over "editor" preference must
+    // resolve to the rendered preview and never offer an Edit toggle.
+    writeFileViewPreferences({
+      diffActive: false,
+      diffLayout: "unified",
+      previewableViewMode: "editor",
+      hideWhitespace: false,
+      wrapLines: false,
+    });
+    renderViewer({ open: true, path: "page.html" });
+    expect(viewModeOf()).toBe("preview");
+    expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
+  });
+
+  it("restores the chosen markdown mode across a remount (persistence)", () => {
+    // Mirror the diff/layout refresh test for the tri-state previewable mode:
+    // pick Source, tear the tree down, remount with no URL params, and confirm
+    // the seed-on-mount read restores Source rather than the preview default.
+    const first = render(viewerTree({ open: true, path: "notes.md" }));
+    selectMode("Source");
+    expect(viewModeOf()).toBe("source");
+    first.unmount();
+    render(viewerTree({ open: true, path: "notes.md" }));
+    expect(viewModeOf()).toBe("source");
+  });
+
+  it.each(["preview", "source"] as const)(
+    "forces the editor on a ?comment= deep link even when the preference is %s",
+    (pref) => {
+      // Following a comment link must land on the rich-text editor so the
+      // comment's anchor highlight is visible — that's the whole point of the
+      // link. This holds regardless of the user's sticky preference: Preview
+      // can't render the highlight at all, and even Source is overridden so the
+      // deep link is consistent. Seed a non-editor preference so the bias (not
+      // the default) is what's under test.
+      writeFileViewPreferences({
+        diffActive: false,
+        diffLayout: "unified",
+        previewableViewMode: pref,
+        hideWhitespace: false,
+        wrapLines: false,
+      });
+      useCommentsMock.mockReturnValue(makeCommentsQuery([makeComment("c1")]));
+      renderViewer({ open: true, path: "notes.md", initialSearch: "comment=c1" });
+      expect(viewModeOf()).toBe("editor");
+      // Once the user explicitly picks a mode, the deep-link bias is dropped.
+      selectMode("Preview");
+      expect(viewModeOf()).toBe("preview");
+    },
+  );
+
+  it("keeps a dirty deep-linked editor when the discard dialog is cancelled", () => {
+    // The bias must only drop when the switch actually proceeds: cancelling the
+    // discard prompt has to leave the editor (and its unsaved edits) intact, not
+    // fall through to preview. Seed Preview so the bias (not the default) is
+    // what puts us in the editor.
+    writeFileViewPreferences({
+      diffActive: false,
+      diffLayout: "unified",
+      previewableViewMode: "preview",
+      hideWhitespace: false,
+      wrapLines: false,
+    });
+    useCommentsMock.mockReturnValue(makeCommentsQuery([makeComment("c1")]));
+    renderViewer({ open: true, path: "notes.md", initialSearch: "comment=c1" });
+    expect(viewModeOf()).toBe("editor");
+    fireEvent.click(screen.getByRole("button", { name: "make dirty" }));
+    selectMode("Preview");
+    fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
+    expect(viewModeOf()).toBe("editor");
+  });
+});
+
 // ── Split/unified toggle width gating ───────────────────────────────────────
 //
 // Side-by-side ("split") is only usable once the diff area clears Monaco's
@@ -922,6 +1235,73 @@ describe("FileViewer split-toggle width gating", () => {
     expect(await screen.findByTestId("diff-viewer")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Split view" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Unified view" })).toBeNull();
+  });
+});
+
+// ── View settings "⋯" menu ──────────────────────────────────────────────────
+//
+// Find, Download, and the diff-only toggles (wrap lines, hide whitespace) are
+// folded into one "View settings" overflow menu to save toolbar width. The
+// toggles keep the menu open and drive props on the diff viewer; the diff-only
+// items are hidden outside diff view. Radix menus open on pointerdown.
+
+describe("FileViewer view-settings menu", () => {
+  beforeEach(() => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+  });
+
+  const openSettingsMenu = () =>
+    fireEvent.pointerDown(screen.getByRole("button", { name: "View settings" }), { button: 0 });
+
+  it("offers Find and Download but no diff toggles outside diff view", () => {
+    render(viewerTree({ open: true }));
+    openSettingsMenu();
+    expect(screen.getByRole("menuitem", { name: "Find in file" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "Download file" })).toBeInTheDocument();
+    // Wrap / whitespace are diff-only — absent when the source view is showing.
+    expect(screen.queryByRole("menuitem", { name: "Wrap lines" })).toBeNull();
+    expect(screen.queryByRole("menuitem", { name: "Hide whitespace changes" })).toBeNull();
+  });
+
+  it("adds the wrap-lines and whitespace toggles in diff view", async () => {
+    render(viewerTree({ open: true, initialSearch: "diff=1" }));
+    expect(await screen.findByTestId("diff-viewer")).toBeInTheDocument();
+    openSettingsMenu();
+    expect(screen.getByRole("menuitem", { name: "Wrap lines" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "Hide whitespace changes" })).toBeInTheDocument();
+  });
+
+  it("toggling Wrap lines flips the diff viewer's wrapLines prop", async () => {
+    render(viewerTree({ open: true, initialSearch: "diff=1" }));
+    const diff = await screen.findByTestId("diff-viewer");
+    expect(diff).toHaveAttribute("data-wrap-lines", "false");
+    openSettingsMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Wrap lines" }));
+    // The prop flips without re-opening — the toggle drives the diff editor.
+    expect(screen.getByTestId("diff-viewer")).toHaveAttribute("data-wrap-lines", "true");
+  });
+
+  it("toggling Hide whitespace flips the diff viewer's hideWhitespace prop", async () => {
+    render(viewerTree({ open: true, initialSearch: "diff=1" }));
+    const diff = await screen.findByTestId("diff-viewer");
+    expect(diff).toHaveAttribute("data-hide-whitespace", "false");
+    openSettingsMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Hide whitespace changes" }));
+    expect(screen.getByTestId("diff-viewer")).toHaveAttribute("data-hide-whitespace", "true");
+  });
+
+  it("persists the wrap-lines choice across a refresh", async () => {
+    const first = render(viewerTree({ open: true, initialSearch: "diff=1" }));
+    expect(await screen.findByTestId("diff-viewer")).toBeInTheDocument();
+    openSettingsMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Wrap lines" }));
+    expect(screen.getByTestId("diff-viewer")).toHaveAttribute("data-wrap-lines", "true");
+
+    // A fresh mount (refresh) can only come up wrapped by reading the persisted
+    // preference — ?diff=1 restores diff view, wrap comes from localStorage.
+    first.unmount();
+    render(viewerTree({ open: true, initialSearch: "diff=1" }));
+    expect(await screen.findByTestId("diff-viewer")).toHaveAttribute("data-wrap-lines", "true");
   });
 });
 

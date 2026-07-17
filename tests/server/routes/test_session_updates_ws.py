@@ -139,13 +139,15 @@ def _seed_session(
     conversation_store, agent_store, permission_store = stores
     # The conversations.agent_id FK requires a real agent row; create one
     # idempotently (the same agent backs every seeded session).
-    if agent_store.get("ag_test") is None:
+    if agent_store.get("087b7cb7ac30abf4debfaa578d052ec6") is None:
         agent_store.create(
-            agent_id="ag_test",
+            agent_id="087b7cb7ac30abf4debfaa578d052ec6",
             name="test-agent",
-            bundle_location="ag_test/bundle",
+            bundle_location="087b7cb7ac30abf4debfaa578d052ec6/bundle",
         )
-    conv = conversation_store.create_conversation(title=title, agent_id="ag_test")
+    conv = conversation_store.create_conversation(
+        title=title, agent_id="087b7cb7ac30abf4debfaa578d052ec6"
+    )
     permission_store.ensure_user(owner)
     permission_store.grant(owner, conv.id, LEVEL_OWNER)
     return conv.id
@@ -219,7 +221,7 @@ def test_child_busy_rollup_flows_through_updates_stream(
         kind="sub_agent",
         title="coder:auth",
         parent_conversation_id=parent_id,
-        agent_id="ag_test",
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
     )
     sessions_routes._session_status_cache.pop(parent_id, None)
     sessions_routes._session_status_cache[child.id] = "waiting"
@@ -732,7 +734,7 @@ def test_daily_cost_recorded_for_owned_session_without_a_policy(app: FastAPI, st
 
     The policy gate that previously suppressed the ``user_daily_cost`` write on
     no-policy sessions has been removed, so the daily rollup accrues for any
-    owned session that records spend. Here ``ag_test`` has no guardrails/policy,
+    owned session that records spend. Here the owned session has no guardrails/policy,
     yet posting cumulative spend must still land in the owner's daily rollup. A
     regression that re-added the gate would leave ``get_daily_cost`` at 0.0.
     """
@@ -806,7 +808,7 @@ def test_daily_cost_attributed_via_root_for_sub_agent_without_owner_grant(
     # root_conversation_id from the parent automatically.
     child = conversation_store.create_conversation(
         title="sub-agent",
-        agent_id="ag_test",
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
         parent_conversation_id=parent_id,
     )
     # Sanity: child has no owner grant (the gap being fixed).

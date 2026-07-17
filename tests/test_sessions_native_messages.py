@@ -17,11 +17,11 @@ def _conversation_with_wrapper(wrapper: str) -> Conversation:
     :returns: Conversation with that label and a bound agent_id.
     """
     return Conversation(
-        id="conv_test",
+        id="e1f7c651c9f97fac088ea70ef633409d",
         created_at=0,
         updated_at=0,
-        root_conversation_id="conv_test",
-        agent_id="ag_native_test",
+        root_conversation_id="e1f7c651c9f97fac088ea70ef633409d",
+        agent_id="d5de5cef9504e12d06e729f3071d4f48",
         labels={"omnigent.wrapper": wrapper},
     )
 
@@ -61,7 +61,7 @@ def test_codex_native_session_uses_codex_harness_for_web_messages() -> None:
         "content": [{"type": "input_text", "text": "hello"}],
         "model": "codex-native-ui",
         "harness": "codex-native",
-        "agent_id": "ag_native_test",
+        "agent_id": "d5de5cef9504e12d06e729f3071d4f48",
     }
 
 
@@ -78,7 +78,7 @@ def test_kiro_native_session_uses_kiro_harness_for_web_messages() -> None:
         "content": [{"type": "input_text", "text": "hello"}],
         "model": "kiro-native-ui",
         "harness": "kiro-native",
-        "agent_id": "ag_native_test",
+        "agent_id": "d5de5cef9504e12d06e729f3071d4f48",
     }
 
 
@@ -101,7 +101,7 @@ def test_antigravity_native_session_uses_antigravity_harness_for_web_messages() 
         "content": [{"type": "input_text", "text": "hello"}],
         "model": "antigravity-native-ui",
         "harness": "antigravity-native",
-        "agent_id": "ag_native_test",
+        "agent_id": "d5de5cef9504e12d06e729f3071d4f48",
     }
 
 
@@ -185,3 +185,78 @@ def test_policy_notice_from_ensure_response(
     from omnigent.server.routes import sessions as sessions_routes
 
     assert sessions_routes._policy_notice_from_ensure_response(response) == expected
+
+
+# ── native routing is harness-driven, not presentation-driven ────────
+
+
+def test_custom_native_harness_session_without_wrapper_label_is_native(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A chat-first custom agent on a native harness is still single-writer.
+
+    A user agent that declares ``executor.harness: codex-native`` but is not a
+    built-in ``*-native-ui`` wrapper (e.g. a ``polly`` orchestrator) carries NO
+    ``omnigent.wrapper`` label — it renders chat-first on purpose. Its runner
+    still runs a native transcript forwarder, so the persist decision must
+    treat it as native via the RESOLVED harness; otherwise the inbound user
+    message is persisted AP-side AND mirrored by the forwarder (double input).
+    """
+    from omnigent.server.routes import sessions as sessions_routes
+
+    conv = Conversation(
+        id="0e877e3fab4a2d5f5e386ef9f791eec0",
+        created_at=0,
+        updated_at=0,
+        root_conversation_id="0e877e3fab4a2d5f5e386ef9f791eec0",
+        agent_id="61fc939de6af22c5349fa22ba6e62aca",
+        labels={},  # chat-first: no wrapper / ui presentation labels
+    )
+    monkeypatch.setattr(sessions_routes, "_resolve_harness", lambda _c: "codex-native")
+    assert sessions_routes._is_native_terminal_session(conv) is True
+    # The native dispatch branch resolves runtime strings from the SAME
+    # resolver, so a label-less native session no longer raises
+    # "Unsupported native terminal session".
+    display_name, _model, harness = sessions_routes._native_terminal_runtime(conv)
+    assert (display_name, harness) == ("Codex", "codex-native")
+
+
+def test_custom_sdk_harness_session_is_not_native(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An SDK-harness session keeps the normal persist-before-forward path.
+
+    SDK harnesses have no transcript forwarder, so the server's single
+    persisted copy is correct — the harness fallback must not over-fire.
+    """
+    from omnigent.server.routes import sessions as sessions_routes
+
+    conv = Conversation(
+        id="9842b654446e37e810871eba75f58608",
+        created_at=0,
+        updated_at=0,
+        root_conversation_id="9842b654446e37e810871eba75f58608",
+        agent_id="112e3284aa0a61b1b971de591fae1a26",
+        labels={},
+    )
+    monkeypatch.setattr(sessions_routes, "_resolve_harness", lambda _c: "claude-sdk")
+    assert sessions_routes._is_native_terminal_session(conv) is False
+
+
+def test_wrapper_label_session_is_native_without_resolving_harness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The wrapper-label path short-circuits before the harness fallback.
+
+    Built-in terminal-first wrapper sessions are recognized by label alone, so
+    the (spec-loading) harness resolution never runs for them.
+    """
+    from omnigent.server.routes import sessions as sessions_routes
+
+    conv = _conversation_with_wrapper("codex-native-ui")
+
+    def _must_not_run(_c: object) -> str:
+        raise AssertionError("harness resolution must not run when the wrapper label matches")
+
+    monkeypatch.setattr(sessions_routes, "_resolve_harness", _must_not_run)
+    assert sessions_routes._is_native_terminal_session(conv) is True

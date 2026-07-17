@@ -24,6 +24,7 @@ from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, AuthProvider, local_single_user_enabled
 from omnigent.server.bundles import bundle_location, validate_agent_bundle
 from omnigent.server.routes._auth_helpers import get_user_id, require_access
+from omnigent.server.routes._errors import session_not_found
 from omnigent.server.schemas import (
     MCPServerSummary,
     SessionAgentChangedEvent,
@@ -79,7 +80,7 @@ def create_session_mcp_servers_router(
         )
         conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if conv is None:
-            raise OmnigentError("Session not found", code=ErrorCode.NOT_FOUND)
+            raise session_not_found()
         if conv.agent_id is None:
             raise OmnigentError("Session has no agent binding", code=ErrorCode.INVALID_INPUT)
         agent = await asyncio.to_thread(agent_store.get, conv.agent_id)
@@ -245,7 +246,9 @@ def create_session_mcp_servers_router(
                 )
 
         new_location = bundle_location(agent.id, new_bundle)
-        if new_location != agent.bundle_location:
+        # Sha-segment compare: legacy rows keep an ``ag_``-prefixed left
+        # segment (physical artifact key); only the sha encodes content.
+        if new_location.rsplit("/", 1)[-1] != agent.bundle_location.rsplit("/", 1)[-1]:
             artifact_store.put(new_location, new_bundle)
             updated = agent_store.update(agent.id, new_location)
             if updated is None:

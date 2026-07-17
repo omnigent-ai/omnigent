@@ -14,10 +14,10 @@ from starlette.datastructures import State
 
 from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.harness_plugins import CODEX_NATIVE_CODING_AGENT
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE as _HARNESS_NOT_CONFIGURED_ERROR_CODE,
 )
-from omnigent.native_coding_agents import CODEX_NATIVE_CODING_AGENT
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, AuthProvider
@@ -294,7 +294,9 @@ async def _initialize_codex_goal_runner(
             "Session not found",
             code=ErrorCode.NOT_FOUND,
         )
-    await _ensure_runner_session_initialized(session_id, refreshed_conv, runner_client)
+    await _ensure_runner_session_initialized(
+        session_id, refreshed_conv, runner_client, conversation_store
+    )
 
 
 async def _launch_runner_for_codex_goal(

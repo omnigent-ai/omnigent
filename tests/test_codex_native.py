@@ -35,9 +35,25 @@ def _write_codex_auth(path: Path, payload: object) -> None:
 
 
 def _point_codex_auth_check_at(
-    monkeypatch: pytest.MonkeyPatch, auth_path: Path, *, binary_present: bool
+    monkeypatch: pytest.MonkeyPatch,
+    auth_path: Path,
+    *,
+    binary_present: bool,
+    launch: Any | None = None,
 ) -> None:
-    """Redirect Codex availability checks away from the real machine state."""
+    """Redirect Codex availability checks away from the real machine state.
+
+    ``launch`` pins what :func:`resolve_native_codex_launch` returns; the default
+    is the defer-to-Codex-login shape (``profile=None``, ``model_provider`` not
+    set → resolves to ``"openai"``), which is exactly the case where
+    ``auth.json`` is the credential that decides availability. Provider-routed
+    tests pass an explicit launch.
+    """
+    if launch is None:
+        launch = codex_native_app_server.NativeCodexLaunch(
+            config_overrides=[], model=None, profile=None
+        )
+    monkeypatch.setattr(codex_native, "resolve_native_codex_launch", lambda model=None: launch)
     monkeypatch.setattr(
         codex_native,
         "_resolve_codex_auth_source",
@@ -135,6 +151,53 @@ def test_codex_auth_unavailable_reason_malformed_auth_needs_auth(
     auth_path.parent.mkdir(parents=True, exist_ok=True)
     auth_path.write_text("{not json", encoding="utf-8")
 
+    assert codex_native._codex_auth_unavailable_reason() == "needs-auth"
+
+
+def test_codex_auth_unavailable_reason_databricks_profile_available(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A Databricks-profile launch is available even with an EMPTY auth.json.
+
+    The reported bug: the launch mints its bearer via ``databricks auth token``
+    and never reads ``auth.json``, so gating on it is a false negative. auth.json
+    is deliberately absent here — availability must come from the launch.
+    """
+    auth_path = tmp_path / "codex-home" / "auth.json"  # never created
+    launch = codex_native_app_server.NativeCodexLaunch(
+        config_overrides=[], model=None, profile="my-profile"
+    )
+    _point_codex_auth_check_at(monkeypatch, auth_path, binary_present=True, launch=launch)
+
+    assert codex_native._codex_auth_unavailable_reason() is None
+
+
+def test_codex_auth_unavailable_reason_provider_override_available(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A launch pinning a non-openai model_provider is available sans auth.json."""
+    auth_path = tmp_path / "codex-home" / "auth.json"  # never created
+    launch = codex_native_app_server.NativeCodexLaunch(
+        config_overrides=['model_provider="omnigent_databricks"'], model=None, profile=None
+    )
+    _point_codex_auth_check_at(monkeypatch, auth_path, binary_present=True, launch=launch)
+
+    assert codex_native._codex_auth_unavailable_reason() is None
+
+
+def test_codex_auth_unavailable_reason_resolver_failure_falls_back_to_auth_json(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A resolver blow-up fails safe onto the auth.json check (never raises)."""
+    auth_path = tmp_path / "codex-home" / "auth.json"
+    _point_codex_auth_check_at(monkeypatch, auth_path, binary_present=True)
+
+    def _boom(model: object = None) -> object:
+        raise RuntimeError("corrupt config")
+
+    monkeypatch.setattr(codex_native, "resolve_native_codex_launch", _boom)
+
+    # No auth.json → falls through to needs-auth rather than propagating.
     assert codex_native._codex_auth_unavailable_reason() == "needs-auth"
 
 
@@ -572,12 +635,18 @@ def _elicitation_tracker() -> codex_native_forwarder._CodexElicitationTaskTracke
     return codex_native_forwarder._CodexElicitationTaskTracker()
 
 
-def test_materialize_codex_agent_spec_uses_codex_native_harness(tmp_path: Path) -> None:
+def test_materialize_codex_agent_spec_uses_codex_native_harness(
+    tmp_path: Path, monkeypatch
+) -> None:
     """
     The generated wrapper spec is self-contained and selects the
     isolated ``codex-native`` harness rather than the existing
     non-TUI ``codex`` harness.
     """
+    # Pin the host shells so the declared terminals are deterministic
+    # ($SHELL=bash → the default/first terminal is ``bash``).
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setenv("SHELL", "/bin/bash")
     spec_path = codex_native._materialize_codex_agent_spec(
         tmp_path,
         model="gpt-test",
@@ -619,13 +688,12 @@ def test_materialized_codex_agent_spec_loads_as_valid_omnigent_yaml(
     # via ToolManager, so a dropped flag silently removes
     # sys_session_create/send/close from the native CLI.
     assert spec.spawn is True
-    # The native wrapper declares a default shell terminal so the
-    # relay advertises the sys_terminal_* family to the wrapped
-    # codex (the relay gate is a non-empty ``terminals:`` block on
-    # this spec); a dropped block silently removes the terminal
-    # tools from the native CLI.
+    # The native wrapper declares one terminal per installed shell so the
+    # relay advertises the sys_terminal_* family to the wrapped codex (the
+    # relay gate is a non-empty ``terminals:`` block on this spec); a
+    # dropped block silently removes the terminal tools from the native CLI.
     assert spec.terminals is not None
-    assert spec.terminals["shell"].command == "bash"
+    assert spec.terminals["bash"].command == "bash"
 
 
 @pytest.mark.parametrize(
@@ -5193,9 +5261,29 @@ def test_forwarder_posts_codex_turn_plan_update(tmp_path: Path) -> None:
 
     asyncio.run(run())
 
-    assert len(posted) == 1
-    assert posted[0]["type"] == "external_conversation_item"
-    data = posted[0]["data"]
+    # The plan is mirrored to the todo panel and inline in the transcript.
+    assert len(posted) == 2
+    todos_post = next(p for p in posted if p["type"] == "external_session_todos")
+    assert todos_post["data"]["todos"] == [
+        {
+            "content": "Inspect Codex plan events",
+            "status": "completed",
+            "activeForm": "Inspect Codex plan events",
+        },
+        {
+            "content": "Mirror plans to web",
+            "status": "in_progress",
+            "activeForm": "Mirror plans to web",
+        },
+        {
+            "content": "Run checks",
+            "status": "pending",
+            "activeForm": "Run checks",
+        },
+    ]
+
+    message_post = next(p for p in posted if p["type"] == "external_conversation_item")
+    data = message_post["data"]
     assert data["item_type"] == "message"
     assert data["response_id"] == "codex_turn_123"
     assert data["item_data"] == {
@@ -5213,6 +5301,57 @@ def test_forwarder_posts_codex_turn_plan_update(tmp_path: Path) -> None:
             }
         ],
     }
+
+
+def test_plan_todos_from_update_maps_steps_and_statuses() -> None:
+    """
+    ``_plan_todos_from_update`` maps Codex plan steps to the todo schema.
+
+    Each step becomes ``{"content", "status", "activeForm"}`` with the
+    status vocabulary normalized (``inProgress`` -> ``in_progress``) and the
+    step text reused for ``activeForm`` since Codex has no gerund form.
+    """
+    todos = codex_native_forwarder._plan_todos_from_update(
+        {
+            "plan": [
+                {"step": "Inspect", "status": "completed"},
+                {"step": "Mirror", "status": "inProgress"},
+                {"step": "Verify", "status": "in_progress"},
+                {"step": "Ship", "status": "pending"},
+                {"step": "Unknown", "status": "weird"},
+            ]
+        }
+    )
+
+    assert todos == [
+        {"content": "Inspect", "status": "completed", "activeForm": "Inspect"},
+        {"content": "Mirror", "status": "in_progress", "activeForm": "Mirror"},
+        {"content": "Verify", "status": "in_progress", "activeForm": "Verify"},
+        {"content": "Ship", "status": "pending", "activeForm": "Ship"},
+        {"content": "Unknown", "status": "pending", "activeForm": "Unknown"},
+    ]
+
+
+def test_plan_todos_from_update_skips_malformed_and_empty() -> None:
+    """
+    ``_plan_todos_from_update`` drops malformed steps and empty plans.
+
+    Non-dict entries and steps without a usable ``step`` string are
+    skipped; a plan that is missing, not a list, or yields no valid
+    items returns ``None`` so the caller posts nothing.
+    """
+    assert codex_native_forwarder._plan_todos_from_update({}) is None
+    assert codex_native_forwarder._plan_todos_from_update({"plan": []}) is None
+    assert codex_native_forwarder._plan_todos_from_update({"plan": "nope"}) is None
+    assert (
+        codex_native_forwarder._plan_todos_from_update(
+            {"plan": ["bad", {"step": ""}, {"status": "pending"}]}
+        )
+        is None
+    )
+    assert codex_native_forwarder._plan_todos_from_update(
+        {"plan": ["bad", {"step": "Keep me", "status": "pending"}]}
+    ) == [{"content": "Keep me", "status": "pending", "activeForm": "Keep me"}]
 
 
 def test_forwarder_posts_completed_codex_plan_item() -> None:
@@ -5365,6 +5504,117 @@ def test_forwarder_posts_codex_command_execution_tool_call() -> None:
             },
         },
     ]
+
+
+def test_forwarder_streams_codex_command_output_before_completed_item(tmp_path: Path) -> None:
+    """Command output deltas update the live tool before its final result."""
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_123",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_123",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id="turn_123",
+        ),
+    )
+    posted: list[dict[str, Any]] = []
+    state = codex_native_forwarder._CodexForwarderState()
+    started_item = {
+        "type": "commandExecution",
+        "id": "call_abc123",
+        "command": "pytest -q",
+        "cwd": "/repo",
+        "status": "inProgress",
+    }
+    completed_item = {
+        **started_item,
+        "status": "completed",
+        "aggregatedOutput": "collecting tests...\n1 passed\n",
+        "exitCode": 0,
+    }
+
+    async def run() -> None:
+        """Replay command start, output chunks, and completion."""
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=httpx.MockTransport(_capture_handler(posted)),
+        ) as client:
+            coalescer = codex_native_forwarder._OutputTextDeltaCoalescer(
+                client,
+                "conv_123",
+                flush_interval_seconds=60.0,
+                flush_char_threshold=1000,
+            )
+            events = [
+                {
+                    "method": "item/started",
+                    "params": {
+                        "threadId": "thread_123",
+                        "turnId": "turn_123",
+                        "item": started_item,
+                    },
+                },
+                {
+                    "method": "item/commandExecution/outputDelta",
+                    "params": {
+                        "threadId": "thread_123",
+                        "turnId": "turn_123",
+                        "itemId": "call_abc123",
+                        "delta": "collecting ",
+                    },
+                },
+                {
+                    "method": "item/commandExecution/outputDelta",
+                    "params": {
+                        "threadId": "thread_123",
+                        "turnId": "turn_123",
+                        "itemId": "call_abc123",
+                        "delta": "tests...",
+                    },
+                },
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": "thread_123",
+                        "turnId": "turn_123",
+                        "item": completed_item,
+                    },
+                },
+            ]
+            for event in events:
+                await codex_native_forwarder._handle_event(
+                    client,
+                    session_id="conv_123",
+                    bridge_dir=tmp_path,
+                    usage_coalescer=_usage_coalescer(client),
+                    elicitation_tracker=_elicitation_tracker(),
+                    event=event,
+                    delta_coalescer=coalescer,
+                    forwarder_state=state,
+                )
+            await coalescer.close()
+
+    asyncio.run(run())
+
+    assert [payload["type"] for payload in posted] == [
+        "external_conversation_item",
+        "external_tool_output_delta",
+        "external_conversation_item",
+    ]
+    assert posted[0]["data"]["item_type"] == "function_call"
+    assert posted[1] == {
+        "type": "external_tool_output_delta",
+        "data": {"call_id": "call_abc123", "delta": "collecting tests..."},
+    }
+    assert posted[2]["data"] == {
+        "item_type": "function_call_output",
+        "item_data": {
+            "call_id": "call_abc123",
+            "output": "collecting tests...\n1 passed\n",
+        },
+        "response_id": "codex_turn_123",
+    }
 
 
 def test_forwarder_surfaces_failed_command_exit_code() -> None:

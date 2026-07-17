@@ -47,7 +47,7 @@ pytestmark = [
     pytest.mark.flaky(reruns=2, reruns_delay=1),
 ]
 
-_HOST_ID = "host_fs_test"
+_HOST_ID = "9ab0645ef9c07bb922a404d4ec2466a9"
 _HOST_NAME = "fs-test-laptop"
 
 
@@ -361,7 +361,7 @@ async def test_list_filesystem_unknown_host_returns_404(
     """
     app, _reg, _hs, _cs = fs_app
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        resp = await client.get("/v1/hosts/host_does_not_exist/filesystem")
+        resp = await client.get("/v1/hosts/7139b7e896ef9478abca6480107d1677/filesystem")
     assert resp.status_code == 404
 
 
@@ -379,12 +379,12 @@ async def test_list_filesystem_offline_host_returns_409(
     app, _reg, host_store, _cs = fs_app
     # Persist the host record but never register a tunnel.
     host_store.upsert_on_connect(
-        host_id="host_offline",
+        host_id="3d9665477127e41f42de3f4109418173",
         name="offline-host",
         owner="local",
     )
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        resp = await client.get("/v1/hosts/host_offline/filesystem")
+        resp = await client.get("/v1/hosts/3d9665477127e41f42de3f4109418173/filesystem")
     assert resp.status_code == 409
 
 
@@ -519,7 +519,7 @@ async def test_list_filesystem_owner_check_blocks_other_users(
 
     # Persist a host owned by alice.
     host_store.upsert_on_connect(
-        host_id="host_alice",
+        host_id="f54bb9272002938a3a934bfcb6bb228a",
         name="alice-laptop",
         owner="alice@example.com",
     )
@@ -528,7 +528,7 @@ async def test_list_filesystem_owner_check_blocks_other_users(
         transport=ASGITransport(app=auth_app), base_url="http://test"
     ) as client:
         resp = await client.get(
-            "/v1/hosts/host_alice/filesystem",
+            "/v1/hosts/f54bb9272002938a3a934bfcb6bb228a/filesystem",
             headers={"X-Test-User": "bob@example.com"},
         )
     assert resp.status_code == 403

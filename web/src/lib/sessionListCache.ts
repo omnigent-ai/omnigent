@@ -13,10 +13,27 @@ import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
 /** Cache value shape for a `useConversations` infinite query. */
 export type ConversationsInfiniteData = InfiniteData<ConversationsPage, string | undefined>;
 
+/**
+ * The reserved `conversation_labels` key that stores a session's project
+ * membership. Namespaced (`omni_*`) so it never collides with the user-facing
+ * "project" term or other reserved keys. Defined in this leaf cache module so
+ * membership checks can read it without importing back from the hooks layer
+ * (which would create a value import cycle); `useConversations` re-exports it
+ * for the existing consumers.
+ */
+export const PROJECT_LABEL_KEY = "omni_project";
+
 /** Filter dimensions encoded by a `["conversations", ...]` query key. */
 export interface ConversationListFilters {
   searchQuery: string;
   includeArchived: boolean;
+  /**
+   * Project (``omni_project`` label) the list is scoped to. Present only on
+   * the project-filtered variant (the Archived settings view's picker); the
+   * default sidebar / search queries omit it entirely. ``undefined`` means
+   * "all projects".
+   */
+  project?: string;
 }
 
 /**
@@ -83,32 +100,48 @@ function changedWireFields(conv: Conversation, wire: SessionListWireItem): Set<s
 /**
  * Decode the filter dimensions from a conversations query key.
  *
- * The canonical key is `["conversations", searchQuery, includeArchived]`.
- * Query membership decisions depend on both filter dimensions, so
- * malformed keys fail loudly instead of being guessed.
+ * The base key is `["conversations", searchQuery, includeArchived]`. The
+ * project-filtered variant appends a fourth element:
+ * `["conversations", searchQuery, includeArchived, project]` (the Archived
+ * settings picker is the only producer today). Both lengths are accepted so
+ * the rename overlay and push-delta merge — which iterate *every* cached
+ * `["conversations", ...]` query — never throw on the project variant. Query
+ * membership decisions depend on these dimensions, so malformed keys fail
+ * loudly instead of being guessed.
  *
  * @param key - TanStack Query key for a conversations query.
  * @returns Parsed list filters.
- * @throws Error if the key is not the canonical conversations list key.
+ * @throws Error if the key is not a conversations list key.
  */
 export function filtersFromConversationQueryKey(key: readonly unknown[]): ConversationListFilters {
-  if (key.length !== 3 || key[0] !== "conversations") {
+  if ((key.length !== 3 && key.length !== 4) || key[0] !== "conversations") {
     throw new Error("Invalid conversations query key");
   }
-  const [, searchQuery, includeArchived] = key;
+  const [, searchQuery, includeArchived, project] = key;
   if (typeof searchQuery !== "string" || typeof includeArchived !== "boolean") {
+    throw new Error("Invalid conversations query key");
+  }
+  if (project !== undefined && typeof project !== "string") {
     throw new Error("Invalid conversations query key");
   }
   return {
     searchQuery,
     includeArchived,
+    project,
   };
 }
 
 /**
  * Check membership rules the client can decide exactly from a patched row.
  *
- * Archived rows never belong in default (non-includeArchived) queries.
+ * - Archived rows never belong in default (non-includeArchived) queries.
+ * - Project-filtered variants (the Archived picker's `["conversations","",true,
+ *   name]` key) hold only rows whose `omni_project` label matches; a row
+ *   relabeled out of that project — via a push-delta — is no longer a member.
+ *   A falsy project (`undefined` or `""`) is the "all projects" list and
+ *   applies no project constraint — consistent with the request (which omits
+ *   `project=` for a falsy value) and the query key (which drops it). This list
+ *   never requests the server's "unfiled" (`project=`) slice.
  *
  * @param conv - Cached row after applying the incoming wire item.
  * @param filters - Canonical filters for the query being patched.
@@ -116,6 +149,7 @@ export function filtersFromConversationQueryKey(key: readonly unknown[]): Conver
  */
 function violatesKnownMembership(conv: Conversation, filters: ConversationListFilters): boolean {
   if (!filters.includeArchived && conv.archived === true) return true;
+  if (filters.project && conv.labels?.[PROJECT_LABEL_KEY] !== filters.project) return true;
   return false;
 }
 
@@ -138,6 +172,14 @@ function violatesKnownMembership(conv: Conversation, filters: ConversationListFi
 function changedFieldsNeedRefetch(changed: Set<string>, isActiveRow: boolean): boolean {
   if (changed.has("archived")) return true;
   if (changed.has("title")) return true;
+  // A labels change can move a row between project-filtered variants and the
+  // project folders (["project-sessions", …]). A session relabeled INTO the
+  // selected project isn't in that filtered cache yet, so no local patch can
+  // place it; only a server reconcile can. The unfiltered variant where the
+  // row lives detects the label change here and flags the refetch, and the
+  // caller's invalidation is prefix-wide (["conversations"]), so it reconciles
+  // the filtered variants too.
+  if (changed.has("labels")) return true;
   // updated_at only affects the server's sort order. The active chat row is
   // pinned at its position by ActiveChatOverride regardless of that order, so
   // an updated_at bump on it — the common case while the user sends messages —

@@ -647,6 +647,25 @@ async def test_shell_nonzero_exit(
 
 
 @pytest.mark.asyncio
+async def test_shell_timeout_returns_structured_result(
+    client: httpx.AsyncClient,
+) -> None:
+    """POST /shell returns the timeout result instead of raising."""
+    resp = await client.post(
+        f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/shell",
+        json={"command": "sleep 2", "timeout": 1},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["object"] == "session.environment.shell_result"
+    assert body["stdout"] == ""
+    assert body["stderr"] == ""
+    assert body["exit_code"] is None
+    assert body["timed_out"] is True
+    assert body["cwd"] is not None
+
+
+@pytest.mark.asyncio
 async def test_shell_missing_command_returns_400(
     client: httpx.AsyncClient,
 ) -> None:
@@ -754,6 +773,11 @@ async def test_filesystem_changes_modified(
     entries_by_path = {e["path"]: e for e in body["data"]}
     assert "hello.txt" in entries_by_path, "Modified file must appear in changes"
     assert entries_by_path["hello.txt"]["status"] == "modified"
+    # Line-count fields are always serialized; null in non-git (agent-edit)
+    # mode since those records carry no counts (see .get() in the endpoint).
+    entry = entries_by_path["hello.txt"]
+    assert entry["lines_added"] is None
+    assert entry["lines_removed"] is None
 
 
 @pytest.mark.asyncio

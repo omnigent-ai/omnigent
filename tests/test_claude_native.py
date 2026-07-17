@@ -385,6 +385,49 @@ def test_ucode_config_for_profile_sets_only_present_tier_env_vars(
     assert "ANTHROPIC_DEFAULT_HAIKU_MODEL" not in config.env
 
 
+def test_ucode_config_for_profile_sets_custom_model_option_for_second_sonnet(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A ``claude_models["sonnet_5"]`` entry pins Claude Code's one custom
+    ``/model`` slot (``ANTHROPIC_CUSTOM_MODEL_OPTION``) to the newer Sonnet,
+    offered as an opt-in *alongside* the ``sonnet`` tier alias, which stays
+    on the workspace's existing default Sonnet (4.6). The default is
+    unchanged; Sonnet 5 is an additional, explicit choice.
+    """
+    from omnigent.onboarding.ucode_state import UcodeAgentState, UcodeWorkspaceState
+
+    workspace_state = UcodeWorkspaceState(
+        workspace_url="https://example.databricks.com",
+        claude_models={
+            "sonnet": "databricks-claude-sonnet-4-6",
+            "sonnet_5": "databricks-claude-sonnet-5",
+        },
+        agents={
+            "claude": UcodeAgentState(
+                model="databricks-claude-sonnet-4-6",
+                base_url="https://example.databricks.com/ai-gateway/anthropic",
+                auth_command="printf token",
+            )
+        },
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.databricks_config.get_workspace_url_for_profile",
+        lambda profile: "https://example.databricks.com",
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.ucode_state.read_ucode_state",
+        lambda workspace_url: workspace_state,
+    )
+
+    config = claude_native._ucode_config_for_profile("test-profile")
+
+    assert config is not None
+    assert config.env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "databricks-claude-sonnet-4-6"
+    assert config.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "databricks-claude-sonnet-5"
+    assert config.env["ANTHROPIC_CUSTOM_MODEL_OPTION_NAME"] == "Sonnet 5"
+
+
 def test_ucode_config_for_profile_omits_model_tier_vars_when_no_claude_models(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -503,7 +546,9 @@ def test_attach_url_encodes_path_components() -> None:
     )
 
 
-def test_materialized_session_spec_is_valid_terminal_metadata(tmp_path: Path) -> None:
+def test_materialized_session_spec_is_valid_terminal_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """
     The generated bundled agent spec validates for Omnigent session creation.
 
@@ -511,6 +556,10 @@ def test_materialized_session_spec_is_valid_terminal_metadata(tmp_path: Path) ->
     normal session row; Claude itself is launched as a terminal
     resource after creation, not through this executor block.
     """
+    # Pin the host shells so the declared terminals are deterministic
+    # ($SHELL=bash → the default/first terminal is ``bash``).
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setenv("SHELL", "/bin/bash")
     path = claude_native._materialize_claude_agent_spec(tmp_path)
 
     raw = yaml.safe_load(path.read_text())
@@ -538,13 +587,12 @@ def test_materialized_session_spec_is_valid_terminal_metadata(tmp_path: Path) ->
     # sys_session_create/send/close from the native CLI.
     assert raw["spawn"] is True
     assert spec.spawn is True
-    # The native wrapper declares a default shell terminal so the
-    # relay advertises the sys_terminal_* family to the wrapped
-    # Claude Code (the relay gate is a non-empty ``terminals:``
-    # block on this spec); a dropped block silently removes the
-    # terminal tools from the native CLI.
+    # The native wrapper declares one terminal per installed shell so the
+    # relay advertises the sys_terminal_* family to the wrapped Claude Code
+    # (the relay gate is a non-empty ``terminals:`` block on this spec); a
+    # dropped block silently removes the terminal tools from the native CLI.
     assert spec.terminals is not None
-    assert spec.terminals["shell"].command == "bash"
+    assert spec.terminals["bash"].command == "bash"
 
 
 def test_remote_run_preflights_local_claude_binary(
@@ -5718,7 +5766,14 @@ def _isolated_provider_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
     monkeypatch.setenv("OMNIGENT_DISABLE_KEYRING", "1")
     monkeypatch.setenv("HOME", str(tmp_path))
-    for var in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY"):
+    for var in (
+        "ANTHROPIC_API_KEY",
+        "OMNIGENT_ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "OMNIGENT_OPENAI_API_KEY",
+        "OPENROUTER_API_KEY",
+        "OMNIGENT_OPENROUTER_API_KEY",
+    ):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
     return tmp_path
@@ -6016,6 +6071,23 @@ def test_resolve_native_claude_config_ambient_key(
     assert cfg.api_key_helper == "printf %s sk-ant-ambient"
 
 
+def test_resolve_native_claude_config_ambient_prefixed_key(
+    _isolated_provider_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A prefixed Anthropic key routes native Claude without raw env exposure."""
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("OMNIGENT_ANTHROPIC_API_KEY", "sk-ant-prefixed")
+
+    cfg = claude_native.resolve_native_claude_config(spec=None)
+
+    assert cfg is not None
+    assert cfg.env == {
+        "ANTHROPIC_BASE_URL": "https://api.anthropic.com",
+        "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
+    }
+    assert cfg.api_key_helper == "printf %s sk-ant-prefixed"
+
+
 def test_bedrock_config_auth_command_failure_returns_none() -> None:
     """A failing bedrock auth_command falls back to Claude's own login (None)."""
     from omnigent.onboarding.provider_config import load_providers
@@ -6114,6 +6186,7 @@ def test_claude_transcript_records_handles_compaction_item() -> None:
             "id": "cmp_1",
             "type": "compaction",
             "summary": "compaction summary",
+            "token_count": 4321,
             "compacted_messages": [
                 {
                     "type": "message",
@@ -6159,3 +6232,203 @@ def test_claude_transcript_records_handles_compaction_item() -> None:
         str(r.get("message", {}).get("content", "")) for r in records if r.get("type") == "user"
     ]
     assert any("after compaction" in t for t in user_texts)
+    # The compact_boundary must carry a non-null compactMetadata: Claude
+    # destructures it on every resume-time /compact and auto-compact, and a
+    # missing object crashes compaction ("Cannot destructure property
+    # 'cumulativeDroppedTokens' from null or undefined value").
+    boundaries = [
+        r for r in records if r.get("type") == "system" and r.get("subtype") == "compact_boundary"
+    ]
+    assert len(boundaries) == 1
+    assert boundaries[0]["compactMetadata"]["postTokens"] == 4321
+
+
+@pytest.mark.parametrize(
+    ("output", "expected_parsed"),
+    [
+        # An angle-bracket display string (e.g. a TaskOutput result) is the
+        # regression case: Claude's TaskOutput renderer JSON.parses
+        # toolUseResult on resume and threw "Unrecognized token '<'" at boot.
+        (
+            "<retrieval_status>timeout</retrieval_status>",
+            "<retrieval_status>timeout</retrieval_status>",
+        ),
+        # A <tool_use_error> blob is the same hazard from a different tool.
+        (
+            "<tool_use_error>No task found</tool_use_error>",
+            "<tool_use_error>No task found</tool_use_error>",
+        ),
+        # Ordinary plain text must also round-trip to a string.
+        ("plain text output", "plain text output"),
+        # Already-JSON output (e.g. an image content-block array) must pass
+        # through verbatim, not get double-encoded into a string literal.
+        (
+            '[{"type":"image","source":{"type":"base64","data":"AAA"}}]',
+            [{"type": "image", "source": {"type": "base64", "data": "AAA"}}],
+        ),
+    ],
+)
+def test_claude_transcript_tool_use_result_is_json_parseable(
+    output: str,
+    expected_parsed: object,
+) -> None:
+    """
+    Synthesized ``toolUseResult`` must survive Claude's resume-time parse.
+
+    Claude Code ``JSON.parse``s ``toolUseResult`` for some built-in
+    renderers (``TaskOutput``). A raw ``<...>`` display string crashed
+    the TUI at boot before the input prompt rendered, so the resume
+    failed. The synthesizer must always emit a JSON-parseable value,
+    while leaving the ``tool_result`` content block as the verbatim
+    string the model and web UI see.
+    """
+    items: list[dict[str, Any]] = [
+        {
+            "id": "fco_1",
+            "response_id": "resp_1",
+            "type": "function_call_output",
+            "call_id": "toolu_1",
+            "output": output,
+        }
+    ]
+    records = claude_native._claude_transcript_records_from_session_items(
+        items,
+        session_id="conv_test",
+        external_session_id="02857840-6362-408f-b41f-309e396ed7c6",
+        cwd=Path("/tmp/test"),
+    )
+    assert len(records) == 1
+    record = records[0]
+    # toolUseResult must parse without raising, and preserve the value.
+    assert json.loads(record["toolUseResult"]) == expected_parsed
+    # Plain-text results keep the raw string as the content block; a
+    # content-block array (e.g. images) is rehydrated into real blocks so
+    # ``claude --resume`` sends them as blocks, not text (see the dedicated
+    # rehydration test below).
+    content = record["message"]["content"][0]["content"]
+    if isinstance(expected_parsed, list):
+        assert content == expected_parsed
+    else:
+        assert content == output
+
+
+def test_json_safe_tool_use_result_wraps_non_json() -> None:
+    """Non-JSON strings become a JSON string literal; JSON passes through."""
+    # A leading '<' is not valid JSON, so it is wrapped.
+    wrapped = claude_native._json_safe_tool_use_result("<x>y</x>")
+    assert json.loads(wrapped) == "<x>y</x>"
+    # A bare number is valid JSON and must not be re-wrapped.
+    assert claude_native._json_safe_tool_use_result("42") == "42"
+    # A JSON object string passes through unchanged.
+    assert claude_native._json_safe_tool_use_result('{"a":1}') == '{"a":1}'
+
+
+def test_claude_tool_result_content_blocks_rehydrates_only_block_arrays() -> None:
+    """Only a non-empty list of text/image block dicts rehydrates; else ``None``."""
+    fn = claude_native._claude_tool_result_content_blocks
+    # An image content-block array rehydrates to the parsed list.
+    assert fn('[{"type":"image","source":{"type":"base64","data":"AAA"}}]') == [
+        {"type": "image", "source": {"type": "base64", "data": "AAA"}}
+    ]
+    # A text block array rehydrates too.
+    assert fn('[{"type":"text","text":"hi"}]') == [{"type": "text", "text": "hi"}]
+    # Plain text is not JSON → keep the raw string.
+    assert fn("file written") is None
+    # A JSON string / number / object is not a block array → keep raw.
+    assert fn('"just a string"') is None
+    assert fn("42") is None
+    assert fn('{"type":"image"}') is None
+    # An empty array carries nothing to rehydrate.
+    assert fn("[]") is None
+    # A list whose entries are not typed block dicts is not a block array.
+    assert fn('["a","b"]') is None
+    assert fn('[{"no_type":1}]') is None
+    # A typed block the API does not accept in a tool_result stays a raw
+    # string, so resume keeps sending exactly what it sent before.
+    assert fn('[{"type":"file","path":"/x"}]') is None
+
+
+def test_claude_transcript_image_result_sent_as_blocks_not_text() -> None:
+    """
+    Image tool results resume as real content blocks, not base64 text.
+
+    A screenshot tool result is persisted as a stringified content-block
+    array. The old code dropped that string straight into the
+    ``tool_result`` content, so ``claude --resume`` re-sent ~250K tokens of
+    base64 as plain text and blew the context limit. The synthesizer must
+    rehydrate it into image blocks so the API tokenizes it as an image.
+    """
+    # ~4K chars of base64 stands in for a real screenshot payload.
+    big_b64 = "A" * 4096
+    output = json.dumps(
+        [
+            {
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": big_b64},
+            }
+        ]
+    )
+    items: list[dict[str, Any]] = [
+        {
+            "id": "fco_1",
+            "response_id": "resp_1",
+            "type": "function_call_output",
+            "call_id": "toolu_1",
+            "output": output,
+        }
+    ]
+    records = claude_native._claude_transcript_records_from_session_items(
+        items,
+        session_id="conv_test",
+        external_session_id="02857840-6362-408f-b41f-309e396ed7c6",
+        cwd=Path("/tmp/test"),
+    )
+    assert len(records) == 1
+    block = records[0]["message"]["content"][0]
+    assert block["type"] == "tool_result"
+    # content is a real content-block list — an image block, not a string.
+    assert isinstance(block["content"], list)
+    assert block["content"][0]["type"] == "image"
+    assert block["content"][0]["source"]["data"] == big_b64
+
+
+def test_tool_use_result_regression_old_flatten_would_crash_resume() -> None:
+    """
+    Pin the resume crash to the old ``toolUseResult = output`` flatten.
+
+    Claude Code ``JSON.parse``s ``toolUseResult`` for its ``TaskOutput``
+    renderer at resume time. A real ``isaac review`` result whose text
+    starts with ``<retrieval_status>...`` is not valid JSON, so the old
+    verbatim flatten crashed the TUI at boot with "Unrecognized token
+    '<'" before the input prompt rendered — the failure the user hit.
+
+    This models both sides of that parse: the pre-fix value would raise,
+    the value the synthesizer emits today does not. It fails if anyone
+    reverts to assigning ``output`` verbatim.
+    """
+    output = (
+        "<retrieval_status>timeout</retrieval_status>\n\n"
+        "<task_id>b51au379y</task_id>\n\n<status>running</status>"
+    )
+
+    # The synthesizer must emit a JSON-parseable toolUseResult. The old
+    # verbatim flatten stored the raw "<...>" string, which threw
+    # "Unrecognized token '<'" when Claude's TaskOutput renderer parsed it
+    # at resume — this assertion fails if that flatten is restored.
+    items: list[dict[str, Any]] = [
+        {
+            "id": "fco_1",
+            "response_id": "resp_1",
+            "type": "function_call_output",
+            "call_id": "toolu_1",
+            "output": output,
+        }
+    ]
+    records = claude_native._claude_transcript_records_from_session_items(
+        items,
+        session_id="conv_test",
+        external_session_id="02857840-6362-408f-b41f-309e396ed7c6",
+        cwd=Path("/tmp/test"),
+    )
+    assert len(records) == 1
+    assert json.loads(records[0]["toolUseResult"]) == output

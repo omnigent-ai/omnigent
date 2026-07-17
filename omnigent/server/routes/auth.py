@@ -553,6 +553,57 @@ def create_auth_router(
             },
         )
 
+    # ── Admin: read-only user list ────────────────────────────────
+
+    @router.get("/users")
+    async def list_users(request: Request) -> Response:
+        """List all users (admin only).
+
+        The OIDC analog of the accounts provider's ``GET /auth/users``
+        — same response shape, so the SPA's Members surface renders
+        identically. This is the read-only discovery half of the
+        admin surface: OIDC identities are owned by the IdP, so there
+        are no server-side password actions (invite/reset/delete) to
+        offer here, and the SPA hides those controls in OIDC mode.
+
+        Admin is gated on the same ``is_admin`` flag the rest of the
+        app uses (set by the admin-list promotion at login), with the
+        admin list as a direct fallback — matching the OIDC invite
+        route above.
+
+        :param request: The incoming request (carries the session cookie).
+        :returns: 200 with ``{"users": [...]}``, 401 if unauthenticated,
+            403 if not an admin, or 200 with an empty list if no
+            permission store is wired.
+        """
+        from fastapi.responses import JSONResponse
+
+        caller = auth_provider.get_user_id(request)
+        if caller is None:
+            return JSONResponse(status_code=401, content={"error": "not authenticated"})
+        is_admin = (
+            permission_store is not None and permission_store.is_admin(caller)
+        ) or admin_list.is_admin(caller)
+        if not is_admin:
+            return JSONResponse(status_code=403, content={"error": "admin only"})
+
+        users = permission_store.list_users() if permission_store is not None else []
+        return JSONResponse(
+            status_code=200,
+            content={
+                "users": [
+                    {
+                        "id": u.id,
+                        "is_admin": u.is_admin,
+                        "created_at": u.created_at,
+                        "last_login_at": u.last_login_at,
+                        "has_password": u.has_password,
+                    }
+                    for u in users
+                ]
+            },
+        )
+
     return router
 
 
@@ -705,14 +756,26 @@ def _resolve_oidc_email(
     allowed domain. This mirrors the GitHub path, which
     requires ``verified`` on the primary email.
 
+    ``config.skip_email_verification`` (from
+    ``OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION``) waives the gate for
+    IdPs that omit the claim for directory-managed users (e.g. Okta
+    without custom API Access Management).
+
+    ``config.email_claim`` (from ``OMNIGENT_OIDC_EMAIL_CLAIM``) names
+    the claim that carries the email identity, for IdPs that omit
+    ``email`` (Microsoft Entra ID commonly issues only
+    ``preferred_username``). ``email_verified`` refers to the ``email``
+    claim, so a custom claim always needs the verification opt-out too.
+
     :param token_json: The token endpoint response JSON containing
         ``id_token``.
     :param config: The OIDC configuration with JWKS URI and
         expected issuer/audience.
     :returns: The user's email from the ``id_token`` when present and
-        marked verified; ``None`` if the token is missing/invalid,
-        the email claim is absent, or ``email_verified`` is not
-        truthy.
+        marked verified; ``None`` if the token is missing/invalid, the
+        email claim is absent or not a non-empty string, or
+        ``email_verified`` is not truthy (and verification is not
+        skipped via config).
     """
     id_token = token_json.get("id_token")
     if not id_token:
@@ -732,14 +795,55 @@ def _resolve_oidc_email(
         _logger.warning("id_token validation failed: %s", exc)
         return None
 
-    email = claims.get("email")
-    if not email:
+    email = claims.get(config.email_claim)
+    if not isinstance(email, str) or not email.strip():
+        _logger.warning(
+            "Rejecting id_token: %r claim is missing or not a non-empty string "
+            "(claims present: %s). "
+            "IdPs that use a different claim for the email identity "
+            "can set OMNIGENT_OIDC_EMAIL_CLAIM.",
+            config.email_claim,
+            sorted(claims.keys()),
+        )
+        return None
+    email = email.strip()
+
+    # ``email_verified`` refers to the ``email`` claim (OIDC core), so
+    # it vouches nothing about a custom identity claim — a token can
+    # carry ``email_verified: true`` for a *different* address than the
+    # one being minted. A custom claim therefore always requires the
+    # explicit opt-out, regardless of ``email_verified``.
+    if config.email_claim != "email":
+        if config.skip_email_verification:
+            _logger.info(
+                "Accepting id_token %s %r; the claim has no verified "
+                "marker (OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION is set)",
+                config.email_claim,
+                email,
+            )
+            return email
+        _logger.warning(
+            "Rejecting id_token: %s %r has no email_verified marker "
+            "(email_verified refers to the email claim); set "
+            "OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION to accept it",
+            config.email_claim,
+            email,
+        )
         return None
 
     # Reject unless the IdP affirmatively verified the email. A signed
     # token only proves IdP provenance, not mailbox ownership.
-    # Absent/false ``email_verified`` is a hard reject.
+    # Absent/false ``email_verified`` is a hard reject — unless the
+    # operator opted out (OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION) for
+    # IdPs like Okta that omit the claim for directory-managed users.
     if not _claim_is_verified_true(claims.get("email_verified")):
+        if config.skip_email_verification:
+            _logger.info(
+                "Accepting id_token email %r without email_verified "
+                "(OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION is set)",
+                email,
+            )
+            return email
         _logger.warning(
             "Rejecting id_token: email %r present but email_verified is not true",
             email,

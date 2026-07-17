@@ -22,7 +22,7 @@ final class NativeNotificationManager: NSObject, UNUserNotificationCenterDelegat
 
   func setBadgeCount(_ count: Int) {
     Task {
-      await requestAuthorizationIfNeeded()
+      _ = await requestAuthorizationIfNeeded()
       do {
         try await center.setBadgeCount(max(0, count))
       } catch {
@@ -81,6 +81,10 @@ final class NativeNotificationManager: NSObject, UNUserNotificationCenterDelegat
   }
 
   private func requestAuthorizationIfNeeded() async -> Bool {
+    #if DEBUG
+      guard !ProcessInfo.processInfo.isOmnigentScreenshotRun else { return false }
+    #endif
+
     let settings = await center.notificationSettings()
     switch settings.authorizationStatus {
     case .authorized, .provisional, .ephemeral:
@@ -98,3 +102,12 @@ final class NativeNotificationManager: NSObject, UNUserNotificationCenterDelegat
     }
   }
 }
+
+#if DEBUG
+  extension ProcessInfo {
+    fileprivate var isOmnigentScreenshotRun: Bool {
+      environment["OMNIGENT_SCREENSHOT_APP_URL"] != nil
+        || arguments.contains("-FASTLANE_SNAPSHOT")
+    }
+  }
+#endif

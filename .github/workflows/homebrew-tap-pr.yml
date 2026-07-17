@@ -1,0 +1,200 @@
+name: Homebrew tap PR
+
+# When a final GitHub Release is PUBLISHED, open a PR to
+# omnigent-ai/homebrew-tap bumping the `omnigent` formula to the released
+# version. The PR regenerates the stable `url`/`sha256` and every dependency
+# `resource` stanza from the PyPI dependency tree of the just-published
+# `omnigent==X.Y.Z` (resolved with `uv pip compile` for the tap's macOS
+# arm/intel build matrix), splices them into the hand-tuned template at
+# `.github/scripts/homebrew/omnigent.rb.template`, and pushes a branch for
+# review. The tap's own `brew test-bot` then builds the bottles; a maintainer
+# labels the PR `pr-pull` so the tap's `brew pr-pull` workflow commits the
+# `bottle do` block and merges (see the tap's `.github/workflows/`).
+#
+# We trigger on `release: published` (not the tag push) for the same reason as
+# publish-changelog.yml: that's the moment the version is installable from PyPI
+# — the secure-release repo publishes to PyPI before the GitHub Release goes
+# public (see RELEASING.md), so the sdist we pin the formula to actually exists.
+#
+# Cross-repo writes can't use the workflow's own GITHUB_TOKEN (scoped to this
+# repo), so we mint a short-lived token from the omnigent-ci GitHub App scoped to
+# homebrew-tap — the same App used by publish-changelog.yml / doc-sync.yml. One
+# prerequisite: the omnigent-ci App must be installed on omnigent-ai/homebrew-tap
+# with contents:write + pull-requests:write.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Final release tag to (re)open the tap PR for, e.g. v0.3.0
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+# Serialize per tag so two triggers can't race the same formula PR.
+concurrency:
+  group: homebrew-tap-pr-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Resolve release tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.r.outputs.tag }}
+      version: ${{ steps.r.outputs.version }}
+      is_final: ${{ steps.r.outputs.is_final }}
+    steps:
+      - name: Resolve tag, version, and finality
+        id: r
+        env:
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          PRERELEASE: ${{ github.event.release.prerelease }}
+        run: |
+          set -euo pipefail
+          tag="${INPUT_TAG:-$EVENT_TAG}"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          is_final=true
+          # Only final vX.Y.Z tags; exclude rc/dev/alpha/beta and the event's
+          # prerelease flag (homebrew users get stable releases from the tap).
+          case "$tag" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) is_final=false ;;
+          esac
+          case "$tag" in
+            *rc*|*dev*|*a[0-9]*|*b[0-9]*) is_final=false ;;
+          esac
+          if [ "${PRERELEASE}" = "true" ]; then is_final=false; fi
+          echo "is_final=${is_final}" >> "$GITHUB_OUTPUT"
+          echo "Resolved tag=${tag} is_final=${is_final}" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  pr:
+    name: Open homebrew-tap formula PR
+    needs: resolve
+    runs-on: ubuntu-latest
+    # Canonical repo only — forks/mirrors have no PyPI release or the App token.
+    if: needs.resolve.outputs.is_final == 'true' && github.repository == 'omnigent-ai/omnigent'
+    env:
+      TAG: ${{ needs.resolve.outputs.tag }}
+      VERSION: ${{ needs.resolve.outputs.version }}
+      TAP_REPO: ${{ github.repository_owner }}/homebrew-tap
+      BRANCH: auto/formula/${{ needs.resolve.outputs.tag }}
+    steps:
+      - name: Checkout omnigent (template + generator)
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          enable-cache: false
+
+      - name: Wait for the released sdist to land on PyPI
+        # The GitHub Release is published after the prod PyPI publish, but the
+        # secure-release publish can lag a few minutes; poll so a slightly-early
+        # release (or a rerun right at publish time) doesn't fail the whole job.
+        run: |
+          set -euo pipefail
+          python3 - "$VERSION" <<'PY'
+          import json, sys, time, urllib.request
+          ver = sys.argv[1]
+          url = f"https://pypi.org/pypi/omnigent/{ver}/json"
+          deadline = time.time() + 15 * 60
+          while time.time() < deadline:
+              try:
+                  with urllib.request.urlopen(url, timeout=20) as r:
+                      data = json.load(r)
+                  if any(f.get("packagetype") == "sdist" for f in data.get("urls", [])):
+                      print(f"omnigent=={ver} sdist is on PyPI.")
+                      sys.exit(0)
+              except Exception as e:
+                  print(f"waiting for {url}: {e}")
+              time.sleep(30)
+          print(f"::error::omnigent=={ver} sdist not found on PyPI after 15m")
+          sys.exit(1)
+          PY
+
+      - name: Generate the formula
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/homebrew/generate_formula.py \
+            --version "$VERSION" \
+            --template .github/scripts/homebrew/omnigent.rb.template \
+            --out /tmp/omnigent.rb
+          {
+            echo "### Generated \`Formula/omnigent.rb\` for $TAG"
+            echo '```ruby'
+            cat /tmp/omnigent.rb
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Mint homebrew-tap App token
+        id: app-token
+        if: vars.OMNIGENT_BOT_APP_ID != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.OMNIGENT_BOT_APP_ID }}
+          private-key: ${{ secrets.OMNIGENT_BOT_APP_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: homebrew-tap
+
+      - name: Checkout homebrew-tap (PR target)
+        if: steps.app-token.outputs.token != ''
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ env.TAP_REPO }}
+          token: ${{ steps.app-token.outputs.token }}
+          path: tap
+
+      - name: Open or update the formula PR
+        if: steps.app-token.outputs.token != ''
+        working-directory: tap
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p Formula
+          cp /tmp/omnigent.rb Formula/omnigent.rb
+
+          if [ -z "$(git status --porcelain -- Formula/omnigent.rb)" ]; then
+            echo "Formula already at $TAG — nothing to do." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          git config user.name "omnigent-ci[bot]"
+          git config user.email "294685417+omnigent-ci[bot]@users.noreply.github.com"
+          git switch -C "$BRANCH"
+          git add Formula/omnigent.rb
+          git commit -m "omnigent $VERSION"
+          git push --force origin "$BRANCH"
+
+          if [ -n "$(gh pr list --repo "$TAP_REPO" --head "$BRANCH" --state open --json number --jq '.[].number')" ]; then
+            echo "Formula PR already open for $BRANCH — force-push updated it." \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          body="$(printf 'Bumps the **omnigent** formula to **%s**.\n\nRegenerates the stable `url`/`sha256` and every `resource` stanza from the PyPI dependency tree of `omnigent==%s` (resolved with `uv pip compile` for macOS arm + intel), spliced into the hand-tuned template in `omnigent-ai/omnigent` (`.github/scripts/homebrew/omnigent.rb.template`). The structural parts (`depends_on`, `install`, `test`) are unchanged.\n\nOnce `brew test-bot` builds the bottles, label this PR **`pr-pull`** so the tap'"'"'s `brew pr-pull` workflow commits the `bottle do` block and merges.\n\nGenerated by `omnigent-ai/omnigent` `.github/workflows/homebrew-tap-pr.yml` on the **%s** release.' "$VERSION" "$VERSION" "$TAG")"
+          gh pr create \
+            --repo "$TAP_REPO" \
+            --base main \
+            --head "$BRANCH" \
+            --title "omnigent $VERSION" \
+            --body "$body"
+
+      - name: Note skipped (no App token)
+        if: steps.app-token.outputs.token == ''
+        run: |
+          echo "::warning::OMNIGENT_BOT_APP_ID/KEY missing, or the omnigent-ci App isn't installed on $TAP_REPO with contents:write + pull-requests:write. The formula was generated (see the job summary) but the PR was not opened."
+          echo "### Homebrew tap PR skipped" >> "$GITHUB_STEP_SUMMARY"
+          echo "The omnigent-ci App token couldn't be minted — install the App on \`$TAP_REPO\` with contents:write + pull-requests:write and rerun." >> "$GITHUB_STEP_SUMMARY"

@@ -48,6 +48,7 @@ from omnigent.inner.seatbelt_sandbox import (
     _per_user_dyld_cache_subpath,
     _quote,
     _resolve_root,
+    _symlink_hop_literals,
 )
 
 # ---------------------------------------------------------------------------
@@ -2079,4 +2080,322 @@ def test_s5_read_paths_dedup_skips_paths_under_cwd(tmp_path: Path) -> None:
     assert profile.count(env_deny) == 1, (
         ".env masked more than once — the dedup that skips "
         "read_paths roots at-or-under cwd regressed."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Exec-chain symlink hops + launcher target visibility (bwrap parity)
+# ---------------------------------------------------------------------------
+
+
+def _uv_style_layout(base: Path) -> tuple[Path, Path, Path]:
+    """
+    Stage uv's tool-venv → versionless-hop → real-install layout.
+
+    Mirrors what ``uv tool install omnigent`` produces: the tool
+    venv's ``bin/python`` symlinks to a path that traverses the
+    version-floating ``cpython-3.12`` directory symlink before
+    landing on the real ``cpython-3.12.13`` install. Both roots get
+    the venv/install shape (``bin/`` + ``lib/python3.12``) so the
+    narrow install-root fallback matches them.
+
+    :param base: Directory to stage the fake ``$HOME`` layout under.
+    :returns: ``(tool_exe, versionless_dir, real_install_root)``.
+    """
+    real_root = base / ".local" / "share" / "uv" / "python" / "cpython-3.12.13-macos"
+    (real_root / "bin").mkdir(parents=True)
+    (real_root / "lib" / "python3.12").mkdir(parents=True)
+    real_exe = real_root / "bin" / "python3.12"
+    real_exe.write_text("#!fake\n")
+    real_exe.chmod(0o755)
+    versionless = base / ".local" / "share" / "uv" / "python" / "cpython-3.12-macos"
+    versionless.symlink_to("cpython-3.12.13-macos")
+    tool_root = base / ".local" / "share" / "uv" / "tools" / "omnigent"
+    (tool_root / "bin").mkdir(parents=True)
+    (tool_root / "lib" / "python3.12").mkdir(parents=True)
+    tool_exe = tool_root / "bin" / "python"
+    tool_exe.symlink_to(versionless / "bin" / "python3.12")
+    return tool_exe, versionless, real_root
+
+
+def test_wrap_launcher_argv_grants_uv_versionless_hop_literal(tmp_path: Path) -> None:
+    """
+    The uv boot regression: the helper interpreter is reached through
+    uv's version-floating directory symlink
+    (``cpython-3.12 -> cpython-3.12.13``). The profile grants a
+    subpath on the RESOLVED install root, but execve reads the
+    versionless symlink at its LITERAL path — without a literal
+    grant for the hop, ``sandbox-exec``'s execvp of the helper dies
+    with EPERM and every jailed helper spawn fails at boot.
+    """
+    tool_exe, versionless, real_root = _uv_style_layout(tmp_path / "fake-home")
+    cwd = tmp_path / "workspace"
+    cwd.mkdir()
+
+    backend = _make_backend()
+    policy = _make_policy(cwd, allow_hidden=[".venv"])
+    argv = backend.wrap_launcher_argv(
+        [str(tool_exe), "-m", "omnigent.inner.os_env", "helper", "X"], policy, cwd
+    )
+    profile = Path(argv[2]).read_text()
+
+    hop_literal = f"(allow file-read* (literal {_quote(str(versionless))}))"
+    assert hop_literal in profile, (
+        f"Missing literal read grant for the versionless symlink hop "
+        f"{str(versionless)!r}. Subpath rules match only canonical "
+        "paths, so without this literal the kernel denies reading the "
+        "symlink during execve resolution and the helper interpreter "
+        "never boots (execvp EPERM)."
+    )
+    resolved_subpath = (
+        f"(allow file-read* (subpath {_quote(str(real_root.resolve(strict=False)))}))"
+    )
+    assert resolved_subpath in profile, (
+        "The resolved install root must keep its narrow subpath grant "
+        "— the hop literal complements it, never replaces it."
+    )
+
+
+def test_wrap_launcher_argv_target_grants_claude_cli_install(tmp_path: Path) -> None:
+    """
+    The launcher target (e.g. the claude CLI wrapped by
+    ``prepare_claude_cli_path``) must be readable inside the sandbox:
+    the standalone installer puts a symlink at ``~/.local/bin/claude``
+    pointing into ``~/.local/share/claude/versions/<v>/``. The wrap
+    must grant a literal read on the symlink and a subpath on the
+    version directory — and nothing wider — instead of discarding
+    ``target`` (which crashed the whole native-tool wrap with
+    ``PermissionError`` at connect time).
+    """
+    fake_home = tmp_path / "fake-home"
+    version_dir = fake_home / ".local" / "share" / "claude" / "versions" / "1.0.61"
+    version_dir.mkdir(parents=True)
+    cli_real = version_dir / "claude"
+    cli_real.write_bytes(b"\x00fakebun")
+    cli_real.chmod(0o755)
+    bin_dir = fake_home / ".local" / "bin"
+    bin_dir.mkdir(parents=True)
+    cli_link = bin_dir / "claude"
+    cli_link.symlink_to(cli_real)
+    cwd = tmp_path / "workspace"
+    cwd.mkdir()
+
+    backend = _make_backend()
+    policy = _make_policy(cwd, allow_hidden=[".venv"])
+    argv = backend.wrap_launcher_argv(_safe_helper_argv(cwd), policy, cwd, target=str(cli_link))
+    profile = Path(argv[2]).read_text()
+
+    assert f"(allow file-read* (literal {_quote(str(cli_link))}))" in profile, (
+        "The target symlink needs a literal read grant — the kernel "
+        "reads it at its literal path when the launcher execs the CLI."
+    )
+    assert f"(allow file-read* (subpath {_quote(str(version_dir))}))" in profile, (
+        "The resolved CLI's own directory needs a subpath grant so the "
+        "in-sandbox exec can read the binary."
+    )
+    dotlocal = fake_home / ".local"
+    assert f"(allow file-read* (subpath {_quote(str(dotlocal))}))" not in profile, (
+        "The grant must stay scoped to the CLI install — widening to "
+        "~/.local would expose sibling tool state."
+    )
+    assert f"(allow file-read-metadata (literal {_quote(str(bin_dir))}))" in profile, (
+        "The literal grant's ancestors need stat-only traversal allows "
+        "or realpath() walks to the CLI EPERM under deny-default."
+    )
+
+
+def test_wrap_launcher_argv_target_under_cwd_changes_nothing(tmp_path: Path) -> None:
+    """
+    A target already covered by the cwd subpath must not change the
+    profile — no redundant grants, profile contents byte-identical to
+    the no-target wrap (mirrors the bwrap no-op-target behaviour).
+    """
+    backend = _make_backend()
+    policy = _make_policy(tmp_path, allow_hidden=[".venv"])
+    tool = tmp_path / "tools" / "cli"
+    tool.parent.mkdir()
+    tool.write_text("#!fake\n")
+    tool.chmod(0o755)
+    helper_argv = _safe_helper_argv(tmp_path)
+
+    argv_no_target = backend.wrap_launcher_argv(helper_argv, policy, tmp_path)
+    argv_with_target = backend.wrap_launcher_argv(helper_argv, policy, tmp_path, target=str(tool))
+    assert Path(argv_no_target[2]).read_text() == Path(argv_with_target[2]).read_text(), (
+        "A cwd-covered target must be a no-op for the profile; extra "
+        "grants here mean the coverage check regressed."
+    )
+
+
+def test_wrap_launcher_argv_target_with_unsafe_parent_degrades_not_raises(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    The target lane must NEVER raise (parity with the crash-instead-
+    of-degrade complaint): when the resolved target's parent directory
+    is too broad to grant — an unsafe ancestor, ``$HOME``, or above —
+    the wrap degrades to a literal read on the binary plus an audit
+    WARNING instead of failing the spawn.
+    """
+    fake_home = tmp_path / "fake-home"
+    fake_home.mkdir()
+    binary = fake_home / "claude"
+    binary.write_bytes(b"\x00fakebun")
+    binary.chmod(0o755)
+    cwd = tmp_path / "workspace"
+    cwd.mkdir()
+
+    backend = _make_backend()
+    policy = _make_policy(cwd, allow_hidden=[".venv"])
+    with patch(
+        "omnigent.inner.seatbelt_sandbox._UNSAFE_WIDEN_ANCESTORS",
+        frozenset({str(fake_home)}),
+    ):
+        with caplog.at_level("WARNING", logger="omnigent.inner.seatbelt_sandbox"):
+            argv = backend.wrap_launcher_argv(
+                _safe_helper_argv(cwd), policy, cwd, target=str(binary)
+            )
+    profile = Path(argv[2]).read_text()
+
+    assert f"(allow file-read* (literal {_quote(str(binary))}))" in profile, (
+        "The degraded path must still grant a literal read on the "
+        "binary itself — best effort beats a guaranteed crash."
+    )
+    assert f"(allow file-read* (subpath {_quote(str(fake_home))}))" not in profile, (
+        "The refused parent must NOT get a subpath grant — that's the "
+        "sandbox-defeating widening the guard exists to prevent."
+    )
+    assert any("too broad" in record.message for record in caplog.records), (
+        "The degrade must be auditable via a WARNING naming the refused parent."
+    )
+
+
+def test_symlink_hop_literals_survives_cycles(tmp_path: Path) -> None:
+    """
+    A symlink cycle (``a -> b -> a``) must terminate via the
+    visited-set (same contract as the bwrap walk) and still report
+    the symlinks it saw.
+    """
+    a = tmp_path / "a"
+    b = tmp_path / "b"
+    a.symlink_to(b)
+    b.symlink_to(a)
+
+    literals = _symlink_hop_literals(a, [])
+
+    assert a in literals and b in literals, (
+        f"Cycle members should each be collected once; got {literals!r}."
+    )
+    assert len(literals) == 2, f"Cycle must not duplicate entries or spin; got {literals!r}."
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="darwin_seatbelt requires macOS")
+def test_run_launcher_spawn_wrap_private_tmpdir_boots_under_seatbelt(
+    tmp_path: Path,
+) -> None:
+    """
+    End-to-end regression for the spawn-time-wrap private-tmpdir grant.
+
+    Drives the FULL ``create_exec_launcher`` -> ``run_launcher``
+    two-pass re-exec (the host pass builds the ``sandbox-exec`` wrap and
+    ``execvp``s into it; the in-wrap pass activates and runs the target).
+    This is the path claude-sdk / terminals / the other spawn-wrap
+    harnesses use — distinct from the direct ``wrap_launcher_argv``
+    calls the rest of this file exercises.
+
+    Reproduces the reported failure: inside the wrap, the launcher mints
+    a private scratch tmpdir via ``tempfile.mkdtemp()``, which targets
+    ``$TMPDIR``. On macOS ``$TMPDIR`` is the system tempdir *root*
+    (``/var/folders/.../T``), and the seatbelt profile — baked before
+    the re-exec — only grants a *subpath* of it, so the in-wrap
+    ``mkdtemp`` died with ``FileNotFoundError: No usable temporary
+    directory``. (bwrap masked this via its ``--tmpfs /tmp`` fallback,
+    so Linux CI never saw it.) The fix mints + grants the scratch dir on
+    the host BEFORE the wrap and hands it to the in-wrap pass, so
+    ``mkdtemp`` lands in a profile-granted, writable location.
+
+    The target is a tiny script that calls ``tempfile.mkdtemp()`` and
+    writes a file into it — the exact operation that failed. We force
+    ``TMPDIR`` to the system tempdir root to reproduce the macOS
+    condition deterministically. Pre-fix: the in-wrap launcher exits
+    non-zero with the ``FileNotFoundError`` before the target ever runs.
+    Post-fix: the target runs and prints ``TMPOK``.
+    """
+    import os
+    import shutil as _shutil
+    import subprocess
+    import tempfile
+
+    from omnigent.inner.sandbox import _project_root, create_exec_launcher
+
+    if _shutil.which("sandbox-exec") is None:
+        pytest.skip("sandbox-exec not on PATH")
+
+    cwd = tmp_path
+    # A target that exercises the scratch tmpdir the way real helpers do:
+    # mkdtemp() (honours $TMPDIR) then write into it. This is what raised
+    # FileNotFoundError inside the wrap pre-fix.
+    target = cwd / "tmp_probe.py"
+    target.write_text(
+        "import tempfile, pathlib\n"
+        "d = tempfile.mkdtemp()\n"
+        "p = pathlib.Path(d) / 'scratch.txt'\n"
+        "p.write_text('ok')\n"
+        "assert p.read_text() == 'ok'\n"
+        "print('TMPOK', d)\n"
+    )
+
+    # cwd is READ-ONLY — the seatbelt default, and the condition that
+    # makes this a real reproduction: with no writable cwd, Python's
+    # tempfile fallback chain ($TMPDIR -> /tmp -> ... -> os.getcwd())
+    # has NO writable entry, so a private-tmpdir mkdtemp that targets an
+    # un-granted $TMPDIR fails outright. (If cwd were writable, mkdtemp
+    # would silently fall back to it and mask the bug.) ``.venv`` allowed
+    # so the dotfile mask doesn't fight the interpreter symlink
+    # convention. The project root is a read root so the inline re-exec
+    # can import ``omnigent.inner`` — in production that import is
+    # covered by the interpreter install-root grant or by cwd; here cwd
+    # is pytest's tmp_path, so grant it explicitly.
+    policy = _make_policy(
+        cwd.resolve(strict=False),
+        allow_hidden=[".venv"],
+        read_roots=[_project_root()],
+    )
+
+    # The launcher script re-execs run_launcher under sandbox-exec. Its
+    # shebang is ``sys.executable``; run it as a plain argv so the
+    # two-pass flow (host -> execvp sandbox-exec -> in-wrap) happens for
+    # real. ``target`` is the interpreter here, exec'd inside the jail.
+    launcher = create_exec_launcher(str(Path(sys.executable).resolve(strict=True)), policy)
+    try:
+        env = dict(os.environ)
+        # Reproduce the macOS failure condition explicitly: $TMPDIR is
+        # the system tempdir ROOT, which the profile only grants a
+        # subpath of. Pre-fix this is exactly what broke the in-wrap
+        # mkdtemp.
+        env["TMPDIR"] = tempfile.gettempdir()
+        result = subprocess.run(
+            [launcher, str(target)],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=env,
+        )
+    finally:
+        os.unlink(launcher)
+
+    assert "No usable temporary directory" not in result.stderr, (
+        "In-wrap mkdtemp could not find a writable $TMPDIR — the private "
+        "scratch tmpdir was not granted in the baked seatbelt profile. "
+        f"rc={result.returncode}\nstdout={result.stdout!r}\n"
+        f"stderr={result.stderr!r}"
+    )
+    assert result.returncode == 0, (
+        f"Wrapped launcher exited {result.returncode}.\n"
+        f"stdout={result.stdout!r}\nstderr={result.stderr!r}"
+    )
+    assert "TMPOK" in result.stdout, (
+        "Target ran but didn't reach the scratch-write marker; "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
     )

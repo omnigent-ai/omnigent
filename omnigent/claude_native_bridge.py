@@ -124,6 +124,14 @@ _TMUX_SEND_TIMEOUT_S = 5.0
 # The glyph persists while Claude is busy responding, so its presence
 # means "input box mounted" (not "idle"), which is what injection needs.
 _CLAUDE_PROMPT_GLYPH = "❯"
+# Matches a selected numbered menu row (``❯ 2. No (recommended)``): the glyph
+# followed by a numbered choice, which the chat input never renders. Used to
+# exclude startup menus from the readiness scan (see ``_is_selected_menu_row``).
+_SELECTED_MENU_ROW_RE = re.compile(rf"{_CLAUDE_PROMPT_GLYPH}\s*\d+\.\s")
+# Box-drawing glyphs Claude Code's input-box frame is made of. A line of
+# these below ``❯`` marks the live input box (see ``_is_box_rule``),
+# distinguishing it from a bare prompt echoed into scrollback.
+_BOX_RULE_CHARS = frozenset("─━╭╮╰╯│┃╌╍")
 # How many trailing non-empty lines to scan for the prompt glyph. The
 # input box sits near the bottom of the pane; scanning only the tail
 # avoids false positives from the glyph appearing in scrollback output.
@@ -149,6 +157,27 @@ _SUBMIT_VERIFY_TIMEOUT_S = 10.0
 # (so a slow-but-successful first Enter isn't double-tapped), short
 # enough that a swallowed Enter is retried promptly.
 _SUBMIT_RETRY_INTERVAL_S = 1.0
+# After the submit registers at the TUI layer, how long to wait for
+# Claude Code to record ``UserPromptSubmit`` in hooks.jsonl — the
+# authoritative signal that the prompt was accepted (not just that the
+# draft left the input box, which draft-restore can undo). If it never
+# arrives the submit did not register and the message was not delivered.
+_SUBMIT_ACK_TIMEOUT_S = 8.0
+# After ``UserPromptSubmit`` is seen, a brief window to let a draft-restore
+# manifest (the text bounces back into the box a moment after submit)
+# before treating an empty box as a healthy, turn-is-starting delivery.
+_TURN_START_SETTLE_S = 2.0
+# Once a draft-restore stall is detected, how long to keep re-submitting the
+# restored draft while waiting for an assistant turn to actually start before
+# surfacing the stall as an error.
+_TURN_START_TIMEOUT_S = 20.0
+# Parent-turn hook events that prove an assistant turn has actually started
+# (as opposed to just the prompt being accepted). ``UserPromptSubmit`` and
+# ``SessionStart`` are deliberately excluded — they fire before/at submit,
+# not at turn start.
+_TURN_START_HOOK_EVENTS: frozenset[str] = frozenset(
+    {"PreToolUse", "PostToolUse", "Notification", "Stop", "StopFailure"}
+)
 # Claude Code collapses large pastes into this placeholder in the
 # input box instead of rendering the text itself.
 _PASTED_PLACEHOLDER_PREFIX = "[Pasted text"
@@ -277,11 +306,18 @@ def _trusted_parent_for_bridge_dir(target: Path) -> Path:
         # bridge-owned directories below it.
         return _absolute_syntactic_path(kiro_root.parent.parent)
 
+    # Headless ACP harnesses (acp / goose / qwen) put their Omnigent-MCP relay
+    # bridge below ``$TMPDIR/omnigent-<uid>/acp-mcp`` (same uid-scoped shape as
+    # cursor/qwen/hermes-native), so trust the uid-scoped temp dir's parent.
+    acp_root = _absolute_syntactic_path(acp_mcp_bridge_root())
+    if target.is_relative_to(acp_root):
+        return _absolute_syntactic_path(acp_root.parent.parent)
+
     raise RuntimeError(
         f"bridge dir {target!s} is not under an allowed bridge root "
         f"({claude_root!s}, {codex_root!s}, {cursor_root!s}, "
         f"{antigravity_root!s}, {qwen_root!s}, {hermes_root!s}, {opencode_root!s}, "
-        f"{kiro_root!s})"
+        f"{kiro_root!s}, {acp_root!s})"
     )
 
 
@@ -700,6 +736,38 @@ def _ensure_secure_dir(target: Path) -> None:
             os.chmod(ancestor, 0o700)
 
 
+def acp_mcp_bridge_root() -> Path:
+    """Bridge root for the headless ACP harnesses' Omnigent-MCP relay.
+
+    Shares the uid-scoped temp parent with claude-native
+    (``$TMPDIR/omnigent-<uid>/acp-mcp``). Used by the acp / goose / qwen
+    executors' ``OmnigentAcpMcp`` relay so ``serve-mcp``'s bridge dir passes the
+    :func:`_trusted_parent_for_bridge_dir` secure-root check.
+
+    :returns: The ACP-MCP bridge root directory (not created here).
+    """
+    return _BRIDGE_ROOT_PARENT / "acp-mcp"
+
+
+def prepare_acp_mcp_bridge_dir() -> Path:
+    """Create a fresh, secure per-relay bridge dir for an ACP harness.
+
+    Returns a unique owner-only directory under :func:`acp_mcp_bridge_root` with
+    a minimal token-only ``bridge.json`` — so the shared ``serve-mcp`` serves
+    ONLY the relay tools (no raw ``sys_os_*`` filesystem tools; the ACP agent
+    owns those). The caller's relay writes ``tool_relay.json`` here and points
+    ``serve-mcp`` at the directory.
+
+    :returns: The prepared bridge directory path.
+    """
+    bridge_dir = acp_mcp_bridge_root() / secrets.token_hex(8)
+    _ensure_secure_dir(bridge_dir)
+    config_path = bridge_dir / _CONFIG_FILE
+    if not config_path.exists():
+        _write_json_file(config_path, {"token": secrets.token_urlsafe(32)})
+    return bridge_dir
+
+
 def bridge_dir_for_bridge_id(bridge_id: str) -> Path:
     """
     Return the deterministic bridge directory for a Claude-native bridge.
@@ -1043,6 +1111,9 @@ def build_hook_settings(
     ap_server_url: str | None = None,
     ap_auth_headers: dict[str, str] | None = None,
     api_key_helper: str | None = None,
+    launch_model: str | None = None,
+    launch_permission_mode: str | None = None,
+    launch_effort: str | None = None,
 ) -> dict[str, Any]:
     """
     Build invocation-local Claude Code hook settings.
@@ -1062,6 +1133,15 @@ def build_hook_settings(
     :param api_key_helper: Optional Claude Code ``apiKeyHelper``
         command from ucode state, e.g. ``"databricks auth token
         --host https://example.databricks.com ..."``.
+    :param launch_model: Effective launch model from ``--model``. Mirrored
+        into the invocation-local settings sidecar so a wrapped Claude Code
+        re-exec that preserves ``--settings`` but rebuilds argv cannot fall
+        back to the user's global default model.
+    :param launch_permission_mode: Effective launch permission mode from
+        ``--permission-mode``. Mirrored into ``permissions.defaultMode``
+        for the same re-exec hardening.
+    :param launch_effort: Effective launch effort from ``--effort``.
+        Mirrored into ``effortLevel`` for restart/re-exec parity.
     :returns: JSON-serializable Claude settings fragment.
     """
     python = python_executable or sys.executable
@@ -1247,6 +1327,12 @@ def build_hook_settings(
         # prompts, since both fire UserPromptSubmit.
         hooks["UserPromptSubmit"].append({"hooks": [evaluate_policy_hook]})
     settings: dict[str, Any] = {"hooks": hooks}
+    if launch_model:
+        settings["model"] = launch_model
+    if launch_permission_mode:
+        settings["permissions"] = {"defaultMode": launch_permission_mode}
+    if launch_effort and launch_effort in CLAUDE_EFFORTS:
+        settings["effortLevel"] = launch_effort
     if api_key_helper:
         settings["apiKeyHelper"] = api_key_helper
     # Override Claude Code's statusLine so we receive its stdin (the
@@ -1343,6 +1429,9 @@ def augment_claude_args(
         ap_server_url=ap_server_url,
         ap_auth_headers=ap_auth_headers,
         api_key_helper=api_key_helper,
+        launch_model=_arg_value(claude_args, "--model"),
+        launch_permission_mode=_arg_value(claude_args, "--permission-mode"),
+        launch_effort=_arg_value(claude_args, "--effort"),
     )
     args = _merge_disallowed_tools(list(claude_args), _OMNIGENT_DISALLOWED_TOOLS)
     args.extend(
@@ -1361,6 +1450,32 @@ def augment_claude_args(
         )
     )
     return args
+
+
+def _arg_value(args: tuple[str, ...], flag: str) -> str | None:
+    """Return the effective CLI flag value from ``args``.
+
+    Supports both ``--flag value`` and ``--flag=value`` spellings. When a
+    flag appears more than once, the last valid occurrence wins, matching the
+    usual CLI precedence for repeated long options.
+
+    :param args: Claude CLI args, e.g. ``("--model", "sonnet")``.
+    :param flag: Long flag to read, e.g. ``"--model"``.
+    :returns: The flag value, or ``None`` when absent/empty.
+    """
+    joined_prefix = f"{flag}="
+    value: str | None = None
+    for idx, arg in enumerate(args):
+        if arg.startswith(joined_prefix):
+            candidate = arg[len(joined_prefix) :]
+            if candidate:
+                value = candidate
+            continue
+        if arg == flag and idx + 1 < len(args):
+            candidate = args[idx + 1]
+            if candidate and not candidate.startswith("--"):
+                value = candidate
+    return value
 
 
 def _merge_disallowed_tools(args: list[str], extra: tuple[str, ...]) -> list[str]:
@@ -1440,6 +1555,26 @@ def read_transcript_path(bridge_dir: Path) -> Path | None:
     if not isinstance(raw, str) or not raw:
         return None
     return Path(raw)
+
+
+def _count_transcript_lines(transcript_path: Path | None) -> int:
+    """
+    Return the current line count of a transcript file.
+
+    Used to snapshot a pre-injection cursor so the delivery ack only reads
+    assistant text appended after this message. ``None`` or a missing file
+    (fresh session) reports ``0``.
+
+    :param transcript_path: Transcript path, or ``None``.
+    :returns: Line count, or ``0`` when absent.
+    """
+    if transcript_path is None:
+        return 0
+    try:
+        with transcript_path.open("r", encoding="utf-8") as handle:
+            return sum(1 for _ in handle)
+    except FileNotFoundError:
+        return 0
 
 
 def read_claude_session_id(bridge_dir: Path) -> str | None:
@@ -2131,6 +2266,125 @@ def stop_hook_seen_since(bridge_dir: Path, start_event_count: int) -> bool:
     return False
 
 
+def user_prompt_submit_seen_since(bridge_dir: Path, start_event_count: int) -> bool:
+    """
+    Return whether Claude recorded a ``UserPromptSubmit`` after a cursor.
+
+    This is the authoritative "the prompt was accepted" signal for an
+    injected message: Claude Code fires ``UserPromptSubmit`` when a
+    submit registers, before any assistant activity. It is what lets the
+    bridge tell a genuinely-delivered message apart from one whose submit
+    Enter was swallowed (draft still sitting unsent). Subagent prompts
+    (whose ``transcript_path`` contains a ``subagents/`` component) are
+    ignored so they cannot be mistaken for the parent turn's submit.
+
+    :param bridge_dir: Bridge directory path.
+    :param start_event_count: Hook record count captured before the
+        message was injected into the Claude terminal.
+    :returns: ``True`` once a parent-process ``UserPromptSubmit`` hook has
+        been recorded after the cursor.
+    """
+    path = bridge_dir / _HOOKS_FILE
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for index, line in enumerate(handle, start=1):
+                if index <= start_event_count:
+                    continue
+                try:
+                    envelope = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                payload = envelope.get("payload") if isinstance(envelope, dict) else None
+                event_name = payload.get("hook_event_name") if isinstance(payload, dict) else None
+                if event_name != "UserPromptSubmit":
+                    continue
+                transcript_path = (
+                    payload.get("transcript_path") if isinstance(payload, dict) else None
+                )
+                if isinstance(transcript_path, str) and "/subagents/" in transcript_path:
+                    continue
+                return True
+    except FileNotFoundError:
+        return False
+    return False
+
+
+def _turn_activity_hook_seen_since(bridge_dir: Path, start_event_count: int) -> bool:
+    """
+    Return whether a parent-turn activity hook fired after a cursor.
+
+    Turn-start (as opposed to prompt-accept) is proven by any parent
+    ``PreToolUse`` / ``PostToolUse`` / ``Notification`` / ``Stop`` /
+    ``StopFailure`` in ``hooks.jsonl`` after the cursor — see
+    :data:`_TURN_START_HOOK_EVENTS`. Subagent events are skipped so a
+    finishing subagent cannot masquerade as the parent turn starting.
+
+    :param bridge_dir: Bridge directory path.
+    :param start_event_count: Hook record count captured before injection.
+    :returns: ``True`` once a parent turn-activity hook is recorded after
+        the cursor.
+    """
+    path = bridge_dir / _HOOKS_FILE
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for index, line in enumerate(handle, start=1):
+                if index <= start_event_count:
+                    continue
+                try:
+                    envelope = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                payload = envelope.get("payload") if isinstance(envelope, dict) else None
+                event_name = payload.get("hook_event_name") if isinstance(payload, dict) else None
+                if event_name not in _TURN_START_HOOK_EVENTS:
+                    continue
+                transcript_path = (
+                    payload.get("transcript_path") if isinstance(payload, dict) else None
+                )
+                if isinstance(transcript_path, str) and "/subagents/" in transcript_path:
+                    continue
+                return True
+    except FileNotFoundError:
+        return False
+    return False
+
+
+def _assistant_turn_started_since(
+    bridge_dir: Path,
+    *,
+    hook_cursor: int,
+    transcript_path: Path | None,
+    transcript_cursor: int,
+) -> bool:
+    """
+    Return whether an assistant turn actually started after injection.
+
+    Combines two signals so both tool-first and text-only turns are
+    caught: a parent turn-activity hook
+    (:func:`_turn_activity_hook_seen_since`, covers tool calls and the
+    end-of-turn ``Stop``) or new assistant text appended to the transcript
+    after the pre-injection cursor (:func:`read_assistant_text_since`,
+    covers a turn that streams text before any tool). ``read_assistant_text_since``
+    ignores user entries, so the injected prompt itself never counts as a
+    turn start.
+
+    :param bridge_dir: Bridge directory path.
+    :param hook_cursor: Hook record count captured before injection.
+    :param transcript_path: Transcript path captured before injection, or
+        ``None`` when hooks had not yet reported one (re-resolved here).
+    :param transcript_cursor: Transcript line count captured before
+        injection.
+    :returns: ``True`` once assistant activity is observed after injection.
+    """
+    if _turn_activity_hook_seen_since(bridge_dir, hook_cursor):
+        return True
+    path = transcript_path or read_transcript_path(bridge_dir)
+    if path is None:
+        return False
+    _cursor, texts = read_assistant_text_since(path, transcript_cursor)
+    return bool(texts)
+
+
 # Terminal per-task ``status`` values in a ``Stop`` hook's ``background_tasks``
 # array. Claude Code retains finished/stopped shells in that array rather than
 # reaping them (claude-code issues #67895, #59456, #14049), so counting the raw
@@ -2390,11 +2644,112 @@ def write_tmux_target(
     _write_json_file(bridge_dir / _TMUX_FILE, payload)
 
 
+def _await_delivery_ack(
+    info: dict[str, str],
+    bridge_dir: Path,
+    *,
+    needle: str,
+    hook_cursor: int,
+    transcript_path: Path | None,
+    transcript_cursor: int,
+) -> None:
+    """
+    Confirm an injected message was delivered end-to-end, or raise.
+
+    Called after the TUI-level submit. Two bounded phases:
+
+    1. **Submit registered?** Wait up to :data:`_SUBMIT_ACK_TIMEOUT_S`
+       for ``UserPromptSubmit`` after ``hook_cursor``. While waiting,
+       re-send ``Enter`` only while the draft is verifiably still in the
+       input box — this recovers a swallowed submit (and the old
+       blind-Enter path) without ever double-submitting a cleared box. If
+       it never arrives the submit did not register: raise.
+    2. **Turn started?** Once the prompt is accepted, the draft leaving
+       the box is not proof of a turn (draft-restore can undo it). Watch
+       for a real turn start; if instead the draft reappears in the box
+       (the draft-restore signature) re-submit it, spaced out, until a
+       turn starts. Raise only if redelivery never produces a turn within
+       :data:`_TURN_START_TIMEOUT_S`.
+
+    Skipped entirely when ``hooks.jsonl`` does not exist — the hook stream
+    is unobservable for this bridge, so this cannot do better than the
+    pane-based submit and must not newly block delivery.
+
+    :param info: Resolved tmux info (``socket_path`` / ``tmux_target``).
+    :param bridge_dir: Bridge directory path.
+    :param needle: Draft marker from :func:`_submit_needle`.
+    :param hook_cursor: Hook record count captured before injection.
+    :param transcript_path: Transcript path captured before injection.
+    :param transcript_cursor: Transcript line count captured before injection.
+    :raises RuntimeError: If ``UserPromptSubmit`` never registers, or if a
+        draft-restore stall never yields an assistant turn.
+    """
+    if not (bridge_dir / _HOOKS_FILE).exists():
+        return
+
+    # Phase 1 — submit registered (UserPromptSubmit recorded)?
+    deadline = time.monotonic() + _SUBMIT_ACK_TIMEOUT_S
+    last_enter = time.monotonic()
+    submitted = False
+    while time.monotonic() < deadline:
+        if user_prompt_submit_seen_since(bridge_dir, hook_cursor):
+            submitted = True
+            break
+        pane = _capture_pane(info["socket_path"], info["tmux_target"])
+        if (
+            _draft_in_input_box(pane, needle)
+            and time.monotonic() - last_enter >= _SUBMIT_RETRY_INTERVAL_S
+        ):
+            _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Enter")
+            last_enter = time.monotonic()
+        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+    if not submitted:
+        raise RuntimeError(
+            "Claude Code never recorded UserPromptSubmit for the injected message "
+            f"within {_SUBMIT_ACK_TIMEOUT_S}s; the message was not delivered."
+        )
+
+    # Phase 2 — assistant turn actually started?
+    deadline = time.monotonic() + _TURN_START_TIMEOUT_S
+    settle = time.monotonic() + _TURN_START_SETTLE_S
+    last_enter = time.monotonic()
+    saw_restore = False
+    while time.monotonic() < deadline:
+        if _assistant_turn_started_since(
+            bridge_dir,
+            hook_cursor=hook_cursor,
+            transcript_path=transcript_path,
+            transcript_cursor=transcript_cursor,
+        ):
+            return
+        pane = _capture_pane(info["socket_path"], info["tmux_target"])
+        if _draft_in_input_box(pane, needle):
+            # Draft-restore stall: the submit registered but the text
+            # bounced back into the box. Re-submit it (what a human does by
+            # pressing Enter), spaced out, until a turn starts.
+            saw_restore = True
+            if time.monotonic() - last_enter >= _SUBMIT_RETRY_INTERVAL_S:
+                _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Enter")
+                last_enter = time.monotonic()
+        elif not saw_restore and time.monotonic() >= settle:
+            # UserPromptSubmit is in and the box stayed empty through the
+            # settle window with no restore — the turn is starting or is
+            # queued behind a running one. Delivered; don't block further.
+            return
+        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+    raise RuntimeError(
+        "Claude Code recorded the message but no assistant turn started within "
+        f"{_TURN_START_TIMEOUT_S}s (draft-restore stall); redelivery did not recover. "
+        "The message may be sitting unsent in the terminal input box."
+    )
+
+
 def inject_user_message(
     bridge_dir: Path,
     *,
     content: str,
     timeout_s: float = _TMUX_READY_TIMEOUT_S,
+    verify_delivery: bool = True,
 ) -> None:
     r"""
     Deliver a user message into the Claude terminal via tmux send-keys.
@@ -2417,24 +2772,40 @@ def inject_user_message(
     client→server command at ~16KB, so a large message — e.g. a PR diff
     in a sub-agent dispatch — failed with "command too long".
 
-    The submit is **verified, not fire-and-forget**: Claude Code
-    coalesces rapid stdin bursts into a paste, so an Enter that lands
-    while the TUI is still consuming the paste is folded in as a
-    newline and the draft sits unsent. This helper first polls
-    ``capture-pane`` until the draft is visible in the input box (the
-    paste was committed), sends Enter, then polls that the draft left
-    the box — re-sending Enter while it hasn't — and raises if the
-    message never submits.
+    The submit is **verified end-to-end, not fire-and-forget**. Claude
+    Code coalesces rapid stdin bursts into a paste, so an Enter that lands
+    while the TUI is still consuming the paste is folded in as a newline
+    and the draft sits unsent; this helper first polls ``capture-pane``
+    until the draft is visible (paste committed), sends Enter, then polls
+    that the draft left the box, re-sending Enter while it hasn't. That
+    only proves the TUI accepted the keystroke, which draft-restore can
+    undo, so when ``verify_delivery`` is set (the default) it then waits
+    on the authoritative hook signal: ``UserPromptSubmit`` recorded in
+    ``hooks.jsonl`` (submit registered), followed by an assistant turn
+    actually starting. If the prompt never registers, or it registers but
+    the draft is restored to the box and no turn starts even after
+    redelivery, it raises so the caller can surface the failure instead of
+    stranding the message in a terminal the user may not be watching. The
+    hook ack is skipped when ``hooks.jsonl`` is absent (signal
+    unobservable). Pass ``verify_delivery=False`` for mid-turn steering,
+    where a queued message may not fire ``UserPromptSubmit`` promptly.
 
     :param bridge_dir: Bridge directory path.
     :param content: User text from the Omnigent web UI. Must be non-empty.
     :param timeout_s: Seconds to wait for each readiness gate
         (``tmux.json`` advertised, then prompt rendered), e.g. ``30.0``.
+    :param verify_delivery: When ``True`` (default), block after submit
+        until the hook stream acknowledges delivery (``UserPromptSubmit``
+        + assistant turn start), raising on failure. When ``False``, use
+        the legacy pane-only verification — for mid-turn steering, where a
+        queued prompt may not ack promptly.
     :returns: None.
     :raises RuntimeError: If the tmux target is not advertised in time,
         if Claude's input prompt never renders, if a ``tmux send-keys``
-        invocation fails, or if the draft never leaves the input box
-        after repeated submit Enters (message not delivered).
+        invocation fails, if the draft never leaves the input box after
+        repeated submit Enters, or — when ``verify_delivery`` — if the
+        hook stream never acknowledges the message (no ``UserPromptSubmit``,
+        or a draft-restore stall that redelivery cannot start).
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     # tmux.json only means the tmux session exists; Claude Code's input
@@ -2445,6 +2816,13 @@ def inject_user_message(
         info["tmux_target"],
         timeout_s=timeout_s,
     )
+    # Snapshot the hook + transcript cursors BEFORE injecting so the
+    # delivery ack can tell this message's UserPromptSubmit / turn-start
+    # apart from prior activity. read_hook_events_since(..., 0) returns the
+    # current complete-record count as its cursor.
+    hook_cursor, _ = read_hook_events_since(bridge_dir, 0)
+    ack_transcript_path = read_transcript_path(bridge_dir)
+    transcript_cursor = _count_transcript_lines(ack_transcript_path)
     # Clear any leftover text in Claude's input field before typing.
     # After Escape-cancel, Claude Code re-populates the prompt area
     # with the previous input for re-editing. Without this clear,
@@ -2501,29 +2879,45 @@ def inject_user_message(
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
     time.sleep(_PASTE_SETTLE_S)
     _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Enter")
-    if not draft_seen:
-        # The draft was never observed, so its absence proves nothing —
-        # verification would trivially "pass". Submit blind as before.
+    # TUI-level submit verification: a successful Enter clears the input
+    # box. If the draft is still sitting there the Enter was swallowed into
+    # the paste burst as a newline — re-send it (the retry lands well after
+    # the burst, so it submits). Each Enter only fires while the draft is
+    # verifiably still present, so a retry can never hit an empty prompt or
+    # a permission dialog of the started turn. Skipped when the draft was
+    # never identifiable (draft_seen False) — its absence proves nothing, so
+    # the hook ack below is what guards that path.
+    if draft_seen:
+        deadline = time.monotonic() + _SUBMIT_VERIFY_TIMEOUT_S
+        last_enter = time.monotonic()
+        submitted = False
+        while time.monotonic() < deadline:
+            time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+            pane = _capture_pane(info["socket_path"], info["tmux_target"])
+            if not _draft_in_input_box(pane, needle):
+                submitted = True
+                break
+            if time.monotonic() - last_enter >= _SUBMIT_RETRY_INTERVAL_S:
+                _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Enter")
+                last_enter = time.monotonic()
+        if not submitted:
+            raise RuntimeError(
+                "Claude Code did not accept the submitted message within "
+                f"{_SUBMIT_VERIFY_TIMEOUT_S}s (the draft is still in the input box). "
+                "The message was not delivered."
+            )
+    if not verify_delivery:
+        # Legacy behavior for mid-turn steering: the pane-level submit above
+        # is as far as we verify (a queued steering prompt may not ack).
         return
-    # Verify the submit took: a successful Enter clears the input box.
-    # If the draft is still sitting there the Enter was swallowed into
-    # the paste burst as a newline — re-send it (the retry lands well
-    # after the burst, so it submits). Each Enter only fires while the
-    # draft is verifiably still present, so a retry can never hit an
-    # empty prompt or a permission dialog of the started turn.
-    deadline = time.monotonic() + _SUBMIT_VERIFY_TIMEOUT_S
-    last_enter = time.monotonic()
-    while time.monotonic() < deadline:
-        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
-        pane = _capture_pane(info["socket_path"], info["tmux_target"])
-        if not _draft_in_input_box(pane, needle):
-            return
-        if time.monotonic() - last_enter >= _SUBMIT_RETRY_INTERVAL_S:
-            _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Enter")
-            last_enter = time.monotonic()
-    raise RuntimeError(
-        f"Claude Code did not accept the submitted message within {_SUBMIT_VERIFY_TIMEOUT_S}s "
-        "(the draft is still in the input box). The message was not delivered."
+    # End-to-end ack: confirm UserPromptSubmit registered and a turn started.
+    _await_delivery_ack(
+        info,
+        bridge_dir,
+        needle=needle,
+        hook_cursor=hook_cursor,
+        transcript_path=ack_transcript_path,
+        transcript_cursor=transcript_cursor,
     )
 
 
@@ -2831,11 +3225,77 @@ def _claude_prompt_rendered(pane: str) -> bool:
     positives from the glyph appearing in scrollback (e.g. echoed in a
     prior response), since the live input box always sits at the bottom.
 
+    A mid-turn injection grows the footer with running-state rows (a
+    ``○ Explore …`` subagent line, extra spinners) that can push ``❯``
+    past that window — arbitrarily far, since a subagent fan-out adds one
+    row per concurrent subagent. To reach it at any depth without also
+    matching a scrollback echo, a glyph above the window counts only when
+    it's framed by a box rule — the ``────`` closing line the live input
+    box always renders below ``❯`` but a bare echoed prompt never has.
+
+    A bare ``❯`` on a selected numbered menu row is not the chat input. A
+    numbered line with an input-box rule below it still counts, however: the
+    readiness gate runs before every injection, so a restored composer draft
+    may legitimately begin with text such as ``2. buy milk``.
+
     :param pane: Captured pane text from :func:`_capture_pane`.
     :returns: ``True`` when the input box appears mounted.
     """
     non_empty = [line for line in pane.splitlines() if line.strip()]
-    return any(_CLAUDE_PROMPT_GLYPH in line for line in non_empty[-_PROMPT_SCAN_TAIL_LINES:])
+    tail_start = max(0, len(non_empty) - _PROMPT_SCAN_TAIL_LINES)
+    for idx in range(tail_start, len(non_empty)):
+        line = non_empty[idx]
+        if _CLAUDE_PROMPT_GLYPH not in line:
+            continue
+        if not _is_selected_menu_row(line) or any(
+            _is_box_rule(rule) for rule in non_empty[idx + 1 :]
+        ):
+            return True
+    # Above that window, trust the glyph only when a box rule sits below
+    # it — the live input box's closing frame, absent from scrollback.
+    # The footer height scales with concurrent subagents (a fan-out of
+    # ``○ Explore …`` rows), so no fixed window can bound it; the box rule
+    # is a reliable structural signal at any depth, and `capture-pane -p`
+    # returns only the visible pane, so this stays within one screen.
+    for idx, line in enumerate(non_empty):
+        if _CLAUDE_PROMPT_GLYPH not in line:
+            continue
+        if any(_is_box_rule(rule) for rule in non_empty[idx + 1 :]):
+            return True
+    return False
+
+
+def _is_selected_menu_row(line: str) -> bool:
+    """
+    Return whether a ``❯`` line is a selected numbered menu row.
+
+    Claude Code's startup menus (e.g. the "Detected a custom API key"
+    confirmation) mark the highlighted choice with the same ``❯`` glyph the
+    chat input uses (``❯ 2. No (recommended)``). The readiness scan must not
+    treat such a row as the chat composer, or the first message gets typed
+    into the menu. A chat prompt never renders a numbered choice after the
+    glyph, so the ``<glyph> <digit>.`` shape distinguishes them.
+
+    :param line: A single pane line, e.g. ``"❯ 2. No (recommended)"``.
+    :returns: ``True`` when the line is a selected numbered menu choice.
+    """
+    return bool(_SELECTED_MENU_ROW_RE.match(line.strip()))
+
+
+def _is_box_rule(line: str) -> bool:
+    """
+    Return whether a line is a TUI box-drawing horizontal rule.
+
+    Claude Code frames its input box with rows of ``─`` (plus corner
+    glyphs). Such a rule below ``❯`` marks the live input box, letting
+    the readiness scan reach a prompt buried under a tall running-turn
+    footer without matching a bare ``❯`` echoed into scrollback.
+
+    :param line: A single pane line, e.g. ``"──────────"``.
+    :returns: ``True`` when the line is predominantly box-rule glyphs.
+    """
+    stripped = line.strip()
+    return len(stripped) >= 3 and all(ch in _BOX_RULE_CHARS for ch in stripped)
 
 
 def _submit_needle(content: str) -> str:
@@ -2950,25 +3410,47 @@ def _wait_for_claude_prompt_ready(
     :param timeout_s: Seconds to wait for the prompt, e.g. ``30.0``.
     :returns: None.
     :raises RuntimeError: If the prompt never renders within
-        *timeout_s* (Claude failed to boot). The message carries the
-        tail of the captured pane (see :func:`_format_terminal_failure_tail`)
-        so Claude Code's own startup output surfaces in the caller's error.
+        *timeout_s* (Claude failed to boot). The message carries a poll
+        count, how many of those polls saw an empty capture, and the tail
+        of the last non-empty capture the loop actually observed (see
+        :func:`_format_terminal_failure_tail`) so the true failure mode —
+        a startup crash, a torn/empty capture under a mid-turn repaint, or
+        a box that never appeared — is diagnosable from the error alone.
     """
     deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        if _claude_prompt_rendered(_capture_pane(socket_path, tmux_target)):
+    polls = 0
+    empty_polls = 0
+    # Keep the last non-empty capture the loop actually saw, not a fresh
+    # capture taken after the deadline. A post-timeout re-capture can show
+    # a different (often healthier-looking) frame than any decision the
+    # loop made — e.g. the input box repainting just as the turn settles —
+    # which misrepresents why the gate failed. Attaching what was observed
+    # while it mattered keeps the error honest.
+    last_nonempty = ""
+    # Poll at least once even at timeout_s=0: a single readiness check is
+    # still meaningful, and it guarantees a capture to attach on failure.
+    while True:
+        pane = _capture_pane(socket_path, tmux_target)
+        polls += 1
+        if pane.strip():
+            last_nonempty = pane
+        else:
+            empty_polls += 1
+        if _claude_prompt_rendered(pane):
             return
+        if time.monotonic() >= deadline:
+            break
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
-    # Timed out: Claude Code never rendered its input prompt. Capture the
-    # pane one last time and attach its tail so the real cause — often a
-    # startup crash like a ``JSON Parse error`` — surfaces in the web UI
-    # error banner this raises into, instead of only a generic timeout
-    # the user has to open the terminal to diagnose.
-    pane = _capture_pane(socket_path, tmux_target)
+    # Timed out. The poll/empty-capture counts separate the failure modes:
+    # mostly-empty captures point at a torn read under a busy repaint (the
+    # session is alive but capture-pane came back blank); non-empty captures
+    # with no box point at Claude never rendering the prompt (a boot crash,
+    # e.g. a ``JSON Parse error``, whose text the tail then surfaces).
     raise RuntimeError(
         f"Claude Code terminal did not become ready within {timeout_s}s "
-        "(input prompt never rendered). The message was not delivered."
-        + _format_terminal_failure_tail(pane)
+        f"(input prompt never rendered in {polls} polls, "
+        f"{empty_polls} empty captures). The message was not delivered."
+        + _format_terminal_failure_tail(last_nonempty)
     )
 
 

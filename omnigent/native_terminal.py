@@ -62,10 +62,38 @@ async def bind_session_runner(
     :returns: None.
     :raises click.ClickException: If binding fails.
     """
-    resp = await client.patch(
-        f"/v1/sessions/{url_component(session_id)}",
-        json={"runner_id": runner_id},
-    )
+    try:
+        resp = await client.patch(
+            f"/v1/sessions/{url_component(session_id)}",
+            json={"runner_id": runner_id},
+        )
+    except httpx.ConnectError as exc:
+        # Connection refused/reset or DNS failure: the server was never reached.
+        raise click.ClickException(
+            f"Couldn't reach the Omnigent server to bind session {session_id!r} ({exc!r}). "
+            "Check the server URL and your connection."
+        ) from exc
+    except httpx.ConnectTimeout as exc:
+        # Connect phase timed out: also never reached the server (down or wrong
+        # host), so point at the URL/connection rather than server load.
+        raise click.ClickException(
+            f"Couldn't reach the Omnigent server to bind session {session_id!r}: connection "
+            f"timed out ({exc!r}). Check the server URL and your connection."
+        ) from exc
+    except httpx.TimeoutException as exc:
+        # Connected, but the server didn't respond in time: it's reachable and
+        # likely slow rather than down.
+        raise click.ClickException(
+            f"Timed out binding session {session_id!r}: the Omnigent server is responding too "
+            f"slowly ({exc!r}); retry shortly."
+        ) from exc
+    except httpx.TransportError as exc:
+        # Any other transport failure (protocol error, etc.): no response, so
+        # there is no status to report.
+        raise click.ClickException(
+            f"Couldn't reach the Omnigent server to bind session {session_id!r} ({exc!r}). "
+            "Check the server URL and your connection."
+        ) from exc
     if resp.status_code >= 400:
         raise click.ClickException(
             f"Native terminal session runner bind failed ({resp.status_code}): {error_text(resp)}"

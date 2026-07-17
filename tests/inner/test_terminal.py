@@ -16,10 +16,66 @@ import pytest
 import omnigent.inner.terminal as terminal_mod
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from omnigent.inner.terminal import (
+    TERMINAL_TRANSPORT_CONTROL,
+    TERMINAL_TRANSPORT_PTY,
     TerminalInstance,
+    _apply_utf8_locale_default,
+    _has_utf8_locale,
+    _is_utf8_locale_value,
     create_terminal_instance,
+    resolve_terminal_transport,
 )
 from omnigent.runner.identity import RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR
+
+
+def _write_transport_config(config_home: Path, value: str | None) -> None:
+    """Write ``terminal.transport: <value>`` into a scratch config.yaml.
+
+    :param config_home: Directory used as ``OMNIGENT_CONFIG_HOME``.
+    :param value: Transport value to persist, or ``None`` to write a config
+        with no ``terminal`` table.
+    """
+    body = "" if value is None else f"terminal:\n  transport: {value}\n"
+    (config_home / "config.yaml").write_text(body, encoding="utf-8")
+
+
+def test_resolve_terminal_transport_precedence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Override beats spec, spec beats config, config opts out of the control default."""
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+
+    # No config file at all → control mode is the default.
+    assert resolve_terminal_transport() == TERMINAL_TRANSPORT_CONTROL
+
+    # A config with no terminal table → still control.
+    _write_transport_config(tmp_path, None)
+    assert resolve_terminal_transport() == TERMINAL_TRANSPORT_CONTROL
+
+    # terminal.transport opts OUT to the legacy PTY path.
+    _write_transport_config(tmp_path, "pty")
+    assert resolve_terminal_transport() == TERMINAL_TRANSPORT_PTY
+    _write_transport_config(tmp_path, "false")
+    assert resolve_terminal_transport() == TERMINAL_TRANSPORT_PTY
+
+    # A control/ truthy value keeps control mode.
+    _write_transport_config(tmp_path, "control")
+    assert resolve_terminal_transport() == TERMINAL_TRANSPORT_CONTROL
+
+    # Spec beats config: config opts out globally, but this terminal forces control.
+    _write_transport_config(tmp_path, "pty")
+    assert resolve_terminal_transport(spec_transport="control") == TERMINAL_TRANSPORT_CONTROL
+
+    # Per-attach override beats spec.
+    assert (
+        resolve_terminal_transport(override="pty", spec_transport="control")
+        == TERMINAL_TRANSPORT_PTY
+    )
+    # Unrecognized override values fall through to the spec rather than break.
+    assert (
+        resolve_terminal_transport(override="garbage", spec_transport="pty")
+        == TERMINAL_TRANSPORT_PTY
+    )
 
 
 @dataclass
@@ -1267,3 +1323,90 @@ def test_create_terminal_instance_denies_control_socket_but_keeps_private_dir_wr
         )
     finally:
         shutil.rmtree(instance.private_dir, ignore_errors=True)
+
+
+# ── UTF-8 locale default for native TUI panes (issue #2427) ──────────────────
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("C.UTF-8", True),
+        ("en_US.UTF-8", True),
+        ("en_US.utf8", True),
+        ("en_US.UTF8", True),
+        ("de_DE.UTF-8@euro", True),
+        ("C", False),
+        ("POSIX", False),
+        ("en_US", False),
+        ("en_US.ISO-8859-1", False),
+        ("", False),
+        (None, False),
+    ],
+)
+def test_is_utf8_locale_value(value: str | None, expected: bool) -> None:
+    """Only a UTF-8 codeset (after the dot) counts, case/separator-insensitive."""
+    assert _is_utf8_locale_value(value) is expected
+
+
+def test_has_utf8_locale_lc_all_overrides_lang() -> None:
+    """A non-empty LC_ALL wins over LANG per POSIX precedence."""
+    # LC_ALL UTF-8 beats a non-UTF-8 LANG.
+    assert _has_utf8_locale({"LC_ALL": "C.UTF-8", "LANG": "C"}) is True
+    # A pinned non-UTF-8 LC_ALL shadows an otherwise-UTF-8 LANG.
+    assert _has_utf8_locale({"LC_ALL": "C", "LANG": "en_US.UTF-8"}) is False
+    # Empty LC_ALL falls through to LANG.
+    assert _has_utf8_locale({"LC_ALL": "", "LANG": "en_US.UTF-8"}) is True
+
+
+def test_has_utf8_locale_ignores_lc_ctype() -> None:
+    """The affected CLIs read LC_ALL/LANG directly; a UTF-8 LC_CTYPE alone
+    (the CoDA container repro: empty LANG, unset LC_ALL) is not a signal."""
+    assert _has_utf8_locale({"LC_CTYPE": "C.UTF-8", "LANG": ""}) is False
+
+
+def test_apply_utf8_locale_default_fixes_repro_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The repro env (LC_CTYPE=C.UTF-8, empty LANG, no LC_ALL) gets C.UTF-8."""
+    monkeypatch.setattr(terminal_mod, "IS_WINDOWS", False)
+    env = {"LC_CTYPE": "C.UTF-8", "LANG": ""}
+    _apply_utf8_locale_default(env)
+    assert env["LANG"] == "C.UTF-8"
+    assert env["LC_ALL"] == "C.UTF-8"
+    # LC_CTYPE is left untouched.
+    assert env["LC_CTYPE"] == "C.UTF-8"
+
+
+def test_apply_utf8_locale_default_preserves_operator_locale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An operator-provided UTF-8 locale is left exactly as-is."""
+    monkeypatch.setattr(terminal_mod, "IS_WINDOWS", False)
+    env = {"LANG": "en_US.UTF-8"}
+    _apply_utf8_locale_default(env)
+    assert env["LANG"] == "en_US.UTF-8"
+    assert "LC_ALL" not in env
+
+
+def test_apply_utf8_locale_default_corrects_pinned_non_utf8_lc_all(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pinned non-UTF-8 LC_ALL is corrected to C.UTF-8."""
+    monkeypatch.setattr(terminal_mod, "IS_WINDOWS", False)
+    env = {"LC_ALL": "C", "LANG": "C"}
+    _apply_utf8_locale_default(env)
+    assert env["LANG"] == "C.UTF-8"
+    assert env["LC_ALL"] == "C.UTF-8"
+
+
+def test_apply_utf8_locale_default_noop_on_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No-op on Windows: tmux panes are POSIX-only, and forcing a locale onto
+    a Windows operator's env would be wrong."""
+    monkeypatch.setattr(terminal_mod, "IS_WINDOWS", True)
+    env = {"LANG": ""}
+    _apply_utf8_locale_default(env)
+    assert "LC_ALL" not in env
+    assert env["LANG"] == ""

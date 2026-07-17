@@ -328,10 +328,12 @@ def _fastapi_instrumentation_enabled() -> bool:
     return bool(os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "").strip())
 
 
-# Session id as it appears in a request path: ``/v1/sessions/<conv_…>/...``
-# (runner-internal conversations use the ``agy_conv_`` prefix). Used to stamp
-# ``session.id`` onto the auto-created FastAPI server span.
-_SESSION_ID_IN_PATH = re.compile(r"/sessions/((?:agy_)?conv_[0-9a-f]+)")
+# Session id as it appears in a request path (``/v1/sessions/<id>/…``), used to
+# stamp ``session.id`` onto the FastAPI server span. Matches bare 32-char hex
+# plus the legacy ``conv_``/``agy_conv_`` forms so old links keep tagging spans.
+_SESSION_ID_IN_PATH = re.compile(
+    r"/sessions/((?:agy_)?(?:conv_)?[0-9a-f]{32}|(?:agy_)?conv_[0-9a-f]+)"
+)
 
 
 def _fastapi_session_id_hook(span: Any, scope: Mapping[str, Any]) -> None:
@@ -399,10 +401,17 @@ def _instrument_httpx() -> None:
     runner reverse-tunnel (whose transport forwards request headers
     verbatim), and the native-harness policy HTTP hook.
 
+    Disabled when ``OMNIGENT_OTEL_HTTP_CLIENT_INSTRUMENTATION=false``.
+    Set this to suppress internal API call spans (server↔runner↔harness
+    requests) from appearing in the trace backend alongside agent spans.
+
     Idempotent: ``HTTPXClientInstrumentor`` no-ops if already
     instrumented. Failures degrade quietly — tracing is best-effort and
     must never break request handling.
     """
+    explicit = os.environ.get("OMNIGENT_OTEL_HTTP_CLIENT_INSTRUMENTATION")
+    if explicit is not None and explicit.strip().lower() not in ("true", "1", "yes"):
+        return
     try:
         from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
 

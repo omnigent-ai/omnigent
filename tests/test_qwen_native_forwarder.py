@@ -32,9 +32,11 @@ from omnigent.qwen_native_bridge import (
     write_tmux_target,
 )
 from omnigent.qwen_native_forwarder import (
+    _DEDUP_WINDOW,
     _compaction_status_from_record,
     _event_to_item,
     _ForwardState,
+    _new_seen,
     _read_new_compaction_statuses,
     _read_new_events,
     _read_state,
@@ -322,6 +324,35 @@ def test_forward_state_caps_seen_uuids(tmp_path: Path) -> None:
     loaded = _read_state(tmp_path)
     assert len(loaded.seen_uuids or []) == 512
     assert (loaded.seen_uuids or [])[-1] == "999"  # most-recent retained
+
+
+def test_seen_dedup_window_keeps_most_recent_in_insertion_order(tmp_path: Path) -> None:
+    """The persisted dedup window retains the *most recent* uuids, in order.
+
+    Regression: ``seen`` used to be a ``set``, so the forwarder's
+    ``list(seen)`` at persist time was hash-ordered and ``_write_state``'s
+    ``[-_DEDUP_WINDOW:]`` cap kept an arbitrary subset — not the most recent.
+    On a qwen relaunch past ``_DEDUP_WINDOW`` events (offset rewinds to 0 and
+    the file is re-read from the top), recent uuids evicted from the window
+    were re-posted as duplicate bubbles. Building ``seen`` through
+    :func:`_new_seen` (an insertion-ordered ``dict``) keeps the real tail.
+
+    This exercises the forwarder's own reload/persist path — ``_new_seen`` (the
+    line-301 ``seen = _new_seen(persisted.seen_uuids)`` idiom) then
+    ``list(seen)`` — so a revert to a ``set`` fails the ordering assertion here
+    (unlike ``test_forward_state_caps_seen_uuids``, which feeds an
+    already-ordered list straight into ``_write_state`` and so never sees the
+    ordering bug).
+    """
+    uuids = [f"u{i:05d}" for i in range(_DEDUP_WINDOW * 2)]
+    seen = _new_seen(uuids)
+
+    assert _write_state(tmp_path, _ForwardState(offset=7, seen_uuids=list(seen))) is True
+
+    kept = _read_state(tmp_path).seen_uuids or []
+    # The cap must keep the most-recent _DEDUP_WINDOW uuids, in order — not an
+    # arbitrary hash-ordered subset (which a set-backed ``seen`` produced).
+    assert kept == uuids[-_DEDUP_WINDOW:]
 
 
 def test_tmux_target_round_trip(tmp_path: Path) -> None:

@@ -851,18 +851,17 @@ def test_repl_tool_call_refusal_blocks_tool(
     mock_llm_server_url: str,
 ) -> None:
     """
-    TOOL_CALL ASK → refuse → tool NEVER runs → sentinel
-    replaces output → LLM sees sentinel and typically relays
-    that denial to the user.
+    TOOL_CALL ASK → explicit decline → turn aborts → tool NEVER runs.
 
-    Load-bearing: the raw tool output MUST NOT reach the
-    conversation — ``_enforce_tool_result_policy`` substitutes
-    ``[Denied by policy: ...]``. This test is the end-to-end
-    proof that the pre-persistence ordering holds under real
-    streaming + durable-workflow parking. The mock LLM is scripted to emit
-    the ``echo`` ``function_call`` so the TOOL_CALL ASK fires.
+    An explicit refusal (typing "n") now aborts the agent turn rather
+    than feeding a denial marker to the LLM and letting it continue.
+    The tool must never execute: its raw output must not appear in the
+    terminal or reach the mock LLM as a function_call_output.
+
+    The mock LLM is scripted to emit the ``echo`` ``function_call`` so
+    the TOOL_CALL ASK fires. (The follow-up text is never reached: the
+    turn aborts on decline before any second LLM call.)
     """
-    follow_up = "tool-call-refuse-followup-marker"
     _configure_mock_tool_then_text(
         mock_llm_server_url,
         [
@@ -872,7 +871,7 @@ def test_repl_tool_call_refusal_blocks_tool(
                 "arguments": json.dumps({"message": "testing456"}),
             }
         ],
-        follow_up,
+        "tool-call-refuse-followup-marker",
         match="testing456",
     )
     child = pexpect.spawn(
@@ -890,24 +889,21 @@ def test_repl_tool_call_refusal_blocks_tool(
         child.expect("approval required", timeout=45)
         child.send("n" + "\r")
         child.expect("refused", timeout=5)
-        # Sync on the post-tool follow-up reply — the LLM only makes its
-        # second call after the (blocked) tool round-trip completes.
-        child.expect(follow_up, timeout=120)
-        # On a TOOL_CALL-phase refusal the tool never runs: its
-        # function_call_output is a denial marker, NOT the raw echo
-        # output. (The ``[Denied by policy: ...]`` sentinel is the
-        # separate TOOL_RESULT substitution path.) The regression
-        # guard: a denial is recorded AND the raw echo output must
-        # NEVER reach the conversation.
-        joined = _wait_for_function_call_outputs(mock_llm_server_url)
-        assert "denied" in joined.lower(), (
-            "Tool-call denial marker did not appear in the LLM's "
-            "function_call_output — refusal enforcement may have "
-            f"regressed.\nfunction_call_outputs: {joined[:800]}"
+        # Turn is now aborted — wait for the REPL to return to idle.
+        _wait_for_turn_complete(child, timeout=30)
+        # The tool must never have run: raw echo output must not appear
+        # anywhere in the terminal buffer captured so far.
+        assert "echo: testing456" not in child.before, (
+            "Raw tool output appeared in REPL despite refusal — the tool "
+            "ran when it must not have."
         )
+        # The mock LLM must NOT have received a second request carrying a
+        # function_call_output, because the turn was aborted before the
+        # denial reached the LLM.
+        joined = _wait_for_function_call_outputs(mock_llm_server_url, timeout=5.0)
         assert "echo: testing456" not in joined, (
-            "Raw tool output leaked to the LLM despite refusal — the tool "
-            f"ran when it must not have.\nfunction_call_outputs: {joined[:800]}"
+            "Raw tool output leaked to the LLM despite refusal — "
+            f"function_call_outputs: {joined[:800]}"
         )
     finally:
         try:
@@ -1693,11 +1689,11 @@ def test_repl_subagent_tool_call_ask_does_not_tunnel_banner_to_root(
         )
         # No interactive approval banner tunneled to the root REPL —
         # the sub-agent TOOL_CALL ASK is a non-interactive pass-through
-        # today (see #765), exactly like the sub-agent INPUT-phase ASK.
+        # today, exactly like the sub-agent INPUT-phase ASK.
         assert "approval required" not in full_turn, (
             "A sub-agent TOOL_CALL ASK banner surfaced on the root REPL — "
-            "interactive tunneled mid-flight ASK is not implemented (see "
-            "#765); the sub-agent ASK is non-interactive today.\n"
+            "interactive tunneled mid-flight ASK is not implemented; "
+            "the sub-agent ASK is non-interactive today.\n"
             f"Captured:\n{full_turn[:1500]}"
         )
     finally:

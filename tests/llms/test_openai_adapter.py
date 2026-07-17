@@ -586,3 +586,65 @@ def test_parse_responses_event_non_native_item_done_returns_none() -> None:
 
     event = _parse_responses_event("response.output_item.done", {"item": {"type": "message"}})
     assert event is None
+
+
+def test_streamed_400_overflow_classified_as_context_window_exceeded(
+    serve_streamed_response,
+) -> None:
+    """
+    A streamed HTTP 400 buffers the error body before raising so
+    ``classify_llm_error`` can detect context-window overflow.
+
+    End-to-end companion to the ``aread()`` test above: a genuine
+    OpenAI overflow body must survive the streaming error path and
+    classify as ``ContextWindowExceededError`` (not a plain
+    ``PermanentLLMError``) so the workflow can compact and retry.
+
+    Failure meaning: the ``aread()`` guard has been removed and
+    streaming OpenAI overflow errors no longer trigger compaction.
+    """
+    import asyncio
+
+    import httpx
+
+    from omnigent.llms.errors import ContextWindowExceededError
+    from omnigent.runtime.llm_retry import classify_llm_error
+
+    adapter = OpenAICompatibleAdapter(base_url="https://fake-host/v1", api_key_env=None)
+    overflow_body = json.dumps(
+        {
+            "error": {
+                "message": (
+                    "This model's maximum context length is 128000 tokens."
+                    " However, you requested 131015 tokens (127015 in the"
+                    " messages, 4000 in the completion). Please reduce the"
+                    " length of the messages or completion."
+                ),
+                "type": "invalid_request_error",
+                "param": "messages",
+                "code": "context_length_exceeded",
+            }
+        }
+    ).encode()
+    serve_streamed_response(400, overflow_body)
+
+    async def _run() -> Exception:
+        gen = adapter._stream_request(
+            "https://fake-host/v1/chat/completions",
+            {},
+            {"model": "dummy", "stream": True, "messages": []},
+        )
+        try:
+            async for _ in gen:
+                pass
+        except httpx.HTTPStatusError as exc:
+            return classify_llm_error(exc, [429, 500, 502, 503])
+        raise AssertionError("Expected HTTPStatusError was not raised")
+
+    err = asyncio.run(_run())
+
+    assert isinstance(err, ContextWindowExceededError)
+    assert err.max_context_tokens == 128000
+    assert err.actual_tokens == 131015
+    assert err.detail is not None
+    assert "maximum context length" in (err.detail.response_body or "")

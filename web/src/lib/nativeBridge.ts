@@ -28,6 +28,22 @@
 export type SidebarDragPhase = "begin" | "move" | "open" | "close";
 
 /**
+ * Extra hints for the badge on shells that render it as a tappable OS
+ * notification. Android has no numeric icon badge, so the count is surfaced as
+ * a notification — without these it's a dead, generic "N pending" toast. They
+ * let that notification open a target and carry descriptive text. Ignored by
+ * shells with a real icon badge (Electron dock, iOS app icon).
+ */
+export interface BadgeActivation {
+  /** In-app path to open when the badge notification is tapped, e.g. "/inbox". */
+  navigatePath?: string;
+  /** Notification title; falls back to the app name when absent. */
+  title?: string;
+  /** Notification body; falls back to a generic "N pending" when absent. */
+  body?: string;
+}
+
+/**
  * Minimal API surface exposed by native shells. Electron exposes the legacy
  * `window.omnigentDesktop`; newer shells expose `window.omnigentNative`.
  * Kept intentionally tiny and string/number only so it survives bridge
@@ -35,9 +51,14 @@ export type SidebarDragPhase = "begin" | "move" | "open" | "close";
  */
 interface NativeShellApi {
   /** Discriminator so feature detection is unambiguous. */
-  kind: "electron" | "ios";
-  /** Paint the dock/taskbar badge; 0 clears it. */
-  setBadgeCount: (count: number) => void;
+  kind: "electron" | "ios" | "android";
+  /**
+   * Paint the dock/taskbar badge; 0 clears it. `activation` is consumed only by
+   * the Android shell, which renders the badge as a tray notification and needs
+   * a tap target + descriptive text; Electron/iOS paint a real icon badge and
+   * ignore it.
+   */
+  setBadgeCount: (count: number, activation?: BadgeActivation) => void;
   /** Fire an OS notification; resolves true when it was shown. */
   notify: (params: NativeNotifyParams) => Promise<boolean>;
   // Optional: a shell older than this SPA may lack notification-click routing,
@@ -48,6 +69,14 @@ interface NativeShellApi {
    * path the notification carried (its `navigatePath`); returns an unsubscribe.
    */
   onNotificationActivated?: (callback: (path: string) => void) => () => void;
+  /**
+   * Subscribe to deep-link navigations from the desktop shell. When the user
+   * clicks an `omnigent://.../c/<id>` link for a server this window is already
+   * on, the main process sends the in-app path here so the SPA routes to it
+   * in-place (no reload). Same path shape as onNotificationActivated. Absent
+   * on older shells / outside Electron; returns an unsubscribe.
+   */
+  onOpenPath?: (callback: (path: string) => void) => () => void;
   /**
    * Subscribe to native sidebar-drag events. The iOS shell streams a left-edge
    * swipe here (the gesture it repurposed from back-navigation) so the renderer
@@ -114,6 +143,8 @@ export interface NativeViewModeParams {
  */
 interface ElectronDesktopApi extends NativeShellApi {
   kind: "electron";
+  /** Desktop auto-update bridge, absent on shells older than the updater work. */
+  updates?: ElectronUpdateBridge;
   /** Current server origin + recent servers, or null on a foreign page. */
   getServerPicker?: () => Promise<ServerPickerInfo | null>;
   /** Re-point this window to a previously-connected server URL. */
@@ -130,6 +161,17 @@ interface ElectronDesktopApi extends NativeShellApi {
   getCliStatus?: () => Promise<CliStatus | null>;
   /** Clear the CLI-path override (revert to auto-detection); resolves status. */
   resetCliPath?: () => Promise<CliStatus | null>;
+  /**
+   * Open/navigate a conversation's embedded browser view. Present only on
+   * desktop shells new enough to ship the embedded browser feature — its
+   * presence is the capability marker the whole `browser*` suite ships with.
+   */
+  browserOpenOrNavigate?: (
+    conversationId: string,
+    url: string,
+    bounds?: unknown,
+    opts?: { force?: boolean; agent?: boolean },
+  ) => Promise<{ ok: boolean; created?: boolean; error?: string }>;
 }
 
 /** A lifecycle action for the host daemon. */
@@ -165,6 +207,50 @@ export interface HostActionResult {
   error?: string;
 }
 
+export type UpdateMode = "none" | "manual" | "start" | "default";
+
+export interface UpdateConfig {
+  mode: UpdateMode;
+  autoInstall: boolean;
+  skippedVersion: string | null;
+}
+
+export type UpdateStatus =
+  | {
+      state: "idle" | "checking" | "none";
+      info?: undefined;
+      progress?: undefined;
+      lastError?: string;
+    }
+  | {
+      state: "available" | "downloaded";
+      info?: { version: string; releaseNotes?: string };
+      progress?: undefined;
+      lastError?: string;
+    }
+  | {
+      state: "downloading";
+      info?: { version: string; releaseNotes?: string };
+      progress?: { percent: number };
+      lastError?: string;
+    }
+  | {
+      state: "error-security";
+      info?: { version: string; releaseNotes?: string };
+      progress?: undefined;
+      lastError?: string;
+    };
+
+export interface ElectronUpdateBridge {
+  getConfig: () => Promise<UpdateConfig>;
+  getStatus: () => Promise<UpdateStatus>;
+  check: () => Promise<void>;
+  download: () => Promise<void>;
+  installNow: () => Promise<void>;
+  setConfig: (patch: Partial<UpdateConfig>) => Promise<UpdateConfig>;
+  onStatus: (callback: (status: UpdateStatus) => void) => () => void;
+}
+
 /** Data backing the title-bar server picker, from the Electron shell. */
 export interface ServerPickerInfo {
   /** Origin this window is connected to, e.g. `"http://localhost:8000"`. */
@@ -184,13 +270,29 @@ function electronApi(): ElectronDesktopApi | undefined {
 function nativeApi(): NativeShellApi | undefined {
   if (typeof window === "undefined") return undefined;
   const api = (window as unknown as { omnigentNative?: NativeShellApi }).omnigentNative;
-  if (api?.kind === "ios" || api?.kind === "electron") return api;
+  if (api?.kind === "ios" || api?.kind === "android" || api?.kind === "electron") return api;
   return electronApi();
 }
 
 /** True when running inside the Electron desktop shell. */
 export function isElectronShell(): boolean {
   return electronApi() !== undefined;
+}
+
+/** Desktop auto-update bridge, or undefined outside Electron / older shells. */
+export function updateBridge(): ElectronUpdateBridge | undefined {
+  return electronApi()?.updates;
+}
+
+/**
+ * True when the desktop shell is new enough to host the embedded browser pane.
+ * Older installed builds expose `omnigentDesktop` but predate the `browser*`
+ * bridge, so `isElectronShell()` alone would surface a dead Browser tab whose
+ * calls no-op. Probes the foundational browser method (the suite ships
+ * together); false in a plain browser and on shells without the feature.
+ */
+export function supportsBrowser(): boolean {
+  return typeof electronApi()?.browserOpenOrNavigate === "function";
 }
 
 /**
@@ -207,6 +309,17 @@ export function isMacElectronShell(): boolean {
 /** True when running inside the iOS WKWebView native shell. */
 export function isIOSShell(): boolean {
   return nativeApi()?.kind === "ios";
+}
+
+/**
+ * True when running inside the native Android WebView shell. A sibling to
+ * {@link isIOSShell} — deliberately NOT folded into it, since the iOS-only
+ * chrome (viewport lock, native keyboard inset, server switcher) keys off
+ * `isIOSShell()` and must stay off on Android, which uses its own WebView
+ * keyboard/inset behavior and the web in-page fallbacks.
+ */
+export function isAndroidShell(): boolean {
+  return nativeApi()?.kind === "android";
 }
 
 /**
@@ -283,6 +396,29 @@ export function onNativeNotificationActivated(callback: (path: string) => void):
 }
 
 /**
+ * Subscribe to deep-link navigations from the desktop shell. When the user
+ * clicks an `omnigent://.../c/<id>` link for a server this window is already
+ * on, the main process sends the in-app path here so the SPA can route to it
+ * in-place (no reload) — reusing the same router `navigate` a notification
+ * click uses. The path is basename-less (`/c/<id>`); the embedded build's
+ * `basenamedRouting` rebases it under the mount.
+ *
+ * Returns an unsubscribe function. A no-op (returning a no-op unsubscribe)
+ * outside the Electron shell or under a shell too old to support deep-link
+ * routing, so callers can register it unconditionally.
+ */
+export function onOpenPath(callback: (path: string) => void): () => void {
+  const native = nativeApi();
+  if (!native?.onOpenPath) return () => {};
+  try {
+    return native.onOpenPath(callback);
+  } catch (err) {
+    console.warn("[nativeBridge] native onOpenPath failed:", err);
+    return () => {};
+  }
+}
+
+/**
  * Subscribe to native sidebar-drag events from the iOS shell's left-edge swipe
  * (the gesture it repurposed from back-navigation), so the renderer can drive
  * its sidebar as an interactive drawer — tracking the finger on `begin`/`move`
@@ -312,12 +448,20 @@ export function onNativeSidebarDrag(
  * No-op outside the Electron shell. The Electron main process calls
  * `app.setBadgeCount`, which on Windows is unsupported at the app level — we
  * intentionally don't paper over that.
+ *
+ * `activation` is only meaningful on the Android shell, where the badge is a
+ * tray notification: it makes that notification open a target and show
+ * descriptive text. Electron/iOS have a real icon badge and ignore it.
  */
-export async function setBadgeCount(count: number): Promise<void> {
+export async function setBadgeCount(count: number, activation?: BadgeActivation): Promise<void> {
   const native = nativeApi();
   if (!native) return;
   try {
-    native.setBadgeCount(count);
+    // Forward `activation` only when present so shells (and tests) that expect
+    // the single-arg call keep matching; Android reads it to make the badge
+    // notification actionable + descriptive.
+    if (activation) native.setBadgeCount(count, activation);
+    else native.setBadgeCount(count);
   } catch (err) {
     console.warn("[nativeBridge] native setBadgeCount failed:", err);
   }

@@ -23,6 +23,7 @@ from ipaddress import ip_address
 
 from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
 
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runner.transports.ws_tunnel.frames import (
     PingFrame,
@@ -33,6 +34,7 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     encode_frame,
 )
 from omnigent.runner.transports.ws_tunnel.registry import RunnerSession, TunnelRegistry
+from omnigent.server import session_live_state
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.host_registry import RunnerExitReports
 from omnigent.server.routes._auth_helpers import require_user
@@ -44,6 +46,12 @@ PING_INTERVAL_S = 30.0
 PING_MISS_THRESHOLD = 3
 RUNNER_ID_MISMATCH_CLOSE_CODE = 4004
 _ON_RUNNER_CONNECT_TIMEOUT_SEC = 30.0
+
+# Lifetime of a managed runner's minted owner bearer (POST
+# /v1/runners/{id}/token). Short by design: the runner re-mints on demand
+# via its token factory, so a compromised sandbox's credential is usable
+# only briefly, while a live session refreshes indefinitely with no cap.
+_MANAGED_RUNNER_TOKEN_TTL_S = 1800
 
 
 def _is_loopback_websocket_client(ws: WebSocket) -> bool:
@@ -273,6 +281,66 @@ def create_runner_tunnel_router(
             if error is not None:
                 result["error"] = error
         return result
+
+    @router.post("/runners/{runner_id}/token")
+    async def mint_runner_owner_token(request: Request, runner_id: str) -> dict[str, str | int]:
+        """Mint a short-lived owner bearer for a managed-sandbox runner.
+
+        A managed sandbox runner has no user credential of its own; it
+        presents its server-minted tunnel binding token
+        (``X-Omnigent-Runner-Tunnel-Token``) and the server returns a
+        short-lived owner JWT the runner then uses on its HTTP callbacks
+        (which gate on ``require_user``). This is the HTTP analog of the
+        runner tunnel's binding-token handshake: the same SHA-256 gate
+        (``token_bound_runner_id(token) == runner_id``) and the same
+        owner resolution (``resolve_managed_runner_owner``), minting a
+        bearer instead of registering a tunnel.
+
+        The binding-token match is required unconditionally — the
+        allow-list shortcut honored on some other runner-token checks is
+        deliberately NOT accepted here, because this endpoint issues a
+        full owner credential and managed sandboxes always run
+        token-bound (no allow-list).
+
+        :param request: The incoming FastAPI request (carries the binding
+            token header).
+        :param runner_id: Token-bound runner id from the path.
+        :returns: ``{"token": <jwt>, "expires_at": <epoch seconds>}``.
+        :raises OmnigentError: 401 when the binding token is absent,
+            doesn't match ``runner_id``, or resolves to no managed-launch
+            owner; 400 when the active auth mode can't mint server-side
+            (header/proxy, or no auth provider).
+        """
+        if auth_provider is None:
+            # No auth configured: the runner authenticates by binding
+            # token alone and needs no bearer — minting is meaningless.
+            raise OmnigentError(
+                "managed-runner token minting requires an auth provider",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        token = (request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER) or "").strip()
+        if not token or token_bound_runner_id(token) != runner_id:
+            raise OmnigentError("unauthenticated", code=ErrorCode.UNAUTHORIZED)
+        owner: str | None = None
+        if resolve_managed_runner_owner is not None:
+            owner = await asyncio.to_thread(resolve_managed_runner_owner, runner_id)
+        if owner is None:
+            # No managed-launch record bound to this runner id: a peer
+            # with a syntactically valid but unrecognized token. Refuse,
+            # the same fail-closed posture as the tunnel handshake.
+            raise OmnigentError("unauthenticated", code=ErrorCode.UNAUTHORIZED)
+        bearer = auth_provider.mint_runner_token(owner, _MANAGED_RUNNER_TOKEN_TTL_S)
+        if bearer is None:
+            # oidc/accounts mint; header/proxy mode can't (identity is
+            # asserted upstream). Signal clearly rather than 401.
+            raise OmnigentError(
+                "managed-runner token minting is unsupported in this auth mode",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        return {
+            "token": bearer,
+            "expires_at": int(time.time()) + _MANAGED_RUNNER_TOKEN_TTL_S,
+        }
 
     @router.websocket("/runners/{runner_id}/tunnel")
     async def tunnel(ws: WebSocket, runner_id: str) -> None:
@@ -634,6 +702,16 @@ async def _ping_loop(
 ) -> None:
     """Send pings every PING_INTERVAL_S; declare dead after misses.
 
+    Each tick that the runner is still alive also re-stamps
+    ``runner_last_seen`` (``session_live_state.touch_runner_liveness``)
+    so replicas that don't hold this tunnel keep deriving
+    ``runner_online`` from a fresh row instead of their own empty
+    registry. This runs from the per-connection ping loop — inside the
+    tunnel handler's ``workspace_scope`` — rather than a central lifespan
+    sweep, which would run context-free (default workspace) over a
+    workspace-blind registry and stamp no rows on a multi-tenant replica.
+    Mirrors the host tunnel's ``host_store.heartbeat`` refresh.
+
     :param ws: Accepted Starlette WebSocket used only for timeout
         close.
     :param session: Session-generation guard for the ping loop.
@@ -661,6 +739,11 @@ async def _ping_loop(
             except RuntimeError:
                 _logger.debug("Runner %s websocket already closed during ping timeout", runner_id)
             return
+        # Still within the liveness window — refresh the row so the
+        # freshness gate keeps the runner in the online set cross-replica.
+        # Best-effort and deduplicated inside the chokepoint; the enqueue
+        # inherits this handler's workspace scope via copy_context.
+        session_live_state.touch_runner_liveness([runner_id])
         try:
             await registry.send_text(
                 session,

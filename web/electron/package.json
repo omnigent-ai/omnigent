@@ -5,7 +5,15 @@
   "description": "Omnigent desktop shell (Electron edition) — a thin native wrapper around the server-served web UI.",
   "private": true,
   "main": "src/main.js",
-  "author": "Databricks, Inc.",
+  "homepage": "https://omnigent.ai",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/omnigent-ai/omnigent.git"
+  },
+  "author": {
+    "name": "Databricks, Inc.",
+    "email": "support@omnigent.ai"
+  },
   "scripts": {
     "start": "electron .",
     "dev": "electron .",
@@ -26,6 +34,21 @@
     "directories": {
       "output": "dist"
     },
+    "protocols": [
+      {
+        "name": "Omnigent session link",
+        "schemes": [
+          "omnigent"
+        ]
+      }
+    ],
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "omnigent-ai",
+        "repo": "omnigent"
+      }
+    ],
     "afterPack": "build/afterPack.js",
     "files": [
       "src/**/*",
@@ -45,8 +68,8 @@
     "mac": {
       "category": "public.app-category.developer-tools",
       "icon": "icons/icon.icns",
+      "artifactName": "${productName}-${version}-${arch}-mac.${ext}",
       "identity": "Databricks, Inc. (8RMX4WU6F8)",
-      "provisioningProfile": "signing/omnigent.provisionprofile",
       "hardenedRuntime": true,
       "entitlements": "signing/entitlements.mac.plist",
       "entitlementsInherit": "signing/entitlements.mac.inherit.plist",
@@ -59,6 +82,12 @@
       "target": [
         "dmg",
         "zip"
+      ],
+      "publish": [
+        {
+          "provider": "generic",
+          "url": "https://diksk5m140cfbma7.public.blob.vercel-storage.com/mac/"
+        }
       ]
     },
     "dmg": {
@@ -85,19 +114,33 @@
     "linux": {
       "icon": "icons/icon.png",
       "category": "Development",
+      "maintainer": "Databricks, Inc. <support@omnigent.ai>",
       "target": [
         "AppImage",
         "deb"
+      ],
+      "publish": [
+        {
+          "provider": "generic",
+          "url": "https://diksk5m140cfbma7.public.blob.vercel-storage.com/linux/"
+        }
       ]
     },
     "win": {
       "icon": "icons/icon.ico",
       "target": [
         "nsis"
+      ],
+      "publish": [
+        {
+          "provider": "generic",
+          "url": "https://diksk5m140cfbma7.public.blob.vercel-storage.com/win/"
+        }
       ]
     }
   },
   "dependencies": {
+    "electron-updater": "^6.3.9",
     "js-yaml": "^4.2.0"
   }
 }

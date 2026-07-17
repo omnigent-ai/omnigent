@@ -29,9 +29,21 @@ vi.mock("@/hooks/RunnerHealthProvider", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/hooks/RunnerHealthProvider")>()),
   useSessionHostOnline: () => undefined,
 }));
+vi.mock("@/lib/agentLabels", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/agentLabels")>()),
+  useBrainHarnessLabels: () => ({
+    "claude-sdk": "Claude SDK",
+    codex: "Codex",
+    cursor: "Cursor",
+    pi: "Pi",
+    antigravity: "Antigravity",
+    copilot: "Copilot",
+  }),
+}));
 import type { ElicitationBlock } from "@/lib/blocks";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { Composer } from "./ChatPage";
+import { Composer, shouldQueueSend } from "./ChatPage";
+import type { QueuedMessage } from "@/store/chatStore";
 import { SlashCommandMenu } from "@/components/SlashCommandMenu";
 
 // These tests pin the slash-command suggestions menu UX in the composer:
@@ -391,16 +403,12 @@ describe("Composer slash-command submit routing", () => {
     expect(screen.getAllByTestId("model-picker-item").length).toBeGreaterThan(0);
   });
 
-  it("shows the read-only model hint for bare /model on opencode-native", () => {
-    // opencode surfaces showModels (its pill mirrors the live TUI model) but
-    // has no web model options to populate a dropdown. The bare-/model intercept
-    // must NOT fire — opening an empty picker and swallowing the command was the
-    // regression. Instead it falls through to the builtin /model handler, which
-    // surfaces the current model as a read-only hint. ("/model <name>" still
-    // routes to setModel below — opencode reads model_override on the next turn,
-    // so a web switch is functional even though the picker list is empty.)
+  it("opens the server-backed model picker for bare /model on opencode-native", () => {
     const setModel = vi.fn().mockResolvedValue(undefined);
-    useChatStore.setState({ setModel, llmModel: "openrouter/nemotron" });
+    useChatStore.setState({
+      setModel,
+      llmModel: "opencode-go/glm-5.2",
+    });
     const onSend = vi.fn();
     render(
       <Composer
@@ -410,6 +418,7 @@ describe("Composer slash-command submit routing", () => {
           isNativeWrapper: true,
           showModels: true,
           modelPickerKind: "opencode",
+          codexModelOptions: [{ id: "opencode-go/glm-5.2", displayName: "opencode-go/glm-5.2" }],
         })}
       />,
     );
@@ -417,12 +426,11 @@ describe("Composer slash-command submit routing", () => {
     fireEvent.change(ta, { target: { value: "/model " } });
     fireEvent.keyDown(ta, { key: "Enter" });
 
-    // Not sent as plaintext, not a switch, and the (empty) web picker stays shut.
+    // Bare /model opens the picker without sending text or changing the model.
     expect(onSend).not.toHaveBeenCalled();
     expect(setModel).not.toHaveBeenCalled();
-    expect(screen.queryAllByTestId("model-picker-item")).toHaveLength(0);
-    // The builtin handler surfaced the current model as a read-only hint.
-    expect(screen.getByText(/openrouter\/nemotron/)).toBeTruthy();
+    expect(screen.getAllByTestId("model-picker-item")).toHaveLength(1);
+    expect(screen.getByText("opencode-go/glm-5.2")).toBeTruthy();
   });
 
   it("routes /model <name> to setModel on opencode-native (functional switch)", () => {
@@ -516,6 +524,9 @@ describe("AgentPicker trigger label", () => {
       selectedModel: null,
       selectedEffort: null,
       llmModel: null,
+      // Reset the per-session override too: a test that sets it must not leak
+      // into the next, which now reads sessionModelOverride first for the label.
+      sessionModelOverride: null,
       codexModelOptions: [],
       nativeVendorOwnsModel: false,
     });
@@ -546,6 +557,46 @@ describe("AgentPicker trigger label", () => {
     // Model black, effort grey.
     expect(within(trigger).getByText("Opus")).toHaveClass("text-foreground");
     expect(within(trigger).getByText("High")).toHaveClass("text-muted-foreground");
+  });
+
+  it("prefers a claude session override over the cross-session sticky model", () => {
+    useChatStore.setState({
+      selectedModel: "opus",
+      sessionModelOverride: "sonnet",
+      selectedEffort: null,
+      llmModel: "haiku",
+    });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          agents: [{ id: "a1", name: "claude" }],
+          selectedAgentId: "a1",
+          modelPickerKind: "claude",
+          showModels: true,
+          showEffort: false,
+        })}
+      />,
+    );
+
+    const trigger = screen.getByTestId("agent-picker-trigger");
+    expect(trigger).toHaveTextContent("Sonnet 4.6");
+    expect(trigger).not.toHaveTextContent("Opus");
+
+    // Open the picker via the bare-"/model" intercept — a synthetic click on the
+    // Radix trigger doesn't open the menu under jsdom, so the rows never mount.
+    fireEvent.change(textarea(), { target: { value: "/model " } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+
+    const sonnetRow = document.querySelector<HTMLElement>(
+      '[data-testid="model-picker-item"][data-model-id="sonnet"]',
+    );
+    const opusRow = document.querySelector<HTMLElement>(
+      '[data-testid="model-picker-item"][data-model-id="opus"]',
+    );
+    // The applied session override ("sonnet") is the active row, not the
+    // cross-session sticky ("opus").
+    expect(sonnetRow).toHaveAttribute("data-active", "true");
+    expect(opusRow).not.toHaveAttribute("data-active", "true");
   });
 
   it("still renders an enabled trigger when the model/effort label is unresolved", () => {
@@ -1174,5 +1225,72 @@ describe("Composer sub-agent tray", () => {
     // that some tray exists.
     expect(screen.getByText("check-account-eligibility")).toBeTruthy();
     expect(screen.getByText(/Chatting with sub-agent/)).toBeTruthy();
+  });
+});
+
+describe("Composer — queued-message flush gating", () => {
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+    useChatStore.setState({ queuedMessages: [] });
+  });
+
+  // Regression (Polly review 3a): the level-triggered flush effect must NOT
+  // drain the queue while the session is unreachable — flushing would POST
+  // into a void, bypassing onSend's reconnect dialog. It must drain once
+  // reachable again.
+  it("holds the queue while unreachable, then flushes when reachable", async () => {
+    const sendSpy = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({
+      conversationId: "conv_test",
+      boundAgentId: "agent_xyz",
+      status: "idle",
+      sessionStatus: "idle",
+      send: sendSpy,
+      queuedMessages: [{ queueId: "q_1", text: "held", conversationId: "conv_test" }],
+    });
+
+    // Idle + a waiting head, but unreachable → the effect must not flush.
+    const { rerender } = render(<Composer {...composerProps({ unreachable: true })} />);
+    await waitFor(() => expect(sendSpy).not.toHaveBeenCalled());
+    expect(useChatStore.getState().queuedMessages).toHaveLength(1);
+
+    // Becomes reachable → the effect re-fires and drains the head.
+    rerender(<Composer {...composerProps({ unreachable: false })} />);
+    await waitFor(() => expect(sendSpy).toHaveBeenCalledTimes(1));
+    expect(sendSpy.mock.calls[0]!.slice(0, 2)).toEqual(["held", "agent_xyz"]);
+    expect(useChatStore.getState().queuedMessages).toHaveLength(0);
+  });
+});
+
+describe("shouldQueueSend", () => {
+  const q = (conversationId: string): QueuedMessage => ({
+    queueId: `q_${conversationId}`,
+    text: "queued",
+    conversationId,
+  });
+
+  it("sends directly (no queue) for a brand-new chat with no conversation", () => {
+    expect(shouldQueueSend(null, "streaming", "running", [])).toBe(false);
+  });
+
+  it("queues while the session is busy (streaming or running/waiting)", () => {
+    expect(shouldQueueSend("conv_a", "streaming", "idle", [])).toBe(true);
+    expect(shouldQueueSend("conv_a", "idle", "running", [])).toBe(true);
+    expect(shouldQueueSend("conv_a", "idle", "waiting", [])).toBe(true);
+  });
+
+  it("sends directly when idle and nothing is queued for this conversation", () => {
+    expect(shouldQueueSend("conv_a", "idle", "idle", [])).toBe(false);
+  });
+
+  it("queues when idle but this conversation already has a queued message", () => {
+    // The ordering fix: an idle flicker must not let a later send overtake the
+    // still-queued earlier one.
+    expect(shouldQueueSend("conv_a", "idle", "idle", [q("conv_a")])).toBe(true);
+  });
+
+  it("ignores queued messages belonging to a different conversation", () => {
+    expect(shouldQueueSend("conv_a", "idle", "idle", [q("conv_b")])).toBe(false);
   });
 });

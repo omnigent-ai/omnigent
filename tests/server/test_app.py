@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from importlib.metadata import version as _pkg_version
 from pathlib import Path
 
 import httpx
@@ -34,15 +33,20 @@ async def test_health_returns_ok(client: httpx.AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
-async def test_version_returns_installed_package_version(
+async def test_version_returns_source_of_truth_version(
     client: httpx.AsyncClient,
 ) -> None:
-    """GET /api/version returns the installed omnigent package version.
+    """GET /api/version returns ``omnigent.version.VERSION``.
 
-    Compares the endpoint response against ``importlib.metadata.version``
-    directly — confirms the handler forwards the real installed version
-    rather than a hard-coded string.
+    The endpoint surfaces the shared source-of-truth constant, authoritative
+    regardless of how the package was installed. We deliberately do NOT assert
+    against ``importlib.metadata.version`` here: that is a frozen build-time
+    snapshot which can legitimately differ from ``VERSION`` (stale editable
+    install, or ``"source"`` placeholder metadata) — asserting equality would
+    re-couple to exactly the metadata this change moved off of.
     """
+    from omnigent.version import VERSION
+
     resp = await client.get("/api/version")
     assert resp.status_code == 200
     body = resp.json()
@@ -50,49 +54,16 @@ async def test_version_returns_installed_package_version(
     # "version" key must be present — a missing key means the UI's
     # fetchVersion() falls back to "unknown" in every bug report.
     assert "version" in body
-
-    expected = _pkg_version("omnigent")
-    # Exact match against the installed version — confirms the endpoint
-    # calls importlib.metadata.version("omnigent"), not a constant.
-    assert body["version"] == expected, (
-        f"Expected version {expected!r} from importlib.metadata, "
-        f"got {body['version']!r}. If the handler hard-codes a version, "
-        "bug reports will always show the wrong version string."
+    assert body["version"] == VERSION, (
+        f"Expected version {VERSION!r} from omnigent.version.VERSION, got {body['version']!r}."
     )
 
 
-def test_server_version_uses_metadata_when_pep440(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A valid installed package version is the server version source of truth."""
-    monkeypatch.setattr(server_app, "_metadata_omnigent_version", lambda: "0.3.1")
-    monkeypatch.setattr(server_app, "_source_pyproject_version", lambda: "0.3.0.dev0")
+def test_server_version_reads_version_constant() -> None:
+    """The server version is the shared ``omnigent.version.VERSION`` constant."""
+    from omnigent.version import VERSION
 
-    assert server_app._server_version() == "0.3.1"
-
-
-def test_server_version_falls_back_to_pyproject_for_source_metadata(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Source/editable installs can report ``source``; use pyproject's version."""
-    monkeypatch.setattr(server_app, "_metadata_omnigent_version", lambda: "source")
-    monkeypatch.setattr(server_app, "_source_pyproject_version", lambda: "0.3.0.dev0")
-
-    assert server_app._server_version() == "0.3.0.dev0"
-
-
-def test_source_pyproject_version_reads_project_version(tmp_path: Path) -> None:
-    """The pyproject fallback reads the source checkout's ``[project].version``."""
-    repo = tmp_path / "repo"
-    package_file = repo / "omnigent" / "server" / "app.py"
-    package_file.parent.mkdir(parents=True)
-    package_file.write_text("", encoding="utf-8")
-    (repo / "pyproject.toml").write_text(
-        '[project]\nname = "omnigent"\nversion = "0.3.0.dev0"\n',
-        encoding="utf-8",
-    )
-
-    assert server_app._source_pyproject_version(package_file) == "0.3.0.dev0"
+    assert server_app._server_version() == VERSION
 
 
 class _StubWebSocket:
@@ -173,11 +144,13 @@ def _build_liveness_app(
     host_store = HostStore(db_uri)
     artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
     # Online host so a host-bound session reports host_online=True.
-    host_store.upsert_on_connect("host_live", "laptop", "alice@example.com")
+    host_store.upsert_on_connect("2fd786c75c03cfbbec099a6820c08b62", "laptop", "alice@example.com")
     # A host that EXISTS (so the conversations.host_id FK is satisfied) but
     # is offline, for the runner-down + host-offline state.
-    host_store.upsert_on_connect("host_offline", "old-laptop", "alice@example.com")
-    host_store.set_offline("host_offline")
+    host_store.upsert_on_connect(
+        "3d9665477127e41f42de3f4109418173", "old-laptop", "alice@example.com"
+    )
+    host_store.set_offline("3d9665477127e41f42de3f4109418173")
 
     app = create_app(
         agent_store=SqlAlchemyAgentStore(db_uri),
@@ -228,11 +201,11 @@ async def test_health_batch_reports_strict_runner_and_host_liveness(
     _register_live_runner(app, "rnr_live")
     # (b) runner bound but tunnel NOT registered, host online.
     runner_down_host_up = conversation_store.create_conversation(
-        runner_id="rnr_dead", host_id="host_live", workspace="/tmp/ws"
+        runner_id="rnr_dead", host_id="2fd786c75c03cfbbec099a6820c08b62", workspace="/tmp/ws"
     )
     # (c) runner bound but tunnel down, host offline (unknown host id).
     runner_down_host_down = conversation_store.create_conversation(
-        runner_id="rnr_dead2", host_id="host_offline", workspace="/tmp/ws"
+        runner_id="rnr_dead2", host_id="3d9665477127e41f42de3f4109418173", workspace="/tmp/ws"
     )
     # (d) runner bound but tunnel down, NO host binding.
     runner_down_no_host = conversation_store.create_conversation(runner_id="rnr_dead3")
@@ -240,7 +213,7 @@ async def test_health_batch_reports_strict_runner_and_host_liveness(
     # tunnel/host state only — the stopped marker is no longer consulted by
     # liveness. Bind a (down) runner so this isn't the no-runner terminal.
     stopped = conversation_store.create_conversation(
-        runner_id="rnr_dead4", host_id="host_live", workspace="/tmp/ws"
+        runner_id="rnr_dead4", host_id="2fd786c75c03cfbbec099a6820c08b62", workspace="/tmp/ws"
     )
     conversation_store.set_labels(stopped.id, {"omnigent.stopped": "true"})
 
@@ -251,7 +224,7 @@ async def test_health_batch_reports_strict_runner_and_host_liveness(
             runner_down_host_down.id,
             runner_down_no_host.id,
             stopped.id,
-            "conv_unknown",
+            "fee171f70cf25c4cff8203046e727fd4",
         ]
     )
     transport = httpx.ASGITransport(app=app)
@@ -307,7 +280,7 @@ async def test_health_batch_reports_strict_runner_and_host_liveness(
         "host_version": None,
     }
     # Unknown id (no conversation row) ⇒ reachable, no host.
-    assert sessions["conv_unknown"] == {
+    assert sessions["fee171f70cf25c4cff8203046e727fd4"] == {
         "runner_online": True,
         "host_online": None,
         "host_version": None,
@@ -330,7 +303,7 @@ async def test_health_single_session_reports_both_liveness_fields(
     wired = _build_liveness_app(db_uri, tmp_path)
     # Dead runner on a live host: the runner-down-but-host-alive state.
     conv = wired.conversation_store.create_conversation(
-        runner_id="rnr_dead", host_id="host_live", workspace="/tmp/ws"
+        runner_id="rnr_dead", host_id="2fd786c75c03cfbbec099a6820c08b62", workspace="/tmp/ws"
     )
     app = wired.app
 
@@ -375,13 +348,13 @@ async def test_health_reports_host_version_from_live_registry(
     # host_live is already online in the host_store (DB) via the builder;
     # registering it in the in-memory registry is what carries the version.
     app.state.host_registry.register(
-        "host_live",
+        "2fd786c75c03cfbbec099a6820c08b62",
         _StubWebSocket(),
         HostHelloFrame(version="9.9.9-test", frame_protocol_version=1, name="laptop"),
         "alice@example.com",
     )
     conv = wired.conversation_store.create_conversation(
-        runner_id="rnr_dead", host_id="host_live", workspace="/tmp/ws"
+        runner_id="rnr_dead", host_id="2fd786c75c03cfbbec099a6820c08b62", workspace="/tmp/ws"
     )
 
     transport = httpx.ASGITransport(app=app)
@@ -403,17 +376,19 @@ async def test_info_includes_server_version(
     client: httpx.AsyncClient,
 ) -> None:
     """
-    ``GET /v1/info`` includes ``server_version`` — the installed package
-    version (same source as ``/api/version``) — so the web UI can show it
+    ``GET /v1/info`` includes ``server_version`` — the shared ``VERSION``
+    constant (same source as ``/api/version``) — so the web UI can show it
     in the session info popover's version footer without a second fetch.
     """
+    from omnigent.version import VERSION
+
     resp = await client.get("/v1/info")
     assert resp.status_code == 200
     body = resp.json()
-    # Exact match against the installed version confirms the handler reads
-    # importlib.metadata, not a constant — a stale constant would mislead
-    # anyone reading the version off the popover.
-    assert body["server_version"] == _pkg_version("omnigent")
+    # Matches the source-of-truth constant, not importlib.metadata: the latter
+    # is a frozen build-time snapshot that can drift from VERSION in a stale
+    # editable or "source"-placeholder install.
+    assert body["server_version"] == VERSION
 
 
 @pytest.mark.asyncio
@@ -468,7 +443,9 @@ async def test_health_unbound_fork_of_coding_session_reads_offline(
     # Unbound forks: no runner_id, no host_id. The label is the only
     # difference between them.
     coding_fork = conversation_store.create_conversation()
-    conversation_store.set_labels(coding_fork.id, {"omnigent.fork.source_id": "conv_src"})
+    conversation_store.set_labels(
+        coding_fork.id, {"omnigent.fork.source_id": "e9f8f58523cec9a57d3bdf93be543e8c"}
+    )
     chat_fork = conversation_store.create_conversation()
 
     app = create_app(
@@ -1019,3 +996,120 @@ def test_ensure_default_debby_agent_skips_when_bundle_absent(
     )
 
     assert seed_stores.agent_store.get_by_name(server_app._DEBBY_AGENT_NAME) is None
+
+
+def _build_api_only_app(db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FastAPI:
+    """Build an app with the web UI bundle ABSENT (the API-only branch).
+
+    The dev checkout has a built ``static/web-ui`` (so ``create_app`` would
+    mount the SPA), so point ``_WEB_UI_DIST`` at an empty path to force the
+    API-only fallback branch under test.
+    """
+    from omnigent.server.app import create_app
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+    from omnigent.stores.host_store import HostStore
+
+    monkeypatch.setattr(server_app, "_WEB_UI_DIST", tmp_path / "no-web-ui")
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    return create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifact_store,
+        host_store=HostStore(db_uri),
+        agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_api_only_root_serves_html_200_to_any_client(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On a no-web-UI server, ``GET /`` always returns the HTML explainer with a
+    200 — no content negotiation. A browser navigation and a plain JSON client
+    get the same page (``/`` is not used for anything else)."""
+    app = _build_api_only_app(db_uri, tmp_path, monkeypatch)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        for headers in ({"accept": "text/html"}, {"accept": "application/json"}):
+            resp = await c.get("/", headers=headers)
+            assert resp.status_code == 200, headers
+            assert resp.headers["content-type"].startswith("text/html"), headers
+            assert "web UI" in resp.text
+            assert "OMNIGENT_SKIP_WEB_UI" in resp.text
+
+
+@pytest.mark.asyncio
+async def test_api_only_unknown_path_gets_json_404(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unknown path still returns the exact default ``404 {"detail": "Not
+    Found"}`` for every client — the landing is served only at ``/``, never as a
+    catch-all, so API consumers that parse that body are unaffected."""
+    app = _build_api_only_app(db_uri, tmp_path, monkeypatch)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        for headers in ({"accept": "text/html"}, {"accept": "application/json"}):
+            resp = await c.get("/c/4e92b5a0c0ee6db3f874f9c4a3f855a5", headers=headers)
+            assert resp.status_code == 404, headers
+            assert resp.json() == {"detail": "Not Found"}, headers
+
+
+@pytest.mark.asyncio
+async def test_api_only_root_does_not_shadow_real_routes(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ``/`` landing is an exact-path route, so real routes like ``/health``
+    still serve their normal JSON even when the client prefers HTML."""
+    app = _build_api_only_app(db_uri, tmp_path, monkeypatch)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.get("/health", headers={"accept": "text/html"})
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ok"}
+
+
+@pytest.mark.asyncio
+async def test_health_derives_runner_online_from_fresh_row_stamp(
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    """A runner whose tunnel lives on ANOTHER replica reads online here.
+
+    Under host_id replica sharding, the replica holding a runner's tunnel
+    stamps ``conversations.runner_last_seen`` (on connect + each ping-loop
+    tick of that tunnel) and clears it on graceful disconnect. A replica
+    serving ``/health`` with an EMPTY tunnel registry — this app — must
+    derive ``runner_online`` from that stamp's freshness: fresh reads
+    online, past the TTL reads offline (the self-correcting path for an
+    ungraceful host/replica death), cleared reads offline immediately.
+    """
+    import time
+
+    from omnigent.stores.conversation_store import RUNNER_LIVENESS_TTL_S
+
+    wired = _build_liveness_app(db_uri, tmp_path)
+    app = wired.app
+    conversation_store = wired.conversation_store
+
+    fresh = conversation_store.create_conversation(runner_id="rnr_remote_fresh")
+    stale = conversation_store.create_conversation(runner_id="rnr_remote_stale")
+    cleared = conversation_store.create_conversation(runner_id="rnr_remote_cleared")
+    now = int(time.time())
+    conversation_store.touch_runner_liveness(["rnr_remote_fresh"], now=now - 5)
+    conversation_store.touch_runner_liveness(
+        ["rnr_remote_stale"], now=now - RUNNER_LIVENESS_TTL_S - 5
+    )
+    conversation_store.touch_runner_liveness(["rnr_remote_cleared"], now=now - 5)
+    conversation_store.clear_runner_liveness("rnr_remote_cleared")
+
+    ids = ",".join([fresh.id, stale.id, cleared.id])
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.get(f"/health?session_ids={ids}")
+
+    assert resp.status_code == 200
+    sessions = resp.json()["sessions"]
+    assert sessions[fresh.id]["runner_online"] is True
+    assert sessions[stale.id]["runner_online"] is False
+    assert sessions[cleared.id]["runner_online"] is False

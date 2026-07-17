@@ -26,6 +26,7 @@ from omnigent.server.oidc import (
     generate_code_verifier,
     hmac_digest,
     mint_session_cookie,
+    mint_session_token,
 )
 
 # ── PKCE helpers ─────────────────────────────────────────────────
@@ -112,6 +113,44 @@ def test_mint_session_cookie_rejected_with_wrong_secret() -> None:
     wrong_secret = b"b" * 32
     with pytest.raises(jwt.InvalidSignatureError):
         jwt.decode(token, wrong_secret, algorithms=["HS256"])
+
+
+def test_mint_session_token_produces_valid_jwt_with_seconds_ttl() -> None:
+    """The seconds-granularity primitive mints the same HS256 claim shape.
+
+    A managed runner needs a sub-hour owner token; ``mint_session_token``
+    is the seconds-based core the hours-only ``mint_session_cookie``
+    cannot express. The claims must match so the same validator accepts
+    either.
+    """
+    token = mint_session_token(
+        user_id="alice@example.com",
+        cookie_secret=_TEST_SECRET,
+        ttl_seconds=120,
+        provider="accounts",
+    )
+    payload = jwt.decode(token, _TEST_SECRET, algorithms=["HS256"])
+    assert payload["sub"] == "alice@example.com"
+    assert payload["provider"] == "accounts"
+    # exp is ~120 seconds out, not hours.
+    assert time.time() < payload["exp"] <= time.time() + 120 + 5
+
+
+def test_mint_session_token_short_ttl_expires() -> None:
+    """A past TTL yields a token the HS256 validator rejects as expired.
+
+    This is the property that removes the fixed session-length cap: the
+    minted owner token genuinely expires, so the runner must (and does)
+    re-mint — rather than holding one static long-lived credential.
+    """
+    token = mint_session_token(
+        user_id="alice@example.com",
+        cookie_secret=_TEST_SECRET,
+        ttl_seconds=-1,
+        provider="accounts",
+    )
+    with pytest.raises(jwt.ExpiredSignatureError):
+        jwt.decode(token, _TEST_SECRET, algorithms=["HS256"])
 
 
 def test_hmac_digest_is_deterministic() -> None:

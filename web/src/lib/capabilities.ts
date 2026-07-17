@@ -20,9 +20,31 @@
 
 import { hostFetch } from "./host";
 
+/**
+ * Server session-sharing policy (mirrors the backend ``SharingMode``):
+ * ``"on"`` allows grants at any level, ``"read_only"`` caps grants at
+ * view, ``"restricted_read_only"`` also caps at view but the server
+ * additionally blocks sharing sessions whose cwd is a home/root
+ * directory (enforced server-side), and ``"off"`` disables all new
+ * grants (the SPA hides the Share control). Fails open to ``"on"`` for
+ * an unknown/missing value.
+ */
+export type SharingMode = "on" | "read_only" | "restricted_read_only" | "off";
+const _SHARING_MODES: readonly SharingMode[] = ["on", "read_only", "restricted_read_only", "off"];
+
 /** Shape of the response from ``GET /v1/info``. */
 export interface ServerInfo {
   accounts_enabled: boolean;
+  /**
+   * True only on an explicit single-user local runtime
+   * (``OMNIGENT_LOCAL_SINGLE_USER=1``). This is the sole signal that
+   * separates a genuine one-user server from a multi-user header-auth
+   * deploy (e.g. an SSO proxy injecting ``X-Forwarded-Email``) — both
+   * report ``accounts_enabled: false`` / ``login_url: null``. Gates
+   * account/sharing chrome that's meaningless without other users.
+   * Fails to ``false`` (multi-user) so a failed probe never hides it.
+   */
+  single_user: boolean;
   login_url: string | null;
   /**
    * True when accounts mode is on but no admin has been claimed yet —
@@ -57,6 +79,19 @@ export interface ServerInfo {
    */
   sandbox_provider: string | null;
   /**
+   * Server session-sharing policy. Drives whether the SPA shows the
+   * Share control (``"on"``), restricts it to read-only invites
+   * (``"read_only"``), or hides it entirely (``"off"``), in lockstep
+   * with the server-side grant gate. Fails open to ``"on"``.
+   */
+  sharing_mode: SharingMode;
+  /**
+   * Whether public (anyone-with-the-link) read access may be granted.
+   * Independent of ``sharing_mode`` — drives whether the Share modal shows
+   * the "Public access" toggle. Fails open to ``true``.
+   */
+  public_sharing_enabled: boolean;
+  /**
    * Installed omnigent server version (same value as ``/api/version``),
    * e.g. ``"0.3.0.dev0"``. Shown in the session info popover's version
    * footer. ``null`` only when the probe failed (the OFF sentinel) — a
@@ -73,11 +108,17 @@ export interface ServerInfo {
 /** Sentinel used when the probe fails — accounts is off, no login URL. */
 const _OFF: ServerInfo = {
   accounts_enabled: false,
+  // Fail to multi-user: a failed probe must not hide account/sharing chrome.
+  single_user: false,
   login_url: null,
   needs_setup: false,
   databricks_features: false,
   managed_sandboxes_enabled: false,
   sandbox_provider: null,
+  // Sharing fails OPEN (opposite of the other caps): a failed probe must
+  // not silently disable sharing, so the sentinel is the permissive "on".
+  sharing_mode: "on",
+  public_sharing_enabled: true,
   server_version: null,
   smart_routing_enabled: false,
 };
@@ -106,12 +147,18 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
         const data = (await res.json()) as Partial<ServerInfo>;
         _cached = {
           accounts_enabled: data.accounts_enabled === true,
+          single_user: data.single_user === true,
           login_url: typeof data.login_url === "string" ? data.login_url : null,
           needs_setup: data.needs_setup === true,
           databricks_features: data.databricks_features === true,
           managed_sandboxes_enabled: data.managed_sandboxes_enabled === true,
           sandbox_provider:
             typeof data.sandbox_provider === "string" ? data.sandbox_provider : null,
+          sharing_mode: _SHARING_MODES.includes(data.sharing_mode as SharingMode)
+            ? (data.sharing_mode as SharingMode)
+            : "on",
+          // Fail open: only an explicit false disables the public toggle.
+          public_sharing_enabled: data.public_sharing_enabled !== false,
           server_version: typeof data.server_version === "string" ? data.server_version : null,
           smart_routing_enabled: data.smart_routing_enabled === true,
         };
@@ -137,6 +184,19 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
  */
 export function getCachedServerInfo(): ServerInfo | null {
   return _cached;
+}
+
+/**
+ * Whether the server is an explicit single-user local runtime, per the
+ * server's ``single_user`` signal (``OMNIGENT_LOCAL_SINGLE_USER=1``). This
+ * is NOT the same as "no accounts / no login" — a multi-user header-auth
+ * deploy (SSO proxy injecting ``X-Forwarded-Email``) also reports
+ * ``accounts_enabled: false`` / ``login_url: null`` but is genuinely
+ * multi-user, so it must keep its account/sharing chrome. Returns ``false``
+ * while the probe is still loading (and on the failed-probe sentinel).
+ */
+export function isSingleUserMode(info: ServerInfo | "loading"): boolean {
+  return info !== "loading" && info.single_user;
 }
 
 /**

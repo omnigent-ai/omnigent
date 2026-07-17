@@ -35,6 +35,11 @@ from typing import Any
 
 _logger = logging.getLogger(__name__)
 
+# Wall-clock cap for git subprocesses backing the changed-files view. Kept
+# short so a slow/hung repo can't block the panel; each call degrades cleanly
+# on timeout rather than raising. Bump if very large repos need more headroom.
+_GIT_TIMEOUT_SECONDS = 5
+
 
 class GitStatusUnavailable(RuntimeError):
     """A ``git`` invocation backing the changed-files view could not complete.
@@ -711,7 +716,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
                 argv,
                 cwd=str(self._git_root),
                 capture_output=True,
-                timeout=5,
+                timeout=_GIT_TIMEOUT_SECONDS,
             )
         except subprocess.TimeoutExpired as exc:
             elapsed = time.monotonic() - started
@@ -748,6 +753,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
                 f"git status exited {result.returncode}" + (f": {stderr}" if stderr else "")
             )
 
+        numstat = self._run_git_numstat()
         records: list[dict[str, Any]] = []
         for line in result.stdout.decode("utf-8", errors="replace").splitlines():
             parsed = _parse_git_porcelain_line(line)
@@ -764,7 +770,10 @@ class GitFilesystemRegistry(FilesystemRegistry):
             first_component = Path(rel_path).parts[0] if Path(rel_path).parts else ""
             if first_component in _SKIP_DIRS:
                 continue
-            records.append(self._make_record(rel_path, operation))
+            # Counts come only from `git diff HEAD` (via numstat). Files git
+            # doesn't diff — untracked new files, binaries — get no counter.
+            counts = numstat.get(rel_path, (None, None))
+            records.append(self._make_record(rel_path, operation, counts))
 
         records.sort(key=lambda r: (r["modified_at"] or 0, r["path"]), reverse=True)
         return records[:limit]
@@ -802,7 +811,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
                 argv,
                 cwd=str(self._git_root),
                 capture_output=True,
-                timeout=5,
+                timeout=_GIT_TIMEOUT_SECONDS,
             )
         except subprocess.TimeoutExpired as exc:
             elapsed = time.monotonic() - started
@@ -870,7 +879,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
                 ["git", "show", f"HEAD:{git_path}"],
                 cwd=str(self._git_root),
                 capture_output=True,
-                timeout=5,
+                timeout=_GIT_TIMEOUT_SECONDS,
             )
             if result.returncode == 0:
                 return result.stdout.decode("utf-8", errors="replace")
@@ -897,13 +906,22 @@ class GitFilesystemRegistry(FilesystemRegistry):
         except ValueError:
             return None
 
-    def _make_record(self, rel_path: str, operation: str) -> dict[str, Any]:
+    def _make_record(
+        self,
+        rel_path: str,
+        operation: str,
+        line_counts: tuple[int | None, int | None] = (None, None),
+    ) -> dict[str, Any]:
         """Build a file-record dict for *rel_path*.
 
         :param rel_path: Path relative to ``self._cwd``.
         :param operation: One of ``"created"``, ``"modified"``, ``"deleted"``.
-        :returns: File-record dict with ``path``, ``status``, ``bytes``, and
-            ``modified_at`` fields.
+        :param line_counts: ``(lines_added, lines_removed)`` for this file, each
+            ``None`` when unknown (binary file, path missing from numstat, or
+            numstat unavailable). Defaults to ``(None, None)`` so callers that
+            don't need counts (e.g. the diff endpoint) can omit them.
+        :returns: File-record dict with ``path``, ``status``, ``bytes``,
+            ``modified_at``, ``lines_added``, and ``lines_removed`` fields.
         """
         bytes_: int | None = None
         modified_at: int | None = None
@@ -914,7 +932,66 @@ class GitFilesystemRegistry(FilesystemRegistry):
                 modified_at = int(st.st_mtime)
             except OSError:
                 pass
-        return {"path": rel_path, "status": operation, "bytes": bytes_, "modified_at": modified_at}
+        added, removed = line_counts
+        return {
+            "path": rel_path,
+            "status": operation,
+            "bytes": bytes_,
+            "modified_at": modified_at,
+            "lines_added": added,
+            "lines_removed": removed,
+        }
+
+    def _run_git_numstat(self) -> dict[str, tuple[int | None, int | None]]:
+        """Return per-file line counts from ``git diff --numstat HEAD``.
+
+        ``--no-renames`` splits a rename into two independent entries — a full
+        add on the destination path and a full delete on the old path — so the
+        paths line up with ``git status``'s destination-only entries rather than
+        an ``old -> new`` pair. (A pure rename therefore shows ``+N`` on the
+        moved file, not ``(None, None)``.) Binary files report ``-\\t-`` →
+        ``(None, None)``. Paths are keyed cwd-relative via :meth:`_git_to_rel`.
+
+        Never raises: a numstat failure (timeout, spawn error, non-zero exit)
+        returns ``{}`` so the changed-files list still renders with counts
+        degraded to ``None``. This is the sole guard for numstat failures.
+
+        :returns: Map of cwd-relative path → ``(lines_added, lines_removed)``.
+        """
+        argv = ["git", "diff", "--numstat", "--no-renames", "HEAD"]
+        try:
+            result = subprocess.run(
+                argv,
+                cwd=str(self._git_root),
+                capture_output=True,
+                timeout=_GIT_TIMEOUT_SECONDS,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            _logger.warning(
+                "GitFilesystemRegistry._run_git_numstat: %r in %s failed",
+                argv,
+                self._git_root,
+                exc_info=True,
+            )
+            return {}
+        if result.returncode != 0:
+            return {}
+        counts: dict[str, tuple[int | None, int | None]] = {}
+        for line in result.stdout.decode("utf-8", errors="replace").splitlines():
+            fields = line.split("\t")
+            if len(fields) != 3:
+                continue
+            added_s, removed_s, git_path = fields
+            rel_path = self._git_to_rel(_strip_git_quotes(git_path))
+            if rel_path is None:
+                continue
+            try:
+                added = None if added_s == "-" else int(added_s)
+                removed = None if removed_s == "-" else int(removed_s)
+            except ValueError:
+                continue
+            counts[rel_path] = (added, removed)
+        return counts
 
 
 # ── Factory ───────────────────────────────────────────────────────────────────

@@ -99,7 +99,7 @@ async def host_aware_client(
         yield client
 
 
-_HOST_ID = "host_stale_repro"
+_HOST_ID = "9b2ec6de30f5e014c7056afe505510c3"
 
 # How far in the past to push the host's last-seen to model a host
 # that crashed "a while ago". The freshness window (on the order of the
@@ -113,7 +113,7 @@ async def _session_host_online(client: httpx.AsyncClient, session_id: str) -> bo
 
     :param client: Test HTTP client wired to the app.
     :param session_id: Session whose host liveness to read,
-        e.g. ``"conv_abc123"``.
+        e.g. ``"d1f9214d74c38b9f9a9db17ed8352dc4"``.
     :returns: ``True`` when the bound host is online and fresh,
         ``False`` when it is offline/stale, ``None`` when the session
         has no host binding.

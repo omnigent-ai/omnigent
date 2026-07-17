@@ -1495,7 +1495,7 @@ class HarnessApp:
                 # the idle watchdog — not the connectivity error — is what fails
                 # the turn. If such a POST failure was recorded recently, attach
                 # it so the user sees the real cause rather than a generic
-                # "wedged LLM" reason (issue #1119). The window is twice the
+                # "wedged LLM" reason. The window is twice the
                 # idle timeout: the failure that began the stall is already
                 # ~idle_timeout old when the watchdog fires, so a window equal
                 # to the stall would race past it; 2x captures it while still

@@ -24,7 +24,7 @@ from omnigent.stores.host_store import HostStore
 
 pytestmark = pytest.mark.asyncio
 
-_HOST_ID = "host_test_001"
+_HOST_ID = "1444b179a19322377dcc75cf7fcd1bd2"
 _TUNNEL_PATH = f"/v1/hosts/{_HOST_ID}/tunnel"
 
 
@@ -36,7 +36,7 @@ def _websocket_scope(
     """Build an ASGI WebSocket scope for a test path.
 
     :param path: WebSocket path, e.g.
-        ``"/v1/hosts/host_test_001/tunnel"``.
+        ``"/v1/hosts/1444b179a19322377dcc75cf7fcd1bd2/tunnel"``.
     :param client_host: ASGI client host, e.g. ``"127.0.0.1"``.
     :returns: A minimal ASGI WebSocket scope accepted by FastAPI.
     """
@@ -560,7 +560,7 @@ async def test_same_owner_reconnect_still_accepts(db_uri: str) -> None:
 def _managed_scope(path: str, token: str) -> dict[str, object]:
     """Build a WebSocket scope carrying a managed-host launch token.
 
-    :param path: WebSocket path, e.g. ``"/v1/hosts/host_x/tunnel"``.
+    :param path: WebSocket path, e.g. ``"/v1/hosts/5d23e459b50e20479abf5d3fa8e2f936/tunnel"``.
     :param token: Raw launch token for the managed-host header.
     :returns: ASGI WebSocket scope with the token header set.
     """
@@ -636,7 +636,7 @@ async def test_managed_token_authenticates_as_record_owner(
         # never downgrade into the anonymous/local auth path.
         (None, None, "no-such-token", 3600),
         # Token scoped to a DIFFERENT host id than the path.
-        ("host_other_sandbox", "tunnel-token-scoped", "tunnel-token-scoped", 3600),
+        ("33fc174daced5821a9bfb975aa99b086", "tunnel-token-scoped", "tunnel-token-scoped", 3600),
         # Expired token.
         (_HOST_ID, "tunnel-token-expired", "tunnel-token-expired", -1),
     ],

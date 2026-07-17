@@ -98,5 +98,5 @@ def test_child_sessions_sdk_helpers_against_live_server(
 
     # ── subtree_busy: all children are freshly-created with no task → idle →
     # the rollup must read False ("safe to inject your turn"). This is the
-    # deterministic half of issue #444's contract.
+    # deterministic half of the subtree-busy rollup contract.
     assert out["busy"] is False, "subtree_busy should be False when no child has a task"

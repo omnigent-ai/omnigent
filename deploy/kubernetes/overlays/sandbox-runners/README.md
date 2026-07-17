@@ -42,10 +42,11 @@ the generated runner Pod is already restricted-compliant (non-root uid 1000, dro
 
 ## Prerequisites
 
-1. **A server image built with the `kubernetes` extra.** The base image omits
-   it, so `_ensure_sdk()` would fail every launch. Build with
-   `--build-arg OMNIGENT_EXTRAS=kubernetes` (see `deploy/docker`) and set the
-   image in `kustomization.yaml` (`images:` → `newName`/`newTag`).
+1. **A server image built with the `kubernetes` extra.** The overlay's
+   `images:` block already points at the official `omnigent-server-kubernetes`
+   variant, which includes it — nothing to build. If you self-build instead,
+   keep `kubernetes` in `OMNIGENT_EXTRAS` (see `deploy/docker`) or
+   `_ensure_sdk()` fails every launch, and point `images:` at your build.
 2. **Harness credentials.** The runners read their LLM / git credentials from a
    Secret named by `secret_name` (default `omnigent-creds`); you create it out of
    band after applying the overlay — see step 2 of **Apply**. It is deliberately
@@ -130,9 +131,9 @@ writing nothing to disk — use HTTPS repository URLs. Details by provider match
 | `namespace` | Runner-Pod namespace (defaults to `omnigent-sandboxes`). |
 | `secret_name` | Harness-creds Secret projected into every Pod via `envFrom`. |
 | `service_account` | ServiceAccount the runner Pods run as (powerless). |
-| `image` | Optional runner image override (defaults to the official amd64 host image). |
+| `image` | Optional runner image override (defaults to the official multi-arch amd64/arm64 host image). |
 | `env` | Optional list of SERVER env-var names to inject as literal Pod env (prefer `secret_name` for credentials). |
-| `node_selector` | Optional extra node labels, merged with the mandatory `kubernetes.io/arch: amd64`. |
+| `node_selector` | Optional extra node labels, merged with a default `kubernetes.io/arch: amd64` — set that key to `arm64` to schedule runners on arm64 nodes. (arm64 note: the CEL policy module is unavailable there — `cel-expr-python` ships no aarch64 wheel — and degrades gracefully.) |
 | `resources` | Optional `requests` / `limits` (`cpu` / `memory`) override. |
 | `in_cluster` | Optional cluster-config source: `true` (in-cluster SA only), `false` (kubeconfig only), omit (try in-cluster, then kubeconfig). |
 | `kubeconfig` | Optional kubeconfig path for the out-of-cluster fallback (env: `OMNIGENT_KUBERNETES_KUBECONFIG`). |
