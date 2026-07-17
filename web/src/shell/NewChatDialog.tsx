@@ -3302,10 +3302,6 @@ export function NewChatLandingScreen() {
                   hasAgents={agentList.length > 0}
                   host={harnessWarningHost}
                   onSelectAgent={handleSelectAgent}
-                  // Hide the pending (just-created, unsubmitted) custom agent
-                  // row on a sandbox — it can't run there, so it would linger
-                  // as an unselectable entry. Pending state is in-memory only,
-                  // so it's cleared on reload regardless.
                   pendingAgent={pendingAgentAllowedOnTarget ? pendingAgent : null}
                   pendingAgentId={PENDING_AGENT_ID}
                   onSelectPending={handleSelectPending}
