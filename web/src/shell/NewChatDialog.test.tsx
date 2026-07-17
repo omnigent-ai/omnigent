@@ -2331,18 +2331,15 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
     );
   }
 
-  it("disables 'Create custom agent' on a sandbox and does not open the dialog", async () => {
+  it("hides 'Create custom agent' on a sandbox", async () => {
     renderLanding({ managed_sandboxes_enabled: true });
     await selectSandbox();
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    const createItem = screen.getByTestId("new-chat-landing-create-agent");
-    expect(createItem).toHaveAttribute("aria-disabled", "true");
-    // Activating the disabled row must not open the create-agent dialog.
-    fireEvent.click(createItem);
-    expect(screen.queryByTestId("create-agent-dialog")).toBeNull();
+    // The item is omitted entirely on a sandbox target.
+    expect(screen.queryByTestId("new-chat-landing-create-agent")).toBeNull();
   });
 
-  it("keeps 'Create custom agent' enabled on a host and opens the dialog", async () => {
+  it("shows 'Create custom agent' on a host and opens the dialog", async () => {
     renderLanding({ managed_sandboxes_enabled: true });
     // The managed default is the sandbox even with a host present, so switch
     // to the connected host (machine-1) first.
@@ -2358,10 +2355,9 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("machine-1"),
     );
-    // On a host, the create item is enabled and opens the dialog.
+    // On a host, the create item is present and opens the dialog.
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     const createItem = screen.getByTestId("new-chat-landing-create-agent");
-    expect(createItem).not.toHaveAttribute("aria-disabled", "true");
     fireEvent.click(createItem);
     await waitFor(() => expect(screen.getByTestId("create-agent-dialog")).toBeTruthy());
   });

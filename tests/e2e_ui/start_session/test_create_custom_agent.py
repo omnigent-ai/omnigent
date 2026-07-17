@@ -402,20 +402,20 @@ async def _drive_cancel(base_url: str, session_id: str) -> None:
             await browser.close()
 
 
-def test_create_agent_disabled_on_sandbox(
+def test_create_agent_hidden_on_sandbox(
     seeded_session: tuple[str, str],
 ) -> None:
-    """On a managed sandbox target, "Create custom agent" is disabled and inert.
+    """On a managed sandbox target, "Create custom agent" is hidden.
 
     A sandbox provisions its runner from a baked image with no create path for
-    an uploaded bundle, so the affordance is shown disabled (with a tooltip)
-    rather than opening the dialog. Switching to a connected host re-enables it.
+    an uploaded bundle, so the affordance is omitted from the picker. Switching
+    to a connected host brings it back.
     """
     base_url, session_id = seeded_session
-    _run_in_fresh_loop(_drive_disabled_on_sandbox(base_url, session_id))
+    _run_in_fresh_loop(_drive_hidden_on_sandbox(base_url, session_id))
 
 
-async def _drive_disabled_on_sandbox(base_url: str, session_id: str) -> None:
+async def _drive_hidden_on_sandbox(base_url: str, session_id: str) -> None:
     async with async_playwright() as pw:
         browser = await pw.chromium.launch()
         page = await browser.new_page()
@@ -440,16 +440,11 @@ async def _drive_disabled_on_sandbox(base_url: str, session_id: str) -> None:
                 "Databricks Sandbox"
             )
 
-            # On the sandbox, the create item is disabled and does not open the
-            # dialog when activated.
+            # On the sandbox, the create item is omitted from the picker.
             await page.get_by_test_id("new-chat-landing-agent-select").click()
-            create_item = page.get_by_test_id("new-chat-landing-create-agent")
-            await expect(create_item).to_be_visible()
-            await expect(create_item).to_have_attribute("aria-disabled", "true")
-            await create_item.click()
-            await expect(page.get_by_test_id("create-agent-dialog")).to_have_count(0)
+            await expect(page.get_by_test_id("new-chat-landing-create-agent")).to_have_count(0)
 
-            # Switch to the connected host: the item becomes enabled and opens.
+            # Switch to the connected host: the item reappears and opens.
             await page.keyboard.press("Escape")
             await page.get_by_test_id("new-chat-landing-host-chip").click()
             await page.get_by_test_id(f"new-chat-landing-host-{_HOST_ID}").click()
@@ -457,9 +452,9 @@ async def _drive_disabled_on_sandbox(base_url: str, session_id: str) -> None:
                 "Databricks Sandbox"
             )
             await page.get_by_test_id("new-chat-landing-agent-select").click()
-            enabled_item = page.get_by_test_id("new-chat-landing-create-agent")
-            await expect(enabled_item).not_to_have_attribute("aria-disabled", "true")
-            await enabled_item.click()
+            create_item = page.get_by_test_id("new-chat-landing-create-agent")
+            await expect(create_item).to_be_visible()
+            await create_item.click()
             await expect(page.get_by_test_id("create-agent-dialog")).to_be_visible(timeout=5_000)
         finally:
             await browser.close()
