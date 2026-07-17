@@ -60,6 +60,11 @@ class ErrorCode:
     # Keep the string equal to frames.HARNESS_NOT_CONFIGURED_ERROR_CODE —
     # the host's wire error code passes through as the API error code.
     HARNESS_NOT_CONFIGURED = "harness_not_configured"
+    ADMISSION_UNAVAILABLE = "admission_unavailable"
+    ADMISSION_NOT_FOUND = "admission_not_found"
+    ADMISSION_EXPIRED = "admission_expired"
+    ADMISSION_ALREADY_CONSUMED = "admission_already_consumed"
+    ADMISSION_SESSION_MISMATCH = "admission_session_mismatch"
 
 
 # Single source of truth for error code → HTTP status.
@@ -81,6 +86,11 @@ _CODE_TO_HTTP_STATUS: dict[str, int] = {
     # can't satisfy it until the user runs `omnigent setup` there —
     # neither a 400 (input is fine) nor a 503 (a retry won't help).
     ErrorCode.HARNESS_NOT_CONFIGURED: 412,
+    ErrorCode.ADMISSION_UNAVAILABLE: 503,
+    ErrorCode.ADMISSION_NOT_FOUND: 404,
+    ErrorCode.ADMISSION_EXPIRED: 410,
+    ErrorCode.ADMISSION_ALREADY_CONSUMED: 409,
+    ErrorCode.ADMISSION_SESSION_MISMATCH: 409,
 }
 
 

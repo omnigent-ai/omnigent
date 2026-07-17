@@ -7833,6 +7833,20 @@ class _BodyRequest:
         return self._body
 
 
+@dataclasses.dataclass
+class _AdmissionReservation:
+    """One transient FIFO slot reserved before AP policy evaluation."""
+
+    admission_id: str
+    session_id: str
+    input_seq: int
+    disposition: str
+    lineage_id: str
+    active_response_id: str | None
+    expires_at_ms: int
+    expiry_task: asyncio.Task[None] | None = None
+
+
 def create_runner_app(
     *,
     process_manager: HarnessProcessManager | None = None,
@@ -7844,6 +7858,7 @@ def create_runner_app(
     per_session_workspace: bool = True,
     mcp_manager: Any | None = None,
     auth_token: str | None = None,
+    admission_reservation_ttl_seconds: float = 30.0,
 ) -> FastAPI:
     """Build a fresh runner FastAPI app.
 
@@ -7876,8 +7891,14 @@ def create_runner_app(
         request except ``GET /health`` is rejected with 401 if
         the token is missing or wrong.  ``None``
         disables auth (in-process / test path).
+    :param admission_reservation_ttl_seconds: Lifetime of an unconsumed
+        admission reservation. Expiry releases its FIFO slot and later
+        consumption fails with ``admission_expired``.
     """
     import hmac
+
+    if admission_reservation_ttl_seconds <= 0:
+        raise ValueError("admission_reservation_ttl_seconds must be positive")
 
     app = FastAPI(title="omnigent-runner")
 
@@ -8016,6 +8037,15 @@ def create_runner_app(
     _ingest_next_seq: dict[str, int] = {}
     _ingest_now_serving: dict[str, int] = {}
     _ingest_cond: dict[str, asyncio.Condition] = {}
+    # Opt-in admission reservations occupy an ingest sequence until the AP
+    # consumes, cancels, or lets them expire. Only the configured path creates
+    # entries; stock sessions never touch these maps.
+    _admission_reservations: dict[str, _AdmissionReservation] = {}
+    _admission_by_session: dict[str, str] = {}
+    _admission_tombstones: dict[str, tuple[str, str, float]] = {}
+    _session_lineage_ids: dict[str, str] = {}
+    app.state.admission_reservations = _admission_reservations
+    app.state.session_lineage_ids = _session_lineage_ids
     # Closure-local (one per app instance — a module global would leak stale
     # interrupt flags between distinct create_runner_app() instances in the
     # same process). Exposed on app.state below for test inspection.
@@ -8089,6 +8119,10 @@ def create_runner_app(
         :param session_id: Session/conversation identifier.
         :param event: The SSE event dict to enqueue.
         """
+        lineage_id = _session_lineage_ids.get(session_id)
+        if lineage_id is not None and str(event.get("type", "")).startswith("response."):
+            event = dict(event)
+            event.setdefault("lineage_id", lineage_id)
         queue = _session_event_queues.get(session_id)
         if queue is None:
             queue = asyncio.Queue()
@@ -9867,6 +9901,12 @@ def create_runner_app(
         _ingest_next_seq.pop(session_id, None)
         _ingest_now_serving.pop(session_id, None)
         _ingest_cond.pop(session_id, None)
+        admission_id = _admission_by_session.pop(session_id, None)
+        if admission_id is not None:
+            reservation = _admission_reservations.pop(admission_id, None)
+            if reservation is not None and reservation.expiry_task is not None:
+                reservation.expiry_task.cancel()
+        _session_lineage_ids.pop(session_id, None)
         _codex_terminal_ensure_locks.pop(session_id, None)
         _claude_terminal_ensure_locks.pop(session_id, None)
         _pi_terminal_ensure_locks.pop(session_id, None)
@@ -12931,7 +12971,9 @@ def create_runner_app(
         # publishes "running" microseconds later, and the in-between idle
         # otherwise hides the Working indicator on the client.
         # `failed` is always published so a real error is never swallowed.
-        has_buffered = bool(_session_message_buffers.get(conv_id))
+        has_buffered = bool(_session_message_buffers.get(conv_id)) or (
+            _has_pending_continuation_admission(conv_id)
+        )
         was_interrupted = conv_id in _interrupted_sessions
         if was_interrupted:
             _interrupted_sessions.discard(conv_id)
@@ -14856,6 +14898,225 @@ def create_runner_app(
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
+    def _purge_admission_tombstones() -> None:
+        """Drop old one-shot outcomes used only for named retry errors."""
+        now = time.monotonic()
+        for admission_id, (_outcome, _session_id, expires_at) in list(
+            _admission_tombstones.items()
+        ):
+            if expires_at <= now:
+                _admission_tombstones.pop(admission_id, None)
+
+    def _admission_error(code: str, detail: str, status_code: int) -> JSONResponse:
+        """Build a runner error response with a stable machine-readable code."""
+        return JSONResponse(
+            status_code=status_code,
+            content={"error": code, "detail": detail},
+        )
+
+    async def _release_admission(
+        reservation: _AdmissionReservation,
+        *,
+        outcome: str,
+    ) -> bool:
+        """Release a reservation's FIFO slot exactly once."""
+        current = _admission_reservations.get(reservation.admission_id)
+        if current is not reservation:
+            return False
+        _admission_reservations.pop(reservation.admission_id, None)
+        if _admission_by_session.get(reservation.session_id) == reservation.admission_id:
+            _admission_by_session.pop(reservation.session_id, None)
+        expiry_task = reservation.expiry_task
+        if expiry_task is not None and expiry_task is not asyncio.current_task():
+            expiry_task.cancel()
+        _purge_admission_tombstones()
+        _admission_tombstones[reservation.admission_id] = (
+            outcome,
+            reservation.session_id,
+            time.monotonic() + max(60.0, admission_reservation_ttl_seconds * 2),
+        )
+        cond = _ingest_cond.get(reservation.session_id)
+        if cond is not None:
+            async with cond:
+                if _ingest_now_serving.get(reservation.session_id, 0) == reservation.input_seq:
+                    _ingest_now_serving[reservation.session_id] = reservation.input_seq + 1
+                    cond.notify_all()
+        if (
+            outcome in {"cancelled", "expired"}
+            and reservation.disposition != "new_turn"
+            and reservation.session_id not in _active_turns
+            and not _session_message_buffers.get(reservation.session_id)
+        ):
+            # The turn may have ended while AP policy held a continuation
+            # reservation. Its stream-end path deliberately suppressed idle
+            # and sub-agent completion because the reservation promised a
+            # follow-up. If that promise is cancelled or expires, replay the
+            # terminal bookkeeping now that no continuation remains.
+            _on_proxy_stream_end(reservation.session_id)
+        return True
+
+    async def _expire_admission(reservation: _AdmissionReservation) -> None:
+        """Expire one reservation and wake the next FIFO waiter."""
+        delay = max(0.0, (reservation.expires_at_ms - int(time.time() * 1000)) / 1000)
+        await asyncio.sleep(delay)
+        await _release_admission(reservation, outcome="expired")
+
+    def _admission_retry_error(
+        conversation_id: str,
+        admission_id: str,
+    ) -> JSONResponse:
+        """Return the named error for a missing or already-finished id."""
+        active = _admission_reservations.get(admission_id)
+        if active is not None and active.session_id != conversation_id:
+            return _admission_error(
+                "admission_session_mismatch",
+                "Admission reservation belongs to a different session.",
+                409,
+            )
+        _purge_admission_tombstones()
+        tombstone = _admission_tombstones.get(admission_id)
+        if tombstone is None:
+            return _admission_error(
+                "admission_not_found",
+                "Admission reservation was not found on this runner.",
+                404,
+            )
+        outcome, owner_session_id, _expires_at = tombstone
+        if owner_session_id != conversation_id:
+            return _admission_error(
+                "admission_session_mismatch",
+                "Admission reservation belongs to a different session.",
+                409,
+            )
+        if outcome == "consumed":
+            return _admission_error(
+                "admission_already_consumed",
+                "Admission reservation has already been consumed.",
+                409,
+            )
+        if outcome == "expired":
+            return _admission_error(
+                "admission_expired",
+                "Admission reservation has expired.",
+                410,
+            )
+        return _admission_error(
+            "admission_not_found",
+            "Admission reservation has been cancelled.",
+            404,
+        )
+
+    def _has_pending_continuation_admission(conversation_id: str) -> bool:
+        """Whether turn completion must wait for a reserved continuation."""
+        admission_id = _admission_by_session.get(conversation_id)
+        reservation = (
+            _admission_reservations.get(admission_id) if admission_id is not None else None
+        )
+        return reservation is not None and reservation.disposition != "new_turn"
+
+    @app.post(
+        "/v1/sessions/{conversation_id}/admission-reservations",
+        status_code=201,
+    )
+    async def reserve_session_admission(
+        conversation_id: str,
+        request: Request,
+    ) -> JSONResponse:
+        """Reserve the next message's atomic turn-versus-buffer decision."""
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, ValueError):
+            body = None
+        if (
+            not isinstance(body, dict)
+            or body.get("source") != "ap"
+            or body.get("kind") != "user_message"
+        ):
+            return _admission_error(
+                "invalid_request",
+                "Admission reservations require source='ap' and kind='user_message'.",
+                400,
+            )
+
+        seq = _ingest_next_seq.get(conversation_id, 0)
+        _ingest_next_seq[conversation_id] = seq + 1
+        cond = _ingest_cond.get(conversation_id)
+        if cond is None:
+            cond = asyncio.Condition()
+            _ingest_cond[conversation_id] = cond
+        async with cond:
+            while _ingest_now_serving.get(conversation_id, 0) != seq:
+                await cond.wait()
+
+        active_turn = conversation_id in _active_turns
+        active_turn = active_turn or bool(_session_message_buffers.get(conversation_id))
+        if _is_native_harness(conversation_id):
+            active_turn = active_turn or _native_pane_status.get(conversation_id) == "running"
+        if process_manager is not None:
+            active_turn = active_turn or process_manager.has_active_turn(conversation_id)
+
+        if active_turn:
+            can_steer = (
+                not _is_native_harness(conversation_id)
+                and not pending_approvals.has_pending(conversation_id)
+                and conversation_id in _live_response_id
+            )
+            disposition = "active_steer" if can_steer else "next_turn_buffer"
+            lineage_id = _session_lineage_ids.get(conversation_id)
+            if lineage_id is None:
+                lineage_id = f"lin_{uuid.uuid4().hex}"
+                _session_lineage_ids[conversation_id] = lineage_id
+        else:
+            disposition = "new_turn"
+            lineage_id = f"lin_{uuid.uuid4().hex}"
+            _session_lineage_ids[conversation_id] = lineage_id
+
+        admission_id = f"adm_{uuid.uuid4().hex}"
+        expires_at_ms = int(time.time() * 1000 + admission_reservation_ttl_seconds * 1000)
+        reservation = _AdmissionReservation(
+            admission_id=admission_id,
+            session_id=conversation_id,
+            input_seq=seq,
+            disposition=disposition,
+            lineage_id=lineage_id,
+            active_response_id=_live_response_id.get(conversation_id),
+            expires_at_ms=expires_at_ms,
+        )
+        _admission_reservations[admission_id] = reservation
+        _admission_by_session[conversation_id] = admission_id
+        reservation.expiry_task = asyncio.create_task(
+            _expire_admission(reservation),
+            name=f"admission-expiry-{admission_id}",
+        )
+        return JSONResponse(
+            status_code=201,
+            content={
+                "admissionId": admission_id,
+                "inputSeq": seq,
+                "disposition": disposition,
+                "lineageId": lineage_id,
+                "activeResponseId": reservation.active_response_id,
+                "expiresAt": expires_at_ms,
+            },
+        )
+
+    @app.delete(
+        "/v1/sessions/{conversation_id}/admission-reservations/{admission_id}",
+        status_code=204,
+    )
+    async def cancel_session_admission(
+        conversation_id: str,
+        admission_id: str,
+    ) -> Response:
+        """Cancel an unconsumed reservation and release its FIFO slot."""
+        reservation = _admission_reservations.get(admission_id)
+        if reservation is None:
+            return _admission_retry_error(conversation_id, admission_id)
+        if reservation.session_id != conversation_id:
+            return _admission_retry_error(conversation_id, admission_id)
+        await _release_admission(reservation, outcome="cancelled")
+        return Response(status_code=204)
+
     @app.post("/v1/sessions/{conversation_id}/events")
     async def post_session_events(
         conversation_id: str,
@@ -14911,6 +15172,33 @@ def create_runner_app(
 
         body = await request.json()
         body_type = body.get("type") if isinstance(body, dict) else None
+        admission_id = body.get("admissionId") if isinstance(body, dict) else None
+        reservation: _AdmissionReservation | None = None
+        if admission_id is not None:
+            if not isinstance(admission_id, str) or not admission_id:
+                return _admission_error(
+                    "invalid_request",
+                    "admissionId must be a non-empty string.",
+                    400,
+                )
+            reservation = _admission_reservations.get(admission_id)
+            if reservation is None or reservation.session_id != conversation_id:
+                return _admission_retry_error(conversation_id, admission_id)
+            if reservation.expires_at_ms <= int(time.time() * 1000):
+                await _release_admission(reservation, outcome="expired")
+                return _admission_retry_error(conversation_id, admission_id)
+            if body_type not in ("message", None):
+                return _admission_error(
+                    "invalid_request",
+                    "Admission reservations can only be consumed by message events.",
+                    400,
+                )
+            # Crossing this point consumes before TTL even if later event
+            # processing awaits harness setup. Without cancelling now, the
+            # expiry task could release the FIFO slot mid-consume.
+            if reservation.expiry_task is not None:
+                reservation.expiry_task.cancel()
+                reservation.expiry_task = None
         _logger.info(
             "post_session_events: conv=%s type=%s active=%s buffer_len=%d content_types=%s",
             conversation_id,
@@ -14950,15 +15238,22 @@ def create_runner_app(
             # read-incremented synchronously here, before any await, so it
             # reflects arrival order. Content resolution + the decision then
             # run inside the served slot, serialized per conversation.
-            _seq = _ingest_next_seq.get(conversation_id, 0)
-            _ingest_next_seq[conversation_id] = _seq + 1
-            _cond = _ingest_cond.get(conversation_id)
-            if _cond is None:
-                _cond = asyncio.Condition()
-                _ingest_cond[conversation_id] = _cond
-            async with _cond:
-                while _ingest_now_serving.get(conversation_id, 0) != _seq:
-                    await _cond.wait()
+            if reservation is None:
+                _seq = _ingest_next_seq.get(conversation_id, 0)
+                _ingest_next_seq[conversation_id] = _seq + 1
+                _cond = _ingest_cond.get(conversation_id)
+                if _cond is None:
+                    _cond = asyncio.Condition()
+                    _ingest_cond[conversation_id] = _cond
+                async with _cond:
+                    while _ingest_now_serving.get(conversation_id, 0) != _seq:
+                        await _cond.wait()
+            else:
+                _seq = reservation.input_seq
+                _cond = _ingest_cond[conversation_id]
+                async with _cond:
+                    if _ingest_now_serving.get(conversation_id, 0) != _seq:
+                        return _admission_retry_error(conversation_id, admission_id)
             try:
                 _raw_content = message_body.get("content")
                 if isinstance(_raw_content, list):
@@ -14969,7 +15264,10 @@ def create_runner_app(
                     )
 
                 # Turn sequencing gate (invariant I2: single active turn).
-                if conversation_id in _active_turns:
+                reserved_continuation = (
+                    reservation is not None and reservation.disposition != "new_turn"
+                )
+                if conversation_id in _active_turns or reserved_continuation:
                     _native = _is_native_harness(conversation_id)
                     # A turn parked on a human approval must not be steered
                     # past its gate by an incoming message. The non-native
@@ -15000,9 +15298,11 @@ def create_runner_app(
                     # streaming; otherwise it would start a rogue turn (→ 204).
                     # The buffered copy still drives the post-turn continuation.
                     _can_forward = (
-                        not _native
+                        conversation_id in _active_turns
+                        and not _native
                         and not _awaiting_approval
                         and conversation_id in _live_response_id
+                        and (reservation is None or reservation.disposition == "active_steer")
                     )
                     if _can_forward:
                         message_body["injection_id"] = f"inj_{uuid.uuid4().hex[:16]}"
@@ -15065,12 +15365,20 @@ def create_runner_app(
                                 conversation_id,
                                 exc_info=True,
                             )
+                    buffered_content: dict[str, Any] = {
+                        "status": "buffered",
+                        "detail": ("Message buffered; active turn will process it."),
+                    }
+                    if reservation is not None:
+                        buffered_content.update(
+                            {
+                                "admissionId": reservation.admission_id,
+                                "lineageId": reservation.lineage_id,
+                            }
+                        )
                     return JSONResponse(
                         status_code=202,
-                        content={
-                            "status": "buffered",
-                            "detail": ("Message buffered; active turn will process it."),
-                        },
+                        content=buffered_content,
                     )
 
                 # Make the new user message visible to the turn. On the
@@ -15151,20 +15459,31 @@ def create_runner_app(
                 )
                 _background_tasks.add(_turn_task)
 
+                accepted_content: dict[str, Any] = {
+                    "status": "accepted",
+                    "detail": "Turn started.",
+                }
+                if reservation is not None:
+                    accepted_content.update(
+                        {
+                            "admissionId": reservation.admission_id,
+                            "lineageId": reservation.lineage_id,
+                        }
+                    )
                 return JSONResponse(
                     status_code=202,
-                    content={
-                        "status": "accepted",
-                        "detail": "Turn started.",
-                    },
+                    content=accepted_content,
                 )
             finally:
                 # Advance the gate so the next-arriving message for this
                 # conversation proceeds — even if this one raised, so a
                 # failed resolve/decision can't stall later messages.
-                async with _cond:
-                    _ingest_now_serving[conversation_id] = _seq + 1
-                    _cond.notify_all()
+                if reservation is not None:
+                    await _release_admission(reservation, outcome="consumed")
+                else:
+                    async with _cond:
+                        _ingest_now_serving[conversation_id] = _seq + 1
+                        _cond.notify_all()
 
         if body_type == "interrupt":
             # Native harnesses get a key sent to their TUI pane — a forwarded

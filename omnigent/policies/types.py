@@ -32,6 +32,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from omnigent.admission import AdmissionInfo
 from omnigent.spec.types import Phase, PolicyAction, StateUpdate
 
 if TYPE_CHECKING:
@@ -185,6 +186,9 @@ class EvaluationContext:
         ``llm:`` config. The client is shared across all policies
         in one engine; each call should pass ``model`` and
         ``connection_params`` from the engine's resolved config.
+    :param admission: Atomic session-event admission decision for a
+        REQUEST policy. ``None`` on every stock path and on phases that do
+        not start or join a turn.
     """
 
     phase: Phase
@@ -201,6 +205,7 @@ class EvaluationContext:
     harness: str | None = None
     labels: dict[str, str] | None = None
     llm_client: Any = None  # PolicyLLMClient | None — Any to avoid import cycle
+    admission: AdmissionInfo | None = None
 
 
 @dataclass(frozen=True)

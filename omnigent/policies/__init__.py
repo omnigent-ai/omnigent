@@ -24,6 +24,7 @@ artifacts, not declarations that appear in a spec.
 
 from __future__ import annotations
 
+from omnigent.admission import AdmissionInfo
 from omnigent.policies.base import Policy
 from omnigent.policies.function import (
     FunctionPolicy,
@@ -44,6 +45,7 @@ from omnigent.policies.types import (
 )
 
 __all__ = [
+    "AdmissionInfo",
     "ElicitationRequest",
     "EvaluationContext",
     "FunctionPolicy",

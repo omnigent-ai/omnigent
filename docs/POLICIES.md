@@ -8,6 +8,10 @@ Policies are declarative gates that enforce rules on agent behavior. They evalua
 
 Policies compose: multiple policies can be active at once. The engine evaluates them in declaration order. A DENY from any policy short-circuits the rest.
 
+Server embedders that need the runner's atomic turn-versus-buffer decision in a
+REQUEST policy can use the opt-in
+[session-event admission extension](SESSION_EVENT_ADMISSION.md).
+
 ## Who configures policies
 
 Policies are set at three levels. Each level serves a different persona:
