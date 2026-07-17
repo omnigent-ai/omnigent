@@ -25,6 +25,18 @@ from playwright.sync_api import Browser, Page, expect
 # window. Kept local to avoid coupling the test to the exact TS constant.
 _CLOSE_SETTLE_MS = 600
 
+# Dwell time while the pointer sits in the icon→panel gap. A fraction of the
+# 150ms close delay: long enough that a bridge-less (immediate-close) or
+# near-zero-delay implementation would have shut the panel by now, short enough
+# that the real 150ms bridge still holds it open until the pointer lands on the
+# panel and cancels the pending close.
+_GAP_DWELL_MS = 60
+
+# Time for the popover's open animation (``duration-150`` zoom/slide) to settle
+# so ``bounding_box`` reports stable, untransformed geometry. Spent while the
+# pointer still rests on the trigger, so the panel cannot close during it.
+_ANIM_SETTLE_MS = 250
+
 
 def _open_trigger(page: Page) -> Page:
     """Navigate to the seeded chat and wait for the info trigger to mount.
@@ -67,17 +79,52 @@ def test_agent_info_opens_on_hover_and_bridges_to_panel(
     page.goto(f"{base_url}/c/{session_id}")
     _open_trigger(page)
 
+    trigger = page.get_by_test_id("agent-info-trigger")
     panel = page.get_by_test_id("agent-info-panel")
-    # Hover opens without a click.
-    page.get_by_test_id("agent-info-trigger").hover()
+
+    # Hover the icon (real mouse move) — the panel opens without a click.
+    trigger.hover()
+    expect(panel).to_be_visible()
+    # Let the open animation settle so the boxes below are stable geometry.
+    page.wait_for_timeout(_ANIM_SETTLE_MS)
+
+    # The panel is anchored just below the icon (Radix side="bottom",
+    # sideOffset=4), so there's a real vertical gap between them. Walk the
+    # pointer down through that gap in small steps, pausing in the empty space
+    # so a bridge-less implementation has a chance to fire its close, then land
+    # on the panel. If the close-delay bridge were removed, leaving the icon
+    # would schedule an immediate close and the mid-transit assertion (or the
+    # landing) would find the panel already gone.
+    trigger_box = trigger.bounding_box()
+    panel_box = panel.bounding_box()
+    assert trigger_box is not None, "trigger has no bounding box"
+    assert panel_box is not None, "panel has no bounding box"
+
+    # A vertical line at the icon's center x that also lies within the panel's
+    # x-range, so every point on the descent is over either the icon, the gap,
+    # or the panel — never off to the side.
+    cross_x = trigger_box["x"] + trigger_box["width"] / 2
+    assert panel_box["x"] <= cross_x <= panel_box["x"] + panel_box["width"], (
+        "icon center x is not within the panel's x-range; the vertical transit "
+        "would leave the panel's column"
+    )
+    gap_top = trigger_box["y"] + trigger_box["height"]
+    gap_bottom = panel_box["y"]
+    # The gap must be real for the transit to be meaningful; if the panel abutted
+    # or overlapped the icon there'd be nothing to bridge.
+    assert gap_bottom > gap_top, f"expected a gap below the icon, got {gap_top}..{gap_bottom}"
+
+    # Step through the gap, dwelling in the empty middle.
+    page.mouse.move(cross_x, gap_top + (gap_bottom - gap_top) * 0.5)
+    page.wait_for_timeout(_GAP_DWELL_MS)
+    # Still crossing empty space — the bridge must be holding the panel open.
     expect(panel).to_be_visible()
 
-    # Moving the pointer from the icon onto the panel must keep it open: the
-    # leave off the icon schedules a close that entering the panel cancels.
-    panel.hover()
+    # Land on the panel (just inside its top edge) and confirm it's still open,
+    # then dwell well past the close delay: resting on the panel cancels any
+    # pending close, so it must stay open.
+    page.mouse.move(cross_x, panel_box["y"] + 5)
     expect(panel).to_be_visible()
-    # Give any errant close timer time to fire; the panel must still be open
-    # because the pointer is resting on it.
     page.wait_for_timeout(_CLOSE_SETTLE_MS)
     expect(panel).to_be_visible()
 
@@ -116,12 +163,23 @@ def test_agent_info_click_toggles_panel(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """Click opens the panel, and clicking again closes it.
+    """A real mouse click toggles the hover-opened panel shut.
 
-    Uses ``dispatch_event("click")`` so the click fires without Playwright's
-    implicit hover-move first — otherwise the hover would open the panel and the
-    click would toggle it shut, hiding whether click-to-open itself works. This
-    keeps click/keyboard access working independently of the hover wiring.
+    Real-input path chosen: a genuine mouse pointer (``hover`` + ``click``, not
+    ``dispatch_event``), because that is the actual interaction a mouse user
+    has. On a real mouse you cannot press the icon without first moving the
+    pointer onto it, and that move already hover-opens the panel — so the
+    meaningful thing a click does on a mouse is *toggle the open panel shut*.
+    This asserts exactly that against real browser pointer/mouse events:
+
+    1. Hover the icon (real mouse move) → the panel opens.
+    2. Real ``click()`` on the icon → the panel toggles closed and stays closed
+       (the pointer is still on the icon, but a click that lands closed must not
+       immediately re-open — this is the "no double-open" contract).
+
+    The click-to-open direction on a pointer where hover does *not* apply is
+    covered by :func:`test_agent_info_touch_tap_opens_panel`; here the point is
+    that a real click drives the toggle rather than a synthetic DOM event.
 
     :param page: Playwright page fixture (fresh context per test).
     :param seeded_session: ``(base_url, session_id)`` for a pre-created
@@ -134,11 +192,17 @@ def test_agent_info_click_toggles_panel(
     trigger = page.get_by_test_id("agent-info-trigger")
     panel = page.get_by_test_id("agent-info-panel")
 
-    trigger.dispatch_event("click")
+    # A real mouse move onto the icon hover-opens the panel.
+    trigger.hover()
     expect(panel).to_be_visible()
 
-    trigger.dispatch_event("click")
+    # A real click then toggles it shut...
+    trigger.click()
     expect(panel).to_be_hidden(timeout=5_000)
+    # ...and it stays shut: the click cleared the hover-open flag, so the
+    # pointer still resting on the icon must not re-open it.
+    page.wait_for_timeout(_CLOSE_SETTLE_MS)
+    expect(panel).to_be_hidden()
 
 
 @pytest.mark.flaky(reruns=2, reruns_delay=5)
