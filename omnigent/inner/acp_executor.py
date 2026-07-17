@@ -49,6 +49,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import os
 import secrets
 import shlex
@@ -106,7 +107,15 @@ _TOOL_STATUS_COMPLETED = "completed"
 _TOOL_STATUS_FAILED = "failed"
 
 # Idle (time-without-progress) timeouts in seconds.
-_PROMPT_TIMEOUT_SECONDS = 300.0
+# Some ACP agents may remain silent while an external interaction is pending.
+# Parsing is import-time and fail-loud so a malformed value aborts the child.
+_PROMPT_TIMEOUT_ENV = "HARNESS_ACP_PROMPT_TIMEOUT_S"
+try:
+    _PROMPT_TIMEOUT_SECONDS = float(os.environ.get(_PROMPT_TIMEOUT_ENV, "300"))
+except ValueError as exc:
+    raise ValueError(f"{_PROMPT_TIMEOUT_ENV} must be a positive finite number of seconds") from exc
+if not math.isfinite(_PROMPT_TIMEOUT_SECONDS) or _PROMPT_TIMEOUT_SECONDS <= 0:
+    raise ValueError(f"{_PROMPT_TIMEOUT_ENV} must be a positive finite number of seconds")
 _INIT_TIMEOUT_SECONDS = 30.0
 
 # ACP protocol version this executor targets (matches Goose 1.38 / Qwen).
