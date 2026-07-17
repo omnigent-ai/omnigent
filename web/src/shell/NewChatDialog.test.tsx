@@ -2312,3 +2312,57 @@ describe("NewChatLandingScreen agent picker (mobile)", () => {
     expect(screen.queryByTestId("new-chat-landing-agent-config-page")).toBeNull();
   });
 });
+
+describe("NewChatLandingScreen custom-agent sandbox gating", () => {
+  beforeEach(setupLandingMocks);
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+  });
+
+  // Select the managed sandbox as the target. The default mocks give one
+  // online host (auto-selected), so we open the host chip and pick the
+  // sandbox option pinned at the top.
+  async function selectSandbox(): Promise<void> {
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("Sandbox"),
+    );
+  }
+
+  it("disables 'Create custom agent' on a sandbox and does not open the dialog", async () => {
+    renderLanding({ managed_sandboxes_enabled: true });
+    await selectSandbox();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    const createItem = screen.getByTestId("new-chat-landing-create-agent");
+    expect(createItem).toHaveAttribute("aria-disabled", "true");
+    // Activating the disabled row must not open the create-agent dialog.
+    fireEvent.click(createItem);
+    expect(screen.queryByTestId("create-agent-dialog")).toBeNull();
+  });
+
+  it("keeps 'Create custom agent' enabled on a host and opens the dialog", async () => {
+    renderLanding({ managed_sandboxes_enabled: true });
+    // The managed default is the sandbox even with a host present, so switch
+    // to the connected host (machine-1) first.
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("Sandbox"),
+    );
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    const hostItem = screen
+      .getAllByText("machine-1")
+      .find((el) => el.closest('[role="menuitem"]') !== null);
+    expect(hostItem).toBeTruthy();
+    fireEvent.click(hostItem!);
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("machine-1"),
+    );
+    // On a host, the create item is enabled and opens the dialog.
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    const createItem = screen.getByTestId("new-chat-landing-create-agent");
+    expect(createItem).not.toHaveAttribute("aria-disabled", "true");
+    fireEvent.click(createItem);
+    await waitFor(() => expect(screen.getByTestId("create-agent-dialog")).toBeTruthy());
+  });
+});

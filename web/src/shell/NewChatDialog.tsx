@@ -1299,6 +1299,7 @@ function AgentHarnessPicker({
   pendingAgentId,
   onSelectPending,
   onCreateCustomAgent,
+  sandboxSelected,
   permissionMode,
   approvalMode,
   cursorExecMode,
@@ -1326,6 +1327,11 @@ function AgentHarnessPicker({
   pendingAgentId: string;
   onSelectPending: () => void;
   onCreateCustomAgent: () => void;
+  // When a managed sandbox is the target, custom-agent creation is disabled:
+  // the sandbox create path doesn't provision a runner for a bundled agent, so
+  // the "Create custom agent" item is shown disabled with an explanatory
+  // tooltip rather than opening the dialog.
+  sandboxSelected: boolean;
   permissionMode: string;
   approvalMode: string;
   cursorExecMode: string;
@@ -1727,14 +1733,52 @@ function AgentHarnessPicker({
                 </div>
               </DropdownMenuItem>
             )}
-            <DropdownMenuItem
-              data-testid="new-chat-landing-create-agent"
-              onSelect={onCreateCustomAgent}
-              className="gap-2 rounded-sm px-2 py-1.5 text-13 text-muted-foreground"
-            >
-              <PlusIcon className="size-3.5" />
-              Create custom agent
-            </DropdownMenuItem>
+            {sandboxSelected ? (
+              // A managed sandbox provisions its runner from a baked image and
+              // has no create path for an uploaded bundle, so custom-agent
+              // creation isn't offered there. Keep the row visible but disabled
+              // (with a why-tooltip) rather than hiding it, so the affordance
+              // stays discoverable — mirrors the disabled New-Sandbox row.
+              <DropdownMenuItem
+                data-testid="new-chat-landing-create-agent"
+                aria-disabled="true"
+                onSelect={(e) => e.preventDefault()}
+                className="flex items-center justify-between gap-2 rounded-sm px-2 py-1.5 text-13 text-muted-foreground opacity-60"
+              >
+                <span className="flex items-center gap-2">
+                  <PlusIcon className="size-3.5" />
+                  Create custom agent
+                </span>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <button
+                      type="button"
+                      className="inline-flex size-4 items-center justify-center rounded-sm text-muted-foreground/80 hover:text-foreground"
+                      aria-label="Why custom agents are unavailable on a sandbox"
+                      onClick={(e) => e.stopPropagation()}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") e.stopPropagation();
+                      }}
+                    >
+                      <CircleHelpIcon className="size-3.5" />
+                    </button>
+                  </TooltipTrigger>
+                  <TooltipContent className="max-w-64">
+                    Custom agents aren&apos;t available on a sandbox. Select a connected host to
+                    create one.
+                  </TooltipContent>
+                </Tooltip>
+              </DropdownMenuItem>
+            ) : (
+              <DropdownMenuItem
+                data-testid="new-chat-landing-create-agent"
+                onSelect={onCreateCustomAgent}
+                className="gap-2 rounded-sm px-2 py-1.5 text-13 text-muted-foreground"
+              >
+                <PlusIcon className="size-3.5" />
+                Create custom agent
+              </DropdownMenuItem>
+            )}
           </>
         )}
       </DropdownMenuContent>
@@ -3294,6 +3338,7 @@ export function NewChatLandingScreen() {
                   pendingAgentId={PENDING_AGENT_ID}
                   onSelectPending={handleSelectPending}
                   onCreateCustomAgent={() => setCreateAgentOpen(true)}
+                  sandboxSelected={sandboxSelected}
                   permissionMode={permissionMode}
                   approvalMode={approvalMode}
                   cursorExecMode={cursorExecMode}
