@@ -5,11 +5,10 @@ outbound WebSocket. The server sends control frames
 (launch/stop runner) over the tunnel; the host process spawns
 or terminates runner subprocesses accordingly.
 
-Per ``designs/DAEMON_API.md``, the host sends a ``host.hello``
-frame on connect advertising its version, name, and live runner
-IDs, then reports readiness changes while connected. The server
-validates ``frame_protocol_version`` for version-skew enforcement
-(strict-major).
+The host sends a ``host.hello`` frame on connect advertising its
+version, name, live runner IDs, and harness readiness, then reports
+readiness changes while connected. The server validates
+``frame_protocol_version`` for version-skew enforcement (strict-major).
 
 The endpoint registers the host in the :class:`HostRegistry`
 (in-memory, per-replica) and upserts the host in the ``hosts``
@@ -106,7 +105,7 @@ def create_host_tunnel_router(
     :param on_host_disconnect: Optional async callback fired when
         a host's tunnel closes. Receives the ``host_id``.
     :param on_host_update: Optional async callback fired when a connected
-        host reports changed harness readiness. Receives the ``host_id``.
+        host reports changed harness readiness. Receives ``host_id`` and owner.
     :param local_single_user: When ``True``, allow a host to re-own a
         ``host_id`` already registered under a different owner — needed
         only for the single-user loopback local server, where the owner

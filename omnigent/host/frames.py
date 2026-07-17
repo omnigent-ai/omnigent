@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-HarnessAvailability = bool | str
+from omnigent.harness_availability import HarnessAvailability, is_harness_availability
 
 # Structured error code carried in ``HostLaunchRunnerResultFrame.error_code``
 # when the host refuses a launch because the session's harness is not
@@ -82,8 +82,9 @@ class HostHelloFrame:
         (see ``omnigent.onboarding.harness_readiness``). Keys
         cover every accepted harness spelling. ``None`` means
         unknown (an older host that doesn't report it) — never
-        treat ``None`` as "nothing is configured". Refreshed while
-        connected; the launch-time check is authoritative.
+        treat ``None`` as "nothing is configured". Changes arrive in
+        :class:`HostHarnessReadinessFrame`; launch-time checks remain
+        authoritative.
     """
 
     version: str
@@ -1056,6 +1057,11 @@ def _decode_harness_readiness(msg: dict[str, Any]) -> HostHarnessReadinessFrame:
     configured_harnesses = _optional_str_availability_map(msg, "configured_harnesses")
     if configured_harnesses is None:
         raise ValueError("harness readiness frame requires a configured_harnesses object")
+    raw = msg["configured_harnesses"]
+    if len(configured_harnesses) != len(raw):
+        raise ValueError("harness readiness frame contains an unsupported availability state")
+    if not configured_harnesses:
+        raise ValueError("harness readiness frame requires a non-empty configured_harnesses map")
     return HostHarnessReadinessFrame(configured_harnesses=configured_harnesses)
 
 
@@ -1484,7 +1490,7 @@ def _optional_str_availability_map(
     Tolerant by design: absent, null, or non-mapping values all decode
     to ``None`` ("unknown") rather than raising, so an older or newer
     peer's hello never breaks the tunnel handshake. Entries with a
-    non-string key or non-bool/string value are dropped for the same reason.
+    non-string key or unsupported readiness value are dropped for the same reason.
 
     :param msg: Decoded frame object.
     :param key: Field name, e.g. ``"configured_harnesses"``.
@@ -1494,7 +1500,7 @@ def _optional_str_availability_map(
     val = msg.get(key)
     if not isinstance(val, dict):
         return None
-    return {k: v for k, v in val.items() if isinstance(k, str) and isinstance(v, (bool, str))}
+    return {k: v for k, v in val.items() if isinstance(k, str) and is_harness_availability(v)}
 
 
 def _optional_nullable_str(msg: dict[str, Any], key: str) -> str | None:

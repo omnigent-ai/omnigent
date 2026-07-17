@@ -211,6 +211,33 @@ def test_malformed_configured_harnesses_column_reads_as_none(
     assert fetched.configured_harnesses is None
 
 
+def test_host_store_drops_unknown_harness_availability(
+    host_store: HostStore,
+    db_uri: str,
+) -> None:
+    """Persisted readiness maps retain only states supported by the wire contract."""
+    host_id = "7c1e25b5bfa49cb0cfb4fb1ed86333fb"
+    host_store.upsert_on_connect(
+        host_id=host_id,
+        name="laptop-readiness",
+        owner="alice@example.com",
+        configured_harnesses={"codex": "needs-auth"},
+    )
+    engine = get_or_create_engine(db_uri)
+    with Session(engine) as session:
+        session.execute(
+            update(SqlHost)
+            .where(SqlHost.host_id == host_id)
+            .values(configured_harnesses='{"codex":"needs-auth","pi":"future-state"}')
+        )
+        session.commit()
+
+    fetched = host_store.get_host(host_id)
+
+    assert fetched is not None
+    assert fetched.configured_harnesses == {"codex": "needs-auth"}
+
+
 def test_reconnect_with_rotated_host_id_repoints_bound_conversations(
     host_store: HostStore,
     db_uri: str,

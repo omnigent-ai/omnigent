@@ -24,6 +24,7 @@ from websockets.exceptions import InvalidStatus, InvalidURI
 
 from omnigent._platform import WINDOWS_ENV_PASSTHROUGH
 from omnigent.env_credentials import env_names_with_omnigent_prefix
+from omnigent.harness_availability import HARNESS_BINARY_MISSING, HarnessAvailability
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     HostCreateDirFrame,
@@ -94,16 +95,18 @@ from omnigent.version import VERSION
 
 _logger = logging.getLogger(__name__)
 
+# Binary appearance is cheap to probe, so new CLI installs surface quickly.
 HARNESS_READINESS_REFRESH_INTERVAL_S = 5.0
+# Auth changes and removals need the full, potentially expensive readiness map.
 HARNESS_READINESS_FULL_REFRESH_INTERVAL_S = 60.0
 
 
 def _unavailable_harness_became_ready(
-    previous: Mapping[str, bool | str],
+    previous: Mapping[str, HarnessAvailability],
 ) -> bool:
-    """Return whether a previously missing CLI-backed harness is now ready."""
+    """Detect newly available binaries; auth changes wait for the full refresh."""
     return any(
-        (availability is False or availability == "binary-missing")
+        (availability is False or availability == HARNESS_BINARY_MISSING)
         and harness_is_configured(harness)
         for harness, availability in previous.items()
     )

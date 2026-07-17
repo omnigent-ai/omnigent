@@ -513,6 +513,54 @@ async def test_live_host_refreshes_harness_readiness_without_reconnect(
     assert refresh.configured_harnesses == {"pi": True}
 
 
+async def test_live_host_full_refresh_detects_auth_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The full-refresh fallback catches readiness changes beyond binary installs."""
+    readiness = iter(({"codex": "needs-auth"}, {"codex": True}))
+    monkeypatch.setattr(
+        "omnigent.host.connect.configured_harness_map",
+        lambda: next(readiness),
+    )
+    monkeypatch.setattr(
+        "omnigent.host.connect.HARNESS_READINESS_FULL_REFRESH_INTERVAL_S",
+        0.01,
+    )
+    host = _make_host_process()
+    tunnel = _ReadinessChangingTunnel()
+
+    with pytest.raises(ConnectionError, match="test disconnect"):
+        await host._serve_frames(tunnel)  # type: ignore[arg-type] — duck-typed ws
+
+    assert len(tunnel.sent) == 2
+    refresh = decode_host_frame(tunnel.sent[1])
+    assert isinstance(refresh, HostHarnessReadinessFrame)
+    assert refresh.configured_harnesses == {"codex": True}
+
+
+async def test_live_host_does_not_repeat_unchanged_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A periodic full refresh sends nothing when the readiness map is unchanged."""
+    readiness = iter(({"codex": "needs-auth"}, {"codex": "needs-auth"}))
+    monkeypatch.setattr(
+        "omnigent.host.connect.configured_harness_map",
+        lambda: next(readiness),
+    )
+    monkeypatch.setattr(
+        "omnigent.host.connect.HARNESS_READINESS_FULL_REFRESH_INTERVAL_S",
+        0.01,
+    )
+    host = _make_host_process()
+    tunnel = _ReadinessChangingTunnel()
+
+    with pytest.raises(ConnectionError, match="test disconnect"):
+        await host._serve_frames(tunnel)  # type: ignore[arg-type] — duck-typed ws
+
+    assert len(tunnel.sent) == 1
+    assert isinstance(decode_host_frame(tunnel.sent[0]), HostHelloFrame)
+
+
 async def test_handle_launch_immediate_exit_reports_exit_code_and_log_tail(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

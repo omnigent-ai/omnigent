@@ -30,6 +30,10 @@ from collections.abc import Callable
 
 import omnigent.onboarding.gemini_auth as _gemini_auth
 from omnigent.harness_aliases import HARNESS_ALIASES, canonicalize_harness
+from omnigent.harness_availability import (
+    CODEX_CANONICAL_HARNESSES,
+    HarnessAvailability,
+)
 from omnigent.harness_plugins import harness_install_keys, valid_harnesses
 from omnigent.onboarding.harness_install import (
     COPILOT_KEY,
@@ -51,8 +55,6 @@ from omnigent.onboarding.provider_config import (
     OPENAI_FAMILY,
     PI_SURFACE,
 )
-
-HarnessAvailability = bool | str
 
 # In-process SDK harnesses: no CLI binary, credentials resolved at runtime
 # from ambient/spec sources the daemon can't see. Never gated. Includes both
@@ -289,14 +291,18 @@ def harness_is_configured(harness: str) -> bool:
 
 def _harness_availability(canonical: str) -> HarnessAvailability:
     """Return picker-facing availability for one canonical harness spelling."""
-    if (
-        canonical in {"codex", "codex-native", "native-codex"}
-        and _HARNESS_FAMILY.get(canonical) == OPENAI_FAMILY
-    ):
+    if _is_codex_family_harness(canonical):
         from omnigent.codex_native import _codex_auth_unavailable_reason
 
         return _codex_auth_unavailable_reason() or True
     return harness_is_configured(canonical)
+
+
+def _is_codex_family_harness(canonical: str) -> bool:
+    """Return whether a canonical harness uses Codex readiness semantics."""
+    return (
+        canonical in CODEX_CANONICAL_HARNESSES and _HARNESS_FAMILY.get(canonical) == OPENAI_FAMILY
+    )
 
 
 def configured_harness_map() -> dict[str, HarnessAvailability]:
@@ -335,11 +341,7 @@ def configured_harness_map() -> dict[str, HarnessAvailability]:
     result: dict[str, HarnessAvailability] = {}
     for spelling in spellings:
         canonical = _canonical_harness(spelling)
-        cache_key = (
-            ("codex",)
-            if canonical in {"codex", "codex-native", "native-codex"}
-            else ("harness", canonical)
-        )
+        cache_key = ("codex",) if _is_codex_family_harness(canonical) else ("harness", canonical)
         if cache_key not in availability_cache:
             availability_cache[cache_key] = _harness_availability(canonical)
         result[spelling] = availability_cache[cache_key]

@@ -207,6 +207,48 @@ def test_harness_readiness_frame_round_trip() -> None:
     assert decoded.configured_harnesses == {"pi": True, "codex": "needs-auth"}
 
 
+def test_harness_readiness_frame_rejects_unknown_availability() -> None:
+    """Unknown readiness states cannot partially replace the live map."""
+    encoded = json.dumps(
+        {
+            "kind": "host.harness_readiness",
+            "configured_harnesses": {
+                "pi": "future-state",
+                "codex": "needs-auth",
+            },
+        }
+    )
+
+    with pytest.raises(ValueError, match="unsupported availability state"):
+        decode_host_frame(encoded)
+
+
+def test_harness_readiness_frame_requires_object_map() -> None:
+    """A malformed live refresh is rejected instead of clearing known readiness."""
+    encoded = json.dumps(
+        {
+            "kind": "host.harness_readiness",
+            "configured_harnesses": ["pi"],
+        }
+    )
+
+    with pytest.raises(ValueError, match="requires a configured_harnesses object"):
+        decode_host_frame(encoded)
+
+
+def test_harness_readiness_frame_rejects_empty_map() -> None:
+    """An empty refresh cannot erase the host's last complete readiness map."""
+    encoded = json.dumps(
+        {
+            "kind": "host.harness_readiness",
+            "configured_harnesses": {},
+        }
+    )
+
+    with pytest.raises(ValueError, match="requires a non-empty configured_harnesses map"):
+        decode_host_frame(encoded)
+
+
 def test_hello_frame_legacy_payload_decodes_unknown_harnesses() -> None:
     """
     Verify a hello payload from an OLDER host (no configured_harnesses
