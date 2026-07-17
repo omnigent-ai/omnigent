@@ -158,53 +158,6 @@ jobs:
             echo "available=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Set up uv
-        if: steps.creds.outputs.available == 'true'
-        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
-        with:
-          enable-cache: true
-
-      - name: Cache virtualenv
-        if: steps.creds.outputs.available == 'true'
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
-        with:
-          path: omnigent/.venv
-          key: venv-${{ runner.os }}-${{ hashFiles('omnigent/.python-version') }}-${{ hashFiles('omnigent/uv.lock') }}
-
-      - name: Install dependencies
-        if: steps.creds.outputs.available == 'true'
-        working-directory: omnigent
-        run: uv sync --extra all --extra dev
-
-      - name: Install Claude Code CLI
-        if: steps.creds.outputs.available == 'true'
-        env:
-          NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
-        run: |
-          mkdir -p "${GITHUB_WORKSPACE}/.cc-cli" && cd "${GITHUB_WORKSPACE}/.cc-cli"
-          npm install --ignore-scripts --no-audit --no-fund @anthropic-ai/claude-code@2.1.170
-          node node_modules/@anthropic-ai/claude-code/install.cjs
-          echo "${GITHUB_WORKSPACE}/.cc-cli/node_modules/.bin" >> "$GITHUB_PATH"
-
-      - name: Write Omnigent provider config
-        if: steps.creds.outputs.available == 'true'
-        env:
-          GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
-        run: |
-          mkdir -p "$HOME/.omnigent"
-          python3 -c "
-          import pathlib, os, json
-          gw = os.environ['GATEWAY_BASE_URL']
-          cfg = {'providers': {'databricks-gateway': {
-              'kind': 'gateway', 'default': ['anthropic'],
-              'anthropic': {
-                  'base_url': gw + '/anthropic',
-                  'api_key_ref': 'env:LLM_API_KEY',
-                  'models': {'default': 'databricks-claude-opus-4-8'},
-              }}}}
-          pathlib.Path.home().joinpath('.omnigent', 'config.yaml').write_text(json.dumps(cfg, indent=2))
-          "
-
       - name: Build formatter prompt
         if: steps.creds.outputs.available == 'true'
         env:
@@ -228,31 +181,21 @@ jobs:
           pathlib.Path("/tmp/format_prompt.txt").write_text(prompt)
           PYEOF
 
+      # Runs the tools-less formatter and secret-scans its output; degrades to the
+      # raw release body (below) if the agent can't run. Omnigent is checked out
+      # into omnigent/, so the action's workdir is that subdir.
       - name: Run release-post formatter
         id: format
         if: steps.creds.outputs.available == 'true'
-        working-directory: omnigent
-        env:
-          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
-        run: |
-          set -euo pipefail
-          prompt="$(cat /tmp/format_prompt.txt)"
-          uv run --project "${GITHUB_WORKSPACE}/omnigent" omnigent run \
-            "${GITHUB_WORKSPACE}/omnigent/.github/agents/release-post-formatter" \
-            -p "$prompt" --no-session \
-            2>format-stderr.log | tee /tmp/format_out.txt \
-            || { echo "::warning::formatter exited non-zero — keeping raw release body"; cat format-stderr.log; }
-
-      - name: Scan formatter output for secrets
-        if: steps.format.outcome == 'success'
-        env:
-          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
-        run: |
-          set -euo pipefail
-          if [ -n "${LLM_API_KEY:-}" ] && grep -qF "$LLM_API_KEY" /tmp/format_out.txt 2>/dev/null; then
-            echo "::error::Formatter output contains LLM_API_KEY — aborting."
-            exit 1
-          fi
+        uses: ./omnigent/.github/actions/run-omnigent-agent
+        with:
+          workdir: omnigent
+          agent: release-post-formatter
+          prompt-file: /tmp/format_prompt.txt
+          output-file: /tmp/format_out.txt
+          stderr-file: /tmp/format-stderr.log
+          gateway-base-url: ${{ secrets.GATEWAY_BASE_URL }}
+          llm-api-key: ${{ secrets.LLM_API_KEY }}
 
       - name: Extract narrative post (fall back to raw body)
         if: steps.creds.outputs.available == 'true'
@@ -404,7 +347,7 @@ jobs:
           python3 - <<'PYEOF'
           import os, pathlib
           key = os.environ.get("LLM_API_KEY", "")
-          for f in ["omnigent/format-stderr.log", "/tmp/format_out.txt",
+          for f in ["/tmp/format-stderr.log", "/tmp/format_out.txt",
                     "/tmp/format_prompt.txt", "/tmp/site_body.md"]:
               p = pathlib.Path(f)
               if not p.is_file() or not key:
@@ -421,7 +364,7 @@ jobs:
         with:
           name: publish-changelog-${{ env.TAG }}-${{ github.run_id }}
           path: |
-            omnigent/format-stderr.log
+            /tmp/format-stderr.log
             /tmp/format_out.txt
             /tmp/site_body.md
           retention-days: 7
