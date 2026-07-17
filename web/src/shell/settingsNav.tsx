@@ -13,6 +13,7 @@ import {
   DownloadIcon,
   GitBranchIcon,
   KeyboardIcon,
+  ListChecksIcon,
   PaletteIcon,
   PanelRightOpenIcon,
   Share2Icon,
@@ -38,6 +39,7 @@ export type SettingsSectionId =
   | "members"
   | "policies"
   | "sharing"
+  | "sessions"
   | "archived"
   | "cli"
   | "updates";
@@ -50,6 +52,7 @@ const SECTION_IDS: readonly SettingsSectionId[] = [
   "members",
   "policies",
   "sharing",
+  "sessions",
   "archived",
   "cli",
   "updates",
@@ -125,8 +128,11 @@ export function settingsNavGroups(
     groups.push({ title: "Admin", items: adminItems });
   }
   groups.push({
-    title: "Archived",
-    items: [{ id: "archived", label: "Archived sessions", icon: ArchiveIcon }],
+    title: "Sessions",
+    items: [
+      { id: "sessions", label: "Session management", icon: ListChecksIcon },
+      { id: "archived", label: "Archived sessions", icon: ArchiveIcon },
+    ],
   });
   return groups;
 }

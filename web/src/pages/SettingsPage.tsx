@@ -22,6 +22,8 @@
  *   standalone `/members` and `/policies` pages linked from Account) so
  *   entering them stays inside settings — the sidebar keeps the section nav
  *   instead of snapping back to the conversation list.
+ * - **Session management** — active sessions with multi-select archive /
+ *   delete for mass cleanup.
  * - **Archived sessions** — archived sessions, moved out of the sidebar
  *   list. Not clickable; each row reveals Delete / Unarchive on hover.
  */
@@ -174,6 +176,11 @@ const PoliciesPage = lazy(() =>
 const SharingPage = lazy(() =>
   import("@/pages/SharingPage").then((m) => ({ default: m.SharingPage })),
 );
+const SessionManagementSection = lazy(() =>
+  import("@/pages/SessionManagementSection").then((m) => ({
+    default: m.SessionManagementSection,
+  })),
+);
 
 /**
  * Settings content panel. The section nav lives in the sidebar card
@@ -216,6 +223,11 @@ export function SettingsPage() {
       {section === "git" && <GitSection />}
       {section === "shortcuts" && <ShortcutsSection />}
       {section === "account" && hasAuthSession && <AccountSection />}
+      {section === "sessions" && (
+        <Suspense fallback={null}>
+          <SessionManagementSection />
+        </Suspense>
+      )}
       {section === "archived" && <ArchivedSection />}
       {section === "cli" && isElectronShell() && <LocalCliSection />}
       {section === "updates" && isElectronShell() && <UpdatesSection />}

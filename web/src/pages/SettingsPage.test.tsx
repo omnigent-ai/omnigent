@@ -148,6 +148,9 @@ vi.mock("@/pages/MembersPage", () => ({
 vi.mock("@/pages/PoliciesPage", () => ({
   PoliciesPage: () => <div>policies-page-stub</div>,
 }));
+vi.mock("@/pages/SessionManagementSection", () => ({
+  SessionManagementSection: () => <div>session-management-stub</div>,
+}));
 
 import { SettingsPage } from "./SettingsPage";
 

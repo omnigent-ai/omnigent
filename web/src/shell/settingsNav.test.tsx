@@ -128,6 +128,15 @@ describe("settingsNavGroups", () => {
     );
     expect(singleUserAdmin?.items.map((i) => i.id)).toEqual(["policies"]);
   });
+
+  it("includes Session management and Archived sessions under a Sessions group", () => {
+    const sessions = settingsNavGroups(false, false).find((g) => g.title === "Sessions");
+    expect(sessions?.items.map((i) => i.id)).toEqual(["sessions", "archived"]);
+    expect(sessions?.items.map((i) => i.label)).toEqual([
+      "Session management",
+      "Archived sessions",
+    ]);
+  });
 });
 
 describe("SettingsSidebarBody", () => {
@@ -136,7 +145,16 @@ describe("SettingsSidebarBody", () => {
     expect(screen.getByTestId("settings-nav-shortcuts").className).toContain("max-md:hidden");
     // Sibling items stay visible on every viewport.
     expect(screen.getByTestId("settings-nav-appearance").className).not.toContain("max-md:hidden");
+    expect(screen.getByTestId("settings-nav-sessions").className).not.toContain("max-md:hidden");
     expect(screen.getByTestId("settings-nav-archived").className).not.toContain("max-md:hidden");
+  });
+
+  it("links Session management under /settings/sessions", () => {
+    renderBody();
+    expect(screen.getByTestId("settings-nav-sessions")).toHaveAttribute(
+      "href",
+      "/settings/sessions",
+    );
   });
 
   it("does NOT close the sidebar when 'Back to Omnigent' is tapped", () => {
@@ -300,6 +318,10 @@ describe("useSettingsRoute", () => {
     expect(routeHook("/settings/appearance")).toEqual({
       inSettings: true,
       section: "appearance",
+    });
+    expect(routeHook("/settings/sessions")).toEqual({
+      inSettings: true,
+      section: "sessions",
     });
     expect(routeHook("/settings/updates")).toEqual({
       inSettings: true,

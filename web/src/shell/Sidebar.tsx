@@ -121,6 +121,7 @@ import { useCommentInbox } from "@/hooks/useCommentInbox";
 import { sumPendingApprovals } from "@/lib/inbox";
 import { isSessionStoppable } from "@/lib/sessionStop";
 import { isOwnerLevel } from "@/lib/permissionsApi";
+import { computeShiftSelectRange } from "@/lib/shiftSelect";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { getSessionState, type SessionState } from "@/hooks/useSessionState";
 import {
@@ -249,17 +250,7 @@ function ArchivedToast() {
  * Compute the set of IDs to add for a shift-click range selection.
  * Returns null when the range can't be computed (missing anchor or id).
  */
-export function computeShiftSelectRange(
-  visibleIds: readonly string[],
-  anchorId: string,
-  targetId: string,
-): string[] | null {
-  const anchorIdx = visibleIds.indexOf(anchorId);
-  const targetIdx = visibleIds.indexOf(targetId);
-  if (anchorIdx === -1 || targetIdx === -1) return null;
-  const [start, end] = anchorIdx < targetIdx ? [anchorIdx, targetIdx] : [targetIdx, anchorIdx];
-  return visibleIds.slice(start, end + 1);
-}
+export { computeShiftSelectRange } from "@/lib/shiftSelect";
 
 /** Fire the post-archive toast. Hoisted so it isn't a render-scoped closure. */
 function showArchivedToast() {
