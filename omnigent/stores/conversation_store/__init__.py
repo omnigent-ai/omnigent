@@ -1327,6 +1327,7 @@ class ConversationStore(ABC):
         cloned_agent_bundle_location: str | None = None,
         cloned_agent_description: str | None = None,
         copy_model_settings: bool = True,
+        copy_terminal_launch_args: bool = True,
         carry_history_into_native: bool = False,
         resume_source_native_session: bool = True,
         presentation_labels: dict[str, str] | None = None,
@@ -1370,6 +1371,11 @@ class ConversationStore(ABC):
             the bound agent's defaults — used when the fork switches to
             an agent in a different provider family, where the source's
             model id is meaningless (a model is provider-bound).
+        :param copy_terminal_launch_args: When ``True`` (default), copy the
+            source's ``terminal_launch_args``. When ``False``, the fork starts
+            with none — used when the fork switches to a different CLI, where
+            the source's flags are meaningless or rejected (e.g. Claude Code's
+            ``--permission-mode`` would make ``pi`` exit at launch).
         :param carry_history_into_native: When ``True``, stamp
             :data:`FORK_CARRY_HISTORY_LABEL_KEY` on the fork so a native
             target harness rebuilds its transcript (clone the source's

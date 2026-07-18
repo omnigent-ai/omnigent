@@ -27,6 +27,11 @@ SSE stream, sends the first message, and times to the first output-text delta �
 so the span includes the on-demand runner launch + reverse-tunnel handshake the
 UI's first message races, exactly as a real new chat pays it.
 
+``session_cold_restart`` reuses one existing host-bound session. Before every
+timed message it stops that session's runner outside the measured span; the
+message then exercises the server's automatic relaunch path and times to the
+first streamed response.
+
 The framework (``Journey`` + the two runners) is harness-agnostic and reused
 verbatim by phase-2 full-turn journeys.
 """
@@ -70,6 +75,9 @@ class Journey:
         the environment and the setup context.
     :param setup: Optional coroutine run once before timing; its return value
         is passed to ``measure`` (and ``teardown``) as ``ctx``.
+    :param prepare: Optional coroutine run before every measured operation,
+        outside that operation's latency timer. Used when each sample needs a
+        repeatable precondition, such as an offline runner.
     :param teardown: Optional coroutine run once after timing, given ``ctx``.
     :param concurrency_safe: Whether many ``measure`` calls may run at once
         against a shared setup (true for read-only / independent-write HTTP
@@ -79,8 +87,7 @@ class Journey:
         HTTP/DB journeys leave this ``False``.
     :param needs_host: Whether this journey needs a real host daemon
         (``BenchEnvironment(with_host=True)``) so a host-bound session-create
-        fires ``host.launch_runner`` and the first message races the runner's
-        boot. Implies ``needs_runner``. Only ``session_cold_start`` sets this.
+        or restart can fire ``host.launch_runner``. Implies ``needs_runner``.
     :param max_iterations: Upper bound on latency iterations for this journey,
         clamping ``--iterations`` down (never up). Full-turn journeys cost ~1s+
         per op, so 100+ iterations would blow the CI time budget; they cap at a
@@ -93,6 +100,7 @@ class Journey:
     kind: JourneyKind
     measure: Callable[[BenchEnvironment, JourneyContext], Awaitable[None]]
     setup: Callable[[BenchEnvironment], Awaitable[JourneyContext]] | None = None
+    prepare: Callable[[BenchEnvironment, JourneyContext], Awaitable[None]] | None = None
     teardown: Callable[[BenchEnvironment, JourneyContext], Awaitable[None]] | None = None
     concurrency_safe: bool = False
     needs_runner: bool = False
@@ -102,6 +110,10 @@ class Journey:
 
     async def run_setup(self, env: BenchEnvironment) -> JourneyContext:
         return await self.setup(env) if self.setup is not None else None
+
+    async def run_prepare(self, env: BenchEnvironment, ctx: JourneyContext) -> None:
+        if self.prepare is not None:
+            await self.prepare(env, ctx)
 
     async def run_teardown(self, env: BenchEnvironment, ctx: JourneyContext) -> None:
         if self.teardown is not None:
@@ -141,10 +153,19 @@ async def run_latency(
     try:
         for _ in range(warmup):
             with contextlib.suppress(Exception):  # warmup errors are non-fatal
+                await journey.run_prepare(env, ctx)
                 await journey.measure(env, ctx)
         result = RunResult()
         wall_start = time.perf_counter()
         for _ in range(iterations):
+            try:
+                await journey.run_prepare(env, ctx)
+            except httpx.HTTPStatusError as exc:
+                result.record_failure(f"HTTP {exc.response.status_code}")
+                continue
+            except Exception as exc:  # noqa: BLE001 — preparation failure is a data point
+                result.record_failure(exc.__class__.__name__)
+                continue
             await _timed(journey, env, ctx, result)
         result.wall_time = time.perf_counter() - wall_start
         return result
@@ -173,9 +194,18 @@ async def run_throughput(
         async def _one(count_it: bool, result: RunResult) -> None:
             async with sem:
                 if count_it:
+                    try:
+                        await journey.run_prepare(env, ctx)
+                    except httpx.HTTPStatusError as exc:
+                        result.record_failure(f"HTTP {exc.response.status_code}")
+                        return
+                    except Exception as exc:  # noqa: BLE001 — preparation failure is a data point
+                        result.record_failure(exc.__class__.__name__)
+                        return
                     await _timed(journey, env, ctx, result)
                 else:
                     with contextlib.suppress(Exception):  # warmup errors are non-fatal
+                        await journey.run_prepare(env, ctx)
                         await journey.measure(env, ctx)
 
         if warmup:
@@ -385,6 +415,32 @@ async def _setup_cold_start_agent(env: BenchEnvironment) -> str:
     return await _setup_turn_agent(env, stream=True)
 
 
+async def _setup_cold_restart_session(env: BenchEnvironment) -> str:
+    """Create a host-backed session and complete its first turn.
+
+    This establishes the durable conversation and its runner binding before
+    the per-sample preparation stops the runner. Every measured message then
+    resumes this same existing session through the automatic relaunch path.
+    """
+    agent_id = await _setup_turn_agent(env, stream=True)
+    session_id = await env.create_hosted_session(agent_id)
+    await env.drive_turn(session_id, _TURN_PROMPT)
+    return session_id
+
+
+async def _prepare_cold_restart(env: BenchEnvironment, ctx: JourneyContext) -> None:
+    """Stop the existing session's runner before a cold-restart sample."""
+    session_id = cast(str, ctx)  # _setup_cold_restart_session
+    await env.stop_session_runner(session_id)
+
+
+async def _teardown_cold_restart(env: BenchEnvironment, ctx: JourneyContext) -> None:
+    """Stop the runner left online after the final first-token sample."""
+    session_id = cast(str, ctx)  # _setup_cold_restart_session
+    with contextlib.suppress(Exception):
+        await env.stop_session_runner(session_id)
+
+
 async def _setup_warm_session(env: BenchEnvironment) -> str:
     """Create+bind a session and drive one warm-up turn; return the session id.
 
@@ -445,6 +501,12 @@ async def _measure_session_cold_start(env: BenchEnvironment, ctx: JourneyContext
     """
     agent_id = cast(str, ctx)  # _setup_turn_agent (stream=True)
     await env.cold_start_first_delta(agent_id, _TURN_PROMPT)
+
+
+async def _measure_session_cold_restart(env: BenchEnvironment, ctx: JourneyContext) -> None:
+    """Post to an existing session with a dead runner; await first token."""
+    session_id = cast(str, ctx)  # _setup_cold_restart_session
+    await env.cold_restart_first_delta(session_id, _TURN_PROMPT)
 
 
 async def _measure_warm_turn(env: BenchEnvironment, ctx: JourneyContext) -> None:
@@ -551,6 +613,19 @@ ALL_JOURNEYS: dict[str, Journey] = {
             max_iterations=_RUNNER_MAX_ITERATIONS,
             description="Create a host-bound session (fires host.launch_runner) then "
             "time create → attach SSE → send → first token — the real UI cold path.",
+        ),
+        Journey(
+            name="session_cold_restart",
+            kind="latency",
+            measure=_measure_session_cold_restart,
+            setup=_setup_cold_restart_session,
+            prepare=_prepare_cold_restart,
+            teardown=_teardown_cold_restart,
+            needs_runner=True,
+            needs_host=True,
+            max_iterations=_RUNNER_MAX_ITERATIONS,
+            description="Stop the runner for an existing host-bound session, then time "
+            "POST message → automatic runner relaunch → first token.",
         ),
         Journey(
             name="warm_turn",

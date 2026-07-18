@@ -773,6 +773,11 @@ async def test_filesystem_changes_modified(
     entries_by_path = {e["path"]: e for e in body["data"]}
     assert "hello.txt" in entries_by_path, "Modified file must appear in changes"
     assert entries_by_path["hello.txt"]["status"] == "modified"
+    # Line-count fields are always serialized; null in non-git (agent-edit)
+    # mode since those records carry no counts (see .get() in the endpoint).
+    entry = entries_by_path["hello.txt"]
+    assert entry["lines_added"] is None
+    assert entry["lines_removed"] is None
 
 
 @pytest.mark.asyncio

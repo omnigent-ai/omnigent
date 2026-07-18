@@ -33,7 +33,6 @@ import json
 import logging
 import os
 import pathlib
-import shutil
 import sys
 import tempfile
 import time
@@ -43,10 +42,11 @@ from dataclasses import dataclass
 from types import ModuleType
 from typing import Any, Protocol, TypeAlias, cast
 
-from omnigent._platform import stable_user_id
+from omnigent._platform import resolve_cli_binary, stable_user_id
 from omnigent.inner import _proc
 from omnigent.inner.bundle_skills import ensure_bundle_plugin_manifest
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
+from omnigent.llms.adapters._content import parse_data_uri as _parse_replay_data_uri
 from omnigent.onboarding.databricks_config import DATABRICKS_CLAUDE_DEFAULT_MODEL
 from omnigent.reasoning_effort import CLAUDE_EFFORTS, validate_effort
 from omnigent.spec.types import RetryPolicy
@@ -332,6 +332,118 @@ _STREAM_IDLE_WARN_SECONDS = 600.0
 # ── Multimodal content block conversion ──────────────────────
 
 
+def _get_inline_data_uri_info(value: Any) -> tuple[str, int] | None:  # type: ignore[explicit-any]
+    """If ``value`` contains an inline ``data:*;base64,...`` URI, return its
+    ``(media_type, base64_char_count)``; otherwise ``None``.
+
+    A resolved attachment block looks like::
+
+        {"type": "input_image",
+         "filename": "screenshot.png",
+         "image_url": "data:image/png;base64,iVBORw0KGgoAAAANS...=="}   # ~520k chars
+
+    (non-image files carry the same payload under ``file_data`` instead of
+    ``image_url``.) Returns e.g. ``("image/png", 519324)`` — the media type and
+    payload size used to build the compact
+    ``[image: screenshot.png, image/png, 519324 base64 chars]`` placeholder,
+    so the raw base64 never lands in the ``Conversation so far:`` prompt text.
+    """
+    if isinstance(value, str):
+        parsed = _parse_replay_data_uri(value)
+        if parsed is not None:
+            return parsed.media_type, len(parsed.data)
+        return None
+    if isinstance(value, list):
+        for item in value:
+            found = _get_inline_data_uri_info(item)
+            if found is not None:
+                return found
+        return None
+    if isinstance(value, dict):
+        for item in value.values():
+            found = _get_inline_data_uri_info(item)
+            if found is not None:
+                return found
+    return None
+
+
+def _redact_inline_base64(value: Any) -> Any:  # type: ignore[explicit-any]
+    """Deep-replace any whole-string inline base64 data URI with a compact
+    ``[attachment: …]`` marker, recursing through dict/list values. The fallback
+    path for values that reach ``json.dumps`` (nested dicts, non-block content)
+    so a resolver-produced base64 payload does not survive serialization. Only
+    whole-string data-URI values are redacted — not data URIs used as dict keys,
+    tuple members, or substrings embedded mid-text (the runner never emits
+    those)."""
+    if isinstance(value, str):
+        parsed = _parse_replay_data_uri(value)
+        if parsed is None:
+            return value
+        return f"[attachment: {parsed.media_type}, {len(parsed.data)} base64 chars]"
+    if isinstance(value, list):
+        return [_redact_inline_base64(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _redact_inline_base64(item) for key, item in value.items()}
+    return value
+
+
+def _render_prior_content(content: Any) -> str:  # type: ignore[explicit-any]
+    """Render one prior message's content for the ``Conversation so far:`` prefix
+    WITHOUT inlining attachment bytes.
+
+    Why this exists: ``_build_prompt`` only serializes prior history when
+    ``resume_session=False`` — a *fresh* SDK client that must replay existing
+    multimodal history (forked/shared sessions, sub-agents with
+    ``pass_history=True``, or a client restarted mid-session). By that point a
+    historical image/file block's ``file_id`` has already been resolved to a
+    ``data:<media>;base64,...`` URI. The previous code ``json.dumps()``-ed that
+    block verbatim, flattening the *entire* base64 payload into prompt TEXT — so
+    the model tokenizes the bytes as text instead of counting them as a
+    structured image. Seven ~390KB PNGs alone expand to ~2.5M tokens, and one
+    real shared session hit a 3.5M-token prompt against a 1M limit.
+
+    Any resolver-produced inline attachment *value* — a whole-string
+    ``data:*;base64,...`` under ``image_url`` / ``file_data``, including nested
+    in dict/list values — is redacted before it can reach this text prefix.
+    Plain-text blocks pass through unchanged; a block carrying an inline data
+    URI is replaced with a compact
+    ``[image/attachment: <id>, <media_type>, <N> base64 chars]`` marker that
+    preserves *that an attachment was present* without its bytes. (This does not
+    attempt to cover non-resolver shapes such as a data URI used as a dict key,
+    a tuple member, or a substring embedded mid-text — the runner never emits
+    those.) The latest/current message is handled separately by
+    ``_extract_latest_user_content`` and keeps its real image blocks — only
+    historical replay is de-inlined here.
+    """
+    if isinstance(content, str):
+        sanitized = _redact_inline_base64(content)
+        return str(sanitized)
+    if not isinstance(content, list):
+        return json.dumps(_redact_inline_base64(content), ensure_ascii=True)
+
+    rendered: list[str] = []
+    for block in content:
+        if isinstance(block, dict):
+            block_type = block.get("type")
+            text = block.get("text")
+            if block_type in ("input_text", "output_text", "text") and isinstance(text, str):
+                rendered.append(str(_redact_inline_base64(text)))
+                continue
+
+            inline_data = _get_inline_data_uri_info(block)
+            if inline_data is not None:
+                media_type, payload_chars = inline_data
+                kind = "image" if block_type == "input_image" else "attachment"
+                identifier = block.get("filename") or block.get("file_id") or block_type
+                rendered.append(
+                    f"[{kind}: {identifier}, {media_type}, {payload_chars} base64 chars]"
+                )
+                continue
+
+        rendered.append(json.dumps(_redact_inline_base64(block), ensure_ascii=True))
+    return "\n".join(rendered)
+
+
 def _parse_data_uri(uri: str) -> tuple[str, str]:
     """
     Parse a ``data:`` URI into ``(media_type, base64_data)``.
@@ -470,6 +582,11 @@ async def _multimodal_message_iter(
 # via ``create_exec_launcher``. Used to isolate whether the silent
 # connect hang is sandbox-related vs. inside the binary itself.
 _NO_SANDBOX_ENV = "OMNIGENT_CLAUDE_SDK_NO_SANDBOX"
+
+# Env override for an explicit claude binary, mirroring codex's
+# OMNIGENT_CODEX_PATH. Set this when claude lives on a PATH the host
+# daemon doesn't inherit (e.g. an nvm-managed global bin dir).
+_CLAUDE_PATH_ENV = "OMNIGENT_CLAUDE_PATH"
 
 
 def _sandbox_disabled_by_env() -> bool:
@@ -708,13 +825,16 @@ def _augment_system_prompt_for_omnigent_mcp_tools(
 
 
 def _find_system_claude() -> str | None:
-    """Find a system-installed ``claude`` CLI binary on PATH.
+    """Find a system-installed ``claude`` CLI binary.
 
-    Returns the absolute path, or None if not found.  Prefers the system
-    install over the SDK's bundled CLI because the bundled version may be
-    older and send beta flags the Databricks gateway doesn't support.
+    Resolves via the ``OMNIGENT_CLAUDE_PATH`` override, then ``PATH``, then
+    common global install dirs — so an nvm/npm-installed claude off the host
+    daemon's frozen ``PATH`` is still found. Prefers the system install over
+    the SDK's bundled CLI because the bundled version may be older and send
+    beta flags the Databricks gateway doesn't support. Returns the absolute
+    path, or ``None`` if not found.
     """
-    return shutil.which("claude")
+    return resolve_cli_binary("claude", env_var=_CLAUDE_PATH_ENV)
 
 
 def _resolve_gateway_env(
@@ -2747,10 +2867,8 @@ class ClaudeSDKExecutor(Executor):
             raw_content = msg.get("content")
             if raw_content is None:
                 content = ""
-            elif isinstance(raw_content, str):
-                content = raw_content
             else:
-                content = json.dumps(raw_content, ensure_ascii=True)
+                content = _render_prior_content(raw_content)
             lines.append(f"{role}: {content}")
         lines.append("")
         lines.append(

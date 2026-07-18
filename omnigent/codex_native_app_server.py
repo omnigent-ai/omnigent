@@ -1111,7 +1111,11 @@ def build_codex_native_server(
     """
     resolved_codex = codex_path or _find_codex_cli()
     if not resolved_codex:
-        raise ImportError("Native Codex requires the 'codex' CLI on PATH.")
+        raise ImportError(
+            "Native Codex requires the 'codex' CLI on PATH. If codex is "
+            "installed on a PATH the host daemon didn't inherit (e.g. an "
+            "nvm-managed bin dir), set OMNIGENT_CODEX_PATH=/path/to/codex."
+        )
     env = _clean_codex_env()
     config_overrides: list[str] = []
     if profile is not None:

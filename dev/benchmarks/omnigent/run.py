@@ -154,6 +154,7 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[dict[str, object], bo
                 max_p99_ms=args.max_p99_ms,
             ):
                 passed = False
+        resource_usage = env.resource_usage
 
     config = {
         "iterations": args.iterations,
@@ -170,6 +171,7 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[dict[str, object], bo
         generated_at=generated_at,
         config=config,
         harness=harness,
+        resource_usage=resource_usage,
     )
     return report, passed
 

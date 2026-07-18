@@ -3084,6 +3084,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         cloned_agent_bundle_location: str | None = None,
         cloned_agent_description: str | None = None,
         copy_model_settings: bool = True,
+        copy_terminal_launch_args: bool = True,
         carry_history_into_native: bool = False,
         resume_source_native_session: bool = True,
         presentation_labels: dict[str, str] | None = None,
@@ -3344,8 +3345,16 @@ class SqlAlchemyConversationStore(ConversationStore):
             }
             source_workspace = source_meta_ref.workspace if source_meta_ref else None
             source_ext_session = source_meta_ref.external_session_id if source_meta_ref else None
+            # ``terminal_launch_args`` are CLI-specific launch flags. A fork
+            # that switches CLI family (e.g. claude-code → pi) must NOT inherit
+            # them: the source's flags are meaningless or rejected by the new
+            # CLI — Claude Code's ``--permission-mode auto`` makes ``pi`` exit 1
+            # at launch (unknown option), which surfaces as
+            # ``required_terminal_exited``. Drop them on a switching fork.
             source_terminal_args = (
-                source_meta_ref.terminal_launch_args if source_meta_ref else None
+                source_meta_ref.terminal_launch_args
+                if source_meta_ref and copy_terminal_launch_args
+                else None
             )
             if source_workspace is not None:
                 fork_labels[FORK_SOURCE_LABEL_KEY] = source_conversation_id
@@ -3518,6 +3527,11 @@ class SqlAlchemyConversationStore(ConversationStore):
             meta = session.get(SqlConversationMetadata, (current_workspace_id(), conversation_id))
             if meta is not None:
                 meta.external_session_id = None
+                # Launch flags are CLI-specific: a switch to a different CLI
+                # (e.g. claude-code → pi) leaves the prior CLI's flags stale —
+                # Claude Code's ``--permission-mode`` makes pi exit 1 at launch.
+                # Clear them so the new CLI launches with its own defaults.
+                meta.terminal_launch_args = None
 
         conv = self.get_conversation(conversation_id)
         if conv is None:

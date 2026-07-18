@@ -100,6 +100,10 @@ export interface WorkspaceChangedFile {
   status: "created" | "modified" | "deleted";
   bytes: number | null;
   modified_at: number | null;
+  /** Lines added, or null when unknown (binary, rename, numstat unavailable). */
+  lines_added: number | null;
+  /** Lines removed, or null when unknown. */
+  lines_removed: number | null;
 }
 
 export interface WorkspaceChangedFilesResult {
@@ -180,6 +184,8 @@ interface ChangedFilesResponse {
     status: "created" | "modified" | "deleted";
     bytes: number | null;
     modified_at: number | null;
+    lines_added: number | null;
+    lines_removed: number | null;
   }>;
   has_more: boolean;
 }
@@ -220,6 +226,8 @@ async function fetchWorkspaceChangedFiles(
     status: e.status,
     bytes: e.bytes,
     modified_at: e.modified_at,
+    lines_added: e.lines_added ?? null,
+    lines_removed: e.lines_removed ?? null,
   }));
   return { available: true, data };
 }

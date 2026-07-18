@@ -84,6 +84,71 @@ class TestPromptExtraction(unittest.TestCase):
         self.assertIn("ZEBRA-99", prompt)
         self.assertIn("Summarize our conversation.", prompt)
 
+    def test_historical_image_data_uri_is_replaced_with_compact_placeholder(self):
+        executor = self._make_executor()
+        image_payload = base64.b64encode(b"synthetic png bytes").decode("ascii")
+        image_data_uri = f"data:image/png;base64,{image_payload}"
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_image",
+                        "image_url": image_data_uri,
+                        "filename": "screenshot.png",
+                    },
+                    {"type": "input_text", "text": "What is shown here?"},
+                ],
+            },
+            {"role": "assistant", "content": "It shows a test image."},
+            {"role": "user", "content": "Summarize our conversation."},
+        ]
+
+        prompt = executor._build_prompt(messages, resume_session=False)
+
+        self.assertIsInstance(prompt, str)
+        self.assertNotIn("data:", prompt)
+        self.assertNotIn(image_payload, prompt)
+        self.assertIn(
+            "[image: screenshot.png, image/png, 28 base64 chars]",
+            prompt,
+        )
+        self.assertIn("What is shown here?", prompt)
+
+    def test_historical_file_data_uri_is_replaced_with_compact_placeholder(self):
+        # The blowup hits ALL attachments, not just images: the runner resolves a
+        # non-image file_id block to ``file_data = data:...;base64,...`` too. This
+        # locks in the field-name-independent redaction fallback for file_data.
+        executor = self._make_executor()
+        file_payload = base64.b64encode(b"synthetic pdf bytes").decode("ascii")
+        file_data_uri = f"data:application/pdf;base64,{file_payload}"
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_file",
+                        "file_data": file_data_uri,
+                        "filename": "doc.pdf",
+                    },
+                    {"type": "input_text", "text": "What does this document say?"},
+                ],
+            },
+            {"role": "assistant", "content": "It is a test document."},
+            {"role": "user", "content": "Summarize our conversation."},
+        ]
+
+        prompt = executor._build_prompt(messages, resume_session=False)
+
+        self.assertIsInstance(prompt, str)
+        self.assertNotIn("data:", prompt)
+        self.assertNotIn(file_payload, prompt)
+        self.assertIn(
+            f"[attachment: doc.pdf, application/pdf, {len(file_payload)} base64 chars]",
+            prompt,
+        )
+        self.assertIn("What does this document say?", prompt)
+
 
 # ---------------------------------------------------------------------------
 # Tests: Constructor and properties
@@ -4018,3 +4083,22 @@ def test_no_precompact_no_compaction_event() -> None:
         assert len(compaction_events) == 0
 
     _run(_t())
+
+
+def test_find_system_claude_delegates_to_shared_resolver(monkeypatch) -> None:
+    """``_find_system_claude`` resolves claude via the shared resolver with the
+    OMNIGENT_CLAUDE_PATH override, so an nvm/npm-installed claude off the host
+    daemon's frozen PATH is still found. (The resolver's PATH/override/fallback
+    behavior is covered in tests/inner/test_proc_and_platform.py.)"""
+    from omnigent.inner import claude_sdk_executor as cse
+
+    captured = {}
+
+    def fake_resolve(name, *, env_var=None):
+        captured["name"] = name
+        captured["env_var"] = env_var
+        return "/opt/homebrew/bin/claude"
+
+    monkeypatch.setattr(cse, "resolve_cli_binary", fake_resolve)
+    assert cse._find_system_claude() == "/opt/homebrew/bin/claude"
+    assert captured == {"name": "claude", "env_var": "OMNIGENT_CLAUDE_PATH"}
