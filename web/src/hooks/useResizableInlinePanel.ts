@@ -12,17 +12,12 @@ import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/ses
 const MIN_WIDTH_PX = 240;
 const MAX_WIDTH_RATIO = 0.6;
 
-// ~36 % of viewport, clamped [420, 600] — ~30 % wider than the prior default so
-// the first manual open lands at a comfortable working width.
-const DEFAULT_RATIO = 0.36;
-const DEFAULT_MIN_PX = 420;
-const DEFAULT_MAX_PX = 600;
-const DEFAULT_SSR_PX = 500;
+// Match the compact workspace pane from the agentic-ux reference. Users can
+// still drag wider, and saved per-session widths continue to win.
+const DEFAULT_WIDTH_PX = 400;
 
 function defaultWidthPx(): number {
-  if (typeof window === "undefined") return DEFAULT_SSR_PX;
-  const candidate = Math.round(window.innerWidth * DEFAULT_RATIO);
-  return Math.max(DEFAULT_MIN_PX, Math.min(DEFAULT_MAX_PX, candidate));
+  return DEFAULT_WIDTH_PX;
 }
 
 function clamp(w: number, minPx = MIN_WIDTH_PX): number {

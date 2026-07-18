@@ -380,8 +380,8 @@
     linear-gradient(145deg, #f7f7f5 0%, #faf9f8 52%, #f6f7f5 100%);
 }
 
-/* A white paper sidebar with the existing Omnigent blush texture. The warm
- * hairline and low shadow mirror Isaac Light's quiet floating-panel depth. */
+/* Flat warm-white sidebar: the app canvas supplies the Omnigent atmosphere,
+ * while the navigation stays quiet and paper-like like Isaac Light. */
 :root:not(.dark) .conversations-sidebar:not([data-collapsed]) {
   --foreground: #27272a;
   --muted: rgba(61, 57, 41, 0.06);
@@ -391,34 +391,45 @@
   box-shadow:
     0 2px 8px rgba(61, 57, 41, 0.06),
     0 1px 2px rgba(61, 57, 41, 0.04);
-  background:
-    radial-gradient(rgba(142, 83, 115, 0.065) 0.5px, transparent 0.7px) 0 0 / 5px 5px,
-    radial-gradient(104% 74% at 112% 108%, rgba(248, 177, 215, 0.13), transparent 66%),
-    linear-gradient(
-      45deg,
-      rgb(251, 250, 249),
-      rgb(252, 249, 250) 18%,
-      rgb(253, 249, 251) 36%,
-      rgb(253, 251, 251) 58%,
-      rgb(254, 253, 252) 80%,
-      rgb(255, 255, 255)
-    );
+  background: #fbfaf9;
 }
 
 :root:not(.dark) .reference-composer-surface {
   border-color: rgba(61, 57, 41, 0.1);
   background: #fff;
   background-image: none;
+  box-shadow: 0 6px 12px -6px rgb(0 0 0 / 0.12);
+}
+
+/* Reference workspace card: the right pane uses the compact floating geometry
+ * and elevation from the live agentic-ux prototype instead of the older
+ * oversized dashboard-card treatment. */
+:root:not(.dark) .workspace-panel-surface {
+  border-color: #ececee;
+  background: #fff;
+  box-shadow: 0 6px 12px -6px rgb(0 0 0 / 0.12);
+}
+
+html.dark .app-shell .workspace-panel-surface {
+  -webkit-backdrop-filter: none !important;
+  backdrop-filter: none !important;
+  border: 1px solid rgba(255, 255, 255, 0.09) !important;
+  background: linear-gradient(145deg, rgba(40, 38, 45, 0.98), rgba(31, 29, 35, 0.98)) !important;
+  background-image: linear-gradient(
+    145deg,
+    rgba(40, 38, 45, 0.98),
+    rgba(31, 29, 35, 0.98)
+  ) !important;
   box-shadow:
-    0 2px 8px rgba(61, 57, 41, 0.06),
-    0 1px 2px rgba(61, 57, 41, 0.04);
+    0 8px 20px rgba(0, 0, 0, 0.24),
+    inset 0 1px rgba(255, 255, 255, 0.035) !important;
 }
 .dark .app-shell {
   --foreground: rgb(226 225 218);
-  --background: #0d1017;
+  --background: #1b191e;
   background:
-    radial-gradient(circle at 66% 18%, rgba(245, 59, 157, 0.12), transparent 28%),
-    radial-gradient(circle at 54% 92%, rgba(77, 197, 160, 0.08), transparent 28%), #0d1017;
+    radial-gradient(circle at 68% 15%, rgba(245, 59, 157, 0.045), transparent 38%),
+    radial-gradient(circle at 55% 92%, rgba(77, 197, 160, 0.025), transparent 36%), #1b191e;
 }
 
 /* Chat scroll fade: the ChatHeader overlay paints no background (a flat
@@ -495,17 +506,20 @@
     0 1px 3px rgba(0, 0, 0, 0.16);
 }
 
-/* Dark landing surfaces from the finalized Comfortable Orbit Left mockup. */
+/* Isaac Dark keeps its sidebar flat and only slightly lighter than the page.
+ * Omnigent follows that relationship with a warm-plum charcoal lifted above
+ * the #1b191e canvas, without gradients or decorative texture. */
 html.dark .app-shell aside[aria-label="Conversations"].conversations-sidebar:not([data-collapsed]) {
   --foreground: hsl(55 9% 74%);
   --muted-foreground: hsl(48 5% 57%);
   --muted: rgba(255, 255, 255, 0.055);
-  -webkit-backdrop-filter: blur(24px) !important;
-  backdrop-filter: blur(24px) !important;
-  border: 1px solid rgba(255, 255, 255, 0.07) !important;
-  background: rgba(8, 11, 17, 0.88) !important;
-  background-image: none !important;
-  box-shadow: none !important;
+  -webkit-backdrop-filter: none !important;
+  backdrop-filter: none !important;
+  border: 1px solid rgba(255, 255, 255, 0.09) !important;
+  background: #242228 !important;
+  box-shadow:
+    0 6px 20px rgba(0, 0, 0, 0.2),
+    inset 0 1px rgba(255, 255, 255, 0.035) !important;
 }
 
 .dark .sidebar-primary-nav-item {

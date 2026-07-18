@@ -554,8 +554,9 @@ describe("AgentPicker trigger label", () => {
     // The harness identity ("Claude") is NOT in the trigger anymore — it
     // moved to the status tray below.
     expect(trigger).not.toHaveTextContent("Claude");
-    // Model black, effort grey.
-    expect(within(trigger).getByText("Opus")).toHaveClass("text-foreground");
+    // The whole trigger uses the reference composer's muted, normal-weight treatment.
+    expect(within(trigger).getByText("Opus")).not.toHaveClass("text-foreground");
+    expect(trigger).toHaveClass("font-normal", "text-muted-foreground");
     expect(within(trigger).getByText("High")).toHaveClass("text-muted-foreground");
   });
 
@@ -663,7 +664,8 @@ describe("AgentPicker trigger label", () => {
     expect(trigger).not.toHaveTextContent("Opus 4.5");
     expect(trigger).not.toHaveTextContent("fable");
     expect(trigger).not.toHaveTextContent("Low");
-    expect(within(trigger).getByText("Composer 2.5")).toHaveClass("text-foreground");
+    expect(within(trigger).getByText("Composer 2.5")).not.toHaveClass("text-foreground");
+    expect(trigger).toHaveClass("font-normal", "text-muted-foreground");
   });
 
   it("surfaces an SDK/bundle session's model from the override, not the cross-session sticky", () => {

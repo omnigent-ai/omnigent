@@ -185,7 +185,7 @@ export function ChatHeader({
         // Scrolled chat text can't render through the controls because the
         // conversation viewport fades its top edge instead (chat-scroll-fade
         // in index.css, applied in ChatPage).
-        "chat-header absolute inset-x-0 top-0 z-30 flex h-14 items-center justify-between px-2 py-3",
+        "chat-header absolute top-0 right-0 left-0 z-30 flex h-14 items-center justify-between px-2 py-3 md:right-[var(--workspace-panel-offset,0px)]",
       )}
     >
       {/* Left slot: sidebar toggle (when sidebar is closed) and a

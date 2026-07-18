@@ -1662,7 +1662,7 @@ function AgentHarnessPicker({
           // when focus returns to the trigger after a pick.
           className="h-8 gap-1.5 px-2.5 font-normal text-muted-foreground hover:text-foreground focus-visible:border-transparent focus-visible:ring-0"
         >
-          <span className="max-w-[12rem] truncate text-xs text-foreground">
+          <span className="max-w-[12rem] truncate text-xs">
             {hasAgents ? agentLabel : "No agents"}
           </span>
           <ChevronDownIcon className="size-3.5 opacity-60" />
@@ -3005,13 +3005,12 @@ export function NewChatLandingScreen() {
     // desktop offset stays comfortable on both laptop and tall displays.
     <div
       ref={setLandingSurface}
-      className="flex flex-1 items-start justify-center pt-20 md:pt-[clamp(96px,18vh,176px)]"
+      className="flex flex-1 items-start justify-center pt-[88px] md:pt-[clamp(104px,calc(18vh_+_8px),184px)]"
       data-testid="new-chat-landing"
     >
-      {/* Padding lives inside the 860px cap, so the composer renders at
-          860 − 80 = 780px max on desktop. px-4 on phones (16px gutters)
-          keeps the composer from feeling cramped against the viewport
-          edges; widens to the full px-10 at the md breakpoint and up. */}
+      {/* Keep enough outer room for the greeting, while the composer itself
+          uses the same 746px rendered width as the narrow session column with
+          the workspace pane open. px-4 on phones preserves 16px gutters. */}
       <div className="flex w-full max-w-[860px] flex-col items-center gap-6 px-4 pb-16 md:select-none md:px-10">
         <div className="flex flex-col items-center gap-0">
           <div className="relative h-20 w-[98px] shrink-0" aria-hidden="true">
@@ -3026,7 +3025,7 @@ export function NewChatLandingScreen() {
             What should we build?
           </h1>
         </div>
-        <div className="relative flex w-full flex-col gap-0">
+        <div className="relative flex w-full max-w-[746px] flex-col gap-0">
           <ComposerFormSurface
             onSubmit={(e) => {
               e.preventDefault();
@@ -3254,12 +3253,12 @@ export function NewChatLandingScreen() {
                 shadow) and visually split the pill in half. */}
             <div className="contents">
               {/* Attach + dictate — left side, mirroring the in-session composer. */}
-              <div className="order-1 flex items-center gap-0.5">
+              <div className="order-1 flex items-center gap-[1px]">
                 <Button
                   type="button"
                   size="icon"
                   variant="ghost"
-                  className="size-8 rounded-[8px]"
+                  className="size-8 rounded-[8px] text-muted-foreground hover:text-foreground"
                   disabled={creating}
                   onClick={() => fileInputRef.current?.click()}
                   title="Attach files"

@@ -5,9 +5,8 @@ import { resetWidthStoreForTesting, useResizableInlinePanel } from "./useResizab
 
 // useResizableInlinePanel keeps its width in a module-level store shared across
 // all callers, re-seeded per conversation. resetWidthStoreForTesting clears it
-// between tests so cases are fully independent. A 2000px viewport gives a
-// 1200px clamp ceiling (2000 * 0.6); the default width there is 600 (0.36 *
-// 2000 = 720, clamped to the [420, 600] band).
+// between tests so cases are fully independent. A 2000px viewport leaves the
+// 400px reference default unclamped.
 
 const SESSION = "conv_test";
 const originalInnerWidth = window.innerWidth;
@@ -42,31 +41,31 @@ describe("useResizableInlinePanel persistence", () => {
   it("persists explicit keyboard resize per session and restores it after store reset", () => {
     const { result, unmount } = renderHook(() => useResizableInlinePanel(SESSION));
 
-    // Default 600 + one ArrowLeft step (20px) = 620, persisted under the
+    // Default 400 + one ArrowLeft step (20px) = 420, persisted under the
     // session key.
     const afterNudge = nudgeWiderOnce(result);
-    expect(afterNudge).toBe(620);
-    expect(readSessionWorkspaceState(SESSION).widthPx).toBe(620);
+    expect(afterNudge).toBe(420);
+    expect(readSessionWorkspaceState(SESSION).widthPx).toBe(420);
 
     unmount();
     resetWidthStoreForTesting();
     const restored = renderHook(() => useResizableInlinePanel(SESSION));
 
-    // The saved manual width wins over the viewport-derived default of 600.
-    expect(restored.result.current.panelWidth).toBe(620);
+    // The saved manual width wins over the 400px reference default.
+    expect(restored.result.current.panelWidth).toBe(420);
     restored.unmount();
   });
 
   it("scopes the saved width to its session: a different session uses the default", () => {
     const first = renderHook(() => useResizableInlinePanel(SESSION));
-    expect(nudgeWiderOnce(first.result)).toBe(620);
-    expect(readSessionWorkspaceState(SESSION).widthPx).toBe(620);
+    expect(nudgeWiderOnce(first.result)).toBe(420);
+    expect(readSessionWorkspaceState(SESSION).widthPx).toBe(420);
     first.unmount();
 
     // A second conversation has no saved width, so it falls back to the
-    // viewport-derived default (600) rather than inheriting the first's 620.
+    // 400px reference default rather than inheriting the first's 420px width.
     const second = renderHook(() => useResizableInlinePanel("conv_other"));
-    expect(second.result.current.panelWidth).toBe(600);
+    expect(second.result.current.panelWidth).toBe(400);
     expect(readSessionWorkspaceState("conv_other").widthPx).toBeUndefined();
     second.unmount();
   });
@@ -74,21 +73,21 @@ describe("useResizableInlinePanel persistence", () => {
   it("re-derives from the preference on resize: clamps down on shrink, springs back on widen", () => {
     const { result } = renderHook(() => useResizableInlinePanel(SESSION));
 
-    // Establish a persisted preference of 620 (default 600 + one ArrowLeft step).
-    expect(nudgeWiderOnce(result)).toBe(620);
-    expect(readSessionWorkspaceState(SESSION).widthPx).toBe(620);
+    // Establish a persisted preference of 420 (default 400 + one ArrowLeft step).
+    expect(nudgeWiderOnce(result)).toBe(420);
+    expect(readSessionWorkspaceState(SESSION).widthPx).toBe(420);
 
     // Shrinking the viewport clamps the live width to the 0.6 ceiling
-    // (700 * 0.6 = 420) without disturbing the saved 620 preference.
-    setInnerWidth(700);
+    // (600 * 0.6 = 360) without disturbing the saved 420 preference.
+    setInnerWidth(600);
     act(() => window.dispatchEvent(new Event("resize")));
-    expect(result.current.panelWidth).toBe(420);
-    expect(readSessionWorkspaceState(SESSION).widthPx).toBe(620);
+    expect(result.current.panelWidth).toBe(360);
+    expect(readSessionWorkspaceState(SESSION).widthPx).toBe(420);
 
-    // Widening again re-derives from the preference, restoring 620 in-session.
+    // Widening again re-derives from the preference, restoring 420 in-session.
     setInnerWidth(2000);
     act(() => window.dispatchEvent(new Event("resize")));
-    expect(result.current.panelWidth).toBe(620);
+    expect(result.current.panelWidth).toBe(420);
   });
 });
 

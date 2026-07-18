@@ -275,8 +275,12 @@ export function collectBubbleMarkdown(items: RenderItem[]): string {
     .trim();
 }
 
-// All chat-column elements must share this width to stay aligned.
-const CHAT_COLUMN_WIDTH = "max-w-[808px]";
+// Match SP2K's narrow chat setting: the transcript has an 832px outer cap,
+// then ConversationContent adds 24px horizontal padding on each side. Keep
+// the composer surfaces aligned to that 784px readable-content column rather
+// than the transcript's padded outer box.
+const CHAT_COLUMN_WIDTH = "max-w-[832px]";
+const COMPOSER_COLUMN_WIDTH = "w-[calc(100%-1rem)] md:w-[calc(100%-3rem)] max-w-[784px]";
 
 const TABLE_SEPARATOR_RE = /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/;
 
@@ -3647,7 +3651,7 @@ function ComposerStatusLine({
         // with its own border/shadow, duplicating the composer's chrome —
         // and matches the home composer's footer tray surface.
         "mx-auto -mt-3 flex w-full items-center gap-3 rounded-b-2xl bg-tray/40 px-3 pb-1 pt-4",
-        CHAT_COLUMN_WIDTH,
+        COMPOSER_COLUMN_WIDTH,
       )}
     >
       {/* Left: host badge then worktree branch. Always holds the flex-1 slot
@@ -3749,7 +3753,7 @@ function SubagentComposerTray({ label }: { label: string }) {
       data-testid="composer-subagent-tray"
       className={cn(
         "mx-auto -mb-4 flex w-full items-center gap-1.5 rounded-t-2xl bg-brand-accent/10 px-4 pt-1.5 pb-5.5 text-xs text-brand-accent",
-        CHAT_COLUMN_WIDTH,
+        COMPOSER_COLUMN_WIDTH,
       )}
     >
       <BotIcon className="size-3.5 shrink-0" aria-hidden="true" />
@@ -4574,7 +4578,9 @@ export function Composer({
     <form
       onSubmit={handleSubmit}
       className={cn(
-        "chat-composer-form px-4 md:px-6",
+        // Match the conversation scroller's stable 15px gutter on desktop so
+        // the composer and transcript share the same rendered left/right edge.
+        "chat-composer-form px-4 md:px-[15px]",
         isTerminalFirst ? "terminal-first-composer-form pb-1.5" : "pb-3",
       )}
     >
@@ -4613,7 +4619,7 @@ export function Composer({
         }}
         onSteer={(queueId) => steerMessage(queueId)}
         onReorder={reorderQueuedMessage}
-        widthClassName={CHAT_COLUMN_WIDTH}
+        widthClassName={COMPOSER_COLUMN_WIDTH}
       />
       {/* Sub-agent context tray — peeks above the card; reserves its own
           layout slot so the card sits below it (see SubagentComposerTray).
@@ -4631,7 +4637,7 @@ export function Composer({
           glass rule still keys off the bg-card class, so the dark border/
           shadow chrome is unchanged; only the fill goes opaque. */}
       <ComposerSurface
-        className={cn("chat-reference-composer mx-auto", CHAT_COLUMN_WIDTH)}
+        className={cn("chat-reference-composer mx-auto", COMPOSER_COLUMN_WIDTH)}
         isDragActive={isDragActive}
         onDrop={handleDrop}
         onDragOver={handleDragOver}
@@ -4858,12 +4864,12 @@ export function Composer({
         )}
         <div className="contents">
           {/* Attach + mic — left side of the action row */}
-          <div className="order-1 flex shrink-0 items-center gap-0.5">
+          <div className="order-1 flex shrink-0 items-center gap-[1px]">
             <Button
               type="button"
               size="icon"
               variant="ghost"
-              className="size-8 rounded-[8px]"
+              className="size-8 rounded-[8px] text-muted-foreground hover:text-foreground"
               disabled={disabled || isReadOnly || hasPendingElicitation}
               onClick={() => fileInputRef.current?.click()}
               title="Attach files"
@@ -5481,7 +5487,7 @@ function AgentPicker({
   } else if (modelLabel) {
     triggerContent = (
       <>
-        <span className="text-foreground">{modelLabel}</span>
+        <span>{modelLabel}</span>
         {effortTriggerLabel && <span className="text-muted-foreground"> {effortTriggerLabel}</span>}
       </>
     );
@@ -5515,7 +5521,7 @@ function AgentPicker({
           size="sm"
           disabled={!hasAgents || disabled || !hasPickerActions}
           data-testid="agent-picker-trigger"
-          className="h-7 min-w-0 shrink gap-1.5 px-2 text-muted-foreground hover:text-foreground"
+          className="h-7 min-w-0 shrink gap-1.5 px-2 font-normal text-muted-foreground hover:text-foreground"
         >
           <span className="min-w-0 truncate text-xs tabular-nums">{triggerContent}</span>
           {hasPickerActions && <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />}

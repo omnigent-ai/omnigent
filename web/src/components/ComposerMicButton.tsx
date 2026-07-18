@@ -260,7 +260,7 @@ export const ComposerMicButton = ({
       aria-label={a11yLabel}
       title={tooltip}
       className={cn(
-        "size-9 md:size-8",
+        "size-9 text-muted-foreground hover:text-foreground md:size-8",
         isListening &&
           "bg-muted/60 text-foreground hover:bg-destructive/10 hover:text-destructive focus-visible:bg-destructive/10 focus-visible:text-destructive",
         error && "text-destructive",
