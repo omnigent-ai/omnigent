@@ -212,3 +212,26 @@ def test_community_namespace_imports_external_harness_package(
 
     module = importlib.import_module("omnigent.community.harness.foo")
     assert module.VALUE == "ok"
+
+
+def test_omp_builtin_harness_is_acp_backed() -> None:
+    """The built-in ``omp`` harness is ACP-backed with a pinned command builder."""
+    assert "omp" in hp.valid_harnesses()
+    assert hp.harness_modules()["omp"] == "omnigent.inner.acp_harness"
+    assert (
+        hp.spawn_env_builders()["omp"] == "omnigent.runtime.workflow._build_omp_spawn_env"
+    )
+    assert hp.harness_labels().get("omp") == "Oh My Pi"
+
+
+def test_omp_spawn_env_pins_the_acp_command() -> None:
+    """``_build_omp_spawn_env`` pins ``omp acp`` so the built-in needs no config."""
+    from types import SimpleNamespace
+
+    from omnigent.runtime.workflow import _build_omp_spawn_env
+
+    spec = SimpleNamespace(executor=SimpleNamespace(model=None), os_env=None)
+    env = _build_omp_spawn_env(spec)
+    assert env["HARNESS_ACP_COMMAND"] == "omp acp"
+    assert env["HARNESS_ACP_NAME"] == "Oh My Pi"
+    assert env["HARNESS_ACP_SESSION_ID_MODE"] == "server"

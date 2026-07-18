@@ -9,6 +9,7 @@ import { KimiIcon } from "@/components/icons/KimiIcon";
 import { KiroIcon } from "@/components/icons/KiroIcon";
 import { NessieIcon } from "@/components/icons/NessieIcon";
 import { OpenCodeIcon } from "@/components/icons/OpenCodeIcon";
+import { OmpIcon } from "@/components/icons/OmpIcon";
 import { PiIcon } from "@/components/icons/PiIcon";
 import type { ComponentType, SVGProps } from "react";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
@@ -54,6 +55,8 @@ function iconForAgent(agent: AvailableAgent): ComponentType<SVGProps<SVGSVGEleme
   // qwen falls back to generic BotIcon for now; see docs/QWEN_FOLLOWUPS.md
   // Exact match — a substring check would false-match e.g. "openapi".
   if (agent.harness === "pi") return PiIcon;
+  // omp (Oh My Pi) is an ACP-backed harness; exact match avoids false hits.
+  if (agent.harness === "omp") return OmpIcon;
   // Both the native (`antigravity-native`) and SDK (`antigravity`) harnesses
   // share the Antigravity glyph.
   if (agent.harness?.includes("antigravity")) return AntigravityIcon;
