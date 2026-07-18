@@ -547,12 +547,11 @@ include = [
     ".claude/skills",
     "setup.py",
 ]
-# Generated protobuf bindings and the vendored Google MCP snapshot are not
-# first-party editable sources. Their hand-written callers remain checked.
+# Generated protobuf bindings are not first-party editable sources. Their
+# hand-written callers remain checked.
 exclude = [
     "omnigent/api/routing/v1/routing_pb2.py",
     "omnigent/api/routing/v1/routing_pb2.pyi",
-    "omnigent/inner/databricks_mcps/google",
 ]
 extraPaths = ["sdks/python-client", "sdks/ui", ".github/scripts/pr-template"]
 [dependency-groups]
