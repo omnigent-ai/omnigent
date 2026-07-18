@@ -69,8 +69,6 @@ if TYPE_CHECKING:
     from omnigent.onboarding.provider_config import ProviderEntry
     from omnigent.update_check import _InstalledWheelInfo
 
-_logger = logging.getLogger(__name__)
-
 
 # Any: YAML configs have heterogeneous value types (str, int, list, etc.)
 def _load_config(path: str | None) -> dict[str, Any]:  # type: ignore[explicit-any]
@@ -108,7 +106,10 @@ def _build_external_routing_client(
     model_prefix = (routing_cfg.get("model_prefix") or "").strip()
 
     if not base_url or not router_name:
-        _logger.warning("routing.provider=external requires base_url and router_name; skipping")
+        click.echo(
+            "routing.provider=external requires base_url and router_name; skipping",
+            err=True,
+        )
         return None
 
     from omnigent.server.smart_routing import _bearer_auth
@@ -128,9 +129,9 @@ def _build_external_routing_client(
             creds = resolve_databricks_workspace(profile)
             auth = _bearer_auth(creds.token)
         except OSError:
-            _logger.warning(
-                "routing.profile=%s could not be resolved; calling router unauthenticated",
-                profile,
+            click.echo(
+                f"routing.profile={profile} could not be resolved; calling router unauthenticated",
+                err=True,
             )
 
     from omnigent.server.smart_routing import ExternalRoutingClient
