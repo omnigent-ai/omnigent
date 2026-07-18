@@ -26,6 +26,7 @@ import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isSingleUserMode } from "@/lib/capabilities";
+import { useAppName } from "@/lib/branding";
 import { useIsAdmin } from "@/hooks/useIsAdmin";
 import { isElectronShell } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
@@ -199,6 +200,7 @@ export function SettingsSidebarBody({
   onClose: () => void;
 }) {
   const info = useServerInfo();
+  const appName = useAppName();
   // Account section shows whenever there's a login session (accounts OR OIDC).
   const hasAuthSession = info !== "loading" && info.login_url !== null;
   // Admin gating for the Members / Policies sub-categories. Sourced from
@@ -226,7 +228,7 @@ export function SettingsSidebarBody({
           (persistent card), so dropping it changes nothing there. */}
           <Link to={settingsReturnPath}>
             <ArrowLeftIcon className="size-4" />
-            Back to Omnigent
+            Back to {appName}
           </Link>
         </Button>
         <Tooltip>

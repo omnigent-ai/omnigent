@@ -1967,7 +1967,7 @@ def create_app(
         return {"version": _server_version()}
 
     @app.get("/v1/info")
-    async def info() -> dict[str, bool | str | None]:
+    async def info() -> dict[str, Any]:
         """Runtime capabilities probe for the SPA + CLI.
 
         Returned at app boot by the frontend (and by ``omnigent
@@ -1992,6 +1992,7 @@ def create_app(
         ``server_version`` (already public via ``/api/version``).
         """
         from omnigent.server.auth import UnifiedAuthProvider, local_single_user_enabled
+        from omnigent.server.server_config import branding_config
 
         accounts_enabled = (
             isinstance(auth_provider, UnifiedAuthProvider) and auth_provider._source == "accounts"
@@ -2076,7 +2077,21 @@ def create_app(
             "public_sharing_enabled": public_sharing_enabled,
             "server_version": _server_version(),
             "smart_routing_enabled": smart_routing_enabled,
+            "branding": branding_config(),
         }
+
+    @app.get("/v1/branding/logo/{variant}")
+    async def branding_logo(variant: str) -> FileResponse:
+        """Serve a branding logo variant, or 404 when unset.
+
+        Public (unauthed), like ``/v1/info``.
+        """
+        from omnigent.server.server_config import branding_logo_file
+
+        path = branding_logo_file(variant)
+        if path is None:
+            raise OmnigentError(f"No {variant!r} logo configured", code=ErrorCode.NOT_FOUND)
+        return FileResponse(path)
 
     @app.get("/v1/me", response_model=None)  # Union return type (dict | JSONResponse)
     async def me(request: Request) -> dict[str, str | bool | None] | JSONResponse:

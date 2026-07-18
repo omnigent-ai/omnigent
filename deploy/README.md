@@ -483,6 +483,34 @@ to set and sanitize the identity header, and read
 [`docker/README.md#header-proxy-mode-for-deploys-behind-an-existing-sso-proxy`](docker/README.md#header-proxy-mode-for-deploys-behind-an-existing-sso-proxy)
 first.
 
+## Branding (white-labeling)
+
+Customize the app name, landing heading, and logos with a `branding:` block in
+the server config (`omnigent server -c config.yaml`, or `<data_dir>/config.yaml`
+— `/data/config.yaml` in the Docker stack). Takes effect on the next server
+start.
+
+```yaml
+branding:
+  app_name: "Acme Agent"        # tab title, sidebar wordmark, login screen
+  heading: "How can I help?"     # landing hero; "" hides it, omit to keep the default
+  logo:                          # a bare string sets `main`; or per-variant:
+    main: logo.svg               # hero / primary mark
+    loading: loading.svg         # working indicator (falls back to main)
+    favicon: favicon.svg         # browser-tab icon
+  powered_by: true               # "Powered by Omnigent" credit; false to hide
+```
+
+Logo files are resolved next to the config file (drop `logo.svg` beside
+`config.yaml`); SVG or PNG both work. The values are served over the unauthed
+`GET /v1/info` and `GET /v1/branding/logo/<variant>` endpoints so the login
+screen is branded before sign-in. Any unset field keeps its built-in default,
+so a partial block is fine.
+
+The small "Powered by Omnigent" credit under the landing composer appears only
+once you set custom branding; `powered_by: false` hides it even then. It always
+shows the Omnigent mascot, never your logo.
+
 ## Adding a new deploy target
 
 Drop a new subdirectory under `deploy/<target>/` with a `README.md`

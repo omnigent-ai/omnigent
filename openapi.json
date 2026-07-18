@@ -6542,6 +6542,44 @@
         ]
       }
     },
+    "/v1/branding/logo/{variant}": {
+      "get": {
+        "description": "Serve a branding logo variant, or 404 when unset.\n\nPublic (unauthed), like `/v1/info`.",
+        "operationId": "branding_logo_v1_branding_logo__variant__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "variant",
+            "required": true,
+            "schema": {
+              "title": "Variant",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Branding Logo"
+      }
+    },
     "/v1/harnesses": {
       "get": {
         "operationId": "list_harnesses_v1_harnesses_get",
@@ -7062,19 +7100,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": {
-                    "anyOf": [
-                      {
-                        "type": "boolean"
-                      },
-                      {
-                        "type": "string"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ]
-                  },
+                  "additionalProperties": true,
                   "title": "Response Info V1 Info Get",
                   "type": "object"
                 }
