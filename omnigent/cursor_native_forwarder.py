@@ -50,7 +50,7 @@ import httpx
 from omnigent import cursor_native_status
 from omnigent._native_post_delivery import post_may_have_been_delivered
 from omnigent.cursor_native_bridge import FORK_HISTORY_CLOSE_TAG, FORK_HISTORY_OPEN_TAG
-from omnigent.inner.native_attachments import UNRESOLVED_ATTACHMENT_MARKER_PATTERN
+from omnigent.inner.native_attachments import ATTACHMENT_MARKER_STRIP_PATTERN
 
 _logger = logging.getLogger(__name__)
 
@@ -109,7 +109,7 @@ _USER_QUERY_RE = re.compile(r"<user_query>(.*?)</user_query>", re.DOTALL)
 # The executor injects ``[Attached: <path>]`` (or the could-not-load marker
 # from native_attachments) for web-UI attachments before pasting into the TUI;
 # cursor stores them inside the user_query, so strip them from the mirrored bubble.
-_ATTACHMENT_MARKER_RE = re.compile(rf"\[Attached:[^\]]*\]|{UNRESOLVED_ATTACHMENT_MARKER_PATTERN}")
+_ATTACHMENT_MARKER_RE = re.compile(ATTACHMENT_MARKER_STRIP_PATTERN)
 # On a fork into cursor, the executor prepends the prior conversation to the
 # first user message, fenced in <omnigent_fork_history>…</omnigent_fork_history>
 # (cursor_native_bridge.wrap_fork_preamble). cursor stores it inside the

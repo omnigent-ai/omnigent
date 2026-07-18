@@ -10,8 +10,10 @@ from pathlib import Path
 import pytest
 
 from omnigent.inner.native_attachments import (
+    ATTACHMENT_MARKER_STRIP_PATTERN,
     UNRESOLVED_ATTACHMENT_MARKER_PATTERN,
     DataUri,
+    attachment_reference_line,
     materialize_attachment,
     parse_data_uri,
     unresolved_attachment_marker,
@@ -193,3 +195,42 @@ def test_materialize_attachment_reuses_identical_existing_file(tmp_path: Path) -
     assert second == first
     assert third is not None and third != first
     assert len(list((tmp_path / "uploads").iterdir())) == 2
+
+
+def test_materialize_attachment_sanitizes_bracketed_filenames(tmp_path: Path) -> None:
+    """
+    Brackets in the filename cannot break the "[Attached: ...]" line.
+
+    The success-path reference line is matched by the same consumers as
+    the unresolved marker; an unsanitized ``]`` in the written path
+    would end their ``\\[Attached:[^\\]]*\\]`` match early.
+    """
+    block = {
+        "type": "input_image",
+        "image_url": _PNG_DATA_URI,
+        "filename": "shot [final].png",
+    }
+
+    path = materialize_attachment(block, tmp_path)
+
+    assert path is not None
+    assert path.name == "shot _final_.png"
+
+
+def test_attachment_reference_line_covers_both_outcomes(tmp_path: Path) -> None:
+    """
+    One call site yields the path line or the visible loss marker.
+
+    Both shapes must match ATTACHMENT_MARKER_STRIP_PATTERN so TUI
+    forwarders can strip them from mirrored bubbles.
+    """
+    resolved = {"type": "input_image", "image_url": _PNG_DATA_URI, "filename": "photo.png"}
+    unresolved = {"type": "input_image", "file_id": "file_x", "filename": "photo.png"}
+
+    resolved_line = attachment_reference_line(resolved, tmp_path)
+    unresolved_line = attachment_reference_line(unresolved, tmp_path)
+
+    assert resolved_line == f"[Attached: {tmp_path / 'uploads' / 'photo.png'}]"
+    assert unresolved_line == "[Attachment photo.png could not be loaded]"
+    assert re.fullmatch(ATTACHMENT_MARKER_STRIP_PATTERN, resolved_line)
+    assert re.fullmatch(ATTACHMENT_MARKER_STRIP_PATTERN, unresolved_line)

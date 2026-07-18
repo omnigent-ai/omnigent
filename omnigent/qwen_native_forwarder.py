@@ -57,7 +57,7 @@ from pathlib import Path
 
 import httpx
 
-from omnigent.inner.native_attachments import UNRESOLVED_ATTACHMENT_MARKER_PATTERN
+from omnigent.inner.native_attachments import ATTACHMENT_MARKER_STRIP_PATTERN
 from omnigent.qwen_native_bridge import events_file_path
 
 _logger = logging.getLogger(__name__)
@@ -91,7 +91,7 @@ def _new_seen(uuids: Iterable[str] | None = None) -> dict[str, None]:
 # The executor injects ``[Attached: <path>]`` (or the could-not-load marker
 # from native_attachments) for web-UI attachments before submitting; strip them
 # from the mirrored bubble (internal bridge details).
-_ATTACHMENT_MARKER_RE = re.compile(rf"\[Attached:[^\]]*\]|{UNRESOLVED_ATTACHMENT_MARKER_PATTERN}")
+_ATTACHMENT_MARKER_RE = re.compile(ATTACHMENT_MARKER_STRIP_PATTERN)
 
 
 @dataclass

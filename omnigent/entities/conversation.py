@@ -19,8 +19,8 @@ from omnigent.inner.native_attachments import UNRESOLVED_ATTACHMENT_MARKER_PATTE
 # text, so without filtering them a session started with an image is
 # titled by a temp-file path instead of what the user typed. Matched per
 # line by synthesize_conversation_title; keep the Attached variants in
-# sync with omnigent/inner/claude_native_executor.py and
-# omnigent/inner/codex_native_executor.py.
+# sync with attachment_reference_line in omnigent/inner/native_attachments.py
+# and omnigent/inner/codex_native_executor.py.
 _ATTACHMENT_MARKER_RE = re.compile(
     rf"^(?:\[Attached(?: file)?: .+\]|{UNRESOLVED_ATTACHMENT_MARKER_PATTERN})$"
 )

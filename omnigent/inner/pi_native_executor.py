@@ -16,10 +16,7 @@ from omnigent.inner.executor import (
     ToolSpec,
     TurnComplete,
 )
-from omnigent.inner.native_attachments import (
-    materialize_attachment,
-    unresolved_attachment_marker,
-)
+from omnigent.inner.native_attachments import attachment_reference_line
 from omnigent.pi_native_bridge import (
     PI_NATIVE_BRIDGE_DIR_ENV_VAR,
     PI_NATIVE_REQUEST_SESSION_ID_ENV_VAR,
@@ -203,11 +200,7 @@ def _content_to_text(content: Any, bridge_dir: Path) -> str:
                 if isinstance(text, str):
                     text_parts.append(text)
             elif block_type in ("input_image", "input_file"):
-                path = materialize_attachment(block, bridge_dir)
-                if path is not None:
-                    attachment_lines.append(f"[Attached: {path}]")
-                else:
-                    attachment_lines.append(unresolved_attachment_marker(block))
+                attachment_lines.append(attachment_reference_line(block, bridge_dir))
         return "\n\n".join([*attachment_lines, *text_parts])
     if content is None:
         return ""

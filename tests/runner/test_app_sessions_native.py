@@ -829,7 +829,7 @@ async def test_sessions_native_history_file_id_fetch_failure_is_nonfatal(
             )
 
     assert resp.status_code == 202
-    assert "runner failed to resolve file_id" in caplog.text
+    assert "failed to resolve file_id" in caplog.text
     for _ in range(20):
         if harness_client.posted_bodies:
             break

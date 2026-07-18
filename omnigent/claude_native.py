@@ -3524,74 +3524,18 @@ async def _resolve_session_item_file_references(
     :returns: The same items with resolvable attachment blocks rewritten
         to carry ``image_url`` / ``file_data`` data URIs.
     """
-    import base64 as _base64
+    from omnigent.inner.native_attachments import has_unresolved_file_id, resolve_file_id_block
 
     for item in items:
         content = item.get("content")
         if item.get("type") != "message" or not isinstance(content, list):
             continue
-        resolved: list[Any] = []
-        changed = False
-        for block in content:
-            if not isinstance(block, dict):
-                resolved.append(block)
-                continue
-            file_id = block.get("file_id")
-            data_uri = block.get("image_url") or block.get("file_data")
-            already_inline = isinstance(data_uri, str) and data_uri.startswith("data:")
-            if not isinstance(file_id, str) or not file_id or already_inline:
-                resolved.append(block)
-                continue
-            try:
-                meta_resp = await client.get(
-                    f"/v1/sessions/{url_component(session_id)}/resources/files/{file_id}",
-                    timeout=10.0,
-                )
-                content_resp = await client.get(
-                    f"/v1/sessions/{url_component(session_id)}/resources/files/{file_id}/content",
-                    timeout=30.0,
-                )
-                meta_resp.raise_for_status()
-                content_resp.raise_for_status()
-            except httpx.HTTPError:
-                _logger.warning(
-                    "transcript rebuild failed to resolve file_id=%s for session=%s",
-                    file_id,
-                    session_id,
-                    exc_info=True,
-                )
-                resolved.append(block)
-                continue
-            meta = _json_object_from_string(meta_resp.text)
-            if meta_resp.content and not meta:
-                # Unusable metadata only costs the media-type hint; the
-                # content response's Content-Type header still provides it.
-                _logger.warning(
-                    "transcript rebuild got unusable metadata for file_id=%s "
-                    "in session=%s; falling back to the content headers",
-                    file_id,
-                    session_id,
-                )
-            content_type = (
-                meta.get("content_type")
-                or content_resp.headers.get("content-type")
-                or "application/octet-stream"
-            )
-            # Strip any charset suffix: data URIs need the media type hint.
-            if isinstance(content_type, str):
-                content_type = content_type.split(";", 1)[0]
-            else:
-                content_type = "application/octet-stream"
-            encoded = _base64.b64encode(content_resp.content).decode("ascii")
-            new_block = {k: v for k, v in block.items() if k != "file_id"}
-            if block.get("type") == "input_image":
-                new_block["image_url"] = f"data:{content_type};base64,{encoded}"
-            else:
-                new_block["file_data"] = f"data:{content_type};base64,{encoded}"
-            resolved.append(new_block)
-            changed = True
-        if changed:
-            item["content"] = resolved
+        item["content"] = [
+            (await resolve_file_id_block(block, session_id=session_id, client=client) or block)
+            if isinstance(block, dict) and has_unresolved_file_id(block)
+            else block
+            for block in content
+        ]
     return items
 
 
@@ -3897,23 +3841,15 @@ def _claude_attachment_text_blocks_from_api_content(
     :param bridge_dir: Session bridge directory to write files under.
     :returns: Claude ``{"type": "text", "text": ...}`` blocks.
     """
-    from omnigent.inner.native_attachments import (
-        materialize_attachment,
-        unresolved_attachment_marker,
-    )
+    from omnigent.inner.native_attachments import attachment_reference_line
 
     if not isinstance(content, list):
         return []
-    blocks: list[dict[str, Any]] = []
-    for block in content:
-        if not isinstance(block, dict) or block.get("type") not in ("input_image", "input_file"):
-            continue
-        path = materialize_attachment(block, bridge_dir)
-        if path is not None:
-            blocks.append({"type": "text", "text": f"[Attached: {path}]"})
-        else:
-            blocks.append({"type": "text", "text": unresolved_attachment_marker(block)})
-    return blocks
+    return [
+        {"type": "text", "text": attachment_reference_line(block, bridge_dir)}
+        for block in content
+        if isinstance(block, dict) and block.get("type") in ("input_image", "input_file")
+    ]
 
 
 def _claude_assistant_content_from_api_blocks(content: object) -> list[dict[str, Any]] | None:

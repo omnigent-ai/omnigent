@@ -49,7 +49,7 @@ from pathlib import Path
 import httpx
 
 from omnigent._native_post_delivery import post_external_session_status
-from omnigent.inner.native_attachments import UNRESOLVED_ATTACHMENT_MARKER_PATTERN
+from omnigent.inner.native_attachments import ATTACHMENT_MARKER_STRIP_PATTERN
 
 _logger = logging.getLogger(__name__)
 
@@ -95,7 +95,7 @@ def _warn_sqlite_once(context: str, exc: sqlite3.Error) -> None:
 # The executor injects ``[Attached: <path>]`` (or the could-not-load marker
 # from native_attachments) for web-UI attachments before pasting into the TUI;
 # strip them from the mirrored bubble (internal bridge details).
-_ATTACHMENT_MARKER_RE = re.compile(rf"\[Attached:[^\]]*\]|{UNRESOLVED_ATTACHMENT_MARKER_PATTERN}")
+_ATTACHMENT_MARKER_RE = re.compile(ATTACHMENT_MARKER_STRIP_PATTERN)
 
 
 def default_sessions_db() -> Path:

@@ -52,6 +52,7 @@ from omnigent.harness_aliases import (
     native_terminal_name,
 )
 from omnigent.harness_plugins import load_object, model_env_keys, spawn_env_builders
+from omnigent.inner.native_attachments import has_unresolved_file_id, resolve_file_id_block
 from omnigent.llms.summarize import (
     build_summarization_input,
     build_summarization_prompt,
@@ -6950,74 +6951,22 @@ async def _resolve_forwarded_message_content(
     file resource endpoint and inline them before handing content to a
     harness. Blocks already resolved by the server pass through.
     """
-    if not any(isinstance(block, dict) and "file_id" in block for block in content):
+    if not any(isinstance(block, dict) and has_unresolved_file_id(block) for block in content):
         return content
-
-    import base64 as _base64
 
     resolved: list[dict[str, Any]] = []
     changed = False
     for block in content:
-        if not isinstance(block, dict) or "file_id" not in block:
+        new_block = None
+        if isinstance(block, dict) and has_unresolved_file_id(block):
+            new_block = await resolve_file_id_block(
+                block, session_id=session_id, client=server_client
+            )
+        if new_block is None:
             resolved.append(block)
-            continue
-        file_id = block.get("file_id")
-        if not isinstance(file_id, str) or not file_id:
-            resolved.append(block)
-            continue
-        try:
-            meta_resp = await server_client.get(
-                f"/v1/sessions/{session_id}/resources/files/{file_id}",
-                timeout=10.0,
-            )
-            content_resp = await server_client.get(
-                f"/v1/sessions/{session_id}/resources/files/{file_id}/content",
-                timeout=30.0,
-            )
-            meta_resp.raise_for_status()
-            content_resp.raise_for_status()
-        except httpx.HTTPError:
-            _logger.warning(
-                "runner failed to resolve file_id=%s for session=%s",
-                file_id,
-                session_id,
-                exc_info=True,
-            )
-            resolved.append(block)
-            continue
-
-        try:
-            parsed = meta_resp.json() if meta_resp.content else {}
-        except ValueError:
-            parsed = None
-        meta = parsed if isinstance(parsed, dict) else {}
-        if meta_resp.content and not meta:
-            # Unusable metadata only costs the media-type hint; the content
-            # response's Content-Type header still provides it.
-            _logger.warning(
-                "runner got unusable file metadata for file_id=%s in session=%s; "
-                "falling back to the content headers",
-                file_id,
-                session_id,
-            )
-        content_type = (
-            meta.get("content_type")
-            or content_resp.headers.get("content-type")
-            or "application/octet-stream"
-        )
-        # Strip any charset suffix: data URIs need the media type hint.
-        if isinstance(content_type, str):
-            content_type = content_type.split(";", 1)[0]
         else:
-            content_type = "application/octet-stream"
-        encoded = _base64.b64encode(content_resp.content).decode("ascii")
-        new_block = {k: v for k, v in block.items() if k != "file_id"}
-        if block.get("type") == "input_image":
-            new_block["image_url"] = f"data:{content_type};base64,{encoded}"
-        else:
-            new_block["file_data"] = f"data:{content_type};base64,{encoded}"
-        resolved.append(new_block)
-        changed = True
+            resolved.append(new_block)
+            changed = True
 
     return resolved if changed else content
 
