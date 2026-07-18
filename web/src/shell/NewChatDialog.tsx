@@ -134,6 +134,10 @@ import { createBundledSession, launchRunner } from "@/lib/sessionsApi";
 // `kimi` / `kimi-code` are the headless SDK harness (kept for sub-agent / `run
 // --harness kimi` use) — the picker offers only the native TUI (`kimi-native-ui`).
 const NEW_SESSION_HIDDEN_AGENTS = new Set(["nessie", "kimi", "kimi-code"]);
+// Sentinel harness_override value: the synthetic "Smart route" picker entry
+// sends this on create, and the server picks the harness + model itself.
+// Must match SMART_ROUTE_HARNESS in omnigent/server/routes/sessions.py.
+const SMART_ROUTE_HARNESS = "__smart_route__";
 
 // Short picker-row blurbs — the spec descriptions are long paragraphs that
 // truncate badly in the dropdown; other dialogs keep the server values.
@@ -1543,7 +1547,13 @@ function AgentHarnessPicker({
   };
 
   const renderEntry = (agent: AvailableAgent): ReactNode => {
-    const active = agent.id === effectiveAgentId;
+    // When Smart route is picked, effectiveAgentId resolves to a real
+    // fallback agent, so highlight the Smart route row (not that agent) by
+    // its harness sentinel instead of the agent-id match.
+    const smartRouteActive = pickedHarness === SMART_ROUTE_HARNESS;
+    const active = smartRouteActive
+      ? agent.id === SMART_ROUTE_HARNESS
+      : agent.id === effectiveAgentId;
     if (!hasKnobs(agent)) {
       return (
         <DropdownMenuItem
@@ -1803,10 +1813,28 @@ export function NewChatLandingScreen() {
   // user-registered agents). This is the isNativeCodingAgent split, NOT the
   // builtins/customs split: Polly & Debby are built-ins but belong under
   // "Agents", not "Harnesses".
-  const harnessEntries = useMemo(
-    () => agentList.filter((a) => isNativeCodingAgent(a)),
-    [agentList],
-  );
+  // Read once here (before harnessEntries) so the SMART ROUTE entry can be
+  // gated on it. ``info`` is also consumed further down for sandbox chrome.
+  const info = useServerInfo();
+  const smartRoutingEnabled = info !== "loading" && info.smart_routing_enabled;
+  const harnessEntries = useMemo(() => {
+    const entries = agentList.filter((a) => isNativeCodingAgent(a));
+    // SMART ROUTE: a synthetic harness row. When picked it sends
+    // harness_override="__smart_route__" (SMART_ROUTE_HARNESS) on create; the
+    // server chooses the harness + model and binds the session to its pick.
+    // Only offered when the server advertises a routing client.
+    if (smartRoutingEnabled) {
+      entries.push({
+        id: SMART_ROUTE_HARNESS,
+        name: "smart_route",
+        display_name: "Smart route",
+        description: "Let the server pick the best harness and model for your first message.",
+        harness: null,
+        skills: [],
+      });
+    }
+    return entries;
+  }, [agentList, smartRoutingEnabled]);
   const agentEntries = useMemo(() => agentList.filter((a) => !isNativeCodingAgent(a)), [agentList]);
 
   // "Create custom agent" dialog state and pending bundle. When the user
@@ -1876,9 +1904,7 @@ export function NewChatLandingScreen() {
   // Gates the sandbox host option: only servers whose sandbox
   // config can actually serve a managed launch advertise it. "loading"
   // fails closed (option hidden) until the boot probe resolves.
-  const info = useServerInfo();
   const managedSandboxesEnabled = info !== "loading" && info.managed_sandboxes_enabled;
-  const smartRoutingEnabled = info !== "loading" && info.smart_routing_enabled;
   // Provider-named label for the sandbox option (e.g. "Modal Sandbox"),
   // falling back to the generic "New Sandbox" when the server names no
   // provider.
@@ -2717,7 +2743,12 @@ export function NewChatLandingScreen() {
   // The trigger label is just the agent name; the run-config knobs live in
   // the picker's per-entry submenu, so duplicating their values here would be
   // redundant.
-  const agentLabel = selectedAgent ? selectedAgent.display_name : "Select agent";
+  const agentLabel =
+    pickedHarness === SMART_ROUTE_HARNESS
+      ? "Smart route"
+      : selectedAgent
+        ? selectedAgent.display_name
+        : "Select agent";
 
   // Wrap the harness setter so every explicit pick is persisted to
   // localStorage. The caller can pass an explicit `agentId` for the
@@ -2737,6 +2768,14 @@ export function NewChatLandingScreen() {
   // returning user lands on the harness they used last); explicit picks
   // persist via localStorage.
   const handleSelectAgent = (agent: AvailableAgent) => {
+    // Smart route: bind to the default agent (effectiveAgentId resolves the
+    // sentinel to agentList[0]) and send the SMART_ROUTE_HARNESS override so
+    // the server picks the harness + model. Not persisted as a "last agent".
+    if (agent.id === SMART_ROUTE_HARNESS) {
+      setPickedAgentId(SMART_ROUTE_HARNESS);
+      setPickedHarness(SMART_ROUTE_HARNESS);
+      return;
+    }
     if (agent.id !== effectiveAgentId) setPickedHarness(readLastHarness(agent.id));
     setPickedAgentId(agent.id);
     writeLastAgentId(agent.id);

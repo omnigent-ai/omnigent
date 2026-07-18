@@ -3052,6 +3052,119 @@ def _resolve_harness(conv: Conversation | None) -> str | None:
         return None
 
 
+# Sentinel ``harness_override`` value meaning "let the server pick the harness
+# at session start" (SMART ROUTE). Detected before harness validation and
+# replaced with the routed harness; never persisted verbatim.
+SMART_ROUTE_HARNESS = "__smart_route__"
+
+
+def _load_agent_spec_from_agent(agent: Agent) -> Any | None:  # type: ignore[explicit-any]  # AgentSpec
+    """Load the parsed :class:`AgentSpec` for an agent row, or ``None``.
+
+    Mirrors :func:`_validated_harness_override`'s bundle load; used at
+    session create where no conversation row exists yet.
+    """
+    from omnigent.runtime import get_agent_cache
+
+    try:
+        loaded = get_agent_cache().load(
+            agent.id, agent.bundle_location, expand_env=agent.session_id is None
+        )
+    except (KeyError, AttributeError, ValueError, ImportError, OSError):
+        _logger.debug("smart_route: could not load spec for agent=%s", agent.id, exc_info=True)
+        return None
+    return loaded.spec
+
+
+def _first_user_text(items: list[SessionEventInput]) -> str:
+    """Return the first user message's text from create-time ``initial_items``.
+
+    Reuses :func:`_extract_user_text_for_routing`; ``""`` when no message
+    item carries text.
+    """
+    for item in items:
+        if item.type == "message":
+            text = _extract_user_text_for_routing(item)
+            if text:
+                return text
+    return ""
+
+
+def _smart_route_eligible_harnesses(host: Host | None) -> list[str]:
+    """Config-declared SMART ROUTE harnesses, filtered to launchable ones.
+
+    Intersects ``RuntimeCaps.smart_route_harnesses`` with the host's
+    ``configured_harnesses`` so the router is never offered a harness the
+    host cannot spawn. When the host has never reported its harnesses
+    (``None`` — older build), trust the config list unfiltered.
+
+    :param host: The host the session will launch on, or ``None``.
+    :returns: Eligible harness ids, possibly empty.
+    """
+    from omnigent.runtime import get_caps
+
+    declared = get_caps().smart_route_harnesses or []
+    configured = host.configured_harnesses if host is not None else None
+    if configured is None:
+        return list(declared)
+    return [h for h in declared if configured.get(h)]
+
+
+async def _smart_route_harness(
+    *,
+    spec: Any,  # type: ignore[explicit-any]  # AgentSpec
+    first_message: str,
+    host: Host | None,
+) -> tuple[str | None, str | None]:
+    """Pick a harness + model for a fresh session via the routing client.
+
+    Offers the routing client a cross-harness candidate set — each eligible
+    harness (:func:`_smart_route_eligible_harnesses`) with its live model
+    catalog (``list_models_for_worker``) — and returns the router's choice.
+
+    :param spec: The creating agent's spec (provider resolution source).
+    :param first_message: The session's first user message text.
+    :param host: The launch host (for harness eligibility).
+    :returns: ``(harness, model)`` to persist, or ``(None, None)`` to fall
+        back to the agent's default harness (routing off, empty catalog, or
+        the router declined / returned no harness).
+    """
+    from omnigent.model_catalog import list_models_for_worker
+    from omnigent.runtime import get_caps
+
+    routing_client = get_caps().routing_client
+    if routing_client is None or not first_message.strip():
+        return None, None
+
+    available: dict[str, list[str]] = {}
+    for harness in _smart_route_eligible_harnesses(host):
+        try:
+            listing = await asyncio.to_thread(list_models_for_worker, spec, harness)
+        except Exception:  # noqa: BLE001 — one bad provider must not block routing
+            _logger.debug(
+                "smart_route: model listing failed for harness=%s", harness, exc_info=True
+            )
+            continue
+        ids = [m.id for m in listing.models]
+        if ids:
+            available[harness] = ids
+    if not available:
+        _logger.info("smart_route: no eligible harness models; using agent default")
+        return None, None
+
+    result = await routing_client.route(first_message, available)
+    if result is None or result.harness is None:
+        _logger.info("smart_route: router returned no harness; using agent default")
+        return None, None
+    _logger.info(
+        "smart_route: selected harness=%s model=%s rationale=%s",
+        result.harness,
+        result.model,
+        result.rationale,
+    )
+    return result.harness, result.model
+
+
 def _validated_harness_override(value: str | None, agent: Agent) -> str | None:
     """
     Validate + canonicalize a session-create ``harness_override``.
@@ -12989,12 +13102,34 @@ async def _create_session_from_existing_agent(
         body.cost_control_mode_override
     )
 
-    # Validated against the loaded spec (known harness + omnigent
-    # executor type) before any row exists, mirroring the CLI's
-    # --harness fail-loud rules.
-    harness_override = await asyncio.to_thread(
-        _validated_harness_override, body.harness_override, agent
-    )
+    # SMART ROUTE: the sentinel asks the server to pick the harness at
+    # session start. Route now (before validation/persist) and substitute the
+    # chosen harness + model; on any failure fall through to the agent default.
+    if body.harness_override == SMART_ROUTE_HARNESS:
+        _sr_spec = await asyncio.to_thread(_load_agent_spec_from_agent, agent)
+        _sr_message = _first_user_text(body.initial_items)
+        _sr_host = None
+        if body.host_id is not None:
+            _host_store = getattr(request.app.state, "host_store", None)
+            if _host_store is not None:
+                _sr_host = await asyncio.to_thread(_host_store.get_host, body.host_id)
+        _routed_harness = None
+        if _sr_spec is not None:
+            _routed_harness, _routed_model = await _smart_route_harness(
+                spec=_sr_spec, first_message=_sr_message, host=_sr_host
+            )
+            if _routed_harness is not None and _routed_model is not None:
+                model_override = _routed_model
+        # Sentinel consumed either way: persist the routed harness or None
+        # (agent default) — never the literal sentinel.
+        harness_override = _routed_harness
+    else:
+        # Validated against the loaded spec (known harness + omnigent
+        # executor type) before any row exists, mirroring the CLI's
+        # --harness fail-loud rules.
+        harness_override = await asyncio.to_thread(
+            _validated_harness_override, body.harness_override, agent
+        )
 
     # Inherit runner affinity from the parent session so the child
     # is assigned to the same runner (sub-agent co-location).

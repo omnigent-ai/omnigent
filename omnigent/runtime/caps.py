@@ -75,3 +75,9 @@ class RuntimeCaps:
     # Managed deployments can supply a different implementation (e.g.
     # a rules engine or remote service).  ``None`` disables routing.
     routing_client: RoutingClient | None = None
+    # Harnesses the SMART ROUTE create-time router may choose among, from
+    # ``routing.harnesses`` in the server --config YAML. Each harness's
+    # models are resolved live at session create (model_catalog); the set is
+    # intersected with the host's launchable harnesses. Empty disables the
+    # create-time harness pick (first-message model routing still applies).
+    smart_route_harnesses: list[str] = field(default_factory=list)

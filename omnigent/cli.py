@@ -3332,18 +3332,25 @@ def server(
     # Hidden by default — managed deployments override
     # RuntimeCaps.routing_client with their own implementation.
     routing_client = None
+    smart_route_harnesses: list[str] = []
     if os.environ.get("OMNIGENT_SMART_ROUTING") == "1":
         routing_cfg = cfg.get("routing")
         if isinstance(routing_cfg, dict) and routing_cfg.get("provider") == "external":
             routing_client = _build_external_routing_client(routing_cfg)
         else:
             routing_client = _build_local_llm_routing_client(server_llm)
+        # SMART ROUTE candidate harnesses (create-time harness selection).
+        if isinstance(routing_cfg, dict):
+            raw_harnesses = routing_cfg.get("harnesses")
+            if isinstance(raw_harnesses, list):
+                smart_route_harnesses = [h for h in raw_harnesses if isinstance(h, str) and h]
 
     caps = RuntimeCaps(
         execution_timeout=int(effective_timeout),
         default_policies=parse_default_policies(cfg.get("policies")),
         llm=server_llm,
         routing_client=routing_client,
+        smart_route_harnesses=smart_route_harnesses,
     )
     init_runtime(
         conversation_store=conversation_store,
