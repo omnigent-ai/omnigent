@@ -193,6 +193,54 @@ def test_web_started_codex_turn_returns_without_waiting_for_terminal_event(
     ]
 
 
+def test_system_prompt_does_not_override_collaboration_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Native startup config owns system prompts; turns preserve Codex defaults."""
+    from omnigent.tools.builtins.session_rename import SESSION_RENAME_INSTRUCTION
+
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.created = []
+    _FakeCodexNativeClient.next_turn = 1
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_123",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_123",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id=None,
+        ),
+    )
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    async def run() -> None:
+        async for _event in executor.run_turn(
+            [{"role": "user", "content": [{"type": "input_text", "text": "hello"}]}],
+            [],
+            SESSION_RENAME_INSTRUCTION,
+            None,
+        ):
+            pass
+
+    asyncio.run(run())
+
+    assert _FakeCodexNativeClient.requests == [
+        (
+            "turn/start",
+            {
+                "threadId": "thread_123",
+                "input": [{"type": "text", "text": "hello"}],
+            },
+        ),
+    ]
+
+
 def test_image_block_is_sent_as_local_image_not_inline_base64(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

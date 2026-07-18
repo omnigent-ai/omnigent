@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import random
@@ -11,9 +12,70 @@ from typing import Any
 
 import httpx
 
+# Pure event parsing, DTOs, and the base error live in ``events``; the client
+# and pool here build on them. Re-exported below so existing
+# ``from omnigent_slack.omnigent import extract_delta`` sites keep working.
+from omnigent_slack.events import (
+    ElicitationOption,
+    ElicitationQuestion,
+    ElicitationRequest,
+    OmnigentError,
+    OutputFile,
+    SessionActivity,
+    _extract_list,
+    _extract_runner_id,
+    _extract_session_id,
+    _host_id,
+    _is_host_online,
+    extract_assistant_text,
+    extract_delta,
+    extract_elicitation_request,
+    extract_error_text,
+    extract_output_file,
+    extract_policy_denied,
+    extract_todos,
+    is_elicitation_request,
+    is_soft_idle_event,
+    is_terminal_event,
+    iter_sse_events,
+)
 
-class OmnigentError(RuntimeError):
-    pass
+__all__ = [
+    "AuthRequiredError",
+    "AuthResolver",
+    "ClientAuth",
+    "ElicitationOption",
+    "ElicitationQuestion",
+    "ElicitationRequest",
+    "HostUnavailableError",
+    "OmnigentClient",
+    "OmnigentClientPool",
+    "OmnigentError",
+    "OutputFile",
+    "RunnerUnavailableError",
+    "ServerUnreachableError",
+    "SessionActivity",
+    "ValidatedServer",
+    "extract_assistant_text",
+    "extract_delta",
+    "extract_elicitation_request",
+    "extract_error_text",
+    "extract_output_file",
+    "extract_policy_denied",
+    "extract_todos",
+    "is_elicitation_request",
+    "is_soft_idle_event",
+    "is_terminal_event",
+    "iter_sse_events",
+]
+
+_logger = logging.getLogger(__name__)
+
+# Sentinels for the idle-grace disambiguation. ``_NO_RESUMPTION``: the grace
+# window elapsed and the snapshot confirms the turn is over. ``_RESUMED``: the
+# stream produced another event (or ended), so the turn continues.
+_NO_RESUMPTION = object()
+_RESUMED = object()
 
 
 class RunnerUnavailableError(OmnigentError):
@@ -95,9 +157,15 @@ class OmnigentClient:
         runner_launch_timeout_seconds: float = 60.0,
         auth: ClientAuth | None = None,
     ) -> None:
+        # Bounded read timeout for ordinary requests so a stalled server can't
+        # hang a call indefinitely and wedge the per-thread turn queue. The
+        # long-lived SSE stream overrides this with ``read=None`` at its call
+        # site (see ``stream_session_events``), since a live tail legitimately
+        # blocks between events.
+        self._timeout = timeout
         self._client = httpx.AsyncClient(
             base_url=base_url.rstrip("/"),
-            timeout=httpx.Timeout(timeout, read=None),
+            timeout=httpx.Timeout(timeout),
         )
         self._runner_launch_timeout_seconds = runner_launch_timeout_seconds
         self._auth = auth
@@ -116,7 +184,10 @@ class OmnigentClient:
         # server itself is unreachable — distinct from an HTTP error response,
         # which ``_raise_for_status`` classifies.
         used_token = self._auth.access_token if self._auth is not None else None
-        headers = {**self._auth_headers(), **(kwargs.pop("headers", None) or {})}
+        # Pop caller headers once — a second pop would return None and silently
+        # drop them on the 401 retry below.
+        custom_headers = kwargs.pop("headers", None) or {}
+        headers = {**self._auth_headers(), **custom_headers}
         try:
             response = await self._client.request(method, url, headers=headers, **kwargs)
         except httpx.HTTPError as exc:
@@ -128,7 +199,7 @@ class OmnigentClient:
         if response.status_code == 401 and self._auth is not None:
             new_token = await self._auth.refresh(used_token)
             if new_token:
-                retry_headers = {**self._auth_headers(), **(kwargs.pop("headers", None) or {})}
+                retry_headers = {**self._auth_headers(), **custom_headers}
                 try:
                     response = await self._client.request(
                         method, url, headers=retry_headers, **kwargs
@@ -159,7 +230,9 @@ class OmnigentClient:
         return ValidatedServer(agents=agents, online_hosts=online_hosts)
 
     async def create_session(self, agent_id: str, title: str) -> str:
-        self._logger.info("Creating Omnigent session agent_id=%s title=%r", agent_id, title)
+        # Don't log the title — it embeds the user's message text; log only the
+        # agent id (everywhere else we log lengths, not content).
+        self._logger.info("Creating Omnigent session agent_id=%s", agent_id)
         response = await self._request(
             "POST",
             "/v1/sessions",
@@ -189,6 +262,46 @@ class OmnigentClient:
         response = await self._request("POST", f"/v1/sessions/{session_id}/events", json=payload)
         await _raise_for_status(response)
         self._logger.debug("Submitted Omnigent message session_id=%s", session_id)
+
+    async def resolve_elicitation(
+        self,
+        session_id: str,
+        elicitation_id: str,
+        *,
+        accepted: bool,
+        content: dict[str, Any] | None = None,
+    ) -> None:
+        """Deliver a verdict for a parked elicitation.
+
+        ``accepted`` picks the MCP action (``accept``/``decline``). ``content``
+        carries form answers for a form-mode elicitation (e.g. AskUserQuestion's
+        ``{question: selected_label}`` map, which the server forwards to the
+        agent as the tool result) — omitted for a binary approve/deny.
+
+        Posts to the dedicated resolve endpoint (the id rides in the URL). The
+        server returns 202 on delivery and 404/409 when the elicitation is
+        already gone (cancel race / already resolved) — all benign, so only an
+        unexpected status is surfaced.
+        """
+        self._logger.info(
+            "Resolving Omnigent elicitation session_id=%s elicitation_id=%s accepted=%s "
+            "has_content=%s",
+            session_id,
+            elicitation_id,
+            accepted,
+            content is not None,
+        )
+        body: dict[str, Any] = {"action": "accept" if accepted else "decline"}
+        if content:
+            body["content"] = content
+        response = await self._request(
+            "POST",
+            f"/v1/sessions/{session_id}/elicitations/{elicitation_id}/resolve",
+            json=body,
+        )
+        if response.status_code in (200, 202, 404, 409):
+            return
+        await _raise_for_status(response)
 
     async def launch_runner(
         self,
@@ -222,9 +335,13 @@ class OmnigentClient:
         # the chosen host can't serve the session — surface it as host-unavailable
         # so the caller can tell the user to start a host.
         if response.status_code in (404, 409):
-            raise HostUnavailableError(
-                f"Omnigent host {target_host} is not available: {response.text}"
+            self._logger.warning(
+                "Omnigent host unavailable host=%s status=%s body=%r",
+                target_host,
+                response.status_code,
+                response.text,
             )
+            raise HostUnavailableError(f"Omnigent host {target_host} is not available.")
         await _raise_for_status(response)
         payload = response.json()
         runner_id = _extract_runner_id(payload)
@@ -286,7 +403,9 @@ class OmnigentClient:
             if _is_host_online(host) and (host_id := _host_id(host)) is not None
         ]
         if not host_ids:
-            raise HostUnavailableError("No online Omnigent hosts are available to launch a runner.")
+            raise HostUnavailableError(
+                "No online Omnigent hosts are available to launch a runner."
+            )
         host_id = random.choice(host_ids)
         self._logger.info(
             "Selected random Omnigent host host_id=%s candidates=%s",
@@ -333,6 +452,9 @@ class OmnigentClient:
                 f"/v1/sessions/{session_id}/stream",
                 params={"idle": "false"},
                 headers=self._auth_headers(),
+                # A live tail blocks between events — disable the read timeout
+                # for the stream only (ordinary requests keep the bounded one).
+                timeout=httpx.Timeout(self._timeout, read=None),
             ) as response:
                 await _raise_for_status(response)
                 self._logger.debug("Connected to Omnigent SSE stream session_id=%s", session_id)
@@ -349,9 +471,14 @@ class OmnigentClient:
         *,
         workspace: str | None = None,
         host_id: str | None = None,
+        idle_grace_seconds: float = 600.0,
+        idle_poll_seconds: float = 5.0,
+        idle_settle_seconds: float = 2.0,
     ) -> AsyncIterator[dict[str, Any]]:
         try:
-            async for event in self._run_turn_once(session_id, text):
+            async for event in self._run_turn_once(
+                session_id, text, idle_grace_seconds, idle_poll_seconds, idle_settle_seconds
+            ):
                 yield event
             return
         except RunnerUnavailableError:
@@ -364,44 +491,273 @@ class OmnigentClient:
             )
             await self.launch_runner(session_id, workspace=workspace, host_id=host_id)
 
-        async for event in self._run_turn_once(session_id, text):
+        async for event in self._run_turn_once(
+            session_id, text, idle_grace_seconds, idle_poll_seconds, idle_settle_seconds
+        ):
             yield event
 
-    async def _run_turn_once(self, session_id: str, text: str) -> AsyncIterator[dict[str, Any]]:
+    async def _run_turn_once(
+        self,
+        session_id: str,
+        text: str,
+        idle_grace_seconds: float,
+        idle_poll_seconds: float,
+        idle_settle_seconds: float,
+    ) -> AsyncIterator[dict[str, Any]]:
         async with self.stream_session_events(session_id) as events:
             await self.submit_message(session_id, text)
-            async for event in events:
-                self._logger.debug(
-                    "Received Omnigent event session_id=%s type=%s",
-                    session_id,
-                    event.get("type"),
-                )
-                yield event
-                if is_terminal_event(event):
-                    self._logger.info(
-                        "Omnigent turn reached terminal event session_id=%s type=%s",
+            iterator = events.__aiter__()
+            # A single in-flight "next event" task, reused across idle grace
+            # windows. Timing it out must NOT cancel the underlying __anext__
+            # (that would terminate the async generator), so we keep the task
+            # alive with asyncio.wait and only await it again next window.
+            pending: asyncio.Task[dict[str, Any]] | None = None
+            # The FIRST read is unbounded — the turn hasn't started producing yet,
+            # so a bare wait is correct (the server may be `idle` for a beat right
+            # after submit before it goes `running`). Every read AFTER the first
+            # event is disambiguated via the grace window: this makes the turn
+            # ALWAYS bounded — it can only stay alive while the server reports
+            # `running`. A stream that goes silent without a terminal/idle event
+            # (half-open connection, or an `idle` edge missed because the consumer
+            # was parked on an elicitation) would otherwise block this read
+            # forever and wedge the thread. Active streaming pays NO latency: the
+            # settle-wait returns immediately when events are flowing, so the
+            # status poll only fires after a genuine quiet gap.
+            disambiguate = False
+            try:
+                while True:
+                    if pending is None:
+                        pending = asyncio.ensure_future(iterator.__anext__())
+
+                    if disambiguate:
+                        # Time out the wait WITHOUT cancelling the in-flight read
+                        # (cancelling __anext__ would kill the generator); on a
+                        # quiet window consult the rolled-up snapshot — while a
+                        # sub-agent child is still running the parent reads
+                        # `running`, so keep waiting (a slow child can outlast the
+                        # grace window). Ends only when the snapshot is not running.
+                        resumed = await self._await_within_grace(
+                            pending,
+                            session_id,
+                            idle_grace_seconds,
+                            idle_poll_seconds,
+                            idle_settle_seconds,
+                        )
+                        if resumed is _NO_RESUMPTION:
+                            pending.cancel()
+                            self._logger.info(
+                                "Omnigent turn settled idle with no resumption session_id=%s",
+                                session_id,
+                            )
+                            break
+
+                    try:
+                        event = await pending
+                    except StopAsyncIteration:
+                        break
+                    pending = None
+
+                    self._logger.debug(
+                        "Received Omnigent event session_id=%s type=%s",
                         session_id,
                         event.get("type"),
                     )
-                    break
+                    yield event
 
-    async def latest_assistant_text(self, session_id: str) -> str | None:
-        self._logger.debug("Fetching latest Omnigent assistant item session_id=%s", session_id)
-        response = await self._request(
-            "GET",
-            f"/v1/sessions/{session_id}/items",
-            params={"limit": 100, "order": "desc"},
+                    # Every subsequent read is bounded by the grace disambiguation.
+                    disambiguate = True
+
+                    # A HARD terminal (failed/cancelled) ends the turn now. A soft
+                    # `idle` is NOT terminal here: a fan-out orchestrator settles
+                    # idle between wake cycles, so we DON'T break — the next
+                    # (bounded) read either resumes when more arrives or ends via
+                    # the status poll when the server is genuinely done.
+                    if is_terminal_event(event) and not is_soft_idle_event(event):
+                        self._logger.info(
+                            "Omnigent turn reached terminal event session_id=%s type=%s",
+                            session_id,
+                            event.get("type"),
+                        )
+                        break
+            finally:
+                # Cancel and AWAIT the in-flight read so the underlying httpx
+                # stream isn't still running when the context manager closes it
+                # (aclose on a mid-flight async generator raises "already
+                # running"). Swallow the cancellation/stop that surfaces here.
+                if pending is not None:
+                    pending.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await pending
+
+    async def _await_within_grace(
+        self,
+        pending: asyncio.Task[dict[str, Any]],
+        session_id: str,
+        grace_seconds: float,
+        poll_seconds: float,
+        settle_seconds: float,
+    ) -> object:
+        """After a soft ``idle``, wait for the stream to resume or confirm it ended.
+
+        Waits on the in-flight read WITHOUT cancelling it (``asyncio.wait``
+        leaves the task pending, so the async generator survives to be awaited
+        again). Returns ``_RESUMED`` when the stream produced another event (or
+        ended — the caller's ``await`` then surfaces ``StopAsyncIteration``), or
+        ``_NO_RESUMPTION`` once the turn is genuinely over.
+
+        Two timescales, because ``idle`` is doubly ambiguous:
+
+        1. **Settle wait** (``settle_seconds``, short): a claude-native turn
+           oscillates ``running``/``idle`` *while still streaming* its answer,
+           with sub-second gaps between bursts. So EVERY idle first waits a short
+           settle window for the next burst — ending here would truncate the
+           reply mid-answer. Bounded and small so a genuinely-final idle adds
+           only a brief tail.
+        2. **Snapshot + poll** (``poll_seconds``, coarse): if still quiet after
+           the settle, consult the rolled-up status. A fan-out orchestrator
+           parked between wake cycles reads ``running`` (a sub-agent is working),
+           so keep polling — a slow child can take many seconds. Only when the
+           snapshot is no longer ``running`` is the turn over.
+
+        ``grace_seconds`` caps the total wait so a stuck session can't park the
+        turn forever.
+        """
+        deadline = asyncio.get_running_loop().time() + grace_seconds
+        while True:
+            # Settle: wait briefly for the next streaming burst. Handles the
+            # mid-answer running/idle oscillation without truncating.
+            done, _ = await asyncio.wait({pending}, timeout=settle_seconds)
+            if done:
+                return _RESUMED
+            # Still quiet — is the session genuinely done, or a fan-out parent
+            # waiting on a sub-agent (rolled-up status still `running`)?
+            status = await self.get_session_status(session_id)
+            # The status fetch is a network round-trip; the next event may have
+            # arrived during it. Re-check before ending, or we'd cancel a
+            # completed read and truncate the reply.
+            if pending.done():
+                return _RESUMED
+            # Only a DEFINITIVE not-running status ends the turn. A ``None`` here
+            # is a best-effort snapshot failure (transient network/server blip) —
+            # treating it as "done" would truncate a still-live fan-out on a
+            # momentary hiccup, so keep waiting until the grace cap instead.
+            if status is not None and status != "running":
+                return _NO_RESUMPTION
+            if asyncio.get_running_loop().time() >= deadline:
+                self._logger.info(
+                    "Idle grace cap (%ss) elapsed while still running session_id=%s; "
+                    "ending turn to avoid parking forever",
+                    grace_seconds,
+                    session_id,
+                )
+                return _NO_RESUMPTION
+            # Fan-out parent still working — wait a coarser poll for resumption.
+            done, _ = await asyncio.wait({pending}, timeout=poll_seconds)
+            if done:
+                return _RESUMED
+            self._logger.debug(
+                "Idle poll quiet but session still running (sub-agent "
+                "outstanding) session_id=%s; continuing to wait",
+                session_id,
+            )
+
+    async def _get_json(self, url: str, **kwargs: Any) -> dict[str, Any] | None:
+        """Best-effort GET returning the JSON body as a dict, else ``None``.
+
+        Shared by the read-only status/elicitation/items probes, all of which
+        must degrade gracefully (a transient failure must never abort or wedge a
+        turn). Swallows transport/HTTP errors AND a non-JSON body — callers get
+        ``None`` and apply their own conservative default.
+        """
+        try:
+            response = await self._request("GET", url, **kwargs)
+            await _raise_for_status(response)
+            payload = response.json()
+        except (OmnigentError, ValueError):
+            # ValueError covers json.JSONDecodeError (non-JSON 200 body).
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    async def get_session_status(self, session_id: str) -> str | None:
+        """Fetch the session's rolled-up status from the snapshot.
+
+        The snapshot's ``status`` rolls direct sub-agent child activity into the
+        parent: a fan-out orchestrator parked between wake cycles reads
+        ``running`` here (a child is still working) even though its own runner
+        emitted ``idle`` on the stream. That makes this the authoritative "is the
+        turn really over?" check when a stream ``idle`` is ambiguous. Best-effort
+        — returns ``None`` on any failure so the caller falls back to the timer.
+        """
+        snapshot = await self._get_json(f"/v1/sessions/{session_id}")
+        status = snapshot.get("status") if snapshot else None
+        return status if isinstance(status, str) else None
+
+    async def get_session_activity(self, session_id: str) -> SessionActivity:
+        """Snapshot of whether the SERVER considers this session busy.
+
+        Mirrors the web UI's send-gating (``computeIsWorking`` +
+        pending-elicitation): a session is busy when its rolled-up ``status`` is
+        ``running``/``waiting``, and needs user action when it has a pending
+        elicitation. Both are SERVER-derived — the authoritative "can I submit a
+        new prompt now?" signal — unlike any local connection bookkeeping. One
+        GET. Best-effort: an unreadable snapshot returns ``unknown`` so the caller
+        can decide conservatively (we treat unknown as "go ahead", since the
+        server itself safely buffers a message that races a turn).
+        """
+        snapshot = await self._get_json(f"/v1/sessions/{session_id}")
+        if snapshot is None:
+            return SessionActivity(status=None, pending_elicitation=False)
+        status = snapshot.get("status")
+        return SessionActivity(
+            status=status if isinstance(status, str) else None,
+            pending_elicitation=bool(self._parse_pending(snapshot)),
         )
-        await _raise_for_status(response)
-        payload = response.json()
-        items = payload.get("data", [])
+
+    @staticmethod
+    def _parse_pending(snapshot: dict[str, Any] | None) -> list[dict[str, Any]]:
+        pending = snapshot.get("pending_elicitations") if snapshot else None
+        return [e for e in pending if isinstance(e, dict)] if isinstance(pending, list) else []
+
+    async def is_elicitation_pending(self, session_id: str, elicitation_id: str) -> bool:
+        """Whether ``elicitation_id`` is still outstanding on the server.
+
+        Lets a Slack-side waiter detect that the elicitation was resolved
+        *elsewhere* (the web UI, another client) and stop waiting. Best-effort:
+        on a read failure returns ``True`` (assume still pending) so a transient
+        hiccup doesn't spuriously abandon the wait.
+        """
+        snapshot = await self._get_json(f"/v1/sessions/{session_id}")
+        if snapshot is None:
+            return True  # read failed — assume still pending, don't abandon.
+        return any(
+            e.get("elicitation_id") == elicitation_id for e in self._parse_pending(snapshot)
+        )
+
+    async def latest_assistant_message(self, session_id: str) -> tuple[str | None, str] | None:
+        """Return ``(item_id, text)`` of the newest assistant message, or None.
+
+        The id lets a caller tell *this* turn's message from a prior turn's — a
+        blind "latest text" fetch would otherwise resurrect the previous answer
+        when the current turn produced none (e.g. a denied approval). ``item_id``
+        is ``None`` when the message carries no id, so a caller can't mistake two
+        id-less messages for the same one. Best-effort: the outer ``None`` on any
+        read failure (the caller must not be left mid-turn if the snapshot fetch
+        fails).
+        """
+        self._logger.debug("Fetching latest Omnigent assistant item session_id=%s", session_id)
+        payload = await self._get_json(
+            f"/v1/sessions/{session_id}/items", params={"limit": 100, "order": "desc"}
+        )
+        items = payload.get("data") if payload else None
         if not isinstance(items, list):
             return None
         for item in items:
-            if isinstance(item, dict):
-                text = extract_assistant_text(item)
-                if text:
-                    return text
+            if not isinstance(item, dict):
+                continue
+            text = extract_assistant_text(item)
+            if text:
+                item_id = item.get("id")
+                return (item_id if isinstance(item_id, str) and item_id else None, text)
         return None
 
 
@@ -486,213 +842,28 @@ class OmnigentClientPool:
             await client.aclose()
 
 
-async def iter_sse_events(lines: AsyncIterator[str]) -> AsyncIterator[dict[str, Any]]:
-    event_name: str | None = None
-    data_lines: list[str] = []
-
-    async for raw_line in lines:
-        line = raw_line.rstrip("\r")
-        if line == "":
-            event = _decode_sse_event(event_name, data_lines)
-            event_name = None
-            data_lines = []
-            if event is None:
-                continue
-            if event == "[DONE]":
-                break
-            if isinstance(event, str):
-                continue
-            yield event
-            continue
-
-        if line.startswith(":"):
-            continue
-
-        field, separator, value = line.partition(":")
-        if separator and value.startswith(" "):
-            value = value[1:]
-        if field == "event":
-            event_name = value
-        elif field == "data":
-            data_lines.append(value)
-
-    event = _decode_sse_event(event_name, data_lines)
-    if isinstance(event, dict):
-        yield event
-
-
-def is_terminal_event(event: dict[str, Any]) -> bool:
-    # A turn ends at the SESSION level, not the response level. Orchestrator
-    # agents emit a `response.completed`/`turn.completed` every time they end a
-    # turn to wait on a background sub-agent, then resume with more responses in
-    # the same turn — so treating those as terminal cuts the stream off at the
-    # first sub-agent dispatch. `session.status` is the authoritative signal:
-    # `running` -> `waiting` (parked on async work) -> `running` -> `idle`, and
-    # only `idle`/`failed` mean the turn is truly over.
-    event_type = str(event.get("type"))
-    if event_type == "session.status":
-        return str(event.get("status")) in {"idle", "failed"}
-    # Explicit turn/response failure and cancellation still end the turn; keep
-    # them as a fallback in case the session settles without an `idle` edge.
-    return event_type in {
-        "response.failed",
-        "response.cancelled",
-        "turn.failed",
-        "turn.cancelled",
-    }
-
-
-def extract_delta(event: dict[str, Any]) -> str | None:
-    if event.get("type") != "response.output_text.delta":
-        return None
-    delta = event.get("delta")
-    return delta if isinstance(delta, str) else None
-
-
-def extract_error_text(event: dict[str, Any]) -> str | None:
-    event_type = str(event.get("type"))
-    if event_type == "response.error":
-        error = event.get("error")
-        if isinstance(error, dict):
-            message = error.get("message")
-            if isinstance(message, str):
-                return message
-        message = event.get("message")
-        if isinstance(message, str):
-            return message
-    if event_type in {"response.failed", "turn.failed"}:
-        response = event.get("response")
-        if isinstance(response, dict):
-            last_error = response.get("error") or response.get("last_error")
-            if isinstance(last_error, dict):
-                message = last_error.get("message")
-                if isinstance(message, str):
-                    return message
-        error = event.get("error")
-        if isinstance(error, dict):
-            message = error.get("message")
-            if isinstance(message, str):
-                return message
-        if isinstance(error, str):
-            return error
-    return None
-
-
-def extract_assistant_text(event_or_item: dict[str, Any]) -> str | None:
-    if event_or_item.get("type") == "response.output_item.done":
-        item = event_or_item.get("item")
-        return extract_assistant_text(item) if isinstance(item, dict) else None
-
-    item_type = event_or_item.get("type")
-    if item_type != "message":
-        return None
-
-    data = event_or_item.get("data")
-    message = data if isinstance(data, dict) else event_or_item
-    if message.get("role") != "assistant":
-        return None
-
-    content = message.get("content")
-    if not isinstance(content, list):
-        return None
-
-    parts: list[str] = []
-    for block in content:
-        if not isinstance(block, dict):
-            continue
-        text = block.get("text")
-        if isinstance(text, str):
-            parts.append(text)
-    return "".join(parts).strip() or None
-
-
-def _decode_sse_event(event_name: str | None, data_lines: list[str]) -> dict[str, Any] | str | None:
-    if not data_lines:
-        return None
-    data = "\n".join(data_lines)
-    if data == "[DONE]":
-        return data
-    try:
-        payload = json.loads(data)
-    except json.JSONDecodeError as exc:
-        raise OmnigentError(f"Invalid SSE JSON payload: {data}") from exc
-    if not isinstance(payload, dict):
-        return None
-    if event_name and "type" not in payload:
-        payload["type"] = event_name
-    return payload
-
-
-def _extract_session_id(payload: Any) -> str | None:
-    if isinstance(payload, dict):
-        for key in ("id", "session_id", "conversation_id"):
-            value = payload.get(key)
-            if isinstance(value, str):
-                return value
-        for key in ("session", "data"):
-            value = _extract_session_id(payload.get(key))
-            if value:
-                return value
-    return None
-
-
-def _extract_list(payload: Any, key: str) -> list[Any] | None:
-    if not isinstance(payload, dict):
-        return None
-    value = payload.get(key)
-    return value if isinstance(value, list) else None
-
-
-def _runner_id(runner: dict[str, Any]) -> str | None:
-    for key in ("id", "runner_id"):
-        value = runner.get(key)
-        if isinstance(value, str):
-            return value
-    return None
-
-
-def _extract_runner_id(payload: Any) -> str | None:
-    if isinstance(payload, dict):
-        value = _runner_id(payload)
-        if value:
-            return value
-        for key in ("runner", "data"):
-            value = _extract_runner_id(payload.get(key))
-            if value:
-                return value
-    return None
-
-
-def _host_id(host: dict[str, Any]) -> str | None:
-    for key in ("id", "host_id"):
-        value = host.get(key)
-        if isinstance(value, str):
-            return value
-    return None
-
-
-def _is_host_online(host: dict[str, Any]) -> bool:
-    if host.get("online") is True or host.get("host_online") is True:
-        return True
-    status = host.get("status")
-    return isinstance(status, str) and status.lower() == "online"
-
-
 async def _raise_for_status(response: httpx.Response) -> None:
     try:
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:
         error_code = _extract_error_code(response)
+        # The raw server body can carry internal paths/stack traces; log it for
+        # operators but keep it out of the exception message, which surfaces to
+        # the Slack channel (visible to everyone in the thread).
+        _logger.warning(
+            "Omnigent request failed status=%s url=%s body=%r",
+            response.status_code,
+            response.request.url,
+            response.text,
+        )
         if response.status_code == 503 and error_code == "runner_unavailable":
-            raise RunnerUnavailableError(
-                f"Omnigent runner unavailable for {response.request.url}: {response.text}"
-            ) from exc
+            raise RunnerUnavailableError("Omnigent runner is unavailable.") from exc
         if response.status_code == 401:
             raise AuthRequiredError(
                 f"Omnigent server requires authentication for {response.request.url}"
             ) from exc
         raise OmnigentError(
-            f"Omnigent request failed with {response.status_code}: {response.text}"
+            f"Omnigent request failed with status {response.status_code}."
         ) from exc
 
 

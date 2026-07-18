@@ -2055,6 +2055,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     assert app_server.codex_home == expected_codex_home
     assert build_calls[0]["model"] == "gpt-5.4-mini"
     assert build_calls[0]["cwd"] == tmp_path / "workspace"
+    assert build_calls[0]["developer_instructions"] is None
     assert len(launched_specs) == 1
     launched = launched_specs[0]
     assert launched.command == "/opt/codex/bin/codex"
@@ -2850,6 +2851,9 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
         "mean the session snapshot workspace was ignored."
     )
     assert build_calls[0]["cwd"] != bundle_dir.resolve()  # never the spec-bundle dir
+    from omnigent.tools.builtins.session_rename import SESSION_RENAME_INSTRUCTION
+
+    assert build_calls[0]["developer_instructions"] == SESSION_RENAME_INSTRUCTION
 
     # Sandbox-override regression: the launched Codex terminal must inherit
     # the agent's sandbox: none rather than falling back to the platform
@@ -14235,6 +14239,10 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
     # early no longer cascades into "no server running" (#540).
     assert spec.keep_alive_after_exit is True
     args = spec.args
+    from omnigent.tools.builtins.session_rename import SESSION_RENAME_INSTRUCTION
+
+    prompt_index = args.index("--append-system-prompt")
+    assert args[prompt_index + 1] == SESSION_RENAME_INSTRUCTION
     settings = json.loads(args[args.index("--settings") + 1])
     assert "PermissionRequest" in settings["hooks"]
     permission_hook = settings["hooks"]["PermissionRequest"][0]["hooks"][0]
@@ -15320,6 +15328,8 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
 
             return _SnapResponse()
 
+    launched_args: list[str] = []
+
     class _FakeResourceRegistry:
         """Resource registry that returns a terminal without launching."""
 
@@ -15336,7 +15346,8 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
             parent_os_env: Any = None,
         ) -> SessionResourceView:
             """Return a terminal resource view without spawning a TTY."""
-            del terminal_name, session_key, spec
+            del terminal_name, session_key
+            launched_args.extend(spec.args)
             return SessionResourceView(
                 id="terminal_claude_main",
                 type="terminal",
@@ -15373,8 +15384,10 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
     # snapshot carried an external session id.
     if snapshot_external_id is None:
         assert synth_calls == []
+        assert "--append-system-prompt" in launched_args
     else:
         assert synth_calls == [snapshot_external_id]
+        assert "--append-system-prompt" not in launched_args
 
 
 @pytest.mark.asyncio

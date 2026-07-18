@@ -208,6 +208,8 @@ from omnigent.server.routes._host_worktree import CreatedWorktree
 from omnigent.server.routes._origin import require_trusted_origin
 from omnigent.server.schemas import (
     AgentObject,
+    AutomaticSessionRenameRequest,
+    AutomaticSessionRenameResponse,
     BrowserActionRequestEvent,
     ChildSessionList,
     ChildSessionSummary,
@@ -9104,7 +9106,9 @@ async def _dispatch_skill_slash_command_to_runner(
     return visible.id
 
 
-def _title_content_from_item(item: NewConversationItem) -> list[dict[str, Any]]:
+def _title_content_from_item(
+    item: NewConversationItem | ConversationItem,
+) -> list[dict[str, Any]]:
     """
     Extract title candidate content blocks from a session item.
 
@@ -15926,6 +15930,65 @@ def create_sessions_router(
     )
 
     # ── PATCH /sessions/{session_id} ────────────────────────────
+
+    @router.post(
+        "/sessions/{session_id}/auto-title",
+        response_model=AutomaticSessionRenameResponse,
+    )
+    async def automatically_rename_session(
+        request: Request,
+        session_id: str,
+        body: AutomaticSessionRenameRequest,
+    ) -> AutomaticSessionRenameResponse:
+        """Replace the deterministic first-message title when still current."""
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access(
+            user_id,
+            session_id,
+            LEVEL_EDIT,
+            permission_store,
+            conversation_store,
+        )
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None:
+            raise OmnigentError("Session not found", code=ErrorCode.NOT_FOUND)
+        if conv.parent_conversation_id is not None:
+            return AutomaticSessionRenameResponse(renamed=False, reason="not_top_level")
+
+        title = " ".join(body.title.split())
+        if "\n" in body.title or "\r" in body.title or len(title) < 2:
+            raise OmnigentError(
+                "title must be a single non-empty line",
+                code=ErrorCode.INVALID_INPUT,
+            )
+
+        page = await asyncio.to_thread(
+            conversation_store.list_items,
+            session_id,
+            100,
+            None,
+            None,
+            "asc",
+            None,
+        )
+        seed_title: str | None = None
+        for item in page.data:
+            seed_title = synthesize_conversation_title(_title_content_from_item(item))
+            if seed_title is not None:
+                break
+        if seed_title is None:
+            return AutomaticSessionRenameResponse(renamed=False, reason="no_seed")
+        if conv.title != seed_title:
+            return AutomaticSessionRenameResponse(renamed=False, reason="title_changed")
+        updated = await asyncio.to_thread(
+            conversation_store.rename_conversation_if_title_matches,
+            session_id,
+            seed_title,
+            title,
+        )
+        if updated is None:
+            return AutomaticSessionRenameResponse(renamed=False, reason="title_changed")
+        return AutomaticSessionRenameResponse(renamed=True, title=updated.title)
 
     @router.patch(
         "/sessions/{session_id}",

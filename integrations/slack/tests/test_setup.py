@@ -3,7 +3,6 @@ from typing import Any
 
 import httpx
 import respx
-
 from omnigent_slack.models import ThreadKey, UserConfig
 from omnigent_slack.omnigent import OmnigentClientPool
 from omnigent_slack.setup import (
@@ -266,7 +265,6 @@ async def test_setup_shows_login_in_modal_and_advances_on_approval(tmp_path: Pat
         )
     )
     from cryptography.fernet import Fernet
-
     from omnigent_slack.auth_manager import AuthManager
     from omnigent_slack.tokens import EncryptedTokenStore
 
@@ -331,7 +329,6 @@ async def test_setup_reports_device_grant_disabled(tmp_path: Path) -> None:
     """Accounts server with the device grant OFF (/oauth/* unmounted → 405):
     the modal must tell the user to contact the admin, not "try again shortly"."""
     from cryptography.fernet import Fernet
-
     from omnigent_slack.auth_manager import AuthManager
     from omnigent_slack.tokens import EncryptedTokenStore
 
@@ -402,7 +399,9 @@ async def test_logout_revokes_all_and_clears_settings(tmp_path: Path) -> None:
 
     store = await _store(tmp_path)
     # Seed config + an owned thread session so we can prove they're cleared.
-    await store.upsert_user_config("T1", "U1", UserConfig("ag_1", "Helper", "/home/bob", "h1", "H"))
+    await store.upsert_user_config(
+        "T1", "U1", UserConfig("ag_1", "Helper", "/home/bob", "h1", "H")
+    )
     await store.upsert_session(ThreadKey("T1", "C1", "100.1"), "conv_1", "t", owner_user_id="U1")
 
     auth = FakeAuth()
@@ -567,7 +566,9 @@ async def test_prompt_unconfigured_handles_slack_response_object(tmp_path: Path)
     client = SlackResponseSetupClient()
 
     try:
-        await flow.prompt_unconfigured(client, "U1", channel="C1", thread_ts=None, in_channel=False)
+        await flow.prompt_unconfigured(
+            client, "U1", channel="C1", thread_ts=None, in_channel=False
+        )
     finally:
         await pool.aclose_all()
 

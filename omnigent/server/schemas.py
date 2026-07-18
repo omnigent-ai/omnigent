@@ -1923,6 +1923,22 @@ class UpdateSessionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class AutomaticSessionRenameRequest(BaseModel):
+    """Request body for the current-agent automatic rename endpoint."""
+
+    title: str = Field(min_length=2, max_length=60)
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class AutomaticSessionRenameResponse(BaseModel):
+    """Result of a conditional automatic session rename."""
+
+    renamed: bool
+    title: str | None = None
+    reason: Literal["not_top_level", "no_seed", "title_changed"] | None = None
+
+
 class CodexGoalObject(BaseModel):
     """
     Current Codex goal state for a Codex-native session.

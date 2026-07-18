@@ -2085,6 +2085,53 @@ def test_augment_claude_args_uses_last_repeated_launch_override(
     assert settings["effortLevel"] == "high"
 
 
+def test_augment_claude_args_appends_caller_system_prompt(
+    tmp_path: Path,
+) -> None:
+    """Claude native appends framework instructions supplied by its launcher."""
+    from omnigent.tools.builtins.session_rename import SESSION_RENAME_INSTRUCTION
+
+    args = augment_claude_args(
+        (),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+        append_system_prompt=SESSION_RENAME_INSTRUCTION,
+    )
+
+    assert args.count("--append-system-prompt") == 1
+    index = args.index("--append-system-prompt")
+    assert args[index + 1] == SESSION_RENAME_INSTRUCTION
+
+
+def test_augment_claude_args_merges_caller_allowed_tools(tmp_path: Path) -> None:
+    """Framework preapproval extends rather than replaces the user's allowlist."""
+    args = augment_claude_args(
+        ("--allowedTools", "Bash,mcp__user__tool"),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+        allowed_tools=("mcp__omnigent__sys_session_rename", "Bash"),
+    )
+
+    assert args.count("--allowedTools") == 1
+    index = args.index("--allowedTools")
+    assert args[index + 1].split(",") == [
+        "Bash",
+        "mcp__user__tool",
+        "mcp__omnigent__sys_session_rename",
+    ]
+
+
+def test_augment_claude_args_omits_unsupplied_system_prompt(tmp_path: Path) -> None:
+    """The bridge does not invent framework policy on its own."""
+    args = augment_claude_args(
+        (),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+    )
+
+    assert "--append-system-prompt" not in args
+
+
 def test_augment_claude_args_merges_user_disallowed_tools(tmp_path: Path) -> None:
     """
     A user-supplied ``--disallowedTools`` passes through unchanged.

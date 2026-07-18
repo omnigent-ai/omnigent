@@ -1388,6 +1388,8 @@ def augment_claude_args(
     bundle_dir: Path | None = None,
     agent_name: str | None = None,
     skills_filter: str | list[str] = "all",
+    append_system_prompt: str | None = None,
+    allowed_tools: tuple[str, ...] = (),
 ) -> list[str]:
     """
     Return Claude CLI args with Omnigent MCP/hook/skill injection.
@@ -1420,6 +1422,10 @@ def augment_claude_args(
         / ``"none"`` / list of skill names), mapped to
         ``--setting-sources`` exactly as the SDK executor maps it onto
         ``setting_sources``. Defaults to ``"all"``.
+    :param append_system_prompt: Optional framework-owned instructions to
+        append through Claude Code's native ``--append-system-prompt`` flag.
+    :param allowed_tools: Optional narrowly scoped Claude tool names to merge
+        into ``--allowedTools`` without replacing the user's allowlist.
     :returns: Augmented argument list for the terminal resource.
     """
     mcp_config = build_mcp_config(bridge_dir, python_executable=python_executable)
@@ -1434,6 +1440,7 @@ def augment_claude_args(
         launch_effort=_arg_value(claude_args, "--effort"),
     )
     args = _merge_disallowed_tools(list(claude_args), _OMNIGENT_DISALLOWED_TOOLS)
+    args = _merge_allowed_tools(args, allowed_tools)
     args.extend(
         [
             "--mcp-config",
@@ -1442,6 +1449,8 @@ def augment_claude_args(
             json.dumps(hook_settings, separators=(",", ":")),
         ]
     )
+    if append_system_prompt:
+        args.extend(["--append-system-prompt", append_system_prompt])
     args.extend(
         claude_native_skill_args(
             bundle_dir,
@@ -1476,6 +1485,28 @@ def _arg_value(args: tuple[str, ...], flag: str) -> str | None:
             if candidate and not candidate.startswith("--"):
                 value = candidate
     return value
+
+
+def _merge_allowed_tools(args: list[str], extra: tuple[str, ...]) -> list[str]:
+    """Merge framework-approved tools into Claude's ``--allowedTools`` flag.
+
+    :param args: Claude CLI argument list to mutate-and-return.
+    :param extra: Tool names Omnigent may call without an interactive prompt.
+    :returns: ``args`` with a deduplicated, order-preserving allowlist.
+    """
+    if not extra:
+        return args
+    try:
+        idx = args.index("--allowedTools")
+    except ValueError:
+        args.extend(["--allowedTools", ",".join(extra)])
+        return args
+    value_idx = idx + 1
+    if value_idx >= len(args):
+        return args
+    existing = [tool for tool in args[value_idx].split(",") if tool]
+    args[value_idx] = ",".join(dict.fromkeys([*existing, *extra]))
+    return args
 
 
 def _merge_disallowed_tools(args: list[str], extra: tuple[str, ...]) -> list[str]:

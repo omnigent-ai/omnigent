@@ -6,7 +6,6 @@ from pathlib import Path
 import httpx
 import respx
 from cryptography.fernet import Fernet
-
 from omnigent_slack.auth_manager import AuthManager, slack_client_id
 from omnigent_slack.tokens import EncryptedTokenStore, TokenStore
 
@@ -34,7 +33,9 @@ async def test_disabled_without_key() -> None:
 
 def _mock_authorize() -> None:
     # Device-grant path: /v1/me → accounts mode, then the device authorize.
-    respx.get(_BASE + "/v1/me").mock(return_value=httpx.Response(401, json={"login_url": "/login"}))
+    respx.get(_BASE + "/v1/me").mock(
+        return_value=httpx.Response(401, json={"login_url": "/login"})
+    )
     respx.post(_BASE + "/oauth/device/authorize").mock(
         return_value=httpx.Response(
             200,
@@ -237,7 +238,9 @@ async def test_oidc_login_stores_session_jwt_no_refresh(tmp_path: Path) -> None:
         )
     )
     respx.get(_BASE + "/auth/cli-poll").mock(
-        return_value=httpx.Response(200, json={"token": "sess", "user_id": "a@x", "expires_in": 60})
+        return_value=httpx.Response(
+            200, json={"token": "sess", "user_id": "a@x", "expires_in": 60}
+        )
     )
     mgr, store = await _manager(tmp_path)
 
