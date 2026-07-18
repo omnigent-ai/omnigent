@@ -90,20 +90,17 @@ def _build_routing_client(
 ) -> Any | None:  # type: ignore[explicit-any]  # RoutingClient | None
     """Build the ``RuntimeCaps.routing_client`` from the ``routing:`` config.
 
-    Two mutually-exclusive providers:
+    Dispatches on ``routing.provider`` to one of two mutually-exclusive
+    builders:
 
-    - ``external`` — :class:`ExternalRoutingClient`, calling an external
-      ``routes:select`` service. Requires ``base_url`` + ``router_name``;
-      auth is resolved from ``profile`` (a Databricks CLI profile for the
-      router's host) or left unauthenticated.
-    - ``llm`` (default when ``routing:`` is absent) — the built-in
-      :class:`LLMRoutingClient`, using the server-level ``llm:`` block.
+    - ``external`` — :func:`_build_external_routing_client` (call an
+      external ``routes:select`` service).
+    - ``llm`` (default when ``routing:`` is absent) —
+      :func:`_build_local_llm_routing_client` (the built-in judge).
 
     :param routing_cfg: The parsed ``routing:`` mapping, or ``None``.
     :param server_llm: The parsed ``LLMConfig`` (for the ``llm`` provider).
-    :returns: A routing client, or ``None`` when routing can't be built
-        (e.g. ``llm`` provider with no ``llm:`` block, or an ``external``
-        config missing ``base_url``).
+    :returns: A routing client, or ``None`` when routing can't be built.
     """
     provider = "llm"
     if isinstance(routing_cfg, dict):
@@ -112,39 +109,66 @@ def _build_routing_client(
             provider = raw_provider.strip()
 
     if provider == "external":
-        if not isinstance(routing_cfg, dict):
-            _logger.warning("routing.provider=external but no routing config block; skipping")
-            return None
-        base_url = routing_cfg.get("base_url")
-        router_name = routing_cfg.get("router_name")
-        if not isinstance(base_url, str) or not base_url.strip():
-            _logger.warning("routing.provider=external requires base_url; skipping")
-            return None
-        if not isinstance(router_name, str) or not router_name.strip():
-            _logger.warning("routing.provider=external requires router_name; skipping")
-            return None
-        auth = None
-        profile = routing_cfg.get("profile")
-        if isinstance(profile, str) and profile.strip():
-            from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
+        return _build_external_routing_client(routing_cfg)
+    return _build_local_llm_routing_client(server_llm)
 
-            try:
-                creds = resolve_databricks_workspace(profile.strip())
-                from omnigent.server.smart_routing import _bearer_auth
 
-                auth = _bearer_auth(creds.token)
-            except OSError:
-                _logger.warning(
-                    "routing.profile=%s could not be resolved; calling router unauthenticated",
-                    profile,
-                )
-        from omnigent.server.smart_routing import ExternalRoutingClient
+def _build_external_routing_client(
+    routing_cfg: Any,  # type: ignore[explicit-any]  # parsed YAML block
+) -> Any | None:  # type: ignore[explicit-any]  # ExternalRoutingClient | None
+    """Build an :class:`ExternalRoutingClient` from the ``routing:`` config.
 
-        return ExternalRoutingClient(
-            base_url=base_url.strip(), router_name=router_name.strip(), auth=auth
-        )
+    Requires ``base_url`` + ``router_name``; auth is resolved from
+    ``profile`` (a Databricks CLI profile for the router's host) or left
+    unauthenticated.
 
-    # provider == "llm" (default): built-in judge using the llm: block.
+    :param routing_cfg: The parsed ``routing:`` mapping (``routing.provider``
+        is ``external``), or ``None``.
+    :returns: A configured client, or ``None`` when required config is
+        missing (a warning is logged; routing stays off rather than raising).
+    """
+    if not isinstance(routing_cfg, dict):
+        _logger.warning("routing.provider=external but no routing config block; skipping")
+        return None
+    base_url = routing_cfg.get("base_url")
+    router_name = routing_cfg.get("router_name")
+    if not isinstance(base_url, str) or not base_url.strip():
+        _logger.warning("routing.provider=external requires base_url; skipping")
+        return None
+    if not isinstance(router_name, str) or not router_name.strip():
+        _logger.warning("routing.provider=external requires router_name; skipping")
+        return None
+    auth = None
+    profile = routing_cfg.get("profile")
+    if isinstance(profile, str) and profile.strip():
+        from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
+
+        try:
+            creds = resolve_databricks_workspace(profile.strip())
+            from omnigent.server.smart_routing import _bearer_auth
+
+            auth = _bearer_auth(creds.token)
+        except OSError:
+            _logger.warning(
+                "routing.profile=%s could not be resolved; calling router unauthenticated",
+                profile,
+            )
+    from omnigent.server.smart_routing import ExternalRoutingClient
+
+    return ExternalRoutingClient(
+        base_url=base_url.strip(), router_name=router_name.strip(), auth=auth
+    )
+
+
+def _build_local_llm_routing_client(
+    server_llm: Any,  # type: ignore[explicit-any]  # LLMConfig | None
+) -> Any | None:  # type: ignore[explicit-any]  # LLMRoutingClient | None
+    """Build the built-in :class:`LLMRoutingClient` from the ``llm:`` block.
+
+    :param server_llm: The parsed server-level ``LLMConfig``.
+    :returns: A configured client, or ``None`` when there is no ``llm:``
+        block (or its policy client can't be built).
+    """
     if server_llm is None:
         return None
     from omnigent.runtime.policies.builder import (
