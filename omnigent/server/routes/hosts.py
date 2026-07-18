@@ -771,6 +771,7 @@ def create_hosts_router(
             host_permission_store,
             host_store,
             permission_store,
+            admin_list,
         ):
             raise HTTPException(status_code=403, detail="not your host")
 
@@ -873,6 +874,7 @@ def create_hosts_router(
             conversation_store=conversation_store,
             permission_store=permission_store,
             host_permission_store=host_permission_store,
+            admin_list=admin_list,
         )
         conn = target.conn
 
@@ -1318,6 +1320,7 @@ def create_hosts_router(
             host_permission_store,
             host_store,
             permission_store,
+            admin_list,
         ):
             raise HTTPException(status_code=403, detail="not your host")
 
@@ -1408,6 +1411,7 @@ def create_hosts_router(
             host_permission_store,
             host_store,
             permission_store,
+            admin_list,
         ):
             raise HTTPException(status_code=403, detail="not your host")
 
@@ -1705,7 +1709,7 @@ def create_hosts_router(
         List the git worktrees of a repository on a host.
 
         Used by the Web UI's new-session worktree picker to show the
-        worktrees a session can start in directly. Owner-scoped exactly
+        worktrees a session can start in directly. Requires ``use``, exactly
         like the filesystem browse endpoints; NOT scoped to a session.
         A path that is not a git repository is reported as 400 so the
         picker can quietly fall back to "no worktrees".
@@ -1733,7 +1737,16 @@ def create_hosts_router(
         host = await asyncio.to_thread(host_store.get_host, host_id)
         if host is None:
             raise HTTPException(status_code=404, detail="host not found")
-        if user_id is not None and host.user_id != user_id:
+        if not await asyncio.to_thread(
+            check_host_access,
+            user_id,
+            host_id,
+            HOST_LEVEL_USE,
+            host_permission_store,
+            host_store,
+            permission_store,
+            admin_list,
+        ):
             raise HTTPException(status_code=403, detail="not your host")
 
         if not path.strip():
@@ -1798,6 +1811,7 @@ def create_hosts_router(
             host_permission_store,
             host_store,
             permission_store,
+            admin_list,
         ):
             raise HTTPException(status_code=403, detail="not your host")
         return user_id

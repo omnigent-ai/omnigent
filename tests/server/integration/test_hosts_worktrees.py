@@ -26,13 +26,18 @@ from omnigent.host.frames import (
     decode_host_frame,
     encode_host_frame,
 )
+from omnigent.server.auth import UnifiedAuthProvider
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.host_tunnel import create_host_tunnel_router
 from omnigent.server.routes.hosts import create_hosts_router
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
+from omnigent.stores.host_permission_store.sqlalchemy_store import (
+    SqlAlchemyHostPermissionStore,
+)
 from omnigent.stores.host_store import HostStore
+from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 
 # Same liveness-race flake mitigation as test_hosts_filesystem: the
 # mock-WS host can be deregistered under parallel CI load, yielding a
@@ -44,6 +49,14 @@ pytestmark = [
 
 _HOST_ID = "7f6bda8f5e302e51cee65f7094f3d49e"
 _HOST_NAME = "wt-test-laptop"
+_OWNER = "owner@example.com"
+_SHARED_USER = "shared@example.com"
+_VIEWER = "viewer@example.com"
+
+
+def _user_headers(user_id: str = _SHARED_USER) -> dict[str, str]:
+    """Return strict-header auth headers for a test user."""
+    return {"X-Forwarded-Email": user_id}
 
 
 def _websocket_scope(path: str) -> dict[str, object]:
@@ -59,7 +72,7 @@ def _websocket_scope(path: str) -> dict[str, object]:
         "path": path,
         "raw_path": path.encode("ascii"),
         "query_string": b"",
-        "headers": [],
+        "headers": [(b"x-forwarded-email", _OWNER.encode())],
         "client": ("127.0.0.1", 50000),
         "server": ("testserver", 80),
         "subprotocols": [],
@@ -91,9 +104,24 @@ def wt_app(
     host_store = HostStore(db_uri)
     conv_store = SqlAlchemyConversationStore(db_uri)
     app = FastAPI()
-    app.include_router(create_host_tunnel_router(registry, host_store), prefix="/v1")
+    auth_provider = UnifiedAuthProvider(source="header", local_single_user=False)
+    permission_store = SqlAlchemyPermissionStore(db_uri)
+    host_permission_store = SqlAlchemyHostPermissionStore(db_uri)
+    host_permission_store.grant(_SHARED_USER, _HOST_ID, 2)
+    host_permission_store.grant(_VIEWER, _HOST_ID, 1)
     app.include_router(
-        create_hosts_router(registry, host_store, conv_store),
+        create_host_tunnel_router(registry, host_store, auth_provider=auth_provider),
+        prefix="/v1",
+    )
+    app.include_router(
+        create_hosts_router(
+            registry,
+            host_store,
+            conv_store,
+            host_permission_store=host_permission_store,
+            permission_store=permission_store,
+            auth_provider=auth_provider,
+        ),
         prefix="/v1",
     )
     return app, registry, host_store, conv_store
@@ -201,6 +229,7 @@ async def test_list_worktrees_returns_data(
         resp = await client.get(
             f"/v1/hosts/{_HOST_ID}/worktrees",
             params={"path": "/Users/corey/repo"},
+            headers=_user_headers(),
         )
     assert resp.status_code == 200, resp.text
     payload = resp.json()
@@ -220,8 +249,23 @@ async def test_list_worktrees_non_git_path_400(
         resp = await client.get(
             f"/v1/hosts/{_HOST_ID}/worktrees",
             params={"path": "/tmp/not-a-repo"},
+            headers=_user_headers(),
         )
     assert resp.status_code == 400, resp.text
+
+
+async def test_list_worktrees_view_grant_is_denied(
+    wt_setup: tuple[FastAPI, HostRegistry, ApplicationCommunicator, dict[str, dict[str, Any]]],
+) -> None:
+    """A view-only grantee cannot inspect worktrees on the shared host."""
+    app, _reg, _comm, _replies = wt_setup
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get(
+            f"/v1/hosts/{_HOST_ID}/worktrees",
+            params={"path": "/Users/corey/repo"},
+            headers=_user_headers(_VIEWER),
+        )
+    assert resp.status_code == 403, resp.text
 
 
 async def test_list_worktrees_missing_path_param_422(
@@ -230,7 +274,10 @@ async def test_list_worktrees_missing_path_param_422(
     """The ``path`` query param is required."""
     app, _reg, _comm, _replies = wt_setup
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        resp = await client.get(f"/v1/hosts/{_HOST_ID}/worktrees")
+        resp = await client.get(
+            f"/v1/hosts/{_HOST_ID}/worktrees",
+            headers=_user_headers(),
+        )
     assert resp.status_code == 422, resp.text
 
 
@@ -245,6 +292,7 @@ async def test_list_worktrees_unknown_host_404(
         resp = await client.get(
             f"/v1/hosts/{unknown_id}/worktrees",
             params={"path": "/Users/corey/repo"},
+            headers=_user_headers(),
         )
     # No host record exists for this id → 404, not 409 ("offline").
     assert resp.status_code == 404, resp.text

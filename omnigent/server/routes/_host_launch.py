@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from fastapi import HTTPException
 
 from omnigent.entities import Conversation
+from omnigent.server.admin_list import AdminList
 from omnigent.server.auth import LEVEL_OWNER
 from omnigent.server.host_permissions import HOST_LEVEL_USE, check_host_access
 from omnigent.server.host_registry import HostConnection, HostRegistry
@@ -55,6 +56,7 @@ def resolve_host_access(
     host_store: HostStore,
     host_permission_store: HostPermissionStore,
     permission_store: PermissionStore | None,
+    admin_list: AdminList | None = None,
     required_level: int = HOST_LEVEL_USE,
 ) -> Host:
     """
@@ -97,6 +99,7 @@ def resolve_host_access(
         host_permission_store,
         host_store,
         permission_store,
+        admin_list,
     ):
         raise HTTPException(status_code=403, detail="not your host")
     return host
@@ -112,6 +115,7 @@ def resolve_host_launch(
     conversation_store: ConversationStore,
     permission_store: PermissionStore | None,
     host_permission_store: HostPermissionStore,
+    admin_list: AdminList | None = None,
 ) -> HostLaunchTarget:
     """
     Resolve and authorize a host runner launch.
@@ -154,6 +158,7 @@ def resolve_host_launch(
         host_store=host_store,
         host_permission_store=host_permission_store,
         permission_store=permission_store,
+        admin_list=admin_list,
         required_level=HOST_LEVEL_USE,
     )
 

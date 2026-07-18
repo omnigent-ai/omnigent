@@ -14,6 +14,7 @@ See ``specs/admin-host-management-spec.md``.
 
 from __future__ import annotations
 
+from omnigent.server.admin_list import AdminList
 from omnigent.stores.host_permission_store import HostPermissionStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store import PermissionStore
@@ -37,6 +38,7 @@ def check_host_access(
     host_permission_store: HostPermissionStore,
     host_store: HostStore,
     permission_store: PermissionStore | None = None,
+    admin_list: AdminList | None = None,
 ) -> bool:
     """Check whether *user_id* may act on a host at *required_level*.
 
@@ -61,13 +63,17 @@ def check_host_access(
     :param host_permission_store: Store for host grant lookups.
     :param host_store: Store for host owner lookup.
     :param permission_store: Session permission store, consulted only
-        for the global admin flag. ``None`` skips the admin bypass.
+        for the global admin flag. ``None`` skips the DB admin bypass.
+    :param admin_list: Config/file-backed admin roster. ``None`` skips
+        the declarative admin bypass.
     :returns: ``True`` if access is allowed, ``False`` otherwise.
     """
     if user_id is None:
         return True
 
     if permission_store is not None and permission_store.is_admin(user_id):
+        return True
+    if admin_list is not None and admin_list.is_admin(user_id):
         return True
 
     host = host_store.get_host(host_id)

@@ -17,9 +17,11 @@ behave exactly as in production.
 from __future__ import annotations
 
 import uuid
+from pathlib import Path
 
 import pytest
 
+from omnigent.server.admin_list import AdminList
 from omnigent.server.host_permissions import (
     HOST_LEVEL_MANAGE,
     HOST_LEVEL_OWNER,
@@ -114,6 +116,26 @@ def test_admin_allowed_without_grant(
     assert (
         get_host_permission_level("admin@example", _HOST_SP, host_perm, host_store, perm)
         == HOST_LEVEL_USE
+    )
+
+
+def test_configured_admin_allowed_without_db_promotion(
+    stores: tuple[HostStore, SqlAlchemyHostPermissionStore, SqlAlchemyPermissionStore],
+    tmp_path: Path,
+) -> None:
+    """Declarative admins receive the same implicit access as DB admins."""
+    host_store, host_perm, perm = stores
+    admin_list = AdminList(tmp_path / "admins", extra=frozenset({"Config@Example"}))
+
+    assert not perm.is_admin("config@example")
+    assert check_host_access(
+        "config@example",
+        _HOST_SP,
+        HOST_LEVEL_MANAGE,
+        host_perm,
+        host_store,
+        perm,
+        admin_list,
     )
 
 
