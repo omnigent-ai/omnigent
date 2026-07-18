@@ -34,6 +34,20 @@ from omnigent.server.host_registry import HostConnection, HostRegistry
 
 _logger = logging.getLogger(__name__)
 
+
+def is_absolute_host_path(path: str) -> bool:
+    """True if ``path`` is absolute on the host — POSIX or Windows.
+
+    Accepts POSIX absolute paths (``/foo``), Windows drive-absolute paths
+    (``C:\\foo`` or ``C:/foo``), and UNC paths (``\\\\server\\share``). The
+    workspace lives on the (possibly native-Windows) host, so a bare
+    ``startswith("/")`` check wrongly rejects every Windows workspace.
+    """
+    if path.startswith(("/", "\\\\", "//")):
+        return True
+    return len(path) >= 3 and path[0].isalpha() and path[1] == ":" and path[2] in ("\\", "/")
+
+
 # Treat these spec cwd values as "relative" — the agent doesn't pin
 # a specific directory and the workspace is unconstrained.
 _RELATIVE_CWD_PLACEHOLDERS: frozenset[str] = frozenset({"", ".", "./"})
@@ -214,11 +228,11 @@ async def validate_workspace(
         The exception message is suitable for surfacing to the
         API caller verbatim.
     """
-    if not workspace.startswith("/"):
+    if not is_absolute_host_path(workspace):
         # Belt-and-suspenders. The Pydantic schema layer also
         # rejects this; pin it here so direct callers (tests,
         # other server-internal paths) can't bypass.
-        raise WorkspaceValidationError("workspace must be an absolute path starting with /")
+        raise WorkspaceValidationError("workspace must be an absolute path")
 
     display_host = host_name_for_errors or host_id
 
