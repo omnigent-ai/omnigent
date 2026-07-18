@@ -81,6 +81,24 @@ def test_record_publish_increments_count_for_elicitation_event() -> None:
     assert pending_elicitations.count_for("conv_a") == 1
 
 
+def test_snapshot_replays_approval_presentation_without_aliasing() -> None:
+    """Cold-load replay preserves nested target metadata as a deep copy."""
+    event = _elicit_event("elicit_1")
+    event["params"] = {
+        "approval": {
+            "title": "acme/widgets #123",
+            "href": "https://github.com/acme/widgets/pull/123",
+            "secondary_arguments": ["grant_id"],
+        }
+    }
+    pending_elicitations.record_publish("session_a", event)
+    first = pending_elicitations.snapshot_for("session_a")
+    assert first[0]["params"]["approval"] == event["params"]["approval"]
+    first[0]["params"]["approval"]["title"] = "mutated"
+    second = pending_elicitations.snapshot_for("session_a")
+    assert second[0]["params"]["approval"]["title"] == "acme/widgets #123"
+
+
 def test_record_publish_is_idempotent_on_repeat_publish() -> None:
     """
     Re-publishing the same elicitation_id does not double-count.

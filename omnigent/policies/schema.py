@@ -38,6 +38,8 @@ from __future__ import annotations
 from collections.abc import Awaitable
 from typing import TYPE_CHECKING, Literal, Protocol, TypeAlias, TypedDict, cast
 
+from omnigent.policies.types import ApprovalPresentation
+
 if TYPE_CHECKING:
     from omnigent.policies.types import PolicyLLMClient
 
@@ -278,6 +280,11 @@ class PolicyResponse(TypedDict, total=False):
                 {"key": "call_count", "action": "increment", "value": 1}
             ],
             "set_labels": {"integrity": "0"},
+            "approval": ApprovalPresentation(
+                title="example/repository #42",
+                href="https://example.com/example/repository/pull/42",
+                secondary_arguments=("grant_id",),
+            ),
         }
 
     Returning ``None`` is treated as abstain (equivalent to
@@ -299,6 +306,9 @@ class PolicyResponse(TypedDict, total=False):
         ``DENY``; withheld on ``ASK`` pending approval.
     :param set_labels: Label key-value writes. Filtered through
         the policy's ``set_labels`` whitelist (if declared).
+    :param approval: Optional target presentation for an ``ASK``.
+        It changes display hierarchy only; raw arguments remain
+        available and the renderer decides their appearance.
     """
 
     result: Literal["ALLOW", "DENY", "ASK"]
@@ -306,6 +316,7 @@ class PolicyResponse(TypedDict, total=False):
     data: object
     state_updates: list[StateUpdateEntry]
     set_labels: dict[str, str]
+    approval: ApprovalPresentation
 
 
 # ── Callable protocol ────────────────────────────────────────────────────────

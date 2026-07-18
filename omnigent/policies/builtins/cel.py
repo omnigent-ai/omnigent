@@ -7,8 +7,9 @@ loops, no file I/O.
 
 The expression receives the full ``PolicyEvent`` dict as an
 ``event`` variable and must return a map with a ``result`` key
-(``"DENY"``, ``"ASK"``, or ``"ALLOW"``) and an optional
-``"reason"`` key. Non-map returns abstain.
+(``"DENY"``, ``"ASK"``, or ``"ALLOW"``), an optional
+``"reason"`` key, and an optional ``"approval"`` map. Non-map
+returns abstain.
 
 Register statically in an agent's YAML, or dynamically on a running
 session via the policy API.
@@ -74,8 +75,27 @@ from omnigent.policies.schema import (
     PolicyResponse,
     request_user_text,
 )
+from omnigent.policies.types import coerce_approval_presentation
 
 _log = logging.getLogger(__name__)
+
+
+def _cel_to_plain(value: object) -> object:
+    """Convert a CEL result value into plain Python containers.
+
+    CEL maps raise :class:`KeyError` from ``get`` on an absent key, so the
+    tolerant approval coercer must never receive one directly.
+
+    :param value: A CEL value from an evaluated expression.
+    :returns: The equivalent plain ``dict`` / ``list`` / ``str`` / scalar.
+    """
+    if isinstance(value, dict):
+        return {str(key): _cel_to_plain(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_cel_to_plain(item) for item in value]
+    if isinstance(value, str):
+        return str(value)
+    return value
 
 
 def cel_policy(
@@ -122,6 +142,7 @@ def cel_policy(
     prog = env.program(ast)
     _result_key = celpy.celtypes.StringType("result")
     _reason_key = celpy.celtypes.StringType("reason")
+    _approval_key = celpy.celtypes.StringType("approval")
 
     def evaluate(event: PolicyEvent) -> PolicyResponse | None:
         # llm_client is a live object used by Python policy callables;
@@ -160,6 +181,12 @@ def cel_policy(
             out["reason"] = str(result[_reason_key])
         elif verdict != "ALLOW":
             out["reason"] = reason
+        if _approval_key in result:
+            approval = coerce_approval_presentation(_cel_to_plain(result[_approval_key]))
+            if approval is not None:
+                out["approval"] = approval
+            else:
+                _log.debug("CEL policy returned malformed approval presentation; dropping it")
         return out
 
     return evaluate
@@ -179,7 +206,7 @@ POLICY_REGISTRY: list[dict[str, object]] = (
                 "Evaluate a CEL (Common Expression Language) expression against "
                 "every policy event. The expression receives the full event as "
                 '`event` and must return a map with `result` ("DENY", "ASK", or '
-                '"ALLOW") and optional `reason` keys. '
+                '"ALLOW") and optional `reason` and `approval` keys. '
                 "CEL is non-Turing-complete and side-effect-free."
             ),
             "params_schema": {

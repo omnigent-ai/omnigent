@@ -646,6 +646,51 @@ describe("response.output_item.done (routing_decision)", () => {
 });
 
 describe("response.elicitation_request (FLAT envelope)", () => {
+  it("lifts a validated policy approval presentation", () => {
+    const out = parse("response.elicitation_request", {
+      type: "response.elicitation_request",
+      elicitation_id: "elicit_merge",
+      params: {
+        mode: "form",
+        message: "Merge this pull request?",
+        phase: "tool_call",
+        policy_name: "github_approval_gate",
+        content_preview: "{}",
+        requestedSchema: {},
+        approval: {
+          title: "acme/widgets #123",
+          href: "https://github.com/acme/widgets/pull/123",
+          secondary_arguments: ["grant_id", "idempotency_key"],
+        },
+      },
+    });
+
+    const event = out[0] as ElicitationRequest;
+    expect(event.approval).toEqual({
+      title: "acme/widgets #123",
+      href: "https://github.com/acme/widgets/pull/123",
+      secondaryArguments: ["grant_id", "idempotency_key"],
+    });
+  });
+
+  it.each([
+    "http://github.com/example/repository",
+    "javascript:alert(1)",
+    "https://user@github.com/example/repository",
+    "github.com/example/repository",
+  ])("drops an unsafe approval href before rendering: %s", (href) => {
+    const out = parse("response.elicitation_request", {
+      type: "response.elicitation_request",
+      elicitation_id: "elicit_unsafe",
+      params: {
+        message: "Review",
+        requestedSchema: {},
+        approval: { title: "target", href, secondary_arguments: [] },
+      },
+    });
+    expect((out[0] as ElicitationRequest).approval).toBeNull();
+  });
+
   it("lifts structured Codex requestUserInput payloads", () => {
     // Codex's final plan-mode prompt rides as the same
     // ``ask_user_question`` extra as Claude's AskUserQuestion flow.

@@ -37,7 +37,7 @@ from omnigent.policies.function import (
     FunctionPolicy,
     resolve_function_policy,
 )
-from omnigent.policies.types import EvaluationContext, PolicyResult
+from omnigent.policies.types import ApprovalPresentation, EvaluationContext, PolicyResult
 from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.spec.types import (
     FunctionPolicySpec,
@@ -138,6 +138,47 @@ async def test_sync_callable_allow() -> None:
         {"labels": {}, "conversation_id": "c"},
     )
     assert result.action == PolicyAction.ALLOW
+
+
+@pytest.mark.asyncio
+async def test_python_policy_dict_carries_approval_presentation() -> None:
+    """Dict-returning Python policies share the typed ASK contract."""
+
+    def fn(_event: dict) -> dict[str, Any]:
+        return {
+            "result": "ASK",
+            "reason": "Review",
+            "approval": {
+                "title": "acme/widgets #123",
+                "href": "https://github.com/acme/widgets/pull/123",
+                "secondary_arguments": ["grant_id"],
+            },
+        }
+
+    result = await FunctionPolicy(_spec(), fn).evaluate(
+        EvaluationContext(phase=Phase.REQUEST, content="hi"),
+        {},
+    )
+    assert result.approval == ApprovalPresentation(
+        title="acme/widgets #123",
+        href="https://github.com/acme/widgets/pull/123",
+        secondary_arguments=("grant_id",),
+    )
+
+
+@pytest.mark.asyncio
+async def test_python_policy_malformed_approval_is_dropped() -> None:
+    """Malformed Python metadata leaves the policy decision intact."""
+
+    def fn(_event: dict) -> dict[str, Any]:
+        return {"result": "ASK", "reason": "Review", "approval": {"title": 42}}
+
+    result = await FunctionPolicy(_spec(), fn).evaluate(
+        EvaluationContext(phase=Phase.REQUEST, content="hi"),
+        {},
+    )
+    assert result.action == PolicyAction.ASK
+    assert result.approval is None
 
 
 @pytest.mark.asyncio
