@@ -92,17 +92,17 @@ def _build_routing_client(
 
     Two mutually-exclusive providers:
 
-    - ``gateway`` — :class:`ExternalRoutingClient`, calling an external
+    - ``external`` — :class:`ExternalRoutingClient`, calling an external
       ``routes:select`` service. Requires ``base_url`` + ``router_name``;
       auth is resolved from ``profile`` (a Databricks CLI profile for the
-      gateway host) or left unauthenticated.
+      router's host) or left unauthenticated.
     - ``llm`` (default when ``routing:`` is absent) — the built-in
       :class:`LLMRoutingClient`, using the server-level ``llm:`` block.
 
     :param routing_cfg: The parsed ``routing:`` mapping, or ``None``.
     :param server_llm: The parsed ``LLMConfig`` (for the ``llm`` provider).
     :returns: A routing client, or ``None`` when routing can't be built
-        (e.g. ``llm`` provider with no ``llm:`` block, or a gateway
+        (e.g. ``llm`` provider with no ``llm:`` block, or an ``external``
         config missing ``base_url``).
     """
     provider = "llm"
@@ -111,17 +111,17 @@ def _build_routing_client(
         if isinstance(raw_provider, str) and raw_provider.strip():
             provider = raw_provider.strip()
 
-    if provider == "gateway":
+    if provider == "external":
         if not isinstance(routing_cfg, dict):
-            _logger.warning("routing.provider=gateway but no routing config block; skipping")
+            _logger.warning("routing.provider=external but no routing config block; skipping")
             return None
         base_url = routing_cfg.get("base_url")
         router_name = routing_cfg.get("router_name")
         if not isinstance(base_url, str) or not base_url.strip():
-            _logger.warning("routing.provider=gateway requires base_url; skipping")
+            _logger.warning("routing.provider=external requires base_url; skipping")
             return None
         if not isinstance(router_name, str) or not router_name.strip():
-            _logger.warning("routing.provider=gateway requires router_name; skipping")
+            _logger.warning("routing.provider=external requires router_name; skipping")
             return None
         auth = None
         profile = routing_cfg.get("profile")
@@ -135,7 +135,7 @@ def _build_routing_client(
                 auth = _bearer_auth(creds.token)
             except OSError:
                 _logger.warning(
-                    "routing.profile=%s could not be resolved; calling gateway unauthenticated",
+                    "routing.profile=%s could not be resolved; calling router unauthenticated",
                     profile,
                 )
         from omnigent.server.smart_routing import ExternalRoutingClient
@@ -3408,8 +3408,8 @@ def server(
 
     # Build the routing client when the feature is enabled via
     # OMNIGENT_SMART_ROUTING=1. Two mutually-exclusive providers, chosen
-    # by the ``routing:`` config block:
-    #   - ``gateway``: call an external ``routes:select`` service.
+    # by ``routing.provider``:
+    #   - ``external``: call an external ``routes:select`` service.
     #   - ``llm`` (default): the built-in judge using the ``llm:`` block.
     # Hidden by default — managed deployments override
     # RuntimeCaps.routing_client with their own implementation.

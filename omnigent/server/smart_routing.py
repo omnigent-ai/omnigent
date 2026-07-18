@@ -21,6 +21,10 @@ if TYPE_CHECKING:
 
 _logger = logging.getLogger(__name__)
 
+# Custom-method path (Google API convention) appended to the external
+# router's base URL, e.g. ``<base_url>/routes:select``.
+ROUTES_SELECT_PATH = "routes:select"
+
 # ── Model lists per harness family ──────────────────────────────────────────
 #
 # Ordered cheapest → most powerful within each family.
@@ -340,14 +344,14 @@ def _bearer_auth(token: str) -> Any:  # type: ignore[explicit-any]  # returns ht
 
 
 class ExternalRoutingClient:
-    """Routing client backed by an external ``routes:select`` gateway.
+    """Routing client backed by an external ``routes:select`` service.
 
-    Calls a Databricks AI-Gateway routing service (or any endpoint
-    speaking the ``omnigent.api.routing.v1`` proto) instead of running a
-    local judge. The candidate models come from ``available_models``
-    (the same live catalog the built-in judge sees), so no catalog
-    plumbing changes. A failure or empty selection returns ``None`` so
-    the turn proceeds on the agent's default model.
+    Calls an external routing service (the Databricks AI-Gateway router,
+    or any endpoint speaking the ``omnigent.api.routing.v1`` proto)
+    instead of running a local judge. The candidate models come from
+    ``available_models`` (the same live catalog the built-in judge sees),
+    so no catalog plumbing changes. A failure or empty selection returns
+    ``None`` so the turn proceeds on the agent's default model.
     """
 
     def __init__(
@@ -360,15 +364,15 @@ class ExternalRoutingClient:
     ) -> None:
         """
         :param base_url: Routing service base, e.g.
-            ``"https://host/ai-gateway/routing/v1"``. ``/routes:select``
-            is appended.
+            ``"https://host/ai-gateway/routing/v1"``.
+            ``/routes:select`` is appended.
         :param router_name: Router strategy name, e.g. ``"task_v0"``.
         :param auth: Optional httpx auth (a Databricks bearer for the
-            gateway host). ``None`` for an unauthenticated endpoint.
+            router's host). ``None`` for an unauthenticated endpoint.
         :param request_timeout: Per-call timeout in seconds; routing
-            runs once per turn so a slow gateway can't stall forever.
+            runs once per turn so a slow router can't stall forever.
         """
-        self._url = base_url.rstrip("/") + "/routes:select"
+        self._url = base_url.rstrip("/") + "/" + ROUTES_SELECT_PATH
         self._router_name = router_name
         self._auth = auth
         self._request_timeout = request_timeout
@@ -395,7 +399,7 @@ class ExternalRoutingClient:
             task=pb.Task(prompt=message[:4000]),
             route_selector=pb.RouteSelector(router_name=self._router_name),
         )
-        # snake_case wire format — the gateway uses the proto field names.
+        # snake_case wire format — the router uses the proto field names.
         body = json_format.MessageToDict(request, preserving_proto_field_name=True)
         _logger.info("ExternalRoutingClient: available_models=%s", dict(available_models))
         try:

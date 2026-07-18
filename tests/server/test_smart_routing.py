@@ -424,7 +424,7 @@ def _patch_httpx(transport: Any) -> Any:
 
 
 @pytest.mark.asyncio
-async def test_gateway_routing_client_sends_snake_case_and_parses() -> None:
+async def test_external_routing_client_sends_snake_case_and_parses() -> None:
     """available_models -> snake_case route_options; response -> RoutingResult."""
     import httpx
 
@@ -469,7 +469,7 @@ async def test_gateway_routing_client_sends_snake_case_and_parses() -> None:
 
 
 @pytest.mark.asyncio
-async def test_gateway_routing_client_empty_available_models_skips() -> None:
+async def test_external_routing_client_empty_available_models_skips() -> None:
     """No candidates -> no HTTP call, returns None."""
     import httpx
 
@@ -489,8 +489,8 @@ async def test_gateway_routing_client_empty_available_models_skips() -> None:
 
 
 @pytest.mark.asyncio
-async def test_gateway_routing_client_swallows_http_error() -> None:
-    """A gateway outage returns None so the turn proceeds."""
+async def test_external_routing_client_swallows_http_error() -> None:
+    """A router outage returns None so the turn proceeds."""
     import httpx
 
     from omnigent.server.smart_routing import ExternalRoutingClient
@@ -504,7 +504,7 @@ async def test_gateway_routing_client_swallows_http_error() -> None:
 
 
 @pytest.mark.asyncio
-async def test_gateway_routing_client_empty_selection_returns_none() -> None:
+async def test_external_routing_client_empty_selection_returns_none() -> None:
     """An empty route_selection (e.g. router declined) yields None."""
     import httpx
 
@@ -519,7 +519,7 @@ async def test_gateway_routing_client_empty_selection_returns_none() -> None:
 
 
 @pytest.mark.asyncio
-async def test_gateway_routing_client_sends_bearer_auth() -> None:
+async def test_external_routing_client_sends_bearer_auth() -> None:
     """When built with auth, the request carries the bearer header."""
     import httpx
 

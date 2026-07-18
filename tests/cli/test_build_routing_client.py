@@ -2,8 +2,8 @@
 
 Verifies the ``routing:`` config block chooses between the built-in
 ``LLMRoutingClient`` and the ``ExternalRoutingClient``, and that a
-malformed gateway config degrades to ``None`` (routing disabled) rather
-than raising.
+malformed ``external`` config degrades to ``None`` (routing disabled)
+rather than raising.
 """
 
 from __future__ import annotations
@@ -14,9 +14,9 @@ from omnigent.cli import _build_routing_client
 from omnigent.server.smart_routing import ExternalRoutingClient, LLMRoutingClient
 
 
-def test_gateway_provider_builds_gateway_client() -> None:
+def test_external_provider_builds_external_client() -> None:
     cfg = {
-        "provider": "gateway",
+        "provider": "external",
         "base_url": "https://host/ai-gateway/routing/v1",
         "router_name": "task_v0",
     }
@@ -27,9 +27,9 @@ def test_gateway_provider_builds_gateway_client() -> None:
     assert client._auth is None  # no profile -> unauthenticated
 
 
-def test_gateway_provider_resolves_profile_auth() -> None:
+def test_external_provider_resolves_profile_auth() -> None:
     cfg = {
-        "provider": "gateway",
+        "provider": "external",
         "base_url": "https://host/v1",
         "router_name": "task_v0",
         "profile": "staging",
@@ -45,12 +45,14 @@ def test_gateway_provider_resolves_profile_auth() -> None:
     assert client._auth is not None  # bearer auth built from the profile token
 
 
-def test_gateway_provider_missing_base_url_disables() -> None:
-    assert _build_routing_client({"provider": "gateway", "router_name": "x"}, None) is None
+def test_external_provider_missing_base_url_disables() -> None:
+    assert _build_routing_client({"provider": "external", "router_name": "x"}, None) is None
 
 
-def test_gateway_provider_missing_router_name_disables() -> None:
-    assert _build_routing_client({"provider": "gateway", "base_url": "https://h/v1"}, None) is None
+def test_external_provider_missing_router_name_disables() -> None:
+    assert (
+        _build_routing_client({"provider": "external", "base_url": "https://h/v1"}, None) is None
+    )
 
 
 def test_llm_provider_without_server_llm_disables() -> None:
