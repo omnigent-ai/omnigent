@@ -3411,12 +3411,7 @@ def server(
     routing_client = None
     if os.environ.get("OMNIGENT_SMART_ROUTING") == "1":
         routing_cfg = cfg.get("routing")
-        provider = "llm"
-        if isinstance(routing_cfg, dict):
-            raw_provider = routing_cfg.get("provider")
-            if isinstance(raw_provider, str) and raw_provider.strip():
-                provider = raw_provider.strip()
-        if provider == "external":
+        if isinstance(routing_cfg, dict) and routing_cfg.get("provider") == "external":
             routing_client = _build_external_routing_client(routing_cfg)
         else:
             routing_client = _build_local_llm_routing_client(server_llm)
