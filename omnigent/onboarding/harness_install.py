@@ -67,6 +67,12 @@ KIMI_KEY = "kimi"
 # installer, not an npm package managed by ``omnigent setup``.
 KIRO_KEY = "kiro"
 
+# omp ("Oh My Pi") is driven over ACP (``omp acp``). A compiled single binary
+# (not npm), so — like cursor/kimi/kiro — it declares no install package and is
+# gated purely on the ``omp`` binary being on PATH. omp self-authenticates via
+# its own ``~/.omp`` state, so there is no Omnigent-side credential.
+OMP_KEY = "omp"
+
 # OpenCode native harness CLI (``opencode serve`` / ``opencode attach``),
 # installed via the ``opencode-ai`` npm package. No login/logout/status argv
 # is wired yet — readiness is binary-only until an auth check exists.
@@ -166,6 +172,13 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         package=None,
         install_hint="curl -fsSL https://cli.kiro.dev/install | bash",
     ),
+    OMP_KEY: HarnessInstallSpec(
+        "Oh My Pi",
+        "omp",
+        package=None,
+        install_hint="install the omp (Oh My Pi) CLI and add it to your PATH",
+        auth_hint="run `omp` once to sign in (writes provider state to ~/.omp)",
+    ),
     # The native Antigravity (agy) TUI bridge wraps the ``agy`` CLI. ``agy`` has
     # no ``login`` / ``logout`` subcommand — the user authenticates via browser
     # OAuth by launching ``agy`` with no arguments on first run — so login_args /
@@ -232,6 +245,8 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     "cursor-native": CURSOR_KEY,
     "native-cursor": CURSOR_KEY,
     "kiro-native": KIRO_KEY,
+    # omp is binary-gated: the ACP harness can't launch without the ``omp`` CLI.
+    OMP_KEY: OMP_KEY,
     "native-kiro": KIRO_KEY,
     # The native agy TUI bridge wraps the ``agy`` CLI; both spellings map to
     # the Gemini family's install spec. (The in-process ``antigravity`` SDK

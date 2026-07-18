@@ -1544,6 +1544,43 @@ def _build_acp_spawn_env(
     return env
 
 
+def _build_omp_spawn_env(
+    spec: AgentSpec,
+    *,
+    cwd: Path | None = None,
+    workdir: Path | None = None,
+) -> dict[str, str]:
+    """Build the env-var dict for the built-in omp (Oh My Pi) ACP harness.
+
+    omp is driven over ACP via ``omp acp``. Unlike the generic ``acp`` harness —
+    which resolves its command from the user's ``acp:`` config block — the ``omp``
+    harness pins the command so the seeded omp agent works out of the box with no
+    setup. Like Goose, omp owns its own auth (``~/.omp``), so this wires no
+    provider/gateway credential; a ``databricks-*`` model is dropped and omp's own
+    configured model applies. The knobs match ``_build_acp_spawn_env`` /
+    ``omnigent/inner/acp_harness.py``.
+
+    :param spec: The agent spec.
+    :param cwd: Session workspace (selected working folder), or ``None``.
+    :param workdir: Accepted for builder-signature parity; unused.
+    :returns: A dict of ``HARNESS_ACP_*`` env-var overrides for the spawn.
+    """
+    env: dict[str, str] = {
+        "HARNESS_ACP_COMMAND": "omp acp",
+        "HARNESS_ACP_NAME": "Oh My Pi",
+        "HARNESS_ACP_SESSION_ID_MODE": "server",
+    }
+    model = _resolve_spec_model(spec)
+    if model is not None and not model.startswith(("databricks-", "databricks/")):
+        env["HARNESS_ACP_MODEL"] = model
+    if cwd is not None:
+        env["HARNESS_ACP_CWD"] = str(cwd)
+    os_env_payload = _serialize_os_env(spec.os_env)
+    if os_env_payload is not None:
+        env["HARNESS_ACP_OS_ENV"] = os_env_payload
+    return env
+
+
 def _load_global_auth() -> ApiKeyAuth | DatabricksAuth | None:
     """
     Load the ``auth:`` block from ``~/.omnigent/config.yaml``.

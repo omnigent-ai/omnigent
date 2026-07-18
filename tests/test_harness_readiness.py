@@ -74,3 +74,18 @@ def test_configured_harness_map_exposes_kiro_native(monkeypatch: pytest.MonkeyPa
     cmap = hr.configured_harness_map()
     assert cmap.get("kiro-native") is False
     assert cmap.get("native-kiro") is False
+
+
+def test_omp_harness_gates_on_omp_binary(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The ACP-backed ``omp`` harness is gated on the ``omp`` binary on PATH."""
+    monkeypatch.setattr(hr.shutil, "which", lambda _b: None)
+    assert hr.harness_is_configured("omp") is False
+
+    monkeypatch.setattr(hr.shutil, "which", lambda _b: "/usr/local/bin/omp")
+    assert hr.harness_is_configured("omp") is True
+
+
+def test_configured_harness_map_exposes_omp(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The readiness map carries an ``omp`` key for the web picker lookup."""
+    monkeypatch.setattr(hr.shutil, "which", lambda _b: None)
+    assert hr.configured_harness_map().get("omp") is False

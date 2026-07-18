@@ -444,6 +444,7 @@ def _ensure_default_agents(
     _ensure_default_claude_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_codex_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_pi_agent(agent_store, artifact_store, agent_cache)
+    _ensure_default_omp_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_opencode_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_cursor_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_kiro_agent(agent_store, artifact_store, agent_cache)
@@ -610,6 +611,49 @@ def _ensure_default_codex_agent(
         agent_cache,
         name=_CODEX_NATIVE_AGENT_NAME,
         bundle_bytes=_build_codex_native_bundle(),
+    )
+
+
+def _build_omp_bundle() -> bytes:
+    """
+    Build a gzipped tarball of the built-in omp (Oh My Pi) agent spec.
+
+    :returns: Gzipped tarball bytes suitable for the artifact store.
+    """
+    import tempfile
+
+    from omnigent.omp_agent import materialize_omp_agent_spec
+    from omnigent.spec import materialize_bundle
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        spec_path = materialize_omp_agent_spec(Path(tmpdir))
+        bundle_dir = materialize_bundle(spec_path, Path(tmpdir) / "bundle")
+        return _tar_gz_dir(bundle_dir)
+
+
+def _ensure_default_omp_agent(
+    agent_store: AgentStore,
+    artifact_store: ArtifactStore,
+    agent_cache: Any,
+) -> None:
+    """
+    Register or refresh the built-in omp (Oh My Pi) agent.
+
+    Called during server lifespan startup so the Web UI can offer Oh My Pi as a
+    built-in ACP-backed agent. Content-aware via :func:`_ensure_builtin_agent`.
+
+    :param agent_store: Store for agent metadata.
+    :param artifact_store: Store for agent bundles.
+    :param agent_cache: Cache for loaded agent specs.
+    """
+    from omnigent.omp_agent import OMP_AGENT_NAME
+
+    _ensure_builtin_agent(
+        agent_store,
+        artifact_store,
+        agent_cache,
+        name=OMP_AGENT_NAME,
+        bundle_bytes=_build_omp_bundle(),
     )
 
 
