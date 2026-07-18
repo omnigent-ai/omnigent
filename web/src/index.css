@@ -4,6 +4,14 @@
 @import "shadcn/tailwind.css";
 @import "@fontsource-variable/geist-mono";
 
+@font-face {
+  font-family: "Hanken Grotesk";
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url("./assets/hanken-grotesk-latin-wght-normal.woff2") format("woff2-variations");
+}
+
 /* Streamdown ships utility classes pre-compiled in its dist; this @source
  * pragma tells Tailwind v4 to scan those files so the classes survive the
  * production build. Required by ai-elements/MessageResponse, which uses
@@ -327,39 +335,52 @@
   --tooltip-bg: #2a2440;
 }
 
-/* App-shell canvas gradient. Copied verbatim from the brand mock
- * (agentic-ux-2026, "modern-1" layout): a near-white 45° gradient with the
- * faintest warm/pink drift, painted over the lavender --background. The
- * lavender base is effectively never seen (the opaque gradient covers it),
- * exactly as on the mock — it remains the fallback. The white sidebar /
- * workspace cards float on this near-white canvas, delineated by their
- * border + shadow rather than background contrast. --sidebar is set to the
- * gradient's near-white so bg-sidebar chrome stays invisible against this
- * canvas. */
+/* Compact light layout from the live agentic-ux-2026 reference. */
 .app-shell {
-  background: linear-gradient(
-    45deg,
-    rgb(253, 250, 250),
-    rgb(253, 249, 251) 8%,
-    rgb(253, 249, 251) 17%,
-    rgb(253, 249, 252) 25%,
-    rgb(254, 248, 253) 33%,
-    rgb(254, 248, 252) 42%,
-    rgb(254, 251, 252) 50%,
-    rgb(254, 251, 251) 58%,
-    rgb(254, 251, 251) 67%,
-    rgb(254, 251, 251) 75%,
-    rgb(254, 251, 251) 83%,
-    rgb(254, 251, 251) 92%,
-    rgb(254, 253, 253)
-  );
+  background: #fff;
+}
+
+/* Light-mode sidebar surface from the agentic-ux-2026 reference. */
+:root:not(.dark) .conversations-sidebar:not([data-collapsed]) {
+  --foreground: #27272a;
+  --muted: rgb(0 0 0 / 0.06);
+  --muted-foreground: #71717a;
+
+  border-color: #ececee;
+  box-shadow: 0 6px 12px -6px rgb(0 0 0 / 0.12);
+  background:
+    radial-gradient(rgba(142, 83, 115, 0.08) 0.5px, transparent 0.7px) 0 0 / 5px 5px,
+    radial-gradient(104% 74% at 112% 108%, rgba(248, 177, 215, 0.16), transparent 66%),
+    linear-gradient(
+      45deg,
+      rgb(253, 250, 250),
+      rgb(253, 249, 251) 8%,
+      rgb(253, 249, 251) 17%,
+      rgb(253, 249, 252) 25%,
+      rgb(254, 248, 253) 33%,
+      rgb(254, 248, 252) 42%,
+      rgb(254, 251, 252) 50%,
+      rgb(254, 251, 251) 58%,
+      rgb(254, 251, 251) 67%,
+      rgb(254, 251, 251) 75%,
+      rgb(254, 251, 251) 83%,
+      rgb(254, 251, 251) 92%,
+      rgb(254, 253, 253)
+    );
+}
+
+:root:not(.dark) .landing-reference-composer {
+  border-color: #ececee;
+  background: #fff;
+  background-image: none;
+  box-shadow: 0 6px 12px -6px rgb(0 0 0 / 0.12);
 }
 .dark .app-shell {
+  --foreground: rgb(226 225 218);
+  --background: #0d1017;
   background:
-    radial-gradient(ellipse at 20% 50%, rgba(100, 40, 180, 0.15) 0%, transparent 50%),
-    radial-gradient(ellipse at 80% 20%, rgba(80, 30, 140, 0.1) 0%, transparent 45%),
-    radial-gradient(ellipse at 60% 80%, rgba(140, 30, 100, 0.08) 0%, transparent 40%),
-    linear-gradient(145deg, #1e1035 0%, #11171c 50%, #161020 100%);
+    radial-gradient(circle at 66% 18%, rgba(245, 59, 157, 0.12), transparent 28%),
+    radial-gradient(circle at 54% 92%, rgba(77, 197, 160, 0.08), transparent 28%), #0d1017;
 }
 
 /* Chat scroll fade: the ChatHeader overlay paints no background (a flat
@@ -434,6 +455,65 @@
   box-shadow:
     0 4px 16px rgba(0, 0, 0, 0.22),
     0 1px 3px rgba(0, 0, 0, 0.16);
+}
+
+/* Dark landing surfaces from the finalized Comfortable Orbit Left mockup. */
+html.dark .app-shell aside[aria-label="Conversations"].conversations-sidebar:not([data-collapsed]) {
+  --foreground: hsl(55 9% 74%);
+  --muted-foreground: hsl(48 5% 57%);
+  --muted: rgba(255, 255, 255, 0.055);
+  -webkit-backdrop-filter: blur(24px) !important;
+  backdrop-filter: blur(24px) !important;
+  border: 1px solid rgba(255, 255, 255, 0.07) !important;
+  background: rgba(8, 11, 17, 0.88) !important;
+  background-image: none !important;
+  box-shadow: none !important;
+}
+
+.dark .sidebar-primary-nav-item {
+  color: hsl(55 9% 74%);
+}
+
+html.dark
+  .app-shell
+  .landing-reference-composer.landing-reference-composer[data-testid="new-chat-landing-composer"] {
+  --foreground: rgb(226 225 218);
+  --muted-foreground: hsl(48 5% 57%);
+  --muted: rgba(255, 255, 255, 0.035);
+  -webkit-backdrop-filter: none !important;
+  backdrop-filter: none !important;
+  border: 1px solid rgba(255, 255, 255, 0.12) !important;
+  border-color: rgba(255, 255, 255, 0.12) !important;
+  border-top-color: rgba(255, 255, 255, 0.12) !important;
+  background: linear-gradient(145deg, rgba(39, 37, 51, 0.96), rgba(24, 27, 37, 0.96)) !important;
+  background-image: linear-gradient(
+    145deg,
+    rgba(39, 37, 51, 0.96),
+    rgba(24, 27, 37, 0.96)
+  ) !important;
+  box-shadow:
+    0 30px 70px rgba(0, 0, 0, 0.42),
+    inset 0 1px rgba(255, 255, 255, 0.035) !important;
+}
+
+.dark .landing-reference-composer textarea::placeholder {
+  color: hsl(48 5% 57%);
+  opacity: 1;
+}
+
+.dark .landing-reference-composer + div {
+  --muted-foreground: hsl(48 5% 57%);
+  --muted: rgba(255, 255, 255, 0.035);
+}
+
+.dark [data-testid="new-chat-landing"] h1 {
+  color: rgb(226 225 218);
+}
+
+.dark .landing-reference-composer [data-testid="new-chat-landing-submit"]:not(:disabled) {
+  color: #f8f5fa;
+  background: linear-gradient(135deg, #f43ba6, #e60c7f);
+  box-shadow: 0 10px 24px rgba(244, 59, 166, 0.24);
 }
 
 /* Side panels (FileViewer, TerminalsPanel, FilesPanelDrawer) manage their own

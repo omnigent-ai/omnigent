@@ -701,8 +701,9 @@ describe("NewChatLandingScreen", () => {
     // The home page offers an inline chat box rather than the old
     // "click New session in the sidebar" placeholder. If it regressed to
     // the placeholder, the composer input would be absent and this fails.
-    expect(screen.getByText("What should we do?")).toBeTruthy();
+    expect(screen.getByText("What should we build?")).toBeTruthy();
     expect(screen.getByTestId("new-chat-landing-input")).toBeTruthy();
+    expect(screen.getByPlaceholderText("Ask anything...")).toBeTruthy();
   });
 
   it("preserves the typed message and attachments when the landing screen unmounts and remounts", () => {
@@ -1139,6 +1140,23 @@ describe("NewChatLandingScreen", () => {
     expect(label("new-chat-landing-host-chip")?.className).toContain("max-w-32");
     expect(label("new-chat-landing-project-chip")?.className).toContain("max-w-32");
     expect(label("new-chat-landing-branch-chip")?.className).toContain("max-w-32");
+  });
+
+  it("uses the reference footer icons for host, directory, and worktree", async () => {
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+
+    expect(
+      screen.getByTestId("new-chat-landing-host-chip").querySelector("svg.lucide-monitor-cloud"),
+    ).toBeTruthy();
+    expect(
+      screen.getByTestId("new-chat-landing-workspace-chip").querySelector("svg.lucide-folder-tree"),
+    ).toBeTruthy();
+    expect(
+      screen.getByTestId("new-chat-landing-branch-chip").querySelector("svg.lucide-git-fork"),
+    ).toBeTruthy();
   });
 
   it("suppresses the conflict banner once a git branch is named", async () => {

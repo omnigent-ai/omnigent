@@ -239,25 +239,22 @@ describe("Sidebar session list", () => {
     );
   });
 
-  it("renders the footer Settings as an icon-only floating control on mobile", () => {
+  it("renders the compact header controls and reference navigation rows", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar();
 
     const settings = screen.getByTestId("settings-button");
-    // Accessible name survives even though the label is visually dropped on
-    // mobile (the icon stands alone there).
     expect(settings).toHaveAttribute("aria-label", "Settings");
-    // Mobile: compact square icon button, out of flow at the bottom-left.
-    expect(settings.className).toContain("max-md:size-9");
-    // The text label is desktop-only.
-    const label = within(settings).getByText("Settings");
-    expect(label.className).toContain("max-md:hidden");
+    expect(settings.className).toContain("size-6");
+    expect(screen.getByRole("link", { name: "Customize" })).toHaveAttribute(
+      "href",
+      "/settings/appearance",
+    );
+    expect(screen.getByTestId("sidebar-more-button")).toHaveTextContent("More");
   });
 
-  it("does NOT close the sidebar when the footer Settings is tapped", () => {
-    // No onNavClick on the footer Settings link: on mobile the overlay stays
-    // open and swaps to the settings section list rather than collapsing onto
-    // the default section's content.
+  it("does NOT close the sidebar when the header Settings control is tapped", () => {
+    // Settings swaps to the section list without collapsing the mobile overlay.
     mockConversations(THREE_TYPE_CONVERSATIONS);
     const onClose = vi.fn();
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -282,13 +279,13 @@ describe("Sidebar session list", () => {
     renderSidebar();
 
     // There is no longer an "Archived" section in the sidebar — archived
-    // chats are surfaced on /settings, reached via the footer Settings row.
+    // chats are surfaced on /settings, reached via the header Settings control.
     expect(screen.queryByRole("button", { name: "Archived" })).toBeNull();
     expect(screen.queryByText("conv_archived")).toBeNull();
     // Active sessions still render in the Sessions list.
     const recentSection = screen.getByText("Sessions").closest("section")!;
     expect(within(recentSection).getByText("conv_active")).toBeInTheDocument();
-    // The footer Settings link points at the settings page.
+    // The header Settings link points at the settings page.
     expect(screen.getByTestId("settings-button")).toHaveAttribute("href", "/settings");
   });
 

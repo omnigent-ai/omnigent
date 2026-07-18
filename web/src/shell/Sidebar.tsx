@@ -15,6 +15,7 @@ import {
   AlertTriangleIcon,
   ArchiveIcon,
   ArchiveRestoreIcon,
+  BlocksIcon,
   CheckIcon,
   CheckIcon as CheckMarkIcon,
   ChevronLeftIcon,
@@ -135,7 +136,6 @@ import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { useSessionSwitchHotkey } from "@/hooks/useSessionSwitchHotkey";
 import { usePinnedSessionHotkeys } from "@/hooks/usePinnedSessionHotkeys";
 import { absoluteTime, relativeTime } from "@/lib/relativeTime";
-import { MOD_KEY } from "@/components/KeyboardShortcutsDialog";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import { SettingsSidebarBody, useSettingsRoute, useTrackSettingsReturn } from "./settingsNav";
 import {
@@ -208,13 +208,13 @@ interface SidebarProps {
  * which is `inbox` in both standalone and embedded modes. Conversation ids are
  * `conv_…`-prefixed, so a chat route's leaf can never collide with `inbox`.
  */
-function useActiveNavItem(): { isNewChatPage: boolean; isInboxPage: boolean } {
+function useActiveNavItem(): { isNewChatPage: boolean } {
   const { conversationId: activeConversationId } = useParams<{ conversationId: string }>();
   const isInboxPage = useLocation().pathname.split("/").filter(Boolean).at(-1) === "inbox";
   // Exclude inbox: it also has no `:conversationId`, so it would otherwise
   // light up the "New session" button.
   const isNewChatPage = activeConversationId == null && !isInboxPage;
-  return { isNewChatPage, isInboxPage };
+  return { isNewChatPage };
 }
 
 /**
@@ -362,7 +362,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
   }
 
   // Which top-level nav button to highlight for the current route.
-  const { isNewChatPage, isInboxPage } = useActiveNavItem();
+  const { isNewChatPage } = useActiveNavItem();
 
   // On /settings the card keeps its chrome but swaps the conversation list
   // for the settings section nav (see settingsNav.tsx) — entering settings
@@ -431,7 +431,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
         // nothing lingers.
         "md:relative md:inset-auto md:translate-x-0 md:overflow-hidden",
         open
-          ? "md:m-2 md:w-[var(--sidebar-width)] md:rounded-xl md:border md:border-border md:shadow-lg"
+          ? "md:m-2 md:w-[var(--sidebar-width)] md:rounded-lg md:border md:border-border md:shadow-lg"
           : "md:m-0 md:w-0 md:border-0",
       )}
       style={
@@ -463,8 +463,8 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
       {inSettings ? (
         <SettingsSidebarBody onNavClick={onNavClick} onClose={onClose} />
       ) : (
-        <>
-          <div className="flex items-center justify-between px-4 pt-3">
+        <div className="flex h-full flex-col gap-4 px-2 pb-2">
+          <div className="-mb-4 mt-1 flex h-12 shrink-0 items-center justify-between px-2">
             {/* Brand mark doubles as the "home" affordance: clicking it
             returns to `/`, the new-session composer. Without this there
             is no way back to the landing composer once you're inside a
@@ -474,42 +474,42 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
             <Link
               to="/"
               onClick={onNavClick}
-              className="rounded-sm text-[15px] font-semibold tracking-tight text-foreground transition-colors hover:text-foreground/70"
+              className="rounded-none font-['Hanken_Grotesk'] text-[15px] font-semibold leading-[22.5px] tracking-[-0.01em] text-foreground transition-colors hover:text-foreground/70"
             >
               Omnigent
             </Link>
             <div className="flex items-center gap-1">
-              {/* Inbox lives at the top next to the collapse toggle. Rendered
-              as a Link so cmd/middle-click opens it in a new tab; onNavClick
-              still closes the sidebar on a plain mobile tap. */}
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    aria-label="Search"
+                    onClick={() => onOpenSearch?.()}
+                    className="size-6 rounded-md"
+                    data-testid="sidebar-search-button"
+                  >
+                    <SearchIcon className="size-4" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="bottom">Search</TooltipContent>
+              </Tooltip>
               <Tooltip>
                 <TooltipTrigger asChild>
                   <Button
                     asChild
                     variant="ghost"
                     size="icon"
-                    aria-label="Inbox"
-                    className={cn("relative rounded-full", isInboxPage && "bg-muted")}
-                    data-testid="inbox-button"
+                    aria-label="Settings"
+                    className="size-6 rounded-md"
                   >
-                    <Link to="/inbox" onClick={onNavClick}>
-                      <InboxIcon className="size-4" />
-                      {inboxCount > 0 && (
-                        <span
-                          aria-label={
-                            inboxCount === 1
-                              ? "1 inbox item waiting"
-                              : `${inboxCount} inbox items waiting`
-                          }
-                          className="-top-0.5 -right-0.5 absolute inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-warning/15 px-1 text-[10px] font-medium text-warning tabular-nums"
-                        >
-                          {inboxCount}
-                        </span>
-                      )}
+                    <Link to="/settings" data-testid="settings-button">
+                      <SettingsIcon className="size-4" />
                     </Link>
                   </Button>
                 </TooltipTrigger>
-                <TooltipContent side="bottom">Inbox</TooltipContent>
+                <TooltipContent side="bottom">Settings</TooltipContent>
               </Tooltip>
               <Tooltip>
                 <TooltipTrigger asChild>
@@ -519,7 +519,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                     size="icon"
                     aria-label="Close sidebar"
                     onClick={onClose}
-                    className="rounded-full"
+                    className="size-6 rounded-md"
                   >
                     {/* panel-right-open while the sidebar IS open — this button
                     only renders in the open state (ChatHeader's PanelLeftIcon
@@ -534,7 +534,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
             </div>
           </div>
 
-          <div className="px-3 py-3">
+          <div className="flex flex-col gap-0 pr-1 py-0">
             {/* "New session" routes to the home composer ("/"), which now owns
             session creation end-to-end (host/workspace/worktree chips +
             send). Rendered as a Link so cmd/middle-click opens it in a new
@@ -545,8 +545,8 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                 // px-2 + gap-1 puts the icon on the sidebar's left (red) column
                 // and the label on the label (blue) column — matching section
                 // headers and project folders.
-                "w-full justify-start gap-1 px-2 text-sm",
-                isNewChatPage && "bg-muted font-semibold",
+                "sidebar-primary-nav-item h-7 w-full justify-start gap-2 rounded-[6px] border-0 px-2 text-[13px] leading-5 font-normal",
+                isNewChatPage && "bg-muted",
               )}
               variant="ghost"
               data-testid="new-chat-button"
@@ -561,7 +561,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                   onNavClick(e);
                 }}
               >
-                <SquarePenIcon className="size-4 text-foreground" />
+                <SquarePenIcon className="size-3.5 text-muted-foreground" />
                 New session
               </Link>
             </Button>
@@ -576,43 +576,48 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                 onExit={exitSelectionMode}
               />
             ) : (
-              <div className="relative mt-3 flex items-center gap-1.5">
-                {/* "Search" opens the command palette (⌘K), which searches both
-                    session titles and chat content. It replaces the old inline
-                    filter box — the palette is the single search surface now.
-                    The `group` scope reveals the ⌘K badge on hover/focus. */}
-                <button
-                  type="button"
-                  onClick={() => onOpenSearch?.()}
-                  aria-label="Search"
-                  data-testid="sidebar-search-button"
-                  className="group relative flex min-h-8 flex-1 items-center rounded-full border border-input pr-2 pl-7 text-left text-sm text-muted-foreground transition hover:bg-muted focus-visible:outline-1"
+              <>
+                <Button
+                  asChild
+                  variant="ghost"
+                  className="sidebar-primary-nav-item h-7 w-full justify-start gap-2 rounded-[6px] border-0 px-2 text-[13px] leading-5 font-normal"
                 >
-                  <SearchIcon className="-translate-y-1/2 pointer-events-none absolute top-1/2 left-2 size-3.5" />
-                  <span className="flex-1 truncate">Search</span>
-                  {/* ⌘K hint — hidden until the button is hovered / focused,
-                      mirroring the sidebar's other hover-revealed affordances. */}
-                  <kbd className="ml-2 hidden shrink-0 items-center rounded-md border border-border bg-muted px-1.5 py-0.5 font-sans text-[10px] font-medium text-muted-foreground transition-opacity group-hover:inline-flex group-focus-visible:inline-flex">
-                    {MOD_KEY}K
-                  </kbd>
-                </button>
-                <Tooltip>
-                  <TooltipTrigger asChild>
+                  <Link to="/settings/appearance">
+                    <BlocksIcon className="size-3.5 text-muted-foreground" />
+                    Customize
+                  </Link>
+                </Button>
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
                     <Button
                       type="button"
                       variant="ghost"
-                      size="icon-sm"
-                      aria-label="Select sessions"
-                      data-testid="toggle-selection-mode"
-                      className="shrink-0 rounded-full"
-                      onClick={() => setSelectionMode(true)}
+                      className="sidebar-primary-nav-item h-7 w-full justify-start gap-2 rounded-[6px] border-0 px-2 text-[13px] leading-5 font-normal"
+                      data-testid="sidebar-more-button"
                     >
-                      <ListChecksIcon className="size-3.5" />
+                      <MoreHorizontalIcon className="size-3.5 text-muted-foreground" />
+                      More
+                      {inboxCount > 0 && (
+                        <span className="ml-auto inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-warning/15 px-1 text-[10px] font-medium text-warning tabular-nums">
+                          {inboxCount}
+                        </span>
+                      )}
                     </Button>
-                  </TooltipTrigger>
-                  <TooltipContent side="bottom">Select sessions</TooltipContent>
-                </Tooltip>
-              </div>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="start" className="min-w-48">
+                    <DropdownMenuItem asChild>
+                      <Link to="/inbox" onClick={onNavClick}>
+                        <InboxIcon className="size-4" />
+                        Inbox
+                      </Link>
+                    </DropdownMenuItem>
+                    <DropdownMenuItem onSelect={() => setSelectionMode(true)}>
+                      <ListChecksIcon className="size-4" />
+                      Select sessions
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              </>
             )}
           </div>
 
@@ -622,7 +627,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
           scrolls. Hidden during selection mode, where the bulk-action bar owns
           this strip. */}
           {multiUser && !selectionMode && (
-            <div className="px-3 pb-2">
+            <div className="pb-2">
               <Tabs
                 value={activeTab}
                 onValueChange={(v) => setActiveTab(v as SidebarTab)}
@@ -645,7 +650,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
           flow, over the bottom-left corner). */}
           <nav
             ref={scrollContainerRef}
-            className="relative flex-1 overflow-y-auto px-3 pb-3 max-md:pb-16 [scrollbar-gutter:stable]"
+            className="relative flex-1 overflow-y-auto pb-3 max-md:pb-16"
           >
             <ConversationList
               conversationsQuery={conversationsQuery}
@@ -664,46 +669,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
               onVisibleCountChange={setVisibleConversationCount}
             />
           </nav>
-
-          {/* Settings entry. Always present (every deploy): the full settings
-          surface — appearance, keyboard shortcuts, archived chats, and the
-          account/sign-out controls when accounts auth is on — lives behind
-          this on the /settings page.
-
-          Desktop: a full-width footer row pinned below the flex-1 nav, the
-          gear aligned with the New session / Inbox icons.
-          Mobile: pulled OUT of flow (absolute, bottom-left) so it floats over
-          the conversation list as a compact icon instead of stealing a row's
-          height from the scroll area. */}
-          <div className="md:shrink-0 md:px-3 md:pb-3 max-md:absolute max-md:bottom-3 max-md:left-3 max-md:z-10">
-            <Button
-              asChild
-              variant="ghost"
-              className={cn(
-                "gap-2 text-sm",
-                // Desktop: full-width row with label, matching New session /
-                // Inbox. Mobile: a small round icon-only button with its own
-                // surface (border + solid bg + shadow) so it reads as a
-                // floating control over the scrolling list beneath it.
-                "md:w-full md:justify-start",
-                "max-md:size-9 max-md:justify-center max-md:rounded-full max-md:border max-md:border-border max-md:bg-card-solid max-md:p-0 max-md:shadow-sm",
-              )}
-              data-testid="settings-button"
-            >
-              {/* No onNavClick here: on mobile the sidebar is a full-screen
-              overlay, and entering settings swaps it to the section list
-              (SettingsSidebarBody). Closing the overlay would skip that list
-              and drop straight onto the default section's content — instead we
-              keep it open so mobile lands on the section list, then tapping a
-              section (which DOES use onNavClick) closes it to show content. */}
-              <Link to="/settings" aria-label="Settings">
-                <SettingsIcon className="size-4 text-muted-foreground" />
-                {/* Label is desktop-only; the icon stands alone on mobile. */}
-                <span className="max-md:hidden">Settings</span>
-              </Link>
-            </Button>
-          </div>
-        </>
+        </div>
       )}
     </aside>
   );
@@ -1438,7 +1404,7 @@ function ConversationList({
       onDragEnd={handleDragEnd}
       onDragCancel={() => setActiveDrag(null)}
     >
-      <div className="flex flex-col gap-3">
+      <div className="flex flex-col gap-4 pr-1">
         {/* Removing a filed session from its project means dropping it back
             onto the flat "Chats" list — so the Chats section itself is the
             ungroup target (wrapped below). This top strip is only a FALLBACK
@@ -1797,7 +1763,7 @@ function SectionHeader({
         type="button"
         aria-expanded={!collapsed}
         onClick={onToggleCollapsed}
-        className="group flex w-full items-center gap-1 rounded-md px-2 py-1 text-left text-sm text-muted-foreground transition-colors hover:text-foreground"
+        className="group flex w-full items-center gap-1 border-0 pt-0 pr-0 pb-1 pl-2 text-left text-xs leading-4 text-muted-foreground transition-colors hover:text-foreground"
       >
         {icon ? (
           // Headers with a leading icon (project folders) swap the folder for a
@@ -2720,8 +2686,9 @@ function ConversationRow({
     <Link
       to={selectionMode ? "#" : `/c/${conversation.id}`}
       className={cn(
-        "relative flex w-full flex-col gap-0.5 rounded-md px-2 py-2 text-left text-sm hover:bg-muted",
-        !selectionMode && (sessionState?.kind === "awaiting" ? "pr-48 md:pr-29" : "pr-28 md:pr-16"),
+        "relative flex min-h-7 w-full flex-col gap-0.5 rounded-[6px] px-2 py-0.5 text-left text-[13px] leading-5 text-foreground hover:bg-muted",
+        !selectionMode &&
+          (sessionState?.kind === "awaiting" ? "pr-48 md:pr-29" : "pr-28 md:pr-[52px]"),
         selectionMode && "pr-10",
         isActive && "bg-muted",
         selectionMode && isSelected && "bg-primary/5",
@@ -2848,7 +2815,10 @@ function ConversationRow({
         </span>
       ) : (
         <span
-          className={cn(TIME_MARKER_SLOT_CLASS, "text-xs tabular-nums text-muted-foreground")}
+          className={cn(
+            TIME_MARKER_SLOT_CLASS,
+            "w-9 justify-end text-xs tabular-nums text-muted-foreground",
+          )}
           aria-label={absoluteTime(conversation.updated_at * 1000)}
           title={absoluteTime(conversation.updated_at * 1000)}
         >
