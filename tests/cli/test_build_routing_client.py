@@ -8,6 +8,7 @@ Covers :func:`_build_external_routing_client` (the external
 
 from __future__ import annotations
 
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 from omnigent.cli import _build_external_routing_client, _build_local_llm_routing_client
@@ -56,6 +57,44 @@ def test_external_resolves_profile_auth() -> None:
     resolve.assert_called_once_with("staging")
     assert isinstance(client, ExternalRoutingClient)
     assert client._auth is not None  # bearer auth built from the profile token
+
+
+def test_external_api_key_expands_env(monkeypatch: Any) -> None:
+    """api_key is provider-agnostic and ${ENV}-expanded into a bearer header."""
+    import httpx
+
+    monkeypatch.setenv("OMNIGENT_TEST_ROUTING_KEY", "sekret")
+    cfg = {
+        "provider": "external",
+        "base_url": "https://host/v1",
+        "router_name": "task_v0",
+        "api_key": "${OMNIGENT_TEST_ROUTING_KEY}",
+    }
+    client = _build_external_routing_client(cfg)
+    assert isinstance(client, ExternalRoutingClient)
+    # The bearer auth carries the expanded token.
+    request = httpx.Request("POST", "https://host/v1/routes:select")
+    flow = client._auth.auth_flow(request)
+    assert next(flow).headers["Authorization"] == "Bearer sekret"
+
+
+def test_external_api_key_wins_over_profile(monkeypatch: Any) -> None:
+    """When both are set, api_key takes precedence; profile is not resolved."""
+    monkeypatch.setenv("OMNIGENT_TEST_ROUTING_KEY", "sekret")
+    cfg = {
+        "provider": "external",
+        "base_url": "https://host/v1",
+        "router_name": "task_v0",
+        "api_key": "${OMNIGENT_TEST_ROUTING_KEY}",
+        "profile": "staging",
+    }
+    with patch(
+        "omnigent.runtime.credentials.databricks.resolve_databricks_workspace",
+    ) as resolve:
+        client = _build_external_routing_client(cfg)
+    resolve.assert_not_called()
+    assert isinstance(client, ExternalRoutingClient)
+    assert client._auth is not None
 
 
 def test_external_missing_required_fields_disables() -> None:

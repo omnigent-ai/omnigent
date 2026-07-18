@@ -89,12 +89,12 @@ def _build_external_routing_client(
 ) -> Any | None:  # type: ignore[explicit-any]  # ExternalRoutingClient | None
     """Build an :class:`ExternalRoutingClient` from the ``routing:`` config.
 
-    Requires ``base_url`` + ``router_name``; auth is resolved from
-    ``profile`` (a Databricks CLI profile for the router's host) or left
-    unauthenticated. Optional ``model_prefix`` is stripped from catalog
-    model ids sent to the router (and restored on its answer) — e.g.
-    ``"databricks-"`` when serving-endpoint names carry that prefix but the
-    router keys on bare ids.
+    Requires ``base_url`` + ``router_name``. Auth mirrors the ``llm:`` block:
+    an explicit, provider-agnostic ``api_key`` (``${ENV}`` expanded) wins,
+    else the Databricks ``profile`` convenience, else unauthenticated.
+    Optional ``model_prefix`` is stripped from catalog model ids sent to the
+    router (and restored on its answer) — e.g. ``"databricks-"`` when
+    serving-endpoint names carry that prefix but the router keys on bare ids.
 
     :param routing_cfg: The parsed ``routing:`` mapping (a dict with
         ``provider == "external"``, per the caller).
@@ -103,6 +103,7 @@ def _build_external_routing_client(
     """
     base_url = (routing_cfg.get("base_url") or "").strip()
     router_name = (routing_cfg.get("router_name") or "").strip()
+    api_key = (routing_cfg.get("api_key") or "").strip()
     profile = (routing_cfg.get("profile") or "").strip()
     model_prefix = (routing_cfg.get("model_prefix") or "").strip()
 
@@ -110,10 +111,18 @@ def _build_external_routing_client(
         _logger.warning("routing.provider=external requires base_url and router_name; skipping")
         return None
 
+    from omnigent.server.smart_routing import _bearer_auth
+
+    # Auth precedence mirrors the ``llm:`` block: an explicit (provider-
+    # agnostic) api_key wins, else the Databricks ``profile`` convenience,
+    # else unauthenticated.
     auth = None
-    if profile:
+    if api_key:
+        from omnigent.spec import expand_env_vars
+
+        auth = _bearer_auth(expand_env_vars({"api_key": api_key})["api_key"])
+    elif profile:
         from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
-        from omnigent.server.smart_routing import _bearer_auth
 
         try:
             creds = resolve_databricks_workspace(profile)
