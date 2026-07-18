@@ -3000,18 +3000,19 @@ export function NewChatLandingScreen() {
   );
 
   return (
-    // pb-12 lifts the content slightly above the geometric center, where
-    // the hero reads better optically.
+    // Keep the new-session controls in the upper third, like SP2K, rather
+    // than vertically centering them in the full workspace. The clamped
+    // desktop offset stays comfortable on both laptop and tall displays.
     <div
       ref={setLandingSurface}
-      className="flex flex-1 items-center justify-center"
+      className="flex flex-1 items-start justify-center pt-20 md:pt-[clamp(96px,18vh,176px)]"
       data-testid="new-chat-landing"
     >
       {/* Padding lives inside the 860px cap, so the composer renders at
           860 − 80 = 780px max on desktop. px-4 on phones (16px gutters)
           keeps the composer from feeling cramped against the viewport
           edges; widens to the full px-10 at the md breakpoint and up. */}
-      <div className="flex w-full max-w-[860px] flex-col items-center gap-6 px-4 pt-8 pb-16 md:select-none md:px-10">
+      <div className="flex w-full max-w-[860px] flex-col items-center gap-6 px-4 pb-16 md:select-none md:px-10">
         <div className="flex flex-col items-center gap-0">
           <div className="relative h-[92px] w-[112px] shrink-0" aria-hidden="true">
             <div className="absolute -inset-3.5 rounded-full bg-[radial-gradient(circle,rgba(245,59,157,0.22),rgba(245,59,157,0.055)_44%,rgba(77,197,160,0.03)_58%,transparent_73%)] blur-[4px]" />
