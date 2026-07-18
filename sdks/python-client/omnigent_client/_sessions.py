@@ -188,6 +188,7 @@ class Session:
     llm_model: str | None = None
     harness: str | None = None
     model_override: str | None = None
+    cost_control_mode_override: str | None = None
     context_window: int | None = None
     last_total_tokens: int | None = None
     last_task_error: dict[str, str] | None = None
@@ -222,6 +223,7 @@ class Session:
             llm_model=raw.get("llm_model"),
             harness=raw.get("harness"),
             model_override=raw.get("model_override"),
+            cost_control_mode_override=raw.get("cost_control_mode_override"),
             context_window=int(raw_cw) if raw_cw is not None else None,
             last_total_tokens=int(raw_ltt) if raw_ltt is not None else None,
             last_task_error=raw.get("last_task_error"),
@@ -568,6 +570,45 @@ class SessionsNamespace:
         body: dict[str, object] = {"model_override": wire_model}
         if silent:
             body["silent"] = True
+        resp = await self._http.patch(
+            f"{self._base}/v1/sessions/{session_id}",
+            json=body,
+        )
+        raise_for_status(resp.status_code, response_body(resp))
+        return Session.from_dict(
+            require_json_object(resp, "PATCH /v1/sessions/{session_id}"),
+        )
+
+    async def set_cost_control_mode(
+        self,
+        session_id: str,
+        *,
+        mode: str | None,
+        clear_model_override: bool = False,
+    ) -> Session:
+        """
+        Set or clear a session's cost-control / smart-routing mode.
+
+        Calls ``PATCH /v1/sessions/{session_id}`` with
+        ``{"cost_control_mode_override": "on"|"off"}``, the switch the
+        server's routing gate reads. ``None`` sends an explicit JSON
+        null to clear the override back to the spec default.
+
+        Turning routing ``on`` while a model override is pinned would let
+        the pinned model win (the server skips routing when an override
+        is set), so pass ``clear_model_override=True`` to clear it in the
+        same PATCH — matching the web client's behaviour.
+
+        :param session_id: Session/conversation identifier.
+        :param mode: ``"on"``, ``"off"``, or ``None`` to clear.
+        :param clear_model_override: Also clear ``model_override`` in the
+            same request (use when turning routing on).
+        :returns: The updated :class:`Session` snapshot.
+        :raises OmnigentError: On non-2xx status.
+        """
+        body: dict[str, object] = {"cost_control_mode_override": mode}
+        if clear_model_override:
+            body["model_override"] = "default"
         resp = await self._http.patch(
             f"{self._base}/v1/sessions/{session_id}",
             json=body,

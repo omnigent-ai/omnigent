@@ -69,6 +69,8 @@ if TYPE_CHECKING:
     from omnigent.onboarding.provider_config import ProviderEntry
     from omnigent.update_check import _InstalledWheelInfo
 
+_logger = logging.getLogger(__name__)
+
 
 # Any: YAML configs have heterogeneous value types (str, int, list, etc.)
 def _load_config(path: str | None) -> dict[str, Any]:  # type: ignore[explicit-any]
@@ -80,6 +82,83 @@ def _load_config(path: str | None) -> dict[str, Any]:  # type: ignore[explicit-a
         return {}
     with open(path) as f:
         return yaml.safe_load(f) or {}
+
+
+def _build_routing_client(
+    routing_cfg: Any,  # type: ignore[explicit-any]  # parsed YAML block
+    server_llm: Any,  # type: ignore[explicit-any]  # LLMConfig | None
+) -> Any | None:  # type: ignore[explicit-any]  # RoutingClient | None
+    """Build the ``RuntimeCaps.routing_client`` from the ``routing:`` config.
+
+    Two mutually-exclusive providers:
+
+    - ``gateway`` — :class:`GatewayRoutingClient`, calling an external
+      ``routes:select`` service. Requires ``base_url`` + ``router_name``;
+      auth is resolved from ``profile`` (a Databricks CLI profile for the
+      gateway host) or left unauthenticated.
+    - ``llm`` (default when ``routing:`` is absent) — the built-in
+      :class:`LLMRoutingClient`, using the server-level ``llm:`` block.
+
+    :param routing_cfg: The parsed ``routing:`` mapping, or ``None``.
+    :param server_llm: The parsed ``LLMConfig`` (for the ``llm`` provider).
+    :returns: A routing client, or ``None`` when routing can't be built
+        (e.g. ``llm`` provider with no ``llm:`` block, or a gateway
+        config missing ``base_url``).
+    """
+    provider = "llm"
+    if isinstance(routing_cfg, dict):
+        raw_provider = routing_cfg.get("provider")
+        if isinstance(raw_provider, str) and raw_provider.strip():
+            provider = raw_provider.strip()
+
+    if provider == "gateway":
+        if not isinstance(routing_cfg, dict):
+            _logger.warning("routing.provider=gateway but no routing config block; skipping")
+            return None
+        base_url = routing_cfg.get("base_url")
+        router_name = routing_cfg.get("router_name")
+        if not isinstance(base_url, str) or not base_url.strip():
+            _logger.warning("routing.provider=gateway requires base_url; skipping")
+            return None
+        if not isinstance(router_name, str) or not router_name.strip():
+            _logger.warning("routing.provider=gateway requires router_name; skipping")
+            return None
+        auth = None
+        profile = routing_cfg.get("profile")
+        if isinstance(profile, str) and profile.strip():
+            from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
+
+            try:
+                creds = resolve_databricks_workspace(profile.strip())
+                from omnigent.server.smart_routing import _bearer_auth
+
+                auth = _bearer_auth(creds.token)
+            except OSError:
+                _logger.warning(
+                    "routing.profile=%s could not be resolved; calling gateway unauthenticated",
+                    profile,
+                )
+        from omnigent.server.smart_routing import GatewayRoutingClient
+
+        return GatewayRoutingClient(
+            base_url=base_url.strip(), router_name=router_name.strip(), auth=auth
+        )
+
+    # provider == "llm" (default): built-in judge using the llm: block.
+    if server_llm is None:
+        return None
+    from omnigent.runtime.policies.builder import (
+        _build_policy_llm_client,
+        _resolve_server_llm_connection,
+    )
+
+    conn = _resolve_server_llm_connection(server_llm)
+    policy_client = _build_policy_llm_client(server_llm, conn)
+    if policy_client is None:
+        return None
+    from omnigent.server.smart_routing import LLMRoutingClient
+
+    return LLMRoutingClient(policy_client)
 
 
 def _server_uvicorn_log_config(
@@ -3327,23 +3406,16 @@ def server(
 
     server_llm = parse_server_llm(cfg.get("llm"))
 
-    # Build the default LLM-based routing client when BOTH the server
-    # has an ``llm:`` config AND the feature is explicitly enabled via
-    # OMNIGENT_SMART_ROUTING=1.  Hidden by default — managed deployments
-    # override RuntimeCaps.routing_client with their own implementation.
+    # Build the routing client when the feature is enabled via
+    # OMNIGENT_SMART_ROUTING=1. Two mutually-exclusive providers, chosen
+    # by the ``routing:`` config block:
+    #   - ``gateway``: call an external ``routes:select`` service.
+    #   - ``llm`` (default): the built-in judge using the ``llm:`` block.
+    # Hidden by default — managed deployments override
+    # RuntimeCaps.routing_client with their own implementation.
     routing_client = None
-    if server_llm is not None and os.environ.get("OMNIGENT_SMART_ROUTING") == "1":
-        from omnigent.runtime.policies.builder import (
-            _build_policy_llm_client,
-            _resolve_server_llm_connection,
-        )
-
-        _conn = _resolve_server_llm_connection(server_llm)
-        _policy_client = _build_policy_llm_client(server_llm, _conn)
-        if _policy_client is not None:
-            from omnigent.server.smart_routing import LLMRoutingClient
-
-            routing_client = LLMRoutingClient(_policy_client)
+    if os.environ.get("OMNIGENT_SMART_ROUTING") == "1":
+        routing_client = _build_routing_client(cfg.get("routing"), server_llm)
 
     caps = RuntimeCaps(
         execution_timeout=int(effective_timeout),

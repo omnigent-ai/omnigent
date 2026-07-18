@@ -405,3 +405,138 @@ async def test_route_turn_falls_back_to_static_when_runner_unavailable() -> None
         )
     # Still routes — fell back to static infer_models
     assert model == "databricks-claude-haiku-4-5"
+
+
+# ── GatewayRoutingClient ─────────────────────────────────────────────
+
+
+def _patch_httpx(transport: Any) -> Any:
+    """Patch httpx.AsyncClient to use a MockTransport."""
+    import httpx
+
+    real = httpx.AsyncClient
+
+    def factory(*args: Any, **kwargs: Any) -> Any:
+        kwargs["transport"] = transport
+        return real(*args, **kwargs)
+
+    return patch("httpx.AsyncClient", factory)
+
+
+@pytest.mark.asyncio
+async def test_gateway_routing_client_sends_snake_case_and_parses() -> None:
+    """available_models -> snake_case route_options; response -> RoutingResult."""
+    import httpx
+
+    from omnigent.server.smart_routing import GatewayRoutingClient
+
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "route_selection": [
+                    {"route_option": {"model": "claude-opus-4-8", "harness": "claude"}}
+                ],
+                "rationale": "task_v0 matched rule 'bugfix_to_opus'.",
+            },
+        )
+
+    client = GatewayRoutingClient(
+        base_url="https://host/ai-gateway/routing/v1", router_name="task_v0"
+    )
+    with _patch_httpx(httpx.MockTransport(handler)):
+        result = await client.route(
+            "fix this code: x = y + 2",
+            {"claude": ["claude-opus-4-8"], "codex": ["gpt-5-5"]},
+        )
+
+    assert result is not None
+    assert result.model == "claude-opus-4-8"
+    assert result.harness == "claude"
+    assert result.rationale == "task_v0 matched rule 'bugfix_to_opus'."
+    assert captured["url"] == "https://host/ai-gateway/routing/v1/routes:select"
+    body = captured["body"]
+    assert body["route_selector"]["router_name"] == "task_v0"  # snake_case
+    assert body["task"]["prompt"] == "fix this code: x = y + 2"
+    assert body["route_options"] == [
+        {"model": "claude-opus-4-8", "harness": "claude"},
+        {"model": "gpt-5-5", "harness": "codex"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_gateway_routing_client_empty_available_models_skips() -> None:
+    """No candidates -> no HTTP call, returns None."""
+    import httpx
+
+    from omnigent.server.smart_routing import GatewayRoutingClient
+
+    called = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal called
+        called = True
+        return httpx.Response(200, json={})
+
+    client = GatewayRoutingClient(base_url="http://localhost:6767/v1", router_name="task_v0")
+    with _patch_httpx(httpx.MockTransport(handler)):
+        assert await client.route("hi", {}) is None
+    assert called is False
+
+
+@pytest.mark.asyncio
+async def test_gateway_routing_client_swallows_http_error() -> None:
+    """A gateway outage returns None so the turn proceeds."""
+    import httpx
+
+    from omnigent.server.smart_routing import GatewayRoutingClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503)
+
+    client = GatewayRoutingClient(base_url="http://localhost:6767/v1", router_name="task_v0")
+    with _patch_httpx(httpx.MockTransport(handler)):
+        assert await client.route("hi", {"claude": ["claude-opus-4-8"]}) is None
+
+
+@pytest.mark.asyncio
+async def test_gateway_routing_client_empty_selection_returns_none() -> None:
+    """An empty route_selection (e.g. router declined) yields None."""
+    import httpx
+
+    from omnigent.server.smart_routing import GatewayRoutingClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"route_selection": [], "rationale": ""})
+
+    client = GatewayRoutingClient(base_url="http://localhost:6767/v1", router_name="task_v0")
+    with _patch_httpx(httpx.MockTransport(handler)):
+        assert await client.route("hi", {"claude": ["claude-opus-4-8"]}) is None
+
+
+@pytest.mark.asyncio
+async def test_gateway_routing_client_sends_bearer_auth() -> None:
+    """When built with auth, the request carries the bearer header."""
+    import httpx
+
+    from omnigent.server.smart_routing import GatewayRoutingClient, _bearer_auth
+
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["authorization"] = request.headers.get("Authorization")
+        return httpx.Response(
+            200,
+            json={"route_selection": [{"route_option": {"model": "m", "harness": "h"}}]},
+        )
+
+    client = GatewayRoutingClient(
+        base_url="https://host/v1", router_name="task_v0", auth=_bearer_auth("dapi-XYZ")
+    )
+    with _patch_httpx(httpx.MockTransport(handler)):
+        await client.route("hi", {"h": ["m"]})
+    assert captured["authorization"] == "Bearer dapi-XYZ"
