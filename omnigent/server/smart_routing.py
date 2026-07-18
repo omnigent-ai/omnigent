@@ -246,28 +246,137 @@ _VERDICT_SCHEMA: dict[str, object] = {
     "additionalProperties": False,
 }
 
+# Routing-strategy name recorded in the ``SelectRouteRequest`` the built-in
+# judge constructs. External routers carry the operator's ``router_name``;
+# the local judge has no remote strategy, so it labels its own.
+_LLM_ROUTER_NAME = "llm"
 
-class LLMRoutingClient:
-    """Default routing client using the server-level PolicyLLMClient."""
 
-    def __init__(self, llm_client: Any) -> None:  # type: ignore[explicit-any]
-        self._llm = llm_client
+def _build_route_options(
+    available_models: dict[str, list[str]],
+    to_router_id: Any = None,  # type: ignore[explicit-any]  # Callable[[str], str] | None
+) -> tuple[list[Any], dict[str, str]]:  # type: ignore[explicit-any]  # list[pb.RouteOption]
+    """Build proto ``route_options`` from a harness → models catalog.
+
+    :param available_models: Mapping of harness → catalog model ids.
+    :param to_router_id: Optional transform applied to each id before it is
+        sent (e.g. stripping a provider prefix). Identity when ``None``.
+    :returns: ``(route_options, router_id -> local_id map)``. The map
+        recovers the exact catalog id from the router's (transformed) answer.
+    """
+    from omnigent.api.routing.v1 import routing_pb2 as pb
+
+    options: list[Any] = []  # type: ignore[explicit-any]
+    router_to_local: dict[str, str] = {}
+    for harness, models in available_models.items():
+        for model in models:
+            router_id = to_router_id(model) if to_router_id is not None else model
+            router_to_local[router_id] = model
+            options.append(pb.RouteOption(model=router_id, harness=harness))
+    return options, router_to_local
+
+
+def _result_from_response(
+    response: Any,  # type: ignore[explicit-any]  # pb.SelectRouteResponse
+    router_to_local: dict[str, str],
+) -> RoutingResult | None:
+    """Map the first ``route_selection`` back to a :class:`RoutingResult`.
+
+    Recovers the local catalog id via *router_to_local*, falling back to the
+    returned id if the router answered with something we did not send.
+    """
+    if not response.route_selection:
+        return None
+    selected = response.route_selection[0].route_option
+    if not selected.model:
+        return None
+    return RoutingResult(
+        model=router_to_local.get(selected.model, selected.model),
+        rationale=response.rationale,
+        harness=selected.harness or None,
+    )
+
+
+class _ProtoRoutingClient:
+    """Shared skeleton for routers speaking the ``routing.v1`` proto.
+
+    Both concrete clients follow the same shape — build a
+    ``SelectRouteRequest`` from the catalog, obtain a ``SelectRouteResponse``
+    (via :meth:`_select`), and map it to a :class:`RoutingResult`. Subclasses
+    supply only the decision step (an HTTP call, or a local LLM judge) and,
+    optionally, an id transform.
+    """
+
+    _router_name: str = ""
+
+    def _to_router_id(self, model: str) -> str:
+        """Transform a catalog id into the router's vocabulary. Identity by default."""
+        return model
+
+    async def _select(
+        self,
+        request: Any,  # type: ignore[explicit-any]  # pb.SelectRouteRequest
+    ) -> Any | None:  # type: ignore[explicit-any]  # pb.SelectRouteResponse | None
+        """Decide a route for *request*. Returns ``None`` to skip routing."""
+        raise NotImplementedError
 
     async def route(
         self,
         message: str,
         available_models: dict[str, list[str]],
     ) -> RoutingResult | None:
-        flat = _flatten_models(available_models)
-        rubric = _build_rubric(available_models)
-        _logger.info("LLMRoutingClient: available_models=%s", dict(available_models))
+        from omnigent.api.routing.v1 import routing_pb2 as pb
+
+        options, router_to_local = _build_route_options(available_models, self._to_router_id)
+        if not options:
+            return None
+        request = pb.SelectRouteRequest(
+            route_options=options,
+            task=pb.Task(prompt=message[:4000]),
+            route_selector=pb.RouteSelector(router_name=self._router_name),
+        )
+        response = await self._select(request)
+        if response is None:
+            return None
+        return _result_from_response(response, router_to_local)
+
+
+class LLMRoutingClient(_ProtoRoutingClient):
+    """Built-in routing client: a local LLM judge that answers the same proto.
+
+    Implements the ``routes:select`` contract locally — it builds a
+    ``SelectRouteResponse`` by prompting the server-level ``PolicyLLMClient``
+    and validating the verdict against the request's ``route_options``
+    (clamping a hallucinated model to the cheapest offered, re-resolving the
+    harness). Same request/response shape as :class:`ExternalRoutingClient`.
+    """
+
+    _router_name = _LLM_ROUTER_NAME
+
+    def __init__(self, llm_client: Any) -> None:  # type: ignore[explicit-any]
+        self._llm = llm_client
+
+    async def _select(
+        self,
+        request: Any,  # type: ignore[explicit-any]  # pb.SelectRouteRequest
+    ) -> Any | None:  # type: ignore[explicit-any]  # pb.SelectRouteResponse | None
+        from omnigent.api.routing.v1 import routing_pb2 as pb
+
+        # Regroup the request's route_options into the harness → models shape
+        # the rubric + clamping logic works on (insertion order preserved).
+        grouped: dict[str, list[str]] = {}
+        for opt in request.route_options:
+            grouped.setdefault(opt.harness, []).append(opt.model)
+        flat = _flatten_models(grouped)
+        rubric = _build_rubric(grouped)
+        _logger.info("LLMRoutingClient: available_models=%s", grouped)
         try:
             response = await self._llm.create(
                 instructions=rubric,
                 input=[
                     {
                         "role": "user",
-                        "content": [{"type": "input_text", "text": message[:4000]}],
+                        "content": [{"type": "input_text", "text": request.task.prompt}],
                     }
                 ],
                 text={
@@ -294,11 +403,7 @@ class LLMRoutingClient:
         # Clamp hallucinated models to the cheapest available.
         if model not in flat:
             if flat:
-                _logger.info(
-                    "LLMRoutingClient: clamping unknown model %r to %s",
-                    model,
-                    flat[0],
-                )
+                _logger.info("LLMRoutingClient: clamping unknown model %r to %s", model, flat[0])
                 model = flat[0]
             else:
                 return None
@@ -310,21 +415,23 @@ class LLMRoutingClient:
         chosen_harness = verdict.get("harness")
         if (
             not isinstance(chosen_harness, str)
-            or chosen_harness not in available_models
-            or model not in available_models[chosen_harness]
+            or chosen_harness not in grouped
+            or model not in grouped[chosen_harness]
         ):
-            if isinstance(chosen_harness, str) and chosen_harness in available_models:
+            if isinstance(chosen_harness, str) and chosen_harness in grouped:
                 _logger.info(
                     "LLMRoutingClient: harness %r does not contain model %r; re-resolving",
                     chosen_harness,
                     model,
                 )
-            chosen_harness = next(
-                (h for h, models in available_models.items() if model in models),
-                None,
-            )
+            chosen_harness = next((h for h, models in grouped.items() if model in models), None)
 
-        return RoutingResult(model=model, rationale=str(rationale), harness=chosen_harness)
+        out = pb.SelectRouteResponse(rationale=str(rationale))
+        selection = out.route_selection.add()
+        selection.route_option.model = model
+        if chosen_harness:
+            selection.route_option.harness = chosen_harness
+        return out
 
 
 def _bearer_auth(token: str) -> Any:  # type: ignore[explicit-any]  # returns httpx.Auth
@@ -343,7 +450,7 @@ def _bearer_auth(token: str) -> Any:  # type: ignore[explicit-any]  # returns ht
     return _BearerAuth()
 
 
-class ExternalRoutingClient:
+class ExternalRoutingClient(_ProtoRoutingClient):
     """Routing client backed by an external ``routes:select`` service.
 
     Calls an external routing service (the Databricks AI-Gateway router,
@@ -395,39 +502,18 @@ class ExternalRoutingClient:
             return model[len(self._model_prefix) :]
         return model
 
-    async def route(
+    async def _select(
         self,
-        message: str,
-        available_models: dict[str, list[str]],
-    ) -> RoutingResult | None:
+        request: Any,  # type: ignore[explicit-any]  # pb.SelectRouteRequest
+    ) -> Any | None:  # type: ignore[explicit-any]  # pb.SelectRouteResponse | None
         import httpx
         from google.protobuf import json_format
 
         from omnigent.api.routing.v1 import routing_pb2 as pb
 
-        # The router keys on its own model vocabulary, which may differ from
-        # the session's catalog ids (e.g. catalog "databricks-claude-opus-4-8"
-        # vs router "claude-opus-4-8"). Apply the configured ``model_prefix``
-        # transform on the way out and keep a router-id -> local-id map to
-        # recover the exact catalog id from the router's answer. With no
-        # ``model_prefix`` configured this sends catalog ids verbatim.
-        options: list[pb.RouteOption] = []
-        router_to_local: dict[str, str] = {}
-        for harness, models in available_models.items():
-            for model in models:
-                router_id = self._to_router_id(model)
-                router_to_local[router_id] = model
-                options.append(pb.RouteOption(model=router_id, harness=harness))
-        if not options:
-            return None
-        request = pb.SelectRouteRequest(
-            route_options=options,
-            task=pb.Task(prompt=message[:4000]),
-            route_selector=pb.RouteSelector(router_name=self._router_name),
-        )
         # snake_case wire format — the router uses the proto field names.
         body = json_format.MessageToDict(request, preserving_proto_field_name=True)
-        _logger.info("ExternalRoutingClient: available_models=%s", dict(available_models))
+        _logger.info("ExternalRoutingClient: POST %s body=%s", self._url, body)
         try:
             async with httpx.AsyncClient(timeout=self._request_timeout) as http:
                 resp = await http.post(
@@ -451,28 +537,13 @@ class ExternalRoutingClient:
             )
             return None
         try:
-            out = json_format.ParseDict(resp.json(), pb.SelectRouteResponse())
+            return json_format.ParseDict(resp.json(), pb.SelectRouteResponse())
         except (ValueError, json_format.ParseError):
             _logger.warning(
                 "ExternalRoutingClient: could not parse routes:select response: %s",
                 resp.text[:2000],
             )
             return None
-        if not out.route_selection:
-            return None
-        selected = out.route_selection[0].route_option
-        if not selected.model:
-            return None
-        # Recover the exact catalog id the runner expects. The router echoes
-        # the (transformed) id it was given; map it back to the local catalog
-        # form. Fall back to the returned id if the router answered with
-        # something we didn't send.
-        local_model = router_to_local.get(selected.model, selected.model)
-        return RoutingResult(
-            model=local_model,
-            rationale=out.rationale,
-            harness=selected.harness or None,
-        )
 
 
 # ── Public API ──────────────────────────────────────────────────────────────

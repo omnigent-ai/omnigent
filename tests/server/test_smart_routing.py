@@ -49,8 +49,10 @@ class _FakeLLMClient:
 
     def __init__(self, verdict: dict[str, Any]) -> None:
         self._verdict = verdict
+        self.last_kwargs: dict[str, Any] | None = None
 
     async def create(self, **kwargs: Any) -> _FakeResponse:
+        self.last_kwargs = kwargs
         text = json.dumps(self._verdict)
         return _FakeResponse(
             output=[_FakeMessageOutput(content=[_FakeOutputText(text=text)])],
@@ -158,6 +160,42 @@ async def test_llm_routing_client_returns_result() -> None:
     assert result.model == "databricks-claude-opus-4-8"
     assert result.rationale == "hard refactor"
     assert result.harness == "claude-sdk"
+
+
+@pytest.mark.asyncio
+async def test_llm_routing_client_speaks_the_proto() -> None:
+    """The built-in judge answers the same proto as the external router.
+
+    ``_select`` takes a ``SelectRouteRequest`` and returns a
+    ``SelectRouteResponse``, and the judge is prompted with the request's
+    ``task.prompt`` — same contract as :class:`ExternalRoutingClient`.
+    """
+    from omnigent.api.routing.v1 import routing_pb2 as pb
+
+    verdict = {
+        "harness": "claude-sdk",
+        "model": "databricks-claude-opus-4-8",
+        "rationale": "hard refactor",
+    }
+    fake = _FakeLLMClient(verdict)
+    client = LLMRoutingClient(fake)
+    models = infer_models("claude-sdk")
+    assert models is not None
+
+    request = pb.SelectRouteRequest(
+        route_options=[pb.RouteOption(model=m, harness="claude-sdk") for m in models],
+        task=pb.Task(prompt="refactor auth"),
+        route_selector=pb.RouteSelector(router_name="llm"),
+    )
+    response = await client._select(request)
+
+    assert isinstance(response, pb.SelectRouteResponse)
+    assert response.route_selection[0].route_option.model == "databricks-claude-opus-4-8"
+    assert response.route_selection[0].route_option.harness == "claude-sdk"
+    assert response.rationale == "hard refactor"
+    # The judge was prompted with the request's task prompt.
+    assert fake.last_kwargs is not None
+    assert fake.last_kwargs["input"][0]["content"][0]["text"] == "refactor auth"
 
 
 @pytest.mark.asyncio
