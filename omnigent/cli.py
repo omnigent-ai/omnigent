@@ -13283,6 +13283,42 @@ def _workspace_api_server_url(server: str) -> str:
     return server
 
 
+def _canonicalize_azure_databricks_url(server: str) -> str:
+    """Rewrite an Azure Databricks custom-URL workspace to its canonical host.
+
+    Azure workspaces can front a custom (vanity) URL such as
+    ``https://mydomain.azuredatabricks.net``, but that edge 303-redirects an
+    unauthenticated request to ``/login`` instead of answering the probe, so the
+    login/host flow can't detect the Databricks posture and fails. The canonical
+    host ``adb-{workspace_id}.{workspace_id % 20}.azuredatabricks.net`` does
+    answer, and the ``?o=<workspace_id>`` selector already carries the id, so
+    rewrite to it. Only ``*.azuredatabricks.net`` hosts that are not already the
+    ``adb-`` canonical form and carry a numeric ``?o=`` are touched; anything
+    else (AWS/GCP hosts, canonical URLs, a missing selector) is left unchanged.
+
+    :param server: A scheme-bearing server URL, e.g.
+        ``"https://mydomain.azuredatabricks.net/?o=123"``.
+    :returns: The URL with the canonical Azure host, or *server* unchanged.
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
+    parsed = urlsplit(server)
+    hostname = (parsed.hostname or "").lower()
+    if not hostname.endswith(".azuredatabricks.net") or hostname.startswith("adb-"):
+        return server
+    org_id = _org_id_from_url(server)
+    # isdecimal (not isdigit) so the id is exactly what int() accepts below.
+    if org_id is None or not org_id.isdecimal():
+        return server
+    try:
+        port = parsed.port
+    except ValueError:
+        return server  # malformed port: leave the URL for the probe to reject
+    canonical_host = f"adb-{org_id}.{int(org_id) % 20}.azuredatabricks.net"
+    netloc = f"{canonical_host}:{port}" if port else canonical_host
+    return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+
+
 def _resolve_server_url(server: str) -> str:
     """
     Normalize a user-supplied ``--server`` value to the Omnigent API base.
@@ -13290,16 +13326,19 @@ def _resolve_server_url(server: str) -> str:
     Every ``--server`` entry point (and ``login``) needs the same
     normalization, so they all route through here: strip a trailing slash,
     default a schemeless URL to ``https`` (``http`` for loopback hosts),
-    then expand a bare Databricks workspace URL — or the ``/omnigent``
-    web-UI URL the internal user guide hands out — to the
-    ``/api/2.0/omnigent`` mount.
+    rewrite an Azure Databricks custom (vanity) URL to its canonical
+    ``adb-`` host so the probe reaches the workspace, then expand a bare
+    Databricks workspace URL — or the ``/omnigent`` web-UI URL the internal
+    user guide hands out — to the ``/api/2.0/omnigent`` mount.
 
     :param server: A non-empty ``--server`` value, e.g.
         ``"example.cloud.databricks.com/omnigent"``.
     :returns: The normalized API base URL without a trailing slash, e.g.
         ``"https://example.cloud.databricks.com/api/2.0/omnigent"``.
     """
-    return _workspace_api_server_url(_with_default_scheme(server.rstrip("/")))
+    return _workspace_api_server_url(
+        _canonicalize_azure_databricks_url(_with_default_scheme(server.rstrip("/")))
+    )
 
 
 def _databricks_workspace_login_target(server: str, probe: httpx.Response) -> str | None:

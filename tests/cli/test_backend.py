@@ -1724,6 +1724,54 @@ def test_resolve_attach_server_defaults_scheme_https(monkeypatch: pytest.MonkeyP
     assert result == _expand_marker("https://dbc-x.cloud.databricks.com/omnigent")
 
 
+def test_canonicalize_azure_databricks_custom_url_rewrites_to_canonical() -> None:
+    """A custom Azure vanity URL with ?o= is rewritten to the canonical adb- host."""
+    result = cli._canonicalize_azure_databricks_url("https://mydomain.azuredatabricks.net/?o=123")
+
+    # shard = 123 % 20 = 3
+    assert result == "https://adb-123.3.azuredatabricks.net/?o=123"
+
+
+def test_canonicalize_azure_databricks_leaves_other_urls_unchanged() -> None:
+    """Canonical, non-Azure, and selector-less URLs are returned unchanged."""
+    canonical = "https://adb-123.3.azuredatabricks.net/?o=123"
+    assert cli._canonicalize_azure_databricks_url(canonical) == canonical
+    # AWS host (not azuredatabricks.net)
+    aws = "https://acme.cloud.databricks.com/?o=123"
+    assert cli._canonicalize_azure_databricks_url(aws) == aws
+    # Azure vanity but no ?o= to derive the workspace id
+    no_selector = "https://mydomain.azuredatabricks.net"
+    assert cli._canonicalize_azure_databricks_url(no_selector) == no_selector
+    # Non-numeric selector is ignored
+    bad = "https://mydomain.azuredatabricks.net/?o=notanid"
+    assert cli._canonicalize_azure_databricks_url(bad) == bad
+    # A non-ASCII "digit" that int() would reject is left unchanged, not crashed
+    superscript = "https://mydomain.azuredatabricks.net/?o=²"
+    assert cli._canonicalize_azure_databricks_url(superscript) == superscript
+    # A malformed port must not crash the shared resolver, just pass through
+    bad_port = "https://mydomain.azuredatabricks.net:notaport/?o=123"
+    assert cli._canonicalize_azure_databricks_url(bad_port) == bad_port
+
+
+def test_resolve_server_url_canonicalizes_custom_azure_before_expansion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_resolve_server_url hands the canonical adb- host to the mount expansion.
+
+    Regression for the custom-URL login/host failure: the vanity host reached the
+    probe unchanged, 303-redirected to /login, and login failed while the
+    canonical adb- URL worked.
+    """
+    seen: list[str] = []
+    monkeypatch.setattr(cli, "_workspace_api_server_url", _recording_expander(seen))
+
+    result = cli._resolve_server_url("https://mydomain.azuredatabricks.net/?o=456")
+
+    # shard = 456 % 20 = 16
+    assert seen == ["https://adb-456.16.azuredatabricks.net/?o=456"]
+    assert result == _expand_marker("https://adb-456.16.azuredatabricks.net/?o=456")
+
+
 def test_resolve_host_server_expands_explicit_workspace_url(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
