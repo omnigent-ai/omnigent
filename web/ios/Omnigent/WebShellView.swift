@@ -11,6 +11,11 @@ struct WebShellView: View {
   @EnvironmentObject private var settings: SettingsStore
   @EnvironmentObject private var router: AppRouter
   @StateObject private var model = WebViewModel()
+  /// A deep-link path that arrived while the page was still loading — emitted
+  /// to the SPA once `isLoading` flips false, so a cold-start / mid-load deep
+  /// link to the current server isn't lost (its `onOpenPath` subscriber isn't
+  /// mounted until the SPA finishes booting).
+  @State private var deferredOpenPath: String?
 
   var body: some View {
     GeometryReader { geometry in
@@ -67,6 +72,24 @@ struct WebShellView: View {
     .onChange(of: router.pendingNotificationPath) { _, _ in
       if let path = router.consumeNotificationPath() {
         model.emitNotificationActivation(path)
+      }
+    }
+    .onChange(of: router.pendingOpenPath) { _, _ in
+      guard let path = router.consumeOpenPath() else { return }
+      // If the SPA is still booting (a cold-start deep link to the current
+      // server, or one that arrived mid-navigation), defer the path until the
+      // page finishes loading — emitting now would fire into a page whose
+      // `onOpenPath` subscriber isn't mounted yet and be lost.
+      if model.isLoading {
+        deferredOpenPath = path
+      } else {
+        model.emitOpenPath(path)
+      }
+    }
+    .onChange(of: model.isLoading) { _, loading in
+      if !loading, let path = deferredOpenPath {
+        deferredOpenPath = nil
+        model.emitOpenPath(path)
       }
     }
     .onChange(of: model.isLoading) { _, loading in

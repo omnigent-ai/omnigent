@@ -23,7 +23,9 @@ LOG_TTY_FD_ENV_VAR = "OMNIGENT_LOG_TTY_FD"
 
 DEFAULT_LOG_SOURCE_WIDTH = 32
 DEFAULT_LOG_FUNC_WIDTH = 18
-DEFAULT_LOG_PREFIX_FORMAT = "%(levelname)s %(asctime)s %(source_name)s %(func_name)s | "
+DEFAULT_LOG_PREFIX_FORMAT = (
+    "%(levelname)s %(asctime)s.%(msecs)03d %(source_name)s %(func_name)s | "
+)
 DEFAULT_LOG_FORMAT = f"{DEFAULT_LOG_PREFIX_FORMAT}%(message)s"
 DEFAULT_LOG_DATEFMT = "%m-%d %H:%M:%S"
 _LEVEL_WIDTH = 5

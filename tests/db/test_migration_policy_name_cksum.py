@@ -85,7 +85,8 @@ def test_backfill_computes_sha256_of_name(tmp_path: Path) -> None:
                 # scope=1 default, type=1 python (int codes at this revision).
                 "INSERT INTO policies"
                 " (workspace_id, id, name, session_id, scope, created_at, type, handler, enabled)"
-                " VALUES (0, 'pol_bf1', 'legacy_name', NULL, 1, 1, 1, 'mod.f', 1)"
+                " VALUES (0, '2f9bdde44384914ae0d8850527cdfe7d', 'legacy_name',"
+                " NULL, 1, 1, 1, 'mod.f', 1)"
             )
         )
     with engine.begin() as conn:
@@ -94,7 +95,9 @@ def test_backfill_computes_sha256_of_name(tmp_path: Path) -> None:
 
     with engine.begin() as conn:
         cksum = conn.execute(
-            sa.text("SELECT name_cksum FROM policies WHERE id = 'pol_bf1'")
+            sa.text(
+                "SELECT name_cksum FROM policies WHERE id = '2f9bdde44384914ae0d8850527cdfe7d'"
+            )
         ).scalar_one()
     assert bytes(cksum) == hashlib.sha256(b"legacy_name").digest()
 

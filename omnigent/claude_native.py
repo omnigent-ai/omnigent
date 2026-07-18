@@ -3214,6 +3214,11 @@ async def _prepare_claude_terminal(
             startup_progress=startup_progress,
             progress_message="Starting Claude terminal...",
         )
+        from omnigent.tools.builtins.session_rename import (
+            session_rename_allowed_tools,
+            session_rename_instruction,
+        )
+
         terminal_id = await _launch_claude_terminal(
             client,
             session_id,
@@ -3221,6 +3226,8 @@ async def _prepare_claude_terminal(
             command=command,
             bridge_dir=bridge_dir,
             claude_config=claude_config,
+            append_system_prompt=session_rename_instruction(initial_session=not cold_resumed),
+            allowed_tools=session_rename_allowed_tools(initial_session=not cold_resumed),
         )
         _mark_startup_step(
             startup_profiler,
@@ -3671,13 +3678,21 @@ def _claude_transcript_record_from_session_item(
         if not isinstance(output, str):
             output = "" if output is None else json.dumps(output, separators=(",", ":"))
         record_type = "user"
+        # Image (and other structured) tool results are persisted as a
+        # stringified content-block array. Rehydrate them into real blocks
+        # so ``claude --resume`` sends screenshots as images — not as ~250K
+        # tokens of base64 text — and the model actually sees them again.
+        content_blocks = _claude_tool_result_content_blocks(output)
+        content: str | list[dict[str, Any]] = (
+            content_blocks if content_blocks is not None else output
+        )
         message = {
             "role": "user",
             "content": [
                 {
                     "type": "tool_result",
                     "tool_use_id": call_id,
-                    "content": output,
+                    "content": content,
                 }
             ],
         }
@@ -3831,6 +3846,42 @@ def _json_safe_tool_use_result(output: str) -> str:
     return output
 
 
+def _claude_tool_result_content_blocks(output: str) -> list[dict[str, Any]] | None:
+    """
+    Rehydrate a stringified content-block array into real blocks.
+
+    Tool results that return image content are persisted as a JSON *string*
+    like ``'[{"type":"image","source":{...}}]'``. Passing that string
+    straight into a ``tool_result`` content block makes ``claude --resume``
+    send the base64 to the API as plain text — a single screenshot balloons
+    to ~250K text tokens instead of the ~1.5K an image block costs, which is
+    what pushes a resumed conversation over the context limit.
+
+    Only ``text`` and ``image`` blocks are rehydrated: those are the block
+    types the API accepts inside a ``tool_result``. Anything else (plain
+    text, or a JSON array of some other shape) stays a raw string so the
+    resume request keeps sending exactly what it did before.
+
+    :param output: The persisted tool-result string, e.g.
+        ``'[{"type":"image","source":{"type":"base64","data":"..."}}]'``
+        or plain text like ``"file written"``.
+    :returns: A list of content blocks when *output* parses to a non-empty
+        list of ``text``/``image`` block dicts; ``None`` otherwise, so the
+        caller keeps the raw string as the block content.
+    """
+    try:
+        parsed = json.loads(output)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(parsed, list) or not parsed:
+        return None
+    if not all(
+        isinstance(block, dict) and block.get("type") in ("text", "image") for block in parsed
+    ):
+        return None
+    return parsed
+
+
 def _preflight_local_tools(command: str) -> None:
     """
     Verify local executables required by the native Claude wrapper.
@@ -3922,6 +3973,8 @@ async def _launch_claude_terminal(
     command: str,
     bridge_dir: Path,
     claude_config: ClaudeNativeUcodeConfig | None = None,
+    append_system_prompt: str | None = None,
+    allowed_tools: tuple[str, ...] = (),
 ) -> str:
     """
     Launch the server-backed Claude terminal resource.
@@ -3937,6 +3990,10 @@ async def _launch_claude_terminal(
     :param bridge_dir: Bridge directory shared with Claude's MCP
         MCP server and the web-chat harness.
     :param claude_config: Optional ucode-derived Claude Code config.
+    :param append_system_prompt: Optional framework-owned instructions for
+        this fresh native session.
+    :param allowed_tools: Optional narrowly scoped Claude tools preapproved
+        for this native session.
     :returns: Terminal resource id.
     :raises click.ClickException: If terminal launch fails.
     """
@@ -3947,6 +4004,8 @@ async def _launch_claude_terminal(
         ap_server_url=str(client.base_url),
         ap_auth_headers=dict(client.headers),
         claude_config=claude_config,
+        append_system_prompt=append_system_prompt,
+        allowed_tools=allowed_tools,
     )
     resp = await client.post(
         f"/v1/sessions/{url_component(session_id)}/resources/terminals",
@@ -4077,6 +4136,8 @@ def _claude_terminal_request(
     ap_server_url: str | None = None,
     ap_auth_headers: dict[str, str] | None = None,
     claude_config: ClaudeNativeUcodeConfig | None = None,
+    append_system_prompt: str | None = None,
+    allowed_tools: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """
     Build the terminal resource creation body for Claude Code.
@@ -4092,6 +4153,10 @@ def _claude_terminal_request(
     :param ap_auth_headers: Auth headers for the
         ``PermissionRequest`` command hook.
     :param claude_config: Optional ucode-derived Claude Code config.
+    :param append_system_prompt: Optional framework-owned instructions to
+        append to Claude Code's system prompt.
+    :param allowed_tools: Optional narrowly scoped Claude tools preapproved
+        for this native session.
     :returns: JSON body for ``POST /resources/terminals``.
     """
     claude_args = _merge_default_model_arg(
@@ -4104,6 +4169,8 @@ def _claude_terminal_request(
         ap_server_url=ap_server_url,
         ap_auth_headers=ap_auth_headers,
         api_key_helper=claude_config.api_key_helper if claude_config is not None else None,
+        append_system_prompt=append_system_prompt,
+        allowed_tools=allowed_tools,
     )
     # Let a registered launcher plugin (e.g. Databricks' isaac) rewrite the
     # command/args to wrap the same fully-augmented Claude launch. Identity by

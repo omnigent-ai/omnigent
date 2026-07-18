@@ -181,6 +181,14 @@ class OpenCodeNativeForwarder:
         # the cumulative reasoning text on each ``part.updated``; we forward only
         # the new suffix so the web reasoning block grows once, not duplicated.
         self._reasoning_posted: dict[str, int] = {}
+        # The in-flight turn's assistant messageID (its per-turn ``response_id``),
+        # captured from ``message.updated`` and stamped on the running/idle status
+        # edges so the web chat renders this turn's tool calls live — the mirrored
+        # ``function_call`` items carry the SAME id. ``_running_response_id``
+        # records the id the ``running`` edge went out with, gating it to once per
+        # turn; both reset in :meth:`_end_turn`.
+        self._active_message_id: str | None = None
+        self._running_response_id: str | None = None
 
     async def seed_dedupe_from_history(self) -> None:
         """
@@ -342,7 +350,17 @@ class OpenCodeNativeForwarder:
             return None
 
     async def _post_status(self, status: str, *, extra: Mapping[str, Any] | None = None) -> None:
-        """Publish a coarse session status edge."""
+        """Publish a coarse session status edge.
+
+        :param extra: Extra fields merged into the edge payload. On the
+            ``running``/``idle`` edges this carries ``{"response_id": <assistant
+            messageID>}``: when it matches the ``response_id`` on this turn's
+            mirrored ``function_call`` items, the web chat renders the in-flight
+            tool calls live (spinner + ticking elapsed timer) instead of static
+            completed cards, and the server tracks it (``active_response_id``) so
+            a mid-turn reconnect stays live. A ``failed`` edge instead carries
+            ``output`` / ``reauth_required``.
+        """
         data: dict[str, Any] = {"status": status}
         if extra:
             data.update(extra)
@@ -420,23 +438,54 @@ class OpenCodeNativeForwarder:
         )
 
     async def _begin_turn_if_needed(self) -> None:
-        """Post a single ``running`` status at the start of a turn."""
-        if not self.state.turn_active:
-            self.state.turn_active = True
-            await self._post_status(_STATUS_RUNNING)
+        """Emit the turn's id-bearing ``running`` edge once, when the id is known.
+
+        The ``running`` edge carries the assistant ``response_id`` (the opencode
+        messageID held in ``_active_message_id``) so the web chat can render this
+        turn's in-flight tool calls live — the mirrored ``function_call`` items
+        carry the SAME id. It fires once per turn and is deferred until the id is
+        known: a bare ``session.status`` busy can open the turn before the
+        assistant ``message.updated`` supplies the id, and emitting an id-less
+        (session-id-fallback) edge then would never match the tool-call items.
+        """
+        self.state.turn_active = True
+        if self._running_response_id is None and self._active_message_id is not None:
+            self._running_response_id = self._active_message_id
+            await self._post_status(
+                _STATUS_RUNNING, extra={"response_id": self._running_response_id}
+            )
 
     async def _end_turn(
         self, *, status: str = _STATUS_IDLE, extra: Mapping[str, Any] | None = None
     ) -> None:
-        """Post the terminal status (idle by default) and clear active state."""
+        """Post the terminal status (idle by default), stamped with the turn's id.
+
+        The terminal edge carries the same ``response_id`` the ``running`` edge
+        used so the server retires this turn's live tool-call cards for the right
+        response; a caller may pass extra fields (e.g. ``output`` /
+        ``reauth_required`` on a ``failed`` edge), which are merged on top.
+        """
         self.state.turn_active = False
         # Reasoning deltas are per-turn; drop the per-part offsets so the map
         # can't grow across a long-lived session (the next turn's reasoning
         # parts carry fresh ids anyway).
         self._reasoning_posted.clear()
+        # Stamp the terminal edge with the id the ``running`` edge actually went
+        # out with (``_running_response_id``), then merge any caller-supplied
+        # fields on top. If a turn produced more than one assistant messageID,
+        # ``_active_message_id`` has advanced past the id that went live; using
+        # the running id keeps both edges consistent so the web retires the cards
+        # that were rendered live. Fall back to the latest assistant id (then the
+        # session id) when no running edge fired.
+        terminal_id = self._running_response_id or self._active_message_id
+        merged_extra: dict[str, Any] = {"response_id": self._response_id(terminal_id)}
+        if extra:
+            merged_extra.update(extra)
         if self._bridge_dir is not None:
             update_active_message_id(self._bridge_dir, None, status="idle")
-        await self._post_status(status, extra=extra)
+        await self._post_status(status, extra=merged_extra)
+        self._active_message_id = None
+        self._running_response_id = None
 
     # --- per-event handlers ----------------------------------------------
 
@@ -455,6 +504,10 @@ class OpenCodeNativeForwarder:
             return
         self._msg_role[message_id] = role
         if role == "assistant":
+            # This turn's per-turn ``response_id`` — the running/idle edges carry
+            # it so the web chat can correlate them with the tool-call items that
+            # already stamp the same id (renders in-flight tool calls live).
+            self._active_message_id = message_id
             if self._bridge_dir is not None:
                 update_active_message_id(self._bridge_dir, message_id, status="busy")
             await self._begin_turn_if_needed()

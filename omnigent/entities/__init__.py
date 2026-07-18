@@ -23,10 +23,12 @@ from omnigent.entities.conversation import (
     parse_item_data,
     synthesize_conversation_title,
 )
+from omnigent.entities.device_grant import DeviceGrant
 from omnigent.entities.file import StoredFile
 from omnigent.entities.pagination import PagedList
 from omnigent.entities.permission import ResolvedAccess, SessionPermission
 from omnigent.entities.policy import Policy
+from omnigent.entities.scheduled_task import ScheduledTask, ScheduledTaskRun
 from omnigent.entities.session_resources import (
     DEFAULT_ENVIRONMENT_ID,
     SessionResourceView,
@@ -46,6 +48,7 @@ __all__ = [
     "CompactionData",
     "Conversation",
     "ConversationItem",
+    "DeviceGrant",
     "ErrorData",
     "FunctionCallData",
     "FunctionCallOutputData",
@@ -60,6 +63,8 @@ __all__ = [
     "ResolvedAccess",
     "ResourceEventData",
     "RoutingDecisionData",
+    "ScheduledTask",
+    "ScheduledTaskRun",
     "SessionPermission",
     "SessionResourceView",
     "SlashCommandData",

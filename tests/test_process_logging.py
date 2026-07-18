@@ -87,7 +87,7 @@ def test_terminal_log_formatter_colors_level_name() -> None:
     output = formatter.format(record)
 
     assert re.match(
-        r"\x1b\[32mINFO \x1b\[0m \d{2}-\d{2} \d{2}:\d{2}:\d{2} "
+        r"\x1b\[32mINFO \x1b\[0m \d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} "
         r"\x1b\[34mexample\s+\x1b\[0m \x1b\[35mserve\s+\x1b\[0m \| ready",
         output,
     )
@@ -113,7 +113,7 @@ def test_terminal_log_formatter_abbreviates_warning_and_source() -> None:
     output = formatter.format(record)
 
     assert re.match(
-        r"WARN  \d{2}-\d{2} \d{2}:\d{2}:\d{2} "
+        r"WARN  \d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} "
         r"codex_native_app_server\s+native_codex\s+\| native-codex: ready",
         output,
     )

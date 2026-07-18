@@ -155,6 +155,11 @@
   --omnigent-native-bottom-bar: 0px; /* set by native bridge (px) */
   --omnigent-top-bar-visible: 0; /* web-owned 0|1 */
   --omnigent-bottom-bar-visible: 0; /* web-owned 0|1 */
+  /* Android floating server-switcher pill footprint (margin + height).
+     Used by the Android scroll-fade gradient so it starts at the pill
+     bottom. Set once; if the pill size changes, update both values. */
+  --omnigent-android-switcher-margin: 8px;
+  --omnigent-android-switcher-height: 25px;
   --omnigent-inset-top: var(--omnigent-safe-top);
   --omnigent-inset-bottom: calc(
     var(--omnigent-safe-bottom) + var(--omnigent-native-bottom-bar) *
@@ -581,6 +586,26 @@
       to bottom,
       transparent calc(48px + var(--omnigent-inset-top)),
       black calc(80px + var(--omnigent-inset-top))
+    );
+  }
+
+  /* Android: the floating server-switcher pill sits at the top. Start the
+     fade at the pill bottom (safe-top + margin + height) so content scrolls
+     smoothly into view below it. */
+  [data-android-native] .chat-scroll-fade {
+    --fade-start: calc(
+      var(--omnigent-safe-top) + var(--omnigent-android-switcher-margin) +
+        var(--omnigent-android-switcher-height)
+    );
+    mask-image: linear-gradient(
+      to bottom,
+      transparent var(--fade-start),
+      black calc(var(--fade-start) + 32px)
+    );
+    -webkit-mask-image: linear-gradient(
+      to bottom,
+      transparent var(--fade-start),
+      black calc(var(--fade-start) + 32px)
     );
   }
 
@@ -1122,6 +1147,25 @@
   border-radius: 2px;
 }
 
+/* Find-in-file matches in the markdown editor — all matches dim, current match strong */
+.md-search-match {
+  background-color: color-mix(in oklch, var(--warning) 30%, transparent);
+  border-radius: 2px;
+}
+.md-search-match-current {
+  background-color: color-mix(in oklch, var(--warning) 70%, transparent);
+}
+
+/* Find-in-file matches in the rendered markdown / notebook preview. The preview
+   is React-owned DOM, so matches are painted with the CSS Custom Highlight API
+   (Range-based, no node mutation) rather than wrapper spans. */
+::highlight(md-preview-search) {
+  background-color: color-mix(in oklch, var(--warning) 30%, transparent);
+}
+::highlight(md-preview-search-current) {
+  background-color: color-mix(in oklch, var(--warning) 70%, transparent);
+}
+
 /* TipTap editor prose styling */
 .tiptap-md-content .ProseMirror {
   outline: none;
@@ -1486,6 +1530,98 @@
  * gradient is overridden per palette + mode.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
+/* Custom themes keep one user configuration and map its derived light/dark
+ * values onto the same semantic tokens as built-in palettes. */
+:root:not(.dark)[data-theme="custom"] {
+  --background: var(--custom-light-background);
+  --foreground: var(--custom-light-foreground);
+  --card: var(--custom-light-card);
+  --card-solid: var(--custom-light-card-solid);
+  --card-foreground: var(--custom-light-foreground);
+  --tray: var(--custom-light-card);
+  --popover: var(--custom-light-card-solid);
+  --popover-foreground: var(--custom-light-foreground);
+  --primary: var(--custom-light-primary);
+  --primary-foreground: var(--custom-light-primary-foreground);
+  --secondary: var(--custom-light-secondary);
+  --secondary-foreground: var(--custom-light-foreground);
+  --muted: var(--custom-light-muted);
+  --muted-foreground: var(--custom-light-muted-foreground);
+  --code-bg: var(--custom-light-code-bg);
+  --accent: var(--custom-light-accent);
+  --accent-foreground: var(--custom-light-foreground);
+  --border: var(--custom-light-border);
+  --border-strong: var(--custom-light-border-strong);
+  --button-border: var(--custom-light-border);
+  --input: var(--custom-light-border);
+  --ring: var(--custom-light-primary);
+  --brand-accent: var(--custom-light-primary);
+  --sidebar: var(--custom-light-sidebar);
+  --sidebar-foreground: var(--custom-light-foreground);
+  --sidebar-primary: var(--custom-light-primary);
+  --sidebar-primary-foreground: var(--custom-light-primary-foreground);
+  --sidebar-accent: var(--custom-light-accent);
+  --sidebar-accent-foreground: var(--custom-light-foreground);
+  --sidebar-border: var(--custom-light-border);
+  --sidebar-ring: var(--custom-light-primary);
+}
+.dark[data-theme="custom"] {
+  --background: var(--custom-dark-background);
+  --foreground: var(--custom-dark-foreground);
+  --card: var(--custom-dark-card);
+  --card-solid: var(--custom-dark-card-solid);
+  --card-foreground: var(--custom-dark-foreground);
+  --tray: var(--custom-dark-card);
+  --popover: var(--custom-dark-card-solid);
+  --popover-foreground: var(--custom-dark-foreground);
+  --primary: var(--custom-dark-primary);
+  --primary-foreground: var(--custom-dark-primary-foreground);
+  --secondary: var(--custom-dark-secondary);
+  --secondary-foreground: var(--custom-dark-foreground);
+  --muted: var(--custom-dark-muted);
+  --muted-foreground: var(--custom-dark-muted-foreground);
+  --code-bg: var(--custom-dark-code-bg);
+  --accent: var(--custom-dark-accent);
+  --accent-foreground: var(--custom-dark-foreground);
+  --border: var(--custom-dark-border);
+  --border-strong: var(--custom-dark-border-strong);
+  --button-border: var(--custom-dark-border);
+  --input: var(--custom-dark-border);
+  --ring: var(--custom-dark-primary);
+  --brand-accent: var(--custom-dark-primary);
+  --sidebar: var(--custom-dark-sidebar);
+  --sidebar-foreground: var(--custom-dark-foreground);
+  --sidebar-primary: var(--custom-dark-primary);
+  --sidebar-primary-foreground: var(--custom-dark-primary-foreground);
+  --sidebar-accent: var(--custom-dark-accent);
+  --sidebar-accent-foreground: var(--custom-dark-foreground);
+  --sidebar-border: var(--custom-dark-border);
+  --sidebar-ring: var(--custom-dark-primary);
+}
+:root:not(.dark)[data-theme="custom"] .app-shell {
+  background: var(--custom-light-shell-background);
+}
+.dark[data-theme="custom"] .app-shell {
+  background: var(--custom-dark-shell-background);
+}
+@media (min-width: 48rem) {
+  :root:not(.dark)[data-theme="custom"][data-custom-translucent-sidebar]
+    :is(.conversations-sidebar, aside[aria-label="Workspace"]) {
+    background-color: var(--custom-light-sidebar);
+    backdrop-filter: blur(20px) saturate(1.12);
+  }
+  .dark[data-theme="custom"][data-custom-translucent-sidebar]
+    :is(.conversations-sidebar, aside[aria-label="Workspace"]) {
+    background-color: var(--custom-dark-sidebar);
+    backdrop-filter: blur(20px) saturate(1.12);
+  }
+  :root[data-theme="custom"][data-custom-translucent-sidebar]
+    aside[aria-label="Workspace"]
+    :is([data-workspace-panel-content] > *, [data-workspace-panel-surface]) {
+    background-color: transparent;
+  }
+}
+
 /* ── GitHub — clean neutrals, signal blue, green primary ──────────────────── */
 :root:not(.dark)[data-theme="github"] {
   --background: #f6f8fa;
@@ -1789,4 +1925,81 @@
     radial-gradient(ellipse at 20% 40%, rgba(189, 147, 249, 0.14) 0%, transparent 50%),
     radial-gradient(ellipse at 80% 20%, rgba(255, 121, 198, 0.1) 0%, transparent 45%),
     linear-gradient(160deg, #2a2c3a 0%, #282a36 55%, #21222c 100%);
+}
+
+/* ── Nord — arctic frost blues, polar-night neutrals ──────────────────────── */
+:root:not(.dark)[data-theme="nord"] {
+  --background: #eceff4;
+  --foreground: #2e3440;
+  --card: #e5e9f0;
+  --card-solid: #e5e9f0;
+  --card-foreground: #2e3440;
+  --tray: #e5e9f0;
+  --popover: #e5e9f0;
+  --popover-foreground: #2e3440;
+  --primary: #5e81ac;
+  --primary-foreground: #eceff4;
+  --secondary: #d8dee9;
+  --secondary-foreground: #2e3440;
+  --muted: #d8dee9;
+  --muted-foreground: #4c566a;
+  --code-bg: #d8dee9;
+  --accent: #e5e9f0;
+  --accent-foreground: #5e81ac;
+  --border: #d8dee9;
+  --border-strong: #81a1c1;
+  --button-border: #d8dee9;
+  --input: #d8dee9;
+  --ring: #5e81ac;
+  --brand-accent: #5e81ac;
+  --sidebar: #e5e9f0;
+  --sidebar-foreground: #2e3440;
+  --sidebar-primary: #5e81ac;
+  --sidebar-primary-foreground: #eceff4;
+  --sidebar-accent: #d8dee9;
+  --sidebar-accent-foreground: #5e81ac;
+  --sidebar-border: #d8dee9;
+  --sidebar-ring: #5e81ac;
+}
+.dark[data-theme="nord"] {
+  --background: #2e3440;
+  --foreground: #eceff4;
+  --card: rgba(59, 66, 82, 0.6);
+  --card-solid: #3b4252;
+  --card-foreground: #eceff4;
+  --tray: rgba(59, 66, 82, 0.6);
+  --popover: rgba(46, 52, 64, 0.92);
+  --popover-foreground: #eceff4;
+  --primary: #88c0d0;
+  --primary-foreground: #2e3440;
+  --secondary: #3b4252;
+  --secondary-foreground: #eceff4;
+  --muted: #434c5e;
+  --muted-foreground: #d8dee9;
+  --code-bg: #3b4252;
+  --accent: #434c5e;
+  --accent-foreground: #88c0d0;
+  --border: #4c566a;
+  --border-strong: #81a1c1;
+  --button-border: #4c566a;
+  --input: #4c566a;
+  --ring: #88c0d0;
+  --brand-accent: #88c0d0;
+  --sidebar: rgba(46, 52, 64, 0.8);
+  --sidebar-foreground: #eceff4;
+  --sidebar-primary: #88c0d0;
+  --sidebar-primary-foreground: #2e3440;
+  --sidebar-accent: #434c5e;
+  --sidebar-accent-foreground: #88c0d0;
+  --sidebar-border: #4c566a;
+  --sidebar-ring: #88c0d0;
+}
+:root:not(.dark)[data-theme="nord"] .app-shell {
+  background: linear-gradient(160deg, #eceff4 0%, #e5e9f0 55%, #d8dee9 100%);
+}
+.dark[data-theme="nord"] .app-shell {
+  background:
+    radial-gradient(ellipse at 20% 30%, rgba(136, 192, 208, 0.12) 0%, transparent 55%),
+    radial-gradient(ellipse at 80% 20%, rgba(94, 129, 172, 0.08) 0%, transparent 45%),
+    linear-gradient(160deg, #434c5e 0%, #2e3440 60%, #2e3440 100%);
 }

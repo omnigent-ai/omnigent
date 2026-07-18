@@ -24,6 +24,7 @@ import type {
   ErrorBlock,
   NativeToolBlock,
   TextDone,
+  ToolGroup,
   UserMessageBlock,
 } from "@/lib/blocks";
 import type { ConversationItem } from "@/lib/conversationItems";
@@ -2026,6 +2027,7 @@ describe("chatStore — send (first-send ordering)", () => {
       conversationId: "conv_existing",
       abortController: new AbortController(),
       status: "idle",
+      sessionStatus: "running",
       blocks: [],
       pendingUserMessages: [],
     });
@@ -2047,6 +2049,7 @@ describe("chatStore — send (first-send ordering)", () => {
     // Optimistic bubble rolled back, turn settled to idle.
     expect(state.pendingUserMessages).toEqual([]);
     expect(state.status).toBe("idle");
+    expect(state.sessionStatus).toBe("idle");
     // A standalone error block is appended carrying the friendly, retryable
     // copy — NOT the server's terse "No runner bound for session" — and no
     // raw code in the banner (code "" → clean "Error" title).
@@ -5754,6 +5757,48 @@ describe("chatStore — pumpStreamEvents frame batching", () => {
     controller.abort();
   });
 
+  it("appends live command output to the running tool card", async () => {
+    useChatStore.setState({ conversationId: "conv_tool_delta", blocks: [] });
+    const sink = pushableStream();
+    const controller = new AbortController();
+    void pumpStreamEvents("conv_tool_delta", sink.stream, controller, setState, getState);
+
+    sink.push(sse("response.created", { id: "resp_tool", status: "in_progress", output: [] }));
+    sink.push(
+      sse("response.output_item.done", {
+        item: {
+          id: "item_call",
+          type: "function_call",
+          response_id: "resp_tool",
+          call_id: "call_123",
+          name: "shell",
+          arguments: '{"command":"pytest"}',
+          status: "in_progress",
+        },
+      }),
+    );
+    sink.push(
+      sse("response.function_call_output.delta", {
+        call_id: "call_123",
+        delta: "collecting ",
+      }),
+    );
+    sink.push(
+      sse("response.function_call_output.delta", {
+        call_id: "call_123",
+        delta: "tests...",
+      }),
+    );
+    await tick();
+
+    const group = useChatStore
+      .getState()
+      .blocks.find((b): b is ToolGroup => b.type === "tool_group");
+    expect(group?.executions[0]?.output).toBe("collecting tests...");
+
+    controller.abort();
+  });
+
   it("keeps response_start/response_end lifecycle intact through batching", async () => {
     useChatStore.setState({
       conversationId: "conv_life",
@@ -5811,6 +5856,71 @@ describe("chatStore — pumpStreamEvents frame batching", () => {
     // the response_end branch ran after the buffer was flushed.
     expect(useChatStore.getState().activeResponse?.state).toBe("completed");
     expect(useChatStore.getState().status).toBe("idle");
+
+    controller.abort();
+  });
+
+  it("a stale wrapper response_end does NOT downgrade a newer turn's activeResponse", async () => {
+    // Hermes-native first-turn spinner bug: the runner opens an empty wrapper
+    // response that completes AFTER the forwarder's per-turn id (hermes_turn_1)
+    // has already taken over activeResponse. The wrapper's response_end must be
+    // ignored for lifecycle — otherwise it finalizes the LIVE turn to
+    // "completed", stopping its tool cards streaming (the "no spinner" bug).
+    useChatStore.setState({
+      conversationId: "conv_stale",
+      blocks: [],
+      activeResponse: null,
+      status: "idle",
+      sessionStatus: "idle",
+    });
+    const sink = pushableStream();
+    const controller = new AbortController();
+    const manual = manualScheduler();
+    void pumpStreamEvents(
+      "conv_stale",
+      sink.stream,
+      controller,
+      setState,
+      getState,
+      manual.scheduler,
+    );
+
+    // 1) The empty wrapper response opens → activeResponse adopts its id.
+    sink.push(sse("response.created", { id: "resp_wrap", status: "in_progress", output: [] }));
+    await tick();
+    expect(useChatStore.getState().activeResponse).toEqual({
+      responseId: "resp_wrap",
+      state: "streaming",
+      error: null,
+    });
+
+    // 2) The forwarder's per-turn running edge takes over activeResponse.
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_stale",
+      status: "running",
+      responseId: "hermes_turn_1",
+    });
+    expect(useChatStore.getState().activeResponse).toEqual({
+      responseId: "hermes_turn_1",
+      state: "streaming",
+      error: null,
+    });
+
+    // 3) The stale wrapper completes (empty). Its response_end targets
+    //    resp_wrap, which is no longer the active response, so it must NOT
+    //    touch activeResponse.
+    sink.push(sse("response.completed", { id: "resp_wrap", status: "completed", output: [] }));
+    sink.close();
+    await tick();
+    await tick();
+
+    // The live turn is still streaming — its cards keep their spinner.
+    expect(useChatStore.getState().activeResponse).toEqual({
+      responseId: "hermes_turn_1",
+      state: "streaming",
+      error: null,
+    });
 
     controller.abort();
   });
@@ -6385,11 +6495,13 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     expect(useChatStore.getState().abortController).toBeNull();
   });
 
-  it("gives up and marks the session failed on a permanent 404", async () => {
+  it("gives up after exhausting the transient-404 retry cap", async () => {
     seedSession("conv_404", []);
+    let opens = 0;
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
       if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
+        opens += 1;
         return mockResponse({}, { ok: false, status: 404 });
       }
       return defaultFetchHandler(input, init);
@@ -6402,11 +6514,53 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     });
 
     const loop = startStreamPump("conv_404", controller, setState, getState);
-    await vi.advanceTimersByTimeAsync(1);
+    // Every open 404s, so each is retried with backoff until the cap is
+    // exhausted; advance well past the worst-case cumulative backoff so the
+    // loop has time to give up on its own.
+    await vi.advanceTimersByTimeAsync(90_000);
     await loop;
 
+    expect(opens).toBe(11); // 1 initial open + 10 retries, then gives up
     expect(useChatStore.getState().sessionStatus).toBe("failed");
     expect(useChatStore.getState().abortController).toBeNull();
+  });
+
+  it("rides out a handful of transient 404s (backend restart) without failing the session", async () => {
+    seedSession("conv_404flap", []);
+    const sinks: StreamSink[] = [];
+    let opens = 0;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
+        opens += 1;
+        // A reverse proxy 404s the first few opens (backend mid-restart);
+        // the next one succeeds once it's back.
+        if (opens <= 3) return mockResponse({}, { ok: false, status: 404 });
+        const sink = pushableStream();
+        sinks.push(sink);
+        return mockResponse(null, { bodyStream: sink.stream });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const controller = new AbortController();
+    useChatStore.setState({
+      conversationId: "conv_404flap",
+      abortController: controller,
+      sessionStatus: "running",
+    });
+
+    const loop = startStreamPump("conv_404flap", controller, setState, getState);
+    await vi.advanceTimersByTimeAsync(20_000);
+
+    expect(opens).toBe(4);
+    expect(sinks).toHaveLength(1);
+    // The 404s resolved well inside the cap — must not flip to failed.
+    expect(useChatStore.getState().sessionStatus).toBe("running");
+
+    sinks[0]!.push("data: [DONE]\n\n");
+    sinks[0]!.close();
+    await vi.advanceTimersByTimeAsync(1);
+    await loop;
   });
 
   it("treats the first SUCCESSFUL open as initial (no reconcile) even after a failed open", async () => {

@@ -19,7 +19,10 @@ vi.mock("react-router-dom", async (importOriginal) => {
   return { ...actual, useNavigate: () => navigateMock };
 });
 vi.mock("@/lib/sessionsApi", () => ({ forkSession: vi.fn(), launchRunner: vi.fn() }));
-vi.mock("@/hooks/useAvailableAgents", () => ({ useAvailableAgents: vi.fn() }));
+vi.mock("@/hooks/useAvailableAgents", () => ({
+  useAvailableAgents: vi.fn(),
+  prefetchAvailableAgentDetails: vi.fn(),
+}));
 vi.mock("@/hooks/useAgents", () => ({ useSessionAgent: vi.fn() }));
 vi.mock("@/hooks/useHosts", () => ({ useHosts: vi.fn() }));
 vi.mock("@/hooks/useDirectorySessions", () => ({ useDirectorySessions: vi.fn() }));

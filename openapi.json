@@ -165,6 +165,64 @@
         "title": "AgentObject",
         "type": "object"
       },
+      "AutomaticSessionRenameRequest": {
+        "additionalProperties": false,
+        "description": "Request body for the current-agent automatic rename endpoint.",
+        "properties": {
+          "title": {
+            "maxLength": 60,
+            "minLength": 2,
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "title"
+        ],
+        "title": "AutomaticSessionRenameRequest",
+        "type": "object"
+      },
+      "AutomaticSessionRenameResponse": {
+        "description": "Result of a conditional automatic session rename.",
+        "properties": {
+          "reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "not_top_level",
+                  "no_seed",
+                  "title_changed"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "renamed": {
+            "title": "Renamed",
+            "type": "boolean"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          }
+        },
+        "required": [
+          "renamed"
+        ],
+        "title": "AutomaticSessionRenameResponse",
+        "type": "object"
+      },
       "Body_update_session_agent_v1_sessions__session_id__agent_put": {
         "properties": {
           "bundle": {
@@ -1653,6 +1711,105 @@
         "title": "HeartbeatEvent",
         "type": "object"
       },
+      "ImportItemInput": {
+        "description": "One normalized existing Omnigent item received from the CLI.",
+        "properties": {
+          "data": {
+            "additionalProperties": true,
+            "title": "Data",
+            "type": "object"
+          },
+          "response_id": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Response Id",
+            "type": "string"
+          },
+          "type": {
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "response_id",
+          "data"
+        ],
+        "title": "ImportItemInput",
+        "type": "object"
+      },
+      "ImportSessionRequest": {
+        "description": "Request body for importing one local harness session.",
+        "properties": {
+          "external_session_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "External Session Id",
+            "type": "string"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/ImportItemInput"
+            },
+            "maxItems": 100000,
+            "minItems": 1,
+            "title": "Items",
+            "type": "array"
+          },
+          "source": {
+            "enum": [
+              "claude",
+              "codex"
+            ],
+            "title": "Source",
+            "type": "string"
+          },
+          "workspace": {
+            "anyOf": [
+              {
+                "maxLength": 2048,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workspace"
+          }
+        },
+        "required": [
+          "source",
+          "external_session_id",
+          "items"
+        ],
+        "title": "ImportSessionRequest",
+        "type": "object"
+      },
+      "ImportSessionResponse": {
+        "description": "Result of importing or locating one source session.",
+        "properties": {
+          "item_count": {
+            "title": "Item Count",
+            "type": "integer"
+          },
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "status": {
+            "const": "imported",
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "status",
+          "item_count"
+        ],
+        "title": "ImportSessionResponse",
+        "type": "object"
+      },
       "InProgressEvent": {
         "description": "Event emitted once the task transitions to in-progress.\n\nAlways follows `response.created` (and `response.queued`\nfor background tasks).",
         "properties": {
@@ -3007,6 +3164,7 @@
             "response.elicitation_resolved": "#/components/schemas/ElicitationResolvedEvent",
             "response.error": "#/components/schemas/ErrorEvent",
             "response.failed": "#/components/schemas/FailedEvent",
+            "response.function_call_output.delta": "#/components/schemas/ToolOutputDeltaEvent",
             "response.heartbeat": "#/components/schemas/HeartbeatEvent",
             "response.in_progress": "#/components/schemas/InProgressEvent",
             "response.incomplete": "#/components/schemas/IncompleteEvent",
@@ -3118,6 +3276,9 @@
           },
           {
             "$ref": "#/components/schemas/OutputTextDeltaEvent"
+          },
+          {
+            "$ref": "#/components/schemas/ToolOutputDeltaEvent"
           },
           {
             "$ref": "#/components/schemas/ReasoningStartedEvent"
@@ -3901,6 +4062,17 @@
             ],
             "description": "The user_id of the session owner, or `None` when permissions are disabled. Included so the sidebar can display the owner without a separate API call.",
             "title": "Owner"
+          },
+          "parent_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parent Session Id"
           },
           "pending_elicitations_count": {
             "default": 0,
@@ -5554,6 +5726,46 @@
         "title": "TerminalCommandData",
         "type": "object"
       },
+      "ToolOutputDeltaEvent": {
+        "description": "Incremental output from an in-progress function call.",
+        "properties": {
+          "call_id": {
+            "description": "Function-call correlation id.",
+            "title": "Call Id",
+            "type": "string"
+          },
+          "delta": {
+            "description": "Command stdout/stderr fragment.",
+            "title": "Delta",
+            "type": "string"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "type": {
+            "const": "response.function_call_output.delta",
+            "description": "Always `\"response.function_call_output.delta\"`.",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "call_id",
+          "delta"
+        ],
+        "title": "ToolOutputDeltaEvent",
+        "type": "object"
+      },
       "TurnCancelledEvent": {
         "description": "Emitted when a turn is interrupted by the user or system.",
         "properties": {
@@ -6857,9 +7069,51 @@
         ]
       }
     },
+    "/v1/imports": {
+      "post": {
+        "description": "Import one normalized transcript, rejecting duplicate sources.",
+        "operationId": "import_session_v1_imports_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ImportSessionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ImportSessionResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Import Session",
+        "tags": [
+          "imports"
+        ]
+      }
+    },
     "/v1/info": {
       "get": {
-        "description": "Runtime capabilities probe for the SPA + CLI.\n\nReturned at app boot by the frontend (and by `omnigent login` when it needs to choose between flows). Drives\nconditional route registration and chrome on the SPA side\n\u2014 when `accounts_enabled` is false, the SPA never\nregisters `/login`, `/register`, `/members` and\nnever renders the AccountMenu, so the bundle behaves\nidentically to a pre-PR-2008 build for header / OIDC\ndeploys (in particular, the internal hosted product that\nsyncs from this repo).\n\nAuthentication: this endpoint is intentionally UNAUTHED\nso the SPA can probe it before holding a session cookie.\nIt exposes no sensitive state \u2014 only the active auth\nsource, the login URL, whether first-run admin setup is\nstill pending (`needs_setup`), coarse capability\nbooleans (`databricks_features`,\n`managed_sandboxes_enabled`), the short sandbox\nprovider name (`sandbox_provider`) the web UI labels the\nnew-session sandbox option with, and the installed\n`server_version` (already public via `/api/version`).",
+        "description": "Runtime capabilities probe for the SPA + CLI.\n\nReturned at app boot by the frontend (and by `omnigent login` when it needs to choose between flows). Drives\nconditional route registration and chrome on the SPA side\n\u2014 when `accounts_enabled` is false, the SPA never\nregisters `/login`, `/register`, `/members` and\nnever renders the AccountMenu, so the bundle behaves\nidentically to a pre-PR-2008 build for header / OIDC\ndeploys (in particular, the internal hosted product that\nsyncs from this repo).\n\nAuthentication: this endpoint is intentionally UNAUTHED\nso the SPA can probe it before holding a session cookie.\nIt exposes no sensitive state \u2014 only the active auth\nsource, the login URL, whether first-run admin setup is\nstill pending (`needs_setup`), coarse capability\nbooleans (`databricks_features`,\n`managed_sandboxes_enabled`, `single_user`), the short\nsandbox provider name (`sandbox_provider`) the web UI labels\nthe new-session sandbox option with, and the installed\n`server_version` (already public via `/api/version`).",
         "operationId": "info_v1_info_get",
         "responses": {
           "200": {
@@ -8039,6 +8293,59 @@
         "summary": "Update Mcp Server",
         "tags": [
           "session_mcp_servers"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/auto-title": {
+      "post": {
+        "description": "Replace the deterministic first-message title when still current.",
+        "operationId": "automatically_rename_session_v1_sessions__session_id__auto_title_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AutomaticSessionRenameRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AutomaticSessionRenameResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Automatically Rename Session",
+        "tags": [
+          "sessions"
         ]
       }
     },

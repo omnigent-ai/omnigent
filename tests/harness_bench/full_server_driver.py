@@ -13,7 +13,12 @@ from typing import Any
 import httpx
 
 from tests.e2e._harness_probes import cli_unavailable_reason
-from tests.harness_bench.driver import ForkResult, TurnResult, fill_snapshot_cost
+from tests.harness_bench.driver import (
+    REASONING_PROMPT,
+    ForkResult,
+    TurnResult,
+    fill_snapshot_cost,
+)
 from tests.harness_bench.full_server import (
     _DENY_REASON,
     _POLL_INTERVAL_S,
@@ -26,6 +31,7 @@ from tests.harness_bench.session_items import (
     assistant_text,
     contains_user_text,
     function_calls,
+    reasoning_item_count,
     tool_output_states,
 )
 
@@ -39,6 +45,13 @@ _LONG_PROMPT = (
 
 _STREAM_PROMPT = (
     "Count from 1 to 30 in words, one number per line, and add a short note after each."
+)
+_REASONING_DELTA_EVENTS = frozenset(
+    {
+        "response.reasoning.delta",
+        "response.reasoning_text.delta",
+        "response.reasoning_summary_text.delta",
+    }
 )
 _TERMINAL_EVENTS = frozenset({"response.completed", "response.failed", "response.cancelled"})
 
@@ -109,6 +122,9 @@ class FullServerDriver:
 
     async def run_streaming_turn(self) -> TurnResult:
         return await asyncio.to_thread(self.streaming_probe_turn)
+
+    async def run_reasoning_turn(self) -> TurnResult:
+        return await asyncio.to_thread(self.reasoning_probe_turn)
 
     async def run_tool_turn(self, *, deny: bool) -> TurnResult:
         return await asyncio.to_thread(lambda: self.tool_probe_turn(deny=deny))
@@ -327,7 +343,12 @@ class FullServerDriver:
                 },
             )
 
-    def streaming_probe_turn(self, *, timeout: float = 120.0) -> TurnResult:
+    def streaming_probe_turn(
+        self,
+        *,
+        prompt: str = _STREAM_PROMPT,
+        timeout: float = 120.0,
+    ) -> TurnResult:
         """Measure token-level streaming via the session SSE subscribe stream.
 
         The full-server stream (``GET /v1/sessions/{id}/stream``) is separate
@@ -351,6 +372,8 @@ class FullServerDriver:
                         etype = line[len("event:") :].strip()
                         if etype == "response.output_text.delta":
                             result.text_delta_count += 1
+                        elif etype in _REASONING_DELTA_EVENTS:
+                            result.reasoning_delta_count += 1
                         elif etype in _TERMINAL_EVENTS:
                             result.completed = etype == "response.completed"
                             result.cancelled = etype == "response.cancelled"
@@ -370,13 +393,33 @@ class FullServerDriver:
                 "type": "message",
                 "data": {
                     "role": "user",
-                    "content": [{"type": "input_text", "text": _STREAM_PROMPT}],
+                    "content": [{"type": "input_text", "text": prompt}],
                 },
             },
         ).raise_for_status()
         if not done.wait(timeout):
             result.timed_out = True
         return result
+
+    def reasoning_probe_turn(self) -> TurnResult:
+        """Request high reasoning effort and count forwarded reasoning deltas."""
+        assert self._client is not None and self._session_id is not None
+        before = self._reasoning_item_count()
+        updated = self._client.patch(
+            f"/v1/sessions/{self._session_id}",
+            json={"reasoning_effort": "high"},
+        )
+        updated.raise_for_status()
+        result = self.streaming_probe_turn(prompt=REASONING_PROMPT)
+        result.reasoning_item_count = max(0, self._reasoning_item_count() - before)
+        return result
+
+    def _reasoning_item_count(self) -> int:
+        """Return the current number of persisted reasoning items."""
+        assert self._client is not None and self._session_id is not None
+        response = self._client.get(f"/v1/sessions/{self._session_id}")
+        response.raise_for_status()
+        return reasoning_item_count(response.json().get("items", []))
 
     def interrupt_probe_turn(self, *, timeout: float = 120.0) -> TurnResult:
         """Start a long turn, interrupt it mid-flight, and report the outcome.

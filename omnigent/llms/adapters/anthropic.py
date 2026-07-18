@@ -652,6 +652,12 @@ async def _stream_request(
             json=payload,
         ) as resp,
     ):
+        # Buffer error bodies before raising: a streamed response is
+        # unread, so exc.response.text would raise ResponseNotRead and
+        # error classification (e.g. context-overflow detection) would
+        # never see the provider's message.
+        if resp.status_code >= 400:
+            await resp.aread()
         resp.raise_for_status()
         async for chunk in _stream_to_chat_chunks(
             resp.aiter_lines(),

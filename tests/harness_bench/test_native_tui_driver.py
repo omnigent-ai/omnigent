@@ -154,6 +154,39 @@ def test_tool_turn_observes_function_call_item() -> None:
     assert client.attached_policies == []
 
 
+def test_reasoning_turn_counts_forwarded_deltas() -> None:
+    client = _FakeClient(
+        items=[
+            {
+                "type": "message",
+                "data": {
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "391"}],
+                },
+            },
+        ],
+        stream_events=[
+            "response.reasoning_text.delta",
+            "response.reasoning_summary_text.delta",
+            "response.output_item.done",
+        ],
+    )
+    driver = _driver_with_fake("claude-native", client)
+    counts = iter([0, 1])
+    driver._reasoning_item_count = lambda: next(counts)  # type: ignore[method-assign]
+
+    result = driver._drive_reasoning_turn()
+
+    assert result.completed
+    assert result.reasoning_delta_count == 2
+    assert result.reasoning_item_count == 1
+    assert result.text == "391"
+    assert client.patched_sessions[-1] == (
+        "/v1/sessions/conv_test",
+        {"reasoning_effort": "high"},
+    )
+
+
 def test_tool_turn_deny_attaches_policy_and_observes_denied_event() -> None:
     """deny=True: attaches a CEL deny and sets tool_call_denied on the stream event."""
     client = _FakeClient(

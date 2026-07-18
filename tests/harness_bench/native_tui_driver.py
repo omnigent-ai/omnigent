@@ -33,6 +33,7 @@ from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_ex
 from tests._helpers.live_server import find_free_port
 from tests.e2e._harness_probes import cli_unavailable_reason
 from tests.harness_bench.driver import (
+    REASONING_PROMPT,
     ForkResult,
     ProvisioningError,
     TurnResult,
@@ -52,6 +53,7 @@ from tests.harness_bench.session_items import (
     function_calls,
     item_role,
     item_type,
+    reasoning_item_count,
 )
 
 # Timeouts are "clearly stuck" ceilings, not expected durations: provisioning is
@@ -70,6 +72,13 @@ _LONG_PROMPT = "Write a detailed 500-word essay about the history of computing."
 
 # ``response.completed`` precedes native text deltas; output_item.done is terminal.
 _DELTA_EVENT = "response.output_text.delta"
+_REASONING_DELTA_EVENTS = frozenset(
+    {
+        "response.reasoning.delta",
+        "response.reasoning_text.delta",
+        "response.reasoning_summary_text.delta",
+    }
+)
 _OUTPUT_DONE_EVENT = "response.output_item.done"
 _IN_PROGRESS_EVENT = "response.in_progress"
 _FAILED_EVENT = "response.failed"
@@ -255,6 +264,9 @@ class NativeTuiDriver:
 
     async def run_streaming_turn(self) -> TurnResult:
         return await asyncio.to_thread(self._drive_turn, _STREAM_PROMPT, count_deltas=True)
+
+    async def run_reasoning_turn(self) -> TurnResult:
+        return await asyncio.to_thread(self._drive_reasoning_turn)
 
     async def run_tool_turn(self, *, deny: bool) -> TurnResult:
         return await asyncio.to_thread(self._drive_tool_turn, deny=deny)
@@ -492,6 +504,7 @@ class NativeTuiDriver:
         reader.join(timeout=10.0)
 
         result.text_delta_count = sum(1 for e in events if e == _DELTA_EVENT)
+        result.reasoning_delta_count = sum(1 for e in events if e in _REASONING_DELTA_EVENTS)
         result.text = text or ""
         if text is not None or _OUTPUT_DONE_EVENT in events:
             result.completed = True
@@ -499,6 +512,19 @@ class NativeTuiDriver:
             result.timed_out = True
         if result.completed:
             self._fill_cost_from_snapshot(result)
+        return result
+
+    def _drive_reasoning_turn(self) -> TurnResult:
+        """Request high reasoning effort and count forwarded reasoning deltas."""
+        assert self._client is not None
+        before = self._reasoning_item_count()
+        updated = self._client.patch(
+            f"/v1/sessions/{self._session_id}",
+            json={"reasoning_effort": "high"},
+        )
+        updated.raise_for_status()
+        result = self._drive_turn(REASONING_PROMPT, count_deltas=True)
+        result.reasoning_item_count = max(0, self._reasoning_item_count() - before)
         return result
 
     def _fill_cost_from_snapshot(self, result: TurnResult) -> None:
@@ -841,6 +867,14 @@ class NativeTuiDriver:
         if resp.status_code != 200:
             return 0
         return sum(1 for it in resp.json().get("data", []) if item_role(it) == "assistant")
+
+    def _reasoning_item_count(self) -> int:
+        """Return the current number of persisted reasoning items."""
+        assert self._client is not None
+        resp = self._client.get(f"/v1/sessions/{self._session_id}/items", params={"order": "asc"})
+        if resp.status_code != 200:
+            return 0
+        return reasoning_item_count(resp.json().get("data", []))
 
     def _poll_new_assistant_text(
         self, baseline: int, timeout: float = _TURN_TIMEOUT_S

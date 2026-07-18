@@ -81,23 +81,21 @@ drift negligible (~2 ms/turn).
 
 | Journey | Operation timed |
 | --- | --- |
-| `session_cold_start` | Spawn a **fresh runner process**, wait for its tunnel, bind a session, and drive the first turn to `idle` — the full new-conversation cold path |
+| `session_cold_start` | Create a new host-bound session and time its fresh runner launch through the first token — the full new-conversation cold path |
+| `session_cold_restart` | With an existing session's runner stopped before the sample, post a user message and time the automatic runner relaunch to first token |
 | `warm_turn` | Drive a turn on an already-warm session — steady-state dispatch overhead |
 | `time_to_first_token` | Post a turn; time to the first streamed `output_text` delta |
 | `interrupt` | Interrupt a running (gated) turn; time to cancellation |
 | `read_runner_file` | `GET .../environments/default/filesystem/{path}` — server → runner filesystem read proxy |
 
-**`session_cold_start` spawns a real runner.** The env spawns one runner at
-boot, but the warm journeys reuse it — so `session_cold_start` instead spawns a
-*fresh* runner subprocess per iteration and waits for its reverse tunnel to
-register before binding and driving the turn. That captures the runner process
-start + tunnel handshake that a real new conversation always pays (and that a
-host-launched session pays on its first message), not just the sub-second
-executor-construction + first-turn overhead. Each iteration terminates its
-runner afterward, so at most one extra runner is ever live. Each spawned runner
-mints its own binding token and derives its `runner_id` from it (so tunnel,
-mint, and session binding all agree on one id) and registers over loopback,
-exactly like the boot runner — a fully independent runner.
+The two cold journeys use a real `omni host` daemon. `session_cold_start`
+creates a new host-bound session per sample, while `session_cold_restart`
+creates one session up front and sends `stop_session` before each sample. That
+control event preserves the conversation but stops its runner; the timed user
+message then follows the production auto-relaunch path. In both cases the host
+spawns a fresh runner with its own binding token and reverse tunnel, so the
+latency includes process startup, tunnel registration, and first-token
+dispatch. The daemon reaps any remaining runners when the benchmark exits.
 
 `read_runner_file` needs a runner but does **not** drive a turn or call the LLM:
 its setup plants a file via `PUT`, and the timed op is the proxied read (a

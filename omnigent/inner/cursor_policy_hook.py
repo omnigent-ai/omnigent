@@ -65,7 +65,7 @@ def main() -> None:
 
         headers = policy_hook_request_headers()
         reauth = policy_hook_reauth(server_url, headers)
-        resp, _ = post_evaluate_with_retry(
+        resp, api_error = post_evaluate_with_retry(
             url=url,
             headers=headers,
             eval_request=eval_body,
@@ -82,15 +82,25 @@ def main() -> None:
         return
 
     if resp is None:
-        # Network error / retry budget exhausted -- fail open (allow) so a
-        # transient server outage doesn't block the Cursor turn.
-        json.dump({"permission": "allow"}, sys.stdout)
+        # Network error / retry budget exhausted -- fail closed so a
+        # transient server outage doesn't skip DENY/ASK enforcement.
+        detail = api_error or reauth.failure_reason
+        message = f"Tool '{tool_name}' blocked: Omnigent policy evaluation unavailable"
+        if detail:
+            message += f" ({detail})"
+        json.dump({"permission": "deny", "agent_message": message}, sys.stdout)
         return
 
     try:
         result = resp.json()
     except Exception:  # noqa: BLE001
-        json.dump({"permission": "allow"}, sys.stdout)
+        json.dump(
+            {
+                "permission": "deny",
+                "agent_message": f"Tool '{tool_name}' blocked: malformed Omnigent policy response",
+            },
+            sys.stdout,
+        )
         return
 
     action = result.get("result", "POLICY_ACTION_ALLOW")

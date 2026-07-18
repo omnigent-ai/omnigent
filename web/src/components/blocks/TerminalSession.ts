@@ -74,7 +74,28 @@ export function terminalTheme(isDark: boolean): ITheme {
  */
 export function openTerminalLink(event: MouseEvent, uri: string): void {
   event.preventDefault();
+  const sameOriginSessionPath = sameOriginSessionLink(uri);
+  if (sameOriginSessionPath) {
+    const currentPath = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+    if (sameOriginSessionPath !== currentPath) {
+      window.history.pushState(null, "", sameOriginSessionPath);
+      window.dispatchEvent(new PopStateEvent("popstate", { state: window.history.state }));
+    }
+    return;
+  }
   window.open(uri, "_blank", "noopener,noreferrer");
+}
+
+function sameOriginSessionLink(uri: string): string | null {
+  let url: URL;
+  try {
+    url = new URL(uri, window.location.href);
+  } catch {
+    return null;
+  }
+  if (url.origin !== window.location.origin) return null;
+  if (!/(^|\/)c\/[^/]+\/?$/.test(url.pathname)) return null;
+  return `${url.pathname}${url.search}${url.hash}`;
 }
 
 /**

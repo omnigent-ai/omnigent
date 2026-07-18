@@ -516,6 +516,148 @@ async def test_evaluate_endpoint_passes_actor_to_policy(
     assert body["reason"] == "Blocked user"
 
 
+async def test_evaluate_server_stashed_turn_actor_overrides_request_user_id(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    When the server has stashed a turn-initiating actor for the session
+    (set at forward time from the human's verified ``created_by``), that
+    identity is used for policy evaluation instead of the HTTP request's
+    ``user_id`` (the runner's service-account credential).
+
+    No actor field in the request body is needed or trusted.
+    """
+    policy = FunctionPolicySpec(
+        name="admin__deny_blocked_actor",
+        on=None,
+        function=FunctionRef(path=f"{__name__}._deny_blocked_actor"),
+    )
+    original_caps = get_caps()
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.get_caps",
+        lambda: RuntimeCaps(
+            execution_timeout=original_caps.execution_timeout,
+            default_policies=[policy],
+        ),
+    )
+    # HTTP request carries the runner's service-account identity.
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._get_user_id",
+        lambda _req, _auth: "runner-svc@example.com",
+    )
+
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+
+    # Simulate the server persisting the turn-initiating human's identity
+    # (normally written by _forward_event_to_runner via set_labels).
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.routes.sessions import _TURN_ACTOR_LABEL
+
+    await asyncio.to_thread(
+        get_conversation_store().set_labels,
+        session_id,
+        {_TURN_ACTOR_LABEL: "blocked@test.com"},
+    )
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate",
+        json=_tool_call_request("Read"),
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["result"] == "POLICY_ACTION_DENY", (
+        "persisted turn actor label should override the request user_id"
+    )
+    assert body["reason"] == "Blocked user"
+
+
+async def test_evaluate_body_actor_field_is_ignored(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A caller cannot spoof the policy actor by injecting ``context.actor``
+    into the event payload — the body field is ignored; only the
+    server-stashed turn actor (or the request ``user_id``) is used.
+    """
+    policy = FunctionPolicySpec(
+        name="admin__deny_blocked_actor",
+        on=None,
+        function=FunctionRef(path=f"{__name__}._deny_blocked_actor"),
+    )
+    original_caps = get_caps()
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.get_caps",
+        lambda: RuntimeCaps(
+            execution_timeout=original_caps.execution_timeout,
+            default_policies=[policy],
+        ),
+    )
+    # HTTP request is unauthenticated; no turn actor stashed server-side.
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._get_user_id",
+        lambda _req, _auth: None,
+    )
+
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+
+    # Caller tries to spoof actor via the event context body field.
+    payload = _tool_call_request("Read")
+    payload["event"]["context"] = {"actor": {"run_as": "blocked@test.com"}}
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate",
+        json=payload,
+    )
+    assert resp.status_code == 200
+    # Policy should NOT fire — the body field is ignored, actor is None.
+    assert resp.json()["result"] == "POLICY_ACTION_ALLOW", (
+        "body-injected context.actor must not influence the policy actor"
+    )
+
+
+async def test_evaluate_falls_back_to_request_user_id_when_no_turn_actor(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    When no turn actor is stashed (direct API callers, no-auth mode),
+    the HTTP request's ``user_id`` is used — no regression.
+    """
+    policy = FunctionPolicySpec(
+        name="admin__deny_blocked_actor",
+        on=None,
+        function=FunctionRef(path=f"{__name__}._deny_blocked_actor"),
+    )
+    original_caps = get_caps()
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.get_caps",
+        lambda: RuntimeCaps(
+            execution_timeout=original_caps.execution_timeout,
+            default_policies=[policy],
+        ),
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._get_user_id",
+        lambda _req, _auth: "blocked@test.com",
+    )
+
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate",
+        json=_tool_call_request("Read"),
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["result"] == "POLICY_ACTION_DENY"
+    assert body["reason"] == "Blocked user"
+
+
 # ── Native ASK gate (URL-based elicitation) ──────────────────
 
 
@@ -712,15 +854,20 @@ def test_native_ask_gate_lock_keys_by_session_and_policy() -> None:
     """
     from omnigent.server.routes.sessions import _native_ask_gate_lock
 
-    lock_a = _native_ask_gate_lock("conv_1", "session_cost_guard")
+    lock_a = _native_ask_gate_lock("8e32600337d08f59ad381caf96a90659", "session_cost_guard")
     # Same key → same lock: this is what makes parallel tool calls that
     # all trip one checkpoint share a single gate.
-    assert _native_ask_gate_lock("conv_1", "session_cost_guard") is lock_a
+    assert (
+        _native_ask_gate_lock("8e32600337d08f59ad381caf96a90659", "session_cost_guard") is lock_a
+    )
     # Different policy on the same session → different lock, so a cost ask
     # and (say) a destructive-file ask can prompt concurrently.
-    assert _native_ask_gate_lock("conv_1", "other_policy") is not lock_a
+    assert _native_ask_gate_lock("8e32600337d08f59ad381caf96a90659", "other_policy") is not lock_a
     # Different session → different lock, so sessions stay independent.
-    assert _native_ask_gate_lock("conv_2", "session_cost_guard") is not lock_a
+    assert (
+        _native_ask_gate_lock("19b2d8e5c4e1733f25034907cb7d05ed", "session_cost_guard")
+        is not lock_a
+    )
 
 
 async def test_concurrent_cost_asks_serialize_and_collapse_sibling(

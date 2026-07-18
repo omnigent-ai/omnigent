@@ -39,6 +39,10 @@ class Driver(Protocol):
         """A multi-token turn; the result's ``text_delta_count`` reflects
         whether the transport streamed token-level deltas."""
 
+    async def run_reasoning_turn(self) -> TurnResult:
+        """A reasoning-eligible turn; ``reasoning_delta_count`` records
+        reasoning events forwarded by the transport."""
+
     async def run_tool_turn(self, *, deny: bool) -> TurnResult:
         """Provoke a tool call. With *deny*, a tool-call policy DENY is in
         force so the call should be blocked (``tool_call_denied``); otherwise

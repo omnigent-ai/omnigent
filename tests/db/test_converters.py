@@ -29,7 +29,7 @@ class TestSqlAgentToEntity:
     def test_basic_conversion(self) -> None:
         """All fields on the ORM row map to the corresponding entity fields."""
         row = SqlAgent(
-            id="ag_abc123",
+            id="104c4932179e16161e9ed9298fd5a3e2",
             created_at=1700000000,
             name="research-agent",
             bundle_location="ag_abc123/sha256hash",
@@ -41,7 +41,7 @@ class TestSqlAgentToEntity:
         entity = sql_agent_to_entity(row)
 
         assert isinstance(entity, Agent)
-        assert entity.id == "ag_abc123"
+        assert entity.id == "104c4932179e16161e9ed9298fd5a3e2"
         assert entity.created_at == 1700000000
         assert entity.name == "research-agent"
         assert entity.bundle_location == "ag_abc123/sha256hash"
@@ -53,20 +53,20 @@ class TestSqlAgentToEntity:
     def test_session_scoped_agent_passes_session_id(self) -> None:
         """session_id is forwarded for session-scoped agents."""
         row = SqlAgent(
-            id="ag_sess",
+            id="372d0296768feff7262c605c5553d1da",
             created_at=1700000000,
             name="session-agent",
             bundle_location="ag_sess/hash",
             version=1,
             kind=AGENT_KIND_SESSION,
         )
-        entity = sql_agent_to_entity(row, session_id="conv_xyz")
-        assert entity.session_id == "conv_xyz"
+        entity = sql_agent_to_entity(row, session_id="12b8fd5b4413ededb99560e847b32b0e")
+        assert entity.session_id == "12b8fd5b4413ededb99560e847b32b0e"
 
     def test_nullable_fields_as_none(self) -> None:
         """Optional fields convert cleanly when they are None."""
         row = SqlAgent(
-            id="ag_minimal",
+            id="b9cd9ad3940ded42096b1b1ca99275c1",
             created_at=1700000000,
             name="minimal-agent",
             bundle_location="ag_minimal/hash",
@@ -84,7 +84,7 @@ class TestSqlAgentToEntity:
     def test_special_characters_in_fields(self) -> None:
         """Names and descriptions with unicode / special chars survive conversion."""
         row = SqlAgent(
-            id="ag_unicode",
+            id="babb354a08c7d93e17d1d56ae9e8fa96",
             created_at=1700000000,
             name="agent-with-emoji-\u2603",
             bundle_location="ag_unicode/hash",
@@ -102,7 +102,7 @@ class TestSqlAgentToEntity:
         """Create an Agent entity, build an ORM row from it, convert back, and
         verify all fields match the original."""
         original = Agent(
-            id="ag_roundtrip",
+            id="90fe97c45ce0fd25c67a73f24b325697",
             created_at=1700000000,
             name="round-trip-agent",
             bundle_location="ag_roundtrip/abc123def456",
@@ -140,7 +140,7 @@ class TestSqlAgentToEntity:
         managed = make_managed_session_maker(engine)
 
         original = Agent(
-            id="ag_dbrt",
+            id="66f3422b1183ac0b04cb6f3f313c3f1e",
             created_at=_now(),
             name="db-round-trip",
             bundle_location="ag_dbrt/hash",
@@ -164,7 +164,7 @@ class TestSqlAgentToEntity:
             session.add(row)
 
         with managed() as session:
-            loaded = session.get(SqlAgent, (0, "ag_dbrt"))
+            loaded = session.get(SqlAgent, (0, "66f3422b1183ac0b04cb6f3f313c3f1e"))
             assert loaded is not None
             result = sql_agent_to_entity(loaded)
 
@@ -183,7 +183,7 @@ class TestSqlAgentToEntity:
         managed = make_managed_session_maker(engine)
 
         row = SqlAgent(
-            id="ag_defver",
+            id="5bc53358f0a0e7be94a234cb39730c38",
             created_at=1700000000,
             name="default-version",
             bundle_location="ag_defver/hash",
@@ -193,7 +193,7 @@ class TestSqlAgentToEntity:
             session.add(row)
 
         with managed() as session:
-            loaded = session.get(SqlAgent, (0, "ag_defver"))
+            loaded = session.get(SqlAgent, (0, "5bc53358f0a0e7be94a234cb39730c38"))
             assert loaded is not None
             entity = sql_agent_to_entity(loaded)
             assert entity.version == 1
@@ -201,7 +201,7 @@ class TestSqlAgentToEntity:
     def test_empty_string_description(self) -> None:
         """An empty-string description is preserved (not coerced to None)."""
         row = SqlAgent(
-            id="ag_empty",
+            id="2e58fb3f06227a85bf771cd4fedc5429",
             created_at=1700000000,
             name="empty-desc",
             bundle_location="ag_empty/hash",

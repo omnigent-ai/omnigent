@@ -77,6 +77,44 @@ def test_streaming_capability_declares_binary_verdict() -> None:
         assert declared is not Verdict.PARTIAL, f"{harness!r}: PARTIAL is never a declared verdict"
 
 
+def test_remaining_capabilities_map_to_declared_verdicts(monkeypatch: pytest.MonkeyPatch) -> None:
+    from omnigent.harness_capabilities import (
+        AuthModel,
+        EffortFamily,
+        Elicitation,
+        HarnessCapabilities,
+        IntegrationMode,
+        ModelFamily,
+        Resume,
+    )
+    from tests.harness_bench import manifest
+
+    capability = HarnessCapabilities(
+        IntegrationMode.SDK_IN_PROCESS,
+        Elicitation.NONE,
+        Resume.NONE,
+        EffortFamily.NONE,
+        ModelFamily.MULTI,
+        AuthModel.OWN_AUTH,
+        subagents=False,
+        interrupt=True,
+        streaming=True,
+        steering=True,
+        live_queue=False,
+        images=None,
+        compaction=True,
+    )
+    monkeypatch.setattr(manifest, "harness_capabilities", lambda: {"fake": capability})
+
+    declared = manifest._declared_from_capabilities("fake")
+
+    assert declared["resume"] is Verdict.UNSUPPORTED
+    assert declared["steering"] is Verdict.SUPPORTED
+    assert declared["live_queue"] is Verdict.UNSUPPORTED
+    assert "images" not in declared
+    assert declared["compaction"] is Verdict.SUPPORTED
+
+
 def test_reconcile_flags_concrete_mismatch() -> None:
     assert reconcile(Verdict.UNSUPPORTED, Verdict.SUPPORTED) is Verdict.DRIFT
     assert reconcile(Verdict.SUPPORTED, Verdict.UNSUPPORTED) is Verdict.DRIFT
@@ -269,6 +307,20 @@ def test_grid_already_shown_only_for_grid_drawing_sink() -> None:
     assert _grid_already_shown(_GridSink()) is True
 
 
+def test_progress_sink_receives_selected_probes(monkeypatch) -> None:
+    from tests.harness_bench import __main__ as cli
+
+    captured = []
+    sentinel = object()
+    monkeypatch.setattr(
+        "tests.harness_bench.richreport.rich_sink_or_none",
+        lambda *, force, probes: (captured.extend(probes), sentinel)[1],
+    )
+    selected = [ALL_PROBES[0], ALL_PROBES[3]]
+    assert cli._select_progress_sink(True, probes=selected) is sentinel
+    assert captured == selected
+
+
 async def test_render_table_grid_false_drops_grid_keeps_footer() -> None:
     """grid=False omits the heading + glyph rows but keeps the legend/notes.
 
@@ -338,6 +390,9 @@ async def test_run_harness_emits_structured_events_and_linesink_adapts() -> None
 
         async def run_streaming_turn(self) -> TurnResult:
             return TurnResult(completed=True, text_delta_count=5)
+
+        async def run_reasoning_turn(self) -> TurnResult:
+            return TurnResult(completed=True, reasoning_delta_count=2)
 
         async def run_tool_turn(self, *, deny: bool) -> TurnResult:
             return TurnResult(completed=True)
@@ -415,6 +470,9 @@ async def test_run_bench_jobs_preserves_order(monkeypatch: pytest.MonkeyPatch) -
         async def run_streaming_turn(self) -> TurnResult:
             return TurnResult(completed=True, text_delta_count=3)
 
+        async def run_reasoning_turn(self) -> TurnResult:
+            return TurnResult(completed=True, reasoning_delta_count=2)
+
         async def run_tool_turn(self, *, deny: bool) -> TurnResult:
             return TurnResult(completed=True)
 
@@ -491,6 +549,9 @@ async def test_parallel_full_server_shares_one_server(monkeypatch: pytest.Monkey
         async def run_streaming_turn(self) -> TurnResult:
             return TurnResult(completed=True, text_delta_count=3)
 
+        async def run_reasoning_turn(self) -> TurnResult:
+            return TurnResult(completed=True, reasoning_delta_count=2)
+
         async def run_tool_turn(self, *, deny: bool) -> TurnResult:
             return TurnResult(completed=True, tool_call_denied=deny)
 
@@ -540,6 +601,109 @@ def test_cli_writes_report_file(tmp_path) -> None:
     main(["--no-live", "--report", str(js)])
     payload = json.loads(js.read_text())
     assert payload.get("harnesses")
+
+
+def test_dimension_selection_includes_basic_prerequisite() -> None:
+    from tests.harness_bench.__main__ import _resolve_probes
+
+    probes = _resolve_probes(["reasoning", "streaming,tool-calling"])
+    assert [probe.name for probe in probes] == [
+        "basic_turn",
+        "streaming",
+        "reasoning",
+        "tool_calling",
+    ]
+
+
+def test_dimension_selection_deduplicates_and_preserves_registry_order() -> None:
+    from tests.harness_bench.__main__ import _resolve_probes
+
+    probes = _resolve_probes(["reasoning,basic-turn", "reasoning"])
+    assert [probe.name for probe in probes] == ["basic_turn", "reasoning"]
+
+
+def test_unknown_dimension_is_a_cli_error(capsys: pytest.CaptureFixture[str]) -> None:
+    from tests.harness_bench.__main__ import main
+
+    assert main(["--no-live", "--dimension", "telepathy"]) == 2
+    assert "unknown --dimension 'telepathy'" in capsys.readouterr().err
+
+
+def test_harness_model_override_and_dimension_slice_reach_report(capsys) -> None:
+    from tests.harness_bench.__main__ import main
+
+    assert (
+        main(
+            [
+                "--no-live",
+                "--harness",
+                "codex=system.ai.gpt-5-6-sol",
+                "--dimension",
+                "reasoning",
+                "--json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    harness = payload["harnesses"][0]
+    assert harness["model"] == "system.ai.gpt-5-6-sol"
+    assert [cell["dimension"] for cell in harness["cells"]] == ["basic_turn", "reasoning"]
+
+
+def test_multi_harness_specs_keep_models_attached(capsys) -> None:
+    from tests.harness_bench.__main__ import main
+
+    assert (
+        main(
+            [
+                "--no-live",
+                "--harness",
+                "codex=system.ai.gpt-5-6-sol",
+                "--harness",
+                "claude-sdk=databricks-claude-opus-4-8",
+                "--dimension",
+                "reasoning",
+                "--json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    models = {harness["harness"]: harness["model"] for harness in payload["harnesses"]}
+    assert models == {
+        "codex": "system.ai.gpt-5-6-sol",
+        "claude-sdk": "databricks-claude-opus-4-8",
+    }
+
+
+def test_multi_harness_specs_allow_default_and_custom_models(capsys) -> None:
+    from tests.harness_bench.__main__ import main
+
+    assert (
+        main(
+            [
+                "--no-live",
+                "--harness",
+                "codex=system.ai.gpt-5-6-sol",
+                "--harness",
+                "claude-sdk",
+                "--json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    models = {harness["harness"]: harness["model"] for harness in payload["harnesses"]}
+    assert models["codex"] == "system.ai.gpt-5-6-sol"
+    assert models["claude-sdk"] == OFFICIAL_PROFILES["claude-sdk"].model
+
+
+def test_harness_spec_rejects_empty_model(capsys: pytest.CaptureFixture[str]) -> None:
+    from tests.harness_bench.__main__ import main
+
+    assert main(["--no-live", "--harness", "codex="]) == 2
+    assert "--harness 'codex' has an empty model override" in capsys.readouterr().err
 
 
 @pytest.fixture
@@ -605,6 +769,7 @@ async def test_full_server_async_shims_delegate_to_sync(monkeypatch: pytest.Monk
     monkeypatch.setattr(driver, "__exit__", lambda *a: calls.append("exit"))
     monkeypatch.setattr(driver, "run_turn", lambda prompt, **kw: _stub("run_turn", prompt=prompt))
     monkeypatch.setattr(driver, "streaming_probe_turn", lambda **kw: _stub("streaming"))
+    monkeypatch.setattr(driver, "reasoning_probe_turn", lambda: _stub("reasoning"))
     monkeypatch.setattr(driver, "tool_probe_turn", lambda **kw: _stub("tool", **kw))
     monkeypatch.setattr(driver, "fork_probe_turn", _fork_stub)
     monkeypatch.setattr(driver, "interrupt_probe_turn", lambda **kw: _stub("interrupt"))
@@ -613,6 +778,7 @@ async def test_full_server_async_shims_delegate_to_sync(monkeypatch: pytest.Monk
         assert d is driver
         assert (await d.run_basic_turn("STUB_OK")).completed
         assert (await d.run_streaming_turn()).completed
+        assert (await d.run_reasoning_turn()).completed
         assert (await d.run_tool_turn(deny=True)).completed
         assert (await d.run_fork_turn("STUB_OK")).recalled
         assert (await d.run_interrupt_turn()).completed

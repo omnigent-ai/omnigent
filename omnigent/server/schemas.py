@@ -1923,6 +1923,22 @@ class UpdateSessionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class AutomaticSessionRenameRequest(BaseModel):
+    """Request body for the current-agent automatic rename endpoint."""
+
+    title: str = Field(min_length=2, max_length=60)
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class AutomaticSessionRenameResponse(BaseModel):
+    """Result of a conditional automatic session rename."""
+
+    renamed: bool
+    title: str | None = None
+    reason: Literal["not_top_level", "no_seed", "title_changed"] | None = None
+
+
 class CodexGoalObject(BaseModel):
     """
     Current Codex goal state for a Codex-native session.
@@ -2219,6 +2235,7 @@ class SessionListItem(BaseModel):
     viewer_last_seen: int | None = None
     viewer_unread: bool = False
     search_snippet: str | None = None
+    parent_session_id: str | None = None
 
 
 class SessionList(BaseModel):
@@ -3015,6 +3032,19 @@ class OutputTextDeltaEvent(_SSEEventBase):
     message_id: str | None = None
     index: int | None = None
     final: bool | None = None
+
+
+class ToolOutputDeltaEvent(_SSEEventBase):
+    """Incremental output from an in-progress function call.
+
+    :param type: Always ``"response.function_call_output.delta"``.
+    :param call_id: Function-call correlation id.
+    :param delta: Command stdout/stderr fragment.
+    """
+
+    type: Literal["response.function_call_output.delta"]
+    call_id: str
+    delta: str
 
 
 class ReasoningStartedEvent(_SSEEventBase):
@@ -3948,6 +3978,7 @@ ServerStreamEvent = Annotated[
     | SessionTerminalActivityEvent
     # ── Transient (SSE-only) — incremental token deltas ────────
     | OutputTextDeltaEvent
+    | ToolOutputDeltaEvent
     | ReasoningStartedEvent
     | ReasoningTextDeltaEvent
     | ReasoningSummaryTextDeltaEvent

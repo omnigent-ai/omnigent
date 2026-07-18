@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from tests.harness_bench.driver import TurnResult
@@ -23,9 +24,31 @@ class _Response:
         return self._payload
 
 
+class _Stream:
+    def __init__(self, events: list[str]) -> None:
+        self._events = events
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        pass
+
+    def iter_lines(self):
+        for event in self._events:
+            yield f"event: {event}"
+            yield f"data: {json.dumps({'type': event})}"
+
+
 class _Client:
-    def __init__(self, snapshots: list[dict[str, Any]]) -> None:
+    def __init__(
+        self,
+        snapshots: list[dict[str, Any]],
+        *,
+        stream_events: list[str] | None = None,
+    ) -> None:
         self._snapshots = iter(snapshots)
+        self._stream_events = stream_events or []
         self.patches: list[tuple[str, dict[str, Any]]] = []
         self.posts: list[tuple[str, dict[str, Any]]] = []
 
@@ -40,10 +63,17 @@ class _Client:
         self.patches.append((url, json))
         return _Response({})
 
+    def stream(self, method: str, url: str, timeout: float):
+        return _Stream(self._stream_events)
 
-def _driver(snapshots: list[dict[str, Any]]) -> FullServerDriver:
+
+def _driver(
+    snapshots: list[dict[str, Any]],
+    *,
+    stream_events: list[str] | None = None,
+) -> FullServerDriver:
     class _Shared:
-        client = _Client(snapshots)
+        client = _Client(snapshots, stream_events=stream_events)
         runner_id = "runner-test"
 
     driver = FullServerDriver(_PROFILE, databricks_profile=None, shared=_Shared())
@@ -104,3 +134,43 @@ def test_fork_probe_binds_clone_and_recalls_copied_history(monkeypatch) -> None:
 
     assert result.created and result.history_copied and result.recalled
     assert driver._client.patches == [("/v1/sessions/forked", {"runner_id": "runner-test"})]
+
+
+def test_reasoning_turn_counts_forwarded_deltas(monkeypatch) -> None:
+    monkeypatch.setattr("tests.harness_bench.full_server_driver.time.sleep", lambda _: None)
+    driver = _driver(
+        [],
+        stream_events=[
+            "response.reasoning.started",
+            "response.reasoning_text.delta",
+            "response.reasoning_summary_text.delta",
+            "response.output_text.delta",
+            "response.completed",
+        ],
+    )
+
+    result = driver.streaming_probe_turn(prompt="reason", timeout=1)
+
+    assert result.completed
+    assert result.reasoning_delta_count == 2
+    assert result.text_delta_count == 1
+
+
+def test_reasoning_probe_requests_high_effort(monkeypatch) -> None:
+    driver = _driver([])
+    counts = iter([2, 3])
+    monkeypatch.setattr(driver, "_reasoning_item_count", lambda: next(counts))
+    monkeypatch.setattr(
+        driver,
+        "streaming_probe_turn",
+        lambda **kwargs: TurnResult(completed=True, reasoning_delta_count=1),
+    )
+
+    result = driver.reasoning_probe_turn()
+
+    assert result.reasoning_delta_count == 1
+    assert result.reasoning_item_count == 1
+    assert driver._client.patches[-1] == (
+        "/v1/sessions/source",
+        {"reasoning_effort": "high"},
+    )

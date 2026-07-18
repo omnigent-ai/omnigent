@@ -23,3 +23,4 @@ class HarnessInstallSpec:
     install_hint: str | None = None
     login_status_key: str | None = None
     auth_hint: str | None = None
+    install_command: tuple[str, ...] | None = None

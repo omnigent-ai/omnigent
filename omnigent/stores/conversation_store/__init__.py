@@ -1,5 +1,6 @@
 """Conversation store — manages conversations and their items."""
 
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any
@@ -11,6 +12,7 @@ from omnigent.entities import (
     NewConversationItem,
     PagedList,
 )
+from omnigent.session_import import IMPORT_PROVENANCE_LABEL_KEYS
 
 # Label set on a fork of a session that had a working directory. Its
 # value is the source session id. Presence marks the (unbound) clone as
@@ -112,6 +114,10 @@ _INSTANCE_SCOPED_LABEL_KEYS = frozenset(
     }
 )
 
+# Source identity belongs only to the original imported session. Unlike runtime
+# instance labels, these survive an in-place agent switch but never a fork.
+_FORK_ONLY_DROPPED_LABEL_KEYS = IMPORT_PROVENANCE_LABEL_KEYS
+
 
 @dataclass(frozen=True)
 class CreatedSession:
@@ -148,11 +154,45 @@ class SessionConnectivity:
         dot off while ``runner_id``/``host_id`` are still ``None`` so
         the UI prompts for a host + directory before the clone can run,
         rather than treating it as an in-process session.
+    :param runner_last_seen: Epoch seconds the bound runner's tunnel was
+        last observed alive, written by the replica holding the tunnel.
+        ``None`` when never observed (or cleared on graceful disconnect).
+        Lets a replica that does NOT hold the tunnel derive
+        ``runner_online`` from freshness (see
+        :func:`runner_seen_is_fresh`) instead of its own empty registry.
     """
 
     runner_id: str | None
     host_id: str | None
     needs_workspace: bool
+    runner_last_seen: int | None = None
+
+
+# Freshness window for ``omnigent_conversation_metadata.runner_last_seen``. The tunnel
+# replica refreshes live runners every ~30s (the tunnel ping interval),
+# so 3 missed refreshes = offline — the same budget the tunnel's own
+# keepalive uses and the same shape as ``host_store.HOST_LIVENESS_TTL_S``.
+# Level-triggered on purpose: if the runner, its host, or the server
+# replica holding the tunnel dies without a graceful disconnect, the
+# stale value self-corrects after this window.
+RUNNER_LIVENESS_TTL_S = 90
+
+
+def runner_seen_is_fresh(last_seen: int | None, now: int | None = None) -> bool:
+    """
+    Return whether a ``runner_last_seen`` stamp is within the liveness TTL.
+
+    :param last_seen: Epoch seconds from ``SessionConnectivity``, or
+        ``None`` when the runner was never observed / was cleared.
+    :param now: Epoch seconds to measure against; defaults to the
+        current time. Pass an explicit value to classify many rows
+        against one consistent clock.
+    :returns: ``True`` when the stamp exists and is fresh.
+    """
+    if last_seen is None:
+        return False
+    ref = now if now is not None else int(time.time())
+    return last_seen >= ref - RUNNER_LIVENESS_TTL_S
 
 
 class ConversationNotFoundError(Exception):
@@ -162,6 +202,10 @@ class ConversationNotFoundError(Exception):
     Store methods use this when absence is not a benign
     no-op and the route layer must return a typed 404.
     """
+
+
+class ConversationAlreadyExistsError(Exception):
+    """Raised when a caller-supplied conversation id is already in use."""
 
 
 class NameAlreadyExistsError(Exception):
@@ -210,14 +254,20 @@ class ConversationStore(ABC):
     updates, and deletion.
     """
 
-    def __init__(self, storage_location: str) -> None:
+    def __init__(
+        self, storage_location: str, conversation_storage_location: str | None = None
+    ) -> None:
         """
         Initialize the conversation store.
 
-        :param storage_location: Backend-specific storage URI,
-            e.g. ``"sqlite:///conversations.db"``.
+        :param storage_location: Backend-specific storage URI for the
+            Omnigent operational DB, e.g. ``"sqlite:///conversations.db"``.
+        :param conversation_storage_location: Optional URI for the Agent Platform DB.
+            When ``None`` (default), the AP tables live in the same DB as
+            the Omnigent tables.
         """
         self.storage_location = storage_location
+        self.conversation_storage_location = conversation_storage_location
 
     @abstractmethod
     def create_conversation(
@@ -232,6 +282,7 @@ class ConversationStore(ABC):
         workspace: str | None = None,
         git_branch: str | None = None,
         terminal_launch_args: list[str] | None = None,
+        conversation_id: str | None = None,
     ) -> Conversation:
         """
         Create a new conversation. Generates a unique
@@ -284,6 +335,9 @@ class ConversationStore(ABC):
             the column NULL; a list (including ``[]``) is persisted
             so the runner applies it when it auto-launches the
             terminal.
+        :param conversation_id: Optional caller-supplied identifier.
+            ``None`` generates a new random id. Reserved for flows that
+            require database-enforced idempotency.
         :returns: The newly created :class:`Conversation`.
         :raises NameAlreadyExistsError: If
             ``parent_conversation_id`` is not ``None`` and a
@@ -292,6 +346,8 @@ class ConversationStore(ABC):
         :raises ConversationNotFoundError: If
             ``parent_conversation_id`` is set but the parent
             row does not exist (root id can't be inherited).
+        :raises ConversationAlreadyExistsError: If a caller-supplied
+            ``conversation_id`` is already in use.
         """
         ...
 
@@ -304,6 +360,20 @@ class ConversationStore(ABC):
             e.g. ``"conv_abc123"``.
         :returns: The :class:`Conversation` if found, otherwise
             ``None``.
+        """
+        ...
+
+    @abstractmethod
+    def find_imported_conversation(
+        self,
+        source: str,
+        external_session_id: str,
+    ) -> Conversation | None:
+        """Find the original session imported from one external transcript.
+
+        :param source: Import source key, e.g. ``"claude"``.
+        :param external_session_id: Source harness session id.
+        :returns: The matching conversation, or ``None``.
         """
         ...
 
@@ -676,6 +746,23 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def rename_conversation_if_title_matches(
+        self,
+        conversation_id: str,
+        expected_title: str,
+        title: str,
+    ) -> Conversation | None:
+        """Rename a conversation only while its current title matches.
+
+        :param conversation_id: Conversation to update.
+        :param expected_title: Title that must still be stored.
+        :param title: Replacement title.
+        :returns: The updated conversation, or ``None`` when the row is
+            missing or its title changed before this call.
+        """
+        ...
+
+    @abstractmethod
     def set_labels(
         self,
         conversation_id: str,
@@ -968,6 +1055,63 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def touch_runner_liveness(self, runner_ids: list[str], now: int) -> None:
+        """
+        Stamp ``runner_last_seen`` for every session bound to these runners.
+
+        Called by the replica holding the runner tunnels (on connect and
+        on a periodic sweep of the live registry) so any replica can
+        derive ``runner_online`` from freshness. One bulk ``UPDATE``;
+        must NOT bump ``updated_at`` (it drives sidebar ordering).
+
+        :param runner_ids: Runner ids with a live tunnel,
+            e.g. ``["runner_token_abc123"]``. Empty is a no-op.
+        :param now: Epoch seconds to stamp.
+        """
+        ...
+
+    @abstractmethod
+    def clear_runner_liveness(self, runner_id: str) -> None:
+        """
+        Clear ``runner_last_seen`` for every session bound to a runner.
+
+        Called on a graceful tunnel disconnect so the sidebar flips
+        offline immediately instead of waiting out
+        :data:`RUNNER_LIVENESS_TTL_S`. Must NOT bump ``updated_at``.
+
+        :param runner_id: The disconnected runner's id.
+        """
+        ...
+
+    @abstractmethod
+    def set_session_live_status(self, conversation_id: str, status: str) -> None:
+        """
+        Persist the relay-observed turn status for one session.
+
+        Written by the replica whose SSE relay observed the transition
+        (idle/running/waiting/failed) so any replica's session list can
+        serve it. Must NOT bump ``updated_at``.
+
+        :param conversation_id: Session/conversation identifier.
+        :param status: One of ``enum_codecs.SESSION_LIVE_STATUS``.
+        """
+        ...
+
+    @abstractmethod
+    def set_pending_elicitation_count(self, conversation_id: str, count: int) -> None:
+        """
+        Persist the outstanding elicitation count for one session.
+
+        Written on every pending-elicitation publish/resolve so any
+        replica's session list shows parked approvals. Must NOT bump
+        ``updated_at``.
+
+        :param conversation_id: Session/conversation identifier.
+        :param count: Outstanding elicitations, ``>= 0``.
+        """
+        ...
+
+    @abstractmethod
     def replace_runner_id(self, conversation_id: str, runner_id: str) -> Conversation:
         """
         Replace ``conversations.runner_id`` for a conversation.
@@ -1200,6 +1344,7 @@ class ConversationStore(ABC):
         cloned_agent_bundle_location: str | None = None,
         cloned_agent_description: str | None = None,
         copy_model_settings: bool = True,
+        copy_terminal_launch_args: bool = True,
         carry_history_into_native: bool = False,
         resume_source_native_session: bool = True,
         presentation_labels: dict[str, str] | None = None,
@@ -1243,6 +1388,11 @@ class ConversationStore(ABC):
             the bound agent's defaults — used when the fork switches to
             an agent in a different provider family, where the source's
             model id is meaningless (a model is provider-bound).
+        :param copy_terminal_launch_args: When ``True`` (default), copy the
+            source's ``terminal_launch_args``. When ``False``, the fork starts
+            with none — used when the fork switches to a different CLI, where
+            the source's flags are meaningless or rejected (e.g. Claude Code's
+            ``--permission-mode`` would make ``pi`` exit at launch).
         :param carry_history_into_native: When ``True``, stamp
             :data:`FORK_CARRY_HISTORY_LABEL_KEY` on the fork so a native
             target harness rebuilds its transcript (clone the source's

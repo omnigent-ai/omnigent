@@ -23,10 +23,12 @@ from omnigent.server.managed_hosts import (
     OPENSHELL_MANAGED_TOKEN_TTL_S,
     ManagedSandboxConfig,
     RepoWorkspace,
+    host_resume_supported,
     launch_managed_host,
     parse_repo_workspace,
     parse_sandbox_config,
     relaunch_managed_host,
+    resume_managed_host,
     terminate_managed_host,
 )
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
@@ -312,6 +314,7 @@ def test_parse_valid_islo_config_builds_parameterized_factory(
                 "vcpus": 4,
                 "memory_mb": 8192,
                 "disk_gb": 40,
+                "idle_pause_after_s": 1200,
             },
         }
     )
@@ -332,6 +335,7 @@ def test_parse_valid_islo_config_builds_parameterized_factory(
     assert fake.vcpus == 4
     assert fake.memory_mb == 8192
     assert fake.disk_gb == 40
+    assert fake.idle_pause_after_s == 1200
 
 
 def test_parse_islo_without_section_defaults(
@@ -356,6 +360,26 @@ def test_parse_islo_without_section_defaults(
     assert fake.vcpus is None
     assert fake.memory_mb is None
     assert fake.disk_gb is None
+    assert fake.idle_pause_after_s == 900
+
+
+def test_parse_islo_config_idle_pause_null_disables_lifecycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Explicit null opts out of Islo's default idle pause policy."""
+    cfg = parse_sandbox_config(
+        {
+            "provider": "islo",
+            "server_url": "https://s.example.com",
+            "islo": {"idle_pause_after_s": None},
+        }
+    )
+    assert cfg is not None
+    fake = FakeSandboxLauncher()
+    install_fake_islo_launcher(monkeypatch, fake)
+
+    assert cfg.launcher_factory() is fake
+    assert fake.idle_pause_after_s is None
 
 
 def test_parse_valid_e2b_config_builds_parameterized_factory(
@@ -720,6 +744,18 @@ def test_parse_kubernetes_invalid_block_fails_loud(
         (
             {"provider": "islo", "server_url": "https://s", "islo": {"memory_mb": "large"}},
             "sandbox.islo.memory_mb",
+        ),
+        (
+            {"provider": "islo", "server_url": "https://s", "islo": {"idle_pause_after_s": 0}},
+            "sandbox.islo.idle_pause_after_s",
+        ),
+        (
+            {
+                "provider": "islo",
+                "server_url": "https://s",
+                "islo": {"idle_pause_after_s": "900"},
+            },
+            "sandbox.islo.idle_pause_after_s",
         ),
         # openshell section present but malformed.
         (
@@ -1436,7 +1472,7 @@ async def test_relaunch_rejects_unconfigured_provider(db_uri: str) -> None:
     """
     host_store = HostStore(db_uri)
     host = host_store.register_managed_host(
-        host_id="host_relaunch_mismatch",
+        host_id="8369cb15e751573a1ee641d5fa09c70a",
         name="managed-mismatch",
         owner=_OWNER,
         token="tok",
@@ -1458,6 +1494,177 @@ async def test_relaunch_rejects_unconfigured_provider(db_uri: str) -> None:
     assert fake.terminated == []
 
 
+# ── resume_managed_host ─────────────────────────────────────
+
+
+class _IsloFakeLauncher(FakeSandboxLauncher):
+    """Fake launcher carrying Islo's provider label for managed resume tests."""
+
+    provider: ClassVar[str] = "islo"
+
+
+async def test_host_resume_supported_requires_resumable_matching_launcher(db_uri: str) -> None:
+    """The wake gate requires matching provider, sandbox id, and ``can_resume``."""
+    host_store = HostStore(db_uri)
+    host = host_store.register_managed_host(
+        host_id="292a6322075a34e482fde44975da10f3",
+        name="managed-resume-gate",
+        owner=_OWNER,
+        token="tok-resume-gate",
+        provider="islo",
+        sandbox_id="sb-resume-gate",
+        token_expires_at=now_epoch() + 3600,
+    )
+
+    resumable = _IsloFakeLauncher(can_resume=True)
+    assert host_resume_supported(host, _injected_config(resumable)) is True
+
+    non_resumable = _IsloFakeLauncher(can_resume=False)
+    assert host_resume_supported(host, _injected_config(non_resumable)) is False
+
+    mismatched = FakeSandboxLauncher(can_resume=True)  # provider "modal"
+    assert host_resume_supported(host, _injected_config(mismatched)) is False
+
+    no_sandbox = host_store.register_managed_host(
+        host_id="0c3d744a455047df9a3c0acf432d08dd",
+        name="managed-resume-no-sandbox",
+        owner=_OWNER,
+        token="tok-resume-no-sandbox",
+        provider="islo",
+        sandbox_id="sb-temp",
+        token_expires_at=now_epoch() + 3600,
+    )
+    no_sandbox.sandbox_id = None
+    assert host_resume_supported(no_sandbox, _injected_config(resumable)) is False
+
+
+async def test_resume_managed_host_wakes_same_sandbox_and_refreshes_token(db_uri: str) -> None:
+    """A resumable managed host wakes in place under the same sandbox id."""
+    host_store = HostStore(db_uri)
+
+    def _register(invocation: HostStartInvocation) -> None:
+        """Simulate the sandbox host reconnecting over the tunnel."""
+        host_store.upsert_on_connect(
+            host_id=invocation.host_id,
+            name=invocation.host_name,
+            owner=_OWNER,
+        )
+
+    fake = _IsloFakeLauncher(on_host_start=_register, can_resume=True)
+    config = _injected_config(fake)
+    first = await launch_managed_host(config=config, owner=_OWNER, host_store=host_store)
+    host = host_store.get_host(first.host_id)
+    assert host is not None
+    assert host.sandbox_provider == "islo"
+    assert host.sandbox_id == "sb-fake-1"
+    first_token = fake.host_starts[0].token
+
+    host_store.set_offline(first.host_id)
+    assert host_resume_supported(host_store.get_host(first.host_id), config) is True
+
+    await resume_managed_host(first.host_id, host_store, config)
+
+    assert fake.resumed == ["sb-fake-1"]
+    assert len(fake.provisioned_names) == 1
+    woke = host_store.get_host(first.host_id)
+    assert woke is not None
+    assert woke.status == "online"
+    assert woke.sandbox_provider == "islo"
+    assert woke.sandbox_id == "sb-fake-1"
+    second_token = fake.host_starts[1].token
+    assert second_token != first_token
+    assert host_store.resolve_launch_token(first_token) is None
+    resolved = host_store.resolve_launch_token(second_token)
+    assert resolved is not None and resolved.host_id == first.host_id
+
+
+async def test_resume_managed_host_force_wakes_fresh_online_row(db_uri: str) -> None:
+    """A local missing-tunnel wake can bypass stale cross-replica DB freshness."""
+    host_store = HostStore(db_uri)
+    host_store.register_managed_host(
+        host_id="62d4405ba38711fe34bebfeb5a7adaf2",
+        name="managed-resume-force",
+        owner=_OWNER,
+        token="tok-resume-force",
+        provider="islo",
+        sandbox_id="sb-resume-force",
+        token_expires_at=now_epoch() + 3600,
+    )
+    host_store.upsert_on_connect(
+        host_id="62d4405ba38711fe34bebfeb5a7adaf2",
+        name="managed-resume-force",
+        owner=_OWNER,
+    )
+    assert host_store.is_online("62d4405ba38711fe34bebfeb5a7adaf2") is True
+    fake = _IsloFakeLauncher(can_resume=True)
+
+    await resume_managed_host(
+        "62d4405ba38711fe34bebfeb5a7adaf2", host_store, _injected_config(fake), force=True
+    )
+
+    assert fake.resumed == ["sb-resume-force"]
+    assert len(fake.host_starts) == 1
+    assert host_store.resolve_launch_token("tok-resume-force") is None
+    resolved = host_store.resolve_launch_token(fake.host_starts[0].token)
+    assert resolved is not None and resolved.host_id == "62d4405ba38711fe34bebfeb5a7adaf2"
+
+
+async def test_resume_managed_host_noops_for_non_resumable_provider(db_uri: str) -> None:
+    """Non-resumable providers fall through without mutating the host row."""
+    host_store = HostStore(db_uri)
+    host_store.register_managed_host(
+        host_id="249d058fbcde7b2ce941479cdb8c82d7",
+        name="managed-resume-noop",
+        owner=_OWNER,
+        token="tok-resume-noop",
+        provider="modal",
+        sandbox_id="sb-resume-noop",
+        token_expires_at=now_epoch() + 3600,
+    )
+    fake = FakeSandboxLauncher(can_resume=False)
+
+    await resume_managed_host(
+        "249d058fbcde7b2ce941479cdb8c82d7", host_store, _injected_config(fake)
+    )
+
+    assert fake.resumed == []
+    assert fake.host_starts == []
+    host = host_store.get_host("249d058fbcde7b2ce941479cdb8c82d7")
+    assert host is not None
+    assert host.status == "offline"
+    assert host.sandbox_id == "sb-resume-noop"
+    assert host_store.resolve_launch_token("tok-resume-noop") is not None
+
+
+async def test_resume_managed_host_failure_preserves_existing_row_and_token(db_uri: str) -> None:
+    """A failed wake leaves the dormant host retryable."""
+    host_store = HostStore(db_uri)
+    host_store.register_managed_host(
+        host_id="efbef7dede7be6577770cbb1287992f2",
+        name="managed-resume-fail",
+        owner=_OWNER,
+        token="tok-resume-fail",
+        provider="islo",
+        sandbox_id="sb-resume-fail",
+        token_expires_at=now_epoch() + 3600,
+    )
+    fake = _IsloFakeLauncher(can_resume=True, fail_on_resume=True)
+
+    with pytest.raises(HTTPException) as exc:
+        await resume_managed_host(
+            "efbef7dede7be6577770cbb1287992f2", host_store, _injected_config(fake)
+        )
+
+    assert exc.value.status_code == 502
+    assert "managed host wake failed" in exc.value.detail
+    assert fake.host_starts == []
+    host = host_store.get_host("efbef7dede7be6577770cbb1287992f2")
+    assert host is not None
+    assert host.status == "offline"
+    assert host.sandbox_id == "sb-resume-fail"
+    assert host_store.resolve_launch_token("tok-resume-fail") is not None
+
+
 # ── terminate_managed_host ──────────────────────────────────
 
 
@@ -1470,7 +1677,7 @@ async def test_terminate_managed_host_terminates_and_deletes_row(db_uri: str) ->
     fake = FakeSandboxLauncher()
     host_store = HostStore(db_uri)
     host = host_store.register_managed_host(
-        host_id="host_term_1",
+        host_id="62a91eb065624754c6a6dfb5869dd7e8",
         name="managed-term1",
         owner=_OWNER,
         token="tok-term-1",
@@ -1482,7 +1689,7 @@ async def test_terminate_managed_host_terminates_and_deletes_row(db_uri: str) ->
     await terminate_managed_host(host, host_store, _injected_config(fake))
 
     assert fake.terminated == ["sb-term-1"]
-    assert host_store.get_host("host_term_1") is None
+    assert host_store.get_host("62a91eb065624754c6a6dfb5869dd7e8") is None
     assert host_store.resolve_launch_token("tok-term-1") is None
 
 
@@ -1503,7 +1710,7 @@ async def test_terminate_managed_host_deletes_row_even_when_terminate_fails(
     monkeypatch.setattr(fake, "terminate", _explode)
     host_store = HostStore(db_uri)
     host = host_store.register_managed_host(
-        host_id="host_term_2",
+        host_id="057e7fa3f1cdb40c0ec393a3d42affc7",
         name="managed-term2",
         owner=_OWNER,
         token="tok-term-2",
@@ -1514,7 +1721,7 @@ async def test_terminate_managed_host_deletes_row_even_when_terminate_fails(
 
     await terminate_managed_host(host, host_store, _injected_config(fake))
 
-    assert host_store.get_host("host_term_2") is None
+    assert host_store.get_host("057e7fa3f1cdb40c0ec393a3d42affc7") is None
     assert host_store.resolve_launch_token("tok-term-2") is None
 
 
@@ -1529,7 +1736,7 @@ async def test_terminate_managed_host_skips_mismatched_provider(db_uri: str) -> 
     fake = FakeSandboxLauncher()  # provider "modal"
     host_store = HostStore(db_uri)
     host = host_store.register_managed_host(
-        host_id="host_term_3",
+        host_id="487212fd2b157b6ab6a6d6d3ef06ce5b",
         name="managed-term3",
         owner=_OWNER,
         token="tok-term-3",
@@ -1542,12 +1749,12 @@ async def test_terminate_managed_host_skips_mismatched_provider(db_uri: str) -> 
     await terminate_managed_host(host, host_store, _injected_config(fake))
     # No cross-provider terminate was attempted.
     assert fake.terminated == []
-    assert host_store.get_host("host_term_3") is None
+    assert host_store.get_host("487212fd2b157b6ab6a6d6d3ef06ce5b") is None
     assert host_store.resolve_launch_token("tok-term-3") is None
 
     # config=None behaves the same: row deleted, nothing terminated.
     host2 = host_store.register_managed_host(
-        host_id="host_term_4",
+        host_id="b114bf90a8fd155ce6007c3bb262aa79",
         name="managed-term4",
         owner=_OWNER,
         token="tok-term-4",
@@ -1556,7 +1763,7 @@ async def test_terminate_managed_host_skips_mismatched_provider(db_uri: str) -> 
         token_expires_at=now_epoch() + 3600,
     )
     await terminate_managed_host(host2, host_store, None)
-    assert host_store.get_host("host_term_4") is None
+    assert host_store.get_host("b114bf90a8fd155ce6007c3bb262aa79") is None
 
 
 def test_parse_modal_secrets_thread_to_launcher(monkeypatch: pytest.MonkeyPatch) -> None:

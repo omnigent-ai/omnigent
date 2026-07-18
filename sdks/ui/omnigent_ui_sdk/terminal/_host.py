@@ -796,11 +796,30 @@ def _install_csi_u_sequences() -> None:
 
     # Other CSI-u sequences power users hit:
     ANSI_SEQUENCES["\x1b[27u"] = Keys.Escape
-    ANSI_SEQUENCES["\x1b[127;5u"] = Keys.ControlH  # Ctrl+Backspace
+    # Modified Backspace under the Kitty keyboard protocol → delete the
+    # previous WORD (Claude Code / readline parity). Route both Ctrl+Backspace
+    # (mod 5) and Option/Alt+Backspace (mod 3) to Ctrl+W, which prompt_toolkit's
+    # emacs default already binds to a word kill (unix-word-rubout). We must NOT
+    # use Keys.ControlH here: Keys.Backspace IS Keys.ControlH in prompt_toolkit,
+    # so mapping to ControlH collapses a modified Backspace into a single-char
+    # delete (the Ctrl+Backspace bug). And without the 127;3u entry the
+    # Option+Backspace sequence was unregistered and leaked as literal
+    # "[127;3u" into the prompt on CSI-u terminals.
+    ANSI_SEQUENCES["\x1b[127;3u"] = Keys.ControlW  # Option/Alt+Backspace → word delete
+    ANSI_SEQUENCES["\x1b[127;5u"] = Keys.ControlW  # Ctrl+Backspace → word delete
     ANSI_SEQUENCES["\x1b[127;2u"] = Keys.Backspace  # Shift+Backspace
     ANSI_SEQUENCES["\x1b[3;2~"] = Keys.Delete  # Shift+Delete
     ANSI_SEQUENCES["\x1b[13u"] = Keys.ControlM  # plain Enter via CSI-u
+    # Option/Alt+Enter and Ctrl+Enter → insert a newline. F20 is the key the
+    # host binds the newline action to (same as Shift+Enter, \x1b[13;2u above).
+    # Unregistered, these leaked the literal "[13;3u" / "[13;5u" on CSI-u
+    # terminals whenever a user reached for a multi-line newline.
+    ANSI_SEQUENCES["\x1b[13;3u"] = Keys.F20  # Option/Alt+Enter → newline
+    ANSI_SEQUENCES["\x1b[13;5u"] = Keys.F20  # Ctrl+Enter → newline
     ANSI_SEQUENCES["\x1b[9u"] = Keys.ControlI  # plain Tab via CSI-u
+    # Shift+Tab → back-tab. Unregistered it leaked "[9;2u"; the overlay
+    # navigation already uses BackTab, so decode it consistently here.
+    ANSI_SEQUENCES["\x1b[9;2u"] = Keys.BackTab  # Shift+Tab → back-tab
     ANSI_SEQUENCES["\x1b[127u"] = Keys.Backspace  # plain Backspace via CSI-u
 
     # Xterm/iTerm2 focus-reporting sends ESC [ I when the terminal gains

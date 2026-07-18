@@ -172,12 +172,7 @@ import { supportsEffortControl } from "@/lib/sessionCapabilities";
 import { isCodexNativeSession } from "@/lib/codexPlanMode";
 import { getCliServerUrl } from "@/lib/host";
 import { SessionImage } from "@/components/SessionImage";
-import {
-  CodexGoalControl,
-  CodexGoalStatusPill,
-  useCodexGoalState,
-  type CodexGoal,
-} from "@/components/codex";
+import { GoalControl, GoalStatusPill, useGoalState, type Goal } from "@/components/goal";
 import { copyText } from "@/lib/clipboard";
 import { showToast } from "@/components/ui/toast";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
@@ -599,8 +594,8 @@ export function ChatPage() {
     isLoading: agentsLoading,
     error: agentsError,
     refetch: refetchAgents,
-  } = useAgents();
-  const { data: conversationsData } = useConversations();
+  } = useAgents({ enabled: !urlConvId });
+  const { data: conversationsData } = useConversations("", true);
   const conversations = useMemo(
     () => conversationsData?.pages.flatMap((p) => p.data),
     [conversationsData],
@@ -739,10 +734,9 @@ export function ChatPage() {
   // for legacy conversations without an agent binding — leave the
   // picker alone in those cases.
   //
-  // If the bound agent isn't in the cached list (e.g. a new agent was
-  // registered by a fresh `omnigent run` after the page loaded),
-  // refetch so the list stays current. staleTime: Infinity means the
-  // query won't self-update, so we do it manually on demand.
+  // On the landing page, if the bound agent isn't in the cached list
+  // (e.g. a new agent registered by a fresh `omnigent run` after load),
+  // refetch on demand — useAgents is only enabled there.
   useEffect(() => {
     if (boundAgentId === null) return;
     setSelectedAgentId(boundAgentId);
@@ -1115,7 +1109,7 @@ export function ChatPage() {
       modelPickerKind={modelPickerKind}
       codexModelOptions={codexModelOptions}
       showCodexPlanMode={shouldShowCodexPlanModeControl(capabilitySource)}
-      showCodexGoal={shouldShowCodexGoalControl(capabilitySource)}
+      showGoalControl={shouldShowGoalControl(capabilitySource)}
       costRoutingVerdict={costRoutingVerdict}
       costRoutingEligible={costRoutingEligible}
       subAgentLabel={subAgentLabel}
@@ -1346,8 +1340,8 @@ interface MainAgentSurfaceProps {
   codexModelOptions: readonly CodexModelOption[];
   /** Show the Codex Plan-mode toggle. */
   showCodexPlanMode: boolean;
-  /** Show the Codex Goal control. */
-  showCodexGoal?: boolean;
+  /** Show the session Goal control. */
+  showGoalControl?: boolean;
   /** Latest advisor verdict for the cost-routing pill; null when none. */
   costRoutingVerdict: CostRoutingVerdict | null;
   /** Session passes `isCostRoutingSession` (polly orchestrator, not a child). */
@@ -1421,7 +1415,7 @@ function MainAgentSurface({
   modelPickerKind,
   codexModelOptions,
   showCodexPlanMode,
-  showCodexGoal = false,
+  showGoalControl = false,
   costRoutingVerdict,
   costRoutingEligible,
   subAgentLabel,
@@ -1831,7 +1825,7 @@ function MainAgentSurface({
         modelPickerKind={modelPickerKind}
         codexModelOptions={codexModelOptions}
         showCodexPlanMode={showCodexPlanMode}
-        showCodexGoal={showCodexGoal}
+        showGoalControl={showGoalControl}
         isTerminalFirst={isTerminalFirst}
         isNativeWrapper={isNativeWrapper}
         reconnectHint={liveness.kind === "runner_asleep" || liveness.kind === "host_asleep"}
@@ -3338,8 +3332,8 @@ interface ComposerProps {
   codexModelOptions: readonly CodexModelOption[];
   /** Show the Codex Plan-mode toggle. */
   showCodexPlanMode: boolean;
-  /** Show the Codex Goal control. */
-  showCodexGoal?: boolean;
+  /** Show the session Goal control. */
+  showGoalControl?: boolean;
   /**
    * Terminal-first session (Chat/Terminal pill present). Presentation
    * only: tightens the composer's bottom padding to `pb-1.5` so it sits
@@ -3593,11 +3587,11 @@ export function composerHarnessLabel(
  */
 function ComposerStatusLine({
   harnessLabel,
-  codexGoal,
+  goal,
   isSubAgentSession,
 }: {
   harnessLabel: string | null;
-  codexGoal: CodexGoal | null;
+  goal: Goal | null;
   isSubAgentSession: boolean;
 }) {
   const conversationId = useChatStore((s) => s.conversationId);
@@ -3621,7 +3615,7 @@ function ComposerStatusLine({
   // control that changes them.
   const showHarness = !!conversationId && harnessLabel !== null;
   const showPlanMode = !!conversationId && codexPlanMode;
-  const showGoal = !!conversationId && codexGoal != null;
+  const showGoal = !!conversationId && goal != null;
   // contextWindow > 0: the SSE path validates it but the snapshot path doesn't, and 0/0 → "NaN%".
   const showRing =
     !!conversationId && contextWindow != null && contextWindow > 0 && tokensUsed != null;
@@ -3668,7 +3662,7 @@ function ComposerStatusLine({
             <span>Plan mode</span>
           </span>
         )}
-        {showGoal && codexGoal && <CodexGoalStatusPill goal={codexGoal} />}
+        {showGoal && goal && <GoalStatusPill goal={goal} />}
         {showHarness && harnessLabel && (
           <span
             data-testid="composer-harness"
@@ -3781,7 +3775,7 @@ export function Composer({
   modelPickerKind,
   codexModelOptions,
   showCodexPlanMode,
-  showCodexGoal = false,
+  showGoalControl = false,
   isTerminalFirst = false,
   isNativeWrapper = false,
   reconnectHint = false,
@@ -3900,10 +3894,7 @@ export function Composer({
     unreachable,
     maybeFlushQueuedHead,
   ]);
-  const { goal: codexGoal, setGoal: setCodexGoal } = useCodexGoalState(
-    conversationId,
-    showCodexGoal,
-  );
+  const { goal, setGoal: setGoalState } = useGoalState(conversationId, showGoalControl);
   // "@"-file-mention is scoped to the native coding-agent harnesses: their
   // vendor CLIs run in the workspace and read an on-disk file from an
   // attachment marker the executor already emits. In-process SDK sessions
@@ -4367,13 +4358,15 @@ export function Composer({
       // the user choose there. "/model <name>" takes the builtin route below to
       // setModel — the same write the picker makes.
       //
-      // opencode is excluded: it surfaces showModels (the pill mirrors its live
-      // TUI model) but ships no web model options, so intercepting bare "/model"
-      // would pop an empty dropdown and swallow the command. Fall through to the
-      // builtin "/model" handler below, which surfaces the current model as a
-      // read-only hint. ("/model <name>" still routes to setModel there —
-      // opencode reads model_override on the next web-injected turn.)
-      if (cmd === "/model" && !arg && showModels && modelPickerKind !== "opencode") {
+      // opencode-native now surfaces server-backed model options too, so bare
+      // "/model" opens the picker when options are loaded. When the options are
+      // still empty (e.g. the runner catalog hasn't arrived yet), fall through
+      // to the builtin "/model" handler, which surfaces the current model as a
+      // read-only hint instead of popping an empty dropdown. ("/model <name>"
+      // still routes to setModel there — opencode reads model_override on the
+      // next web-injected turn.)
+      const canOpenModelPicker = modelPickerKind !== "opencode" || codexModelOptions.length > 0;
+      if (cmd === "/model" && !arg && showModels && canOpenModelPicker) {
         dirtyRef.current = true;
         setValue("");
         setCommandError(null);
@@ -4930,12 +4923,13 @@ export function Composer({
                 </TooltipContent>
               </Tooltip>
             )}
-            {showCodexGoal && (
-              <CodexGoalControl
+            {showGoalControl && (
+              <GoalControl
                 conversationId={conversationId}
                 readOnly={isReadOnly}
-                goal={codexGoal}
-                onGoalChange={setCodexGoal}
+                goal={goal}
+                onGoalChange={setGoalState}
+                backendLabel="Codex"
               />
             )}
             <AgentPicker
@@ -4983,7 +4977,7 @@ export function Composer({
       </div>
       <ComposerStatusLine
         harnessLabel={harnessLabel}
-        codexGoal={codexGoal}
+        goal={goal}
         isSubAgentSession={subAgentLabel != null}
       />
     </form>
@@ -5006,8 +5000,12 @@ export function computeIsWorking(sessionStatus: SessionStatus): boolean {
  * @param options.hasPendingElicitation - ``true`` when an elicitation prompt
  *   owns the in-progress slot and should suppress the shimmer/pinned pill.
  * @param options.runnerOnline - Runner liveness: ``true`` online, ``false``
- *   known offline, ``undefined`` before the health poll resolves. Only known
- *   offline suppresses the indicator.
+ *   known offline, ``undefined`` before the health poll resolves. A known-offline
+ *   runner suppresses the indicator ONLY when the session is otherwise idle: a
+ *   session actively reporting ``running``/``waiting`` cannot have an offline
+ *   runner, so its live status wins over the ``/health`` poll — which polls at a
+ *   10s cadence and reads stale-offline during the runner's connect window on a
+ *   fresh session's first turn (it would otherwise hide "Working…" for seconds).
  * @param options.backgroundTaskCount - Background shells still running after
  *   the turn ended. A claude-native turn settles to ``idle`` (the PTY-activity
  *   watcher's edge) even while shells run, so the bare status alone would hide
@@ -5023,9 +5021,14 @@ export function computeShowsWorking(
     backgroundTaskCount?: number;
   },
 ): boolean {
-  if (options.runnerOnline === false) return false;
   if (options.hasPendingElicitation) return false;
-  return computeIsWorking(sessionStatus) || (options.backgroundTaskCount ?? 0) > 0;
+  const isWorking = computeIsWorking(sessionStatus);
+  // A running/waiting session is proof the runner is up, so a stale
+  // poll-derived ``runnerOnline === false`` must not suppress it. Only gate on
+  // known-offline for the not-actively-working case (e.g. a background-shell
+  // tally on an idle session).
+  if (options.runnerOnline === false && !isWorking) return false;
+  return isWorking || (options.backgroundTaskCount ?? 0) > 0;
 }
 
 /**
@@ -5160,7 +5163,7 @@ const EFFORT_LEVELS = ["low", "medium", "high"] as const;
 /** Anthropic-side efforts for claude-native sessions (matches ANTHROPIC_EFFORTS in reasoning_effort.py). */
 const CLAUDE_NATIVE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
 
-type NativeModelPickerKind = "claude" | "codex" | "cursor" | "kiro" | "opencode";
+type NativeModelPickerKind = "claude" | "codex" | "cursor" | "kiro" | "opencode" | "pi";
 
 type LabelSource = { labels?: Record<string, string | null> | null } | null | undefined;
 
@@ -5234,6 +5237,12 @@ export function modelPickerKindForConv(
       // model into the session ``model_override`` (the forwarder's terminal→web
       // mirror), so the picker surfaces that as the live model.
       return "opencode";
+    case "pi-native-ui":
+      // Like cursor: the runner types a model switch into the live Pi process
+      // (via the bridge inbox → Pi's ``setModel``) and Pi mirrors its own
+      // ``/model`` picks back to ``model_override`` via the extension's
+      // model_select handler, so the picker surfaces that as the live model.
+      return "pi";
     default:
       return null;
   }
@@ -5265,13 +5274,14 @@ export function shouldShowCodexPlanModeControl(
 }
 
 /**
- * True when the Codex Goal control should be visible.
+ * True when the session Goal control should be visible.
  *
  * @param conv - Session or sidebar row carrying labels. ``null`` or missing
  *   labels fail closed.
- * @returns True only for Codex-native wrapper sessions.
+ * @returns True only for Codex-native wrapper sessions until the server
+ *   advertises a generic goal capability.
  */
-export function shouldShowCodexGoalControl(
+export function shouldShowGoalControl(
   conv: { labels?: Record<string, string | null> | null } | null | undefined,
 ): boolean {
   return isCodexNativeSession(conv);
@@ -5355,11 +5365,15 @@ function AgentPicker({
   const sessionModelOverride = useChatStore((s) => s.sessionModelOverride);
   const llmModel = useChatStore((s) => s.llmModel);
 
-  // Codex and cursor both populate the picker from the server-provided
-  // ``codexModelOptions`` channel (the snapshot's ``model_options`` field);
-  // claude uses the static local catalog.
+  // Codex, cursor, kiro, pi, and opencode all populate the picker from the
+  // server-provided ``codexModelOptions`` channel (the snapshot's
+  // ``model_options`` field); claude uses the static local catalog.
   const usesServerModelOptions =
-    modelPickerKind === "codex" || modelPickerKind === "cursor" || modelPickerKind === "kiro";
+    modelPickerKind === "codex" ||
+    modelPickerKind === "cursor" ||
+    modelPickerKind === "kiro" ||
+    modelPickerKind === "pi" ||
+    modelPickerKind === "opencode";
   const modelOptions: ReadonlyArray<{ id: string; label?: string; displayName?: string }> =
     modelPickerKind === "claude"
       ? CLAUDE_NATIVE_MODELS
@@ -5396,8 +5410,15 @@ function AgentPicker({
   // There is no terminal→web mirror, so the picker reflects the web-side
   // ``sessionModelOverride`` (which stays correct since a web pick sets it), like
   // cursor/opencode surface theirs.
+  // pi mirrors both ways into ``model_override`` (a web pick persists it before
+  // the live ``setModel``; a TUI ``/model`` pick posts external_model_change),
+  // so like cursor/kiro/opencode the live model is the session override, never
+  // the cross-session sticky ``selectedModel``.
   const pickerSelectedModel =
-    modelPickerKind === "cursor" || modelPickerKind === "kiro" || modelPickerKind === "opencode"
+    modelPickerKind === "cursor" ||
+    modelPickerKind === "kiro" ||
+    modelPickerKind === "opencode" ||
+    modelPickerKind === "pi"
       ? sessionModelOverride
       : (sessionModelOverride ?? selectedModel);
   // SDK/bundle agents (no native picker) never have the cross-session sticky
@@ -5416,10 +5437,11 @@ function AgentPicker({
         // on a web pick (which also drives a live ``/model`` switch). Either way
         // the Omnigent-visible model is ``model_override``.
         sessionModelOverride
-      : modelPickerKind === "opencode"
-        ? // opencode mirrors its live TUI model into ``model_override`` (set at
-          // launch and updated by the forwarder on a TUI switch); show that,
-          // falling back to the launch-resolved model before any switch.
+      : modelPickerKind === "opencode" || modelPickerKind === "pi"
+        ? // opencode/pi mirror their live TUI model into ``model_override``
+          // (set on a web pick, updated by the extension's model_select
+          // handler on a TUI switch); show that, falling back to the
+          // launch-resolved model before any switch.
           (sessionModelOverride ?? llmModel)
         : null
     : nonNativeModel;
@@ -5430,14 +5452,16 @@ function AgentPicker({
       : null;
   const hasPickerActions = showAgents || modelOptions.length > 0 || showEffort;
 
-  // Until kiro mirrors its live model (its first session ``.json`` write), there
-  // is no resolved model to show; fall back to the catalog default (e.g. "Auto")
-  // so the trigger reads as a model rather than the harness name ("Kiro").
-  const kiroDefaultOption =
-    modelPickerKind === "kiro"
+  // Before kiro/pi resolve a live model, there is no model to show: kiro until
+  // its first session ``.json`` write, pi until its snapshot fills llmModel (or
+  // the workspace model-list fetch failed, leaving only the launch model). Fall
+  // back to the catalog default (e.g. "Auto") / first option so the trigger
+  // reads as a model rather than the harness name ("Kiro" / "Pi").
+  const launchFallbackOption =
+    modelPickerKind === "kiro" || modelPickerKind === "pi"
       ? (codexModelOptions.find((m) => m.isDefault) ?? codexModelOptions[0])
       : undefined;
-  const kiroLaunchFallbackLabel = kiroDefaultOption?.displayName ?? kiroDefaultOption?.id;
+  const launchFallbackLabel = launchFallbackOption?.displayName ?? launchFallbackOption?.id;
 
   // Model in foreground (black), effort in muted (grey). Static fallbacks
   // first; the final `else` returns null so a session with nothing to show
@@ -5468,10 +5492,10 @@ function AgentPicker({
     // spec may carry no executor model and no sticky/override is set), but the
     // dropdown still has model rows to switch. Keep the trigger rendered — and
     // the model dropdown + bare-`/model` open path reachable — with a stable
-    // identity fallback rather than hiding the picker entirely. For kiro, prefer
-    // the catalog default (e.g. "Auto") over the agent name so the launch-window
-    // label reads as a model.
-    triggerContent = kiroLaunchFallbackLabel ?? agentDisplayName ?? "Model";
+    // identity fallback rather than hiding the picker entirely. For kiro/pi,
+    // prefer the catalog default (e.g. "Auto") over the agent name so the
+    // launch-window label reads as a model.
+    triggerContent = launchFallbackLabel ?? agentDisplayName ?? "Model";
   } else {
     return null;
   }

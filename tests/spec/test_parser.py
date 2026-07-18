@@ -3587,3 +3587,30 @@ def test_parse_credential_proxy_https_primitive_allowed_on_macos(tmp_path: Path)
     proxy = spec.os_env.sandbox.credential_proxy
     assert proxy is not None
     assert proxy.entries[0].scheme == "bearer"
+
+
+def test_config_loader_does_not_mutate_shared_safeloader_resolvers() -> None:
+    """``_ConfigYamlLoader`` must not corrupt ``yaml.SafeLoader`` process-wide.
+
+    The loader narrows the YAML 1.1 bool resolver to YAML-1.2 spellings, but it
+    must do so on its OWN copy of ``yaml_implicit_resolvers``. If it mutated the
+    dict it inherits from ``SafeLoader`` by reference, every plain
+    ``yaml.safe_load`` caller in the process would lose bool parsing — e.g.
+    ``safe_load("false")`` would return the string ``"false"``.
+    """
+    import omnigent.spec.parser as parser
+
+    # Importing the module must leave SafeLoader's bool resolver intact.
+    assert yaml.safe_load("false") is False
+    assert yaml.safe_load("true") is True
+    # SafeLoader keeps its own YAML 1.1 behavior (``on`` -> True) untouched.
+    assert yaml.safe_load("on") is True
+
+    # Sharpest guard: the subclass must own a distinct resolver dict. This
+    # fails the instant someone drops the copy, regardless of import order.
+    loader = parser._ConfigYamlLoader
+    assert loader.yaml_implicit_resolvers is not yaml.SafeLoader.yaml_implicit_resolvers
+
+    # The subclass still narrows bools: ``on`` is a plain string, ``false`` a bool.
+    assert yaml.load("on", loader) == "on"
+    assert yaml.load("false", loader) is False

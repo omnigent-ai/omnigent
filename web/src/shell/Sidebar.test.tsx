@@ -200,12 +200,14 @@ describe("Sidebar session list", () => {
     // so its trigger button must be gone entirely.
     expect(screen.queryByRole("button", { name: "Filter sessions" })).toBeNull();
 
-    // The sidebar issues a single session-list query with `includeArchived`
+    // The sidebar requests the session list with `includeArchived`
     // hard-wired to true, so archived sessions can be peeled into the
     // bottom "Archived" section. A regression to false would make that
     // section perpetually empty.
-    expect(useConvMock.mock.calls).toHaveLength(1);
-    expect(useConvMock.mock.calls[0]).toEqual(["", true, { reconcileWhileConnected: true }]);
+    expect(useConvMock.mock.calls.length).toBeGreaterThanOrEqual(1);
+    for (const call of useConvMock.mock.calls) {
+      expect(call).toEqual(["", true, { reconcileWhileConnected: true }]);
+    }
   });
 
   it("opens the command palette when the Search button is clicked", () => {

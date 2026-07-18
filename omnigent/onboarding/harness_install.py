@@ -40,6 +40,7 @@ import os
 import shutil
 import subprocess
 import sys
+from pathlib import Path
 
 from omnigent.harness_install_spec import HarnessInstallSpec
 from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
@@ -88,6 +89,8 @@ COPILOT_KEY = "copilot"
 # authenticates through its own ``hermes model`` interactive flow (no
 # Omnigent-managed credentials). The ``hermes`` binary must be on PATH.
 HERMES_KEY = "hermes"
+
+_HERMES_INSTALL_HINT = "curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash"
 
 
 # Keyed by harness family (Claude=anthropic, Codex=openai) plus the pi
@@ -194,7 +197,8 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         "Hermes",
         "hermes",
         package=None,
-        install_hint="curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash",
+        install_hint=_HERMES_INSTALL_HINT,
+        install_command=("bash", "-c", _HERMES_INSTALL_HINT),
     ),
 }
 
@@ -378,11 +382,12 @@ def harness_cli_installed(key: str) -> bool:
 
 
 def harness_install_command(key: str) -> list[str]:
-    """Return the argv that installs the harness CLI, e.g. ``npm install -g …``.
+    """Return the argv that installs the harness CLI.
 
     :param key: A harness family or :data:`PI_KEY`.
-    :returns: The install command, e.g.
-        ``["npm", "install", "-g", "@anthropic-ai/claude-code"]``.
+    :returns: The install command, e.g. ``["npm", "install", "-g",
+        "@anthropic-ai/claude-code"]`` or an explicitly configured vendor
+        installer command.
     :raises KeyError: If *key* has no install spec (caller should gate on
         :func:`harness_install_spec`).
     :raises ValueError: If *key* has a spec but no npm ``package`` (a CLI
@@ -391,6 +396,8 @@ def harness_install_command(key: str) -> list[str]:
     spec = harness_install_spec(key)
     if spec is None:
         raise KeyError(key)
+    if spec.install_command is not None:
+        return list(spec.install_command)
     package = spec.package
     if package is None:
         raise ValueError(f"{key!r} has no npm package; show its install_hint instead")
@@ -398,11 +405,12 @@ def harness_install_command(key: str) -> list[str]:
 
 
 def install_harness_cli(key: str) -> bool:
-    """Install the harness CLI via npm; return whether it landed on ``PATH``.
+    """Install the harness CLI; return whether it landed on ``PATH``.
 
     Shells out to :func:`harness_install_command` and re-checks
-    :func:`harness_cli_installed`. Surfaces npm's own output (no capture) so a
-    failing install is visible. Requires ``npm`` on ``PATH``.
+    :func:`harness_cli_installed`. Surfaces the installer's own output (no
+    capture) so a failing install is visible. Harnesses without an npm package
+    or explicit installer command remain manual-only.
 
     :param key: A harness family or :data:`PI_KEY`.
     :returns: ``True`` when the CLI is on ``PATH`` after the install attempt
@@ -411,16 +419,29 @@ def install_harness_cli(key: str) -> bool:
     :raises KeyError: If *key* has no install spec.
     """
     spec = harness_install_spec(key)
-    if spec is not None and spec.package is None:
-        # Non-npm CLI (e.g. cursor-agent): no auto-install; caller shows install_hint.
-        return False
-    if shutil.which("npm") is None:
+    if spec is not None and spec.package is None and spec.install_command is None:
+        # Manual-only CLI (e.g. cursor-agent): caller shows install_hint.
         return False
     cmd = harness_install_command(key)
+    if shutil.which(cmd[0]) is None:
+        return False
     try:
         subprocess.run(cmd, check=False, timeout=300)
     except (OSError, subprocess.TimeoutExpired):
         return False
+    if harness_cli_installed(key):
+        return True
+
+    # uv-based vendor installers commonly place entry points here and update
+    # shell startup files, which cannot change this already-running process.
+    if spec is not None:
+        user_bin = Path.home() / ".local" / "bin"
+        candidate = user_bin / spec.binary
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            current_path = os.environ.get("PATH", "")
+            path_entries = current_path.split(os.pathsep) if current_path else []
+            if str(user_bin) not in path_entries:
+                os.environ["PATH"] = os.pathsep.join([str(user_bin), *path_entries])
     return harness_cli_installed(key)
 
 
