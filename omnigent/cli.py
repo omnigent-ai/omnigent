@@ -84,35 +84,6 @@ def _load_config(path: str | None) -> dict[str, Any]:  # type: ignore[explicit-a
         return yaml.safe_load(f) or {}
 
 
-def _build_routing_client(
-    routing_cfg: Any,  # type: ignore[explicit-any]  # parsed YAML block
-    server_llm: Any,  # type: ignore[explicit-any]  # LLMConfig | None
-) -> Any | None:  # type: ignore[explicit-any]  # RoutingClient | None
-    """Build the ``RuntimeCaps.routing_client`` from the ``routing:`` config.
-
-    Dispatches on ``routing.provider`` to one of two mutually-exclusive
-    builders:
-
-    - ``external`` — :func:`_build_external_routing_client` (call an
-      external ``routes:select`` service).
-    - ``llm`` (default when ``routing:`` is absent) —
-      :func:`_build_local_llm_routing_client` (the built-in judge).
-
-    :param routing_cfg: The parsed ``routing:`` mapping, or ``None``.
-    :param server_llm: The parsed ``LLMConfig`` (for the ``llm`` provider).
-    :returns: A routing client, or ``None`` when routing can't be built.
-    """
-    provider = "llm"
-    if isinstance(routing_cfg, dict):
-        raw_provider = routing_cfg.get("provider")
-        if isinstance(raw_provider, str) and raw_provider.strip():
-            provider = raw_provider.strip()
-
-    if provider == "external":
-        return _build_external_routing_client(routing_cfg)
-    return _build_local_llm_routing_client(server_llm)
-
-
 def _build_external_routing_client(
     routing_cfg: Any,  # type: ignore[explicit-any]  # parsed YAML block
 ) -> Any | None:  # type: ignore[explicit-any]  # ExternalRoutingClient | None
@@ -3439,7 +3410,16 @@ def server(
     # RuntimeCaps.routing_client with their own implementation.
     routing_client = None
     if os.environ.get("OMNIGENT_SMART_ROUTING") == "1":
-        routing_client = _build_routing_client(cfg.get("routing"), server_llm)
+        routing_cfg = cfg.get("routing")
+        provider = "llm"
+        if isinstance(routing_cfg, dict):
+            raw_provider = routing_cfg.get("provider")
+            if isinstance(raw_provider, str) and raw_provider.strip():
+                provider = raw_provider.strip()
+        if provider == "external":
+            routing_client = _build_external_routing_client(routing_cfg)
+        else:
+            routing_client = _build_local_llm_routing_client(server_llm)
 
     caps = RuntimeCaps(
         execution_timeout=int(effective_timeout),
