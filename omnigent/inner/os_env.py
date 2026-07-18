@@ -495,7 +495,13 @@ class _HelperProcessClient:
         # paths/booleans — but we still keep the file private and ephemeral.
         r_fd: int | None = None
         if IS_WINDOWS:
-            assert self._tmpdir is not None
+            # Windows has no pass_fds, so the config is delivered via a private
+            # file in the helper's tmpdir. That dir is created above only for
+            # active sandboxes; create one here too when the sandbox is inactive
+            # (sandbox.type: none — used by polly and every example agent) so the
+            # helper still gets a config file to read.
+            if self._tmpdir is None:
+                self._tmpdir = create_private_tmpdir()
             config_file = self._tmpdir / "helper-config.json"
             config_file.write_bytes(config_bytes)
             config_arg = ["--config-file", str(config_file)]
@@ -900,11 +906,7 @@ def create_os_environment(spec: OSEnvSpec | None) -> OSEnvironment | None:
             "os_env.start_in_scratch requires an active sandbox; "
             f"resolved sandbox type {sandbox.backend_type!r} is inactive"
         )
-    shell_path = shutil.which("bash") or shutil.which("sh")
-    if shell_path is None:
-        # No POSIX shell on PATH. On Windows fall back to cmd.exe; elsewhere
-        # keep the historical /bin/sh default.
-        shell_path = os.environ.get("COMSPEC", "cmd.exe") if IS_WINDOWS else "/bin/sh"
+    shell_path = _select_default_shell(IS_WINDOWS)
     egress_rules = spec.sandbox.egress_rules if spec.sandbox else None
     egress_allow_private = (
         spec.sandbox.egress_allow_private_destinations if spec.sandbox else False
@@ -1494,6 +1496,20 @@ def _shell_argv(shell_path: str, command: str) -> list[str]:
     if shell_name in ("bash", "bash.exe"):
         return [shell_path, "--noprofile", "--norc", "-c", command]
     return [shell_path, "-c", command]
+
+
+def _select_default_shell(is_windows: bool) -> str:
+    """Pick the default shell for ``sys_os_shell`` on the host.
+
+    On Windows, ``shutil.which("bash")`` resolves to the WSL launcher
+    (``C:\\Windows\\System32\\bash.exe``); using it would run every
+    ``sys_os_shell`` command inside WSL. Use the native ``cmd.exe`` (via
+    ``%COMSPEC%``) instead — :func:`_shell_argv` invokes it with ``/c``. On
+    POSIX, prefer ``bash`` then ``sh``, matching long-standing behaviour.
+    """
+    if is_windows:
+        return os.environ.get("COMSPEC", "cmd.exe")
+    return shutil.which("bash") or shutil.which("sh") or "/bin/sh"
 
 
 def _project_root() -> Path:

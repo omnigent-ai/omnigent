@@ -16,6 +16,7 @@ from omnigent.inner.os_env import (
     _child_shell_env,
     _project_root,
     _read_impl,
+    _select_default_shell,
     _shell_impl,
     build_helper_env,
     create_os_environment,
@@ -401,3 +402,32 @@ def test_shell_command_does_not_see_omnigent_project_root(
     out = result.get("stdout", "")
     assert project_entry in out
     assert str(_project_root()) not in out
+
+
+class TestSelectDefaultShell:
+    """`_select_default_shell` must never pick the WSL bash on Windows."""
+
+    def test_windows_uses_comspec_not_wsl_bash(self, monkeypatch) -> None:
+        # On Windows, shutil.which("bash") is the WSL launcher; the selector
+        # must ignore it and use the native cmd.exe via %COMSPEC%.
+        monkeypatch.setattr(
+            "omnigent.inner.os_env.shutil.which",
+            lambda name: r"C:\Windows\System32\bash.exe" if name == "bash" else None,
+        )
+        monkeypatch.setenv("COMSPEC", r"C:\Windows\System32\cmd.exe")
+        assert _select_default_shell(True) == r"C:\Windows\System32\cmd.exe"
+
+    def test_windows_defaults_to_cmd_when_no_comspec(self, monkeypatch) -> None:
+        monkeypatch.delenv("COMSPEC", raising=False)
+        assert _select_default_shell(True) == "cmd.exe"
+
+    def test_posix_prefers_bash(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            "omnigent.inner.os_env.shutil.which",
+            lambda name: "/usr/bin/bash" if name == "bash" else None,
+        )
+        assert _select_default_shell(False) == "/usr/bin/bash"
+
+    def test_posix_falls_back_to_sh(self, monkeypatch) -> None:
+        monkeypatch.setattr("omnigent.inner.os_env.shutil.which", lambda name: None)
+        assert _select_default_shell(False) == "/bin/sh"
