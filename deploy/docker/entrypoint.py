@@ -304,6 +304,9 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
         SqlAlchemyConversationStore,
     )
     from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+    from omnigent.stores.host_permission_store.sqlalchemy_store import (
+        SqlAlchemyHostPermissionStore,
+    )
     from omnigent.stores.host_store import HostStore
     from omnigent.stores.permission_store.sqlalchemy_store import (
         SqlAlchemyPermissionStore,
@@ -418,6 +421,7 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
         permission_store=permission_store,
         policy_store=policy_store,
         host_store=host_store,
+        host_permission_store=SqlAlchemyHostPermissionStore(database_url),
         scheduled_task_store=scheduled_task_store,
         auth_provider=auth_provider,
         account_store=account_store,

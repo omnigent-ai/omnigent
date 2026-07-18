@@ -3467,9 +3467,13 @@ def server(
             agent_cache,
         )
 
+    from omnigent.stores.host_permission_store.sqlalchemy_store import (
+        SqlAlchemyHostPermissionStore,
+    )
     from omnigent.stores.host_store import HostStore
 
     host_store = HostStore(db_uri)
+    host_permission_store = SqlAlchemyHostPermissionStore(db_uri)
 
     # Managed sandbox hosts (host_type="managed" sessions): parse the
     # config's `sandbox:` section up front so an operator typo stops
@@ -3542,6 +3546,7 @@ def server(
         project_store=project_store,
         auth_provider=auth_provider,
         host_store=host_store,
+        host_permission_store=host_permission_store,
         account_store=account_store,
         policy_modules=cfg.get("policy_modules"),
         debug_router_modules=config_str_list(cfg.get("debug_router_modules")),
