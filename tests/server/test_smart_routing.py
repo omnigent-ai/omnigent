@@ -407,7 +407,7 @@ async def test_route_turn_falls_back_to_static_when_runner_unavailable() -> None
     assert model == "databricks-claude-haiku-4-5"
 
 
-# ── GatewayRoutingClient ─────────────────────────────────────────────
+# ── ExternalRoutingClient ─────────────────────────────────────────────
 
 
 def _patch_httpx(transport: Any) -> Any:
@@ -428,7 +428,7 @@ async def test_gateway_routing_client_sends_snake_case_and_parses() -> None:
     """available_models -> snake_case route_options; response -> RoutingResult."""
     import httpx
 
-    from omnigent.server.smart_routing import GatewayRoutingClient
+    from omnigent.server.smart_routing import ExternalRoutingClient
 
     captured: dict[str, Any] = {}
 
@@ -445,7 +445,7 @@ async def test_gateway_routing_client_sends_snake_case_and_parses() -> None:
             },
         )
 
-    client = GatewayRoutingClient(
+    client = ExternalRoutingClient(
         base_url="https://host/ai-gateway/routing/v1", router_name="task_v0"
     )
     with _patch_httpx(httpx.MockTransport(handler)):
@@ -473,7 +473,7 @@ async def test_gateway_routing_client_empty_available_models_skips() -> None:
     """No candidates -> no HTTP call, returns None."""
     import httpx
 
-    from omnigent.server.smart_routing import GatewayRoutingClient
+    from omnigent.server.smart_routing import ExternalRoutingClient
 
     called = False
 
@@ -482,7 +482,7 @@ async def test_gateway_routing_client_empty_available_models_skips() -> None:
         called = True
         return httpx.Response(200, json={})
 
-    client = GatewayRoutingClient(base_url="http://localhost:6767/v1", router_name="task_v0")
+    client = ExternalRoutingClient(base_url="http://localhost:6767/v1", router_name="task_v0")
     with _patch_httpx(httpx.MockTransport(handler)):
         assert await client.route("hi", {}) is None
     assert called is False
@@ -493,12 +493,12 @@ async def test_gateway_routing_client_swallows_http_error() -> None:
     """A gateway outage returns None so the turn proceeds."""
     import httpx
 
-    from omnigent.server.smart_routing import GatewayRoutingClient
+    from omnigent.server.smart_routing import ExternalRoutingClient
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(503)
 
-    client = GatewayRoutingClient(base_url="http://localhost:6767/v1", router_name="task_v0")
+    client = ExternalRoutingClient(base_url="http://localhost:6767/v1", router_name="task_v0")
     with _patch_httpx(httpx.MockTransport(handler)):
         assert await client.route("hi", {"claude": ["claude-opus-4-8"]}) is None
 
@@ -508,12 +508,12 @@ async def test_gateway_routing_client_empty_selection_returns_none() -> None:
     """An empty route_selection (e.g. router declined) yields None."""
     import httpx
 
-    from omnigent.server.smart_routing import GatewayRoutingClient
+    from omnigent.server.smart_routing import ExternalRoutingClient
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"route_selection": [], "rationale": ""})
 
-    client = GatewayRoutingClient(base_url="http://localhost:6767/v1", router_name="task_v0")
+    client = ExternalRoutingClient(base_url="http://localhost:6767/v1", router_name="task_v0")
     with _patch_httpx(httpx.MockTransport(handler)):
         assert await client.route("hi", {"claude": ["claude-opus-4-8"]}) is None
 
@@ -523,7 +523,7 @@ async def test_gateway_routing_client_sends_bearer_auth() -> None:
     """When built with auth, the request carries the bearer header."""
     import httpx
 
-    from omnigent.server.smart_routing import GatewayRoutingClient, _bearer_auth
+    from omnigent.server.smart_routing import ExternalRoutingClient, _bearer_auth
 
     captured: dict[str, Any] = {}
 
@@ -534,7 +534,7 @@ async def test_gateway_routing_client_sends_bearer_auth() -> None:
             json={"route_selection": [{"route_option": {"model": "m", "harness": "h"}}]},
         )
 
-    client = GatewayRoutingClient(
+    client = ExternalRoutingClient(
         base_url="https://host/v1", router_name="task_v0", auth=_bearer_auth("dapi-XYZ")
     )
     with _patch_httpx(httpx.MockTransport(handler)):

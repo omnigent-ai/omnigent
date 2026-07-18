@@ -1,7 +1,7 @@
 """Tests for ``omnigent.cli._build_routing_client`` provider selection.
 
 Verifies the ``routing:`` config block chooses between the built-in
-``LLMRoutingClient`` and the external ``GatewayRoutingClient``, and that
+``LLMRoutingClient`` and the ``ExternalRoutingClient``, and that a
 malformed gateway config degrades to ``None`` (routing disabled) rather
 than raising.
 """
@@ -11,7 +11,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 from omnigent.cli import _build_routing_client
-from omnigent.server.smart_routing import GatewayRoutingClient, LLMRoutingClient
+from omnigent.server.smart_routing import ExternalRoutingClient, LLMRoutingClient
 
 
 def test_gateway_provider_builds_gateway_client() -> None:
@@ -21,7 +21,7 @@ def test_gateway_provider_builds_gateway_client() -> None:
         "router_name": "task_v0",
     }
     client = _build_routing_client(cfg, None)
-    assert isinstance(client, GatewayRoutingClient)
+    assert isinstance(client, ExternalRoutingClient)
     assert client._url == "https://host/ai-gateway/routing/v1/routes:select"
     assert client._router_name == "task_v0"
     assert client._auth is None  # no profile -> unauthenticated
@@ -41,7 +41,7 @@ def test_gateway_provider_resolves_profile_auth() -> None:
     ) as resolve:
         client = _build_routing_client(cfg, None)
     resolve.assert_called_once_with("staging")
-    assert isinstance(client, GatewayRoutingClient)
+    assert isinstance(client, ExternalRoutingClient)
     assert client._auth is not None  # bearer auth built from the profile token
 
 

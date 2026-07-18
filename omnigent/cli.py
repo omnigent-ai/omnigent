@@ -92,7 +92,7 @@ def _build_routing_client(
 
     Two mutually-exclusive providers:
 
-    - ``gateway`` — :class:`GatewayRoutingClient`, calling an external
+    - ``gateway`` — :class:`ExternalRoutingClient`, calling an external
       ``routes:select`` service. Requires ``base_url`` + ``router_name``;
       auth is resolved from ``profile`` (a Databricks CLI profile for the
       gateway host) or left unauthenticated.
@@ -138,9 +138,9 @@ def _build_routing_client(
                     "routing.profile=%s could not be resolved; calling gateway unauthenticated",
                     profile,
                 )
-        from omnigent.server.smart_routing import GatewayRoutingClient
+        from omnigent.server.smart_routing import ExternalRoutingClient
 
-        return GatewayRoutingClient(
+        return ExternalRoutingClient(
             base_url=base_url.strip(), router_name=router_name.strip(), auth=auth
         )
 

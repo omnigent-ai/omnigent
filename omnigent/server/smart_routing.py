@@ -339,7 +339,7 @@ def _bearer_auth(token: str) -> Any:  # type: ignore[explicit-any]  # returns ht
     return _BearerAuth()
 
 
-class GatewayRoutingClient:
+class ExternalRoutingClient:
     """Routing client backed by an external ``routes:select`` gateway.
 
     Calls a Databricks AI-Gateway routing service (or any endpoint
@@ -397,7 +397,7 @@ class GatewayRoutingClient:
         )
         # snake_case wire format — the gateway uses the proto field names.
         body = json_format.MessageToDict(request, preserving_proto_field_name=True)
-        _logger.info("GatewayRoutingClient: available_models=%s", dict(available_models))
+        _logger.info("ExternalRoutingClient: available_models=%s", dict(available_models))
         try:
             async with httpx.AsyncClient(timeout=self._request_timeout) as http:
                 resp = await http.post(
@@ -409,7 +409,7 @@ class GatewayRoutingClient:
                 resp.raise_for_status()
                 out = json_format.ParseDict(resp.json(), pb.SelectRouteResponse())
         except (httpx.HTTPError, ValueError, json_format.ParseError):
-            _logger.debug("GatewayRoutingClient: routes:select failed", exc_info=True)
+            _logger.debug("ExternalRoutingClient: routes:select failed", exc_info=True)
             return None
         if not out.route_selection:
             return None
