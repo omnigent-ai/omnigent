@@ -20,7 +20,11 @@ from omnigent.server.auth import (
     LEVEL_READ,
     RESERVED_USER_PUBLIC,
 )
-from omnigent.server.routes._auth_helpers import require_access_and_level
+from omnigent.server.routes._auth_helpers import (
+    authorize_runner_or_user,
+    require_access_and_level,
+)
+from omnigent.server.runner_capabilities import RunnerAction
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -231,136 +235,176 @@ async def test_missing_conversation_raises_404(
     assert exc.value.code == ErrorCode.NOT_FOUND
 
 
-# --- Runner binding-token session access (header-mode, feature 002) ---
+# --- Runner capability auth (header-mode, feature 003) ---
 
 _BINDING_TOKEN = "test-binding-token-xyz"
 
 
 @pytest.mark.asyncio
-async def test_binding_token_grants_read_on_own_session_without_user(
+async def test_runner_token_authenticates_on_own_session_without_user(
     perm_store: SqlAlchemyPermissionStore, conv_store: SqlAlchemyConversationStore
 ) -> None:
-    """A runner reads AND posts events on its OWN bound session, no user_id.
+    """A runner reads its own bound session via capability, no user_id.
 
-    The header-mode case (US1): user_id is None (no readable identity), but the
-    token's derived runner id matches conv.runner_id → the runner gets its
-    self-access level (EDIT: read the spec + post events/usage back).
+    The header-mode case: user_id is None (no readable identity), but the
+    token's derived runner id matches conv.runner_id → the runner is
+    authorized via RunnerAction.READ_SESSION with level None.
     """
+    from omnigent.server.runner_capabilities import RunnerAction
+
     conv = conv_store.create_conversation()
     conv_store.replace_runner_id(conv.id, token_bound_runner_id(_BINDING_TOKEN))
 
-    # A read requirement (spec fetch) is satisfied ...
-    access = await require_access_and_level(
-        None,
-        conv.id,
-        LEVEL_READ,
-        perm_store,
-        conv_store,
-        runner_binding_token=_BINDING_TOKEN,
-    )
-    assert access.level == LEVEL_EDIT
-    assert access.conversation is not None
-    assert access.conversation.id == conv.id
+    class FakeRequest:
+        headers = {"X-Omnigent-Runner-Tunnel-Token": _BINDING_TOKEN}
 
-    # ... and so is an edit requirement (POST /events, the transcript/usage
-    # forwarder), so the agent's responses reach the web transcript.
-    access_edit = await require_access_and_level(
-        None,
+    auth = await authorize_runner_or_user(
+        FakeRequest(),
         conv.id,
-        LEVEL_EDIT,
+        RunnerAction.READ_SESSION,
+        LEVEL_READ,
+        None,  # auth_provider=None → no user extraction
         perm_store,
         conv_store,
-        runner_binding_token=_BINDING_TOKEN,
     )
-    assert access_edit.level == LEVEL_EDIT
+    assert auth.is_runner
+    assert auth.user_id is None
+    assert auth.level is None
+    assert auth.conversation is not None
+    assert auth.conversation.id == conv.id
 
 
 @pytest.mark.asyncio
-async def test_binding_token_does_not_grant_other_session(
+async def test_runner_token_does_not_grant_other_session(
     perm_store: SqlAlchemyPermissionStore, conv_store: SqlAlchemyConversationStore
 ) -> None:
-    """A token bound to session X grants nothing on session Y (US2 security).
+    """A token bound to session X grants nothing on session Y."""
+    from omnigent.server.runner_capabilities import RunnerAction
 
-    Y is bound to a DIFFERENT runner, so presenting X's token for Y falls
-    through to the normal deny (404, no user identity).
-    """
     conv_y = conv_store.create_conversation()
     conv_store.replace_runner_id(conv_y.id, token_bound_runner_id("some-other-token"))
 
+    class FakeRequest:
+        headers = {"X-Omnigent-Runner-Tunnel-Token": _BINDING_TOKEN}
+
     with pytest.raises(OmnigentError) as exc:
-        await require_access_and_level(
-            None,
+        await authorize_runner_or_user(
+            FakeRequest(),
             conv_y.id,
+            RunnerAction.READ_SESSION,
             LEVEL_READ,
-            perm_store,
-            conv_store,
-            runner_binding_token=_BINDING_TOKEN,
-        )
-    # No user identity + no matching binding → 401 (unauthenticated), never a grant.
-    assert exc.value.code == ErrorCode.UNAUTHORIZED
-
-
-@pytest.mark.asyncio
-async def test_binding_token_cannot_satisfy_above_edit(
-    perm_store: SqlAlchemyPermissionStore, conv_store: SqlAlchemyConversationStore
-) -> None:
-    """A matching binding token does NOT satisfy a > LEVEL_EDIT requirement (US2).
-
-    The grant caps at EDIT (read spec + post events on its own session); a
-    manage/owner requirement (delete the session, change its sharing) falls
-    through to the normal deny — the runner can't escalate on its own session.
-    """
-    conv = conv_store.create_conversation()
-    conv_store.replace_runner_id(conv.id, token_bound_runner_id(_BINDING_TOKEN))
-
-    with pytest.raises(OmnigentError) as exc:
-        await require_access_and_level(
             None,
-            conv.id,
-            LEVEL_OWNER,
             perm_store,
             conv_store,
-            runner_binding_token=_BINDING_TOKEN,
         )
     assert exc.value.code == ErrorCode.UNAUTHORIZED
 
 
 @pytest.mark.asyncio
-async def test_absent_binding_token_unchanged(
+async def test_runner_token_cannot_perform_non_runner_action(
     perm_store: SqlAlchemyPermissionStore, conv_store: SqlAlchemyConversationStore
 ) -> None:
-    """No binding token → resolution is exactly as before (US3 regression).
+    """A matching token authorizes the runner regardless of required_level.
 
-    A runner-bound session with no token + no user identity still 401s.
+    The runner capability path is action-based, not level-based: a valid
+    token + allowed action authorizes regardless of required_level (which is
+    only used for the human fallback). An invalid token falls through to
+    human auth, which 401s without a user.
     """
+    from omnigent.server.runner_capabilities import RunnerAction
+
     conv = conv_store.create_conversation()
     conv_store.replace_runner_id(conv.id, token_bound_runner_id(_BINDING_TOKEN))
 
+    class FakeRequest:
+        headers = {"X-Omnigent-Runner-Tunnel-Token": _BINDING_TOKEN}
+
+    # Runner is authorized for READ_SESSION even though required_level is OWNER.
+    auth = await authorize_runner_or_user(
+        FakeRequest(),
+        conv.id,
+        RunnerAction.READ_SESSION,
+        LEVEL_OWNER,
+        None,
+        perm_store,
+        conv_store,
+    )
+    assert auth.is_runner
+    assert auth.level is None
+
+    # But an invalid token falls through to human auth, which 401s without a user.
+    class FakeRequestBad:
+        headers = {"X-Omnigent-Runner-Tunnel-Token": "wrong-token"}
+
     with pytest.raises(OmnigentError) as exc:
-        await require_access_and_level(None, conv.id, LEVEL_READ, perm_store, conv_store)
+        await authorize_runner_or_user(
+            FakeRequestBad(),
+            conv.id,
+            RunnerAction.READ_SESSION,
+            LEVEL_OWNER,
+            None,
+            perm_store,
+            conv_store,
+        )
     assert exc.value.code == ErrorCode.UNAUTHORIZED
 
 
 @pytest.mark.asyncio
-async def test_binding_token_owner_access_unaffected(
+async def test_absent_runner_token_unchanged(
     perm_store: SqlAlchemyPermissionStore, conv_store: SqlAlchemyConversationStore
 ) -> None:
-    """A real owner still gets their owner level even if a (bogus) token is passed.
+    """No binding token → resolution is exactly as before (401)."""
+    conv = conv_store.create_conversation()
+    conv_store.replace_runner_id(conv.id, token_bound_runner_id(_BINDING_TOKEN))
 
-    The binding-token branch only ADDS read on a match; it never downgrades or
-    overrides a user's own access.
+    class FakeRequest:
+        headers = {}
+
+    with pytest.raises(OmnigentError) as exc:
+        await authorize_runner_or_user(
+            FakeRequest(),
+            conv.id,
+            RunnerAction.READ_SESSION,
+            LEVEL_READ,
+            None,
+            perm_store,
+            conv_store,
+        )
+    assert exc.value.code == ErrorCode.UNAUTHORIZED
+
+
+@pytest.mark.asyncio
+async def test_runner_token_owner_access_unaffected(
+    perm_store: SqlAlchemyPermissionStore, conv_store: SqlAlchemyConversationStore
+) -> None:
+    """A real owner still gets their owner level even with a bogus token.
+
+    The runner capability check fails (bogus token) and falls through to
+    human auth, which resolves the owner's real permission level.
     """
+    from omnigent.server.auth import UnifiedAuthProvider
+    from omnigent.server.runner_capabilities import RunnerAction
+
     conv = conv_store.create_conversation()
     conv_store.replace_runner_id(conv.id, token_bound_runner_id(_BINDING_TOKEN))
     perm_store.ensure_user(ALICE)
     perm_store.grant(ALICE, conv.id, LEVEL_OWNER)
 
-    access = await require_access_and_level(
-        ALICE,
+    class FakeRequest:
+        headers = {
+            "X-Forwarded-Email": ALICE,
+            "X-Omnigent-Runner-Tunnel-Token": "unrelated-token",
+        }
+
+    auth = await authorize_runner_or_user(
+        FakeRequest(),
         conv.id,
+        RunnerAction.READ_SESSION,
         LEVEL_READ,
+        UnifiedAuthProvider(source="header", local_single_user=False),
         perm_store,
         conv_store,
-        runner_binding_token="unrelated-token",
     )
-    assert access.level == LEVEL_OWNER
+    assert not auth.is_runner
+    assert auth.level == LEVEL_OWNER
+    assert auth.user_id == ALICE
