@@ -2125,7 +2125,10 @@ def _parse_skill(skill_md: Path) -> SkillSpec:
         ``strict=False``) can catch them uniformly.
     """
     try:
-        text = skill_md.read_text()
+        # SKILL.md files are UTF-8 by convention; without an explicit encoding
+        # Path.read_text() uses the platform locale (cp1252 on Windows) and
+        # rejects perfectly valid UTF-8 skill files.
+        text = skill_md.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         # UnicodeDecodeError (a non-UTF-8 SKILL.md) is a ValueError, not an
         # OSError — funnel it through OmnigentError too so the lenient
