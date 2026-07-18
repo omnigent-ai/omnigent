@@ -56,10 +56,6 @@ def test_external_missing_router_name_disables() -> None:
     )
 
 
-def test_external_no_config_block_disables() -> None:
-    assert _build_external_routing_client(None) is None
-
-
 def test_llm_without_server_llm_disables() -> None:
     assert _build_local_llm_routing_client(None) is None
 

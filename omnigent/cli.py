@@ -93,42 +93,36 @@ def _build_external_routing_client(
     ``profile`` (a Databricks CLI profile for the router's host) or left
     unauthenticated.
 
-    :param routing_cfg: The parsed ``routing:`` mapping (``routing.provider``
-        is ``external``), or ``None``.
+    :param routing_cfg: The parsed ``routing:`` mapping (a dict with
+        ``provider == "external"``, per the caller).
     :returns: A configured client, or ``None`` when required config is
         missing (a warning is logged; routing stays off rather than raising).
     """
-    if not isinstance(routing_cfg, dict):
-        _logger.warning("routing.provider=external but no routing config block; skipping")
+    base_url = (routing_cfg.get("base_url") or "").strip()
+    router_name = (routing_cfg.get("router_name") or "").strip()
+    profile = (routing_cfg.get("profile") or "").strip()
+
+    if not base_url or not router_name:
+        _logger.warning("routing.provider=external requires base_url and router_name; skipping")
         return None
-    base_url = routing_cfg.get("base_url")
-    router_name = routing_cfg.get("router_name")
-    if not isinstance(base_url, str) or not base_url.strip():
-        _logger.warning("routing.provider=external requires base_url; skipping")
-        return None
-    if not isinstance(router_name, str) or not router_name.strip():
-        _logger.warning("routing.provider=external requires router_name; skipping")
-        return None
+
     auth = None
-    profile = routing_cfg.get("profile")
-    if isinstance(profile, str) and profile.strip():
+    if profile:
         from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
+        from omnigent.server.smart_routing import _bearer_auth
 
         try:
-            creds = resolve_databricks_workspace(profile.strip())
-            from omnigent.server.smart_routing import _bearer_auth
-
+            creds = resolve_databricks_workspace(profile)
             auth = _bearer_auth(creds.token)
         except OSError:
             _logger.warning(
                 "routing.profile=%s could not be resolved; calling router unauthenticated",
                 profile,
             )
+
     from omnigent.server.smart_routing import ExternalRoutingClient
 
-    return ExternalRoutingClient(
-        base_url=base_url.strip(), router_name=router_name.strip(), auth=auth
-    )
+    return ExternalRoutingClient(base_url=base_url, router_name=router_name, auth=auth)
 
 
 def _build_local_llm_routing_client(
