@@ -45,11 +45,9 @@ def test_external_resolves_profile_auth() -> None:
     assert client._auth is not None  # bearer auth built from the profile token
 
 
-def test_external_missing_base_url_disables() -> None:
+def test_external_missing_required_fields_disables() -> None:
+    """base_url and router_name are both required; missing either disables."""
     assert _build_external_routing_client({"provider": "external", "router_name": "x"}) is None
-
-
-def test_external_missing_router_name_disables() -> None:
     assert (
         _build_external_routing_client({"provider": "external", "base_url": "https://h/v1"})
         is None
