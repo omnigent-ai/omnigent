@@ -1308,8 +1308,9 @@ class SqlHostPermission(OmnigentBase):
 
     Junction table mapping ``(user_id, host_id)`` to a numeric
     permission level, sharing a host the user does not own with them.
-    PK is ``(user_id, host_id)`` — optimized for the hot path ("list
-    hosts I can access" = prefix scan on ``user_id``). The host owner
+    PK is ``(workspace_id, user_id, host_id)`` — tenant-scoped and
+    optimized for the hot path ("list hosts I can access" = prefix scan
+    on workspace + user). The host owner
     (``hosts.owner``) and admins need no row — owner/admin access is
     resolved by :func:`omnigent.server.host_permissions.check_host_access`,
     not stored here.
@@ -1336,6 +1337,13 @@ class SqlHostPermission(OmnigentBase):
     # No DB foreign keys (Rule R032): the application owns referential
     # cleanup — HostStore.delete_host removes a host's grants, mirroring
     # how it nulls conversations.host_id.
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
     user_id: Mapped[str] = mapped_column(String(128), primary_key=True)
     host_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
     level: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -1345,7 +1353,7 @@ class SqlHostPermission(OmnigentBase):
 
     __table_args__ = (
         CheckConstraint("level IN (1, 2, 3)", name="ck_host_permissions_level"),
-        Index("ix_host_permissions_host_id", "host_id"),
+        Index("ix_host_permissions_host_id", "workspace_id", "host_id"),
     )
 
 

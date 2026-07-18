@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from sqlalchemy import delete, select
+from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-from omnigent.db.db_models import SqlHostPermission
+from omnigent.db.db_models import SqlHostPermission, current_workspace_id
 from omnigent.db.utils import get_or_create_engine, make_managed_session_maker, now_epoch
 from omnigent.entities import HostPermission
 from omnigent.stores.host_permission_store import HostPermissionStore
@@ -58,28 +59,45 @@ class SqlAlchemyHostPermissionStore(HostPermissionStore):
         """Upsert a host permission grant. See base class for contract."""
         now = now_epoch()
         with self._session() as session:
-            is_sqlite = self._engine.dialect.name == "sqlite"
-            insert = sqlite_insert if is_sqlite else pg_insert
-            stmt = (
-                insert(SqlHostPermission)
-                .values(
-                    user_id=user_id,
-                    host_id=host_id,
-                    level=level,
-                    created_at=now,
-                    updated_at=now,
-                    created_by=created_by,
+            dialect = self._engine.dialect.name
+            values = {
+                "user_id": user_id,
+                "host_id": host_id,
+                "level": level,
+                "created_at": now,
+                "updated_at": now,
+                "created_by": created_by,
+            }
+            if dialect == "sqlite":
+                stmt = (
+                    sqlite_insert(SqlHostPermission)
+                    .values(**values)
+                    .on_conflict_do_update(
+                        index_elements=["workspace_id", "user_id", "host_id"],
+                        set_={"level": level, "updated_at": now},
+                    )
                 )
-                .on_conflict_do_update(
-                    index_elements=["user_id", "host_id"],
-                    # Only the level and updated_at change on re-grant;
-                    # created_at / created_by stay as first written.
-                    set_={"level": level, "updated_at": now},
+            elif dialect == "mysql":
+                stmt = (
+                    mysql_insert(SqlHostPermission)
+                    .values(**values)
+                    .on_duplicate_key_update(level=level, updated_at=now)
                 )
-            )
+            else:
+                stmt = (
+                    pg_insert(SqlHostPermission)
+                    .values(**values)
+                    .on_conflict_do_update(
+                        index_elements=["workspace_id", "user_id", "host_id"],
+                        set_={"level": level, "updated_at": now},
+                    )
+                )
             session.execute(stmt)
             session.flush()
-            row = session.get(SqlHostPermission, (user_id, host_id))
+            row = session.get(
+                SqlHostPermission,
+                (current_workspace_id(), user_id, host_id),
+            )
             # row is non-None: we just upserted it.
             assert row is not None
             return _to_entity(row)
@@ -89,6 +107,7 @@ class SqlAlchemyHostPermissionStore(HostPermissionStore):
         with self._session() as session:
             result = session.execute(
                 delete(SqlHostPermission).where(
+                    SqlHostPermission.workspace_id == current_workspace_id(),
                     SqlHostPermission.user_id == user_id,
                     SqlHostPermission.host_id == host_id,
                 )
@@ -98,7 +117,10 @@ class SqlAlchemyHostPermissionStore(HostPermissionStore):
     def get(self, user_id: str, host_id: str) -> HostPermission | None:
         """Look up a single grant. See base class for contract."""
         with self._session() as session:
-            row = session.get(SqlHostPermission, (user_id, host_id))
+            row = session.get(
+                SqlHostPermission,
+                (current_workspace_id(), user_id, host_id),
+            )
             return _to_entity(row) if row is not None else None
 
     def list_for_host(self, host_id: str) -> list[HostPermission]:
@@ -106,7 +128,10 @@ class SqlAlchemyHostPermissionStore(HostPermissionStore):
         with self._session() as session:
             rows = (
                 session.execute(
-                    select(SqlHostPermission).where(SqlHostPermission.host_id == host_id)
+                    select(SqlHostPermission).where(
+                        SqlHostPermission.workspace_id == current_workspace_id(),
+                        SqlHostPermission.host_id == host_id,
+                    )
                 )
                 .scalars()
                 .all()
@@ -118,7 +143,10 @@ class SqlAlchemyHostPermissionStore(HostPermissionStore):
         with self._session() as session:
             rows = (
                 session.execute(
-                    select(SqlHostPermission).where(SqlHostPermission.user_id == user_id)
+                    select(SqlHostPermission).where(
+                        SqlHostPermission.workspace_id == current_workspace_id(),
+                        SqlHostPermission.user_id == user_id,
+                    )
                 )
                 .scalars()
                 .all()

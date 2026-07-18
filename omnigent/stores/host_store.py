@@ -635,7 +635,12 @@ class HostStore:
         :returns: List of :class:`Host` entities for every owner.
         """
         with self._session() as session:
-            rows = session.query(SqlHost).order_by(SqlHost.updated_at.desc()).all()
+            rows = (
+                session.query(SqlHost)
+                .filter(SqlHost.workspace_id == current_workspace_id())
+                .order_by(SqlHost.updated_at.desc())
+                .all()
+            )
             return [_row_to_host(row) for row in rows]
 
     def list_hosts_for(self, user_id: str) -> list[Host]:
@@ -658,11 +663,15 @@ class HostStore:
         """
         with self._session() as session:
             granted_host_ids = select(SqlHostPermission.host_id).where(
-                SqlHostPermission.user_id == user_id
+                SqlHostPermission.workspace_id == current_workspace_id(),
+                SqlHostPermission.user_id == user_id,
             )
             rows = (
                 session.query(SqlHost)
-                .filter((SqlHost.owner == user_id) | (SqlHost.host_id.in_(granted_host_ids)))
+                .filter(
+                    SqlHost.workspace_id == current_workspace_id(),
+                    (SqlHost.owner == user_id) | (SqlHost.host_id.in_(granted_host_ids)),
+                )
                 .order_by(SqlHost.updated_at.desc())
                 .all()
             )
@@ -839,6 +848,7 @@ class HostStore:
             )
             session.execute(
                 sql_delete(SqlHostPermission).where(
+                    SqlHostPermission.workspace_id == current_workspace_id(),
                     SqlHostPermission.host_id == host_id,
                 )
             )

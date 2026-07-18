@@ -6,6 +6,7 @@ import uuid
 
 import pytest
 
+from omnigent.db.db_models import workspace_scope
 from omnigent.stores.host_permission_store.sqlalchemy_store import (
     SqlAlchemyHostPermissionStore,
 )
@@ -106,3 +107,52 @@ def test_get_permission_level(store: SqlAlchemyHostPermissionStore) -> None:
     assert store.get_permission_level("alice@test.com", _HOST_X) == 2
     assert store.get_permission_level("bob@test.com", _HOST_X) is None
     assert store.get_permission_level(None, _HOST_X) is None
+
+
+def test_grants_are_isolated_by_workspace(db_uri: str) -> None:
+    """The same user and host identifiers have independent workspace grants."""
+    store = SqlAlchemyHostPermissionStore(db_uri)
+
+    with workspace_scope(11):
+        store.grant("alice@test.com", _HOST_X, 2, created_by="admin-11")
+    with workspace_scope(22):
+        assert store.get("alice@test.com", _HOST_X) is None
+        store.grant("alice@test.com", _HOST_X, 1, created_by="admin-22")
+
+    with workspace_scope(11):
+        grant = store.get("alice@test.com", _HOST_X)
+        assert grant is not None
+        assert grant.level == 2
+        assert grant.created_by == "admin-11"
+        assert len(store.list_for_user("alice@test.com")) == 1
+    with workspace_scope(22):
+        grant = store.get("alice@test.com", _HOST_X)
+        assert grant is not None
+        assert grant.level == 1
+        assert grant.created_by == "admin-22"
+        assert store.revoke("alice@test.com", _HOST_X)
+
+    with workspace_scope(11):
+        assert store.get("alice@test.com", _HOST_X) is not None
+
+
+def test_host_lists_and_cleanup_are_isolated_by_workspace(db_uri: str) -> None:
+    """Host visibility and deletion never cross the active workspace boundary."""
+    hosts = HostStore(db_uri)
+    grants = SqlAlchemyHostPermissionStore(db_uri)
+
+    with workspace_scope(11):
+        hosts.upsert_on_connect(_HOST_X, "shared-name", "owner@test.com")
+        grants.grant("alice@test.com", _HOST_X, 2)
+    with workspace_scope(22):
+        hosts.upsert_on_connect(_HOST_X, "shared-name", "owner@test.com")
+        assert hosts.list_hosts_for("alice@test.com") == []
+        assert [host.host_id for host in hosts.list_all_hosts()] == [_HOST_X]
+        grants.grant("bob@test.com", _HOST_X, 1)
+        hosts.delete_host(_HOST_X)
+        assert hosts.list_all_hosts() == []
+
+    with workspace_scope(11):
+        assert [host.host_id for host in hosts.list_hosts_for("alice@test.com")] == [_HOST_X]
+        assert [host.host_id for host in hosts.list_all_hosts()] == [_HOST_X]
+        assert grants.get("alice@test.com", _HOST_X) is not None

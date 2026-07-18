@@ -94,6 +94,13 @@ def upgrade() -> None:
     # cleanup — HostStore.delete_host removes a host's grants.
     op.create_table(
         "host_permissions",
+        sa.Column(
+            "workspace_id",
+            sa.BigInteger(),
+            primary_key=True,
+            nullable=False,
+            server_default="0",
+        ),
         sa.Column("user_id", sa.String(128), primary_key=True),
         sa.Column("host_id", sa.LargeBinary(16), primary_key=True),
         sa.Column("level", sa.Integer, nullable=False),
@@ -105,7 +112,7 @@ def upgrade() -> None:
     op.create_index(
         "ix_host_permissions_host_id",
         "host_permissions",
-        ["host_id"],
+        ["workspace_id", "host_id"],
     )
 
 
