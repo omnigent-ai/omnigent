@@ -2583,9 +2583,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                     SqlConversation.title == expected_title,
                 )
                 .values(title=title, updated_at=now_epoch())
-                .returning(SqlConversation.id)
             )
-            if result.scalar_one_or_none() is None:
+            if result.rowcount != 1:
                 return None
         return self.get_conversation(conversation_id)
 
