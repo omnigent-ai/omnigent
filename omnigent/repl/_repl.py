@@ -1372,10 +1372,6 @@ class _SessionsChatReplAdapter:
         # override (not an agent switch) applied by this adapter when
         # dispatching future turns through the sessions route.
         self._model_override: str | None = None
-        # Session-local /route toggle: cost-control / smart-routing mode
-        # ("on"/"off"/None). Cached locally before the session exists, then
-        # applied on create; hydrated from the snapshot thereafter.
-        self._cost_control_mode: str | None = None
         self._llm_model: str | None = None
         self._harness: str | None = harness
         self._context_window: int | None = None
@@ -1543,46 +1539,6 @@ class _SessionsChatReplAdapter:
         self._model_override = session.model_override
 
     @property
-    def cost_control_mode(self) -> str | None:
-        """
-        Current cost-control / smart-routing mode for this session.
-
-        ``"on"`` when server-side routing is enabled, ``"off"`` when
-        explicitly disabled, ``None`` for the spec default. Set via the
-        ``/route`` slash command.
-        """
-        return self._cost_control_mode
-
-    async def set_cost_control_mode(self, mode: str | None) -> None:
-        """
-        Turn server-side routing on/off for this session.
-
-        Before the session exists, caches the value locally so
-        :meth:`_ensure_session` can apply it on create. After, PATCHes
-        via ``PATCH /v1/sessions/{id}`` (matching
-        :meth:`set_model_override`). Turning routing ``on`` also clears
-        any pinned model override — the server's routing gate skips when
-        an override is set, so a stale pin would silently beat the router
-        (the web client clears it the same way).
-
-        :param mode: ``"on"``, ``"off"``, or ``None`` to clear to the
-            spec default.
-        """
-        clear_model = mode == "on" and self._model_override is not None
-        if self._session_id is None:
-            self._cost_control_mode = mode
-            if clear_model:
-                self._model_override = None
-            return
-        session = await self._client.sessions.set_cost_control_mode(
-            self._session_id,
-            mode=mode,
-            clear_model_override=clear_model,
-        )
-        self._cost_control_mode = session.cost_control_mode_override
-        self._model_override = session.model_override
-
-    @property
     def llm_model(self) -> str | None:
         """
         LLM model identifier from the bound agent's spec.
@@ -1682,7 +1638,6 @@ class _SessionsChatReplAdapter:
             self._runner_id = session.runner_id
         self._reasoning_effort = session.reasoning_effort
         self._model_override = session.model_override
-        self._cost_control_mode = getattr(session, "cost_control_mode_override", None)
         self._llm_model = session.llm_model
         # Don't clobber a launch-provided harness with a None from the
         # snapshot (e.g. an agent the server couldn't resolve a spec for).
@@ -1729,7 +1684,6 @@ class _SessionsChatReplAdapter:
                 # clobbers it; PATCHed below since create() has no
                 # model_override metadata field.
                 pending_model_override = self._model_override
-                pending_cost_control = self._cost_control_mode
                 session = await self._client.sessions.create(
                     self._session_bundle,
                     filename=self._session_bundle_filename,
@@ -1766,24 +1720,6 @@ class _SessionsChatReplAdapter:
                             exc_info=True,
                         )
                         self._model_override = None
-                if pending_cost_control is not None and session.cost_control_mode_override is None:
-                    # Apply a pre-session ``/route on|off`` so the first
-                    # event is routed (or not) per the user's choice.
-                    try:
-                        patched = await self._client.sessions.set_cost_control_mode(
-                            self._session_id,
-                            mode=pending_cost_control,
-                        )
-                        self._cost_control_mode = patched.cost_control_mode_override
-                    except Exception:  # noqa: BLE001 — REPL boundary; log and clear
-                        _log.warning(
-                            "Failed to apply pending /route=%r to session %s; "
-                            "clearing local cache.",
-                            pending_cost_control,
-                            self._session_id,
-                            exc_info=True,
-                        )
-                        self._cost_control_mode = None
                 if _dbg:
                     print(
                         f"[sessions-adapter] session created id={self._session_id!r}",
@@ -4666,7 +4602,7 @@ async def _cmd_help(
     # newly registered command is never silently hidden from /help.
     groups: list[tuple[str, list[str]]] = [
         ("Chat", ["/new", "/clear", "/switch", "/fork", "/history", "/cancel"]),
-        ("Context", ["/compact", "/context", "/model", "/effort", "/route"]),
+        ("Context", ["/compact", "/context", "/model", "/effort"]),
         ("Display", ["/theme"]),
         ("Diagnostics", ["/logs", "/report"]),
         ("Help", ["/help", "/quit"]),
@@ -4832,73 +4768,6 @@ async def _cmd_effort(
             f"for future responses{suffix}[/{fmt.muted}]"
         )
     )
-
-
-_ROUTE_CLEAR_ALIASES = {"default", "reset"}
-
-
-@_cmd("/route", "Show/set smart routing (server picks the model): /route on|off")
-async def _cmd_route(
-    arg: str,
-    session: Session,
-    client: OmnigentClient,  # noqa: ARG001 — dispatch-contract params
-    host: TerminalHost,
-    fmt: RichBlockFormatter,
-) -> None:
-    """Show or set server-side smart routing for this session.
-
-    ``/route`` shows the current mode; ``/route on`` enables routing (the
-    server picks the model per turn via its configured router — clears any
-    pinned ``/model`` override); ``/route off`` disables it;
-    ``/route default`` clears the override to the agent/spec default.
-    """
-    from rich.text import Text
-
-    value = arg.strip().lower()
-    if not value:
-        current = getattr(session, "cost_control_mode", None)
-        label = "default" if current is None else current
-        host.output(Text.from_markup(f"  [{fmt.muted}]smart routing: {label}[/{fmt.muted}]"))
-        host.output(Text.from_markup(f"  [{fmt.muted}]options: on, off, default[/{fmt.muted}]"))
-        return
-
-    if value in _ROUTE_CLEAR_ALIASES:
-        mode: str | None = None
-    elif value in ("on", "off"):
-        mode = value
-    else:
-        host.output(
-            Text.from_markup(
-                f"  [bold red]Invalid route mode: {value} · expected on, off, or default[/]"
-            )
-        )
-        return
-
-    setter = getattr(session, "set_cost_control_mode", None)
-    if setter is None:
-        host.output(
-            Text.from_markup(
-                f"  [{fmt.muted}]/route is not supported on this session[/{fmt.muted}]"
-            )
-        )
-        return
-    result = setter(mode)
-    if inspect.isawaitable(result):
-        await result
-
-    if mode is None:
-        host.output(
-            Text.from_markup(f"  [{fmt.muted}]smart routing reset to default[/{fmt.muted}]")
-        )
-    elif mode == "on":
-        host.output(
-            Text.from_markup(
-                f"  [{fmt.muted}]smart routing on — the server will pick the model "
-                f"(pinned /model cleared)[/{fmt.muted}]"
-            )
-        )
-    else:
-        host.output(Text.from_markup(f"  [{fmt.muted}]smart routing off[/{fmt.muted}]"))
 
 
 _MODEL_CLEAR_ALIASES = {"default", "off", "reset"}
