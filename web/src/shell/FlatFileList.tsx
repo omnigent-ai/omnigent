@@ -3,7 +3,7 @@ import { RunnerOfflineError, type WorkspaceChangedFile } from "@/hooks/useWorksp
 import { RunnerAsleepHint } from "./RunnerAsleepHint";
 import { cn } from "@/lib/utils";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { formatBytes, gitStatusLabel, gitStatusLetter } from "./fileStatusUtils";
+import { gitStatusLabel, gitStatusLetter } from "./fileStatusUtils";
 import { FileDownloadButton } from "./FileDownloadButton";
 import { useCursorTooltip } from "./useCursorTooltip";
 
@@ -73,27 +73,60 @@ function FileListItem({
   conversationId: string | undefined;
 }) {
   const { handlers, tooltip } = useCursorTooltip(file.path);
+  const slash = file.path.lastIndexOf("/");
+  const dir = slash > 0 ? file.path.slice(0, slash) : "";
+  const hasDownload = !isDeleted && Boolean(conversationId);
 
   return (
     <li>
       <div
         className={cn(
-          "group flex w-full min-w-0 items-center gap-1.5 rounded-md px-2 py-1",
+          "group flex w-full min-w-0 items-center gap-2 rounded-md px-2 py-1",
           isDeleted ? "opacity-50" : "hover:bg-muted",
         )}
       >
         <button
           type="button"
           className={cn(
-            "flex min-w-0 flex-1 items-center gap-1.5 text-left",
+            "flex min-w-0 flex-1 items-baseline gap-1.5 text-left",
             isDeleted ? "cursor-default" : "cursor-pointer",
           )}
           onClick={() => !isDeleted && onFileSelect(file.path)}
           disabled={isDeleted}
         >
+          <FileIcon className="size-3.5 shrink-0 self-center text-muted-foreground" />
+          <span
+            className={cn("truncate font-mono text-sm md:text-xs", isDeleted && "line-through")}
+            {...handlers}
+          >
+            {file.name}
+          </span>
+          {dir && <span className="truncate text-muted-foreground text-[11px]">{dir}</span>}
+        </button>
+        {((file.lines_added ?? 0) !== 0 || (file.lines_removed ?? 0) !== 0) && (
+          <span
+            className="shrink-0 font-mono text-[10px]"
+            aria-label={[
+              file.lines_added !== null && `${file.lines_added} lines added`,
+              file.lines_removed !== null && `${file.lines_removed} removed`,
+            ]
+              .filter(Boolean)
+              .join(", ")}
+          >
+            {file.lines_added !== null && (
+              <span className="text-green-600 dark:text-green-400">+{file.lines_added}</span>
+            )}
+            {file.lines_added !== null && file.lines_removed !== null && " "}
+            {file.lines_removed !== null && (
+              <span className="text-destructive">&minus;{file.lines_removed}</span>
+            )}
+          </span>
+        )}
+        <span className="relative flex shrink-0 items-center justify-center">
           <span
             className={cn(
-              "shrink-0 rounded px-1 py-0.5 font-mono text-[10px]",
+              "rounded px-1 py-0.5 font-mono text-[10px]",
+              hasDownload && "group-hover:invisible",
               isDeleted
                 ? "bg-destructive/10 text-destructive"
                 : file.status === "created"
@@ -104,32 +137,12 @@ function FileListItem({
           >
             {gitStatusLetter(file.status)}
           </span>
-          <FileIcon className="size-3.5 shrink-0 text-muted-foreground" />
-          <span
-            className={cn(
-              "min-w-0 flex-1 truncate text-left font-mono text-sm md:text-xs [direction:rtl]",
-              isDeleted && "line-through",
-            )}
-            {...handlers}
-          >
-            <bdi>{file.path}</bdi>
-          </span>
-        </button>
-        {file.bytes !== null && !isDeleted ? (
-          <div className="relative shrink-0 flex items-center">
-            <span className="text-muted-foreground text-[10px] group-hover:invisible">
-              {formatBytes(file.bytes)}
+          {hasDownload && conversationId && (
+            <span className="absolute inset-0 flex items-center justify-center">
+              <FileDownloadButton conversationId={conversationId} path={file.path} />
             </span>
-            {conversationId && (
-              <span className="absolute inset-0 flex items-center justify-center">
-                <FileDownloadButton conversationId={conversationId} path={file.path} />
-              </span>
-            )}
-          </div>
-        ) : (
-          !isDeleted &&
-          conversationId && <FileDownloadButton conversationId={conversationId} path={file.path} />
-        )}
+          )}
+        </span>
       </div>
       {tooltip}
     </li>

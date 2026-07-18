@@ -38,6 +38,7 @@ from omnigent.cli import (
     _is_run_shorthand,
     _load_global_config,
     _manage_goose_harness,
+    _manage_hermes_harness,
     _manage_kimi_harness,
     _manage_qwen_harness,
     _materialize_harness_launcher_file,
@@ -5324,6 +5325,48 @@ def test_manage_qwen_harness_back_does_not_launch(
     _manage_qwen_harness()
 
     launch.assert_not_called()
+
+
+# ── omnigent setup: Hermes drill-in (_manage_hermes_harness) ─────────────
+
+
+def test_manage_hermes_harness_installs_then_opens_config_menu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Accepting the Hermes install offer continues directly to configuration."""
+    import omnigent.onboarding.harness_install as hi
+    import omnigent.onboarding.interactive as it
+
+    monkeypatch.setattr(hi, "harness_cli_installed", lambda key: False)
+    install = Mock(return_value=True)
+    monkeypatch.setattr(hi, "install_harness_cli", install)
+    monkeypatch.setattr(it, "console", Mock())
+    select = Mock(side_effect=[0, 1])
+    monkeypatch.setattr(it, "select", select)
+
+    _manage_hermes_harness()
+
+    install.assert_called_once_with(hi.HERMES_KEY)
+    assert "Install it now?" in select.call_args_list[0].args[0]
+    assert select.call_args_list[1].args[0] == "Hermes Agent"
+
+
+def test_manage_hermes_harness_declines_install(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Declining the Hermes install offer returns without running the script."""
+    import omnigent.onboarding.harness_install as hi
+    import omnigent.onboarding.interactive as it
+
+    monkeypatch.setattr(hi, "harness_cli_installed", lambda key: False)
+    install = Mock()
+    monkeypatch.setattr(hi, "install_harness_cli", install)
+    monkeypatch.setattr(it, "console", Mock())
+    monkeypatch.setattr(it, "select", lambda *args, **kwargs: 1)
+
+    _manage_hermes_harness()
+
+    install.assert_not_called()
 
 
 # ── omnigent setup: Goose drill-in (_manage_goose_harness) ───────────────

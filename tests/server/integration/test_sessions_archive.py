@@ -21,6 +21,9 @@ import httpx
 import pytest
 
 from omnigent.server.routes import sessions as sessions_module
+from omnigent.stores.conversation_store.sqlalchemy_store import (
+    SqlAlchemyConversationStore,
+)
 from tests.server.helpers import create_test_session
 
 pytestmark = pytest.mark.asyncio
@@ -123,6 +126,48 @@ async def test_archive_running_session_attempts_stop(
         mock_stop.assert_awaited_once()
     finally:
         sessions_module._session_status_cache.pop(session_id, None)
+
+
+async def test_archive_idle_parent_stops_running_child(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """Archiving an idle parent with a running child stops the child.
+
+    Regression test: ``_best_effort_stop`` previously used the child
+    rollup only to decide whether to act, then always issued the stop
+    against the parent's own session id. A parent that has already gone
+    idle while its sub-agent child keeps running would get a no-op stop,
+    leaving the child orphaned once the parent (and its DB row, via the
+    cascading subtree delete/archive) is gone.
+    """
+    session = await create_test_session(client, name="archive-idle-parent-child")
+    session_id = session["id"]
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    child = conv_store.create_conversation(
+        kind="sub_agent",
+        title="researcher:auth",
+        parent_conversation_id=session_id,
+        agent_id=session["agent_id"],
+    )
+
+    mock_stop = AsyncMock(return_value=True)
+    sessions_module._session_status_cache[child.id] = "running"
+    try:
+        with patch.object(sessions_module, "_stop_session_via_runner", mock_stop):
+            resp = await client.patch(
+                f"/v1/sessions/{session_id}",
+                json={"archived": True},
+            )
+        assert resp.status_code == 200
+        assert resp.json()["archived"] is True
+        # The child must be the one stopped, not the (idle) parent.
+        mock_stop.assert_awaited_once()
+        assert mock_stop.await_args is not None
+        assert mock_stop.await_args.args[0] == child.id
+    finally:
+        sessions_module._session_status_cache.pop(child.id, None)
 
 
 async def test_archive_proceeds_when_stop_fails(

@@ -29,6 +29,8 @@ on:
   workflow_run:
     workflows: [PR Template, CI, Lint, Docker build, E2E UI Tests, E2E Tests, Integration Tests]
     types: [completed]
+  check_run:
+    types: [completed]
   issue_comment:
     types: [created]
   # Programmatic / manual re-evaluation of a single PR.
@@ -48,7 +50,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: merge-ready-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr || github.event.workflow_run.head_sha }}
+  group: merge-ready-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr || github.event.workflow_run.head_sha || github.event.check_run.head_sha }}
   cancel-in-progress: true
 
 jobs:
@@ -61,8 +63,9 @@ jobs:
       actions: read         # evaluate-checks.sh reads GET /actions/runs to classify missing checks
       statuses: write
     # Fire on automerge label adds, PR CI workflow_run completions (same-repo
-    # and fork), `/merge` comments, or a workflow_dispatch re-eval. Runs with no
-    # open PR (push to main, etc.) are dropped by the ctx step.
+    # and fork), DCO check_run completions, `/merge` comments, or a
+    # workflow_dispatch re-eval. Runs with no open PR (push to main, etc.) are
+    # dropped by the ctx step.
     if: >-
       (
         github.event_name == 'pull_request_target' &&
@@ -71,6 +74,11 @@ jobs:
       (
         github.event_name == 'workflow_run' &&
         github.event.workflow_run.event == 'pull_request'
+      ) ||
+      (
+        github.event_name == 'check_run' &&
+        github.event.check_run.name == 'DCO' &&
+        github.event.check_run.app.slug == 'dco'
       ) ||
       github.event_name == 'workflow_dispatch' ||
       (
@@ -102,6 +110,7 @@ jobs:
           # Via env, not interpolated: author-controlled, so direct
           # interpolation would be a shell-injection vector.
           WF_PRS: ${{ toJSON(github.event.workflow_run.pull_requests) }}
+          CHECK_RUN_SHA: ${{ github.event.check_run.head_sha }}
           COMMENT_BODY: ${{ github.event.comment.body }}
           PR_INPUT: ${{ inputs.pr }}
           SHA_INPUT: ${{ inputs.sha }}
@@ -142,6 +151,14 @@ jobs:
             fi
             PR="${{ github.event.issue.number }}"
             SHA=$(gh pr view "$PR" --repo "$REPO" --json headRefOid --jq '.headRefOid')
+          elif [[ "${{ github.event_name }}" == "check_run" ]]; then
+            SHA="$CHECK_RUN_SHA"
+            PR=$(resolve_pr_from_sha "$SHA")
+            if [[ -z "$PR" ]]; then
+              echo "::notice::Skipped: DCO check_run has no associated open PR"
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
           else
             PR=$(echo "$WF_PRS" | jq -r '.[0].number // empty')
             SHA="${{ github.event.workflow_run.head_sha }}"

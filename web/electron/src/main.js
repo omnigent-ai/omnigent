@@ -132,106 +132,6 @@ const GRANTED_PERMISSIONS = new Set([
 const LNA_PERMISSIONS = new Set(["local-network-access", "loopback-network"]);
 
 /**
- * Keychain access group for the WebAuthn Touch ID platform authenticator
- * (`app.configureWebAuthn`), in the form ``"<TEAM_ID>.ai.omnigent.desktop"``.
- *
- * null disables the platform authenticator: the value only works in a
- * code-signed build whose `keychain-access-groups` entitlement
- * (signing/entitlements.mac.plist) lists the SAME string, so there is no
- * meaningful default — set both places together when configuring signing.
- * External security keys (e.g. YubiKey) work regardless of this setting.
- *
- * Three pieces must agree: this constant, the `keychain-access-groups`
- * entitlement, AND the embedded Developer ID provisioning profile
- * authorizing the group — without the profile, AMFI SIGKILLs the signed
- * app at launch. Details in signing/entitlements.mac.plist.
- * @type {string | null}
- */
-const WEBAUTHN_KEYCHAIN_ACCESS_GROUP = "8RMX4WU6F8.ai.omnigent.desktop";
-
-/**
- * Enable the macOS WebAuthn platform authenticator so passkey
- * registration/sign-in shows the native Touch ID / keychain dialog instead
- * of completing invisibly. Two pieces:
- *
- *   1. `app.configureWebAuthn` (Electron ≥ 42, macOS-only) turns on the
- *      Secure-Enclave-backed authenticator. Until it's called,
- *      `PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable()`
- *      resolves false in the page and sites offer only external keys.
- *   2. The `select-webauthn-account` session event fires when a
- *      `navigator.credentials.get()` matches several discoverable
- *      credentials; we show a native chooser and answer with the picked
- *      `credentialId` (answering with nothing cancels the request).
- *
- * No-ops (with a console note) when the access group isn't configured,
- * off macOS, or on an Electron without the API — external security keys
- * keep working through Chromium's built-in CTAP path in all cases.
- * Credentials are device-bound (Secure Enclave), not synced to iCloud
- * Keychain, and invisible to Safari/Chrome — and vice versa.
- */
-function registerWebAuthn() {
-  if (process.platform !== "darwin") return;
-  if (typeof app.configureWebAuthn !== "function") {
-    console.log("[omnigent] webauthn: Electron too old for configureWebAuthn; skipping");
-    return;
-  }
-  if (WEBAUTHN_KEYCHAIN_ACCESS_GROUP === null) {
-    console.log(
-      "[omnigent] webauthn: WEBAUTHN_KEYCHAIN_ACCESS_GROUP not set; " +
-        "platform passkeys (Touch ID dialog) disabled — security keys still work",
-    );
-    return;
-  }
-  // Dev runs (`electron .`) use the unsigned prebuilt Electron binary, which
-  // has no keychain-access-groups entitlement: configuring the authenticator
-  // there doesn't fail at this call, but breaks every later ceremony with an
-  // opaque NotAllowedError ("operation timed out or was not allowed"). Skip
-  // cleanly so dev keeps the silent security-key path.
-  if (!app.isPackaged) {
-    console.log(
-      "[omnigent] webauthn: dev run (unsigned, no keychain entitlement); " +
-        "platform passkeys disabled — security keys still work",
-    );
-    return;
-  }
-  app.configureWebAuthn({
-    touchID: {
-      keychainAccessGroup: WEBAUTHN_KEYCHAIN_ACCESS_GROUP,
-      // Rendered by macOS as "<app name> is trying to <promptReason>".
-      promptReason: "sign in with your passkey",
-    },
-  });
-
-  session.defaultSession.on("select-webauthn-account", (_event, details, callback) => {
-    const accounts = details.accounts ?? [];
-    const win = activeWindow();
-    if (!win || accounts.length === 0) {
-      callback(); // no UI to ask with / nothing to pick → cancel the request
-      return;
-    }
-    // Label each account by whatever name fields the credential carries;
-    // the index-based fallback is display-only (the answer is always the
-    // credentialId, never the label).
-    const labels = accounts.map((a, i) => a.userName || a.userDisplayName || `Account ${i + 1}`);
-    void dialog
-      .showMessageBox(win, {
-        type: "question",
-        message: `Choose a passkey for ${details.relyingPartyId}`,
-        buttons: [...labels, "Cancel"],
-        cancelId: labels.length,
-      })
-      .then(({ response }) => {
-        if (response >= 0 && response < accounts.length) {
-          callback(accounts[response].credentialId);
-        } else {
-          callback(); // Cancel
-        }
-      })
-      .catch(() => callback()); // dialog failure must still answer → cancel
-  });
-}
-
-/**
  * Origin of a webContents' top-level (main-frame) page, or null when the
  * webContents is absent or already destroyed. Electron passes a null
  * webContents to the permission-check handler for some permission types —
@@ -2830,7 +2730,6 @@ if (!gotLock) {
     registerPermissions();
     registerLocalhostAccess();
     registerSessionExpiryAccess();
-    registerWebAuthn();
     registerIpc();
     buildMenu();
     // Patch PATH for GUI-launched Electron on macOS/Linux:

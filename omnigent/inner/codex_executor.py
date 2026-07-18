@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, TypeAlias
 
+from omnigent._platform import resolve_cli_binary
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.reasoning_effort import CODEX_EFFORTS, validate_effort
 from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
@@ -280,8 +281,15 @@ def _kill_process_tree(process: _Process | None) -> None:
     _proc.kill_tree(process)
 
 
+# Env override for an explicit codex binary, mirroring goose's
+# OMNIGENT_GOOSE_PATH. Set this when codex lives on a PATH the host
+# daemon doesn't inherit (e.g. an nvm-managed global bin dir).
+_CODEX_PATH_ENV = "OMNIGENT_CODEX_PATH"
+
+
 def _find_codex_cli() -> str | None:
-    return shutil.which("codex")
+    """Resolve the ``codex`` CLI binary (override → ``PATH`` → global dirs)."""
+    return resolve_cli_binary("codex", env_var=_CODEX_PATH_ENV)
 
 
 async def _codex_cli_version(codex_path: str) -> tuple[int, int, int] | None:
@@ -2139,7 +2147,11 @@ class CodexExecutor(Executor):
         self._skills_filter = skills_filter
         resolved_codex = codex_path or _find_codex_cli()
         if not resolved_codex:
-            raise ImportError("CodexExecutor requires the 'codex' CLI on PATH.")
+            raise ImportError(
+                "CodexExecutor requires the 'codex' CLI on PATH. If codex is "
+                "installed on a PATH the host daemon didn't inherit (e.g. an "
+                f"nvm-managed bin dir), set {_CODEX_PATH_ENV}=/path/to/codex."
+            )
         self._codex_path = resolved_codex
         self._env = _clean_codex_env(_declared_passthrough(self._os_env_spec))
         # Retry policy → OpenAI SDK env vars (Codex uses the OpenAI

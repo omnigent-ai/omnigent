@@ -2819,6 +2819,24 @@ def test_declared_passthrough_reads_sandbox_env_passthrough():
     assert _declared_passthrough(OSEnvSpec(sandbox=OSEnvSandboxSpec(type="none"))) == ()
 
 
+def test_find_codex_cli_delegates_to_shared_resolver(monkeypatch):
+    """``_find_codex_cli`` resolves codex via the shared resolver with the
+    OMNIGENT_CODEX_PATH override. (The resolver's own PATH/override/fallback
+    behavior is covered in tests/inner/test_proc_and_platform.py.)"""
+    from omnigent.inner import codex_executor as ce
+
+    captured = {}
+
+    def fake_resolve(name, *, env_var=None):
+        captured["name"] = name
+        captured["env_var"] = env_var
+        return "/opt/homebrew/bin/codex"
+
+    monkeypatch.setattr(ce, "resolve_cli_binary", fake_resolve)
+    assert ce._find_codex_cli() == "/opt/homebrew/bin/codex"
+    assert captured == {"name": "codex", "env_var": "OMNIGENT_CODEX_PATH"}
+
+
 class TestCodexAppServerSessionReadOnlyCwd(unittest.TestCase):
     """Regression tests for .codex-tmp fallback on read-only cwd."""
 

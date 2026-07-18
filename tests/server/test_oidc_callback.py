@@ -44,7 +44,10 @@ _ISSUER = "https://accounts.google.com"
 _CLIENT_ID = "cid"
 
 
-def _oidc_config(skip_email_verification: bool = False) -> OIDCConfig:
+def _oidc_config(
+    skip_email_verification: bool = False,
+    email_claim: str = "email",
+) -> OIDCConfig:
     """Build a generic-OIDC config over plain HTTP (so TestClient cookies stick).
 
     ``allowed_domains=None`` means admit-all, so the test isolates the
@@ -52,6 +55,8 @@ def _oidc_config(skip_email_verification: bool = False) -> OIDCConfig:
 
     :param skip_email_verification: Waive the ``email_verified`` gate,
         as ``OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION`` would.
+    :param email_claim: Claim carrying the email identity, as
+        ``OMNIGENT_OIDC_EMAIL_CLAIM`` would set it.
     """
     return OIDCConfig(
         issuer=_ISSUER,
@@ -70,6 +75,7 @@ def _oidc_config(skip_email_verification: bool = False) -> OIDCConfig:
         userinfo_endpoint=None,
         allow_invites=False,
         skip_email_verification=skip_email_verification,
+        email_claim=email_claim,
     )
 
 
@@ -124,15 +130,20 @@ def callback_client(
     ``post`` — exposed on ``app.state.pending_id_token`` so ``_do_callback``
     can set the signed token the IdP should return.
 
-    Indirect parametrization (``request.param``, default ``False``) sets
-    the config's ``skip_email_verification`` flag.
+    Indirect parametrization (``request.param``, default ``False``)
+    sets the config's ``skip_email_verification`` flag; a dict param is
+    passed to :func:`_oidc_config` as keyword arguments instead.
     """
     keys = _IdpKeys()
     perm_store = SqlAlchemyPermissionStore(db_uri)
     admins = tmp_path / "admins"
     admins.write_text("")
 
-    config = _oidc_config(skip_email_verification=getattr(request, "param", False))
+    param = getattr(request, "param", False)
+    if isinstance(param, dict):
+        config = _oidc_config(**param)
+    else:
+        config = _oidc_config(skip_email_verification=param)
     provider = UnifiedAuthProvider(source="oidc", oidc_config=config)
 
     # The signed id_token the mocked token endpoint will return. Each
@@ -292,6 +303,127 @@ def test_callback_skip_verification_flag_admits_unverified(
     assert session_cookie is not None
     decoded = jwt.decode(session_cookie, _TEST_SECRET, algorithms=["HS256"])
     assert decoded["sub"] == "carol@example.com"
+
+
+@pytest.mark.parametrize(
+    "callback_client",
+    [{"email_claim": "preferred_username", "skip_email_verification": True}],
+    indirect=True,
+)
+def test_callback_custom_email_claim_admits_upn(
+    callback_client: tuple[TestClient, _IdpKeys],
+) -> None:
+    """``email_claim`` reads the identity from an alternate claim.
+
+    Models Microsoft Entra ID id_tokens that carry only
+    ``preferred_username`` (the UPN) and no ``email`` claim: with the
+    claim configured via ``OMNIGENT_OIDC_EMAIL_CLAIM`` and the
+    verification opt-out set (a custom claim has no ``email_verified``
+    marker), the UPN mints the session. Before the fix this token was
+    rejected outright. Surrounding whitespace is removed before the
+    identity is normalized.
+    """
+    client, keys = callback_client
+    token = keys.sign_id_token({"preferred_username": " Dana@Example.com "})
+
+    resp = _do_callback(client, token)
+
+    assert resp.status_code == 302, resp.text
+    session_cookie = resp.cookies.get("ap_session")
+    assert session_cookie is not None
+    decoded = jwt.decode(session_cookie, _TEST_SECRET, algorithms=["HS256"])
+    # The UPN flowed into the session sub, normalized like an email.
+    assert decoded["sub"] == "dana@example.com"
+
+
+@pytest.mark.parametrize(
+    "callback_client",
+    [{"email_claim": "preferred_username", "skip_email_verification": True}],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "claim_value",
+    [
+        pytest.param(["dana@example.com"], id="list"),
+        pytest.param({"value": "dana@example.com"}, id="object"),
+        pytest.param("   ", id="blank"),
+    ],
+)
+def test_callback_custom_email_claim_rejects_invalid_value(
+    callback_client: tuple[TestClient, _IdpKeys],
+    claim_value: object,
+) -> None:
+    """A malformed configured identity claim is rejected cleanly."""
+    client, keys = callback_client
+    token = keys.sign_id_token({"preferred_username": claim_value})
+
+    resp = _do_callback(client, token)
+
+    assert resp.status_code == 400, resp.text
+    assert resp.cookies.get("ap_session") is None
+
+
+@pytest.mark.parametrize(
+    "callback_client",
+    [{"email_claim": "preferred_username"}],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "claims",
+    [
+        pytest.param({"preferred_username": "dana@example.com"}, id="no-verified-marker"),
+        pytest.param(
+            {
+                "preferred_username": "dana@example.com",
+                "email": "attacker@evil.example",
+                "email_verified": True,
+            },
+            id="verified-refers-to-a-different-claim",
+        ),
+    ],
+)
+def test_callback_custom_email_claim_still_requires_verification_optout(
+    callback_client: tuple[TestClient, _IdpKeys],
+    claims: dict[str, object],
+) -> None:
+    """A custom claim always requires the verification opt-out.
+
+    ``email_verified`` refers to the ``email`` claim, so it vouches
+    nothing about a custom identity claim — a token carrying
+    ``email_verified: true`` for a *different* address must not smuggle
+    the custom claim past the gate. Without
+    ``OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION`` both shapes are rejected.
+    """
+    client, keys = callback_client
+    token = keys.sign_id_token(claims)
+
+    resp = _do_callback(client, token)
+
+    assert resp.status_code == 400, resp.text
+    assert resp.cookies.get("ap_session") is None
+
+
+@pytest.mark.parametrize(
+    "callback_client",
+    [{"email_claim": "preferred_username", "skip_email_verification": True}],
+    indirect=True,
+)
+def test_callback_custom_email_claim_absent_rejected(
+    callback_client: tuple[TestClient, _IdpKeys],
+) -> None:
+    """When the configured claim is absent, the login is rejected.
+
+    A verified ``email`` claim is not a silent fallback: the operator
+    configured ``preferred_username`` as the identity claim, so a token
+    without it must not mint a session from a different claim.
+    """
+    client, keys = callback_client
+    token = keys.sign_id_token({"email": "dana@example.com", "email_verified": True})
+
+    resp = _do_callback(client, token)
+
+    assert resp.status_code == 400, resp.text
+    assert resp.cookies.get("ap_session") is None
 
 
 @pytest.mark.parametrize("verified_value", [True, "true", "True", "TRUE"])

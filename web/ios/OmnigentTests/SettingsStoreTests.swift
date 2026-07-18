@@ -39,4 +39,24 @@ final class SettingsStoreTests: XCTestCase {
     XCTAssertTrue(store.isProtocolAllowed("vscode", from: "https://one.example.com"))
     XCTAssertFalse(store.isProtocolAllowed("vscode", from: "https://two.example.com"))
   }
+
+  func testKnownServerURLMatchesByOrigin() {
+    // A recorded server URL carries the workspace mount (/ml/omnigents); a deep
+    // link matches by ORIGIN and reuses that recorded URL so the mount is
+    // already present — no probe needed.
+    let store = SettingsStore(defaults: defaults)
+    store.rememberRecentServer(
+      URL(string: "https://my-workspace.cloud.databricks.com/ml/omnigents")!)
+
+    let known = store.knownServerURL(forOrigin: "https://my-workspace.cloud.databricks.com")
+    XCTAssertEqual(
+      known?.absoluteString, "https://my-workspace.cloud.databricks.com/ml/omnigents")
+  }
+
+  func testKnownServerURLReturnsNilForNeverConnectedOrigin() {
+    let store = SettingsStore(defaults: defaults)
+    store.rememberRecentServer(URL(string: "https://other.example.com")!)
+
+    XCTAssertNil(store.knownServerURL(forOrigin: "https://never-seen.example.com"))
+  }
 }

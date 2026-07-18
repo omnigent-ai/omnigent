@@ -30,6 +30,8 @@ from omnigent.host.frames import (
     HostCreateDirResultFrame,
     HostCreateWorktreeFrame,
     HostCreateWorktreeResultFrame,
+    HostFsRequestFrame,
+    HostFsResultFrame,
     HostHelloFrame,
     HostLaunchRunnerFrame,
     HostLaunchRunnerResultFrame,
@@ -41,6 +43,8 @@ from omnigent.host.frames import (
     HostRemoveWorktreeFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
+    HostRunnerStatusFrame,
+    HostRunnerStatusResultFrame,
     HostStatFrame,
     HostStatResultFrame,
     HostStopRunnerFrame,
@@ -1189,6 +1193,37 @@ class HostProcess:
             status="stopped",
         )
 
+    def _handle_runner_status(
+        self,
+        frame: HostRunnerStatusFrame,
+    ) -> HostRunnerStatusResultFrame:
+        """Answer whether a runner's process is alive, dead, or unknown.
+
+        The host is the authoritative owner of runner liveness: it holds
+        the runner's :class:`subprocess.Popen`. A runner tracked with a
+        still-running process is ``alive`` (covers a runner that is still
+        booting — it is inserted at ``Popen`` time, before its tunnel
+        connects — so the server waits for it). A tracked-but-exited
+        process is ``dead``. A runner this host has no record of is
+        ``unknown`` — it was stopped (``_handle_stop`` popped it) or a
+        fresh post-restart host never spawned it; either way it will never
+        connect, so the server relaunches without waiting.
+
+        :param frame: The status query frame.
+        :returns: Result frame with ``alive`` / ``dead`` / ``unknown``.
+        """
+        handle = self._runners.get(frame.runner_id)
+        if handle is None:
+            status = "unknown"
+        elif handle.proc.poll() is None:
+            status = "alive"
+        else:
+            status = "dead"
+        return HostRunnerStatusResultFrame(
+            request_id=frame.request_id,
+            status=status,
+        )
+
     async def _watch_runner(self, runner_id: str) -> None:
         """Watch a spawned runner and report an unexpected exit.
 
@@ -1484,6 +1519,120 @@ class HostProcess:
             status="ok",
             path=created,
         )
+
+    def _handle_fs_request(self, frame: HostFsRequestFrame) -> HostFsResultFrame:
+        """Serve a read-only workspace filesystem request from the host.
+
+        Runs :class:`omnigent.workspace_fs.WorkspaceReader` against the
+        session's workspace so the web UI's file panel keeps working when
+        the runner is offline but the host still holds the workspace on
+        disk. Read-only and confined to the workspace root; never writes
+        or runs a shell. Called inside a worker thread by the dispatcher
+        because git / directory-walk work can block.
+
+        :param frame: The fs request frame (op + workspace + params).
+        :returns: A result frame with the runner-shaped payload, or an
+            error frame mirroring the status the runner would return.
+        """
+        from pathlib import Path
+
+        from omnigent.workspace_fs import WorkspaceReader, WorkspaceReaderError
+
+        try:
+            expanded = os.path.expanduser(frame.workspace)
+        except (TypeError, ValueError) as exc:
+            return HostFsResultFrame(
+                request_id=frame.request_id,
+                status="error",
+                error_status=400,
+                error_code="invalid_workspace",
+                error=f"workspace path expansion failed: {exc}",
+            )
+        if not os.path.isdir(expanded):
+            return HostFsResultFrame(
+                request_id=frame.request_id,
+                status="error",
+                error_status=404,
+                error_code="not_found",
+                error="workspace directory does not exist on host",
+            )
+
+        reader = WorkspaceReader(Path(expanded))
+        params = frame.params or {}
+        try:
+            payload = self._dispatch_fs_op(reader, frame.op, frame.session_id, params)
+        except WorkspaceReaderError as exc:
+            return HostFsResultFrame(
+                request_id=frame.request_id,
+                status="error",
+                error_status=exc.status,
+                error_code=exc.code,
+                error=exc.message,
+            )
+        except ValueError as exc:
+            return HostFsResultFrame(
+                request_id=frame.request_id,
+                status="error",
+                error_status=400,
+                error_code="invalid_request",
+                error=str(exc),
+            )
+        except Exception as exc:
+            _logger.exception("host fs_request op %r failed", frame.op)
+            return HostFsResultFrame(
+                request_id=frame.request_id,
+                status="error",
+                error_status=500,
+                error_code="fs_read_failed",
+                error=str(exc),
+            )
+        return HostFsResultFrame(
+            request_id=frame.request_id,
+            status="ok",
+            payload=payload,
+        )
+
+    @staticmethod
+    def _dispatch_fs_op(
+        reader: object,
+        op: str,
+        session_id: str,
+        params: dict[str, object],
+    ) -> dict[str, object]:
+        """Route an fs op to the matching :class:`WorkspaceReader` method.
+
+        :param reader: The workspace reader bound to the workspace root.
+        :param op: Operation name from the request frame.
+        :param session_id: Session id forwarded to change-registry ops.
+        :param params: Operation-specific arguments.
+        :returns: The runner-shaped result dict.
+        :raises ValueError: On an unknown op.
+        """
+        from typing import cast
+
+        from omnigent.workspace_fs import WorkspaceReader
+
+        r = cast("WorkspaceReader", reader)
+        if op == "list_or_read":
+            return r.list_or_read(
+                str(params.get("path", "")),
+                limit=int(params.get("limit", 20)),
+                after=cast("str | None", params.get("after")),
+                before=cast("str | None", params.get("before")),
+                order=str(params.get("order", "desc")),
+            )
+        if op == "changes":
+            return r.changes(session_id)
+        if op == "diff":
+            return r.diff(session_id, str(params.get("path", "")))
+        if op == "search":
+            return r.search(
+                str(params.get("q", "")),
+                include=cast("str | None", params.get("include")),
+                exclude=cast("str | None", params.get("exclude")),
+                limit=int(params.get("limit", 500)),
+            )
+        raise ValueError(f"unknown fs op: {op!r}")
 
     async def _handle_create_worktree(
         self,
@@ -1952,6 +2101,8 @@ class HostProcess:
             await ws.send(encode_host_frame(await self._handle_launch(frame)))
         elif isinstance(frame, HostStopRunnerFrame):
             await ws.send(encode_host_frame(self._handle_stop(frame)))
+        elif isinstance(frame, HostRunnerStatusFrame):
+            await ws.send(encode_host_frame(self._handle_runner_status(frame)))
         elif isinstance(frame, HostStatFrame):
             await ws.send(encode_host_frame(self._handle_stat(frame)))
         elif isinstance(frame, HostListDirFrame):
@@ -1964,6 +2115,11 @@ class HostProcess:
             await ws.send(encode_host_frame(await self._handle_remove_worktree(frame)))
         elif isinstance(frame, HostListWorktreesFrame):
             await ws.send(encode_host_frame(await self._handle_list_worktrees(frame)))
+        elif isinstance(frame, HostFsRequestFrame):
+            # Git status and directory walks can block, so run the read
+            # off the event loop and reply when it completes.
+            result = await asyncio.to_thread(self._handle_fs_request, frame)
+            await ws.send(encode_host_frame(result))
 
 
 def run_host_process(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -106,6 +107,19 @@ def test_kiro_install_spec_is_manual_installer_no_npm() -> None:
     assert spec.binary == "kiro-cli"
     assert spec.package is None
     assert spec.install_hint == "curl -fsSL https://cli.kiro.dev/install | bash"
+
+
+def test_hermes_install_spec_has_actionable_vendor_installer() -> None:
+    """Hermes' trusted vendor installer can be launched from the setup menu."""
+    spec = hi.harness_install_spec(hi.HERMES_KEY)
+    assert spec is not None
+    assert spec.package is None
+    assert spec.install_hint is not None
+    assert hi.harness_install_command(hi.HERMES_KEY) == [
+        "bash",
+        "-c",
+        spec.install_hint,
+    ]
 
 
 def test_antigravity_install_spec_status_only_no_npm() -> None:
@@ -340,6 +354,65 @@ def test_install_harness_cli_runs_npm_then_rechecks(monkeypatch: pytest.MonkeyPa
 
     assert hi.install_harness_cli(OPENAI_FAMILY) is True
     assert calls == [["npm", "install", "-g", "@openai/codex"]]
+
+
+def test_install_harness_cli_runs_hermes_installer_then_rechecks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Hermes installer is interactive-menu actionable and PATH-verified."""
+    calls: list[list[str]] = []
+    state = {"installed": False}
+
+    def _which(name: str) -> str | None:
+        if name == "bash":
+            return "/bin/bash"
+        if name == "hermes" and state["installed"]:
+            return "/usr/local/bin/hermes"
+        return None
+
+    def _run(argv: list[str], *, check: bool = False, timeout: float | None = None):
+        calls.append(argv)
+        state["installed"] = True
+        return subprocess.CompletedProcess(args=argv, returncode=0)
+
+    monkeypatch.setattr(hi.shutil, "which", _which)
+    monkeypatch.setattr(hi.subprocess, "run", _run)
+
+    assert hi.install_harness_cli(hi.HERMES_KEY) is True
+    spec = hi.harness_install_spec(hi.HERMES_KEY)
+    assert spec is not None
+    assert spec.install_hint is not None
+    assert calls == [["bash", "-c", spec.install_hint]]
+
+
+def test_install_harness_cli_refreshes_user_local_bin(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A vendor install into ~/.local/bin is usable without restarting setup."""
+    user_bin = tmp_path / ".local" / "bin"
+    user_bin.mkdir(parents=True)
+    hermes = user_bin / "hermes"
+    hermes.write_text("#!/bin/sh\n")
+    hermes.chmod(0o755)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+
+    def _which(name: str) -> str | None:
+        if name == "bash":
+            return "/bin/bash"
+        if name == "hermes" and str(user_bin) in hi.os.environ["PATH"].split(hi.os.pathsep):
+            return str(hermes)
+        return None
+
+    monkeypatch.setattr(hi.shutil, "which", _which)
+    monkeypatch.setattr(
+        hi.subprocess,
+        "run",
+        lambda argv, *, check=False, timeout=None: subprocess.CompletedProcess(argv, 0),
+    )
+
+    assert hi.install_harness_cli(hi.HERMES_KEY) is True
+    assert hi.os.environ["PATH"].split(hi.os.pathsep)[0] == str(user_bin)
 
 
 def test_harness_login_skips_when_already_logged_in(monkeypatch: pytest.MonkeyPatch) -> None:

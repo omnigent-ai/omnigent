@@ -171,6 +171,15 @@ wheels = [
 ]
 
 [[package]]
+name = "aiosqlite"
+version = "0.22.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/4e/8a/64761f4005f17809769d23e518d915db74e6310474e733e3593cfc854ef1/aiosqlite-0.22.1.tar.gz", hash = "sha256:043e0bd78d32888c0a9ca90fc788b38796843360c855a7262a532813133a0650", upload-time = "2025-12-23T19:25:43.997Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/00/b7/e3bf5133d697a08128598c8d0abc5e16377b51465a33756de24fa7dee953/aiosqlite-0.22.1-py3-none-any.whl", hash = "sha256:21c002eb13823fad740196c5a2e9d8e62f6243bd9e7e4a1f87fb5e44ecb4fceb", upload-time = "2025-12-23T19:25:42.139Z" },
+]
+
+[[package]]
 name = "alembic"
 version = "1.18.4"
 source = { registry = "https://pypi.org/simple" }
@@ -2881,6 +2890,7 @@ dependencies = [
     { name = "pydantic" },
     { name = "pyjwt", extra = ["crypto"] },
     { name = "pyte", marker = "sys_platform != 'win32'" },
+    { name = "python-dateutil" },
     { name = "pyyaml" },
     { name = "rich" },
     { name = "sqlalchemy" },
@@ -2975,6 +2985,9 @@ s3 = [
     { name = "boto3" },
     { name = "botocore" },
 ]
+slack = [
+    { name = "omnigent-slack" },
+]
 vertex = [
     { name = "google-auth" },
 ]
@@ -3020,8 +3033,9 @@ requires-dist = [
     { name = "moto", extras = ["s3"], marker = "extra == 'dev'", specifier = ">=5,<6" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.10" },
     { name = "omnigent-client", editable = "sdks/python-client" },
+    { name = "omnigent-slack", marker = "extra == 'slack'", editable = "integrations/slack" },
     { name = "omnigent-ui-sdk", editable = "sdks/ui" },
-    { name = "openai", specifier = ">=1.0,<3" },
+    { name = "openai", specifier = ">=1.0,<2.45" },
     { name = "openai-agents", specifier = ">=0.0.17" },
     { name = "openai-agents", marker = "extra == 'agents-sdk'", specifier = ">=0.1,<1" },
     { name = "openshell", marker = "extra == 'openshell'", specifier = ">=0.0.7,<1" },
@@ -3053,6 +3067,7 @@ requires-dist = [
     { name = "pytest-shard", marker = "extra == 'dev'", specifier = "==0.1.2" },
     { name = "pytest-timeout", marker = "extra == 'dev'", specifier = "==2.4.0" },
     { name = "pytest-xdist", marker = "extra == 'dev'", specifier = ">=3.6" },
+    { name = "python-dateutil", specifier = ">=2.8,<3" },
     { name = "pyyaml", specifier = ">=6.0,<7" },
     { name = "respx", marker = "extra == 'dev'", specifier = ">=0.21,<1" },
     { name = "rich", specifier = ">=14,<15" },
@@ -3067,7 +3082,7 @@ requires-dist = [
     { name = "websockets", specifier = ">=10.4,<15" },
     { name = "zstandard", specifier = ">=0.22,<1" },
 ]
-provides-extras = ["claude-sdk", "openai-agents", "all", "bedrock", "s3", "vertex", "modal", "daytona", "boxlite", "cwsandbox", "e2b", "islo", "openshell", "kubernetes", "tracing", "agents-sdk", "antigravity", "copilot", "cursor", "hindsight", "databricks", "dev"]
+provides-extras = ["claude-sdk", "openai-agents", "all", "bedrock", "s3", "vertex", "modal", "daytona", "boxlite", "cwsandbox", "e2b", "islo", "openshell", "kubernetes", "tracing", "agents-sdk", "antigravity", "copilot", "cursor", "hindsight", "slack", "databricks", "dev"]
 
 [[package]]
 name = "omnigent-client"
@@ -3084,6 +3099,33 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.27" },
     { name = "omnigent", editable = "." },
     { name = "pydantic", specifier = ">=2.0,<3" },
+]
+
+[[package]]
+name = "omnigent-slack"
+version = "0.1.0"
+source = { editable = "integrations/slack" }
+dependencies = [
+    { name = "aiohttp" },
+    { name = "aiosqlite" },
+    { name = "cryptography" },
+    { name = "httpx" },
+    { name = "pydantic-settings" },
+    { name = "python-dotenv" },
+    { name = "slack-bolt" },
+    { name = "slack-sdk" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "aiohttp", specifier = ">=3.12.0" },
+    { name = "aiosqlite", specifier = ">=0.21.0" },
+    { name = "cryptography", specifier = ">=42.0.0" },
+    { name = "httpx", specifier = ">=0.28.0" },
+    { name = "pydantic-settings", specifier = ">=2.10.0" },
+    { name = "python-dotenv", specifier = ">=1.1.0" },
+    { name = "slack-bolt", specifier = ">=1.29.0" },
+    { name = "slack-sdk", specifier = ">=3.43.0" },
 ]
 
 [[package]]
@@ -4888,6 +4930,27 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/c8/9f/46448c4e41a4c5ee4bdb74b3758af48e5ff0faeffe40f4e301bfc7594894/skops-0.14.0.tar.gz", hash = "sha256:6c8c0e047f691a3a582c3258943eecafcbfd79c8c7eef66260f3703e363254f0", upload-time = "2026-04-20T18:23:55.336Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/e7/0e/3ae19fa941522cd98e119762e7181d371c8dba0b2d72bfaf9522692e329c/skops-0.14.0-py3-none-any.whl", hash = "sha256:60a5db78a9db46ccee2139a0ba13ab5afb1c96f4749b382e75a371291bbe3e36", upload-time = "2026-04-20T18:23:54.018Z" },
+]
+
+[[package]]
+name = "slack-bolt"
+version = "1.29.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "slack-sdk" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/3c/2c/7434f5d8c52eafb1e702012e9f291b013bd05985a5b32bde568b2279a28a/slack_bolt-1.29.0.tar.gz", hash = "sha256:b6271ba0a9b71e319c86b40632e6cb6240aacd0433773615b76b890b9a574762", upload-time = "2026-06-30T20:24:44.11Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/2f/cc/e5f78a80a1775a4cbb2cc41e8ef433602d5e755ff0d829bd43145015740a/slack_bolt-1.29.0-py2.py3-none-any.whl", hash = "sha256:1835b66b778158f3af0da77603aa18d7dfd82fd9b9a985e25c752f95050ab826", upload-time = "2026-06-30T20:24:42.558Z" },
+]
+
+[[package]]
+name = "slack-sdk"
+version = "3.43.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/13/75/a4964eb771a0c74d79ee7a3bee6fb5d9718909dd1b675e80d62a6a0ad90a/slack_sdk-3.43.0.tar.gz", hash = "sha256:0553152e46c4259eb69f7464cdadc35ba4802ca10f9f5a849c92cf03d6c2ba07", upload-time = "2026-06-30T18:04:41.59Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e4/55/42141b8338d46323d5b3c6095201b044c670c20f898643b322ea9b1543a1/slack_sdk-3.43.0-py2.py3-none-any.whl", hash = "sha256:4b6557c65577fc172f685af218b811f9f3b4909e24cddd839ada09565f10c585", upload-time = "2026-06-30T18:04:39.636Z" },
 ]
 
 [[package]]

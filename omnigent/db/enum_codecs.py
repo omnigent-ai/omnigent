@@ -64,6 +64,17 @@ COMMENT_STATUS: dict[str, int] = {
     "addressed": 2,
 }
 
+# Last relay-observed turn status persisted on the conversation's metadata
+# row (``omnigent_conversation_metadata.live_status``) so any server replica
+# can serve the sidebar's activity state, not just the pod holding the
+# runner tunnel.
+SESSION_LIVE_STATUS: dict[str, int] = {
+    "idle": 1,
+    "running": 2,
+    "waiting": 3,
+    "failed": 4,
+}
+
 ACCOUNT_TOKEN_KIND: dict[str, int] = {
     "invite": 1,
     "magic": 2,
@@ -72,6 +83,14 @@ ACCOUNT_TOKEN_KIND: dict[str, int] = {
 POLICY_TYPE: dict[str, int] = {
     "python": 1,
     "url": 2,
+}
+
+DEVICE_GRANT_STATUS: dict[str, int] = {
+    "pending": 1,
+    "approved": 2,
+    "denied": 3,
+    "redeemed": 4,
+    "revoked": 5,
 }
 
 HOST_STATUS: dict[str, int] = {
@@ -221,6 +240,16 @@ def decode_comment_status(code: int) -> str:
     return _decode(COMMENT_STATUS, code, field="comments.status")
 
 
+def encode_session_live_status(name: str) -> int:
+    """Encode an ``omnigent_conversation_metadata.live_status`` name to its int code."""
+    return _encode(SESSION_LIVE_STATUS, name, field="omnigent_conversation_metadata.live_status")
+
+
+def decode_session_live_status(code: int) -> str:
+    """Decode an ``omnigent_conversation_metadata.live_status`` int code to its name."""
+    return _decode(SESSION_LIVE_STATUS, code, field="omnigent_conversation_metadata.live_status")
+
+
 def encode_account_token_kind(name: str) -> int:
     """Encode an ``account_tokens.kind`` name to its int code."""
     return _encode(ACCOUNT_TOKEN_KIND, name, field="account_tokens.kind")
@@ -229,6 +258,16 @@ def encode_account_token_kind(name: str) -> int:
 def decode_account_token_kind(code: int) -> str:
     """Decode an ``account_tokens.kind`` int code to its name."""
     return _decode(ACCOUNT_TOKEN_KIND, code, field="account_tokens.kind")
+
+
+def encode_device_grant_status(name: str) -> int:
+    """Encode a ``device_grants.status`` name to its int code."""
+    return _encode(DEVICE_GRANT_STATUS, name, field="device_grants.status")
+
+
+def decode_device_grant_status(code: int) -> str:
+    """Decode a ``device_grants.status`` int code to its name."""
+    return _decode(DEVICE_GRANT_STATUS, code, field="device_grants.status")
 
 
 def encode_policy_type(name: str) -> int:
