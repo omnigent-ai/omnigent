@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import secrets
+from pathlib import PurePosixPath, PureWindowsPath
 from typing import Any
 
 from omnigent.host.frames import HostStatFrame, encode_host_frame
@@ -163,33 +164,38 @@ def _is_relative_cwd(spec_cwd: str | None) -> bool:
     return False
 
 
+def _is_windows_style_path(path: str) -> bool:
+    """Return ``True`` for Windows drive / UNC / backslash paths.
+
+    Used to pick the path flavour for containment checks so a Windows host's
+    realpaths (``C:\\repo``) aren't compared with POSIX ``/`` semantics.
+    """
+    if path.startswith("\\\\") or "\\" in path:
+        return True
+    return len(path) >= 2 and path[0].isalpha() and path[1] == ":"
+
+
 def _is_subpath_of(canonical_workspace: str, canonical_boundary: str) -> bool:
     """
     Return ``True`` when ``canonical_workspace`` equals the
     boundary or is a subdirectory of it.
 
-    Pure string comparison on canonicalized absolute paths — both
-    inputs are realpaths returned by ``host.stat``, so symlinks
-    are already resolved and ``..`` segments are gone. Without the
-    canonicalization step, this comparison would be unsafe.
+    Both inputs are realpaths returned by ``host.stat`` (symlinks resolved,
+    ``..`` segments gone). Comparison honours the host's path flavour: Windows
+    paths (drive / UNC / backslash) compare case-insensitively and accept both
+    ``\\`` and ``/`` separators; POSIX paths compare case-sensitively. Using
+    ``PurePath.is_relative_to`` compares whole path components, so ``/a/foo``
+    is not treated as a subpath of ``/a/fo`` (no prefix-collision bug).
 
-    :param canonical_workspace: Realpath returned by host.stat for
-        the workspace, e.g. ``"/Users/corey/universe/src/foo"``.
-    :param canonical_boundary: Realpath for the agent's boundary,
-        e.g. ``"/Users/corey/universe"``.
+    :param canonical_workspace: Realpath returned by host.stat for the
+        workspace, e.g. ``"/Users/corey/universe/src/foo"`` or
+        ``"C:\\Users\\corey\\src\\foo"``.
+    :param canonical_boundary: Realpath for the agent's boundary.
     :returns: ``True`` when the workspace is the boundary or
         nested under it.
     """
-    if canonical_workspace == canonical_boundary:
-        return True
-    # Add a trailing separator so ``/a/foo`` is not treated as a
-    # subpath of ``/a/fo`` (prefix collision). ``/`` is the only
-    # separator the host stat returns since ``canonical_path`` is
-    # always absolute.
-    boundary_with_sep = (
-        canonical_boundary if canonical_boundary.endswith("/") else canonical_boundary + "/"
-    )
-    return canonical_workspace.startswith(boundary_with_sep)
+    flavour = PureWindowsPath if _is_windows_style_path(canonical_boundary) else PurePosixPath
+    return flavour(canonical_workspace).is_relative_to(flavour(canonical_boundary))
 
 
 async def validate_workspace(
