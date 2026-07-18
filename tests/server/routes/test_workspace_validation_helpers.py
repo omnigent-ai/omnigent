@@ -9,6 +9,7 @@ from __future__ import annotations
 from omnigent.server.routes._workspace_validation import (
     _is_relative_cwd,
     _is_subpath_of,
+    _is_windows_style_path,
     is_absolute_host_path,
 )
 
@@ -80,6 +81,30 @@ class TestIsSubpathOf:
 
     def test_windows_unc_child(self) -> None:
         assert _is_subpath_of(r"\\srv\share\proj\src", r"\\srv\share\proj") is True
+
+    def test_posix_backslash_filename_not_contained(self) -> None:
+        r"""``\`` is a legal POSIX filename char: boundary ``/tmp/a\b`` is a
+        single component and must NOT contain ``/tmp/a/b/child``."""
+        assert _is_subpath_of("/tmp/a/b/child", r"/tmp/a\b") is False
+
+
+class TestIsWindowsStylePath:
+    """Detection must key on drive/UNC prefix, not an embedded backslash."""
+
+    def test_drive_backslash(self) -> None:
+        assert _is_windows_style_path(r"C:\repo") is True
+
+    def test_drive_forward_slash(self) -> None:
+        assert _is_windows_style_path("C:/repo") is True
+
+    def test_unc(self) -> None:
+        assert _is_windows_style_path(r"\\server\share") is True
+
+    def test_posix_root(self) -> None:
+        assert _is_windows_style_path("/tmp/a/b") is False
+
+    def test_posix_with_backslash_char(self) -> None:
+        assert _is_windows_style_path(r"/tmp/a\b") is False
 
 
 class TestIsAbsoluteHostPath:

@@ -165,12 +165,14 @@ def _is_relative_cwd(spec_cwd: str | None) -> bool:
 
 
 def _is_windows_style_path(path: str) -> bool:
-    """Return ``True`` for Windows drive / UNC / backslash paths.
+    """Return ``True`` for Windows drive or UNC absolute paths.
 
-    Used to pick the path flavour for containment checks so a Windows host's
-    realpaths (``C:\\repo``) aren't compared with POSIX ``/`` semantics.
+    Detection keys on a drive prefix (``C:``) or UNC prefix (``\\\\``) only. A
+    bare embedded backslash does NOT imply Windows — ``\\`` is a legal character
+    in POSIX filenames, so ``/tmp/a\\b`` is a single-component POSIX path and
+    must not be reparsed with ``\\`` as a separator.
     """
-    if path.startswith("\\\\") or "\\" in path:
+    if path.startswith("\\\\"):
         return True
     return len(path) >= 2 and path[0].isalpha() and path[1] == ":"
 
