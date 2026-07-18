@@ -95,14 +95,7 @@ The bot lives in the separate `omnigent-slack` package, which must be installed
 to find it. Install it as the `slack` extra of omnigent:
 
 ```bash
-uv pip install "omnigent[slack]"     # or, from a source checkout: uv sync --extra slack
-```
-
-If it isn't installed, the command prints this hint. From a source checkout you
-can also run the bot module directly, without the `omni` CLI:
-
-```bash
-uv run python -m omnigent_slack
+uv tool install "omnigent[slack]"     # or, from a source checkout: uv sync --extra slack
 ```
 
 Set `LOG_LEVEL=DEBUG` in `.env` when diagnosing why Slack events are not producing replies.
