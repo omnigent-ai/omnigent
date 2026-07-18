@@ -3214,7 +3214,10 @@ async def _prepare_claude_terminal(
             startup_progress=startup_progress,
             progress_message="Starting Claude terminal...",
         )
-        from omnigent.tools.builtins.session_rename import session_rename_instruction
+        from omnigent.tools.builtins.session_rename import (
+            session_rename_allowed_tools,
+            session_rename_instruction,
+        )
 
         terminal_id = await _launch_claude_terminal(
             client,
@@ -3224,6 +3227,7 @@ async def _prepare_claude_terminal(
             bridge_dir=bridge_dir,
             claude_config=claude_config,
             append_system_prompt=session_rename_instruction(initial_session=not cold_resumed),
+            allowed_tools=session_rename_allowed_tools(initial_session=not cold_resumed),
         )
         _mark_startup_step(
             startup_profiler,
@@ -3970,6 +3974,7 @@ async def _launch_claude_terminal(
     bridge_dir: Path,
     claude_config: ClaudeNativeUcodeConfig | None = None,
     append_system_prompt: str | None = None,
+    allowed_tools: tuple[str, ...] = (),
 ) -> str:
     """
     Launch the server-backed Claude terminal resource.
@@ -3987,6 +3992,8 @@ async def _launch_claude_terminal(
     :param claude_config: Optional ucode-derived Claude Code config.
     :param append_system_prompt: Optional framework-owned instructions for
         this fresh native session.
+    :param allowed_tools: Optional narrowly scoped Claude tools preapproved
+        for this native session.
     :returns: Terminal resource id.
     :raises click.ClickException: If terminal launch fails.
     """
@@ -3998,6 +4005,7 @@ async def _launch_claude_terminal(
         ap_auth_headers=dict(client.headers),
         claude_config=claude_config,
         append_system_prompt=append_system_prompt,
+        allowed_tools=allowed_tools,
     )
     resp = await client.post(
         f"/v1/sessions/{url_component(session_id)}/resources/terminals",
@@ -4129,6 +4137,7 @@ def _claude_terminal_request(
     ap_auth_headers: dict[str, str] | None = None,
     claude_config: ClaudeNativeUcodeConfig | None = None,
     append_system_prompt: str | None = None,
+    allowed_tools: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """
     Build the terminal resource creation body for Claude Code.
@@ -4146,6 +4155,8 @@ def _claude_terminal_request(
     :param claude_config: Optional ucode-derived Claude Code config.
     :param append_system_prompt: Optional framework-owned instructions to
         append to Claude Code's system prompt.
+    :param allowed_tools: Optional narrowly scoped Claude tools preapproved
+        for this native session.
     :returns: JSON body for ``POST /resources/terminals``.
     """
     claude_args = _merge_default_model_arg(
@@ -4159,6 +4170,7 @@ def _claude_terminal_request(
         ap_auth_headers=ap_auth_headers,
         api_key_helper=claude_config.api_key_helper if claude_config is not None else None,
         append_system_prompt=append_system_prompt,
+        allowed_tools=allowed_tools,
     )
     # Let a registered launcher plugin (e.g. Databricks' isaac) rewrite the
     # command/args to wrap the same fully-augmented Claude launch. Identity by

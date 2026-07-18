@@ -4251,6 +4251,7 @@ async def test_prepare_claude_terminal_cold_resume_injects_external_session_id(
         bridge_dir: Path,
         claude_config: claude_native.ClaudeNativeUcodeConfig | None = None,
         append_system_prompt: str | None = None,
+        allowed_tools: tuple[str, ...] = (),
     ) -> str:
         """
         Capture the launch args without invoking the real runner.
@@ -4268,6 +4269,7 @@ async def test_prepare_claude_terminal_cold_resume_injects_external_session_id(
         captured_terminal_args["session_id"] = session_id
         captured_terminal_args["claude_args"] = claude_args
         captured_terminal_args["append_system_prompt"] = append_system_prompt
+        captured_terminal_args["allowed_tools"] = allowed_tools
         del command, bridge_dir, claude_config
         return "terminal_claude_main"
 
@@ -4336,6 +4338,7 @@ async def test_prepare_claude_terminal_cold_resume_injects_external_session_id(
         "hello",
     )
     assert captured_terminal_args["append_system_prompt"] is None
+    assert captured_terminal_args["allowed_tools"] == ()
 
     # Load-bearing for the duplicate-message bug: cold resume
     # MUST set ``cold_resumed=True`` so the transcript forwarder seeks
@@ -4397,11 +4400,16 @@ async def test_prepare_claude_terminal_fresh_session_is_not_cold_resumed(
         bridge_dir: Path,
         claude_config: claude_native.ClaudeNativeUcodeConfig | None = None,
         append_system_prompt: str | None = None,
+        allowed_tools: tuple[str, ...] = (),
     ) -> str:
         """Return a fixed terminal id without spawning anything."""
-        from omnigent.tools.builtins.session_rename import SESSION_RENAME_INSTRUCTION
+        from omnigent.tools.builtins.session_rename import (
+            CLAUDE_NATIVE_SESSION_RENAME_TOOL,
+            SESSION_RENAME_INSTRUCTION,
+        )
 
         assert append_system_prompt == SESSION_RENAME_INSTRUCTION
+        assert allowed_tools == (CLAUDE_NATIVE_SESSION_RENAME_TOOL,)
         del _client, _session_id, _claude_args, command, bridge_dir, claude_config
         return "terminal_claude_main"
 

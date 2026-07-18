@@ -3947,7 +3947,13 @@ async def _rename_current_session_via_rest(
     conversation_id: str | None,
     server_client: httpx.AsyncClient | None,
 ) -> str:
-    """Conditionally rename the calling session through the server API."""
+    """Conditionally rename the calling session through the server API.
+
+    Automatic naming is framework metadata, never a prerequisite for the
+    user's turn. Every failure therefore becomes a tool-result envelope so a
+    missing route, unavailable server, or malformed response cannot abort the
+    harness session.
+    """
     if server_client is None:
         return json.dumps({"error": "sys_session_rename requires server access"})
     if conversation_id is None:
@@ -3970,7 +3976,13 @@ async def _rename_current_session_via_rest(
                 "detail": response.text[:200],
             }
         )
-    return json.dumps(response.json())
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        return json.dumps({"error": f"sys_session_rename returned invalid JSON: {exc}"})
+    if not isinstance(payload, dict):
+        return json.dumps({"error": "sys_session_rename returned a non-object response"})
+    return json.dumps(payload)
 
 
 async def _collect_sub_agents(

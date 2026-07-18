@@ -91,7 +91,10 @@ from omnigent.tools.builtins.load_skill import (
     find_skill_by_name,
     format_skill_meta_text,
 )
-from omnigent.tools.builtins.session_rename import session_rename_instruction
+from omnigent.tools.builtins.session_rename import (
+    session_rename_allowed_tools,
+    session_rename_instruction,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -5803,6 +5806,9 @@ async def _auto_create_claude_terminal(
         skills_filter=skills_filter,
         api_key_helper=claude_config.api_key_helper if claude_config is not None else None,
         append_system_prompt=session_rename_instruction(
+            initial_session=session_external_id is None and not fork_carry_history
+        ),
+        allowed_tools=session_rename_allowed_tools(
             initial_session=session_external_id is None and not fork_carry_history
         ),
     )
