@@ -510,6 +510,7 @@ from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStor
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
+from omnigent.stores.host_permission_store.sqlalchemy_store import SqlAlchemyHostPermissionStore
 db_uri = os.environ["OMNIGENT_E2E_DB_URI"]
 artifact_location = Path(os.environ["OMNIGENT_E2E_ARTIFACT_LOCATION"])
 port = int(os.environ["OMNIGENT_E2E_PORT"])
@@ -541,6 +542,7 @@ app = create_app(
     agent_cache=agent_cache,
     runner_tunnel_tokens=None,
     host_store=host_store,
+    host_permission_store=SqlAlchemyHostPermissionStore(db_uri),
 )
 uvicorn.run(app, host="127.0.0.1", port=port)
 """

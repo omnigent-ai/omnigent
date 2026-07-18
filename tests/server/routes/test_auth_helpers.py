@@ -13,6 +13,7 @@ from __future__ import annotations
 import pytest
 
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.runner.identity import token_bound_runner_id
 from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_OWNER,
@@ -228,3 +229,138 @@ async def test_missing_conversation_raises_404(
         )
 
     assert exc.value.code == ErrorCode.NOT_FOUND
+
+
+# --- Runner binding-token session access (header-mode, feature 002) ---
+
+_BINDING_TOKEN = "test-binding-token-xyz"
+
+
+@pytest.mark.asyncio
+async def test_binding_token_grants_read_on_own_session_without_user(
+    perm_store: SqlAlchemyPermissionStore, conv_store: SqlAlchemyConversationStore
+) -> None:
+    """A runner reads AND posts events on its OWN bound session, no user_id.
+
+    The header-mode case (US1): user_id is None (no readable identity), but the
+    token's derived runner id matches conv.runner_id → the runner gets its
+    self-access level (EDIT: read the spec + post events/usage back).
+    """
+    conv = conv_store.create_conversation()
+    conv_store.replace_runner_id(conv.id, token_bound_runner_id(_BINDING_TOKEN))
+
+    # A read requirement (spec fetch) is satisfied ...
+    access = await require_access_and_level(
+        None,
+        conv.id,
+        LEVEL_READ,
+        perm_store,
+        conv_store,
+        runner_binding_token=_BINDING_TOKEN,
+    )
+    assert access.level == LEVEL_EDIT
+    assert access.conversation is not None
+    assert access.conversation.id == conv.id
+
+    # ... and so is an edit requirement (POST /events, the transcript/usage
+    # forwarder), so the agent's responses reach the web transcript.
+    access_edit = await require_access_and_level(
+        None,
+        conv.id,
+        LEVEL_EDIT,
+        perm_store,
+        conv_store,
+        runner_binding_token=_BINDING_TOKEN,
+    )
+    assert access_edit.level == LEVEL_EDIT
+
+
+@pytest.mark.asyncio
+async def test_binding_token_does_not_grant_other_session(
+    perm_store: SqlAlchemyPermissionStore, conv_store: SqlAlchemyConversationStore
+) -> None:
+    """A token bound to session X grants nothing on session Y (US2 security).
+
+    Y is bound to a DIFFERENT runner, so presenting X's token for Y falls
+    through to the normal deny (404, no user identity).
+    """
+    conv_y = conv_store.create_conversation()
+    conv_store.replace_runner_id(conv_y.id, token_bound_runner_id("some-other-token"))
+
+    with pytest.raises(OmnigentError) as exc:
+        await require_access_and_level(
+            None,
+            conv_y.id,
+            LEVEL_READ,
+            perm_store,
+            conv_store,
+            runner_binding_token=_BINDING_TOKEN,
+        )
+    # No user identity + no matching binding → 401 (unauthenticated), never a grant.
+    assert exc.value.code == ErrorCode.UNAUTHORIZED
+
+
+@pytest.mark.asyncio
+async def test_binding_token_cannot_satisfy_above_edit(
+    perm_store: SqlAlchemyPermissionStore, conv_store: SqlAlchemyConversationStore
+) -> None:
+    """A matching binding token does NOT satisfy a > LEVEL_EDIT requirement (US2).
+
+    The grant caps at EDIT (read spec + post events on its own session); a
+    manage/owner requirement (delete the session, change its sharing) falls
+    through to the normal deny — the runner can't escalate on its own session.
+    """
+    conv = conv_store.create_conversation()
+    conv_store.replace_runner_id(conv.id, token_bound_runner_id(_BINDING_TOKEN))
+
+    with pytest.raises(OmnigentError) as exc:
+        await require_access_and_level(
+            None,
+            conv.id,
+            LEVEL_OWNER,
+            perm_store,
+            conv_store,
+            runner_binding_token=_BINDING_TOKEN,
+        )
+    assert exc.value.code == ErrorCode.UNAUTHORIZED
+
+
+@pytest.mark.asyncio
+async def test_absent_binding_token_unchanged(
+    perm_store: SqlAlchemyPermissionStore, conv_store: SqlAlchemyConversationStore
+) -> None:
+    """No binding token → resolution is exactly as before (US3 regression).
+
+    A runner-bound session with no token + no user identity still 401s.
+    """
+    conv = conv_store.create_conversation()
+    conv_store.replace_runner_id(conv.id, token_bound_runner_id(_BINDING_TOKEN))
+
+    with pytest.raises(OmnigentError) as exc:
+        await require_access_and_level(None, conv.id, LEVEL_READ, perm_store, conv_store)
+    assert exc.value.code == ErrorCode.UNAUTHORIZED
+
+
+@pytest.mark.asyncio
+async def test_binding_token_owner_access_unaffected(
+    perm_store: SqlAlchemyPermissionStore, conv_store: SqlAlchemyConversationStore
+) -> None:
+    """A real owner still gets their owner level even if a (bogus) token is passed.
+
+    The binding-token branch only ADDS read on a match; it never downgrades or
+    overrides a user's own access.
+    """
+    conv = conv_store.create_conversation()
+    conv_store.replace_runner_id(conv.id, token_bound_runner_id(_BINDING_TOKEN))
+    perm_store.ensure_user(ALICE)
+    perm_store.grant(ALICE, conv.id, LEVEL_OWNER)
+
+    access = await require_access_and_level(
+        ALICE,
+        conv.id,
+        LEVEL_READ,
+        perm_store,
+        conv_store,
+        runner_binding_token="unrelated-token",
+    )
+    assert access.level == LEVEL_OWNER

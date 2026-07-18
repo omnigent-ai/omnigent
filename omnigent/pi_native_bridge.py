@@ -295,17 +295,19 @@ def refresh_config_auth_headers(bridge_dir: Path, auth_headers: dict[str, str]) 
     Best-effort and behavior-preserving: it touches only ``authHeaders``,
     leaving ``serverUrl`` / ``tools`` / etc. intact.
 
-    Headers are **merged** (fresh values win on collision) rather than replaced,
-    so launch-written headers such as ``X-Omnigent-Runner-Tunnel-Token`` — set
-    when the binding token was available in the runner-main process env and
-    needed for guest-on-shared-host self-access — survive every bearer rotation.
+    The fresh headers are **merged over** the existing ``authHeaders`` rather
+    than replacing them, so a header the launch established but the refresh
+    caller cannot re-derive — notably the guest-on-shared-host
+    ``X-Omnigent-Runner-Tunnel-Token`` (the binding token is scrubbed from the
+    harness-worker env that drives the per-turn refresh) — survives the bearer
+    rotation instead of being clobbered.
 
     :param bridge_dir: Native Pi bridge directory.
     :param auth_headers: Fresh outbound auth headers to merge in, e.g.
         ``{"Authorization": "Bearer <token>"}``.
     :returns: ``True`` when the config was rewritten; ``False`` when
         *auth_headers* is empty (local/unauthenticated), the config is
-        missing/unreadable, or the merged result is unchanged.
+        missing/unreadable, or the merged headers already match.
     """
     if not auth_headers:
         return False
@@ -316,8 +318,8 @@ def refresh_config_auth_headers(bridge_dir: Path, auth_headers: dict[str, str]) 
         return False
     if not isinstance(payload, dict):
         return False
-    existing = payload.get("authHeaders") or {}
-    merged = {**existing, **auth_headers}
+    existing = payload.get("authHeaders")
+    merged = {**existing, **auth_headers} if isinstance(existing, dict) else dict(auth_headers)
     if merged == existing:
         return False
     payload["authHeaders"] = merged
