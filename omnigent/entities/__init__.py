@@ -26,7 +26,7 @@ from omnigent.entities.conversation import (
 from omnigent.entities.device_grant import DeviceGrant
 from omnigent.entities.file import StoredFile
 from omnigent.entities.pagination import PagedList
-from omnigent.entities.permission import ResolvedAccess, SessionPermission
+from omnigent.entities.permission import HostPermission, ResolvedAccess, SessionPermission
 from omnigent.entities.policy import Policy
 from omnigent.entities.project import Project
 from omnigent.entities.scheduled_task import ScheduledTask, ScheduledTaskRun
@@ -53,6 +53,7 @@ __all__ = [
     "ErrorData",
     "FunctionCallData",
     "FunctionCallOutputData",
+    "HostPermission",
     "ItemData",
     "LoadedAgent",
     "MessageData",
