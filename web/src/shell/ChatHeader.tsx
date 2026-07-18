@@ -11,6 +11,7 @@ import {
   PanelRightIcon,
   ShareIcon,
   TerminalIcon,
+  UserRoundPlusIcon,
 } from "lucide-react";
 import { Link } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
@@ -101,6 +102,8 @@ interface ChatHeaderProps {
   parentSessionId: string | null | undefined;
   /** Active session id, or undefined on the landing composer. */
   conversationId: string | undefined;
+  /** Active session title shown in the centered desktop header slot. */
+  sessionTitle?: string;
   /** The bound agent (mcp_servers + policies) for the info popover. */
   boundAgent: Agent | undefined;
   /** Whether the Share button/menu entry should render. */
@@ -158,6 +161,7 @@ export function ChatHeader({
   isChildSession,
   parentSessionId,
   conversationId,
+  sessionTitle,
   boundAgent,
   canShare,
   shareDisabled = false,
@@ -258,6 +262,14 @@ export function ChatHeader({
         )}
       </div>
 
+      {conversationId && sessionTitle && (
+        <div className="pointer-events-none absolute left-1/2 flex max-w-[220px] -translate-x-1/2 items-center justify-center">
+          <p className="min-w-0 truncate text-sm leading-5 font-medium text-foreground">
+            {sessionTitle}
+          </p>
+        </div>
+      )}
+
       <div className="flex items-center gap-1">
         {/* Other users currently viewing this session (presence).
             Self-contained — reads the chat store directly, renders
@@ -332,9 +344,9 @@ export function ChatHeader({
                   title={shareDisabledReason}
                   // share-button-glassy (index.css) paints the pink gradient,
                   // shadow, and white text in both light and dark mode.
-                  className="share-button-glassy h-8 rounded-full px-6 text-13 font-normal text-white"
+                  className="share-button-glassy h-6 rounded-md px-2 text-13 font-normal text-white"
                 >
-                  <ShareIcon className="size-4" />
+                  <UserRoundPlusIcon className="size-4" />
                   Share
                 </Button>
               </span>
@@ -348,9 +360,9 @@ export function ChatHeader({
             onClick={onShare}
             // share-button-glassy (index.css) paints the pink gradient,
             // shadow, and white text in both light and dark mode.
-            className="share-button-glassy hidden h-8 rounded-full px-6 text-13 font-normal text-white md:inline-flex"
+            className="share-button-glassy hidden h-6 rounded-md px-2 text-13 font-normal text-white md:inline-flex"
           >
-            <ShareIcon className="size-4" />
+            <UserRoundPlusIcon className="size-4" />
             Share
           </Button>
         ) : null}

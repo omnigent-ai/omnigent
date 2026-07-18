@@ -247,9 +247,9 @@ export function ToolGroupSummary({ tools, count }: { tools: RenderItem[]; count?
     // `peer` lets `BlockRenderer`'s trailing tail react to this
     // collapsible's open/closed state for the border-join effect.
     <Collapsible defaultOpen={false} className="group/tool-summary peer not-prose w-full">
-      <CollapsibleTrigger className="flex cursor-pointer items-center gap-1.5 py-0.5 text-left text-muted-foreground text-xs transition-colors hover:text-foreground">
-        <ChevronRightIcon className="size-3.5 shrink-0 transition-transform group-data-[state=open]/tool-summary:rotate-90" />
+      <CollapsibleTrigger className="flex cursor-pointer items-center gap-1.5 py-0.5 text-left text-muted-foreground text-13 leading-5 transition-colors hover:text-foreground">
         <span>{label}</span>
+        <ChevronRightIcon className="size-3.5 shrink-0 transition-transform group-data-[state=open]/tool-summary:rotate-90" />
       </CollapsibleTrigger>
       <CollapsibleContent className="mt-1 ml-2 space-y-1 border-l pl-3 pt-1 pb-0 data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:animate-out data-[state=open]:animate-in">
         {tools.map((item) => {

@@ -83,7 +83,6 @@ import { readHarnessOptions, writeHarnessOption } from "@/lib/modePreferences";
 import { useBrainHarnessLabels } from "@/lib/agentLabels";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import { sortAgentsForDisplay } from "@/lib/agentGrouping";
-import { cn } from "@/lib/utils";
 import {
   isNativeCodingAgent,
   nativeAgentHasCapability,
@@ -114,6 +113,7 @@ import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 import type { Conversation } from "@/hooks/useConversations";
 import { useNewestProjectSession, useProjects, PROJECT_LABEL_KEY } from "@/hooks/useConversations";
 import { FileMentionMenu } from "@/components/FileMentionMenu";
+import { ComposerFormSurface } from "@/components/composer/ComposerSurface";
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
 import {
   buildMentionPreamble,
@@ -3014,20 +3014,20 @@ export function NewChatLandingScreen() {
           edges; widens to the full px-10 at the md breakpoint and up. */}
       <div className="flex w-full max-w-[860px] flex-col items-center gap-6 px-4 pb-16 md:select-none md:px-10">
         <div className="flex flex-col items-center gap-0">
-          <div className="relative h-[92px] w-[112px] shrink-0" aria-hidden="true">
-            <div className="absolute -inset-3.5 rounded-full bg-[radial-gradient(circle,rgba(245,59,157,0.22),rgba(245,59,157,0.055)_44%,rgba(77,197,160,0.03)_58%,transparent_73%)] blur-[4px]" />
-            <span className="absolute top-7 left-2 h-[35px] w-24 -rotate-[19deg] rounded-[50%] border border-[#F53B9D]/40 shadow-[inset_0_0_18px_rgba(245,59,157,0.055)]" />
-            <span className="absolute top-8 left-4 h-7 w-20 rotate-[20deg] rounded-[50%] border border-[#4DC5A0]/30" />
-            <span className="absolute top-[25px] right-[13px] size-[5px] rounded-full bg-[#F53B9D] shadow-[0_0_10px_#F53B9D]" />
-            <span className="absolute bottom-[22px] left-4 size-[5px] rounded-full bg-[#4DC5A0] shadow-[0_0_10px_#4DC5A0]" />
-            <OttoEyes className="absolute top-[21px] left-[31px] h-[50px] w-auto -rotate-[5deg] drop-shadow-[0_18px_28px_rgba(245,59,157,0.22)]" />
+          <div className="relative h-20 w-[98px] shrink-0" aria-hidden="true">
+            <div className="absolute -inset-3 rounded-full bg-[radial-gradient(circle,rgba(245,59,157,0.21),rgba(245,59,157,0.052)_44%,rgba(77,197,160,0.028)_58%,transparent_73%)] blur-[3px]" />
+            <span className="absolute top-6 left-[7px] h-[31px] w-[84px] -rotate-[19deg] rounded-[50%] border border-[#F53B9D]/40 shadow-[inset_0_0_16px_rgba(245,59,157,0.055)]" />
+            <span className="absolute top-7 left-3.5 h-6 w-[70px] rotate-[20deg] rounded-[50%] border border-[#4DC5A0]/30" />
+            <span className="absolute top-[22px] right-[11px] size-1 rounded-full bg-[#F53B9D] shadow-[0_0_9px_#F53B9D]" />
+            <span className="absolute bottom-[19px] left-3.5 size-1 rounded-full bg-[#4DC5A0] shadow-[0_0_9px_#4DC5A0]" />
+            <OttoEyes className="absolute top-[18px] left-[27px] h-11 w-auto -rotate-[5deg] drop-shadow-[0_16px_25px_rgba(245,59,157,0.21)]" />
           </div>
-          <h1 className="text-center text-[28px] leading-8 font-medium tracking-[-0.03em] text-foreground">
+          <h1 className="text-center text-[28px] leading-8 font-normal tracking-[-0.03em] text-foreground">
             What should we build?
           </h1>
         </div>
         <div className="relative flex w-full flex-col gap-0">
-          <form
+          <ComposerFormSurface
             onSubmit={(e) => {
               e.preventDefault();
               void handleCreate();
@@ -3036,25 +3036,10 @@ export function NewChatLandingScreen() {
             onDragOver={handleDragOver}
             onDragEnter={handleDragEnter}
             onDragLeave={handleDragLeave}
-            // Two visual states only (no hover): resting --border, and
-            // --foreground while the textarea itself has focus (has-[]
-            // scopes it so focusing footer buttons doesn't trigger it).
-            // dark:bg-card-solid: the footer tray below tucks its top
-            // edge behind this card (-mt-9), and the dark glass --card
-            // is 60% alpha — the tucked strip ghosts through a
-            // translucent card. Mirrors the chat composer card. Drag-over
-            // lifts an inset ring (overlay below).
-            className={cn(
-              "landing-reference-composer relative z-10 flex min-h-[58px] w-full flex-row flex-wrap items-center gap-2 rounded-[16px] border border-border bg-card p-3 transition-[border-color,box-shadow] duration-150",
-              isDragActive && "ring-2 ring-ring ring-inset",
-            )}
+            className="landing-reference-composer"
+            isDragActive={isDragActive}
             data-testid="new-chat-landing-composer"
           >
-            {isDragActive && (
-              <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-2xl bg-card/80">
-                <span className="text-sm font-medium text-ring">Drop files here</span>
-              </div>
-            )}
             {/* Skill suggestions — floats above the composer box. */}
             {slashMenuOpen && (
               <SlashCommandMenu
@@ -3359,7 +3344,7 @@ export function NewChatLandingScreen() {
                 </TooltipProvider>
               </div>
             </div>
-          </form>
+          </ComposerFormSurface>
           {/* Borderless context row beneath the composer, matching the reference:
               36px tall with transparent 24px controls and no inter-chip gap. */}
           <div className="relative z-0 w-full [&_button]:hover:!bg-transparent">

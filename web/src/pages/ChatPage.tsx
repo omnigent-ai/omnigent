@@ -52,6 +52,7 @@ import {
   MessageContent,
 } from "@/components/ai-elements/message";
 import { Shimmer } from "@/components/ai-elements/shimmer";
+import { ComposerSurface } from "@/components/composer/ComposerSurface";
 import { ElicitationCard } from "@/components/blocks/ApprovalCard";
 import { BlockRenderer, FilePathAwareMessageResponse } from "@/components/blocks/BlockRenderer";
 import { CompactionMarker, RoutingDecisionCard } from "@/components/blocks/StatusBlocks";
@@ -275,7 +276,7 @@ export function collectBubbleMarkdown(items: RenderItem[]): string {
 }
 
 // All chat-column elements must share this width to stay aligned.
-const CHAT_COLUMN_WIDTH = "max-w-3xl min-[1921px]:max-w-4xl min-[2561px]:max-w-5xl";
+const CHAT_COLUMN_WIDTH = "max-w-[808px]";
 
 const TABLE_SEPARATOR_RE = /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/;
 
@@ -1190,7 +1191,7 @@ interface SessionLayoutProps {
  */
 function SessionLayout({ mainAgent }: SessionLayoutProps) {
   return (
-    <div className="flex min-h-0 flex-1 overflow-hidden">
+    <div className="flex min-h-0 flex-1 overflow-hidden pt-14">
       <div className="flex min-w-0 flex-1 flex-col">{mainAgent}</div>
     </div>
   );
@@ -1688,7 +1689,7 @@ function MainAgentSurface({
               rail is hidden on mobile, so the extra left padding is md-only. */}
           <ConversationContent
             className={cn(
-              "chat-conversation-content mx-auto w-full gap-4 pt-20 pb-6 md:pl-12",
+              "chat-conversation-content mx-auto w-full gap-2 pt-6 pb-6",
               CHAT_COLUMN_WIDTH,
             )}
           >
@@ -3100,7 +3101,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
       data-testid="message-bubble"
       data-role="user"
       data-user-message-id={bubble.itemId}
-      className="max-w-3xl"
+      className="max-w-[960px]"
     >
       {/* w-fit + ml-auto shrink-wrap the row so the author avatar sits
           immediately left of the right-aligned bubble (the bubble's own
@@ -3252,7 +3253,7 @@ function AssistantBubble({ bubble }: { bubble: Extract<Bubble, { kind: "assistan
         from="assistant"
         data-testid="message-bubble"
         data-role="assistant"
-        className={isWide ? "max-w-full" : "max-w-3xl"}
+        className="max-w-full"
       >
         <MessageContent className={isWide ? "w-full" : undefined}>
           <BlockRenderer items={bubble.items} sessionStatus={sessionStatus} />
@@ -3645,7 +3646,7 @@ function ComposerStatusLine({
         // dark-mode glass rule — bg-card here would re-decorate the tray
         // with its own border/shadow, duplicating the composer's chrome —
         // and matches the home composer's footer tray surface.
-        "mx-auto -mt-4 flex w-full items-center gap-3 rounded-b-2xl bg-tray/40 px-4 pb-1.5 pt-5.5",
+        "mx-auto -mt-3 flex w-full items-center gap-3 rounded-b-2xl bg-tray/40 px-3 pb-1 pt-4",
         CHAT_COLUMN_WIDTH,
       )}
     >
@@ -4629,22 +4630,15 @@ export function Composer({
           alpha — the tucked strips ghost through a translucent card. The
           glass rule still keys off the bg-card class, so the dark border/
           shadow chrome is unchanged; only the fill goes opaque. */}
-      <div
-        className={cn(
-          "relative mx-auto flex w-full flex-col rounded-2xl border border-border bg-card dark:bg-card-solid shadow-sm transition",
-          CHAT_COLUMN_WIDTH,
-          isDragActive && "ring-2 ring-ring ring-inset",
-        )}
+      <ComposerSurface
+        className={cn("chat-reference-composer mx-auto", CHAT_COLUMN_WIDTH)}
+        isDragActive={isDragActive}
         onDrop={handleDrop}
         onDragOver={handleDragOver}
         onDragEnter={handleDragEnter}
         onDragLeave={handleDragLeave}
+        data-testid="chat-composer-surface"
       >
-        {isDragActive && (
-          <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-2xl bg-card/80">
-            <span className="text-sm font-medium text-ring">Drop files here</span>
-          </div>
-        )}
         {/* Slash-command suggestions — floats above the composer box */}
         {menuOpen && (
           <SlashCommandMenu
@@ -4694,13 +4688,13 @@ export function Composer({
             (text-transparent, caret kept visible) and render an aligned mirror
             behind it. Same box/typography so wrapping matches the textarea
             exactly. Only mounted while the draft is a command. */}
-        <div className="relative">
+        <div className="order-2 flex min-w-0 flex-1 items-center">
           {composerIsCommand && (
             <div
               ref={backdropRef}
               aria-hidden
               data-testid="composer-highlight-overlay"
-              className="pointer-events-none absolute inset-0 overflow-hidden whitespace-pre-wrap break-words px-4 pt-3 pb-2 text-sm text-foreground"
+              className="pointer-events-none absolute inset-0 overflow-hidden whitespace-pre-wrap break-words px-0 py-[6px] text-13 leading-5 text-foreground"
             >
               {(() => {
                 const split = splitSlashCommand(value);
@@ -4782,7 +4776,7 @@ export function Composer({
             disabled={disabled || isReadOnly || unreachable || hasPendingElicitation}
             data-slash-command={composerIsCommand ? "true" : undefined}
             className={cn(
-              "relative w-full resize-none bg-transparent px-4 pt-3 pb-2 text-sm outline-none placeholder:text-muted-foreground disabled:opacity-60",
+              "h-8 max-h-[180px] min-h-8 w-full resize-none overflow-y-auto bg-transparent px-0 py-[6px] text-13 leading-5 outline-none placeholder:text-muted-foreground disabled:opacity-60",
               // Hand glyph painting to the overlay while a command is drafted;
               // the caret stays visible via caret-foreground.
               composerIsCommand && "text-transparent caret-foreground",
@@ -4862,14 +4856,14 @@ export function Composer({
             {commandError}
           </div>
         )}
-        <div className="flex items-center justify-between gap-2 px-2 pb-2">
+        <div className="contents">
           {/* Attach + mic — left side of the action row */}
-          <div className="flex shrink-0 items-center gap-0.5">
+          <div className="order-1 flex shrink-0 items-center gap-0.5">
             <Button
               type="button"
               size="icon"
               variant="ghost"
-              className="size-9 md:size-8"
+              className="size-8 rounded-[8px]"
               disabled={disabled || isReadOnly || hasPendingElicitation}
               onClick={() => fileInputRef.current?.click()}
               title="Attach files"
@@ -4890,7 +4884,7 @@ export function Composer({
             />
           </div>
           {/* Cost toggle + agent picker + Send — right side */}
-          <div className="flex min-w-0 items-center gap-0.5">
+          <div className="order-3 flex min-w-0 items-center gap-0.5">
             {costRoutingEligible && (
               <IntelligentModelControl
                 value={costControlModeOverride}
@@ -4964,7 +4958,7 @@ export function Composer({
               // overrides the base 50% disabled-opacity so the affordance
               // reads as "waiting for input", not "almost active".
               className={cn(
-                "size-9 shrink-0 rounded-full md:size-8",
+                "size-8 shrink-0 rounded-[8px]",
                 !showInterruptButton && "hover:bg-primary/90 disabled:opacity-30",
               )}
               // Interrupt stays live during a pending elicitation —
@@ -4986,7 +4980,7 @@ export function Composer({
             </Button>
           </div>
         </div>
-      </div>
+      </ComposerSurface>
       <ComposerStatusLine
         harnessLabel={harnessLabel}
         goal={goal}

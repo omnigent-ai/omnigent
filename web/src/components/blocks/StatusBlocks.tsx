@@ -13,7 +13,6 @@ import {
   ChevronRightIcon,
   RotateCcwIcon,
   ShieldXIcon,
-  ShrinkIcon,
 } from "lucide-react";
 import { useMemo } from "react";
 import { CodeBlock, CodeBlockHeader, CodeBlockTitle } from "@/components/ai-elements/code-block";
@@ -110,9 +109,10 @@ export function RetryIndicator({
  */
 export function CompactionMarker() {
   return (
-    <div className="flex items-center gap-2 text-muted-foreground text-xs italic">
-      <ShrinkIcon className="size-3" />
+    <div className="flex w-full items-center gap-3 py-1 text-13 leading-5 text-muted-foreground">
+      <span className="h-px flex-1 bg-border" />
       <span>Conversation compacted</span>
+      <span className="h-px flex-1 bg-border" />
     </div>
   );
 }

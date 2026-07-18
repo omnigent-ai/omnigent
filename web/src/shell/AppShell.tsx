@@ -1280,6 +1280,7 @@ export function AppShell() {
                   isChildSession={isChildSession}
                   parentSessionId={activeSession?.parentSessionId}
                   conversationId={conversationId}
+                  sessionTitle={activeSession?.title ?? activeConv?.title ?? undefined}
                   boundAgent={boundAgent}
                   canShare={canShare}
                   shareDisabled={shareDisabled}

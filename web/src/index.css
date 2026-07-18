@@ -174,15 +174,12 @@
       var(--omnigent-bottom-bar-visible)
   );
 
-  /* Brand palette (light). Hex values are the brand spec, kept verbatim
-     * for fidelity. --background is white: the lavender brand canvas is
-     * expressed by the .app-shell gradient (see index.css .app-shell), so
-     * the base background stays white. This keeps bg-background tiles/
-     * inputs/code-blocks/tables (incl. Streamdown's hardcoded bg-background)
-     * from rendering as lavender patches on the white cards they sit on.
-     * The auth pages (outside the gradient shell) use this as their
-     * full-page canvas. */
-  --background: #fff;
+  /* Brand palette (light). The canvas/surface hierarchy follows Isaac Light:
+     * a near-white paper base, pure-white elevated cards, and warm neutral
+     * hairlines. Omnigent's pink/green atmosphere remains on .app-shell, so
+     * the product still feels unmistakably on-brand instead of becoming an
+     * SP2K clone. */
+  --background: #fdfdfc;
   --foreground: #11171c;
   --card: #fff;
   /* Light --card is already opaque; the solid form only diverges in dark. */
@@ -197,16 +194,16 @@
   --popover-foreground: #11171c;
   --primary: #11171c;
   --primary-foreground: #fff;
-  /* Light grey fill so secondary badges/headers read as surfaces (a
-     * fully-transparent value left them as bare floating text). */
-  --secondary: #eceef1;
+  /* Warm paper steps keep controls distinct without introducing a cool-grey
+     * cast that would fight the pink and green brand colors. */
+  --secondary: #f2f1ee;
   --secondary-foreground: #11171c;
-  --muted: #0000000f;
-  --muted-foreground: #6f6f6f;
+  --muted: rgba(61, 57, 41, 0.06);
+  --muted-foreground: #6e6c68;
   /* Dedicated chip background for inline code — a hair darker than the
      * white card so the chip reads as a tile. Kept separate from --muted
      * (now a translucent black wash reused for hover/quote surfaces). */
-  --code-bg: #0000000f;
+  --code-bg: #f2f1ee;
   --accent: #d7edfe;
   --accent-foreground: #04355d;
   --destructive: #c8324c;
@@ -220,12 +217,12 @@
      * that harmonizes with the brand blues (#2272b4 / #3b8ff5) and reads
      * with strong contrast on the white card surface. */
   --session-active: #2f7fd4;
-  --border: #e8ecf0;
+  --border: rgba(61, 57, 41, 0.1);
   /* Stronger divider/outline + a dedicated neutral button border. */
-  --border-strong: #a3b1bf;
-  --button-border: #d6d6d6;
+  --border-strong: rgba(61, 57, 41, 0.18);
+  --button-border: rgba(61, 57, 41, 0.14);
   --button-icon-hover-color: #11171c;
-  --input: #e8ecf0;
+  --input: rgba(61, 57, 41, 0.1);
   /* Focus ring matches --primary. */
   --ring: #11171c;
   /* Brand pink — reserved for brand moments, not status. */
@@ -242,20 +239,18 @@
   --chart-4: #d4972a;
   --chart-5: #8e99a4;
   --radius: 0.5rem;
-  /* Sidebar + workspace cards are white (--card); they float on the
-     * near-white .app-shell gradient canvas. --sidebar matches that
-     * gradient's lightest tone so bg-sidebar surfaces (the app-shell's
-     * fallback fill under the gradient, translucent chrome like the
-     * message copy button) blend into the canvas rather than painting
-     * a lavender band. */
-  --sidebar: #fdfafa;
+  /* Sidebar chrome uses the white surface tier while the workspace canvas
+     * stays softly gray-white behind it. */
+  --sidebar: #fff;
   --sidebar-foreground: #11171c;
   --sidebar-primary: #2272b4;
   --sidebar-primary-foreground: #fff;
   --sidebar-accent: #d7edfe;
   --sidebar-accent-foreground: #04355d;
-  --sidebar-border: #e8ecf0;
+  --sidebar-border: rgba(61, 57, 41, 0.1);
   --sidebar-ring: #2272b4;
+  --scrollbar-thumb: rgba(0, 0, 0, 0.12);
+  --scrollbar-thumb-hover: rgba(0, 0, 0, 0.22);
 }
 
 .dark {
@@ -333,47 +328,90 @@
   --sidebar-border: oklch(0.28 0.005 240);
   --sidebar-ring: oklch(0.92 0.003 240 / 0.4);
   --tooltip-bg: #2a2440;
+  --scrollbar-thumb: rgba(255, 255, 255, 0.08);
+  --scrollbar-thumb-hover: rgba(255, 255, 255, 0.16);
 }
 
-/* Compact light layout from the live agentic-ux-2026 reference. */
+/* SP2K-style auto-hiding scrollbars: a 10px hit area with a 6px painted
+ * thumb. Tracks and idle thumbs blend completely into their surfaces; the
+ * thumb appears faintly when the scrolling region is hovered. */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background: transparent;
+  background-clip: padding-box;
+  transition: background 0.2s ease;
+}
+
+*:hover::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+}
+
+*:hover::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-thumb-hover);
+}
+
+/* Firefox cannot animate its scrollbar pseudo-elements, but it can preserve
+ * the same transparent track and faint hover treatment. */
+* {
+  scrollbar-color: transparent transparent;
+}
+
+*:hover {
+  scrollbar-color: var(--scrollbar-thumb) transparent;
+}
+
+/* Isaac-inspired light canvas with Omnigent's restrained pink/green
+ * atmosphere. Cards stay white, so the hierarchy comes from subtle surface
+ * steps rather than visible grey boxes. */
 .app-shell {
-  background: #fff;
+  background:
+    radial-gradient(circle at 67% 13%, rgba(245, 59, 157, 0.045), transparent 30%),
+    radial-gradient(circle at 55% 94%, rgba(77, 197, 160, 0.04), transparent 30%),
+    linear-gradient(145deg, #f7f7f5 0%, #faf9f8 52%, #f6f7f5 100%);
 }
 
-/* Light-mode sidebar surface from the agentic-ux-2026 reference. */
+/* A white paper sidebar with the existing Omnigent blush texture. The warm
+ * hairline and low shadow mirror Isaac Light's quiet floating-panel depth. */
 :root:not(.dark) .conversations-sidebar:not([data-collapsed]) {
   --foreground: #27272a;
-  --muted: rgb(0 0 0 / 0.06);
-  --muted-foreground: #71717a;
+  --muted: rgba(61, 57, 41, 0.06);
+  --muted-foreground: #6e6c68;
 
-  border-color: #ececee;
-  box-shadow: 0 6px 12px -6px rgb(0 0 0 / 0.12);
+  border-color: rgba(61, 57, 41, 0.1);
+  box-shadow:
+    0 2px 8px rgba(61, 57, 41, 0.06),
+    0 1px 2px rgba(61, 57, 41, 0.04);
   background:
-    radial-gradient(rgba(142, 83, 115, 0.08) 0.5px, transparent 0.7px) 0 0 / 5px 5px,
-    radial-gradient(104% 74% at 112% 108%, rgba(248, 177, 215, 0.16), transparent 66%),
+    radial-gradient(rgba(142, 83, 115, 0.065) 0.5px, transparent 0.7px) 0 0 / 5px 5px,
+    radial-gradient(104% 74% at 112% 108%, rgba(248, 177, 215, 0.13), transparent 66%),
     linear-gradient(
       45deg,
-      rgb(253, 250, 250),
-      rgb(253, 249, 251) 8%,
-      rgb(253, 249, 251) 17%,
-      rgb(253, 249, 252) 25%,
-      rgb(254, 248, 253) 33%,
-      rgb(254, 248, 252) 42%,
-      rgb(254, 251, 252) 50%,
-      rgb(254, 251, 251) 58%,
-      rgb(254, 251, 251) 67%,
-      rgb(254, 251, 251) 75%,
-      rgb(254, 251, 251) 83%,
-      rgb(254, 251, 251) 92%,
-      rgb(254, 253, 253)
+      rgb(251, 250, 249),
+      rgb(252, 249, 250) 18%,
+      rgb(253, 249, 251) 36%,
+      rgb(253, 251, 251) 58%,
+      rgb(254, 253, 252) 80%,
+      rgb(255, 255, 255)
     );
 }
 
-:root:not(.dark) .landing-reference-composer {
-  border-color: #ececee;
+:root:not(.dark) .reference-composer-surface {
+  border-color: rgba(61, 57, 41, 0.1);
   background: #fff;
   background-image: none;
-  box-shadow: 0 6px 12px -6px rgb(0 0 0 / 0.12);
+  box-shadow:
+    0 2px 8px rgba(61, 57, 41, 0.06),
+    0 1px 2px rgba(61, 57, 41, 0.04);
 }
 .dark .app-shell {
   --foreground: rgb(226 225 218);
@@ -397,8 +435,8 @@
  * is independent of viewport height, and the mask sits on the viewport
  * box (not the scrolling content) so it stays pinned while text moves. */
 .chat-scroll-fade {
-  mask-image: linear-gradient(to bottom, transparent 48px, black 80px);
-  -webkit-mask-image: linear-gradient(to bottom, transparent 48px, black 80px);
+  mask-image: none;
+  -webkit-mask-image: none;
 }
 
 /* Turn rail's edges dissolve so it's clear the ticks scroll past both ends.
@@ -474,9 +512,7 @@ html.dark .app-shell aside[aria-label="Conversations"].conversations-sidebar:not
   color: hsl(55 9% 74%);
 }
 
-html.dark
-  .app-shell
-  .landing-reference-composer.landing-reference-composer[data-testid="new-chat-landing-composer"] {
+html.dark .app-shell .reference-composer-surface {
   --foreground: rgb(226 225 218);
   --muted-foreground: hsl(48 5% 57%);
   --muted: rgba(255, 255, 255, 0.035);
@@ -496,12 +532,12 @@ html.dark
     inset 0 1px rgba(255, 255, 255, 0.035) !important;
 }
 
-.dark .landing-reference-composer textarea::placeholder {
+.dark .reference-composer-surface textarea::placeholder {
   color: hsl(48 5% 57%);
   opacity: 1;
 }
 
-.dark .landing-reference-composer + div {
+.dark .reference-composer-surface + div {
   --muted-foreground: hsl(48 5% 57%);
   --muted: rgba(255, 255, 255, 0.035);
 }
@@ -510,7 +546,8 @@ html.dark
   color: rgb(226 225 218);
 }
 
-.dark .landing-reference-composer [data-testid="new-chat-landing-submit"]:not(:disabled) {
+.dark .reference-composer-surface [data-testid="new-chat-landing-submit"]:not(:disabled),
+.dark .reference-composer-surface button[aria-label="Send"]:not(:disabled) {
   color: #f8f5fa;
   background: linear-gradient(135deg, #f43ba6, #e60c7f);
   box-shadow: 0 10px 24px rgba(244, 59, 166, 0.24);
@@ -915,6 +952,23 @@ html.dark
 [data-streamdown="inline-code"] {
   font-size: 0.875em;
   background-color: var(--code-bg);
+}
+
+/* Session keyword chips mirror the Vercel prototype exactly: compact 12/18
+ * mono text, 5px inline + 1px block padding, and a quiet 4px surface. */
+.chat-conversation-content [data-streamdown="inline-code"] {
+  padding: 1px 5px;
+  border-radius: 4px;
+  background-color: rgba(0, 0, 0, 0.06);
+  color: rgb(39, 39, 42);
+  font-family: "Geist Mono Variable", "SF Mono", Monaco, Consolas, monospace;
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.dark .chat-conversation-content [data-streamdown="inline-code"] {
+  background-color: rgba(64, 64, 85, 0.66);
+  color: #fff;
 }
 [data-streamdown="code-block-body"] {
   font-size: 0.875em;
@@ -2082,4 +2136,36 @@ html.dark
     radial-gradient(ellipse at 20% 30%, rgba(136, 192, 208, 0.12) 0%, transparent 55%),
     radial-gradient(ellipse at 80% 20%, rgba(94, 129, 172, 0.08) 0%, transparent 45%),
     linear-gradient(160deg, #434c5e 0%, #2e3440 60%, #2e3440 100%);
+}
+
+/* Reference chat tables are part of the transcript, not standalone cards:
+ * no toolbar or nested rounded surfaces, just compact rows and hairline rules. */
+[data-role="assistant"] [data-streamdown="table-wrapper"] {
+  margin-block: 8px;
+  gap: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  padding: 0;
+}
+
+[data-role="assistant"] [data-streamdown="table-wrapper"] > div:first-child {
+  display: none;
+}
+
+[data-role="assistant"] [data-streamdown="table-wrapper"] > div:last-child {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+
+[data-role="assistant"] [data-streamdown="table-header"] {
+  background: transparent;
+}
+
+[data-role="assistant"] [data-streamdown="table-header-cell"],
+[data-role="assistant"] [data-streamdown="table-cell"] {
+  padding: 6px 12px;
+  font-size: 13px;
+  line-height: 20px;
 }

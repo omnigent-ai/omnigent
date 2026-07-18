@@ -39,6 +39,8 @@ function renderHeader(props: {
   isChildSession?: boolean;
   parentSessionId?: string;
   boundAgent?: Agent;
+  conversationId?: string;
+  sessionTitle?: string;
 }) {
   return render(
     <MemoryRouter initialEntries={["/"]}>
@@ -51,7 +53,8 @@ function renderHeader(props: {
           // No active session: PresenceAvatars / AgentInfoButton / right-panel
           // toggle / mobile FAB all gate on conversationId and stay unmounted,
           // isolating the left-slot affordances under test.
-          conversationId={undefined}
+          conversationId={props.conversationId}
+          sessionTitle={props.sessionTitle}
           boundAgent={props.boundAgent}
           canShare={false}
           onShare={() => {}}
@@ -70,6 +73,24 @@ function renderHeader(props: {
 }
 
 afterEach(cleanup);
+
+describe("ChatHeader — centered session title", () => {
+  it("shows the active session title in the header", () => {
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: "session-123",
+      sessionTitle: "Rethink new user onboarding",
+    });
+
+    expect(screen.getByText("Rethink new user onboarding")).toBeInTheDocument();
+  });
+
+  it("does not render a title without an active session", () => {
+    renderHeader({ sidebarOpen: true, sessionTitle: "Hidden landing title" });
+
+    expect(screen.queryByText("Hidden landing title")).toBeNull();
+  });
+});
 
 describe("ChatHeader — open-sidebar toggle visibility", () => {
   it("hides the toggle entirely when the sidebar is open", () => {
