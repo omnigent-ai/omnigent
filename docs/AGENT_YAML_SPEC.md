@@ -6,8 +6,9 @@ Omnigent can run an agent from a single YAML file:
 omnigent run path/to/agent.yaml
 ```
 
-Use this file to choose the harness/model, write the system prompt, and declare
-which tools, sub-agents, OS access, and policies the agent can use.
+Use this file to choose the harness/model, write the agent-owned system
+instructions, and declare which tools, sub-agents, OS access, and policies the
+agent can use.
 
 ## Minimal agent
 
@@ -28,12 +29,17 @@ executor:
 `prompt` may also be replaced by `instructions: AGENTS.md`; relative paths are
 resolved from the YAML file's directory.
 
+These fields define the portable, agent-authored portion of the system prompt.
+Omnigent may append framework-owned lifecycle or metadata instructions at
+runtime after agent and per-request instructions; those additions are not part
+of the agent YAML.
+
 ## Common top-level fields
 
 | Field | Required? | Purpose |
 | --- | --- | --- |
 | `name` | Recommended | Stable identifier shown in sessions and logs. |
-| `prompt` | Usually | Inline system prompt. |
+| `prompt` | Usually | Inline agent-owned system instructions. |
 | `instructions` | Optional | Inline instructions or a path to an instructions file. If set, it takes precedence over `prompt`. |
 | `executor` | Recommended | Harness, model, and auth settings. |
 | `tools` | Optional | MCP tools, Python function tools, sub-agents, handoffs, or inherited tools. |
