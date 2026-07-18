@@ -188,6 +188,12 @@ def test_configured_harness_map_covers_all_spellings(
         "hermes",
         "hermes-native",
         "native-hermes",
+        # Snowflake CoCo — native TUI (``omni coco``); all spellings gate on
+        # the ``cortex`` CLI.
+        "coco",
+        "coco-native",
+        "native-coco",
+        "cortex",
         # Generic ACP harness — config-gated (≥1 agent in the acp: block), no CLI
         # binary of its own; the acp:<slug> picks are config-derived, not keyed here.
         "acp",

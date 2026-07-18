@@ -15,7 +15,8 @@ export type NativeCodingAgentIconKind =
   | "qwen"
   | "antigravity"
   | "kimi"
-  | "hermes";
+  | "hermes"
+  | "coco";
 export type NativeCodingAgentCapability = "permissionMode" | "approvalMode" | "cursorMode";
 
 export interface NativeCodingAgentSpec {
@@ -155,6 +156,18 @@ export const NATIVE_CODING_AGENTS = [
     iconKind: "hermes",
     sortRank: 80,
   },
+  {
+    // Snowflake CoCo (Cortex Code). Auth/approval surface in the embedded
+    // terminal (CoCo's own connection wizard + three-tier approvals), so no
+    // capability flags are declared here.
+    key: "coco",
+    agentName: "coco-native-ui",
+    harness: "coco-native",
+    wrapperLabel: "coco-native-ui",
+    displayName: "CoCo",
+    iconKind: "coco",
+    sortRank: 90,
+  },
 ] as const satisfies readonly NativeCodingAgentSpec[];
 
 const BY_AGENT_NAME: Map<string, NativeCodingAgentSpec> = new Map(
@@ -181,6 +194,11 @@ const HARNESS_ALIASES: Record<string, string> = {
   "native-kimi": "kimi-native",
   "native-hermes": "hermes-native",
   "native-opencode": "opencode-native",
+  "native-coco": "coco-native",
+  // Friendly server-side spellings (product + binary name) fold to the
+  // canonical native harness, mirroring omnigent.harness_plugins aliases.
+  coco: "coco-native",
+  cortex: "coco-native",
 };
 
 export function nativeCodingAgentForAgentName(

@@ -18,8 +18,8 @@
 //
 // Hence two predicates: forkTargetCarriesHistory (rebuild ∪ preamble ∪ SDK)
 // and switchTargetCarriesHistory (rebuild ∪ SDK — no preamble). Native
-// harnesses with no carry path (kiro/kimi/goose) are offered by neither; an
-// unclassifiable harness (catalog harness=null) is conservatively dropped.
+// harnesses with no carry path (kiro/kimi/goose/coco) are offered by neither;
+// an unclassifiable harness (catalog harness=null) is conservatively dropped.
 
 /** Provider family a harness consumes, or null when unknown. */
 export function harnessFamily(
@@ -121,7 +121,7 @@ const PREAMBLE_FORK_HARNESSES: ReadonlySet<string> = new Set([
  * replays the transcript as context). Conservatively false for an
  * unclassifiable harness (the catalog can report harness=null when the bundle
  * failed to load) and for native harnesses with no carry path
- * (kiro/kimi/goose).
+ * (kiro/kimi/goose/coco).
  *
  * NOTE: the SDK branch is `harnessFamily(h) !== null`, which also matches the
  * one native harness that has a single family today — antigravity-native

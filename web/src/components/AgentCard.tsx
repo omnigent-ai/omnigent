@@ -1,6 +1,7 @@
 import { BotIcon } from "lucide-react";
 import { AntigravityIcon } from "@/components/icons/AntigravityIcon";
 import { ClaudeIcon } from "@/components/icons/ClaudeIcon";
+import { CocoIcon } from "@/components/icons/CocoIcon";
 import { CodexIcon } from "@/components/icons/CodexIcon";
 import { CursorIcon } from "@/components/icons/CursorIcon";
 import { GooseIcon } from "@/components/icons/GooseIcon";
@@ -41,12 +42,15 @@ function iconForAgent(agent: AvailableAgent): ComponentType<SVGProps<SVGSVGEleme
   if (nativeAgent?.iconKind === "kimi") return KimiIcon;
   if (nativeAgent?.iconKind === "antigravity") return AntigravityIcon;
   if (nativeAgent?.iconKind === "hermes") return HermesIcon;
+  if (nativeAgent?.iconKind === "coco") return CocoIcon;
   // A null harness (spec couldn't load) flows through to the bot fallback.
   if (agent.harness?.includes("codex")) return CodexIcon;
   if (agent.harness?.includes("claude")) return ClaudeIcon;
   // Both the SDK "cursor" harness and "cursor-native" get the Cursor glyph.
   if (agent.harness?.includes("cursor")) return CursorIcon;
   if (agent.harness?.includes("hermes")) return HermesIcon;
+  // Both the "coco-native" harness and its "cortex" alias get the CoCo glyph.
+  if (agent.harness?.includes("coco") || agent.harness === "cortex") return CocoIcon;
   if (agent.harness?.includes("kiro")) return KiroIcon;
   if (agent.harness?.includes("goose")) return GooseIcon;
   // Both the SDK "kimi"/"kimi-code" harness and "kimi-native" get the Kimi glyph.

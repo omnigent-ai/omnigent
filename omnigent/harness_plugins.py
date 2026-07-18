@@ -16,6 +16,7 @@ from typing import Any
 from omnigent._wrapper_labels import (
     ANTIGRAVITY_NATIVE_WRAPPER_VALUE,
     CLAUDE_NATIVE_WRAPPER_VALUE,
+    COCO_NATIVE_WRAPPER_VALUE,
     CODEX_NATIVE_WRAPPER_VALUE,
     CURSOR_NATIVE_WRAPPER_VALUE,
     GOOSE_NATIVE_WRAPPER_VALUE,
@@ -198,6 +199,15 @@ HERMES_NATIVE_CODING_AGENT = NativeCodingAgent(
     terminal_name="hermes",
 )
 
+COCO_NATIVE_CODING_AGENT = NativeCodingAgent(
+    key="coco",
+    display_name="CoCo",
+    agent_name="coco-native-ui",
+    harness="coco-native",
+    wrapper_label=COCO_NATIVE_WRAPPER_VALUE,
+    terminal_name="coco",
+)
+
 
 # Declared capabilities for the built-in harnesses. Each value is backed by the
 # module that implements it; the derivable axes (model_family, subagents) are
@@ -348,6 +358,21 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+    ),
+    # Snowflake CoCo (Cortex Code) native TUI. Tool approvals stay in the
+    # vendor TUI (its three-tier confirm/plan/bypass modes) — no web mirror
+    # yet. streaming=False by construction: the forwarder mirrors finished
+    # turns from CoCo's transcript at each Stop hook, so no delta path exists.
+    "coco-native": _C(
+        _IM.NATIVE_TUI,
+        _EL.NONE,
+        _RS.WARM_REATTACH,
+        _EF.NONE,
+        _MF.MULTI,
+        _AU.OWN_AUTH,
+        subagents=False,
+        interrupt=True,
+        streaming=False,
     ),
     # SDK / subprocess harnesses (run the vendor model directly). The first four
     # are bench-verified interrupt=streaming=True.
@@ -514,6 +539,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
             "antigravity-native",
             "claude-native",
             "claude-sdk",
+            "coco-native",
             "codex",
             "codex-native",
             "copilot",
@@ -541,6 +567,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "antigravity-native": "omnigent.inner.antigravity_native_harness",
         "claude-native": "omnigent.inner.claude_native_harness",
         "claude-sdk": "omnigent.inner.claude_sdk_harness",
+        "coco-native": "omnigent.inner.coco_native_harness",
         "codex": "omnigent.inner.codex_harness",
         "codex-native": "omnigent.inner.codex_native_harness",
         "copilot": "omnigent.inner.copilot_harness",
@@ -563,10 +590,15 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
     aliases={
         "agy": "antigravity",
         "claude": "claude-sdk",
+        # Snowflake CoCo ships only as a native TUI harness, so the friendly
+        # spellings (product name, binary name) all resolve to it.
+        "coco": "coco-native",
+        "cortex": "coco-native",
         "github-copilot": "copilot",
         "google-antigravity": "antigravity",
         "kimi-code": "kimi",
         "native-antigravity": "antigravity-native",
+        "native-coco": "coco-native",
         "native-goose": "goose-native",
         "native-hermes": "hermes-native",
         "native-kimi": "kimi-native",
@@ -582,6 +614,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         {
             "antigravity-native",
             "claude-native",
+            "coco-native",
             "codex-native",
             "cursor-native",
             "goose-native",
@@ -590,6 +623,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
             "kiro-native",
             "native-antigravity",
             "native-claude",
+            "native-coco",
             "native-codex",
             "native-cursor",
             "native-goose",
@@ -616,6 +650,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         QWEN_NATIVE_CODING_AGENT,
         KIMI_NATIVE_CODING_AGENT,
         HERMES_NATIVE_CODING_AGENT,
+        COCO_NATIVE_CODING_AGENT,
     ),
     model_env_keys={
         "acp": "HARNESS_ACP_MODEL",

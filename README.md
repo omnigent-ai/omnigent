@@ -261,6 +261,7 @@ Or launch a specific agent runtime:
 ```bash
 omnigent claude                      # Claude Code, in a session your team can join
 omnigent codex                       # Codex
+omnigent coco                        # Snowflake CoCo (Cortex Code)
 omnigent cursor                      # Cursor
 omnigent opencode                    # OpenCode
 omnigent hermes                      # Hermes Agent (Nous Research)
@@ -473,9 +474,10 @@ name: my_agent
 prompt: You are a helpful data analyst.
 
 executor:
-  harness: claude-sdk          # or: claude-native, codex, codex-native, cursor,
-                               # cursor-native, hermes, hermes-native, opencode,
-                               # pi, pi-native, openai-agents
+  harness: claude-sdk          # or: claude-native, coco-native, codex,
+                               # codex-native, cursor, cursor-native, hermes,
+                               # hermes-native, opencode, pi, pi-native,
+                               # openai-agents
 
 tools:
   # A local Python function (schema auto-generated from the signature)

@@ -306,6 +306,15 @@ def _dispatch_wrapper(
             hermes_args=(),
         )
         return True
+    if native_agent.key == "coco":
+        from omnigent.coco_native import run_coco_native
+
+        run_coco_native(
+            server=server,
+            session_id=session_id,
+            coco_args=(),
+        )
+        return True
     return False
 
 

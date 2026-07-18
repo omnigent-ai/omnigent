@@ -89,6 +89,11 @@ COPILOT_KEY = "copilot"
 # Omnigent-managed credentials). The ``hermes`` binary must be on PATH.
 HERMES_KEY = "hermes"
 
+# Snowflake CoCo (Cortex Code) is installed via Snowflake's curl installer and
+# authenticates against the user's own ``~/.snowflake/connections.toml`` (no
+# Omnigent-managed credentials). The binary is named ``cortex``.
+COCO_KEY = "coco"
+
 
 # Keyed by harness family (Claude=anthropic, Codex=openai) plus the pi
 # fallback. Binaries/packages mirror ucode's ``TOOL_SPECS`` so the two tools
@@ -196,6 +201,13 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         package=None,
         install_hint="curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash",
     ),
+    COCO_KEY: HarnessInstallSpec(
+        "CoCo",
+        "cortex",
+        package=None,
+        install_hint="curl -LsS https://ai.snowflake.com/static/cc-scripts/install.sh | sh",
+        auth_hint="run `cortex` once and complete the Snowflake connection setup",
+    ),
 }
 
 
@@ -260,6 +272,12 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     # gates on the same binary.
     "hermes-native": HERMES_KEY,
     "native-hermes": HERMES_KEY,
+    # Native Snowflake CoCo TUI (``coco-native``, via ``omni coco``) wraps the
+    # ``cortex`` CLI; all accepted spellings gate on the same binary.
+    "coco-native": COCO_KEY,
+    "native-coco": COCO_KEY,
+    COCO_KEY: COCO_KEY,
+    "cortex": COCO_KEY,
 }
 
 

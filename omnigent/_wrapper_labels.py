@@ -80,3 +80,7 @@ KIMI_NATIVE_WRAPPER_VALUE = "kimi-native-ui"
 # Value the ``omnigent hermes`` wrapper writes into
 # ``conversations.labels[WRAPPER_LABEL_KEY]``.
 HERMES_NATIVE_WRAPPER_VALUE = "hermes-native-ui"
+
+# Value the ``omnigent coco`` (Snowflake CoCo / Cortex Code) wrapper writes
+# into ``conversations.labels[WRAPPER_LABEL_KEY]``.
+COCO_NATIVE_WRAPPER_VALUE = "coco-native-ui"

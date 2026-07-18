@@ -91,6 +91,7 @@ OMNIGENT_HARNESSES = frozenset(
         "antigravity-native",
         "claude-native",
         "claude-sdk",
+        "coco-native",
         "codex",
         "codex-native",
         "copilot",
@@ -130,6 +131,9 @@ OMNIGENT_HARNESS_ALIASES = frozenset(
         "native-hermes",
         "github-copilot",
         "native-kimi",
+        "coco",
+        "cortex",
+        "native-coco",
     }
 )
 _OMNIGENT_ACCEPTED_HARNESSES = OMNIGENT_HARNESSES | OMNIGENT_HARNESS_ALIASES

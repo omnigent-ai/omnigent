@@ -145,6 +145,12 @@ _HARNESS_MODULES: dict[str, str] = {
     # name stays the headless subprocess harness. See
     # omnigent/inner/hermes_native_harness.py.
     "hermes-native": "omnigent.inner.hermes_native_harness",
+    # coco-native harness wrap. Drives the resident Snowflake CoCo (Cortex
+    # Code) ``cortex`` TUI by injecting each web-UI turn into its tmux pane and
+    # mirroring the transcript back from CoCo's hook event log + conversations
+    # store — a native-CLI harness like goose-native, so it IS in
+    # ``NATIVE_HARNESSES``. See omnigent/inner/coco_native_harness.py.
+    "coco-native": "omnigent.inner.coco_native_harness",
 }
 
 # Keep the historical mutable dict surface while sourcing builtins and

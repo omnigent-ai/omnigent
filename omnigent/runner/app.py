@@ -65,6 +65,7 @@ from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
 from omnigent.runner.resource_registry import (
     ANTIGRAVITY_NATIVE_TERMINAL_ROLE,
     CLAUDE_NATIVE_TERMINAL_ROLE,
+    COCO_NATIVE_TERMINAL_ROLE,
     CODEX_NATIVE_TERMINAL_ROLE,
     CURSOR_NATIVE_TERMINAL_ROLE,
     GOOSE_NATIVE_TERMINAL_ROLE,
@@ -2496,6 +2497,191 @@ async def _auto_create_goose_terminal(
     _register_auto_forwarder_task(session_id, _forwarder_task)
     _logger.info(
         "Auto-created goose terminal + forwarder/approval-mirror for session %s; task=%s",
+        session_id,
+        _forwarder_task.get_name(),
+    )
+    return terminal_view
+
+
+async def _persist_coco_external_session_id(
+    server_client: httpx.AsyncClient | None,
+    session_id: str,
+    coco_session_id: str,
+) -> None:
+    """Record the CoCo session id on the Omnigent session as ``external_session_id``.
+
+    Mirrors qwen-/hermes-native: the persisted id is what a later cold resume
+    reads back from the session snapshot to relaunch ``cortex -r <id>``.
+    Best-effort — a transient failure only degrades resume, never the live
+    turn (the forwarder re-announces the id on the next hook event).
+
+    :param server_client: Runner Omnigent server client (``None`` skips the write).
+    :param session_id: Omnigent session/conversation id.
+    :param coco_session_id: The CoCo session id the lifecycle hook announced.
+    """
+    if server_client is None:
+        return
+    try:
+        resp = await server_client.patch(
+            f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
+            json={"external_session_id": coco_session_id},
+            timeout=10.0,
+        )
+    except httpx.HTTPError:
+        _logger.warning(
+            "Could not record coco external_session_id for %s; resume will start fresh",
+            session_id,
+            exc_info=True,
+        )
+        return
+    if resp.status_code >= 400:
+        _logger.warning(
+            "AP rejected coco external_session_id PATCH (%s); session=%s",
+            resp.status_code,
+            session_id,
+        )
+
+
+async def _auto_create_coco_terminal(
+    session_id: str,
+    resource_registry: SessionResourceRegistry,
+    publish_event: Callable[[str, dict[str, Any]], None],
+    *,
+    server_client: httpx.AsyncClient | None,
+    ensure_comment_relay: Callable[..., Awaitable[None]] | None = None,
+) -> SessionResourceView:
+    """
+    Auto-create the Snowflake CoCo TUI terminal for a coco-native session.
+
+    Launches the ``cortex`` TUI in a runner-owned tmux pane with a per-session
+    ``SNOWFLAKE_HOME`` that symlinks the user's real config/auth and adds the
+    Omnigent lifecycle hook (see :func:`omnigent.coco_native_bridge.write_coco_home`).
+    CoCo mints its own session id in TUI mode, so discovery flows the other way:
+    the hook's ``SessionStart`` event announces the id and the forwarder persists
+    it as ``external_session_id`` for cold resume (``cortex -r <id>``).
+    Mirrors :func:`_auto_create_goose_terminal`.
+
+    :param session_id: Session/conversation identifier.
+    :param resource_registry: Session resource registry for launching the terminal.
+    :param publish_event: Runner session event publisher.
+    :param server_client: Runner Omnigent server client.
+    :returns: Created terminal resource view.
+    """
+    from omnigent.coco_native import resolve_coco_executable
+    from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
+
+    # Tear down any forwarder left from a prior terminal for this session before
+    # re-creating, so old and new tasks can't both mirror (double-posting), and
+    # drop the prior terminal's stale forward cursor + hook event log.
+    await _cancel_auto_forwarder_task(session_id)
+    from omnigent.coco_native_bridge import (
+        bridge_dir_for_session_id,
+        coco_session_recording_exists,
+        write_coco_home,
+        write_tmux_target,
+    )
+    from omnigent.coco_native_forwarder import clear_coco_bridge_state
+
+    bridge_dir = bridge_dir_for_session_id(session_id)
+    clear_coco_bridge_state(bridge_dir)
+    coco_home = await asyncio.to_thread(write_coco_home, bridge_dir)
+
+    # ``_pi_native_launch_config`` is a generic session-snapshot reader
+    # (workspace + terminal_launch_args); reused here, not Pi-specific.
+    launch_config = await _pi_native_launch_config(
+        session_id=session_id,
+        server_client=server_client,
+    )
+    workspace = os.path.realpath(str(launch_config.workspace))
+    coco_command = resolve_coco_executable()
+    # Cold resume: relaunch the prior CoCo session when its recording exists
+    # (``-r`` on an unknown id errors). The conversations dir is symlinked
+    # from the user's real home, so the recording check resolves either way.
+    # A fork or a never-announced session starts fresh; CoCo announces the new
+    # id via the SessionStart hook and it is persisted below.
+    resume_args: list[str] = []
+    existing_coco_id = launch_config.external_session_id
+    if existing_coco_id and coco_session_recording_exists(existing_coco_id):
+        resume_args = ["-r", existing_coco_id]
+    coco_args = [
+        *resume_args,
+        *(launch_config.terminal_launch_args or []),
+    ]
+    coco_env: dict[str, str] = {
+        # Per-session home: user config/auth symlinked in, hooks.json replaced
+        # with the Omnigent lifecycle relay the forwarder tails.
+        "SNOWFLAKE_HOME": str(coco_home),
+    }
+    terminal_view = await resource_registry.launch_required_terminal(
+        session_id=session_id,
+        terminal_name="coco",
+        session_key="main",
+        resource_role=COCO_NATIVE_TERMINAL_ROLE,
+        spec=TerminalEnvSpec(
+            os_env=OSEnvSpec(type="caller_process", cwd=workspace),
+            command=coco_command,
+            args=coco_args,
+            env=coco_env,
+            scrollback=100_000,
+            tmux_allow_passthrough=True,
+            tmux_start_on_attach=False,
+        ),
+    )
+    # Advertise the tmux socket+target so the coco-native harness executor can
+    # inject web-UI messages into this same pane (tmux paste).
+    terminal_registry = resource_registry.terminal_registry
+    if terminal_registry is not None:
+        instance = terminal_registry.get(session_id, "coco", "main")
+        if instance is not None and instance.running:
+            write_tmux_target(
+                bridge_dir,
+                socket_path=instance.socket_path,
+                tmux_target=instance.tmux_target,
+            )
+    publish_event(
+        session_id,
+        {
+            "type": "session.resource.created",
+            "resource": session_resource_view_to_dict(terminal_view),
+        },
+    )
+
+    # Mirror the CoCo TUI's conversation back into the Omnigent session so the
+    # chat view tracks the embedded terminal. Host-spawned sessions have no CLI
+    # client to start this, so the runner owns it — reusing the runner's own
+    # server URL + refresh-capable auth.
+    from omnigent.runner._entry import _make_auth_token_factory, _RunnerDatabricksAuth
+
+    server_url = _required_runner_env("RUNNER_SERVER_URL")
+    _runner_auth = _RunnerDatabricksAuth(_make_auth_token_factory())
+
+    from omnigent.coco_native_forwarder import supervise_coco_forwarder
+
+    if server_client is not None and ensure_comment_relay is not None:
+        await ensure_comment_relay(
+            session_id,
+            explicit_bridge_dir=bridge_dir,
+            await_notify=False,
+        )
+
+    async def _on_coco_session_id(coco_session_id: str) -> None:
+        await _persist_coco_external_session_id(server_client, session_id, coco_session_id)
+
+    _forwarder_task = asyncio.create_task(
+        supervise_coco_forwarder(
+            base_url=server_url,
+            headers={},
+            session_id=session_id,
+            bridge_dir=bridge_dir,
+            agent_name="coco-native-ui",
+            on_coco_session_id=_on_coco_session_id,
+            auth=_runner_auth,
+        ),
+        name=f"coco-forwarder-{session_id}",
+    )
+    _register_auto_forwarder_task(session_id, _forwarder_task)
+    _logger.info(
+        "Auto-created coco terminal + forwarder for session %s; task=%s",
         session_id,
         _forwarder_task.get_name(),
     )
@@ -6088,8 +6274,8 @@ async def _delete_native_bridge_dirs(
     holding a bridge token / auth secret + MCP config — secret material. Closing
     the pane does not remove it, so without this they accumulate even on a clean
     session delete (issue #1350). We don't know which harness this session used,
-    so delete every candidate dir for all 11 native families
-    (antigravity/claude/codex/cursor/goose/hermes/kimi/kiro/opencode/pi/qwen);
+    so delete every candidate dir for all 12 native families
+    (antigravity/claude/coco/codex/cursor/goose/hermes/kimi/kiro/opencode/pi/qwen);
     the per-target ``FileNotFoundError`` swallow makes wrong-harness / already-gone
     cases a no-op, while other ``OSError``s are logged at debug rather than hidden.
     Antigravity/claude/codex/opencode bridge ids can be rotated via a session
@@ -6111,6 +6297,9 @@ async def _delete_native_bridge_dirs(
     )
     from omnigent.claude_native_bridge import (
         bridge_dir_for_bridge_id as claude_bridge_dir,
+    )
+    from omnigent.coco_native_bridge import (
+        bridge_dir_for_session_id as coco_bridge_dir,
     )
     from omnigent.codex_native_bridge import (
         CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
@@ -6160,6 +6349,7 @@ async def _delete_native_bridge_dirs(
         claude_bridge_dir(session_id),
         codex_bridge_dir(labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY) or session_id),
         codex_bridge_dir(session_id),
+        coco_bridge_dir(session_id),
         cursor_bridge_dir(session_id),
         goose_bridge_dir(session_id),
         hermes_bridge_dir(session_id),
@@ -7976,6 +8166,7 @@ def create_runner_app(
     _qwen_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _kimi_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _hermes_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
+    _coco_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     # Per-session lock guarding the claude-native terminal auto-create in
     # ``create_session``. Two ``POST /v1/sessions`` calls can land
     # concurrently on a host-launched runner — ``_on_runner_connect``
@@ -8970,6 +9161,10 @@ def create_runner_app(
                 from omnigent.kimi_native_bridge import build_kimi_native_spawn_env
 
                 spawn_env = build_kimi_native_spawn_env(session_id)
+            if harness_name == "coco-native" and spawn_env is None:
+                from omnigent.coco_native_bridge import build_coco_native_spawn_env
+
+                spawn_env = build_coco_native_spawn_env(session_id)
             _session_spec_cache[session_id] = spec_entry
         else:
             harness_name = "runner-test-default"
@@ -9535,6 +9730,37 @@ def create_runner_app(
                     finally:
                         _publish_terminal_pending(_publish_event, session_id, False)
 
+        if harness_name == "coco-native":
+            _coco_ensure_lock = _coco_terminal_ensure_locks.setdefault(session_id, asyncio.Lock())
+            async with _coco_ensure_lock:
+                _tr = resource_registry.terminal_registry
+                _has_coco_terminal = (
+                    _tr is not None and _tr.get(session_id, "coco", "main") is not None
+                )
+                if not _has_coco_terminal:
+                    _publish_terminal_pending(_publish_event, session_id, True)
+                    try:
+                        await _auto_create_coco_terminal(
+                            session_id,
+                            resource_registry,
+                            _publish_event,
+                            server_client=server_client,
+                            ensure_comment_relay=_ensure_comment_relay_started,
+                        )
+                    except Exception as exc:
+                        _logger.exception(
+                            "Failed to auto-create coco terminal for %s",
+                            session_id,
+                        )
+                        _publish_native_terminal_start_error(
+                            _publish_event,
+                            session_id,
+                            "CoCo",
+                            exc,
+                        )
+                    finally:
+                        _publish_terminal_pending(_publish_event, session_id, False)
+
         if harness_name == "qwen-native":
             _qwen_ensure_lock = _qwen_terminal_ensure_locks.setdefault(session_id, asyncio.Lock())
             async with _qwen_ensure_lock:
@@ -9877,6 +10103,7 @@ def create_runner_app(
         _qwen_terminal_ensure_locks.pop(session_id, None)
         _kimi_terminal_ensure_locks.pop(session_id, None)
         _hermes_terminal_ensure_locks.pop(session_id, None)
+        _coco_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         _interrupted_sessions.discard(session_id)
         # Stop any TUI→web transcript forwarder (cursor-/goose-native) for this
@@ -10568,6 +10795,7 @@ def create_runner_app(
             "qwen-native",
             "kimi-native",
             "hermes-native",
+            "coco-native",
         }:
             return
         if status == "idle" and harness in {"codex-native", "antigravity-native"}:
@@ -11683,6 +11911,78 @@ def create_runner_app(
         ):
             _logger.warning(
                 "Hermes-native stop succeeded but sub-agent delivery was "
+                "not confirmed; session=%s reason=%s",
+                conv_id,
+                delivery_ack.reason,
+            )
+        return Response(status_code=204)
+
+    async def _handle_coco_native_interrupt(conv_id: str) -> Response:
+        """Cancel the in-flight CoCo turn by sending ``Escape`` to its TUI pane.
+
+        coco-native turns run inside the ``cortex`` TUI; the runner harness
+        task returns right after the tmux paste, so the in-process cancel floor
+        has nothing to cancel. CoCo binds Escape to interrupt (its footer
+        advertises "esc to interrupt"); Ctrl+C is avoided because CoCo
+        double-taps it into a full TUI exit. Mirrors the goose-native interrupt.
+
+        :param conv_id: Session/conversation identifier.
+        :returns: 204 when Escape was sent; 503 if the tmux target is unavailable.
+        """
+        from omnigent.coco_native_bridge import bridge_dir_for_session_id, inject_interrupt
+
+        try:
+            await asyncio.to_thread(
+                inject_interrupt, bridge_dir_for_session_id(conv_id), timeout_s=1.0
+            )
+        except RuntimeError as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "coco_native_interrupt_failed",
+                    "detail": _client_safe_error_detail(exc, context="coco-native interrupt"),
+                },
+            )
+        _wake_parent_after_native_interrupt(conv_id)
+        return Response(status_code=204)
+
+    async def _handle_coco_native_stop(conv_id: str) -> Response:
+        """Hard-stop a coco-native session by killing its tmux session.
+
+        Mirrors :func:`_handle_goose_native_stop`: kill the pane (ends
+        ``cortex``), tear the terminal resource down, cancel the forwarder,
+        publish ``idle``, and reclaim any sub-agent work entry.
+
+        :param conv_id: Session/conversation identifier.
+        :returns: 204 on success; 503 if the tmux target is unavailable.
+        """
+        from omnigent.coco_native_bridge import bridge_dir_for_session_id, kill_session
+
+        try:
+            await asyncio.to_thread(
+                kill_session, bridge_dir_for_session_id(conv_id), timeout_s=1.0
+            )
+        except RuntimeError as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "coco_native_stop_failed",
+                    "detail": _client_safe_error_detail(exc, context="coco-native stop"),
+                },
+            )
+        await _teardown_session_terminals(conv_id)
+        await _cancel_auto_forwarder_task(conv_id)
+        _publish_event(conv_id, {"type": "session.status", "status": "idle"})
+        delivery_ack = _mark_subagent_terminal_and_wake(
+            conv_id,
+            status="cancelled",
+            output="[System: sub-agent stopped]",
+        )
+        if not delivery_ack.delivered and (
+            delivery_ack.entry is not None or conv_id in _session_sub_agent_names
+        ):
+            _logger.warning(
+                "CoCo-native stop succeeded but sub-agent delivery was "
                 "not confirmed; session=%s reason=%s",
                 conv_id,
                 delivery_ack.reason,
@@ -14205,6 +14505,10 @@ def create_runner_app(
             from omnigent.kimi_native_bridge import build_kimi_native_spawn_env
 
             spawn_env = build_kimi_native_spawn_env(conv_id)
+        if harness_name == "coco-native" and spawn_env is None:
+            from omnigent.coco_native_bridge import build_coco_native_spawn_env
+
+            spawn_env = build_coco_native_spawn_env(conv_id)
 
         agent_version = dispatch.agent_version if dispatch else body.get("agent_version")
         if agent_version is not None and conv_id in _version_cache:
@@ -15199,6 +15503,9 @@ def create_runner_app(
             if _harness == "kimi-native":
                 # kimi turn lives in the kimi TUI; send Escape to stop it.
                 return await _handle_kimi_native_interrupt(conversation_id)
+            if _harness == "coco-native":
+                # coco turn lives in the cortex TUI; send Escape to stop it.
+                return await _handle_coco_native_interrupt(conversation_id)
             # In-process harness: mark interrupted, forward an interrupt to the
             # harness, and force-cancel the runner turn task so the turn ends
             # promptly even if the harness can't honor the interrupt in time.
@@ -15297,6 +15604,9 @@ def create_runner_app(
             if _harness == "kimi-native":
                 # Hard-kill the kimi tmux pane (the TUI is the runtime).
                 return await _handle_kimi_native_stop(conversation_id)
+            if _harness == "coco-native":
+                # Hard-kill the cortex tmux pane (the TUI is the runtime).
+                return await _handle_coco_native_stop(conversation_id)
             await _cancel_inprocess_turn(conversation_id)
             return Response(status_code=204)
 
@@ -16177,6 +16487,41 @@ def create_runner_app(
                         session_id,
                     )
                     return _native_terminal_start_error_response(exc, "Hermes")
+            return JSONResponse(
+                status_code=200,
+                content=session_resource_view_to_dict(terminal_view),
+            )
+
+        if (
+            body.get("ensure_native_terminal")
+            and terminal_name == "coco"
+            and session_key == "main"
+        ):
+            coco_terminal_id = terminal_resource_id("coco", "main")
+            ensure_lock = _coco_terminal_ensure_locks.setdefault(session_id, asyncio.Lock())
+            async with ensure_lock:
+                existing = await resource_registry.get_terminal_resource(
+                    session_id, coco_terminal_id
+                )
+                if existing is not None:
+                    return JSONResponse(
+                        status_code=200,
+                        content=session_resource_view_to_dict(existing),
+                    )
+                try:
+                    terminal_view = await _auto_create_coco_terminal(
+                        session_id,
+                        resource_registry,
+                        _publish_event,
+                        server_client=server_client,
+                        ensure_comment_relay=_ensure_comment_relay_started,
+                    )
+                except Exception as exc:
+                    _logger.exception(
+                        "CoCo terminal ensure failed for session=%s",
+                        session_id,
+                    )
+                    return _native_terminal_start_error_response(exc, "CoCo")
             return JSONResponse(
                 status_code=200,
                 content=session_resource_view_to_dict(terminal_view),
@@ -18091,6 +18436,7 @@ def create_runner_app(
         _qwen_terminal_ensure_locks.pop(session_id, None)
         _kimi_terminal_ensure_locks.pop(session_id, None)
         _hermes_terminal_ensure_locks.pop(session_id, None)
+        _coco_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         await resource_registry.cleanup_session(session_id)
         # This is the runner endpoint the SERVER's session-delete actually
@@ -18161,6 +18507,7 @@ def create_runner_app(
         _qwen_terminal_ensure_locks.pop(session_id, None)
         _kimi_terminal_ensure_locks.pop(session_id, None)
         _hermes_terminal_ensure_locks.pop(session_id, None)
+        _coco_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         # Close terminals with ``session.resource.deleted`` events BEFORE
         # cleanup_session — cleanup_conversation would silently pop them

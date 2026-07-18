@@ -29,6 +29,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_plugins import (
     ANTIGRAVITY_NATIVE_CODING_AGENT,
     CLAUDE_NATIVE_CODING_AGENT,
+    COCO_NATIVE_CODING_AGENT,
     CODEX_NATIVE_CODING_AGENT,
     CURSOR_NATIVE_CODING_AGENT,
     GOOSE_NATIVE_CODING_AGENT,
@@ -165,6 +166,7 @@ _HERMES_NATIVE_AGENT_NAME = HERMES_NATIVE_CODING_AGENT.agent_name
 _ANTIGRAVITY_NATIVE_AGENT_NAME = ANTIGRAVITY_NATIVE_CODING_AGENT.agent_name
 _QWEN_NATIVE_AGENT_NAME = QWEN_NATIVE_CODING_AGENT.agent_name
 _KIMI_NATIVE_AGENT_NAME = KIMI_NATIVE_CODING_AGENT.agent_name
+_COCO_NATIVE_AGENT_NAME = COCO_NATIVE_CODING_AGENT.agent_name
 _DEBBY_AGENT_NAME = "debby"
 _POLLY_AGENT_NAME = "polly"
 _UNMATCHED_ROUTE_TEMPLATE = "<unmatched>"
@@ -452,6 +454,7 @@ def _ensure_default_agents(
     _ensure_default_antigravity_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_qwen_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_kimi_native_agent(agent_store, artifact_store, agent_cache)
+    _ensure_default_coco_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_debby_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_polly_agent(agent_store, artifact_store, agent_cache)
     _ensure_extra_builtin_agents(agent_store, artifact_store, agent_cache)
@@ -953,6 +956,34 @@ def _ensure_default_kimi_native_agent(
         agent_cache,
         name=_KIMI_NATIVE_AGENT_NAME,
         bundle_bytes=_build_kimi_native_bundle(),
+    )
+
+
+def _build_coco_native_bundle() -> bytes:
+    """Build a gzipped tarball of the coco-native-ui agent spec."""
+    import tempfile
+
+    from omnigent.coco_native import _materialize_coco_agent_spec
+    from omnigent.spec import materialize_bundle
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        spec_path = _materialize_coco_agent_spec(Path(tmpdir))
+        bundle_dir = materialize_bundle(spec_path, Path(tmpdir) / "bundle")
+        return _tar_gz_dir(bundle_dir)
+
+
+def _ensure_default_coco_agent(
+    agent_store: AgentStore,
+    artifact_store: ArtifactStore,
+    agent_cache: Any,
+) -> None:
+    """Register or refresh the coco-native-ui agent."""
+    _ensure_builtin_agent(
+        agent_store,
+        artifact_store,
+        agent_cache,
+        name=_COCO_NATIVE_AGENT_NAME,
+        bundle_bytes=_build_coco_native_bundle(),
     )
 
 

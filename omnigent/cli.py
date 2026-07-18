@@ -1323,6 +1323,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "antigravity",
         "attach",
         "claude",
+        "coco",
         "codex",
         "config",
         "cursor",
@@ -5488,6 +5489,69 @@ def goose(
     default=None,
     help=(
         "Remote omnigent URL. Ensures the host daemon, asks the "
+        "daemon-spawned runner to launch the Snowflake CoCo TUI, and attaches "
+        'this TTY. Pass --server "" to auto-spawn a persistent local server in '
+        "the background and use that instead of a remote one."
+    ),
+)
+@click.option(
+    "-r",
+    "--resume",
+    "resume",
+    is_flag=False,
+    flag_value=_RESUME_PICKER_SENTINEL,
+    default=None,
+    help=(
+        "Resume a prior Omnigent conversation. With a conversation id "
+        "(e.g. ``--resume conv_abc123``) attaches directly; with no value "
+        "opens an interactive picker scoped to coco-native sessions."
+    ),
+)
+@click.argument("coco_args", nargs=-1, type=click.UNPROCESSED)
+def coco(
+    server: str | None,
+    resume: str | None,
+    coco_args: tuple[str, ...],
+) -> None:
+    """Launch the Snowflake CoCo (Cortex Code) TUI in an Omnigent terminal.
+
+    \b
+    Examples:
+      omnigent coco
+      omnigent coco --resume conv_abc123
+      omnigent coco --resume                  # interactive picker
+    """
+    choice = _split_resume_value(resume)
+
+    from omnigent.coco_native import run_coco_native
+
+    cfg = _load_effective_config()
+    if server is None:
+        server = cfg.get("server")
+    auto_open_conversation = _resolve_auto_open_conversation_from_config(cfg)
+
+    server = _ensure_backend(server)
+
+    run_coco_native(
+        server=server,
+        session_id=choice.conversation_id,
+        resume_picker=choice.picker,
+        coco_args=coco_args,
+        auto_open_conversation=auto_open_conversation,
+    )
+
+
+@cli.command(
+    context_settings={
+        "ignore_unknown_options": True,
+        "allow_extra_args": True,
+    }
+)
+@click.option(
+    "--server",
+    default=None,
+    help=(
+        "Remote omnigent URL. Ensures the host daemon, asks the "
         "daemon-spawned runner to launch the Hermes TUI, and attaches this TTY. "
         'Pass --server "" to auto-spawn a persistent local server in the '
         "background and use that instead of a remote one."
@@ -6560,6 +6624,14 @@ _NATIVE_TERMINAL_DISPATCH_SPECS: dict[str, _NativeTerminalDispatchSpec] = {
         module="omnigent.hermes_native",
         function="run_hermes_native",
         args_param="hermes_args",
+        model_strategy="explicit_passthrough",
+    ),
+    # ``cortex`` accepts ``--model`` directly, so an explicit ``--model`` is
+    # forwarded as a passthrough arg; otherwise CoCo's own default applies.
+    "coco": _NativeTerminalDispatchSpec(
+        module="omnigent.coco_native",
+        function="run_coco_native",
+        args_param="coco_args",
         model_strategy="explicit_passthrough",
     ),
 }
@@ -10932,6 +11004,67 @@ def _manage_hermes_harness() -> None:
                 status = "✗ hermes binary not found"
 
 
+def _manage_coco_harness() -> None:
+    """Run the level-2 loop for Snowflake CoCo: ensure the CLI is installed.
+
+    CoCo owns its own auth via ``~/.snowflake/connections.toml`` (shared with
+    the Snowflake CLI; its connection wizard runs on first ``cortex`` launch)
+    and is installed via Snowflake's curl script — Omnigent stores no CoCo
+    credential. A missing CLI gates the drill-in; when installed, the drill-in
+    offers to list the configured Snowflake connections. Mirrors
+    :func:`_manage_hermes_harness`.
+
+    :returns: None. Side effects: may run ``cortex connections list``.
+    """
+    from omnigent.onboarding.harness_install import (
+        COCO_KEY,
+        harness_cli_installed,
+        harness_install_spec,
+    )
+    from omnigent.onboarding.interactive import console, select
+
+    if not harness_cli_installed(COCO_KEY):
+        spec = harness_install_spec(COCO_KEY)
+        hint = (
+            spec.install_hint
+            if spec and spec.install_hint
+            else "curl -LsS https://ai.snowflake.com/static/cc-scripts/install.sh | sh"
+        )
+        console.print(
+            f"  Snowflake CoCo isn't installed. Install it with:\n    [bold]{hint}[/bold]\n"
+            "  then re-open this menu."
+        )
+        return
+
+    status: str | None = None
+    while True:
+        rows: list[_HarnessMenuRow] = [
+            _HarnessMenuRow(
+                "Run cortex connections list (show Snowflake connections)", action="list"
+            ),
+            _HarnessMenuRow("← Back", action="back"),
+        ]
+        idx = select(
+            "Snowflake CoCo",
+            [r.label for r in rows],
+            clear_on_exit=True,
+            status=status,
+        )
+        if idx < 0:
+            return
+        action = rows[idx].action
+        if action == "back":
+            return
+        if action == "list":
+            import subprocess
+
+            try:
+                subprocess.run(["cortex", "connections", "list"], check=False)
+                status = "✓ connections listed (run `cortex` once to add one via its wizard)"
+            except FileNotFoundError:
+                status = "✗ cortex binary not found"
+
+
 def _manage_kiro_harness() -> None:
     """Run the level-2 loop for Kiro: ensure the CLI is installed and signed in.
 
@@ -11822,6 +11955,7 @@ def _run_configure_harnesses_interactive() -> None:
     from omnigent.onboarding.extra_install import extra_install_display
     from omnigent.onboarding.goose_auth import goose_config_summary
     from omnigent.onboarding.harness_install import (
+        COCO_KEY,
         COPILOT_KEY,
         CURSOR_KEY,
         GOOSE_KEY,
@@ -11882,6 +12016,10 @@ def _run_configure_harnesses_interactive() -> None:
     # Sentinel marking the Hermes row — like Goose it owns its own auth via
     # ``hermes model`` and is installed via a curl installer.
     _HERMES = "\x00hermes"
+    # Sentinel marking the Snowflake CoCo row — like Hermes it owns its own
+    # auth (``~/.snowflake/connections.toml`` via CoCo's wizard) and is
+    # installed via Snowflake's curl installer.
+    _COCO = "\x00coco"
     # Sentinel marking the Kiro row — like Goose/Hermes it owns its own auth (via
     # ``kiro-cli login``) and is installed via Kiro's curl installer, so it
     # dispatches to its own drill-in rather than a provider family.
@@ -12172,6 +12310,35 @@ def _run_configure_harnesses_interactive() -> None:
             kimi_hint = (kimi_spec.install_hint if kimi_spec else None) or "see Kimi Code docs"
             rows.append((_KIMI, "Kimi Code", "Not installed", "missing", _install_hint(kimi_hint)))
 
+        # Snowflake CoCo — curl-installed ``cortex`` binary; auth is the
+        # user's ``connections.toml`` (written by CoCo's own first-run
+        # wizard), so readiness is binary + that file's presence.
+        if not harness_cli_installed(COCO_KEY):
+            coco_spec = harness_install_spec(COCO_KEY)
+            coco_hint = (
+                coco_spec.install_hint
+                if coco_spec and coco_spec.install_hint
+                else "curl -LsS https://ai.snowflake.com/static/cc-scripts/install.sh | sh"
+            )
+            rows.append(
+                (_COCO, "Snowflake CoCo", "Not installed", "missing", _install_hint(coco_hint)),
+            )
+        elif (
+            Path(os.environ.get("SNOWFLAKE_HOME", "") or "~/.snowflake").expanduser()
+            / "connections.toml"
+        ).is_file():
+            rows.append((_COCO, "Snowflake CoCo", "connections.toml", "ready", ""))
+        else:
+            rows.append(
+                (
+                    _COCO,
+                    "Snowflake CoCo",
+                    "Not configured",
+                    "warn",
+                    "Run `cortex` once to set up a Snowflake connection.",
+                ),
+            )
+
         # Custom ACP agents — the generic `acp` harness driving any user-configured
         # ACP-agent command. Each configured agent gets its own overview row
         # (select → per-agent remove drill-in) so it sits alongside the built-in
@@ -12263,6 +12430,8 @@ def _run_configure_harnesses_interactive() -> None:
             _manage_acp_agent(target[len(_ACP_AGENT_PREFIX) :])
         elif target == _HERMES:
             _manage_hermes_harness()
+        elif target == _COCO:
+            _manage_coco_harness()
         elif target == _KIRO:
             _manage_kiro_harness()
         elif target == _KIMI:

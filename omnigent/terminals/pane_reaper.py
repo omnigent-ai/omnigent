@@ -51,6 +51,7 @@ _logger = logging.getLogger(__name__)
 NATIVE_PANE_TERMINAL_NAMES: frozenset[str] = frozenset(
     {
         "claude",
+        "coco",
         "codex",
         "cursor",
         "goose",

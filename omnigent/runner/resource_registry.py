@@ -62,6 +62,7 @@ ANTIGRAVITY_NATIVE_TERMINAL_ROLE = "antigravity-native"
 QWEN_NATIVE_TERMINAL_ROLE = "qwen-native"
 KIMI_NATIVE_TERMINAL_ROLE = "kimi-native"
 HERMES_NATIVE_TERMINAL_ROLE = "hermes-native"
+COCO_NATIVE_TERMINAL_ROLE = "coco-native"
 # Role marker for the embedded Omnigent REPL terminal auto-created for
 # runner-hosted SDK sessions (``omnigent attach`` in a tmux pane — the
 # SDK mirror of the native terminals above). The attach WebSocket uses
@@ -1022,6 +1023,12 @@ class SessionResourceRegistry:
             # SQLite transcript, not status), so the PTY watcher is its status
             # source too.
             HERMES_NATIVE_TERMINAL_ROLE,
+            # coco-native injects then returns. Its forwarder posts hook-driven
+            # per-turn edges, but the PTY watcher is still needed as the
+            # id-less status source: it seeds the exit-classification memo
+            # (so a /quit before the first turn reads as clean, not a crash)
+            # and the pane reaper's busy check.
+            COCO_NATIVE_TERMINAL_ROLE,
         }
         if activity_publisher is None and not emit_status and exit_publisher is None:
             return

@@ -32,6 +32,7 @@ import omnigent.onboarding.gemini_auth as _gemini_auth
 from omnigent.harness_aliases import HARNESS_ALIASES, canonicalize_harness
 from omnigent.harness_plugins import harness_install_keys, valid_harnesses
 from omnigent.onboarding.harness_install import (
+    COCO_KEY,
     COPILOT_KEY,
     CURSOR_KEY,
     GOOSE_KEY,
@@ -124,6 +125,12 @@ _KIMI_NATIVE_HARNESSES: frozenset[str] = frozenset({"kimi-native", "native-kimi"
 # native CLI harnesses. Hermes owns its own auth (``hermes setup`` /
 # ``hermes model``); the headless ``hermes`` harness gates on the same binary.
 _HERMES_NATIVE_HARNESSES: frozenset[str] = frozenset({"hermes-native", "native-hermes"})
+
+# Native Snowflake CoCo harnesses. Boot the ``cortex`` TUI (``omni coco``) and
+# can't launch without the ``cortex`` binary on ``PATH`` — gate on it, like the
+# other native CLI harnesses. CoCo owns its own auth
+# (``~/.snowflake/connections.toml``, shared with the Snowflake CLI).
+_COCO_NATIVE_HARNESSES: frozenset[str] = frozenset({"coco-native", "native-coco"})
 
 # CLI-wrapping qwen harnesses. ``qwen`` / ``qwen-code`` (the ACP harness) and
 # ``qwen-native`` / ``native-qwen`` (the native TUI via ``omni qwen``) all resolve
@@ -226,6 +233,12 @@ def harness_is_configured(harness: str) -> bool:
         # Research). Auth/provider config surfaces at run time via Hermes' own
         # ``hermes model`` flow; gate only on binary presence.
         return harness_cli_installed(HERMES_KEY)
+    if canonical in _COCO_NATIVE_HARNESSES:
+        # Snowflake CoCo (``coco-native``, via ``omni coco``) wraps the
+        # ``cortex`` CLI (installed via Snowflake's curl script). Connection
+        # auth surfaces at run time via CoCo's own setup wizard; gate only on
+        # binary presence.
+        return harness_cli_installed(COCO_KEY)
     if canonical == CURSOR_KEY:
         # Cursor runs in-process via ``cursor-sdk`` and authenticates with a
         # ``CURSOR_API_KEY`` (a ``cursor-agent login`` does not apply). So,
@@ -325,6 +338,7 @@ def configured_harness_map() -> dict[str, HarnessAvailability]:
     spellings.update(_GOOSE_NATIVE_HARNESSES)
     spellings.update(_KIMI_NATIVE_HARNESSES)
     spellings.update(_HERMES_NATIVE_HARNESSES)
+    spellings.update(_COCO_NATIVE_HARNESSES)
     spellings.update(_QWEN_HARNESSES)
     spellings.add(CURSOR_KEY)
     spellings.add(KIMI_SURFACE)
