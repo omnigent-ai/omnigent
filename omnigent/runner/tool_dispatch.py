@@ -1599,12 +1599,16 @@ async def _execute_subagent_tool(
         ):
             return (
                 f"Error: sub-agent {sub_agent_name!r} title {session_name!r} "
-                "already has a launching or running turn; wait for completion before sending again"
+                "already has a launching or running turn. Use a distinct task-based title "
+                "for independent parallel work; reuse this title only to continue the same "
+                "conversation after completion."
             )
         if existing.get("busy") is True:
             return (
                 f"Error: sub-agent {sub_agent_name!r} title {session_name!r} "
-                "is already running; wait for completion before sending again"
+                "is already running. Use a distinct task-based title for independent "
+                "parallel work; reuse this title only to continue the same conversation "
+                "after completion."
             )
     else:
         child_harness = _subagent_harness(str(sub_agent_name), agent_spec)
