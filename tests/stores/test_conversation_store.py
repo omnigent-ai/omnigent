@@ -5,6 +5,8 @@ from __future__ import annotations
 import pytest
 from sqlalchemy import text
 
+from omnigent.db.db_models import uuid_to_bytes
+from omnigent.db.enum_codecs import encode_item_type
 from omnigent.db.utils import get_or_create_engine
 from omnigent.entities import (
     ErrorData,
@@ -22,6 +24,7 @@ from omnigent.session_import import (
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
+    _latest_message_items_query,
 )
 from omnigent.stores.host_store import HostStore
 
@@ -216,7 +219,13 @@ def test_list_latest_message_items_for_conversations(
     )
 
     result = conversation_store.list_latest_message_items_for_conversations(
-        [conv_a.id, conv_b.id, conv_empty.id, "5eca720dc2bc6cdc3a99028d7bd0f917"],
+        [
+            conv_a.id,
+            conv_b.id,
+            conv_a.id,
+            conv_empty.id,
+            "5eca720dc2bc6cdc3a99028d7bd0f917",
+        ],
         per_conversation_limit=2,
     )
 
@@ -241,39 +250,17 @@ def test_list_latest_message_items_for_conversations(
     assert result["5eca720dc2bc6cdc3a99028d7bd0f917"] == []
 
 
-def test_ranked_latest_message_items_omits_search_text(
+def test_latest_message_items_query_uses_bounded_index_seek(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
-    """The ranked-message subquery must not select the heavy ``search_text``
-    column — the preview caller never reads it, and pulling it roughly doubles
-    the bytes transferred per row on a chatty child.
+    """The preview query must be a bounded index seek, not a scan/sort.
 
-    Guards the projection so a future refactor can't silently go back to
-    ``select(SqlConversationItem)`` (the whole row). Also seeds a message whose
-    ``search_text`` differs from its visible text and asserts the returned item
-    still carries the visible text, proving the preview reads ``data``.
+    The regression shape for issue #2432 is a per-conversation top-N query:
+    ``WHERE workspace_id = ? AND conversation_id = ? AND type = ?
+    ORDER BY position DESC LIMIT ?``. SQLite should satisfy it with
+    ``ix_conversation_items_conv_type_position`` and must not report a table
+    scan or temporary b-tree sort.
     """
-    from omnigent.stores.conversation_store.sqlalchemy_store import (
-        _ranked_latest_message_items,
-    )
-
-    ranked = _ranked_latest_message_items(["8af356d908005a65f872c246158c6293"])
-    columns = {c.key for c in ranked.c}
-    assert "search_text" not in columns
-    # The columns _to_item + the preview actually consume must all be present.
-    assert {
-        "conversation_id",
-        "id",
-        "response_id",
-        "created_at",
-        "status",
-        "position",
-        "type",
-        "data",
-        "created_by",
-        "row_num",
-    } <= columns
-
     conv = conversation_store.create_conversation(title="chatty")
     conversation_store.append(
         conv.id,
@@ -289,12 +276,53 @@ def test_ranked_latest_message_items_omits_search_text(
             )
         ],
     )
+
+    query = _latest_message_items_query(conv.id, 2)
+    columns = {c.key for c in query.selected_columns}
+    assert "search_text" not in columns
+    # The columns _to_item + the preview actually consume must all be present.
+    assert {
+        "conversation_id",
+        "id",
+        "response_id",
+        "created_at",
+        "status",
+        "position",
+        "type",
+        "data",
+        "created_by",
+    } <= columns
+
+    compiled = query.compile(dialect=conversation_store.engine.dialect)
+    params = []
+    for key in compiled.positiontup or ():
+        value = compiled.params[key]
+        if key.startswith("conversation_id"):
+            value = uuid_to_bytes(value)
+        params.append(value)
+
+    with conversation_store.engine.connect() as connection:
+        plan_rows = connection.exec_driver_sql(
+            "EXPLAIN QUERY PLAN " + str(compiled),
+            tuple(params),
+        ).all()
+
+    details = [row[3] for row in plan_rows]
+    plan = "\n".join(details)
+    assert (
+        "SEARCH conversation_items USING INDEX ix_conversation_items_conv_type_position "
+        "(workspace_id=? AND conversation_id=? AND type=?)"
+    ) in plan
+    assert "SCAN" not in plan
+    assert "TEMP B-TREE" not in plan
+
     result = conversation_store.list_latest_message_items_for_conversations(
         [conv.id], per_conversation_limit=1
     )
     item = result[conv.id][0]
     assert isinstance(item.data, MessageData)
     assert item.data.content[0]["text"] == "visible reply"
+    assert encode_item_type("message") in params
 
 
 def test_update_title(conversation_store: SqlAlchemyConversationStore) -> None:

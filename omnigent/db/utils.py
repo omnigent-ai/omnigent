@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import os
@@ -10,6 +11,7 @@ import time
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -538,6 +540,102 @@ def clear_engine_cache() -> None:
         for engine in _engine_cache.values():
             engine.dispose()
         _engine_cache.clear()
+
+
+# ── WAL checkpointing ──────────────────────────────────
+
+
+@dataclass(frozen=True)
+class WalCheckpointResult:
+    """
+    Outcome returned by SQLite ``PRAGMA wal_checkpoint``.
+
+    :param busy: Non-zero when SQLite reports that active database users
+        prevented a complete checkpoint.
+    :param log_frames: Number of frames in the WAL at checkpoint time.
+    :param checkpointed_frames: Number of frames copied back to the database.
+    """
+
+    busy: int
+    log_frames: int
+    checkpointed_frames: int
+
+
+def _wal_checkpoint_result(row: object) -> WalCheckpointResult | None:
+    """
+    Convert SQLite's checkpoint row to a named result.
+    """
+    if row is None:
+        return None
+    busy, log_frames, checkpointed_frames = row
+    return WalCheckpointResult(
+        busy=int(busy),
+        log_frames=int(log_frames),
+        checkpointed_frames=int(checkpointed_frames),
+    )
+
+
+def run_wal_checkpoint(engine: Engine) -> WalCheckpointResult | None:
+    """
+    Run one best-effort SQLite WAL checkpoint.
+
+    Non-SQLite engines are a no-op. SQLite runs a non-blocking PASSIVE
+    checkpoint first and escalates to TRUNCATE only when SQLite reports no
+    busy readers or writers. Errors are logged and swallowed because WAL
+    reclamation must never take down the server.
+
+    :param engine: SQLAlchemy engine to checkpoint.
+    :returns: The final checkpoint result, or ``None`` for non-SQLite engines
+        or unexpected empty pragma output.
+    """
+    if engine.dialect.name != "sqlite":
+        return None
+
+    try:
+        with engine.connect() as connection:
+            result = _wal_checkpoint_result(
+                connection.exec_driver_sql("PRAGMA wal_checkpoint(PASSIVE)").one_or_none()
+            )
+            if result is None:
+                return None
+            if result.busy:
+                _logger.debug(
+                    "WAL checkpoint busy; skipping truncate "
+                    "(log_frames=%d, checkpointed_frames=%d)",
+                    result.log_frames,
+                    result.checkpointed_frames,
+                )
+                return result
+
+            # TRUNCATE can block up to busy_timeout, but this runs on a worker
+            # thread via asyncio.to_thread, never on the event loop.
+            return _wal_checkpoint_result(
+                connection.exec_driver_sql("PRAGMA wal_checkpoint(TRUNCATE)").one_or_none()
+            )
+    except Exception as exc:  # noqa: BLE001
+        _logger.warning("WAL checkpoint failed: %s", exc)
+        return None
+
+
+async def checkpoint_wal_periodically(
+    engine: Engine,
+    interval: float = 60.0,
+) -> None:
+    """
+    Periodically run a best-effort SQLite WAL checkpoint until cancelled.
+
+    :param engine: SQLAlchemy engine to checkpoint.
+    :param interval: Delay between checkpoint attempts in seconds.
+    """
+    if engine.dialect.name != "sqlite":
+        return
+
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await asyncio.to_thread(run_wal_checkpoint, engine)
+        except Exception as exc:  # noqa: BLE001
+            _logger.warning("Periodic WAL checkpoint failed: %s", exc)
 
 
 # ── Managed session ────────────────────────────────────

@@ -16,6 +16,7 @@ from typing import Any, Protocol
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy import Engine
 from sqlalchemy.exc import StatementError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.gzip import GZipMiddleware
@@ -1382,6 +1383,15 @@ def create_app(
                 otel_publisher=server_metrics_otel,
             )
         )
+        from omnigent.db.utils import checkpoint_wal_periodically
+
+        wal_checkpoint_engine = getattr(conversation_store, "engine", None)
+        wal_checkpoint_task = (
+            asyncio.create_task(checkpoint_wal_periodically(wal_checkpoint_engine))
+            if isinstance(wal_checkpoint_engine, Engine)
+            and wal_checkpoint_engine.dialect.name == "sqlite"
+            else None
+        )
         # Runner ``runner_last_seen`` is refreshed per-tunnel from each
         # runner tunnel's ping loop (``runner_tunnel._ping_loop``), inside
         # that handler's ``workspace_scope`` — not from a lifespan sweep,
@@ -1414,6 +1424,10 @@ def create_app(
         try:
             yield
         finally:
+            if wal_checkpoint_task is not None:
+                wal_checkpoint_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await wal_checkpoint_task
             if scheduled_task_scheduler is not None:
                 scheduled_task_scheduler.stop()
             metrics_publish_task.cancel()
