@@ -469,6 +469,79 @@ async def test_external_routing_client_sends_snake_case_and_parses() -> None:
 
 
 @pytest.mark.asyncio
+async def test_external_routing_client_roundtrips_provider_prefix() -> None:
+    """Send bare ids out; recover the exact catalog id from the bare answer.
+
+    A Databricks catalog carries a ``databricks-`` prefix the router doesn't
+    want, so we send bare ids and map the router's (bare) pick back to the
+    local prefixed id the runner needs.
+    """
+    import httpx
+
+    from omnigent.server.smart_routing import ExternalRoutingClient
+
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        # Router echoes the bare id it was given.
+        return httpx.Response(
+            200,
+            json={"route_selection": [{"route_option": {"model": "claude-opus-4-8"}}]},
+        )
+
+    client = ExternalRoutingClient(
+        base_url="https://host/v1", router_name="task_v0", model_prefix="databricks-"
+    )
+    with _patch_httpx(httpx.MockTransport(handler)):
+        result = await client.route(
+            "hi", {"self": ["databricks-claude-opus-4-8", "databricks-gpt-5-5"]}
+        )
+
+    # Outbound: configured prefix stripped for the router's vocabulary.
+    assert captured["body"]["route_options"] == [
+        {"model": "claude-opus-4-8", "harness": "self"},
+        {"model": "gpt-5-5", "harness": "self"},
+    ]
+    # Inbound: mapped back to the local (prefixed) catalog id.
+    assert result is not None
+    assert result.model == "databricks-claude-opus-4-8"
+
+
+@pytest.mark.asyncio
+async def test_external_routing_client_no_prefix_sends_catalog_ids_verbatim() -> None:
+    """With no model_prefix configured, catalog ids are sent verbatim.
+
+    Provider-agnostic guarantee: core invents/strips nothing — even a
+    ``databricks-`` id passes through untouched when unconfigured.
+    """
+    import httpx
+
+    from omnigent.server.smart_routing import ExternalRoutingClient
+
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={"route_selection": [{"route_option": {"model": "databricks-claude-opus-4-8"}}]},
+        )
+
+    client = ExternalRoutingClient(base_url="https://host/v1", router_name="task_v0")
+    with _patch_httpx(httpx.MockTransport(handler)):
+        result = await client.route("hi", {"self": ["databricks-claude-opus-4-8", "gpt-5-5"]})
+
+    # Sent verbatim — no prefix stripped.
+    assert captured["body"]["route_options"] == [
+        {"model": "databricks-claude-opus-4-8", "harness": "self"},
+        {"model": "gpt-5-5", "harness": "self"},
+    ]
+    assert result is not None
+    assert result.model == "databricks-claude-opus-4-8"
+
+
+@pytest.mark.asyncio
 async def test_external_routing_client_empty_available_models_skips() -> None:
     """No candidates -> no HTTP call, returns None."""
     import httpx

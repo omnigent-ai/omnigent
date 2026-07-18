@@ -25,6 +25,19 @@ def test_external_builds_client() -> None:
     assert client._url == "https://host/ai-gateway/routing/v1/routes:select"
     assert client._router_name == "task_v0"
     assert client._auth is None  # no profile -> unauthenticated
+    assert client._model_prefix == ""  # no prefix -> catalog ids sent verbatim
+
+
+def test_external_threads_model_prefix() -> None:
+    cfg = {
+        "provider": "external",
+        "base_url": "https://host/v1",
+        "router_name": "task_v0",
+        "model_prefix": "databricks-",
+    }
+    client = _build_external_routing_client(cfg)
+    assert isinstance(client, ExternalRoutingClient)
+    assert client._model_prefix == "databricks-"
 
 
 def test_external_resolves_profile_auth() -> None:

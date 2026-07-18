@@ -91,7 +91,10 @@ def _build_external_routing_client(
 
     Requires ``base_url`` + ``router_name``; auth is resolved from
     ``profile`` (a Databricks CLI profile for the router's host) or left
-    unauthenticated.
+    unauthenticated. Optional ``model_prefix`` is stripped from catalog
+    model ids sent to the router (and restored on its answer) — e.g.
+    ``"databricks-"`` when serving-endpoint names carry that prefix but the
+    router keys on bare ids.
 
     :param routing_cfg: The parsed ``routing:`` mapping (a dict with
         ``provider == "external"``, per the caller).
@@ -101,6 +104,7 @@ def _build_external_routing_client(
     base_url = (routing_cfg.get("base_url") or "").strip()
     router_name = (routing_cfg.get("router_name") or "").strip()
     profile = (routing_cfg.get("profile") or "").strip()
+    model_prefix = (routing_cfg.get("model_prefix") or "").strip()
 
     if not base_url or not router_name:
         _logger.warning("routing.provider=external requires base_url and router_name; skipping")
@@ -122,7 +126,9 @@ def _build_external_routing_client(
 
     from omnigent.server.smart_routing import ExternalRoutingClient
 
-    return ExternalRoutingClient(base_url=base_url, router_name=router_name, auth=auth)
+    return ExternalRoutingClient(
+        base_url=base_url, router_name=router_name, auth=auth, model_prefix=model_prefix
+    )
 
 
 def _build_local_llm_routing_client(
