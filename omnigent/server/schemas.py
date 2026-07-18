@@ -3572,6 +3572,9 @@ class ElicitationRequestParams(BaseModel):
         this elicitation, e.g. ``"conv_child123"``. Present when a
         child/sub-agent prompt is mirrored into an ancestor stream;
         ``None`` means resolve against the current session.
+    :param approval: Optional policy-supplied target presentation.
+        It changes display hierarchy only; the complete raw call remains
+        available to the renderer.
     """
 
     mode: Literal["form", "url"] = "form"
@@ -3585,6 +3588,7 @@ class ElicitationRequestParams(BaseModel):
     policy_name: str | None = None
     content_preview: str | None = None
     target_session_id: str | None = None
+    approval: dict[str, Any] | None = None
 
     # MCP's ElicitRequestParams uses ``extra="allow"``; mirror
     # that here so MCP-shaped passthrough (an MCP server's

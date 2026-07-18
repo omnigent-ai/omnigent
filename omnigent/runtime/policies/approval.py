@@ -39,11 +39,13 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import unicodedata
 from collections.abc import Awaitable, Callable
 from typing import Any
+from urllib.parse import urlsplit
 
 from omnigent.errors import ElicitationDeclinedError
-from omnigent.policies.types import ElicitationRequest, PolicyResult
+from omnigent.policies.types import ApprovalPresentation, ElicitationRequest, PolicyResult
 from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.spec.types import Phase
 
@@ -76,6 +78,122 @@ _EmitCallback = Callable[[dict[str, Any]], None]
 # elicitation params (stored in the row's ``arguments`` column for
 # inspection / replay).
 _RegisterCallback = Callable[[str, str, str], None]
+
+APPROVAL_TITLE_MAX_LENGTH = 256
+
+
+def _has_disallowed_title_character(title: str) -> bool:
+    """Return whether a title can manipulate its security-sensitive display line."""
+    return any(
+        character in "\r\n"
+        or ord(character) <= 0x1F
+        or 0x7F <= ord(character) <= 0x9F
+        or unicodedata.category(character) in {"Zl", "Zp"}
+        or 0x202A <= ord(character) <= 0x202E
+        or 0x2066 <= ord(character) <= 0x2069
+        or ord(character) in (0x061C, 0x200E, 0x200F)
+        for character in title
+    )
+
+
+def validate_approval_presentation(
+    approval: ApprovalPresentation | None,
+    arguments: dict[str, Any] | None,
+) -> ApprovalPresentation | None:
+    """Validate policy-supplied display metadata at the elicitation boundary.
+
+    Titles are trimmed and capped at 256 characters. Links must use HTTPS,
+    include a hostname, contain no user information, and contain no whitespace.
+    Unknown secondary argument names are ignored. Any invalid title or link
+    drops the presentation so the ordinary approval card remains usable.
+
+    :param approval: Candidate presentation from the composed policy result.
+    :param arguments: Top-level tool arguments available to the approval card.
+    :returns: A safe presentation, or ``None`` for the plain-card fallback.
+    """
+    if approval is None:
+        return None
+    if (
+        not isinstance(approval.title, str)
+        or (approval.href is not None and not isinstance(approval.href, str))
+        or not isinstance(approval.secondary_arguments, tuple)
+        or not all(isinstance(name, str) for name in approval.secondary_arguments)
+    ):
+        _log_invalid_approval("malformed fields")
+        return None
+    title = approval.title.strip()
+    if not title:
+        _log_invalid_approval("empty title")
+        return None
+    title = title[:APPROVAL_TITLE_MAX_LENGTH]
+    # Newlines manipulate line structure, C0/C1/DEL carry control behavior, and bidi
+    # marks can falsify the primary line and visible hostname. Reject to keep declared
+    # and rendered text identical; the policy that evaluated the values owns hygiene.
+    if _has_disallowed_title_character(approval.title):
+        _log_invalid_approval("unsafe title characters")
+        return None
+
+    href = approval.href
+    if href is not None:
+        try:
+            parsed = urlsplit(href)
+            valid_href = (
+                parsed.scheme == "https"
+                and parsed.hostname is not None
+                and parsed.username is None
+                and parsed.password is None
+                and not any(character.isspace() for character in href)
+            )
+        except ValueError:
+            valid_href = False
+        if not valid_href:
+            _log_invalid_approval("unsafe href")
+            return None
+
+    known_names = set(arguments or {})
+    secondary_arguments = tuple(
+        dict.fromkeys(name for name in approval.secondary_arguments if name in known_names)
+    )
+    return ApprovalPresentation(
+        title=title,
+        href=href,
+        secondary_arguments=secondary_arguments,
+    )
+
+
+def approval_presentation_to_dict(
+    approval: ApprovalPresentation | None,
+) -> dict[str, Any] | None:
+    """Return the stable wire shape for a validated presentation."""
+    if approval is None:
+        return None
+    return {
+        "title": approval.title,
+        "href": approval.href,
+        "secondary_arguments": list(approval.secondary_arguments),
+    }
+
+
+def _arguments_from_preview(content_preview: str) -> dict[str, Any]:
+    """Recover top-level tool arguments from an elicitation preview."""
+    try:
+        content = json.loads(content_preview)
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(content, dict):
+        return {}
+    arguments = content.get("arguments")
+    return arguments if isinstance(arguments, dict) else content
+
+
+def _log_invalid_approval(reason: str) -> None:
+    """Log a presentation fallback without changing the policy verdict."""
+    import logging
+
+    logging.getLogger(__name__).debug(
+        "Dropping invalid approval presentation at elicitation boundary: %s",
+        reason,
+    )
 
 
 async def _await_elicitation(
@@ -129,11 +247,16 @@ async def _await_elicitation(
         (explicit user refusal — distinct from cancel/timeout).
     """
     elicitation_id = f"elicit_{secrets.token_hex(16)}"
+    approval = validate_approval_presentation(
+        result.approval,
+        _arguments_from_preview(content_preview),
+    )
     elicitation = ElicitationRequest(
         message=result.reason or "",
         phase=phase.value,
         policy_names=result.deciding_policies or [""],
         content_preview=_truncate(content_preview, limit=1024),
+        approval=approval,
     )
     params_json = build_elicitation_params_json(elicitation)
     register(elicitation_id, task_id, params_json)
@@ -234,6 +357,9 @@ def build_elicitation_request_event(
     }
     if len(elicitation.policy_names) > 1:
         params["policy_names"] = elicitation.policy_names
+    approval = approval_presentation_to_dict(elicitation.approval)
+    if approval is not None:
+        params["approval"] = approval
     if url is not None:
         params["url"] = url
 
@@ -259,16 +385,18 @@ def build_elicitation_params_json(elicitation: ElicitationRequest) -> str:
     :returns: JSON string suitable for the
         ``pending_tool_calls.arguments`` column.
     """
-    return json.dumps(
-        {
-            "mode": "form",
-            "message": elicitation.message,
-            "requestedSchema": elicitation.requested_schema,
-            "phase": elicitation.phase,
-            "policy_name": elicitation.policy_name,
-            "content_preview": elicitation.content_preview,
-        }
-    )
+    params: dict[str, Any] = {
+        "mode": "form",
+        "message": elicitation.message,
+        "requestedSchema": elicitation.requested_schema,
+        "phase": elicitation.phase,
+        "policy_name": elicitation.policy_name,
+        "content_preview": elicitation.content_preview,
+    }
+    approval = approval_presentation_to_dict(elicitation.approval)
+    if approval is not None:
+        params["approval"] = approval
+    return json.dumps(params)
 
 
 def resolve_ask_timeout(

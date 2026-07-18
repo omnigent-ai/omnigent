@@ -430,6 +430,8 @@ export interface ElicitationBlock {
   policyName: string;
   /** Truncated snapshot of the gated content. */
   contentPreview: string;
+  /** Policy-supplied target hierarchy for this approval. */
+  approval?: import("./events").ApprovalPresentation | null;
   /** A restricted-JSON-Schema form. `{}` for a binary accept/decline. */
   requestedSchema: Record<string, unknown>;
   /** Standalone approval page URL when ``mode === "url"``. */

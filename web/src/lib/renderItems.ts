@@ -120,6 +120,7 @@ export type RenderItem =
       phase: string;
       policyName: string;
       contentPreview: string;
+      approval?: import("./events").ApprovalPresentation | null;
       requestedSchema: Record<string, unknown>;
       url?: string | null;
       status: "pending" | "responded";
@@ -1491,6 +1492,7 @@ function buildAssistantItems(
         phase: b.phase,
         policyName: b.policyName,
         contentPreview: b.contentPreview,
+        approval: b.approval,
         requestedSchema: b.requestedSchema,
         url: b.url,
         status: b.status,

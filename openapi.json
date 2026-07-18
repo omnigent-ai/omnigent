@@ -1451,6 +1451,20 @@
         "additionalProperties": true,
         "description": "Inner `params` block of a `ElicitationRequestEvent`.\n\nThe standard fields (`mode`, `message`, `requestedSchema`,\n`url`) mirror MCP's `ElicitRequestFormParams` /\n`ElicitRequestUrlParams` byte-for-byte (Principle 8 \u2014 adopt\nMCP's wire shape verbatim where it overlaps). The\nAP-specific extensions (`phase`, `policy_name`,\n`content_preview`, `target_session_id`) carry policy-engine\ncontext and mirrored-child routing for the consumer's renderer;\nMCP's `extra=\"allow\"` config permits them under the same params\nblock. Wire shape matches\n`omnigent/runtime/policies/approval.py:175`.",
         "properties": {
+          "approval": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional policy-supplied target presentation. It changes display hierarchy only; the complete raw call remains available to the renderer.",
+            "title": "Approval"
+          },
           "content_preview": {
             "anyOf": [
               {
