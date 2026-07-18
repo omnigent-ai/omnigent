@@ -151,11 +151,15 @@ socket server can drive the device flow.
 IdP* in their browser. The server hands back its session JWT — the same token
 a browser session gets. There is **no device grant and no refresh token**: the
 session lasts its normal TTL (default 8h), after which the user logs in again.
-- `header` **/ proxy mode** → **unsupported**. Identity is asserted by a trusted
-upstream proxy header (e.g. `X-Forwarded-Email`), so the server mints no token
-and exposes no per-user login the bot can drive; setup reports that the server
-can't be logged into. Run the server in `accounts` or `oidc` mode to use the
-bot with authentication, or place the bot behind the same identity proxy.
+- `header` **/ proxy mode** → identity is asserted by a trusted upstream proxy
+header (e.g. `X-Forwarded-Email`), so the server mints no token and exposes no
+per-user login the auto-detect flow can drive. Two options:
+  - **Databricks Apps** (the common case): set
+    `OMNIGENT_SLACK_SERVER_AUTH=databricks` and the bot enrolls each user
+    through a web page it serves as its own Databricks App — see
+    [Databricks Apps web-auth](#databricks-apps-web-auth) below.
+  - Otherwise run the server in `accounts`/`oidc` mode, or place the bot behind
+    the same identity proxy.
 
 Either way the flow is the same from Slack's side:
 
@@ -181,6 +185,33 @@ Run `/omnigent` afterwards to set up again.
 
 See `designs/DEVICE_AUTH.md` in the main repo for the full design and
 threat model.
+
+### Databricks Apps web-auth
+
+When the Omnigent server is deployed as a **Databricks App**, it runs in header
+mode: the Databricks Apps proxy authenticates every request and injects the
+user's identity. A Socket-Mode event carries no such proxy-authenticated
+request, so the device/OIDC flows above can't be driven. Instead the bot is
+deployed as **its own Databricks App with user authorization enabled** and
+serves an enrollment page:
+
+1. On `/omnigent`, the bot posts a signed *Sign in with Databricks* link.
+2. Opening it hits the bot's own Databricks proxy, which authenticates the user
+   and forwards their token (`x-forwarded-access-token`).
+3. The bot exchanges that token for one **scoped to the target Omnigent app**
+   (RFC 8693 audience-scoped token exchange) — the exchanged token can't call
+   any other Databricks API, so storing it per user is least-privilege.
+4. The token is stored (encrypted at rest) for the Slack `(team, user)` the
+   signed link was bound to; the setup modal advances automatically.
+5. The bot calls the server with that token; the proxy validates it and injects
+   the real `X-Forwarded-Email`, so the server maps the request to the user —
+   **no server-side change needed**.
+
+There is no refresh token (the exchanged token stands alone until it expires,
+then the user re-enrolls — the same model as `oidc` mode). Configure it with
+`OMNIGENT_SLACK_SERVER_AUTH=databricks` plus the `OMNIGENT_SLACK_DATABRICKS_*`
+variables in `.env.example`. Full design and threat model:
+[`docs/DATABRICKS_APP_WEBAUTH_DESIGN.md`](docs/DATABRICKS_APP_WEBAUTH_DESIGN.md).
 
 Run `/omnigent` (or `/omnigent config`) any time to reopen this modal and change
 your agent, host, or workspace. The server is fixed by the operator, so there's

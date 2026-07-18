@@ -22,6 +22,7 @@ from omnigent_slack.service import SlackOmnigentService
 from omnigent_slack.setup import SetupFlow
 from omnigent_slack.store import SQLiteStore
 from omnigent_slack.tokens import EncryptedTokenStore, InMemoryTokenStore, TokenStore
+from omnigent_slack.webauth import WebAuthServer
 
 
 async def run() -> None:
@@ -74,8 +75,24 @@ async def run() -> None:
         client_secret=settings.device_client_secret,
     )
     pool.set_auth_resolver(auth_manager.resolve_auth)
+
+    # Databricks web-auth mode: the server is fronted by the Databricks Apps
+    # proxy, which the device/OIDC probe can't drive. Instead the bot serves an
+    # enrollment page (as its own Databricks App) that exchanges each user's
+    # forwarded token for one scoped to the target app. The web server shares
+    # the token store, so a token it writes is immediately usable by the bot.
+    webauth: WebAuthServer | None = None
+    enrollment_url = None
+    if settings.server_auth_mode == "databricks":
+        webauth = WebAuthServer(settings, token_store, on_enrolled=_on_token_changed)
+        enrollment_url = webauth.enrollment_url
+
     setup = SetupFlow(
-        store=store, pool=pool, server_url=settings.server_url, auth_manager=auth_manager
+        store=store,
+        pool=pool,
+        server_url=settings.server_url,
+        auth_manager=auth_manager,
+        enrollment_url=enrollment_url,
     )
     service = SlackOmnigentService(
         store=store,
@@ -88,6 +105,9 @@ async def run() -> None:
     setup.register(app)
     register_handlers(app, service)
 
+    if webauth is not None:
+        await webauth.start()
+
     handler = AsyncSocketModeHandler(app, settings.slack_app_token)
     try:
         logger.info("Connecting to Slack Socket Mode")
@@ -96,6 +116,8 @@ async def run() -> None:
         logger.info("Shutting down Omnigent Slack bot")
         await service.shutdown()
         await pool.aclose_all()
+        if webauth is not None:
+            await webauth.stop()
 
 
 def register_handlers(app: AsyncApp, service: SlackOmnigentService) -> None:

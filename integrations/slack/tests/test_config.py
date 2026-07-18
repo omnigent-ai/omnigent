@@ -28,6 +28,13 @@ def _set_env(monkeypatch: pytest.MonkeyPatch, **overrides: str) -> None:
         "OMNIGENT_DEVICE_CLIENT_SECRET",
         "OMNIGENT_DATA_DIR",
         "OMNIGENT_SLACK_DATABASE_PATH",
+        "OMNIGENT_SLACK_SERVER_AUTH",
+        "OMNIGENT_SLACK_DATABRICKS_AUDIENCE",
+        "OMNIGENT_SLACK_DATABRICKS_STATE_SECRET",
+        "OMNIGENT_SLACK_DATABRICKS_WORKSPACE_HOST",
+        "OMNIGENT_SLACK_WEBAUTH_BASE_URL",
+        "DATABRICKS_HOST",
+        "DATABRICKS_APP_URL",
     ):
         monkeypatch.delenv(key, raising=False)
     env = {**_REQUIRED, **overrides}
@@ -82,3 +89,47 @@ def test_database_path_defaults_under_home_when_no_data_dir(
 def test_database_path_env_override_wins(monkeypatch: pytest.MonkeyPatch) -> None:
     _set_env(monkeypatch, OMNIGENT_SLACK_DATABASE_PATH="/custom/bot.sqlite3")
     assert _load().database_path == Path("/custom/bot.sqlite3")
+
+
+def test_server_auth_mode_defaults_auto(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_env(monkeypatch)
+    monkeypatch.delenv("DATABRICKS_HOST", raising=False)
+    assert _load().server_auth_mode == "auto"
+
+
+def test_databricks_mode_requires_audience_and_state_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_env(monkeypatch, OMNIGENT_SLACK_SERVER_AUTH="databricks")
+    with pytest.raises(ValidationError):
+        _load()
+
+
+def test_databricks_mode_valid_with_required_knobs(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_env(
+        monkeypatch,
+        OMNIGENT_SLACK_SERVER_AUTH="databricks",
+        OMNIGENT_SLACK_DATABRICKS_AUDIENCE="app-client-id",
+        OMNIGENT_SLACK_DATABRICKS_STATE_SECRET="secret",
+    )
+    settings = _load()
+    assert settings.server_auth_mode == "databricks"
+    assert settings.databricks_target_audience == "app-client-id"
+
+
+def test_workspace_host_falls_back_to_databricks_host_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_env(monkeypatch)
+    monkeypatch.setenv("DATABRICKS_HOST", "myworkspace.cloud.databricks.com")
+    # Scheme is added when missing.
+    assert _load().workspace_host == "https://myworkspace.cloud.databricks.com"
+
+
+def test_workspace_host_explicit_config_wins(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_env(
+        monkeypatch,
+        OMNIGENT_SLACK_DATABRICKS_WORKSPACE_HOST="https://explicit.databricks.com/",
+    )
+    monkeypatch.setenv("DATABRICKS_HOST", "ignored.databricks.com")
+    assert _load().workspace_host == "https://explicit.databricks.com"

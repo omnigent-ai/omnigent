@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -89,11 +90,16 @@ class SetupFlow:
         pool: OmnigentClientPool,
         server_url: str,
         auth_manager: AuthManager | None = None,
+        enrollment_url: Callable[[str, str], str | None] | None = None,
     ) -> None:
         self._store = store
         self._pool = pool
         self._server_url = server_url
         self._auth = auth_manager
+        # In Databricks web-auth mode, returns the signed enrollment link for a
+        # (team, user) or ``None`` if the web server isn't configured. ``None``
+        # here means the historical device-grant / OIDC-ticket login is used.
+        self._enrollment_url = enrollment_url
         self._logger = logging.getLogger(__name__)
 
     def register(self, app: AsyncApp) -> None:
@@ -302,8 +308,18 @@ class SetupFlow:
         server_url: str,
         view_id: str,
     ) -> None:
-        """Show the login link in the modal and advance it once approved."""
+        """Show the login link in the modal and advance it once complete.
+
+        Dispatches on the configured login style: the Databricks web-auth
+        enrollment link (when wired) or the historical device-grant / OIDC
+        ticket flow.
+        """
         assert self._auth is not None
+        if self._enrollment_url is not None:
+            await self._begin_databricks_enrollment(
+                client, team_id=team_id, user_id=user_id, server_url=server_url, view_id=view_id
+            )
+            return
         client_id = slack_client_id(await self._team_name(client, team_id))
         try:
             pending = await self._auth.authorize(server_url=server_url, client_id=client_id)
@@ -356,6 +372,66 @@ class SetupFlow:
 
         self._auth.await_authorization_in_background(
             pending=pending,
+            team_id=team_id,
+            user_id=user_id,
+            server_url=server_url,
+            on_success=_on_success,
+            on_failure=_on_failure,
+        )
+
+    async def _begin_databricks_enrollment(
+        self,
+        client: Any,
+        *,
+        team_id: str,
+        user_id: str,
+        server_url: str,
+        view_id: str,
+    ) -> None:
+        """Show the Databricks enrollment link and advance once the user signs in.
+
+        Unlike the device flow, there's no code to poll: the user completes SSO
+        in their browser and the enrollment web server stores the token. We poll
+        the shared token store (via the auth manager) for it to appear, keyed by
+        the same (team, user) the signed link is bound to.
+        """
+        assert self._auth is not None and self._enrollment_url is not None
+        link = self._enrollment_url(team_id, user_id)
+        if not link:
+            await client.views_update(
+                view_id=view_id,
+                view=login_failed_modal(
+                    server_url,
+                    "sign-in isn't fully configured (no enrollment URL). "
+                    "Contact your Omnigent operator.",
+                ),
+            )
+            return
+
+        await client.views_update(
+            view_id=view_id,
+            view=enrollment_waiting_modal(server_url, link),
+        )
+
+        async def _on_success() -> None:
+            omnigent = await self._pool.get(server_url, pack_user_key(team_id, user_id))
+            try:
+                validated = await omnigent.validate()
+                await self._advance_to_select(
+                    _ViewUpdateAck(client, view_id), omnigent, server_url, validated
+                )
+            except Exception as exc:
+                self._logger.info("Post-enrollment modal advance failed: %s", exc)
+
+        async def _on_failure(reason: str) -> None:
+            try:
+                await client.views_update(
+                    view_id=view_id, view=login_failed_modal(server_url, reason)
+                )
+            except Exception as exc:
+                self._logger.info("Enrollment-failure modal update failed: %s", exc)
+
+        self._auth.await_enrollment_in_background(
             team_id=team_id,
             user_id=user_id,
             server_url=server_url,
@@ -588,6 +664,39 @@ def login_waiting_modal(server_url: str, verification_url: str, user_code: str) 
                 "type": "context",
                 "elements": [
                     {"type": "mrkdwn", "text": "Waiting for approval… keep this window open."}
+                ],
+            },
+        ],
+    }
+
+
+def enrollment_waiting_modal(server_url: str, enrollment_url: str) -> dict[str, Any]:
+    # Databricks web-auth variant of ``login_waiting_modal``. The user opens the
+    # enrollment link, which authenticates them through the bot's own Databricks
+    # proxy and stores an app-scoped token; the modal then advances itself to the
+    # agent/host picker once the token lands. No submit button — this just waits.
+    return {
+        "type": "modal",
+        "callback_id": CALLBACK_SETUP_INFO,
+        "title": {"type": "plain_text", "text": "Set up Omnigent"},
+        "close": {"type": "plain_text", "text": "Cancel"},
+        "blocks": [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        f"*{server_url}* is hosted on Databricks and needs a quick "
+                        "sign-in.\n\n"
+                        f"1. <{enrollment_url}|Sign in with Databricks> in your browser.\n"
+                        "2. This window will continue automatically once you're done."
+                    ),
+                },
+            },
+            {
+                "type": "context",
+                "elements": [
+                    {"type": "mrkdwn", "text": "Waiting for sign-in… keep this window open."}
                 ],
             },
         ],

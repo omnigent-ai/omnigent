@@ -64,7 +64,7 @@ targets:
   prod:
     mode: production
     workspace:
-      host: https://example.databricks.com   # ← your workspace URL
+      host: https://e2-dogfood.staging.cloud.databricks.com/   # ← your workspace URL
       # Isolate state per app so one bundle can deploy multiple apps.
       root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${var.app_name}
     resources:

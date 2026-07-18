@@ -242,6 +242,76 @@ class AuthManager:
         _logger.info("Login complete team=%s user=%s server=%s", team_id, user_id, server_url)
         await on_success()
 
+    def await_enrollment_in_background(
+        self,
+        *,
+        team_id: str,
+        user_id: str,
+        server_url: str,
+        on_success: Callable[[], Awaitable[None]],
+        on_failure: Callable[[str], Awaitable[None]],
+        timeout_seconds: int = 300,
+        poll_interval_seconds: float = 2.0,
+    ) -> None:
+        """Poll the token store until a web-auth enrollment lands, then advance.
+
+        The Databricks web-auth flow completes out-of-band: the user finishes in
+        their browser and the enrollment web server stores the token directly.
+        There's no device code to poll, so we watch the shared store for the
+        token to appear (keyed by the Slack identity the signed ``state`` bound
+        the browser session to). On arrival ``on_success`` runs (the setup modal
+        advances to agent/host selection, mirroring the device flow); on timeout
+        ``on_failure`` runs so the modal doesn't hang forever. UI-agnostic.
+        """
+        task = asyncio.create_task(
+            self._await_enrollment(
+                team_id=team_id,
+                user_id=user_id,
+                server_url=server_url,
+                on_success=on_success,
+                on_failure=on_failure,
+                timeout_seconds=timeout_seconds,
+                poll_interval_seconds=poll_interval_seconds,
+            )
+        )
+        self._login_tasks.add(task)
+        task.add_done_callback(self._login_tasks.discard)
+
+    async def _await_enrollment(
+        self,
+        *,
+        team_id: str,
+        user_id: str,
+        server_url: str,
+        on_success: Callable[[], Awaitable[None]],
+        on_failure: Callable[[str], Awaitable[None]],
+        timeout_seconds: int,
+        poll_interval_seconds: float,
+    ) -> None:
+        deadline = asyncio.get_event_loop().time() + timeout_seconds
+        try:
+            while True:
+                if await self.has_token(team_id, user_id, server_url):
+                    _logger.info(
+                        "Web-auth enrollment complete team=%s user=%s server=%s",
+                        team_id,
+                        user_id,
+                        server_url,
+                    )
+                    await on_success()
+                    return
+                if asyncio.get_event_loop().time() >= deadline:
+                    await on_failure(
+                        "That enrollment link expired before you finished. "
+                        "Run /omnigent to try again."
+                    )
+                    return
+                await asyncio.sleep(poll_interval_seconds)
+        except Exception:
+            # Never let an unexpected error strand the setup modal on "waiting…".
+            _logger.exception("Unexpected error while awaiting enrollment server=%s", server_url)
+            await on_failure("Sign-in failed. Please try again.")
+
     async def logout(self, team_id: str, user_id: str, server_url: str) -> None:
         """Revoke the grant on one server and delete the local token."""
         if self._tokens is None:
