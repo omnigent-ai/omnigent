@@ -13157,6 +13157,73 @@ def _with_default_scheme(server_url: str) -> str:
     return f"{scheme}://{server_url}"
 
 
+_AZURE_DATABRICKS_SUFFIX = ".azuredatabricks.net"
+# Azure spreads workspaces across a fixed set of regional shards; the
+# canonical host embeds the shard as workspace_id modulo this count.
+_AZURE_WORKSPACE_SHARD_COUNT = 20
+
+
+def _canonical_azure_workspace_host(host: str, org_id: str | None) -> str | None:
+    """Derive the canonical Azure Databricks host for a vanity workspace URL.
+
+    Azure serves every workspace at the shard-addressed canonical domain
+    ``adb-<workspace_id>.<shard>.azuredatabricks.net`` where
+    ``shard = workspace_id % 20`` — regardless of any custom / vanity URL
+    configured on top of it. Some vanity edges hide the omnigent mount
+    from unauthenticated requests (a 303 to a login page), so a workspace
+    that logs in fine on the canonical host cannot be detected through its
+    vanity host. The ``?o=`` selector carries the workspace id, which is
+    all the canonical host needs.
+
+    :param host: The URL host, e.g. ``"mydomain.azuredatabricks.net"``.
+    :param org_id: The ``?o=`` workspace id (see :func:`_org_id_from_url`),
+        e.g. ``"1140651659700000"``.
+    :returns: The canonical host, e.g.
+        ``"adb-1140651659700000.0.azuredatabricks.net"``, or ``None`` when
+        *host* is not an Azure ``azuredatabricks.net`` domain, is already
+        the ``adb-`` canonical form, or *org_id* is missing / non-numeric.
+    """
+    if not org_id or not org_id.isdigit():
+        return None
+    host = host.lower()
+    if not host.endswith(_AZURE_DATABRICKS_SUFFIX) or host.startswith("adb-"):
+        return None
+    shard = int(org_id) % _AZURE_WORKSPACE_SHARD_COUNT
+    return f"adb-{org_id}.{shard}{_AZURE_DATABRICKS_SUFFIX}"
+
+
+def _canonical_azure_workspace_mount(scheme: str, host: str, org_id: str | None) -> str | None:
+    """Probe the canonical Azure workspace's omnigent mount for a vanity host.
+
+    Used as a last resort when a custom / vanity Azure workspace URL never
+    yields the mount (its edge 303-redirects the anonymous probe to a
+    login page). Derives the canonical host from the ``?o=`` selector and
+    probes its ``/api/2.0/omnigent`` mount anonymously — the canonical
+    host answers the same DatabricksRealm challenge the AWS proxy does.
+
+    :param scheme: The URL scheme, e.g. ``"https"``.
+    :param host: The vanity URL host, e.g. ``"mydomain.azuredatabricks.net"``.
+    :param org_id: The ``?o=`` workspace id (see :func:`_org_id_from_url`).
+    :returns: The canonical ``/api/2.0/omnigent`` mount URL when the
+        canonical host answers as a workspace-hosted omnigent server, e.g.
+        ``"https://adb-<id>.<shard>.azuredatabricks.net/api/2.0/omnigent"``
+        — or ``None`` when no canonical host applies or its mount is dark.
+    """
+    import httpx as _httpx
+
+    from omnigent.conversation_browser import WORKSPACE_API_PATH
+
+    canonical_host = _canonical_azure_workspace_host(host, org_id)
+    if canonical_host is None:
+        return None
+    mount = f"{scheme}://{canonical_host}{WORKSPACE_API_PATH}"
+    try:
+        probe = _httpx.get(f"{mount}/v1/me", timeout=10.0)
+    except _httpx.HTTPError:
+        return None
+    return mount if _workspace_mount_probe_matches(mount, probe) else None
+
+
 def _workspace_api_server_url(server: str) -> str:
     """Expand a bare Databricks workspace URL to its omnigent API base.
 
@@ -13199,6 +13266,9 @@ def _workspace_api_server_url(server: str) -> str:
 
     server = server.rstrip("/")
     parsed = urlsplit(server)
+    # Read the ?o= selector before the query is stripped below — the
+    # canonical-Azure fallback needs the workspace id to rebuild the host.
+    org_id = _org_id_from_url(server)
     # Strip any ?o= selector / query / fragment before probing: callers append
     # a path (``f"{base}/v1/..."``), so a query-bearing base would push that
     # path into the query (``…/?o=123/v1/me``) and break the probe + expansion.
@@ -13219,6 +13289,19 @@ def _workspace_api_server_url(server: str) -> str:
         return expanded if expanded != root else server
     if parsed.path not in ("", "/") or parsed.scheme != "https":
         return server
+
+    def _canonical_fallback() -> str | None:
+        """Adopt the canonical Azure mount when a vanity host hides its own."""
+        canonical = _canonical_azure_workspace_mount(parsed.scheme, parsed.hostname or "", org_id)
+        if canonical is None:
+            return None
+        click.echo(
+            f"Note: {server} hides the omnigent mount from unauthenticated "
+            f"requests; using the canonical workspace URL "
+            f"{display_server_url(canonical)} instead."
+        )
+        return canonical
+
     try:
         probe = _httpx.get(f"{server}/v1/me", timeout=10.0)
     except _httpx.HTTPError:
@@ -13232,7 +13315,10 @@ def _workspace_api_server_url(server: str) -> str:
         return server
     server_header = probe.headers.get("server")
     if server_header is None or server_header.lower() != "databricks":
-        return server
+        # A vanity Azure edge can front the workspace without echoing the
+        # databricks server header; the ?o= selector still reaches the
+        # canonical host, so try that before leaving the URL untouched.
+        return _canonical_fallback() or server
     candidate = urlunsplit((parsed.scheme, parsed.netloc, WORKSPACE_API_PATH, "", ""))
     try:
         api_probe = _httpx.get(f"{candidate}/v1/me", timeout=10.0)
@@ -13244,10 +13330,11 @@ def _workspace_api_server_url(server: str) -> str:
         )
         return candidate
     # The anonymous probe came back inconclusive (404 on Azure even
-    # when the mount exists). Retry it with a cached workspace bearer;
-    # either way, say what was decided — this branch is only reached
-    # for genuine workspace web hosts, where a silent decline strands
-    # the user on a bare URL that can only 404.
+    # when the mount exists, or a 303 to a login page on custom/vanity
+    # domains). Retry it with a cached workspace bearer; either way, say
+    # what was decided — this branch is only reached for genuine
+    # workspace web hosts, where a silent decline strands the user on a
+    # bare URL that can only 404.
     token = _cached_workspace_bearer(server)
     if token is not None:
         try:
@@ -13263,6 +13350,14 @@ def _workspace_api_server_url(server: str) -> str:
                 f"Using {display_server_url(candidate)} (Databricks workspace-hosted omnigent)."
             )
             return candidate
+    # The given host never yielded the mount. Azure serves every
+    # workspace at the canonical adb-<id>.<shard>.azuredatabricks.net
+    # domain no matter what custom/vanity URL fronts it, so derive it
+    # from the ?o= selector and adopt its mount when it answers.
+    canonical = _canonical_fallback()
+    if canonical is not None:
+        return canonical
+    if token is not None:
         click.echo(
             f"Note: {server} answers like a Databricks workspace, but "
             f"{candidate} did not answer as an omnigent server even with "

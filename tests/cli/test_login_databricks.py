@@ -31,6 +31,14 @@ _WORKSPACE = "https://example.databricks.com"
 _APPS_REDIRECT = f"{_WORKSPACE}/oidc/oauth2/v2.0/authorize?client_id=abc&response_type=code"
 _WORKSPACE_API_URL = f"{_WORKSPACE}/api/2.0/omnigent"
 
+# A custom / vanity Azure workspace URL and the canonical
+# ``adb-<workspace_id>.<shard>.azuredatabricks.net`` host it maps to
+# (``shard = workspace_id % 20`` → ``1234567890123457 % 20 == 17``).
+_AZURE_VANITY = "https://mydomain.azuredatabricks.net"
+_AZURE_ORG_ID = "1234567890123457"
+_AZURE_CANONICAL = "https://adb-1234567890123457.17.azuredatabricks.net"
+_AZURE_CANONICAL_API_URL = f"{_AZURE_CANONICAL}/api/2.0/omnigent"
+
 
 @dataclass
 class _FakeHttpx:
@@ -861,6 +869,186 @@ def test_workspace_url_skips_authed_probe_without_databricks_extra(
     assert result == _WORKSPACE
     # Only the two anonymous probes — no token, no authed retry.
     assert [r["authorization"] for r in fake.requests] == [None, None]
+
+
+# ── custom / vanity Azure workspace URLs → canonical adb-* host ──
+
+
+@pytest.mark.parametrize(
+    ("host", "org_id", "expected"),
+    [
+        # Vanity azuredatabricks.net host + numeric ?o= → canonical adb-* host.
+        ("mydomain.azuredatabricks.net", "1234567890123457", _AZURE_CANONICAL[len("https://") :]),
+        # shard = workspace_id % 20; a different id lands on a different shard.
+        ("mydomain.azuredatabricks.net", "40", "adb-40.0.azuredatabricks.net"),
+        ("mydomain.azuredatabricks.net", "43", "adb-43.3.azuredatabricks.net"),
+        # Case-insensitive host match.
+        ("MyDomain.AzureDatabricks.NET", "43", "adb-43.3.azuredatabricks.net"),
+        # Already the canonical adb-* form → no rewrite (avoid a self-probe).
+        ("adb-43.3.azuredatabricks.net", "43", None),
+        # Not an Azure domain → no canonical form to derive.
+        ("example.databricks.com", "43", None),
+        ("myapp.aws.databricksapps.com", "43", None),
+        # No workspace id, or a non-numeric one → nothing to rebuild the host from.
+        ("mydomain.azuredatabricks.net", None, None),
+        ("mydomain.azuredatabricks.net", "", None),
+        ("mydomain.azuredatabricks.net", "not-a-number", None),
+    ],
+)
+def test_canonical_azure_workspace_host(
+    host: str, org_id: str | None, expected: str | None
+) -> None:
+    """The canonical Azure host is derived from the ``?o=`` workspace id.
+
+    Azure serves every workspace at ``adb-<id>.<shard>.azuredatabricks.net``
+    (``shard = id % 20``) regardless of any vanity URL, so the ``?o=``
+    selector is enough to rebuild the working host — but only for Azure
+    domains that are not already canonical and carry a numeric id.
+    """
+
+    assert cli_mod._canonical_azure_workspace_host(host, org_id) == expected
+
+
+def test_workspace_url_falls_back_to_canonical_when_vanity_mount_hidden(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A vanity Azure host that 303-hides its mount resolves via the canonical host.
+
+    Custom workspace URLs front the same workspace but some edges redirect
+    the unauthenticated ``/api/2.0/omnigent`` probe to a login page (303),
+    hiding the mount. The canonical ``adb-<id>.<shard>`` host always
+    answers the DatabricksRealm challenge, so with the ``?o=`` selector we
+    derive it and adopt its mount instead of stranding the user.
+    """
+
+    probed = _scripted_normalizer_httpx(
+        monkeypatch,
+        {
+            # Bare vanity root: workspace web app shape → triggers expansion.
+            f"{_AZURE_VANITY}/v1/me": _response(404, headers={"server": "databricks"}),
+            # Vanity mount, anonymous: hidden behind the login redirect.
+            f"{_AZURE_VANITY}/api/2.0/omnigent/v1/me": _response(
+                303,
+                headers={
+                    "location": "/login?next_url=%2Fapi%2F2.0%2Fomnigent",
+                    "server": "databricks",
+                },
+            ),
+            # Canonical mount: answers the DatabricksRealm challenge.
+            f"{_AZURE_CANONICAL_API_URL}/v1/me": _response(
+                401, headers={"www-authenticate": 'Bearer realm="DatabricksRealm"'}
+            ),
+        },
+    )
+    # No cached grant → the authed retry never runs; only anonymous probes.
+    monkeypatch.setattr(
+        "omnigent.onboarding.databricks_config.databricks_sdk_installed",
+        lambda: False,
+    )
+
+    result = cli_mod._workspace_api_server_url(f"{_AZURE_VANITY}/?o={_AZURE_ORG_ID}")
+
+    assert result == _AZURE_CANONICAL_API_URL
+    # The canonical mount was probed after the vanity mount came back dark.
+    assert f"{_AZURE_CANONICAL_API_URL}/v1/me" in probed
+    # The note names the canonical host it switched to (as the display /
+    # web-UI URL) so the user understands why the URL changed.
+    out = capsys.readouterr().out
+    assert _AZURE_CANONICAL in out
+
+
+def test_workspace_url_falls_back_to_canonical_when_vanity_lacks_databricks_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A vanity edge that omits the ``databricks`` header still reaches canonical.
+
+    Some vanity edges answer the bare root without echoing ``server:
+    databricks``, so the header-driven expansion never fires — but the
+    ``?o=`` selector on an ``azuredatabricks.net`` host is signal enough
+    to try the canonical host before leaving the URL untouched.
+    """
+
+    probed = _scripted_normalizer_httpx(
+        monkeypatch,
+        {
+            # Bare vanity root: 404 with no databricks header.
+            f"{_AZURE_VANITY}/v1/me": _response(404),
+            # Canonical mount: answers the DatabricksRealm challenge.
+            f"{_AZURE_CANONICAL_API_URL}/v1/me": _response(
+                401, headers={"www-authenticate": 'Bearer realm="DatabricksRealm"'}
+            ),
+        },
+    )
+
+    result = cli_mod._workspace_api_server_url(f"{_AZURE_VANITY}/?o={_AZURE_ORG_ID}")
+
+    assert result == _AZURE_CANONICAL_API_URL
+    # The vanity mount is skipped entirely (no databricks header); the
+    # canonical mount is probed straight off the bare-root response.
+    assert f"{_AZURE_VANITY}/api/2.0/omnigent/v1/me" not in probed
+    assert f"{_AZURE_CANONICAL_API_URL}/v1/me" in probed
+
+
+def test_workspace_url_keeps_vanity_when_its_own_mount_answers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A vanity host whose own mount answers is kept — no canonical rewrite.
+
+    Private-link / custom-DNS deployments may reach only the vanity host,
+    so the canonical adb-* host must stay a fallback: when the vanity mount
+    answers the challenge itself, it is adopted and the canonical host is
+    never probed.
+    """
+
+    probed = _scripted_normalizer_httpx(
+        monkeypatch,
+        {
+            f"{_AZURE_VANITY}/v1/me": _response(404, headers={"server": "databricks"}),
+            f"{_AZURE_VANITY}/api/2.0/omnigent/v1/me": _response(
+                401, headers={"www-authenticate": 'Bearer realm="DatabricksRealm"'}
+            ),
+        },
+    )
+
+    result = cli_mod._workspace_api_server_url(f"{_AZURE_VANITY}/?o={_AZURE_ORG_ID}")
+
+    assert result == f"{_AZURE_VANITY}/api/2.0/omnigent"
+    # The canonical host was never probed — the vanity mount worked.
+    assert all("adb-" not in url for url in probed)
+
+
+def test_resolve_server_url_falls_back_to_canonical(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The shared normalizer wires the canonical fallback end to end.
+
+    ``_resolve_server_url`` is the single seam ``login`` / ``host`` route
+    through, so a schemeless vanity host carrying ``?o=`` must resolve to
+    the canonical ``/api/2.0/omnigent`` mount over https.
+    """
+
+    monkeypatch.setattr(
+        "omnigent.onboarding.databricks_config.databricks_sdk_installed",
+        lambda: False,
+    )
+    _scripted_normalizer_httpx(
+        monkeypatch,
+        {
+            f"{_AZURE_VANITY}/v1/me": _response(404, headers={"server": "databricks"}),
+            f"{_AZURE_VANITY}/api/2.0/omnigent/v1/me": _response(
+                303, headers={"location": "/login", "server": "databricks"}
+            ),
+            f"{_AZURE_CANONICAL_API_URL}/v1/me": _response(
+                401, headers={"www-authenticate": 'Bearer realm="DatabricksRealm"'}
+            ),
+        },
+    )
+
+    assert (
+        cli_mod._resolve_server_url(f"mydomain.azuredatabricks.net/?o={_AZURE_ORG_ID}")
+        == _AZURE_CANONICAL_API_URL
+    )
 
 
 # ── schemeless input + web-UI URL acceptance (internal user guide) ──
