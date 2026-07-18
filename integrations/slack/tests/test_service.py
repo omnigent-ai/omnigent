@@ -7,6 +7,7 @@ from omnigent_slack.approvals import Verdict, parse_action_value
 from omnigent_slack.models import ThreadKey, UserConfig
 from omnigent_slack.omnigent import (
     AuthRequiredError,
+    HarnessNotConfiguredError,
     HostUnavailableError,
     OmnigentError,
     ServerUnreachableError,
@@ -177,6 +178,11 @@ class FakeSlackClient:
                 post.update(kwargs)
         return {"ok": True, "ts": ts}
 
+    async def chat_getPermalink(self, **kwargs: Any) -> dict[str, Any]:
+        channel = kwargs.get("channel")
+        ts = kwargs.get("message_ts")
+        return {"ok": True, "permalink": f"https://slack.test/archives/{channel}/p{ts}"}
+
     async def chat_stream(self, **kwargs: Any) -> FakeStream:
         # Only the first stream auto-closes (Slack finalizes the idle message);
         # the continuation the bot opens streams fresh, mirroring reality.
@@ -206,19 +212,16 @@ class FakeOmnigentClient:
         self.resolved_content: list[dict[str, Any] | None] = []
         self.next_session_id = "conv_1"
         self.final_text = final_text
-        # Rolled-up status the grace window polls at a soft idle; default idle so
-        # a turn ends promptly unless a test sets it to "running".
-        self.status = "idle"
         # Newest assistant message the server would return, for the no-delta
         # fallback. ``latest_message_id`` pins the id (else each call gets a
         # fresh id, so the fallback treats it as new relative to the baseline).
         self.latest_message: str | None = None
         self.latest_message_id: str | None = None
         self._latest_calls = 0
-        # Whether an outstanding elicitation is still pending server-side. Default
-        # True so the Slack-click path is exercised; a test sets it False to
-        # simulate the user answering elsewhere (web UI).
-        self.elicitation_pending = True
+        # Fires when the bot POSTs a verdict via resolve_elicitation — lets a
+        # fixture generator wait for the answer before emitting the server's
+        # elicitation_resolved + continuation (the pure-push model).
+        self.resolve_signal = asyncio.Event()
         # Server activity reported at ROUTE time (before a turn) — the gate that
         # decides whether a new message runs or is deflected. Defaults to free
         # (idle, no pending) so a follow-up runs; a test sets these to simulate a
@@ -226,9 +229,9 @@ class FakeOmnigentClient:
         # in-turn grace window polls) so the two don't collide.
         self.route_status: str | None = "idle"
         self.route_pending_elicitation = False
-
-    async def get_session_status(self, session_id: str) -> str | None:
-        return self.status
+        # Server-authoritative harness/agent for the first-message config summary.
+        self.info_harness: str | None = "claude-native"
+        self.info_agent_name: str | None = "debby"
 
     async def get_session_activity(self, session_id: str) -> Any:
         from omnigent_slack.omnigent import SessionActivity
@@ -237,8 +240,10 @@ class FakeOmnigentClient:
             status=self.route_status, pending_elicitation=self.route_pending_elicitation
         )
 
-    async def is_elicitation_pending(self, session_id: str, elicitation_id: str) -> bool:
-        return self.elicitation_pending
+    async def get_session_info(self, session_id: str) -> Any:
+        from omnigent_slack.omnigent import SessionInfo
+
+        return SessionInfo(harness=self.info_harness, agent_name=self.info_agent_name)
 
     async def create_session(self, agent_id: str, title: str) -> str:
         self.created.append((agent_id, title))
@@ -293,6 +298,7 @@ class FakeOmnigentClient:
     ) -> None:
         self.resolved.append((session_id, elicitation_id, accepted))
         self.resolved_content.append(content)
+        self.resolve_signal.set()
 
 
 class FakePool:
@@ -405,6 +411,9 @@ async def test_app_mention_creates_session_and_posts_response(tmp_path: Path) ->
     record = await store.get_session(key)
     assert record is not None and record.session_id == "conv_1"
     assert omnigent.created[0][0] == "ag_1"
+    # Session title is "Slack: <thread permalink>" (a clickable URL the web UI
+    # linkifies), not the old opaque "Slack C…/ts" descriptor.
+    assert omnigent.created[0][1] == "Slack: https://slack.test/archives/C1/p100.1"
     assert omnigent.bound == ["conv_1"]
     assert omnigent.turns == [("conv_1", "hello")]
     # The stream replies in-thread and delivers the streamed answer.
@@ -416,7 +425,16 @@ async def test_app_mention_creates_session_and_posts_response(tmp_path: Path) ->
     # started streaming — leaving no leftover placeholder.
     assert len(slack.acks) == 1
     assert slack.acks[0]["ts"] in slack.deleted_ts
-    assert slack.posts == []
+    # A new session posts one durable config-summary message (agent / harness /
+    # workspace + web-UI link) as the first thread message.
+    assert len(slack.posts) == 1
+    info_text = slack.posts[0]["text"]
+    assert "debby" in info_text  # agent name
+    assert "claude-native" in info_text  # harness
+    assert "/c/conv_1|Open in Omnigent>" in info_text  # web-UI link
+    # The config summary comes FIRST, then the "Working on it…" ack: the thread
+    # reads metadata → ack → answer.
+    assert slack.posts[0]["order"] < slack.acks[0]["order"]
     # The placeholder stayed up until the streamed message was actually on
     # screen. This short answer buffers in the SDK and only becomes visible at
     # stop(); the ack was still live then and is deleted only afterwards, so the
@@ -424,9 +442,63 @@ async def test_app_mention_creates_session_and_posts_response(tmp_path: Path) ->
     assert stream.ack_live_when_visible is True
 
 
-async def test_ack_is_posted_and_cleared_on_host_unavailable(tmp_path: Path) -> None:
-    # Even when the session can't start, the immediate ack is posted and then
-    # deleted before the guidance reply, so no placeholder lingers.
+async def test_session_title_falls_back_when_permalink_unavailable(tmp_path: Path) -> None:
+    # The title lookup is cosmetic and must never block session start: if
+    # chat.getPermalink fails (e.g. a missing scope), fall back to a plain
+    # channel/ts descriptor and still create the session.
+    store = await _store(tmp_path)
+
+    class NoPermalinkSlack(FakeSlackClient):
+        async def chat_getPermalink(self, **kwargs: Any) -> dict[str, Any]:
+            raise RuntimeError("missing scope")
+
+    slack = NoPermalinkSlack()
+    omnigent = FakeOmnigentClient()
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1")
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> hello"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await _wait_for_stream_stop(slack)
+    await service.shutdown()
+
+    assert len(omnigent.created) == 1
+    assert omnigent.created[0][1] == "Slack thread C1/100.1"
+
+
+async def test_session_info_omits_missing_fields(tmp_path: Path) -> None:
+    # The config summary degrades gracefully when the snapshot omits harness /
+    # agent (unreadable or older session) — no "None", no crash.
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    omnigent = FakeOmnigentClient()
+    omnigent.info_harness = None
+    omnigent.info_agent_name = None
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1")
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> hello"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await _wait_for_stream_stop(slack)
+    await service.shutdown()
+
+    info_text = slack.posts[0]["text"]
+    assert "None" not in info_text
+    assert "/c/conv_1|Open in Omnigent>" in info_text  # link still present
+
+
+async def test_no_ack_when_session_cannot_start_host_unavailable(tmp_path: Path) -> None:
+    # The "Working on it…" placeholder is posted only after the session is
+    # established, so a failed start shows just the guidance — no placeholder
+    # flicker to clear.
     store = await _store(tmp_path)
     slack = FakeSlackClient()
     omnigent = HostUnavailableClient()
@@ -442,9 +514,8 @@ async def test_ack_is_posted_and_cleared_on_host_unavailable(tmp_path: Path) -> 
     await _wait_for_posts(slack, 1)
     await service.shutdown()
 
-    assert len(slack.acks) == 1
-    assert slack.acks[0]["ts"] in slack.deleted_ts
-    # The only durable post is the guidance, not the ack.
+    assert slack.acks == []
+    # The only durable post is the guidance.
     assert len(slack.posts) == 1
     assert "omni host --server http://omnigent.test" in slack.posts[-1]["text"]
 
@@ -507,8 +578,8 @@ class StreamingClient(FakeOmnigentClient):
 class NoDeltaIdleClient(FakeOmnigentClient):
     """Mirrors a real claude-native short answer: NO text deltas — the answer
     arrives only as a committed ``output_item.done`` — and the turn ends on
-    ``session.status: idle`` (not ``response.completed``), exercising the grace
-    window. The ack must stay live until the buffered answer is on screen.
+    ``session.status: idle`` (not ``response.completed``). The ack must stay live
+    until the buffered answer is on screen.
     """
 
     async def run_turn(
@@ -541,8 +612,6 @@ async def test_no_delta_idle_answer_keeps_ack_until_visible(tmp_path: Path) -> N
     slack = FakeSlackClient()
     omnigent = NoDeltaIdleClient(final_text="Here is the answer.")
     service, _pool, _setup = _service(store, omnigent)
-    # Snapshot idle so the grace window ends promptly.
-    omnigent.status = "idle"  # type: ignore[attr-defined]
     await _configure_user(store, "T1", "U1")
 
     await service.handle_app_mention(
@@ -582,9 +651,10 @@ async def test_long_answer_streams_in_full(tmp_path: Path) -> None:
     await service.shutdown()
 
     # The full answer is delivered (deltas + stop tail) with one stream, no
-    # overflow chat.postMessage replies.
+    # overflow chat.postMessage replies — the only durable post is the session
+    # config summary, which never carries answer text.
     assert stream.text == long_answer
-    assert slack.posts == []
+    assert all(long_answer not in str(p.get("text", "")) for p in slack.posts)
 
 
 async def test_turn_error_posts_separate_reply_and_keeps_answer(tmp_path: Path) -> None:
@@ -679,8 +749,9 @@ async def test_turn_error_without_answer_finalizes_with_error(tmp_path: Path) ->
     await service.shutdown()
 
     assert "boom" in (stream.stop_text or "")
-    # No extra failure reply when there was no answer to preserve.
-    assert slack.posts == []
+    # No extra failure reply when there was no answer to preserve (the error is
+    # in the stream's stop text). The only durable post is the config summary.
+    assert all("failed" not in str(p.get("text", "")).lower() for p in slack.posts)
 
 
 async def test_stream_closed_mid_turn_continues_in_new_stream(tmp_path: Path) -> None:
@@ -708,9 +779,10 @@ async def test_stream_closed_mid_turn_continues_in_new_stream(tmp_path: Path) ->
     # first, and together they reconstruct the full answer with no lost text.
     assert len(slack.streams) >= 2
     assert slack.streamed_text == "chunk-a" + "y" * 600
-    # The continuation streamed in the same thread; no static catch-up reply.
+    # The continuation streamed in the same thread; no static catch-up reply
+    # (the answer text never appears in a durable post — only the config summary).
     assert slack.streams[-1].start_kwargs["thread_ts"] == "100.1"
-    assert slack.posts == []
+    assert all("chunk-a" not in str(p.get("text", "")) for p in slack.posts)
 
 
 async def test_stream_closed_then_error_continues_and_posts_failure(tmp_path: Path) -> None:
@@ -1285,10 +1357,10 @@ async def test_unreachable_server_prompts_config_command(tmp_path: Path) -> None
     assert "couldn't reach" in text.lower()
 
 
-async def test_auth_required_clears_ack_and_prompts_relogin(tmp_path: Path) -> None:
+async def test_auth_required_prompts_relogin(tmp_path: Path) -> None:
     # A user with saved config but no valid token (e.g. bot restarted, in-memory
-    # tokens lost) must NOT be left with a lingering "Working on it…" — the ack
-    # is cleared and a re-login prompt is posted instead.
+    # tokens lost) is told to log in again. The ack is posted only after the
+    # session starts, so a failed start leaves no "Working on it…" behind.
     store = await _store(tmp_path)
     slack = FakeSlackClient()
     omnigent = AuthRequiredClient()
@@ -1304,9 +1376,8 @@ async def test_auth_required_clears_ack_and_prompts_relogin(tmp_path: Path) -> N
     await _wait_for_posts(slack, 1)
     await service.shutdown()
 
-    # The placeholder was posted and then deleted — nothing lingers.
-    assert len(slack.acks) == 1
-    assert slack.acks[0]["ts"] in slack.deleted_ts
+    # No placeholder was posted (session never started).
+    assert slack.acks == []
     # No session persisted; the user is told to log in again.
     assert await store.get_session(ThreadKey("T1", "C1", "100.1")) is None
     text = slack.posts[-1]["text"]
@@ -1314,10 +1385,11 @@ async def test_auth_required_clears_ack_and_prompts_relogin(tmp_path: Path) -> N
     assert "log in" in text.lower() or "login" in text.lower()
 
 
-async def test_server_error_creating_session_clears_ack_and_reports(tmp_path: Path) -> None:
+async def test_server_error_creating_session_reports(tmp_path: Path) -> None:
     # A 500 from create_session raises a bare OmnigentError (not one of the
-    # specifically-handled subclasses). It must still clear the "Working on
-    # it…" placeholder and post a failure — never strand the thread.
+    # specifically-handled subclasses). It must still post a failure and never
+    # strand the thread. The ack posts only after the session starts, so a
+    # failed start leaves no placeholder to clear.
     store = await _store(tmp_path)
     slack = FakeSlackClient()
     omnigent = ServerErrorClient()
@@ -1333,9 +1405,8 @@ async def test_server_error_creating_session_clears_ack_and_reports(tmp_path: Pa
     await _wait_for_posts(slack, 1)
     await service.shutdown()
 
-    # Placeholder posted then deleted — nothing lingers on "Working on it…".
-    assert len(slack.acks) == 1
-    assert slack.acks[0]["ts"] in slack.deleted_ts
+    # No placeholder was posted (session never started).
+    assert slack.acks == []
     # A failure reply was posted, and no session was persisted.
     assert await store.get_session(ThreadKey("T1", "C1", "100.1")) is None
     text = slack.posts[-1]["text"]
@@ -1362,6 +1433,41 @@ async def test_no_online_host_prompts_omni_host_command(tmp_path: Path) -> None:
     text = slack.posts[-1]["text"]
     assert "omni host --server http://omnigent.test" in text
     assert "/omnigent" in text
+
+
+class HarnessNotConfiguredClient(FakeOmnigentClient):
+    async def launch_runner(
+        self, session_id: str, *, workspace: str, host_id: str | None = None
+    ) -> str:
+        raise HarnessNotConfiguredError(
+            "host failed to launch runner: claude CLI not found; run omnigent setup"
+        )
+
+
+async def test_harness_not_configured_412_surfaces_server_message(tmp_path: Path) -> None:
+    # A 412 on runner launch (harness not set up on the host) is actionable — the
+    # server's message must reach the user so they know to run `omnigent setup`,
+    # not a generic "request failed".
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    omnigent = HarnessNotConfiguredClient()
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1")
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> hi"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await _wait_for_posts(slack, 1)
+    await service.shutdown()
+
+    # Session was not persisted (startup failed) and the actionable message shows.
+    assert await store.get_session(ThreadKey("T1", "C1", "100.1")) is None
+    text = slack.posts[-1]["text"]
+    assert "omnigent setup" in text
+    assert "status 412" not in text  # not the generic fallback
 
 
 # ── Tool-approval (elicitation) flow ─────────────────────────────────
@@ -1407,12 +1513,26 @@ def _form_elicitation_event(elicitation_id: str = "elicit_form") -> dict[str, An
     }
 
 
+async def _wait_any(*events: asyncio.Event) -> None:
+    """Wait until any of ``events`` is set (with a safety timeout)."""
+    waiters = [asyncio.ensure_future(e.wait()) for e in events]
+    try:
+        await asyncio.wait(waiters, timeout=5.0, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for w in waiters:
+            if not w.done():
+                w.cancel()
+
+
 class ApprovalClient(FakeOmnigentClient):
     """A turn that streams, parks on an elicitation, then streams a tail.
 
-    The generator yields the elicitation event and then blocks until the worker
-    resolves it (the worker awaits the verdict before pulling the next event).
-    This mirrors the server keeping the stream open across the park.
+    Pure-push model: the generator yields the elicitation event, then WAITS for
+    the verdict to be resolved — either the bot POSTs it (``resolve_signal``, a
+    Slack click) or the test resolves it externally (``resolve_externally``).
+    It then emits the server's ``response.elicitation_resolved`` push, streams
+    the continuation, and ends on an id-bearing idle. This mirrors the real
+    server holding the continuation until the elicitation is answered.
     """
 
     def __init__(
@@ -1421,6 +1541,9 @@ class ApprovalClient(FakeOmnigentClient):
         super().__init__(final_text="done")
         self._elicitation_id = elicitation_id
         self._event = event or _elicitation_event(elicitation_id)
+        # When set, the fixture emits elicitation_resolved WITHOUT waiting for the
+        # bot to POST a verdict — models an answer in the web UI / another client.
+        self.resolve_externally = asyncio.Event()
 
     async def run_turn(
         self,
@@ -1433,10 +1556,15 @@ class ApprovalClient(FakeOmnigentClient):
         self.turns.append((session_id, text))
         yield {"type": "response.output_text.delta", "delta": "work"}
         yield self._event
-        # The worker resolves the elicitation before requesting more events;
-        # by the time control returns here the verdict has been delivered.
+        # Keep the stream "open": wait until the elicitation is answered — either
+        # the bot POSTs a verdict (Slack click) or the test resolves it elsewhere.
+        await _wait_any(self.resolve_signal, self.resolve_externally)
+        yield {
+            "type": "response.elicitation_resolved",
+            "elicitation_id": self._elicitation_id,
+        }
         yield {"type": "response.output_text.delta", "delta": "ing"}
-        yield {"type": "session.status", "status": "idle"}
+        yield {"type": "session.status", "status": "idle", "response_id": "resp_1"}
 
 
 class PreambleThenCommittedAnswerClient(FakeOmnigentClient):
@@ -1470,6 +1598,9 @@ class PreambleThenCommittedAnswerClient(FakeOmnigentClient):
             },
         }
         yield self._event
+        # Wait for the answer, then the server pushes elicitation_resolved.
+        await _wait_any(self.resolve_signal)
+        yield {"type": "response.elicitation_resolved", "elicitation_id": "elicit_form"}
         # Post-answer message arrives ONLY as a committed item (no deltas) — the
         # tail must be recovered and delivered, not dropped.
         yield {
@@ -1480,7 +1611,7 @@ class PreambleThenCommittedAnswerClient(FakeOmnigentClient):
                 "content": [{"type": "output_text", "text": "You picked A. Full summary here."}],
             },
         }
-        yield {"type": "session.status", "status": "idle"}
+        yield {"type": "session.status", "status": "idle", "response_id": "resp_1"}
 
 
 async def _wait_for_card(client: FakeSlackClient) -> dict[str, Any]:
@@ -1610,6 +1741,36 @@ async def test_tool_approval_deny_forwards_decline(tmp_path: Path) -> None:
     assert "Denied" in slack.updates[-1]["blocks"][0]["text"]["text"]
 
 
+async def test_elicitation_resolved_externally_finalizes_without_posting(tmp_path: Path) -> None:
+    # Pure-push: the user answers in the web UI (not the Slack card). The loop
+    # keeps reading and sees response.elicitation_resolved; it must finalize the
+    # card ("Answered elsewhere") WITHOUT posting its own verdict, and the
+    # continuation must still stream.
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    omnigent = ApprovalClient()
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1")
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> edit"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await _wait_for_card(slack)
+    # No Slack click — resolve elsewhere; the fixture then emits the push.
+    omnigent.resolve_externally.set()
+    await _wait_for_turn_end(slack)
+    await service.shutdown()
+
+    # We posted NO verdict (answered elsewhere), the card shows the neutral
+    # outcome, and the continuation ("ing") streamed after the card.
+    assert omnigent.resolved == []
+    assert "Answered elsewhere" in slack.updates[-1]["blocks"][0]["text"]["text"]
+    assert any("ing" in s.text for s in slack.streams)
+
+
 async def test_elicitation_resolved_externally_unblocks_without_verdict(tmp_path: Path) -> None:
     # The user answers the request in the web UI instead of clicking the Slack
     # card. The worker must stop waiting (once the server shows it no longer
@@ -1663,9 +1824,12 @@ async def test_denied_approval_does_not_resurrect_prior_answer(tmp_path: Path) -
             host_id: str | None = None,
         ) -> AsyncIterator[dict[str, Any]]:
             self.turns.append((session_id, text))
-            # Only a gated tool call, no answer text; ends on idle.
+            # Only a gated tool call, no answer text. Park until the deny is
+            # posted, then the server resolves and ends the turn — no answer.
             yield _elicitation_event("elicit_rm")
-            yield {"type": "session.status", "status": "idle"}
+            await _wait_any(self.resolve_signal)
+            yield {"type": "response.elicitation_resolved", "elicitation_id": "elicit_rm"}
+            yield {"type": "session.status", "status": "idle", "response_id": "resp_1"}
 
     omnigent = DeniedNoAnswerClient()
     # A stale prior-turn answer exists on the server, pinned to a fixed id so it
@@ -1887,11 +2051,10 @@ async def test_post_answer_message_only_committed_is_not_dropped(tmp_path: Path)
 
 
 class PreambleThenSilentAfterElicitationClient(FakeOmnigentClient):
-    """Models the stale-connection incident: a preamble streams, the elicitation
-    is handled, then the SSE connection goes SILENT — the post-answer message
-    never arrives on the stream (only the terminal idle does). The final answer
-    lives solely in the server's latest_assistant_message, recovered by the
-    no-delta fallback. Regression for a turn that hung + dropped the answer.
+    """The turn produces NO answer text on the stream at all — a preamble seals
+    at the elicitation, and after resolution the answer never streams (it lives
+    only in the server's committed message). Exercises the no-delta fallback
+    safety net: the final answer is recovered from latest_assistant_message.
     """
 
     def __init__(self, event: dict[str, Any]) -> None:
@@ -1909,10 +2072,12 @@ class PreambleThenSilentAfterElicitationClient(FakeOmnigentClient):
         self.turns.append((session_id, text))
         yield {"type": "response.output_text.delta", "delta": "Before deleting, let me look."}
         yield self._event
-        # After the verdict resolves, the connection is stale — no post-answer
-        # event arrives, only the eventual terminal idle. The answer is recovered
-        # from the server snapshot (latest_message), not the stream.
-        yield {"type": "session.status", "status": "idle"}
+        # Park until the verdict is posted; the answer then never streams (no
+        # delta, no committed item) — only the id-bearing terminal. The final
+        # answer is recovered from the server snapshot (latest_message).
+        await _wait_any(self.resolve_signal)
+        yield {"type": "response.elicitation_resolved", "elicitation_id": "elicit_form"}
+        yield {"type": "session.status", "status": "idle", "response_id": "resp_1"}
 
 
 async def test_post_elicitation_answer_recovered_when_stream_silent(tmp_path: Path) -> None:
