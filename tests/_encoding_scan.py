@@ -87,14 +87,42 @@ def _mode_present(call: ast.Call, mode_argindex: int) -> bool:
     return any(k.arg == "mode" for k in call.keywords)
 
 
+def _has_dynamic_args(call: ast.Call) -> bool:
+    """True when the call uses ``*args`` or ``**kwargs``.
+
+    Such a call's mode and encoding can't be read statically (``open(*[p, "rt"])``,
+    ``open(p, **{"mode": "rt"})``), so it must be treated conservatively.
+    """
+    return any(isinstance(a, ast.Starred) for a in call.args) or any(
+        k.arg is None for k in call.keywords
+    )
+
+
+def _assigned_names(tree: ast.AST) -> set[str]:
+    """Names that appear as an assignment target (Store context) anywhere.
+
+    A name imported as a compressed module but also *assigned* — e.g.
+    ``import gzip; gzip = Path(...)`` — is ambiguous, so it is dropped from the
+    module bindings and its ``.open`` falls back to the ordinary text-default
+    path. (Import statements bind via ``alias`` nodes, not ``Name`` stores, so
+    they are not counted here.)
+    """
+    return {
+        n.id for n in ast.walk(tree) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)
+    }
+
+
 def _compressed_bindings(tree: ast.AST) -> tuple[set[str], set[str]]:
     """``(module_aliases, open_func_aliases)`` proven to reference gzip/bz2/lzma.
 
     ``import gzip as gz`` binds ``gz`` to the module; ``from gzip import open as
-    gopen`` binds ``gopen`` to its text-capable ``open``. Only these bindings get
-    compressed-open handling, so an unrelated name (``gzip = Path(...)``) is not
-    mistaken for the module and vice-versa.
+    gopen`` binds ``gopen`` to its text-capable ``open``. A *non-aliased*
+    ``from gzip import open`` is deliberately NOT tracked: it shadows the builtin,
+    and routing such a bare ``open`` through the stricter builtin/text-default
+    path is sound. Any binding whose name is also assigned elsewhere is dropped as
+    ambiguous, so a rebinding is not mistaken for the module.
     """
+    assigned = _assigned_names(tree)
     modules: set[str] = set()
     funcs: set[str] = set()
     for node in ast.walk(tree):
@@ -104,9 +132,10 @@ def _compressed_bindings(tree: ast.AST) -> tuple[set[str], set[str]]:
                     modules.add(a.asname or a.name)
         elif isinstance(node, ast.ImportFrom) and node.module in _COMPRESSED_MODULES:
             for a in node.names:
-                if a.name == "open":
-                    funcs.add(a.asname or a.name)
-    return modules, funcs
+                bound = a.asname or a.name
+                if a.name == "open" and bound != "open":
+                    funcs.add(bound)
+    return modules - assigned, funcs - assigned
 
 
 def _fdopen_names(tree: ast.AST) -> set[str]:
@@ -197,10 +226,12 @@ def _literal_text(node: ast.AST) -> str | None:
 
 
 def _compressed_open_violation(node: ast.Call, label: str) -> tuple[int, str] | None:
-    """A gzip/bz2/lzma open needs an encoding when a mode is supplied and not
-    statically provable as binary (an explicit text mode, or a computed/dynamic
-    mode). A bare call or a proven-binary mode stays clean."""
-    if not _has_encoding(node) and _mode_present(node, 1) and not _mode_is_binary(node, 1):
+    """A gzip/bz2/lzma open needs an encoding unless it is statically proven safe:
+    a bare call or a proven-binary mode stays clean. A dynamic-args call, an
+    explicit text mode, or a computed/dynamic mode all require the encoding."""
+    if _has_encoding(node):
+        return None
+    if _has_dynamic_args(node) or (_mode_present(node, 1) and not _mode_is_binary(node, 1)):
         return (node.lineno, label)
     return None
 

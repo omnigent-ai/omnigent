@@ -145,6 +145,12 @@ _FLAGGED = [
     'import gzip\ngzip.open(p, "r" + "t")',  # computed mode, not provably binary
     "import gzip\ngzip.open(p, mode)",  # dynamic mode, not provably binary
     'from pathlib import Path\ngzip = Path("x")\ngzip.open("rt")',  # rebound name: real text open
+    'from pathlib import Path\nimport gzip\ngzip = Path("x")\ngzip.open()',  # rebound module
+    'def a():\n    from gzip import open\ndef b():\n    open("plain.txt")',  # nested, no taint
+    'import gzip\ngzip.open(path, **{"mode": "rt"})',  # **kwargs hides a text mode
+    'import gzip\ngzip.open(*[path, "rt"])',  # *args hides a text mode
+    "open(*args)",  # dynamic args: can't prove binary
+    "open(**kwargs)",  # dynamic kwargs: can't prove binary/encoding
     'run("import os; data = open(p).read()")',  # embedded, plain string
     'run(f"exec(open({p!r}).read())")',  # embedded, f-string
     'run("""\n    import os\n    data = open(p).read()\n""")',  # embedded, indented
@@ -305,3 +311,62 @@ def test_read_existing_cfg_unreadable_raises(
     with pytest.raises(OSError):
         _read_existing_cfg(cfg, original, "utf-8")
     assert cfg.sections() == []
+
+
+def _fake_internal_beta(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stub the Databricks-internal module the context manager imports, so the
+    end-to-end flow can run in this OSS checkout (which does not ship it)."""
+    import sys
+    import types
+
+    mod = types.ModuleType("omnigent.onboarding.internal_beta")
+    mod.DEFAULT_PROFILES = []  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "omnigent.onboarding.internal_beta", mod)
+
+
+def test_isolated_databricks_cfg_restores_env_on_prep_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If preparation fails after conflicting env vars are popped (here: a failing
+    mkstemp), the try/finally must still restore them — not leave DATABRICKS_HOST
+    /DATABRICKS_TOKEN deleted.
+    """
+    import tempfile
+
+    _fake_internal_beta(monkeypatch)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("DATABRICKS_HOST", "https://keep.example")
+
+    def _boom(*_a: object, **_k: object) -> None:
+        raise OSError("mkstemp failed")
+
+    monkeypatch.setattr(tempfile, "mkstemp", _boom)
+
+    from omnigent.cli import _isolated_databricks_cfg
+
+    with pytest.raises(OSError), _isolated_databricks_cfg():
+        pass
+    assert os.environ.get("DATABRICKS_HOST") == "https://keep.example"
+
+
+@pytest.mark.windows_only
+def test_isolated_databricks_cfg_redetects_codec_on_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The merge-back must re-detect the codec. Entry sees UTF-8; another process
+    replaces the file with cp1252 mid-flight. Reusing the entry-time UTF-8 codec
+    would fail to decode the cp1252 ``é`` (0xE9); re-detecting reads/writes cp1252
+    cleanly, so the flow completes and ``café`` survives.
+    """
+    _fake_internal_beta(monkeypatch)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    original = tmp_path / ".databrickscfg"
+    original.write_text("[legacy]\nhost = café\n", encoding="utf-8")  # entry: UTF-8
+
+    from omnigent.cli import _isolated_databricks_cfg
+
+    with _isolated_databricks_cfg():
+        # Another process rewrites the config as cp1252 mid-flight.
+        original.write_bytes("[legacy]\nhost = café\n".encode("cp1252"))
+
+    assert "café" in original.read_text(encoding="cp1252")
