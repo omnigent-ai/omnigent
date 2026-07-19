@@ -2625,17 +2625,15 @@ export function NewChatLandingScreen() {
     if (mentionFsQuery.isPlaceholderData) return [];
     const rows = (mentionFsQuery.data?.entries ?? [])
       .filter((e) => e.type === "directory" || e.type === "file")
-      .map(
-        (e): WorkspaceFile => ({
-          path: e.path.startsWith(workspaceRoot)
-            ? e.path.slice(workspaceRoot.length).replace(/^\/+/, "")
-            : e.name,
-          name: e.name,
-          type: e.type === "directory" ? "directory" : "file",
-          bytes: e.bytes,
-          modified_at: e.modified_at,
-        }),
-      );
+      .map((e): WorkspaceFile => ({
+        path: e.path.startsWith(workspaceRoot)
+          ? e.path.slice(workspaceRoot.length).replace(/^\/+/, "")
+          : e.name,
+        name: e.name,
+        type: e.type === "directory" ? "directory" : "file",
+        bytes: e.bytes,
+        modified_at: e.modified_at,
+      }));
     return rankMentionEntries(rows, mentionFilter);
   }, [
     mentionEnabled,
@@ -3008,9 +3006,10 @@ export function NewChatLandingScreen() {
       className="flex flex-1 items-start justify-center pt-[104px] md:pt-[clamp(128px,22vh,216px)]"
       data-testid="new-chat-landing"
     >
-      {/* Keep enough outer room for the greeting, while the composer itself
-          uses the same 746px rendered width as the narrow session column with
-          the workspace pane open. px-4 on phones preserves 16px gutters. */}
+      {/* Keep enough outer room for the greeting, while the landing composer
+          stays narrower than the in-session column so it remains visually
+          grouped with Otto and the prompt. px-4 on phones preserves 16px
+          gutters. */}
       <div className="flex w-full max-w-[860px] flex-col items-center gap-6 px-4 pb-16 md:select-none md:px-10">
         <div className="flex flex-col items-center gap-0">
           <div
@@ -3018,18 +3017,18 @@ export function NewChatLandingScreen() {
             aria-hidden="true"
             data-testid="new-chat-landing-otto"
           >
-            <div className="absolute -inset-3 rounded-full bg-[radial-gradient(circle,rgba(245,59,157,0.21),rgba(245,59,157,0.052)_44%,rgba(77,197,160,0.028)_58%,transparent_73%)] blur-[3px]" />
+            <div className="otto-landing-halo absolute -inset-3 rounded-full bg-[radial-gradient(circle,rgba(245,59,157,0.21),rgba(245,59,157,0.052)_44%,rgba(77,197,160,0.028)_58%,transparent_73%)] blur-[3px]" />
             <span className="otto-landing-orbit otto-landing-orbit--pink absolute top-[26px] left-2 h-[34px] w-[92px] rounded-[50%] border border-[#F53B9D]/40 shadow-[inset_0_0_16px_rgba(245,59,157,0.055)]" />
             <span className="otto-landing-orbit otto-landing-orbit--green absolute top-[31px] left-4 h-[26px] w-[77px] rounded-[50%] border border-[#4DC5A0]/30" />
             <span className="otto-landing-satellite otto-landing-satellite--pink absolute top-6 right-3 size-1 rounded-full bg-[#F53B9D] shadow-[0_0_9px_#F53B9D]" />
             <span className="otto-landing-satellite otto-landing-satellite--green absolute bottom-[21px] left-4 size-1 rounded-full bg-[#4DC5A0] shadow-[0_0_9px_#4DC5A0]" />
             <OttoEyes className="otto-landing-mascot absolute top-5 left-[30px] h-12 w-auto drop-shadow-[0_16px_25px_rgba(245,59,157,0.21)]" />
           </div>
-          <h1 className="text-center text-[28px] leading-8 font-normal tracking-[-0.03em] text-foreground">
+          <h1 className="brand-display-title text-center text-[28px] leading-8 font-[450] tracking-[-0.035em] text-foreground">
             What should we build?
           </h1>
         </div>
-        <div className="relative flex w-full max-w-[746px] flex-col gap-0">
+        <div className="relative flex w-full max-w-[704px] flex-col gap-0">
           <ComposerFormSurface
             onSubmit={(e) => {
               e.preventDefault();
@@ -3330,7 +3329,7 @@ export function NewChatLandingScreen() {
                           aria-label={creating ? "Starting session" : "Start session"}
                           aria-busy={creating}
                           data-testid="new-chat-landing-submit"
-                          className="size-8 rounded-[8px] bg-foreground text-card transition-opacity hover:opacity-80 disabled:bg-muted disabled:text-muted-foreground disabled:opacity-100"
+                          className="size-8 rounded-full bg-foreground text-card transition-opacity hover:opacity-80 disabled:bg-muted disabled:text-muted-foreground disabled:opacity-100"
                         >
                           {creating ? (
                             <Loader2Icon className="size-4 animate-spin" />

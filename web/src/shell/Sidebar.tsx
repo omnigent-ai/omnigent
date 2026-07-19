@@ -63,6 +63,7 @@ import {
   useSensors,
 } from "@dnd-kit/core";
 import { Link, useLocation, useNavigate, useParams } from "@/lib/routing";
+import omnigentWordmark from "@/assets/omnigent-wordmark.svg";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -171,7 +172,11 @@ const TIME_MARKER_SLOT_CLASS =
 // row-selection highlight in this file, at /5 (half the original /10) so it's a
 // gentler gray in light mode (a gentler glow in dark mode) and reads as "active
 // area" without the heavy fill. Pair with `transition-colors` so it eases in.
-const DROP_TARGET_HIGHLIGHT = "bg-primary/5";
+const SIDEBAR_HOVER_HIGHLIGHT =
+  "hover:bg-[var(--sidebar-hover)] hover:text-[var(--sidebar-active-foreground)]";
+const SIDEBAR_ACTIVE_HIGHLIGHT =
+  "bg-[var(--sidebar-active)] text-[var(--sidebar-active-foreground)]";
+const DROP_TARGET_HIGHLIGHT = SIDEBAR_ACTIVE_HIGHLIGHT;
 
 /**
  * Which session tab the sidebar is showing. ``"mine"`` is the viewer's own
@@ -435,7 +440,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
         // nothing lingers.
         "md:relative md:inset-auto md:translate-x-0 md:overflow-hidden",
         open
-          ? "md:m-2 md:w-[var(--sidebar-width)] md:rounded-lg md:border md:border-border md:shadow-lg"
+          ? "md:m-2 md:w-[var(--sidebar-width)] md:rounded-[var(--radius-otto-md)] md:border md:border-border"
           : "md:m-0 md:w-0 md:border-0",
       )}
       style={
@@ -478,9 +483,14 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
             <Link
               to="/"
               onClick={onNavClick}
-              className="rounded-none font-['Hanken_Grotesk'] text-[15px] font-semibold leading-[22.5px] tracking-[-0.01em] text-foreground transition-colors hover:text-foreground/70"
+              className="rounded-none transition-opacity duration-200 ease-[var(--ease-otto)] hover:opacity-70"
             >
-              Omnigent
+              <img
+                src={omnigentWordmark}
+                alt="Omnigent"
+                data-testid="sidebar-wordmark"
+                className="h-[15px] w-auto shrink-0 dark:invert"
+              />
             </Link>
             <div className="flex items-center gap-1">
               <Tooltip>
@@ -549,8 +559,9 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                 // px-2 + gap-1 puts the icon on the sidebar's left (red) column
                 // and the label on the label (blue) column — matching section
                 // headers and project folders.
-                "sidebar-primary-nav-item h-7 w-full justify-start gap-2 rounded-[6px] border-0 px-2 text-[13px] leading-5 font-normal",
-                isNewChatPage && "bg-muted",
+                "sidebar-primary-nav-item h-7 w-full justify-start gap-2 rounded-[var(--radius-otto-sm)] border-0 px-2 text-[13px] leading-5 font-normal",
+                SIDEBAR_HOVER_HIGHLIGHT,
+                isNewChatPage && SIDEBAR_ACTIVE_HIGHLIGHT,
               )}
               variant="ghost"
               data-testid="new-chat-button"
@@ -584,7 +595,10 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                 <Button
                   asChild
                   variant="ghost"
-                  className="sidebar-primary-nav-item h-7 w-full justify-start gap-2 rounded-[6px] border-0 px-2 text-[13px] leading-5 font-normal"
+                  className={cn(
+                    "sidebar-primary-nav-item h-7 w-full justify-start gap-2 rounded-[var(--radius-otto-sm)] border-0 px-2 text-[13px] leading-5 font-normal",
+                    SIDEBAR_HOVER_HIGHLIGHT,
+                  )}
                 >
                   <Link to="/settings/appearance">
                     <BlocksIcon className="size-3.5 text-muted-foreground" />
@@ -596,7 +610,10 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                     <Button
                       type="button"
                       variant="ghost"
-                      className="sidebar-primary-nav-item h-7 w-full justify-start gap-2 rounded-[6px] border-0 px-2 text-[13px] leading-5 font-normal"
+                      className={cn(
+                        "sidebar-primary-nav-item h-7 w-full justify-start gap-2 rounded-[var(--radius-otto-sm)] border-0 px-2 text-[13px] leading-5 font-normal",
+                        SIDEBAR_HOVER_HIGHLIGHT,
+                      )}
                       data-testid="sidebar-more-button"
                     >
                       <MoreHorizontalIcon className="size-3.5 text-muted-foreground" />
@@ -638,10 +655,18 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                 className="w-full"
               >
                 <TabsList className="w-full">
-                  <TabsTrigger value="mine" data-testid="sidebar-tab-mine" className="min-w-0">
+                  <TabsTrigger
+                    value="mine"
+                    data-testid="sidebar-tab-mine"
+                    className="min-w-0 text-[13px] font-normal hover:bg-[var(--sidebar-hover)] data-active:bg-[var(--sidebar-active)] data-active:text-[var(--sidebar-active-foreground)] data-active:shadow-none"
+                  >
                     <span className="min-w-0 truncate">My sessions</span>
                   </TabsTrigger>
-                  <TabsTrigger value="shared" data-testid="sidebar-tab-shared" className="min-w-0">
+                  <TabsTrigger
+                    value="shared"
+                    data-testid="sidebar-tab-shared"
+                    className="min-w-0 text-[13px] font-normal hover:bg-[var(--sidebar-hover)] data-active:bg-[var(--sidebar-active)] data-active:text-[var(--sidebar-active-foreground)] data-active:shadow-none"
+                  >
                     <span className="min-w-0 truncate">Shared with me</span>
                   </TabsTrigger>
                 </TabsList>
@@ -723,7 +748,8 @@ function InfiniteScrollSentinel({
         if (hasMore) fetchMore();
       }}
       className={cn(
-        "flex w-full cursor-pointer items-center justify-center gap-1.5 rounded-md px-2 py-1.5 text-muted-foreground text-xs hover:bg-muted disabled:pointer-events-none disabled:opacity-50",
+        "flex w-full cursor-pointer items-center justify-center gap-1.5 rounded-md px-2 py-1.5 text-muted-foreground text-xs disabled:pointer-events-none disabled:opacity-50",
+        SIDEBAR_HOVER_HIGHLIGHT,
         indent && "pl-5",
       )}
     >
@@ -816,7 +842,7 @@ function ProjectFolder({
     <div
       ref={setNodeRef}
       className={cn(
-        "rounded-md transition-colors",
+        "rounded-[var(--radius-otto-sm)] transition-colors duration-200 ease-[var(--ease-otto)]",
         // Subtle background tint on drag-over — no border, no shadow.
         isOver && DROP_TARGET_HIGHLIGHT,
       )}
@@ -1175,8 +1201,7 @@ function ConversationList({
   );
   const handleDragStart = useCallback((event: DragStartEvent) => {
     const data = event.active.data.current as
-      | { label?: string; project?: string | null; isPinned?: boolean }
-      | undefined;
+      { label?: string; project?: string | null; isPinned?: boolean } | undefined;
     setActiveDrag({
       id: String(event.active.id),
       label: data?.label ?? String(event.active.id),
@@ -1661,7 +1686,10 @@ function ChatsDropZone({ active, children }: { active: boolean; children: ReactN
     <div
       ref={setNodeRef}
       data-testid="sidebar-chats-drop-zone"
-      className={cn("rounded-md transition-colors", active && isOver && DROP_TARGET_HIGHLIGHT)}
+      className={cn(
+        "rounded-[var(--radius-otto-sm)] transition-colors duration-200 ease-[var(--ease-otto)]",
+        active && isOver && DROP_TARGET_HIGHLIGHT,
+      )}
     >
       {children}
     </div>
@@ -1684,7 +1712,10 @@ function PinDropZone({ active, children }: { active: boolean; children: ReactNod
     <div
       ref={setNodeRef}
       data-testid="sidebar-pin-drop-zone"
-      className={cn("rounded-md transition-colors", active && isOver && DROP_TARGET_HIGHLIGHT)}
+      className={cn(
+        "rounded-[var(--radius-otto-sm)] transition-colors duration-200 ease-[var(--ease-otto)]",
+        active && isOver && DROP_TARGET_HIGHLIGHT,
+      )}
     >
       {children}
     </div>
@@ -2706,12 +2737,13 @@ function ConversationRow({
     <Link
       to={selectionMode ? "#" : `/c/${conversation.id}`}
       className={cn(
-        "relative flex min-h-7 w-full flex-col gap-0.5 rounded-[6px] px-2 py-0.5 text-left text-[13px] leading-5 text-foreground hover:bg-muted",
+        "relative flex min-h-7 w-full flex-col gap-0.5 rounded-[var(--radius-otto-sm)] px-2 py-0.5 text-left text-[13px] leading-5 text-foreground transition-colors duration-200 ease-[var(--ease-otto)]",
+        SIDEBAR_HOVER_HIGHLIGHT,
         !selectionMode &&
           (sessionState?.kind === "awaiting" ? "pr-48 md:pr-29" : "pr-28 md:pr-[52px]"),
         selectionMode && "pr-10",
-        isActive && "bg-muted",
-        selectionMode && isSelected && "bg-primary/5",
+        isActive && SIDEBAR_ACTIVE_HIGHLIGHT,
+        selectionMode && isSelected && SIDEBAR_ACTIVE_HIGHLIGHT,
       )}
       onClick={(e) => {
         // Swallow the click that trails a drag so it doesn't navigate.

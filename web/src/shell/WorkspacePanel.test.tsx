@@ -89,6 +89,14 @@ function renderWorkspace(
 }
 
 describe("WorkspacePanel open-file tabs", () => {
+  it("uses the Otto structural-container radius", () => {
+    renderWorkspace();
+    expect(screen.getByRole("complementary", { name: "Workspace" })).toHaveClass(
+      "md:rounded-[var(--radius-otto-md)]",
+      "md:m-2",
+    );
+  });
+
   it("renders a tab per open file labeled by basename, next to the fixed Files tab", () => {
     renderWorkspace({ openFiles: ["src/App.tsx", "docs/README.md"] });
 

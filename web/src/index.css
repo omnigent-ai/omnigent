@@ -3,6 +3,7 @@
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
 @import "@fontsource-variable/geist-mono";
+@import "@fontsource-variable/fredoka";
 
 @font-face {
   font-family: "Hanken Grotesk";
@@ -96,6 +97,9 @@
   --color-tray: var(--tray);
   --color-foreground: var(--foreground);
   --color-assistant-foreground: var(--assistant-foreground);
+  --color-user-bubble: var(--user-bubble-bg);
+  --color-user-bubble-border: var(--user-bubble-border);
+  --color-user-bubble-foreground: var(--user-bubble-foreground);
   --color-background: var(--background);
   --radius-sm: calc(var(--radius) * 0.6);
   --radius-md: calc(var(--radius) * 0.8);
@@ -117,6 +121,21 @@
    * browser default; the root `html` rules multiply it into their font-size so
    * the whole rem-based UI scales. Overridden at runtime on documentElement. */
   --ui-font-scale: 1;
+  --font-brand-display: "Fredoka Variable", "Hanken Grotesk", system-ui, sans-serif;
+
+  /* Otto's UI grammar mirrors the mascot's soft body-to-arm curvature:
+   * compact controls stay precise, containers soften outward, and major
+   * surfaces float with warm rather than neutral elevation. */
+  --radius-otto-xs: 6px;
+  --radius-otto-sm: 10px;
+  --radius-otto-md: 14px;
+  --radius-otto-lg: 20px;
+  --ease-otto: cubic-bezier(0.34, 1.4, 0.64, 1);
+  --border-otto-hairline: rgba(61, 57, 41, 0.1);
+  --border-otto-container: rgba(61, 57, 41, 0.14);
+  --border-otto-interactive: rgba(61, 57, 41, 0.18);
+  --elevation-otto-1: 0 1px 2px rgba(61, 57, 41, 0.04), 0 2px 8px rgba(61, 57, 41, 0.05);
+  --elevation-otto-2: 0 2px 4px rgba(61, 57, 41, 0.05), 0 8px 24px rgba(61, 57, 41, 0.065);
 
   /* User-controlled UI font family (see Appearance settings /
    * lib/uiFontPreferences.ts). Deliberately left unset here so the `html` rule's
@@ -181,11 +200,14 @@
      * the product still feels unmistakably on-brand instead of becoming an
      * SP2K clone. */
   --background: #fdfdfc;
-  --shell-surface: #f7f7f5;
-  --side-pane-surface: #fbfaf9;
+  --shell-surface: #fdfdfc;
+  --side-pane-surface: #fff;
   --composer-surface: #fff;
   --foreground: #11171c;
   --assistant-foreground: #2a262a;
+  --user-bubble-bg: var(--muted);
+  --user-bubble-border: transparent;
+  --user-bubble-foreground: var(--foreground);
   --card: #fff;
   /* Light --card is already opaque; the solid form only diverges in dark. */
   --card-solid: #fff;
@@ -197,8 +219,8 @@
      * (These all consume bg-popover / text-popover-foreground.) */
   --popover: #fff;
   --popover-foreground: #11171c;
-  --primary: #11171c;
-  --primary-foreground: #fff;
+  --primary: #4dc5a0;
+  --primary-foreground: #123d33;
   /* Warm paper steps keep controls distinct without introducing a cool-grey
      * cast that would fight the pink and green brand colors. */
   --secondary: #f2f1ee;
@@ -228,7 +250,7 @@
   --button-icon-hover-color: #11171c;
   --input: rgba(61, 57, 41, 0.1);
   /* Focus ring matches --primary. */
-  --ring: #11171c;
+  --ring: #26a079;
   /* Brand pink — reserved for brand moments, not status. */
   --brand-accent: #df3c85;
   /* Named status hues. success/warning/info above mirror green/yellow/blue. */
@@ -247,17 +269,32 @@
      * stays softly gray-white behind it. */
   --sidebar: #fff;
   --sidebar-foreground: #11171c;
-  --sidebar-primary: #2272b4;
-  --sidebar-primary-foreground: #fff;
+  --sidebar-primary: #4dc5a0;
+  --sidebar-primary-foreground: #123d33;
   --sidebar-accent: #f3e7ed;
   --sidebar-accent-foreground: #653047;
   --sidebar-border: rgba(61, 57, 41, 0.1);
-  --sidebar-ring: #2272b4;
+  --sidebar-ring: #26a079;
+  /* Routine navigation states stay neutral and theme-adaptive. Brand color is
+     reserved for primary actions and semantic status, not row selection. */
+  --sidebar-hover: color-mix(in srgb, var(--sidebar-foreground) 5%, transparent);
+  --sidebar-active: color-mix(in srgb, var(--sidebar-foreground) 7%, var(--sidebar));
+  --sidebar-active-foreground: var(--sidebar-foreground);
   --scrollbar-thumb: rgba(0, 0, 0, 0.12);
   --scrollbar-thumb-hover: rgba(0, 0, 0, 0.22);
 }
 
+.brand-display-title {
+  font-family: var(--font-brand-display);
+  font-variation-settings: "wdth" 100;
+}
+
 .dark {
+  --border-otto-hairline: rgba(255, 255, 255, 0.08);
+  --border-otto-container: rgba(255, 255, 255, 0.1);
+  --border-otto-interactive: rgba(255, 255, 255, 0.14);
+  --elevation-otto-1: 0 1px 2px rgba(0, 0, 0, 0.18), 0 3px 10px rgba(0, 0, 0, 0.2);
+  --elevation-otto-2: 0 2px 4px rgba(0, 0, 0, 0.28), 0 12px 32px rgba(0, 0, 0, 0.3);
   /* Isaac Darker-inspired near-black ladder with a tiny Omnigent rose bias. */
   --background: #121113;
   --shell-surface: #121113;
@@ -267,6 +304,9 @@
   --composer-surface: rgb(40, 36, 44);
   --foreground: oklch(0.965 0.003 240);
   --assistant-foreground: #ded7dc;
+  --user-bubble-bg: var(--muted);
+  --user-bubble-border: transparent;
+  --user-bubble-foreground: var(--foreground);
   --card: rgba(36, 33, 38, 0.72);
   --card-solid: #242126;
   --card-foreground: oklch(0.965 0.003 240);
@@ -372,17 +412,17 @@
   background: var(--shell-surface);
 }
 
-/* Flat warm-white sidebar: the app canvas supplies the Omnigent atmosphere,
- * while the navigation stays quiet and paper-like like Isaac Light. */
+/* Flat warm-white sidebar: keep the surface within one luminance step of the
+ * app canvas and use a hairline edge instead of elevation. This follows the
+ * quiet pairing shared by Isaac Light and macOS Light, where navigation reads
+ * as part of the window rather than a card floating beside it. */
 :root:not(.dark) .conversations-sidebar:not([data-collapsed]) {
   --foreground: #27272a;
   --muted: rgba(61, 57, 41, 0.06);
   --muted-foreground: #6e6c68;
 
-  border-color: rgba(61, 57, 41, 0.1);
-  box-shadow:
-    0 2px 8px rgba(61, 57, 41, 0.06),
-    0 1px 2px rgba(61, 57, 41, 0.04);
+  border-color: rgba(61, 57, 41, 0.08);
+  box-shadow: 0 1px 3px rgba(20, 20, 19, 0.06);
   background: var(--side-pane-surface);
 }
 
@@ -401,22 +441,23 @@
 }
 
 :root:not(.dark) .reference-composer-surface {
-  border-color: rgba(61, 57, 41, 0.1);
+  /* Otto-derived P0 geometry: a softer outer silhouette with a role-strong
+   * container edge and warm lift, so the composer feels buoyant rather than
+   * like a flat generic chat box. */
+  border-color: var(--border-otto-container);
   background: var(--composer-surface);
   background-image: none;
-  box-shadow: 0 6px 12px -6px rgb(0 0 0 / 0.12);
+  box-shadow: var(--elevation-otto-2);
 }
 
 /* Reference workspace card: the right pane uses the compact floating geometry
  * and elevation from the live agentic-ux prototype instead of the older
  * oversized dashboard-card treatment. */
 :root:not(.dark) .workspace-panel-surface {
-  border-color: rgba(61, 57, 41, 0.1);
+  border-color: rgba(61, 57, 41, 0.08);
   background: var(--side-pane-surface);
   background-image: none;
-  box-shadow:
-    0 2px 8px rgba(61, 57, 41, 0.06),
-    0 1px 2px rgba(61, 57, 41, 0.04);
+  box-shadow: 0 1px 3px rgba(20, 20, 19, 0.06);
 }
 
 html.dark .app-shell .workspace-panel-surface {
@@ -552,7 +593,8 @@ html.dark .app-shell .reference-composer-surface {
   background: var(--composer-surface) !important;
   background-image: none !important;
   box-shadow:
-    0 30px 70px rgba(0, 0, 0, 0.42),
+    0 2px 4px rgba(0, 0, 0, 0.28),
+    0 12px 32px rgba(0, 0, 0, 0.3),
     inset 0 1px rgba(255, 255, 255, 0.035) !important;
 }
 
@@ -1922,6 +1964,88 @@ html.dark:not([data-theme])
     :is([data-workspace-panel-content] > *, [data-workspace-panel-surface]) {
     background-color: transparent;
   }
+}
+
+/* ── Omnigent Rose — flat dusty-rose paper, berry accent ─────────────────── */
+:root:not(.dark)[data-theme="omni-rose"] {
+  --background: #faf0f5;
+  --shell-surface: #faf0f5;
+  --side-pane-surface: #fef6fa;
+  --composer-surface: #fffafd;
+  --foreground: #2f252d;
+  --assistant-foreground: #3f343d;
+  --user-bubble-bg: #eedbe4;
+  --user-bubble-border: #dfc4d0;
+  --user-bubble-foreground: #36232e;
+  --card: #fffafd;
+  --card-solid: #fffafd;
+  --card-foreground: #2f252d;
+  --tray: #fffafd;
+  --popover: #fffafd;
+  --popover-foreground: #2f252d;
+  --primary: #4dc5a0;
+  --primary-foreground: #123d33;
+  --secondary: #eef3f0;
+  --secondary-foreground: #345f53;
+  --muted: #efe7eb;
+  --muted-foreground: #685b65;
+  --code-bg: #eee4e9;
+  --accent: #e1f1eb;
+  --accent-foreground: #26705a;
+  --border: #e4d6de;
+  --border-strong: #c7aeba;
+  --button-border: #decdd6;
+  --input: #decdd6;
+  --ring: #26a079;
+  --brand-accent: #cf3e83;
+  --sidebar: #fef6fa;
+  --sidebar-foreground: #3b3038;
+  --sidebar-primary: #4dc5a0;
+  --sidebar-primary-foreground: #123d33;
+  --sidebar-accent: #e1f1eb;
+  --sidebar-accent-foreground: #26705a;
+  --sidebar-border: #e4d6de;
+  --sidebar-ring: #26a079;
+}
+:root:not(.dark)[data-theme="omni-rose"] .app-shell {
+  background: var(--shell-surface);
+}
+:root:not(.dark)[data-theme="omni-rose"] .app-shell:has([data-testid="new-chat-landing"])::before {
+  background: none;
+}
+:root:not(.dark)[data-theme="omni-rose"] .otto-landing-halo {
+  background: none;
+  filter: none;
+}
+:root:not(.dark)[data-theme="omni-rose"] .otto-landing-mascot {
+  filter: drop-shadow(0 10px 14px rgba(166, 58, 104, 0.12));
+}
+:root:not(.dark)[data-theme="omni-rose"]
+  .reference-composer-surface
+  [data-testid="new-chat-landing-submit"]:not(:disabled),
+:root:not(.dark):not([data-theme])
+  .reference-composer-surface
+  [data-testid="new-chat-landing-submit"]:not(:disabled),
+:root:not(.dark)[data-theme="omni-rose"]
+  .reference-composer-surface
+  button[aria-label="Send"]:not(:disabled),
+:root:not(.dark):not([data-theme])
+  .reference-composer-surface
+  button[aria-label="Send"]:not(:disabled) {
+  color: #123d33 !important;
+  background: #4dc5a0 !important;
+  box-shadow: 0 8px 20px rgba(38, 160, 121, 0.2) !important;
+}
+:root:not(.dark)[data-theme="omni-rose"] [data-slot="switch"][data-checked],
+:root:not(.dark):not([data-theme]) [data-slot="switch"][data-checked] {
+  background: var(--primary) !important;
+}
+:root:not(.dark)[data-theme="omni-rose"] .conversations-sidebar:not([data-collapsed]) {
+  border-color: var(--sidebar-border);
+}
+:root:not(.dark)[data-theme="omni-rose"]
+  :is(.reference-composer-surface, .workspace-panel-surface) {
+  border-color: var(--border);
 }
 
 /* ── GitHub — clean neutrals, signal blue, green primary ──────────────────── */

@@ -275,12 +275,12 @@ export function collectBubbleMarkdown(items: RenderItem[]): string {
     .trim();
 }
 
-// Match SP2K's narrow chat setting: the transcript has an 832px outer cap,
-// then ConversationContent adds 24px horizontal padding on each side. Keep
-// the composer surfaces aligned to that 784px readable-content column rather
-// than the transcript's padded outer box.
-const CHAT_COLUMN_WIDTH = "max-w-[832px]";
-const COMPOSER_COLUMN_WIDTH = "w-[calc(100%-1rem)] md:w-[calc(100%-3rem)] max-w-[784px]";
+// Keep the transcript deliberately narrow for comfortable long-form reading:
+// ConversationContent adds 24px horizontal padding on each side, leaving a
+// 720px readable column. Align the composer surfaces to that inner width
+// rather than the transcript's padded outer box.
+const CHAT_COLUMN_WIDTH = "max-w-[768px]";
+const COMPOSER_COLUMN_WIDTH = "w-[calc(100%-1rem)] md:w-[calc(100%-3rem)] max-w-[720px]";
 
 const TABLE_SEPARATOR_RE = /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/;
 
@@ -4964,7 +4964,7 @@ export function Composer({
               // overrides the base 50% disabled-opacity so the affordance
               // reads as "waiting for input", not "almost active".
               className={cn(
-                "size-8 shrink-0 rounded-[8px]",
+                "size-8 shrink-0 rounded-full",
                 !showInterruptButton && "hover:bg-primary/90 disabled:opacity-30",
               )}
               // Interrupt stays live during a pending elicitation —

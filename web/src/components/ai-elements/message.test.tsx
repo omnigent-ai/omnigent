@@ -22,6 +22,23 @@ afterEach(() => {
 });
 
 describe("MessageContent", () => {
+  it("uses dedicated theme-specific user bubble colors", () => {
+    render(
+      <Message from="user">
+        <MessageContent>Theme-aware prompt</MessageContent>
+      </Message>,
+    );
+
+    const prompt = screen.getByText("Theme-aware prompt");
+    expect(prompt).toHaveClass(
+      "group-[.is-user]:rounded-[var(--radius-otto-md)]",
+      "group-[.is-user]:bg-user-bubble",
+      "group-[.is-user]:text-user-bubble-foreground",
+      "group-[.is-user]:ring-user-bubble-border",
+    );
+    expect(prompt).not.toHaveClass("group-[.is-user]:bg-muted", "group-[.is-user]:text-foreground");
+  });
+
   it("uses readable theme-specific assistant typography", () => {
     render(
       <Message from="assistant">

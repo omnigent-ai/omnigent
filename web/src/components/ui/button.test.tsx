@@ -28,6 +28,11 @@ const VARIANTS = ["default", "outline", "secondary", "ghost", "destructive", "li
 const SIZES = ["default", "xs", "sm", "lg", "icon", "icon-xs", "icon-sm", "icon-lg"] as const;
 
 describe("buttonVariants translate/transform composition", () => {
+  it("uses Otto's compact control radius and buoyant timing", () => {
+    expect(buttonVariants({})).toContain("rounded-[var(--radius-otto-sm)]");
+    expect(buttonVariants({})).toContain("ease-[var(--ease-otto)]");
+  });
+
   it.each(VARIANTS.flatMap((variant) => SIZES.map((size) => ({ variant, size }))))(
     "emits no translate-* utility for variant=$variant size=$size",
     ({ variant, size }) => {

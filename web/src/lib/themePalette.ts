@@ -24,6 +24,7 @@ const STORAGE_KEY = "omnigent:ui-theme-palette";
 /** Selectable color palettes. The first entry is the default (brand) look. */
 export const themePalettes = [
   "omni",
+  "omni-rose",
   "dracula",
   "github",
   "catppuccin",
@@ -82,6 +83,22 @@ export const PALETTES: readonly PaletteMeta[] = [
       text: "#11171c",
     },
     dark: { bg: "#160e24", card: "#28223a", accent: "#df3c85", border: "#2a2440", text: "#f4f5f7" },
+  },
+  {
+    id: "omni-rose",
+    label: "Omnigent Rose",
+    blurb: "Dusty rose paper with berry and Otto-green accents.",
+    light: {
+      bg: "#faf0f5",
+      card: "#fffafd",
+      accent: "#a63a68",
+      border: "#e4d6de",
+      text: "#2f252d",
+    },
+    // This palette intentionally customizes light mode only. Dark mode keeps
+    // the established Omnigent dark treatment rather than inventing a second
+    // unrequested rose-dark system.
+    dark: { bg: "#121113", card: "#242126", accent: "#df3c85", border: "#322f34", text: "#f4f5f7" },
   },
   {
     id: "dracula",

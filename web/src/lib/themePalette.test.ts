@@ -59,6 +59,7 @@ describe("themePalette", () => {
   it("guards known vs unknown palette ids", () => {
     expect(isThemePalette("github")).toBe(true);
     expect(isThemePalette("omni")).toBe(true);
+    expect(isThemePalette("omni-rose")).toBe(true);
     expect(isThemePalette("nord")).toBe(true);
     expect(isThemePalette("nope")).toBe(false);
     expect(isThemePalette(undefined)).toBe(false);
@@ -72,6 +73,11 @@ describe("themePalette", () => {
   it("sets data-theme on the document root for a non-default palette", () => {
     applyThemePalette("catppuccin");
     expect(document.documentElement.getAttribute("data-theme")).toBe("catppuccin");
+  });
+
+  it("applies the light-only Omnigent Rose palette as a built-in selection", () => {
+    applyThemePalette("omni-rose");
+    expect(document.documentElement.getAttribute("data-theme")).toBe("omni-rose");
   });
 
   it("sets the custom data-theme when the custom configuration is selected", () => {

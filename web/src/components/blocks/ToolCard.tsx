@@ -420,7 +420,7 @@ function OutputSection({ output }: { output: string }) {
     <div className="space-y-2">
       <div
         className={cn(
-          "relative rounded-md",
+          "relative rounded-[var(--radius-otto-sm)]",
           canExpand && !isExpanded && "max-h-80 overflow-hidden",
           // overflow-auto (vs overflow-y-auto) keeps long single-line output from blowing out the bubble width.
           (!canExpand || isExpanded) && "max-h-[36rem] overflow-auto",
@@ -428,11 +428,11 @@ function OutputSection({ output }: { output: string }) {
       >
         <CodePanel title="Output" text={preview.text} copyText={output} copyLabel="Copy output" />
         {canExpand && !isExpanded && (
-          <div className="pointer-events-none absolute inset-x-px bottom-px h-16 rounded-b-md bg-gradient-to-t from-background to-transparent" />
+          <div className="pointer-events-none absolute inset-x-px bottom-px h-16 rounded-b-[var(--radius-otto-sm)] bg-gradient-to-t from-background to-transparent" />
         )}
       </div>
       {canExpand && (
-        <div className="flex flex-col gap-2 rounded-md border bg-muted/30 px-3 py-2 text-muted-foreground text-xs sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex flex-col gap-2 rounded-[var(--radius-otto-sm)] border border-[var(--border-otto-hairline)] bg-muted/30 px-3 py-2 text-muted-foreground text-xs sm:flex-row sm:items-center sm:justify-between">
           <span className="min-w-0">
             {isExpanded ? "Showing full output" : "Previewing output"} (
             {formatOutputStats(isExpanded ? preview : collapsedPreview)})
@@ -459,7 +459,7 @@ function OutputSection({ output }: { output: string }) {
 
 function ToolPendingOutput({ duration }: { duration: number | undefined }) {
   return (
-    <div className="rounded-md border border-dashed bg-muted/30 p-3">
+    <div className="rounded-[var(--radius-otto-sm)] border border-dashed bg-muted/30 p-3">
       <div className="flex items-center gap-2 text-muted-foreground text-sm">
         <Loader2Icon className="size-4 animate-spin text-info" />
         <span>
@@ -484,7 +484,7 @@ function EmptyOutputState({ state }: { state: "output-error" | "cancelled" | "no
     message = "Tool did not return output before the response failed.";
   }
   return (
-    <div className="rounded-md border border-dashed bg-muted/30 px-3 py-2 text-muted-foreground text-sm">
+    <div className="rounded-[var(--radius-otto-sm)] border border-dashed bg-muted/30 px-3 py-2 text-muted-foreground text-sm">
       {message}
     </div>
   );

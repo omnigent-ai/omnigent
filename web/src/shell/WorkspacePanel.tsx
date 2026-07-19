@@ -273,14 +273,14 @@ export function WorkspacePanel({
     <aside
       aria-label="Workspace"
       inert={inert}
-      // Reference-style floating card on desktop: 8px from every edge, 8px
-      // radius, compact border/shadow, and a self-contained top tab strip.
+      // Structural Otto surface on desktop: 8px from every edge, the 14px
+      // container radius, quiet border/shadow, and a self-contained tab strip.
       // AppShell reserves this width from ChatHeader, so the card can extend
       // to the top without sitting underneath the session action buttons.
       // ``@container/rail`` makes the rail a named container-query context so
       // the tab strip can switch scroll behavior on the rail's own width
       // (see the strip below) without a JS width listener.
-      className="workspace-panel-surface @container/rail relative z-40 hidden md:m-2 md:flex md:min-h-0 md:shrink-0 md:flex-col md:overflow-hidden md:rounded-lg md:border md:border-border md:bg-card"
+      className="workspace-panel-surface @container/rail relative z-40 hidden md:m-2 md:flex md:min-h-0 md:shrink-0 md:flex-col md:overflow-hidden md:rounded-[var(--radius-otto-md)] md:border md:border-border md:bg-card"
       style={{ width }}
     >
       {/* Left-edge horizontal resize handle. */}

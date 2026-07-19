@@ -701,7 +701,11 @@ describe("NewChatLandingScreen", () => {
     // The home page offers an inline chat box rather than the old
     // "click New session in the sidebar" placeholder. If it regressed to
     // the placeholder, the composer input would be absent and this fails.
-    expect(screen.getByText("What should we build?")).toBeTruthy();
+    expect(screen.getByText("What should we build?")).toHaveClass(
+      "brand-display-title",
+      "font-[450]",
+      "tracking-[-0.035em]",
+    );
     expect(screen.getByTestId("new-chat-landing-input")).toBeTruthy();
     expect(screen.getByPlaceholderText("Ask anything...")).toBeTruthy();
     const otto = screen.getByTestId("new-chat-landing-otto");

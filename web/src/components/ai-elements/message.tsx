@@ -52,7 +52,7 @@ export const MessageContent = ({ children, className, ...props }: MessageContent
       // to 14px / 20px for the primary reading surface without enlarging
       // tool rows, code blocks, or surrounding UI chrome.
       "is-user:dark flex w-fit min-w-0 max-w-full flex-col gap-2 overflow-hidden text-13 leading-5",
-      "group-[.is-user]:ml-auto group-[.is-user]:rounded-2xl group-[.is-user]:bg-muted group-[.is-user]:px-3 group-[.is-user]:py-2 group-[.is-user]:text-foreground",
+      "group-[.is-user]:ml-auto group-[.is-user]:rounded-[var(--radius-otto-md)] group-[.is-user]:bg-user-bubble group-[.is-user]:px-3 group-[.is-user]:py-2 group-[.is-user]:text-user-bubble-foreground group-[.is-user]:ring-1 group-[.is-user]:ring-inset group-[.is-user]:ring-user-bubble-border",
       // Tighter than the user bubble's gap-2 so muted single-line tool
       // ("See N steps") / reasoning rows don't look orphaned between prose.
       "group-[.is-assistant]:gap-1.5 group-[.is-assistant]:text-[14px] group-[.is-assistant]:leading-5 group-[.is-assistant]:text-assistant-foreground",
