@@ -12,6 +12,7 @@ from omnigent.onboarding.provider_config import (
     GEMINI_FAMILY,
     OPENAI_FAMILY,
     PI_SURFACE,
+    databricks_provider_models,
     default_provider_for_harness,
     harness_family,
     load_providers,
@@ -815,3 +816,86 @@ def test_default_provider_for_pi_none_when_only_bedrock_default() -> None:
         }
     }
     assert default_provider_for_harness(config, "pi") is None
+
+
+# ── databricks kind: per-tier model overrides ────────────────────────────────
+
+
+def test_parse_databricks_models_map() -> None:
+    """A databricks entry's ``models:`` map parses onto the entry.
+
+    Failure means per-tier endpoint overrides in ``~/.omnigent/config.yaml``
+    are silently dropped at parse, and every Databricks model-resolution
+    point falls back to ucode state / the hardcoded default.
+    """
+    entry = load_providers(
+        {
+            "providers": {
+                "dbx": {
+                    "kind": "databricks",
+                    "profile": "my-ws",
+                    "models": {
+                        "default": "main.agents.opus-endpoint",
+                        "opus": "main.agents.opus-endpoint",
+                        "sonnet": "main.agents.sonnet-endpoint",
+                    },
+                }
+            }
+        }
+    )["dbx"]
+    assert entry.models == {
+        "default": "main.agents.opus-endpoint",
+        "opus": "main.agents.opus-endpoint",
+        "sonnet": "main.agents.sonnet-endpoint",
+    }
+
+
+@pytest.mark.parametrize("models_raw", [None, "not-a-map", ["a", "b"]])
+def test_parse_databricks_models_absent_or_malformed_is_empty(models_raw: object) -> None:
+    """An absent or non-mapping ``models:`` parses to an empty map.
+
+    Mirrors the lenient ``FamilyConfig.models`` handling: a malformed value
+    must not fail the whole config, and an absent key keeps the ucode-driven
+    resolution byte-for-byte unchanged.
+    """
+    raw: dict[str, object] = {"kind": "databricks", "profile": "my-ws"}
+    if models_raw is not None:
+        raw["models"] = models_raw
+    entry = load_providers({"providers": {"dbx": raw}})["dbx"]
+    assert entry.models == {}
+
+
+def test_databricks_provider_models_looks_up_by_profile(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``databricks_provider_models`` returns the matching entry's map.
+
+    The lookup is keyed on the profile (the only databricks identity that
+    reaches the model-resolution points), skips non-databricks kinds, and
+    returns ``{}`` for a mapless entry / unknown profile / no profile — the
+    "absent map leaves behavior unchanged" contract.
+    """
+    (tmp_path / "config.yaml").write_text(
+        "providers:\n"
+        "  gw:\n"
+        "    kind: gateway\n"
+        "    anthropic:\n"
+        "      base_url: https://gw\n"
+        "      api_key_ref: env:K\n"
+        "  dbx:\n"
+        "    kind: databricks\n"
+        "    profile: my-ws\n"
+        "    models:\n"
+        "      default: main.agents.opus-endpoint\n"
+        "  other:\n"
+        "    kind: databricks\n"
+        "    profile: other-ws\n"
+    )
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+
+    assert databricks_provider_models("my-ws") == {"default": "main.agents.opus-endpoint"}
+    # A matching entry without a models: map — no overrides.
+    assert databricks_provider_models("other-ws") == {}
+    # No databricks entry carries this profile.
+    assert databricks_provider_models("unknown-ws") == {}
+    assert databricks_provider_models(None) == {}

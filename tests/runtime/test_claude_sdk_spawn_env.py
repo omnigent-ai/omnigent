@@ -243,3 +243,127 @@ def test_ucode_state_with_model_is_not_overridden_by_default(
     env = _build_claude_sdk_spawn_env(spec, workdir=None)
 
     assert env["HARNESS_CLAUDE_SDK_MODEL"] == "databricks-claude-sonnet-4-6"
+
+
+def _write_databricks_models_config(tmp_path: Path, *, models: dict[str, str]) -> None:
+    """
+    Write a ``providers:`` config with a databricks entry carrying *models*.
+
+    The autouse ``_isolate_global_config`` fixture already points
+    ``$OMNIGENT_CONFIG_HOME`` at *tmp_path*, so this exercises the real
+    config-loading path behind ``databricks_provider_models``.
+
+    :param tmp_path: The per-test config home.
+    :param models: The tier→model overrides, e.g.
+        ``{"default": "main.agents.my-opus-endpoint"}``.
+    """
+    (tmp_path / "config.yaml").write_text(
+        _yaml.safe_dump(
+            {
+                "providers": {
+                    "databricks": {"kind": "databricks", "profile": "oss", "models": models}
+                }
+            }
+        )
+    )
+
+
+def test_provider_models_default_beats_ucode_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    The provider entry's ``models.default`` outranks the ucode-cached model.
+
+    The user picked an explicit endpoint on the ``kind: databricks``
+    provider in ``~/.omnigent/config.yaml``; the ucode state cache must
+    not shadow it (config > ucode > hardcoded default).
+    """
+    _ucode_state_without_model(monkeypatch, model="databricks-claude-sonnet-4-6")
+    _write_databricks_models_config(tmp_path, models={"default": "main.agents.my-opus-endpoint"})
+
+    spec = _make_spec(model=None, profile="oss")
+    env = _build_claude_sdk_spawn_env(spec, workdir=None)
+
+    assert env["HARNESS_CLAUDE_SDK_MODEL"] == "main.agents.my-opus-endpoint"
+
+
+def test_provider_models_without_default_keeps_ucode_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    A ``models:`` map with no ``default`` tier leaves the ucode model alone.
+
+    Only the ``default`` tier feeds the single claude-sdk model env var;
+    a per-tier-only map (e.g. just ``opus:``) must not clobber the
+    ucode-resolved launch model.
+    """
+    _ucode_state_without_model(monkeypatch, model="databricks-claude-sonnet-4-6")
+    _write_databricks_models_config(tmp_path, models={"opus": "main.agents.my-opus-endpoint"})
+
+    spec = _make_spec(model=None, profile="oss")
+    env = _build_claude_sdk_spawn_env(spec, workdir=None)
+
+    assert env["HARNESS_CLAUDE_SDK_MODEL"] == "databricks-claude-sonnet-4-6"
+
+
+def test_spec_model_beats_provider_models_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    A spec-pinned model still wins over the provider ``models:`` override.
+
+    Failure means the config-level override clobbers an explicit
+    ``executor.model`` from the agent YAML — spec must stay strongest.
+    """
+    _ucode_state_without_model(monkeypatch, model=None)
+    _write_databricks_models_config(tmp_path, models={"default": "main.agents.my-opus-endpoint"})
+
+    spec = _make_spec(model="databricks-claude-opus-4-8", profile="oss")
+    env = _build_claude_sdk_spawn_env(spec, workdir=None)
+
+    assert env["HARNESS_CLAUDE_SDK_MODEL"] == "databricks-claude-opus-4-8"
+
+
+def test_provider_models_apply_without_ucode_state(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    The override lands even when the profile has no ucode state at all.
+
+    On the profile-derived gateway path (no ``~/.ucode/state.json`` entry)
+    ``configure_agent_harness_with_ucode`` early-returns before its ucode
+    lookups — the provider override must be applied before those checks or
+    a configured endpoint would silently fall back to the executor's
+    hardcoded Databricks default.
+    """
+    monkeypatch.setattr(
+        "omnigent.runtime.workflow.get_workspace_url_for_profile",
+        lambda profile: None,
+    )
+    _write_databricks_models_config(tmp_path, models={"default": "main.agents.my-opus-endpoint"})
+
+    spec = _make_spec(model=None, profile="oss")
+    env = _build_claude_sdk_spawn_env(spec, workdir=None)
+
+    assert env["HARNESS_CLAUDE_SDK_GATEWAY"] == "true"
+    assert env["HARNESS_CLAUDE_SDK_MODEL"] == "main.agents.my-opus-endpoint"
+
+
+def test_provider_models_1m_suffix_kept_for_claude_sdk(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The ``[1m]`` suffix passes through to the claude-sdk spawn env.
+
+    The claude-sdk harness drives the claude CLI, which understands the
+    suffix (1M-context accounting) and strips it before the API call — so
+    unlike pi, the producer must NOT strip it here.
+    """
+    _ucode_state_without_model(monkeypatch, model=None)
+    _write_databricks_models_config(
+        tmp_path, models={"default": "main.agents.my-opus-endpoint[1m]"}
+    )
+
+    spec = _make_spec(model=None, profile="oss")
+    env = _build_claude_sdk_spawn_env(spec, workdir=None)
+
+    assert env["HARNESS_CLAUDE_SDK_MODEL"] == "main.agents.my-opus-endpoint[1m]"

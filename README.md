@@ -338,6 +338,37 @@ the OpenAI-compatible `…/api/v1`.
 
 </details>
 
+<details>
+<summary>Databricks model endpoints (pin serving endpoints or UC model services)</summary>
+
+A **Databricks** credential resolves its models from the workspace (via
+ucode state) by default. To pin specific endpoints, give the provider entry
+an optional `models:` map in `~/.omnigent/config.yaml`:
+
+```yaml
+providers:
+  databricks:
+    kind: databricks
+    profile: my-workspace
+    models:                                   # optional — omit to keep the workspace defaults
+      default: main.agents.my-opus-endpoint   # session launch model (Claude Code, claude-sdk, pi)
+      opus: main.agents.my-opus-endpoint      # Claude Code's Opus alias
+      sonnet: main.agents.my-sonnet-endpoint  # Claude Code's Sonnet alias
+      haiku: databricks-claude-haiku-4-5      # Claude Code's fast/background alias
+```
+
+Values are model serving endpoint names or Unity Catalog model service FQNs
+(`catalog.schema.name`) that answer the gateway's Anthropic surface — Claude
+models only. Each tier resolves as: this map → the workspace's ucode state →
+the built-in default, so unset tiers keep the workspace behavior and removing
+the map restores it entirely. Claude Code's `[1m]` long-context suffix passes
+through verbatim (e.g. `main.agents.my-opus-endpoint[1m]`), so a pinned
+endpoint can run with the 1M-token context window where the workspace's
+gateway supports it — except for the `pi` harness, which speaks the API
+directly and gets the suffix stripped at spawn.
+
+</details>
+
 ### 4. Deploy a server (and use it from your phone📱)
 
 Run Omnigent on a server with a stable URL

@@ -932,6 +932,79 @@ def test_databricks_kind_default_routes_through_profile(
     assert "HARNESS_CLAUDE_SDK_GATEWAY_BASE_URL" not in env
 
 
+def test_databricks_kind_default_applies_models_map(
+    config_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A databricks-kind default provider's ``models:`` map reaches claude-sdk.
+
+    The provider-selected route (not just the legacy-profile route) must
+    honor the per-tier overrides: with no ucode state at all, the entry's
+    ``models.default`` still lands in ``HARNESS_CLAUDE_SDK_MODEL`` instead
+    of leaving the executor to its hardcoded Databricks default.
+    """
+    _write_config(
+        config_home,
+        {
+            "providers": {
+                "dbx": {
+                    "kind": "databricks",
+                    "default": True,
+                    "profile": "my-dbx-profile",
+                    "models": {"default": "main.agents.claude-endpoint"},
+                }
+            }
+        },
+    )
+    # No ucode state for the profile — the override alone supplies the model.
+    monkeypatch.setattr(
+        "omnigent.runtime.workflow.get_workspace_url_for_profile",
+        lambda profile: None,
+    )
+    spec = _make_spec(harness="claude-sdk")
+
+    env = _build_claude_sdk_spawn_env(spec, workdir=None)
+
+    assert env["HARNESS_CLAUDE_SDK_DATABRICKS_PROFILE"] == "my-dbx-profile"
+    assert env["HARNESS_CLAUDE_SDK_MODEL"] == "main.agents.claude-endpoint"
+
+
+def test_databricks_models_map_does_not_touch_codex(
+    config_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The databricks ``models:`` map never feeds a codex-family harness.
+
+    The map is Claude-tier-shaped (``opus`` / ``sonnet`` / ``default``
+    endpoints), so injecting it into ``HARNESS_CODEX_MODEL`` would point
+    codex at an Anthropic-surface endpoint. The override is scoped to the
+    Claude-gateway harnesses; codex must resolve its model as before.
+    """
+    _write_config(
+        config_home,
+        {
+            "providers": {
+                "dbx": {
+                    "kind": "databricks",
+                    "default": True,
+                    "profile": "my-dbx-profile",
+                    "models": {"default": "main.agents.claude-endpoint"},
+                }
+            }
+        },
+    )
+    monkeypatch.setattr(
+        "omnigent.runtime.workflow.get_workspace_url_for_profile",
+        lambda profile: None,
+    )
+    spec = _make_spec(harness="codex")
+
+    env = _build_codex_spawn_env(spec, workdir=None)
+
+    assert env["HARNESS_CODEX_DATABRICKS_PROFILE"] == "my-dbx-profile"
+    assert "HARNESS_CODEX_MODEL" not in env
+
+
 # ── Backwards-compat: no provider configured ───────────────────────────────
 
 
