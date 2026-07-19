@@ -20,3 +20,25 @@ export function relativeTime(timestampMs: number, nowMs: number = Date.now()): s
 export function absoluteTime(timestampMs: number): string {
   return new Date(timestampMs).toLocaleString();
 }
+
+/** Compact absolute time for UI metadata: "Jul 18, 2026 · 11:02 AM". */
+export function compactAbsoluteTime(
+  timestampMs: number,
+  locale?: string,
+  timeZone?: string,
+): string {
+  const date = new Date(timestampMs);
+  const zone = timeZone ? { timeZone } : {};
+  const datePart = date.toLocaleDateString(locale, {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+    ...zone,
+  });
+  const timePart = date.toLocaleTimeString(locale, {
+    hour: "numeric",
+    minute: "2-digit",
+    ...zone,
+  });
+  return `${datePart} · ${timePart}`;
+}

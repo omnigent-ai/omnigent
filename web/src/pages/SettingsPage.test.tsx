@@ -254,6 +254,20 @@ describe("SettingsPage", () => {
     expect(mocks.setTheme).toHaveBeenCalledWith("dark");
   });
 
+  it("persists the sidebar timestamp visibility preference", () => {
+    renderPage("/settings/appearance");
+    const toggle = screen.getByTestId("sidebar-timestamps-toggle");
+
+    expect(toggle).toHaveAttribute("data-state", "checked");
+    fireEvent.click(toggle);
+    expect(localStorage.getItem("omnigent:show-sidebar-timestamps")).toBe("false");
+    expect(toggle).toHaveAttribute("data-state", "unchecked");
+
+    fireEvent.click(toggle);
+    expect(localStorage.getItem("omnigent:show-sidebar-timestamps")).toBeNull();
+    expect(toggle).toHaveAttribute("data-state", "checked");
+  });
+
   it("renders the Terminal theme radiogroup with auto selected by default", () => {
     renderPage("/settings/appearance");
     expect(screen.getByRole("radiogroup", { name: "Terminal theme" })).toBeInTheDocument();

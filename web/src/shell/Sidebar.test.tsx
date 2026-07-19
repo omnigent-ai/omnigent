@@ -6,11 +6,12 @@
 // are no longer listed here — they live on the Settings page.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
+import { writeShowSidebarTimestamps } from "@/lib/sidebarTimestampPreferences";
 
 // Project mocks are declared via vi.hoisted so they exist before the hoisted
 // vi.mock factory runs. projectsMock is mutated per-test to drive project
@@ -353,6 +354,18 @@ describe("Sidebar session list", () => {
     // it everywhere would be an over-broad fix.
     const idleRow = screen.getByRole("link", { name: /conv_idle/ }).closest("li")!;
     expect(within(idleRow).getByText("now")).toBeInTheDocument();
+
+    act(() => writeShowSidebarTimestamps(false));
+
+    expect(within(idleRow).queryByText("now")).toBeNull();
+    expect(within(workingRow).getByTestId("session-state-badge")).toHaveAttribute(
+      "data-state",
+      "running",
+    );
+    expect(within(awaitingRow).getByTestId("session-state-badge")).toHaveAttribute(
+      "data-state",
+      "awaiting",
+    );
   });
 });
 

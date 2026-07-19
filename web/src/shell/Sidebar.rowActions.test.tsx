@@ -83,6 +83,7 @@ vi.mock("@/lib/serverOrigin", () => ({ isCurrentServerLocal: () => false }));
 
 import { type Conversation, useConversations } from "@/hooks/useConversations";
 import { __resetReadStateForTests, seedReadState } from "@/hooks/useUnseenConversations";
+import { compactAbsoluteTime } from "@/lib/relativeTime";
 import { Sidebar } from "./Sidebar";
 
 const useConvMock = vi.mocked(useConversations);
@@ -558,11 +559,26 @@ describe("right-click context menu", () => {
     expect(screen.getByTestId("move-to-project")).toBeInTheDocument();
     expect(screen.getByTestId("archive-conversation")).toBeInTheDocument();
     expect(screen.getByTestId("delete-conversation")).toBeInTheDocument();
+    expect(screen.getByTestId("conversation-updated-at")).toHaveTextContent(
+      `Last updated ${compactAbsoluteTime(CONV.updated_at * 1000)}`,
+    );
 
     // Selecting Rename runs the same path as the kebab / double-click: the
     // inline rename input appears.
     fireEvent.click(screen.getByTestId("rename-conversation"));
     expect(screen.getByTestId("rename-conversation-input")).toBeInTheDocument();
+  });
+
+  it("keeps the absolute update time available when relative timestamps are hidden", () => {
+    localStorage.setItem("omnigent:show-sidebar-timestamps", "false");
+    renderSidebar();
+
+    const updatedAt = new Date(CONV.updated_at * 1000).toLocaleString();
+    expect(screen.queryByTitle(updatedAt)).toBeNull();
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+    expect(screen.getByTestId("conversation-updated-at")).toHaveTextContent(
+      `Last updated ${compactAbsoluteTime(CONV.updated_at * 1000)}`,
+    );
   });
 });
 

@@ -704,6 +704,9 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByText("What should we build?")).toBeTruthy();
     expect(screen.getByTestId("new-chat-landing-input")).toBeTruthy();
     expect(screen.getByPlaceholderText("Ask anything...")).toBeTruthy();
+    const otto = screen.getByTestId("new-chat-landing-otto");
+    expect(otto.querySelector(".otto-landing-mascot")).toBeTruthy();
+    expect(otto.querySelectorAll(".otto-landing-orbit")).toHaveLength(2);
   });
 
   it("preserves the typed message and attachments when the landing screen unmounts and remounts", () => {

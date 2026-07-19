@@ -21,6 +21,7 @@ import {
   ChevronLeftIcon,
   ChevronRightIcon,
   CircleStopIcon,
+  Clock3Icon,
   FolderIcon,
   FolderInputIcon,
   FolderMinusIcon,
@@ -75,6 +76,7 @@ import {
   ContextMenu,
   ContextMenuContent,
   ContextMenuItem,
+  ContextMenuLabel,
   ContextMenuSeparator,
   ContextMenuSub,
   ContextMenuSubContent,
@@ -86,6 +88,7 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuLabel,
   DropdownMenuSeparator,
   DropdownMenuSub,
   DropdownMenuSubContent,
@@ -135,7 +138,8 @@ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { useSessionSwitchHotkey } from "@/hooks/useSessionSwitchHotkey";
 import { usePinnedSessionHotkeys } from "@/hooks/usePinnedSessionHotkeys";
-import { absoluteTime, relativeTime } from "@/lib/relativeTime";
+import { useShowSidebarTimestamps } from "@/hooks/useSidebarTimestampPreference";
+import { absoluteTime, compactAbsoluteTime, relativeTime } from "@/lib/relativeTime";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import { SettingsSidebarBody, useSettingsRoute, useTrackSettingsReturn } from "./settingsNav";
 import {
@@ -1984,6 +1988,11 @@ type MenuItemProps = {
 
 type MenuComponents = {
   Item: ComponentType<MenuItemProps>;
+  Label: ComponentType<{
+    children?: ReactNode;
+    className?: string;
+    "data-testid"?: string;
+  }>;
   Separator: ComponentType<{ className?: string }>;
   Sub: ComponentType<{ children?: ReactNode }>;
   SubTrigger: ComponentType<{
@@ -1998,6 +2007,7 @@ type MenuComponents = {
 // divergence surfaces here rather than at the call site.
 const dropdownBundle: MenuComponents = {
   Item: DropdownMenuItem,
+  Label: DropdownMenuLabel,
   Separator: DropdownMenuSeparator,
   Sub: DropdownMenuSub,
   SubTrigger: DropdownMenuSubTrigger,
@@ -2006,6 +2016,7 @@ const dropdownBundle: MenuComponents = {
 
 const contextBundle: MenuComponents = {
   Item: ContextMenuItem,
+  Label: ContextMenuLabel,
   Separator: ContextMenuSeparator,
   Sub: ContextMenuSub,
   SubTrigger: ContextMenuSubTrigger,
@@ -2149,6 +2160,14 @@ function ConversationMenuItems({
 
   return (
     <>
+      <C.Label
+        data-testid="conversation-updated-at"
+        className="flex items-center gap-1.5 whitespace-nowrap font-normal"
+      >
+        <Clock3Icon className="size-3.5" />
+        Last updated {compactAbsoluteTime(conversation.updated_at * 1000)}
+      </C.Label>
+      <C.Separator />
       {/* Pin/Unpin — mobile-only (md:hidden); desktop uses the
           hover-revealed quick-pin button. Archived rows omit it (archive
           outranks pin). */}
@@ -2375,6 +2394,7 @@ function ConversationRow({
   onToggleSelected: (conversationId: string, shiftKey?: boolean) => void;
   onProjectAssigned?: (projectName: string) => void;
 }) {
+  const showSidebarTimestamps = useShowSidebarTimestamps();
   // `useParams` reads from the active matched route. On `/`, the param is
   // undefined; on `/c/:conversationId`, it carries the active id.
   const { conversationId: activeId } = useParams<{ conversationId: string }>();
@@ -2813,7 +2833,7 @@ function ConversationRow({
         <span className={TIME_MARKER_SLOT_CLASS}>
           <SessionStateBadge state={sessionState} />
         </span>
-      ) : (
+      ) : showSidebarTimestamps ? (
         <span
           className={cn(
             TIME_MARKER_SLOT_CLASS,
@@ -2824,7 +2844,7 @@ function ConversationRow({
         >
           {relativeTime(conversation.updated_at * 1000)}
         </span>
-      )}
+      ) : null}
       {/* Archived rows omit the pin entirely: pinning is meaningless there
           (archive outranks pin), so there's no pin action even on hover. Also
           hidden while selecting (bulk mode owns the row controls). */}

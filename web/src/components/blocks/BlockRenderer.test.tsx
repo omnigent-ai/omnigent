@@ -561,6 +561,7 @@ describe("BlockRenderer inline file-path linkification", () => {
     });
 
     const link = await screen.findByRole("button", { name: "src/app/main.ts" });
+    expect(link).toHaveAttribute("data-streamdown", "inline-code");
     link.click();
     expect(openFile).toHaveBeenCalledWith("src/app/main.ts");
     // No existence check needed when the path is already a known change.

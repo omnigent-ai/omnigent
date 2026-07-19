@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { relativeTime } from "./relativeTime";
+import { compactAbsoluteTime, relativeTime } from "./relativeTime";
 
 const NOW = new Date("2026-05-28T12:00:00Z").getTime();
 const MIN = 60_000;
@@ -63,5 +63,13 @@ describe("relativeTime", () => {
     expect(relativeTime(NOW - DAY, NOW)).toBe("1d");
     expect(relativeTime(NOW - (WEEK - 1), NOW)).toBe("6d");
     expect(relativeTime(NOW - WEEK, NOW)).toBe("1w");
+  });
+});
+
+describe("compactAbsoluteTime", () => {
+  it("uses a concise date and time without seconds", () => {
+    expect(compactAbsoluteTime(Date.UTC(2026, 6, 18, 11, 2, 17), "en-US", "UTC")).toBe(
+      "Jul 18, 2026 · 11:02 AM",
+    );
   });
 });

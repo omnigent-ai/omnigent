@@ -133,6 +133,8 @@ import {
   readHideUnconfiguredHarnesses,
   writeHideUnconfiguredHarnesses,
 } from "@/lib/harnessVisibilityPreferences";
+import { useShowSidebarTimestamps } from "@/hooks/useSidebarTimestampPreference";
+import { writeShowSidebarTimestamps } from "@/lib/sidebarTimestampPreferences";
 import {
   applyThemePalette,
   isThemeSelection,
@@ -801,6 +803,33 @@ function HideUnconfiguredHarnessesControl() {
   );
 }
 
+/** Toggle relative last-updated times for idle sessions in the sidebar. */
+function SidebarTimestampControl() {
+  const value = useShowSidebarTimestamps();
+  const labelId = useId();
+
+  return (
+    <div className="flex items-start justify-between gap-6">
+      <div className="flex flex-col">
+        <span id={labelId} className="text-sm font-medium">
+          Show session timestamps
+        </span>
+        <span className="text-sm text-muted-foreground">
+          Show relative last-updated times for idle sessions in the sidebar.
+        </span>
+      </div>
+      <Switch
+        aria-labelledby={labelId}
+        checked={value}
+        onCheckedChange={writeShowSidebarTimestamps}
+        data-testid="sidebar-timestamps-toggle"
+        className="mt-0.5 shrink-0 data-checked:!bg-[var(--brand-accent)]"
+        thumbClassName="data-checked:ring-1 data-checked:ring-black/55"
+      />
+    </div>
+  );
+}
+
 function AppearanceSection() {
   // Embedded: the host owns light/dark, so the Mode and Color theme pickers
   // would be no-ops — hide them and say so (matching ThemeModeMenu). Terminal
@@ -827,6 +856,8 @@ function AppearanceSection() {
         {!isEmbedded && <ColorThemeControl />}
 
         <WorkspacePanelDefaultControl />
+
+        <SidebarTimestampControl />
 
         <HideUnconfiguredHarnessesControl />
 

@@ -4773,9 +4773,9 @@ export function Composer({
                         : isStreaming
                           ? "Send a follow-up (queued) — Esc to stop"
                           : sandboxAsleepHint
-                            ? "Current session's host is offline. Next message will resume the sandbox host which can take minutes"
+                            ? "Send to wake the sandbox"
                             : reconnectHint
-                              ? "Send a message to reconnect this session"
+                              ? "Send a message to reconnect"
                               : "Ask the agent anything…"
             }
             rows={1}

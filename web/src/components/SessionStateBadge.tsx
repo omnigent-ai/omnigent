@@ -54,7 +54,7 @@ function describe(state: SessionState): Visual {
 }
 
 function Dot({ tone }: { tone: string }) {
-  return <span aria-hidden className={cn("size-2 shrink-0 rounded-full", tone)} />;
+  return <span aria-hidden className={cn("size-1.5 shrink-0 rounded-full", tone)} />;
 }
 
 export function SessionStateBadge({ state }: SessionStateBadgeProps) {

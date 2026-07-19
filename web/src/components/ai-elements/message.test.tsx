@@ -1,6 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { MessageResponse } from "./message";
+import { Message, MessageContent, MessageResponse } from "./message";
 
 const clipboardDescriptor = Object.getOwnPropertyDescriptor(Navigator.prototype, "clipboard");
 const execCommandDescriptor = Object.getOwnPropertyDescriptor(Document.prototype, "execCommand");
@@ -19,6 +19,23 @@ afterEach(() => {
   } else {
     delete (Document.prototype as { execCommand?: unknown }).execCommand;
   }
+});
+
+describe("MessageContent", () => {
+  it("uses readable theme-specific assistant typography", () => {
+    render(
+      <Message from="assistant">
+        <MessageContent>Theme-aware response</MessageContent>
+      </Message>,
+    );
+
+    const response = screen.getByText("Theme-aware response");
+    expect(response).toHaveClass(
+      "group-[.is-assistant]:text-[14px]",
+      "group-[.is-assistant]:leading-5",
+      "group-[.is-assistant]:text-assistant-foreground",
+    );
+  });
 });
 
 describe("MessageResponse", () => {

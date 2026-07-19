@@ -3005,7 +3005,7 @@ export function NewChatLandingScreen() {
     // desktop offset stays comfortable on both laptop and tall displays.
     <div
       ref={setLandingSurface}
-      className="flex flex-1 items-start justify-center pt-[88px] md:pt-[clamp(104px,calc(18vh_+_8px),184px)]"
+      className="flex flex-1 items-start justify-center pt-[104px] md:pt-[clamp(128px,22vh,216px)]"
       data-testid="new-chat-landing"
     >
       {/* Keep enough outer room for the greeting, while the composer itself
@@ -3013,13 +3013,17 @@ export function NewChatLandingScreen() {
           the workspace pane open. px-4 on phones preserves 16px gutters. */}
       <div className="flex w-full max-w-[860px] flex-col items-center gap-6 px-4 pb-16 md:select-none md:px-10">
         <div className="flex flex-col items-center gap-0">
-          <div className="relative h-20 w-[98px] shrink-0" aria-hidden="true">
+          <div
+            className="relative h-[88px] w-[108px] shrink-0"
+            aria-hidden="true"
+            data-testid="new-chat-landing-otto"
+          >
             <div className="absolute -inset-3 rounded-full bg-[radial-gradient(circle,rgba(245,59,157,0.21),rgba(245,59,157,0.052)_44%,rgba(77,197,160,0.028)_58%,transparent_73%)] blur-[3px]" />
-            <span className="absolute top-6 left-[7px] h-[31px] w-[84px] -rotate-[19deg] rounded-[50%] border border-[#F53B9D]/40 shadow-[inset_0_0_16px_rgba(245,59,157,0.055)]" />
-            <span className="absolute top-7 left-3.5 h-6 w-[70px] rotate-[20deg] rounded-[50%] border border-[#4DC5A0]/30" />
-            <span className="absolute top-[22px] right-[11px] size-1 rounded-full bg-[#F53B9D] shadow-[0_0_9px_#F53B9D]" />
-            <span className="absolute bottom-[19px] left-3.5 size-1 rounded-full bg-[#4DC5A0] shadow-[0_0_9px_#4DC5A0]" />
-            <OttoEyes className="absolute top-[18px] left-[27px] h-11 w-auto -rotate-[5deg] drop-shadow-[0_16px_25px_rgba(245,59,157,0.21)]" />
+            <span className="otto-landing-orbit otto-landing-orbit--pink absolute top-[26px] left-2 h-[34px] w-[92px] rounded-[50%] border border-[#F53B9D]/40 shadow-[inset_0_0_16px_rgba(245,59,157,0.055)]" />
+            <span className="otto-landing-orbit otto-landing-orbit--green absolute top-[31px] left-4 h-[26px] w-[77px] rounded-[50%] border border-[#4DC5A0]/30" />
+            <span className="otto-landing-satellite otto-landing-satellite--pink absolute top-6 right-3 size-1 rounded-full bg-[#F53B9D] shadow-[0_0_9px_#F53B9D]" />
+            <span className="otto-landing-satellite otto-landing-satellite--green absolute bottom-[21px] left-4 size-1 rounded-full bg-[#4DC5A0] shadow-[0_0_9px_#4DC5A0]" />
+            <OttoEyes className="otto-landing-mascot absolute top-5 left-[30px] h-12 w-auto drop-shadow-[0_16px_25px_rgba(245,59,157,0.21)]" />
           </div>
           <h1 className="text-center text-[28px] leading-8 font-normal tracking-[-0.03em] text-foreground">
             What should we build?
