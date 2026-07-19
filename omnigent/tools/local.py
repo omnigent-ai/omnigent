@@ -475,7 +475,7 @@ class LocalPythonTool(Tool):
             (
                 "import sys,json,importlib.util,asyncio,os;"
                 "os.environ['_AP_RESPONSE_MODE']='stdout';"
-                f"exec(open('{_RUNNER_PATH}').read())"
+                f"exec(open('{_RUNNER_PATH}', encoding='utf-8').read())"
             ),
         ]
 
@@ -533,7 +533,7 @@ def _write_srt_settings_file(state_root: str) -> str:
         },
     }
     fd, path = _tempfile.mkstemp(suffix=".srt.json")
-    with os.fdopen(fd, "w") as f:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(settings, f)
     return path
 

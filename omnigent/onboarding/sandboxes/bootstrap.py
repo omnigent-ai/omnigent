@@ -621,12 +621,13 @@ def set_sandbox_host_name(launcher: SandboxLauncher, sandbox_id: str, host_name:
         "import os, uuid, yaml; "
         "p=os.path.expanduser('~/.omnigent/config.yaml'); "
         "os.makedirs(os.path.dirname(p), exist_ok=True); "
-        "cfg=yaml.safe_load(open(p)) if os.path.exists(p) else {}; "
+        "cfg=yaml.safe_load(open(p, encoding='utf-8')) if os.path.exists(p) else {}; "
         "cfg=cfg or {}; "
         f"h=cfg.get('host') or {{}}; h['name']='{safe_name}'; "
         "h.setdefault('host_id', uuid.uuid4().hex); "
         "cfg['host']=h; "
-        "yaml.safe_dump(cfg, open(p,'w'), default_flow_style=False, sort_keys=True)"
+        "yaml.safe_dump(cfg, open(p, 'w', encoding='utf-8'), "
+        "default_flow_style=False, sort_keys=True)"
     )
     launcher.run(sandbox_id, f'python3 -c "{py}"')
 

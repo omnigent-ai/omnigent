@@ -87,12 +87,12 @@ _CLEAR_API_KEY_HELPER_SCRIPT = """\
 import json, os
 path = os.path.expanduser("~/.claude/settings.json")
 try:
-    with open(path) as handle:
+    with open(path, encoding="utf-8") as handle:
         settings = json.load(handle)
 except (FileNotFoundError, ValueError):
     raise SystemExit(0)
 if isinstance(settings, dict) and settings.pop("apiKeyHelper", None) is not None:
-    with open(path, "w") as handle:
+    with open(path, "w", encoding="utf-8") as handle:
         json.dump(settings, handle, indent=2)
 """
 
