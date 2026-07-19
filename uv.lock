@@ -2430,6 +2430,18 @@ wheels = [
 ]
 
 [[package]]
+name = "microsandbox"
+version = "0.6.6"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/48/65/2ae39dc0696be4c62294a9f75e994ab6e4607cbe17616e8e8a886e5f6e69/microsandbox-0.6.6-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:af13ac4dce2d6e65a5d133a82ded83b8d3d87a12f7509fd4463b6dd066b740a3", upload-time = "2026-07-07T19:50:31.088Z" },
+    { url = "https://files.pythonhosted.org/packages/53/7a/16f408a001ff95413ba24e6e8d97c0fc3612889b148ecda6fad288c667ed/microsandbox-0.6.6-cp310-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:3fea362038b1b5e089784bcfb15a31cc16fc1fb65ccc75b14ed41bc47c03d10c", upload-time = "2026-07-07T19:50:36.278Z" },
+    { url = "https://files.pythonhosted.org/packages/5e/fb/53b10d0009c1fc0ec9ec2e6bf105da82be0e63bb9c67559c918ff8b05d54/microsandbox-0.6.6-cp310-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:6d9e1fd907f63076c1dd98320047c8e174a9b582708b58790cf8b2873d95a6e6", upload-time = "2026-07-07T19:50:41.009Z" },
+    { url = "https://files.pythonhosted.org/packages/30/5f/122938a028194bf83dfa315f58935743af51175609d4e80822da868997d3/microsandbox-0.6.6-cp310-abi3-win_amd64.whl", hash = "sha256:8d1a1792b2bc9621e50f5e63bd736767c6ddd42de167ab6cd98dce6d9f6ab7d8", upload-time = "2026-07-07T19:50:45.42Z" },
+    { url = "https://files.pythonhosted.org/packages/ac/08/b9e1324f46d2b2c90388d977fef91179f6a432b808ff90d29338474b07bf/microsandbox-0.6.6-cp310-abi3-win_arm64.whl", hash = "sha256:f38aa447b70ed19d3570e27a58a40f9037bc1e6891747b485359dc9f4e536d12", upload-time = "2026-07-07T19:50:50.523Z" },
+]
+
+[[package]]
 name = "mlflow"
 version = "3.13.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2975,6 +2987,9 @@ islo = [
 kubernetes = [
     { name = "kubernetes" },
 ]
+microsandbox = [
+    { name = "microsandbox" },
+]
 modal = [
     { name = "modal" },
 ]
@@ -3029,6 +3044,7 @@ requires-dist = [
     { name = "keyring", specifier = ">=24,<26" },
     { name = "kubernetes", marker = "extra == 'kubernetes'", specifier = ">=36,<37" },
     { name = "mcp", specifier = ">=1.0,<2" },
+    { name = "microsandbox", marker = "extra == 'microsandbox'", specifier = ">=0.6.6,<0.7" },
     { name = "modal", marker = "extra == 'modal'", specifier = ">=1.0,<2" },
     { name = "moto", extras = ["s3"], marker = "extra == 'dev'", specifier = ">=5,<6" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.10" },
@@ -3082,7 +3098,7 @@ requires-dist = [
     { name = "websockets", specifier = ">=10.4,<15" },
     { name = "zstandard", specifier = ">=0.22,<1" },
 ]
-provides-extras = ["claude-sdk", "openai-agents", "all", "bedrock", "s3", "vertex", "modal", "daytona", "boxlite", "cwsandbox", "e2b", "islo", "openshell", "kubernetes", "tracing", "agents-sdk", "antigravity", "copilot", "cursor", "hindsight", "slack", "databricks", "dev"]
+provides-extras = ["claude-sdk", "openai-agents", "all", "bedrock", "s3", "vertex", "modal", "daytona", "boxlite", "microsandbox", "cwsandbox", "e2b", "islo", "openshell", "kubernetes", "tracing", "agents-sdk", "antigravity", "copilot", "cursor", "hindsight", "slack", "databricks", "dev"]
 
 [[package]]
 name = "omnigent-client"

@@ -32,7 +32,8 @@ stores into ``create_app``):
    ``<data_dir>/config.yaml``)::
 
        sandbox:
-         provider: modal          # lakebox|modal|daytona|boxlite|cwsandbox|islo|e2b|openshell
+         provider: modal          # lakebox|modal|daytona|boxlite|cwsandbox|islo|
+                                  # e2b|openshell|kubernetes|microsandbox
          server_url: https://omnigent.example.com
          modal:                   # optional block
            image: docker.io/me/omnigent-host:latest  # default: official image
@@ -66,6 +67,14 @@ stores into ``create_app``):
            env: [OPENAI_API_KEY, GIT_TOKEN]  # SERVER env var NAMES injected
                                              # as sandbox env
            cluster: my-gateway              # optional OpenShell gateway name
+         microsandbox:            # optional block (provider: microsandbox)
+           image: docker.io/me/omnigent-host:latest  # default: official image
+           env: [OPENAI_API_KEY, GIT_TOKEN]  # SERVER env var NAMES injected
+                                             # as sandbox env
+           cpus: 2                           # default 2
+           memory_mib: 4096                  # default 4096
+           idle_timeout_s: 86400             # default 24h; 0 disables draining
+           network: host                     # host (default)|public-only|all
 
    The image defaults to the official prebaked host image
    (``ghcr.io/omnigent-ai/omnigent-host:latest``; see
@@ -81,9 +90,11 @@ stores into ``create_app``):
    it connects to the gateway made active with ``openshell gateway
    select`` (``$OPENSHELL_GATEWAY`` / ``~/.config/openshell/active_gateway``,
    or ``sandbox.openshell.cluster``), so the server process needs
-   OpenShell gateway access. ``modal``, ``daytona``, ``cwsandbox``,
-   ``islo``, and ``openshell`` have managed-launch support; ``lakebox``
-   parses but rejects at launch.
+   OpenShell gateway access. The microsandbox launcher needs no
+   credentials at all: VMs run embedded on the server host itself
+   (Apple Silicon macOS / KVM Linux). Every provider except
+   ``lakebox`` has managed-launch support; ``lakebox`` parses but
+   rejects at launch.
 
 2. **Direct construction** (embedding deployments): build
    :class:`ManagedSandboxConfig` with a custom
@@ -141,10 +152,21 @@ SUPPORTED_SANDBOX_PROVIDERS: frozenset[str] = frozenset(
         "e2b",
         "openshell",
         "kubernetes",
+        "microsandbox",
     }
 )
 PROVIDERS_WITH_MANAGED_LAUNCH: frozenset[str] = frozenset(
-    {"modal", "daytona", "boxlite", "cwsandbox", "islo", "e2b", "openshell", "kubernetes"}
+    {
+        "modal",
+        "daytona",
+        "boxlite",
+        "cwsandbox",
+        "islo",
+        "e2b",
+        "openshell",
+        "kubernetes",
+        "microsandbox",
+    }
 )
 
 # How long a managed launch waits for the sandboxed host to register
@@ -178,6 +200,14 @@ DAYTONA_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
 # re-authenticate its tunnel across reconnects while still expiring tokens of
 # boxes nobody removed. A relaunch mints a fresh token.
 BOXLITE_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
+
+# Launch-token lifetime for the YAML microsandbox path. Microsandbox VMs have
+# no lifetime cap - idle ones drain (releasing compute, keeping their writable
+# layer) and are resumed in place by the wake path - so the bound is policy,
+# not platform: the same 7-day window as Daytona/boxlite keeps a long-lived VM
+# re-authenticating across tunnel reconnects while still expiring tokens of
+# VMs nobody removed. A relaunch mints a fresh token.
+MICROSANDBOX_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
 
 # Launch-token lifetime for the YAML islo path. Islo sandboxes are
 # deleted by managed-session teardown; use the same 7-day policy bound
@@ -645,7 +675,7 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
         token_ttl_s = DAYTONA_MANAGED_TOKEN_TTL_S
     elif provider == "boxlite":
         section = _boxlite_section(raw)
-        _reject_unknown_boxlite_keys(
+        _reject_unknown_provider_keys(
             section, {"image", "env", "local", "cloud"}, "sandbox.boxlite"
         )
         endpoint, home_dir, registry = _parse_boxlite_mode(section)
@@ -710,6 +740,23 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
             resources=_parse_kubernetes_resources(raw),
         )
         token_ttl_s = KUBERNETES_MANAGED_TOKEN_TTL_S
+    elif provider == "microsandbox":
+        microsandbox_section = _parse_provider_section(raw, "microsandbox")
+        if microsandbox_section is not None:
+            _reject_unknown_provider_keys(
+                microsandbox_section,
+                {"image", "cpus", "memory_mib", "env", "idle_timeout_s", "network"},
+                "sandbox.microsandbox",
+            )
+        launcher_factory = _microsandbox_launcher_factory(
+            image=_parse_provider_image(raw, "microsandbox"),
+            env=_parse_provider_env(raw, "microsandbox"),
+            cpus=_parse_provider_positive_int(raw, "microsandbox", "cpus"),
+            memory_mib=_parse_provider_positive_int(raw, "microsandbox", "memory_mib"),
+            idle_timeout_s=_parse_microsandbox_idle_timeout_s(raw),
+            network=_parse_microsandbox_network(raw),
+        )
+        token_ttl_s = MICROSANDBOX_MANAGED_TOKEN_TTL_S
     else:
         launcher_factory = _unsupported_launcher_factory(provider)
         # Never consulted (the factory rejects before any token is
@@ -952,7 +999,9 @@ def _boxlite_section(raw: dict[str, object]) -> dict[str, object]:
     return section
 
 
-def _reject_unknown_boxlite_keys(mapping: dict[str, object], allowed: set[str], path: str) -> None:
+def _reject_unknown_provider_keys(
+    mapping: dict[str, object], allowed: set[str], path: str
+) -> None:
     """
     Fail loud on any key outside *allowed* — catches typos and misplaced keys
     (e.g. ``endpoint`` at the section level instead of under ``cloud:``, or a
@@ -1003,7 +1052,7 @@ def _parse_boxlite_mode(
     if cloud_present:
         if not isinstance(cloud_block, dict):
             raise ValueError("server config 'sandbox.boxlite.cloud' must be a mapping")
-        _reject_unknown_boxlite_keys(cloud_block, {"endpoint"}, "sandbox.boxlite.cloud")
+        _reject_unknown_provider_keys(cloud_block, {"endpoint"}, "sandbox.boxlite.cloud")
         endpoint = cloud_block.get("endpoint")
         if not isinstance(endpoint, str) or not endpoint.strip():
             raise ValueError(
@@ -1016,7 +1065,7 @@ def _parse_boxlite_mode(
         return None, None, None
     if not isinstance(local_block, dict):
         raise ValueError("server config 'sandbox.boxlite.local' must be a mapping")
-    _reject_unknown_boxlite_keys(local_block, {"home_dir", "registry"}, "sandbox.boxlite.local")
+    _reject_unknown_provider_keys(local_block, {"home_dir", "registry"}, "sandbox.boxlite.local")
     return None, _parse_boxlite_home_dir(local_block), _parse_boxlite_registry(local_block)
 
 
@@ -1097,7 +1146,7 @@ def _parse_boxlite_registry(local: dict[str, object]) -> dict[str, object] | Non
         return None
     if not isinstance(registry, dict):
         raise ValueError("server config 'sandbox.boxlite.local.registry' must be a mapping")
-    _reject_unknown_boxlite_keys(
+    _reject_unknown_provider_keys(
         registry,
         {"host", "transport", "skip_verify", "username_env", "password_env", "token_env"},
         "sandbox.boxlite.local.registry",
@@ -1358,6 +1407,96 @@ def _openshell_launcher_factory(
         return OpenShellSandboxLauncher(image=image, env=env, cluster=cluster)
 
     return _build
+
+
+def _microsandbox_launcher_factory(
+    *,
+    image: str | None,
+    env: list[str] | None,
+    cpus: int | None,
+    memory_mib: int | None,
+    idle_timeout_s: int | None,
+    network: str | None,
+) -> Callable[[], SandboxLauncher]:
+    """
+    Build the launcher factory for the YAML ``provider: microsandbox`` path.
+
+    :param image: Registry image reference with omnigent pre-installed, or
+        ``None`` to use the official prebaked host image (env-overridable; see
+        :mod:`omnigent.onboarding.sandboxes.microsandbox`).
+    :param env: Names of server-process environment variables (harness LLM
+        credentials, gateway URLs, ``GIT_TOKEN``) injected into every VM, or
+        ``None`` to resolve from the launcher's env-var fallback / inject
+        nothing.
+    :param cpus: vCPUs per VM, or ``None`` for the launcher default (2).
+    :param memory_mib: Memory per VM in MiB, or ``None`` for the launcher
+        default (4096).
+    :param idle_timeout_s: Idle-drain timeout in seconds (``0`` disables), or
+        ``None`` for the launcher default (24h).
+    :param network: Network mode (``host`` / ``public-only`` / ``all``), or
+        ``None`` for the launcher default (``host``).
+    :returns: A factory producing parameterized microsandbox launchers.
+    """
+
+    def _build() -> SandboxLauncher:
+        """Construct the microsandbox launcher (lazy SDK import inside)."""
+        from omnigent.onboarding.sandboxes.microsandbox import MicrosandboxSandboxLauncher
+
+        return MicrosandboxSandboxLauncher(
+            image=image,
+            env=env,
+            cpus=cpus,
+            memory_mib=memory_mib,
+            idle_timeout_s=idle_timeout_s,
+            network=network,
+        )
+
+    return _build
+
+
+def _parse_microsandbox_idle_timeout_s(raw: dict[str, object]) -> int | None:
+    """
+    Extract the microsandbox idle-drain timeout.
+
+    Omitted keeps the launcher's default (24h). ``0`` disables idle draining
+    entirely - VMs then run until explicitly terminated.
+
+    :param raw: The raw ``sandbox`` mapping.
+    :returns: The timeout in seconds, or ``None`` when omitted.
+    :raises ValueError: When the value is not a non-negative integer.
+    """
+    section = _parse_provider_section(raw, "microsandbox")
+    if section is None:
+        return None
+    value = section.get("idle_timeout_s")
+    if value is None:
+        return None
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError(
+            "server config 'sandbox.microsandbox.idle_timeout_s' must be a "
+            "non-negative integer (0 disables idle draining)"
+        )
+    return value
+
+
+def _parse_microsandbox_network(raw: dict[str, object]) -> str | None:
+    """
+    Extract and validate the microsandbox network mode.
+
+    :param raw: The raw ``sandbox`` mapping.
+    :returns: The validated mode, or ``None`` when omitted (launcher defaults
+        to ``host``).
+    :raises ValueError: When the value is not a recognized mode.
+    """
+    from omnigent.onboarding.sandboxes.microsandbox import NETWORK_MODES
+
+    value = _parse_provider_string(raw, "microsandbox", "network")
+    if value is not None and value not in NETWORK_MODES:
+        raise ValueError(
+            "server config 'sandbox.microsandbox.network' must be one of: "
+            f"{', '.join(NETWORK_MODES)} (got {value!r})"
+        )
+    return value
 
 
 def _parse_provider_section(raw: dict[str, object], provider: str) -> dict[str, object] | None:

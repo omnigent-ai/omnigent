@@ -19,6 +19,7 @@ from omnigent.server.managed_hosts import (
     DAYTONA_MANAGED_TOKEN_TTL_S,
     ISLO_MANAGED_TOKEN_TTL_S,
     KUBERNETES_MANAGED_TOKEN_TTL_S,
+    MICROSANDBOX_MANAGED_TOKEN_TTL_S,
     MODAL_MANAGED_TOKEN_TTL_S,
     OPENSHELL_MANAGED_TOKEN_TTL_S,
     ManagedSandboxConfig,
@@ -44,6 +45,7 @@ from tests.server.helpers import (
     install_fake_e2b_launcher,
     install_fake_islo_launcher,
     install_fake_kubernetes_launcher,
+    install_fake_microsandbox_launcher,
     install_fake_modal_launcher,
     install_fake_openshell_launcher,
 )
@@ -576,6 +578,67 @@ def test_parse_kubernetes_invalid_block_fails_loud(
         )
 
 
+def test_parse_valid_microsandbox_config_builds_parameterized_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The documented microsandbox YAML shape parses into a config whose
+    factory constructs microsandbox launchers carrying image, env names,
+    sizing, idle-drain, and network mode.
+    """
+    cfg = parse_sandbox_config(
+        {
+            "provider": "microsandbox",
+            "server_url": "http://host.microsandbox.internal:8799/",
+            "microsandbox": {
+                "image": "docker.io/me/omnigent-host:latest",
+                "env": ["OPENAI_API_KEY", "GIT_TOKEN"],
+                "cpus": 4,
+                "memory_mib": 8192,
+                "idle_timeout_s": 0,
+                "network": "all",
+            },
+        }
+    )
+    assert cfg is not None
+    assert cfg.server_url == "http://host.microsandbox.internal:8799"
+    assert cfg.token_ttl_s == MICROSANDBOX_MANAGED_TOKEN_TTL_S
+    assert cfg.managed_launch_supported is True
+    assert cfg.provider == "microsandbox"
+    fake = FakeSandboxLauncher()
+    install_fake_microsandbox_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.image == "docker.io/me/omnigent-host:latest"
+    assert fake.env == ["OPENAI_API_KEY", "GIT_TOKEN"]
+    assert fake.cpus == 4
+    assert fake.memory_mib == 8192
+    assert fake.idle_timeout_s == 0
+    assert fake.network == "all"
+
+
+def test_parse_microsandbox_without_section_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    `provider: microsandbox` + `server_url` is a complete config: optional
+    constructor fields reach the launcher as None so its defaults (official
+    image, 2 vCPU / 4 GiB, 24h idle drain, "host" network) apply.
+    """
+    cfg = parse_sandbox_config(
+        {"provider": "microsandbox", "server_url": "http://host.microsandbox.internal:8799"}
+    )
+    assert cfg is not None
+    fake = FakeSandboxLauncher()
+    install_fake_microsandbox_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.image is None
+    assert fake.env is None
+    assert fake.cpus is None
+    assert fake.memory_mib is None
+    assert fake.idle_timeout_s is None
+    assert fake.network is None
+
+
 @pytest.mark.parametrize(
     ("raw", "expected_fragment"),
     [
@@ -756,6 +819,67 @@ def test_parse_kubernetes_invalid_block_fails_loud(
                 "islo": {"idle_pause_after_s": "900"},
             },
             "sandbox.islo.idle_pause_after_s",
+        ),
+        # microsandbox section present but malformed.
+        (
+            {"provider": "microsandbox", "server_url": "https://s", "microsandbox": "x"},
+            "sandbox.microsandbox",
+        ),
+        (
+            {
+                "provider": "microsandbox",
+                "server_url": "https://s",
+                "microsandbox": {"image": "  "},
+            },
+            "sandbox.microsandbox.image",
+        ),
+        (
+            {
+                "provider": "microsandbox",
+                "server_url": "https://s",
+                "microsandbox": {"env": ["", "X"]},
+            },
+            "sandbox.microsandbox.env",
+        ),
+        (
+            {
+                "provider": "microsandbox",
+                "server_url": "https://s",
+                "microsandbox": {"cpus": 0},
+            },
+            "sandbox.microsandbox.cpus",
+        ),
+        (
+            {
+                "provider": "microsandbox",
+                "server_url": "https://s",
+                "microsandbox": {"memory_mib": "large"},
+            },
+            "sandbox.microsandbox.memory_mib",
+        ),
+        (
+            {
+                "provider": "microsandbox",
+                "server_url": "https://s",
+                "microsandbox": {"idle_timeout_s": -1},
+            },
+            "sandbox.microsandbox.idle_timeout_s",
+        ),
+        (
+            {
+                "provider": "microsandbox",
+                "server_url": "https://s",
+                "microsandbox": {"network": "lan"},
+            },
+            "sandbox.microsandbox.network",
+        ),
+        (
+            {
+                "provider": "microsandbox",
+                "server_url": "https://s",
+                "microsandbox": {"memory_gib": 4},
+            },
+            "unknown key",
         ),
         # openshell section present but malformed.
         (
