@@ -140,6 +140,11 @@ _FLAGGED = [
     "self.cfg = ConfigParser()\nself.cfg.read(p)",  # attribute-bound instance
     'import gzip\ngzip.open(p, "rt")',  # gzip text mode needs encoding
     'import bz2\nbz2.open(p, "wt")',  # bz2 text mode needs encoding
+    'from gzip import open as gopen\ngopen(p, "rt")',  # aliased gzip.open, text
+    'import gzip as gz\ngz.open("blob.gz", "rt")',  # aliased module (filename has 'b')
+    'import gzip\ngzip.open(p, "r" + "t")',  # computed mode, not provably binary
+    "import gzip\ngzip.open(p, mode)",  # dynamic mode, not provably binary
+    'from pathlib import Path\ngzip = Path("x")\ngzip.open("rt")',  # rebound name: real text open
     'run("import os; data = open(p).read()")',  # embedded, plain string
     'run(f"exec(open({p!r}).read())")',  # embedded, f-string
     'run("""\n    import os\n    data = open(p).read()\n""")',  # embedded, indented
@@ -159,6 +164,8 @@ _CLEAN = [
     'import gzip\ngzip.open(p, "rb")',  # gzip explicit binary
     'import gzip\ngzip.open(p, "rt", encoding="utf-8")',  # gzip text + encoding
     'import lzma\nlzma.open(p, "wb")',  # lzma binary
+    "import gzip as gz\ngz.open(p)",  # aliased module, default binary
+    'import gzip as gz\ngz.open(p, "rb")',  # aliased module, binary
     "import configparser\ncfg = configparser.ConfigParser()\ncfg.read(p, encoding='locale')",
     "from configparser import ConfigParser as CP\nc = CP()\nc.read(p, encoding='utf-8')",
     "self.cfg = ConfigParser()\nself.cfg.read(p, encoding='utf-8')",  # attr-bound, encoded
@@ -248,3 +255,53 @@ def test_detect_encoding_reads_utf8_config_under_utf8_mode(tmp_path: Path) -> No
         """
     )
     assert result.returncode == 0, result.stderr
+
+
+# ``cli._read_existing_cfg`` is the guard that keeps the Databricks rewrite flow
+# from replacing an original it failed to read. (The full ``_isolated_databricks_
+# cfg`` context manager pulls in a Databricks-internal module not shipped here, so
+# the guard itself is tested directly.)
+def test_read_existing_cfg_missing_is_noop(tmp_path: Path) -> None:
+    """A missing original is the new-config case: no read, no error."""
+    import configparser
+
+    from omnigent.cli import _read_existing_cfg
+
+    cfg = configparser.ConfigParser()
+    _read_existing_cfg(cfg, tmp_path / "absent.cfg", "utf-8")
+    assert cfg.sections() == []
+
+
+def test_read_existing_cfg_loads_present_file(tmp_path: Path) -> None:
+    """An existing, readable original is loaded (so it can be preserved)."""
+    import configparser
+
+    from omnigent.cli import _read_existing_cfg
+
+    original = tmp_path / ".databrickscfg"
+    original.write_text("[legacy]\nhost = https://keep.example\n", encoding="utf-8")
+    cfg = configparser.ConfigParser()
+    _read_existing_cfg(cfg, original, "utf-8")
+    assert cfg["legacy"]["host"] == "https://keep.example"
+
+
+def test_read_existing_cfg_unreadable_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An existing file that ``ConfigParser.read`` silently skips (a permission
+    or transient I/O error) must raise, so the rewrite flow aborts instead of
+    seeding an empty config and overwriting the original — which would drop the
+    user's ``[legacy]`` section. Nothing is captured, so a caller cannot proceed.
+    """
+    import configparser
+
+    from omnigent.cli import _read_existing_cfg
+
+    original = tmp_path / ".databrickscfg"
+    original.write_text("[legacy]\nhost = https://keep.example\n", encoding="utf-8")
+    monkeypatch.setattr(configparser.ConfigParser, "read", lambda self, *a, **k: [])
+
+    cfg = configparser.ConfigParser()
+    with pytest.raises(OSError):
+        _read_existing_cfg(cfg, original, "utf-8")
+    assert cfg.sections() == []

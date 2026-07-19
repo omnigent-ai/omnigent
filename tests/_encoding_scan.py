@@ -40,9 +40,12 @@ _NON_FILE_OPEN_RECEIVERS = {
     "socket",
     "subprocess",
 }
-# ``X.open(...)`` here is text-capable but *binary by default*: a bare call or a
-# binary mode is fine, but an explicit text mode ('t') must name an encoding.
-_BINARY_DEFAULT_OPENERS = {"gzip", "bz2", "lzma"}
+# ``<module>.open(...)`` here is text-capable but *binary by default*: a bare
+# call or a binary mode is fine, but any other mode (text, or one not statically
+# provable as binary) must name an encoding. Matched by *import binding*, not by
+# literal receiver name, so an alias (``import gzip as gz``) is caught and an
+# unrelated ``gzip = Path(...)`` is not misread as the module.
+_COMPRESSED_MODULES = {"gzip", "bz2", "lzma"}
 _CONFIGPARSER_CTORS = {"ConfigParser", "RawConfigParser", "SafeConfigParser"}
 
 # Only str literals containing one of these are candidate embedded scripts —
@@ -77,19 +80,33 @@ def _mode_is_binary(call: ast.Call, mode_argindex: int) -> bool:
     return False
 
 
-def _mode_is_text(call: ast.Call, mode_argindex: int) -> bool:
-    """True when a literal ``mode`` argument explicitly requests text ('t')."""
-    args = call.args
-    if len(args) > mode_argindex >= 0 and isinstance(args[mode_argindex], ast.Constant):
-        val = args[mode_argindex].value
-        if isinstance(val, str) and "t" in val:
-            return True
-    for k in call.keywords:
-        if k.arg == "mode" and isinstance(k.value, ast.Constant):
-            val = k.value.value
-            if isinstance(val, str) and "t" in val:
-                return True
-    return False
+def _mode_present(call: ast.Call, mode_argindex: int) -> bool:
+    """True when a ``mode`` argument is supplied (positionally or by keyword)."""
+    if mode_argindex >= 0 and len(call.args) > mode_argindex:
+        return True
+    return any(k.arg == "mode" for k in call.keywords)
+
+
+def _compressed_bindings(tree: ast.AST) -> tuple[set[str], set[str]]:
+    """``(module_aliases, open_func_aliases)`` proven to reference gzip/bz2/lzma.
+
+    ``import gzip as gz`` binds ``gz`` to the module; ``from gzip import open as
+    gopen`` binds ``gopen`` to its text-capable ``open``. Only these bindings get
+    compressed-open handling, so an unrelated name (``gzip = Path(...)``) is not
+    mistaken for the module and vice-versa.
+    """
+    modules: set[str] = set()
+    funcs: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name in _COMPRESSED_MODULES:
+                    modules.add(a.asname or a.name)
+        elif isinstance(node, ast.ImportFrom) and node.module in _COMPRESSED_MODULES:
+            for a in node.names:
+                if a.name == "open":
+                    funcs.add(a.asname or a.name)
+    return modules, funcs
 
 
 def _fdopen_names(tree: ast.AST) -> set[str]:
@@ -179,8 +196,22 @@ def _literal_text(node: ast.AST) -> str | None:
     return None
 
 
+def _compressed_open_violation(node: ast.Call, label: str) -> tuple[int, str] | None:
+    """A gzip/bz2/lzma open needs an encoding when a mode is supplied and not
+    statically provable as binary (an explicit text mode, or a computed/dynamic
+    mode). A bare call or a proven-binary mode stays clean."""
+    if not _has_encoding(node) and _mode_present(node, 1) and not _mode_is_binary(node, 1):
+        return (node.lineno, label)
+    return None
+
+
 def _call_violations(
-    tree: ast.AST, instances: set[str], ctor_names: set[str], fdopen_names: set[str]
+    tree: ast.AST,
+    instances: set[str],
+    ctor_names: set[str],
+    fdopen_names: set[str],
+    comp_modules: set[str],
+    comp_funcs: set[str],
 ) -> list[tuple[int, str]]:
     """Unencoded text I/O among the *Call* nodes of a single parsed tree."""
     out: list[tuple[int, str]] = []
@@ -188,6 +219,21 @@ def _call_violations(
         if not isinstance(node, ast.Call):
             continue
         func = node.func
+        # Compressed openers first (matched by import binding), so a from-import
+        # ``open`` alias or aliased module attribute isn't mishandled below.
+        if isinstance(func, ast.Name) and func.id in comp_funcs:
+            if (v := _compressed_open_violation(node, "gzip.open")) is not None:
+                out.append(v)
+            continue
+        if (
+            isinstance(func, ast.Attribute)
+            and func.attr == "open"
+            and isinstance(func.value, ast.Name)
+            and func.value.id in comp_modules
+        ):
+            if (v := _compressed_open_violation(node, f"{func.value.id}.open")) is not None:
+                out.append(v)
+            continue
         if isinstance(func, ast.Name) and func.id == "open":
             name, mode_idx = "open", 1
         elif isinstance(func, ast.Name) and func.id in fdopen_names:
@@ -204,12 +250,6 @@ def _call_violations(
             recv_id = func.value.id if isinstance(func.value, ast.Name) else None
             if func.attr == "open" and recv_id in _NON_FILE_OPEN_RECEIVERS:
                 continue  # tarfile.open() etc. — binary archive, not text I/O
-            if func.attr == "open" and recv_id in _BINARY_DEFAULT_OPENERS:
-                # gzip/bz2/lzma default to binary; only an explicit text mode
-                # ('t', e.g. "rt"/"wt") needs an encoding.
-                if not _has_encoding(node) and _mode_is_text(node, 1):
-                    out.append((node.lineno, f"{recv_id}.open"))
-                continue
             name = func.attr
             mode_idx = 0 if func.attr == "open" else -1
         else:
@@ -230,8 +270,14 @@ def find_violations(source: str) -> list[tuple[int, str]]:
     """
     tree = ast.parse(source)
     ctor_names = _configparser_ctor_names(tree)
+    comp_modules, comp_funcs = _compressed_bindings(tree)
     out = _call_violations(
-        tree, _configparser_instances(tree, ctor_names), ctor_names, _fdopen_names(tree)
+        tree,
+        _configparser_instances(tree, ctor_names),
+        ctor_names,
+        _fdopen_names(tree),
+        comp_modules,
+        comp_funcs,
     )
 
     # Constants nested inside an f-string are reconstructed as part of that
@@ -256,8 +302,14 @@ def find_violations(source: str) -> list[tuple[int, str]]:
         except SyntaxError:
             continue  # not Python (prose, JS, a fragment) — not an embedded script
         sub_ctor = _configparser_ctor_names(sub)
+        sub_modules, sub_funcs = _compressed_bindings(sub)
         if _call_violations(
-            sub, _configparser_instances(sub, sub_ctor), sub_ctor, _fdopen_names(sub)
+            sub,
+            _configparser_instances(sub, sub_ctor),
+            sub_ctor,
+            _fdopen_names(sub),
+            sub_modules,
+            sub_funcs,
         ):
             out.append((node.lineno, "open(embedded)"))
     return out
