@@ -200,12 +200,14 @@ def _alias_profile(source: str, target: str) -> None:
     """
     path = _databrickscfg_path()
     cfg = configparser.ConfigParser()
-    cfg.read(path)
+    # ~/.databrickscfg is vendor-written: read and write it symmetrically at
+    # the locale default so a round-trip never re-encodes non-ASCII values.
+    cfg.read(path, encoding="locale")
     if source not in cfg:
         raise ValueError(f"alias source {source!r} not in {path}")
     cfg[target] = dict(cfg[source])
     tmp = path.with_name(path.name + ".write")
-    with tmp.open("w", encoding="utf-8") as f:
+    with tmp.open("w", encoding="locale") as f:
         cfg.write(f)
     tmp.replace(path)
 
@@ -225,12 +227,14 @@ def _remove_profile_section(name: str) -> bool:
     if not path.exists():
         return False
     cfg = configparser.ConfigParser()
-    cfg.read(path)
+    # ~/.databrickscfg is vendor-written: read and write it symmetrically at
+    # the locale default so a round-trip never re-encodes non-ASCII values.
+    cfg.read(path, encoding="locale")
     if name not in cfg:
         return False
     cfg.remove_section(name)
     tmp = path.with_name(path.name + ".write")
-    with tmp.open("w", encoding="utf-8") as f:
+    with tmp.open("w", encoding="locale") as f:
         cfg.write(f)
     tmp.replace(path)
     return True

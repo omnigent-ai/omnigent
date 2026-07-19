@@ -471,7 +471,8 @@ def _list_databricks_profiles() -> list[str]:
         return []
     parser = configparser.ConfigParser()
     try:
-        parser.read(cfg_path)
+        # ~/.databrickscfg is vendor-written; read at the locale default.
+        parser.read(cfg_path, encoding="locale")
     except configparser.Error:
         return []
     return [s for s in parser.sections() if s != "DEFAULT"] or (

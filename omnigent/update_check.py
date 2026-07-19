@@ -447,7 +447,8 @@ def _index_from_pip_config() -> str:
     for path in candidates:
         parser = configparser.ConfigParser(interpolation=None)
         try:
-            if not parser.read(path):
+            # pip.conf is an external, locale-defined config; read it as pip does.
+            if not parser.read(path, encoding="locale"):
                 continue
         except (configparser.Error, OSError, UnicodeDecodeError):
             continue
@@ -1171,7 +1172,7 @@ def _safe_read_dist_file(dist: importlib.metadata.Distribution, name: str) -> st
         missing / unreadable / empty.
     """
     try:
-        text = dist.read_text(name)
+        text = dist.read_text(name)  # enc-ok: importlib metadata read_text (no encoding kwarg)
     except (OSError, UnicodeDecodeError):
         return None
     if text is None:

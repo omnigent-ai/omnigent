@@ -100,7 +100,8 @@ def list_databricks_profiles() -> list[str]:
         return []
     parser = configparser.ConfigParser()
     try:
-        parser.read(_DATABRICKSCFG_PATH)
+        # Vendor-written cfg: read at the locale default, symmetric with writers.
+        parser.read(_DATABRICKSCFG_PATH, encoding="locale")
     except configparser.Error as exc:
         _logger.debug("Could not parse %s: %s", _DATABRICKSCFG_PATH, exc)
         return []
@@ -125,7 +126,8 @@ def get_workspace_url_for_profile(profile: str) -> str | None:
     if _DATABRICKSCFG_PATH.exists():
         cfg = configparser.ConfigParser()
         try:
-            cfg.read(_DATABRICKSCFG_PATH)
+            # Vendor-written cfg: read at the locale default (see above).
+            cfg.read(_DATABRICKSCFG_PATH, encoding="locale")
         except configparser.Error as exc:
             _logger.debug("Could not parse %s: %s", _DATABRICKSCFG_PATH, exc)
         else:

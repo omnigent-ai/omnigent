@@ -331,7 +331,8 @@ def _try_resolve_from_cfg(profile: str | None, cfg_path: Path) -> WorkspaceCreds
         return None
 
     config = configparser.ConfigParser()
-    config.read(cfg_path)
+    # Vendor-written cfg: read at the locale default, symmetric with writers.
+    config.read(cfg_path, encoding="locale")
 
     if profile is not None:
         # _read_section raises _SectionPresentButInvalid when the

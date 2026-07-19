@@ -9154,8 +9154,11 @@ def _isolated_databricks_cfg() -> collections.abc.Generator[None, None, None]:
     # section per workspace host and `databricks auth token --host X`
     # never hits the "multiple profiles match" ambiguity error.
     orig_cfg = configparser.ConfigParser()
+    # ~/.databrickscfg is vendor-written; every read and write in this flow
+    # uses the locale default so a round-trip never re-encodes non-ASCII
+    # values (a UTF-8 write followed by a locale read would mojibake).
     if original_cfg.exists():
-        orig_cfg.read(original_cfg)
+        orig_cfg.read(original_cfg, encoding="locale")
     cfg = configparser.ConfigParser()
     for spec in DEFAULT_PROFILES:
         if orig_cfg.has_section(spec.name):
@@ -9169,7 +9172,7 @@ def _isolated_databricks_cfg() -> collections.abc.Generator[None, None, None]:
         suffix=".tmp",
     )
     try:
-        with os.fdopen(tmp_fd, "w") as f:
+        with os.fdopen(tmp_fd, "w", encoding="locale") as f:
             cfg.write(f)
     except Exception:
         os.unlink(tmp_name)
@@ -9195,15 +9198,15 @@ def _isolated_databricks_cfg() -> collections.abc.Generator[None, None, None]:
         yield
         # Merge canonical sections written by setup back into the real cfg.
         tmp_cfg = configparser.ConfigParser()
-        tmp_cfg.read(tmp_path)
+        tmp_cfg.read(tmp_path, encoding="locale")
         orig_cfg = configparser.ConfigParser()
         if original_cfg.exists():
-            orig_cfg.read(original_cfg)
+            orig_cfg.read(original_cfg, encoding="locale")
         for spec in DEFAULT_PROFILES:
             if tmp_cfg.has_section(spec.name):
                 orig_cfg[spec.name] = dict(tmp_cfg[spec.name])
         write_tmp = original_cfg.with_suffix(".tmp")
-        with write_tmp.open("w", encoding="utf-8") as f:
+        with write_tmp.open("w", encoding="locale") as f:
             orig_cfg.write(f)
         write_tmp.replace(original_cfg)
         write_tmp = None
