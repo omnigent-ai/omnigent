@@ -34,8 +34,11 @@ export const lazyCodePlugin: CodeHighlighterPlugin = {
   type: "code-highlighter",
   getThemes: () => realCode?.getThemes() ?? DEFAULT_THEMES,
   getSupportedLanguages: () => realCode?.getSupportedLanguages() ?? [],
-  // Streamdown never calls this on the render path; stay optimistic until the
-  // real plugin (which knows the bundled languages) has loaded.
+  // Streamdown never calls supportsLanguage/getSupportedLanguages on the render
+  // path (zero call sites in streamdown's dist), and the real plugin's
+  // highlight() falls back to "text" for unknown languages anyway, so an
+  // optimistic pre-load answer is safe — unsupported code just renders as
+  // plain text once the engine loads.
   supportsLanguage: (language) => realCode?.supportsLanguage(language) ?? true,
   highlight: (
     options: HighlightOptions,
@@ -48,13 +51,26 @@ export const lazyCodePlugin: CodeHighlighterPlugin = {
       return realCode.highlight(options, callback);
     }
 
-    // First call: kick off the lazy load, report "not ready", and resolve
-    // through the callback once the engine tokenizes.
+    // First call before the engine finishes loading: report "not ready" by
+    // returning null. Streamdown's HighlightedCodeBlockBody keeps the raw code
+    // in state and re-renders when the callback fires (it calls setState in the
+    // callback), so we resolve tokens through the callback once loaded.
+    //
+    // Fire the callback at most once: on a synchronous cache hit the real
+    // plugin returns the result without invoking the callback, so we invoke it;
+    // otherwise the plugin invokes it later. The `fired` guard makes a double
+    // invocation impossible regardless of which path the real plugin takes.
     // oxlint-disable-next-line eslint-plugin-promise(prefer-await-to-then)
     void loadCode().then((plugin) => {
-      const result = plugin.highlight(options, callback);
-      if (result && callback) {
-        callback(result);
+      let fired = false;
+      const fireOnce = (result: HighlightResult) => {
+        if (fired) return;
+        fired = true;
+        callback?.(result);
+      };
+      const sync = plugin.highlight(options, fireOnce);
+      if (sync) {
+        fireOnce(sync);
       }
     });
     return null;

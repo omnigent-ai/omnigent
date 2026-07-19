@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { lazyCodePlugin } from "./lazyCodePlugin";
 
 describe("lazyCodePlugin — deferred Shiki engine", () => {
@@ -30,5 +30,25 @@ describe("lazyCodePlugin — deferred Shiki engine", () => {
 
     expect(Array.isArray(result.tokens)).toBe(true);
     expect(result.tokens.length).toBeGreaterThan(0);
+  });
+
+  it("invokes the highlight callback exactly once", async () => {
+    const callback = vi.fn();
+
+    lazyCodePlugin.highlight(
+      {
+        code: "const doubled = 1;",
+        language: "typescript",
+        themes: ["github-light", "github-dark"],
+      },
+      callback,
+    );
+
+    // Wait past the lazy import + tokenization, then give a couple more
+    // microtask/macrotask turns so any stray second invocation would land.
+    await vi.waitFor(() => expect(callback).toHaveBeenCalled(), { timeout: 10000 });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(callback).toHaveBeenCalledTimes(1);
   });
 });
