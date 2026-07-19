@@ -464,3 +464,13 @@ def test_render_menu_compact_truncates_long_description_to_one_line() -> None:
     assert len(hint_lines) == 1
     assert "…" in hint_lines[0]
     assert len(hint_lines[0]) <= 40
+
+
+@pytest.mark.windows_only
+def test_select_routes_to_fallback_on_windows(monkeypatch: pytest.MonkeyPatch) -> None:
+    """On Windows, select() uses the numbered fallback instead of importing
+    termios (which doesn't exist there). isatty is forced True so only the
+    Windows branch can trigger the fallback."""
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(interactive, "_select_fallback", lambda *a, **k: 42)
+    assert interactive.select("pick", ["a", "b"]) == 42

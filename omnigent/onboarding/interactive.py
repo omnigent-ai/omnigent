@@ -398,7 +398,8 @@ def select(
         raise ValueError("descriptions must match options length")
     mask = _normalize_selectable(options, selectable)
 
-    if not sys.stdin.isatty():
+    if not sys.stdin.isatty() or sys.platform == "win32":
+        # Windows has no termios/tty raw mode; use the numbered fallback.
         return _select_fallback(title, options, default=default, selectable=mask)
 
     import termios

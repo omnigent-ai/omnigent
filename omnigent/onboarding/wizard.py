@@ -73,8 +73,9 @@ def _arrow_menu(
     cursor = default
     selected: set[int] = set()
 
-    # Fall back to number input if not a real terminal.
-    if not sys.stdin.isatty():
+    # Fall back to number input if not a real terminal (or on Windows, which
+    # has no termios/tty raw mode).
+    if not sys.stdin.isatty() or sys.platform == "win32":
         return _arrow_menu_fallback(options, default=default, disabled=disabled, multi=multi)
 
     import select as _select
@@ -279,8 +280,9 @@ def _text_prompt(
     :returns: The user's input (or *default* on bare enter).
     :raises _GoBack: When the user presses Escape and *allow_back* is True.
     """
-    # Non-tty fallback -- just use click.prompt.
-    if not sys.stdin.isatty():
+    # Non-tty fallback -- just use click.prompt. Windows also takes this path
+    # (no termios/tty raw mode).
+    if not sys.stdin.isatty() or sys.platform == "win32":
         raw = str(
             click.prompt(
                 label,
