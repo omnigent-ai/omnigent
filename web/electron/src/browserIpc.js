@@ -271,6 +271,11 @@ function registerBrowserIpc({ ipcMain, isPinnedOriginSender, getRegistryForEvent
     return { registry };
   };
 
+  const agentControlError = (registry, conversationId) => {
+    const verdict = registry.agentControlVerdict(conversationId);
+    return verdict.ok ? null : verdict.error;
+  };
+
   /** A window-scoped sender for the event's own webContents. Used to push
    *  url/nav-state pings back to exactly the renderer that drives the view. */
   const senderFor = (event) => (channel, payload) => {
@@ -334,6 +339,8 @@ function registerBrowserIpc({ ipcMain, isPinnedOriginSender, getRegistryForEvent
     const g = gateRegistry(event);
     if (g.error) return { ok: false, error: g.error };
     const { conversationId } = args ?? {};
+    const accessError = agentControlError(g.registry, conversationId);
+    if (accessError) return { ok: false, error: accessError };
     const entry = g.registry.get(conversationId);
     if (!entry) return { ok: false, error: "No browser view" };
     try {
@@ -353,6 +360,8 @@ function registerBrowserIpc({ ipcMain, isPinnedOriginSender, getRegistryForEvent
     if (g.error) return { ok: false, error: g.error };
     const { conversationId, js } = args ?? {};
     if (typeof js !== "string") return { ok: false, error: "js must be a string" };
+    const accessError = agentControlError(g.registry, conversationId);
+    if (accessError) return { ok: false, error: accessError };
     const entry = g.registry.get(conversationId);
     if (!entry) return { ok: false, error: "No browser view" };
     try {
@@ -372,6 +381,21 @@ function registerBrowserIpc({ ipcMain, isPinnedOriginSender, getRegistryForEvent
     if (g.error) return { exists: false };
     const { conversationId } = args ?? {};
     return { exists: typeof conversationId === "string" && g.registry.has(conversationId) };
+  });
+
+  ipcMain.handle("omnigent:browser-get-agent-access", (event, args) => {
+    const g = gateRegistry(event);
+    if (g.error) return { ok: false, allowed: false, error: g.error };
+    return g.registry.agentAccessStatus(args?.conversationId);
+  });
+
+  ipcMain.handle("omnigent:browser-set-agent-access", (event, args) => {
+    const g = gateRegistry(event);
+    if (g.error) return { ok: false, allowed: false, error: g.error };
+    if (typeof args?.allowed !== "boolean") {
+      return { ok: false, allowed: false, error: "allowed must be a boolean" };
+    }
+    return g.registry.setAgentAccess(args?.conversationId, args.allowed);
   });
 
   // Destroy the conversation's view (explicit close — unmount only detaches).
@@ -448,6 +472,8 @@ function registerBrowserIpc({ ipcMain, isPinnedOriginSender, getRegistryForEvent
     const g = gateRegistry(event);
     if (g.error) return { ok: false, error: g.error };
     const { conversationId } = args ?? {};
+    const accessError = agentControlError(g.registry, conversationId);
+    if (accessError) return { ok: false, error: accessError };
     const entry = g.registry.get(conversationId);
     if (!entry) return { ok: false, error: "No browser view" };
     try {

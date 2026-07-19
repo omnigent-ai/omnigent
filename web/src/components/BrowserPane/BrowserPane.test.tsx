@@ -28,6 +28,23 @@ function installBridge(overrides: Record<string, unknown> = {}) {
     browserSetActive: vi.fn().mockResolvedValue({ ok: true }),
     browserResize: vi.fn().mockResolvedValue({ ok: true }),
     browserOpenOrNavigate: vi.fn().mockResolvedValue({ ok: true, created: true }),
+    browserGetAgentAccess: vi.fn().mockResolvedValue({
+      ok: true,
+      url: "https://example.com/",
+      origin: "https://example.com",
+      kind: "public",
+      allowed: true,
+    }),
+    browserSetAgentAccess: vi.fn().mockImplementation((_conversationId: string, allowed: boolean) =>
+      Promise.resolve({
+        ok: true,
+        url: "http://localhost:3000/",
+        origin: "http://localhost:3000",
+        kind: "local",
+        allowed,
+      }),
+    ),
+    browserClose: vi.fn().mockResolvedValue({ ok: true, removed: true }),
     browserGoBack: vi.fn().mockResolvedValue({ ok: true }),
     browserGoForward: vi.fn().mockResolvedValue({ ok: true }),
     browserReload: vi.fn().mockResolvedValue({ ok: true }),
@@ -167,6 +184,91 @@ describe("BrowserPane design-mode toggle", () => {
       "aria-pressed",
       "false",
     );
+  });
+});
+
+describe("BrowserPane local agent access", () => {
+  async function renderWithAccess(kind: "local" | "blocked", allowed: boolean) {
+    let fireCreated: ((p: { conversationId: string }) => void) | undefined;
+    const status = {
+      ok: true,
+      url: kind === "local" ? "http://localhost:3000/" : "file:///tmp/app.html",
+      origin: kind === "local" ? "http://localhost:3000" : null,
+      kind,
+      allowed,
+    };
+    const bridge = installBridge({
+      onBrowserViewCreated: vi.fn((cb: (p: { conversationId: string }) => void) => {
+        fireCreated = cb;
+        return () => {};
+      }),
+      browserGetAgentAccess: vi.fn().mockResolvedValue(status),
+      browserSetAgentAccess: vi
+        .fn()
+        .mockImplementation((_conversationId: string, next: boolean) =>
+          Promise.resolve({ ...status, allowed: next }),
+        ),
+    });
+    render(<BrowserPane conversationId="conv_access" />);
+    await screen.findByRole("textbox", { name: /address bar/i });
+    act(() => fireCreated?.({ conversationId: "conv_access" }));
+    await waitFor(() => expect(bridge.browserGetAgentAccess).toHaveBeenCalled());
+    return bridge;
+  }
+
+  it("opens localhost user-only and asks before enabling every agent control", async () => {
+    const bridge = await renderWithAccess("local", false);
+
+    expect(
+      await screen.findByText(/allow the agent to inspect and control http:\/\/localhost:3000/i),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /enter design mode/i })).toBeDisabled();
+
+    screen.getByRole("button", { name: "Not now" }).click();
+    await waitFor(() => {
+      expect(screen.queryByText(/this includes page content/i)).toBeNull();
+    });
+    screen.getByRole("button", { name: /allow agent access to http:\/\/localhost:3000/i }).click();
+    expect(await screen.findByText(/this includes page content/i)).toBeInTheDocument();
+
+    screen.getByRole("button", { name: "Allow for this conversation" }).click();
+    await waitFor(() => {
+      expect(bridge.browserSetAgentAccess).toHaveBeenCalledWith("conv_access", true);
+      expect(
+        screen.getByRole("button", {
+          name: "Revoke agent access to http://localhost:3000",
+        }),
+      ).toHaveTextContent("Agent on");
+    });
+    expect(screen.getByRole("button", { name: /enter design mode/i })).not.toBeDisabled();
+  });
+
+  it("revokes the current local origin from the persistent indicator", async () => {
+    const bridge = await renderWithAccess("local", true);
+    const revoke = await screen.findByRole("button", {
+      name: "Revoke agent access to http://localhost:3000",
+    });
+    revoke.click();
+    await waitFor(() => {
+      expect(bridge.browserSetAgentAccess).toHaveBeenCalledWith("conv_access", false);
+      expect(screen.getByText(/allow the agent to inspect and control/i)).toBeInTheDocument();
+    });
+  });
+
+  it("closes the browser view and clears its visible state", async () => {
+    const bridge = await renderWithAccess("local", true);
+    screen.getByRole("button", { name: /close browser and revoke agent access/i }).click();
+    await waitFor(() => {
+      expect(bridge.browserClose).toHaveBeenCalledWith("conv_access", "user");
+      expect(screen.getByText(/enter a url above to get started/i)).toBeInTheDocument();
+    });
+  });
+
+  it("never offers an allow action for file or private pages", async () => {
+    await renderWithAccess("blocked", false);
+    expect(await screen.findByText("Agent blocked")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /allow agent access/i })).toBeNull();
+    expect(screen.getByRole("button", { name: /enter design mode/i })).toBeDisabled();
   });
 });
 

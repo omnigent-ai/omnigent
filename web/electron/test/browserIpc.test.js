@@ -65,6 +65,8 @@ function makeWebContents({ canBack = false, canForward = false } = {}) {
       goForward: () => calls.push("goForward"),
     },
     reload: () => calls.push("reload"),
+    getURL: () => "http://localhost:3000/",
+    capturePage: () => Promise.resolve({ toPNG: () => Buffer.from("png") }),
     isDevToolsOpened: () => devtoolsOpen,
     isDestroyed: () => false,
     getZoomFactor: () => 1,
@@ -106,9 +108,17 @@ function nonceFromScripts(scripts) {
 }
 
 /** Build a registry stub around one entry keyed by conversationId. */
-function makeRegistry(conversationId, webContents) {
+function makeRegistry(conversationId, webContents, agentAllowed = true) {
   const entries = new Map();
   if (conversationId) entries.set(conversationId, { view: { webContents } });
+  let allowed = agentAllowed;
+  const accessStatus = () => ({
+    ok: true,
+    url: "http://localhost:3000/",
+    origin: "http://localhost:3000",
+    kind: "local",
+    allowed,
+  });
   return {
     get: (id) => entries.get(id) ?? null,
     has: (id) => entries.has(id),
@@ -120,15 +130,27 @@ function makeRegistry(conversationId, webContents) {
     },
     setActive: () => ({ ok: true }),
     close: () => ({ ok: true, removed: true }),
+    agentAccessStatus: accessStatus,
+    setAgentAccess: (_id, next) => {
+      allowed = next;
+      return accessStatus();
+    },
+    agentControlVerdict: () =>
+      allowed ? { ok: true } : { ok: false, error: "Agent access has not been approved" },
   };
 }
 
 /** Register the IPC surface with injectable gate + registry, and capture the
  *  events sent to a fake sender. */
-function setup({ pinned = true, conversationId = "conv_1", webContents } = {}) {
+function setup({
+  pinned = true,
+  conversationId = "conv_1",
+  webContents,
+  agentAllowed = true,
+} = {}) {
   const ipcMain = makeIpcMain();
   const wc = webContents ?? makeWebContents();
-  const registry = makeRegistry(conversationId, wc);
+  const registry = makeRegistry(conversationId, wc, agentAllowed);
   const sent = [];
   const event = { sender: { send: (channel, payload) => sent.push({ channel, payload }) } };
   registerBrowserIpc({
@@ -150,6 +172,8 @@ describe("browserIpc — trust gate", () => {
       "omnigent:browser-screenshot",
       "omnigent:browser-execute",
       "omnigent:browser-has-view",
+      "omnigent:browser-get-agent-access",
+      "omnigent:browser-set-agent-access",
       "omnigent:browser-close",
       "omnigent:browser-go-back",
       "omnigent:browser-go-forward",
@@ -178,6 +202,51 @@ describe("browserIpc — trust gate", () => {
       assert.equal(r.ok, false, `${channels[i]} should be gated`);
       assert.match(r.error, /connected server's page/);
     });
+  });
+});
+
+describe("browserIpc — local agent access", () => {
+  it("blocks screenshot, execute, and design mode before approval", async () => {
+    const wc = makeWebContents();
+    const { ipcMain, event } = setup({ webContents: wc, agentAllowed: false });
+    const [screenshot, execute, design] = await Promise.all([
+      ipcMain.invoke("omnigent:browser-screenshot", event, { conversationId: "conv_1" }),
+      ipcMain.invoke("omnigent:browser-execute", event, {
+        conversationId: "conv_1",
+        js: "document.title",
+      }),
+      ipcMain.invoke("omnigent:browser-enable-design-mode", event, {
+        conversationId: "conv_1",
+      }),
+    ]);
+    for (const result of [screenshot, execute, design]) {
+      assert.equal(result.ok, false);
+      assert.match(result.error, /not been approved/);
+    }
+    assert.equal(
+      wc.calls.some((call) => call.startsWith("executeJavaScript:")),
+      false,
+    );
+  });
+
+  it("reports, grants, and revokes access through trusted IPC", async () => {
+    const { ipcMain, event } = setup({ agentAllowed: false });
+    const before = await ipcMain.invoke("omnigent:browser-get-agent-access", event, {
+      conversationId: "conv_1",
+    });
+    assert.equal(before.allowed, false);
+
+    const granted = await ipcMain.invoke("omnigent:browser-set-agent-access", event, {
+      conversationId: "conv_1",
+      allowed: true,
+    });
+    assert.equal(granted.allowed, true);
+
+    const revoked = await ipcMain.invoke("omnigent:browser-set-agent-access", event, {
+      conversationId: "conv_1",
+      allowed: false,
+    });
+    assert.equal(revoked.allowed, false);
   });
 });
 

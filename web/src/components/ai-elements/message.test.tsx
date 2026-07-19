@@ -28,6 +28,21 @@ describe("MessageResponse", () => {
     expect(document.querySelector('img[src^="https://attacker.example"]')).toBeNull();
     expect(await screen.findByText("[Image blocked: leak]")).toBeTruthy();
   });
+
+  it("marks only loopback links for the embedded preview", async () => {
+    render(
+      <MessageResponse>
+        {"[local](http://localhost:3000/app) [public](https://example.com/)"}
+      </MessageResponse>,
+    );
+
+    expect(await screen.findByRole("link", { name: "local" })).toHaveAttribute(
+      "data-omnigent-local-preview",
+    );
+    expect(screen.getByRole("link", { name: "public" })).not.toHaveAttribute(
+      "data-omnigent-local-preview",
+    );
+  });
 });
 
 describe("MessageResponse code-block copy", () => {

@@ -231,6 +231,12 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    */
   browserHasView: (conversationId) =>
     ipcRenderer.invoke("omnigent:browser-has-view", { conversationId }),
+  /** Read whether the agent may inspect/control the current page. */
+  browserGetAgentAccess: (conversationId) =>
+    ipcRenderer.invoke("omnigent:browser-get-agent-access", { conversationId }),
+  /** Allow or revoke agent control for the current loopback origin. */
+  browserSetAgentAccess: (conversationId, allowed) =>
+    ipcRenderer.invoke("omnigent:browser-set-agent-access", { conversationId, allowed }),
   /**
    * Subscribe to browser-view close events (`{conversationId, reason}`) so the
    * SPA can drop the pane when the view is destroyed. Returns an unsubscribe.

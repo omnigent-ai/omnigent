@@ -197,6 +197,72 @@ describe("browserViewRegistry — agent-navigation allowlist", () => {
     assert.equal(loaded.length, 0);
   });
 
+  it("opens localhost user-only until the exact origin is explicitly granted", () => {
+    const { registry, loaded } = makeLoadTrackingRegistry();
+    const opened = registry.openOrNavigate("conv_1", "http://localhost:3000/app", undefined, {
+      force: true,
+    });
+    assert.equal(opened.ok, true);
+    assert.deepEqual(registry.agentAccessStatus("conv_1"), {
+      ok: true,
+      url: "http://localhost:3000/app",
+      origin: "http://localhost:3000",
+      kind: "local",
+      allowed: false,
+    });
+    assert.match(registry.agentControlVerdict("conv_1").error, /has not been approved/);
+
+    const granted = registry.setAgentAccess("conv_1", true);
+    assert.equal(granted.ok, true);
+    assert.equal(granted.allowed, true);
+
+    const sameOrigin = registry.openOrNavigate(
+      "conv_1",
+      "http://localhost:3000/settings",
+      undefined,
+      { agent: true },
+    );
+    assert.equal(sameOrigin.ok, true);
+
+    const otherPort = registry.openOrNavigate("conv_1", "http://localhost:3001/admin", undefined, {
+      agent: true,
+    });
+    assert.equal(otherPort.ok, false);
+
+    const otherConversation = registry.openOrNavigate(
+      "conv_2",
+      "http://localhost:3000/admin",
+      undefined,
+      { agent: true },
+    );
+    assert.equal(otherConversation.ok, false);
+    assert.deepEqual(loaded, ["http://localhost:3000/app", "http://localhost:3000/settings"]);
+  });
+
+  it("revokes the current origin and clears grants when the view closes", () => {
+    const { registry } = makeLoadTrackingRegistry();
+    registry.openOrNavigate("conv_1", "http://localhost:3000/");
+    assert.equal(registry.setAgentAccess("conv_1", true).allowed, true);
+    assert.equal(registry.setAgentAccess("conv_1", false).allowed, false);
+    assert.equal(registry.agentControlVerdict("conv_1").ok, false);
+
+    registry.setAgentAccess("conv_1", true);
+    registry.close("conv_1", "user");
+    registry.openOrNavigate("conv_1", "http://localhost:3000/");
+    assert.equal(registry.agentAccessStatus("conv_1").allowed, false);
+  });
+
+  it("never grants file or private-network origins", () => {
+    const { registry } = makeLoadTrackingRegistry();
+    for (const url of ["file:///tmp/app.html", "http://10.0.0.2/admin"]) {
+      registry.openOrNavigate("conv_1", url, undefined, { force: true });
+      const grant = registry.setAgentAccess("conv_1", true);
+      assert.equal(grant.ok, false);
+      assert.equal(grant.allowed, false);
+      assert.equal(registry.agentControlVerdict("conv_1").ok, false);
+    }
+  });
+
   it("allows agent navigation to a normal public https URL (loadURL runs)", () => {
     const { registry, loaded } = makeLoadTrackingRegistry();
     const r = registry.openOrNavigate("conv_1", "https://example.com/", undefined, {
@@ -292,6 +358,16 @@ describe("browserViewRegistry — redirect/nav guard (SSRF: allowlist on every h
     registry.openOrNavigate("conv_1", "https://example.com/", undefined, { agent: true });
     const ev = fire("will-navigate", "http://10.1.2.3/admin");
     assert.equal(ev.prevented, true);
+  });
+
+  it("allows only the granted local origin through the redirect guard", () => {
+    const { registry, fire } = makeEventCapturingRegistry();
+    registry.openOrNavigate("conv_1", "http://localhost:3000/");
+    registry.setAgentAccess("conv_1", true);
+    registry.openOrNavigate("conv_1", "http://localhost:3000/app", undefined, { agent: true });
+
+    assert.equal(fire("will-navigate", "http://localhost:3000/settings").prevented, false);
+    assert.equal(fire("will-navigate", "http://localhost:3001/admin").prevented, true);
   });
 
   it("allows an agent-locked redirect between normal public https hosts", () => {

@@ -67,6 +67,27 @@ function isBlockedHostname(hostname) {
   return false;
 }
 
+/** True only for HTTP(S) loopback URLs a user may grant to an agent. */
+function isLoopbackNavigationUrl(url) {
+  try {
+    const parsed = new URL(url);
+    if (!ALLOWED_SCHEMES.has(parsed.protocol)) return false;
+    const host = parsed.hostname.toLowerCase();
+    if (
+      host === "localhost" ||
+      host.endsWith(".localhost") ||
+      host === "[::1]" ||
+      host === "[::]"
+    ) {
+      return true;
+    }
+    const ipv4 = parseIpv4(host);
+    return !!ipv4 && (ipv4[0] === 127 || ipv4.every((octet) => octet === 0));
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Decide whether an AGENT-issued navigation to `url` is allowed: `{ ok: true }`
  * for an http(s) URL to a non-internal host, else `{ ok: false, error }`. Never
@@ -110,6 +131,7 @@ function isAgentNavigationAllowed(url) {
 
 module.exports = {
   isAgentNavigationAllowed,
+  isLoopbackNavigationUrl,
   // Exported for focused unit tests.
   parseIpv4,
   isBlockedIpv4,

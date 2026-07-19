@@ -9,7 +9,31 @@
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
 
-const { isAgentNavigationAllowed } = require("../src/browserUrlPolicy");
+const { isAgentNavigationAllowed, isLoopbackNavigationUrl } = require("../src/browserUrlPolicy");
+
+describe("browserUrlPolicy — user-grantable loopback origins", () => {
+  it("allows only HTTP(S) loopback URLs", () => {
+    for (const url of [
+      "http://localhost:3000/",
+      "https://app.localhost/path",
+      "http://127.5.6.7:8080/",
+      "http://0.0.0.0:5173/",
+      "http://[::1]/",
+      "http://[::]/",
+    ]) {
+      assert.equal(isLoopbackNavigationUrl(url), true, `expected loopback: ${url}`);
+    }
+    for (const url of [
+      "https://example.com/",
+      "http://10.0.0.1/",
+      "http://192.168.1.2/",
+      "http://169.254.169.254/",
+      "file:///tmp/app.html",
+    ]) {
+      assert.equal(isLoopbackNavigationUrl(url), false, `expected non-grantable: ${url}`);
+    }
+  });
+});
 
 describe("browserUrlPolicy — agent navigation allowlist", () => {
   it("allows ordinary public http(s) URLs", () => {

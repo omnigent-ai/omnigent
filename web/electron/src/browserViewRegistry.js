@@ -17,7 +17,7 @@
  *    detached on hide and destroyed only on explicit close.
  */
 
-const { isAgentNavigationAllowed } = require("./browserUrlPolicy");
+const { isAgentNavigationAllowed, isLoopbackNavigationUrl } = require("./browserUrlPolicy");
 
 const DEFAULT_CAP = 10;
 
@@ -55,6 +55,9 @@ function createBrowserViewRegistry({
       // Last URL we EXPLICITLY requested (not getURL(), which drifts as the page
       // navigates) — lets openOrNavigate skip reissuing loadURL on a re-mount.
       lastRequestedUrl: "",
+      // Exact loopback origins the user explicitly allowed this conversation's
+      // agent to inspect and control. Destroyed with the browser entry.
+      userGrantedOrigins: new Set(),
       // Whether the CURRENT navigation was agent-initiated. Set on every
       // openOrNavigate from opts.agent; read by the will-navigate/will-redirect
       // guard so the allowlist is enforced on the agent's whole nav chain
@@ -108,6 +111,85 @@ function createBrowserViewRegistry({
     wc.setWindowOpenHandler(() => ({ action: "deny" }));
   }
 
+  function httpOrigin(url) {
+    try {
+      const parsed = new URL(url);
+      return parsed.protocol === "http:" || parsed.protocol === "https:" ? parsed.origin : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function currentEntryUrl(entry) {
+    try {
+      const live = entry.view.webContents.getURL?.();
+      if (live && live !== "chrome-error://chromewebdata/") return live;
+    } catch {
+      /* destroyed */
+    }
+    return entry.lastRequestedUrl || "";
+  }
+
+  function agentNavigationVerdict(entry, url) {
+    const verdict = isAgentNavigationAllowed(url);
+    const origin = httpOrigin(url);
+    return !verdict.ok &&
+      origin &&
+      isLoopbackNavigationUrl(url) &&
+      entry &&
+      entry.userGrantedOrigins.has(origin)
+      ? { ok: true }
+      : verdict;
+  }
+
+  function agentAccessStatus(conversationId) {
+    const entry = entries.get(conversationId);
+    if (!entry) return { ok: false, allowed: false, error: "No browser view" };
+    const url = currentEntryUrl(entry);
+    const origin = httpOrigin(url);
+    if (isAgentNavigationAllowed(url).ok) {
+      return { ok: true, url, origin, kind: "public", allowed: true };
+    }
+    if (origin && isLoopbackNavigationUrl(url)) {
+      return {
+        ok: true,
+        url,
+        origin,
+        kind: "local",
+        allowed: entry.userGrantedOrigins.has(origin),
+      };
+    }
+    return { ok: true, url, origin, kind: "blocked", allowed: false };
+  }
+
+  function setAgentAccess(conversationId, allowed) {
+    const entry = entries.get(conversationId);
+    const status = agentAccessStatus(conversationId);
+    if (!entry || !status.ok) return status;
+    if (status.kind !== "local" || !status.origin) {
+      return { ...status, ok: false, error: "Only loopback HTTP(S) origins can be granted" };
+    }
+    if (allowed) entry.userGrantedOrigins.add(status.origin);
+    else entry.userGrantedOrigins.delete(status.origin);
+    return agentAccessStatus(conversationId);
+  }
+
+  function agentControlVerdict(conversationId) {
+    const status = agentAccessStatus(conversationId);
+    if (!status.ok) return { ok: false, error: status.error };
+    if (status.allowed) return { ok: true };
+    if (status.kind === "local") {
+      return {
+        ok: false,
+        error: `Agent access to ${status.origin} has not been approved. Ask the user to allow it in the Browser toolbar.`,
+      };
+    }
+    return {
+      ok: false,
+      error: `Agent access to ${status.url || "this page"} is blocked.`,
+    };
+  }
+
   // SECURITY (SSRF): enforce the agent-navigation allowlist on the child view's
   // OWN navigation events, not just the first loadURL. A server 302 / meta-
   // refresh / location.href during an agent-initiated navigation would otherwise
@@ -123,7 +205,7 @@ function createBrowserViewRegistry({
     if (!wc || typeof wc.on !== "function") return;
     const guard = (event, targetUrl) => {
       if (!entry.agentNavLocked) return; // user-driven nav: permissive
-      const verdict = isAgentNavigationAllowed(targetUrl);
+      const verdict = agentNavigationVerdict(entry, targetUrl);
       if (!verdict.ok) {
         try {
           event.preventDefault();
@@ -149,13 +231,11 @@ function createBrowserViewRegistry({
 
   function openOrNavigate(conversationId, url, bounds, opts) {
     const force = !!(opts && opts.force);
-    // Agent-driven nav (opts.agent) is gated by an allowlist (see
-    // browserUrlPolicy) so the model can't point the view at file:// /
-    // metadata / loopback / private hosts and exfiltrate via screenshot. URL-bar
-    // (user-typed) nav stays permissive. Checked before getOrCreate so a
-    // rejected nav creates no blank view.
+    // Agent-driven nav is public-web-only unless this conversation's user
+    // explicitly granted the exact HTTP(S) origin from a chat preview click.
+    // Checked before getOrCreate so a rejected nav creates no blank view.
     if (opts && opts.agent && url) {
-      const verdict = isAgentNavigationAllowed(url);
+      const verdict = agentNavigationVerdict(entries.get(conversationId), url);
       if (!verdict.ok) {
         return { ok: false, error: verdict.error };
       }
@@ -312,6 +392,9 @@ function createBrowserViewRegistry({
     setActive,
     close,
     closeAll,
+    agentAccessStatus,
+    setAgentAccess,
+    agentControlVerdict,
     // Introspection
     activeConversationId: () => activeConversationId,
     size: () => entries.size,

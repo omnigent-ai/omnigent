@@ -324,7 +324,7 @@ function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
   };
 }
 
-function renderShell(path: string, info?: ServerInfo) {
+function renderShell(path: string, info?: ServerInfo, previewHref?: string) {
   const qc = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
@@ -350,6 +350,11 @@ function renderShell(path: string, info?: ServerInfo) {
                     <TerminalFirstViewProbe />
                     <ForkDialogProbe />
                     <LocationDisplay />
+                    {previewHref && (
+                      <a href={previewHref} data-omnigent-local-preview="">
+                        local preview
+                      </a>
+                    )}
                   </>
                 }
               />
@@ -459,7 +464,10 @@ beforeEach(() => {
   useChatStore.setState({ todos: [], terminalPending: false, sessionStatus: "idle" });
 });
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  delete (window as unknown as Record<string, unknown>).omnigentDesktop;
+});
 
 describe("AppShell header", () => {
   it("renders the sidebar toggle on all pages", () => {
@@ -1608,6 +1616,26 @@ describe("FilesPanel visibility", () => {
 });
 
 describe("Right workspace card visibility", () => {
+  it("opens a clicked localhost chat link user-only in the Browser tab", () => {
+    const browserOpenOrNavigate = vi.fn().mockResolvedValue({ ok: true, created: true });
+    (window as unknown as Record<string, unknown>).omnigentDesktop = {
+      kind: "electron",
+      browserOpenOrNavigate,
+    };
+    mockConversations([{ id: "conv_preview", permission_level: null }]);
+
+    renderShell("/c/conv_preview", undefined, "http://localhost:3000/app");
+    fireEvent.click(screen.getByRole("link", { name: "local preview" }));
+
+    expect(browserOpenOrNavigate).toHaveBeenCalledWith(
+      "conv_preview",
+      "http://localhost:3000/app",
+      undefined,
+      { force: true },
+    );
+    expect(screen.getByRole("tab", { name: /Browser/i })).toHaveAttribute("aria-selected", "true");
+  });
+
   it("keeps the card mounted with Agents as the only tab for a minimal agent", () => {
     // A no-os_env agent (available: false) with no shells and no todos
     // still has the unconditional Agents tab (the panel lists at least

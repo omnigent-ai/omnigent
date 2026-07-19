@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Outlet, useParams, useSearchParams } from "@/lib/routing";
 import { useConversations } from "@/hooks/useConversations";
@@ -17,8 +17,10 @@ import {
   isAndroidShell,
   isElectronShell,
   isIOSShell,
+  isLocalBrowserPreviewUrl,
   isMacElectronShell,
   onNativeSidebarDrag,
+  openLocalBrowserPreview,
   supportsBrowser,
 } from "@/lib/nativeBridge";
 import { onBrowserActionRequest } from "@/lib/browserActionBus";
@@ -567,6 +569,34 @@ export function AppShell() {
       setRightPanelOpen(true);
     });
   }, []);
+
+  const handleLocalPreviewClick = useCallback(
+    (event: MouseEvent<HTMLDivElement>) => {
+      if (
+        event.defaultPrevented ||
+        event.button !== 0 ||
+        event.metaKey ||
+        event.ctrlKey ||
+        event.shiftKey ||
+        event.altKey ||
+        !conversationId ||
+        !supportsBrowser() ||
+        !(event.target instanceof Element)
+      ) {
+        return;
+      }
+      const link = event.target.closest<HTMLAnchorElement>("a[data-omnigent-local-preview]");
+      if (!link || !isLocalBrowserPreviewUrl(link.href)) return;
+
+      event.preventDefault();
+      setRightRailTab("browser");
+      setRightPanelOpen(true);
+      void openLocalBrowserPreview(conversationId, link.href).then((result) => {
+        if (!result.ok) console.warn("Could not open local browser preview:", result.error);
+      });
+    },
+    [conversationId],
+  );
 
   // Design-mode submit routing. Lives here (with the hoisted relay) because the
   // in-page popup posts back via preload IPC delivered to the always-mounted
@@ -1237,6 +1267,7 @@ export function AppShell() {
           <div
             className="app-shell relative flex h-dvh bg-sidebar text-foreground"
             data-electron-mac={isMacElectronShell() ? "true" : undefined}
+            onClick={handleLocalPreviewClick}
             data-ios-native={isIOSShell() ? "true" : undefined}
             data-android-native={isAndroidShell() ? "true" : undefined}
           >

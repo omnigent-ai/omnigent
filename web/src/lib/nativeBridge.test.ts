@@ -4,10 +4,12 @@ import {
   isAndroidShell,
   isElectronShell,
   isIOSShell,
+  isLocalBrowserPreviewUrl,
   isNativeShell,
   nativeNotify,
   onNativeNotificationActivated,
   onNativeSidebarDrag,
+  openLocalBrowserPreview,
   setBadgeCount as bridgeSetBadge,
   setNativeServerSwitcherHidden,
   supportsBrowser,
@@ -18,6 +20,7 @@ const electronSetBadge = vi.fn();
 const electronNotify = vi.fn().mockResolvedValue(true);
 const electronUnsubscribe = vi.fn();
 const electronOnNotificationActivated = vi.fn().mockReturnValue(electronUnsubscribe);
+const electronBrowserOpen = vi.fn().mockResolvedValue({ ok: true });
 
 // The iOS WKWebView bridge mock, installed on window.omnigentNative.
 const iosSetBadge = vi.fn();
@@ -57,7 +60,7 @@ function setElectron(on: boolean, withClickRouting = true, withBrowser = false):
               electronOnNotificationActivated(...args),
           }
         : {}),
-      ...(withBrowser ? { browserOpenOrNavigate: () => Promise.resolve({ ok: true }) } : {}),
+      ...(withBrowser ? { browserOpenOrNavigate: electronBrowserOpen } : {}),
     };
   } else {
     delete (window as unknown as Record<string, unknown>).omnigentDesktop;
@@ -107,6 +110,7 @@ function setAndroid(on: boolean, withClickRouting = true): void {
 beforeEach(() => {
   vi.clearAllMocks();
   electronNotify.mockResolvedValue(true);
+  electronBrowserOpen.mockResolvedValue({ ok: true });
   iosNotify.mockResolvedValue(true);
   androidNotify.mockResolvedValue(true);
 });
@@ -194,6 +198,47 @@ describe("supportsBrowser", () => {
   it("is false under a non-Electron native shell (iOS)", () => {
     setIOS(true);
     expect(supportsBrowser()).toBe(false);
+  });
+});
+
+describe("local browser previews", () => {
+  it.each([
+    "http://localhost:3000/",
+    "https://app.localhost/path",
+    "http://127.0.0.1:5173/",
+    "http://0.0.0.0:8000/",
+    "http://[::1]:4321/",
+  ])("recognizes loopback preview URL %s", (url) => {
+    expect(isLocalBrowserPreviewUrl(url)).toBe(true);
+  });
+
+  it.each(["https://example.com/", "http://192.168.1.2/", "file:///tmp/app.html", "/relative"])(
+    "rejects non-loopback preview URL %s",
+    (url) => {
+      expect(isLocalBrowserPreviewUrl(url)).toBe(false);
+    },
+  );
+
+  it("opens a preview in user-only mode", async () => {
+    setElectron(true, true, true);
+    await expect(openLocalBrowserPreview("conv_1", "http://localhost:3000/app")).resolves.toEqual({
+      ok: true,
+    });
+    expect(electronBrowserOpen).toHaveBeenCalledWith(
+      "conv_1",
+      "http://localhost:3000/app",
+      undefined,
+      { force: true },
+    );
+  });
+
+  it("does not send non-local URLs to the privileged bridge", async () => {
+    setElectron(true, true, true);
+    await expect(openLocalBrowserPreview("conv_1", "http://10.0.0.2/admin")).resolves.toEqual({
+      ok: false,
+      error: "not a local preview URL",
+    });
+    expect(electronBrowserOpen).not.toHaveBeenCalled();
   });
 });
 

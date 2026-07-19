@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button";
 import { ButtonGroup, ButtonGroupText } from "@/components/ui/button-group";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { copyText } from "@/lib/clipboard";
+import { isLocalBrowserPreviewUrl } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
 import type { UIMessage } from "ai";
 import { CheckIcon, ChevronLeftIcon, ChevronRightIcon, CopyIcon, WrapTextIcon } from "lucide-react";
@@ -423,10 +424,22 @@ function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
   );
 }
 
+function ChatLink({ href, ...props }: ComponentProps<"a">) {
+  return (
+    <a
+      {...props}
+      href={href}
+      data-omnigent-local-preview={
+        typeof href === "string" && isLocalBrowserPreviewUrl(href) ? "" : undefined
+      }
+    />
+  );
+}
+
 export const MessageResponse = memo(
   ({ className, components, controls, ...props }: MessageResponseProps) => {
     const messageComponents = useMemo(
-      () => ({ ...components, pre: ChatCodeBlockPre }),
+      () => ({ ...components, a: ChatLink, pre: ChatCodeBlockPre }),
       [components],
     );
 

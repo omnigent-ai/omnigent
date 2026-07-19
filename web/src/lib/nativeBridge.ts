@@ -295,6 +295,36 @@ export function supportsBrowser(): boolean {
   return typeof electronApi()?.browserOpenOrNavigate === "function";
 }
 
+/** True for HTTP(S) loopback URLs commonly emitted by local dev servers. */
+export function isLocalBrowserPreviewUrl(rawUrl: string): boolean {
+  try {
+    const url = new URL(rawUrl);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return false;
+    const host = url.hostname.toLowerCase();
+    return (
+      host === "localhost" ||
+      host.endsWith(".localhost") ||
+      /^127(?:\.\d{1,3}){3}$/.test(host) ||
+      host === "0.0.0.0" ||
+      host === "[::1]" ||
+      host === "[::]"
+    );
+  } catch {
+    return false;
+  }
+}
+
+/** Open a user-clicked local preview in user-only mode. */
+export async function openLocalBrowserPreview(
+  conversationId: string,
+  url: string,
+): Promise<{ ok: boolean; created?: boolean; error?: string }> {
+  if (!isLocalBrowserPreviewUrl(url)) return { ok: false, error: "not a local preview URL" };
+  const open = electronApi()?.browserOpenOrNavigate;
+  if (!open) return { ok: false, error: "embedded browser is unavailable" };
+  return open(conversationId, url, undefined, { force: true });
+}
+
 /**
  * True when running inside the Electron desktop shell on macOS — the one
  * platform where the shell hides the native title bar (titleBarStyle

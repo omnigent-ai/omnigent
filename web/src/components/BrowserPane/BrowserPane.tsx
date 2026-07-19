@@ -21,6 +21,7 @@ import {
   RotateCwIcon,
   SquareDashedMousePointerIcon,
   WrenchIcon,
+  XIcon,
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { supportsBrowser } from "@/lib/nativeBridge";
@@ -45,6 +46,15 @@ interface NavResult {
   error?: string;
 }
 
+interface AgentAccessStatus {
+  ok: boolean;
+  allowed: boolean;
+  url?: string;
+  origin?: string | null;
+  kind?: "public" | "local" | "blocked";
+  error?: string;
+}
+
 /** Subset of `window.omnigentDesktop` the pane calls. Typed locally so the
  *  component doesn't depend on the full nativeBridge type; every method is
  *  optional (an older shell may predate the browser feature). */
@@ -66,6 +76,12 @@ interface BrowserPaneBridge {
   openBrowserDevTools?: (conversationId: string) => Promise<{ ok: boolean; error?: string }>;
   browserEnableDesignMode?: (conversationId: string) => Promise<{ ok: boolean; error?: string }>;
   browserDisableDesignMode?: (conversationId: string) => Promise<{ ok: boolean; error?: string }>;
+  browserGetAgentAccess?: (conversationId: string) => Promise<AgentAccessStatus>;
+  browserSetAgentAccess?: (conversationId: string, allowed: boolean) => Promise<AgentAccessStatus>;
+  browserClose?: (
+    conversationId: string,
+    reason?: string,
+  ) => Promise<{ ok: boolean; removed?: boolean; error?: string }>;
   onBrowserHostActiveChanged?: (
     callback: (payload: { conversationId: string | null }) => void,
   ) => () => void;
@@ -123,6 +139,18 @@ export function BrowserPane({ conversationId, className }: BrowserPaneProps) {
   // Design-mode toggle: on, the main process injects the in-page picker; submit
   // routing lives in AppShell. This flag only drives the button + enable/disable IPC.
   const [designMode, setDesignMode] = useState(false);
+  const [agentAccess, setAgentAccess] = useState<AgentAccessStatus | null>(null);
+  const [accessPromptDismissed, setAccessPromptDismissed] = useState(false);
+
+  const refreshAgentAccess = useCallback(async () => {
+    const result = await getBridge()?.browserGetAgentAccess?.(conversationId);
+    if (!result?.ok) {
+      setAgentAccess(null);
+      return;
+    }
+    setAgentAccess(result);
+    if (!urlEditingRef.current && result.url) setCurrentUrl(result.url);
+  }, [conversationId]);
 
   // Feed `viewActive` from three signals so the placeholder mounts exactly when
   // a view exists: (1) browser-view-created — first navigate (often detached,
@@ -137,21 +165,37 @@ export function BrowserPane({ conversationId, className }: BrowserPaneProps) {
 
     // (2) Re-show an already-created view when the pane remounts.
     void bridge.browserHasView?.(conversationId).then((r) => {
-      if (!cancelled && r?.exists) setViewActive(true);
+      if (!cancelled && r?.exists) {
+        setViewActive(true);
+        void refreshAgentAccess();
+      }
     });
 
     // (1) A view was just created for this conversation (first navigate).
     const unsubCreated = bridge.onBrowserViewCreated?.((payload) => {
-      if (payload.conversationId === conversationId) setViewActive(true);
+      if (payload.conversationId === conversationId) {
+        setViewActive(true);
+        void refreshAgentAccess();
+      }
     });
     // (3) Attach/detach transitions. An attach for another conversation, or a
     // detach (null), means this pane's view is no longer the visible one.
     const unsubActive = bridge.onBrowserHostActiveChanged?.((payload) => {
-      if (payload.conversationId === conversationId) setViewActive(true);
-      else if (payload.conversationId === null) setViewActive(false);
+      if (payload.conversationId === conversationId) {
+        setViewActive(true);
+        void refreshAgentAccess();
+      } else if (payload.conversationId === null) {
+        setViewActive(false);
+      }
     });
     const unsubClosed = bridge.onBrowserViewClosed?.((payload) => {
-      if (payload.conversationId === conversationId) setViewActive(false);
+      if (payload.conversationId !== conversationId) return;
+      setViewActive(false);
+      setCurrentUrl("");
+      setCanGoBack(false);
+      setCanGoForward(false);
+      setAgentAccess(null);
+      setAccessPromptDismissed(false);
     });
     return () => {
       cancelled = true;
@@ -159,7 +203,7 @@ export function BrowserPane({ conversationId, className }: BrowserPaneProps) {
       unsubActive?.();
       unsubClosed?.();
     };
-  }, [conversationId, browserSupported]);
+  }, [conversationId, browserSupported, refreshAgentAccess]);
 
   // Live-track the real URL + back/forward via did-navigate listeners (redirects,
   // link clicks, agent nav all keep the bar honest), but never stomp the input
@@ -170,6 +214,7 @@ export function BrowserPane({ conversationId, className }: BrowserPaneProps) {
     if (!bridge) return;
     const unsubUrl = bridge.onBrowserUrlChanged?.((payload) => {
       if (payload.conversationId !== conversationId) return;
+      void refreshAgentAccess();
       if (urlEditingRef.current) return;
       setCurrentUrl(payload.url);
     });
@@ -182,7 +227,11 @@ export function BrowserPane({ conversationId, className }: BrowserPaneProps) {
       unsubUrl?.();
       unsubNav?.();
     };
-  }, [conversationId, browserSupported]);
+  }, [conversationId, browserSupported, refreshAgentAccess]);
+
+  useEffect(() => {
+    setAccessPromptDismissed(false);
+  }, [agentAccess?.origin]);
 
   // ── Toolbar handlers ─────────────────────────────────────────────────────
 
@@ -196,8 +245,12 @@ export function BrowserPane({ conversationId, className }: BrowserPaneProps) {
     if (!raw) return;
     const navUrl = normalizeTypedUrl(raw);
     setCurrentUrl(navUrl);
-    void bridge.browserOpenOrNavigate(conversationId, navUrl, undefined, { force: true });
-  }, [conversationId, currentUrl]);
+    void bridge
+      .browserOpenOrNavigate(conversationId, navUrl, undefined, { force: true })
+      .then((result) => {
+        if (result.ok) void refreshAgentAccess();
+      });
+  }, [conversationId, currentUrl, refreshAgentAccess]);
 
   const handleBack = useCallback(() => {
     const bridge = getBridge();
@@ -236,10 +289,42 @@ export function BrowserPane({ conversationId, className }: BrowserPaneProps) {
       void bridge.browserDisableDesignMode?.(conversationId);
       setDesignMode(false);
     } else {
-      void bridge.browserEnableDesignMode?.(conversationId);
-      setDesignMode(true);
+      void bridge.browserEnableDesignMode?.(conversationId).then((result) => {
+        if (result?.ok) setDesignMode(true);
+      });
     }
   }, [conversationId, designMode]);
+
+  const handleAgentAccess = useCallback(
+    async (allowed: boolean) => {
+      const bridge = getBridge();
+      if (!bridge?.browserSetAgentAccess) return;
+      if (!allowed && designMode) {
+        await bridge.browserDisableDesignMode?.(conversationId);
+        setDesignMode(false);
+      }
+      const result = await bridge.browserSetAgentAccess(conversationId, allowed);
+      if (result.ok) {
+        setAgentAccess(result);
+        setAccessPromptDismissed(false);
+      }
+    },
+    [conversationId, designMode],
+  );
+
+  const handleClose = useCallback(async () => {
+    const bridge = getBridge();
+    if (!bridge?.browserClose) return;
+    const result = await bridge.browserClose(conversationId, "user");
+    if (!result.ok) return;
+    setViewActive(false);
+    setCurrentUrl("");
+    setCanGoBack(false);
+    setCanGoForward(false);
+    setDesignMode(false);
+    setAgentAccess(null);
+    setAccessPromptDismissed(false);
+  }, [conversationId]);
 
   // If the view goes away (closed) while design mode is on, drop the pressed
   // state so the button doesn't lie — the injected picker died with the view.
@@ -440,6 +525,37 @@ export function BrowserPane({ conversationId, className }: BrowserPaneProps) {
           }}
           className="h-6 min-w-0 flex-1 rounded-md border border-input bg-transparent px-2 text-foreground text-xs outline-none placeholder:text-muted-foreground focus-visible:border-ring dark:bg-input/30"
         />
+        {viewActive && agentAccess?.kind === "local" && (
+          <button
+            type="button"
+            onClick={() => {
+              if (agentAccess.allowed) void handleAgentAccess(false);
+              else setAccessPromptDismissed(false);
+            }}
+            aria-label={
+              agentAccess.allowed
+                ? `Revoke agent access to ${agentAccess.origin}`
+                : `Allow agent access to ${agentAccess.origin}`
+            }
+            title={agentAccess.allowed ? "Revoke agent access" : "Agent access is off"}
+            className={cn(
+              "h-6 shrink-0 rounded border px-2 font-medium text-[11px]",
+              agentAccess.allowed
+                ? "border-green-500/40 bg-green-500/10 text-green-700 dark:text-green-300"
+                : "border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300",
+            )}
+          >
+            Agent {agentAccess.allowed ? "on" : "off"}
+          </button>
+        )}
+        {viewActive && agentAccess?.kind === "blocked" && (
+          <span
+            className="h-6 shrink-0 rounded border border-destructive/30 bg-destructive/10 px-2 font-medium text-[11px] leading-6 text-destructive"
+            title="Agent access is blocked for this page"
+          >
+            Agent blocked
+          </span>
+        )}
         <button
           type="button"
           onClick={handleDevTools}
@@ -453,7 +569,7 @@ export function BrowserPane({ conversationId, className }: BrowserPaneProps) {
         <button
           type="button"
           onClick={handleToggleDesignMode}
-          disabled={!viewActive}
+          disabled={!viewActive || agentAccess?.allowed !== true}
           aria-pressed={designMode}
           aria-label={designMode ? "Exit design mode" : "Enter design mode"}
           title={
@@ -468,7 +584,50 @@ export function BrowserPane({ conversationId, className }: BrowserPaneProps) {
         >
           <SquareDashedMousePointerIcon className="size-4" />
         </button>
+        <button
+          type="button"
+          onClick={handleClose}
+          disabled={!viewActive}
+          aria-label="Close browser and revoke agent access"
+          title="Close browser and revoke agent access"
+          className="flex size-6 items-center justify-center rounded text-foreground hover:bg-muted disabled:pointer-events-none disabled:opacity-40"
+        >
+          <XIcon className="size-4" />
+        </button>
       </div>
+      {viewActive &&
+        agentAccess?.kind === "local" &&
+        !agentAccess.allowed &&
+        !accessPromptDismissed && (
+          <div
+            className="flex shrink-0 items-center gap-3 border-amber-500/30 border-b bg-amber-500/10 px-3 py-2 text-xs"
+            role="status"
+          >
+            <div className="min-w-0 flex-1">
+              <div className="font-medium text-foreground">
+                Allow the agent to inspect and control {agentAccess.origin}?
+              </div>
+              <div className="text-muted-foreground">
+                This includes page content, screenshots, clicks, typing, and navigation within this
+                origin.
+              </div>
+            </div>
+            <button
+              type="button"
+              className="shrink-0 rounded px-2 py-1 text-muted-foreground hover:bg-muted"
+              onClick={() => setAccessPromptDismissed(true)}
+            >
+              Not now
+            </button>
+            <button
+              type="button"
+              className="shrink-0 rounded bg-primary px-2 py-1 font-medium text-primary-foreground hover:bg-primary/90"
+              onClick={() => void handleAgentAccess(true)}
+            >
+              Allow for this conversation
+            </button>
+          </div>
+        )}
       {viewActive ? (
         /* Measuring region — the native WebContentsView paints over this.
            flex-1 min-h-0 so it fills everything BELOW the toolbar; its rect
