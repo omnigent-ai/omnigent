@@ -1408,8 +1408,22 @@ def _shell_impl(
     """
     argv = _shell_argv(shell_path, command)
     try:
+        run_target: str | list[str] = argv
+        if IS_WINDOWS and argv and argv[-1] == command:
+            # Passing [cmd.exe, "/c", command] as a list makes subprocess apply
+            # Windows list-quoting (list2cmdline) to `command`, escaping its own
+            # quotes as \" and corrupting any quoted command (echo "a b",
+            # git commit -m "x", python -c "..."). Build the command line as a
+            # single string so the shell receives the payload verbatim.
+            if Path(shell_path).name.lower() in ("cmd.exe", "cmd"):
+                # Wrap the payload in an extra pair of quotes, which `cmd.exe /c`
+                # strips — without it cmd.exe corrupts a command that starts with
+                # a quote (e.g. a quoted executable path).
+                run_target = f'{argv[0]} /c "{command}"'
+            else:
+                run_target = subprocess.list2cmdline(argv[:-1]) + " " + command
         completed = subprocess.run(
-            argv,
+            run_target,
             cwd=str(cwd),
             env=_child_shell_env(),
             text=True,

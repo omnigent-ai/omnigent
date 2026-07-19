@@ -431,3 +431,23 @@ class TestSelectDefaultShell:
     def test_posix_falls_back_to_sh(self, monkeypatch) -> None:
         monkeypatch.setattr("omnigent.inner.os_env.shutil.which", lambda name: None)
         assert _select_default_shell(False) == "/bin/sh"
+
+
+@pytest.mark.windows_only
+def test_shell_impl_preserves_quotes_on_windows(tmp_path: Path) -> None:
+    """`_shell_impl` must pass a quoted command to cmd.exe verbatim.
+
+    Regression for list-based argv serialization escaping the command's own
+    quotes as ``\\"`` (so ``echo "a b"`` produced ``\\"a b\\"``) and for
+    ``cmd.exe /c`` stripping the outer quotes of a quote-leading command.
+    """
+    comspec = os.environ.get("COMSPEC", "cmd.exe")
+    result = _shell_impl(
+        command='echo "a b"',
+        timeout=15,
+        shell_path=comspec,
+        cwd=tmp_path,
+    )
+    assert result["exit_code"] == 0, result
+    assert "\\" not in result["stdout"], result["stdout"]
+    assert "a b" in result["stdout"]
