@@ -426,6 +426,7 @@ def _authorize_runner_or_user_sync(
     auth_provider: AuthProvider | None,
     permission_store: PermissionStore | None,
     conversation_store: ConversationStore,
+    user_id: str | None = None,
 ) -> RequestAuth:
     """Synchronous core of :func:`authorize_runner_or_user`.
 
@@ -446,7 +447,8 @@ def _authorize_runner_or_user_sync(
                 conversation=conv,
             )
 
-    user_id = get_user_id(request, auth_provider)
+    if user_id is None:
+        user_id = get_user_id(request, auth_provider)
     access = _require_access_and_level_sync(
         user_id, conversation_id, required_level, permission_store, conversation_store
     )
@@ -466,6 +468,7 @@ async def authorize_runner_or_user(
     auth_provider: AuthProvider | None,
     permission_store: PermissionStore | None,
     conversation_store: ConversationStore,
+    user_id: str | None = None,
 ) -> RequestAuth:
     """Authorize a request via runner capability or human permission.
 
@@ -502,6 +505,7 @@ async def authorize_runner_or_user(
         auth_provider,
         permission_store,
         conversation_store,
+        user_id,
     )
 
 

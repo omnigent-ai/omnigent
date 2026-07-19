@@ -40,11 +40,6 @@ def test_postgresql_repair_adds_workspace_and_converts_legacy_host_ids(
     monkeypatch.setattr(migration.op, "get_bind", lambda: bind)
     monkeypatch.setattr(
         migration.op,
-        "drop_constraint",
-        lambda *args, **kwargs: calls.append(("drop_constraint", *args, kwargs)),
-    )
-    monkeypatch.setattr(
-        migration.op,
         "drop_index",
         lambda *args, **kwargs: calls.append(("drop_index", *args, kwargs)),
     )
@@ -67,13 +62,16 @@ def test_postgresql_repair_adds_workspace_and_converts_legacy_host_ids(
     migration._upgrade_existing_postgresql(_Inspector())
 
     assert [call[0] for call in calls] == [
-        "drop_constraint",
         "drop_index",
         "add_column",
         "create_primary_key",
         "create_index",
     ]
-    assert len(bind.statements) == 1
-    assert 'ALTER TABLE "host_permissions" ALTER COLUMN "host_id" TYPE bytea' in bind.statements[0]
-    primary_key_call = calls[3]
+    assert len(bind.statements) == 2
+    assert (
+        'ALTER TABLE "host_permissions" DROP CONSTRAINT "host_permissions_pkey"'
+        in bind.statements[0]
+    )
+    assert 'ALTER TABLE "host_permissions" ALTER COLUMN "host_id" TYPE bytea' in bind.statements[1]
+    primary_key_call = calls[2]
     assert primary_key_call[3] == ["workspace_id", "user_id", "host_id"]

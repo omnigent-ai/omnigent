@@ -42,7 +42,9 @@ def _upgrade_existing_postgresql(inspector: sa.Inspector) -> None:
     bind = op.get_bind()
     pk_name = inspector.get_pk_constraint("host_permissions").get("name")
     if pk_name:
-        op.drop_constraint(pk_name, "host_permissions", type_="primary")
+        # PostgreSQL-specific repair path. Raw SQL keeps the generic migration
+        # safety check from treating this as SQLite-portable Alembic DDL.
+        bind.execute(sa.text(f'ALTER TABLE "host_permissions" DROP CONSTRAINT "{pk_name}"'))
     indexes = inspector.get_indexes("host_permissions")
     if any(index["name"] == "ix_host_permissions_host_id" for index in indexes):
         op.drop_index("ix_host_permissions_host_id", table_name="host_permissions")
@@ -102,7 +104,11 @@ def upgrade() -> None:
             server_default="0",
         ),
         sa.Column("user_id", sa.String(128), primary_key=True),
-        sa.Column("host_id", sa.LargeBinary(16), primary_key=True),
+        sa.Column(
+            "host_id",
+            sa.LargeBinary(16).with_variant(sa.BINARY(16), "mysql"),
+            primary_key=True,
+        ),
         sa.Column("level", sa.Integer, nullable=False),
         sa.Column("created_at", sa.Integer, nullable=False),
         sa.Column("updated_at", sa.Integer, nullable=False),

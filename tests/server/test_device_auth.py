@@ -235,6 +235,9 @@ def _build_accounts_app(
     from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
     from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
     from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+    from omnigent.stores.host_permission_store.sqlalchemy_store import (
+        SqlAlchemyHostPermissionStore,
+    )
     from omnigent.stores.host_store import HostStore
     from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 
@@ -268,6 +271,7 @@ def _build_accounts_app(
         comment_store=comment_store,
         permission_store=permission_store,
         host_store=host_store,
+        host_permission_store=SqlAlchemyHostPermissionStore(db_url),
         auth_provider=auth_provider,
         account_store=account_store,
     )
