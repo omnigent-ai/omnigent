@@ -2,7 +2,7 @@
 
 Dev tooling for Omnigent, in one binary with two independent capabilities:
 
-1. A per-repo dev **pod supervisor** (bare `omnidev`) — the default.
+1. A per-checkout dev **pod supervisor** (bare `omnidev`) — the default.
 2. **Install management** (`omnidev install`/`update`/`check`) — install and
    keep a git-based omnigent up to date. See
    [Managing your omnigent install](#managing-your-omnigent-install). These
@@ -10,7 +10,7 @@ Dev tooling for Omnigent, in one binary with two independent capabilities:
 
 ## Pod supervisor
 
-A per-repo dev **pod** supervisor, as a single long-running terminal UI. It
+A per-checkout dev **pod** supervisor, as a single long-running terminal UI. It
 replaces the three-terminal local dev flow (`omnigent server`, `omnigent host`,
 `npm run dev`) with one process that:
 
@@ -29,7 +29,7 @@ replaces the three-terminal local dev flow (`omnigent server`, `omnigent host`,
 ## Build & run
 
 Requires the repo's usual dev prerequisites (`uv` for Python, `npm` for the
-web UI) plus a Rust toolchain.
+web UI) plus a current stable Rust toolchain.
 
 ```bash
 cd dev/omnidev
@@ -40,6 +40,23 @@ Run it from anywhere inside the checkout — it walks up to the repo root
 (the `.jj`/`.git` marker) and requires `omnigent/` and
 `web/` to be present. Build a release binary with `cargo build --release`
 (lands at `target/release/omnidev`).
+
+### Scaling across checkouts, sessions, and projects
+
+Run one `omnidev` process for each independently running Omnigent source
+checkout. `N = 1` uses one checkout and pod; `N > 1` uses one pod per worktree
+or separate clone. Existing worktrees need no special setup because the default
+pod directory is keyed to each checkout's canonical path. A per-pod lock rejects
+a second `omnidev` process in the same checkout.
+
+A pod is not tied to one chat session or target project directory. Multiple
+sessions and projects may share a pod when they use the same Omnigent server
+revision. Use another checkout and pod only when the Omnigent code, database
+migrations, config, or runtime state must differ.
+
+When starting several previously unseen checkouts, wait for each pod to display
+its header and allocated ports before starting the next. Keep the default pod
+directories and automatic ports unless explicit unique overrides are required.
 
 ## What it starts
 

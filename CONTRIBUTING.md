@@ -81,6 +81,83 @@ The host URL can also be passed positionally (`omnigent host
 http://localhost:6767`). See the [README](README.md) for more on hosts,
 harnesses, and credentials.
 
+### Develop and test one or more changes
+
+Use one isolated [`omnidev`](dev/omnidev/README.md) pod for each Omnigent
+source checkout whose code must run independently. For `N = 1`, run one pod in
+your current checkout or a dedicated worktree. For `N > 1`, run one pod per
+worktree or separate clone. `omnidev` keys pod state to the checkout's canonical
+path and allocates distinct ports, so existing worktrees work without extra
+configuration.
+
+A pod belongs to an Omnigent source checkout, not to an individual chat session
+or target project directory:
+
+- sessions and project directories using the same Omnigent revision may share
+  one pod;
+- revisions that need independent server code, database migrations, config, or
+  runtime state need separate checkouts and pods.
+
+List any worktrees you already have:
+
+```bash
+git worktree list
+```
+
+If the required worktrees already exist, skip creation. Otherwise, create one
+for each missing change from the main checkout:
+
+```bash
+git fetch origin
+mkdir -p ../omnigent-worktrees
+
+add_omnigent_worktrees() {
+  for change in "$@"; do
+    git worktree add "../omnigent-worktrees/$change" \
+      -b "feature/$change" origin/main
+  done
+}
+
+add_omnigent_worktrees search-export billing-alerts
+```
+
+Pass one name for `N = 1` or as many names as needed. In a separate persistent
+terminal for each checkout, run:
+
+```bash
+cd <path-to-omnigent-checkout-or-worktree>
+cargo run --manifest-path dev/omnidev/Cargo.toml
+```
+
+When starting several new pods, wait for each one to display its header and
+ports before starting the next. `omnidev` requires a current stable Rust
+toolchain in addition to the regular development prerequisites. Each invocation
+starts that checkout's server, host, and Vite frontend with:
+
+- automatically allocated backend and frontend ports;
+- an isolated database, config, artifacts, logs, and process state;
+- inherited provider credentials and package caches;
+- backend reloads and frontend hot-module replacement.
+
+Open the UI URL shown in each `omnidev` header. For a session that modifies
+Omnigent itself, select the source worktree served by that pod. Sessions working
+on other project directories may share the pod and host.
+
+Coding harnesses should keep each pod in its own persistent PTY or tmux session
+and execute tests from the matching Omnigent checkout. Keep the default pod
+directory and automatic ports unless explicit unique overrides are required.
+
+Press `q` or `Ctrl-C` to stop a pod. After merging, remove only worktrees you
+created for finished changes:
+
+```bash
+git worktree remove ../omnigent-worktrees/<change-name>
+git branch -d feature/<change-name>
+```
+
+See [`dev/omnidev/README.md`](dev/omnidev/README.md) for port overrides,
+backend-only mode, LAN testing, logs, and keyboard controls.
+
 ### Backend-only local development validation
 
 Use this when you want to validate the Python backend and local API server from
