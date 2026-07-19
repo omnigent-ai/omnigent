@@ -22,15 +22,16 @@ from pathlib import Path
 
 import pytest
 
-from tests._encoding_scan import ALLOWLIST, find_violations, scan_package
+from tests._encoding_scan import ALLOWLIST, find_violations, owned_packages, scan_package
 
 
 def test_no_unencoded_owned_text_io() -> None:
-    """Structural guard: no omnigent-owned open/read_text/write_text may omit an
-    explicit ``encoding`` (receiver-independent; catches what PLW1514 misses).
+    """Structural guard: no owned open/read_text/write_text/os.fdopen/
+    ConfigParser.read may omit an explicit ``encoding`` (receiver-independent;
+    catches what PLW1514 misses). Covers every first-party package shipped from
+    this repo — the ``omnigent`` app and the ``omnigent_client`` SDK.
     """
-    pkg = Path(__file__).resolve().parents[1] / "omnigent"
-    violations = scan_package(pkg, ALLOWLIST)
+    violations = [v for pkg in owned_packages() for v in scan_package(pkg, ALLOWLIST)]
     assert not violations, "Unencoded text I/O (add encoding=...):\n" + "\n".join(violations)
 
 
@@ -120,23 +121,31 @@ def test_config_read_forces_utf8_under_cp1252_default(tmp_path: Path) -> None:
 # long before it lets a real omnigent regression through).
 _FLAGGED = [
     'open("f")',
+    'open("f", encoding=None)',  # encoding=None == default codec, not a fix
     'from pathlib import Path\nPath("f").read_text()',
     'from pathlib import Path\nPath("f").write_text("x")',
     'import os\nos.fdopen(fd, "w")',
+    'from os import fdopen\nfdopen(fd, "w")',  # aliased/imported fdopen
+    'import os as _o\n_o.fdopen(fd, "w")',  # aliased os module
     "import configparser\ncfg = configparser.ConfigParser()\ncfg.read(p)",
+    "from configparser import ConfigParser as CP\nc = CP()\nc.read(p)",  # aliased ctor
     'run("import os; data = open(p).read()")',  # embedded, plain string
     'run(f"exec(open({p!r}).read())")',  # embedded, f-string
+    'run("""\n    import os\n    data = open(p).read()\n""")',  # embedded, indented
 ]
 _CLEAN = [
     'open("f", encoding="utf-8")',
     'open("f", "rb")',  # binary
     'open("f", encoding="locale")',
+    'open("f", encoding=enc)',  # a real (non-None) encoding expression
     'from pathlib import Path\nPath("f").read_text(encoding="utf-8")',
     'import tarfile\ntarfile.open("f")',  # archive, not text
     'import os\nos.open("f", 0)',  # low-level fd
     'import os\nos.fdopen(fd, "wb")',  # binary
     'import os\nos.fdopen(fd, "w", encoding="utf-8")',
+    'from os import fdopen\nfdopen(fd, "w", encoding="utf-8")',
     "import configparser\ncfg = configparser.ConfigParser()\ncfg.read(p, encoding='locale')",
+    "from configparser import ConfigParser as CP\nc = CP()\nc.read(p, encoding='utf-8')",
     "run(\"open(p, encoding='utf-8')\")",  # embedded, encoded
     'run("call open() to begin; then stop.")',  # prose: not parseable Python
     'run("// import fs;\\nfs.open(p);")',  # generated JS: not parseable Python
@@ -151,3 +160,68 @@ def test_scanner_flags_unencoded(src: str) -> None:
 @pytest.mark.parametrize("src", _CLEAN)
 def test_scanner_accepts_encoded_and_nonfile(src: str) -> None:
     assert not find_violations(src), f"unexpected violation for:\n{src}"
+
+
+def _run_utf8_mode(script: str) -> subprocess.CompletedProcess[str]:
+    """Run *script* in a child with UTF-8 Mode ON (Python 3.15's default)."""
+    env = dict(os.environ)
+    env["PYTHONUTF8"] = "1"
+    return subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(script)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        env=env,
+    )
+
+
+@pytest.mark.windows_only
+def test_edit_preserves_cp1252_under_utf8_mode(tmp_path: Path) -> None:
+    """Editing a cp1252 file under UTF-8 Mode must not mix encodings.
+
+    ``getpreferredencoding(False)`` returns ``"utf-8"`` in UTF-8 Mode even on a
+    cp1252 host, so a naive detection fallback would rewrite the existing ``é``
+    as UTF-8 (``\\xc3\\xa9``) beside cp1252 bytes. The coding tools fall back to
+    ``locale.getencoding()`` (the true cp1252), so the file stays single-codec.
+    """
+    f = tmp_path / "latin.txt"
+    f.write_bytes("caf\N{LATIN SMALL LETTER E WITH ACUTE} old\n".encode("cp1252"))
+    result = _run_utf8_mode(
+        f"""
+        import sys, locale
+        assert sys.flags.utf8_mode, "expected PYTHONUTF8=1"
+        assert locale.getpreferredencoding(False).lower() == "utf-8"  # the trap
+        assert locale.getencoding().lower() == "cp1252"               # the truth
+        from omnigent.client_tools.coding import Edit
+        edit = getattr(Edit, "func", None) or getattr(Edit, "__wrapped__", Edit)
+        edit(file_path=r{str(f)!r}, old_string="old", new_string="new")
+        raw = __import__("pathlib").Path(r{str(f)!r}).read_bytes()
+        assert b"\\xe9" in raw and b"\\xc3\\xa9" not in raw, raw
+        """
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.windows_only
+def test_detect_encoding_reads_utf8_config_under_utf8_mode(tmp_path: Path) -> None:
+    """A UTF-8 vendor config must read back correctly under UTF-8 Mode, and a
+    cp1252 one must still be detected as cp1252 (not the lying preferred codec).
+    """
+    utf8_cfg = tmp_path / "utf8"
+    utf8_cfg.write_text("[p]\nhost = café\n", encoding="utf-8")
+    latin_cfg = tmp_path / "latin"
+    latin_cfg.write_bytes("[p]\nhost = café\n".encode("cp1252"))
+    result = _run_utf8_mode(
+        f"""
+        import configparser
+        from pathlib import Path
+        from omnigent._encoding import detect_encoding
+        u, latin = Path(r{str(utf8_cfg)!r}), Path(r{str(latin_cfg)!r})
+        assert detect_encoding(u) == "utf-8"
+        assert detect_encoding(latin).lower() == "cp1252"
+        c = configparser.ConfigParser()
+        c.read(u, encoding=detect_encoding(u))
+        assert c["p"]["host"] == "café", c["p"]["host"]
+        """
+    )
+    assert result.returncode == 0, result.stderr

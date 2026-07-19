@@ -18,6 +18,7 @@ an enumerator (``python tests/_encoding_scan.py``).
 from __future__ import annotations
 
 import ast
+import textwrap
 from pathlib import Path
 
 _METHODS = {"read_text", "write_text", "open"}
@@ -50,7 +51,15 @@ _EMBEDDED_HINTS = ("open(", "read_text(", "write_text(")
 
 
 def _has_encoding(call: ast.Call) -> bool:
-    return any(k.arg == "encoding" for k in call.keywords)
+    """True only when a *real* encoding is named.
+
+    ``encoding=None`` selects the platform default codec — identical to omitting
+    the argument — so it is treated as a violation, not a fix.
+    """
+    for k in call.keywords:
+        if k.arg == "encoding":
+            return not (isinstance(k.value, ast.Constant) and k.value.value is None)
+    return False
 
 
 def _mode_is_binary(call: ast.Call, mode_argindex: int) -> bool:
@@ -68,16 +77,31 @@ def _mode_is_binary(call: ast.Call, mode_argindex: int) -> bool:
     return False
 
 
-def _is_configparser_ctor(func: ast.expr) -> bool:
-    """True for ``ConfigParser()`` / ``configparser.RawConfigParser()`` etc."""
+def _configparser_ctor_names(tree: ast.AST) -> set[str]:
+    """Names that construct a ConfigParser: the classes plus any import alias.
+
+    Resolves ``from configparser import ConfigParser as CP`` so an aliased
+    constructor is still recognized.
+    """
+    names = set(_CONFIGPARSER_CTORS)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "configparser":
+            for a in node.names:
+                if a.name in _CONFIGPARSER_CTORS:
+                    names.add(a.asname or a.name)
+    return names
+
+
+def _is_configparser_ctor(func: ast.expr, ctor_names: set[str]) -> bool:
+    """True for ``ConfigParser()`` / ``configparser.RawConfigParser()`` / an alias."""
     if isinstance(func, ast.Name):
-        return func.id in _CONFIGPARSER_CTORS
+        return func.id in ctor_names
     if isinstance(func, ast.Attribute):
-        return func.attr in _CONFIGPARSER_CTORS
+        return func.attr in _CONFIGPARSER_CTORS  # module.ConfigParser(), cp.ConfigParser()
     return False
 
 
-def _configparser_names(tree: ast.AST) -> set[str]:
+def _configparser_names(tree: ast.AST, ctor_names: set[str]) -> set[str]:
     """Names bound to a ConfigParser instance anywhere in the module."""
     names: set[str] = set()
     for node in ast.walk(tree):
@@ -87,19 +111,19 @@ def _configparser_names(tree: ast.AST) -> set[str]:
             targets, value = [node.target], node.value
         else:
             continue
-        if isinstance(value, ast.Call) and _is_configparser_ctor(value.func):
+        if isinstance(value, ast.Call) and _is_configparser_ctor(value.func, ctor_names):
             names.update(t.id for t in targets if isinstance(t, ast.Name))
     return names
 
 
-def _is_configparser_read(func: ast.Attribute, names: set[str]) -> bool:
+def _is_configparser_read(func: ast.Attribute, inst_names: set[str], ctor_names: set[str]) -> bool:
     """True for ``cfg.read(...)`` / ``configparser.ConfigParser().read(...)``."""
     if func.attr != "read":
         return False
     recv = func.value
-    if isinstance(recv, ast.Name) and recv.id in names:
+    if isinstance(recv, ast.Name) and recv.id in inst_names:
         return True
-    return isinstance(recv, ast.Call) and _is_configparser_ctor(recv.func)
+    return isinstance(recv, ast.Call) and _is_configparser_ctor(recv.func, ctor_names)
 
 
 def _literal_text(node: ast.AST) -> str | None:
@@ -114,7 +138,9 @@ def _literal_text(node: ast.AST) -> str | None:
     return None
 
 
-def _call_violations(tree: ast.AST, cfg_names: set[str]) -> list[tuple[int, str]]:
+def _call_violations(
+    tree: ast.AST, inst_names: set[str], ctor_names: set[str]
+) -> list[tuple[int, str]]:
     """Unencoded text I/O among the *Call* nodes of a single parsed tree."""
     out: list[tuple[int, str]] = []
     for node in ast.walk(tree):
@@ -123,14 +149,13 @@ def _call_violations(tree: ast.AST, cfg_names: set[str]) -> list[tuple[int, str]
         func = node.func
         if isinstance(func, ast.Name) and func.id == "open":
             name, mode_idx = "open", 1
-        elif (
-            isinstance(func, ast.Attribute)
-            and func.attr == "fdopen"
-            and isinstance(func.value, ast.Name)
-            and func.value.id == "os"
+        elif isinstance(func, ast.Name) and func.id == "fdopen":
+            name, mode_idx = "fdopen", 1  # from os import fdopen
+        elif isinstance(func, ast.Attribute) and func.attr == "fdopen":
+            name, mode_idx = "os.fdopen", 1  # os.fdopen / aliased module.fdopen
+        elif isinstance(func, ast.Attribute) and _is_configparser_read(
+            func, inst_names, ctor_names
         ):
-            name, mode_idx = "os.fdopen", 1
-        elif isinstance(func, ast.Attribute) and _is_configparser_read(func, cfg_names):
             if not _has_encoding(node):
                 out.append((node.lineno, "ConfigParser.read"))
             continue
@@ -160,7 +185,8 @@ def find_violations(source: str) -> list[tuple[int, str]]:
     templates (e.g. generated JS) are excluded rather than false-flagged.
     """
     tree = ast.parse(source)
-    out = _call_violations(tree, _configparser_names(tree))
+    ctor_names = _configparser_ctor_names(tree)
+    out = _call_violations(tree, _configparser_names(tree, ctor_names), ctor_names)
 
     # Constants nested inside an f-string are reconstructed as part of that
     # f-string; skip them so a half-open interpolated fragment isn't parsed alone.
@@ -178,10 +204,13 @@ def find_violations(source: str) -> list[tuple[int, str]]:
         if text is None or not any(h in text for h in _EMBEDDED_HINTS):
             continue
         try:
-            sub = ast.parse(text)
+            # dedent so a uniformly-indented embedded script (common when the
+            # literal sits inside an indented block) still parses as Python.
+            sub = ast.parse(textwrap.dedent(text))
         except SyntaxError:
             continue  # not Python (prose, JS, a fragment) — not an embedded script
-        if _call_violations(sub, _configparser_names(sub)):
+        sub_ctor = _configparser_ctor_names(sub)
+        if _call_violations(sub, _configparser_names(sub, sub_ctor), sub_ctor):
             out.append((node.lineno, "open(embedded)"))
     return out
 
@@ -202,7 +231,14 @@ def scan_package(pkg: Path, allow: frozenset[str] | set[str] = ALLOWLIST) -> lis
     return hits
 
 
+# Every first-party package shipped from this repo (each scanned against its own
+# parent so the reported path stays package-relative).
+def owned_packages() -> list[Path]:
+    repo = Path(__file__).resolve().parents[1]
+    return [repo / "omnigent", repo / "sdks" / "python-client" / "omnigent_client"]
+
+
 if __name__ == "__main__":
-    root = Path(__file__).resolve().parents[1] / "omnigent"
-    for h in scan_package(root, ALLOWLIST):
-        print(h)
+    for pkg in owned_packages():
+        for h in scan_package(pkg, ALLOWLIST):
+            print(h)
