@@ -39,12 +39,16 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from omnigent._platform import stable_user_id
+
 _logger = logging.getLogger(__name__)
 
 #: Env var carrying the bridge dir into the harness executor process.
 BRIDGE_DIR_ENV_VAR = "HARNESS_HERMES_NATIVE_BRIDGE_DIR"
 
-_BRIDGE_ROOT = Path(os.environ.get("TMPDIR", "/tmp")) / f"omnigent-{os.getuid()}" / "hermes-native"
+_BRIDGE_ROOT = (
+    Path(os.environ.get("TMPDIR", "/tmp")) / f"omnigent-{stable_user_id()}" / "hermes-native"
+)
 _TMUX_FILE = "tmux.json"
 _TMUX_READY_TIMEOUT_S = 30.0
 _TMUX_SEND_TIMEOUT_S = 10.0
@@ -297,6 +301,7 @@ def write_policy_hook_config(
     bridge_dir: Path,
     server_url: str,
     session_id: str,
+    hermes_home: Path | None = None,
 ) -> Path:
     """Write per-session ``HERMES_HOME`` with Omnigent policy hook and MCP server.
 
@@ -305,21 +310,32 @@ def write_policy_hook_config(
     1. A ``pre_tool_call`` shell hook that evaluates tool calls against the
        Omnigent policy engine (same hook the headless ``hermes`` harness uses).
     2. An ``mcp_servers.omnigent`` entry that launches the Omnigent MCP stdio
-       server (``serve-mcp``), exposing Omnigent builtin tools
-       (``sys_session_*``, ``sys_agent_*``, ``load_skill``, ``web_fetch``, etc.)
-       to the Hermes model.
+       server (``serve-mcp --bridge-dir <bridge_dir>``), exposing Omnigent
+       builtin tools (``sys_session_*``, ``sys_agent_*``, ``load_skill``,
+       ``web_fetch``, etc.) to the Hermes model.
 
-    Also copies the user's auth/env files so the TUI can still authenticate
-    with its inference provider. Mirrors
-    :func:`omnigent.inner.hermes_executor._populate_hermes_home`.
+    Also copies the user's auth/env files so Hermes can still authenticate with
+    its inference provider. Shared by the ``hermes-native`` TUI path and the
+    headless ``hermes`` executor. The credential-bearing HERMES_HOME and the
+    runner-shared bridge dir are separable: ``bridge_dir`` (predictable, holds
+    only ``bridge.json`` + the relay's ``tool_relay.json``) is the rendezvous
+    the runner and ``serve-mcp`` agree on, while ``hermes_home`` may be a
+    private tempdir so the copied ``.env`` / ``auth.json`` never land on the
+    predictable path. Defaults to ``bridge_dir/hermes_home`` when unset.
 
-    :param bridge_dir: Per-session bridge dir (parent of the HERMES_HOME).
+    :param bridge_dir: Per-session bridge dir (runner<->serve-mcp rendezvous).
     :param server_url: Omnigent server base URL.
     :param session_id: Omnigent session / conversation ID.
+    :param hermes_home: Where to write the credential-bearing home. ``None``
+        places it under ``bridge_dir``.
     :returns: The HERMES_HOME path.
     """
-    hermes_home = bridge_dir / _HERMES_HOME_SUBDIR
-    hermes_home.mkdir(parents=True, exist_ok=True)
+    if hermes_home is None:
+        hermes_home = bridge_dir / _HERMES_HOME_SUBDIR
+    _ensure_dir(bridge_dir)
+    # Owner-only: the home holds the copied .env / auth.json credentials and the
+    # token-bearing hook wrapper.
+    _ensure_dir(hermes_home)
 
     hook_script_path = str(Path(__file__).resolve().parent / "inner" / "hermes_policy_hook.py")
 

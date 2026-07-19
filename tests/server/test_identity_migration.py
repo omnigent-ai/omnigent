@@ -113,8 +113,8 @@ def test_remap_repoints_comments_policies_tokens_hosts(db_uri: str) -> None:
     with Session(engine) as s:
         s.add(
             SqlComment(
-                id="cmt_1",
-                conversation_id="conv_x",
+                id="747618b4b2dd94383e50ddf180ceddc3",
+                conversation_id="8af356d908005a65f872c246158c6293",
                 path="a.py",
                 start_index=0,
                 end_index=1,
@@ -128,7 +128,7 @@ def test_remap_repoints_comments_policies_tokens_hosts(db_uri: str) -> None:
         )
         s.add(
             SqlPolicy(
-                id="pol_1",
+                id="12a6858438cb1aa1b9e00dc79bb04dd9",
                 name="p",
                 session_id=None,
                 scope=encode_policy_scope("default"),
@@ -152,7 +152,7 @@ def test_remap_repoints_comments_policies_tokens_hosts(db_uri: str) -> None:
             SqlHost(
                 owner="alice",
                 name="laptop",
-                host_id="h1",
+                host_id="a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
                 status=encode_host_status("offline"),
                 created_at=1,
                 updated_at=1,
@@ -163,8 +163,14 @@ def test_remap_repoints_comments_policies_tokens_hosts(db_uri: str) -> None:
     remap_identities(engine, {"alice": "alice@example.com"}, dry_run=False)
 
     with Session(engine) as s:
-        assert s.get(SqlComment, (0, "cmt_1")).created_by == "alice@example.com"
-        assert s.get(SqlPolicy, (0, "pol_1")).created_by == "alice@example.com"
+        assert (
+            s.get(SqlComment, (0, "747618b4b2dd94383e50ddf180ceddc3")).created_by
+            == "alice@example.com"
+        )
+        assert (
+            s.get(SqlPolicy, (0, "12a6858438cb1aa1b9e00dc79bb04dd9")).created_by
+            == "alice@example.com"
+        )
         assert s.get(SqlAccountToken, (0, "tok_1")).created_by == "alice@example.com"
         host_owners = s.execute(select(SqlHost.owner)).scalars().all()
         assert host_owners == ["alice@example.com"]

@@ -30,6 +30,8 @@ from omnigent.host.frames import (
     HostCreateDirResultFrame,
     HostCreateWorktreeFrame,
     HostCreateWorktreeResultFrame,
+    HostFsRequestFrame,
+    HostFsResultFrame,
     HostHelloFrame,
     HostLaunchRunnerFrame,
     HostLaunchRunnerResultFrame,
@@ -41,6 +43,8 @@ from omnigent.host.frames import (
     HostRemoveWorktreeFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
+    HostRunnerStatusFrame,
+    HostRunnerStatusResultFrame,
     HostStatFrame,
     HostStatResultFrame,
     HostStopRunnerFrame,
@@ -59,6 +63,14 @@ from omnigent.onboarding.harness_install import harness_setup_hint
 from omnigent.onboarding.harness_readiness import (
     configured_harness_map,
     harness_is_configured,
+)
+from omnigent.process_logging import (
+    LOG_TTY_FD_ENV_VAR,
+    PROCESS_LOG_FILE_ENV_VAR,
+    child_logging_popen_kwargs,
+    configure_process_logging,
+    open_process_log_file,
+    process_log_dir,
 )
 from omnigent.runner.identity import (
     RUNNER_ID_ENV_VAR,
@@ -90,17 +102,17 @@ def _runner_log_dir() -> Path:
     (not a module constant) so tests that repoint ``Path.home`` see the
     override.
 
-    :returns: The host-runner log directory, e.g.
-        ``Path.home() / ".omnigent" / "logs" / "host-runner"``.
+    :returns: The runner log directory, e.g.
+        ``<data-dir>/logs/runner``.
     """
-    return Path.home() / ".omnigent" / "logs" / "host-runner"
+    return process_log_dir("runner")
 
 
 def _display_log_path(path: Path) -> str:
     """Format a log path for display, collapsing the home prefix to ``~``.
 
     :param path: Absolute path, typically under the user's state dir, e.g.
-        ``Path("/Users/alice/.omnigent/logs/host-runner/runner-ab12.log")``.
+        ``Path("/Users/alice/.omnigent/logs/runner/runner-ab12.log")``.
     :returns: ``"~/.omnigent/..."`` when *path* is under ``$HOME``,
         otherwise ``str(path)``.
     """
@@ -171,7 +183,7 @@ def _read_log_tail(path: Path, max_bytes: int = _LOG_TAIL_MAX_BYTES) -> str:
     """Read the last portion of a runner log file for diagnostics.
 
     :param path: The runner's captured stdout/stderr log file, e.g.
-        ``Path("~/.omnigent/logs/host-runner/runner-ab12.log")``.
+        ``Path("~/.omnigent/logs/runner/runner-ab12.log")``.
     :param max_bytes: Max bytes to read from the end of the file,
         e.g. ``4096``.
     :returns: The decoded tail (lossy UTF-8 — runner output may
@@ -323,6 +335,10 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # alias, still propagated so existing setups keep working.
         "OMNIGENT_AUTH_ENABLED",
         "OMNIGENT_ACCOUNTS_ENABLED",
+        # Process logging controls. These are diagnostics knobs, not secrets.
+        "OMNIGENT_LOG_LEVEL",
+        "OMNIGENT_LOG_TO_STDERR",
+        LOG_TTY_FD_ENV_VAR,
         # Secret-store backend selector. The CLI's `configure harnesses` stores
         # pasted API keys via the file backend when this is set (headless /
         # locked-keyring hosts), writing `keychain:<name>` refs. The runner
@@ -602,7 +618,7 @@ class _RunnerHandle:
 
     :param proc: The runner subprocess handle.
     :param log_path: File capturing the runner's stdout/stderr, e.g.
-        ``Path("~/.omnigent/logs/host-runner/runner-ab12.log")``.
+        ``Path("~/.omnigent/logs/runner/runner-ab12.log")``.
         Read back for diagnostics when the runner dies before
         connecting its tunnel.
     """
@@ -1066,39 +1082,39 @@ class HostProcess:
         )
 
         try:
-            log_dir = _runner_log_dir()
-            log_dir.mkdir(parents=True, exist_ok=True)
             # Embed the session id so operators can find all logs for a
             # session with `omnigent debug logs --session <id>`. Cap at 32
             # chars to keep filenames manageable; strip anything non-word to
             # guard against unexpected id shapes from older servers.
             import re
-            import tempfile
 
             _session_slug = (
                 re.sub(r"[^\w-]", "", frame.session_id)[:32] + "-" if frame.session_id else ""
             )
-            _log_fd, _log_name = tempfile.mkstemp(
+            log_path, _log_fh = open_process_log_file(
+                "runner",
                 prefix=f"runner-{_session_slug}",
-                suffix=".log",
-                dir=log_dir,
             )
-            _log_fh = os.fdopen(_log_fd, "wb")
-            proc = subprocess.Popen(
-                [sys.executable, "-m", "omnigent.runner._entry"],
-                env=env,
-                # Runners are WS-tunnel clients with no interactive input.
-                # Give them a clean /dev/null stdin instead of inheriting the
-                # daemon's: a long-lived daemon (e.g. backgrounded / nohup'd)
-                # can end up with a closed or recycled stdin fd, and an
-                # inherited bad fd makes the runner die at interpreter startup
-                # with "init_sys_streams: Bad file descriptor" — it never
-                # connects, so the session fails with "runner did not connect".
-                stdin=subprocess.DEVNULL,
-                stdout=_log_fh,
-                stderr=_log_fh,
-            )
-            _log_fh.close()
+            env[PROCESS_LOG_FILE_ENV_VAR] = str(log_path)
+            try:
+                with child_logging_popen_kwargs(env) as logging_kwargs:
+                    proc = subprocess.Popen(
+                        [sys.executable, "-m", "omnigent.runner._entry"],
+                        env=env,
+                        # Runners are WS-tunnel clients with no interactive input.
+                        # Give them a clean /dev/null stdin instead of inheriting the
+                        # daemon's: a long-lived daemon (e.g. backgrounded / nohup'd)
+                        # can end up with a closed or recycled stdin fd, and an
+                        # inherited bad fd makes the runner die at interpreter startup
+                        # with "init_sys_streams: Bad file descriptor" — it never
+                        # connects, so the session fails with "runner did not connect".
+                        stdin=subprocess.DEVNULL,
+                        stdout=_log_fh,
+                        stderr=_log_fh,
+                        **logging_kwargs,
+                    )
+            finally:
+                _log_fh.close()
         except OSError as exc:
             return HostLaunchRunnerResultFrame(
                 request_id=frame.request_id,
@@ -1106,7 +1122,6 @@ class HostProcess:
                 error=f"failed to spawn runner: {exc}",
             )
 
-        log_path = Path(_log_name)
         if proc.poll() is not None:
             # The runner died before Popen returned — its actual error
             # is in the captured log, so ship the tail with the result
@@ -1176,6 +1191,37 @@ class HostProcess:
         return HostStopRunnerResultFrame(
             request_id=frame.request_id,
             status="stopped",
+        )
+
+    def _handle_runner_status(
+        self,
+        frame: HostRunnerStatusFrame,
+    ) -> HostRunnerStatusResultFrame:
+        """Answer whether a runner's process is alive, dead, or unknown.
+
+        The host is the authoritative owner of runner liveness: it holds
+        the runner's :class:`subprocess.Popen`. A runner tracked with a
+        still-running process is ``alive`` (covers a runner that is still
+        booting — it is inserted at ``Popen`` time, before its tunnel
+        connects — so the server waits for it). A tracked-but-exited
+        process is ``dead``. A runner this host has no record of is
+        ``unknown`` — it was stopped (``_handle_stop`` popped it) or a
+        fresh post-restart host never spawned it; either way it will never
+        connect, so the server relaunches without waiting.
+
+        :param frame: The status query frame.
+        :returns: Result frame with ``alive`` / ``dead`` / ``unknown``.
+        """
+        handle = self._runners.get(frame.runner_id)
+        if handle is None:
+            status = "unknown"
+        elif handle.proc.poll() is None:
+            status = "alive"
+        else:
+            status = "dead"
+        return HostRunnerStatusResultFrame(
+            request_id=frame.request_id,
+            status=status,
         )
 
     async def _watch_runner(self, runner_id: str) -> None:
@@ -1473,6 +1519,120 @@ class HostProcess:
             status="ok",
             path=created,
         )
+
+    def _handle_fs_request(self, frame: HostFsRequestFrame) -> HostFsResultFrame:
+        """Serve a read-only workspace filesystem request from the host.
+
+        Runs :class:`omnigent.workspace_fs.WorkspaceReader` against the
+        session's workspace so the web UI's file panel keeps working when
+        the runner is offline but the host still holds the workspace on
+        disk. Read-only and confined to the workspace root; never writes
+        or runs a shell. Called inside a worker thread by the dispatcher
+        because git / directory-walk work can block.
+
+        :param frame: The fs request frame (op + workspace + params).
+        :returns: A result frame with the runner-shaped payload, or an
+            error frame mirroring the status the runner would return.
+        """
+        from pathlib import Path
+
+        from omnigent.workspace_fs import WorkspaceReader, WorkspaceReaderError
+
+        try:
+            expanded = os.path.expanduser(frame.workspace)
+        except (TypeError, ValueError) as exc:
+            return HostFsResultFrame(
+                request_id=frame.request_id,
+                status="error",
+                error_status=400,
+                error_code="invalid_workspace",
+                error=f"workspace path expansion failed: {exc}",
+            )
+        if not os.path.isdir(expanded):
+            return HostFsResultFrame(
+                request_id=frame.request_id,
+                status="error",
+                error_status=404,
+                error_code="not_found",
+                error="workspace directory does not exist on host",
+            )
+
+        reader = WorkspaceReader(Path(expanded))
+        params = frame.params or {}
+        try:
+            payload = self._dispatch_fs_op(reader, frame.op, frame.session_id, params)
+        except WorkspaceReaderError as exc:
+            return HostFsResultFrame(
+                request_id=frame.request_id,
+                status="error",
+                error_status=exc.status,
+                error_code=exc.code,
+                error=exc.message,
+            )
+        except ValueError as exc:
+            return HostFsResultFrame(
+                request_id=frame.request_id,
+                status="error",
+                error_status=400,
+                error_code="invalid_request",
+                error=str(exc),
+            )
+        except Exception as exc:
+            _logger.exception("host fs_request op %r failed", frame.op)
+            return HostFsResultFrame(
+                request_id=frame.request_id,
+                status="error",
+                error_status=500,
+                error_code="fs_read_failed",
+                error=str(exc),
+            )
+        return HostFsResultFrame(
+            request_id=frame.request_id,
+            status="ok",
+            payload=payload,
+        )
+
+    @staticmethod
+    def _dispatch_fs_op(
+        reader: object,
+        op: str,
+        session_id: str,
+        params: dict[str, object],
+    ) -> dict[str, object]:
+        """Route an fs op to the matching :class:`WorkspaceReader` method.
+
+        :param reader: The workspace reader bound to the workspace root.
+        :param op: Operation name from the request frame.
+        :param session_id: Session id forwarded to change-registry ops.
+        :param params: Operation-specific arguments.
+        :returns: The runner-shaped result dict.
+        :raises ValueError: On an unknown op.
+        """
+        from typing import cast
+
+        from omnigent.workspace_fs import WorkspaceReader
+
+        r = cast("WorkspaceReader", reader)
+        if op == "list_or_read":
+            return r.list_or_read(
+                str(params.get("path", "")),
+                limit=int(params.get("limit", 20)),
+                after=cast("str | None", params.get("after")),
+                before=cast("str | None", params.get("before")),
+                order=str(params.get("order", "desc")),
+            )
+        if op == "changes":
+            return r.changes(session_id)
+        if op == "diff":
+            return r.diff(session_id, str(params.get("path", "")))
+        if op == "search":
+            return r.search(
+                str(params.get("q", "")),
+                include=cast("str | None", params.get("include")),
+                exclude=cast("str | None", params.get("exclude")),
+                limit=int(params.get("limit", 500)),
+            )
+        raise ValueError(f"unknown fs op: {op!r}")
 
     async def _handle_create_worktree(
         self,
@@ -1826,6 +1986,21 @@ class HostProcess:
         :raises Exception: On WebSocket disconnect or error — propagated
             to the reconnect loop in :meth:`run`.
         """
+        _tel_opt_out = False
+        try:
+            from omnigent.telemetry.client import is_disabled as _tel_disabled
+
+            _tel_opt_out = _tel_disabled()
+        except Exception:  # noqa: BLE001 — telemetry errors must not abort hello
+            pass
+        _tel_install_id: str | None = None
+        try:
+            from omnigent.telemetry.installation_id import get_installation_id as _get_install_id
+
+            if not _tel_opt_out:
+                _tel_install_id = _get_install_id()
+        except Exception:  # noqa: BLE001
+            pass
         hello = HostHelloFrame(
             version=VERSION,
             frame_protocol_version=1,
@@ -1836,6 +2011,8 @@ class HostProcess:
             # the server's view refreshes whenever the tunnel does; the
             # launch-time check above stays the authoritative gate.
             configured_harnesses=await asyncio.to_thread(configured_harness_map),
+            telemetry_opt_out=_tel_opt_out,
+            installation_id=_tel_install_id,
         )
         await ws.send(encode_host_frame(hello))
         self._ws = ws
@@ -1924,6 +2101,8 @@ class HostProcess:
             await ws.send(encode_host_frame(await self._handle_launch(frame)))
         elif isinstance(frame, HostStopRunnerFrame):
             await ws.send(encode_host_frame(self._handle_stop(frame)))
+        elif isinstance(frame, HostRunnerStatusFrame):
+            await ws.send(encode_host_frame(self._handle_runner_status(frame)))
         elif isinstance(frame, HostStatFrame):
             await ws.send(encode_host_frame(self._handle_stat(frame)))
         elif isinstance(frame, HostListDirFrame):
@@ -1936,6 +2115,11 @@ class HostProcess:
             await ws.send(encode_host_frame(await self._handle_remove_worktree(frame)))
         elif isinstance(frame, HostListWorktreesFrame):
             await ws.send(encode_host_frame(await self._handle_list_worktrees(frame)))
+        elif isinstance(frame, HostFsRequestFrame):
+            # Git status and directory walks can block, so run the read
+            # off the event loop and reply when it completes.
+            result = await asyncio.to_thread(self._handle_fs_request, frame)
+            await ws.send(encode_host_frame(result))
 
 
 def run_host_process(
@@ -1955,6 +2139,7 @@ def run_host_process(
         (auth / authorization / outdated server). The
         actionable cause is printed to stderr first.
     """
+    host_log_path = configure_process_logging("host")
     # Initialize tracing so the host daemon exports its own spans
     # (e.g. handling launch_runner / stat / list_dir frames) into the
     # same distributed trace as the server that requested them. The
@@ -1972,17 +2157,16 @@ def run_host_process(
     print(f"Connecting to {server_url} as {identity.name!r} ({identity.host_id})")
     # Tell the user where logs land up front — `omnigent host` used to run
     # silently, so a stuck/quiet host gave no hint where to look. Session
-    # work goes to per-runner files under the host-runner dir (the exact
-    # file is printed when each runner launches). The foreground process's
-    # own diagnostics (warnings, tracebacks) go to the always-on cli-*.log;
-    # that path is None in the background daemon (no setup_cli_logging) —
-    # its stdout is already captured to the daemon log, so skip the line.
+    # work goes to per-runner files under the runner dir (the exact
+    # file is printed when each runner launches). The host process's
+    # own diagnostics go to the host destination.
     print(f"Session logs: {_display_log_path(_runner_log_dir())}/")
+    print(f"This host's log: {_display_log_path(host_log_path)}")
     from omnigent.cli_diagnostics import current_cli_log_path
 
     _cli_log = current_cli_log_path()
-    if _cli_log is not None:
-        print(f"This host's log: {_display_log_path(_cli_log)}")
+    if _cli_log is not None and _cli_log != host_log_path:
+        print(f"CLI diagnostics: {_display_log_path(_cli_log)}")
 
     host = HostProcess(identity, server_url)
     try:

@@ -3,14 +3,14 @@ Islo sandbox launcher.
 
 Implements :class:`~omnigent.onboarding.sandboxes.base.SandboxLauncher`
 for `Islo <https://islo.dev>`_ sandboxes. The integration talks to the
-Islo HTTP API directly through ``httpx`` (already a base Omnigent
-dependency), so there is no provider SDK extra to install.
+Islo Python SDK for lifecycle, auth refresh, and blocking execs. A small
+raw HTTP path remains for the SSE stream and file upload endpoints because
+Omnigent's bootstrap needs interactive streaming output.
 
 Platform notes that shape this launcher:
 
-- **API-key auth.** ``ISLO_API_KEY`` is exchanged for a short-lived
-  session token via ``POST /auth/token``. The token is cached until
-  shortly before expiry, mirroring Islo's Go SDK.
+- **API-key auth.** ``ISLO_API_KEY`` is passed to the SDK, which exchanges
+  it for short-lived session tokens and refreshes them automatically.
 - **Prebaked host image.** Like Modal and Daytona, sandboxes boot from
   the official Omnigent host image unless overridden. That keeps
   server-managed launches fast.
@@ -28,12 +28,12 @@ import queue
 import re
 import shlex
 import threading
-import time
 import uuid
 from collections.abc import Callable, Iterator, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar
-from urllib.parse import quote, urlencode
+from urllib.parse import quote
 
 import click
 import httpx
@@ -62,10 +62,18 @@ SANDBOX_ENV_PASSTHROUGH_ENV_VAR: str = "OMNIGENT_ISLO_SANDBOX_ENV"
 into created Islo sandboxes."""
 
 _DEFAULT_BASE_URL = "https://api.islo.dev"
-_TOKEN_REFRESH_MARGIN_S = 60.0
 _SANDBOX_CPU = 2
 _SANDBOX_MEMORY_MB = 4096
+DEFAULT_IDLE_PAUSE_AFTER_S = 15 * 60
 _REQUEST_TIMEOUT_S = 30.0
+_STREAM_TIMEOUT_S = None
+_RUNNING_STATUSES = frozenset({"running", "ready"})
+_RESUMABLE_STATUSES = frozenset({"paused", "stopped"})
+_NON_RESUMABLE_STATUSES = frozenset({"deleted", "deleting", "failed", "error"})
+_INSTALL_HINT = (
+    "The Islo sandbox provider requires the optional Islo SDK. Install it with "
+    "`pip install 'omnigent[islo]'` or `uv tool install 'omnigent[islo]'`."
+)
 
 # Claude credentials a user injects via sandbox env passthrough that must win
 # over the gateway ``apiKeyHelper`` Islo pre-seeds into every sandbox. When one
@@ -88,48 +96,184 @@ if isinstance(settings, dict) and settings.pop("apiKeyHelper", None) is not None
         json.dump(settings, handle, indent=2)
 """
 
+_STOP_PRESERVED_HOST_DAEMON_SCRIPT = """\
+import os, signal, subprocess, time
+
+self_pids = {os.getpid(), os.getppid()}
+try:
+    output = subprocess.check_output(["ps", "-eo", "pid=,args="], text=True)
+except Exception as exc:
+    print(f"could not inspect process table: {exc}")
+    raise SystemExit(0)
+
+targets = []
+for line in output.splitlines():
+    parts = line.strip().split(None, 1)
+    if len(parts) != 2:
+        continue
+    try:
+        pid = int(parts[0])
+    except ValueError:
+        continue
+    args = parts[1]
+    if pid in self_pids:
+        continue
+    if "omnigent host" in args:
+        targets.append(pid)
+
+for pid in targets:
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    except PermissionError as exc:
+        print(f"could not terminate preserved omnigent host pid {pid}: {exc}")
+
+time.sleep(0.5)
+for pid in targets:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        continue
+    except PermissionError:
+        continue
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+if targets:
+    print(f"stopped preserved omnigent host daemon(s): {', '.join(map(str, targets))}")
+"""
+
 
 class _IsloAPIError(RuntimeError):
     """Provider-boundary error with a user-facing message."""
 
 
+@dataclass(frozen=True)
+class _IsloSDK:
+    """Lazy-loaded SDK symbols used by the launcher."""
+
+    islo_cls: type[Any]
+    api_error_cls: type[Exception]
+    exec_and_wait_sync: Callable[..., Any]
+
+
+def _load_islo_sdk() -> _IsloSDK:
+    """
+    Import the optional Islo SDK at use time.
+
+    The launcher module is importable without ``omnigent[islo]`` installed;
+    users only need the extra when they actually select the Islo provider.
+    """
+    try:
+        from islo import Islo
+        from islo.core.api_error import ApiError
+        from islo.custom.exec import exec_and_wait_sync
+    except ImportError as exc:
+        raise click.ClickException(_INSTALL_HINT) from exc
+    return _IsloSDK(
+        islo_cls=Islo,
+        api_error_cls=ApiError,
+        exec_and_wait_sync=exec_and_wait_sync,
+    )
+
+
 class _IsloClient:
-    """Small synchronous Islo HTTP API client."""
+    """Small synchronous adapter around the Islo Python SDK."""
 
     def __init__(self, *, base_url: str, api_key: str) -> None:
-        self._base_url = base_url.rstrip("/")
-        self._api_key = api_key
-        self._client = httpx.Client(timeout=_REQUEST_TIMEOUT_S)
-        self._token: str | None = None
-        self._token_expires_at = 0.0
+        sdk = _load_islo_sdk()
+        self._api_error_cls = sdk.api_error_cls
+        self._exec_and_wait_sync = sdk.exec_and_wait_sync
+        self._client = sdk.islo_cls(
+            api_key=api_key,
+            base_url=base_url.rstrip("/"),
+            timeout=_REQUEST_TIMEOUT_S,
+        )
 
     def close(self) -> None:
-        """Close the underlying HTTP connection pool."""
-        self._client.close()
+        """Close the SDK's underlying HTTP connection pool when possible."""
+        try:
+            self._client._client_wrapper.httpx_client.httpx_client.close()
+        except AttributeError:
+            return
 
     def create_sandbox(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Create a sandbox and return the response object."""
-        return self._request_json("POST", "/sandboxes/", json=payload)
+        try:
+            sandbox = self._client.sandboxes.create_sandbox(**payload)
+        except Exception as exc:
+            raise self._sdk_error("create sandbox", exc) from exc
+        return _object_dict(sandbox)
 
     def get_sandbox(self, name: str) -> dict[str, Any]:
         """Fetch a sandbox by name."""
-        return self._request_json("GET", f"/sandboxes/{_url_component(name)}")
+        try:
+            sandbox = self._client.sandboxes.get_sandbox(name)
+        except Exception as exc:
+            raise self._sdk_error(f"get sandbox '{name}'", exc) from exc
+        return _object_dict(sandbox)
 
     def delete_sandbox(self, name: str) -> None:
         """Delete a sandbox by name. Missing sandboxes are treated as gone."""
         try:
-            self._request("DELETE", f"/sandboxes/{_url_component(name)}")
-        except _IsloAPIError as exc:
-            if "HTTP 404" not in str(exc):
-                raise
+            self._client.sandboxes.delete_sandbox(name)
+        except Exception as exc:
+            if self._is_not_found(exc):
+                return
+            raise self._sdk_error(f"delete sandbox '{name}'", exc) from exc
+
+    def resume_sandbox(self, name: str) -> dict[str, Any]:
+        """Resume a paused/stopped sandbox and return the refreshed object."""
+        try:
+            sandbox = self._client.sandboxes.resume_sandbox(name)
+        except Exception as exc:
+            raise self._sdk_error(f"resume sandbox '{name}'", exc) from exc
+        return _object_dict(sandbox)
 
     def upload_file(self, name: str, local_path: Path, remote_path: str) -> None:
         """Upload one file to an absolute path in the sandbox."""
-        params = urlencode({"path": remote_path})
-        endpoint = f"/sandboxes/{_url_component(name)}/files?{params}"
-        with local_path.open("rb") as file_obj:
-            files = {"file": (local_path.name, file_obj, "application/octet-stream")}
-            self._request("POST", endpoint, files=files)
+        wrapper = self._client._client_wrapper
+        try:
+            with local_path.open("rb") as file_obj:
+                response = wrapper.httpx_client.request(
+                    f"sandboxes/{_url_component(name)}/files",
+                    base_url=wrapper.get_environment().compute,
+                    method="POST",
+                    params={"path": remote_path},
+                    files={"file": (local_path.name, file_obj, "application/octet-stream")},
+                )
+        except (OSError, httpx.HTTPError) as exc:
+            raise _IsloAPIError(f"islo file upload failed: {exc}") from exc
+        if response.status_code >= 400:
+            raise self._response_error("POST", f"/sandboxes/{name}/files", response)
+
+    def exec(
+        self,
+        name: str,
+        command: Sequence[str],
+        *,
+        workdir: str | None = None,
+        env: dict[str, str] | None = None,
+    ) -> tuple[int, str, str]:
+        """Execute a command through the SDK helper and wait for completion."""
+        try:
+            result = self._exec_and_wait_sync(
+                self._client,
+                name,
+                list(command),
+                workdir=workdir,
+                env=env,
+            )
+        except Exception as exc:
+            raise self._sdk_error(f"exec in sandbox '{name}'", exc) from exc
+        return (
+            int(getattr(result, "exit_code", -1)),
+            str(getattr(result, "stdout", "") or ""),
+            str(getattr(result, "stderr", "") or ""),
+        )
 
     def exec_stream(
         self,
@@ -147,16 +291,18 @@ class _IsloClient:
             body["workdir"] = workdir
         if env:
             body["env"] = env
-        headers = self._auth_headers()
+        wrapper = self._client._client_wrapper
+        headers = wrapper.get_headers()
         headers["Accept"] = "text/event-stream"
-        url = self._url(f"/sandboxes/{_url_component(name)}/exec/stream")
+        compute_url = wrapper.get_environment().compute.rstrip("/")
+        url = f"{compute_url}/sandboxes/{_url_component(name)}/exec/stream"
         try:
-            with self._client.stream(
+            with wrapper.httpx_client.httpx_client.stream(
                 "POST",
                 url,
                 headers=headers,
                 json=body,
-                timeout=None,
+                timeout=_STREAM_TIMEOUT_S,
             ) as response:
                 if response.status_code >= 400:
                     raise self._response_error("POST", url, response)
@@ -167,65 +313,6 @@ class _IsloClient:
                 )
         except httpx.HTTPError as exc:
             raise _IsloAPIError(f"islo exec stream failed: {exc}") from exc
-
-    def _request_json(self, method: str, endpoint: str, **kwargs: Any) -> dict[str, Any]:
-        response = self._request(method, endpoint, **kwargs)
-        try:
-            data = response.json()
-        except ValueError as exc:
-            raise _IsloAPIError(f"islo {method} {endpoint} returned invalid JSON") from exc
-        if not isinstance(data, dict):
-            raise _IsloAPIError(f"islo {method} {endpoint} returned a non-object response")
-        return data
-
-    def _request(self, method: str, endpoint: str, **kwargs: Any) -> httpx.Response:
-        url = self._url(endpoint)
-        headers = kwargs.pop("headers", None) or {}
-        headers = {**headers, **self._auth_headers()}
-        try:
-            response = self._client.request(method, url, headers=headers, **kwargs)
-        except httpx.HTTPError as exc:
-            raise _IsloAPIError(f"islo {method} {endpoint} failed: {exc}") from exc
-        if response.status_code >= 400:
-            raise self._response_error(method, endpoint, response)
-        return response
-
-    def _auth_headers(self) -> dict[str, str]:
-        return {"Authorization": f"Bearer {self._session_token()}"}
-
-    def _session_token(self) -> str:
-        now = time.time()
-        if self._token is not None and now < self._token_expires_at:
-            return self._token
-        try:
-            response = self._client.post(
-                self._url("/auth/token"),
-                json={"access_key": self._api_key},
-                timeout=_REQUEST_TIMEOUT_S,
-            )
-        except httpx.HTTPError as exc:
-            raise _IsloAPIError(f"islo token exchange failed: {exc}") from exc
-        if response.status_code >= 400:
-            raise self._response_error("POST", "/auth/token", response)
-        try:
-            data = response.json()
-        except ValueError as exc:
-            raise _IsloAPIError("islo token exchange returned invalid JSON") from exc
-        token = data.get("session_token") if isinstance(data, dict) else None
-        if not isinstance(token, str) or not token:
-            raise _IsloAPIError("islo token exchange response missing session_token")
-        max_age = data.get("cookie_max_age", 0) if isinstance(data, dict) else 0
-        ttl = (
-            max(float(max_age) - _TOKEN_REFRESH_MARGIN_S, 0.0)
-            if isinstance(max_age, (int, float))
-            else 0.0
-        )
-        self._token = token
-        self._token_expires_at = now + ttl
-        return token
-
-    def _url(self, endpoint: str) -> str:
-        return self._base_url + endpoint
 
     def _response_error(
         self, method: str, endpoint: str, response: httpx.Response
@@ -239,6 +326,20 @@ class _IsloClient:
         return _IsloAPIError(
             f"islo {method} {endpoint} failed with HTTP {response.status_code}{detail}"
         )
+
+    def _is_not_found(self, exc: BaseException) -> bool:
+        return isinstance(exc, self._api_error_cls) and getattr(exc, "status_code", None) == 404
+
+    def _sdk_error(self, action: str, exc: BaseException) -> _IsloAPIError:
+        if isinstance(exc, _IsloAPIError):
+            return exc
+        if isinstance(exc, self._api_error_cls):
+            status = getattr(exc, "status_code", None)
+            body = getattr(exc, "body", None)
+            status_text = f" with HTTP {status}" if status is not None else ""
+            detail = f": {body}" if body else ""
+            return _IsloAPIError(f"islo {action} failed{status_text}{detail}")
+        return _IsloAPIError(f"islo {action} failed: {exc}")
 
 
 class _IsloRemoteProcess(RemoteProcess):
@@ -305,6 +406,7 @@ class IsloSandboxLauncher(SandboxLauncher):
 
     provider: ClassVar[str] = "islo"
     supports_local_port_forward: ClassVar[bool] = False
+    can_resume: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -318,6 +420,7 @@ class IsloSandboxLauncher(SandboxLauncher):
         vcpus: int | None = None,
         memory_mb: int | None = None,
         disk_gb: int | None = None,
+        idle_pause_after_s: int | None = DEFAULT_IDLE_PAUSE_AFTER_S,
     ) -> None:
         self._image_ref = image
         self._env_names = tuple(env) if env is not None else None
@@ -328,6 +431,7 @@ class IsloSandboxLauncher(SandboxLauncher):
         self._vcpus = vcpus
         self._memory_mb = memory_mb
         self._disk_gb = disk_gb
+        self._idle_pause_after_s = idle_pause_after_s
         self._client: _IsloClient | None = None
 
     def prepare(self) -> None:
@@ -337,6 +441,7 @@ class IsloSandboxLauncher(SandboxLauncher):
                 "No Islo credentials found. Create an API key at "
                 "https://islo.dev and set ISLO_API_KEY."
             )
+        _load_islo_sdk()
 
     def provision(self, name: str) -> str:
         """Create a new Islo sandbox from the host image."""
@@ -360,6 +465,11 @@ class IsloSandboxLauncher(SandboxLauncher):
             payload["snapshot_name"] = self._snapshot_name
         if self._disk_gb is not None:
             payload["disk_gb"] = self._disk_gb
+        if self._idle_pause_after_s is not None:
+            payload["lifecycle"] = {
+                "pause_after_idle": self._idle_pause_after_s,
+                "auto_resume": "never",
+            }
         click.echo(f"▸ Creating Islo sandbox '{sandbox_name}' from {resolved_ref}")
         try:
             sandbox = self._islo().create_sandbox(payload)
@@ -403,6 +513,50 @@ class IsloSandboxLauncher(SandboxLauncher):
         except click.ClickException as exc:
             click.echo(f"  → warning: could not clear seeded apiKeyHelper: {exc}", err=True)
 
+    def start_host(
+        self,
+        sandbox_id: str,
+        *,
+        token: str,
+        host_id: str,
+        host_name: str,
+        server_url: str,
+        repo_url: str | None = None,
+        repo_branch: str | None = None,
+        repo_name: str | None = None,
+        on_stage: Callable[[str], None] | None = None,
+    ) -> str:
+        """Stop any memory-preserved host daemon, then start with a fresh token."""
+        self._stop_preserved_host_daemon(sandbox_id)
+        return super().start_host(
+            sandbox_id,
+            token=token,
+            host_id=host_id,
+            host_name=host_name,
+            server_url=server_url,
+            repo_url=repo_url,
+            repo_branch=repo_branch,
+            repo_name=repo_name,
+            on_stage=on_stage,
+        )
+
+    def _stop_preserved_host_daemon(self, sandbox_id: str) -> None:
+        """
+        Best-effort cleanup for Islo's memory-preserving pause/resume.
+
+        A paused VM can resume with the old ``omnigent host`` process still
+        alive and carrying a stale launch token. Stop it before the shared
+        startup path launches a fresh daemon.
+        """
+        try:
+            self.run(
+                sandbox_id,
+                f"python3 -c {shlex.quote(_STOP_PRESERVED_HOST_DAEMON_SCRIPT)}",
+                check=False,
+            )
+        except click.ClickException as exc:
+            click.echo(f"  → warning: could not stop preserved omnigent host: {exc}", err=True)
+
     def attach(self, sandbox_id: str) -> None:
         """Validate access to an existing Islo sandbox."""
         click.echo(f"▸ Reusing existing Islo sandbox '{sandbox_id}'")
@@ -412,6 +566,52 @@ class IsloSandboxLauncher(SandboxLauncher):
             raise click.ClickException(
                 f"Could not attach to Islo sandbox '{sandbox_id}': {exc}"
             ) from exc
+
+    def resume(self, sandbox_id: str) -> None:
+        """Resume a paused/stopped Islo sandbox in place."""
+        click.echo(f"▸ Resuming Islo sandbox '{sandbox_id}'")
+        try:
+            sandbox = self._islo().get_sandbox(sandbox_id)
+        except _IsloAPIError as exc:
+            raise click.ClickException(
+                f"Could not resume Islo sandbox '{sandbox_id}': {exc}"
+            ) from exc
+        status = str(sandbox.get("status") or "").lower()
+        if status in _RUNNING_STATUSES:
+            click.echo(f"  → sandbox '{sandbox_id}' is already running")
+            return
+        if status in _RESUMABLE_STATUSES:
+            try:
+                self._islo().resume_sandbox(sandbox_id)
+            except _IsloAPIError as exc:
+                raise click.ClickException(
+                    f"Could not resume Islo sandbox '{sandbox_id}': {exc}"
+                ) from exc
+            click.echo(f"  → resumed {sandbox_id}")
+            return
+        if status in _NON_RESUMABLE_STATUSES:
+            raise click.ClickException(
+                f"Islo sandbox '{sandbox_id}' is {status}; it cannot be resumed in place."
+            )
+        raise click.ClickException(
+            f"Islo sandbox '{sandbox_id}' is in unknown state {status!r}; "
+            "it cannot be safely resumed in place."
+        )
+
+    def is_running(self, sandbox_id: str) -> bool | None:
+        """Return whether Islo currently reports the sandbox as running."""
+        try:
+            sandbox = self._islo().get_sandbox(sandbox_id)
+        except _IsloAPIError as exc:
+            raise click.ClickException(
+                f"Could not inspect Islo sandbox '{sandbox_id}': {exc}"
+            ) from exc
+        status = str(sandbox.get("status") or "").lower()
+        if status in _RUNNING_STATUSES:
+            return True
+        if status in _RESUMABLE_STATUSES or status in _NON_RESUMABLE_STATUSES:
+            return False
+        return None
 
     def keep_alive(self, sandbox_id: str) -> None:
         """No local keep-alive setting is exposed by the Islo API."""
@@ -433,18 +633,16 @@ class IsloSandboxLauncher(SandboxLauncher):
                 click.echo(text, nl=False, err=True)
 
         try:
-            returncode = self._islo().exec_stream(
+            returncode, stdout, stderr = self._islo().exec(
                 sandbox_id,
                 ["bash", "-lc", command],
-                on_stdout=_stdout,
-                on_stderr=_stderr,
             )
         except _IsloAPIError as exc:
             raise click.ClickException(
                 f"Remote command failed to execute on Islo sandbox '{sandbox_id}': {exc}"
             ) from exc
-        stdout = "".join(stdout_chunks)
-        stderr = "".join(stderr_chunks)
+        _stdout(stdout)
+        _stderr(stderr)
         if check and returncode != 0:
             raise click.ClickException(
                 f"Remote command failed on Islo sandbox '{sandbox_id}' "
@@ -526,6 +724,21 @@ class IsloSandboxLauncher(SandboxLauncher):
 
 def _url_component(value: str) -> str:
     return quote(value, safe="")
+
+
+def _object_dict(value: Any) -> dict[str, Any]:
+    """Normalize SDK pydantic models and test fakes into plain dicts."""
+    if isinstance(value, dict):
+        return value
+    if hasattr(value, "model_dump"):
+        data = value.model_dump()
+        if isinstance(data, dict):
+            return data
+    if hasattr(value, "dict"):
+        data = value.dict()
+        if isinstance(data, dict):
+            return data
+    raise _IsloAPIError("islo SDK returned a non-object response")
 
 
 def _new_sandbox_name(label: str) -> str:

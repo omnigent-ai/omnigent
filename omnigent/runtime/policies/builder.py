@@ -42,6 +42,7 @@ from omnigent.spec.types import (
     FunctionRef,
     LabelDef,
     LLMConfig,
+    Phase,
     PolicySpec,
 )
 from omnigent.stores.conversation_store import ConversationStore
@@ -231,6 +232,51 @@ def _load_user_daily_cost(
     )
     state["user_id"] = owner
     return state
+
+
+def any_policies_apply(
+    *,
+    spec: AgentSpec,
+    conversation_id: str,
+    default_policies: list[PolicySpec] | None,
+    policy_store: PolicyStore | None,
+    phase: Phase | None = None,
+    tool_name: str | None = None,
+) -> bool:
+    """Return ``True`` when at least one policy would run for this evaluation.
+
+    Cheaper than building a full :class:`PolicyEngine`: only checks whether
+    the combined policy list is non-empty. Used as a fast-path guard in
+    ``POST /policies/evaluate`` to skip the engine build (and the associated
+    conversation-store reads for labels/state/usage) when nothing would fire.
+
+    Reads from the same caches as :func:`build_policy_engine`, so the check
+    is O(1) for warm cache hits.
+
+    :param spec: The agent's parsed spec.
+    :param conversation_id: Conversation id, e.g. ``"conv_abc123"``.
+    :param default_policies: Server-wide policies from ``RuntimeCaps``.
+    :param policy_store: Session-scoped policy store; ``None`` means no DB
+        policies are configured.
+    :param phase: The evaluation phase, if known.
+    :param tool_name: The tool being called (for ``PHASE_TOOL_CALL`` events).
+    :returns: ``False`` when the engine would have an empty policy list and
+        ``evaluate()`` would unconditionally return ALLOW/UNSPECIFIED.
+    """
+    # The engine unconditionally injects _ASK_ON_ADD_POLICY_SPEC so agents
+    # cannot silently install session policies. Never fast-path sys_add_policy
+    # TOOL_CALL events — they must always reach the engine for that gate.
+    if phase == Phase.TOOL_CALL and tool_name == "sys_add_policy":
+        return True
+    if spec.guardrails and spec.guardrails.policies:
+        return True
+    if default_policies:
+        return True
+    # Session policies are LRU-cached per (workspace_id, conversation_id) —
+    # this is a cache hit on any call after the first for this session.
+    if _load_session_policy_specs(conversation_id, policy_store):
+        return True
+    return False
 
 
 def build_policy_engine(
@@ -468,22 +514,70 @@ def _build_policy_llm_client(
         return None
     from omnigent.llms.client import Client
 
-    # Models prefixed with ``databricks-`` (e.g.
-    # ``databricks-claude-sonnet-4-6``) need the ``databricks/``
-    # provider prefix so the LLM adapter routes through
-    # DatabricksAdapter (Chat Completions) rather than
-    # OpenAIAdapter (Responses API). Without this, the request
-    # hits ``/responses`` on the Databricks gateway → 400.
-    model = server_llm.model
-    if "/" not in model and model.startswith("databricks-"):
-        model = f"databricks/{model}"
+    primary = _normalize_policy_model(server_llm.model)
+    fallbacks = [_normalize_policy_model(m) for m in server_llm.fallback_models]
+
+    # The resolved ``connection`` (api_key / profile creds) is shared
+    # across the primary and every fallback. It is provider-specific,
+    # so a fallback on a different provider would be handed the wrong
+    # credentials. Warn at build time rather than failing mid-request.
+    if connection is not None:
+        primary_provider = _model_provider(primary)
+        mismatched = sorted(
+            {_model_provider(m) for m in fallbacks if _model_provider(m) != primary_provider}
+        )
+        if mismatched:
+            _logger.warning(
+                "Policy llm: connection is configured for provider %r but "
+                "fallback_models target %s; the shared connection likely "
+                "won't authenticate those providers. Use same-provider "
+                "fallbacks, or rely on environment defaults (no connection).",
+                primary_provider,
+                mismatched,
+            )
 
     return PolicyLLMClient(
         _client=Client(),
-        _model=model,
+        _model=primary,
         _connection=connection,
         _request_timeout=server_llm.request_timeout,
+        _fallback_models=fallbacks,
     )
+
+
+def _normalize_policy_model(model: str) -> str:
+    """
+    Apply the ``databricks-`` → ``databricks/`` provider-prefix fixup.
+
+    Models prefixed with ``databricks-`` (e.g.
+    ``databricks-claude-sonnet-4-6``) need the ``databricks/``
+    provider prefix so the LLM adapter routes through
+    ``DatabricksAdapter`` (Chat Completions) rather than
+    ``OpenAIAdapter`` (Responses API). Without this, the request
+    hits ``/responses`` on the Databricks gateway → 400. Applied
+    uniformly to the primary model and every fallback so the
+    fallback path routes the same way as the primary.
+
+    :param model: A model id from the server ``llm:`` config,
+        possibly a bare ``databricks-`` name.
+    :returns: The model id with the ``databricks/`` prefix applied
+        when needed; otherwise unchanged.
+    """
+    if "/" not in model and model.startswith("databricks-"):
+        return f"databricks/{model}"
+    return model
+
+
+def _model_provider(model: str) -> str:
+    """
+    Extract the provider prefix from a normalized model id.
+
+    :param model: A provider-prefixed model id, e.g.
+        ``"databricks/claude-sonnet-4"`` or ``"openai/gpt-4o-mini"``.
+    :returns: The provider segment before the first ``/`` (e.g.
+        ``"openai"``), or the whole string when unprefixed.
+    """
+    return model.split("/", 1)[0] if "/" in model else model
 
 
 def _resolve_databricks_connection(profile: str) -> dict[str, str]:

@@ -21,7 +21,11 @@ from sqlalchemy import delete as sql_delete
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from omnigent.db.db_models import SqlConversation, SqlHost, current_workspace_id
+from omnigent.db.db_models import (
+    SqlConversationMetadata,
+    SqlHost,
+    current_workspace_id,
+)
 from omnigent.db.enum_codecs import decode_host_status, encode_host_status
 from omnigent.db.utils import get_or_create_engine, make_managed_session_maker, now_epoch
 
@@ -342,18 +346,18 @@ class HostStore:
 
         bound_ids = list(
             session.execute(
-                select(SqlConversation.id).where(
-                    SqlConversation.workspace_id == current_workspace_id(),
-                    SqlConversation.host_id == old_host_id,
+                select(SqlConversationMetadata.id).where(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.host_id == old_host_id,
                 )
             ).scalars()
         )
         if bound_ids:
             session.execute(
-                update(SqlConversation)
+                update(SqlConversationMetadata)
                 .where(
-                    SqlConversation.workspace_id == current_workspace_id(),
-                    SqlConversation.host_id == old_host_id,
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.host_id == old_host_id,
                 )
                 .values(host_id=None)
             )
@@ -387,10 +391,10 @@ class HostStore:
 
         if bound_ids:
             session.execute(
-                update(SqlConversation)
+                update(SqlConversationMetadata)
                 .where(
-                    SqlConversation.workspace_id == current_workspace_id(),
-                    SqlConversation.id.in_(bound_ids),
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.id.in_(bound_ids),
                 )
                 .values(host_id=new_host_id)
             )
@@ -744,10 +748,10 @@ class HostStore:
         """
         with self._session() as session:
             session.execute(
-                update(SqlConversation)
+                update(SqlConversationMetadata)
                 .where(
-                    SqlConversation.workspace_id == current_workspace_id(),
-                    SqlConversation.host_id == host_id,
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.host_id == host_id,
                 )
                 .values(host_id=None)
             )

@@ -164,8 +164,8 @@ interface WorkspacePanelProps {
    * badge denominator) — starts at 1 for a lone agent.
    */
   agentCount: number;
-  /** Whether this is a claude-native session (gates the Tasks tab). */
-  isClaudeNative: boolean;
+  /** Whether the session publishes a todo list (gates the Tasks tab). */
+  todosSupported: boolean;
   /** Number of completed todos (Tasks tab badge numerator). */
   todosCompleted: number;
   /** Total todo count (Tasks tab badge denominator + visibility gate). */
@@ -236,7 +236,7 @@ export function WorkspacePanel({
   terminalsLength,
   subagentsWorking,
   agentCount,
-  isClaudeNative,
+  todosSupported,
   todosCompleted,
   todosTotal,
   rootSessionId,
@@ -363,7 +363,7 @@ export function WorkspacePanel({
                 )}
               </TabsTrigger>
             )}
-            {isClaudeNative && todosTotal > 0 && (
+            {todosSupported && todosTotal > 0 && (
               <TabsTrigger
                 value="todos"
                 className="h-[32px] gap-[6px] rounded-[8px] px-[12px] text-[13px] leading-5"
@@ -423,7 +423,7 @@ export function WorkspacePanel({
           The Shells branch is unreachable when its tab is hidden —
           native wrappers, claude-native sub-agents, or no shell
           attached. */}
-      <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+      <div data-workspace-panel-content className="flex min-h-0 flex-1 flex-col overflow-hidden">
         {selectedFilePath !== null ? (
           <FileViewer
             frameless
@@ -443,7 +443,7 @@ export function WorkspacePanel({
           <BrowserPane conversationId={conversationId} className="min-h-0 flex-1" />
         ) : rightRailTab === "subagents" && rootSessionId ? (
           <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
-        ) : rightRailTab === "todos" && isClaudeNative ? (
+        ) : rightRailTab === "todos" && todosSupported ? (
           <TodoPanel frameless />
         ) : rightRailTab === "terminals" && showShellsTab ? (
           <InlineTerminalsSection conversationId={conversationId} onExpand={openTerminalsPanel} />

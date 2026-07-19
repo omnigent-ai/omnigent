@@ -28,6 +28,7 @@ from omnigent.runtime import get_caps
 from omnigent.runtime.policies.builder import invalidate_session_policy_specs_cache
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, AuthProvider
 from omnigent.server.routes._auth_helpers import get_user_id, require_access
+from omnigent.server.routes._errors import session_not_found
 from omnigent.server.schemas import (
     _DOTTED_PATH_RE,
     CreateSessionPolicyRequest,
@@ -42,10 +43,10 @@ from omnigent.stores.policy_store import PolicyStore
 def _generate_policy_id() -> str:
     """Generate a unique policy identifier.
 
-    :returns: A string of the form ``"pol_<32-char hex>"``,
-        e.g. ``"pol_a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"``.
+    :returns: A bare 32-char hex uuid,
+        e.g. ``"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"``.
     """
-    return f"pol_{uuid.uuid4().hex}"
+    return uuid.uuid4().hex
 
 
 def _entity_to_response(policy: Policy) -> dict[str, Any]:
@@ -144,7 +145,7 @@ def create_session_policies_router(
         """
         conv = conversation_store.get_conversation(session_id)
         if conv is None:
-            raise OmnigentError("Session not found", code=ErrorCode.NOT_FOUND)
+            raise session_not_found()
 
     @router.post("/sessions/{session_id}/policies")
     async def create_policy(

@@ -61,26 +61,134 @@ describe("FlatFileList runner-offline state", () => {
   });
 });
 
-describe("FlatFileList file size / download alignment", () => {
-  it("overlays the download button on the file size so both share one slot", () => {
-    // The size label and the hover download button must occupy the same
-    // relative container: the size reserves the width and the button overlays
-    // it (absolute inset-0), so the button appears exactly where the size was.
+describe("FlatFileList status / download alignment", () => {
+  it("does not show a file-size label", () => {
     renderList({
       files: [
-        { path: "src/app.ts", name: "app.ts", status: "modified", bytes: 2048, modified_at: null },
+        {
+          path: "src/app.ts",
+          name: "app.ts",
+          status: "modified",
+          bytes: 2048,
+          modified_at: null,
+          lines_added: null,
+          lines_removed: null,
+        },
       ],
     });
 
-    const size = screen.getByText("2.0 KB");
-    const slot = size.parentElement;
+    expect(screen.queryByText(/\bKB\b/)).not.toBeInTheDocument();
+  });
+
+  it("overlays the download button on the status letter so both share one slot", () => {
+    // The status letter and the hover download button occupy the same relative
+    // container: the letter reserves the width and the button overlays it
+    // (absolute inset-0), so the button appears exactly where the letter was.
+    renderList({
+      files: [
+        {
+          path: "src/app.ts",
+          name: "app.ts",
+          status: "modified",
+          bytes: 2048,
+          modified_at: null,
+          lines_added: null,
+          lines_removed: null,
+        },
+      ],
+    });
+
+    const letter = screen.getByText("M");
+    const slot = letter.parentElement;
     expect(slot).toHaveClass("relative");
-    // Size hides on hover but keeps its width to avoid a layout shift.
-    expect(size).toHaveClass("group-hover:invisible");
+    // The letter hides on hover but keeps its width to avoid a layout shift.
+    expect(letter).toHaveClass("group-hover:invisible");
 
     const download = screen.getByRole("button", { name: /download app\.ts/i });
     const overlay = download.closest("span.absolute") as HTMLElement | null;
     expect(overlay).not.toBeNull();
     expect(slot).toContainElement(overlay);
+  });
+});
+
+describe("FlatFileList line-change counter", () => {
+  it("renders +added and −removed when both counts are present", () => {
+    renderList({
+      files: [
+        {
+          path: "src/app.ts",
+          name: "app.ts",
+          status: "modified",
+          bytes: 2048,
+          modified_at: null,
+          lines_added: 12,
+          lines_removed: 3,
+        },
+      ],
+    });
+
+    expect(screen.getByText("+12")).toBeInTheDocument();
+    expect(screen.getByText("−3")).toBeInTheDocument();
+  });
+
+  it("shows only −removed for a deleted file (added is 0)", () => {
+    renderList({
+      files: [
+        {
+          path: "gone.py",
+          name: "gone.py",
+          status: "deleted",
+          bytes: null,
+          modified_at: null,
+          lines_added: 0,
+          lines_removed: 7,
+        },
+      ],
+    });
+
+    expect(screen.getByText("−7")).toBeInTheDocument();
+    // +0 still renders (0 is a real, non-null count) but the removed side is
+    // the meaningful one for a deletion.
+    expect(screen.getByText("+0")).toBeInTheDocument();
+  });
+
+  it("omits the counter entirely when both counts are null (binary/untracked/unavailable)", () => {
+    renderList({
+      files: [
+        {
+          path: "img.bin",
+          name: "img.bin",
+          status: "modified",
+          bytes: 1024,
+          modified_at: null,
+          lines_added: null,
+          lines_removed: null,
+        },
+      ],
+    });
+
+    expect(screen.queryByText(/^\+/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/^−/)).not.toBeInTheDocument();
+  });
+
+  it("omits the counter for a mode-only change (both counts 0)", () => {
+    // A chmod-only edit shows in numstat as 0/0; a "+0 −0" badge is noise, so
+    // suppress it while still rendering a real deletion's −N.
+    renderList({
+      files: [
+        {
+          path: "script.sh",
+          name: "script.sh",
+          status: "modified",
+          bytes: 512,
+          modified_at: null,
+          lines_added: 0,
+          lines_removed: 0,
+        },
+      ],
+    });
+
+    expect(screen.queryByText(/^\+/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/^−/)).not.toBeInTheDocument();
   });
 });

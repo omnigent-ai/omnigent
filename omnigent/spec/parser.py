@@ -90,6 +90,13 @@ _YAML_1_2_BOOL_RE = re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$")
 # ``executor.config`` keys kept as their nested YAML structure instead of
 # string-coerced — their consumers read the nested mapping/list shape.
 _STRUCTURED_EXECUTOR_CONFIG_KEYS: frozenset[str] = frozenset()
+
+# Copy the resolver dict onto the subclass before mutating — it's inherited
+# from SafeLoader by reference, so in-place edits below would strip
+# SafeLoader's bool resolver process-wide.
+_ConfigYamlLoader.yaml_implicit_resolvers = {
+    key: value[:] for key, value in yaml.SafeLoader.yaml_implicit_resolvers.items()
+}
 for _ch in list(_ConfigYamlLoader.yaml_implicit_resolvers.keys()):
     _ConfigYamlLoader.yaml_implicit_resolvers[_ch] = [
         (tag, regexp)
@@ -348,7 +355,28 @@ def _parse_llm(
         else 300
     )
     retry = _parse_retry(raw.get("retry"))
-    reserved = {"model", "connection", "profile", "request_timeout", "retry"}
+    fallback_models_raw = raw.get("fallback_models")
+    if fallback_models_raw is None:
+        fallback_models = []
+    elif isinstance(fallback_models_raw, list):
+        fallback_models = [str(m) for m in fallback_models_raw]
+    else:
+        # A non-list value (e.g. a bare string) is almost certainly a
+        # config typo — a bare string would iterate per-character, so
+        # reject it loudly rather than silently dropping the fallbacks.
+        _log.warning(
+            "llm.fallback_models must be a list, got %s; ignoring it",
+            type(fallback_models_raw).__name__,
+        )
+        fallback_models = []
+    reserved = {
+        "model",
+        "connection",
+        "profile",
+        "request_timeout",
+        "retry",
+        "fallback_models",
+    }
     extra = {k: v for k, v in raw.items() if k not in reserved}
     return LLMConfig(
         model=str(model),
@@ -357,6 +385,7 @@ def _parse_llm(
         profile=profile,
         request_timeout=request_timeout,
         retry=retry,
+        fallback_models=fallback_models,
     )
 
 
@@ -898,7 +927,10 @@ def _parse_os_env_sandbox(
             "(Linux) or sandbox.type=darwin_seatbelt (macOS) for hard "
             "network enforcement: those backends restrict network access "
             "at spawn time so the MITM proxy is the only egress path. "
-            f"Got sandbox.type={sandbox_type!r}.",
+            f"Got sandbox.type={sandbox_type!r}. "
+            "Fix: set os_env.sandbox.type to linux_bwrap on Linux or "
+            "darwin_seatbelt on macOS; do not use sandbox.type=none with "
+            "egress_rules.",
             code=ErrorCode.INVALID_INPUT,
         )
     credential_proxy = _parse_credential_proxy(raw.get("credential_proxy"))

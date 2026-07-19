@@ -31,6 +31,7 @@ import logging
 import os
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from enum import Enum
 
 from starlette.requests import HTTPConnection
@@ -47,6 +48,36 @@ RESERVED_USER_LOCAL = "local"
 RESERVED_USER_PUBLIC = "__public__"
 _RESERVED_USERS = frozenset({RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC})
 _TRUTHY_STRINGS = ("1", "true", "yes")
+
+# Path prefixes a delegated (device-grant) access token may reach.
+# Fail-closed allowlist: a token carrying a ``scope`` claim is rejected on
+# any path not covered here, so it can never touch admin / user-management
+# endpoints (``/auth/users``, ``/auth/invite``, ``/auth/setup`` …) even if
+# its underlying identity is an admin. Delegated clients only need these.
+_DELEGATED_ALLOWED_PREFIXES = (
+    "/health",
+    "/v1/agents",
+    "/v1/hosts",
+    "/v1/sessions",
+    "/v1/runners",
+    "/oauth/token",
+    "/oauth/revoke",
+)
+
+
+def delegated_path_allowed(path: str) -> bool:
+    """Return True if a delegated access token may access *path*.
+
+    Fail-closed: matches against :data:`_DELEGATED_ALLOWED_PREFIXES` and
+    rejects everything else. Exact match or a ``prefix/…`` sub-path
+    counts, so ``/v1/hosts`` and ``/v1/hosts/h1/runners`` pass but
+    ``/v1/hostsX`` does not.
+    """
+    for prefix in _DELEGATED_ALLOWED_PREFIXES:
+        if path == prefix or path.startswith(prefix + "/"):
+            return True
+    return False
+
 
 # Explicit single-user marker. Set by the managed local-server spawn
 # paths (`omnigent run` in chat.py, the daemon's
@@ -402,6 +433,19 @@ class UnifiedAuthProvider(AuthProvider):
             else resolve_auth_header_strip_prefix()
         )
         self._cookie_cache: dict[str, tuple[str, float]] = {}
+        # Set by create_app when a device-grant store is wired. Returns
+        # True if a grant_id has been revoked (or is unknown → fail
+        # closed). Consulted only for delegated tokens (those carrying a
+        # ``grant_id`` claim); left None disables the check.
+        self._grant_revoked: Callable[[str], bool] | None = None
+
+    def set_grant_revocation_check(self, check: Callable[[str], bool]) -> None:
+        """Wire the device-grant revocation lookup.
+
+        :param check: Callable mapping a ``grant_id`` to True when the
+            grant is revoked or unknown (fail closed).
+        """
+        self._grant_revoked = check
 
     @property
     def login_url(self) -> str | None:
@@ -527,6 +571,18 @@ class UnifiedAuthProvider(AuthProvider):
         user_id = payload.get("sub")
         if not user_id or user_id in _RESERVED_USERS:
             return None
+
+        # Delegated (device-grant) tokens carry a ``grant_id`` claim.
+        # They get two extra, request-scoped checks — a fail-closed path
+        # allowlist and a live revocation lookup — so they are never
+        # served from the plain user-id cache (which would skip both).
+        grant_id = payload.get("grant_id")
+        if grant_id is not None:
+            if not delegated_path_allowed(request.url.path):
+                return None
+            if self._grant_revoked is not None and self._grant_revoked(grant_id):
+                return None
+            return user_id
 
         # Cache for remaining lifetime of the token.
         remaining = payload.get("exp", 0) - time.time()

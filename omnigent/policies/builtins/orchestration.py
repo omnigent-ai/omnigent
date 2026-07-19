@@ -9,6 +9,7 @@ The evaluators run runner-side at tool dispatch
 
 from __future__ import annotations
 
+import os
 import re
 import shlex
 from collections.abc import Callable
@@ -560,7 +561,16 @@ def worktree_guard(
         path = args.get("path") or args.get("file_path")
         if not isinstance(path, str):
             return _ALLOW
-        if path.startswith(("/", "~")) or ".." in path.split("/"):
+        # Backslashes are not valid in POSIX paths and could confuse
+        # downstream processing into treating them as separators, slipping a
+        # ``..\\`` past the split-on-'/' traversal check.
+        if "\\" in path:
+            return _decision("DENY", f"{deny_reason} (outside {allowed_root}/: {path!r})")
+        # normpath collapses ``..``/``.``/repeated slashes and pushes every
+        # upward traversal to the front, so a single startswith catches every
+        # escape form (e.g. "a/../../escape" → "../../escape").
+        normalized = os.path.normpath(path)
+        if normalized.startswith(("/", "~", "..")):
             return _decision("DENY", f"{deny_reason} (outside {allowed_root}/: {path!r})")
         return _ALLOW
 

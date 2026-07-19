@@ -81,11 +81,21 @@ drift negligible (~2 ms/turn).
 
 | Journey | Operation timed |
 | --- | --- |
-| `session_cold_start` | Create+bind a fresh session and drive its first turn to `idle` (runner spawn + executor construction + turn) |
+| `session_cold_start` | Create a new host-bound session and time its fresh runner launch through the first token — the full new-conversation cold path |
+| `session_cold_restart` | With an existing session's runner stopped before the sample, post a user message and time the automatic runner relaunch to first token |
 | `warm_turn` | Drive a turn on an already-warm session — steady-state dispatch overhead |
 | `time_to_first_token` | Post a turn; time to the first streamed `output_text` delta |
 | `interrupt` | Interrupt a running (gated) turn; time to cancellation |
 | `read_runner_file` | `GET .../environments/default/filesystem/{path}` — server → runner filesystem read proxy |
+
+The two cold journeys use a real `omni host` daemon. `session_cold_start`
+creates a new host-bound session per sample, while `session_cold_restart`
+creates one session up front and sends `stop_session` before each sample. That
+control event preserves the conversation but stops its runner; the timed user
+message then follows the production auto-relaunch path. In both cases the host
+spawns a fresh runner with its own binding token and reverse tunnel, so the
+latency includes process startup, tunnel registration, and first-token
+dispatch. The daemon reaps any remaining runners when the benchmark exits.
 
 `read_runner_file` needs a runner but does **not** drive a turn or call the LLM:
 its setup plants a file via `PUT`, and the timed op is the proxied read (a
@@ -128,7 +138,8 @@ that a schema change hasn't broken seeding.
 ## Backends
 
 `--database-uri` selects the DB; the report's `backend` field (`sqlite` /
-`postgres`) is derived from the URI scheme so results group by backend.
+`postgres` / `mysql`) is derived from the URI scheme so results group by
+backend.
 
 - **SQLite** (default) — in-process; fast, but not prod-representative.
 - **Postgres** — `postgresql+psycopg://user@host:5432/db` (the fully-qualified
@@ -136,6 +147,11 @@ that a schema change hasn't broken seeding.
   Requires `psycopg[binary]` (the `databricks` extra). Matches prod's
   round-trip/pooling profile. Stand up a local one with
   `docker run -e POSTGRES_PASSWORD=… -p 5432:5432 postgres:16`.
+- **MySQL** — `mysql+mysqldb://user@host:3306/db`. Requires the `mysqlclient`
+  driver (`pip install mysqlclient`, which needs the `libmysqlclient-dev`
+  system library) — it is not in any extra. A supported backend, though prod
+  runs on Postgres. Stand up a local one with
+  `docker run -e MYSQL_ROOT_PASSWORD=… -e MYSQL_DATABASE=benchdb -p 3306:3306 mysql:8.0`.
 
 ## Output → Databricks → dashboard
 
@@ -157,7 +173,7 @@ document without running the harness.
 
 ```jsonc
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "generated_at": "<ISO-8601 UTC>",
   "git_sha": "<HEAD sha>",
   "git_branch": "<branch>",
@@ -169,7 +185,8 @@ document without running the harness.
   "journeys": {
     "<journey name>": {
       "kind": "latency" | "throughput",
-      "backend": "sqlite" | "postgres",
+      "backend": "sqlite" | "postgres" | "mysql",
+      "needs_runner": false,          // hardcoded per journey: HTTP=false, full-turn=true
       "runs": [                       // one per --runs
         {"n_success": N, "n_failures": N, "failures": {"HTTP 500": 1},
          "wall_time_s": …, "mean_ms": …, "p50_ms": …, "p95_ms": …,
@@ -205,10 +222,11 @@ creds).
 ## CI
 
 `.github/workflows/benchmark.yml` runs nightly (and on dispatch) as a backend
-matrix — `sqlite` and `postgres` (a `postgres:16` service container). Each leg
-seeds a corpus (SQLite reuses a cache keyed on the schema head + `seed.py` +
-corpus config, so a migration busts the cache and forces a reseed; Postgres is
-fresh per run), runs the benchmark, and uploads
+matrix — `sqlite`, `postgres` (a `postgres:16` service container), and `mysql`
+(a `mysql:8.0` service container; the `mysqlclient` driver is installed on that
+leg only). Each leg seeds a corpus (SQLite reuses a cache keyed on the schema
+head + `seed.py` + corpus config, so a migration busts the cache and forces a
+reseed; Postgres and MySQL are fresh per run), runs the benchmark, and uploads
 `benchmark-results-<backend>-<run_id>.json`. The workspace notebook pulls those
 artifacts.
 

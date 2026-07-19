@@ -74,7 +74,7 @@ async def test_add_comment_nonexistent_session_returns_404_without_persisting(
     client: httpx.AsyncClient, db_uri: str
 ) -> None:
     """Adding a comment to a nonexistent single-user session returns 404."""
-    missing_session_id = "conv_does_not_exist"
+    missing_session_id = "1d0b12236c77f69f5073a53583de1a3f"
 
     resp = await client.post(
         f"/v1/sessions/{missing_session_id}/comments",

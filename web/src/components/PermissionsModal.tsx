@@ -15,7 +15,8 @@ import {
   useRef,
   useState,
 } from "react";
-import { CheckIcon, LinkIcon, Trash2Icon, UserPlusIcon } from "lucide-react";
+import { CheckIcon, LinkIcon, QrCodeIcon, Trash2Icon, UserPlusIcon } from "lucide-react";
+import { QRCodeSVG } from "qrcode.react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -87,6 +88,7 @@ export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsM
   const [newUserId, setNewUserId] = useState("");
   const [newLevel, setNewLevel] = useState("1");
   const [error, setError] = useState<string | null>(null);
+  const [showQr, setShowQr] = useState(false);
 
   const userGrants = (permissions ?? []).filter((p) => p.user_id !== PUBLIC_USER);
   const publicGrant = (permissions ?? []).find((p) => p.user_id === PUBLIC_USER);
@@ -249,12 +251,26 @@ export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsM
         {error && <p className="text-xs text-destructive">{error}</p>}
 
         <DialogFooter className="flex-row justify-between sm:justify-between">
-          <CopyLinkButton sessionId={sessionId} />
+          <div className="flex items-center gap-2">
+            <CopyLinkButton sessionId={sessionId} />
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => setShowQr(true)}
+              className="gap-1.5 text-primary"
+            >
+              <QrCodeIcon className="size-3.5" />
+              Open in mobile app
+            </Button>
+          </div>
           <Button variant="outline" onClick={() => onOpenChange(false)}>
             Done
           </Button>
         </DialogFooter>
       </DialogContent>
+
+      {/* Separate modal for the QR code so the share dialog stays compact. */}
+      <QrCodeDialog sessionId={sessionId} open={showQr} onOpenChange={setShowQr} />
     </Dialog>
   );
 }
@@ -443,6 +459,25 @@ function getShareableLink(sessionId: string, rebasePath: (path: string) => strin
   return transform ? transform(path) : `${window.location.origin}${path}`;
 }
 
+/**
+ * The `omnigent://<host>/c/<session_id>` deep link encoded into the share QR
+ * code. The host (with port when non-default) is parsed from the same shareable
+ * URL `getShareableLink` resolves — so standalone and embedded (host-transformed)
+ * origins agree on the same server the desktop shell's deep-link handler keys
+ * off of (see `electron/src/deepLink.js`). The path is always basename-less
+ * `/c/<id>`; the workspace mount is server-determined and intentionally absent.
+ */
+function getDeepLink(sessionId: string, rebasePath: (path: string) => string): string {
+  const url = getShareableLink(sessionId, rebasePath);
+  try {
+    const { host } = new URL(url);
+    return `omnigent://${host}/c/${sessionId}`;
+  } catch {
+    // Unparseable transform output: fall back to the current origin's host.
+    return `omnigent://${window.location.host}/c/${sessionId}`;
+  }
+}
+
 function CopyLinkButton({ sessionId }: { sessionId: string }) {
   const [copied, setCopied] = useState(false);
   const rebasePath = useRebasePath();
@@ -468,6 +503,62 @@ function CopyLinkButton({ sessionId }: { sessionId: string }) {
       {copied ? <CheckIcon className="size-3.5" /> : <LinkIcon className="size-3.5" />}
       {copied ? "Copied!" : "Copy link"}
     </Button>
+  );
+}
+
+/**
+ * A separate modal showing a QR code encoding the session's
+ * `omnigent://<host>/c/<id>` deep link so a user can scan it with their phone
+ * to open the session in the Omnigent app. The code is rendered on a fixed
+ * white tile so it stays scannable regardless of the app's dark/light theme
+ * (a dark-on-dark QR won't read). Error correction is bumped to M for
+ * resilience against partial occlusion.
+ */
+function QrCodeDialog({
+  sessionId,
+  open,
+  onOpenChange,
+}: {
+  sessionId: string;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+}) {
+  const rebasePath = useRebasePath();
+  const deepLink = getDeepLink(sessionId, rebasePath);
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-sm">
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2">
+            <QrCodeIcon className="size-4" />
+            Open in mobile app
+          </DialogTitle>
+          <DialogDescription>
+            Scan with your phone's camera to open this session in the Omnigent app.
+          </DialogDescription>
+        </DialogHeader>
+        <div className="flex justify-center">
+          <div className="rounded-lg bg-white p-3">
+            <QRCodeSVG
+              value={deepLink}
+              size={200}
+              level="M"
+              // White tile + explicit module colors keep the code scannable in dark
+              // mode; the padding also serves as the QR quiet zone.
+              bgColor="#ffffff"
+              fgColor="#000000"
+              aria-label="QR code to open this session in the Omnigent app"
+            />
+          </div>
+        </div>
+        <DialogFooter>
+          <Button variant="outline" onClick={() => onOpenChange(false)}>
+            Close
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }
 

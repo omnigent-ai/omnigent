@@ -3,7 +3,7 @@
 Exposes Hindsight's retain / recall / reflect operations as three built-in
 tools so an agent can persist and recall memory across runs. Hindsight
 (https://github.com/vectorize-io/hindsight) is an open-source agent-memory
-system; the client SDK is an optional dependency (``omnigent[memory]``).
+system; the client SDK is an optional dependency (``omnigent[hindsight]``).
 
 The memory bank is resolved per invocation from the agent spec config, falling
 back to the run's identity in :class:`ToolContext` — so a single declaration

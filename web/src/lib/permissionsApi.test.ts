@@ -240,6 +240,19 @@ describe("derivePermissionLevel — resolution order", () => {
     expect(derivePermissionLevel(null, true, sidebar, "conv_test", true)).toBe(2);
   });
 
+  it("ignores a sidebar row whose level is null and defers to the snapshot fallback", () => {
+    // A deployment whose session list is owner-only (the caller's effective
+    // level omitted, e.g. the Databricks-managed server) returns rows with
+    // permission_level=null. That absence is NOT the permissive null sentinel:
+    // we must not conclude from it, so while the single-fetch loads we return
+    // null (loading, permissive) rather than reading the row's null as a
+    // resolved level — the authoritative snapshot then wins once it lands.
+    const sidebar = makeConv(null);
+    expect(derivePermissionLevel(null, true, sidebar, "conv_test", true)).toBeNull();
+    // And once the snapshot resolves, it — not the null row — decides.
+    expect(derivePermissionLevel(makeSession(1), false, sidebar, "conv_test", true)).toBe(1);
+  });
+
   it("returns null while the single-fetch is still loading and the sidebar has no row", () => {
     // Child session case before the single-fetch resolves: don't flash
     // read-only just because the sidebar doesn't know about this conv.

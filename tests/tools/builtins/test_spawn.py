@@ -51,7 +51,6 @@ def test_file_ids_present_and_optional() -> None:
         "type": "array",
         "items": {"type": "string", "minLength": 1},
         "minItems": 1,
-        "uniqueItems": True,
         "description": branch["properties"]["file_ids"]["description"],
     }
     assert "file_ids" not in branch["required"]
@@ -105,9 +104,10 @@ def test_empty_file_ids_rejected() -> None:
         _validate({"input": "go", "file_ids": []})
 
 
-def test_duplicate_file_ids_rejected() -> None:
-    with pytest.raises(jsonschema.ValidationError):
-        _validate({"input": "go", "file_ids": ["file_abc", "file_abc"]})
+def test_duplicate_file_ids_allowed() -> None:
+    # uniqueItems was removed so non-OpenAI models don't reject the schema;
+    # duplicate file ids are deduplicated by the server handler instead.
+    _validate({"input": "go", "file_ids": ["file_abc", "file_abc"]})
 
 
 def test_empty_file_id_rejected() -> None:

@@ -64,6 +64,8 @@ def _backend_of(database_uri: str | None) -> str:
         return "sqlite"
     if database_uri.startswith("postgres"):
         return "postgres"
+    if database_uri.startswith("mysql"):
+        return "mysql"
     return "other"
 
 
@@ -122,10 +124,16 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[dict[str, object], bo
     # Any full-turn journey needs the runner + mock LLM. A full env is a
     # superset — HTTP journeys still run against it — so a mixed selection just
     # boots with_runner=True. The harness label reflects what drove the turns.
+    # A host-backed journey (session_cold_start) additionally needs a host
+    # daemon; with_host is a further superset (it implies with_runner) so a
+    # mixed selection that includes it boots the host too.
     with_runner = any(j.needs_runner for j in journeys)
+    with_host = any(j.needs_host for j in journeys)
     harness = _RUNNER_HARNESS if with_runner else _HTTP_HARNESS
 
-    async with BenchEnvironment(with_runner=with_runner, database_uri=args.database_uri) as env:
+    async with BenchEnvironment(
+        with_runner=with_runner, with_host=with_host, database_uri=args.database_uri
+    ) as env:
         for journey in journeys:
             console.print(f"\n[bold]Benchmarking[/bold] {journey.name} [dim]({backend})[/dim]")
             kind, results = await _run_journey(journey, env, args)
@@ -133,6 +141,11 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[dict[str, object], bo
             block = aggregate(results)
             block["kind"] = kind
             block["backend"] = backend
+            # Hardcoded per-journey mapping: HTTP journeys are False, full-turn
+            # journeys True. Sourced from the journey itself, not the run-level
+            # env, so it stays correct in a mixed selection (where with_runner
+            # is True for the whole run because *some* journey needs it).
+            block["needs_runner"] = journey.needs_runner
             journey_results[journey.name] = block
             if not check_thresholds(
                 results,
@@ -141,6 +154,7 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[dict[str, object], bo
                 max_p99_ms=args.max_p99_ms,
             ):
                 passed = False
+        resource_usage = env.resource_usage
 
     config = {
         "iterations": args.iterations,
@@ -157,6 +171,7 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[dict[str, object], bo
         generated_at=generated_at,
         config=config,
         harness=harness,
+        resource_usage=resource_usage,
     )
     return report, passed
 
@@ -178,10 +193,10 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         "--database-uri",
         default=None,
         metavar="URI",
-        help="DB the server boots against — a pre-seeded SQLite file or a "
-        "postgresql+psycopg://… instance (see seed.py). Default: a fresh "
-        "throwaway SQLite DB (empty — best-case numbers). The report's "
-        "`backend` field is derived from this.",
+        help="DB the server boots against — a pre-seeded SQLite file, a "
+        "postgresql+psycopg://… instance, or a mysql+mysqldb://… instance "
+        "(see seed.py). Default: a fresh throwaway SQLite DB (empty — "
+        "best-case numbers). The report's `backend` field is derived from this.",
     )
     parser.add_argument(
         "--iterations",

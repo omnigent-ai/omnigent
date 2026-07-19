@@ -95,6 +95,40 @@ def test_p0_bench_harnesses_declare_interrupt_and_streaming() -> None:
         assert caps[harness].streaming is True, harness
 
 
+def test_optional_bench_capabilities_default_to_unknown() -> None:
+    capability = HarnessCapabilities(
+        IntegrationMode.SDK_IN_PROCESS,
+        Elicitation.NONE,
+        Resume.COLD_ONLY,
+        EffortFamily.NONE,
+        ModelFamily.MULTI,
+        AuthModel.OWN_AUTH,
+        subagents=False,
+        interrupt=True,
+        streaming=True,
+    )
+
+    assert capability.steering is None
+    assert capability.live_queue is None
+    assert capability.images is None
+    assert capability.compaction is None
+    assert capability.as_dict() == {
+        "integration_mode": "sdk-in-process",
+        "elicitation": "none",
+        "resume": "cold-only",
+        "effort": "none",
+        "model_family": "multi",
+        "auth": "own-auth",
+        "subagents": False,
+        "interrupt": True,
+        "streaming": True,
+        "steering": None,
+        "live_queue": None,
+        "images": None,
+        "compaction": None,
+    }
+
+
 def test_community_capabilities_cannot_override_builtin() -> None:
     # `capabilities` is part of the collision-key set, so a community plugin that
     # declares capabilities for a built-in harness id is rejected rather than
@@ -128,6 +162,6 @@ def test_catalog_rows_include_capabilities() -> None:
     for row in rows:
         if row["id"] in caps:
             assert "capabilities" in row, row["id"]
-            # JSON-serializable: values are str/bool, not enums.
+            # JSON-serializable: values are primitives, not enums.
             for value in row["capabilities"].values():
-                assert isinstance(value, (str, bool))
+                assert value is None or isinstance(value, (str, bool))

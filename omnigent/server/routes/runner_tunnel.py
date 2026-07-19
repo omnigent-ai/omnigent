@@ -34,6 +34,7 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     encode_frame,
 )
 from omnigent.runner.transports.ws_tunnel.registry import RunnerSession, TunnelRegistry
+from omnigent.server import session_live_state
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.host_registry import RunnerExitReports
 from omnigent.server.routes._auth_helpers import require_user
@@ -701,6 +702,16 @@ async def _ping_loop(
 ) -> None:
     """Send pings every PING_INTERVAL_S; declare dead after misses.
 
+    Each tick that the runner is still alive also re-stamps
+    ``runner_last_seen`` (``session_live_state.touch_runner_liveness``)
+    so replicas that don't hold this tunnel keep deriving
+    ``runner_online`` from a fresh row instead of their own empty
+    registry. This runs from the per-connection ping loop — inside the
+    tunnel handler's ``workspace_scope`` — rather than a central lifespan
+    sweep, which would run context-free (default workspace) over a
+    workspace-blind registry and stamp no rows on a multi-tenant replica.
+    Mirrors the host tunnel's ``host_store.heartbeat`` refresh.
+
     :param ws: Accepted Starlette WebSocket used only for timeout
         close.
     :param session: Session-generation guard for the ping loop.
@@ -728,6 +739,11 @@ async def _ping_loop(
             except RuntimeError:
                 _logger.debug("Runner %s websocket already closed during ping timeout", runner_id)
             return
+        # Still within the liveness window — refresh the row so the
+        # freshness gate keeps the runner in the online set cross-replica.
+        # Best-effort and deduplicated inside the chokepoint; the enqueue
+        # inherits this handler's workspace scope via copy_context.
+        session_live_state.touch_runner_liveness([runner_id])
         try:
             await registry.send_text(
                 session,

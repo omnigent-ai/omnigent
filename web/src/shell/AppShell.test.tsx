@@ -13,6 +13,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+import { writeWorkspacePanelDefault } from "@/lib/workspacePanelPreferences";
 
 vi.mock("@/hooks/useConversations", () => ({
   useConversations: vi.fn(),
@@ -309,6 +310,7 @@ function SessionNavButton({ to }: { to: string }) {
 function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
   return {
     accounts_enabled: false,
+    single_user: false,
     login_url: null,
     needs_setup: false,
     databricks_features: false,
@@ -1653,9 +1655,10 @@ describe("Right workspace card visibility", () => {
   });
 
   it("starts open for a fresh session (no stored open-state)", () => {
-    // A brand-new session has no persisted open-state, so the rail opens by
-    // default — the card is mounted and the header offers Collapse, not
-    // Expand.
+    // A brand-new session has no persisted open-state, so the Appearance
+    // Workspace panel default applies. With no preference stored that
+    // default is open — the card is mounted and the header offers Collapse,
+    // not Expand.
     useEnvironmentMock.mockReturnValue({
       data: { available: false, root: null, home: null },
       isLoading: false,
@@ -1667,6 +1670,38 @@ describe("Right workspace card visibility", () => {
     expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Collapse right panel" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Expand right panel" })).toBeNull();
+  });
+
+  it("starts collapsed for a fresh session when Appearance default is collapsed", () => {
+    // The Appearance setting only seeds sessions with no saved open-state.
+    writeWorkspacePanelDefault("collapsed");
+    useEnvironmentMock.mockReturnValue({
+      data: { available: false, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_fresh_collapsed", permission_level: null }]);
+
+    renderShell("/c/conv_fresh_collapsed");
+
+    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Expand right panel" })).toBeInTheDocument();
+  });
+
+  it("restores a saved open-state even when Appearance default is collapsed", () => {
+    // Per-chat persistence wins over the Appearance default once the user
+    // has toggled the rail in that session.
+    writeWorkspacePanelDefault("collapsed");
+    writeSessionWorkspaceState("conv_saved_open", { open: true });
+    useEnvironmentMock.mockReturnValue({
+      data: { available: false, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_saved_open", permission_level: null }]);
+
+    renderShell("/c/conv_saved_open");
+
+    expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Collapse right panel" })).toBeInTheDocument();
   });
 
   it("persists the open-state per session across remounts", () => {
@@ -2610,6 +2645,40 @@ describe("Mobile session menu", () => {
     expect(screen.getByTestId("todo-panel")).toBeInTheDocument();
   });
 
+  it("opens the Tasks drawer for a codex-native session with todos", () => {
+    // Codex-native maps its plan updates to the same todo schema, so the
+    // Tasks entry must gate on codex-native too — not just claude-native.
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([
+      {
+        id: "conv_codex",
+        permission_level: null,
+        labels: { "omnigent.wrapper": "codex-native-ui" },
+      },
+    ]);
+    useChatStore.setState({
+      todos: [
+        { content: "Locate CLI parser", status: "in_progress", activeForm: "Locate CLI parser" },
+      ],
+    });
+
+    renderShell("/c/conv_codex");
+
+    expect(screen.getByTestId("todos-panel-drawer")).toHaveAttribute("data-state", "closed");
+    expect(screen.queryByTestId("todo-panel")).toBeNull();
+
+    openSessionMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: /Tasks/i }));
+
+    // A codex-native session with a non-empty plan opens the Tasks drawer,
+    // the same as a claude-native session with todos.
+    expect(screen.getByTestId("todos-panel-drawer")).toHaveAttribute("data-state", "open");
+    expect(screen.getByTestId("todo-panel")).toBeInTheDocument();
+  });
+
   it("keeps the FAB with only the Agents entry for a minimal agent", () => {
     // available:false → no files; no shells, no todos, no debug. The
     // Agents entry is unconditional (badge = 1, the main agent), so the
@@ -2717,9 +2786,11 @@ describe("AppShell clone/fork action", () => {
 
 describe("AppShell share action", () => {
   it("shows the Share button to an owner of a top-level session", () => {
-    // permission_level null = owner. A top-level session can be shared.
+    // permission_level 4 = owner. Share is owner-only; a top-level session
+    // the viewer owns can be shared. (A multi-user owner's list row carries
+    // level 4; null only occurs in single-user mode, where Share is hidden.)
     withWindowOrigin("https://app.example.com", () => {
-      mockConversations([{ id: "conv_top", permission_level: null }]);
+      mockConversations([{ id: "conv_top", permission_level: 4 }]);
 
       renderShell("/c/conv_top");
 
@@ -2731,7 +2802,7 @@ describe("AppShell share action", () => {
 
   it("disables the Share button when the server is local", () => {
     withWindowOrigin("http://localhost:6767", () => {
-      mockConversations([{ id: "conv_top", permission_level: null }]);
+      mockConversations([{ id: "conv_top", permission_level: 4 }]);
 
       renderShell("/c/conv_top");
 
@@ -2750,7 +2821,7 @@ describe("AppShell share action", () => {
     // Non-local origin isolates the reason to the server policy (not the
     // local-server path), so the tooltip must be the sharing-off message.
     withWindowOrigin("https://app.example.com", () => {
-      mockConversations([{ id: "conv_top", permission_level: null }]);
+      mockConversations([{ id: "conv_top", permission_level: 4 }]);
 
       renderShell("/c/conv_top", serverInfo({ sharing_mode: "off" }));
 
@@ -2763,11 +2834,41 @@ describe("AppShell share action", () => {
     });
   });
 
+  it("hides the Share button entirely in single-user mode", () => {
+    // Non-local origin isolates the single-user gate from the local-server
+    // path. The explicit single_user marker (not just accounts-off/no-login,
+    // which a multi-user header deploy also reports) means no other users to
+    // share with, so the button is removed — not disabled like the
+    // local-server / sharing-off cases.
+    withWindowOrigin("https://app.example.com", () => {
+      mockConversations([{ id: "conv_top", permission_level: null }]);
+
+      renderShell("/c/conv_top", serverInfo({ single_user: true }));
+
+      expect(screen.queryByRole("button", { name: /share session/i })).toBeNull();
+    });
+  });
+
+  it("keeps the Share button on a multi-user header-auth deploy (not single_user)", () => {
+    // Header-auth multi-user (SSO proxy): accounts off AND no login_url, same
+    // shape as single-user, but single_user is false — the button must stay.
+    // This is the regression the single_user signal fixes.
+    withWindowOrigin("https://app.example.com", () => {
+      mockConversations([{ id: "conv_top", permission_level: 4 }]);
+
+      renderShell("/c/conv_top", serverInfo({ single_user: false }));
+
+      const shareButton = screen.getByRole("button", { name: /share session/i });
+      expect(shareButton).toBeInTheDocument();
+      expect(shareButton).toBeEnabled();
+    });
+  });
+
   it("keeps the Share button enabled when sharing_mode is read_only", () => {
     // read_only still permits (read) grants, so the affordance stays live —
     // the modal caps the level, the button is not disabled.
     withWindowOrigin("https://app.example.com", () => {
-      mockConversations([{ id: "conv_top", permission_level: null }]);
+      mockConversations([{ id: "conv_top", permission_level: 4 }]);
 
       renderShell("/c/conv_top", serverInfo({ sharing_mode: "read_only" }));
 
@@ -2853,7 +2954,7 @@ describe("Mobile header actions menu", () => {
       mockConversations([
         {
           id: "conv_host",
-          permission_level: null,
+          permission_level: 4,
           labels: {},
           host_id: "host_a1b2",
           runner_id: "runner_token_abc",
@@ -2880,7 +2981,7 @@ describe("Mobile header actions menu", () => {
 
   it("disables the mobile Share item when the server is local", () => {
     withWindowOrigin("http://127.0.0.1:6767", () => {
-      mockConversations([{ id: "conv_host", permission_level: null, labels: {} }]);
+      mockConversations([{ id: "conv_host", permission_level: 4, labels: {} }]);
 
       renderShell("/c/conv_host");
       openActionsMenu();
