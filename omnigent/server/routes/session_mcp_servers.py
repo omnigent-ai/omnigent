@@ -477,7 +477,7 @@ def _preserve_keys(
 
 def _read_yaml_mapping(path: Path) -> dict[str, Any]:
     """Read a YAML mapping from disk."""
-    raw = yaml.safe_load(path.read_text())
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
     if not isinstance(raw, dict):
         raise OmnigentError(
             f"YAML file must be a mapping: {path.name}",

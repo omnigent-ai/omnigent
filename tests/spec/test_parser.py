@@ -3614,3 +3614,18 @@ def test_config_loader_does_not_mutate_shared_safeloader_resolvers() -> None:
     # The subclass still narrows bools: ``on`` is a plain string, ``false`` a bool.
     assert yaml.load("on", loader) == "on"
     assert yaml.load("false", loader) is False
+
+
+def test_parse_config_preserves_non_ascii_prompt(tmp_path: Path) -> None:
+    """config.yaml is read as UTF-8 so non-ASCII prompt text (em-dash, arrows)
+    survives instead of mojibaking through the platform locale (cp1252 on
+    Windows)."""
+    (tmp_path / "config.yaml").write_text(
+        'spec_version: 1\nname: t\nprompt: "plans — not code ↔ review"\n',
+        encoding="utf-8",
+    )
+    spec = parse(tmp_path)
+    assert spec.instructions is not None
+    assert "—" in spec.instructions
+    assert "↔" in spec.instructions
+    assert "â€" not in spec.instructions  # no cp1252 mojibake
