@@ -143,16 +143,26 @@ def test_no_footer_when_turn_never_started() -> None:
 # ── Formatting + threshold resolution ────────────────
 
 
-def test_format_elapsed_keeps_decimal_below_cutoff() -> None:
-    """Short/medium turns keep one decimal of precision."""
+def test_format_elapsed_sub_minute_keeps_decimal() -> None:
+    """Below a minute, one decimal of precision (Nielsen's sub-second scale)."""
     assert _format_elapsed(4.24) == "4.2s"
     assert _format_elapsed(13.75) == "13.8s"
+    assert _format_elapsed(59.8) == "59.8s"
 
 
-def test_format_elapsed_drops_decimal_for_long_turns() -> None:
-    """Past ~200s the sub-second fraction is meaningless, so it's dropped."""
-    assert _format_elapsed(213.4) == "213s"
-    assert _format_elapsed(200.0) == "200s"
+def test_format_elapsed_minutes_and_seconds() -> None:
+    """1min–1hr shows minutes + integer seconds, unpadded (Go/kubectl style)."""
+    assert _format_elapsed(60.0) == "1m0s"
+    assert _format_elapsed(63.4) == "1m3s"
+    assert _format_elapsed(326.0) == "5m26s"  # the old unreadable "326s"
+    assert _format_elapsed(3599.0) == "59m59s"
+
+
+def test_format_elapsed_hours_and_minutes() -> None:
+    """At/above an hour, hours + minutes only — seconds dropped at this scale."""
+    assert _format_elapsed(3600.0) == "1h0m"
+    assert _format_elapsed(3900.0) == "1h5m"
+    assert _format_elapsed(9420.0) == "2h37m"
 
 
 def test_resolve_threshold_defaults_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:

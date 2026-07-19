@@ -665,10 +665,6 @@ def _humanize_agent_name(agent_name: str) -> str:
 _ELAPSED_FOOTER_MIN_S = 5.0
 _ELAPSED_FOOTER_MIN_ENV = "OMNIGENT_ELAPSED_FOOTER_MIN_S"
 
-# Past this, sub-second precision is meaningless — drop the decimal so a long
-# turn reads "213s", not "213.4s".
-_ELAPSED_WHOLE_SECONDS_ABOVE_S = 200.0
-
 
 def _resolve_elapsed_footer_min_s() -> float:
     """Resolve the elapsed-footer threshold (seconds) from the environment.
@@ -690,17 +686,28 @@ def _resolve_elapsed_footer_min_s() -> float:
 
 
 def _format_elapsed(elapsed: float) -> str:
-    """Render an elapsed duration for the footer.
+    """Render an elapsed duration in the compact Go/kubectl style.
 
-    One decimal below :data:`_ELAPSED_WHOLE_SECONDS_ABOVE_S` (``4.2s``), whole
-    seconds at/above it (``213s``) where the fraction no longer matters.
+    A large raw second count (``326s``, ``1543s``) is hard to read, so the unit
+    grows with the duration and only the two largest units are shown:
 
-    :param elapsed: Elapsed seconds.
-    :returns: The formatted duration, e.g. ``"4.2s"`` or ``"213s"``.
+    - ``< 60s`` → one decimal second, e.g. ``4.2s`` (sub-second precision only
+      matters at this scale).
+    - ``< 60m`` → minutes + integer seconds, e.g. ``5m26s``.
+    - ``≥ 60m`` → hours + minutes (seconds dropped), e.g. ``1h5m``.
+
+    Leading-zero units are omitted and nothing is zero-padded, matching Go's
+    ``time.Duration.String()`` and ``kubectl`` age output.
+
+    :param elapsed: Elapsed seconds (non-negative).
+    :returns: The formatted duration, e.g. ``"4.2s"``, ``"5m26s"``, ``"1h5m"``.
     """
-    if elapsed >= _ELAPSED_WHOLE_SECONDS_ABOVE_S:
-        return f"{elapsed:.0f}s"
-    return f"{elapsed:.1f}s"
+    if elapsed < 60:
+        return f"{elapsed:.1f}s"
+    total = int(elapsed)
+    if elapsed < 3600:
+        return f"{total // 60}m{total % 60}s"
+    return f"{total // 3600}h{(total % 3600) // 60}m"
 
 
 class TimedFormatter(RichBlockFormatter):  # type: ignore[misc]
