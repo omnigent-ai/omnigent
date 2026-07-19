@@ -9158,11 +9158,19 @@ def _isolated_databricks_cfg() -> collections.abc.Generator[None, None, None]:
     orig_encoding = detect_encoding(original_cfg)
     orig_cfg = configparser.ConfigParser()
     _read_existing_cfg(orig_cfg, original_cfg, orig_encoding)
+
+    # Seed the temp with only the canonical internal-beta profile sections
+    # (see DEFAULT_PROFILES) that already exist, so there is exactly one section
+    # per workspace host and `databricks auth token --host X` never hits the
+    # "multiple profiles match" ambiguity error.
+    cfg = configparser.ConfigParser()
+    for spec in DEFAULT_PROFILES:
+        if orig_cfg.has_section(spec.name):
+            cfg[spec.name] = dict(orig_cfg[spec.name])
+
     saved_env: dict[str, str | None] = {
         "DATABRICKS_CONFIG_FILE": os.environ.get("DATABRICKS_CONFIG_FILE"),
     }
-    for var in CONFLICTING_ENV_VARS:
-        saved_env[var] = os.environ.pop(var, None)
 
     def _restore_env() -> None:
         for var, prev in saved_env.items():
@@ -9171,65 +9179,70 @@ def _isolated_databricks_cfg() -> collections.abc.Generator[None, None, None]:
             else:
                 os.environ[var] = prev
 
-    # Temp file contains only the canonical internal-beta profile sections
-    # (see DEFAULT_PROFILES), seeded from the original when they already
-    # exist. Everything else is excluded so there is exactly one section per
-    # workspace host and `databricks auth token --host X` never hits the
-    # "multiple profiles match" ambiguity error. The temp file below is ours, so
-    # it stays UTF-8 (setup detects+preserves, so it round-trips); the write-back
-    # preserves the original's detected codec (orig_encoding, above).
-    cfg = configparser.ConfigParser()
-    for spec in DEFAULT_PROFILES:
-        if orig_cfg.has_section(spec.name):
-            cfg[spec.name] = dict(orig_cfg[spec.name])
-
-    omnigent_dir = Path.home() / ".omnigent"
-    omnigent_dir.mkdir(exist_ok=True)
-    tmp_fd, tmp_name = tempfile.mkstemp(
-        prefix="databrickscfg-setup-",
-        dir=omnigent_dir,
-        suffix=".tmp",
-    )
+    # Capture the handlers to restore before installing ours, so restoration in
+    # ``finally`` is safe even if preparation below never installs anything.
+    prev_sigterm = signal.getsignal(signal.SIGTERM)
+    prev_sigint = signal.getsignal(signal.SIGINT)
+    tmp_path: Path | None = None
+    write_tmp: Path | None = None
+    # A single try/finally spans EVERY mutation — popping CONFLICTING_ENV_VARS,
+    # creating the temp file, installing signal handlers — so all of them are
+    # undone even if preparation itself fails. (A failed mkstemp must not leave
+    # DATABRICKS_HOST / DATABRICKS_TOKEN deleted.)
     try:
+        for var in CONFLICTING_ENV_VARS:
+            saved_env[var] = os.environ.pop(var, None)
+
+        omnigent_dir = Path.home() / ".omnigent"
+        omnigent_dir.mkdir(exist_ok=True)
+        tmp_fd, tmp_name = tempfile.mkstemp(
+            prefix="databrickscfg-setup-",
+            dir=omnigent_dir,
+            suffix=".tmp",
+        )
+        tmp_path = Path(tmp_name)
+        # The temp file is ours, so it stays UTF-8 (setup detects+preserves, so
+        # it round-trips); the write-back preserves the original's codec.
         with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
             cfg.write(f)
-    except Exception:
-        os.unlink(tmp_name)
-        raise
-    tmp_path = Path(tmp_name)
+        os.environ["DATABRICKS_CONFIG_FILE"] = tmp_name
 
-    os.environ["DATABRICKS_CONFIG_FILE"] = tmp_name
+        def _on_signal(signum: int, _frame: types.FrameType | None) -> None:
+            _restore_env()
+            if tmp_path is not None:
+                tmp_path.unlink(missing_ok=True)
+            # Restore the original handler before re-raising so signal chaining
+            # (e.g. Click's Ctrl-C → Abort) is preserved rather than falling
+            # back to SIG_DFL which would kill the process through the OS.
+            signal.signal(signum, prev_sigterm if signum == signal.SIGTERM else prev_sigint)
+            signal.raise_signal(signum)
 
-    def _on_signal(signum: int, _frame: types.FrameType | None) -> None:
-        tmp_path.unlink(missing_ok=True)
-        _restore_env()
-        # Restore the original handler before re-raising so signal chaining
-        # (e.g. Click's Ctrl-C → Abort) is preserved rather than falling
-        # back to SIG_DFL which would kill the process through the OS.
-        signal.signal(signum, prev_sigterm if signum == signal.SIGTERM else prev_sigint)
-        signal.raise_signal(signum)
+        signal.signal(signal.SIGTERM, _on_signal)
+        signal.signal(signal.SIGINT, _on_signal)
 
-    prev_sigterm = signal.signal(signal.SIGTERM, _on_signal)
-    prev_sigint = signal.signal(signal.SIGINT, _on_signal)
-
-    write_tmp: Path | None = None
-    try:
         yield
-        # Merge canonical sections written by setup back into the real cfg.
+
+        # Merge the canonical sections setup wrote back into the real config.
+        # Re-detect the codec now: another process may have replaced the file
+        # (e.g. cp1252 -> UTF-8) while setup ran, and reusing the codec detected
+        # at entry would write a mixed-encoding file. The read is guarded, so an
+        # original that became unreadable aborts instead of being overwritten.
+        final_encoding = detect_encoding(original_cfg)
         tmp_cfg = configparser.ConfigParser()
-        tmp_cfg.read(tmp_path, encoding="utf-8")  # our temp file (written above)
-        orig_cfg = configparser.ConfigParser()
-        _read_existing_cfg(orig_cfg, original_cfg, orig_encoding)
+        tmp_cfg.read(tmp_path, encoding="utf-8")  # our temp file (UTF-8, above)
+        merged = configparser.ConfigParser()
+        _read_existing_cfg(merged, original_cfg, final_encoding)
         for spec in DEFAULT_PROFILES:
             if tmp_cfg.has_section(spec.name):
-                orig_cfg[spec.name] = dict(tmp_cfg[spec.name])
+                merged[spec.name] = dict(tmp_cfg[spec.name])
         write_tmp = original_cfg.with_suffix(".tmp")
-        with write_tmp.open("w", encoding=orig_encoding) as f:
-            orig_cfg.write(f)
+        with write_tmp.open("w", encoding=final_encoding) as f:
+            merged.write(f)
         write_tmp.replace(original_cfg)
         write_tmp = None
     finally:
-        tmp_path.unlink(missing_ok=True)
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
         if write_tmp is not None:
             write_tmp.unlink(missing_ok=True)
         signal.signal(signal.SIGTERM, prev_sigterm)
