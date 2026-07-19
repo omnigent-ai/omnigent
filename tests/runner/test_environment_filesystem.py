@@ -1570,3 +1570,53 @@ async def test_worktree_session_uses_session_workspace_for_changes(
             "The /changes endpoint is reading from the runner's global "
             "workspace instead of the session's worktree workspace."
         )
+
+
+class TestPythonRunCommand:
+    """`_python_run_command` builds a platform-correct Python invocation."""
+
+    def test_posix_uses_python3_dash_c(self, monkeypatch) -> None:
+        from omnigent.runner import environment_filesystem as efs
+
+        monkeypatch.setattr(efs, "IS_WINDOWS", False)
+        cmd = efs._python_run_command("print('hi')")
+        assert cmd.startswith("python3 -c ")
+        assert "print('hi')" in cmd
+
+    def test_windows_base64_roundtrips(self, monkeypatch) -> None:
+        import base64
+
+        from omnigent.runner import environment_filesystem as efs
+
+        monkeypatch.setattr(efs, "IS_WINDOWS", True)
+        script = "import os\nprint(os.getcwd())"
+        cmd = efs._python_run_command(script)
+        # A multi-line script must not leak raw newlines into the command line.
+        assert "\n" not in cmd
+        assert " -c " in cmd
+        # The embedded base64 decodes back to the original script.
+        b64 = cmd.split("b64decode('")[1].split("')")[0]
+        assert base64.b64decode(b64).decode() == script
+
+
+@pytest.mark.asyncio
+@pytest.mark.windows_only
+async def test_inactive_sandbox_shell_runs_quoted_command_windows(tmp_path: Path) -> None:
+    """Regression: Windows inactive-sandbox helper startup + quoted execution.
+
+    Guards two Windows defects together: the ``sandbox.type: none`` helper
+    previously failed to spawn (message-less AssertionError -> ``{"error": ""}``
+    because its tmpdir was only created for active sandboxes), and quoted
+    commands were mangled to ``\\"a b\\"`` by list-based argv serialization
+    through ``cmd.exe``.
+    """
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", cwd=str(ws), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    result = await os_env.shell('echo "a b"')
+    assert not result.get("error"), result  # helper spawned + ran
+    assert result.get("exit_code") == 0, result
+    assert "\\" not in result["stdout"], result["stdout"]  # not \"a b\"
+    assert "a b" in result["stdout"]

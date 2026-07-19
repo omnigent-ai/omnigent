@@ -15,9 +15,11 @@ import base64
 import os
 import re
 import stat
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from omnigent._platform import IS_WINDOWS
 from omnigent.entities.environment_filesystem import (
     DeleteFilesystemResult,
     DirectoryNotEmpty,
@@ -45,6 +47,22 @@ def _shell_quote(s: str) -> str:
     :returns: Single-quoted shell-safe string.
     """
     return "'" + s.replace("'", "'\\''") + "'"
+
+
+def _python_run_command(script: str) -> str:
+    """Build a host-shell command that runs ``script`` through Python.
+
+    POSIX keeps the historical ``python3 -c '<script>'`` form (single-quoted;
+    this resolves the python inside the sandbox, e.g. under bwrap). On Windows
+    the native shell is ``cmd.exe``, which has no POSIX single-quoting and
+    mangles inline multi-line scripts, so base64-encode the script (pure ASCII,
+    safe to embed in a double-quoted argument) and run it with the runtime's
+    own interpreter.
+    """
+    if IS_WINDOWS:
+        b64 = base64.b64encode(script.encode("utf-8")).decode("ascii")
+        return f'"{sys.executable}" -c "import base64;exec(base64.b64decode(\'{b64}\').decode())"'
+    return f"python3 -c {_shell_quote(script)}"
 
 
 def _glob_to_regex(pattern: str) -> str:
@@ -336,7 +354,7 @@ class CallerProcessFilesystem:
         )
         result = await _run_os_env_async(
             self._os_env.shell,
-            f"python3 -c {_shell_quote(_script)}",
+            _python_run_command(_script),
         )
         if "error" in result:
             raise FilesystemPathNotFound(f"Directory {path!r} not found or not accessible")
@@ -468,7 +486,7 @@ class CallerProcessFilesystem:
         )
         result = await _run_os_env_async(
             self._os_env.shell,
-            f"python3 -c {_shell_quote(_script)}",
+            _python_run_command(_script),
         )
         if "error" in result:
             raise FilesystemPathNotFound(f"Root directory not accessible: {result['error']}")
@@ -649,7 +667,7 @@ class CallerProcessFilesystem:
         )
         result = await _run_os_env_async(
             self._os_env.shell,
-            f"python3 -c {_shell_quote(_script)}",
+            _python_run_command(_script),
         )
         if "error" in result or result.get("exit_code", 1) != 0:
             raise FilesystemPathNotFound(f"Path {path!r} not found")
@@ -766,7 +784,7 @@ class CallerProcessFilesystem:
         )
         result = await _run_os_env_async(
             self._os_env.shell,
-            f"python3 -c {_shell_quote(_script)}",
+            _python_run_command(_script),
         )
         if "error" in result or result.get("exit_code", 1) != 0:
             raise FilesystemPathNotFound(f"Path {validated!r} not found")
@@ -798,7 +816,7 @@ class CallerProcessFilesystem:
         )
         check = await _run_os_env_async(
             self._os_env.shell,
-            f"python3 -c {_shell_quote(_script)}",
+            _python_run_command(_script),
         )
         count = int(check.get("stdout", "0").strip() or "0")
         return count > 0
@@ -829,7 +847,28 @@ class CallerProcessFilesystem:
                 f"Directory {path!r} is not empty; use recursive=true to delete"
             )
 
-        cmd = f"rm -rf {_shell_quote(validated)}" if is_dir else f"rm -f {_shell_quote(validated)}"
+        if IS_WINDOWS:
+            # cmd.exe has no `rm`; delete via a Python script, tolerating a
+            # missing path like `rm -f` does.
+            import json as _json
+
+            _del_script = "\n".join(
+                [
+                    "import os, shutil",
+                    f"p = {_json.dumps(validated)}",
+                    "if os.path.isdir(p):",
+                    "    shutil.rmtree(p)",
+                    "elif os.path.exists(p):",
+                    "    os.remove(p)",
+                ]
+            )
+            cmd = _python_run_command(_del_script)
+        else:
+            cmd = (
+                f"rm -rf {_shell_quote(validated)}"
+                if is_dir
+                else f"rm -f {_shell_quote(validated)}"
+            )
         result = await _run_os_env_async(self._os_env.shell, cmd)
         if "error" in result and result.get("exit_code", 0) != 0:
             raise FilesystemPathNotFound(
