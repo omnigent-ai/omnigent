@@ -16664,16 +16664,12 @@ def create_sessions_router(
             conversation_store,
             source_id,
         )
-        target_index = next(
-            (index for index, item in enumerate(items) if item.id == body.user_message_id),
-            None,
-        )
-        if target_index is None:
+        target = next((item for item in items if item.id == body.user_message_id), None)
+        if target is None:
             raise OmnigentError(
                 f"User message not found: {body.user_message_id!r}",
                 code=ErrorCode.INVALID_INPUT,
             )
-        target = items[target_index]
         if (
             target.type != "message"
             or not isinstance(target.data, MessageData)
@@ -16717,7 +16713,7 @@ def create_sessions_router(
 
         draft = _message_text(target.data.content) or ""
         try:
-            rewound = await asyncio.to_thread(
+            await asyncio.to_thread(
                 conversation_store.rewind_conversation,
                 source_id,
                 before_item_id=target.id,
@@ -16726,7 +16722,6 @@ def create_sessions_router(
         except LookupError as exc:
             raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
 
-        files_reverted = False
         file_revert_error: str | None = None
         if body.revert_files:
             if runner_client is None:
@@ -16738,8 +16733,7 @@ def create_sessions_router(
                         json={"type": "revert_files", "checkpoint_id": target.id},
                         timeout=35.0,
                     )
-                    files_reverted = restore_response.status_code == 200
-                    if not files_reverted:
+                    if restore_response.status_code != 200:
                         file_revert_error = (
                             "No Git checkpoint was available for that message, so file changes "
                             "were kept."
@@ -16749,26 +16743,7 @@ def create_sessions_router(
                 except (httpx.HTTPError, ConnectionError):
                     file_revert_error = "The runner disconnected, so file changes were kept."
 
-        rewound_items = await asyncio.to_thread(
-            conversation_store.list_items,
-            source_id,
-            limit=10000,
-        )
-        level = await _get_permission_level(user_id, source_id, permission_store)
-        session_response = _build_session_response(
-            rewound,
-            rewound_items.data,
-            "idle",
-            permission_level=level,
-            last_task_error=None,
-            agent_name=agent.name,
-        )
-        return SessionRevertResponse(
-            session=session_response,
-            draft=draft,
-            files_reverted=files_reverted,
-            file_revert_error=file_revert_error,
-        )
+        return SessionRevertResponse(draft=draft, file_revert_error=file_revert_error)
 
     # ── POST /sessions/{session_id}/switch-agent ─────────────────
 

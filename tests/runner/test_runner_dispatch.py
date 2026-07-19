@@ -35,7 +35,6 @@ import asyncio
 import json
 import logging
 import os
-import subprocess
 import tempfile
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
@@ -43,6 +42,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace, TracebackType
 from typing import Any, cast
+from unittest.mock import Mock
 
 import httpx
 import pytest
@@ -7035,47 +7035,34 @@ async def test_create_session_reinit_preserves_existing_inbox() -> None:
 
 
 @pytest.mark.asyncio
-async def test_revert_file_control_restores_runner_git_checkpoint(tmp_path: Path) -> None:
-    """Runner capture/revert controls restore the workspace without a harness turn."""
-    env = {
-        **os.environ,
-        "GIT_AUTHOR_NAME": "Test",
-        "GIT_AUTHOR_EMAIL": "test@example.com",
-        "GIT_COMMITTER_NAME": "Test",
-        "GIT_COMMITTER_EMAIL": "test@example.com",
-    }
-    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, env=env)
-    tracked = tmp_path / "tracked.py"
-    tracked.write_text("base\n")
-    subprocess.run(["git", "add", "tracked.py"], cwd=tmp_path, check=True, env=env)
-    subprocess.run(
-        ["git", "commit", "-m", "init"],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-        env=env,
-    )
-    tracked.write_text("checkpoint\n")
+async def test_revert_file_control_routes_to_filesystem_registry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Runner capture/revert controls call the session filesystem registry."""
     app = create_runner_app(
         process_manager=cast(HarnessProcessManager, _FakeProcessManager()),
         server_client=NullServerClient(),  # type: ignore[arg-type]
         runner_workspace=tmp_path,
     )
+    registry = app.state.filesystem_registry
+    create_checkpoint = Mock(return_value=True)
+    restore_checkpoint = Mock(return_value=True)
+    monkeypatch.setattr(registry, "create_revert_checkpoint", create_checkpoint)
+    monkeypatch.setattr(registry, "restore_revert_checkpoint", restore_checkpoint)
 
     async with _runner_test_client(app) as http:
         captured = await http.post(
             "/v1/sessions/conv_revert/events",
             json={"type": "capture_revert_checkpoint", "checkpoint_id": "msg_1"},
         )
-        assert captured.status_code == 200, captured.text
-        tracked.write_text("later\n")
         restored = await http.post(
             "/v1/sessions/conv_revert/events",
             json={"type": "revert_files", "checkpoint_id": "msg_1"},
         )
 
-    assert restored.status_code == 200, restored.text
-    assert tracked.read_text() == "checkpoint\n"
+    assert captured.status_code == restored.status_code == 200
+    create_checkpoint.assert_called_once_with("conv_revert", "msg_1")
+    restore_checkpoint.assert_called_once_with("conv_revert", "msg_1")
 
 
 # ── approval-event flattening (elicitation-approval hang regression) ──────

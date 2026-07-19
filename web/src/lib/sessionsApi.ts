@@ -550,9 +550,7 @@ export async function forkSession(
  *   is running) so the caller can surface it inline.
  */
 export interface RevertSessionResult {
-  session: Session;
   draft: string;
-  filesReverted: boolean;
   fileRevertError: string | null;
 }
 
@@ -560,28 +558,21 @@ export interface RevertSessionResult {
 export async function revertSession(
   sourceId: string,
   userMessageId: string,
-  options: { revertFiles?: boolean } = {},
+  revertFiles = false,
 ): Promise<RevertSessionResult> {
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sourceId)}/revert`, {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-Omnigent-Client": getClientSurface() },
     body: JSON.stringify({
       user_message_id: userMessageId,
-      revert_files: options.revertFiles ?? false,
+      revert_files: revertFiles,
     }),
   });
   const body = await readJsonOrThrow<{
-    session: SessionResponseWire;
     draft: string;
-    files_reverted?: boolean;
-    file_revert_error?: string | null;
+    file_revert_error: string | null;
   }>(res);
-  return {
-    session: sessionFromWire(body.session),
-    draft: body.draft,
-    filesReverted: body.files_reverted ?? false,
-    fileRevertError: body.file_revert_error ?? null,
-  };
+  return { draft: body.draft, fileRevertError: body.file_revert_error };
 }
 
 export async function switchSessionAgent(sessionId: string, agentId: string): Promise<Session> {

@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { HistoryIcon, Loader2Icon } from "lucide-react";
-import { useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -63,68 +63,54 @@ export function RevertSessionDialog({
   onOpenChange: (open: boolean) => void;
 }) {
   const queryClient = useQueryClient();
-  const [messages, setMessages] = useState<MessageItem[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [fileChoice, setFileChoice] = useState<"keep" | "revert">("keep");
-  const [loading, setLoading] = useState(false);
+  const [revertFiles, setRevertFiles] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const {
+    data: messages = [],
+    isLoading: loading,
+    error: loadError,
+  } = useQuery({
+    queryKey: ["session", sourceSessionId, "revert-messages"],
+    queryFn: () => loadUserMessages(sourceSessionId),
+    enabled: open,
+  });
 
   useEffect(() => {
-    if (!open) return;
-    let cancelled = false;
-    setLoading(true);
-    setError(null);
-    void loadUserMessages(sourceSessionId)
-      .then((loaded) => {
-        if (cancelled) return;
-        setMessages(loaded);
-        setSelectedId(
-          initialUserMessageId && loaded.some((message) => message.id === initialUserMessageId)
-            ? initialUserMessageId
-            : (loaded[0]?.id ?? null),
-        );
-      })
-      .catch((reason: unknown) => {
-        if (!cancelled) {
-          setError(
-            reason instanceof Error ? reason.message : "Couldn't load conversation history.",
-          );
-        }
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [initialUserMessageId, open, sourceSessionId]);
+    if (!open || loading) return;
+    setSelectedId(
+      initialUserMessageId && messages.some((message) => message.id === initialUserMessageId)
+        ? initialUserMessageId
+        : (messages[0]?.id ?? null),
+    );
+  }, [initialUserMessageId, loading, messages, open]);
 
   useEffect(() => {
     if (!open) {
-      setFileChoice("keep");
+      queryClient.removeQueries({
+        queryKey: ["session", sourceSessionId, "revert-messages"],
+      });
+      setRevertFiles(false);
       setError(null);
     }
-  }, [open]);
+  }, [open, queryClient, sourceSessionId]);
+
+  const errorMessage = error ?? loadError?.message ?? null;
 
   async function handleRevert(): Promise<void> {
     if (!selectedId || submitting) return;
     setSubmitting(true);
     setError(null);
     try {
-      const result = await revertSession(sourceSessionId, selectedId, {
-        revertFiles: fileChoice === "revert",
-      });
-      if (result.session.id !== sourceSessionId) {
-        throw new Error("Revert unexpectedly created a different session.");
-      }
+      const result = await revertSession(sourceSessionId, selectedId, revertFiles);
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
       await useChatStore.getState().reloadCurrent();
       setSessionTextDraft(sourceSessionId, result.draft);
       onOpenChange(false);
       showToast(
         result.fileRevertError ||
-          (result.filesReverted
+          (revertFiles
             ? "Conversation and files reverted."
             : "Conversation reverted; file changes kept."),
       );
@@ -189,56 +175,31 @@ export function RevertSessionDialog({
           )}
         </div>
 
-        <div className="grid gap-5 rounded-xl border p-4">
-          <fieldset className="grid gap-3">
-            <legend className="mb-2 text-sm font-semibold text-foreground">File changes</legend>
-            <label
-              className={cn(
-                "flex cursor-pointer items-start gap-3 rounded-lg border p-3",
-                fileChoice === "keep" && "border-primary/50 bg-accent",
-              )}
-            >
-              <input
-                type="radio"
-                name="revert-files"
-                checked={fileChoice === "keep"}
-                onChange={() => setFileChoice("keep")}
-                className="mt-0.5 accent-primary"
-              />
-              <span>
-                <span className="block text-sm font-medium">Keep current changes</span>
-                <span className="block text-xs text-muted-foreground">
-                  Only rewind the conversation.
-                </span>
+        <div className="rounded-xl border p-4">
+          <label
+            className={cn(
+              "flex items-start gap-3",
+              sourceWorkspace && canModifySource ? "cursor-pointer" : "opacity-50",
+            )}
+          >
+            <input
+              type="checkbox"
+              checked={revertFiles}
+              disabled={!sourceWorkspace || !canModifySource}
+              onChange={(event) => setRevertFiles(event.target.checked)}
+              className="mt-0.5 accent-primary"
+            />
+            <span>
+              <span className="block text-sm font-medium">Revert file changes</span>
+              <span className="block text-xs text-muted-foreground">
+                Return your files to how they were before this message.
               </span>
-            </label>
-            <label
-              className={cn(
-                "flex items-start gap-3 rounded-lg border p-3",
-                sourceWorkspace && canModifySource ? "cursor-pointer" : "opacity-50",
-                fileChoice === "revert" && "border-primary/50 bg-accent",
-              )}
-            >
-              <input
-                type="radio"
-                name="revert-files"
-                checked={fileChoice === "revert"}
-                disabled={!sourceWorkspace || !canModifySource}
-                onChange={() => setFileChoice("revert")}
-                className="mt-0.5 accent-primary"
-              />
-              <span>
-                <span className="block text-sm font-medium">Restore file changes</span>
-                <span className="block text-xs text-muted-foreground">
-                  Restores a Git checkpoint captured before the selected message.
-                </span>
-              </span>
-            </label>
-          </fieldset>
+            </span>
+          </label>
         </div>
 
         <div>
-          {error && <p className="mb-2 text-sm text-destructive">{error}</p>}
+          {errorMessage && <p className="mb-2 text-sm text-destructive">{errorMessage}</p>}
           <DialogFooter>
             <Button variant="outline" onClick={() => onOpenChange(false)} disabled={submitting}>
               Cancel

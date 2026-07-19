@@ -936,11 +936,7 @@ class SessionsNamespace:
         *,
         revert_files: bool = False,
     ) -> dict[str, Any]:
-        """Rewind a session to immediately before a past user message.
-
-        The response contains the updated ``session``, the selected prompt as
-        ``draft``, and optional file-rollback results.
-        """
+        """Rewind a session and return the selected prompt plus any file warning."""
         body: dict[str, Any] = {
             "user_message_id": user_message_id,
             "revert_files": revert_files,

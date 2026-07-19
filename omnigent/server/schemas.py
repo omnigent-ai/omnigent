@@ -2074,12 +2074,10 @@ class SessionRevertRequest(BaseModel):
 
 
 class SessionRevertResponse(BaseModel):
-    """Rewound session plus the selected prompt and optional file result."""
+    """Selected prompt plus any non-fatal file-restore warning."""
 
-    session: SessionResponse
     draft: str
-    files_reverted: bool = False
-    file_revert_error: str | None = None
+    file_revert_error: str | None
 
 
 class ReadStatePutRequest(BaseModel):

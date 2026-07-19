@@ -5093,7 +5093,7 @@
         "type": "object"
       },
       "SessionRevertResponse": {
-        "description": "Rewound session plus the selected prompt and optional file result.",
+        "description": "Selected prompt plus any non-fatal file-restore warning.",
         "properties": {
           "draft": {
             "title": "Draft",
@@ -5109,19 +5109,11 @@
               }
             ],
             "title": "File Revert Error"
-          },
-          "files_reverted": {
-            "default": false,
-            "title": "Files Reverted",
-            "type": "boolean"
-          },
-          "session": {
-            "$ref": "#/components/schemas/SessionResponse"
           }
         },
         "required": [
-          "session",
-          "draft"
+          "draft",
+          "file_revert_error"
         ],
         "title": "SessionRevertResponse",
         "type": "object"

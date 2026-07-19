@@ -312,25 +312,12 @@ describe("forkSession", () => {
 });
 
 describe("revertSession", () => {
-  it("POSTs snake-case options and parses the nested session result", async () => {
+  it("POSTs snake-case options and parses the result", async () => {
     fetchMock.mockResolvedValueOnce(
-      mockJsonResponse({
-        session: {
-          id: "conv source",
-          agent_id: "agent_clone",
-          status: "idle",
-          created_at: 1704067200,
-          items: [],
-        },
-        draft: "retry this",
-        files_reverted: true,
-        file_revert_error: null,
-      }),
+      mockJsonResponse({ draft: "retry this", file_revert_error: null }),
     );
 
-    const result = await revertSession("conv source", "msg_1", {
-      revertFiles: true,
-    });
+    const result = await revertSession("conv source", "msg_1", true);
 
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe("/v1/sessions/conv%20source/revert");
@@ -338,9 +325,7 @@ describe("revertSession", () => {
       user_message_id: "msg_1",
       revert_files: true,
     });
-    expect(result.session.id).toBe("conv source");
-    expect(result.draft).toBe("retry this");
-    expect(result.filesReverted).toBe(true);
+    expect(result).toEqual({ draft: "retry this", fileRevertError: null });
   });
 });
 

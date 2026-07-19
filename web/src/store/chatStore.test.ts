@@ -464,14 +464,9 @@ describe("chatStore — switchTo", () => {
 
     const state = useChatStore.getState();
     expect(state.conversationId).toBe("conv_rewind");
-    expect(state.blocks).toHaveLength(2);
-    expect(
-      state.blocks.some(
-        (block) =>
-          block.type === "user_message" &&
-          block.content.some((part) => part.type === "input_text" && part.text === "discard"),
-      ),
-    ).toBe(false);
+    expect(state.blocks.map((block) => block.ctx.itemId)).toEqual(
+      original.slice(0, 2).map((item) => item.id),
+    );
   });
 
   it("hydrates pendingUserMessages from the snapshot's pending_inputs (native rebind)", async () => {

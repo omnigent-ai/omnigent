@@ -11,28 +11,22 @@ pytestmark = pytest.mark.asyncio
 
 async def test_revert_command_registered_and_filters_system_messages() -> None:
     """``/revert`` is discoverable and only offers real user prompts."""
+
+    def message(item_id: str, text: str, **extra: object) -> dict[str, object]:
+        return {
+            "id": item_id,
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": text}],
+            **extra,
+        }
+
     assert "/revert" in repl_mod.COMMANDS
     candidates = repl_mod._revert_user_messages(
         [
-            {
-                "id": "msg_real",
-                "type": "message",
-                "role": "user",
-                "content": [{"type": "input_text", "text": "retry me"}],
-            },
-            {
-                "id": "msg_system",
-                "type": "message",
-                "role": "user",
-                "content": [{"type": "input_text", "text": "[System: timer fired]"}],
-            },
-            {
-                "id": "msg_meta",
-                "type": "message",
-                "role": "user",
-                "is_meta": True,
-                "content": [{"type": "input_text", "text": "hidden"}],
-            },
+            message("msg_real", "retry me"),
+            message("msg_system", "[System: timer fired]"),
+            message("msg_meta", "hidden", is_meta=True),
         ]
     )
     assert [item["id"] for item in candidates] == ["msg_real"]

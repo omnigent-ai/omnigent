@@ -1128,9 +1128,7 @@ files and return `file_revert_error`.
 ```
 200 OK
 {
-  "session": { ...SessionResponse },
   "draft": "selected prompt text",
-  "files_reverted": false,
   "file_revert_error": null
 }
 

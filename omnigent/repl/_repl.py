@@ -5620,14 +5620,8 @@ async def _cmd_revert(
             message_id,
             revert_files=revert_files,
         )
-        reverted = result.get("session")
-        new_id = reverted.get("id") if isinstance(reverted, dict) else None
-        if not isinstance(new_id, str):
-            raise RuntimeError("Revert response did not include a session id")
-        if new_id != current_id:
-            raise RuntimeError("Revert unexpectedly created a different session")
         await _attach_to_conversation(
-            new_id,
+            current_id,
             session,
             client,
             host,
