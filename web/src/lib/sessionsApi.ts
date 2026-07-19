@@ -549,6 +549,41 @@ export async function forkSession(
  * @throws Error carrying the server's failure detail (e.g. 409 when a turn
  *   is running) so the caller can surface it inline.
  */
+export interface RevertSessionResult {
+  session: Session;
+  draft: string;
+  filesReverted: boolean;
+  fileRevertError: string | null;
+}
+
+/** Rewind a session to immediately before a selected user message. */
+export async function revertSession(
+  sourceId: string,
+  userMessageId: string,
+  options: { revertFiles?: boolean } = {},
+): Promise<RevertSessionResult> {
+  const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sourceId)}/revert`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Omnigent-Client": getClientSurface() },
+    body: JSON.stringify({
+      user_message_id: userMessageId,
+      revert_files: options.revertFiles ?? false,
+    }),
+  });
+  const body = await readJsonOrThrow<{
+    session: SessionResponseWire;
+    draft: string;
+    files_reverted?: boolean;
+    file_revert_error?: string | null;
+  }>(res);
+  return {
+    session: sessionFromWire(body.session),
+    draft: body.draft,
+    filesReverted: body.files_reverted ?? false,
+    fileRevertError: body.file_revert_error ?? null,
+  };
+}
+
 export async function switchSessionAgent(sessionId: string, agentId: string): Promise<Session> {
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(sessionId)}/switch-agent`,

@@ -38,10 +38,9 @@ FORK_SOURCE_LABEL_KEY = "omnigent.fork.source_id"
 # ``external_session_id`` is still NULL. Cleared/ignored thereafter.
 FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY = "omnigent.fork.source_external_session_id"
 
-# Fork directive: set when the fork binds a NATIVE target harness
-# (claude-native / codex-native) whose history should carry over. A native
-# CLI ignores the Omnigent transcript, so the runner rebuilds the target's
-# on-disk transcript before launch. Two rebuild paths share this directive:
+# Native-history replay directive used by forks, agent switches, and in-place
+# rewinds. A native CLI ignores the Omnigent transcript, so the runner rebuilds
+# the target's on-disk transcript before launch. Two rebuild paths share it:
 # when the source was a SAME-FAMILY native session its captured
 # ``external_session_id`` is also stamped (see
 # FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY) and the runner clones that
@@ -104,15 +103,17 @@ PROJECT_LABEL_KEY = "omni_project"
 #     typed re-confirmation and no banner, violating the "impossible to
 #     enable accidentally" contract (#657). Dropping it forces each session
 #     that runs bypass to make its own explicit opt-in.
-_INSTANCE_SCOPED_LABEL_KEYS = frozenset(
+_RUNTIME_INSTANCE_LABEL_KEYS = frozenset(
     {
         "omnigent.claude_native.bridge_id",
         "omnigent.codex_native.bridge_id",
         "omnigent.last_context_tokens",
         "omnigent.last_context_window",
-        CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
     }
 )
+_INSTANCE_SCOPED_LABEL_KEYS = _RUNTIME_INSTANCE_LABEL_KEYS | {
+    CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY
+}
 
 # Source identity belongs only to the original imported session. Unlike runtime
 # instance labels, these survive an in-place agent switch but never a fork.
@@ -1334,6 +1335,28 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def rewind_conversation(
+        self,
+        conversation_id: str,
+        *,
+        before_item_id: str,
+        carry_history_into_native: bool = False,
+    ) -> Conversation:
+        """Delete a selected item and everything after it in the same session.
+
+        Resets the native runtime identity so a supported native harness
+        rebuilds from the retained Agent Platform items on its next launch.
+
+        :param conversation_id: Session to rewind, e.g. ``"conv_abc123"``.
+        :param before_item_id: First item to delete, e.g. ``"msg_def456"``.
+        :param carry_history_into_native: Whether to mark the retained items for
+            native transcript replay.
+        :returns: The updated conversation with the same id.
+        :raises LookupError: If the conversation or cutoff item does not exist.
+        """
+        ...
+
+    @abstractmethod
     def fork_conversation(
         self,
         source_conversation_id: str,
@@ -1426,8 +1449,8 @@ class ConversationStore(ABC):
         :returns: The newly created :class:`Conversation`.
         :raises LookupError: If no conversation with
             *source_conversation_id* exists.
-        :raises ValueError: If *up_to_response_id* is set but no item in
-            the source conversation has that ``response_id``.
+        :raises ValueError: If the requested response/item cutoff is invalid
+            or does not exist in the source conversation.
         """
         ...
 

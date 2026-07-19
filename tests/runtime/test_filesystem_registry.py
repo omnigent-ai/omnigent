@@ -1038,3 +1038,51 @@ def test_git_line_counts_numstat_failure_degrades_but_status_intact(
     assert rec["status"] == "modified"
     assert rec["lines_added"] is None, rec
     assert rec["lines_removed"] is None, rec
+
+
+def test_git_revert_checkpoint_restores_tracked_and_untracked_files(tmp_path: Path) -> None:
+    """A checkpoint restores the exact non-ignored workspace tree without moving HEAD."""
+    env = _init_git_with_commit(tmp_path, "tracked.py", "base\n")
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    ).stdout.strip()
+    (tmp_path / "tracked.py").write_text("at checkpoint\n")
+    (tmp_path / "checkpoint-only.py").write_text("keep me\n")
+    reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+
+    assert reg.create_revert_checkpoint("conv_test", "msg_1") is True
+
+    (tmp_path / "tracked.py").write_text("after checkpoint\n")
+    (tmp_path / "checkpoint-only.py").unlink()
+    (tmp_path / "later.py").write_text("remove me\n")
+
+    assert reg.restore_revert_checkpoint("conv_test", "msg_1") is True
+    assert (tmp_path / "tracked.py").read_text() == "at checkpoint\n"
+    assert (tmp_path / "checkpoint-only.py").read_text() == "keep me\n"
+    assert not (tmp_path / "later.py").exists()
+    restored_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    ).stdout.strip()
+    assert restored_head == head
+    assert (
+        subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=tmp_path, env=env).returncode
+        == 0
+    )
+
+
+def test_non_git_revert_checkpoint_is_unsupported(tmp_path: Path) -> None:
+    """Non-Git workspaces keep files instead of pretending a checkpoint exists."""
+    reg = AgentEditFilesystemRegistry(watch_path=tmp_path)
+
+    assert reg.create_revert_checkpoint("conv_test", "msg_1") is False
+    assert reg.restore_revert_checkpoint("conv_test", "msg_1") is False

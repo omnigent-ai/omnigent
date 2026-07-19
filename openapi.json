@@ -5071,6 +5071,61 @@
         "title": "SessionResponse",
         "type": "object"
       },
+      "SessionRevertRequest": {
+        "additionalProperties": false,
+        "description": "Request to rewind a session to before a past user message.",
+        "properties": {
+          "revert_files": {
+            "default": false,
+            "title": "Revert Files",
+            "type": "boolean"
+          },
+          "user_message_id": {
+            "minLength": 1,
+            "title": "User Message Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_message_id"
+        ],
+        "title": "SessionRevertRequest",
+        "type": "object"
+      },
+      "SessionRevertResponse": {
+        "description": "Rewound session plus the selected prompt and optional file result.",
+        "properties": {
+          "draft": {
+            "title": "Draft",
+            "type": "string"
+          },
+          "file_revert_error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "File Revert Error"
+          },
+          "files_reverted": {
+            "default": false,
+            "title": "Files Reverted",
+            "type": "boolean"
+          },
+          "session": {
+            "$ref": "#/components/schemas/SessionResponse"
+          }
+        },
+        "required": [
+          "session",
+          "draft"
+        ],
+        "title": "SessionRevertResponse",
+        "type": "object"
+      },
       "SessionSandboxStatusEvent": {
         "description": "Managed-sandbox launch progress for a `host_type=\"managed\"` session.\n\nA managed create returns before its sandbox exists; the Omnigent\nserver emits this event as the background launch pipeline advances\nso the Web UI can show live provisioning progress on the session\npage instead of a silent dead chat: sandbox provision \u2192 repository\nclone \u2192 host startup \u2192 runner connect \u2192 ready, or a terminal\nfailure with the reason.",
         "properties": {
@@ -11209,6 +11264,59 @@
           }
         },
         "summary": "Fork Session",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{source_id}/revert": {
+      "post": {
+        "description": "Rewind one session to immediately before a selected user message.",
+        "operationId": "revert_session_v1_sessions__source_id__revert_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "source_id",
+            "required": true,
+            "schema": {
+              "title": "Source Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionRevertRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionRevertResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Revert Session",
         "tags": [
           "sessions"
         ]

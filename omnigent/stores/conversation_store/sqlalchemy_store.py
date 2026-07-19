@@ -79,6 +79,7 @@ from omnigent.session_import.models import (
 from omnigent.stores.conversation_store import (
     _FORK_ONLY_DROPPED_LABEL_KEYS,
     _INSTANCE_SCOPED_LABEL_KEYS,
+    _RUNTIME_INSTANCE_LABEL_KEYS,
     FORK_CARRY_HISTORY_LABEL_KEY,
     FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
     FORK_SOURCE_LABEL_KEY,
@@ -3094,6 +3095,94 @@ class SqlAlchemyConversationStore(ConversationStore):
         return _created_session_from_rows(
             conversation_row, meta_row, agent_config_row, agent_row, labels
         )
+
+    def rewind_conversation(
+        self,
+        conversation_id: str,
+        *,
+        before_item_id: str,
+        carry_history_into_native: bool = False,
+    ) -> Conversation:
+        """Delete a selected item and all later items from one conversation."""
+        now = now_epoch()
+        with self._conv_session() as session:
+            conversation = session.get(
+                SqlConversation,
+                (current_workspace_id(), conversation_id),
+            )
+            if conversation is None:
+                raise LookupError(f"conversation not found: {conversation_id!r}")
+            target_position = session.execute(
+                select(SqlConversationItem.position).where(
+                    SqlConversationItem.workspace_id == current_workspace_id(),
+                    SqlConversationItem.conversation_id == conversation_id,
+                    SqlConversationItem.id == before_item_id,
+                )
+            ).scalar_one_or_none()
+            if target_position is None:
+                raise LookupError(
+                    f"item not found in conversation {conversation_id!r}: {before_item_id!r}"
+                )
+
+            # ponytail: child sessions lack an origin item id; add that link before
+            # cascading post-rewind children instead of guessing from timestamps.
+            kept_items = (
+                session.execute(
+                    select(SqlConversationItem)
+                    .where(
+                        SqlConversationItem.workspace_id == current_workspace_id(),
+                        SqlConversationItem.conversation_id == conversation_id,
+                        SqlConversationItem.position < target_position,
+                    )
+                    .order_by(SqlConversationItem.position.asc())
+                )
+                .scalars()
+                .all()
+            )
+            delete_fts_by_conversation(session, conversation_id)
+            session.execute(
+                delete(SqlConversationItem).where(
+                    SqlConversationItem.workspace_id == current_workspace_id(),
+                    SqlConversationItem.conversation_id == conversation_id,
+                    SqlConversationItem.position >= target_position,
+                )
+            )
+            for item in kept_items:
+                insert_fts(session, item.id, conversation_id, item.search_text or "")
+
+            conversation.next_position = target_position
+            conversation.updated_at = now
+            reset_label_keys = _RUNTIME_INSTANCE_LABEL_KEYS | {
+                FORK_CARRY_HISTORY_LABEL_KEY,
+                FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
+            }
+            session.execute(
+                delete(SqlConversationLabel).where(
+                    SqlConversationLabel.workspace_id == current_workspace_id(),
+                    SqlConversationLabel.conversation_id == conversation_id,
+                    SqlConversationLabel.key.in_(reset_label_keys),
+                )
+            )
+            if carry_history_into_native:
+                _upsert_labels(
+                    session,
+                    conversation_id,
+                    {FORK_CARRY_HISTORY_LABEL_KEY: "1"},
+                    now,
+                )
+
+        with self._session() as session:
+            metadata = session.get(
+                SqlConversationMetadata,
+                (current_workspace_id(), conversation_id),
+            )
+            if metadata is not None:
+                metadata.external_session_id = None
+
+        updated = self.get_conversation(conversation_id)
+        if updated is None:
+            raise LookupError(f"conversation not found: {conversation_id!r}")
+        return updated
 
     def fork_conversation(
         self,

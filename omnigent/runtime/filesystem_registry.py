@@ -23,10 +23,14 @@ defines the full public interface.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import fnmatch
+import hashlib
 import logging
+import os
 import subprocess
+import tempfile
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -39,6 +43,7 @@ _logger = logging.getLogger(__name__)
 # short so a slow/hung repo can't block the panel; each call degrades cleanly
 # on timeout rather than raising. Bump if very large repos need more headroom.
 _GIT_TIMEOUT_SECONDS = 5
+_GIT_REVERT_TIMEOUT_SECONDS = 30
 
 
 class GitStatusUnavailable(RuntimeError):
@@ -389,13 +394,29 @@ class FilesystemRegistry(ABC):
         """Drop per-session state when a session is deleted.
 
         Called on session teardown so implementations can evict in-memory
-        events and snapshots.  No-op by default (e.g.
-        :class:`GitFilesystemRegistry` holds no per-session state).
+        events and snapshots.  No-op by default.
 
         :param conversation_id: The conversation to remove,
             e.g. ``"conv_abc123"``.
         """
         return
+
+    def create_revert_checkpoint(self, session_id: str, checkpoint_id: str) -> bool:
+        """Snapshot the workspace before a user turn.
+
+        The base implementation reports unsupported; Git-backed registries
+        override it with an object-database snapshot that survives runner
+        restarts.
+        """
+        return False
+
+    def restore_revert_checkpoint(self, session_id: str, checkpoint_id: str) -> bool:
+        """Restore a checkpoint created by :meth:`create_revert_checkpoint`.
+
+        The base implementation reports unsupported. Implementations must
+        either restore the whole watched workspace or leave it unchanged.
+        """
+        return False
 
     def start(self) -> None:
         """Start any background observers.  Idempotent."""
@@ -692,6 +713,124 @@ class GitFilesystemRegistry(FilesystemRegistry):
         """
         super().__init__(watch_path)
         self._git_root = git_root
+
+    def create_revert_checkpoint(self, session_id: str, checkpoint_id: str) -> bool:
+        """Write the current workspace tree to a private Git ref.
+
+        A temporary index captures tracked, staged, unstaged, and untracked
+        (non-ignored) files without touching the user's real index or branch.
+        """
+        ref = self._revert_ref(session_id, checkpoint_id)
+        with tempfile.TemporaryDirectory(prefix="omnigent-revert-") as tmp:
+            env = {**os.environ, "GIT_INDEX_FILE": str(Path(tmp) / "index")}
+            head = self._git_optional(["rev-parse", "--verify", "HEAD"])
+            self._git(["read-tree", head if head is not None else "--empty"], env=env)
+            self._git(["add", "-A", "--", self._workspace_pathspec()], env=env)
+            tree = self._git(["write-tree"], env=env)
+            commit_args = ["commit-tree", tree]
+            if head is not None:
+                commit_args.extend(["-p", head])
+            commit = self._git(commit_args, env=env, input_=b"Omnigent revert checkpoint\n")
+            self._git(["update-ref", ref, commit])
+        return True
+
+    def restore_revert_checkpoint(self, session_id: str, checkpoint_id: str) -> bool:
+        """Restore the watched workspace to a private checkpoint tree.
+
+        The current state is checkpointed first and automatically restored if
+        applying the target tree fails, so a partial Git operation cannot lose
+        the user's work.
+        """
+        target = self._git_optional(
+            ["rev-parse", "--verify", self._revert_ref(session_id, checkpoint_id)]
+        )
+        if target is None:
+            raise KeyError(f"revert checkpoint not found: {checkpoint_id}")
+        rescue_id = f"rescue-{time.time_ns()}"
+        self.create_revert_checkpoint(session_id, rescue_id)
+        rescue = self._git(["rev-parse", "--verify", self._revert_ref(session_id, rescue_id)])
+        try:
+            self._restore_tree(target)
+        except Exception:
+            with contextlib.suppress(Exception):
+                self._restore_tree(rescue)
+            raise
+        finally:
+            self._git_optional(["update-ref", "-d", self._revert_ref(session_id, rescue_id)])
+        return True
+
+    def unregister_conversation(self, conversation_id: str) -> None:
+        """Delete private checkpoint refs for a removed session."""
+        prefix = self._revert_ref_prefix(conversation_id)
+        refs = self._git_optional(["for-each-ref", "--format=%(refname)", prefix])
+        for ref in refs.splitlines() if refs else []:
+            self._git_optional(["update-ref", "-d", ref])
+
+    def _restore_tree(self, target: str) -> None:
+        """Make the watched workspace match *target* without moving HEAD."""
+        head = self._git_optional(["rev-parse", "--verify", "HEAD"])
+        if head is None:
+            raise RuntimeError("cannot restore a revert checkpoint in a repository without HEAD")
+        pathspec = self._workspace_pathspec()
+        patch = self._git_bytes(["diff", "--binary", "--full-index", head, target, "--", pathspec])
+        self._git(["restore", "--source", head, "--staged", "--worktree", "--", pathspec])
+        # ponytail: ignored files are intentionally outside checkpoints; add an
+        # archive backend if reverting generated/ignored artifacts becomes necessary.
+        self._git(["clean", "-fd", "--", pathspec])
+        if patch:
+            self._git(["apply", "--whitespace=nowarn", "-"], input_=patch)
+
+    def _workspace_pathspec(self) -> str:
+        relative = self._cwd.relative_to(self._git_root)
+        return "." if relative == Path(".") else f":(literal){relative.as_posix()}"
+
+    @staticmethod
+    def _ref_component(value: str) -> str:
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+    def _revert_ref_prefix(self, session_id: str) -> str:
+        return f"refs/omnigent/revert/{self._ref_component(session_id)}"
+
+    def _revert_ref(self, session_id: str, checkpoint_id: str) -> str:
+        return f"{self._revert_ref_prefix(session_id)}/{self._ref_component(checkpoint_id)}"
+
+    def _git(
+        self,
+        args: list[str],
+        *,
+        env: dict[str, str] | None = None,
+        input_: bytes | None = None,
+    ) -> str:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=self._git_root,
+            env=env,
+            input=input_,
+            capture_output=True,
+            timeout=_GIT_REVERT_TIMEOUT_SECONDS,
+        )
+        if result.returncode != 0:
+            detail = result.stderr.decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"git {' '.join(args)} failed: {detail or result.returncode}")
+        return result.stdout.decode("utf-8", errors="replace").strip()
+
+    def _git_bytes(self, args: list[str]) -> bytes:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=self._git_root,
+            capture_output=True,
+            timeout=_GIT_REVERT_TIMEOUT_SECONDS,
+        )
+        if result.returncode != 0:
+            detail = result.stderr.decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"git {' '.join(args)} failed: {detail or result.returncode}")
+        return result.stdout
+
+    def _git_optional(self, args: list[str]) -> str | None:
+        try:
+            return self._git(args)
+        except (OSError, RuntimeError, subprocess.TimeoutExpired):
+            return None
 
     def list_changed_files(self, conversation_id: str, *, limit: int) -> list[dict[str, Any]]:
         """Return all uncommitted changes in the working tree, newest first.

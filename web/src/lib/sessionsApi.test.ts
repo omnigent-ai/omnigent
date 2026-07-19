@@ -20,6 +20,7 @@ import {
   listRunners,
   openSessionStream,
   postEvent,
+  revertSession,
   SESSION_HISTORY_PAGE_SIZE,
   stopSession,
   updateSession,
@@ -307,6 +308,39 @@ describe("forkSession", () => {
   it("surfaces a non-ok response as a thrown error (e.g. 403 no access)", async () => {
     fetchMock.mockResolvedValueOnce(mockJsonResponse({}, { ok: false, status: 403 }));
     await expect(forkSession("conv_src")).rejects.toThrow(/403/);
+  });
+});
+
+describe("revertSession", () => {
+  it("POSTs snake-case options and parses the nested session result", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        session: {
+          id: "conv source",
+          agent_id: "agent_clone",
+          status: "idle",
+          created_at: 1704067200,
+          items: [],
+        },
+        draft: "retry this",
+        files_reverted: true,
+        file_revert_error: null,
+      }),
+    );
+
+    const result = await revertSession("conv source", "msg_1", {
+      revertFiles: true,
+    });
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/v1/sessions/conv%20source/revert");
+    expect(JSON.parse(init.body as string)).toEqual({
+      user_message_id: "msg_1",
+      revert_files: true,
+    });
+    expect(result.session.id).toBe("conv source");
+    expect(result.draft).toBe("retry this");
+    expect(result.filesReverted).toBe(true);
   });
 });
 

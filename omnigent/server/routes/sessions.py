@@ -263,6 +263,8 @@ from omnigent.server.schemas import (
     SessionResourceObject,
     SessionResourcePaginatedList,
     SessionResponse,
+    SessionRevertRequest,
+    SessionRevertResponse,
     SessionSandboxStatusEvent,
     SessionSkillsEvent,
     SessionStatusEvent,
@@ -5283,6 +5285,7 @@ async def _persist_external_conversation_item(
     body: SessionEventInput,
     conversation_store: ConversationStore,
     created_by: str | None = None,
+    runner_router: RunnerRouter | None = None,
 ) -> str:
     """
     Persist and broadcast a conversation item produced outside AP.
@@ -5349,6 +5352,21 @@ async def _persist_external_conversation_item(
     persisted_items = await asyncio.to_thread(conversation_store.append, session_id, [item])
     await _seed_missing_title_from_user_message(conv, item, conversation_store)
     persisted = persisted_items[0]
+    if (
+        persisted.type == "message"
+        and isinstance(persisted.data, MessageData)
+        and persisted.data.role == "user"
+        and not persisted.data.is_meta
+    ):
+        # Native TUI input bypasses the runner's regular message-ingest path.
+        # Capture here, when the transcript first mirrors the accepted prompt,
+        # so direct terminal input gets the same file checkpoint as web input.
+        await _forward_session_change_to_runner(
+            session_id,
+            runner_router,
+            {"type": "capture_revert_checkpoint", "checkpoint_id": persisted.id},
+            timeout=35.0,
+        )
     _publish_external_conversation_item(
         session_id, persisted, cleared_pending_id=cleared_pending_id
     )
@@ -8386,6 +8404,7 @@ async def _forward_native_terminal_message(
     body: SessionEventInput,
     file_store: FileStore | None = None,
     artifact_store: ArtifactStore | None = None,
+    checkpoint_id: str | None = None,
 ) -> None:
     """
     Forward one Omnigent web-chat message to the native terminal harness.
@@ -8411,6 +8430,8 @@ async def _forward_native_terminal_message(
     """
     display_name, _, _ = _native_terminal_runtime(conv)
     event = _build_native_terminal_message_event(conv, body)
+    if checkpoint_id is not None:
+        event["revert_checkpoint_id"] = checkpoint_id
     _logger.info(
         "%s terminal message forward starting: session=%s block_types=%s",
         display_name,
@@ -8542,6 +8563,8 @@ async def _forward_session_change_to_runner(
     session_id: str,
     runner_router: Any,
     event: dict[str, Any],
+    *,
+    timeout: float = 5.0,
 ) -> _RunnerForwardResult | None:
     """
     Best-effort POST a control event to the bound runner.
@@ -8581,6 +8604,7 @@ async def _forward_session_change_to_runner(
         ``{"type": "effort_change", "effort": "high"}``,
         ``{"type": "model_change", "model": "claude-opus-4-7"}``, or
         ``{"type": "compact"}``.
+    :param timeout: Runner POST timeout in seconds.
     :returns: The runner's HTTP status/body, or ``None`` when no
         runner client could be resolved or the POST failed at the
         transport layer (in both cases the AP-side persisted value /
@@ -8597,7 +8621,7 @@ async def _forward_session_change_to_runner(
         resp = await runner_client.post(
             f"/v1/sessions/{session_id}/events",
             json=event,
-            timeout=5.0,
+            timeout=timeout,
         )
     except (httpx.HTTPError, ConnectionError):
         _logger.exception(
@@ -9809,6 +9833,7 @@ async def _dispatch_session_event_to_runner(
                 body,
                 file_store=file_store,
                 artifact_store=artifact_store,
+                checkpoint_id=pending_id,
             )
             forwarded = True
         finally:
@@ -10901,6 +10926,26 @@ async def _ensure_runner_relay_ready(
 # Per-session compaction locks so concurrent ``/compact`` POSTs
 # don't race.
 _COMPACT_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def _list_all_items_for_revert(
+    conversation_store: ConversationStore,
+    session_id: str,
+) -> list[ConversationItem]:
+    """Read a complete transcript through the store's cursor contract."""
+    items: list[ConversationItem] = []
+    after: str | None = None
+    while True:
+        page = conversation_store.list_items(
+            session_id,
+            limit=1000,
+            after=after,
+            order="asc",
+        )
+        items.extend(page.data)
+        if not page.has_more or not page.data:
+            return items
+        after = page.data[-1].id
 
 
 async def _run_compact_locked(
@@ -16577,6 +16622,154 @@ def create_sessions_router(
             agent_name=base_agent.name,
         )
 
+    # ── POST /sessions/{source_id}/revert ────────────────────────
+
+    @router.post(
+        "/sessions/{source_id}/revert",
+        response_model=None,
+        responses={200: {"model": SessionRevertResponse}},
+    )
+    async def revert_session(
+        request: Request,
+        source_id: str,
+        body: SessionRevertRequest,
+    ) -> SessionRevertResponse:
+        """Rewind one session to immediately before a selected user message."""
+        user_id = _get_user_id(request, auth_provider)
+        access = await _require_access_and_level(
+            user_id,
+            source_id,
+            LEVEL_EDIT,
+            permission_store,
+            conversation_store,
+        )
+        source = access.conversation
+        if source is None:
+            source = await asyncio.to_thread(conversation_store.get_conversation, source_id)
+        if source is None:
+            raise _session_not_found()
+        if source.kind == "sub_agent":
+            raise OmnigentError(
+                "Only top-level sessions can be reverted.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if _session_status_from_cache(source_id) in ("running", "waiting"):
+            raise OmnigentError(
+                "Wait for the current turn to finish before reverting.",
+                code=ErrorCode.CONFLICT,
+            )
+
+        items = await asyncio.to_thread(
+            _list_all_items_for_revert,
+            conversation_store,
+            source_id,
+        )
+        target_index = next(
+            (index for index, item in enumerate(items) if item.id == body.user_message_id),
+            None,
+        )
+        if target_index is None:
+            raise OmnigentError(
+                f"User message not found: {body.user_message_id!r}",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        target = items[target_index]
+        if (
+            target.type != "message"
+            or not isinstance(target.data, MessageData)
+            or target.data.role != "user"
+            or target.data.is_meta
+            or (_message_text(target.data.content) or "").lstrip().startswith("[System:")
+        ):
+            raise OmnigentError(
+                "The revert point must be a user message.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if source.agent_id is None:
+            raise OmnigentError("Session has no agent binding.", code=ErrorCode.INVALID_INPUT)
+        agent = await asyncio.to_thread(agent_store.get, source.agent_id)
+        if agent is None:
+            raise OmnigentError("Session agent not found.", code=ErrorCode.NOT_FOUND)
+
+        target_is_cursor = await asyncio.to_thread(_agent_carries_cursor_fork_history, agent)
+        carry_history_into_native = target_is_cursor or await asyncio.to_thread(
+            _agent_carries_native_fork_history,
+            agent,
+        )
+        is_native = await asyncio.to_thread(_agent_is_native, agent)
+        runner_client = (
+            await _get_runner_client(source_id, runner_router)
+            if is_native or body.revert_files
+            else None
+        )
+        if is_native and runner_client is not None:
+            try:
+                reset_response = await runner_client.post(
+                    f"/v1/sessions/{urllib.parse.quote(source_id, safe='')}/reset-state",
+                    timeout=15.0,
+                )
+                reset_response.raise_for_status()
+            except (httpx.HTTPError, ConnectionError) as exc:
+                raise OmnigentError(
+                    "The native session could not be reset. Please retry.",
+                    code=ErrorCode.RUNNER_UNAVAILABLE,
+                ) from exc
+
+        draft = _message_text(target.data.content) or ""
+        try:
+            rewound = await asyncio.to_thread(
+                conversation_store.rewind_conversation,
+                source_id,
+                before_item_id=target.id,
+                carry_history_into_native=carry_history_into_native,
+            )
+        except LookupError as exc:
+            raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+
+        files_reverted = False
+        file_revert_error: str | None = None
+        if body.revert_files:
+            if runner_client is None:
+                file_revert_error = "The runner is offline, so file changes were kept."
+            else:
+                try:
+                    restore_response = await runner_client.post(
+                        f"/v1/sessions/{source_id}/events",
+                        json={"type": "revert_files", "checkpoint_id": target.id},
+                        timeout=35.0,
+                    )
+                    files_reverted = restore_response.status_code == 200
+                    if not files_reverted:
+                        file_revert_error = (
+                            "No Git checkpoint was available for that message, so file changes "
+                            "were kept."
+                            if restore_response.status_code in (404, 409)
+                            else "File changes could not be restored, so they were kept."
+                        )
+                except (httpx.HTTPError, ConnectionError):
+                    file_revert_error = "The runner disconnected, so file changes were kept."
+
+        rewound_items = await asyncio.to_thread(
+            conversation_store.list_items,
+            source_id,
+            limit=10000,
+        )
+        level = await _get_permission_level(user_id, source_id, permission_store)
+        session_response = _build_session_response(
+            rewound,
+            rewound_items.data,
+            "idle",
+            permission_level=level,
+            last_task_error=None,
+            agent_name=agent.name,
+        )
+        return SessionRevertResponse(
+            session=session_response,
+            draft=draft,
+            files_reverted=files_reverted,
+            file_revert_error=file_revert_error,
+        )
+
     # ── POST /sessions/{session_id}/switch-agent ─────────────────
 
     @router.post(
@@ -20417,6 +20610,7 @@ def create_sessions_router(
                 body,
                 conversation_store,
                 created_by=_attribution_user(user_id),
+                runner_router=runner_router,
             )
             return {"queued": False, "item_id": item_id}
         if body.type == _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE:

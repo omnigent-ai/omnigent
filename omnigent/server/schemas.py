@@ -2064,6 +2064,24 @@ class SessionForkRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class SessionRevertRequest(BaseModel):
+    """Request to rewind a session to before a past user message."""
+
+    user_message_id: str = Field(min_length=1)
+    revert_files: bool = False
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class SessionRevertResponse(BaseModel):
+    """Rewound session plus the selected prompt and optional file result."""
+
+    session: SessionResponse
+    draft: str
+    files_reverted: bool = False
+    file_revert_error: str | None = None
+
+
 class ReadStatePutRequest(BaseModel):
     """
     Request body for ``PUT /v1/sessions/{session_id}/read-state``.

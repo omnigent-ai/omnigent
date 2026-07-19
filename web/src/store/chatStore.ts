@@ -614,6 +614,8 @@ export interface ChatState {
   ) => Promise<void>;
   stop: () => void;
   switchTo: (conversationId: string | null) => Promise<void>;
+  /** Re-fetch the active session after its history changes in place. */
+  reloadCurrent: () => Promise<void>;
   submitApproval: (
     elicitationId: string,
     action: "accept" | "decline" | "cancel",
@@ -1646,6 +1648,33 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // native messages; when one was, bindStream dedupes it against the
     // committed snapshot. Reconnect/rebind paths pass false so they never
     // overwrite the live optimistic bubbles (which would flink).
+    await bindStream(conversationId, set, get, true);
+  },
+
+  reloadCurrent: async () => {
+    const conversationId = get().conversationId;
+    if (conversationId === null) return;
+    get().abortController?.abort();
+    set((state) => {
+      const pendingByConversation = { ...state.pendingByConversation };
+      delete pendingByConversation[conversationId];
+      return {
+        blocks: [],
+        pendingUserMessages: [],
+        pendingByConversation,
+        activeResponse: null,
+        interruptedResponseIds: [],
+        status: "idle",
+        sessionStatus: "idle",
+        loadingConversation: true,
+        conversationLoadError: null,
+        hasMoreHistory: false,
+        loadingMoreHistory: false,
+        oldestItemId: null,
+        abortController: null,
+        historyGeneration: state.historyGeneration + 1,
+      };
+    });
     await bindStream(conversationId, set, get, true);
   },
 

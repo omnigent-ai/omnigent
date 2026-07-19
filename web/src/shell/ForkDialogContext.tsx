@@ -20,6 +20,10 @@ export interface ForkDialogContextValue {
    * a full clone (the header button's behavior).
    */
   openForkDialog: (opts?: { upToResponseId?: string }) => void;
+  /** Whether the caller may edit and rewind the active top-level session. */
+  canRevert: boolean;
+  /** Open the shared revert picker, optionally preselecting a user message. */
+  openRevertDialog: (opts?: { userMessageId?: string }) => void;
 }
 
 const ForkDialogContext = createContext<ForkDialogContextValue | null>(null);

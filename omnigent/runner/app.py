@@ -1773,11 +1773,10 @@ async def _resolve_pi_resume_session(
        (cross-machine, a fresh runner, or a cleared bridge dir). Synthesize the
        file from committed Omnigent items so ``pi --session <id>`` opens with
        prior context. An existing file is reused untouched.
-    2. **Fork rebuild** — a forked clone bound to a pi-native target with NO
-       captured session of its own and a carry-history marker: mint a new Pi
-       session id, build its file from the clone's OWN copied Omnigent items,
-       and patch the server so Omnigent reflects the clone's session id and a
-       later relaunch resumes it via case 1.
+    2. **History rebuild** — a forked or rewound pi-native session with no
+       captured native id and a carry-history marker: mint a new Pi session id,
+       build its file from the session's current Omnigent items, and patch the
+       server so a later relaunch resumes it via case 1.
     3. **Fresh / nothing to carry** — return ``None`` so Pi launches a brand
        new session.
 
@@ -1847,8 +1846,8 @@ async def _resolve_pi_resume_session(
             return None
         return launch_config.external_session_id
 
-    # Case 2: forked clone bound to a pi-native target with no captured session
-    # yet. Build the clone's session from its OWN copied Omnigent items under a
+    # Case 2: a forked or rewound pi-native session with no captured session
+    # yet. Build its native session from its current Omnigent items under a
     # minted id. (A same-provider source's captured id, when present, is stamped
     # as fork_source_external_id; but Pi session files are runner-local and the
     # clone has its OWN copied items, so we rebuild from items either way —
@@ -1867,12 +1866,12 @@ async def _resolve_pi_resume_session(
         except Exception:  # noqa: BLE001 — best-effort; launch fresh on failure
             built = None
             _logger.warning(
-                "Could not build Pi session from items for forked clone %s; launching fresh",
+                "Could not rebuild Pi session from items for %s; launching fresh",
                 session_id,
                 exc_info=True,
             )
         _logger.info(
-            "Pi terminal fork-rebuild decision: session=%s minted=%s built=%s",
+            "Pi terminal history-rebuild decision: session=%s minted=%s built=%s",
             session_id,
             minted,
             str(built) if built is not None else None,
@@ -1890,7 +1889,7 @@ async def _resolve_pi_resume_session(
                 )
             except httpx.HTTPError:
                 _logger.warning(
-                    "Could not pre-set external_session_id for forked Pi clone %s; "
+                    "Could not pre-set rebuilt external_session_id for Pi session %s; "
                     "relying on extension capture",
                     session_id,
                     exc_info=True,
@@ -8728,6 +8727,32 @@ def create_runner_app(
         _session_fs_registries[session_id] = registry
         return registry
 
+    async def _capture_revert_checkpoint(
+        session_id: str,
+        body: dict[str, Any],
+    ) -> bool:
+        """Best-effort workspace snapshot immediately before a user turn."""
+        checkpoint_id = body.get("revert_checkpoint_id") or body.get("persisted_item_id")
+        if not isinstance(checkpoint_id, str) or not checkpoint_id:
+            return False
+        registry = await _resolve_session_fs_registry(session_id)
+        if registry is None:
+            return False
+        try:
+            return await asyncio.to_thread(
+                registry.create_revert_checkpoint,
+                session_id,
+                checkpoint_id,
+            )
+        except Exception:  # noqa: BLE001 — chat must still work if snapshotting fails
+            _logger.warning(
+                "Could not create revert checkpoint for session=%s item=%s",
+                session_id,
+                checkpoint_id,
+                exc_info=True,
+            )
+            return False
+
     from omnigent.entities.environment_filesystem import (
         FilesystemEntry,
         ResourceError,
@@ -9967,7 +9992,7 @@ def create_runner_app(
         _session_snapshot_cache.pop(session_id, None)
         _session_snapshot_locks.pop(session_id, None)
         _session_spec_locks.pop(session_id, None)
-        _session_fs_registries.pop(session_id, None)
+        session_fs_registry = _session_fs_registries.pop(session_id, None)
         _session_agent_ids.pop(session_id, None)
         _session_tool_schemas.pop(session_id, None)
         if _relay := _session_comment_relays.pop(session_id, None):
@@ -9986,8 +10011,9 @@ def create_runner_app(
         # spawned sub-agent child (no-op otherwise).
         unregister_child_session(session_id)
         unregister_subagent_work_for_session(session_id)
-        if filesystem_registry is not None:
-            filesystem_registry.unregister_conversation(session_id)
+        checkpoint_registry = session_fs_registry or filesystem_registry
+        if checkpoint_registry is not None:
+            checkpoint_registry.unregister_conversation(session_id)
         for _task, evt in _session_async_tasks.pop(session_id, {}).values():
             evt.set()
         for _tmr in _session_timers.pop(session_id, {}).values():
@@ -13192,6 +13218,7 @@ def create_runner_app(
                 next_body = buf.pop(0)
                 if not buf:
                     _session_message_buffers.pop(session_id, None)
+                await _capture_revert_checkpoint(session_id, next_body)
                 _session_histories.setdefault(session_id, []).append(
                     {
                         "type": "message",
@@ -13207,6 +13234,7 @@ def create_runner_app(
                 _session_message_buffers.pop(session_id, None)
 
                 for body in all_bodies:
+                    await _capture_revert_checkpoint(session_id, body)
                     _session_histories.setdefault(session_id, []).append(
                         {
                             "type": "message",
@@ -15138,6 +15166,11 @@ def create_runner_app(
                         },
                     )
 
+                # Snapshot immediately before this turn. Queued messages take
+                # this path only when they actually start (the drain above), so
+                # their checkpoint never races an earlier active turn.
+                await _capture_revert_checkpoint(conversation_id, message_body)
+
                 # Make the new user message visible to the turn. On the
                 # first touch of a conversation after a runner restart the
                 # in-memory cache is empty; seeding it with ONLY this
@@ -15230,6 +15263,80 @@ def create_runner_app(
                 async with _cond:
                     _ingest_now_serving[conversation_id] = _seq + 1
                     _cond.notify_all()
+
+        if body_type == "capture_revert_checkpoint":
+            checkpoint_id = body.get("checkpoint_id") if isinstance(body, dict) else None
+            if not isinstance(checkpoint_id, str) or not checkpoint_id:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "invalid_input", "detail": "checkpoint_id is required"},
+                )
+            captured = await _capture_revert_checkpoint(
+                conversation_id,
+                {"revert_checkpoint_id": checkpoint_id},
+            )
+            if not captured:
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "error": "checkpoint_unavailable",
+                        "detail": "File checkpoints require a Git workspace.",
+                    },
+                )
+            return JSONResponse(status_code=200, content={"captured": True})
+
+        if body_type == "revert_files":
+            checkpoint_id = body.get("checkpoint_id") if isinstance(body, dict) else None
+            if not isinstance(checkpoint_id, str) or not checkpoint_id:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "invalid_input", "detail": "checkpoint_id is required"},
+                )
+            if conversation_id in _active_turns:
+                return JSONResponse(
+                    status_code=409,
+                    content={"error": "session_busy", "detail": "Wait for the turn to finish."},
+                )
+            registry = await _resolve_session_fs_registry(conversation_id)
+            if registry is None:
+                restored = False
+            else:
+                try:
+                    restored = await asyncio.to_thread(
+                        registry.restore_revert_checkpoint,
+                        conversation_id,
+                        checkpoint_id,
+                    )
+                except KeyError:
+                    return JSONResponse(
+                        status_code=404,
+                        content={
+                            "error": "checkpoint_not_found",
+                            "detail": "No file checkpoint exists for that message.",
+                        },
+                    )
+                except Exception:
+                    _logger.exception(
+                        "File revert failed for session=%s checkpoint=%s",
+                        conversation_id,
+                        checkpoint_id,
+                    )
+                    return JSONResponse(
+                        status_code=500,
+                        content={
+                            "error": "revert_failed",
+                            "detail": "Git could not restore the checkpoint.",
+                        },
+                    )
+            if not restored:
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "error": "checkpoint_unavailable",
+                        "detail": "File checkpoints require a Git workspace.",
+                    },
+                )
+            return JSONResponse(status_code=200, content={"restored": True})
 
         if body_type == "interrupt":
             # Native harnesses get a key sent to their TUI pane — a forwarded

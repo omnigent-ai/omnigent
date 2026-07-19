@@ -1106,6 +1106,43 @@ shape as `GET /v1/sessions/{id}` — with status `"idle"` and all
 copied items in chronological order. Clients must bind a runner
 before opening the fork's SSE stream or posting events.
 
+### Revert Session
+
+```
+POST /v1/sessions/{source_id}/revert
+Content-Type: application/json
+
+{
+  "user_message_id": "msg_abc123",
+  "revert_files": false
+}
+```
+
+Rewinds the existing session in place, deleting the selected non-meta user
+message and everything after it. The session id, title, agent, runner, and
+workspace remain unchanged. The selected prompt is returned as `draft` so
+clients can prefill it. `revert_files` restores the Git workspace checkpoint
+captured before that prompt; non-Git, offline, or older sessions keep current
+files and return `file_revert_error`.
+
+```
+200 OK
+{
+  "session": { ...SessionResponse },
+  "draft": "selected prompt text",
+  "files_reverted": false,
+  "file_revert_error": null
+}
+
+400 Bad Request — the item is missing, is not selectable, or belongs to a sub-agent
+403 Forbidden — edit access is required
+409 Conflict — the source session is running
+```
+
+Revert always requires edit access because it mutates conversation history.
+For supported native harnesses, the live terminal is reset and rebuilt from the
+retained history before the next turn.
+
 ### Stream Session
 
 ```

@@ -14,6 +14,7 @@ import logging
 import os
 import pathlib
 import re
+import shlex
 import sys
 import tempfile
 from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
@@ -5523,6 +5524,129 @@ async def _cmd_fork(
             f"To return to the previous conversation, run /switch {current_id}[/{fmt.muted}]"
         )
     )
+
+
+def _revert_user_messages(items: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Return selectable, non-meta user messages newest first."""
+    return [
+        item
+        for item in reversed(items)
+        if item.get("type") == "message"
+        and item.get("role") == "user"
+        and not item.get("is_meta")
+        and not _extract_message_text(item).lstrip().startswith("[System:")
+        and isinstance(item.get("id"), str)
+    ]
+
+
+async def _pick_revert_message(
+    items: list[dict[str, object]],
+) -> tuple[str, bool] | None:
+    """Open prompt-toolkit message and option pickers for ``/revert``."""
+    from prompt_toolkit.application import run_in_terminal
+    from prompt_toolkit.shortcuts import checkboxlist_dialog, radiolist_dialog
+
+    candidates = _revert_user_messages(items)
+    if not candidates:
+        return None
+
+    def choose_message() -> str | None:
+        values = []
+        for item in candidates:
+            text = " ".join(_extract_message_text(item).split()) or "(attachments only)"
+            if len(text) > 88:
+                text = text[:87].rstrip() + "…"
+            values.append((str(item["id"]), text))
+        return radiolist_dialog(
+            title="Revert conversation",
+            text="Choose the user message to return to. The original session is preserved.",
+            values=values,
+        ).run()
+
+    selected = await run_in_terminal(choose_message, in_executor=True)
+    if selected is None:
+        return None
+
+    def choose_options() -> list[str] | None:
+        return checkboxlist_dialog(
+            title="Revert options",
+            text="Conversation history always rewinds. Select any additional actions:",
+            values=[("files", "Restore Git files to this point")],
+        ).run()
+
+    options = await run_in_terminal(choose_options, in_executor=True)
+    if options is None:
+        return None
+    return selected, "files" in options
+
+
+@_cmd("/revert", "Revert to a past user message")
+async def _cmd_revert(
+    arg: str,
+    session: Session,
+    client: OmnigentClient,
+    host: TerminalHost,
+    fmt: RichBlockFormatter,
+) -> None:
+    """Create and enter a safe branch before a selected user message."""
+    current_id = getattr(session, "session_id", None)
+    if current_id is None:
+        host.output(Text("  /revert requires the sessions API.", style="bold red"))
+        return
+    try:
+        tokens = shlex.split(arg)
+    except ValueError as exc:
+        host.output(Text(f"  Invalid /revert arguments: {exc}", style="bold red"))
+        return
+    unknown = [token for token in tokens if token.startswith("-") and token != "--files"]
+    ids = [token for token in tokens if not token.startswith("-")]
+    if unknown or len(ids) > 1:
+        host.output(Text("  Usage: /revert [user-message-id] [--files]", style="bold red"))
+        return
+    try:
+        items = await _list_all_conversation_items(client, current_id)
+        if ids:
+            selected = (ids[0], "--files" in tokens)
+        elif not _revert_user_messages(items):
+            host.output(Text(f"  [{fmt.muted}]No user messages to revert to.[/{fmt.muted}]"))
+            return
+        else:
+            selected = await _pick_revert_message(items)
+        if selected is None:
+            return
+        message_id, revert_files = selected
+        result = await client.sessions.revert(
+            current_id,
+            message_id,
+            revert_files=revert_files,
+        )
+        reverted = result.get("session")
+        new_id = reverted.get("id") if isinstance(reverted, dict) else None
+        if not isinstance(new_id, str):
+            raise RuntimeError("Revert response did not include a session id")
+        if new_id != current_id:
+            raise RuntimeError("Revert unexpectedly created a different session")
+        await _attach_to_conversation(
+            new_id,
+            session,
+            client,
+            host,
+            fmt,
+            ui_name=_humanize_agent_name(session.model),
+            redraw_screen=True,
+        )
+    except Exception as exc:  # noqa: BLE001 — command boundary renders failures inline
+        _log.exception("Revert failed")
+        host.output(Text(f"  Revert failed: {exc}", style="bold red"))
+        return
+
+    host.output(Text.from_markup(f"  [{fmt.muted}]Reverted this session.[/{fmt.muted}]"))
+    file_error = result.get("file_revert_error")
+    if isinstance(file_error, str) and file_error:
+        host.output(Text(f"  {file_error}", style="yellow"))
+    draft = result.get("draft")
+    if isinstance(draft, str) and draft:
+        host.output(Text.from_markup(f"\n  [bold]Message to retry[/]\n  {escape(draft)}"))
 
 
 @_cmd("/history", "Show current conversation history")

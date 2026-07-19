@@ -32,6 +32,7 @@ import {
   TerminalIcon,
   WifiOffIcon,
   XIcon,
+  Undo2Icon,
 } from "lucide-react";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -176,6 +177,7 @@ import { GoalControl, GoalStatusPill, useGoalState, type Goal } from "@/componen
 import { copyText } from "@/lib/clipboard";
 import { showToast } from "@/components/ui/toast";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { saveDraftsToStorage, sessionDrafts, SESSION_TEXT_DRAFT_EVENT } from "@/lib/sessionDrafts";
 
 // Matches both wordings the native executors emit: "[Attached: <path>]"
 // (claude/pi/cursor) and "[Attached file: <path>]" (codex). Capturing group
@@ -504,46 +506,8 @@ function truncateTitle(raw: string, max = 60): string {
   return slice.slice(0, cut).join("").trimEnd() + "…";
 }
 
-// Per-session draft storage — module-level so it survives the Composer
-// unmount/remount that happens during the loading gate between session
-// switches (ChatPage returns <HydratingPlaceholder /> while
-// loadingConversation is true, which unmounts the entire chat surface).
-// Text drafts are also persisted to sessionStorage so they survive page
-// refreshes; File objects can't be serialized, so only text round-trips.
-const SESSION_DRAFTS_KEY = "omnigent.sessionDrafts";
-
-function loadDraftsFromStorage(): Map<string, { text: string; files: File[] }> {
-  try {
-    const raw = window.sessionStorage.getItem(SESSION_DRAFTS_KEY);
-    if (!raw) return new Map();
-    const entries = JSON.parse(raw) as Record<string, string>;
-    const map = new Map<string, { text: string; files: File[] }>();
-    for (const [id, text] of Object.entries(entries)) {
-      if (text) map.set(id, { text, files: [] });
-    }
-    return map;
-  } catch {
-    return new Map();
-  }
-}
-
-function saveDraftsToStorage(drafts: Map<string, { text: string; files: File[] }>): void {
-  try {
-    const obj: Record<string, string> = {};
-    for (const [id, draft] of drafts) {
-      if (draft.text) obj[id] = draft.text;
-    }
-    if (Object.keys(obj).length === 0) {
-      window.sessionStorage.removeItem(SESSION_DRAFTS_KEY);
-    } else {
-      window.sessionStorage.setItem(SESSION_DRAFTS_KEY, JSON.stringify(obj));
-    }
-  } catch {
-    // Storage full or unavailable — drafts still work in-memory.
-  }
-}
-
-const sessionDrafts = loadDraftsFromStorage();
+// Draft storage is shared with RevertSessionDialog so a selected past prompt
+// can be prefilled in the newly-created session before its composer mounts.
 
 /**
  * Single component that drives the chat surface. Streaming + history
@@ -3061,6 +3025,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   const sessionId = useChatStore((s) => s.conversationId);
   // Author labels only matter once the session is shared with someone else.
   const isSessionShared = useContext(SessionSharedContext);
+  const forkDialog = useForkDialog();
   // Plain-text path is the common case.
   // - input_image: render inline <img> when the file is uploaded (file_id
   //   doesn't start with "pending:"); show a chip while the upload is
@@ -3213,11 +3178,24 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
           {text && <FilePathAwareMessageResponse breaks>{text}</FilePathAwareMessageResponse>}
         </MessageContent>
       </div>
-      {text && (
+      {(text || forkDialog?.canRevert) && (
         <MessageActions className="mt-1 ml-auto opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
-          <MessageAction tooltip="Copy" onClick={handleCopy}>
-            {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
-          </MessageAction>
+          {text && (
+            <MessageAction tooltip="Copy" onClick={handleCopy}>
+              {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
+            </MessageAction>
+          )}
+          {forkDialog?.canRevert &&
+            !bubble.itemId.startsWith("pend_") &&
+            !bubble.itemId.startsWith("pending_") && (
+              <MessageAction
+                tooltip="Revert to here"
+                data-testid="revert-from-message"
+                onClick={() => forkDialog.openRevertDialog({ userMessageId: bubble.itemId })}
+              >
+                <Undo2Icon size={14} />
+              </MessageAction>
+            )}
         </MessageActions>
       )}
     </Message>
@@ -3799,6 +3777,7 @@ export function Composer({
 }: ComposerProps) {
   const [value, setValue] = useState("");
   const [files, setFiles] = useState<File[]>([]);
+  const forkDialog = useForkDialog();
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [commandError, setCommandError] = useState<string | null>(null);
   const [planModeBusy, setPlanModeBusy] = useState(false);
@@ -3964,6 +3943,21 @@ export function Composer({
       }
       saveDraftsToStorage(sessionDrafts);
     };
+  }, [conversationId]);
+
+  useEffect(() => {
+    const applyDraft = (event: Event): void => {
+      const detail = (event as CustomEvent<{ sessionId: string; text: string }>).detail;
+      if (detail.sessionId !== conversationId) return;
+      sessionDrafts.delete(detail.sessionId);
+      saveDraftsToStorage(sessionDrafts);
+      setValue(detail.text);
+      setFiles([]);
+      dirtyRef.current = false;
+      if (!isMobileRef.current) textareaRef.current?.focus();
+    };
+    window.addEventListener(SESSION_TEXT_DRAFT_EVENT, applyDraft);
+    return () => window.removeEventListener(SESSION_TEXT_DRAFT_EVENT, applyDraft);
   }, [conversationId]);
 
   // Adding a reply quote (via the floating "Reply" button) should drop the
@@ -4215,6 +4209,17 @@ export function Composer({
           .catch((err: unknown) => {
             setCommandError(err instanceof Error ? err.message : "Failed to set model");
           });
+        return true;
+      }
+      case "/revert": {
+        if (!forkDialog?.canRevert) {
+          setCommandError("/revert is unavailable for this session");
+          return true;
+        }
+        dirtyRef.current = true;
+        setValue("");
+        setCommandError(null);
+        forkDialog.openRevertDialog({ userMessageId: arg || undefined });
         return true;
       }
       case "/context": {

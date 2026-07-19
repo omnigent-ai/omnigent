@@ -3544,6 +3544,52 @@ def test_fork_conversation_up_to_response_truncates_items(
     assert len(conversation_store.list_items(source.id).data) == 6
 
 
+def test_rewind_conversation_removes_selected_prompt_and_later_history(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Rewind mutates one session, resets native state, and keeps FTS valid."""
+    from omnigent.stores.conversation_store import (
+        CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
+        FORK_CARRY_HISTORY_LABEL_KEY,
+    )
+
+    source = conversation_store.create_conversation(title="Keep this title")
+    conversation_store.set_external_session_id(source.id, "native-session-old")
+    conversation_store.set_labels(
+        source.id,
+        {
+            "omnigent.claude_native.bridge_id": "bridge-old",
+            CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY: "1",
+        },
+    )
+    _append_three_responses(conversation_store, source.id)
+    source_items = conversation_store.list_items(source.id).data
+
+    rewound = conversation_store.rewind_conversation(
+        source.id,
+        before_item_id=source_items[2].id,
+        carry_history_into_native=True,
+    )
+
+    rewound_items = conversation_store.list_items(source.id).data
+    texts = [
+        block["text"]
+        for item in rewound_items
+        for block in item.data.content  # type: ignore[union-attr]
+    ]
+    assert rewound.id == source.id
+    assert rewound.title == "Keep this title"
+    assert rewound.external_session_id is None
+    assert rewound.labels[FORK_CARRY_HISTORY_LABEL_KEY] == "1"
+    assert "omnigent.claude_native.bridge_id" not in rewound.labels
+    assert rewound.labels[CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY] == "1"
+    assert texts == ["Q1", "A1"]
+    assert conversation_store.search("Q2", conversation_id=source.id) == []
+    assert [item.id for item in conversation_store.search("Q1", conversation_id=source.id)] == [
+        rewound_items[0].id
+    ]
+
+
 def test_fork_conversation_truncated_drops_external_session_directive(
     conversation_store: SqlAlchemyConversationStore,
     agent_store: SqlAlchemyAgentStore,
