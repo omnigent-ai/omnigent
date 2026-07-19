@@ -59,7 +59,6 @@ import {
 } from "@/hooks/useWorkspaceChangedFiles";
 import { cn } from "@/lib/utils";
 import { isNativeWrapper as isNativeWrapperLabel } from "@/lib/nativeCodingAgents";
-import { isCodexNativeSession } from "@/lib/codexPlanMode";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isSingleUserMode } from "@/lib/capabilities";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
@@ -346,16 +345,14 @@ export function AppShell() {
   const sessionLabels = { ...activeConv?.labels, ...activeSession?.labels };
   const terminalFirst = sessionLabels["omnigent.ui"] === "terminal";
   const isClaudeNative = sessionLabels["omnigent.wrapper"] === "claude-code-native-ui";
-  // Harnesses that publish a todo list to the TodoPanel: Claude via
-  // TodoWrite, and Codex which maps its plan updates to the same schema.
-  const isCodexNative = isCodexNativeSession({ labels: sessionLabels });
-  const todosSupported = isClaudeNative || isCodexNative;
+  const todos = useChatStore((s) => s.todos);
+  // The session.todos contract is harness-agnostic; show Tasks when it has data.
+  const todosSupported = todos.length > 0;
   // Native-CLI wrapper of either family. Keys harness behavior gates
   // (composer slash commands, `/model`); terminal-first SDK sessions
   // (embedded Omnigent REPL terminal) have NO wrapper label and must
   // keep regular chat behavior. See TerminalFirstContext.tsx.
   const isNativeWrapper = isNativeWrapperLabel(sessionLabels["omnigent.wrapper"]);
-  const todos = useChatStore((s) => s.todos);
   const todosCompleted = todos.filter((t) => t.status === "completed").length;
   // Used for the header "Back to parent" link, which is hidden on
   // top-level sessions. The Subagents tab itself is always visible —
