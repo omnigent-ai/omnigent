@@ -45,24 +45,41 @@ _NON_FILE_OPEN_RECEIVERS = {
 # provable as binary) must name an encoding. Matched by *import binding*, not by
 # literal receiver name, so an alias (``import gzip as gz``) is caught and an
 # unrelated ``gzip = Path(...)`` is not misread as the module.
-_COMPRESSED_MODULES = {"gzip", "bz2", "lzma"}
-_TEXT_OPEN_MODULES = {"builtins", "codecs", "io"}
+_COMPRESSED_ENCODING_INDEX = {"gzip": 3, "bz2": 3, "lzma": None}
+_COMPRESSED_MODULES = set(_COMPRESSED_ENCODING_INDEX)
+_TEXT_OPEN_ENCODING_INDEX = {"builtins": 3, "codecs": 2, "io": 3}
+_TEXT_OPEN_MODULES = set(_TEXT_OPEN_ENCODING_INDEX)
 _CONFIGPARSER_CTORS = {"ConfigParser", "RawConfigParser", "SafeConfigParser"}
 
 # Only str literals containing one of these are candidate embedded scripts —
 # a cheap prefilter before the (costlier) ``ast.parse`` gate.
 _EMBEDDED_HINTS = ("open", "read_text", "write_text")
+_MISSING = object()
 
 
-def _has_encoding(call: ast.Call) -> bool:
+def _positional_arg(call: ast.Call, index: int) -> ast.expr | object:
+    """Return a statically positioned argument, or ``_MISSING`` if shifted."""
+    if index < 0 or len(call.args) <= index:
+        return _MISSING
+    if any(isinstance(value, ast.Starred) for value in call.args[: index + 1]):
+        return _MISSING
+    return call.args[index]
+
+
+def _has_encoding(call: ast.Call, positional_index: int | None = None) -> bool:
     """True only when a *real* encoding is named.
 
     ``encoding=None`` selects the platform default codec — identical to omitting
-    the argument — so it is treated as a violation, not a fix.
+    the argument for text-default openers — so it is treated as a violation, not
+    a fix. ``positional_index`` is the zero-based signature position for the
+    specific opener being checked.
     """
     for k in call.keywords:
         if k.arg == "encoding":
             return not (isinstance(k.value, ast.Constant) and k.value.value is None)
+    if positional_index is not None:
+        value = _positional_arg(call, positional_index)
+        return not (value is _MISSING or (isinstance(value, ast.Constant) and value.value is None))
     return False
 
 
@@ -88,9 +105,9 @@ def _mode_is_binary(call: ast.Call, mode_argindex: int) -> bool:
             and "b" in value
         )
 
-    args = call.args
-    if len(args) > mode_argindex >= 0 and isinstance(args[mode_argindex], ast.Constant):
-        if is_binary_mode(args[mode_argindex].value):
+    value = _positional_arg(call, mode_argindex)
+    if isinstance(value, ast.Constant):
+        if is_binary_mode(value.value):
             return True
     for k in call.keywords:  # keyword mode=
         if k.arg == "mode" and isinstance(k.value, ast.Constant):
@@ -101,7 +118,7 @@ def _mode_is_binary(call: ast.Call, mode_argindex: int) -> bool:
 
 def _mode_present(call: ast.Call, mode_argindex: int) -> bool:
     """True when a ``mode`` argument is supplied (positionally or by keyword)."""
-    if mode_argindex >= 0 and len(call.args) > mode_argindex:
+    if _positional_arg(call, mode_argindex) is not _MISSING:
         return True
     return any(k.arg == "mode" for k in call.keywords)
 
@@ -308,7 +325,7 @@ def _callable_assignment_aliases(
 
 def _compressed_bindings(
     tree: ast.AST,
-) -> tuple[set[str], set[str], set[str], set[str]]:
+) -> tuple[dict[str, int | None], dict[str, int | None], set[str], set[str]]:
     """Return stable and ambiguous bindings for gzip/bz2/lzma openers.
 
     The result is ``(modules, funcs, ambiguous_modules, ambiguous_funcs)``.
@@ -316,29 +333,54 @@ def _compressed_bindings(
     with any conflicting binding is never discarded: it becomes ambiguous and
     its calls fail closed by requiring an explicit encoding.
     """
-    direct_modules: set[str] = set()
-    direct_funcs: set[str] = set()
+    module_positions: dict[str, set[int | None]] = {}
+    func_positions: dict[str, set[int | None]] = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                if alias.name.split(".", 1)[0] in _COMPRESSED_MODULES:
-                    direct_modules.add(_import_bound_name(alias))
+                module = alias.name.split(".", 1)[0]
+                if module in _COMPRESSED_MODULES:
+                    module_positions.setdefault(_import_bound_name(alias), set()).add(
+                        _COMPRESSED_ENCODING_INDEX[module]
+                    )
         elif isinstance(node, ast.ImportFrom) and node.module in _COMPRESSED_MODULES:
             for alias in node.names:
                 if alias.name == "open":
-                    direct_funcs.add(alias.asname or alias.name)
+                    func_positions.setdefault(alias.asname or alias.name, set()).add(
+                        _COMPRESSED_ENCODING_INDEX[node.module]
+                    )
 
+    direct_modules = set(module_positions)
+    direct_funcs = set(func_positions)
     alias_modules, alias_funcs = _assignment_aliases(tree, direct_modules, direct_funcs)
     module_candidates = direct_modules | alias_modules
     func_candidates = direct_funcs | alias_funcs
     other = _other_bound_names(tree)
     both = module_candidates & func_candidates
 
-    ambiguous_modules = (module_candidates & other) | both | alias_modules
-    ambiguous_funcs = (func_candidates & other) | both | alias_funcs
-    modules = module_candidates - ambiguous_modules
+    ambiguous_modules = (
+        (module_candidates & other)
+        | both
+        | alias_modules
+        | {name for name, indexes in module_positions.items() if len(indexes) != 1}
+    )
+    ambiguous_funcs = (
+        (func_candidates & other)
+        | both
+        | alias_funcs
+        | {name for name, indexes in func_positions.items() if len(indexes) != 1}
+    )
+    modules = {
+        name: next(iter(indexes))
+        for name, indexes in module_positions.items()
+        if name not in ambiguous_modules
+    }
     # Bare ``open`` always follows the stricter builtin/text-default path.
-    funcs = func_candidates - ambiguous_funcs - {"open"}
+    funcs = {
+        name: next(iter(indexes))
+        for name, indexes in func_positions.items()
+        if name not in ambiguous_funcs and name != "open"
+    }
     ambiguous_funcs.discard("open")
     return modules, funcs, ambiguous_modules, ambiguous_funcs
 
@@ -363,21 +405,27 @@ def _non_file_open_bindings(tree: ast.AST) -> tuple[set[str], set[str]]:
 
 def _text_open_bindings(
     tree: ast.AST,
-) -> tuple[set[str], set[str], set[str], set[str]]:
-    """Bindings for modules/functions whose ``open`` uses builtin-style args."""
-    direct_modules: set[str] = set()
+) -> tuple[dict[str, int], dict[str, int], set[str], set[str]]:
+    """Bindings mapped to each text opener's positional encoding index."""
+    module_positions: dict[str, set[int]] = {}
     # Seed the builtin too so ``fopen = open`` cannot evade the strict path.
-    direct_funcs: set[str] = {"open"}
+    func_positions: dict[str, set[int]] = {"open": {3}}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 if alias.name in _TEXT_OPEN_MODULES:
-                    direct_modules.add(_import_bound_name(alias))
+                    module_positions.setdefault(_import_bound_name(alias), set()).add(
+                        _TEXT_OPEN_ENCODING_INDEX[alias.name]
+                    )
         elif isinstance(node, ast.ImportFrom) and node.module in _TEXT_OPEN_MODULES:
             for alias in node.names:
                 if alias.name == "open":
-                    direct_funcs.add(alias.asname or alias.name)
+                    func_positions.setdefault(alias.asname or alias.name, set()).add(
+                        _TEXT_OPEN_ENCODING_INDEX[node.module]
+                    )
 
+    direct_modules = set(module_positions)
+    direct_funcs = set(func_positions)
     alias_modules, alias_funcs = _assignment_aliases(
         tree,
         direct_modules,
@@ -391,11 +439,28 @@ def _text_open_bindings(
         exempt_open_imports=_TEXT_OPEN_MODULES,
     )
     both = module_candidates & func_candidates
-    ambiguous_modules = (module_candidates & other) | both | alias_modules
-    ambiguous_funcs = (func_candidates & other) | both | alias_funcs
-    modules = module_candidates - ambiguous_modules
-    funcs = func_candidates - ambiguous_funcs - {"open"}
-    ambiguous_funcs.discard("open")
+    ambiguous_modules = (
+        (module_candidates & other)
+        | both
+        | alias_modules
+        | {name for name, indexes in module_positions.items() if len(indexes) != 1}
+    )
+    ambiguous_funcs = (
+        (func_candidates & other)
+        | both
+        | alias_funcs
+        | {name for name, indexes in func_positions.items() if len(indexes) != 1}
+    )
+    modules = {
+        name: next(iter(indexes))
+        for name, indexes in module_positions.items()
+        if name not in ambiguous_modules
+    }
+    funcs = {
+        name: next(iter(indexes))
+        for name, indexes in func_positions.items()
+        if name not in ambiguous_funcs and name != "open"
+    }
     return modules, funcs, ambiguous_modules, ambiguous_funcs
 
 
@@ -519,13 +584,29 @@ def _literal_text(node: ast.AST) -> str | None:
     return None
 
 
-def _compressed_open_violation(node: ast.Call, label: str) -> tuple[int, str] | None:
+def _compressed_open_violation(
+    node: ast.Call,
+    label: str,
+    encoding_index: int | None,
+) -> tuple[int, str] | None:
     """A gzip/bz2/lzma open needs an encoding unless it is statically proven safe:
     a bare call or a proven-binary mode stays clean. A dynamic-args call, an
     explicit text mode, or a computed/dynamic mode all require the encoding."""
-    if _has_encoding(node):
+    if _has_encoding(node, encoding_index):
         return None
-    if _has_dynamic_args(node) or (_mode_present(node, 1) and not _mode_is_binary(node, 1)):
+    if _has_dynamic_args(node):
+        return (node.lineno, label)
+    if not _mode_present(node, 1):
+        return None
+    mode: object | None = None
+    if len(node.args) > 1 and isinstance(node.args[1], ast.Constant):
+        mode = node.args[1].value
+    else:
+        for keyword in node.keywords:
+            if keyword.arg == "mode" and isinstance(keyword.value, ast.Constant):
+                mode = keyword.value.value
+                break
+    if mode not in {"r", "rb", "w", "wb", "a", "ab", "x", "xb"}:
         return (node.lineno, label)
     return None
 
@@ -535,14 +616,14 @@ def _call_violations(
     instances: set[str],
     ctor_names: set[str],
     fdopen_names: set[str],
-    comp_modules: set[str],
-    comp_funcs: set[str],
+    comp_modules: dict[str, int | None],
+    comp_funcs: dict[str, int | None],
     ambiguous_comp_modules: set[str],
     ambiguous_comp_funcs: set[str],
     non_file_modules: set[str],
     ambiguous_non_file_modules: set[str],
-    text_open_modules: set[str],
-    text_open_funcs: set[str],
+    text_open_modules: dict[str, int],
+    text_open_funcs: dict[str, int],
     ambiguous_text_open_modules: set[str],
     ambiguous_text_open_funcs: set[str],
 ) -> list[tuple[int, str]]:
@@ -552,11 +633,19 @@ def _call_violations(
         if not isinstance(node, ast.Call):
             continue
         func = node.func
+        # A bare ``open`` whose whole-tree binding is ambiguous (notably
+        # ``codecs.open``, whose positional encoding index differs) cannot use a
+        # guessed positional signature. A keyword codec or proven binary mode is
+        # safe for every candidate binding.
+        if isinstance(func, ast.Name) and func.id in ambiguous_text_open_funcs:
+            if not _has_encoding(node) and not _mode_is_binary(node, 1):
+                out.append((node.lineno, "open(ambiguous text alias)"))
+            continue
         # A bare name spelled ``open`` always takes builtin/text-default
         # semantics, including ``from gzip import open``. This is conservative
         # for gzip's binary default and sound for unrelated builtin calls.
         if isinstance(func, ast.Name) and func.id == "open":
-            name, mode_idx = "open", 1
+            name, mode_idx, encoding_idx = "open", 1, 3
         # Ambiguous compressed aliases never fall through to a guessed receiver
         # signature: requiring an encoding is the fail-closed policy.
         elif isinstance(func, ast.Name) and func.id in ambiguous_comp_funcs:
@@ -581,10 +670,6 @@ def _call_violations(
             if not _has_encoding(node):
                 out.append((node.lineno, f"{func.value.id}.open(ambiguous receiver)"))
             continue
-        elif isinstance(func, ast.Name) and func.id in ambiguous_text_open_funcs:
-            if not _has_encoding(node):
-                out.append((node.lineno, "open(ambiguous text alias)"))
-            continue
         elif (
             isinstance(func, ast.Attribute)
             and func.attr == "open"
@@ -597,7 +682,13 @@ def _call_violations(
         # Compressed openers first (matched by import binding), so a from-import
         # ``open`` alias or aliased module attribute isn't mishandled below.
         elif isinstance(func, ast.Name) and func.id in comp_funcs:
-            if (v := _compressed_open_violation(node, "gzip.open")) is not None:
+            if (
+                v := _compressed_open_violation(
+                    node,
+                    "compressed.open",
+                    comp_funcs[func.id],
+                )
+            ) is not None:
                 out.append(v)
             continue
         elif (
@@ -606,37 +697,53 @@ def _call_violations(
             and isinstance(func.value, ast.Name)
             and func.value.id in comp_modules
         ):
-            if (v := _compressed_open_violation(node, f"{func.value.id}.open")) is not None:
+            if (
+                v := _compressed_open_violation(
+                    node,
+                    f"{func.value.id}.open",
+                    comp_modules[func.value.id],
+                )
+            ) is not None:
                 out.append(v)
             continue
         elif isinstance(func, ast.Name) and func.id in text_open_funcs:
-            name, mode_idx = "open", 1
+            name, mode_idx, encoding_idx = "open", 1, text_open_funcs[func.id]
         elif (
             isinstance(func, ast.Attribute)
             and func.attr == "open"
             and isinstance(func.value, ast.Name)
             and func.value.id in text_open_modules
         ):
-            name, mode_idx = f"{func.value.id}.open", 1
-        elif isinstance(func, ast.Name) and func.id in fdopen_names:
-            name, mode_idx = "os.fdopen", 1  # fdopen / from-os alias
-        elif isinstance(func, ast.Attribute) and func.attr == "fdopen":
-            name, mode_idx = "os.fdopen", 1  # os.fdopen / aliased module.fdopen
+            name = f"{func.value.id}.open"
+            mode_idx, encoding_idx = 1, text_open_modules[func.value.id]
+        elif (isinstance(func, ast.Name) and func.id in fdopen_names) or (
+            isinstance(func, ast.Attribute) and func.attr == "fdopen"
+        ):
+            # An arbitrary ``.fdopen`` receiver does not prove os.fdopen's
+            # positional signature; only shared keywords are sound here.
+            name, mode_idx, encoding_idx = "os.fdopen", 1, None
         elif isinstance(func, ast.Attribute) and _is_configparser_read(
             func, instances, ctor_names
         ):
+            # Tracked names can be rebound, so do not guess a positional
+            # signature for a later ``.read``.
             if not _has_encoding(node):
                 out.append((node.lineno, "ConfigParser.read"))
             continue
         elif isinstance(func, ast.Attribute) and func.attr in _METHODS:
             recv_id = func.value.id if isinstance(func.value, ast.Name) else None
             if func.attr == "open" and recv_id in non_file_modules:
-                continue  # tarfile.open() etc. — binary archive, not text I/O
+                continue
             name = func.attr
-            mode_idx = 0 if func.attr == "open" else -1
+            if func.attr == "open":
+                # An unknown receiver may take a filename first, so only
+                # ``mode=`` proves binary intent across receiver families.
+                mode_idx, encoding_idx = -1, None
+            else:
+                mode_idx, encoding_idx = -1, None
         else:
             continue
-        if _has_encoding(node) or _mode_is_binary(node, mode_idx):
+        if _has_encoding(node, encoding_idx) or _mode_is_binary(node, mode_idx):
             continue
         out.append((node.lineno, name))
     return out

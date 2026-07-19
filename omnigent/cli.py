@@ -9160,7 +9160,7 @@ def _databricks_cfg_merge_lock(
     """Serialize Omnigent read/merge/publish operations across threads/processes."""
     lock_path = path.with_name(f"{path.name}.omnigent.lock")
     with _DATABRICKS_CFG_THREAD_LOCK:
-        lock_file = lock_path.open("a+b")
+        lock_file = lock_path.open(mode="a+b")
         locked = False
         primary_error: BaseException | None = None
         cleanup_errors: list[tuple[str, BaseException]] = []

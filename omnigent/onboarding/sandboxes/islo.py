@@ -237,7 +237,7 @@ class _IsloClient:
         """Upload one file to an absolute path in the sandbox."""
         wrapper = self._client._client_wrapper
         try:
-            with local_path.open("rb") as file_obj:
+            with local_path.open(mode="rb") as file_obj:
                 response = wrapper.httpx_client.request(
                     f"sandboxes/{_url_component(name)}/files",
                     base_url=wrapper.get_environment().compute,

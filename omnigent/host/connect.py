@@ -193,7 +193,7 @@ def _read_log_tail(path: Path, max_bytes: int = _LOG_TAIL_MAX_BYTES) -> str:
         1" answer into a failure.
     """
     try:
-        with path.open("rb") as fh:
+        with path.open(mode="rb") as fh:
             fh.seek(0, os.SEEK_END)
             size = fh.tell()
             fh.seek(max(0, size - max_bytes))

@@ -154,7 +154,7 @@ def _read_new_permission_events(
     if size == offset:
         return [], offset
     try:
-        with record_file.open("rb") as handle:
+        with record_file.open(mode="rb") as handle:
             handle.seek(offset)
             data = handle.read(size - offset)
     except OSError:

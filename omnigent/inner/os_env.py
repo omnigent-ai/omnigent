@@ -1180,7 +1180,7 @@ def _is_binary_file(path: Path) -> bool:
     :param path: Absolute path of the file to classify.
     :returns: ``True`` if the prefix contains a NUL or is not decodable UTF-8.
     """
-    with path.open("rb") as fh:
+    with path.open(mode="rb") as fh:
         prefix = fh.read(_BINARY_SNIFF_BYTES)
     if b"\x00" in prefix:
         return True
@@ -1220,7 +1220,7 @@ def _read_binary_impl(path: Path, max_binary_bytes: int | None) -> OpResult:
                 "View or download it via the file viewer."
             ),
         }
-    with path.open("rb") as fh:
+    with path.open(mode="rb") as fh:
         payload = fh.read(max_binary_bytes)
     return {
         "path": str(path),

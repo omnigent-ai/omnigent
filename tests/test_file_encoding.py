@@ -129,15 +129,23 @@ def test_config_read_forces_utf8_under_cp1252_default(tmp_path: Path) -> None:
 _FLAGGED = [
     'open("f")',
     'open("f", encoding=None)',  # encoding=None == default codec, not a fix
+    'open("f", "r", -1, None)',  # positional encoding=None is still default
+    'open(*args, "rb")',  # star expansion shifts the apparent mode position
+    'open("f", "r", *args, "utf-8")',  # star shifts the apparent encoding
     'from pathlib import Path\nPath("f").read_text()',
+    'from pathlib import Path\nPath("f").read_text(None)',
     'from pathlib import Path\nPath("f").write_text("x")',
+    'from pathlib import Path\nPath("f").write_text("x", None)',
+    'from pathlib import Path\nPath("f").open("r", -1, None)',
     'import os\nos.fdopen(fd, "w")',
+    'import os\nos.fdopen(fd, "r", -1, None)',
     'from os import fdopen\nfdopen(fd, "w")',  # imported fdopen
     'from os import fdopen as fdo\nfdo(fd, "w")',  # aliased fdopen
     'import os as _o\n_o.fdopen(fd, "w")',  # aliased os module
     'import os\nfdo = os.fdopen\nfdo(fd, "w")',  # assigned fdopen alias
     'fopen = open\nfopen("f")',  # assigned builtin-open alias
     "import configparser\ncfg = configparser.ConfigParser()\ncfg.read(p)",
+    "import configparser\ncfg = configparser.ConfigParser()\ncfg.read(p, None)",
     "from configparser import ConfigParser as CP\nc = CP()\nc.read(p)",  # aliased ctor
     (
         'import configparser\nCP = configparser.ConfigParser\ncfg = CP()\ncfg.read("f")'
@@ -147,7 +155,9 @@ _FLAGGED = [
     ),  # assigned instance alias
     "self.cfg = ConfigParser()\nself.cfg.read(p)",  # attribute-bound instance
     'import gzip\ngzip.open(p, "rt")',  # gzip text mode needs encoding
+    'import gzip\ngzip.open(p, "rt", 9, None)',  # positional None is not a codec
     'import bz2\nbz2.open(p, "wt")',  # bz2 text mode needs encoding
+    'import lzma\nlzma.open(p, "rt")',  # lzma encoding is keyword-only
     'from gzip import open as gopen\ngopen(p, "rt")',  # aliased gzip.open, text
     'import gzip as gz\ngz.open("blob.gz", "rt")',  # aliased module (filename has 'b')
     'import gzip\ngzip.open(p, "r" + "t")',  # computed mode, not provably binary
@@ -179,9 +189,24 @@ _FLAGGED = [
     "open(**kwargs)",  # dynamic kwargs: can't prove binary/encoding
     'import io\nio.open("blob.txt")',  # module-style filename is not a Path mode
     'import io\nio.open("rb")',  # valid-looking filename; io mode is argument 1
+    'import io\nio.open(p, "r", -1, None)',  # positional None still defaults
     'import io as streamio\nstreamio.open("wb")',  # aliased text-opener module
     'from io import open as iopen\niopen("rb")',  # aliased text-opener function
+    'import io\nbox.open = io.open\nbox.open(p, "r", -1)',  # unknown receiver signature
+    'import io\nbox.open = io.open\nbox.open("rb")',  # filename is not a bound mode
+    "dist.read_text(name)",  # unknown read_text signature: positional arg is not a codec
+    "thing.write_text(data, enc)",  # unknown write_text signature
+    "import codecs\ncodecs.open(p)",  # codecs defaults to locale text in mode r
+    'import codecs\ncodecs.open(p, "r")',
     'import codecs\ncodecs.open("rb")',  # codecs filename, default text mode
+    'import codecs\ncodecs.open(p, "r", None)',  # None still uses the locale
+    ('from codecs import open\nopen(p, "r", None, "utf-8")'),  # arg 3 is errors, not encoding
+    (
+        'import codecs\nopen = codecs.open\nopen(p, "r", None, "utf-8")'
+    ),  # rebound bare name has an ambiguous positional signature
+    (
+        'import codecs\nbox.fdopen = codecs.open\nbox.fdopen(p, "r", None, "utf-8")'
+    ),  # unknown fdopen receiver: argument 3 may not be its encoding
     'from builtins import open as bopen\nbopen("rb")',  # filename, not a mode
     'import io\n(streamio,) = (io,)\nstreamio.open("rb")',  # unpacked module alias
     'import io\n(iopen,) = (io.open,)\niopen("rb")',  # unpacked function alias
@@ -194,6 +219,15 @@ _FLAGGED = [
     (
         'run("""import gzip as gz\ngz.open("blob.gz", "rt")\ndef later():\n    gz = object()\n""")'
     ),  # embedded binding ambiguity
+    (
+        'run("""import io\nbox.open = io.open\nbox.open(p, "r", -1)\n""")'
+    ),  # embedded unknown receiver
+    (
+        'run("""import io\nbox.open = io.open\nbox.open("rb")\n""")'
+    ),  # embedded positional-mode ambiguity
+    (
+        'run("""import codecs\nbox.fdopen = codecs.open\nbox.fdopen(p, "r", None, "utf-8")\n""")'
+    ),  # embedded unknown fdopen receiver
     "run(\"import gzip; gzip.open (p, 'rt')\")",  # legal whitespace before call
 ]
 _CLEAN = [
@@ -201,25 +235,39 @@ _CLEAN = [
     'open("f", "rb")',  # binary
     'open("f", encoding="locale")',
     'open("f", encoding=enc)',  # a real (non-None) encoding expression
+    'open("f", "r", -1, "utf-8")',  # builtin positional encoding
+    'from builtins import open as bopen\nbopen("f", "r", -1, "utf-8")',
     'from pathlib import Path\nPath("f").read_text(encoding="utf-8")',
     'import tarfile\ntarfile.open("f")',  # archive, not text
     'import tarfile as tf\ntf.open("archive.tar")',  # proven archive-module alias
     'import os\nos.open("f", 0)',  # low-level fd
     'import os\nos.fdopen(fd, "wb")',  # binary
     'import os\nos.fdopen(fd, "w", encoding="utf-8")',
-    'from pathlib import Path\nPath("f").open("rb")',  # proven binary Path mode
+    'from pathlib import Path\nPath("f").open(mode="rb")',  # receiver-independent binary mode
     'import io\nio.open("f", "rb")',  # io.open's mode is positional argument 1
+    'import io\nio.open("f", "r", -1, "utf-8")',
     'import io as streamio\nstreamio.open("f", "wb")',
     'from io import open as iopen\niopen("f", "rb")',
+    'from io import open as iopen\niopen("f", "r", -1, "utf-8")',
+    'import codecs\ncodecs.open("f", "r", "utf-8")',
+    'import codecs\ncodecs.open("f", "rb")',
+    'from codecs import open as copen\ncopen("f", "r", "utf-8")',
+    'from codecs import open\nopen("f", "rb")',
+    'from codecs import open\nopen("f", "r", encoding="utf-8")',
     'from os import fdopen as fdo\nfdo(fd, "wb")',  # aliased fdopen, binary
     'import os\nfdo = os.fdopen\nfdo(fd, "wb")',  # assigned fdopen alias, binary
     'fopen = open\nfopen("f", encoding="utf-8")',
     "import gzip\ngzip.open(p)",  # gzip default binary
+    'import gzip\ngzip.open(p, "r")',  # compressed plain r is binary
+    'import gzip\ngzip.open(p, "w")',  # compressed plain w is binary
     'import gzip\ngzip.open(p, "rb")',  # gzip explicit binary
     "import bz2\nbz2.open(p)",  # bz2 default binary
     'import bz2\nbz2.open(p, "rb")',  # bz2 explicit binary
     'import gzip\ngzip.open(p, "rt", encoding="utf-8")',  # gzip text + encoding
+    'import gzip\ngzip.open(p, "rt", 9, "utf-8")',  # gzip positional encoding
+    'import bz2\nbz2.open(p, "wt", 9, "utf-8")',  # bz2 positional encoding
     'import lzma\nlzma.open(p, "wb")',  # lzma binary
+    'import lzma\nlzma.open(p, "rt", encoding="utf-8")',
     "import gzip as gz\ngz.open(p)",  # aliased module, default binary
     'import gzip as gz\ngz.open(p, "rb")',  # aliased module, binary
     "import configparser\ncfg = configparser.ConfigParser()\ncfg.read(p, encoding='locale')",
