@@ -84,6 +84,8 @@ def _patch_session_as_claude_native(
             payload = dict(latest_payload or {})
             if "model_override" in request_body:
                 payload["model_override"] = request_body["model_override"]
+            if "cost_control_mode_override" in request_body:
+                payload["cost_control_mode_override"] = request_body["cost_control_mode_override"]
         else:
             route.continue_()
             return
@@ -330,3 +332,55 @@ def test_claude_native_picker_prefers_session_override_over_sticky_model(
     expect(page.locator('[role="option"][data-model-id="haiku"]')).not_to_have_attribute(
         "data-active", "true"
     )
+
+
+def test_smart_routing_clears_persisted_model_and_effort(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Enabling routing clears both persisted manual selections in one PATCH."""
+    base_url, session_id = seeded_session
+    seed_response = page.request.patch(
+        f"{base_url}/v1/sessions/{session_id}",
+        data={"model_override": "pinned-model", "reasoning_effort": "high"},
+    )
+    assert seed_response.ok, seed_response.text()
+    patch_bodies: list[dict] = []
+
+    def capture_session_patch(route: Route) -> None:
+        request = route.request
+        if (
+            request.method == "PATCH"
+            and urlparse(request.url).path == f"/v1/sessions/{session_id}"
+        ):
+            patch_bodies.append(json.loads(request.post_data or "{}"))
+        route.continue_()
+
+    def enable_smart_routing(route: Route) -> None:
+        response = route.fetch()
+        payload = response.json()
+        payload["smart_routing_enabled"] = True
+        route.fulfill(status=200, headers=response.headers, body=json.dumps(payload))
+
+    page.route("**/v1/sessions/**", capture_session_patch)
+    page.route("**/v1/info", enable_smart_routing)
+    page.goto(f"{base_url}/c/{session_id}")
+    gear = page.get_by_test_id("composer-config-gear")
+    expect(gear).to_be_visible(timeout=15_000)
+    gear.click()
+    page.get_by_test_id("composer-config-smart-routing").click()
+    with page.expect_response(
+        lambda response: (
+            response.request.method == "PATCH"
+            and urlparse(response.url).path == f"/v1/sessions/{session_id}"
+            and response.status == 200
+        )
+    ):
+        page.get_by_test_id("composer-config-save").click()
+
+    expect(page.get_by_test_id("composer-model-effort-label")).to_contain_text("Smart Routing")
+    assert patch_bodies[-1] == {
+        "cost_control_mode_override": "on",
+        "model_override": "default",
+        "reasoning_effort": "default",
+    }

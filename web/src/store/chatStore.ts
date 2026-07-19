@@ -1772,22 +1772,28 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // clear when a model is actually pinned, so toggling routing on a
     // model-less (e.g. SDK) session doesn't emit a spurious model-cleared change.
     const previousModel = get().sessionModelOverride;
+    const previousEffort = get().selectedEffort;
     const clearModel = mode === "on" && previousModel != null;
+    const clearEffort = mode === "on";
     // Optimistic flip so the pill responds instantly; the PATCH
     // response (or the rollback below) is the settled truth.
     set({
       costControlModeOverride: mode,
       ...(clearModel ? { sessionModelOverride: null } : {}),
+      ...(clearEffort ? { selectedEffort: null } : {}),
     });
+    if (clearEffort) savePickerPref(PICKER_PREF_EFFORT_KEY, null);
     try {
       const session = await updateSession(conversationId, {
         costControlModeOverride: mode,
         ...(clearModel ? { modelOverride: null } : {}),
+        ...(clearEffort ? { reasoningEffort: null } : {}),
       });
       if (get().conversationId !== conversationId) return;
       set({
         costControlModeOverride: session.costControlModeOverride ?? null,
         ...(clearModel ? { sessionModelOverride: session.modelOverride ?? null } : {}),
+        ...(clearEffort ? { selectedEffort: session.reasoningEffort ?? null } : {}),
       });
     } catch (err) {
       // Roll back so neither control claims a state the server never persisted.
@@ -1795,7 +1801,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
         set({
           costControlModeOverride: previous,
           ...(clearModel ? { sessionModelOverride: previousModel } : {}),
+          ...(clearEffort ? { selectedEffort: previousEffort } : {}),
         });
+        if (clearEffort) savePickerPref(PICKER_PREF_EFFORT_KEY, previousEffort);
       }
       throw err;
     }
@@ -2266,9 +2274,10 @@ async function bindStream(
     const canApplyEffort = supportsEffortControl(session);
     const stickyEffort = get().selectedEffort;
     const stickyModel = get().selectedModel;
+    const routingOn = session.costControlModeOverride === "on";
     // Apply sticky effort only where the Web UI control is meaningful.
     const effectiveEffort = canApplyEffort
-      ? (session.reasoningEffort ?? stickyEffort ?? null)
+      ? (session.reasoningEffort ?? (routingOn ? null : stickyEffort) ?? null)
       : stickyEffort;
     // Non-native: don't auto-apply the model, but keep the sticky pick so
     // navigating back to a native session restores it.
@@ -2292,7 +2301,6 @@ async function bindStream(
     // would re-pin the session (e.g. to the last-used Opus) and trip the
     // server's ``model_override is None`` routing guard. effectiveSessionOverride
     // then resolves to null too, so the /model readout doesn't mislabel it.
-    const routingOn = session.costControlModeOverride === "on";
     const willApplyStickyModel =
       !isSubAgentSession &&
       !routingOn &&
@@ -2303,6 +2311,7 @@ async function bindStream(
       session.modelOverride ?? (willApplyStickyModel ? compatibleStickyModel : null);
     if (
       !isSubAgentSession &&
+      !routingOn &&
       canApplyEffort &&
       session.reasoningEffort == null &&
       stickyEffort != null

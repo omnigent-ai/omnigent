@@ -33,7 +33,9 @@ class _ClientStub:
         self.responses = _ResponsesStub()
 
 
-@pytest.mark.parametrize("effort", ["none", "minimal", "low", "medium", "high", "xhigh", "max"])
+@pytest.mark.parametrize(
+    "effort", ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
+)
 def test_session_set_reasoning_effort_valid_values(effort: str) -> None:
     session = Session(_ClientStub(), "agent")  # type: ignore[arg-type]
     session.set_reasoning_effort(effort)

@@ -552,7 +552,7 @@ Request parts:
 
   metadata (JSON string, required)
     Session metadata. Shape matches `SessionCreateMetadata`:
-    `{title?: string | null, labels?: object, reasoning_effort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | null, workspace?: string | null, terminal_launch_args?: string[] | null}`.
+    `{title?: string | null, labels?: object, reasoning_effort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra" | null, workspace?: string | null, terminal_launch_args?: string[] | null}`.
     `terminal_launch_args` carries pass-through CLI args for a native
     terminal wrapper, e.g. `["--permission-mode", "bypassPermissions"]`
     (same field as the JSON create path below). Unknown fields fail with 400.
@@ -784,7 +784,7 @@ Request body:
 
   reasoning_effort (string or null, optional)
     Per-session reasoning-effort hint. Accepted metadata values are
-    `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`.
+    `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`.
     Provider-specific support is validated when a turn executes.
     Clear values follow the existing sessions API semantics.
 

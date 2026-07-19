@@ -1907,7 +1907,7 @@ async def test_patch_session_archive_hides_from_default_list(
     assert sid in default_ids_after, "unarchived session must reappear in the default list"
 
 
-@pytest.mark.parametrize("reasoning_effort", ["high", "xhigh", "max"])
+@pytest.mark.parametrize("reasoning_effort", ["high", "xhigh", "max", "ultra"])
 async def test_patch_session_updates_reasoning_effort(
     client: httpx.AsyncClient,
     reasoning_effort: str,
@@ -5975,7 +5975,7 @@ async def test_post_external_reasoning_effort_change_publishes_session_effort(
         f"/v1/sessions/{session['id']}/events",
         json={
             "type": "external_reasoning_effort_change",
-            "data": {"reasoning_effort": "medium"},
+            "data": {"reasoning_effort": "ultra"},
         },
     )
 
@@ -5983,10 +5983,10 @@ async def test_post_external_reasoning_effort_change_publishes_session_effort(
     assert resp.json() == {"queued": False}
     assert [event["type"] for _, event in published] == ["session.reasoning_effort"]
     assert published[0][1]["conversation_id"] == session["id"]
-    assert published[0][1]["reasoning_effort"] == "medium"
+    assert published[0][1]["reasoning_effort"] == "ultra"
     # Persisted snapshot proves this was not just a transient SSE update.
     snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
-    assert snapshot["reasoning_effort"] == "medium"
+    assert snapshot["reasoning_effort"] == "ultra"
 
 
 async def test_post_external_reasoning_effort_change_clears_effort(

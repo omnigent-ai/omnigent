@@ -709,7 +709,11 @@ async def test_smart_routing_overrides_orchestrator_model_for_child_session(
         return (
             routed_harness,
             routed_model,
-            {"model": routed_model, "rationale": "trivial task — cheap model suffices"},
+            {
+                "model": routed_model,
+                "reasoning_effort": "high",
+                "rationale": "trivial task — cheap model suffices",
+            },
             None,
         )
 
@@ -759,6 +763,8 @@ async def test_smart_routing_overrides_orchestrator_model_for_child_session(
         f"{routed_model!r}; runner body had "
         f"{captured['body'].get('model_override')!r}."
     )
+    assert captured["body"].get("reasoning") == {"effort": "high"}
+    assert (await client.get(f"/v1/sessions/{child_id}")).json()["reasoning_effort"] == "high"
     assert captured["body"].get("harness_override") == routed_harness, (
         f"Smart routing should have set the harness to {routed_harness!r}; "
         f"runner body had {captured['body'].get('harness_override')!r}."

@@ -5464,12 +5464,13 @@ describe("chatStore — bindStream sticky-pref handoff", () => {
       model_override: null,
     });
 
-    useChatStore.setState({ selectedModel: "claude-opus-4-7" });
+    useChatStore.setState({ selectedModel: "claude-opus-4-7", selectedEffort: "high" });
     await useChatStore.getState().switchTo("conv_routing");
 
     // No model_override PATCH fired (contrast the handoff test above).
     const patches = patchCallsFor("conv_routing");
     expect(patches.some((p) => "model_override" in p)).toBe(false);
+    expect(patches.some((p) => "reasoning_effort" in p)).toBe(false);
     // …and the session is not mislabeled as pinned to the sticky model.
     expect(useChatStore.getState().sessionModelOverride).toBeNull();
   });
@@ -7647,7 +7648,7 @@ describe("chatStore — setCostControlMode", () => {
     });
     expect(patchCall).toBeDefined();
     const body = JSON.parse((patchCall![1] as RequestInit).body as string);
-    expect(body).toEqual({ cost_control_mode_override: "on" });
+    expect(body).toEqual({ cost_control_mode_override: "on", reasoning_effort: "default" });
     // Settled state is the server echo, proving the canonical refresh ran.
     expect(useChatStore.getState().costControlModeOverride).toBe("on");
   });
@@ -7658,11 +7659,15 @@ describe("chatStore — setCostControlMode", () => {
     // judge never runs. The clear rides in the SAME PATCH as the toggle.
     seedSession("conv_cc_model", []);
     await useChatStore.getState().switchTo("conv_cc_model");
-    useChatStore.setState({ sessionModelOverride: "claude-opus-4-7" });
+    useChatStore.setState({
+      sessionModelOverride: "claude-opus-4-7",
+      selectedEffort: "high",
+    });
 
     // The optimistic clear is visible before the PATCH resolves.
     const settled = useChatStore.getState().setCostControlMode("on");
     expect(useChatStore.getState().sessionModelOverride).toBeNull();
+    expect(useChatStore.getState().selectedEffort).toBeNull();
     await settled;
 
     const patchCall = fetchMock.mock.calls.find(([u, init]) => {
@@ -7677,6 +7682,7 @@ describe("chatStore — setCostControlMode", () => {
     expect(JSON.parse((patchCall![1] as RequestInit).body as string)).toEqual({
       cost_control_mode_override: "on",
       model_override: "default",
+      reasoning_effort: "default",
     });
   });
 
@@ -7699,6 +7705,7 @@ describe("chatStore — setCostControlMode", () => {
     expect(patchCall).toBeDefined();
     expect(JSON.parse((patchCall![1] as RequestInit).body as string)).toEqual({
       cost_control_mode_override: "on",
+      reasoning_effort: "default",
     });
   });
 
