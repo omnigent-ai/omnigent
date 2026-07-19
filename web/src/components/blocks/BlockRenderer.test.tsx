@@ -547,6 +547,7 @@ describe("BlockRenderer inline file-path linkification", () => {
     await waitFor(() => expect(fetchMock).toHaveBeenCalled());
     const span = await screen.findByText("projects/ghost/missing.md");
     expect(span.tagName).toBe("CODE");
+    expect(span).toHaveAttribute("data-file-reference", "true");
     expect(screen.queryByRole("button", { name: "projects/ghost/missing.md" })).toBeNull();
   });
 
@@ -562,6 +563,7 @@ describe("BlockRenderer inline file-path linkification", () => {
 
     const link = await screen.findByRole("button", { name: "src/app/main.ts" });
     expect(link).toHaveAttribute("data-streamdown", "inline-code");
+    expect(link).toHaveAttribute("data-file-reference", "true");
     link.click();
     expect(openFile).toHaveBeenCalledWith("src/app/main.ts");
     // No existence check needed when the path is already a known change.
@@ -580,6 +582,7 @@ describe("BlockRenderer inline file-path linkification", () => {
 
     const span = await screen.findByText("git status");
     expect(span.tagName).toBe("CODE");
+    expect(span).not.toHaveAttribute("data-file-reference");
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
@@ -644,7 +647,25 @@ describe("BlockRenderer inline file-path linkification", () => {
 
     const span = await screen.findByText("/etc/hosts");
     expect(span.tagName).toBe("CODE");
+    expect(span).toHaveAttribute("data-file-reference", "true");
     expect(screen.queryByRole("button", { name: "/etc/hosts" })).toBeNull();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("styles an out-of-workspace absolute CSV as a file reference without linking it", async () => {
+    const openFile = vi.fn();
+    const path = "/home/jackson.zheng/projects/data/user_data_2024.csv";
+    renderMessage(`Inspect \`${path}\`.`, {
+      openFile,
+      isChangedPath: () => false,
+      conversationId: "conv_1",
+      workspaceRoot: "/home/jackson.zheng/omnigent",
+      workspaceHome: "/home/jackson.zheng",
+    });
+
+    const span = await screen.findByText(path);
+    expect(span).toHaveAttribute("data-file-reference", "true");
+    expect(span).not.toHaveAttribute("role", "button");
     expect(fetchMock).not.toHaveBeenCalled();
   });
 });

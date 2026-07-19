@@ -325,6 +325,11 @@ describe("SettingsPage", () => {
     expect(select.value).toBe("omni-rose");
     expect(document.documentElement.getAttribute("data-theme")).toBe("omni-rose");
     expect(localStorage.getItem("omnigent:ui-theme-palette")).toBe(JSON.stringify("omni-rose"));
+
+    fireEvent.change(select, { target: { value: "otto-dream" } });
+    expect(select.value).toBe("otto-dream");
+    expect(document.documentElement.getAttribute("data-theme")).toBe("otto-dream");
+    expect(localStorage.getItem("omnigent:ui-theme-palette")).toBe(JSON.stringify("otto-dream"));
   });
 
   it("creates and applies a custom theme when a guided color control changes", () => {

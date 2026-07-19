@@ -16,7 +16,7 @@ function ComposerDropOverlay() {
 }
 
 export const COMPOSER_SURFACE_CLASS_NAME =
-  "reference-composer-surface relative z-10 flex min-h-[58px] w-full flex-row flex-wrap items-center gap-2 rounded-[var(--radius-otto-lg)] border border-border bg-card p-3 transition-[border-color,box-shadow] duration-200 ease-[var(--ease-otto)]";
+  "reference-composer-surface relative z-10 flex min-h-[58px] w-full flex-row flex-wrap items-center gap-2 rounded-[var(--radius-otto-lg)] border border-border bg-card p-3 transition-[border-color,box-shadow,transform] duration-[var(--duration-otto-fast)] ease-[var(--ease-otto)]";
 
 type ComposerSurfaceProps = ComposerSurfaceCommonProps & HTMLAttributes<HTMLDivElement>;
 

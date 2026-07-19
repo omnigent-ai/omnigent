@@ -739,6 +739,16 @@ describe("NewChatLandingScreen", () => {
   it("enables submit only once a message, host, agent and valid workspace are set", async () => {
     renderLanding();
     const submit = screen.getByTestId("new-chat-landing-submit") as HTMLButtonElement;
+    expect(screen.getByTestId("new-chat-landing-otto")).toHaveClass("buoyant-enter");
+    expect(screen.getByText("What should we build?")).toHaveClass(
+      "buoyant-enter",
+      "buoyant-enter--title",
+    );
+    expect(screen.getByTestId("new-chat-landing-composer").parentElement).toHaveClass(
+      "buoyant-enter",
+      "buoyant-enter--composer",
+    );
+    expect(submit).toHaveClass("buoyant-send-action", "active:rounded-full");
     // Host (auto-selected) + agent (default) + workspace (seeded from the
     // recent) are all present, but with no message there's no task → disabled.
     await waitFor(() =>

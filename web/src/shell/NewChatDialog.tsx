@@ -3013,7 +3013,7 @@ export function NewChatLandingScreen() {
       <div className="flex w-full max-w-[860px] flex-col items-center gap-6 px-4 pb-16 md:select-none md:px-10">
         <div className="flex flex-col items-center gap-0">
           <div
-            className="relative h-[88px] w-[108px] shrink-0"
+            className="buoyant-enter relative h-[88px] w-[108px] shrink-0"
             aria-hidden="true"
             data-testid="new-chat-landing-otto"
           >
@@ -3024,11 +3024,11 @@ export function NewChatLandingScreen() {
             <span className="otto-landing-satellite otto-landing-satellite--green absolute bottom-[21px] left-4 size-1 rounded-full bg-[#4DC5A0] shadow-[0_0_9px_#4DC5A0]" />
             <OttoEyes className="otto-landing-mascot absolute top-5 left-[30px] h-12 w-auto drop-shadow-[0_16px_25px_rgba(245,59,157,0.21)]" />
           </div>
-          <h1 className="brand-display-title text-center text-[28px] leading-8 font-[450] tracking-[-0.035em] text-foreground">
+          <h1 className="brand-display-title buoyant-enter buoyant-enter--title text-center text-[28px] leading-8 font-[450] tracking-[-0.035em] text-foreground">
             What should we build?
           </h1>
         </div>
-        <div className="relative flex w-full max-w-[704px] flex-col gap-0">
+        <div className="buoyant-enter buoyant-enter--composer relative flex w-full max-w-[704px] flex-col gap-0">
           <ComposerFormSurface
             onSubmit={(e) => {
               e.preventDefault();
@@ -3329,7 +3329,7 @@ export function NewChatLandingScreen() {
                           aria-label={creating ? "Starting session" : "Start session"}
                           aria-busy={creating}
                           data-testid="new-chat-landing-submit"
-                          className="size-8 rounded-full bg-foreground text-card transition-opacity hover:opacity-80 disabled:bg-muted disabled:text-muted-foreground disabled:opacity-100"
+                          className="buoyant-send-action size-8 rounded-full bg-foreground text-card transition-[opacity,transform] hover:opacity-80 active:rounded-full disabled:bg-muted disabled:text-muted-foreground disabled:opacity-100"
                         >
                           {creating ? (
                             <Loader2Icon className="size-4 animate-spin" />

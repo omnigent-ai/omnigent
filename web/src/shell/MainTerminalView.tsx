@@ -112,9 +112,9 @@ export function MainTerminalView({
   );
 
   return (
-    // Outer wrapper fills the main column. `pt-14` clears the 56px
-    // absolute-positioned AppShell header on desktop (matching the
-    // workspace rail's `mt-14`, so the two cards' tops line up); iOS
+    // Outer wrapper fills the main column. Mobile `pt-14` clears the 56px
+    // touch header; desktop `md:pt-10` clears the compact 40px session
+    // header. iOS
     // native gets a safe-area-aware override in index.css. `px-3` gives a
     // 12px gutter on
     // the sides. The card stretches to full width and height of the
@@ -126,7 +126,7 @@ export function MainTerminalView({
       // Exposed for e2e assertions that an expand targeted the right
       // terminal (not just that the view opened).
       data-active-terminal={activeKey}
-      className="main-terminal-view flex min-h-0 flex-1 flex-col px-3 pt-14 pb-1.5"
+      className="main-terminal-view flex min-h-0 flex-1 flex-col px-3 pt-14 pb-1.5 md:pt-10"
     >
       <div className="flex min-h-0 w-full flex-1 flex-col overflow-hidden rounded-lg border border-border bg-card p-3 shadow-sm">
         {terminals.length === 0 ? (

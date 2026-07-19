@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { useChatStore } from "@/store/chatStore";
 import type { Bubble } from "@/lib/renderItems";
@@ -198,6 +198,21 @@ describe("BubbleView dispatch", () => {
     expect(bubble).toHaveAttribute("data-role", "assistant");
     expect(bubble).toHaveTextContent("the answer is 42");
     expect(screen.getByRole("button", { name: "Copy" })).toBeInTheDocument();
+  });
+
+  it("settles only when a live assistant response completes", async () => {
+    const { rerender } = render(<BubbleView bubble={assistantText("working", "streaming")} />);
+    expect(screen.getByTestId("message-bubble")).not.toHaveClass("buoyant-message-settle");
+
+    rerender(<BubbleView bubble={assistantText("done", "completed")} />);
+    await waitFor(() =>
+      expect(screen.getByTestId("message-bubble")).toHaveClass("buoyant-message-settle"),
+    );
+  });
+
+  it("does not animate a historical completed assistant response on mount", () => {
+    render(<BubbleView bubble={assistantText("already done", "completed")} />);
+    expect(screen.getByTestId("message-bubble")).not.toHaveClass("buoyant-message-settle");
   });
 
   it("marks a cancelled assistant turn as Interrupted", () => {

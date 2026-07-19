@@ -25,6 +25,7 @@ const STORAGE_KEY = "omnigent:ui-theme-palette";
 export const themePalettes = [
   "omni",
   "omni-rose",
+  "otto-dream",
   "dracula",
   "github",
   "catppuccin",
@@ -87,18 +88,37 @@ export const PALETTES: readonly PaletteMeta[] = [
   {
     id: "omni-rose",
     label: "Omnigent Rose",
-    blurb: "Dusty rose paper with berry and Otto-green accents.",
+    blurb: "Warm rose paper with plum ink and Otto-green accents.",
     light: {
-      bg: "#faf0f5",
-      card: "#fffafd",
-      accent: "#a63a68",
-      border: "#e4d6de",
-      text: "#2f252d",
+      bg: "#fcfafb",
+      card: "#fffefe",
+      accent: "#df3c85",
+      border: "#e2d7dd",
+      text: "#2b252a",
     },
     // This palette intentionally customizes light mode only. Dark mode keeps
     // the established Omnigent dark treatment rather than inventing a second
     // unrequested rose-dark system.
     dark: { bg: "#121113", card: "#242126", accent: "#df3c85", border: "#322f34", text: "#f4f5f7" },
+  },
+  {
+    id: "otto-dream",
+    label: "Otto Dream",
+    blurb: "Cotton-candy paper, plum ink, and playful Otto accents.",
+    light: {
+      bg: "#fff6fb",
+      card: "#fffdfd",
+      accent: "#f45d9c",
+      border: "#ead7e5",
+      text: "#43324f",
+    },
+    dark: {
+      bg: "#211526",
+      card: "#34243b",
+      accent: "#ff75b5",
+      border: "#59405f",
+      text: "#f8eef9",
+    },
   },
   {
     id: "dracula",

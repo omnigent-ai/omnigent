@@ -60,6 +60,7 @@ describe("themePalette", () => {
     expect(isThemePalette("github")).toBe(true);
     expect(isThemePalette("omni")).toBe(true);
     expect(isThemePalette("omni-rose")).toBe(true);
+    expect(isThemePalette("otto-dream")).toBe(true);
     expect(isThemePalette("nord")).toBe(true);
     expect(isThemePalette("nope")).toBe(false);
     expect(isThemePalette(undefined)).toBe(false);
@@ -75,9 +76,12 @@ describe("themePalette", () => {
     expect(document.documentElement.getAttribute("data-theme")).toBe("catppuccin");
   });
 
-  it("applies the light-only Omnigent Rose palette as a built-in selection", () => {
+  it("applies built-in Omnigent palettes as DOM theme selections", () => {
     applyThemePalette("omni-rose");
     expect(document.documentElement.getAttribute("data-theme")).toBe("omni-rose");
+
+    applyThemePalette("otto-dream");
+    expect(document.documentElement.getAttribute("data-theme")).toBe("otto-dream");
   });
 
   it("sets the custom data-theme when the custom configuration is selected", () => {

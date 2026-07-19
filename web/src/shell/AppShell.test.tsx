@@ -219,6 +219,10 @@ import { useChatStore } from "@/store/chatStore";
  * the production labels ever change, these tests fail loudly instead
  * of drifting silently.
  */
+function getViewProbeButton(name: "Chat" | "Terminal") {
+  return within(screen.getByTestId("view-probe")).getByRole("button", { name });
+}
+
 function TerminalFirstViewProbe() {
   const ctx = useTerminalFirst();
   if (!ctx) return <div data-testid="view-probe" data-no-context="true" />;
@@ -646,7 +650,7 @@ describe("TerminalFirstContext", () => {
     expect(screen.queryByTestId("terminals-panel")).toBeNull();
     expect(screen.getByTestId("files-panel")).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "Terminal" }));
+    fireEvent.click(getViewProbeButton("Terminal"));
 
     // After flip: view is "terminal", drawer still NOT mounted (inline
     // render lives in ChatPage), and the rail's files panel remains.
@@ -655,7 +659,7 @@ describe("TerminalFirstContext", () => {
     expect(screen.getByTestId("files-panel")).toBeInTheDocument();
 
     // Toggling back to Chat returns the probe to "chat".
-    fireEvent.click(screen.getByRole("button", { name: "Chat" }));
+    fireEvent.click(getViewProbeButton("Chat"));
     expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "chat");
   });
 
@@ -683,7 +687,7 @@ describe("TerminalFirstContext", () => {
     expect(probe).toHaveAttribute("data-terminals-available", "false");
     expect(probe).toHaveAttribute("data-view", "chat");
 
-    fireEvent.click(screen.getByRole("button", { name: "Terminal" }));
+    fireEvent.click(getViewProbeButton("Terminal"));
 
     expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "terminal");
     expect(screen.queryByTestId("terminals-panel")).toBeNull();
@@ -715,7 +719,7 @@ describe("TerminalFirstContext", () => {
     const { unmount } = renderShell("/c/conv_native");
 
     // Opt into terminal view.
-    fireEvent.click(screen.getByRole("button", { name: "Terminal" }));
+    fireEvent.click(getViewProbeButton("Terminal"));
     expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "terminal");
 
     // Leave to a different (non-terminal-first) conversation and come back.
@@ -727,10 +731,7 @@ describe("TerminalFirstContext", () => {
 
     // The native session should land back on terminal view, not chat.
     expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "terminal");
-    expect(screen.getByRole("button", { name: "Terminal" })).toHaveAttribute(
-      "aria-pressed",
-      "true",
-    );
+    expect(getViewProbeButton("Terminal")).toHaveAttribute("aria-pressed", "true");
   });
 
   it("does not restore terminal view in a fresh tab (sessionStorage scope)", () => {
@@ -756,7 +757,7 @@ describe("TerminalFirstContext", () => {
 
     renderShell("/c/conv_native");
     expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "chat");
-    expect(screen.getByRole("button", { name: "Chat" })).toHaveAttribute("aria-pressed", "true");
+    expect(getViewProbeButton("Chat")).toHaveAttribute("aria-pressed", "true");
   });
 });
 
@@ -791,10 +792,10 @@ describe("Right-rail terminals card", () => {
 
     // The context-backed toggle still flips view state; main stays
     // mounted (no md:hidden) so it can host the inline terminal.
-    fireEvent.click(screen.getByRole("button", { name: "Terminal" }));
+    fireEvent.click(getViewProbeButton("Terminal"));
     expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "terminal");
     expect(screen.queryByTestId("terminals-panel")).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "Chat" }));
+    fireEvent.click(getViewProbeButton("Chat"));
     expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "chat");
   });
 
@@ -929,7 +930,7 @@ describe("Right-rail terminals card", () => {
     renderShell("/c/conv_native");
 
     // Opt into Terminal view.
-    fireEvent.click(screen.getByRole("button", { name: "Terminal" }));
+    fireEvent.click(getViewProbeButton("Terminal"));
     expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "terminal");
 
     // Surface the rail's Files panel (Agents is the default tab now).
@@ -2834,18 +2835,18 @@ describe("AppShell share action", () => {
     });
   });
 
-  it("hides the Share button entirely in single-user mode", () => {
+  it("keeps the Share button visible but disabled in single-user mode", () => {
     // Non-local origin isolates the single-user gate from the local-server
-    // path. The explicit single_user marker (not just accounts-off/no-login,
-    // which a multi-user header deploy also reports) means no other users to
-    // share with, so the button is removed — not disabled like the
-    // local-server / sharing-off cases.
+    // path. The header action remains structurally stable, but the explicit
+    // single_user marker disables it because there is nobody to grant access.
     withWindowOrigin("https://app.example.com", () => {
       mockConversations([{ id: "conv_top", permission_level: null }]);
 
       renderShell("/c/conv_top", serverInfo({ single_user: true }));
 
-      expect(screen.queryByRole("button", { name: /share session/i })).toBeNull();
+      const shareButton = screen.getByRole("button", { name: /share session/i });
+      expect(shareButton).toBeDisabled();
+      expect(shareButton).toHaveAttribute("title", "Sharing is unavailable in single-user mode.");
     });
   });
 

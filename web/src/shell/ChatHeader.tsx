@@ -6,6 +6,8 @@ import {
   InfoIcon,
   ListIcon,
   ListTodoIcon,
+  Loader2Icon,
+  MessageSquareIcon,
   PanelLeftIcon,
   PanelRightCloseIcon,
   PanelRightIcon,
@@ -27,6 +29,7 @@ import { PresenceAvatars } from "@/components/PresenceAvatars";
 import type { Agent } from "@/hooks/useAgents";
 import { cn } from "@/lib/utils";
 import { TAB_BADGE_BASE } from "./railTabs";
+import { useTerminalFirst } from "./TerminalFirstContext";
 
 /**
  * Gating flags + handlers for the mobile-only session-menu FAB (the
@@ -102,7 +105,7 @@ interface ChatHeaderProps {
   parentSessionId: string | null | undefined;
   /** Active session id, or undefined on the landing composer. */
   conversationId: string | undefined;
-  /** Active session title shown in the centered desktop header slot. */
+  /** Active session title shown in the left side of the desktop header. */
   sessionTitle?: string;
   /** The bound agent (mcp_servers + policies) for the info popover. */
   boundAgent: Agent | undefined;
@@ -176,16 +179,21 @@ export function ChatHeader({
   onToggleRightPanel,
   mobileMenu,
 }: ChatHeaderProps) {
+  const terminalFirst = useTerminalFirst();
+  const showDesktopViewSwitcher =
+    conversationId && terminalFirst?.isTerminalFirst && !terminalFirst.isShellView;
+
   return (
     <header
+      data-testid="chat-header"
       className={cn(
-        // h-14 fixes the bar at 56px: 12px symmetric vertical padding around
-        // the 32px controls. No own background — the app canvas shows
-        // through (a scrim can't track the canvas gradient).
-        // Scrolled chat text can't render through the controls because the
-        // conversation viewport fades its top edge instead (chat-scroll-fade
-        // in index.css, applied in ChatPage).
-        "chat-header absolute top-0 right-0 left-0 z-30 flex h-14 items-center justify-between px-2 py-3 md:right-[var(--workspace-panel-offset,0px)]",
+        // Mobile keeps the existing 56px touch-friendly bar. Desktop adopts
+        // the reference's compact 40px session chrome: title left, view mode
+        // centered, and actions right. Only active sessions paint the surface
+        // + hairline; the landing page keeps its atmospheric canvas clear.
+        "chat-header absolute top-0 right-0 left-0 z-30 flex h-14 items-center justify-between px-2 py-3 md:right-[var(--workspace-panel-offset,0px)] md:h-10 md:py-2",
+        conversationId &&
+          "chat-header-session md:border-b md:border-border md:bg-background/95 md:backdrop-blur-xl",
       )}
     >
       {/* Left slot: sidebar toggle (when sidebar is closed) and a
@@ -198,7 +206,12 @@ export function ChatHeader({
           where the macOS Electron shell's traffic lights float — drop
           just this slot below them (the right action cluster stays up
           in the title-bar strip). Inert outside the shell (index.css). */}
-      <div className={cn("flex items-center gap-1", !sidebarOpen && "traffic-light-clearance")}>
+      <div
+        className={cn(
+          "flex min-w-0 flex-1 items-center gap-1",
+          !sidebarOpen && "traffic-light-clearance",
+        )}
+      >
         {!sidebarOpen && (
           <Tooltip>
             <TooltipTrigger asChild>
@@ -260,17 +273,61 @@ export function ChatHeader({
             </div>
           </>
         )}
-      </div>
-
-      {conversationId && sessionTitle && (
-        <div className="pointer-events-none absolute left-1/2 flex max-w-[220px] -translate-x-1/2 items-center justify-center">
-          <p className="min-w-0 truncate text-sm leading-5 font-medium text-foreground">
+        {conversationId && sessionTitle && (
+          <p className="min-w-0 max-w-[320px] truncate text-13 leading-5 font-normal">
             {sessionTitle}
           </p>
+        )}
+      </div>
+
+      {showDesktopViewSwitcher && terminalFirst && (
+        <div className="absolute left-1/2 hidden -translate-x-1/2 md:flex">
+          <div
+            role="group"
+            aria-label="View mode"
+            className="flex h-6 items-center rounded-[var(--radius-otto-xs)] bg-muted p-px"
+          >
+            <button
+              type="button"
+              aria-pressed={terminalFirst.view === "chat"}
+              aria-label="Chat"
+              onClick={() => terminalFirst.setView("chat")}
+              className={cn(
+                "flex h-[22px] cursor-pointer items-center gap-1 rounded-[5px] px-2 text-xs transition-[background-color,color,box-shadow] duration-[var(--duration-otto-fast)] ease-[var(--ease-otto)]",
+                terminalFirst.view === "chat"
+                  ? "bg-card text-foreground shadow-sm"
+                  : "text-muted-foreground hover:text-foreground",
+              )}
+            >
+              <MessageSquareIcon className="size-3.5" />
+              <span>Chat</span>
+            </button>
+            <button
+              type="button"
+              aria-pressed={terminalFirst.view === "terminal"}
+              aria-label="Terminal"
+              disabled={!terminalFirst.terminalsAvailable}
+              title={terminalFirst.terminalStartingUp ? "Terminal is starting up…" : undefined}
+              onClick={() => terminalFirst.setView("terminal")}
+              className={cn(
+                "flex h-[22px] cursor-pointer items-center gap-1 rounded-[5px] px-2 text-xs transition-[background-color,color,box-shadow] duration-[var(--duration-otto-fast)] ease-[var(--ease-otto)] disabled:cursor-not-allowed disabled:opacity-50",
+                terminalFirst.view === "terminal"
+                  ? "bg-card text-foreground shadow-sm"
+                  : "text-muted-foreground hover:text-foreground",
+              )}
+            >
+              {terminalFirst.terminalStartingUp ? (
+                <Loader2Icon className="size-3.5 animate-spin" aria-hidden />
+              ) : (
+                <TerminalIcon className="size-3.5" />
+              )}
+              <span>Terminal</span>
+            </button>
+          </div>
         </div>
       )}
 
-      <div className="flex items-center gap-1">
+      <div className="ml-auto flex min-w-0 flex-1 items-center justify-end gap-2">
         {/* Other users currently viewing this session (presence).
             Self-contained — reads the chat store directly, renders
             nothing when the user is alone. */}
@@ -342,9 +399,9 @@ export function ChatHeader({
                   aria-label="Share session"
                   disabled
                   title={shareDisabledReason}
-                  // share-button-glassy (index.css) paints the pink gradient,
-                  // shadow, and white text in both light and dark mode.
-                  className="share-button-glassy h-6 rounded-md px-2 text-13 font-normal text-white"
+                  // share-button-header (index.css) paints the quiet branded
+                  // secondary surface in both light and dark mode.
+                  className="share-button-header h-6 rounded-full px-2.5 text-13 font-normal"
                 >
                   <UserRoundPlusIcon className="size-4" />
                   Share
@@ -358,9 +415,9 @@ export function ChatHeader({
             type="button"
             aria-label="Share session"
             onClick={onShare}
-            // share-button-glassy (index.css) paints the pink gradient,
-            // shadow, and white text in both light and dark mode.
-            className="share-button-glassy hidden h-6 rounded-md px-2 text-13 font-normal text-white md:inline-flex"
+            // share-button-header (index.css) paints the quiet branded
+            // secondary surface in both light and dark mode.
+            className="share-button-header hidden h-6 rounded-full px-2.5 text-13 font-normal text-foreground md:inline-flex"
           >
             <UserRoundPlusIcon className="size-4" />
             Share
@@ -372,7 +429,7 @@ export function ChatHeader({
               <Button
                 type="button"
                 variant="ghost"
-                size="icon"
+                size="icon-xs"
                 aria-label={rightPanelOpen ? "Collapse right panel" : "Expand right panel"}
                 onClick={onToggleRightPanel}
                 className="hidden md:inline-flex text-muted-foreground hover:text-foreground"

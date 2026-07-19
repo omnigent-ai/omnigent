@@ -1195,7 +1195,7 @@ interface SessionLayoutProps {
  */
 function SessionLayout({ mainAgent }: SessionLayoutProps) {
   return (
-    <div className="flex min-h-0 flex-1 overflow-hidden pt-14">
+    <div className="flex min-h-0 flex-1 overflow-hidden pt-14 md:pt-10">
       <div className="flex min-w-0 flex-1 flex-col">{mainAgent}</div>
     </div>
   );
@@ -1718,14 +1718,18 @@ function MainAgentSurface({
                 <RunnerStartingIndicator variant="hero" />
               ) : (
                 <ConversationEmptyState>
-                  <div className="space-y-1.5">
-                    <h3 className="text-2xl font-medium tracking-[-0.02em]">
-                      What should we work on?
+                  <div className="flex flex-col items-center gap-2.5 text-center">
+                    <OttoIcon
+                      className="buoyant-enter h-14 w-auto drop-shadow-[0_10px_18px_rgba(245,59,157,0.16)]"
+                      aria-hidden="true"
+                    />
+                    <h3 className="brand-display-title buoyant-enter buoyant-enter--title text-2xl font-[450] tracking-[-0.025em]">
+                      Ready when you are
                     </h3>
-                    <p className="text-muted-foreground text-base">
+                    <p className="buoyant-enter buoyant-enter--composer text-muted-foreground text-base">
                       {agentsError
                         ? `Failed to load agents: ${agentsError instanceof Error ? agentsError.message : String(agentsError)}`
-                        : "Send a message to get started."}
+                        : "Describe the outcome; Omnigent will handle the steps."}
                     </p>
                   </div>
                 </ConversationEmptyState>
@@ -2896,7 +2900,7 @@ function ConnectedTerminalFirstPill({
   return (
     <div
       className={cn(
-        "terminal-first-switcher-container mx-auto flex w-full items-center justify-center px-6 pb-1.5",
+        "terminal-first-switcher-container mx-auto flex w-full items-center justify-center px-6 pb-1.5 md:hidden",
         CHAT_COLUMN_WIDTH,
       )}
     >
@@ -3241,6 +3245,18 @@ function AssistantBubble({ bubble }: { bubble: Extract<Bubble, { kind: "assistan
   const { isCopied, handleCopy } = useCopyMessage(() => collectBubbleMarkdown(bubble.items));
   // null outside AppShell's provider (isolated tests) → hide the action.
   const forkDialog = useForkDialog();
+  const previousLifecycleRef = useRef(bubble.lifecycle);
+  const [isSettling, setIsSettling] = useState(false);
+
+  useEffect(() => {
+    const previousLifecycle = previousLifecycleRef.current;
+    previousLifecycleRef.current = bubble.lifecycle;
+    if (previousLifecycle !== "streaming" || bubble.lifecycle !== "completed") return;
+
+    setIsSettling(true);
+    const settleTimer = window.setTimeout(() => setIsSettling(false), 220);
+    return () => window.clearTimeout(settleTimer);
+  }, [bubble.lifecycle]);
 
   if (bubble.items.length === 0) return null;
 
@@ -3257,7 +3273,7 @@ function AssistantBubble({ bubble }: { bubble: Extract<Bubble, { kind: "assistan
         from="assistant"
         data-testid="message-bubble"
         data-role="assistant"
-        className="max-w-full"
+        className={cn("max-w-full", isSettling && "buoyant-message-settle")}
       >
         <MessageContent className={isWide ? "w-full" : undefined}>
           <BlockRenderer items={bubble.items} sessionStatus={sessionStatus} />
@@ -4964,7 +4980,8 @@ export function Composer({
               // overrides the base 50% disabled-opacity so the affordance
               // reads as "waiting for input", not "almost active".
               className={cn(
-                "size-8 shrink-0 rounded-full",
+                "size-8 shrink-0 rounded-full active:rounded-full",
+                !showInterruptButton && "buoyant-send-action",
                 !showInterruptButton && "hover:bg-primary/90 disabled:opacity-30",
               )}
               // Interrupt stays live during a pending elicitation —

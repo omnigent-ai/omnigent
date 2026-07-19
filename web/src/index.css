@@ -131,6 +131,7 @@
   --radius-otto-md: 14px;
   --radius-otto-lg: 20px;
   --ease-otto: cubic-bezier(0.34, 1.4, 0.64, 1);
+  --duration-otto-fast: 180ms;
   --border-otto-hairline: rgba(61, 57, 41, 0.1);
   --border-otto-container: rgba(61, 57, 41, 0.14);
   --border-otto-interactive: rgba(61, 57, 41, 0.18);
@@ -295,10 +296,10 @@
   --border-otto-interactive: rgba(255, 255, 255, 0.14);
   --elevation-otto-1: 0 1px 2px rgba(0, 0, 0, 0.18), 0 3px 10px rgba(0, 0, 0, 0.2);
   --elevation-otto-2: 0 2px 4px rgba(0, 0, 0, 0.28), 0 12px 32px rgba(0, 0, 0, 0.3);
-  /* Isaac Darker-inspired near-black ladder with a tiny Omnigent rose bias. */
+  /* Xcode-inspired near-black ladder: warm-black canvas with neutral graphite utility panes. */
   --background: #121113;
   --shell-surface: #121113;
-  --side-pane-surface: #1b191d;
+  --side-pane-surface: #1d1d1f;
   /* Composer is the primary interaction surface: use a restrained
      rose-neutral tier that separates from the canvas without reading pink. */
   --composer-surface: rgb(40, 36, 44);
@@ -355,7 +356,7 @@
   --chart-3: oklch(0.68 0.15 145);
   --chart-4: oklch(0.75 0.16 70);
   --chart-5: oklch(0.65 0.008 240);
-  --sidebar: #1b191d;
+  --sidebar: #1d1d1f;
   --sidebar-foreground: oklch(0.965 0.003 240);
   --sidebar-primary: oklch(0.64 0.22 254);
   --sidebar-primary-foreground: oklch(0.12 0.004 240);
@@ -426,6 +427,17 @@
   background: var(--side-pane-surface);
 }
 
+/* Match SP2K's floating-sidebar depth: a broad 24px lift at very low alpha,
+ * retaining Omnigent's existing hairline border rather than duplicating the
+ * shadow-ring SP2K uses in place of a CSS border. Scope this to the canonical
+ * light palette so named themes keep their own elevation language. */
+:root:not(.dark):not([data-theme]) .conversations-sidebar:not([data-collapsed]) {
+  background: var(--sidebar);
+  box-shadow:
+    0 1px 2px rgba(20, 20, 19, 0.05),
+    0 4px 24px rgba(10, 10, 10, 0.04);
+}
+
 /* Give the new-session landing the mockup's magical pink/green atmosphere
  * without replacing the established app or sidebar surface colors. The
  * generated layer paints behind the real shell children and disappears on
@@ -448,6 +460,68 @@
   background: var(--composer-surface);
   background-image: none;
   box-shadow: var(--elevation-otto-2);
+}
+
+.reference-composer-surface:focus-within {
+  transform: translateY(-1px);
+}
+
+:root:not(.dark) .reference-composer-surface:focus-within {
+  border-color: var(--border-otto-interactive);
+}
+
+html:not(.dark):not([data-theme]) .reference-composer-surface:focus-within,
+html:not(.dark)[data-theme="omni-rose"] .reference-composer-surface:focus-within,
+html:not(.dark)[data-theme="otto-dream"] .reference-composer-surface:focus-within {
+  border-color: rgba(38, 160, 121, 0.42);
+  border-top-color: rgba(38, 160, 121, 0.5);
+}
+
+.buoyant-send-action:not(:disabled):active {
+  border-radius: 999px;
+  transform: scale(0.95);
+}
+
+.buoyant-enter {
+  animation: buoyant-enter var(--duration-otto-fast) var(--ease-otto) both;
+}
+
+.buoyant-enter--title {
+  animation-delay: 35ms;
+}
+
+.buoyant-enter--composer {
+  animation-delay: 70ms;
+}
+
+.buoyant-message-settle {
+  animation: buoyant-message-settle var(--duration-otto-fast) var(--ease-otto) both;
+}
+
+@keyframes buoyant-enter {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes buoyant-message-settle {
+  0% {
+    transform: translateY(4px);
+    filter: drop-shadow(0 5px 10px color-mix(in srgb, #4dc5a0 12%, transparent));
+  }
+  72% {
+    transform: translateY(-0.5px);
+    filter: drop-shadow(0 1px 3px color-mix(in srgb, #4dc5a0 5%, transparent));
+  }
+  100% {
+    transform: translateY(0);
+    filter: none;
+  }
 }
 
 /* Reference workspace card: the right pane uses the compact floating geometry
@@ -482,22 +556,29 @@ html.dark .app-shell .workspace-panel-surface {
   background: var(--shell-surface);
 }
 
-/* Chat scroll fade: the ChatHeader overlay paints no background (a flat
- * fill can't track the .app-shell canvas gradient, and a copy of the
- * gradient can't stay aligned — the header resizes when the sidebar
- * opens), so instead of occluding scrolled-under text at the header, the
- * conversation's scroll viewport masks its own top edge: content
- * dissolves into the canvas before it reaches the header's control row
- * (on mobile, message text used to render straight through the icons).
- * Geometry is tied to the header chrome — fully transparent through 48px
- * (the h-14 bar is 56px tall; its 32px controls end at 44px), ramping to
- * full opacity at 80px, the chat column's pt-20 clearance line, so
- * at-rest content is never faded. Stops are px from the top so the fade
- * is independent of viewport height, and the mask sits on the viewport
- * box (not the scrolling content) so it stays pinned while text moves. */
+/* The conversation viewport begins immediately below the absolute header.
+ * Fade its first 24px so scrolled text dissolves as it approaches the header
+ * instead of striking the hairline abruptly. ConversationContent owns 24px of
+ * top padding, so the first at-rest message reaches full opacity exactly where
+ * content begins. The mask stays pinned to the viewport while messages scroll. */
 .chat-scroll-fade {
-  mask-image: none;
-  -webkit-mask-image: none;
+  mask-image: linear-gradient(to bottom, transparent 0, rgba(0, 0, 0, 0.5) 10px, black 24px);
+  -webkit-mask-image: linear-gradient(
+    to bottom,
+    transparent 0,
+    rgba(0, 0, 0, 0.5) 10px,
+    black 24px
+  );
+}
+
+/* Compact active-session header: backdrop blur handles content passing beneath
+ * it; this low, warm shadow only separates the chrome from the thread. */
+.chat-header-session {
+  box-shadow: 0 8px 20px -14px rgba(61, 57, 41, 0.32);
+}
+
+.dark .chat-header-session {
+  box-shadow: 0 10px 24px -14px rgba(0, 0, 0, 0.65);
 }
 
 /* Turn rail's edges dissolve so it's clear the ticks scroll past both ends.
@@ -596,6 +677,11 @@ html.dark .app-shell .reference-composer-surface {
     0 2px 4px rgba(0, 0, 0, 0.28),
     0 12px 32px rgba(0, 0, 0, 0.3),
     inset 0 1px rgba(255, 255, 255, 0.035) !important;
+}
+
+html.dark .app-shell .reference-composer-surface:focus-within {
+  border-color: rgba(77, 197, 160, 0.34) !important;
+  border-top-color: rgba(77, 197, 160, 0.42) !important;
 }
 
 .dark .reference-composer-surface textarea::placeholder {
@@ -918,35 +1004,44 @@ html[data-theme] .reference-composer-surface button[aria-label="Send"]:not(:disa
     transition-duration: 1ms;
   }
 }
-/* Share button — glassy pink effect (both modes). The vertical
- * gradient alone does the embossed work (lighter top = light catch,
- * darker bottom = shadow, simulating a convex surface lit from above);
- * no border or inset shine. Light mode: gentler gradient, no shadow —
- * the full emboss + dark depth shadow reads too heavy on the light
- * canvas. Dark mode: stronger emboss plus the grounding shadow. */
-.share-button-glassy {
-  background: linear-gradient(to bottom, #fa3d99 0%, #f22286 40%, #d51d74 100%);
-  border: none;
-  box-shadow: none;
-  color: #ffffff;
+/* Share is a secondary workstation action, not a promotional CTA. Keep
+ * the surface quiet and let a restrained Otto-rose icon carry the brand.
+ * Theme-role tokens preserve the same hierarchy across Omnigent and named
+ * palettes without introducing a loud, theme-breaking gradient. */
+.share-button-header {
+  background: var(--accent);
+  border: 1px solid var(--button-border);
+  box-shadow: var(--elevation-otto-1);
+  color: var(--accent-foreground);
 }
 
-.share-button-glassy:hover {
-  /* Darken the gradient slightly on hover */
-  background: linear-gradient(to bottom, #ec3790 0%, #e51b7d 40%, #c41a6b 100%);
+.share-button-header svg {
+  color: var(--brand-accent);
 }
 
-.dark .share-button-glassy {
-  background: linear-gradient(150deg, #ff4da6 0%, #f22286 40%, #b8185f 100%);
-  border: none;
+.share-button-header:hover {
+  border-color: var(--border-strong);
   box-shadow:
-    0 4px 16px rgba(0, 0, 0, 0.5),
-    0 1px 3px rgba(0, 0, 0, 0.4);
-  color: #ffffff;
+    var(--elevation-otto-1),
+    0 0 0 1px var(--accent);
 }
 
-.dark .share-button-glassy:hover {
-  background: linear-gradient(150deg, #f0408f 0%, #e51b7d 40%, #a51455 100%);
+.share-button-header:disabled {
+  opacity: 0.72;
+}
+
+.dark .share-button-header {
+  background: var(--accent);
+  border-color: var(--button-border);
+  box-shadow: var(--elevation-otto-1);
+  color: var(--accent-foreground);
+}
+
+.dark .share-button-header:hover {
+  border-color: var(--border-strong);
+  box-shadow:
+    var(--elevation-otto-1),
+    0 0 0 1px var(--accent);
 }
 
 @layer base {
@@ -1037,12 +1132,12 @@ html[data-theme] .reference-composer-surface button[aria-label="Send"]:not(:disa
   background-color: var(--code-bg);
 }
 
-/* Session keyword chips mirror the Vercel prototype exactly: compact 12/18
- * mono text, 5px inline + 1px block padding, and a quiet 4px surface. */
+/* Session keyword chips keep the Vercel prototype's compact 12/18 geometry,
+ * with a slightly stronger neutral fill for Omnigent Light's brighter canvas. */
 .chat-conversation-content [data-streamdown="inline-code"] {
   padding: 1px 5px;
   border-radius: 4px;
-  background-color: rgba(0, 0, 0, 0.06);
+  background-color: rgba(0, 0, 0, 0.085);
   color: rgb(39, 39, 42);
   font-family: "Geist Mono Variable", "SF Mono", Monaco, Consolas, monospace;
   font-size: 12px;
@@ -1054,51 +1149,37 @@ html[data-theme] .reference-composer-surface button[aria-label="Send"]:not(:disa
   color: #fff;
 }
 
-/* Default Omnigent light theme mirrors the dark syntax categories with
- * paper-soft Otto tints. Keep saturation low so the pills feel editorial,
- * not like status badges; named palettes retain their neutral treatment. */
-html:not(.dark):not([data-theme]) .chat-conversation-content [data-streamdown="inline-code"] {
-  background-color: color-mix(in srgb, #e60c7f 6%, var(--card-solid));
-  color: #8c315c;
+/* File references use plain inline treatment rather than keyword-chip
+ * geometry. A contrast-safe Otto rose distinguishes paths without adding a
+ * background tile or heavier font weight. */
+.chat-conversation-content [data-streamdown="inline-code"][data-file-reference="true"] {
+  padding: 0;
+  border-radius: 0;
+  background: transparent !important;
+  box-shadow: none;
+  color: #bc2f72 !important;
+  font-size: 13px;
+  font-weight: 400;
+  line-height: inherit;
 }
 
-html:not(.dark):not([data-theme])
+.chat-conversation-content
+  [data-streamdown="inline-code"][data-file-reference="true"][role="button"]:hover {
+  color: #9f1f5b !important;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.dark .chat-conversation-content [data-streamdown="inline-code"][data-file-reference="true"] {
+  color: #f58abd !important;
+}
+
+.dark
   .chat-conversation-content
-  [data-streamdown="inline-code"][role="button"] {
-  background-color: color-mix(in srgb, #26a079 7%, var(--card-solid));
-  color: #237d63;
+  [data-streamdown="inline-code"][data-file-reference="true"][role="button"]:hover {
+  color: #ffc0dc !important;
 }
 
-html:not(.dark):not([data-theme])
-  .chat-conversation-content
-  [data-streamdown="inline-code"][role="button"]:hover {
-  color: #185f4b;
-}
-
-/* Default Omnigent dark theme: Monokai-Pro-like restraint in Otto's palette.
- * A low-chroma rose-charcoal surface and softened syntax rose distinguish the
- * token without the outlined/candy-like harshness of saturated pink. Other
- * palettes retain the neutral treatment above. */
-html.dark:not([data-theme]) .chat-conversation-content [data-streamdown="inline-code"] {
-  background-color: color-mix(in srgb, #e60c7f 8%, var(--card-solid));
-  color: #f2a3c7;
-}
-
-/* Verified workspace file references are a second syntax category. Use the
- * green sidekick's palette so files scan differently from commands/keywords,
- * while retaining the same quiet Monokai-Pro-like pill treatment. */
-html.dark:not([data-theme])
-  .chat-conversation-content
-  [data-streamdown="inline-code"][role="button"] {
-  background-color: color-mix(in srgb, #26a079 10%, var(--card-solid));
-  color: #4dc5a0;
-}
-
-html.dark:not([data-theme])
-  .chat-conversation-content
-  [data-streamdown="inline-code"][role="button"]:hover {
-  color: #8ed9c0;
-}
 [data-streamdown="code-block-body"] {
   font-size: 0.875em;
 }
@@ -1966,56 +2047,57 @@ html.dark:not([data-theme])
   }
 }
 
-/* ── Omnigent Rose — flat dusty-rose paper, berry accent ─────────────────── */
+/* ── Omnigent Rose — warm rose-paper ladder with plum-charcoal ink ──────── */
 :root:not(.dark)[data-theme="omni-rose"] {
-  --background: #faf0f5;
-  --shell-surface: #faf0f5;
-  --side-pane-surface: #fef6fa;
-  --composer-surface: #fffafd;
-  --foreground: #2f252d;
-  --assistant-foreground: #3f343d;
-  --user-bubble-bg: #eedbe4;
-  --user-bubble-border: #dfc4d0;
-  --user-bubble-foreground: #36232e;
-  --card: #fffafd;
-  --card-solid: #fffafd;
-  --card-foreground: #2f252d;
-  --tray: #fffafd;
-  --popover: #fffafd;
-  --popover-foreground: #2f252d;
+  --background: #fcfafb;
+  --shell-surface: #fcfafb;
+  --side-pane-surface: #f8f4f6;
+  --composer-surface: #fffefe;
+  --foreground: #2b252a;
+  --assistant-foreground: #3b3338;
+  --user-bubble-bg: #f4eef1;
+  --user-bubble-border: rgba(87, 55, 73, 0.09);
+  --user-bubble-foreground: #2b252a;
+  --card: #fffefe;
+  --card-solid: #fffefe;
+  --card-foreground: #2b252a;
+  --tray: #fffefe;
+  --popover: #fffefe;
+  --popover-foreground: #2b252a;
   --primary: #4dc5a0;
   --primary-foreground: #123d33;
-  --secondary: #eef3f0;
-  --secondary-foreground: #345f53;
-  --muted: #efe7eb;
-  --muted-foreground: #685b65;
-  --code-bg: #eee4e9;
-  --accent: #e1f1eb;
-  --accent-foreground: #26705a;
-  --border: #e4d6de;
-  --border-strong: #c7aeba;
-  --button-border: #decdd6;
-  --input: #decdd6;
+  --secondary: #f3eff1;
+  --secondary-foreground: #3b3338;
+  --muted: rgba(87, 55, 73, 0.06);
+  --muted-foreground: #6f656b;
+  --code-bg: #f2edef;
+  --accent: #f3e8ee;
+  --accent-foreground: #66384d;
+  --border: rgba(87, 55, 73, 0.11);
+  --border-strong: rgba(87, 55, 73, 0.19);
+  --button-border: rgba(87, 55, 73, 0.15);
+  --button-icon-hover-color: #2b252a;
+  --input: rgba(87, 55, 73, 0.12);
   --ring: #26a079;
-  --brand-accent: #cf3e83;
-  --sidebar: #fef6fa;
-  --sidebar-foreground: #3b3038;
+  --brand-accent: #df3c85;
+  --sidebar: #f8f4f6;
+  --sidebar-foreground: #332c31;
   --sidebar-primary: #4dc5a0;
   --sidebar-primary-foreground: #123d33;
-  --sidebar-accent: #e1f1eb;
-  --sidebar-accent-foreground: #26705a;
-  --sidebar-border: #e4d6de;
+  --sidebar-accent: #eee7eb;
+  --sidebar-accent-foreground: #62394c;
+  --sidebar-border: rgba(87, 55, 73, 0.1);
   --sidebar-ring: #26a079;
+  --scrollbar-thumb: rgba(67, 45, 58, 0.12);
+  --scrollbar-thumb-hover: rgba(67, 45, 58, 0.22);
 }
 :root:not(.dark)[data-theme="omni-rose"] .app-shell {
   background: var(--shell-surface);
 }
 :root:not(.dark)[data-theme="omni-rose"] .app-shell:has([data-testid="new-chat-landing"])::before {
-  background: none;
-}
-:root:not(.dark)[data-theme="omni-rose"] .otto-landing-halo {
-  background: none;
-  filter: none;
+  background:
+    radial-gradient(circle at 66% 18%, rgba(245, 59, 157, 0.09), transparent 29%),
+    radial-gradient(circle at 54% 92%, rgba(77, 197, 160, 0.072), transparent 30%);
 }
 :root:not(.dark)[data-theme="omni-rose"] .otto-landing-mascot {
   filter: drop-shadow(0 10px 14px rgba(166, 58, 104, 0.12));
@@ -2041,11 +2123,271 @@ html.dark:not([data-theme])
   background: var(--primary) !important;
 }
 :root:not(.dark)[data-theme="omni-rose"] .conversations-sidebar:not([data-collapsed]) {
+  --foreground: var(--sidebar-foreground);
+  --muted: rgba(87, 55, 73, 0.06);
+  --muted-foreground: #6f656b;
   border-color: var(--sidebar-border);
+  box-shadow:
+    0 1px 2px rgba(67, 45, 58, 0.055),
+    0 12px 30px -24px rgba(223, 60, 133, 0.28),
+    inset -1px 0 rgba(255, 255, 255, 0.6);
 }
-:root:not(.dark)[data-theme="omni-rose"]
-  :is(.reference-composer-surface, .workspace-panel-surface) {
-  border-color: var(--border);
+:root:not(.dark)[data-theme="omni-rose"] .reference-composer-surface {
+  border-color: rgba(87, 55, 73, 0.15);
+  box-shadow:
+    0 2px 4px rgba(67, 45, 58, 0.06),
+    0 10px 28px rgba(67, 45, 58, 0.045),
+    0 18px 38px -26px rgba(223, 60, 133, 0.34);
+}
+:root:not(.dark)[data-theme="omni-rose"] .workspace-panel-surface {
+  border-color: var(--sidebar-border);
+  box-shadow:
+    0 1px 2px rgba(67, 45, 58, 0.055),
+    0 12px 30px -24px rgba(223, 60, 133, 0.28);
+}
+
+/* ── Otto Dream — cotton-candy paper and multicolor buoyant utility ─────── */
+:root:not(.dark)[data-theme="otto-dream"] {
+  --background: #fff6fb;
+  --shell-surface: #fff6fb;
+  --side-pane-surface: #f8edf7;
+  --composer-surface: #fffdfd;
+  --foreground: #43324f;
+  --assistant-foreground: #574263;
+  --user-bubble-bg: #fffdfd;
+  --user-bubble-border: #e5c3d7;
+  --user-bubble-foreground: #43324f;
+  --card: #fffdfd;
+  --card-solid: #fffdfd;
+  --card-foreground: #43324f;
+  --tray: #fffdfd;
+  --popover: #fffafd;
+  --popover-foreground: #43324f;
+  --primary: #4dc5a0;
+  --primary-foreground: #123d33;
+  --secondary: #f0e8f5;
+  --secondary-foreground: #5f3f70;
+  --muted: #f5eaf2;
+  --muted-foreground: #7b6983;
+  --code-bg: #f2eaf7;
+  --accent: #e5f2ff;
+  --accent-foreground: #3d628e;
+  --destructive: #d94377;
+  --destructive-foreground: #ffffff;
+  --success: #26a079;
+  --warning: #d99a3e;
+  --info: #579de0;
+  --session-active: #267f66;
+  --border: #ead7e5;
+  --border-strong: #d7b9d0;
+  --button-border: #dec8d8;
+  --button-icon-hover-color: #43324f;
+  --input: #dec8d8;
+  --ring: #26a079;
+  --brand-accent: #f45d9c;
+  --status-blue: #6fb7f7;
+  --status-green: #4dc5a0;
+  --status-yellow: #efb650;
+  --status-red: #e85f82;
+  --status-gray: #9a879e;
+  --chart-1: #f45d9c;
+  --chart-2: #c86be0;
+  --chart-3: #6fb7f7;
+  --chart-4: #4dc5a0;
+  --chart-5: #ff9ec7;
+  --sidebar: #f8edf7;
+  --sidebar-foreground: #4d3958;
+  --sidebar-primary: #4dc5a0;
+  --sidebar-primary-foreground: #123d33;
+  --sidebar-accent: #e5f2ff;
+  --sidebar-accent-foreground: #3d628e;
+  --sidebar-border: #e4cfdf;
+  --sidebar-ring: #26a079;
+  --sidebar-hover: rgba(111, 183, 247, 0.09);
+  --sidebar-active: rgba(111, 183, 247, 0.17);
+  --sidebar-active-foreground: #3d5578;
+  --scrollbar-thumb: rgba(67, 50, 79, 0.12);
+  --scrollbar-thumb-hover: rgba(67, 50, 79, 0.22);
+  --border-otto-hairline: rgba(67, 50, 79, 0.09);
+  --border-otto-container: rgba(151, 99, 137, 0.2);
+  --border-otto-interactive: rgba(38, 160, 121, 0.42);
+  --elevation-otto-1: 0 1px 2px rgba(67, 50, 79, 0.07), 0 5px 16px rgba(200, 107, 224, 0.07);
+  --elevation-otto-2:
+    0 2px 4px rgba(67, 50, 79, 0.08), 0 16px 38px -18px rgba(244, 93, 156, 0.35),
+    12px 18px 40px -26px rgba(111, 183, 247, 0.5);
+}
+
+.dark[data-theme="otto-dream"] {
+  --background: #211526;
+  --shell-surface: #211526;
+  --side-pane-surface: #2b1d32;
+  --composer-surface: #34243b;
+  --foreground: #f8eef9;
+  --assistant-foreground: #eadbea;
+  --user-bubble-bg: #3d2944;
+  --user-bubble-border: #664964;
+  --user-bubble-foreground: #fff5fc;
+  --card: #34243b;
+  --card-solid: #34243b;
+  --card-foreground: #f8eef9;
+  --tray: #34243b;
+  --popover: #392740;
+  --popover-foreground: #f8eef9;
+  --primary: #4dc5a0;
+  --primary-foreground: #102f29;
+  --secondary: #44304d;
+  --secondary-foreground: #f6e6f5;
+  --muted: #3a293f;
+  --muted-foreground: #bca8bf;
+  --code-bg: #2b2033;
+  --accent: #3a3354;
+  --accent-foreground: #a9d8ff;
+  --destructive: #ff6f9f;
+  --destructive-foreground: #2b1422;
+  --success: #74d6a0;
+  --warning: #f3bd62;
+  --info: #8bc9ff;
+  --session-active: #74d6a0;
+  --border: #59405f;
+  --border-strong: #755579;
+  --button-border: #604765;
+  --button-icon-hover-color: #ffffff;
+  --input: #604765;
+  --ring: #74d6a0;
+  --brand-accent: #ff75b5;
+  --status-blue: #83c8ff;
+  --status-green: #74d6a0;
+  --status-yellow: #f3bd62;
+  --status-red: #ff719d;
+  --status-gray: #aa98ae;
+  --chart-1: #ff75b5;
+  --chart-2: #d68af0;
+  --chart-3: #83c8ff;
+  --chart-4: #74d6a0;
+  --chart-5: #ffadd0;
+  --sidebar: #2b1d32;
+  --sidebar-foreground: #f4e7f4;
+  --sidebar-primary: #74d6a0;
+  --sidebar-primary-foreground: #102f29;
+  --sidebar-accent: #3a3354;
+  --sidebar-accent-foreground: #b7ddff;
+  --sidebar-border: #503956;
+  --sidebar-ring: #74d6a0;
+  --sidebar-hover: rgba(131, 200, 255, 0.08);
+  --sidebar-active: rgba(131, 200, 255, 0.14);
+  --sidebar-active-foreground: #d8ecff;
+  --tooltip-bg: #392740;
+  --scrollbar-thumb: rgba(255, 255, 255, 0.09);
+  --scrollbar-thumb-hover: rgba(255, 255, 255, 0.17);
+  --border-otto-hairline: rgba(255, 255, 255, 0.09);
+  --border-otto-container: rgba(255, 173, 208, 0.2);
+  --border-otto-interactive: rgba(116, 214, 160, 0.5);
+  --elevation-otto-1: 0 1px 2px rgba(8, 3, 12, 0.28), 0 5px 18px rgba(13, 5, 18, 0.26);
+  --elevation-otto-2:
+    0 2px 4px rgba(8, 3, 12, 0.32), 0 18px 42px -20px rgba(255, 117, 181, 0.32),
+    12px 20px 44px -28px rgba(131, 200, 255, 0.35);
+}
+
+:is(:root:not(.dark), .dark)[data-theme="otto-dream"] .app-shell {
+  background: var(--shell-surface);
+}
+
+.dark[data-theme="otto-dream"] .app-shell {
+  --foreground: #f8eef9;
+  --muted: #3a293f;
+  --muted-foreground: #bca8bf;
+  color: var(--foreground);
+}
+
+:root:not(.dark)[data-theme="otto-dream"] .app-shell:has([data-testid="new-chat-landing"])::before,
+.dark[data-theme="otto-dream"] .app-shell:has([data-testid="new-chat-landing"])::before {
+  background: none;
+}
+
+:is(:root:not(.dark), .dark)[data-theme="otto-dream"] .brand-display-title {
+  color: var(--foreground);
+  font-weight: 520;
+  letter-spacing: -0.045em;
+}
+
+:root:not(.dark)[data-theme="otto-dream"] .otto-landing-halo {
+  background: rgba(244, 93, 156, 0.17);
+  filter: blur(7px);
+  box-shadow:
+    -64px 18px 62px rgba(200, 107, 224, 0.2),
+    68px -8px 64px rgba(111, 183, 247, 0.23),
+    24px 56px 54px rgba(77, 197, 160, 0.14);
+}
+
+.dark[data-theme="otto-dream"] .otto-landing-halo {
+  background: rgba(255, 117, 181, 0.18);
+  filter: blur(8px);
+  box-shadow:
+    -64px 18px 68px rgba(214, 138, 240, 0.2),
+    68px -8px 68px rgba(131, 200, 255, 0.18),
+    24px 58px 58px rgba(116, 214, 160, 0.1);
+}
+
+:is(:root:not(.dark), .dark)[data-theme="otto-dream"] .otto-landing-orbit--pink {
+  border-color: color-mix(in srgb, var(--status-blue) 58%, transparent);
+  box-shadow: inset 0 0 16px color-mix(in srgb, var(--status-blue) 10%, transparent);
+}
+
+:is(:root:not(.dark), .dark)[data-theme="otto-dream"] .otto-landing-orbit--green {
+  border-color: color-mix(in srgb, #c86be0 48%, transparent);
+}
+
+:root:not(.dark)[data-theme="otto-dream"] .reference-composer-surface,
+:root:not(.dark)[data-theme="otto-dream"] .workspace-panel-surface {
+  border-color: var(--border-otto-container);
+  box-shadow: var(--elevation-otto-2);
+}
+
+.dark[data-theme="otto-dream"] .app-shell .reference-composer-surface,
+.dark[data-theme="otto-dream"] .app-shell .workspace-panel-surface {
+  --foreground: #f8eef9;
+  --muted: #3a293f;
+  --muted-foreground: #bca8bf;
+  color: var(--foreground);
+  border-color: var(--border-otto-container) !important;
+  background: var(--composer-surface) !important;
+  box-shadow: var(--elevation-otto-2) !important;
+}
+
+:root:not(.dark)[data-theme="otto-dream"] .conversations-sidebar:not([data-collapsed]) {
+  --foreground: var(--sidebar-foreground);
+  --muted: rgba(111, 183, 247, 0.08);
+  --muted-foreground: #7b6983;
+  border-color: var(--sidebar-border);
+  box-shadow:
+    0 1px 2px rgba(67, 50, 79, 0.07),
+    0 12px 28px -22px rgba(200, 107, 224, 0.48);
+}
+
+.dark[data-theme="otto-dream"]
+  .app-shell
+  aside[aria-label="Conversations"].conversations-sidebar:not([data-collapsed]) {
+  --foreground: var(--sidebar-foreground);
+  --muted: rgba(131, 200, 255, 0.07);
+  --muted-foreground: #bca8bf;
+  color: var(--sidebar-foreground);
+  border-color: var(--sidebar-border) !important;
+  background: var(--side-pane-surface) !important;
+  box-shadow:
+    0 1px 2px rgba(8, 3, 12, 0.24),
+    0 14px 34px -24px rgba(255, 117, 181, 0.34) !important;
+}
+
+:is(:root:not(.dark), .dark)[data-theme="otto-dream"]
+  .reference-composer-surface
+  :is([data-testid="new-chat-landing-submit"], button[aria-label="Send"]):not(:disabled) {
+  color: #123d33 !important;
+  background: #4dc5a0 !important;
+  box-shadow: 0 8px 22px rgba(38, 160, 121, 0.24) !important;
+}
+
+:is(:root:not(.dark), .dark)[data-theme="otto-dream"] [data-slot="switch"][data-checked] {
+  background: #4dc5a0 !important;
 }
 
 /* ── GitHub — clean neutrals, signal blue, green primary ──────────────────── */
