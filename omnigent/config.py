@@ -25,7 +25,7 @@ def load_global_config(path: Path | None = None) -> dict[str, Any]:  # type: ign
     resolved_path = path or global_config_path()
     if not resolved_path.exists():
         return {}
-    with resolved_path.open() as config_file:
+    with resolved_path.open(encoding="utf-8") as config_file:
         raw: dict[str, Any] = yaml.safe_load(config_file) or {}  # type: ignore[explicit-any]
         return raw
 
@@ -35,7 +35,7 @@ def load_local_config(path: Path | None = None) -> dict[str, Any]:  # type: igno
     resolved_path = path or Path.cwd() / _LOCAL_CONFIG_RELPATH
     if not resolved_path.exists():
         return {}
-    with resolved_path.open() as config_file:
+    with resolved_path.open(encoding="utf-8") as config_file:
         raw: dict[str, Any] = yaml.safe_load(config_file) or {}  # type: ignore[explicit-any]
         return raw
 

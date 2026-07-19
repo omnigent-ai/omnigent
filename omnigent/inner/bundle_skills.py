@@ -56,6 +56,7 @@ def ensure_bundle_plugin_manifest(
             indent=2,
         )
         + "\n",
+        encoding="utf-8",
     )
 
 

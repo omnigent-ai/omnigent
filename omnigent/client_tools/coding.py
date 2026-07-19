@@ -78,7 +78,7 @@ def Read(
             for large files.
     """
     try:
-        text = Path(file_path).read_text(encoding="utf-8")
+        text = Path(file_path).read_text(encoding="utf-8", errors="surrogateescape")
     except (OSError, UnicodeDecodeError) as exc:
         return _truncate(f"Error reading {file_path}: {exc}")
     lines = text.splitlines()
@@ -105,7 +105,7 @@ def Write(file_path: str, content: str) -> str:
     target = Path(file_path)
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8")
+        target.write_text(content, encoding="utf-8", errors="surrogateescape")
     except OSError as exc:
         return _truncate(f"Error writing {target}: {exc}")
     return _truncate(f"Successfully wrote {target}")
@@ -132,7 +132,7 @@ def Edit(
     """
     target = Path(file_path)
     try:
-        text = target.read_text(encoding="utf-8")
+        text = target.read_text(encoding="utf-8", errors="surrogateescape")
     except OSError as exc:
         return _truncate(f"Error reading {target}: {exc}")
     count = text.count(old_string)
@@ -149,7 +149,7 @@ def Edit(
         else text.replace(old_string, new_string, 1)
     )
     try:
-        target.write_text(result, encoding="utf-8")
+        target.write_text(result, encoding="utf-8", errors="surrogateescape")
     except OSError as exc:
         return _truncate(f"Error writing {target}: {exc}")
     replacements = count if replace_all else 1

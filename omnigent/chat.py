@@ -3702,7 +3702,7 @@ def _raise_server_failed(server: LocalServer) -> None:
     else:
         cmd_display = str(args)
     try:
-        lines = server.log_path.read_text(errors="replace").splitlines()
+        lines = server.log_path.read_text(encoding="utf-8", errors="replace").splitlines()
         tail = "\n".join(lines[-_SERVER_LOG_TAIL_LINES:]) if lines else "(empty log file)"
     except OSError as e:
         tail = f"(could not read log file: {e})"

@@ -9203,7 +9203,7 @@ def _isolated_databricks_cfg() -> collections.abc.Generator[None, None, None]:
             if tmp_cfg.has_section(spec.name):
                 orig_cfg[spec.name] = dict(tmp_cfg[spec.name])
         write_tmp = original_cfg.with_suffix(".tmp")
-        with write_tmp.open("w") as f:
+        with write_tmp.open("w", encoding="utf-8") as f:
             orig_cfg.write(f)
         write_tmp.replace(original_cfg)
         write_tmp = None
@@ -13080,7 +13080,7 @@ def debug_logs(
         # Show all files for the session, oldest first, with separators.
         for f in reversed(log_files):
             click.echo(f"# {f}", err=True)
-            content = f.read_text(errors="replace")
+            content = f.read_text(encoding="utf-8", errors="replace")
             if lines > 0:
                 content = "\n".join(content.splitlines()[-lines:])
             click.echo(content)
@@ -13088,7 +13088,7 @@ def debug_logs(
     else:
         latest = log_files[0]
         click.echo(f"# {latest}", err=True)
-        content = latest.read_text(errors="replace")
+        content = latest.read_text(encoding="utf-8", errors="replace")
         if lines > 0:
             content = "\n".join(content.splitlines()[-lines:])
         click.echo(content)

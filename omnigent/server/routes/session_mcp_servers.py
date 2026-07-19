@@ -350,7 +350,8 @@ def _replace_mcp_server(
     if location.source == "file":
         next_path = location.path.with_name(f"{body.name}.yaml")
         next_path.write_text(
-            yaml.safe_dump(_body_to_file_yaml(body, location.raw), sort_keys=False)
+            yaml.safe_dump(_body_to_file_yaml(body, location.raw), sort_keys=False),
+            encoding="utf-8",
         )
         if next_path != location.path:
             location.path.unlink()

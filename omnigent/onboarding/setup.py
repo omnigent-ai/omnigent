@@ -205,7 +205,7 @@ def _alias_profile(source: str, target: str) -> None:
         raise ValueError(f"alias source {source!r} not in {path}")
     cfg[target] = dict(cfg[source])
     tmp = path.with_name(path.name + ".write")
-    with tmp.open("w") as f:
+    with tmp.open("w", encoding="utf-8") as f:
         cfg.write(f)
     tmp.replace(path)
 
@@ -230,7 +230,7 @@ def _remove_profile_section(name: str) -> bool:
         return False
     cfg.remove_section(name)
     tmp = path.with_name(path.name + ".write")
-    with tmp.open("w") as f:
+    with tmp.open("w", encoding="utf-8") as f:
         cfg.write(f)
     tmp.replace(path)
     return True
