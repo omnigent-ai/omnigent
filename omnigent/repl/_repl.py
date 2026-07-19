@@ -659,12 +659,61 @@ def _humanize_agent_name(agent_name: str) -> str:
     return agent_name.replace("-", " ").replace("_", " ")
 
 
+# Only show the elapsed footer once a turn takes at least this many seconds —
+# quick turns don't need a duration and the line is just noise. Override with
+# OMNIGENT_ELAPSED_FOOTER_MIN_S (0 shows every turn; a huge value hides them).
+_ELAPSED_FOOTER_MIN_S = 5.0
+_ELAPSED_FOOTER_MIN_ENV = "OMNIGENT_ELAPSED_FOOTER_MIN_S"
+
+# Past this, sub-second precision is meaningless — drop the decimal so a long
+# turn reads "213s", not "213.4s".
+_ELAPSED_WHOLE_SECONDS_ABOVE_S = 200.0
+
+
+def _resolve_elapsed_footer_min_s() -> float:
+    """Resolve the elapsed-footer threshold (seconds) from the environment.
+
+    Reads ``OMNIGENT_ELAPSED_FOOTER_MIN_S``; an unset, empty, non-numeric, or
+    negative value falls back to :data:`_ELAPSED_FOOTER_MIN_S` so a typo never
+    silently disables the footer. ``0`` is honored and shows every turn.
+
+    :returns: The minimum elapsed seconds before the footer is shown.
+    """
+    raw = os.environ.get(_ELAPSED_FOOTER_MIN_ENV)
+    if raw is None or not raw.strip():
+        return _ELAPSED_FOOTER_MIN_S
+    try:
+        value = float(raw)
+    except ValueError:
+        return _ELAPSED_FOOTER_MIN_S
+    return value if value >= 0 else _ELAPSED_FOOTER_MIN_S
+
+
+def _format_elapsed(elapsed: float) -> str:
+    """Render an elapsed duration for the footer.
+
+    One decimal below :data:`_ELAPSED_WHOLE_SECONDS_ABOVE_S` (``4.2s``), whole
+    seconds at/above it (``213s``) where the fraction no longer matters.
+
+    :param elapsed: Elapsed seconds.
+    :returns: The formatted duration, e.g. ``"4.2s"`` or ``"213s"``.
+    """
+    if elapsed >= _ELAPSED_WHOLE_SECONDS_ABOVE_S:
+        return f"{elapsed:.0f}s"
+    return f"{elapsed:.1f}s"
+
+
 class TimedFormatter(RichBlockFormatter):  # type: ignore[misc]
-    """Shows final elapsed time after response completes."""
+    """Shows final elapsed time after response completes.
+
+    The footer is suppressed for turns shorter than the resolved threshold
+    (:func:`_resolve_elapsed_footer_min_s`), so quick turns stay uncluttered.
+    """
 
     def __init__(self, **kwargs: object) -> None:
         super().__init__(**kwargs)
         self._start_time: float | None = None
+        self._min_elapsed_s = _resolve_elapsed_footer_min_s()
 
     def format_response_start(self, block: ResponseStartBlock) -> list[FormattedItem]:
         self._start_time = block.ctx.timestamp
@@ -674,7 +723,10 @@ class TimedFormatter(RichBlockFormatter):  # type: ignore[misc]
         items = super().format_response_end(block)
         if self._start_time is not None:
             elapsed = block.ctx.timestamp - self._start_time
-            items.append(Text.from_markup(f"   [{self.muted}]{elapsed:.1f}s[/{self.muted}]"))
+            if elapsed >= self._min_elapsed_s:
+                items.append(
+                    Text.from_markup(f"   [{self.muted}]{_format_elapsed(elapsed)}[/{self.muted}]")
+                )
             self._start_time = None
         return items
 
