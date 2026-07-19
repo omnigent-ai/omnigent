@@ -545,7 +545,13 @@ class MicrosandboxSandboxLauncher(SandboxLauncher):
         """
         cached = self._connections.get(sandbox_id)
         if cached is not None:
-            return cached
+            try:
+                await cached.ping()
+                return cached
+            except Exception:
+                # Stale after an external drain/restart - drop it and fall
+                # through so the fresh path reports actionable status.
+                self._forget(sandbox_id)
         import microsandbox as msb
 
         try:
@@ -1055,17 +1061,24 @@ class MicrosandboxSandboxLauncher(SandboxLauncher):
                 )
             deadline = time.monotonic() + _RELAY_READY_TIMEOUT_S
             while True:
+                # Three-way probe: 0 = ready, 3 = still starting, 4 = the
+                # relay died (e.g. EADDRINUSE) - fail fast on death instead
+                # of burning the whole readiness timeout.
                 probe = self.run(
-                    sandbox_id, f"grep -q relay-ready {shlex.quote(log_path)}", check=False
+                    sandbox_id,
+                    f"if grep -q relay-ready {shlex.quote(log_path)}; then exit 0; "
+                    f"elif kill -0 {pid} 2>/dev/null; then exit 3; else exit 4; fi",
+                    check=False,
                 )
                 if probe.returncode == 0:
                     break
-                if time.monotonic() > deadline:
+                if probe.returncode == 4 or time.monotonic() > deadline:
                     tail = self.run(
                         sandbox_id, f"cat {shlex.quote(log_path)}", check=False
                     ).stdout[-400:]
+                    reason = "died at startup" if probe.returncode == 4 else "did not come up"
                     raise click.ClickException(
-                        f"port-forward relay did not come up in microsandbox "
+                        f"port-forward relay {reason} in microsandbox "
                         f"'{sandbox_id}'" + (f" - {tail.strip()}" if tail.strip() else "")
                     )
                 time.sleep(0.2)

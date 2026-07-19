@@ -171,6 +171,12 @@ class _FakeSandbox:
     async def touch(self) -> None:
         self.touches += 1
 
+    async def ping(self) -> None:
+        # Mirror the real SDK: a ping over a drained/stopped sandbox's dead
+        # transport fails rather than answering.
+        if self.status != _FakeSandboxStatus.RUNNING:
+            raise RuntimeError("transport closed")
+
     async def kill(self) -> None:
         self.killed = True
         self.status = _FakeSandboxStatus.STOPPED
@@ -679,6 +685,22 @@ def test_run_stopped_sandbox_names_resume_path(
         MicrosandboxSandboxLauncher().run(sandbox_id, "true")
 
 
+def test_run_revalidates_stale_cached_connection(
+    fake_microsandbox: _FakeMicrosandboxState,
+) -> None:
+    """
+    A launcher holding a cached connection across an external drain must not
+    surface an opaque transport error - the cache is revalidated (ping) and
+    the fresh path reports the actionable stopped-status message.
+    """
+    launcher = MicrosandboxSandboxLauncher()
+    sandbox_id = _provisioned(fake_microsandbox, launcher)  # caches the connection
+    fake_microsandbox.sandboxes[sandbox_id].status = _FakeSandboxStatus.STOPPED
+
+    with pytest.raises(click.ClickException, match="stopped"):
+        launcher.run(sandbox_id, "true")
+
+
 def test_run_wraps_exec_errors_with_provider_reason(
     fake_microsandbox: _FakeMicrosandboxState,
 ) -> None:
@@ -1025,14 +1047,39 @@ def test_forward_local_port_fails_when_relay_never_ready(
     sandbox = fake_microsandbox.sandboxes[sandbox_id]
     sandbox.shell_queue.append((0, "", ""))  # command -v python3
     sandbox.shell_queue.append((0, "4242\n", ""))  # nohup start → pid
-    # grep probes fail (one per poll); the log-tail cat reports the crash.
-    sandbox.shell_queue.append((1, "", ""))
-    sandbox.shell_queue.append((1, "", ""))
+    # Probes report "still starting" (rc 3, one per poll) until the deadline;
+    # the log-tail cat then reports the crash.
+    sandbox.shell_queue.append((3, "", ""))
+    sandbox.shell_queue.append((3, "", ""))
     sandbox.shell_queue.append((0, "Traceback: boom", ""))
 
     with pytest.raises(click.ClickException, match="Traceback: boom"):
         with launcher.forward_local_port(sandbox_id, 8022):
             pass
+
+
+def test_forward_local_port_fails_fast_when_relay_dies(
+    fake_microsandbox: _FakeMicrosandboxState,
+) -> None:
+    """
+    A relay that dies at startup (e.g. EADDRINUSE) fails on the FIRST probe
+    with the log tail - not after burning the whole readiness timeout.
+    """
+    launcher = MicrosandboxSandboxLauncher()
+    sandbox_id = _provisioned(fake_microsandbox, launcher)
+    sandbox = fake_microsandbox.sandboxes[sandbox_id]
+    sandbox.shell_queue.append((0, "", ""))  # command -v python3
+    sandbox.shell_queue.append((0, "4242\n", ""))  # nohup start → pid
+    sandbox.shell_queue.append((4, "", ""))  # probe: process dead
+    sandbox.shell_queue.append((0, "OSError: [Errno 98] EADDRINUSE", ""))  # log tail
+
+    with pytest.raises(click.ClickException, match=r"died at startup.*EADDRINUSE"):
+        with launcher.forward_local_port(sandbox_id, 8022):
+            pass
+
+    # One spawn, one probe, one log read, one teardown - no 15s poll loop.
+    probes = [c for c in sandbox.shell_calls if "relay-ready" in c.script]
+    assert len(probes) == 1
 
 
 # ── misc ────────────────────────────────────────────────────
