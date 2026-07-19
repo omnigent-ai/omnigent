@@ -1392,14 +1392,16 @@ def _run_windows_cmd_shell(
     ``cmd.exe /c "<inline>"`` stops at the first newline and mangles quoting;
     writing the command to a UTF-8 ``.cmd`` (with ``chcp 65001``) runs it
     verbatim, so multi-line, quoted, and non-ASCII commands all work. The child
-    is spawned in its own process group and its whole tree is killed on timeout —
-    killing cmd.exe alone leaves its spawned child (e.g. ping/python) running.
+    is contained in a ``KILL_ON_JOB_CLOSE`` Job Object so a timeout tears down
+    the whole tree — including grandchildren orphaned by a launcher that exits,
+    which killing cmd.exe (or a parent-walk) alone would miss.
 
     :raises subprocess.TimeoutExpired: On timeout, after killing the tree.
     :returns: ``(stdout, stderr, returncode)``.
     """
     fd, script_path = tempfile.mkstemp(suffix=".cmd")
     os.close(fd)
+    job = None
     try:
         Path(script_path).write_text(
             "@echo off\r\nchcp 65001>nul\r\n" + command.replace("\n", "\r\n") + "\r\n",
@@ -1415,15 +1417,27 @@ def _run_windows_cmd_shell(
             errors="replace",
             **_proc.spawn_kwargs(),
         )
+        # Assign to the job right after spawn, before cmd.exe reads the batch
+        # file and launches the actual command (so the child is captured too).
+        with contextlib.suppress(Exception):
+            from omnigent.inner.windows_jobobject_sandbox import (
+                assign_pid_to_kill_on_close_job,
+            )
+
+            job = assign_pid_to_kill_on_close_job(proc.pid)
         try:
             stdout, stderr = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
-            _proc.kill_tree(proc)
+            if job is not None:
+                job.close()  # KILL_ON_JOB_CLOSE terminates the whole tree
+            _proc.kill_tree(proc)  # fallback when the job couldn't be created
             with contextlib.suppress(subprocess.TimeoutExpired):
                 proc.communicate(timeout=5)
             raise
         return stdout, stderr, proc.returncode
     finally:
+        if job is not None:
+            job.close()
         with contextlib.suppress(OSError):
             os.remove(script_path)
 
@@ -1507,9 +1521,9 @@ def _shell_impl(
     if returncode != 0:
         detail = stderr.strip() or stdout.strip()
         if detail:
-            result["error"] = f"Command exited with status {completed.returncode}: {detail}"
+            result["error"] = f"Command exited with status {returncode}: {detail}"
         else:
-            result["error"] = f"Command exited with status {completed.returncode}"
+            result["error"] = f"Command exited with status {returncode}"
     return result
 
 

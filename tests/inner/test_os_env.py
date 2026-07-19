@@ -130,8 +130,14 @@ def test_build_helper_env_active_passes_omnigent_session_marker() -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.posix_only
 def test_shell_impl_timeout_includes_exit_code(tmp_path: Path) -> None:
-    """Timed-out shell commands still return the documented result fields."""
+    """Timed-out shell commands still return the documented result fields.
+
+    POSIX-only: ``shutil.which("bash")`` resolves to the WSL launcher on Windows;
+    the native Windows timeout path is covered by
+    ``test_shell_impl_timeout_kills_child_tree_on_windows``.
+    """
     shell_path = shutil.which("bash") or shutil.which("sh")
     assert shell_path is not None
 
@@ -481,3 +487,38 @@ def test_shell_impl_timeout_kills_child_tree_on_windows(tmp_path: Path) -> None:
     elapsed = time.monotonic() - start
     assert result["timed_out"] is True, result
     assert elapsed < 3, f"took {elapsed:.1f}s; child tree not killed"
+
+
+@pytest.mark.windows_only
+def test_shell_impl_nonzero_exit_on_windows(tmp_path: Path) -> None:
+    """A non-zero exit returns the code without crashing (regression for an
+    UnboundLocalError that referenced an undefined `completed` on Windows)."""
+    comspec = os.environ.get("COMSPEC", "cmd.exe")
+    result = _shell_impl(command="exit /b 7", timeout=15, shell_path=comspec, cwd=tmp_path)
+    assert result["exit_code"] == 7, result
+    assert result.get("error"), result
+
+
+@pytest.mark.windows_only
+def test_shell_impl_timeout_kills_orphaned_descendant_on_windows(tmp_path: Path) -> None:
+    """A grandchild orphaned by a launcher that exits is still killed on timeout.
+
+    The Job Object contains the whole tree; a parent-walk (psutil/taskkill) can't
+    reach a descendant whose intermediate parent has already exited.
+    """
+    import sys
+    import time
+
+    marker = tmp_path / "MARKER"
+    comspec = os.environ.get("COMSPEC", "cmd.exe")
+    # Detach a worker that writes the marker after 6s, then keep cmd busy so the
+    # 1s timeout fires; the whole tree (incl. the detached worker) must die.
+    cmd = (
+        f'start "" /b "{sys.executable}" -c '
+        f"\"import time; time.sleep(6); open(r'{marker}', 'w').close()\"\n"
+        "ping -n 10 127.0.0.1 >NUL"
+    )
+    result = _shell_impl(command=cmd, timeout=1, shell_path=comspec, cwd=tmp_path)
+    assert result["timed_out"] is True, result
+    time.sleep(8)
+    assert not marker.exists(), "orphaned worker survived the timeout"

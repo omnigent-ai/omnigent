@@ -35,6 +35,7 @@ import functools
 import logging
 from pathlib import Path
 from types import TracebackType
+from typing import ClassVar
 
 from .datamodel import OSEnvSandboxSpec, OSEnvSpec
 from .sandbox import (
@@ -67,7 +68,7 @@ def _warn_no_fs_isolation_once() -> None:
 
 
 class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
-    _fields_ = [
+    _fields_: ClassVar = [
         ("PerProcessUserTimeLimit", ctypes.c_int64),
         ("PerJobUserTimeLimit", ctypes.c_int64),
         ("LimitFlags", wintypes.DWORD),
@@ -81,7 +82,7 @@ class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
 
 
 class _IO_COUNTERS(ctypes.Structure):
-    _fields_ = [
+    _fields_: ClassVar = [
         ("ReadOperationCount", ctypes.c_uint64),
         ("WriteOperationCount", ctypes.c_uint64),
         ("OtherOperationCount", ctypes.c_uint64),
@@ -92,7 +93,7 @@ class _IO_COUNTERS(ctypes.Structure):
 
 
 class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
-    _fields_ = [
+    _fields_: ClassVar = [
         ("BasicLimitInformation", _JOBOBJECT_BASIC_LIMIT_INFORMATION),
         ("IoInfo", _IO_COUNTERS),
         ("ProcessMemoryLimit", ctypes.c_size_t),
@@ -134,6 +135,47 @@ class _JobHandle:
         tb: TracebackType | None,
     ) -> None:
         self.close()
+
+
+def assign_pid_to_kill_on_close_job(pid: int) -> _JobHandle | None:
+    """Create a ``KILL_ON_JOB_CLOSE`` job and assign ``pid`` to it.
+
+    ``AssignProcessToJobObject`` also captures the process's future children, so
+    closing the returned :class:`_JobHandle` terminates the whole tree — even
+    descendants orphaned by an intermediate process that exits, which a
+    parent-walk (psutil / ``taskkill /T``) cannot reach. Returns ``None`` if the
+    job can't be created/assigned; the caller then falls back to a best-effort
+    tree kill. Used by the shell-timeout path.
+    """
+    kernel32 = ctypes.windll.kernel32
+    job = kernel32.CreateJobObjectW(None, None)
+    if not job:
+        return None
+    info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+    info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    if not kernel32.SetInformationJobObject(
+        wintypes.HANDLE(job),
+        _JobObjectExtendedLimitInformation,
+        ctypes.byref(info),
+        ctypes.sizeof(info),
+    ):
+        kernel32.CloseHandle(wintypes.HANDLE(job))
+        return None
+    proc_handle = kernel32.OpenProcess(
+        _PROCESS_SET_QUOTA | _PROCESS_TERMINATE, False, wintypes.DWORD(pid)
+    )
+    if not proc_handle:
+        kernel32.CloseHandle(wintypes.HANDLE(job))
+        return None
+    try:
+        if not kernel32.AssignProcessToJobObject(
+            wintypes.HANDLE(job), wintypes.HANDLE(proc_handle)
+        ):
+            kernel32.CloseHandle(wintypes.HANDLE(job))
+            return None
+    finally:
+        kernel32.CloseHandle(wintypes.HANDLE(proc_handle))
+    return _JobHandle(job)
 
 
 class WindowsJobObjectSandboxBackend(SandboxBackend):
