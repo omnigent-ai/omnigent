@@ -1670,3 +1670,47 @@ async def test_delete_directory_symlink_removes_link_not_target(tmp_path: Path) 
     await fs.delete("link", recursive=True)
     assert not link.is_symlink()
     assert target.is_dir() and (target / "keep.txt").exists()
+
+
+@pytest.mark.asyncio
+async def test_list_dir_two_level_nested_path_forward_slash(tmp_path: Path) -> None:
+    """Multi-level paths stay '/'-separated end to end (_validate_path
+    normalizes, so stat/write/edit/list all agree)."""
+    ws = tmp_path / "ws"
+    (ws / "src" / "pkg").mkdir(parents=True)
+    (ws / "src" / "pkg" / "main.py").write_text("x")
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", cwd=str(ws), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    fs = CallerProcessFilesystem(os_env)
+    page = await fs.list_dir("src/pkg")
+    assert [e.path for e in page.data] == ["src/pkg/main.py"]
+    results = await fs.search_files("main", include=["src/**"])
+    assert [e.path for e in results] == ["src/pkg/main.py"]
+
+
+@pytest.mark.windows_only
+@pytest.mark.asyncio
+async def test_delete_directory_junction_removes_link_not_target(tmp_path: Path) -> None:
+    """Deleting a Windows directory junction removes the junction, not the
+    target (os.path.islink misses junctions, so the delete keys off the reparse
+    attribute from lstat)."""
+    import subprocess
+
+    ws = tmp_path / "ws"
+    target = ws / "real"
+    target.mkdir(parents=True)
+    (target / "keep.txt").write_text("x")
+    junction = ws / "jx"
+    rc = subprocess.run(
+        f'mklink /J "{junction}" "{target}"', shell=True, capture_output=True
+    ).returncode
+    if rc != 0:
+        pytest.skip("could not create a junction")
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", cwd=str(ws), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    fs = CallerProcessFilesystem(os_env)
+    await fs.delete("jx", recursive=True)
+    assert not junction.exists()
+    assert target.is_dir() and (target / "keep.txt").exists()

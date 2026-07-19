@@ -212,7 +212,10 @@ def _validate_path(relative_path: str) -> str:
         raise InvalidPath("Path traversal is not allowed")
     if normalized == ".":
         return ""
-    return normalized
+    # Return POSIX separators: os.path.normpath yields '\' on Windows, but the
+    # API contract, glob logic, and web UI all use '/', and Windows os.* calls
+    # accept '/' equally. This keeps stat/write/edit/list output consistent.
+    return normalized.replace(os.sep, "/")
 
 
 def _entry_from_stat(
@@ -856,16 +859,23 @@ class CallerProcessFilesystem:
 
             _del_script = "\n".join(
                 [
-                    "import os, shutil",
+                    "import os, shutil, stat",
                     f"p = {_json.dumps(validated)}",
-                    # A directory symlink follows as isdir but shutil.rmtree
-                    # refuses it; remove the link itself (os.rmdir for a dir
-                    # symlink, os.remove for a file symlink) like `rm` would.
-                    "if os.path.islink(p):",
-                    "    (os.rmdir if os.path.isdir(p) else os.remove)(p)",
-                    "elif os.path.isdir(p):",
+                    # Reparse points (symlinks AND junctions) must be removed as
+                    # the link itself, not followed: shutil.rmtree refuses a link,
+                    # and following a junction would wrongly delete the target's
+                    # contents. os.path.islink misses junctions, so key off the
+                    # reparse attribute from lstat (which also covers broken
+                    # links). attrs == 0 means already gone (tolerate like rm -f).
+                    "try:",
+                    "    attrs = os.lstat(p).st_file_attributes",
+                    "except FileNotFoundError:",
+                    "    attrs = 0",
+                    "if attrs & stat.FILE_ATTRIBUTE_REPARSE_POINT:",
+                    "    (os.rmdir if attrs & stat.FILE_ATTRIBUTE_DIRECTORY else os.remove)(p)",
+                    "elif attrs & stat.FILE_ATTRIBUTE_DIRECTORY:",
                     "    shutil.rmtree(p)",
-                    "elif os.path.exists(p):",
+                    "elif attrs:",
                     "    os.remove(p)",
                 ]
             )
