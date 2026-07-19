@@ -522,3 +522,120 @@ def test_shell_impl_timeout_kills_orphaned_descendant_on_windows(tmp_path: Path)
     assert result["timed_out"] is True, result
     time.sleep(8)
     assert not marker.exists(), "orphaned worker survived the timeout"
+
+
+@pytest.mark.windows_only
+def test_tree_kill_job_close_spares_but_terminate_kills() -> None:
+    """The containment job has no kill-on-close: closing the handle leaves the
+    process running (a detached server survives a successful command), while
+    ``terminate()`` kills it (the timeout path). Tested at the job API directly
+    to avoid cmd.exe quoting in the assertion.
+    """
+    import subprocess
+    import sys
+    import time
+
+    from omnigent.inner.windows_jobobject_sandbox import create_tree_kill_job
+
+    sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        job = create_tree_kill_job()
+        assert job is not None and job.assign(sleeper.pid)
+        job.close()  # no kill-on-close
+        time.sleep(1)
+        assert sleeper.poll() is None, "close() killed the process (kill-on-close regression)"
+    finally:
+        sleeper.kill()
+        sleeper.wait(timeout=10)
+
+    victim = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        job = create_tree_kill_job()
+        assert job is not None and job.assign(victim.pid)
+        job.terminate()  # timeout path: tear the tree down
+        victim.wait(timeout=10)
+        assert victim.poll() is not None, "terminate() did not kill the process"
+    finally:
+        if victim.poll() is None:
+            victim.kill()
+            victim.wait(timeout=10)
+        job.close()
+
+
+@pytest.mark.windows_only
+def test_tree_kill_job_terminate_reaches_grandchild(tmp_path: Path) -> None:
+    """``terminate()`` kills the whole tree, including a grandchild orphaned by an
+    intermediate process — the reach a parent-walk (psutil/taskkill) can't match.
+    Helper scripts avoid all shell quoting.
+    """
+    import subprocess
+    import sys
+    import time
+
+    from omnigent.inner.windows_jobobject_sandbox import create_tree_kill_job
+
+    marker = tmp_path / "gc_marker.txt"
+    gc_py = tmp_path / "gc.py"
+    gc_py.write_text(
+        f"import time\ntime.sleep(8)\nopen({str(marker)!r}, 'w').close()\n",
+        encoding="utf-8",
+    )
+    parent_py = tmp_path / "parent.py"
+    parent_py.write_text(
+        f"import subprocess, sys, time\n"
+        f"subprocess.Popen([sys.executable, {str(gc_py)!r}])\n"
+        f"time.sleep(30)\n",
+        encoding="utf-8",
+    )
+    parent = subprocess.Popen([sys.executable, str(parent_py)])
+    try:
+        job = create_tree_kill_job()
+        assert job is not None and job.assign(parent.pid)
+        time.sleep(2)  # let the parent spawn the grandchild (both now in the job)
+        job.terminate()
+        parent.wait(timeout=10)
+        assert parent.poll() is not None
+    finally:
+        if parent.poll() is None:
+            parent.kill()
+            parent.wait(timeout=10)
+        job.close()
+    time.sleep(10)  # past the grandchild's 8s sleep — its marker must never appear
+    assert not marker.exists(), "terminate() did not reach the grandchild"
+
+
+@pytest.mark.windows_only
+def test_shell_impl_runs_from_hostile_temp_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A %TEMP% containing a space AND ``&`` must still run.
+
+    The batch path is double-quoted via ``/s /c ""<path>""`` so cmd strips only
+    the outer pair, leaving a properly quoted path — where a bare, list-quoted
+    path would break once cmd stripped its single quote pair.
+    """
+    import tempfile
+
+    hostile = tmp_path / "a b & c"
+    hostile.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(hostile))
+    comspec = os.environ.get("COMSPEC", "cmd.exe")
+    result = _shell_impl(command="echo spacey", timeout=15, shell_path=comspec, cwd=tmp_path)
+    assert result["exit_code"] == 0, result
+    assert "spacey" in result["stdout"], result
+
+
+@pytest.mark.windows_only
+def test_shell_impl_batch_for_loop_uses_double_percent(tmp_path: Path) -> None:
+    """Commands run in batch context, so a ``for`` loop variable is ``%%i`` (not
+    the interactive ``%i``). Documents/locks the cmd.exe semantic that the
+    batch-file approach requires."""
+    comspec = os.environ.get("COMSPEC", "cmd.exe")
+    result = _shell_impl(
+        command="for %%i in (1 2 3) do @echo N%%i",
+        timeout=15,
+        shell_path=comspec,
+        cwd=tmp_path,
+    )
+    assert result["exit_code"] == 0, result
+    assert "N1" in result["stdout"] and "N3" in result["stdout"], result

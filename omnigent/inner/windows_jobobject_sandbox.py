@@ -106,6 +106,24 @@ class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
 _PROCESS_SET_QUOTA = 0x0100
 _PROCESS_TERMINATE = 0x0001
 
+# Toolhelp thread-snapshot constants for resuming a CREATE_SUSPENDED process
+# whose primary-thread handle subprocess.Popen has already closed (tlhelp32.h).
+_TH32CS_SNAPTHREAD = 0x00000004
+_THREAD_SUSPEND_RESUME = 0x0002
+_RESUME_THREAD_FAILED = 0xFFFFFFFF  # (DWORD)-1 return from ResumeThread
+
+
+class _THREADENTRY32(ctypes.Structure):
+    _fields_: ClassVar = [
+        ("dwSize", wintypes.DWORD),
+        ("cntUsage", wintypes.DWORD),
+        ("th32ThreadID", wintypes.DWORD),
+        ("th32OwnerProcessID", wintypes.DWORD),
+        ("tpBasePri", wintypes.LONG),
+        ("tpDeltaPri", wintypes.LONG),
+        ("dwFlags", wintypes.DWORD),
+    ]
+
 
 class _JobHandle:
     """Owns a Windows Job Object handle; closing it kills the contained tree.
@@ -117,6 +135,43 @@ class _JobHandle:
 
     def __init__(self, handle: int) -> None:
         self._handle: int | None = handle
+
+    def assign(self, pid: int) -> bool:
+        """Assign ``pid`` (and its future children) to this job.
+
+        ``AssignProcessToJobObject`` also captures the process's future
+        descendants, so a later ``terminate()`` tears down the whole tree — even
+        grandchildren orphaned by an intermediate process that exits, which a
+        parent-walk (psutil / ``taskkill /T``) cannot reach.
+        """
+        if self._handle is None:
+            return False
+        kernel32 = ctypes.windll.kernel32
+        proc_handle = kernel32.OpenProcess(
+            _PROCESS_SET_QUOTA | _PROCESS_TERMINATE, False, wintypes.DWORD(pid)
+        )
+        if not proc_handle:
+            return False
+        try:
+            return bool(
+                kernel32.AssignProcessToJobObject(
+                    wintypes.HANDLE(self._handle), wintypes.HANDLE(proc_handle)
+                )
+            )
+        finally:
+            kernel32.CloseHandle(wintypes.HANDLE(proc_handle))
+
+    def terminate(self) -> None:
+        """Terminate every process in the job — used only on the timeout path.
+
+        The job has no ``KILL_ON_JOB_CLOSE`` limit, so a successful run's
+        ``close()`` leaves a detached child (a server the command started)
+        running; only this explicit call tears the tree down.
+        """
+        if self._handle is None:
+            return
+        if not ctypes.windll.kernel32.TerminateJobObject(wintypes.HANDLE(self._handle), 1):
+            _LOGGER.debug("windows_jobobject: TerminateJobObject failed")
 
     def close(self) -> None:
         if self._handle is None:
@@ -137,45 +192,59 @@ class _JobHandle:
         self.close()
 
 
-def assign_pid_to_kill_on_close_job(pid: int) -> _JobHandle | None:
-    """Create a ``KILL_ON_JOB_CLOSE`` job and assign ``pid`` to it.
+def create_tree_kill_job() -> _JobHandle | None:
+    """Create a plain Job Object for process-tree containment.
 
-    ``AssignProcessToJobObject`` also captures the process's future children, so
-    closing the returned :class:`_JobHandle` terminates the whole tree — even
-    descendants orphaned by an intermediate process that exits, which a
-    parent-walk (psutil / ``taskkill /T``) cannot reach. Returns ``None`` if the
-    job can't be created/assigned; the caller then falls back to a best-effort
-    tree kill. Used by the shell-timeout path.
+    Deliberately has **no** ``KILL_ON_JOB_CLOSE`` limit: closing the returned
+    :class:`_JobHandle` does not terminate the contained tree, so a command that
+    intentionally starts a detached child (a background server) survives a
+    normal successful run. Assign a process with :meth:`_JobHandle.assign` and
+    call :meth:`_JobHandle.terminate` to kill the tree — only ever on the
+    shell-timeout path. Returns ``None`` if the job can't be created; the caller
+    then falls back to a best-effort tree kill.
     """
-    kernel32 = ctypes.windll.kernel32
-    job = kernel32.CreateJobObjectW(None, None)
+    job = ctypes.windll.kernel32.CreateJobObjectW(None, None)
     if not job:
         return None
-    info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
-    info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-    if not kernel32.SetInformationJobObject(
-        wintypes.HANDLE(job),
-        _JobObjectExtendedLimitInformation,
-        ctypes.byref(info),
-        ctypes.sizeof(info),
-    ):
-        kernel32.CloseHandle(wintypes.HANDLE(job))
-        return None
-    proc_handle = kernel32.OpenProcess(
-        _PROCESS_SET_QUOTA | _PROCESS_TERMINATE, False, wintypes.DWORD(pid)
-    )
-    if not proc_handle:
-        kernel32.CloseHandle(wintypes.HANDLE(job))
-        return None
-    try:
-        if not kernel32.AssignProcessToJobObject(
-            wintypes.HANDLE(job), wintypes.HANDLE(proc_handle)
-        ):
-            kernel32.CloseHandle(wintypes.HANDLE(job))
-            return None
-    finally:
-        kernel32.CloseHandle(wintypes.HANDLE(proc_handle))
     return _JobHandle(job)
+
+
+def resume_process_threads(pid: int) -> bool:
+    """Resume every thread of *pid*, a process created ``CREATE_SUSPENDED``.
+
+    ``subprocess.Popen`` closes the primary thread handle after spawning, so the
+    thread can't be resumed directly; enumerate it via a toolhelp thread
+    snapshot instead. A freshly-suspended process has exactly one thread.
+    Returns ``True`` if at least one thread was resumed — the caller must treat
+    ``False`` as a hard failure (the child would otherwise hang suspended).
+    """
+    kernel32 = ctypes.windll.kernel32
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel32.OpenThread.restype = wintypes.HANDLE
+    invalid = wintypes.HANDLE(-1).value
+    snapshot = kernel32.CreateToolhelp32Snapshot(_TH32CS_SNAPTHREAD, 0)
+    if not snapshot or snapshot == invalid:
+        return False
+    resumed = False
+    try:
+        entry = _THREADENTRY32()
+        entry.dwSize = ctypes.sizeof(_THREADENTRY32)
+        ok = kernel32.Thread32First(wintypes.HANDLE(snapshot), ctypes.byref(entry))
+        while ok:
+            if entry.th32OwnerProcessID == pid:
+                thread = kernel32.OpenThread(
+                    _THREAD_SUSPEND_RESUME, False, wintypes.DWORD(entry.th32ThreadID)
+                )
+                if thread:
+                    try:
+                        if kernel32.ResumeThread(wintypes.HANDLE(thread)) != _RESUME_THREAD_FAILED:
+                            resumed = True
+                    finally:
+                        kernel32.CloseHandle(wintypes.HANDLE(thread))
+            ok = kernel32.Thread32Next(wintypes.HANDLE(snapshot), ctypes.byref(entry))
+    finally:
+        kernel32.CloseHandle(wintypes.HANDLE(snapshot))
+    return resumed
 
 
 class WindowsJobObjectSandboxBackend(SandboxBackend):

@@ -1384,6 +1384,11 @@ def _truncate_output(text: str, label: str, limit: int = _MAX_TOOL_OUTPUT_CHARS)
     )
 
 
+# winbase.h; subprocess does not expose it. Spawn the child suspended so it is
+# assigned to the containment job BEFORE cmd.exe can launch any grandchildren.
+_CREATE_SUSPENDED = 0x00000004
+
+
 def _run_windows_cmd_shell(
     command: str, *, timeout: int, shell_path: str, cwd: Path
 ) -> tuple[str, str, int]:
@@ -1391,14 +1396,27 @@ def _run_windows_cmd_shell(
 
     ``cmd.exe /c "<inline>"`` stops at the first newline and mangles quoting;
     writing the command to a UTF-8 ``.cmd`` (with ``chcp 65001``) runs it
-    verbatim, so multi-line, quoted, and non-ASCII commands all work. The child
-    is contained in a ``KILL_ON_JOB_CLOSE`` Job Object so a timeout tears down
-    the whole tree — including grandchildren orphaned by a launcher that exits,
-    which killing cmd.exe (or a parent-walk) alone would miss.
+    verbatim, so multi-line, quoted, and non-ASCII commands all work.
+
+    The command runs in **batch context**, so a ``for`` loop variable is written
+    ``%%i`` (not ``%i`` as on an interactive prompt) — a known cmd.exe semantic
+    difference, kept because batch is what makes multi-line/quoting reliable.
+
+    Containment: a plain Job Object holds the whole tree. The child is spawned
+    ``CREATE_SUSPENDED`` and assigned to the job before it is resumed, so no
+    grandchild can escape in a spawn/assign race. The job has **no**
+    kill-on-close limit — a successful run's detached children (e.g. a server
+    the command started) survive; only a *timeout* calls ``TerminateJobObject``
+    to tear the tree down (grandchildren a parent-walk would miss included).
 
     :raises subprocess.TimeoutExpired: On timeout, after killing the tree.
     :returns: ``(stdout, stderr, returncode)``.
     """
+    from omnigent.inner.windows_jobobject_sandbox import (
+        create_tree_kill_job,
+        resume_process_threads,
+    )
+
     fd, script_path = tempfile.mkstemp(suffix=".cmd")
     os.close(fd)
     job = None
@@ -1407,29 +1425,40 @@ def _run_windows_cmd_shell(
             "@echo off\r\nchcp 65001>nul\r\n" + command.replace("\n", "\r\n") + "\r\n",
             encoding="utf-8",
         )
+        # Build the command line as a string (not a list) so the script path is
+        # double-quoted: `/s` strips the OUTER quote pair, leaving a properly
+        # quoted path — so a %TEMP% containing spaces or `&` still runs. `/d`
+        # skips any AutoRun registry command. Windows filenames can't contain a
+        # quote, so there is no embedded-quote escape to worry about.
+        cmdline = f'"{shell_path}" /d /s /c ""{script_path}""'
+        spawn_kwargs = dict(_proc.spawn_kwargs())
+        creationflags = int(spawn_kwargs.pop("creationflags", 0)) | _CREATE_SUSPENDED
+        job = create_tree_kill_job()
         proc = subprocess.Popen(
-            [shell_path, "/c", script_path],
+            cmdline,
             cwd=str(cwd),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
             errors="replace",
-            **_proc.spawn_kwargs(),
+            creationflags=creationflags,
+            **spawn_kwargs,
         )
-        # Assign to the job right after spawn, before cmd.exe reads the batch
-        # file and launches the actual command (so the child is captured too).
-        with contextlib.suppress(Exception):
-            from omnigent.inner.windows_jobobject_sandbox import (
-                assign_pid_to_kill_on_close_job,
-            )
-
-            job = assign_pid_to_kill_on_close_job(proc.pid)
+        # Assign while suspended (captures future children), then resume. If the
+        # resume fails the child would hang suspended, so treat it as fatal.
+        if job is not None:
+            job.assign(proc.pid)
+        if not resume_process_threads(proc.pid):
+            proc.kill()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.communicate(timeout=5)
+            raise OSError("could not resume the suspended cmd.exe process")
         try:
             stdout, stderr = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
             if job is not None:
-                job.close()  # KILL_ON_JOB_CLOSE terminates the whole tree
+                job.terminate()  # kill the whole tree — only on timeout
             _proc.kill_tree(proc)  # fallback when the job couldn't be created
             with contextlib.suppress(subprocess.TimeoutExpired):
                 proc.communicate(timeout=5)
@@ -1437,7 +1466,7 @@ def _run_windows_cmd_shell(
         return stdout, stderr, proc.returncode
     finally:
         if job is not None:
-            job.close()
+            job.close()  # no kill-on-close: releasing the handle spares the tree
         with contextlib.suppress(OSError):
             os.remove(script_path)
 
