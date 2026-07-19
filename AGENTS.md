@@ -3,6 +3,14 @@
 Guidance for AI agents (Claude Code, Copilot, Cursor, etc.) working in this
 repository. See `CONTRIBUTING.md` for the full contributor workflow.
 
+## Parallel development
+
+For concurrent changes, use one Git worktree and one isolated `omnidev` pod per
+change. Do not share databases, ports, or pod directories between worktrees.
+Follow [Develop multiple changes in
+parallel](CONTRIBUTING.md#develop-multiple-changes-in-parallel) and see the
+[`omnidev` reference](dev/omnidev/README.md) for pod behavior and options.
+
 ## Committing
 
 Run the `pre-commit` hook before committing (`pre-commit run --all-files`, or

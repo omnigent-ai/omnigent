@@ -81,6 +81,66 @@ The host URL can also be passed positionally (`omnigent host
 http://localhost:6767`). See the [README](README.md) for more on hosts,
 harnesses, and credentials.
 
+### Develop multiple changes in parallel
+
+Use one Git worktree and one isolated
+[`omnidev`](dev/omnidev/README.md) pod per change. This works for any number
+of concurrent changes, limited only by your machine's resources.
+
+Do not run multiple worktrees against the default shared Omnigent data
+directory. Branches may contain incompatible database migrations or runtime
+state.
+
+From the main checkout, create one worktree per change:
+
+```bash
+git fetch origin
+mkdir -p ../omnigent-worktrees
+
+add_omnigent_worktrees() {
+  for change in "$@"; do
+    git worktree add "../omnigent-worktrees/$change" \
+      -b "feature/$change" origin/main
+  done
+}
+
+add_omnigent_worktrees search-export billing-alerts
+```
+
+Pass as many change names as needed. In a separate terminal for each worktree,
+run:
+
+```bash
+cd ../omnigent-worktrees/<change-name>
+cargo run --manifest-path dev/omnidev/Cargo.toml
+```
+
+`omnidev` requires a Rust toolchain in addition to the regular development
+prerequisites. Each invocation starts that checkout's server, host, and Vite
+frontend with:
+
+- automatically allocated backend and frontend ports;
+- an isolated database, config, artifacts, logs, and process state;
+- inherited provider credentials and package caches;
+- backend reloads and frontend hot-module replacement.
+
+Open the UI URL shown in each `omnidev` header. When starting a session, select
+the worktree corresponding to that feature.
+
+Coding harnesses should run each pod in its own persistent PTY or tmux session
+and execute tests from the matching worktree. Never reuse another worktree's
+pod directory or manually start several servers on the default ports.
+
+Press `q` or `Ctrl-C` to stop a pod. After merging a change:
+
+```bash
+git worktree remove ../omnigent-worktrees/<change-name>
+git branch -d feature/<change-name>
+```
+
+See [`dev/omnidev/README.md`](dev/omnidev/README.md) for port overrides,
+backend-only mode, LAN testing, logs, and keyboard controls.
+
 ### Backend-only local development validation
 
 Use this when you want to validate the Python backend and local API server from
