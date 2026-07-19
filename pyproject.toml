@@ -143,12 +143,9 @@ daytona = ["daytona>=0.180,<1"]
 # pool. Same lazy-import posture as the modal/daytona extras. Pre-1.0 SDK: pin
 # minor.
 boxlite = ["boxlite>=0.9.5,<1"]
-# Microsandbox sandbox launcher (`omnigent sandbox --provider microsandbox`
-# and server-managed `sandbox.provider: microsandbox`): local libkrun microVMs
-# booting OCI images directly (Apple Silicon macOS / KVM Linux), embedded SDK,
-# no daemon. Same lazy-import posture as the modal/daytona extras. Beta,
-# pre-1.0 SDK with an explicit breaking-change warning: pin minor. 0.6.5 was
-# yanked (missing DB migrations), hence the >=0.6.6 floor.
+# Microsandbox launcher: local libkrun microVMs with an embedded, optional SDK.
+# Its beta, pre-1.0 SDK has an explicit breaking-change warning, so pin minor.
+# Version 0.6.5 was yanked for missing DB migrations, hence the >=0.6.6 floor.
 microsandbox = ["microsandbox>=0.6.6,<0.7"]
 # CoreWeave Sandbox launcher (`omnigent sandbox --provider cwsandbox` and
 # server-managed `sandbox.provider: cwsandbox`).

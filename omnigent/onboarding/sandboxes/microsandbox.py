@@ -1049,10 +1049,8 @@ class MicrosandboxSandboxLauncher(SandboxLauncher):
             f"nohup python3 {shlex.quote(script_path)} > {shlex.quote(log_path)} "
             "2>&1 < /dev/null & echo $!",
         )
-        # Cleanup covers everything after the spawn attempt: kill by recorded
-        # pid when we have one, else by script path (the relay may be running
-        # even when the pid echo came back garbled). Teardown is best-effort
-        # and must never mask the context body's exception.
+        # Kill by recorded pid, or by script path if the echo was garbled.
+        # Teardown is best-effort and must not mask the body's exception.
         pid = started.stdout.strip().splitlines()[-1] if started.stdout.strip() else ""
         try:
             if not pid.isdigit():

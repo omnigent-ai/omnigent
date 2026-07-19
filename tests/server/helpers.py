@@ -457,7 +457,7 @@ def install_fake_islo_launcher(
 
 
 def install_fake_microsandbox_launcher(
-    monkeypatch: Any,  # pytest.MonkeyPatch — Any avoids importing pytest in a helpers module
+    monkeypatch: Any,  # Avoid importing pytest in a helpers module.
     fake: FakeSandboxLauncher,
 ) -> None:
     """

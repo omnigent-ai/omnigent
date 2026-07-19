@@ -203,12 +203,9 @@ DAYTONA_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
 # boxes nobody removed. A relaunch mints a fresh token.
 BOXLITE_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
 
-# Launch-token lifetime for the YAML microsandbox path. Microsandbox VMs have
-# no lifetime cap - idle ones drain (releasing compute, keeping their writable
-# layer) and are resumed in place by the wake path - so the bound is policy,
-# not platform: the same 7-day window as Daytona/boxlite keeps a long-lived VM
-# re-authenticating across tunnel reconnects while still expiring tokens of
-# VMs nobody removed. A relaunch mints a fresh token.
+# Microsandbox VMs have no lifetime cap and drain when idle.
+# The seven-day policy keeps live VMs reconnecting while stale tokens expire.
+# A relaunch mints a fresh token.
 MICROSANDBOX_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
 
 # Launch-token lifetime for the YAML islo path. Islo sandboxes are

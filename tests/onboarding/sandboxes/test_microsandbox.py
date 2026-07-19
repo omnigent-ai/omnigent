@@ -22,18 +22,9 @@ from omnigent.onboarding.sandboxes.microsandbox import (
     MicrosandboxSandboxLauncher,
 )
 
-# ── Fake microsandbox SDK ───────────────────────────────────
-#
-# The microsandbox SDK is an optional dependency the test environment
-# does not install, and real sandboxes are microVMs that only exist on a
-# virtualization-capable host - so these are hand-rolled stub classes
-# (never MagicMock: the launcher's attribute access must hit explicitly
-# defined recorders). Crucially the SDK is ASYNC: create/get/start/
-# remove/shell are coroutines and shell_stream hands back an async
-# iterator of exec events - the launcher marshals them onto its shared
-# event loop, so the fakes must mirror that shape. The fake module is
-# injected via sys.modules so the launcher's function-local
-# ``import microsandbox`` resolves to it.
+# Fakes mirror the optional async SDK without requiring a virtualization host.
+# Explicit recorders catch invalid access, and sys.modules resolves local imports.
+# Streaming fakes preserve the async iterator and shared-loop behavior.
 
 
 class _FakeSandboxNotFoundError(Exception):
