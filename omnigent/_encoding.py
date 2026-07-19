@@ -27,12 +27,14 @@ def detect_encoding(path: Path) -> str:
     """Return ``"utf-8"`` if *path* decodes as UTF-8, else the locale encoding.
 
     UTF-8 first because that is what modern CLIs write (and what UTF-8 Mode
-    produces); the locale codec is the legacy fallback. A missing/unreadable
-    path resolves to the locale encoding — callers that then hand it to
-    ``ConfigParser.read`` (which silently skips missing files) stay correct.
+    produces); the locale codec is the legacy fallback for a file that exists
+    but is not valid UTF-8. A *missing* path resolves to UTF-8 so a file about
+    to be created is written in the modern default rather than the locale codec.
     """
     try:
         path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return "utf-8"  # new file — write it UTF-8, not the legacy locale codec
     except (UnicodeDecodeError, OSError):
         return locale_encoding()
     return "utf-8"
