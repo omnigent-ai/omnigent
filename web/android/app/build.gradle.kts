@@ -30,7 +30,7 @@ android {
         applicationId = "ai.omnigent.android"
         minSdk = 28
         targetSdk = 35
-        versionCode = 2
+        versionCode = (project.findProperty("versionCode") as? String)?.toIntOrNull() ?: 2
         versionName = "0.1.0"
     }
 

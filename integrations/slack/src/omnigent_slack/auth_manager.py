@@ -159,7 +159,9 @@ class AuthManager:
             OIDC mode, which has no client identifier.
         """
         assert self._tokens is not None, "delegated auth not enabled"
-        return await start_login(server_url, client_id=client_id, client_secret=self._client_secret)
+        return await start_login(
+            server_url, client_id=client_id, client_secret=self._client_secret
+        )
 
     def await_authorization_in_background(
         self,

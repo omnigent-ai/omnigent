@@ -49,6 +49,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import os
 import secrets
 import shlex
@@ -105,8 +106,20 @@ _UPDATE_USAGE = "usage_update"
 _TOOL_STATUS_COMPLETED = "completed"
 _TOOL_STATUS_FAILED = "failed"
 
-# Idle (time-without-progress) timeouts in seconds.
-_PROMPT_TIMEOUT_SECONDS = 300.0
+# Idle (time-without-progress) timeout for a prompt turn, in seconds.
+# Some ACP agents stay silent while an external interaction is pending, so
+# this is configurable. Parsing is import-time and fail-loud: a malformed,
+# non-positive, or non-finite value aborts the ACP child at startup.
+_PROMPT_TIMEOUT_ENV = "HARNESS_ACP_PROMPT_TIMEOUT_S"
+_PROMPT_TIMEOUT_ERR = f"{_PROMPT_TIMEOUT_ENV} must be a positive finite number of seconds"
+try:
+    _PROMPT_TIMEOUT_SECONDS = float(os.environ.get(_PROMPT_TIMEOUT_ENV, "300"))
+except ValueError as exc:
+    raise ValueError(_PROMPT_TIMEOUT_ERR) from exc
+if not math.isfinite(_PROMPT_TIMEOUT_SECONDS) or _PROMPT_TIMEOUT_SECONDS <= 0:
+    raise ValueError(_PROMPT_TIMEOUT_ERR)
+
+# Idle timeout for the initial ACP handshake (initialize / session setup).
 _INIT_TIMEOUT_SECONDS = 30.0
 
 # ACP protocol version this executor targets (matches Goose 1.38 / Qwen).

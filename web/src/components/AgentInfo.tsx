@@ -1311,18 +1311,123 @@ export function AgentInfoContent({ agent, sessionId }: AgentInfoProps) {
 }
 
 /**
+ * Delay before a hover-opened popover closes once the pointer leaves both the
+ * icon and the panel. Long enough to cross the small gap between them without
+ * the panel flickering shut; re-entering either side cancels the pending close.
+ */
+export const HOVER_CLOSE_DELAY_MS = 150;
+
+/**
+ * Grace window after a hover-open during which a Radix click-toggle to *closed*
+ * is treated as the opening half of a single click gesture, not a dismiss.
+ *
+ * A mouse `click()` first moves the pointer onto the icon — firing
+ * `pointerenter` → hover-open (`setOpen(true)`) — and then dispatches the click,
+ * whose Radix trigger toggles `open`. On a slow render the hover-open commits
+ * `open = true` before the click's toggle runs, so the toggle reads `true` and
+ * flips it back to `false`, and the panel never opens. Both halves of that one
+ * gesture land within a few milliseconds; a deliberate hover-then-click dismiss
+ * dwells far longer. Swallowing a close inside this window keeps click-to-open
+ * reliable without weakening the real click-to-dismiss (see AgentInfoButton).
+ */
+export const HOVER_CLICK_GRACE_MS = 30;
+
+/**
  * Header info icon revealing the active agent's tools & policies.
  *
- * Desktop-only: on mobile (`< md`) the same content is reached via the
- * header's three-dot menu, which opens {@link AgentInfoContent} in a
- * dialog. Self-hides when the agent has neither tools nor policies.
+ * Opens on mouse hover over the (i) icon and stays open while the pointer is on
+ * the icon or the panel (a short close delay bridges the gap between them).
+ * Hover is gated to a real mouse pointer, so touch/pen taps fall through to
+ * Radix's native click-to-open; click and keyboard still toggle it. Desktop-only:
+ * on mobile (`< md`) the same content is reached via the header's three-dot menu,
+ * which opens {@link AgentInfoContent} in a dialog. Self-hides when the agent has
+ * neither tools nor policies.
  */
 export function AgentInfoButton({ agent, sessionId }: AgentInfoProps) {
+  const [open, setOpen] = useState(false);
+  // Tracks whether the current open came from hover, so we can suppress Radix's
+  // focus move into the panel on hover-open (which would steal focus and could
+  // scroll the page) while keeping it for click / keyboard access.
+  const openedByHoverRef = useRef(false);
+  const closeTimeoutRef = useRef<number | null>(null);
+  // Timestamp of the last hover-open, used to recognize the click that lands in
+  // the same gesture (pointer arrival + click) and would otherwise toggle the
+  // just-hover-opened panel straight back shut. See HOVER_CLICK_GRACE_MS.
+  const hoverOpenedAtRef = useRef(0);
+
+  useEffect(() => {
+    return () => {
+      if (closeTimeoutRef.current !== null) window.clearTimeout(closeTimeoutRef.current);
+    };
+  }, []);
+
   if (!agentHasInfo(agent, sessionId)) return null;
 
+  function cancelClose() {
+    if (closeTimeoutRef.current !== null) {
+      window.clearTimeout(closeTimeoutRef.current);
+      closeTimeoutRef.current = null;
+    }
+  }
+
+  function scheduleClose() {
+    cancelClose();
+    closeTimeoutRef.current = window.setTimeout(() => {
+      closeTimeoutRef.current = null;
+      openedByHoverRef.current = false;
+      setOpen(false);
+    }, HOVER_CLOSE_DELAY_MS);
+  }
+
+  // Hover only applies to a real mouse. Touch/pen synthesize a mouseenter that
+  // would open the panel, only for the follow-up synthetic click to toggle it
+  // straight back shut — so a tap could never open it. Gating on pointerType
+  // lets touch fall through to Radix's native tap-to-open (and keeps the hover
+  // bridge from auto-closing a tap-opened panel).
+  function openOnHover(e: React.PointerEvent) {
+    if (e.pointerType !== "mouse") return;
+    cancelClose();
+    openedByHoverRef.current = true;
+    hoverOpenedAtRef.current = performance.now();
+    setOpen(true);
+  }
+
+  function scheduleCloseOnLeave(e: React.PointerEvent) {
+    if (e.pointerType !== "mouse") return;
+    scheduleClose();
+  }
+
+  function cancelCloseOnEnter(e: React.PointerEvent) {
+    if (e.pointerType !== "mouse") return;
+    cancelClose();
+  }
+
   return (
-    <Popover>
-      <Tooltip>
+    <Popover
+      open={open}
+      onOpenChange={(next) => {
+        // A mouse click's own pointer-arrival hover-opens the panel; if that
+        // open commits before the click's Radix toggle runs, the toggle sees
+        // open=true and asks to close within the same gesture. Swallow that
+        // close so click-to-open stays reliable (a real click-to-dismiss dwells
+        // far past the grace window). Only guards the hover-opened case.
+        if (
+          !next &&
+          openedByHoverRef.current &&
+          performance.now() - hoverOpenedAtRef.current < HOVER_CLICK_GRACE_MS
+        ) {
+          return;
+        }
+        // Click / keyboard / outside-dismiss path: honor Radix immediately and
+        // drop the hover flag so focus behaves normally.
+        cancelClose();
+        if (!next) openedByHoverRef.current = false;
+        setOpen(next);
+      }}
+    >
+      {/* Suppress the tooltip while the panel is open — the panel already names
+          the agent, so showing both on the same hover is redundant noise. */}
+      <Tooltip open={open ? false : undefined}>
         <TooltipTrigger asChild>
           <PopoverTrigger asChild>
             <Button
@@ -1332,6 +1437,11 @@ export function AgentInfoButton({ agent, sessionId }: AgentInfoProps) {
               aria-label="Agent tools and policies"
               data-testid="agent-info-trigger"
               className="hidden text-muted-foreground hover:text-foreground md:inline-flex"
+              onPointerEnter={openOnHover}
+              onPointerLeave={scheduleCloseOnLeave}
+              onFocus={() => {
+                openedByHoverRef.current = false;
+              }}
             >
               <InfoIcon className="size-4" />
             </Button>
@@ -1339,7 +1449,16 @@ export function AgentInfoButton({ agent, sessionId }: AgentInfoProps) {
         </TooltipTrigger>
         <TooltipContent>Agent tools &amp; policies</TooltipContent>
       </Tooltip>
-      <PopoverContent align="end" className="w-80">
+      <PopoverContent
+        align="end"
+        className="w-80"
+        data-testid="agent-info-panel"
+        onPointerEnter={cancelCloseOnEnter}
+        onPointerLeave={scheduleCloseOnLeave}
+        onOpenAutoFocus={(e) => {
+          if (openedByHoverRef.current) e.preventDefault();
+        }}
+      >
         <AgentInfoContent agent={agent} sessionId={sessionId} />
       </PopoverContent>
     </Popover>

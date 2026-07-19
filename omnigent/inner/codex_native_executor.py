@@ -188,9 +188,8 @@ class CodexNativeExecutor(Executor):
             shape. The latest user message is delivered to Codex.
         :param tools: Tool schemas from Omnigent. Ignored here;
             native Codex owns its own tool surface.
-        :param system_prompt: System prompt from the agent spec.
-            Ignored because the native thread was created by the
-            wrapper.
+        :param system_prompt: System prompt from the agent spec. Native
+            startup instructions are configured before the app-server launches.
         :param config: Per-turn executor config. Its ``model`` and
             ``extra["reasoning_effort"]`` (carrying the Omnigent web
             ``/model`` pick) are applied via a ``thread/settings/update``
@@ -279,13 +278,11 @@ class CodexNativeExecutor(Executor):
                                     **settings_overrides,
                                 },
                             )
-                        response = await client.request(
-                            "turn/start",
-                            {
-                                "threadId": state.thread_id,
-                                "input": input_items,
-                            },
-                        )
+                        turn_params: dict[str, Any] = {
+                            "threadId": state.thread_id,
+                            "input": input_items,
+                        }
+                        response = await client.request("turn/start", turn_params)
                         turn_id = response.get("result", {}).get("turn", {}).get("id")
                         if isinstance(turn_id, str) and turn_id:
                             update_active_turn_id(self._bridge_dir, turn_id)

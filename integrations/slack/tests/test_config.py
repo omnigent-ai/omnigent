@@ -3,9 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from pydantic import ValidationError
-
 from omnigent_slack.config import Settings
+from pydantic import ValidationError
 
 
 def _load() -> Settings:
