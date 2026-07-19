@@ -46,7 +46,8 @@ Omnigent lets you:
   [Islo](https://islo.dev), [E2B](https://e2b.dev),
   [CoreWeave](https://docs.coreweave.com/products/sandboxes),
   [Kubernetes](https://kubernetes.io), [OpenShell](https://github.com/NVIDIA/OpenShell),
-  [Boxlite](https://github.com/boxlite-ai/boxlite), or
+  [Boxlite](https://github.com/boxlite-ai/boxlite),
+  [microsandbox](https://github.com/superradcompany/microsandbox), or
   [Databricks](https://www.databricks.com) sandboxes, launched from the
   CLI or provisioned by the server per session (*managed hosts*).
 
@@ -80,8 +81,8 @@ curl -fsSL https://raw.githubusercontent.com/omnigent-ai/omnigent/main/scripts/i
 Available user-facing extras include:
 
 - **Model providers:** `databricks`, `bedrock`, `vertex`
-- **Sandbox providers:** `modal`, `daytona`, `boxlite`, `cwsandbox`, `e2b`,
-  `openshell`, `kubernetes`
+- **Sandbox providers:** `modal`, `daytona`, `boxlite`, `microsandbox`,
+  `cwsandbox`, `e2b`, `openshell`, `kubernetes`
 - **SDK harnesses:** `antigravity`, `copilot`, `cursor`, `agents-sdk`
 - **Storage and memory:** `s3`, `hindsight`
 
