@@ -4771,6 +4771,7 @@ async def _cmd_effort(
 
 
 _MODEL_CLEAR_ALIASES = {"default", "off", "reset"}
+_MODEL_SHOW_ALIASES = {"show", "list", "status", "current"}
 
 
 def _model_readout_harness(active_model: str | None) -> str:
@@ -5059,8 +5060,7 @@ async def _cmd_model(
     """
     from rich.text import Text
 
-    value = arg.strip()
-    if not value:
+    def _emit_model_readout() -> None:
         from omnigent.onboarding.detected import effective_config_with_detected
         from omnigent.onboarding.provider_config import load_config
 
@@ -5071,6 +5071,12 @@ async def _cmd_model(
         config = effective_config_with_detected(load_config())
         for line in _build_model_readout_lines(config, harness, current):
             host.output(Text.from_markup(f"  [{fmt.muted}]{line}[/{fmt.muted}]"))
+
+    value = arg.strip()
+    # Bare `/model` and the display keywords both just show the readout — never
+    # persist `show`/`list`/`status`/`current` as a literal model override.
+    if not value or value.lower() in _MODEL_SHOW_ALIASES:
+        _emit_model_readout()
         return
 
     if value.lower() in _MODEL_CLEAR_ALIASES:
