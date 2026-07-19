@@ -36,6 +36,7 @@ marshalled onto a single PROCESS-LIFETIME background loop thread
 from __future__ import annotations
 
 import asyncio
+import codecs
 import contextlib
 import os
 import platform
@@ -119,8 +120,7 @@ _RELAY_READY_TIMEOUT_S: float = 15.0
 
 # In-guest TCP relay backing forward_local_port: listens on the guest's
 # loopback and pipes every connection to the same port on the host machine
-# (reachable at host.microsandbox.internal under the "host"/"all" network
-# modes). Formatted with the port number; runs under the image's python3.
+# (host.microsandbox.internal). Formatted with the port; needs guest python3.
 _RELAY_SCRIPT = """\
 import asyncio
 
@@ -310,6 +310,9 @@ class _MicrosandboxRemoteProcess(RemoteProcess):
 
     def _iter_lines(self) -> Iterator[str]:
         """Yield output lines, recording the exit code as events arrive."""
+        # Incremental decoder: a multi-byte UTF-8 sequence may be split
+        # across event payloads, so per-event decode would mangle it.
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
         buffer = ""
         while True:
             event = self._next_event()
@@ -318,13 +321,14 @@ class _MicrosandboxRemoteProcess(RemoteProcess):
             event_type = getattr(event, "event_type", None)
             if event_type in ("stdout", "stderr"):
                 data = getattr(event, "data", None) or b""
-                buffer += data.decode("utf-8", "replace")
+                buffer += decoder.decode(data)
                 while "\n" in buffer:
                     line, _, buffer = buffer.partition("\n")
                     yield line + "\n"
             elif event_type == "exited":
                 code = getattr(event, "code", None)
                 self._exit_code = 0 if code is None else int(code)
+        buffer += decoder.decode(b"", final=True)
         if buffer:
             yield buffer
 
@@ -334,9 +338,10 @@ class _MicrosandboxRemoteProcess(RemoteProcess):
 
         :returns: The process's exit code.
         """
-        if self._exit_code is None:
+        if self._exit_code is None and not self._closed:
             # Drain remaining events (recording the exit code) - the caller
-            # has stopped consuming lines, so discarding them is fine.
+            # has stopped consuming lines, so discarding them is fine. After
+            # a close() the stream may never EOF, so skip straight to wait.
             for _ in self._lines:
                 pass
         if self._exit_code is None:
@@ -351,18 +356,26 @@ class _MicrosandboxRemoteProcess(RemoteProcess):
 
     def close(self) -> None:
         """
-        Terminate the process if it is still running and reap it. Idempotent.
+        Terminate the process if it is still running and reap it. Idempotent:
+        safe after :meth:`wait` and after a prior successful ``close``. A
+        failed kill/reap leaves the handle open so a retry can still reap.
         """
         if self._closed:
             return
-        self._closed = True
         if self._exit_code is None:
+            # Kill may race a natural exit - suppress it and let wait()
+            # deliver the (possibly natural) exit code as the reap.
+            async def _kill_and_wait() -> int:
+                with contextlib.suppress(Exception):
+                    await self._handle.kill()
+                code, _success = await self._handle.wait()
+                return int(code)
 
-            async def _kill() -> None:
-                await self._handle.kill()
-
-            with contextlib.suppress(Exception):
-                _run(_kill(), timeout=_TERMINATE_TIMEOUT_S)
+            try:
+                self._exit_code = _run(_kill_and_wait(), timeout=_TERMINATE_TIMEOUT_S)
+            except Exception:
+                return
+        self._closed = True
 
 
 class MicrosandboxSandboxLauncher(SandboxLauncher):
@@ -397,6 +410,7 @@ class MicrosandboxSandboxLauncher(SandboxLauncher):
         env: Sequence[str] | None = None,
         idle_timeout_s: int | None = None,
         network: str | None = None,
+        host_ports: Sequence[int] | None = None,
     ) -> None:
         """
         Initialize the launcher.
@@ -417,6 +431,13 @@ class MicrosandboxSandboxLauncher(SandboxLauncher):
             drains itself (restartable via :meth:`resume`); ``None`` uses
             :data:`DEFAULT_IDLE_TIMEOUT_S`, ``0`` disables draining.
         :param network: One of :data:`NETWORK_MODES`; ``None`` uses ``host``.
+        :param host_ports: Under the ``host`` network mode, restrict
+            guest-to-host traffic to these TCP ports (e.g. the omnigent
+            server port plus an LLM-gateway port). ``None`` allows every
+            host port - required for the CLI bootstrap, whose OAuth relay
+            port isn't known at creation time; the server's managed path
+            always passes an explicit list so untrusted agents cannot
+            reach unrelated host-local services.
         :raises click.ClickException: When *network* is not a recognized mode.
         """
         if network is not None and network not in NETWORK_MODES:
@@ -432,6 +453,7 @@ class MicrosandboxSandboxLauncher(SandboxLauncher):
             idle_timeout_s if idle_timeout_s is not None else (DEFAULT_IDLE_TIMEOUT_S)
         )
         self._network_mode = network or "host"
+        self._host_ports = tuple(host_ports) if host_ports is not None else None
         self._connections: dict[str, microsandbox_sdk.Sandbox] = {}
 
     # ── Config resolution ──────────────────────────────
@@ -478,11 +500,12 @@ class MicrosandboxSandboxLauncher(SandboxLauncher):
         """
         Build the sandbox network config for the configured mode.
 
-        ``host`` keeps microsandbox's public-egress-only posture and adds an
-        allow-rule for guest-to-host traffic (``host.microsandbox.internal``),
-        so hosts can dial back to a server on this machine and
+        ``host`` keeps microsandbox's public-egress-only posture and adds
+        guest-to-host allow-rules (``host.microsandbox.internal``), so hosts
+        can dial back to a server on this machine and
         :meth:`forward_local_port` can relay. Loopback / private-LAN /
-        metadata destinations stay blocked.
+        metadata destinations stay blocked, and when ``host_ports`` is set
+        the host rules are scoped to just those TCP ports.
         """
         import microsandbox as msb
 
@@ -490,13 +513,22 @@ class MicrosandboxSandboxLauncher(SandboxLauncher):
             return msb.Network.allow_all()
         if self._network_mode == "public-only":
             return msb.Network.public_only()
+        host = msb.Destination.group(msb.DestGroup.HOST)
+        host_rules: tuple[msb.Rule, ...]
+        if self._host_ports is None:
+            host_rules = (msb.Rule.allow(destination=host),)
+        else:
+            host_rules = tuple(
+                msb.Rule.allow(protocol=msb.Protocol.TCP, port=port, destination=host)
+                for port in self._host_ports
+            )
         return msb.Network(
             policy=msb.NetworkPolicy(
                 default_egress=msb.Action.DENY,
                 rules=(
                     *msb.Rule.allow_dns(),
                     msb.Rule.allow(destination=msb.Destination.group(msb.DestGroup.PUBLIC)),
-                    msb.Rule.allow(destination=msb.Destination.group(msb.DestGroup.HOST)),
+                    *host_rules,
                 ),
             )
         )
@@ -603,6 +635,14 @@ class MicrosandboxSandboxLauncher(SandboxLauncher):
         except click.ClickException:
             self._best_effort_remove(sandbox_id)
             raise
+        except (TimeoutError, asyncio.CancelledError):
+            # Cancellation is not atomic: the native create may register the
+            # VM a moment AFTER the coroutine was cancelled, so keep probing
+            # for it briefly - else it leaks untracked with no lifetime cap.
+            self._best_effort_remove(sandbox_id, retry_not_found=True)
+            raise click.ClickException(
+                f"microsandbox VM creation timed out after {_PROVISION_TIMEOUT_S:.0f}s"
+            ) from None
         except Exception as exc:
             self._best_effort_remove(sandbox_id)
             # Surface the provider's reason (image pull failure, no
@@ -612,20 +652,33 @@ class MicrosandboxSandboxLauncher(SandboxLauncher):
         click.echo(f"  → created {sandbox_id}")
         return sandbox_id
 
-    def _best_effort_remove(self, sandbox_id: str) -> None:
+    def _best_effort_remove(self, sandbox_id: str, *, retry_not_found: bool = False) -> None:
         """
         Kill and remove a sandbox by name, swallowing every error. Used to
         clean up a provision that failed or was cancelled - the sandbox may
         exist even though ``create()`` never returned.
+
+        :param retry_not_found: Keep probing briefly when the sandbox is not
+            found yet - a CANCELLED create may register it a moment after the
+            cancellation. Only the timeout/cancel path pays this wait.
         """
+        attempts = 3 if retry_not_found else 1
 
         async def _do() -> None:
             import microsandbox as msb
 
-            handle = await msb.Sandbox.get(sandbox_id)
-            with contextlib.suppress(Exception):
-                await handle.kill()
-            await handle.remove()
+            for attempt in range(attempts):
+                try:
+                    handle = await msb.Sandbox.get(sandbox_id)
+                except msb.SandboxNotFoundError:
+                    if attempt == attempts - 1:
+                        return
+                    await asyncio.sleep(2.0)
+                    continue
+                with contextlib.suppress(Exception):
+                    await handle.kill()
+                await handle.remove()
+                return
 
         self._forget(sandbox_id)
         with contextlib.suppress(Exception):
@@ -818,7 +871,14 @@ class MicrosandboxSandboxLauncher(SandboxLauncher):
             sandbox = await self._aconnect(sandbox_id)
             return await sandbox.shell_stream(command, tty=True, env={"TERM": "xterm-256color"})
 
-        handle = _run(_spawn(), timeout=_CONNECT_TIMEOUT_S)
+        try:
+            handle = _run(_spawn(), timeout=_CONNECT_TIMEOUT_S)
+        except click.ClickException:
+            raise
+        except Exception as exc:
+            raise click.ClickException(
+                f"Could not start foreground command on microsandbox '{sandbox_id}': {exc}"
+            ) from exc
         process = _MicrosandboxRemoteProcess(handle)
         try:
             for line in process.lines:
@@ -854,7 +914,12 @@ class MicrosandboxSandboxLauncher(SandboxLauncher):
             if handle.status == msb.SandboxStatus.RUNNING:
                 with contextlib.suppress(Exception):
                     await handle.kill()
-            await handle.remove()
+            try:
+                await handle.remove()
+            except msb.SandboxNotFoundError:
+                # A concurrent terminate won the race - desired end state
+                # holds either way.
+                return
 
         self._forget(sandbox_id)
         try:
@@ -954,26 +1019,40 @@ class MicrosandboxSandboxLauncher(SandboxLauncher):
     @contextlib.contextmanager
     def _relay_forward(self, sandbox_id: str, port: int) -> Generator[None, None, None]:
         """Run the in-guest relay for :meth:`forward_local_port`."""
-        script_path = f"/tmp/oa-relay-{port}.py"
-        log_path = f"/tmp/oa-relay-{port}.log"
+        # Per-forward random paths: two concurrent forwards for the same
+        # port must not share script/log/readiness state.
+        run_tag = f"oa-relay-{port}-{secrets.token_hex(4)}"
+        script_path = f"/tmp/{run_tag}.py"
+        log_path = f"/tmp/{run_tag}.log"
         self.run(sandbox_id, "command -v python3 >/dev/null")
 
         async def _ship() -> None:
             sandbox = await self._aconnect(sandbox_id)
             await sandbox.fs.write(script_path, _RELAY_SCRIPT.format(port=port).encode())
 
-        _run(_ship(), timeout=_RUN_TIMEOUT_S)
+        try:
+            _run(_ship(), timeout=_RUN_TIMEOUT_S)
+        except click.ClickException:
+            raise
+        except Exception as exc:
+            raise click.ClickException(
+                f"Could not ship the port-forward relay into microsandbox '{sandbox_id}': {exc}"
+            ) from exc
         started = self.run(
             sandbox_id,
             f"nohup python3 {shlex.quote(script_path)} > {shlex.quote(log_path)} "
             "2>&1 < /dev/null & echo $!",
         )
+        # Cleanup covers everything after the spawn attempt: kill by recorded
+        # pid when we have one, else by script path (the relay may be running
+        # even when the pid echo came back garbled). Teardown is best-effort
+        # and must never mask the context body's exception.
         pid = started.stdout.strip().splitlines()[-1] if started.stdout.strip() else ""
-        if not pid.isdigit():
-            raise click.ClickException(
-                f"could not start the port-forward relay in microsandbox '{sandbox_id}'"
-            )
         try:
+            if not pid.isdigit():
+                raise click.ClickException(
+                    f"could not start the port-forward relay in microsandbox '{sandbox_id}'"
+                )
             deadline = time.monotonic() + _RELAY_READY_TIMEOUT_S
             while True:
                 probe = self.run(
@@ -992,12 +1071,19 @@ class MicrosandboxSandboxLauncher(SandboxLauncher):
                 time.sleep(0.2)
             yield
         finally:
-            self.run(
-                sandbox_id,
-                f"kill {pid} 2>/dev/null; rm -f {shlex.quote(script_path)} "
-                f"{shlex.quote(log_path)}",
-                check=False,
+            kill_cmd = (
+                f"kill {pid} 2>/dev/null; "
+                if pid.isdigit()
+                else f"pkill -f {shlex.quote(script_path)} 2>/dev/null; "
             )
+            try:
+                self.run(
+                    sandbox_id,
+                    f"{kill_cmd}rm -f {shlex.quote(script_path)} {shlex.quote(log_path)}",
+                    check=False,
+                )
+            except click.ClickException as exc:
+                click.echo(f"  → port-forward relay cleanup failed: {exc.message}", err=True)
 
     def wheel_install_command(self, remote_tgz_path: str) -> str:
         """

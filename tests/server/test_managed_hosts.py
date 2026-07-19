@@ -597,6 +597,7 @@ def test_parse_valid_microsandbox_config_builds_parameterized_factory(
                 "memory_mib": 8192,
                 "idle_timeout_s": 0,
                 "network": "all",
+                "host_ports": [8317, 8799],
             },
         }
     )
@@ -614,6 +615,8 @@ def test_parse_valid_microsandbox_config_builds_parameterized_factory(
     assert fake.memory_mib == 8192
     assert fake.idle_timeout_s == 0
     assert fake.network == "all"
+    # server_url port always leads; configured extras follow, de-duplicated.
+    assert fake.host_ports == [8799, 8317]
 
 
 def test_parse_microsandbox_without_section_defaults(
@@ -637,6 +640,23 @@ def test_parse_microsandbox_without_section_defaults(
     assert fake.memory_mib is None
     assert fake.idle_timeout_s is None
     assert fake.network is None
+    # Managed VMs run untrusted code on the server's machine, so even the
+    # no-section default scopes guest-to-host access to the dial-back port.
+    assert fake.host_ports == [8799]
+
+
+def test_parse_microsandbox_derives_scheme_default_port(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A server_url without an explicit port scopes host access by scheme."""
+    cfg = parse_sandbox_config(
+        {"provider": "microsandbox", "server_url": "https://omnigent.example.com"}
+    )
+    assert cfg is not None
+    fake = FakeSandboxLauncher()
+    install_fake_microsandbox_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.host_ports == [443]
 
 
 @pytest.mark.parametrize(
@@ -880,6 +900,22 @@ def test_parse_microsandbox_without_section_defaults(
                 "microsandbox": {"memory_gib": 4},
             },
             "unknown key",
+        ),
+        (
+            {
+                "provider": "microsandbox",
+                "server_url": "https://s",
+                "microsandbox": {"host_ports": [8317, "8080"]},
+            },
+            "sandbox.microsandbox.host_ports",
+        ),
+        (
+            {
+                "provider": "microsandbox",
+                "server_url": "https://s",
+                "microsandbox": {"host_ports": [0]},
+            },
+            "sandbox.microsandbox.host_ports",
         ),
         # openshell section present but malformed.
         (

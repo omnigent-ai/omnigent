@@ -86,6 +86,9 @@ class _FakeExecHandle:
     def __init__(self, events: list[_FakeExecEvent]) -> None:
         self._events = list(events)
         self.killed = False
+        self.waits = 0
+        self.wait_raises: Exception | None = None
+        self.wait_result: tuple[int, bool] = (0, True)
 
     def __aiter__(self) -> _FakeExecHandle:
         return self
@@ -96,7 +99,10 @@ class _FakeExecHandle:
         return self._events.pop(0)
 
     async def wait(self) -> tuple[int, bool]:
-        return 0, True
+        self.waits += 1
+        if self.wait_raises is not None:
+            raise self.wait_raises
+        return self.wait_result
 
     async def kill(self) -> None:
         self.killed = True
@@ -243,13 +249,21 @@ class _FakeAction:
 
 @dataclass(frozen=True)
 class _FakeRule:
-    """Stand-in for ``Rule`` (records the destination it allows)."""
+    """Stand-in for ``Rule`` (records what it allows)."""
 
     destination: object = None
+    protocol: object = None
+    port: object = None
 
     @staticmethod
-    def allow(*, destination: object = None, **kwargs: object) -> _FakeRule:
-        return _FakeRule(destination=destination)
+    def allow(
+        *,
+        destination: object = None,
+        protocol: object = None,
+        port: object = None,
+        **kwargs: object,
+    ) -> _FakeRule:
+        return _FakeRule(destination=destination, protocol=protocol, port=port)
 
     @staticmethod
     def allow_dns() -> tuple[_FakeRule, _FakeRule]:
@@ -259,6 +273,10 @@ class _FakeRule:
 class _FakeDestGroup:
     HOST = "host"
     PUBLIC = "public"
+
+
+class _FakeProtocol:
+    TCP = "tcp"
 
 
 class _FakeDestination:
@@ -327,6 +345,7 @@ def _install_fake_microsandbox(monkeypatch: pytest.MonkeyPatch) -> _FakeMicrosan
     fake.Rule = _FakeRule  # type: ignore[attr-defined]
     fake.Destination = _FakeDestination  # type: ignore[attr-defined]
     fake.DestGroup = _FakeDestGroup  # type: ignore[attr-defined]
+    fake.Protocol = _FakeProtocol  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "microsandbox", fake)
     return state
 
@@ -560,6 +579,24 @@ def test_provision_default_network_allows_public_and_host(
     assert "group:host" in destinations
 
 
+def test_provision_host_ports_scope_the_host_rules(
+    fake_microsandbox: _FakeMicrosandboxState,
+) -> None:
+    """
+    With host_ports set (the managed path), guest-to-host access is limited
+    to exactly those TCP ports - untrusted agents must not reach unrelated
+    host-local services.
+    """
+    MicrosandboxSandboxLauncher(host_ports=[8799, 8317]).provision("a")
+
+    [create] = fake_microsandbox.create_calls
+    host_rules = [
+        rule for rule in create.kwargs["network"].policy.rules if rule.destination == "group:host"
+    ]
+    assert {rule.port for rule in host_rules} == {8799, 8317}
+    assert all(rule.protocol == _FakeProtocol.TCP for rule in host_rules)
+
+
 def test_provision_network_mode_public_only(fake_microsandbox: _FakeMicrosandboxState) -> None:
     """``public-only`` maps to the SDK's stock public-egress network."""
     MicrosandboxSandboxLauncher(network="public-only").provision("a")
@@ -699,6 +736,25 @@ def test_stream_exec_merges_streams_and_yields_lines(
     assert call.tty is False
 
 
+def test_stream_exec_reassembles_split_utf8(
+    fake_microsandbox: _FakeMicrosandboxState,
+) -> None:
+    """A multi-byte UTF-8 sequence split across event payloads must survive."""
+    launcher = MicrosandboxSandboxLauncher()
+    sandbox_id = _provisioned(fake_microsandbox, launcher)
+    sandbox = fake_microsandbox.sandboxes[sandbox_id]
+    euro = "€".encode()
+    sandbox.stream_events = [
+        _FakeExecEvent("stdout", data=b"cost " + euro[:1]),
+        _FakeExecEvent("stdout", data=euro[1:] + b"42\n"),
+        _FakeExecEvent("exited", code=0),
+    ]
+
+    process = launcher.stream_exec(sandbox_id, "echo cost")
+
+    assert list(process.lines) == ["cost €42\n"]
+
+
 def test_stream_exec_pty_skips_merge(fake_microsandbox: _FakeMicrosandboxState) -> None:
     """A PTY already interleaves both streams - no in-shell merge."""
     launcher = MicrosandboxSandboxLauncher()
@@ -711,10 +767,13 @@ def test_stream_exec_pty_skips_merge(fake_microsandbox: _FakeMicrosandboxState) 
     assert call.tty is True
 
 
-def test_stream_exec_close_kills_running_process(
+def test_stream_exec_close_kills_and_reaps(
     fake_microsandbox: _FakeMicrosandboxState,
 ) -> None:
-    """``close`` on a still-running process kills it through the SDK handle."""
+    """
+    ``close`` on a still-running process kills it AND reaps it (the base
+    contract), caching the exit code so a later wait() returns instantly.
+    """
     launcher = MicrosandboxSandboxLauncher()
     sandbox_id = _provisioned(fake_microsandbox, launcher)
     sandbox = fake_microsandbox.sandboxes[sandbox_id]
@@ -723,7 +782,34 @@ def test_stream_exec_close_kills_running_process(
     process = launcher.stream_exec(sandbox_id, "sleep 300")
     process.close()
 
-    assert sandbox.stream_handles[-1].killed is True
+    handle = sandbox.stream_handles[-1]
+    assert handle.killed is True
+    assert handle.waits == 1  # reaped
+    assert process.wait() == 0  # cached; no second SDK wait
+    assert handle.waits == 1
+    process.close()  # idempotent
+    assert handle.waits == 1
+
+
+def test_stream_exec_failed_close_can_be_retried(
+    fake_microsandbox: _FakeMicrosandboxState,
+) -> None:
+    """A close whose reap fails leaves the handle open so a retry can reap."""
+    launcher = MicrosandboxSandboxLauncher()
+    sandbox_id = _provisioned(fake_microsandbox, launcher)
+    sandbox = fake_microsandbox.sandboxes[sandbox_id]
+    sandbox.stream_events = [_FakeExecEvent("stdout", data=b"partial")]
+
+    process = launcher.stream_exec(sandbox_id, "sleep 300")
+    handle = sandbox.stream_handles[-1]
+    handle.wait_raises = RuntimeError("transport flake")
+    process.close()  # swallowed; must NOT latch closed
+    handle.wait_raises = None
+    handle.wait_result = (137, False)
+    process.close()  # retry succeeds and reaps
+
+    assert handle.waits == 2
+    assert process.wait() == 137
 
 
 def test_exec_foreground_uses_tty_and_term(
@@ -766,6 +852,17 @@ def test_terminate_kills_running_and_removes(
     # Already gone → no-op success.
     launcher.terminate(sandbox_id)
     assert fake_microsandbox.removed == [sandbox_id]
+
+
+def test_terminate_tolerates_concurrent_removal(
+    fake_microsandbox: _FakeMicrosandboxState,
+) -> None:
+    """A concurrent terminate winning the remove race is success, not an error."""
+    launcher = MicrosandboxSandboxLauncher()
+    sandbox_id = _provisioned(fake_microsandbox, launcher)
+    fake_microsandbox.remove_raises = _FakeSandboxNotFoundError("already removed")
+
+    launcher.terminate(sandbox_id)  # must not raise
 
 
 def test_terminate_wraps_removal_errors(fake_microsandbox: _FakeMicrosandboxState) -> None:
@@ -884,13 +981,38 @@ def test_forward_local_port_runs_and_tears_down_relay(
 
     with launcher.forward_local_port(sandbox_id, 8022):
         [(script_path, script)] = sandbox.fs.written
-        assert script_path == "/tmp/oa-relay-8022.py"
+        # Per-forward random suffix: concurrent forwards must not share paths.
+        assert script_path.startswith("/tmp/oa-relay-8022-")
+        assert script_path.endswith(".py")
         assert b"8022" in script
         assert b"host.microsandbox.internal" in script
 
     teardown = sandbox.shell_calls[-1].script
     assert "kill 4242" in teardown
-    assert "/tmp/oa-relay-8022.py" in teardown
+    assert script_path in teardown
+
+
+def test_forward_local_port_cleans_up_on_garbled_pid(
+    fake_microsandbox: _FakeMicrosandboxState,
+) -> None:
+    """
+    A garbled pid echo still fails loud, but cleanup falls back to killing
+    the relay by script path - a started relay must never be orphaned.
+    """
+    launcher = MicrosandboxSandboxLauncher()
+    sandbox_id = _provisioned(fake_microsandbox, launcher)
+    sandbox = fake_microsandbox.sandboxes[sandbox_id]
+    sandbox.shell_queue.append((0, "", ""))  # command -v python3
+    sandbox.shell_queue.append((0, "oops\n", ""))  # nohup start → garbage
+
+    with pytest.raises(click.ClickException, match="could not start"):
+        with launcher.forward_local_port(sandbox_id, 8022):
+            pass
+
+    teardown = sandbox.shell_calls[-1].script
+    assert "pkill -f" in teardown
+    [(script_path, _script)] = sandbox.fs.written
+    assert script_path in teardown
 
 
 def test_forward_local_port_fails_when_relay_never_ready(

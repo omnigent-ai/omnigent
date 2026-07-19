@@ -60,15 +60,21 @@ sandbox:
     memory_mib: 4096                          # optional; default 4096
     idle_timeout_s: 86400                     # optional; default 24h, 0 disables draining
     network: host                             # optional; host (default) | public-only | all
+    host_ports: [8317]                        # optional; extra guest-to-host TCP ports
 ```
 
 ### Network modes
 
 | Mode | Guest can reach |
 |------|-----------------|
-| `host` (default) | Public internet + the host machine (`host.microsandbox.internal`). Loopback, private LANs, and cloud metadata stay blocked. |
+| `host` (default) | Public internet + selected ports on the host machine (`host.microsandbox.internal`). Loopback, private LANs, and cloud metadata stay blocked. |
 | `public-only` | Public internet only. Use when `server_url` is a public URL; breaks local dial-back and the CLI App OAuth port-forward. |
 | `all` | Everything, including private LANs. |
+
+Under `host` mode, **managed** VMs run untrusted agent code on the same machine as the server, so guest-to-host access is scoped to a TCP port allowlist: the `server_url` port (always) plus any `host_ports` entries.
+List the ports of host-local services agents legitimately need - e.g. `host_ports: [8317]` for a local LLM gateway the sandbox env points at via `http://host.microsandbox.internal:8317`.
+Everything else on the host stays unreachable.
+CLI-bootstrap sandboxes (`omnigent sandbox create`, your own interactive session) keep unrestricted host access, because the App OAuth relay port is not known at VM creation time.
 
 ### Environment variables
 
@@ -116,4 +122,5 @@ Pass `--image ghcr.io/omnigent-ai/omnigent-host:latest` to smoke the real host i
 - **Same-machine only.** VMs run where the Omnigent server (or CLI) runs; there is no remote pool mode (unlike boxlite's `cloud:`).
 - **Platform floor.** Apple Silicon macOS or KVM glibc Linux; no Intel Macs, no musl/Alpine hosts, Windows support in microsandbox is preview and untested here.
 - **`/tmp` is tmpfs.** Guest `/tmp` does not survive a drain/resume cycle; the writable layer (everything else, including `$HOME`) does.
+- **A server killed mid-provision can orphan a VM.** Provisioning runs on a worker thread; if the server process dies at exactly the wrong moment, the created VM is never recorded. The idle-drain timeout parks such a VM automatically; `msb ls` / `msb rm` cleans it up.
 - **Beta runtime.** See the pin note under Prerequisites.

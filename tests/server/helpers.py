@@ -209,6 +209,7 @@ class FakeSandboxLauncher(SandboxLauncher):
         self.memory_mib: int | None = None
         self.idle_timeout_s: int | None = None
         self.network: str | None = None
+        self.host_ports: list[int] | None = None
         # Kubernetes ctor wiring (captured by install_fake_kubernetes_launcher).
         self.namespace: str | None = None
         self.secret_name: str | None = None
@@ -480,6 +481,7 @@ def install_fake_microsandbox_launcher(
         memory_mib: int | None = None,
         idle_timeout_s: int | None = None,
         network: str | None = None,
+        host_ports: list[int] | None = None,
     ) -> FakeSandboxLauncher:
         """Stand-in constructor recording the construction wiring."""
         fake.image = image
@@ -488,6 +490,7 @@ def install_fake_microsandbox_launcher(
         fake.memory_mib = memory_mib
         fake.idle_timeout_s = idle_timeout_s
         fake.network = network
+        fake.host_ports = host_ports
         return fake
 
     monkeypatch.setattr(microsandbox_mod, "MicrosandboxSandboxLauncher", _ctor)

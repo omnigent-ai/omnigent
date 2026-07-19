@@ -75,6 +75,8 @@ stores into ``create_app``):
            memory_mib: 4096                  # default 4096
            idle_timeout_s: 86400             # default 24h; 0 disables draining
            network: host                     # host (default)|public-only|all
+           host_ports: [8317]                # extra guest-to-host ports (the
+                                             # server_url port is always allowed)
 
    The image defaults to the official prebaked host image
    (``ghcr.io/omnigent-ai/omnigent-host:latest``; see
@@ -745,7 +747,7 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
         if microsandbox_section is not None:
             _reject_unknown_provider_keys(
                 microsandbox_section,
-                {"image", "cpus", "memory_mib", "env", "idle_timeout_s", "network"},
+                {"image", "cpus", "memory_mib", "env", "idle_timeout_s", "network", "host_ports"},
                 "sandbox.microsandbox",
             )
         launcher_factory = _microsandbox_launcher_factory(
@@ -755,6 +757,7 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
             memory_mib=_parse_provider_positive_int(raw, "microsandbox", "memory_mib"),
             idle_timeout_s=_parse_microsandbox_idle_timeout_s(raw),
             network=_parse_microsandbox_network(raw),
+            host_ports=_resolve_microsandbox_host_ports(raw, server_url),
         )
         token_ttl_s = MICROSANDBOX_MANAGED_TOKEN_TTL_S
     else:
@@ -1417,6 +1420,7 @@ def _microsandbox_launcher_factory(
     memory_mib: int | None,
     idle_timeout_s: int | None,
     network: str | None,
+    host_ports: list[int],
 ) -> Callable[[], SandboxLauncher]:
     """
     Build the launcher factory for the YAML ``provider: microsandbox`` path.
@@ -1435,6 +1439,8 @@ def _microsandbox_launcher_factory(
         ``None`` for the launcher default (24h).
     :param network: Network mode (``host`` / ``public-only`` / ``all``), or
         ``None`` for the launcher default (``host``).
+    :param host_ports: Guest-to-host TCP port allowlist for the ``host``
+        network mode - see :func:`_resolve_microsandbox_host_ports`.
     :returns: A factory producing parameterized microsandbox launchers.
     """
 
@@ -1449,6 +1455,7 @@ def _microsandbox_launcher_factory(
             memory_mib=memory_mib,
             idle_timeout_s=idle_timeout_s,
             network=network,
+            host_ports=host_ports,
         )
 
     return _build
@@ -1477,6 +1484,49 @@ def _parse_microsandbox_idle_timeout_s(raw: dict[str, object]) -> int | None:
             "non-negative integer (0 disables idle draining)"
         )
     return value
+
+
+def _resolve_microsandbox_host_ports(raw: dict[str, object], server_url: str) -> list[int]:
+    """
+    Resolve the guest-to-host TCP port allowlist for managed microsandbox VMs.
+
+    Managed VMs run untrusted agent code on the SAME machine as the server,
+    so their default ``host`` network mode is scoped to explicit ports rather
+    than the whole host: the port of *server_url* (the dial-back path) plus
+    any operator-listed ``sandbox.microsandbox.host_ports`` (e.g. a local LLM
+    gateway). Only the launcher's managed path receives this list - the CLI
+    bootstrap constructs the launcher without one and keeps full host access
+    (its OAuth relay port isn't known at creation time).
+
+    :param raw: The raw ``sandbox`` mapping.
+    :param server_url: The validated ``sandbox.server_url`` value.
+    :returns: De-duplicated port list, always containing the server port.
+    :raises ValueError: When ``host_ports`` is present but not a list of
+        integers in 1-65535, or the server URL carries no resolvable port.
+    """
+    from urllib.parse import urlsplit
+
+    split = urlsplit(server_url.strip())
+    server_port = split.port or {"http": 80, "https": 443}.get(split.scheme or "")
+    if server_port is None:
+        raise ValueError(
+            "server config 'sandbox.server_url' must carry a resolvable port "
+            "for the microsandbox provider (an explicit :port, or an "
+            "http/https scheme)"
+        )
+    ports = [server_port]
+    section = _parse_provider_section(raw, "microsandbox")
+    extra = section.get("host_ports") if section is not None else None
+    if extra is not None:
+        if not isinstance(extra, list) or not all(
+            isinstance(p, int) and not isinstance(p, bool) and 1 <= p <= 65535 for p in extra
+        ):
+            raise ValueError(
+                "server config 'sandbox.microsandbox.host_ports' must be a "
+                "list of TCP ports (1-65535), e.g. [8317]"
+            )
+        ports.extend(p for p in extra if p not in ports)
+    return ports
 
 
 def _parse_microsandbox_network(raw: dict[str, object]) -> str | None:

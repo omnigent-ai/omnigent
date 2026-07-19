@@ -4,13 +4,14 @@ Smoke test for the microsandbox sandbox provider.
 
 Drives the REAL
 :class:`~omnigent.onboarding.sandboxes.microsandbox.MicrosandboxSandboxLauncher`
-against a live local microVM to validate every primitive the managed-host /
+against a live local microVM to validate the primitives the managed-host /
 CLI-bootstrap flows rely on: prepare -> provision -> run (incl. the non-zero
 exit path and stderr surfacing) -> put + read-back -> stream_exec (combined
-output + exit code) -> keep_alive -> is_running -> forward_local_port (an
-in-guest connection reaching a local listener) -> stop + resume in place ->
-attach -> terminate (idempotent). This is the test that actually exercises
-the microsandbox SDK calls the launcher makes, end to end.
+output + exit code) -> exec_foreground (TTY) -> keep_alive -> is_running ->
+forward_local_port (an in-guest connection reaching a local listener) ->
+stop + resume in place -> attach -> terminate (idempotent). Edge conditions
+(split UTF-8, close-retry, relay races) live in the unit suite; the
+interactive in-sandbox OAuth login is not driven here.
 
 By default it boots from ``python:alpine`` (small, has the python3 the
 port-forward relay needs), so it needs NO pre-built omnigent host image - it
@@ -150,6 +151,10 @@ def main() -> int:
             "stream_exec merges stdout+stderr",
         )
         _check(failures, process.wait() == 5, "stream_exec wait returns exit code")
+
+        print("==> exec_foreground (TTY)")
+        rc = launcher.exec_foreground(sandbox_id, "printf 'fg says %s\\n' \"$TERM\"; exit 6")
+        _check(failures, rc == 6, "exec_foreground returns the exit code")
 
         print("==> keep_alive / is_running")
         launcher.keep_alive(sandbox_id)
