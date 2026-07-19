@@ -373,6 +373,11 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # and fail to mint a token — the runner tunnel is rejected with HTTP 401
         # even though the host authenticated fine.
         "DATABRICKS_AUTH_STORAGE",
+        # Optional executable command that returns a fresh Databricks bearer.
+        # The command is configuration, not a credential; host-spawned runners
+        # execute it on demand so Apps-proxy auth can refresh without receiving
+        # a static token or client secret.
+        "OMNIGENT_DATABRICKS_TOKEN_COMMAND",
         # Runtime config/data-dir selection. These are filesystem PATHS, not
         # secrets, so they're safe to propagate to the host owner's own
         # daemon/runner subprocesses. They MUST propagate so the whole local

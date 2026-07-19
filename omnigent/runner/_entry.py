@@ -12,7 +12,9 @@ import asyncio
 import contextlib
 import logging
 import os
+import shlex
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -40,6 +42,7 @@ _RUNNER_PREWARM_SPEC_PATH_ENV_VAR = "RUNNER_PREWARM_SPEC_PATH"
 # with the CLI/server/host) instead of a hard-coded placeholder.
 _RUNNER_VERSION = VERSION
 _RUNNER_CONFIG_HOME_ENV_VAR = "OMNIGENT_CONFIG_HOME"
+_DATABRICKS_TOKEN_COMMAND_ENV_VAR = "OMNIGENT_DATABRICKS_TOKEN_COMMAND"
 _DEFAULT_RUNNER_IDLE_TIMEOUT_S = 60 * 60
 _RUNNER_IDLE_MONITOR_MAX_POLL_INTERVAL_S = 60.0
 # Backstop on how long a graceful (idle-reaper) shutdown waits for the tunnel
@@ -361,13 +364,14 @@ def _make_auth_token_factory(
     """Build a callable that mints fresh auth tokens.
 
     Resolution order:
-      1. Host's current bearer, when injected for runner bootstrap. This is
+      1. Explicit token command from ``OMNIGENT_DATABRICKS_TOKEN_COMMAND``.
+      2. Host's current bearer, when injected for runner bootstrap. This is
          used until rejection; local refreshable auth resolves lazily.
-      2. Host-delegated runner token, when the host launch marker and
+      3. Host-delegated runner token, when the host launch marker and
          binding token are present.
-      3. Stored OIDC token from ``~/.omnigent/auth_tokens.json``
+      4. Stored OIDC token from ``~/.omnigent/auth_tokens.json``
          (populated by ``omnigent login``), keyed by ``server_url``.
-      4. Databricks OAuth token (refreshed via the SDK) — host-keyed
+      5. Databricks OAuth token (refreshed via the SDK) — host-keyed
          when a Databricks Apps pointer record is stored for
          ``server_url`` (``omnigent login <apps-url>``), ambient
          otherwise.
@@ -417,6 +421,23 @@ def _make_auth_token_factory(
         _DatabricksBearerAuth,
         _resolve_databricks_auth,
     )
+
+    resolved_server_url = server_url or os.environ.get(_RUNNER_SERVER_URL_ENV_VAR)
+    token_command = os.environ.get(_DATABRICKS_TOKEN_COMMAND_ENV_VAR, "").strip()
+
+    if token_command:
+        def _command_token() -> str | None:
+            result = subprocess.run(
+                shlex.split(token_command),
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            token = result.stdout.strip()
+            return token if result.returncode == 0 and token else None
+
+        return _command_token
 
     # Prefer the host-launched runner's owner-bound capability so user
     # credentials stay out of the runner and credential discovery is skipped.

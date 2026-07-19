@@ -1905,6 +1905,23 @@ def test_build_runner_env_preserves_ambient_databricks_profile() -> None:
     assert env["DATABRICKS_CONFIG_FILE"] == "/tmp/databrickscfg"
 
 
+async def test_build_runner_env_propagates_databricks_token_command() -> None:
+    """A non-secret refresh command reaches host-spawned runners."""
+    env = _build_runner_env(
+        {
+            "PATH": "/usr/bin:/bin",
+            "OMNIGENT_DATABRICKS_TOKEN_COMMAND": "/opt/bin/fresh-token",
+        },
+        server_url="http://server",
+        runner_id="runner_abc",
+        binding_token="tok",
+        workspace="/ws",
+        parent_pid=42,
+    )
+
+    assert env["OMNIGENT_DATABRICKS_TOKEN_COMMAND"] == "/opt/bin/fresh-token"
+
+
 def test_build_runner_env_propagates_data_dir_paths_not_db_uri() -> None:
     """
     The runtime data/config-dir PATH vars propagate to runners so the whole
