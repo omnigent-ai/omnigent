@@ -105,7 +105,7 @@ def load_or_create_host_identity(
 
     cfg: dict[str, object] = {}
     if path.exists():
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             cfg = yaml.safe_load(f) or {}
 
     host_section = cfg.get("host")
@@ -121,7 +121,7 @@ def load_or_create_host_identity(
 
     cfg["host"] = {"host_id": identity.host_id, "name": identity.name}
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=True)
 
     return identity

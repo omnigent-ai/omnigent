@@ -163,7 +163,7 @@ def _read_local_server_pid_file() -> tuple[int, int] | None:
     if not _LOCAL_SERVER_PID_PATH.exists():
         return None
     try:
-        lines = _LOCAL_SERVER_PID_PATH.read_text().strip().splitlines()
+        lines = _LOCAL_SERVER_PID_PATH.read_text(encoding="utf-8").strip().splitlines()
         if len(lines) < 2:
             return None
         return int(lines[0]), int(lines[1])
@@ -247,7 +247,7 @@ def _read_local_server_log_path() -> Path | None:
         record, or no server) or unreadable.
     """
     try:
-        text = _LOCAL_SERVER_LOG_REF_PATH.read_text().strip()
+        text = _LOCAL_SERVER_LOG_REF_PATH.read_text(encoding="utf-8").strip()
     except OSError:
         return None
     return Path(text) if text else None
@@ -288,7 +288,7 @@ def _read_local_server_sig() -> str | None:
         ``None`` if the sidecar is absent (legacy server) or unreadable.
     """
     try:
-        sig = _LOCAL_SERVER_SIG_PATH.read_text().strip()
+        sig = _LOCAL_SERVER_SIG_PATH.read_text(encoding="utf-8").strip()
     except OSError:
         return None
     return sig or None
@@ -889,7 +889,7 @@ def _raise_local_server_failed(base_url: str, log_path: Path) -> None:
     :raises click.ClickException: Always.
     """
     try:
-        lines = log_path.read_text(errors="replace").splitlines()
+        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
         tail = "\n".join(lines[-50:]) if lines else "(empty log file)"
     except OSError as exc:
         tail = f"(could not read log file: {exc})"

@@ -427,7 +427,9 @@ def _write_cursor_hooks(cwd: str, hook_script_path: str, server_url: str, sessio
     from omnigent.native_policy_hook import policy_hook_wrapper_script
 
     wrapper = hooks_dir / "omnigent-hook.sh"
-    wrapper.write_text(policy_hook_wrapper_script(server_url, session_id, hook_script_path))
+    wrapper.write_text(
+        policy_hook_wrapper_script(server_url, session_id, hook_script_path), encoding="utf-8"
+    )
     wrapper.chmod(0o700)
     command = str(wrapper)
     config = {
@@ -441,7 +443,7 @@ def _write_cursor_hooks(cwd: str, hook_script_path: str, server_url: str, sessio
             ]
         },
     }
-    hooks_file.write_text(json.dumps(config, indent=2))
+    hooks_file.write_text(json.dumps(config, indent=2), encoding="utf-8")
     return hooks_file
 
 

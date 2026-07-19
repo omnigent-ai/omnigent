@@ -124,13 +124,13 @@ def load_or_create_runner_id(path: Path) -> str:
     :raises RuntimeError: If the cache file exists but is empty.
     """
     if path.exists():
-        runner_id = path.read_text().strip()
+        runner_id = path.read_text(encoding="utf-8").strip()
         if not runner_id:
             raise RuntimeError(f"runner id file is empty: {path}")
         return runner_id
     path.parent.mkdir(parents=True, exist_ok=True)
     runner_id = f"runner_{uuid.uuid4().hex}"
-    path.write_text(runner_id)
+    path.write_text(runner_id, encoding="utf-8")
     return runner_id
 
 

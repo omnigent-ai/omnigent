@@ -400,7 +400,7 @@ def _index_from_uv_config() -> str:
 
     for path in (_user_config_base() / "uv" / "uv.toml", Path("/etc/uv/uv.toml")):
         try:
-            data = tomllib.loads(path.read_text())
+            data = tomllib.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
         legacy = data.get("index-url")
@@ -697,7 +697,7 @@ def _read_cache() -> _CacheEntry | None:
         JSON, otherwise ``None``.
     """
     try:
-        raw = _CACHE_FILE.read_text()
+        raw = _CACHE_FILE.read_text(encoding="utf-8")
         data = json.loads(raw)
         return _CacheEntry(
             last_check_epoch=float(data["last_check_epoch"]),

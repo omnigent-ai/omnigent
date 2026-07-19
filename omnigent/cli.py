@@ -77,7 +77,7 @@ def _load_config(path: str | None) -> dict[str, Any]:  # type: ignore[explicit-a
     """
     if path is None:
         return {}
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         return yaml.safe_load(f) or {}
 
 
@@ -252,7 +252,7 @@ def _migrate_legacy_state_dir() -> None:
     legacy_pid_file = legacy_src / "host.pid"
     if legacy_pid_file.exists():
         try:
-            first_line = legacy_pid_file.read_text().strip().splitlines()[0]
+            first_line = legacy_pid_file.read_text(encoding="utf-8").strip().splitlines()[0]
             legacy_pid = int(first_line)
         except (ValueError, OSError, IndexError):
             legacy_pid = None
@@ -515,7 +515,7 @@ def _peek_default_agent_harness(target: str) -> str | None:
     if not path.is_file():
         return None
     try:
-        raw = yaml.safe_load(path.read_text()) or {}
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     except (OSError, yaml.YAMLError):
         return None
     if not isinstance(raw, dict):
@@ -801,7 +801,7 @@ def _save_global_config(  # type: ignore[explicit-any]
         cfg.pop(key, None)
     path = _effective_global_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=True)
 
 
@@ -874,7 +874,7 @@ def _save_local_config(
     for key in unset_keys:
         cfg.pop(key, None)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=True)
 
 
@@ -1919,7 +1919,7 @@ def _read_daemon_record(path: Path) -> _HostDaemonRecord | None:
     :returns: Parsed daemon record, or ``None`` if unreadable or malformed.
     """
     try:
-        raw = json.loads(path.read_text())
+        raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
     if not isinstance(raw, dict):
@@ -1936,7 +1936,7 @@ def _write_daemon_record(record: _HostDaemonRecord) -> None:
     """
     path = _daemon_record_path(record.target)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(asdict(record), indent=2, sort_keys=True) + "\n")
+    path.write_text(json.dumps(asdict(record), indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def _delete_daemon_record(record: _HostDaemonRecord) -> None:
@@ -2050,7 +2050,7 @@ def _load_existing_host_id() -> str | None:
         candidate_paths.append(CONFIG_PATH)
     for path in candidate_paths:
         try:
-            raw = yaml.safe_load(path.read_text()) if path.exists() else None
+            raw = yaml.safe_load(path.read_text(encoding="utf-8")) if path.exists() else None
         except (OSError, yaml.YAMLError):
             continue
         if not isinstance(raw, dict):
@@ -2297,7 +2297,7 @@ def _persist_spawned_daemon(
             config_sig=config_sig,
         )
     )
-    _HOST_PID_PATH.write_text(f"{spawned.pid}\n{target}\n")
+    _HOST_PID_PATH.write_text(f"{spawned.pid}\n{target}\n", encoding="utf-8")
 
 
 def _foreground_daemon_record(
@@ -2517,7 +2517,7 @@ def _read_host_pid_file() -> tuple[int, str] | None:
     if not _HOST_PID_PATH.exists():
         return None
     try:
-        lines = _HOST_PID_PATH.read_text().strip().splitlines()
+        lines = _HOST_PID_PATH.read_text(encoding="utf-8").strip().splitlines()
         if len(lines) < 2:
             return None
         return int(lines[0]), lines[1]
@@ -4330,7 +4330,7 @@ def _resolve_bundle_env_vars(source: Path) -> dict[str, str]:
     # ── config.yaml ──────────────────────────────────
     config_path = source / "config.yaml"
     if config_path.exists():
-        raw = yaml.safe_load(config_path.read_text())
+        raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
         if isinstance(raw, dict):
             changed = _expand_config_env_vars(raw, expand_env_vars)
             if changed:
@@ -4346,7 +4346,7 @@ def _resolve_bundle_env_vars(source: Path) -> dict[str, str]:
     mcp_dir = source / "tools" / "mcp"
     if mcp_dir.is_dir():
         for yaml_file in sorted(mcp_dir.glob("*.yaml")):
-            raw = yaml.safe_load(yaml_file.read_text())
+            raw = yaml.safe_load(yaml_file.read_text(encoding="utf-8"))
             if not isinstance(raw, dict):
                 continue
             changed = False
@@ -5063,7 +5063,7 @@ def _bundled_agent_brain_harness(name: str) -> str | None:
     if not config_path.is_file():
         return None
     try:
-        raw = yaml.safe_load(config_path.read_text()) or {}
+        raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     except (OSError, yaml.YAMLError):
         return None
     if not isinstance(raw, dict):
@@ -6408,7 +6408,7 @@ def _materialize_harness_launcher_file(
     }
     if canonical in _OS_ENV_HARNESSES:
         raw["os_env"] = {"type": "caller_process", "sandbox": {"type": "none"}}
-    yaml_path.write_text(yaml.safe_dump(raw, default_flow_style=False))
+    yaml_path.write_text(yaml.safe_dump(raw, default_flow_style=False), encoding="utf-8")
     return yaml_path
 
 
@@ -10839,7 +10839,7 @@ def _qwen_auth_configured() -> bool:
     settings = Path.home() / ".qwen" / "settings.json"
     if settings.is_file():
         try:
-            data = json.loads(settings.read_text())
+            data = json.loads(settings.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return False
         if isinstance(data, dict):

@@ -304,7 +304,7 @@ def read_codex_config_model(bridge_dir: Path) -> str | None:
     """
     config_path = codex_home_for_bridge_dir(bridge_dir) / "config.toml"
     try:
-        data = tomllib.loads(config_path.read_text())
+        data = tomllib.loads(config_path.read_text(encoding="utf-8"))
     except (OSError, tomllib.TOMLDecodeError):
         return None
     model = data.get("model")

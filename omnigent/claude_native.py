@@ -1801,7 +1801,7 @@ def _materialize_claude_agent_spec(tmpdir: Path) -> Path:
         # the native CLI already runs unsandboxed on the user's workspace.
         "terminals": native_shell_terminal_spec(),
     }
-    yaml_path.write_text(yaml.safe_dump(raw, sort_keys=False))
+    yaml_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
     return yaml_path
 
 

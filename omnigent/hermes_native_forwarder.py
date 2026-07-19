@@ -147,7 +147,7 @@ def _read_model_from_hermes_config(bridge_dir: Path) -> str | None:
         try:
             import yaml
 
-            data = yaml.safe_load(config_path.read_text()) or {}
+            data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
             model = data.get("model")
             if isinstance(model, str) and model:
                 return model

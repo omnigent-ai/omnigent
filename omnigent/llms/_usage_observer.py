@@ -105,7 +105,7 @@ def set_current_test(nodeid: str | None) -> None:
         # Atomic publish: a subprocess reading mid-update sees either
         # the previous nodeid or the new one, never a truncated line.
         tmp = path.with_name(f"{path.name}.tmp{os.getpid()}")
-        tmp.write_text(nodeid)
+        tmp.write_text(nodeid, encoding="utf-8")
         os.replace(tmp, path)
     except OSError:
         logger.exception("failed to update current-test sidecar at %s", path)
@@ -209,7 +209,7 @@ def _current_test_from_sidecar() -> str | None:
     if path is None:
         return None
     try:
-        text = path.read_text().strip()
+        text = path.read_text(encoding="utf-8").strip()
     except OSError:
         return None
     # An empty file carries no nodeid; normalize to None so the caller
@@ -306,7 +306,7 @@ def _write_records() -> None:
             # Path is per-pid, so only same-process threads contend on
             # the temp name; the lock serializes them.
             tmp = path.with_name(path.name + ".tmp")
-            tmp.write_text(payload)
+            tmp.write_text(payload, encoding="utf-8")
             os.replace(tmp, path)
         except OSError:
             logger.exception("failed to write token-usage records to %s", path)

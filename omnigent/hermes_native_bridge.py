@@ -287,7 +287,7 @@ def _load_user_hermes_config() -> dict:
     try:
         import yaml
 
-        full = yaml.safe_load(user_config.read_text()) or {}
+        full = yaml.safe_load(user_config.read_text(encoding="utf-8")) or {}
         return {k: v for k, v in full.items() if k in _USER_CONFIG_KEYS}
     except Exception:  # noqa: BLE001
         _logger.debug("Failed to load user Hermes config at %s", user_config, exc_info=True)
@@ -345,7 +345,9 @@ def write_policy_hook_config(
     from omnigent.native_policy_hook import policy_hook_wrapper_script
 
     wrapper = hermes_home / "omnigent-policy-hook.sh"
-    wrapper.write_text(policy_hook_wrapper_script(server_url, session_id, hook_script_path))
+    wrapper.write_text(
+        policy_hook_wrapper_script(server_url, session_id, hook_script_path), encoding="utf-8"
+    )
     wrapper.chmod(0o700)
 
     # Write bridge.json with an auth token for serve-mcp (idempotent).
@@ -383,7 +385,7 @@ def write_policy_hook_config(
     }
 
     config_path = hermes_home / "config.yaml"
-    config_path.write_text(json.dumps(config, indent=2) + "\n")
+    config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
 
     # Copy user's .env (API keys).
     user_env = Path.home() / ".hermes" / ".env"
@@ -402,7 +404,7 @@ def write_policy_hook_config(
             {"event": "pre_tool_call", "command": str(wrapper)},
         ],
     }
-    allowlist_path.write_text(json.dumps(allowlist_data, indent=2) + "\n")
+    allowlist_path.write_text(json.dumps(allowlist_data, indent=2) + "\n", encoding="utf-8")
 
     return hermes_home
 

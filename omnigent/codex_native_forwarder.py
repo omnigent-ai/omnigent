@@ -5882,7 +5882,7 @@ def _read_compacted_history(rollout_path: Path) -> dict[str, object] | None:
     :returns: Dict with ``replacement_history`` and ``window_id``, or ``None``.
     """
     last_compacted = None
-    with rollout_path.open() as f:
+    with rollout_path.open(encoding="utf-8") as f:
         for line in f:
             try:
                 entry = json.loads(line)

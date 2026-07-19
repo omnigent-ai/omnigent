@@ -336,7 +336,9 @@ def _write_new_mcp_server(root: Path, body: UpsertMCPServerRequest) -> None:
     mcp_dir = root / "tools" / "mcp"
     mcp_dir.mkdir(parents=True, exist_ok=True)
     path = mcp_dir / f"{body.name}.yaml"
-    path.write_text(yaml.safe_dump(_body_to_file_yaml(body, {}), sort_keys=False))
+    path.write_text(
+        yaml.safe_dump(_body_to_file_yaml(body, {}), sort_keys=False), encoding="utf-8"
+    )
 
 
 def _replace_mcp_server(
@@ -366,7 +368,7 @@ def _delete_mcp_server(location: _McpLocation, target_name: str) -> None:
     tools = config.get("tools")
     if isinstance(tools, dict):
         tools.pop(target_name, None)
-    location.path.write_text(yaml.safe_dump(config, sort_keys=False))
+    location.path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
 
 
 def _find_mcp_location(root: Path, name: str) -> _McpLocation | None:
@@ -419,7 +421,7 @@ def _write_inline_server(
     if old_name is not None and old_name != body.name:
         tools.pop(old_name, None)
     tools[body.name] = _body_to_inline_yaml(body, existing)
-    config_path.write_text(yaml.safe_dump(config, sort_keys=False))
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
 
 
 def _body_to_file_yaml(

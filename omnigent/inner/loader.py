@@ -105,7 +105,7 @@ def load_agent_def(
     """
     if isinstance(path_or_dict, (str, Path)):
         path = Path(path_or_dict)
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             data = yaml.load(f, Loader=_OmnigentYamlLoader)
         instructions_root: Path | None = path.parent
     else:

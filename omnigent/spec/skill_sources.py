@@ -121,7 +121,7 @@ def resolve_harness_skills(ctx: SkillSourceContext, harness: str | None) -> list
 def _read_json(path: Path) -> dict[str, Any] | None:
     """Best-effort JSON read; ``None`` on missing/unreadable/non-dict."""
     try:
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     return data if isinstance(data, dict) else None
