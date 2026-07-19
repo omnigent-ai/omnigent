@@ -62,6 +62,7 @@ jobs:
           uv run pytest
           tests/inner/test_proc_and_platform.py
           tests/runtime/test_process_manager.py
+          tests/test_file_encoding.py
           -p no:cacheprovider -q
 
       - name: Broader unit sweep (non-blocking)

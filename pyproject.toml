@@ -427,12 +427,6 @@ extend-exclude = [
 ]
 
 [tool.ruff.lint]
-# PLW1514 (unspecified-encoding) is still a preview rule; opt into it
-# explicitly so every open()/read_text()/write_text() must name an encoding
-# (Windows defaults to cp1252 and mojibakes UTF-8), without enabling the rest
-# of Ruff's preview rules.
-preview = true
-explicit-preview-rules = true
 # ``E``/``F``  — pycodestyle + pyflakes baseline
 # ``I``        — import sorting
 # ``UP``       — pyupgrade (modernize syntax)
@@ -446,7 +440,7 @@ explicit-preview-rules = true
 # ``PIE``      — flake8-pie (misc correctness + style)
 # ``RUF``      — ruff-specific (sorted ``__all__``, dangling asyncio
 #                tasks, unused noqa, ...)
-select = ["E", "F", "I", "UP", "ARG", "BLE", "B", "SIM", "RET", "C4", "PIE", "RUF", "PLW1514"]
+select = ["E", "F", "I", "UP", "ARG", "BLE", "B", "SIM", "RET", "C4", "PIE", "RUF"]
 ignore = [
     # ARG003 (unused class-method args): too noisy on ABC-subclass signatures
     # where the arg is required by the interface contract.
