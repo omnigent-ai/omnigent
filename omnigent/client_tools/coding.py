@@ -16,6 +16,7 @@ Used by ``omnigent chat --tools coding`` and the terminal TUI.
 from __future__ import annotations
 
 import glob as glob_mod
+import locale
 import os
 import subprocess
 import time
@@ -55,6 +56,24 @@ def _truncate(output: str) -> str:
     )
 
 
+def _read_detecting_encoding(path: Path) -> tuple[str, str]:
+    """Read *path* as text, detecting UTF-8 versus the locale encoding.
+
+    Returns ``(text, encoding)`` — the codec the file actually decoded under.
+    An ``Edit`` write-back reuses that codec so it never produces a
+    mixed-encoding file (the failure mode of blindly writing UTF-8 into a
+    cp1252 file, or vice versa). UTF-8 is tried first; on failure we fall back
+    to the platform locale encoding with ``surrogateescape`` so arbitrary bytes
+    still round-trip losslessly. Both branches read in text mode so newline
+    handling matches the write-back (no ``\\r`` doubling on CRLF files).
+    """
+    try:
+        return path.read_text(encoding="utf-8"), "utf-8"
+    except UnicodeDecodeError:
+        enc = locale.getpreferredencoding(False)
+        return path.read_text(encoding=enc, errors="surrogateescape"), enc
+
+
 # ── @tool functions ──────────────────────────────────────
 
 
@@ -78,8 +97,8 @@ def Read(
             for large files.
     """
     try:
-        text = Path(file_path).read_text(encoding="utf-8", errors="surrogateescape")
-    except (OSError, UnicodeDecodeError) as exc:
+        text, _ = _read_detecting_encoding(Path(file_path))
+    except OSError as exc:
         return _truncate(f"Error reading {file_path}: {exc}")
     lines = text.splitlines()
     start_line = offset if offset is not None else 1
@@ -105,7 +124,14 @@ def Write(file_path: str, content: str) -> str:
     target = Path(file_path)
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8", errors="surrogateescape")
+        # New content is authored by the model as real Unicode, so a brand-new
+        # file is always strict UTF-8. Validate before writing so an unencodable
+        # character reports cleanly instead of truncating the target (a caller
+        # error, not silently mangled).
+        content.encode("utf-8")
+        target.write_text(content, encoding="utf-8")
+    except UnicodeError as exc:
+        return _truncate(f"Error writing {target}: content is not valid UTF-8 ({exc})")
     except OSError as exc:
         return _truncate(f"Error writing {target}: {exc}")
     return _truncate(f"Successfully wrote {target}")
@@ -132,7 +158,7 @@ def Edit(
     """
     target = Path(file_path)
     try:
-        text = target.read_text(encoding="utf-8", errors="surrogateescape")
+        text, encoding = _read_detecting_encoding(target)
     except OSError as exc:
         return _truncate(f"Error reading {target}: {exc}")
     count = text.count(old_string)
@@ -149,7 +175,18 @@ def Edit(
         else text.replace(old_string, new_string, 1)
     )
     try:
-        target.write_text(result, encoding="utf-8", errors="surrogateescape")
+        # Reuse the codec the file was read under so the edit never mixes
+        # encodings within one file; surrogateescape lets bytes the original
+        # carried round-trip. Validate encodability BEFORE writing so a
+        # non-representable new character (e.g. an emoji into a cp1252 file)
+        # leaves the original file intact instead of truncating it.
+        result.encode(encoding, errors="surrogateescape")
+        target.write_text(result, encoding=encoding, errors="surrogateescape")
+    except UnicodeError as exc:
+        return _truncate(
+            f"Error writing {target}: new text has a character not encodable "
+            f"as {encoding} ({exc}); save the file as UTF-8 to use it"
+        )
     except OSError as exc:
         return _truncate(f"Error writing {target}: {exc}")
     replacements = count if replace_all else 1
