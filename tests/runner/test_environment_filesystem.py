@@ -1714,3 +1714,41 @@ async def test_delete_directory_junction_removes_link_not_target(tmp_path: Path)
     await fs.delete("jx", recursive=True)
     assert not junction.exists()
     assert target.is_dir() and (target / "keep.txt").exists()
+
+
+@pytest.mark.asyncio
+async def test_delete_broken_symlink_succeeds(tmp_path: Path) -> None:
+    """A broken symlink (its target is gone) is still deletable: delete keys off
+    ``os.lstat`` — ``os.stat`` would follow the link, fail, and report it as
+    'missing', leaving the dangling link stuck forever."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    link = ws / "dangling"
+    try:
+        link.symlink_to(ws / "does_not_exist")
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"cannot create symlink: {exc}")
+    assert link.is_symlink() and not link.exists()  # broken by construction
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", cwd=str(ws), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    fs = CallerProcessFilesystem(os_env)
+    await fs.delete("dangling")
+    assert not link.is_symlink()
+
+
+@pytest.mark.asyncio
+async def test_write_entry_path_is_forward_slash_for_nested(tmp_path: Path) -> None:
+    """The write result's entry path/id use '/' even for a nested path.
+    ``Path.relative_to`` renders '\\' on Windows; ``_entry_from_stat`` normalizes
+    centrally so every entry the API returns is '/'-separated."""
+    ws = tmp_path / "ws"
+    (ws / "sub" / "dir").mkdir(parents=True)
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", cwd=str(ws), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    fs = CallerProcessFilesystem(os_env)
+    result = await fs.write("sub/dir/f.py", b"x")
+    assert result.entry.path == "sub/dir/f.py"
+    assert "\\" not in result.entry.path
+    assert "\\" not in result.entry.id

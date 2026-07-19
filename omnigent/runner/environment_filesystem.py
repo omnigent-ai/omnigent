@@ -230,6 +230,10 @@ def _entry_from_stat(
     :param relative: Path relative to root.
     :returns: The filesystem entry.
     """
+    # The API contract, glob logic, and web UI all use '/'. ``relative`` may
+    # arrive with OS separators (e.g. ``Path.relative_to`` renders '\' on
+    # Windows), so normalize here — the single point every entry passes through.
+    relative = relative.replace(os.sep, "/")
     try:
         st = full_path.stat()
     except OSError:
@@ -767,24 +771,37 @@ class CallerProcessFilesystem:
             entry=entry,
         )
 
-    async def _stat_via_shell(self, validated: str) -> tuple[int, bool]:
-        """Stat a path via the sandboxed helper.
+    async def _lstat_kind_via_shell(self, validated: str) -> tuple[bool, bool, int]:
+        """Classify a path via ``os.lstat`` (does NOT follow symlinks).
+
+        Returns ``(exists, is_real_dir, size)``. A broken symlink/junction
+        reports ``exists=True`` (the link is present) with ``is_real_dir=False``
+        so delete removes the link instead of following it — unlike ``os.stat``,
+        which raises on a broken link and would report the link as missing. Only
+        a genuinely absent path reports ``exists=False``. ``size`` is the link's
+        own ``st_size`` (used as ``bytes_deleted`` for non-directory targets).
 
         :param validated: Validated relative path.
-        :returns: Tuple of (size_bytes, is_directory).
-        :raises FilesystemPathNotFound: If the path does not exist.
+        :raises FilesystemPathNotFound: If the helper itself errors.
         """
         import json as _json
 
-        # Embed the path as a Python literal via json.dumps and shell-quote
-        # the entire script so the caller-controlled path is never interpreted
-        # by the shell; see stat() for the full rationale.
+        # os.lstat does not follow the link; a reparse point (symlink OR Windows
+        # junction) is "not a real dir" so it is deleted as a link. st_mode alone
+        # misses junctions, so also key off the reparse file attribute (0 on
+        # POSIX, where S_ISLNK covers symlinks).
         _script = "\n".join(
             [
                 "import os, json, stat as S",
                 f"p = {_json.dumps(validated)}",
-                "s = os.stat(p)",
-                "print(json.dumps({'s': s.st_size, 'd': S.S_ISDIR(s.st_mode)}))",
+                "try:",
+                "    st = os.lstat(p)",
+                "    reparse = bool(getattr(st, 'st_file_attributes', 0)"
+                " & S.FILE_ATTRIBUTE_REPARSE_POINT) or S.S_ISLNK(st.st_mode)",
+                "    d = S.S_ISDIR(st.st_mode) and not reparse",
+                "    print(json.dumps({'e': True, 'd': d, 's': st.st_size}))",
+                "except FileNotFoundError:",
+                "    print(json.dumps({'e': False, 'd': False, 's': 0}))",
             ]
         )
         result = await _run_os_env_async(
@@ -796,10 +813,8 @@ class CallerProcessFilesystem:
         try:
             info = _json.loads(result.get("stdout", "{}"))
         except _json.JSONDecodeError as exc:
-            raise FilesystemPathNotFound(
-                f"Path {validated!r} not found",
-            ) from exc
-        return info.get("s", 0), info.get("d", False)
+            raise FilesystemPathNotFound(f"Path {validated!r} not found") from exc
+        return bool(info.get("e", False)), bool(info.get("d", False)), int(info.get("s", 0))
 
     async def _check_dir_empty(self, validated: str) -> bool:
         """Check if a directory is empty via the sandboxed helper.
@@ -845,7 +860,11 @@ class CallerProcessFilesystem:
         if not validated:
             raise InvalidPath("Cannot delete the environment root")
 
-        size, is_dir = await self._stat_via_shell(validated)
+        # lstat, not stat: a broken symlink/junction still exists as a link and
+        # must be deletable, where os.stat would follow it and report "missing".
+        exists, is_dir, size = await self._lstat_kind_via_shell(validated)
+        if not exists:
+            raise FilesystemPathNotFound(f"Path {path!r} not found")
 
         if is_dir and not recursive and await self._check_dir_empty(validated):
             raise DirectoryNotEmpty(
