@@ -6447,3 +6447,30 @@ def test_tool_use_result_regression_old_flatten_would_crash_resume() -> None:
     )
     assert len(records) == 1
     assert json.loads(records[0]["toolUseResult"]) == output
+
+
+def test_resolve_claude_native_launch_model_maps_custom_tier_on_subscription() -> None:
+    """
+    The custom ``sonnet_5`` picker tier is not a Claude Code ``--model``
+    alias, so on the plain-subscription path (no ucode/workspace config) it
+    resolves to the concrete ``claude-sonnet-5`` id. Family aliases and a
+    missing override pass through unchanged, and the ucode/workspace path
+    (``has_ucode_config=True``) leaves the value untouched because the
+    concrete gateway id is pinned separately via
+    ``ANTHROPIC_CUSTOM_MODEL_OPTION``.
+    """
+    resolve = claude_native.resolve_claude_native_launch_model
+
+    # Plain subscription (no ucode config): the bare custom-slot key is
+    # spelled as the concrete Anthropic id Claude Code actually accepts.
+    assert (
+        resolve("sonnet_5", has_ucode_config=False)
+        == claude_native._CLAUDE_CUSTOM_TIER_FALLBACK_MODEL
+        == "claude-sonnet-5"
+    )
+    # ucode/workspace launch: left unchanged (gateway id pinned elsewhere).
+    assert resolve("sonnet_5", has_ucode_config=True) == "sonnet_5"
+    # Family aliases are real Claude Code CLI aliases: pass through untouched.
+    assert resolve("sonnet", has_ucode_config=False) == "sonnet"
+    # No per-session override -> ``None`` passes through.
+    assert resolve(None, has_ucode_config=False) is None

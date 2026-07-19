@@ -5529,6 +5529,7 @@ async def _auto_create_claude_terminal(
     from omnigent.claude_native import (
         augment_claude_args,
         build_native_claude_terminal_env,
+        resolve_claude_native_launch_model,
         resolve_native_claude_config,
     )
 
@@ -5806,8 +5807,15 @@ async def _auto_create_claude_terminal(
         # Precedence: per-session ``/model`` override > agent-spec pin
         # (``executor.model``) > provider/ucode default. All three yield to an
         # explicit ``--model`` in the user's pass-through args (handled in the
-        # helper).
-        model_override=session_model_override
+        # helper). The custom "sonnet_5" picker tier is not a Claude Code
+        # ``--model`` alias, so on the plain-subscription path (no ucode
+        # config) it is resolved to the concrete ``claude-sonnet-5`` id;
+        # the ucode/workspace path pins the gateway id via
+        # ANTHROPIC_CUSTOM_MODEL_OPTION and is left unchanged.
+        model_override=resolve_claude_native_launch_model(
+            session_model_override,
+            has_ucode_config=claude_config is not None,
+        )
         or _claude_native_model_from_spec(agent_spec)
         or (claude_config.model if claude_config is not None else None),
         terminal_launch_args=session_launch_args,

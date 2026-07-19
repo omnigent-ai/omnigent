@@ -161,6 +161,14 @@ _ANTHROPIC_CUSTOM_MODEL_OPTION_ENV = "ANTHROPIC_CUSTOM_MODEL_OPTION"
 _ANTHROPIC_CUSTOM_MODEL_OPTION_NAME_ENV = "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME"
 _UCODE_CLAUDE_CUSTOM_TIER = "sonnet_5"
 _UCODE_CLAUDE_CUSTOM_TIER_LABEL = "Sonnet 5"
+# Concrete Anthropic model id the custom "sonnet_5" tier resolves to on a
+# plain Anthropic subscription (Claude Code's own login — no ucode/workspace
+# override). Claude Code accepts the family aliases (fable/opus/sonnet/haiku)
+# as ``--model`` values, but NOT the custom-slot key "sonnet_5"; passing it
+# bare makes ``claude --model sonnet_5`` fail with "Model 'sonnet_5' not
+# found". The ucode/workspace path instead pins the concrete gateway id via
+# ANTHROPIC_CUSTOM_MODEL_OPTION and is left untouched.
+_CLAUDE_CUSTOM_TIER_FALLBACK_MODEL = "claude-sonnet-5"
 _DEFAULT_UCODE_AUTH_REFRESH_INTERVAL_MS = 900_000
 _SESSION_LABELS = {
     "omnigent.ui": "terminal",
@@ -333,6 +341,38 @@ def build_native_claude_terminal_env(
                 "Claude Code via the helper, not the environment."
             )
     return terminal_env
+
+
+def resolve_claude_native_launch_model(
+    model_override: str | None,
+    *,
+    has_ucode_config: bool,
+) -> str | None:
+    """
+    Resolve a claude-native picker tier key to a concrete ``--model`` value.
+
+    Family aliases (``fable`` / ``opus`` / ``sonnet`` / ``haiku``) and any
+    fully-qualified Claude id pass through unchanged — Claude Code resolves
+    those natively. The one exception is the custom
+    :data:`_UCODE_CLAUDE_CUSTOM_TIER` (``"sonnet_5"``) picker row: it is
+    Claude Code's single custom ``/model`` slot key, not a CLI alias, so a
+    plain Anthropic subscription launch must spell it as the concrete
+    Anthropic id or ``claude --model sonnet_5`` fails with "Model 'sonnet_5'
+    not found". When a ucode/workspace launch config is present
+    (``has_ucode_config``), the concrete gateway id is pinned separately via
+    ``ANTHROPIC_CUSTOM_MODEL_OPTION`` and the value is left unchanged so the
+    Databricks/ucode path is unaffected.
+
+    :param model_override: Persisted per-session model override / picker tier
+        key, e.g. ``"sonnet"`` or ``"sonnet_5"``. ``None`` passes through.
+    :param has_ucode_config: ``True`` when a provider/ucode launch config
+        resolved (Databricks or a configured provider); ``False`` for Claude
+        Code's own subscription login.
+    :returns: The concrete ``--model`` value to launch with.
+    """
+    if model_override == _UCODE_CLAUDE_CUSTOM_TIER and not has_ucode_config:
+        return _CLAUDE_CUSTOM_TIER_FALLBACK_MODEL
+    return model_override
 
 
 def _mark_startup_step(
