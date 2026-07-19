@@ -28,10 +28,17 @@ from tests._encoding_scan import ALLOWLIST, find_violations, owned_packages, sca
 def test_no_unencoded_owned_text_io() -> None:
     """Structural guard: no owned open/read_text/write_text/os.fdopen/
     ConfigParser.read may omit an explicit ``encoding`` (receiver-independent;
-    catches what PLW1514 misses). Covers every first-party package shipped from
-    this repo — the ``omnigent`` app and the ``omnigent_client`` SDK.
+    catches what PLW1514 misses). Covers every first-party Python package shipped
+    from this repo (the ``omnigent`` app and the ``omnigent_client`` /
+    ``omnigent_ui_sdk`` SDKs).
     """
-    violations = [v for pkg in owned_packages() for v in scan_package(pkg, ALLOWLIST)]
+    packages = owned_packages()
+    for pkg in packages:
+        # Fail loudly if a configured root moved or emptied — otherwise the guard
+        # would silently pass by scanning nothing.
+        assert pkg.is_dir(), f"configured package root is missing: {pkg}"
+        assert any(pkg.rglob("*.py")), f"configured package root has no .py files: {pkg}"
+    violations = [v for pkg in packages for v in scan_package(pkg, ALLOWLIST)]
     assert not violations, "Unencoded text I/O (add encoding=...):\n" + "\n".join(violations)
 
 
@@ -125,10 +132,14 @@ _FLAGGED = [
     'from pathlib import Path\nPath("f").read_text()',
     'from pathlib import Path\nPath("f").write_text("x")',
     'import os\nos.fdopen(fd, "w")',
-    'from os import fdopen\nfdopen(fd, "w")',  # aliased/imported fdopen
+    'from os import fdopen\nfdopen(fd, "w")',  # imported fdopen
+    'from os import fdopen as fdo\nfdo(fd, "w")',  # aliased fdopen
     'import os as _o\n_o.fdopen(fd, "w")',  # aliased os module
     "import configparser\ncfg = configparser.ConfigParser()\ncfg.read(p)",
     "from configparser import ConfigParser as CP\nc = CP()\nc.read(p)",  # aliased ctor
+    "self.cfg = ConfigParser()\nself.cfg.read(p)",  # attribute-bound instance
+    'import gzip\ngzip.open(p, "rt")',  # gzip text mode needs encoding
+    'import bz2\nbz2.open(p, "wt")',  # bz2 text mode needs encoding
     'run("import os; data = open(p).read()")',  # embedded, plain string
     'run(f"exec(open({p!r}).read())")',  # embedded, f-string
     'run("""\n    import os\n    data = open(p).read()\n""")',  # embedded, indented
@@ -143,9 +154,14 @@ _CLEAN = [
     'import os\nos.open("f", 0)',  # low-level fd
     'import os\nos.fdopen(fd, "wb")',  # binary
     'import os\nos.fdopen(fd, "w", encoding="utf-8")',
-    'from os import fdopen\nfdopen(fd, "w", encoding="utf-8")',
+    'from os import fdopen as fdo\nfdo(fd, "wb")',  # aliased fdopen, binary
+    "import gzip\ngzip.open(p)",  # gzip default binary
+    'import gzip\ngzip.open(p, "rb")',  # gzip explicit binary
+    'import gzip\ngzip.open(p, "rt", encoding="utf-8")',  # gzip text + encoding
+    'import lzma\nlzma.open(p, "wb")',  # lzma binary
     "import configparser\ncfg = configparser.ConfigParser()\ncfg.read(p, encoding='locale')",
     "from configparser import ConfigParser as CP\nc = CP()\nc.read(p, encoding='utf-8')",
+    "self.cfg = ConfigParser()\nself.cfg.read(p, encoding='utf-8')",  # attr-bound, encoded
     "run(\"open(p, encoding='utf-8')\")",  # embedded, encoded
     'run("call open() to begin; then stop.")',  # prose: not parseable Python
     'run("// import fs;\\nfs.open(p);")',  # generated JS: not parseable Python
@@ -177,26 +193,33 @@ def _run_utf8_mode(script: str) -> subprocess.CompletedProcess[str]:
 
 @pytest.mark.windows_only
 def test_edit_preserves_cp1252_under_utf8_mode(tmp_path: Path) -> None:
-    """Editing a cp1252 file under UTF-8 Mode must not mix encodings.
+    """Editing a cp1252 file under UTF-8 Mode, INSERTING non-ASCII, must not mix
+    encodings.
 
     ``getpreferredencoding(False)`` returns ``"utf-8"`` in UTF-8 Mode even on a
-    cp1252 host, so a naive detection fallback would rewrite the existing ``é``
-    as UTF-8 (``\\xc3\\xa9``) beside cp1252 bytes. The coding tools fall back to
-    ``locale.getencoding()`` (the true cp1252), so the file stays single-codec.
+    cp1252 host, so a naive fallback reads the existing ``é`` as a surrogate and
+    writes the whole result UTF-8 — leaving one file with cp1252 ``\\xe9`` and a
+    UTF-8 ``ï`` (``\\xc3\\xaf``) side by side. The coding tools fall back to
+    ``locale.getencoding()`` (the true cp1252), so both stay cp1252.
+
+    The assertion is on the exact bytes: a no-op or the old broken fallback both
+    diverge from ``b"caf\\xe9 na\\xefve\\r\\n"`` (an ASCII->ASCII edit would not).
     """
     f = tmp_path / "latin.txt"
     f.write_bytes("caf\N{LATIN SMALL LETTER E WITH ACUTE} old\n".encode("cp1252"))
     result = _run_utf8_mode(
         f"""
         import sys, locale
+        from pathlib import Path
         assert sys.flags.utf8_mode, "expected PYTHONUTF8=1"
         assert locale.getpreferredencoding(False).lower() == "utf-8"  # the trap
         assert locale.getencoding().lower() == "cp1252"               # the truth
         from omnigent.client_tools.coding import Edit
         edit = getattr(Edit, "func", None) or getattr(Edit, "__wrapped__", Edit)
-        edit(file_path=r{str(f)!r}, old_string="old", new_string="new")
-        raw = __import__("pathlib").Path(r{str(f)!r}).read_bytes()
-        assert b"\\xe9" in raw and b"\\xc3\\xa9" not in raw, raw
+        msg = edit(file_path=r{str(f)!r}, old_string="old", new_string="na\\u00efve")
+        assert "Replaced" in msg, msg
+        raw = Path(r{str(f)!r}).read_bytes()
+        assert raw == b"caf\\xe9 na\\xefve\\r\\n", raw
         """
     )
     assert result.returncode == 0, result.stderr
