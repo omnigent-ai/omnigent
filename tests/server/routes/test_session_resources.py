@@ -2998,6 +2998,46 @@ class _ScriptedStreamingRunnerClient:
 
 
 @pytest.mark.asyncio
+async def test_relay_caches_and_publishes_runner_todos(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Runner todo events populate both the live stream and snapshot cache."""
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes.sessions import (
+        _relay_runner_stream,
+        _session_todos_cache,
+    )
+
+    session_id = "79b22ebd2309e48fdeb450c65611d51b"
+    todos = [
+        {"content": "Inspect", "status": "completed", "activeForm": "Inspect"},
+        {"content": "Implement", "status": "in_progress", "activeForm": "Implement"},
+    ]
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        session_stream,
+        "publish",
+        lambda conversation_id, event: published.append((conversation_id, event)),
+    )
+    client = _FakeStreamingRunnerClient(
+        [_sse_frame({"type": "session.todos", "todos": todos}), "data: [DONE]\n\n"]
+    )
+
+    _session_todos_cache.pop(session_id, None)
+    try:
+        await _relay_runner_stream(session_id, client, _ConversationStore())  # type: ignore[arg-type]
+        assert _session_todos_cache[session_id] == todos
+    finally:
+        _session_todos_cache.pop(session_id, None)
+
+    todo_events = [event for sid, event in published if sid == session_id]
+    assert len(todo_events) == 1
+    assert todo_events[0]["type"] == "session.todos"
+    assert todo_events[0]["conversation_id"] == session_id
+    assert todo_events[0]["todos"] == todos
+
+
+@pytest.mark.asyncio
 async def test_relay_persists_terminal_resource_created_from_runner() -> None:
     """The relay persists a ``resource_event`` for a runner-emitted create.
 

@@ -17,6 +17,7 @@ import pytest
 import yaml
 
 from omnigent import codex_native, codex_native_app_server, codex_native_forwarder
+from omnigent._codex_plan import todos_from_plan_update
 from omnigent._runner_startup import RunnerStartupProgress
 from omnigent.codex_native_bridge import (
     CodexNativeBridgeState,
@@ -5207,15 +5208,8 @@ def test_forwarder_skips_user_recovery_when_user_seen_live(tmp_path: Path) -> No
     assert fake_client.requests == []
 
 
-def test_forwarder_posts_codex_turn_plan_update(tmp_path: Path) -> None:
-    """
-    Codex ``turn/plan/updated`` notifications are visible in Omnigent web.
-
-    Plan mode emits plan state through a dedicated app-server
-    notification rather than assistant text. If the forwarder ignores
-    it, the terminal shows the plan while the web transcript appears to
-    skip straight to the final prompt.
-    """
+def test_forwarder_posts_codex_turn_plan_update_to_tasks_only(tmp_path: Path) -> None:
+    """Codex plan updates populate Tasks without duplicating chat history."""
     posted: list[dict[str, Any]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -5261,9 +5255,9 @@ def test_forwarder_posts_codex_turn_plan_update(tmp_path: Path) -> None:
 
     asyncio.run(run())
 
-    # The plan is mirrored to the todo panel and inline in the transcript.
-    assert len(posted) == 2
-    todos_post = next(p for p in posted if p["type"] == "external_session_todos")
+    assert len(posted) == 1
+    todos_post = posted[0]
+    assert todos_post["type"] == "external_session_todos"
     assert todos_post["data"]["todos"] == [
         {
             "content": "Inspect Codex plan events",
@@ -5282,36 +5276,16 @@ def test_forwarder_posts_codex_turn_plan_update(tmp_path: Path) -> None:
         },
     ]
 
-    message_post = next(p for p in posted if p["type"] == "external_conversation_item")
-    data = message_post["data"]
-    assert data["item_type"] == "message"
-    assert data["response_id"] == "codex_turn_123"
-    assert data["item_data"] == {
-        "role": "assistant",
-        "agent": "codex-native-ui",
-        "content": [
-            {
-                "type": "output_text",
-                "text": (
-                    "Plan:\n"
-                    "- [x] Inspect Codex plan events\n"
-                    "- [~] Mirror plans to web\n"
-                    "- [ ] Run checks"
-                ),
-            }
-        ],
-    }
-
 
 def test_plan_todos_from_update_maps_steps_and_statuses() -> None:
     """
-    ``_plan_todos_from_update`` maps Codex plan steps to the todo schema.
+    ``todos_from_plan_update`` maps Codex plan steps to the todo schema.
 
     Each step becomes ``{"content", "status", "activeForm"}`` with the
     status vocabulary normalized (``inProgress`` -> ``in_progress``) and the
     step text reused for ``activeForm`` since Codex has no gerund form.
     """
-    todos = codex_native_forwarder._plan_todos_from_update(
+    todos = todos_from_plan_update(
         {
             "plan": [
                 {"step": "Inspect", "status": "completed"},
@@ -5334,24 +5308,19 @@ def test_plan_todos_from_update_maps_steps_and_statuses() -> None:
 
 def test_plan_todos_from_update_skips_malformed_and_empty() -> None:
     """
-    ``_plan_todos_from_update`` drops malformed steps and empty plans.
+    ``todos_from_plan_update`` drops malformed steps and empty plans.
 
     Non-dict entries and steps without a usable ``step`` string are
     skipped; a plan that is missing, not a list, or yields no valid
     items returns ``None`` so the caller posts nothing.
     """
-    assert codex_native_forwarder._plan_todos_from_update({}) is None
-    assert codex_native_forwarder._plan_todos_from_update({"plan": []}) is None
-    assert codex_native_forwarder._plan_todos_from_update({"plan": "nope"}) is None
-    assert (
-        codex_native_forwarder._plan_todos_from_update(
-            {"plan": ["bad", {"step": ""}, {"status": "pending"}]}
-        )
-        is None
-    )
-    assert codex_native_forwarder._plan_todos_from_update(
-        {"plan": ["bad", {"step": "Keep me", "status": "pending"}]}
-    ) == [{"content": "Keep me", "status": "pending", "activeForm": "Keep me"}]
+    assert todos_from_plan_update({}) is None
+    assert todos_from_plan_update({"plan": []}) is None
+    assert todos_from_plan_update({"plan": "nope"}) is None
+    assert todos_from_plan_update({"plan": ["bad", {"step": ""}, {"status": "pending"}]}) is None
+    assert todos_from_plan_update({"plan": ["bad", {"step": "Keep me", "status": "pending"}]}) == [
+        {"content": "Keep me", "status": "pending", "activeForm": "Keep me"}
+    ]
 
 
 def test_forwarder_posts_completed_codex_plan_item() -> None:

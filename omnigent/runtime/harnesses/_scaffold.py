@@ -56,6 +56,7 @@ from omnigent.policies.types import FAIL_CLOSED_PHASES
 from omnigent.runtime.tool_output import cap_tool_output
 from omnigent.server.schemas import (
     CompletedEvent,
+    ConversationRef,
     CreatedEvent,
     CreateResponseRequest,
     ElicitationRequestEvent,
@@ -1107,7 +1108,10 @@ class HarnessApp:
             return denied
         self._check_conversation_id(request, conversation_id)
         if isinstance(body, MessageEvent):
-            return await self._start_or_inject_turn(body.to_create_request())
+            turn_request = body.to_create_request().model_copy(
+                update={"conversation": ConversationRef(id=conversation_id)}
+            )
+            return await self._start_or_inject_turn(turn_request)
         if isinstance(body, InterruptEvent):
             return await self._handle_interrupt_event()
         if isinstance(body, ToolResultEvent):

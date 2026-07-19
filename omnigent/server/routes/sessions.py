@@ -582,9 +582,8 @@ _LAST_TASK_ERROR_MESSAGE_LABEL_KEY: str = "omnigent.last_task_error_message"
 # from the schema so the truncation and the column can never drift apart.
 _LABEL_VALUE_MAX_LEN: int = LABEL_VALUE_MAX_LEN
 
-# Todo-list update from the claude-native forwarder. Carries the raw
-# todo items captured from PostToolUse/TodoWrite hook events. Payload
-# shape: ``{"todos": [{"content": "...", "status": "...", "activeForm": ...}]}``.
+# Todo-list update from native harness forwarders. Payload shape:
+# ``{"todos": [{"content": "...", "status": "...", "activeForm": ...}]}``.
 _EXTERNAL_SESSION_TODOS_TYPE: str = "external_session_todos"
 
 # Session labels stamped by ``omnigent claude``. A matching session
@@ -1141,9 +1140,9 @@ def announce_hosts_changed(user_id: str | None) -> None:
     user_session_stream.publish(_discovery_key(user_id), {"type": "hosts_changed"})
 
 
-# Per-session todo cache updated by external_session_todos events from the
-# claude-native forwarder. Used by _build_session_response to populate the
-# ``todos`` snapshot field so the panel survives page refresh.
+# Per-session todo cache updated by native ``external_session_todos`` events
+# and runner ``session.todos`` events. Used by _build_session_response so the
+# panel survives page refresh.
 _session_todos_cache: dict[str, list[dict[str, Any]]] = {}
 
 # Per-session terminal-spin-up flag updated by the runner SSE relay from
@@ -4043,47 +4042,16 @@ async def _persist_model_change_note(
     _publish_external_conversation_item(session_id, persisted_items[0])
 
 
-def _handle_external_session_todos(
-    session_id: str,
-    body: SessionEventInput,
-) -> None:
-    """
-    Cache and broadcast a todo-list update from a native forwarder.
-
-    Sent by the claude-native forwarder (from ``TodoWrite``) and the
-    codex-native forwarder (from Codex plan updates); the panel is
-    harness-agnostic.
-
-    Updates the in-memory ``_session_todos_cache`` so subsequent
-    ``GET /v1/sessions/{id}`` snapshot calls can populate the ``todos``
-    field without a file read. Then publishes a ``session.todos`` SSE event
-    so connected web clients update their todo panel immediately.
-
-    :param session_id: Session/conversation identifier,
-        e.g. ``"conv_abc123"``.
-    :param body: The ``external_session_todos`` event body. Must have
-        ``data.todos`` as a list of todo dicts, e.g.
-        ``[{"content": "Fix bug", "status": "in_progress", "activeForm": "Fixing the bug"}]``.
-    :raises OmnigentError: When ``data.todos`` is missing or not a list.
-    """
-    todos = body.data.get("todos")
-    if not isinstance(todos, list):
-        raise OmnigentError(
-            "external_session_todos requires data.todos to be a list",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    # Filter to well-formed items before caching so that malformed entries
-    # from a buggy forwarder version don't persist in the snapshot.  The
-    # same filter is applied by sse.ts on the live-event path; keeping the
-    # two in sync means the snapshot and live panel always show the same set.
+def _publish_session_todos(session_id: str, todos: list[Any]) -> None:
+    """Validate, cache, and broadcast a complete todo-list snapshot."""
     valid_statuses = {"pending", "in_progress", "completed"}
     validated: list[dict[str, Any]] = [
-        t
-        for t in todos
-        if isinstance(t, dict)
-        and isinstance(t.get("content"), str)
-        and t.get("status") in valid_statuses
-        and isinstance(t.get("activeForm"), str)
+        item
+        for item in todos
+        if isinstance(item, dict)
+        and isinstance(item.get("content"), str)
+        and item.get("status") in valid_statuses
+        and isinstance(item.get("activeForm"), str)
     ]
     _session_todos_cache[session_id] = validated
     event = SessionTodosEvent(
@@ -4092,6 +4060,20 @@ def _handle_external_session_todos(
         todos=validated,
     )
     session_stream.publish(session_id, event.model_dump())
+
+
+def _handle_external_session_todos(
+    session_id: str,
+    body: SessionEventInput,
+) -> None:
+    """Cache and broadcast a todo-list update from a native forwarder."""
+    todos = body.data.get("todos")
+    if not isinstance(todos, list):
+        raise OmnigentError(
+            "external_session_todos requires data.todos to be a list",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    _publish_session_todos(session_id, todos)
 
 
 def _publish_external_conversation_item(
@@ -10444,6 +10426,17 @@ async def _relay_runner_stream(
                             session_id,
                             event.get("pending") is True,
                         )
+                        continue
+
+                    if evt_type == "session.todos":
+                        todos = event.get("todos")
+                        if isinstance(todos, list):
+                            _publish_session_todos(session_id, todos)
+                        else:
+                            _logger.warning(
+                                "Relay: ignored malformed todo update for session=%s",
+                                session_id,
+                            )
                         continue
 
                     # Track the turn's response_id from lifecycle

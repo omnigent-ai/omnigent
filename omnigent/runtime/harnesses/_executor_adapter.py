@@ -54,6 +54,7 @@ from omnigent.inner.executor import (
     Message,
     ReasoningChunk,
     TextChunk,
+    TodoListUpdate,
     ToolCallComplete,
     ToolCallRequest,
     TurnCancelled,
@@ -72,6 +73,7 @@ from omnigent.server.schemas import (
     ReasoningStartedEvent,
     ReasoningSummaryTextDeltaEvent,
     ReasoningTextDeltaEvent,
+    SessionTodosEvent,
 )
 
 _logger = logging.getLogger(__name__)
@@ -256,6 +258,7 @@ class ExecutorAdapter(HarnessApp):
             scaffold.
         """
         executor = self._ensure_executor()
+        conversation_id = request.conversation.id if request.conversation is not None else None
         messages = _translate_input_to_messages(request.input)
         # Stamp every message with the adapter's session_key so
         # the inner :class:`ClaudeSDKExecutor` keys its cached
@@ -435,7 +438,7 @@ class ExecutorAdapter(HarnessApp):
                                 # aggregate visibility.
                                 record_llm_usage(agent_span, event.usage)
                     # --- End tracing ---
-                    self._translate_event(event, ctx)
+                    self._translate_event(event, ctx, conversation_id=conversation_id)
                     if isinstance(event, TurnComplete):
                         if tctx is not None and agent_span is not None:
                             tctx.end_agent_span(agent_span, response=response_text)
@@ -827,7 +830,13 @@ class ExecutorAdapter(HarnessApp):
             self._executor = self._executor_factory()
         return self._executor
 
-    def _translate_event(self, event: ExecutorEvent, ctx: TurnContext) -> None:
+    def _translate_event(
+        self,
+        event: ExecutorEvent,
+        ctx: TurnContext,
+        *,
+        conversation_id: str | None = None,
+    ) -> None:
         """
         Translate one inner :class:`ExecutorEvent` into Omnigent SSE
         events emitted via ``ctx.emit``.
@@ -842,6 +851,7 @@ class ExecutorAdapter(HarnessApp):
         :param event: The inner executor event to translate.
         :param ctx: The per-turn context; events are pushed onto
             its queue.
+        :param conversation_id: Session id used by session-scoped events.
         """
         if isinstance(event, TextChunk):
             ctx.emit(
@@ -873,6 +883,19 @@ class ExecutorAdapter(HarnessApp):
                         delta=event.delta,
                     ),
                 )
+        elif isinstance(event, TodoListUpdate):
+            if conversation_id is None:
+                _logger.warning("Dropping todo update without a conversation id")
+                return
+            ctx.emit(
+                SessionTodosEvent.model_validate(
+                    {
+                        "type": "session.todos",
+                        "conversation_id": conversation_id,
+                        "todos": event.todos,
+                    }
+                )
+            )
         elif isinstance(event, ToolCallRequest):
             # Observed function_call item, emitted INLINE as the
             # inner SDK parses each tool_use block — that's what

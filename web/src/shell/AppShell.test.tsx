@@ -2679,6 +2679,44 @@ describe("Mobile session menu", () => {
     expect(screen.getByTestId("todo-panel")).toBeInTheDocument();
   });
 
+  it("opens the Tasks drawer for a headless codex session with todos", () => {
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_codex_headless", permission_level: null }]);
+    useSessionMock.mockReturnValue({
+      session: {
+        id: "conv_codex_headless",
+        agentId: "ag_codex",
+        agentName: "codex-agent",
+        runnerId: null,
+        status: "idle",
+        createdAt: 0,
+        title: null,
+        labels: {},
+        items: [],
+        pendingElicitations: [],
+        permissionLevel: 4,
+        parentSessionId: null,
+        subAgentName: null,
+        harness: "codex",
+      },
+      isLoading: false,
+      error: null,
+    });
+    useChatStore.setState({
+      todos: [{ content: "Implement", status: "in_progress", activeForm: "Implement" }],
+    });
+
+    renderShell("/c/conv_codex_headless");
+    openSessionMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: /Tasks/i }));
+
+    expect(screen.getByTestId("todos-panel-drawer")).toHaveAttribute("data-state", "open");
+    expect(screen.getByTestId("todo-panel")).toBeInTheDocument();
+  });
+
   it("keeps the FAB with only the Agents entry for a minimal agent", () => {
     // available:false → no files; no shells, no todos, no debug. The
     // Agents entry is unconditional (badge = 1, the main agent), so the

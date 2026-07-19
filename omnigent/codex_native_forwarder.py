@@ -14,6 +14,7 @@ from typing import Any
 
 import httpx
 
+from omnigent._codex_plan import todos_from_plan_update
 from omnigent._native_forwarder_health import (
     note_post_success as note_native_post_success,
 )
@@ -3084,41 +3085,14 @@ async def _handle_turn_plan_updated(
     session_id: str,
     params: dict[str, Any],
 ) -> None:
-    """
-    Mirror a Codex plan update in both the transcript and the todo panel.
-
-    Codex emits plan changes as app-server notifications rather than
-    ordinary assistant text. The forwarder posts the structured plan as an
-    ``external_session_todos`` event so the web ``TodoPanel`` renders it like
-    Claude's todo list, and also mirrors it as a compact assistant message so
-    the plan stays visible inline in the transcript.
-
-    :param client: HTTP client for Omnigent event posts.
-    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
-    :param params: Codex ``turn/plan/updated`` params.
-    :returns: None.
-    """
-    todos = _plan_todos_from_update(params)
+    """Publish a Codex plan update to the todo panel."""
+    todos = todos_from_plan_update(params)
     if todos is not None:
         await _post_external_session_todos(
             client,
             session_id=session_id,
             todos=todos,
         )
-    text = _plan_text_from_update(params)
-    if not text:
-        return
-    await _post_external_item(
-        client,
-        session_id,
-        item_type="message",
-        item_data={
-            "role": "assistant",
-            "agent": _AGENT_NAME,
-            "content": [{"type": "output_text", "text": text}],
-        },
-        response_id=_response_id(params),
-    )
 
 
 def _handle_turn_diff_updated(
@@ -5684,7 +5658,7 @@ async def _post_external_session_todos(
     client: httpx.AsyncClient,
     *,
     session_id: str,
-    todos: list[dict[str, Any]],
+    todos: list[dict[str, object]],
 ) -> None:
     """
     Post one ``external_session_todos`` event to the Sessions API.
@@ -6849,97 +6823,6 @@ def _json_string(value: dict[str, Any]) -> str | None:
         return json.dumps(value, ensure_ascii=False)
     except (TypeError, ValueError):
         return None
-
-
-def _plan_text_from_update(params: dict[str, Any]) -> str | None:
-    """
-    Render a Codex ``turn/plan/updated`` payload as Markdown text.
-
-    :param params: Codex plan update params.
-    :returns: Markdown plan text, or ``None`` when no valid plan steps
-        are present.
-    """
-    plan = params.get("plan")
-    if not isinstance(plan, list) or not plan:
-        return None
-    lines: list[str] = []
-    explanation = params.get("explanation")
-    if isinstance(explanation, str) and explanation:
-        lines.append(explanation)
-        lines.append("")
-    lines.append("Plan:")
-    for entry in plan:
-        if not isinstance(entry, dict):
-            continue
-        step = entry.get("step")
-        if not isinstance(step, str) or not step:
-            continue
-        status = entry.get("status")
-        marker = _plan_status_marker(status)
-        lines.append(f"{marker} {step}")
-    if len(lines) == 1 or (len(lines) == 3 and lines[-1] == "Plan:"):
-        return None
-    return "\n".join(lines)
-
-
-def _plan_todos_from_update(params: dict[str, Any]) -> list[dict[str, Any]] | None:
-    """
-    Map a Codex ``turn/plan/updated`` payload to the todo-list schema.
-
-    Produces items shaped like Claude's ``TodoWrite`` output so the web
-    ``TodoPanel`` can render Codex plans through the same pipeline. Codex
-    steps have no gerund ``activeForm``, so the step text is reused there.
-
-    :param params: Codex plan update params.
-    :returns: List of ``{"content", "status", "activeForm"}`` items, or
-        ``None`` when no valid plan steps are present.
-    """
-    plan = params.get("plan")
-    if not isinstance(plan, list) or not plan:
-        return None
-    todos: list[dict[str, Any]] = []
-    for entry in plan:
-        if not isinstance(entry, dict):
-            continue
-        step = entry.get("step")
-        if not isinstance(step, str) or not step:
-            continue
-        todos.append(
-            {
-                "content": step,
-                "status": _plan_todo_status(entry.get("status")),
-                "activeForm": step,
-            }
-        )
-    return todos or None
-
-
-def _plan_todo_status(status: Any) -> str:
-    """
-    Normalize a Codex plan step status to the todo-list vocabulary.
-
-    :param status: Codex step status value.
-    :returns: One of ``"pending"``, ``"in_progress"``, ``"completed"``.
-    """
-    if status == "completed":
-        return "completed"
-    if status in {"inProgress", "in_progress"}:
-        return "in_progress"
-    return "pending"
-
-
-def _plan_status_marker(status: Any) -> str:
-    """
-    Return a readable Markdown marker for a Codex plan step status.
-
-    :param status: Codex step status value.
-    :returns: Markdown list marker.
-    """
-    return {
-        "completed": "- [x]",
-        "in_progress": "- [~]",
-        "pending": "- [ ]",
-    }[_plan_todo_status(status)]
 
 
 def _response_id(params: dict[str, Any]) -> str:

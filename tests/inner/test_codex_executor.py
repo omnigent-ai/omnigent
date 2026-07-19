@@ -28,6 +28,7 @@ from omnigent.inner.executor import (
     ExecutorError,
     ReasoningChunk,
     TextChunk,
+    TodoListUpdate,
     ToolCallComplete,
     ToolCallRequest,
     ToolCallStatus,
@@ -1453,6 +1454,71 @@ class TestCodexExecutor(unittest.TestCase):
             self.assertEqual(len(events), 1)
             self.assertIsInstance(events[0], TurnComplete)
             self.assertEqual(events[0].response, "done")
+
+        _run(_t())
+
+    def test_app_server_run_turn_plan_updates_yield_todo_list(self):
+        """``turn/plan/updated`` becomes a shared todo-list update."""
+
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/tmp/workspace",
+                env={},
+                tool_executor=None,
+            )
+            session.start = AsyncMock()
+            session._proc = _FakeProcess()
+            session.thread_id = "thread-1"
+            session._request = AsyncMock(return_value={"result": {"turn": {"id": "turn-1"}}})
+
+            async def _inject() -> None:
+                await asyncio.sleep(0.01)
+                session._events.put_nowait(
+                    {
+                        "method": "turn/plan/updated",
+                        "params": {
+                            "turnId": "turn-1",
+                            "plan": [
+                                {"step": "Inspect", "status": "completed"},
+                                {"step": "Implement", "status": "inProgress"},
+                                {"step": "Verify", "status": "pending"},
+                            ],
+                        },
+                    }
+                )
+                session._events.put_nowait(
+                    {"method": "turn/completed", "params": {"turn": {"id": "turn-1"}}}
+                )
+
+            inject_task = asyncio.create_task(_inject())
+            events = [
+                event
+                async for event in session.run_turn(
+                    messages=[{"role": "user", "content": "fix it"}],
+                    tools=[],
+                    system_prompt="",
+                    model="gpt-5.4-mini",
+                    cwd=".",
+                    sandbox="workspace-write",
+                )
+            ]
+            await inject_task
+
+            todo_update = next(event for event in events if isinstance(event, TodoListUpdate))
+            self.assertFalse(any(isinstance(event, TextChunk) for event in events))
+            self.assertEqual(
+                todo_update.todos,
+                [
+                    {"content": "Inspect", "status": "completed", "activeForm": "Inspect"},
+                    {
+                        "content": "Implement",
+                        "status": "in_progress",
+                        "activeForm": "Implement",
+                    },
+                    {"content": "Verify", "status": "pending", "activeForm": "Verify"},
+                ],
+            )
 
         _run(_t())
 

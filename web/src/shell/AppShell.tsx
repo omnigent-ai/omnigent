@@ -347,9 +347,9 @@ export function AppShell() {
   const terminalFirst = sessionLabels["omnigent.ui"] === "terminal";
   const isClaudeNative = sessionLabels["omnigent.wrapper"] === "claude-code-native-ui";
   // Harnesses that publish a todo list to the TodoPanel: Claude via
-  // TodoWrite, and Codex which maps its plan updates to the same schema.
+  // TodoWrite, and both Codex integrations via plan updates.
   const isCodexNative = isCodexNativeSession({ labels: sessionLabels });
-  const todosSupported = isClaudeNative || isCodexNative;
+  const todosSupported = isClaudeNative || isCodexNative || activeSession?.harness === "codex";
   // Native-CLI wrapper of either family. Keys harness behavior gates
   // (composer slash commands, `/model`); terminal-first SDK sessions
   // (embedded Omnigent REPL terminal) have NO wrapper label and must

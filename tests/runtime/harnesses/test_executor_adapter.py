@@ -149,6 +149,12 @@ def use_tool_call(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
+def use_todo_list(monkeypatch: pytest.MonkeyPatch) -> None:
+    """MockExecutor that yields a complete todo-list snapshot."""
+    monkeypatch.setenv("MOCK_EXECUTOR_SCRIPT", "todo_list")
+
+
+@pytest.fixture
 def use_error(monkeypatch: pytest.MonkeyPatch) -> None:
     """MockExecutor that yields an ExecutorError."""
     monkeypatch.setenv("MOCK_EXECUTOR_SCRIPT", "error")
@@ -214,6 +220,28 @@ async def test_text_chunk_translates_to_output_text_delta(
     # If a future change makes TurnComplete.response emit a
     # delta, this test should be updated.
     assert "response.completed" in event_names
+
+
+async def test_todo_list_uses_bound_conversation_id(
+    use_todo_list: None,
+    manager: HarnessProcessManager,
+) -> None:
+    """TodoListUpdate becomes a session.todos event for the URL session."""
+    conv_id = "conv_todos"
+    client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
+    events: list[_ParsedSSEEvent] = []
+    async with client.stream(
+        "POST", f"/v1/sessions/{conv_id}/events", json=_start_turn_body()
+    ) as response:
+        async for event in _stream_iter(response):
+            events.append(event)
+
+    todo_event = next(event for event in events if event.event == "session.todos")
+    assert todo_event.data["conversation_id"] == conv_id
+    assert todo_event.data["todos"] == [
+        {"content": "Inspect", "status": "completed", "activeForm": "Inspect"},
+        {"content": "Implement", "status": "in_progress", "activeForm": "Implement"},
+    ]
 
 
 async def test_tool_call_translates_to_paired_function_call_items(

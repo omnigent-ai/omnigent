@@ -10,6 +10,7 @@ Four scripts:
 - ``"text_only"``: a single TurnComplete with response text.
 - ``"tool_call"``: a ToolCallRequest, then a ToolCallComplete
   with a result, then a TurnComplete (no further text).
+- ``"todo_list"``: a TodoListUpdate followed by TurnComplete.
 - ``"error"``: an ExecutorError event.
 - ``"cancelled"``: a TurnCancelled event.
 - ``"capture_messages"``: writes the received messages list as
@@ -36,6 +37,7 @@ from omnigent.inner.executor import (
     ExecutorEvent,
     Message,
     MockExecutor,
+    TodoListUpdate,
     ToolCallComplete,
     ToolCallRequest,
     ToolCallStatus,
@@ -135,6 +137,27 @@ def _build_tool_call() -> Executor:
     return executor
 
 
+def _build_todo_list() -> Executor:
+    """MockExecutor scripted with one complete todo-list snapshot."""
+    executor = MockExecutor()
+    executor._turns.append(
+        [
+            TodoListUpdate(
+                todos=[
+                    {"content": "Inspect", "status": "completed", "activeForm": "Inspect"},
+                    {
+                        "content": "Implement",
+                        "status": "in_progress",
+                        "activeForm": "Implement",
+                    },
+                ]
+            ),
+            TurnComplete(response=None),
+        ]
+    )
+    return executor
+
+
 def _build_error() -> Executor:
     """
     MockExecutor scripted with an :class:`ExecutorError`.
@@ -179,6 +202,7 @@ def _build_capture_messages() -> Executor:
 _SCRIPTS: dict[str, Callable[[], Executor]] = {
     "text_only": _build_text_only,
     "tool_call": _build_tool_call,
+    "todo_list": _build_todo_list,
     "error": _build_error,
     "cancelled": _build_cancelled,
     "capture_messages": _build_capture_messages,

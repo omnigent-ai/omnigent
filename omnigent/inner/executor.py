@@ -131,6 +131,17 @@ class ReasoningChunk(ExecutorEvent):
 
 
 @dataclass
+class TodoListUpdate(ExecutorEvent):
+    """Replace the session's current todo list.
+
+    :param todos: Full todo-list snapshot using the shared ``content``,
+        ``status``, and ``activeForm`` item schema.
+    """
+
+    todos: list[dict[str, object]]
+
+
+@dataclass
 class ToolCallRequest(ExecutorEvent):
     """The LLM wants to call a tool.
 

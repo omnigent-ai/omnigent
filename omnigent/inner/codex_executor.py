@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, TypeAlias
 
+from omnigent._codex_plan import todos_from_plan_update
 from omnigent._platform import resolve_cli_binary
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.reasoning_effort import CODEX_EFFORTS, validate_effort
@@ -42,6 +43,7 @@ from .executor import (
     Message,
     ReasoningChunk,
     TextChunk,
+    TodoListUpdate,
     ToolArgs,
     ToolCallComplete,
     ToolCallRequest,
@@ -1615,6 +1617,14 @@ class _CodexAppServerSession:
                 raw_method = message.get("method")
                 method: str | None = raw_method if isinstance(raw_method, str) else None
                 params = message.get("params", {})
+
+                if method == "turn/plan/updated":
+                    if not _event_turn_matches(params):
+                        continue
+                    todos = todos_from_plan_update(params)
+                    if todos is not None:
+                        yield TodoListUpdate(todos=todos)
+                    continue
 
                 if method == "item/tool/call":
                     if not _event_turn_matches(params):
