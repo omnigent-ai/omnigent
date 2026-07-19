@@ -16,7 +16,6 @@ Used by ``omnigent chat --tools coding`` and the terminal TUI.
 from __future__ import annotations
 
 import glob as glob_mod
-import locale
 import os
 import subprocess
 import time
@@ -25,6 +24,8 @@ from pathlib import Path
 from typing import Any
 
 from omnigent_client.tools import build_tool_handler, tool
+
+from omnigent._encoding import locale_encoding
 
 # Maximum characters returned from any tool execution.
 # Prevents TUI freezes when tools produce huge output
@@ -70,7 +71,7 @@ def _read_detecting_encoding(path: Path) -> tuple[str, str]:
     try:
         return path.read_text(encoding="utf-8"), "utf-8"
     except UnicodeDecodeError:
-        enc = locale.getpreferredencoding(False)
+        enc = locale_encoding()
         return path.read_text(encoding=enc, errors="surrogateescape"), enc
 
 
