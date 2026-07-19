@@ -9,6 +9,7 @@ website under `/releases`.
 
 ### Features
 
+- [Feature] Added the Tenki (https://tenki.cloud) cloud sandbox provider: run agents on Tenki microVMs via the CLI (`omnigent sandbox create --provider tenki`) or server-managed hosts (`sandbox.provider: tenki`). Install with the `tenki` extra and set `TENKI_API_KEY`; see `deploy/tenki/README.md`.
 - [UI / Feature] Added a Nord color theme (arctic frost-blue palette) to the Appearance settings palette picker.
 
 ## [v0.5.0] — 2026-07-10

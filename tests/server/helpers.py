@@ -195,6 +195,8 @@ class FakeSandboxLauncher(SandboxLauncher):
         self.home_dir: str | None = None
         self.registry: dict[str, object] | None = None
         self.base_url: str | None = None
+        self.project: str | None = None
+        self.workspace: str | None = None
         self.gateway_profile: str | None = None
         self.snapshot_name: str | None = None
         self.workdir: str | None = None
@@ -476,6 +478,52 @@ def install_fake_e2b_launcher(
         return fake
 
     monkeypatch.setattr(e2b_mod, "E2BSandboxLauncher", _ctor)
+
+
+def install_fake_tenki_launcher(
+    monkeypatch: Any,  # pytest.MonkeyPatch — Any avoids importing pytest in a helpers module
+    fake: FakeSandboxLauncher,
+) -> None:
+    """
+    Substitute the fake for ``TenkiSandboxLauncher`` at its public seam.
+
+    The managed flow constructs ``TenkiSandboxLauncher(image=…, env=…,
+    base_url=…, vcpus=…, memory_mb=…, disk_gb=…)``; the shim records
+    those constructor args on the fake and hands it back, so production
+    code runs unmodified against it.
+
+    :param monkeypatch: The test's ``pytest.MonkeyPatch``.
+    :param fake: The fake launcher to substitute.
+    """
+    import omnigent.onboarding.sandboxes.tenki as tenki_mod
+
+    def _ctor(
+        *,
+        image: str | None = None,
+        env: list[str] | None = None,
+        base_url: str | None = None,
+        project: str | None = None,
+        workspace: str | None = None,
+        vcpus: int | None = None,
+        memory_mb: int | None = None,
+        disk_gb: int | None = None,
+    ) -> FakeSandboxLauncher:
+        """Stand-in constructor recording the construction wiring."""
+        fake.image = image
+        fake.env = env
+        fake.base_url = base_url
+        fake.project = project
+        fake.workspace = workspace
+        fake.vcpus = vcpus
+        fake.memory_mb = memory_mb
+        fake.disk_gb = disk_gb
+        # Report the tenki provider so managed-host teardown's provider match
+        # (launcher.provider vs host.sandbox_provider) exercises the real path
+        # instead of the FakeSandboxLauncher default ("modal").
+        fake.provider = "tenki"  # type: ignore[misc]  # shadow the ClassVar per-instance
+        return fake
+
+    monkeypatch.setattr(tenki_mod, "TenkiSandboxLauncher", _ctor)
 
 
 def install_fake_openshell_launcher(

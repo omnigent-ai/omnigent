@@ -141,10 +141,11 @@ SUPPORTED_SANDBOX_PROVIDERS: frozenset[str] = frozenset(
         "e2b",
         "openshell",
         "kubernetes",
+        "tenki",
     }
 )
 PROVIDERS_WITH_MANAGED_LAUNCH: frozenset[str] = frozenset(
-    {"modal", "daytona", "boxlite", "cwsandbox", "islo", "e2b", "openshell", "kubernetes"}
+    {"modal", "daytona", "boxlite", "cwsandbox", "islo", "e2b", "openshell", "kubernetes", "tenki"}
 )
 
 # How long a managed launch waits for the sandboxed host to register
@@ -198,6 +199,14 @@ OPENSHELL_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
 # reconnects while still expiring tokens of Pods nobody deleted. A relaunch
 # mints a fresh token (and the per-Pod token Secret is replaced).
 KUBERNETES_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
+
+# Launch-token lifetime for the YAML tenki path. Omnigent does not set a
+# session max_duration, so Tenki sandboxes have no forced lifetime cap
+# (they run until managed-session teardown terminates them); the bound is
+# policy, not platform: the same 7-day window as Daytona/Islo keeps a
+# long-lived host re-authenticating across tunnel reconnects while still
+# expiring tokens of sandboxes nobody deleted. A relaunch mints a fresh token.
+TENKI_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
 
 # The cwsandbox launch-token TTL is NOT a constant: CW Sandbox's lifetime is
 # operator-overridable (OMNIGENT_CWSANDBOX_MAX_LIFETIME_S), so the TTL is
@@ -710,6 +719,22 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
             resources=_parse_kubernetes_resources(raw),
         )
         token_ttl_s = KUBERNETES_MANAGED_TOKEN_TTL_S
+    elif provider == "tenki":
+        launcher_factory = _tenki_launcher_factory(
+            image=_parse_provider_image(raw, "tenki"),
+            env=_parse_provider_env(raw, "tenki"),
+            base_url=_parse_provider_string(raw, "tenki", "base_url"),
+            project=_parse_provider_string(raw, "tenki", "project"),
+            workspace=_parse_provider_string(raw, "tenki", "workspace"),
+            vcpus=_parse_tenki_bounded_int(raw, "vcpus", _TENKI_MIN_VCPUS, _TENKI_MAX_VCPUS),
+            memory_mb=_parse_tenki_bounded_int(
+                raw, "memory_mb", _TENKI_MIN_MEMORY_MB, _TENKI_MAX_MEMORY_MB, align2=True
+            ),
+            disk_gb=_parse_tenki_bounded_int(
+                raw, "disk_gb", _TENKI_MIN_DISK_GB, _TENKI_MAX_DISK_GB
+            ),
+        )
+        token_ttl_s = TENKI_MANAGED_TOKEN_TTL_S
     else:
         launcher_factory = _unsupported_launcher_factory(provider)
         # Never consulted (the factory rejects before any token is
@@ -1325,6 +1350,105 @@ def _islo_launcher_factory(
             memory_mb=memory_mb,
             disk_gb=disk_gb,
             idle_pause_after_s=idle_pause_after_s,
+        )
+
+    return _build
+
+
+# Tenki's SDK-enforced create-time resource bounds (mirrors
+# tenki_sandbox._resource_validation): vCPU 1..16, memory 128..65536 MiB
+# aligned to 2 MiB, root disk 5..100 GiB. Enforced at parse time so an
+# out-of-range value stops server startup instead of 502-ing the first
+# managed launch (the SDK would otherwise reject it before the create RPC).
+_TENKI_MIN_VCPUS, _TENKI_MAX_VCPUS = 1, 16
+_TENKI_MIN_MEMORY_MB, _TENKI_MAX_MEMORY_MB = 128, 65536
+_TENKI_MIN_DISK_GB, _TENKI_MAX_DISK_GB = 5, 100
+
+
+def _parse_tenki_bounded_int(
+    raw: dict[str, object], key: str, minimum: int, maximum: int, *, align2: bool = False
+) -> int | None:
+    """
+    Parse a Tenki resource field, rejecting values outside Tenki's bounds.
+
+    Reuses :func:`_parse_provider_positive_int` for the optional / type /
+    bool / positive checks, then enforces the documented ``[minimum,
+    maximum]`` range and (for memory) 2 MiB alignment — so an invalid
+    deployment fails at server startup with the offending key named,
+    rather than at the first managed launch's create RPC.
+
+    :param raw: The raw ``sandbox`` mapping (provider already ``"tenki"``).
+    :param key: The field name under ``sandbox.tenki``, e.g. ``"vcpus"``.
+    :param minimum: Inclusive lower bound.
+    :param maximum: Inclusive upper bound.
+    :param align2: When ``True``, also require the value to be even (the
+        SDK's 2 MiB memory alignment).
+    :returns: The validated value, or ``None`` when the field is absent.
+    :raises ValueError: When the value is out of range or misaligned.
+    """
+    value = _parse_provider_positive_int(raw, "tenki", key)
+    if value is None:
+        return None
+    if not minimum <= value <= maximum:
+        raise ValueError(
+            f"server config 'sandbox.tenki.{key}' must be between {minimum} and "
+            f"{maximum} (got {value})"
+        )
+    if align2 and value % 2 != 0:
+        raise ValueError(
+            f"server config 'sandbox.tenki.{key}' must be aligned to 2 MiB (got {value})"
+        )
+    return value
+
+
+def _tenki_launcher_factory(
+    *,
+    image: str | None,
+    env: list[str] | None,
+    base_url: str | None,
+    project: str | None,
+    workspace: str | None,
+    vcpus: int | None,
+    memory_mb: int | None,
+    disk_gb: int | None,
+) -> Callable[[], SandboxLauncher]:
+    """
+    Build the launcher factory for the YAML ``provider: tenki`` path.
+
+    :param image: Tenki registry image reference the Omnigent host was
+        baked into (``<workspace>/<name>:tag``), or ``None`` to resolve
+        the launcher's env-var fallback. Unlike the official prebaked
+        image the other providers default to, Tenki has no built-in
+        default (registry refs are workspace-scoped), so provisioning
+        fails fast when neither this nor the env var is set — see
+        :class:`omnigent.onboarding.sandboxes.tenki.TenkiSandboxLauncher`.
+    :param env: Names of server-process environment variables (harness
+        LLM credentials, gateway URLs, ``GIT_TOKEN``) injected into every
+        sandbox, e.g. ``["OPENAI_API_KEY", "GIT_TOKEN"]``, or ``None`` to
+        resolve from the launcher's env-var fallback / inject nothing.
+    :param base_url: Optional Tenki API endpoint override.
+    :param project: Optional Tenki project id to create sessions in
+        (required unless the API key is project-scoped).
+    :param workspace: Optional Tenki workspace id to create sessions in.
+    :param vcpus: Optional vCPU count.
+    :param memory_mb: Optional memory allocation in MiB.
+    :param disk_gb: Optional root disk size in GiB.
+    :returns: A factory producing parameterized Tenki launchers.
+    """
+
+    def _build() -> SandboxLauncher:
+        """Construct the Tenki launcher (lazy SDK import inside)."""
+        from omnigent.onboarding.sandboxes.tenki import TenkiSandboxLauncher
+
+        return TenkiSandboxLauncher(
+            image=image,
+            env=env,
+            base_url=base_url,
+            project=project,
+            workspace=workspace,
+            vcpus=vcpus,
+            memory_mb=memory_mb,
+            disk_gb=disk_gb,
         )
 
     return _build

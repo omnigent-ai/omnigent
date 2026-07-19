@@ -165,6 +165,11 @@ openshell = ["openshell>=0.0.7,<1"]
 # package and imports the official client lazily, so only users of the
 # provider need this extra.
 kubernetes = ["kubernetes>=36,<37"]
+# Tenki sandbox launcher (`omnigent sandbox --provider tenki` and
+# server-managed `sandbox.provider: tenki`). The launcher module ships in
+# the base package and imports the SDK lazily, so only users of the
+# provider need this extra. Pre-1.0 SDK: pin minor.
+tenki = ["tenki-sandbox>=0.3.6,<0.4"]
 # The tracing extra is now a no-op shim kept for backwards compatibility.
 # Tracing is built on OpenTelemetry directly (opentelemetry-exporter-otlp-*
 # are in the default install). `omnigent[tracing]` still works — it just
@@ -633,6 +638,13 @@ ignore_missing_imports = true
 # posture as modal above. urllib3 rides in via the kubernetes client.
 [[tool.mypy.overrides]]
 module = "kubernetes.*"
+ignore_missing_imports = true
+
+# tenki-sandbox is an optional dep (the `tenki` extra); same lazy-import
+# posture as modal above. The import name is `tenki_sandbox`. grpcio +
+# protobuf ride in via the SDK and are not base dependencies.
+[[tool.mypy.overrides]]
+module = "tenki_sandbox.*"
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]

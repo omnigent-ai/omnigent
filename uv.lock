@@ -2988,6 +2988,9 @@ s3 = [
 slack = [
     { name = "omnigent-slack" },
 ]
+tenki = [
+    { name = "tenki-sandbox" },
+]
 vertex = [
     { name = "google-auth" },
 ]
@@ -3075,6 +3078,7 @@ requires-dist = [
     { name = "sqlalchemy", specifier = ">=2.0,<3" },
     { name = "sqlalchemy-cloudflare-d1", marker = "extra == 'dev'", specifier = "==0.3.10" },
     { name = "starlette", specifier = ">=1.0.1,<2" },
+    { name = "tenki-sandbox", marker = "extra == 'tenki'", specifier = ">=0.3.6,<0.4" },
     { name = "tiktoken", specifier = ">=0.7,<1" },
     { name = "tomlkit", specifier = ">=0.12,<1" },
     { name = "types-pyyaml", marker = "extra == 'dev'", specifier = ">=6.0" },
@@ -3082,7 +3086,7 @@ requires-dist = [
     { name = "websockets", specifier = ">=10.4,<15" },
     { name = "zstandard", specifier = ">=0.22,<1" },
 ]
-provides-extras = ["claude-sdk", "openai-agents", "all", "bedrock", "s3", "vertex", "modal", "daytona", "boxlite", "cwsandbox", "e2b", "islo", "openshell", "kubernetes", "tracing", "agents-sdk", "antigravity", "copilot", "cursor", "hindsight", "slack", "databricks", "dev"]
+provides-extras = ["claude-sdk", "openai-agents", "all", "bedrock", "s3", "vertex", "modal", "daytona", "boxlite", "cwsandbox", "e2b", "islo", "openshell", "kubernetes", "tenki", "tracing", "agents-sdk", "antigravity", "copilot", "cursor", "hindsight", "slack", "databricks", "dev"]
 
 [[package]]
 name = "omnigent-client"
@@ -5121,6 +5125,20 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/47/c6/ee486fd809e357697ee8a44d3d69222b344920433d3b6666ccd9b374630c/tenacity-9.1.4.tar.gz", hash = "sha256:adb31d4c263f2bd041081ab33b498309a57c77f9acf2db65aadf0898179cf93a", size = 49413, upload-time = "2026-02-07T10:45:33.841Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/d7/c1/eb8f9debc45d3b7918a32ab756658a0904732f75e555402972246b0b8e71/tenacity-9.1.4-py3-none-any.whl", hash = "sha256:6095a360c919085f28c6527de529e76a06ad89b23659fa881ae0649b867a9d55", size = 28926, upload-time = "2026-02-07T10:45:32.24Z" },
+]
+
+[[package]]
+name = "tenki-sandbox"
+version = "0.3.6"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "grpcio" },
+    { name = "protobuf" },
+    { name = "websocket-client" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/c8/3e/319d553fb6bd266aed3f5e0ec5d9b1865ee7cb45388c9dc6dac1ee30a51f/tenki_sandbox-0.3.6.tar.gz", hash = "sha256:f4a6e0b7329a7fd42138d5eb582adb1356c084e6f6b3fe046530cbbcd426ffe2", size = 144662, upload-time = "2026-07-10T08:28:16.269Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e5/4f/860d1ba154200904b493ed4353e1994aa14627f407144d975b21e4cf51be/tenki_sandbox-0.3.6-py3-none-any.whl", hash = "sha256:324fe804a0b561ffa129e6b1b1874e0d7747ebcb566d976e8485c9dd45ef6853", size = 128658, upload-time = "2026-07-10T08:28:14.925Z" },
 ]
 
 [[package]]
