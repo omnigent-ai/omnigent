@@ -13,11 +13,11 @@ import pytest
 from fastapi import FastAPI
 
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID
-from omnigent.entities.environment_filesystem import FilesystemPathNotFound
+from omnigent.entities.environment_filesystem import FilesystemPathNotFound, InvalidPath
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.os_env import create_os_environment
 from omnigent.runner import create_runner_app
-from omnigent.runner.environment_filesystem import CallerProcessFilesystem
+from omnigent.runner.environment_filesystem import CallerProcessFilesystem, _validate_path
 from omnigent.runner.resource_registry import SessionResourceRegistry
 from tests.runner.helpers import NullServerClient
 
@@ -1667,7 +1667,8 @@ async def test_delete_directory_symlink_removes_link_not_target(tmp_path: Path) 
         OSEnvSpec(type="caller_process", cwd=str(ws), sandbox=OSEnvSandboxSpec(type="none"))
     )
     fs = CallerProcessFilesystem(os_env)
-    await fs.delete("link", recursive=True)
+    result = await fs.delete("link", recursive=True)
+    assert result.type == "symlink"
     assert not link.is_symlink()
     assert target.is_dir() and (target / "keep.txt").exists()
 
@@ -1711,7 +1712,8 @@ async def test_delete_directory_junction_removes_link_not_target(tmp_path: Path)
         OSEnvSpec(type="caller_process", cwd=str(ws), sandbox=OSEnvSandboxSpec(type="none"))
     )
     fs = CallerProcessFilesystem(os_env)
-    await fs.delete("jx", recursive=True)
+    result = await fs.delete("jx", recursive=True)
+    assert result.type == "symlink"
     assert not junction.exists()
     assert target.is_dir() and (target / "keep.txt").exists()
 
@@ -1733,7 +1735,8 @@ async def test_delete_broken_symlink_succeeds(tmp_path: Path) -> None:
         OSEnvSpec(type="caller_process", cwd=str(ws), sandbox=OSEnvSandboxSpec(type="none"))
     )
     fs = CallerProcessFilesystem(os_env)
-    await fs.delete("dangling")
+    result = await fs.delete("dangling")
+    assert result.type == "symlink"
     assert not link.is_symlink()
 
 
@@ -1752,3 +1755,105 @@ async def test_write_entry_path_is_forward_slash_for_nested(tmp_path: Path) -> N
     assert result.entry.path == "sub/dir/f.py"
     assert "\\" not in result.entry.path
     assert "\\" not in result.entry.id
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "C:outside.txt",
+        r"D:..\outside.txt",
+        r"C:\outside.txt",
+        r"\outside.txt",
+        r"\\server\share\outside.txt",
+        r"\\?\C:\outside.txt",
+    ],
+)
+def test_validate_path_rejects_windows_drive_and_root_forms(path: str) -> None:
+    """Windows drive-relative, absolute, UNC, and device paths never pass."""
+    with pytest.raises(InvalidPath):
+        _validate_path(path)
+
+
+@pytest.mark.asyncio
+async def test_delete_through_escaping_intermediate_symlink_is_rejected(
+    tmp_path: Path,
+) -> None:
+    """An intermediate symlink cannot redirect a deletion outside the root."""
+    ws = tmp_path / "ws"
+    outside = tmp_path / "outside"
+    ws.mkdir()
+    outside.mkdir()
+    victim = outside / "keep.txt"
+    victim.write_text("keep")
+    link = ws / "escape"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"cannot create directory symlink: {exc}")
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", cwd=str(ws), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    fs = CallerProcessFilesystem(os_env)
+
+    with pytest.raises(InvalidPath):
+        await fs.delete("escape/keep.txt")
+
+    assert victim.read_text() == "keep"
+
+
+@pytest.mark.asyncio
+async def test_delete_through_in_root_intermediate_symlink_succeeds(
+    tmp_path: Path,
+) -> None:
+    """An intermediate symlink may resolve to another directory inside root."""
+    ws = tmp_path / "ws"
+    target = ws / "target"
+    target.mkdir(parents=True)
+    victim = target / "remove.txt"
+    victim.write_text("remove")
+    link = ws / "alias"
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"cannot create directory symlink: {exc}")
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", cwd=str(ws), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    fs = CallerProcessFilesystem(os_env)
+
+    result = await fs.delete("alias/remove.txt")
+
+    assert result.type == "file"
+    assert not victim.exists()
+    assert link.is_symlink()
+
+
+@pytest.mark.windows_only
+@pytest.mark.asyncio
+async def test_delete_through_escaping_intermediate_junction_is_rejected(
+    tmp_path: Path,
+) -> None:
+    """An intermediate Windows junction cannot redirect deletion outside."""
+    ws = tmp_path / "ws"
+    outside = tmp_path / "outside"
+    ws.mkdir()
+    outside.mkdir()
+    victim = outside / "keep.txt"
+    victim.write_text("keep")
+    junction = ws / "escape"
+    result = subprocess.run(
+        f'mklink /J "{junction}" "{outside}"',
+        shell=True,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        pytest.skip("could not create a junction")
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", cwd=str(ws), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    fs = CallerProcessFilesystem(os_env)
+
+    with pytest.raises(InvalidPath):
+        await fs.delete("escape/keep.txt")
+
+    assert victim.read_text() == "keep"

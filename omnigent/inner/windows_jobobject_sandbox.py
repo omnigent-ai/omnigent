@@ -126,11 +126,10 @@ class _THREADENTRY32(ctypes.Structure):
 
 
 class _JobHandle:
-    """Owns a Windows Job Object handle; closing it kills the contained tree.
+    """Own a Windows Job Object handle.
 
-    Held by the parent for the helper's lifetime. Closing (explicitly or via
-    ``with``) closes the kernel handle; with ``KILL_ON_JOB_CLOSE`` set, that
-    terminates every still-running process in the job.
+    Closing follows the job's configured limits: sandbox jobs use
+    ``KILL_ON_JOB_CLOSE``; shell-timeout jobs deliberately do not.
     """
 
     def __init__(self, handle: int) -> None:
@@ -162,11 +161,12 @@ class _JobHandle:
             kernel32.CloseHandle(wintypes.HANDLE(proc_handle))
 
     def terminate(self) -> None:
-        """Terminate every process in the job — used only on the timeout path.
+        """Terminate every process in the job after an abnormal shell exit.
 
         The job has no ``KILL_ON_JOB_CLOSE`` limit, so a successful run's
         ``close()`` leaves a detached child (a server the command started)
-        running; only this explicit call tears the tree down.
+        running; this explicit call handles timeout, cancellation, and setup
+        failure after the suspended child exists.
         """
         if self._handle is None:
             return
@@ -200,8 +200,8 @@ def create_tree_kill_job() -> _JobHandle | None:
     intentionally starts a detached child (a background server) survives a
     normal successful run. Assign a process with :meth:`_JobHandle.assign` and
     call :meth:`_JobHandle.terminate` to kill the tree — only ever on the
-    shell-timeout path. Returns ``None`` if the job can't be created; the caller
-    then falls back to a best-effort tree kill.
+    abnormal shell path. Returns ``None`` if the job can't be created; callers
+    that require race-free containment must fail closed.
     """
     job = ctypes.windll.kernel32.CreateJobObjectW(None, None)
     if not job:
@@ -219,8 +219,6 @@ def resume_process_threads(pid: int) -> bool:
     ``False`` as a hard failure (the child would otherwise hang suspended).
     """
     kernel32 = ctypes.windll.kernel32
-    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
-    kernel32.OpenThread.restype = wintypes.HANDLE
     invalid = wintypes.HANDLE(-1).value
     snapshot = kernel32.CreateToolhelp32Snapshot(_TH32CS_SNAPTHREAD, 0)
     if not snapshot or snapshot == invalid:
@@ -415,6 +413,18 @@ def _configure_prototypes() -> None:
     k.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
     k.AssignProcessToJobObject.restype = wintypes.BOOL
     k.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    k.TerminateJobObject.restype = wintypes.BOOL
+    k.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    k.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    k.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    k.Thread32First.restype = wintypes.BOOL
+    k.Thread32First.argtypes = [wintypes.HANDLE, ctypes.POINTER(_THREADENTRY32)]
+    k.Thread32Next.restype = wintypes.BOOL
+    k.Thread32Next.argtypes = [wintypes.HANDLE, ctypes.POINTER(_THREADENTRY32)]
+    k.OpenThread.restype = wintypes.HANDLE
+    k.OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k.ResumeThread.restype = wintypes.DWORD
+    k.ResumeThread.argtypes = [wintypes.HANDLE]
     k.CloseHandle.restype = wintypes.BOOL
     k.CloseHandle.argtypes = [wintypes.HANDLE]
 

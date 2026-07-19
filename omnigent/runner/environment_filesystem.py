@@ -12,12 +12,13 @@ filesystem service.
 from __future__ import annotations
 
 import base64
+import ntpath
 import os
 import re
 import stat
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from omnigent._platform import IS_WINDOWS
 from omnigent.entities.environment_filesystem import (
@@ -38,6 +39,8 @@ if TYPE_CHECKING:
     from omnigent.inner.os_env import OSEnvironment
 
 _MAX_READ_BYTES = 10 * 1024 * 1024  # 10 MiB
+_FilesystemKind = Literal["file", "directory", "symlink", "other"]
+_DeleteStatus = Literal["deleted", "invalid_path", "not_found", "not_empty"]
 
 
 def _shell_quote(s: str) -> str:
@@ -205,6 +208,12 @@ def _validate_path(relative_path: str) -> str:
     """
     if "\x00" in relative_path:
         raise InvalidPath("Path contains NUL bytes")
+    # Reject Windows drive-relative forms (``C:foo``) as well as absolute,
+    # UNC, and device paths on every host. Host-native ``isabs`` alone misses
+    # drive-relative paths, which can resolve outside the environment cwd.
+    windows_drive, _ = ntpath.splitdrive(relative_path)
+    if windows_drive or ntpath.isabs(relative_path):
+        raise InvalidPath("Absolute or drive-qualified paths are not allowed")
     normalized = os.path.normpath(relative_path)
     if os.path.isabs(normalized):
         raise InvalidPath("Absolute paths are not allowed")
@@ -771,37 +780,87 @@ class CallerProcessFilesystem:
             entry=entry,
         )
 
-    async def _lstat_kind_via_shell(self, validated: str) -> tuple[bool, bool, int]:
-        """Classify a path via ``os.lstat`` (does NOT follow symlinks).
+    async def _delete_via_shell(
+        self,
+        validated: str,
+        *,
+        recursive: bool,
+    ) -> tuple[_DeleteStatus, _FilesystemKind, int]:
+        """Delete one root-anchored path without following its final leaf.
 
-        Returns ``(exists, is_real_dir, size)``. A broken symlink/junction
-        reports ``exists=True`` (the link is present) with ``is_real_dir=False``
-        so delete removes the link instead of following it — unlike ``os.stat``,
-        which raises on a broken link and would report the link as missing. Only
-        a genuinely absent path reports ``exists=False``. ``size`` is the link's
-        own ``st_size`` (used as ``bytes_deleted`` for non-directory targets).
+        Parent components are resolved and entered one at a time inside the
+        sandbox helper. Each new cwd is re-checked beneath the original root,
+        so an intermediate symlink/junction cannot redirect deletion outside
+        the environment. The final basename is classified with ``lstat`` and
+        deleted from that anchored parent in the same helper transaction.
 
-        :param validated: Validated relative path.
-        :raises FilesystemPathNotFound: If the helper itself errors.
+        :returns: ``(status, kind, size)`` from the helper.
         """
         import json as _json
 
-        # os.lstat does not follow the link; a reparse point (symlink OR Windows
-        # junction) is "not a real dir" so it is deleted as a link. st_mode alone
-        # misses junctions, so also key off the reparse file attribute (0 on
-        # POSIX, where S_ISLNK covers symlinks).
         _script = "\n".join(
             [
-                "import os, json, stat as S",
+                "import errno, json, os, shutil, stat as S",
                 f"p = {_json.dumps(validated)}",
+                f"recursive = {recursive!r}",
+                "root = os.path.realpath(os.getcwd())",
+                "root_key = os.path.normcase(root)",
+                "reparse_flag = getattr(S, 'FILE_ATTRIBUTE_REPARSE_POINT', 0)",
+                "directory_flag = getattr(S, 'FILE_ATTRIBUTE_DIRECTORY', 0)",
+                "def inside_root(candidate):",
+                "    try:",
+                "        return os.path.normcase(os.path.commonpath("
+                "[root, candidate])) == root_key",
+                "    except ValueError:",
+                "        return False",
+                "def is_reparse(st):",
+                "    return S.S_ISLNK(st.st_mode) or bool("
+                "getattr(st, 'st_file_attributes', 0) & reparse_flag)",
+                "parts = [x for x in os.path.normpath(p).split(os.sep) if x not in ('', '.')]",
+                "status, kind, size = 'not_found', 'other', 0",
                 "try:",
-                "    st = os.lstat(p)",
-                "    reparse = bool(getattr(st, 'st_file_attributes', 0)"
-                " & S.FILE_ATTRIBUTE_REPARSE_POINT) or S.S_ISLNK(st.st_mode)",
-                "    d = S.S_ISDIR(st.st_mode) and not reparse",
-                "    print(json.dumps({'e': True, 'd': d, 's': st.st_size}))",
-                "except FileNotFoundError:",
-                "    print(json.dumps({'e': False, 'd': False, 's': 0}))",
+                "    if not parts:",
+                "        status = 'invalid_path'",
+                "    else:",
+                "        for part in parts[:-1]:",
+                "            candidate = os.path.realpath(part)",
+                "            if not inside_root(candidate):",
+                "                status = 'invalid_path'",
+                "                break",
+                "            os.chdir(candidate)",
+                "            if not inside_root(os.path.realpath(os.getcwd())):",
+                "                status = 'invalid_path'",
+                "                break",
+                "        else:",
+                "            leaf = parts[-1]",
+                "            st = os.lstat(leaf)",
+                "            attrs = getattr(st, 'st_file_attributes', 0)",
+                "            link = is_reparse(st)",
+                "            real_dir = S.S_ISDIR(st.st_mode) and not link",
+                "            kind = ('symlink' if link else 'directory' if real_dir"
+                " else 'file' if S.S_ISREG(st.st_mode) else 'other')",
+                "            size = st.st_size",
+                "            if link:",
+                "                if os.name == 'nt' and attrs & directory_flag:",
+                "                    os.rmdir(leaf)",
+                "                else:",
+                "                    os.unlink(leaf)",
+                "            elif real_dir and recursive:",
+                "                shutil.rmtree(leaf)",
+                "            elif real_dir:",
+                "                os.rmdir(leaf)",
+                "            else:",
+                "                os.unlink(leaf)",
+                "            status = 'deleted'",
+                "except (FileNotFoundError, NotADirectoryError):",
+                "    status = 'not_found'",
+                "except OSError as exc:",
+                "    if exc.errno in (errno.ENOTEMPTY, errno.EEXIST)"
+                " or getattr(exc, 'winerror', None) == 145:",
+                "        status = 'not_empty'",
+                "    else:",
+                "        raise",
+                "print(json.dumps({'status': status, 'type': kind, 'size': size}))",
             ]
         )
         result = await _run_os_env_async(
@@ -809,37 +868,24 @@ class CallerProcessFilesystem:
             _python_run_command(_script),
         )
         if "error" in result or result.get("exit_code", 1) != 0:
-            raise FilesystemPathNotFound(f"Path {validated!r} not found")
+            raise FilesystemPathNotFound(
+                result.get("error", f"Delete failed for {validated!r}"),
+            )
         try:
             info = _json.loads(result.get("stdout", "{}"))
         except _json.JSONDecodeError as exc:
-            raise FilesystemPathNotFound(f"Path {validated!r} not found") from exc
-        return bool(info.get("e", False)), bool(info.get("d", False)), int(info.get("s", 0))
-
-    async def _check_dir_empty(self, validated: str) -> bool:
-        """Check if a directory is empty via the sandboxed helper.
-
-        :param validated: Validated relative path.
-        :returns: ``True`` if the directory has children.
-        """
-        import json as _json
-
-        # Embed the path as a Python literal via json.dumps and shell-quote
-        # the entire script so the caller-controlled path is never interpreted
-        # by the shell; see stat() for the full rationale.
-        _script = "\n".join(
-            [
-                "import os",
-                f"p = {_json.dumps(validated)}",
-                "print(len(os.listdir(p)))",
-            ]
+            raise FilesystemPathNotFound(f"Delete failed for {validated!r}") from exc
+        raw_kind = info.get("type", "other")
+        if raw_kind not in {"file", "directory", "symlink", "other"}:
+            raise RuntimeError(f"Unexpected filesystem kind from delete helper: {raw_kind!r}")
+        raw_status = info.get("status", "not_found")
+        if raw_status not in {"deleted", "invalid_path", "not_found", "not_empty"}:
+            raise RuntimeError(f"Unexpected status from delete helper: {raw_status!r}")
+        return (
+            cast(_DeleteStatus, raw_status),
+            cast(_FilesystemKind, raw_kind),
+            int(info.get("size", 0)),
         )
-        check = await _run_os_env_async(
-            self._os_env.shell,
-            _python_run_command(_script),
-        )
-        count = int(check.get("stdout", "0").strip() or "0")
-        return count > 0
 
     async def delete(
         self,
@@ -852,7 +898,7 @@ class CallerProcessFilesystem:
         :param path: Relative path. Root deletion is rejected.
         :param recursive: Allow recursive directory deletion.
         :returns: Delete result.
-        :raises InvalidPath: If attempting to delete the root.
+        :raises InvalidPath: If deleting the root or an escaping path.
         :raises FilesystemPathNotFound: If the path does not exist.
         :raises DirectoryNotEmpty: If non-empty without recursive.
         """
@@ -860,60 +906,24 @@ class CallerProcessFilesystem:
         if not validated:
             raise InvalidPath("Cannot delete the environment root")
 
-        # lstat, not stat: a broken symlink/junction still exists as a link and
-        # must be deletable, where os.stat would follow it and report "missing".
-        exists, is_dir, size = await self._lstat_kind_via_shell(validated)
-        if not exists:
+        status, kind, size = await self._delete_via_shell(
+            validated,
+            recursive=recursive,
+        )
+        if status == "invalid_path":
+            raise InvalidPath(f"Path {path!r} escapes the environment root")
+        if status == "not_found":
             raise FilesystemPathNotFound(f"Path {path!r} not found")
-
-        if is_dir and not recursive and await self._check_dir_empty(validated):
+        if status == "not_empty":
             raise DirectoryNotEmpty(
                 f"Directory {path!r} is not empty; use recursive=true to delete"
             )
-
-        if IS_WINDOWS:
-            # cmd.exe has no `rm`; delete via a Python script, tolerating a
-            # missing path like `rm -f` does.
-            import json as _json
-
-            _del_script = "\n".join(
-                [
-                    "import os, shutil, stat",
-                    f"p = {_json.dumps(validated)}",
-                    # Reparse points (symlinks AND junctions) must be removed as
-                    # the link itself, not followed: shutil.rmtree refuses a link,
-                    # and following a junction would wrongly delete the target's
-                    # contents. os.path.islink misses junctions, so key off the
-                    # reparse attribute from lstat (which also covers broken
-                    # links). attrs == 0 means already gone (tolerate like rm -f).
-                    "try:",
-                    "    attrs = os.lstat(p).st_file_attributes",
-                    "except FileNotFoundError:",
-                    "    attrs = 0",
-                    "if attrs & stat.FILE_ATTRIBUTE_REPARSE_POINT:",
-                    "    (os.rmdir if attrs & stat.FILE_ATTRIBUTE_DIRECTORY else os.remove)(p)",
-                    "elif attrs & stat.FILE_ATTRIBUTE_DIRECTORY:",
-                    "    shutil.rmtree(p)",
-                    "elif attrs:",
-                    "    os.remove(p)",
-                ]
-            )
-            cmd = _python_run_command(_del_script)
-        else:
-            cmd = (
-                f"rm -rf {_shell_quote(validated)}"
-                if is_dir
-                else f"rm -f {_shell_quote(validated)}"
-            )
-        result = await _run_os_env_async(self._os_env.shell, cmd)
-        if "error" in result and result.get("exit_code", 0) != 0:
-            raise FilesystemPathNotFound(
-                result.get("error", f"Delete failed for {path!r}"),
-            )
+        if status != "deleted":
+            raise RuntimeError(f"Unexpected delete status: {status!r}")
 
         return DeleteFilesystemResult(
             path=path,
             deleted=True,
-            type="directory" if is_dir else "file",
-            bytes_deleted=size if not is_dir else None,
+            type=kind,
+            bytes_deleted=size if kind not in {"directory", "symlink"} else None,
         )

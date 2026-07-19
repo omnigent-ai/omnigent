@@ -605,19 +605,190 @@ def test_tree_kill_job_terminate_reaches_grandchild(tmp_path: Path) -> None:
 
 
 @pytest.mark.windows_only
+def test_shell_impl_job_creation_failure_never_spawns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A missing containment job fails before a suspended child is created."""
+    import omnigent.inner.os_env as os_env_module
+    import omnigent.inner.windows_jobobject_sandbox as jobs
+
+    monkeypatch.setattr(jobs, "create_tree_kill_job", lambda: None)
+
+    def _unexpected_popen(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("cmd.exe was spawned without a containment job")
+
+    monkeypatch.setattr(os_env_module.subprocess, "Popen", _unexpected_popen)
+    with pytest.raises(OSError, match="could not create a Windows Job Object"):
+        os_env_module._run_windows_cmd_shell(
+            "echo MUST_NOT_RUN",
+            timeout=10,
+            shell_path=os.environ.get("COMSPEC", "cmd.exe"),
+            cwd=tmp_path,
+        )
+
+
+@pytest.mark.windows_only
+def test_shell_impl_job_assignment_failure_never_resumes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rejected Job assignment kills the suspended cmd.exe instead of running it."""
+    import omnigent.inner.os_env as os_env_module
+    import omnigent.inner.windows_jobobject_sandbox as jobs
+    from omnigent.inner._proc import process_alive
+
+    marker = tmp_path / "must_not_run.txt"
+    assigned_pid: list[int] = []
+    job_events: list[str] = []
+
+    class _RejectingJob:
+        def assign(self, pid: int) -> bool:
+            job_events.append("assign")
+            assigned_pid.append(pid)
+            return False
+
+        def terminate(self) -> None:
+            job_events.append("terminate")
+
+        def close(self) -> None:
+            job_events.append("close")
+
+    monkeypatch.setattr(jobs, "create_tree_kill_job", _RejectingJob)
+
+    def _unexpected_resume(_pid: int) -> bool:
+        raise AssertionError("an uncontained cmd.exe was resumed")
+
+    monkeypatch.setattr(jobs, "resume_process_threads", _unexpected_resume)
+    with pytest.raises(OSError, match="could not assign"):
+        os_env_module._run_windows_cmd_shell(
+            f'echo escaped>"{marker}"',
+            timeout=10,
+            shell_path=os.environ.get("COMSPEC", "cmd.exe"),
+            cwd=tmp_path,
+        )
+
+    assert assigned_pid
+    assert job_events == ["assign", "terminate", "close"]
+    assert not process_alive(assigned_pid[0])
+    assert not marker.exists()
+
+
+@pytest.mark.windows_only
+def test_shell_impl_abnormal_exit_terminates_and_reaps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cancellation after resume tears down and reaps the contained process tree."""
+    import subprocess
+
+    import omnigent.inner.os_env as os_env_module
+    from omnigent.inner._proc import process_alive
+
+    real_popen = subprocess.Popen
+    created_pid: list[int] = []
+
+    class _InterruptOnce:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            self._proc = real_popen(*args, **kwargs)
+            self._first_communicate = True
+            created_pid.append(self._proc.pid)
+
+        @property
+        def pid(self) -> int:
+            return self._proc.pid
+
+        @property
+        def returncode(self) -> int | None:
+            return self._proc.returncode
+
+        def communicate(self, *args: object, **kwargs: object) -> tuple[str, str]:
+            if self._first_communicate:
+                self._first_communicate = False
+                raise KeyboardInterrupt
+            return self._proc.communicate(*args, **kwargs)
+
+        def kill(self) -> None:
+            self._proc.kill()
+
+        def wait(self, *args: object, **kwargs: object) -> int:
+            return self._proc.wait(*args, **kwargs)
+
+    monkeypatch.setattr(os_env_module.subprocess, "Popen", _InterruptOnce)
+    with pytest.raises(KeyboardInterrupt):
+        os_env_module._run_windows_cmd_shell(
+            "ping -n 30 127.0.0.1 >nul",
+            timeout=30,
+            shell_path=os.environ.get("COMSPEC", "cmd.exe"),
+            cwd=tmp_path,
+        )
+
+    assert created_pid
+    assert not process_alive(created_pid[0])
+
+
+@pytest.mark.windows_only
+def test_resume_thread_failure_uses_unsigned_dword_sentinel() -> None:
+    """Win32 ``ResumeThread`` failure must compare equal to ``DWORD(-1)``."""
+    import ctypes
+    import ctypes.wintypes as wintypes
+
+    from omnigent.inner.windows_jobobject_sandbox import _RESUME_THREAD_FAILED
+
+    kernel32 = ctypes.windll.kernel32
+    assert kernel32.ResumeThread.restype is wintypes.DWORD
+    assert kernel32.ResumeThread(wintypes.HANDLE(-1)) == _RESUME_THREAD_FAILED
+
+
+@pytest.mark.windows_only
+def test_shell_impl_normal_completion_spares_detached_child(tmp_path: Path) -> None:
+    """A truly detached child survives the normal close-without-terminate path."""
+    import sys
+    import time
+
+    marker = tmp_path / "detached_survived.txt"
+    worker = tmp_path / "detached_worker.py"
+    worker.write_text(
+        f"import time\ntime.sleep(2)\nopen({str(marker)!r}, 'w', encoding='utf-8').write('ok')\n",
+        encoding="utf-8",
+    )
+    launcher = tmp_path / "detached_launcher.py"
+    launcher.write_text(
+        "import subprocess, sys\n"
+        f"subprocess.Popen([sys.executable, {str(worker)!r}], "
+        "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
+        "stderr=subprocess.DEVNULL, close_fds=True, "
+        "creationflags=0x00000008 | 0x00000200)\n",
+        encoding="utf-8",
+    )
+
+    result = _shell_impl(
+        command=f'"{sys.executable}" "{launcher}"',
+        timeout=10,
+        shell_path=os.environ.get("COMSPEC", "cmd.exe"),
+        cwd=tmp_path,
+    )
+    assert result["exit_code"] == 0, result
+    assert result["timed_out"] is False, result
+    assert not marker.exists(), "detached worker completed before the shell returned"
+
+    deadline = time.monotonic() + 8
+    while time.monotonic() < deadline and not marker.exists():
+        time.sleep(0.05)
+    assert marker.exists(), "normal Job close killed the detached child"
+
+
+@pytest.mark.windows_only
 def test_shell_impl_runs_from_hostile_temp_dir(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A %TEMP% containing a space AND ``&`` must still run.
+    """A %TEMP% containing spaces, ``&``, and ``%NAME%`` must still run.
 
-    The batch path is double-quoted via ``/s /c ""<path>""`` so cmd strips only
-    the outer pair, leaving a properly quoted path — where a bare, list-quoted
-    path would break once cmd stripped its single quote pair.
+    The batch path is expanded once from a private environment variable, so cmd
+    does not reinterpret percent sequences inside the resulting path.
     """
     import tempfile
 
-    hostile = tmp_path / "a b & c"
+    hostile = tmp_path / "a b & %OMNIGENT_EXPAND_ME% c"
     hostile.mkdir()
+    monkeypatch.setenv("OMNIGENT_EXPAND_ME", "expanded")
     monkeypatch.setattr(tempfile, "tempdir", str(hostile))
     comspec = os.environ.get("COMSPEC", "cmd.exe")
     result = _shell_impl(command="echo spacey", timeout=15, shell_path=comspec, cwd=tmp_path)

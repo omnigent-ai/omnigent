@@ -1387,6 +1387,7 @@ def _truncate_output(text: str, label: str, limit: int = _MAX_TOOL_OUTPUT_CHARS)
 # winbase.h; subprocess does not expose it. Spawn the child suspended so it is
 # assigned to the containment job BEFORE cmd.exe can launch any grandchildren.
 _CREATE_SUSPENDED = 0x00000004
+_CMD_SCRIPT_ENV = "OMNIGENT_INTERNAL_CMD_SCRIPT"
 
 
 def _run_windows_cmd_shell(
@@ -1406,10 +1407,11 @@ def _run_windows_cmd_shell(
     ``CREATE_SUSPENDED`` and assigned to the job before it is resumed, so no
     grandchild can escape in a spawn/assign race. The job has **no**
     kill-on-close limit — a successful run's detached children (e.g. a server
-    the command started) survive; only a *timeout* calls ``TerminateJobObject``
-    to tear the tree down (grandchildren a parent-walk would miss included).
+    the command started) survive. A timeout or any other abnormal post-spawn
+    exit terminates the job tree (including orphaned grandchildren).
 
     :raises subprocess.TimeoutExpired: On timeout, after killing the tree.
+    :raises OSError: If race-free Job Object containment cannot be established.
     :returns: ``(stdout, stderr, returncode)``.
     """
     from omnigent.inner.windows_jobobject_sandbox import (
@@ -1420,20 +1422,28 @@ def _run_windows_cmd_shell(
     fd, script_path = tempfile.mkstemp(suffix=".cmd")
     os.close(fd)
     job = None
+    proc: subprocess.Popen[str] | None = None
+    completed = False
     try:
         Path(script_path).write_text(
-            "@echo off\r\nchcp 65001>nul\r\n" + command.replace("\n", "\r\n") + "\r\n",
+            (
+                f'@set "{_CMD_SCRIPT_ENV}="\r\n'
+                "@echo off\r\n"
+                "chcp 65001>nul\r\n" + command.replace("\n", "\r\n") + "\r\n"
+            ),
             encoding="utf-8",
         )
-        # Build the command line as a string (not a list) so the script path is
-        # double-quoted: `/s` strips the OUTER quote pair, leaving a properly
-        # quoted path — so a %TEMP% containing spaces or `&` still runs. `/d`
-        # skips any AutoRun registry command. Windows filenames can't contain a
-        # quote, so there is no embedded-quote escape to worry about.
-        cmdline = f'"{shell_path}" /d /s /c ""{script_path}""'
+        # One-pass environment expansion preserves literal ``%NAME%`` in the
+        # path; quoting also protects spaces and ``&``. The batch clears this
+        # private variable before it runs caller code.
+        child_env = dict(os.environ)
+        child_env[_CMD_SCRIPT_ENV] = script_path
+        cmdline = f'"{shell_path}" /d /s /v:off /c ""%{_CMD_SCRIPT_ENV}%""'
         spawn_kwargs = dict(_proc.spawn_kwargs())
         creationflags = int(spawn_kwargs.pop("creationflags", 0)) | _CREATE_SUSPENDED
         job = create_tree_kill_job()
+        if job is None:
+            raise OSError("could not create a Windows Job Object for cmd.exe containment")
         proc = subprocess.Popen(
             cmdline,
             cwd=str(cwd),
@@ -1443,28 +1453,38 @@ def _run_windows_cmd_shell(
             encoding="utf-8",
             errors="replace",
             creationflags=creationflags,
+            env=child_env,
             **spawn_kwargs,
         )
         # Assign while suspended (captures future children), then resume. If the
-        # resume fails the child would hang suspended, so treat it as fatal.
-        if job is not None:
-            job.assign(proc.pid)
+        # assignment/resume fails, never run the child outside containment.
+        if not job.assign(proc.pid):
+            raise OSError("could not assign the suspended cmd.exe process to its Job Object")
         if not resume_process_threads(proc.pid):
-            proc.kill()
-            with contextlib.suppress(subprocess.TimeoutExpired):
-                proc.communicate(timeout=5)
             raise OSError("could not resume the suspended cmd.exe process")
-        try:
-            stdout, stderr = proc.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            if job is not None:
-                job.terminate()  # kill the whole tree — only on timeout
-            _proc.kill_tree(proc)  # fallback when the job couldn't be created
-            with contextlib.suppress(subprocess.TimeoutExpired):
-                proc.communicate(timeout=5)
-            raise
-        return stdout, stderr, proc.returncode
+        stdout, stderr = proc.communicate(timeout=timeout)
+        returncode = proc.returncode
+        if returncode is None:
+            raise RuntimeError("cmd.exe exited without publishing a return code")
+        completed = True
+        return stdout, stderr, returncode
     finally:
+        # A normal communicate() completion is the only path that spares
+        # detached descendants. Timeout, cancellation, assignment/resume
+        # failure, and every other post-spawn exception tear down and reap.
+        if proc is not None and not completed:
+            if job is not None:
+                with contextlib.suppress(BaseException):
+                    job.terminate()
+            with contextlib.suppress(BaseException):
+                _proc.kill_tree(proc)
+            try:
+                proc.communicate(timeout=5)
+            except BaseException:  # noqa: BLE001 - cleanup must survive cancellation
+                with contextlib.suppress(BaseException):
+                    proc.kill()
+                with contextlib.suppress(BaseException):
+                    proc.wait(timeout=5)
         if job is not None:
             job.close()  # no kill-on-close: releasing the handle spares the tree
         with contextlib.suppress(OSError):
@@ -1499,8 +1519,7 @@ def _shell_impl(
     try:
         if windows_cmd:
             # cmd.exe can't run a quoted/multi-line command inline; route it
-            # through a temp batch file and kill the whole process tree on
-            # timeout (see _run_windows_cmd_shell).
+            # through a contained temp batch file (see _run_windows_cmd_shell).
             stdout_raw, stderr_raw, returncode = _run_windows_cmd_shell(
                 command, timeout=timeout, shell_path=shell_path, cwd=cwd
             )
