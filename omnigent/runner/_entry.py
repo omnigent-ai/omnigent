@@ -426,6 +426,7 @@ def _make_auth_token_factory(
     token_command = os.environ.get(_DATABRICKS_TOKEN_COMMAND_ENV_VAR, "").strip()
 
     if token_command:
+
         def _command_token() -> str | None:
             result = subprocess.run(
                 shlex.split(token_command),
