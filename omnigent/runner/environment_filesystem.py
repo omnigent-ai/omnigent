@@ -366,7 +366,9 @@ class CallerProcessFilesystem:
             raw = []
         for item in raw:
             name = item["n"]
-            rel = os.path.join(validated, name) if validated else name
+            # Always forward-slash: the API contract, glob logic, and web UI
+            # use POSIX-separated relative paths (os.path.join uses \ on Windows).
+            rel = f"{validated}/{name}" if validated else name
             entry_type = "directory" if item["t"] == "d" else "file"
             entries.append(
                 FilesystemEntry(
@@ -458,13 +460,13 @@ class CallerProcessFilesystem:
                 "    # Prune excluded subtrees (e.g. node_modules) from the walk.",
                 "    kept = []",
                 "    for d in sorted(dirnames):",
-                "        dp = os.path.normpath(os.path.join(dirpath, d))",
+                "        dp = os.path.normpath(os.path.join(dirpath, d)).replace(os.sep, '/')",
                 "        if any(r.match(dp) for r in exc):",
                 "            continue",
                 "        kept.append(d)",
                 "    dirnames[:] = kept",
                 "    for fname in sorted(filenames):",
-                "        p = os.path.normpath(os.path.join(dirpath, fname))",
+                "        p = os.path.normpath(os.path.join(dirpath, fname)).replace(os.sep, '/')",
                 "        if exc and any(r.match(p) for r in exc):",
                 "            continue",
                 "        if inc and not any(r.match(p) for r in inc):",
@@ -856,7 +858,12 @@ class CallerProcessFilesystem:
                 [
                     "import os, shutil",
                     f"p = {_json.dumps(validated)}",
-                    "if os.path.isdir(p):",
+                    # A directory symlink follows as isdir but shutil.rmtree
+                    # refuses it; remove the link itself (os.rmdir for a dir
+                    # symlink, os.remove for a file symlink) like `rm` would.
+                    "if os.path.islink(p):",
+                    "    (os.rmdir if os.path.isdir(p) else os.remove)(p)",
+                    "elif os.path.isdir(p):",
                     "    shutil.rmtree(p)",
                     "elif os.path.exists(p):",
                     "    os.remove(p)",

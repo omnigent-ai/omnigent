@@ -1579,9 +1579,9 @@ class TestPythonRunCommand:
         from omnigent.runner import environment_filesystem as efs
 
         monkeypatch.setattr(efs, "IS_WINDOWS", False)
-        cmd = efs._python_run_command("print('hi')")
-        assert cmd.startswith("python3 -c ")
-        assert "print('hi')" in cmd
+        # A script without single quotes so _shell_quote wraps it cleanly.
+        cmd = efs._python_run_command("import os")
+        assert cmd == "python3 -c 'import os'"
 
     def test_windows_base64_roundtrips(self, monkeypatch) -> None:
         import base64
@@ -1620,3 +1620,53 @@ async def test_inactive_sandbox_shell_runs_quoted_command_windows(tmp_path: Path
     assert result.get("exit_code") == 0, result
     assert "\\" not in result["stdout"], result["stdout"]  # not \"a b\"
     assert "a b" in result["stdout"]
+
+
+@pytest.mark.asyncio
+async def test_list_dir_returns_forward_slash_nested_paths(tmp_path: Path) -> None:
+    """Nested entry paths use POSIX '/' regardless of host OS (os.path.join
+    would emit '\' on Windows, which the API/glob/frontend reject)."""
+    ws = tmp_path / "ws"
+    (ws / "src").mkdir(parents=True)
+    (ws / "src" / "main.py").write_text("x")
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", cwd=str(ws), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    fs = CallerProcessFilesystem(os_env)
+    page = await fs.list_dir("src")
+    assert [e.path for e in page.data] == ["src/main.py"]
+
+
+@pytest.mark.asyncio
+async def test_search_matches_forward_slash_include(tmp_path: Path) -> None:
+    """search honours '/'-separated include globs and returns '/'-paths."""
+    ws = tmp_path / "ws"
+    (ws / "src").mkdir(parents=True)
+    (ws / "src" / "main.py").write_text("x")
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", cwd=str(ws), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    fs = CallerProcessFilesystem(os_env)
+    results = await fs.search_files("main", include=["src/**"])
+    assert [e.path for e in results] == ["src/main.py"]
+
+
+@pytest.mark.asyncio
+async def test_delete_directory_symlink_removes_link_not_target(tmp_path: Path) -> None:
+    """Deleting a directory symlink removes the link, not the target tree."""
+    ws = tmp_path / "ws"
+    target = ws / "real"
+    target.mkdir(parents=True)
+    (target / "keep.txt").write_text("x")
+    link = ws / "link"
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"cannot create directory symlink: {exc}")
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", cwd=str(ws), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    fs = CallerProcessFilesystem(os_env)
+    await fs.delete("link", recursive=True)
+    assert not link.is_symlink()
+    assert target.is_dir() and (target / "keep.txt").exists()
