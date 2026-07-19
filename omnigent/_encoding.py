@@ -30,6 +30,13 @@ def detect_encoding(path: Path) -> str:
     produces); the locale codec is the legacy fallback for a file that exists
     but is not valid UTF-8. A *missing* path resolves to UTF-8 so a file about
     to be created is written in the modern default rather than the locale codec.
+
+    This is a best-effort *detection* helper: an existing-but-unreadable file
+    (permissions, transient I/O) also resolves to the locale codec, matching the
+    tolerance of a plain ``ConfigParser.read`` on the same file. A caller that
+    must not act on a file it failed to read (i.e. a rewrite flow, which could
+    otherwise overwrite it) verifies readability itself — see
+    ``cli._read_existing_cfg``.
     """
     try:
         path.read_text(encoding="utf-8")

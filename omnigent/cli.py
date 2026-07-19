@@ -62,6 +62,8 @@ from omnigent.onboarding.ucode_setup import (
 from omnigent.process_logging import LOG_LEVEL_ENV_VAR, LOG_TO_STDERR_ENV_VAR
 
 if TYPE_CHECKING:
+    import configparser
+
     import httpx
 
     from omnigent._runner_startup import RunnerStartupProgress
@@ -9105,6 +9107,18 @@ def _node_dependency_problem() -> str | None:
     return f"Node.js is too old{detected} — Claude, Codex, and Pi need {_NODE_MIN_VERSION_HINT}."
 
 
+def _read_existing_cfg(cfg: configparser.ConfigParser, path: Path, encoding: str) -> None:
+    """Load *path* into *cfg* when it exists, raising if it exists but can't be read.
+
+    ``ConfigParser.read`` silently skips an unreadable file (permissions, a
+    transient I/O error), so a rewrite flow that trusted it would drop the user's
+    other sections and then replace the original — destroying it. Only a
+    genuinely missing file may no-op here (the new-config case).
+    """
+    if path.exists() and not cfg.read(path, encoding=encoding):
+        raise OSError(f"cannot read existing {path}; refusing to overwrite it")
+
+
 @contextlib.contextmanager
 def _isolated_databricks_cfg() -> collections.abc.Generator[None, None, None]:
     """Run Databricks setup against a temp config containing only our three profiles.
@@ -9136,6 +9150,14 @@ def _isolated_databricks_cfg() -> collections.abc.Generator[None, None, None]:
     from omnigent.onboarding.setup import CONFLICTING_ENV_VARS
 
     original_cfg = Path.home() / ".databrickscfg"
+    # Read the existing config (and detect its codec) BEFORE mutating the
+    # environment, so a hard failure — e.g. an unreadable original we must not
+    # overwrite — leaves both the env and the file untouched. ~/.databrickscfg is
+    # vendor-written; detect UTF-8 first (locale fallback) and preserve that codec
+    # on the write-back so a round-trip never re-encodes non-ASCII values.
+    orig_encoding = detect_encoding(original_cfg)
+    orig_cfg = configparser.ConfigParser()
+    _read_existing_cfg(orig_cfg, original_cfg, orig_encoding)
     saved_env: dict[str, str | None] = {
         "DATABRICKS_CONFIG_FILE": os.environ.get("DATABRICKS_CONFIG_FILE"),
     }
@@ -9151,17 +9173,11 @@ def _isolated_databricks_cfg() -> collections.abc.Generator[None, None, None]:
 
     # Temp file contains only the canonical internal-beta profile sections
     # (see DEFAULT_PROFILES), seeded from the original when they already
-    # exist. Everything else is excluded so there is exactly one
-    # section per workspace host and `databricks auth token --host X`
-    # never hits the "multiple profiles match" ambiguity error.
-    # ~/.databrickscfg is vendor-written; detect the real file's codec (UTF-8
-    # first, locale fallback) and preserve it across the final write-back so a
-    # round-trip never re-encodes non-ASCII values. The temp file below is ours,
-    # so it stays UTF-8 (setup detects+preserves, so it round-trips).
-    orig_encoding = detect_encoding(original_cfg)
-    orig_cfg = configparser.ConfigParser()
-    if original_cfg.exists():
-        orig_cfg.read(original_cfg, encoding=orig_encoding)
+    # exist. Everything else is excluded so there is exactly one section per
+    # workspace host and `databricks auth token --host X` never hits the
+    # "multiple profiles match" ambiguity error. The temp file below is ours, so
+    # it stays UTF-8 (setup detects+preserves, so it round-trips); the write-back
+    # preserves the original's detected codec (orig_encoding, above).
     cfg = configparser.ConfigParser()
     for spec in DEFAULT_PROFILES:
         if orig_cfg.has_section(spec.name):
@@ -9203,8 +9219,7 @@ def _isolated_databricks_cfg() -> collections.abc.Generator[None, None, None]:
         tmp_cfg = configparser.ConfigParser()
         tmp_cfg.read(tmp_path, encoding="utf-8")  # our temp file (written above)
         orig_cfg = configparser.ConfigParser()
-        if original_cfg.exists():
-            orig_cfg.read(original_cfg, encoding=orig_encoding)
+        _read_existing_cfg(orig_cfg, original_cfg, orig_encoding)
         for spec in DEFAULT_PROFILES:
             if tmp_cfg.has_section(spec.name):
                 orig_cfg[spec.name] = dict(tmp_cfg[spec.name])
