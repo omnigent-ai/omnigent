@@ -26,7 +26,6 @@ from omnigent_slack.events import (
     _extract_list,
     _extract_runner_id,
     _extract_session_id,
-    _host_id,
     _is_host_online,
     extract_assistant_text,
     extract_delta,
@@ -36,6 +35,7 @@ from omnigent_slack.events import (
     extract_output_file,
     extract_policy_denied,
     extract_todos,
+    host_id_of,
     is_hard_terminal_event,
     iter_sse_events,
     session_status,
@@ -185,10 +185,15 @@ class OmnigentClient:
             return {"Authorization": f"Bearer {self._auth.access_token}"}
         return {}
 
+    def _unreachable(self, exc: httpx.HTTPError) -> ServerUnreachableError:
+        # A transport failure (DNS, refused connection, timeout) means the server
+        # itself is unreachable — distinct from an HTTP error response, which
+        # ``_raise_for_status`` classifies.
+        return ServerUnreachableError(
+            f"Could not reach Omnigent server at {self._client.base_url}: {exc}"
+        )
+
     async def _request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
-        # A transport failure (DNS, refused connection, timeout) means the
-        # server itself is unreachable — distinct from an HTTP error response,
-        # which ``_raise_for_status`` classifies.
         used_token = self._auth.access_token if self._auth is not None else None
         # Pop caller headers once — a second pop would return None and silently
         # drop them on the 401 retry below.
@@ -197,9 +202,7 @@ class OmnigentClient:
         try:
             response = await self._client.request(method, url, headers=headers, **kwargs)
         except httpx.HTTPError as exc:
-            raise ServerUnreachableError(
-                f"Could not reach Omnigent server at {self._client.base_url}: {exc}"
-            ) from exc
+            raise self._unreachable(exc) from exc
         # A delegated token expires within the hour; on a 401 refresh once
         # and retry so long-lived threads keep working without re-login.
         if response.status_code == 401 and self._auth is not None:
@@ -211,9 +214,7 @@ class OmnigentClient:
                         method, url, headers=retry_headers, **kwargs
                     )
                 except httpx.HTTPError as exc:
-                    raise ServerUnreachableError(
-                        f"Could not reach Omnigent server at {self._client.base_url}: {exc}"
-                    ) from exc
+                    raise self._unreachable(exc) from exc
         return response
 
     async def check_health(self) -> None:
@@ -248,7 +249,11 @@ class OmnigentClient:
         payload = response.json()
         session_id = _extract_session_id(payload)
         if session_id is None:
-            raise OmnigentError(f"Create session response did not include an id: {payload!r}")
+            # Log the raw body for operators, but keep it out of the exception —
+            # it surfaces to the Slack thread, and a server body can carry
+            # internal detail (matches the discipline in _raise_for_status).
+            self._logger.warning("Create session response had no id: %r", payload)
+            raise OmnigentError("Omnigent server returned no session id.")
         self._logger.info("Created Omnigent session session_id=%s", session_id)
         return session_id
 
@@ -352,7 +357,10 @@ class OmnigentClient:
         payload = response.json()
         runner_id = _extract_runner_id(payload)
         if runner_id is None:
-            raise OmnigentError(f"Launch runner response did not include a runner id: {payload!r}")
+            # Log the raw body for operators; keep it out of the thread-facing
+            # exception (see create_session / _raise_for_status).
+            self._logger.warning("Launch runner response had no id: %r", payload)
+            raise OmnigentError("Omnigent server returned no runner id.")
 
         await self.wait_for_runner_online(runner_id)
         self._logger.info(
@@ -406,7 +414,7 @@ class OmnigentClient:
         host_ids = [
             host_id
             for host in hosts
-            if _is_host_online(host) and (host_id := _host_id(host)) is not None
+            if _is_host_online(host) and (host_id := host_id_of(host)) is not None
         ]
         if not host_ids:
             raise HostUnavailableError(
@@ -466,9 +474,7 @@ class OmnigentClient:
                 self._logger.debug("Connected to Omnigent SSE stream session_id=%s", session_id)
                 yield iter_sse_events(response.aiter_lines())
         except httpx.HTTPError as exc:
-            raise ServerUnreachableError(
-                f"Could not reach Omnigent server at {self._client.base_url}: {exc}"
-            ) from exc
+            raise self._unreachable(exc) from exc
 
     async def run_turn(
         self,
@@ -810,6 +816,16 @@ async def _raise_for_status(response: httpx.Response) -> None:
         )
         if response.status_code == 503 and error_code == "runner_unavailable":
             raise RunnerUnavailableError("Omnigent runner is unavailable.") from exc
+        # A 3xx redirect means an auth proxy in front of the server is bouncing
+        # an unauthenticated request to its login page — the omnigent API itself
+        # never redirects its own endpoints. This is how a Databricks-App-hosted
+        # server signals "no credentials" (its proxy 302s to /oidc/... rather
+        # than returning 401), so treat it the same as 401 → the setup flow then
+        # starts the per-user login/enrollment instead of reporting "unreachable".
+        if response.is_redirect:
+            raise AuthRequiredError(
+                f"Omnigent server requires authentication for {response.request.url}"
+            ) from exc
         if response.status_code == 401:
             raise AuthRequiredError(
                 f"Omnigent server requires authentication for {response.request.url}"

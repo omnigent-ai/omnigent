@@ -1358,9 +1358,10 @@ async def test_unreachable_server_prompts_config_command(tmp_path: Path) -> None
 
 
 async def test_auth_required_prompts_relogin(tmp_path: Path) -> None:
-    # A user with saved config but no valid token (e.g. bot restarted, in-memory
-    # tokens lost) is told to log in again. The ack is posted only after the
-    # session starts, so a failed start leaves no "Working on it…" behind.
+    # A user with saved config but an expired/lost token is told to log in
+    # again — ephemerally, so a routine ~1h expiry doesn't spam the thread. The
+    # ack posts only after the session starts, so a failed start leaves no
+    # "Working on it…" behind.
     store = await _store(tmp_path)
     slack = FakeSlackClient()
     omnigent = AuthRequiredClient()
@@ -1373,16 +1374,22 @@ async def test_auth_required_prompts_relogin(tmp_path: Path) -> None:
         client=slack,
         context={"bot_user_id": "B1"},
     )
-    await _wait_for_posts(slack, 1)
+    for _ in range(50):
+        if slack.ephemerals:
+            break
+        await asyncio.sleep(0.02)
     await service.shutdown()
 
     # No placeholder was posted (session never started).
     assert slack.acks == []
-    # No session persisted; the user is told to log in again.
+    # No session persisted.
     assert await store.get_session(ThreadKey("T1", "C1", "100.1")) is None
-    text = slack.posts[-1]["text"]
-    assert "/omnigent" in text
-    assert "log in" in text.lower() or "login" in text.lower()
+    # The re-login notice is ephemeral (sender-only), not a public thread post.
+    assert slack.posts == []
+    notice = slack.ephemerals[-1]
+    assert notice["user"] == "U1"
+    assert "/omnigent" in notice["text"]
+    assert "expired" in notice["text"].lower()
 
 
 async def test_server_error_creating_session_reports(tmp_path: Path) -> None:
@@ -1411,6 +1418,9 @@ async def test_server_error_creating_session_reports(tmp_path: Path) -> None:
     assert await store.get_session(ThreadKey("T1", "C1", "100.1")) is None
     text = slack.posts[-1]["text"]
     assert "failed" in text.lower()
+    # A non-auth error is PUBLIC (affects everyone on the thread), unlike the
+    # expired-login notice — this pins the other side of _classify_turn_error.
+    assert slack.ephemerals == []
 
 
 async def test_no_online_host_prompts_omni_host_command(tmp_path: Path) -> None:

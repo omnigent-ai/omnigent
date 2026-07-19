@@ -2,17 +2,18 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 
-import httpx
 import pytest
-import respx
 from aiohttp.test_utils import TestClient, TestServer
 from omnigent_slack.config import Settings
-from omnigent_slack.databricks_auth import FORWARDED_ACCESS_TOKEN_HEADER, sign_state
+from omnigent_slack.enrollment_state import (
+    FORWARDED_ACCESS_TOKEN_HEADER,
+    FORWARDED_EMAIL_HEADER,
+    sign_state,
+)
 from omnigent_slack.tokens import InMemoryTokenStore
 from omnigent_slack.webauth import WebAuthServer
 
 _STATE_SECRET = "state-secret"
-_AUDIENCE = "target-app-client-id"
 
 
 def _settings() -> Settings:
@@ -22,9 +23,7 @@ def _settings() -> Settings:
         OMNIGENT_SLACK_APP_TOKEN="xapp-x",
         OMNIGENT_SERVER_URL="https://omnigent.example.com",
         OMNIGENT_SLACK_SERVER_AUTH="databricks",
-        OMNIGENT_SLACK_DATABRICKS_AUDIENCE=_AUDIENCE,
         OMNIGENT_SLACK_DATABRICKS_STATE_SECRET=_STATE_SECRET,
-        OMNIGENT_SLACK_DATABRICKS_WORKSPACE_HOST="https://ws.example.com",
         OMNIGENT_SLACK_WEBAUTH_BASE_URL="https://slackbot.example.com",
     )
 
@@ -47,54 +46,121 @@ async def harness() -> AsyncIterator[tuple[TestClient, InMemoryTokenStore, list[
         await client.close()
 
 
+_EMAIL = "user@example.com"
+
+
+def _headers(token: str = "forwarded-user-token", email: str = _EMAIL) -> dict[str, str]:
+    return {FORWARDED_ACCESS_TOKEN_HEADER: token, FORWARDED_EMAIL_HEADER: email}
+
+
 def test_enrollment_url_signed_and_pointed_at_base() -> None:
     server = WebAuthServer(_settings(), InMemoryTokenStore())
-    url = server.enrollment_url("T1", "U1")
+    url = server.enrollment_url("T1", "U1", _EMAIL)
     assert url is not None
     assert url.startswith("https://slackbot.example.com/auth/callback?state=")
 
 
-def test_enrollment_url_none_without_base() -> None:
+def test_enrollment_url_none_without_email() -> None:
+    # No email → no verifiable link (fail closed), even with base + secret set.
+    server = WebAuthServer(_settings(), InMemoryTokenStore())
+    assert server.enrollment_url("T1", "U1", "") is None
+
+
+def test_enrollment_url_none_without_base(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Fail closed when no public base URL is configured. webauth_base_url falls
+    # back to the DATABRICKS_APP_URL env var, so clear it — otherwise a value in
+    # the runner's environment would make this assert nothing and silently pass.
+    monkeypatch.delenv("DATABRICKS_APP_URL", raising=False)
     settings = _settings().model_copy(update={"databricks_webauth_base_url": None})
-    # Also clear the DATABRICKS_APP_URL fallback by constructing without it.
     server = WebAuthServer(settings, InMemoryTokenStore())
-    # webauth_base_url reads env; ensure None when neither config nor env set.
-    if settings.webauth_base_url is None:
-        assert server.enrollment_url("T1", "U1") is None
+    assert settings.webauth_base_url is None
+    assert server.enrollment_url("T1", "U1", _EMAIL) is None
 
 
 @pytest.mark.asyncio
-@respx.mock
-async def test_callback_exchanges_and_stores_token(harness) -> None:
+async def test_get_shows_consent_and_stores_nothing(harness) -> None:
+    # The GET landing shows a consent page naming the identities but must NOT
+    # persist a token — storage only happens on the confirming POST.
     client, store, enrolled = harness
-    respx.post("https://ws.example.com/oidc/v1/token").mock(
-        return_value=httpx.Response(200, json={"access_token": "app-scoped-token"})
-    )
-    state = sign_state("T1", "U1", _STATE_SECRET)
+    state = sign_state("T1", "U1", _EMAIL, _STATE_SECRET, team_name="Acme")
 
-    resp = await client.get(
-        "/auth/callback",
-        params={"state": state},
-        headers={FORWARDED_ACCESS_TOKEN_HEADER: "forwarded-user-token"},
-    )
+    resp = await client.get("/auth/callback", params={"state": state}, headers=_headers())
     assert resp.status == 200
+    body = await resp.text()
+    assert "about to connect" in body
+    assert "https://omnigent.example.com" in body  # names the server
+    assert _EMAIL in body
+    assert '<form method="post"' in body  # a Confirm button that POSTs
+
+    assert await store.get("T1", "U1", "https://omnigent.example.com") is None
+    assert enrolled == []
+
+
+@pytest.mark.asyncio
+async def test_post_confirm_stores_forwarded_token(harness) -> None:
+    client, store, enrolled = harness
+    state = sign_state("T1", "U1", _EMAIL, _STATE_SECRET)
+
+    resp = await client.post("/auth/callback", params={"state": state}, headers=_headers())
+    assert resp.status == 200
+    body = await resp.text()
+    assert "connected" in body
 
     record = await store.get("T1", "U1", "https://omnigent.example.com")
     assert record is not None
-    assert record.access_token == "app-scoped-token"
-    # Empty refresh: re-enroll on expiry (no broad token stored).
+    # The forwarded user token is stored directly (Databricks OBO); no exchange.
+    assert record.access_token == "forwarded-user-token"
+    # Empty refresh: re-enroll on expiry (no refresh token stored).
     assert record.refresh_token == ""
     assert enrolled == [("T1", "U1", "https://omnigent.example.com")]
 
 
 @pytest.mark.asyncio
-async def test_callback_rejects_bad_state(harness) -> None:
+async def test_post_confirm_email_match_is_case_insensitive(harness) -> None:
     client, store, _ = harness
+    state = sign_state("T1", "U1", "User@Example.com", _STATE_SECRET)
+    resp = await client.post(
+        "/auth/callback", params={"state": state}, headers=_headers(email="user@example.com")
+    )
+    assert resp.status == 200
+    assert await store.get("T1", "U1", "https://omnigent.example.com") is not None
+
+
+@pytest.mark.asyncio
+async def test_post_confirm_rejects_email_mismatch(harness) -> None:
+    # Confused-deputy guard: the browser (victim) email differs from the email
+    # the link was issued for (attacker). Must refuse and store nothing — even
+    # on the POST (validation is re-run, never trusting that a GET happened).
+    client, store, enrolled = harness
+    state = sign_state("T1", "ATTACKER", "attacker@example.com", _STATE_SECRET)
+    resp = await client.post(
+        "/auth/callback",
+        params={"state": state},
+        headers=_headers(token="victim-token", email="victim@example.com"),
+    )
+    assert resp.status == 403
+    assert await store.get("T1", "ATTACKER", "https://omnigent.example.com") is None
+    assert enrolled == []
+
+
+@pytest.mark.asyncio
+async def test_get_consent_rejects_email_mismatch(harness) -> None:
+    # The mismatch is caught at the consent step too, so a victim never even
+    # sees a Confirm button for someone else's link.
+    client, _, _ = harness
+    state = sign_state("T1", "ATTACKER", "attacker@example.com", _STATE_SECRET)
     resp = await client.get(
         "/auth/callback",
-        params={"state": "tampered"},
-        headers={FORWARDED_ACCESS_TOKEN_HEADER: "forwarded-user-token"},
+        params={"state": state},
+        headers=_headers(email="victim@example.com"),
     )
+    assert resp.status == 403
+
+
+@pytest.mark.asyncio
+async def test_callback_rejects_bad_state(harness) -> None:
+    client, store, _ = harness
+    resp = await client.post("/auth/callback", params={"state": "tampered"}, headers=_headers())
     assert resp.status == 400
     assert await store.get("T1", "U1", "https://omnigent.example.com") is None
 
@@ -102,27 +168,24 @@ async def test_callback_rejects_bad_state(harness) -> None:
 @pytest.mark.asyncio
 async def test_callback_missing_forwarded_token_is_401(harness) -> None:
     client, store, _ = harness
-    state = sign_state("T1", "U1", _STATE_SECRET)
-    # No x-forwarded-access-token header — proxy/user-auth misconfiguration.
-    resp = await client.get("/auth/callback", params={"state": state})
+    state = sign_state("T1", "U1", _EMAIL, _STATE_SECRET)
+    # No x-forwarded-* headers — proxy/user-auth misconfiguration.
+    resp = await client.post("/auth/callback", params={"state": state})
     assert resp.status == 401
     assert await store.get("T1", "U1", "https://omnigent.example.com") is None
 
 
 @pytest.mark.asyncio
-@respx.mock
-async def test_callback_exchange_failure_is_502(harness) -> None:
+async def test_callback_missing_forwarded_email_is_401(harness) -> None:
     client, store, _ = harness
-    respx.post("https://ws.example.com/oidc/v1/token").mock(
-        return_value=httpx.Response(403, json={"error": "access_denied"})
-    )
-    state = sign_state("T1", "U1", _STATE_SECRET)
-    resp = await client.get(
+    state = sign_state("T1", "U1", _EMAIL, _STATE_SECRET)
+    # Token present but no email header — can't verify identity, fail closed.
+    resp = await client.post(
         "/auth/callback",
         params={"state": state},
-        headers={FORWARDED_ACCESS_TOKEN_HEADER: "forwarded-user-token"},
+        headers={FORWARDED_ACCESS_TOKEN_HEADER: "tok"},
     )
-    assert resp.status == 502
+    assert resp.status == 401
     assert await store.get("T1", "U1", "https://omnigent.example.com") is None
 
 

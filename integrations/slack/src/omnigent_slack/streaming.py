@@ -208,6 +208,7 @@ class _AnswerReply:
         self._reply = _LiveReply(client, key, recipient_user_id=recipient_user_id)
         self._client = client
         self._key = key
+        self._recipient_user_id = recipient_user_id
         self._ack_ts = ack_ts
         self._logger = logger
         self._streamed = ""
@@ -315,13 +316,24 @@ class _AnswerReply:
     def set_fallback_text(self, text: str) -> None:
         self._final = text
 
-    async def stop_with(self, text: str) -> None:
+    async def stop_with(self, text: str, *, ephemeral: bool = False) -> None:
         # Terminal notice (auth/unreachable/host errors, or a no-op abort): clear
-        # the placeholder, then deliver ``text`` as a plain thread reply. Empty
-        # text is a silent stop (nothing to say). A notice is not a streamed
-        # answer, so it goes via a normal message, not the streaming reply.
+        # the placeholder, then deliver ``text``. Empty text is a silent stop
+        # (nothing to say). A notice is not a streamed answer, so it goes via a
+        # normal message, not the streaming reply. ``ephemeral`` sends it only to
+        # the sender (e.g. a routine "login expired" notice), so it doesn't spam
+        # the thread for everyone else.
         await self._clear_ack()
-        if text:
+        if not text:
+            return
+        if ephemeral:
+            await self._client.chat_postEphemeral(
+                channel=self._key.channel_id,
+                thread_ts=self._key.thread_ts,
+                user=self._recipient_user_id,
+                text=truncate_for_slack(text),
+            )
+        else:
             await self._client.chat_postMessage(
                 channel=self._key.channel_id,
                 thread_ts=self._key.thread_ts,

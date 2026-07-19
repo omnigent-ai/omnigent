@@ -1,0 +1,4 @@
+command: ["python", "app.py"]
+env:
+  - name: OMNIGENT_SLACK_SERVER_AUTH
+    value: databricks

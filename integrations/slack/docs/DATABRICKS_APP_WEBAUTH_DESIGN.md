@@ -1,15 +1,16 @@
 # Design: omnigent-slack web-auth page for Databricks-App-hosted servers
 
-Status: **implemented (pending live validation)**. Code lives in
-`omnigent_slack/databricks_auth.py` (state signing + token exchange),
-`omnigent_slack/webauth.py` (enrollment web server), and the `databricks`
-branch of `config.py` / `setup.py` / `auth_manager.py` / `app.py`. The open
-questions at the end still require a spike against a real workspace
-(e2-dogfood) — they are correctness contingencies, not blockers to the code.
+Status: **implemented and validated on e2-dogfood.** Code lives in
+`omnigent_slack/enrollment_state.py` (state signing), `omnigent_slack/webauth.py`
+(enrollment web server), and the `databricks` branch of `config.py` /
+`setup.py` / `auth_manager.py` / `app.py`. Operator/deploy guide:
+[`../deploy/databricks/README.md`](../deploy/databricks/README.md).
 
-Companion to [`DATABRICKS_APP_AUTH_SPIKE.md`](./DATABRICKS_APP_AUTH_SPIKE.md)
-(the experiment plan). Experiment workspace:
-`https://e2-dogfood.staging.cloud.databricks.com/`.
+> The original proposal narrowed the stored token to omnigent-dev via an
+> audience-scoped token exchange. That is unavailable (Databricks rejects
+> `audience` for an access-token subject), so the shipped design passes the
+> forwarded token straight through, bounded by `user_api_scopes`. See
+> [How least-privilege is achieved](#how-least-privilege-is-achieved).
 
 ## Goal
 
@@ -18,9 +19,9 @@ Databricks App in **header/proxy mode**, where:
 
 - the Databricks Apps proxy authenticates every request and injects
   `X-Forwarded-Email` (the app trusts it verbatim; the proxy is the only
-  reachable path — `deploy/databricks/README.md:187-195`),
-- the server cannot mint its own tokens (`mint_runner_token` → `None` in header
-  mode, `server/auth.py:496-508`),
+  reachable path — see the server deploy's `deploy/databricks/README.md`),
+- the server cannot mint its own tokens (`mint_runner_token` returns `None` in
+  header mode, `omnigent/server/auth.py`),
 - Slack events arrive over a Socket-Mode websocket with **no** authenticated
   HTTP request, so there is no `x-forwarded-access-token` to relay and no
   unauthenticated Omnigent endpoint to run the existing device flow against.
@@ -31,84 +32,83 @@ Deploy **omnigent-slack itself as a Databricks App with user authorization
 enabled**, exposing a small **web auth page**. A Slack user opening that page
 makes an authenticated browser request *through omnigent-slack's own proxy* —
 which is exactly the authenticated HTTP context Slack traffic otherwise lacks.
-That page runs an OAuth flow, obtains a **per-user, app-audience-scoped** token
-for omnigent-dev, and the bot stores it and uses it for that user's requests.
+The proxy forwards that user's access token (`x-forwarded-access-token`); the
+bot stores it and uses it as the bearer for that user's requests to omnigent-dev
+(Databricks' documented on-behalf-of pattern — pass the forwarded token
+through).
 
-## The security keystone: audience-scoped token exchange
+## How least-privilege is achieved
 
-The premise "store tokens only if they can only talk to omnigent-dev" is
-**achievable** and documented. Databricks supports OAuth token exchange scoped
-to a single app via its `oauth2_app_client_id` as `audience`:
+The original design aimed to store a token scoped to *only* omnigent-dev via an
+**audience-scoped token exchange** (`oauth2_app_client_id` as `audience`). That
+turned out to be **unavailable**: Databricks rejects `audience` for an
+`access_token` subject (`"audience parameter is not supported for access_token"`)
+— it's only supported for PAT-type subjects (the notebook→app flow). The
+`x-forwarded-access-token` is an OAuth access token, so it can't be narrowed.
 
-```
-POST https://<ws>/oidc/v1/token
-  grant_type       = urn:ietf:params:oauth:grant-type:token-exchange
-  subject_token    = <user's token>
-  subject_token_type = urn:databricks:params:oauth:token-type:... (PAT/access token)
-  requested_token_type = urn:ietf:params:oauth:token-type:access_token
-  scope            = all-apis
-  audience         = <omnigent-dev app_client_id>   # w.apps.get("omnigent-dev").oauth2_app_client_id
-```
-
-Databricks states verbatim: **"The exchanged token is scoped to the specific
-app, so you can't use it to call other Databricks APIs."**
-
-This is the mechanism that makes token storage acceptable: even though the
-*subject* token may be broad, the **exchanged token the bot stores/uses is
-inert against clusters/jobs/SQL/secrets/UC** — it only opens omnigent-dev's
-door. A bot-DB breach then leaks "can talk to Omnigent as this user," not a
-workspace skeleton key — which is the property we wanted.
-
-> Caveat requiring verification (spike): docs demonstrate token exchange
-> **notebook→app** and do not explicitly document **user-OBO→app** exchange
-> preserving user identity, nor the exchanged token's **lifetime/refresh**. If
-> the exchanged token is short-lived with no refresh, the bot must re-exchange
-> from a stored (broader) refresh token — which reintroduces holding a broad
-> refresh token at rest. See Open Questions.
+Least-privilege instead comes from the app's declared **`user_api_scopes`**
+(`iam.current-user:read`). The forwarded token can only do what those scopes
+permit, so a stolen store leaks "act as this user within those scopes", not a
+workspace skeleton key. It's not as tight as a single-app-audience token would
+have been, but it is **not** a broad `all-apis` credential either. Keep
+`user_api_scopes` as narrow as the omnigent-dev proxy will accept.
 
 ## Flow
 
-### Enrollment (once per Slack user, or on token expiry)
+### Enrollment (once per Slack user, or on token expiry) — as implemented
 
-1. Slack user runs `/omnigent ...`; bot has no valid token for
+1. Slack user runs `/omnigent`; bot has no valid token for
    `(team, user, omnigent-dev)`.
-2. Bot posts an ephemeral Slack message with an **enrollment link** to
-   omnigent-slack's own App URL:
-   `https://<slack-app-host>/auth/start?state=<signed: team,user,nonce>`.
-3. User clicks → browser hits omnigent-slack **through its own Databricks
-   proxy**, which authenticates the user (SSO) and injects
-   `x-forwarded-access-token` + `X-Forwarded-Email` for that user.
-4. omnigent-slack's page:
-   - **3A path:** uses the forwarded `x-forwarded-access-token` directly as the
-     subject token; or
-   - **3B path:** runs auth-code+PKCE against Databricks as a registered custom
-     OAuth client to obtain access + **refresh** tokens (durable).
-5. omnigent-slack performs the **audience-scoped token exchange** (above) to
-   mint an omnigent-dev-only token for the user.
-6. Bot stores, keyed by `(team_id, user_id, omnigent-dev-host)`: the app-scoped
-   access token (+ refresh material if 3B), encrypted at rest. Validates the
-   `state` nonce to bind the browser session back to the Slack identity.
-7. Page shows "You're connected — return to Slack."
+2. Bot looks up the user's email via Slack `users.info` and posts an
+   **enrollment link** to omnigent-slack's own App URL:
+   `https://<slack-app-host>/auth/callback?state=<HMAC-signed: team,user,email,team_name,issued_at>`.
+   If the email can't be resolved (missing `users:read.email` scope), the bot
+   **fails closed** — no link is issued.
+3. User clicks → browser makes a **GET** to omnigent-slack **through its own
+   Databricks proxy**, which authenticates the user (SSO) and injects
+   `x-forwarded-access-token` + `x-forwarded-email` for that user.
+4. The `GET /auth/callback` (consent) handler:
+   a. verifies the signed `state` (HMAC-SHA256, TTL-bounded);
+   b. **identity binding:** requires `x-forwarded-email` to equal the email in
+      the state (`emails_match`, case-insensitive). Mismatch → 403. This closes
+      the confused-deputy (a link for user A opened by victim V is refused).
+   c. renders a **consent page** naming the exact identities ("You are about to
+      connect your Omnigent `<server>` account `<idp-email>` with Slack user
+      `<slack-email>` in workspace `<name>`") with a **Confirm** button — and
+      stores **nothing**.
+5. Confirm submits a **POST** to the same URL. The `POST` handler re-runs the
+   full validation (never trusts that a GET happened), then stores the forwarded
+   `x-forwarded-access-token` **directly** (Databricks OBO — no token exchange;
+   audience-scoping is unavailable for access-token subjects), keyed by
+   `(team_id, user_id, omnigent-dev-host)`, encrypted at rest, empty refresh
+   token.
+6. Success page confirms which identities were linked and how to undo
+   (`/omnigent logout`).
+
+Splitting consent (GET) from storage (POST) means a credential is **never
+persisted without an explicit user action** on a page that names the identities
+— the browser user is whoever the proxy authenticated, which may not be the
+person handed the link, so they must confirm *their own* identity first. It also
+makes the state-mutating step a POST rather than a side-effecting GET.
 
 ### Per-request (steady state)
 
-- Bot resolves the stored app-scoped token for `(team,user,server)`.
-- Calls omnigent-dev with `Authorization: Bearer <app-scoped token>` (+
+- Bot resolves the stored token for `(team,user,server)`.
+- Calls omnigent-dev with `Authorization: Bearer <forwarded token>` (+
   `X-Databricks-Org-Id` routing, reusing `databricks_request_headers`).
 - omnigent-dev's proxy validates it and injects **`X-Forwarded-Email` for the
   real user** → `server/auth.py` header mode maps it to the Omnigent user.
 - **No omnigent-dev changes.** Identity mapping is entirely the existing header
   path.
-- On 401 (expiry), re-exchange from refresh material; if that fails, re-post the
-  enrollment link.
+- On 401 (expiry) there is no refresh token, so the stored token is dropped and
+  the user re-enrolls via a fresh link (same model as `oidc` session JWTs).
 
-### Transport question (orthogonal, still open)
+### Transport
 
-Whether the bot's connection to omnigent-dev can be a long-lived `wss://`
-tunnel through the proxy is a **separate** unknown (spike E2). If WS-through-
-proxy is unsupported, the bot uses HTTP request/response + SSE for streaming,
-which the current bot already does for most calls (`omnigent.py`). This design
-is about **identity**, not transport; it works with either.
+Identity and transport are independent. The bot talks to omnigent-dev over
+ordinary HTTP request/response + SSE (`omnigent.py`), which is what it already
+uses for every other server — no `wss://` tunnel through the proxy is required.
+This design is only about **identity**.
 
 ## Why this beats the alternatives
 
@@ -116,7 +116,7 @@ is about **identity**, not transport; it works with either.
 |---|---|---|---|
 | SP app-to-app (M2M) | ❌ all users collapse to one SP | n/a (but wrong identity) | none, but unusable |
 | Store raw `all-apis` user token | ✅ | ❌ full workspace | none |
-| **Web page + audience-scoped exchange** | ✅ | ✅ omnigent-dev only | **none** |
+| **Web page + forwarded token, `user_api_scopes`-limited** | ✅ | ✅ limited to `user_api_scopes` | **none** |
 
 ## Critique
 
@@ -124,68 +124,71 @@ is about **identity**, not transport; it works with either.
 
 - **Solves the identity problem with zero omnigent-dev changes** — reuses the
   existing header-mode path; the proxy does the mapping.
-- **Audience-scoped exchange makes stored tokens genuinely least-privilege** —
-  directly addresses the "skeleton key" objection; a breach is contained to
-  Omnigent access.
+- **`user_api_scopes` bounds the stored token** — not a single-app-audience
+  token (unavailable, see above), but a narrowly-scoped one, not a workspace
+  skeleton key.
 - **Never reintroduces a spoofable header** — identity always rides a real
   proxy-validated token; the proxy's header-stripping boundary stays intact.
 - **Enrollment anchor is legitimate** — the web page manufactures the
   authenticated HTTP context Slack lacks, using a first-class Apps feature
   (user authorization), not a hack.
+- **Confirm-before-store + email binding** — a credential is never persisted
+  without an explicit user action on a page naming the exact identities, and the
+  browser's email must match the signed Slack email (closes the confused-deputy).
 
-### Weaknesses / risks
+### Weaknesses / risks (current state)
 
-1. **Exchanged-token lifetime/refresh is unproven.** If app-scoped tokens are
-   ~1h with no refresh, the bot must re-exchange from a stored **broad** token
-   (access or refresh), so *something* broad may still sit at rest — partially
-   eroding the least-privilege win. Must verify (E4/E5). Mitigation: store only
-   a refresh token (not a live broad access token) and mint app-scoped tokens
-   just-in-time; or accept hourly re-enrollment (drop refresh) for max safety.
-2. **User-OBO→app exchange may not be documented/supported.** Docs show
-   notebook→app. If user-identity exchange isn't supported, 3A/3B may not
-   produce a token that both (a) is app-scoped and (b) still resolves to the
-   *user* at omnigent-dev's proxy. This is the single biggest correctness
-   unknown — must verify before committing.
-3. **Two apps to operate + a custom OAuth integration** (3B) — more deployment
-   surface, an account-level admin action to register the client, redirect-URI
-   management, and a second app's lifecycle. Heavier than the current
-   single-daemon bot.
-4. **omnigent-slack now holds user tokens for many users** — even app-scoped,
-   it's a higher-value target than today's Omnigent-delegated-token store.
-   Requires KMS-backed encryption, per-user revocation on Slack deprovisioning,
-   and audit logging.
-5. **`state`/CSRF binding is security-critical** — the browser session must be
-   cryptographically bound to the Slack `(team,user)` that requested it, or one
-   user could enroll another's Slack identity. Signed, single-use, short-TTL
-   `state` is mandatory.
-6. **WebSocket transport still unresolved** (E2) — if the host-tunnel model is
-   needed and WS-through-proxy is unsupported, that's a separate blocker this
-   design doesn't address.
-7. **Consumer vs workspace access** — a Slack user with only consumer access to
-   the workspace may authenticate to omnigent-slack's page but still be rejected
-   by omnigent-dev (mirrors the CLI "not assigned to this application" case).
-   Enrollment must surface this clearly.
+1. **No refresh — hourly re-enrollment.** The forwarded `x-forwarded-access-token`
+   is ~1h with no refresh token, so a user must re-click the enrollment link
+   about once an hour. Stored with `refresh_token=""`; on 401 the token is
+   dropped and re-enrollment is prompted. Poor fit for a chat bot where a user
+   returns after a gap. **Resolved-if-needed by:** omnigent-slack running its
+   own auth-code+PKCE OAuth client with `offline_access` (durable, refreshable)
+   — deferred; not built.
+2. **Token is scoped by `user_api_scopes`, not to a single app.** Audience-scoped
+   exchange (which would restrict the token to omnigent-dev alone) is
+   unavailable — Databricks rejects `audience` for an access-token subject. So a
+   stolen store yields tokens usable for whatever `user_api_scopes` grants
+   (`iam.current-user:read` today), not a single-app credential. Keep
+   `user_api_scopes` as tight as the server proxy will accept.
+3. **No server-side revocation on logout.** Because it's stored with no refresh
+   token, `logout`/`logout_all` only delete the local copy; the token stays
+   live on Databricks until it expires (~1h). "Logout" doesn't cut off an
+   already-exfiltrated token.
+4. **omnigent-slack holds user tokens for many users** — a higher-value target
+   than the Omnigent-delegated-token store. Mitigations in place: Fernet
+   encryption at rest, in-memory-only fallback when no key is set, and no token
+   ever logged. Still wants: KMS-backed key (not an env var) and audit logging.
+5. **Proxy-origin trust.** Security assumes the app port is reachable only
+   through the Apps proxy (which strips client-supplied `x-forwarded-*`). The
+   callback fails closed on *absent* identity headers, but has no proof-of-proxy
+   check against *forged* ones if the port is ever reachable off-proxy. Inherent
+   to header-mode; same assumption the server itself documents.
+6. **Consumer vs workspace access** — a Slack user with only consumer access may
+   authenticate at the enrollment page but still be rejected by omnigent-dev
+   (mirrors the CLI "not assigned to this application" case).
 
-### Verdict
+### Resolved (were open questions)
 
-Promising and, unlike every earlier option, it has a **credible path to
-least-privilege token storage** via audience-scoped exchange — which is exactly
-the property you argued makes storage acceptable. It is **contingent** on two
-unverified facts: (a) a user-identity-preserving token that omnigent-dev's proxy
-accepts and maps to the right user, and (b) an exchanged-token lifetime/refresh
-story that doesn't force a broad token to live at rest. Both are cheap to settle
-on e2-dogfood before any build.
+- **Confused-deputy / `state` binding (was the top risk):** closed by two
+  layers. (1) The enrollment `state` carries the Slack user's email (from
+  `users.info`), and the callback requires the proxy's `x-forwarded-email` to
+  match it — a link issued for user A, opened by victim V, is refused (403).
+  (2) Nothing is stored on the GET; the user must click **Confirm** on a page
+  that names their exact Databricks + Slack identities, and only that POST
+  persists the token. TTL-replay is benign (same-identity idempotent).
+- **Token exchange:** does NOT work — `audience` is rejected for access-token
+  subjects. Replaced by direct forwarded-token pass-through (Databricks OBO).
+- **Per-user identity at the server:** confirmed on e2-dogfood — the forwarded
+  token authenticates to omnigent-dev's proxy and yields the correct per-user
+  `X-Forwarded-Email` (verified end-to-end).
 
-## Open questions (settle on e2-dogfood before committing)
+## Open questions / follow-ups
 
-1. Does an **audience-scoped token** for omnigent-dev, when sent to
-   omnigent-dev's URL, get accepted by the proxy AND yield the **correct
-   per-user `X-Forwarded-Email`** (not a machine/SP identity)?  ← correctness
-   keystone
-2. Can token exchange start from a **user** credential (OBO) and preserve user
-   identity, or only from notebook/PAT contexts?
-3. What is the **lifetime** of the exchanged app-scoped token, and can it be
-   **refreshed** without holding a broad live access token at rest?
-4. Does the Apps proxy support **`wss://` WebSocket upgrade** (transport)?
-5. Minimum subject-token scope needed for the exchange (is `all-apis` required
-   on the subject, or does a narrower scope suffice)?
+1. **Refresh model:** accept hourly re-enrollment, or build the auth-code+PKCE
+   `offline_access` client for a durable, revocable token? (Product/UX call.)
+2. **Minimum `user_api_scopes`** the omnigent-dev proxy will accept while still
+   emitting `X-Forwarded-Email` — keep it as tight as possible.
+3. **Single-use `state`:** currently replay is TTL-bounded but benign
+   (same-identity); a server-side consumed-marker would make it strictly
+   single-use if we ever want it.

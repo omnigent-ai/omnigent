@@ -28,10 +28,21 @@ from omnigent_slack.webauth import WebAuthServer
 async def run() -> None:
     load_dotenv()
     settings = load_settings()
+    level = getattr(logging, settings.log_level.upper(), logging.INFO)
+    # force=True so this wins even when an entry point (e.g. the Databricks App
+    # wrapper) already called basicConfig at import — otherwise a second
+    # basicConfig is a no-op and LOG_LEVEL is silently ignored, pinning us to
+    # whatever the first call set and hiding slack_sdk's connection diagnostics.
     logging.basicConfig(
-        level=getattr(logging, settings.log_level.upper(), logging.INFO),
+        level=level,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        force=True,
     )
+    # The Slack SDK/Bolt loggers carry the connection diagnostics (DNS, TLS,
+    # websocket handshake) needed to diagnose an outbound-egress failure. Pin
+    # them to the configured level so LOG_LEVEL=DEBUG actually surfaces them.
+    for name in ("slack_sdk", "slack_bolt"):
+        logging.getLogger(name).setLevel(level)
     logger = logging.getLogger(__name__)
     logger.info(
         "Starting Omnigent Slack bot server=%s database=%s",
@@ -78,8 +89,8 @@ async def run() -> None:
 
     # Databricks web-auth mode: the server is fronted by the Databricks Apps
     # proxy, which the device/OIDC probe can't drive. Instead the bot serves an
-    # enrollment page (as its own Databricks App) that exchanges each user's
-    # forwarded token for one scoped to the target app. The web server shares
+    # enrollment page (as its own Databricks App) that captures each user's
+    # proxy-forwarded token and stores it as their bearer. The web server shares
     # the token store, so a token it writes is immediately usable by the bot.
     webauth: WebAuthServer | None = None
     enrollment_url = None
@@ -104,6 +115,7 @@ async def run() -> None:
     app = AsyncApp(token=settings.slack_bot_token)
     setup.register(app)
     register_handlers(app, service)
+    _register_error_handler(app, logger)
 
     if webauth is not None:
         await webauth.start()
@@ -112,12 +124,32 @@ async def run() -> None:
     try:
         logger.info("Connecting to Slack Socket Mode")
         await handler.start_async()  # type: ignore[no-untyped-call]
+    except Exception:
+        # The initial reach-out to Slack (apps.connections.open over HTTPS, then
+        # the wss:// socket) is the most likely outbound failure — restricted
+        # egress, DNS, or a bad app token. Log it explicitly with a traceback so
+        # it's not swallowed into a generic "failed to start" upstream.
+        logger.exception("Could not connect to Slack Socket Mode")
+        raise
     finally:
         logger.info("Shutting down Omnigent Slack bot")
         await service.shutdown()
         await pool.aclose_all()
         if webauth is not None:
             await webauth.stop()
+
+
+def _register_error_handler(app: AsyncApp, logger: logging.Logger) -> None:
+    """Log any listener/API error Bolt would otherwise swallow at DEBUG.
+
+    Without a registered handler, Bolt logs unhandled listener exceptions at a
+    level that's easy to miss and returns a generic ack. This surfaces every
+    one (including outbound Web API failures inside a handler) with a traceback.
+    """
+
+    @app.error
+    async def _on_error(error: Exception, body: dict[str, Any]) -> None:
+        logger.exception("Unhandled Slack listener error; body_type=%s", body.get("type"))
 
 
 def register_handlers(app: AsyncApp, service: SlackOmnigentService) -> None:

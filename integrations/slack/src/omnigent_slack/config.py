@@ -11,16 +11,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # server (the historical behaviour — device grant / OIDC ticket). ``databricks``
 # is for a server fronted by the Databricks Apps proxy (header mode), which the
 # probe can't drive: identity is asserted by the proxy, so the bot enrolls each
-# user through a web page it hosts as its own Databricks App and exchanges the
-# user's forwarded token for one scoped to the target app. See
+# user through a web page it hosts as its own Databricks App and forwards the
+# user's proxy-issued token to the server. See
 # ``docs/DATABRICKS_APP_WEBAUTH_DESIGN.md``.
 ServerAuthMode = Literal["auto", "databricks"]
-
-# Default OAuth token-exchange knobs for the Databricks web-auth flow. The
-# subject is the user's forwarded access token; the exchange returns a token
-# whose audience is the target app, so it can't call other Databricks APIs.
-_DEFAULT_EXCHANGE_SCOPE = "all-apis"
-_DEFAULT_SUBJECT_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:access_token"
 
 
 def _local_data_dir() -> Path:
@@ -101,24 +95,6 @@ class Settings(BaseSettings):
         validation_alias="OMNIGENT_SLACK_SERVER_AUTH",
     )
 
-    # oauth2_app_client_id of the target Omnigent app (audience of the token
-    # exchange). Fetch with ``w.apps.get("<app>").oauth2_app_client_id``. The
-    # exchanged token is scoped to this app and can't call other Databricks
-    # APIs — the property that makes storing it least-privilege. Required when
-    # server_auth_mode == "databricks".
-    databricks_target_audience: str | None = Field(
-        default=None,
-        validation_alias="OMNIGENT_SLACK_DATABRICKS_AUDIENCE",
-    )
-
-    # Workspace base URL whose /oidc/v1/token endpoint performs the exchange.
-    # Defaults to DATABRICKS_HOST (injected into every Databricks App), so it
-    # normally needs no explicit value.
-    databricks_workspace_host: str | None = Field(
-        default=None,
-        validation_alias="OMNIGENT_SLACK_DATABRICKS_WORKSPACE_HOST",
-    )
-
     # HMAC key (any non-empty string) that signs the ``state`` binding a browser
     # enrollment session to the Slack (team, user) that requested it. Prevents a
     # user from enrolling someone else's Slack identity. Required when
@@ -152,54 +128,23 @@ class Settings(BaseSettings):
         return value
 
     @property
-    def workspace_host(self) -> str | None:
-        """Workspace base URL for the token exchange, honouring DATABRICKS_HOST.
-
-        Explicit config wins; else the Databricks-App-injected ``DATABRICKS_HOST``
-        (normalised to include a scheme). ``None`` when neither is available.
-        """
-        host = self.databricks_workspace_host or os.environ.get("DATABRICKS_HOST")
-        if not host:
-            return None
-        host = host.strip().rstrip("/")
-        if not host.startswith(("http://", "https://")):
-            host = f"https://{host}"
-        return host
-
-    @property
     def webauth_base_url(self) -> str | None:
         """Public base URL of this bot's enrollment page (for the Slack link)."""
         base = self.databricks_webauth_base_url or os.environ.get("DATABRICKS_APP_URL")
         return base.strip().rstrip("/") if base else None
 
-    @property
-    def exchange_scope(self) -> str:
-        return _DEFAULT_EXCHANGE_SCOPE
-
-    @property
-    def subject_token_type(self) -> str:
-        return _DEFAULT_SUBJECT_TOKEN_TYPE
-
     @model_validator(mode="after")
     def _check_databricks_config(self) -> Settings:
-        """Fail fast when databricks mode is missing its required knobs.
+        """Fail fast when databricks mode is missing its required secret.
 
         Catches misconfiguration at startup rather than at first enrollment,
         where a Slack user would just see a generic failure.
         """
-        if self.server_auth_mode == "databricks":
-            missing = [
-                name
-                for name, value in (
-                    ("OMNIGENT_SLACK_DATABRICKS_AUDIENCE", self.databricks_target_audience),
-                    ("OMNIGENT_SLACK_DATABRICKS_STATE_SECRET", self.databricks_state_secret),
-                )
-                if not value
-            ]
-            if missing:
-                raise ValueError(
-                    "OMNIGENT_SLACK_SERVER_AUTH=databricks requires: " + ", ".join(missing)
-                )
+        if self.server_auth_mode == "databricks" and not self.databricks_state_secret:
+            raise ValueError(
+                "OMNIGENT_SLACK_SERVER_AUTH=databricks requires "
+                "OMNIGENT_SLACK_DATABRICKS_STATE_SECRET"
+            )
         return self
 
 

@@ -29,12 +29,11 @@ def _set_env(monkeypatch: pytest.MonkeyPatch, **overrides: str) -> None:
         "OMNIGENT_DATA_DIR",
         "OMNIGENT_SLACK_DATABASE_PATH",
         "OMNIGENT_SLACK_SERVER_AUTH",
-        "OMNIGENT_SLACK_DATABRICKS_AUDIENCE",
         "OMNIGENT_SLACK_DATABRICKS_STATE_SECRET",
-        "OMNIGENT_SLACK_DATABRICKS_WORKSPACE_HOST",
         "OMNIGENT_SLACK_WEBAUTH_BASE_URL",
-        "DATABRICKS_HOST",
+        "OMNIGENT_SLACK_WEBAUTH_PORT",
         "DATABRICKS_APP_URL",
+        "DATABRICKS_APP_PORT",
     ):
         monkeypatch.delenv(key, raising=False)
     env = {**_REQUIRED, **overrides}
@@ -93,11 +92,10 @@ def test_database_path_env_override_wins(monkeypatch: pytest.MonkeyPatch) -> Non
 
 def test_server_auth_mode_defaults_auto(monkeypatch: pytest.MonkeyPatch) -> None:
     _set_env(monkeypatch)
-    monkeypatch.delenv("DATABRICKS_HOST", raising=False)
     assert _load().server_auth_mode == "auto"
 
 
-def test_databricks_mode_requires_audience_and_state_secret(
+def test_databricks_mode_requires_state_secret(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _set_env(monkeypatch, OMNIGENT_SLACK_SERVER_AUTH="databricks")
@@ -109,27 +107,23 @@ def test_databricks_mode_valid_with_required_knobs(monkeypatch: pytest.MonkeyPat
     _set_env(
         monkeypatch,
         OMNIGENT_SLACK_SERVER_AUTH="databricks",
-        OMNIGENT_SLACK_DATABRICKS_AUDIENCE="app-client-id",
         OMNIGENT_SLACK_DATABRICKS_STATE_SECRET="secret",
     )
     settings = _load()
     assert settings.server_auth_mode == "databricks"
-    assert settings.databricks_target_audience == "app-client-id"
+    assert settings.databricks_state_secret == "secret"
 
 
-def test_workspace_host_falls_back_to_databricks_host_env(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_webauth_base_url_falls_back_to_app_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The platform injects DATABRICKS_APP_URL; the enrollment-link base uses it
+    # when not set explicitly (trailing slash trimmed).
     _set_env(monkeypatch)
-    monkeypatch.setenv("DATABRICKS_HOST", "myworkspace.cloud.databricks.com")
-    # Scheme is added when missing.
-    assert _load().workspace_host == "https://myworkspace.cloud.databricks.com"
+    monkeypatch.setenv("DATABRICKS_APP_URL", "https://bot.example.com/")
+    assert _load().webauth_base_url == "https://bot.example.com"
 
 
-def test_workspace_host_explicit_config_wins(monkeypatch: pytest.MonkeyPatch) -> None:
-    _set_env(
-        monkeypatch,
-        OMNIGENT_SLACK_DATABRICKS_WORKSPACE_HOST="https://explicit.databricks.com/",
-    )
-    monkeypatch.setenv("DATABRICKS_HOST", "ignored.databricks.com")
-    assert _load().workspace_host == "https://explicit.databricks.com"
+def test_webauth_port_defaults_to_databricks_app_port(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Databricks Apps route to DATABRICKS_APP_PORT; the web server binds it.
+    _set_env(monkeypatch)
+    monkeypatch.setenv("DATABRICKS_APP_PORT", "9001")
+    assert _load().databricks_webauth_port == 9001

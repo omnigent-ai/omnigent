@@ -191,6 +191,31 @@ async def test_validate_raises_auth_required_on_401() -> None:
 
 
 @respx.mock
+async def test_validate_raises_auth_required_on_proxy_redirect() -> None:
+    # A Databricks-App-hosted server sits behind an auth proxy that 302s an
+    # unauthenticated request to its OIDC login page rather than returning 401.
+    # The bot must treat that as auth-required (→ start enrollment), not as a
+    # generic unreachable error.
+    respx.get("http://omnigent.test/health").mock(
+        return_value=httpx.Response(
+            302, headers={"location": "https://ws.example.com/oidc/oauth2/v2.0/authorize"}
+        )
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    try:
+        raised = False
+        try:
+            await client.validate()
+        except AuthRequiredError:
+            raised = True
+    finally:
+        await client.aclose()
+
+    assert raised
+
+
+@respx.mock
 async def test_get_host_home_derives_home_from_filesystem_listing() -> None:
     respx.get("http://omnigent.test/v1/hosts/host_1/filesystem").mock(
         return_value=httpx.Response(

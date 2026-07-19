@@ -30,3 +30,13 @@ def truncate_for_slack(text: str, limit: int = SLACK_MESSAGE_CHAR_LIMIT) -> str:
     if limit <= len(suffix):
         return text[:limit]
     return text[: limit - len(suffix)].rstrip() + suffix
+
+
+# Block Kit caps a static_select option's text and value at 75 chars; some
+# packed values (e.g. an elicitation question key) use a larger app-defined cap.
+SLACK_OPTION_CHAR_LIMIT = 75
+
+
+def truncate_option(text: str, limit: int = SLACK_OPTION_CHAR_LIMIT) -> str:
+    """Fit ``text`` within a Block Kit option's char cap, eliding with ``…``."""
+    return text if len(text) <= limit else text[: limit - 1] + "…"

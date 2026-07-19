@@ -7,7 +7,7 @@ from enum import Enum
 from typing import Any, Protocol
 
 from omnigent_slack.omnigent import ElicitationRequest
-from omnigent_slack.text import truncate_for_slack
+from omnigent_slack.text import truncate_for_slack, truncate_option
 
 _logger = logging.getLogger(__name__)
 
@@ -224,7 +224,7 @@ def _form_card_blocks(request: ElicitationRequest, owner_user_id: str) -> list[d
         # back to the untruncated label at resolve time (`resolve_form_answers`).
         options = [
             {
-                "text": {"type": "plain_text", "text": _plain(opt.label)},
+                "text": {"type": "plain_text", "text": truncate_option(opt.label)},
                 "value": str(index),
             }
             for index, opt in enumerate(question.options)
@@ -234,11 +234,13 @@ def _form_card_blocks(request: ElicitationRequest, owner_user_id: str) -> list[d
             "action_id": ACTION_FORM_ANSWER,
             "options": options,
         }
+        block_key = truncate_option(question.key, limit=200)
+        label = truncate_option(question.question, limit=140)
         blocks.append(
             {
                 "type": "section",
-                "block_id": f"{_QUESTION_BLOCK_PREFIX}{_plain(question.key, limit=200)}",
-                "text": {"type": "mrkdwn", "text": f"*{_plain(question.question, limit=140)}*"},
+                "block_id": f"{_QUESTION_BLOCK_PREFIX}{block_key}",
+                "text": {"type": "mrkdwn", "text": f"*{label}*"},
                 "accessory": element,
             }
         )
@@ -284,11 +286,6 @@ def resolved_card_blocks(
         # request was dropped and that re-sending starts a fresh attempt.
         text += "\n_No response in time — I declined it. Send your message again to retry._"
     return [{"type": "section", "text": {"type": "mrkdwn", "text": text}}]
-
-
-def _plain(text: str, limit: int = 75) -> str:
-    # Slack option text/value are capped (75 chars for option value/text).
-    return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
 @dataclass(frozen=True, slots=True)
@@ -358,7 +355,7 @@ def resolve_form_answers(
     if not raw:
         return {}
     # Match each answer's (possibly truncated) block key back to its question.
-    by_block_key = {_plain(q.key, limit=200): q for q in request.questions}
+    by_block_key = {truncate_option(q.key, limit=200): q for q in request.questions}
     answers: dict[str, Any] = {}
     for block_key, value in raw.items():
         question = by_block_key.get(block_key)

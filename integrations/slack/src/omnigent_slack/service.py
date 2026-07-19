@@ -54,20 +54,25 @@ _SERVER_UNREACHABLE_TEXT = (
     "down, run /omnigent to reconfigure."
 )
 
-# Shown when the server rejects the request as unauthenticated — the user's
-# delegated login is missing or expired (e.g. the bot restarted and in-memory
-# tokens were lost). They re-authenticate by running /omnigent.
-_AUTH_REQUIRED_TEXT = (
-    ":lock: Your Omnigent login has expired or isn't set up. Run /omnigent to log in again."
-)
+# Shown when the server rejects a turn as unauthenticated. The user was already
+# set up (a turn only runs with a saved config), so this is an expired/lost
+# login — most often the ~1h token expiry on Databricks-hosted servers, or a
+# bot restart that dropped in-memory tokens. Delivered ephemerally (sender-only)
+# so a routine re-login doesn't spam the thread.
+_AUTH_REQUIRED_TEXT = ":lock: Your Omnigent login has expired. Run /omnigent to sign in again."
 
 
 class _TurnAborted(Exception):
-    """A turn can't proceed; ``text`` is the user-facing reason to deliver."""
+    """A turn can't proceed; ``text`` is the user-facing reason to deliver.
 
-    def __init__(self, text: str) -> None:
+    ``ephemeral`` delivers that reason only to the sender (e.g. an expired-login
+    notice), so a routine failure doesn't post to the whole thread.
+    """
+
+    def __init__(self, text: str, *, ephemeral: bool = False) -> None:
         super().__init__(text)
         self.text = text
+        self.ephemeral = ephemeral
 
 
 @dataclass
@@ -84,23 +89,28 @@ class _StreamState:
     elicitations: ElicitationTurnState = field(default_factory=ElicitationTurnState)
 
 
-def _turn_error_text(exc: BaseException, server_url: str) -> str | None:
-    """User-facing message for a known startup/turn error, else ``None``.
+def _classify_turn_error(exc: BaseException, server_url: str) -> tuple[str | None, bool]:
+    """Map a known startup/turn error to ``(user_text, ephemeral)``.
 
     Single source of truth shared by the session-creation and mid-turn error
-    paths so the two stay in sync.
+    paths, so the text and its delivery mode can't drift. ``ephemeral`` means
+    "show only to the sender": an expired login is a routine, per-user event
+    (especially with ~1h token expiry on Databricks) that only the sender can
+    act on, whereas server-down / no-host errors affect everyone on the thread
+    and stay public. ``user_text`` is ``None`` for an unrecognized error (the
+    caller falls back to ``str(exc)``).
     """
     if isinstance(exc, AuthRequiredError):
-        return _AUTH_REQUIRED_TEXT
+        return _AUTH_REQUIRED_TEXT, True
     if isinstance(exc, ServerUnreachableError):
-        return _SERVER_UNREACHABLE_TEXT
+        return _SERVER_UNREACHABLE_TEXT, False
     if isinstance(exc, HostUnavailableError):
-        return host_unavailable_text(server_url)
+        return host_unavailable_text(server_url), False
     if isinstance(exc, HarnessNotConfiguredError):
         # The server's message is curated, actionable guidance for this code —
         # surface it so the user knows to run `omnigent setup` on the host.
-        return f":warning: {exc}"
-    return None
+        return f":warning: {exc}", False
+    return None, False
 
 
 class SlackOmnigentService:
@@ -446,7 +456,7 @@ class SlackOmnigentService:
         try:
             session_id = await self._ensure_session(turn, omnigent)
         except _TurnAborted as aborted:
-            await reply.stop_with(aborted.text)
+            await reply.stop_with(aborted.text, ephemeral=aborted.ephemeral)
             return
         if session_id is None:
             # No session and creation disabled (a follow-up on a dead thread):
@@ -536,7 +546,8 @@ class SlackOmnigentService:
             HarnessNotConfiguredError,
         ) as exc:
             self._logger.info("Session startup failed thread=%s: %s", turn.key.display(), exc)
-            raise _TurnAborted(_turn_error_text(exc, self._server_url) or str(exc)) from exc
+            text, ephemeral = _classify_turn_error(exc, self._server_url)
+            raise _TurnAborted(text or str(exc), ephemeral=ephemeral) from exc
         except Exception as exc:
             # Any other startup failure (e.g. a 500 surfaced as OmnigentError)
             # must still report rather than strand the thread on "Working on it…".
@@ -608,7 +619,8 @@ class SlackOmnigentService:
             HarnessNotConfiguredError,
         ) as exc:
             self._logger.info("Turn error mid-stream thread=%s: %s", turn.key.display(), exc)
-            await reply.stop_with(_turn_error_text(exc, self._server_url) or str(exc))
+            text, ephemeral = _classify_turn_error(exc, self._server_url)
+            await reply.stop_with(text or str(exc), ephemeral=ephemeral)
             state.aborted = True
         except Exception as exc:
             self._logger.exception("Omnigent turn failed for %s", turn.key.display())

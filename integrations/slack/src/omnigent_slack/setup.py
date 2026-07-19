@@ -8,6 +8,7 @@ from typing import Any
 from slack_bolt.async_app import AsyncApp
 
 from omnigent_slack.auth_manager import AuthManager, pack_user_key, slack_client_id
+from omnigent_slack.events import host_id_of
 from omnigent_slack.models import UserConfig
 from omnigent_slack.oauth import DeviceGrantUnavailableError, OAuthError
 from omnigent_slack.omnigent import (
@@ -18,6 +19,7 @@ from omnigent_slack.omnigent import (
     ValidatedServer,
 )
 from omnigent_slack.store import SQLiteStore
+from omnigent_slack.text import truncate_option
 
 # Block Kit identifiers shared by the modal builders and the submission
 # handlers. Keeping them in one place avoids drift between what a modal renders
@@ -90,15 +92,16 @@ class SetupFlow:
         pool: OmnigentClientPool,
         server_url: str,
         auth_manager: AuthManager | None = None,
-        enrollment_url: Callable[[str, str], str | None] | None = None,
+        enrollment_url: Callable[[str, str, str], str | None] | None = None,
     ) -> None:
         self._store = store
         self._pool = pool
         self._server_url = server_url
         self._auth = auth_manager
         # In Databricks web-auth mode, returns the signed enrollment link for a
-        # (team, user) or ``None`` if the web server isn't configured. ``None``
-        # here means the historical device-grant / OIDC-ticket login is used.
+        # (team, user, email) or ``None`` if the web server isn't configured.
+        # ``None`` here means the historical device-grant / OIDC-ticket login
+        # is used.
         self._enrollment_url = enrollment_url
         self._logger = logging.getLogger(__name__)
 
@@ -396,7 +399,26 @@ class SetupFlow:
         the same (team, user) the signed link is bound to.
         """
         assert self._auth is not None and self._enrollment_url is not None
-        link = self._enrollment_url(team_id, user_id)
+        # The enrollment link is bound to the Slack user's email so the callback
+        # can require the browser's X-Forwarded-Email to match — closing the
+        # confused-deputy where one user's link captures another's token. If we
+        # can't resolve the email, fail closed rather than issue an unverifiable
+        # link. (Needs the `users:read.email` Slack scope.)
+        email = await self._user_email(client, user_id)
+        if not email:
+            await client.views_update(
+                view_id=view_id,
+                view=login_failed_modal(
+                    server_url,
+                    "couldn't read your email from Slack, which is required to "
+                    "sign in securely. Ask the bot operator to grant the "
+                    "`users:read.email` scope, then run `/omnigent` again.",
+                ),
+            )
+            return
+        # Workspace name is display-only (shown on the enrollment success page).
+        team_name = await self._team_name(client, team_id)
+        link = self._enrollment_url(team_id, user_id, email, team_name)
         if not link:
             await client.views_update(
                 view_id=view_id,
@@ -455,12 +477,31 @@ class SetupFlow:
         team = resp.get("team") if hasattr(resp, "get") else None
         return str(team.get("name") or "") if isinstance(team, dict) else ""
 
+    async def _user_email(self, client: Any, user_id: str) -> str:
+        """Resolve the Slack user's email via ``users.info``.
+
+        Signed into the enrollment state and matched against the browser's
+        ``X-Forwarded-Email`` in the callback, so security depends on it — a
+        lookup failure (missing ``users:read.email`` scope, network) returns an
+        empty string and the caller fails closed rather than issuing an
+        unverifiable link.
+        """
+        try:
+            resp = await client.users_info(user=user_id)
+        except Exception as exc:
+            self._logger.info("users.info lookup failed user=%s error=%s", user_id, exc)
+            return ""
+        user = resp.get("user") if hasattr(resp, "get") else None
+        profile = user.get("profile") if isinstance(user, dict) else None
+        email = profile.get("email") if isinstance(profile, dict) else None
+        return str(email) if isinstance(email, str) and email else ""
+
     async def _resolve_default_workspace(
         self, client: OmnigentClient, online_hosts: list[dict[str, Any]]
     ) -> str:
         for host in online_hosts:
-            host_id = host.get("host_id") or host.get("id")
-            if not isinstance(host_id, str):
+            host_id = host_id_of(host)
+            if host_id is None:
                 continue
             try:
                 home = await client.get_host_home(host_id)
@@ -797,28 +838,23 @@ def _agent_options(agents: list[dict[str, Any]]) -> list[dict[str, Any]]:
         name = agent.get("name") or agent_id
         if not isinstance(agent_id, str):
             continue
-        options.append(_option(_plain(str(name)), agent_id))
+        options.append(_option(truncate_option(str(name)), agent_id))
     return options
 
 
 def _host_options(hosts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     options: list[dict[str, Any]] = []
     for host in hosts[:_MAX_SELECT_OPTIONS]:
-        host_id = host.get("host_id") or host.get("id")
-        name = host.get("name") or host_id
-        if not isinstance(host_id, str):
+        host_id = host_id_of(host)
+        if host_id is None:
             continue
-        options.append(_option(_plain(str(name)), host_id))
+        name = host.get("name") or host_id
+        options.append(_option(truncate_option(str(name)), host_id))
     return options
 
 
 def _option(text: str, value: str) -> dict[str, Any]:
     return {"text": {"type": "plain_text", "text": text}, "value": value}
-
-
-def _plain(text: str) -> str:
-    # Slack option text is capped at 75 characters.
-    return text if len(text) <= 75 else text[:74] + "…"
 
 
 def _input_value(view: dict[str, Any], block_id: str, action_id: str) -> str:

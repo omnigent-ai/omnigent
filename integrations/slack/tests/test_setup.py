@@ -63,6 +63,9 @@ class FakeSetupClient:
     async def team_info(self, **kwargs: Any) -> dict[str, Any]:
         return {"ok": True, "team": {"id": kwargs.get("team", "T1"), "name": "Acme Corp"}}
 
+    async def users_info(self, **kwargs: Any) -> dict[str, Any]:
+        return {"ok": True, "user": {"profile": {"email": "user@example.com"}}}
+
 
 class SlackResponseLike:
     """Mimics slack_sdk's SlackResponse: not a dict, but proxies ``.get``/``[]``."""
@@ -418,6 +421,84 @@ async def test_logout_revokes_all_and_clears_settings(tmp_path: Path) -> None:
     assert await store.get_user_config("T1", "U1") is None
     assert await store.get_session(ThreadKey("T1", "C1", "100.1")) is None
     assert any("Logged out" in str(p.get("text", "")) for p in client.posts)
+
+
+class _EnrollAuth:
+    """Minimal auth manager stub for the Databricks enrollment path."""
+
+    enabled = True
+
+    def __init__(self) -> None:
+        self.awaited: list[dict[str, Any]] = []
+
+    def await_enrollment_in_background(self, **kwargs: Any) -> None:
+        self.awaited.append(kwargs)
+
+
+def _enroll_flow(
+    store: SQLiteStore, pool: OmnigentClientPool, auth: Any, enrollment_url: Any
+) -> SetupFlow:
+    return SetupFlow(
+        store=store,
+        pool=pool,
+        server_url=_SERVER,
+        auth_manager=auth,
+        enrollment_url=enrollment_url,
+    )
+
+
+async def test_databricks_enrollment_shows_link_bound_to_slack_email(tmp_path: Path) -> None:
+    # The enrollment link must be built from the user's Slack email (looked up
+    # via users.info), so the callback can bind it to X-Forwarded-Email.
+    seen: list[tuple[str, str, str, str]] = []
+
+    def _url(team_id: str, user_id: str, email: str, team_name: str = "") -> str:
+        seen.append((team_id, user_id, email, team_name))
+        return f"https://bot.example.com/auth/callback?state=signed-{email}"
+
+    auth = _EnrollAuth()
+    pool = OmnigentClientPool()
+    flow = _enroll_flow(await _store(tmp_path), pool, auth, _url)
+    client = FakeSetupClient()
+    try:
+        await flow._begin_databricks_enrollment(
+            client, team_id="T1", user_id="U1", server_url=_SERVER, view_id="V1"
+        )
+    finally:
+        await pool.aclose_all()
+
+    # Email + workspace name were resolved from Slack and passed to the minter.
+    assert seen == [("T1", "U1", "user@example.com", "Acme Corp")]
+    # The waiting modal shows the signed link and the poll was started.
+    body = _last_update(client)["blocks"][0]["text"]["text"]
+    assert "auth/callback?state=signed-user@example.com" in body
+    assert len(auth.awaited) == 1
+
+
+async def test_databricks_enrollment_fails_closed_without_email(tmp_path: Path) -> None:
+    # If Slack won't give us the email (missing users:read.email scope), we must
+    # NOT issue an unverifiable link — show an error and don't start the poll.
+    class NoEmailClient(FakeSetupClient):
+        async def users_info(self, **kwargs: Any) -> dict[str, Any]:
+            return {"ok": True, "user": {"profile": {}}}
+
+    def _url(*args: Any, **kwargs: Any) -> str:  # pragma: no cover - must not be called
+        raise AssertionError("enrollment_url must not be called without an email")
+
+    auth = _EnrollAuth()
+    pool = OmnigentClientPool()
+    flow = _enroll_flow(await _store(tmp_path), pool, auth, _url)
+    client = NoEmailClient()
+    try:
+        await flow._begin_databricks_enrollment(
+            client, team_id="T1", user_id="U1", server_url=_SERVER, view_id="V1"
+        )
+    finally:
+        await pool.aclose_all()
+
+    body = _last_update(client)["blocks"][0]["text"]["text"]
+    assert "email" in body.lower()
+    assert auth.awaited == []
 
 
 @respx.mock

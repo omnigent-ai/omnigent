@@ -1,0 +1,9 @@
+# DAB local state directory (created by `databricks bundle deploy`).
+.databricks/
+
+# NOTE: the per-deploy app payload deploy.py generates under src/
+# (src/*.whl, src/pyproject.toml, src/uv.lock) is deliberately NOT ignored.
+# `databricks bundle deploy` respects .gitignore for its file sync, so
+# ignoring those would silently drop them from the upload and the app would
+# fail with "No module named 'omnigent_slack'". Keep them untracked (don't
+# `git add` them) rather than gitignored.
