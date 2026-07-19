@@ -451,3 +451,33 @@ def test_shell_impl_preserves_quotes_on_windows(tmp_path: Path) -> None:
     assert result["exit_code"] == 0, result
     assert "\\" not in result["stdout"], result["stdout"]
     assert "a b" in result["stdout"]
+
+
+@pytest.mark.windows_only
+def test_shell_impl_runs_multiline_command_on_windows(tmp_path: Path) -> None:
+    """Regression: multi-line commands must run every line, not silently line 1."""
+    comspec = os.environ.get("COMSPEC", "cmd.exe")
+    result = _shell_impl(
+        command="echo AAA\necho BBB", timeout=15, shell_path=comspec, cwd=tmp_path
+    )
+    assert result["exit_code"] == 0, result
+    assert "AAA" in result["stdout"] and "BBB" in result["stdout"], result
+
+
+@pytest.mark.windows_only
+def test_shell_impl_timeout_kills_child_tree_on_windows(tmp_path: Path) -> None:
+    """Regression: a timeout kills the whole tree, not just cmd.exe.
+
+    A ~5s ping child under a 1s timeout must return promptly rather than waiting
+    for the orphaned child to finish.
+    """
+    import time
+
+    comspec = os.environ.get("COMSPEC", "cmd.exe")
+    start = time.monotonic()
+    result = _shell_impl(
+        command="ping -n 6 127.0.0.1 >NUL", timeout=1, shell_path=comspec, cwd=tmp_path
+    )
+    elapsed = time.monotonic() - start
+    assert result["timed_out"] is True, result
+    assert elapsed < 3, f"took {elapsed:.1f}s; child tree not killed"

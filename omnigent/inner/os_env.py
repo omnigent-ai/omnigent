@@ -26,6 +26,7 @@ from omnigent.runner.identity import (
     strip_runner_auth_secrets,
 )
 
+from . import _proc
 from .async_utils import run_sync_on_thread
 from .credential_proxy import (
     CredentialProxyRuntime,
@@ -1383,6 +1384,50 @@ def _truncate_output(text: str, label: str, limit: int = _MAX_TOOL_OUTPUT_CHARS)
     )
 
 
+def _run_windows_cmd_shell(
+    command: str, *, timeout: int, shell_path: str, cwd: Path
+) -> tuple[str, str, int]:
+    """Run ``command`` through cmd.exe via a temp batch file.
+
+    ``cmd.exe /c "<inline>"`` stops at the first newline and mangles quoting;
+    writing the command to a UTF-8 ``.cmd`` (with ``chcp 65001``) runs it
+    verbatim, so multi-line, quoted, and non-ASCII commands all work. The child
+    is spawned in its own process group and its whole tree is killed on timeout —
+    killing cmd.exe alone leaves its spawned child (e.g. ping/python) running.
+
+    :raises subprocess.TimeoutExpired: On timeout, after killing the tree.
+    :returns: ``(stdout, stderr, returncode)``.
+    """
+    fd, script_path = tempfile.mkstemp(suffix=".cmd")
+    os.close(fd)
+    try:
+        Path(script_path).write_text(
+            "@echo off\r\nchcp 65001>nul\r\n" + command.replace("\n", "\r\n") + "\r\n",
+            encoding="utf-8",
+        )
+        proc = subprocess.Popen(
+            [shell_path, "/c", script_path],
+            cwd=str(cwd),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            **_proc.spawn_kwargs(),
+        )
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _proc.kill_tree(proc)
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.communicate(timeout=5)
+            raise
+        return stdout, stderr, proc.returncode
+    finally:
+        with contextlib.suppress(OSError):
+            os.remove(script_path)
+
+
 def _shell_impl(
     *,
     command: str,
@@ -1407,29 +1452,29 @@ def _shell_impl(
         characters.
     """
     argv = _shell_argv(shell_path, command)
+    windows_cmd = IS_WINDOWS and Path(shell_path).name.lower() in ("cmd.exe", "cmd")
     try:
-        run_target: str | list[str] = argv
-        if IS_WINDOWS and argv and argv[-1] == command:
-            # Passing [cmd.exe, "/c", command] as a list makes subprocess apply
-            # Windows list-quoting (list2cmdline) to `command`, escaping its own
-            # quotes as \" and corrupting any quoted command (echo "a b",
-            # git commit -m "x", python -c "..."). Build the command line as a
-            # single string so the shell receives the payload verbatim.
-            if Path(shell_path).name.lower() in ("cmd.exe", "cmd"):
-                # Wrap the payload in an extra pair of quotes, which `cmd.exe /c`
-                # strips — without it cmd.exe corrupts a command that starts with
-                # a quote (e.g. a quoted executable path).
-                run_target = f'{argv[0]} /c "{command}"'
-            else:
-                run_target = subprocess.list2cmdline(argv[:-1]) + " " + command
-        completed = subprocess.run(
-            run_target,
-            cwd=str(cwd),
-            env=_child_shell_env(),
-            text=True,
-            capture_output=True,
-            timeout=timeout,
-        )
+        if windows_cmd:
+            # cmd.exe can't run a quoted/multi-line command inline; route it
+            # through a temp batch file and kill the whole process tree on
+            # timeout (see _run_windows_cmd_shell).
+            stdout_raw, stderr_raw, returncode = _run_windows_cmd_shell(
+                command, timeout=timeout, shell_path=shell_path, cwd=cwd
+            )
+        else:
+            completed = subprocess.run(
+                argv,
+                cwd=str(cwd),
+                env=_child_shell_env(),
+                text=True,
+                capture_output=True,
+                timeout=timeout,
+            )
+            stdout_raw, stderr_raw, returncode = (
+                completed.stdout,
+                completed.stderr,
+                completed.returncode,
+            )
     except subprocess.TimeoutExpired as exc:
         # ``subprocess.TimeoutExpired.stdout``/``stderr`` are ``str | bytes
         # | None`` from the stdlib; widening the op result at this boundary
@@ -1449,18 +1494,18 @@ def _shell_impl(
     except OSError as exc:
         return {"error": f"Failed to run shell command: {exc}"}
 
-    stdout = _truncate_output(completed.stdout, "stdout", max_output)
-    stderr = _truncate_output(completed.stderr, "stderr", max_output)
+    stdout = _truncate_output(stdout_raw, "stdout", max_output)
+    stderr = _truncate_output(stderr_raw, "stderr", max_output)
     result: OpResult = {
         "stdout": stdout,
         "stderr": stderr,
-        "exit_code": completed.returncode,
+        "exit_code": returncode,
         "timed_out": False,
         "shell": shell_path,
         "cwd": str(cwd),
     }
-    if completed.returncode != 0:
-        detail = completed.stderr.strip() or completed.stdout.strip()
+    if returncode != 0:
+        detail = stderr.strip() or stdout.strip()
         if detail:
             result["error"] = f"Command exited with status {completed.returncode}: {detail}"
         else:
