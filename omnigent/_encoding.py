@@ -35,8 +35,8 @@ def detect_encoding(path: Path) -> str:
     (permissions, transient I/O) also resolves to the locale codec, matching the
     tolerance of a plain ``ConfigParser.read`` on the same file. A caller that
     must not act on a file it failed to read (i.e. a rewrite flow, which could
-    otherwise overwrite it) verifies readability itself — see
-    ``cli._read_existing_cfg``.
+    otherwise overwrite it) reads and decodes one byte snapshot itself — see
+    ``cli._read_existing_cfg_snapshot``.
     """
     try:
         path.read_text(encoding="utf-8")
