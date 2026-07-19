@@ -8,6 +8,8 @@ import logging
 from pathlib import Path
 from urllib.parse import urlparse
 
+from omnigent._encoding import detect_encoding
+
 _logger = logging.getLogger(__name__)
 
 _DATABRICKSCFG_PATH = Path.home() / ".databrickscfg"
@@ -100,8 +102,8 @@ def list_databricks_profiles() -> list[str]:
         return []
     parser = configparser.ConfigParser()
     try:
-        # Vendor-written cfg: read at the locale default, symmetric with writers.
-        parser.read(_DATABRICKSCFG_PATH, encoding="locale")
+        # Vendor-written cfg (CLI emits UTF-8): detect UTF-8 first, locale fallback.
+        parser.read(_DATABRICKSCFG_PATH, encoding=detect_encoding(_DATABRICKSCFG_PATH))
     except configparser.Error as exc:
         _logger.debug("Could not parse %s: %s", _DATABRICKSCFG_PATH, exc)
         return []
@@ -126,8 +128,8 @@ def get_workspace_url_for_profile(profile: str) -> str | None:
     if _DATABRICKSCFG_PATH.exists():
         cfg = configparser.ConfigParser()
         try:
-            # Vendor-written cfg: read at the locale default (see above).
-            cfg.read(_DATABRICKSCFG_PATH, encoding="locale")
+            # Vendor-written cfg: detect UTF-8 first, locale fallback (see above).
+            cfg.read(_DATABRICKSCFG_PATH, encoding=detect_encoding(_DATABRICKSCFG_PATH))
         except configparser.Error as exc:
             _logger.debug("Could not parse %s: %s", _DATABRICKSCFG_PATH, exc)
         else:

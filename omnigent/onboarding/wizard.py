@@ -26,6 +26,8 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.syntax import Syntax
 
+from omnigent._encoding import detect_encoding
+
 console = Console()
 
 # ANSI helpers - used in arrow-menu labels (rendered via sys.stdout.write,
@@ -471,8 +473,8 @@ def _list_databricks_profiles() -> list[str]:
         return []
     parser = configparser.ConfigParser()
     try:
-        # ~/.databrickscfg is vendor-written; read at the locale default.
-        parser.read(cfg_path, encoding="locale")
+        # ~/.databrickscfg is vendor-written; detect UTF-8 first, locale fallback.
+        parser.read(cfg_path, encoding=detect_encoding(cfg_path))
     except configparser.Error:
         return []
     return [s for s in parser.sections() if s != "DEFAULT"] or (

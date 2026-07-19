@@ -47,6 +47,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from omnigent._encoding import detect_encoding
+
 if TYPE_CHECKING:
     # Imported only for type hints; the heavy/optional imports remain lazy
     # at runtime so importing this module stays cheap.
@@ -447,8 +449,9 @@ def _index_from_pip_config() -> str:
     for path in candidates:
         parser = configparser.ConfigParser(interpolation=None)
         try:
-            # pip.conf is an external, locale-defined config; read it as pip does.
-            if not parser.read(path, encoding="locale"):
+            # pip 26.1 reads pip.conf as UTF-8; detect UTF-8 first with a locale
+            # fallback so a valid UTF-8 corporate config isn't silently skipped.
+            if not parser.read(path, encoding=detect_encoding(path)):
                 continue
         except (configparser.Error, OSError, UnicodeDecodeError):
             continue

@@ -30,6 +30,7 @@ from rich import box
 from rich.console import Console
 from rich.table import Table
 
+from omnigent._encoding import detect_encoding
 from omnigent._platform import IS_WINDOWS, resolve_repo_symlink
 from omnigent._startup_profile import StartupProfiler
 from omnigent.cli_sandbox import lakebox as _lakebox_alias_group
@@ -9153,12 +9154,14 @@ def _isolated_databricks_cfg() -> collections.abc.Generator[None, None, None]:
     # exist. Everything else is excluded so there is exactly one
     # section per workspace host and `databricks auth token --host X`
     # never hits the "multiple profiles match" ambiguity error.
+    # ~/.databrickscfg is vendor-written; detect the real file's codec (UTF-8
+    # first, locale fallback) and preserve it across the final write-back so a
+    # round-trip never re-encodes non-ASCII values. The temp file below is ours,
+    # so it stays UTF-8 (setup detects+preserves, so it round-trips).
+    orig_encoding = detect_encoding(original_cfg)
     orig_cfg = configparser.ConfigParser()
-    # ~/.databrickscfg is vendor-written; every read and write in this flow
-    # uses the locale default so a round-trip never re-encodes non-ASCII
-    # values (a UTF-8 write followed by a locale read would mojibake).
     if original_cfg.exists():
-        orig_cfg.read(original_cfg, encoding="locale")
+        orig_cfg.read(original_cfg, encoding=orig_encoding)
     cfg = configparser.ConfigParser()
     for spec in DEFAULT_PROFILES:
         if orig_cfg.has_section(spec.name):
@@ -9172,7 +9175,7 @@ def _isolated_databricks_cfg() -> collections.abc.Generator[None, None, None]:
         suffix=".tmp",
     )
     try:
-        with os.fdopen(tmp_fd, "w", encoding="locale") as f:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
             cfg.write(f)
     except Exception:
         os.unlink(tmp_name)
@@ -9198,15 +9201,15 @@ def _isolated_databricks_cfg() -> collections.abc.Generator[None, None, None]:
         yield
         # Merge canonical sections written by setup back into the real cfg.
         tmp_cfg = configparser.ConfigParser()
-        tmp_cfg.read(tmp_path, encoding="locale")
+        tmp_cfg.read(tmp_path, encoding="utf-8")  # our temp file (written above)
         orig_cfg = configparser.ConfigParser()
         if original_cfg.exists():
-            orig_cfg.read(original_cfg, encoding="locale")
+            orig_cfg.read(original_cfg, encoding=orig_encoding)
         for spec in DEFAULT_PROFILES:
             if tmp_cfg.has_section(spec.name):
                 orig_cfg[spec.name] = dict(tmp_cfg[spec.name])
         write_tmp = original_cfg.with_suffix(".tmp")
-        with write_tmp.open("w", encoding="locale") as f:
+        with write_tmp.open("w", encoding=orig_encoding) as f:
             orig_cfg.write(f)
         write_tmp.replace(original_cfg)
         write_tmp = None
