@@ -7,8 +7,8 @@
 // foo.py", "Start child session: 'researcher - auth'").
 //
 // The result is split into a neutral `verb` and a dynamic `body`. The
-// body also carries a semantic kind so the trigger can add restrained,
-// SP2K-like emphasis to commands, paths, identifiers, and metrics without
+// body also carries a semantic kind so the trigger can add restrained
+// emphasis to commands, paths, identifiers, and metrics without
 // making every tool call look like a badge. Unknown tools fall back to the
 // pre-existing `name(argsSummary)` shape so we never lose information for
 // tools we haven't taught this module about.

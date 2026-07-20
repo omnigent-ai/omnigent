@@ -210,11 +210,9 @@
       var(--omnigent-bottom-bar-visible)
   );
 
-  /* Brand palette (light). The canvas/surface hierarchy follows Isaac Light:
-     * a near-white paper base, pure-white elevated cards, and warm neutral
-     * hairlines. Omnigent's pink/green atmosphere remains on .app-shell, so
-     * the product still feels unmistakably on-brand instead of becoming an
-     * SP2K clone. */
+  /* Brand palette (light): a near-white paper base, pure-white elevated
+     * cards, and warm neutral hairlines. Pink and green atmosphere remains
+     * scoped to the landing surface. */
   --background: #fdfdfc;
   --shell-surface: #fdfdfc;
   --side-pane-surface: #fff;
@@ -245,8 +243,8 @@
   --secondary-foreground: #11171c;
   --muted: rgba(61, 57, 41, 0.06);
   --muted-foreground: #6e6c68;
-  /* Landing composer context badges follow the Vercel reference's lighter
-     * zinc-500 tier without weakening muted text across the rest of the app. */
+  /* Landing composer context badges use a lighter dedicated tier without
+     * weakening muted text across the rest of the app. */
   --landing-footer-foreground: #71717a;
   /* Dedicated chip background for inline code — a hair darker than the
      * white card so the chip reads as a tile. Kept separate from --muted
@@ -329,7 +327,7 @@
   --border-otto-interactive: rgba(255, 255, 255, 0.14);
   --elevation-otto-1: 0 1px 2px rgba(0, 0, 0, 0.18), 0 3px 10px rgba(0, 0, 0, 0.2);
   --elevation-otto-2: 0 2px 4px rgba(0, 0, 0, 0.28), 0 12px 32px rgba(0, 0, 0, 0.3);
-  /* Xcode-inspired near-black ladder: warm-black canvas with neutral graphite utility panes. */
+  /* Warm-black canvas with neutral graphite utility panes. */
   --background: #121113;
   --shell-surface: #121113;
   --side-pane-surface: #1d1d1f;
@@ -421,9 +419,9 @@
   --landing-footer-foreground: var(--muted-foreground);
 }
 
-/* SP2K-style auto-hiding scrollbars: a 10px hit area with a 6px painted
- * thumb. Tracks and idle thumbs blend completely into their surfaces; the
- * thumb appears faintly when the scrolling region is hovered. */
+/* Auto-hiding scrollbars use a 10px hit area with a 6px painted thumb.
+ * Tracks and idle thumbs blend into their surfaces; the thumb appears faintly
+ * when the scrolling region is hovered. */
 ::-webkit-scrollbar {
   width: 10px;
   height: 10px;
@@ -459,16 +457,15 @@
   scrollbar-color: var(--scrollbar-thumb) transparent;
 }
 
-/* Quiet Isaac-inspired light workspace canvas. The Omnigent pink/green
- * atmosphere is added separately and only on the new-session landing. */
+/* Quiet light workspace canvas. Pink and green atmosphere is added separately
+ * and only on the new-session landing. */
 .app-shell {
   background: var(--shell-surface);
 }
 
 /* Flat warm-white sidebar: keep the surface within one luminance step of the
- * app canvas and use a hairline edge instead of elevation. This follows the
- * quiet pairing shared by Isaac Light and macOS Light, where navigation reads
- * as part of the window rather than a card floating beside it. */
+ * app canvas and use a hairline edge instead of elevation, so navigation reads
+ * as part of the window rather than a separate floating card. */
 :root:not(.dark) .conversations-sidebar:not([data-collapsed]) {
   --foreground: #464247;
   --sidebar-foreground: #464247;
@@ -481,10 +478,9 @@
   background: var(--side-pane-surface);
 }
 
-/* Match SP2K's floating-sidebar depth: a broad 24px lift at very low alpha,
- * retaining Omnigent's existing hairline border rather than duplicating the
- * shadow-ring SP2K uses in place of a CSS border. Scope this to the canonical
- * light palette so named themes keep their own elevation language. */
+/* Give the floating sidebar a broad 24px lift at very low alpha while
+ * retaining the existing hairline border. Scope this to the canonical light
+ * palette so named themes keep their own elevation language. */
 :root:not(.dark):not([data-theme]) .conversations-sidebar:not([data-collapsed]) {
   background: var(--sidebar);
   box-shadow:
@@ -525,10 +521,8 @@
     0 0 0 3px color-mix(in srgb, var(--ring) 16%, transparent);
 }
 
-/* Tool-step presentation follows SP2K's quiet “Worked for…” hierarchy while
- * retaining Omnigent's own surfaces and theme tokens. Expanded calls form a
- * compact timeline; each category/status glyph sits inside an 18px node that
- * masks the guide behind it. */
+/* Expanded tool calls form a compact timeline. Each category/status glyph
+ * sits inside an 18px node that masks the guide behind it. */
 .tool-step-icon-node {
   position: relative;
   z-index: 1;
@@ -629,9 +623,7 @@
   }
 }
 
-/* Reference workspace card: the right pane uses the compact floating geometry
- * and elevation from the live agentic-ux prototype instead of the older
- * oversized dashboard-card treatment. */
+/* The right pane uses compact floating geometry and restrained elevation. */
 :root:not(.dark) .workspace-panel-surface {
   border-color: rgba(61, 57, 41, 0.08);
   background: var(--side-pane-surface);
@@ -732,8 +724,8 @@ html.dark .app-shell .workspace-panel-surface {
     0 1px 3px rgba(0, 0, 0, 0.16);
 }
 
-/* Isaac Darker keeps the page near-black and lifts the sidebar by one compact
- * step. Omnigent adds only a tiny rose bias to the otherwise-neutral ladder. */
+/* The dark canvas stays near-black while the sidebar lifts by one compact
+ * step with a small rose bias in the otherwise-neutral ladder. */
 html.dark .app-shell aside[aria-label="Conversations"].conversations-sidebar:not([data-collapsed]) {
   --foreground: hsl(55 9% 74%);
   --muted-foreground: hsl(48 5% 57%);
@@ -1197,9 +1189,9 @@ html[data-theme] .reference-composer-surface button[aria-label="Send"]:not(:disa
   .xterm {
     font-family: var(--font-mono);
   }
-  /* Text selection follows the familiar macOS system-blue wash rather than
-   * the active palette's brand accent. Keep the original text color intact so
-   * selections remain quiet and readable across prose, code, and themed UI. */
+  /* Text selection uses a restrained system-blue wash rather than the active
+   * palette's brand accent. Keep the original text color intact so selections
+   * remain quiet and readable across prose, code, and themed UI. */
   ::selection {
     background: rgba(0, 122, 255, 0.22);
   }
@@ -1256,8 +1248,8 @@ html.dark:not([data-theme]) .chat-conversation-content {
   --muted: color-mix(in srgb, #999397 13%, #242126);
 }
 
-/* Session keyword chips keep the Vercel prototype's compact 12/18 geometry,
- * with a slightly stronger neutral fill for Omnigent Light's brighter canvas. */
+/* Session keyword chips use compact 12/18 geometry with a slightly stronger
+ * neutral fill for the brighter light canvas. */
 .chat-conversation-content [data-streamdown="inline-code"] {
   padding: 1px 5px;
   border-radius: 4px;
@@ -2357,9 +2349,8 @@ html.dark:not([data-theme]) .chat-conversation-content {
 :root:not(.dark):not([data-theme])
   .reference-composer-surface
   button[aria-label="Send"]:not(:disabled) {
-  /* Soft bubblegum fill + darker rose outline + pale halo, sampled from the
-   * user's reference. The fill is nudged darker than the sample so the white
-   * glyph retains 3:1 non-text contrast. */
+  /* Soft bubblegum fill, darker rose outline, and pale halo. The fill keeps
+   * enough contrast for the white glyph. */
   color: #fff !important;
   border-color: #c94f89 !important;
   background: #e468a1 !important;

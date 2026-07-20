@@ -117,9 +117,9 @@ describe("project folder header icon/chevron", () => {
     renderSidebar();
     const header = headerButton("My Project");
 
-    // Project folders are real rows, not muted section labels: match the
-    // mockup's 26px row (20px line + 3px vertical padding), 8px insets/gap,
-    // and regular 13px foreground text.
+    // Project folders are real rows, not muted section labels: use a 26px row
+    // (20px line + 3px vertical padding), 8px insets/gap, and regular 13px
+    // foreground text.
     expect(header).toHaveClass(
       "gap-2",
       "rounded-[var(--radius-otto-xs)]",

@@ -240,7 +240,7 @@ describe("Sidebar session list", () => {
     );
   });
 
-  it("renders the compact header controls and reference navigation rows", () => {
+  it("renders the compact header controls and navigation rows", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar();
 

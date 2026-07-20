@@ -1169,7 +1169,7 @@ describe("NewChatLandingScreen", () => {
     expect(label("new-chat-landing-branch-chip")?.className).toContain("max-w-32");
   });
 
-  it("uses the reference footer icons for host, directory, and worktree", async () => {
+  it("uses the footer icons for host, directory, and worktree", async () => {
     renderLanding();
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
@@ -1186,7 +1186,7 @@ describe("NewChatLandingScreen", () => {
     ).toBeTruthy();
   });
 
-  it("uses the lighter reference color for every landing footer badge", async () => {
+  it("uses the lighter color for every landing footer badge", async () => {
     renderLanding({}, "/?project=docs");
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),

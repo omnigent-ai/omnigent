@@ -554,7 +554,7 @@ describe("AgentPicker trigger label", () => {
     // The harness identity ("Claude") is NOT in the trigger anymore — it
     // moved to the status tray below.
     expect(trigger).not.toHaveTextContent("Claude");
-    // The whole trigger uses the reference composer's muted, normal-weight treatment.
+    // The whole trigger uses a muted, normal-weight treatment.
     expect(within(trigger).getByText("Opus")).not.toHaveClass("text-foreground");
     expect(trigger).toHaveClass("font-normal", "text-muted-foreground");
     expect(within(trigger).getByText("High")).toHaveClass("text-muted-foreground");

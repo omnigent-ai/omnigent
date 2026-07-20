@@ -187,9 +187,9 @@ export function ChatHeader({
     <header
       data-testid="chat-header"
       className={cn(
-        // Mobile keeps the existing 56px touch-friendly bar. Desktop adopts
-        // the reference's compact 40px session chrome: title left, view mode
-        // centered, and actions right. Only active sessions paint the flat,
+        // Mobile keeps the existing 56px touch-friendly bar. Desktop uses
+        // compact 40px session chrome: title left, view mode centered, and
+        // actions right. Only active sessions paint the flat,
         // translucent surface; the landing page keeps its canvas clear.
         "chat-header absolute top-0 right-0 left-0 z-30 flex h-14 items-center justify-between px-2 py-3 md:right-[var(--workspace-panel-offset,0px)] md:h-10 md:py-2",
         conversationId && "chat-header-session md:bg-background/95 md:backdrop-blur-xl",

@@ -12,8 +12,8 @@ import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/ses
 const MIN_WIDTH_PX = 240;
 const MAX_WIDTH_RATIO = 0.6;
 
-// Match the compact workspace pane from the agentic-ux reference. Users can
-// still drag wider, and saved per-session widths continue to win.
+// Keep the workspace pane compact by default. Users can still drag wider, and
+// saved per-session widths continue to win.
 const DEFAULT_WIDTH_PX = 400;
 
 function defaultWidthPx(): number {

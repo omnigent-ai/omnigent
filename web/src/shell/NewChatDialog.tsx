@@ -3000,9 +3000,9 @@ export function NewChatLandingScreen() {
   );
 
   return (
-    // Keep the new-session controls in the upper third, like SP2K, rather
-    // than vertically centering them in the full workspace. The clamped
-    // desktop offset stays comfortable on both laptop and tall displays.
+    // Keep the new-session controls in the upper third rather than vertically
+    // centering them in the full workspace. The clamped desktop offset stays
+    // comfortable on both laptop and tall displays.
     <div
       ref={setLandingSurface}
       className="flex flex-1 items-start justify-center pt-[104px] md:pt-[clamp(128px,22vh,216px)]"
@@ -3349,8 +3349,8 @@ export function NewChatLandingScreen() {
               </div>
             </div>
           </ComposerFormSurface>
-          {/* Borderless context row beneath the composer, matching the reference:
-              36px tall with transparent 24px controls and no inter-chip gap. */}
+          {/* Borderless context row beneath the composer: 36px tall with
+              transparent 24px controls and no inter-chip gap. */}
           <div className="relative z-0 w-full [&_button]:hover:!bg-transparent">
             <div className="ml-2 flex min-h-9 min-w-0 flex-nowrap items-center gap-0 overflow-hidden rounded-b-[var(--radius-otto-lg)] px-0 py-1.5">
               {/* Host chip */}

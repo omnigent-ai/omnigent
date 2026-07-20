@@ -61,7 +61,7 @@ describe("index.css semantic token contract", () => {
     expect(cssSource).toContain("--text-card-meta: 11px;");
   });
 
-  it("matches the reference landing-footer foregrounds in both default modes", () => {
+  it("defines dedicated landing-footer foregrounds in both default modes", () => {
     expect(light.get("landing-footer-foreground")).toBe("#71717a");
     expect(dark.get("landing-footer-foreground")).toBe("#92a4b3");
     expect(cssSource).toContain("--color-landing-footer: var(--landing-footer-foreground);");
@@ -198,7 +198,7 @@ describe("index.css default light composer action", () => {
 });
 
 describe("index.css text selection", () => {
-  it("uses restrained macOS system-blue washes instead of the brand accent", () => {
+  it("uses restrained system-blue washes instead of the brand accent", () => {
     expect(cssSource).toContain("background: rgba(0, 122, 255, 0.22);");
     expect(cssSource).toContain("background: rgba(10, 132, 255, 0.28);");
     expect(cssSource).not.toContain("background: var(--brand-accent);\n    color: #ffffff;");

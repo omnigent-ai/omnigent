@@ -6,7 +6,7 @@ import { resetWidthStoreForTesting, useResizableInlinePanel } from "./useResizab
 // useResizableInlinePanel keeps its width in a module-level store shared across
 // all callers, re-seeded per conversation. resetWidthStoreForTesting clears it
 // between tests so cases are fully independent. A 2000px viewport leaves the
-// 400px reference default unclamped.
+// 400px default unclamped.
 
 const SESSION = "conv_test";
 const originalInnerWidth = window.innerWidth;
@@ -51,7 +51,7 @@ describe("useResizableInlinePanel persistence", () => {
     resetWidthStoreForTesting();
     const restored = renderHook(() => useResizableInlinePanel(SESSION));
 
-    // The saved manual width wins over the 400px reference default.
+    // The saved manual width wins over the 400px default.
     expect(restored.result.current.panelWidth).toBe(420);
     restored.unmount();
   });
@@ -63,7 +63,7 @@ describe("useResizableInlinePanel persistence", () => {
     first.unmount();
 
     // A second conversation has no saved width, so it falls back to the
-    // 400px reference default rather than inheriting the first's 420px width.
+    // 400px default rather than inheriting the first's 420px width.
     const second = renderHook(() => useResizableInlinePanel("conv_other"));
     expect(second.result.current.panelWidth).toBe(400);
     expect(readSessionWorkspaceState("conv_other").widthPx).toBeUndefined();
