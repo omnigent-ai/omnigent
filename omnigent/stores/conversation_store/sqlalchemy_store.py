@@ -37,6 +37,7 @@ from omnigent.db.db_models import (
     SqlPolicy,
     SqlSessionPermission,
     SqlUserDailyCost,
+    conversation_title_hash,
     current_workspace_id,
     uuid_to_bytes,
 )
@@ -2516,6 +2517,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             ap_changed = False
             if title is not None:
                 row.title = title or ""
+                # Column default only fires on INSERT; keep the hash in sync here.
+                row.title_hash = conversation_title_hash(row.title)
                 ap_changed = True
             if _unset_reasoning_effort:
                 agent_config.reasoning_effort = None
@@ -2582,7 +2585,12 @@ class SqlAlchemyConversationStore(ConversationStore):
                     SqlConversation.id == conversation_id,
                     SqlConversation.title == expected_title,
                 )
-                .values(title=title, updated_at=now_epoch())
+                # Bulk UPDATE bypasses the column default, so stamp the hash here.
+                .values(
+                    title=title,
+                    title_hash=conversation_title_hash(title),
+                    updated_at=now_epoch(),
+                )
             )
             if result.rowcount != 1:
                 return None
