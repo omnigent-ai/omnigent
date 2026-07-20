@@ -25,7 +25,6 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
-from omnigent.cost_plan import COST_CONTROL_PLAN_LABEL, parse_verdict
 from omnigent.errors import OmnigentError
 from omnigent.runner.identity import (
     OMNIGENT_INTERNAL_WS_ORIGIN,
@@ -45,6 +44,11 @@ from omnigent.stores.permission_store.sqlalchemy_store import (
 
 ALICE = "alice@example.com"
 BOB = "bob@example.com"
+
+# Label key used as a concrete test target for the cost_control.* namespace
+# guard. The full parse/serialize logic was removed with the cost_advisor;
+# the namespace protection in sessions.py still applies to this key.
+COST_CONTROL_PLAN_LABEL = "cost_control.plan"
 
 # The binding token the test runner presents; its token-bound id is what
 # the session's runner_id must equal for the write to be authorized.
@@ -162,13 +166,15 @@ def _seed_session(
     :returns: The new session/conversation id.
     """
     conversation_store, agent_store, permission_store = stores
-    if agent_store.get("ag_test") is None:
+    if agent_store.get("087b7cb7ac30abf4debfaa578d052ec6") is None:
         agent_store.create(
-            agent_id="ag_test",
+            agent_id="087b7cb7ac30abf4debfaa578d052ec6",
             name="test-agent",
-            bundle_location="ag_test/bundle",
+            bundle_location="087b7cb7ac30abf4debfaa578d052ec6/bundle",
         )
-    conv = conversation_store.create_conversation(title="advised session", agent_id="ag_test")
+    conv = conversation_store.create_conversation(
+        title="advised session", agent_id="087b7cb7ac30abf4debfaa578d052ec6"
+    )
     if owner is not None:
         permission_store.ensure_user(owner)
         permission_store.grant(owner, conv.id, LEVEL_OWNER)
@@ -206,7 +212,6 @@ def test_editor_cannot_patch_cost_control_plan(
     conv = conversation_store.get_conversation(conv_id)
     assert conv is not None
     assert COST_CONTROL_PLAN_LABEL not in conv.labels
-    assert parse_verdict(conv.labels) is None
 
 
 def test_owner_without_runner_proof_cannot_patch_cost_control_plan(
@@ -330,11 +335,8 @@ def test_bound_runner_token_authorizes_plan_write(
     assert resp.status_code == 200
     conv = conversation_store.get_conversation(conv_id)
     assert conv is not None
-    # The persisted value round-trips through parse_verdict — the full
-    # write→read chain is intact.
-    verdict = parse_verdict(conv.labels)
-    assert verdict is not None
-    assert verdict.tier == "expensive"
+    # The write landed in the store.
+    assert conv.labels.get(COST_CONTROL_PLAN_LABEL) == _FORGED_PLAN
 
 
 def test_allowlisted_pool_token_authorizes_plan_write(
@@ -359,7 +361,7 @@ def test_allowlisted_pool_token_authorizes_plan_write(
     assert resp.status_code == 200
     conv = conversation_store.get_conversation(conv_id)
     assert conv is not None
-    assert parse_verdict(conv.labels) is not None
+    assert COST_CONTROL_PLAN_LABEL in conv.labels
 
 
 def test_single_user_server_skips_the_gate(
@@ -380,7 +382,7 @@ def test_single_user_server_skips_the_gate(
     assert resp.status_code == 200
     conv = conversation_store.get_conversation(conv_id)
     assert conv is not None
-    assert parse_verdict(conv.labels) is not None
+    assert COST_CONTROL_PLAN_LABEL in conv.labels
 
 
 # ── Create: no client may seed the namespace ─────────────────────────────────
@@ -399,7 +401,7 @@ def test_create_session_rejects_cost_control_label_seed(
     resp = TestClient(app).post(
         "/v1/sessions",
         json={
-            "agent_id": "ag_test",
+            "agent_id": "087b7cb7ac30abf4debfaa578d052ec6",
             "labels": {COST_CONTROL_PLAN_LABEL: _FORGED_PLAN},
         },
         # Sentinel Origin: first-party client past the require_trusted_origin guard.
@@ -447,7 +449,7 @@ def test_create_session_with_ordinary_labels_succeeds(
 
     resp = TestClient(app).post(
         "/v1/sessions",
-        json={"agent_id": "ag_test", "labels": {"team": "ml"}},
+        json={"agent_id": "087b7cb7ac30abf4debfaa578d052ec6", "labels": {"team": "ml"}},
         # Sentinel Origin: first-party client past the require_trusted_origin guard.
         headers={"X-Forwarded-Email": ALICE, "Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
     )

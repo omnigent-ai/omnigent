@@ -203,11 +203,23 @@ def test_write_blocked_outside_workspace(
     mock_llm_server_url: str,
 ) -> None:
     """
-    The Write tool cannot create files outside the workspace.
+    The native Write tool cannot create files outside the workspace.
 
-    The mock LLM issues a Write tool call targeting /tmp. The
-    sandbox (PreToolUse hook) must block it. The file must NOT
+    The mock LLM issues a Write tool call targeting /tmp; the file must NOT
     exist on disk after the turn completes.
+
+    **Caveat (claude-sdk-specific):** Claude Code confines its built-in file
+    tools to the CLI's working directory, so the out-of-workspace write never
+    lands — but it enforces this *silently*. Under the default
+    ``bypassPermissions`` mode no PreToolUse hook fires and ``can_use_tool``
+    is never invoked for built-in tools, so the dropped Write produces **no
+    tool result** to assert against. Hence this test asserts the security
+    property that actually holds (file not created) plus a guard that the
+    mock turn was exercised, rather than expecting a surfaced denial. The
+    *surfaced*-deny path — the ``worktree_guard`` policy denying an
+    out-of-workspace ``sys_os_write`` and returning a deny tool result — is
+    covered for the openai-agents harness (which does surface tool results)
+    in ``tests/e2e/test_os_env_write_boundary_e2e.py``.
 
     **What breaks if wrong:** The agent writes arbitrary files
     to the host filesystem.
@@ -232,7 +244,7 @@ def test_write_blocked_outside_workspace(
                         }
                     ]
                 },
-                # Turn 2: LLM responds with text
+                # Turn 2: LLM responds with text after the (dropped) write
                 {"text": "I attempted to write the file."},
             ],
             key=model,
@@ -246,29 +258,21 @@ def test_write_blocked_outside_workspace(
         )
         assert body["status"] == "completed", f"Task failed: {body.get('error')}"
 
-        # Primary assertion: file must not exist on disk.
+        # Primary security property: the file must not exist on disk.
         assert not os.path.exists(target), (
             f"Sandbox escape! File {target} was written outside "
-            "the workspace. The sandbox did not block the Write tool."
+            "the workspace. The CLI did not confine the Write tool."
         )
 
-        # Secondary assertion: the sandbox hook must have fired and
-        # returned an error in the tool results. Without this, the
-        # test could pass if the mock response was never consumed
-        # (e.g. due to a URL misconfiguration).
-        tool_results = _collect_tool_results(body)
-        has_block = any(
-            "denied" in r.lower()
-            or "blocked" in r.lower()
-            or "outside" in r.lower()
-            or "not allowed" in r.lower()
-            or "error" in r.lower()
-            for r in tool_results
-        )
-        assert has_block or tool_results, (
-            "Write tool call produced no tool results — the sandbox "
-            "hook may not have fired. Expected at least one tool "
-            f"result with a block/error message. Output: {body.get('output', [])}"
+        # Guard: the mock turns were actually consumed (the Write tool call
+        # was dispatched and the follow-up turn ran), so a silent no-op or a
+        # mock-URL misconfiguration can't make the assertion above pass
+        # vacuously. The turn-2 reply only appears after turn-1's Write was
+        # processed. (We can't assert on a tool result here — see the
+        # docstring caveat: claude-sdk surfaces none for the confined write.)
+        assert "attempted to write the file" in _extract_all_text(body).lower(), (
+            "Mock turn-2 reply missing — the Write tool call may not have "
+            f"been dispatched. Output: {body.get('output', [])}"
         )
     finally:
         if os.path.exists(target):

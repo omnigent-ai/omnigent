@@ -31,6 +31,8 @@ class Policy:
     :param session_id: The session this policy is scoped to,
         e.g. ``"conv_abc123"``. ``None`` for server-wide
         default policies.
+    :param scope: ``"default"`` for server-wide policies;
+        ``"session"`` for session-scoped policies.
     :param created_at: Unix epoch seconds at row creation.
     :param type: Handler discriminator: ``"python"`` or
         ``"url"``.
@@ -52,6 +54,7 @@ class Policy:
     id: str
     name: str
     session_id: str | None
+    scope: str
     created_at: int
     type: str
     handler: str

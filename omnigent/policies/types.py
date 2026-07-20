@@ -28,31 +28,37 @@ and :class:`PolicyResult` from here (or from the
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from omnigent.spec.types import Phase, PolicyAction, StateUpdate
 
-if TYPE_CHECKING:
-    from omnigent.entities import ConversationItem
+_log = logging.getLogger(__name__)
 
 
 # Proto-style phase wire strings (the ``type`` field on events that
 # cross the harness↔runner boundary) for which an unavailable policy
 # evaluation must fail CLOSED (default ``POLICY_ACTION_DENY``).
 #
-# Only ``PHASE_TOOL_CALL`` qualifies: for connector-native MCP tools the
-# in-band verdict is the only enforcement point — the call is never
-# re-checked server-side — so an unevaluable policy must not let the call
-# through. ``PHASE_TOOL_RESULT`` is intentionally NOT here: by the time the
-# result phase runs the tool has already executed, so failing it closed
-# would only block an already-incurred side effect; it fails OPEN like the
-# advisory LLM phases.
+# ``PHASE_TOOL_CALL``: for connector-native MCP tools the in-band verdict is
+# the only enforcement point — the call is never re-checked server-side — so
+# an unevaluable policy must not let the call through.
 #
-# Defined once here so the two enforcement sites
+# ``PHASE_REQUEST``: the request gate runs before the LLM turn and is the
+# sole pre-turn enforcement point for native sessions (UserPromptSubmit). A
+# server hiccup must not let an over-budget or otherwise-blocked request
+# proceed, so this phase also fails CLOSED.
+#
+# ``PHASE_TOOL_RESULT`` is intentionally NOT here: by the time the result
+# phase runs the tool has already executed, so failing it closed would only
+# block an already-incurred side effect; it fails OPEN like the advisory LLM
+# phases.
+#
+# Defined once here so the enforcement sites
 # (``omnigent.runner.app`` and ``omnigent.runtime.harnesses._scaffold``)
 # can't drift if the set of fail-closed phases changes.
-FAIL_CLOSED_PHASES: tuple[str, ...] = ("PHASE_TOOL_CALL",)
+FAIL_CLOSED_PHASES: tuple[str, ...] = ("PHASE_TOOL_CALL", "PHASE_REQUEST")
 
 
 @dataclass(frozen=True)
@@ -130,6 +136,13 @@ class EvaluationContext:
         callable. ``None`` means "engine not yet populated"
         (test contexts); empty dict means "no usage recorded
         yet."
+    :param subtree_usage: Subtree-scoped cumulative LLM cost for
+        this conversation and its descendants only (not the whole
+        session tree). Same shape as ``usage``. Injected by the
+        engine ONLY when a ``subagent_cost_budget`` policy is
+        configured — ``None`` otherwise, so sessions without that
+        policy pay no subtree-cost lookup. Surfaced as
+        ``event["context"]["subtree_usage"]`` to the callable.
     :param user_daily_cost: The session owner's per-UTC-day cost
         rollup, shape
         ``{"cost_usd": <float>, "ask_approved_usd": <float>}``,
@@ -174,11 +187,11 @@ class EvaluationContext:
     phase: Phase
     content: Any
     tool_name: str | None = None
-    trajectory: list[ConversationItem] | None = None
     actor: dict[str, str] | None = None
     request_data: Any = None
     session_state: dict[str, Any] | None = None
     usage: dict[str, float] | None = None
+    subtree_usage: dict[str, float] | None = None
     user_daily_cost: dict[str, float | str] | None = None
     model: str | None = None
     harness: str | None = None
@@ -209,14 +222,15 @@ class PolicyResult:
         accumulated and intends to apply on this decision
         (filtering already done). ``None`` when the policy
         wrote no labels, e.g. ``{"integrity": "0"}``.
-    :param deciding_policy: Name of the policy whose action
-        drove the composed result. Engine-set only —
-        single-policy results leave it ``None``. On DENY: the
-        first short-circuiting policy. On ASK: the first
-        ASKing policy in YAML order. On ALLOW: ``None``.
-        Powers the ``deciding_policy`` outer-span attribute
-        (POLICIES.md §11.5) and the per-policy ``ask_timeout``
-        lookup (§7.2).
+    :param deciding_policies: Names of all policies that drove
+        the composed result. Engine-set only — single-policy
+        results leave it ``None``. On DENY: a single-element
+        list with the short-circuiting policy. On ASK: all
+        ASKing policies in YAML order. On ALLOW: ``None``.
+        ``deciding_policy`` is a computed property returning
+        ``deciding_policies[0]`` (or ``None`` when unset);
+        all existing callers that read ``.deciding_policy``
+        work unchanged.
     :param data: Optional replacement payload returned by the
         policy callable. When present on an ALLOW result, the
         enforcement site substitutes this value for the original
@@ -225,6 +239,10 @@ class PolicyResult:
         phase). ``None`` means "use original content unchanged".
         ``Any`` because the shape varies by phase: a dict of
         tool arguments on TOOL_CALL, a string on TOOL_RESULT.
+        When multiple policies transform data, each policy
+        receives the previous policy's output as its input —
+        the engine feeds the composed result back as
+        ``ctx.content`` before dispatching to the next policy.
     :param state_updates: Ordered list of :class:`StateUpdate`
         operations to apply to the engine's ``session_state``.
         Each entry specifies a key, an action (``SET``,
@@ -240,9 +258,18 @@ class PolicyResult:
     action: PolicyAction
     reason: str | None = None
     set_labels: dict[str, str] | None = None
-    deciding_policy: str | None = None
+    deciding_policies: list[str] | None = None
     data: Any = None
     state_updates: list[StateUpdate] | None = None
+
+    @property
+    def deciding_policy(self) -> str | None:
+        """First deciding policy name, or ``None``.
+
+        Derived from ``deciding_policies[0]`` so callers that
+        read ``.deciding_policy`` work without change.
+        """
+        return self.deciding_policies[0] if self.deciding_policies else None
 
 
 @dataclass(frozen=True)
@@ -272,10 +299,12 @@ class ElicitationRequest:
         e.g. ``"request"`` or ``"tool_call"``. Surfaces in the
         elicitation event's extras so the renderer can label the
         prompt.
-    :param policy_name: Name of the deciding (first-in-YAML-order)
-        ASKing policy. Drives per-policy ``ask_timeout`` lookup,
-        observability, and the renderer's "policy X says..." label.
-        e.g. ``"pii_redact"``.
+    :param policy_names: Names of all ASKing policies that contributed
+        to this elicitation, in YAML order. Always a non-empty list.
+        ``policy_name`` is a computed property returning
+        ``policy_names[0]`` — existing callers that read
+        ``.policy_name`` work without change.
+        e.g. ``["pii_redact"]`` or ``["pii_redact", "cost_gate"]``.
     :param content_preview: Truncated snapshot of the content being
         gated. Lets a human reviewer see what they're approving
         without overwhelming the UI on a 50 KB payload. Surfaces in
@@ -284,9 +313,18 @@ class ElicitationRequest:
 
     message: str
     phase: str
-    policy_name: str
+    policy_names: list[str]
     content_preview: str
     requested_schema: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def policy_name(self) -> str:
+        """First ASKing policy name.
+
+        Derived from ``policy_names[0]`` so callers that read
+        ``.policy_name`` work without change.
+        """
+        return self.policy_names[0] if self.policy_names else ""
 
 
 @dataclass
@@ -314,12 +352,21 @@ class PolicyLLMClient:
         adapter defaults / env vars.
     :param _request_timeout: Request timeout in seconds from the
         server ``llm:`` config, e.g. ``300``.
+    :param _fallback_models: Ordered backup models tried when the
+        primary ``_model`` call fails. Same provider-prefixed
+        format as ``_model``. Empty (the default) preserves
+        single-model behaviour — one attempt, no fallback loop.
+        ``_connection``/``_request_timeout`` are shared across the
+        primary and every fallback, so same-provider fallbacks are
+        the reliable case (a cross-provider fallback only works when
+        ``_connection`` is ``None``).
     """
 
     _client: Any  # omnigent.llms.client.Client — Any to avoid import cycle
     _model: str
     _connection: dict[str, str] | None
     _request_timeout: int
+    _fallback_models: list[str] = field(default_factory=list)
 
     async def create(
         self,
@@ -336,6 +383,18 @@ class PolicyLLMClient:
         from the server config. Callers can override any of these
         via kwargs.
 
+        When ``_fallback_models`` is non-empty and the caller does
+        not override ``model``, the primary model is tried first and
+        each fallback in turn on failure; the last exception is
+        re-raised only after every candidate has failed. A caller
+        that passes an explicit ``model`` opts out of fallback — the
+        single requested model is used as-is.
+
+        Candidates are tried serially, so the worst-case latency of
+        this call is ``(1 + len(_fallback_models)) * timeout``. On
+        the policy hot path this delays the fail-closed (DENY)
+        verdict, so keep the fallback list short.
+
         :param input: Messages in OpenAI Responses API format,
             e.g. ``[{"role": "user", "content": [{"type": "input_text",
             "text": "..."}]}]``.
@@ -343,15 +402,73 @@ class PolicyLLMClient:
         :param kwargs: Additional kwargs forwarded to
             ``client.responses.create()``.
         :returns: A :class:`~omnigent.llms.types.Response`.
+        :raises Exception: The last error encountered when every
+            candidate model fails. Propagates the primary model's
+            exception when no fallbacks are configured.
         """
-        return await self._client.responses.create(
-            input=input,
-            model=kwargs.pop("model", self._model),
-            connection_params=kwargs.pop("connection_params", self._connection),
-            timeout=kwargs.pop("timeout", self._request_timeout),
-            instructions=instructions,
-            **kwargs,
+        connection_params = kwargs.pop("connection_params", self._connection)
+        timeout = kwargs.pop("timeout", self._request_timeout)
+
+        # An explicit model override opts out of the fallback chain —
+        # honour exactly what the caller asked for.
+        if "model" in kwargs:
+            return await self._client.responses.create(
+                input=input,
+                model=kwargs.pop("model"),
+                connection_params=connection_params,
+                timeout=timeout,
+                instructions=instructions,
+                **kwargs,
+            )
+
+        candidates = [self._model, *self._fallback_models]
+        last_exc: Exception | None = None
+        for index, model in enumerate(candidates):
+            try:
+                response = await self._client.responses.create(
+                    input=input,
+                    model=model,
+                    connection_params=connection_params,
+                    timeout=timeout,
+                    instructions=instructions,
+                    **kwargs,
+                )
+            except Exception as exc:  # noqa: BLE001 — retry next model on any failure
+                last_exc = exc
+                remaining = len(candidates) - index - 1
+                if remaining:
+                    _log.warning(
+                        "PolicyLLMClient: model %r failed (%s); "
+                        "falling back to next of %d remaining",
+                        model,
+                        exc,
+                        remaining,
+                        exc_info=True,
+                    )
+                continue
+            # A non-primary candidate succeeded — record which fallback
+            # recovered the call so the fallback path is visible in logs.
+            if index > 0:
+                _log.warning(
+                    "PolicyLLMClient: recovered on fallback model %r "
+                    "(candidate %d of %d) after primary failure",
+                    model,
+                    index + 1,
+                    len(candidates),
+                )
+            return response
+        # Every candidate failed — surface the last error to the caller.
+        # This is the fail-closed (DENY) path and, because candidates are
+        # tried serially, the caller has now waited up to
+        # ``len(candidates) * timeout``; log it so the latency is visible.
+        _log.error(
+            "PolicyLLMClient: all %d candidate model(s) failed after "
+            "serial attempts (up to %ds each); surfacing last error",
+            len(candidates),
+            timeout,
         )
+        assert last_exc is not None
+        raise last_exc
 
 
 __all__ = [

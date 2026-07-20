@@ -3,11 +3,27 @@
 from __future__ import annotations
 
 import subprocess
+from pathlib import Path
 
 import pytest
 
+import omnigent._platform as _platform
 from omnigent.onboarding import harness_install as hi
-from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, OPENAI_FAMILY
+from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
+
+
+@pytest.fixture(autouse=True)
+def _stub_cli_fallback_dirs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Reduce ``resolve_cli_binary`` to a pure ``PATH`` probe under test.
+
+    ``harness_cli_installed`` / ``missing_harness_cli`` resolve via
+    ``resolve_cli_binary``, which also probes on-disk global install dirs
+    (``~/.local/bin``, nvm, …). Tests here stub ``shutil.which`` to simulate a
+    binary's presence/absence; stub the fallback dirs to empty too so a
+    developer's real claude/codex install can't flip a ``which``-returns-None
+    assertion.
+    """
+    monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: ())
 
 
 @pytest.mark.parametrize(
@@ -16,6 +32,7 @@ from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, OPENAI_FAMILY
         (ANTHROPIC_FAMILY, "claude", "@anthropic-ai/claude-code"),
         (OPENAI_FAMILY, "codex", "@openai/codex"),
         (hi.PI_KEY, "pi", "@earendil-works/pi-coding-agent"),
+        (hi.QWEN_KEY, "qwen", "@qwen-code/qwen-code"),
     ],
 )
 def test_install_spec_and_command(key: str, binary: str, package: str) -> None:
@@ -29,6 +46,53 @@ def test_install_spec_and_command(key: str, binary: str, package: str) -> None:
     assert spec.binary == binary
     assert spec.package == package
     assert hi.harness_install_command(key) == ["npm", "install", "-g", package]
+
+
+def test_kimi_install_spec_is_login_only_no_npm() -> None:
+    """Kimi ships via a curl installer (no npm package) and authenticates
+    through its own ``kimi login`` (OAuth or Moonshot API key), so it carries
+    an ``install_hint`` instead of a ``package`` and intentionally has no
+    ``status_args`` (no exit-code "am I logged in?" probe to read).
+    """
+    spec = hi.harness_install_spec(hi.KIMI_KEY)
+    assert spec is not None
+    assert spec.binary == "kimi"
+    assert spec.package is None
+    assert spec.install_hint is not None and "code.kimi.com" in spec.install_hint
+    assert spec.login_args == ("login",)
+    assert spec.logout_args == ("logout",)
+    assert spec.status_args is None
+
+
+def test_kimi_required_cli_returns_install_spec() -> None:
+    """The kimi harness is binary-gated: it cannot launch without ``kimi`` on
+    PATH, so the sub-agent dispatch preflight must surface the install spec."""
+    spec = hi.required_cli_for_harness("kimi")
+    assert spec is not None
+    assert spec.binary == "kimi"
+
+
+def test_kimi_only_upstream_binary_satisfies_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only ``kimi`` (the upstream MoonshotAI/Kimi-Code binary) counts as
+    installed. The legacy pypi ``kimi-cli`` package is intentionally NOT
+    accepted — its command-line surface is incompatible with what the
+    executor drives, so falsely reading it as configured would crash at
+    the first turn."""
+    monkeypatch.setattr(
+        hi.shutil,
+        "which",
+        lambda name: "/Users/x/.local/bin/kimi-cli" if name == "kimi-cli" else None,
+    )
+    assert hi.harness_cli_installed(hi.KIMI_KEY) is False
+
+    monkeypatch.setattr(
+        hi.shutil,
+        "which",
+        lambda name: "/Users/x/.kimi-code/bin/kimi" if name == "kimi" else None,
+    )
+    assert hi.harness_cli_installed(hi.KIMI_KEY) is True
 
 
 def test_cursor_install_spec_is_login_only_no_npm() -> None:
@@ -50,15 +114,75 @@ def test_cursor_install_spec_is_login_only_no_npm() -> None:
     assert spec.login_status_key == "isAuthenticated"
 
 
+def test_kiro_install_spec_is_manual_installer_no_npm() -> None:
+    """Kiro ships as a standalone native installer, not an npm package."""
+    spec = hi.harness_install_spec(hi.KIRO_KEY)
+    assert spec is not None
+    assert spec.display == "Kiro"
+    assert spec.binary == "kiro-cli"
+    assert spec.package is None
+    assert spec.install_hint == "curl -fsSL https://cli.kiro.dev/install | bash"
+
+
+def test_hermes_install_spec_has_actionable_vendor_installer() -> None:
+    """Hermes' trusted vendor installer can be launched from the setup menu."""
+    spec = hi.harness_install_spec(hi.HERMES_KEY)
+    assert spec is not None
+    assert spec.package is None
+    assert spec.install_hint is not None
+    assert hi.harness_install_command(hi.HERMES_KEY) == [
+        "bash",
+        "-c",
+        spec.install_hint,
+    ]
+
+
+def test_antigravity_install_spec_status_only_no_npm() -> None:
+    """Antigravity (agy) ships via a shell installer (no npm) and has no login
+    subcommand — the user signs in by launching ``agy`` once. It DOES expose a
+    status check (``agy models``), so the spec carries ``status_args`` +
+    ``install_hint`` but no ``package`` / ``login_args`` / ``logout_args``.
+
+    Drift here (a package sneaking in, or losing ``status_args``) would make the
+    setup menu offer a bogus ``npm install`` or fall back to a file-only login
+    check that can't see server-side revocation.
+    """
+    spec = hi.harness_install_spec(GEMINI_FAMILY)
+    assert spec is not None
+    assert spec.binary == "agy"
+    assert spec.package is None
+    assert spec.install_hint is not None
+    assert "antigravity.google/cli/install.sh" in spec.install_hint
+    assert spec.status_args == ("models",)
+    assert spec.login_args is None
+    assert spec.logout_args is None
+    assert spec.login_status_key is None
+    assert spec.auth_hint is not None
+
+
+def test_harness_setup_hint_antigravity_surfaces_sign_in() -> None:
+    """A not-yet-signed-in agy can't be fixed by ``agy login`` (no such
+    command), so the launch hint names the installer AND the "run agy to sign
+    in" step — otherwise a user who already has agy installed gets a misleading
+    install-only hint.
+    """
+    hint = hi.harness_setup_hint("antigravity-native")
+    assert "antigravity.google/cli/install.sh" in hint
+    assert "agy" in hint
+    assert "sign" in hint.lower()
+
+
 def test_install_command_rejects_non_npm_harness() -> None:
-    """A non-npm harness (cursor) has no npm install command; asking for one is
+    """A non-npm harness has no npm install command; asking for one is
     a loud error so the caller shows its ``install_hint`` instead."""
     with pytest.raises(ValueError):
         hi.harness_install_command(hi.CURSOR_KEY)
+    with pytest.raises(ValueError):
+        hi.harness_install_command(hi.KIRO_KEY)
 
 
 def test_install_harness_cli_noop_for_non_npm(monkeypatch: pytest.MonkeyPatch) -> None:
-    """``install_harness_cli`` never shells npm for a non-npm CLI (cursor).
+    """``install_harness_cli`` never shells npm for a non-npm CLI.
 
     It returns ``False`` without spawning anything, so the menu falls back to
     the manual ``install_hint`` rather than running a bogus npm command.
@@ -70,6 +194,7 @@ def test_install_harness_cli_noop_for_non_npm(monkeypatch: pytest.MonkeyPatch) -
 
     monkeypatch.setattr(hi.subprocess, "run", _explode)
     assert hi.install_harness_cli(hi.CURSOR_KEY) is False
+    assert hi.install_harness_cli(hi.KIRO_KEY) is False
 
 
 def test_unknown_key_has_no_spec_and_is_not_installed() -> None:
@@ -85,6 +210,12 @@ def test_unknown_key_has_no_spec_and_is_not_installed() -> None:
         ("claude-native", "claude"),
         ("codex-native", "codex"),
         ("pi", "pi"),
+        # Native Cursor wraps the cursor-agent CLI (distinct from the SDK
+        # ``cursor`` harness, which needs no binary — see the test below).
+        ("cursor-native", "cursor-agent"),
+        ("native-cursor", "cursor-agent"),
+        ("kiro-native", "kiro-cli"),
+        ("native-kiro", "kiro-cli"),
     ],
 )
 def test_required_cli_for_cli_backed_harness(harness: str, binary: str) -> None:
@@ -97,6 +228,39 @@ def test_required_cli_for_cli_backed_harness(harness: str, binary: str) -> None:
     spec = hi.required_cli_for_harness(harness)
     assert spec is not None
     assert spec.binary == binary
+
+
+@pytest.mark.parametrize("harness", ["cursor-native", "native-cursor"])
+def test_setup_hint_for_native_cursor_points_at_vendor_installer(harness: str) -> None:
+    """Native Cursor's "not configured" hint names the curl installer + login,
+    never ``omnigent setup`` — which only configures the SDK ``cursor`` harness
+    (``cursor-sdk`` + ``CURSOR_API_KEY``) and never installs ``cursor-agent``.
+
+    A regression to the generic hint sends a native-Cursor user down a dead end
+    (the exact bug this fixes).
+    """
+    hint = hi.harness_setup_hint(harness)
+    assert "cursor-agent" in hint
+    assert "cursor.com/install" in hint
+    assert "cursor-agent login" in hint
+    assert "omnigent setup" not in hint
+
+
+@pytest.mark.parametrize("harness", ["kiro-native", "native-kiro"])
+def test_setup_hint_for_native_kiro_points_at_vendor_installer(harness: str) -> None:
+    """Native Kiro's missing-binary hint names Kiro's installer, not setup."""
+    hint = hi.harness_setup_hint(harness)
+    assert "kiro-cli" in hint
+    assert "cli.kiro.dev/install" in hint
+    assert "omnigent setup" not in hint
+
+
+@pytest.mark.parametrize("harness", ["claude-native", "codex", "pi", "claude-sdk", None])
+def test_setup_hint_defaults_to_omnigent_setup(harness: str | None) -> None:
+    """Harnesses whose CLI ``omnigent setup`` installs (npm CLIs) — and the
+    SDK / unknown / ``None`` cases — route to the ``omnigent setup`` hint."""
+    hint = hi.harness_setup_hint(harness)
+    assert "omnigent setup" in hint
 
 
 @pytest.mark.parametrize("harness", ["cursor", "claude-sdk", "openai-agents"])
@@ -158,16 +322,37 @@ def test_missing_harness_cli_none_for_sdk_harness(monkeypatch: pytest.MonkeyPatc
 
 
 def test_cli_installed_reflects_which(monkeypatch: pytest.MonkeyPatch) -> None:
-    """``harness_cli_installed`` is exactly ``shutil.which(binary) is not None``.
+    """``harness_cli_installed`` follows ``resolve_cli_binary``.
 
-    Present → True; absent → False — the signal the configure ✗ marker and the
-    run gating both read.
+    On ``PATH`` → True; unresolvable (the autouse fixture stubs the fallback
+    dirs empty) → False — the signal the configure ✗ marker and the run gating
+    both read.
     """
     monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
     assert hi.harness_cli_installed(ANTHROPIC_FAMILY) is True
 
     monkeypatch.setattr(hi.shutil, "which", lambda name: None)
     assert hi.harness_cli_installed(ANTHROPIC_FAMILY) is False
+
+
+def test_cli_installed_finds_binary_off_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A CLI in a global install dir but off ``PATH`` still reads installed.
+
+    This is the reported nvm case: the host daemon's frozen ``PATH`` omits the
+    bin dir, so bare ``shutil.which`` misses it, but ``resolve_cli_binary``'s
+    fallback ladder finds it on disk. Readiness must not report it missing.
+    """
+    fallback_dir = tmp_path / "bin"
+    fallback_dir.mkdir()
+    claude = fallback_dir / "claude"
+    claude.write_text("#!/bin/sh\n")
+    claude.chmod(0o755)
+    monkeypatch.setattr(hi.shutil, "which", lambda name: None)
+    monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: (fallback_dir,))
+    assert hi.harness_cli_installed(ANTHROPIC_FAMILY) is True
+    assert hi.missing_harness_cli("claude-native") is None
 
 
 def test_install_harness_cli_requires_npm(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -205,6 +390,65 @@ def test_install_harness_cli_runs_npm_then_rechecks(monkeypatch: pytest.MonkeyPa
 
     assert hi.install_harness_cli(OPENAI_FAMILY) is True
     assert calls == [["npm", "install", "-g", "@openai/codex"]]
+
+
+def test_install_harness_cli_runs_hermes_installer_then_rechecks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Hermes installer is interactive-menu actionable and PATH-verified."""
+    calls: list[list[str]] = []
+    state = {"installed": False}
+
+    def _which(name: str) -> str | None:
+        if name == "bash":
+            return "/bin/bash"
+        if name == "hermes" and state["installed"]:
+            return "/usr/local/bin/hermes"
+        return None
+
+    def _run(argv: list[str], *, check: bool = False, timeout: float | None = None):
+        calls.append(argv)
+        state["installed"] = True
+        return subprocess.CompletedProcess(args=argv, returncode=0)
+
+    monkeypatch.setattr(hi.shutil, "which", _which)
+    monkeypatch.setattr(hi.subprocess, "run", _run)
+
+    assert hi.install_harness_cli(hi.HERMES_KEY) is True
+    spec = hi.harness_install_spec(hi.HERMES_KEY)
+    assert spec is not None
+    assert spec.install_hint is not None
+    assert calls == [["bash", "-c", spec.install_hint]]
+
+
+def test_install_harness_cli_refreshes_user_local_bin(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A vendor install into ~/.local/bin is usable without restarting setup."""
+    user_bin = tmp_path / ".local" / "bin"
+    user_bin.mkdir(parents=True)
+    hermes = user_bin / "hermes"
+    hermes.write_text("#!/bin/sh\n")
+    hermes.chmod(0o755)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+
+    def _which(name: str) -> str | None:
+        if name == "bash":
+            return "/bin/bash"
+        if name == "hermes" and str(user_bin) in hi.os.environ["PATH"].split(hi.os.pathsep):
+            return str(hermes)
+        return None
+
+    monkeypatch.setattr(hi.shutil, "which", _which)
+    monkeypatch.setattr(
+        hi.subprocess,
+        "run",
+        lambda argv, *, check=False, timeout=None: subprocess.CompletedProcess(argv, 0),
+    )
+
+    assert hi.install_harness_cli(hi.HERMES_KEY) is True
+    assert hi.os.environ["PATH"].split(hi.os.pathsep)[0] == str(user_bin)
 
 
 def test_harness_login_skips_when_already_logged_in(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -494,6 +738,42 @@ def test_harness_cli_logged_in_uses_cursor_json_verdict(
 
     monkeypatch.setattr(hi.subprocess, "run", _run)
     assert hi.harness_cli_logged_in(hi.CURSOR_KEY) is expected
+
+
+@pytest.mark.parametrize(
+    "stdout,returncode,expected",
+    [
+        # ``agy models`` lists models (exit 0) only when signed in.
+        ("Gemini 3.5 Flash (Medium)\nGemini 3.1 Pro (High)\n", 0, True),
+        ("Error: Please sign in to view available models.", 1, False),
+        # Exit code is authoritative for agy (no ``login_status_key``): stdout
+        # that happens to be a JSON object with ``loggedIn`` must NOT override
+        # it, so an exit-0 run still reads as signed in.
+        ('{"loggedIn": false}', 0, True),
+        # Empty stdout (e.g. the list went to stderr) → exit code decides.
+        ("", 0, True),
+        ("", 1, False),
+    ],
+)
+def test_harness_cli_logged_in_agy_uses_exit_code(
+    monkeypatch: pytest.MonkeyPatch, stdout: str, returncode: int, expected: bool
+) -> None:
+    """Antigravity's ``agy models`` is non-JSON, so the exit code is the verdict.
+
+    ``agy`` has no ``login status`` subcommand; ``agy models`` exits 0 only when
+    signed in (else exits non-zero with "Please sign in"). A regression would
+    misread agy login state in the setup menu's ✓/✗ marker.
+    """
+    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    def _run(argv: list[str], **k: object):
+        assert argv == ["agy", "models"]  # the status subcommand
+        return subprocess.CompletedProcess(
+            args=argv, returncode=returncode, stdout=stdout, stderr=""
+        )
+
+    monkeypatch.setattr(hi.subprocess, "run", _run)
+    assert hi.harness_cli_logged_in(GEMINI_FAMILY) is expected
 
 
 def test_harness_cli_logged_in_false_when_binary_missing(monkeypatch: pytest.MonkeyPatch) -> None:

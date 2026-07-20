@@ -7,11 +7,10 @@ driving ``TerminalRegistry.launch`` → ``TerminalInstance.send`` / ``.read``
 directly: interactive state that survives across calls, cwd anchoring of
 the live shell, control-key delivery, and per-session isolation.
 
-The equivalent end-to-end coverage in ``tests/e2e/test_sys_terminal_e2e.py``
-is suppressed in ``tests/known_failures.yaml`` because it needs a live
-runner and a real LLM. These reach the same tmux behaviors with neither,
-so the capability keeps coverage in the ``tests/terminals`` CI shard
-(which installs tmux).
+End-to-end coverage of the same capability would need a live runner and a
+real LLM. These reach the same tmux behaviors with neither, so the
+capability keeps coverage in the ``tests/terminals`` CI shard (which
+installs tmux).
 
 Skipped when tmux is absent. ``send`` is asynchronous from the shell's
 view, so reads poll on a bounded budget rather than asserting a single

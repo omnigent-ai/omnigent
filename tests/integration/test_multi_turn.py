@@ -3,8 +3,7 @@
 The invariant: history established in earlier turns reaches the model
 on later dispatches. Each turn is a separate session dispatch through
 the harness subprocess, so this fails if the harness loses or fails to
-replay its transcript between turns. Runs with either a real LLM or
-the mock LLM server.
+replay its transcript between turns.
 """
 
 from __future__ import annotations

@@ -37,9 +37,10 @@ Env vars read at startup:
   the Claude CLI in. ``None`` falls back to the subprocess's
   inherited cwd.
 - ``HARNESS_CLAUDE_SDK_PERMISSION_MODE``: SDK permission mode
-  (``"bypassPermissions"``, ``"acceptEdits"``,
-  ``"plan"``, ``"default"``). Defaults to
-  ``"bypassPermissions"`` so the agent runs autonomously.
+  (``"auto"``, ``"bypassPermissions"``, ``"acceptEdits"``,
+  ``"plan"``, ``"dontAsk"``, ``"default"``). Defaults to
+  ``"auto"`` so the agent runs autonomously with background
+  safety checks.
 - ``HARNESS_CLAUDE_SDK_OS_ENV``: JSON-encoded :class:`OSEnvSpec`
   (from :func:`dataclasses.asdict`) controlling the SDK's
   native OS-tool exposure. When set, the inner executor builds
@@ -124,10 +125,10 @@ _ENV_GATEWAY_AUTH_REFRESH_INTERVAL_MS = "HARNESS_CLAUDE_SDK_GATEWAY_AUTH_REFRESH
 # auth being bypassed).
 _ENV_API_KEY_HELPER = "HARNESS_CLAUDE_SDK_API_KEY_HELPER"
 
-# Default permission mode for the Claude SDK. ``"bypassPermissions"``
-# matches the inner executor's own default and lets the agent run
-# autonomously without prompting per tool call.
-_DEFAULT_PERMISSION_MODE = "bypassPermissions"
+# Default permission mode for the Claude SDK. ``"auto"`` auto-approves
+# tool calls with background safety checks that verify actions align
+# with the request.
+_DEFAULT_PERMISSION_MODE = "auto"
 
 
 def _resolve_os_env() -> OSEnvSpec:
@@ -271,7 +272,15 @@ def _build_claude_sdk_executor() -> Executor:
     agent_name_raw = os.environ.get(_ENV_AGENT_NAME, "").strip()
     agent_name = agent_name_raw or None
     return ClaudeSDKExecutor(
-        cwd=os.environ.get(_ENV_CWD),
+        # Run the CLI in the session workspace: an explicit
+        # HARNESS_CLAUDE_SDK_CWD wins, else the runner's
+        # OMNIGENT_RUNNER_WORKSPACE (the folder the user launched in, and
+        # the same one the tmux terminal uses), else the process cwd.
+        # Without the workspace fallback the CLI ran out of the runner
+        # daemon's $HOME — disagreeing with the terminal and rooting the
+        # sandbox at the whole home dir. Mirrors goose / kimi / pi / qwen
+        # / hermes harness cwd resolution.
+        cwd=os.environ.get(_ENV_CWD) or os.environ.get("OMNIGENT_RUNNER_WORKSPACE") or None,
         os_env=_resolve_os_env(),
         model=os.environ.get(_ENV_MODEL),
         permission_mode=os.environ.get(_ENV_PERMISSION_MODE, _DEFAULT_PERMISSION_MODE),

@@ -674,6 +674,19 @@ class LLMConfig:  # type: ignore[explicit-any]  # extra: dict[str, Any] field (s
         ``request_timeout`` to distinguish from the task-level
         ``executor.timeout``.
     :param retry: Retry policy for transient LLM failures.
+    :param fallback_models: Ordered backup models tried, in order,
+        when a call to ``model`` fails. Same provider-prefixed
+        format as ``model``, e.g.
+        ``["databricks/claude-3-5-haiku", "databricks/gpt-4o-mini"]``.
+        Consumed today by the policy LLM client
+        (:class:`~omnigent.policies.types.PolicyLLMClient`): a call
+        advances to the next model on any failure and only surfaces
+        an error once every candidate is exhausted. Empty (the
+        default) preserves single-model behaviour. The resolved
+        ``connection`` (or ``profile``) is shared across the primary
+        and every fallback, so prefer same-provider fallbacks; a
+        fallback on a different provider only works when credentials
+        come from environment defaults (no ``connection``/``profile``).
     """
 
     model: str
@@ -690,6 +703,9 @@ class LLMConfig:  # type: ignore[explicit-any]  # extra: dict[str, Any] field (s
     profile: str | None = None
     request_timeout: int = 300
     retry: RetryPolicy = field(default_factory=RetryPolicy)
+    # Ordered backup models tried when a call to ``model`` fails.
+    # Empty preserves single-model behaviour.
+    fallback_models: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -762,9 +778,20 @@ class SandboxConfig:
 
     container_image: str | None = None
     docker_image: str | None = None
-    container_runtime: str = "docker"
+    container_runtime: Literal["docker", "podman"] = "docker"
+
+    _ALLOWED_RUNTIMES = frozenset({"docker", "podman"})
 
     def __post_init__(self) -> None:
+        if self.container_runtime not in self._ALLOWED_RUNTIMES:
+            raise ValueError(
+                f"container_runtime must be one of {sorted(self._ALLOWED_RUNTIMES)}, "
+                f"got {self.container_runtime!r}"
+            )
+        # Resolve the deprecated docker_image alias: if only
+        # docker_image was provided, promote it to container_image.
+        # Then sync docker_image to container_image so both fields
+        # always agree after construction.
         if self.container_image is None and self.docker_image is not None:
             self.container_image = self.docker_image
         self.docker_image = self.container_image
@@ -816,12 +843,18 @@ class SkillSpec:
         disk, e.g. ``Path("/agents/code-review")``. Used by
         ``read_skill_file`` to resolve resource paths. ``None``
         when the skill was created in-memory (e.g. tests).
+    :param user_invocable: Whether the skill may be invoked directly
+        by a user as a slash command. ``False`` for internal
+        orchestration skills (frontmatter ``user-invocable: false``);
+        such skills are excluded from the composer's ``/`` menu.
+        Defaults to ``True`` (absent frontmatter field = invocable).
     """
 
     name: str
     description: str
     content: str
     skill_dir: Path | None = None
+    user_invocable: bool = True
 
 
 @dataclass
@@ -908,6 +941,12 @@ class MCPServerConfig:
     command: str | None = None
     args: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict, repr=False)
+    # Optional per-server tool allow-list: only these tool names are exposed to
+    # the model; others are filtered at registration (server/mcp_pool.py,
+    # runner/mcp_manager.py). ``None`` exposes all. Applies to both transports
+    # and mirrors ``MCPTool.tools`` / the YAML ``tools:`` whitelist documented
+    # in docs/AGENT_YAML_SPEC.md.
+    tools: list[str] | None = None
     description: str | None = None
     # Per-tool timeout/retry overrides. None = inherit from
     # tools.timeout / tools.retry.
@@ -952,6 +991,28 @@ class ToolRuntime(str, Enum):
     SERVER = "server"
     CLIENT = "client"
     UC_FUNCTION = "uc_function"
+
+
+class SharePolicy(str, Enum):
+    """How much session-sharing authority ``sys_session_share`` grants.
+
+    Maps the top-level ``agent_session_sharing:`` YAML flag. The flag is
+    the *only* thing that enables the ``sys_session_share`` tool — it is
+    independent of ``spawn`` / ``tools.agents`` (which gate the
+    spawn-lifecycle tools). Sharing mutates access control, so it is
+    off by default and the public tier is a deliberate extra opt-in.
+
+    - :attr:`NONE`: sharing disabled — ``sys_session_share`` is not
+      registered at all (default).
+    - :attr:`NON_PUBLIC`: the agent may grant access to named users
+      (emails), but NOT to ``__public__`` — no anonymous-read exposure.
+    - :attr:`PUBLIC`: the agent may additionally grant ``__public__``
+      (anonymous read of the full transcript).
+    """
+
+    NONE = "none"
+    NON_PUBLIC = "non-public"
+    PUBLIC = "public"
 
 
 @dataclass
@@ -1186,21 +1247,14 @@ class LabelDef:
     :param initial: Seed value written at conversation start.
         ``None`` means the label is unset until a policy
         writes it for the first time, e.g. ``"0"``.
-    :param values: Ordered list of allowed values. Position
-        defines ranking when ``monotonic`` is set. ``None``
+    :param values: Ordered list of allowed values. ``None``
         means schemaless — writes are unconstrained, e.g.
         ``["0", "1"]`` or
         ``["public", "internal", "confidential"]``.
-    :param monotonic: Update constraint when ``values`` is
-        declared. ``"increasing"`` means new index must be
-        ``>=`` current; ``"decreasing"`` means ``<=``.
-        ``None`` means free transitions between declared
-        values.
     """
 
     initial: str | None = None
     values: list[str] | None = None
-    monotonic: Literal["increasing", "decreasing"] | None = None
 
 
 @dataclass(frozen=True)
@@ -1281,11 +1335,6 @@ class FunctionPolicySpec(PolicySpec):
 
     :param function: Where the callable lives + optional
         factory kwargs.
-    :param action: Allowed actions the callable may return.
-        Returns outside this list → fail-closed DENY (or
-        substituted ALLOW when the list contains no DENY, per
-        the classifier-only carve-out in §13). ``None`` means
-        accept any action.
     :param set_labels: Whitelist of label keys the callable
         may write. Keys outside dropped silently. ``None``
         means no writes declared (any key the callable emits
@@ -1301,7 +1350,6 @@ class FunctionPolicySpec(PolicySpec):
     """
 
     function: FunctionRef | None = None
-    action: list[PolicyAction] | None = None
     set_labels: list[str] | None = None
     config: dict[str, str] | None = None
 
@@ -1439,6 +1487,16 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
         ``sys_session_get_history`` / ``sys_session_get_info``)
         are always registered and are not affected by either
         opt-in.
+    :param agent_session_sharing: Authority for the agent to share the
+        session it is running in, via ``sys_session_share``. YAML key is
+        ``agent_session_sharing:`` (top-level, like ``spawn:``). This
+        flag is the SOLE enabler of that tool — it is independent of
+        ``spawn`` / ``tools.agents``, and has no bearing on sharing the
+        session through the server API or CLI. One of
+        :class:`SharePolicy`: ``none`` (default — tool not registered),
+        ``non-public`` (grant named users only), or ``public`` (also
+        allow ``__public__`` anonymous read). **Defaults to
+        ``SharePolicy.NONE``.**
     """
 
     spec_version: int
@@ -1484,3 +1542,4 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
     terminals: dict[str, TerminalEnvSpec] | None = None
     timers: bool = False
     spawn: bool = False
+    agent_session_sharing: SharePolicy = SharePolicy.NONE

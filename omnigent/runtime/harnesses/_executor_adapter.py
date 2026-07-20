@@ -36,7 +36,6 @@ import asyncio
 import contextlib
 import json
 import logging
-import os
 import secrets
 import uuid
 from collections import deque
@@ -45,7 +44,9 @@ from typing import Any
 
 from fastapi import Response
 
+from omnigent.errors import ElicitationDeclinedError
 from omnigent.inner.executor import (
+    CompactionComplete,
     Executor,
     ExecutorConfig,
     ExecutorError,
@@ -59,6 +60,7 @@ from omnigent.inner.executor import (
     TurnComplete,
 )
 from omnigent.inner.tracing import TracingContext, is_tracing_enabled
+from omnigent.policies.types import FAIL_CLOSED_PHASES
 from omnigent.runtime.harnesses._scaffold import HarnessApp, PolicyVerdictPayload, TurnContext
 from omnigent.runtime.tool_output import cap_tool_output
 from omnigent.server.schemas import (
@@ -106,34 +108,6 @@ _OBSERVED_TOOL_CALL_STATUS = "in_progress"
 #    ToolCallComplete — the dispatch's PATCH handler emits the
 #    paired output. Keeps the dedup story symmetric.
 _MCP_TOOL_NAME_PREFIX = "mcp__"
-
-
-def _finalize_trace_status(response_id: str) -> None:
-    """PATCH the trace status to OK on the MLflow server.
-
-    OTLP-ingested traces stay "In progress" because the server has
-    no signal that all spans have arrived. This call explicitly
-    marks the trace as complete after the OTel provider is flushed.
-    """
-    try:
-        from omnigent.runtime.telemetry import trace_id_from_response_id
-
-        trace_id = trace_id_from_response_id(response_id)
-        request_id = f"tr-{trace_id}"
-
-        tracking_uri = os.environ.get("MLFLOW_TRACKING_URI") or os.environ.get(
-            "OTEL_EXPORTER_OTLP_ENDPOINT", ""
-        )
-        if not tracking_uri:
-            return
-        import httpx
-
-        httpx.Client(timeout=5).patch(
-            f"{tracking_uri.rstrip('/')}/api/2.0/mlflow/traces/{request_id}",
-            json={"status": "OK"},
-        ).close()
-    except Exception:
-        _logger.debug("failed to finalize trace status", exc_info=True)
 
 
 def _strip_mcp_tool_prefix(name: str) -> str:
@@ -201,10 +175,15 @@ class ExecutorAdapter(HarnessApp):
         self,
         executor_factory: Callable[[], Executor],
         session_key: str | None = None,
+        harness_label: str = "Claude",
     ) -> None:
         super().__init__()
         self._executor_factory = executor_factory
         self._session_key = session_key or uuid.uuid4().hex
+        # Human-readable harness name used in elicitation card messages,
+        # e.g. "Claude" → "Claude wants to call **Bash**" or
+        # "Cursor" → "Cursor wants to use **Bash**".
+        self._harness_label = harness_label
         # Layer 1: lazily-constructed inner executor, reused
         # across turns for the conversation's lifetime.
         self._executor: Executor | None = None
@@ -247,6 +226,16 @@ class ExecutorAdapter(HarnessApp):
         # turn when tracing is enabled; reused across turns so the
         # span parent chain stays rooted on the session's executor.
         self._tracing_ctx: TracingContext | None = None
+        # Call ids actually round-tripped through :meth:`_stable_tool_executor`
+        # -> ``ctx.dispatch_tool`` this turn. ``dispatch_tool`` emits the paired
+        # function_call_output itself, so a ToolCallComplete carrying one of
+        # these ids must be SUPPRESSED in :meth:`_translate_event` to avoid a
+        # duplicate output card. Completions whose id is NOT here come from
+        # tools the inner SDK ran entirely internally (e.g. the antigravity
+        # executor, which has no ``_stable_tool_executor`` dispatch) — those are
+        # the ONLY output source and MUST be emitted. Reset per turn alongside
+        # ``_pending_mcp_call_ids``.
+        self._dispatched_call_ids: set[str] = set()
 
     async def run_turn(self, request: CreateResponseRequest, ctx: TurnContext) -> None:
         """
@@ -336,6 +325,7 @@ class ExecutorAdapter(HarnessApp):
         # previous turn. Clearing makes each turn's correlation
         # window self-contained.
         self._pending_mcp_call_ids.clear()
+        self._dispatched_call_ids.clear()
 
         # --- Tracing setup ------------------------------------------------
         # Create a TracingContext per turn when tracing is enabled.
@@ -343,8 +333,15 @@ class ExecutorAdapter(HarnessApp):
         # trace ID from the response_id so operators can look up
         # traces by response ID without a mapping table.
         tracing = is_tracing_enabled()
+        from omnigent.runtime.telemetry import current_session_id, session_scope
+
+        # Prefer the conversation id the request hook already bound
+        # (authoritative, from the /sessions/<conv>/events path); fall back to
+        # the adapter session key, which can be a random uuid for harnesses
+        # built without one.
+        turn_session_id = current_session_id() or self._session_key
         if tracing and self._tracing_ctx is None:
-            self._tracing_ctx = TracingContext()
+            self._tracing_ctx = TracingContext(session_id=turn_session_id)
         tctx = self._tracing_ctx if tracing else None
         agent_span = None
         # Active tool span for correlating ToolCallRequest → ToolCallComplete.
@@ -382,7 +379,11 @@ class ExecutorAdapter(HarnessApp):
                     trace_cm = trace_context_for_response(response_id=ctx.response_id)
                 except Exception:
                     _logger.debug("trace_context_for_response unavailable", exc_info=True)
-            with trace_cm:
+            # Bind the session for the whole turn so every span the harness
+            # creates (agent/LLM/tool, the native tmux inject, DB/httpx child
+            # spans) is tagged with session.id by the span processor — no
+            # per-harness code. (session_scope imported above with current_session_id.)
+            with session_scope(turn_session_id), trace_cm:
                 if tctx is not None:
                     agent_span = tctx.start_agent_span(
                         agent_name=request.model or "unknown",
@@ -402,7 +403,7 @@ class ExecutorAdapter(HarnessApp):
                             from omnigent.runtime.telemetry import record_cancellation
 
                             record_cancellation(agent_span)
-                            tctx.end_agent_span(agent_span, response=None, status="ERROR")
+                            tctx.end_agent_span(agent_span, response=None)
                             agent_span = None
                         await executor.interrupt_session(self._session_key)
                         return
@@ -419,7 +420,6 @@ class ExecutorAdapter(HarnessApp):
                                 tctx.end_tool_span(
                                     _active_tool_span,
                                     result=event.result,
-                                    status="ERROR" if event.error else "OK",
                                     error=event.error,
                                     duration_ms=event.duration_ms,
                                     parent_span=_active_tool_parent,
@@ -447,25 +447,44 @@ class ExecutorAdapter(HarnessApp):
                             from omnigent.runtime.telemetry import record_cancellation
 
                             record_cancellation(agent_span)
-                            tctx.end_agent_span(agent_span, response=None, status="ERROR")
+                            tctx.end_agent_span(agent_span, response=None)
                         return
                     if isinstance(event, ExecutorError):
                         if tctx is not None and agent_span is not None:
                             tctx.end_agent_span(
                                 agent_span,
                                 response=None,
-                                status="ERROR",
                                 error=event.message,
                             )
                             agent_span = None
                         raise RuntimeError(f"inner executor error: {event.message}")
+        except ElicitationDeclinedError:
+            # Fallback for executors that propagate the exception directly
+            # (non-SDK / non-spawned-task paths). SDK-based executors use
+            # ctx.cancelled.set() from _stable_elicitation_handler instead,
+            # because the SDK wraps its control-request callbacks in their
+            # own tasks and would swallow a raised exception before it
+            # reached this handler. Either way the turn ends as cancelled.
+            _logger.info(
+                "elicitation explicitly declined for response %s — aborting turn",
+                ctx.response_id,
+            )
+            if tctx is not None and agent_span is not None:
+                from omnigent.runtime.telemetry import record_cancellation
+
+                record_cancellation(agent_span)
+                tctx.end_agent_span(agent_span, response=None)
+            ctx.cancelled.set()
+            # Interrupt the inner executor session so the in-flight
+            # generation stops immediately, same as the normal
+            # cancellation path.
+            if self._executor is not None:
+                await self._executor.interrupt_session(self._session_key)
         except BaseException:
             # End agent span on unhandled exceptions so it's not
             # left open (which would leak on the OTel provider).
             if tctx is not None and agent_span is not None:
-                tctx.end_agent_span(
-                    agent_span, response=None, status="ERROR", error="unhandled exception"
-                )
+                tctx.end_agent_span(agent_span, response=None, error="unhandled exception")
                 agent_span = None
             raise
         finally:
@@ -492,7 +511,6 @@ class ExecutorAdapter(HarnessApp):
                         provider.force_flush(timeout_millis=5000)
                 except Exception:
                     pass
-                _finalize_trace_status(ctx.response_id)
             # Clear the per-turn pointers so a stray late callback
             # (e.g. one fired after the SDK's stream closed) sees
             # ``None`` and returns an explicit error rather than
@@ -663,12 +681,20 @@ class ExecutorAdapter(HarnessApp):
         correlated_call_id: str | None = None
         if self._pending_mcp_call_ids:
             correlated_call_id = self._pending_mcp_call_ids.popleft()
+        # Allocate the dispatch id here (rather than letting
+        # _bridge_one_dispatch default it) so we can record EXACTLY which id was
+        # round-tripped. _translate_event suppresses the inner
+        # ToolCallComplete for these ids — dispatch_tool already emits their
+        # function_call_output — while letting internally-run SDK tool
+        # completions (not in this set) through as the sole output source.
+        dispatch_call_id = correlated_call_id or f"call_{uuid.uuid4().hex[:12]}"
+        self._dispatched_call_ids.add(dispatch_call_id)
         return await _bridge_one_dispatch(
             ctx,
             agent,
             tool_name,
             args,
-            call_id=correlated_call_id,
+            call_id=dispatch_call_id,
         )
 
     async def _stable_elicitation_handler(
@@ -690,7 +716,7 @@ class ExecutorAdapter(HarnessApp):
         or before a turn starts), returns ``False`` to deny by default
         rather than granting unreviewed permission.
 
-        :param tool_name: Tool name Claude wants to call, e.g. ``"Bash"``.
+        :param tool_name: Tool name the agent wants to call, e.g. ``"Bash"``.
         :param tool_input: Arguments dict for the tool call,
             e.g. ``{"command": "ls -la"}``.
         :returns: ``True`` when the user approves the tool call;
@@ -719,16 +745,25 @@ class ExecutorAdapter(HarnessApp):
             preview = repr(tool_input)
         preview = preview[:300]
 
+        label = self._harness_label
+        policy_name = f"{label.lower()}_sdk_permission"
         params = ElicitationRequestParams(
             mode="form",
-            message=f"Claude wants to call **{tool_name}**",
+            message=f"{label} wants to use **{tool_name}**",
             requestedSchema=None,
             url=None,
             phase="tool_call",
-            policy_name="claude_sdk_permission",
+            policy_name=policy_name,
             content_preview=f"{tool_name}({preview})",
         )
         result = await ctx.elicit(elicitation_id, params)
+        if result.action == "decline":
+            # The SDK invokes this callback from a spawned control-request
+            # task whose try/except would swallow a raised exception before
+            # it could reach run_turn's except block. Signal the cancellation
+            # via ctx.cancelled instead — the run_turn event loop checks this
+            # flag between events and takes the existing interrupt path.
+            ctx.cancelled.set()
         return result.action == "accept"
 
     async def _stable_policy_evaluator(
@@ -757,12 +792,27 @@ class ExecutorAdapter(HarnessApp):
         """
         ctx = self._current_ctx
         if ctx is None:
+            # Orphaned callback after a turn-context desync (#1026). Blanket
+            # ALLOW here silently bypasses guardrails: for a PHASE_TOOL_CALL this
+            # adapter is the only enforcement point (the call is never re-checked
+            # server-side), so an unevaluable verdict must fail closed. Mirror
+            # the runner's phase-aware default in _evaluate_policy_via_omnigent —
+            # tool calls DENY; advisory LLM phases and the post-execution result
+            # phase ALLOW so a transient desync never needlessly wedges them.
+            fail_closed = phase in FAIL_CLOSED_PHASES
+            action = "POLICY_ACTION_DENY" if fail_closed else "POLICY_ACTION_ALLOW"
             _logger.warning(
                 "policy evaluator fired with no active turn context (phase=%s); "
-                "returning ALLOW by default",
+                "returning %s by default",
                 phase,
+                "DENY" if fail_closed else "ALLOW",
             )
-            return PolicyVerdictPayload(action="POLICY_ACTION_ALLOW")
+            return PolicyVerdictPayload(
+                action=action,
+                reason=(
+                    f"No active turn context; failing closed for {phase}." if fail_closed else None
+                ),
+            )
         evaluation_id = f"poleval_{secrets.token_hex(16)}"
         return await ctx.evaluate_policy(evaluation_id, phase, data)
 
@@ -885,22 +935,52 @@ class ExecutorAdapter(HarnessApp):
                 )
             )
         elif isinstance(event, ToolCallComplete):
-            # Paired function_call_output. The executor doesn't
-            # always echo the call_id back on ToolCallComplete;
-            # when it doesn't, consumers correlate by position
-            # (the most recent function_call without an output).
+            # Paired function_call_output. Downstream consumers (web
+            # blockStream, runner persistence) pair results to requests
+            # STRICTLY by call_id and discard empty ones — there is NO
+            # positional correlation, so a ToolCallComplete that reaches
+            # here without a real call_id orphans and leaves its request a
+            # perpetual in_progress card. Inner executors must stamp a real
+            # id (antigravity allocates one positionally for the SDK's
+            # id-less error hook); an id-less completion is DROPPED below
+            # (it cannot pair) rather than emitted as a ghost card.
             #
-            # Every tool routed through _stable_tool_executor →
+            # A tool routed through _stable_tool_executor →
             # ctx.dispatch_tool already has its function_call_output
             # emitted by dispatch_tool when the Future resolves.
             # Emitting a second one here would duplicate it on the
             # SSE stream and produce ghost "Waiting for output"
-            # cards in the Web UI. Suppress for all dispatched
-            # tools — the scaffold is the single source of output
-            # events for round-tripped calls.
-            if self._current_ctx is not None:
-                return
+            # cards in the Web UI. Suppress ONLY for those
+            # round-tripped call ids (tracked in
+            # ``_dispatched_call_ids``) — the scaffold is their single
+            # output source.
+            #
+            # Tools the inner SDK ran ENTIRELY INTERNALLY — the
+            # antigravity executor has no _stable_tool_executor
+            # dispatch at all, and its ToolCallComplete is bridged
+            # from the SDK's PostToolCall/OnToolError hooks — never go
+            # through dispatch_tool, so their completion here is the
+            # ONLY output event. Suppressing those (the prior
+            # ``_current_ctx is not None`` blanket rule) left every
+            # antigravity tool call rendering as perpetual in_progress
+            # with no paired function_call_output. Emit them.
             call_id = _call_id_from_metadata(getattr(event, "metadata", None)) or ""
+            # Suppress two cases — each would otherwise put a useless or duplicate
+            # function_call_output on the SSE stream:
+            #   1. a DISPATCHED id — _stable_tool_executor already emitted the
+            #      authoritative output via ctx.dispatch_tool (its single source);
+            #      a second one here duplicates it and ghosts a "Waiting for
+            #      output" card.
+            #   2. an EMPTY call_id — downstream consumers pair STRICTLY by call_id
+            #      and discard empty ones, so an id-less completion cannot pair; it
+            #      only renders a perpetual ghost card. This is a shared adapter
+            #      used by every adapter-backed harness, so an inner executor that
+            #      bridges an id-less ToolCallComplete mid-turn (the old blanket
+            #      ``_current_ctx is not None`` rule swallowed these) must not leak
+            #      an empty-id output. Internal-tool executors (antigravity) stamp a
+            #      real positional id, so their legitimate completions still emit.
+            if not call_id or call_id in self._dispatched_call_ids:
+                return
             item: dict[str, Any] = {
                 "id": f"fco_{uuid.uuid4().hex[:12]}",
                 "type": "function_call_output",
@@ -934,6 +1014,26 @@ class ExecutorAdapter(HarnessApp):
             # payload to populate TurnComplete.usage on the Omnigent side.
             if event.usage is not None:
                 ctx.provider_usage = event.usage
+        elif isinstance(event, CompactionComplete):
+            from omnigent.server.schemas import (
+                CompactionCompletedEvent,
+                CompactionInProgressEvent,
+            )
+
+            ctx.emit(
+                CompactionInProgressEvent(
+                    type="response.compaction.in_progress",
+                )
+            )
+            ctx.emit(
+                CompactionCompletedEvent(
+                    type="response.compaction.completed",
+                    total_tokens=event.token_count,
+                    summary=event.summary,
+                    summary_model=event.model,
+                    compacted_messages=event.compacted_messages,
+                )
+            )
         # ExecutorError handled by the caller (re-raises so the
         # scaffold can build a response.failed terminal event).
 

@@ -467,6 +467,30 @@ class SessionsChat:
         self._session = await self._namespace.get(self._session.id)
         return self._session
 
+    async def tree_busy(self, *, max_depth: int = 3) -> bool:
+        """Whether any sub-agent anywhere in this session's subtree is working.
+
+        Unlike :attr:`status` (per-session — it reads ``"idle"`` once this
+        session has delegated and returned to its own prompt, even while its
+        sub-agents run), this rolls up the whole sub-agent tree. A driver that
+        feeds the agent a simulated "your turn" whenever it yields can gate that
+        on real subtree activity:
+
+        .. code-block:: python
+
+            if not await chat.tree_busy():
+                await chat.send("your turn")  # only when nothing is still working
+
+        Point-in-time and recursive (capped at *max_depth*); delegates to
+        :meth:`SessionsNamespace.subtree_busy`, which applies the same canonical
+        "busy" definition as the CLI badge and the web ``SubagentsPanel``.
+
+        :param max_depth: Levels of the sub-agent tree to descend.
+        :returns: ``True`` while any descendant sub-agent is busy.
+        :raises OmnigentError: On non-2xx status.
+        """
+        return await self._namespace.subtree_busy(self._session.id, max_depth=max_depth)
+
     async def send(
         self,
         input: str | list[dict[str, Any]],
@@ -1065,6 +1089,66 @@ class SessionsChat:
         if stream:
             return self._stream_query(input, files=files)
         return await self._collect_query(input, files=files)
+
+    async def await_turn(self, *, timeout: float | None = 1200.0) -> QueryResult:
+        """
+        Collect the next auto-triggered turn without posting a message.
+
+        Used by headless runners to follow async orchestrator sessions
+        across multiple turns. Unlike :meth:`query`, no user message is
+        posted — this helper subscribes to the live stream and waits for
+        the server to start a new turn (e.g. an inbox auto-wake when a
+        sub-agent completes), then collects its text output.
+
+        A ``timeout`` guards against the race window where the turn
+        already completed before the subscription opened. If no terminal
+        event arrives within ``timeout`` seconds, the coroutine returns
+        an empty :class:`QueryResult` so the caller can refresh session
+        status and decide how to proceed.
+
+        :param timeout: Seconds to wait for the turn to complete. ``None``
+            waits indefinitely. Defaults to 1200 (20 minutes).
+        :returns: :class:`QueryResult` with the turn's text (may be empty
+            if the turn completed before we subscribed).
+        :raises OmnigentError: Propagated from :meth:`stream` if the
+            session does not exist.
+        """
+        text_parts: list[str] = []
+        produced: list[File] = []
+
+        async def _collect() -> None:
+            async for event in self.stream():
+                if isinstance(event, OutputTextDeltaEvent):
+                    if event.delta:
+                        text_parts.append(event.delta)
+                elif isinstance(event, OutputItemDoneEvent) and not text_parts:
+                    text_parts.extend(_assistant_text_from_output_item(event.item))
+                elif isinstance(event, OutputFileDoneEvent):
+                    produced.append(await self._fetch_file(event))
+                elif isinstance(event, CompletedEvent):
+                    if not text_parts:
+                        text_parts.extend(_assistant_text_from_response(event.response.output))
+                    break
+                elif isinstance(event, SessionStatusEvent) and event.status in (
+                    "waiting",
+                    "idle",
+                ):
+                    # Break on terminal status events so the async generator
+                    # closes cleanly (avoids "aclose(): already running" when
+                    # asyncio.timeout fires mid-stream).
+                    break
+                elif isinstance(event, _TURN_TERMINAL_EVENT_TYPES):
+                    break
+
+        try:
+            async with asyncio.timeout(timeout):
+                await _collect()
+        except asyncio.TimeoutError:
+            # Timeout is expected when the session completes before the deadline
+            # or the race window is missed; return whatever text was collected so
+            # far per the method contract (empty QueryResult is valid).
+            pass
+        return QueryResult(text="".join(text_parts), files=produced)
 
     async def _collect_query(
         self,

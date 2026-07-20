@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 import types
 from types import SimpleNamespace
@@ -68,6 +69,7 @@ def _install_fake_sdk(
         "custom_tools": [],
         "custom_tool_results": [],
         "launch_kwargs": [],
+        "launch_cwds": [],
         "sent": [],
         "closed": 0,
         "client_closed": 0,
@@ -126,6 +128,10 @@ def _install_fake_sdk(
         @classmethod
         async def launch_bridge(cls, **kwargs: Any) -> _FakeClient:
             state["launch_kwargs"].append(kwargs)
+            # Record the process cwd at spawn time: the real bridge subprocess
+            # inherits it (the SDK spawns without a cwd=), so the executor must
+            # have chdir'd to the workspace by now.
+            state["launch_cwds"].append(os.getcwd())
             return cls()
 
         # The real AsyncClient exposes ONLY aclose() (no close()); it owns the
@@ -157,9 +163,13 @@ def _install_fake_sdk(
             self.input_schema = input_schema
 
     class _FakeLocalAgentOptions:
-        def __init__(self, cwd: Any = None, custom_tools: Any = None, **_kw: Any) -> None:
+        def __init__(
+            self, cwd: Any = None, custom_tools: Any = None, auto_review: Any = None, **_kw: Any
+        ) -> None:
             self.cwd = cwd
             self.custom_tools = custom_tools
+            self.auto_review = auto_review
+            state.setdefault("local_options", []).append(self)
 
     class _FakeSendOptions:
         def __init__(self, on_delta: Any = None, **_kw: Any) -> None:
@@ -199,11 +209,12 @@ def _tool(
 # ---------------------------------------------------------------------------
 
 
-def test_resolve_model_drops_databricks_and_defaults_to_auto() -> None:
+def test_resolve_model_drops_databricks_and_defaults_to_auto_smart() -> None:
     assert _resolve_model("gpt-5") == "gpt-5"
-    assert _resolve_model("databricks-claude-sonnet-4-6") == "auto"
-    assert _resolve_model("databricks/kimi") == "auto"
-    assert _resolve_model(None) == "auto"
+    assert _resolve_model("databricks-claude-sonnet-4-6") == "auto-smart"
+    assert _resolve_model("databricks/kimi") == "auto-smart"
+    assert _resolve_model(None) == "auto-smart"
+    assert _resolve_model("auto") == "auto-smart"
 
 
 def test_resolve_model_warns_when_dropping_a_pinned_model(
@@ -214,7 +225,7 @@ def test_resolve_model_warns_when_dropping_a_pinned_model(
     import logging
 
     with caplog.at_level(logging.WARNING, logger="omnigent.inner.cursor_executor"):
-        assert _resolve_model("databricks-claude-opus-4-8") == "auto"
+        assert _resolve_model("databricks-claude-opus-4-8") == "auto-smart"
     assert any(
         r.levelno == logging.WARNING and "not a Cursor model" in r.getMessage()
         for r in caplog.records
@@ -222,7 +233,7 @@ def test_resolve_model_warns_when_dropping_a_pinned_model(
     # No warning when there was no explicit model to honor.
     caplog.clear()
     with caplog.at_level(logging.WARNING, logger="omnigent.inner.cursor_executor"):
-        assert _resolve_model(None) == "auto"
+        assert _resolve_model(None) == "auto-smart"
     assert not caplog.records
 
 
@@ -473,14 +484,14 @@ async def test_session_restart_on_system_prompt_change(monkeypatch: pytest.Monke
     assert state["closed"] >= 1
 
 
-async def test_databricks_model_resolved_to_auto(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_databricks_model_resolved_to_auto_smart(monkeypatch: pytest.MonkeyPatch) -> None:
     state = _install_fake_sdk(monkeypatch, [{"messages": [_assistant("ok")], "result": "ok"}])
     executor = CursorExecutor(model="databricks-claude-sonnet-4-6", api_key="crsr_x")
     try:
         _ = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
     finally:
         await executor.close()
-    assert state["create_models"] == ["auto"]
+    assert state["create_models"] == ["auto-smart"]
 
 
 async def test_api_key_threaded_to_create(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1003,6 +1014,50 @@ def test_normalize_cursor_usage_includes_cache_fields() -> None:
     result = _normalize_cursor_usage(raw, "auto")
     assert result["cache_read_input_tokens"] == 300
     assert result["cache_creation_input_tokens"] == 50
+    # cursor's inputTokens (500) is inclusive of cache read (300) + write (50);
+    # input_tokens must be the non-cached remainder (150) so compute_llm_cost,
+    # which prices the cache buckets additively, does not double-bill them.
+    assert result["input_tokens"] == 150
+
+
+def test_normalize_cursor_usage_subtracts_cache_to_avoid_double_billing() -> None:
+    """``input_tokens`` excludes cached tokens so cache reads/writes aren't billed twice.
+
+    cursor reports ``inputTokens`` inclusive of cache read + write, but
+    ``compute_llm_cost`` requires ``input_tokens`` to be the non-cached portion
+    and prices ``cache_read_input_tokens`` / ``cache_creation_input_tokens``
+    additively. Passing the full inclusive count while also reporting the cache
+    buckets bills the cached tokens twice.
+
+    Regression guard: pre-fix ``input_tokens`` was the full 1000 here.
+    """
+    raw = {
+        "inputTokens": 1000,
+        "outputTokens": 200,
+        "totalTokens": 1200,
+        "cacheReadTokens": 700,
+        "cacheWriteTokens": 50,
+    }
+    result = _normalize_cursor_usage(raw, "auto")
+    # 1000 inclusive - 700 read - 50 write = 250 non-cached input.
+    assert result["input_tokens"] == 250, (
+        f"input_tokens {result['input_tokens']} != 250 — the cache read/write must be "
+        "subtracted from cursor's inclusive inputTokens so compute_llm_cost does not "
+        "double-bill them against the additive cache buckets."
+    )
+    assert result["cache_read_input_tokens"] == 700
+    assert result["cache_creation_input_tokens"] == 50
+    # total_tokens keeps the reported inclusive total; input + read + write
+    # reconstructs it against output, proving cached tokens are counted once.
+    assert result["input_tokens"] + 700 + 50 == 1000
+
+
+def test_normalize_cursor_usage_clamps_when_cache_exceeds_input() -> None:
+    """Malformed cache > input clamps ``input_tokens`` to 0, not negative."""
+    raw = {"inputTokens": 100, "outputTokens": 20, "cacheReadTokens": 999}
+    result = _normalize_cursor_usage(raw, "auto")
+    assert result["input_tokens"] == 0
+    assert result["cache_read_input_tokens"] == 999
 
 
 async def test_run_turn_captures_usage_from_turn_ended_update(
@@ -1042,11 +1097,11 @@ async def test_run_turn_captures_usage_from_turn_ended_update(
     assert usage["input_tokens"] == 1000
     assert usage["output_tokens"] == 200
     assert usage["total_tokens"] == 1200
-    assert usage["model"] == "auto"
+    assert usage["model"] == "auto-smart"
 
     # _notify_usage_from_dict was called with the same data.
     assert len(notified) == 1
-    assert notified[0]["model"] == "auto"
+    assert notified[0]["model"] == "auto-smart"
     assert notified[0]["usage"] == usage
 
 
@@ -1177,8 +1232,8 @@ async def test_run_turn_native_tool_denied_by_policy(monkeypatch: pytest.MonkeyP
     # Then an ExecutorError with the denial reason.
     errors = [e for e in events if isinstance(e, ExecutorError)]
     assert len(errors) == 1
-    assert "denied by policy" in errors[0].message
     assert "bash" in errors[0].message
+    assert "denied" in errors[0].message
 
     # ToolCallRequest appears before ExecutorError, and nothing follows the error.
     req_idx = next(i for i, e in enumerate(events) if isinstance(e, ToolCallRequest))
@@ -1281,37 +1336,37 @@ def _policy_ask(ask_phase: str) -> Any:
     return evaluator
 
 
-async def test_run_turn_native_tool_ask_no_handler_fails_closed(
+async def test_run_turn_native_tool_no_handler_and_no_deny_allows(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """ASK with no elicitation handler is fail-closed to DENY."""
+    """No elicitation handler and no DENY policy → native tool is allowed (pass-through)."""
     script = {
         "messages": [
             _assistant("Let me check."),
             _tool("bash", "t1", "running", args={"cmd": "ls"}),
+            _tool("bash", "t1", "completed", result="file.txt"),
+            _assistant("Done."),
         ],
         "status": "finished",
-        "result": "",
+        "result": "Done.",
     }
     _install_fake_sdk(monkeypatch, [script])
     executor = CursorExecutor(api_key="crsr_x")
     executor._policy_evaluator = _policy_ask("PHASE_TOOL_CALL")
-    # No _elicitation_handler set → fail closed.
+    # No _elicitation_handler → falls through to allow.
     try:
         events = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
     finally:
         await executor.close()
 
-    errors = [e for e in events if isinstance(e, ExecutorError)]
-    assert len(errors) == 1
-    assert "auto-denied" in errors[0].message
-    assert not any(isinstance(e, TurnComplete) for e in events)
+    assert any(isinstance(e, TurnComplete) for e in events)
+    assert not any(isinstance(e, ExecutorError) for e in events)
 
 
-async def test_run_turn_native_tool_ask_user_approves(
+async def test_run_turn_native_tool_handler_approves(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """ASK with elicitation handler that approves → turn continues."""
+    """Elicitation handler (no policy evaluator) approves → turn continues."""
     script = {
         "messages": [
             _assistant("Running."),
@@ -1323,7 +1378,110 @@ async def test_run_turn_native_tool_ask_user_approves(
         "result": "Done.",
     }
     _install_fake_sdk(monkeypatch, [script])
+    # Interactive mode keeps per-tool elicitation; auto (default) would skip it.
+    executor = CursorExecutor(api_key="crsr_x", permission_mode="default")
+    # No policy evaluator — handler alone is sufficient to show the card.
+
+    async def _approve(_name: str, _args: dict[str, Any]) -> bool:
+        return True
+
+    executor._elicitation_handler = _approve
+    try:
+        events = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
+    finally:
+        await executor.close()
+
+    assert any(isinstance(e, TurnComplete) for e in events)
+    assert not any(isinstance(e, ExecutorError) for e in events)
+
+
+async def test_run_turn_native_tool_handler_denies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Elicitation handler (no policy evaluator) denies → turn aborted."""
+    script = {
+        "messages": [
+            _assistant("Running."),
+            _tool("bash", "t1", "running", args={"cmd": "rm -rf /"}),
+        ],
+        "status": "finished",
+        "result": "",
+    }
+    _install_fake_sdk(monkeypatch, [script])
+    executor = CursorExecutor(api_key="crsr_x", permission_mode="default")
+
+    async def _deny(_name: str, _args: dict[str, Any]) -> bool:
+        return False
+
+    executor._elicitation_handler = _deny
+    try:
+        events = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
+    finally:
+        await executor.close()
+
+    errors = [e for e in events if isinstance(e, ExecutorError)]
+    assert len(errors) == 1
+    assert "elicitation" in errors[0].message
+    assert not any(isinstance(e, TurnComplete) for e in events)
+
+
+async def test_run_turn_native_tool_policy_deny_skips_handler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Policy DENY blocks immediately without calling the elicitation handler."""
+    script = {
+        "messages": [
+            _assistant("Running."),
+            _tool("bash", "t1", "running", args={"cmd": "rm -rf /"}),
+        ],
+        "status": "finished",
+        "result": "",
+    }
+    _install_fake_sdk(monkeypatch, [script])
     executor = CursorExecutor(api_key="crsr_x")
+
+    async def _deny_policy(phase: str, _data: dict[str, Any]) -> Any:
+        # Only deny TOOL_CALL; allow LLM phases so the turn reaches the tool.
+        action = "POLICY_ACTION_DENY" if phase == "PHASE_TOOL_CALL" else "POLICY_ACTION_ALLOW"
+        return SimpleNamespace(action=action, reason="admin blocked")
+
+    handler_called = False
+
+    async def _approve(_name: str, _args: dict[str, Any]) -> bool:
+        nonlocal handler_called
+        handler_called = True
+        return True
+
+    executor._policy_evaluator = _deny_policy
+    executor._elicitation_handler = _approve
+    try:
+        events = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
+    finally:
+        await executor.close()
+
+    errors = [e for e in events if isinstance(e, ExecutorError)]
+    assert len(errors) == 1
+    assert "admin blocked" in errors[0].message
+    assert not handler_called, "handler must not be called when policy hard-denies"
+    assert not any(isinstance(e, TurnComplete) for e in events)
+
+
+async def test_run_turn_native_tool_ask_user_approves(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Policy ASK + elicitation handler that approves → turn continues."""
+    script = {
+        "messages": [
+            _assistant("Running."),
+            _tool("bash", "t1", "running", args={"cmd": "ls"}),
+            _tool("bash", "t1", "completed", result="file.txt"),
+            _assistant("Done."),
+        ],
+        "status": "finished",
+        "result": "Done.",
+    }
+    _install_fake_sdk(monkeypatch, [script])
+    executor = CursorExecutor(api_key="crsr_x", permission_mode="default")
     executor._policy_evaluator = _policy_ask("PHASE_TOOL_CALL")
 
     async def _approve(_name: str, _args: dict[str, Any]) -> bool:
@@ -1342,7 +1500,7 @@ async def test_run_turn_native_tool_ask_user_approves(
 async def test_run_turn_native_tool_ask_user_denies(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """ASK with elicitation handler that denies → turn aborted."""
+    """Policy ASK + elicitation handler that denies → turn aborted."""
     script = {
         "messages": [
             _assistant("Running."),
@@ -1352,7 +1510,7 @@ async def test_run_turn_native_tool_ask_user_denies(
         "result": "",
     }
     _install_fake_sdk(monkeypatch, [script])
-    executor = CursorExecutor(api_key="crsr_x")
+    executor = CursorExecutor(api_key="crsr_x", permission_mode="default")
     executor._policy_evaluator = _policy_ask("PHASE_TOOL_CALL")
 
     async def _deny(_name: str, _args: dict[str, Any]) -> bool:
@@ -1369,6 +1527,40 @@ async def test_run_turn_native_tool_ask_user_denies(
     assert not any(isinstance(e, TurnComplete) for e in events)
 
 
+async def test_run_turn_native_tool_auto_mode_skips_elicitation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Default ``permission_mode=auto`` skips the web-UI approval card."""
+    script = {
+        "messages": [
+            _assistant("Running."),
+            _tool("bash", "t1", "running", args={"cmd": "ls"}),
+            _tool("bash", "t1", "completed", result="file.txt"),
+            _assistant("Done."),
+        ],
+        "status": "finished",
+        "result": "Done.",
+    }
+    _install_fake_sdk(monkeypatch, [script])
+    executor = CursorExecutor(api_key="crsr_x")  # default permission_mode=auto
+    handler_called = False
+
+    async def _deny(_name: str, _args: dict[str, Any]) -> bool:
+        nonlocal handler_called
+        handler_called = True
+        return False
+
+    executor._elicitation_handler = _deny
+    try:
+        events = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
+    finally:
+        await executor.close()
+
+    assert not handler_called
+    assert any(isinstance(e, TurnComplete) for e in events)
+    assert not any(isinstance(e, ExecutorError) for e in events)
+
+
 # ---------------------------------------------------------------------------
 # preToolUse hook: .cursor/hooks.json writing and cleanup
 # ---------------------------------------------------------------------------
@@ -1380,12 +1572,13 @@ async def test_ensure_session_writes_hooks_json(
 ) -> None:
     """After _ensure_session, .cursor/hooks.json exists in the workspace with the
     correct preToolUse config pointing at the hook script."""
-    _install_fake_sdk(monkeypatch, [{"messages": [_assistant("ok")], "result": "ok"}])
+    sdk_state = _install_fake_sdk(monkeypatch, [{"messages": [_assistant("ok")], "result": "ok"}])
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:6767")
     monkeypatch.setattr("sys.argv", ["runner", "--conversation-id", "conv_test123"])
     cwd = str(tmp_path)
     executor = CursorExecutor(api_key="crsr_x", cwd=cwd)
-    _ = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
+    events = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
+    assert events  # ensure _ensure_session ran
 
     # Assert BEFORE close (close cleans up the file).
     hooks_file = tmp_path / ".cursor" / "hooks.json"
@@ -1395,7 +1588,7 @@ async def test_ensure_session_writes_hooks_json(
     assert "preToolUse" in config["hooks"]
     hooks = config["hooks"]["preToolUse"]
     assert len(hooks) == 1
-    assert hooks[0]["timeout"] == 30
+    assert hooks[0]["timeout"] == 86400
     cmd = hooks[0]["command"]
     # The command points to the wrapper shell script, not the Python hook directly.
     assert "omnigent-hook.sh" in cmd
@@ -1404,14 +1597,60 @@ async def test_ensure_session_writes_hooks_json(
     wrapper = tmp_path / ".cursor" / "omnigent-hook.sh"
     assert wrapper.exists()
     wrapper_text = wrapper.read_text()
-    assert "_OMNIGENT_SERVER_URL='http://127.0.0.1:6767'" in wrapper_text
-    assert "_OMNIGENT_SESSION_ID='conv_test123'" in wrapper_text
+    # Values are shlex-quoted (shell-safe URLs/ids need no quotes).
+    assert "_OMNIGENT_SERVER_URL=http://127.0.0.1:6767" in wrapper_text
+    assert "_OMNIGENT_SESSION_ID=conv_test123" in wrapper_text
     assert "cursor_policy_hook.py" in wrapper_text
+    # The wrapper bakes a one-shot auth + workspace-routing header...
+    assert "_OMNIGENT_AUTH_HEADERS=" in wrapper_text
+    # ...so it must be owner-only (the baked token is never world-readable).
+    assert wrapper.stat().st_mode & 0o777 == 0o700
+
+    # auto_review=True must be passed so cursor's own TUI approval prompts
+    # are bypassed in favour of the executor's native elicitation card.
+    local_opts = sdk_state.get("local_options", [])
+    assert local_opts, "LocalAgentOptions was never constructed"
+    assert local_opts[0].auto_review is True
 
     await executor.close()
     # Both files are cleaned up on close.
     assert not hooks_file.exists()
     assert not wrapper.exists()
+
+
+async def test_bridge_spawns_in_workspace_cwd(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    """The bridge is launched with the process cwd set to the workspace.
+
+    cursor-sdk spawns the bridge subprocess without a ``cwd=``, so it -- and the
+    shell tools Cursor runs in it -- inherit the launching process's directory.
+    The executor must chdir to the declared workspace across the spawn (so
+    commands run in the workspace, not wherever the runner daemon lives) and
+    restore the previous cwd afterwards.
+    """
+    sdk_state = _install_fake_sdk(monkeypatch, [{"messages": [_assistant("ok")], "result": "ok"}])
+    # Workspace differs from the process cwd at launch time.
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    daemon_cwd = tmp_path / "daemon-cwd"
+    daemon_cwd.mkdir()
+    monkeypatch.chdir(daemon_cwd)
+    original_cwd = os.getcwd()
+
+    executor = CursorExecutor(api_key="crsr_x", cwd=str(workspace))
+    try:
+        events = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
+        assert events  # _ensure_session ran
+    finally:
+        await executor.close()
+
+    # The bridge saw the workspace (not the daemon cwd) as its directory...
+    assert len(sdk_state["launch_cwds"]) == 1
+    assert os.path.realpath(sdk_state["launch_cwds"][0]) == os.path.realpath(str(workspace))
+    # ...and the process cwd was restored afterwards.
+    assert os.getcwd() == original_cwd
 
 
 async def test_hooks_json_not_written_without_server_url(
@@ -1462,6 +1701,16 @@ async def test_hooks_json_cleaned_up_on_close(
 # ---------------------------------------------------------------------------
 
 
+def _fake_evaluate_response(result_action: str, reason: str = "") -> Any:
+    """Build a fake (response, error) tuple for post_evaluate_with_retry mocks."""
+    payload = {"result": result_action}
+    if reason:
+        payload["reason"] = reason
+    resp = SimpleNamespace()
+    resp.json = lambda: payload
+    return resp, None
+
+
 def test_cursor_policy_hook_allow(monkeypatch: pytest.MonkeyPatch) -> None:
     """Hook script returns allow when the server responds with ALLOW."""
     import io
@@ -1471,20 +1720,17 @@ def test_cursor_policy_hook_allow(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("_OMNIGENT_SESSION_ID", "conv_test")
 
     stdin_data = json.dumps({"tool_name": "Bash", "tool_input": {"command": "ls"}})
-    server_response = json.dumps({"result": "POLICY_ACTION_ALLOW", "reason": ""}).encode()
 
     from omnigent.inner import cursor_policy_hook
-
-    fake_resp = io.BytesIO(server_response)
-    fake_resp.read = fake_resp.read  # type: ignore[assignment]
-    fake_resp.__enter__ = lambda s: s  # type: ignore[attr-defined]
-    fake_resp.__exit__ = lambda s, *a: None  # type: ignore[attr-defined]
 
     stdout = io.StringIO()
     with (
         patch.object(sys, "stdin", io.StringIO(stdin_data)),
         patch.object(sys, "stdout", stdout),
-        patch("urllib.request.urlopen", return_value=fake_resp),
+        patch(
+            "omnigent.native_policy_hook.post_evaluate_with_retry",
+            return_value=_fake_evaluate_response("POLICY_ACTION_ALLOW"),
+        ),
     ):
         cursor_policy_hook.main()
 
@@ -1501,21 +1747,17 @@ def test_cursor_policy_hook_deny(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("_OMNIGENT_SESSION_ID", "conv_test")
 
     stdin_data = json.dumps({"tool_name": "Bash", "tool_input": {"command": "rm -rf /"}})
-    server_response = json.dumps(
-        {"result": "POLICY_ACTION_DENY", "reason": "dangerous command"}
-    ).encode()
 
     from omnigent.inner import cursor_policy_hook
-
-    fake_resp = io.BytesIO(server_response)
-    fake_resp.__enter__ = lambda s: s  # type: ignore[attr-defined]
-    fake_resp.__exit__ = lambda s, *a: None  # type: ignore[attr-defined]
 
     stdout = io.StringIO()
     with (
         patch.object(sys, "stdin", io.StringIO(stdin_data)),
         patch.object(sys, "stdout", stdout),
-        patch("urllib.request.urlopen", return_value=fake_resp),
+        patch(
+            "omnigent.native_policy_hook.post_evaluate_with_retry",
+            return_value=_fake_evaluate_response("POLICY_ACTION_DENY", "dangerous command"),
+        ),
     ):
         cursor_policy_hook.main()
 
@@ -1525,8 +1767,8 @@ def test_cursor_policy_hook_deny(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "Bash" in result["agent_message"]
 
 
-def test_cursor_policy_hook_network_error_fails_open(monkeypatch: pytest.MonkeyPatch) -> None:
-    """On network error, the hook script fails open (allows)."""
+def test_cursor_policy_hook_network_error_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """None from post_evaluate_with_retry (network error) fails closed with deny."""
     import io
     from unittest.mock import patch
 
@@ -1541,12 +1783,52 @@ def test_cursor_policy_hook_network_error_fails_open(monkeypatch: pytest.MonkeyP
     with (
         patch.object(sys, "stdin", io.StringIO(stdin_data)),
         patch.object(sys, "stdout", stdout),
-        patch("urllib.request.urlopen", side_effect=OSError("connection refused")),
+        patch(
+            "omnigent.native_policy_hook.post_evaluate_with_retry",
+            return_value=(None, "connection error: simulated"),
+        ),
     ):
         cursor_policy_hook.main()
 
     result = json.loads(stdout.getvalue())
-    assert result["permission"] == "allow"
+    assert result["permission"] == "deny"
+    assert "unavailable" in result["agent_message"]
+    assert "connection error: simulated" in result["agent_message"]
+
+
+def test_cursor_policy_hook_malformed_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A policy response whose body isn't valid JSON fails closed with deny."""
+    import io
+    from unittest.mock import patch
+
+    monkeypatch.setenv("_OMNIGENT_SERVER_URL", "http://localhost:6767")
+    monkeypatch.setenv("_OMNIGENT_SESSION_ID", "conv_test")
+
+    stdin_data = json.dumps({"tool_name": "Bash", "tool_input": {"command": "ls"}})
+
+    from omnigent.inner import cursor_policy_hook
+
+    def _raise() -> dict[str, object]:
+        raise ValueError("not json")
+
+    resp = SimpleNamespace()
+    resp.json = _raise
+
+    stdout = io.StringIO()
+    with (
+        patch.object(sys, "stdin", io.StringIO(stdin_data)),
+        patch.object(sys, "stdout", stdout),
+        patch(
+            "omnigent.native_policy_hook.post_evaluate_with_retry",
+            return_value=(resp, None),
+        ),
+    ):
+        cursor_policy_hook.main()
+
+    result = json.loads(stdout.getvalue())
+    assert result["permission"] == "deny"
+    assert "malformed" in result["agent_message"]
+    assert "Bash" in result["agent_message"]
 
 
 def test_cursor_policy_hook_no_env_fails_open(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1571,7 +1853,7 @@ def test_cursor_policy_hook_no_env_fails_open(monkeypatch: pytest.MonkeyPatch) -
 
 
 def test_cursor_policy_hook_ask_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
-    """ASK verdict (unresolved approval) fails closed with deny."""
+    """ASK verdict (server couldn't resolve via the gate) fails closed with deny."""
     import io
     from unittest.mock import patch
 
@@ -1579,24 +1861,47 @@ def test_cursor_policy_hook_ask_fails_closed(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setenv("_OMNIGENT_SESSION_ID", "conv_test")
 
     stdin_data = json.dumps({"tool_name": "Write", "tool_input": {}})
-    server_response = json.dumps(
-        {"result": "POLICY_ACTION_ASK", "reason": "needs approval"}
-    ).encode()
 
     from omnigent.inner import cursor_policy_hook
-
-    fake_resp = io.BytesIO(server_response)
-    fake_resp.__enter__ = lambda s: s  # type: ignore[attr-defined]
-    fake_resp.__exit__ = lambda s, *a: None  # type: ignore[attr-defined]
 
     stdout = io.StringIO()
     with (
         patch.object(sys, "stdin", io.StringIO(stdin_data)),
         patch.object(sys, "stdout", stdout),
-        patch("urllib.request.urlopen", return_value=fake_resp),
+        patch(
+            "omnigent.native_policy_hook.post_evaluate_with_retry",
+            return_value=_fake_evaluate_response("POLICY_ACTION_ASK", "needs approval"),
+        ),
     ):
         cursor_policy_hook.main()
 
     result = json.loads(stdout.getvalue())
     assert result["permission"] == "deny"
     assert "requires approval" in result["agent_message"]
+
+
+def test_cursor_policy_hook_uses_long_read_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """post_evaluate_with_retry is called with 86400s read_timeout to stay alive for approval."""
+    import io
+    from unittest.mock import MagicMock, patch
+
+    monkeypatch.setenv("_OMNIGENT_SERVER_URL", "http://localhost:6767")
+    monkeypatch.setenv("_OMNIGENT_SESSION_ID", "conv_test")
+
+    stdin_data = json.dumps({"tool_name": "Bash", "tool_input": {}})
+
+    from omnigent.inner import cursor_policy_hook
+
+    mock_fn = MagicMock(return_value=_fake_evaluate_response("POLICY_ACTION_ALLOW"))
+    stdout = io.StringIO()
+    with (
+        patch.object(sys, "stdin", io.StringIO(stdin_data)),
+        patch.object(sys, "stdout", stdout),
+        patch("omnigent.native_policy_hook.post_evaluate_with_retry", mock_fn),
+    ):
+        cursor_policy_hook.main()
+
+    mock_fn.assert_called_once()
+    _call_kwargs = mock_fn.call_args
+    read_timeout = _call_kwargs.kwargs.get("read_timeout") or _call_kwargs.args[3]
+    assert read_timeout == 86400.0

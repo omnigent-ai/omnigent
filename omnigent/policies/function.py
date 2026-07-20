@@ -120,8 +120,7 @@ class FunctionPolicy(Policy):
         Build an event dict and invoke the underlying callable.
 
         The engine is responsible for selector + condition
-        gating + action whitelist validation +
-        set_labels filtering; this method only:
+        gating + set_labels filtering; this method only:
 
         1. Builds the ``event`` dict from the
            :class:`EvaluationContext`.
@@ -131,8 +130,7 @@ class FunctionPolicy(Policy):
         4. Coerces the ``{"result": ..., "data": ...}``
            return into a :class:`PolicyResult`.
         5. Lets any exception bubble up — the engine wraps it
-           in fail-closed DENY (or substituted ALLOW under the
-           classifier-only carve-out).
+           in a fail-closed DENY.
 
         :param ctx: Current evaluation context.
         :param context: Read-only engine context bundle
@@ -158,7 +156,7 @@ class FunctionPolicy(Policy):
         would accumulate forever and a "15 calls per turn"
         limit would silently degrade to "15 calls per session"
         under Omnigent mode — see
-        :meth:`omnigent.inner.policies.FunctionPolicy.reset_turn`
+        :meth:`omnigent.runtime.policies.engine.PolicyEngine.reset_turn`
         for the native equivalent we mirror.
 
         Stateless callables (no ``reset_turn`` attribute) are a
@@ -238,6 +236,10 @@ def _build_event(ctx: EvaluationContext) -> dict[str, Any]:
             "harness": ctx.harness,
             # Conversation labels (engine hot cache), empty when unpopulated.
             "labels": dict(ctx.labels) if ctx.labels is not None else {},
+            # Subtree-scoped cumulative cost (this conversation + its
+            # descendants only), injected by the engine only when a
+            # subagent_cost_budget policy is present; empty dict otherwise.
+            "subtree_usage": dict(ctx.subtree_usage) if ctx.subtree_usage else {},
         },
         # Mutable per-conversation state readable by the callable.
         # Empty dict when no policy has written state yet; the engine

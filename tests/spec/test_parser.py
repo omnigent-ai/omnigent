@@ -9,7 +9,7 @@ import yaml
 
 from omnigent.errors import OmnigentError
 from omnigent.spec.parser import discover_host_skills, parse
-from omnigent.spec.types import ApiKeyAuth, DatabricksAuth, ProviderAuth
+from omnigent.spec.types import ApiKeyAuth, DatabricksAuth, ProviderAuth, SharePolicy
 
 
 @pytest.fixture()
@@ -203,6 +203,49 @@ def test_parse_llm_connection_unresolved_var_raises(
         parse(tmp_path)
 
 
+def test_parse_inline_mcp_tools_whitelist(tmp_path: Path) -> None:
+    """A per-server ``tools:`` whitelist on an inline MCP tool propagates to
+    ``MCPServerConfig.tools`` (regression: it was silently dropped, so the
+    documented allow-list was a no-op and all tools were exposed)."""
+    config = {
+        "spec_version": 1,
+        "tools": {
+            "github": {
+                "type": "mcp",
+                "command": "npx",
+                "args": ["-y", "server-github"],
+                "tools": ["search_issues", "get_pull_request"],
+            },
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    cfg = next(m for m in spec.mcp_servers if m.name == "github")
+    assert cfg.tools == ["search_issues", "get_pull_request"]
+
+
+def test_parse_inline_mcp_tools_absent_is_none(tmp_path: Path) -> None:
+    """Omitting ``tools:`` leaves the allow-list as ``None`` (expose all)."""
+    config = {
+        "spec_version": 1,
+        "tools": {"github": {"type": "mcp", "command": "npx", "args": []}},
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    cfg = next(m for m in parse(tmp_path).mcp_servers if m.name == "github")
+    assert cfg.tools is None
+
+
+def test_parse_inline_mcp_tools_non_list_raises(tmp_path: Path) -> None:
+    """A non-list ``tools:`` value is a clear error, not a silent type bug."""
+    config = {
+        "spec_version": 1,
+        "tools": {"github": {"type": "mcp", "command": "npx", "tools": "search_issues"}},
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(OmnigentError, match=r"'tools' must be a list"):
+        parse(tmp_path)
+
+
 def test_parse_expand_env_false_keeps_var_references(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -225,6 +268,84 @@ def test_parse_expand_env_false_keeps_var_references(
     spec = parse(tmp_path, expand_env=False)
     assert spec.llm is not None
     assert spec.llm.connection == {"api_key": "${MY_API_KEY}"}
+
+
+def test_parse_builtin_tool_config_expands_env_vars(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``${VAR}`` references in builtin tool config values are expanded."""
+    monkeypatch.setenv("PERPLEXITY_API_KEY", "pplx-redacted-test-key")
+    config = {
+        "spec_version": 1,
+        "tools": {
+            "builtins": [
+                {
+                    "name": "web_search",
+                    "search_provider": "perplexity",
+                    "api_key": "${PERPLEXITY_API_KEY}",
+                },
+            ],
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+
+    spec = parse(tmp_path)
+
+    builtin = spec.tools.builtins[0]
+    assert builtin.name == "web_search"
+    assert builtin.config == {
+        "search_provider": "perplexity",
+        "api_key": "pplx-redacted-test-key",
+    }
+
+
+def test_parse_builtin_tool_config_expand_env_false_keeps_literals(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``expand_env=False`` keeps builtin tool ``${VAR}`` config literal."""
+    monkeypatch.delenv("PERPLEXITY_API_KEY", raising=False)
+    config = {
+        "spec_version": 1,
+        "tools": {
+            "builtins": [
+                {
+                    "name": "web_search",
+                    "search_provider": "perplexity",
+                    "api_key": "${PERPLEXITY_API_KEY}",
+                },
+            ],
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+
+    spec = parse(tmp_path, expand_env=False)
+
+    assert spec.tools.builtins[0].config == {
+        "search_provider": "perplexity",
+        "api_key": "${PERPLEXITY_API_KEY}",
+    }
+
+
+def test_parse_builtin_tool_config_unresolved_var_raises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unresolved ``${VAR}`` in builtin tool config raises clearly."""
+    monkeypatch.delenv("PERPLEXITY_API_KEY", raising=False)
+    config = {
+        "spec_version": 1,
+        "tools": {
+            "builtins": [
+                {"name": "web_search", "api_key": "${PERPLEXITY_API_KEY}"},
+            ],
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+
+    with pytest.raises(OmnigentError, match=r"Unresolved environment variable"):
+        parse(tmp_path)
 
 
 def test_parse_instructions_multiline_inline(tmp_path: Path) -> None:
@@ -407,6 +528,61 @@ def test_parse_skill(agent_dir: Path) -> None:
     assert skill.description == "Search the web for sources."
     assert skill.content == "When asked to research, use search.web."
     assert skill.skill_dir == skill_dir
+    # Absent ``user-invocable`` frontmatter defaults to invocable.
+    assert skill.user_invocable is True
+
+
+def test_parse_skill_user_invocable_false(agent_dir: Path) -> None:
+    """``user-invocable: false`` frontmatter parses to ``user_invocable=False``."""
+    skill_dir = agent_dir / "skills" / "internal-hook"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        "name: internal-hook\n"
+        "description: Internal orchestration skill.\n"
+        "user-invocable: false\n"
+        "---\n"
+        "Body."
+    )
+    spec = parse(agent_dir)
+    skill = next(s for s in spec.skills if s.name == "internal-hook")
+    assert skill.user_invocable is False
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        # Quoted-string spellings (YAML keeps these as ``str``, not bool) —
+        # the string branch of _falsey_flag, never exercised by the bare forms.
+        ('"false"', False),
+        ('"False"', False),
+        ('"FALSE"', False),
+        ('" false "', False),
+        ('"no"', False),  # extended false spellings (quoted → str)
+        ('"off"', False),
+        ('"0"', False),
+        ('"true"', True),
+        ('"yes"', True),  # not in the false set
+        ('"maybe"', True),
+        # Genuine YAML booleans — PyYAML parses bare false/no/off to ``bool``.
+        ("false", False),
+        ("no", False),
+        ("off", False),
+        ("true", True),
+    ],
+)
+def test_parse_skill_user_invocable_string_and_bool_spellings(
+    agent_dir: Path, raw: str, expected: bool
+) -> None:
+    """Both the YAML bool ``false`` and the quoted string ``"false"`` parse falsey."""
+    skill_dir = agent_dir / "skills" / "flag-skill"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        f"---\nname: flag-skill\ndescription: d\nuser-invocable: {raw}\n---\nBody."
+    )
+    spec = parse(agent_dir)
+    skill = next(s for s in spec.skills if s.name == "flag-skill")
+    assert skill.user_invocable is expected
 
 
 def test_parse_skill_missing_frontmatter(agent_dir: Path) -> None:
@@ -430,6 +606,20 @@ def test_parse_skill_missing_description(agent_dir: Path) -> None:
     skill_dir.mkdir(parents=True)
     (skill_dir / "SKILL.md").write_text("---\nname: no-desc\n---\nContent.")
     with pytest.raises(OmnigentError, match=r"missing required field 'description'"):
+        parse(agent_dir)
+
+
+def test_parse_skill_non_utf8_raises_omnigent_error(agent_dir: Path) -> None:
+    """
+    A non-UTF-8 SKILL.md must funnel through OmnigentError (not escape as a
+    bare UnicodeDecodeError) so the lenient scanner / menu providers can
+    catch it and skip the file instead of crashing.
+    """
+    skill_dir = agent_dir / "skills" / "bad-bytes"
+    skill_dir.mkdir(parents=True)
+    # 0xff is invalid UTF-8 — read_text() raises UnicodeDecodeError.
+    (skill_dir / "SKILL.md").write_bytes(b"---\nname: bad-bytes\ndescription: \xff\n---\nx")
+    with pytest.raises(OmnigentError, match=r"could not be read"):
         parse(agent_dir)
 
 
@@ -1849,6 +2039,35 @@ def test_parse_llm_timeout_defaults(tmp_path: Path) -> None:
     assert spec.llm.retry.max_retries == 7
 
 
+def test_parse_llm_profile_survives_consolidation(tmp_path: Path) -> None:
+    """``llm.profile`` must survive the llm/executor consolidation rebuild.
+
+    When an ``llm:`` block is present, ``parse`` rebuilds ``LLMConfig`` to
+    keep model/connection in sync with the authoritative executor fields.
+    That rebuild used to omit ``profile``, silently dropping the credentials
+    profile. Downstream, the policy/guardrail builder resolves a Databricks
+    workspace connection from ``spec.llm.profile``
+    (``omnigent/runtime/policies/builder.py``), so losing it makes those
+    paths fall back to env/default auth instead of the declared profile.
+
+    Regression guard: pre-fix ``spec.llm.profile`` is ``None`` here.
+    """
+    config = {
+        "spec_version": 1,
+        "llm": {
+            "model": "databricks/databricks-claude-sonnet-4",
+            "profile": "my-workspace",
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    assert spec.llm is not None
+    assert spec.llm.profile == "my-workspace", (
+        f"spec.llm.profile is {spec.llm.profile!r}, expected 'my-workspace' — the "
+        "consolidation rebuild dropped the declared credentials profile."
+    )
+
+
 def test_parse_tools_global_timeout_and_retry(tmp_path: Path) -> None:
     """Tools block with explicit timeout and retry overrides."""
     config = {
@@ -2002,6 +2221,90 @@ def test_parse_executor_defaults(tmp_path: Path) -> None:
     assert spec.executor.type == "omnigent"
 
 
+@pytest.mark.parametrize(
+    ("config", "match"),
+    [
+        (
+            {"llm": {"model": "openai/gpt-4o", "request_timeout": True}},
+            r"llm\.request_timeout must be an integer",
+        ),
+        (
+            {"tools": {"timeout": False}},
+            r"tools\.timeout must be an integer",
+        ),
+        (
+            {"llm": {"model": "openai/gpt-4o", "retry": {"max_retries": True}}},
+            r"retry\.max_retries must be an integer",
+        ),
+        (
+            {"llm": {"model": "openai/gpt-4o", "retry": {"backoff_base_s": False}}},
+            r"retry\.backoff_base_s must be a number",
+        ),
+        (
+            {
+                "llm": {
+                    "model": "openai/gpt-4o",
+                    "retry": {"retryable_status_codes": [429, True]},
+                }
+            },
+            r"retry\.retryable_status_codes must be an integer",
+        ),
+        (
+            {"executor": {"timeout": True}},
+            r"executor\.timeout must be an integer",
+        ),
+        (
+            {"executor": {"max_iterations": False}},
+            r"executor\.max_iterations must be an integer",
+        ),
+        (
+            {"executor": {"context_window": True}},
+            r"executor\.context_window must be an integer",
+        ),
+        (
+            {"compaction": {"recent_window": False}},
+            r"compaction\.recent_window must be an integer",
+        ),
+        (
+            {"compaction": {"trigger_threshold": True}},
+            r"compaction\.trigger_threshold must be a number",
+        ),
+        (
+            {"guardrails": {"ask_timeout": True}},
+            r"guardrails\.ask_timeout must be an integer",
+        ),
+    ],
+)
+def test_parse_rejects_boolean_values_for_numeric_config_fields(
+    tmp_path: Path,
+    config: dict[str, object],
+    match: str,
+) -> None:
+    """Boolean YAML values must not be accepted as numeric config."""
+    config = {"spec_version": 1, **config}
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+
+    with pytest.raises(OmnigentError, match=match):
+        parse(tmp_path)
+
+
+def test_parse_rejects_boolean_terminal_scrollback(tmp_path: Path) -> None:
+    """Terminal scrollback is a line count, not a boolean flag."""
+    config = {
+        "spec_version": 1,
+        "terminals": {
+            "main": {
+                "command": "bash",
+                "scrollback": False,
+            },
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+
+    with pytest.raises(OmnigentError, match=r"terminals\.main\.scrollback must be an integer"):
+        parse(tmp_path)
+
+
 def test_parse_executor_config_field(tmp_path: Path) -> None:
     """Executor block with a ``config`` sub-block parses string values.
 
@@ -2077,6 +2380,22 @@ def test_parse_mcp_server_with_timeout_and_retry(
     # Retry max_retries should match the YAML value.
     # Failure means MCP retry fields are not forwarded correctly.
     assert mcp.retry.max_retries == 7
+
+
+def test_parse_rejects_boolean_mcp_timeout(agent_dir: Path) -> None:
+    """MCP timeout is a duration in seconds, not a boolean flag."""
+    mcp_dir = agent_dir / "tools" / "mcp"
+    mcp_dir.mkdir(parents=True)
+    mcp_config = {
+        "name": "slow-service",
+        "transport": "http",
+        "url": "http://localhost:9000/mcp",
+        "timeout": True,
+    }
+    (mcp_dir / "slow.yaml").write_text(yaml.dump(mcp_config))
+
+    with pytest.raises(OmnigentError, match=r"MCP server 'slow-service'\.timeout"):
+        parse(agent_dir)
 
 
 def test_parse_mcp_stdio_minimal(agent_dir: Path) -> None:
@@ -2353,6 +2672,65 @@ def test_parse_spawn_true_sets_flag(tmp_path: Path) -> None:
     (tmp_path / "config.yaml").write_text(yaml.dump(config))
     spec = parse(tmp_path)
     assert spec.spawn is True
+
+
+def test_parse_share_defaults_to_none_when_omitted(agent_dir: Path) -> None:
+    """
+    Without a top-level ``agent_session_sharing:`` key the parsed
+    ``AgentSpec.agent_session_sharing`` is :attr:`SharePolicy.NONE` —
+    sharing is off by default, so ``sys_session_share`` is not
+    registered. A regression flipping the default would expose the
+    access-control mutation (incl. ``__public__``) to every agent.
+
+    :param agent_dir: Temporary agent directory fixture.
+    """
+    spec = parse(agent_dir)
+    assert spec.agent_session_sharing is SharePolicy.NONE
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("none", SharePolicy.NONE),
+        ("non-public", SharePolicy.NON_PUBLIC),
+        ("public", SharePolicy.PUBLIC),
+    ],
+)
+def test_parse_share_maps_each_policy_string(
+    tmp_path: Path,
+    value: str,
+    expected: SharePolicy,
+) -> None:
+    """
+    Each recognized ``agent_session_sharing:`` string round-trips to its
+    :class:`SharePolicy` member. The flag is the sole enabler of
+    ``sys_session_share`` (and ``public`` of the ``__public__`` tier);
+    a parser regression dropping or mismapping it would silently change
+    what the agent is allowed to expose.
+
+    :param tmp_path: pytest-provided temporary directory.
+    :param value: The YAML ``agent_session_sharing:`` string under test.
+    :param expected: The :class:`SharePolicy` it must parse to.
+    """
+    config = {"spec_version": 1, "name": "share-agent", "agent_session_sharing": value}
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    assert spec.agent_session_sharing is expected
+
+
+def test_parse_share_invalid_value_fails_loud(tmp_path: Path) -> None:
+    """
+    An unrecognized ``agent_session_sharing:`` value (here a plausible
+    typo) raises rather than silently disabling sharing — fail-loud, so
+    a misconfigured capability surfaces at parse time instead of becoming
+    a confusing "the tool isn't there" at runtime.
+
+    :param tmp_path: pytest-provided temporary directory.
+    """
+    config = {"spec_version": 1, "name": "bad-share", "agent_session_sharing": "private"}
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(OmnigentError, match="agent_session_sharing"):
+        parse(tmp_path)
 
 
 # ---------------------------------------------------------------------------
@@ -3209,3 +3587,30 @@ def test_parse_credential_proxy_https_primitive_allowed_on_macos(tmp_path: Path)
     proxy = spec.os_env.sandbox.credential_proxy
     assert proxy is not None
     assert proxy.entries[0].scheme == "bearer"
+
+
+def test_config_loader_does_not_mutate_shared_safeloader_resolvers() -> None:
+    """``_ConfigYamlLoader`` must not corrupt ``yaml.SafeLoader`` process-wide.
+
+    The loader narrows the YAML 1.1 bool resolver to YAML-1.2 spellings, but it
+    must do so on its OWN copy of ``yaml_implicit_resolvers``. If it mutated the
+    dict it inherits from ``SafeLoader`` by reference, every plain
+    ``yaml.safe_load`` caller in the process would lose bool parsing — e.g.
+    ``safe_load("false")`` would return the string ``"false"``.
+    """
+    import omnigent.spec.parser as parser
+
+    # Importing the module must leave SafeLoader's bool resolver intact.
+    assert yaml.safe_load("false") is False
+    assert yaml.safe_load("true") is True
+    # SafeLoader keeps its own YAML 1.1 behavior (``on`` -> True) untouched.
+    assert yaml.safe_load("on") is True
+
+    # Sharpest guard: the subclass must own a distinct resolver dict. This
+    # fails the instant someone drops the copy, regardless of import order.
+    loader = parser._ConfigYamlLoader
+    assert loader.yaml_implicit_resolvers is not yaml.SafeLoader.yaml_implicit_resolvers
+
+    # The subclass still narrows bools: ``on`` is a plain string, ``false`` a bool.
+    assert yaml.load("on", loader) == "on"
+    assert yaml.load("false", loader) is False

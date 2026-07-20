@@ -26,6 +26,8 @@ from __future__ import annotations
 import httpx
 import pytest
 
+from omnigent.entities.conversation import MessageData, NewConversationItem
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from tests.server.helpers import (
     create_test_session,
 )
@@ -135,6 +137,56 @@ async def test_list_sessions_search_query_excludes_null_titles(
     # Only the titled match returns. If conv_b appears, the NULL
     # filter is misbehaving.
     assert ids == [conv_a]
+
+
+async def test_list_sessions_search_snippet_on_content_match(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A content match returns a ``search_snippet``; a title match omits it.
+
+    The palette uses ``search_snippet`` to show *where* a session matched
+    when the hit is in the chat body (invisible in the title). Seed one
+    session whose body — not title — contains the query, and one whose
+    title matches, then assert only the content match carries the snippet.
+
+    :param client: HTTP client wired to the test app.
+    :param db_uri: Per-test SQLite database URI (same DB the app uses),
+        so an item can be appended directly through a store.
+    """
+    conv_content = await _create_session(
+        client,
+        name="snippet-content-agent",
+        title="General chat",
+    )
+    conv_title = await _create_session(
+        client,
+        name="snippet-title-agent",
+        title="deployment runbook",
+    )
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv_store.append(
+        conv_content,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_snip",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": "please fix the deployment pipeline"}],
+                ),
+            ),
+        ],
+    )
+
+    resp = await client.get("/v1/sessions", params={"search_query": "deployment"})
+    assert resp.status_code == 200
+    by_id = {c["id"]: c for c in resp.json()["data"]}
+    # Content match carries the excerpt with the matched term.
+    assert "deployment" in by_id[conv_content]["search_snippet"].lower()
+    # Title-only match: exclude_none drops the null field entirely.
+    assert "search_snippet" not in by_id[conv_title]
 
 
 # ── DELETE /v1/sessions/{conversation_id} ─────────────────────

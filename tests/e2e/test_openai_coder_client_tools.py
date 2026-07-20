@@ -1,4 +1,4 @@
-"""E2E test: openai-coder agent uses client-side tools to list and manipulate files.
+"""E2E test: openai-coder agent uses client-side tools (mock LLM).
 
 The openai-coder agent should be able to use client-side tools
 (Read, Write, Edit, Glob, Grep, Bash) when the frontend passes
@@ -8,19 +8,23 @@ the runner-native session-events path.
 These tests drive client-side tools the way the real REPL does: they
 subscribe to the session's live SSE stream and respond to
 ``action_required`` function_calls with ``function_call_output``
-events. Snapshot polling cannot be used — ``action_required`` calls are
+events. Snapshot polling cannot be used -- ``action_required`` calls are
 published to the live stream but never persisted to conversation items.
+
+The mock LLM returns predetermined tool calls (Glob, Read, Write);
+the client executes them locally and tunnels results back. The mock
+then returns a final text response incorporating the tool output.
 
 Usage::
 
-    pytest tests/e2e/test_openai_coder_client_tools.py \\
-        --llm-api-key $LLM_API_KEY -v
+    pytest tests/e2e/test_openai_coder_client_tools.py -v
 """
 
 from __future__ import annotations
 
 import json
 import threading
+import uuid
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -30,7 +34,10 @@ import httpx
 # Load the coder tool set for client-side tool execution.
 from omnigent.client_tools import get_tool_set as _get_tool_set
 from tests.e2e.conftest import (
+    configure_mock_llm,
     create_runner_bound_session,
+    register_inline_agent,
+    reset_mock_llm,
     send_user_message_to_session,
 )
 
@@ -93,14 +100,6 @@ def _run_with_tunneling(
     tool, execute it locally and post a ``function_call_output`` event
     so the parked turn resumes.
 
-    Snapshot polling is deliberately NOT used here: ``action_required``
-    function_calls are only published to the live stream, never
-    persisted to conversation items (``_extract_persistent_item_from_sse``
-    skips non-completed function_calls). The terminal turn body is
-    assembled from the stream events — function_calls observed plus the
-    outputs this client produced — so the assertions check what actually
-    tunneled rather than relying on snapshot persistence.
-
     :param http_client: HTTP client pointed at the live server; holds
         the streaming GET open for the turn's duration.
     :param base_url: Server base URL for the short-lived POST clients
@@ -149,7 +148,7 @@ def _run_with_tunneling(
         posted = False
         for event in _iter_sse(response):
             # Post the user message only after the first frame confirms
-            # the live-tail subscription is registered — the stream does
+            # the live-tail subscription is registered -- the stream does
             # not replay history, so posting earlier could drop events.
             if not posted:
                 threading.Thread(target=_post_user_message, daemon=True).start()
@@ -240,7 +239,7 @@ def _assert_client_tool_output_contains(
     Assert that at least one client-side tool output contains ``needle``.
 
     Checks the actual ``function_call_output`` items for client-side
-    tools (Glob, Read, Bash, Grep) — not the agent's prose. This
+    tools (Glob, Read, Bash, Grep) -- not the agent's prose. This
     prevents false-positives from LLM hallucination.
 
     :param result: The terminal response body.
@@ -268,8 +267,8 @@ def _assert_client_tool_output_contains(
 def test_openai_coder_lists_files_with_client_tools(
     live_server: str,
     http_client: httpx.Client,
-    openai_coder_agent: str,
     live_runner_id: str,
+    mock_llm_server_url: str,
     sample_code_dir: Path,
 ) -> None:
     """
@@ -285,20 +284,78 @@ def test_openai_coder_lists_files_with_client_tools(
 
     :param live_server: Server base URL for the tunneling POST clients.
     :param http_client: HTTP client pointed at the live server.
-    :param openai_coder_agent: The uploaded openai-coder agent name.
     :param live_runner_id: Registered runner id for session dispatch.
+    :param mock_llm_server_url: Mock LLM server URL.
     :param sample_code_dir: Temp dir with calculator.py, utils.py.
     """
+    uid = uuid.uuid4().hex[:6]
+    model = f"mock-coder-glob-{uid}"
+
+    reset_mock_llm(mock_llm_server_url)
+    agent_name = register_inline_agent(
+        http_client,
+        name=f"coder-glob-{uid}",
+        harness="openai-agents",
+        model=model,
+        profile="",
+        prompt="You are a coding assistant. Use client tools to list and read files.",
+        mock_llm_base_url=f"{mock_llm_server_url}/v1",
+    )
+
+    # Mock LLM sequence:
+    # 1. Call Glob to list .py files
+    # 2. After Glob result, call Read to read calculator.py
+    # 3. After Read result, produce final text
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_glob",
+                        "name": "Glob",
+                        "arguments": json.dumps(
+                            {
+                                "pattern": "**/*.py",
+                                "path": str(sample_code_dir),
+                            }
+                        ),
+                    },
+                ],
+            },
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_read",
+                        "name": "Read",
+                        "arguments": json.dumps(
+                            {
+                                "file_path": str(sample_code_dir / "calculator.py"),
+                            }
+                        ),
+                    },
+                ],
+            },
+            {
+                "text": (
+                    "I found the Python files and read calculator.py. "
+                    "It contains divide and average functions."
+                ),
+            },
+        ],
+        key=model,
+    )
+
     result = _run_with_tunneling(
         http_client,
         base_url=live_server,
-        agent_name=openai_coder_agent,
+        agent_name=agent_name,
         runner_id=live_runner_id,
         user_input=f"List all Python files in {sample_code_dir} and tell me "
         f"their names. Use the Glob tool with pattern '**/*.py' and "
         f"path '{sample_code_dir}'. Then use the Read tool to read "
         f"the contents of calculator.py from that directory. "
-        f"Do NOT use Shell or ApplyPatch — use the Glob and Read "
+        f"Do NOT use Shell or ApplyPatch -- use the Glob and Read "
         f"tools only.",
     )
 
@@ -353,8 +410,8 @@ def _assert_file_written_locally(
 def test_openai_coder_writes_and_reads_file(
     live_server: str,
     http_client: httpx.Client,
-    openai_coder_agent: str,
     live_runner_id: str,
+    mock_llm_server_url: str,
     tmp_path: Path,
 ) -> None:
     """
@@ -362,22 +419,76 @@ def test_openai_coder_writes_and_reads_file(
     create a file and verify its contents locally.
 
     **What breaks if wrong:** If Write/Read fall back to
-    codex:ApplyPatch/Shell, the file lands in the sandbox — not
+    codex:ApplyPatch/Shell, the file lands in the sandbox -- not
     on the host filesystem. The local file assertion fails.
 
     :param live_server: Server base URL for the tunneling POST clients.
     :param http_client: HTTP client pointed at the live server.
-    :param openai_coder_agent: The uploaded openai-coder agent name.
     :param live_runner_id: Registered runner id for session dispatch.
+    :param mock_llm_server_url: Mock LLM server URL.
     :param tmp_path: Pytest-provided temporary directory.
     """
+    uid = uuid.uuid4().hex[:6]
+    model = f"mock-coder-write-{uid}"
     target_file = tmp_path / "agent_test_output.txt"
     sentinel = "OMNIGENT_E2E_CANARY_2026"
+
+    reset_mock_llm(mock_llm_server_url)
+    agent_name = register_inline_agent(
+        http_client,
+        name=f"coder-write-{uid}",
+        harness="openai-agents",
+        model=model,
+        profile="",
+        prompt="You are a coding assistant. Use Write and Read tools as instructed.",
+        mock_llm_base_url=f"{mock_llm_server_url}/v1",
+    )
+
+    # Mock LLM sequence:
+    # 1. Call Write to create file with sentinel
+    # 2. After Write result, call Read to read it back
+    # 3. After Read result, produce final text with sentinel
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_write",
+                        "name": "Write",
+                        "arguments": json.dumps(
+                            {
+                                "file_path": str(target_file),
+                                "content": sentinel,
+                            }
+                        ),
+                    },
+                ],
+            },
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_read",
+                        "name": "Read",
+                        "arguments": json.dumps(
+                            {
+                                "file_path": str(target_file),
+                            }
+                        ),
+                    },
+                ],
+            },
+            {
+                "text": (f"I wrote the file and read it back. The contents are: {sentinel}"),
+            },
+        ],
+        key=model,
+    )
 
     result = _run_with_tunneling(
         http_client,
         base_url=live_server,
-        agent_name=openai_coder_agent,
+        agent_name=agent_name,
         runner_id=live_runner_id,
         user_input=f"Do exactly these two steps:\n"
         f"1. Use the Write tool to create a file at "

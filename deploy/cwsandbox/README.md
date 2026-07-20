@@ -46,7 +46,7 @@ export CWSANDBOX_BASE_URL=https://api.cwsandbox.com   # optional (this is the de
 Sandboxes boot from `ghcr.io/omnigent-ai/omnigent-host:latest`, published by CI
 from the `host` target of [`deploy/docker/Dockerfile`](../docker/Dockerfile)
 with Omnigent and its dependencies preinstalled — including the coding-harness
-CLIs (`claude`, `codex`, `pi`), so agents on any harness run without an
+CLIs (`claude`, `codex`, `pi`, `kiro-cli`), so agents on any harness run without an
 in-sandbox install.
 
 To use a different image (a fork, or extra tooling baked in), build the same
@@ -135,6 +135,18 @@ sandbox:
   provider: cwsandbox
   server_url: https://your-host    # public URL sandboxes dial back to
 ```
+
+A top-level `sandbox.host_config:` (provider-agnostic) holds verbatim
+in-sandbox `~/.omnigent/config.yaml` content — e.g. a `providers:`
+block routing a harness through a self-hosted gateway — installed into
+the sandbox before `omnigent host` starts. The block is server-managed:
+entries injected by a previous launch are replaced or removed on the
+next launch/resume, while config created inside the sandbox survives.
+Keep secrets out via
+`api_key_ref: env:VAR` (resolved in the sandbox against the injected
+env). See the [sandbox-runners config
+table](../kubernetes/overlays/sandbox-runners/README.md#configuration-sandbox-configyaml)
+for the shape.
 
 `provider` + `server_url` is a complete config. `server_url` **must be reachable
 from CoreWeave** — the host inside the sandbox opens an outbound WebSocket to it,

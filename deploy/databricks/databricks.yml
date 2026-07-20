@@ -1,0 +1,84 @@
+# Databricks Asset Bundle config for the Omnigent Databricks App.
+#
+# Every knob the app exposes lives here. deploy.py wraps `databricks
+# bundle deploy` + `bundle run`; per-app values are passed as `--var`
+# pairs (see deploy.py / README.md).
+
+bundle:
+  name: omnigent
+
+variables:
+  app_name:
+    description: "Databricks App name (e.g. omnigent)."
+  lakebase_branch:
+    description: "projects/<app>/branches/production"
+  lakebase_database:
+    description: "projects/<app>/branches/production/databases/databricks-postgres"
+  volume_name:
+    description: "<catalog>.<schema>.<volume> for artifact storage"
+  otel_table_schema:
+    description: >
+      UC schema (catalog.schema) holding the OTel destination tables.
+      The platform writes to <schema>.otel_logs, otel_metrics, otel_spans.
+    default: main.omnigent_logs
+
+resources:
+  apps:
+    # Resource key must match _BUNDLE_RESOURCE_KEY in deploy.py. The app's
+    # display name comes from ${var.app_name}.
+    omnigent:
+      name: ${var.app_name}
+      description: "Omnigent server backed by Lakebase + UC Volumes."
+      source_code_path: ./src
+      # compute_size is intentionally NOT declared here. Terraform's
+      # databricks_app provider uses an apps update API that rejects
+      # compute_size changes ("not supported in this update API"). We
+      # set it out-of-band via apps.create_update in deploy.py before
+      # the bundle deploy runs.
+      config:
+        command: ["opentelemetry-instrument", "python", "app.py"]
+        env:
+          - name: AP_LAKEBASE_ENDPOINT
+            value_from: postgres
+          - name: AP_ARTIFACT_VOLUME_PATH
+            value_from: artifact_volume
+          - name: OTEL_TRACES_SAMPLER
+            value: 'always_on'
+      resources:
+        - name: postgres
+          postgres:
+            branch: ${var.lakebase_branch}
+            database: ${var.lakebase_database}
+            permission: CAN_CONNECT_AND_CREATE
+        - name: artifact_volume
+          uc_securable:
+            securable_full_name: ${var.volume_name}
+            securable_type: VOLUME
+            permission: WRITE_VOLUME
+
+targets:
+  # One target per workspace. workspace.host must be literal (DAB reads it
+  # before resolving vars). deploy.py selects via --target. To deploy to a
+  # different workspace, add another target block here and pass
+  # `deploy.py --target <name>`.
+  prod:
+    mode: production
+    workspace:
+      host: https://example.databricks.com   # ← your workspace URL
+      # Isolate state per app so one bundle can deploy multiple apps.
+      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${var.app_name}
+    resources:
+      apps:
+        omnigent:
+          # Optional: Databricks Apps platform OTel export. The platform
+          # auto-injects OTEL_EXPORTER_OTLP_ENDPOINT into the app container
+          # so any OTLP emitter (including telemetry.init() in src/app.py)
+          # routes to the configured UC tables. The export API rejects tables
+          # in default storage ("Cannot export App telemetry to tables in
+          # default storage"), so this requires a workspace with a custom
+          # storage location — drop this block if yours has none.
+          telemetry_export_destinations:
+            - unity_catalog:
+                logs_table: ${var.otel_table_schema}.otel_logs
+                metrics_table: ${var.otel_table_schema}.otel_metrics
+                traces_table: ${var.otel_table_schema}.otel_spans

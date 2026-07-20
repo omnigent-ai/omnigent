@@ -1,4 +1,4 @@
-"""E2E journey test: terminal-driven development workflow.
+"""E2E journey test: terminal-driven development workflow (mock LLM).
 
 Exercises the realistic developer workflow where an agent uses
 terminals to run commands, inspect output, and follow up with
@@ -13,20 +13,23 @@ Skipped if tmux is not installed on the host.
 
 Usage::
 
-    pytest tests/e2e/test_journey_terminal_driven_dev.py \\
-        --llm-api-key $LLM_API_KEY -v
+    pytest tests/e2e/test_journey_terminal_driven_dev.py -v
 """
 
 from __future__ import annotations
 
 import shutil
+import uuid
 
 import httpx
 import pytest
 
 from tests.e2e.conftest import (
+    configure_mock_llm,
     create_runner_bound_session,
     poll_session_until_terminal,
+    register_inline_agent,
+    reset_mock_llm,
     send_user_message_to_session,
 )
 
@@ -78,28 +81,95 @@ def _get_function_call_outputs(
 
 @pytest.mark.llm_flaky(reruns=2)
 def test_terminal_multi_command_workflow(
-    live_server: str,
-    sys_terminal_test_agent: str,
     http_client: httpx.Client,
     live_runner_id: str,
+    mock_llm_server_url: str,
 ) -> None:
     """Multi-command developer workflow: run a command, see output,
     follow up with another command that references the first.
 
-    Turn 1: ``echo hello_world`` — verify terminal tool was invoked
-    and the output contains the marker.
+    Turn 1: ``echo hello_world`` — mock LLM emits sys_terminal_launch
+    then sys_terminal_send(echo hello_world) then sys_terminal_read
+    then a text reply. Verify terminal tool was invoked and the output
+    contains the marker.
 
-    Turn 2: ``echo goodbye_world`` in the same terminal — verify
-    the second marker appears and ideally the same terminal was
-    reused (no second launch).
+    Turn 2: ``echo goodbye_world`` in the same terminal — mock LLM
+    emits sys_terminal_send(echo goodbye_world) then sys_terminal_read
+    then a text reply. Verify the second marker appears.
     """
+    model = f"mock-terminal-multi-{uuid.uuid4().hex[:6]}"
+
+    reset_mock_llm(mock_llm_server_url)
+    agent_name = register_inline_agent(
+        http_client,
+        name=f"terminal-multi-{uuid.uuid4().hex[:6]}",
+        harness="openai-agents",
+        model=model,
+        profile="",
+        prompt=(
+            "You are a terminal test assistant. "
+            "Use sys_terminal_launch, sys_terminal_send, and sys_terminal_read "
+            "to execute shell commands and report results."
+        ),
+        mock_llm_base_url=f"{mock_llm_server_url}/v1",
+        extra_config={
+            "terminals": {
+                "bash": {
+                    "command": "bash",
+                    "os_env": {"type": "caller_process", "sandbox": {"type": "none"}},
+                }
+            },
+            "os_env": {"type": "caller_process", "cwd": ".", "sandbox": {"type": "none"}},
+        },
+    )
+
     session_id = create_runner_bound_session(
         http_client,
-        agent_name=sys_terminal_test_agent,
+        agent_name=agent_name,
         runner_id=live_runner_id,
     )
 
-    # ── Turn 1: echo hello_world ──────────────────────────────
+    # ── Turn 1: launch terminal and echo hello_world ──────────
+    # Mock: launch -> send echo hello_world -> read -> text reply.
+    reset_mock_llm(mock_llm_server_url)
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_launch1",
+                        "name": "sys_terminal_launch",
+                        "arguments": '{"terminal": "bash", "session": "s1"}',
+                    }
+                ],
+            },
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_send1",
+                        "name": "sys_terminal_send",
+                        "arguments": (
+                            '{"terminal": "bash", "session": "s1",'
+                            ' "text": "echo hello_world", "keys": "Enter"}'
+                        ),
+                    }
+                ],
+            },
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_read1",
+                        "name": "sys_terminal_read",
+                        "arguments": '{"terminal": "bash", "session": "s1"}',
+                    }
+                ],
+            },
+            {"text": "I ran echo hello_world and the terminal showed hello_world."},
+        ],
+        key=model,
+    )
+
     resp_id_1 = send_user_message_to_session(
         http_client,
         session_id=session_id,
@@ -115,29 +185,62 @@ def test_terminal_multi_command_workflow(
         f"Turn 1 failed: status={result_1['status']!r}, error={result_1.get('error')!r}"
     )
 
-    # The agent must have used sys_terminal_send (or at minimum
-    # sys_terminal_launch). Check that the tool output contains
-    # the marker.
-    sends_1 = _get_function_call_outputs(http_client, session_id, "sys_terminal_send")
-    reads_1 = _get_function_call_outputs(http_client, session_id, "sys_terminal_read")
+    # The agent must have used sys_terminal_launch.
     launches_1 = _get_function_call_outputs(http_client, session_id, "sys_terminal_launch")
-
     assert launches_1, (
         f"sys_terminal_launch was never called in turn 1; "
         f"session_id={session_id}. The agent must launch a terminal "
         f"before it can execute commands."
     )
 
-    # hello_world must appear in send or read outputs.
-    all_outputs_1 = " ".join(sends_1 + reads_1)
-    assert "hello_world" in all_outputs_1, (
-        f"'hello_world' not found in terminal tool outputs after "
-        f"turn 1. Sends: {sends_1!r}, Reads: {reads_1!r}. The "
-        f"echo command either wasn't sent or the read didn't "
-        f"capture the output."
+    # Verify send and read were called (tool pipeline ran end-to-end).
+    sends_1 = _get_function_call_outputs(http_client, session_id, "sys_terminal_send")
+    reads_1 = _get_function_call_outputs(http_client, session_id, "sys_terminal_read")
+    assert sends_1, f"sys_terminal_send was never called in turn 1; session_id={session_id}."
+    assert reads_1, f"sys_terminal_read was never called in turn 1; session_id={session_id}."
+
+    # Stronger output assertions: the read output must be non-empty and
+    # contain "hello_world" — proving the echo actually ran and tmux
+    # captured it before the read call completed.
+    combined_reads_1 = " ".join(reads_1)
+    assert "hello_world" in combined_reads_1, (
+        f"Expected 'hello_world' in sys_terminal_read output from turn 1, "
+        f"got reads_1={reads_1!r}. The echo may not have flushed before the "
+        f"read, or the terminal send did not execute the command."
     )
 
     # ── Turn 2: echo goodbye_world ────────────────────────────
+    # Mock: reuse existing terminal, send goodbye_world, read, reply.
+    reset_mock_llm(mock_llm_server_url)
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_send2",
+                        "name": "sys_terminal_send",
+                        "arguments": (
+                            '{"terminal": "bash", "session": "s1",'
+                            ' "text": "echo goodbye_world", "keys": "Enter"}'
+                        ),
+                    }
+                ],
+            },
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_read2",
+                        "name": "sys_terminal_read",
+                        "arguments": '{"terminal": "bash", "session": "s1"}',
+                    }
+                ],
+            },
+            {"text": "I ran echo goodbye_world and the terminal showed goodbye_world."},
+        ],
+        key=model,
+    )
+
     resp_id_2 = send_user_message_to_session(
         http_client,
         session_id=session_id,
@@ -153,13 +256,25 @@ def test_terminal_multi_command_workflow(
         f"Turn 2 failed: status={result_2['status']!r}, error={result_2.get('error')!r}"
     )
 
-    # goodbye_world must appear in the cumulative tool outputs.
+    # Verify a second send and read were issued in turn 2.
     sends_2 = _get_function_call_outputs(http_client, session_id, "sys_terminal_send")
     reads_2 = _get_function_call_outputs(http_client, session_id, "sys_terminal_read")
-    all_outputs_2 = " ".join(sends_2 + reads_2)
-    assert "goodbye_world" in all_outputs_2, (
-        f"'goodbye_world' not found in terminal tool outputs after "
-        f"turn 2. Sends: {sends_2!r}, Reads: {reads_2!r}."
+    assert len(sends_2) >= 2, (
+        f"Expected at least 2 sys_terminal_send calls across both turns; "
+        f"got {len(sends_2)}. Turn 2 send may not have executed."
+    )
+    assert len(reads_2) >= 2, (
+        f"Expected at least 2 sys_terminal_read calls across both turns; "
+        f"got {len(reads_2)}. Turn 2 read may not have executed."
+    )
+
+    # Stronger output assertion: the combined reads across both turns must
+    # contain "goodbye_world" — proving the second echo ran and was captured.
+    combined_reads_2 = " ".join(reads_2)
+    assert "goodbye_world" in combined_reads_2, (
+        f"Expected 'goodbye_world' in sys_terminal_read outputs after turn 2, "
+        f"got reads_2={reads_2!r}. The echo may not have flushed before the "
+        f"read, or the terminal send did not execute the command."
     )
 
     # Soft check: the agent should have reused the terminal (only
@@ -176,10 +291,9 @@ def test_terminal_multi_command_workflow(
 
 @pytest.mark.llm_flaky(reruns=2)
 def test_terminal_persists_across_turns(
-    live_server: str,
-    sys_terminal_test_agent: str,
     http_client: httpx.Client,
     live_runner_id: str,
+    mock_llm_server_url: str,
 ) -> None:
     """Terminal state (tmux session) persists between agent turns.
 
@@ -196,15 +310,82 @@ def test_terminal_persists_across_turns(
     test also validates that the agent can reuse the terminal
     without relaunching.
     """
+    model = f"mock-terminal-persist-{uuid.uuid4().hex[:6]}"
+
+    reset_mock_llm(mock_llm_server_url)
+    agent_name = register_inline_agent(
+        http_client,
+        name=f"terminal-persist-{uuid.uuid4().hex[:6]}",
+        harness="openai-agents",
+        model=model,
+        profile="",
+        prompt=(
+            "You are a terminal test assistant. "
+            "Use sys_terminal_launch, sys_terminal_send, and sys_terminal_read "
+            "to execute shell commands and report results."
+        ),
+        mock_llm_base_url=f"{mock_llm_server_url}/v1",
+        extra_config={
+            "terminals": {
+                "bash": {
+                    "command": "bash",
+                    "os_env": {"type": "caller_process", "sandbox": {"type": "none"}},
+                }
+            },
+            "os_env": {"type": "caller_process", "cwd": ".", "sandbox": {"type": "none"}},
+        },
+    )
+
     session_id = create_runner_bound_session(
         http_client,
-        agent_name=sys_terminal_test_agent,
+        agent_name=agent_name,
         runner_id=live_runner_id,
     )
 
     test_file = f"/tmp/omni_test_{session_id[:8]}.txt"
 
     # ── Turn 1: create the file ───────────────────────────────
+    # Mock: launch -> send echo "test content" > file -> read -> reply.
+    reset_mock_llm(mock_llm_server_url)
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_launch_p1",
+                        "name": "sys_terminal_launch",
+                        "arguments": '{"terminal": "bash", "session": "s1"}',
+                    }
+                ],
+            },
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_send_p1",
+                        "name": "sys_terminal_send",
+                        "arguments": (
+                            f'{{"terminal": "bash", "session": "s1",'
+                            f' "text": "echo \\"test content\\" > {test_file}",'
+                            f' "keys": "Enter"}}'
+                        ),
+                    }
+                ],
+            },
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_read_p1",
+                        "name": "sys_terminal_read",
+                        "arguments": '{"terminal": "bash", "session": "s1"}',
+                    }
+                ],
+            },
+            {"text": f"I created the file at {test_file}. Confirmed it ran."},
+        ],
+        key=model,
+    )
+
     resp_id_1 = send_user_message_to_session(
         http_client,
         session_id=session_id,
@@ -225,6 +406,37 @@ def test_terminal_persists_across_turns(
     assert launches, f"No sys_terminal_launch in turn 1; session_id={session_id}."
 
     # ── Turn 2: read the file ─────────────────────────────────
+    # Mock: reuse terminal, send cat file, read, reply.
+    reset_mock_llm(mock_llm_server_url)
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_send_p2",
+                        "name": "sys_terminal_send",
+                        "arguments": (
+                            f'{{"terminal": "bash", "session": "s1",'
+                            f' "text": "cat {test_file}", "keys": "Enter"}}'
+                        ),
+                    }
+                ],
+            },
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_read_p2",
+                        "name": "sys_terminal_read",
+                        "arguments": '{"terminal": "bash", "session": "s1"}',
+                    }
+                ],
+            },
+            {"text": "The file contains: test content"},
+        ],
+        key=model,
+    )
+
     resp_id_2 = send_user_message_to_session(
         http_client,
         session_id=session_id,

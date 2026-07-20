@@ -40,6 +40,19 @@ class _GenerateBuildInfo(build_py):
         self._write_build_info()
         super().run()
         self._bundle_examples()
+        self._bundle_scripts()
+
+    def _bundle_scripts(self) -> None:
+        """Copy top-level maintenance scripts into package resources."""
+        import shutil
+
+        root = Path(__file__).resolve().parent
+        src = root / "scripts" / "uninstall_oss.sh"
+        if not src.is_file():
+            return
+        dest = Path(self.build_lib) / "omnigent" / "resources" / "scripts" / src.name
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dest)
 
     def _bundle_examples(self) -> None:
         """Copy bundled example agents into the wheel as real directories.
@@ -79,7 +92,7 @@ class _GenerateBuildInfo(build_py):
             shutil.copytree(src, dst)
 
     def _build_web_ui(self) -> None:
-        """Build the ap-web SPA into ``omnigent/server/static/web-ui/``.
+        """Build the web SPA into ``omnigent/server/static/web-ui/``.
 
         The server mounts that directory at ``/`` when present
         (``omnigent/server/app.py``); when absent it serves an
@@ -92,7 +105,7 @@ class _GenerateBuildInfo(build_py):
         Build policy, chosen to fix that case without slowing the
         backend-only dev loop or breaking node-less CI:
 
-        - Skip if ``ap-web/`` is absent (sdists that don't vendor it).
+        - Skip if ``web/`` is absent (sdists that don't vendor it).
         - Skip if ``OMNIGENT_SKIP_WEB_UI=true``. The hardened CI
           runners ship a system ``npm`` but have no fast registry
           mirror configured for the lint/test shards, so ``npm
@@ -120,7 +133,7 @@ class _GenerateBuildInfo(build_py):
         import shutil
 
         root = Path(__file__).resolve().parent
-        web_src = root / "ap-web"
+        web_src = root / "web"
         bundle = root / "omnigent" / "server" / "static" / "web-ui" / "index.html"
 
         if not (web_src / "package.json").is_file():

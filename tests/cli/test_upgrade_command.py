@@ -317,6 +317,69 @@ def test_upgrade_pre_passes_prerelease_flag_to_installer(
     assert ran == ["uv tool upgrade omnigent --prerelease allow"]
 
 
+# ── ``omni update`` alias ────────────────────────────────────────────
+
+
+def test_update_is_alias_for_upgrade_same_callback() -> None:
+    """``update`` and ``upgrade`` resolve to the exact same Click command.
+
+    The alias is registered by handing the *same* Command object to the
+    group under a second name, so its callback, options and help must be
+    identical — there is no second implementation to drift from ``upgrade``.
+    """
+    update_cmd = cli.commands["update"]
+    upgrade_cmd = cli.commands["upgrade"]
+
+    assert update_cmd is upgrade_cmd
+    assert update_cmd.callback is upgrade_cmd.callback
+    # Same option surface (--check / --force / --pre).
+    assert [p.name for p in update_cmd.params] == [p.name for p in upgrade_cmd.params]
+
+
+def test_update_up_to_date(monkeypatch: pytest.MonkeyPatch, _wheel_install: None) -> None:
+    """``omni update`` runs the upgrade flow end-to-end (up-to-date path)."""
+    monkeypatch.setattr("omnigent.update_check.fetch_latest_version", lambda *_a, **_k: "0.1.0")
+
+    def _must_not_run(*_a: object, **_k: object) -> int:
+        raise AssertionError("upgrade command ran while already up to date")
+
+    monkeypatch.setattr("omnigent.update_check._run_upgrade_command", _must_not_run)
+
+    result = CliRunner().invoke(cli, ["update"])
+
+    assert result.exit_code == 0, result.output
+    assert "up to date" in result.output
+    assert "0.1.0" in result.output
+
+
+def test_update_check_matches_upgrade_check(
+    monkeypatch: pytest.MonkeyPatch, _wheel_install: None
+) -> None:
+    """``update --check`` behaves identically to ``upgrade --check``."""
+    monkeypatch.setattr("omnigent.update_check.fetch_latest_version", lambda *_a, **_k: "0.2.0")
+
+    def _must_not_run(*_a: object, **_k: object) -> int:
+        raise AssertionError("--check must not run the upgrade")
+
+    monkeypatch.setattr("omnigent.update_check._run_upgrade_command", _must_not_run)
+
+    runner = CliRunner()
+    update_result = runner.invoke(cli, ["update", "--check"])
+    upgrade_result = runner.invoke(cli, ["upgrade", "--check"])
+
+    assert update_result.exit_code == upgrade_result.exit_code == 1
+    assert update_result.output == upgrade_result.output
+    assert "v0.1.0 → v0.2.0" in update_result.output
+
+
+def test_update_suppresses_update_check_like_upgrade() -> None:
+    """``update`` is special-cased alongside ``upgrade`` in the skip set."""
+    from omnigent.cli import _should_skip_update_check
+
+    assert _should_skip_update_check(["update"]) is True
+    assert _should_skip_update_check(["upgrade"]) is True
+
+
 def test_upgrade_noop_install_reports_failure_not_success(
     monkeypatch: pytest.MonkeyPatch, _wheel_install: None
 ) -> None:

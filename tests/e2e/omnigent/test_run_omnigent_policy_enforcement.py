@@ -40,40 +40,20 @@ from __future__ import annotations
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
-from shutil import which
 
 import pytest
 import yaml
 
-from tests.e2e._harness_probes import HARNESS_HARNESS_MODELS, HARNESS_IDS
+from tests.e2e.omnigent.conftest import configure_mock_llm
 
 _TIMEOUT_SEC = 180
 
-
-def _check_harness_available(harness: str) -> None:
-    """
-    Fail loud if the parametrized harness's outer CLI binary is missing.
-
-    Mirrors the per-harness availability checks elsewhere in
-    the e2e suite. Following CLAUDE.md rule 30 we fail rather
-    than silently skip so missing prerequisites stay visible.
-
-    :param harness: The harness identifier under test.
-    """
-    if harness == "claude-sdk":
-        if which("claude") is None:
-            pytest.fail(
-                "claude-sdk harness prerequisite missing: the 'claude' "
-                "CLI binary must be installed on PATH."
-            )
-    elif harness == "codex":
-        if which("codex") is None:
-            pytest.fail(
-                "codex harness prerequisite missing: the 'codex' CLI "
-                "binary must be installed on PATH (install via "
-                "'npm i -g @openai/codex')."
-            )
-
+# Run against openai-agents + mock-model only — the policy-engine
+# paths under test are harness-agnostic; openai-agents is the most
+# reliable harness for mock-LLM e2e (no CLI binary required and
+# honors OPENAI_BASE_URL directly).
+_HARNESS_HARNESS_MODELS = [("openai-agents", "mock-model")]
+_HARNESS_IDS = ["openai-agents"]
 
 # Sentinel token that the ``block_on_sentinel`` policy callable
 # in ``omnigent/_e2e_policy_callables.py`` DENYs on. The token
@@ -141,12 +121,11 @@ def policy_enforcement_yaml_factory(tmp_path: Path) -> Callable[[str, str], Path
     return _build
 
 
-@pytest.mark.parametrize("harness,model", HARNESS_HARNESS_MODELS, ids=HARNESS_IDS)
+@pytest.mark.parametrize("harness,model", _HARNESS_HARNESS_MODELS, ids=_HARNESS_IDS)
 def test_policy_denies_input_containing_sentinel(
     omnigent_python: Path,
     omnigent_repo_root: Path,
-    omnigent_credentials_env: dict[str, str],
-    databricks_workspace: tuple[str, str],
+    mock_credentials_env: dict[str, str],
     policy_enforcement_yaml_factory: Callable[[str, str], Path],
     harness: str,
     model: str,
@@ -156,22 +135,23 @@ def test_policy_denies_input_containing_sentinel(
     the DENY-by-policy sentinel in output — proof that the
     translator lifted the YAML's ``policies:`` into
     ``AgentSpec.guardrails.policies`` AND the omnigent
-    workflow enforced it at INPUT. Parametrized so each wrapped
-    harness exercises the policy gate.
+    workflow enforced it at INPUT.
+
+    The policy fires before any LLM call, so no mock response
+    needs to be pre-configured — the mock server is only
+    reachable if the policy incorrectly returns ALLOW.
 
     :param omnigent_python: Shared interpreter fixture.
     :param omnigent_repo_root: Subprocess cwd — the YAML's
         callable import path resolves relative to
         PYTHONPATH, which conftest anchors at the repo root +
         omnigent.
-    :param omnigent_credentials_env: Env with PAT + profile.
+    :param mock_credentials_env: Mock-LLM env vars.
     :param policy_enforcement_yaml_factory: Builder for the
         harness-specific omnigent YAML.
-    :param harness: The harness identifier from
-        :data:`HARNESS_HARNESS_MODELS`.
-    :param model: The harness-routed model identifier.
+    :param harness: The harness identifier.
+    :param model: The model identifier.
     """
-    _check_harness_available(harness)
     yaml_path = policy_enforcement_yaml_factory(harness, model)
     prompt = f"Tell me a joke about {_BLOCK_TOKEN}."
     result = subprocess.run(
@@ -185,7 +165,7 @@ def test_policy_denies_input_containing_sentinel(
             "-p",
             prompt,
         ],
-        env=omnigent_credentials_env,
+        env=mock_credentials_env,
         cwd=str(omnigent_repo_root),
         capture_output=True,
         text=True,
@@ -306,12 +286,12 @@ def tool_ban_yaml_factory(tmp_path: Path) -> Callable[[str, str], Path]:
     return _build
 
 
-@pytest.mark.parametrize("harness,model", HARNESS_HARNESS_MODELS, ids=HARNESS_IDS)
+@pytest.mark.parametrize("harness,model", _HARNESS_HARNESS_MODELS, ids=_HARNESS_IDS)
 def test_policy_denies_tool_call_by_name(
     omnigent_python: Path,
     omnigent_repo_root: Path,
-    omnigent_credentials_env: dict[str, str],
-    databricks_workspace: tuple[str, str],
+    mock_credentials_env: dict[str, str],
+    mock_llm_server_url: str,
     tool_ban_yaml_factory: Callable[[str, str], Path],
     harness: str,
     model: str,
@@ -348,28 +328,42 @@ def test_policy_denies_tool_call_by_name(
       longer propagate through the translator into
       the policy spec.
 
+    The mock LLM is configured to issue a ``calculate`` tool call
+    on the first turn, then acknowledge the denial on the second
+    turn — this deterministically exercises the TOOL_CALL
+    enforcement path without a real gateway.
+
     :param omnigent_python: Shared interpreter fixture.
     :param omnigent_repo_root: Subprocess cwd — conftest's
         PYTHONPATH anchors at repo root so
         ``tests.resources.examples._shared.tool_functions.calculate`` resolves during
         YAML load.
-    :param omnigent_credentials_env: Env with PAT + profile.
+    :param mock_credentials_env: Mock-LLM env vars.
+    :param mock_llm_server_url: Mock server URL for configuring
+        response queues.
     :param tool_ban_yaml_factory: Builder for the tool-ban YAML.
-    :param harness: The harness identifier from
-        :data:`HARNESS_HARNESS_MODELS`.
-    :param model: The harness-routed model identifier.
+    :param harness: The harness identifier.
+    :param model: The model identifier.
     """
-    _check_harness_available(harness)
+    # Turn 1: LLM emits a calculate tool call → policy intercepts
+    # and returns DENY sentinel as tool output.
+    # Turn 2: LLM sees DENY sentinel and acknowledges the denial.
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_calc_1",
+                        "name": "calculate",
+                        "arguments": '{"expression": "48273 * 9182"}',
+                    }
+                ]
+            },
+            {"text": "The calculation was denied by policy."},
+        ],
+    )
     yaml_path = tool_ban_yaml_factory(harness, model)
-    # A math question the LLM cannot evaluate in-head, so it
-    # reliably routes through the ``calculate`` tool. A trivial
-    # expression like "6 + 6" let the model answer inline without
-    # ever emitting a tool call — the deny policy then had nothing
-    # to intercept and the test flaked on model nondeterminism. A
-    # large product forces the tool call. Under the policy the
-    # calculate call is intercepted and the sentinel is returned as
-    # tool output instead, so the LLM's final reply reflects the
-    # denial, never the real product 443242686.
     prompt = "What is 48273 multiplied by 9182? Use the calculate tool."
     result = subprocess.run(
         [
@@ -382,7 +376,7 @@ def test_policy_denies_tool_call_by_name(
             "-p",
             prompt,
         ],
-        env=omnigent_credentials_env,
+        env=mock_credentials_env,
         cwd=str(omnigent_repo_root),
         capture_output=True,
         text=True,

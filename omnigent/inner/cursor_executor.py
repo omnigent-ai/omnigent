@@ -81,22 +81,30 @@ ToolExecutor: TypeAlias = Callable[[str, dict[str, Any]], Awaitable[Any]]  # typ
 
 # Cursor's auto model-select, used when a spec pins no cursor model (the SDK
 # requires a model for local agents, so unlike the old ACP path we can't pass
-# ``None``).
-_DEFAULT_CURSOR_MODEL = "auto"
+# ``None``). The SDK renamed the id from ``auto`` to ``auto-smart``; keep
+# mapping the legacy id for specs/env that still say ``auto``.
+_DEFAULT_CURSOR_MODEL = "auto-smart"
+_LEGACY_AUTO_MODEL = "auto"
 
 # Upper bound (seconds) on one bridged-tool call: generous (sub-agent dispatches
 # can run for minutes) but finite, so a wedged tool surfaces a timeout error
 # instead of blocking the SDK's daemon callback thread forever.
 _TOOL_CALL_TIMEOUT_S = 1800.0
+# Maximum time (seconds) Cursor will wait for the preToolUse hook subprocess
+# to return.  Held at one day so the hook stays alive while the human responds
+# to the web-UI approval card — mirrors the server-side ``ask_timeout`` default
+# and the ``read_timeout`` used by ``cursor_policy_hook.py``.
+_HOOK_APPROVAL_TIMEOUT_S = 86400
 
 
 def _resolve_model(model: str | None) -> str:
     """Resolve the cursor model id, dropping ids cursor can't honor.
 
-    cursor-sdk accepts only Cursor model ids (``auto``, ``gpt-5``,
+    cursor-sdk accepts only Cursor model ids (``auto-smart``, ``gpt-5``,
     ``composer-2.5``, ...), so a gateway-routed model id (carried by a spec
     authored for another harness) falls back to cursor's auto-select. ``None``
-    likewise resolves to ``auto`` (the SDK requires a model).
+    likewise resolves to :data:`_DEFAULT_CURSOR_MODEL` (the SDK requires a model).
+    The legacy ``auto`` id is remapped to ``auto-smart``.
     """
     if not model or model.startswith(("databricks-", "databricks/")):
         if model:
@@ -109,6 +117,8 @@ def _resolve_model(model: str | None) -> str:
                 model,
                 _DEFAULT_CURSOR_MODEL,
             )
+        return _DEFAULT_CURSOR_MODEL
+    if model == _LEGACY_AUTO_MODEL:
         return _DEFAULT_CURSOR_MODEL
     return model
 
@@ -156,6 +166,16 @@ def _normalize_cursor_usage(raw: dict[str, Any], model: str) -> dict[str, Any]:
             if val is not None:
                 usage[dst] = val
                 break
+    # cursor's inputTokens is INCLUSIVE of cache read + write. compute_llm_cost
+    # expects input_tokens to be the NON-cached portion and prices the cache
+    # buckets additively, so subtract the cached tokens here — otherwise they
+    # are billed twice (once at the full input rate, once at their cache rate).
+    # Mirrors the qwen / antigravity executors. Clamp so a malformed cached >
+    # input never goes negative. total_tokens keeps the reported inclusive total.
+    cached = (usage.get("cache_read_input_tokens") or 0) + (
+        usage.get("cache_creation_input_tokens") or 0
+    )
+    usage["input_tokens"] = max(0, in_tok - cached)
     return usage
 
 
@@ -401,15 +421,14 @@ def _write_cursor_hooks(cwd: str, hook_script_path: str, server_url: str, sessio
     hooks_dir.mkdir(parents=True, exist_ok=True)
     hooks_file = hooks_dir / "hooks.json"
 
-    # Write a wrapper script that sets env vars and execs the hook.
+    # Write a wrapper script that sets env vars and execs the hook. It bakes a
+    # one-shot auth token + workspace-routing header, so it is owner-only
+    # (0o700) — the secret is never world-readable.
+    from omnigent.native_policy_hook import policy_hook_wrapper_script
+
     wrapper = hooks_dir / "omnigent-hook.sh"
-    wrapper.write_text(
-        f"#!/bin/sh\n"
-        f"export _OMNIGENT_SERVER_URL='{server_url}'\n"
-        f"export _OMNIGENT_SESSION_ID='{session_id}'\n"
-        f"exec '{sys.executable}' '{hook_script_path}'\n"
-    )
-    wrapper.chmod(0o755)
+    wrapper.write_text(policy_hook_wrapper_script(server_url, session_id, hook_script_path))
+    wrapper.chmod(0o700)
     command = str(wrapper)
     config = {
         "version": 1,
@@ -417,13 +436,49 @@ def _write_cursor_hooks(cwd: str, hook_script_path: str, server_url: str, sessio
             "preToolUse": [
                 {
                     "command": command,
-                    "timeout": 30,
+                    "timeout": _HOOK_APPROVAL_TIMEOUT_S,
                 }
             ]
         },
     }
     hooks_file.write_text(json.dumps(config, indent=2))
     return hooks_file
+
+
+_BRIDGE_SPAWN_CWD_LOCK: asyncio.Lock | None = None
+
+
+def _bridge_spawn_cwd_lock() -> asyncio.Lock:
+    """Process-global lock serialising the cwd change around a bridge spawn.
+
+    Created lazily so it binds to the running event loop.
+    """
+    global _BRIDGE_SPAWN_CWD_LOCK
+    if _BRIDGE_SPAWN_CWD_LOCK is None:
+        _BRIDGE_SPAWN_CWD_LOCK = asyncio.Lock()
+    return _BRIDGE_SPAWN_CWD_LOCK
+
+
+@contextlib.asynccontextmanager
+async def _bridge_spawn_in_cwd(cwd: str) -> AsyncIterator[None]:
+    """Set the process cwd to *cwd* across a cursor-sdk bridge launch.
+
+    ``AsyncClient.launch_bridge`` spawns the bridge subprocess without a
+    ``cwd=`` argument, so the bridge -- and the shell tools Cursor runs inside
+    it -- inherit the launching process's directory. ``--workspace`` only routes
+    indexing, not command execution, so a bridge started from the runner
+    daemon's directory would run ``pwd`` / git / relative paths there rather than
+    in the declared workspace. We chdir only across the spawn and restore
+    afterwards; a process-global lock serialises the window so an overlapping
+    launch can't observe a half-applied cwd.
+    """
+    async with _bridge_spawn_cwd_lock():
+        prev_cwd = os.getcwd()
+        os.chdir(cwd)
+        try:
+            yield
+        finally:
+            os.chdir(prev_cwd)
 
 
 @dataclass
@@ -452,6 +507,7 @@ class CursorExecutor(Executor):
         bundle_dir: Path | None = None,
         agent_name: str | None = None,
         skills_filter: str | list[str] = "all",
+        permission_mode: str = "auto",
     ) -> None:
         """Create a CursorExecutor.
 
@@ -460,12 +516,17 @@ class CursorExecutor(Executor):
         :param os_env: Optional OS environment / sandbox spec (its ``cwd`` is
             used when *cwd* is unset).
         :param model: Cursor model id (e.g. ``"gpt-5"``); a gateway-routed id
-            or ``None`` falls back to cursor's ``auto`` select.
+            or ``None`` falls back to cursor's ``auto-smart`` select. Legacy
+            ``"auto"`` is remapped to ``auto-smart``.
         :param api_key: Cursor API key. ``None`` falls back to ``CURSOR_API_KEY``
             in the environment.
         :param bundle_dir: Reserved for future skill wiring; unused in v1.
         :param agent_name: Optional agent name passed to the SDK.
         :param skills_filter: Accepted for parity; cursor has no skill mechanism here.
+        :param permission_mode: Omnigent permission stance. ``"auto"`` (default)
+            and ``"bypassPermissions"`` skip web-UI elicitation for native
+            tools (policy DENY still blocks). Any other value keeps the
+            interactive per-tool approval card.
         """
         self._cwd = cwd or (os_env.cwd if os_env is not None else None)
         self._os_env_spec = os_env
@@ -474,6 +535,7 @@ class CursorExecutor(Executor):
         self._bundle_dir = bundle_dir
         self._agent_name = agent_name
         self._skills_filter = skills_filter
+        self._permission_mode = permission_mode or "auto"
         self._session_states: dict[str, _CursorSessionState] = {}
         # Installed by the runtime adapter; routes a bridged-tool call back into
         # Omnigent's session (policy gating, sub-agent dispatch, logging).
@@ -520,49 +582,54 @@ class CursorExecutor(Executor):
     async def _evaluate_native_tool_policy(
         self, name: str, args: dict[str, Any]
     ) -> dict[str, Any]:
-        """Evaluate PHASE_TOOL_CALL policy for a Cursor native tool.
+        """Gate a Cursor native tool call via policy check + user elicitation.
 
         Returns ``{"block": bool, "reason": str}``.
 
-        ASK is treated as DENY (fail-closed) because Cursor native tools
-        execute inside the Cursor process — by the time we observe them the
-        tool has already started, so we cannot pause for human approval.
+        Two-stage gate that mirrors how :class:`claude_sdk_executor
+        <omnigent.inner.claude_sdk_executor.ClaudeSDKExecutor>` exposes
+        tool permission requests natively through ``ctx.elicit()``:
+
+        1. **Policy hard-deny**: if the policy evaluator returns
+           ``POLICY_ACTION_DENY``, block immediately without prompting the
+           user (the admin already decided).
+
+        2. **Native elicitation**: for interactive permission modes, invoke
+           ``_elicitation_handler`` so the user can review the call from the
+           web-UI approval card. Under ``auto`` / ``bypassPermissions``
+           (the default for headless / Polly workers) this step is skipped
+           so native tools don't stall on ApprovalCards — matching
+           claude-sdk's ``permission_mode: auto`` ergonomics.
+
+        Cursor native tools execute inside the Cursor process, so they have
+        already started by the time the executor observes
+        ``ToolCallRequest(status="running")``.  This gate therefore cannot
+        block individual tool executions; it can only cancel the remainder of
+        the turn on denial.
         """
+        # Stage 1 — hard policy deny: block immediately, no elicitation.
         evaluator = self._policy_evaluator
-        if evaluator is None:
+        if evaluator is not None:
+            verdict = await evaluator("PHASE_TOOL_CALL", {"name": name, "arguments": args})
+            if getattr(verdict, "action", None) == "POLICY_ACTION_DENY":
+                return {
+                    "block": True,
+                    "reason": getattr(verdict, "reason", "") or "blocked by policy",
+                }
+
+        # Stage 2 — native elicitation: skip under auto / bypass so headless
+        # Cursor SDK workers (and Polly dispatches) don't prompt per tool.
+        if self._permission_mode in ("auto", "bypassPermissions"):
             return {"block": False, "reason": ""}
-        verdict = await evaluator("PHASE_TOOL_CALL", {"name": name, "arguments": args})
-        action = getattr(verdict, "action", None)
-        if action == "POLICY_ACTION_DENY":
-            return {"block": True, "reason": getattr(verdict, "reason", "") or "blocked by policy"}
-        if action == "POLICY_ACTION_ASK":
-            reason = getattr(verdict, "reason", "") or "approval required by policy"
-            # Cursor native tools have already started by the time we see
-            # them, but we still surface the elicitation UI so the human
-            # can decide whether the *rest of the turn* should continue.
-            handler = self._elicitation_handler
-            if handler is not None:
-                logger.info(
-                    "TOOL_CALL policy ASK on native cursor tool %s; "
-                    "prompting user (tool already started): %s",
-                    name,
-                    reason,
-                )
-                approved = await handler(name, args)
-                if approved:
-                    return {"block": False, "reason": ""}
-                return {"block": True, "reason": reason}
-            # No handler → fail closed.
-            logger.warning(
-                "TOOL_CALL policy ASK on native cursor tool %s — no elicitation "
-                "handler; treating as DENY: %s",
-                name,
-                reason,
-            )
-            return {
-                "block": True,
-                "reason": f"approval required (auto-denied — no elicitation handler): {reason}",
-            }
+
+        handler = self._elicitation_handler
+        if handler is not None:
+            logger.info("surfacing elicitation for native cursor tool %s", name)
+            approved = await handler(name, args)
+            if approved:
+                return {"block": False, "reason": ""}
+            return {"block": True, "reason": "turn aborted via web-UI elicitation"}
+
         return {"block": False, "reason": ""}
 
     # -- custom-tool bridge -------------------------------------------------
@@ -656,9 +723,12 @@ class CursorExecutor(Executor):
         try:
             from cursor_sdk import AsyncAgent, AsyncClient, LocalAgentOptions
         except ImportError as exc:
+            from omnigent.onboarding.cursor_auth import CURSOR_EXTRA
+            from omnigent.onboarding.extra_install import extra_install_display
+
             raise ImportError(
                 "CursorExecutor requires the 'cursor-sdk' package. "
-                "Install it with: uv pip install cursor-sdk"
+                f"Install it with: {extra_install_display(CURSOR_EXTRA)}"
             ) from exc
 
         loop = asyncio.get_running_loop()
@@ -676,11 +746,22 @@ class CursorExecutor(Executor):
             hook_script = str(Path(__file__).with_name("cursor_policy_hook.py"))
             state.hooks_file = _write_cursor_hooks(cwd, hook_script, server_url, conv_id)
 
-        client = await AsyncClient.launch_bridge(workspace=cwd)
+        # Spawn the bridge with the process cwd pointing at the workspace so
+        # Cursor's shell tools execute there, not in the runner daemon's
+        # directory (the SDK spawns the bridge without a cwd=). See
+        # _bridge_spawn_in_cwd.
+        async with _bridge_spawn_in_cwd(cwd):
+            client = await AsyncClient.launch_bridge(workspace=cwd)
         try:
             local_kwargs: dict[str, Any] = {
                 "cwd": cwd,
                 "custom_tools": self._make_custom_tools(tools, loop) or None,
+                # Bypass cursor's own TUI approval prompts so native tool calls
+                # reach the executor's event stream and can be gated via the
+                # web-UI elicitation card (see _evaluate_native_tool_policy).
+                # Without this cursor may pause internally for its own approval
+                # before emitting a ToolCallRequest event.
+                "auto_review": True,
             }
             # Tell the SDK to read project-level settings (including hooks.json).
             if state.hooks_file is not None:
@@ -803,10 +884,16 @@ class CursorExecutor(Executor):
                         elif isinstance(event, ToolCallRequest):
                             tool_calls += 1
                             separate_next_text = True
-                            # Evaluate PHASE_TOOL_CALL for native tools.
-                            # Bridged tools are already gated by the
-                            # dispatch bridge — skip to avoid double eval.
-                            if not event.metadata.get("is_bridged") and policy_eval is not None:
+                            # Gate non-bridged (native) tool calls through
+                            # policy + elicitation.  Bridged tools are
+                            # already gated by the dispatch bridge.
+                            # Trigger when either the policy evaluator or
+                            # the elicitation handler is wired — the
+                            # latter alone (no server connection) still
+                            # surfaces an approval card natively.
+                            if not event.metadata.get("is_bridged") and (
+                                policy_eval is not None or self._elicitation_handler is not None
+                            ):
                                 gate = await self._evaluate_native_tool_policy(
                                     event.name, event.args if isinstance(event.args, dict) else {}
                                 )
@@ -817,7 +904,7 @@ class CursorExecutor(Executor):
                                         await run.cancel()
                                     yield event  # emit so observers see what was attempted
                                     reason = gate["reason"]
-                                    msg = f"Native tool {event.name!r} denied by policy: {reason}"
+                                    msg = f"Native tool {event.name!r} denied: {reason}"
                                     yield ExecutorError(message=msg)
                                     return
                         elif isinstance(event, ToolCallComplete):

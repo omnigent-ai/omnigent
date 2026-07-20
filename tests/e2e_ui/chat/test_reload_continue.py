@@ -13,21 +13,35 @@ import uuid
 import pytest
 from playwright.sync_api import Page, expect
 
+from tests.e2e_ui.conftest import configure_mock_llm
+
 _COMPOSER = "Ask the agent anything…"
 _ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
 _USER = '[data-testid="message-bubble"][data-role="user"]'
 _WORKING = '[data-testid="working-indicator"]'
 
+# Turn-2 prompt's stable substring — present only in turn 2, so the mock can
+# content-route it to the token-echo response.
+_REPEAT_PROMPT = "Repeat the token from my first message, exactly, and nothing else."
 
-# Back on nightly burn-in: flaked on its first PR-gate run (turn-2
-# reply paraphrased instead of echoing the token verbatim).
+
 @pytest.mark.nightly
 def test_reload_hydrates_history_and_continues(
     page: Page,
     seeded_session: tuple[str, str],
+    mock_llm_server_url: str,
 ) -> None:
     base_url, session_id = seeded_session
     token = f"ui-reload-{uuid.uuid4().hex[:8]}"
+
+    # Turn 1 (the only message carrying the token) replies "stored"; turn 2
+    # (the repeat prompt) replies with the token. Content-routing keys each
+    # queue to a substring unique to its turn, so both fire deterministically.
+    configure_mock_llm(mock_llm_server_url, [{"text": "stored"}], key="reload-store", match=token)
+    configure_mock_llm(
+        mock_llm_server_url, [{"text": token}], key="reload-echo", match=_REPEAT_PROMPT
+    )
+
     page.goto(f"{base_url}/c/{session_id}")
 
     composer = page.get_by_placeholder(_COMPOSER)
@@ -48,7 +62,7 @@ def test_reload_hydrates_history_and_continues(
 
     composer = page.get_by_placeholder(_COMPOSER)
     expect(composer).to_be_visible()
-    composer.fill("Repeat the token from my first message, exactly, and nothing else.")
+    composer.fill(_REPEAT_PROMPT)
     page.get_by_role("button", name="Send", exact=True).click()
 
     # Turn 2 rendered (2 user bubbles) and produced a second assistant

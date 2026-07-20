@@ -1,0 +1,5 @@
+{
+    "exit_code": {"kind": "exact", "value": 0},
+    "overview_session_header_present": {"kind": "exact", "value": true},
+    "overview_footer_hint_present": {"kind": "exact", "value": true}
+}

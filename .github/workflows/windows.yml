@@ -1,0 +1,72 @@
+name: Windows (native)
+
+# Smoke + unit check that omnigent imports, the CLI loads, and the
+# cross-platform process/sandbox primitives work on native Windows. This is a
+# NON-BLOCKING signal while native Windows support stabilizes: it is not wired
+# into merge-ready.yml, and the broader unit sweep runs with continue-on-error
+# so POSIX-only gaps don't gate merges. The hard checks (import, --help, the
+# Windows-support unit tests) must pass.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths-ignore: ['web/**', 'tests/e2e_ui/**']
+  push:
+    branches:
+      - main
+    paths-ignore: ['web/**', 'tests/e2e_ui/**']
+
+permissions:
+  contents: read
+
+env:
+  # No web SPA build during `uv sync`; this job never serves the bundle.
+  OMNIGENT_SKIP_WEB_UI: "true"
+  UV_INDEX_URL: https://pypi.org/simple
+  PIP_INDEX_URL: https://pypi.org/simple
+
+concurrency:
+  group: windows-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  windows-smoke:
+    name: Windows smoke + unit
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version-file: ".python-version"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v3
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --locked --extra dev
+
+      - name: Import + CLI smoke
+        run: |
+          uv run python -c "import omnigent; print('import omnigent OK')"
+          uv run omnigent --help
+
+      - name: Windows-support unit tests (hard)
+        run: >-
+          uv run pytest
+          tests/inner/test_proc_and_platform.py
+          tests/runtime/test_process_manager.py
+          -p no:cacheprovider -q
+
+      - name: Broader unit sweep (non-blocking)
+        continue-on-error: true
+        run: >-
+          uv run pytest tests/inner tests/runtime/harnesses
+          -m "not posix_only"
+          -p no:cacheprovider -q

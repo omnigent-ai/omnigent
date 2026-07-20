@@ -58,8 +58,9 @@ class _FakeOp:
 
 
 class _FakeProcess:
-    def __init__(self, result: _FakeResult) -> None:
+    def __init__(self, result: _FakeResult, *, wait_raises: BaseException | None = None) -> None:
         self._result = result
+        self._wait_raises = wait_raises
         self.cancelled = False
 
     @property
@@ -70,6 +71,8 @@ class _FakeProcess:
         return self._result
 
     def wait(self, timeout: float | None = None) -> int:
+        if self._wait_raises is not None:
+            raise self._wait_raises
         return self._result.returncode
 
     def cancel(self) -> bool:
@@ -87,6 +90,10 @@ class _State:
     stopped: list[str] = field(default_factory=list)
     exec_result: _FakeResult = field(default_factory=_FakeResult)
     from_id_missing: bool = False
+    # Each exec() call's command (list argv), in order.
+    exec_commands: list[list] = field(default_factory=list)
+    # Processes handed back by successive exec() calls, in order.
+    exec_processes: list[_FakeProcess] = field(default_factory=list)
 
 
 class _FakeSandbox:
@@ -115,6 +122,9 @@ class _FakeSandbox:
         return self
 
     def exec(self, command, **kwargs) -> _FakeProcess:
+        self._state.exec_commands.append(list(command))
+        if self._state.exec_processes:
+            return self._state.exec_processes.pop(0)
         return _FakeProcess(self._state.exec_result)
 
     def write_file(self, path: str, data: bytes) -> _FakeOp:
@@ -209,3 +219,44 @@ def test_terminate_swallows_not_found(sdk: _State) -> None:
 def test_terminate_stops_existing(sdk: _State) -> None:
     CWSandboxLauncher().terminate("sb-1")
     assert sdk.stopped == ["sb-1"]
+
+
+# ── exec_foreground ─────────────────────────────────────────
+
+
+def test_exec_foreground_records_pid_and_streams_output(sdk: _State) -> None:
+    """The foreground command records its pid in a private mode-700 dir."""
+    sdk.exec_processes = [
+        _FakeProcess(_FakeResult(stdout="host-output\n", returncode=0)),
+        _FakeProcess(_FakeResult()),  # cleanup exec on normal exit
+    ]
+
+    returncode = CWSandboxLauncher().exec_foreground("sb-1", "omnigent host --server u")
+
+    assert returncode == 0
+    remote = sdk.exec_commands[0][-1]
+    # The pidfile lives in a private, unpredictably-named dir created mode 700
+    # (fails closed if it already exists) so /tmp can't be pre-seeded.
+    assert "mkdir -m 700 /tmp/oa-foreground-" in remote
+    assert "echo $$ > /tmp/oa-foreground-" in remote and "/pid" in remote
+    # `exec` keeps the recorded pid across the swap to the real command.
+    assert "exec omnigent host --server u" in remote
+    # A normal exit cleans up the run dir so it isn't orphaned in /tmp.
+    assert len(sdk.exec_commands) == 2
+    cleanup = sdk.exec_commands[1][-1]
+    assert cleanup.startswith("rm -rf /tmp/oa-foreground-")
+
+
+def test_exec_foreground_kills_remote_on_interrupt(sdk: _State) -> None:
+    """Ctrl-C kills the remote process (via the pidfile) and re-raises."""
+    sdk.exec_processes = [_FakeProcess(_FakeResult(), wait_raises=KeyboardInterrupt())]
+
+    with pytest.raises(KeyboardInterrupt):
+        CWSandboxLauncher().exec_foreground("sb-1", "omnigent host --server u")
+
+    # Second exec is the kill, addressed via the recorded pidfile. The pid is
+    # validated as numeric before being signalled, and the dir is cleaned up.
+    assert len(sdk.exec_commands) == 2
+    kill = sdk.exec_commands[1][-1]
+    assert 'case "$pid" in' in kill and 'kill "$pid"' in kill
+    assert "rm -rf /tmp/oa-foreground-" in kill

@@ -18,10 +18,98 @@ from omnigent.codex_native_app_server import (
     _POLICY_HOOK_TIMEOUT_SECONDS,
     CodexNativeAppServer,
     _codex_policy_hooks_settings,
+    _sync_codex_developer_instructions,
     build_codex_native_server,
     trust_native_policy_hooks,
 )
 from omnigent.codex_native_hook import _EVALUATE_POLICY_TIMEOUT_S
+from omnigent.inner.codex_executor import _populate_codex_home_config
+
+
+def test_sync_developer_instructions_preserves_and_restores_user_config(tmp_path: Path) -> None:
+    """Framework instructions append without replacing the user's Codex guidance."""
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    config_path = codex_home / "config.toml"
+    config_path.write_text(
+        'model = "gpt-5.5"\ndeveloper_instructions = "Keep user guidance."\n',
+        encoding="utf-8",
+    )
+
+    _sync_codex_developer_instructions(codex_home, "Rename the session.")
+    _sync_codex_developer_instructions(codex_home, "Rename the session.")
+
+    config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    assert config["model"] == "gpt-5.5"
+    assert config["developer_instructions"] == ("Keep user guidance.\n\nRename the session.")
+
+    _sync_codex_developer_instructions(codex_home, None)
+
+    resumed_config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    assert resumed_config["developer_instructions"] == "Keep user guidance."
+
+
+def test_sync_developer_instructions_survives_reseeded_config(tmp_path: Path) -> None:
+    """A persisted sidecar restores the original base after config reseeding."""
+    codex_home = tmp_path / "codex-home"
+    source_home = tmp_path / "source-home"
+    codex_home.mkdir()
+    source_home.mkdir()
+    config_path = codex_home / "config.toml"
+    config_path.write_text(
+        'developer_instructions = "Keep original guidance."\n',
+        encoding="utf-8",
+    )
+    (source_home / "config.toml").write_text(
+        'developer_instructions = "New shared guidance."\n',
+        encoding="utf-8",
+    )
+
+    _sync_codex_developer_instructions(codex_home, "Rename the session.")
+    config_path.unlink()
+    _populate_codex_home_config(codex_home, source_home)
+
+    reseeded = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    assert reseeded["developer_instructions"] == "New shared guidance."
+
+    _sync_codex_developer_instructions(codex_home, None)
+
+    resumed = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    assert resumed["developer_instructions"] == "Keep original guidance."
+
+
+def test_sync_developer_instructions_recovers_legacy_augmented_config(tmp_path: Path) -> None:
+    """A missing sidecar does not capture an existing framework suffix as user base."""
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    config_path = codex_home / "config.toml"
+    config_path.write_text(
+        'developer_instructions = "Keep user guidance.\\n\\nRename the session."\n',
+        encoding="utf-8",
+    )
+
+    _sync_codex_developer_instructions(codex_home, "Rename the session.")
+
+    active = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    assert active["developer_instructions"] == "Keep user guidance.\n\nRename the session."
+
+    _sync_codex_developer_instructions(codex_home, None)
+
+    resumed = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    assert resumed["developer_instructions"] == "Keep user guidance."
+
+
+def test_sync_developer_instructions_skips_invalid_config(tmp_path: Path) -> None:
+    """Optional title metadata never blocks Codex startup on malformed config."""
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    config_path = codex_home / "config.toml"
+    config_path.write_text("invalid = [", encoding="utf-8")
+
+    _sync_codex_developer_instructions(codex_home, "Rename the session.")
+
+    assert config_path.read_text(encoding="utf-8") == "invalid = ["
+
 
 _CWD = "/home/user/repo"
 _OUR_COMMAND = "/venv/bin/python -m omnigent.codex_native_hook evaluate-policy --bridge-dir /b"
@@ -157,7 +245,7 @@ def test_build_codex_native_server_profile_error_names_profile(
         lambda: sys.executable,
     )
     monkeypatch.setattr(
-        "omnigent.codex_native_app_server._read_databrickscfg",
+        "omnigent.codex_native_app_server._databricks_gateway_host",
         lambda _profile: None,
     )
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(tmp_path / "missing-databrickscfg"))
@@ -183,18 +271,13 @@ def test_build_codex_native_server_uses_profile_host_without_static_token(
     Native Codex accepts Databricks CLI OAuth profiles without static tokens.
 
     A default Omnigent install may not include ``databricks-sdk`` in the
-    runner process. In that case ``_read_databrickscfg`` cannot mint a bearer
-    at startup, but the profile's host is still enough: Codex gets an
-    ``auth.command`` that runs ``databricks auth token --profile`` at request
-    time.
+    runner process. In that case a bearer cannot be minted at startup, but the
+    profile's host is still enough: Codex gets an ``auth.command`` that runs
+    ``databricks auth token --profile`` at request time.
     """
     monkeypatch.setattr(
         "omnigent.codex_native_app_server._find_codex_cli",
         lambda: sys.executable,
-    )
-    monkeypatch.setattr(
-        "omnigent.codex_native_app_server._read_databrickscfg",
-        lambda _profile: None,
     )
     cfg_path = tmp_path / "databrickscfg"
     cfg_path.write_text(
@@ -224,6 +307,75 @@ def test_build_codex_native_server_uses_profile_host_without_static_token(
     overrides = "\n".join(app_server.config_overrides)
     assert "https://example.cloud.databricks.com/ai-gateway/codex/v1" in overrides
     assert 'databricks auth token --profile \\"oss\\"' in overrides
+
+
+def test_build_codex_native_server_without_bypass_emits_no_bypass_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The default (``bypass_sandbox=False``) writes no approval/sandbox overrides.
+
+    Guards the safe default: an app-server built without the opt-in must
+    leave Codex's normal approval-prompt + own-sandbox stance untouched, so
+    no ``approval_policy`` / ``sandbox_mode`` override leaks in. A regression
+    that always emitted them would silently disable the sandbox for every
+    native Codex session.
+    """
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server._find_codex_cli",
+        lambda: sys.executable,
+    )
+    app_server = build_codex_native_server(
+        socket_path=tmp_path / "codex.sock",
+        codex_home=tmp_path / "codex-home",
+        cwd=tmp_path,
+        model=None,
+        profile=None,
+        bridge_dir=tmp_path / "bridge",
+        ap_server_url=None,
+        ap_auth_headers={},
+    )
+
+    overrides = "\n".join(app_server.config_overrides)
+    assert "approval_policy" not in overrides
+    assert "sandbox_mode" not in overrides
+
+
+def test_build_codex_native_server_bypass_emits_full_access_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``bypass_sandbox=True`` puts the app-server threads into the bypass stance.
+
+    The ``--remote`` TUI launched with
+    ``--dangerously-bypass-approvals-and-sandbox`` fixes the thread's
+    approval/sandbox stance, but the chat/forwarder seam drives the SAME
+    thread through the app-server, so the app-server config must match —
+    ``approval_policy="never"`` (no prompts a headless seam can't answer)
+    and ``sandbox_mode="danger-full-access"`` (commands run with no command
+    sandbox, the #657 ask). Without these the app-server-driven turns would
+    keep prompting / keep the sandbox even though the TUI bypassed it.
+    """
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server._find_codex_cli",
+        lambda: sys.executable,
+    )
+    app_server = build_codex_native_server(
+        socket_path=tmp_path / "codex.sock",
+        codex_home=tmp_path / "codex-home",
+        cwd=tmp_path,
+        model=None,
+        profile=None,
+        bridge_dir=tmp_path / "bridge",
+        ap_server_url=None,
+        ap_auth_headers={},
+        bypass_sandbox=True,
+    )
+
+    assert 'approval_policy="never"' in app_server.config_overrides
+    assert 'sandbox_mode="danger-full-access"' in app_server.config_overrides
 
 
 def _test_app_server(
@@ -277,6 +429,9 @@ args = ["old"]
 [mcp_servers.omnigent.env] # stale generated env
 OLD = "1"
 
+[mcp_servers.omnigent.tools.sys_session_rename] # stale generated approval
+approval_mode = "prompt"
+
 [mcp_servers.other]
 command = "other"
 args = []
@@ -314,6 +469,9 @@ args = []
             "--bridge-dir",
             str(bridge_dir),
         ],
+        "tools": {
+            "sys_session_rename": {"approval_mode": "approve"},
+        },
     }
 
 
@@ -353,6 +511,9 @@ async def test_start_writes_fresh_mcp_config_without_leading_blanks(
             "--bridge-dir",
             str(bridge_dir),
         ],
+        "tools": {
+            "sys_session_rename": {"approval_mode": "approve"},
+        },
     }
 
 

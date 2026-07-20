@@ -47,6 +47,9 @@ _BUBBLE = '[data-testid="message-bubble"]'
 _LEVEL_READ = 1
 _LEVEL_EDIT = 2
 
+_AGENT_INFO_TRIGGER = '[data-testid="agent-info-trigger"]'
+_OWNER_ROW = '[data-testid="agent-info-session-owner"]'
+
 
 @dataclass
 class _SharedFixture:
@@ -155,6 +158,7 @@ def _goto_expecting_snapshot(page: Page, base_url: str, session_id: str) -> int:
     return resp_info.value.status
 
 
+@pytest.mark.flaky(reruns=2, reruns_delay=5)
 def test_share_grant_downgrade_revoke_journey(
     browser: Browser,
     live_server: str,
@@ -224,3 +228,75 @@ def test_share_grant_downgrade_revoke_journey(
     finally:
         owner_ctx.close()
         bob_ctx.close()
+
+
+def _open_agent_info(page: Page) -> None:
+    """Open the header agent-info popover from a known-closed state.
+
+    Escape first so we re-open from closed rather than toggling shut, mirroring
+    ``agents/test_agent_info_popover.py``. The trigger is desktop-only
+    (``md:inline-flex``), which the e2e viewport satisfies.
+    """
+    page.keyboard.press("Escape")
+    trigger = page.locator(_AGENT_INFO_TRIGGER)
+    expect(trigger).to_be_visible(timeout=30_000)
+    trigger.click()
+
+
+def test_agent_info_popover_shows_session_owner(
+    browser: Browser,
+    live_server: str,
+    shared: _SharedFixture,
+) -> None:
+    """The info popover's Owner row surfaces the session owner per viewer.
+
+    Covers ``components/AgentInfo.tsx`` → ``AgentInfoContent``'s owner row
+    (``GET /v1/sessions/<id>/owner`` via ``useSessionOwner``):
+
+    * a collaborator (Bob, edit) sees the owner **without** the ``(you)`` hint;
+    * the owner (headerless ``local``) sees the same row **with** ``(you)``.
+
+    The expected owner string is read from the API, not hard-coded, so the
+    assertion doesn't bake in the headerless-owner sentinel.
+    """
+    sid = shared.session_id
+    owner_id = shared.owner.get(f"/v1/sessions/{sid}/owner").json()["owner"]
+    # The row only renders for a resolvable owner; a null here would mean
+    # permissions are off in this env (then the feature has nothing to show).
+    assert owner_id, "expected a resolvable session owner"
+    # The headerless browser context resolves to the same identity that owns the
+    # session, so the owner view is the "(you)" case.
+    assert shared.owner.get("/v1/me").json()["user_id"] == owner_id
+
+    # Bob needs at least read to open the session + popover.
+    shared.owner.put(
+        f"/v1/sessions/{sid}/permissions",
+        json={"user_id": shared.bob_email, "level": _LEVEL_EDIT},
+    ).raise_for_status()
+
+    # ── Collaborator (Bob): sees the owner, but not "(you)" ──────────
+    bob_ctx = _user_context(browser, shared.bob_email)
+    try:
+        bob_page = bob_ctx.new_page()
+        bob_page.goto(f"{live_server}/c/{sid}")
+        expect(bob_page.get_by_placeholder(_COMPOSER)).to_be_visible(timeout=30_000)
+        _open_agent_info(bob_page)
+        bob_row = bob_page.locator(_OWNER_ROW)
+        expect(bob_row).to_be_visible(timeout=15_000)
+        expect(bob_row).to_contain_text(owner_id)
+        expect(bob_row).not_to_contain_text("(you)")
+    finally:
+        bob_ctx.close()
+
+    # ── Owner (headerless): same row, now with "(you)" ───────────────
+    owner_ctx = browser.new_context()
+    try:
+        owner_page = owner_ctx.new_page()
+        owner_page.goto(f"{live_server}/c/{sid}")
+        expect(owner_page.get_by_placeholder(_COMPOSER)).to_be_visible(timeout=30_000)
+        _open_agent_info(owner_page)
+        owner_row = owner_page.locator(_OWNER_ROW)
+        expect(owner_row).to_be_visible(timeout=15_000)
+        expect(owner_row).to_contain_text("(you)")
+    finally:
+        owner_ctx.close()

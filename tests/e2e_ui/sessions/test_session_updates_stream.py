@@ -21,7 +21,7 @@ of that claim against a real server + real browser:
   regression that restored ``refetchInterval: 4000`` would light it up.
 
 Selectors: the sidebar renders each session as ``<a href="/c/{id}">``
-whose text is the session title (``ap-web/src/shell/Sidebar.tsx`` — the
+whose text is the session title (``web/src/shell/Sidebar.tsx`` — the
 ``Link to={`/c/${conversation.id}`}`` row). The default pytest-playwright
 viewport (1280×720) is desktop, so the sidebar is shown without a toggle.
 """

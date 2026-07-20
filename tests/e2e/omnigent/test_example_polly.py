@@ -3,10 +3,11 @@
 polly is the standalone multi-agent coding orchestrator (successor to the
 deleted nessie example, whose deep structural pins were folded in here).
 Loads the bundle and asserts the distinctive wiring stays intact: the
-claude-sdk orchestrator brain, the three cross-vendor coding sub-agents
-(claude_code / codex / pi, which implement, review, and explore), the three
-spine skills, and the bounds/blast-radius guardrails. Pure spec-load — no
-LLM, no credentials.
+claude-sdk orchestrator brain, the six cross-vendor coding sub-agents
+(claude_code / codex / opencode / cursor / hermes / pi, which implement, review,
+and explore),
+the three spine skills, and the bounds/blast-radius guardrails. Pure spec-load
+— no LLM, no credentials.
 
 What breaks if this fails:
 - the orchestrator substrate drifts (model / harness / context window),
@@ -68,24 +69,41 @@ def test_orchestrator_executor(polly_spec: AgentSpec) -> None:
 
 def test_coding_subagents(polly_spec: AgentSpec) -> None:
     """
-    The bundle has exactly three coding sub-agents: ``claude_code`` (Claude
-    Code, claude-native) and ``codex`` (Codex, codex-native) on the native
-    terminal harnesses, plus ``pi`` (Pi, pi) as the headless multi-model
-    third worker. All implement, review, and explore. The native harnesses
-    make claude_code / codex render terminal-first (Chat / Terminal pill) so
-    the human can watch or take over.
+    The bundle has exactly six coding sub-agents: ``claude_code`` (claude-native),
+    ``codex`` (codex-native), ``opencode`` (opencode-native), ``cursor``
+    (cursor-native), and ``hermes`` (hermes-native) on the native terminal
+    harnesses, plus ``pi`` (pi) as the headless multi-model worker. All
+    implement, review, and explore. The native harnesses render terminal-first
+    (Chat / Terminal pill) so the human can watch or take over.
 
-    A missing/renamed agent means no implementers, and same-vendor harnesses
+    A missing/renamed agent means fewer implementers, and same-vendor harnesses
     would break cross-vendor review — polly's differentiator.
     """
     fam = {a.name: a.executor.config.get("harness") for a in polly_spec.sub_agents}
-    assert sorted(polly_spec.tools.agents) == ["claude_code", "codex", "pi"]
+    assert sorted(polly_spec.tools.agents) == [
+        "claude_code",
+        "codex",
+        "cursor",
+        "hermes",
+        "opencode",
+        "pi",
+    ]
     assert fam["claude_code"] == "claude-native"
     assert fam["codex"] == "codex-native"
+    assert fam["opencode"] == "opencode-native"
+    assert fam["cursor"] == "cursor-native"
+    assert fam["hermes"] == "hermes-native"
     assert fam["pi"] == "pi"
-    # Three distinct vendors → any diff is always reviewable by another.
-    assert len(set(fam.values())) == 3
-    for name in ("claude_code", "codex", "pi"):
+    # Six distinct vendors → any implementer's diff is reviewable by another.
+    assert len(set(fam.values())) == 6
+    # Headless bypass knobs so workers don't stall on ApprovalCards.
+    by_name = {a.name: a for a in polly_spec.sub_agents}
+    assert by_name["claude_code"].executor.config.get("permission_mode") == "auto"
+    assert by_name["claude_code"].executor.model is None
+    assert by_name["codex"].executor.config.get("yolo") in (True, "True", "true")
+    assert by_name["cursor"].executor.config.get("yolo") in (True, "True", "true")
+    assert by_name["cursor"].executor.model == "grok-4.5"
+    for name in ("claude_code", "codex", "opencode", "cursor", "hermes", "pi"):
         prompt = (_POLLY_BUNDLE / "agents" / name / "config.yaml").read_text(encoding="utf-8")
         assert "IMPLEMENT — write real product code" in prompt
         assert "REVIEW — verify another agent's diff" in prompt
@@ -190,6 +208,43 @@ def test_orchestrator_keeps_timer_tool_but_forbids_worker_polling(
     assert "not for polling workers that already auto-wake you" in compact
 
 
+def test_polly_test_count_ground_truth_guidance() -> None:
+    """
+    Polly prevents pytest count reconciliation from using source-function counts.
+
+    Regression guard for #949: a prior orchestration handoff compared a worker's
+    multi-file pytest total against ``grep -c 'def test_'`` from a single file,
+    which misses parametrized case expansion and falsely labels accurate reports
+    as over-counts. The contract must be present at the orchestrator layer, the
+    cross-review workflow, while workers supply enough exact test context for
+    Polly to verify the same gate.
+    """
+    config = (_POLLY_BUNDLE / "config.yaml").read_text(encoding="utf-8")
+    cross_review = (_POLLY_BUNDLE / "skills" / "cross-review" / "SKILL.md").read_text(
+        encoding="utf-8"
+    )
+
+    config_compact = " ".join(config.split())
+    cross_review_compact = " ".join(cross_review.split())
+    for text in (config_compact, cross_review_compact):
+        assert "python -m pytest --collect-only -q <same files>" in text
+        assert "grep -c 'def test_'" in text
+        assert "collected cases" in text
+        assert "parametrized" in text
+
+    assert "same command, same file set, and same commit" in config_compact
+    assert "miscount`, `over-report`, or `fabrication`" in config_compact
+    assert "exact file set/command/commit" in cross_review_compact
+
+    for name in ("claude_code", "codex", "opencode", "cursor", "hermes", "pi"):
+        worker = (_POLLY_BUNDLE / "agents" / name / "config.yaml").read_text(encoding="utf-8")
+        worker_compact = " ".join(worker.split())
+        assert "When you report test results, include the exact command and file set" in (
+            worker_compact
+        ), name
+        assert "distinguish collected test cases from test functions" in worker_compact, name
+
+
 def test_orchestrator_forbids_premature_idle_after_announcing_intent() -> None:
     """
     The base prompt forbids ending a turn after only announcing intent.
@@ -284,8 +339,9 @@ def test_investigation_skill_delegates_read_only_work() -> None:
 
     assert "Use for any read-only task: investigation, debugging, audit" in compact
     assert (
-        "Dispatch each task to `claude_code`, `codex`, or `pi`: "
-        '`sys_session_send(agent="claude_code"|"codex"|"pi", title="explore-<task_slug>", '
+        "Dispatch each task to `claude_code`, `codex`, `opencode`, `cursor`, `hermes`, or `pi`: "
+        '`sys_session_send(agent="claude_code"|"codex"|"opencode"|"cursor"|"hermes"|"pi", '
+        'title="explore-<task_slug>", '
         'args={purpose: "explore", input: "<question + exact scope + evidence requested>"})`'
     ) in compact
     # The audited skill (#3074) made task-based titles mandatory at dispatch.
@@ -355,7 +411,7 @@ def test_orchestrator_guardrails(polly_spec: AgentSpec) -> None:
 def test_subagent_guardrails(polly_spec: AgentSpec) -> None:
     """Each sub-agent carries the blast_radius gate (push/destructive)."""
     by_name = {a.name: a for a in polly_spec.sub_agents}
-    for name in ("claude_code", "codex", "pi"):
+    for name in ("claude_code", "codex", "opencode", "cursor", "hermes", "pi"):
         guardrails = by_name[name].guardrails
         assert guardrails is not None, name
         assert [p.name for p in guardrails.policies] == ["blast_radius"], name
@@ -388,6 +444,6 @@ def test_function_policies_have_nonempty_arguments(polly_spec: AgentSpec) -> Non
             )
             checked += 1
     # orchestrator: blast_radius + spawn_bounds + headless_subagent_purpose_guard
-    # = 3; sub-agents: blast_radius x3 (claude_code, codex, pi) = 3 -> 6 total.
-    # Fewer = a policy dropped.
-    assert checked == 6, f"expected 6 function policies in the bundle, inspected {checked}"
+    # = 3; sub-agents: blast_radius x6 (claude_code, codex, opencode, cursor,
+    # hermes, pi) = 6 -> 9 total. Fewer = a policy dropped.
+    assert checked == 9, f"expected 9 function policies in the bundle, inspected {checked}"

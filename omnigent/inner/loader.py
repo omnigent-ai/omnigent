@@ -252,6 +252,7 @@ def _parse_agent_def(
     agent.runtime = data.get("runtime", False)
     agent.timers = data.get("timers", False)
     agent.spawn = data.get("spawn", False)
+    agent.agent_session_sharing = data.get("agent_session_sharing", "none")
     agent.os_env = _parse_os_env_spec(data.get("os_env"))
 
     # Executor
@@ -297,14 +298,10 @@ def _parse_agent_def(
     # Label schema
     from .datamodel import LabelSchemaRule
 
-    _MONOTONIC_ALIASES = {"up": "max", "down": "min"}
     for ls_name, ls_data in data.get("label_schema", {}).items():
         if isinstance(ls_data, dict):
-            raw_monotonic = str(ls_data.get("monotonic", "none"))
-            monotonic = _MONOTONIC_ALIASES.get(raw_monotonic, raw_monotonic)
             agent.label_schema[str(ls_name)] = LabelSchemaRule(
                 values=[str(v) for v in ls_data.get("values", [])],
-                monotonic=monotonic,
             )
 
     # Policy transparency
@@ -623,10 +620,23 @@ def _parse_executor_spec(data: YamlData | str | bool | None) -> ExecutorSpec | N
         # missing keys map to ``None`` directly. ``data.get`` happens to
         # already return ``None`` for missing keys, so the assignment
         # flows through unchanged.
+        #
+        # Parse ``executor.auth`` into a typed auth dataclass so that
+        # inline AgentTool sub-agents can declare auth (e.g. api_key +
+        # base_url for mock LLM routing) and have it flow through to the
+        # child spec's executor. Without this, auth blocks on inline
+        # sub-agent executors are silently dropped.
+        auth = None
+        raw_auth = data.get("auth")
+        if isinstance(raw_auth, dict):
+            from omnigent.spec.parser import _parse_executor_auth
+
+            auth = _parse_executor_auth(data, expand_env=True)
         return ExecutorSpec(
             model=data.get("model"),
             harness=data.get("harness"),
             profile=data.get("profile"),
+            auth=auth,
         )
     return None
 

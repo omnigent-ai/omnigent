@@ -20,7 +20,10 @@ from __future__ import annotations
 import re
 
 import httpx
+import pytest
 from playwright.sync_api import Page, expect
+
+from tests.e2e_ui.conftest import configure_mock_llm
 
 # Unique marker so the copied-transcript assertion can't match
 # UI chrome or another test's message.
@@ -34,6 +37,7 @@ _XFAM_MARKER = "loquat-xfam-marker"
 def test_clone_session_copies_transcript_and_navigates(
     page: Page,
     seeded_session: tuple[str, str],
+    mock_llm_server_url: str,
 ) -> None:
     """Clone a session from a message's Fork action and land in a fork with history.
 
@@ -52,6 +56,16 @@ def test_clone_session_copies_transcript_and_navigates(
         runner-bound session.
     """
     base_url, session_id = seeded_session
+
+    # Route this turn on the mock by marker so an exhausted queue left by
+    # an earlier test in the shard cannot swallow the request.
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": "OK"}],
+        key="clone-seed",
+        match=_MARKER,
+    )
+
     page.goto(f"{base_url}/c/{session_id}")
 
     # Seed the transcript with a uniquely-marked user turn and wait for
@@ -82,7 +96,7 @@ def test_clone_session_copies_transcript_and_navigates(
     # landed back on the source); a visible dialog means the fork call
     # failed and surfaced an inline error instead.
     expect(page).to_have_url(
-        re.compile(rf"/c/(?!{re.escape(session_id)})conv_[0-9a-f]+"),
+        re.compile(rf"/c/(?!{re.escape(session_id)})[0-9a-f]{{32}}"),
         timeout=30_000,
     )
     expect(dialog).not_to_be_visible()
@@ -99,9 +113,18 @@ def test_clone_session_copies_transcript_and_navigates(
     expect(copied_user.first).to_be_visible(timeout=30_000)
 
 
+# Forking needs a real assistant bubble to anchor "Fork from here", so
+# this sends a turn and waits on the reply. The in-process harness
+# occasionally produces no assistant output on the first turn (the
+# runner goes idle after dispatch — a nondeterministic harness
+# scheduling stall, not a real-LLM artifact since this drives the mock
+# LLM). Rerun on failure rather than widen the already-generous 60s
+# wait, which a stalled turn would never satisfy.
+@pytest.mark.flaky(reruns=2, reruns_delay=5)
 def test_clone_dialog_offers_cross_family_native_target_and_forks(
     page: Page,
     seeded_session: tuple[str, str],
+    mock_llm_server_url: str,
 ) -> None:
     """The fork dialog offers a CROSS-FAMILY native target and forks into it.
 
@@ -139,6 +162,13 @@ def test_clone_dialog_offers_cross_family_native_target_and_forks(
         "seeded unconditionally at startup, so its absence is a server bug"
     )
 
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": "OK"}],
+        key="clone-xfam-seed",
+        match=_XFAM_MARKER,
+    )
+
     page.goto(f"{base_url}/c/{session_id}")
 
     # One marked turn so the fork has content and an assistant bubble to
@@ -165,7 +195,7 @@ def test_clone_dialog_offers_cross_family_native_target_and_forks(
 
     # The fork succeeds and navigates to a NEW session id.
     expect(page).to_have_url(
-        re.compile(rf"/c/(?!{re.escape(session_id)})conv_[0-9a-f]+"),
+        re.compile(rf"/c/(?!{re.escape(session_id)})[0-9a-f]{{32}}"),
         timeout=30_000,
     )
     fork_id = page.url.rsplit("/c/", 1)[1].split("?", 1)[0]

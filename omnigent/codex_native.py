@@ -37,6 +37,7 @@ from omnigent.claude_native_bridge import url_component
 from omnigent.codex_native_app_server import (
     CodexAppServerClient,
     CodexNativeAppServer,
+    _find_codex_cli,
     build_codex_native_server,
     build_codex_remote_args,
     client_for_transport,
@@ -66,6 +67,7 @@ from omnigent.host.daemon_launch import (
     wait_for_host_online,
     wait_for_runner_online,
 )
+from omnigent.native_coding_agents import native_shell_terminal_spec
 from omnigent.native_terminal import (
     DAEMON_HOST_ONLINE_TIMEOUT_S as _DAEMON_HOST_ONLINE_TIMEOUT_S,
 )
@@ -105,6 +107,134 @@ _UNBOUND_RUNNER_MESSAGE_FRAGMENT = "not bound to a runner"
 # hex + hyphens keeps it safe to interpolate into a rollout filename and a
 # ``codex resume`` argument (no path separators / traversal).
 _CODEX_THREAD_ID_RE = re.compile(r"^[0-9a-fA-F-]+$")
+_CODEX_AUTH_UNAVAILABLE_BINARY_MISSING = "binary-missing"
+_CODEX_AUTH_UNAVAILABLE_NEEDS_AUTH = "needs-auth"
+
+
+@dataclass(frozen=True)
+class _CodexAuthSource:
+    """Resolved source for Codex authentication material."""
+
+    auth_path: Path
+
+
+def _resolve_codex_auth_source() -> _CodexAuthSource:
+    """
+    Resolve the local Codex auth source used for availability checks.
+
+    This is the seam for future managed credentials: once Omnigent can provide
+    centrally managed Codex credentials, this resolver can return that source
+    instead. For now it deliberately defaults to Codex's local ``auth.json`` via
+    the same ``CODEX_HOME`` source resolver used when launching native Codex, so
+    inherited private Omnigent homes map back to the user's real Codex home.
+
+    :returns: Local Codex auth source to inspect synchronously.
+    """
+    from omnigent.inner.codex_executor import _codex_home_config_source_from_env
+
+    return _CodexAuthSource(auth_path=_codex_home_config_source_from_env() / "auth.json")
+
+
+def _codex_auth_json_has_available_credential(auth_path: Path) -> bool:
+    """Return whether ``auth.json`` parses and carries a usable credential.
+
+    Presence-based by design. A real Codex ``auth.json`` (see the openai/codex
+    ``AuthDotJson`` shape) is one of:
+
+    * **API-key** auth — a top-level ``OPENAI_API_KEY`` (or a
+      ``personal_access_token`` from ``codex login --with-access-token``).
+    * **ChatGPT / OAuth** auth — a ``tokens`` object holding ``access_token`` /
+      ``refresh_token`` (and an ``id_token``).
+
+    There is intentionally **no expiry judgement**. Codex stores no top-level
+    expiry field; ChatGPT-mode access tokens are short-lived JWTs that Codex
+    silently refreshes via the long-lived ``refresh_token`` (recorded in
+    ``last_refresh``), so an "expired" ``access_token`` is the normal
+    between-refresh state, not a deauth. Whether the ``refresh_token`` itself is
+    still valid is server-side and opaque, so this local-only, side-effect-free
+    check only asks whether a credential is *configured* — not whether it would
+    authenticate. A revoked/truly-expired session can therefore still surface as
+    available and fail at run time; catching that needs a network probe, which
+    is out of scope here.
+
+    :param auth_path: Path to the Codex ``auth.json``.
+    :returns: ``True`` when the file parses and contains a credential field;
+        ``False`` when it is missing, malformed, or carries no credential.
+    """
+    try:
+        raw = auth_path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(data, dict):
+        return False
+
+    for key in ("OPENAI_API_KEY", "personal_access_token"):
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            return True
+    tokens = data.get("tokens")
+    if isinstance(tokens, dict):
+        for field in ("access_token", "refresh_token"):
+            value = tokens.get(field)
+            if isinstance(value, str) and value.strip():
+                return True
+    return False
+
+
+def _codex_auth_unavailable_reason() -> str | None:
+    """
+    Return why local Codex is unavailable, or ``None`` when available.
+
+    Readiness must ask the same question the launch resolver answers, not read a
+    credential file the launch ignores. :func:`resolve_native_codex_launch`
+    routes a Databricks-gateway / provider-configured setup through a Databricks
+    profile or a ``model_provider`` override and mints its bearer at run time
+    (``databricks auth token`` / a provider auth command) — it never reads
+    ``auth.json``. So on such a host ``auth.json`` is legitimately empty, and
+    gating on it is a false negative (the launch works). Only when the launch
+    defers to Codex's *own* login is ``auth.json`` the credential that decides
+    availability, so that is the only case gated on it. This mirrors the
+    fail-open the ``claude-sdk`` / ``openai-agents`` gateway harnesses already
+    rely on: their gateway token is a runtime mint the daemon can't observe.
+
+    The check stays synchronous, side-effect free, and local: it resolves the
+    launch (local config reads) and, only on the defer-to-login path, inspects
+    the local auth source. It never runs ``codex login``, a status command, or a
+    network probe; any resolver failure fails safe onto the ``auth.json`` check.
+
+    :returns: ``"binary-missing"`` when the CLI is absent, ``"needs-auth"``
+        when the launch would defer to Codex's own login but ``auth.json`` is
+        missing, malformed, or carries no credential, and ``None`` when a
+        provider will route the launch or a login credential is configured.
+        Token *validity* (revoked/expired refresh, an unreachable gateway) is
+        not judged locally — it surfaces at the first turn via the executor.
+    """
+    if _find_codex_cli() is None:
+        return _CODEX_AUTH_UNAVAILABLE_BINARY_MISSING
+    # ponytail: resolve_native_codex_launch runs once per codex spelling
+    # (codex / codex-native / native-codex → 3×) per hello frame; on a host with
+    # NO configured provider it also runs ambient detection (a localhost ollama
+    # probe + a `claude auth status` subprocess). It's off the event loop and
+    # only bites unconfigured hosts — memoize the launch across the map build in
+    # configured_harness_map if that cost ever shows up.
+    try:
+        launch = resolve_native_codex_launch(model=None)
+        routes_through_provider = (
+            launch.profile is not None or codex_session_meta_model_provider(launch) != "openai"
+        )
+    except Exception:  # noqa: BLE001 - readiness must never raise; fail onto auth.json.
+        _logger.debug("codex readiness: launch resolve failed; using auth.json", exc_info=True)
+        routes_through_provider = False
+    if routes_through_provider:
+        return None
+    source = _resolve_codex_auth_source()
+    if not _codex_auth_json_has_available_credential(source.auth_path):
+        return _CODEX_AUTH_UNAVAILABLE_NEEDS_AUTH
+    return None
 
 
 def _update_startup_progress(
@@ -398,21 +528,11 @@ def _materialize_codex_agent_spec(
         },
         # Declare a default shell terminal so the relay advertises the
         # ``sys_terminal_*`` family to the wrapped codex (the relay's
-        # gate is a non-empty ``terminals:`` block on this spec).
-        # Caller process / no sandbox matches the ``os_env`` stance
-        # above — the native CLI already runs unsandboxed on the
-        # user's workspace.
-        "terminals": {
-            "shell": {
-                "command": "bash",
-                "allow_cwd_override": True,
-                "os_env": {
-                    "type": "caller_process",
-                    "cwd": ".",
-                    "sandbox": {"type": "none"},
-                },
-            },
-        },
+        # gate is a non-empty ``terminals:`` block on this spec). Its
+        # command follows the user's ``$SHELL`` (zsh/fish/bash); caller
+        # process / no sandbox matches the ``os_env`` stance above — the
+        # native CLI already runs unsandboxed on the user's workspace.
+        "terminals": native_shell_terminal_spec(),
     }
     yaml_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
     return yaml_path
@@ -1811,6 +1931,30 @@ def _codex_rollout_records_from_session_items(
     interrupted_response_ids = _interrupted_response_ids_from_session_items(items)
     for index, item in enumerate(items):
         if _session_item_response_id(item) in interrupted_response_ids:
+            continue
+        # Compaction items carry the post-compaction context. Emit a
+        # Compacted rollout record and discard all prior records — the
+        # replacement_history replaces them.
+        if item.get("type") == "compaction":
+            compacted_msgs = item.get("compacted_messages")
+            if compacted_msgs:
+                compacted_record: dict[str, Any] = {
+                    "timestamp": timestamp,
+                    "type": "compacted",
+                    "payload": {
+                        "message": item.get("summary", ""),
+                        "replacement_history": compacted_msgs,
+                    },
+                }
+                w_id = item.get("window_id")
+                if w_id is not None:
+                    compacted_record["payload"]["window_id"] = w_id
+                # Replace all prior response_item records — the
+                # replacement_history is the new context baseline.
+                # Keep only session_meta and turn_context records.
+                records = [r for r in records if r.get("type") in ("session_meta",)]
+                records.append(compacted_record)
+                seen_turn_ids.clear()
             continue
         payload = _codex_response_item_from_session_item(item)
         if payload is None:

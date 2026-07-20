@@ -44,9 +44,6 @@ from pathlib import Path
 
 import pytest
 
-from tests._model_pools import resolve_model
-
-_MODEL = resolve_model("databricks-gpt-5-mini", key=__name__)
 _HARNESS = "openai-agents"
 _TIMEOUT_SEC = 30
 
@@ -82,8 +79,7 @@ _REJECTION_CASES: list[pytest.param] = []
 def test_run_omnigent_rejects_unsupported_yaml(
     omnigent_python: Path,
     omnigent_repo_root: Path,
-    omnigent_credentials_env: dict[str, str],
-    databricks_workspace: tuple[str, str],
+    mock_credentials_env: dict[str, str],
     yaml_rel: str,
     expected_error: str,
 ) -> None:
@@ -121,7 +117,7 @@ def test_run_omnigent_rejects_unsupported_yaml(
             # LLM roundtrip so the text doesn't matter.
             "hello",
         ],
-        env=omnigent_credentials_env,
+        env=mock_credentials_env,
         cwd=str(omnigent_repo_root),
         capture_output=True,
         text=True,

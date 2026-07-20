@@ -1,12 +1,12 @@
-"""E2E test — Session Resources API against a real ``omnigent server``.
+"""E2E test -- Session Resources API against ``omnigent server`` (mock LLM).
 
 Boots ``omnigent server --agent <yaml>`` as a subprocess and
-exercises every session-resource endpoint. No LLM calls are made —
+exercises every session-resource endpoint. No LLM calls are made --
 the test only needs the server to boot and register the agent.
 
-Run with no special flags:
-
-    pytest tests/e2e/omnigent/test_session_resources_e2e.py -v
+Migrated to mock LLM: uses ``mock_credentials_env`` so the server
+subprocess doesn't depend on real Databricks credentials in the
+environment.
 
 Design reference: ``designs/SESSION_RESOURCES_API_DESIGN.md``
 """
@@ -269,19 +269,28 @@ def _resolve_python() -> Path:
 # ── Test ─────────────────────────────────────────────────────────
 
 
-def test_session_resources_e2e(tmp_path: Path) -> None:
+def test_session_resources_e2e(
+    mock_credentials_env: dict[str, str],
+    omnigent_python: Path,
+    omnigent_repo_root: Path,
+    tmp_path: Path,
+) -> None:
     """Full session resources API round-trip against a real server.
 
-    No LLM credentials needed — the test only exercises the
-    resource API surface, not the agent execution path.
+    No LLM credentials needed -- the test only exercises the
+    resource API surface, not the agent execution path. Uses
+    ``mock_credentials_env`` so no real credentials leak through.
 
+    :param mock_credentials_env: Mock credentials env from conftest.
+    :param omnigent_python: Python interpreter fixture.
+    :param omnigent_repo_root: Repo root fixture.
     :param tmp_path: Pytest temp directory for the agent YAML
         and SQLite database.
     """
     from omnigent.runner.identity import token_bound_runner_id
 
-    python = _resolve_python()
-    repo_root = Path(__file__).resolve().parents[3]
+    python = omnigent_python
+    repo_root = omnigent_repo_root
     port = _find_free_port()
 
     agent_dir = tmp_path / "agent"
@@ -291,7 +300,7 @@ def test_session_resources_e2e(tmp_path: Path) -> None:
     db_path = tmp_path / "test.db"
     binding_token = secrets.token_urlsafe(32)
     runner_id = token_bound_runner_id(binding_token)
-    env = _clean_env()
+    env = dict(mock_credentials_env)
 
     with _omnigent_server(
         python=python,

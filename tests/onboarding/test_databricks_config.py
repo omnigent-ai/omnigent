@@ -6,9 +6,12 @@ import configparser
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from omnigent.onboarding.databricks_config import (
     databricks_sdk_installed,
     get_workspace_url_for_profile,
+    normalize_workspace_url,
 )
 
 _WORKSPACE_URL = "https://example.databricks.com"
@@ -124,3 +127,44 @@ def test_databricks_sdk_installed_true_in_dev_env() -> None:
     Databricks extra is missing even on installs that have it.
     """
     assert databricks_sdk_installed() is True
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        # The reported foot-gun: the URL copied from a browser address bar.
+        (
+            "https://my-ws.cloud.databricks.com/browse?o=1234567890",
+            "https://my-ws.cloud.databricks.com",
+        ),
+        # Path with no query.
+        (
+            "https://my-ws.cloud.databricks.com/explore/data",
+            "https://my-ws.cloud.databricks.com",
+        ),
+        # Fragment is dropped too.
+        (
+            "https://my-ws.cloud.databricks.com/#/setting/account",
+            "https://my-ws.cloud.databricks.com",
+        ),
+        # Surrounding whitespace is trimmed before parsing.
+        (
+            "  https://my-ws.cloud.databricks.com/browse  ",
+            "https://my-ws.cloud.databricks.com",
+        ),
+        # Pre-existing trailing-slash case still collapses.
+        ("https://my-ws.cloud.databricks.com/", "https://my-ws.cloud.databricks.com"),
+        # Already an origin — returned unchanged.
+        ("https://my-ws.cloud.databricks.com", "https://my-ws.cloud.databricks.com"),
+    ],
+)
+def test_normalize_workspace_url_reduces_to_origin(raw: str, expected: str) -> None:
+    """A pasted workspace URL is reduced to its bare ``scheme://host`` origin."""
+    assert normalize_workspace_url(raw) == expected
+
+
+def test_normalize_workspace_url_scheme_less_input_only_strips_trailing_slash() -> None:
+    """Without a scheme there is no netloc to isolate, so the result matches the
+    prior ``rstrip("/")`` behavior — the wizard pre-adds ``https://`` before
+    calling, so a scheme is present in practice."""
+    assert normalize_workspace_url("my-ws.cloud.databricks.com/") == "my-ws.cloud.databricks.com"
