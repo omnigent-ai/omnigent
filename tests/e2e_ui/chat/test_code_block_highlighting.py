@@ -83,9 +83,7 @@ def test_code_block_becomes_syntax_highlighted(
     token_spans = page.locator(_TOKEN_SPANS)
     expect(token_spans.first).to_be_visible(timeout=30_000)
     page.wait_for_function(
-        "() => document.querySelectorAll('"
-        + _TOKEN_SPANS.replace("'", "\\'")
-        + "').length > 1",
+        "() => document.querySelectorAll('" + _TOKEN_SPANS.replace("'", "\\'") + "').length > 1",
         timeout=30_000,
     )
 
