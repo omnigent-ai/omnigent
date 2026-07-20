@@ -631,3 +631,71 @@ async def test_runner_recovery_clears_persisted_disconnect_error_labels() -> Non
         sessions_module._runner_relay_tasks.clear()
         sessions_module._session_status_cache.pop(session_id, None)
         session_stream.close(session_id)
+
+
+@pytest.mark.asyncio
+async def test_relay_suppresses_disconnect_error_on_intentional_stop() -> None:
+    """
+    A user-initiated Stop drops the tunnel quietly, not as a failure.
+
+    Stopping a host-spawned session tears down its runner tunnel on
+    purpose, which makes the relay hit the same ``ConnectionError`` path a
+    genuine runner death takes. The Stop handler marks the session in
+    ``_intentional_stop_sessions`` first, so the relay must resolve to a
+    quiet ``idle`` (no ``runner_disconnected`` status, no persisted error
+    labels) rather than rendering "Error · runner_disconnected".
+    """
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+
+    sessions_module._runner_relay_tasks.clear()
+    gate = asyncio.Event()
+    fake_runner = _TunnelCloseRunnerClient(gate)
+    store = _RecordingLabelStore()
+    session_id = "b7c1e2d3f4a5968778695a4b3c2d1e0f"
+
+    collector = None
+    try:
+        # Simulate the Stop handler: mark the intentional teardown before
+        # the tunnel drops.
+        sessions_module._intentional_stop_sessions.add(session_id)
+
+        handle = await sessions_module._ensure_runner_relay_ready(
+            session_id,
+            "runner_intentional_stop",
+            fake_runner,  # type: ignore[arg-type]
+            conversation_store=store,  # type: ignore[arg-type]
+        )
+        assert handle is not None
+
+        collector = await start_session_stream_collector(session_id)
+        gate.set()
+        await asyncio.wait_for(handle.task, timeout=2.0)
+
+        # The relay publishes a quiet idle, never a runner_disconnected failure.
+        event = await asyncio.wait_for(collector.queue.get(), timeout=2.0)
+        assert event.get("type") == "session.status"
+        assert event.get("status") == "idle"
+        assert event.get("error") is None
+
+        # The marker is one-shot: consumed by the disconnect handler.
+        assert session_id not in sessions_module._intentional_stop_sessions
+
+        # No durable runner_disconnected label persists, so snapshots and
+        # child summaries stay clean.
+        persisted = store.labels.get(session_id)
+        assert persisted is not None
+        assert sessions_module._last_task_error_from_labels(persisted) is None
+    finally:
+        gate.set()
+        sessions_module._intentional_stop_sessions.discard(session_id)
+        if collector is not None:
+            await collector.stop()
+        handle = sessions_module._runner_relay_tasks.get(session_id)
+        if handle is not None and not handle.task.done():
+            handle.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(handle.task, timeout=1.0)
+        sessions_module._runner_relay_tasks.clear()
+        sessions_module._session_status_cache.pop(session_id, None)
+        session_stream.close(session_id)

@@ -1054,6 +1054,13 @@ def _prune_session_read_state(session_id: str) -> None:
 # turn's "running" status or on any terminal response.* event.
 _interrupt_fenced_sessions: set[str] = set()
 
+# Host-spawned sessions whose runner tunnel we are about to tear down on
+# purpose as part of a user-initiated Stop. The relay's disconnect handler
+# consults this so an intentional tunnel drop resolves to a quiet idle state
+# instead of a scary ``runner_disconnected`` failure. One-shot: the disconnect
+# handler discards it, so a later genuine disconnect still surfaces normally.
+_intentional_stop_sessions: set[str] = set()
+
 # Turn-terminal response lifecycle events: the relay flushes buffered
 # assistant text on each of these and resets its turn-scoped state.
 _TERMINAL_RESPONSE_EVENT_TYPES: frozenset[str] = frozenset(
@@ -10386,6 +10393,11 @@ async def _relay_runner_stream(
                     if session_id in _interrupt_fenced_sessions:
                         if evt_type == "session.status" and event.get("status") == "running":
                             _interrupt_fenced_sessions.discard(session_id)
+                            # A new turn proves the runner is live again: a stop
+                            # that never dropped the tunnel must not leave the
+                            # intentional-stop marker to swallow a later genuine
+                            # disconnect.
+                            _intentional_stop_sessions.discard(session_id)
                         elif evt_type in _TERMINAL_RESPONSE_EVENT_TYPES:
                             # Terminal proves the stopped turn is over (completed =
                             # the stop lost the race); process it normally.
@@ -10740,26 +10752,41 @@ async def _relay_runner_stream(
             session_id,
             exc_info=True,
         )
-        # Publish a failed status so the client's SSE stream sees a
-        # clean error event instead of silent truncation (#1114).
-        disconnect_error = ErrorDetail(
-            code="runner_disconnected",
-            message="Runner disconnected unexpectedly.",
-        )
-        _publish_status(session_id, "failed", disconnect_error)
-        # Persist the disconnect cause as durable labels so the
-        # distinction survives into snapshots and child-session
-        # summaries. Without this the relay-fed cache only carries a
-        # generic ``failed`` and ``last_task_error`` is dropped, leaving
-        # the UI unable to tell a benign runner disconnect from a real
-        # task failure (Option B: render a "Disconnected" pill, not the
-        # red "Failed" pill). Cleared on the next ``running`` edge by the
-        # session.status handler, exactly like other failure labels.
-        await _persist_session_status_error_labels(
-            session_id,
-            disconnect_error,
-            conversation_store,
-        )
+        if session_id in _intentional_stop_sessions:
+            # User clicked Stop: the Stop handler brought this runner's tunnel
+            # down on purpose (see _stop_session_host_runner), so the drop is
+            # expected — not a failure. Publish a quiet idle and clear any error
+            # label so the chat and sidebar settle to a stopped state instead of
+            # rendering "Error · runner_disconnected". One-shot: discard the
+            # marker so a genuine later disconnect surfaces normally.
+            _intentional_stop_sessions.discard(session_id)
+            _publish_status(session_id, "idle")
+            await _persist_session_status_error_labels(
+                session_id,
+                None,
+                conversation_store,
+            )
+        else:
+            # Publish a failed status so the client's SSE stream sees a
+            # clean error event instead of silent truncation (#1114).
+            disconnect_error = ErrorDetail(
+                code="runner_disconnected",
+                message="Runner disconnected unexpectedly.",
+            )
+            _publish_status(session_id, "failed", disconnect_error)
+            # Persist the disconnect cause as durable labels so the
+            # distinction survives into snapshots and child-session
+            # summaries. Without this the relay-fed cache only carries a
+            # generic ``failed`` and ``last_task_error`` is dropped, leaving
+            # the UI unable to tell a benign runner disconnect from a real
+            # task failure (Option B: render a "Disconnected" pill, not the
+            # red "Failed" pill). Cleared on the next ``running`` edge by the
+            # session.status handler, exactly like other failure labels.
+            await _persist_session_status_error_labels(
+                session_id,
+                disconnect_error,
+                conversation_store,
+            )
     except asyncio.CancelledError:
         raise
     finally:
@@ -20278,6 +20305,12 @@ def create_sessions_router(
             # only ever stop the runner bound to this session.
             stop_conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if stop_conv is not None and stop_conv.host_id and stop_conv.runner_id:
+                # Mark the tunnel drop as intentional BEFORE tearing it down so
+                # the relay's disconnect handler renders a quiet stopped state
+                # rather than "Error · runner_disconnected". Only host-spawned
+                # sessions drop the tunnel on Stop; other harnesses leave the
+                # runner connected, so there is nothing to suppress for them.
+                _intentional_stop_sessions.add(session_id)
                 await _stop_session_host_runner(
                     session_id,
                     stop_conv.host_id,
@@ -21328,6 +21361,7 @@ def create_sessions_router(
                 reason="session-delete",
             )
         _interrupt_fenced_sessions.discard(session_id)
+        _intentional_stop_sessions.discard(session_id)
         deleted = await conversation_store.delete_conversation(session_id)
         if not deleted:
             raise _session_not_found()
