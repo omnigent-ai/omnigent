@@ -4376,6 +4376,7 @@ async def test_prepare_claude_terminal_fresh_session_is_not_cold_resumed(
     transcript on a fresh launch — the user would type a prompt
     and see no assistant reply mirrored to the web UI.
     """
+    monkeypatch.setenv("OMNIGENT_SESSION_RENAME", "on")
 
     async def _fake_create_session(
         _client: object,

@@ -592,6 +592,118 @@ async def _drive_permission_mode(base_url: str, session_id: str) -> None:
             await browser.close()
 
 
+def test_start_session_send_shows_busy_spinner(seeded_session: tuple[str, str]) -> None:
+    """Send shows a busy spinner while the create is in flight, then navigates.
+
+    The create awaits the backend (session bootstrap + git worktree setup)
+    before navigating, so the landing screen lingers for the whole round-trip.
+    Without feedback the Send button just goes inert and the typed message sits
+    in the composer, so the click reads as "frozen". This holds the create POST
+    open with a gate so that in-flight window is observable, and asserts the
+    Send button flips to a busy/spinning state (disabled + ``aria-busy`` +
+    "Starting session" label) before the response lands and navigation happens.
+    """
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_send_busy_spinner(base_url, session_id))
+
+
+async def _drive_send_busy_spinner(base_url: str, session_id: str) -> None:
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_bodies: list[dict[str, Any]] = []
+            # A gate the create handler awaits before responding, so the POST
+            # stays pending long enough to observe the button's busy state. The
+            # test opens it after asserting the spinner, letting navigation run.
+            release_create = asyncio.Event()
+
+            async def handle_hosts(route: Route) -> None:
+                await route.fulfill(
+                    status=200, content_type="application/json", body=_hosts_body()
+                )
+
+            async def handle_agents(route: Route) -> None:
+                await route.fulfill(
+                    status=200, content_type="application/json", body=_agents_body()
+                )
+
+            async def handle_events(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({"queued": True, "item_id": "ci_e2e"}),
+                )
+
+            async def handle_sessions(route: Route) -> None:
+                if route.request.method == "POST":
+                    create_bodies.append(route.request.post_data_json)
+                    # Hold the create open so the composer stays in its
+                    # `creating` state — the window under test.
+                    await release_create.wait()
+                    await route.fulfill(
+                        status=200,
+                        content_type="application/json",
+                        body=json.dumps({"id": session_id}),
+                    )
+                else:
+                    await route.continue_()
+
+            await page.route("**/v1/hosts", handle_hosts)
+            await page.route("**/v1/agents", handle_agents)
+            await page.route("**/v1/sessions/*/events", handle_events)
+            await page.route(_SESSIONS_RE, handle_sessions)
+
+            # Keep the agent-discovery scan empty so only the stubbed Claude
+            # agent feeds the picker (see _drive_permission_mode for why).
+            async def handle_agent_scan(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({"data": []}),
+                )
+
+            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+
+            await page.add_init_script(
+                f"""window.localStorage.setItem(
+                    "omnigent:recent-workspaces",
+                    JSON.stringify({{ {_HOST_ID}: ["/work/repo"] }})
+                );"""
+            )
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+
+            submit = page.get_by_test_id("new-chat-landing-submit")
+            await page.get_by_test_id("new-chat-landing-input").fill("set up the project")
+            # Idle with a message typed: enabled, not busy (arrow, no spin).
+            await expect(submit).to_be_enabled()
+            await expect(submit).to_have_attribute("aria-busy", "false")
+
+            await submit.click()
+
+            # The POST reached the server (proving we're truly in flight, not
+            # blocked by a disabled button) and the button shows the busy state.
+            await _wait_until(lambda: len(create_bodies) == 1)
+            await expect(submit).to_be_disabled()
+            await expect(submit).to_have_attribute("aria-busy", "true")
+            await expect(submit).to_have_attribute("aria-label", "Starting session")
+            # Still on the landing screen — the "frozen"-looking window.
+            await expect(page.get_by_test_id("new-chat-landing-input")).to_be_visible()
+
+            # Release the create: the flow completes and navigates to the
+            # session, so the landing composer unmounts.
+            release_create.set()
+            await expect(page.get_by_test_id("new-chat-landing-input")).to_have_count(
+                0, timeout=30_000
+            )
+        finally:
+            await browser.close()
+
+
 def test_start_session_remembers_last_picked_host(seeded_session: tuple[str, str]) -> None:
     """The host chip restores the last explicitly-picked host after a reload.
 

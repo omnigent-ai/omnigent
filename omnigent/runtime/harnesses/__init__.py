@@ -136,7 +136,7 @@ _HARNESS_MODULES: dict[str, str] = {
     # for each turn, managing its own session state via Hermes' SQLite
     # session store. See omnigent/inner/hermes_harness.py and
     # omnigent/inner/hermes_executor.py. The ``hermes`` binary must be
-    # on PATH (or set by HARNESS_HERMES_PATH).
+    # on PATH (or set by OMNIGENT_HERMES_PATH; legacy HARNESS_HERMES_PATH honored).
     "hermes": "omnigent.inner.hermes_harness",
     # hermes-native harness wrap. Drives the resident ``hermes`` TUI by
     # injecting each web-UI turn into its tmux pane and mirroring the transcript
