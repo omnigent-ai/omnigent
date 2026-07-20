@@ -319,16 +319,31 @@ class HostRegistry:
             self._hosts[host_id] = conn
         return conn
 
-    def deregister(self, host_id: str) -> None:
+    def deregister(self, host_id: str, conn: HostConnection | None = None) -> bool:
         """Remove a host connection.
 
-        No-op if ``host_id`` is not registered.
+        No-op if ``host_id`` is not registered, or when *conn* is given
+        and a different (newer) connection is registered — a replaced
+        connection's late cleanup must not clobber its replacement.
+        Without this guard, an abrupt drop + prompt reconnect leaves the
+        registry empty while the new tunnel is alive: the stale handler
+        unwinds after ``register`` replaced it and popped the fresh entry,
+        so the host showed offline until the client was force-restarted.
 
         :param host_id: Host identifier to remove, in any accepted
             spelling (see :func:`_canonical_host_id`).
+        :param conn: When given, only deregister if this exact connection
+            is still the registered one.
+        :returns: ``True`` if an entry was removed, ``False`` otherwise —
+            callers use this to skip offline bookkeeping for stale conns.
         """
         with self._lock:
-            self._hosts.pop(_canonical_host_id(host_id), None)
+            key = _canonical_host_id(host_id)
+            current = self._hosts.get(key)
+            if current is None or (conn is not None and current is not conn):
+                return False
+            del self._hosts[key]
+            return True
 
     def get(self, host_id: str) -> HostConnection | None:
         """Look up a live host connection.

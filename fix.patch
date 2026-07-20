@@ -1,0 +1,88 @@
+diff --git a/omnigent/server/host_registry.py b/omnigent/server/host_registry.py
+index e13783b..599283a 100644
+--- a/omnigent/server/host_registry.py
++++ b/omnigent/server/host_registry.py
+@@ -271,15 +271,29 @@ class HostRegistry:
+             self._hosts[host_id] = conn
+         return conn
+ 
+-    def deregister(self, host_id: str) -> None:
++    def deregister(self, host_id: str, conn: HostConnection | None = None) -> bool:
+         """Remove a host connection.
+ 
+-        No-op if ``host_id`` is not registered.
++        No-op if ``host_id`` is not registered, or when *conn* is given
++        and a different (newer) connection is registered — a replaced
++        connection's late cleanup must not clobber its replacement.
++        Without this guard, an abrupt drop + prompt reconnect leaves the
++        registry empty while the new tunnel is alive: the stale handler
++        unwinds after ``register`` replaced it and popped the fresh entry,
++        so the host showed offline until the client was force-restarted.
+ 
+         :param host_id: Host identifier to remove.
++        :param conn: When given, only deregister if this exact connection
++            is still the registered one.
++        :returns: ``True`` if an entry was removed, ``False`` otherwise —
++            callers use this to skip offline bookkeeping for stale conns.
+         """
+         with self._lock:
+-            self._hosts.pop(host_id, None)
++            current = self._hosts.get(host_id)
++            if current is None or (conn is not None and current is not conn):
++                return False
++            del self._hosts[host_id]
++            return True
+ 
+     def get(self, host_id: str) -> HostConnection | None:
+         """Look up a live host connection.
+diff --git a/omnigent/server/routes/host_tunnel.py b/omnigent/server/routes/host_tunnel.py
+index 7f469f3..df96407 100644
+--- a/omnigent/server/routes/host_tunnel.py
++++ b/omnigent/server/routes/host_tunnel.py
+@@ -293,16 +293,16 @@ def create_host_tunnel_router(
+                     receive_task,
+                     return_exceptions=True,
+                 )
+-                host_registry.deregister(host_id)
+-                await asyncio.to_thread(host_store.set_offline, host_id)
+-                if on_host_disconnect is not None:
+-                    try:
+-                        await on_host_disconnect(host_id)
+-                    except Exception:
+-                        _logger.exception(
+-                            "on_host_disconnect callback failed for %s",
+-                            host_id,
+-                        )
++                if host_registry.deregister(host_id, conn):
++                    await asyncio.to_thread(host_store.set_offline, host_id)
++                    if on_host_disconnect is not None:
++                        try:
++                            await on_host_disconnect(host_id)
++                        except Exception:
++                            _logger.exception(
++                                "on_host_disconnect callback failed for %s",
++                                host_id,
++                            )
+ 
+         except WebSocketDisconnect:
+             _logger.warning("Host %s disconnected", host_id)
+@@ -311,8 +311,7 @@ def create_host_tunnel_router(
+             # register — e.g. the upsert IntegrityError when a peer
+             # connects with another owner's host_id — must not deregister
+             # or flip that owner's host offline (cross-user DoS).
+-            if conn is not None:
+-                host_registry.deregister(host_id)
++            if conn is not None and host_registry.deregister(host_id, conn):
+                 await asyncio.to_thread(host_store.set_offline, host_id)
+                 if on_host_disconnect is not None:
+                     try:
+@@ -325,8 +324,7 @@ def create_host_tunnel_router(
+         except Exception:
+             _logger.exception("Host tunnel error for %s", host_id)
+             # Same guard as above: don't touch a host we never registered.
+-            if conn is not None:
+-                host_registry.deregister(host_id)
++            if conn is not None and host_registry.deregister(host_id, conn):
+                 await asyncio.to_thread(host_store.set_offline, host_id)
+ 
+     return router

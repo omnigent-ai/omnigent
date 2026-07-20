@@ -86,6 +86,28 @@ def test_deregister() -> None:
     assert registry.get("host_bbb") is None
 
 
+def test_deregister_stale_conn_keeps_replacement() -> None:
+    """
+    Verify that a replaced connection's deregister does not remove
+    its replacement.
+
+    An abrupt drop + prompt client reconnect replaces the stale
+    connection; the stale handler's cleanup then unwinds late. If
+    conn-conditional deregister is broken, that cleanup pops the
+    live replacement and the host shows offline while the client is
+    connected.
+    """
+    registry = HostRegistry()
+    old = registry.register("host_bbb", FakeWebSocket(), _make_hello(), owner="bob")
+    new = registry.register("host_bbb", FakeWebSocket(), _make_hello(), owner="bob")
+
+    assert registry.deregister("host_bbb", old) is False
+    assert registry.get("host_bbb") is new
+
+    assert registry.deregister("host_bbb", new) is True
+    assert registry.get("host_bbb") is None
+
+
 def test_deregister_noop_for_unknown() -> None:
     """
     Verify that deregister is a no-op for an unknown host_id.
