@@ -18,6 +18,11 @@ def test_host_shorten_never_exceeds_max_chars(max_chars: int) -> None:
     assert len(result) <= max_chars
 
 
+def test_host_shorten_width_two_uses_plain_slice() -> None:
+    """A two-character budget uses a plain slice without an ellipsis."""
+    assert _host_shorten("abcdefghij", max_chars=2) == "ab"
+
+
 def test_host_shorten_fits_under_max_returns_unchanged() -> None:
     """A value already within budget is returned as-is."""
     assert _host_shorten("short", max_chars=24) == "short"
