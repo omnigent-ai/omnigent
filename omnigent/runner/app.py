@@ -7045,6 +7045,14 @@ def _schema_tool_name(schema: dict[str, Any]) -> str | None:
     return None
 
 
+def _merge_session_tool_schemas(
+    builtin_schemas: list[dict[str, Any]],
+    mcp_schemas: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Combine builtin and MCP schemas while preserving their provenance."""
+    return [*builtin_schemas, *mcp_schemas]
+
+
 def _merge_request_client_tools(
     spec_tools: list[dict[str, Any]],
     client_tools: list[dict[str, Any]],
@@ -8015,6 +8023,10 @@ def create_runner_app(
     # sub-spec from the parent's spec tree.
     _session_sub_agent_names: dict[str, str] = {}
     _session_tool_schemas: dict[str, list[dict[str, Any]]] = {}  # session_id → cached tool schemas
+    # Keep schema provenance separate so an MCP refresh never needs to infer
+    # a tool's origin from its name.
+    _session_builtin_tool_schemas: dict[str, list[dict[str, Any]]] = {}
+    _session_mcp_tool_schemas: dict[str, list[dict[str, Any]]] = {}
     _session_mcp_spec_hash: dict[str, str] = {}  # session_id → last MCP spec hash
     # Per-session comment-tool relay for claude-native sessions. Value is a
     # ClaudeNativeToolRelay handle; ``Any`` avoids importing the class at
@@ -9970,6 +9982,9 @@ def create_runner_app(
         _session_fs_registries.pop(session_id, None)
         _session_agent_ids.pop(session_id, None)
         _session_tool_schemas.pop(session_id, None)
+        _session_builtin_tool_schemas.pop(session_id, None)
+        _session_mcp_tool_schemas.pop(session_id, None)
+        _session_mcp_spec_hash.pop(session_id, None)
         if _relay := _session_comment_relays.pop(session_id, None):
             _relay.close()
         _session_histories.pop(session_id, None)
@@ -13700,6 +13715,9 @@ def create_runner_app(
             _session_spec_cache.pop(conv, None)
             _session_skills_cache.pop(conv, None)
             _session_tool_schemas.pop(conv, None)
+            _session_builtin_tool_schemas.pop(conv, None)
+            _session_mcp_tool_schemas.pop(conv, None)
+            _session_mcp_spec_hash.pop(conv, None)
             # The AP snapshot carries external_session_id + labels, which the
             # switch just changed (cleared id, stamped carry-history); re-fetch.
             _session_snapshot_cache.pop(conv, None)
@@ -13897,6 +13915,7 @@ def create_runner_app(
                         conv,
                         exc_info=True,
                     )
+            _session_builtin_tool_schemas[conv] = all_tools
             _session_tool_schemas[conv] = all_tools
 
         # MCP schemas are re-resolved only when the spec's MCP server
@@ -13913,15 +13932,13 @@ def create_runner_app(
                     mcp_result = await _session_mcp_proxy.schemas_for(
                         cached_spec,
                     )
-                    # Replace MCP tools in the cached list: keep builtin
-                    # tools (no double-underscore separator) and append
-                    # the fresh MCP schemas.
-                    _builtin_tools = [
-                        t
-                        for t in _session_tool_schemas.get(conv, [])
-                        if not (isinstance(t, dict) and "__" in (t.get("name") or ""))
-                    ]
-                    _session_tool_schemas[conv] = _builtin_tools + list(mcp_result.schemas)
+                    # Keep MCP schemas separate from builtin schemas so tool
+                    # names never determine their provenance.
+                    _session_mcp_tool_schemas[conv] = list(mcp_result.schemas)
+                    _session_tool_schemas[conv] = _merge_session_tool_schemas(
+                        _session_builtin_tool_schemas.get(conv, []),
+                        _session_mcp_tool_schemas[conv],
+                    )
                     _session_mcp_spec_hash[conv] = _mcp_hash
                 except (
                     httpx.HTTPError,
@@ -18128,6 +18145,8 @@ def create_runner_app(
         _session_spec_cache.pop(session_id, None)
         _session_skills_cache.pop(session_id, None)
         _session_tool_schemas.pop(session_id, None)
+        _session_builtin_tool_schemas.pop(session_id, None)
+        _session_mcp_tool_schemas.pop(session_id, None)
         _session_mcp_spec_hash.pop(session_id, None)
         _session_snapshot_cache.pop(session_id, None)
         if agent_id:
