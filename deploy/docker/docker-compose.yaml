@@ -63,11 +63,14 @@ services:
       HOST: 0.0.0.0
       PORT: "8000"
       # Anchor the server's data dir on the persistent volume so
-      # operator-editable state (accounts, admin list, allowed
-      # domains) survives container restarts. The server resolves
-      # its data dir from this path's parent (/data). Empty/unset
-      # would fall back to /root/.omnigent/ inside the ephemeral
-      # container.
+      # file-backed operator config survives container restarts:
+      # the admin roster (/data/admins) and allowed-domains file
+      # (/data/allowed_domains), plus artifacts mounted elsewhere
+      # in the same volume. Account rows and password hashes live in
+      # PostgreSQL (the postgres-data volume), not here. The server
+      # resolves its data dir from this path's parent (/data);
+      # empty/unset would fall back to /root/.omnigent/ inside the
+      # ephemeral container.
       OMNIGENT_ADMIN_CREDENTIALS_PATH: /data/admin-credentials
 
       # ── Auth ─────────────────────────────────────────

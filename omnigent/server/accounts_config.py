@@ -32,9 +32,11 @@ Env vars (all start with ``OMNIGENT_ACCOUNTS_``):
   (rather than inferring per-request from the Host header) so the
   cookie attributes are stable across reverse proxies.
 - ``INIT_ADMIN_PASSWORD`` — optional. When set on first boot,
-  the auto-created ``admin`` user gets this password instead of
-  a random one. Useful for headless deploys (CI, Cloud Run,
-  etc.) where the operator can't read the host console.
+  bootstrap creates the ``admin`` user directly with this password.
+  No credential is ever auto-generated: when it's unset the first
+  admin is claimed instead through the web Create-admin form (or a
+  terminal prompt). Useful for headless deploys (CI, Cloud Run,
+  etc.) where that form can't be reached interactively.
 - ``INVITE_TTL_HOURS`` — optional, default 72. Invite tokens
   expire after this window.
 - ``MAGIC_TTL_MINUTES`` — optional, default 10. Magic-link
@@ -59,8 +61,9 @@ class AccountsConfig:
     :param base_url: Public base URL of the deployment. Drives
         the ``Secure`` cookie attribute and the ``__Host-`` prefix.
     :param init_admin_password: Optional pre-seeded password for
-        the first-boot admin user. ``None`` means generate a
-        random one.
+        the first-boot admin user. ``None`` means no admin is
+        created at boot — the first one is claimed via the web
+        Create-admin form (nothing is auto-generated).
     :param invite_ttl_seconds: How long ``/auth/invite`` tokens
         are redeemable for.
     :param magic_ttl_seconds: How long ``/auth/magic`` tokens
