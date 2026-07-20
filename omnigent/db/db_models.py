@@ -1259,6 +1259,48 @@ class SqlHost(OmnigentBase):
     )
 
 
+class SqlUserCredential(OmnigentBase):
+    """
+    SQLAlchemy model for the ``user_credentials`` table.
+
+    One row per (user, provider): an external-service credential the user
+    connected in the web UI (Settings → Credentials), e.g. a GitHub OAuth
+    token. The token is Fernet-encrypted at rest with
+    ``OMNIGENT_CREDENTIAL_ENCRYPTION_KEY`` — this table never holds a
+    usable token without that key.
+
+    :param workspace_id: Tenant partition key (0 = default), matching the
+        convention of every other tenant-scoped table.
+    :param user_id: Owning user id as the auth provider reports it, e.g.
+        ``"alice@example.com"``.
+    :param provider: External service, e.g. ``"github"``.
+    :param token_encrypted: Fernet ciphertext of the provider token.
+    :param login: Provider-side account name for display, e.g. the
+        GitHub login ``"alice"``.
+    :param scopes: Comma/space-joined granted scopes for display, e.g.
+        ``"repo"``.
+    :param created_at: Unix epoch seconds of first connect.
+    :param updated_at: Unix epoch seconds of the last (re)connect.
+    """
+
+    __tablename__ = "user_credentials"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    user_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    provider: Mapped[str] = mapped_column(String(32), primary_key=True)
+    token_encrypted: Mapped[str] = mapped_column(Text, nullable=False)
+    login: Mapped[str] = mapped_column(String(256), nullable=False)
+    scopes: Mapped[str] = mapped_column(String(256), nullable=False, default="")
+    created_at: Mapped[int] = mapped_column(Integer)
+    updated_at: Mapped[int] = mapped_column(Integer)
+
+
 class SqlUserDailyCost(OmnigentBase):
     """
     SQLAlchemy model for the ``user_daily_cost`` table.
