@@ -1034,9 +1034,7 @@ describe("CredentialsSection", () => {
   it("renders the connected account and disconnects", async () => {
     credentialsMocks.listCredentials.mockResolvedValue({
       ok: true,
-      credentials: [
-        { provider: "github", login: "alice-gh", scopes: "repo", connected_at: 1 },
-      ],
+      credentials: [{ provider: "github", login: "alice-gh", scopes: "repo", connected_at: 1 }],
       enabled: true,
     });
     credentialsMocks.disconnectGithub.mockResolvedValue({ ok: true });
