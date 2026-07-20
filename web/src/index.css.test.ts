@@ -169,6 +169,13 @@ describe("index.css landing atmosphere scope", () => {
     expect(cssSource).toContain('.app-shell[data-landing="true"]::before');
     expect(cssSource).not.toContain(':has([data-testid="new-chat-landing"])');
   });
+
+  it("keeps the landing canvas flat", () => {
+    expect(cssSource).toMatch(
+      /\.app-shell\[data-landing="true"\]::before \{[\s\S]*?background: none;/,
+    );
+    expect(cssSource).not.toContain("radial-gradient(circle at 66% 18%");
+  });
 });
 
 describe("index.css Omnigent code surfaces", () => {

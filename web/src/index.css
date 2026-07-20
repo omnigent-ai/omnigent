@@ -456,18 +456,15 @@
     0 4px 24px rgba(10, 10, 10, 0.04);
 }
 
-/* Give the new-session landing the mockup's magical pink/green atmosphere
- * without replacing the established app or sidebar surface colors. The
- * generated layer paints behind the real shell children and disappears on
- * every non-landing route. */
+/* Keep the landing canvas flat so Otto and the composer provide the visual
+ * identity without a full-page color wash. The explicit route state remains
+ * available to named themes that intentionally opt into their own treatment. */
 .app-shell[data-landing="true"]::before {
   position: absolute;
   inset: 0;
   content: "";
   pointer-events: none;
-  background:
-    radial-gradient(circle at 66% 18%, rgba(245, 59, 157, 0.075), transparent 29%),
-    radial-gradient(circle at 54% 92%, rgba(77, 197, 160, 0.065), transparent 30%);
+  background: none;
 }
 
 :root:not(.dark) .reference-composer-surface {
@@ -712,12 +709,6 @@ html.dark .app-shell aside[aria-label="Conversations"].conversations-sidebar:not
   box-shadow:
     0 4px 18px rgba(0, 0, 0, 0.1),
     inset -1px 0 rgba(255, 255, 255, 0.025) !important;
-}
-
-html.dark .app-shell[data-landing="true"]::before {
-  background:
-    radial-gradient(circle at 66% 18%, rgba(245, 59, 157, 0.075), transparent 28%),
-    radial-gradient(circle at 54% 92%, rgba(77, 197, 160, 0.035), transparent 28%);
 }
 
 .dark .sidebar-primary-nav-item {
@@ -2250,11 +2241,6 @@ html.dark:not([data-theme]) .chat-conversation-content {
 }
 :root:not(.dark)[data-theme="omni-rose"] .app-shell {
   background: var(--shell-surface);
-}
-:root:not(.dark)[data-theme="omni-rose"] .app-shell[data-landing="true"]::before {
-  background:
-    radial-gradient(circle at 66% 18%, rgba(245, 59, 157, 0.09), transparent 29%),
-    radial-gradient(circle at 54% 92%, rgba(77, 197, 160, 0.072), transparent 30%);
 }
 :root:not(.dark)[data-theme="omni-rose"] .otto-landing-mascot {
   filter: drop-shadow(0 10px 14px rgba(166, 58, 104, 0.12));
