@@ -770,10 +770,9 @@ class SqlConversation(ConversationBase):
     )
 
     __table_args__ = (
-        Index("ix_conversations_created_at", "workspace_id", "created_at", "id"),
-        Index("ix_conversations_updated_at", "workspace_id", "updated_at", "id"),
-        # Default sidebar filters archived=false and sorts by updated_at DESC;
-        # archived leads as an equality so the page walk stays index-only.
+        # No bare created_at/updated_at indexes: the sessions list is ACL-scoped
+        # (id IN (...)) and resolves via the PK; the default sidebar (archived=
+        # false, updated_at DESC) is served by the archived_updated index below.
         Index("ix_conversations_archived_updated", "workspace_id", "archived", "updated_at", "id"),
         Index(
             "ix_conversations_root_conversation_id",
