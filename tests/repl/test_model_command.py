@@ -6,10 +6,6 @@ from omnigent_ui_sdk import RichBlockFormatter
 from omnigent.repl._repl import COMMANDS, handle_slash_command
 from tests.repl.helpers import CapturingHost
 
-_Host = CapturingHost
-
-_SENTINEL = object()
-
 
 class _Session:
     """Fake session that records every ``set_model_override`` call.
@@ -35,9 +31,12 @@ async def test_model_command_registered() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("keyword", ["show", "list", "status", "current"])
+@pytest.mark.parametrize(
+    "keyword",
+    ["show", "list", "status", "current", "SHOW", "List", "Status", "CURRENT"],
+)
 async def test_model_show_keywords_display_not_switch(keyword: str) -> None:
-    host = _Host()
+    host = CapturingHost()
     session = _Session()
     await handle_slash_command(
         f"/model {keyword}",
@@ -54,24 +53,8 @@ async def test_model_show_keywords_display_not_switch(keyword: str) -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("keyword", ["SHOW", "List", "Status", "CURRENT"])
-async def test_model_show_keywords_case_insensitive(keyword: str) -> None:
-    host = _Host()
-    session = _Session()
-    await handle_slash_command(
-        f"/model {keyword}",
-        session,
-        None,
-        host,
-        RichBlockFormatter(),  # type: ignore[arg-type]
-    )
-    assert session.override_calls == []
-    assert "Active:" in host.text
-
-
-@pytest.mark.asyncio
 async def test_model_no_arg_shows_readout() -> None:
-    host = _Host()
+    host = CapturingHost()
     session = _Session()
     await handle_slash_command("/model", session, None, host, RichBlockFormatter())  # type: ignore[arg-type]
     assert session.override_calls == []
@@ -81,7 +64,7 @@ async def test_model_no_arg_shows_readout() -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("alias", ["default", "off", "reset"])
 async def test_model_default_aliases_clear(alias: str) -> None:
-    host = _Host()
+    host = CapturingHost()
     session = _Session()
     session.model_override = "claude-sonnet-4-6"
     await handle_slash_command(
@@ -98,7 +81,7 @@ async def test_model_default_aliases_clear(alias: str) -> None:
 
 @pytest.mark.asyncio
 async def test_model_sets_valid_id() -> None:
-    host = _Host()
+    host = CapturingHost()
     session = _Session()
     await handle_slash_command(
         "/model claude-sonnet-4-6",
