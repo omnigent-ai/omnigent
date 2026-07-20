@@ -589,12 +589,61 @@ def test_ucode_config_refreshes_live_models_and_builds_picker_options(
     ]
 
 
-def test_claude_native_static_model_options_keep_alias_as_model() -> None:
+def test_claude_native_static_model_options_keep_alias_as_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Direct Claude auth rows preserve the alias/model/label contract."""
+    monkeypatch.setattr(claude_native, "_CLAUDE_CODE_MANAGED_SETTINGS_PATHS", ())
     options = claude_native.claude_native_model_options(None)
 
     assert options
     assert all(option["model"] == option["id"] for option in options)
+
+
+def test_claude_native_model_options_follow_managed_claude_catalog(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Managed Claude model overrides replace the generic fallback rows."""
+    managed_settings = tmp_path / "managed-settings.json"
+    managed_settings.write_text(
+        json.dumps(
+            {
+                "env": {
+                    "ANTHROPIC_DEFAULT_OPUS_MODEL": "system.ai.claude-opus-4-8[1m]",
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL": "system.ai.claude-sonnet-4-6[1m]",
+                    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "system.ai.claude-haiku-4-5",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        claude_native,
+        "_CLAUDE_CODE_MANAGED_SETTINGS_PATHS",
+        (managed_settings,),
+    )
+
+    assert claude_native.claude_native_model_options(None) == [
+        {
+            "id": "opus",
+            "model": "system.ai.claude-opus-4-8[1m]",
+            "displayName": "Opus 4.8",
+            "isDefault": False,
+        },
+        {
+            "id": "sonnet",
+            "model": "system.ai.claude-sonnet-4-6[1m]",
+            "displayName": "Sonnet 4.6",
+            "isDefault": False,
+        },
+        {
+            "id": "haiku",
+            "model": "system.ai.claude-haiku-4-5",
+            "displayName": "Haiku 4.5",
+            "isDefault": False,
+        },
+    ]
 
 
 def test_sonnet_5_selection_resolves_to_the_configured_custom_model() -> None:

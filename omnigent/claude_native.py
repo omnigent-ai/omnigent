@@ -119,6 +119,7 @@ _TERMINAL_NAME = "claude"
 _TERMINAL_SESSION_KEY = "main"
 _UCODE_CLAUDE_AGENT_NAME = "claude"
 _UCODE_CLAUDE_BASE_URL_ENV = "ANTHROPIC_BASE_URL"
+_ANTHROPIC_MODEL_ENV = "ANTHROPIC_MODEL"
 _ANTHROPIC_API_KEY_ENV = "ANTHROPIC_API_KEY"
 _ANTHROPIC_BEDROCK_BASE_URL_ENV = "ANTHROPIC_BEDROCK_BASE_URL"
 _AWS_BEARER_TOKEN_BEDROCK_ENV = "AWS_BEARER_TOKEN_BEDROCK"
@@ -174,6 +175,11 @@ _SESSION_LABELS = {
     _WRAPPER_LABEL_KEY: _WRAPPER_LABEL_VALUE,
 }
 _CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
+_CLAUDE_CODE_MANAGED_SETTINGS_PATHS: tuple[Path, ...] = (
+    Path("/Library/Application Support/ClaudeCode/managed-settings.json"),
+    Path("/etc/claude-code/managed-settings.json"),
+    Path(os.environ.get("PROGRAMDATA", "C:/ProgramData")) / "ClaudeCode" / "managed-settings.json",
+)
 _CLAUDE_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 _RESUME_ACTION_SWITCH = "switch"
 _RESUME_ACTION_MOVE = "move"
@@ -352,23 +358,51 @@ def _claude_model_display_name(tier: str, model_id: str) -> str:
     return f"{family} {'.'.join(version_parts)}" if version_parts else family
 
 
+def _managed_claude_model_config() -> ClaudeNativeUcodeConfig | None:
+    """Read the model overrides Claude Code applies from managed settings."""
+    allowed_env = {
+        *_UCODE_CLAUDE_TIER_TO_ENV.values(),
+        _ANTHROPIC_CUSTOM_MODEL_OPTION_ENV,
+        _ANTHROPIC_CUSTOM_MODEL_OPTION_NAME_ENV,
+    }
+    for path in _CLAUDE_CODE_MANAGED_SETTINGS_PATHS:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        raw_env = payload.get("env") if isinstance(payload, dict) else None
+        if not isinstance(raw_env, dict):
+            continue
+        model_env = {
+            key: value.strip()
+            for key, value in raw_env.items()
+            if key in allowed_env and isinstance(value, str) and value.strip()
+        }
+        if model_env:
+            raw_default = raw_env.get(_ANTHROPIC_MODEL_ENV)
+            default_model = raw_default.strip() if isinstance(raw_default, str) else None
+            return ClaudeNativeUcodeConfig(env=model_env, model=default_model or None)
+    return None
+
+
 def claude_native_model_options(
     claude_config: ClaudeNativeUcodeConfig | None,
 ) -> list[dict[str, object]]:
     """Return the model picker rows supported by a Claude launch config.
 
     Databricks/ucode configs expose only aliases that were pinned to a live or
-    cached gateway model. Other Claude auth modes retain the curated fallback
-    catalog because Claude Code owns their account-scoped availability.
+    cached gateway model. When Claude owns its configuration, mirror managed
+    model overrides before falling back to the curated subscription catalog.
 
     :param claude_config: Launch config resolved for the session.
     :returns: Wire-ready model option objects.
     """
     options: list[dict[str, object]] = []
-    if claude_config is not None:
-        default_model = (claude_config.model or "").removesuffix("[1m]")
+    effective_config = claude_config or _managed_claude_model_config()
+    if effective_config is not None:
+        default_model = (effective_config.model or "").removesuffix("[1m]")
         for tier, env_var in _UCODE_CLAUDE_TIER_TO_ENV.items():
-            model_id = claude_config.env.get(env_var)
+            model_id = effective_config.env.get(env_var)
             if model_id:
                 options.append(
                     {
@@ -379,9 +413,9 @@ def claude_native_model_options(
                     }
                 )
             if tier == "sonnet":
-                custom_model = claude_config.env.get(_ANTHROPIC_CUSTOM_MODEL_OPTION_ENV)
+                custom_model = effective_config.env.get(_ANTHROPIC_CUSTOM_MODEL_OPTION_ENV)
                 if custom_model:
-                    custom_name = claude_config.env.get(
+                    custom_name = effective_config.env.get(
                         _ANTHROPIC_CUSTOM_MODEL_OPTION_NAME_ENV,
                         _UCODE_CLAUDE_CUSTOM_TIER_LABEL,
                     )
