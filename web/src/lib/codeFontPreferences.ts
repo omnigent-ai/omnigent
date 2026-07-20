@@ -200,9 +200,13 @@ export function writeCodeFontFamily(name: string): void {
  */
 export function loadCodeFontFamily(family: string): void {
   const normalized = normalizeCodeFontFamily(family);
-  const { entry, ready } = loadFontByFamily(normalized);
+  const { entry, ready } = loadFontByFamily(normalized, "code");
   if (!entry) return;
-  void ready.then(() => {
+  void ready.then((loaded) => {
+    // Only re-emit once the glyphs genuinely arrived — a failed/blocked load
+    // resolves `false`, and re-measuring then would just churn against the
+    // fallback cell.
+    if (!loaded) return;
     // Re-read live prefs at resolution time: if the user changed the family
     // again while this was loading, don't clobber the newer choice.
     emit(readCodeFont());

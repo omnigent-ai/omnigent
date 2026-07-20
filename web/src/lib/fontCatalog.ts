@@ -291,26 +291,67 @@ export function getFontById(id: string): FontCatalogEntry | undefined {
   return BY_ID.get(id);
 }
 
-// Lower-cased family → entry. A family (e.g. "IBM Plex Mono") can appear in more
-// than one category; the FIRST catalog occurrence wins, which is enough for the
-// loader — it only needs the delivery metadata, identical across duplicates.
-const BY_FAMILY = new Map<string, FontCatalogEntry>();
+// Lower-cased family → ALL matching entries, in catalog order. A family (e.g.
+// "IBM Plex Mono") can appear in more than one category, so we keep every match
+// rather than the first — a category-aware lookup needs the right one.
+const BY_FAMILY = new Map<string, FontCatalogEntry[]>();
 for (const entry of FONT_CATALOG) {
   const key = entry.family.trim().toLowerCase();
-  if (key && !BY_FAMILY.has(key)) BY_FAMILY.set(key, entry);
+  if (!key) continue;
+  const list = BY_FAMILY.get(key);
+  if (list) list.push(entry);
+  else BY_FAMILY.set(key, [entry]);
 }
 
 /**
- * Resolve a typed/stored family NAME to its catalog entry, case-insensitively.
- *
- * This is the bridge from the existing free-text font inputs (which store a
- * bare family string) to the loader: a typed name that matches a catalog family
- * gets loaded; anything else (a locally-installed font, a partial name) resolves
- * to `undefined` and the loader leaves it to the OS, unchanged. An empty name
- * (System default) is never a catalog family, so it also returns `undefined`.
+ * All catalog entries offered under a family NAME, case-insensitively (empty
+ * for a non-catalog family or the empty/System-default name). A shared family
+ * like "IBM Plex Mono" returns one entry per category it appears in.
  */
-export function getFontByFamily(family: string): FontCatalogEntry | undefined {
+export function getFontsByFamily(family: string): readonly FontCatalogEntry[] {
   const key = family.trim().toLowerCase();
-  if (!key) return undefined;
-  return BY_FAMILY.get(key);
+  if (!key) return [];
+  return BY_FAMILY.get(key) ?? [];
+}
+
+/**
+ * Resolve a typed/stored family NAME to a catalog entry, case-insensitively.
+ *
+ * The bridge from the free-text font inputs (which store a bare family string)
+ * to the loader: a typed name matching a catalog family resolves to an entry to
+ * load; anything else (a locally-installed font, a partial name, the empty
+ * System-default name) resolves to `undefined` and is left to the OS.
+ *
+ * When `category` is given (e.g. PR 2's per-role dropdowns), the entry from that
+ * category wins — so a shared family like "IBM Plex Mono" resolves to its `code`
+ * entry for the code control and its `fixedWidth` entry for the mono control. If
+ * the family isn't offered in that category, the first match is returned anyway:
+ * the delivery metadata is identical across a family's entries, so the font
+ * still loads. With no `category`, the first catalog occurrence wins
+ * (backward-compatible).
+ */
+export function getFontByFamily(
+  family: string,
+  category?: FontCategory,
+): FontCatalogEntry | undefined {
+  const matches = getFontsByFamily(family);
+  if (matches.length === 0) return undefined;
+  if (category) return matches.find((e) => e.category === category) ?? matches[0];
+  return matches[0];
+}
+
+/**
+ * The canonical load key for an entry: its underlying resource identity, NOT its
+ * catalog id. Two entries with different ids but the same delivery resource (e.g.
+ * the `fixedWidth` and `code` IBM Plex Mono entries share one Google CSS2 URL)
+ * produce the same key, so the loader injects the stylesheet/faces once and
+ * shares a single in-flight load across them.
+ */
+export function fontLoadKey(entry: FontCatalogEntry): string {
+  if (entry.source === "google-css2") return entry.cssUrl ?? `id:${entry.id}`;
+  if (entry.source === "self-hosted") {
+    const urls = (entry.faces ?? []).map((f) => f.url).join("|");
+    return urls || `id:${entry.id}`;
+  }
+  return `bundled:${entry.id}`;
 }
