@@ -52,6 +52,12 @@ vi.mock("@/lib/accountsApi", () => ({
   logout: vi.fn(),
   changePassword: vi.fn(),
 }));
+const credentialsMocks = vi.hoisted(() => ({
+  listCredentials: vi.fn(),
+  connectGithub: vi.fn(),
+  disconnectGithub: vi.fn(),
+}));
+vi.mock("@/lib/credentialsApi", () => credentialsMocks);
 vi.mock("@/lib/identity", () => ({
   resolveIdentity: () => Promise.resolve(mocks.me?.id ?? null),
   getCurrentIsAdmin: () => mocks.me?.is_admin ?? false,
@@ -864,5 +870,67 @@ describe("SettingsPage", () => {
     expect(mocks.fetchNextPage).toHaveBeenCalled();
     expect(screen.getByTestId("archived-row")).toBeInTheDocument();
     expect(screen.getByText("Deep archive")).toBeInTheDocument();
+  });
+});
+
+describe("CredentialsSection", () => {
+  beforeEach(() => {
+    credentialsMocks.listCredentials.mockReset();
+    credentialsMocks.connectGithub.mockReset();
+    credentialsMocks.disconnectGithub.mockReset();
+  });
+
+  it("renders Connect GitHub when nothing is connected and navigates on click", async () => {
+    credentialsMocks.listCredentials.mockResolvedValue({
+      ok: true,
+      credentials: [],
+      enabled: true,
+    });
+    credentialsMocks.connectGithub.mockResolvedValue({
+      ok: true,
+      authorize_url: "https://github.com/login/oauth/authorize?x=1",
+    });
+    const assign = vi.fn();
+    const original = window.location;
+    Object.defineProperty(window, "location", {
+      configurable: true,
+      value: { ...original, assign, search: "" },
+    });
+    try {
+      renderPage("/settings/credentials");
+      const connect = await screen.findByTestId("settings-credentials-github-connect");
+      fireEvent.click(connect);
+      await waitFor(() =>
+        expect(assign).toHaveBeenCalledWith("https://github.com/login/oauth/authorize?x=1"),
+      );
+    } finally {
+      Object.defineProperty(window, "location", { configurable: true, value: original });
+    }
+  });
+
+  it("renders the connected account and disconnects", async () => {
+    credentialsMocks.listCredentials.mockResolvedValue({
+      ok: true,
+      credentials: [
+        { provider: "github", login: "alice-gh", scopes: "repo", connected_at: 1 },
+      ],
+      enabled: true,
+    });
+    credentialsMocks.disconnectGithub.mockResolvedValue({ ok: true });
+    renderPage("/settings/credentials");
+    expect(await screen.findByText(/Connected as alice-gh/)).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("settings-credentials-github-disconnect"));
+    await waitFor(() => expect(credentialsMocks.disconnectGithub).toHaveBeenCalled());
+  });
+
+  it("disables Connect and explains when the deployment lacks configuration", async () => {
+    credentialsMocks.listCredentials.mockResolvedValue({
+      ok: true,
+      credentials: [],
+      enabled: false,
+    });
+    renderPage("/settings/credentials");
+    const connect = await screen.findByTestId("settings-credentials-github-connect");
+    expect(connect).toBeDisabled();
   });
 });

@@ -77,6 +77,12 @@ import {
 } from "@/components/ui/dialog";
 import { KeyboardShortcutsList } from "@/components/KeyboardShortcutsDialog";
 import { changePassword, logout } from "@/lib/accountsApi";
+import {
+  connectGithub,
+  disconnectGithub,
+  listCredentials,
+  type CredentialInfo,
+} from "@/lib/credentialsApi";
 import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import {
@@ -214,6 +220,7 @@ export function SettingsPage() {
     <PageScroll contentClassName="px-8" extraBottom="2.5rem">
       {section === "appearance" && <AppearanceSection />}
       {section === "git" && <GitSection />}
+      {section === "credentials" && <CredentialsSection />}
       {section === "shortcuts" && <ShortcutsSection />}
       {section === "account" && hasAuthSession && <AccountSection />}
       {section === "archived" && <ArchivedSection />}
@@ -852,6 +859,114 @@ function GitSection() {
     <Section title="Git" description="Configure how Omnigent works with Git.">
       <div className="flex flex-col gap-8">
         <DefaultBaseBranchControl />
+      </div>
+    </Section>
+  );
+}
+
+/**
+ * Per-user external-service credentials. Connect GitHub via the deployment's
+ * OAuth App; the token is injected as GIT_TOKEN into this user's managed
+ * sandbox sessions. The callback redirects back here with ?connected= or
+ * ?error= query params, surfaced as a banner.
+ */
+function CredentialsSection() {
+  const [creds, setCreds] = useState<CredentialInfo[] | null>(null);
+  const [enabled, setEnabled] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(() => {
+    const params = new URLSearchParams(window.location.search);
+    const err = params.get("error");
+    if (!err) return null;
+    if (err === "github_denied") return "GitHub authorization was denied.";
+    if (err === "state_mismatch") return "The sign-in attempt expired. Try again.";
+    if (err === "exchange_failed") return "GitHub rejected the connection. Try again.";
+    if (err === "disabled") return "Credentials are not configured on this deployment.";
+    return "Connecting GitHub failed.";
+  });
+
+  const refresh = useCallback(async () => {
+    const result = await listCredentials();
+    if (result.ok) {
+      setCreds(result.credentials);
+      setEnabled(result.enabled);
+    } else {
+      setCreds([]);
+      setError(result.error);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  const github = creds?.find((c) => c.provider === "github") ?? null;
+
+  const onConnect = useCallback(async () => {
+    setBusy(true);
+    setError(null);
+    const result = await connectGithub();
+    if (result.ok) {
+      window.location.assign(result.authorize_url);
+      return;
+    }
+    setBusy(false);
+    setError(
+      result.status === 409
+        ? "Credentials are not configured on this deployment."
+        : result.error,
+    );
+  }, []);
+
+  const onDisconnect = useCallback(async () => {
+    setBusy(true);
+    setError(null);
+    const result = await disconnectGithub();
+    setBusy(false);
+    if (result.ok) {
+      await refresh();
+    } else {
+      setError(result.error);
+    }
+  }, [refresh]);
+
+  return (
+    <Section
+      title="Credentials"
+      description="Connect external accounts. Connected credentials are injected into your managed sandbox sessions."
+    >
+      {error && (
+        <p role="alert" className="mb-4 text-sm text-destructive">
+          {error}
+        </p>
+      )}
+      <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
+        <div className="flex min-w-0 flex-1 flex-col">
+          <span className="text-sm font-medium">GitHub</span>
+          <span className="text-sm text-muted-foreground">
+            {github
+              ? `Connected as ${github.login}${github.scopes ? ` (${github.scopes})` : ""}. Private repositories clone and push with your account.`
+              : "Authorize with GitHub so your sandbox sessions can clone and push your private repositories."}
+          </span>
+        </div>
+        {creds === null ? null : github ? (
+          <Button
+            variant="outline"
+            disabled={busy}
+            data-testid="settings-credentials-github-disconnect"
+            onClick={() => void onDisconnect()}
+          >
+            Disconnect
+          </Button>
+        ) : (
+          <Button
+            disabled={busy || !enabled}
+            data-testid="settings-credentials-github-connect"
+            onClick={() => void onConnect()}
+          >
+            Connect GitHub
+          </Button>
+        )}
       </div>
     </Section>
   );

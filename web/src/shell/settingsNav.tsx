@@ -13,6 +13,7 @@ import {
   DownloadIcon,
   GitBranchIcon,
   KeyboardIcon,
+  KeyRoundIcon,
   PaletteIcon,
   PanelRightOpenIcon,
   Share2Icon,
@@ -33,6 +34,7 @@ import { cn } from "@/lib/utils";
 export type SettingsSectionId =
   | "appearance"
   | "git"
+  | "credentials"
   | "shortcuts"
   | "account"
   | "members"
@@ -45,6 +47,7 @@ export type SettingsSectionId =
 const SECTION_IDS: readonly SettingsSectionId[] = [
   "appearance",
   "git",
+  "credentials",
   "shortcuts",
   "account",
   "members",
@@ -86,6 +89,7 @@ export function settingsNavGroups(
   const general: SettingsNavItem[] = [
     { id: "appearance", label: "Appearance", icon: PaletteIcon },
     { id: "git", label: "Git", icon: GitBranchIcon },
+    { id: "credentials", label: "Credentials", icon: KeyRoundIcon },
     { id: "shortcuts", label: "Keyboard shortcuts", icon: KeyboardIcon, hideOnMobile: true },
   ];
   if (hasAuthSession) {
