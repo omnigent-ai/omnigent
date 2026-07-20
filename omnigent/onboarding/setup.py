@@ -34,6 +34,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
+from omnigent._encoding import detect_encoding
+
 if TYPE_CHECKING:
     from rich.console import Console
 
@@ -199,13 +201,16 @@ def _alias_profile(source: str, target: str) -> None:
     :param target: New profile name to create.
     """
     path = _databrickscfg_path()
+    # ~/.databrickscfg is vendor-written (CLI emits UTF-8): detect its codec and
+    # preserve it across the read+rewrite so a round-trip never re-encodes values.
+    encoding = detect_encoding(path)
     cfg = configparser.ConfigParser()
-    cfg.read(path)
+    cfg.read(path, encoding=encoding)
     if source not in cfg:
         raise ValueError(f"alias source {source!r} not in {path}")
     cfg[target] = dict(cfg[source])
     tmp = path.with_name(path.name + ".write")
-    with tmp.open("w") as f:
+    with tmp.open("w", encoding=encoding) as f:
         cfg.write(f)
     tmp.replace(path)
 
@@ -224,13 +229,16 @@ def _remove_profile_section(name: str) -> bool:
     path = _databrickscfg_path()
     if not path.exists():
         return False
+    # ~/.databrickscfg is vendor-written (CLI emits UTF-8): detect its codec and
+    # preserve it across the read+rewrite so a round-trip never re-encodes values.
+    encoding = detect_encoding(path)
     cfg = configparser.ConfigParser()
-    cfg.read(path)
+    cfg.read(path, encoding=encoding)
     if name not in cfg:
         return False
     cfg.remove_section(name)
     tmp = path.with_name(path.name + ".write")
-    with tmp.open("w") as f:
+    with tmp.open("w", encoding=encoding) as f:
         cfg.write(f)
     tmp.replace(path)
     return True

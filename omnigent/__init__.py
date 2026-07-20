@@ -29,6 +29,12 @@ from omnigent._env_compat import mirror_legacy_env as _mirror_legacy_env  # noqa
 
 _mirror_legacy_env()
 
+# Force UTF-8 text IO on Windows before any submodule below is imported, so
+# console/tunnel output never hits the cp1252 codec. No-op on non-Windows hosts.
+from omnigent import _win_compat as _win_compat  # noqa: E402
+
+_win_compat.apply()
+
 from omnigent.inner.datamodel import (  # noqa: E402 — must follow md5 patch
     AgentDef,
     Connection,

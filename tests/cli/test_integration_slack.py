@@ -36,6 +36,20 @@ def test_record_round_trip_and_prune(tmp_path: Path) -> None:
     assert d.read_record() is None  # pruned from disk
 
 
+def test_read_log_tail_detects_legacy_locale_encoding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A legacy child log remains readable when Python UTF-8 Mode is active."""
+    log_path = tmp_path / "slack.log"
+    log_path.write_bytes("older\ncafé\n".encode("cp1252"))
+    monkeypatch.setattr("omnigent._encoding.locale_encoding", lambda: "cp1252")
+
+    daemon = IntegrationDaemon("slack", tmp_path)
+    daemon._write_record(DaemonRecord(pid=4242, log_path=str(log_path), started_at=1))
+
+    assert daemon.read_log_tail(max_lines=1) == "café"
+
+
 def test_start_writes_record_detached(tmp_path: Path) -> None:
     d = IntegrationDaemon("slack", tmp_path)
     with mock.patch("omnigent.integration_daemon.subprocess.Popen") as popen:
@@ -209,12 +223,13 @@ def test_slack_logs_prints_path(data_dir: Path) -> None:
     none = runner.invoke(cli, ["integration", "slack", "logs"])
     assert "No Slack daemon" in none.output
     # With a record, prints the path.
+    log_path = data_dir / "slack.log"
     IntegrationDaemon("slack", data_dir)._write_record(
-        DaemonRecord(pid=1, log_path="/tmp/slack.log", started_at=1)
+        DaemonRecord(pid=1, log_path=str(log_path), started_at=1)
     )
     result = runner.invoke(cli, ["integration", "slack", "logs"])
     assert result.exit_code == 0
-    assert "/tmp/slack.log" in result.output
+    assert str(log_path) in result.output
 
 
 def test_integration_group_bare_shows_help(data_dir: Path) -> None:

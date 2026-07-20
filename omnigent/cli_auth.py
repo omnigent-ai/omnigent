@@ -71,13 +71,13 @@ def _store_entry(server_url: str, entry: dict[str, str | float]) -> None:
     data: dict[str, dict[str, str | float]] = {}
     if path.exists():
         try:
-            data = json.loads(path.read_text())
+            data = json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             data = {}
 
     data[_normalize_server_url(server_url)] = entry
 
-    path.write_text(json.dumps(data, indent=2))
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
     os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
 
 
@@ -155,7 +155,7 @@ def _load_entry(server_url: str) -> dict[str, str | float] | None:
         return None
 
     try:
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return None
 
@@ -311,11 +311,11 @@ def clear_token(server_url: str) -> None:
         return
 
     try:
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return
 
     key = _normalize_server_url(server_url)
     if key in data:
         del data[key]
-        path.write_text(json.dumps(data, indent=2))
+        path.write_text(json.dumps(data, indent=2), encoding="utf-8")

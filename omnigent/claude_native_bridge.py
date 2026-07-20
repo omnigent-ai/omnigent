@@ -2437,7 +2437,7 @@ def _read_complete_jsonl_records(
     cursor = start_line
     position = byte_offset
     try:
-        with path.open("rb") as handle:
+        with path.open(mode="rb") as handle:
             handle.seek(0, os.SEEK_END)
             file_size = handle.tell()
             if byte_offset > file_size:

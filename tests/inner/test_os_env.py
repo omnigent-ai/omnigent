@@ -16,6 +16,7 @@ from omnigent.inner.os_env import (
     _child_shell_env,
     _project_root,
     _read_impl,
+    _select_default_shell,
     _shell_impl,
     build_helper_env,
     create_os_environment,
@@ -129,8 +130,14 @@ def test_build_helper_env_active_passes_omnigent_session_marker() -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.posix_only
 def test_shell_impl_timeout_includes_exit_code(tmp_path: Path) -> None:
-    """Timed-out shell commands still return the documented result fields."""
+    """Timed-out shell commands still return the documented result fields.
+
+    POSIX-only: ``shutil.which("bash")`` resolves to the WSL launcher on Windows;
+    the native Windows timeout path is covered by
+    ``test_shell_impl_timeout_kills_child_tree_on_windows``.
+    """
     shell_path = shutil.which("bash") or shutil.which("sh")
     assert shell_path is not None
 
@@ -393,11 +400,414 @@ def test_shell_command_does_not_see_omnigent_project_root(
         OSEnvSpec(type="caller_process", sandbox=OSEnvSandboxSpec(type="none"))
     )
     assert os_env is not None
+    command = "echo PP=%PYTHONPATH%" if os.name == "nt" else "echo PP=$PYTHONPATH"
     try:
-        result = asyncio.run(os_env.shell("echo PP=$PYTHONPATH"))
+        result = asyncio.run(os_env.shell(command))
     finally:
         os_env.close()
 
     out = result.get("stdout", "")
     assert project_entry in out
     assert str(_project_root()) not in out
+
+
+class TestSelectDefaultShell:
+    """`_select_default_shell` must never pick the WSL bash on Windows."""
+
+    def test_windows_uses_comspec_not_wsl_bash(self, monkeypatch) -> None:
+        # On Windows, shutil.which("bash") is the WSL launcher; the selector
+        # must ignore it and use the native cmd.exe via %COMSPEC%.
+        monkeypatch.setattr(
+            "omnigent.inner.os_env.shutil.which",
+            lambda name: r"C:\Windows\System32\bash.exe" if name == "bash" else None,
+        )
+        monkeypatch.setenv("COMSPEC", r"C:\Windows\System32\cmd.exe")
+        assert _select_default_shell(True) == r"C:\Windows\System32\cmd.exe"
+
+    def test_windows_defaults_to_cmd_when_no_comspec(self, monkeypatch) -> None:
+        monkeypatch.delenv("COMSPEC", raising=False)
+        assert _select_default_shell(True) == "cmd.exe"
+
+    def test_posix_prefers_bash(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            "omnigent.inner.os_env.shutil.which",
+            lambda name: "/usr/bin/bash" if name == "bash" else None,
+        )
+        assert _select_default_shell(False) == "/usr/bin/bash"
+
+    def test_posix_falls_back_to_sh(self, monkeypatch) -> None:
+        monkeypatch.setattr("omnigent.inner.os_env.shutil.which", lambda name: None)
+        assert _select_default_shell(False) == "/bin/sh"
+
+
+@pytest.mark.windows_only
+def test_shell_impl_preserves_quotes_on_windows(tmp_path: Path) -> None:
+    """`_shell_impl` must pass a quoted command to cmd.exe verbatim.
+
+    Regression for list-based argv serialization escaping the command's own
+    quotes as ``\\"`` (so ``echo "a b"`` produced ``\\"a b\\"``) and for
+    ``cmd.exe /c`` stripping the outer quotes of a quote-leading command.
+    """
+    comspec = os.environ.get("COMSPEC", "cmd.exe")
+    result = _shell_impl(
+        command='echo "a b"',
+        timeout=15,
+        shell_path=comspec,
+        cwd=tmp_path,
+    )
+    assert result["exit_code"] == 0, result
+    assert "\\" not in result["stdout"], result["stdout"]
+    assert "a b" in result["stdout"]
+
+
+@pytest.mark.windows_only
+def test_shell_impl_runs_multiline_command_on_windows(tmp_path: Path) -> None:
+    """Regression: multi-line commands must run every line, not silently line 1."""
+    comspec = os.environ.get("COMSPEC", "cmd.exe")
+    result = _shell_impl(
+        command="echo AAA\necho BBB", timeout=15, shell_path=comspec, cwd=tmp_path
+    )
+    assert result["exit_code"] == 0, result
+    assert "AAA" in result["stdout"] and "BBB" in result["stdout"], result
+
+
+@pytest.mark.windows_only
+def test_shell_impl_timeout_kills_child_tree_on_windows(tmp_path: Path) -> None:
+    """Regression: a timeout kills the whole tree, not just cmd.exe.
+
+    A ~5s ping child under a 1s timeout must return promptly rather than waiting
+    for the orphaned child to finish.
+    """
+    import time
+
+    comspec = os.environ.get("COMSPEC", "cmd.exe")
+    start = time.monotonic()
+    result = _shell_impl(
+        command="ping -n 6 127.0.0.1 >NUL", timeout=1, shell_path=comspec, cwd=tmp_path
+    )
+    elapsed = time.monotonic() - start
+    assert result["timed_out"] is True, result
+    assert elapsed < 3, f"took {elapsed:.1f}s; child tree not killed"
+
+
+@pytest.mark.windows_only
+def test_shell_impl_nonzero_exit_on_windows(tmp_path: Path) -> None:
+    """A non-zero exit returns the code without crashing (regression for an
+    UnboundLocalError that referenced an undefined `completed` on Windows)."""
+    comspec = os.environ.get("COMSPEC", "cmd.exe")
+    result = _shell_impl(command="exit /b 7", timeout=15, shell_path=comspec, cwd=tmp_path)
+    assert result["exit_code"] == 7, result
+    assert result.get("error"), result
+
+
+@pytest.mark.windows_only
+def test_shell_impl_timeout_kills_orphaned_descendant_on_windows(tmp_path: Path) -> None:
+    """A grandchild orphaned by a launcher that exits is still killed on timeout.
+
+    The Job Object contains the whole tree; a parent-walk (psutil/taskkill) can't
+    reach a descendant whose intermediate parent has already exited.
+    """
+    import sys
+    import time
+
+    marker = tmp_path / "MARKER"
+    comspec = os.environ.get("COMSPEC", "cmd.exe")
+    # Detach a worker that writes the marker after 6s, then keep cmd busy so the
+    # 1s timeout fires; the whole tree (incl. the detached worker) must die.
+    cmd = (
+        f'start "" /b "{sys.executable}" -c '
+        f"\"import time; time.sleep(6); open(r'{marker}', 'w').close()\"\n"
+        "ping -n 10 127.0.0.1 >NUL"
+    )
+    result = _shell_impl(command=cmd, timeout=1, shell_path=comspec, cwd=tmp_path)
+    assert result["timed_out"] is True, result
+    time.sleep(8)
+    assert not marker.exists(), "orphaned worker survived the timeout"
+
+
+@pytest.mark.windows_only
+def test_tree_kill_job_close_spares_but_terminate_kills() -> None:
+    """The containment job has no kill-on-close: closing the handle leaves the
+    process running (a detached server survives a successful command), while
+    ``terminate()`` kills it (the timeout path). Tested at the job API directly
+    to avoid cmd.exe quoting in the assertion.
+    """
+    import subprocess
+    import sys
+    import time
+
+    from omnigent.inner.windows_jobobject_sandbox import create_tree_kill_job
+
+    sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        job = create_tree_kill_job()
+        assert job is not None and job.assign(sleeper.pid)
+        job.close()  # no kill-on-close
+        time.sleep(1)
+        assert sleeper.poll() is None, "close() killed the process (kill-on-close regression)"
+    finally:
+        sleeper.kill()
+        sleeper.wait(timeout=10)
+
+    victim = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        job = create_tree_kill_job()
+        assert job is not None and job.assign(victim.pid)
+        job.terminate()  # timeout path: tear the tree down
+        victim.wait(timeout=10)
+        assert victim.poll() is not None, "terminate() did not kill the process"
+    finally:
+        if victim.poll() is None:
+            victim.kill()
+            victim.wait(timeout=10)
+        job.close()
+
+
+@pytest.mark.windows_only
+def test_tree_kill_job_terminate_reaches_grandchild(tmp_path: Path) -> None:
+    """``terminate()`` kills the whole tree, including a grandchild orphaned by an
+    intermediate process — the reach a parent-walk (psutil/taskkill) can't match.
+    Helper scripts avoid all shell quoting.
+    """
+    import subprocess
+    import sys
+    import time
+
+    from omnigent.inner.windows_jobobject_sandbox import create_tree_kill_job
+
+    marker = tmp_path / "gc_marker.txt"
+    gc_py = tmp_path / "gc.py"
+    gc_py.write_text(
+        f"import time\ntime.sleep(8)\nopen({str(marker)!r}, 'w').close()\n",
+        encoding="utf-8",
+    )
+    parent_py = tmp_path / "parent.py"
+    parent_py.write_text(
+        f"import subprocess, sys, time\n"
+        f"subprocess.Popen([sys.executable, {str(gc_py)!r}])\n"
+        f"time.sleep(30)\n",
+        encoding="utf-8",
+    )
+    parent = subprocess.Popen([sys.executable, str(parent_py)])
+    try:
+        job = create_tree_kill_job()
+        assert job is not None and job.assign(parent.pid)
+        time.sleep(2)  # let the parent spawn the grandchild (both now in the job)
+        job.terminate()
+        parent.wait(timeout=10)
+        assert parent.poll() is not None
+    finally:
+        if parent.poll() is None:
+            parent.kill()
+            parent.wait(timeout=10)
+        job.close()
+    time.sleep(10)  # past the grandchild's 8s sleep — its marker must never appear
+    assert not marker.exists(), "terminate() did not reach the grandchild"
+
+
+@pytest.mark.windows_only
+def test_shell_impl_job_creation_failure_never_spawns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A missing containment job fails before a suspended child is created."""
+    import omnigent.inner.os_env as os_env_module
+    import omnigent.inner.windows_jobobject_sandbox as jobs
+
+    monkeypatch.setattr(jobs, "create_tree_kill_job", lambda: None)
+
+    def _unexpected_popen(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("cmd.exe was spawned without a containment job")
+
+    monkeypatch.setattr(os_env_module.subprocess, "Popen", _unexpected_popen)
+    with pytest.raises(OSError, match="could not create a Windows Job Object"):
+        os_env_module._run_windows_cmd_shell(
+            "echo MUST_NOT_RUN",
+            timeout=10,
+            shell_path=os.environ.get("COMSPEC", "cmd.exe"),
+            cwd=tmp_path,
+        )
+
+
+@pytest.mark.windows_only
+def test_shell_impl_job_assignment_failure_never_resumes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rejected Job assignment kills the suspended cmd.exe instead of running it."""
+    import omnigent.inner.os_env as os_env_module
+    import omnigent.inner.windows_jobobject_sandbox as jobs
+    from omnigent.inner._proc import process_alive
+
+    marker = tmp_path / "must_not_run.txt"
+    assigned_pid: list[int] = []
+    job_events: list[str] = []
+
+    class _RejectingJob:
+        def assign(self, pid: int) -> bool:
+            job_events.append("assign")
+            assigned_pid.append(pid)
+            return False
+
+        def terminate(self) -> None:
+            job_events.append("terminate")
+
+        def close(self) -> None:
+            job_events.append("close")
+
+    monkeypatch.setattr(jobs, "create_tree_kill_job", _RejectingJob)
+
+    def _unexpected_resume(_pid: int) -> bool:
+        raise AssertionError("an uncontained cmd.exe was resumed")
+
+    monkeypatch.setattr(jobs, "resume_process_threads", _unexpected_resume)
+    with pytest.raises(OSError, match="could not assign"):
+        os_env_module._run_windows_cmd_shell(
+            f'echo escaped>"{marker}"',
+            timeout=10,
+            shell_path=os.environ.get("COMSPEC", "cmd.exe"),
+            cwd=tmp_path,
+        )
+
+    assert assigned_pid
+    assert job_events == ["assign", "terminate", "close"]
+    assert not process_alive(assigned_pid[0])
+    assert not marker.exists()
+
+
+@pytest.mark.windows_only
+def test_shell_impl_abnormal_exit_terminates_and_reaps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cancellation after resume tears down and reaps the contained process tree."""
+    import subprocess
+
+    import omnigent.inner.os_env as os_env_module
+    from omnigent.inner._proc import process_alive
+
+    real_popen = subprocess.Popen
+    created_pid: list[int] = []
+
+    class _InterruptOnce:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            self._proc = real_popen(*args, **kwargs)
+            self._first_communicate = True
+            created_pid.append(self._proc.pid)
+
+        @property
+        def pid(self) -> int:
+            return self._proc.pid
+
+        @property
+        def returncode(self) -> int | None:
+            return self._proc.returncode
+
+        def communicate(self, *args: object, **kwargs: object) -> tuple[str, str]:
+            if self._first_communicate:
+                self._first_communicate = False
+                raise KeyboardInterrupt
+            return self._proc.communicate(*args, **kwargs)
+
+        def kill(self) -> None:
+            self._proc.kill()
+
+        def wait(self, *args: object, **kwargs: object) -> int:
+            return self._proc.wait(*args, **kwargs)
+
+    monkeypatch.setattr(os_env_module.subprocess, "Popen", _InterruptOnce)
+    with pytest.raises(KeyboardInterrupt):
+        os_env_module._run_windows_cmd_shell(
+            "ping -n 30 127.0.0.1 >nul",
+            timeout=30,
+            shell_path=os.environ.get("COMSPEC", "cmd.exe"),
+            cwd=tmp_path,
+        )
+
+    assert created_pid
+    assert not process_alive(created_pid[0])
+
+
+@pytest.mark.windows_only
+def test_resume_thread_failure_uses_unsigned_dword_sentinel() -> None:
+    """Win32 ``ResumeThread`` failure must compare equal to ``DWORD(-1)``."""
+    import ctypes
+    import ctypes.wintypes as wintypes
+
+    from omnigent.inner.windows_jobobject_sandbox import _RESUME_THREAD_FAILED
+
+    kernel32 = ctypes.windll.kernel32
+    assert kernel32.ResumeThread.restype is wintypes.DWORD
+    assert kernel32.ResumeThread(wintypes.HANDLE(-1)) == _RESUME_THREAD_FAILED
+
+
+@pytest.mark.windows_only
+def test_shell_impl_normal_completion_spares_detached_child(tmp_path: Path) -> None:
+    """A truly detached child survives the normal close-without-terminate path."""
+    import sys
+    import time
+
+    marker = tmp_path / "detached_survived.txt"
+    worker = tmp_path / "detached_worker.py"
+    worker.write_text(
+        f"import time\ntime.sleep(2)\nopen({str(marker)!r}, 'w', encoding='utf-8').write('ok')\n",
+        encoding="utf-8",
+    )
+    launcher = tmp_path / "detached_launcher.py"
+    launcher.write_text(
+        "import subprocess, sys\n"
+        f"subprocess.Popen([sys.executable, {str(worker)!r}], "
+        "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
+        "stderr=subprocess.DEVNULL, close_fds=True, "
+        "creationflags=0x00000008 | 0x00000200)\n",
+        encoding="utf-8",
+    )
+
+    result = _shell_impl(
+        command=f'"{sys.executable}" "{launcher}"',
+        timeout=10,
+        shell_path=os.environ.get("COMSPEC", "cmd.exe"),
+        cwd=tmp_path,
+    )
+    assert result["exit_code"] == 0, result
+    assert result["timed_out"] is False, result
+    assert not marker.exists(), "detached worker completed before the shell returned"
+
+    deadline = time.monotonic() + 8
+    while time.monotonic() < deadline and not marker.exists():
+        time.sleep(0.05)
+    assert marker.exists(), "normal Job close killed the detached child"
+
+
+@pytest.mark.windows_only
+def test_shell_impl_runs_from_hostile_temp_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A %TEMP% containing spaces, ``&``, and ``%NAME%`` must still run.
+
+    The batch path is expanded once from a private environment variable, so cmd
+    does not reinterpret percent sequences inside the resulting path.
+    """
+    import tempfile
+
+    hostile = tmp_path / "a b & %OMNIGENT_EXPAND_ME% c"
+    hostile.mkdir()
+    monkeypatch.setenv("OMNIGENT_EXPAND_ME", "expanded")
+    monkeypatch.setattr(tempfile, "tempdir", str(hostile))
+    comspec = os.environ.get("COMSPEC", "cmd.exe")
+    result = _shell_impl(command="echo spacey", timeout=15, shell_path=comspec, cwd=tmp_path)
+    assert result["exit_code"] == 0, result
+    assert "spacey" in result["stdout"], result
+
+
+@pytest.mark.windows_only
+def test_shell_impl_batch_for_loop_uses_double_percent(tmp_path: Path) -> None:
+    """Commands run in batch context, so a ``for`` loop variable is ``%%i`` (not
+    the interactive ``%i``). Documents/locks the cmd.exe semantic that the
+    batch-file approach requires."""
+    comspec = os.environ.get("COMSPEC", "cmd.exe")
+    result = _shell_impl(
+        command="for %%i in (1 2 3) do @echo N%%i",
+        timeout=15,
+        shell_path=comspec,
+        cwd=tmp_path,
+    )
+    assert result["exit_code"] == 0, result
+    assert "N1" in result["stdout"] and "N3" in result["stdout"], result

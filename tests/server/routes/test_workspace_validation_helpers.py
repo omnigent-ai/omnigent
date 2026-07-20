@@ -9,6 +9,8 @@ from __future__ import annotations
 from omnigent.server.routes._workspace_validation import (
     _is_relative_cwd,
     _is_subpath_of,
+    _is_windows_style_path,
+    is_absolute_host_path,
 )
 
 
@@ -58,3 +60,76 @@ class TestIsSubpathOf:
 
     def test_trailing_slash_boundary(self) -> None:
         assert _is_subpath_of("/a/b/c", "/a/b/") is True
+
+    # --- Windows path flavour (native-Windows host) ---
+
+    def test_windows_child_path(self) -> None:
+        assert _is_subpath_of(r"C:\repo\child", r"C:\repo") is True
+
+    def test_windows_not_a_subpath(self) -> None:
+        assert _is_subpath_of(r"C:\repo", r"C:\other") is False
+
+    def test_windows_case_insensitive(self) -> None:
+        assert _is_subpath_of(r"c:\repo\child", r"C:\Repo") is True
+
+    def test_windows_mixed_separators(self) -> None:
+        assert _is_subpath_of("C:/repo/child", r"C:\repo") is True
+
+    def test_windows_prefix_collision(self) -> None:
+        """``C:\\repo2`` must NOT be treated as a subpath of ``C:\\repo``."""
+        assert _is_subpath_of(r"C:\repo2\x", r"C:\repo") is False
+
+    def test_windows_unc_child(self) -> None:
+        assert _is_subpath_of(r"\\srv\share\proj\src", r"\\srv\share\proj") is True
+
+    def test_posix_backslash_filename_not_contained(self) -> None:
+        r"""``\`` is a legal POSIX filename char: boundary ``/tmp/a\b`` is a
+        single component and must NOT contain ``/tmp/a/b/child``."""
+        assert _is_subpath_of("/tmp/a/b/child", r"/tmp/a\b") is False
+
+
+class TestIsWindowsStylePath:
+    """Detection must key on drive/UNC prefix, not an embedded backslash."""
+
+    def test_drive_backslash(self) -> None:
+        assert _is_windows_style_path(r"C:\repo") is True
+
+    def test_drive_forward_slash(self) -> None:
+        assert _is_windows_style_path("C:/repo") is True
+
+    def test_unc(self) -> None:
+        assert _is_windows_style_path(r"\\server\share") is True
+
+    def test_posix_root(self) -> None:
+        assert _is_windows_style_path("/tmp/a/b") is False
+
+    def test_posix_with_backslash_char(self) -> None:
+        assert _is_windows_style_path(r"/tmp/a\b") is False
+
+
+class TestIsAbsoluteHostPath:
+    """Tests for the POSIX-or-Windows absolute-path gate."""
+
+    def test_posix_absolute(self) -> None:
+        assert is_absolute_host_path("/Users/alice/project") is True
+
+    def test_windows_drive_backslash(self) -> None:
+        assert is_absolute_host_path(r"C:\Users\alice") is True
+
+    def test_windows_drive_forward_slash(self) -> None:
+        assert is_absolute_host_path("C:/Users/alice") is True
+
+    def test_unc_path(self) -> None:
+        assert is_absolute_host_path(r"\\server\share") is True
+
+    def test_relative_rejected(self) -> None:
+        assert is_absolute_host_path("project/src") is False
+
+    def test_dot_relative_rejected(self) -> None:
+        assert is_absolute_host_path("./src") is False
+
+    def test_bare_name_rejected(self) -> None:
+        assert is_absolute_host_path("project") is False
+
+    def test_empty_rejected(self) -> None:
+        assert is_absolute_host_path("") is False

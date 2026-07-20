@@ -62,7 +62,7 @@ def load_or_generate_cookie_secret(data_dir: str | os.PathLike[str]) -> str:
 
     path = Path(data_dir) / _SECRET_FILENAME
     if path.exists():
-        existing = path.read_text().strip()
+        existing = path.read_text(encoding="utf-8").strip()
         if existing:
             return existing
 

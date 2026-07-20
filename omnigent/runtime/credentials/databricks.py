@@ -53,6 +53,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from omnigent._encoding import detect_encoding
+
 _logger = logging.getLogger(__name__)
 
 # Default location of the Databricks CLI config file when
@@ -331,7 +333,8 @@ def _try_resolve_from_cfg(profile: str | None, cfg_path: Path) -> WorkspaceCreds
         return None
 
     config = configparser.ConfigParser()
-    config.read(cfg_path)
+    # Vendor-written cfg (CLI emits UTF-8): detect UTF-8 first, locale fallback.
+    config.read(cfg_path, encoding=detect_encoding(cfg_path))
 
     if profile is not None:
         # _read_section raises _SectionPresentButInvalid when the

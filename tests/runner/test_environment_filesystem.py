@@ -13,11 +13,11 @@ import pytest
 from fastapi import FastAPI
 
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID
-from omnigent.entities.environment_filesystem import FilesystemPathNotFound
+from omnigent.entities.environment_filesystem import FilesystemPathNotFound, InvalidPath
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.os_env import create_os_environment
 from omnigent.runner import create_runner_app
-from omnigent.runner.environment_filesystem import CallerProcessFilesystem
+from omnigent.runner.environment_filesystem import CallerProcessFilesystem, _validate_path
 from omnigent.runner.resource_registry import SessionResourceRegistry
 from tests.runner.helpers import NullServerClient
 
@@ -207,7 +207,7 @@ async def test_read_text_byte_cap_truncates_on_utf8_boundary(
     """
     # "é" is 2 bytes (0xC3 0xA9) in UTF-8; on "aé" a 2-byte cap keeps the "a"
     # and lands mid-codepoint inside "é".
-    (workspace / "accents.txt").write_text("aé")
+    (workspace / "accents.txt").write_text("aé", encoding="utf-8")
 
     os_env = create_os_environment(
         OSEnvSpec(type="caller_process", cwd=str(workspace), sandbox=OSEnvSandboxSpec(type="none"))
@@ -302,7 +302,7 @@ async def test_delete_directory_recursive(
     assert not (workspace / "src").exists()
 
 
-# ── shell-injection regression for stat/_stat_via_shell/_check_dir_empty ──
+# ── shell-injection regressions for stat and anchored delete ──
 
 
 @pytest.mark.asyncio
@@ -312,15 +312,14 @@ async def test_delete_path_with_command_substitution_does_not_execute(
 ) -> None:
     """A DELETE path containing ``$(...)`` must not execute the substituted command.
 
-    Regression test: the DELETE handler reaches ``_stat_via_shell``
-    and ``_check_dir_empty``, which used to interpolate the caller-controlled
+    Regression test: the old DELETE helpers interpolated the caller-controlled
     path into a double-quoted ``python3 -c`` script. The shell expanded
-    ``$(...)`` before python ran, giving arbitrary command execution.
+    ``$(...)`` before Python ran, giving arbitrary command execution.
 
     The payload ``inj$(touch PWNED)x`` would, on the vulnerable code, run
     ``touch PWNED`` in the workspace (cwd of the helper). With the path
-    embedded as a Python literal via ``json.dumps`` and the whole script
-    shell-quoted, the string is statted verbatim — no command runs.
+    The anchored delete helper now embeds the path as a Python literal via
+    ``json.dumps`` and shell-quotes the whole script, so no command runs.
     """
     import urllib.parse
 
@@ -335,7 +334,7 @@ async def test_delete_path_with_command_substitution_does_not_execute(
         f"/{DEFAULT_ENVIRONMENT_ID}/filesystem/{encoded}"
     )
 
-    # The literal path does not exist, so the stat fails and the endpoint
+    # The literal path does not exist, so classification fails and the endpoint
     # returns 404 — on BOTH old and new code the HTTP status is 404 (the
     # substituted command produced empty output, leaving "injx"). The marker
     # is the discriminator: it is created only if the injection executed.
@@ -357,11 +356,11 @@ async def test_delete_real_file_with_command_substitution_name(
 
     Usability guard for the shell-injection fix: embedding the path as a Python
     literal must treat shell metacharacters as ordinary filename bytes, so a
-    legitimately (if unusually) named file is statted and removed correctly.
+    legitimately (if unusually) named file is classified and removed correctly.
 
     If the path were still shell-interpreted, ``$(whoami)`` would expand and
-    ``os.stat`` would receive a *different* string (``data<user>.txt``), the
-    stat would miss, and the real file would be left on disk — surfacing as a
+    the helper would receive a *different* string (``data<user>.txt``), the
+    lookup would miss, and the real file would be left on disk — surfacing as a
     404 and a surviving file. Asserting a successful delete of the real file
     proves the verbatim path made it through.
     """
@@ -386,9 +385,9 @@ async def test_delete_real_file_with_command_substitution_name(
     body = resp.json()
     assert body["deleted"] is True, "The endpoint must report the file as deleted."
     assert body["type"] == "file", "The metacharacter-named entry is a regular file."
-    # The verbatim-named file is gone — proves stat + rm both used the literal path.
+    # The verbatim-named file is gone — proves the anchored helper used the literal path.
     assert not target.exists(), (
-        f"File {weird_name!r} still on disk after a reported delete; the rm "
+        f"File {weird_name!r} still on disk after a reported delete; the helper "
         "did not target the literal path."
     )
 
@@ -651,9 +650,10 @@ async def test_shell_timeout_returns_structured_result(
     client: httpx.AsyncClient,
 ) -> None:
     """POST /shell returns the timeout result instead of raising."""
+    command = "ping -n 3 127.0.0.1 >nul" if os.name == "nt" else "sleep 2"
     resp = await client.post(
         f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/shell",
-        json={"command": "sleep 2", "timeout": 1},
+        json={"command": command, "timeout": 1},
     )
     assert resp.status_code == 200
     body = resp.json()
@@ -1570,3 +1570,318 @@ async def test_worktree_session_uses_session_workspace_for_changes(
             "The /changes endpoint is reading from the runner's global "
             "workspace instead of the session's worktree workspace."
         )
+
+
+class TestPythonRunCommand:
+    """`_python_run_command` builds a platform-correct Python invocation."""
+
+    def test_posix_uses_python3_dash_c(self, monkeypatch) -> None:
+        from omnigent.runner import environment_filesystem as efs
+
+        monkeypatch.setattr(efs, "IS_WINDOWS", False)
+        # A script without single quotes so _shell_quote wraps it cleanly.
+        cmd = efs._python_run_command("import os")
+        assert cmd == "python3 -c 'import os'"
+
+    def test_windows_base64_roundtrips(self, monkeypatch) -> None:
+        import base64
+
+        from omnigent.runner import environment_filesystem as efs
+
+        monkeypatch.setattr(efs, "IS_WINDOWS", True)
+        script = "import os\nprint(os.getcwd())"
+        cmd = efs._python_run_command(script)
+        # A multi-line script must not leak raw newlines into the command line.
+        assert "\n" not in cmd
+        assert " -c " in cmd
+        # The embedded base64 decodes back to the original script.
+        b64 = cmd.split("b64decode('")[1].split("')")[0]
+        assert base64.b64decode(b64).decode() == script
+
+
+@pytest.mark.asyncio
+@pytest.mark.windows_only
+async def test_inactive_sandbox_shell_runs_quoted_command_windows(tmp_path: Path) -> None:
+    """Regression: Windows inactive-sandbox helper startup + quoted execution.
+
+    Guards two Windows defects together: the ``sandbox.type: none`` helper
+    previously failed to spawn (message-less AssertionError -> ``{"error": ""}``
+    because its tmpdir was only created for active sandboxes), and quoted
+    commands were mangled to ``\\"a b\\"`` by list-based argv serialization
+    through ``cmd.exe``.
+    """
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", cwd=str(ws), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    result = await os_env.shell('echo "a b"')
+    assert not result.get("error"), result  # helper spawned + ran
+    assert result.get("exit_code") == 0, result
+    assert "\\" not in result["stdout"], result["stdout"]  # not \"a b\"
+    assert "a b" in result["stdout"]
+
+
+@pytest.mark.asyncio
+async def test_list_dir_returns_forward_slash_nested_paths(tmp_path: Path) -> None:
+    """Nested entry paths use POSIX '/' regardless of host OS (os.path.join
+    would emit '\' on Windows, which the API/glob/frontend reject)."""
+    ws = tmp_path / "ws"
+    (ws / "src").mkdir(parents=True)
+    (ws / "src" / "main.py").write_text("x")
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", cwd=str(ws), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    fs = CallerProcessFilesystem(os_env)
+    page = await fs.list_dir("src")
+    assert [e.path for e in page.data] == ["src/main.py"]
+
+
+@pytest.mark.asyncio
+async def test_search_matches_forward_slash_include(tmp_path: Path) -> None:
+    """search honours '/'-separated include globs and returns '/'-paths."""
+    ws = tmp_path / "ws"
+    (ws / "src").mkdir(parents=True)
+    (ws / "src" / "main.py").write_text("x")
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", cwd=str(ws), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    fs = CallerProcessFilesystem(os_env)
+    results = await fs.search_files("main", include=["src/**"])
+    assert [e.path for e in results] == ["src/main.py"]
+
+
+@pytest.mark.asyncio
+async def test_delete_directory_symlink_removes_link_not_target(tmp_path: Path) -> None:
+    """Deleting a directory symlink removes the link, not the target tree."""
+    ws = tmp_path / "ws"
+    target = ws / "real"
+    target.mkdir(parents=True)
+    (target / "keep.txt").write_text("x")
+    link = ws / "link"
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"cannot create directory symlink: {exc}")
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", cwd=str(ws), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    fs = CallerProcessFilesystem(os_env)
+    result = await fs.delete("link", recursive=True)
+    assert result.type == "symlink"
+    assert not link.is_symlink()
+    assert target.is_dir() and (target / "keep.txt").exists()
+
+
+@pytest.mark.asyncio
+async def test_list_dir_two_level_nested_path_forward_slash(tmp_path: Path) -> None:
+    """Multi-level paths stay '/'-separated end to end (_validate_path
+    normalizes, so stat/write/edit/list all agree)."""
+    ws = tmp_path / "ws"
+    (ws / "src" / "pkg").mkdir(parents=True)
+    (ws / "src" / "pkg" / "main.py").write_text("x")
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", cwd=str(ws), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    fs = CallerProcessFilesystem(os_env)
+    page = await fs.list_dir("src/pkg")
+    assert [e.path for e in page.data] == ["src/pkg/main.py"]
+    results = await fs.search_files("main", include=["src/**"])
+    assert [e.path for e in results] == ["src/pkg/main.py"]
+
+
+@pytest.mark.windows_only
+@pytest.mark.asyncio
+async def test_delete_directory_junction_removes_link_not_target(tmp_path: Path) -> None:
+    """Deleting a Windows directory junction removes the junction, not the
+    target (os.path.islink misses junctions, so the delete keys off the reparse
+    attribute from lstat)."""
+    import subprocess
+
+    ws = tmp_path / "ws"
+    target = ws / "real"
+    target.mkdir(parents=True)
+    (target / "keep.txt").write_text("x")
+    junction = ws / "jx"
+    rc = subprocess.run(
+        f'mklink /J "{junction}" "{target}"', shell=True, capture_output=True
+    ).returncode
+    if rc != 0:
+        pytest.skip("could not create a junction")
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", cwd=str(ws), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    fs = CallerProcessFilesystem(os_env)
+    result = await fs.delete("jx", recursive=True)
+    assert result.type == "symlink"
+    assert not junction.exists()
+    assert target.is_dir() and (target / "keep.txt").exists()
+
+
+@pytest.mark.asyncio
+async def test_delete_broken_directory_junction_succeeds(tmp_path: Path) -> None:
+    """A Windows junction remains deletable after its target disappears."""
+    ws = tmp_path / "ws"
+    target = ws / "real"
+    target.mkdir(parents=True)
+    junction = ws / "dangling_junction"
+    result = subprocess.run(
+        f'mklink /J "{junction}" "{target}"',
+        shell=True,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        pytest.skip("could not create a junction")
+    target.rmdir()
+    assert os.path.lexists(junction) and not junction.exists()
+
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", cwd=str(ws), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    fs = CallerProcessFilesystem(os_env)
+
+    deleted = await fs.delete("dangling_junction")
+
+    assert deleted.type == "symlink"
+    assert not os.path.lexists(junction)
+
+
+@pytest.mark.asyncio
+async def test_delete_broken_symlink_succeeds(tmp_path: Path) -> None:
+    """A broken symlink (its target is gone) is still deletable: delete keys off
+    ``os.lstat`` — ``os.stat`` would follow the link, fail, and report it as
+    'missing', leaving the dangling link stuck forever."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    link = ws / "dangling"
+    try:
+        link.symlink_to(ws / "does_not_exist")
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"cannot create symlink: {exc}")
+    assert link.is_symlink() and not link.exists()  # broken by construction
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", cwd=str(ws), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    fs = CallerProcessFilesystem(os_env)
+    result = await fs.delete("dangling")
+    assert result.type == "symlink"
+    assert not link.is_symlink()
+
+
+@pytest.mark.asyncio
+async def test_write_entry_path_is_forward_slash_for_nested(tmp_path: Path) -> None:
+    """The write result's entry path/id use '/' even for a nested path.
+    ``Path.relative_to`` renders '\\' on Windows; ``_entry_from_stat`` normalizes
+    centrally so every entry the API returns is '/'-separated."""
+    ws = tmp_path / "ws"
+    (ws / "sub" / "dir").mkdir(parents=True)
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", cwd=str(ws), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    fs = CallerProcessFilesystem(os_env)
+    result = await fs.write("sub/dir/f.py", b"x")
+    assert result.entry.path == "sub/dir/f.py"
+    assert "\\" not in result.entry.path
+    assert "\\" not in result.entry.id
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "C:outside.txt",
+        r"D:..\outside.txt",
+        r"C:\outside.txt",
+        r"\outside.txt",
+        r"\\server\share\outside.txt",
+        r"\\?\C:\outside.txt",
+    ],
+)
+def test_validate_path_rejects_windows_drive_and_root_forms(path: str) -> None:
+    """Windows drive-relative, absolute, UNC, and device paths never pass."""
+    with pytest.raises(InvalidPath):
+        _validate_path(path)
+
+
+@pytest.mark.asyncio
+async def test_delete_through_escaping_intermediate_symlink_is_rejected(
+    tmp_path: Path,
+) -> None:
+    """An intermediate symlink cannot redirect a deletion outside the root."""
+    ws = tmp_path / "ws"
+    outside = tmp_path / "outside"
+    ws.mkdir()
+    outside.mkdir()
+    victim = outside / "keep.txt"
+    victim.write_text("keep")
+    link = ws / "escape"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"cannot create directory symlink: {exc}")
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", cwd=str(ws), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    fs = CallerProcessFilesystem(os_env)
+
+    with pytest.raises(InvalidPath):
+        await fs.delete("escape/keep.txt")
+
+    assert victim.read_text() == "keep"
+
+
+@pytest.mark.asyncio
+async def test_delete_through_in_root_intermediate_symlink_succeeds(
+    tmp_path: Path,
+) -> None:
+    """An intermediate symlink may resolve to another directory inside root."""
+    ws = tmp_path / "ws"
+    target = ws / "target"
+    target.mkdir(parents=True)
+    victim = target / "remove.txt"
+    victim.write_text("remove")
+    link = ws / "alias"
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"cannot create directory symlink: {exc}")
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", cwd=str(ws), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    fs = CallerProcessFilesystem(os_env)
+
+    result = await fs.delete("alias/remove.txt")
+
+    assert result.type == "file"
+    assert not victim.exists()
+    assert link.is_symlink()
+
+
+@pytest.mark.windows_only
+@pytest.mark.asyncio
+async def test_delete_through_escaping_intermediate_junction_is_rejected(
+    tmp_path: Path,
+) -> None:
+    """An intermediate Windows junction cannot redirect deletion outside."""
+    ws = tmp_path / "ws"
+    outside = tmp_path / "outside"
+    ws.mkdir()
+    outside.mkdir()
+    victim = outside / "keep.txt"
+    victim.write_text("keep")
+    junction = ws / "escape"
+    result = subprocess.run(
+        f'mklink /J "{junction}" "{outside}"',
+        shell=True,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        pytest.skip("could not create a junction")
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", cwd=str(ws), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    fs = CallerProcessFilesystem(os_env)
+
+    with pytest.raises(InvalidPath):
+        await fs.delete("escape/keep.txt")
+
+    assert victim.read_text() == "keep"

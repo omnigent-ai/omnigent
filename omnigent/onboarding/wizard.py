@@ -26,6 +26,8 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.syntax import Syntax
 
+from omnigent._encoding import detect_encoding
+
 console = Console()
 
 # ANSI helpers - used in arrow-menu labels (rendered via sys.stdout.write,
@@ -73,8 +75,9 @@ def _arrow_menu(
     cursor = default
     selected: set[int] = set()
 
-    # Fall back to number input if not a real terminal.
-    if not sys.stdin.isatty():
+    # Fall back to number input if not a real terminal (or on Windows, which
+    # has no termios/tty raw mode).
+    if not sys.stdin.isatty() or sys.platform == "win32":
         return _arrow_menu_fallback(options, default=default, disabled=disabled, multi=multi)
 
     import select as _select
@@ -279,8 +282,9 @@ def _text_prompt(
     :returns: The user's input (or *default* on bare enter).
     :raises _GoBack: When the user presses Escape and *allow_back* is True.
     """
-    # Non-tty fallback -- just use click.prompt.
-    if not sys.stdin.isatty():
+    # Non-tty fallback -- just use click.prompt. Windows also takes this path
+    # (no termios/tty raw mode).
+    if not sys.stdin.isatty() or sys.platform == "win32":
         raw = str(
             click.prompt(
                 label,
@@ -469,7 +473,8 @@ def _list_databricks_profiles() -> list[str]:
         return []
     parser = configparser.ConfigParser()
     try:
-        parser.read(cfg_path)
+        # ~/.databrickscfg is vendor-written; detect UTF-8 first, locale fallback.
+        parser.read(cfg_path, encoding=detect_encoding(cfg_path))
     except configparser.Error:
         return []
     return [s for s in parser.sections() if s != "DEFAULT"] or (
@@ -1301,7 +1306,7 @@ def _save_yaml(content: str, filename: str) -> Path:
     """Write YAML content to ~/.omnigent/agents/<filename>."""
     _AGENTS_DIR.mkdir(parents=True, exist_ok=True)
     path = _AGENTS_DIR / filename
-    path.write_text(content)
+    path.write_text(content, encoding="utf-8")
     return path
 
 

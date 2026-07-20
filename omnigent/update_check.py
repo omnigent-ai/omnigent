@@ -47,6 +47,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from omnigent._encoding import detect_encoding
+
 if TYPE_CHECKING:
     # Imported only for type hints; the heavy/optional imports remain lazy
     # at runtime so importing this module stays cheap.
@@ -400,7 +402,7 @@ def _index_from_uv_config() -> str:
 
     for path in (_user_config_base() / "uv" / "uv.toml", Path("/etc/uv/uv.toml")):
         try:
-            data = tomllib.loads(path.read_text())
+            data = tomllib.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
         legacy = data.get("index-url")
@@ -447,7 +449,9 @@ def _index_from_pip_config() -> str:
     for path in candidates:
         parser = configparser.ConfigParser(interpolation=None)
         try:
-            if not parser.read(path):
+            # pip 26.1 reads pip.conf as UTF-8; detect UTF-8 first with a locale
+            # fallback so a valid UTF-8 corporate config isn't silently skipped.
+            if not parser.read(path, encoding=detect_encoding(path)):
                 continue
         except (configparser.Error, OSError, UnicodeDecodeError):
             continue
@@ -697,7 +701,7 @@ def _read_cache() -> _CacheEntry | None:
         JSON, otherwise ``None``.
     """
     try:
-        raw = _CACHE_FILE.read_text()
+        raw = _CACHE_FILE.read_text(encoding="utf-8")
         data = json.loads(raw)
         return _CacheEntry(
             last_check_epoch=float(data["last_check_epoch"]),
@@ -1171,7 +1175,7 @@ def _safe_read_dist_file(dist: importlib.metadata.Distribution, name: str) -> st
         missing / unreadable / empty.
     """
     try:
-        text = dist.read_text(name)
+        text = dist.read_text(name)  # enc-ok: importlib metadata read_text (no encoding kwarg)
     except (OSError, UnicodeDecodeError):
         return None
     if text is None:

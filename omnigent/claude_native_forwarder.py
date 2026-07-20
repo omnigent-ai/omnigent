@@ -4412,7 +4412,7 @@ def _complete_jsonl_end_offset(path: Path) -> int:
         for missing files or a single partial first record.
     """
     try:
-        with path.open("rb") as handle:
+        with path.open(mode="rb") as handle:
             handle.seek(0, os.SEEK_END)
             size = handle.tell()
             if size == 0:
@@ -4446,7 +4446,7 @@ def _jsonl_cursor_fingerprint(path: Path, byte_offset: int) -> str | None:
     if byte_offset < 0:
         return None
     try:
-        with path.open("rb") as handle:
+        with path.open(mode="rb") as handle:
             handle.seek(0, os.SEEK_END)
             size = handle.tell()
             if byte_offset > size:

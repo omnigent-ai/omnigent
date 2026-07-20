@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from openai import OpenAI, Stream
     from openai.types.chat import ChatCompletionChunk
 
+from .._encoding import detect_encoding
 from .async_utils import run_sync_on_thread
 from .executor import (
     Executor,
@@ -200,7 +201,10 @@ def _read_databrickscfg_file_fallback(profile: str | None = None) -> DatabricksC
         return None
 
     config = configparser.ConfigParser()
-    config.read(cfg_path)
+    # ~/.databrickscfg is vendor-written (the Databricks CLI emits UTF-8):
+    # detect the file's codec — UTF-8 first, locale fallback — so it reads
+    # correctly under both legacy and UTF-8-mode interpreters.
+    config.read(cfg_path, encoding=detect_encoding(cfg_path))
 
     resolved_profile = profile or os.environ.get("DATABRICKS_CONFIG_PROFILE")
     if resolved_profile and resolved_profile in config:
@@ -256,7 +260,10 @@ def _read_databrickscfg_host(profile: str | None = None) -> str | None:
         return None
 
     config = configparser.ConfigParser()
-    config.read(cfg_path)
+    # ~/.databrickscfg is vendor-written (the Databricks CLI emits UTF-8):
+    # detect the file's codec — UTF-8 first, locale fallback — so it reads
+    # correctly under both legacy and UTF-8-mode interpreters.
+    config.read(cfg_path, encoding=detect_encoding(cfg_path))
 
     resolved_profile = profile or os.environ.get("DATABRICKS_CONFIG_PROFILE")
     if resolved_profile:
@@ -602,7 +609,8 @@ def _databrickscfg_profiles_for_host(host: str) -> list[str]:
         return []
     config = configparser.ConfigParser()
     try:
-        config.read(cfg_path)
+        # Detect the vendor cfg's codec (UTF-8 first, locale fallback).
+        config.read(cfg_path, encoding=detect_encoding(cfg_path))
     except configparser.Error:
         return []
     wanted = _norm(host)

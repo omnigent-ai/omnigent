@@ -87,12 +87,12 @@ _CLEAR_API_KEY_HELPER_SCRIPT = """\
 import json, os
 path = os.path.expanduser("~/.claude/settings.json")
 try:
-    with open(path) as handle:
+    with open(path, encoding="utf-8") as handle:
         settings = json.load(handle)
 except (FileNotFoundError, ValueError):
     raise SystemExit(0)
 if isinstance(settings, dict) and settings.pop("apiKeyHelper", None) is not None:
-    with open(path, "w") as handle:
+    with open(path, "w", encoding="utf-8") as handle:
         json.dump(settings, handle, indent=2)
 """
 
@@ -237,7 +237,7 @@ class _IsloClient:
         """Upload one file to an absolute path in the sandbox."""
         wrapper = self._client._client_wrapper
         try:
-            with local_path.open("rb") as file_obj:
+            with local_path.open(mode="rb") as file_obj:
                 response = wrapper.httpx_client.request(
                     f"sandboxes/{_url_component(name)}/files",
                     base_url=wrapper.get_environment().compute,

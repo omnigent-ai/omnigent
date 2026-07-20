@@ -77,7 +77,7 @@ def test_read_text_file_returns_utf8_content(tmp_path: Path) -> None:
     This is exactly the payload the file viewer renders; if it were
     empty the viewer would show a blank file while the agent is asleep.
     """
-    (tmp_path / "note.md").write_text("# Title\nbody\n")
+    (tmp_path / "note.md").write_text("# Title\nbody\n", encoding="utf-8", newline="\n")
     reader = WorkspaceReader(tmp_path)
 
     result = reader.list_or_read("note.md")
@@ -141,7 +141,7 @@ def test_oversize_text_split_on_codepoint_stays_text(tmp_path: Path, monkeypatch
     monkeypatch.setattr("omnigent.workspace_fs._MAX_READ_BYTES", 4)
     # "aé" → b"a\xc3\xa9"; cap 4 keeps "aé" whole, so pad so the cap lands
     # inside the é: 3 ASCII + é = b"abc\xc3\xa9", cap 4 splits the é.
-    (tmp_path / "u.txt").write_text("abcé")
+    (tmp_path / "u.txt").write_text("abcé", encoding="utf-8")
     reader = WorkspaceReader(tmp_path)
 
     result = reader.list_or_read("u.txt")
@@ -284,7 +284,7 @@ def test_changes_lists_git_working_tree_modifications(tmp_path: Path) -> None:
     so it works identically whether the runner or the host answers.
     """
     _git_repo(tmp_path)
-    (tmp_path / "committed.txt").write_text("modified\n")
+    (tmp_path / "committed.txt").write_text("modified\n", encoding="utf-8", newline="\n")
     (tmp_path / "new.txt").write_text("added\n")
     reader = WorkspaceReader(tmp_path)
 
@@ -309,7 +309,7 @@ def test_diff_returns_before_and_after_for_modified_file(tmp_path: Path) -> None
     and ``after`` from disk — both readable without a runner.
     """
     _git_repo(tmp_path)
-    (tmp_path / "committed.txt").write_text("modified\n")
+    (tmp_path / "committed.txt").write_text("modified\n", encoding="utf-8", newline="\n")
     reader = WorkspaceReader(tmp_path)
 
     result = reader.diff("conv_x", "committed.txt")

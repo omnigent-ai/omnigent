@@ -87,7 +87,7 @@ class ToolState:
         path = self._path_for(key)
         if not path.exists():
             return default
-        with path.open("r") as f:
+        with path.open("r", encoding="utf-8") as f:
             # Shared lock: allow parallel reads, block concurrent writers
             # briefly so we see a complete JSON payload.
             _lock_file(f, exclusive=False)
@@ -110,7 +110,7 @@ class ToolState:
         # Write through a temp file + rename so a reader never sees
         # a half-written JSON payload even without a lock.
         tmp = path.with_suffix(_KEY_SUFFIX + ".tmp")
-        with tmp.open("w") as f:
+        with tmp.open("w", encoding="utf-8") as f:
             json.dump(value, f)
         tmp.replace(path)
 
@@ -182,7 +182,7 @@ class ToolState:
         # we seek to 0 before read. Opening with ``r+`` would fail
         # when the file doesn't exist yet, which is a common first-
         # call case for a tool.
-        with thread_lock, path.open("a+") as f:
+        with thread_lock, path.open("a+", encoding="utf-8") as f:
             _lock_file(f, exclusive=True)
             try:
                 value = _read_transaction_value(f, default)

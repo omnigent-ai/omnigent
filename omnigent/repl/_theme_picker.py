@@ -192,6 +192,10 @@ def _detect_terminal_background() -> Literal["dark", "light"] | None:
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         return None
 
+    if sys.platform == "win32":
+        # The OSC 11 query below needs POSIX termios/tty raw mode.
+        return None
+
     import select
     import termios
     import tty
@@ -306,8 +310,9 @@ def startup_theme_picker(
     detected = _detect_terminal_background()
     selected = 0 if detected == "dark" else 1  # dark=0, light=1
 
-    if not sys.stdin.isatty():
-        # Non-interactive — use detected or default to light.
+    if not sys.stdin.isatty() or sys.platform == "win32":
+        # Non-interactive, or Windows (no POSIX termios raw-mode picker):
+        # use the detected/default theme and skip the interactive picker.
         theme = DARK_THEME if detected == "dark" else LIGHT_THEME
         update_user_config(theme=theme.name)
         return theme

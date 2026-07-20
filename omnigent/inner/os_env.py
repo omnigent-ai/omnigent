@@ -26,6 +26,7 @@ from omnigent.runner.identity import (
     strip_runner_auth_secrets,
 )
 
+from . import _proc
 from .async_utils import run_sync_on_thread
 from .credential_proxy import (
     CredentialProxyRuntime,
@@ -495,7 +496,13 @@ class _HelperProcessClient:
         # paths/booleans — but we still keep the file private and ephemeral.
         r_fd: int | None = None
         if IS_WINDOWS:
-            assert self._tmpdir is not None
+            # Windows has no pass_fds, so the config is delivered via a private
+            # file in the helper's tmpdir. That dir is created above only for
+            # active sandboxes; create one here too when the sandbox is inactive
+            # (sandbox.type: none — used by polly and every example agent) so the
+            # helper still gets a config file to read.
+            if self._tmpdir is None:
+                self._tmpdir = create_private_tmpdir()
             config_file = self._tmpdir / "helper-config.json"
             config_file.write_bytes(config_bytes)
             config_arg = ["--config-file", str(config_file)]
@@ -900,11 +907,7 @@ def create_os_environment(spec: OSEnvSpec | None) -> OSEnvironment | None:
             "os_env.start_in_scratch requires an active sandbox; "
             f"resolved sandbox type {sandbox.backend_type!r} is inactive"
         )
-    shell_path = shutil.which("bash") or shutil.which("sh")
-    if shell_path is None:
-        # No POSIX shell on PATH. On Windows fall back to cmd.exe; elsewhere
-        # keep the historical /bin/sh default.
-        shell_path = os.environ.get("COMSPEC", "cmd.exe") if IS_WINDOWS else "/bin/sh"
+    shell_path = _select_default_shell(IS_WINDOWS)
     egress_rules = spec.sandbox.egress_rules if spec.sandbox else None
     egress_allow_private = (
         spec.sandbox.egress_allow_private_destinations if spec.sandbox else False
@@ -1177,7 +1180,7 @@ def _is_binary_file(path: Path) -> bool:
     :param path: Absolute path of the file to classify.
     :returns: ``True`` if the prefix contains a NUL or is not decodable UTF-8.
     """
-    with path.open("rb") as fh:
+    with path.open(mode="rb") as fh:
         prefix = fh.read(_BINARY_SNIFF_BYTES)
     if b"\x00" in prefix:
         return True
@@ -1217,7 +1220,7 @@ def _read_binary_impl(path: Path, max_binary_bytes: int | None) -> OpResult:
                 "View or download it via the file viewer."
             ),
         }
-    with path.open("rb") as fh:
+    with path.open(mode="rb") as fh:
         payload = fh.read(max_binary_bytes)
     return {
         "path": str(path),
@@ -1381,6 +1384,113 @@ def _truncate_output(text: str, label: str, limit: int = _MAX_TOOL_OUTPUT_CHARS)
     )
 
 
+# winbase.h; subprocess does not expose it. Spawn the child suspended so it is
+# assigned to the containment job BEFORE cmd.exe can launch any grandchildren.
+_CREATE_SUSPENDED = 0x00000004
+_CMD_SCRIPT_ENV = "OMNIGENT_INTERNAL_CMD_SCRIPT"
+
+
+def _run_windows_cmd_shell(
+    command: str, *, timeout: int, shell_path: str, cwd: Path
+) -> tuple[str, str, int]:
+    """Run ``command`` through cmd.exe via a temp batch file.
+
+    ``cmd.exe /c "<inline>"`` stops at the first newline and mangles quoting;
+    writing the command to a UTF-8 ``.cmd`` (with ``chcp 65001``) runs it
+    verbatim, so multi-line, quoted, and non-ASCII commands all work.
+
+    The command runs in **batch context**, so a ``for`` loop variable is written
+    ``%%i`` (not ``%i`` as on an interactive prompt) — a known cmd.exe semantic
+    difference, kept because batch is what makes multi-line/quoting reliable.
+
+    Containment: a plain Job Object holds the whole tree. The child is spawned
+    ``CREATE_SUSPENDED`` and assigned to the job before it is resumed, so no
+    grandchild can escape in a spawn/assign race. The job has **no**
+    kill-on-close limit — a successful run's detached children (e.g. a server
+    the command started) survive. A timeout or any other abnormal post-spawn
+    exit terminates the job tree (including orphaned grandchildren).
+
+    :raises subprocess.TimeoutExpired: On timeout, after killing the tree.
+    :raises OSError: If race-free Job Object containment cannot be established.
+    :returns: ``(stdout, stderr, returncode)``.
+    """
+    from omnigent.inner.windows_jobobject_sandbox import (
+        create_tree_kill_job,
+        resume_process_threads,
+    )
+
+    fd, script_path = tempfile.mkstemp(suffix=".cmd")
+    os.close(fd)
+    job = None
+    proc: subprocess.Popen[str] | None = None
+    completed = False
+    try:
+        Path(script_path).write_text(
+            (
+                f'@set "{_CMD_SCRIPT_ENV}="\r\n'
+                "@echo off\r\n"
+                "chcp 65001>nul\r\n" + command.replace("\n", "\r\n") + "\r\n"
+            ),
+            encoding="utf-8",
+        )
+        # One-pass environment expansion preserves literal ``%NAME%`` in the
+        # path; quoting also protects spaces and ``&``. The batch clears this
+        # private variable before it runs caller code.
+        child_env = _child_shell_env()
+        child_env[_CMD_SCRIPT_ENV] = script_path
+        cmdline = f'"{shell_path}" /d /s /v:off /c ""%{_CMD_SCRIPT_ENV}%""'
+        spawn_kwargs = dict(_proc.spawn_kwargs())
+        creationflags = int(spawn_kwargs.pop("creationflags", 0)) | _CREATE_SUSPENDED
+        job = create_tree_kill_job()
+        if job is None:
+            raise OSError("could not create a Windows Job Object for cmd.exe containment")
+        proc = subprocess.Popen(
+            cmdline,
+            cwd=str(cwd),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=creationflags,
+            env=child_env,
+            **spawn_kwargs,
+        )
+        # Assign while suspended (captures future children), then resume. If the
+        # assignment/resume fails, never run the child outside containment.
+        if not job.assign(proc.pid):
+            raise OSError("could not assign the suspended cmd.exe process to its Job Object")
+        if not resume_process_threads(proc.pid):
+            raise OSError("could not resume the suspended cmd.exe process")
+        stdout, stderr = proc.communicate(timeout=timeout)
+        returncode = proc.returncode
+        if returncode is None:
+            raise RuntimeError("cmd.exe exited without publishing a return code")
+        completed = True
+        return stdout, stderr, returncode
+    finally:
+        # A normal communicate() completion is the only path that spares
+        # detached descendants. Timeout, cancellation, assignment/resume
+        # failure, and every other post-spawn exception tear down and reap.
+        if proc is not None and not completed:
+            if job is not None:
+                with contextlib.suppress(BaseException):
+                    job.terminate()
+            with contextlib.suppress(BaseException):
+                _proc.kill_tree(proc)
+            try:
+                proc.communicate(timeout=5)
+            except BaseException:  # noqa: BLE001 - cleanup must survive cancellation
+                with contextlib.suppress(BaseException):
+                    proc.kill()
+                with contextlib.suppress(BaseException):
+                    proc.wait(timeout=5)
+        if job is not None:
+            job.close()  # no kill-on-close: releasing the handle spares the tree
+        with contextlib.suppress(OSError):
+            os.remove(script_path)
+
+
 def _shell_impl(
     *,
     command: str,
@@ -1405,15 +1515,28 @@ def _shell_impl(
         characters.
     """
     argv = _shell_argv(shell_path, command)
+    windows_cmd = IS_WINDOWS and Path(shell_path).name.lower() in ("cmd.exe", "cmd")
     try:
-        completed = subprocess.run(
-            argv,
-            cwd=str(cwd),
-            env=_child_shell_env(),
-            text=True,
-            capture_output=True,
-            timeout=timeout,
-        )
+        if windows_cmd:
+            # cmd.exe can't run a quoted/multi-line command inline; route it
+            # through a contained temp batch file (see _run_windows_cmd_shell).
+            stdout_raw, stderr_raw, returncode = _run_windows_cmd_shell(
+                command, timeout=timeout, shell_path=shell_path, cwd=cwd
+            )
+        else:
+            completed = subprocess.run(
+                argv,
+                cwd=str(cwd),
+                env=_child_shell_env(),
+                text=True,
+                capture_output=True,
+                timeout=timeout,
+            )
+            stdout_raw, stderr_raw, returncode = (
+                completed.stdout,
+                completed.stderr,
+                completed.returncode,
+            )
     except subprocess.TimeoutExpired as exc:
         # ``subprocess.TimeoutExpired.stdout``/``stderr`` are ``str | bytes
         # | None`` from the stdlib; widening the op result at this boundary
@@ -1433,22 +1556,22 @@ def _shell_impl(
     except OSError as exc:
         return {"error": f"Failed to run shell command: {exc}"}
 
-    stdout = _truncate_output(completed.stdout, "stdout", max_output)
-    stderr = _truncate_output(completed.stderr, "stderr", max_output)
+    stdout = _truncate_output(stdout_raw, "stdout", max_output)
+    stderr = _truncate_output(stderr_raw, "stderr", max_output)
     result: OpResult = {
         "stdout": stdout,
         "stderr": stderr,
-        "exit_code": completed.returncode,
+        "exit_code": returncode,
         "timed_out": False,
         "shell": shell_path,
         "cwd": str(cwd),
     }
-    if completed.returncode != 0:
-        detail = completed.stderr.strip() or completed.stdout.strip()
+    if returncode != 0:
+        detail = stderr.strip() or stdout.strip()
         if detail:
-            result["error"] = f"Command exited with status {completed.returncode}: {detail}"
+            result["error"] = f"Command exited with status {returncode}: {detail}"
         else:
-            result["error"] = f"Command exited with status {completed.returncode}"
+            result["error"] = f"Command exited with status {returncode}"
     return result
 
 
@@ -1494,6 +1617,20 @@ def _shell_argv(shell_path: str, command: str) -> list[str]:
     if shell_name in ("bash", "bash.exe"):
         return [shell_path, "--noprofile", "--norc", "-c", command]
     return [shell_path, "-c", command]
+
+
+def _select_default_shell(is_windows: bool) -> str:
+    """Pick the default shell for ``sys_os_shell`` on the host.
+
+    On Windows, ``shutil.which("bash")`` resolves to the WSL launcher
+    (``C:\\Windows\\System32\\bash.exe``); using it would run every
+    ``sys_os_shell`` command inside WSL. Use the native ``cmd.exe`` (via
+    ``%COMSPEC%``) instead — :func:`_shell_argv` invokes it with ``/c``. On
+    POSIX, prefer ``bash`` then ``sh``, matching long-standing behaviour.
+    """
+    if is_windows:
+        return os.environ.get("COMSPEC", "cmd.exe")
+    return shutil.which("bash") or shutil.which("sh") or "/bin/sh"
 
 
 def _project_root() -> Path:

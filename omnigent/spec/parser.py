@@ -182,7 +182,7 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
     if not config_path.exists():
         raise FileNotFoundError(f"config.yaml not found in {root}")
 
-    raw = yaml.load(config_path.read_text(), Loader=_ConfigYamlLoader)
+    raw = yaml.load(config_path.read_text(encoding="utf-8"), Loader=_ConfigYamlLoader)
     if not isinstance(raw, dict):
         raise OmnigentError(
             f"config.yaml must be a YAML mapping, got {type(raw).__name__}",
@@ -1802,7 +1802,7 @@ def _read_contained_file(root: Path, value: str) -> str | None:
     try:
         resolved = candidate.resolve()
         if resolved.is_relative_to(root.resolve()) and resolved.is_file():
-            return resolved.read_text()
+            return resolved.read_text(encoding="utf-8")
     except OSError:
         # Path too long or invalid characters — treat as inline text.
         pass
@@ -1843,7 +1843,7 @@ def _resolve_instructions(root: Path, raw_value: object) -> str | None:
         candidate = root / filename
         try:
             if candidate.is_file():
-                return candidate.read_text()
+                return candidate.read_text(encoding="utf-8")
         except OSError:
             pass
     return None
@@ -2125,7 +2125,10 @@ def _parse_skill(skill_md: Path) -> SkillSpec:
         ``strict=False``) can catch them uniformly.
     """
     try:
-        text = skill_md.read_text()
+        # SKILL.md files are UTF-8 by convention; without an explicit encoding
+        # Path.read_text() uses the platform locale (cp1252 on Windows) and
+        # rejects perfectly valid UTF-8 skill files.
+        text = skill_md.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         # UnicodeDecodeError (a non-UTF-8 SKILL.md) is a ValueError, not an
         # OSError — funnel it through OmnigentError too so the lenient
@@ -2393,7 +2396,7 @@ def _discover_mcp_servers(
         return []
     servers: list[MCPServerConfig] = []
     for yaml_file in sorted(mcp_dir.glob("*.yaml")):
-        raw = yaml.safe_load(yaml_file.read_text())
+        raw = yaml.safe_load(yaml_file.read_text(encoding="utf-8"))
         if not isinstance(raw, dict):
             raise OmnigentError(
                 f"MCP config must be a YAML mapping: {yaml_file}",

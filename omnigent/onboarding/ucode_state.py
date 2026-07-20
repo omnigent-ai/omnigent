@@ -148,7 +148,7 @@ def read_ucode_state(workspace_url: str) -> UcodeWorkspaceState | None:
     if not _STATE_PATH.exists():
         return None
     try:
-        raw = json.loads(_STATE_PATH.read_text())
+        raw = json.loads(_STATE_PATH.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as exc:
         _logger.debug("Could not read %s: %s", _STATE_PATH, exc)
         return None
@@ -212,7 +212,7 @@ def read_current_ucode_state() -> UcodeWorkspaceState | None:
     if not _STATE_PATH.exists():
         return None
     try:
-        raw = json.loads(_STATE_PATH.read_text())
+        raw = json.loads(_STATE_PATH.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as exc:
         _logger.debug("Could not read %s: %s", _STATE_PATH, exc)
         return None

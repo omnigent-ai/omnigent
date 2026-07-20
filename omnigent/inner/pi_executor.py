@@ -1894,7 +1894,7 @@ class PiExecutor(Executor):
                 model=model,
             )
             models_path = os.path.join(tmp_dir, "models.json")
-            with open(models_path, "w") as f:
+            with open(models_path, "w", encoding="utf-8") as f:
                 json.dump(models_json, f)
             env["PI_CODING_AGENT_DIR"] = tmp_dir
             # Gateway mode relocates Pi's agent root — copy the user's global
@@ -1918,7 +1918,7 @@ class PiExecutor(Executor):
             settings_path = os.path.join(settings_dir_root, ".pi", "settings.json")
             try:
                 if os.path.exists(settings_path):
-                    with open(settings_path) as f:
+                    with open(settings_path, encoding="utf-8") as f:
                         existing_settings = json.load(f)
                     if not isinstance(existing_settings, dict):
                         existing_settings = {}
@@ -1926,12 +1926,12 @@ class PiExecutor(Executor):
                     existing_settings = {}
                 existing_settings.update(retry_settings)
                 os.makedirs(os.path.dirname(settings_path), exist_ok=True)
-                with open(settings_path, "w") as f:
+                with open(settings_path, "w", encoding="utf-8") as f:
                     json.dump(existing_settings, f, indent=2)
             except OSError:
                 fallback_path = os.path.join(tmp_dir, ".pi", "settings.json")
                 os.makedirs(os.path.dirname(fallback_path), exist_ok=True)
-                with open(fallback_path, "w") as f:
+                with open(fallback_path, "w", encoding="utf-8") as f:
                     json.dump(retry_settings, f, indent=2)
 
         # Generate the Omnigent tool bridge extension if tools are available.
@@ -1941,7 +1941,7 @@ class PiExecutor(Executor):
                 # unauthenticated; fail loud instead.
                 raise ValueError("tool_server_token is required when tool_server_port is set")
             ext_path = os.path.join(tmp_dir, "omnigent_tools.js")
-            with open(ext_path, "w") as f:
+            with open(ext_path, "w", encoding="utf-8") as f:
                 f.write(_generate_extension_js(tool_server_port, tools, tool_server_token))
             extra_args.extend(["--extension", ext_path])
             # Allowlist the bridged tool names. ``--no-tools`` (set in

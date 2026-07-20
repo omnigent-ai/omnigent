@@ -219,7 +219,7 @@ def _read_new_kiro_messages(
     """Read conversation messages after *byte_offset* from Kiro's JSONL file."""
     messages: list[_KiroConversationMessage] = []
     try:
-        with jsonl_path.open("rb") as handle:
+        with jsonl_path.open(mode="rb") as handle:
             handle.seek(byte_offset)
             # Advance only past newline-terminated lines: Kiro appends to this
             # JSONL live, so the final line may be a record mid-write (no

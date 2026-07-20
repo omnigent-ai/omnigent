@@ -15,13 +15,14 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import types
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from importlib import import_module, resources
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, BinaryIO, Literal, TypeAlias, cast
+from typing import TYPE_CHECKING, Any, BinaryIO, Literal, TextIO, TypeAlias, cast
 
 import click
 import yaml
@@ -30,6 +31,7 @@ from rich import box
 from rich.console import Console
 from rich.table import Table
 
+from omnigent._encoding import locale_encoding
 from omnigent._platform import IS_WINDOWS, resolve_repo_symlink
 from omnigent._startup_profile import StartupProfiler
 from omnigent.cli_sandbox import lakebox as _lakebox_alias_group
@@ -61,6 +63,8 @@ from omnigent.onboarding.ucode_setup import (
 from omnigent.process_logging import LOG_LEVEL_ENV_VAR, LOG_TO_STDERR_ENV_VAR
 
 if TYPE_CHECKING:
+    import configparser
+
     import httpx
 
     from omnigent._runner_startup import RunnerStartupProgress
@@ -77,7 +81,7 @@ def _load_config(path: str | None) -> dict[str, Any]:  # type: ignore[explicit-a
     """
     if path is None:
         return {}
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         return yaml.safe_load(f) or {}
 
 
@@ -252,7 +256,7 @@ def _migrate_legacy_state_dir() -> None:
     legacy_pid_file = legacy_src / "host.pid"
     if legacy_pid_file.exists():
         try:
-            first_line = legacy_pid_file.read_text().strip().splitlines()[0]
+            first_line = legacy_pid_file.read_text(encoding="utf-8").strip().splitlines()[0]
             legacy_pid = int(first_line)
         except (ValueError, OSError, IndexError):
             legacy_pid = None
@@ -515,7 +519,7 @@ def _peek_default_agent_harness(target: str) -> str | None:
     if not path.is_file():
         return None
     try:
-        raw = yaml.safe_load(path.read_text()) or {}
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     except (OSError, yaml.YAMLError):
         return None
     if not isinstance(raw, dict):
@@ -801,7 +805,7 @@ def _save_global_config(  # type: ignore[explicit-any]
         cfg.pop(key, None)
     path = _effective_global_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=True)
 
 
@@ -874,7 +878,7 @@ def _save_local_config(
     for key in unset_keys:
         cfg.pop(key, None)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=True)
 
 
@@ -1919,7 +1923,7 @@ def _read_daemon_record(path: Path) -> _HostDaemonRecord | None:
     :returns: Parsed daemon record, or ``None`` if unreadable or malformed.
     """
     try:
-        raw = json.loads(path.read_text())
+        raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
     if not isinstance(raw, dict):
@@ -1936,7 +1940,7 @@ def _write_daemon_record(record: _HostDaemonRecord) -> None:
     """
     path = _daemon_record_path(record.target)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(asdict(record), indent=2, sort_keys=True) + "\n")
+    path.write_text(json.dumps(asdict(record), indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def _delete_daemon_record(record: _HostDaemonRecord) -> None:
@@ -2050,7 +2054,7 @@ def _load_existing_host_id() -> str | None:
         candidate_paths.append(CONFIG_PATH)
     for path in candidate_paths:
         try:
-            raw = yaml.safe_load(path.read_text()) if path.exists() else None
+            raw = yaml.safe_load(path.read_text(encoding="utf-8")) if path.exists() else None
         except (OSError, yaml.YAMLError):
             continue
         if not isinstance(raw, dict):
@@ -2297,7 +2301,7 @@ def _persist_spawned_daemon(
             config_sig=config_sig,
         )
     )
-    _HOST_PID_PATH.write_text(f"{spawned.pid}\n{target}\n")
+    _HOST_PID_PATH.write_text(f"{spawned.pid}\n{target}\n", encoding="utf-8")
 
 
 def _foreground_daemon_record(
@@ -2517,7 +2521,7 @@ def _read_host_pid_file() -> tuple[int, str] | None:
     if not _HOST_PID_PATH.exists():
         return None
     try:
-        lines = _HOST_PID_PATH.read_text().strip().splitlines()
+        lines = _HOST_PID_PATH.read_text(encoding="utf-8").strip().splitlines()
         if len(lines) < 2:
             return None
         return int(lines[0]), lines[1]
@@ -3696,7 +3700,7 @@ def _write_uninstall_manifest(ledger: Any) -> Path:
     """Write the ledger fields the POSIX uninstaller needs as tab records."""
     fd, manifest_name = tempfile.mkstemp(prefix="omnigent-uninstall-ledger-", suffix=".tsv")
     manifest = Path(manifest_name)
-    with os.fdopen(fd, "w") as handle:
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
         for profile in ledger.entries.profiles:
             handle.write(
                 "\t".join(
@@ -4330,7 +4334,7 @@ def _resolve_bundle_env_vars(source: Path) -> dict[str, str]:
     # ── config.yaml ──────────────────────────────────
     config_path = source / "config.yaml"
     if config_path.exists():
-        raw = yaml.safe_load(config_path.read_text())
+        raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
         if isinstance(raw, dict):
             changed = _expand_config_env_vars(raw, expand_env_vars)
             if changed:
@@ -4346,7 +4350,7 @@ def _resolve_bundle_env_vars(source: Path) -> dict[str, str]:
     mcp_dir = source / "tools" / "mcp"
     if mcp_dir.is_dir():
         for yaml_file in sorted(mcp_dir.glob("*.yaml")):
-            raw = yaml.safe_load(yaml_file.read_text())
+            raw = yaml.safe_load(yaml_file.read_text(encoding="utf-8"))
             if not isinstance(raw, dict):
                 continue
             changed = False
@@ -5063,7 +5067,7 @@ def _bundled_agent_brain_harness(name: str) -> str | None:
     if not config_path.is_file():
         return None
     try:
-        raw = yaml.safe_load(config_path.read_text()) or {}
+        raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     except (OSError, yaml.YAMLError):
         return None
     if not isinstance(raw, dict):
@@ -6408,7 +6412,7 @@ def _materialize_harness_launcher_file(
     }
     if canonical in _OS_ENV_HARNESSES:
         raw["os_env"] = {"type": "caller_process", "sandbox": {"type": "none"}}
-    yaml_path.write_text(yaml.safe_dump(raw, default_flow_style=False))
+    yaml_path.write_text(yaml.safe_dump(raw, default_flow_style=False), encoding="utf-8")
     return yaml_path
 
 
@@ -9104,6 +9108,113 @@ def _node_dependency_problem() -> str | None:
     return f"Node.js is too old{detected} — Claude, Codex, and Pi need {_NODE_MIN_VERSION_HINT}."
 
 
+def _read_existing_cfg_snapshot(
+    cfg: configparser.ConfigParser,
+    path: Path,
+) -> tuple[str, bytes | None]:
+    """Parse an existing config from one byte snapshot.
+
+    Returns ``(encoding, raw_bytes)``. A genuinely missing file is the new-config
+    case and returns ``("utf-8", None)``. Every other read/decode/parse failure
+    propagates so a rewrite flow cannot act on content it failed to load.
+    """
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return "utf-8", None
+    try:
+        text = raw.decode("utf-8")
+        encoding = "utf-8"
+    except UnicodeDecodeError:
+        encoding = locale_encoding()
+        text = raw.decode(encoding)
+    cfg.read_string(text, source=str(path))
+    return encoding, raw
+
+
+def _optional_file_bytes(path: Path) -> bytes | None:
+    """Return *path* bytes, or ``None`` only when it genuinely does not exist."""
+    try:
+        return path.read_bytes()
+    except FileNotFoundError:
+        return None
+
+
+def _config_section_values(
+    cfg: configparser.ConfigParser,
+    section: str,
+) -> dict[str, str] | None:
+    """Snapshot one section for a three-way config merge."""
+    if not cfg.has_section(section):
+        return None
+    return dict(cfg.items(section, raw=True))
+
+
+_DATABRICKS_CFG_THREAD_LOCK = threading.Lock()
+
+
+@contextlib.contextmanager
+def _databricks_cfg_merge_lock(
+    path: Path,
+) -> collections.abc.Generator[None, None, None]:
+    """Serialize Omnigent read/merge/publish operations across threads/processes."""
+    lock_path = path.with_name(f"{path.name}.omnigent.lock")
+    with _DATABRICKS_CFG_THREAD_LOCK:
+        lock_file = lock_path.open(mode="a+b")
+        locked = False
+        primary_error: BaseException | None = None
+        cleanup_errors: list[tuple[str, BaseException]] = []
+
+        def _unlock() -> None:
+            lock_file.seek(0)
+            if IS_WINDOWS:
+                import msvcrt
+
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+        try:
+            if IS_WINDOWS:
+                import msvcrt
+
+                lock_file.seek(0, os.SEEK_END)
+                if lock_file.tell() == 0:
+                    lock_file.write(b"\0")
+                    lock_file.flush()
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            locked = True
+            yield
+        except BaseException as exc:
+            primary_error = exc
+            raise
+        finally:
+            if locked:
+                try:
+                    _unlock()
+                except BaseException as exc:  # noqa: BLE001 - close must still run
+                    cleanup_errors.append(("unlock merge lock", exc))
+            try:
+                lock_file.close()
+            except BaseException as exc:  # noqa: BLE001 - preserve a primary error
+                cleanup_errors.append(("close merge lock", exc))
+            if cleanup_errors:
+                if primary_error is not None:
+                    for label, error in cleanup_errors:
+                        primary_error.add_note(f"Databricks cleanup failed ({label}): {error!r}")
+                else:
+                    label, error = cleanup_errors[0]
+                    error.add_note(f"Databricks cleanup failed: {label}")
+                    raise error
+
+
 @contextlib.contextmanager
 def _isolated_databricks_cfg() -> collections.abc.Generator[None, None, None]:
     """Run Databricks setup against a temp config containing only our three profiles.
@@ -9135,85 +9246,217 @@ def _isolated_databricks_cfg() -> collections.abc.Generator[None, None, None]:
     from omnigent.onboarding.setup import CONFLICTING_ENV_VARS
 
     original_cfg = Path.home() / ".databrickscfg"
-    saved_env: dict[str, str | None] = {
-        "DATABRICKS_CONFIG_FILE": os.environ.get("DATABRICKS_CONFIG_FILE"),
-    }
-    for var in CONFLICTING_ENV_VARS:
-        saved_env[var] = os.environ.pop(var, None)
-
-    def _restore_env() -> None:
-        for var, prev in saved_env.items():
-            if prev is None:
-                os.environ.pop(var, None)
-            else:
-                os.environ[var] = prev
-
-    # Temp file contains only the canonical internal-beta profile sections
-    # (see DEFAULT_PROFILES), seeded from the original when they already
-    # exist. Everything else is excluded so there is exactly one
-    # section per workspace host and `databricks auth token --host X`
-    # never hits the "multiple profiles match" ambiguity error.
+    # Decode and parse the original from one byte snapshot before mutating the
+    # environment. This both fails closed on read errors and prevents a codec
+    # detection/read race from ever producing mixed bytes.
     orig_cfg = configparser.ConfigParser()
-    if original_cfg.exists():
-        orig_cfg.read(original_cfg)
+    _read_existing_cfg_snapshot(orig_cfg, original_cfg)
+
+    # Seed the temp with only the canonical internal-beta profile sections
+    # (see DEFAULT_PROFILES) that already exist, so there is exactly one section
+    # per workspace host and `databricks auth token --host X` never hits the
+    # "multiple profiles match" ambiguity error.
     cfg = configparser.ConfigParser()
     for spec in DEFAULT_PROFILES:
         if orig_cfg.has_section(spec.name):
             cfg[spec.name] = dict(orig_cfg[spec.name])
 
-    omnigent_dir = Path.home() / ".omnigent"
-    omnigent_dir.mkdir(exist_ok=True)
-    tmp_fd, tmp_name = tempfile.mkstemp(
-        prefix="databrickscfg-setup-",
-        dir=omnigent_dir,
-        suffix=".tmp",
-    )
-    try:
-        with os.fdopen(tmp_fd, "w") as f:
-            cfg.write(f)
-    except Exception:
-        os.unlink(tmp_name)
-        raise
-    tmp_path = Path(tmp_name)
+    env_names = ("DATABRICKS_CONFIG_FILE", *CONFLICTING_ENV_VARS)
+    saved_env = {name: os.environ.get(name) for name in env_names}
 
-    os.environ["DATABRICKS_CONFIG_FILE"] = tmp_name
+    def _restore_env_value(name: str, value: str | None) -> None:
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
+
+    # Capture handlers before the mutation boundary. Flags below ensure cleanup
+    # restores only handlers that were actually installed.
+    prev_sigterm = signal.getsignal(signal.SIGTERM)
+    prev_sigint = signal.getsignal(signal.SIGINT)
+    sigterm_installed = False
+    sigint_installed = False
+    tmp_fd: int | None = None
+    tmp_stream: TextIO | None = None
+    tmp_path: Path | None = None
+    write_fd: int | None = None
+    write_stream: TextIO | None = None
+    write_tmp: Path | None = None
+    primary_error: BaseException | None = None
+    cleanup_errors: list[tuple[str, BaseException]] = []
 
     def _on_signal(signum: int, _frame: types.FrameType | None) -> None:
-        tmp_path.unlink(missing_ok=True)
-        _restore_env()
-        # Restore the original handler before re-raising so signal chaining
-        # (e.g. Click's Ctrl-C → Abort) is preserved rather than falling
-        # back to SIG_DFL which would kill the process through the OS.
-        signal.signal(signum, prev_sigterm if signum == signal.SIGTERM else prev_sigint)
+        """Chain safely without leaving a live context half dismantled."""
+        nonlocal sigint_installed, sigterm_installed
+        previous = prev_sigterm if signum == signal.SIGTERM else prev_sigint
+        # An ignored or returning custom handler leaves the context active, so
+        # preserve all of its state. A raising handler unwinds through ``finally``
+        # below, which performs the normal complete cleanup.
+        if previous == signal.SIG_IGN:
+            return
+        if callable(previous):
+            previous(signum, _frame)
+            return
+
+        # SIG_DFL may terminate before Python can unwind. Clean up first, restore
+        # both handlers, and only then re-raise the signal. SystemExit is a
+        # defensive non-return guarantee for platforms that return from it.
+        for name, value in saved_env.items():
+            with contextlib.suppress(Exception):
+                _restore_env_value(name, value)
+        for path in (write_tmp, tmp_path):
+            if path is not None:
+                with contextlib.suppress(Exception):
+                    path.unlink(missing_ok=True)
+        with contextlib.suppress(Exception):
+            signal.signal(signal.SIGTERM, prev_sigterm)
+        with contextlib.suppress(Exception):
+            signal.signal(signal.SIGINT, prev_sigint)
+        sigterm_installed = False
+        sigint_installed = False
         signal.raise_signal(signum)
+        raise SystemExit(128 + signum)
 
-    prev_sigterm = signal.signal(signal.SIGTERM, _on_signal)
-    prev_sigint = signal.signal(signal.SIGINT, _on_signal)
-
-    write_tmp: Path | None = None
     try:
+        for var in CONFLICTING_ENV_VARS:
+            os.environ.pop(var, None)
+
+        omnigent_dir = Path.home() / ".omnigent"
+        omnigent_dir.mkdir(exist_ok=True)
+        tmp_fd, tmp_name = tempfile.mkstemp(
+            prefix="databrickscfg-setup-",
+            dir=omnigent_dir,
+            suffix=".tmp",
+        )
+        tmp_path = Path(tmp_name)
+        # Transfer ownership only after fdopen succeeds. If it raises, tmp_fd
+        # remains tracked and cleanup closes it before attempting Windows unlink.
+        tmp_stream = os.fdopen(tmp_fd, "w", encoding="utf-8")
+        tmp_fd = None
+        # Keep the stream tracked until an explicit successful close. If either
+        # write or close fails, the outer exception-preserving cleanup retries
+        # close without allowing it to replace the primary failure.
+        cfg.write(tmp_stream)
+        tmp_stream.close()
+        tmp_stream = None
+        os.environ["DATABRICKS_CONFIG_FILE"] = tmp_name
+
+        signal.signal(signal.SIGTERM, _on_signal)
+        sigterm_installed = True
+        signal.signal(signal.SIGINT, _on_signal)
+        sigint_installed = True
+
         yield
-        # Merge canonical sections written by setup back into the real cfg.
+
+        # The owned temp is required merge input: a missing/unreadable temp must
+        # abort rather than silently rewrite the real config with no setup result.
+        if tmp_path is None:  # defensive; successful preparation always sets it
+            raise RuntimeError("isolated Databricks config was not created")
         tmp_cfg = configparser.ConfigParser()
-        tmp_cfg.read(tmp_path)
-        orig_cfg = configparser.ConfigParser()
-        if original_cfg.exists():
-            orig_cfg.read(original_cfg)
-        for spec in DEFAULT_PROFILES:
-            if tmp_cfg.has_section(spec.name):
-                orig_cfg[spec.name] = dict(tmp_cfg[spec.name])
-        write_tmp = original_cfg.with_suffix(".tmp")
-        with write_tmp.open("w") as f:
-            orig_cfg.write(f)
-        write_tmp.replace(original_cfg)
-        write_tmp = None
+        with tmp_path.open("r", encoding="utf-8") as f:
+            tmp_cfg.read_file(f, source=str(tmp_path))
+
+        # Serialize Omnigent writers across threads and processes, then re-read
+        # the current original from one byte snapshot. Independent vendor tools
+        # do not honor our lock, so the comparison immediately before the atomic
+        # replace is an additional best-effort conflict check, not a filesystem
+        # compare-and-swap guarantee.
+        with _databricks_cfg_merge_lock(original_cfg):
+            merged = configparser.ConfigParser()
+            final_encoding, final_snapshot = _read_existing_cfg_snapshot(
+                merged,
+                original_cfg,
+            )
+            for spec in DEFAULT_PROFILES:
+                base = _config_section_values(orig_cfg, spec.name)
+                ours = _config_section_values(tmp_cfg, spec.name)
+                theirs = _config_section_values(merged, spec.name)
+                if ours == base:
+                    continue  # setup did not touch it; preserve the current file
+                if theirs not in (base, ours):
+                    raise OSError(
+                        f"{original_cfg} profile {spec.name!r} changed concurrently; "
+                        "refusing to overwrite it"
+                    )
+                if ours is None:
+                    merged.remove_section(spec.name)
+                else:
+                    merged[spec.name] = ours
+            write_fd, write_name = tempfile.mkstemp(
+                prefix=f"{original_cfg.name}-merge-",
+                dir=original_cfg.parent,
+                suffix=".tmp",
+            )
+            write_tmp = Path(write_name)
+            write_stream = os.fdopen(write_fd, "w", encoding=final_encoding)
+            write_fd = None
+            merged.write(write_stream)
+            write_stream.close()
+            write_stream = None
+            if _optional_file_bytes(original_cfg) != final_snapshot:
+                raise OSError(f"{original_cfg} changed while merging; refusing to overwrite it")
+            write_tmp.replace(original_cfg)
+            write_tmp = None
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
-        tmp_path.unlink(missing_ok=True)
+
+        def _attempt_cleanup(label: str, action: Callable[[], None]) -> None:
+            try:
+                action()
+            except BaseException as exc:  # noqa: BLE001 - every cleanup action must run
+                cleanup_errors.append((label, exc))
+
+        if tmp_stream is not None and not tmp_stream.closed:
+            stream = tmp_stream
+            _attempt_cleanup("close isolated config stream", stream.close)
+        if tmp_fd is not None:
+            fd = tmp_fd
+            _attempt_cleanup("close isolated config descriptor", lambda fd=fd: os.close(fd))
+        if write_stream is not None and not write_stream.closed:
+            stream = write_stream
+            _attempt_cleanup("close merge config stream", stream.close)
+        if write_fd is not None:
+            fd = write_fd
+            _attempt_cleanup("close merge config descriptor", lambda fd=fd: os.close(fd))
+        if sigint_installed:
+            _attempt_cleanup(
+                "restore SIGINT handler",
+                lambda: signal.signal(signal.SIGINT, prev_sigint),
+            )
+        if sigterm_installed:
+            _attempt_cleanup(
+                "restore SIGTERM handler",
+                lambda: signal.signal(signal.SIGTERM, prev_sigterm),
+            )
+        # Restore every environment key independently before fallible file
+        # cleanup, so no cleanup error can leak mutated process credentials.
+        for name, value in saved_env.items():
+            _attempt_cleanup(
+                f"restore {name}",
+                lambda name=name, value=value: _restore_env_value(name, value),
+            )
         if write_tmp is not None:
-            write_tmp.unlink(missing_ok=True)
-        signal.signal(signal.SIGTERM, prev_sigterm)
-        signal.signal(signal.SIGINT, prev_sigint)
-        _restore_env()
+            path = write_tmp
+            _attempt_cleanup("remove merge temp", lambda path=path: path.unlink(missing_ok=True))
+        if tmp_path is not None:
+            path = tmp_path
+            _attempt_cleanup(
+                "remove isolated config",
+                lambda path=path: path.unlink(missing_ok=True),
+            )
+
+        if cleanup_errors:
+            if primary_error is not None:
+                for label, error in cleanup_errors:
+                    primary_error.add_note(f"Databricks cleanup failed ({label}): {error!r}")
+            else:
+                first_label, first_error = cleanup_errors[0]
+                first_error.add_note(f"Databricks cleanup failed: {first_label}")
+                for label, error in cleanup_errors[1:]:
+                    first_error.add_note(f"Additional cleanup failure ({label}): {error!r}")
+                raise first_error
 
 
 def _run_configure_databricks() -> None:
@@ -10839,7 +11082,7 @@ def _qwen_auth_configured() -> bool:
     settings = Path.home() / ".qwen" / "settings.json"
     if settings.is_file():
         try:
-            data = json.loads(settings.read_text())
+            data = json.loads(settings.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return False
         if isinstance(data, dict):
@@ -13080,7 +13323,7 @@ def debug_logs(
         # Show all files for the session, oldest first, with separators.
         for f in reversed(log_files):
             click.echo(f"# {f}", err=True)
-            content = f.read_text(errors="replace")
+            content = f.read_text(encoding="utf-8", errors="replace")
             if lines > 0:
                 content = "\n".join(content.splitlines()[-lines:])
             click.echo(content)
@@ -13088,7 +13331,7 @@ def debug_logs(
     else:
         latest = log_files[0]
         click.echo(f"# {latest}", err=True)
-        content = latest.read_text(errors="replace")
+        content = latest.read_text(encoding="utf-8", errors="replace")
         if lines > 0:
             content = "\n".join(content.splitlines()[-lines:])
         click.echo(content)

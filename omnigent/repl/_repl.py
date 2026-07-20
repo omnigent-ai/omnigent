@@ -4344,7 +4344,7 @@ async def run_repl(
             _sid = resume_conversation_id or f"fresh-{int(_dbg_time.time())}"
             _event_log_path = open_event_log(_sid)
             session._event_log_path = _event_log_path  # type: ignore[attr-defined]
-            _event_log_fh = open(_event_log_path, "a")  # noqa: SIM115 — closed in finally below
+            _event_log_fh = open(_event_log_path, "a", encoding="utf-8")  # noqa: SIM115 — closed in finally below
 
         # Mirror the legacy CLI's mascot-art startup banner so the
         # Omnigent REPL feels identical at boot. Raw stdout write

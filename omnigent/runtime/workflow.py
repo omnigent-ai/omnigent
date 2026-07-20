@@ -1572,7 +1572,7 @@ def _load_global_auth() -> ApiKeyAuth | DatabricksAuth | None:
     if not path.exists():
         return None
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             raw: dict[str, Any] = yaml.safe_load(f) or {}
     except Exception:
         return None
