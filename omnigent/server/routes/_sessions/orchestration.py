@@ -333,6 +333,7 @@ from omnigent.stores.conversation_store import (
     ConversationNotFoundError,
     pinned_label_key,
 )
+from omnigent.stores.credential_store import CredentialStore
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.host_store import Host, HostStore
 from omnigent.stores.permission_store import PermissionStore
@@ -2578,6 +2579,7 @@ async def _run_managed_launch(
     relaunch_host: Host | None = None,
     agent_store: AgentStore | None = None,
     agent_id: str | None = None,
+    credential_store: CredentialStore | None = None,
 ) -> None:
     """
     Provision a managed sandbox for a session in the background.
@@ -2626,6 +2628,7 @@ async def _run_managed_launch(
     :param relaunch_host: Existing managed host row to relaunch a new
         sandbox generation for, or ``None`` for a first launch (a
         fresh host identity is minted).
+
     The runner's agent classifier is resolved here rather than by the
     caller, so the read runs on the task that already owns the
     single-flight claim: the request path keeps no ``await`` between
@@ -2640,6 +2643,8 @@ async def _run_managed_launch(
     :param agent_id: Agent the session is bound to, resolved through the
         built-in gate into the runner Pod's ``omnigent.ai/agent``
         classifier, or ``None`` to leave it unstamped.
+    :param credential_store: The app's credential store, used to inject the
+        owner's ``GIT_TOKEN`` into the launch when connected, or ``None``.
     """
     from omnigent.server.managed_hosts import resolve_managed_agent_label
 
@@ -2660,6 +2665,7 @@ async def _run_managed_launch(
         host_store=host_store,
         relaunch_host=relaunch_host,
         agent_name=agent_name,
+        credential_store=credential_store,
     )
     if managed is None:
         return
@@ -3186,6 +3192,7 @@ def _kick_managed_relaunch(
             tracker=tracker,
             conversation_store=conversation_store,
             host_store=host_store,
+            credential_store=getattr(app_state, "credential_store", None),
             host_registry=getattr(app_state, "host_registry", None),
             tunnel_registry=getattr(app_state, "tunnel_registry", None),
             relaunch_host=host,
