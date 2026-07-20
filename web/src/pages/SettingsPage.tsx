@@ -912,9 +912,7 @@ function CredentialsSection() {
     }
     setBusy(false);
     setError(
-      result.status === 409
-        ? "Credentials are not configured on this deployment."
-        : result.error,
+      result.status === 409 ? "Credentials are not configured on this deployment." : result.error,
     );
   }, []);
 
