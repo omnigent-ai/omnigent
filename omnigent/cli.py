@@ -1833,6 +1833,7 @@ def _daemon_host_online(record: _HostDaemonRecord, *, timeout_s: float = 2.0) ->
         method="GET",
         path=f"/v1/hosts/{url_component(host_id)}",
         timeout_s=timeout_s,
+        host_id=host_id,
     )
     if result.status_code != 200 or not isinstance(result.body, dict):
         return False
@@ -7689,6 +7690,7 @@ def _host_http_json(
     params: dict[str, str | int] | None = None,
     json_body: _HostJsonObject | None = None,
     timeout_s: float = 10.0,
+    host_id: str | None = None,
 ) -> _HostHttpResult:
     """
     Send one management request to an Omnigent server.
@@ -7703,6 +7705,10 @@ def _host_http_json(
         ``{"type": "stop_session", "data": {}}``.
     :param timeout_s: Request timeout in seconds, e.g. ``2.0`` for a
         quick liveness probe. Defaults to ``10.0`` for management calls.
+    :param host_id: The host this request is scoped to (host-control, or a
+        host-backed session event like stop_session), so it reaches the replica
+        holding that host's tunnel. ``None`` for non-host-scoped calls; the
+        builder emits the routing header only on the workspace-hosted server.
     :returns: Decoded HTTP result.
     """
     import httpx
@@ -7712,7 +7718,7 @@ def _host_http_json(
     try:
         with httpx.Client(
             base_url=base_url,
-            headers=_remote_headers(server_url=base_url),
+            headers=_remote_headers(server_url=base_url, host_id=host_id),
             timeout=timeout_s,
         ) as client:
             resp = client.request(method, path, params=params, json=json_body)
@@ -7920,12 +7926,22 @@ def _runner_online_map(
             if isinstance((runner_id := session.get("runner_id")), str) and runner_id
         }
     )
+    # A runner is spawned on exactly one host; its status endpoint reads the
+    # in-memory tunnel registry, so the check must reach that host's replica or
+    # it reports the runner offline. The session rows carry each runner's host.
+    runner_host: dict[str, str] = {}
+    for session in sessions:
+        rid = session.get("runner_id")
+        host = session.get("host_id")
+        if isinstance(rid, str) and rid and isinstance(host, str) and host:
+            runner_host.setdefault(rid, host)
     statuses: dict[str, bool | None] = {}
     for runner_id in runner_ids:
         result = _host_http_json(
             base_url=base_url,
             method="GET",
             path=f"/v1/runners/{url_component(runner_id)}/status",
+            host_id=runner_host.get(runner_id),
         )
         if result.status_code == 200 and isinstance(result.body, dict):
             online = result.body.get("online")
@@ -8002,6 +8018,7 @@ def _add_daemon_host_status(
         base_url=base_url,
         method="GET",
         path=f"/v1/hosts/{url_component(host_id)}",
+        host_id=host_id,
     )
     if host_result.status_code == 200 and isinstance(host_result.body, dict):
         status = host_result.body.get("status")
@@ -8404,11 +8421,27 @@ def _stop_session_on_server(
     """
     from omnigent.claude_native_bridge import url_component
 
+    # This is a standalone CLI process with an empty session→host map, so read
+    # the session's host from its record first: the stop_session event is a
+    # server→runner forward and must reach the replica holding the runner's
+    # tunnel. The metadata GET itself is host-agnostic (served from any replica).
+    host_id: str | None = None
+    info = _host_http_json(
+        base_url=base_url,
+        method="GET",
+        path=f"/v1/sessions/{url_component(session_id)}",
+    )
+    if info.status_code == 200 and isinstance(info.body, dict):
+        host_value = info.body.get("host_id")
+        if isinstance(host_value, str) and host_value:
+            host_id = host_value
+
     result = _host_http_json(
         base_url=base_url,
         method="POST",
         path=f"/v1/sessions/{url_component(session_id)}/events",
         json_body={"type": "stop_session", "data": {}},
+        host_id=host_id,
     )
     if result.status_code == 0:
         raise click.ClickException(

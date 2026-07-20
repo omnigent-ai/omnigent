@@ -17,10 +17,37 @@
 
 import { getCachedServerInfo } from "./capabilities";
 import { getOmnigentHostConfig, hostFetch } from "./host";
+import { getSessionHost } from "@/lib/sessionHost";
 
 // Single-user sentinel from `GET /v1/me` (server's RESERVED_USER_LOCAL);
 // not a real actor, so never used as an author label.
 const RESERVED_USER_LOCAL = "local";
+
+// Dicer replica-routing header read by the managed server's sidecar. A host's
+// control tunnel and its runners' tunnels are keyed by the host_id, so a
+// request scoped to a host (or to a session running on one) must carry the
+// same host_id to reach the replica holding that tunnel.
+const SLICE_KEY_HEADER = "X-Databricks-Omnigent-Slice-Key";
+
+/**
+ * Resolve the host_id a request URL is scoped to, or ``null`` when the request
+ * isn't host-scoped or the host is unknown:
+ *
+ * - ``/v1/hosts/{host_id}/...`` → the host_id straight from the path.
+ * - ``/v1/sessions/{session_id}/...`` → the session's host_id from
+ *   {@link getSessionHost} (the session must have been loaded).
+ *
+ * Everything else (session lists, ``/v1/sessions/updates``, ``/health``) is a
+ * cross-host or DB-backed read that needs no sticky routing → ``null``. The
+ * caller emits the returned host_id as the {@link SLICE_KEY_HEADER} routing key.
+ */
+function hostIdForUrl(url: string): string | null {
+  const hostMatch = url.match(/\/v1\/hosts\/([^/?#]+)/);
+  if (hostMatch) return decodeURIComponent(hostMatch[1]);
+  const sessionMatch = url.match(/\/v1\/sessions\/([^/?#]+)/);
+  if (sessionMatch) return getSessionHost(decodeURIComponent(sessionMatch[1]));
+  return null;
+}
 
 let _currentUserId: string | null = null;
 // Admin flag from the same `/v1/me` probe. Mode-agnostic (the shared
@@ -153,13 +180,25 @@ export async function authenticatedFetch(
   ) {
     headers.set("X-Forwarded-Email", _currentUserId);
   }
+  // Pin host- and session-scoped requests to the managed-server replica
+  // holding that host's runner tunnel (Dicer slice key = host_id). Derived
+  // centrally so no call site has to thread it; a caller that set the header
+  // explicitly wins, and non-host-scoped requests get no key (any replica).
+  // Only on the workspace-embedded (managed) UI — a standalone/self-hosted
+  // server has no Dicer, so the key would just dirty its logs. The embed host
+  // installs a fetcher; standalone has none.
+  const url = typeof input === "string" ? input : input.toString();
+  if (!headers.has(SLICE_KEY_HEADER) && getOmnigentHostConfig().fetcher) {
+    const hostId = hostIdForUrl(url);
+    if (hostId) headers.set(SLICE_KEY_HEADER, hostId);
+  }
   // Bypass the browser HTTP cache for all API calls. Session
   // endpoints (GET /v1/sessions/{id}) carry volatile in-memory state
   // (pending_elicitations) that changes between fetches without any
   // URL change. Without no-store the browser may serve a stale
   // cached response — e.g. one captured before an elicitation was
   // published — causing the ApprovalCard to vanish on navigate-back.
-  const res = await hostFetch(typeof input === "string" ? input : input.toString(), {
+  const res = await hostFetch(url, {
     ...init,
     headers,
     cache: "no-store",

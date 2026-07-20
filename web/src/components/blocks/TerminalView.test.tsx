@@ -82,14 +82,34 @@ describe("buildAttachPath", () => {
     );
   });
 
+  it("appends ?omnigent_slice_key when a routing key is supplied", () => {
+    // A browser WS can't set headers, so the Dicer replica-routing key
+    // rides the query string.
+    expect(buildAttachPath("conv_abc", "terminal_bash_s1", false, "conv_abc")).toBe(
+      "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/attach?omnigent_slice_key=conv_abc",
+    );
+  });
+
+  it("combines read_only and omnigent_slice_key when both are set", () => {
+    expect(buildAttachPath("conv_abc", "terminal_bash_s1", true, "conv_abc")).toBe(
+      "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/attach?read_only=true&omnigent_slice_key=conv_abc",
+    );
+  });
+
+  it("omits omnigent_slice_key when no routing key is supplied", () => {
+    expect(
+      buildAttachPath("conv_abc", "terminal_bash_s1", false).includes("omnigent_slice_key"),
+    ).toBe(false);
+  });
+
   it("appends ?transport= when a transport override is given", () => {
-    expect(buildAttachPath("conv_abc", "terminal_bash_s1", false, "control")).toBe(
+    expect(buildAttachPath("conv_abc", "terminal_bash_s1", false, undefined, "control")).toBe(
       "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/attach?transport=control",
     );
   });
 
   it("combines read_only and transport params", () => {
-    const path = buildAttachPath("conv_abc", "terminal_bash_s1", true, "control");
+    const path = buildAttachPath("conv_abc", "terminal_bash_s1", true, undefined, "control");
     expect(path).toContain("read_only=true");
     expect(path).toContain("transport=control");
   });

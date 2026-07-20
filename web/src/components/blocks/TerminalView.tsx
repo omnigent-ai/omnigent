@@ -12,7 +12,8 @@ import { Loader2Icon } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTheme } from "next-themes";
 import { Button } from "@/components/ui/button";
-import { resolveWebSocketUrl } from "@/lib/host";
+import { getOmnigentHostConfig, resolveWebSocketUrl } from "@/lib/host";
+import { getSessionHost } from "@/lib/sessionHost";
 import { subscribeCodeFont } from "@/lib/codeFontPreferences";
 import {
   readTerminalThemeMode,
@@ -196,7 +197,18 @@ export function TerminalView({
         if (cancelled) return;
         terminalSession = new TerminalSession(
           node,
-          buildAttachUrl(sessionId, terminalId, readOnly, transport),
+          // Route this WS to the replica holding the session's runner tunnel
+          // (Dicer slice key = the session's host_id). A browser WS can't set
+          // request headers, so the key rides the query string. Only on the
+          // workspace-embedded (managed) UI — standalone/self-hosted has no
+          // Dicer (no embed fetcher), and a hostless session yields no key.
+          buildAttachUrl(
+            sessionId,
+            terminalId,
+            readOnly,
+            getOmnigentHostConfig().fetcher ? (getSessionHost(sessionId) ?? undefined) : undefined,
+            transport,
+          ),
           notifyState,
           isDarkRef.current,
           notifyActivity,
@@ -465,6 +477,10 @@ function resumeErrorText(error: unknown): string {
  *     e.g. ``"terminal_bash_s1"``.
  * :param readOnly: If true, requests a read-only attach. Forwarded
  *     to the server as ``?read_only=true``.
+ * :param hostId: The session's host_id, forwarded as the Dicer routing key
+ *     ``?omnigent_slice_key=`` so a browser WS (which can't set request
+ *     headers) reaches the replica holding the runner tunnel. ``undefined``
+ *     on unsharded / self-hosted servers.
  * :param transport: Optional per-attach transport override
  *     (``"control"`` / ``"pty"``), forwarded as ``?transport=``. Lets a
  *     terminal be A/B'd against the other mode side by side; ``undefined``
@@ -476,15 +492,21 @@ export function buildAttachPath(
   sessionId: string,
   terminalId: string,
   readOnly: boolean,
+  hostId?: string,
   transport?: string,
 ): string {
   const path =
     `/v1/sessions/${encodeURIComponent(sessionId)}` +
     `/resources/terminals/${encodeURIComponent(terminalId)}/attach`;
-  // Only emit query params when set — the server defaults keep the common
-  // case's URLs short and stable for anything that greps the access log.
+  // Query params are only emitted when set, so the common (local,
+  // unsharded) case keeps URLs short and stable for anything that greps
+  // the access log. ``omnigent_slice_key`` pins this WebSocket to the managed
+  // server replica: a browser WS handshake can't carry request headers, so the
+  // Dicer routing key rides the query string — the one part of the handshake
+  // page JS controls — and the server ignores it as an app param.
   const params = new URLSearchParams();
   if (readOnly) params.set("read_only", "true");
+  if (hostId) params.set("omnigent_slice_key", hostId);
   if (transport) params.set("transport", transport);
   const qs = params.toString();
   return qs ? `${path}?${qs}` : path;
@@ -500,6 +522,8 @@ export function buildAttachPath(
  * :param sessionId: Session/conversation identifier.
  * :param terminalId: Opaque terminal resource id.
  * :param readOnly: If true, requests a read-only attach.
+ * :param hostId: The session's host_id, forwarded as the Dicer routing key
+ *     ``?omnigent_slice_key=``.
  * :param transport: Optional per-attach transport override.
  * :returns: The fully-qualified ``ws(s)://`` URL.
  */
@@ -507,9 +531,10 @@ function buildAttachUrl(
   sessionId: string,
   terminalId: string,
   readOnly: boolean,
+  hostId?: string,
   transport?: string,
 ): string {
   // Delegates origin/prefix resolution to the embed host when present
   // (standalone falls back to the current page's origin).
-  return resolveWebSocketUrl(buildAttachPath(sessionId, terminalId, readOnly, transport));
+  return resolveWebSocketUrl(buildAttachPath(sessionId, terminalId, readOnly, hostId, transport));
 }

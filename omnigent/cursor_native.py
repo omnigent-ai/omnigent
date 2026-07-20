@@ -38,6 +38,7 @@ from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.host.daemon_launch import (
     error_text,
     launch_or_reuse_daemon_runner,
+    open_daemon_client,
     wait_for_host_online,
     wait_for_runner_online,
 )
@@ -451,7 +452,7 @@ async def _prepare_cursor_terminal_via_daemon(
     """
     persist_args = list(cursor_args)
     timeout = httpx.Timeout(30.0, read=120.0)
-    async with httpx.AsyncClient(base_url=base_url, headers=headers, timeout=timeout) as client:
+    async with open_daemon_client(base_url, headers, host_id, timeout=timeout) as client:
         # Resuming an existing session can either reattach to a live
         # terminal (prior chat intact) or, if that terminal has exited,
         # cold-start a fresh TUI. We only know which after probing for a

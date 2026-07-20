@@ -62,11 +62,14 @@ def test_is_workspace_hosted_url(url: str, expected: bool) -> None:
 
     What this proves: the predicate the banner uses to suppress the
     server-version row fires for ``/api/2.0/omnigent`` and nothing else, so
-    non-Databricks targets keep showing their version.
+    non-Databricks targets keep showing their version. (Now defined in
+    ``cli_auth`` next to the header builder that gates on it.)
 
     :returns: None.
     """
-    assert browser.is_workspace_hosted_url(url) is expected
+    from omnigent.cli_auth import is_workspace_hosted_url
+
+    assert is_workspace_hosted_url(url) is expected
 
 
 def test_conversation_url_quotes_session_id() -> None:

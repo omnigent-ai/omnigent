@@ -86,6 +86,7 @@ from omnigent.host.daemon_launch import (
     DAEMON_POLL_INTERVAL_S,
     error_text,
     launch_or_reuse_daemon_runner,
+    open_daemon_client,
     wait_for_host_online,
     wait_for_runner_online,
 )
@@ -2685,7 +2686,7 @@ async def _prepare_claude_terminal_via_daemon(
     startup_profiler = startup_profiler or StartupProfiler(name="omnigent claude", enabled=False)
     persist_args = list(_strip_resume_from_claude_args(claude_args))
     timeout = httpx.Timeout(30.0, read=120.0)
-    async with httpx.AsyncClient(base_url=base_url, headers=headers, timeout=timeout) as client:
+    async with open_daemon_client(base_url, headers, host_id, timeout=timeout) as client:
         startup_profiler.mark("daemon prepare http client ready")
         # Resuming an existing session must not re-close its terminal on
         # exit; a fresh launch owns teardown.
@@ -2866,8 +2867,13 @@ def _run_with_remote_server(
     from omnigent.host.identity import load_or_create_host_identity
 
     startup_profiler = startup_profiler or StartupProfiler(name="omnigent claude", enabled=False)
+    # This machine's host id keys the WebSocket attach handshake (and its
+    # reconnects) to the replica holding the runner's tunnel. A browser WS can't
+    # set request headers, but the CLI can, so this rides the header — the
+    # builder emits it only on the workspace-hosted server.
+    host_id = load_or_create_host_identity().host_id
     startup_profiler.mark("remote headers resolving")
-    headers = _remote_headers(server_url=base_url)
+    headers = _remote_headers(server_url=base_url, host_id=host_id)
     startup_profiler.mark("remote headers resolved")
     # ``headers`` carries the bearer for the WebSocket attach handshake
     # (refreshed in place by ``_recover``). For HTTP requests we additionally
@@ -2930,7 +2936,6 @@ def _run_with_remote_server(
                 "host daemon ready",
                 startup_progress=progress,
             )
-            host_id = load_or_create_host_identity().host_id
             _mark_startup_step(
                 startup_profiler,
                 "host identity loaded",
@@ -3007,7 +3012,7 @@ def _run_with_remote_server(
             daemon-spawned runner died, the server relaunches it on the
             next message (host-bound auto-relaunch).
             """
-            new_headers = _remote_headers(server_url=base_url)
+            new_headers = _remote_headers(server_url=base_url, host_id=host_id)
             headers.clear()
             headers.update(new_headers)
 

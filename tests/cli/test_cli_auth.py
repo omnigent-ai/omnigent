@@ -282,6 +282,78 @@ def test_databricks_request_headers_pairs_bearer_and_org(token_dir) -> None:
     }
 
 
+def test_databricks_request_headers_slice_key(token_dir) -> None:
+    """The slice key is emitted only on the workspace-hosted server.
+
+    Callers pass ``host_id=<host_id>`` unconditionally; the builder
+    itself gates on the server being the workspace API mount, so a new caller
+    never has to reason about the deployment. On a non-workspace server the key
+    is dropped. When emitted, it travels alongside the bearer and ?o= header.
+    """
+    from omnigent.cli_auth import databricks_request_headers, store_databricks_auth
+
+    # Non-workspace server: the slice key is DROPPED even though it was passed.
+    assert databricks_request_headers("https://other.example.com", host_id="host_abc123") == {}
+    assert databricks_request_headers("http://127.0.0.1:6767", host_id="host_abc123") == {}
+
+    # Workspace API mount: the key rides, alongside the bearer and ?o= selector.
+    store_databricks_auth(
+        server_url="https://acme.databricks.com/api/2.0/omnigent",
+        workspace_host="https://acme.databricks.com",
+        org_id="2850744067564480",
+    )
+    recorded = "https://acme.databricks.com/api/2.0/omnigent"
+    assert databricks_request_headers(recorded, bearer_token="tok", host_id="host_abc123") == {
+        "Authorization": "Bearer tok",
+        "X-Databricks-Org-Id": "2850744067564480",
+        "X-Databricks-Omnigent-Slice-Key": "host_abc123",
+    }
+
+    # Omitted (default) → no slice-key header even on the workspace mount.
+    assert "X-Databricks-Omnigent-Slice-Key" not in databricks_request_headers(recorded)
+
+
+def test_databricks_request_headers_runner_env_default(
+    token_dir, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Inside a runner, an unspecified host_id defaults to the runner's own.
+
+    A runner process exports its host_id at launch (``OMNIGENT_RUNNER_SLICE_KEY``);
+    the builder picks it up when a caller names no host, so the runner's server
+    traffic (transcript posts, uploads, policy checks) keys by host_id and
+    spreads across replicas instead of piling onto the single workspace-key pod.
+    An explicit host_id still wins, the env is honoured only on the workspace
+    mount, and CLI / daemon callers (no such env) are unaffected.
+    """
+    from omnigent.cli_auth import databricks_request_headers, store_databricks_auth
+    from omnigent.runner.identity import RUNNER_SLICE_KEY_ENV_VAR
+
+    store_databricks_auth(
+        server_url="https://acme.databricks.com/api/2.0/omnigent",
+        workspace_host="https://acme.databricks.com",
+    )
+    mount = "https://acme.databricks.com/api/2.0/omnigent"
+
+    # No env, no explicit host_id → no key (CLI / daemon unaffected).
+    monkeypatch.delenv(RUNNER_SLICE_KEY_ENV_VAR, raising=False)
+    assert "X-Databricks-Omnigent-Slice-Key" not in databricks_request_headers(mount)
+
+    # Runner env set → the key defaults to it.
+    monkeypatch.setenv(RUNNER_SLICE_KEY_ENV_VAR, "host_runner")
+    assert databricks_request_headers(mount)["X-Databricks-Omnigent-Slice-Key"] == "host_runner"
+
+    # An explicit host_id still overrides the env.
+    assert (
+        databricks_request_headers(mount, host_id="host_explicit")[
+            "X-Databricks-Omnigent-Slice-Key"
+        ]
+        == "host_explicit"
+    )
+
+    # Gated: even with the env set, a non-workspace server emits nothing.
+    assert databricks_request_headers("http://127.0.0.1:6767") == {}
+
+
 def test_databricks_request_headers_folds_extra_headers(token_dir, monkeypatch) -> None:
     """OMNIGENT_DATABRICKS_EXTRA_HEADERS rides every request built via the helper.
 

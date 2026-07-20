@@ -19,6 +19,11 @@ RUNNER_PARENT_PID_ENV_VAR = "OMNIGENT_RUNNER_PARENT_PID"
 RUNNER_ADOPT_SIGNAL: signal.Signals | None = getattr(signal, "SIGUSR1", None)
 RUNNER_WORKSPACE_ENV_VAR = "OMNIGENT_RUNNER_WORKSPACE"
 RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR = "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN"
+# Dicer replica-routing key the runner stamps on its tunnel handshake so it
+# co-locates with the host that launched it (value = that host's host_id). The
+# host injects it when spawning the runner; absent for CLI-local runners, which
+# then leave routing to the workspace-id fallback.
+RUNNER_SLICE_KEY_ENV_VAR = "OMNIGENT_RUNNER_SLICE_KEY"
 RUNNER_TUNNEL_TOKEN_HEADER = "X-Omnigent-Runner-Tunnel-Token"
 # Sentinel ``Origin`` header that the project's own non-browser WebSocket
 # clients (runner -> server tunnel, host/daemon -> server tunnel,
