@@ -775,69 +775,21 @@ def test_build_codex_remote_args_passes_transport_verbatim(
     )
 
 
-@pytest.mark.parametrize(
-    ("thread_id", "expected"),
-    [
-        # Fresh thread: -c overrides precede the bare --remote attach.
-        (
-            None,
-            [
-                "-c",
-                'model="databricks-gpt-5-5"',
-                "-c",
-                'model_provider="omnigent_databricks"',
-                "--remote",
-                "ws://127.0.0.1:9876",
-            ],
-        ),
-        # Resume: -c overrides are global flags and MUST precede the
-        # ``resume`` subcommand (codex rejects globals placed after it).
-        (
-            "thread_host",
-            [
-                "-c",
-                'model="databricks-gpt-5-5"',
-                "-c",
-                'model_provider="omnigent_databricks"',
-                "resume",
-                "--remote",
-                "ws://127.0.0.1:9876",
-                "thread_host",
-            ],
-        ),
-    ],
-)
-def test_build_codex_remote_args_emits_config_overrides_before_subcommand(
-    thread_id: str | None,
-    expected: list[str],
-) -> None:
-    """
-    ``build_codex_remote_args`` emits each ``config_overrides`` entry as a
-    ``-c <value>`` global flag ahead of the attach flags.
-
-    The ``--remote`` TUI is a separate process that does not inherit the
-    app-server's ``-c`` flags; without these the TUI falls back to the
-    OpenAI built-in provider (``requires_openai_auth = true``), renders
-    the first-run login onboarding screen, and never creates a thread —
-    so a host-spawned session hangs in ``running`` with no response.
-    Asserting the exact argv (not just membership) guards two things at
-    once: that the overrides are forwarded at all, and that they land
-    *before* the ``resume`` subcommand — codex treats ``-c`` as a global
-    option and rejects it when placed after a subcommand, which would
-    abort TUI startup and reintroduce the hang.
-    """
-    assert (
-        codex_native_app_server.build_codex_remote_args(
-            codex_args=(),
-            thread_id=thread_id,
-            remote_url="ws://127.0.0.1:9876",
-            config_overrides=(
-                'model="databricks-gpt-5-5"',
-                'model_provider="omnigent_databricks"',
-            ),
-        )
-        == expected
+def test_build_codex_remote_args_contains_no_config_overrides() -> None:
+    """The remote TUI reads provider settings from its private CODEX_HOME."""
+    args = codex_native_app_server.build_codex_remote_args(
+        codex_args=(),
+        thread_id="thread_host",
+        remote_url="ws://127.0.0.1:9876",
     )
+
+    assert args == [
+        "resume",
+        "--remote",
+        "ws://127.0.0.1:9876",
+        "thread_host",
+    ]
+    assert "-c" not in args
 
 
 @pytest.mark.parametrize(

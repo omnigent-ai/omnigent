@@ -22,6 +22,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, TypeAlias
 
+import tomlkit
+
 from omnigent._platform import resolve_cli_binary
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.reasoning_effort import CODEX_EFFORTS, validate_effort
@@ -77,6 +79,10 @@ CodexToolResult: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 
 # Content passed to ``enqueue_message`` — arbitrary user-supplied payload.
 CodexEnqueuedContent: TypeAlias = Any  # type: ignore[explicit-any]
+
+CodexConfigTable: TypeAlias = (
+    tomlkit.TOMLDocument | tomlkit.items.Table | tomlkit.items.InlineTable
+)
 
 # Tool-server callback provided by ``Session._wire_sdk_executor``. Takes a
 # tool name + args dict and returns either a result dict directly or a
@@ -744,6 +750,69 @@ def _populate_codex_home_config(target_dir: Path, source_dir: Path) -> None:
         shutil.copy2(source_file, dest_path)
 
 
+def _merge_codex_config_table(target: CodexConfigTable, source: CodexConfigTable) -> None:
+    """Recursively merge a parsed Codex config fragment into *target*."""
+    for key, value in source.items():
+        existing = target.get(key)
+        table_types = (tomlkit.items.Table, tomlkit.items.InlineTable)
+        if isinstance(existing, table_types) and isinstance(value, table_types):
+            _merge_codex_config_table(existing, value)
+        else:
+            target[key] = value
+
+
+def _apply_codex_config_overrides(codex_home: Path, overrides: Iterable[str]) -> None:
+    """Persist generated Codex overrides in the private session config.
+
+    Codex configuration may contain provider credentials. Writing those
+    values to the private ``CODEX_HOME`` keeps them out of subprocess argv,
+    process listings, and command-line telemetry.
+
+    :param codex_home: Private per-session Codex home directory.
+    :param overrides: Codex ``key=value`` TOML fragments to merge.
+    :raises ValueError: If an override is not valid TOML.
+    :raises RuntimeError: If the existing private config is not valid TOML.
+    """
+    override_list = list(overrides)
+    if not override_list:
+        return
+
+    config_path = codex_home / "config.toml"
+    try:
+        existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+        document = tomlkit.parse(existing) if existing else tomlkit.document()
+    except (OSError, tomlkit.exceptions.ParseError):
+        raise RuntimeError("Could not read the private Codex configuration") from None
+
+    for override in override_list:
+        try:
+            fragment = tomlkit.parse(override)
+        except tomlkit.exceptions.ParseError:
+            raise ValueError("Invalid generated Codex configuration override") from None
+        _merge_codex_config_table(document, fragment)
+
+    codex_home.mkdir(mode=0o700, parents=True, exist_ok=True)
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=codex_home,
+            prefix=".config.toml.",
+            delete=False,
+        ) as temp_file:
+            temp_path = Path(temp_file.name)
+            temp_file.write(tomlkit.dumps(document))
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+        os.chmod(temp_path, 0o600)
+        os.replace(temp_path, config_path)
+    finally:
+        if temp_path is not None:
+            with suppress(FileNotFoundError):
+                temp_path.unlink()
+
+
 def _databricks_codex_base_url(host: str) -> str:
     """Return the Unity AI Gateway Codex Responses base URL for *host*."""
     return f"{host.rstrip('/')}/ai-gateway/codex/v1"
@@ -1254,14 +1323,16 @@ class _CodexAppServerSession:
             self._codex_home_dir,
             _codex_home_config_source_from_env(),
         )
+        _apply_codex_config_overrides(
+            self._codex_home_dir,
+            self._codex_config_overrides,
+        )
         # Override CODEX_HOME so Codex stores its data (including conversation
         # history) in a private temp directory rather than the user's ~/.codex/.
         # This prevents subagent sessions from polluting the user's Codex history.
         proc_env = {**self._env, "CODEX_HOME": str(self._codex_home_dir)}
         try:
             argv = [self._codex_path, "app-server"]
-            for override in self._codex_config_overrides:
-                argv.extend(["-c", override])
             self._proc = await _create_subprocess_exec(
                 *argv,
                 stdin=asyncio.subprocess.PIPE,
@@ -2079,7 +2150,7 @@ class CodexExecutor(Executor):
             ``None`` falls back to ``DATABRICKS_CONFIG_PROFILE`` then the
             first valid profile.
         :param model_provider_override: A codex ``model_provider`` id to pin
-            via a ``-c`` override, e.g. ``"openai"`` (force the built-in
+            in the private session config, e.g. ``"openai"`` (force the built-in
             provider so a custom default in the user's ``~/.codex/config.toml``
             cannot shadow a subscription) or ``"Databricks"`` (a custom
             ``[model_providers.X]`` table from that same file, which this
@@ -2163,7 +2234,7 @@ class CodexExecutor(Executor):
         self._env.update(self._retry_policy.codex_cli.env())
         self._codex_config_overrides: list[str] = []
         if model_provider_override is not None and gateway:
-            # Both would fight over model_provider in the -c overrides; the
+            # Both would fight over model_provider in the generated config; the
             # AP producer must emit exactly one routing mechanism.
             raise OSError(
                 "CodexExecutor received both gateway=True and "
@@ -2172,7 +2243,7 @@ class CodexExecutor(Executor):
             )
         if model_provider_override is not None:
             # Pin the provider by name. json.dumps yields a valid TOML basic
-            # string (proper quoting/escaping) for the -c override value.
+            # string with proper quoting and escaping.
             self._codex_config_overrides.append(
                 f"model_provider={json.dumps(model_provider_override)}"
             )

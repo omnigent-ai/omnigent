@@ -16,12 +16,14 @@ import pytest
 from omnigent.inner.codex_executor import (
     _TURN_EVENT_WARN_SECONDS,
     CodexExecutor,
+    _apply_codex_config_overrides,
     _build_initial_prompt,
     _codex_cli_version,
     _CodexAppServerSession,
     _databricks_codex_config_overrides,
     _dynamic_tool_result_payload,
     _prompt_for_turn,
+    _provider_codex_config_overrides,
     _to_codex_input_items,
 )
 from omnigent.inner.executor import (
@@ -2130,6 +2132,60 @@ def test_populate_codex_skills_from_bundle_none_leaves_no_dir(tmp_path: Path) ->
 # ---------------------------------------------------------------------------
 
 
+def test_apply_codex_config_overrides_preserves_config_and_locks_permissions(
+    tmp_path: Path,
+) -> None:
+    """Generated settings merge into a mode-0600 private config."""
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    config_path = codex_home / "config.toml"
+    config_path.write_text(
+        (
+            '# keep this comment\nmodel = "old"\n'
+            'model_providers={user_provider={name="User"}}\n'
+            "[features]\nuser_feature = true\n"
+        ),
+        encoding="utf-8",
+    )
+    secret = "sk-private-sentinel"
+
+    _apply_codex_config_overrides(
+        codex_home,
+        [
+            'model="new"',
+            "features.generated=true",
+            *_provider_codex_config_overrides(
+                model=None,
+                base_url="https://provider.invalid/v1",
+                auth_command=f"printf %s {secret}",
+                wire_api="responses",
+            ),
+        ],
+    )
+
+    rendered = config_path.read_text(encoding="utf-8")
+    assert "# keep this comment" in rendered
+    assert 'model = "new"' in rendered
+    assert "user_feature = true" in rendered
+    assert "generated = true" in rendered
+    assert "user_provider" in rendered
+    assert secret in rendered
+    assert config_path.stat().st_mode & 0o777 == 0o600
+
+
+def test_apply_codex_config_overrides_redacts_invalid_secret(
+    tmp_path: Path,
+) -> None:
+    """A malformed generated override is not echoed in its exception."""
+    codex_home = tmp_path / "codex-home"
+    secret = "sk-invalid-sentinel"
+
+    with pytest.raises(ValueError) as exc_info:
+        _apply_codex_config_overrides(codex_home, [f'key="{secret}'])
+
+    assert secret not in str(exc_info.value)
+
+
 def test_populate_codex_home_config_symlinks_auth_and_config(tmp_path: Path) -> None:
     """``auth.json`` is symlinked; ``config.toml`` is copied (not symlinked).
 
@@ -2307,6 +2363,55 @@ def test_app_server_start_uses_real_home_for_private_inherited_codex_home(
         assert fake_proc.terminated
 
     _run(_t())
+
+
+def test_app_server_start_keeps_provider_secret_out_of_argv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Embedded Codex materializes provider auth only in private config."""
+    source_home = tmp_path / "source-home"
+    source_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    secret = "sk-embedded-argv-sentinel"
+    captured_argv: tuple[object, ...] | None = None
+
+    async def _t() -> None:
+        fake_proc = _FakeProcess()
+
+        async def _fake_create_subprocess_exec(*args, **kwargs):
+            nonlocal captured_argv
+            captured_argv = args
+            config_path = Path(kwargs["env"]["CODEX_HOME"]) / "config.toml"
+            assert secret in config_path.read_text(encoding="utf-8")
+            assert config_path.stat().st_mode & 0o777 == 0o600
+            return fake_proc
+
+        session = _CodexAppServerSession(
+            codex_path="/bin/codex",
+            cwd=str(workspace),
+            env={},
+            tool_executor=None,
+            codex_config_overrides=_provider_codex_config_overrides(
+                model="test-model",
+                base_url="https://provider.invalid/v1",
+                auth_command=f"printf %s {secret}",
+                wire_api="responses",
+            ),
+        )
+        session._request = AsyncMock(return_value={"result": {}})
+        with patch(
+            "omnigent.inner.codex_executor._create_subprocess_exec",
+            new=_fake_create_subprocess_exec,
+        ):
+            await session.start()
+            await session.close()
+
+    _run(_t())
+
+    assert captured_argv == ("/bin/codex", "app-server")
+    assert secret not in "\0".join(str(arg) for arg in captured_argv)
 
 
 def test_app_server_start_preserves_custom_home_from_inherited_private_symlink(
