@@ -176,6 +176,11 @@ def sandbox() -> None:
       islo     Uses the built-in HTTP client. Needs ISLO_API_KEY
                (and optionally ISLO_BASE_URL for non-default API
                endpoints).
+      tenki    Boots from a prepared registry image with the host
+               baked in. Needs `pip install 'omnigent[tenki]'` +
+               TENKI_API_KEY, and the image named via
+               sandbox.tenki.image / OMNIGENT_TENKI_IMAGE (see
+               deploy/tenki/README.md).
 
     For provider-side sandbox lifecycle (list / status / delete /
     start / stop), use the provider's own CLI or dashboard directly
