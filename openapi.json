@@ -2160,6 +2160,92 @@
         "title": "ModelUsage",
         "type": "object"
       },
+      "NativeModelOption": {
+        "additionalProperties": true,
+        "description": "One runner-owned native model-picker row.",
+        "properties": {
+          "defaultReasoningEffort": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Defaultreasoningeffort"
+          },
+          "displayName": {
+            "title": "Displayname",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "isDefault": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Isdefault"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "supportedReasoningEfforts": {
+            "items": {
+              "$ref": "#/components/schemas/NativeReasoningEffortOption"
+            },
+            "title": "Supportedreasoningefforts",
+            "type": "array"
+          }
+        },
+        "required": [
+          "id",
+          "displayName"
+        ],
+        "title": "NativeModelOption",
+        "type": "object"
+      },
+      "NativeReasoningEffortOption": {
+        "additionalProperties": true,
+        "description": "Reasoning-effort metadata advertised by a native model catalog.",
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "reasoningEffort": {
+            "title": "Reasoningeffort",
+            "type": "string"
+          }
+        },
+        "required": [
+          "reasoningEffort"
+        ],
+        "title": "NativeReasoningEffortOption",
+        "type": "object"
+      },
       "NativeToolData": {
         "description": "A provider-native tool output item (e.g. `web_search_call`).\n\nThese are executed server-side by the LLM provider and returned\nas opaque dicts. Agent-plane persists and replays them so the\nLLM sees its own tool results on subsequent iterations.",
         "properties": {
@@ -4301,10 +4387,10 @@
         "type": "object"
       },
       "SessionModelOptionsEvent": {
-        "description": "Signal that a codex-native session's model catalog has resolved.\n\nModel options are fetched from the bound runner's live\nCodex app-server via `model/list` and cached on the session\nsnapshot. The initial snapshot can return an empty list while\nthis background fetch is in flight; this event tells connected\nclients to re-read the snapshot and apply its now-populated\n`model_options`.\n\nCarries no payload beyond the conversation id. The snapshot's\n`model_options` field remains the source of truth.",
+        "description": "Signal that a native session's model catalog has resolved.\n\nModel options are fetched from the bound runner and cached on the session\nsnapshot. The initial snapshot can return an empty list while this\nbackground fetch is in flight; this event tells connected clients to\nre-read the snapshot and apply its now-populated `model_options`.\n\nCarries no payload beyond the conversation id. The snapshot's\n`model_options` field remains the source of truth.",
         "properties": {
           "conversation_id": {
-            "description": "Session identifier, e.g. `\"conv_abc123\"`. Category: **transient** (SSE-only). On reconnect, clients seed Codex model / effort controls from the session snapshot.",
+            "description": "Session identifier, e.g. `\"conv_abc123\"`. Category: **transient** (SSE-only). On reconnect, clients seed Native model / effort controls from the session snapshot.",
             "title": "Conversation Id",
             "type": "string"
           },
@@ -4836,10 +4922,9 @@
             "title": "Mcp Startup"
           },
           "model_options": {
-            "description": "Codex app-server `model/list` options for codex-native sessions, including each model's supported reasoning efforts. Empty for non-codex-native sessions or while the bound runner / Codex app-server cannot answer yet.",
+            "description": "Runner-owned model-picker options for native sessions. Claude supplies launch-time gateway aliases; Codex includes each model's supported reasoning efforts. Empty while unavailable.",
             "items": {
-              "additionalProperties": true,
-              "type": "object"
+              "$ref": "#/components/schemas/NativeModelOption"
             },
             "title": "Model Options",
             "type": "array"
