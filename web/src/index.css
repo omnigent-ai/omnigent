@@ -220,8 +220,10 @@
      * (These all consume bg-popover / text-popover-foreground.) */
   --popover: #fff;
   --popover-foreground: #11171c;
-  --primary: #4dc5a0;
-  --primary-foreground: #123d33;
+  /* Primary actions use an accessible Otto rose; focus remains blue below,
+     * while green stays exclusive to success and online state. */
+  --primary: #d4387f;
+  --primary-foreground: #fff;
   /* Warm paper steps keep controls distinct without introducing a cool-grey
      * cast that would fight the pink and green brand colors. */
   --secondary: #f2f1ee;
@@ -250,8 +252,8 @@
   --button-border: rgba(61, 57, 41, 0.14);
   --button-icon-hover-color: #11171c;
   --input: rgba(61, 57, 41, 0.1);
-  /* Focus ring matches --primary. */
-  --ring: #26a079;
+  /* Focus ring matches the interaction color, not semantic status green. */
+  --ring: #0969da;
   /* Brand pink — reserved for brand moments, not status. */
   --brand-accent: #df3c85;
   /* Named status hues. success/warning/info above mirror green/yellow/blue. */
@@ -270,12 +272,12 @@
      * stays softly gray-white behind it. */
   --sidebar: #fff;
   --sidebar-foreground: #11171c;
-  --sidebar-primary: #4dc5a0;
-  --sidebar-primary-foreground: #123d33;
+  --sidebar-primary: #d4387f;
+  --sidebar-primary-foreground: #fff;
   --sidebar-accent: #f3e7ed;
   --sidebar-accent-foreground: #653047;
   --sidebar-border: rgba(61, 57, 41, 0.1);
-  --sidebar-ring: #26a079;
+  --sidebar-ring: #0969da;
   /* Routine navigation states stay neutral and theme-adaptive. Brand color is
      reserved for primary actions and semantic status, not row selection. */
   --sidebar-hover: color-mix(in srgb, var(--sidebar-foreground) 5%, transparent);
@@ -467,14 +469,68 @@
 }
 
 :root:not(.dark) .reference-composer-surface:focus-within {
-  border-color: var(--border-otto-interactive);
+  border-color: color-mix(in srgb, var(--ring) 55%, transparent);
+  border-top-color: color-mix(in srgb, var(--ring) 68%, transparent);
+  box-shadow:
+    var(--elevation-otto-2),
+    0 0 0 3px color-mix(in srgb, var(--ring) 16%, transparent);
 }
 
-html:not(.dark):not([data-theme]) .reference-composer-surface:focus-within,
-html:not(.dark)[data-theme="omni-rose"] .reference-composer-surface:focus-within,
-html:not(.dark)[data-theme="otto-dream"] .reference-composer-surface:focus-within {
-  border-color: rgba(38, 160, 121, 0.42);
-  border-top-color: rgba(38, 160, 121, 0.5);
+/* Tool-step presentation follows SP2K's quiet “Worked for…” hierarchy while
+ * retaining Omnigent's own surfaces and theme tokens. Expanded calls form a
+ * compact timeline; each category/status glyph sits inside an 18px node that
+ * masks the guide behind it. */
+.tool-step-icon-node {
+  position: relative;
+  z-index: 1;
+  display: inline-flex;
+  width: 18px;
+  height: 18px;
+  flex: 0 0 18px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid color-mix(in srgb, var(--foreground) 14%, transparent);
+  border-radius: 999px;
+  color: var(--muted-foreground);
+  background: color-mix(in srgb, var(--card-solid) 88%, var(--shell-surface));
+  box-shadow: 0 0 0 3px var(--shell-surface);
+}
+
+.tool-step-icon-node svg {
+  width: 10px;
+  height: 10px;
+  stroke-width: 1.75;
+}
+
+.tool-group-timeline > .tool-call-row {
+  position: relative;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.tool-group-timeline > .tool-call-row::before,
+.tool-group-timeline > .tool-call-row::after {
+  position: absolute;
+  left: 9px;
+  width: 1px;
+  content: "";
+  pointer-events: none;
+  background: color-mix(in srgb, var(--foreground) 12%, transparent);
+}
+
+.tool-group-timeline > .tool-call-row::before {
+  top: 0;
+  height: 4px;
+}
+
+.tool-group-timeline > .tool-call-row::after {
+  top: 21px;
+  bottom: -4px;
+}
+
+.tool-group-timeline > .tool-call-row:first-child::before,
+.tool-group-timeline > .tool-call-row:last-child::after {
+  display: none;
 }
 
 .buoyant-send-action:not(:disabled):active {
@@ -2105,18 +2161,22 @@ html[data-theme] .reference-composer-surface button[aria-label="Send"]:not(:disa
 :root:not(.dark)[data-theme="omni-rose"]
   .reference-composer-surface
   [data-testid="new-chat-landing-submit"]:not(:disabled),
-:root:not(.dark):not([data-theme])
-  .reference-composer-surface
-  [data-testid="new-chat-landing-submit"]:not(:disabled),
 :root:not(.dark)[data-theme="omni-rose"]
-  .reference-composer-surface
-  button[aria-label="Send"]:not(:disabled),
-:root:not(.dark):not([data-theme])
   .reference-composer-surface
   button[aria-label="Send"]:not(:disabled) {
   color: #123d33 !important;
   background: #4dc5a0 !important;
   box-shadow: 0 8px 20px rgba(38, 160, 121, 0.2) !important;
+}
+:root:not(.dark):not([data-theme])
+  .reference-composer-surface
+  [data-testid="new-chat-landing-submit"]:not(:disabled),
+:root:not(.dark):not([data-theme])
+  .reference-composer-surface
+  button[aria-label="Send"]:not(:disabled) {
+  color: var(--primary-foreground) !important;
+  background: var(--primary) !important;
+  box-shadow: 0 8px 20px color-mix(in srgb, var(--primary) 22%, transparent) !important;
 }
 :root:not(.dark)[data-theme="omni-rose"] [data-slot="switch"][data-checked],
 :root:not(.dark):not([data-theme]) [data-slot="switch"][data-checked] {

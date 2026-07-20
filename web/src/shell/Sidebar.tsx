@@ -501,7 +501,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                     size="icon"
                     aria-label="Search"
                     onClick={() => onOpenSearch?.()}
-                    className="size-6 rounded-md"
+                    className="size-6 rounded-md text-muted-foreground hover:text-foreground"
                     data-testid="sidebar-search-button"
                   >
                     <SearchIcon className="size-4" />
@@ -516,7 +516,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                     variant="ghost"
                     size="icon"
                     aria-label="Settings"
-                    className="size-6 rounded-md"
+                    className="size-6 rounded-md text-muted-foreground hover:text-foreground"
                   >
                     <Link to="/settings" data-testid="settings-button">
                       <SettingsIcon className="size-4" />
@@ -533,7 +533,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                     size="icon"
                     aria-label="Close sidebar"
                     onClick={onClose}
-                    className="size-6 rounded-md"
+                    className="size-6 rounded-md text-muted-foreground hover:text-foreground"
                   >
                     {/* panel-right-open while the sidebar IS open — this button
                     only renders in the open state (ChatHeader's PanelLeftIcon

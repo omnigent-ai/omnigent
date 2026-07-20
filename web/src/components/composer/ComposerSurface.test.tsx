@@ -15,6 +15,7 @@ describe("ComposerSurface geometry", () => {
       "duration-[var(--duration-otto-fast)]",
       "transition-[border-color,box-shadow,transform]",
       "ease-[var(--ease-otto)]",
+      "focus-within:border-ring",
     );
   });
 

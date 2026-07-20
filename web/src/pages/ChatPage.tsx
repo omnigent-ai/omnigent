@@ -4644,9 +4644,10 @@ export function Composer({
       {subAgentLabel ? <SubagentComposerTray label={subAgentLabel} /> : null}
       {/* Single rounded container — textarea on top, action row beneath.
           No top border on the surrounding form; the box itself is the
-          visual container. The static neutral border carries through
-          focus — no focus-within ring — so the box stays clean while
-          typing. Drag-over still lifts an inset ring (below).
+          visual container. The resting border stays neutral, then the
+          shared composer surface introduces a restrained interaction-blue
+          border and halo while focus is inside. Drag-over still lifts a
+          stronger inset ring (below).
           dark:bg-card-solid: the trays tuck their square corners behind
           this card (-mb-4 / -mt-4), and the dark glass --card is 60%
           alpha — the tucked strips ghost through a translucent card. The

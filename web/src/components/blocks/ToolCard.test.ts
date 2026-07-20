@@ -68,7 +68,7 @@ describe("ToolCard rendering", () => {
   it("renders the tool title and duration in the collapsed trigger row", () => {
     // WHY: the trigger row is the always-visible summary; an unknown tool name
     // falls back to `name(argsSummary)`, and a completed duration renders.
-    renderCard({
+    const { container } = renderCard({
       name: "my_tool",
       argsSummary: "x=1",
       arguments: { x: 1 },
@@ -78,6 +78,12 @@ describe("ToolCard rendering", () => {
     });
     expect(screen.getByText("my_tool(x=1)")).toBeInTheDocument();
     expect(screen.getByText("3.3s")).toBeInTheDocument();
+    expect(container.querySelector(".tool-call-trigger")).toHaveClass(
+      "gap-2.5",
+      "text-sm",
+      "font-normal",
+    );
+    expect(container.querySelector(".tool-step-icon-node")).toBeInTheDocument();
   });
 
   it("expands to reveal the Parameters panel and output on click", () => {
@@ -215,9 +221,17 @@ describe("ToolGroupSummary", () => {
       ),
     );
     expect(screen.getByText("See 2 steps")).toBeInTheDocument();
-    fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
+    const summaryTrigger = container.querySelector<HTMLElement>(".tool-group-summary-trigger")!;
+    expect(summaryTrigger).toHaveClass("text-sm", "font-normal", "gap-1.5");
+    fireEvent.click(summaryTrigger);
     expect(screen.getByText("alpha_tool")).toBeInTheDocument();
     expect(screen.getByText("beta_tool")).toBeInTheDocument();
+    expect(container.querySelector(".tool-group-timeline")).toHaveClass(
+      "border-l-2",
+      "border-border/70",
+      "pl-3",
+    );
+    expect(container.querySelectorAll(".tool-step-icon-node")).toHaveLength(2);
   });
 
   it("uses the singular 'step' for one tool and honors an explicit count override", () => {

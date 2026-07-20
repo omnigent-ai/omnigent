@@ -194,7 +194,7 @@ export function ToolCard({
   const onBodyClick = openFile && rawPath ? () => openFile(rawPath) : undefined;
 
   return (
-    <Collapsible defaultOpen={false} className="group not-prose w-full">
+    <Collapsible defaultOpen={false} className="tool-call-row group not-prose w-full">
       <ToolTriggerRow
         title={title}
         name={name}
@@ -203,7 +203,7 @@ export function ToolCard({
         duration={displayDuration}
         onBodyClick={onBodyClick}
       />
-      <CollapsibleContent className="mt-1 ml-2 space-y-2 border-l pl-3 py-1 data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:animate-out data-[state=open]:animate-in">
+      <CollapsibleContent className="mt-1 ml-[9px] space-y-2 border-l pl-4 py-1 data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:animate-out data-[state=open]:animate-in">
         <CodePanel
           title="Parameters"
           text={inputJson}
@@ -247,11 +247,11 @@ export function ToolGroupSummary({ tools, count }: { tools: RenderItem[]; count?
     // `peer` lets `BlockRenderer`'s trailing tail react to this
     // collapsible's open/closed state for the border-join effect.
     <Collapsible defaultOpen={false} className="group/tool-summary peer not-prose w-full">
-      <CollapsibleTrigger className="flex cursor-pointer items-center gap-1.5 py-0.5 text-left text-muted-foreground text-13 leading-5 transition-colors hover:text-foreground">
+      <CollapsibleTrigger className="tool-group-summary-trigger inline-flex max-w-full cursor-pointer items-center gap-1.5 py-[3px] text-left text-sm font-normal leading-[1.4] text-muted-foreground transition-colors hover:text-foreground">
         <span>{label}</span>
-        <ChevronRightIcon className="size-3.5 shrink-0 transition-transform group-data-[state=open]/tool-summary:rotate-90" />
+        <ChevronRightIcon className="size-3 shrink-0 opacity-75 transition-transform group-data-[state=open]/tool-summary:rotate-90" />
       </CollapsibleTrigger>
-      <CollapsibleContent className="mt-1 ml-2 space-y-1 border-l pl-3 pt-1 pb-0 data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:animate-out data-[state=open]:animate-in">
+      <CollapsibleContent className="tool-group-timeline mt-1.5 space-y-1 border-l-2 border-border/70 pl-3 pt-0.5 pb-0 data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:animate-out data-[state=open]:animate-in">
         {tools.map((item) => {
           if (item.kind === "tool") {
             return (
@@ -312,11 +312,11 @@ function ToolTriggerRow({
   return (
     <CollapsibleTrigger
       title={tooltip}
-      className="flex w-full cursor-pointer items-center gap-1.5 py-0.5 text-left text-muted-foreground text-xs transition-colors hover:text-foreground"
+      className="tool-call-trigger inline-flex max-w-full cursor-pointer items-center gap-2.5 py-[3px] text-left text-sm font-normal leading-[1.4] text-muted-foreground transition-opacity hover:opacity-80"
     >
       <StatusIcon name={name} nativeToolType={nativeToolType} state={state} />
-      <span className="min-w-0 flex-1 truncate">
-        {title.verb !== null && <span className="font-semibold text-foreground">{title.verb}</span>}
+      <span className="min-w-0 truncate">
+        {title.verb !== null && <span className="font-normal text-foreground">{title.verb}</span>}
         {title.verb !== null && title.body.length > 0 && " "}
         {onBodyClick ? (
           // Use <span role="link"> instead of <button> to avoid nesting
@@ -345,9 +345,11 @@ function ToolTriggerRow({
         )}
       </span>
       {duration !== undefined && (
-        <span className="shrink-0 tabular-nums opacity-70">{formatToolDuration(duration)}</span>
+        <span className="shrink-0 font-mono text-[11px] tabular-nums opacity-70">
+          {formatToolDuration(duration)}
+        </span>
       )}
-      <ChevronRightIcon className="size-3.5 shrink-0 transition-transform group-data-[state=open]:rotate-90" />
+      <ChevronRightIcon className="size-3 shrink-0 opacity-75 transition-transform group-data-[state=open]:rotate-90" />
     </CollapsibleTrigger>
   );
 }
@@ -370,17 +372,33 @@ function StatusIcon({
   if (state === "input-available") {
     // Slightly larger and tinted so the running indicator is the one
     // thing in the row that actively draws the eye.
-    return <Loader2Icon className="size-3.5 shrink-0 animate-spin text-info" />;
+    return (
+      <span className="tool-step-icon-node">
+        <Loader2Icon className="animate-spin text-info" />
+      </span>
+    );
   }
   if (state === "output-error") {
-    return <XCircleIcon className="size-3.5 shrink-0 text-destructive" />;
+    return (
+      <span className="tool-step-icon-node">
+        <XCircleIcon className="text-destructive" />
+      </span>
+    );
   }
   if (state === "cancelled" || state === "no-output") {
     // Turn over, no output recorded — muted slash, not the error icon.
-    return <CircleSlashIcon className="size-3.5 shrink-0" />;
+    return (
+      <span className="tool-step-icon-node">
+        <CircleSlashIcon />
+      </span>
+    );
   }
   const Icon = iconForTool(name, nativeToolType);
-  return <Icon className="size-3.5 shrink-0" />;
+  return (
+    <span className="tool-step-icon-node">
+      <Icon />
+    </span>
+  );
 }
 
 function CodePanel({

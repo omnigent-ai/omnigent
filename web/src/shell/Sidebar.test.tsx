@@ -246,7 +246,19 @@ describe("Sidebar session list", () => {
 
     const settings = screen.getByTestId("settings-button");
     expect(settings).toHaveAttribute("aria-label", "Settings");
-    expect(settings.className).toContain("size-6");
+    expect(settings).toHaveClass(
+      "size-6",
+      "text-muted-foreground",
+      "hover:text-foreground",
+    );
+    expect(screen.getByTestId("sidebar-search-button")).toHaveClass(
+      "text-muted-foreground",
+      "hover:text-foreground",
+    );
+    expect(screen.getByRole("button", { name: "Close sidebar" })).toHaveClass(
+      "text-muted-foreground",
+      "hover:text-foreground",
+    );
     expect(screen.getByRole("link", { name: "Customize" })).toHaveAttribute(
       "href",
       "/settings/appearance",
