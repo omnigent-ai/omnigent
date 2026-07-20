@@ -19,6 +19,7 @@ import {
   ChevronRightIcon,
   GitBranchIcon,
   ArrowUpIcon,
+  Loader2Icon,
   FileTextIcon,
   FolderIcon,
   ImageIcon,
@@ -588,7 +589,7 @@ export function harnessWarningMessageText(
     return `${agentName} needs Codex authentication on ${hostName} — run codex login on that machine.`;
   }
   if (reason === "binary-missing") {
-    return `${agentName} is missing the Codex binary on ${hostName} — run omnigent setup on that machine.`;
+    return `${agentName} can't find the Codex binary on ${hostName} — if codex is installed, restart the host with omnigent host so it picks up your PATH, or set OMNIGENT_CODEX_PATH. Otherwise run omnigent setup.`;
   }
   return `${agentName} isn't configured on ${hostName} — run omnigent setup on that machine.`;
 }
@@ -618,8 +619,9 @@ function harnessWarningMessage(
   if (reason === "binary-missing") {
     return (
       <>
-        {agentName} is missing the Codex binary on {hostName} — run <code>omnigent setup</code> on
-        that machine.
+        {agentName} can&apos;t find the Codex binary on {hostName} — if codex is installed, restart
+        the host with <code>omnigent host</code> so it picks up your PATH, or set{" "}
+        <code>OMNIGENT_CODEX_PATH</code>. Otherwise run <code>omnigent setup</code>.
       </>
     );
   }
@@ -1298,6 +1300,7 @@ function AgentHarnessPicker({
   pendingAgentId,
   onSelectPending,
   onCreateCustomAgent,
+  sandboxSelected,
   permissionMode,
   approvalMode,
   cursorExecMode,
@@ -1325,6 +1328,7 @@ function AgentHarnessPicker({
   pendingAgentId: string;
   onSelectPending: () => void;
   onCreateCustomAgent: () => void;
+  sandboxSelected: boolean;
   permissionMode: string;
   approvalMode: string;
   cursorExecMode: string;
@@ -1726,14 +1730,19 @@ function AgentHarnessPicker({
                 </div>
               </DropdownMenuItem>
             )}
-            <DropdownMenuItem
-              data-testid="new-chat-landing-create-agent"
-              onSelect={onCreateCustomAgent}
-              className="gap-2 rounded-sm px-2 py-1.5 text-13 text-muted-foreground"
-            >
-              <PlusIcon className="size-3.5" />
-              Create custom agent
-            </DropdownMenuItem>
+            {/* A managed sandbox provisions its runner from a baked image and
+            has no create path for an uploaded bundle, so custom-agent creation
+            isn't offered there — the item is omitted on a sandbox target. */}
+            {!sandboxSelected && (
+              <DropdownMenuItem
+                data-testid="new-chat-landing-create-agent"
+                onSelect={onCreateCustomAgent}
+                className="gap-2 rounded-sm px-2 py-1.5 text-13 text-muted-foreground"
+              >
+                <PlusIcon className="size-3.5" />
+                Create custom agent
+              </DropdownMenuItem>
+            )}
           </>
         )}
       </DropdownMenuContent>
@@ -2234,8 +2243,13 @@ export function NewChatLandingScreen() {
   // A pick only wins while it exists in the list — a persisted id whose
   // agent has since been unregistered (or hidden) falls back to the default.
   // The pending custom agent sentinel also wins when set.
+  // A pending (just-created, not-yet-submitted) custom agent can't run on a
+  // managed sandbox — the sandbox create path doesn't provision a runner for a
+  // bundled agent. So a pending pick made before switching to a sandbox is
+  // dropped there, falling back to a real agent; off the sandbox it's kept.
+  const pendingAgentAllowedOnTarget = !sandboxSelected;
   const effectiveAgentId =
-    pickedAgentId === PENDING_AGENT_ID
+    pickedAgentId === PENDING_AGENT_ID && pendingAgentAllowedOnTarget
       ? PENDING_AGENT_ID
       : ((agentList.some((a) => a.id === pickedAgentId) ? pickedAgentId : agentList[0]?.id) ??
         null);
@@ -3289,10 +3303,11 @@ export function NewChatLandingScreen() {
                   hasAgents={agentList.length > 0}
                   host={harnessWarningHost}
                   onSelectAgent={handleSelectAgent}
-                  pendingAgent={pendingAgent}
+                  pendingAgent={pendingAgentAllowedOnTarget ? pendingAgent : null}
                   pendingAgentId={PENDING_AGENT_ID}
                   onSelectPending={handleSelectPending}
                   onCreateCustomAgent={() => setCreateAgentOpen(true)}
+                  sandboxSelected={sandboxSelected}
                   permissionMode={permissionMode}
                   approvalMode={approvalMode}
                   cursorExecMode={cursorExecMode}
@@ -3324,11 +3339,16 @@ export function NewChatLandingScreen() {
                           type="submit"
                           size="icon"
                           disabled={!canSubmit}
-                          aria-label="Start session"
+                          aria-label={creating ? "Starting session" : "Start session"}
+                          aria-busy={creating}
                           data-testid="new-chat-landing-submit"
                           className="size-8 rounded-full bg-foreground text-card transition-opacity hover:opacity-80 disabled:opacity-50"
                         >
-                          <ArrowUpIcon className="size-4" />
+                          {creating ? (
+                            <Loader2Icon className="size-4 animate-spin" />
+                          ) : (
+                            <ArrowUpIcon className="size-4" />
+                          )}
                         </Button>
                       </span>
                     </TooltipTrigger>

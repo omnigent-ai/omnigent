@@ -319,8 +319,9 @@ export function FilesPanel({
     enabled: true,
   });
   const workingDir = envQuery.data?.root ?? null;
-  const changedCount = changedQuery.data?.data.length ?? 0;
-  const hiddenFilesCount = (changedQuery.data?.data ?? []).filter((f) =>
+  const changedFiles = changedQuery.data?.data ?? [];
+  const changedCount = changedFiles.length;
+  const hiddenFilesCount = changedFiles.filter((f) =>
     f.path.split("/").some((seg) => seg.startsWith(".")),
   ).length;
 

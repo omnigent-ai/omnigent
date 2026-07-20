@@ -11,6 +11,9 @@ androidxWebkit = "1.12.1"
 junit = "4.13.2"
 robolectric = "4.14.1"
 androidxTestCore = "1.6.1"
+# Gradle Play Publisher. 3.x tracks the AGP 8.x / Gradle 8.9 toolchain pinned
+# above; 4.x targets the newer toolchain, so bump it with the rest, not alone.
+playPublisher = "3.12.1"
 
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "androidxCore" }
@@ -23,3 +26,4 @@ androidx-test-core = { group = "androidx.test", name = "core", version.ref = "an
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }
 kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
+play-publisher = { id = "com.github.triplet.play", version.ref = "playPublisher" }

@@ -59,6 +59,18 @@ jobs:
           node-version: "22"
           cache-dependency-path: web/electron/package-lock.json
 
+      - name: Verify lockfile uses public registry
+        # Fail fast (in seconds, not minutes) if any package-lock.json
+        # resolved URL points at an internal proxy that public CI runners
+        # can't reach — e.g. npm-proxy.cloud.databricks.com. Without this
+        # guard, npm ci silently times out mid-install on Windows/Linux.
+        # Uses the shared normalize_package_lock_registry.py script (same
+        # one wired into pre-commit) so CI and local checks stay in sync.
+        working-directory: web/electron
+        shell: bash
+        run: |
+          python3 ../../scripts/normalize_package_lock_registry.py --check package-lock.json
+
       - name: Install dependencies
         working-directory: web/electron
         run: npm ci --no-audit --no-fund
@@ -74,15 +86,34 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: npm run ${{ matrix.build-script }} -- --publish never
 
-      - name: Upload installers
+      # Each distributable gets its own artifact so consumers can download just
+      # the AppImage or just the .deb without pulling down everything else.
+      # Ship only the distributables, not electron-builder's unpacked
+      # intermediates (dist/linux-unpacked, dist/win-unpacked, blockmaps).
+
+      - name: Upload Linux AppImage
+        if: matrix.platform == 'linux'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
-          name: omnigent-desktop-${{ matrix.platform }}
-          # Ship only the distributables, not electron-builder's unpacked
-          # intermediates (dist/linux-unpacked, dist/win-unpacked, blockmaps).
-          path: |
-            web/electron/dist/*.AppImage
-            web/electron/dist/*.deb
-            web/electron/dist/*.exe
+          name: omnigent-desktop-linux-appimage
+          path: web/electron/dist/*.AppImage
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload Linux deb
+        if: matrix.platform == 'linux'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: omnigent-desktop-linux-deb
+          path: web/electron/dist/*.deb
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload Windows installer
+        if: matrix.platform == 'win'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: omnigent-desktop-win
+          path: web/electron/dist/*.exe
           if-no-files-found: error
           retention-days: 14

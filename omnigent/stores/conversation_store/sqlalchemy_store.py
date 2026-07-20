@@ -2567,6 +2567,27 @@ class SqlAlchemyConversationStore(ConversationStore):
                 meta.terminal_launch_args = json.dumps(terminal_launch_args)
         return self.get_conversation(conversation_id)
 
+    def rename_conversation_if_title_matches(
+        self,
+        conversation_id: str,
+        expected_title: str,
+        title: str,
+    ) -> Conversation | None:
+        """Rename a conversation with an atomic title compare-and-swap."""
+        with self._conv_session() as session:
+            result = session.execute(
+                update(SqlConversation)
+                .where(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.id == conversation_id,
+                    SqlConversation.title == expected_title,
+                )
+                .values(title=title, updated_at=now_epoch())
+            )
+            if result.rowcount != 1:
+                return None
+        return self.get_conversation(conversation_id)
+
     def set_runner_id(self, conversation_id: str, runner_id: str) -> bool:
         """
         Pin a conversation to a runner via atomic

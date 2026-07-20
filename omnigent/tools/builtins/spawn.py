@@ -127,8 +127,10 @@ class SysSessionSendTool(Tool):
             "of (agent + title) or session_id, always with args. "
             "Returns the child's output when its turn completes. To run "
             "multiple sessions in parallel, emit multiple "
-            "sys_session_send tool_calls in the same response — they "
-            "dispatch concurrently. "
+            "sys_session_send tool_calls in the same response with a "
+            "distinct task-based title for each independent session — "
+            "they dispatch concurrently. Reusing a title continues the "
+            "same session and cannot run another turn concurrently. "
             "To attach previously-uploaded files, "
             "pass their file ids via the object args form's 'file_ids' "
             "list on the first named (agent, title) send only; file_ids "
@@ -227,13 +229,14 @@ def _build_sys_session_send_schema(
                 "type": "string",
                 "description": (
                     "Named mode: a unique-within-this-parent "
-                    "label for the sub-agent session, e.g. "
-                    "'auth' or 'payments'. Lets later turns "
-                    "reuse the same conversation via another "
-                    "sys_session_send call with the same "
-                    "title. Titles must be distinct under one "
-                    "parent for the same agent. Pair with "
-                    "'agent'; omit when using 'session_id'."
+                    "task-based identity for the sub-agent session, "
+                    "e.g. 'auth' or 'payments'. Reusing it in a later "
+                    "sys_session_send call continues the same "
+                    "conversation. Every independent parallel call "
+                    "for the same agent must use a distinct title; "
+                    "reusing a title cannot start another concurrent "
+                    "turn. Pair with 'agent'; omit when using "
+                    "'session_id'."
                 ),
             },
         }

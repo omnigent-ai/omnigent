@@ -530,6 +530,14 @@ known-first-party = ["omnigent"]
 "sdks/**/*.py" = [
     "ARG001", "ARG002", "BLE001", "B008", "RUF012",
 ]
+# slack_bolt dispatches to handlers by parameter NAME (``body``, ``event``,
+# ``client``, ``ack``, ``view``), so unused handler args can't be renamed to
+# ``_`` without breaking injection. The bot also has deliberate boundary
+# catches (best-effort acks, background login tasks) that must never abort a
+# turn, hence BLE001.
+"integrations/slack/**/*.py" = [
+    "ARG001", "ARG002", "BLE001", "B008", "RUF012",
+]
 
 [tool.mypy]
 python_version = "3.12"
@@ -723,6 +731,15 @@ follow_imports = "skip"
 # via sys.modules aliasing.
 [[tool.mypy.overrides]]
 module = "omnigent_client.*"
+ignore_missing_imports = true
+disallow_any_explicit = false
+
+# Slack integration (omnigent-slack). slack_bolt / slack_sdk ship no type
+# stubs, and Slack event/view payloads are opaque JSON dicts the handlers
+# read positionally — so the code leans on ``Any`` at that boundary. Mirror
+# the client SDK: resolve the untyped imports and lift the Any ban here.
+[[tool.mypy.overrides]]
+module = "omnigent_slack.*"
 ignore_missing_imports = true
 disallow_any_explicit = false
 
