@@ -207,7 +207,7 @@ async def test_read_text_byte_cap_truncates_on_utf8_boundary(
     """
     # "é" is 2 bytes (0xC3 0xA9) in UTF-8; on "aé" a 2-byte cap keeps the "a"
     # and lands mid-codepoint inside "é".
-    (workspace / "accents.txt").write_text("aé")
+    (workspace / "accents.txt").write_text("aé", encoding="utf-8")
 
     os_env = create_os_environment(
         OSEnvSpec(type="caller_process", cwd=str(workspace), sandbox=OSEnvSandboxSpec(type="none"))
@@ -302,7 +302,7 @@ async def test_delete_directory_recursive(
     assert not (workspace / "src").exists()
 
 
-# ── shell-injection regression for stat/_stat_via_shell/_check_dir_empty ──
+# ── shell-injection regressions for stat and anchored delete ──
 
 
 @pytest.mark.asyncio
@@ -312,15 +312,14 @@ async def test_delete_path_with_command_substitution_does_not_execute(
 ) -> None:
     """A DELETE path containing ``$(...)`` must not execute the substituted command.
 
-    Regression test: the DELETE handler reaches ``_stat_via_shell``
-    and ``_check_dir_empty``, which used to interpolate the caller-controlled
+    Regression test: the old DELETE helpers interpolated the caller-controlled
     path into a double-quoted ``python3 -c`` script. The shell expanded
-    ``$(...)`` before python ran, giving arbitrary command execution.
+    ``$(...)`` before Python ran, giving arbitrary command execution.
 
     The payload ``inj$(touch PWNED)x`` would, on the vulnerable code, run
     ``touch PWNED`` in the workspace (cwd of the helper). With the path
-    embedded as a Python literal via ``json.dumps`` and the whole script
-    shell-quoted, the string is statted verbatim — no command runs.
+    The anchored delete helper now embeds the path as a Python literal via
+    ``json.dumps`` and shell-quotes the whole script, so no command runs.
     """
     import urllib.parse
 
@@ -335,7 +334,7 @@ async def test_delete_path_with_command_substitution_does_not_execute(
         f"/{DEFAULT_ENVIRONMENT_ID}/filesystem/{encoded}"
     )
 
-    # The literal path does not exist, so the stat fails and the endpoint
+    # The literal path does not exist, so classification fails and the endpoint
     # returns 404 — on BOTH old and new code the HTTP status is 404 (the
     # substituted command produced empty output, leaving "injx"). The marker
     # is the discriminator: it is created only if the injection executed.
@@ -357,11 +356,11 @@ async def test_delete_real_file_with_command_substitution_name(
 
     Usability guard for the shell-injection fix: embedding the path as a Python
     literal must treat shell metacharacters as ordinary filename bytes, so a
-    legitimately (if unusually) named file is statted and removed correctly.
+    legitimately (if unusually) named file is classified and removed correctly.
 
     If the path were still shell-interpreted, ``$(whoami)`` would expand and
-    ``os.stat`` would receive a *different* string (``data<user>.txt``), the
-    stat would miss, and the real file would be left on disk — surfacing as a
+    the helper would receive a *different* string (``data<user>.txt``), the
+    lookup would miss, and the real file would be left on disk — surfacing as a
     404 and a surviving file. Asserting a successful delete of the real file
     proves the verbatim path made it through.
     """
@@ -386,9 +385,9 @@ async def test_delete_real_file_with_command_substitution_name(
     body = resp.json()
     assert body["deleted"] is True, "The endpoint must report the file as deleted."
     assert body["type"] == "file", "The metacharacter-named entry is a regular file."
-    # The verbatim-named file is gone — proves stat + rm both used the literal path.
+    # The verbatim-named file is gone — proves the anchored helper used the literal path.
     assert not target.exists(), (
-        f"File {weird_name!r} still on disk after a reported delete; the rm "
+        f"File {weird_name!r} still on disk after a reported delete; the helper "
         "did not target the literal path."
     )
 
@@ -651,9 +650,10 @@ async def test_shell_timeout_returns_structured_result(
     client: httpx.AsyncClient,
 ) -> None:
     """POST /shell returns the timeout result instead of raising."""
+    command = "ping -n 3 127.0.0.1 >nul" if os.name == "nt" else "sleep 2"
     resp = await client.post(
         f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/shell",
-        json={"command": "sleep 2", "timeout": 1},
+        json={"command": command, "timeout": 1},
     )
     assert resp.status_code == 200
     body = resp.json()
@@ -1716,6 +1716,34 @@ async def test_delete_directory_junction_removes_link_not_target(tmp_path: Path)
     assert result.type == "symlink"
     assert not junction.exists()
     assert target.is_dir() and (target / "keep.txt").exists()
+
+
+@pytest.mark.asyncio
+async def test_delete_broken_directory_junction_succeeds(tmp_path: Path) -> None:
+    """A Windows junction remains deletable after its target disappears."""
+    ws = tmp_path / "ws"
+    target = ws / "real"
+    target.mkdir(parents=True)
+    junction = ws / "dangling_junction"
+    result = subprocess.run(
+        f'mklink /J "{junction}" "{target}"',
+        shell=True,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        pytest.skip("could not create a junction")
+    target.rmdir()
+    assert os.path.lexists(junction) and not junction.exists()
+
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", cwd=str(ws), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    fs = CallerProcessFilesystem(os_env)
+
+    deleted = await fs.delete("dangling_junction")
+
+    assert deleted.type == "symlink"
+    assert not os.path.lexists(junction)
 
 
 @pytest.mark.asyncio

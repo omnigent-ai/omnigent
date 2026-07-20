@@ -3700,7 +3700,7 @@ def _write_uninstall_manifest(ledger: Any) -> Path:
     """Write the ledger fields the POSIX uninstaller needs as tab records."""
     fd, manifest_name = tempfile.mkstemp(prefix="omnigent-uninstall-ledger-", suffix=".tsv")
     manifest = Path(manifest_name)
-    with os.fdopen(fd, "w") as handle:
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
         for profile in ledger.entries.profiles:
             handle.write(
                 "\t".join(

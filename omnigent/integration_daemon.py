@@ -19,6 +19,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from omnigent._encoding import detect_encoding
 from omnigent.inner import _proc
 
 
@@ -54,8 +55,8 @@ class IntegrationDaemon:
     def read_record(self) -> DaemonRecord | None:
         """Return the recorded daemon, or ``None`` if absent/malformed."""
         try:
-            raw = json.loads(self._record_path.read_text())
-        except (OSError, json.JSONDecodeError):
+            raw = json.loads(self._record_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             return None
         if not isinstance(raw, dict):
             return None
@@ -76,7 +77,8 @@ class IntegrationDaemon:
                     "log_path": record.log_path,
                     "started_at": record.started_at,
                 }
-            )
+            ),
+            encoding="utf-8",
         )
 
     def _clear_record(self) -> None:
@@ -138,7 +140,10 @@ class IntegrationDaemon:
         if record is None:
             return ""
         try:
-            lines = Path(record.log_path).read_text(errors="replace").splitlines()
+            log_path = Path(record.log_path)
+            lines = log_path.read_text(
+                encoding=detect_encoding(log_path), errors="replace"
+            ).splitlines()
         except OSError:
             return ""
         return "\n".join(lines[-max_lines:])

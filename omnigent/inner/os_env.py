@@ -1436,7 +1436,7 @@ def _run_windows_cmd_shell(
         # One-pass environment expansion preserves literal ``%NAME%`` in the
         # path; quoting also protects spaces and ``&``. The batch clears this
         # private variable before it runs caller code.
-        child_env = dict(os.environ)
+        child_env = _child_shell_env()
         child_env[_CMD_SCRIPT_ENV] = script_path
         cmdline = f'"{shell_path}" /d /s /v:off /c ""%{_CMD_SCRIPT_ENV}%""'
         spawn_kwargs = dict(_proc.spawn_kwargs())

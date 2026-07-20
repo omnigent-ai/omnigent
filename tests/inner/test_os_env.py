@@ -400,8 +400,9 @@ def test_shell_command_does_not_see_omnigent_project_root(
         OSEnvSpec(type="caller_process", sandbox=OSEnvSandboxSpec(type="none"))
     )
     assert os_env is not None
+    command = "echo PP=%PYTHONPATH%" if os.name == "nt" else "echo PP=$PYTHONPATH"
     try:
-        result = asyncio.run(os_env.shell("echo PP=$PYTHONPATH"))
+        result = asyncio.run(os_env.shell(command))
     finally:
         os_env.close()
 

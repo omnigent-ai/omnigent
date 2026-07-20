@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from omnigent import install_ledger
@@ -8,6 +9,7 @@ from omnigent import install_ledger
 
 def test_install_ledger_round_trip_and_mode(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / ".omnigent"))
     profile = tmp_path / ".zshrc"
     profile.write_text(
@@ -22,15 +24,55 @@ def test_install_ledger_round_trip_and_mode(tmp_path: Path, monkeypatch) -> None
     path = install_ledger.ledger_path()
     install_ledger.write_ledger(ledger, path=path)
 
-    assert oct(path.stat().st_mode & 0o777) == "0o600"
+    if os.name != "nt":
+        assert oct(path.stat().st_mode & 0o777) == "0o600"
     loaded = install_ledger.load_ledger(path)
     assert loaded is not None
     assert loaded.to_dict() == ledger.to_dict()
     assert loaded.entries.profiles[0].path == str(profile)
 
 
+def test_find_profile_block_detects_legacy_locale_encoding(tmp_path: Path, monkeypatch) -> None:
+    profile = tmp_path / ".profile"
+    profile.write_bytes(
+        (
+            "café\n"
+            f"{install_ledger.PROFILE_MARKER_BEGIN}\n"
+            'export PATH="$HOME/.local/bin:$PATH"\n'
+            f"{install_ledger.PROFILE_MARKER_END}\n"
+        ).encode("cp1252")
+    )
+    monkeypatch.setattr("omnigent._encoding.locale_encoding", lambda: "cp1252")
+
+    found = install_ledger.find_profile_block(profile)
+
+    assert found is not None
+    assert found[2].startswith(install_ledger.PROFILE_MARKER_BEGIN)
+
+
+def test_json_config_detection_supports_legacy_locale_encoding(
+    tmp_path: Path, monkeypatch
+) -> None:
+    path = tmp_path / "mcp.json"
+    path.write_bytes('{"label": "café", "mcpServers": {"omnigent": {}}}\n'.encode("cp1252"))
+    monkeypatch.setattr("omnigent._encoding.locale_encoding", lambda: "cp1252")
+
+    assert install_ledger._json_has_key_path(path, "mcpServers.omnigent")
+
+
+def test_toml_config_detection_supports_legacy_locale_encoding(
+    tmp_path: Path, monkeypatch
+) -> None:
+    path = tmp_path / "config.toml"
+    path.write_bytes("# café\n[mcp_servers.omnigent]\n".encode("cp1252"))
+    monkeypatch.setattr("omnigent._encoding.locale_encoding", lambda: "cp1252")
+
+    assert install_ledger._toml_has_table(path, "mcp_servers.omnigent")
+
+
 def test_backfill_requires_anchor_signal(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / ".omnigent"))
     monkeypatch.setenv("PATH", str(tmp_path / "bin"))
 
@@ -52,6 +94,7 @@ def test_write_install_ledger_from_env_records_profile_and_dep_provenance(
         f"{install_ledger.PROFILE_MARKER_END}\n"
     )
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(state))
     monkeypatch.setenv("OMNIGENT_LEDGER_PROFILE", str(profile))
     monkeypatch.setenv("OMNIGENT_LEDGER_DEP_UV", "omnigent")
@@ -73,6 +116,7 @@ def test_installer_ledger_supersedes_backfill_and_preserves_dep_ownership(
     state = home / ".omnigent"
     state.mkdir(parents=True)
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(state))
 
     backfill = install_ledger.new_ledger(source="backfill", strategy="deep-backfill", deep=False)
@@ -100,6 +144,7 @@ def test_backfill_skips_write_when_content_is_unchanged(tmp_path: Path, monkeypa
     state.mkdir(parents=True)
     (state / "installation_id").write_text("install-123\n")
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(state))
 
     existing = install_ledger.new_ledger(source="backfill", strategy="fast-backfill", deep=False)
@@ -126,6 +171,7 @@ def test_install_ledger_merges_existing_and_observed_external_configs(
     state.mkdir(parents=True)
     cursor_dir.mkdir(parents=True)
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(state))
     monkeypatch.chdir(workspace)
 
@@ -165,6 +211,7 @@ def test_deep_backfill_observes_external_config_and_launch_agents(
     launch_agent = launch_dir / "ai.omnigent.local.plist"
     launch_agent.write_text("plist\n")
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(state))
     monkeypatch.chdir(workspace)
 

@@ -229,7 +229,7 @@ class WorkspaceReader:
         multi-GB file in the viewer can't OOM the host process.
         """
         try:
-            with resolved.open("rb") as fh:
+            with resolved.open(mode="rb") as fh:
                 # One extra byte lets us detect (and flag) truncation
                 # without loading the rest of a large file into memory.
                 capped = fh.read(_MAX_READ_BYTES + 1)
@@ -435,7 +435,7 @@ class WorkspaceReader:
             try:
                 # Bounded read (like _read_file) so a huge changed file can't
                 # OOM the host; the diff view caps at _MAX_READ_BYTES anyway.
-                with resolved.open("rb") as fh:
+                with resolved.open(mode="rb") as fh:
                     raw = fh.read(_MAX_READ_BYTES)
                 after = raw.decode("utf-8", errors="replace")
             except OSError:

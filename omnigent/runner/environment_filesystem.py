@@ -200,7 +200,8 @@ async def _run_os_env_async(
 def _validate_path(relative_path: str) -> str:
     """Validate and normalize a relative path.
 
-    Rejects NUL bytes, absolute paths, and traversal attempts.
+    Rejects NUL bytes, absolute or drive-qualified paths, and traversal
+    attempts.
 
     :param relative_path: Client-supplied path string.
     :returns: Normalized relative path.

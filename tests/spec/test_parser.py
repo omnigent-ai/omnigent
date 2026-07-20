@@ -674,13 +674,13 @@ def test_discover_host_skills_skips_invalid_yaml_frontmatter(
 
     ``discover_host_skills`` scans two locations: walking up from
     ``agent_root`` and ``Path.home() / ".claude" / "skills"``. We
-    pin ``$HOME`` at a fresh tmp dir to keep the developer's real
+    pin ``Path.home()`` at a fresh tmp dir to keep the developer's real
     ``~/.claude/skills/`` (which contains the actual offending
     skill) out of this test.
     """
     fake_home = tmp_path / "home"
     fake_home.mkdir()
-    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: fake_home))
 
     agent_root = tmp_path / "agent"
     agent_root.mkdir()
@@ -699,7 +699,7 @@ def test_discover_host_skills_skips_invalid_yaml_frontmatter(
     (good_dir / "SKILL.md").write_text("---\nname: good-skill\ndescription: y\n---\nContent.")
 
     with caplog.at_level("WARNING", logger="omnigent.spec.parser"):
-        result = discover_host_skills(agent_root, "all")
+        result = discover_host_skills(agent_root, ["bad-skill", "good-skill"])
 
     names = [s.name for s in result]
     assert names == ["good-skill"], (
@@ -730,34 +730,34 @@ def test_discover_host_skills_skips_unreadable_skill_file(
     """
     fake_home = tmp_path / "home"
     fake_home.mkdir()
-    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: fake_home))
 
     agent_root = tmp_path / "agent"
     agent_root.mkdir()
     host_skills = agent_root / ".claude" / "skills"
     host_skills.mkdir(parents=True)
 
-    # Broken symlink: ``SKILL.md`` exists (in the sense that
-    # ``Path.exists()`` follows symlinks and returns False, but the
-    # discoverer's ``skill_md.exists()`` check returns False too).
-    # Use a directory we make read-then-unreadable instead so the
-    # path exists but read_text() raises OSError.
+    # Simulate a permission failure explicitly: chmod(000) remains readable on
+    # Windows, so it cannot make this regression deterministic cross-platform.
     bad_dir = host_skills / "unreadable"
     bad_dir.mkdir()
     bad_md = bad_dir / "SKILL.md"
     bad_md.write_text("---\nname: unreadable\ndescription: x\n---\nbody")
-    bad_md.chmod(0o000)
 
     good_dir = host_skills / "good"
     good_dir.mkdir()
     (good_dir / "SKILL.md").write_text("---\nname: good\ndescription: y\n---\nContent.")
 
-    try:
-        with caplog.at_level("WARNING", logger="omnigent.spec.parser"):
-            result = discover_host_skills(agent_root, "all")
-    finally:
-        # Restore so pytest can clean tmp_path on teardown.
-        bad_md.chmod(0o600)
+    real_read_text = Path.read_text
+
+    def _read_text(path: Path, *args: object, **kwargs: object) -> str:
+        if path == bad_md:
+            raise PermissionError("test permission denied")
+        return real_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", _read_text)
+    with caplog.at_level("WARNING", logger="omnigent.spec.parser"):
+        result = discover_host_skills(agent_root, ["good", "unreadable"])
 
     assert [s.name for s in result] == ["good"]
     skip_records = [rec for rec in caplog.records if "Skipping skill" in rec.message]
@@ -905,6 +905,28 @@ def test_parse_skills_filter_is_independent_of_bundled_skills_dir(
 # ── lenient host-skill discovery ────────────────────
 
 
+def test_discover_host_skills_all_loads_each_local_skill(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The default ``"all"`` filter includes every valid local skill."""
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: fake_home))
+
+    agent_root = tmp_path / "project"
+    for dotdir, name in ((".claude", "claude-local"), (".agents", "agents-local")):
+        skill_dir = agent_root / dotdir / "skills" / name
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: Local test skill.\n---\nContent."
+        )
+
+    names = {skill.name for skill in discover_host_skills(agent_root, "all")}
+
+    assert {"claude-local", "agents-local"} <= names
+
+
 def test_discover_host_skills_skips_missing_frontmatter(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -941,7 +963,7 @@ def test_discover_host_skills_skips_missing_frontmatter(
     agent_root = tmp_path / "project"
     agent_root.mkdir()
 
-    result = discover_host_skills(agent_root, skills_filter="all")
+    result = discover_host_skills(agent_root, skills_filter=["bad-skill", "good-skill"])
 
     assert len(result) == 1
     assert result[0].name == "good-skill"
@@ -980,7 +1002,7 @@ def test_discover_host_skills_skips_yaml_syntax_error(
     agent_root = tmp_path / "project"
     agent_root.mkdir()
 
-    result = discover_host_skills(agent_root, skills_filter="all")
+    result = discover_host_skills(agent_root, skills_filter=["broken-yaml"])
 
     assert result == []
     captured = capsys.readouterr()
@@ -1015,7 +1037,7 @@ def test_discover_host_skills_skips_multiple_bad_skills(
     agent_root = tmp_path / "project"
     agent_root.mkdir()
 
-    result = discover_host_skills(agent_root, skills_filter="all")
+    result = discover_host_skills(agent_root, skills_filter=["bad-a", "bad-b"])
 
     assert result == []
     captured = capsys.readouterr()

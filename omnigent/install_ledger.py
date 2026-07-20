@@ -13,6 +13,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from omnigent._encoding import detect_encoding
+
 SCHEMA_VERSION = 1
 LEDGER_NAME = "install_ledger.json"
 BACKFILL_LEDGER_NAME = "install_ledger.backfill.json"
@@ -185,7 +187,7 @@ def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
     fd = os.open(tmp, flags, 0o600)
     try:
-        with os.fdopen(fd, "w") as handle:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
@@ -198,10 +200,10 @@ def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
 
 def load_ledger(path: Path) -> InstallLedger | None:
     try:
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return None
-    except json.JSONDecodeError:
+    except (UnicodeDecodeError, json.JSONDecodeError):
         return None
     if data.get("schema_version") != SCHEMA_VERSION:
         return None
@@ -236,8 +238,8 @@ def _merge_external_configs(
 def read_installation_id(home: Path | None = None) -> str | None:
     install_id_path = (home or state_dir()) / "installation_id"
     try:
-        value = install_id_path.read_text().strip()
-    except OSError:
+        value = install_id_path.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
         return None
     return value or None
 
@@ -260,8 +262,8 @@ def profile_candidates() -> list[Path]:
 
 def find_profile_block(path: Path) -> tuple[int, int, str] | None:
     try:
-        lines = path.read_text().splitlines(keepends=True)
-    except OSError:
+        lines = path.read_text(encoding=detect_encoding(path)).splitlines(keepends=True)
+    except (OSError, UnicodeDecodeError):
         return None
     begin: int | None = None
     for index, line in enumerate(lines):
@@ -345,8 +347,8 @@ def desktop_data_paths() -> list[str]:
 
 def _json_has_key_path(path: Path, key_path: str) -> bool:
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        data = json.loads(path.read_text(encoding=detect_encoding(path)))
+    except (OSError, UnicodeDecodeError, ValueError):
         return False
     current: Any = data
     for part in key_path.split("."):
@@ -358,8 +360,8 @@ def _json_has_key_path(path: Path, key_path: str) -> bool:
 
 def _toml_has_table(path: Path, table: str) -> bool:
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError:
+        lines = path.read_text(encoding=detect_encoding(path)).splitlines()
+    except (OSError, UnicodeDecodeError):
         return False
     return any(line.strip() == f"[{table}]" for line in lines)
 
