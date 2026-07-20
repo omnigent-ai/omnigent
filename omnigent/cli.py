@@ -12157,6 +12157,7 @@ def _run_configure_harnesses_interactive() -> None:
         harness_install_spec,
     )
     from omnigent.onboarding.interactive import select
+    from omnigent.onboarding.kimi_auth import kimi_login_detected
     from omnigent.onboarding.provider_config import (
         ANTHROPIC_FAMILY,
         OPENAI_FAMILY,
@@ -12498,13 +12499,16 @@ def _run_configure_harnesses_interactive() -> None:
             )
             rows.append((_KIRO, "Kiro", "Not installed", "missing", _install_hint(kiro_hint)))
 
-        # Kimi Code — native CLI, own auth via `kimi login`; there is no local
-        # login status probe yet. Curl-installed (no npm package), so use its
-        # install_hint when absent and show "not configured" when present.
+        # Kimi Code — native CLI, own auth via `kimi login`. Detect credential
+        # directories from current and legacy releases so a
+        # logged-in installation is not incorrectly reported as unconfigured.
         if harness_cli_installed(KIMI_KEY):
-            rows.append(
-                (_KIMI, "Kimi Code", "Not configured", "warn", "Sign in with `kimi login`.")
-            )
+            if kimi_login_detected():
+                rows.append((_KIMI, "Kimi Code", "Ready", "ok", "Kimi login detected."))
+            else:
+                rows.append(
+                    (_KIMI, "Kimi Code", "Not configured", "warn", "Sign in with `kimi login`.")
+                )
         else:
             kimi_spec = harness_install_spec(KIMI_KEY)
             kimi_hint = (kimi_spec.install_hint if kimi_spec else None) or "see Kimi Code docs"

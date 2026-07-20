@@ -1975,6 +1975,7 @@ def test_installed_native_cli_auth_unknown_rows_are_not_configured(
     monkeypatch.setattr(
         "omnigent.onboarding.harness_install.harness_cli_installed", lambda family: True
     )
+    monkeypatch.setattr("omnigent.onboarding.kimi_auth.kimi_login_detected", lambda: False)
     options, selectable, descriptions, _compact, _max_visible = _capture_setup_overview(
         monkeypatch
     )
@@ -1982,6 +1983,25 @@ def test_installed_native_cli_auth_unknown_rows_are_not_configured(
     assert "[yellow]✗ Not configured[/]" in options[row_index]
     assert "[green]✓ Installed[/]" not in options[row_index]
     assert descriptions[row_index]
+
+
+def test_overview_kimi_row_is_ready_when_login_is_detected(
+    isolated_config, monkeypatch
+) -> None:
+    """An installed, logged-in Kimi CLI is shown as ready in setup."""
+    from rich.text import Text
+
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_install.harness_cli_installed", lambda family: True
+    )
+    monkeypatch.setattr("omnigent.onboarding.kimi_auth.kimi_login_detected", lambda: True)
+    options, selectable, descriptions, _compact, _max_visible = _capture_setup_overview(
+        monkeypatch
+    )
+    row_index = _overview_row_names(options, selectable).index("Kimi Code")
+    assert "Ready" in Text.from_markup(options[row_index]).plain
+    assert "Not configured" not in Text.from_markup(options[row_index]).plain
+    assert descriptions[row_index] == "Kimi login detected."
 
 
 def test_overview_descriptions_map_to_their_rows(isolated_config, monkeypatch) -> None:
