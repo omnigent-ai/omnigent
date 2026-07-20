@@ -8121,10 +8121,12 @@ def _host_shorten(text: _HostJsonValue, *, max_chars: int) -> str:
     value = _host_display_value(text)
     if len(value) <= max_chars:
         return value
-    if max_chars <= 1:
+    if max_chars <= 2:
+        # Too narrow for a head + ellipsis + tail; middle-truncation with a
+        # 1-char tail would overflow the budget, so only ever show the head.
         return value[:max_chars]
     head = max(1, (max_chars - 1) // 2)
-    tail = max(1, max_chars - head - 1)
+    tail = max_chars - head - 1
     return f"{value[:head]}…{value[-tail:]}"
 
 

@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from omnigent.db.db_models import SqlHost
 from omnigent.db.utils import get_or_create_engine, now_epoch
 from omnigent.host.frames import (
+    HostHarnessReadinessFrame,
     HostHelloFrame,
     HostLaunchRunnerResultFrame,
     encode_host_frame,
@@ -302,6 +303,66 @@ async def test_host_tunnel_upserts_db_on_connect(
     assert host is not None, "Host row should exist in DB after tunnel connect"
     assert host.name == "test-laptop"
     assert host.status == "online"
+
+
+async def test_host_tunnel_refreshes_harness_readiness_without_reconnect(
+    db_uri: str,
+) -> None:
+    """A live host readiness update must replace the stale setup warning state."""
+    registry = HostRegistry()
+    store = HostStore(db_uri)
+    updates: list[str] = []
+
+    async def _on_host_update(host_id: str, _owner: str | None) -> None:
+        updates.append(host_id)
+
+    app = FastAPI()
+    app.include_router(
+        create_host_tunnel_router(
+            registry,
+            store,
+            on_host_update=_on_host_update,
+        ),
+        prefix="/v1",
+    )
+    comm = await _connect_route(app, _TUNNEL_PATH)
+    await comm.send_input(
+        {
+            "type": "websocket.receive",
+            "text": encode_host_frame(
+                HostHelloFrame(
+                    version="0.1.0-test",
+                    frame_protocol_version=1,
+                    name="test-laptop",
+                    configured_harnesses={"pi": False},
+                )
+            ),
+        }
+    )
+    await asyncio.wait_for(_wait_registered(registry, _HOST_ID), timeout=2.0)
+
+    await comm.send_input(
+        {
+            "type": "websocket.receive",
+            "text": encode_host_frame(
+                HostHarnessReadinessFrame(configured_harnesses={"pi": True})
+            ),
+        }
+    )
+
+    async def _wait_until_ready() -> None:
+        while True:
+            host = store.get_host(_HOST_ID)
+            if host is not None and host.configured_harnesses == {"pi": True}:
+                return
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(_wait_until_ready(), timeout=0.5)
+
+    conn = registry.get(_HOST_ID)
+    assert conn is not None
+    assert conn.hello.configured_harnesses == {"pi": True}
+    assert updates == [_HOST_ID]
 
 
 async def test_host_tunnel_sets_offline_on_disconnect(

@@ -24,6 +24,7 @@ from websockets.exceptions import InvalidStatus, InvalidURI
 
 from omnigent._platform import WINDOWS_ENV_PASSTHROUGH
 from omnigent.env_credentials import env_names_with_omnigent_prefix
+from omnigent.harness_availability import HARNESS_BINARY_MISSING, HarnessAvailability
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     HostCreateDirFrame,
@@ -32,6 +33,7 @@ from omnigent.host.frames import (
     HostCreateWorktreeResultFrame,
     HostFsRequestFrame,
     HostFsResultFrame,
+    HostHarnessReadinessFrame,
     HostHelloFrame,
     HostLaunchRunnerFrame,
     HostLaunchRunnerResultFrame,
@@ -92,6 +94,22 @@ from omnigent.runner.transports.ws_tunnel.limits import (
 from omnigent.version import VERSION
 
 _logger = logging.getLogger(__name__)
+
+# Binary appearance is cheap to probe, so new CLI installs surface quickly.
+HARNESS_READINESS_REFRESH_INTERVAL_S = 5.0
+# Auth changes and removals need the full, potentially expensive readiness map.
+HARNESS_READINESS_FULL_REFRESH_INTERVAL_S = 60.0
+
+
+def _unavailable_harness_became_ready(
+    previous: Mapping[str, HarnessAvailability],
+) -> bool:
+    """Detect newly available binaries; auth changes wait for the full refresh."""
+    return any(
+        (availability is False or availability == HARNESS_BINARY_MISSING)
+        and harness_is_configured(harness)
+        for harness, availability in previous.items()
+    )
 
 
 def _runner_log_dir() -> Path:
@@ -2001,16 +2019,15 @@ class HostProcess:
                 _tel_install_id = _get_install_id()
         except Exception:  # noqa: BLE001
             pass
+        configured_harnesses = await asyncio.to_thread(configured_harness_map)
         hello = HostHelloFrame(
             version=VERSION,
             frame_protocol_version=1,
             name=self._identity.name,
             runners=self._alive_runner_ids(),
-            # Off the event loop: probes PATH (shutil.which) and reads
-            # ~/.omnigent/config.yaml. Recomputed on every (re)connect, so
-            # the server's view refreshes whenever the tunnel does; the
-            # launch-time check above stays the authoritative gate.
-            configured_harnesses=await asyncio.to_thread(configured_harness_map),
+            # Off the event loop: probes PATH and reads local config.
+            # The loop below refreshes changes; launch remains authoritative.
+            configured_harnesses=configured_harnesses,
             telemetry_opt_out=_tel_opt_out,
             installation_id=_tel_install_id,
         )
@@ -2033,11 +2050,42 @@ class HostProcess:
             flush=True,
         )
 
+        loop = asyncio.get_running_loop()
+        next_quick_refresh = loop.time() + HARNESS_READINESS_REFRESH_INTERVAL_S
+        next_full_refresh = loop.time() + HARNESS_READINESS_FULL_REFRESH_INTERVAL_S
         while True:
-            try:
-                raw = await asyncio.wait_for(ws.recv(), timeout=60.0)
-            except asyncio.TimeoutError:
-                continue
+            raw: object | None = None
+            with contextlib.suppress(asyncio.TimeoutError):
+                raw = await asyncio.wait_for(
+                    ws.recv(),
+                    timeout=max(
+                        0.0,
+                        min(next_quick_refresh, next_full_refresh) - loop.time(),
+                    ),
+                )
+
+            now = loop.time()
+            refresh_full_map = now >= next_full_refresh
+            if now >= next_quick_refresh:
+                next_quick_refresh = now + HARNESS_READINESS_REFRESH_INTERVAL_S
+                if not refresh_full_map:
+                    refresh_full_map = await asyncio.to_thread(
+                        _unavailable_harness_became_ready,
+                        configured_harnesses,
+                    )
+
+            if refresh_full_map:
+                latest_harnesses = await asyncio.to_thread(configured_harness_map)
+                next_full_refresh = now + HARNESS_READINESS_FULL_REFRESH_INTERVAL_S
+                if latest_harnesses != configured_harnesses:
+                    await ws.send(
+                        encode_host_frame(
+                            HostHarnessReadinessFrame(
+                                configured_harnesses=latest_harnesses,
+                            )
+                        )
+                    )
+                    configured_harnesses = latest_harnesses
             if isinstance(raw, str):
                 await self._handle_raw_message(ws, raw)
 

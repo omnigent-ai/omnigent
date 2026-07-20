@@ -1055,6 +1055,13 @@ def _prune_session_read_state(session_id: str) -> None:
 # turn's "running" status or on any terminal response.* event.
 _interrupt_fenced_sessions: set[str] = set()
 
+# Host-spawned sessions whose runner tunnel we are about to tear down on
+# purpose as part of a user-initiated Stop. The relay's disconnect handler
+# consults this so an intentional tunnel drop resolves to a quiet idle state
+# instead of a scary ``runner_disconnected`` failure. One-shot: the disconnect
+# handler discards it, so a later genuine disconnect still surfaces normally.
+_intentional_stop_sessions: set[str] = set()
+
 # Turn-terminal response lifecycle events: the relay flushes buffered
 # assistant text on each of these and resets its turn-scoped state.
 _TERMINAL_RESPONSE_EVENT_TYPES: frozenset[str] = frozenset(
@@ -8732,7 +8739,7 @@ async def _stop_session_host_runner(
     host_id: str,
     runner_id: str,
     host_registry: Any,
-) -> None:
+) -> bool:
     """
     Terminate the host-launched runner backing a host-spawned session.
 
@@ -8769,10 +8776,14 @@ async def _stop_session_host_runner(
     :param host_registry: The :class:`HostRegistry` tracking live host
         tunnels on this replica, or ``None`` when host support is not wired
         (in-process / test setups without a host tunnel).
-    :returns: None.
+    :returns: ``True`` when the stop was delivered and acknowledged (the
+        runner is exiting, so a tunnel drop is expected); ``False`` on any
+        best-effort early-out (no host registry, host offline/replaced,
+        ack timeout, or host-reported failure) where the runner may keep
+        running and no tunnel drop will follow.
     """
     if host_registry is None:
-        return
+        return False
     conn = host_registry.get(host_id)
     if conn is None:
         _logger.warning(
@@ -8783,7 +8794,7 @@ async def _stop_session_host_runner(
             session_id,
             host_id,
         )
-        return
+        return False
     from omnigent.host.frames import HostStopRunnerFrame, encode_host_frame
 
     request_id = secrets.token_hex(8)
@@ -8802,7 +8813,7 @@ async def _stop_session_host_runner(
             session_id,
             host_id,
         )
-        return
+        return False
     try:
         result = await asyncio.wait_for(
             future,
@@ -8816,7 +8827,7 @@ async def _stop_session_host_runner(
             runner_id,
             session_id,
         )
-        return
+        return False
     if result.get("status") == "failed":
         _logger.warning(
             "Host %s failed to stop runner %s for session %s: %s",
@@ -8825,6 +8836,8 @@ async def _stop_session_host_runner(
             session_id,
             result.get("error"),
         )
+        return False
+    return True
 
 
 def _build_new_item(
@@ -10455,6 +10468,13 @@ async def _relay_runner_stream(
                                     None,
                                     conversation_store,
                                 )
+                                # A new turn proves the runner is live again, so
+                                # a prior Stop that never dropped the tunnel must
+                                # not leave the intentional-stop marker to swallow
+                                # this turn's genuine disconnect. Fence-independent
+                                # (the fence may already be cleared by a terminal
+                                # stop event), so it fires on every running edge.
+                                _intentional_stop_sessions.discard(session_id)
                             # PTY-activity status is a UI signal only. Terminal
                             # sub-agent delivery rides the Stop/StopFailure hook
                             # via external_session_status (the codex-shared path)
@@ -10773,26 +10793,41 @@ async def _relay_runner_stream(
             session_id,
             exc_info=True,
         )
-        # Publish a failed status so the client's SSE stream sees a
-        # clean error event instead of silent truncation (#1114).
-        disconnect_error = ErrorDetail(
-            code="runner_disconnected",
-            message="Runner disconnected unexpectedly.",
-        )
-        _publish_status(session_id, "failed", disconnect_error)
-        # Persist the disconnect cause as durable labels so the
-        # distinction survives into snapshots and child-session
-        # summaries. Without this the relay-fed cache only carries a
-        # generic ``failed`` and ``last_task_error`` is dropped, leaving
-        # the UI unable to tell a benign runner disconnect from a real
-        # task failure (Option B: render a "Disconnected" pill, not the
-        # red "Failed" pill). Cleared on the next ``running`` edge by the
-        # session.status handler, exactly like other failure labels.
-        await _persist_session_status_error_labels(
-            session_id,
-            disconnect_error,
-            conversation_store,
-        )
+        if session_id in _intentional_stop_sessions:
+            # User clicked Stop: the Stop handler brought this runner's tunnel
+            # down on purpose (see _stop_session_host_runner), so the drop is
+            # expected — not a failure. Publish a quiet idle and clear any error
+            # label so the chat and sidebar settle to a stopped state instead of
+            # rendering "Error · runner_disconnected". One-shot: discard the
+            # marker so a genuine later disconnect surfaces normally.
+            _intentional_stop_sessions.discard(session_id)
+            _publish_status(session_id, "idle")
+            await _persist_session_status_error_labels(
+                session_id,
+                None,
+                conversation_store,
+            )
+        else:
+            # Publish a failed status so the client's SSE stream sees a
+            # clean error event instead of silent truncation (#1114).
+            disconnect_error = ErrorDetail(
+                code="runner_disconnected",
+                message="Runner disconnected unexpectedly.",
+            )
+            _publish_status(session_id, "failed", disconnect_error)
+            # Persist the disconnect cause as durable labels so the
+            # distinction survives into snapshots and child-session
+            # summaries. Without this the relay-fed cache only carries a
+            # generic ``failed`` and ``last_task_error`` is dropped, leaving
+            # the UI unable to tell a benign runner disconnect from a real
+            # task failure (Option B: render a "Disconnected" pill, not the
+            # red "Failed" pill). Cleared on the next ``running`` edge by the
+            # session.status handler, exactly like other failure labels.
+            await _persist_session_status_error_labels(
+                session_id,
+                disconnect_error,
+                conversation_store,
+            )
     except asyncio.CancelledError:
         raise
     finally:
@@ -10802,6 +10837,12 @@ async def _relay_runner_stream(
         # mid-turn, or a rebind cancellation) can't strand it forever.
         # Normal turn-ends already clear via record_publish.
         inflight_text.discard(session_id)
+        # The intentional-stop marker is consumed by the disconnect handler
+        # above on the expected path; discard it here too so a relay that
+        # exits some other way (clean [DONE], rebind cancellation) can't
+        # leave a stale marker to swallow a later genuine disconnect on the
+        # reused per-session relay task.
+        _intentional_stop_sessions.discard(session_id)
         # Relay ended (runner dropped/rebound): re-discover runner-backed
         # snapshot overlays next time. Cancel in-flight fetches so they can't
         # land stale values from the dead runner after this pop.
@@ -20312,12 +20353,26 @@ def create_sessions_router(
             # only ever stop the runner bound to this session.
             stop_conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if stop_conv is not None and stop_conv.host_id and stop_conv.runner_id:
-                await _stop_session_host_runner(
+                # Mark the tunnel drop as intentional BEFORE tearing it down so
+                # the relay's disconnect handler renders a quiet stopped state
+                # rather than "Error · runner_disconnected". Only host-spawned
+                # sessions drop the tunnel on Stop; other harnesses leave the
+                # runner connected, so there is nothing to suppress for them.
+                _intentional_stop_sessions.add(session_id)
+                teardown_delivered = await _stop_session_host_runner(
                     session_id,
                     stop_conv.host_id,
                     stop_conv.runner_id,
                     getattr(request.app.state, "host_registry", None),
                 )
+                if not teardown_delivered:
+                    # Best-effort stop did not land (host offline / timeout /
+                    # failure): no tunnel drop will follow, so the relay won't
+                    # reach the disconnect handler that consumes the marker.
+                    # Discard it now so it can't outlive this turn on the
+                    # reused per-session relay task and later swallow a genuine
+                    # runner_disconnected as a quiet idle.
+                    _intentional_stop_sessions.discard(session_id)
             # Stop is non-sticky: no persistent marker is written. The
             # runner tunnel dropping above flips ``runner_online`` to false
             # honestly, and the next message auto-relaunches the session on
@@ -21362,6 +21417,7 @@ def create_sessions_router(
                 reason="session-delete",
             )
         _interrupt_fenced_sessions.discard(session_id)
+        _intentional_stop_sessions.discard(session_id)
         deleted = await conversation_store.delete_conversation(session_id)
         if not deleted:
             raise _session_not_found()
