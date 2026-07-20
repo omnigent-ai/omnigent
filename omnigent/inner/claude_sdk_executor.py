@@ -2956,20 +2956,14 @@ class ClaudeSDKExecutor(Executor):
         )
         prior_blocks = _coalesce_text_blocks(prior_blocks)
 
-        if any(block.get("type") != "text" for block in prior_blocks):
-            # History carries replayable attachments, so the whole prompt must
-            # travel as structured blocks for the bytes to survive.
-            if isinstance(latest_content, list):
-                return [*prior_blocks, *latest_content]
-            return [*prior_blocks, _text_block(f"\nuser: {latest_content}")]
-
-        history_prefix = prior_blocks[0]["text"]
         if isinstance(latest_content, list):
-            return [
-                _text_block(history_prefix),
-                *latest_content,
-            ]
-        return f"{history_prefix}\n\nuser: {latest_content}"
+            return [*prior_blocks, *latest_content]
+        # Coalescing leaves an all-text history as the single opening block, so
+        # more than one block means an attachment survived and the prompt has
+        # to stay structured for its bytes to reach the model.
+        if len(prior_blocks) > 1:
+            return [*prior_blocks, _text_block(f"\nuser: {latest_content}")]
+        return f"{prior_blocks[0]['text']}\n\nuser: {latest_content}"
 
     @staticmethod
     def _extract_latest_user_content(

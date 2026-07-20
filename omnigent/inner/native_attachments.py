@@ -121,20 +121,13 @@ def materialize_attachment(block: dict[str, Any], bridge_dir: Path) -> Path | No
     uploads_dir = bridge_dir / "uploads"
     uploads_dir.mkdir(parents=True, exist_ok=True)
     dest = uploads_dir / filename
-    if dest.exists():
-        # Same bytes already on disk (e.g. the same history re-materialized
-        # on every resume) — reuse it instead of accumulating copies.
-        if _holds_bytes(dest, raw_bytes):
-            return dest
-        # Same name, different bytes. The collision suffix is derived from the
-        # content so a history carrying two distinct "image.png" uploads keeps
-        # one file per payload instead of gaining a random copy per rebuild.
+    if dest.exists() and not _holds_bytes(dest, raw_bytes):
+        # Same name, different bytes. Deriving the suffix from the content keeps
+        # one file per payload, where a random one grew a copy per rebuild.
         digest = hashlib.sha256(raw_bytes).hexdigest()[:12]
-        dest = uploads_dir / f"{dest.stem}_{digest}{dest.suffix}"
-        if _holds_bytes(dest, raw_bytes):
-            return dest
-
-    dest.write_bytes(raw_bytes)
+        dest = dest.with_stem(f"{dest.stem}_{digest}")
+    if not _holds_bytes(dest, raw_bytes):
+        dest.write_bytes(raw_bytes)
     return dest
 
 
