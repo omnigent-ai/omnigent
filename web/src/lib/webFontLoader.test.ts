@@ -140,7 +140,7 @@ describe("webFontLoader — dedup by resource identity, not id", () => {
     await expect(pb).resolves.toBe(true);
   });
 
-  it("retries after a failed load rather than caching the failure", async () => {
+  it("retries after a <link> error rather than caching the failure", async () => {
     const p1 = loadFont(inter());
     await flush();
     links()[0].dispatchEvent(new Event("error"));
@@ -156,6 +156,104 @@ describe("webFontLoader — dedup by resource identity, not id", () => {
     await flush();
     fontsLoadCalls.at(-1)!.deferred.resolve([{}]);
     await expect(p2).resolves.toBe(true);
+  });
+});
+
+describe("webFontLoader — failure removes the injected node so retry re-fetches", () => {
+  it("google-css2: fonts.load REJECTS → <link> removed, next call reinjects and re-queries", async () => {
+    const p1 = loadFont(inter());
+    await flush();
+    fireLinkLoads();
+    await flush();
+    expect(links().length).toBe(1);
+    // The stylesheet parsed but document.fonts.load rejects (face errored).
+    fontsLoadCalls[0].deferred.reject(new Error("network"));
+    await expect(p1).resolves.toBe(false);
+    await flush();
+    // Regression guard: the dead <link> must be gone, or the DOM guard would
+    // skip reinjection forever.
+    expect(links().length).toBe(0);
+
+    // Retry: reinjects a fresh link AND issues a fresh document.fonts.load.
+    const p2 = loadFont(inter());
+    expect(p2).not.toBe(p1);
+    await flush();
+    expect(links().length).toBe(1);
+    fireLinkLoads();
+    await flush();
+    expect(fontsLoadCalls.length).toBe(2);
+    fontsLoadCalls[1].deferred.resolve([{}]);
+    await expect(p2).resolves.toBe(true);
+  });
+
+  it("google-css2: fonts.load resolves EMPTY → <link> removed, next call reinjects", async () => {
+    const p1 = loadFont(roboto());
+    await flush();
+    fireLinkLoads();
+    await flush();
+    fontsLoadCalls[0].deferred.resolve([]); // not-ready
+    await expect(p1).resolves.toBe(false);
+    await flush();
+    expect(links().length).toBe(0);
+
+    const p2 = loadFont(roboto());
+    expect(p2).not.toBe(p1);
+    await flush();
+    expect(links().length).toBe(1);
+    fireLinkLoads();
+    await flush();
+    fontsLoadCalls.at(-1)!.deferred.resolve([{}]);
+    await expect(p2).resolves.toBe(true);
+  });
+
+  it("self-hosted: not-ready → <style> removed, next call reinjects a fresh face", async () => {
+    const p1 = loadFont(nerd());
+    await flush();
+    expect(styles().length).toBe(1);
+    fontsLoadCalls[0].deferred.resolve([]); // errored/not-ready face
+    await expect(p1).resolves.toBe(false);
+    await flush();
+    // The errored @font-face <style> is dropped so a retry mints a fresh face
+    // instead of document.fonts.load reusing the rejected one.
+    expect(styles().length).toBe(0);
+
+    const p2 = loadFont(nerd());
+    expect(p2).not.toBe(p1);
+    await flush();
+    expect(styles().length).toBe(1);
+    fontsLoadCalls.at(-1)!.deferred.resolve([{}]);
+    await expect(p2).resolves.toBe(true);
+  });
+
+  it("genuine success after a prior failure works end-to-end", async () => {
+    const p1 = loadFont(inter());
+    await flush();
+    fireLinkLoads();
+    await flush();
+    fontsLoadCalls[0].deferred.resolve([]); // fail once
+    await expect(p1).resolves.toBe(false);
+    await flush();
+
+    const p2 = loadFont(inter());
+    await flush();
+    fireLinkLoads();
+    await flush();
+    fontsLoadCalls.at(-1)!.deferred.resolve([{}]); // succeed on retry
+    await expect(p2).resolves.toBe(true);
+    expect(links().length).toBe(1);
+  });
+
+  it("unsupported document.fonts API is NOT treated as retryable (no node thrash)", async () => {
+    // Simulate an environment without the FontFaceSet API.
+    Object.defineProperty(document, "fonts", { configurable: true, value: undefined });
+    const p1 = loadFont(nerd());
+    await flush();
+    // The @font-face was injected (CSS may still paint via font-display); it is
+    // NOT removed, because "API missing" isn't an asset failure.
+    expect(styles().length).toBe(1);
+    await expect(p1).resolves.toBe(false);
+    await flush();
+    expect(styles().length).toBe(1);
   });
 });
 
