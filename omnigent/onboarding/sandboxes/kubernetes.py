@@ -178,6 +178,41 @@ _POD_DELETE_BACKOFF_S: float = 1.0
 # clone error from the init container).
 _LOG_TAIL_LINES: int = 20
 
+# Substrings git emits when an HTTPS clone can't authenticate — a missing,
+# revoked, or under-scoped credential. Matched against the workspace-prep log
+# tail to turn the cryptic default ("could not read Username") into an
+# actionable hint (see :func:`_git_auth_hint`).
+_GIT_AUTH_FAILURE_MARKERS: tuple[str, ...] = (
+    "could not read username",
+    "could not read password",
+    "authentication failed",
+    "terminal prompts disabled",
+    "invalid username or password",
+)
+
+
+def _git_auth_hint(log_tail: str) -> str | None:
+    """
+    Return an actionable hint when a clone failed to authenticate, else ``None``.
+
+    The default git error for a private repo with no usable credential
+    (``could not read Username``) is opaque. When the workspace-prep log tail
+    carries one of :data:`_GIT_AUTH_FAILURE_MARKERS`, surface a message that
+    names the fix — connect a credential — instead.
+
+    :param log_tail: The failed init container's log tail.
+    :returns: The hint, or ``None`` when the tail shows no auth failure.
+    """
+    lowered = log_tail.lower()
+    if any(marker in lowered for marker in _GIT_AUTH_FAILURE_MARKERS):
+        return (
+            "The repository looks private and the clone could not authenticate. "
+            "Connect an account under Settings -> Credentials (and confirm it has "
+            "access to this repository), then start a new session."
+        )
+    return None
+
+
 # Container ``waiting.reason`` values that are genuinely terminal — the kubelet
 # will NOT self-heal them, so the start wait fast-fails rather than burning the
 # budget. Deliberately EXCLUDES ImagePull* (kubelet retries cold pulls / flaps)
@@ -1348,6 +1383,10 @@ class KubernetesSandboxLauncher(SandboxLauncher):
             tail = self._pod_log_tail(namespace, pod_name, log_container).strip()
             if tail:
                 message += f" Container '{log_container}' log tail: {tail[-1500:]}"
+                if log_container == _INIT_CONTAINER_NAME:
+                    hint = _git_auth_hint(tail)
+                    if hint is not None:
+                        message += f" {hint}"
         message += f" Inspect with `kubectl describe pod {pod_name} -n {namespace}`."
         return message
 

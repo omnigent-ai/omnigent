@@ -667,3 +667,33 @@ def test_pod_manifest_never_inlines_extra_env_values() -> None:
     """The value only ever lives in the Secret — never in the Pod spec."""
     manifest = build_pod_manifest(**_MANIFEST_KW, extra_env_keys=["GIT_TOKEN"])
     assert "gho_" not in json.dumps(manifest)
+
+
+# ── git-auth hint on a private-repo clone failure ───────────────────
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        "fatal: could not read Username for 'https://github.com': No such device or address",
+        "remote: Support for password authentication was removed.\nAuthentication failed",
+        "fatal: could not read Password for 'https://github.com'",
+        "fatal: Authentication failed for 'https://github.com/acme/private.git/'",
+    ],
+)
+def test_git_auth_hint_matches_auth_failures(tail: str) -> None:
+    hint = k8s._git_auth_hint(tail)
+    assert hint is not None
+    assert "Credentials" in hint  # points the user at Settings -> Credentials
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        "Cloning into '/home/omnigent/workspace/repo'... done.",
+        "fatal: repository 'https://github.com/acme/missing.git/' not found",
+        "",
+    ],
+)
+def test_git_auth_hint_ignores_non_auth_output(tail: str) -> None:
+    assert k8s._git_auth_hint(tail) is None
