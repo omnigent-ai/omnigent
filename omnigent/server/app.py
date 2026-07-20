@@ -2335,7 +2335,7 @@ def create_app(
             _session_status_cache[session_id] = "failed"
             _publish_status(session_id, "failed")
 
-    async def _on_runner_exited(runner_id: str, error: str) -> None:
+    async def _on_runner_exited(runner_id: str, error: str, idle: bool = False) -> None:
         """Mark a crashed runner's session(s) failed and push the cause.
 
         Fired by the host tunnel when a daemon reports
@@ -2346,9 +2346,15 @@ def create_app(
         failed`` event so the open view surfaces the cause immediately
         instead of spinning on "starting" until a timeout.
 
+        When ``idle`` is set the runner shut itself down on its idle timeout
+        — a benign "paused, relaunch on demand" exit. That surfaces a calm
+        ``runner_idle_paused`` status (no error detail, no red box); the next
+        message relaunches the runner and replays history losslessly.
+
         :param runner_id: The crashed runner's id.
         :param error: Human-readable cause from the daemon (exit code +
             log tail), e.g. ``"runner process exited with code 1 ..."``.
+        :param idle: ``True`` for a benign idle-timeout exit.
         """
         from omnigent.server.routes.sessions import (
             _publish_status,
@@ -2362,6 +2368,16 @@ def create_app(
                 conversation_store.list_conversations_by_runner_id, runner_id
             )
         ]
+        if idle:
+            _logger.info(
+                "Runner %s paused after idle; marking %d session(s) idle-paused",
+                runner_id,
+                len(affected),
+            )
+            for session_id in affected:
+                _session_status_cache[session_id] = "runner_idle_paused"
+                _publish_status(session_id, "runner_idle_paused")
+            return
         _logger.warning(
             "Runner %s reported crashed; marking %d session(s) failed: %s",
             runner_id,

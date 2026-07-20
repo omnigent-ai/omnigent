@@ -2048,6 +2048,7 @@ class _SessionsChatReplAdapter:
                         "idle",
                         "waiting",
                         "failed",
+                        "runner_idle_paused",
                     ):
                         turn_done = getattr(self, "_turn_done", None)
                         if turn_done is not None:
@@ -2937,6 +2938,27 @@ def _render_failed_status_error(
     return err_items
 
 
+def _render_idle_paused_note(fmt: RichBlockFormatter, host: TerminalHost) -> None:
+    """Render the calm note for a terminal ``runner_idle_paused`` event.
+
+    The runner shut itself down on its idle timeout — a benign pause, not a
+    crash. No conversation state is lost (the transcript is server-side and
+    replays on the next message), so this renders a single dim line rather
+    than the red :class:`ErrorBlock` a ``failed`` status draws. Uses the
+    theme-aware ``fmt.muted`` styling, matching the other muted REPL notes
+    (compaction, agent-switch, the elapsed footer).
+
+    :param fmt: The active block formatter, e.g. a :class:`TimedFormatter`.
+    :param host: The terminal host the note is written to.
+    """
+    host.output(
+        Text.from_markup(
+            f"  [{fmt.muted}]Session paused after idle — reconnecting on your "
+            f"next message.[/{fmt.muted}]"
+        )
+    )
+
+
 async def run_repl(
     client: OmnigentClient,
     agent_name: str,
@@ -3319,7 +3341,7 @@ async def run_repl(
                 # a stream-pump reconnect gap or before this REPL
                 # attached is lost — so also re-sync at each turn start.
                 _spawn_metadata_refresh()
-            elif event.status in ("idle", "waiting", "failed"):
+            elif event.status in ("idle", "waiting", "failed", "runner_idle_paused"):
                 from omnigent_client import TextDone
 
                 # A SETUP-phase failure (spec resolution, spawn-env
@@ -3334,6 +3356,12 @@ async def run_repl(
                     err_items = _render_failed_status_error(fmt, host, event)
                     if tape_entry is not None and err_items:
                         _event_tape.mark_rendered(tape_entry, len(err_items))  # type: ignore[union-attr]
+                elif event.status == "runner_idle_paused":
+                    # The runner was idle-reaped — a benign pause, not a
+                    # failure. Render a calm dim note (no red ErrorBlock);
+                    # the next message relaunches the runner and replays
+                    # history losslessly.
+                    _render_idle_paused_note(fmt, host)
 
                 items_out = list(
                     fmt.format_text_done(TextDone(full_text="", has_code_blocks=False))

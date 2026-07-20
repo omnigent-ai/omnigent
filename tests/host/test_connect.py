@@ -686,6 +686,73 @@ async def test_watch_runner_reports_unexpected_exit(
     # The report carries the exit code and the log tail with the cause.
     assert "code 3" in report.error
     assert "tunnel rejected: crash-cause" in report.error
+    # A crash is NOT flagged idle — the server must still fail the session.
+    assert report.idle is False
+
+
+async def test_watch_runner_reports_idle_exit_as_paused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A runner that exits with RUNNER_IDLE_EXIT_CODE reports idle=True.
+
+    The runner shuts itself down on its idle timeout with a dedicated exit
+    code (75, EX_TEMPFAIL). The watcher must report that as a benign paused
+    exit (``idle=True``, no scary log tail) so the server surfaces
+    ``runner_idle_paused`` instead of failing the session — distinct from the
+    crash path above, which keeps the full error + tail.
+    """
+    from omnigent.runner.identity import RUNNER_IDLE_EXIT_CODE
+
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
+    monkeypatch.setattr("omnigent.host.connect._RUNNER_WATCH_INTERVAL_S", 0.01)
+    host = _make_host_process()
+    tunnel = _FakeTunnel()
+    host._ws = tunnel  # type: ignore[assignment] — duck-typed send
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+
+    original_popen = subprocess.Popen
+
+    def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        """Spawn a runner that lives briefly, then idle-exits (code 75).
+
+        Mirrors a runner hitting its idle timeout: it logs the graceful
+        shutdown line and exits with the idle sentinel code.
+
+        :param args: Command args (ignored).
+        :param kwargs: Popen kwargs from production, including log handles.
+        :returns: A live subprocess handle.
+        """
+        return original_popen(
+            [
+                "sh",
+                "-c",
+                f"echo 'runner idle timeout reached' >&2; sleep 0.2; exit {RUNNER_IDLE_EXIT_CODE}",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=kwargs["stdout"],
+            stderr=kwargs["stderr"],
+        )
+
+    frame = HostLaunchRunnerFrame(
+        request_id="req_idle",
+        binding_token="tok_idle",
+        workspace=str(workspace),
+    )
+    with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
+        result = await host._handle_launch(frame)
+    assert result.status == "launched", result.error
+
+    await asyncio.wait_for(asyncio.gather(*host._watcher_tasks), timeout=5.0)
+
+    assert len(tunnel.sent) == 1
+    report = decode_host_frame(tunnel.sent[0])
+    assert isinstance(report, HostRunnerExitedFrame)
+    assert report.runner_id == token_bound_runner_id("tok_idle")
+    # Benign paused exit: flagged idle, and it must NOT carry the log tail.
+    assert report.idle is True
+    assert "--- runner log tail ---" not in report.error
 
 
 async def test_watch_runner_silent_on_intentional_stop(
@@ -758,7 +825,9 @@ async def test_unreported_exit_flushes_after_reconnect(
     never reported and the waiting client polls to its timeout.
     """
     host = _make_host_process()
-    host._unreported_exits["runner_parked"] = "runner process exited with code 1"
+    # Parked as (error, idle) — the idle flag must survive a park/flush so a
+    # benign idle exit that raced a disconnect still reports as paused.
+    host._unreported_exits["runner_parked"] = ("runner process exited with code 1", False)
     tunnel = _FakeTunnel()
 
     # _serve_frames sends hello, flushes parked reports, then hits the
@@ -773,6 +842,7 @@ async def test_unreported_exit_flushes_after_reconnect(
     assert isinstance(report, HostRunnerExitedFrame)
     assert report.runner_id == "runner_parked"
     assert report.error == "runner process exited with code 1"
+    assert report.idle is False
     # The queue drained — a retained entry would re-send on every
     # reconnect forever.
     assert host._unreported_exits == {}

@@ -73,6 +73,7 @@ SESSION_LIVE_STATUS: dict[str, int] = {
     "running": 2,
     "waiting": 3,
     "failed": 4,
+    "runner_idle_paused": 5,
 }
 
 ACCOUNT_TOKEN_KIND: dict[str, int] = {

@@ -212,10 +212,16 @@ class HostRunnerExitedFrame:
     :param error: Human-readable cause, e.g.
         ``"runner process exited with code 1 (log: ~/...) ..."``,
         including the trailing lines of the runner's log.
+    :param idle: ``True`` when the runner exited on its own idle timeout
+        (a benign "paused, relaunch on demand" exit) rather than a crash.
+        The server maps an idle report to a calm ``runner_idle_paused``
+        status instead of ``failed``. Defaults ``False`` for
+        back-compatibility with hosts that predate this field.
     """
 
     runner_id: str
     error: str
+    idle: bool = False
 
 
 @dataclass
@@ -758,6 +764,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "kind": HostFrameKind.RUNNER_EXITED.value,
                 "runner_id": frame.runner_id,
                 "error": frame.error,
+                "idle": frame.idle,
             }
         )
     if isinstance(frame, HostRunnerStatusFrame):
@@ -1133,6 +1140,7 @@ def _decode_runner_exited(msg: dict[str, Any]) -> HostRunnerExitedFrame:
     return HostRunnerExitedFrame(
         runner_id=_required_str(msg, "runner_id"),
         error=_required_str(msg, "error"),
+        idle=_optional_bool(msg, "idle"),
     )
 
 
@@ -1466,6 +1474,22 @@ def _required_bool(msg: dict[str, Any], key: str) -> bool:
     if not isinstance(val, bool):
         raise ValueError(f"frame missing required bool field: {key!r}")
     return val
+
+
+def _optional_bool(msg: dict[str, Any], key: str, default: bool = False) -> bool:
+    """Return an optional boolean field, defaulting when absent.
+
+    A non-bool value (including ``None`` from an older peer that omitted the
+    key) falls back to ``default`` rather than raising, so adding a new
+    boolean frame field stays backward-compatible.
+
+    :param msg: Decoded frame object.
+    :param key: Field name, e.g. ``"idle"``.
+    :param default: Value to use when the key is missing or not a bool.
+    :returns: The boolean value, or ``default``.
+    """
+    val = msg.get(key)
+    return val if isinstance(val, bool) else default
 
 
 def _optional_str_list(msg: dict[str, Any], key: str) -> list[str]:

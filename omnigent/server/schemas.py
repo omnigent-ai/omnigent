@@ -2435,7 +2435,7 @@ class SessionStatusEvent(_SSEEventBase):
 
     type: Literal["session.status"]
     conversation_id: str
-    status: Literal["idle", "launching", "running", "waiting", "failed"]
+    status: Literal["idle", "launching", "running", "waiting", "failed", "runner_idle_paused"]
     response_id: str | None = None
     error: ErrorDetail | None = None
     background_task_count: int | None = None

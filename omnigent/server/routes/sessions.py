@@ -2106,6 +2106,8 @@ def _session_status_from_cache(
         return "running"
     if cached == "failed":
         return "failed"
+    # ``runner_idle_paused`` (idle-reaped runner, relaunch on demand) collapses
+    # to ``idle`` here — in the list it reads as a quiescent session, not broken.
     return "idle"
 
 

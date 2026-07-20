@@ -72,7 +72,7 @@ def create_host_tunnel_router(
     on_host_connect: Callable[[str, str | None], Awaitable[None]] | None = None,
     on_host_disconnect: Callable[[str, str | None], Awaitable[None]] | None = None,
     on_host_update: Callable[[str, str | None], Awaitable[None]] | None = None,
-    on_runner_exited: Callable[[str, str], Awaitable[None]] | None = None,
+    on_runner_exited: Callable[[str, str, bool], Awaitable[None]] | None = None,
     local_single_user: bool | None = None,
     runner_exit_reports: RunnerExitReports | None = None,
 ) -> APIRouter:
@@ -398,7 +398,7 @@ async def _receive_loop(
     host_id: str,
     host_store: HostStore,
     runner_exit_reports: RunnerExitReports | None,
-    on_runner_exited: Callable[[str, str], Awaitable[None]] | None,
+    on_runner_exited: Callable[[str, str, bool], Awaitable[None]] | None,
     on_host_update: Callable[[str, str | None], Awaitable[None]] | None,
 ) -> None:
     """Receive host frames and route results to pending futures.
@@ -409,8 +409,9 @@ async def _receive_loop(
     :param host_store: Persistent store receiving live readiness updates.
     :param runner_exit_reports: Store for ``host.runner_exited``
         reports; ``None`` drops them.
-    :param on_runner_exited: Callback fired with ``(runner_id, error)``
-        when a ``host.runner_exited`` frame arrives; ``None`` skips it.
+    :param on_runner_exited: Callback fired with ``(runner_id, error, idle)``
+        when a ``host.runner_exited`` frame arrives; ``idle`` is ``True`` for a
+        benign idle-timeout exit. ``None`` skips it.
     :param on_host_update: Callback fired after readiness changes persist;
         ``None`` skips it.
     """
@@ -505,14 +506,18 @@ async def _receive_loop(
                 frame.runner_id,
                 frame.error,
             )
-            if runner_exit_reports is not None:
+            # A benign idle exit ("paused, relaunch on demand") is not a
+            # failure — don't stash it as a crash cause that the status
+            # endpoint would surface as an error.
+            if runner_exit_reports is not None and not frame.idle:
                 runner_exit_reports.record(frame.runner_id, frame.error, conn.owner)
             if on_runner_exited is not None:
                 # Mark the runner's session(s) failed and push the cause
                 # to the open view. A runner that crashed before
                 # connecting its tunnel has no runner-tunnel disconnect
-                # event, so this report is the only failure signal.
-                await on_runner_exited(frame.runner_id, frame.error)
+                # event, so this report is the only failure signal. An
+                # idle exit instead surfaces a calm ``runner_idle_paused``.
+                await on_runner_exited(frame.runner_id, frame.error, frame.idle)
             continue
 
         if isinstance(frame, HostRunnerStatusResultFrame):

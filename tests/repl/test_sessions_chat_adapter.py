@@ -1000,3 +1000,29 @@ def test_failed_status_event_without_error_falls_back() -> None:
 
     assert "turn failed" in host.text
     assert items
+
+
+def test_idle_paused_note_renders_calm_not_red() -> None:
+    """``runner_idle_paused`` renders a calm dim note, never a red error.
+
+    An idle-reaped runner is a benign pause (history is server-side and
+    replays on the next message), so the REPL must render a single muted
+    line — not the red ``ErrorBlock`` a ``failed`` status draws. If this
+    ever routed through ``_render_failed_status_error`` the user would see a
+    scary crash box for a normal idle timeout, which is the whole bug #1528
+    set out to fix.
+    """
+    from omnigent_ui_sdk import RichBlockFormatter
+
+    from omnigent.repl._repl import _render_idle_paused_note
+    from tests.repl.helpers import CapturingHost
+
+    host = CapturingHost()
+    _render_idle_paused_note(RichBlockFormatter(), host)  # type: ignore[arg-type]
+
+    # The calm note reaches the screen…
+    assert "paused after idle" in host.text.lower()
+    # …and it is NOT the red error styling (no "error"/"failed" wording that
+    # the ErrorBlock path emits).
+    assert "error" not in host.text.lower()
+    assert "failed" not in host.text.lower()

@@ -445,6 +445,40 @@ def test_runner_exited_frame_missing_error_raises() -> None:
         decode_host_frame('{"kind": "host.runner_exited", "runner_id": "runner_abc123"}')
 
 
+def test_runner_exited_frame_idle_round_trip() -> None:
+    """
+    Verify the ``idle`` flag survives encode → decode.
+
+    A benign idle-timeout exit sets ``idle=True`` so the server surfaces a
+    calm ``runner_idle_paused`` status instead of failing the session. A lossy
+    round-trip here would turn a paused session back into a red failure.
+    """
+    original = HostRunnerExitedFrame(
+        runner_id="runner_abc123",
+        error="runner paused after idle timeout",
+        idle=True,
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostRunnerExitedFrame)
+    assert decoded.idle is True
+
+
+def test_runner_exited_frame_idle_defaults_false_for_legacy_peer() -> None:
+    """
+    Verify a frame from a host that predates the ``idle`` field decodes to
+    ``idle=False`` rather than raising.
+
+    The field is optional-with-default so a mixed-version fleet (older host,
+    newer server) keeps working: a crash report with no ``idle`` key is still
+    treated as a crash, not silently reclassified.
+    """
+    decoded = decode_host_frame(
+        '{"kind": "host.runner_exited", "runner_id": "runner_abc123", "error": "boom"}'
+    )
+    assert isinstance(decoded, HostRunnerExitedFrame)
+    assert decoded.idle is False
+
+
 def test_runner_status_frame_round_trip() -> None:
     """
     Verify HostRunnerStatusFrame survives encode → decode.

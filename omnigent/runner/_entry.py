@@ -1163,10 +1163,12 @@ def create_app(
     return app
 
 
-async def _run_tunnel_from_env() -> None:
+async def _run_tunnel_from_env() -> bool:
     """Run the runner as a WebSocket tunnel client.
 
-    :returns: None.
+    :returns: ``True`` if shutdown was triggered by the idle-timeout monitor
+        (a benign "paused" exit the caller maps to ``RUNNER_IDLE_EXIT_CODE``);
+        ``False`` for any other exit (signal, parent-death, tunnel close).
     """
     from omnigent.runner.identity import get_stable_runner_id
     from omnigent.runner.transports.ws_tunnel.serve import serve_tunnel
@@ -1247,13 +1249,24 @@ async def _run_tunnel_from_env() -> None:
     )
     stop_task = asyncio.create_task(stop_event.wait(), name="runner-signal-wait")
     idle_task: asyncio.Task[None] | None = None
+    # Set only when the idle monitor is what triggers shutdown, so the caller
+    # can exit with RUNNER_IDLE_EXIT_CODE (benign "paused") and the host can
+    # distinguish it from a signal/parent-death stop (which shares stop_event
+    # but is a plain graceful exit).
+    idle_shutdown = False
+
+    def _request_idle_shutdown() -> None:
+        nonlocal idle_shutdown
+        idle_shutdown = True
+        stop_event.set()
+
     if idle_timeout_s > 0:
         idle_task = asyncio.create_task(
             _run_inactivity_monitor(
                 idle_timeout_s=idle_timeout_s,
                 get_last_activity=_last_activity,
                 has_active_work=_has_active_work,
-                request_shutdown=stop_event.set,
+                request_shutdown=_request_idle_shutdown,
             ),
             name=f"runner-idle-monitor:{runner_id}",
         )
@@ -1291,6 +1304,7 @@ async def _run_tunnel_from_env() -> None:
             with contextlib.suppress(asyncio.CancelledError):
                 await idle_task
         await _lifespan_cm.__aexit__(None, None, None)
+    return idle_shutdown
 
 
 def _install_signal_handlers(
@@ -1325,15 +1339,20 @@ def main() -> None:
     :returns: None.
     """
     from omnigent.process_logging import configure_process_logging
+    from omnigent.runner.identity import RUNNER_IDLE_EXIT_CODE
 
     configure_process_logging("runner", force=True)
     try:
-        asyncio.run(_run_tunnel_from_env())
+        idle_shutdown = asyncio.run(_run_tunnel_from_env())
     except RuntimeError as exc:
         if not str(exc).startswith(RUNNER_TUNNEL_REJECTION_PREFIX):
             raise
         print(f"error: {exc}", file=sys.stderr)
         raise SystemExit(1) from None
+    if idle_shutdown:
+        # Benign idle-timeout shutdown — signal the host to report a calm
+        # ``runner_idle_paused`` status and relaunch on demand, not a crash.
+        raise SystemExit(RUNNER_IDLE_EXIT_CODE)
 
 
 if __name__ == "__main__":

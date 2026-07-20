@@ -77,6 +77,7 @@ from omnigent.process_logging import (
 from omnigent.runner.identity import (
     RUNNER_DELEGATED_AUTH_ENV_VAR,
     RUNNER_ID_ENV_VAR,
+    RUNNER_IDLE_EXIT_CODE,
     RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
     RUNNER_PARENT_PID_ENV_VAR,
     RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
@@ -696,7 +697,9 @@ class HostProcess:
         self._ws: websockets.asyncio.client.ClientConnection | None = None
         # runner_id → composed error for exits that could not be sent
         # (tunnel down at the time). Flushed after the next hello.
-        self._unreported_exits: dict[str, str] = {}
+        # runner_id -> (error, idle). idle survives a park/flush so a
+        # benign idle exit that raced a disconnect still reports as paused.
+        self._unreported_exits: dict[str, tuple[str, bool]] = {}
         # Strong refs to per-runner watcher tasks; asyncio only keeps
         # weak refs, so an unreferenced task can be GC'd mid-flight.
         self._watcher_tasks: set[asyncio.Task[None]] = set()
@@ -1288,21 +1291,39 @@ class HostProcess:
             # _handle_stop (or _cleanup_runners) removed it first —
             # an intentional termination, not a crash to report.
             return
+        if handle.proc.returncode == RUNNER_IDLE_EXIT_CODE:
+            # The runner shut itself down on its idle timeout — a benign
+            # "paused, relaunch on demand" exit, not a crash. Report it as
+            # such (idle=True, no scary log tail) so the server surfaces a
+            # calm ``runner_idle_paused`` status instead of failing the
+            # session; the next message respawns the runner losslessly.
+            _logger.info("Runner %s idle-exited; reporting paused", runner_id)
+            await self._report_runner_exit(
+                runner_id,
+                "runner paused after idle timeout",
+                idle=True,
+            )
+            return
         error = _runner_exit_error(handle.proc.returncode, handle.log_path)
         _logger.warning("Runner %s died unexpectedly: %s", runner_id, error)
         await self._report_runner_exit(runner_id, error)
 
-    async def _report_runner_exit(self, runner_id: str, error: str) -> None:
+    async def _report_runner_exit(self, runner_id: str, error: str, *, idle: bool = False) -> None:
         """Send a ``host.runner_exited`` report, queueing on failure.
 
         :param runner_id: The dead runner, e.g. ``"runner_abc123..."``.
         :param error: Composed exit error from
             :func:`_runner_exit_error`.
+        :param idle: ``True`` when the runner exited on its idle timeout (a
+            benign "paused" exit) so the server surfaces ``runner_idle_paused``
+            instead of failing the session.
         :returns: None. A report that cannot be sent (tunnel down or
             mid-reconnect) is parked in ``self._unreported_exits`` and
             flushed by :meth:`_serve_frames` after the next hello.
         """
-        frame = encode_host_frame(HostRunnerExitedFrame(runner_id=runner_id, error=error))
+        frame = encode_host_frame(
+            HostRunnerExitedFrame(runner_id=runner_id, error=error, idle=idle)
+        )
         ws = self._ws
         if ws is not None:
             try:
@@ -1314,7 +1335,7 @@ class HostProcess:
                     runner_id,
                     exc_info=True,
                 )
-        self._unreported_exits[runner_id] = error
+        self._unreported_exits[runner_id] = (error, idle)
 
     def _handle_stat(self, frame: HostStatFrame) -> HostStatResultFrame:
         """Handle a ``host.stat`` request from the server.
@@ -2078,9 +2099,9 @@ class HostProcess:
         # Flush exit reports that raced a disconnect: a runner that died
         # while the tunnel was down would otherwise never be reported and
         # the waiting client would poll to its timeout.
-        for runner_id, error in list(self._unreported_exits.items()):
+        for runner_id, (error, idle) in list(self._unreported_exits.items()):
             del self._unreported_exits[runner_id]
-            await self._report_runner_exit(runner_id, error)
+            await self._report_runner_exit(runner_id, error, idle=idle)
         # ``print`` (not ``_logger.warning``) so the user always sees the
         # success line after the noisy ``databricks.sdk`` warnings —
         # otherwise the terminal goes silent after auth and there's no

@@ -11,6 +11,13 @@ from pathlib import Path
 
 RUNNER_ID_ENV_VAR = "OMNIGENT_RUNNER_ID"
 RUNNER_PARENT_PID_ENV_VAR = "OMNIGENT_RUNNER_PARENT_PID"
+# Exit code the runner uses when it shuts itself down on its idle timeout —
+# a benign "paused, relaunch on demand" exit, distinct from both a crash
+# (nonzero-other) and a plain graceful stop (0, e.g. SIGTERM/parent-death).
+# 75 is EX_TEMPFAIL ("temporary failure, retry later") and collides with no
+# standard code {0,1,2,126,127,128+n}. The host keys on it in _watch_runner
+# to report a calm ``runner_idle_paused`` status instead of a failure.
+RUNNER_IDLE_EXIT_CODE = 75
 # Signal the CLI sends to "adopt" a runner: stop watching the parent
 # pid so the runner survives an intentional CLI exit (tmux detach) and
 # keeps serving the web UI. SIGUSR1 is unused elsewhere in the runner.
