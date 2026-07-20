@@ -44,26 +44,22 @@ async def _provision(monkeypatch, credential_store: CredentialStore | None) -> d
     return captured
 
 
-@pytest.mark.asyncio
 async def test_connected_credential_injected(monkeypatch, credential_store) -> None:
     credential_store.upsert(_OWNER, "github", token="gho_x", login="alice", scopes="repo")
     captured = await _provision(monkeypatch, credential_store)
     assert captured["extra_env"] == {"GIT_TOKEN": "gho_x"}
 
 
-@pytest.mark.asyncio
 async def test_no_credential_launches_without(monkeypatch, credential_store) -> None:
     captured = await _provision(monkeypatch, credential_store)
     assert captured["extra_env"] is None
 
 
-@pytest.mark.asyncio
 async def test_no_store_launches_without(monkeypatch) -> None:
     captured = await _provision(monkeypatch, None)
     assert captured["extra_env"] is None
 
 
-@pytest.mark.asyncio
 async def test_undecryptable_credential_launches_without(monkeypatch, credential_store) -> None:
     credential_store.upsert(_OWNER, "github", token="gho_x", login="alice", scopes="repo")
     monkeypatch.setenv("OMNIGENT_CREDENTIAL_ENCRYPTION_KEY", Fernet.generate_key().decode())

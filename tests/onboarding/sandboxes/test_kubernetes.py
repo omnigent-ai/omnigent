@@ -665,7 +665,5 @@ def test_pod_manifest_references_extra_env_keys_in_both_containers() -> None:
 
 def test_pod_manifest_never_inlines_extra_env_values() -> None:
     """The value only ever lives in the Secret — never in the Pod spec."""
-    import json
-
     manifest = build_pod_manifest(**_MANIFEST_KW, extra_env_keys=["GIT_TOKEN"])
     assert "gho_" not in json.dumps(manifest)

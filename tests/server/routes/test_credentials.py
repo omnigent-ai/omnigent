@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
 import pytest
 import pytest_asyncio
 from cryptography.fernet import Fernet
-from fastapi import FastAPI
 from starlette.requests import HTTPConnection
 
 from omnigent.runtime.agent_cache import AgentCache
@@ -50,32 +50,32 @@ def credential_store(cred_env, db_uri: str) -> CredentialStore:
     return CredentialStore(db_uri)
 
 
-def _build_app(
+@asynccontextmanager
+async def _client(
     db_uri: str, tmp_path: Path, credential_store: CredentialStore, user: str | None
-) -> FastAPI:
+) -> AsyncIterator[httpx.AsyncClient]:
     artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
-    return create_app(
+    app = create_app(
         agent_store=SqlAlchemyAgentStore(db_uri),
         file_store=SqlAlchemyFileStore(db_uri),
         conversation_store=SqlAlchemyConversationStore(db_uri),
         artifact_store=artifact_store,
-        agent_cache=AgentCache(
-            artifact_store=artifact_store,
-            cache_dir=tmp_path / "cache",
-        ),
+        agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
         comment_store=SqlAlchemyCommentStore(db_uri),
         credential_store=credential_store,
         auth_provider=_StubAuth(user),
     )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as c:
+        yield c
 
 
 @pytest_asyncio.fixture()
 async def client(
     runtime_init: None, db_uri: str, tmp_path: Path, credential_store: CredentialStore
 ) -> AsyncIterator[httpx.AsyncClient]:
-    app = _build_app(db_uri, tmp_path, credential_store, _USER)
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+    async with _client(db_uri, tmp_path, credential_store, _USER) as c:
         yield c
 
 
@@ -83,9 +83,7 @@ async def client(
 async def anon_client(
     runtime_init: None, db_uri: str, tmp_path: Path, credential_store: CredentialStore
 ) -> AsyncIterator[httpx.AsyncClient]:
-    app = _build_app(db_uri, tmp_path, credential_store, None)
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+    async with _client(db_uri, tmp_path, credential_store, None) as c:
         yield c
 
 
@@ -151,17 +149,15 @@ async def test_callback_happy_path_then_list_and_disconnect(
     assert resp.status_code == 302
     assert "connected=github" in resp.headers["location"]
 
-    listed = (await client.get("/v1/credentials")).json()
-    assert listed["credentials"] == [
-        {
-            "provider": "github",
-            "login": "alice-gh",
-            "scopes": "repo",
-            "connected_at": listed["credentials"][0]["connected_at"],
-        }
-    ]
-    # Token never appears in the API surface.
-    assert "gho_live" not in (await client.get("/v1/credentials")).text
+    listing = await client.get("/v1/credentials")
+    [cred] = listing.json()["credentials"]
+    assert cred == {
+        "provider": "github",
+        "login": "alice-gh",
+        "scopes": "repo",
+        "connected_at": cred["connected_at"],
+    }
+    assert "gho_live" not in listing.text  # token never on the API surface
 
     resp = await client.delete("/v1/credentials/github")
     assert resp.json() == {"ok": True}
