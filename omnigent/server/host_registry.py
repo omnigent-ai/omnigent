@@ -221,6 +221,11 @@ class HostConnection:
         ``host.install_harness_result``. Values carry the result fields
         (``status``, ``configured_harnesses``, ``error``). Same ``Any``
         typing rationale as ``pending_stats``.
+    :param inflight_installs: Per-``harness`` install tasks used to
+        coalesce concurrent install requests for the same harness (a
+        double-click) onto one in-flight install, so npm's non-race-safe
+        global writes never run twice at once. Keyed by harness identifier
+        (not ``request_id``) and cleared when the install completes.
     :param pending_fs_requests: Per-``request_id`` futures for
         in-flight ``host.fs_request`` reads (the workspace file
         panel served from the host while the runner is offline).
@@ -264,6 +269,9 @@ class HostConnection:
         default_factory=dict,
     )
     pending_installs: dict[str, asyncio.Future[dict[str, Any]]] = field(
+        default_factory=dict,
+    )
+    inflight_installs: dict[str, asyncio.Task[dict[str, Any]]] = field(
         default_factory=dict,
     )
     pending_fs_requests: dict[str, asyncio.Future[dict[str, Any]]] = field(

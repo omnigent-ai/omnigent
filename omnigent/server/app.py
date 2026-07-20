@@ -2071,6 +2071,14 @@ def create_app(
             )
         except ImportError:
             smart_routing_enabled = False
+        # harness_install_enabled gates the web UI's "Install" action for a
+        # missing, npm-installable harness on a connected host. Off by default
+        # (OMNIGENT_HARNESS_INSTALL_ENABLED=1 opts in) while the feature rolls
+        # out; when false the SPA keeps the prior "run omnigent setup" hint.
+        # Read live so flipping the env var takes effect without a rebuild.
+        from omnigent.process_logging import env_truthy
+
+        harness_install_enabled = env_truthy(os.environ.get("OMNIGENT_HARNESS_INSTALL_ENABLED"))
         return {
             "accounts_enabled": accounts_enabled,
             "single_user": single_user,
@@ -2083,6 +2091,7 @@ def create_app(
             "public_sharing_enabled": public_sharing_enabled,
             "server_version": _server_version(),
             "smart_routing_enabled": smart_routing_enabled,
+            "harness_install_enabled": harness_install_enabled,
         }
 
     @app.get("/v1/me", response_model=None)  # Union return type (dict | JSONResponse)

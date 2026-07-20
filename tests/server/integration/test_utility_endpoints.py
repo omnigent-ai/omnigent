@@ -80,6 +80,9 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     assert data["needs_setup"] is False
     assert isinstance(data["databricks_features"], bool)
     assert isinstance(data["managed_sandboxes_enabled"], bool)
+    # harness_install_enabled gates the UI Install action; default off unless
+    # OMNIGENT_HARNESS_INSTALL_ENABLED is set, so it's false in the test app.
+    assert data["harness_install_enabled"] is False
     # single_user reflects OMNIGENT_LOCAL_SINGLE_USER, which the suite's
     # conftest sets to "1" (the default local-dev posture), so it's true here.
     # The multi-user (marker-off) case is covered below.
