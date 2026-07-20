@@ -2287,3 +2287,115 @@ def test_symlink_hop_literals_survives_cycles(tmp_path: Path) -> None:
         f"Cycle members should each be collected once; got {literals!r}."
     )
     assert len(literals) == 2, f"Cycle must not duplicate entries or spin; got {literals!r}."
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="darwin_seatbelt requires macOS")
+def test_run_launcher_spawn_wrap_private_tmpdir_boots_under_seatbelt(
+    tmp_path: Path,
+) -> None:
+    """
+    End-to-end regression for the spawn-time-wrap private-tmpdir grant.
+
+    Drives the FULL ``create_exec_launcher`` -> ``run_launcher``
+    two-pass re-exec (the host pass builds the ``sandbox-exec`` wrap and
+    ``execvp``s into it; the in-wrap pass activates and runs the target).
+    This is the path claude-sdk / terminals / the other spawn-wrap
+    harnesses use — distinct from the direct ``wrap_launcher_argv``
+    calls the rest of this file exercises.
+
+    Reproduces the reported failure: inside the wrap, the launcher mints
+    a private scratch tmpdir via ``tempfile.mkdtemp()``, which targets
+    ``$TMPDIR``. On macOS ``$TMPDIR`` is the system tempdir *root*
+    (``/var/folders/.../T``), and the seatbelt profile — baked before
+    the re-exec — only grants a *subpath* of it, so the in-wrap
+    ``mkdtemp`` died with ``FileNotFoundError: No usable temporary
+    directory``. (bwrap masked this via its ``--tmpfs /tmp`` fallback,
+    so Linux CI never saw it.) The fix mints + grants the scratch dir on
+    the host BEFORE the wrap and hands it to the in-wrap pass, so
+    ``mkdtemp`` lands in a profile-granted, writable location.
+
+    The target is a tiny script that calls ``tempfile.mkdtemp()`` and
+    writes a file into it — the exact operation that failed. We force
+    ``TMPDIR`` to the system tempdir root to reproduce the macOS
+    condition deterministically. Pre-fix: the in-wrap launcher exits
+    non-zero with the ``FileNotFoundError`` before the target ever runs.
+    Post-fix: the target runs and prints ``TMPOK``.
+    """
+    import os
+    import shutil as _shutil
+    import subprocess
+    import tempfile
+
+    from omnigent.inner.sandbox import _project_root, create_exec_launcher
+
+    if _shutil.which("sandbox-exec") is None:
+        pytest.skip("sandbox-exec not on PATH")
+
+    cwd = tmp_path
+    # A target that exercises the scratch tmpdir the way real helpers do:
+    # mkdtemp() (honours $TMPDIR) then write into it. This is what raised
+    # FileNotFoundError inside the wrap pre-fix.
+    target = cwd / "tmp_probe.py"
+    target.write_text(
+        "import tempfile, pathlib\n"
+        "d = tempfile.mkdtemp()\n"
+        "p = pathlib.Path(d) / 'scratch.txt'\n"
+        "p.write_text('ok')\n"
+        "assert p.read_text() == 'ok'\n"
+        "print('TMPOK', d)\n"
+    )
+
+    # cwd is READ-ONLY — the seatbelt default, and the condition that
+    # makes this a real reproduction: with no writable cwd, Python's
+    # tempfile fallback chain ($TMPDIR -> /tmp -> ... -> os.getcwd())
+    # has NO writable entry, so a private-tmpdir mkdtemp that targets an
+    # un-granted $TMPDIR fails outright. (If cwd were writable, mkdtemp
+    # would silently fall back to it and mask the bug.) ``.venv`` allowed
+    # so the dotfile mask doesn't fight the interpreter symlink
+    # convention. The project root is a read root so the inline re-exec
+    # can import ``omnigent.inner`` — in production that import is
+    # covered by the interpreter install-root grant or by cwd; here cwd
+    # is pytest's tmp_path, so grant it explicitly.
+    policy = _make_policy(
+        cwd.resolve(strict=False),
+        allow_hidden=[".venv"],
+        read_roots=[_project_root()],
+    )
+
+    # The launcher script re-execs run_launcher under sandbox-exec. Its
+    # shebang is ``sys.executable``; run it as a plain argv so the
+    # two-pass flow (host -> execvp sandbox-exec -> in-wrap) happens for
+    # real. ``target`` is the interpreter here, exec'd inside the jail.
+    launcher = create_exec_launcher(str(Path(sys.executable).resolve(strict=True)), policy)
+    try:
+        env = dict(os.environ)
+        # Reproduce the macOS failure condition explicitly: $TMPDIR is
+        # the system tempdir ROOT, which the profile only grants a
+        # subpath of. Pre-fix this is exactly what broke the in-wrap
+        # mkdtemp.
+        env["TMPDIR"] = tempfile.gettempdir()
+        result = subprocess.run(
+            [launcher, str(target)],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=env,
+        )
+    finally:
+        os.unlink(launcher)
+
+    assert "No usable temporary directory" not in result.stderr, (
+        "In-wrap mkdtemp could not find a writable $TMPDIR — the private "
+        "scratch tmpdir was not granted in the baked seatbelt profile. "
+        f"rc={result.returncode}\nstdout={result.stdout!r}\n"
+        f"stderr={result.stderr!r}"
+    )
+    assert result.returncode == 0, (
+        f"Wrapped launcher exited {result.returncode}.\n"
+        f"stdout={result.stdout!r}\nstderr={result.stderr!r}"
+    )
+    assert "TMPOK" in result.stdout, (
+        "Target ran but didn't reach the scratch-write marker; "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )

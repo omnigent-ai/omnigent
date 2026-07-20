@@ -17,7 +17,8 @@ from typing import cast
 import pytest
 
 from dev.benchmarks.omnigent import run as bench_run
-from dev.benchmarks.omnigent.journeys import ALL_JOURNEYS
+from dev.benchmarks.omnigent.environment import BenchEnvironment
+from dev.benchmarks.omnigent.journeys import ALL_JOURNEYS, Journey, run_latency
 from dev.benchmarks.omnigent.measure import RunResult, aggregate, check_thresholds
 from dev.benchmarks.omnigent.schema import SCHEMA_VERSION, build_report
 
@@ -149,6 +150,52 @@ def test_runner_journeys_are_capped() -> None:
             assert journey.max_iterations is None, journey.name
 
 
+@pytest.mark.asyncio
+async def test_latency_prepare_runs_before_warmup_and_timed_operations() -> None:
+    """Per-sample preparation is outside measure but runs for every sample."""
+    calls: list[str] = []
+
+    async def _setup(_env: BenchEnvironment) -> object:
+        calls.append("setup")
+        return object()
+
+    async def _prepare(_env: BenchEnvironment, _ctx: object) -> None:
+        calls.append("prepare")
+
+    async def _measure(_env: BenchEnvironment, _ctx: object) -> None:
+        calls.append("measure")
+
+    async def _teardown(_env: BenchEnvironment, _ctx: object) -> None:
+        calls.append("teardown")
+
+    journey = Journey(
+        name="prepared",
+        kind="latency",
+        setup=_setup,
+        prepare=_prepare,
+        measure=_measure,
+        teardown=_teardown,
+    )
+    result = await run_latency(
+        journey,
+        cast(BenchEnvironment, object()),
+        iterations=2,
+        warmup=1,
+    )
+
+    assert result.n_success == 2
+    assert calls == [
+        "setup",
+        "prepare",
+        "measure",
+        "prepare",
+        "measure",
+        "prepare",
+        "measure",
+        "teardown",
+    ]
+
+
 # ── end-to-end smoke (boots the server) ──────────────────────
 
 
@@ -192,6 +239,7 @@ async def test_benchmark_smoke_threshold_failure_exits_nonzero() -> None:
 
 _RUNNER_JOURNEYS = [
     "session_cold_start",
+    "session_cold_restart",
     "warm_turn",
     "time_to_first_token",
     "interrupt",
@@ -204,7 +252,7 @@ async def test_benchmark_smoke_runner_journeys() -> None:
     """Run each full-turn journey once through server + runner + mock LLM.
 
     First exercise of the ``with_runner=True`` path end-to-end. Tiny counts —
-    each cold-start iteration spawns a runner, so this is the slow smoke.
+    each cold-journey iteration spawns a runner, so this is the slow smoke.
     """
     report, passed = await bench_run.run_benchmark(
         _smoke_args(journeys=_RUNNER_JOURNEYS, iterations=1, warmup=1)

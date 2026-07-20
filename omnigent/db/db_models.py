@@ -451,6 +451,95 @@ class SqlAccountToken(OmnigentBase):
     )
 
 
+class SqlDeviceGrant(OmnigentBase):
+    """
+    SQLAlchemy model for the ``device_grants`` table.
+
+    Backs the generic OAuth 2.0 Device Authorization Grant (RFC 8628) —
+    any browserless client (the Slack integration is the first, but the
+    mechanism is not Slack-specific) obtains a delegated, per-user access
+    token without a user credential passing through the client. One row per
+    device-authorization request; it moves ``pending`` → ``approved`` /
+    ``denied`` (browser consent) → ``redeemed`` (token issued) and can be
+    ``revoked`` at any time.
+
+    Secrets are stored **hashed** (never raw): the client's ``device_code``
+    and the current ``refresh_token`` are HMAC-SHA256 digests, so a
+    database read cannot recover a usable token.
+
+    :param id: Opaque grant id (also the ``grant_id`` JWT claim on issued
+        access tokens, used for revocation).
+    :param device_code_hash: HMAC-SHA256 hex digest of the secret
+        ``device_code`` the client polls with. Never store the raw code.
+    :param user_code: Short human-readable code shown on the verification
+        page (also carried in ``verification_uri_complete``).
+    :param status: ``pending`` / ``approved`` / ``denied`` / ``redeemed`` /
+        ``revoked`` (see :data:`omnigent.db.enum_codecs.DEVICE_GRANT_STATUS`).
+    :param client_id: The RFC 8628 client identifier — a public string
+        naming the requesting application (e.g. ``"slack"``), the same for
+        every grant that application initiates. Shown on the consent page
+        and recorded in the issued token's ``act`` claim for audit.
+        Display/audit only — not a security-decision key.
+    :param user_id: The Omnigent identity that approved the grant, set at
+        consent time. ``NULL`` while pending. The delegated token's ``sub``.
+    :param refresh_token_hash: HMAC-SHA256 hex digest of the current
+        refresh token. Rotated on every refresh; a presented token that no
+        longer matches (and isn't the current one) is a reuse signal that
+        revokes the grant.
+    :param created_at: Unix epoch seconds when the grant was created.
+    :param expires_at: Unix epoch seconds after which the ``device_code``
+        can no longer be exchanged (the authorization request expires).
+    :param approved_at: Unix epoch seconds when the grant was approved,
+        starting its absolute lifetime clock. ``NULL`` until approved.
+        Refresh is refused once ``approved_at`` is older than the absolute
+        max lifetime, forcing periodic re-consent.
+    :param last_polled_at: Unix epoch seconds of the last token-poll,
+        used to enforce the RFC 8628 ``interval`` / ``slow_down``.
+    """
+
+    __tablename__ = "device_grants"
+
+    # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    device_code_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    user_code: Mapped[str] = mapped_column(String(32), nullable=False)
+    # Enum stored as a stable int code (see omnigent.db.enum_codecs
+    # DEVICE_GRANT_STATUS). The store converts to/from the name at the
+    # row↔entity boundary.
+    status: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    client_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    refresh_token_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Digest of the just-superseded refresh token, kept only so a replay
+    # of the previous token can be recognised as reuse (token theft) and
+    # revoke the grant. Cleared on revoke.
+    prev_refresh_token_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    expires_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    approved_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_polled_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    __table_args__ = (
+        CheckConstraint("status IN (1, 2, 3, 4, 5)", name="ck_device_grants_status"),
+        # Poll path looks up by device_code_hash; a top-level index keeps it
+        # a point lookup rather than a partition scan.
+        Index("ix_device_grants_device_code_hash", "workspace_id", "device_code_hash"),
+        Index("ix_device_grants_user_code", "workspace_id", "user_code"),
+        Index("ix_device_grants_expires_at", "workspace_id", "expires_at", "id"),
+        # Refresh + revoke look up by the current / previous refresh-token
+        # digest; index both so those paths stay point lookups.
+        Index("ix_device_grants_refresh_hash", "workspace_id", "refresh_token_hash"),
+        Index("ix_device_grants_prev_refresh_hash", "workspace_id", "prev_refresh_token_hash"),
+    )
+
+
 class SqlSessionPermission(OmnigentBase):
     """
     SQLAlchemy model for the ``session_permissions`` table.

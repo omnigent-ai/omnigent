@@ -1478,3 +1478,74 @@ def _argv_mentions(argv: list[str], path: str, *, after_token: str) -> bool:
         if i + 2 < len(argv) and argv[i] == after_token and argv[i + 2] == path:
             return True
     return False
+
+
+@pytestmark_bwrap
+def test_run_launcher_spawn_wrap_private_tmpdir_boots_under_bwrap(tmp_path: Path) -> None:
+    """
+    End-to-end: the ``create_exec_launcher`` -> ``run_launcher``
+    two-pass re-exec grants its private scratch tmpdir on bwrap.
+
+    The macOS-seatbelt counterpart of this test
+    (``test_seatbelt_sandbox.py``) guards the reported
+    ``FileNotFoundError: No usable temporary directory`` — the in-wrap
+    ``mkdtemp`` targeting an un-granted ``$TMPDIR``. bwrap masked that
+    via its ``--tmpfs /tmp`` fallback, so it never regressed; this test
+    exists so the shared fix (mint + grant the scratch dir on the host
+    before the wrap, then adopt it in-wrap) is guarded on the bwrap lane
+    too. Forces ``TMPDIR`` to the system tempdir root to match the
+    seatbelt reproduction exactly.
+    """
+    import tempfile
+
+    from omnigent.inner.sandbox import _project_root, create_exec_launcher
+
+    cwd = tmp_path
+    target = cwd / "tmp_probe.py"
+    target.write_text(
+        "import tempfile, pathlib\n"
+        "d = tempfile.mkdtemp()\n"
+        "p = pathlib.Path(d) / 'scratch.txt'\n"
+        "p.write_text('ok')\n"
+        "assert p.read_text() == 'ok'\n"
+        "print('TMPOK', d)\n"
+    )
+
+    # cwd READ-ONLY (the default) so tempfile can't fall back to it and
+    # mask the bug — the in-wrap mkdtemp must succeed via the granted
+    # private scratch tmpdir. read_roots grants the project root so the
+    # inline re-exec can import ``omnigent.inner``.
+    policy = _make_policy(
+        cwd,
+        allow_hidden=[".venv"],
+        read_roots=[_project_root()],
+        cwd_hidden_scan_overflow="warn",
+    )
+    launcher = create_exec_launcher(os.path.realpath(sys.executable), policy)
+    try:
+        env = dict(os.environ)
+        env["TMPDIR"] = tempfile.gettempdir()
+        completed = subprocess.run(
+            [launcher, str(target)],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=env,
+            check=False,
+        )
+    finally:
+        os.unlink(launcher)
+
+    assert "No usable temporary directory" not in completed.stderr, (
+        "in-wrap mkdtemp could not find a writable $TMPDIR — the private "
+        f"scratch tmpdir was not granted. rc={completed.returncode} "
+        f"stderr={completed.stderr[-400:]!r}"
+    )
+    assert completed.returncode == 0, (
+        f"wrapped launcher exited {completed.returncode}. "
+        f"stdout={completed.stdout!r} stderr={completed.stderr[-400:]!r}"
+    )
+    assert "TMPOK" in completed.stdout, (
+        f"target did not reach the scratch-write marker. stdout={completed.stdout!r}"
+    )

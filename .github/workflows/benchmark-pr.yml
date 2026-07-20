@@ -152,6 +152,9 @@ jobs:
           } > comment_body.md
 
       - name: Post PR comment
+        # Fork PRs have a read-only GITHUB_TOKEN so the comment may fail —
+        # that's acceptable; results are still available in the artifact.
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |

@@ -924,8 +924,20 @@ export function ChatPage() {
   // session, so a host-bound, host-down session whose host is a resumable
   // managed host classifies as `host_asleep` (composer open, send wakes it)
   // instead of dead-ending on `host_offline`.
+  //
+  // Also prefer the snapshot's `permissionLevel` over the sidebar row's when
+  // it's resolved: the hook derives `host_offline`'s `isOwner` from this
+  // level, and a deployment whose session list is owner-only (the caller's
+  // effective level omitted, e.g. the Databricks-managed server) leaves the
+  // row's `permission_level` null — which would read permissively as "owner"
+  // and offer a non-owner the host-reconnect path. The single-session
+  // snapshot always carries the authoritative level.
   const livenessRow: LivenessRow | null = activeConv
-    ? { ...activeConv, host_resumable: activeSession?.hostResumable ?? false }
+    ? {
+        ...activeConv,
+        permission_level: activeSession?.permissionLevel ?? activeConv.permission_level,
+        host_resumable: activeSession?.hostResumable ?? false,
+      }
     : livenessRowFromSession(activeSession);
   const liveness = useSessionLiveness(urlConvId ?? undefined, livenessRow, {
     turnActive: status === "streaming",

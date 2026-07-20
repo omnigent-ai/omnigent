@@ -97,6 +97,7 @@ from omnigent.harness_plugins import (
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE as _HARNESS_NOT_CONFIGURED_ERROR_CODE,
 )
+from omnigent.llms.context_window import resolve_effective_context_window
 from omnigent.model_override import validate_model_override
 from omnigent.native_coding_agents import (
     native_coding_agent_for_agent_name,
@@ -137,9 +138,14 @@ from omnigent.runtime.policies.approval import (
     build_elicitation_request_event,
     resolve_ask_timeout,
 )
-from omnigent.runtime.policies.builder import build_policy_engine, load_session_usage
+from omnigent.runtime.policies.builder import (
+    any_policies_apply,
+    build_policy_engine,
+    load_session_usage,
+)
 from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.runtime.tool_output import cap_tool_output
+from omnigent.runtime.workflow import _find_spec_by_name
 from omnigent.server import presence, session_live_state
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
@@ -204,6 +210,8 @@ from omnigent.server.routes._host_worktree import CreatedWorktree
 from omnigent.server.routes._origin import require_trusted_origin
 from omnigent.server.schemas import (
     AgentObject,
+    AutomaticSessionRenameRequest,
+    AutomaticSessionRenameResponse,
     BrowserActionRequestEvent,
     ChildSessionList,
     ChildSessionSummary,
@@ -1253,6 +1261,12 @@ _pending_policy_ask_writes: cachetools.LRUCache[str, _PendingPolicyAskWrites] = 
     cachetools.LRUCache(maxsize=512)
 )
 
+# Label key used to persist the turn-initiating human's identity on the
+# conversation row.  Written at _forward_event_to_runner time so any
+# server replica can read it back when the runner calls /policies/evaluate
+# or /mcp (tools/call).
+_TURN_ACTOR_LABEL = "omnigent.turn_actor"
+
 
 # (conversation_id, deciding_policy) -> lock serializing native ASK gates.
 # When an agent fires several tool calls in parallel, each spawns its own
@@ -2124,6 +2138,41 @@ def _session_status_with_child_rollup(
     return own_status
 
 
+async def _collect_descendant_conversation_ids(
+    conversation_store: ConversationStore,
+    root_id: str,
+) -> list[str]:
+    """
+    Return every sub-agent descendant of ``root_id``, at any depth.
+
+    Walks the tree one level at a time (child, grandchild, and so on),
+    batching each level into a single ``list_child_conversation_ids_by_parent``
+    call so an N-level tree costs N queries rather than one per node.
+
+    :param conversation_store: Store for child-id lookup.
+    :param root_id: Root session/conversation identifier.
+    :returns: Descendant ids in breadth-first order. Empty if ``root_id``
+        has no sub-agent descendants.
+    """
+    descendant_ids: list[str] = []
+    seen = {root_id}
+    frontier = [root_id]
+    while frontier:
+        child_ids_map = await asyncio.to_thread(
+            conversation_store.list_child_conversation_ids_by_parent,
+            frontier,
+        )
+        next_frontier: list[str] = []
+        for parent_id in frontier:
+            for child_id in child_ids_map.get(parent_id, []):
+                if child_id not in seen:
+                    seen.add(child_id)
+                    descendant_ids.append(child_id)
+                    next_frontier.append(child_id)
+        frontier = next_frontier
+    return descendant_ids
+
+
 async def _best_effort_stop(
     session_id: str,
     conversation_store: ConversationStore,
@@ -2131,33 +2180,56 @@ async def _best_effort_stop(
 ) -> None:
     """Stop a running session before a destructive lifecycle action.
 
-    Mirrors the client-side stop-then-archive/delete pattern: if the
-    session (or any direct sub-agent child) is still running, attempt to
-    stop it via the runner. Failures are swallowed so the caller can
-    always proceed — the session must remain deletable/archivable even
-    when the runner is offline or unreachable.
+    Mirrors the client-side stop-then-archive/delete pattern. A session
+    reads as "running" here if it is itself running, has live background
+    tasks, or has any sub-agent descendant (child, grandchild, and so on)
+    still running or waiting, matching the unbounded depth that
+    ``delete_conversation``'s recursive subtree delete already covers.
+    Each running descendant must be stopped on its own session id: it
+    executes on its own runner, separate from its ancestors', so stopping
+    a parent never reaches it. Every stop attempt is independently
+    best-effort, so one runner being unreachable does not skip stopping
+    the others, and none of this may block the caller from archiving or
+    deleting the session.
 
     :param session_id: Session/conversation identifier.
-    :param conversation_store: Store for child-id lookup.
+    :param conversation_store: Store for descendant-id lookup.
     :param runner_router: The ``RunnerRouter`` for runner-client
         resolution, or ``None`` in tests / in-process setups.
     """
     try:
-        child_ids_map = await asyncio.to_thread(
-            conversation_store.list_child_conversation_ids_by_parent,
-            [session_id],
-        )
-        child_ids = child_ids_map.get(session_id, [])
-        status = _session_status_with_child_rollup(session_id, child_ids)
-        if status != "running":
-            return
-        await _stop_session_via_runner(session_id, runner_router)
-    except Exception:  # noqa: BLE001 — best-effort; must not block archive/delete
+        descendant_ids = await _collect_descendant_conversation_ids(conversation_store, session_id)
+        status = _session_status_with_child_rollup(session_id, descendant_ids)
+    except Exception:  # noqa: BLE001 (best-effort; must not block archive/delete)
         _logger.debug(
             "Best-effort stop failed for %s; proceeding anyway",
             session_id,
             exc_info=True,
         )
+        return
+
+    if status != "running":
+        return
+
+    async def _stop(target_id: str) -> None:
+        try:
+            await _stop_session_via_runner(target_id, runner_router)
+        except Exception:  # noqa: BLE001 (best-effort; must not block archive/delete)
+            _logger.debug(
+                "Best-effort stop failed for %s; proceeding anyway",
+                target_id,
+                exc_info=True,
+            )
+
+    own_status = _session_status_from_cache(session_id)
+    has_background_tasks = (
+        own_status != "failed" and _session_background_task_count_cache.get(session_id, 0) > 0
+    )
+    if own_status == "running" or has_background_tasks:
+        await _stop(session_id)
+    for descendant_id in descendant_ids:
+        if _session_status_cache.get(descendant_id) in ("running", "waiting"):
+            await _stop(descendant_id)
 
 
 @dataclass(frozen=True)
@@ -9036,7 +9108,9 @@ async def _dispatch_skill_slash_command_to_runner(
     return visible.id
 
 
-def _title_content_from_item(item: NewConversationItem) -> list[dict[str, Any]]:
+def _title_content_from_item(
+    item: NewConversationItem | ConversationItem,
+) -> list[dict[str, Any]]:
     """
     Extract title candidate content blocks from a session item.
 
@@ -9379,6 +9453,23 @@ async def _forward_event_to_runner(
         # resolved copy — id-based dedup, not a role/content guess.
         "persisted_item_id": persisted_items[0].id,
     }
+    # Persist the turn-initiating actor so /policies/evaluate and MCP
+    # tools/call can read it back on any server replica.  Skip system-driven
+    # forwards (sub-agent results, parent-wake carry created_by=None) — they
+    # must not stomp the in-flight turn's actor.
+    # Known gap: a queued message from user B can overwrite this label while
+    # user A's turn is still executing tool calls on a shared session.  The
+    # runner's _active_turns guard prevents two turns from running on the same
+    # session concurrently, but the label is written at server-forward time
+    # (before the runner queues the message), not at runner-turn-start time.
+    # For the common case (sequential users or single-user sessions) this is
+    # correct; strictly concurrent shared-session use is an accepted gap.
+    if created_by is not None:
+        await asyncio.to_thread(
+            conversation_store.set_labels,
+            session_id,
+            {_TURN_ACTOR_LABEL: created_by},
+        )
     # Forward request-supplied client-side tool schemas so non-native
     # harnesses can emit (and tunnel) the caller's tools — the runner
     # merges these into the harness tool list (_merge_request_client_tools).
@@ -12082,11 +12173,13 @@ async def _stream_live_events(
     reconcile pre-subscribe state via the snapshot endpoint
     (``GET /v1/sessions/{id}``) and dedupe by item id.
 
-    On client disconnect the subscribe loop breaks; the
-    ``finally`` block emits a ``[DONE]`` sentinel so well-behaved
-    SSE consumers see a clean stream termination. The pub-sub
-    layer auto-cleans this generator's subscriber slot in its own
-    ``finally`` when iteration exits.
+    On client disconnect the subscribe loop breaks; the ``finally`` block
+    emits a ``[DONE]`` sentinel so well-behaved SSE consumers see a clean
+    stream termination. A subscriber-queue overflow instead ends without
+    ``[DONE]`` so clients treat it as a dropped transport, reconnect, and
+    reconcile from the persisted snapshot. The pub-sub layer auto-cleans
+    this generator's subscriber slot in its own ``finally`` when iteration
+    exits.
 
     Each emitted dict is validated against
     :data:`ServerStreamEvent` at the wire boundary so a runtime
@@ -12146,6 +12239,7 @@ async def _stream_live_events(
         presence_token = presence.connect(
             presence_root_id, session_id, viewer_user_id, viewer_idle
         )
+    subscriber_overflowed = False
     try:
         async for event in session_stream.subscribe(
             session_id,
@@ -12168,6 +12262,12 @@ async def _stream_live_events(
                 )
             validated = _SERVER_STREAM_EVENT_ADAPTER.validate_python(event)
             yield _format_sse(event_type, validated.model_dump())
+    except session_stream.SubscriberOverflowError:
+        subscriber_overflowed = True
+        _logger.warning(
+            "session stream subscriber overflowed for %s; closing for snapshot reconnect",
+            session_id,
+        )
     finally:
         # The non-None checks besides presence_token's are type
         # narrowing only: a minted token implies both were set above.
@@ -12177,7 +12277,8 @@ async def _stream_live_events(
             and presence_root_id is not None
         ):
             presence.disconnect(presence_root_id, viewer_user_id, presence_token)
-        yield "data: [DONE]\n\n"
+        if not subscriber_overflowed:
+            yield "data: [DONE]\n\n"
 
 
 # Bounds for per-session native-terminal pass-through args
@@ -12711,6 +12812,25 @@ def _reject_reserved_cost_control_label_seed(labels: dict[str, str]) -> None:
         )
 
 
+def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
+    """
+    Reject a client-supplied label map that touches server-internal keys.
+
+    Keys in this set are written exclusively by server internals and must
+    not be client-settable — doing so would let callers forge security-
+    critical metadata (e.g. the policy-evaluation actor identity).
+
+    :param labels: The client-supplied label mapping, or ``None``.
+    :raises OmnigentError: 400 when any reserved key is present.
+    """
+    if not labels or _TURN_ACTOR_LABEL not in labels:
+        return
+    raise OmnigentError(
+        f"label {_TURN_ACTOR_LABEL!r} is server-internal and cannot be set by clients",
+        code=ErrorCode.INVALID_INPUT,
+    )
+
+
 def _require_cost_control_label_authority(
     *,
     reserved_keys: Sequence[str],
@@ -12807,6 +12927,7 @@ async def _create_session_from_existing_agent(
         fails authorization.
     """
     _reject_reserved_cost_control_label_seed(body.labels)
+    _reject_server_reserved_label_seed(body.labels)
 
     agent = await asyncio.to_thread(agent_store.get, body.agent_id)
     if agent is None:
@@ -15022,6 +15143,7 @@ def create_sessions_router(
             raise HTTPException(status_code=422, detail=[_multipart_missing_detail("bundle")])
         parsed_metadata = _parse_session_create_metadata(metadata)
         _reject_reserved_cost_control_label_seed(parsed_metadata.labels)
+        _reject_server_reserved_label_seed(parsed_metadata.labels)
 
         inherited_runner_id: str | None = None
         if parsed_metadata.parent_session_id is not None:
@@ -15821,6 +15943,65 @@ def create_sessions_router(
 
     # ── PATCH /sessions/{session_id} ────────────────────────────
 
+    @router.post(
+        "/sessions/{session_id}/auto-title",
+        response_model=AutomaticSessionRenameResponse,
+    )
+    async def automatically_rename_session(
+        request: Request,
+        session_id: str,
+        body: AutomaticSessionRenameRequest,
+    ) -> AutomaticSessionRenameResponse:
+        """Replace the deterministic first-message title when still current."""
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access(
+            user_id,
+            session_id,
+            LEVEL_EDIT,
+            permission_store,
+            conversation_store,
+        )
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None:
+            raise OmnigentError("Session not found", code=ErrorCode.NOT_FOUND)
+        if conv.parent_conversation_id is not None:
+            return AutomaticSessionRenameResponse(renamed=False, reason="not_top_level")
+
+        title = " ".join(body.title.split())
+        if "\n" in body.title or "\r" in body.title or len(title) < 2:
+            raise OmnigentError(
+                "title must be a single non-empty line",
+                code=ErrorCode.INVALID_INPUT,
+            )
+
+        page = await asyncio.to_thread(
+            conversation_store.list_items,
+            session_id,
+            100,
+            None,
+            None,
+            "asc",
+            None,
+        )
+        seed_title: str | None = None
+        for item in page.data:
+            seed_title = synthesize_conversation_title(_title_content_from_item(item))
+            if seed_title is not None:
+                break
+        if seed_title is None:
+            return AutomaticSessionRenameResponse(renamed=False, reason="no_seed")
+        if conv.title != seed_title:
+            return AutomaticSessionRenameResponse(renamed=False, reason="title_changed")
+        updated = await asyncio.to_thread(
+            conversation_store.rename_conversation_if_title_matches,
+            session_id,
+            seed_title,
+            title,
+        )
+        if updated is None:
+            return AutomaticSessionRenameResponse(renamed=False, reason="title_changed")
+        return AutomaticSessionRenameResponse(renamed=True, title=updated.title)
+
     @router.patch(
         "/sessions/{session_id}",
         response_model=None,
@@ -15873,6 +16054,7 @@ def create_sessions_router(
                     code=ErrorCode.FORBIDDEN,
                 )
         if body.labels:
+            _reject_server_reserved_label_seed(body.labels)
             # Advisor-owned cost_control.* labels are written only by the
             # session's bound runner; gate them on runner proof BEFORE any
             # store mutation so a rejected request leaves the session untouched.
@@ -16354,6 +16536,12 @@ def create_sessions_router(
                 cloned_agent_bundle_location=base_agent.bundle_location,
                 cloned_agent_description=base_agent.description,
                 copy_model_settings=copy_model_settings,
+                # Launch flags are CLI-specific. On an agent switch the fork may
+                # bind a different CLI (e.g. claude-code → pi), whose flag set
+                # differs — Claude Code's ``--permission-mode`` makes pi exit at
+                # launch (unknown option → ``required_terminal_exited``). Only
+                # carry the source's launch args on a same-agent fork.
+                copy_terminal_launch_args=not switching_agent,
                 carry_history_into_native=carry_history_into_native,
                 resume_source_native_session=resume_source_native_session,
                 presentation_labels=presentation_labels,
@@ -17061,6 +17249,27 @@ def create_sessions_router(
         )
 
         _caps = get_caps()
+
+        # Fast path: if no policies would fire (no agent guardrails, no
+        # session policies, no server-wide defaults), skip the engine build
+        # entirely. This avoids conversation-store reads for labels/state/usage
+        # on every tool call for the common no-policy case. Session policies are
+        # LRU-cached so this check is cheap after the first call per session.
+        # Users can add policies mid-session — the cache is invalidated on
+        # mutation, so newly added policies are visible on the very next call.
+        if not any_policies_apply(
+            spec=loaded.spec,
+            conversation_id=session_id,
+            default_policies=_caps.default_policies,
+            policy_store=get_policy_store(),
+            phase=phase,
+            tool_name=data.get("name") if isinstance(data, dict) else None,
+        ):
+            return Response(
+                content=json.dumps({"result": "POLICY_ACTION_ALLOW"}),
+                media_type="application/json",
+            )
+
         _host_conn = (
             _caps.policy_llm_connection_factory() if _caps.policy_llm_connection_factory else None
         )
@@ -17088,7 +17297,16 @@ def create_sessions_router(
             )
 
         engine = _build_engine()
-        ctx = _build_evaluation_context(phase, data, event, actor=_build_actor(user_id))
+        # Use the turn-initiating human's identity (persisted at forward time)
+        # so per-user policies gate on the correct actor even when the HTTP
+        # caller is the runner's service-account credential.  Falls back to
+        # user_id for direct API callers and native-terminal sessions (whose
+        # turns go via _dispatch_session_event_to_runner, which does not write
+        # this label).
+        turn_actor = conv.labels.get(_TURN_ACTOR_LABEL)
+        ctx = _build_evaluation_context(
+            phase, data, event, actor=_build_actor(turn_actor or user_id)
+        )
         result = await engine.evaluate(ctx, read_only=is_read_only)
 
         # URL-based elicitation for blocking phases: on a TOOL_CALL or
@@ -21847,6 +22065,8 @@ def create_sessions_router(
             )
 
         if method == "tools/call":
+            _mcp_conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            turn_actor = _mcp_conv.labels.get(_TURN_ACTOR_LABEL) if _mcp_conv is not None else None
             return await _handle_mcp_tools_call(
                 rpc_id,
                 session_id,
@@ -21854,7 +22074,7 @@ def create_sessions_router(
                 conversation_store,
                 agent_store,
                 runner_router,
-                actor=_build_actor(user_id),
+                actor=_build_actor(turn_actor or user_id),
                 request=request,
             )
 
@@ -22250,6 +22470,10 @@ async def _get_session_snapshot(
                         agent_cache.load, agent.id, agent.bundle_location
                     )
                     spec = loaded.spec
+                    if conv.sub_agent_name:
+                        child_spec = _find_spec_by_name(spec, conv.sub_agent_name)
+                        if child_spec is not None:
+                            spec = child_spec
                     # Prefer the spec's name over the agent row's: a
                     # switch-created session-scoped clone is named
                     # "<builtin> (switch ag_…)" for row disambiguation,
@@ -22258,9 +22482,6 @@ async def _get_session_snapshot(
                     if spec.name:
                         agent_name = spec.name
                     llm_model = spec.executor.model
-                    from omnigent.llms.context_window import (
-                        resolve_effective_context_window,
-                    )
 
                     # Size the context ring against whatever the next turn will
                     # actually run, using the SAME resolver the runner uses to

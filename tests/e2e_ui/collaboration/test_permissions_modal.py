@@ -217,6 +217,47 @@ def test_permissions_modal_controls_drive_server_state(
     _wait_for(lambda: grantee not in _permissions(base_url, session_id))
 
 
+def test_share_modal_qr_code_opens_mobile_deep_link(
+    browser: Browser,
+    multi_user_server: MultiUserServer,
+) -> None:
+    """The "Open in mobile app" button opens a QR code dialog encoding the
+    session's ``omnigent://<host>/c/<id>`` deep link.
+
+    Pins the new QR flow added to ``PermissionsModal.tsx``: the button sits next
+    to "Copy link", clicking it opens a second dialog with the QR code visible,
+    and closing it returns to the share modal. The QR is rendered as an SVG
+    whose ``value`` attribute carries the deep link — we read it back to
+    confirm the host and session id are correct.
+    """
+    page = _admin_page(browser)
+    page.goto(f"{multi_user_server.public_url}/c/{multi_user_server.session_id}")
+
+    _open_share_modal(page)
+    share_dialog = page.get_by_role("dialog")
+
+    # The button sits next to "Copy link" in the footer.
+    qr_button = share_dialog.get_by_role("button", name="Open in mobile app")
+    expect(qr_button).to_be_visible()
+
+    # Clicking it opens a second dialog with the QR code. Both dialogs
+    # are open simultaneously (the QR dialog is portaled inside the share
+    # dialog's container), so scope to the last-opened dialog via its
+    # unique description text.
+    qr_button.click()
+    qr_dialog = page.get_by_role("dialog").filter(has_text="Scan with your phone").last
+    expect(qr_dialog).to_be_visible(timeout=10_000)
+    # The QR code is an SVG element inside the dialog.
+    qr_svg = qr_dialog.locator("[aria-label='QR code to open this session in the Omnigent app']")
+    expect(qr_svg).to_be_visible(timeout=10_000)
+
+    # Closing the QR dialog returns to the share modal (not dismissed
+    # entirely). Scope the Close button to the QR dialog to avoid matching
+    # the Radix Dialog's built-in close (X) on the share dialog underneath.
+    qr_dialog.get_by_role("button", name="Close").first.click()
+    expect(page.get_by_text("Share this session")).to_be_visible()
+
+
 def test_multi_user_shows_enabled_share_button(
     browser: Browser,
     multi_user_server: MultiUserServer,

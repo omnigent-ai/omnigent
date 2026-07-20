@@ -393,6 +393,8 @@ class WorkspaceReader:
                 "status": rec["status"],
                 "bytes": rec.get("bytes"),
                 "modified_at": rec.get("modified_at"),
+                "lines_added": rec.get("lines_added"),
+                "lines_removed": rec.get("lines_removed"),
             }
             for rec in raw_changes
         ]

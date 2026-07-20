@@ -30,7 +30,9 @@ dependencies = [
     "omnigent-ui-sdk==0.6.0.dev0",
     # Merged from omnigent + omnigent.
     "pyyaml>=6.0,<7",
-    "openai>=1.0,<3",
+    # openai-agents<0.18.2 omits a field required by openai>=2.45.
+    # Keep this cap until the websockets<15 compatibility pin can be lifted.
+    "openai>=1.0,<2.45",
     # >=14: the `e2b` extra's SDK (>=2.26) needs rich>=14 (was >=13,<14).
     "rich>=14,<15",
     "prompt_toolkit>=3.0,<4",
@@ -190,6 +192,15 @@ cursor = ["cursor-sdk>=0.1.7"]
 # _reflect). The tools import the client lazily, so only users who enable a
 # Hindsight memory tool need this extra.
 hindsight = ["hindsight-client>=0.4.0"]
+# Slack integration (`omni integration slack`). The @omnigent socket-mode bot
+# lives in the separate `omnigent-slack` package (heavy deps — slack_bolt /
+# aiohttp — kept out of the baseline install). The CLI launches it as a
+# subprocess (`python -m omnigent_slack`), so it must be importable in the same
+# environment; installing `omnigent[slack]` puts it there. Local/editable
+# installs resolve it from `integrations/slack` via [tool.uv.sources] below;
+# publishing `omnigent[slack]` to an index additionally requires publishing
+# `omnigent-slack` there (not yet wired into the release pipeline).
+slack = ["omnigent-slack"]
 databricks = [
     # Floor matches what core code was tested against when the SDK was a
     # default dependency (it moved here from `dependencies` above).
@@ -296,6 +307,9 @@ omni = "omnigent.cli:main"
 [tool.uv.sources]
 omnigent-client = { path = "sdks/python-client", editable = true }
 omnigent-ui-sdk = { path = "sdks/ui", editable = true }
+# Local resolution for the `slack` extra. Only pulled in when `omnigent[slack]`
+# is requested (the extra is opt-in), so a default install never builds it.
+omnigent-slack = { path = "integrations/slack", editable = true }
 
 [tool.setuptools]
 include-package-data = true
@@ -516,6 +530,14 @@ known-first-party = ["omnigent"]
 "sdks/**/*.py" = [
     "ARG001", "ARG002", "BLE001", "B008", "RUF012",
 ]
+# slack_bolt dispatches to handlers by parameter NAME (``body``, ``event``,
+# ``client``, ``ack``, ``view``), so unused handler args can't be renamed to
+# ``_`` without breaking injection. The bot also has deliberate boundary
+# catches (best-effort acks, background login tasks) that must never abort a
+# turn, hence BLE001.
+"integrations/slack/**/*.py" = [
+    "ARG001", "ARG002", "BLE001", "B008", "RUF012",
+]
 
 [tool.mypy]
 python_version = "3.12"
@@ -709,6 +731,15 @@ follow_imports = "skip"
 # via sys.modules aliasing.
 [[tool.mypy.overrides]]
 module = "omnigent_client.*"
+ignore_missing_imports = true
+disallow_any_explicit = false
+
+# Slack integration (omnigent-slack). slack_bolt / slack_sdk ship no type
+# stubs, and Slack event/view payloads are opaque JSON dicts the handlers
+# read positionally — so the code leans on ``Any`` at that boundary. Mirror
+# the client SDK: resolve the untyped imports and lift the Any ban here.
+[[tool.mypy.overrides]]
+module = "omnigent_slack.*"
 ignore_missing_imports = true
 disallow_any_explicit = false
 

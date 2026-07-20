@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 import types
 from types import SimpleNamespace
@@ -68,6 +69,7 @@ def _install_fake_sdk(
         "custom_tools": [],
         "custom_tool_results": [],
         "launch_kwargs": [],
+        "launch_cwds": [],
         "sent": [],
         "closed": 0,
         "client_closed": 0,
@@ -126,6 +128,10 @@ def _install_fake_sdk(
         @classmethod
         async def launch_bridge(cls, **kwargs: Any) -> _FakeClient:
             state["launch_kwargs"].append(kwargs)
+            # Record the process cwd at spawn time: the real bridge subprocess
+            # inherits it (the SDK spawns without a cwd=), so the executor must
+            # have chdir'd to the workspace by now.
+            state["launch_cwds"].append(os.getcwd())
             return cls()
 
         # The real AsyncClient exposes ONLY aclose() (no close()); it owns the
@@ -1610,6 +1616,41 @@ async def test_ensure_session_writes_hooks_json(
     # Both files are cleaned up on close.
     assert not hooks_file.exists()
     assert not wrapper.exists()
+
+
+async def test_bridge_spawns_in_workspace_cwd(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    """The bridge is launched with the process cwd set to the workspace.
+
+    cursor-sdk spawns the bridge subprocess without a ``cwd=``, so it -- and the
+    shell tools Cursor runs in it -- inherit the launching process's directory.
+    The executor must chdir to the declared workspace across the spawn (so
+    commands run in the workspace, not wherever the runner daemon lives) and
+    restore the previous cwd afterwards.
+    """
+    sdk_state = _install_fake_sdk(monkeypatch, [{"messages": [_assistant("ok")], "result": "ok"}])
+    # Workspace differs from the process cwd at launch time.
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    daemon_cwd = tmp_path / "daemon-cwd"
+    daemon_cwd.mkdir()
+    monkeypatch.chdir(daemon_cwd)
+    original_cwd = os.getcwd()
+
+    executor = CursorExecutor(api_key="crsr_x", cwd=str(workspace))
+    try:
+        events = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
+        assert events  # _ensure_session ran
+    finally:
+        await executor.close()
+
+    # The bridge saw the workspace (not the daemon cwd) as its directory...
+    assert len(sdk_state["launch_cwds"]) == 1
+    assert os.path.realpath(sdk_state["launch_cwds"][0]) == os.path.realpath(str(workspace))
+    # ...and the process cwd was restored afterwards.
+    assert os.getcwd() == original_cwd
 
 
 async def test_hooks_json_not_written_without_server_url(

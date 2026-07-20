@@ -50,6 +50,9 @@ from omnigent.onboarding.sandboxes.base import (
     DEFAULT_HOST_IMAGE,
     RemoteCommandResult,
     SandboxLauncher,
+    foreground_kill_command,
+    foreground_pidfile,
+    foreground_record_prefix,
     host_image_wheel_install_command,
 )
 
@@ -79,7 +82,6 @@ _EXEC_TIMEOUT_S = 300
 # ceiling. The pidfile records the in-sandbox pid so Ctrl-C can kill the
 # remote process (cancelling the local stream doesn't stop it).
 _FOREGROUND_TIMEOUT_S = 7 * 24 * 3600
-_FOREGROUND_PIDFILE_TEMPLATE = "/tmp/oa-openshell-foreground-{sandbox_id}.pid"
 
 # OpenShell runs the agent as the non-root ``sandbox`` user (its image
 # contract; see deploy/docker/Dockerfile), whose home is ``/sandbox``.
@@ -419,26 +421,33 @@ class OpenShellSandboxLauncher(SandboxLauncher):
         Ctrl-C kills the remote process and re-raises ``KeyboardInterrupt``.
         """
         client = self._openshell()
-        pidfile = _FOREGROUND_PIDFILE_TEMPLATE.format(sandbox_id=sandbox_id)
-        # `exec` keeps the recorded pid across the shell swap, so a Ctrl-C
-        # can kill the remote process — cancelling the local gRPC stream
-        # stops our reads but doesn't stop the remote command.
-        remote = f"echo $$ > {shlex.quote(pidfile)} && exec {command}"
+        # Record the remote pid in a private, unpredictably-named dir under
+        # world-writable /tmp: `mkdir -m 700` (no -p) fails closed if the path
+        # already exists, so a co-tenant can't pre-seed a symlink we'd write
+        # through, nor read our pid back. `echo $$ … && exec` keeps the pid
+        # across the shell swap, so cancelling the local gRPC stream (which
+        # stops our reads but not the remote command) can still kill it. See
+        # :func:`foreground_pidfile` for the shared rationale.
+        run_dir, pidfile = foreground_pidfile()
+        remote = f"{foreground_record_prefix(pidfile)}exec {command}"
         try:
-            return client.run_foreground(
+            rc = client.run_foreground(
                 sandbox_id, ["bash", "-lc", remote], timeout=_FOREGROUND_TIMEOUT_S
             )
         except KeyboardInterrupt:
             click.echo("\n  → detaching; stopping the remote process")
+            # Signal only a numeric pid read back from our own private pidfile,
+            # then drop the dir; never feed unvalidated file contents to kill.
             client.execute(
                 sandbox_id,
-                [
-                    "bash",
-                    "-lc",
-                    f"kill $(cat {shlex.quote(pidfile)}) 2>/dev/null || true",
-                ],
+                ["bash", "-lc", foreground_kill_command(pidfile)],
             )
             raise
+        # Normal exit: drop the run dir so we don't orphan a mode-700 dir in
+        # /tmp. The interrupt path already cleans up via
+        # :func:`foreground_kill_command`.
+        client.execute(sandbox_id, ["bash", "-c", f"rm -rf {run_dir} 2>/dev/null"])
+        return rc
 
     def wheel_install_command(self, remote_tgz_path: str) -> str:
         """Overlay shipped wheels onto the prebaked host image."""

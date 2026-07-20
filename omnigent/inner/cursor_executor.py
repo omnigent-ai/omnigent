@@ -445,6 +445,42 @@ def _write_cursor_hooks(cwd: str, hook_script_path: str, server_url: str, sessio
     return hooks_file
 
 
+_BRIDGE_SPAWN_CWD_LOCK: asyncio.Lock | None = None
+
+
+def _bridge_spawn_cwd_lock() -> asyncio.Lock:
+    """Process-global lock serialising the cwd change around a bridge spawn.
+
+    Created lazily so it binds to the running event loop.
+    """
+    global _BRIDGE_SPAWN_CWD_LOCK
+    if _BRIDGE_SPAWN_CWD_LOCK is None:
+        _BRIDGE_SPAWN_CWD_LOCK = asyncio.Lock()
+    return _BRIDGE_SPAWN_CWD_LOCK
+
+
+@contextlib.asynccontextmanager
+async def _bridge_spawn_in_cwd(cwd: str) -> AsyncIterator[None]:
+    """Set the process cwd to *cwd* across a cursor-sdk bridge launch.
+
+    ``AsyncClient.launch_bridge`` spawns the bridge subprocess without a
+    ``cwd=`` argument, so the bridge -- and the shell tools Cursor runs inside
+    it -- inherit the launching process's directory. ``--workspace`` only routes
+    indexing, not command execution, so a bridge started from the runner
+    daemon's directory would run ``pwd`` / git / relative paths there rather than
+    in the declared workspace. We chdir only across the spawn and restore
+    afterwards; a process-global lock serialises the window so an overlapping
+    launch can't observe a half-applied cwd.
+    """
+    async with _bridge_spawn_cwd_lock():
+        prev_cwd = os.getcwd()
+        os.chdir(cwd)
+        try:
+            yield
+        finally:
+            os.chdir(prev_cwd)
+
+
 @dataclass
 class _CursorSessionState:
     """Per-Omnigent-conversation SDK session state."""
@@ -710,7 +746,12 @@ class CursorExecutor(Executor):
             hook_script = str(Path(__file__).with_name("cursor_policy_hook.py"))
             state.hooks_file = _write_cursor_hooks(cwd, hook_script, server_url, conv_id)
 
-        client = await AsyncClient.launch_bridge(workspace=cwd)
+        # Spawn the bridge with the process cwd pointing at the workspace so
+        # Cursor's shell tools execute there, not in the runner daemon's
+        # directory (the SDK spawns the bridge without a cwd=). See
+        # _bridge_spawn_in_cwd.
+        async with _bridge_spawn_in_cwd(cwd):
+            client = await AsyncClient.launch_bridge(workspace=cwd)
         try:
             local_kwargs: dict[str, Any] = {
                 "cwd": cwd,

@@ -29,6 +29,14 @@ def _isolate_cursor_credential(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) 
     monkeypatch.delenv("CURSOR_API_KEY", raising=False)
     for var in ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
         monkeypatch.delenv(var, raising=False)
+    # Codex readiness resolves the binary via resolve_cli_binary, which honors
+    # an OMNIGENT_CODEX_PATH override and probes on-disk global install dirs.
+    # Clear the override and stub the fallback dirs so a developer's real codex
+    # install can't flip the binary-missing verdict these tests assert.
+    import omnigent._platform as platform
+
+    monkeypatch.delenv("OMNIGENT_CODEX_PATH", raising=False)
+    monkeypatch.setattr(platform, "_cli_fallback_dirs", lambda: ())
 
 
 def _all_clis_installed(monkeypatch: pytest.MonkeyPatch) -> None:

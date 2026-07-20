@@ -146,6 +146,7 @@ import { useFileDiff } from "@/hooks/useFileDiff";
 import { getSeenCommentIds } from "@/hooks/useSeenComments";
 import { useWorkspaceChangedFiles } from "@/hooks/useWorkspaceChangedFiles";
 import { classifyAndRemapComments, FileViewer } from "./FileViewer";
+import { encodePdfAnchor } from "./pdfCommentHelpers";
 import { writeFileViewPreferences } from "@/lib/fileViewPreferences";
 import type { ChangedSort } from "./FlatFileList";
 
@@ -853,6 +854,21 @@ describe("classifyAndRemapComments", () => {
 
     expect(result.open).toHaveLength(1);
     expect(result.open[0].id).toBe("c6");
+  });
+
+  it("skips remapping for PDF geometry anchors", () => {
+    const anchor = encodePdfAnchor(1, [{ x: 0.1, y: 0.2, w: 0.3, h: 0.04 }], "Hello PDF");
+    const c = makeAnchoredComment({
+      id: "c_pdf",
+      start_index: anchor.start_index,
+      end_index: anchor.end_index,
+      anchor_content: anchor.anchor_content,
+    });
+
+    const result = classifyAndRemapComments([c], "%PDF-1.4 binary bytes");
+
+    expect(result.open).toHaveLength(1);
+    expect(result.open[0]).toEqual(c);
   });
 
   // Spec/xfail: a draft comment whose anchor can no longer be found
