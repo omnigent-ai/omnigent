@@ -39,25 +39,34 @@ const DATA_ATTR = "data-omnigent-font";
 // fallback cell.
 const loads = new Map<string, Promise<boolean>>();
 
+// load key → the node(s) this loader injected for it. Tracked in a Map rather
+// than found via a DOM attribute selector: the key is a URL (with `:?&;@`) and a
+// quoted attribute selector over such a value is unreliable across engines. The
+// `DATA_ATTR` on each node stays only as a debugging marker.
+const injected = new Map<string, Element[]>();
+
 /**
- * Escape a value for use inside a quoted attribute selector (`[a="<here>"]`).
- * Only `"` and `\` are special there — NOT `:`/`?`/`&` etc., so we must NOT use
- * `CSS.escape` (which escapes identifier chars and would break the match).
+ * Remove every node this loader injected for `key` (the `<link>` and/or the
+ * `@font-face` `<style>`). Called on a retryable failure so a later attempt
+ * genuinely reinjects and re-fetches — and, for self-hosted faces, so the
+ * errored CSS-connected `FontFace` is dropped from `document.fonts` (a fresh
+ * `<style>` mints a fresh face rather than `document.fonts.load` returning the
+ * cached rejected one forever).
  */
-function escapeAttr(value: string): string {
-  return value.replace(/["\\]/g, "\\$&");
+function removeInjected(key: string): void {
+  for (const node of injected.get(key) ?? []) node.remove();
+  injected.delete(key);
 }
 
 /**
  * Inject a `<link rel="stylesheet">` for a Google CSS2 (or any CSS) href and
  * resolve once the browser has parsed it (`load` event) — so the @font-face
  * rules are registered before we ask `document.fonts` about them. Rejects on the
- * link's `error` event. If a node for this key already exists (hot reload / a
- * sibling entry sharing the URL), resolves immediately.
+ * link's `error` event (removing its own node). If a node for this key already
+ * exists (hot reload / a sibling entry sharing the URL), resolves immediately.
  */
 function injectStylesheet(key: string, cssUrl: string): Promise<void> {
-  const selector = `link[${DATA_ATTR}="${escapeAttr(key)}"]`;
-  if (document.querySelector(selector)) return Promise.resolve();
+  if (injected.has(key)) return Promise.resolve();
   return new Promise<void>((resolve, reject) => {
     const link = document.createElement("link");
     link.rel = "stylesheet";
@@ -67,22 +76,22 @@ function injectStylesheet(key: string, cssUrl: string): Promise<void> {
     link.addEventListener(
       "error",
       () => {
-        // Remove the failed node so a later retry (the promise is evicted on
-        // failure) genuinely re-injects instead of matching this dead link.
-        link.remove();
+        // Drop the failed node so a later retry (the promise is evicted on
+        // failure) genuinely re-injects instead of the has-guard skipping it.
+        removeInjected(key);
         reject(new Error(`stylesheet failed: ${cssUrl}`));
       },
       { once: true },
     );
     document.head.appendChild(link);
+    injected.set(key, [link]);
   });
 }
 
 /** Inject a `<style>` holding an entry's explicit `@font-face` rules (once). */
 function injectFontFaces(key: string, entry: FontCatalogEntry): void {
   if (!entry.faces?.length) return;
-  const selector = `style[${DATA_ATTR}="${escapeAttr(key)}"]`;
-  if (document.querySelector(selector)) return;
+  if (injected.has(key)) return;
   const css = entry.faces
     .map((face) => {
       const src = face.format ? `url(${face.url}) format('${face.format}')` : `url(${face.url})`;
@@ -101,28 +110,41 @@ function injectFontFaces(key: string, entry: FontCatalogEntry): void {
   style.setAttribute(DATA_ATTR, key);
   style.textContent = css;
   document.head.appendChild(style);
+  injected.set(key, [style]);
 }
 
 /**
- * Resolve `true` once the browser genuinely has `family` ready to paint.
+ * Outcome of a readiness probe:
+ *   - `ready`       — glyphs genuinely available; remeasure now.
+ *   - `failed`      — a real asset failure (rejected load, or empty/not-ready
+ *     result meaning the rules didn't take). RETRYABLE: the caller drops the
+ *     injected node so a later attempt re-fetches.
+ *   - `unsupported` — no `document.fonts` API (old browser / jsdom). NOT a load
+ *     failure, so NOT retryable — reinjecting would just thrash.
+ */
+type ReadyOutcome = "ready" | "failed" | "unsupported";
+
+/**
+ * Probe whether the browser genuinely has `family` ready to paint.
  *
  * `document.fonts.load('16px "Family"')` kicks the fetch for matching unloaded
  * `@font-face`s and resolves with the FontFace objects it matched. An EMPTY
- * match array (or a rejected load) is treated as NOT ready and resolves `false`
- * — an empty result means the rules weren't registered, so reporting success
- * would fire a premature remeasure against the fallback cell. Callers only await
- * this once the stylesheet/faces are known-injected, so a genuine face resolves
- * non-empty. Never rejects and never resolves on a timer, so a consumer chained
- * off it remeasures exactly when the glyphs actually arrive, however late.
+ * match array (or a rejected load) is `failed` — an empty result means the rules
+ * weren't registered / the face errored, so reporting success would fire a
+ * premature remeasure against the fallback cell. A missing API is `unsupported`,
+ * kept distinct so the caller doesn't treat it as a retryable asset failure.
+ * Never rejects and never resolves on a timer, so a consumer chained off it
+ * remeasures exactly when the glyphs actually arrive, however late.
  */
-async function fontsReady(family: string): Promise<boolean> {
+async function fontsReady(family: string): Promise<ReadyOutcome> {
   const fonts = document.fonts;
-  if (!fonts?.load) return false;
+  if (!fonts?.load) return "unsupported";
   try {
     const faces = await fonts.load(`16px "${family}"`);
-    return Array.isArray(faces) ? faces.length > 0 : Boolean(faces);
+    const ok = Array.isArray(faces) ? faces.length > 0 : Boolean(faces);
+    return ok ? "ready" : "failed";
   } catch {
-    return false;
+    return "failed";
   }
 }
 
@@ -151,29 +173,45 @@ export function loadFont(entry: FontCatalogEntry): Promise<boolean> {
   const existing = loads.get(key);
   if (existing) return existing;
 
-  const promise = (async () => {
+  // The inner load yields a ReadyOutcome; the outer `.then` maps it to the
+  // cached boolean AND handles retry eviction (where `promise` is in scope).
+  const outcome = (async (): Promise<ReadyOutcome> => {
     if (entry.source === "google-css2" && entry.cssUrl) {
       // Wait for the stylesheet to parse so its @font-face rules are registered
       // BEFORE we query document.fonts — otherwise fonts.load resolves empty and
-      // we'd report a premature ready with no later notification.
+      // we'd report a premature ready with no later notification. The link's own
+      // error handler removes its node, so a rejection here is a retryable
+      // failure with nothing left to reinject.
       try {
         await injectStylesheet(key, entry.cssUrl);
       } catch {
-        // A blocked/failed stylesheet leaves the fallback stack; not ready.
-        return false;
+        return "failed";
       }
     } else if (entry.source === "self-hosted") {
       injectFontFaces(key, entry);
     }
     return fontsReady(entry.family);
   })();
-  loads.set(key, promise);
-  // A load that resolves `false` (failed) must not poison the cache: a later
-  // attempt for the same resource should retry rather than get the stale
-  // failure. A genuine success stays cached (idempotent no-op re-injection).
-  void promise.then((ready) => {
-    if (!ready && loads.get(key) === promise) loads.delete(key);
+
+  const promise = outcome.then((result) => {
+    if (result === "failed") {
+      // A real asset failure: drop THIS attempt's injected node(s) so a retry
+      // reinjects and re-fetches (and, for self-hosted, mints a fresh FontFace
+      // instead of reusing the errored one), then evict so the next call re-runs.
+      // Guard against clobbering a newer in-flight load for the same key.
+      if (loads.get(key) === promise) {
+        removeInjected(key);
+        loads.delete(key);
+      }
+    } else if (result === "unsupported") {
+      // No document.fonts API (old browser / jsdom): NOT a load failure. Leave
+      // the injected node in place (CSS may still paint via font-display) and
+      // evict without node removal so we don't thrash reinjecting on retry.
+      if (loads.get(key) === promise) loads.delete(key);
+    }
+    return result === "ready";
   });
+  loads.set(key, promise);
   return promise;
 }
 
@@ -199,7 +237,8 @@ export function loadFontByFamily(
   return { entry, ready: entry ? loadFont(entry) : Promise.resolve(false) };
 }
 
-/** Test-only: clear the in-flight/loaded dedup cache. */
+/** Test-only: clear the in-flight/loaded dedup cache and injected-node index. */
 export function resetFontLoaderForTests(): void {
   loads.clear();
+  injected.clear();
 }
