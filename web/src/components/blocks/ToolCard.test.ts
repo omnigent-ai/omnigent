@@ -86,6 +86,33 @@ describe("ToolCard rendering", () => {
     expect(container.querySelector(".tool-step-icon-node")).toBeInTheDocument();
   });
 
+  it.each([
+    [
+      "sys_os_shell",
+      { command: "git status" },
+      "git status",
+      ["font-mono", "bg-foreground/[0.065]"],
+    ],
+    ["sys_os_read", { path: "/tmp/file.ts" }, "/tmp/file.ts", ["font-mono", "text-[#BC2F72]"]],
+    [
+      "sys_session_get_info",
+      { session_id: "session_42" },
+      "session_42",
+      ["font-mono", "text-foreground/75"],
+    ],
+    ["sys_timer_set", { seconds: 12 }, "12s", ["font-mono", "tabular-nums"]],
+    ["web_search", { query: "tool styling" }, '"tool styling"', ["text-foreground/75"]],
+  ] as const)("uses restrained semantic emphasis for %s", (name, args, body, classes) => {
+    renderCard({
+      name,
+      arguments: args,
+      output: "done",
+      state: "output-available",
+    });
+
+    expect(screen.getByText(body)).toHaveClass(...classes);
+  });
+
   it("expands to reveal the Parameters panel and output on click", () => {
     // WHY: clicking the trigger must reveal the parameters JSON and the output
     // section — the collapsed-by-default content path.

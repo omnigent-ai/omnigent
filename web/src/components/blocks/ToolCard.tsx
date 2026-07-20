@@ -29,7 +29,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { cn } from "@/lib/utils";
 import type { RenderItem, ToolState } from "@/lib/renderItems";
 import { iconForTool } from "@/lib/toolIcon";
-import { type ToolTitle, formatToolTitle } from "@/lib/toolTitle";
+import { type ToolTitle, type ToolTitleBodyKind, formatToolTitle } from "@/lib/toolTitle";
 import { useFileViewer } from "@/shell/FileViewerContext";
 
 const OUTPUT_PREVIEW_LINE_LIMIT = 80;
@@ -288,7 +288,7 @@ export function ToolGroupSummary({ tools, count }: { tools: RenderItem[]; count?
 
 /**
  * Single muted-text trigger line for a tool call. Status/category icon
- * at left, title (verb bold + dynamic body) in the middle truncated to
+ * at left, title (neutral action + subtly emphasized dynamic body) in the middle truncated to
  * one line, optional duration on the right, chevron at the far right.
  */
 function ToolTriggerRow({
@@ -325,7 +325,10 @@ function ToolTriggerRow({
           <span
             role="link"
             tabIndex={0}
-            className="underline decoration-dotted underline-offset-2 hover:text-foreground transition-colors cursor-pointer"
+            className={cn(
+              toolBodyClassName(title.bodyKind),
+              "cursor-pointer underline decoration-dotted underline-offset-2 transition-colors hover:text-foreground",
+            )}
             onClick={(e) => {
               e.stopPropagation();
               onBodyClick();
@@ -341,7 +344,7 @@ function ToolTriggerRow({
             {title.body}
           </span>
         ) : (
-          title.body
+          <span className={toolBodyClassName(title.bodyKind)}>{title.body}</span>
         )}
       </span>
       {duration !== undefined && (
@@ -352,6 +355,25 @@ function ToolTriggerRow({
       <ChevronRightIcon className="size-3 shrink-0 opacity-75 transition-transform group-data-[state=open]:rotate-90" />
     </CollapsibleTrigger>
   );
+}
+
+function toolBodyClassName(kind: ToolTitleBodyKind): string | undefined {
+  switch (kind) {
+    case "command":
+      return "inline-block max-w-full truncate rounded-[4px] bg-foreground/[0.065] px-1 py-px align-bottom font-mono text-[0.88em] leading-[1.35] text-foreground/85 dark:bg-foreground/[0.1]";
+    case "path":
+      return "font-mono text-[0.92em] font-normal text-[#BC2F72] dark:text-[#F58ABD]";
+    case "identifier":
+      return "font-mono text-[0.92em] text-foreground/75";
+    case "metric":
+      return "font-mono text-[0.92em] tabular-nums text-foreground/75";
+    case "query":
+      return "text-foreground/75";
+    case "url":
+      return "font-mono text-[0.9em] text-foreground/70";
+    case "plain":
+      return undefined;
+  }
 }
 
 /**
