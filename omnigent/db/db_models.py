@@ -1131,13 +1131,15 @@ class SqlPolicy(OmnigentBase):
     # omnigent.db.enum_codecs POLICY_TYPE: python=1, url=2).
     type: Mapped[int] = mapped_column(SmallInteger)
     # Dotted import path (type="python") or HTTPS URL
-    # (type="url") for the policy handler.
-    handler: Mapped[str] = mapped_column(Text)
+    # (type="url") for the policy handler. Opaque; never SQL-filtered
+    # — stored compressed (CompressedText).
+    handler: Mapped[str] = mapped_column(CompressedText)
     # JSON-encoded dict of factory kwargs for type="python" when
     # the handler is a factory function. NULL when the handler is
     # a direct callable or for type="url". See the design doc's
-    # FunctionRef.arguments pattern.
-    factory_params: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # FunctionRef.arguments pattern. Opaque; never SQL-filtered
+    # — stored compressed (CompressedText).
+    factory_params: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     enabled: Mapped[bool] = mapped_column(Boolean, server_default=true())
     # "default" for server-wide policies; "session" for per-conversation
     # copies. Mirrors the agents.kind pattern so queries filter by column
@@ -1241,7 +1243,8 @@ class SqlHost(OmnigentBase):
     token_expires_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
     sandbox_provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
     sandbox_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
-    configured_harnesses: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Opaque; never SQL-filtered — stored compressed (CompressedText).
+    configured_harnesses: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
 
     __table_args__ = (
         CheckConstraint(
