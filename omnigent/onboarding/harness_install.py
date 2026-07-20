@@ -433,26 +433,27 @@ def install_harness_cli(key: str) -> bool:
         subprocess.run(cmd, check=False, timeout=300)
     except (OSError, subprocess.TimeoutExpired):
         return False
+    # harness_install_command would have raised for a spec-less key, so spec is
+    # non-None past this point.
+    assert spec is not None
     # This is the setup flow's own process: check bare ``PATH`` (not the
     # resolve_cli_binary ladder), because the point of the ~/.local/bin refresh
     # below is to make the binary reachable via ``PATH`` for this process — the
     # subsequent harness_login/harness_cli_logged_in shell out with the bare
     # binary name and rely on the inherited ``PATH``.
-    if spec is not None and shutil.which(spec.binary) is not None:
+    if shutil.which(spec.binary) is not None:
         return True
 
     # uv-based vendor installers commonly place entry points here and update
     # shell startup files, which cannot change this already-running process.
-    if spec is not None:
-        user_bin = Path.home() / ".local" / "bin"
-        candidate = user_bin / spec.binary
-        if candidate.is_file() and os.access(candidate, os.X_OK):
-            current_path = os.environ.get("PATH", "")
-            path_entries = current_path.split(os.pathsep) if current_path else []
-            if str(user_bin) not in path_entries:
-                os.environ["PATH"] = os.pathsep.join([str(user_bin), *path_entries])
-        return shutil.which(spec.binary) is not None
-    return False
+    user_bin = Path.home() / ".local" / "bin"
+    candidate = user_bin / spec.binary
+    if candidate.is_file() and os.access(candidate, os.X_OK):
+        current_path = os.environ.get("PATH", "")
+        path_entries = current_path.split(os.pathsep) if current_path else []
+        if str(user_bin) not in path_entries:
+            os.environ["PATH"] = os.pathsep.join([str(user_bin), *path_entries])
+    return shutil.which(spec.binary) is not None
 
 
 def harness_cli_logged_in(key: str) -> bool:
