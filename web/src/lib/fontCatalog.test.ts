@@ -3,8 +3,10 @@ import {
   FONT_CATALOG,
   FONT_CATALOG_BY_CATEGORY,
   type FontCategory,
+  fontLoadKey,
   getFontByFamily,
   getFontById,
+  getFontsByFamily,
 } from "./fontCatalog";
 
 const CATEGORIES: FontCategory[] = ["sans", "fixedWidth", "code"];
@@ -102,11 +104,66 @@ describe("fontCatalog — lookups", () => {
     expect(getFontByFamily("Comic Sans MS")).toBeUndefined();
   });
 
-  it("resolves a family shared across categories to a single entry", () => {
-    // IBM Plex Mono is offered in both fixedWidth and code; family lookup must
-    // still resolve deterministically (first catalog occurrence wins).
+  it("resolves a family shared across categories deterministically", () => {
+    // IBM Plex Mono is offered in both fixedWidth and code; the single-arg
+    // lookup resolves to the FIRST catalog occurrence (backward-compatible).
     const entry = getFontByFamily("IBM Plex Mono");
     expect(entry).toBeDefined();
     expect(entry?.family).toBe("IBM Plex Mono");
+    expect(entry?.category).toBe("fixedWidth");
+  });
+
+  it("returns every entry for a shared family via getFontsByFamily", () => {
+    const matches = getFontsByFamily("IBM Plex Mono");
+    expect(matches.length).toBe(2);
+    expect(new Set(matches.map((e) => e.category))).toEqual(new Set(["fixedWidth", "code"]));
+    // Distinct ids, so PR 2 can address each independently.
+    expect(new Set(matches.map((e) => e.id)).size).toBe(2);
+    expect(getFontsByFamily("Comic Sans MS")).toEqual([]);
+    expect(getFontsByFamily("")).toEqual([]);
+  });
+
+  it("resolves a shared family to the requested category", () => {
+    // The whole point of the category arg: the code control must get the code
+    // entry, the mono control the fixedWidth one — not always the first match.
+    expect(getFontByFamily("IBM Plex Mono", "code")?.category).toBe("code");
+    expect(getFontByFamily("IBM Plex Mono", "code")?.id).toBe("ibm-plex-mono-code");
+    expect(getFontByFamily("IBM Plex Mono", "fixedWidth")?.category).toBe("fixedWidth");
+    expect(getFontByFamily("IBM Plex Mono", "fixedWidth")?.id).toBe("ibm-plex-mono");
+  });
+
+  it("falls back to the first match when the family isn't in the asked category", () => {
+    // Fira Code is code-only; asking for it as sans still resolves (delivery
+    // metadata is identical across a family's entries, so it still loads).
+    const entry = getFontByFamily("Fira Code", "sans");
+    expect(entry?.id).toBe("fira-code");
+  });
+});
+
+describe("fontCatalog — fontLoadKey (resource identity)", () => {
+  it("keys google-css2 entries by their stylesheet URL", () => {
+    const inter = getFontById("inter");
+    expect(fontLoadKey(inter!)).toBe(inter!.cssUrl);
+  });
+
+  it("gives the two IBM Plex Mono entries the SAME load key", () => {
+    // Different ids, identical Google CSS2 URL → identical resource → one key,
+    // so the loader dedupes them (see webFontLoader dedup test).
+    const fixed = getFontById("ibm-plex-mono")!;
+    const code = getFontById("ibm-plex-mono-code")!;
+    expect(fixed.id).not.toBe(code.id);
+    expect(fontLoadKey(fixed)).toBe(fontLoadKey(code));
+  });
+
+  it("keys self-hosted entries by their face URLs", () => {
+    const nerd = getFontById("jetbrainsmono-nerd-font-mono")!;
+    expect(fontLoadKey(nerd)).toContain(nerd.faces![0].url);
+  });
+
+  it("gives distinct resources distinct keys", () => {
+    const keys = FONT_CATALOG.filter((e) => e.source !== "bundled").map(fontLoadKey);
+    // The only intentional collision is the shared IBM Plex Mono URL.
+    const dupes = keys.filter((k, i) => keys.indexOf(k) !== i);
+    expect(new Set(dupes).size).toBe(1);
   });
 });
