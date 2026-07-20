@@ -505,8 +505,14 @@ class TestSqlConversationItem:
             assert loaded.status == encode_item_status("completed")
             assert loaded.created_by is None
 
-    def test_unique_position_per_conversation(self, db_uri: str) -> None:
-        """Two items in the same conversation cannot share the same position."""
+    def test_position_not_unique_at_db_level(self, db_uri: str) -> None:
+        """Two items in one conversation may share a position at the DB level.
+
+        The position index is plain (non-unique); strict position uniqueness is
+        owned by the ``next_position`` allocator under ``_lock_conversation``, not
+        the index (see the store's concurrent-append test). Distinct ``id`` keeps
+        the PK unique, so both rows persist.
+        """
         engine = get_or_create_engine(db_uri)
         managed = make_managed_session_maker(engine)
 
@@ -514,11 +520,15 @@ class TestSqlConversationItem:
         item1 = _make_item(id="9980c8a9248139f14f4165e5d53088aa", position=0)
         item2 = _make_item(id="0fd4e86b2daa009cd9929641dbd7dab6", position=0)
 
-        with pytest.raises(IntegrityError):
-            with managed() as session:
-                session.add(conv)
-                session.add(item1)
-                session.add(item2)
+        # No IntegrityError: the DB does not enforce position uniqueness anymore.
+        with managed() as session:
+            session.add(conv)
+            session.add(item1)
+            session.add(item2)
+
+        with managed() as session:
+            count = session.query(SqlConversationItem).filter_by(conversation_id=conv.id).count()
+        assert count == 2, f"both position-0 items should persist; found {count}"
 
     def test_delete_conversation_via_orm_leaves_items_without_fk(self, db_uri: str) -> None:
         """Without DB-level FK cascade, deleting a conversation leaves its items intact.

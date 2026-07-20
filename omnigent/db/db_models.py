@@ -902,17 +902,17 @@ class SqlConversationItem(ConversationBase):
     created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
     __table_args__ = (
-        # created_at trails for partition-readiness (unique indexes must
-        # contain the partition key). Position uniqueness is per-second at
-        # the DB level; the next_position counter under _lock_conversation
-        # is the real allocator and never reuses a position.
+        # Backs the per-conversation position-ordered scan (the dominant read).
+        # Non-unique on purpose: the real position allocator is the next_position
+        # counter advanced under _lock_conversation, which never reuses a
+        # position; the DB is not relied on to enforce it (nothing catches a
+        # collision). Being non-unique also means it needs no partition key, so
+        # created_at is left out — the PK still carries it for partition-readiness.
         Index(
             "ix_conversation_items_conversation_id_position",
             "workspace_id",
             "conversation_id",
             "position",
-            "created_at",
-            unique=True,
         ),
         # Fork-truncation looks up by workspace_id + conversation_id +
         # response_id; id trails to complete the PK.
