@@ -1431,6 +1431,154 @@ async def test_patch_session_updates_labels(
     assert labels["b"] == "2"
 
 
+async def test_auto_title_replaces_only_the_deterministic_seed(
+    client: httpx.AsyncClient,
+) -> None:
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    seeded = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "item_data": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "please investigate the authentication timeout in production",
+                        }
+                    ],
+                },
+            },
+        },
+    )
+    assert seeded.status_code == 202, seeded.text
+
+    renamed = await client.post(
+        f"/v1/sessions/{session['id']}/auto-title",
+        json={"title": "Debug authentication timeout"},
+    )
+    assert renamed.status_code == 200, renamed.text
+    assert renamed.json() == {
+        "renamed": True,
+        "title": "Debug authentication timeout",
+        "reason": None,
+    }
+
+    manual = await client.patch(
+        f"/v1/sessions/{session['id']}",
+        json={"title": "My manual title"},
+    )
+    assert manual.status_code == 200, manual.text
+    declined = await client.post(
+        f"/v1/sessions/{session['id']}/auto-title",
+        json={"title": "Overwrite manual title"},
+    )
+    assert declined.status_code == 200, declined.text
+    assert declined.json() == {
+        "renamed": False,
+        "title": None,
+        "reason": "title_changed",
+    }
+
+
+async def test_auto_title_does_not_replace_explicit_title(
+    client: httpx.AsyncClient,
+) -> None:
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"], title="Keep this title")
+    seeded = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "item_data": {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "investigate the authentication timeout"}
+                    ],
+                },
+            },
+        },
+    )
+    assert seeded.status_code == 202, seeded.text
+
+    response = await client.post(
+        f"/v1/sessions/{session['id']}/auto-title",
+        json={"title": "Debug authentication timeout"},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["renamed"] is False
+    assert response.json()["reason"] == "title_changed"
+
+
+async def test_auto_title_declines_when_no_seed_exists(
+    client: httpx.AsyncClient,
+) -> None:
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    response = await client.post(
+        f"/v1/sessions/{session['id']}/auto-title",
+        json={"title": "Debug authentication timeout"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "renamed": False,
+        "title": None,
+        "reason": "no_seed",
+    }
+
+
+async def test_auto_title_declines_child_sessions(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    agent = await create_test_agent(client)
+    parent = await _create_session(client, agent["id"])
+    store = SqlAlchemyConversationStore(db_uri)
+    child = store.create_conversation(
+        kind="sub_agent",
+        title="coder:debug-auth",
+        parent_conversation_id=parent["id"],
+        agent_id=agent["id"],
+    )
+
+    response = await client.post(
+        f"/v1/sessions/{child.id}/auto-title",
+        json={"title": "Debug authentication timeout"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "renamed": False,
+        "title": None,
+        "reason": "not_top_level",
+    }
+
+
+async def test_auto_title_rejects_multiline_titles(
+    client: httpx.AsyncClient,
+) -> None:
+    agent = await create_test_agent(client)
+    session = await _create_session(
+        client,
+        agent["id"],
+        initial_message="investigate the authentication timeout",
+    )
+
+    response = await client.post(
+        f"/v1/sessions/{session['id']}/auto-title",
+        json={"title": "Debug authentication\ntimeout"},
+    )
+
+    assert response.status_code == 400, response.text
+
+
 async def test_patch_session_archive_hides_from_default_list(
     client: httpx.AsyncClient,
 ) -> None:
@@ -2054,6 +2202,53 @@ async def test_list_sessions_exposes_pending_elicitations_count(
     assert row["pending_elicitations_count"] == 0
 
     pending_elicitations.reset_for_tests()
+
+
+async def test_list_sessions_pending_count_falls_back_to_row_for_bound_session(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A runner-bound session surfaces its persisted pending count when the
+    local in-memory index is empty (the cross-replica fallback).
+
+    The tunnel-holding replica writes ``pending_elicitation_count`` to the
+    row; a replica that does NOT hold the tunnel has an empty
+    ``pending_elicitations`` index for that session and must fall back to
+    the row so a parked approval isn't hidden. ``_build_session_list_item``
+    only consults the row when the session is runner-bound — this pins that
+    fallback fires for a bound session, complementing
+    ``test_list_sessions_exposes_pending_elicitations_count`` (which covers
+    the index-authoritative, unbound path).
+
+    :param client: Test HTTP client backed by the real app.
+    :param db_uri: The app's DB, opened directly to seed the row the way a
+        different replica's live-state write would have.
+    """
+    from omnigent.runtime import pending_elicitations
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore,
+    )
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    session_id = session["id"]
+
+    # Bind a runner and seed the persisted count directly — simulating the
+    # tunnel-holding replica's row write. THIS replica's index stays empty
+    # (no record_publish here), so a correct read falls back to the row.
+    pending_elicitations.reset_for_tests()
+    store = SqlAlchemyConversationStore(db_uri)
+    assert store.set_runner_id(session_id, "runner_other_replica")
+    store.set_pending_elicitation_count(session_id, 2)
+
+    resp = await client.get("/v1/sessions")
+    assert resp.status_code == 200
+    row = next((r for r in resp.json()["data"] if r["id"] == session_id), None)
+    assert row is not None
+    # Index empty + row=2 + runner-bound → fallback surfaces the row's count.
+    assert row["pending_elicitations_count"] == 2
+
+    store.set_pending_elicitation_count(session_id, 0)
 
 
 async def test_get_session_includes_runner_online(
@@ -3309,6 +3504,48 @@ async def test_post_external_output_text_delta_rejects_malformed_delta(
     assert resp.status_code == 400, resp.text
     assert "external_output_text_delta requires string data.delta" in resp.text
     assert published == []
+
+
+async def test_post_external_tool_output_delta_publishes_transient_delta(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Command output deltas publish without changing session history."""
+    published: list[tuple[str, dict[str, Any]]] = []
+
+    def capture_publish(session_id: str, event: dict[str, Any]) -> None:
+        published.append((session_id, event))
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        capture_publish,
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_tool_output_delta",
+            "data": {"call_id": "call_123", "delta": "collecting..."},
+        },
+    )
+    assert resp.status_code == 202, resp.text
+    assert resp.json() == {"queued": False}
+    assert published == [
+        (
+            session["id"],
+            {
+                "type": "response.function_call_output.delta",
+                "call_id": "call_123",
+                "delta": "collecting...",
+            },
+        )
+    ]
+
+    snap = await client.get(f"/v1/sessions/{session['id']}")
+    assert snap.status_code == 200, snap.text
+    assert snap.json()["items"] == []
 
 
 async def test_post_external_output_reasoning_delta_started_publishes_started_then_delta(

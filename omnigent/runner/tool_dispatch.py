@@ -72,6 +72,7 @@ from omnigent.tools.builtins.os_env import (
     SysOsShellTool,
     SysOsWriteTool,
 )
+from omnigent.tools.builtins.session_rename import SysSessionRenameTool
 from omnigent.tools.builtins.spawn import (
     # Shared contract values with the in-process sys_session_* tools. Imported
     # (not duplicated) so the runner's REST-backed peek clamps to the same
@@ -232,6 +233,8 @@ _SESSION_QUERY_TOOLS = frozenset(
     }
 )
 
+_SESSION_SELF_WRITE_TOOLS = frozenset({SysSessionRenameTool.name()})
+
 # Grantee sentinel for an anonymous, public read-only share. Mirrors the
 # server's RESERVED_USER_PUBLIC; only specs with
 # ``agent_session_sharing: public`` may grant it (enforced in
@@ -366,6 +369,7 @@ _BROWSER_TIMEOUT_ERROR = (
 _NATIVE_RELAY_BUILTIN_TOOLS = (
     _COMMENT_TOOLS
     | _SESSION_QUERY_TOOLS
+    | _SESSION_SELF_WRITE_TOOLS
     | _ASYNC_INBOX_TOOLS
     | _SUBAGENT_TOOLS
     | _LIST_MODELS_TOOLS
@@ -455,6 +459,7 @@ def build_native_relay_tool_schemas(spec: Any | None) -> list[dict[str, Any]]:
             SysSessionListTool,
             SysSessionGetHistoryTool,
             SysSessionGetInfoTool,
+            SysSessionRenameTool,
             SysAgentGetTool,
             SysAgentListTool,
             SysAgentDownloadTool,
@@ -513,6 +518,7 @@ _ALL_LOCAL_TOOLS = (
     | _ADVISE_MODELS_TOOLS
     | _SESSION_CREATE_TOOLS
     | _SESSION_QUERY_TOOLS
+    | _SESSION_SELF_WRITE_TOOLS
     | _WEB_FETCH_TOOLS
     | _WEB_SEARCH_TOOLS
     | _HINDSIGHT_TOOLS
@@ -1593,12 +1599,16 @@ async def _execute_subagent_tool(
         ):
             return (
                 f"Error: sub-agent {sub_agent_name!r} title {session_name!r} "
-                "already has a launching or running turn; wait for completion before sending again"
+                "already has a launching or running turn. Use a distinct task-based title "
+                "for independent parallel work; reuse this title only to continue the same "
+                "conversation after completion."
             )
         if existing.get("busy") is True:
             return (
                 f"Error: sub-agent {sub_agent_name!r} title {session_name!r} "
-                "is already running; wait for completion before sending again"
+                "is already running. Use a distinct task-based title for independent "
+                "parallel work; reuse this title only to continue the same conversation "
+                "after completion."
             )
     else:
         child_harness = _subagent_harness(str(sub_agent_name), agent_spec)
@@ -3936,6 +3946,49 @@ async def _session_list_via_rest(
     return json.dumps({"sub_agents": sub_agents, "sessions": sessions})
 
 
+async def _rename_current_session_via_rest(
+    args: dict[str, Any],
+    conversation_id: str | None,
+    server_client: httpx.AsyncClient | None,
+) -> str:
+    """Conditionally rename the calling session through the server API.
+
+    Automatic naming is framework metadata, never a prerequisite for the
+    user's turn. Every failure therefore becomes a tool-result envelope so a
+    missing route, unavailable server, or malformed response cannot abort the
+    harness session.
+    """
+    if server_client is None:
+        return json.dumps({"error": "sys_session_rename requires server access"})
+    if conversation_id is None:
+        return json.dumps({"error": "sys_session_rename requires a session id"})
+    title = args.get("title")
+    if not isinstance(title, str):
+        return json.dumps({"error": "sys_session_rename requires a string 'title'"})
+    try:
+        response = await server_client.post(
+            f"/v1/sessions/{conversation_id}/auto-title",
+            json={"title": title},
+            timeout=30.0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"sys_session_rename failed: {exc}"})
+    if response.status_code >= 400:
+        return json.dumps(
+            {
+                "error": f"sys_session_rename returned {response.status_code}",
+                "detail": response.text[:200],
+            }
+        )
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        return json.dumps({"error": f"sys_session_rename returned invalid JSON: {exc}"})
+    if not isinstance(payload, dict):
+        return json.dumps({"error": "sys_session_rename returned a non-object response"})
+    return json.dumps(payload)
+
+
 async def _collect_sub_agents(
     conversation_id: str,
     server_client: httpx.AsyncClient,
@@ -4532,6 +4585,12 @@ async def execute_tool(
                 publish_event=publish_event,
                 agent_spec=agent_spec,
                 runner_workspace=runner_workspace,
+            )
+        elif tool_name in _SESSION_SELF_WRITE_TOOLS:
+            output = await _rename_current_session_via_rest(
+                args,
+                conversation_id,
+                server_client,
             )
         elif tool_name in _SESSION_QUERY_TOOLS:
             output = await _execute_session_query_tool(

@@ -1,9 +1,9 @@
 """Harness readiness checks used by the host daemon.
 
-The daemon reports a per-harness readiness map in its hello frame (so the
-web agent picker can warn) and re-checks the session's harness before
-spawning a runner (so an unconfigured launch fails with a clear,
-actionable error instead of dying inside the executor).
+The daemon reports a per-harness readiness map in its hello frame, refreshes
+it while connected (so the web agent picker can warn accurately), and
+re-checks the session's harness before spawning a runner (so an unconfigured
+launch fails clearly instead of dying inside the executor).
 
 "Configured" here is deliberately narrow: the **only** thing the daemon
 can reliably determine locally is whether a harness's wrapped CLI binary
@@ -25,11 +25,15 @@ that would actually work.
 from __future__ import annotations
 
 import os
-import shutil
 from collections.abc import Callable
 
 import omnigent.onboarding.gemini_auth as _gemini_auth
+from omnigent._platform import resolve_cli_binary
 from omnigent.harness_aliases import HARNESS_ALIASES, canonicalize_harness
+from omnigent.harness_availability import (
+    CODEX_CANONICAL_HARNESSES,
+    HarnessAvailability,
+)
 from omnigent.harness_plugins import harness_install_keys, valid_harnesses
 from omnigent.onboarding.harness_install import (
     COPILOT_KEY,
@@ -51,8 +55,6 @@ from omnigent.onboarding.provider_config import (
     OPENAI_FAMILY,
     PI_SURFACE,
 )
-
-HarnessAvailability = bool | str
 
 # In-process SDK harnesses: no CLI binary, credentials resolved at runtime
 # from ambient/spec sources the daemon can't see. Never gated. Includes both
@@ -269,7 +271,7 @@ def harness_is_configured(harness: str) -> bool:
     ):
         required_cli = required_cli_for_harness(canonical) or required_cli_for_harness(harness)
         if required_cli is not None:
-            return shutil.which(required_cli.binary) is not None
+            return resolve_cli_binary(required_cli.binary) is not None
         # Unknown harness — the daemon has no install metadata for it, so
         # it can't assess readiness. Fail open (custom/newer harnesses,
         # version skew).
@@ -289,14 +291,18 @@ def harness_is_configured(harness: str) -> bool:
 
 def _harness_availability(canonical: str) -> HarnessAvailability:
     """Return picker-facing availability for one canonical harness spelling."""
-    if (
-        canonical in {"codex", "codex-native", "native-codex"}
-        and _HARNESS_FAMILY.get(canonical) == OPENAI_FAMILY
-    ):
+    if _is_codex_family_harness(canonical):
         from omnigent.codex_native import _codex_auth_unavailable_reason
 
         return _codex_auth_unavailable_reason() or True
     return harness_is_configured(canonical)
+
+
+def _is_codex_family_harness(canonical: str) -> bool:
+    """Return whether a canonical harness uses Codex readiness semantics."""
+    return (
+        canonical in CODEX_CANONICAL_HARNESSES and _HARNESS_FAMILY.get(canonical) == OPENAI_FAMILY
+    )
 
 
 def configured_harness_map() -> dict[str, HarnessAvailability]:
@@ -331,6 +337,12 @@ def configured_harness_map() -> dict[str, HarnessAvailability]:
     spellings.add(GOOSE_KEY)  # headless Goose (``goose acp``) gates on the goose binary
     spellings.add(HERMES_KEY)  # Hermes Agent wraps the ``hermes`` CLI
     spellings.add(COPILOT_KEY)
-    return {
-        spelling: _harness_availability(_canonical_harness(spelling)) for spelling in spellings
-    }
+    availability_cache: dict[tuple[str, ...], HarnessAvailability] = {}
+    result: dict[str, HarnessAvailability] = {}
+    for spelling in spellings:
+        canonical = _canonical_harness(spelling)
+        cache_key = ("codex",) if _is_codex_family_harness(canonical) else ("harness", canonical)
+        if cache_key not in availability_cache:
+            availability_cache[cache_key] = _harness_availability(canonical)
+        result[spelling] = availability_cache[cache_key]
+    return result

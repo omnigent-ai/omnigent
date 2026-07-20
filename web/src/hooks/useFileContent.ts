@@ -7,8 +7,8 @@
 
 import { useEffect, useRef } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { authenticatedFetch } from "@/lib/identity";
+import { useWorkspaceServeable } from "@/hooks/useWorkspaceChangedFiles";
 import { useChatStore } from "@/store/chatStore";
 
 // The primary workspace environment is always "default".  This hook targets
@@ -120,7 +120,10 @@ export function useFileContent(conversationId: string | undefined, path: string 
     !!conversationId &&
     conversationId === focusedId &&
     (sessionStatus === "running" || sessionStatus === "waiting");
-  const runnerOnline = useSessionRunnerOnline(conversationId);
+  // Serveable when the runner is online OR (runner offline but) the host can
+  // read the workspace from disk — keeps the viewer live while the agent is
+  // asleep. `false` only when neither source can answer.
+  const serveable = useWorkspaceServeable(conversationId);
   const queryClient = useQueryClient();
 
   const prevRef = useRef<{ id: string | undefined; active: boolean }>({
@@ -141,7 +144,7 @@ export function useFileContent(conversationId: string | undefined, path: string 
   return useQuery({
     queryKey: ["file-content", conversationId, path],
     queryFn: () => fetchFileContent(conversationId!, path!),
-    enabled: !!conversationId && !!path && runnerOnline !== false,
+    enabled: !!conversationId && !!path && serveable !== false,
     staleTime: 5_000,
   });
 }

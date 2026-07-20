@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 
 from omnigent.claude_native_bridge import read_transcript_items_from_offset
-from omnigent.codex_native import _find_codex_rollout
+from omnigent.codex_native import _CODEX_THREAD_ID_RE, _find_codex_rollout
 from omnigent.entities import NewConversationItem, parse_item_data
 from omnigent.session_import.models import (
     ImportSource,
@@ -24,6 +24,63 @@ def _find_transcript(root: Path, session_id: str) -> Path | None:
         if path.stem == session_id and "subagents" not in path.parts and path.is_file()
     ]
     return max(matches, key=lambda path: path.stat().st_mtime) if matches else None
+
+
+def _recent_unique_session_ids(
+    candidates: list[tuple[Path, str]],
+    *,
+    limit: int,
+) -> tuple[str, ...]:
+    """Return unique session ids ordered from newest transcript to oldest."""
+    newest_by_id: dict[str, float] = {}
+    for path, session_id in candidates:
+        try:
+            modified_at = path.stat().st_mtime
+        except OSError:
+            continue
+        newest_by_id[session_id] = max(newest_by_id.get(session_id, 0), modified_at)
+    ordered = sorted(
+        newest_by_id,
+        key=lambda session_id: (newest_by_id[session_id], session_id),
+        reverse=True,
+    )
+    return tuple(ordered[:limit])
+
+
+def list_recent_local_session_ids(
+    source: ImportSource,
+    *,
+    limit: int,
+) -> tuple[str, ...]:
+    """List recent parent session ids for one local harness."""
+    if source == "claude":
+        configured_home = os.environ.get("CLAUDE_CONFIG_DIR")
+        home = Path(configured_home).expanduser() if configured_home else Path.home() / ".claude"
+        root = home / "projects"
+        candidates = [
+            (path, path.stem)
+            for path in root.rglob("*.jsonl")
+            if "subagents" not in path.parts and path.is_file()
+        ]
+        return _recent_unique_session_ids(candidates, limit=limit)
+
+    configured_home = os.environ.get("CODEX_HOME")
+    home = Path(configured_home).expanduser() if configured_home else Path.home() / ".codex"
+    rollouts: list[Path] = []
+    sessions = home / "sessions"
+    archived_sessions = home / "archived_sessions"
+    if sessions.is_dir():
+        rollouts.extend(path for path in sessions.glob("**/rollout-*.jsonl") if path.is_file())
+    if archived_sessions.is_dir():
+        rollouts.extend(
+            path for path in archived_sessions.glob("rollout-*.jsonl") if path.is_file()
+        )
+    candidates = []
+    for path in rollouts:
+        session_id = path.stem[-36:]
+        if _CODEX_THREAD_ID_RE.fullmatch(session_id):
+            candidates.append((path, session_id))
+    return _recent_unique_session_ids(candidates, limit=limit)
 
 
 def _claude_workspace(transcript_path: Path) -> str | None:
@@ -259,6 +316,7 @@ def load_local_session(source: ImportSource, session_id: str) -> LocalSessionImp
 
 
 __all__ = [
+    "list_recent_local_session_ids",
     "load_claude_session",
     "load_codex_session",
     "load_local_session",

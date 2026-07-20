@@ -165,6 +165,64 @@
         "title": "AgentObject",
         "type": "object"
       },
+      "AutomaticSessionRenameRequest": {
+        "additionalProperties": false,
+        "description": "Request body for the current-agent automatic rename endpoint.",
+        "properties": {
+          "title": {
+            "maxLength": 60,
+            "minLength": 2,
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "title"
+        ],
+        "title": "AutomaticSessionRenameRequest",
+        "type": "object"
+      },
+      "AutomaticSessionRenameResponse": {
+        "description": "Result of a conditional automatic session rename.",
+        "properties": {
+          "reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "not_top_level",
+                  "no_seed",
+                  "title_changed"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "renamed": {
+            "title": "Renamed",
+            "type": "boolean"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          }
+        },
+        "required": [
+          "renamed"
+        ],
+        "title": "AutomaticSessionRenameResponse",
+        "type": "object"
+      },
       "Body_update_session_agent_v1_sessions__session_id__agent_put": {
         "properties": {
           "bundle": {
@@ -3106,6 +3164,7 @@
             "response.elicitation_resolved": "#/components/schemas/ElicitationResolvedEvent",
             "response.error": "#/components/schemas/ErrorEvent",
             "response.failed": "#/components/schemas/FailedEvent",
+            "response.function_call_output.delta": "#/components/schemas/ToolOutputDeltaEvent",
             "response.heartbeat": "#/components/schemas/HeartbeatEvent",
             "response.in_progress": "#/components/schemas/InProgressEvent",
             "response.incomplete": "#/components/schemas/IncompleteEvent",
@@ -3217,6 +3276,9 @@
           },
           {
             "$ref": "#/components/schemas/OutputTextDeltaEvent"
+          },
+          {
+            "$ref": "#/components/schemas/ToolOutputDeltaEvent"
           },
           {
             "$ref": "#/components/schemas/ReasoningStartedEvent"
@@ -5662,6 +5724,46 @@
           "kind"
         ],
         "title": "TerminalCommandData",
+        "type": "object"
+      },
+      "ToolOutputDeltaEvent": {
+        "description": "Incremental output from an in-progress function call.",
+        "properties": {
+          "call_id": {
+            "description": "Function-call correlation id.",
+            "title": "Call Id",
+            "type": "string"
+          },
+          "delta": {
+            "description": "Command stdout/stderr fragment.",
+            "title": "Delta",
+            "type": "string"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "type": {
+            "const": "response.function_call_output.delta",
+            "description": "Always `\"response.function_call_output.delta\"`.",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "call_id",
+          "delta"
+        ],
+        "title": "ToolOutputDeltaEvent",
         "type": "object"
       },
       "TurnCancelledEvent": {
@@ -8191,6 +8293,59 @@
         "summary": "Update Mcp Server",
         "tags": [
           "session_mcp_servers"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/auto-title": {
+      "post": {
+        "description": "Replace the deterministic first-message title when still current.",
+        "operationId": "automatically_rename_session_v1_sessions__session_id__auto_title_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AutomaticSessionRenameRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AutomaticSessionRenameResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Automatically Rename Session",
+        "tags": [
+          "sessions"
         ]
       }
     },

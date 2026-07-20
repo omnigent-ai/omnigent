@@ -37,7 +37,6 @@ from omnigent.stores.conversation_store import ConversationStore
 # ``foo``) rather than generic. Tunable later if needed; pinned
 # here so it surfaces in grep across the engine + prompt layers.
 # See designs/LIVE_POLICIES.md §4.1.
-_TRAJECTORY_WINDOW = 10
 
 
 class PolicyEngine:
@@ -341,11 +340,6 @@ class PolicyEngine:
         composed_data: Any = None
         context = self._context()
 
-        # Populate trajectory and session_state once per evaluate so
-        # PromptPolicy classifiers see situational context and function
-        # policies can read accumulated state. Both queries are bounded
-        # to avoid scanning large conversations. See §4.1.
-        ctx = self._populate_trajectory(ctx)
         ctx = self._inject_session_state(ctx)
         ctx = self._inject_usage(ctx)
         ctx = self._inject_subtree_usage(ctx)
@@ -901,35 +895,6 @@ class PolicyEngine:
             "conversation_id": self._conversation_id,
             "session_state": dict(self._session_state),
         }
-
-    def _populate_trajectory(self, ctx: EvaluationContext) -> EvaluationContext:
-        """
-        Return a copy of ``ctx`` with ``trajectory`` populated.
-
-        Queries the conversation store for the last
-        ``_TRAJECTORY_WINDOW`` items in chronological order. If
-        the conversation has fewer than the window size, returns
-        whatever exists (down to an empty list for brand-new
-        conversations). The store lookup is order=``"desc"`` +
-        slice + reverse so the engine asks for the *tail* without
-        first scanning the entire conversation.
-
-        :param ctx: Original :class:`EvaluationContext` from the
-            caller. ``ctx.trajectory`` is overwritten.
-        :returns: A new :class:`EvaluationContext` with
-            ``trajectory`` set to the recent items list (oldest
-            first).
-        """
-        page = self._store.list_items(
-            self._conversation_id,
-            limit=_TRAJECTORY_WINDOW,
-            order="desc",
-        )
-        # ``order="desc"`` returns most-recent first; reverse so the
-        # classifier sees items chronologically (oldest first), which
-        # matches how a human reads a conversation top-down.
-        trajectory = list(reversed(page.data))
-        return replace(ctx, trajectory=trajectory)
 
 
 def _apply_one(state: dict[str, Any], op: StateUpdate) -> None:

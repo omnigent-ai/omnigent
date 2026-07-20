@@ -1495,12 +1495,14 @@ class TwoAgentChatSession:
         carries, e.g. ``"vogon-3a7f9c2e1b"``.
     :param question_code: Per-run nonce only Deep Thought's QUESTION reply
         carries (round 2), e.g. ``"babelfish-9c2e1b3a7f"``.
+    :param routing_token: Per-run token that selects Arthur's mock queue.
     """
 
     base_url: str
     session_id: str
     verification_code: str
     question_code: str
+    routing_token: str
 
 
 def _two_agent_chat_yaml(verification_code: str, question_code: str) -> str:
@@ -1583,15 +1585,18 @@ tools:
 @pytest.fixture
 def two_agent_chat_session(
     live_server: str,
+    mock_llm_server_url: str,
     tmp_path_factory: pytest.TempPathFactory,
 ) -> Iterator[TwoAgentChatSession]:
     """Create a runner-bound session for the two-agent Hitchhiker's chat.
 
     Same runner-respawn and bind contract as :func:`terminal_session`.
-    Yields the per-run nonces so the test can assert that the sub-agent's
-    replies (and only the sub-agent's) reached the UI.
+    Separate content-routed mock queues drive Arthur and Deep Thought,
+    including both dispatch, child, and auto-wake turns. The original
+    model ids remain in the spec for a future real-gateway job.
 
     :param live_server: Spawned server fixture.
+    :param mock_llm_server_url: Mock LLM server used by credential-free runs.
     :param tmp_path_factory: Pytest temp path factory (for a respawn log).
     :returns: A :class:`TwoAgentChatSession` handle.
     """
@@ -1600,7 +1605,66 @@ def two_agent_chat_session(
 
     verification_code = f"vogon-{uuid.uuid4().hex[:10]}"
     question_code = f"babelfish-{uuid.uuid4().hex[:10]}"
+    suffix = uuid.uuid4().hex[:10]
+    routing_token = f"hitchhiker-parent-{suffix}"
+    child_token = f"hitchhiker-child-{suffix}"
     yaml_text = _two_agent_chat_yaml(verification_code, question_code)
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_deep_thought_answer",
+                        "name": "sys_session_send",
+                        "arguments": json.dumps(
+                            {
+                                "agent": "deep_thought",
+                                "title": "deep_thought",
+                                "args": (
+                                    "What is the Answer to the Ultimate Question? "
+                                    f"Routing marker: {child_token}"
+                                ),
+                            }
+                        ),
+                    }
+                ]
+            },
+            {"text": "Dispatched Deep Thought; waiting for the answer."},
+            {"text": f"Deep Thought replied: 42. Verification code: {verification_code}."},
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_deep_thought_question",
+                        "name": "sys_session_send",
+                        "arguments": json.dumps(
+                            {
+                                "agent": "deep_thought",
+                                "title": "deep_thought",
+                                "args": (
+                                    "What is the Ultimate Question itself? "
+                                    f"Routing marker: {child_token}"
+                                ),
+                            }
+                        ),
+                    }
+                ]
+            },
+            {"text": "Dispatched the follow-up; waiting for the question."},
+            {"text": f"Deep Thought replied with question code {question_code}."},
+        ],
+        key=routing_token,
+        match=routing_token,
+    )
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {"text": f"The Answer is 42. Verification code: {verification_code}."},
+            {"text": f"The Ultimate Question is unknown. Question code: {question_code}."},
+        ],
+        key=child_token,
+        match=child_token,
+    )
     respawned_runner = _ensure_runner_online(live_server, tmp_path_factory)
     runner_id = str(_server_state["runner_id"])
 
@@ -1635,6 +1699,7 @@ def two_agent_chat_session(
             session_id=session_id,
             verification_code=verification_code,
             question_code=question_code,
+            routing_token=routing_token,
         )
     finally:
         httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
@@ -2259,7 +2324,7 @@ def _temp_omnigent_mock_config(
     file (or removes it) on exit.
 
     :param mock_llm_server_url: Base URL of the mock LLM server, e.g.
-        ``"http://127.0.0.1:51235"``. No /v1 suffix — each SDK appends it.
+        ``"http://127.0.0.1:51235"``.
     :param harness: ``"claude"`` or ``"codex"``.
     """
     config_dir = Path.home() / ".omnigent"
@@ -2286,7 +2351,7 @@ def _temp_omnigent_mock_config(
                 kind: key
                 default: [openai]
                 openai:
-                  base_url: "{mock_llm_server_url}"
+                  base_url: "{mock_llm_server_url}/v1"
                   api_key: "mock-key"
                   wire_api: responses
                   models:

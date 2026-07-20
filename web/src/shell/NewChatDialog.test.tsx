@@ -459,6 +459,16 @@ describe("harnessUnconfiguredOnHost", () => {
     );
   });
 
+  it("shows native Cursor's install and login steps before launch", () => {
+    const testHost = hostWith({ "cursor-native": false });
+    const reason = harnessUnavailableReasonOnHost("cursor-native", testHost);
+    expect(reason).toBe("cursor-cli-missing");
+    expect(harnessWarningBadgeText(reason)).toBe("install & login");
+    expect(harnessWarningMessageText("Cursor", "laptop", reason)).toBe(
+      "Cursor needs cursor-agent on laptop — install it with `curl https://cursor.com/install -fsS | bash`, then run `cursor-agent login`.",
+    );
+  });
+
   it("surfaces structured codex unavailable reasons", () => {
     const testHost = hostWith({ codex: "needs-auth", "codex-native": "binary-missing" });
     expect(harnessUnconfiguredOnHost("codex", testHost)).toBe(true);
@@ -470,7 +480,7 @@ describe("harnessUnconfiguredOnHost", () => {
     );
     expect(harnessWarningBadgeText("binary-missing")).toBe("binary missing");
     expect(harnessWarningMessageText("Codex", "laptop", "binary-missing")).toBe(
-      "Codex is missing the Codex binary on laptop — run omnigent setup on that machine.",
+      "Codex can't find the Codex binary on laptop — if codex is installed, restart the host with omnigent host so it picks up your PATH, or set OMNIGENT_CODEX_PATH. Otherwise run omnigent setup.",
     );
   });
 
@@ -2300,5 +2310,99 @@ describe("NewChatLandingScreen agent picker (mobile)", () => {
     openPicker();
     expect(screen.getByTestId("new-chat-landing-agent-a1")).toBeTruthy();
     expect(screen.queryByTestId("new-chat-landing-agent-config-page")).toBeNull();
+  });
+});
+
+describe("NewChatLandingScreen custom-agent sandbox gating", () => {
+  beforeEach(setupLandingMocks);
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+  });
+
+  // Select the managed sandbox as the target. The default mocks give one
+  // online host (auto-selected), so we open the host chip and pick the
+  // sandbox option pinned at the top.
+  async function selectSandbox(): Promise<void> {
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("Sandbox"),
+    );
+  }
+
+  it("hides 'Create custom agent' on a sandbox", async () => {
+    renderLanding({ managed_sandboxes_enabled: true });
+    await selectSandbox();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    // The item is omitted entirely on a sandbox target.
+    expect(screen.queryByTestId("new-chat-landing-create-agent")).toBeNull();
+  });
+
+  it("shows 'Create custom agent' on a host and opens the dialog", async () => {
+    renderLanding({ managed_sandboxes_enabled: true });
+    // The managed default is the sandbox even with a host present, so switch
+    // to the connected host (machine-1) first.
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("Sandbox"),
+    );
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    const hostItem = screen
+      .getAllByText("machine-1")
+      .find((el) => el.closest('[role="menuitem"]') !== null);
+    expect(hostItem).toBeTruthy();
+    fireEvent.click(hostItem!);
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("machine-1"),
+    );
+    // On a host, the create item is present and opens the dialog.
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    const createItem = screen.getByTestId("new-chat-landing-create-agent");
+    fireEvent.click(createItem);
+    await waitFor(() => expect(screen.getByTestId("create-agent-dialog")).toBeTruthy());
+  });
+
+  // Switch the target to the connected host, then create + submit a pending
+  // custom agent from the dialog so it becomes the selected agent.
+  async function createAndSelectPendingAgentOnHost(): Promise<void> {
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("Sandbox"),
+    );
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    const hostItem = screen
+      .getAllByText("machine-1")
+      .find((el) => el.closest('[role="menuitem"]') !== null);
+    fireEvent.click(hostItem!);
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("machine-1"),
+    );
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-create-agent"));
+    await waitFor(() => expect(screen.getByTestId("create-agent-dialog")).toBeTruthy());
+    fireEvent.change(screen.getByTestId("create-agent-name"), { target: { value: "my-agent" } });
+    fireEvent.change(screen.getByTestId("create-agent-model"), {
+      target: { value: "claude-sonnet-4-20250514" },
+    });
+    fireEvent.click(screen.getByTestId("create-agent-submit"));
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain("my-agent"),
+    );
+  }
+
+  it("drops a selected pending custom agent when the target switches to a sandbox", async () => {
+    renderLanding({ managed_sandboxes_enabled: true });
+    await createAndSelectPendingAgentOnHost();
+    // Switch back to the sandbox: the pending pick can't run there, so the
+    // selection falls back to a real agent and the pending row disappears.
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("Sandbox"),
+    );
+    expect(screen.getByTestId("new-chat-landing-agent-select").textContent).not.toContain(
+      "my-agent",
+    );
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    expect(screen.queryByTestId("new-chat-landing-agent-pending")).toBeNull();
   });
 });

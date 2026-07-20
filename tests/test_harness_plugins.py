@@ -182,13 +182,13 @@ def test_community_harness_readiness_uses_install_metadata(
 
     from omnigent.onboarding import harness_readiness as readiness
 
-    monkeypatch.setattr(readiness.shutil, "which", lambda _binary: None)
+    monkeypatch.setattr(readiness, "resolve_cli_binary", lambda _binary: None)
     assert readiness.harness_is_configured("foo") is False
     configured = readiness.configured_harness_map()
     assert configured["foo"] is False
     assert configured["foo-code"] is False
 
-    monkeypatch.setattr(readiness.shutil, "which", lambda binary: f"/usr/bin/{binary}")
+    monkeypatch.setattr(readiness, "resolve_cli_binary", lambda binary: f"/usr/bin/{binary}")
     assert readiness.harness_is_configured("foo") is True
 
 

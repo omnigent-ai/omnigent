@@ -51,6 +51,7 @@ from omnigent.host.local_server import (
     stop_untracked_local_server,
 )
 from omnigent.inner import _proc, ui
+from omnigent.integration_daemon import IntegrationDaemon
 from omnigent.onboarding.sandboxes import available_providers as _sandbox_providers
 from omnigent.onboarding.ucode_setup import (
     build_ucode_configure_command,
@@ -353,6 +354,17 @@ _LOCAL_DAEMON_ENV_ALLOWLIST: frozenset[str] = frozenset(
         "ANTHROPIC_BASE_URL",
         "ANTHROPIC_BEDROCK_BASE_URL",
         "AWS_BEARER_TOKEN_BEDROCK",
+        # M8 (security 2026-07-15): CLAUDE_CODE_OAUTH_TOKEN is listed in
+        # HARNESS_CREDENTIAL_ENV_VARS (connect.py) for forwarding host->runner,
+        # but _build_host_daemon_env (this file) only allows _RUNNER_ENV_ALLOWLIST
+        # + _LOCAL_DAEMON_ENV_ALLOWLIST. CLAUDE_CODE_OAUTH_TOKEN is in neither,
+        # so it is STRIPPED from the daemon env at launch. The daemon starts without it,
+        # so _build_runner_env has no token to forward even though HARNESS_CREDENTIAL_ENV_VARS
+        # includes it. Net effect: `claude setup-token` subscription auth never reaches
+        # the claude subprocess under the claude-sdk harness on macOS local (non-cloud) runs.
+        # Fix: add to the daemon allowlist so it survives the cli->daemon env strip.
+        # Security: it's a credential, same class as ANTHROPIC_API_KEY which is already here.
+        "CLAUDE_CODE_OAUTH_TOKEN",
         "CLAUDE_CODE_USE_BEDROCK",
         "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
         "COHERE_API_KEY",
@@ -1333,6 +1345,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "hermes",
         "host",
         "import",
+        "integration",
         "_internal",
         "kimi",
         "kiro",
@@ -1407,6 +1420,16 @@ def main() -> None:
     so unhandled exceptions are captured even when the user didn't
     enable ``--log`` or ``--debug-events``.
     """
+    # Friendly crash handler: replaces Python's raw traceback with a
+    # calm, branded crash screen + a one-tap path to file a GitHub issue
+    # (browser opens the repo's pre-filled bug-report template with the
+    # traceback, version, and OS in the Description field).
+    # Installed first so crashes anywhere below — argv shorthands, Click
+    # dispatch, imports — are all caught. See omnigent/crash_handler.py.
+    from omnigent.crash_handler import install_crash_handler
+
+    install_crash_handler(app_name="omnigent", repo="omnigent-ai/omnigent")
+
     cwd = os.getcwd()
     if cwd not in sys.path:
         sys.path.insert(0, cwd)
@@ -1484,8 +1507,10 @@ def main() -> None:
     # user to "run omnigent setup" would be circular. ``upgrade`` (and its
     # ``update`` alias) is excluded too: its failures (unreachable index,
     # dev checkout, install error) are never about a missing model
-    # credential, so the setup hint would only mislead.
-    suggest_setup = argv[0] not in {"setup", "update", "upgrade"}
+    # credential, so the setup hint would only mislead. ``integration``
+    # likewise: its errors (package not installed, daemon not running) have
+    # nothing to do with model credentials.
+    suggest_setup = argv[0] not in {"setup", "update", "upgrade", "integration"}
 
     # Lightweight update notice: only on an interactive terminal and only
     # for user-facing commands. Reads a cached "latest PyPI version" and
@@ -1510,10 +1535,19 @@ def main() -> None:
         click.echo("Aborted!", err=True)
         raise SystemExit(1) from exc
     except Exception as exc:
+        # Keep the diagnostics log line ("Details logged to …") — the
+        # always-on CLI log has more context than this single crash — then
+        # hand off to the friendly crash handler for the calm screen,
+        # de-emphasized traceback, and the bug-filing prompt. We drop the
+        # `omnigent setup` hint here: genuine crashes are rarely auth issues,
+        # and "run setup" would contradict the crash screen's reassurance.
+        # `handle_crash` renders the UX and we exit with code 1 (SystemExit
+        # does NOT re-trigger sys.excepthook, so there's no double render).
+        from omnigent.crash_handler import handle_crash
+
         log_cli_error_hint(exc)
-        if suggest_setup:
-            print_setup_hint()
-        raise
+        handle_crash(exc)
+        raise SystemExit(1) from exc
 
 
 def _is_run_shorthand(argv: list[str]) -> bool:
@@ -5960,9 +5994,17 @@ def resume(
 @click.option(
     "--session",
     "source_session_id",
-    required=True,
+    default=None,
     metavar="SESSION_ID",
-    help="Harness-native session ID to import.",
+    help="Harness-native session ID to import. Mutually exclusive with --last.",
+)
+@click.option(
+    "--last",
+    "recent_session_count",
+    type=click.IntRange(min=1, max=50),
+    default=None,
+    metavar="N",
+    help="Import the N most recently modified parent sessions (maximum 50).",
 )
 @click.option(
     "--server",
@@ -5974,18 +6016,21 @@ def resume(
 )
 def import_session_command(
     harness: str,
-    source_session_id: str,
+    source_session_id: str | None,
+    recent_session_count: int | None,
     server: str | None,
 ) -> None:
-    """Import one local Claude Code or Codex chat.
+    """Import local Claude Code or Codex chats.
 
     The source transcript is converted to ordinary Omnigent items and stored
-    as a normal session. A source session can only be imported once.
+    as a normal session. Use --session for one chat or --last for a bounded
+    batch. A source session can only be imported once.
 
     \b
     Examples:
       omnigent import --harness claude --session <session-id>
       omnigent import --harness codex --session <session-id>
+      omnigent import --harness claude --last 10
     """
     import httpx
 
@@ -5994,54 +6039,117 @@ def import_session_command(
         ImportSource,
         SessionImportNotFoundError,
     )
-    from omnigent.session_import.local import load_local_session
+    from omnigent.session_import.local import (
+        list_recent_local_session_ids,
+        load_local_session,
+    )
 
-    try:
-        imported = load_local_session(cast(ImportSource, harness.lower()), source_session_id)
-    except SessionImportNotFoundError as exc:
-        raise click.ClickException(str(exc)) from exc
+    if (source_session_id is None) == (recent_session_count is None):
+        raise click.UsageError("Provide exactly one of --session or --last.")
+
+    source = cast(ImportSource, harness.lower())
+    is_batch = recent_session_count is not None
+    if recent_session_count is not None:
+        recent_ids = list_recent_local_session_ids(source, limit=recent_session_count)
+        if not recent_ids:
+            raise click.ClickException(f"No local {source} parent sessions were found")
+        source_session_ids = tuple(reversed(recent_ids))
+    else:
+        assert source_session_id is not None
+        source_session_ids = (source_session_id,)
 
     cfg = _load_effective_config()
     base_url = _resolve_attach_server(server, cfg.get("server"))
     if base_url is None:
         base_url = ensure_local_omnigent_server().url
     base_url = base_url.rstrip("/")
-    payload = {
-        "source": imported.source,
-        "external_session_id": imported.external_session_id,
-        "workspace": imported.workspace,
-        "items": [
-            {
-                "type": item.type,
-                "response_id": item.response_id,
-                "data": item.data.model_dump(mode="json", exclude_none=True),
-            }
-            for item in imported.items
-        ],
-    }
-    try:
-        response = httpx.post(
-            f"{base_url}/v1/imports",
-            json=payload,
-            headers=_remote_headers(server_url=base_url),
-            timeout=120.0,
-        )
-    except httpx.RequestError as exc:
-        raise click.ClickException(f"Could not reach the Omnigent server: {exc}") from exc
-    if response.is_error:
+    imported_count = 0
+    already_imported_count = 0
+    failed_count = 0
+    for current_source_session_id in source_session_ids:
         try:
-            body = response.json()
-            detail = body.get("error", {}).get("message") or body.get("detail")
-        except (ValueError, AttributeError):
-            detail = None
-        raise click.ClickException(
-            f"Import failed ({response.status_code}): {detail or response.text}"
-        )
+            imported = load_local_session(source, current_source_session_id)
+        except SessionImportNotFoundError as exc:
+            if not is_batch:
+                raise click.ClickException(str(exc)) from exc
+            failed_count += 1
+            click.echo(f"Failed {current_source_session_id}: {exc}", err=True)
+            continue
+        except (OSError, TypeError, ValueError) as exc:
+            if not is_batch:
+                raise
+            failed_count += 1
+            click.echo(f"Failed {current_source_session_id}: {exc}", err=True)
+            continue
 
-    result = response.json()
-    session_id = result["session_id"]
-    item_count = result["item_count"]
-    click.echo(f"Imported {item_count} item(s) into {session_id}.")
+        payload = {
+            "source": imported.source,
+            "external_session_id": imported.external_session_id,
+            "workspace": imported.workspace,
+            "items": [
+                {
+                    "type": item.type,
+                    "response_id": item.response_id,
+                    "data": item.data.model_dump(mode="json", exclude_none=True),
+                }
+                for item in imported.items
+            ],
+        }
+        try:
+            response = httpx.post(
+                f"{base_url}/v1/imports",
+                json=payload,
+                headers=_remote_headers(server_url=base_url),
+                timeout=120.0,
+            )
+        except httpx.RequestError as exc:
+            raise click.ClickException(f"Could not reach the Omnigent server: {exc}") from exc
+
+        if response.status_code == 409 and is_batch:
+            already_imported_count += 1
+            click.echo(f"Already imported {current_source_session_id}; skipped.")
+            continue
+        if response.is_error:
+            try:
+                body = response.json()
+                detail = body.get("error", {}).get("message") or body.get("detail")
+            except (ValueError, AttributeError):
+                detail = None
+            message = f"Import failed ({response.status_code}): {detail or response.text}"
+            if not is_batch:
+                raise click.ClickException(message)
+            failed_count += 1
+            click.echo(f"Failed {current_source_session_id}: {message}", err=True)
+            continue
+
+        try:
+            result = response.json()
+            session_id = result["session_id"]
+            item_count = result["item_count"]
+        except (AttributeError, KeyError, TypeError, ValueError) as exc:
+            if not is_batch:
+                raise click.ClickException("Import returned an invalid server response") from exc
+            failed_count += 1
+            click.echo(
+                f"Failed {current_source_session_id}: import returned an invalid server response",
+                err=True,
+            )
+            continue
+        imported_count += 1
+        if is_batch:
+            click.echo(
+                f"Imported {item_count} item(s) from {current_source_session_id} "
+                f"into {session_id}."
+            )
+        else:
+            click.echo(f"Imported {item_count} item(s) into {session_id}.")
+
+    if is_batch:
+        click.echo(f"\nImported: {imported_count}")
+        click.echo(f"Already imported: {already_imported_count}")
+        click.echo(f"Failed: {failed_count}")
+        if failed_count:
+            raise click.ClickException(f"{failed_count} session(s) failed to import")
 
 
 @cli.group("session", invoke_without_command=True)
@@ -8013,10 +8121,12 @@ def _host_shorten(text: _HostJsonValue, *, max_chars: int) -> str:
     value = _host_display_value(text)
     if len(value) <= max_chars:
         return value
-    if max_chars <= 1:
+    if max_chars <= 2:
+        # Too narrow for a head + ellipsis + tail; middle-truncation with a
+        # 1-char tail would overflow the budget, so only ever show the head.
         return value[:max_chars]
     head = max(1, (max_chars - 1) // 2)
-    tail = max(1, max_chars - head - 1)
+    tail = max_chars - head - 1
     return f"{value[:head]}…{value[-tail:]}"
 
 
@@ -8633,6 +8743,191 @@ class _ConfigGroup(click.Group):
             if hint is not None:
                 raise click.UsageError(hint)
         return super().parse_args(ctx, args)
+
+
+# ── Integrations (Slack, …) ───────────────────────────────────────────
+
+# Slack socket-mode bot: a separate `omnigent-slack` package (heavy deps —
+# slack_bolt/aiohttp — kept out of the core CLI install). The CLI launches it
+# as a subprocess and never imports it.
+_SLACK_PACKAGE = "omnigent_slack"
+_SLACK_INSTALL_HINT = (
+    "The Slack integration (omnigent-slack) isn't installed in this "
+    "environment. Install it alongside omnigent with the `slack` extra:\n"
+    '  uv pip install "omnigent[slack]"\n'
+    "or, from a source checkout:\n"
+    "  uv sync --extra slack"
+)
+
+
+def _slack_installed() -> bool:
+    """Whether the ``omnigent_slack`` package is importable (not imported)."""
+    import importlib.util
+
+    return importlib.util.find_spec(_SLACK_PACKAGE) is not None
+
+
+def _slack_argv() -> list[str]:
+    """Argv that runs the Slack bot in the current interpreter."""
+    return [sys.executable, "-m", _SLACK_PACKAGE]
+
+
+def _slack_cwd() -> Path | None:
+    """Directory to run the Slack bot from, so its ``.env`` resolves.
+
+    The bot's ``Settings`` loads a CWD-relative ``.env``; a background daemon
+    otherwise inherits whatever directory ``omni`` was launched from and
+    silently misses config. For a source/editable install the package lives at
+    ``<integration>/src/omnigent_slack``, so the integration dir (holding the
+    ``.env``) is three parents up. Returns that dir only when it actually holds
+    a ``.env``; otherwise ``None`` (a wheel install has no such dir — config
+    then comes from real environment variables).
+    """
+    import importlib.util
+
+    spec = importlib.util.find_spec(_SLACK_PACKAGE)
+    if spec is None or not spec.origin:
+        return None
+    origin = Path(spec.origin)
+    if len(origin.parents) < 3:
+        return None
+    integration_dir = origin.parents[2]
+    return integration_dir if (integration_dir / ".env").is_file() else None
+
+
+def _integration_state_dir() -> Path:
+    """Runtime dir for integration daemon records (honors OMNIGENT_DATA_DIR)."""
+    from omnigent.host.local_server import _local_data_dir
+
+    return _local_data_dir()
+
+
+def _slack_daemon() -> IntegrationDaemon:
+    return IntegrationDaemon("slack", _integration_state_dir())
+
+
+@cli.group("integration", invoke_without_command=True)
+@click.pass_context
+def integration(ctx: click.Context) -> None:
+    """Run and manage Omnigent chat integrations.
+
+    \b
+    Available integrations:
+      slack   The @omnigent Slack socket-mode bot.
+
+    Run ``omni integration slack`` to start the Slack bot in the foreground,
+    or ``omni integration slack start`` to run it in the background.
+    """
+    if ctx.invoked_subcommand is None:
+        click.echo(ctx.get_help())
+
+
+@integration.group("slack", invoke_without_command=True)
+@click.pass_context
+def slack(ctx: click.Context) -> None:
+    """Run the @omnigent Slack socket-mode bot (foreground).
+
+    \b
+    Bare invocation runs in the FOREGROUND (Ctrl-C to stop):
+      omni integration slack
+    Manage a BACKGROUND daemon with the subcommands:
+      omni integration slack start    # spawn detached, return immediately
+      omni integration slack status   # is it running?
+      omni integration slack stop     # terminate the daemon
+      omni integration slack logs     # where the daemon logs (-f to tail)
+
+    Config (Slack tokens, OMNIGENT_SERVER_URL, …) comes from the environment
+    and the integration's .env file — see integrations/slack/.env.example.
+    """
+    if ctx.invoked_subcommand is not None:
+        return
+    if not _slack_installed():
+        raise click.ClickException(_SLACK_INSTALL_HINT)
+    # A background daemon already holds the Slack socket; a second foreground
+    # bot would contend on the same connection. Refuse rather than double-run.
+    existing = _slack_daemon().running_record()
+    if existing is not None:
+        raise click.ClickException(
+            f"A background Slack bot is already running (pid {existing.pid}). "
+            "Stop it first with `omni integration slack stop`, or view it with "
+            "`omni integration slack status`."
+        )
+    # Foreground: inherit stdio, block until the bot exits (Ctrl-C).
+    click.echo("Starting the Omnigent Slack bot (foreground). Press Ctrl-C to stop.")
+    result = subprocess.run(_slack_argv(), env=os.environ.copy(), cwd=_slack_cwd(), check=False)
+    raise SystemExit(result.returncode)
+
+
+@slack.command("start")
+def slack_start() -> None:
+    """Start the Slack bot as a background daemon."""
+    if not _slack_installed():
+        raise click.ClickException(_SLACK_INSTALL_HINT)
+    daemon = _slack_daemon()
+    existing = daemon.running_record()
+    if existing is not None:
+        click.echo(f"Slack bot already running (pid {existing.pid}).")
+        click.echo(f"Logs: {_display_path(Path(existing.log_path))}")
+        return
+    record = daemon.start(_slack_argv(), os.environ.copy(), cwd=_slack_cwd())
+    # A detached daemon that dies on startup (missing tokens, bad server URL)
+    # leaves nothing on the terminal — confirm it survives a short grace and
+    # surface the log tail if it didn't, instead of falsely reporting success.
+    if not daemon.confirm_alive(record, grace_seconds=2.0):
+        tail = daemon.read_log_tail()
+        message = "The Slack bot exited immediately after starting."
+        if tail:
+            message += f"\nLast log lines:\n{tail}"
+        message += f"\nFull log: {_display_path(Path(record.log_path))}"
+        raise click.ClickException(message)
+    click.echo(f"Started the Omnigent Slack bot in the background (pid {record.pid}).")
+    click.echo(f"Logs: {_display_path(Path(record.log_path))}")
+    click.echo("Stop it with: omni integration slack stop")
+
+
+@slack.command("status")
+def slack_status() -> None:
+    """Show whether the background Slack daemon is running."""
+    record = _slack_daemon().running_record()
+    if record is None:
+        click.echo("Slack bot: not running.")
+        return
+    started = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(record.started_at))
+    click.echo(f"Slack bot: running (pid {record.pid}, since {started}).")
+    click.echo(f"Logs: {_display_path(Path(record.log_path))}")
+
+
+@slack.command("stop")
+def slack_stop() -> None:
+    """Stop the background Slack daemon."""
+    record = _slack_daemon().stop()
+    if record is None:
+        click.echo("Slack bot: not running.")
+        return
+    click.echo(f"Stopped the Omnigent Slack bot (pid {record.pid}).")
+
+
+@slack.command("logs")
+@click.option("-f", "--follow", is_flag=True, help="Follow the log (like tail -f).")
+def slack_logs(follow: bool) -> None:
+    """Print the background Slack daemon's log path (or tail it)."""
+    record = _slack_daemon().read_record()
+    if record is None:
+        click.echo("No Slack daemon has been started yet.")
+        return
+    log_path = Path(record.log_path)
+    if not follow:
+        click.echo(str(log_path))
+        return
+    if not log_path.exists():
+        raise click.ClickException(f"Log file not found: {log_path}")
+    # Delegate to `tail -f` for a portable follow without reimplementing it.
+    try:
+        subprocess.run(["tail", "-f", str(log_path)], check=False)
+    except FileNotFoundError as exc:
+        raise click.ClickException(
+            f"`tail` not available to follow the log. Log file: {log_path}"
+        ) from exc
 
 
 @cli.group("config", cls=_ConfigGroup)
@@ -10147,8 +10442,8 @@ def _prompt_install_cursor() -> str | None:
     return None
 
 
-def _manage_cursor_harness() -> None:
-    """Run the level-2 loop for Cursor: manage its ``CURSOR_API_KEY``.
+def _manage_cursor_sdk_harness() -> None:
+    """Run the Cursor SDK loop: manage its ``CURSOR_API_KEY``.
 
     Cursor runs via the ``cursor-sdk`` package and authenticates against
     Cursor's own backend with a ``CURSOR_API_KEY`` — the SDK requires one (a
@@ -10263,6 +10558,84 @@ def _set_cursor_api_key() -> str | None:
     secret_store.store_secret(CURSOR_SECRET_NAME, pasted)
     _save_global_config(cursor_api_key_settings(f"keychain:{CURSOR_SECRET_NAME}"))
     return "✓ Cursor API key stored"
+
+
+def _manage_cursor_native_harness() -> None:
+    """Configure the ``cursor-agent`` CLI used by the built-in web agent."""
+    from omnigent.onboarding.harness_install import (
+        CURSOR_KEY,
+        harness_cli_installed,
+        harness_cli_logged_in,
+        harness_install_spec,
+        harness_login,
+        harness_logout,
+    )
+    from omnigent.onboarding.interactive import console, select
+
+    if not harness_cli_installed(CURSOR_KEY):
+        spec = harness_install_spec(CURSOR_KEY)
+        hint = (
+            spec.install_hint
+            if spec and spec.install_hint
+            else "curl https://cursor.com/install -fsS | bash"
+        )
+        console.print(
+            "  Cursor CLI isn't installed. Install it with:\n"
+            f"    [bold]{hint}[/bold]\n"
+            "  then run [bold]cursor-agent login[/bold] or re-open this menu."
+        )
+        return
+
+    status: str | None = None
+    while True:
+        logged_in = harness_cli_logged_in(CURSOR_KEY)
+        header = "Cursor CLI — logged in" if logged_in else "Cursor CLI — not logged in yet"
+        rows = [_HarnessMenuRow("Sign in (cursor-agent login)", action="login")]
+        if logged_in:
+            rows.append(_HarnessMenuRow("Sign out (cursor-agent logout)", action="logout"))
+        rows.append(_HarnessMenuRow("← Back", action="back"))
+        idx = select(header, [row.label for row in rows], clear_on_exit=True, status=status)
+        if idx < 0 or rows[idx].action == "back":
+            return
+        if rows[idx].action == "login":
+            status = (
+                "✓ Cursor CLI logged in" if harness_login(CURSOR_KEY) else "Login not detected"
+            )
+        elif rows[idx].action == "logout":
+            status = "✓ Cursor CLI logged out" if harness_logout(CURSOR_KEY) else "Logout failed"
+
+
+def _manage_cursor_harness() -> None:
+    """Configure Cursor CLI and SDK from one consolidated setup entry."""
+    from omnigent.onboarding.cursor_auth import cursor_api_key_configured
+    from omnigent.onboarding.harness_install import (
+        CURSOR_KEY,
+        harness_cli_installed,
+        harness_cli_logged_in,
+    )
+    from omnigent.onboarding.interactive import select
+
+    while True:
+        cli_status = (
+            "logged in"
+            if harness_cli_logged_in(CURSOR_KEY)
+            else "needs login"
+            if harness_cli_installed(CURSOR_KEY)
+            else "not installed"
+        )
+        sdk_status = "API key configured" if cursor_api_key_configured() else "not configured"
+        rows = [
+            _HarnessMenuRow(f"Cursor CLI — {cli_status}", action="cli"),
+            _HarnessMenuRow(f"Cursor SDK — {sdk_status}", action="sdk"),
+            _HarnessMenuRow("← Back", action="back"),
+        ]
+        idx = select("Cursor setup", [row.label for row in rows], clear_on_exit=True)
+        if idx < 0 or rows[idx].action == "back":
+            return
+        if rows[idx].action == "cli":
+            _manage_cursor_native_harness()
+        elif rows[idx].action == "sdk":
+            _manage_cursor_sdk_harness()
 
 
 def _prompt_install_antigravity() -> str | None:
@@ -10801,20 +11174,21 @@ def _manage_acp_agent(slug: str) -> None:
 
 
 def _manage_hermes_harness() -> None:
-    """Run the level-2 loop for Hermes: ensure the CLI is installed.
+    """Run the level-2 loop for Hermes: install the CLI, then configure it.
 
     Hermes owns its own auth via ``hermes model`` (interactive provider/model
     picker) and is installed via a curl script from Nous Research — Omnigent
-    stores no Hermes credential. A missing CLI gates the drill-in; when
-    installed, the drill-in offers to launch ``hermes model`` for provider
-    configuration.
+    stores no Hermes credential. A missing CLI offers to run the vendor
+    installer; when installed, the drill-in offers to launch ``hermes model``
+    for provider configuration.
 
-    :returns: None. Side effects: may launch ``hermes model``.
+    :returns: None. Side effects: may install Hermes or launch ``hermes model``.
     """
     from omnigent.onboarding.harness_install import (
         HERMES_KEY,
         harness_cli_installed,
         harness_install_spec,
+        install_harness_cli,
     )
     from omnigent.onboarding.interactive import console, select
 
@@ -10825,11 +11199,36 @@ def _manage_hermes_harness() -> None:
             if spec and spec.install_hint
             else "curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash"
         )
-        console.print(
-            f"  Hermes isn't installed. Install it with:\n    [bold]{hint}[/bold]\n"
-            "  then re-open this menu."
+        choice = select(
+            "Hermes isn't installed. Install it now?",
+            [
+                f"Yes — install ({hint})",
+                "No — back to harnesses",
+                "I'll run it myself (show the command)",
+            ],
+            descriptions=[
+                f"Runs `{hint}`.",
+                "Return to the harness picker without installing.",
+                "Print the command so you can install it yourself, then return.",
+            ],
+            default=0,
+            clear_on_exit=True,
         )
-        return
+        if choice == 0:
+            console.print(f"  [dim]Installing Hermes — running `{hint}`…[/dim]")
+            if install_harness_cli(HERMES_KEY):
+                console.print("  [green]✓ Hermes installed[/green]")
+            else:
+                console.print(
+                    f"  [red]Install failed.[/red] Run it manually, then re-open: "
+                    f"[bold]{hint}[/bold]"
+                )
+                return
+        elif choice == 2:
+            console.print(f"  Install Hermes with:\n    [bold]{hint}[/bold]")
+            return
+        else:
+            return
 
     status: str | None = None
     while True:
@@ -11740,11 +12139,7 @@ def _run_configure_harnesses_interactive() -> None:
         copilot_github_token_configured,
         copilot_sdk_installed,
     )
-    from omnigent.onboarding.cursor_auth import (
-        CURSOR_EXTRA,
-        cursor_api_key_configured,
-        cursor_sdk_installed,
-    )
+    from omnigent.onboarding.cursor_auth import cursor_api_key_configured
     from omnigent.onboarding.extra_install import extra_install_display
     from omnigent.onboarding.goose_auth import goose_config_summary
     from omnigent.onboarding.harness_install import (
@@ -11757,6 +12152,7 @@ def _run_configure_harnesses_interactive() -> None:
         OPENCODE_KEY,
         QWEN_KEY,
         harness_cli_installed,
+        harness_cli_logged_in,
         harness_install_command,
         harness_install_spec,
     )
@@ -11891,29 +12287,45 @@ def _run_configure_harnesses_interactive() -> None:
         rows.append(_family_row(ANTHROPIC_FAMILY))
         rows.append(_family_row(OPENAI_FAMILY))
 
-        # Cursor — readiness is the CURSOR_API_KEY (the cursor-sdk extra is a
-        # soft dependency; the key is independently storable, so a missing SDK
-        # is surfaced as the install hint, not a hard block).
-        if cursor_api_key_configured(config) or bool(os.environ.get("CURSOR_API_KEY")):
-            rows.append((CURSOR_KEY, "Cursor", "API key", "ready", ""))
-        elif not cursor_sdk_installed():
+        # Cursor setup covers both surfaces, but readiness prioritizes the CLI
+        # used by the built-in web agent. An SDK key never hides a CLI problem.
+        cursor_sdk_ready = cursor_api_key_configured(config) or bool(
+            os.environ.get("CURSOR_API_KEY")
+        )
+        if not harness_cli_installed(CURSOR_KEY):
+            cursor_spec = harness_install_spec(CURSOR_KEY)
+            cursor_hint = (
+                cursor_spec.install_hint
+                if cursor_spec and cursor_spec.install_hint
+                else "curl https://cursor.com/install -fsS | bash"
+            )
             rows.append(
                 (
                     CURSOR_KEY,
                     "Cursor",
-                    "Not installed",
+                    "CLI not installed · SDK ready" if cursor_sdk_ready else "CLI not installed",
                     "missing",
-                    _install_hint(extra_install_display(CURSOR_EXTRA)),
+                    _install_hint(cursor_hint),
                 ),
+            )
+        elif harness_cli_logged_in(CURSOR_KEY):
+            rows.append(
+                (
+                    CURSOR_KEY,
+                    "Cursor",
+                    "CLI + SDK ready" if cursor_sdk_ready else "CLI ready",
+                    "ready",
+                    "",
+                )
             )
         else:
             rows.append(
                 (
                     CURSOR_KEY,
                     "Cursor",
-                    "Not configured",
+                    "CLI needs login · SDK ready" if cursor_sdk_ready else "CLI needs login",
                     "warn",
-                    "Open to add the Cursor API key.",
+                    "Open to run `cursor-agent login`.",
                 ),
             )
 
