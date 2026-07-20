@@ -16,7 +16,6 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 from omnigent.db.db_models import (
     SqlAccountToken,
     SqlAgent,
-    SqlAgentConfiguration,
     SqlComment,
     SqlConversation,
     SqlConversationItem,
@@ -70,6 +69,8 @@ def _make_conversation(
     root_conversation_id: str | None = None,
     title: str | None = None,
     archived: bool = False,
+    agent_id: str | None = None,
+    session_overrides: str | None = None,
 ) -> SqlConversation:
     return SqlConversation(
         id=id,
@@ -79,14 +80,9 @@ def _make_conversation(
         root_conversation_id=root_conversation_id or id,
         title=title,
         archived=archived,
+        agent_id=agent_id,
+        session_overrides=session_overrides,
     )
-
-
-def _make_agent_configuration(
-    conversation_id: str = "a9930027fd3e2e979e65844f7af7bf88",
-    agent_id: str | None = None,
-) -> SqlAgentConfiguration:
-    return SqlAgentConfiguration(conversation_id=conversation_id, agent_id=agent_id)
 
 
 def _make_metadata(
@@ -357,9 +353,8 @@ class TestSqlConversation:
             loaded = session.get(SqlConversation, (0, "a9930027fd3e2e979e65844f7af7bf88"))
             assert loaded is not None
             assert loaded.title == "Hello World"
-            # Identity/hierarchy columns only; kind/archived live on
-            # SqlConversationMetadata, agent binding + overrides on
-            # SqlAgentConfiguration.
+            # kind lives on SqlConversationMetadata; the agent binding
+            # (agent_id) and per-session override blob live on the row itself.
             assert loaded.root_conversation_id == "a9930027fd3e2e979e65844f7af7bf88"
             assert loaded.next_position == 0
 
@@ -368,17 +363,15 @@ class TestSqlConversation:
         managed = make_managed_session_maker(engine)
 
         conv = _make_conversation()
-        agent_config = _make_agent_configuration()
         with managed() as session:
             session.add(conv)
-            session.add(agent_config)
 
         with managed() as session:
-            loaded = session.get(SqlAgentConfiguration, (0, "a9930027fd3e2e979e65844f7af7bf88"))
+            loaded = session.get(SqlConversation, (0, "a9930027fd3e2e979e65844f7af7bf88"))
             assert loaded is not None
-            assert loaded.reasoning_effort is None
-            assert loaded.model_override is None
+            # Agent binding + overrides default to NULL on a bare conversation.
             assert loaded.agent_id is None
+            assert loaded.session_overrides is None
 
     def test_metadata_kind_and_archived(self, db_uri: str) -> None:
         """kind lives on SqlConversationMetadata; archived on SqlConversation."""

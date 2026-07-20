@@ -659,64 +659,6 @@ class SqlConversationMetadata(OmnigentBase):
     )
 
 
-class SqlAgentConfiguration(ConversationBase):
-    """
-    SQLAlchemy model for the ``agent_configuration`` table.
-
-    The agent bound to a conversation and its per-session config
-    overrides. Paired 1-to-1 with :class:`SqlConversation` by
-    ``(workspace_id, conversation_id)``; both tables live on the
-    Conversation base, so the pair is created and deleted in one
-    transaction.
-
-    :param conversation_id: Conversation this row belongs to, e.g.
-        ``"conv_e4f5a6b7..."``.
-    :param agent_id: Agent bound to the conversation at creation
-        time. ``None`` for conversations created without an agent
-        binding.
-    :param reasoning_effort: Per-session reasoning-effort hint.
-    :param model_override: Per-session LLM model override.
-    :param cost_control_mode_override: Per-session cost-control switch.
-    :param harness_override: Per-session brain-harness override.
-    """
-
-    __tablename__ = "agent_configuration"
-
-    workspace_id: Mapped[int] = mapped_column(
-        BigInteger,
-        primary_key=True,
-        nullable=False,
-        server_default="0",
-        default=current_workspace_id,
-    )
-    conversation_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
-    agent_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
-    # Per-session reasoning-effort hint, e.g. "high". Nullable;
-    # None means use the agent default.
-    reasoning_effort: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    # Per-session LLM model override, e.g. "claude-opus-4-7". Nullable;
-    # None means use the agent default from the spec.
-    model_override: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    # Per-session cost-control switch: "on" | "off". Nullable; None
-    # means use the spec default (see entities.Conversation).
-    cost_control_mode_override: Mapped[str | None] = mapped_column(String(8), nullable=True)
-    # Per-session brain-harness override, e.g. "pi". Nullable; None
-    # means use the spec's executor.config.harness (see entities.Conversation).
-    harness_override: Mapped[str | None] = mapped_column(String(64), nullable=True)
-
-    __table_args__ = (
-        # Agent lookups: find the conversation(s) that own a given agent.
-        # Covering: the reverse lookup and the list filters read only
-        # conversation_id, so they resolve as index-only scans.
-        Index(
-            "ix_agent_configuration_agent_id",
-            "workspace_id",
-            "agent_id",
-            "conversation_id",
-        ),
-    )
-
-
 def conversation_title_hash(title: str) -> bytes:
     """Return the 16-byte truncated sha256 digest of a conversation title.
 
@@ -744,9 +686,9 @@ class SqlConversation(ConversationBase):
     SQLAlchemy model for the ``conversations`` table.
 
     Agent Platform (AP) fields for a conversation: identity, timestamps,
-    title, hierarchy, and the next_position allocator. The agent binding
-    and per-session overrides live in :class:`SqlAgentConfiguration`; Omnigent
-    operational state in :class:`SqlConversationMetadata`.
+    title, hierarchy, the next_position allocator, and the agent binding
+    (``agent_id`` + the ``session_overrides`` JSON blob). Omnigent
+    operational state lives in :class:`SqlConversationMetadata`.
 
     :param id: Unique conversation identifier, e.g.
         ``"conv_e4f5a6b7..."``.
@@ -762,6 +704,12 @@ class SqlConversation(ConversationBase):
         conversation in the spawn tree. Equal to ``id`` for
         top-level conversations.
     :param next_position: Monotonic allocator for the next item position.
+    :param agent_id: Agent bound to the conversation at creation time.
+        ``None`` for conversations created without an agent binding.
+    :param session_overrides: Compact JSON blob of per-session config
+        overrides (reasoning_effort, model_override,
+        cost_control_mode_override, harness_override). ``None`` when the
+        session uses all agent/spec defaults.
     """
 
     __tablename__ = "conversations"
@@ -796,6 +744,17 @@ class SqlConversation(ConversationBase):
     )
     # Monotonic allocator for the next item position in this conversation.
     next_position: Mapped[int | None] = mapped_column(Integer, nullable=True, default=0)
+    # Agent bound to this conversation at creation time. NULL for conversations
+    # created without an agent binding. Indexed for the agent→conversation
+    # reverse lookup and the list filters (agent_id / has_agent_id / agent_name).
+    agent_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    # Per-session config overrides packed as a compact JSON object, e.g.
+    # ``{"model_override":"claude-opus-4-8","reasoning_effort":"high"}``. Keys:
+    # reasoning_effort, model_override, cost_control_mode_override,
+    # harness_override. NULL when the session uses all agent/spec defaults; only
+    # set keys are stored. Never filtered in SQL — read and written whole with
+    # the row (see the store's _encode/_decode_session_overrides).
+    session_overrides: Mapped[str | None] = mapped_column(String(512), nullable=True)
     # Whether the session is archived (hidden from the default sidebar). Lives
     # here on the AP table so list_conversations can filter it inline alongside
     # the created_at/updated_at sort keys, instead of pre-fetching ids from the
@@ -813,6 +772,14 @@ class SqlConversation(ConversationBase):
             "ix_conversations_root_conversation_id",
             "workspace_id",
             "root_conversation_id",
+            "id",
+        ),
+        # Agent→conversation reverse lookup and the agent_id / has_agent_id /
+        # agent_name list filters. id trails to complete the PK (index-only).
+        Index(
+            "ix_conversations_agent_id",
+            "workspace_id",
+            "agent_id",
             "id",
         ),
         # Unique index on (parent_conversation_id, title_hash) prevents two
