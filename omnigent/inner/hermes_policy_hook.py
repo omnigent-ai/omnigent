@@ -54,6 +54,13 @@ def main() -> None:
     tool_name = payload.get("tool_name") or "unknown"
     tool_input = payload.get("tool_input") or {}
 
+    # Omnigent relay tools are already gated when the relay dispatches them back
+    # through the server's tool path; gating them here too parks a duplicate approval
+    # card whose long-poll hangs. Hermes' own tools lack the prefix and stay gated.
+    if tool_name.startswith(("mcp_omnigent_", "mcp__omnigent__")):
+        json.dump({}, sys.stdout)
+        return
+
     # Build the evaluation request matching the server's EvaluationRequest
     # schema.
     eval_body: dict[str, object] = {
@@ -71,16 +78,24 @@ def main() -> None:
     url = f"{server_url.rstrip('/')}/v1/sessions/{session_id}/policies/evaluate"
 
     try:
-        from omnigent.native_policy_hook import post_evaluate_with_retry
+        from omnigent.native_policy_hook import (
+            policy_hook_reauth,
+            policy_hook_request_headers,
+            post_evaluate_with_retry,
+        )
 
-        resp = post_evaluate_with_retry(
+        headers = policy_hook_request_headers()
+        reauth = policy_hook_reauth(server_url, headers)
+        resp, api_error = post_evaluate_with_retry(
             url=url,
-            headers={"Content-Type": "application/json"},
+            headers=headers,
             eval_request=eval_body,
             # One day — must match the server's ``ask_timeout`` so the hook
             # stays alive while the human responds to the web-UI approval card.
             read_timeout=86400.0,
             hook_label="hermes pre_tool_call",
+            # Re-mint the baked one-shot token if it lapses mid-session.
+            reauth=reauth,
         )
     except Exception:  # noqa: BLE001 -- fail open on import / unexpected error
         json.dump({}, sys.stdout)
@@ -89,8 +104,16 @@ def main() -> None:
     if resp is None:
         # Network error / retry budget exhausted -- fail closed so a
         # transient server outage doesn't let unreviewed tools through.
+        detail = api_error or reauth.failure_reason
         json.dump(
-            {"decision": "block", "reason": "Policy evaluation unavailable"},
+            {
+                "decision": "block",
+                "reason": (
+                    f"Policy evaluation unavailable: {detail}"
+                    if detail
+                    else "Policy evaluation unavailable"
+                ),
+            },
             sys.stdout,
         )
         return

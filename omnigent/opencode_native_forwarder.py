@@ -63,6 +63,15 @@ _EXTERNAL_OUTPUT_REASONING_DELTA = "external_output_reasoning_delta"
 
 _STATUS_RUNNING = "running"
 _STATUS_IDLE = "idle"
+_STATUS_FAILED = "failed"
+
+# Appended to a failed edge's output when opencode reports a provider-auth
+# error so the web surface can prompt a re-auth (matches the codex-native
+# ``_CODEX_REAUTH_HINT`` phrasing; ``opencode auth login`` per
+# ``omnigent/onboarding/opencode_auth.py``).
+_OPENCODE_REAUTH_HINT = (
+    "OpenCode needs you to re-authenticate. Run `opencode auth login` and retry."
+)
 
 # Bound the dedupe set so a long-lived session can't grow it without limit.
 _MAX_DEDUPE_KEYS = 8192
@@ -172,6 +181,14 @@ class OpenCodeNativeForwarder:
         # the cumulative reasoning text on each ``part.updated``; we forward only
         # the new suffix so the web reasoning block grows once, not duplicated.
         self._reasoning_posted: dict[str, int] = {}
+        # The in-flight turn's assistant messageID (its per-turn ``response_id``),
+        # captured from ``message.updated`` and stamped on the running/idle status
+        # edges so the web chat renders this turn's tool calls live — the mirrored
+        # ``function_call`` items carry the SAME id. ``_running_response_id``
+        # records the id the ``running`` edge went out with, gating it to once per
+        # turn; both reset in :meth:`_end_turn`.
+        self._active_message_id: str | None = None
+        self._running_response_id: str | None = None
 
     async def seed_dedupe_from_history(self) -> None:
         """
@@ -192,6 +209,8 @@ class OpenCodeNativeForwarder:
             role = info.get("role") if isinstance(info, Mapping) else None
             if isinstance(message_id, str) and isinstance(role, str):
                 self._msg_role[message_id] = role
+                if role == "assistant" and isinstance(info, Mapping):
+                    self._record_assistant_usage(message_id, info)
             parts = message.get("parts") if isinstance(message, Mapping) else None
             if isinstance(parts, list):
                 for part in parts:
@@ -214,6 +233,12 @@ class OpenCodeNativeForwarder:
                             self.state.mark(self._key("tool-out", call_id))
             if isinstance(message_id, str):
                 self.state.mark(self._key("message", message_id))
+        try:
+            await self._post_session_usage()
+        except Exception:  # noqa: BLE001 - usage re-post is best effort.
+            _logger.debug(
+                "OpenCode forwarder could not re-post usage after seeding", exc_info=True
+            )
 
     async def run(self, *, max_reconnects: int | None = None) -> None:
         """
@@ -324,9 +349,22 @@ class OpenCodeNativeForwarder:
             )
             return None
 
-    async def _post_status(self, status: str) -> None:
-        """Publish a coarse session status edge."""
-        await self._post_event(_EXTERNAL_STATUS, {"status": status})
+    async def _post_status(self, status: str, *, extra: Mapping[str, Any] | None = None) -> None:
+        """Publish a coarse session status edge.
+
+        :param extra: Extra fields merged into the edge payload. On the
+            ``running``/``idle`` edges this carries ``{"response_id": <assistant
+            messageID>}``: when it matches the ``response_id`` on this turn's
+            mirrored ``function_call`` items, the web chat renders the in-flight
+            tool calls live (spinner + ticking elapsed timer) instead of static
+            completed cards, and the server tracks it (``active_response_id``) so
+            a mid-turn reconnect stays live. A ``failed`` edge instead carries
+            ``output`` / ``reauth_required``.
+        """
+        data: dict[str, Any] = {"status": status}
+        if extra:
+            data.update(extra)
+        await self._post_event(_EXTERNAL_STATUS, data)
 
     def _response_id(self, message_id: str | None) -> str:
         """Map an opencode assistant messageID to a per-turn ``response_id``.
@@ -400,21 +438,54 @@ class OpenCodeNativeForwarder:
         )
 
     async def _begin_turn_if_needed(self) -> None:
-        """Post a single ``running`` status at the start of a turn."""
-        if not self.state.turn_active:
-            self.state.turn_active = True
-            await self._post_status(_STATUS_RUNNING)
+        """Emit the turn's id-bearing ``running`` edge once, when the id is known.
 
-    async def _end_turn(self) -> None:
-        """Post ``idle`` and clear active state at turn end."""
+        The ``running`` edge carries the assistant ``response_id`` (the opencode
+        messageID held in ``_active_message_id``) so the web chat can render this
+        turn's in-flight tool calls live — the mirrored ``function_call`` items
+        carry the SAME id. It fires once per turn and is deferred until the id is
+        known: a bare ``session.status`` busy can open the turn before the
+        assistant ``message.updated`` supplies the id, and emitting an id-less
+        (session-id-fallback) edge then would never match the tool-call items.
+        """
+        self.state.turn_active = True
+        if self._running_response_id is None and self._active_message_id is not None:
+            self._running_response_id = self._active_message_id
+            await self._post_status(
+                _STATUS_RUNNING, extra={"response_id": self._running_response_id}
+            )
+
+    async def _end_turn(
+        self, *, status: str = _STATUS_IDLE, extra: Mapping[str, Any] | None = None
+    ) -> None:
+        """Post the terminal status (idle by default), stamped with the turn's id.
+
+        The terminal edge carries the same ``response_id`` the ``running`` edge
+        used so the server retires this turn's live tool-call cards for the right
+        response; a caller may pass extra fields (e.g. ``output`` /
+        ``reauth_required`` on a ``failed`` edge), which are merged on top.
+        """
         self.state.turn_active = False
         # Reasoning deltas are per-turn; drop the per-part offsets so the map
         # can't grow across a long-lived session (the next turn's reasoning
         # parts carry fresh ids anyway).
         self._reasoning_posted.clear()
+        # Stamp the terminal edge with the id the ``running`` edge actually went
+        # out with (``_running_response_id``), then merge any caller-supplied
+        # fields on top. If a turn produced more than one assistant messageID,
+        # ``_active_message_id`` has advanced past the id that went live; using
+        # the running id keeps both edges consistent so the web retires the cards
+        # that were rendered live. Fall back to the latest assistant id (then the
+        # session id) when no running edge fired.
+        terminal_id = self._running_response_id or self._active_message_id
+        merged_extra: dict[str, Any] = {"response_id": self._response_id(terminal_id)}
+        if extra:
+            merged_extra.update(extra)
         if self._bridge_dir is not None:
             update_active_message_id(self._bridge_dir, None, status="idle")
-        await self._post_status(_STATUS_IDLE)
+        await self._post_status(status, extra=merged_extra)
+        self._active_message_id = None
+        self._running_response_id = None
 
     # --- per-event handlers ----------------------------------------------
 
@@ -433,6 +504,10 @@ class OpenCodeNativeForwarder:
             return
         self._msg_role[message_id] = role
         if role == "assistant":
+            # This turn's per-turn ``response_id`` — the running/idle edges carry
+            # it so the web chat can correlate them with the tool-call items that
+            # already stamp the same id (renders in-flight tool calls live).
+            self._active_message_id = message_id
             if self._bridge_dir is not None:
                 update_active_message_id(self._bridge_dir, message_id, status="busy")
             await self._begin_turn_if_needed()
@@ -727,14 +802,32 @@ class OpenCodeNativeForwarder:
         await self._post_event(_EXTERNAL_SESSION_USAGE, data)
 
     async def _on_session_error(self, event: OpenCodeEvent) -> None:
-        """Handle ``session.error`` — log, finalize, end turn."""
-        _logger.warning(
-            "OpenCode session error for session=%s: %s",
-            self._session_id,
-            event.properties.get("error"),
-        )
+        """Handle ``session.error`` — surface a failed (or re-auth) status edge.
+
+        opencode reports provider/auth failures as ``session.error`` with an
+        ``{name, data}`` error. Post ``external_session_status: failed`` with the
+        error message (and a re-auth hint for provider-auth errors) so the web UI
+        shows the failure instead of a silent idle. A ``MessageAbortedError`` is a
+        user interrupt, not a failure, so it takes the normal idle path.
+        """
+        error = event.properties.get("error")
+        _logger.warning("OpenCode session error for session=%s: %s", self._session_id, error)
         await self._flush_pending_text()
-        await self._end_turn()
+        name = error.get("name") if isinstance(error, Mapping) else None
+        data = error.get("data") if isinstance(error, Mapping) else None
+        if name == "MessageAbortedError":
+            await self._end_turn()
+            return
+        message = data.get("message") if isinstance(data, Mapping) else None
+        if not isinstance(message, str) or not message.strip():
+            message = "OpenCode session ended with an error."
+        status_code = data.get("statusCode") if isinstance(data, Mapping) else None
+        is_auth = name == "ProviderAuthError" or (name == "APIError" and status_code in (401, 403))
+        extra: dict[str, Any] = {"output": message.strip()}
+        if is_auth:
+            extra["output"] = f"{message.strip()}\n\n{_OPENCODE_REAUTH_HINT}"
+            extra["reauth_required"] = True
+        await self._end_turn(status=_STATUS_FAILED, extra=extra)
 
     async def _on_compaction_started(self, event: OpenCodeEvent) -> None:
         """Handle ``session.next.compaction.started`` (auto or manual).

@@ -66,6 +66,9 @@ _SESSIONS_RE = re.compile(r"/v1/sessions(\?.*)?$")
 # ``…/filesystem/home/e2e/projects``; it never matches the bare
 # ``/v1/hosts`` list (no ``/filesystem`` segment).
 _FILESYSTEM_RE = re.compile(r"/v1/hosts/[^/]+/filesystem")
+# The worktree-list endpoint the branch combobox queries for the picked repo.
+# Distinct ``/worktrees`` segment, so it never collides with ``/filesystem``.
+_WORKTREES_RE = re.compile(r"/v1/hosts/[^/]+/worktrees")
 
 
 def _run_in_fresh_loop(coro: Coroutine[Any, Any, None]) -> None:
@@ -407,6 +410,25 @@ def _hosts_body() -> str:
     )
 
 
+# Two online hosts for the sticky-default test. The composer auto-selects the
+# FIRST online host (alpha) when there's no stored pick; the test then picks
+# beta and asserts it's restored after a reload.
+_HOST_ALPHA = ("host_e2e_alpha", "e2e-host-alpha")
+_HOST_BETA = ("host_e2e_beta", "e2e-host-beta")
+
+
+def _two_hosts_body() -> str:
+    """Stub body for ``GET /v1/hosts``: two online, user-connected hosts."""
+    return json.dumps(
+        {
+            "hosts": [
+                {"host_id": hid, "name": name, "owner": "e2e", "status": "online"}
+                for hid, name in (_HOST_ALPHA, _HOST_BETA)
+            ]
+        }
+    )
+
+
 async def _register_common_routes(
     page,
     *,
@@ -570,15 +592,335 @@ async def _drive_permission_mode(base_url: str, session_id: str) -> None:
             await browser.close()
 
 
+def test_start_session_send_shows_busy_spinner(seeded_session: tuple[str, str]) -> None:
+    """Send shows a busy spinner while the create is in flight, then navigates.
+
+    The create awaits the backend (session bootstrap + git worktree setup)
+    before navigating, so the landing screen lingers for the whole round-trip.
+    Without feedback the Send button just goes inert and the typed message sits
+    in the composer, so the click reads as "frozen". This holds the create POST
+    open with a gate so that in-flight window is observable, and asserts the
+    Send button flips to a busy/spinning state (disabled + ``aria-busy`` +
+    "Starting session" label) before the response lands and navigation happens.
+    """
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_send_busy_spinner(base_url, session_id))
+
+
+async def _drive_send_busy_spinner(base_url: str, session_id: str) -> None:
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_bodies: list[dict[str, Any]] = []
+            # A gate the create handler awaits before responding, so the POST
+            # stays pending long enough to observe the button's busy state. The
+            # test opens it after asserting the spinner, letting navigation run.
+            release_create = asyncio.Event()
+
+            async def handle_hosts(route: Route) -> None:
+                await route.fulfill(
+                    status=200, content_type="application/json", body=_hosts_body()
+                )
+
+            async def handle_agents(route: Route) -> None:
+                await route.fulfill(
+                    status=200, content_type="application/json", body=_agents_body()
+                )
+
+            async def handle_events(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({"queued": True, "item_id": "ci_e2e"}),
+                )
+
+            async def handle_sessions(route: Route) -> None:
+                if route.request.method == "POST":
+                    create_bodies.append(route.request.post_data_json)
+                    # Hold the create open so the composer stays in its
+                    # `creating` state — the window under test.
+                    await release_create.wait()
+                    await route.fulfill(
+                        status=200,
+                        content_type="application/json",
+                        body=json.dumps({"id": session_id}),
+                    )
+                else:
+                    await route.continue_()
+
+            await page.route("**/v1/hosts", handle_hosts)
+            await page.route("**/v1/agents", handle_agents)
+            await page.route("**/v1/sessions/*/events", handle_events)
+            await page.route(_SESSIONS_RE, handle_sessions)
+
+            # Keep the agent-discovery scan empty so only the stubbed Claude
+            # agent feeds the picker (see _drive_permission_mode for why).
+            async def handle_agent_scan(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({"data": []}),
+                )
+
+            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+
+            await page.add_init_script(
+                f"""window.localStorage.setItem(
+                    "omnigent:recent-workspaces",
+                    JSON.stringify({{ {_HOST_ID}: ["/work/repo"] }})
+                );"""
+            )
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+
+            submit = page.get_by_test_id("new-chat-landing-submit")
+            await page.get_by_test_id("new-chat-landing-input").fill("set up the project")
+            # Idle with a message typed: enabled, not busy (arrow, no spin).
+            await expect(submit).to_be_enabled()
+            await expect(submit).to_have_attribute("aria-busy", "false")
+
+            await submit.click()
+
+            # The POST reached the server (proving we're truly in flight, not
+            # blocked by a disabled button) and the button shows the busy state.
+            await _wait_until(lambda: len(create_bodies) == 1)
+            await expect(submit).to_be_disabled()
+            await expect(submit).to_have_attribute("aria-busy", "true")
+            await expect(submit).to_have_attribute("aria-label", "Starting session")
+            # Still on the landing screen — the "frozen"-looking window.
+            await expect(page.get_by_test_id("new-chat-landing-input")).to_be_visible()
+
+            # Release the create: the flow completes and navigates to the
+            # session, so the landing composer unmounts.
+            release_create.set()
+            await expect(page.get_by_test_id("new-chat-landing-input")).to_have_count(
+                0, timeout=30_000
+            )
+        finally:
+            await browser.close()
+
+
+def test_start_session_remembers_last_picked_host(seeded_session: tuple[str, str]) -> None:
+    """The host chip restores the last explicitly-picked host after a reload.
+
+    With no stored pick the composer auto-selects the first online host
+    (alpha). After the user picks a different host (beta), that choice must be
+    persisted (``omnigent:last-host-choice`` in localStorage) and restored on
+    the next visit — instead of reverting to the first-online default. This is
+    the OSS mirror of the managed complaint where the picker always reverted to
+    the "Databricks Sandbox" default.
+    """
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_remembers_last_picked_host(base_url, session_id))
+
+
+async def _drive_remembers_last_picked_host(base_url: str, session_id: str) -> None:
+    alpha_id, alpha_name = _HOST_ALPHA
+    beta_id, beta_name = _HOST_BETA
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_bodies: list[dict[str, Any]] = []
+            await _register_common_routes(
+                page, created_session_id=session_id, create_bodies=create_bodies
+            )
+
+            # Override the single-host stub with the two-host body (registered
+            # after the common routes so this handler wins).
+            async def handle_two_hosts(route: Route) -> None:
+                await route.fulfill(
+                    status=200, content_type="application/json", body=_two_hosts_body()
+                )
+
+            await page.route("**/v1/hosts", handle_two_hosts)
+
+            # Neutralize agent discovery so a leaked native agent from another
+            # test can't switch the picker mid-flow (see _drive_permission_mode).
+            async def handle_agent_scan(route: Route) -> None:
+                await route.fulfill(
+                    status=200, content_type="application/json", body=json.dumps({"data": []})
+                )
+
+            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+
+            # Seed recents for both hosts so the working-directory chip auto-fills
+            # and the composer never blocks on the (host-less) file browser.
+            await page.add_init_script(
+                f"""window.localStorage.setItem(
+                    "omnigent:recent-workspaces",
+                    JSON.stringify({{
+                        "{alpha_id}": ["/work/repo"],
+                        "{beta_id}": ["/work/repo"]
+                    }})
+                );"""
+            )
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+
+            chip = page.get_by_test_id("new-chat-landing-host-chip")
+            # No stored pick yet → auto-selects the first online host (alpha).
+            await expect(chip).to_contain_text(alpha_name)
+
+            # Explicitly pick the second host.
+            await chip.click()
+            await page.get_by_test_id(f"new-chat-landing-host-{beta_id}").click()
+            await expect(chip).to_contain_text(beta_name)
+
+            # Reload: a full document load resets the in-memory landing draft, so
+            # the only thing that can restore the pick is the persisted
+            # preference. The chip must come back on beta, NOT the alpha default.
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+            chip = page.get_by_test_id("new-chat-landing-host-chip")
+            await expect(chip).to_contain_text(beta_name)
+        finally:
+            await browser.close()
+
+
+def _managed_info_body() -> str:
+    """Stub body for ``GET /v1/info``: a managed deployment offering a sandbox.
+
+    ``managed_sandboxes_enabled: true`` + ``sandbox_provider: "lakebox"`` makes
+    the picker offer (and default to) the "Databricks Sandbox" option, exactly
+    the deployment shape behind the original complaint. Every field the SPA
+    reads is supplied so the boot probe resolves to a fully-managed capability
+    set rather than the fail-closed sentinel.
+    """
+    return json.dumps(
+        {
+            "accounts_enabled": False,
+            "login_url": None,
+            "needs_setup": False,
+            "databricks_features": True,
+            "managed_sandboxes_enabled": True,
+            "sandbox_provider": "lakebox",
+            "server_version": "0.0.0-e2e",
+            "smart_routing_enabled": False,
+        }
+    )
+
+
+def test_start_session_managed_remembers_host_over_sandbox_default(
+    seeded_session: tuple[str, str],
+) -> None:
+    """In a managed deployment, a picked host survives reload — not the sandbox.
+
+    This is the original complaint end-to-end: the managed picker defaults to
+    "Databricks Sandbox", so a user who picks a connected host used to lose it
+    on the next visit (the picker reverted to the sandbox default). With the
+    last-host preference persisted, picking the host and reloading must restore
+    the host, NOT snap back to the sandbox default.
+    """
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_managed_remembers_host(base_url, session_id))
+
+
+async def _drive_managed_remembers_host(base_url: str, session_id: str) -> None:
+    host_id, host_name = _HOST_ALPHA
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_bodies: list[dict[str, Any]] = []
+            await _register_common_routes(
+                page, created_session_id=session_id, create_bodies=create_bodies
+            )
+
+            # Managed capability probe: makes the sandbox the offered default.
+            # `/v1/info` is fetched once per document load and module-cached, so
+            # a full reload re-hits this stub and re-enters managed mode.
+            async def handle_info(route: Route) -> None:
+                await route.fulfill(
+                    status=200, content_type="application/json", body=_managed_info_body()
+                )
+
+            await page.route("**/v1/info", handle_info)
+
+            # One connected online host alongside the managed sandbox default.
+            async def handle_one_host(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps(
+                        {
+                            "hosts": [
+                                {
+                                    "host_id": host_id,
+                                    "name": host_name,
+                                    "owner": "e2e",
+                                    "status": "online",
+                                }
+                            ]
+                        }
+                    ),
+                )
+
+            await page.route("**/v1/hosts", handle_one_host)
+
+            # Neutralize agent discovery so a leaked native agent from another
+            # test can't switch the picker mid-flow (see _drive_permission_mode).
+            async def handle_agent_scan(route: Route) -> None:
+                await route.fulfill(
+                    status=200, content_type="application/json", body=json.dumps({"data": []})
+                )
+
+            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+
+            await page.add_init_script(
+                f"""window.localStorage.setItem(
+                    "omnigent:recent-workspaces",
+                    JSON.stringify({{ "{host_id}": ["/work/repo"] }})
+                );"""
+            )
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+
+            chip = page.get_by_test_id("new-chat-landing-host-chip")
+            # Managed default with no stored pick: the sandbox, labeled by its
+            # provider ("Databricks Sandbox").
+            await expect(chip).to_contain_text("Databricks Sandbox")
+
+            # Explicitly pick the connected host instead.
+            await chip.click()
+            await page.get_by_test_id(f"new-chat-landing-host-{host_id}").click()
+            await expect(chip).to_contain_text(host_name)
+
+            # Reload: the host must be restored, NOT reverted to the sandbox
+            # default — the exact regression this change fixes.
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+            chip = page.get_by_test_id("new-chat-landing-host-chip")
+            await expect(chip).to_contain_text(host_name)
+            await expect(chip).not_to_contain_text("Databricks Sandbox")
+        finally:
+            await browser.close()
+
+
 def test_start_session_select_model_and_effort(seeded_session: tuple[str, str]) -> None:
     """Picking a model + reasoning effort rides along to the create call.
 
     For the Claude-native agent the config submenu shows a model/effort
-    picker that defaults to Claude Code's own "Sonnet / Medium". Selecting
-    "Opus" and "High" must (a) check those radios as immediate feedback and
-    (b) reach ``POST /v1/sessions`` as ``model_override: "opus"`` +
-    ``reasoning_effort: "high"`` (the runner reads them as ``--model`` /
-    ``--effort`` at terminal launch).
+    picker that starts with NOTHING selected — no model/effort default is
+    forced, so an untouched picker omits the override and Claude Code keeps its
+    own configured model. Explicitly selecting "Opus" and "High" must (a) check
+    those radios as immediate feedback and (b) reach ``POST /v1/sessions`` as
+    ``model_override: "opus"`` + ``reasoning_effort: "high"`` (the runner reads
+    them as ``--model`` / ``--effort`` at terminal launch).
     """
     base_url, session_id = seeded_session
     _run_in_fresh_loop(_drive_model_effort(base_url, session_id))
@@ -621,14 +963,16 @@ async def _drive_model_effort(base_url: str, session_id: str) -> None:
                 state="visible", timeout=30_000
             )
             # Claude Code auto-selects; open its config submenu, which carries the
-            # model + effort radio groups defaulting to Claude Code's effective
-            # defaults (Sonnet / Medium).
+            # model + effort radio groups. No default is forced, so both groups
+            # start with NOTHING checked — an untouched picker omits the override
+            # and Claude Code uses its own configured model. Verify the unselected
+            # default, then make an explicit pick.
             await _open_entry_config(page, "ag_claude_e2e")
-            await expect(page.get_by_test_id("new-chat-landing-model-sonnet")).to_have_attribute(
-                "aria-checked", "true"
+            await expect(page.get_by_test_id("new-chat-landing-model-opus")).to_have_attribute(
+                "aria-checked", "false"
             )
             await expect(page.get_by_test_id("new-chat-landing-effort-medium")).to_have_attribute(
-                "aria-checked", "true"
+                "aria-checked", "false"
             )
 
             # Pick model and effort in SEPARATE submenu visits. Picking a knob
@@ -934,9 +1278,9 @@ def test_start_session_select_harness(seeded_session: tuple[str, str]) -> None:
 
     Unlike Claude Code — whose submenu shows permission/model knobs — Polly and
     Debby declare a brain harness, so their config submenu renders an "Agent
-    Harness" radio group. Selecting a non-default harness ("Pi") must (a) show
-    all four harness options and (b) reach ``POST /v1/sessions`` as
-    ``harness_override: "pi"``.
+    Harness" radio group. Selecting a dynamically registered community harness
+    must (a) show the label from ``/v1/harnesses`` and (b) reach
+    ``POST /v1/sessions`` as ``harness_override: "community-brain"``.
     """
     base_url, session_id = seeded_session
     _run_in_fresh_loop(_drive_select_harness(base_url, session_id))
@@ -954,6 +1298,17 @@ async def _drive_select_harness(base_url: str, session_id: str) -> None:
                 create_bodies=create_bodies,
                 agents_body=_bundle_agents_body(),
             )
+
+            async def handle_harness_catalog(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps(
+                        {"data": [{"id": "community-brain", "label": "Community Brain"}]}
+                    ),
+                )
+
+            await page.route("**/v1/harnesses", handle_harness_catalog)
 
             # Neutralize agent discovery so only the stubbed bundle agents
             # (Polly/Debby) feed the picker. The landing picker merges
@@ -988,14 +1343,20 @@ async def _drive_select_harness(base_url: str, session_id: str) -> None:
             # Polly auto-selects (ranked ahead of Debby); its brain-harness
             # override radios live in the picker's per-entry config submenu.
             await _open_entry_config(page, "ag_polly_e2e")
-            # All four brain harnesses render as radio rows, in registry order.
-            for harness in ("claude-sdk", "openai-agents", "codex", "pi"):
+            # The built-in brain harnesses render as radio rows, in registry
+            # order (openai-agents is intentionally not offered in the picker).
+            for harness in ("claude-sdk", "codex", "pi"):
                 await expect(
                     page.get_by_test_id(f"new-chat-landing-harness-{harness}")
                 ).to_be_visible()
+            # Dynamic harness labels from `/v1/harnesses` extend the built-in
+            # fallback catalog in the user-visible picker.
+            community_harness = page.get_by_test_id("new-chat-landing-harness-community-brain")
+            await expect(community_harness).to_be_visible()
+            await expect(community_harness).to_contain_text("Community Brain")
             # Picking a harness commits and closes the menu (the agent chip keeps
             # the bare agent label "Polly"); the override rides along on create.
-            await page.get_by_test_id("new-chat-landing-harness-pi").click()
+            await community_harness.click()
 
             await page.get_by_test_id("new-chat-landing-input").fill("debate the design")
             await page.get_by_test_id("new-chat-landing-submit").click()
@@ -1005,7 +1366,7 @@ async def _drive_select_harness(base_url: str, session_id: str) -> None:
             assert body["agent_id"] == "ag_polly_e2e", body
             assert body["host_id"] == _HOST_ID, body
             assert body["workspace"] == "/work/repo", body
-            assert body.get("harness_override") == "pi", body
+            assert body.get("harness_override") == "community-brain", body
         finally:
             await browser.close()
 
@@ -1712,6 +2073,106 @@ async def _drive_add_worktree(base_url: str, session_id: str) -> None:
             await browser.close()
 
 
+def test_start_session_select_existing_worktree(seeded_session: tuple[str, str]) -> None:
+    """Picking an existing worktree starts in its directory in git bind mode.
+
+    The branch chip's input doubles as a combobox: focusing it lists the
+    repo's existing worktrees (``GET /v1/hosts/{id}/worktrees``). Selecting
+    one must (a) point the workspace at that worktree's directory and
+    (b) send the ``git`` spec in bind mode on ``POST /v1/sessions`` —
+    ``existing_worktree: true`` with the worktree's branch as
+    ``branch_name`` — so no worktree is created but the sidebar shows the
+    branch and the delete flow can offer to remove it.
+    """
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_select_existing_worktree(base_url, session_id))
+
+
+async def _drive_select_existing_worktree(base_url: str, session_id: str) -> None:
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_bodies: list[dict[str, Any]] = []
+            await _register_common_routes(
+                page, created_session_id=session_id, create_bodies=create_bodies
+            )
+
+            async def handle_worktrees(route: Route) -> None:
+                # The main tree (is_main) plus one linked worktree. The picker
+                # hides the main tree, so only "feature/x" is offered.
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps(
+                        {
+                            "object": "list",
+                            "data": [
+                                {
+                                    "path": "/work/repo",
+                                    "branch": "main",
+                                    "is_main": True,
+                                    "detached": False,
+                                },
+                                {
+                                    "path": "/work/repo-worktrees/feature-x",
+                                    "branch": "feature/x",
+                                    "is_main": False,
+                                    "detached": False,
+                                },
+                            ],
+                        }
+                    ),
+                )
+
+            # Registered after the common routes so it wins for its URL.
+            await page.route(_WORKTREES_RE, handle_worktrees)
+
+            await page.add_init_script(
+                f"""window.localStorage.setItem(
+                    "omnigent:recent-workspaces",
+                    JSON.stringify({{ {_HOST_ID}: ["/work/repo"] }})
+                );"""
+            )
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+
+            # Open the worktree chip; focusing the branch combobox reveals the
+            # repo's existing (linked) worktrees. The main tree is filtered out,
+            # so only the one linked worktree is offered.
+            await page.get_by_test_id("new-chat-landing-branch-chip").click()
+            await page.get_by_test_id("new-chat-landing-branch-input").focus()
+            option = page.get_by_test_id("new-chat-landing-worktree-option")
+            await expect(option).to_have_count(1)
+            await expect(option).to_contain_text("feature/x")
+            await option.click()
+
+            # The warning confirms the session will start in the existing
+            # worktree (rather than creating a new one).
+            await expect(
+                page.get_by_test_id("new-chat-landing-existing-worktree-warning")
+            ).to_be_visible()
+
+            await page.get_by_test_id("new-chat-landing-input").fill("work in the worktree")
+            await page.get_by_test_id("new-chat-landing-submit").click()
+
+            await _wait_until(lambda: len(create_bodies) == 1)
+            body = create_bodies[0]
+            assert body["host_id"] == _HOST_ID, body
+            # Workspace is the worktree dir; the git spec is in bind mode
+            # (existing_worktree) so no worktree is created, and the worktree's
+            # branch rides along as branch_name so the sidebar shows it and the
+            # delete flow can offer to remove it.
+            assert body["workspace"] == "/work/repo-worktrees/feature-x", body
+            assert body["git"]["existing_worktree"] is True, body
+            assert body["git"]["branch_name"] == "feature/x", body
+        finally:
+            await browser.close()
+
+
 # Session-bound agents the discovery scan returns. Both clone names below root
 # to the built-in "claude-native-ui", so the picker must drop both; the fork of
 # a fork (two nested suffixes) is the case a single-layer strip missed.
@@ -1843,5 +2304,147 @@ async def _drive_fork_of_fork_dedup(base_url: str, session_id: str) -> None:
             # the "Create custom agent" action — no duplicate "Claude Code"
             # sneaks in via a leaked clone.
             await expect(page.get_by_role("menuitem")).to_have_count(3)
+        finally:
+            await browser.close()
+
+
+def test_start_session_project_prefill(seeded_session: tuple[str, str]) -> None:
+    """The project pencil prefills the composer from the project's newest session.
+
+    Clicking a project folder's "new session" pencil must (a) seed the host,
+    agent, and source repo — resolved back to the main work tree when that
+    session ran in a linked worktree — from the project's newest session,
+    beating the host's recent-workspace default, (b) auto-generate a fresh
+    worktree branch, and (c) send it all on ``POST /v1/sessions``.
+    """
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_project_prefill(base_url, session_id))
+
+
+async def _drive_project_prefill(base_url: str, session_id: str) -> None:
+    project = "E2E Prefill"
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_bodies: list[dict[str, Any]] = []
+            await _register_common_routes(
+                page, created_session_id=session_id, create_bodies=create_bodies
+            )
+
+            async def handle_projects(route: Route) -> None:
+                # One project so exactly one folder (and pencil) renders.
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps([project]),
+                )
+
+            async def handle_worktrees(route: Route) -> None:
+                # The repo's worktree set: querying from the linked worktree
+                # resolves the ``is_main`` source repo, and the seeded repo's
+                # own listing proves git-ness for the branch auto-generation.
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps(
+                        {
+                            "object": "list",
+                            "data": [
+                                {
+                                    "path": "/work/repo",
+                                    "branch": "main",
+                                    "is_main": True,
+                                    "detached": False,
+                                },
+                                {
+                                    "path": "/work/repo-worktrees/feature-x",
+                                    "branch": "feature/x",
+                                    "is_main": False,
+                                    "detached": False,
+                                },
+                            ],
+                        }
+                    ),
+                )
+
+            async def handle_newest_session(route: Route) -> None:
+                # The prefill's newest-session lookup (``GET /v1/sessions``
+                # with ``?project=``): a session that ran in a linked worktree
+                # of /work/repo on the stubbed host. Everything else falls
+                # back to the common sessions handler.
+                if route.request.method == "GET" and "project=" in route.request.url:
+                    await route.fulfill(
+                        status=200,
+                        content_type="application/json",
+                        body=json.dumps(
+                            {
+                                "data": [
+                                    {
+                                        "id": "conv_prefill_seed",
+                                        "object": "conversation",
+                                        "title": "Previous project session",
+                                        "created_at": 0,
+                                        "updated_at": 9,
+                                        "labels": {"omni_project": project},
+                                        "host_id": _HOST_ID,
+                                        "workspace": "/work/repo-worktrees/feature-x",
+                                        "git_branch": "feature/x",
+                                        "agent_id": "ag_claude_e2e",
+                                    }
+                                ],
+                                "first_id": "conv_prefill_seed",
+                                "last_id": "conv_prefill_seed",
+                                "has_more": False,
+                            }
+                        ),
+                    )
+                else:
+                    await route.fallback()
+
+            # Registered after the common routes so they win for their URLs.
+            await page.route("**/v1/sessions/projects*", handle_projects)
+            await page.route(_WORKTREES_RE, handle_worktrees)
+            await page.route(_SESSIONS_RE, handle_newest_session)
+
+            # A recent workspace that would win under the generic seeding
+            # rules — the project prefill must replace it.
+            await page.add_init_script(
+                f"""window.localStorage.setItem(
+                    "omnigent:recent-workspaces",
+                    JSON.stringify({{ {_HOST_ID}: ["/work/other"] }})
+                );"""
+            )
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+
+            # The pencil is hover-revealed on the project folder's header.
+            header = page.get_by_role("button", name=project, exact=True)
+            await header.hover()
+            await page.get_by_test_id("project-new-session").click()
+
+            # Chips prefill from the newest session: the source repo (not the
+            # worktree dir, not the recent) and a fresh generated branch.
+            await expect(page.get_by_test_id("new-chat-landing-workspace-chip")).to_contain_text(
+                "repo"
+            )
+            await expect(page.get_by_test_id("new-chat-landing-branch-chip")).to_contain_text(
+                re.compile(r"worktree-[0-9a-f]{8}")
+            )
+
+            await page.get_by_test_id("new-chat-landing-input").fill("continue the project")
+            await page.get_by_test_id("new-chat-landing-submit").click()
+
+            await _wait_until(lambda: len(create_bodies) == 1)
+            body = create_bodies[0]
+            assert body["host_id"] == _HOST_ID, body
+            assert body["workspace"] == "/work/repo", body
+            assert body["agent_id"] == "ag_claude_e2e", body
+            git = body.get("git") or {}
+            assert re.fullmatch(r"worktree-[0-9a-f]{8}", git.get("branch_name", "")), body
+            assert git.get("base_branch") is None, body
         finally:
             await browser.close()

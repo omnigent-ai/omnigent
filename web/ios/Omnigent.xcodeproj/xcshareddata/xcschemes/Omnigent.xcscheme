@@ -39,7 +39,27 @@
                ReferencedContainer = "container:Omnigent.xcodeproj">
             </BuildableReference>
          </TestableReference>
+         <TestableReference
+            skipped = "NO"
+            parallelizable = "YES">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintIdentifier = "A0000000000000000000000A"
+               BuildableName = "OmnigentUITests.xctest"
+               BlueprintName = "OmnigentUITests"
+               ReferencedContainer = "container:Omnigent.xcodeproj">
+            </BuildableReference>
+         </TestableReference>
       </Testables>
+      <MacroExpansion>
+         <BuildableReference
+            BuildableIdentifier = "primary"
+            BlueprintIdentifier = "A00000000000000000000006"
+            BuildableName = "Omnigent.app"
+            BlueprintName = "Omnigent"
+            ReferencedContainer = "container:Omnigent.xcodeproj">
+         </BuildableReference>
+      </MacroExpansion>
    </TestAction>
    <LaunchAction
       buildConfiguration = "Debug"

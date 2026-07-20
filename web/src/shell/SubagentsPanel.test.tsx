@@ -1,4 +1,4 @@
-import { cleanup, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import {
   BookOpenIcon,
   Code2Icon,
@@ -37,6 +37,9 @@ vi.mock("@/components/icons/CodexIcon", () => ({
 }));
 vi.mock("@/components/icons/OpenCodeIcon", () => ({
   OpenCodeIcon: (props: Record<string, unknown>) => <svg {...props} data-icon="opencode" />,
+}));
+vi.mock("@/components/icons/KiroIcon", () => ({
+  KiroIcon: (props: Record<string, unknown>) => <svg {...props} data-icon="kiro" />,
 }));
 // Same marker treatment for the local pi glyph so selection assertions stay uniform.
 vi.mock("@/components/icons/PiIcon", () => ({
@@ -89,6 +92,15 @@ function childRow(container: HTMLElement, childId: string): HTMLElement {
   const el = container.querySelector<HTMLElement>(`[data-child-session-id="${childId}"]`);
   if (!el) throw new Error(`subagent row ${childId} not rendered`);
   return el;
+}
+
+function collapseToggleFor(container: HTMLElement, childId: string): HTMLElement {
+  const row = childRow(container, childId);
+  const toggle = row
+    .closest("li")
+    ?.querySelector<HTMLElement>('[data-testid="subagent-collapse-toggle"]');
+  if (!toggle) throw new Error(`collapse toggle for ${childId} not rendered`);
+  return toggle;
 }
 
 /** Point useChildSessions at an id-keyed tree of children. The panel
@@ -513,7 +525,7 @@ describe("SubagentsPanel", () => {
     expect(within(row).queryByText("thread_child_alpha")).toBeNull();
   });
 
-  it("uses native logos for Claude Code, Codex, and OpenCode child rows", () => {
+  it("uses native logos for Claude Code, Codex, OpenCode, and Kiro child rows", () => {
     mockChildTree({
       conv_root: [
         childInfo({
@@ -537,6 +549,13 @@ describe("SubagentsPanel", () => {
           session_name: "review-auth-refactor",
           labels: { "omnigent.wrapper": "claude-code-native-ui" },
         }),
+        childInfo({
+          id: "conv_kiro",
+          title: "kiro:harden-auth",
+          tool: "kiro",
+          session_name: "harden-auth",
+          labels: { "omnigent.wrapper": "kiro-native-ui" },
+        }),
       ],
     });
 
@@ -553,6 +572,10 @@ describe("SubagentsPanel", () => {
     const claudeRow = childRow(container, "conv_claude");
     expect(claudeRow.querySelector('[data-icon="claude"]')).not.toBeNull();
     expect(claudeRow.querySelector(".lucide-code-2")).toBeNull();
+
+    // Kiro renders its own glyph now, not the borrowed Cursor mark (#1137).
+    const kiroRow = childRow(container, "conv_kiro");
+    expect(kiroRow.querySelector('[data-icon="kiro"]')).not.toBeNull();
   });
 
   it("gives native sub-agent children role/Otto icons, not the brand logo", () => {
@@ -663,15 +686,13 @@ describe("SubagentsPanel", () => {
     expect(row.querySelector('[data-icon="pi"]')).toBeNull();
   });
 
-  it("polls the child-sessions list at the tree's staleness-floor interval", () => {
-    // The stream only pushes ``session.child_session.updated`` for the
-    // streamed session's direct children — the rest of the tree has no
-    // live channel — so every list in the rail refetches on a poll floor.
+  it("fetches child sessions without polling (push-driven via watch-set)", () => {
     useChildSessionsMock.mockReturnValue({ children: [], isLoading: false, error: null });
 
     renderPanel({ rootSessionId: "conv_root" });
 
-    expect(useChildSessionsMock).toHaveBeenLastCalledWith("conv_root", 15_000);
+    expect(useChildSessionsMock).toHaveBeenCalledWith("conv_root");
+    expect(useChildSessionsMock).not.toHaveBeenCalledWith("conv_root", expect.any(Number));
   });
 
   it("highlights the main row when conversationId === rootSessionId (on the parent)", () => {
@@ -776,6 +797,176 @@ describe("SubagentsPanel", () => {
     );
   });
 
+  it.each([
+    ["runner_disconnected", "Runner disconnected unexpectedly."],
+    ["runner_failed_to_start", "runner exited before the first turn"],
+  ])(
+    "renders a quiet grey disconnected dot (no word, not red 'Failed') for the runner-disconnect code %s",
+    (code, message) => {
+      // Option B: a runner that merely disconnected/exited is NOT a task
+      // failure. The child summary still collapses to current_task_status
+      // "failed", but last_task_error.code carries the disconnect cause, so
+      // the row must branch to the quiet disconnected dot before the red
+      // "Failed" pill. The dot shows NO inline word — the cause lives in the
+      // tooltip — and uses the neutral grey --muted-foreground token, never
+      // the shared amber --warning.
+      mockChildTree({
+        conv_parent: [
+          childInfo({
+            id: "conv_child",
+            title: "researcher:auth",
+            tool: "researcher",
+            session_name: "auth",
+            current_task_status: "failed",
+            last_task_error: { code, message },
+          }),
+        ],
+      });
+
+      const { container } = renderPanel();
+
+      const row = childRow(container, "conv_child");
+      const indicator = within(row).getByTestId("subagent-status-dot");
+      // The inline "Disconnected" word is hidden (quiet dot, like idle/done).
+      expect(row).not.toHaveTextContent(/Disconnected/);
+      expect(row).not.toHaveTextContent(/Failed/);
+      // Positive quiet-dot guarantee: disconnected falls through to the
+      // generic quiet-dot path, so the wrapper carries the standard muted text
+      // class (same as idle/done) and the grey --muted-foreground dot is the
+      // ONLY color hook — no warning/destructive bleed on the wrapper or the
+      // dot, and crucially never the shared amber --warning (owned by "Needs
+      // response"). The blue --session-active hue is now reserved for the
+      // launching/idle/done dots, so it must NOT appear here.
+      expect(indicator).toHaveClass("text-muted-foreground");
+      expect(indicator).not.toHaveClass("text-warning");
+      expect(indicator).not.toHaveClass("text-destructive");
+      const dot = indicator.querySelector("span.rounded-full");
+      expect(dot).toHaveClass("bg-muted-foreground");
+      expect(dot).not.toHaveClass("bg-session-active");
+      expect(dot).not.toHaveClass("bg-warning");
+      expect(dot).not.toHaveClass("bg-destructive");
+      // The cause is still surfaced in the accessible label / tooltip.
+      expect(indicator).toHaveAttribute("aria-label", `Disconnected: ${message}`);
+    },
+  );
+
+  it("keeps rendering red 'Failed' for a genuine task failure (non-disconnect code)", () => {
+    // Guard the hard constraint: only runner-disconnect/exit codes become
+    // "Disconnected"; any other error code is a real failure and stays red.
+    mockChildTree({
+      conv_parent: [
+        childInfo({
+          id: "conv_child",
+          title: "researcher:auth",
+          tool: "researcher",
+          session_name: "auth",
+          current_task_status: "failed",
+          last_task_error: { code: "tool_error", message: "Tool raised ValueError" },
+        }),
+      ],
+    });
+
+    const { container } = renderPanel();
+
+    const row = childRow(container, "conv_child");
+    const indicator = within(row).getByTestId("subagent-status-dot");
+    expect(row).toHaveTextContent(/Failed/);
+    expect(row).not.toHaveTextContent(/Disconnected/);
+    expect(indicator).toHaveClass("text-destructive");
+    expect(indicator.querySelector(".bg-destructive")).not.toBeNull();
+  });
+
+  it.each([
+    ["runner_disconnected", "Runner disconnected unexpectedly."],
+    ["runner_failed_to_start", "runner exited before the first turn"],
+  ])(
+    "renders a quiet grey disconnected dot on the main row when the parent failed with the runner-disconnect code %s",
+    (code, message) => {
+      // The session snapshot collapses a runner exit to status "failed" but
+      // preserves the cause in lastTaskError.code (runner_failed_to_start /
+      // runner_disconnected). The main row must branch on it to render the
+      // quiet grey disconnected dot rather than the red "Failed" pill.
+      // Parametrized over BOTH disconnect codes, mirroring the child-row
+      // it.each above so neither code can regress on the main row.
+      useChildSessionsMock.mockReturnValue({ children: [], isLoading: false, error: null });
+      useSessionMock.mockReturnValue({
+        session: {
+          id: "conv_root",
+          agentId: "ag_root",
+          agentName: null,
+          runnerId: null,
+          status: "failed",
+          lastTaskError: { code, message },
+          createdAt: 0,
+          title: null,
+          labels: {},
+          items: [],
+          pendingElicitations: [],
+          permissionLevel: 4,
+          parentSessionId: null,
+          subAgentName: null,
+        },
+        isLoading: false,
+        error: null,
+      } as unknown as ReturnType<typeof useSession>);
+
+      renderPanel({ rootSessionId: "conv_root" });
+
+      const mainRow = screen.getByTestId("subagent-main-row");
+      const indicator = within(mainRow).getByTestId("subagent-status-dot");
+      // Quiet grey dot, no inline word — distinct from the red "Failed" pill.
+      expect(mainRow).not.toHaveTextContent(/Disconnected/);
+      expect(mainRow).not.toHaveTextContent(/Failed/);
+      // Positive quiet-dot guarantee: the wrapper carries the standard muted
+      // quiet-dot text class (same path as idle/done) and the grey dot is the
+      // ONLY color hook — no warning/destructive class bleeds onto either the
+      // wrapper or the dot. The blue --session-active hue is reserved for the
+      // launching/idle/done dots, so it must NOT appear here.
+      expect(indicator).toHaveClass("text-muted-foreground");
+      expect(indicator).not.toHaveClass("text-warning");
+      expect(indicator).not.toHaveClass("text-destructive");
+      const dot = indicator.querySelector("span.rounded-full");
+      expect(dot).toHaveClass("bg-muted-foreground");
+      expect(dot).not.toHaveClass("bg-session-active");
+      expect(dot).not.toHaveClass("bg-warning");
+      expect(dot).not.toHaveClass("bg-destructive");
+      // The disconnect cause stays in the tooltip / accessible label.
+      expect(indicator).toHaveAttribute("aria-label", `Disconnected: ${message}`);
+    },
+  );
+
+  it("renders red 'Failed' on the main row for a genuine parent failure (non-disconnect code)", () => {
+    useChildSessionsMock.mockReturnValue({ children: [], isLoading: false, error: null });
+    useSessionMock.mockReturnValue({
+      session: {
+        id: "conv_root",
+        agentId: "ag_root",
+        agentName: null,
+        runnerId: null,
+        status: "failed",
+        lastTaskError: { code: "turn_error", message: "turn setup failed" },
+        createdAt: 0,
+        title: null,
+        labels: {},
+        items: [],
+        pendingElicitations: [],
+        permissionLevel: 4,
+        parentSessionId: null,
+        subAgentName: null,
+      },
+      isLoading: false,
+      error: null,
+    } as unknown as ReturnType<typeof useSession>);
+
+    renderPanel({ rootSessionId: "conv_root" });
+
+    const mainRow = screen.getByTestId("subagent-main-row");
+    const indicator = within(mainRow).getByTestId("subagent-status-dot");
+    expect(mainRow).toHaveTextContent(/Failed/);
+    expect(mainRow).not.toHaveTextContent(/Disconnected/);
+    expect(indicator).toHaveClass("text-destructive");
+  });
+
   it("shows the pulsing working dot (no redundant 'Working' word) on the main row when the parent session is running", () => {
     useChildSessionsMock.mockReturnValue({ children: [], isLoading: false, error: null });
     useSessionMock.mockReturnValue({
@@ -843,23 +1034,52 @@ describe("SubagentsPanel", () => {
           busy: true,
           current_task_status: "in_progress",
         }),
+        childInfo({ id: "c_launch", tool: "researcher", current_task_status: "launching" }),
         childInfo({ id: "c_done", tool: "researcher", current_task_status: "completed" }),
+        childInfo({ id: "c_idle", tool: "researcher" }),
+        // A verbatim "other status" fallthrough — the GREY exception.
+        childInfo({ id: "c_other", tool: "researcher", current_task_status: "cancelled" }),
         childInfo({ id: "c_fail", tool: "researcher", current_task_status: "failed" }),
       ],
     });
 
     const { container } = renderPanel();
 
-    // Working reuses the sidebar RunningDot in the brand-pink tone —
+    const dotOf = (id: string) =>
+      within(childRow(container, id))
+        .getByTestId("subagent-status-dot")
+        .querySelector("span.rounded-full");
+
+    // Working reuses the sidebar RunningDot in the grey tone —
     // identical to the sidebar's running indicator; a wrong tone drops
-    // bg-brand-accent.
+    // text-muted-foreground.
     expect(
-      childRow(container, "c_work").querySelector('[data-testid="running-dot"].bg-brand-accent'),
+      childRow(container, "c_work").querySelector(
+        '[data-testid="running-dot"].text-muted-foreground',
+      ),
     ).not.toBeNull();
-    // Terminal states use design tokens, not raw 500-weight Tailwind. "done"
-    // is a quiet, expected outcome, so it reads as a muted dot (not green);
-    // failures keep destructive text + a destructive dot.
-    expect(childRow(container, "c_done").querySelector(".bg-muted-foreground\\/55")).not.toBeNull();
+
+    // Panel-scoped palette swap: the quiet live/settled states read in the
+    // blue --session-active hue, each PRESERVING its prior opacity treatment
+    // (launching kept /70, idle + done kept /55) — only the hue flipped from
+    // grey to blue.
+    const launchDot = dotOf("c_launch");
+    expect(launchDot).toHaveClass("bg-session-active/70");
+    expect(launchDot).not.toHaveClass("bg-muted-foreground/70");
+    const doneDot = dotOf("c_done");
+    expect(doneDot).toHaveClass("bg-session-active/55");
+    expect(doneDot).not.toHaveClass("bg-muted-foreground/55");
+    const idleDot = dotOf("c_idle");
+    expect(idleDot).toHaveClass("bg-session-active/55");
+    expect(idleDot).not.toHaveClass("bg-muted-foreground/55");
+
+    // Exception: the verbatim "other status" fallthrough STAYS neutral grey —
+    // it is the one quiet dot the swap deliberately leaves on --muted-foreground.
+    const otherDot = dotOf("c_other");
+    expect(otherDot).toHaveClass("bg-muted-foreground/55");
+    expect(otherDot).not.toHaveClass("bg-session-active/55");
+
+    // Terminal failures keep destructive text + a destructive dot.
     const failedIndicator = within(childRow(container, "c_fail")).getByTestId(
       "subagent-status-dot",
     );
@@ -920,9 +1140,22 @@ describe("SubagentsPanel", () => {
     // The unexpected "cancelled" terminal state keeps its word so it stands out.
     expect(childRow(container, "c_cancel")).toHaveTextContent(/cancelled/);
     // Launching is not yet real work, so it shows its word and does not reuse
-    // the active running dot.
+    // the active running dot. Its inline word now reads in the blue
+    // --session-active hue (matching its dot), not the neutral muted text.
     expect(childRow(container, "c_launch")).toHaveTextContent(/Launching/);
     expect(childRow(container, "c_launch").querySelector('[data-testid="running-dot"]')).toBeNull();
+    const launchIndicator = within(childRow(container, "c_launch")).getByTestId(
+      "subagent-status-dot",
+    );
+    expect(launchIndicator).toHaveClass("text-session-active");
+    expect(launchIndicator).not.toHaveClass("text-muted-foreground");
+    // The verbatim "other" word stays neutral grey — its wrapper keeps the
+    // muted text class (the GREY exception).
+    const cancelIndicator = within(childRow(container, "c_cancel")).getByTestId(
+      "subagent-status-dot",
+    );
+    expect(cancelIndicator).toHaveClass("text-muted-foreground");
+    expect(cancelIndicator).not.toHaveClass("text-session-active");
     // Quiet states render no word — the label lives in the tooltip. Working is
     // quiet too: the pulsing pink dot already reads as "active".
     expect(childRow(container, "c_work")).not.toHaveTextContent(/Working/);
@@ -1147,6 +1380,66 @@ describe("SubagentsPanel", () => {
     expect(pad("conv_ggchild")).toBeGreaterThan(pad("conv_grandchild"));
   });
 
+  it("collapses and expands a row's nested subagents", () => {
+    mockChildTree({
+      conv_root: [
+        childInfo({ id: "conv_child", tool: "researcher", session_name: "auth" }),
+        childInfo({ id: "conv_leaf", tool: "Explore", session_name: "leaf" }),
+      ],
+      conv_child: [childInfo({ id: "conv_grandchild", tool: "Explore", session_name: "files" })],
+    });
+
+    const { container } = renderPanel({ rootSessionId: "conv_root" });
+
+    expect(childRow(container, "conv_grandchild")).toBeInTheDocument();
+    expect(screen.getAllByTestId("subagent-collapse-toggle")).toHaveLength(1);
+
+    const toggle = screen.getByTestId("subagent-collapse-toggle");
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    expect(toggle).toHaveAttribute("aria-label", "Collapse subagents");
+
+    fireEvent.click(toggle);
+
+    expect(container.querySelector('[data-child-session-id="conv_grandchild"]')).toBeNull();
+    expect(childRow(container, "conv_leaf")).toBeInTheDocument();
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(toggle).toHaveAttribute("aria-label", "Expand subagents");
+
+    fireEvent.click(toggle);
+
+    expect(childRow(container, "conv_grandchild")).toBeInTheDocument();
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    expect(toggle).toHaveAttribute("aria-label", "Collapse subagents");
+  });
+
+  it("preserves a nested row's collapsed state when its parent unmounts it", () => {
+    mockChildTree({
+      conv_root: [childInfo({ id: "conv_child", tool: "researcher", session_name: "auth" })],
+      conv_child: [childInfo({ id: "conv_grandchild", tool: "Explore", session_name: "files" })],
+      conv_grandchild: [childInfo({ id: "conv_ggchild", tool: "Explore", session_name: "deep" })],
+    });
+
+    const { container } = renderPanel({ rootSessionId: "conv_root" });
+
+    const childToggle = collapseToggleFor(container, "conv_child");
+    const grandchildToggle = collapseToggleFor(container, "conv_grandchild");
+
+    fireEvent.click(grandchildToggle);
+    expect(container.querySelector('[data-child-session-id="conv_ggchild"]')).toBeNull();
+    expect(grandchildToggle).toHaveAttribute("aria-expanded", "false");
+
+    fireEvent.click(childToggle);
+    expect(container.querySelector('[data-child-session-id="conv_grandchild"]')).toBeNull();
+
+    fireEvent.click(childToggle);
+    expect(childRow(container, "conv_grandchild")).toBeInTheDocument();
+    expect(container.querySelector('[data-child-session-id="conv_ggchild"]')).toBeNull();
+    expect(collapseToggleFor(container, "conv_grandchild")).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+  });
+
   it("stops fetching and rendering below the depth cap", () => {
     mockChildTree({
       conv_root: [childInfo({ id: "c1", tool: "researcher" })],
@@ -1163,8 +1456,8 @@ describe("SubagentsPanel", () => {
     ).toEqual(["c1", "c2", "c3"]);
     // The depth-3 row's child query is disabled (null id) instead of
     // fetching c3's children.
-    expect(useChildSessionsMock).toHaveBeenCalledWith(null, expect.any(Number));
-    expect(useChildSessionsMock).not.toHaveBeenCalledWith("c3", expect.any(Number));
+    expect(useChildSessionsMock).toHaveBeenCalledWith(null);
+    expect(useChildSessionsMock).not.toHaveBeenCalledWith("c3");
   });
 
   it("highlights the active grandchild row", () => {

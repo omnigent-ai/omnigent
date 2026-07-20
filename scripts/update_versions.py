@@ -18,7 +18,7 @@ It edits ONLY the ``[project].version`` line and the sibling ``==``
 pins, matched by package name — never a blind version-string replace —
 so unrelated version literals (host/runner wire-protocol versions,
 docstring examples, third-party dependency floors like
-``databricks-mcp>=0.1.0``) are left untouched.
+``databricks-mcp>=0.9.0``) are left untouched.
 
 ``web/package.json`` (a ``0.0.0`` sentinel for the private SPA) and
 ``web/electron/package.json`` (the desktop app's independent
@@ -107,6 +107,15 @@ def packages(root: Path) -> list[Package]:
 # ``version = "..."`` on its own line (the [project].version field).
 _VERSION_LINE = re.compile(r'^version = "[^"]*"$', re.MULTILINE)
 
+# ``VERSION = "..."`` on its own line — the runtime constant in
+# ``omnigent/version.py`` that mirrors the canonical [project].version.
+_VERSION_CONSTANT = re.compile(r'^VERSION = "[^"]*"$', re.MULTILINE)
+
+
+def _version_py(root: Path) -> Path:
+    """Return the path to the runtime version constant module."""
+    return root / "omnigent" / "version.py"
+
 
 def _pin_pattern(name: str) -> re.Pattern[str]:
     """
@@ -159,6 +168,11 @@ def set_version(root: Path, new_version: str) -> list[Path]:
     """
     Rewrite every package's version + sibling pins to *new_version*.
 
+    Also rewrites the runtime ``VERSION`` constant in ``omnigent/version.py``
+    so the value the runtime imports stays equal to ``[project].version`` —
+    the automated bump path must keep both in lockstep (the ``sync-version-py``
+    pre-commit fixer only fires in the local dev flow).
+
     :param root: Repo root.
     :param new_version: PEP 440 version to stamp, e.g. ``"0.1.2"``.
     :returns: The list of files changed (in edit order).
@@ -182,6 +196,17 @@ def set_version(root: Path, new_version: str) -> list[Path]:
             )
         pkg.pyproject.write_text(text)
         changed.append(pkg.pyproject)
+
+    version_py = _version_py(root)
+    version_text = _sub_exactly_once(
+        _VERSION_CONSTANT,
+        f'VERSION = "{new_version}"',
+        version_py.read_text(),
+        f"VERSION constant in {version_py}",
+    )
+    version_py.write_text(version_text)
+    changed.append(version_py)
+
     return changed
 
 
@@ -189,27 +214,51 @@ def next_dev_version(released: str) -> str:
     """
     Compute the next development version after releasing *released*.
 
-    Mirrors MLflow's post-release convention: bump the patch component
-    and append ``.dev0`` (e.g. ``0.1.2`` -> ``0.1.3.dev0``).
+    ``main`` carries the next MINOR as ``.dev0`` (the 0.5 cycle left main at
+    ``0.6.0.dev0``), and post-release runs only when a new ``branch-X.Y``
+    cycle is cut — patches never move main — so bump the minor, not the
+    micro. A micro bump would re-freeze main on the released line and make
+    doc-sync stage to the docs branch the release already owns.
 
-    :param released: The just-released version, e.g. ``"0.1.2"``.
-    :returns: The next dev version, e.g. ``"0.1.3.dev0"``.
+    :param released: The just-released version, e.g. ``"0.6.0rc1"``.
+    :returns: The next dev version, e.g. ``"0.7.0.dev0"``.
     """
     v = Version(released)
-    return f"{v.major}.{v.minor}.{v.micro + 1}.dev0"
+    return f"{v.major}.{v.minor + 1}.0.dev0"
+
+
+def _read_version_constant(root: Path) -> str:
+    """
+    Return the ``VERSION`` literal from ``omnigent/version.py``.
+
+    :param root: Repo root.
+    :returns: The quoted value of the ``VERSION`` assignment.
+    :raises ValueError: If the assignment is missing or not unique.
+    """
+    version_py = _version_py(root)
+    matches = _VERSION_CONSTANT.findall(version_py.read_text())
+    if len(matches) != 1:
+        raise ValueError(
+            f'expected exactly one `VERSION = "..."` line in {version_py}, found {len(matches)}'
+        )
+    return matches[0].split('"')[1]
 
 
 def check(root: Path, expect: str | None = None) -> str:
     """
     Verify every package agrees on the version and pins its siblings.
 
+    Also checks the runtime ``VERSION`` constant in ``omnigent/version.py``
+    against the resolved version, so a bump that forgets it fails here rather
+    than in the ``test_version_matches_pyproject`` backstop on the bot PR.
+
     :param root: Repo root.
     :param expect: If given, additionally assert the resolved version
         equals this (compared as PEP 440), e.g. ``"0.1.2"``.
     :returns: The single resolved version string.
     :raises ValueError: If versions disagree, a sibling pin is missing
-        or not pinned to the package's own version, or the resolved
-        version differs from *expect*.
+        or not pinned to the package's own version, the runtime ``VERSION``
+        constant differs, or the resolved version differs from *expect*.
     """
     versions: dict[str, str] = {}
     for pkg in packages(root):
@@ -224,6 +273,11 @@ def check(root: Path, expect: str | None = None) -> str:
     if len(unique) != 1:
         raise ValueError(f"package versions disagree: {versions}")
     resolved = unique.pop()
+    constant = _read_version_constant(root)
+    if Version(constant) != Version(resolved):
+        raise ValueError(
+            f"omnigent/version.py VERSION {constant!r} != [project].version {resolved!r}"
+        )
     if expect is not None and Version(resolved) != Version(expect):
         raise ValueError(f"resolved version {resolved} != expected {expect}")
     return resolved

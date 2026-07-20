@@ -20,7 +20,7 @@ const mobileMenu = {
   hideTerminalsTab: false,
   showShellsTab: false,
   terminalsLength: 0,
-  isClaudeNative: false,
+  todosSupported: false,
   todosCompleted: 0,
   todosTotal: 0,
   debugMode: false,

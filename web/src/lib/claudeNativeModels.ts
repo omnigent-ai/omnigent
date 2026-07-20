@@ -10,10 +10,17 @@
  */
 export const CLAUDE_NATIVE_MODELS = [
   // Ordered by capability tier, most powerful first.
-  // Fable temporarily withheld while Anthropic has Fable access disabled.
-  // { id: "fable", label: "Fable" },
+  { id: "fable", label: "Fable" },
   { id: "opus", label: "Opus" },
-  { id: "sonnet", label: "Sonnet" },
+  // The "sonnet" alias stays pinned to the workspace's existing default
+  // Sonnet (4.6); relabelled from the bare "Sonnet" only so it reads
+  // unambiguously next to the opt-in row below. Its model binding is
+  // unchanged — picking this row resolves exactly as it did before.
+  { id: "sonnet", label: "Sonnet 4.6" },
+  // Newer Sonnet, offered as an explicit opt-in via Claude Code's one
+  // custom /model slot (ANTHROPIC_CUSTOM_MODEL_OPTION) — not a family
+  // alias, and it does NOT change the default "sonnet" binding above.
+  { id: "sonnet_5", label: "Sonnet 5" },
   { id: "haiku", label: "Haiku" },
 ] as const;
 
@@ -21,12 +28,10 @@ export const CLAUDE_NATIVE_MODELS = [
  * Is `model` something a Claude Code (claude-native) session can actually
  * run — i.e. a Claude model rather than a foreign harness's id?
  *
- * Accepts the version-agnostic aliases (`opus` / `sonnet` / `haiku`) and
- * any fully-qualified Anthropic id (anything containing `claude`, e.g.
- * `claude-fable-5`, `anthropic/claude-opus-4-8`,
- * `databricks-claude-sonnet-4-6`). The bare `fable` alias no longer
- * matches while Fable is withheld, but pinned `claude-fable-5` sessions
- * still pass via the `claude` branch. Rejects everything else — notably the
+ * Accepts the version-agnostic aliases (`fable` / `opus` / `sonnet` /
+ * `haiku`) and any fully-qualified Anthropic id (anything containing
+ * `claude`, e.g. `claude-fable-5`, `anthropic/claude-opus-4-8`,
+ * `databricks-claude-sonnet-4-6`). Rejects everything else — notably the
  * Codex / OpenAI defaults (`gpt-5.4`, `gpt-5.4-mini`, …) that leak into the
  * cross-harness global picker selection.
  *

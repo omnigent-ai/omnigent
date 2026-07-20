@@ -68,12 +68,38 @@ curl -fsSL https://raw.githubusercontent.com/omnigent-ai/omnigent/main/scripts/i
 ```
 
 <details>
+<summary>Optional integrations and extras</summary>
+
+Need an optional integration? Pass one or more extras to the installer:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/omnigent-ai/omnigent/main/scripts/install_oss.sh | sh -s -- --extra databricks
+curl -fsSL https://raw.githubusercontent.com/omnigent-ai/omnigent/main/scripts/install_oss.sh | sh -s -- --extra modal,e2b
+```
+
+Available user-facing extras include:
+
+- **Model providers:** `databricks`, `bedrock`, `vertex`
+- **Sandbox providers:** `modal`, `daytona`, `boxlite`, `cwsandbox`, `e2b`,
+  `openshell`, `kubernetes`
+- **SDK harnesses:** `antigravity`, `copilot`, `cursor`, `agents-sdk`
+- **Storage and memory:** `s3`, `hindsight`
+
+</details>
+
+<details>
 <summary>Prefer to install manually?</summary>
 
 Omnigent needs **Python 3.12+**. Install the `omnigent` package:
 
 ```bash
 uv tool install omnigent        # or: pip install "omnigent"
+```
+
+Manual installs use the same extras syntax, for example:
+
+```bash
+uv tool install "omnigent[databricks,modal]"
 ```
 
 Or with [Homebrew](https://github.com/omnigent-ai/homebrew-tap):
@@ -100,8 +126,13 @@ uv tool install -q --python 3.12 git+https://github.com/omnigent-ai/omnigent.git
   harnesses (Claude, Codex, OpenCode, Pi). `omnigent run` installs the
   harness CLI you pick.
   https://docs.npmjs.com/downloading-and-installing-node-js-and-npm
+- **Kiro CLI** (optional), for `omnigent kiro`: install with
+  `curl -fsSL https://cli.kiro.dev/install | bash`, then sign in with Kiro.
+  Kiro tool approvals stay answerable in the embedded Terminal; supported
+  one-time approvals also appear as Chat cards. See
+  `docs/kiro-native-elicitation.md`.
 - **`tmux`**, required by the native `omnigent <harness>` terminal wrappers
-  (`claude`, `codex`, `cursor`, `hermes`, `pi`)
+  (`claude`, `codex`, `cursor`, `hermes`, `kiro`, `pi`)
   (`brew install tmux` / `apt install tmux`; the installer offers
   to install it for you).
 - **`bubblewrap`** (`bwrap`), **Linux only**. The native `omnigent <harness>`
@@ -168,13 +199,48 @@ mirrors work out of the box; override with `OMNIGENT_INDEX_URL` if needed.
 
 </details>
 
+<details>
+<summary>Uninstalling Omnigent</summary>
+
+Preview the CLI/profile cleanup that would run by default:
+
+```bash
+omnigent uninstall
+```
+
+Remove the CLI and installer-managed PATH entries while keeping your local
+history, credentials, and projects:
+
+```bash
+omnigent uninstall --yes
+```
+
+To also remove Omnigent state under `~/.omnigent`, pass `--purge`; Omnigent
+backs it up outside the target before deletion. Your `~/omnigent` workspace is
+kept unless you explicitly add `--purge-workspace`.
+
+```bash
+omnigent uninstall --purge --yes
+```
+
+If the installed wheel is broken or `omnigent` is not on `PATH`, run the
+standalone script instead:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/omnigent-ai/omnigent/main/scripts/uninstall_oss.sh | sh
+```
+
+Add `--yes` to the standalone script to perform the previewed CLI cleanup.
+
+</details>
+
 ### 2. Start your first agent
 
 `omnigent` picks a model with you and starts a session in your terminal. It
 also launches a local web UI at `http://localhost:6767` that shows the same
 session in the browser, or on a phone on your network (step 4). The
 [desktop app](https://omnigent.ai/docs/interact/desktop) wraps that same UI
-in a native window and adds OS notifications and a dock badge —
+in a native window and adds OS notifications (with a configurable sound) and a dock badge —
 [download it for macOS](https://omnigent.ai/download/mac).
 
 > [!NOTE]
@@ -453,6 +519,10 @@ Polly at [`examples/polly/`](https://github.com/omnigent-ai/omnigent/tree/main/e
 
 Contributions are welcome. See [CONTRIBUTING.md](https://github.com/omnigent-ai/omnigent/blob/main/CONTRIBUTING.md) for how to set up your environment, run the checks, and open a pull request.
 
+Adding or changing support for a harness (Claude, Codex, Cursor, OpenCode,
+Hermes, Pi, ...)? Run the [harness test bench](https://github.com/omnigent-ai/omnigent/tree/main/tests/harness_bench)
+to check its capability matrix against observed behavior.
+
 
 ### Contributors
 
@@ -461,4 +531,3 @@ Thanks to all of our amazing contributors!
 <a href="https://github.com/omnigent-ai/omnigent/graphs/contributors">
   <img src="https://contrib.rocks/image?repo=omnigent-ai/omnigent" />
 </a>
-

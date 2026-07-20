@@ -58,7 +58,6 @@ describe("RunnerStartingIndicator", () => {
     // The exact copy is the user-facing contract — assert the value, not just
     // that *something* rendered (a null/empty state would also pass length>=1).
     expect(indicator).toHaveTextContent(/starting up/i);
-    expect(indicator).toHaveTextContent(/getting your terminal ready/i);
     // The animated spinner is what makes "work is happening" obvious.
     expect(indicator.querySelector(".animate-spin")).not.toBeNull();
     // Announced to assistive tech as a transient status, not a static region.
@@ -73,7 +72,6 @@ describe("RunnerStartingIndicator", () => {
     const indicator = screen.getByTestId("runner-starting-indicator");
     expect(indicator).toBeInTheDocument();
     expect(indicator).toHaveTextContent(/starting up/i);
-    expect(indicator).toHaveTextContent(/getting your terminal ready/i);
     expect(indicator.querySelector(".animate-spin")).not.toBeNull();
     expect(indicator).toHaveAttribute("role", "status");
     expect(indicator).toHaveAttribute("aria-live", "polite");
@@ -145,7 +143,7 @@ describe("RunnerStartingIndicator", () => {
     renderWithContext("row", makeCtx({ terminalStartingUp: true }));
     const indicator = screen.getByTestId("runner-starting-indicator");
     expect(indicator).toHaveTextContent(/cloning repository/i);
-    expect(indicator).not.toHaveTextContent(/getting your terminal ready/i);
+    expect(indicator).not.toHaveTextContent(/starting up/i);
   });
 
   it.each(["hero", "row"] as const)(

@@ -37,7 +37,6 @@ from omnigent.stores.conversation_store import ConversationStore
 # ``foo``) rather than generic. Tunable later if needed; pinned
 # here so it surfaces in grep across the engine + prompt layers.
 # See designs/LIVE_POLICIES.md §4.1.
-_TRAJECTORY_WINDOW = 10
 
 
 class PolicyEngine:
@@ -234,6 +233,60 @@ class PolicyEngine:
         read_only: bool = False,
     ) -> PolicyResult:
         """
+        Evaluate the composed policy decision, recording a span.
+
+        Thin tracing wrapper over :meth:`_evaluate_composed`. Opens a
+        ``policy.evaluate`` span tagged with the phase, resolved tool
+        name, and read-only flag, then records the resulting decision
+        (and reason / deciding policies on a non-ALLOW). This is the one
+        in-process policy choke point — every enforcement site routes
+        through it — so the span makes policy decisions visible inline
+        in the request trace.
+
+        :param ctx: The current evaluation context
+            (phase + content + resolved tool_name).
+        :param read_only: When ``True``, skip persistent side effects;
+            see :meth:`_evaluate_composed`.
+        :returns: The composed :class:`PolicyResult`.
+        """
+        from omnigent.runtime import telemetry
+
+        with telemetry.span(
+            "policy.evaluate",
+            attributes={
+                "policy.phase": getattr(ctx.phase, "name", str(ctx.phase)),
+                "policy.tool_name": ctx.tool_name or "",
+                "policy.read_only": read_only,
+            },
+        ) as evaluate_span:
+            if self._conversation_id:
+                evaluate_span.set_attribute("session.id", self._conversation_id)
+            # The content under evaluation (tool args / prompt) is recorded
+            # only when content capture is on (redacted + capped).
+            telemetry.record_message_payload(
+                {"content": ctx.content},
+                span=evaluate_span,
+                key="policy.content",
+            )
+            result = await self._evaluate_composed(ctx, read_only=read_only)
+            evaluate_span.set_attribute(
+                "policy.decision",
+                getattr(result.action, "name", str(result.action)),
+            )
+            if result.reason:
+                evaluate_span.set_attribute("policy.reason", result.reason)
+            deciding = getattr(result, "deciding_policies", None)
+            if deciding:
+                evaluate_span.set_attribute("policy.deciding_policies", list(deciding))
+            return result
+
+    async def _evaluate_composed(
+        self,
+        ctx: EvaluationContext,
+        *,
+        read_only: bool = False,
+    ) -> PolicyResult:
+        """
         Evaluate the composed policy decision for one phase.
 
         Runs the pipeline from POLICIES.md §4:
@@ -243,8 +296,7 @@ class PolicyEngine:
            b. Skip if the policy's ``condition`` label-gate
               does not match the current hot-cache snapshot.
            c. Dispatch to ``policy.evaluate``.
-           d. Action-list validation and the classifier-only
-              carve-out for FunctionPolicy and PromptPolicy.
+           d. Accumulate any policy result.
            e. Accumulate ``set_labels`` writes.
            f. If the policy returned ``data``, feed it back
               as ``ctx.content`` so the next policy transforms
@@ -288,11 +340,6 @@ class PolicyEngine:
         composed_data: Any = None
         context = self._context()
 
-        # Populate trajectory and session_state once per evaluate so
-        # PromptPolicy classifiers see situational context and function
-        # policies can read accumulated state. Both queries are bounded
-        # to avoid scanning large conversations. See §4.1.
-        ctx = self._populate_trajectory(ctx)
         ctx = self._inject_session_state(ctx)
         ctx = self._inject_usage(ctx)
         ctx = self._inject_subtree_usage(ctx)
@@ -310,7 +357,7 @@ class PolicyEngine:
             # silently dropped per POLICIES.md §9.
             filtered_labels = _filter_writable_labels(result.set_labels, policy.spec)
             if filtered_labels:
-                _merge_monotonic_writes(accumulated, filtered_labels, self.label_defs)
+                accumulated.update(filtered_labels)
             if result.state_updates:
                 accumulated_state.extend(result.state_updates)
             if result.action == PolicyAction.DENY:
@@ -441,9 +488,6 @@ class PolicyEngine:
 
         - The key has a declared ``LabelDef.values`` list and
           the new value is not in it.
-        - The key has a declared ``LabelDef.monotonic`` and
-          the new position (relative to the current cache
-          value) violates the direction.
 
         Keys with no ``LabelDef`` are set freely (omnigent
         parity — "unschema'd labels set freely"). The engine
@@ -490,6 +534,7 @@ class PolicyEngine:
             return
         from omnigent.policies.schema import (
             SESSION_COST_ASK_APPROVED_STATE_KEY,
+            SESSION_COST_UNPRICED_APPROVED_KEY,
             USER_DAILY_ASK_APPROVED_STATE_KEY,
         )
 
@@ -505,7 +550,7 @@ class PolicyEngine:
             if op.key == USER_DAILY_ASK_APPROVED_STATE_KEY:
                 self._record_user_daily_ask_approved(op.value)
             elif (
-                op.key == SESSION_COST_ASK_APPROVED_STATE_KEY
+                op.key in (SESSION_COST_ASK_APPROVED_STATE_KEY, SESSION_COST_UNPRICED_APPROVED_KEY)
                 and self._root_conversation_id != self._conversation_id
             ):
                 self._record_root_cost_ask_approved(op)
@@ -786,12 +831,6 @@ class PolicyEngine:
                 continue
             if ldef.values is not None and value not in ldef.values:
                 continue
-            if ldef.monotonic is not None and not _monotonic_ok(
-                ldef,
-                self._labels.get(key),
-                value,
-            ):
-                continue
             result[key] = value
         return result
 
@@ -857,35 +896,6 @@ class PolicyEngine:
             "session_state": dict(self._session_state),
         }
 
-    def _populate_trajectory(self, ctx: EvaluationContext) -> EvaluationContext:
-        """
-        Return a copy of ``ctx`` with ``trajectory`` populated.
-
-        Queries the conversation store for the last
-        ``_TRAJECTORY_WINDOW`` items in chronological order. If
-        the conversation has fewer than the window size, returns
-        whatever exists (down to an empty list for brand-new
-        conversations). The store lookup is order=``"desc"`` +
-        slice + reverse so the engine asks for the *tail* without
-        first scanning the entire conversation.
-
-        :param ctx: Original :class:`EvaluationContext` from the
-            caller. ``ctx.trajectory`` is overwritten.
-        :returns: A new :class:`EvaluationContext` with
-            ``trajectory`` set to the recent items list (oldest
-            first).
-        """
-        page = self._store.list_items(
-            self._conversation_id,
-            limit=_TRAJECTORY_WINDOW,
-            order="desc",
-        )
-        # ``order="desc"`` returns most-recent first; reverse so the
-        # classifier sees items chronologically (oldest first), which
-        # matches how a human reads a conversation top-down.
-        trajectory = list(reversed(page.data))
-        return replace(ctx, trajectory=trajectory)
-
 
 def _apply_one(state: dict[str, Any], op: StateUpdate) -> None:
     """
@@ -926,16 +936,10 @@ async def _dispatch_policy(
     """
     Run a single policy's ``evaluate`` with full safety net.
 
-    Applies the POLICIES.md §4 / §13 contract:
+    Applies the POLICIES.md §4 contract:
 
     - Any exception raised by the policy is converted to a
-      result via :func:`_fail_closed`: DENY by default,
-      ALLOW for classifier-only specs (``action: [allow]``),
-      ASK for approval-gate specs (``action`` list includes
-      ASK but not DENY, e.g. ``[ask]``, ``[allow, ask]``).
-    - Returned actions are validated against the spec's
-      declared ``action`` list (when present). Mismatch →
-      same fail-closed path.
+      fail-closed DENY result.
     - ``set_labels`` from a failing evaluation are dropped;
       a partial/broken policy does not get to write labels.
 
@@ -948,90 +952,12 @@ async def _dispatch_policy(
     try:
         result = await policy.evaluate(ctx, context)
     except Exception as exc:
-        return _fail_closed(policy.spec, reason=f"policy {policy.spec.name!r} failed: {exc}")
-    if _action_permitted(policy.spec, result.action):
-        return result
-    return _fail_closed(
-        policy.spec,
-        reason=(
-            f"policy {policy.spec.name!r} returned {result.action.value!r} "
-            f"which is not in its declared action list"
-        ),
-    )
-
-
-def _action_permitted(spec: PolicySpec, action: PolicyAction) -> bool:
-    """
-    Check whether *action* is allowed by *spec*'s declared
-    action whitelist.
-
-    Specs with no declared whitelist (FunctionPolicySpec.action
-    may be ``None``) accept any action. Specs that declare a
-    list restrict to that list.
-
-    :param spec: The policy's spec.
-    :param action: The action the policy returned.
-    :returns: ``True`` if the action is permitted.
-    """
-    declared = getattr(spec, "action", None)
-    if not isinstance(declared, list):
-        # FunctionPolicySpec may be None = accept any.
-        return True
-    return action in declared
-
-
-def _fail_closed(spec: PolicySpec, *, reason: str) -> PolicyResult:
-    """
-    Build the fail-closed result for a broken policy.
-
-    Three branches:
-
-    1. **Classifier-only** (``action: [allow]``): substitute ALLOW.
-       Inventing a DENY violates the author's declared "this policy
-       never blocks" intent (POLICIES.md §13).
-    2. **Approval-gate** (``action`` list includes ASK but not DENY,
-       e.g. ``[ask]``, ``[allow, ask]``): substitute ASK so the
-       engine parks for user approval.  Substituting ALLOW would
-       bypass the gate; substituting DENY invents an action the
-       author never declared.
-    3. **All other policies** (no declared list, or list includes
-       DENY): fail-closed DENY.
-
-    :param spec: The policy's spec — used to inspect the declared
-        action whitelist.
-    :param reason: Human-readable explanation attached to the
-        result; discarded on the ALLOW substitution path since
-        ALLOW results carry no reason.
-    :returns: A :class:`PolicyResult` safe for composition.
-    """
-    declared = getattr(spec, "action", None)
-    if isinstance(declared, list):
-        # Classifier-only = advisory policies that never block (e.g. [allow]).
-        # Approval-gate policies ([ask], [allow, ask]) must NOT fail open —
-        # an evaluator exception must park-for-approval or deny, never
-        # substitute ALLOW.  See POLICIES.md §4.
-        has_deny = PolicyAction.DENY in declared
-        has_ask = PolicyAction.ASK in declared
-        if not has_deny and not has_ask:
-            # Classifier-only: honour the "never blocks" intent.
-            return PolicyResult(
-                action=PolicyAction.ALLOW,
-                reason=None,
-                set_labels=None,
-            )
-        if has_ask and not has_deny:
-            # Approval-gate: park for user confirmation.
-            return PolicyResult(
-                action=PolicyAction.ASK,
-                reason=reason,
-                set_labels=None,
-            )
-    # Default: fail-closed DENY.
-    return PolicyResult(
-        action=PolicyAction.DENY,
-        reason=reason,
-        set_labels=None,
-    )
+        return PolicyResult(
+            action=PolicyAction.DENY,
+            reason=f"policy {policy.spec.name!r} failed: {exc}",
+            set_labels=None,
+        )
+    return result
 
 
 def _filter_writable_labels(
@@ -1057,126 +983,6 @@ def _filter_writable_labels(
     if not isinstance(whitelist, list):
         return dict(set_labels)
     return {k: v for k, v in set_labels.items() if k in whitelist}
-
-
-def _merge_monotonic_writes(
-    accumulated: dict[str, str],
-    new_writes: dict[str, str],
-    label_defs: dict[str, LabelDef],
-) -> None:
-    """
-    Merge a per-policy ``set_labels`` batch into the in-flight
-    accumulator, preserving each label's monotonic direction.
-
-    The composed semantics for one ``evaluate()`` call: when
-    multiple policies fire and write the SAME key, the
-    accumulator must end up holding the most-restrictive value
-    in the direction the label declares — not whichever write
-    happened to come last in YAML order. Without this, a
-    ``monotonic: increasing`` label (e.g. taint level) can be
-    silently lowered by a later policy in the same evaluation
-    that writes a smaller value, even though the LabelDef
-    says "labels only move upwards." Symmetric for
-    ``decreasing``: a later write of a higher value cannot
-    raise a label that a prior policy already lowered.
-
-    Behaviour:
-
-    - Key not yet in *accumulated*: insert *new_value*.
-    - Key has no :class:`LabelDef` (schemaless), or the
-      ``LabelDef`` has no monotonic direction, or
-      ``LabelDef.values`` is unset: last-write-wins (matches
-      the historical behaviour for the unconstrained case).
-    - Key is monotonic ``increasing``: keep the higher-index
-      value among ``existing`` and *new_value*.
-    - Key is monotonic ``decreasing``: keep the lower-index
-      value among ``existing`` and *new_value*.
-    - Either side outside ``LabelDef.values``: last-write-wins.
-      ``_filter_schema_valid`` will drop the out-of-enum value
-      at apply time, so the merge result doesn't change the
-      end persistence.
-
-    Mutates *accumulated* in place; symmetric in argument
-    order — running the policy chain in reverse YAML order
-    yields the same final dict.
-
-    :param accumulated: The in-flight accumulator dict.
-        Mutated in place.
-    :param new_writes: One policy's filtered ``set_labels``.
-    :param label_defs: The engine's per-key schema map.
-    """
-    for key, new_value in new_writes.items():
-        existing = accumulated.get(key)
-        if existing is None:
-            accumulated[key] = new_value
-            continue
-        ldef = label_defs.get(key)
-        if ldef is None or ldef.monotonic is None or ldef.values is None:
-            # Schemaless or unconstrained — preserve historical
-            # last-write-wins behaviour.
-            accumulated[key] = new_value
-            continue
-        if existing not in ldef.values or new_value not in ldef.values:
-            # Out-of-enum on either side — defer to the schema
-            # filter at apply time. Keep the latest write so the
-            # filter has something to reject.
-            accumulated[key] = new_value
-            continue
-        existing_idx = ldef.values.index(existing)
-        new_idx = ldef.values.index(new_value)
-        if ldef.monotonic == "increasing":
-            accumulated[key] = new_value if new_idx > existing_idx else existing
-        elif ldef.monotonic == "decreasing":
-            accumulated[key] = new_value if new_idx < existing_idx else existing
-        # No else: any other monotonic value is rejected at
-        # spec parse, so this branch is unreachable.
-
-
-def _monotonic_ok(
-    ldef: LabelDef,
-    current: str | None,
-    new_value: str,
-) -> bool:
-    """
-    Check whether a monotonic label write is permitted.
-
-    Direction semantics (POLICIES.md §10):
-
-    - ``"increasing"``: new_value's index in
-      ``ldef.values`` must be ``>=`` current's index.
-    - ``"decreasing"``: new_value's index must be ``<=``
-      current's index.
-    - Seeding an unset label (``current is None``) is
-      always permitted — nothing to compare against yet.
-
-    Values outside ``ldef.values`` never reach this helper
-    (the values-check runs first in
-    :meth:`PolicyEngine._filter_schema_valid`).
-
-    :param ldef: The label's schema declaration.
-    :param current: Current value in the hot cache, or
-        ``None`` when the label is unset.
-    :param new_value: The value the caller wants to write.
-    :returns: ``True`` when the write is permitted.
-    """
-    if current is None:
-        return True
-    # ldef.values is guaranteed non-None here because the
-    # caller only invokes this helper when monotonic is set,
-    # and the parser rejects monotonic-without-values at
-    # spec load (POLICIES.md §13). Assert rather than branch
-    # so any regression fails loud.
-    assert ldef.values is not None, "monotonic without values reached runtime — parser regression?"
-    current_idx = ldef.values.index(current) if current in ldef.values else -1
-    new_idx = ldef.values.index(new_value)
-    if ldef.monotonic == "increasing":
-        return new_idx >= current_idx
-    if ldef.monotonic == "decreasing":
-        return new_idx <= current_idx
-    # Unknown direction — fall through to reject. Parser
-    # rejects unknown values at spec load so this is
-    # defensive.
-    return False
 
 
 def _condition_matches(

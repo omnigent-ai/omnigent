@@ -20,11 +20,10 @@ describe("filesPanelPreferences", () => {
   });
 
   it("round-trips a written preference", () => {
-    writeFilesPanelPreferences({ changedOnly: true, sort: "alpha", collapsed: false });
+    writeFilesPanelPreferences({ changedOnly: true, sort: "alpha" });
     expect(readFilesPanelPreferences()).toEqual({
       changedOnly: true,
       sort: "alpha",
-      collapsed: false,
     });
   });
 
@@ -48,7 +47,6 @@ describe("filesPanelPreferences", () => {
     expect(readFilesPanelPreferences()).toEqual({
       changedOnly: false,
       sort: "recent",
-      collapsed: false,
     });
   });
 
@@ -57,7 +55,6 @@ describe("filesPanelPreferences", () => {
     expect(readFilesPanelPreferences()).toEqual({
       changedOnly: true,
       sort: "recent",
-      collapsed: false,
     });
   });
 });

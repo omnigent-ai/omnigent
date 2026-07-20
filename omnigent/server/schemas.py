@@ -513,6 +513,61 @@ class FileObject(BaseModel):
     created_at: int
 
 
+class CopyFilesRequest(BaseModel):
+    """
+    Request to copy files from a lineage ancestor into a session.
+
+    The destination session is the path parameter; ``source_session_id``
+    must be a STRICT ancestor of the destination up its
+    ``parent_conversation_id`` chain (spawn lineage) — the destination may
+    not name itself as the source. The copy creates new child-scoped rows —
+    it does not grant cross-session read access.
+
+    :param source_session_id: Session that owns the source files, e.g.
+        ``"conv_parent"``. Must be a strict ancestor of the destination.
+    :param file_ids: Non-empty, unique ids of the source-owned files to
+        copy, e.g. ``["file_abc123"]``.
+    """
+
+    source_session_id: str
+    file_ids: list[Annotated[str, Field(min_length=1)]] = Field(
+        min_length=1,
+        json_schema_extra={"uniqueItems": True},
+    )
+
+
+class CopiedFile(BaseModel):
+    """
+    A single copied file's new identity and preserved metadata.
+
+    :param new_id: The new child-scoped file id, e.g. ``"file_def456"``.
+    :param filename: The copied file's name, carried over from the source.
+    :param content_type: The copied file's MIME type, preserved from the
+        source row so the caller need not re-fetch it or guess from the
+        filename. ``None`` when the source row had no recorded type.
+    """
+
+    new_id: str
+    filename: str
+    content_type: str | None = None
+
+
+class CopyFilesResponse(BaseModel):
+    """
+    Result of a lineage-scoped file copy.
+
+    :param object: Fixed type, always ``"session.files.copied"``.
+    :param session_id: Destination session that now owns the copies.
+    :param mapping: Map of source ``file_id`` to the copied file's new
+        identity and preserved metadata (id, filename, content type), so a
+        caller can attach the copy without a follow-up metadata fetch.
+    """
+
+    object: str = "session.files.copied"
+    session_id: str
+    mapping: dict[str, CopiedFile]
+
+
 # ── Session Resources ───────────────────────────────────────────
 
 
@@ -1091,23 +1146,50 @@ class SessionGitOptions(BaseModel):
     """
     Git worktree options for ``POST /v1/sessions``.
 
-    When present, the server creates a git worktree on the host for a
-    new branch and starts the runner in that worktree instead of the
-    picked directory. Requires ``host_id`` to be set (and therefore
-    ``workspace``, which is interpreted as the source repository
-    directory). See designs/SESSION_GIT_WORKTREE.md.
+    Requires ``host_id`` to be set (and therefore ``workspace``, which
+    is interpreted as the source repository directory). Two modes,
+    selected by ``existing_worktree``:
 
-    :param branch_name: Name of the new branch to create and check
-        out in the worktree, e.g. ``"feature/login"``. Validated
-        against git ref-format rules; invalid names fail with
-        ``invalid_input``.
+    - **create** (default): the server creates a git worktree on the
+      host for a new branch and starts the runner in that worktree
+      instead of the picked directory.
+    - **bind** (``existing_worktree=True``): ``workspace`` already IS a
+      pre-existing worktree; no worktree is created. ``branch_name`` is
+      recorded as the session's ``git_branch`` for display and opt-in
+      cleanup, and ``base_branch`` must not be set.
+
+    See designs/SESSION_GIT_WORKTREE.md.
+
+    :param branch_name: In create mode, the new branch to create and
+        check out, e.g. ``"feature/login"``. In bind mode, the branch
+        already checked out in the existing worktree. Validated against
+        git ref-format rules; invalid names fail with ``invalid_input``.
     :param base_branch: Optional base ref to branch from, e.g.
         ``"main"`` or ``"origin/main"``. ``None`` branches from the
-        source repository's current ``HEAD``.
+        source repository's current ``HEAD``. Create mode only —
+        invalid with ``existing_worktree``.
+    :param existing_worktree: When ``True``, bind to the pre-existing
+        worktree at ``workspace`` instead of creating one (see above).
     """
 
     branch_name: str
     base_branch: str | None = None
+    existing_worktree: bool = False
+
+    @model_validator(mode="after")
+    def _check_existing_worktree(self) -> SessionGitOptions:
+        """Reject ``base_branch`` in bind mode (422).
+
+        ``base_branch`` selects the ref a *new* branch forks from; it is
+        meaningless when binding to a worktree that already exists.
+
+        :returns: The validated instance.
+        :raises ValueError: If ``base_branch`` is set with
+            ``existing_worktree``.
+        """
+        if self.existing_worktree and self.base_branch is not None:
+            raise ValueError("base_branch cannot be set when existing_worktree is true")
+        return self
 
 
 class SessionCreateRequest(BaseModel):
@@ -1489,6 +1571,10 @@ class SessionResponse(BaseModel):
         before building this snapshot; the literal stays a superset
         of what the runtime can produce so a server that forwards
         the raw status never 500s on serialization.
+    :param background_task_count: Background shells (claude-native) still
+        running as of the last status edge, so a reload re-shows "N shells
+        still running" even though the session has settled to ``"idle"``.
+        ``None`` (the default / omitted) when no shells are tracked.
     :param created_at: Unix epoch seconds of creation.
     :param title: Optional human-readable title, e.g.
         ``"debugging auth flow"``. ``None`` when unset.
@@ -1686,12 +1772,22 @@ class SessionResponse(BaseModel):
         ``_session_sandbox_status_cache`` at snapshot build time, so
         a client opening the session mid-launch sees the current
         stage.
+    :param active_response_id: Response id of the turn currently in
+        flight, or ``None`` when the session is idle. Sourced from the
+        server's ``_session_active_response_cache`` at snapshot build
+        time so a client connecting mid-turn can reopen a streaming
+        ``activeResponse`` — the SSE stream is snapshot + live tail with
+        no replay, so the turn-start ``running`` edge that carried this
+        id is not re-sent on reconnect. Today only native-terminal
+        forwarders (claude-native) stamp a turn id on their status
+        edges; other harnesses leave this ``None``.
     """
 
     id: str
     agent_id: str
     agent_name: str | None = None
     status: Literal["idle", "running", "waiting", "failed"]
+    background_task_count: int | None = None
     created_at: int
     title: str | None = None
     labels: dict[str, str] = Field(default_factory=dict)
@@ -1734,6 +1830,13 @@ class SessionResponse(BaseModel):
     model_options: list[dict[str, Any]] = Field(default_factory=list)
     terminal_pending: bool = False
     sandbox_status: SandboxStatus | None = None
+    # Per-MCP-server startup state for native harness sessions
+    # (codex-native), present while the harness boots its MCP servers or
+    # when servers were cancelled/failed. ``None`` otherwise. Sourced from
+    # ``_session_mcp_startup_cache`` at snapshot build time so a client
+    # opening the session mid-startup sees the startup band.
+    mcp_startup: dict[str, McpServerStartup] | None = None
+    active_response_id: str | None = None
 
 
 class UpdateSessionRequest(BaseModel):
@@ -1818,6 +1921,22 @@ class UpdateSessionRequest(BaseModel):
     silent: bool = False
 
     model_config = ConfigDict(extra="forbid")
+
+
+class AutomaticSessionRenameRequest(BaseModel):
+    """Request body for the current-agent automatic rename endpoint."""
+
+    title: str = Field(min_length=2, max_length=60)
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class AutomaticSessionRenameResponse(BaseModel):
+    """Result of a conditional automatic session rename."""
+
+    renamed: bool
+    title: str | None = None
+    reason: Literal["not_top_level", "no_seed", "title_changed"] | None = None
 
 
 class CodexGoalObject(BaseModel):
@@ -1936,18 +2055,36 @@ class SessionForkRequest(BaseModel):
         the last item of that response are copied — items after it are
         dropped from the fork. When ``None`` (default), the full history
         is copied.
-    :param model_override: Model id to launch the fork on, e.g.
-        ``"databricks-gpt-5-4-mini"`` — the "restart with model" path.
-        Overrides the model the fork would otherwise inherit from the
-        source; the value is validated and family-checked against the
-        fork's harness. When ``None`` (default), the fork keeps the
-        source's model (within the same provider family).
     """
 
     title: str | None = None
     agent_id: str | None = None
     up_to_response_id: str | None = None
-    model_override: str | None = None
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class ReadStatePutRequest(BaseModel):
+    """
+    Request body for ``PUT /v1/sessions/{session_id}/read-state``.
+
+    Sets the *calling user's* read tracking for one session. Mirrors the
+    two values the web client keeps per session: a "last seen" wall-clock
+    baseline (seconds since epoch) and an explicit "marked unread"
+    override. The unread dot shows when ``updated_at > last_seen`` and the
+    session is finished; ``unread`` separately pins the override so the
+    thread the user is *viewing* (or a running one) still surfaces the dot
+    where the automatic "seen" logic would otherwise suppress it.
+
+    :param last_seen: Wall-clock baseline in seconds, e.g. ``1717000000``.
+        Marking seen sets this to "now"; marking unread pins it to
+        ``updated_at - 1`` so the row reads unseen.
+    :param unread: Whether this session is explicitly flagged unread for
+        the caller.
+    """
+
+    last_seen: int
+    unread: bool
 
     model_config = ConfigDict(extra="forbid")
 
@@ -2055,6 +2192,22 @@ class SessionListItem(BaseModel):
         distinguishable while staying an exact integer in JavaScript;
         clients only compare it for change. ``None`` when the session
         has no comments or the server has no comment store wired.
+    :param viewer_last_seen: The *requesting user's* "last seen"
+        wall-clock baseline in seconds for this session, or ``None``
+        when they have never seen it. Per-viewer (built from the
+        server's in-memory per-user read-state, written by
+        ``PUT /v1/sessions/{id}/read-state``); the unread dot shows
+        when ``updated_at > viewer_last_seen`` and the session is
+        finished. In-memory only — resets on a server restart.
+    :param viewer_unread: Whether the *requesting user* explicitly
+        marked this session unread. Per-viewer; lifts the active-row
+        dot suppression on the client. ``False`` by default.
+    :param search_snippet: Excerpt of the chat content that matched the
+        request's ``search_query``, centered on the match with ``…``
+        marking elided ends, so the search UI can show *where* a session
+        matched in its body. Present whenever the query hit an item body
+        (even if the title also matched); ``None`` on non-search reads and
+        when only the title matched.
     """
 
     id: str
@@ -2079,6 +2232,10 @@ class SessionListItem(BaseModel):
     archived: bool = False
     comments_count: int = 0
     comments_updated_at: int | None = None
+    viewer_last_seen: int | None = None
+    viewer_unread: bool = False
+    search_snippet: str | None = None
+    parent_session_id: str | None = None
 
 
 class SessionList(BaseModel):
@@ -2281,6 +2438,7 @@ class SessionStatusEvent(_SSEEventBase):
     status: Literal["idle", "launching", "running", "waiting", "failed"]
     response_id: str | None = None
     error: ErrorDetail | None = None
+    background_task_count: int | None = None
 
 
 class SessionUsageEvent(_SSEEventBase):
@@ -2533,6 +2691,48 @@ class SessionSandboxStatusEvent(_SSEEventBase):
     conversation_id: str
     stage: SandboxLaunchStage
     error: str | None = None
+
+
+class McpServerStartup(BaseModel):
+    """
+    One MCP server's startup state within a ``session.mcp_startup`` event.
+
+    :param status: Latest startup state reported by the harness, mirroring
+        Codex's ``McpServerStartupState`` enum.
+    :param error: Failure detail when ``status == "failed"``, e.g.
+        ``"handshaking with MCP server failed"``. ``None`` otherwise.
+    """
+
+    status: Literal["starting", "ready", "failed", "cancelled"]
+    error: str | None = None
+
+
+class SessionMcpStartupEvent(_SSEEventBase):
+    """
+    Per-MCP-server startup progress for a native harness session.
+
+    A codex-native session brings up its configured MCP servers when its
+    Codex thread starts; slow or failing servers previously left the web
+    session looking hung with no signal. The native forwarder mirrors
+    Codex's ``mcpServer/startupStatus/updated`` notifications as
+    ``external_mcp_startup`` posts, republished here so the web UI can
+    show which servers are still starting and which failed or were
+    cancelled.
+
+    :param type: Always ``"session.mcp_startup"``.
+    :param conversation_id: Session identifier,
+        e.g. ``"conv_abc123"``.
+    :param servers: Latest per-server startup map, e.g.
+        ``{"safe": {"status": "starting", "error": None}}``.
+
+    Category: **transient** (SSE + snapshot cache). Not persisted; a
+    client connecting mid-startup seeds from the session snapshot's
+    ``mcp_startup`` field and updates live off this event.
+    """
+
+    type: Literal["session.mcp_startup"]
+    conversation_id: str
+    servers: dict[str, McpServerStartup]
 
 
 class SessionSkillsEvent(_SSEEventBase):
@@ -2832,6 +3032,19 @@ class OutputTextDeltaEvent(_SSEEventBase):
     message_id: str | None = None
     index: int | None = None
     final: bool | None = None
+
+
+class ToolOutputDeltaEvent(_SSEEventBase):
+    """Incremental output from an in-progress function call.
+
+    :param type: Always ``"response.function_call_output.delta"``.
+    :param call_id: Function-call correlation id.
+    :param delta: Command stdout/stderr fragment.
+    """
+
+    type: Literal["response.function_call_output.delta"]
+    call_id: str
+    delta: str
 
 
 class ReasoningStartedEvent(_SSEEventBase):
@@ -3187,6 +3400,35 @@ class ElicitationRequestEvent(_SSEEventBase):
     params: ElicitationRequestParams
 
 
+class BrowserActionRequestEvent(_SSEEventBase):
+    """
+    Request that the desktop renderer perform one browser action.
+
+    Emitted by the server ``POST /v1/sessions/{id}/browser/action_request``
+    route when a runner-side ``browser_*`` tool dispatch needs the
+    Omnigent desktop app's embedded browser to act. The event fans out
+    on the session stream to every subscribed renderer; each renderer
+    first POSTs ``/browser/action_claim/{action_id}`` and only the
+    winning claimant executes the action and POSTs the result back to
+    ``/browser/action_result/{action_id}``. The claim lease prevents
+    double execution when more than one renderer is subscribed.
+
+    :param type: Always ``"browser.action_request"``.
+    :param action_id: Unique correlation id for this request, e.g.
+        ``"baction_abc123"``. Echoed on the claim and result routes.
+    :param action: The browser action to perform — the ``browser_``
+        tool name with the prefix stripped, e.g. ``"navigate"``,
+        ``"snapshot"``, ``"click"``, ``"type"``, ``"screenshot"``.
+    :param args: Action arguments forwarded from the tool call, e.g.
+        ``{"url": "https://example.com"}``.
+    """
+
+    type: Literal["browser.action_request"]
+    action_id: str
+    action: str
+    args: dict[str, Any]
+
+
 class ElicitationResolvedEvent(_SSEEventBase):
     """
     Signal that a previously-published elicitation is no longer
@@ -3214,6 +3456,37 @@ class ElicitationResolvedEvent(_SSEEventBase):
 
     type: Literal["response.elicitation_resolved"]
     elicitation_id: str
+
+
+class PolicyDeniedEvent(_SSEEventBase):
+    """
+    Signal that a policy DENY was enforced on a native harness turn.
+
+    A native harness (Claude Code, Codex, ...) routes each tool call and
+    prompt through Omnigent's policy engine via the vendor command-hook
+    (``POST /v1/sessions/{id}/policies/evaluate``). The DENY verdict is
+    returned synchronously to that hook, so unlike the SDK/wrap path there is
+    no stream-visible signal that a native action was blocked — only the
+    *effect* (the blocked tool never runs). This event surfaces the decision
+    itself on the session stream so observers (the web UI, the capability
+    bench) can see a native DENY as a positive signal rather than infer it
+    from an absence.
+
+    Fire-and-forget and observational: it does not gate the turn (the hook
+    response already did that) and carries no correlation id.
+
+    :param type: Always ``"response.policy_denied"``.
+    :param conversation_id: Session/conversation id the DENY applies to,
+        e.g. ``"conv_abc123"``.
+    :param reason: Human-readable deny reason from the deciding policy, e.g.
+        ``"Blocked by policy."``.
+    :param phase: The policy phase the DENY landed on, e.g. ``"tool_call"``.
+    """
+
+    type: Literal["response.policy_denied"]
+    conversation_id: str
+    reason: str = ""
+    phase: str = ""
 
 
 class CreatedEvent(_SSEEventBase):
@@ -3689,6 +3962,7 @@ ServerStreamEvent = Annotated[
     | SessionTodosEvent
     | SessionTerminalPendingEvent
     | SessionSandboxStatusEvent
+    | SessionMcpStartupEvent
     | SessionSkillsEvent
     | SessionModelOptionsEvent
     | SessionInputConsumedEvent
@@ -3704,6 +3978,7 @@ ServerStreamEvent = Annotated[
     | SessionTerminalActivityEvent
     # ── Transient (SSE-only) — incremental token deltas ────────
     | OutputTextDeltaEvent
+    | ToolOutputDeltaEvent
     | ReasoningStartedEvent
     | ReasoningTextDeltaEvent
     | ReasoningSummaryTextDeltaEvent
@@ -3716,6 +3991,10 @@ ServerStreamEvent = Annotated[
     # ── Transient (SSE-only) — synchronous decision request ────
     | ElicitationRequestEvent
     | ElicitationResolvedEvent
+    # ── Transient (SSE-only) — embedded-browser action request ─
+    | BrowserActionRequestEvent
+    # ── Transient (SSE-only) — native policy DENY signal ───────
+    | PolicyDeniedEvent
     # ── Transient (SSE-only) — Responses-API turn lifecycle ────
     | CreatedEvent
     | QueuedEvent

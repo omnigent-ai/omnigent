@@ -327,6 +327,14 @@ class _FakeProcessManager:
             raise AssertionError("get_client should not be called")
         return self._harness_client
 
+    def mark_in_flight(self, conversation_id: str, response_id: str) -> None:
+        """Reaper in-flight marker — no-op for this stub (issue #1414)."""
+        del conversation_id, response_id
+
+    def clear_in_flight(self, conversation_id: str) -> None:
+        """Reaper in-flight clear — no-op for this stub (issue #1414)."""
+        del conversation_id
+
 
 @pytest.fixture
 async def started_manager() -> AsyncIterator[HarnessProcessManager]:
@@ -481,6 +489,14 @@ class _RecordingProcessManager:
         self._reached.set()
         return _FakeHarnessClient([])
 
+    def mark_in_flight(self, conversation_id: str, response_id: str) -> None:
+        """Reaper in-flight marker — no-op for this stub (issue #1414)."""
+        del conversation_id, response_id
+
+    def clear_in_flight(self, conversation_id: str) -> None:
+        """Reaper in-flight clear — no-op for this stub (issue #1414)."""
+        del conversation_id
+
 
 @pytest.mark.asyncio
 async def test_runner_resolves_agent_from_server_snapshot_when_msg_lacks_agent_id() -> None:
@@ -621,6 +637,14 @@ class _ContentCapturingProcessManager:
         """
         del conversation_id, harness_name, env
         return _ContentCapturingHarnessClient(self._captured, self._reached)
+
+    def mark_in_flight(self, conversation_id: str, response_id: str) -> None:
+        """Reaper in-flight marker — no-op for this stub (issue #1414)."""
+        del conversation_id, response_id
+
+    def clear_in_flight(self, conversation_id: str) -> None:
+        """Reaper in-flight clear — no-op for this stub (issue #1414)."""
+        del conversation_id
 
 
 class _ContentCapturingHarnessClient:
@@ -1487,7 +1511,9 @@ async def test_runner_background_turn_emits_failed_when_spawn_env_build_raises(
             executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
         )
 
-    def _raising_build(spec: object, *, workdir: object = None) -> dict[str, str]:
+    def _raising_build(
+        spec: object, *, cwd: object = None, workdir: object = None
+    ) -> dict[str, str]:
         """
         Stand in for ``_build_claude_sdk_spawn_env`` and fail the way the
         no-model generic-provider path does.
@@ -1581,7 +1607,9 @@ async def test_runner_failed_status_carries_setup_error_message(
             executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
         )
 
-    def _raising_build(spec: object, *, workdir: object = None) -> dict[str, str]:
+    def _raising_build(
+        spec: object, *, cwd: object = None, workdir: object = None
+    ) -> dict[str, str]:
         """
         Fail the spawn-env build the way the no-model provider path does.
 
@@ -2224,6 +2252,9 @@ class _StubTerminalInstance:
         self.os_env = None
         self.socket_path = Path("/tmp/omnigent-test-tmux.sock")
         self.tmux_target = "main"
+        # ``terminal_resource_view`` reads this to project the effective
+        # web-attach transport into metadata; ``None`` => the global default.
+        self.terminal_transport = None
         # Records on_activity callbacks the dispatch wires up so a fresh
         # launch's pane-activity watcher start is observable (and so the
         # call doesn't AttributeError against this stub).
@@ -3598,7 +3629,9 @@ async def test_sys_list_models_dispatches_locally_with_static_provider(
     # The curated claude aliases survive the claude-family filter — the
     # exact ids an orchestrator may pass back as args.model.
     assert [m["id"] for m in worker["models"]] == [
+        "claude-fable-5",
         "claude-opus-4-8",
+        "claude-sonnet-5",
         "claude-sonnet-4-6",
         "claude-haiku-4-5",
     ]
@@ -5365,6 +5398,8 @@ def test_native_relay_builtin_set_matches_toolmanager_gating(
     assert relayed & spawn_writes == expected_writes
     # Model awareness rides the dispatch grant: relayed iff send is.
     assert ("sys_list_models" in relayed) == ("sys_session_send" in expected_writes)
+    # Advise-models also requires a routing client; default caps have none.
+    assert "sys_advise_models" not in relayed
 
     # OS tools ride a separate unconditional relay path (overriding the
     # bridge's static versions), so they must never be in the builtin set —
@@ -6629,6 +6664,53 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
 
 
 @pytest.mark.asyncio
+async def test_sys_session_get_info_hides_native_ui_wrapper_agent_name() -> None:
+    """A native-UI session describes itself with its clean public name.
+
+    Regression for the leak where ``sys_session_get_info`` returned the raw
+    bound ``agent_name`` ``"pi-native-ui"``, which the Pi agent then repeated to
+    the user ("I'm pi (agent name: pi-native-ui)"). The projection must map the
+    internal ``-native-ui`` wrapper name to its display name (``"Pi"``) so the
+    implementation detail never reaches the model.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_pi":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_pi",
+                    "agent_id": "ag_pi",
+                    "agent_name": "pi-native-ui",
+                    "status": "running",
+                    "title": "hi what agent are you?",
+                    "runner_id": "runner_1",
+                },
+            )
+        if request.method == "GET" and request.url.path == "/v1/runners/runner_1/status":
+            return httpx.Response(200, json={"runner_id": "runner_1", "online": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_get_info",
+            arguments=json.dumps({"session_id": "conv_pi"}),
+            server_client=server_client,
+            conversation_id="conv_pi",
+        )
+
+    info = json.loads(output)
+    # The internal wrapper name is rewritten to the public display name; the
+    # raw ``pi-native-ui`` must not appear anywhere in the tool output.
+    assert info["agent_name"] == "Pi"
+    assert "pi-native-ui" not in output
+
+
+@pytest.mark.asyncio
 async def test_sys_session_send_session_id_posts_to_direct_child(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -7036,3 +7118,82 @@ async def test_approval_event_without_content_flattened() -> None:
     assert resp.status_code == 204
     assert captured["body"] == {"type": "approval", "elicitation_id": "e2", "action": "decline"}
     ApprovalEvent.model_validate(captured["body"])
+
+
+@pytest.mark.asyncio
+async def test_spawn_async_tool_cancels_losing_future_no_leak(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``_spawn_async_tool`` races the tool coro against ``cancel_event.wait()``
+    via ``asyncio.wait(FIRST_COMPLETED)``. The losing future must be cancelled
+    in BOTH branches, otherwise every ``sys_call_async`` permanently leaks one
+    pending task (the orphaned ``cancel_event.wait()`` on success, or the
+    orphaned tool coro on cancel).
+    """
+    from omnigent.runner import tool_dispatch
+
+    spawn_kw: dict[str, Any] = {
+        "server_client": None,
+        "terminal_registry": None,
+        "resource_registry": None,
+        "agent_spec": None,
+        "conversation_id": "conv_leak",
+        "task_id": None,
+        "agent_id": None,
+        "agent_name": None,
+        "runner_workspace": None,
+        "mcp_manager": None,
+        "filesystem_registry": None,
+    }
+
+    def _leaked(before: set[asyncio.Task[Any]]) -> list[str]:
+        cur = asyncio.current_task()
+        return [
+            t.get_name()
+            for t in asyncio.all_tasks()
+            if t not in before and t is not cur and not t.done()
+        ]
+
+    # Success path: tool finishes first, so cancel_event.wait() is the loser.
+    async def _fast(**_kw: Any) -> str:
+        return "ok"
+
+    monkeypatch.setattr(tool_dispatch, "execute_tool", _fast)
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    tasks: dict[str, tuple[asyncio.Task[str], asyncio.Event]] = {}
+    before = set(asyncio.all_tasks())
+    tool_dispatch._spawn_async_tool(
+        {"tool": "noop", "args": "{}"},
+        session_inbox=inbox,
+        session_async_tasks=tasks,
+        **spawn_kw,
+    )
+    bg_task, _evt = next(iter(tasks.values()))
+    await bg_task
+    await asyncio.sleep(0)  # let the .cancel() propagate to the losing future
+    assert inbox.get_nowait()["status"] == "completed"
+    assert _leaked(before) == []
+
+    # Cancel path: cancel_event fires first, so the tool coro is the loser.
+    async def _slow(**_kw: Any) -> str:
+        await asyncio.sleep(30)
+        return "late"
+
+    monkeypatch.setattr(tool_dispatch, "execute_tool", _slow)
+    inbox = asyncio.Queue()
+    tasks = {}
+    before = set(asyncio.all_tasks())
+    tool_dispatch._spawn_async_tool(
+        {"tool": "slow", "args": "{}"},
+        session_inbox=inbox,
+        session_async_tasks=tasks,
+        **spawn_kw,
+    )
+    bg_task, evt = next(iter(tasks.values()))
+    await asyncio.sleep(0)  # let _bg reach asyncio.wait
+    evt.set()
+    await bg_task
+    await asyncio.sleep(0)
+    assert inbox.get_nowait()["status"] == "cancelled"
+    assert _leaked(before) == []

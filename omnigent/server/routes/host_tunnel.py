@@ -25,14 +25,18 @@ from collections.abc import Awaitable, Callable
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
+from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
 from omnigent.host.frames import (
     HostCreateDirResultFrame,
     HostCreateWorktreeResultFrame,
+    HostFsResultFrame,
     HostHelloFrame,
     HostLaunchRunnerResultFrame,
     HostListDirResultFrame,
+    HostListWorktreesResultFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
+    HostRunnerStatusResultFrame,
     HostStatResultFrame,
     HostStopRunnerResultFrame,
     decode_host_frame,
@@ -64,8 +68,8 @@ def create_host_tunnel_router(
     host_store: HostStore,
     *,
     auth_provider: AuthProvider | None = None,
-    on_host_connect: Callable[[str], Awaitable[None]] | None = None,
-    on_host_disconnect: Callable[[str], Awaitable[None]] | None = None,
+    on_host_connect: Callable[[str, str | None], Awaitable[None]] | None = None,
+    on_host_disconnect: Callable[[str, str | None], Awaitable[None]] | None = None,
     on_runner_exited: Callable[[str, str], Awaitable[None]] | None = None,
     local_single_user: bool | None = None,
     runner_exit_reports: RunnerExitReports | None = None,
@@ -131,6 +135,16 @@ def create_host_tunnel_router(
         7. Start sender, receiver, and ping loops.
         8. On disconnect: deregister, set offline in DB.
         """
+        # Legacy hosts dial in with ``host_<hex>`` — normalise to the stored
+        # bare form. Malformed ids are refused here because WebSocket routes
+        # bypass the app's StatementError→404 handler.
+        try:
+            host_id = uuid_to_bytes(host_id).hex()
+        except InvalidUuidError:
+            _logger.warning("Refusing host tunnel: malformed host id %r", host_id)
+            await ws.close(code=4003, reason="invalid host id")
+            return
+
         # Authenticate from the handshake BEFORE accepting the upgrade,
         # so an unauthenticated peer never completes the WS handshake — no
         # acceptance oracle and no pre-auth protocol I/O. ``get_user_id`` reads
@@ -261,7 +275,7 @@ def create_host_tunnel_router(
             if on_host_connect is not None:
                 try:
                     await asyncio.wait_for(
-                        on_host_connect(host_id),
+                        on_host_connect(host_id, tunnel_owner),
                         timeout=30.0,
                     )
                 except asyncio.TimeoutError:
@@ -297,7 +311,7 @@ def create_host_tunnel_router(
                 await asyncio.to_thread(host_store.set_offline, host_id)
                 if on_host_disconnect is not None:
                     try:
-                        await on_host_disconnect(host_id)
+                        await on_host_disconnect(host_id, tunnel_owner)
                     except Exception:
                         _logger.exception(
                             "on_host_disconnect callback failed for %s",
@@ -316,7 +330,7 @@ def create_host_tunnel_router(
                 await asyncio.to_thread(host_store.set_offline, host_id)
                 if on_host_disconnect is not None:
                     try:
-                        await on_host_disconnect(host_id)
+                        await on_host_disconnect(host_id, tunnel_owner)
                     except Exception:
                         _logger.exception(
                             "on_host_disconnect callback failed for %s",
@@ -414,6 +428,14 @@ async def _receive_loop(
                 )
                 continue
             if isinstance(runner_frame, PongFrame):
+                # Host-tunnel keepalive round-trip. DEBUG because pings are
+                # frequent — opt in via log level. ``ts`` is epoch-ms stamped
+                # when the server pinged, so now - ts is the daemon round-trip.
+                _logger.debug(
+                    "host %s tunnel keepalive: pong rtt=%dms",
+                    host_id,
+                    int(time.time() * 1000) - runner_frame.ts,
+                )
                 continue
             _logger.warning(
                 "Host %s sent unexpected runner frame; dropping: kind=%s",
@@ -460,6 +482,12 @@ async def _receive_loop(
                 # connecting its tunnel has no runner-tunnel disconnect
                 # event, so this report is the only failure signal.
                 await on_runner_exited(frame.runner_id, frame.error)
+            continue
+
+        if isinstance(frame, HostRunnerStatusResultFrame):
+            status_future = conn.pending_runner_status.pop(frame.request_id, None)
+            if status_future is not None and not status_future.done():
+                status_future.set_result({"status": frame.status})
             continue
 
         if isinstance(frame, HostStatResultFrame):
@@ -522,6 +550,18 @@ async def _receive_loop(
                 )
             continue
 
+        if isinstance(frame, HostListWorktreesResultFrame):
+            list_wt_future = conn.pending_list_worktrees.pop(frame.request_id, None)
+            if list_wt_future is not None and not list_wt_future.done():
+                list_wt_future.set_result(
+                    {
+                        "status": frame.status,
+                        "worktrees": frame.worktrees,
+                        "error": frame.error,
+                    }
+                )
+            continue
+
         if isinstance(frame, HostCreateDirResultFrame):
             create_dir_future = conn.pending_create_dirs.pop(frame.request_id, None)
             if create_dir_future is not None and not create_dir_future.done():
@@ -529,6 +569,20 @@ async def _receive_loop(
                     {
                         "status": frame.status,
                         "path": frame.path,
+                        "error": frame.error,
+                    }
+                )
+            continue
+
+        if isinstance(frame, HostFsResultFrame):
+            fs_future = conn.pending_fs_requests.pop(frame.request_id, None)
+            if fs_future is not None and not fs_future.done():
+                fs_future.set_result(
+                    {
+                        "status": frame.status,
+                        "payload": frame.payload,
+                        "error_status": frame.error_status,
+                        "error_code": frame.error_code,
                         "error": frame.error,
                     }
                 )

@@ -1246,7 +1246,7 @@ def test_codex_native_web_model_effort_override_survives_turn(
     """
     A web model/effort pick applied mid-session does not break the turn.
 
-    Regression for #1256 / PR #1274. A model or reasoning-effort change
+    A model or reasoning-effort change
     made in the Omnigent web picker reaches the runner as
     ``ExecutorConfig.model`` / ``extra["reasoning_effort"]``, and
     ``CodexNativeExecutor.run_turn`` now applies it via a

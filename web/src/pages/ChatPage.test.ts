@@ -25,6 +25,8 @@ import {
   splitSlashCommand,
   stripPendingElicitations,
   subAgentComposerLabel,
+  WORKING_MESSAGES,
+  workingIndicatorLabel,
 } from "./ChatPage";
 
 // The Composer's read-only and disabled states are derived from
@@ -630,14 +632,40 @@ describe("computeShowsWorking", () => {
     expect(computeShowsWorking("running", opts({ hasPendingElicitation: true }))).toBe(false);
   });
 
-  it("a known-offline runner suppresses stale working status", () => {
-    expect(computeShowsWorking("running", opts({ runnerOnline: false }))).toBe(false);
-    expect(computeShowsWorking("waiting", opts({ runnerOnline: false }))).toBe(false);
+  it("live running/waiting status wins over a stale offline poll", () => {
+    // The `/health` poll reads stale-offline during the runner's connect
+    // window on a fresh session's first turn (10s poll cadence). A session
+    // actively reporting running/waiting cannot have an offline runner, so its
+    // live status must keep the indicator lit rather than being suppressed by
+    // the lagging poll.
+    expect(computeShowsWorking("running", opts({ runnerOnline: false }))).toBe(true);
+    expect(computeShowsWorking("waiting", opts({ runnerOnline: false }))).toBe(true);
   });
 
   it("unresolved runner health does not suppress active parent work", () => {
     expect(computeShowsWorking("running", opts({ runnerOnline: undefined }))).toBe(true);
     expect(computeShowsWorking("waiting", opts({ runnerOnline: undefined }))).toBe(true);
+  });
+
+  it("background shells keep the indicator lit after the turn settles to idle", () => {
+    // A claude-native turn ends at `idle` (the PTY-activity watcher's edge)
+    // even while background shells run. The shell count keeps the indicator
+    // visible so "N background tasks still running" stays on screen.
+    expect(computeShowsWorking("idle", opts({ backgroundTaskCount: 1 }))).toBe(true);
+  });
+
+  it("a zero shell count at idle stays idle", () => {
+    expect(computeShowsWorking("idle", opts({ backgroundTaskCount: 0 }))).toBe(false);
+  });
+
+  it("a known-offline runner suppresses the indicator for an idle session with background shells", () => {
+    // For a session that is NOT actively working, known-offline beats a stale
+    // shell count: a dead session must not keep spinning on a background tally.
+    // (An actively running/waiting session is handled above — its live status
+    // wins over the offline poll.)
+    expect(computeShowsWorking("idle", opts({ runnerOnline: false, backgroundTaskCount: 2 }))).toBe(
+      false,
+    );
   });
 });
 
@@ -657,7 +685,10 @@ describe("shouldShowWorkingIndicator", () => {
     expect(shouldShowWorkingIndicator(false, [])).toBe(false);
   });
 
-  it("suppresses Working once a streaming assistant bubble is rendering content", () => {
+  it("keeps Working visible while a streaming assistant bubble renders (always-on)", () => {
+    // Always-on: the indicator no longer hides when content starts arriving.
+    // It stays lit for the whole turn so a long tool run or reasoning gap
+    // never looks stalled.
     const bubbles: Bubble[] = [
       {
         kind: "assistant",
@@ -669,23 +700,6 @@ describe("shouldShowWorkingIndicator", () => {
       },
     ];
 
-    expect(shouldShowWorkingIndicator(true, bubbles)).toBe(false);
-  });
-
-  it("lets an empty streaming assistant bubble keep the Working indicator visible", () => {
-    const bubbles: Bubble[] = [
-      {
-        kind: "assistant",
-        responseId: "resp_live",
-        stableId: "resp_live",
-        lifecycle: "streaming",
-        error: null,
-        items: [],
-      },
-    ];
-
-    // Empty assistant shells do not yet prove content is rendering; hiding
-    // Working here would recreate the blank gap this helper avoids.
     expect(shouldShowWorkingIndicator(true, bubbles)).toBe(true);
   });
 
@@ -695,6 +709,68 @@ describe("shouldShowWorkingIndicator", () => {
     expect(
       shouldShowWorkingIndicator(true, [{ kind: "compaction_loading", itemId: "cmp_1" }]),
     ).toBe(false);
+  });
+
+  it("suppresses Working only when compaction is the LAST bubble", () => {
+    // The compaction guard is trailing-bubble-only: a streaming assistant
+    // after an earlier compaction spinner keeps Working lit.
+    const bubbles: Bubble[] = [
+      { kind: "compaction_loading", itemId: "cmp_1" },
+      {
+        kind: "assistant",
+        responseId: "resp_live",
+        stableId: "resp_live",
+        lifecycle: "streaming",
+        error: null,
+        items: [{ kind: "text", itemId: null, text: "partial", final: false }],
+      },
+    ];
+
+    expect(shouldShowWorkingIndicator(true, bubbles)).toBe(true);
+  });
+});
+
+// ── workingIndicatorLabel ───────────────────────────────────────────────────
+
+describe("workingIndicatorLabel", () => {
+  it("shows the plain Working label when no background tasks remain", () => {
+    expect(workingIndicatorLabel(0)).toBe("Working…");
+  });
+
+  it("treats a negative count as no background tasks", () => {
+    // Defensive: the store seeds 0, but a stale/negative tally must never
+    // produce a nonsensical "-1 background tasks" label.
+    expect(workingIndicatorLabel(-1)).toBe("Working…");
+  });
+
+  it("uses the singular noun for exactly one background task", () => {
+    expect(workingIndicatorLabel(1)).toBe("1 background task still running");
+  });
+
+  it("pluralizes the noun for more than one background task", () => {
+    expect(workingIndicatorLabel(3)).toBe("3 background tasks still running");
+  });
+
+  it("pins the first rotation message to 'Working…'", () => {
+    // A fresh tick and the default arg both land on index 0, so this label
+    // must stay "Working…" — the invariant the (0) / (-1) cases rely on.
+    expect(WORKING_MESSAGES[0]).toBe("Working…");
+    expect(workingIndicatorLabel(0, 0)).toBe("Working…");
+  });
+
+  it("rotates through the message pool by tick", () => {
+    expect(workingIndicatorLabel(0, 1)).toBe(WORKING_MESSAGES[1]);
+    expect(workingIndicatorLabel(0, 2)).toBe(WORKING_MESSAGES[2]);
+  });
+
+  it("wraps the rotation modulo the pool length", () => {
+    expect(workingIndicatorLabel(0, WORKING_MESSAGES.length)).toBe("Working…");
+    expect(workingIndicatorLabel(0, WORKING_MESSAGES.length + 1)).toBe(WORKING_MESSAGES[1]);
+  });
+
+  it("ignores the tick while background tasks remain", () => {
+    // The count is information, not decoration — it must not rotate away.
+    expect(workingIndicatorLabel(2, 5)).toBe("2 background tasks still running");
   });
 });
 

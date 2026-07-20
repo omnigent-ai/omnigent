@@ -88,6 +88,40 @@ describe("terminalInfoFromResource", () => {
     });
     expect(info).toBeNull();
   });
+
+  it("lifts metadata.terminal_transport, defaulting to undefined for unknown values", () => {
+    const control = terminalInfoFromResource({
+      id: "terminal_bash_s1",
+      type: "terminal",
+      name: "bash:s1",
+      metadata: { terminal_transport: "control" },
+    });
+    expect(control?.transport).toBe("control");
+
+    const pty = terminalInfoFromResource({
+      id: "terminal_bash_s1",
+      type: "terminal",
+      name: "bash:s1",
+      metadata: { terminal_transport: "pty" },
+    });
+    expect(pty?.transport).toBe("pty");
+
+    // Absent or unrecognized → undefined (frontend treats as legacy PTY).
+    const legacy = terminalInfoFromResource({
+      id: "terminal_bash_s1",
+      type: "terminal",
+      name: "bash:s1",
+      metadata: {},
+    });
+    expect(legacy?.transport).toBeUndefined();
+    const junk = terminalInfoFromResource({
+      id: "terminal_bash_s1",
+      type: "terminal",
+      name: "bash:s1",
+      metadata: { terminal_transport: "garbage" },
+    });
+    expect(junk?.transport).toBeUndefined();
+  });
 });
 
 describe("fetchTerminals", () => {

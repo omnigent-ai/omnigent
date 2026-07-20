@@ -21,6 +21,9 @@ vi.mock("@/components/icons/CursorIcon", () => ({
 vi.mock("@/components/icons/GooseIcon", () => ({
   GooseIcon: () => null,
 }));
+vi.mock("@/components/icons/KiroIcon", () => ({
+  KiroIcon: () => null,
+}));
 vi.mock("@/components/icons/AntigravityIcon", () => ({
   AntigravityIcon: () => null,
 }));
@@ -62,6 +65,17 @@ if (!("IntersectionObserver" in globalThis)) {
     configurable: true,
     value: MockIntersectionObserver,
   });
+}
+
+// cmdk (the command-palette primitive) constructs a ResizeObserver on mount,
+// which jsdom doesn't implement. A no-op stub lets command-palette/selector
+// component tests render without throwing.
+if (typeof globalThis.ResizeObserver === "undefined") {
+  globalThis.ResizeObserver = class {
+    observe(): void {}
+    unobserve(): void {}
+    disconnect(): void {}
+  };
 }
 
 Object.defineProperty(window, "matchMedia", {

@@ -308,7 +308,7 @@ def test_reparked_elicitation_reliably_resurfaces_in_inbox(
         sink = _park_in_thread(base_url, session_id, eid, workers)
         first = page.locator(f'{_APPROVAL_CARD}[data-state="pending"]')
         expect(first).to_be_visible(timeout=_REPARK_TIMEOUT_MS)
-        first.get_by_role("button", name="Approve").click()
+        first.get_by_role("button", name="Approve", exact=True).click()
         _assert_allow(sink, "initial park")
         _settle_after_drain(page, base_url, session_id, rng)
 
@@ -327,11 +327,11 @@ def test_reparked_elicitation_reliably_resurfaces_in_inbox(
             expect(resurfaced).to_have_attribute(
                 "data-state", "pending", timeout=_REPARK_TIMEOUT_MS
             )
-            expect(resurfaced.get_by_role("button", name="Approve")).to_be_visible()
+            expect(resurfaced.get_by_role("button", name="Approve", exact=True)).to_be_visible()
 
             # Approve again (re-arming the stale verdict), then settle so the
             # next retry is a clean 0→1 diff the socket won't coalesce.
-            resurfaced.get_by_role("button", name="Approve").click()
+            resurfaced.get_by_role("button", name="Approve", exact=True).click()
             _assert_allow(sink, f"re-park {cycle}")
             _settle_after_drain(page, base_url, session_id, rng)
     finally:

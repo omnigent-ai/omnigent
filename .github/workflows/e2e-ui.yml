@@ -18,6 +18,7 @@ on:
     # Security Gate via rerun-security-gate.yml, so label churn need not re-run
     # the heavy Playwright suite. (#399 added these for the gate; superseded.)
     types: [opened, synchronize, reopened, ready_for_review]
+    paths-ignore: ['CHANGELOG.md']
   schedule:
     - cron: "0 9 * * *"
   workflow_dispatch:
@@ -88,12 +89,64 @@ jobs:
           NUM_SHARDS: "3"
         run: bash .github/scripts/ci/e2e-shard-matrix.sh
 
+  # Build the Codex-parity sidecar ONCE and publish the binary. The
+  # mocked_native_codex_goal_session fixture needs it, but compiling it pulls
+  # openai/codex's core_test_support (~1100 crates). Done lazily inside pytest
+  # it lands ~4min (warm) to ~7min (cold) on whichever single shard collects
+  # test_codex_goal_mode, lopsiding that shard against the 20min cap. Building
+  # here once and handing every shard the ~10MB binary (via the artifact +
+  # CODEX_PARITY_SIDECAR_BIN below) keeps the sidecar cost off the shard
+  # critical path entirely. Skips on draft PRs (empty matrix -> no shards).
+  build-sidecar:
+    name: build codex-parity sidecar
+    needs: setup
+    if: needs.setup.outputs.matrix != '{"include":[]}'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          ref: ${{ github.event.inputs.branch || github.ref }}
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+        with:
+          toolchain: stable
+      - name: Capture Rust version
+        id: rustc
+        run: echo "version=$(rustc --version | tr ' ' '-')" >> "$GITHUB_OUTPUT"
+      # The sidecar source is frozen and its deps are rev-pinned, so the binary
+      # is a pure function of sidecar/** + the toolchain. Cache the built binary
+      # (not the 1.6 GB target dir) and skip the ~7 min compile below on a hit;
+      # the key self-invalidates when the source, Cargo.lock, or rustc changes.
+      # Same key as ci.yml's codex-parity job -- ci.yml runs on push to main and
+      # populates the main-scoped cache that this PR-only workflow restores from.
+      - name: Cache parity sidecar binary
+        id: sidecar-cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v4
+        with:
+          path: .tmp-codex-parity-target/debug/codex-parity-sidecar
+          key: codex-parity-bin-${{ runner.os }}-${{ steps.rustc.outputs.version }}-${{ hashFiles('tests/codex_parity/sidecar/**') }}
+      - name: Build parity sidecar
+        if: steps.sidecar-cache.outputs.cache-hit != 'true'
+        run: |
+          cargo build \
+            --manifest-path tests/codex_parity/sidecar/Cargo.toml \
+            --target-dir .tmp-codex-parity-target
+      - name: Upload sidecar binary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: codex-parity-sidecar
+          path: .tmp-codex-parity-target/debug/codex-parity-sidecar
+          if-no-files-found: error
+          retention-days: 1
+
   e2e-ui:
     name: E2E UI Tests (shard ${{ matrix.shard_id }}/${{ matrix.num_shards }})
     # Draft PRs resolve to an EMPTY matrix in `setup`, so no shard runs for
     # them. Fork PRs DO run (mock LLM, no secrets) -- same as ci.yml.
     # `ready_for_review` re-fires when a draft is converted.
-    needs: setup
+    needs: [setup, build-sidecar]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
@@ -143,23 +196,19 @@ jobs:
           sudo apt-get install -y bubblewrap tmux
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
-      # Rust toolchain + target cache for the Codex parity sidecar. The
-      # mocked_native_codex_goal_session fixture builds tests/codex_parity/
-      # sidecar via `cargo build` (it pulls openai/codex's core_test_support
-      # crate, a multi-minute cold compile). Without this cache the build runs
-      # from scratch on whichever shard collects test_codex_goal_mode, adding
-      # ~9min to that shard. Mirrors ci.yml's codex-parity job: pin the
-      # toolchain for a stable cache fingerprint, key on the sidecar Cargo.lock.
-      - name: Set up Rust toolchain
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+      # Fetch the prebuilt Codex-parity sidecar from the build-sidecar job
+      # instead of compiling it here: no per-shard Rust toolchain or cargo
+      # build. The mocked_native_codex_goal_session fixture uses this binary
+      # via CODEX_PARITY_SIDECAR_BIN (set on the pytest step below).
+      - name: Download codex-parity sidecar binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
         with:
-          toolchain: stable
-
-      - name: Cache Rust build
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v4
-        with:
-          path: .tmp-codex-parity-target
-          key: codex-parity-sidecar-${{ runner.os }}-${{ hashFiles('tests/codex_parity/sidecar/Cargo.lock') }}
+          name: codex-parity-sidecar
+          path: .tmp-codex-parity-target/debug
+      - name: Make sidecar binary executable
+        # upload-artifact does not preserve the +x bit; restore it so the
+        # fixture can exec the binary.
+        run: chmod +x .tmp-codex-parity-target/debug/codex-parity-sidecar
 
       - name: Cache Playwright browsers
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
@@ -230,6 +279,10 @@ jobs:
           NIGHTLY_FULL: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
           SHARD_ID: ${{ matrix.shard_id }}
           NUM_SHARDS: ${{ matrix.num_shards }}
+          # Prebuilt sidecar from build-sidecar; the codex goal-mode fixture
+          # uses this instead of running cargo build. Absolute path: the
+          # fixture runs with cwd at the repo root but be explicit.
+          CODEX_PARITY_SIDECAR_BIN: ${{ github.workspace }}/.tmp-codex-parity-target/debug/codex-parity-sidecar
         run: |
           # Always exclude @visual: the UI diff snapshot runs in its own
           # pinned-runner gate (ui-snapshot.yml) so its baseline matches the

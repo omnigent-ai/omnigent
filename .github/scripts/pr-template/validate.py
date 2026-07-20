@@ -11,6 +11,17 @@ from __future__ import annotations
 import os
 import re
 import sys
+from pathlib import Path
+
+# Share the Markdown-section + changelog parsing with the release-time harvester
+# (.github/scripts/changelog/generate.py) so the gate and the harvester can
+# never disagree on what the "## Changelog" section means.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _md import changelog_description
+from _md import checked_labels as _checked_labels
+from _md import heading_spans as _heading_spans
+from _md import section as _section
+from _md import strip_html_comments as _strip_html_comments
 
 REQUIRED_HEADINGS = (
     "Summary",
@@ -22,6 +33,7 @@ REQUIRED_HEADINGS = (
 TYPE_LABELS = (
     "Bug fix",
     "Feature",
+    "UI / frontend change",
     "Refactor / chore",
     "Docs",
     "Test / CI",
@@ -51,41 +63,7 @@ class ValidationResult:
         self.errors = errors
 
 
-_HEADING_RE = re.compile(r"(?im)^\s*##\s+(.+?)\s*$")
 _CHECKBOX_RE = re.compile(r"(?im)^\s*-\s*\[(?P<mark>[ xX])\]\s*(?P<label>.+?)\s*$")
-
-
-def _strip_html_comments(text: str) -> str:
-    return re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
-
-
-def _heading_spans(body: str) -> dict[str, tuple[int, int]]:
-    matches = list(_HEADING_RE.finditer(body))
-    spans: dict[str, tuple[int, int]] = {}
-    for idx, match in enumerate(matches):
-        title = match.group(1).strip().lower()
-        start = match.end()
-        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(body)
-        spans[title] = (start, end)
-    return spans
-
-
-def _section(body: str, spans: dict[str, tuple[int, int]], heading: str) -> str:
-    span = spans.get(heading.lower())
-    if span is None:
-        return ""
-    return body[span[0] : span[1]]
-
-
-def _checked_labels(section: str, expected_labels: tuple[str, ...]) -> set[str]:
-    expected_by_lower = {label.lower(): label for label in expected_labels}
-    checked: set[str] = set()
-    for match in _CHECKBOX_RE.finditer(section):
-        label = match.group("label").strip()
-        canonical = expected_by_lower.get(label.lower())
-        if canonical and match.group("mark").lower() == "x":
-            checked.add(canonical)
-    return checked
 
 
 def _missing_labels(section: str, expected_labels: tuple[str, ...]) -> list[str]:
@@ -135,6 +113,19 @@ def validate_pr_body(body: str) -> ValidationResult:
     if not checked_types:
         errors.append("Check at least one Type of change checkbox.")
 
+    # The Demo section is mandatory for UI / frontend changes — reviewers need
+    # a screenshot or recording of the new behaviour. It stays optional for
+    # everything else.
+    if "UI / frontend change" in checked_types:
+        demo = _meaningful_text(_section(body, spans, "Demo"))
+        if not demo:
+            errors.append(
+                "Demo is required for UI / frontend changes — attach a screenshot "
+                "or screen recording demonstrating the new behaviour."
+            )
+        elif _contains_placeholder(demo):
+            errors.append("Demo still contains template placeholder text.")
+
     test_section = _section(body, spans, "Test coverage")
     missing_test_labels = _missing_labels(test_section, TEST_LABELS)
     if missing_test_labels:
@@ -158,6 +149,18 @@ def validate_pr_body(body: str) -> ValidationResult:
             )
         elif _contains_placeholder(coverage_notes):
             errors.append("Coverage notes still contains template placeholder text.")
+
+    # The Changelog section is optional — an author deletes it (or leaves the
+    # `<…>` placeholder) when the change isn't noteworthy, and the PR is simply
+    # omitted from the changelog. The one exception: a Breaking change is always
+    # noteworthy, so it must carry a real description line.
+    if "Breaking change" in checked_types:
+        changelog_section = _section(body, spans, "Changelog") if "changelog" in spans else ""
+        if not changelog_description(changelog_section):
+            errors.append(
+                "A Breaking change must describe the change in the Changelog section "
+                "(otherwise it would be omitted from the changelog)."
+            )
 
     return ValidationResult(ok=not errors, errors=errors)
 

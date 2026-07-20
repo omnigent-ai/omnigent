@@ -1697,6 +1697,32 @@ def test_apply_overrides_harness_and_model_together_for_spec_version_bundle() ->
     assert executor["model"] == "databricks-claude-sonnet-4-6"
 
 
+def test_apply_overrides_harness_only_clears_pinned_model() -> None:
+    """
+    ``--harness`` alone drops a prior ``executor.model`` pin.
+
+    A brain with a Claude-only model pin must not keep that id when swapped
+    to ``pi`` / ``openai-agents``. Pair with ``--model`` to keep a pin.
+    """
+    raw: dict[str, object] = {
+        "spec_version": 1,
+        "name": "polly",
+        "prompt": "orchestrate",
+        "executor": {
+            "type": "omnigent",
+            "model": "sonnet",
+            "config": {"harness": "claude-sdk"},
+        },
+    }
+
+    _apply_overrides_to_raw(raw, ChatOverrides(harness="pi"))
+
+    executor = raw["executor"]
+    assert isinstance(executor, dict)
+    assert executor["config"]["harness"] == "pi"
+    assert executor.get("model") is None
+
+
 def test_apply_overrides_rejects_harness_for_non_omnigent_executor_type() -> None:
     """
     A spec_version bundle with a non-omnigent ``executor.type`` fails
@@ -1969,6 +1995,9 @@ def test_materialize_directory_bundle_with_override_keeps_nested_harness_unpinne
             {
                 "claude_code": "claude-native",
                 "codex": "codex-native",
+                "opencode": "opencode-native",
+                "cursor": "cursor-native",
+                "hermes": "hermes-native",
                 "pi": "pi",
             },
         ),
@@ -2874,7 +2903,7 @@ def test_databricks_token_auth_sets_org_header(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.delenv(chat_module._REMOTE_AUTH_TOKEN_ENV, raising=False)
     monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
     monkeypatch.setattr(
-        "omnigent.cli_auth.databricks_org_id_headers",
+        "omnigent.cli_auth.databricks_request_headers",
         lambda _url: {"X-Databricks-Org-Id": "2850744067564480"},
     )
     # Isolate from real Databricks SDK resolution: the bearer is irrelevant

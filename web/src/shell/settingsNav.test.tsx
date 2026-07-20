@@ -5,18 +5,44 @@
 // on a plain tap (no onNavClick) so mobile lands back on the conversation list
 // instead of the homepage. Section links still close it.
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { cleanup, fireEvent, render, renderHook, screen } from "@testing-library/react";
+import type { ReactNode } from "react";
+import { MemoryRouter, useNavigate } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
-const mocks = vi.hoisted(() => ({ accountsEnabled: false }));
-
-vi.mock("@/lib/CapabilitiesContext", () => ({
-  useServerInfo: () => ({ accounts_enabled: mocks.accountsEnabled }),
+const mocks = vi.hoisted(() => ({
+  accountsEnabled: false,
+  // login_url: non-null for any sign-in mode (accounts OR OIDC), null in
+  // header mode. Gates the Account section + the bare-/settings default.
+  loginUrl: null as string | null,
+  // single_user: the server's explicit single-user marker. A multi-user
+  // header-auth deploy reports false even though it has no accounts / login,
+  // so this is the ONLY signal that hides account/sharing chrome.
+  singleUser: false,
+  isAdmin: false,
 }));
 
-import { SettingsSidebarBody, settingsNavGroups } from "./settingsNav";
+vi.mock("@/lib/CapabilitiesContext", () => ({
+  useServerInfo: () => ({
+    accounts_enabled: mocks.accountsEnabled,
+    login_url: mocks.loginUrl,
+    single_user: mocks.singleUser,
+  }),
+}));
+// Admin gating is now mode-agnostic, sourced from `/v1/me` via useIsAdmin
+// (not the accounts-only `/auth/me` useMe hook), so the Admin group appears
+// under OIDC too.
+vi.mock("@/hooks/useIsAdmin", () => ({
+  useIsAdmin: () => mocks.isAdmin,
+}));
+
+import {
+  SettingsSidebarBody,
+  settingsNavGroups,
+  useSettingsRoute,
+  useTrackSettingsReturn,
+} from "./settingsNav";
 
 function renderBody(opts: { onNavClick?: () => void; onClose?: () => void } = {}) {
   const onNavClick = opts.onNavClick ?? vi.fn();
@@ -33,6 +59,9 @@ function renderBody(opts: { onNavClick?: () => void; onClose?: () => void } = {}
 
 beforeEach(() => {
   mocks.accountsEnabled = false;
+  mocks.loginUrl = null;
+  mocks.singleUser = false;
+  mocks.isAdmin = false;
 });
 afterEach(cleanup);
 
@@ -46,18 +75,20 @@ describe("settingsNavGroups", () => {
     }
   });
 
-  it("includes Account (leading) only when accounts auth is enabled", () => {
+  it("includes Account (leading) whenever a login session exists (accounts OR OIDC)", () => {
+    // First arg is hasAuthSession (login_url != null), not accounts-specific.
+    // Header single-user (no session) → no Account section.
     expect(
       settingsNavGroups(false, false)
         .flatMap((g) => g.items)
         .map((i) => i.id),
     ).not.toContain("account");
-    const withAccounts = settingsNavGroups(true, false)
+    // Any login session → Account appears and leads its group.
+    const withAccount = settingsNavGroups(true, false)
       .flatMap((g) => g.items)
       .map((i) => i.id);
-    expect(withAccounts).toContain("account");
-    // Account leads its group — it's the most-visited section on accounts deploys.
-    expect(withAccounts[0]).toBe("account");
+    expect(withAccount).toContain("account");
+    expect(withAccount[0]).toBe("account");
   });
 
   it("includes the Local CLI section only in the desktop shell", () => {
@@ -66,7 +97,36 @@ describe("settingsNavGroups", () => {
         .flatMap((g) => g.items)
         .map((i) => i.id);
     expect(ids(false)).not.toContain("cli");
+    expect(ids(false)).not.toContain("updates");
     expect(ids(true)).toContain("cli");
+    expect(ids(true)).toContain("updates");
+  });
+
+  it("includes the Admin group (Members / Policies / Sharing) for any admin, in accounts OR OIDC mode", () => {
+    const ids = (accountsEnabled: boolean, isAdmin: boolean) =>
+      settingsNavGroups(accountsEnabled, false, isAdmin)
+        .flatMap((g) => g.items)
+        .map((i) => i.id);
+    // Non-admin → no admin items, regardless of auth mode.
+    expect(ids(true, false)).not.toContain("members");
+    expect(ids(false, false)).not.toContain("members");
+    // Admin on an accounts deploy → all appear, grouped under "Admin".
+    const accountsAdmin = settingsNavGroups(true, false, true).find((g) => g.title === "Admin");
+    expect(accountsAdmin?.items.map((i) => i.id)).toEqual(["members", "policies", "sharing"]);
+    // Admin under OIDC (accountsEnabled false) → still appears. This is the
+    // #1489 fix: OIDC previously had no admin chrome at all.
+    const oidcAdmin = settingsNavGroups(false, false, true).find((g) => g.title === "Admin");
+    expect(oidcAdmin?.items.map((i) => i.id)).toEqual(["members", "policies", "sharing"]);
+  });
+
+  it("drops Members and Sharing from the Admin group in single-user mode, keeping Policies", () => {
+    // 4th arg is isSingleUser. Members (manage accounts) and Sharing (grant to
+    // other users) are meaningless with no other users, so both are hidden;
+    // Policies stays — global policies apply to the solo user's own sessions.
+    const singleUserAdmin = settingsNavGroups(false, false, true, true).find(
+      (g) => g.title === "Admin",
+    );
+    expect(singleUserAdmin?.items.map((i) => i.id)).toEqual(["policies"]);
   });
 });
 
@@ -88,9 +148,183 @@ describe("SettingsSidebarBody", () => {
     expect(onNavClick).not.toHaveBeenCalled();
   });
 
+  it("'Back to Omnigent' returns to the conversation the user came from", () => {
+    // Simulate the real flow: the sidebar (which stays mounted) tracks the
+    // pre-settings location, then the user enters /settings. Back must point at
+    // the conversation, not the home page.
+    function Harness() {
+      useTrackSettingsReturn();
+      const navigate = useNavigate();
+      const { inSettings } = useSettingsRoute();
+      return (
+        <>
+          <button type="button" onClick={() => navigate("/settings")}>
+            go-settings
+          </button>
+          {inSettings && <SettingsSidebarBody onNavClick={vi.fn()} onClose={vi.fn()} />}
+        </>
+      );
+    }
+    render(
+      <TooltipProvider>
+        <MemoryRouter initialEntries={["/c/conv_123?file=foo.ts"]}>
+          <Harness />
+        </MemoryRouter>
+      </TooltipProvider>,
+    );
+    fireEvent.click(screen.getByText("go-settings"));
+    expect(screen.getByRole("link", { name: /Back to Omnigent/ })).toHaveAttribute(
+      "href",
+      "/c/conv_123?file=foo.ts",
+    );
+  });
+
   it("DOES close the sidebar when a section is tapped (drills into content)", () => {
     const { onNavClick } = renderBody();
     fireEvent.click(screen.getByTestId("settings-nav-appearance"));
     expect(onNavClick).toHaveBeenCalledTimes(1);
+  });
+
+  it("renders Members / Policies sub-categories for an admin, linking under /settings", () => {
+    mocks.accountsEnabled = true;
+    mocks.isAdmin = true;
+    renderBody();
+    const members = screen.getByTestId("settings-nav-members");
+    const policies = screen.getByTestId("settings-nav-policies");
+    expect(members).toHaveAttribute("href", "/settings/members");
+    expect(policies).toHaveAttribute("href", "/settings/policies");
+  });
+
+  it("renders the admin sub-categories for an admin under OIDC (accounts off)", () => {
+    // #1489: admin chrome must surface under OIDC, where accounts is off. OIDC
+    // advertises a login_url, so this is NOT single-user mode — Members shows.
+    mocks.accountsEnabled = false;
+    mocks.loginUrl = "/auth/login";
+    mocks.isAdmin = true;
+    renderBody();
+    expect(screen.getByTestId("settings-nav-members")).toHaveAttribute("href", "/settings/members");
+    expect(screen.getByTestId("settings-nav-policies")).toHaveAttribute(
+      "href",
+      "/settings/policies",
+    );
+  });
+
+  it("hides Members and Sharing but keeps Policies for an admin in single-user mode", () => {
+    // Explicit single-user local runtime (single_user marker set): there are
+    // no other users to manage or share with, so Members and Sharing drop from
+    // the nav. Policies stays — it's meaningful for a solo user's own sessions.
+    mocks.accountsEnabled = false;
+    mocks.loginUrl = null;
+    mocks.singleUser = true;
+    mocks.isAdmin = true;
+    renderBody();
+    expect(screen.queryByTestId("settings-nav-members")).toBeNull();
+    expect(screen.queryByTestId("settings-nav-sharing")).toBeNull();
+    expect(screen.getByTestId("settings-nav-policies")).toHaveAttribute(
+      "href",
+      "/settings/policies",
+    );
+  });
+
+  it("hides the admin sub-categories for a non-admin", () => {
+    mocks.accountsEnabled = true;
+    mocks.isAdmin = false;
+    renderBody();
+    expect(screen.queryByTestId("settings-nav-members")).toBeNull();
+    expect(screen.queryByTestId("settings-nav-policies")).toBeNull();
+  });
+});
+
+describe("useSettingsRoute", () => {
+  function routeHook(path: string) {
+    const w = ({ children }: { children: ReactNode }) => (
+      <MemoryRouter initialEntries={[path]}>{children}</MemoryRouter>
+    );
+    return renderHook(() => useSettingsRoute(), { wrapper: w }).result.current;
+  }
+
+  it("treats /settings/members and /settings/policies as in-settings sections on an accounts deploy", () => {
+    // The core of the fix: Members / Policies now live UNDER /settings, so the
+    // sidebar's `inSettings` gate stays true and the settings nav stays put —
+    // the old standalone /members and /policies fell through to inSettings:false
+    // (see the bare-path case below), which snapped the sidebar back to the
+    // conversation list.
+    mocks.accountsEnabled = true;
+    expect(routeHook("/settings/members")).toEqual({ inSettings: true, section: "members" });
+    expect(routeHook("/settings/policies")).toEqual({ inSettings: true, section: "policies" });
+  });
+
+  it("treats the admin sections as valid destinations even when accounts is off (OIDC)", () => {
+    // #1489: Members / Policies are admin sections valid in ANY multi-user
+    // mode (accounts AND OIDC). They no longer fall back to the default
+    // section off an accounts deploy — the nav gates them on is_admin and the
+    // pages self-gate / the server 403s. OIDC has a login_url, so it's NOT
+    // single-user mode and Members stays valid.
+    mocks.accountsEnabled = false;
+    mocks.loginUrl = "/auth/login";
+    expect(routeHook("/settings/members")).toEqual({ inSettings: true, section: "members" });
+    expect(routeHook("/settings/policies")).toEqual({ inSettings: true, section: "policies" });
+  });
+
+  it("keeps Members / Sharing valid on a multi-user header-auth deploy (not single_user)", () => {
+    // Header-auth multi-user (SSO proxy): accounts off AND no login_url, same
+    // shape as single-user, but single_user is false so the admin sections
+    // stay valid. This is the regression the single_user signal fixes.
+    mocks.accountsEnabled = false;
+    mocks.loginUrl = null;
+    mocks.singleUser = false;
+    expect(routeHook("/settings/members")).toEqual({ inSettings: true, section: "members" });
+    expect(routeHook("/settings/sharing")).toEqual({ inSettings: true, section: "sharing" });
+  });
+
+  it("redirects a direct /settings/members or /settings/sharing to the default section in single-user mode", () => {
+    // Explicit single-user local runtime (single_user marker): Members and
+    // Sharing are hidden, so a direct hit to either falls back to the default
+    // section (Appearance). Policies stays valid — it's functional single-user.
+    mocks.accountsEnabled = false;
+    mocks.loginUrl = null;
+    mocks.singleUser = true;
+    expect(routeHook("/settings/members")).toEqual({ inSettings: true, section: "appearance" });
+    expect(routeHook("/settings/sharing")).toEqual({ inSettings: true, section: "appearance" });
+    expect(routeHook("/settings/policies")).toEqual({ inSettings: true, section: "policies" });
+  });
+
+  it("reports NOT in settings for the legacy standalone /members and /policies paths", () => {
+    // These paths only exist as redirects now; if one is ever hit directly it
+    // must NOT read as in-settings (that was the bug's mechanism).
+    expect(routeHook("/members").inSettings).toBe(false);
+    expect(routeHook("/policies").inSettings).toBe(false);
+  });
+
+  it("keeps recognizing the other settings sections and their bare-path default", () => {
+    expect(routeHook("/settings/appearance")).toEqual({
+      inSettings: true,
+      section: "appearance",
+    });
+    expect(routeHook("/settings/updates")).toEqual({
+      inSettings: true,
+      section: "updates",
+    });
+    // Bare /settings: in-settings, defaulting to Appearance in header mode
+    // (no login session — loginUrl null per beforeEach).
+    expect(routeHook("/settings")).toEqual({ inSettings: true, section: "appearance" });
+    // A non-settings route is out of settings.
+    expect(routeHook("/inbox").inSettings).toBe(false);
+  });
+
+  it("defaults bare /settings to Account when a login session exists", () => {
+    // login_url set (accounts OR OIDC) → Account is the landing section.
+    mocks.loginUrl = "/login";
+    expect(routeHook("/settings")).toEqual({ inSettings: true, section: "account" });
+  });
+
+  it("matches the settings segment under an embed basename", () => {
+    // Basename-agnostic: the sidebar rebases links behind the app's back in the
+    // embed, so detection keys off the `settings` segment wherever it lands.
+    mocks.accountsEnabled = true;
+    expect(routeHook("/ml/omnigent-embed/settings/members")).toEqual({
+      inSettings: true,
+      section: "members",
+    });
   });
 });

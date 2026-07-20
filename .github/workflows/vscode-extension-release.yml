@@ -1,0 +1,168 @@
+# Build the VS Code extension from a FROZEN release branch and attach a
+# SHA256-verified `.vsix` to a DRAFT GitHub release. Triggered manually
+# (workflow_dispatch) with the target version; it checks out the
+# `release/vscode-v<version>` branch (created by vscode-release-pr.yml) rather
+# than main, so the built artifact is frozen to that branch — commits that land
+# on main after the release branch was cut cannot leak into the release. The
+# `vscode-v<version>` tag is created on the branch commit when the draft is
+# published. The version comes from the branch's `package.json` (verified to
+# match the input), so the tag and the packaged version can't diverge.
+#
+# This produces the ARTIFACT ONLY — it does NOT publish to the VS Code
+# Marketplace or Open VSX. That runs from the central secure-release repo
+# (databricks/secure-public-registry-releases-eng), on hardened runners, where
+# a workflow downloads this `.vsix`, verifies its `.sha256`, scans it, and
+# publishes. Keeping the two halves separate is deliberate: this job only
+# builds and uploads; the secured half holds the marketplace tokens and scan
+# gate.
+#
+# The release/tag is named `vscode-v<version>`, a dedicated namespace kept
+# separate from the Python release tags (`v[0-9]*`) consumed by
+# github-release.yml.
+name: VS Code Extension Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, e.g. 0.2.0. Builds from the release/vscode-v<version> branch."
+        required: true
+        type: string
+      dry_run:
+        description: "Build + package + checksum, but do NOT create the draft GitHub release."
+        required: false
+        type: boolean
+        default: true
+
+# Least privilege: creating a release + tag requires `contents: write`.
+permissions:
+  contents: write
+
+defaults:
+  run:
+    working-directory: editors/vscode
+
+jobs:
+  build-and-release:
+    # Inert in forks / mirrors — only the canonical repo cuts releases.
+    if: github.repository == 'omnigent-ai/omnigent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Validate version
+        # Runs before checkout, so the default editors/vscode workdir does not
+        # exist yet — run from the workspace root.
+        working-directory: ${{ github.workspace }}
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          # Strict X.Y.Z (matches vscode-release-pr.yml; vsce rejects suffixes).
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Version '$VERSION' is not a valid X.Y.Z."
+            exit 1
+          fi
+
+      # Build from the FROZEN release branch, not main. Later main commits can't
+      # leak into the release.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: release/vscode-v${{ inputs.version }}
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "20"
+
+      - name: Install, build, and package
+        run: |
+          npm ci
+          npm run build
+          npm run package
+
+      - name: Resolve tag and verify package.json version
+        id: meta
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          # The branch's package.json must already carry this version (the PR
+          # workflow bumped it). Guards against building the wrong branch/commit.
+          pkg_version=$(node -p "require('./package.json').version")
+          if [[ "$pkg_version" != "$VERSION" ]]; then
+            echo "::error::package.json version ($pkg_version) != requested version ($VERSION). Is release/vscode-v$VERSION the branch created by vscode-release-pr.yml?"
+            exit 1
+          fi
+          echo "tag=vscode-v$VERSION" >> "$GITHUB_OUTPUT"
+          # Tag/target the exact branch commit we built.
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "Building vscode-v$VERSION from $(git rev-parse --short HEAD)" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Compute SHA256 checksum
+        run: |
+          vsix=$(ls omnigent-vscode-*.vsix)
+          sha256sum "$vsix" > "$vsix.sha256"
+          echo "Built $vsix" | tee -a "$GITHUB_STEP_SUMMARY"
+          cat "$vsix.sha256" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Build release notes from the CHANGELOG section
+        env:
+          VERSION: ${{ inputs.version }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          # Prefill the release notes with THIS version's CHANGELOG section only
+          # (the block under "## [<version>]", up to the next "## " heading).
+          python3 - "$VERSION" <<'PY'
+          import sys, re, pathlib
+          version = sys.argv[1]
+          text = pathlib.Path("CHANGELOG.md").read_text(encoding="utf-8")
+          # Match "## [<version>]" ... until the next "## " heading or EOF.
+          m = re.search(
+              r"^## \[" + re.escape(version) + r"\][^\n]*\n(.*?)(?=^## |\Z)",
+              text, re.MULTILINE | re.DOTALL,
+          )
+          body = (m.group(1).strip() if m else "")
+          out = pathlib.Path("/tmp/release_notes.md")
+          if body:
+              out.write_text(f"## {version}\n\n{body}\n", encoding="utf-8")
+              print(f"Release notes from CHANGELOG [{version}] section.")
+          else:
+              # Fallback: no matching section — keep a minimal generic note.
+              out.write_text(
+                  f"Omnigent VS Code extension `{version}`.\n", encoding="utf-8"
+              )
+              print(f"::warning::No '## [{version}]' CHANGELOG section found — using a generic note.")
+          PY
+          # Footer applies to every release; append after the CHANGELOG body.
+          {
+            echo ""
+            echo "---"
+            echo "Marketplace / Open VSX publishing runs from the secure-release repo, which downloads and SHA256-verifies the attached \`.vsix\`."
+          } >> /tmp/release_notes.md
+
+      - name: Publish draft GitHub release with the .vsix + checksum
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          if [[ "$DRY_RUN" == "true" ]]; then
+            echo "Dry run — built and checksummed $TAG but skipping the draft release." \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          # Rerun-safe: upload assets to an existing release, else create a draft
+          # one (which creates the vscode-v<version> tag on the frozen branch
+          # commit when the draft is published).
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            # Rerun: refresh assets and the notes on the existing draft.
+            gh release upload "$TAG" omnigent-vscode-*.vsix omnigent-vscode-*.vsix.sha256 \
+              --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file /tmp/release_notes.md
+          else
+            gh release create "$TAG" omnigent-vscode-*.vsix omnigent-vscode-*.vsix.sha256 \
+              --repo "$GITHUB_REPOSITORY" \
+              --draft \
+              --target "${{ steps.meta.outputs.sha }}" \
+              --title "VS Code extension $TAG" \
+              --notes-file /tmp/release_notes.md
+          fi
+          echo "Drafted release $TAG with the .vsix + .sha256 — review and publish it from the Releases page." \
+            | tee -a "$GITHUB_STEP_SUMMARY"

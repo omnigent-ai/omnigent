@@ -40,6 +40,7 @@ from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 from typing import Any
 
+from omnigent.inner._acp_omnigent_mcp import OmnigentAcpMcp
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import (
     Executor,
@@ -96,6 +97,7 @@ def _looks_like_missing_file(message: str) -> bool:
 _AGENT_METHOD_INITIALIZE = "initialize"
 _AGENT_METHOD_SESSION_NEW = "session/new"
 _AGENT_METHOD_SESSION_PROMPT = "session/prompt"
+_AGENT_METHOD_SESSION_CANCEL = "session/cancel"
 
 # Notifications sent *from* the agent to the client.
 _CLIENT_NOTIFICATION_SESSION_UPDATE = "session/update"
@@ -239,10 +241,23 @@ class GooseExecutor(Executor):
         # which case permission falls back to allow. See :meth:`_decide_permission`.
         self._policy_evaluator: Any | None = None  # type: ignore[explicit-any]
         self._elicitation_handler: Any | None = None  # type: ignore[explicit-any]
+        # Adapter-injected tool bridge + the Omnigent-tool MCP relay it backs.
+        # Exposes Omnigent builtin tools to goose via session/new.mcpServers
+        # (the shared serve-mcp relay); goose keeps its own developer tools.
+        self._tool_executor: Any | None = None  # type: ignore[explicit-any]
+        self._mcp = OmnigentAcpMcp(label="goose")
+        self._omnigent_tools: list[Any] = []  # type: ignore[explicit-any]
 
     # ------------------------------------------------------------------
     # Low-level ACP transport
     # ------------------------------------------------------------------
+
+    def _reset_process_state(self) -> None:
+        """Clear state owned by a goose ACP subprocess."""
+        self._session_id = None
+        self._system_prompt_sent = False
+        self._initialized = False
+        self._image_supported = False
 
     async def _start_process(self) -> None:
         """Start ``goose acp`` as an asyncio subprocess.
@@ -250,10 +265,8 @@ class GooseExecutor(Executor):
         The StreamReader limit is raised to 16 MiB so a large ``session/new``
         response or tool output line can't hit the default 64 KiB per-line cap.
         """
-        # Reset handshake state: this may be a restart after the previous
-        # subprocess died. ``_initialized`` is a one-way latch.
-        self._initialized = False
-        self._image_supported = False
+        # This may be a restart after the previous subprocess died.
+        self._reset_process_state()
         env = os.environ.copy()
         env.update(self._provider_env())
         argv: list[str] = ["acp"]
@@ -479,9 +492,14 @@ class GooseExecutor(Executor):
         if self._session_id is not None:
             return self._session_id
 
+        mcp_servers = self._mcp.session_new_servers(
+            tools=self._omnigent_tools,
+            tool_executor=getattr(self, "_tool_executor", None),
+            loop=asyncio.get_event_loop(),
+        )
         resp = await self._rpc(
             _AGENT_METHOD_SESSION_NEW,
-            {"cwd": self._cwd, "mcpServers": []},
+            {"cwd": self._cwd, "mcpServers": mcp_servers},
             timeout=_INIT_TIMEOUT_SECONDS,
         )
         if "error" in resp:
@@ -861,10 +879,70 @@ class GooseExecutor(Executor):
             out["total_tokens"] = usage["totalTokens"]
         return out or None
 
+    async def interrupt_session(self, session_key: str) -> bool:  # noqa: ARG002
+        """Interrupt a running Goose turn, making the web Stop button functional.
+
+        Sends the ACP ``session/cancel`` notification to request a clean stop —
+        Goose ends the in-flight ``session/prompt`` with a ``cancelled`` stop
+        reason, which the ``run_turn`` loop then surfaces as a partial result.
+        ``session/cancel`` is a notification (no ``id``, no reply), so it's sent
+        via ``_send`` rather than ``_rpc``. If no session has been established
+        yet (still in the initialize/session-new handshake) or the send fails,
+        falls back to SIGTERM on the subprocess so the turn always terminates.
+
+        Returns True when any interrupt action was taken (cancel sent or process
+        signalled), False when there is no live process to interrupt.
+        """
+        proc = self._proc
+        if proc is None or proc.returncode is not None:
+            return False
+
+        session_id = self._session_id
+        if session_id is not None:
+            # Preferred path: ask Goose to cancel cleanly over ACP. The agent
+            # doesn't reply to the notification; it ends the running prompt with
+            # a cancelled stop reason, which run_turn observes.
+            try:
+                await self._send(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": _AGENT_METHOD_SESSION_CANCEL,
+                        "params": {"sessionId": session_id},
+                    }
+                )
+                logger.info("goose interrupt: sent session/cancel for session=%s", session_id)
+                return True
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "goose interrupt: session/cancel failed for session=%s (%s); "
+                    "falling back to SIGTERM",
+                    session_id,
+                    exc,
+                )
+
+        # Fallback: SIGTERM the subprocess (mirrors KimiExecutor).
+        return self._interrupt_proc()
+
+    def _interrupt_proc(self) -> bool:
+        """Send SIGTERM to the goose subprocess, returning True if signalled.
+
+        Safe to call at any time — no-ops when the process has already exited.
+        """
+        proc = self._proc
+        if proc is None or proc.returncode is not None:
+            return False
+        try:
+            proc.terminate()
+        except ProcessLookupError:
+            self._reset_process_state()
+            return False
+        self._reset_process_state()
+        return True
+
     async def run_turn(
         self,
         messages: list[Message],
-        tools: list[Any],  # type: ignore[explicit-any]  # noqa: ARG002 — goose runs its own tool registry
+        tools: list[Any],  # type: ignore[explicit-any]  # goose runs its own tools; used for the Omnigent MCP relay
         system_prompt: str,
         config: ExecutorConfig | None = None,  # noqa: ARG002 — unused; required by the interface
     ) -> AsyncIterator[ExecutorEvent]:
@@ -875,6 +953,8 @@ class GooseExecutor(Executor):
         final response (``stopReason``) arrives — then yields ``TurnComplete``
         with token usage.
         """
+        # Captured for the Omnigent MCP relay set up lazily at session/new.
+        self._omnigent_tools = tools or []
         try:
             if self._proc is None or self._proc.returncode is not None:
                 await self._start_process()
@@ -1029,6 +1109,8 @@ class GooseExecutor(Executor):
 
     async def close(self) -> None:
         """Terminate the goose subprocess and clean up."""
+        with contextlib.suppress(Exception):
+            self._mcp.close()
         if self._reader_task:
             self._reader_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):

@@ -190,6 +190,33 @@ def enqueue_compact(bridge_dir: Path, custom_instructions: str | None = None) ->
     return compact_id
 
 
+def enqueue_model_change(bridge_dir: Path, model: str) -> str:
+    """
+    Queue a UI-originated model switch for the resident Pi extension.
+
+    Pi owns the active model inside the already-open TUI process, so a
+    web-picked model must be applied there rather than at the next spawn's
+    ``--model`` arg (which would only take effect on relaunch). Mirrors
+    :func:`enqueue_compact`: the extension consumes this inbox payload in the
+    Pi process, resolves *model* against ``ctx.modelRegistry`` and calls Pi's
+    ``setModel`` — taking effect immediately, no ``/reload`` required.
+
+    :param bridge_dir: Native Pi bridge directory.
+    :param model: Model id to switch to, e.g.
+        ``"databricks-claude-sonnet-4-6"``.
+    :returns: Opaque model-change id.
+    """
+    model_change_id = f"model_change_{uuid.uuid4().hex}"
+    payload = {
+        "id": model_change_id,
+        "type": "model_change",
+        "model": model,
+        "created_at": time.time(),
+    }
+    _enqueue_payload(bridge_dir, model_change_id, payload)
+    return model_change_id
+
+
 def _enqueue_payload(bridge_dir: Path, item_id: str, payload: dict[str, Any]) -> None:
     inbox = bridge_dir / _INBOX_DIR
     inbox.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -254,6 +281,48 @@ def write_extension_files(
     _atomic_json(config_path(bridge_dir), payload)
     _atomic_text(extension_path(bridge_dir), _extension_source())
     return extension_path(bridge_dir), config_path(bridge_dir)
+
+
+def refresh_config_auth_headers(bridge_dir: Path, auth_headers: dict[str, str]) -> bool:
+    """
+    Merge fresh headers into the ``authHeaders`` of an existing extension config.
+
+    The bearer baked into ``config.json`` at launch dies with the ~1h
+    Databricks OAuth lifetime. The resident extension re-reads the config on
+    every outbound request (``freshAuthHeaders``), so refreshing this one key
+    — e.g. at the start of each turn — keeps its ``/policies/evaluate`` and
+    ``/mcp`` POSTs authenticated instead of failing closed mid-session.
+    Best-effort and behavior-preserving: it touches only ``authHeaders``,
+    leaving ``serverUrl`` / ``tools`` / etc. intact.
+
+    Headers are **merged** (fresh values win on collision) rather than replaced,
+    so launch-written headers such as ``X-Omnigent-Runner-Tunnel-Token`` — set
+    when the binding token was available in the runner-main process env and
+    needed for guest-on-shared-host self-access — survive every bearer rotation.
+
+    :param bridge_dir: Native Pi bridge directory.
+    :param auth_headers: Fresh outbound auth headers to merge in, e.g.
+        ``{"Authorization": "Bearer <token>"}``.
+    :returns: ``True`` when the config was rewritten; ``False`` when
+        *auth_headers* is empty (local/unauthenticated), the config is
+        missing/unreadable, or the merged result is unchanged.
+    """
+    if not auth_headers:
+        return False
+    path = config_path(bridge_dir)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    existing = payload.get("authHeaders") or {}
+    merged = {**existing, **auth_headers}
+    if merged == existing:
+        return False
+    payload["authHeaders"] = merged
+    _atomic_json(path, payload)
+    return True
 
 
 def _extension_source() -> str:

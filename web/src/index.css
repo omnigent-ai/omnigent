@@ -55,6 +55,10 @@
   --color-success: var(--success);
   --color-warning: var(--warning);
   --color-info: var(--info);
+  /* Dedicated blue for the sub-agent "session active / idle-alive" states
+     * (launching/idle/done) — distinct from the shared amber --warning (still
+     * used by the "Needs response" badge). */
+  --color-session-active: var(--session-active);
   /* Brand pink — reserved for brand moments, not status. */
   --color-brand-accent: var(--brand-accent);
   /* Named status hues — success/warning/info are repointed to the
@@ -99,6 +103,17 @@
  * buttons stay neutral grey (hue 240). See designs/UI/WEB_UI.md (still
  * describes the older cobalt direction). */
 :root {
+  /* User-controlled UI font size, as a unitless multiplier on the root
+   * font-size (see Appearance settings / lib/uiFontPreferences.ts). 1 = the
+   * browser default; the root `html` rules multiply it into their font-size so
+   * the whole rem-based UI scales. Overridden at runtime on documentElement. */
+  --ui-font-scale: 1;
+
+  /* User-controlled UI font family (see Appearance settings /
+   * lib/uiFontPreferences.ts). Deliberately left unset here so the `html` rule's
+   * `var(--ui-font-family, var(--font-sans))` falls back to the system stack;
+   * the Appearance setting sets it at runtime on documentElement. */
+
   /* ---- Inset system -------------------------------------------------------
    * Single source of truth for how far content must stay clear of screen
    * chrome. The SAME bundle runs in a browser, in Electron, and inside the
@@ -108,7 +123,11 @@
    *
    * Three inputs combine:
    *   1. OS safe area  — `env(safe-area-inset-*)`, nonzero only on notched /
-   *      home-indicator devices (and only when `viewport-fit=cover`).
+   *      home-indicator devices (and only when `viewport-fit=cover`). The
+   *      Android shell can't rely on `env()` alone (unreliable across WebView
+   *      versions / nav modes), so it also injects measured insets as
+   *      `--omnigent-android-safe-area-*`; we fold those in with `max()` so the
+   *      var stays universal and contributes nothing off the Android shell.
    *   2. Native bar footprint — the pixel height of the iOS shell's floating
    *      server switcher (top) and chat/terminal bar (bottom). The native
    *      layer owns these dimensions and pushes them over the bridge (see
@@ -124,12 +143,23 @@
    * tracked here for symmetry/introspection but is intentionally NOT added to
    * the content top inset to avoid double-counting the header band. */
   --omnigent-header-height: 3.5rem; /* web ChatHeader (h-14) */
-  --omnigent-safe-top: env(safe-area-inset-top, 0px);
-  --omnigent-safe-bottom: env(safe-area-inset-bottom, 0px);
+  --omnigent-safe-top: max(
+    env(safe-area-inset-top, 0px),
+    var(--omnigent-android-safe-area-top, 0px)
+  );
+  --omnigent-safe-bottom: max(
+    env(safe-area-inset-bottom, 0px),
+    var(--omnigent-android-safe-area-bottom, 0px)
+  );
   --omnigent-native-top-bar: 0px; /* set by native bridge (px) */
   --omnigent-native-bottom-bar: 0px; /* set by native bridge (px) */
   --omnigent-top-bar-visible: 0; /* web-owned 0|1 */
   --omnigent-bottom-bar-visible: 0; /* web-owned 0|1 */
+  /* Android floating server-switcher pill footprint (margin + height).
+     Used by the Android scroll-fade gradient so it starts at the pill
+     bottom. Set once; if the pill size changes, update both values. */
+  --omnigent-android-switcher-margin: 8px;
+  --omnigent-android-switcher-height: 25px;
   --omnigent-inset-top: var(--omnigent-safe-top);
   --omnigent-inset-bottom: calc(
     var(--omnigent-safe-bottom) + var(--omnigent-native-bottom-bar) *
@@ -178,6 +208,10 @@
   --success: #2ea65c;
   --warning: #d4972a;
   --info: #3b8ff5;
+  /* Session active / idle-alive blue — a deeper, saturated azure
+     * that harmonizes with the brand blues (#2272b4 / #3b8ff5) and reads
+     * with strong contrast on the white card surface. */
+  --session-active: #2f7fd4;
   --border: #e8ecf0;
   /* Stronger divider/outline + a dedicated neutral button border. */
   --border-strong: #a3b1bf;
@@ -255,6 +289,10 @@
   --success: #2ea65c;
   --warning: #d4972a;
   --info: #3b8ff5;
+  /* Session active / idle-alive blue, lightened for the dark glass card so
+     * the small dot keeps adequate contrast against the dark canvas (the
+     * light-mode #2f7fd4 reads too dim here). */
+  --session-active: #5ca4f5;
   /* Brand pink + named status hues (same values as light — the brand
      * status palette is hue-stable across themes). Defined explicitly here
      * rather than inheriting from :root so dark mode is self-contained. */
@@ -340,6 +378,27 @@
 .chat-scroll-fade {
   mask-image: linear-gradient(to bottom, transparent 48px, black 80px);
   -webkit-mask-image: linear-gradient(to bottom, transparent 48px, black 80px);
+}
+
+/* Turn rail's edges dissolve so it's clear the ticks scroll past both ends.
+ * Short symmetric ramps since the ticks are small and evenly spaced. The ramp
+ * width comes from --turn-rail-fade, set inline from TurnRail's FADE constant
+ * so the visual mask and the thumb-tracking math can't silently desync. */
+.turn-rail-fade {
+  mask-image: linear-gradient(
+    to bottom,
+    transparent 0,
+    black var(--turn-rail-fade),
+    black calc(100% - var(--turn-rail-fade)),
+    transparent 100%
+  );
+  -webkit-mask-image: linear-gradient(
+    to bottom,
+    transparent 0,
+    black var(--turn-rail-fade),
+    black calc(100% - var(--turn-rail-fade)),
+    transparent 100%
+  );
 }
 
 /* Elevated surfaces — frosted glass effect with backdrop blur.
@@ -470,7 +529,7 @@
      drawer instantly with no animation. Transition both so the toggle slides
      too. Suppressed inline (`transition: none`) while a drag is live so the
      overlay tracks the finger 1:1. */
-  [data-ios-native] .conversations-sidebar {
+  :is([data-ios-native], [data-android-native]) .conversations-sidebar {
     transition-property: transform, translate;
     transition-duration: 360ms;
     transition-timing-function: cubic-bezier(0.32, 0.72, 0, 1);
@@ -484,11 +543,11 @@
      screen's left edge while parked off-screen. It's visible only mid-slide and
      mid-drag — fully open the drawer covers the viewport, so its right edge (and
      the shadow) sit past the screen. iOS-only: the web overlay is unchanged. */
-  [data-ios-native] .conversations-sidebar:not([data-collapsed]) {
+  :is([data-ios-native], [data-android-native]) .conversations-sidebar:not([data-collapsed]) {
     box-shadow: 8px 0 28px -6px rgb(0 0 0 / 0.22);
   }
 
-  .dark [data-ios-native] .conversations-sidebar:not([data-collapsed]) {
+  .dark :is([data-ios-native], [data-android-native]) .conversations-sidebar:not([data-collapsed]) {
     box-shadow: 8px 0 30px -4px rgb(0 0 0 / 0.55);
   }
 
@@ -496,17 +555,24 @@
     font-size: 16px;
   }
 
-  [data-ios-native] .chat-header {
-    top: max(0px, calc(env(safe-area-inset-top, 0px) - 0.5rem));
+  /* `--omnigent-safe-top` (not raw env()) so this works on Android too, where
+     env(safe-area-inset-top) is 0 in the WebView and the OS inset arrives via
+     the native-injected `--omnigent-android-safe-area-top`. On iOS the var folds
+     down to env(), so the iOS result is unchanged. */
+  [data-ios-native] .chat-header,
+  [data-android-native] .chat-header {
+    top: max(0px, calc(var(--omnigent-safe-top) - 0.5rem));
   }
 
-  [data-ios-native] .chat-conversation-content {
+  [data-ios-native] .chat-conversation-content,
+  [data-android-native] .chat-conversation-content {
     /* header band + 1.5rem breathing room + OS safe area, sourced from the
        shared inset vars (was a hardcoded 5rem). */
     padding-top: calc(var(--omnigent-header-height) + 1.5rem + var(--omnigent-inset-top));
   }
 
-  [data-ios-native] .main-terminal-view {
+  [data-ios-native] .main-terminal-view,
+  [data-android-native] .main-terminal-view {
     padding-top: calc(3.25rem + var(--omnigent-inset-top));
   }
 
@@ -523,7 +589,28 @@
     );
   }
 
-  [data-ios-native] .chat-composer-form {
+  /* Android: the floating server-switcher pill sits at the top. Start the
+     fade at the pill bottom (safe-top + margin + height) so content scrolls
+     smoothly into view below it. */
+  [data-android-native] .chat-scroll-fade {
+    --fade-start: calc(
+      var(--omnigent-safe-top) + var(--omnigent-android-switcher-margin) +
+        var(--omnigent-android-switcher-height)
+    );
+    mask-image: linear-gradient(
+      to bottom,
+      transparent var(--fade-start),
+      black calc(var(--fade-start) + 32px)
+    );
+    -webkit-mask-image: linear-gradient(
+      to bottom,
+      transparent var(--fade-start),
+      black calc(var(--fade-start) + 32px)
+    );
+  }
+
+  [data-ios-native] .chat-composer-form,
+  [data-android-native] .chat-composer-form {
     padding-bottom: calc(0.75rem + var(--omnigent-safe-bottom));
   }
 
@@ -539,15 +626,13 @@
      view (the in-page pill is suppressed in the iOS shell). Height is the
      shared bottom inset — the native bar footprint (sourced from the shell, see
      nativeInsets.ts) plus the home-indicator safe area — so it can never drift
-     from the bar's real size. Chat sits 1rem tighter: its composer status line
-     already cushions the gap to the bar. */
-  [data-ios-native] .omnigent-native-bottom-spacer {
+     from the bar's real size. Chat reserves the same footprint: its composer
+     status line (host / harness / context ring) is content the bar must clear,
+     not spare cushion, so trimming the reserve here let the bar overlap it. */
+  [data-ios-native] .omnigent-native-bottom-spacer,
+  [data-ios-native] .omnigent-native-bottom-spacer--chat {
     height: var(--omnigent-inset-bottom);
     flex: none;
-  }
-
-  [data-ios-native] .omnigent-native-bottom-spacer--chat {
-    height: calc(var(--omnigent-inset-bottom) - 1rem);
   }
 
   [data-ios-native] .terminal-first-switcher {
@@ -614,7 +699,7 @@
       0 1px 0 rgb(255 255 255 / 0.12) inset;
   }
 
-  [data-ios-native]
+  :is([data-ios-native], [data-android-native])
     :is(
       .conversations-sidebar,
       [data-testid="file-viewer"],
@@ -686,16 +771,35 @@
     overflow: hidden;
   }
   html {
-    @apply font-sans;
+    /* Font family for the whole inherited UI. Can't `@apply font-sans`: Tailwind
+     * v4's `@theme inline` inlines the literal stack, so a runtime `--font-sans`
+     * override is a no-op. Read a dedicated `--ui-font-family` (set on
+     * documentElement by the Appearance setting / lib/uiFontPreferences.ts)
+     * with the system stack as the fallback when it's unset. */
+    font-family: var(--ui-font-family, var(--font-sans));
+    /* Root size for the whole rem-based UI. `1em` resolves against the
+     * browser default so a customized default is preserved; --ui-font-scale
+     * layers the user's Appearance choice on top. */
+    font-size: calc(1em * var(--ui-font-scale));
   }
-  /* Text selection — brand pink highlight. Light: gentle wash + dark pink
-   * text. Dark: solid brand pink background + white text. */
+  /* Code surfaces stay on the mono stack, immune to the UI --ui-font-family
+   * override above. The Appearance font-family setting is UI chrome only; the
+   * Monaco editor and xterm terminals are code fonts, owned by a separate
+   * (future) code-font setting. Monaco/xterm already pin their own font, so this
+   * is a guard against inheritance leaking in through any unpinned descendant. */
+  .monaco-editor,
+  .xterm {
+    font-family: var(--font-mono);
+  }
+  /* Text selection tracks the palette's brand accent so it stays cohesive
+   * across themes (pink on Omni, blue on GitHub, coral on Claude, …). Light:
+   * gentle accent wash + accent-colored text. Dark: solid accent + white. */
   ::selection {
-    background: color-mix(in srgb, #f22286 20%, transparent);
-    color: #f22286;
+    background: color-mix(in srgb, var(--brand-accent) 22%, transparent);
+    color: var(--brand-accent);
   }
   .dark ::selection {
-    background: #f22286;
+    background: var(--brand-accent);
     color: #ffffff;
   }
 }
@@ -706,14 +810,15 @@
  * Tailwind's `md` breakpoint. Tailwind v4 sizes typography AND spacing in
  * `rem`, so the whole UI scales up ~12.5% uniformly — easier to read at
  * arm's length and slightly more forgiving touch targets. Desktop is
- * untouched.
+ * untouched. `--ui-font-scale` (the user's Appearance choice) multiplies in
+ * here too, so the bump composes with the setting instead of being lost.
  *
  * Note that `rem` in `@media` queries always refers to the user-agent's
  * default (16px) per the CSS spec — so `48rem` here is the same 768px
  * Tailwind uses for `md:*` utilities, regardless of our root override. */
 @media (width < 48rem) {
   html {
-    font-size: 18px;
+    font-size: calc(1.125em * var(--ui-font-scale));
   }
 }
 
@@ -815,32 +920,6 @@
   .animate-user-msg-flash {
     animation: none;
     box-shadow: 0 0 0 2px var(--ring);
-  }
-}
-
-/* "Running / working" status indicator — a single brand-pink dot that fades
- * between faint and full opacity. Subtle yet noticeable, and cheaper than a
- * spinner. Shared by the sidebar SessionStateBadge and the SubagentsPanel. */
-@keyframes running-pulse {
-  0%,
-  100% {
-    opacity: 0.35;
-  }
-  50% {
-    opacity: 1;
-  }
-}
-
-.running-pulse-dot {
-  animation: running-pulse 1.4s ease-in-out infinite;
-}
-
-/* Reduced-motion: hold the dot at a steady mid-opacity so the state is still
- * legible without motion. */
-@media (prefers-reduced-motion: reduce) {
-  .running-pulse-dot {
-    animation: none;
-    opacity: 0.8;
   }
 }
 
@@ -1068,6 +1147,25 @@
   border-radius: 2px;
 }
 
+/* Find-in-file matches in the markdown editor — all matches dim, current match strong */
+.md-search-match {
+  background-color: color-mix(in oklch, var(--warning) 30%, transparent);
+  border-radius: 2px;
+}
+.md-search-match-current {
+  background-color: color-mix(in oklch, var(--warning) 70%, transparent);
+}
+
+/* Find-in-file matches in the rendered markdown / notebook preview. The preview
+   is React-owned DOM, so matches are painted with the CSS Custom Highlight API
+   (Range-based, no node mutation) rather than wrapper spans. */
+::highlight(md-preview-search) {
+  background-color: color-mix(in oklch, var(--warning) 30%, transparent);
+}
+::highlight(md-preview-search-current) {
+  background-color: color-mix(in oklch, var(--warning) 70%, transparent);
+}
+
 /* TipTap editor prose styling */
 .tiptap-md-content .ProseMirror {
   outline: none;
@@ -1227,6 +1325,93 @@
 .dark .tiptap-md-content .ProseMirror blockquote[data-alert-type="caution"] {
   --md-alert-color: #f85149;
 }
+
+/* ── Rendered Markdown preview (read-only CodeViewer surface) ──────────────
+   The preview renders via react-markdown into a .prose container. Two GitHub
+   parity fixes live here (the rich-text editor handles the same cases above
+   through TipTap, so this is the preview's equivalent). */
+
+/* Honor explicit <img width/height>. Tailwind Preflight sets `img { height:
+   auto }`, which overrides the width/height *attributes* (presentational hints
+   lose to author CSS); a custom <img> renderer forwards them as inline styles,
+   which win. Keep max-width so oversized images still can't overflow, and use
+   inline-block so logos/badges flow within text like on GitHub. */
+.markdown-preview.prose img {
+  max-width: 100%;
+  display: inline-block;
+  vertical-align: middle;
+}
+
+/* GitHub alerts. rehype-github-alerts emits GitHub's own markup
+   (<div class="markdown-alert markdown-alert-note"> + a
+   <p class="markdown-alert-title">Note</p> header). We drop its inline octicon
+   in sanitize and redraw it here as a CSS mask, reusing the exact GitHub icons
+   and hues from the editor block above so both surfaces match. */
+.markdown-preview .markdown-alert {
+  padding: 0.5rem 1rem;
+  margin-bottom: 1rem;
+  color: inherit;
+  border-left: 0.25em solid var(--md-alert-color);
+}
+.markdown-preview .markdown-alert > :first-child {
+  margin-top: 0;
+}
+.markdown-preview .markdown-alert > :last-child {
+  margin-bottom: 0;
+}
+.markdown-preview .markdown-alert-title {
+  display: flex;
+  align-items: center;
+  font-weight: 500;
+  line-height: 1.4;
+  color: var(--md-alert-color);
+}
+/* The icon: a mask over a colored box so it inherits --md-alert-color. */
+.markdown-preview .markdown-alert-title::before {
+  content: "";
+  width: 16px;
+  height: 16px;
+  margin-right: 0.5rem;
+  background-color: var(--md-alert-color);
+  mask: var(--md-alert-icon) no-repeat center / contain;
+  -webkit-mask: var(--md-alert-icon) no-repeat center / contain;
+}
+.markdown-preview .markdown-alert-note {
+  --md-alert-color: #0969da;
+  --md-alert-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M0 8a8 8 0 1 1 16 0A8 8 0 0 1 0 8Zm8-6.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13ZM6.5 7.75A.75.75 0 0 1 7.25 7h1a.75.75 0 0 1 .75.75v2.75h.25a.75.75 0 0 1 0 1.5h-2a.75.75 0 0 1 0-1.5h.25v-2h-.25a.75.75 0 0 1-.75-.75ZM8 6a1 1 0 1 1 0-2 1 1 0 0 1 0 2Z'/%3E%3C/svg%3E");
+}
+.markdown-preview .markdown-alert-tip {
+  --md-alert-color: #1a7f37;
+  --md-alert-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M8 1.5c-2.363 0-4 1.69-4 3.75 0 .984.424 1.625.984 2.304l.214.253c.223.264.47.556.673.848.284.411.537.896.621 1.49a.75.75 0 0 1-1.484.211c-.04-.282-.163-.547-.37-.847a8.456 8.456 0 0 0-.542-.68c-.084-.1-.173-.205-.268-.32C3.201 7.75 2.5 6.766 2.5 5.25 2.5 2.31 4.863 0 8 0s5.5 2.31 5.5 5.25c0 1.516-.701 2.5-1.328 3.259-.095.115-.184.22-.268.319-.207.245-.383.453-.541.681-.208.3-.33.565-.37.847a.751.751 0 0 1-1.485-.212c.084-.593.337-1.078.621-1.489.203-.292.45-.584.673-.848.075-.088.147-.173.213-.253.561-.679.985-1.32.985-2.304 0-2.06-1.637-3.75-4-3.75ZM5.75 12h4.5a.75.75 0 0 1 0 1.5h-4.5a.75.75 0 0 1 0-1.5Zm.75 3.75a.75.75 0 0 1 .75-.75h1.5a.75.75 0 0 1 0 1.5h-1.5a.75.75 0 0 1-.75-.75Z'/%3E%3C/svg%3E");
+}
+.markdown-preview .markdown-alert-important {
+  --md-alert-color: #8250df;
+  --md-alert-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M0 1.75C0 .784.784 0 1.75 0h12.5C15.216 0 16 .784 16 1.75v9.5A1.75 1.75 0 0 1 14.25 13H8.06l-2.573 2.573A1.458 1.458 0 0 1 3 14.543V13H1.75A1.75 1.75 0 0 1 0 11.25Zm1.75-.25a.25.25 0 0 0-.25.25v9.5c0 .138.112.25.25.25h2a.75.75 0 0 1 .75.75v2.19l2.72-2.72a.749.749 0 0 1 .53-.22h6.5a.25.25 0 0 0 .25-.25v-9.5a.25.25 0 0 0-.25-.25Zm7 2.25v2.5a.75.75 0 0 1-1.5 0v-2.5a.75.75 0 0 1 1.5 0ZM9 9a1 1 0 1 1-2 0 1 1 0 0 1 2 0Z'/%3E%3C/svg%3E");
+}
+.markdown-preview .markdown-alert-warning {
+  --md-alert-color: #9a6700;
+  --md-alert-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M6.457 1.047c.659-1.234 2.427-1.234 3.086 0l6.082 11.378A1.75 1.75 0 0 1 14.082 15H1.918a1.75 1.75 0 0 1-1.543-2.575Zm1.763.707a.25.25 0 0 0-.44 0L1.698 13.132a.25.25 0 0 0 .22.368h12.164a.25.25 0 0 0 .22-.368Zm.53 3.996v2.5a.75.75 0 0 1-1.5 0v-2.5a.75.75 0 0 1 1.5 0ZM9 11a1 1 0 1 1-2 0 1 1 0 0 1 2 0Z'/%3E%3C/svg%3E");
+}
+.markdown-preview .markdown-alert-caution {
+  --md-alert-color: #cf222e;
+  --md-alert-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4.47.22A.749.749 0 0 1 5 0h6c.199 0 .389.079.53.22l4.25 4.25c.141.14.22.331.22.53v6a.749.749 0 0 1-.22.53l-4.25 4.25a.749.749 0 0 1-.53.22H5a.749.749 0 0 1-.53-.22L.22 11.53A.749.749 0 0 1 0 11V5c0-.199.079-.389.22-.53Zm.84 1.28L1.5 5.31v5.38l3.81 3.81h5.38l3.81-3.81V5.31L10.69 1.5ZM8 4a.75.75 0 0 1 .75.75v3.5a.75.75 0 0 1-1.5 0v-3.5A.75.75 0 0 1 8 4Zm0 8a1 1 0 1 1 0-2 1 1 0 0 1 0 2Z'/%3E%3C/svg%3E");
+}
+/* GitHub's dark-palette hues for the same five types. */
+.dark .markdown-preview .markdown-alert-note {
+  --md-alert-color: #4493f8;
+}
+.dark .markdown-preview .markdown-alert-tip {
+  --md-alert-color: #3fb950;
+}
+.dark .markdown-preview .markdown-alert-important {
+  --md-alert-color: #ab7df8;
+}
+.dark .markdown-preview .markdown-alert-warning {
+  --md-alert-color: #d29922;
+}
+.dark .markdown-preview .markdown-alert-caution {
+  --md-alert-color: #f85149;
+}
 .tiptap-md-content .ProseMirror code {
   font-family: var(--font-mono);
   font-size: 0.85em;
@@ -1267,10 +1452,12 @@
   font-weight: 500;
   margin: 0.75em 0 0.25em;
 }
-/* GitHub-style images: never overflow the editor column. No `height: auto` —
-   it would override explicit height="" attributes from HTML <img> tags.
-   inline-block overrides Tailwind preflight's `img { display: block }` so
-   images flow within headings/paragraphs (logos, badges) like on GitHub. */
+/* GitHub-style images: never overflow the editor column. Explicit <img
+   width/height> are applied as inline styles by the node view (see
+   TipTapWorkspaceImage), which beat Preflight's `img { height: auto }` — an
+   attribute-based size would not. inline-block overrides Preflight's
+   `img { display: block }` so images flow within headings/paragraphs (logos,
+   badges) like on GitHub. */
 .tiptap-md-content .ProseMirror img {
   max-width: 100%;
   display: inline-block;
@@ -1323,4 +1510,496 @@
 /* Cursor when hovering over a resizable column border */
 .tiptap-md-content .resize-cursor {
   cursor: col-resize;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * COLOR PALETTES
+ *
+ * A palette is a second appearance axis, orthogonal to light/dark mode. It is
+ * selected in Appearance settings and applied as `data-theme` on <html> (see
+ * lib/themePalette.ts), re-pointing the same color tokens the whole app already
+ * reads. The default "omni" palette has NO block here — it falls through to the
+ * base `:root` / `.dark` brand tokens above.
+ *
+ * Each palette defines a light block and a dark block:
+ *   - Light: `:root:not(.dark)[data-theme="X"]` — only when the mode class is
+ *     absent, so the light values never leak into dark.
+ *   - Dark:  `.dark[data-theme="X"]` — outspecifies the base `.dark`.
+ * Tokens left unset (status hues, charts, destructive) inherit the base so the
+ * semantic palette stays consistent everywhere. The `.app-shell` canvas
+ * gradient is overridden per palette + mode.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Custom themes keep one user configuration and map its derived light/dark
+ * values onto the same semantic tokens as built-in palettes. */
+:root:not(.dark)[data-theme="custom"] {
+  --background: var(--custom-light-background);
+  --foreground: var(--custom-light-foreground);
+  --card: var(--custom-light-card);
+  --card-solid: var(--custom-light-card-solid);
+  --card-foreground: var(--custom-light-foreground);
+  --tray: var(--custom-light-card);
+  --popover: var(--custom-light-card-solid);
+  --popover-foreground: var(--custom-light-foreground);
+  --primary: var(--custom-light-primary);
+  --primary-foreground: var(--custom-light-primary-foreground);
+  --secondary: var(--custom-light-secondary);
+  --secondary-foreground: var(--custom-light-foreground);
+  --muted: var(--custom-light-muted);
+  --muted-foreground: var(--custom-light-muted-foreground);
+  --code-bg: var(--custom-light-code-bg);
+  --accent: var(--custom-light-accent);
+  --accent-foreground: var(--custom-light-foreground);
+  --border: var(--custom-light-border);
+  --border-strong: var(--custom-light-border-strong);
+  --button-border: var(--custom-light-border);
+  --input: var(--custom-light-border);
+  --ring: var(--custom-light-primary);
+  --brand-accent: var(--custom-light-primary);
+  --sidebar: var(--custom-light-sidebar);
+  --sidebar-foreground: var(--custom-light-foreground);
+  --sidebar-primary: var(--custom-light-primary);
+  --sidebar-primary-foreground: var(--custom-light-primary-foreground);
+  --sidebar-accent: var(--custom-light-accent);
+  --sidebar-accent-foreground: var(--custom-light-foreground);
+  --sidebar-border: var(--custom-light-border);
+  --sidebar-ring: var(--custom-light-primary);
+}
+.dark[data-theme="custom"] {
+  --background: var(--custom-dark-background);
+  --foreground: var(--custom-dark-foreground);
+  --card: var(--custom-dark-card);
+  --card-solid: var(--custom-dark-card-solid);
+  --card-foreground: var(--custom-dark-foreground);
+  --tray: var(--custom-dark-card);
+  --popover: var(--custom-dark-card-solid);
+  --popover-foreground: var(--custom-dark-foreground);
+  --primary: var(--custom-dark-primary);
+  --primary-foreground: var(--custom-dark-primary-foreground);
+  --secondary: var(--custom-dark-secondary);
+  --secondary-foreground: var(--custom-dark-foreground);
+  --muted: var(--custom-dark-muted);
+  --muted-foreground: var(--custom-dark-muted-foreground);
+  --code-bg: var(--custom-dark-code-bg);
+  --accent: var(--custom-dark-accent);
+  --accent-foreground: var(--custom-dark-foreground);
+  --border: var(--custom-dark-border);
+  --border-strong: var(--custom-dark-border-strong);
+  --button-border: var(--custom-dark-border);
+  --input: var(--custom-dark-border);
+  --ring: var(--custom-dark-primary);
+  --brand-accent: var(--custom-dark-primary);
+  --sidebar: var(--custom-dark-sidebar);
+  --sidebar-foreground: var(--custom-dark-foreground);
+  --sidebar-primary: var(--custom-dark-primary);
+  --sidebar-primary-foreground: var(--custom-dark-primary-foreground);
+  --sidebar-accent: var(--custom-dark-accent);
+  --sidebar-accent-foreground: var(--custom-dark-foreground);
+  --sidebar-border: var(--custom-dark-border);
+  --sidebar-ring: var(--custom-dark-primary);
+}
+:root:not(.dark)[data-theme="custom"] .app-shell {
+  background: var(--custom-light-shell-background);
+}
+.dark[data-theme="custom"] .app-shell {
+  background: var(--custom-dark-shell-background);
+}
+@media (min-width: 48rem) {
+  :root:not(.dark)[data-theme="custom"][data-custom-translucent-sidebar]
+    :is(.conversations-sidebar, aside[aria-label="Workspace"]) {
+    background-color: var(--custom-light-sidebar);
+    backdrop-filter: blur(20px) saturate(1.12);
+  }
+  .dark[data-theme="custom"][data-custom-translucent-sidebar]
+    :is(.conversations-sidebar, aside[aria-label="Workspace"]) {
+    background-color: var(--custom-dark-sidebar);
+    backdrop-filter: blur(20px) saturate(1.12);
+  }
+  :root[data-theme="custom"][data-custom-translucent-sidebar]
+    aside[aria-label="Workspace"]
+    :is([data-workspace-panel-content] > *, [data-workspace-panel-surface]) {
+    background-color: transparent;
+  }
+}
+
+/* ── GitHub — clean neutrals, signal blue, green primary ──────────────────── */
+:root:not(.dark)[data-theme="github"] {
+  --background: #f6f8fa;
+  --foreground: #1f2328;
+  --card: #ffffff;
+  --card-solid: #ffffff;
+  --card-foreground: #1f2328;
+  --tray: #ffffff;
+  --popover: #ffffff;
+  --popover-foreground: #1f2328;
+  --primary: #1f883d;
+  --primary-foreground: #ffffff;
+  --secondary: #eaeef2;
+  --secondary-foreground: #1f2328;
+  --muted: #eaeef2;
+  --muted-foreground: #59636e;
+  --code-bg: #eff1f3;
+  --accent: #ddf4ff;
+  --accent-foreground: #0550ae;
+  --border: #d1d9e0;
+  --border-strong: #afb8c1;
+  --button-border: #d1d9e0;
+  --input: #d1d9e0;
+  --ring: #0969da;
+  --brand-accent: #0969da;
+  --sidebar: #f6f8fa;
+  --sidebar-foreground: #1f2328;
+  --sidebar-primary: #0969da;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #ddf4ff;
+  --sidebar-accent-foreground: #0550ae;
+  --sidebar-border: #d1d9e0;
+  --sidebar-ring: #0969da;
+}
+.dark[data-theme="github"] {
+  --background: #0d1117;
+  --foreground: #e6edf3;
+  --card: rgba(22, 27, 34, 0.72);
+  --card-solid: #161b22;
+  --card-foreground: #e6edf3;
+  --tray: rgba(22, 27, 34, 0.72);
+  --popover: rgba(22, 27, 34, 0.9);
+  --popover-foreground: #e6edf3;
+  --primary: #238636;
+  --primary-foreground: #ffffff;
+  --secondary: #21262d;
+  --secondary-foreground: #e6edf3;
+  --muted: #21262d;
+  --muted-foreground: #8b949e;
+  --code-bg: #1c2128;
+  --accent: #121d2f;
+  --accent-foreground: #58a6ff;
+  --border: #30363d;
+  --border-strong: #444c56;
+  --button-border: #30363d;
+  --input: #30363d;
+  --ring: #58a6ff;
+  --brand-accent: #58a6ff;
+  --sidebar: rgba(13, 17, 23, 0.75);
+  --sidebar-foreground: #e6edf3;
+  --sidebar-primary: #58a6ff;
+  --sidebar-primary-foreground: #0d1117;
+  --sidebar-accent: #121d2f;
+  --sidebar-accent-foreground: #58a6ff;
+  --sidebar-border: #30363d;
+  --sidebar-ring: #58a6ff;
+}
+:root:not(.dark)[data-theme="github"] .app-shell {
+  background: linear-gradient(180deg, #fbfcfd 0%, #f6f8fa 100%);
+}
+.dark[data-theme="github"] .app-shell {
+  background: linear-gradient(160deg, #0d1117 0%, #0a0e14 100%);
+}
+
+/* ── Catppuccin — soft pastels (Latte light / Mocha dark) ─────────────────── */
+:root:not(.dark)[data-theme="catppuccin"] {
+  --background: #eff1f5;
+  --foreground: #4c4f69;
+  --card: #ffffff;
+  --card-solid: #ffffff;
+  --card-foreground: #4c4f69;
+  --tray: #ffffff;
+  --popover: #ffffff;
+  --popover-foreground: #4c4f69;
+  --primary: #8839ef;
+  --primary-foreground: #ffffff;
+  --secondary: #e6e9ef;
+  --secondary-foreground: #4c4f69;
+  --muted: #e6e9ef;
+  --muted-foreground: #6c6f85;
+  --code-bg: #e6e9ef;
+  --accent: #ccd0da;
+  --accent-foreground: #8839ef;
+  --border: #ccd0da;
+  --border-strong: #acb0be;
+  --button-border: #ccd0da;
+  --input: #ccd0da;
+  --ring: #8839ef;
+  --brand-accent: #ea76cb;
+  --sidebar: #e6e9ef;
+  --sidebar-foreground: #4c4f69;
+  --sidebar-primary: #8839ef;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #ccd0da;
+  --sidebar-accent-foreground: #8839ef;
+  --sidebar-border: #ccd0da;
+  --sidebar-ring: #8839ef;
+}
+.dark[data-theme="catppuccin"] {
+  --background: #1e1e2e;
+  --foreground: #cdd6f4;
+  --card: rgba(49, 50, 68, 0.6);
+  --card-solid: #282938;
+  --card-foreground: #cdd6f4;
+  --tray: rgba(49, 50, 68, 0.6);
+  --popover: rgba(24, 24, 37, 0.92);
+  --popover-foreground: #cdd6f4;
+  --primary: #cba6f7;
+  --primary-foreground: #1e1e2e;
+  --secondary: #313244;
+  --secondary-foreground: #cdd6f4;
+  --muted: #313244;
+  --muted-foreground: #a6adc8;
+  --code-bg: #181825;
+  --accent: #45475a;
+  --accent-foreground: #cba6f7;
+  --border: #45475a;
+  --border-strong: #585b70;
+  --button-border: #45475a;
+  --input: #45475a;
+  --ring: #cba6f7;
+  --brand-accent: #cba6f7;
+  --sidebar: rgba(24, 24, 37, 0.8);
+  --sidebar-foreground: #cdd6f4;
+  --sidebar-primary: #cba6f7;
+  --sidebar-primary-foreground: #1e1e2e;
+  --sidebar-accent: #45475a;
+  --sidebar-accent-foreground: #cba6f7;
+  --sidebar-border: #45475a;
+  --sidebar-ring: #cba6f7;
+}
+:root:not(.dark)[data-theme="catppuccin"] .app-shell {
+  background: linear-gradient(160deg, #f2f3f7 0%, #eff1f5 60%, #e9ecf2 100%);
+}
+.dark[data-theme="catppuccin"] .app-shell {
+  background:
+    radial-gradient(ellipse at 20% 30%, rgba(203, 166, 247, 0.12) 0%, transparent 55%),
+    radial-gradient(ellipse at 80% 20%, rgba(245, 194, 231, 0.08) 0%, transparent 45%),
+    linear-gradient(160deg, #232336 0%, #1e1e2e 60%, #181825 100%);
+}
+
+/* ── Gruvbox — warm retro earth tones ─────────────────────────────────────── */
+:root:not(.dark)[data-theme="gruvbox"] {
+  --background: #fbf1c7;
+  --foreground: #3c3836;
+  --card: #fffdf2;
+  --card-solid: #fffdf2;
+  --card-foreground: #3c3836;
+  --tray: #fffdf2;
+  --popover: #fffdf2;
+  --popover-foreground: #3c3836;
+  --primary: #d65d0e;
+  --primary-foreground: #ffffff;
+  --secondary: #ebdbb2;
+  --secondary-foreground: #3c3836;
+  --muted: #ebdbb2;
+  --muted-foreground: #7c6f64;
+  --code-bg: #ebdbb2;
+  --accent: #f2e5bc;
+  --accent-foreground: #af3a03;
+  --border: #e6d5a8;
+  --border-strong: #bdae93;
+  --button-border: #e6d5a8;
+  --input: #e6d5a8;
+  --ring: #d65d0e;
+  --brand-accent: #d65d0e;
+  --sidebar: #f4e8bc;
+  --sidebar-foreground: #3c3836;
+  --sidebar-primary: #d65d0e;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #f2e5bc;
+  --sidebar-accent-foreground: #af3a03;
+  --sidebar-border: #e6d5a8;
+  --sidebar-ring: #d65d0e;
+}
+.dark[data-theme="gruvbox"] {
+  --background: #282828;
+  --foreground: #ebdbb2;
+  --card: rgba(60, 56, 54, 0.6);
+  --card-solid: #32302f;
+  --card-foreground: #ebdbb2;
+  --tray: rgba(60, 56, 54, 0.6);
+  --popover: rgba(29, 32, 33, 0.92);
+  --popover-foreground: #ebdbb2;
+  --primary: #fe8019;
+  --primary-foreground: #282828;
+  --secondary: #3c3836;
+  --secondary-foreground: #ebdbb2;
+  --muted: #3c3836;
+  --muted-foreground: #a89984;
+  --code-bg: #1d2021;
+  --accent: #504945;
+  --accent-foreground: #fe8019;
+  --border: #504945;
+  --border-strong: #665c54;
+  --button-border: #504945;
+  --input: #504945;
+  --ring: #fe8019;
+  --brand-accent: #fe8019;
+  --sidebar: rgba(29, 32, 33, 0.8);
+  --sidebar-foreground: #ebdbb2;
+  --sidebar-primary: #fe8019;
+  --sidebar-primary-foreground: #282828;
+  --sidebar-accent: #504945;
+  --sidebar-accent-foreground: #fe8019;
+  --sidebar-border: #504945;
+  --sidebar-ring: #fe8019;
+}
+:root:not(.dark)[data-theme="gruvbox"] .app-shell {
+  background: linear-gradient(160deg, #fbf3cd 0%, #fbf1c7 55%, #f7ecbb 100%);
+}
+.dark[data-theme="gruvbox"] .app-shell {
+  background:
+    radial-gradient(ellipse at 20% 30%, rgba(254, 128, 25, 0.1) 0%, transparent 55%),
+    radial-gradient(ellipse at 80% 20%, rgba(250, 189, 47, 0.07) 0%, transparent 45%),
+    linear-gradient(160deg, #32302f 0%, #282828 60%, #1d2021 100%);
+}
+
+/* ── Dracula — moody purple, pink pop (dark-first classic) ─────────────────── */
+:root:not(.dark)[data-theme="dracula"] {
+  --background: #f7f5fd;
+  --foreground: #1e1a2b;
+  --card: #ffffff;
+  --card-solid: #ffffff;
+  --card-foreground: #1e1a2b;
+  --tray: #ffffff;
+  --popover: #ffffff;
+  --popover-foreground: #1e1a2b;
+  --primary: #7c3aed;
+  --primary-foreground: #ffffff;
+  --secondary: #efeaf9;
+  --secondary-foreground: #1e1a2b;
+  --muted: #efeaf9;
+  --muted-foreground: #6b6786;
+  --code-bg: #efeaf9;
+  --accent: #f3e8ff;
+  --accent-foreground: #6b21a8;
+  --border: #e6e0f2;
+  --border-strong: #b6abd6;
+  --button-border: #e6e0f2;
+  --input: #e6e0f2;
+  --ring: #7c3aed;
+  --brand-accent: #d6409f;
+  --sidebar: #f3f0fa;
+  --sidebar-foreground: #1e1a2b;
+  --sidebar-primary: #7c3aed;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #f3e8ff;
+  --sidebar-accent-foreground: #6b21a8;
+  --sidebar-border: #e6e0f2;
+  --sidebar-ring: #7c3aed;
+}
+.dark[data-theme="dracula"] {
+  --background: #282a36;
+  --foreground: #f8f8f2;
+  --card: rgba(68, 71, 90, 0.5);
+  --card-solid: #343746;
+  --card-foreground: #f8f8f2;
+  --tray: rgba(68, 71, 90, 0.5);
+  --popover: rgba(33, 34, 44, 0.92);
+  --popover-foreground: #f8f8f2;
+  --primary: #bd93f9;
+  --primary-foreground: #282a36;
+  --secondary: #343746;
+  --secondary-foreground: #f8f8f2;
+  --muted: #3b3d4d;
+  --muted-foreground: #b3b8d4;
+  --code-bg: #21222c;
+  --accent: #3b304f;
+  --accent-foreground: #ff79c6;
+  --border: #44475a;
+  --border-strong: #5a5d75;
+  --button-border: #44475a;
+  --input: #44475a;
+  --ring: #bd93f9;
+  --brand-accent: #ff79c6;
+  --sidebar: rgba(33, 34, 44, 0.8);
+  --sidebar-foreground: #f8f8f2;
+  --sidebar-primary: #bd93f9;
+  --sidebar-primary-foreground: #282a36;
+  --sidebar-accent: #3b304f;
+  --sidebar-accent-foreground: #ff79c6;
+  --sidebar-border: #44475a;
+  --sidebar-ring: #bd93f9;
+}
+:root:not(.dark)[data-theme="dracula"] .app-shell {
+  background: linear-gradient(160deg, #faf8ff 0%, #f5f1fd 50%, #f3eefb 100%);
+}
+.dark[data-theme="dracula"] .app-shell {
+  background:
+    radial-gradient(ellipse at 20% 40%, rgba(189, 147, 249, 0.14) 0%, transparent 50%),
+    radial-gradient(ellipse at 80% 20%, rgba(255, 121, 198, 0.1) 0%, transparent 45%),
+    linear-gradient(160deg, #2a2c3a 0%, #282a36 55%, #21222c 100%);
+}
+
+/* ── Nord — arctic frost blues, polar-night neutrals ──────────────────────── */
+:root:not(.dark)[data-theme="nord"] {
+  --background: #eceff4;
+  --foreground: #2e3440;
+  --card: #e5e9f0;
+  --card-solid: #e5e9f0;
+  --card-foreground: #2e3440;
+  --tray: #e5e9f0;
+  --popover: #e5e9f0;
+  --popover-foreground: #2e3440;
+  --primary: #5e81ac;
+  --primary-foreground: #eceff4;
+  --secondary: #d8dee9;
+  --secondary-foreground: #2e3440;
+  --muted: #d8dee9;
+  --muted-foreground: #4c566a;
+  --code-bg: #d8dee9;
+  --accent: #e5e9f0;
+  --accent-foreground: #5e81ac;
+  --border: #d8dee9;
+  --border-strong: #81a1c1;
+  --button-border: #d8dee9;
+  --input: #d8dee9;
+  --ring: #5e81ac;
+  --brand-accent: #5e81ac;
+  --sidebar: #e5e9f0;
+  --sidebar-foreground: #2e3440;
+  --sidebar-primary: #5e81ac;
+  --sidebar-primary-foreground: #eceff4;
+  --sidebar-accent: #d8dee9;
+  --sidebar-accent-foreground: #5e81ac;
+  --sidebar-border: #d8dee9;
+  --sidebar-ring: #5e81ac;
+}
+.dark[data-theme="nord"] {
+  --background: #2e3440;
+  --foreground: #eceff4;
+  --card: rgba(59, 66, 82, 0.6);
+  --card-solid: #3b4252;
+  --card-foreground: #eceff4;
+  --tray: rgba(59, 66, 82, 0.6);
+  --popover: rgba(46, 52, 64, 0.92);
+  --popover-foreground: #eceff4;
+  --primary: #88c0d0;
+  --primary-foreground: #2e3440;
+  --secondary: #3b4252;
+  --secondary-foreground: #eceff4;
+  --muted: #434c5e;
+  --muted-foreground: #d8dee9;
+  --code-bg: #3b4252;
+  --accent: #434c5e;
+  --accent-foreground: #88c0d0;
+  --border: #4c566a;
+  --border-strong: #81a1c1;
+  --button-border: #4c566a;
+  --input: #4c566a;
+  --ring: #88c0d0;
+  --brand-accent: #88c0d0;
+  --sidebar: rgba(46, 52, 64, 0.8);
+  --sidebar-foreground: #eceff4;
+  --sidebar-primary: #88c0d0;
+  --sidebar-primary-foreground: #2e3440;
+  --sidebar-accent: #434c5e;
+  --sidebar-accent-foreground: #88c0d0;
+  --sidebar-border: #4c566a;
+  --sidebar-ring: #88c0d0;
+}
+:root:not(.dark)[data-theme="nord"] .app-shell {
+  background: linear-gradient(160deg, #eceff4 0%, #e5e9f0 55%, #d8dee9 100%);
+}
+.dark[data-theme="nord"] .app-shell {
+  background:
+    radial-gradient(ellipse at 20% 30%, rgba(136, 192, 208, 0.12) 0%, transparent 55%),
+    radial-gradient(ellipse at 80% 20%, rgba(94, 129, 172, 0.08) 0%, transparent 45%),
+    linear-gradient(160deg, #434c5e 0%, #2e3440 60%, #2e3440 100%);
 }

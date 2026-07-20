@@ -236,6 +236,196 @@ async def test_lifecycle_emits_running_then_idle() -> None:
     assert statuses == ["running", "idle"]
 
 
+async def test_session_error_auth_posts_failed_with_reauth() -> None:
+    """A ProviderAuthError surfaces a `failed` edge flagged for re-auth.
+
+    opencode reports an expired/invalid provider key as `session.error` with a
+    `ProviderAuthError`; the forwarder must post `external_session_status:
+    failed` carrying both the error message and the re-auth hint plus
+    `reauth_required` so the web UI prompts a re-login instead of rendering a
+    silent idle.
+    """
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(
+        _event(
+            "session.error",
+            error={
+                "name": "ProviderAuthError",
+                "data": {"providerID": "anthropic", "message": "invalid api key"},
+            },
+        )
+    )
+    status = next(b["data"] for _u, b in server.posts if b["type"] == "external_session_status")
+    assert status["status"] == "failed"
+    assert status["reauth_required"] is True
+    assert "invalid api key" in status["output"]
+    assert fwd_mod._OPENCODE_REAUTH_HINT in status["output"]
+
+
+async def test_session_error_generic_posts_failed_without_reauth() -> None:
+    """A non-auth error surfaces a `failed` edge with the message, no re-auth."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(
+        _event(
+            "session.error",
+            error={"name": "APIError", "data": {"statusCode": 500, "message": "upstream boom"}},
+        )
+    )
+    status = next(b["data"] for _u, b in server.posts if b["type"] == "external_session_status")
+    assert status["status"] == "failed"
+    assert status["output"] == "upstream boom"
+    assert "reauth_required" not in status
+
+
+async def test_session_error_message_aborted_takes_idle_path() -> None:
+    """A MessageAbortedError is a user interrupt → the normal idle path."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(
+        _event("session.error", error={"name": "MessageAbortedError", "data": {}})
+    )
+    status = next(b["data"] for _u, b in server.posts if b["type"] == "external_session_status")
+    assert status["status"] == "idle"
+    assert "reauth_required" not in status
+    assert "output" not in status
+
+
+def _status_edges(posts: list[tuple[str, dict[str, Any]]]) -> list[dict[str, Any]]:
+    return [b["data"] for _u, b in posts if b["type"] == "external_session_status"]
+
+
+async def test_running_and_idle_carry_assistant_response_id() -> None:
+    """running/idle edges carry the turn's assistant messageID as ``response_id``.
+
+    The web chat renders in-flight tool calls live only when the ``running`` edge
+    and the mirrored ``function_call`` items share the SAME ``response_id``. Here
+    the tool call and both status edges must all group under ``msg_1``.
+    """
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_event("message.updated", info={"id": "msg_1", "role": "assistant"}))
+    await fwd.handle_event(
+        _event(
+            "message.part.updated",
+            part={
+                "id": "prt_t",
+                "messageID": "msg_1",
+                "type": "tool",
+                "callID": "call_1",
+                "tool": "bash",
+                "state": {"status": "completed", "input": {"command": "ls"}, "output": "ok"},
+            },
+        )
+    )
+    await fwd.handle_event(_event("session.idle"))
+
+    edges = _status_edges(server.posts)
+    assert [(e["status"], e["response_id"]) for e in edges] == [
+        ("running", "msg_1"),
+        ("idle", "msg_1"),
+    ]
+    call = next(b for _u, b in server.posts if b["data"].get("item_type") == "function_call")
+    # The live-card contract: same id on the running edge and the tool call.
+    assert call["data"]["response_id"] == edges[0]["response_id"]
+
+
+async def test_running_edge_fires_once_per_turn() -> None:
+    """A turn's many parts still produce exactly one ``running`` edge."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_event("message.updated", info={"id": "msg_1", "role": "assistant"}))
+    for part in (
+        {"id": "s", "messageID": "msg_1", "type": "step-start"},
+        {"id": "prt_x", "messageID": "msg_1", "type": "text", "text": "hi"},
+        {
+            "id": "prt_t",
+            "messageID": "msg_1",
+            "type": "tool",
+            "callID": "c1",
+            "tool": "bash",
+            "state": {"status": "running", "input": {"command": "ls"}},
+        },
+    ):
+        await fwd.handle_event(_event("message.part.updated", part=part))
+    running = [e for e in _status_edges(server.posts) if e["status"] == "running"]
+    assert len(running) == 1
+    assert running[0]["response_id"] == "msg_1"
+
+
+async def test_running_edge_deferred_until_message_id_known() -> None:
+    """A bare ``session.status`` busy before ``message.updated`` still yields the id.
+
+    opencode can open a turn with ``session.status`` busy (no messageID) before
+    the assistant ``message.updated`` arrives. The ``running`` edge must defer
+    until the id is known and carry ``msg_1`` — not an id-less/session-id edge
+    that would never match the tool-call items — and still fire exactly once.
+    """
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_event("session.status", status={"type": "busy"}))
+    # No running edge yet: the id is unknown.
+    assert _status_edges(server.posts) == []
+    await fwd.handle_event(_event("message.updated", info={"id": "msg_1", "role": "assistant"}))
+    running = [e for e in _status_edges(server.posts) if e["status"] == "running"]
+    assert len(running) == 1
+    assert running[0]["response_id"] == "msg_1"
+
+
+async def test_second_turn_gets_its_own_running_response_id() -> None:
+    """Each turn's running/idle edges carry that turn's own assistant id."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    for msg in ("msg_a", "msg_b"):
+        await fwd.handle_event(_event("message.updated", info={"id": msg, "role": "assistant"}))
+        await fwd.handle_event(_event("session.idle"))
+    edges = _status_edges(server.posts)
+    assert [(e["status"], e["response_id"]) for e in edges] == [
+        ("running", "msg_a"),
+        ("idle", "msg_a"),
+        ("running", "msg_b"),
+        ("idle", "msg_b"),
+    ]
+
+
+async def test_multi_assistant_message_turn_retires_with_the_live_id() -> None:
+    """Two assistant messages in ONE turn: idle carries the id that went live.
+
+    If opencode emits more than one assistant ``message.updated`` before
+    ``session.idle`` (no idle between them), the ``running`` edge locks to the
+    first id (``msg_1``) while ``_active_message_id`` advances to ``msg_2``. The
+    terminal ``idle`` edge must still carry ``msg_1`` — the id the running edge
+    used — so the web retires the tool cards that were actually rendered live.
+    """
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_event("message.updated", info={"id": "msg_1", "role": "assistant"}))
+    await fwd.handle_event(_event("message.updated", info={"id": "msg_2", "role": "assistant"}))
+    await fwd.handle_event(_event("session.idle"))
+    edges = _status_edges(server.posts)
+    assert [(e["status"], e["response_id"]) for e in edges] == [
+        ("running", "msg_1"),
+        ("idle", "msg_1"),
+    ]
+
+
+async def test_turn_without_assistant_message_idles_with_session_fallback() -> None:
+    """A turn that opens (busy) and idles with no assistant ``message.updated``.
+
+    No ``running`` edge fires (there was never an id to carry) and the terminal
+    ``idle`` edge falls back to the session id. Benign — there are no live tool
+    cards to retire — but the fallback id is deliberate, not a mismatch bug.
+    """
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_event("session.status", status={"type": "busy"}))
+    await fwd.handle_event(_event("session.idle"))
+    edges = _status_edges(server.posts)
+    assert [e["status"] for e in edges] == ["idle"]
+    assert edges[0]["response_id"] == _SESSION
+
+
 async def test_permission_asked_rejects_when_no_policy_wired() -> None:
     """Absent a policy evaluator the forwarder FAILS CLOSED (no auto-approve).
 
@@ -429,6 +619,45 @@ async def test_seed_dedupe_from_history_swallows_errors() -> None:
     fwd = _forwarder(server, opencode)
     await fwd.seed_dedupe_from_history()  # best-effort → no raise
     assert fwd._msg_role == {}
+
+
+async def test_seed_dedupe_from_history_seeds_usage() -> None:
+    """Resume seeding rebuilds cumulative usage and re-posts it immediately."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    opencode.messages = [
+        {
+            "info": {
+                "id": "msg_1",
+                "role": "assistant",
+                "modelID": "claude-sonnet-4-5",
+                "providerID": "anthropic",
+                "cost": 0.01,
+                "tokens": {"input": 1000, "output": 50, "cache": {"read": 200, "write": 0}},
+            },
+            "parts": [],
+        },
+        {
+            "info": {
+                "id": "msg_2",
+                "role": "assistant",
+                "modelID": "claude-sonnet-4-5",
+                "providerID": "anthropic",
+                "cost": 0.02,
+                "tokens": {"input": 2000, "output": 100, "cache": {"read": 300, "write": 0}},
+            },
+            "parts": [],
+        },
+        {"info": {"id": "msg_u", "role": "user"}, "parts": []},
+    ]
+    fwd = _forwarder(server, opencode)
+    await fwd.seed_dedupe_from_history()
+    # Usage is rebuilt per assistant message id (user messages contribute none).
+    assert set(fwd._usage_by_message) == {"msg_1", "msg_2"}
+    usage = next(b for _u, b in server.posts if b["type"] == "external_session_usage")["data"]
+    assert usage["cumulative_cost_usd"] == 0.03  # 0.01 + 0.02
+    assert usage["cumulative_input_tokens"] == 3000  # 1000 + 2000
+    assert usage["cumulative_output_tokens"] == 150  # 50 + 100
+    assert usage["cumulative_cache_read_input_tokens"] == 500  # 200 + 300
 
 
 async def test_compaction_started_posts_in_progress() -> None:

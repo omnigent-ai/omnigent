@@ -50,6 +50,25 @@ def _remove_bridge_handlers() -> None:
                 provider.shutdown()
 
 
+@pytest.fixture(autouse=True)
+def _opt_in_telemetry(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """
+    Telemetry is opt-in (``OMNIGENT_TELEMETRY_ENABLED``, off by default);
+    these log-bridge tests opt in for every test, and reset global tracing
+    state afterward so init()/enable_tracing() can't leak into other suites.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    monkeypatch.setenv("OMNIGENT_TELEMETRY_ENABLED", "true")
+    try:
+        yield
+    finally:
+        from omnigent.inner.tracing import disable_tracing
+
+        disable_tracing()
+        telemetry._initialized = False
+
+
 @pytest.fixture
 def reset_log_state(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """

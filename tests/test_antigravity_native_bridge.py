@@ -14,10 +14,12 @@ from omnigent.antigravity_native_bridge import (
     ANTIGRAVITY_NATIVE_BRIDGE_DIR_ENV_VAR,
     ANTIGRAVITY_NATIVE_REQUEST_SESSION_ID_ENV_VAR,
     AntigravityNativeBridgeState,
+    agy_gemini_dir,
     agy_home_dir,
     build_antigravity_native_spawn_env,
     build_mcp_config,
     clear_bridge_state,
+    ensure_agy_feedback_survey_disabled,
     ensure_agy_onboarding_complete,
     inject_user_message_via_tui,
     prepare_bridge_dir,
@@ -788,7 +790,7 @@ def test_inject_user_message_via_tui_resends_enter_when_coalesced(
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
     enters = {"n": 0}
-    tui = {"pane": "> hi there\n? for shortcuts"}
+    tui = {"pane": "> \n? for shortcuts"}
 
     def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
         """Activate the turn only on the second Enter."""
@@ -797,6 +799,8 @@ def test_inject_user_message_via_tui_resends_enter_when_coalesced(
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         if "capture-pane" in cmd:
             return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            tui["pane"] = "> hi there\n? for shortcuts"
         if cmd[-1] == "Enter":
             enters["n"] += 1
             if enters["n"] >= 2:
@@ -814,17 +818,16 @@ def test_inject_user_message_via_tui_accepts_changed_active_footer(
     _fast_tmux_timeouts: None,
 ) -> None:
     """
-    The submit is confirmed when the footer leaves idle, even if the running
-    footer text differs from the known marker.
+    The submit is confirmed when the draft leaves the composer, even if the
+    running footer text differs from the known marker.
 
     A future agy build could rename the running footer or a narrow pane could
-    truncate it; as long as the idle ``? for shortcuts`` marker is gone from a
-    non-empty pane, the turn is treated as started — so a working submit is not
-    misread as stuck and falsely failed.
+    truncate it; delivery must key off draft disappearance instead.
     """
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
-    tui = {"pane": "> hi\n? for shortcuts"}
+    content = "hello there"
+    tui = {"pane": "> \n? for shortcuts"}
 
     def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
         """Idle until Enter; then a non-idle footer that is NOT the known marker."""
@@ -833,13 +836,14 @@ def test_inject_user_message_via_tui_accepts_changed_active_footer(
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         if "capture-pane" in cmd:
             return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            tui["pane"] = f"> {content}\n? for shortcuts"
         if cmd[-1] == "Enter":
             tui["pane"] = "> \n(generating response, press the cancel key to stop)"
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("subprocess.run", _fake_run)
-    # Must not raise: the idle marker is gone, so the submit is confirmed.
-    inject_user_message_via_tui(bridge_dir, content="hi", timeout_s=0.5)
+    inject_user_message_via_tui(bridge_dir, content=content, timeout_s=0.5)
 
 
 def test_inject_user_message_via_tui_mid_turn_sends_one_enter(
@@ -860,16 +864,20 @@ def test_inject_user_message_via_tui_mid_turn_sends_one_enter(
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
     enters = {"n": 0}
+    tui = {"pane": "> \nesc to cancel"}
 
     def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
-        """agy is mid-turn the entire time: the footer never leaves ``esc to cancel``."""
+        """agy stays mid-turn, but the draft clears after Enter."""
         del kwargs
         if "has-session" in cmd:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         if "capture-pane" in cmd:
-            return SimpleNamespace(returncode=0, stdout="> steer me\nesc to cancel", stderr="")
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            tui["pane"] = "> steer me\nesc to cancel"
         if cmd[-1] == "Enter":
             enters["n"] += 1
+            tui["pane"] = "> \nesc to cancel"
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("subprocess.run", _fake_run)
@@ -877,48 +885,45 @@ def test_inject_user_message_via_tui_mid_turn_sends_one_enter(
     assert enters["n"] == 1, "mid-turn submit must send exactly one Enter (no re-send)"
 
 
-def test_submit_verify_ignores_single_transient_nonidle_frame(
+def test_inject_user_message_via_tui_ignores_transcript_echo_after_submit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     _fast_tmux_timeouts: None,
 ) -> None:
     """
-    A lone non-idle capture (a mid-repaint frame) must not be read as submitted.
+    The submitted prompt remaining in transcript history is not a stuck draft.
 
-    The "idle marker gone" signal is only accepted on two CONSECUTIVE polls. A
-    single transient frame with neither marker — followed by the idle footer
-    again — resets the counter, so the submit is confirmed only once the active
-    marker actually appears. Otherwise an early return on a redraw glitch could
-    cost the caller a full state-wait before a "did not register" error.
+    Claude/Kiro-style verification must scope matching to agy's live composer.
+    After Enter, agy echoes the prompt above a fresh empty composer; matching the
+    whole pane would falsely retry Enter and could submit an empty follow-up.
     """
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
-    # capture-pane sequence after Enter: idle, one transient blank frame, idle
-    # again, then the running footer. A correct 2-consecutive rule reaches index 3.
-    panes = [
-        "> hi\n? for shortcuts",  # idle
-        "> \n",  # transient: neither marker (mid-repaint)
-        "> hi\n? for shortcuts",  # idle again — resets the non-idle counter
-        "> \nesc to cancel",  # turn running — the real confirmation
-    ]
-    captures = {"n": 0}
+    content = "Reply exactly: transcript echo ok"
+    enters = {"n": 0}
+    separator = "────────────────────────────────────────────────────────────────────────────────"
+    tui = {"pane": f"{separator}\n>\n{separator}\n? for shortcuts"}
 
     def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
-        """Serve the scripted pane sequence; never empty so liveness stays true."""
+        """After Enter, keep the prompt only in transcript history."""
         del kwargs
         if "has-session" in cmd:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         if "capture-pane" in cmd:
-            idx = min(captures["n"], len(panes) - 1)
-            captures["n"] += 1
-            return SimpleNamespace(returncode=0, stdout=panes[idx], stderr="")
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            tui["pane"] = f"{separator}\n> {content}\n{separator}\n? for shortcuts"
+        if cmd[-1] == "Enter":
+            enters["n"] += 1
+            tui["pane"] = (
+                f"{separator}\n> {content}\n⣾  Generating...\n{separator}\n"
+                f">\n{separator}\nesc to cancel"
+            )
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("subprocess.run", _fake_run)
-    inject_user_message_via_tui(bridge_dir, content="hi", timeout_s=0.5)
-    # Must have polled past the transient frame to the running footer (index 3),
-    # i.e. it did NOT return early on the lone non-idle frame at index 1.
-    assert captures["n"] >= 4
+    inject_user_message_via_tui(bridge_dir, content=content, timeout_s=0.5)
+    assert enters["n"] == 1
 
 
 def test_inject_user_message_via_tui_raises_when_target_never_advertised(
@@ -964,6 +969,7 @@ def test_inject_user_message_via_tui_raises_when_session_dies_before_submit(
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
     has_session_calls = {"n": 0}
+    tui = {"pane": "> \n? for shortcuts"}
 
     def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
         """Alive at the entry check; dead by the time the submit re-checks."""
@@ -973,11 +979,34 @@ def test_inject_user_message_via_tui_raises_when_session_dies_before_submit(
             # 1st call = entry gate (alive); later calls = per-submit re-check (dead).
             return SimpleNamespace(returncode=0 if has_session_calls["n"] == 1 else 1, stdout="")
         if "capture-pane" in cmd:
-            return SimpleNamespace(returncode=0, stdout="> draft\n? for shortcuts", stderr="")
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            tui["pane"] = "> draft message\n? for shortcuts"
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("subprocess.run", _fake_run)
     with pytest.raises(RuntimeError, match="exited before the message could be submitted"):
+        inject_user_message_via_tui(bridge_dir, content="draft message", timeout_s=0.5)
+
+
+def test_inject_user_message_via_tui_raises_when_paste_never_renders(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _fast_tmux_timeouts: None,
+) -> None:
+    """A successful tmux paste command is not enough; the draft must render."""
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """Pane stays empty even after paste-buffer returns successfully."""
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout="> \n? for shortcuts", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    with pytest.raises(RuntimeError, match="did not render the pasted message"):
         inject_user_message_via_tui(bridge_dir, content="draft message", timeout_s=0.5)
 
 
@@ -989,21 +1018,25 @@ def test_inject_user_message_via_tui_raises_when_turn_never_starts(
     """
     If no turn ever starts after the submit attempts, the delivery raises.
 
-    The pane stays idle forever (Enter never takes), so after the bounded
-    re-send budget the executor gets a clear error rather than a false success.
+    The pasted draft stays visible forever (Enter never takes), so after the
+    bounded re-send budget the executor gets a clear error rather than a false
+    success.
     """
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
+    tui = {"pane": "> \n? for shortcuts"}
 
     def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
         """Pane never leaves idle — the submit never starts a turn."""
         del kwargs
         if "capture-pane" in cmd:
-            return SimpleNamespace(returncode=0, stdout="> draft\n? for shortcuts", stderr="")
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            tui["pane"] = "> draft message\n? for shortcuts"
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("subprocess.run", _fake_run)
-    with pytest.raises(RuntimeError, match="did not start a turn"):
+    with pytest.raises(RuntimeError, match="draft is still visible"):
         inject_user_message_via_tui(bridge_dir, content="draft message", timeout_s=0.5)
 
 
@@ -1011,6 +1044,151 @@ def test_inject_user_message_via_tui_rejects_empty_content(tmp_path: Path) -> No
     """Empty content is a programming error, not something to type into the TUI."""
     with pytest.raises(RuntimeError, match="non-empty content"):
         inject_user_message_via_tui(tmp_path / "bridge", content="")
+
+
+# ---------------------------------------------------------------------------
+# Composer-region detection robustness (#1598 review follow-ups)
+# ---------------------------------------------------------------------------
+
+
+def test_agy_separator_line_accepts_pure_and_decorated_rules() -> None:
+    """Separator detection accepts a pure ─ rule and corner/join-decorated rules.
+
+    agy 1.0.14 renders a pure ``─`` composer rule, but a future build could frame
+    it with box-drawing corners; detection must tolerate that without matching
+    ordinary text or a short dash run.
+    """
+    assert _mod._agy_separator_line("─" * 60)
+    assert _mod._agy_separator_line("╭" + "─" * 40 + "╮")
+    assert _mod._agy_separator_line("├" + "─" * 20 + "┤")
+    # Not separators: ordinary text, ASCII dashes, and < 8 rule chars.
+    assert not _mod._agy_separator_line("> Generating the answer now")
+    assert not _mod._agy_separator_line("--- short ---")
+    assert not _mod._agy_separator_line("─────")
+
+
+def test_draft_candidate_lines_keep_prompt_text_with_status_words() -> None:
+    """A draft line carrying the ``>`` prompt is kept even if it contains a status word.
+
+    The chrome filters (``Generating``/idle/active markers) must apply only to
+    non-prompt rows; otherwise a legitimate message whose first line contains such
+    a word is filtered out and the turn is misread as "never rendered".
+    """
+    region = "> Generating a fix for the esc to cancel bug\n? for shortcuts"
+    candidates = _mod._agy_draft_candidate_lines(region)
+    assert "Generating a fix for the esc to cancel bug" in candidates
+    # The non-prompt idle footer row is still filtered.
+    assert "? for shortcuts" not in candidates
+
+
+def test_draft_in_input_region_keeps_prompt_text_with_status_words() -> None:
+    """A draft whose first line contains 'Generating' is detected, not hard-failed."""
+    sep = "─" * 60
+    baseline = _mod._agy_input_region(f"{sep}\n>\n{sep}\n? for shortcuts")
+    content = "Generating the migration is slow, please fix it"
+    needle = _mod._submit_needle(content)
+    pane = f"{sep}\n> {content}\n{sep}\n? for shortcuts"
+    assert _mod._draft_in_input_region(pane, needle, baseline)
+
+
+def test_draft_in_input_region_matches_short_message_by_composer_change() -> None:
+    """An empty needle (short message) is detected by a changed composer, not text.
+
+    A draft in a composer that differs from the pre-paste baseline counts as
+    present; the unchanged baseline (or a fresh empty composer after submit) does
+    not — so short messages are render/submit-verified instead of submitted blind.
+    """
+    sep = "─" * 60
+    baseline = _mod._agy_input_region(f"{sep}\n>\n{sep}\n? for shortcuts")
+    pane_with_draft = f"{sep}\n> ok\n{sep}\n? for shortcuts"
+    pane_after_submit = f"{sep}\n> ok\n{sep}\n>\n{sep}\nesc to cancel"
+    assert _mod._draft_in_input_region(pane_with_draft, "", baseline)
+    assert not _mod._draft_in_input_region(pane_after_submit, "", baseline)
+
+
+def test_format_pane_debug_tail_redacts_email_and_secrets() -> None:
+    """The diagnostic pane tail redacts emails and common secret shapes (#1598)."""
+    pane = (
+        "signed in as alice@example.com\n"
+        "key sk-ABCDEF0123456789ABCDEF\n"
+        "export GH=ghp_ABCDEFGHIJ0123456789ABCDEFGHIJ\n"
+        "Authorization: Bearer abcdef123456\n"
+        "> draft text"
+    )
+    out = _mod._format_pane_debug_tail(pane)
+    assert "alice@example.com" not in out
+    assert "sk-ABCDEF0123456789ABCDEF" not in out
+    assert "ghp_ABCDEFGHIJ0123456789ABCDEFGHIJ" not in out
+    assert "[REDACTED_EMAIL]" in out
+    assert "[REDACTED_SECRET]" in out
+    assert "> draft text" in out  # non-secret context is preserved
+    assert _mod._format_pane_debug_tail("") == "<empty pane>"
+
+
+def test_inject_user_message_via_tui_delivers_short_message(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _fast_tmux_timeouts: None,
+) -> None:
+    """A short message with no stable needle ('ok') is render- and submit-verified.
+
+    The empty-needle path must not submit blind: the draft is confirmed to render
+    by composer change, and submission is confirmed by the draft clearing — so a
+    legitimate short turn is delivered with exactly one verified Enter.
+    """
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
+    enters = {"n": 0}
+    tui = {"pane": "> \n? for shortcuts"}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """Idle, draft after paste, composer clears after Enter."""
+        del kwargs
+        if "has-session" in cmd:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            tui["pane"] = "> ok\n? for shortcuts"
+        if cmd[-1] == "Enter":
+            enters["n"] += 1
+            tui["pane"] = "> \n? for shortcuts"
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_user_message_via_tui(bridge_dir, content="ok", timeout_s=0.5)
+    assert enters["n"] == 1
+
+
+def test_inject_user_message_via_tui_short_message_raises_when_not_submitted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _fast_tmux_timeouts: None,
+) -> None:
+    """A short message whose draft never clears fails loudly, not silently.
+
+    Regression guard for the empty-needle path: previously a no-needle message was
+    submitted with a single unverified Enter, so a folded Enter left it stuck in
+    the composer and the turn was silently lost. It must now raise.
+    """
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
+    tui = {"pane": "> \n? for shortcuts"}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """Draft renders but never clears (Enter folded into the paste burst)."""
+        del kwargs
+        if "has-session" in cmd:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            tui["pane"] = "> ok\n? for shortcuts"
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    with pytest.raises(RuntimeError, match="draft is still visible"):
+        inject_user_message_via_tui(bridge_dir, content="ok", timeout_s=0.5)
 
 
 # ---------------------------------------------------------------------------
@@ -1039,9 +1217,8 @@ def test_build_mcp_config_registers_omnigent_relay(tmp_path: Path) -> None:
     assert server["enabledTools"] == sorted(server["enabledTools"])
     assert server["env"]["TMPDIR"]
     # The relay's HOME is pinned to the runner's real home so its bridge-root
-    # validation matches where the bridge dir lives — agy runs the relay under a
-    # per-session isolated HOME (a child of the bridge dir), which the relay must
-    # NOT inherit, or it would reject its own --bridge-dir.
+    # validation matches where the bridge dir lives, even if a future agy launch
+    # path customizes process environment.
     assert server["env"]["HOME"] == str(Path.home())
 
 
@@ -1053,15 +1230,15 @@ def test_build_mcp_config_defaults_python_to_current_interpreter(tmp_path: Path)
     assert server["command"] == sys.executable
 
 
-def test_write_mcp_config_targets_isolated_agy_home(tmp_path: Path) -> None:
-    """write_mcp_config writes into the per-session isolated agy HOME, not ~/.gemini."""
+def test_write_mcp_config_targets_isolated_agy_gemini_dir(tmp_path: Path) -> None:
+    """write_mcp_config writes into the isolated agy Gemini dir, not ~/.gemini."""
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
     path = write_mcp_config(bridge_dir, python_executable="python-test")
 
-    # The config lands under the isolated HOME's ~/.gemini/config — the path agy
-    # actually loads MCP servers from — so the user's real ~/.gemini is untouched.
-    assert path == agy_home_dir(bridge_dir) / ".gemini" / "config" / "mcp_config.json"
+    # The config lands under the isolated --gemini_dir config path, so the user's
+    # real ~/.gemini is untouched.
+    assert path == agy_gemini_dir(bridge_dir) / "config" / "mcp_config.json"
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert payload["mcpServers"]["omnigent"]["command"] == "python-test"
     # The bridge token the shared relay requires is written into the bridge dir.
@@ -1076,17 +1253,21 @@ def test_write_mcp_bridge_config_is_idempotent(tmp_path: Path) -> None:
     assert (tmp_path / "bridge.json").read_text(encoding="utf-8") == first
 
 
-def test_seed_isolated_agy_home_returns_home_override_and_seeds_state(
+def test_seed_isolated_agy_home_seeds_platform_credentials_and_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """seed_isolated_agy_home copies the OAuth token + markers and returns HOME."""
+    """seed_isolated_agy_home copies platform OAuth markers + state."""
     fake_home = tmp_path / "real-home"
     (fake_home / ".gemini" / "antigravity-cli").mkdir(parents=True)
+    (fake_home / ".gemini" / "oauth_creds.json").write_text(
+        '{"access_token":"mac-token"}', encoding="utf-8"
+    )
+    (fake_home / ".gemini" / "installation_id").write_text("root-install-id", encoding="utf-8")
     (fake_home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token").write_text(
-        "real-token", encoding="utf-8"
+        "linux-token", encoding="utf-8"
     )
     (fake_home / ".gemini" / "antigravity-cli" / "installation_id").write_text(
-        "install-id", encoding="utf-8"
+        "cli-install-id", encoding="utf-8"
     )
     monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
 
@@ -1094,19 +1275,65 @@ def test_seed_isolated_agy_home_returns_home_override_and_seeds_state(
     bridge_dir.mkdir()
     env = seed_isolated_agy_home(bridge_dir)
 
-    iso = agy_home_dir(bridge_dir)
-    assert env == {"HOME": str(iso)}
-    # OAuth token is COPIED (never moved) into the isolated tree.
-    token = iso / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
-    assert token.read_text(encoding="utf-8") == "real-token"
-    # The real token file is left in place.
+    iso_gemini = agy_gemini_dir(bridge_dir)
+    assert env == {}
+    # OAuth credentials are COPIED (never moved) into the isolated tree.
+    macos_token = iso_gemini / "oauth_creds.json"
+    linux_token = iso_gemini / "antigravity-cli" / "antigravity-oauth-token"
+    assert macos_token.read_text(encoding="utf-8") == '{"access_token":"mac-token"}'
+    assert linux_token.read_text(encoding="utf-8") == "linux-token"
+    assert (iso_gemini / "installation_id").read_text(encoding="utf-8") == "root-install-id"
+    assert (iso_gemini / "antigravity-cli" / "installation_id").read_text(
+        encoding="utf-8"
+    ) == "cli-install-id"
+    # The real credential files are left in place.
+    assert (fake_home / ".gemini" / "oauth_creds.json").read_text(encoding="utf-8") == (
+        '{"access_token":"mac-token"}'
+    )
     assert (fake_home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token").read_text(
         encoding="utf-8"
-    ) == "real-token"
+    ) == "linux-token"
     # Onboarding + migration markers seeded so a headless launch never blocks.
-    onboarding = iso / ".gemini" / "antigravity-cli" / "cache" / "onboarding.json"
+    onboarding = iso_gemini / "antigravity-cli" / "cache" / "onboarding.json"
     assert json.loads(onboarding.read_text(encoding="utf-8"))["onboardingComplete"] is True
-    assert (iso / ".gemini" / "config" / ".migrated").is_file()
+    assert (iso_gemini / "config" / ".migrated").is_file()
+
+
+def test_seed_isolated_agy_home_trusts_workspace_in_isolated_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Workspace trust is seeded under isolated --gemini_dir, not real ~/.gemini."""
+    fake_home = tmp_path / "real-home"
+    real_settings = fake_home / ".gemini" / "antigravity-cli" / "settings.json"
+    real_settings.parent.mkdir(parents=True)
+    real_settings.write_text(
+        json.dumps({"colorScheme": "dark", "trustedWorkspaces": ["/real/repo"]}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    workspace = tmp_path / "worktrees" / "feature-x"
+    workspace.mkdir(parents=True)
+    iso_gemini = agy_gemini_dir(bridge_dir)
+    isolated_settings = iso_gemini / "antigravity-cli" / "settings.json"
+    isolated_settings.parent.mkdir(parents=True)
+    isolated_settings.write_text(
+        json.dumps({"colorScheme": "solarized dark", "trustedWorkspaces": ["/existing"]}),
+        encoding="utf-8",
+    )
+
+    seed_isolated_agy_home(bridge_dir, trusted_workspace=workspace)
+
+    isolated = json.loads(isolated_settings.read_text(encoding="utf-8"))
+    assert isolated["colorScheme"] == "solarized dark"
+    assert isolated["trustedWorkspaces"] == ["/existing", str(workspace.resolve())]
+    # The user's real agy settings are never modified by this bridge-scoped seed.
+    assert json.loads(real_settings.read_text(encoding="utf-8")) == {
+        "colorScheme": "dark",
+        "trustedWorkspaces": ["/real/repo"],
+    }
 
 
 def test_seed_isolated_agy_home_tolerates_missing_credential(
@@ -1121,17 +1348,75 @@ def test_seed_isolated_agy_home_tolerates_missing_credential(
     bridge_dir.mkdir()
     env = seed_isolated_agy_home(bridge_dir)
 
-    iso = agy_home_dir(bridge_dir)
-    assert env == {"HOME": str(iso)}
-    # No token copied (none existed), but the isolated HOME + markers still exist.
-    assert not (iso / ".gemini" / "antigravity-cli" / "antigravity-oauth-token").exists()
-    assert (iso / ".gemini" / "antigravity-cli" / "cache" / "onboarding.json").is_file()
+    iso_gemini = agy_gemini_dir(bridge_dir)
+    assert env == {}
+    # No token copied (none existed), but the isolated Gemini dir + markers still exist.
+    assert not (iso_gemini / "antigravity-cli" / "antigravity-oauth-token").exists()
+    assert (iso_gemini / "antigravity-cli" / "cache" / "onboarding.json").is_file()
 
 
 def test_agy_home_dir_is_under_bridge_dir(tmp_path: Path) -> None:
-    """The isolated HOME is a child of the (hash-scoped, per-session) bridge dir."""
+    """The isolated state parent is a child of the per-session bridge dir."""
     bridge_dir = tmp_path / "bridge"
     assert agy_home_dir(bridge_dir).parent == bridge_dir
+
+
+def test_agy_gemini_dir_is_under_agy_home_dir(tmp_path: Path) -> None:
+    """The isolated Gemini dir is passed to agy via --gemini_dir."""
+    bridge_dir = tmp_path / "bridge"
+    assert agy_gemini_dir(bridge_dir) == agy_home_dir(bridge_dir) / ".gemini"
+
+
+def test_seeding_and_mcp_config_never_mutate_real_gemini_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Linux non-regression: the user's real ``~/.gemini`` is read-only to setup.
+
+    This is the central promise of the ``--gemini_dir`` design: keeping the real
+    ``HOME`` must NOT reintroduce the clobber/concurrency footgun the prior
+    isolated-HOME design avoided. Both setup steps that touch the real
+    ``~/.gemini`` — ``seed_isolated_agy_home`` (COPIES the OAuth markers out) and
+    ``write_mcp_config`` (writes the relay config) — must leave a fully populated
+    real ``~/.gemini`` (interactive-agy user with their own MCP config) byte-for-byte
+    untouched, writing only under the per-session isolated Gemini dir.
+    """
+    fake_home = tmp_path / "real-home"
+    real_gemini = fake_home / ".gemini"
+    (real_gemini / "antigravity-cli").mkdir(parents=True)
+    (real_gemini / "config").mkdir(parents=True)
+    # Populate the real tree as a logged-in interactive-agy user would have it,
+    # including their OWN mcp_config.json the design must never clobber.
+    seeded_files = {
+        real_gemini / "oauth_creds.json": '{"access_token":"mac-token"}',
+        real_gemini / "installation_id": "root-install-id",
+        real_gemini / "antigravity-cli" / "antigravity-oauth-token": "linux-token",
+        real_gemini / "antigravity-cli" / "installation_id": "cli-install-id",
+        real_gemini / "config" / "mcp_config.json": '{"mcpServers":{"user_own":{}}}',
+    }
+    for path, body in seeded_files.items():
+        path.write_text(body, encoding="utf-8")
+    before = {path: path.read_text(encoding="utf-8") for path in seeded_files}
+    real_listing_before = sorted(
+        p.relative_to(real_gemini).as_posix() for p in real_gemini.rglob("*")
+    )
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    seed_isolated_agy_home(bridge_dir)
+    write_mcp_config(bridge_dir, python_executable="python-test")
+
+    # Every real file is byte-for-byte unchanged: nothing copied OUT was mutated,
+    # and the user's own mcp_config.json was NOT overwritten by the relay config.
+    for path, original in before.items():
+        assert path.read_text(encoding="utf-8") == original
+    # No new files leaked into the real tree (e.g. a relay config under real config/).
+    real_listing_after = sorted(
+        p.relative_to(real_gemini).as_posix() for p in real_gemini.rglob("*")
+    )
+    assert real_listing_after == real_listing_before
+    # The relay config DID land in the isolated tree (positive control).
+    assert (agy_gemini_dir(bridge_dir) / "config" / "mcp_config.json").is_file()
 
 
 # ---------------------------------------------------------------------------
@@ -1215,3 +1500,170 @@ def test_send_interaction_keys_via_tui_rejects_empty_keys(tmp_path: Path) -> Non
     """No keys is a programming error, not an empty send-keys call."""
     with pytest.raises(RuntimeError, match="at least one key"):
         send_interaction_keys_via_tui(tmp_path / "bridge")
+
+
+def _agy_settings_path(home: Path) -> Path:
+    return home / ".gemini" / "antigravity-cli" / "settings.json"
+
+
+def test_ensure_agy_feedback_survey_disabled_creates_missing_settings(tmp_path: Path) -> None:
+    """A home with no settings.json gets one carrying just the disable key."""
+    ensure_agy_feedback_survey_disabled(tmp_path)
+    assert json.loads(_agy_settings_path(tmp_path).read_text(encoding="utf-8")) == {
+        "showFeedbackSurvey": False
+    }
+
+
+def test_ensure_agy_feedback_survey_disabled_merges_preserving_keys(tmp_path: Path) -> None:
+    """The user's other settings (model/trustedWorkspaces/…) survive the merge."""
+    settings = _agy_settings_path(tmp_path)
+    settings.parent.mkdir(parents=True)
+    settings.write_text(
+        json.dumps(
+            {
+                "enableTelemetry": False,
+                "model": "Gemini 3.5 Flash (High)",
+                "trustedWorkspaces": ["/work/a"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    ensure_agy_feedback_survey_disabled(tmp_path)
+    data = json.loads(settings.read_text(encoding="utf-8"))
+    assert data["showFeedbackSurvey"] is False
+    assert data["model"] == "Gemini 3.5 Flash (High)"
+    assert data["trustedWorkspaces"] == ["/work/a"]
+    assert data["enableTelemetry"] is False
+
+
+def test_ensure_agy_feedback_survey_disabled_idempotent_no_rewrite(tmp_path: Path) -> None:
+    """Already-false short-circuits before any (reformatting) rewrite."""
+    settings = _agy_settings_path(tmp_path)
+    settings.parent.mkdir(parents=True)
+    original = '{"showFeedbackSurvey": false, "model": "x"}'  # compact + unsorted
+    settings.write_text(original, encoding="utf-8")
+    ensure_agy_feedback_survey_disabled(tmp_path)
+    # Untouched byte-for-byte: the function returned at the already-disabled guard
+    # rather than rewriting (which would indent + sort the keys).
+    assert settings.read_text(encoding="utf-8") == original
+
+
+def test_ensure_agy_feedback_survey_disabled_skips_malformed(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A malformed settings.json is left untouched (never clobbered)."""
+    settings = _agy_settings_path(tmp_path)
+    settings.parent.mkdir(parents=True)
+    settings.write_text("{ not valid json", encoding="utf-8")
+    with caplog.at_level(logging.WARNING):
+        ensure_agy_feedback_survey_disabled(tmp_path)
+    assert settings.read_text(encoding="utf-8") == "{ not valid json"
+    assert "not valid JSON" in caplog.text
+
+
+def test_ensure_agy_feedback_survey_disabled_skips_non_dict(tmp_path: Path) -> None:
+    """A JSON file that isn't an object is left untouched."""
+    settings = _agy_settings_path(tmp_path)
+    settings.parent.mkdir(parents=True)
+    settings.write_text('["a", "b"]', encoding="utf-8")
+    ensure_agy_feedback_survey_disabled(tmp_path)
+    assert settings.read_text(encoding="utf-8") == '["a", "b"]'
+
+
+def test_ensure_agy_feedback_survey_disabled_leaves_non_utf8_untouched(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Non-UTF-8 bytes must not crash the launch nor clobber the file (#1494 review)."""
+    settings = _agy_settings_path(tmp_path)
+    settings.parent.mkdir(parents=True)
+    settings.write_bytes(b"\xff\xfe not valid utf-8 \x00")
+    with caplog.at_level(logging.WARNING):
+        ensure_agy_feedback_survey_disabled(tmp_path)  # must NOT raise
+    assert settings.read_bytes() == b"\xff\xfe not valid utf-8 \x00"
+    assert "not valid UTF-8" in caplog.text
+
+
+def test_ensure_agy_feedback_survey_disabled_skips_unreadable_existing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An existing-but-unreadable file (OSError != FileNotFoundError) is not clobbered."""
+    settings = _agy_settings_path(tmp_path)
+    settings.parent.mkdir(parents=True)
+    settings.write_text('{"model": "x"}', encoding="utf-8")
+
+    def _boom(self: Path, *args: object, **kwargs: object) -> str:
+        raise PermissionError("unreadable")
+
+    monkeypatch.setattr(Path, "read_text", _boom)
+    with caplog.at_level(logging.WARNING):
+        ensure_agy_feedback_survey_disabled(tmp_path)
+    # Path.read_text is patched, so read back via the builtin open.
+    with open(settings, encoding="utf-8") as handle:
+        assert handle.read() == '{"model": "x"}'
+    assert "could not read" in caplog.text
+
+
+def test_ensure_agy_feedback_survey_disabled_on_empty_file(tmp_path: Path) -> None:
+    """An empty settings.json is treated as create-fresh."""
+    settings = _agy_settings_path(tmp_path)
+    settings.parent.mkdir(parents=True)
+    settings.write_text("", encoding="utf-8")
+    ensure_agy_feedback_survey_disabled(tmp_path)
+    assert json.loads(settings.read_text(encoding="utf-8")) == {"showFeedbackSurvey": False}
+
+
+def test_ensure_agy_feedback_survey_disabled_flips_true_to_false(tmp_path: Path) -> None:
+    """An explicit ``true`` is flipped to ``false`` (other keys preserved)."""
+    settings = _agy_settings_path(tmp_path)
+    settings.parent.mkdir(parents=True)
+    settings.write_text(json.dumps({"showFeedbackSurvey": True, "model": "x"}), encoding="utf-8")
+    ensure_agy_feedback_survey_disabled(tmp_path)
+    data = json.loads(settings.read_text(encoding="utf-8"))
+    assert data == {"showFeedbackSurvey": False, "model": "x"}
+
+
+def test_ensure_agy_feedback_survey_disabled_follows_symlink(tmp_path: Path) -> None:
+    """A symlinked settings.json (dotfiles) is followed, not replaced (agy review)."""
+    real = tmp_path / "dotfiles" / "agy-settings.json"
+    real.parent.mkdir(parents=True)
+    real.write_text(json.dumps({"model": "x"}), encoding="utf-8")
+    link = _agy_settings_path(tmp_path)
+    link.parent.mkdir(parents=True)
+    link.symlink_to(real)
+    ensure_agy_feedback_survey_disabled(tmp_path)
+    # The symlink is preserved (not clobbered into a regular file) and the real
+    # target gained the key.
+    assert link.is_symlink()
+    assert json.loads(real.read_text(encoding="utf-8")) == {
+        "model": "x",
+        "showFeedbackSurvey": False,
+    }
+
+
+def test_ensure_agy_feedback_survey_disabled_write_failure_never_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A write-side OSError is swallowed + logged so the launch is never broken (#1494 review).
+
+    The read of an existing-but-unreadable file is already covered; this exercises
+    the WRITE phase guarantee — a failing atomic replace must not propagate out of
+    a best-effort helper called inline on the launch path.
+    """
+    settings = _agy_settings_path(tmp_path)
+    settings.parent.mkdir(parents=True)
+    settings.write_text(json.dumps({"model": "x"}), encoding="utf-8")
+
+    def _boom(*args: object, **kwargs: object) -> None:
+        raise OSError("disk full")
+
+    # os.replace is the last step of the atomic write; failing it stresses the
+    # finally-cleanup + outer best-effort guard together.
+    monkeypatch.setattr(_mod.os, "replace", _boom)
+    with caplog.at_level(logging.WARNING):
+        ensure_agy_feedback_survey_disabled(tmp_path)  # must NOT raise
+    # The original file is untouched (the failed write never landed) and no stray
+    # temp file is left behind in the settings dir.
+    assert json.loads(settings.read_text(encoding="utf-8")) == {"model": "x"}
+    leftover = [p.name for p in settings.parent.iterdir() if p.name != settings.name]
+    assert leftover == []
+    assert "could not write" in caplog.text

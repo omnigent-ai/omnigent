@@ -5,9 +5,9 @@
 // Notification constructor, and so the one place that calls `new
 // Notification` / `requestPermission` is small and feature-detected.
 //
-// No service worker is registered in this app, so we use the page-scoped
-// `new Notification()` path (fine for desktop, our primary target) rather
-// than ServiceWorkerRegistration.showNotification().
+// We deliberately use the page-scoped Notification API rather than
+// ServiceWorkerRegistration.showNotification(): the service worker we register
+// is installability/update-only and intercepts nothing.
 
 // When running inside the Electron desktop shell, notifications are routed
 // through the OS-native notification API (via the preload bridge) instead of

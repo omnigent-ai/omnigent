@@ -25,7 +25,7 @@ interface HostsResponse {
   hosts: Host[];
 }
 
-async function fetchHosts(): Promise<Host[]> {
+async function fetchHosts(includeSandbox: boolean): Promise<Host[]> {
   const res = await authenticatedFetch("/v1/hosts");
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const body = (await res.json()) as HostsResponse;
@@ -33,21 +33,30 @@ async function fetchHosts(): Promise<Host[]> {
   // are launch targets the server creates on demand (and relaunches
   // at will), not user-connectable machines, so offering them as
   // manual targets is misleading. Hosts from older servers lack the
-  // field and are kept.
+  // field and are kept. `includeSandbox` opts a caller (the chat-header
+  // HostBadge) back into seeing them so it can label sandbox sessions.
+  if (includeSandbox) return body.hosts;
   return body.hosts.filter((h) => !h.sandbox_provider);
 }
 
 interface UseHostsOptions {
   enabled?: boolean;
+  includeSandbox?: boolean;
 }
 
 export function useHosts(options: UseHostsOptions = {}) {
   const enabled = options.enabled ?? true;
+  const includeSandbox = options.includeSandbox ?? false;
   return useQuery({
-    queryKey: ["hosts"],
-    queryFn: fetchHosts,
+    // Distinct cache key per filtering mode so the picker's filtered
+    // list and the header's unfiltered list don't overwrite each other.
+    // A bare ["hosts"] invalidation still prefix-matches both.
+    queryKey: ["hosts", { includeSandbox }],
+    queryFn: () => fetchHosts(includeSandbox),
     enabled,
-    staleTime: 10_000,
-    refetchInterval: enabled ? 10_000 : false,
+    staleTime: 30_000,
+    // Host status is pushed via WS (hosts_changed frame in SessionUpdatesProvider).
+    // 60 s fallback poll catches any missed events (tab backgrounded, reconnect gap).
+    refetchInterval: enabled ? 60_000 : false,
   });
 }

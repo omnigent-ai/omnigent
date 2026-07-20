@@ -141,5 +141,5 @@ def _build_copilot_executor() -> Executor:
 
 def create_app() -> FastAPI:
     """Build the copilot harness's FastAPI app (required entry point)."""
-    adapter = ExecutorAdapter(executor_factory=_build_copilot_executor)
+    adapter = ExecutorAdapter(executor_factory=_build_copilot_executor, harness_label="Copilot")
     return adapter.build()

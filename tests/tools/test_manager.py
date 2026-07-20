@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import logging
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 
@@ -22,7 +25,7 @@ from omnigent.spec.types import (
 )
 from omnigent.tools import ToolManager
 from omnigent.tools.base import ToolContext
-from omnigent.tools.client_specified import ClientSideToolSpec
+from omnigent.tools.client_specified import ClientSideTool, ClientSideToolSpec
 from omnigent.tools.mcp import clear_discovery_cache
 
 _TEST_CTX = ToolContext(task_id="task_test", agent_id="agent_test")
@@ -59,6 +62,7 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         "sys_session_get_history",
         "sys_session_list",
         "sys_session_get_info",
+        "sys_session_rename",
         # Read-only agent discovery tools are likewise always available
         # (global, permission-bounded reads of any accessible session's
         # agent / bundle).
@@ -69,6 +73,14 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         # browse the registry and add policies at runtime.
         "sys_add_policy",
         "sys_policy_registry",
+        # Embedded-browser tools are always auto-registered (framework-
+        # owned) so any agent can drive the desktop app's browser without
+        # the spec opting in. Schema-only; runner-dispatched.
+        "browser_navigate",
+        "browser_snapshot",
+        "browser_click",
+        "browser_type",
+        "browser_screenshot",
     }
 )
 
@@ -97,6 +109,12 @@ def _non_lifecycle_schemas(
             and fn.get("name") in _ALWAYS_PRESENT_TOOLS
         )
     ]
+
+
+def test_session_rename_is_registered_for_every_agent() -> None:
+    names = {schema["function"]["name"] for schema in ToolManager(_make_spec()).get_tool_schemas()}
+
+    assert "sys_session_rename" in names
 
 
 @pytest.fixture()
@@ -295,13 +313,85 @@ def test_schemas_empty_when_no_skills() -> None:
     assert _non_lifecycle_schemas(mgr) == []
 
 
+def test_schemas_isolate_a_failing_tool(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A tool whose ``get_schema`` raises is skipped, not allowed to drop
+    the entire toolset: every other tool's schema is still returned and
+    a warning names the offending tool.
+
+    Regression test for the silent total-toolset drop in #378. A single
+    unimportable ``type: function`` tool (dotted ``callable`` path that
+    fails to import) used to abort the whole list comprehension, leaving
+    the model with zero declared tools and only a swallowed WARNING.
+    """
+
+    class _BoomTool:
+        def get_schema(self) -> dict[str, Any]:
+            raise ImportError("No module named 'boom'")
+
+    mgr = ToolManager(_make_spec([]))
+    healthy = {s["function"]["name"] for s in mgr.get_tool_schemas()}
+    assert healthy  # sanity: always-present lifecycle tools exist
+
+    mgr._tools["boom"] = _BoomTool()  # type: ignore[assignment]
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.tools.manager"):
+        schemas = mgr.get_tool_schemas()
+
+    names = {s["function"]["name"] for s in schemas}
+    assert "boom" not in names
+    assert names == healthy  # every healthy tool survived the bad one
+    assert any("boom" in record.getMessage() for record in caplog.records)
+
+
+def test_client_schemas_isolate_a_failing_tool(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A client-side tool whose ``get_schema`` raises is skipped, not
+    allowed to drop the entire client toolset: every other client tool's
+    schema is still returned and a warning names the offending tool.
+
+    Mirrors ``test_schemas_isolate_a_failing_tool`` for the
+    ``get_client_tool_schemas`` path that ``SpawnTool`` uses to propagate
+    client tools to sub-agents (#378).
+    """
+
+    class _BoomClientTool(ClientSideTool):
+        def get_schema(self) -> dict[str, Any]:
+            raise ImportError("No module named 'boom'")
+
+    mgr = ToolManager(_make_spec([]))
+    healthy_tool = ClientSideTool(
+        ClientSideToolSpec(
+            name="weather",
+            schema={"type": "function", "function": {"name": "weather"}},
+        )
+    )
+    mgr._tools["weather"] = healthy_tool
+    healthy = {s["function"]["name"] for s in mgr.get_client_tool_schemas()}
+    assert healthy == {"weather"}  # sanity: the good client tool is advertised
+
+    mgr._tools["boom"] = _BoomClientTool(ClientSideToolSpec(name="boom", schema={}))
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.tools.manager"):
+        schemas = mgr.get_client_tool_schemas()
+
+    names = {s["function"]["name"] for s in schemas}
+    assert "boom" not in names
+    assert names == healthy  # the healthy client tool survived the bad one
+    assert any("boom" in record.getMessage() for record in caplog.records)
+
+
 def test_session_reads_registered_but_writes_gated_without_opt_in() -> None:
     """
     Read-only session discovery (``sys_session_get_history`` /
     ``sys_session_list`` / ``sys_session_get_info``) is registered for
     **every** agent, even one that declares no sub-agents — so a
     user-added agent can read its session-mates for context. The
-    mutating session tools (``sys_session_send`` /
+    opt-in session-spawn tools (``sys_session_send`` /
     ``sys_session_close`` / ``sys_session_create`` /
     ``sys_session_share``) are NOT registered without an opt-in
     (``tools.agents`` or top-level ``spawn: true``). A regression that
@@ -350,6 +440,8 @@ def test_spawn_flag_registers_write_tools_without_sub_agents() -> None:
     assert "sys_session_create" in names
     # The dispatch grant brings model awareness along with it.
     assert "sys_list_models" in names
+    # Intelligent routing advisor stays hidden when routing is disabled.
+    assert "sys_advise_models" not in names
     # Sharing is DECOUPLED from spawn — its own `share:` flag governs it,
     # so `spawn: true` alone (share defaulting to `none`) does NOT
     # register it. A regression coupling them would re-expose sharing to
@@ -412,9 +504,38 @@ def test_declared_agents_grant_send_close_but_not_create() -> None:
     assert "sys_session_create" not in names
     # Model awareness rides the same grant as send.
     assert "sys_list_models" in names
+    # Advisor is capability-gated — absent without a routing client.
+    assert "sys_advise_models" not in names
     # Declaring sub-agents does NOT enable sharing — that is the separate
     # `share:` flag's job, decoupled from the spawn/agents grant.
     assert "sys_session_share" not in names
+
+
+@dataclass
+class _FakeRoutingCaps:
+    routing_client: object | None = None
+
+
+def _spawn_spec() -> AgentSpec:
+    return AgentSpec(spec_version=1, spawn=True)
+
+
+def test_advise_models_hidden_when_routing_disabled() -> None:
+    """sys_advise_models must not appear when RuntimeCaps.routing_client is None."""
+    caps = _FakeRoutingCaps(routing_client=None)
+    with patch("omnigent.runtime._globals._caps", new=caps):
+        names = {s["function"]["name"] for s in ToolManager(_spawn_spec()).get_tool_schemas()}
+    assert "sys_list_models" in names
+    assert "sys_advise_models" not in names
+
+
+def test_advise_models_exposed_when_routing_enabled() -> None:
+    """sys_advise_models is advertised alongside send when routing is configured."""
+    caps = _FakeRoutingCaps(routing_client=object())
+    with patch("omnigent.runtime._globals._caps", new=caps):
+        names = {s["function"]["name"] for s in ToolManager(_spawn_spec()).get_tool_schemas()}
+    assert "sys_list_models" in names
+    assert "sys_advise_models" in names
 
 
 def test_share_non_public_registers_share_tool_without_public() -> None:

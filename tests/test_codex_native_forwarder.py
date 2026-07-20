@@ -1411,3 +1411,826 @@ def test_read_compacted_history_returns_none_for_no_compacted_entry(
     rollout.write_text(_json.dumps({"type": "session_meta", "payload": {"id": "abc"}}) + "\n")
 
     assert fwd._read_compacted_history(rollout) is None
+
+
+@pytest.mark.asyncio
+async def test_post_session_event_dead_letters_durable_event_on_permanent_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A permanently-failed durable event is dead-lettered to disk (#1120).
+
+    Drives ``_post_session_event`` (the health-tracking wrapper) with a stubbed
+    inner that returns an HTTP 500, and asserts the dropped
+    ``external_conversation_item`` payload is appended to
+    ``{bridge_dir}/dead_letter.jsonl``.
+
+    :param tmp_path: Pytest temp dir standing in for the bridge dir.
+    :param monkeypatch: Pytest patcher (auto-restores the stubbed inner).
+    """
+    import json as _json
+
+    fwd._reset_forward_health()
+
+    async def _failing_inner(client, session_id, *, event_type, data):
+        return fwd._PostResult(
+            response=httpx.Response(500, request=httpx.Request("POST", "http://test"))
+        )
+
+    monkeypatch.setattr(fwd, "_post_session_event_inner", _failing_inner)
+    token = fwd._dead_letter_dir.set(tmp_path)
+    try:
+        data = {"item_type": "message", "item_data": {"role": "assistant"}}
+        await fwd._post_session_event(
+            MagicMock(),
+            "conv_codex1",
+            event_type="external_conversation_item",
+            data=data,
+        )
+    finally:
+        fwd._dead_letter_dir.reset(token)
+        fwd._reset_forward_health()
+
+    dl_path = tmp_path / "dead_letter.jsonl"
+    lines = dl_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    record = _json.loads(lines[0])
+    assert record["session_id"] == "conv_codex1"
+    assert record["event_type"] == "external_conversation_item"
+    assert record["payload"] == data
+
+
+@pytest.mark.asyncio
+async def test_post_session_event_does_not_dead_letter_ephemeral_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    An ephemeral (non-durable) event is NOT dead-lettered on failure (#1120).
+
+    :param tmp_path: Pytest temp dir standing in for the bridge dir.
+    :param monkeypatch: Pytest patcher (auto-restores the stubbed inner).
+    """
+    fwd._reset_forward_health()
+
+    async def _failing_inner(client, session_id, *, event_type, data):
+        return fwd._PostResult(
+            response=httpx.Response(500, request=httpx.Request("POST", "http://test"))
+        )
+
+    monkeypatch.setattr(fwd, "_post_session_event_inner", _failing_inner)
+    token = fwd._dead_letter_dir.set(tmp_path)
+    try:
+        await fwd._post_session_event(
+            MagicMock(),
+            "conv_codex1",
+            event_type="external_output_text_delta",
+            data={"delta": "hi"},
+        )
+    finally:
+        fwd._dead_letter_dir.reset(token)
+        fwd._reset_forward_health()
+
+    assert not (tmp_path / "dead_letter.jsonl").exists()
+
+
+@pytest.mark.asyncio
+async def test_post_session_event_dead_letters_usage_on_permanent_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A permanently-failed ``external_session_usage`` event is dead-lettered (#1120).
+
+    Usage is the other durable type alongside conversation items, so its
+    transcript/usage data must also be recoverable on a sustained outage.
+
+    :param tmp_path: Pytest temp dir standing in for the bridge dir.
+    :param monkeypatch: Pytest patcher (auto-restores the stubbed inner).
+    """
+    import json as _json
+
+    fwd._reset_forward_health()
+
+    async def _failing_inner(client, session_id, *, event_type, data):
+        return fwd._PostResult(
+            response=httpx.Response(500, request=httpx.Request("POST", "http://test"))
+        )
+
+    monkeypatch.setattr(fwd, "_post_session_event_inner", _failing_inner)
+    token = fwd._dead_letter_dir.set(tmp_path)
+    try:
+        data = {"context_tokens": 1234, "model": "databricks-claude-opus-4-7"}
+        await fwd._post_session_event(
+            MagicMock(),
+            "conv_codex_usage",
+            event_type="external_session_usage",
+            data=data,
+        )
+    finally:
+        fwd._dead_letter_dir.reset(token)
+        fwd._reset_forward_health()
+
+    dl_path = tmp_path / "dead_letter.jsonl"
+    lines = dl_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    record = _json.loads(lines[0])
+    assert record["session_id"] == "conv_codex_usage"
+    assert record["event_type"] == "external_session_usage"
+    assert record["payload"] == data
+
+
+class _RaisingPostClient:
+    """Async client stub whose ``post`` always raises a fixed transport error."""
+
+    def __init__(self, exc: httpx.HTTPError) -> None:
+        self._exc = exc
+        self.calls = 0
+
+    async def post(self, url: str, json: object) -> httpx.Response:
+        self.calls += 1
+        raise self._exc
+
+
+@pytest.mark.asyncio
+async def test_post_session_event_inner_classifies_ambiguous_skip() -> None:
+    """
+    An ambiguous conversation-item transport failure surfaces as ambiguous (#1579).
+
+    The inner used to conflate this with a proven-undelivered failure (both
+    returned ``None``); replay must be able to tell them apart.
+    """
+    client = _RaisingPostClient(
+        httpx.ReadTimeout("response lost", request=httpx.Request("POST", "http://test"))
+    )
+    result = await fwd._post_session_event_inner(
+        client,
+        "conv_codex1",
+        event_type="external_conversation_item",
+        data={"item_type": "message"},
+    )
+    assert result.response is None
+    assert result.delivered_ambiguous is True
+    assert result.transport_error == "ReadTimeout"
+    # Ambiguous items are abandoned immediately — no retries.
+    assert client.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_post_session_event_inner_classifies_proven_undelivered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A connect failure exhausted after retries is proven-undelivered, not ambiguous.
+    """
+    monkeypatch.setattr(fwd, "_sleep", AsyncMock())
+    client = _RaisingPostClient(
+        httpx.ConnectError("refused", request=httpx.Request("POST", "http://test"))
+    )
+    result = await fwd._post_session_event_inner(
+        client,
+        "conv_codex1",
+        event_type="external_conversation_item",
+        data={"item_type": "message"},
+    )
+    assert result.response is None
+    assert result.delivered_ambiguous is False
+    assert result.transport_error == "ConnectError"
+    # Connect failures are safe to retry, so all attempts are spent.
+    assert client.calls == fwd._POST_MAX_ATTEMPTS
+
+
+@pytest.mark.asyncio
+async def test_post_session_event_dead_letters_ambiguous_classification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    An ambiguous-skip drop is dead-lettered with ``delivered_ambiguous=True`` (#1579).
+
+    :param tmp_path: Pytest temp dir standing in for the bridge dir.
+    :param monkeypatch: Pytest patcher (auto-restores the stubbed inner).
+    """
+    import json as _json
+
+    fwd._reset_forward_health()
+
+    async def _ambiguous_inner(client, session_id, *, event_type, data):
+        return fwd._PostResult(
+            response=None, delivered_ambiguous=True, transport_error="ReadTimeout"
+        )
+
+    monkeypatch.setattr(fwd, "_post_session_event_inner", _ambiguous_inner)
+    token = fwd._dead_letter_dir.set(tmp_path)
+    try:
+        await fwd._post_session_event(
+            MagicMock(),
+            "conv_codex1",
+            event_type="external_conversation_item",
+            data={"item_type": "message"},
+        )
+    finally:
+        fwd._dead_letter_dir.reset(token)
+        fwd._reset_forward_health()
+
+    record = _json.loads((tmp_path / "dead_letter.jsonl").read_text().splitlines()[0])
+    assert record["delivered_ambiguous"] is True
+    assert record["http_status"] is None
+    assert record["transport_error"] == "ReadTimeout"
+
+
+@pytest.mark.asyncio
+async def test_post_session_event_dead_letters_records_http_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A status-bearing failure records ``http_status`` and is not ambiguous (#1579).
+
+    :param tmp_path: Pytest temp dir standing in for the bridge dir.
+    :param monkeypatch: Pytest patcher (auto-restores the stubbed inner).
+    """
+    import json as _json
+
+    fwd._reset_forward_health()
+
+    async def _failing_inner(client, session_id, *, event_type, data):
+        return fwd._PostResult(
+            response=httpx.Response(503, request=httpx.Request("POST", "http://test"))
+        )
+
+    monkeypatch.setattr(fwd, "_post_session_event_inner", _failing_inner)
+    token = fwd._dead_letter_dir.set(tmp_path)
+    try:
+        await fwd._post_session_event(
+            MagicMock(),
+            "conv_codex1",
+            event_type="external_conversation_item",
+            data={"item_type": "message"},
+        )
+    finally:
+        fwd._dead_letter_dir.reset(token)
+        fwd._reset_forward_health()
+
+    record = _json.loads((tmp_path / "dead_letter.jsonl").read_text().splitlines()[0])
+    assert record["http_status"] == 503
+    assert record["delivered_ambiguous"] is False
+    assert record["transport_error"] is None
+
+
+@pytest.mark.asyncio
+async def test_replay_dead_letters_on_startup_reposts_proven_undelivered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    On startup, a proven-undelivered record is re-POSTed and removed (#1579).
+
+    :param tmp_path: Pytest temp dir standing in for the bridge dir.
+    :param monkeypatch: Pytest patcher (auto-restores the stubbed inner).
+    """
+    fwd.append_dead_letter(
+        tmp_path,
+        session_id="conv_codex1",
+        event_type="external_conversation_item",
+        payload={"item_type": "message"},
+        reason="proven-undelivered transport failure after retries",
+        delivered_ambiguous=False,
+        http_status=None,
+        transport_error="ConnectError",
+    )
+
+    posted: list[dict] = []
+
+    async def _ok_inner(client, session_id, *, event_type, data, max_attempts, timeout):
+        posted.append(
+            {
+                "session_id": session_id,
+                "event_type": event_type,
+                "data": data,
+                "max_attempts": max_attempts,
+                "timeout": timeout,
+            }
+        )
+        return fwd._PostResult(
+            response=httpx.Response(200, request=httpx.Request("POST", "http://test"))
+        )
+
+    monkeypatch.setattr(fwd, "_post_session_event_inner", _ok_inner)
+    await fwd._replay_dead_letters_on_startup(MagicMock(), tmp_path)
+
+    assert len(posted) == 1
+    assert posted[0]["session_id"] == "conv_codex1"
+    assert posted[0]["event_type"] == "external_conversation_item"
+    assert posted[0]["data"] == {"item_type": "message"}
+    # Replay re-POSTs with a single attempt and a short timeout so a large file
+    # or a hung server cannot stall startup.
+    assert posted[0]["max_attempts"] == 1
+    assert posted[0]["timeout"] == fwd._REPLAY_POST_TIMEOUT_SECONDS
+    # Delivered → record removed.
+    assert not (tmp_path / "dead_letter.jsonl").exists()
+
+
+@pytest.mark.asyncio
+async def test_replay_dead_letters_on_startup_skips_ambiguous(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    On startup, an ambiguous record is never re-POSTed and is retained (#1579).
+
+    :param tmp_path: Pytest temp dir standing in for the bridge dir.
+    :param monkeypatch: Pytest patcher (auto-restores the stubbed inner).
+    """
+    fwd.append_dead_letter(
+        tmp_path,
+        session_id="conv_codex1",
+        event_type="external_conversation_item",
+        payload={"item_type": "message"},
+        reason="ambiguous transport failure (may already be committed)",
+        delivered_ambiguous=True,
+    )
+
+    called = False
+
+    async def _inner(client, session_id, *, event_type, data, **_kwargs):
+        nonlocal called
+        called = True
+        return fwd._PostResult(
+            response=httpx.Response(200, request=httpx.Request("POST", "http://test"))
+        )
+
+    monkeypatch.setattr(fwd, "_post_session_event_inner", _inner)
+    await fwd._replay_dead_letters_on_startup(MagicMock(), tmp_path)
+
+    assert called is False
+    # Ambiguous record retained as a forensic record.
+    assert (tmp_path / "dead_letter.jsonl").exists()
+
+
+class _RecordingPostClient:
+    """Async client stub that records each ``post`` call's kwargs."""
+
+    def __init__(self, response: httpx.Response) -> None:
+        self._response = response
+        self.calls: list[dict] = []
+
+    async def post(self, url: str, **kwargs: object) -> httpx.Response:
+        self.calls.append(kwargs)
+        return self._response
+
+
+@pytest.mark.asyncio
+async def test_post_session_event_inner_single_attempt_and_timeout() -> None:
+    """
+    ``max_attempts=1`` makes one POST (no retry) and ``timeout`` is threaded through.
+
+    Replay relies on both so a hung server fails fast and startup is bounded (#1579).
+    """
+    client = _RecordingPostClient(
+        httpx.Response(503, request=httpx.Request("POST", "http://test"))
+    )
+    result = await fwd._post_session_event_inner(
+        client,
+        "conv_codex1",
+        event_type="external_conversation_item",
+        data={"item_type": "message"},
+        max_attempts=1,
+        timeout=5.0,
+    )
+    # A single attempt even though 503 is normally retryable.
+    assert len(client.calls) == 1
+    assert client.calls[0]["timeout"] == 5.0
+    assert result.response is not None
+    assert result.response.status_code == 503
+
+
+async def test_post_session_event_records_connectivity_failure_for_watchdog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex's exhausted-retry POST failure is recorded for the idle watchdog.
+
+    Writer half of issue #1119 for the codex forwarder: when every attempt to
+    POST a session event raises a connect error, ``_post_session_event`` must
+    record the failure in ``_native_forwarder_health`` (via
+    ``_log_post_transport_failure``) so the harness idle-turn watchdog can name
+    the connectivity cause instead of a generic "wedged LLM" reason.
+    """
+    from omnigent import _native_forwarder_health as health
+
+    class _AlwaysConnectError:
+        """Stub client whose every POST fails to connect."""
+
+        async def post(self, url: str, *, json: object) -> httpx.Response:
+            """Raise a connect error mimicking an unreachable server."""
+            del json
+            raise httpx.ConnectError("No route to host", request=httpx.Request("POST", url))
+
+    async def _no_sleep(_seconds: float) -> None:
+        """No-op sleep so the retry loop doesn't add real delay."""
+
+    monkeypatch.setattr(fwd, "_sleep", _no_sleep)
+
+    health.clear()
+    try:
+        result = await fwd._post_session_event(
+            _AlwaysConnectError(),  # type: ignore[arg-type]
+            "conv_x",
+            event_type="external_session_status",
+            data={},
+        )
+        assert result is None
+        detail = health.recent_post_failure(60.0)
+        assert detail is not None
+        assert "external_session_status" in detail
+        assert "No route to host" in detail
+    finally:
+        health.clear()
+
+
+# ── MCP startup status mirroring (issue #2058) ─────────────────────────
+
+
+def _mcp_startup_event(
+    name: str,
+    status: str,
+    *,
+    error: str | None = None,
+    thread_id: str | None = None,
+) -> dict:
+    """
+    Build a Codex ``mcpServer/startupStatus/updated`` envelope.
+
+    :param name: MCP server name, e.g. ``"safe"``.
+    :param status: Startup state, e.g. ``"starting"``.
+    :param error: Optional failure detail.
+    :param thread_id: Optional ``threadId`` param.
+    :returns: Notification envelope dict.
+    """
+    params: dict = {"name": name, "status": status}
+    if error is not None:
+        params["error"] = error
+    if thread_id is not None:
+        params["threadId"] = thread_id
+    return {"method": "mcpServer/startupStatus/updated", "params": params}
+
+
+@pytest.mark.asyncio
+async def test_mcp_startup_event_records_and_posts(tmp_path: Path) -> None:
+    """
+    An MCP startup notification updates the bridge map and mirrors it to AP.
+
+    The bridge write is what unblocks the executor's first-turn gate; the
+    ``external_mcp_startup`` post is what makes the web session show
+    per-server startup state instead of appearing hung.
+    """
+    client = _RecordingClient()
+
+    await fwd._handle_event(
+        client,  # type: ignore[arg-type]
+        session_id="conv_x",
+        bridge_dir=tmp_path,
+        event=_mcp_startup_event("safe", "starting", thread_id="thread_1"),
+        usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
+        elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+        expected_thread_id="thread_1",
+    )
+
+    from omnigent.codex_native_bridge import read_mcp_startup
+
+    assert read_mcp_startup(tmp_path) == {"safe": {"status": "starting", "error": None}}
+    assert client.posts == [
+        (
+            "/v1/sessions/conv_x/events",
+            {
+                "type": "external_mcp_startup",
+                "data": {"servers": {"safe": {"status": "starting", "error": None}}},
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_mcp_startup_event_carries_failure_error(tmp_path: Path) -> None:
+    """
+    A ``failed`` update retains the error detail through bridge and post.
+
+    The error text is what the web UI (and the executor's timeout text)
+    surface for a server that never came up.
+    """
+    client = _RecordingClient()
+
+    await fwd._handle_event(
+        client,  # type: ignore[arg-type]
+        session_id="conv_x",
+        bridge_dir=tmp_path,
+        event=_mcp_startup_event("safe", "failed", error="handshake failed"),
+        usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
+        elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+        expected_thread_id="thread_1",
+    )
+
+    from omnigent.codex_native_bridge import read_mcp_startup
+
+    assert read_mcp_startup(tmp_path) == {
+        "safe": {"status": "failed", "error": "handshake failed"}
+    }
+    assert client.posts[0][1]["data"]["servers"]["safe"]["error"] == "handshake failed"
+
+
+@pytest.mark.asyncio
+async def test_mcp_startup_event_for_other_thread_is_ignored(tmp_path: Path) -> None:
+    """
+    An MCP startup update naming a different thread is dropped.
+
+    A child thread's (or stale thread's) startup must not overwrite the
+    parent bridge map or flash the parent session's startup band.
+    """
+    client = _RecordingClient()
+
+    await fwd._handle_event(
+        client,  # type: ignore[arg-type]
+        session_id="conv_x",
+        bridge_dir=tmp_path,
+        event=_mcp_startup_event("safe", "starting", thread_id="thread_other"),
+        usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
+        elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+        expected_thread_id="thread_1",
+    )
+
+    from omnigent.codex_native_bridge import read_mcp_startup
+
+    assert read_mcp_startup(tmp_path) == {}
+    assert client.posts == []
+
+
+@pytest.mark.asyncio
+async def test_mcp_startup_event_with_unknown_status_is_ignored(tmp_path: Path) -> None:
+    """
+    An unknown status value neither records nor posts.
+
+    Guards against a future Codex enum change feeding a bogus status into
+    the executor gate or the web UI.
+    """
+    client = _RecordingClient()
+
+    await fwd._handle_event(
+        client,  # type: ignore[arg-type]
+        session_id="conv_x",
+        bridge_dir=tmp_path,
+        event=_mcp_startup_event("safe", "exploded"),
+        usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
+        elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+        expected_thread_id="thread_1",
+    )
+
+    from omnigent.codex_native_bridge import read_mcp_startup
+
+    assert read_mcp_startup(tmp_path) == {}
+    assert client.posts == []
+
+
+def _write_session_config(tmp_path: Path, body: str) -> None:
+    """
+    Write the session's private ``config.toml`` under the bridge dir.
+
+    :param tmp_path: Bridge directory.
+    :param body: Raw TOML body, e.g. ``"[mcp_servers.safe]\ncommand='x'"``.
+    """
+    home = codex_home_for_bridge_dir(tmp_path)
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.toml").write_text(body)
+
+
+@pytest.mark.asyncio
+async def test_seed_mcp_startup_round_posts_config_servers(tmp_path: Path) -> None:
+    """
+    Seeding records the enabled config servers as ``starting`` and posts them.
+
+    Codex delivers per-server startup edges only to the thread-owning
+    connection, so this synthesized round is the only way the web session
+    learns startup is in flight (issue #2058). Disabled servers must be
+    excluded — codex does not boot them, and a permanently-"starting"
+    band entry would never resolve.
+    """
+    from omnigent.codex_native_bridge import read_mcp_startup
+
+    client = _RecordingClient()
+    _write_session_config(
+        tmp_path,
+        '[mcp_servers.safe]\ncommand = "x"\n'
+        '[mcp_servers.off]\ncommand = "y"\nenabled = false\n'
+        '[mcp_servers.omnigent]\ncommand = "z"\n',
+    )
+
+    timer = await fwd._seed_mcp_startup_round(
+        client,  # type: ignore[arg-type]
+        session_id="conv_x",
+        bridge_dir=tmp_path,
+    )
+
+    try:
+        assert read_mcp_startup(tmp_path) == {
+            "safe": {"status": "starting", "error": None},
+            "omnigent": {"status": "starting", "error": None},
+        }
+        assert client.posts == [
+            (
+                "/v1/sessions/conv_x/events",
+                {
+                    "type": "external_mcp_startup",
+                    "data": {
+                        "servers": {
+                            "safe": {"status": "starting", "error": None},
+                            "omnigent": {"status": "starting", "error": None},
+                        }
+                    },
+                },
+            )
+        ]
+        assert timer is not None
+    finally:
+        if timer is not None:
+            timer.cancel()
+
+
+@pytest.mark.asyncio
+async def test_seed_mcp_startup_round_skips_when_state_exists(tmp_path: Path) -> None:
+    """
+    A bridge dir that already carries round state is not reseeded.
+
+    ``supervise_forwarder`` restarts on reconnect mid-session; reseeding
+    then would flash a false "starting" band for servers that finished
+    booting long ago. Only ``clear_bridge_state`` (each app-server
+    launch) resets the map.
+    """
+    from omnigent.codex_native_bridge import read_mcp_startup, update_mcp_server_startup
+
+    client = _RecordingClient()
+    _write_session_config(tmp_path, '[mcp_servers.safe]\ncommand = "x"\n')
+    update_mcp_server_startup(tmp_path, "safe", "cancelled")
+
+    timer = await fwd._seed_mcp_startup_round(
+        client,  # type: ignore[arg-type]
+        session_id="conv_x",
+        bridge_dir=tmp_path,
+    )
+
+    assert timer is None
+    assert client.posts == []
+    assert read_mcp_startup(tmp_path) == {"safe": {"status": "cancelled", "error": None}}
+
+
+@pytest.mark.asyncio
+async def test_seed_rearms_settle_timer_when_round_still_pending(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A reconnect that finds the round still pending re-arms the settle window.
+
+    The previous forwarder's settle timer dies with its connection; if the
+    reconnect only skipped reseeding, a missed idle edge would leave the
+    band stuck on "starting" for the rest of the session. The re-armed
+    timer must actually resolve the round: once it fires, the pending
+    entries are dropped and the settled map is posted.
+    """
+    from omnigent.codex_native_bridge import read_mcp_startup, update_mcp_server_startup
+
+    client = _RecordingClient()
+    update_mcp_server_startup(tmp_path, "safe", "starting")
+    update_mcp_server_startup(tmp_path, "storage-console", "cancelled")
+
+    async def _no_sleep(_seconds: float) -> None:
+        """Collapse the settle window so the test observes the timer firing."""
+
+    monkeypatch.setattr(fwd, "_sleep", _no_sleep)
+
+    timer = await fwd._seed_mcp_startup_round(
+        client,  # type: ignore[arg-type]
+        session_id="conv_x",
+        bridge_dir=tmp_path,
+    )
+
+    # No reseed/repost on reconnect — the recorded map is left intact...
+    assert timer is not None
+    assert client.posts == []
+    assert read_mcp_startup(tmp_path)["safe"]["status"] == "starting"
+
+    # ...but the re-armed timer settles the round when the window elapses.
+    await timer
+    assert read_mcp_startup(tmp_path) == {
+        "storage-console": {"status": "cancelled", "error": None}
+    }
+    assert client.posts == [
+        (
+            "/v1/sessions/conv_x/events",
+            {
+                "type": "external_mcp_startup",
+                "data": {"servers": {"storage-console": {"status": "cancelled", "error": None}}},
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_thread_idle_settles_synthesized_round(tmp_path: Path) -> None:
+    """
+    An idle ``thread/status/changed`` resolves the synthesized round.
+
+    Codex defers turn execution until MCP startup settles, so a thread
+    going idle after a turn proves the round ended. Unresolved
+    ``starting`` entries are dropped (their real outcomes are only
+    delivered to the thread owner) while locally-recorded ``cancelled``
+    states survive, and the settled map is posted so the band clears.
+    """
+    from omnigent.codex_native_bridge import read_mcp_startup, update_mcp_server_startup
+
+    client = _RecordingClient()
+    update_mcp_server_startup(tmp_path, "safe", "starting")
+    update_mcp_server_startup(tmp_path, "storage-console", "cancelled")
+
+    await fwd._handle_event(
+        client,  # type: ignore[arg-type]
+        session_id="conv_x",
+        bridge_dir=tmp_path,
+        event={
+            "method": "thread/status/changed",
+            "params": {"threadId": "thread_1", "status": {"type": "idle"}},
+        },
+        usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
+        elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+        expected_thread_id="thread_1",
+    )
+
+    assert read_mcp_startup(tmp_path) == {
+        "storage-console": {"status": "cancelled", "error": None}
+    }
+    assert client.posts == [
+        (
+            "/v1/sessions/conv_x/events",
+            {
+                "type": "external_mcp_startup",
+                "data": {"servers": {"storage-console": {"status": "cancelled", "error": None}}},
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_thread_active_status_does_not_settle_round(tmp_path: Path) -> None:
+    """
+    An ``active`` status edge must not settle the round.
+
+    Codex flips the thread active the moment a turn is ACCEPTED — which
+    happens mid-startup, before the round ends — so settling there would
+    clear the band exactly when it matters most.
+    """
+    from omnigent.codex_native_bridge import read_mcp_startup, update_mcp_server_startup
+
+    client = _RecordingClient()
+    update_mcp_server_startup(tmp_path, "safe", "starting")
+
+    await fwd._handle_event(
+        client,  # type: ignore[arg-type]
+        session_id="conv_x",
+        bridge_dir=tmp_path,
+        event={
+            "method": "thread/status/changed",
+            "params": {"threadId": "thread_1", "status": {"type": "active", "activeFlags": []}},
+        },
+        usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
+        elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+        expected_thread_id="thread_1",
+    )
+
+    assert read_mcp_startup(tmp_path) == {"safe": {"status": "starting", "error": None}}
+    assert client.posts == []
+
+
+def test_settle_timeout_tracks_slowest_configured_server(tmp_path: Path) -> None:
+    """
+    The settle window follows the slowest ``startup_timeout_sec`` in config.
+
+    Codex bounds each server's spawn+handshake by that budget, so the
+    round cannot outlive it; a config without budgets falls back to the
+    codex default, and an absurd budget is capped.
+    """
+    _write_session_config(
+        tmp_path,
+        '[mcp_servers.fast]\ncommand = "x"\n'
+        '[mcp_servers.slow]\ncommand = "y"\nstartup_timeout_sec = 120\n',
+    )
+    assert fwd._mcp_startup_settle_timeout_seconds(tmp_path) == 135.0
+
+    _write_session_config(tmp_path, '[mcp_servers.fast]\ncommand = "x"\n')
+    assert fwd._mcp_startup_settle_timeout_seconds(tmp_path) == 25.0
+
+    _write_session_config(
+        tmp_path,
+        '[mcp_servers.slow]\ncommand = "y"\nstartup_timeout_sec = 100000\n',
+    )
+    assert fwd._mcp_startup_settle_timeout_seconds(tmp_path) == 240.0
+
+    # A disabled server's budget must not stretch the window: codex never
+    # boots it, and the seed excludes it from the synthesized round.
+    _write_session_config(
+        tmp_path,
+        '[mcp_servers.fast]\ncommand = "x"\n'
+        '[mcp_servers.off]\ncommand = "y"\nenabled = false\nstartup_timeout_sec = 120\n',
+    )
+    assert fwd._mcp_startup_settle_timeout_seconds(tmp_path) == 25.0

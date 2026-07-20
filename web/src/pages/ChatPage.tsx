@@ -21,6 +21,7 @@ import {
   CornerUpLeftIcon,
   CopyIcon,
   FileTextIcon,
+  FolderIcon,
   GitBranchIcon,
   GitForkIcon,
   ImageIcon,
@@ -53,12 +54,14 @@ import {
 import { Shimmer } from "@/components/ai-elements/shimmer";
 import { ElicitationCard } from "@/components/blocks/ApprovalCard";
 import { BlockRenderer, FilePathAwareMessageResponse } from "@/components/blocks/BlockRenderer";
-import { CompactionMarker, RoutingDecisionChip } from "@/components/blocks/StatusBlocks";
+import { CompactionMarker, RoutingDecisionCard } from "@/components/blocks/StatusBlocks";
 import { SystemMessageView } from "@/components/blocks/SystemMessage";
-import { parseSystemMessage } from "@/lib/systemMessage";
+import { isSystemUserContent, parseSystemMessage } from "@/lib/systemMessage";
 import { Button } from "@/components/ui/button";
 import { OttoIcon } from "@/components/icons/OttoIcon";
 import { cn } from "@/lib/utils";
+import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
+import { TurnRail, type Turn } from "@/pages/TurnRail";
 import { validateAttachments } from "@/lib/attachments";
 import { useSurfaceFrontmost } from "@/hooks/useNativeServerSwitcher";
 import {
@@ -77,7 +80,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { type Agent, useSessionAgent, useAgents } from "@/hooks/useAgents";
 import { agentDisplayLabel } from "@/components/AgentInfo";
-import { BRAIN_HARNESS_LABELS } from "@/lib/agentLabels";
+import { BRAIN_HARNESS_LABELS, useBrainHarnessLabels } from "@/lib/agentLabels";
 import { useConversations } from "@/hooks/useConversations";
 import { usePermissions } from "@/hooks/usePermissions";
 import type { CodexModelOption, SandboxStatus, Session, SessionStatus } from "@/lib/types";
@@ -102,11 +105,29 @@ import { getCurrentAuthorId } from "@/lib/identity";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import { codexEffortLevelsForModel, findCodexModelOption } from "@/lib/codexNativeModels";
 import {
+  composerAttachmentKey,
   consumePendingInitialPrompt,
   type PendingInitialPrompt,
   type PendingUserMessage,
+  type QueuedMessage,
   useChatStore,
 } from "@/store/chatStore";
+import { nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
+import {
+  buildMentionPreamble,
+  detectMentionAt,
+  type MentionItem,
+  mentionItemPath,
+  mentionMarkerFor,
+  type MentionState,
+  parseMentionToken,
+  rankMentionEntries,
+} from "@/lib/composerMentions";
+import { useMentionBrowser } from "@/hooks/useMentionBrowser";
+// Re-exported so existing tests importing these from "./ChatPage" keep working
+// after the pure helpers moved to the shared lib.
+export { detectMentionAt, mentionMarkerFor };
+export type { MentionItem, MentionState };
 import { useSession } from "@/hooks/useSession";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useRefreshSessionStateOnRunnerOnline } from "@/hooks/useSessionOnlineRefresh";
@@ -118,12 +139,20 @@ import {
 } from "@/hooks/useSessionLiveness";
 import { useMarkConversationSeen } from "@/hooks/useUnseenConversations";
 import { useUserMessageNav } from "@/hooks/useUserMessageNav";
+import { useWorkingLabelTick } from "@/hooks/useWorkingLabelTick";
 import { UserMessageNav } from "@/components/UserMessageNav";
+import { HostBadge } from "@/components/HostBadge";
 import {
   BUILTIN_SLASH_COMMANDS,
   isSlashCommandText,
   SlashCommandMenu,
 } from "@/components/SlashCommandMenu";
+import { FileMentionMenu } from "@/components/FileMentionMenu";
+import {
+  useWorkspaceAllFiles,
+  useWorkspaceDirectory,
+  type WorkspaceFile,
+} from "@/hooks/useWorkspaceChangedFiles";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
 import {
   IntelligentModelControl,
@@ -143,14 +172,15 @@ import { supportsEffortControl } from "@/lib/sessionCapabilities";
 import { isCodexNativeSession } from "@/lib/codexPlanMode";
 import { getCliServerUrl } from "@/lib/host";
 import { SessionImage } from "@/components/SessionImage";
-import {
-  CodexGoalControl,
-  CodexGoalStatusPill,
-  useCodexGoalState,
-  type CodexGoal,
-} from "@/components/codex";
+import { GoalControl, GoalStatusPill, useGoalState, type Goal } from "@/components/goal";
+import { copyText } from "@/lib/clipboard";
+import { showToast } from "@/components/ui/toast";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 
-const ATTACHED_RE = /\[Attached:[^\]]*\]\s*/g;
+// Matches both wordings the native executors emit: "[Attached: <path>]"
+// (claude/pi/cursor) and "[Attached file: <path>]" (codex). Capturing group
+// is the path. Global so all markers in a message are found / stripped.
+const ATTACHED_RE = /\[Attached(?: file)?:\s*([^\]]*)\]\s*/g;
 
 function extractUserText(content: MessageContentBlock[]): string {
   return content
@@ -161,6 +191,59 @@ function extractUserText(content: MessageContentBlock[]): string {
     .join("")
     .replace(ATTACHED_RE, "")
     .trim();
+}
+
+/**
+ * Pull the paths out of the "[Attached: …]" markers an "@"-mention adds to a
+ * user message, so the bubble can show what was attached (the marker text
+ * itself is stripped from the rendered text by {@link extractUserText}). A
+ * trailing "/" marks a folder. Returns [] for ordinary messages.
+ *
+ * Explicitly *uploaded* files share this marker wording: the native executor
+ * materializes the upload to disk and injects `[Attached: <abs-path>]` so the
+ * vendor CLI can read it. Those uploads already ride in as an
+ * `input_image`/`input_file` block (rendered as the image / a file chip), so
+ * surfacing them again here would double-render — as the path of an internal
+ * bridge temp dir, no less. "@"-mention paths are always workspace-relative
+ * while upload markers are absolute, so skip absolute paths (see
+ * {@link isAbsolutePath}).
+ */
+// An absolute filesystem path in any form a native executor might materialize
+// an upload to: POSIX ("/…"), Windows drive ("C:\…" or "C:/…"), or UNC
+// ("\\host\share"). Workspace "@"-mention paths are always relative, so this
+// reliably tells a materialized upload apart from a tagged workspace file
+// regardless of the host OS the runner happens to be on.
+function isAbsolutePath(p: string): boolean {
+  return /^(\/|[A-Za-z]:[\\/]|\\\\)/.test(p);
+}
+
+function extractAttachedPaths(content: MessageContentBlock[]): MentionItem[] {
+  const text = content
+    .filter(
+      (c): c is Extract<MessageContentBlock, { type: "input_text" }> => c.type === "input_text",
+    )
+    .map((c) => c.text)
+    .join("");
+  const out: MentionItem[] = [];
+  for (const m of text.matchAll(ATTACHED_RE)) {
+    const raw = m[1].trim();
+    if (!raw) continue;
+    // Absolute path → a materialized upload, already shown via its file block.
+    if (isAbsolutePath(raw)) continue;
+    // Split a trailing ":start-end" line span back out so the chip can show
+    // it without truncation (it's the whole point of a partial-file attach).
+    const range = /^(.*):(\d+)-(\d+)$/.exec(raw);
+    if (range) {
+      out.push({
+        path: range[1],
+        isDir: false,
+        lineRange: { start: Number(range[2]), end: Number(range[3]) },
+      });
+    } else {
+      out.push({ path: raw.replace(/\/$/, ""), isDir: raw.endsWith("/") });
+    }
+  }
+  return out;
 }
 
 // Leading whitespace + the command token, so the composer overlay can tint
@@ -384,6 +467,27 @@ export function shouldShowAuthorBadge(
   return isSessionShared && author !== undefined && author !== viewerId;
 }
 
+/**
+ * Whether a submitted message should be queued rather than POSTed now.
+ *
+ * Queue when busy, or when this conversation already has a queued message even
+ * if it reads idle: the direct-send and queue-drain paths aren't ordered, so a
+ * later direct send could overtake a still-queued earlier one when status
+ * flickers idle mid-queue (cursor-native). A new chat always sends.
+ */
+export function shouldQueueSend(
+  conversationId: string | null,
+  status: "idle" | "streaming",
+  sessionStatus: SessionStatus,
+  queuedMessages: QueuedMessage[],
+): boolean {
+  if (conversationId === null) return false;
+  const isBusy =
+    status === "streaming" || sessionStatus === "running" || sessionStatus === "waiting";
+  const hasQueued = queuedMessages.some((m) => m.conversationId === conversationId);
+  return isBusy || hasQueued;
+}
+
 // Author labels render only in a shared session; ChatPage provides the
 // value and UserBubble reads it, so the gate lives in one place.
 const SessionSharedContext = createContext(false);
@@ -490,8 +594,8 @@ export function ChatPage() {
     isLoading: agentsLoading,
     error: agentsError,
     refetch: refetchAgents,
-  } = useAgents();
-  const { data: conversationsData } = useConversations();
+  } = useAgents({ enabled: !urlConvId });
+  const { data: conversationsData } = useConversations("", true);
   const conversations = useMemo(
     () => conversationsData?.pages.flatMap((p) => p.data),
     [conversationsData],
@@ -575,6 +679,7 @@ export function ChatPage() {
   useRefreshSessionStateOnRunnerOnline(urlConvId, runnerOnline);
   // OR'd into "Working…" so cross-client turns surface a shimmer.
   const sessionStatus = useChatStore((s) => s.sessionStatus);
+  const backgroundTaskCount = useChatStore((s) => s.backgroundTaskCount);
   const loadingConversation = useChatStore((s) => s.loadingConversation);
   const conversationLoadError = useChatStore((s) => s.conversationLoadError);
   const boundAgentId = useChatStore((s) => s.boundAgentId);
@@ -629,10 +734,9 @@ export function ChatPage() {
   // for legacy conversations without an agent binding — leave the
   // picker alone in those cases.
   //
-  // If the bound agent isn't in the cached list (e.g. a new agent was
-  // registered by a fresh `omnigent run` after the page loaded),
-  // refetch so the list stays current. staleTime: Infinity means the
-  // query won't self-update, so we do it manually on demand.
+  // On the landing page, if the bound agent isn't in the cached list
+  // (e.g. a new agent registered by a fresh `omnigent run` after load),
+  // refetch on demand — useAgents is only enabled there.
   useEffect(() => {
     if (boundAgentId === null) return;
     setSelectedAgentId(boundAgentId);
@@ -763,7 +867,11 @@ export function ChatPage() {
   // + shimmer/pill) for the main chat and is suppressed mid-elicitation or
   // when the runner is known offline.
   const isWorking = !hasPendingElicitation && computeIsWorking(sessionStatus);
-  const showsWorking = computeShowsWorking(sessionStatus, { hasPendingElicitation, runnerOnline });
+  const showsWorking = computeShowsWorking(sessionStatus, {
+    hasPendingElicitation,
+    runnerOnline,
+    backgroundTaskCount,
+  });
 
   // A fork of a coding session carries the source id in this label (set by
   // fork_conversation). It is provenance — it persists after the clone is
@@ -816,8 +924,20 @@ export function ChatPage() {
   // session, so a host-bound, host-down session whose host is a resumable
   // managed host classifies as `host_asleep` (composer open, send wakes it)
   // instead of dead-ending on `host_offline`.
+  //
+  // Also prefer the snapshot's `permissionLevel` over the sidebar row's when
+  // it's resolved: the hook derives `host_offline`'s `isOwner` from this
+  // level, and a deployment whose session list is owner-only (the caller's
+  // effective level omitted, e.g. the Databricks-managed server) leaves the
+  // row's `permission_level` null — which would read permissively as "owner"
+  // and offer a non-owner the host-reconnect path. The single-session
+  // snapshot always carries the authoritative level.
   const livenessRow: LivenessRow | null = activeConv
-    ? { ...activeConv, host_resumable: activeSession?.hostResumable ?? false }
+    ? {
+        ...activeConv,
+        permission_level: activeSession?.permissionLevel ?? activeConv.permission_level,
+        host_resumable: activeSession?.hostResumable ?? false,
+      }
     : livenessRowFromSession(activeSession);
   const liveness = useSessionLiveness(urlConvId ?? undefined, livenessRow, {
     turnActive: status === "streaming",
@@ -882,6 +1002,15 @@ export function ChatPage() {
     // a void.
     if (urlConvId && isUnreachable) {
       setReconnectDialogOpen(true);
+      return;
+    }
+    // Queue instead of POSTing now (see shouldQueueSend). enqueueMessage flushes
+    // FIFO immediately when genuinely idle, so nothing stalls.
+    const chat = useChatStore.getState();
+    if (
+      shouldQueueSend(chat.conversationId, chat.status, chat.sessionStatus, chat.queuedMessages)
+    ) {
+      chat.enqueueMessage(text, files);
       return;
     }
     void useChatStore.getState().send(text, agentId, files, {
@@ -992,7 +1121,7 @@ export function ChatPage() {
       modelPickerKind={modelPickerKind}
       codexModelOptions={codexModelOptions}
       showCodexPlanMode={shouldShowCodexPlanModeControl(capabilitySource)}
-      showCodexGoal={shouldShowCodexGoalControl(capabilitySource)}
+      showGoalControl={shouldShowGoalControl(capabilitySource)}
       costRoutingVerdict={costRoutingVerdict}
       costRoutingEligible={costRoutingEligible}
       subAgentLabel={subAgentLabel}
@@ -1054,6 +1183,10 @@ interface SessionLayoutProps {
  * Inside a conversation: wraps the chat surface. The terminals panel
  * and right rail are managed by AppShell and rendered outside this
  * component as flex siblings.
+ *
+ * The embedded browser pane is NOT here — it lives as the "Browser"
+ * tab inside the right Workspace rail (WorkspacePanel), so it never floats as a
+ * mid-page column.
  */
 function SessionLayout({ mainAgent }: SessionLayoutProps) {
   return (
@@ -1219,8 +1352,8 @@ interface MainAgentSurfaceProps {
   codexModelOptions: readonly CodexModelOption[];
   /** Show the Codex Plan-mode toggle. */
   showCodexPlanMode: boolean;
-  /** Show the Codex Goal control. */
-  showCodexGoal?: boolean;
+  /** Show the session Goal control. */
+  showGoalControl?: boolean;
   /** Latest advisor verdict for the cost-routing pill; null when none. */
   costRoutingVerdict: CostRoutingVerdict | null;
   /** Session passes `isCostRoutingSession` (polly orchestrator, not a child). */
@@ -1294,18 +1427,28 @@ function MainAgentSurface({
   modelPickerKind,
   codexModelOptions,
   showCodexPlanMode,
-  showCodexGoal = false,
+  showGoalControl = false,
   costRoutingVerdict,
   costRoutingEligible,
   subAgentLabel,
 }: MainAgentSurfaceProps) {
   const terminalFirst = useTerminalFirst();
+  // The turn rail is a hover minimap with no mobile affordance (CSS-hidden
+  // under `md`). Gate its MOUNT — not just its visibility — on the viewport so
+  // mobile never runs its eager history backfill (up to 2000 items/open) for a
+  // rail the user can't see.
+  const isMobileViewport = useIsMobileViewport();
   // Mirrors ChatPage's `sandboxLaunching`: while the managed-sandbox
   // launch runs, the composer must stay sendable — the server parks
   // the message on the launch rendezvous — even though liveness reads
   // the not-yet-host-bound session as stranded.
   const sandboxStatus = useChatStore((s) => s.sandboxStatus);
   const sandboxLaunching = sandboxStatus !== null && sandboxStatus.stage !== "failed";
+  // True while the harness reports MCP-server startup state (codex-native).
+  // Forces the message-flow branch below even with zero bubbles, so a user
+  // staring at a fresh session during a slow MCP boot sees the startup band
+  // instead of a bare "What should we work on?" empty state.
+  const mcpStartupActive = useChatStore((s) => s.mcpStartup !== null);
   // Render the inline terminal whenever the user has opted in via the
   // connection pill. The terminal surface owns its no-terminal state,
   // including stopped/resumable sessions, and the connection indicator
@@ -1330,6 +1473,40 @@ function MainAgentSurface({
     [bubbles],
   );
   const nav = useUserMessageNav(userMessageIds);
+
+  // One rail tick per real user turn, paired with a preview of the reply that
+  // followed. Walk bubbles in order: each non-system user bubble opens a turn,
+  // and the first assistant text after it (before the next user bubble) is the
+  // preview. Same first-page window as the transcript, so a fresh load shows
+  // ≤20 ticks and older ones page in on scroll-up.
+  const turns = useMemo<Turn[]>(() => {
+    const out: Turn[] = [];
+    for (let i = 0; i < bubbles.length; i++) {
+      const b = bubbles[i];
+      if (b.kind !== "user" || isSystemBubble(b)) continue;
+      let preview = "";
+      for (let j = i + 1; j < bubbles.length; j++) {
+        const next = bubbles[j];
+        // Stop at the next REAL user turn only. A system-marker user bubble
+        // isn't a tick of its own, so breaking on it would strand this turn
+        // with a blank preview even though its reply follows the marker.
+        if (next.kind === "user" && !isSystemBubble(next)) break;
+        if (next.kind === "assistant") {
+          const textItem = next.items.find((it) => it.kind === "text" && it.text.trim());
+          if (textItem && textItem.kind === "text") {
+            preview = textItem.text.trim();
+            break;
+          }
+        }
+      }
+      out.push({
+        itemId: b.itemId,
+        userText: extractUserText(b.content),
+        responsePreview: preview.slice(0, 240),
+      });
+    }
+    return out;
+  }, [bubbles]);
 
   // Pending elicitation cards float to the bottom of the chat: rendered as the
   // last items in the scroll flow and removed from their inline position so
@@ -1469,10 +1646,10 @@ function MainAgentSurface({
     [onSendSlashCommand, isNativeWrapper],
   );
 
-  // "Working…" is shown when the main session is busy, including after a
-  // reload that hydrates `running` before any bubbles exist locally. Streaming
-  // assistant content and compaction spinners own the in-progress slot once
-  // they have rendered.
+  // "Working…" stays lit for the whole busy turn — through streaming text,
+  // tool runs, and reasoning gaps — including after a reload that hydrates
+  // `running` before any bubbles exist locally. Only a trailing compaction
+  // spinner suppresses it (that bubble owns the slot with its own animation).
   const showWorkingIndicator = shouldShowWorkingIndicator(showsWorking, bubbles);
 
   if (showTerminal && conversationId) {
@@ -1505,10 +1682,13 @@ function MainAgentSurface({
             content dissolves into the canvas before reaching the
             ChatHeader overlay's controls (geometry in index.css). */}
         <Conversation className="chat-scroll-fade flex-1">
-          {/* gap-4 overrides ConversationContent's default gap-8 so consecutive agent turns read as one thread. */}
+          {/* gap-4 overrides ConversationContent's default gap-8 so consecutive agent turns read as one thread.
+              md:pl-12 opens a gap between the left-edge TurnRail (24px wide) and
+              the message column so the ticks don't butt against the text; the
+              rail is hidden on mobile, so the extra left padding is md-only. */}
           <ConversationContent
             className={cn(
-              "chat-conversation-content mx-auto w-full gap-4 pt-20 pb-6",
+              "chat-conversation-content mx-auto w-full gap-4 pt-20 pb-6 md:pl-12",
               CHAT_COLUMN_WIDTH,
             )}
           >
@@ -1520,7 +1700,7 @@ function MainAgentSurface({
               hasMoreHistory={hasMoreHistory}
               loadingMoreHistory={loadingMoreHistory}
             />
-            {bubbles.length === 0 && !showWorkingIndicator ? (
+            {bubbles.length === 0 && !showWorkingIndicator && !mcpStartupActive ? (
               // Cold launch: a centered spinner instead of the "ready to
               // type" empty state (the create-then-send path uses the
               // "row" variant). Two launch shapes land here: a
@@ -1571,24 +1751,12 @@ function MainAgentSurface({
                     </MessageContent>
                   </Message>
                 ))}
-                {/* Working… shimmer between send and first rendered block.
-                    Suppressed when the last bubble is a compaction spinner —
-                    that bubble already owns the "in-progress" slot. aria-hidden:
-                    the pinned pill owns the single aria-live region (see WorkingStatusPin). */}
-                {showWorkingIndicator && (
-                  <Message from="assistant" data-testid="working-indicator" aria-hidden="true">
-                    <MessageContent>
-                      {/* py-0.5 = headroom for the bob: MessageContent is overflow-hidden
-                          and would clip otto's head at the top of the bounce. */}
-                      <div className="flex items-center gap-1.5 py-0.5">
-                        <OttoIcon className="otto-working h-4 w-auto shrink-0" />
-                        <Shimmer className="text-xs font-mono" duration={1.5}>
-                          Working…
-                        </Shimmer>
-                      </div>
-                    </MessageContent>
-                  </Message>
-                )}
+                {/* Working… shimmer, lit for the whole busy turn so the user
+                    always sees the session is still going. Suppressed when the
+                    last bubble is a compaction spinner — that bubble already
+                    owns the "in-progress" slot. aria-hidden: the pinned pill
+                    owns the single aria-live region (see WorkingStatusPin). */}
+                {showWorkingIndicator && <WorkingIndicator />}
                 {/* Terminal-first spin-up cue beneath the just-sent first
                     message: the prompt bubble renders immediately (no
                     runner-online send gate), but `showWorkingIndicator` stays
@@ -1597,6 +1765,12 @@ function MainAgentSurface({
                     Self-gates to null off the spin-up window; rendered only
                     when not already showing Working… so the two never stack. */}
                 {!showWorkingIndicator && <RunnerStartingIndicator variant="row" />}
+                {/* MCP-server startup band (codex-native): renders while the
+                    harness boots its MCP servers and, after startup settles,
+                    when servers failed or were cancelled. Independent of the
+                    Working… shimmer — it is strictly more specific about why
+                    the turn hasn't produced output yet. */}
+                <McpStartupIndicator />
               </>
             )}
           </ConversationContent>
@@ -1621,6 +1795,19 @@ function MainAgentSurface({
           scroller={scroller}
           hasMoreHistory={hasMoreHistory}
         />
+        {/* Left-edge minimap: one tick per turn, scrolls independently, pages
+            in older history on scroll-up. Sibling of Conversation for the same
+            reason as JumpToTopButton — it escapes the chat-scroll-fade mask.
+            Desktop-only: not mounted on mobile so its eager backfill never
+            runs where the rail is hidden. */}
+        {!isMobileViewport && (
+          <TurnRail
+            turns={turns}
+            scroller={scroller}
+            hasMoreHistory={hasMoreHistory}
+            loadingMoreHistory={loadingMoreHistory}
+          />
+        )}
       </div>
       {/* Floating reply button — scoped to the conversation container. */}
       <SelectionPopup
@@ -1650,7 +1837,7 @@ function MainAgentSurface({
         modelPickerKind={modelPickerKind}
         codexModelOptions={codexModelOptions}
         showCodexPlanMode={showCodexPlanMode}
-        showCodexGoal={showCodexGoal}
+        showGoalControl={showGoalControl}
         isTerminalFirst={isTerminalFirst}
         isNativeWrapper={isNativeWrapper}
         reconnectHint={liveness.kind === "runner_asleep" || liveness.kind === "host_asleep"}
@@ -1727,7 +1914,15 @@ function ConversationLoadError({
 function UserMessageNavConnected(props: React.ComponentProps<typeof UserMessageNav>) {
   const { isAtBottom } = useStickToBottomContext();
   return (
-    <UserMessageNav {...props} className={cn(props.className, isAtBottom && "max-md:hidden")} />
+    <UserMessageNav
+      {...props}
+      // Mobile-only: the TurnRail (a hover minimap) replaces these buttons on
+      // desktop, but mobile has no hover, so the ↑↓ nav stays there. Hidden at
+      // the bottom on mobile too — nothing above to page up to matters less
+      // than keeping the composer area clear. Keyboard ⌘⌥↑↓ still works on all
+      // sizes regardless of the buttons.
+      className={cn(props.className, "md:hidden", isAtBottom && "max-md:hidden")}
+    />
   );
 }
 
@@ -1744,6 +1939,8 @@ function UserMessageNavConnected(props: React.ComponentProps<typeof UserMessageN
  */
 function WorkingStatusPin({ show, suppress = false }: { show: boolean; suppress?: boolean }) {
   const { isAtBottom } = useStickToBottomContext();
+  const bgCount = useChatStore((s) => s.backgroundTaskCount);
+  const tick = useWorkingLabelTick();
   const visible = show && !isAtBottom && !suppress;
   return (
     <div
@@ -1757,18 +1954,23 @@ function WorkingStatusPin({ show, suppress = false }: { show: boolean; suppress?
         visible ? "opacity-100" : "opacity-0",
       )}
     >
+      {/* The single announced string. Held stable at "Working…" so the rotating
+          tab text below never re-announces every few seconds. Present whenever
+          the agent is working, so it announces whether the tab is painted
+          (scrolled up) or collapsed (at the bottom, where the inline shimmer
+          owns the visuals). */}
+      {show && <span className="sr-only">Working…</span>}
       {/* Mirror the conversation content column (mx-auto + px-6 + width) so the
           tab's left edge lines up with the inline shimmer's. */}
       <div className={cn("mx-auto w-full px-6", CHAT_COLUMN_WIDTH)}>
-        {/* Gated on `show` (not `visible`) so the aria-live region always holds
-            the "Working…" text while the agent is working — that's what gets
-            announced. When at the bottom (`!visible`) the inline shimmer owns
-            the visuals, so the pill collapses to sr-only: still announced, but
-            not painted. Scrolled up, it renders as the visible tab. */}
         {show && (
           // Tab shape (rounded top, no bottom border, composer-matching bg) so
-          // its flat bottom edge merges into the chat box.
+          // its flat bottom edge merges into the chat box. aria-hidden: the
+          // sr-only span above owns the announcement, so the rotating label
+          // here stays silent to screen readers. Collapses to sr-only when at
+          // the bottom (`!visible`) — the inline shimmer paints there instead.
           <div
+            aria-hidden="true"
             className={cn(
               "flex w-fit items-center gap-1.5 rounded-t-lg border border-b-0 border-border bg-card px-3 pt-1 pb-1.5",
               !visible && "sr-only",
@@ -1776,7 +1978,7 @@ function WorkingStatusPin({ show, suppress = false }: { show: boolean; suppress?
           >
             <OttoIcon className="otto-working h-4 w-auto shrink-0" />
             <Shimmer className="text-xs font-mono" duration={1.5}>
-              Working…
+              {workingIndicatorLabel(bgCount, tick)}
             </Shimmer>
           </div>
         )}
@@ -2215,35 +2417,73 @@ function bubbleKey(bubble: Bubble): string {
 }
 
 /**
- * True when there's an assistant bubble whose stream is still in
- * progress (lifecycle "streaming", at least one item rendered). Used
- * to suppress the "Working…" shimmer once content starts arriving.
+ * Playful labels the idle-but-busy indicator rotates through (one per
+ * `ROTATE_MS`). Index 0 MUST stay "Working…": it's the label a fresh tick
+ * (and every unit test) lands on. Keep each entry a single short word +
+ * ellipsis — `Shimmer` scales its sweep width to the text length, so uniform
+ * lengths keep the animation steady across rotations.
  */
-function hasInProgressAssistantBubble(bubbles: Bubble[]): boolean {
-  return bubbles.some(
-    (b) => b.kind === "assistant" && b.lifecycle === "streaming" && b.items.length > 0,
+export const WORKING_MESSAGES = [
+  "Working…",
+  "Cooking…",
+  "Crunching…",
+  "Tinkering…",
+  "Pondering…",
+  "Brewing…",
+] as const;
+
+/**
+ * The label shown next to the working spinner. When background shells outlive
+ * the turn (`bgCount > 0`) it names how many are still running (the tick is
+ * ignored — that count is information, not decoration). Otherwise it rotates
+ * through `WORKING_MESSAGES` by wall-clock `tick`.
+ */
+export function workingIndicatorLabel(bgCount: number, tick = 0): string {
+  if (bgCount > 0) {
+    return bgCount === 1
+      ? "1 background task still running"
+      : `${bgCount} background tasks still running`;
+  }
+  return WORKING_MESSAGES[tick % WORKING_MESSAGES.length]!;
+}
+
+function WorkingIndicator() {
+  const bgCount = useChatStore((s) => s.backgroundTaskCount);
+  const tick = useWorkingLabelTick();
+  const label = workingIndicatorLabel(bgCount, tick);
+  return (
+    <Message from="assistant" data-testid="working-indicator" aria-hidden="true">
+      <MessageContent>
+        <div className="flex items-center gap-1.5 py-0.5">
+          <OttoIcon className="otto-working h-4 w-auto shrink-0" />
+          <Shimmer className="text-xs font-mono" duration={1.5}>
+            {label}
+          </Shimmer>
+        </div>
+      </MessageContent>
+    </Message>
   );
 }
 
 /**
  * Decide whether to render the main chat's "Working…" indicator.
  *
- * A reload can hydrate a custom-agent session as ``running`` before any
- * committed or pending bubble is available locally — keep the indicator
- * visible in that empty-but-busy state.
+ * Lit for the whole busy turn — through streaming text, tool runs, and
+ * reasoning gaps — so the user always sees the session is still going. A
+ * reload can hydrate a custom-agent session as ``running`` before any bubble
+ * exists locally; the indicator stays visible in that empty-but-busy state
+ * too.
  *
  * @param showsWorking - True when the session snapshot or local response
  *   state says the main session is still working.
  * @param bubbles - Rendered chat bubbles currently hydrated in the main
  *   session, e.g. assistant, user, or compaction-loading bubbles.
  * @returns True when the standalone working indicator should render; false
- *   when the session is idle, a streaming assistant bubble has rendered at
- *   least one item, or a compaction-loading bubble already represents the
- *   busy state.
+ *   when the session is idle, or a compaction-loading bubble is last and
+ *   already represents the busy state with its own animation.
  */
 export function shouldShowWorkingIndicator(showsWorking: boolean, bubbles: Bubble[]): boolean {
   if (!showsWorking) return false;
-  if (hasInProgressAssistantBubble(bubbles)) return false;
   return bubbles[bubbles.length - 1]?.kind !== "compaction_loading";
 }
 
@@ -2455,8 +2695,7 @@ export function RunnerStartingIndicator({ variant }: { variant: "hero" | "row" }
   if (sandboxLabel === undefined && !terminalSpinUp) {
     return null;
   }
-  const line =
-    sandboxLabel !== undefined ? `${sandboxLabel}…` : "Starting up… getting your terminal ready.";
+  const line = sandboxLabel !== undefined ? `${sandboxLabel}…` : "Starting up…";
   // role=status + aria-live so assistive tech announces the transient wait;
   // the spinner glyph itself is decorative (aria-hidden).
   if (variant === "hero") {
@@ -2470,7 +2709,7 @@ export function RunnerStartingIndicator({ variant }: { variant: "hero" | "row" }
         description={
           sandboxLabel !== undefined
             ? "Setting up your sandbox — this can take a minute."
-            : "Getting your terminal ready — this can take a few seconds."
+            : "This can take a few seconds."
         }
       />
     );
@@ -2486,6 +2725,92 @@ export function RunnerStartingIndicator({ variant }: { variant: "hero" | "row" }
         <span className="flex items-center gap-2 text-muted-foreground text-sm">
           <Loader2Icon className="size-4 shrink-0 animate-spin" aria-hidden />
           {line}
+        </span>
+      </MessageContent>
+    </Message>
+  );
+}
+
+// How many still-starting server names the startup band spells out
+// before collapsing the rest into "…" — mirrors the Codex TUI's own
+// startup header, and keeps a 20-server config to one line.
+const MCP_STARTING_NAMES_SHOWN = 3;
+// Cap for the settled warning's failed/cancelled name lists. Longer
+// than the starting cap because these name servers the user may need
+// to fix; beyond this the count carries the signal.
+const MCP_SETTLED_NAMES_SHOWN = 8;
+
+/**
+ * The startup band's in-flight line, mirroring the Codex TUI's header.
+ *
+ * @param starting Still-starting server names, sorted.
+ * @param total Total servers in the round.
+ * @returns e.g. `"Starting MCP servers (1/20): glean, jira, safe, …"`.
+ */
+export function mcpStartingLine(starting: string[], total: number): string {
+  if (total === 1 && starting.length === 1) {
+    return `Starting MCP server: ${starting[0]}…`;
+  }
+  const shown = starting.slice(0, MCP_STARTING_NAMES_SHOWN);
+  if (starting.length > MCP_STARTING_NAMES_SHOWN) shown.push("…");
+  return `Starting MCP servers (${total - starting.length}/${total}): ${shown.join(", ")}`;
+}
+
+/**
+ * A settled warning's name list, capped so the band stays scannable.
+ *
+ * @param names Failed or cancelled server names, sorted.
+ * @returns e.g. `"a, b, c, d, e, f, g, h, +12 more"`.
+ */
+export function mcpSettledNames(names: string[]): string {
+  if (names.length <= MCP_SETTLED_NAMES_SHOWN) return names.join(", ");
+  const shown = names.slice(0, MCP_SETTLED_NAMES_SHOWN);
+  return `${shown.join(", ")}, +${names.length - MCP_SETTLED_NAMES_SHOWN} more`;
+}
+
+/**
+ * Per-MCP-server startup band for native harness sessions (codex-native).
+ * Codex defers a mid-startup turn's execution until its MCP servers
+ * settle, and the session previously showed nothing during that window.
+ * Renders a spinner naming the still-starting servers; once startup
+ * settles with failures/cancellations, a one-line notice says which
+ * servers never came up. Self-gates to null when the store carries no
+ * startup state (an all-ready map is cleared by the store handler).
+ */
+export function McpStartupIndicator() {
+  const mcpStartup = useChatStore((s) => s.mcpStartup);
+  if (mcpStartup === null) return null;
+  const names = Object.keys(mcpStartup).sort();
+  const starting = names.filter((name) => mcpStartup[name].status === "starting");
+  if (starting.length > 0) {
+    return (
+      <Message
+        from="assistant"
+        data-testid="mcp-startup-indicator"
+        role="status"
+        aria-live="polite"
+      >
+        <MessageContent>
+          <span className="flex items-center gap-2 text-muted-foreground text-sm">
+            <Loader2Icon className="size-4 shrink-0 animate-spin" aria-hidden />
+            {mcpStartingLine(starting, names.length)}
+          </span>
+        </MessageContent>
+      </Message>
+    );
+  }
+  const failed = names.filter((name) => mcpStartup[name].status === "failed");
+  const cancelled = names.filter((name) => mcpStartup[name].status === "cancelled");
+  if (failed.length === 0 && cancelled.length === 0) return null;
+  const parts: string[] = [];
+  if (failed.length > 0) parts.push(`failed: ${mcpSettledNames(failed)}`);
+  if (cancelled.length > 0) parts.push(`cancelled: ${mcpSettledNames(cancelled)}`);
+  return (
+    <Message from="assistant" data-testid="mcp-startup-indicator" role="status">
+      <MessageContent>
+        <span className="flex items-center gap-2 text-muted-foreground text-sm">
+          <AlertTriangleIcon className="size-4 shrink-0" aria-hidden />
+          {`MCP startup incomplete (${parts.join("; ")})`}
         </span>
       </MessageContent>
     </Message>
@@ -2626,11 +2951,7 @@ function ConnectedTerminalFirstPill({
  */
 function isSystemBubble(bubble: Bubble): boolean {
   if (bubble.kind !== "user") return false;
-  const hasAttachments = bubble.content.some(
-    (c) => c.type === "input_image" || c.type === "input_file",
-  );
-  if (hasAttachments) return false;
-  return parseSystemMessage(extractUserText(bubble.content)) !== null;
+  return isSystemUserContent(bubble.content);
 }
 
 function CompactionLoadingIndicator() {
@@ -2677,11 +2998,11 @@ export const BubbleView = memo(
     if (bubble.kind === "compaction") return <CompactionMarker />;
     if (bubble.kind === "routing_decision") {
       return (
-        <RoutingDecisionChip
+        <RoutingDecisionCard
           model={bubble.model}
-          tier={bubble.tier}
           applied={bubble.applied}
           rationale={bubble.rationale}
+          agent={bubble.agent}
         />
       );
     }
@@ -2689,6 +3010,52 @@ export const BubbleView = memo(
   },
   (prev, next) => bubblesEqual(prev.bubble, next.bubble),
 );
+
+/**
+ * Copy-to-clipboard handler for a message bubble's "Copy" action.
+ *
+ * Uses the shared {@link copyText} helper (async Clipboard API with an
+ * `execCommand` fallback) rather than `navigator.clipboard.writeText`
+ * directly — the latter is undefined in the iOS webview and on non-secure
+ * origins, where a bare guard made the button silently no-op. Drives the
+ * inline check-icon confirmation for 2s, and on mobile (where the desktop
+ * hover affordance and tooltip aren't visible) also fires a toast so the
+ * copy is confirmed.
+ *
+ * @param getText - Produces the text to copy at click time.
+ * @returns `{ isCopied, handleCopy }` for the action button.
+ */
+function useCopyMessage(getText: () => string): {
+  isCopied: boolean;
+  handleCopy: () => void;
+} {
+  const [isCopied, setIsCopied] = useState(false);
+  const timeoutRef = useRef<number>(0);
+  const isMobile = useIsMobileViewport();
+
+  useEffect(() => () => window.clearTimeout(timeoutRef.current), []);
+
+  const handleCopy = useCallback(() => {
+    if (isCopied) return;
+    const text = getText();
+    if (!text) return;
+    copyText(text).then(
+      () => {
+        setIsCopied(true);
+        window.clearTimeout(timeoutRef.current);
+        timeoutRef.current = window.setTimeout(() => setIsCopied(false), 2000);
+        if (isMobile) {
+          showToast(<span className="text-sm">Copied to clipboard</span>, { duration: 1500 });
+        }
+      },
+      (error) => {
+        console.warn("Failed to copy message", error);
+      },
+    );
+  }, [getText, isCopied, isMobile]);
+
+  return { isCopied, handleCopy };
+}
 
 function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   const sessionId = useChatStore((s) => s.conversationId);
@@ -2707,11 +3074,15 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   const fileChips = bubble.content.filter(
     (c): c is Extract<MessageContentBlock, { type: "input_file" }> => c.type === "input_file",
   );
+  // "@"-mentioned workspace files/folders ride in as "[Attached: …]" text
+  // markers (no input_file block), so surface them as chips — otherwise the
+  // marker is stripped and the user can't see what they attached.
+  const mentionedChips = extractAttachedPaths(bubble.content);
   // Runtime-injected `[System: ...]` notifications (task completion,
   // timer firings, terminal idle) ride in on role=user. When the content
   // is a pure system marker — no attached images or files — swap the
   // normal bubble for a muted centered indicator.
-  if (images.length === 0 && fileChips.length === 0) {
+  if (images.length === 0 && fileChips.length === 0 && mentionedChips.length === 0) {
     const parsed = parseSystemMessage(text);
     if (parsed) return <SystemMessageView message={parsed} />;
   }
@@ -2721,6 +3092,8 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   const showAuthorBadge = shouldShowAuthorBadge(author, getCurrentAuthorId(), isSessionShared);
   // Equality selector so Zustand only re-renders the matching bubble.
   const flashing = useChatStore((s) => s.flashItemId === bubble.itemId);
+  const { isCopied, handleCopy } = useCopyMessage(() => text);
+
   return (
     <Message
       from="user"
@@ -2805,6 +3178,32 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
               ))}
             </div>
           )}
+          {/* "@"-mentioned workspace files/folders (delivered as text markers) */}
+          {mentionedChips.length > 0 && (
+            <div className="mb-1.5 flex flex-wrap gap-1.5">
+              {mentionedChips.map((item) => (
+                <span
+                  key={mentionItemPath(item)}
+                  className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-xs text-muted-foreground"
+                >
+                  {item.isDir ? (
+                    <FolderIcon className="size-3 shrink-0" />
+                  ) : (
+                    <FileTextIcon className="size-3 shrink-0" />
+                  )}
+                  <span className="max-w-[180px] truncate" title={mentionItemPath(item)}>
+                    @{item.path}
+                    {item.isDir ? "/" : ""}
+                  </span>
+                  {item.lineRange && (
+                    <span className="shrink-0">
+                      :{item.lineRange.start}-{item.lineRange.end}
+                    </span>
+                  )}
+                </span>
+              ))}
+            </div>
+          )}
           {/* Render user text as markdown, matching the assistant bubble
             (headings, lists, code fences, file-path links). `breaks` keeps
             single newlines as line breaks — users type multi-line messages
@@ -2814,6 +3213,13 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
           {text && <FilePathAwareMessageResponse breaks>{text}</FilePathAwareMessageResponse>}
         </MessageContent>
       </div>
+      {text && (
+        <MessageActions className="mt-1 ml-auto opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
+          <MessageAction tooltip="Copy" onClick={handleCopy}>
+            {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
+          </MessageAction>
+        </MessageActions>
+      )}
     </Message>
   );
 }
@@ -2824,8 +3230,10 @@ function AssistantBubble({ bubble }: { bubble: Extract<Bubble, { kind: "assistan
   // common case. The "Working…" shimmer for the empty-items / streaming
   // gap is rendered at the page level, not inside this component.
   const sessionStatus = useChatStore((s) => s.sessionStatus);
-  const [isCopied, setIsCopied] = useState(false);
-  const copyTimeoutRef = useRef<number>(0);
+  // Getter computes the markdown lazily at click time — the hook must run
+  // before the early return below (rules of hooks), but `markdownText` is
+  // derived after it.
+  const { isCopied, handleCopy } = useCopyMessage(() => collectBubbleMarkdown(bubble.items));
   // null outside AppShell's provider (isolated tests) → hide the action.
   const forkDialog = useForkDialog();
 
@@ -2837,18 +3245,6 @@ function AssistantBubble({ bubble }: { bubble: Extract<Bubble, { kind: "assistan
   // width to match the composer, not the default w-fit shrink-to-content.
   const hasElicitation = bubble.items.some((it) => it.kind === "elicitation");
   const isWide = hasElicitation || containsMarkdownTable(bubble.items);
-
-  const handleCopy = async () => {
-    if (!markdownText || !navigator?.clipboard?.writeText) return;
-    try {
-      await navigator.clipboard.writeText(markdownText);
-      setIsCopied(true);
-      window.clearTimeout(copyTimeoutRef.current);
-      copyTimeoutRef.current = window.setTimeout(() => setIsCopied(false), 2000);
-    } catch {
-      // ignore clipboard errors
-    }
-  };
 
   return (
     <>
@@ -2948,8 +3344,8 @@ interface ComposerProps {
   codexModelOptions: readonly CodexModelOption[];
   /** Show the Codex Plan-mode toggle. */
   showCodexPlanMode: boolean;
-  /** Show the Codex Goal control. */
-  showCodexGoal?: boolean;
+  /** Show the session Goal control. */
+  showGoalControl?: boolean;
   /**
    * Terminal-first session (Chat/Terminal pill present). Presentation
    * only: tightens the composer's bottom padding to `pb-1.5` so it sits
@@ -3176,13 +3572,15 @@ export function composerHarnessLabel(
   modelPickerKind: NativeModelPickerKind | null,
   agentName: string | null | undefined,
   sessionHarness: string | null,
+  harnessLabels: Record<string, string> = BRAIN_HARNESS_LABELS,
 ): string | null {
   if (modelPickerKind === "claude") return "Claude";
   if (modelPickerKind === "codex") return "Codex";
   if (modelPickerKind === "cursor") return "Cursor";
+  if (modelPickerKind === "kiro") return "Kiro";
   if (modelPickerKind === "opencode") return "OpenCode";
   const display = agentName ? agentDisplayLabel(agentName) : null;
-  const harness = sessionHarness ? (BRAIN_HARNESS_LABELS[sessionHarness] ?? null) : null;
+  const harness = sessionHarness ? (harnessLabels[sessionHarness] ?? null) : null;
   if (display && harness) return `${display} (${harness})`;
   return display ?? harness;
 }
@@ -3201,10 +3599,12 @@ export function composerHarnessLabel(
  */
 function ComposerStatusLine({
   harnessLabel,
-  codexGoal,
+  goal,
+  isSubAgentSession,
 }: {
   harnessLabel: string | null;
-  codexGoal: CodexGoal | null;
+  goal: Goal | null;
+  isSubAgentSession: boolean;
 }) {
   const conversationId = useChatStore((s) => s.conversationId);
   const contextWindow = useChatStore((s) => s.contextWindow);
@@ -3216,12 +3616,18 @@ function ComposerStatusLine({
   const gitBranch = useChatStore((s) => s.gitBranch);
 
   const showBranch = !!conversationId && !!gitBranch;
+  // Host indicator (green/red dot + host name), left of the worktree branch.
+  // Hidden on sub-agent sessions — the header's child-session slot owns the
+  // back affordance there, mirroring where this badge used to live. HostBadge
+  // self-hides when the session isn't host-bound, so this is a visibility gate,
+  // not a host-presence claim.
+  const showHost = !!conversationId && !isSubAgentSession;
   // The harness/agent identity (e.g. "Claude", "Polly (Pi)") lives here now;
   // the picker trigger above owns the model/effort label since it's the
   // control that changes them.
   const showHarness = !!conversationId && harnessLabel !== null;
   const showPlanMode = !!conversationId && codexPlanMode;
-  const showGoal = !!conversationId && codexGoal != null;
+  const showGoal = !!conversationId && goal != null;
   // contextWindow > 0: the SSE path validates it but the snapshot path doesn't, and 0/0 → "NaN%".
   const showRing =
     !!conversationId && contextWindow != null && contextWindow > 0 && tokensUsed != null;
@@ -3243,19 +3649,20 @@ function ComposerStatusLine({
         CHAT_COLUMN_WIDTH,
       )}
     >
-      {/* Left: worktree branch. Always holds the flex-1 slot so the
-          right cluster stays pinned right even with no branch, and
-          truncates to an ellipsis so the tray never wraps. */}
-      <span className="flex min-w-0 flex-1 items-center gap-1.5 text-xs text-muted-foreground">
+      {/* Left: host badge then worktree branch. Always holds the flex-1 slot
+          so the right cluster stays pinned right even when both are absent;
+          each item truncates to an ellipsis so the tray never wraps. */}
+      <div className="flex min-w-0 flex-1 items-center gap-3 text-xs text-muted-foreground">
+        {showHost && conversationId && <HostBadge sessionId={conversationId} />}
         {showBranch && (
-          <>
+          <span className="flex min-w-0 items-center gap-1.5">
             <GitBranchIcon className="size-3.5 shrink-0" />
             <span data-testid="composer-git-branch" className="min-w-0 truncate" title={gitBranch}>
               {gitBranch}
             </span>
-          </>
+          </span>
         )}
-      </span>
+      </div>
       {/* Right: model/effort and context ring, never shrinks. */}
       <div className="flex min-w-0 shrink-0 items-center gap-3">
         {showPlanMode && (
@@ -3267,7 +3674,7 @@ function ComposerStatusLine({
             <span>Plan mode</span>
           </span>
         )}
-        {showGoal && codexGoal && <CodexGoalStatusPill goal={codexGoal} />}
+        {showGoal && goal && <GoalStatusPill goal={goal} />}
         {showHarness && harnessLabel && (
           <span
             data-testid="composer-harness"
@@ -3380,7 +3787,7 @@ export function Composer({
   modelPickerKind,
   codexModelOptions,
   showCodexPlanMode,
-  showCodexGoal = false,
+  showGoalControl = false,
   isTerminalFirst = false,
   isNativeWrapper = false,
   reconnectHint = false,
@@ -3400,6 +3807,19 @@ export function Composer({
   // opens with matches the reset logic below pre-selects the first item (0)
   // so Tab/Enter complete it immediately.
   const [menuIndex, setMenuIndex] = useState(-1);
+  // Active "@"-file-mention being typed, plus its highlighted row and the
+  // workspace paths the user has already tagged. ``@``-mention is wired for
+  // the native coding-agent sessions (see ``mentionEnabled``): those harnesses
+  // run in the workspace and read a file from an "[Attached: …]" marker, so a
+  // tagged path is delivered by prepending that marker at send time — no
+  // upload, the agent reads the on-disk file directly.
+  // Active "@"-mention token (owned here; the shared useMentionBrowser hook
+  // owns the selection index, tagged chips, and attach/drill/keyboard glue).
+  const [mention, setMention] = useState<MentionState | null>(null);
+  // Attachments pushed in from outside the composer (e.g. the file viewer's
+  // "Attach to agent" button). Drained into ``mentionedItems`` below, then
+  // cleared from the store so they aren't re-applied.
+  const pendingComposerAttachments = useChatStore((s) => s.pendingComposerAttachments);
   // Nonce bumped when bare "/model" is submitted; opens the AgentPicker
   // dropdown instead of sending (see submit()).
   const [pickerOpenNonce, setPickerOpenNonce] = useState(0);
@@ -3410,6 +3830,7 @@ export function Composer({
   // `/skill` token stays aligned once the draft grows past the visible rows.
   const backdropRef = useRef<HTMLDivElement>(null);
   const isStreaming = status === "streaming";
+
   // Read-only when either the user lacks a write grant OR the session
   // is structurally non-interactive (``readOnlyReason``). The
   // structural reason takes priority for the placeholder text since it
@@ -3438,6 +3859,7 @@ export function Composer({
   // picker trigger owns model/effort now, so the identity moves here.
   const sessionHarness = useChatStore((s) => s.sessionHarness);
   const subAgentName = useChatStore((s) => s.subAgentName);
+  const brainHarnessLabels = useBrainHarnessLabels();
   const harnessLabel = composerHarnessLabel(
     modelPickerKind,
     // For a sub-agent (head) session, identify the head family being viewed
@@ -3448,6 +3870,7 @@ export function Composer({
       agents?.[0]?.name ??
       null,
     sessionHarness,
+    brainHarnessLabels,
   );
 
   // Preserve unsent text + file attachments per session so switching
@@ -3455,10 +3878,50 @@ export function Composer({
   // module scope (not useRef) because Composer unmounts during the
   // loading gate between session switches.
   const conversationId = useChatStore((s) => s.conversationId);
-  const { goal: codexGoal, setGoal: setCodexGoal } = useCodexGoalState(
+  const queuedMessages = useChatStore((s) => s.queuedMessages);
+  const sessionStatus = useChatStore((s) => s.sessionStatus);
+  const flushBoundAgentId = useChatStore((s) => s.boundAgentId);
+  const maybeFlushQueuedHead = useChatStore((s) => s.maybeFlushQueuedHead);
+  const dequeueMessage = useChatStore((s) => s.dequeueMessage);
+  const steerMessage = useChatStore((s) => s.steerMessage);
+  const reorderQueuedMessage = useChatStore((s) => s.reorderQueuedMessage);
+  // Drain the queue whenever idle with a waiting head — level-triggered so a
+  // message queued right after the turn ended (or after an SSE reconnect that
+  // carries no fresh idle transition) still sends instead of stranding. Hold
+  // while unreachable: flushing would POST into a void (no executor / no host
+  // to wake), bypassing onSend's reconnect dialog. The next reachable render
+  // re-fires this effect and drains. `boundAgentId` is a dep because the flush
+  // needs it: on navigate-back the binding lands after the status settles, and
+  // without this dep the effect wouldn't re-fire to drain a queue for the
+  // returned-to conversation.
+  useEffect(() => {
+    if (unreachable) return;
+    maybeFlushQueuedHead();
+  }, [
+    status,
+    sessionStatus,
+    queuedMessages,
     conversationId,
-    showCodexGoal,
-  );
+    flushBoundAgentId,
+    unreachable,
+    maybeFlushQueuedHead,
+  ]);
+  const { goal, setGoal: setGoalState } = useGoalState(conversationId, showGoalControl);
+  // "@"-file-mention is scoped to the native coding-agent harnesses: their
+  // vendor CLIs run in the workspace and read an on-disk file from an
+  // attachment marker the executor already emits. In-process SDK sessions
+  // get no mention menu, so the workspace listing is never fetched for them
+  // (``enabled`` gate below). Codex's marker says "Attached file:" while the
+  // others say "Attached:" — see ``mentionMarkerFor``. ``sessionHarness`` is
+  // already read above for the status-tray harness label.
+  // Derive from the canonical native-agent registry (which folds reversed
+  // spellings like ``native-pi``) rather than a literal harness-string compare,
+  // so the composer's "@" entry point can't split-brain from the file viewer's
+  // "Attach to agent" gate (``canAttachToAgent``), which already uses it.
+  const mentionEnabled = nativeCodingAgentForHarness(sessionHarness) !== undefined;
+  const workspaceFilesQuery = useWorkspaceAllFiles(conversationId ?? undefined, {
+    enabled: mentionEnabled,
+  });
   const valueRef = useRef(value);
   valueRef.current = value;
   const filesRef = useRef(files);
@@ -3554,8 +4017,6 @@ export function Composer({
   // Tint the `/skill` token blue while the draft reads as a slash command, so
   // the command shape is signalled as the user types it.
   const composerIsCommand = files.length === 0 && isSlashCommandText(value);
-  const hasDraft = value.trim().length > 0 || files.length > 0;
-  const showInterruptButton = isWorking && !hasDraft;
   const toggleCodexPlanMode = async () => {
     if (planModeBusy) return;
     setCommandError(null);
@@ -3589,6 +4050,100 @@ export function Composer({
     prevMenuMatchesRef.current = menuMatches;
     setMenuIndex(menuMatches.length > 0 ? 0 : -1);
   }
+
+  // "@"-mention is a drill-down file/folder browser. The token after "@"
+  // doubles as a path: text up to the last "/" is the directory being
+  // browsed; text after it filters that directory's entries. Opening a
+  // folder rewrites the token to "<dir>/" so the menu re-lists it — that
+  // is how nested files are reached (recursion via navigation, mirroring
+  // the terminal's git-tracked walk). At any level the user can attach a
+  // single file or the whole folder.
+  const { dir: mentionDir, filter: mentionFilter } = parseMentionToken(mention?.query ?? "");
+  // Root listing reuses the gate's useWorkspaceAllFiles; a sub-directory
+  // uses the lazy per-dir hook (disabled — null path — at the root). Both
+  // return files AND directories with a ``type`` discriminator.
+  const mentionDirQuery = useWorkspaceDirectory(
+    conversationId ?? undefined,
+    mentionEnabled && mention && mentionDir ? mentionDir : null,
+  );
+  const mentionSourceEntries: WorkspaceFile[] = mentionDir
+    ? (mentionDirQuery.data ?? [])
+    : (workspaceFilesQuery.data?.data ?? []);
+  // Folders first, filtered by the typed segment, capped (see rankMentionEntries).
+  const mentionEntries: WorkspaceFile[] =
+    mentionEnabled && mention ? rankMentionEntries(mentionSourceEntries, mentionFilter) : [];
+  // True while a mention token is active but its listing hasn't resolved yet:
+  // the cold-boot root fetch, or a sub-directory's first load after drilling
+  // in. During this window ``mentionEntries`` is transiently empty (so the
+  // menu is closed), and a stray Enter must NOT fall through to ``submit`` and
+  // send the half-typed "@dir/" token as a chat message. A *settled*
+  // zero-match (e.g. "@notafile") is deliberately excluded — sending that
+  // literally is the user's intent.
+  const mentionListingPending =
+    mentionEnabled &&
+    mention != null &&
+    (mentionDir ? mentionDirQuery.isLoading : workspaceFilesQuery.isLoading);
+
+  // Shared selection/chip/keyboard glue (see useMentionBrowser). The token
+  // state and the data source above stay here; everything stateful is shared
+  // so this composer and the launcher can't drift. ``setText`` also flags the
+  // draft dirty so attach/drill participate in draft persistence.
+  const {
+    mentionIndex,
+    mentionOpen,
+    mentionedItems,
+    setMentionedItems,
+    attachMention,
+    openMentionDir,
+    removeMentionedItem,
+    handleKeyDown: handleMentionKeyDown,
+    dismiss: dismissMention,
+  } = useMentionBrowser({
+    mention,
+    setMention,
+    mentionEntries,
+    text: value,
+    setText: (next) => {
+      setValue(next);
+      dirtyRef.current = true;
+    },
+    textareaRef,
+    isMobile,
+  });
+
+  // Depends on mentionedItems (from the hook above), so it's computed here.
+  const hasDraft = value.trim().length > 0 || files.length > 0 || mentionedItems.length > 0;
+  const showInterruptButton = isWorking && !hasDraft;
+
+  // Drain externally-queued attachments (file viewer "Attach to agent") into
+  // the local mention chips, deduping against what's already tagged, then
+  // clear the store queue so they aren't re-applied. Placed after
+  // ``useMentionBrowser`` since it owns ``setMentionedItems``.
+  useEffect(() => {
+    if (pendingComposerAttachments.length === 0) return;
+    setMentionedItems((prev) => {
+      // Dedup against already-tagged chips AND within this batch (accumulate
+      // into ``seen`` as we go) so a duplicated queue can't double-apply.
+      const seen = new Set(prev.map(composerAttachmentKey));
+      const fresh: MentionItem[] = [];
+      for (const a of pendingComposerAttachments) {
+        const k = composerAttachmentKey(a);
+        if (seen.has(k)) continue;
+        seen.add(k);
+        fresh.push(a);
+      }
+      return fresh.length > 0 ? [...prev, ...fresh] : prev;
+    });
+    useChatStore.getState().clearPendingComposerAttachments();
+    textareaRef.current?.focus();
+    // Defense-in-depth against the cross-session leak: if the composer unmounts
+    // while an entry is still queued (route change, panel close, the
+    // loading-conversation gate during a session switch), clear the queue so
+    // the next-mounted composer doesn't drain a stale chip. ``switchTo`` also
+    // resets the queue, but this closes the non-switch unmount paths too.
+    return () => useChatStore.getState().clearPendingComposerAttachments();
+    // setMentionedItems is a stable useState setter (from useMentionBrowser).
+  }, [pendingComposerAttachments, setMentionedItems]);
 
   /**
    * Execute a slash command by name + optional argument string.
@@ -3743,6 +4298,9 @@ export function Composer({
     if (accepted.length > 0) {
       setFiles((prev) => [...prev, ...accepted]);
       dirtyRef.current = true;
+      // Return focus to the composer so the user can keep typing right
+      // after attaching (the file picker / paperclip button steals it).
+      if (!isMobileRef.current) textareaRef.current?.focus();
     }
     setAttachmentError(errors.length > 0 ? errors.join("\n") : null);
   };
@@ -3783,8 +4341,13 @@ export function Composer({
 
   const submit = () => {
     const trimmed = value.trim();
-    // Allow send if there's text OR attached files.
-    if ((!trimmed && files.length === 0) || disabled || hasPendingElicitation) return;
+    // Allow send if there's text, attached files, OR "@"-tagged paths.
+    if (
+      (!trimmed && files.length === 0 && mentionedItems.length === 0) ||
+      disabled ||
+      hasPendingElicitation
+    )
+      return;
 
     // Slash command path: the first token must read as "/name" (the shared
     // isSlashCommandText guard — file paths like "/Users/foo/bar.txt" don't
@@ -3796,7 +4359,7 @@ export function Composer({
     // Anything else (unknown command, or a skill on a native-terminal
     // session where ``onSendSlashCommand`` is undefined) falls through to the
     // plaintext send path below.
-    if (isSlashCommandText(trimmed) && files.length === 0) {
+    if (isSlashCommandText(trimmed) && files.length === 0 && mentionedItems.length === 0) {
       const parts = trimmed.split(/\s+/);
       const cmd = parts[0].toLowerCase();
       const arg = parts[1] ?? "";
@@ -3807,13 +4370,15 @@ export function Composer({
       // the user choose there. "/model <name>" takes the builtin route below to
       // setModel — the same write the picker makes.
       //
-      // opencode is excluded: it surfaces showModels (the pill mirrors its live
-      // TUI model) but ships no web model options, so intercepting bare "/model"
-      // would pop an empty dropdown and swallow the command. Fall through to the
-      // builtin "/model" handler below, which surfaces the current model as a
-      // read-only hint. ("/model <name>" still routes to setModel there —
-      // opencode reads model_override on the next web-injected turn.)
-      if (cmd === "/model" && !arg && showModels && modelPickerKind !== "opencode") {
+      // opencode-native now surfaces server-backed model options too, so bare
+      // "/model" opens the picker when options are loaded. When the options are
+      // still empty (e.g. the runner catalog hasn't arrived yet), fall through
+      // to the builtin "/model" handler, which surfaces the current model as a
+      // read-only hint instead of popping an empty dropdown. ("/model <name>"
+      // still routes to setModel there — opencode reads model_override on the
+      // next web-injected turn.)
+      const canOpenModelPicker = modelPickerKind !== "opencode" || codexModelOptions.length > 0;
+      if (cmd === "/model" && !arg && showModels && canOpenModelPicker) {
         dirtyRef.current = true;
         setValue("");
         setCommandError(null);
@@ -3857,7 +4422,14 @@ export function Composer({
             )
             .join("\n\n") + "\n\n"
         : "";
-    const messageText = quotePreamble + trimmed;
+    // Prepend each "@"-tagged path as an attachment marker on its own line —
+    // the same format the native executors emit for attachments and that
+    // title-seeding strips (_ATTACHMENT_MARKER_RE). Wording is harness-aware
+    // (codex says "Attached file:"). Folders carry a trailing "/" so the
+    // agent knows to open the directory. The native vendor reads the on-disk
+    // workspace file/folder from this marker; no upload happens.
+    const messageText =
+      buildMentionPreamble(mentionedItems, sessionHarness) + quotePreamble + trimmed;
     // Sending while a prior response is streaming is fine — the
     // server queues the message and delivers it to the running task
     // (or starts a fresh one once the current drains). Escape still
@@ -3868,6 +4440,8 @@ export function Composer({
     setValue("");
     setFiles([]);
     setAttachmentError(null);
+    setMentionedItems([]);
+    setMention(null);
     onClearAllQuotes();
   };
 
@@ -3896,6 +4470,11 @@ export function Composer({
     if (isImeCompositionKeyEvent(e, isComposingRef.current)) {
       return;
     }
+
+    // "@"-mention menu navigation (shared useMentionBrowser) — mutually
+    // exclusive with the slash menu below (a mention token can't also read as a
+    // "/"-command). Takes priority over history recall and submission.
+    if (handleMentionKeyDown(e)) return;
 
     // When the suggestions menu is open, ArrowUp/Down navigate it and
     // Enter/Tab complete the highlighted item. These take priority over
@@ -3929,6 +4508,10 @@ export function Composer({
     // newline (no Shift available on-screen) and Send must be tapped instead.
     if (e.key === "Enter" && !e.shiftKey && !isMobile && !e.nativeEvent.isComposing) {
       e.preventDefault();
+      // The mention menu is briefly closed while its listing loads (see
+      // ``mentionListingPending``); swallow Enter so the in-progress "@dir/"
+      // token isn't sent as a chat message. The menu reopens when entries land.
+      if (mentionListingPending) return;
       submit();
       return;
     }
@@ -4009,6 +4592,28 @@ export function Composer({
           }
         }}
       />
+      {/* Queued messages — peeks above the card like the sub-agent tray.
+          Lists follow-ups held while the agent is busy; drains FIFO on idle.
+          Scope to this conversation so a queue held elsewhere never leaks in. */}
+      <QueuedMessagesStrip
+        messages={queuedMessages.filter((m) => m.conversationId === conversationId)}
+        onDelete={dequeueMessage}
+        onEdit={(queueId) => {
+          // Pull the queued message back into the composer for editing:
+          // replace the composer's text + attachments with the queued
+          // message's, remove it from the queue, and focus the textarea.
+          // Re-sending re-queues it (busy) or sends it (idle).
+          const target = queuedMessages.find((m) => m.queueId === queueId);
+          if (!target) return;
+          setValue(target.text);
+          setFiles(target.files ?? []);
+          dequeueMessage(queueId);
+          textareaRef.current?.focus();
+        }}
+        onSteer={(queueId) => steerMessage(queueId)}
+        onReorder={reorderQueuedMessage}
+        widthClassName={CHAT_COLUMN_WIDTH}
+      />
       {/* Sub-agent context tray — peeks above the card; reserves its own
           layout slot so the card sits below it (see SubagentComposerTray).
           Truthy (not just non-null) so an empty label never peeks a
@@ -4047,6 +4652,19 @@ export function Composer({
             activeIndex={menuIndex}
             onSelect={applyMenuSelection}
             commands={slashCommands}
+          />
+        )}
+        {/* "@"-file-mention browser — native coding-agent sessions only.
+            Also shown (as a loading row) while the listing is still fetching,
+            so "@" isn't silently dead during runner cold-boot or a drill-in. */}
+        {(mentionOpen || mentionListingPending) && (
+          <FileMentionMenu
+            currentDir={mentionDir}
+            activeIndex={mentionIndex}
+            entries={mentionEntries}
+            loading={mentionListingPending}
+            onOpenDir={openMentionDir}
+            onAttach={attachMention}
           />
         )}
         {/* Quote chips — one per quoted selection, shown above the textarea */}
@@ -4104,6 +4722,16 @@ export function Composer({
               setValue(e.target.value);
               dirtyRef.current = true;
               if (commandError !== null) setCommandError(null);
+              // Recompute the active "@"-mention from the caret on every
+              // keystroke (native coding-agent sessions — ``mentionEnabled``).
+              setMention(
+                mentionEnabled
+                  ? detectMentionAt(
+                      e.target.value,
+                      e.target.selectionStart ?? e.target.value.length,
+                    )
+                  : null,
+              );
               // Treat user-driven changes as exiting recall mode. Recall-
               // driven setValue toggles `recallingRef` first so we skip the
               // reset for that one tick.
@@ -4117,6 +4745,14 @@ export function Composer({
               isComposingRef.current = false;
             }}
             onKeyDown={handleKeyDown}
+            onBlur={() => {
+              // Dismiss the "@"-mention menu when focus leaves the textarea
+              // (clicking a chip's ✕, the Send button, or another field).
+              // Menu rows ``preventDefault`` on mousedown so selecting an entry
+              // keeps focus and does NOT blur — this only fires for genuine
+              // focus-out, where the lingering menu would otherwise float.
+              dismissMention();
+            }}
             onPaste={handlePaste}
             onScroll={(e) => {
               // Keep the overlay's scroll position locked to the textarea's.
@@ -4183,6 +4819,41 @@ export function Composer({
         {attachmentError !== null && (
           <div className="px-4 pb-2 text-xs text-destructive whitespace-pre-wrap">
             {attachmentError}
+          </div>
+        )}
+        {/* "@"-mention chips — one per tagged workspace file/folder. Each is
+            delivered as a "[Attached: <path>]" marker at send time. */}
+        {mentionedItems.length > 0 && (
+          <div className="flex flex-wrap gap-1.5 px-4 pb-2">
+            {mentionedItems.map((item, i) => (
+              <span
+                key={mentionItemPath(item)}
+                className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-xs text-muted-foreground"
+              >
+                {item.isDir ? (
+                  <FolderIcon className="size-3 shrink-0" />
+                ) : (
+                  <FileTextIcon className="size-3 shrink-0" />
+                )}
+                <span className="max-w-[200px] truncate" title={mentionItemPath(item)}>
+                  @{item.path}
+                  {item.isDir ? "/" : ""}
+                </span>
+                {item.lineRange && (
+                  <span className="shrink-0">
+                    :{item.lineRange.start}-{item.lineRange.end}
+                  </span>
+                )}
+                <button
+                  type="button"
+                  onClick={() => removeMentionedItem(i)}
+                  className="ml-0.5 rounded-full hover:text-foreground"
+                  aria-label={`Remove ${item.path}`}
+                >
+                  <XIcon className="size-3" />
+                </button>
+              </span>
+            ))}
           </div>
         )}
         {/* Inline slash-command feedback: errors and /help output */}
@@ -4264,12 +4935,13 @@ export function Composer({
                 </TooltipContent>
               </Tooltip>
             )}
-            {showCodexGoal && (
-              <CodexGoalControl
+            {showGoalControl && (
+              <GoalControl
                 conversationId={conversationId}
                 readOnly={isReadOnly}
-                goal={codexGoal}
-                onGoalChange={setCodexGoal}
+                goal={goal}
+                onGoalChange={setGoalState}
+                backendLabel="Codex"
               />
             )}
             <AgentPicker
@@ -4315,7 +4987,11 @@ export function Composer({
           </div>
         </div>
       </div>
-      <ComposerStatusLine harnessLabel={harnessLabel} codexGoal={codexGoal} />
+      <ComposerStatusLine
+        harnessLabel={harnessLabel}
+        goal={goal}
+        isSubAgentSession={subAgentLabel != null}
+      />
     </form>
   );
 }
@@ -4336,17 +5012,35 @@ export function computeIsWorking(sessionStatus: SessionStatus): boolean {
  * @param options.hasPendingElicitation - ``true`` when an elicitation prompt
  *   owns the in-progress slot and should suppress the shimmer/pinned pill.
  * @param options.runnerOnline - Runner liveness: ``true`` online, ``false``
- *   known offline, ``undefined`` before the health poll resolves. Only known
- *   offline suppresses the indicator.
+ *   known offline, ``undefined`` before the health poll resolves. A known-offline
+ *   runner suppresses the indicator ONLY when the session is otherwise idle: a
+ *   session actively reporting ``running``/``waiting`` cannot have an offline
+ *   runner, so its live status wins over the ``/health`` poll — which polls at a
+ *   10s cadence and reads stale-offline during the runner's connect window on a
+ *   fresh session's first turn (it would otherwise hide "Working…" for seconds).
+ * @param options.backgroundTaskCount - Background shells still running after
+ *   the turn ended. A claude-native turn settles to ``idle`` (the PTY-activity
+ *   watcher's edge) even while shells run, so the bare status alone would hide
+ *   the indicator; a positive count keeps it lit so "N background tasks still running"
+ *   stays visible.
  * @returns ``true`` when the main session's own status should render Working.
  */
 export function computeShowsWorking(
   sessionStatus: SessionStatus,
-  options: { hasPendingElicitation: boolean; runnerOnline: boolean | undefined },
+  options: {
+    hasPendingElicitation: boolean;
+    runnerOnline: boolean | undefined;
+    backgroundTaskCount?: number;
+  },
 ): boolean {
-  if (options.runnerOnline === false) return false;
   if (options.hasPendingElicitation) return false;
-  return computeIsWorking(sessionStatus);
+  const isWorking = computeIsWorking(sessionStatus);
+  // A running/waiting session is proof the runner is up, so a stale
+  // poll-derived ``runnerOnline === false`` must not suppress it. Only gate on
+  // known-offline for the not-actively-working case (e.g. a background-shell
+  // tally on an idle session).
+  if (options.runnerOnline === false && !isWorking) return false;
+  return isWorking || (options.backgroundTaskCount ?? 0) > 0;
 }
 
 /**
@@ -4481,7 +5175,7 @@ const EFFORT_LEVELS = ["low", "medium", "high"] as const;
 /** Anthropic-side efforts for claude-native sessions (matches ANTHROPIC_EFFORTS in reasoning_effort.py). */
 const CLAUDE_NATIVE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
 
-type NativeModelPickerKind = "claude" | "codex" | "cursor" | "opencode";
+type NativeModelPickerKind = "claude" | "codex" | "cursor" | "kiro" | "opencode" | "pi";
 
 type LabelSource = { labels?: Record<string, string | null> | null } | null | undefined;
 
@@ -4545,11 +5239,22 @@ export function modelPickerKindForConv(
       return "codex";
     case "cursor-native-ui":
       return "cursor";
+    case "kiro-native-ui":
+      // Launch-only model selection: kiro applies ``--model`` at launch. Unlike
+      // cursor/opencode there is no terminal->web model mirror, so the picker
+      // reflects the pre-launch ``model_override`` selection.
+      return "kiro";
     case "opencode-native-ui":
       // Like cursor: a vendor-owns-model wrapper that mirrors its live TUI
       // model into the session ``model_override`` (the forwarder's terminal→web
       // mirror), so the picker surfaces that as the live model.
       return "opencode";
+    case "pi-native-ui":
+      // Like cursor: the runner types a model switch into the live Pi process
+      // (via the bridge inbox → Pi's ``setModel``) and Pi mirrors its own
+      // ``/model`` picks back to ``model_override`` via the extension's
+      // model_select handler, so the picker surfaces that as the live model.
+      return "pi";
     default:
       return null;
   }
@@ -4581,13 +5286,14 @@ export function shouldShowCodexPlanModeControl(
 }
 
 /**
- * True when the Codex Goal control should be visible.
+ * True when the session Goal control should be visible.
  *
  * @param conv - Session or sidebar row carrying labels. ``null`` or missing
  *   labels fail closed.
- * @returns True only for Codex-native wrapper sessions.
+ * @returns True only for Codex-native wrapper sessions until the server
+ *   advertises a generic goal capability.
  */
-export function shouldShowCodexGoalControl(
+export function shouldShowGoalControl(
   conv: { labels?: Record<string, string | null> | null } | null | undefined,
 ): boolean {
   return isCodexNativeSession(conv);
@@ -4597,9 +5303,18 @@ export function shouldShowCodexGoalControl(
  * Highlight a model row when ``selectedModel`` is null by matching the
  * bound spec ``llmModel`` to its tier alias (e.g.
  * ``"anthropic/claude-opus-4-8"`` matches ``"opus"``).
+ *
+ * Sonnet 5 is special-cased both ways: its concrete id ("...-sonnet-5")
+ * would otherwise substring-match the generic "sonnet" row (since "sonnet"
+ * is itself a substring), and its own opt-in row id ("sonnet_5") never
+ * literally appears in a hyphenated concrete id. The default "sonnet" row
+ * stays bound to the older Sonnet (4.6), which collapses to it normally.
  */
 export function isModelImplicitlySelected(modelId: string, llmModel: string | null): boolean {
   if (!llmModel) return false;
+  const isSonnet5 = llmModel.includes("sonnet-5") || llmModel.includes("sonnet_5");
+  if (modelId === "sonnet_5") return isSonnet5;
+  if (modelId === "sonnet" && isSonnet5) return false;
   return llmModel === modelId || llmModel.endsWith(`/${modelId}`) || llmModel.includes(modelId);
 }
 
@@ -4662,10 +5377,15 @@ function AgentPicker({
   const sessionModelOverride = useChatStore((s) => s.sessionModelOverride);
   const llmModel = useChatStore((s) => s.llmModel);
 
-  // Codex and cursor both populate the picker from the server-provided
-  // ``codexModelOptions`` channel (the snapshot's ``model_options`` field);
-  // claude uses the static local catalog.
-  const usesServerModelOptions = modelPickerKind === "codex" || modelPickerKind === "cursor";
+  // Codex, cursor, kiro, pi, and opencode all populate the picker from the
+  // server-provided ``codexModelOptions`` channel (the snapshot's
+  // ``model_options`` field); claude uses the static local catalog.
+  const usesServerModelOptions =
+    modelPickerKind === "codex" ||
+    modelPickerKind === "cursor" ||
+    modelPickerKind === "kiro" ||
+    modelPickerKind === "pi" ||
+    modelPickerKind === "opencode";
   const modelOptions: ReadonlyArray<{ id: string; label?: string; displayName?: string }> =
     modelPickerKind === "claude"
       ? CLAUDE_NATIVE_MODELS
@@ -4697,10 +5417,22 @@ function AgentPicker({
   // carried over from some other session) nor the meaningless `llmModel`
   // default. The other vendor-owns wrappers have no Omnigent-visible model and
   // stay null.
+  // kiro persists the pick as ``model_override`` (applied via ``--model`` at
+  // launch) and, mid-session, the runner types ``/model <id>`` into the live TUI.
+  // There is no terminal→web mirror, so the picker reflects the web-side
+  // ``sessionModelOverride`` (which stays correct since a web pick sets it), like
+  // cursor/opencode surface theirs.
+  // pi mirrors both ways into ``model_override`` (a web pick persists it before
+  // the live ``setModel``; a TUI ``/model`` pick posts external_model_change),
+  // so like cursor/kiro/opencode the live model is the session override, never
+  // the cross-session sticky ``selectedModel``.
   const pickerSelectedModel =
-    modelPickerKind === "cursor" || modelPickerKind === "opencode"
+    modelPickerKind === "cursor" ||
+    modelPickerKind === "kiro" ||
+    modelPickerKind === "opencode" ||
+    modelPickerKind === "pi"
       ? sessionModelOverride
-      : selectedModel;
+      : (sessionModelOverride ?? selectedModel);
   // SDK/bundle agents (no native picker) never have the cross-session sticky
   // applied to them, so their live model is the session's own — the applied
   // override or the bound default — never `selectedModel` (a pick carried over
@@ -4708,14 +5440,20 @@ function AgentPicker({
   // on a Claude-SDK agent like Polly). claude-/codex-native keep `selectedModel`:
   // there the sticky IS the applied model.
   const nonNativeModel =
-    modelPickerKind === null ? (sessionModelOverride ?? llmModel) : (selectedModel ?? llmModel);
+    modelPickerKind === null
+      ? (sessionModelOverride ?? llmModel)
+      : (sessionModelOverride ?? selectedModel ?? llmModel);
   const effectiveModel = nativeVendorOwnsModel
-    ? modelPickerKind === "cursor"
-      ? sessionModelOverride
-      : modelPickerKind === "opencode"
-        ? // opencode mirrors its live TUI model into ``model_override`` (set at
-          // launch and updated by the forwarder on a TUI switch); show that,
-          // falling back to the launch-resolved model before any switch.
+    ? modelPickerKind === "cursor" || modelPickerKind === "kiro"
+      ? // cursor mirrors its live TUI model into ``model_override``; kiro sets it
+        // on a web pick (which also drives a live ``/model`` switch). Either way
+        // the Omnigent-visible model is ``model_override``.
+        sessionModelOverride
+      : modelPickerKind === "opencode" || modelPickerKind === "pi"
+        ? // opencode/pi mirror their live TUI model into ``model_override``
+          // (set on a web pick, updated by the extension's model_select
+          // handler on a TUI switch); show that, falling back to the
+          // launch-resolved model before any switch.
           (sessionModelOverride ?? llmModel)
         : null
     : nonNativeModel;
@@ -4725,6 +5463,17 @@ function AgentPicker({
       ? formatStatusEffortLabel(selectedEffort, modelPickerKind === "codex")
       : null;
   const hasPickerActions = showAgents || modelOptions.length > 0 || showEffort;
+
+  // Before kiro/pi resolve a live model, there is no model to show: kiro until
+  // its first session ``.json`` write, pi until its snapshot fills llmModel (or
+  // the workspace model-list fetch failed, leaving only the launch model). Fall
+  // back to the catalog default (e.g. "Auto") / first option so the trigger
+  // reads as a model rather than the harness name ("Kiro" / "Pi").
+  const launchFallbackOption =
+    modelPickerKind === "kiro" || modelPickerKind === "pi"
+      ? (codexModelOptions.find((m) => m.isDefault) ?? codexModelOptions[0])
+      : undefined;
+  const launchFallbackLabel = launchFallbackOption?.displayName ?? launchFallbackOption?.id;
 
   // Model in foreground (black), effort in muted (grey). Static fallbacks
   // first; the final `else` returns null so a session with nothing to show
@@ -4755,8 +5504,10 @@ function AgentPicker({
     // spec may carry no executor model and no sticky/override is set), but the
     // dropdown still has model rows to switch. Keep the trigger rendered — and
     // the model dropdown + bare-`/model` open path reachable — with a stable
-    // identity fallback rather than hiding the picker entirely.
-    triggerContent = agentDisplayName ?? "Model";
+    // identity fallback rather than hiding the picker entirely. For kiro/pi,
+    // prefer the catalog default (e.g. "Auto") over the agent name so the
+    // launch-window label reads as a model.
+    triggerContent = launchFallbackLabel ?? agentDisplayName ?? "Model";
   } else {
     return null;
   }

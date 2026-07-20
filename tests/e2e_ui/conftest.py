@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import os
 import re
 import shutil
@@ -52,7 +53,7 @@ from typing import Any
 import filelock
 import httpx
 import pytest
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Locator, Page, expect
 
 from tests.codex_parity.helpers import ev_assistant_message, ev_completed, ev_response_created
 from tests.codex_parity.sidecar_harness import (
@@ -89,6 +90,23 @@ def open_right_rail(page: Page) -> None:
     if toggle.get_attribute("aria-label") == "Expand right panel":
         toggle.click()
     expect(page.get_by_role("complementary", name="Workspace")).to_be_visible()
+
+
+def switch_markdown_view_mode(page: Page, file_viewer: Locator, mode: str) -> None:
+    """Switch a markdown FileViewer to Preview / Edit / Source via the toolbar.
+
+    Markdown files default to the rendered Preview pane; the three modes live
+    behind a single "View mode" dropdown in the toolbar. Open that dropdown and
+    pick the option. The menu renders in a portal (outside ``file_viewer``), so
+    the menuitem is queried off ``page``, not the viewer locator.
+
+    :param page: Playwright page with the file viewer open.
+    :param file_viewer: The visible ``[data-testid="file-viewer"]`` locator.
+    :param mode: One of ``"Preview"``, ``"Edit"``, ``"Source"``.
+    :returns: None.
+    """
+    file_viewer.get_by_role("button", name=re.compile(r"^View mode")).first.click()
+    page.get_by_role("menuitem", name=mode, exact=True).click()
 
 
 # Populated by ``live_server`` so test-scoped fixtures can access the
@@ -579,6 +597,64 @@ def _codex_cli_supports_goal_mode(codex_path: str) -> bool:
     return tuple(int(part) for part in match.groups()) >= _CODEX_GOAL_MIN_VERSION
 
 
+def _assert_pwa_build(build_output: Path) -> None:
+    """Fail if the built SPA is missing the PWA outputs or the SW won't update.
+
+    The standalone build must ship the installable-PWA assets, and the
+    hand-rolled service worker must (a) embed the per-build fingerprint so its
+    bytes change every deploy — or the update prompt never fires — and (b) NOT
+    cache or serve the app shell: Omnigent is a cloud app, so a stale cached
+    shell would white-screen users after every deploy.
+    """
+    for name in ("index.html", "sw.js", "manifest.webmanifest", "version.json"):
+        if not (build_output / name).is_file():
+            pytest.fail(f"SPA build is missing {name} at {build_output}")
+    build = json.loads((build_output / "version.json").read_text(encoding="utf-8")).get("build")
+    sw = (build_output / "sw.js").read_text(encoding="utf-8")
+    if not build or build not in sw:
+        pytest.fail(
+            "sw.js does not embed the version.json build fingerprint — the PWA "
+            "update prompt would never fire on a JS-only deploy"
+        )
+    # Installability-only contract — enforce the *dangerous* direction too, not
+    # just "the fingerprint is present". The service worker must NOT precache or
+    # serve the app shell or intercept navigations; otherwise a deploy
+    # white-screens users behind a stale shell. Strip line comments first so
+    # prose that mentions these tokens can neither fake nor mask a regression.
+    sw_code = re.sub(r"//[^\n]*", "", sw)
+    if "index.html" in sw_code:
+        pytest.fail("sw.js references index.html — it must not cache or serve the app shell")
+    shell_precache = re.search(r"(?:cache\.add|addAll|precache)[^\n]*\.(?:js|html)\b", sw_code)
+    if shell_precache is not None:
+        pytest.fail(
+            f"sw.js precaches an app-shell asset ({shell_precache.group(0)}) — "
+            "it must precache only version.json"
+        )
+    # The architecture rests on "navigations always hit the network". Enforce it
+    # by marker AND structurally: the SW must call respondWith() exactly once,
+    # inside the /version.json branch. A fetch handler that serves navigations or
+    # the shell from cache would pass every check above yet white-screen users
+    # behind a stale shell after each deploy.
+    if re.search(r"request\.mode|NavigationRoute|navigationPreload", sw_code):
+        pytest.fail(
+            "sw.js inspects navigation requests — navigations must always reach "
+            "the network (a stale cached shell white-screens users after a deploy)"
+        )
+    responders = sw_code.count("respondWith")
+    if responders != 1:
+        pytest.fail(
+            f"sw.js has {responders} respondWith() call(s); expected exactly 1 (the "
+            "/version.json sentinel). Any other responder risks serving a stale shell."
+        )
+    # The single respondWith must sit inside the `=== "/version.json"` block —
+    # i.e. no `}` (block close) between the pathname check and the respondWith.
+    if not re.search(r'"/version\.json"[^}]*?respondWith', sw_code, re.DOTALL):
+        pytest.fail(
+            "sw.js's respondWith() is not guarded by a `/version.json` pathname "
+            "check — the service worker must not serve the shell or intercept navigations"
+        )
+
+
 @pytest.fixture(scope="session")
 def built_spa(request: pytest.FixtureRequest) -> None:
     """
@@ -600,11 +676,7 @@ def built_spa(request: pytest.FixtureRequest) -> None:
     if request.config.getoption("--ui-base-url"):
         return
     if request.config.getoption("--ui-skip-build"):
-        if not (_BUILD_OUTPUT / "index.html").is_file():
-            pytest.fail(
-                f"--ui-skip-build was passed but no SPA build exists at "
-                f"{_BUILD_OUTPUT}. Run `cd web && npm run build` first."
-            )
+        _assert_pwa_build(_BUILD_OUTPUT)
         return
 
     lock_path = _WEB_DIR / ".build.lock"
@@ -620,6 +692,8 @@ def built_spa(request: pytest.FixtureRequest) -> None:
             check=True,
         )
         subprocess.run(["npm", "run", "build"], cwd=_WEB_DIR, check=True)
+
+    _assert_pwa_build(_BUILD_OUTPUT)
 
 
 def _spawn_runner_against_external_server(
@@ -1421,12 +1495,14 @@ class TwoAgentChatSession:
         carries, e.g. ``"vogon-3a7f9c2e1b"``.
     :param question_code: Per-run nonce only Deep Thought's QUESTION reply
         carries (round 2), e.g. ``"babelfish-9c2e1b3a7f"``.
+    :param routing_token: Per-run token that selects Arthur's mock queue.
     """
 
     base_url: str
     session_id: str
     verification_code: str
     question_code: str
+    routing_token: str
 
 
 def _two_agent_chat_yaml(verification_code: str, question_code: str) -> str:
@@ -1509,15 +1585,18 @@ tools:
 @pytest.fixture
 def two_agent_chat_session(
     live_server: str,
+    mock_llm_server_url: str,
     tmp_path_factory: pytest.TempPathFactory,
 ) -> Iterator[TwoAgentChatSession]:
     """Create a runner-bound session for the two-agent Hitchhiker's chat.
 
     Same runner-respawn and bind contract as :func:`terminal_session`.
-    Yields the per-run nonces so the test can assert that the sub-agent's
-    replies (and only the sub-agent's) reached the UI.
+    Separate content-routed mock queues drive Arthur and Deep Thought,
+    including both dispatch, child, and auto-wake turns. The original
+    model ids remain in the spec for a future real-gateway job.
 
     :param live_server: Spawned server fixture.
+    :param mock_llm_server_url: Mock LLM server used by credential-free runs.
     :param tmp_path_factory: Pytest temp path factory (for a respawn log).
     :returns: A :class:`TwoAgentChatSession` handle.
     """
@@ -1526,7 +1605,66 @@ def two_agent_chat_session(
 
     verification_code = f"vogon-{uuid.uuid4().hex[:10]}"
     question_code = f"babelfish-{uuid.uuid4().hex[:10]}"
+    suffix = uuid.uuid4().hex[:10]
+    routing_token = f"hitchhiker-parent-{suffix}"
+    child_token = f"hitchhiker-child-{suffix}"
     yaml_text = _two_agent_chat_yaml(verification_code, question_code)
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_deep_thought_answer",
+                        "name": "sys_session_send",
+                        "arguments": json.dumps(
+                            {
+                                "agent": "deep_thought",
+                                "title": "deep_thought",
+                                "args": (
+                                    "What is the Answer to the Ultimate Question? "
+                                    f"Routing marker: {child_token}"
+                                ),
+                            }
+                        ),
+                    }
+                ]
+            },
+            {"text": "Dispatched Deep Thought; waiting for the answer."},
+            {"text": f"Deep Thought replied: 42. Verification code: {verification_code}."},
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_deep_thought_question",
+                        "name": "sys_session_send",
+                        "arguments": json.dumps(
+                            {
+                                "agent": "deep_thought",
+                                "title": "deep_thought",
+                                "args": (
+                                    "What is the Ultimate Question itself? "
+                                    f"Routing marker: {child_token}"
+                                ),
+                            }
+                        ),
+                    }
+                ]
+            },
+            {"text": "Dispatched the follow-up; waiting for the question."},
+            {"text": f"Deep Thought replied with question code {question_code}."},
+        ],
+        key=routing_token,
+        match=routing_token,
+    )
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {"text": f"The Answer is 42. Verification code: {verification_code}."},
+            {"text": f"The Ultimate Question is unknown. Question code: {question_code}."},
+        ],
+        key=child_token,
+        match=child_token,
+    )
     respawned_runner = _ensure_runner_online(live_server, tmp_path_factory)
     runner_id = str(_server_state["runner_id"])
 
@@ -1561,6 +1699,7 @@ def two_agent_chat_session(
             session_id=session_id,
             verification_code=verification_code,
             question_code=question_code,
+            routing_token=routing_token,
         )
     finally:
         httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
@@ -2185,7 +2324,7 @@ def _temp_omnigent_mock_config(
     file (or removes it) on exit.
 
     :param mock_llm_server_url: Base URL of the mock LLM server, e.g.
-        ``"http://127.0.0.1:51235"``. No /v1 suffix — each SDK appends it.
+        ``"http://127.0.0.1:51235"``.
     :param harness: ``"claude"`` or ``"codex"``.
     """
     config_dir = Path.home() / ".omnigent"
@@ -2212,7 +2351,7 @@ def _temp_omnigent_mock_config(
                 kind: key
                 default: [openai]
                 openai:
-                  base_url: "{mock_llm_server_url}"
+                  base_url: "{mock_llm_server_url}/v1"
                   api_key: "mock-key"
                   wire_api: responses
                   models:

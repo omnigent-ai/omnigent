@@ -3,11 +3,27 @@
 from __future__ import annotations
 
 import subprocess
+from pathlib import Path
 
 import pytest
 
+import omnigent._platform as _platform
 from omnigent.onboarding import harness_install as hi
 from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
+
+
+@pytest.fixture(autouse=True)
+def _stub_cli_fallback_dirs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Reduce ``resolve_cli_binary`` to a pure ``PATH`` probe under test.
+
+    ``harness_cli_installed`` / ``missing_harness_cli`` resolve via
+    ``resolve_cli_binary``, which also probes on-disk global install dirs
+    (``~/.local/bin``, nvm, …). Tests here stub ``shutil.which`` to simulate a
+    binary's presence/absence; stub the fallback dirs to empty too so a
+    developer's real claude/codex install can't flip a ``which``-returns-None
+    assertion.
+    """
+    monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: ())
 
 
 @pytest.mark.parametrize(
@@ -106,6 +122,19 @@ def test_kiro_install_spec_is_manual_installer_no_npm() -> None:
     assert spec.binary == "kiro-cli"
     assert spec.package is None
     assert spec.install_hint == "curl -fsSL https://cli.kiro.dev/install | bash"
+
+
+def test_hermes_install_spec_has_actionable_vendor_installer() -> None:
+    """Hermes' trusted vendor installer can be launched from the setup menu."""
+    spec = hi.harness_install_spec(hi.HERMES_KEY)
+    assert spec is not None
+    assert spec.package is None
+    assert spec.install_hint is not None
+    assert hi.harness_install_command(hi.HERMES_KEY) == [
+        "bash",
+        "-c",
+        spec.install_hint,
+    ]
 
 
 def test_antigravity_install_spec_status_only_no_npm() -> None:
@@ -293,16 +322,37 @@ def test_missing_harness_cli_none_for_sdk_harness(monkeypatch: pytest.MonkeyPatc
 
 
 def test_cli_installed_reflects_which(monkeypatch: pytest.MonkeyPatch) -> None:
-    """``harness_cli_installed`` is exactly ``shutil.which(binary) is not None``.
+    """``harness_cli_installed`` follows ``resolve_cli_binary``.
 
-    Present → True; absent → False — the signal the configure ✗ marker and the
-    run gating both read.
+    On ``PATH`` → True; unresolvable (the autouse fixture stubs the fallback
+    dirs empty) → False — the signal the configure ✗ marker and the run gating
+    both read.
     """
     monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
     assert hi.harness_cli_installed(ANTHROPIC_FAMILY) is True
 
     monkeypatch.setattr(hi.shutil, "which", lambda name: None)
     assert hi.harness_cli_installed(ANTHROPIC_FAMILY) is False
+
+
+def test_cli_installed_finds_binary_off_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A CLI in a global install dir but off ``PATH`` still reads installed.
+
+    This is the reported nvm case: the host daemon's frozen ``PATH`` omits the
+    bin dir, so bare ``shutil.which`` misses it, but ``resolve_cli_binary``'s
+    fallback ladder finds it on disk. Readiness must not report it missing.
+    """
+    fallback_dir = tmp_path / "bin"
+    fallback_dir.mkdir()
+    claude = fallback_dir / "claude"
+    claude.write_text("#!/bin/sh\n")
+    claude.chmod(0o755)
+    monkeypatch.setattr(hi.shutil, "which", lambda name: None)
+    monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: (fallback_dir,))
+    assert hi.harness_cli_installed(ANTHROPIC_FAMILY) is True
+    assert hi.missing_harness_cli("claude-native") is None
 
 
 def test_install_harness_cli_requires_npm(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -340,6 +390,65 @@ def test_install_harness_cli_runs_npm_then_rechecks(monkeypatch: pytest.MonkeyPa
 
     assert hi.install_harness_cli(OPENAI_FAMILY) is True
     assert calls == [["npm", "install", "-g", "@openai/codex"]]
+
+
+def test_install_harness_cli_runs_hermes_installer_then_rechecks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Hermes installer is interactive-menu actionable and PATH-verified."""
+    calls: list[list[str]] = []
+    state = {"installed": False}
+
+    def _which(name: str) -> str | None:
+        if name == "bash":
+            return "/bin/bash"
+        if name == "hermes" and state["installed"]:
+            return "/usr/local/bin/hermes"
+        return None
+
+    def _run(argv: list[str], *, check: bool = False, timeout: float | None = None):
+        calls.append(argv)
+        state["installed"] = True
+        return subprocess.CompletedProcess(args=argv, returncode=0)
+
+    monkeypatch.setattr(hi.shutil, "which", _which)
+    monkeypatch.setattr(hi.subprocess, "run", _run)
+
+    assert hi.install_harness_cli(hi.HERMES_KEY) is True
+    spec = hi.harness_install_spec(hi.HERMES_KEY)
+    assert spec is not None
+    assert spec.install_hint is not None
+    assert calls == [["bash", "-c", spec.install_hint]]
+
+
+def test_install_harness_cli_refreshes_user_local_bin(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A vendor install into ~/.local/bin is usable without restarting setup."""
+    user_bin = tmp_path / ".local" / "bin"
+    user_bin.mkdir(parents=True)
+    hermes = user_bin / "hermes"
+    hermes.write_text("#!/bin/sh\n")
+    hermes.chmod(0o755)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+
+    def _which(name: str) -> str | None:
+        if name == "bash":
+            return "/bin/bash"
+        if name == "hermes" and str(user_bin) in hi.os.environ["PATH"].split(hi.os.pathsep):
+            return str(hermes)
+        return None
+
+    monkeypatch.setattr(hi.shutil, "which", _which)
+    monkeypatch.setattr(
+        hi.subprocess,
+        "run",
+        lambda argv, *, check=False, timeout=None: subprocess.CompletedProcess(argv, 0),
+    )
+
+    assert hi.install_harness_cli(hi.HERMES_KEY) is True
+    assert hi.os.environ["PATH"].split(hi.os.pathsep)[0] == str(user_bin)
 
 
 def test_harness_login_skips_when_already_logged_in(monkeypatch: pytest.MonkeyPatch) -> None:

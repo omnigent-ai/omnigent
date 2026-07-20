@@ -57,32 +57,50 @@ def main() -> None:
     url = f"{server_url.rstrip('/')}/v1/sessions/{session_id}/policies/evaluate"
 
     try:
-        from omnigent.native_policy_hook import post_evaluate_with_retry
+        from omnigent.native_policy_hook import (
+            policy_hook_reauth,
+            policy_hook_request_headers,
+            post_evaluate_with_retry,
+        )
 
-        resp = post_evaluate_with_retry(
+        headers = policy_hook_request_headers()
+        reauth = policy_hook_reauth(server_url, headers)
+        resp, api_error = post_evaluate_with_retry(
             url=url,
-            headers={"Content-Type": "application/json"},
+            headers=headers,
             eval_request=eval_body,
             # One day — must match the hooks.json ``timeout`` and the
             # server's ``ask_timeout`` so the hook stays alive while the
             # human responds to the web-UI approval card.
             read_timeout=86400.0,
             hook_label="cursor preToolUse",
+            # Re-mint the baked one-shot token if it lapses mid-session.
+            reauth=reauth,
         )
     except Exception:  # noqa: BLE001 -- fail open on import / unexpected error
         json.dump({"permission": "allow"}, sys.stdout)
         return
 
     if resp is None:
-        # Network error / retry budget exhausted -- fail open (allow) so a
-        # transient server outage doesn't block the Cursor turn.
-        json.dump({"permission": "allow"}, sys.stdout)
+        # Network error / retry budget exhausted -- fail closed so a
+        # transient server outage doesn't skip DENY/ASK enforcement.
+        detail = api_error or reauth.failure_reason
+        message = f"Tool '{tool_name}' blocked: Omnigent policy evaluation unavailable"
+        if detail:
+            message += f" ({detail})"
+        json.dump({"permission": "deny", "agent_message": message}, sys.stdout)
         return
 
     try:
         result = resp.json()
     except Exception:  # noqa: BLE001
-        json.dump({"permission": "allow"}, sys.stdout)
+        json.dump(
+            {
+                "permission": "deny",
+                "agent_message": f"Tool '{tool_name}' blocked: malformed Omnigent policy response",
+            },
+            sys.stdout,
+        )
         return
 
     action = result.get("result", "POLICY_ACTION_ALLOW")

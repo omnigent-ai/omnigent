@@ -74,7 +74,7 @@ def _section(page: Page, title: str) -> Locator:
 
     Each ``ConversationSection`` renders an ``<h2>`` with a collapse button
     whose accessible name is the section title (e.g. "Pinned"). Scoping
-    lookups to the matching section keeps them off the "Chats" rows.
+    lookups to the matching section keeps them off the "Sessions" rows.
 
     :param page: Playwright page with the sidebar open.
     :param title: Section header text, e.g. ``"Pinned"``.

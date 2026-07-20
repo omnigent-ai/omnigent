@@ -11,6 +11,7 @@
 // `SessionEventInput`, `SessionStatusEvent.status`).
 
 import type { ConversationItem } from "./conversationItems";
+import type { McpServerStartup } from "./events";
 import type { MessageContentBlock } from "./blocks";
 
 /** Reference to a conversation, as returned on response objects. */
@@ -256,6 +257,12 @@ export interface Session {
    */
   hostResumable?: boolean;
   status: SessionStatus;
+  /**
+   * Background shells (claude-native) still running as of the last status
+   * edge, so a reload re-shows "N background tasks still running" even though the
+   * session has settled to ``"idle"``. Absent/0 when none are tracked.
+   */
+  backgroundTaskCount?: number;
   createdAt: number;
   /**
    * Human-readable session title, e.g. ``"researcher:auth"`` for a
@@ -426,6 +433,24 @@ export interface Session {
    * sees the current stage.
    */
   sandboxStatus?: SandboxStatus | null;
+  /**
+   * Per-MCP-server startup state for native harness sessions
+   * (codex-native). Present while the harness boots its MCP servers or
+   * when servers were cancelled/failed; `null` otherwise. Sourced from
+   * the server's `_session_mcp_startup_cache` at snapshot build time so
+   * a client opening the session mid-startup sees the startup band.
+   */
+  mcpStartup?: Record<string, McpServerStartup> | null;
+  /**
+   * Response id of the turn currently in flight, or `null`/absent when
+   * the session is idle. Sourced from the server's
+   * `_session_active_response_cache` at snapshot build time so a client
+   * reconnecting mid-turn can reopen a streaming `activeResponse` (the
+   * SSE stream is snapshot + live tail with no replay, so the turn-start
+   * `running` edge that carried this id is not re-sent). Today only
+   * native-terminal sessions (claude-native) populate it.
+   */
+  activeResponseId?: string | null;
 }
 
 /**

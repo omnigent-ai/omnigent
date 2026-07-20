@@ -22,16 +22,23 @@ import {
   type RefObject,
 } from "react";
 import {
+  AtSignIcon,
   ChevronDownIcon,
   ChevronUpIcon,
   MessageSquarePlusIcon,
   SearchIcon,
   XIcon,
 } from "lucide-react";
+import { useChatStore } from "@/store/chatStore";
+import { nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
 import type { BundledLanguage, ThemedToken } from "shiki";
 import { highlightCode } from "@/components/ai-elements/code-block";
-import ReactMarkdown from "react-markdown";
+import ReactMarkdown, { type Components, type Options } from "react-markdown";
 import remarkGfm from "remark-gfm";
+import remarkEmoji from "remark-emoji";
+import rehypeRaw from "rehype-raw";
+import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
+import { rehypeGithubAlerts } from "rehype-github-alerts";
 import { type Comment } from "@/hooks/useComments";
 import {
   type FileContentResponse,
@@ -44,17 +51,21 @@ import { MarkdownRichTextViewer } from "./MarkdownRichTextViewer";
 import {
   type ActiveSelection,
   type SaveStatus,
-  HTML_PREVIEW_SANDBOX,
   detectLang,
   getSelectionOffsets,
   indexToLine,
   isBinaryPath,
   isImageFile,
+  isNotebookPath,
+  isPdfFile,
   lineOverlapsSelection,
-  prepareHtmlPreviewDoc,
 } from "./codeViewerHelpers";
+import { NotebookPreview } from "./NotebookPreview";
+import { PreviewSearchBar } from "./PreviewSearchBar";
 import { renderLineTokens } from "./codeViewerRendering";
+import { HtmlCommentViewer } from "./HtmlCommentViewer";
 import { TruncatedBanner } from "./TruncatedBanner";
+import { useLightbox } from "@/components/ImageLightbox";
 import { getEmbedRoot } from "@/lib/host";
 
 // Monaco is heavy (~MBs + worker); load it only when a non-markdown file is
@@ -64,6 +75,10 @@ const MonacoCodeEditor = lazy(() =>
   import("./MonacoCodeEditor").then((m) => ({ default: m.MonacoCodeEditor })),
 );
 
+// react-pdf + pdf.js (worker) is heavy; load it only when a PDF is actually
+// viewed so it never enters the initial bundle.
+const PdfViewer = lazy(() => import("./PdfViewer").then((m) => ({ default: m.PdfViewer })));
+
 // ---------------------------------------------------------------------------
 // MarkdownPreview — read-only render of Markdown content via react-markdown + GFM
 // ---------------------------------------------------------------------------
@@ -71,10 +86,131 @@ const MonacoCodeEditor = lazy(() =>
 // Width of the line-number gutter — must match the `w-12` Tailwind class on the gutter div.
 const GUTTER_WIDTH = 48;
 
-function MarkdownPreview({ content }: { content: string }) {
+// GFM covers tables, task lists, strikethrough, and autolinks; remark-emoji
+// renders GitHub-style `:shortcode:` emoji as their unicode glyphs so docs read
+// the same here as on GitHub.
+const MARKDOWN_REMARK_PLUGINS = [remarkGfm, remarkEmoji];
+
+// rehype-github-alerts turns `> [!NOTE]` blockquotes into GitHub's
+// `<div class="markdown-alert markdown-alert-note">…` callout markup (GFM
+// itself leaves them as plain blockquotes). We keep only the alert's div/p
+// classes and drop its inline <svg> octicon in sanitize below; the icon is
+// redrawn from CSS (see `.markdown-alert` in index.css) so the sanitized
+// output stays a tiny, fixed class surface rather than arbitrary SVG.
+const ALERT_CLASS = /^markdown-alert(-\w+)?$/;
+const ALERT_TITLE_CLASS = /^markdown-alert-title$/;
+// Extend the default (GitHub-derived) sanitize schema minimally: allow `class`
+// on the alert wrapper div (markdown-alert*) and its title p (markdown-alert-
+// title) only for those exact tokens. Everything else — <script>, event
+// handlers, javascript: URLs, arbitrary classes — is still stripped, so raw
+// HTML in a .md file stays safe to render inline.
+const MARKDOWN_SANITIZE_SCHEMA = {
+  ...defaultSchema,
+  attributes: {
+    ...defaultSchema.attributes,
+    div: [...(defaultSchema.attributes?.div ?? []), ["className", ALERT_CLASS]],
+    p: [...(defaultSchema.attributes?.p ?? []), ["className", ALERT_TITLE_CLASS]],
+  },
+};
+
+// Markdown files routinely embed raw HTML that GitHub renders — <details>,
+// <sub>/<sup>, <kbd>, <br>, <div align>, inline <img> — which react-markdown
+// drops by default, showing the escaped tags as literal text. rehype-raw parses
+// that HTML; rehype-sanitize then strips anything unsafe (<script>, event
+// handlers, javascript: URLs) so this stays safe to render inline without an
+// iframe. Order matters: alerts transform before sanitize, and sanitize runs
+// last, after raw parsing and GFM.
+const MARKDOWN_REHYPE_PLUGINS: Options["rehypePlugins"] = [
+  rehypeRaw,
+  rehypeGithubAlerts,
+  [rehypeSanitize, MARKDOWN_SANITIZE_SCHEMA],
+];
+
+// Tailwind Preflight applies `img { height: auto }`, which overrides the HTML
+// `width`/`height` *attributes* (presentational hints lose to any author CSS).
+// GitHub honors explicit dimensions, so mirror them onto an inline style —
+// which does win the cascade — for the one image being rendered. This runs
+// after sanitize (React components render the already-sanitized tree), so it
+// adds no attack surface. Only literal integer pixel values are forwarded.
+const MARKDOWN_COMPONENTS: Components = {
+  img({ node: _node, width, height, style, ...props }) {
+    const px = (v: string | number | undefined) =>
+      typeof v === "number" || (typeof v === "string" && /^\d+$/.test(v)) ? `${v}px` : undefined;
+    const sized = {
+      ...style,
+      width: px(width) ?? style?.width,
+      height: px(height) ?? style?.height,
+    };
+    // eslint-disable-next-line jsx-a11y/alt-text -- alt is forwarded via props
+    return <img {...props} style={sized} />;
+  },
+};
+
+function MarkdownPreview({
+  content,
+  rootRef,
+}: {
+  content: string;
+  rootRef?: RefObject<HTMLDivElement | null>;
+}) {
   return (
-    <div className="px-6 py-4 overflow-auto h-full prose dark:prose-invert prose-sm max-w-none">
-      <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
+    <div
+      ref={rootRef}
+      data-preview-scroll
+      className="markdown-preview px-6 py-4 overflow-auto h-full prose dark:prose-invert prose-sm max-w-none"
+    >
+      <ReactMarkdown
+        remarkPlugins={MARKDOWN_REMARK_PLUGINS}
+        rehypePlugins={MARKDOWN_REHYPE_PLUGINS}
+        components={MARKDOWN_COMPONENTS}
+      >
+        {content}
+      </ReactMarkdown>
+    </div>
+  );
+}
+
+// Markdown / notebook preview with find-in-file. The preview is React-owned
+// DOM, so PreviewSearchBar highlights matches via the CSS Custom Highlight API
+// (no node mutation). `contentVersion` = content string, so the match ranges
+// recompute when the rendered document changes.
+function PreviewWithSearch({
+  content,
+  isNotebook,
+  truncated,
+  searchOpen,
+  onSearchHandled,
+  searchInputRef,
+}: {
+  content: string;
+  isNotebook: boolean;
+  truncated: boolean;
+  searchOpen: boolean;
+  onSearchHandled: () => void;
+  searchInputRef: RefObject<HTMLInputElement | null>;
+}) {
+  const previewRef = useRef<HTMLDivElement>(null);
+  const bar = (
+    <PreviewSearchBar
+      containerRef={previewRef}
+      contentVersion={content}
+      open={searchOpen}
+      onClose={onSearchHandled}
+      inputRef={searchInputRef}
+    />
+  );
+  const preview = isNotebook ? (
+    <NotebookPreview content={content} rootRef={previewRef} />
+  ) : (
+    <MarkdownPreview content={content} rootRef={previewRef} />
+  );
+  // The find bar sits above the preview; a truncated preview also shows the
+  // banner. The bar renders nothing when closed, so layout is unchanged then.
+  return (
+    <div className="flex h-full flex-col">
+      {bar}
+      {truncated && <TruncatedBanner />}
+      <div className="min-h-0 flex-1">{preview}</div>
     </div>
   );
 }
@@ -98,6 +234,7 @@ const CHECKERBOARD_STYLE: React.CSSProperties = {
 function ImageViewer({ data, path }: { data: FileContentResponse; path: string }) {
   const [url, setUrl] = useState<string | null>(null);
   const [errored, setErrored] = useState(false);
+  const { open } = useLightbox();
 
   // Create the object URL in an effect and revoke it on cleanup so the blob is
   // released when the file changes or the viewer unmounts (avoids a leak).
@@ -131,8 +268,10 @@ function ImageViewer({ data, path }: { data: FileContentResponse; path: string }
           src={url}
           alt={filename}
           onError={() => setErrored(true)}
-          className="max-h-full max-w-full object-contain"
+          onClick={() => open({ src: url, alt: filename })}
+          className="max-h-full max-w-full cursor-zoom-in object-contain"
           style={CHECKERBOARD_STYLE}
+          title="Click to zoom"
         />
       )}
     </div>
@@ -247,6 +386,15 @@ export function CodeViewer({
   // Only the Shiki DOM path needs the per-line split; skip it in Monaco mode.
   const rawLines = useMemo(() => (showMonaco ? [] : content.split("\n")), [content, showMonaco]);
 
+  // "Attach to agent" delivers a "[Attached: path:start-end]" marker the
+  // composer reads — only the native coding-agent harnesses act on it, so
+  // gate the button to them (same set as the "@"-mention feature).
+  const sessionHarness = useChatStore((s) => s.sessionHarness);
+  // ``!!path`` mirrors the Monaco hook's guard: without it an empty path would
+  // emit a malformed ``[Attached: :start-end]`` marker. ``path`` is typed
+  // non-optional here, but the guard keeps the two surfaces in lockstep.
+  const canAttachToAgent = !!path && nativeCodingAgentForHarness(sessionHarness) !== undefined;
+
   // Kick off Shiki highlighting whenever content or language changes.
   useEffect(() => {
     if (showMonaco) return; // Monaco does its own highlighting.
@@ -289,12 +437,32 @@ export function CodeViewer({
     matchLineRefs.current.get(idx)?.scrollIntoView({ block: "center", behavior: "smooth" });
   }, [searchQuery, currentMatchIdx]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Open search on Cmd+F / Ctrl+F.
-  // Don't intercept in markdown editor mode — the custom search bar isn't
-  // available there, so let the browser's native find handle it instead.
   const isMarkdownEditor = viewMode === "editor" && lang === "markdown";
+
+  // Markdown editor mode has its own find bar (MarkdownSearchBar), driven by the
+  // shared `searchOpen` toggle. Cmd+F opens it and Escape closes it; the bar
+  // also handles Escape while its input is focused, but this covers the case
+  // where focus is in the editor body.
   useEffect(() => {
-    // Skip in Monaco mode too — Monaco owns Cmd+F (native find).
+    if (!panelOpen || !isMarkdownEditor) return;
+    const handler = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "f") {
+        e.preventDefault();
+        setSearchOpen(true);
+        setTimeout(() => searchInputRef.current?.focus(), 0);
+      } else if (e.key === "Escape" && searchOpen) {
+        e.preventDefault();
+        setSearchOpen(false);
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [panelOpen, isMarkdownEditor, searchOpen, setSearchOpen, searchInputRef]);
+
+  // Open search on Cmd+F / Ctrl+F in the Shiki source view.
+  useEffect(() => {
+    // Skip in Monaco mode (Monaco owns Cmd+F) and markdown editor mode (handled
+    // above with its own find bar).
     if (!panelOpen || isMarkdownEditor || showMonaco) return;
     const handler = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key === "f") {
@@ -325,9 +493,10 @@ export function CodeViewer({
     return () => window.removeEventListener("keydown", handler);
   }, [panelOpen, isMarkdownEditor, showMonaco, searchOpen, setSearchOpen, searchInputRef]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // In Monaco mode the custom search bar isn't rendered; the editor opens its
-  // native find when `searchOpen` is set (once it has mounted), then calls this
-  // to reset the flag so the next Find click re-triggers it.
+  // In Monaco mode the custom search bar isn't rendered; the editor mirrors its
+  // native find widget to `searchOpen` (open when set, close when cleared). This
+  // resets the flag when find is closed from within Monaco (Escape or the
+  // widget's ✕) so the toolbar toggle stays in sync with the visible widget.
   const handleSearchHandled = useCallback(() => setSearchOpen(false), [setSearchOpen]);
 
   // Show "Add Comment" button after the user finishes a text selection
@@ -388,16 +557,36 @@ export function CodeViewer({
     return () => container.removeEventListener("mouseup", handleMouseUp);
   }, [rawLines]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Dismiss the floating button on any mousedown outside of it.
+  // Dismiss the floating buttons on any mousedown outside of them, or on any
+  // scroll. Both the "Add comment" and "Attach to agent" buttons must be
+  // exempted from the mousedown dismiss — otherwise a click on "Attach to
+  // agent" clears the anchor and unmounts the portal before its own onClick
+  // runs. The buttons are ``position: fixed`` at captured viewport coords, so
+  // a scroll leaves them hovering over unrelated lines while the anchor's
+  // char offsets still point at the original selection; clear on scroll
+  // (capture phase, since scroll doesn't bubble) so a stale span can't be
+  // attached. Monaco does the equivalent via ``onDidScrollChange``.
   useEffect(() => {
     const handleMouseDown = (e: MouseEvent) => {
-      if (!(e.target as HTMLElement).closest("[data-add-comment-btn]")) {
+      if (!(e.target as HTMLElement).closest("[data-add-comment-btn], [data-attach-agent-btn]")) {
         setSelectionAnchor(null);
       }
     };
+    const handleScroll = () => setSelectionAnchor(null);
     document.addEventListener("mousedown", handleMouseDown);
-    return () => document.removeEventListener("mousedown", handleMouseDown);
+    window.addEventListener("scroll", handleScroll, true);
+    return () => {
+      document.removeEventListener("mousedown", handleMouseDown);
+      window.removeEventListener("scroll", handleScroll, true);
+    };
   }, []);
+
+  // Switching renderer (Shiki↔Monaco), view mode (preview↔editor), or file
+  // invalidates the captured viewport coords + char offsets, so drop the
+  // floating buttons rather than re-render them at a stale position.
+  useEffect(() => {
+    setSelectionAnchor(null);
+  }, [showMonaco, viewMode, path]);
 
   // When Cmd/Ctrl+A selected the entire container, intercept the copy event
   // and write the raw file content so line numbers and flex-layout artifacts
@@ -440,6 +629,25 @@ export function CodeViewer({
   if (fileQuery.data && isImageFile(path, fileQuery.data.content_type)) {
     return <ImageViewer data={fileQuery.data} path={path} />;
   }
+  if (fileQuery.data && isPdfFile(path, fileQuery.data.content_type)) {
+    return (
+      <Suspense
+        fallback={
+          <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">
+            Loading…
+          </div>
+        }
+      >
+        <PdfViewer
+          data={fileQuery.data}
+          conversationId={conversationId}
+          comments={comments}
+          activeSelection={activeSelection}
+          onSetActiveSelection={onSetActiveSelection}
+        />
+      </Suspense>
+    );
+  }
   if (fileQuery.data?.encoding === "base64" || isBinaryPath(path)) {
     return (
       <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">
@@ -461,31 +669,39 @@ export function CodeViewer({
         activeSelection={activeSelection}
         onSetActiveSelection={onSetActiveSelection}
         pendingBodyRef={pendingBodyRef}
+        searchOpen={searchOpen}
+        onSearchHandled={handleSearchHandled}
+        searchInputRef={searchInputRef}
       />
     );
   }
 
-  if (viewMode === "preview" && (lang === "markdown" || lang === "html")) {
-    const preview =
-      lang === "markdown" ? (
-        <MarkdownPreview content={content} />
-      ) : (
-        <iframe
-          srcDoc={prepareHtmlPreviewDoc(content)}
-          // oxlint-disable-next-line eslint-plugin-react(iframe-missing-sandbox)
-          sandbox={HTML_PREVIEW_SANDBOX}
-          title="HTML preview"
-          className="w-full h-full border-0"
-        />
-      );
-    // A truncated preview renders incomplete content; warn the user (the editor
-    // and source surfaces already do). No layout change when not truncated.
-    if (!truncated) return preview;
+  // HTML preview gets its own comment-enabled viewer (selection capture +
+  // highlights relayed over a bridge into the still-sandboxed iframe), so it
+  // owns the truncated banner internally.
+  if (viewMode === "preview" && lang === "html") {
     return (
-      <div className="flex h-full flex-col">
-        <TruncatedBanner />
-        <div className="min-h-0 flex-1">{preview}</div>
-      </div>
+      <HtmlCommentViewer
+        conversationId={conversationId}
+        content={content}
+        truncated={truncated}
+        comments={comments}
+        activeSelection={activeSelection}
+        onSetActiveSelection={onSetActiveSelection}
+      />
+    );
+  }
+
+  if (viewMode === "preview" && (lang === "markdown" || isNotebookPath(path))) {
+    return (
+      <PreviewWithSearch
+        content={content}
+        isNotebook={isNotebookPath(path)}
+        truncated={truncated}
+        searchOpen={searchOpen}
+        onSearchHandled={handleSearchHandled}
+        searchInputRef={searchInputRef}
+      />
     );
   }
 
@@ -737,32 +953,71 @@ export function CodeViewer({
         })}
       </div>
 
-      {/* Floating "Add Comment" button — rendered into document.body so that
+      {/* Floating selection actions — rendered into document.body so that
           CSS transforms on ancestor elements don't break fixed positioning. */}
       {selectionAnchor &&
         createPortal(
-          <button
-            data-add-comment-btn
-            type="button"
-            className="fixed z-50 flex items-center gap-1.5 rounded-md border border-border bg-popover backdrop-blur-xl backdrop-saturate-150 px-2.5 py-1 text-xs font-medium text-foreground shadow-md hover:bg-secondary transition-colors"
+          <div
+            className="fixed z-50 flex items-center gap-1"
             style={{
-              left: selectionAnchor.x,
+              // Clamp so the (one- or two-) button group can't clip off the
+              // right edge near the viewport boundary. Width is an estimate of
+              // the rendered buttons ("Add comment" ≈ 130px, + "Attach to
+              // agent" ≈ 150px).
+              left: Math.min(
+                selectionAnchor.x,
+                Math.max(8, window.innerWidth - (canAttachToAgent ? 288 : 138)),
+              ),
               top: selectionAnchor.y,
               transform: "translateY(-100%)",
             }}
-            onClick={() => {
-              onSetActiveSelection({
-                start_index: selectionAnchor.start_index,
-                end_index: selectionAnchor.end_index,
-                anchor_content: selectionAnchor.anchor_content,
-              });
-              setSelectionAnchor(null);
-              window.getSelection()?.removeAllRanges();
-            }}
           >
-            <MessageSquarePlusIcon className="size-3.5" />
-            Add comment
-          </button>,
+            <button
+              data-add-comment-btn
+              type="button"
+              className="flex items-center gap-1.5 rounded-md border border-border bg-popover backdrop-blur-xl backdrop-saturate-150 px-2.5 py-1 text-xs font-medium text-foreground shadow-md hover:bg-secondary transition-colors"
+              onClick={() => {
+                onSetActiveSelection({
+                  start_index: selectionAnchor.start_index,
+                  end_index: selectionAnchor.end_index,
+                  anchor_content: selectionAnchor.anchor_content,
+                });
+                setSelectionAnchor(null);
+                window.getSelection()?.removeAllRanges();
+              }}
+            >
+              <MessageSquarePlusIcon className="size-3.5" />
+              Add comment
+            </button>
+            {canAttachToAgent && (
+              <button
+                data-attach-agent-btn
+                type="button"
+                className="flex items-center gap-1.5 rounded-md border border-border bg-popover backdrop-blur-xl backdrop-saturate-150 px-2.5 py-1 text-xs font-medium text-foreground shadow-md hover:bg-secondary transition-colors"
+                onClick={() => {
+                  // Convert the selection's char offsets to a 1-based inclusive
+                  // line span. ``end_index`` is exclusive, so step back one char
+                  // (clamped) before mapping so a trailing newline doesn't bleed
+                  // into the next line.
+                  const startLine = indexToLine(selectionAnchor.start_index, rawLines);
+                  const endLine = indexToLine(
+                    Math.max(selectionAnchor.start_index, selectionAnchor.end_index - 1),
+                    rawLines,
+                  );
+                  useChatStore.getState().addComposerAttachment({
+                    path,
+                    isDir: false,
+                    lineRange: { start: startLine, end: endLine },
+                  });
+                  setSelectionAnchor(null);
+                  window.getSelection()?.removeAllRanges();
+                }}
+              >
+                <AtSignIcon className="size-3.5" />
+                Attach to agent
+              </button>
+            )}
+          </div>,
           getEmbedRoot() ?? document.body,
         )}
     </>

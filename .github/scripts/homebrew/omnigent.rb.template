@@ -1,0 +1,83 @@
+# Homebrew formula TEMPLATE for the Omnigent CLI (`omnigent` / `omni`).
+#
+# The volatile parts of this formula are regenerated on every release by
+# `generate_formula.py` (run from `.github/workflows/homebrew-tap-pr.yml`) and
+# spliced into this file via three placeholders that live ONLY in the class body
+# below — keep them out of this comment or the splicer will mangle it:
+#   * the stable `url` / `sha256` lines  -> the released omnigent sdist on PyPI
+#   * the per-dependency `resource` stanzas (one per PyPI sdist in the closure)
+#
+# Edit the hand-tuned STRUCTURAL parts here (desc, depends_on, install, test).
+# Edit the dependency set in omnigent-ai/omnigent's `pyproject.toml`
+# (`[project.dependencies]` and the bundled `cursor` extra).
+# When you change the brewed `depends_on ... => :no_linkage` set, also update the
+# `BREWED_EXCLUSIONS` in `generate_formula.py` so those packages are emitted as
+# resources (or not) to match.
+#
+# `bottle do … end` and `revision` are deliberately NOT here: Homebrew's
+# `brew pr-pull` adds the bottle block after `brew test-bot` builds it, and
+# bumps `revision` on each rebuild. A new version starts at revision 0
+# (omitted).
+class Omnigent < Formula
+  include Language::Python::Virtualenv
+
+  desc "Meta-harness for AI agents"
+  homepage "https://github.com/omnigent-ai/omnigent"
+  url "__OMNIGENT_URL__"
+  sha256 "__OMNIGENT_SHA256__"
+  license "Apache-2.0"
+
+  # The Rust toolchain builds jiter and watchfiles from source.
+  depends_on "pkgconf" => :build
+  depends_on "rust" => :build
+  # certifi, cryptography, pydantic (which bundles pydantic-core), and rpds-py
+  # are provided by Homebrew formulae rather than built as virtualenv resources.
+  # The compiled ones would otherwise need a Rust/C build, and their transitive
+  # deps (cffi, pycparser) come along for free. The virtualenv is created with
+  # system site-packages, so it imports them from the brewed python. :no_linkage
+  # because they are Python imports, not libraries this formula links against.
+  depends_on "certifi" => :no_linkage
+  depends_on "cryptography" => :no_linkage
+  depends_on "libyaml"
+  depends_on "pydantic" => :no_linkage
+  depends_on "python@3.14"
+  depends_on "rpds-py" => :no_linkage
+  depends_on "tmux"
+
+__RESOURCES__
+
+  def install
+    venv = virtualenv_create(libexec, "python3.14")
+
+    # The Rust extensions (jiter, watchfiles) must leave Mach-O header padding so
+    # Homebrew can rewrite their install names to the Cellar path during
+    # relocation (macOS only; the flag breaks Linux ld).
+    ENV.append_to_rustflags "-C link-args=-Wl,-headerpad_max_install_names" if OS.mac?
+
+    # argon2-cffi-bindings' sdist ships an unprocessed .git_archival.txt that the
+    # (build-isolated, latest) setuptools-scm parses instead of falling back to
+    # PKG-INFO, so version detection fails. Pin the version it should report.
+    ENV["SETUPTOOLS_SCM_PRETEND_VERSION_FOR_ARGON2_CFFI_BINDINGS"] =
+      resource("argon2-cffi-bindings").version.to_s
+
+    venv.pip_install resources
+
+    venv.pip_install_and_link buildpath
+
+    bin.install_symlink libexec/"bin/omnigent", libexec/"bin/omni"
+
+    %w[omnigent omni].each do |cmd|
+      generate_completions_from_executable(libexec/"bin/#{cmd}",
+                                           base_name: cmd, shell_parameter_format: :click)
+    end
+  end
+
+  test do
+    system bin/"omnigent", "--help"
+
+    # certifi, cryptography, pydantic (with pydantic-core), and rpds-py are
+    # provided by Homebrew formulae and imported from the brewed python through
+    # the virtualenv's system site-packages; confirm they resolve in the venv.
+    system libexec/"bin/python", "-c", "import certifi, cryptography, pydantic, rpds"
+  end
+end

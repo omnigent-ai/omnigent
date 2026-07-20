@@ -78,7 +78,7 @@ export function useRevokePermission(sessionId: string) {
  * `null` permission level (single-user mode) is treated as unrestricted.
  */
 export function useCanEdit(conversationId: string): boolean {
-  const { data: conversationsData } = useConversations();
+  const { data: conversationsData } = useConversations("", true);
   const { session: activeSession, isLoading: sessionLoading } = useSession(conversationId);
   return useMemo(() => {
     const conversations = conversationsData?.pages.flatMap((p) => p.data);

@@ -17,7 +17,11 @@ from typing import Any
 
 import httpx
 
-from omnigent._native_post_delivery import post_may_have_been_delivered
+from omnigent._native_post_delivery import (
+    append_dead_letter,
+    post_external_session_status,
+    post_may_have_been_delivered,
+)
 from omnigent.claude_native_bridge import (
     BRIDGE_ID_LABEL_KEY,
     ClaudeHookRecord,
@@ -224,6 +228,14 @@ _HTTP_POST_MAX_PERMANENT_FAILURES = 3
 _HTTP_POST_RETRY_BASE_DELAY_S = 1.0
 _HTTP_POST_RETRY_MAX_DELAY_S = 30.0
 _HTTP_TRANSIENT_STATUS_CODES = {408, 409, 425, 429}
+# A 503 ``subagent_delivery_not_confirmed`` means the runner could not deliver a
+# terminal sub-agent result to the parent inbox. It is retried (the work entry can
+# be created slightly after the child reports terminal — a short dispatch race), but
+# UNLIKE a generic 5xx it must NOT retry forever: when the parent host is gone the
+# condition is permanent. Bounded so a single orphaned sub-agent cannot flood the
+# shared server. The budget spans the backoff schedule (capped at 30 s) ⇒ a few
+# minutes, comfortably covering the dispatch race.
+_SUBAGENT_DELIVERY_NOT_CONFIRMED_MAX_ATTEMPTS = 12
 _SUPERVISOR_INITIAL_BACKOFF_S = 1.0
 _SUPERVISOR_MAX_BACKOFF_S = 30.0
 _SUPERVISOR_HEALTHY_UPTIME_S = 60.0
@@ -249,6 +261,88 @@ _HOOK_EVENT_TO_STATUS: dict[str, str] = {
 }
 
 _logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _ForwardHealth:
+    """
+    Process-level health of Omnigent transcript/usage forwarding (#1120).
+
+    Network trouble (connect timeouts, 503s, resets) makes the forwarder's
+    event posts fail. Transient failures are retried indefinitely and
+    permanent ones are eventually dropped, but either way a sustained
+    outage previously surfaced only as scattered per-item warnings. This
+    tracks consecutive post failures so a real outage escalates to a
+    single loud signal instead of staying effectively silent.
+
+    Unlike the codex forwarder (which counts only its bounded-retry give-ups),
+    the claude forwarder retries transient failures forever, so every failed
+    post is counted here — that is what makes the indicator fire for the
+    503/connect-timeout outages #1120 is about, not just permanent 4xx drops.
+
+    :param consecutive_failures: Post failures since the last success.
+    :param degraded_logged: Whether the degraded-sync edge has already
+        been logged for the current outage (so it logs once, not per item).
+    """
+
+    consecutive_failures: int = 0
+    degraded_logged: bool = False
+
+
+# After this many consecutive post failures, sync is treated as degraded and
+# escalated once to ERROR. Small enough to fire during a real outage, large
+# enough to ride out a transient blip the retries already cover.
+_FORWARD_DEGRADED_THRESHOLD = 5
+_forward_health = _ForwardHealth()
+
+
+def _reset_forward_health() -> None:
+    """
+    Reset forward-health tracking (test seam / new forwarder lifetime).
+
+    :returns: None.
+    """
+    global _forward_health
+    _forward_health = _ForwardHealth()
+
+
+def _note_forward_success() -> None:
+    """
+    Record a successful (or ambiguously-delivered) forward, clearing any
+    degraded-sync state.
+
+    :returns: None.
+    """
+    if _forward_health.degraded_logged:
+        _logger.info(
+            "claude-native forward sync recovered after %d consecutive failures",
+            _forward_health.consecutive_failures,
+        )
+    _forward_health.consecutive_failures = 0
+    _forward_health.degraded_logged = False
+
+
+def _note_forward_failure(retry_key: str) -> None:
+    """
+    Record a forward post failure; escalate once when sync degrades.
+
+    :param retry_key: Stable retry key of the failed post, e.g.
+        ``"item:source-1"``.
+    :returns: None.
+    """
+    _forward_health.consecutive_failures += 1
+    if (
+        _forward_health.consecutive_failures >= _FORWARD_DEGRADED_THRESHOLD
+        and not _forward_health.degraded_logged
+    ):
+        _logger.error(
+            "claude-native forward sync degraded: %d consecutive Omnigent "
+            "event-post failures; transcript/usage mirroring may be incomplete "
+            "(latest key=%s)",
+            _forward_health.consecutive_failures,
+            retry_key,
+        )
+        _forward_health.degraded_logged = True
 
 
 @dataclass(frozen=True)
@@ -435,6 +529,17 @@ class _ForwardDedupeState:
     # sub-agent spend so the gate can block mid-turn. Separate baseline
     # because it can advance while ``posted_cost`` (S) is frozen.
     posted_policy_cost: float | None = None
+    # Response id of the last turn-start ``running`` status POSTed, so the
+    # id-bearing running edge fires exactly once per turn even when an
+    # assistant item is held across polls for delta ordering (which leaves
+    # ``state.current_response_id`` unadvanced). ``None`` until the first
+    # turn-start edge. Reset on /clear and /fork like the other baselines.
+    posted_running_response_id: str | None = None
+    # Failed cost posts are retried by this long-running poll loop. Without a
+    # retry gate, an edge 429 turns the poll interval into a request storm and
+    # prevents the limiter from recovering.
+    cost_retry_not_before: float = 0.0
+    cost_retry_failures: int = 0
 
 
 @dataclass(frozen=True)
@@ -509,6 +614,7 @@ class _PostRetryTracker:
         self,
         *,
         max_permanent_attempts: int = _HTTP_POST_MAX_PERMANENT_FAILURES,
+        max_not_confirmed_attempts: int = _SUBAGENT_DELIVERY_NOT_CONFIRMED_MAX_ATTEMPTS,
         base_delay_s: float = _HTTP_POST_RETRY_BASE_DELAY_S,
         max_delay_s: float = _HTTP_POST_RETRY_MAX_DELAY_S,
     ) -> None:
@@ -517,11 +623,14 @@ class _PostRetryTracker:
 
         :param max_permanent_attempts: Attempts before a permanent
             failure is exhausted.
+        :param max_not_confirmed_attempts: Attempts before a
+            ``subagent_delivery_not_confirmed`` 503 is exhausted.
         :param base_delay_s: Initial retry delay in seconds.
         :param max_delay_s: Maximum retry delay in seconds.
         :returns: None.
         """
         self._max_permanent_attempts = max(1, max_permanent_attempts)
+        self._max_not_confirmed_attempts = max(1, max_not_confirmed_attempts)
         self._base_delay_s = max(0.0, base_delay_s)
         self._max_delay_s = max(0.0, max_delay_s)
         self._entries: dict[str, _PostRetryEntry] = {}
@@ -550,6 +659,9 @@ class _PostRetryTracker:
         :returns: None.
         """
         self._entries.pop(key, None)
+        # A cleared key means the post got through (or was ambiguously
+        # delivered); reset process-level forward-sync health (#1120).
+        _note_forward_success()
 
     def record_failure(self, key: str, exc: httpx.HTTPError) -> _PostRetryDecision:
         """
@@ -559,19 +671,26 @@ class _PostRetryTracker:
         :param exc: HTTP exception raised while posting the event.
         :returns: Retry decision for this failure.
         """
+        # Count every failed post (transient or permanent) so a sustained
+        # outage escalates once to a degraded-sync signal (#1120).
+        _note_forward_failure(key)
         entry = self._entries.get(key)
         if entry is None:
             entry = _PostRetryEntry()
             self._entries[key] = entry
         entry.attempts += 1
         permanent = _is_permanent_http_error(exc)
-        if permanent and entry.attempts >= self._max_permanent_attempts:
+        not_confirmed = _is_subagent_delivery_not_confirmed(exc)
+        give_up = (permanent and entry.attempts >= self._max_permanent_attempts) or (
+            not_confirmed and entry.attempts >= self._max_not_confirmed_attempts
+        )
+        if give_up:
             self._entries.pop(key, None)
             return _PostRetryDecision(
                 attempts=entry.attempts,
                 delay_s=0.0,
                 exhausted=True,
-                permanent=True,
+                permanent=permanent,
             )
         delay_s = min(
             self._base_delay_s * (2 ** max(0, entry.attempts - 1)),
@@ -824,6 +943,14 @@ async def forward_claude_transcript_to_session(
                         task_subjects=task_subjects,
                         task_statuses=task_statuses,
                         task_order=task_order,
+                        # The turn-end edges (Stop→idle / StopFailure→failed)
+                        # carry the turn's response id so ap-web can CLOSE the
+                        # streaming ``activeResponse`` opened by the turn-start
+                        # ``running`` edge (_forward_available_items). The
+                        # transcript forwarder ran just above, so
+                        # ``state.current_response_id`` is the active turn's id
+                        # (the user-message reset only fires on the next turn).
+                        response_id=state.current_response_id,
                     )
                     subagent_state = await _forward_available_subagents(
                         client=client,
@@ -1192,6 +1319,24 @@ async def _forward_available_subagents(
                     decision.attempts,
                     _http_status_for_log(exc),
                 )
+                # Dead-letter the dropped payload for recovery (#1120; replay #1579).
+                append_dead_letter(
+                    bridge_dir,
+                    session_id=parent_session_id,
+                    event_type="external_subagent_start",
+                    payload={
+                        "subagent_id": subagent_id,
+                        "agent_type": meta["agentType"],
+                        "description": meta["description"],
+                        "tool_use_id": meta["toolUseId"],
+                    },
+                    reason="permanent HTTP failure after retries",
+                    # Claude only dead-letters permanent 4xx (it retries
+                    # transient failures forever), so the server proved it
+                    # rejected the item: never ambiguous, never replayable (#1579).
+                    delivered_ambiguous=False,
+                    http_status=_http_status_for_log(exc),
+                )
                 # Park this sub-agent: insert a sentinel entry so we
                 # don't keep retrying. ``child_conversation_id=""``
                 # is filtered out by the tail / status loops below.
@@ -1287,6 +1432,23 @@ async def _forward_available_subagents(
                         item.source_id,
                         decision.attempts,
                         _http_status_for_log(exc),
+                    )
+                    # Dead-letter the dropped item for recovery (#1120; replay #1579).
+                    append_dead_letter(
+                        bridge_dir,
+                        session_id=entry.child_conversation_id,
+                        event_type="external_conversation_item",
+                        payload={
+                            "item_type": item.item_type,
+                            "item_data": item.data,
+                            "response_id": item.response_id,
+                        },
+                        reason="permanent HTTP failure after retries",
+                        # Claude only dead-letters permanent 4xx (it retries
+                        # transient failures forever), so the server proved it
+                        # rejected the item: never ambiguous, never replayable (#1579).
+                        delivered_ambiguous=False,
+                        http_status=_http_status_for_log(exc),
                     )
                     # Skip this item and continue — alternative is to
                     # block the whole sub-agent forever on one poison
@@ -1413,7 +1575,7 @@ async def _forward_available_subagents(
             retry_key = f"subagent_status:{entry.child_conversation_id}"
             if status_retry_tracker.retry_delay_s(retry_key) is None:
                 try:
-                    await _post_external_session_status(
+                    await post_external_session_status(
                         client,
                         session_id=entry.child_conversation_id,
                         status=desired_status,
@@ -1623,6 +1785,8 @@ async def _forward_session_cost(
         mutated in place.
     :returns: None.
     """
+    if time.monotonic() < dedupe.cost_retry_not_before:
+        return
     status_state = await asyncio.to_thread(read_claude_context_state, bridge_dir)
     status_cost = _cumulative_cost_from_status_state(status_state)
     active_subagents = [
@@ -1677,14 +1841,25 @@ async def _forward_session_cost(
             usage=payload,
         )
     except httpx.HTTPError as exc:
+        dedupe.cost_retry_failures += 1
+        delay = min(30.0, float(2 ** min(dedupe.cost_retry_failures - 1, 5)))
+        if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 429:
+            raw_retry_after = exc.response.headers.get("retry-after")
+            with contextlib.suppress(ValueError):
+                delay = max(delay, float(raw_retry_after)) if raw_retry_after else delay
+        dedupe.cost_retry_not_before = time.monotonic() + delay
         _logger.warning(
-            "Failed to forward Claude session cost; session=%s bridge_dir=%s http_status=%s",
+            "Failed to forward Claude session cost; session=%s bridge_dir=%s "
+            "http_status=%s retry_in=%.1fs",
             session_id,
             bridge_dir,
             _http_status_for_log(exc),
+            delay,
             exc_info=True,
         )
         return
+    dedupe.cost_retry_failures = 0
+    dedupe.cost_retry_not_before = 0.0
     if "cumulative_cost_usd" in payload:
         dedupe.posted_cost = display_cost
     if "policy_cost_usd" in payload:
@@ -2383,6 +2558,7 @@ async def _forward_available_status_events(
     task_subjects: dict[str, str],
     task_statuses: dict[str, str],
     task_order: list[str],
+    response_id: str | None = None,
 ) -> HookForwardState:
     """
     Forward currently available hook events as ``session.status``.
@@ -2417,6 +2593,11 @@ async def _forward_available_status_events(
     :param task_order: Mutable ordered list of task ids in creation order,
         e.g. ``["1", "2", "3"]``. Appended in-place from ``TaskCreated``
         events. Used to render the task list in a stable order.
+    :param response_id: Active turn's response id, stamped on the
+        ``Stop``→``idle`` / ``StopFailure``→``failed`` edges so ap-web
+        closes the streaming ``activeResponse`` opened by the matching
+        turn-start ``running`` edge. ``None`` when no turn id is known
+        (the status still posts, just without a turn association).
     :returns: Updated state. On post failure, returns the last
         durable state so successfully-posted statuses are not
         retried and the failing event is retried later.
@@ -2571,11 +2752,22 @@ async def _forward_available_status_events(
         retry_key = f"hook:{record.event_cursor}:{record.byte_offset}:{status}"
         if retry_tracker.retry_delay_s(retry_key) is not None:
             return durable
+        effective_status = status
+        if status == "idle" and record.background_task_count > 0:
+            effective_status = "waiting"
         try:
-            await _post_external_session_status(
+            await post_external_session_status(
                 client,
                 session_id=session_id,
-                status=status,
+                status=effective_status,
+                response_id=response_id,
+                # Only the ``Stop`` (idle/waiting) edge carries an authoritative
+                # background-shell count — ``0`` clears the tally, ``N`` sets it.
+                # ``StopFailure`` (failed) clears it on the server regardless, so
+                # leave its count off the wire.
+                background_task_count=(
+                    None if status == "failed" else record.background_task_count
+                ),
             )
         except httpx.HTTPError as exc:
             decision = retry_tracker.record_failure(retry_key, exc)
@@ -2597,6 +2789,7 @@ async def _forward_available_status_events(
                         session_id=session_id,
                         bridge_dir=bridge_dir,
                         reason=f"hook status {status} rejected",
+                        response_id=response_id,
                     )
                 durable = next_durable
                 await _write_hook_state_async(bridge_dir, durable)
@@ -2680,6 +2873,31 @@ async def _ensure_state_for_transcript(
     return state
 
 
+def _turn_has_assistant_output(items: list[ClaudeTranscriptItem], response_id: str) -> bool:
+    """
+    Whether ``response_id`` has assistant-generated output among ``items``.
+
+    The turn-start ``running`` edge should open a streaming turn only for an id
+    that a later ``Stop``/``StopFailure`` hook will close — i.e. one produced by
+    an actual LLM turn. Assistant text (``message`` with ``role=assistant``) and
+    tool calls (``function_call``) qualify; a ``slash_command`` (``/model``,
+    ``/effort``) or ``terminal_command`` (``!cmd``) item opens an id with no LLM
+    turn behind it, so it must not.
+
+    :param items: Transcript items read this poll.
+    :param response_id: The current turn's response id.
+    :returns: ``True`` when an assistant-output item carries ``response_id``.
+    """
+    for item in items:
+        if item.response_id != response_id:
+            continue
+        if item.item_type == "function_call":
+            return True
+        if item.item_type == "message" and item.data.get("role") == "assistant":
+            return True
+    return False
+
+
 async def _forward_available_items(
     *,
     client: httpx.AsyncClient,
@@ -2729,6 +2947,49 @@ async def _forward_available_items(
     # never fired ``UserPromptSubmit``). PTY-activity status makes it
     # obsolete: the pane keeps changing through a mid-turn compaction, so
     # the runner's watcher holds the session ``running`` directly.
+    #
+    # Turn-start edge: the first time we see a turn's response id, publish a
+    # ``running`` status carrying it. The PTY watcher already drives the
+    # running/idle BADGE with a bare (id-less) status; this id-bearing edge is
+    # what lets ap-web open a *streaming* ``activeResponse`` for the turn, so
+    # the forwarded tool-call cards (which carry the same response id) render
+    # LIVE — spinner + elapsed timer — instead of as static completed cards.
+    # Deduped on the persistent ``dedupe`` baseline (NOT ``state``): when an
+    # assistant item is held across polls for delta ordering, this function
+    # early-returns with ``state`` unadvanced, so a ``state``-based guard would
+    # re-fire ``running`` every poll of the hold window. Best-effort — a failed
+    # status post must not abort item forwarding (the items below are the
+    # primary payload); the turn-end idle/failed edge still carries the id to
+    # close the lifecycle, and the badge is unaffected either way.
+    #
+    # Only open the streaming turn for an id that has ASSISTANT output in this
+    # poll's items. A surfaced CLI built-in (``/model``, ``/effort``) or a
+    # ``!cmd`` becomes a slash_command / terminal_command item that opens its
+    # own response id but runs no LLM turn, so no ``Stop`` hook ever fires to
+    # close it — a ``running`` opened for it would strand the web composer in
+    # its "Stop"/busy state until the next real message. A skill that DOES
+    # trigger an LLM turn shares its id with the assistant text it produces, so
+    # ``running`` still fires — one poll later, when that output appears.
+    if (
+        current_response_id is not None
+        and dedupe.posted_running_response_id != current_response_id
+        and _turn_has_assistant_output(items, current_response_id)
+    ):
+        try:
+            await post_external_session_status(
+                client,
+                session_id=session_id,
+                status="running",
+                response_id=current_response_id,
+            )
+            dedupe.posted_running_response_id = current_response_id
+        except httpx.HTTPError:
+            _logger.warning(
+                "Failed to forward Claude turn-start running status; session=%s response_id=%s",
+                session_id,
+                current_response_id,
+                exc_info=True,
+            )
     updated = state
     for item in items:
         if item.source_id in seen:
@@ -2765,11 +3026,29 @@ async def _forward_available_items(
                     decision.attempts,
                     _http_status_for_log(exc),
                 )
+                # Dead-letter the dropped item for recovery (#1120; replay #1579).
+                append_dead_letter(
+                    bridge_dir,
+                    session_id=session_id,
+                    event_type="external_conversation_item",
+                    payload={
+                        "item_type": item.item_type,
+                        "item_data": item.data,
+                        "response_id": item.response_id,
+                    },
+                    reason="permanent HTTP failure after retries",
+                    # Claude only dead-letters permanent 4xx (it retries
+                    # transient failures forever), so the server proved it
+                    # rejected the item: never ambiguous, never replayable (#1579).
+                    delivered_ambiguous=False,
+                    http_status=_http_status_for_log(exc),
+                )
                 await _post_forwarder_failed_status(
                     client,
                     session_id=session_id,
                     bridge_dir=bridge_dir,
                     reason=f"transcript item {item.source_id} rejected",
+                    response_id=current_response_id,
                 )
                 seen.add(item.source_id)
                 seen_source_ids.append(item.source_id)
@@ -3214,18 +3493,32 @@ async def _post_external_conversation_item(
     :returns: None.
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     """
-    resp = await client.post(
-        f"/v1/sessions/{session_id}/events",
-        json={
-            "type": "external_conversation_item",
-            "data": {
-                "item_type": item.item_type,
-                "item_data": item.data,
-                "response_id": item.response_id,
+    from omnigent.runtime import telemetry
+
+    # The forwarder is the decoupled response path (it tails Claude's
+    # transcript and re-POSTs items under its own trace, not the request's).
+    # session_scope binds the session generically (the processor stamps
+    # session.id on this span and any other span in the forward); response_id
+    # is per-item, so it's set explicitly.
+    with (
+        telemetry.session_scope(session_id),
+        telemetry.span(
+            "claude_native.forward",
+            attributes={"omnigent.response_id": item.response_id},
+        ),
+    ):
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "external_conversation_item",
+                "data": {
+                    "item_type": item.item_type,
+                    "item_data": item.data,
+                    "response_id": item.response_id,
+                },
             },
-        },
-    )
-    resp.raise_for_status()
+        )
+        resp.raise_for_status()
 
 
 async def _post_external_output_text_delta(
@@ -3387,22 +3680,29 @@ def _model_alias_for(model: str | None) -> str | None:
     Collapse a concrete Claude model id to the picker's tier alias.
 
     The web model picker speaks Claude Code's version-agnostic aliases
-    (``"fable"`` / ``"opus"`` / ``"sonnet"`` / ``"haiku"``); the
+    (``"fable"`` / ``"opus"`` / ``"sonnet"`` / ``"haiku"``), plus the one
+    extra concrete-id slot ``"sonnet_5"`` (see
+    :data:`omnigent.claude_native._UCODE_CLAUDE_CUSTOM_TIER`) for the newer
+    Sonnet generation offered alongside the default ``"sonnet"`` tier; the
     transcript records the resolved concrete id (e.g.
-    ``"claude-opus-4-8"`` or ``"databricks-claude-sonnet-4-6"``).
+    ``"claude-opus-4-8"`` or ``"databricks-claude-sonnet-5"``).
     Mapping to the tier keeps the mirrored value in the picker's
-    vocabulary and makes a web→TUI round-trip a no-op.
+    vocabulary and makes a web→TUI round-trip a no-op. The older Sonnet
+    (``sonnet-4-6``) collapses to the generic ``"sonnet"`` alias — it is the
+    default that row is bound to.
 
     :param model: Concrete model id from the transcript, e.g.
         ``"claude-opus-4-8"``; ``None`` when none observed yet.
-    :returns: ``"fable"`` / ``"opus"`` / ``"sonnet"`` / ``"haiku"``
-        when the id carries a known tier token, else ``None`` (the
-        caller skips the post rather than surface an id the picker
+    :returns: ``"fable"`` / ``"opus"`` / ``"sonnet"`` / ``"sonnet_5"`` /
+        ``"haiku"`` when the id carries a known tier token, else ``None``
+        (the caller skips the post rather than surface an id the picker
         can't render).
     """
     if not model:
         return None
     lowered = model.lower()
+    if "sonnet-5" in lowered or "sonnet_5" in lowered:
+        return "sonnet_5"
     for tier in ("fable", "opus", "sonnet", "haiku"):
         if tier in lowered:
             return tier
@@ -3529,40 +3829,6 @@ async def _forward_model_from_status(
         dedupe=dedupe,
         alias=alias,
     )
-
-
-async def _post_external_session_status(
-    client: httpx.AsyncClient,
-    *,
-    session_id: str,
-    status: str,
-    output: str | None = None,
-) -> None:
-    """
-    Post one ``external_session_status`` event to the Sessions API.
-
-    :param client: Omnigent HTTP client.
-    :param session_id: Omnigent session/conversation id.
-    :param status: Session status value, e.g. ``"idle"`` or
-        ``"failed"``.
-    :param output: Optional text attached to the event ``data``. On a
-        ``"failed"`` edge the server surfaces it as the session's failure
-        reason (``last_task_error``) so the UI renders a detail instead of
-        a bare "failed" (#1113). Ignored when falsy.
-    :returns: None.
-    :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
-    """
-    data: dict[str, Any] = {"status": status}
-    if output:
-        data["output"] = output
-    resp = await client.post(
-        f"/v1/sessions/{session_id}/events",
-        json={
-            "type": "external_session_status",
-            "data": data,
-        },
-    )
-    resp.raise_for_status()
 
 
 async def _post_external_compaction_status(
@@ -3754,6 +4020,7 @@ async def _post_forwarder_failed_status(
     session_id: str,
     bridge_dir: Path,
     reason: str,
+    response_id: str | None = None,
 ) -> None:
     """
     Best-effort publish a failed status after dropping a poison event.
@@ -3763,11 +4030,19 @@ async def _post_forwarder_failed_status(
     :param bridge_dir: Native Claude bridge directory.
     :param reason: Diagnostic reason for the failure event, e.g.
         ``"transcript item item-1 rejected"``.
+    :param response_id: Active turn's response id, so this ``failed``
+        edge closes the streaming ``activeResponse`` for the matching
+        turn rather than leaving its tool cards spinning. ``None`` when
+        no turn id is known.
     :returns: None.
     """
     try:
-        await _post_external_session_status(
-            client, session_id=session_id, status="failed", output=reason
+        await post_external_session_status(
+            client,
+            session_id=session_id,
+            status="failed",
+            output=reason,
+            response_id=response_id,
         )
     except httpx.HTTPError:
         _logger.warning(
@@ -3816,6 +4091,29 @@ def _is_permanent_http_error(exc: httpx.HTTPError) -> bool:
         return False
     status_code = exc.response.status_code
     return 400 <= status_code < 500 and status_code not in _HTTP_TRANSIENT_STATUS_CODES
+
+
+def _is_subagent_delivery_not_confirmed(exc: httpx.HTTPError) -> bool:
+    """
+    Return whether ``exc`` is a runner ``subagent_delivery_not_confirmed`` 503.
+
+    The runner returns this application-level 503 when a terminal sub-agent
+    payload could not be delivered to the parent inbox (no work entry / inbox).
+    It is a bounded-retry class, distinct from a generic transient 5xx.
+
+    :param exc: HTTP exception raised while posting an Omnigent event.
+    :returns: ``True`` only for a 503 whose JSON body carries
+        ``error == "subagent_delivery_not_confirmed"``.
+    """
+    if not isinstance(exc, httpx.HTTPStatusError):
+        return False
+    if exc.response.status_code != 503:
+        return False
+    try:
+        body = exc.response.json()
+    except Exception:  # noqa: BLE001 — best-effort body parse
+        return False
+    return isinstance(body, dict) and body.get("error") == "subagent_delivery_not_confirmed"
 
 
 def _http_status_for_log(exc: httpx.HTTPError) -> int | None:

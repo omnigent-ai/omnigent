@@ -81,6 +81,45 @@ The host URL can also be passed positionally (`omnigent host
 http://localhost:6767`). See the [README](README.md) for more on hosts,
 harnesses, and credentials.
 
+### Backend-only local development validation
+
+Use this when you want to validate the Python backend and local API server from
+a source checkout without building the web UI, configuring provider
+credentials, creating sessions, or running agents -- a quick server/API smoke
+check on your working copy or current `main`.
+
+[`scripts/backend-smoke.sh`](scripts/backend-smoke.sh) automates it:
+
+```bash
+scripts/backend-smoke.sh              # boots on port 18080
+PORT=18090 scripts/backend-smoke.sh   # override the port if 18080 is busy
+```
+
+It installs `uv` into a throwaway toolchain venv, runs `uv sync --frozen`,
+starts the server in API-only mode (`OMNIGENT_SKIP_WEB_UI=true`), waits for
+`/health`, and smoke-tests `/`, `/health`, `/docs`, `/v1/agents`, and
+`/v1/sessions` -- expecting HTTP `200` from all five. It exits non-zero if any
+check fails.
+
+Notes:
+
+- **Requires `bash` or `zsh`** (the script's `#!/usr/bin/env bash` shebang
+  guarantees this); it is not POSIX-`sh` portable. **Also needs** Python 3.12+
+  as `python3`, `git`, `curl`, and network access to PyPI. No provider
+  credentials are needed. **Works on Linux and macOS.**
+- **Fully isolated, disposable:** every artifact -- the toolchain and project
+  venvs, config, data, the SQLite database, artifacts, logs, and `pip`/`uv`
+  caches -- lives under one `mktemp -d` runtime directory removed on exit, so
+  the run never touches your real `~/.omnigent`, `~/.config` / `~/Library`, or
+  package caches. `HOME` is the primary isolation lever (it redirects
+  `~/.config` on Linux and `~/Library` on macOS); the explicit `UV_*` / `PIP_*`
+  / `OMNIGENT_*` overrides pin the toolchain and app state regardless of OS,
+  and `XDG_*` are set so an `XDG_*` already exported in your shell cannot
+  redirect state back to your real home.
+- **What it does not cover:** the web UI, mobile access, human-in-the-loop
+  approval flows, provider-backed sessions, or agent execution. Use the full
+  local development flow above when working on those areas.
+
 ## Tests
 
 A change that alters behaviour under `omnigent/` should ship with a test, and a
@@ -142,3 +181,7 @@ Frontend changes follow the same expectation with a different toolchain:
 
 - Branch from `main`, keep changes focused, and include tests or docs when relevant.
 - Sign off your commits with `git commit -s` (Developer Certificate of Origin).
+- Fill in the PR template. For **UI / frontend changes**, check the
+  "UI / frontend change" box and attach a **video or images** in the `Demo`
+  section showing the new behaviour, so reviewers can see it without checking
+  out the branch.

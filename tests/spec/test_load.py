@@ -338,12 +338,10 @@ def test_load_omnigent_yaml_preserves_use_responses_bool(tmp_path: Path) -> None
     ``HARNESS_OPENAI_AGENTS_USE_RESPONSES=true``, causing silent API failures for
     models that require ``use_responses=False`` (e.g. Kimi K2 via Databricks).
 
-    Root cause guarded: ``_omnigent_compat.load_omnigent_yaml`` previously used
-    ``yaml.safe_load`` to read the raw YAML, but importing ``load_agent_def`` mutates
-    ``yaml.SafeLoader``'s implicit resolvers as a side effect, causing ``safe_load`` to
-    return string ``"false"`` for unquoted ``false`` values.  The fix is to use
-    ``_OmnigentYamlLoader`` directly (which owns its resolvers and is unaffected by
-    the mutation).
+    How it's guarded: ``_omnigent_compat.load_omnigent_yaml`` reads the raw YAML
+    with ``_OmnigentYamlLoader`` (not ``yaml.safe_load``) so this raw read resolves
+    booleans the same way ``load_agent_def``'s own parsing does — both loaders keep
+    ``on``/``off`` as plain strings and parse unquoted ``false`` as bool ``False``.
     """
     yaml_text = textwrap.dedent("""\
         name: kimi-test

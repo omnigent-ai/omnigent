@@ -19,7 +19,7 @@ import { Button } from "@/components/ui/button";
 import { switchSessionAgent } from "@/lib/sessionsApi";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { useSessionAgent } from "@/hooks/useAgents";
-import { agentRootName, forkTargetCarriesHistory, harnessFamily } from "@/lib/forkHarness";
+import { agentRootName, harnessFamily, switchTargetCarriesHistory } from "@/lib/forkHarness";
 
 // "" means no target chosen yet. It must be empty (not a sentinel like
 // "__none__"): Radix only renders the trigger placeholder when the controlled
@@ -38,7 +38,9 @@ const NONE_CHOSEN = "";
  * Unlike Clone (fork), this keeps the SAME session — transcript, comments,
  * files, and workspace are untouched; only the agent/harness changes, and
  * the next turn runs on it. The picker lists only history-preserving targets
- * (the same rule as the fork agent picker, via `forkTargetCarriesHistory`).
+ * via `switchTargetCarriesHistory` — like the fork picker but WITHOUT the
+ * fork-only preamble harnesses (cursor/opencode), which would start fresh on
+ * an in-place switch.
  * A cross-family switch resets model + reasoning effort to the target's
  * defaults, which the dialog warns about before submitting. On success it
  * refreshes the bound-agent and session-list queries; a failure (e.g. 409
@@ -86,15 +88,16 @@ export function SwitchAgentDialog({
     currentAgentName;
 
   // Targets, excluding the session's own agent (switching to it is a no-op)
-  // and any target that wouldn't preserve history — SDK and native targets
-  // both carry from any source (see forkTargetCarriesHistory); only
-  // unclassifiable harnesses are hidden.
+  // and any target that wouldn't preserve history on an in-place switch. SDK
+  // and native-rebuild targets carry from any source; the fork-only preamble
+  // harnesses (cursor/opencode) and unclassifiable harnesses are hidden — see
+  // switchTargetCarriesHistory.
   const switchableAgents = (agents ?? []).filter(
     (a) =>
       a.id !== currentAgent?.id &&
       a.name !== currentAgentName &&
       a.name !== currentAgentRootName &&
-      forkTargetCarriesHistory(a.harness),
+      switchTargetCarriesHistory(a.harness),
   );
 
   const chosen = switchableAgents.find((a) => a.id === agentChoice) ?? null;

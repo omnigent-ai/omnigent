@@ -1,4 +1,12 @@
-import { type DragEvent, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import {
+  type DragEvent,
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useNavigate, useSearchParams } from "@/lib/routing";
 import { useQueryClient } from "@tanstack/react-query";
 import {
@@ -7,14 +15,18 @@ import {
   CheckIcon,
   CircleHelpIcon,
   ChevronDownIcon,
+  ChevronLeftIcon,
+  ChevronRightIcon,
   GitBranchIcon,
   ArrowUpIcon,
+  Loader2Icon,
   FileTextIcon,
   FolderIcon,
   ImageIcon,
   PaperclipIcon,
   PlusIcon,
   SearchIcon,
+  ShuffleIcon,
   TagIcon,
   TriangleAlertIcon,
   XIcon,
@@ -45,13 +57,28 @@ import { sandboxOptionLabel } from "@/lib/capabilities";
 import { isSlashCommandText, SlashCommandMenu } from "@/components/SlashCommandMenu";
 import { setPendingInitialPrompt } from "@/store/chatStore";
 import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { CliCommandBlock } from "./CliCommandBlock";
 import { WorkspacePicker, isNavigablePath } from "./WorkspacePicker";
+import {
+  initialPrefillState,
+  prefillDone,
+  projectPrefillStep,
+  type ProjectPrefillState,
+} from "./projectPrefill";
 import { getCliServerUrl } from "@/lib/host";
 import { getOmnigentHostConfig } from "@/lib/host";
 import { readLastAgentId, writeLastAgentId } from "@/lib/agentPreferences";
-import { readLastModeForHarness, writeLastModeForHarness } from "@/lib/modePreferences";
-import { BRAIN_HARNESS_LABELS } from "@/lib/agentLabels";
+import {
+  readLastHostChoice,
+  writeLastHostChoice,
+  SANDBOX_HOST_CHOICE,
+} from "@/lib/hostPreferences";
+import { readLastHarness, writeLastHarness } from "@/lib/harnessPreferences";
+import { readHideUnconfiguredHarnesses } from "@/lib/harnessVisibilityPreferences";
+import { readDefaultBaseBranch } from "@/lib/baseBranchPreferences";
+import { readHarnessOptions, writeHarnessOption } from "@/lib/modePreferences";
+import { useBrainHarnessLabels } from "@/lib/agentLabels";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import { sortAgentsForDisplay } from "@/lib/agentGrouping";
 import { cn } from "@/lib/utils";
@@ -69,15 +96,31 @@ import {
   onHostStatusChanged,
   type HostIdentity,
 } from "@/lib/nativeBridge";
-import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
+import {
+  useAvailableAgents,
+  prefetchAvailableAgentDetails,
+  type AvailableAgent,
+} from "@/hooks/useAvailableAgents";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import { useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import { useHostFilesystem, type HostFilesystemEntry } from "@/hooks/useHostFilesystem";
+import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 import { useNativeServerSwitcherForMainSurface } from "@/hooks/useNativeServerSwitcher";
+import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 import type { Conversation } from "@/hooks/useConversations";
-import { useProjects, PROJECT_LABEL_KEY } from "@/hooks/useConversations";
+import { useNewestProjectSession, useProjects, PROJECT_LABEL_KEY } from "@/hooks/useConversations";
+import { FileMentionMenu } from "@/components/FileMentionMenu";
+import { useMentionBrowser } from "@/hooks/useMentionBrowser";
+import {
+  buildMentionPreamble,
+  detectMentionAt,
+  mentionItemPath,
+  type MentionState,
+  parseMentionToken,
+  rankMentionEntries,
+} from "@/lib/composerMentions";
 import { OttoEyes } from "@/components/OttoEyes";
 import { SkillPills } from "@/components/SkillPills";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
@@ -109,6 +152,16 @@ const SKILL_PILL_AGENTS = new Set(["polly", "debby"]);
 // sessions only. "default" is Claude's own default and sends no flag; any
 // other value is passed through as `--permission-mode <value>` via the
 // session's terminal_launch_args. Keep in sync with `claude --help`.
+// Harnesses for which server-side smart routing is available.
+const _ROUTABLE_HARNESSES = new Set([
+  "claude-sdk",
+  "claude_sdk",
+  "claude-native",
+  "codex",
+  "codex-native",
+  "pi",
+]);
+
 const CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE = "default";
 const CLAUDE_NATIVE_PERMISSION_MODES: { value: string; label: string; description: string }[] = [
   { value: "default", label: "Default", description: "Prompts before edits and commands" },
@@ -131,13 +184,14 @@ const CLAUDE_NATIVE_PERMISSION_MODES: { value: string; label: string; descriptio
   },
 ];
 
-// Claude-native model + reasoning-effort defaults for the new-session
-// model/effort picker. These are Claude Code's own effective defaults, so a
-// fresh session shows "Sonnet Medium" and rides along as `model_override` /
-// `reasoning_effort` on the create. Effort levels mirror CLAUDE_NATIVE_EFFORT
-// _LEVELS in ChatPage's in-session picker (ANTHROPIC_EFFORTS server-side).
-const CLAUDE_NATIVE_DEFAULT_MODEL = "sonnet";
-const CLAUDE_NATIVE_DEFAULT_EFFORT = "medium";
+// Claude-native reasoning-effort options for the new-session model/effort
+// picker. There is deliberately no hardcoded model/effort default: a fresh
+// session leaves both unselected and omits `model_override` / `reasoning_effort`
+// from the create, so Claude Code falls back to its own configured model — the
+// same "no override" semantics the in-session picker's `null` state and the
+// `/model default` / `/effort default` commands use. Effort levels mirror
+// CLAUDE_NATIVE_EFFORT_LEVELS in ChatPage's in-session picker (ANTHROPIC_EFFORTS
+// server-side).
 const CLAUDE_NATIVE_EFFORTS: { value: string; label: string }[] = [
   { value: "low", label: "Low" },
   { value: "medium", label: "Medium" },
@@ -354,6 +408,22 @@ export function normalizeWorkspacePath(path: string): string | null {
 }
 
 /**
+ * Shorten an absolute path to its last two segments with a leading
+ * ellipsis, so worktree rows show the disambiguating tail (e.g.
+ * ``"…/myrepo-worktrees/feature-x"``) instead of a shared prefix that
+ * truncates to the same string for every entry.
+ *
+ * @param path Absolute path, e.g. ``"/Users/me/myrepo-worktrees/feature-x"``.
+ * @returns The tail, prefixed with ``"…/"`` when segments were dropped;
+ *   the original path when it already has two or fewer segments.
+ */
+export function worktreePathTail(path: string): string {
+  const segments = path.replace(/\/+$/, "").split("/").filter(Boolean);
+  if (segments.length <= 2) return path;
+  return `…/${segments.slice(-2).join("/")}`;
+}
+
+/**
  * Existing sessions that would share an on-disk working directory with a new
  * session created in ``workspace`` on ``hostId``.
  *
@@ -475,13 +545,21 @@ function isCodexHarness(harness: string): boolean {
   return harness === "codex" || harness === "codex-native" || harness === "native-codex";
 }
 
+function isNativeCursorHarness(harness: string): boolean {
+  return harness === "cursor-native" || harness === "native-cursor";
+}
+
 export function harnessUnavailableReasonOnHost(
   harness: string | null | undefined,
   host: Host | undefined | null,
 ): string | null {
   if (!harness || !host?.configured_harnesses) return null;
   const availability = host.configured_harnesses[harness];
-  if (availability === false) return isCodexHarness(harness) ? "binary-missing" : "unconfigured";
+  if (availability === false) {
+    if (isCodexHarness(harness)) return "binary-missing";
+    if (isNativeCursorHarness(harness)) return "cursor-cli-missing";
+    return "unconfigured";
+  }
   if (
     isCodexHarness(harness) &&
     (availability === "binary-missing" || availability === "needs-auth")
@@ -495,6 +573,7 @@ export function harnessUnavailableReasonOnHost(
 export function harnessWarningBadgeText(reason: string | null): string {
   if (reason === "binary-missing") return "binary missing";
   if (reason === "needs-auth") return "needs auth";
+  if (reason === "cursor-cli-missing") return "install & login";
   return "needs setup";
 }
 
@@ -503,11 +582,14 @@ export function harnessWarningMessageText(
   hostName: string | undefined,
   reason: string | null,
 ): string {
+  if (reason === "cursor-cli-missing") {
+    return `${agentName} needs cursor-agent on ${hostName} — install it with \`curl https://cursor.com/install -fsS | bash\`, then run \`cursor-agent login\`.`;
+  }
   if (reason === "needs-auth") {
     return `${agentName} needs Codex authentication on ${hostName} — run codex login on that machine.`;
   }
   if (reason === "binary-missing") {
-    return `${agentName} is missing the Codex binary on ${hostName} — run omnigent setup on that machine.`;
+    return `${agentName} can't find the Codex binary on ${hostName} — if codex is installed, restart the host with omnigent host so it picks up your PATH, or set OMNIGENT_CODEX_PATH. Otherwise run omnigent setup.`;
   }
   return `${agentName} isn't configured on ${hostName} — run omnigent setup on that machine.`;
 }
@@ -517,6 +599,15 @@ function harnessWarningMessage(
   hostName: string | undefined,
   reason: string | null,
 ): ReactNode {
+  if (reason === "cursor-cli-missing") {
+    return (
+      <>
+        {agentName} needs cursor-agent on {hostName} — install it with{" "}
+        <code>curl https://cursor.com/install -fsS | bash</code>, then run{" "}
+        <code>cursor-agent login</code>.
+      </>
+    );
+  }
   if (reason === "needs-auth") {
     return (
       <>
@@ -528,8 +619,9 @@ function harnessWarningMessage(
   if (reason === "binary-missing") {
     return (
       <>
-        {agentName} is missing the Codex binary on {hostName} — run <code>omnigent setup</code> on
-        that machine.
+        {agentName} can&apos;t find the Codex binary on {hostName} — if codex is installed, restart
+        the host with <code>omnigent host</code> so it picks up your PATH, or set{" "}
+        <code>OMNIGENT_CODEX_PATH</code>. Otherwise run <code>omnigent setup</code>.
       </>
     );
   }
@@ -776,6 +868,9 @@ function LandingProjectPicker({
                 value={newName}
                 onChange={(e) => setNewName(e.target.value)}
                 onKeyDown={(e) => {
+                  // Don't commit while an IME composition Enter is being
+                  // confirmed (e.g. Japanese conversion). Mirrors #132/#243.
+                  if (isImeCompositionKeyEvent(e)) return;
                   if (e.key === "Enter") {
                     e.preventDefault();
                     commitNew();
@@ -1059,18 +1154,28 @@ function BrainHarnessOptions({
   value,
   onValueChange,
   host,
+  labels,
+  hideUnconfigured,
 }: {
   value: string;
   onValueChange: (harness: string) => void;
   host: Host | undefined | null;
+  labels: Record<string, string>;
+  hideUnconfigured: boolean;
 }) {
+  // With "hide unconfigured harnesses" on, drop brain options that can't launch
+  // on the host — except the current selection, which stays so the radio group
+  // still reflects the active pick.
+  const entries = Object.entries(labels).filter(
+    ([id]) => id === value || !hideUnconfigured || !harnessUnconfiguredOnHost(id, host),
+  );
   return (
     <>
       <div className="px-2 pt-1.5 pb-0.5 text-[11px] font-medium text-muted-foreground">
         Agent Harness
       </div>
       <DropdownMenuRadioGroup value={value} onValueChange={onValueChange}>
-        {Object.entries(BRAIN_HARNESS_LABELS).map(([id, label]) => (
+        {entries.map(([id, label]) => (
           <DropdownMenuRadioItem
             key={id}
             value={id}
@@ -1185,6 +1290,7 @@ function PickerSectionHeader({ children }: { children: ReactNode }) {
 function AgentHarnessPicker({
   agentEntries,
   harnessEntries,
+  brainHarnessLabels,
   effectiveAgentId,
   agentLabel,
   hasAgents,
@@ -1194,6 +1300,7 @@ function AgentHarnessPicker({
   pendingAgentId,
   onSelectPending,
   onCreateCustomAgent,
+  sandboxSelected,
   permissionMode,
   approvalMode,
   cursorExecMode,
@@ -1211,6 +1318,7 @@ function AgentHarnessPicker({
 }: {
   agentEntries: AvailableAgent[];
   harnessEntries: AvailableAgent[];
+  brainHarnessLabels: Record<string, string>;
   effectiveAgentId: string | null;
   agentLabel: string;
   hasAgents: boolean;
@@ -1220,6 +1328,7 @@ function AgentHarnessPicker({
   pendingAgentId: string;
   onSelectPending: () => void;
   onCreateCustomAgent: () => void;
+  sandboxSelected: boolean;
   permissionMode: string;
   approvalMode: string;
   cursorExecMode: string;
@@ -1233,17 +1342,51 @@ function AgentHarnessPicker({
   setBypassSandbox: (enabled: boolean) => void;
   setPickedModel: (model: string) => void;
   setPickedEffort: (effort: string) => void;
-  setPickedHarness: (harness: string | null) => void;
+  setPickedHarness: (harness: string | null, agentId?: string) => void;
 }) {
   // Controlled so clicking a knobbed row can commit the pick and close the
   // menu (see the sub-trigger onClick below) without diving into the submenu.
   const [open, setOpen] = useState(false);
+  const queryClient = useQueryClient();
+
+  // Touch devices can't hover, so the desktop knob flyout (a Radix sub-menu
+  // that opens on hover) is unreachable there. On mobile we instead swap the
+  // dropdown's contents in place: tapping anywhere on a configurable row
+  // drills into that agent's knobs on the same surface, with a Back row to
+  // return. `mobileKnobsAgentId` is the agent whose knobs are showing (null =
+  // the agent list). Inert on desktop, which keeps the hover flyout.
+  const isMobile = useIsMobileViewport();
+  const [mobileKnobsAgentId, setMobileKnobsAgentId] = useState<string | null>(null);
+
+  // Pin the open direction on mobile. The agent list is tall and often opens
+  // upward (Radix flips it above the trigger when it won't fit below); the
+  // shorter knobs page would fit below and snap back down, so the menu would
+  // jump across the trigger on every drill-in. We instead measure at open
+  // time which side has more room and force it for the whole session
+  // (`avoidCollisions` off), so the in-place swap can't change the direction.
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const [mobileSide, setMobileSide] = useState<"top" | "bottom">("bottom");
 
   const hasKnobs = (agent: AvailableAgent): boolean =>
     nativeAgentHasCapability(agent, "permissionMode") ||
     nativeAgentHasCapability(agent, "approvalMode") ||
     nativeAgentHasCapability(agent, "cursorMode") ||
-    (agent.harness != null && agent.harness in BRAIN_HARNESS_LABELS);
+    (agent.harness != null && agent.harness in brainHarnessLabels);
+
+  // The agent whose knobs page is open, resolved from the live entry lists so
+  // it tracks renames / removals. `showMobileKnobs` gates the page: false on
+  // desktop, or if the agent vanished or lost its knobs (e.g. the list
+  // refreshed) — in which case the effect below clears the id so a reopened
+  // menu lands back on the agent list instead of an empty page.
+  const mobileKnobsAgent =
+    mobileKnobsAgentId != null
+      ? ([...harnessEntries, ...agentEntries].find((a) => a.id === mobileKnobsAgentId) ?? null)
+      : null;
+  const showMobileKnobs = isMobile && mobileKnobsAgent != null && hasKnobs(mobileKnobsAgent);
+
+  useEffect(() => {
+    if (mobileKnobsAgentId != null && !showMobileKnobs) setMobileKnobsAgentId(null);
+  }, [mobileKnobsAgentId, showMobileKnobs]);
 
   // The agent name + optional short blurb, shared by leaf rows and
   // submenu sub-triggers. The hover flyout (full spec description) is kept
@@ -1276,31 +1419,48 @@ function AgentHarnessPicker({
   const knobSectionsFor = (agent: AvailableAgent): ReactNode => {
     const isSelected = agent.id === effectiveAgentId;
     const entryHarness = nativeCodingAgentForAvailableAgent(agent)?.harness ?? null;
-    // The value to show: the live shared state when this entry is the active
-    // selection, else the entry harness's last pick (or its default).
+    // All of this entry harness's remembered knobs (mode / model / effort),
+    // read once. The value to SHOW: the live shared state when this entry is the
+    // active selection, else the stored pick.
+    const stored = entryHarness ? readHarnessOptions(entryHarness) : {};
     const modeValue = (modes: readonly { value: string }[], dflt: string, live: string): string => {
       if (isSelected) return live;
-      const stored = entryHarness ? readLastModeForHarness(entryHarness) : null;
-      return stored != null && modes.some((m) => m.value === stored) ? stored : dflt;
+      return stored.mode != null && modes.some((m) => m.value === stored.mode) ? stored.mode : dflt;
     };
     const onModeChange = (setMode: (m: string) => void) => (mode: string) => {
       onSelectAgent(agent);
-      if (entryHarness) writeLastModeForHarness(entryHarness, mode);
+      if (entryHarness) writeHarnessOption(entryHarness, { mode });
       setMode(mode);
     };
+    // Same show-the-live-pick-or-the-stored-last logic for the model/effort
+    // knobs (only the claude-native entry has them). Resolves to "" (nothing
+    // checked → no override sent → Claude Code's own default) when nothing's
+    // stored or the stored id has since retired.
+    const modelValue = isSelected
+      ? pickedModel
+      : stored.model != null && CLAUDE_NATIVE_MODELS.some((m) => m.id === stored.model)
+        ? stored.model
+        : "";
+    const effortValue = isSelected
+      ? pickedEffort
+      : stored.effort != null && CLAUDE_NATIVE_EFFORTS.some((e) => e.value === stored.effort)
+        ? stored.effort
+        : "";
 
     if (nativeAgentHasCapability(agent, "permissionMode")) {
       return (
         <>
           <ModelEffortOptions
-            model={pickedModel}
-            effort={pickedEffort}
+            model={modelValue}
+            effort={effortValue}
             onModelChange={(m) => {
               onSelectAgent(agent);
+              if (entryHarness) writeHarnessOption(entryHarness, { model: m });
               setPickedModel(m);
             }}
             onEffortChange={(e) => {
               onSelectAgent(agent);
+              if (entryHarness) writeHarnessOption(entryHarness, { effort: e });
               setPickedEffort(e);
             }}
           />
@@ -1362,7 +1522,7 @@ function AgentHarnessPicker({
     }
     // Bundle / custom agent with an overridable brain harness.
     const defaultHarness =
-      agent.harness != null && agent.harness in BRAIN_HARNESS_LABELS ? agent.harness : null;
+      agent.harness != null && agent.harness in brainHarnessLabels ? agent.harness : null;
     if (defaultHarness) {
       const value = isSelected ? (pickedHarness ?? defaultHarness) : defaultHarness;
       return (
@@ -1372,9 +1532,11 @@ function AgentHarnessPicker({
             onSelectAgent(agent);
             // Picking the spec default clears the override so the session
             // tracks the spec.
-            setPickedHarness(h === defaultHarness ? null : h);
+            setPickedHarness(h === defaultHarness ? null : h, agent.id);
           }}
           host={host}
+          labels={brainHarnessLabels}
+          hideUnconfigured={hideUnconfigured}
         />
       );
     }
@@ -1394,6 +1556,34 @@ function AgentHarnessPicker({
         >
           {renderRowInner(agent, true)}
           {renderBadge(agent)}
+        </DropdownMenuItem>
+      );
+    }
+    if (isMobile) {
+      // Mobile has no hover, so there's no flyout to reveal the knobs. Tapping
+      // anywhere on a configurable row drills into this agent's knobs page on
+      // the same surface (the trailing chevron signals the drill-in); a Back
+      // row returns to the list. One tap target — the whole row — so no part
+      // of the row behaves differently from the rest.
+      return (
+        <DropdownMenuItem
+          key={agent.id}
+          data-testid={`new-chat-landing-agent-${agent.id}`}
+          data-active={active ? "true" : undefined}
+          onSelect={(e) => {
+            // Keep the menu open and swap to this agent's knobs page instead
+            // of closing. Commit the pick too, mirroring the desktop flyout
+            // where touching a knob selects the entry — so closing from the
+            // knobs page (tap-away / Back-then-elsewhere) lands on this agent.
+            e.preventDefault();
+            onSelectAgent(agent);
+            setMobileKnobsAgentId(agent.id);
+          }}
+          className="items-start gap-2 rounded-sm px-2 py-1.5 text-13 data-[active=true]:bg-accent/60 data-[active=true]:text-foreground"
+        >
+          {renderRowInner(agent, false)}
+          {renderBadge(agent)}
+          <ChevronRightIcon className="ml-1 size-4 shrink-0 self-center text-muted-foreground/70" />
         </DropdownMenuItem>
       );
     }
@@ -1424,10 +1614,44 @@ function AgentHarnessPicker({
     );
   };
 
+  // Opt-in "hide unconfigured harnesses" filter (Settings › Appearance). When
+  // on, drop harness rows that can't launch on the selected host. Fails open:
+  // harnessUnconfiguredOnHost returns false with no host / no readiness map, so
+  // nothing is hidden in those cases, and unrecognized harnesses stay visible.
+  const hideUnconfigured = useMemo(() => readHideUnconfiguredHarnesses(), []);
+  const visibleHarnessEntries = useMemo(
+    () =>
+      hideUnconfigured
+        ? harnessEntries.filter((a) => !harnessUnconfiguredOnHost(a.harness, host))
+        : harnessEntries,
+    [hideUnconfigured, harnessEntries, host],
+  );
+
   return (
-    <DropdownMenu open={open} onOpenChange={setOpen}>
+    <DropdownMenu
+      open={open}
+      onOpenChange={(next) => {
+        setOpen(next);
+        if (next) {
+          // Lock the open direction to whichever side has more room for the
+          // tall list, so the later drill-in (shorter page) can't flip it.
+          const rect = triggerRef.current?.getBoundingClientRect();
+          if (rect) setMobileSide(window.innerHeight - rect.bottom >= rect.top ? "bottom" : "top");
+          // Prefetch harness/description/skills for all session-discovered
+          // agents so hasKnobs is stable before the user reads the list.
+          for (const agent of [...harnessEntries, ...agentEntries]) {
+            void prefetchAvailableAgentDetails(agent, queryClient);
+          }
+        } else {
+          // Closing resets the in-place page so the menu always reopens on the
+          // agent list, never a stale knobs page.
+          setMobileKnobsAgentId(null);
+        }
+      }}
+    >
       <DropdownMenuTrigger asChild>
         <Button
+          ref={triggerRef}
           type="button"
           variant="ghost"
           size="sm"
@@ -1445,47 +1669,119 @@ function AgentHarnessPicker({
       </DropdownMenuTrigger>
       <DropdownMenuContent
         align="end"
-        side="bottom"
+        // Desktop keeps the default collision handling (the content never
+        // resizes there — knobs live in hover flyouts). On mobile we force the
+        // measured side and disable flipping so the in-place page swap holds
+        // its direction; `--radix-..-available-height` still caps + scrolls it.
+        side={isMobile ? mobileSide : "bottom"}
+        avoidCollisions={!isMobile}
         className="max-h-[var(--radix-dropdown-menu-content-available-height)] min-w-64 max-w-[calc(100vw-2rem)] overflow-y-auto p-1"
       >
-        {/* Harnesses group first — the native terminal CLIs (Claude Code is
-            the default), so the most-used picks lead. */}
-        {harnessEntries.length > 0 && (
-          <>
-            <PickerSectionHeader>Harnesses</PickerSectionHeader>
-            {harnessEntries.map(renderEntry)}
+        {showMobileKnobs && mobileKnobsAgent ? (
+          // Mobile knobs page: the selected agent's run-config knobs shown in
+          // place of the list, led by a Back row that returns to it. The
+          // slide-in keeps the drill-in feel without the fragile
+          // height-measuring the reverted flyout-fold needed (#393).
+          <div
+            data-testid="new-chat-landing-agent-config-page"
+            className="animate-in fade-in-0 slide-in-from-right-2 duration-150"
+          >
+            <DropdownMenuItem
+              data-testid="new-chat-landing-agent-config-back"
+              onSelect={(e) => {
+                // Step back to the list instead of closing the menu.
+                e.preventDefault();
+                setMobileKnobsAgentId(null);
+              }}
+              className="items-center gap-1.5 rounded-sm px-2 py-1.5 text-13 font-medium"
+            >
+              <ChevronLeftIcon className="size-4 shrink-0 opacity-70" />
+              <span className="truncate">{mobileKnobsAgent.display_name}</span>
+            </DropdownMenuItem>
             <DropdownMenuSeparator />
+            {knobSectionsFor(mobileKnobsAgent)}
+          </div>
+        ) : (
+          <>
+            {/* Harnesses group first — the native terminal CLIs (Claude Code is
+            the default), so the most-used picks lead. */}
+            {visibleHarnessEntries.length > 0 && (
+              <>
+                <PickerSectionHeader>Harnesses</PickerSectionHeader>
+                {visibleHarnessEntries.map(renderEntry)}
+                <DropdownMenuSeparator />
+              </>
+            )}
+            {/* Agents group — SDK / bundle + custom agents. Always rendered so the
+            "Create custom agent" action is reachable even with no bundle agents. */}
+            <PickerSectionHeader>Agents</PickerSectionHeader>
+            {agentEntries.map(renderEntry)}
+            {pendingAgent && (
+              <DropdownMenuItem
+                key={pendingAgentId}
+                data-testid="new-chat-landing-agent-pending"
+                data-active={effectiveAgentId === pendingAgentId ? "true" : undefined}
+                onSelect={onSelectPending}
+                className="items-start gap-2 rounded-sm px-2 py-1.5 text-13 data-[active=true]:bg-accent/60 data-[active=true]:text-foreground"
+              >
+                <div className="flex min-w-0 flex-1 items-baseline gap-2.5">
+                  <span className="truncate">{pendingAgent.name}</span>
+                  <span className="truncate text-[11px] text-muted-foreground/70">Custom</span>
+                </div>
+              </DropdownMenuItem>
+            )}
+            {/* A managed sandbox provisions its runner from a baked image and
+            has no create path for an uploaded bundle, so custom-agent creation
+            isn't offered there — the item is omitted on a sandbox target. */}
+            {!sandboxSelected && (
+              <DropdownMenuItem
+                data-testid="new-chat-landing-create-agent"
+                onSelect={onCreateCustomAgent}
+                className="gap-2 rounded-sm px-2 py-1.5 text-13 text-muted-foreground"
+              >
+                <PlusIcon className="size-3.5" />
+                Create custom agent
+              </DropdownMenuItem>
+            )}
           </>
         )}
-        {/* Agents group — SDK / bundle + custom agents. Always rendered so the
-            "Create custom agent" action is reachable even with no bundle agents. */}
-        <PickerSectionHeader>Agents</PickerSectionHeader>
-        {agentEntries.map(renderEntry)}
-        {pendingAgent && (
-          <DropdownMenuItem
-            key={pendingAgentId}
-            data-testid="new-chat-landing-agent-pending"
-            data-active={effectiveAgentId === pendingAgentId ? "true" : undefined}
-            onSelect={onSelectPending}
-            className="items-start gap-2 rounded-sm px-2 py-1.5 text-13 data-[active=true]:bg-accent/60 data-[active=true]:text-foreground"
-          >
-            <div className="flex min-w-0 flex-1 items-baseline gap-2.5">
-              <span className="truncate">{pendingAgent.name}</span>
-              <span className="truncate text-[11px] text-muted-foreground/70">Custom</span>
-            </div>
-          </DropdownMenuItem>
-        )}
-        <DropdownMenuItem
-          data-testid="new-chat-landing-create-agent"
-          onSelect={onCreateCustomAgent}
-          className="gap-2 rounded-sm px-2 py-1.5 text-13 text-muted-foreground"
-        >
-          <PlusIcon className="size-3.5" />
-          Create custom agent
-        </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
   );
+}
+
+// In-memory draft for the new-session landing screen, so a half-composed
+// message, attachments and picker selections survive the unmount that happens
+// when the user navigates into an existing session and back. Module-scoped,
+// not persisted to storage (a page refresh starts clean); cleared on create.
+type LandingDraft = {
+  message: string;
+  files: File[];
+  pickedAgentId: string | null;
+  selectedHostId: string | null;
+  sandboxSelected: boolean;
+  sandboxRepoUrl: string;
+  sandboxRepoBranch: string;
+  workspace: string;
+  branchName: string;
+  prefilledBranch: string;
+  permissionMode: string;
+  approvalMode: string;
+  bypassSandbox: boolean;
+  cursorExecMode: string;
+  pickedHarness: string | null;
+  pickedModel: string;
+  pickedEffort: string;
+  costControlMode: CostControlMode;
+};
+
+let landingDraft: LandingDraft | null = null;
+
+// Test-only: clears the preserved landing draft so each case starts from a
+// clean module state (the draft is module-scoped and survives unmount by
+// design, which would otherwise leak between tests).
+export function resetLandingDraft(): void {
+  landingDraft = null;
 }
 
 export function NewChatLandingScreen() {
@@ -1494,10 +1790,8 @@ export function NewChatLandingScreen() {
   const queryClient = useQueryClient();
   const serverUrl = getCliServerUrl();
   const { data: agents } = useAvailableAgents();
-  const { data: hosts } = useHosts();
-  // Sessions the caller can access, to warn when a new session would share a
-  // working directory with a live one (see the conflict tooltip below).
-  const { data: directorySessions } = useDirectorySessions(true);
+  const brainHarnessLabels = useBrainHarnessLabels();
+  const { data: hosts, isLoading: hostsLoading } = useHosts();
 
   const agentList = useMemo(
     () =>
@@ -1532,7 +1826,7 @@ export function NewChatLandingScreen() {
   const [landingSurface, setLandingSurface] = useState<HTMLElement | null>(null);
   useNativeServerSwitcherForMainSurface(landingSurface, true);
 
-  const [message, setMessage] = useState<string>("");
+  const [message, setMessage] = useState<string>(() => landingDraft?.message ?? "");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const isComposingRef = useRef(false);
   // maxRows 9 = 180px of 20px lines, matching the composer's 200px
@@ -1542,7 +1836,7 @@ export function NewChatLandingScreen() {
   // Attachments for the first message — same affordances as the in-session
   // composer (paperclip + paste); carried to ChatPage via the pending
   // initial prompt and sent with the auto-dispatched first turn.
-  const [files, setFiles] = useState<File[]>([]);
+  const [files, setFiles] = useState<File[]>(() => landingDraft?.files ?? []);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const addFiles = (incoming: File[]) => setFiles((prev) => [...prev, ...incoming]);
   const removeFile = (index: number) => setFiles((prev) => prev.filter((_, i) => i !== index));
@@ -1600,15 +1894,29 @@ export function NewChatLandingScreen() {
   const databricksGitCredentialsTooltipContent = docsLinks?.databricksGitCredentials;
   const showDisabledSandboxWithDocs = !managedSandboxesEnabled && !!newSandboxTooltipContent;
 
+  // Project driving this visit, when the sidebar's per-project "new session"
+  // pencil landed here with a `?project=` query param. Empty otherwise.
+  const projectParam = searchParams.get("project") ?? "";
   // Seeded from the persisted last pick so a returning user starts on the
   // agent they used last; validated against the live list in
-  // effectiveAgentId below (a stale id falls back to the default).
-  const [pickedAgentId, setPickedAgentId] = useState<string | null>(() => readLastAgentId());
-  const [selectedHostId, setSelectedHostId] = useState<string | null>(null);
+  // effectiveAgentId below (a stale id falls back to the default). A
+  // project-driven visit defers to the project-prefill effect instead
+  // (which falls back to the same last pick).
+  const [pickedAgentId, setPickedAgentId] = useState<string | null>(
+    () => landingDraft?.pickedAgentId ?? (projectParam !== "" ? null : readLastAgentId()),
+  );
+  const [selectedHostId, setSelectedHostId] = useState<string | null>(
+    () => landingDraft?.selectedHostId ?? null,
+  );
+  // Sessions on the selected host — fetched only when a host is selected,
+  // to avoid registering hundreds of sessions into the health poll at idle.
+  const { data: directorySessions } = useDirectorySessions(selectedHostId !== null);
   // True when the user picked the sandbox option instead of a connected
   // host — the server provisions a sandbox host at create time
   // (host_type: "managed"), so no host_id or workspace is sent.
-  const [sandboxSelected, setSandboxSelected] = useState(false);
+  const [sandboxSelected, setSandboxSelected] = useState(
+    () => landingDraft?.sandboxSelected ?? false,
+  );
   // Desktop-shell host status for THIS machine (null outside Electron), so the
   // picker can tag the current machine and offer to auto-connect it.
   const [desktopHost, setDesktopHost] = useState<HostIdentity | null>(null);
@@ -1620,16 +1928,36 @@ export function NewChatLandingScreen() {
   // Sandbox repository inputs — composed into the managed create's
   // `workspace` string (`<url>[#<branch>]`); both blank = empty
   // server-created workspace.
-  const [sandboxRepoUrl, setSandboxRepoUrl] = useState<string>("");
-  const [sandboxRepoBranch, setSandboxRepoBranch] = useState<string>("");
-  const [workspace, setWorkspace] = useState<string>("");
-  const [branchName, setBranchName] = useState<string>("");
-  const [baseBranch, setBaseBranch] = useState<string>("");
+  const [sandboxRepoUrl, setSandboxRepoUrl] = useState<string>(
+    () => landingDraft?.sandboxRepoUrl ?? "",
+  );
+  const [sandboxRepoBranch, setSandboxRepoBranch] = useState<string>(
+    () => landingDraft?.sandboxRepoBranch ?? "",
+  );
+  const [workspace, setWorkspace] = useState<string>(() => landingDraft?.workspace ?? "");
+  const [branchName, setBranchName] = useState<string>(() => landingDraft?.branchName ?? "");
+  // The base branch auto-fills from the configured default (Settings › Git)
+  // when the user names a worktree branch, and is left alone once the user
+  // touches it — clearing the branch name re-arms the auto-fill (see the effect
+  // below). `baseBranchEdited` tracks that hand-off; any edit (including
+  // clearing the field) sets it so a later re-seed won't clobber the choice.
+  const [baseBranch, _setBaseBranch] = useState<string>("");
+  const [baseBranchEdited, setBaseBranchEdited] = useState<boolean>(false);
+  const setBaseBranch = useCallback((next: string) => {
+    _setBaseBranch(next);
+    setBaseBranchEdited(true);
+  }, []);
+  // Branch prefilled from the existing worktree the current workspace points
+  // at. When `branchName` still equals this, the session starts directly in
+  // that worktree (no git opts). Editing the field away from it means the user
+  // wants a *new* worktree off that name.
+  const [prefilledBranch, setPrefilledBranch] = useState<string>(
+    () => landingDraft?.prefilledBranch ?? "",
+  );
   // Project to file the new session under (an implicit collection stored as a
   // conversation_labels row). Empty = unfiled. Applied right after create.
-  // Pre-filled from a `?project=` query param so the sidebar's per-project
-  // "new session" pencil can land here with the project already selected.
-  const projectParam = searchParams.get("project") ?? "";
+  // Pre-filled from the `?project=` param so the sidebar's per-project
+  // "new session" pencil lands here with the project already selected.
   const [selectedProject, setSelectedProject] = useState<string>(() => projectParam);
   // The landing screen stays mounted while the `?project=` param changes (e.g.
   // clicking a different project's pencil), so the lazy initializer above won't
@@ -1641,40 +1969,99 @@ export function NewChatLandingScreen() {
   // meaningful for the claude-native wrapper; ignored otherwise. Lives in
   // the footer tray's Advanced settings menu.
   const [permissionMode, setPermissionMode] = useState<string>(
-    CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE,
+    () => landingDraft?.permissionMode ?? CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE,
   );
   // Approval mode for Codex (codex --approval-mode). Only meaningful for
   // the codex-native wrapper; ignored otherwise. Lives in the footer
   // tray's Advanced settings menu.
-  const [approvalMode, setApprovalMode] = useState<string>(CODEX_NATIVE_DEFAULT_APPROVAL_MODE);
+  const [approvalMode, setApprovalMode] = useState<string>(
+    () => landingDraft?.approvalMode ?? CODEX_NATIVE_DEFAULT_APPROVAL_MODE,
+  );
   // DANGEROUS codex full-bypass opt-in (Codex only). OFF by default and only
   // flippable on after the user types the confirmation phrase, so it can
   // never be enabled by an accidental click. Persisted as a conversation
   // label so it survives reload. When on, a persistent red banner warns and
   // the runner ignores the approval-mode preset's flags.
-  const [bypassSandbox, setBypassSandbox] = useState<boolean>(false);
+  const [bypassSandbox, setBypassSandbox] = useState<boolean>(
+    () => landingDraft?.bypassSandbox ?? false,
+  );
   // Execution mode for Cursor (cursor-agent --mode / --yolo). Only meaningful
   // for the cursor-native wrapper; ignored otherwise.
-  const [cursorExecMode, setCursorExecMode] = useState<string>(CURSOR_NATIVE_DEFAULT_EXEC_MODE);
+  const [cursorExecMode, setCursorExecMode] = useState<string>(
+    () => landingDraft?.cursorExecMode ?? CURSOR_NATIVE_DEFAULT_EXEC_MODE,
+  );
   // Per-session brain-harness override for bundle agents (polly / debby).
-  // null = the agent spec's declared harness (no override sent); cleared on
-  // every agent switch so a pick never leaks across agents.
-  const [pickedHarness, setPickedHarness] = useState<string | null>(null);
+  // null = the agent spec's declared harness (no override sent). On agent
+  // switch, seeded from the user's last stored pick for that agent.
+  const [pickedHarness, setPickedHarness] = useState<string | null>(
+    () =>
+      landingDraft?.pickedHarness ??
+      readLastHarness(landingDraft?.pickedAgentId ?? readLastAgentId()),
+  );
   // Per-session model + reasoning effort for the claude-native model picker.
-  // Default to Claude Code's own effective defaults (Sonnet / Medium); the
-  // pick rides along as `model_override` / `reasoning_effort` on the create.
-  const [pickedModel, setPickedModel] = useState<string>(CLAUDE_NATIVE_DEFAULT_MODEL);
-  const [pickedEffort, setPickedEffort] = useState<string>(CLAUDE_NATIVE_DEFAULT_EFFORT);
+  // "" = unselected: nothing is checked and `model_override` / `reasoning_effort`
+  // are omitted from the create, so Claude Code uses its own configured model.
+  // An explicit pick rides along and is remembered (seeded back on a later visit
+  // via the harness-seed effect below).
+  const [pickedModel, _setPickedModel] = useState<string>(() => landingDraft?.pickedModel ?? "");
+  const [pickedEffort, setPickedEffort] = useState<string>(() => landingDraft?.pickedEffort ?? "");
   // Per-session cost-control switch ("Cost Optimized" pill). Unset
   // (null) defers to the agent spec's default and is omitted from
   // the create body.
-  const [costControlMode, setCostControlMode] = useState<CostControlMode>(null);
+  const [costControlMode, _setCostControlMode] = useState<CostControlMode>(
+    () => landingDraft?.costControlMode ?? null,
+  );
+  // Model selection and smart routing are mutually exclusive: enabling
+  // routing clears the explicit model pick, and picking a model turns
+  // routing off.
+  const setPickedModel = useCallback((model: string) => {
+    _setPickedModel(model);
+    if (model) _setCostControlMode(null);
+  }, []);
+  const setCostControlMode = useCallback((mode: CostControlMode) => {
+    _setCostControlMode(mode);
+    if (mode === "on") _setPickedModel("");
+  }, []);
   // Controls the working-directory popover so picking a directory closes it.
   const [workspacePopoverOpen, setWorkspacePopoverOpen] = useState(false);
+  // Controlled so selecting an existing worktree can close the popover.
+  const [worktreePopoverOpen, setWorktreePopoverOpen] = useState(false);
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
   // "Connect a host" instructions modal, opened from the host dropdown.
   const [connectOpen, setConnectOpen] = useState(false);
+
+  // Mirror the current draft fields into a ref every render so the unmount
+  // cleanup below can snapshot the latest values without re-subscribing.
+  // `submittedRef` is flipped just before we navigate to a freshly-created
+  // session so the snapshot is dropped instead of resurrected.
+  const submittedRef = useRef(false);
+  const draftRef = useRef<LandingDraft>(null as unknown as LandingDraft);
+  draftRef.current = {
+    message,
+    files,
+    pickedAgentId,
+    selectedHostId,
+    sandboxSelected,
+    sandboxRepoUrl,
+    sandboxRepoBranch,
+    workspace,
+    branchName,
+    prefilledBranch,
+    permissionMode,
+    approvalMode,
+    bypassSandbox,
+    cursorExecMode,
+    pickedHarness,
+    pickedModel,
+    pickedEffort,
+    costControlMode,
+  };
+  useEffect(() => {
+    return () => {
+      landingDraft = submittedRef.current ? null : draftRef.current;
+    };
+  }, []);
 
   const { recent, addRecent } = useRecentWorkspaces(selectedHostId);
 
@@ -1709,21 +2096,116 @@ export function NewChatLandingScreen() {
     };
   }, []);
 
-  // Auto-select the FIRST AVAILABLE option, mirroring the menu order, so
-  // a session can be started without an explicit pick: the sandbox when
-  // the server supports it (it's pinned first in the picker), else the
-  // first online host. Only fills an empty slot; explicit choices are
-  // never overridden.
+  // Project prefill: a project-driven visit reuses the project's newest
+  // session — its host, source repo, and agent — so the composer is ready
+  // to send without re-picking anything.
+  const { data: projectNewest, isError: projectNewestFailed } = useNewestProjectSession(
+    projectParam !== "" ? projectParam : null,
+  );
+  // That session may have run in a linked worktree (git_branch set), where
+  // its workspace is the worktree dir, not the repo. Listing that path's
+  // worktrees returns the whole set, including the `is_main` source repo.
+  const needsSourceRepoResolve =
+    projectNewest != null &&
+    projectNewest.git_branch != null &&
+    projectNewest.workspace != null &&
+    projectNewest.host_id != null;
+  const {
+    data: sourceWorktreesData,
+    isError: projectSourceWorktreesFailed,
+    isPlaceholderData: sourceWorktreesArePlaceholder,
+  } = useHostWorktrees(
+    needsSourceRepoResolve ? (projectNewest.host_id ?? null) : null,
+    needsSourceRepoResolve ? (projectNewest.workspace ?? null) : null,
+  );
+  // The hook serves the previous query's data as a placeholder while a new
+  // fetch is in flight — that would be another repo's worktrees here.
+  const projectSourceWorktrees = sourceWorktreesArePlaceholder ? undefined : sourceWorktreesData;
+  // State machine driving the project prefill: a location track (host →
+  // workspace → branch → settled) plus an independent agent seed. The
+  // generic host/workspace defaults below hold off until the location
+  // track settles so they can't win the race against the project's values.
+  const [prefill, setPrefill] = useState<ProjectPrefillState>(() =>
+    initialPrefillState(projectParam),
+  );
+  // The generic defaults gate on the location track only — the agent seed
+  // waits on its own fetch and must not hold up the host/workspace fill.
+  const prefillSettled = prefill.phase === "settled";
+  // Host whose workspace was already seeded once, so a host re-pick doesn't
+  // clobber the field (used by the per-host seeding effect below).
+  const seededHostRef = useRef<string | null>(null);
+
+  // The landing screen stays mounted while `?project=` changes (clicking
+  // another project's pencil), so re-create a fresh visit by hand: clear
+  // every seedable slot and restart the machine. Values the user set are
+  // reset too — a pencil click means "set me up for this project".
   useEffect(() => {
+    if (prefill.project === projectParam) return;
+    setSandboxSelected(false);
+    setSelectedHostId(null);
+    setPickedAgentId(projectParam !== "" ? null : readLastAgentId());
+    setWorkspace("");
+    setBranchName("");
+    seededHostRef.current = null;
+    setPrefill(initialPrefillState(projectParam));
+  }, [projectParam, prefill.project]);
+
+  // Auto-select an option so a session can be started without an explicit
+  // pick. Prefer the user's last explicit choice (persisted across visits);
+  // otherwise fall back to the FIRST AVAILABLE option in menu order — the
+  // sandbox when the server supports it (it's pinned first in the picker),
+  // else the first online host. Only fills an empty slot; an explicit choice
+  // already in state (or restored from the in-memory draft) is never
+  // overridden. Holds off while a project prefill is deciding.
+  useEffect(() => {
+    if (!prefillSettled) return;
     if (sandboxSelected) return;
     if (selectedHostId !== null) return;
+
+    // Read the persisted pick once, as a mount-time seed — deliberately NOT a
+    // dependency: it only matters until the slot is filled, and re-running on
+    // its value would fight an explicit in-session selection.
+    const lastChoice = readLastHostChoice();
+    if (lastChoice === SANDBOX_HOST_CHOICE) {
+      // Wait for the server-info probe before acting on a sandbox pick: until
+      // it resolves we don't know whether the sandbox is offered, and falling
+      // through to a connected host would strand the returning sandbox user
+      // (this effect wouldn't re-run to correct it once a host is set).
+      if (info === "loading") return;
+      if (managedSandboxesEnabled) {
+        setSandboxSelected(true);
+        return;
+      }
+      // Sandbox no longer offered (e.g. an OSS server) — fall through.
+    } else if (lastChoice) {
+      // A persisted host pick can only be honored once the host list has
+      // loaded and shows it online. Wait for the load rather than defaulting
+      // past it — defaulting to the sandbox here would set sandboxSelected and
+      // this effect would then never re-run to restore the host.
+      if (hostsLoading) return;
+      const stored = (hosts ?? []).find((h) => h.host_id === lastChoice && h.status === "online");
+      if (stored) {
+        setSelectedHostId(stored.host_id);
+        return;
+      }
+      // Stored host is gone or offline — fall through to the default.
+    }
+
     if (managedSandboxesEnabled) {
       setSandboxSelected(true);
       return;
     }
     const firstOnline = (hosts ?? []).find((h) => h.status === "online");
     if (firstOnline) setSelectedHostId(firstOnline.host_id);
-  }, [hosts, selectedHostId, sandboxSelected, managedSandboxesEnabled]);
+  }, [
+    hosts,
+    hostsLoading,
+    selectedHostId,
+    sandboxSelected,
+    managedSandboxesEnabled,
+    info,
+    prefillSettled,
+  ]);
 
   // Fall back to the host's home directory when it has no recorded recents, so
   // the working-directory field is pre-filled and the user can send in one
@@ -1746,36 +2228,45 @@ export function NewChatLandingScreen() {
 
   // Seed the working directory once per host, into an empty field only, so an
   // explicit pick isn't clobbered. Prefer the most-recent path; else the
-  // derived home (which can arrive a render later, hence the dep).
-  const seededHostRef = useRef<string | null>(null);
+  // derived home (which can arrive a render later, hence the dep). Holds
+  // off while a project prefill is deciding on a workspace of its own.
   useEffect(() => {
+    if (!prefillSettled) return;
     if (selectedHostId === null) return;
     if (seededHostRef.current === selectedHostId) return;
     const candidate = recent[0] ?? derivedHome;
     if (!candidate) return;
     seededHostRef.current = selectedHostId;
     setWorkspace((cur) => (cur === "" ? candidate : cur));
-  }, [selectedHostId, recent, derivedHome]);
+  }, [selectedHostId, recent, derivedHome, prefillSettled]);
 
   // A pick only wins while it exists in the list — a persisted id whose
   // agent has since been unregistered (or hidden) falls back to the default.
   // The pending custom agent sentinel also wins when set.
+  // A pending (just-created, not-yet-submitted) custom agent can't run on a
+  // managed sandbox — the sandbox create path doesn't provision a runner for a
+  // bundled agent. So a pending pick made before switching to a sandbox is
+  // dropped there, falling back to a real agent; off the sandbox it's kept.
+  const pendingAgentAllowedOnTarget = !sandboxSelected;
   const effectiveAgentId =
-    pickedAgentId === PENDING_AGENT_ID
+    pickedAgentId === PENDING_AGENT_ID && pendingAgentAllowedOnTarget
       ? PENDING_AGENT_ID
       : ((agentList.some((a) => a.id === pickedAgentId) ? pickedAgentId : agentList[0]?.id) ??
         null);
-  const selectedAgent =
-    effectiveAgentId === PENDING_AGENT_ID && pendingAgent
-      ? ({
-          id: PENDING_AGENT_ID,
-          name: pendingAgent.name,
-          display_name: pendingAgent.name,
-          description: pendingAgent.description ?? null,
-          harness: pendingAgent.harness ?? null,
-          skills: [],
-        } satisfies AvailableAgent)
-      : agentList.find((a) => a.id === effectiveAgentId);
+  const selectedAgent = useMemo(
+    () =>
+      effectiveAgentId === PENDING_AGENT_ID && pendingAgent
+        ? ({
+            id: PENDING_AGENT_ID,
+            name: pendingAgent.name,
+            display_name: pendingAgent.name,
+            description: pendingAgent.description ?? null,
+            harness: pendingAgent.harness ?? null,
+            skills: [],
+          } satisfies AvailableAgent)
+        : agentList.find((a) => a.id === effectiveAgentId),
+    [agentList, effectiveAgentId, pendingAgent],
+  );
   const supportsPermissionMode = nativeAgentHasCapability(selectedAgent, "permissionMode");
   const supportsApprovalMode = nativeAgentHasCapability(selectedAgent, "approvalMode");
   const supportsCursorMode = nativeAgentHasCapability(selectedAgent, "cursorMode");
@@ -1789,30 +2280,44 @@ export function NewChatLandingScreen() {
   useEffect(() => {
     setBypassSandbox(false);
   }, [effectiveAgentId]);
-  // The selected native harness, used to persist/seed its mode pick (the
-  // mode knob is harness-specific). null for non-native agents, which have
-  // no mode knob to remember.
+  // The selected native harness, used to persist/seed its option knobs (mode /
+  // model / effort), which are harness-specific. null for non-native agents,
+  // which have no knobs to remember.
   const selectedNativeHarness = nativeCodingAgentForAvailableAgent(selectedAgent)?.harness ?? null;
-  // Seed the harness's mode knob from the user's last pick when the selected
+  // Seed the harness's knobs from the user's last picks when the selected
   // harness changes (including the first mount), so a returning user starts a
-  // new session on the mode they used last for that harness instead of the
+  // new session on the options they used last for that harness instead of the
   // default. Keyed on the harness so an in-session edit isn't clobbered on
   // re-render — only a harness switch reseeds.
   useEffect(() => {
     if (!selectedNativeHarness) return;
-    const stored = readLastModeForHarness(selectedNativeHarness);
-    // Resolve to the stored value when it's still valid for this harness,
-    // else the harness default. The else branch must RESET (not early-return)
-    // because codex-native and opencode-native share the single approvalMode
-    // state: returning early would leave the previously-selected harness's
-    // mode in place — e.g. codex's "full-access" carried onto OpenCode — and
-    // flow into the launch args unchanged. A stale value not in the current
-    // list resolves to the default for the same reason.
+    const stored = readHarnessOptions(selectedNativeHarness);
+    // Resolve the mode to the stored value when it's still valid for this
+    // harness, else the harness default. The else branch must RESET (not
+    // early-return) because codex-native and opencode-native share the single
+    // approvalMode state: returning early would leave the previously-selected
+    // harness's mode in place — e.g. codex's "full-access" carried onto
+    // OpenCode — and flow into the launch args unchanged. A stale value not in
+    // the current list resolves to the default for the same reason.
     const resolve = (modes: readonly { value: string }[], dflt: string) =>
-      stored != null && modes.some((m) => m.value === stored) ? stored : dflt;
+      stored.mode != null && modes.some((m) => m.value === stored.mode) ? stored.mode : dflt;
     if (supportsPermissionMode) {
       setPermissionMode(
         resolve(CLAUDE_NATIVE_PERMISSION_MODES, CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE),
+      );
+      // The model + effort picker remembers its own last pick (same per-harness
+      // snapshot the mode knob uses), validated against the current vocab. With
+      // nothing stored (or a retired id) it resolves to "" — unselected, so the
+      // create omits the override and Claude Code uses its own configured model.
+      setPickedModel(
+        stored.model != null && CLAUDE_NATIVE_MODELS.some((m) => m.id === stored.model)
+          ? stored.model
+          : "",
+      );
+      setPickedEffort(
+        stored.effort != null && CLAUDE_NATIVE_EFFORTS.some((e) => e.value === stored.effort)
+          ? stored.effort
+          : "",
       );
     } else if (supportsApprovalMode) {
       setApprovalMode(resolve(CODEX_NATIVE_APPROVAL_MODES, CODEX_NATIVE_DEFAULT_APPROVAL_MODE));
@@ -1846,9 +2351,10 @@ export function NewChatLandingScreen() {
   const isCloudHost =
     sandboxSelected || (selectedHost?.name?.toLowerCase().includes("cloud") ?? false);
 
-  // Sessions on the selected host that have a workspace — candidates for a
-  // directory conflict, fed to the runner-health poll so only *connected*
-  // agents count (same /health signal as the sidebar dots).
+  // Sessions on the selected host that have a workspace — the narrow set
+  // the health poll needs to check for live directory conflicts. Much
+  // smaller than all 200 directorySessions (only host-matched + workspace
+  // rows), so registering them into the /health poll is cheap.
   const conflictCandidates = useMemo(
     () =>
       (directorySessions ?? []).filter((s) => s.host_id === selectedHostId && s.workspace != null),
@@ -1867,6 +2373,156 @@ export function NewChatLandingScreen() {
     }
     return counts;
   }, [conflictCandidates, runnerHealth]);
+
+  // Existing git worktrees of the picked directory's repo, for the
+  // worktree picker. Skipped for sandbox sessions (server-managed) and
+  // when no directory is picked. A non-git path resolves to [].
+  const worktreesEnabled = !sandboxSelected && selectedHostId !== null && workspaceTrimmed !== "";
+  const {
+    data: hostWorktrees,
+    isPlaceholderData: hostWorktreesArePlaceholder,
+    isError: hostWorktreesFailed,
+  } = useHostWorktrees(
+    worktreesEnabled ? selectedHostId : null,
+    worktreesEnabled ? workspaceTrimmed : null,
+  );
+  // Linked worktrees (exclude the main work tree — "starting in the main
+  // repo" is just picking that directory, not selecting a worktree).
+  const linkedWorktrees = useMemo(
+    () => (hostWorktrees ?? []).filter((w) => !w.is_main),
+    [hostWorktrees],
+  );
+  // The worktree the picked directory currently points at, if any. Set when
+  // the user navigated the picker straight into a worktree folder, or clicked
+  // one in the list below.
+  const activeWorktree = useMemo(() => {
+    const target = normalizeWorkspacePath(workspaceTrimmed);
+    if (target === null) return null;
+    return linkedWorktrees.find((w) => normalizeWorkspacePath(w.path) === target) ?? null;
+  }, [linkedWorktrees, workspaceTrimmed]);
+  // When the workspace lands on an existing worktree, prefill the branch
+  // field with its branch and remember it as the prefill. Leaving the
+  // worktree clears the prefill (but not a name the user typed themselves).
+  useEffect(() => {
+    const branch = activeWorktree?.branch ?? "";
+    if (branch !== "") {
+      setPrefilledBranch(branch);
+      setBranchName(branch);
+    } else {
+      setPrefilledBranch((prev) => {
+        // Only clear the field if it still holds the previous prefill —
+        // don't wipe a branch name the user typed for a new worktree.
+        setBranchName((cur) => (cur === prev ? "" : cur));
+        return "";
+      });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeWorktree?.path]);
+  // True when the session should start directly in the existing worktree:
+  // the workspace is a worktree and the branch field still holds its
+  // prefilled branch (the user hasn't edited it to request a new worktree).
+  const startInExistingWorktree =
+    activeWorktree !== null && prefilledBranch !== "" && branchName.trim() === prefilledBranch;
+  // A new, isolated worktree is created only when a branch is named and the
+  // workspace isn't already sitting on that existing worktree.
+  const shouldCreateWorktree = branchName.trim() !== "" && !startInExistingWorktree;
+  // Auto-fill the base branch from the configured default (Settings › Git) when
+  // a new-worktree branch is named, but only until the user touches the base
+  // field — then their choice (including a cleared field) stands. Clearing the
+  // branch name (so the base field goes away) re-arms the auto-fill, so naming
+  // a branch again starts fresh from the current default.
+  useEffect(() => {
+    if (!shouldCreateWorktree) {
+      // No base field shown: reset so the next named branch re-seeds cleanly.
+      setBaseBranchEdited(false);
+      _setBaseBranch("");
+      return;
+    }
+    if (!baseBranchEdited) {
+      _setBaseBranch(readDefaultBaseBranch() ?? "");
+    }
+  }, [shouldCreateWorktree, baseBranchEdited]);
+  // The branch input doubles as a combobox: focusing it reveals existing
+  // worktrees, and what the user types filters them (match on branch or path
+  // substring, case-insensitive). Typing a name that matches none = a new
+  // worktree; picking a match = start in that existing worktree.
+  const [branchInputFocused, setBranchInputFocused] = useState(false);
+  const filteredWorktrees = useMemo(() => {
+    const q = branchName.trim().toLowerCase();
+    if (q === "") return linkedWorktrees;
+    return linkedWorktrees.filter(
+      (w) => (w.branch ?? "").toLowerCase().includes(q) || w.path.toLowerCase().includes(q),
+    );
+  }, [linkedWorktrees, branchName]);
+  // Fill the branch field with a unique auto-generated name so the user can
+  // spin up a throwaway worktree without inventing one. crypto.randomUUID is
+  // available in every browser the app targets; the short prefix keeps the
+  // dir/branch readable (worktree-1a2b3c4d).
+  const generateBranchName = useCallback(() => {
+    const suffix = crypto.randomUUID().replace(/-/g, "").slice(0, 8);
+    setBranchName(`worktree-${suffix}`);
+  }, []);
+  // Project prefill: advance the machine one step per render as its data
+  // arrives. It steps rather than loops in one pass because the "branch"
+  // phase needs `hostWorktrees` for the workspace the "workspace" phase
+  // just wrote, and that listing only reflects the seeded repo one render
+  // after the write applies.
+  useEffect(() => {
+    if (prefill.project !== projectParam || prefillDone(prefill)) return;
+    const step = projectPrefillStep(prefill, {
+      newest: projectNewest,
+      newestFailed: projectNewestFailed,
+      hosts,
+      // The pickable list, not the raw one — a hidden agent's id would seed
+      // a pick that effectiveAgentId rejects. Raw undefined = still loading.
+      agents: agents === undefined ? undefined : agentList,
+      sandboxSelected,
+      selectedHostId,
+      lastAgentId: readLastAgentId(),
+      sourceWorktrees: projectSourceWorktrees,
+      sourceWorktreesFailed: projectSourceWorktreesFailed,
+      workspaceTrimmed,
+      branchName,
+      prefilledBranch,
+      hostWorktrees: hostWorktreesArePlaceholder ? undefined : hostWorktrees,
+      hostWorktreesFailed,
+    });
+    if (step === null) return;
+    const { writes } = step;
+    if (writes.hostId !== undefined) setSelectedHostId((cur) => cur ?? writes.hostId!);
+    if (writes.agentId !== undefined) {
+      setPickedAgentId((cur) => cur ?? writes.agentId!);
+      if (pickedAgentId === null) setPickedHarness(readLastHarness(writes.agentId));
+    }
+    if (writes.workspace !== undefined) {
+      setWorkspace((cur) => (cur === "" ? writes.workspace! : cur));
+    }
+    if (writes.branch !== undefined && prefilledBranch === "") {
+      // Functional fill-empty-only, like the other slots: a branch typed
+      // between the qualifying render and this effect must not be clobbered.
+      setBranchName((cur) => (cur === "" ? writes.branch! : cur));
+    }
+    setPrefill(step.state);
+  }, [
+    prefill,
+    projectParam,
+    projectNewest,
+    projectNewestFailed,
+    hosts,
+    agents,
+    agentList,
+    sandboxSelected,
+    selectedHostId,
+    projectSourceWorktrees,
+    projectSourceWorktreesFailed,
+    workspaceTrimmed,
+    branchName,
+    prefilledBranch,
+    hostWorktrees,
+    hostWorktreesArePlaceholder,
+    hostWorktreesFailed,
+    pickedAgentId,
+  ]);
 
   // Sandbox repo inputs are valid when blank (empty workspace), or when
   // the URL passes the shape check; a branch without a URL is dangling.
@@ -1935,6 +2591,90 @@ export function NewChatLandingScreen() {
     textareaRef.current?.focus();
   }
 
+  // ── "@"-file-mention browser (parity with the in-session composer) ────────
+  // Only for native terminal agents on a real local host with an absolute
+  // workspace. No session/runner exists yet, so the listing comes from the
+  // host filesystem endpoint (absolute paths) rather than the session-scoped
+  // workspace API; each tagged path is delivered as an "[Attached: …]" marker
+  // prepended to the first message, which the runner reads from that workspace.
+  const [mention, setMention] = useState<MentionState | null>(null);
+  const mentionEnabled =
+    isNativeTerminalAgent && !sandboxSelected && !!selectedHostId && workspaceValid;
+  const { dir: mentionDir, filter: mentionFilter } = parseMentionToken(mention?.query ?? "");
+  const workspaceRoot = workspaceTrimmed.replace(/\/+$/, "");
+  // Absolute dir to list = workspace root + the drilled sub-path.
+  const mentionAbsDir =
+    mentionEnabled && mention
+      ? mentionDir
+        ? `${workspaceRoot}/${mentionDir}`
+        : workspaceRoot
+      : null;
+  const mentionFsQuery = useHostFilesystem(
+    mentionEnabled && mention ? selectedHostId : null,
+    mentionAbsDir,
+  );
+  // Map host entries (absolute paths) to workspace-relative WorkspaceFile rows,
+  // then rank (folders-first, filtered, capped) via the shared helper.
+  const mentionEntries: WorkspaceFile[] = useMemo(() => {
+    if (!mentionEnabled || !mention) return [];
+    // ``useHostFilesystem`` keeps the previous directory's rows as placeholder
+    // data (no flicker on navigate). When the user drills into a folder a new
+    // fetch starts but ``data`` still holds the *parent's* entries — ``isLoading``
+    // is false, only ``isPlaceholderData`` is true. Returning those stale rows
+    // here would show the parent's files while purporting to be inside the
+    // child, so a click/Enter could attach the wrong entry. Suppress them until
+    // the current directory's own listing arrives.
+    if (mentionFsQuery.isPlaceholderData) return [];
+    const rows = (mentionFsQuery.data?.entries ?? [])
+      .filter((e) => e.type === "directory" || e.type === "file")
+      .map(
+        (e): WorkspaceFile => ({
+          path: e.path.startsWith(workspaceRoot)
+            ? e.path.slice(workspaceRoot.length).replace(/^\/+/, "")
+            : e.name,
+          name: e.name,
+          type: e.type === "directory" ? "directory" : "file",
+          bytes: e.bytes,
+          modified_at: e.modified_at,
+        }),
+      );
+    return rankMentionEntries(rows, mentionFilter);
+  }, [
+    mentionEnabled,
+    mention,
+    mentionFsQuery.data,
+    mentionFsQuery.isPlaceholderData,
+    mentionFilter,
+    workspaceRoot,
+  ]);
+  const mentionOpen = mentionEntries.length > 0;
+  // Closed-but-loading window: don't let Enter send the half-typed "@dir/".
+  // ``isPlaceholderData`` covers the drill-down window where react-query is
+  // still serving the previous directory's rows (``isLoading`` stays false).
+  const mentionListingPending =
+    mentionEnabled &&
+    mention != null &&
+    (mentionFsQuery.isLoading || mentionFsQuery.isPlaceholderData);
+
+  // Shared selection/chip/keyboard glue — see useMentionBrowser. Only the
+  // host-filesystem source + token state above are launcher-specific.
+  const {
+    mentionIndex,
+    mentionedItems,
+    attachMention,
+    openMentionDir,
+    removeMentionedItem,
+    handleKeyDown: handleMentionKeyDown,
+    dismiss: dismissMention,
+  } = useMentionBrowser({
+    mention,
+    setMention,
+    mentionEntries,
+    text: message,
+    setText: setMessage,
+    textareaRef,
+  });
+
   const canSubmit =
     message.trim().length > 0 &&
     selectedAgent != null &&
@@ -1964,6 +2704,8 @@ export function NewChatLandingScreen() {
     : sandboxSelected
       ? sandboxLabel
       : (selectedHost?.name ?? (onlineHosts.length === 0 ? "No hosts" : "Select host"));
+  // The chip shows just the branch (the "(existing)" distinction lives in the
+  // popover's warning; appending it here only gets clipped by the chip's cap).
   const worktreeLabel = branchName.trim() || "No worktree";
   // Sandbox repository chip label: repo name (server's clone-dir rule)
   // plus the pinned branch, e.g. "repo#main"; placeholder when unset.
@@ -1978,11 +2720,25 @@ export function NewChatLandingScreen() {
   // redundant.
   const agentLabel = selectedAgent ? selectedAgent.display_name : "Select agent";
 
-  // Select an agent/harness from the picker. Switching agents drops the
-  // harness override so a pick never leaks across agents; explicit picks
-  // persist (auto-defaults never do).
+  // Wrap the harness setter so every explicit pick is persisted to
+  // localStorage. The caller can pass an explicit `agentId` for the
+  // switch-via-submenu path where `effectiveAgentId` still reflects the
+  // previously selected agent (the state update from `onSelectAgent` hasn't
+  // applied yet).
+  const handleSetPickedHarness = useCallback(
+    (harness: string | null, agentId?: string) => {
+      setPickedHarness(harness);
+      writeLastHarness(agentId ?? effectiveAgentId, harness);
+    },
+    [effectiveAgentId],
+  );
+
+  // Select an agent/harness from the picker. Switching agents seeds the
+  // harness override from the user's last pick for that agent (so a
+  // returning user lands on the harness they used last); explicit picks
+  // persist via localStorage.
   const handleSelectAgent = (agent: AvailableAgent) => {
-    if (agent.id !== effectiveAgentId) setPickedHarness(null);
+    if (agent.id !== effectiveAgentId) setPickedHarness(readLastHarness(agent.id));
     setPickedAgentId(agent.id);
     writeLastAgentId(agent.id);
   };
@@ -1992,6 +2748,10 @@ export function NewChatLandingScreen() {
   };
 
   function selectHost(hostId: string) {
+    // Persist the explicit pick even when it matches the current selection, so
+    // clicking the auto-selected host still records it as the sticky default
+    // for the next visit.
+    writeLastHostChoice(hostId);
     // Re-selecting the current host is a no-op. Clearing the workspace here
     // would empty the field for good: the seeding effect's deps (host id,
     // recents, derived home) are all unchanged on a same-host pick, so it
@@ -2008,6 +2768,10 @@ export function NewChatLandingScreen() {
   }
 
   function selectSandbox() {
+    // Persist the explicit sandbox pick (as the reserved sentinel) even when
+    // it's already selected, mirroring selectHost — so the sandbox becomes the
+    // sticky default for the next visit.
+    writeLastHostChoice(SANDBOX_HOST_CHOICE);
     if (sandboxSelected) return;
     // Mirror selectHost: a managed session's host and workspace are both
     // server-chosen, so clear any prior host pick and its workspace.
@@ -2045,6 +2809,11 @@ export function NewChatLandingScreen() {
     setCreateError(null);
     try {
       const trimmedBranch = branchName.trim();
+      // `shouldCreateWorktree` (component scope): true only when a branch is
+      // named and the workspace isn't already an existing worktree. Starting
+      // in an existing worktree sends no git opts — the workspace is bound
+      // straight to that dir, which also sidesteps the "branch already
+      // exists" guard.
       const agent = agentList.find((a) => a.id === effectiveAgentId);
       const nativeLabels = nativeWrapperLabelsForAgent(agent);
       const agentSupportsPermissionMode = nativeAgentHasCapability(agent, "permissionMode");
@@ -2069,9 +2838,14 @@ export function NewChatLandingScreen() {
         // Launch the runner on the selected host. The multipart create
         // only stores DB rows — launchRunner binds + starts the runner.
         if (!sandboxSelected && selectedHostId && workspaceTrimmed) {
-          const gitOpts = trimmedBranch
+          // Create a new worktree, bind an existing one (records the branch
+          // for the sidebar + delete flow without creating anything), or
+          // neither — mirrored on the `git` block.
+          const gitOpts = shouldCreateWorktree
             ? { branchName: trimmedBranch, baseBranch: baseBranch.trim() || undefined }
-            : undefined;
+            : startInExistingWorktree
+              ? { branchName: trimmedBranch, existingWorktree: true }
+              : undefined;
           await launchRunner(selectedHostId, data.id, workspaceTrimmed, gitOpts);
         }
         // Clear pending agent after successful creation.
@@ -2091,9 +2865,14 @@ export function NewChatLandingScreen() {
               : {
                   host_id: selectedHostId,
                   workspace: workspaceTrimmed,
-                  git: trimmedBranch
+                  // Create a new worktree, or bind an existing one
+                  // (`existing_worktree` records the branch for the sidebar +
+                  // delete flow without creating anything), or neither.
+                  git: shouldCreateWorktree
                     ? { branch_name: trimmedBranch, base_branch: baseBranch.trim() || undefined }
-                    : undefined,
+                    : startInExistingWorktree
+                      ? { branch_name: trimmedBranch, existing_worktree: true }
+                      : undefined,
                 }),
             // Native terminal agents open terminal-first: `omnigent.ui:
             // terminal` tells the UI to render the terminal wrapper, and
@@ -2122,9 +2901,11 @@ export function NewChatLandingScreen() {
             // Model + reasoning effort, persisted on the session row before
             // the runner launches. Only claude-native surfaces the picker, so
             // only its agents carry the choice; the runner reads them as
-            // `--model` / `--effort` at terminal launch.
-            model_override: agentSupportsPermissionMode ? pickedModel : undefined,
-            reasoning_effort: agentSupportsPermissionMode ? pickedEffort : undefined,
+            // `--model` / `--effort` at terminal launch. An unselected ("")
+            // knob is omitted so Claude Code keeps its own configured model.
+            model_override: agentSupportsPermissionMode && pickedModel ? pickedModel : undefined,
+            reasoning_effort:
+              agentSupportsPermissionMode && pickedEffort ? pickedEffort : undefined,
             // Smart routing toggle — server-side, available for any agent.
             cost_control_mode_override: costControlMode ?? undefined,
             harness_override: pickedHarness ?? undefined,
@@ -2152,6 +2933,9 @@ export function NewChatLandingScreen() {
           // session shows up immediately (the folder fetches via
           // useProjectSessions, separate from the global conversations list).
           void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
+          // The just-created session is now the project's newest; without this
+          // a pencil click within staleTime prefills from the previous one.
+          void queryClient.invalidateQueries({ queryKey: ["project-newest-session"] });
         } catch {
           // Leave the session unfiled; the user can file it from the sidebar.
         }
@@ -2164,7 +2948,13 @@ export function NewChatLandingScreen() {
       // loads from the session id and never reads the sidebar cache.
       void queryClient.refetchQueries({ queryKey: ["conversations"] });
       void queryClient.invalidateQueries({ queryKey: ["directory-sessions"] });
-      const initialPrompt = sanitizeInitialPrompt(message);
+      // Prepend each "@"-tagged path as an attachment marker on its own line —
+      // the same wording the native executors emit and that title-seeding
+      // strips. The runner, rooted at this workspace, reads the on-disk file
+      // from the marker; no upload happens. Folders carry a trailing "/".
+      const initialPrompt =
+        buildMentionPreamble(mentionedItems, selectedAgent?.harness ?? null) +
+        sanitizeInitialPrompt(message);
       // A first message matching one of the agent's bundled skills is
       // handed off as a structured invocation so ChatPage auto-sends it
       // as a `slash_command` event (server resolves the skill) instead
@@ -2181,6 +2971,11 @@ export function NewChatLandingScreen() {
       // the freshly-opened chat (whose composer reads the same per-conversation
       // key). Sanitized text so recall reproduces exactly what was sent.
       appendPromptHistoryEntry(initialPrompt, data.id);
+      // The session was created — drop the preserved draft so the next visit
+      // to the landing screen starts clean (and the unmount cleanup below
+      // doesn't resurrect what we just sent).
+      submittedRef.current = true;
+      landingDraft = null;
       navigate(`/c/${data.id}`);
     } catch {
       setCreateError("Couldn't reach the server. Check your connection and try again.");
@@ -2268,10 +3063,38 @@ export function NewChatLandingScreen() {
                 commands={skillCommands}
               />
             )}
+            {/* "@"-file-mention browser — native terminal agents with a workspace */}
+            {(mentionOpen || mentionListingPending) && (
+              <FileMentionMenu
+                currentDir={mentionDir}
+                activeIndex={mentionIndex}
+                entries={mentionEntries}
+                loading={mentionListingPending}
+                onOpenDir={openMentionDir}
+                onAttach={attachMention}
+              />
+            )}
             <textarea
               ref={textareaRef}
               value={message}
-              onChange={(e) => setMessage(e.target.value)}
+              onChange={(e) => {
+                setMessage(e.target.value);
+                // Recompute the active "@"-mention from the caret each keystroke
+                // (native terminal agents with a workspace — ``mentionEnabled``).
+                setMention(
+                  mentionEnabled
+                    ? detectMentionAt(
+                        e.target.value,
+                        e.target.selectionStart ?? e.target.value.length,
+                      )
+                    : null,
+                );
+              }}
+              onBlur={() => {
+                // Dismiss the mention menu when focus leaves the textarea; menu
+                // rows preventDefault on mousedown so selecting one doesn't blur.
+                dismissMention();
+              }}
               onCompositionStart={() => {
                 isComposingRef.current = true;
               }}
@@ -2282,6 +3105,11 @@ export function NewChatLandingScreen() {
                 if (isImeCompositionKeyEvent(e, isComposingRef.current)) {
                   return;
                 }
+
+                // "@"-mention menu navigation (shared useMentionBrowser) —
+                // mutually exclusive with the slash menu (a token can't be both)
+                // and takes priority over submission.
+                if (handleMentionKeyDown(e)) return;
 
                 // While the skills menu is open, ArrowUp/Down navigate it and
                 // Enter/Tab complete the highlighted item — these take
@@ -2318,6 +3146,9 @@ export function NewChatLandingScreen() {
                 // Enter sends; Shift+Enter inserts a newline.
                 if (e.key === "Enter" && !e.shiftKey) {
                   e.preventDefault();
+                  // The mention menu is briefly closed while its listing loads;
+                  // swallow Enter so the in-progress "@dir/" token isn't sent.
+                  if (mentionListingPending) return;
                   void handleCreate();
                 }
               }}
@@ -2376,6 +3207,37 @@ export function NewChatLandingScreen() {
                 }
               }}
             />
+            {/* "@"-mention chips — one per tagged workspace file/folder. Each is
+                delivered as an "[Attached: <path>]" marker prepended to the
+                first message at create time. */}
+            {mentionedItems.length > 0 && (
+              <div className="flex flex-wrap gap-1.5 px-4 pb-2">
+                {mentionedItems.map((item, i) => (
+                  <span
+                    key={mentionItemPath(item)}
+                    className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-xs text-muted-foreground"
+                  >
+                    {item.isDir ? (
+                      <FolderIcon className="size-3 shrink-0" />
+                    ) : (
+                      <FileTextIcon className="size-3 shrink-0" />
+                    )}
+                    <span className="max-w-[200px] truncate" title={mentionItemPath(item)}>
+                      @{item.path}
+                      {item.isDir ? "/" : ""}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => removeMentionedItem(i)}
+                      className="ml-0.5 rounded-full hover:text-foreground"
+                      aria-label={`Remove ${item.path}`}
+                    >
+                      <XIcon className="size-3" />
+                    </button>
+                  </span>
+                ))}
+              </div>
+            )}
             {/* File chips — shown below the textarea when files are attached. */}
             {files.length > 0 && (
               <div className="flex flex-wrap gap-1.5 px-4 pb-2">
@@ -2435,15 +3297,17 @@ export function NewChatLandingScreen() {
                 <AgentHarnessPicker
                   agentEntries={agentEntries}
                   harnessEntries={harnessEntries}
+                  brainHarnessLabels={brainHarnessLabels}
                   effectiveAgentId={effectiveAgentId}
                   agentLabel={agentLabel}
                   hasAgents={agentList.length > 0}
                   host={harnessWarningHost}
                   onSelectAgent={handleSelectAgent}
-                  pendingAgent={pendingAgent}
+                  pendingAgent={pendingAgentAllowedOnTarget ? pendingAgent : null}
                   pendingAgentId={PENDING_AGENT_ID}
                   onSelectPending={handleSelectPending}
                   onCreateCustomAgent={() => setCreateAgentOpen(true)}
+                  sandboxSelected={sandboxSelected}
                   permissionMode={permissionMode}
                   approvalMode={approvalMode}
                   cursorExecMode={cursorExecMode}
@@ -2457,11 +3321,16 @@ export function NewChatLandingScreen() {
                   setBypassSandbox={setBypassSandbox}
                   setPickedModel={setPickedModel}
                   setPickedEffort={setPickedEffort}
-                  setPickedHarness={setPickedHarness}
+                  setPickedHarness={handleSetPickedHarness}
                 />
-                {smartRoutingEnabled && selectedAgent && (
-                  <IntelligentModelControl value={costControlMode} onChange={setCostControlMode} />
-                )}
+                {smartRoutingEnabled &&
+                  selectedAgent &&
+                  _ROUTABLE_HARNESSES.has(selectedAgent.harness ?? "") && (
+                    <IntelligentModelControl
+                      value={costControlMode}
+                      onChange={setCostControlMode}
+                    />
+                  )}
                 <TooltipProvider>
                   <Tooltip>
                     <TooltipTrigger asChild>
@@ -2470,11 +3339,16 @@ export function NewChatLandingScreen() {
                           type="submit"
                           size="icon"
                           disabled={!canSubmit}
-                          aria-label="Start session"
+                          aria-label={creating ? "Starting session" : "Start session"}
+                          aria-busy={creating}
                           data-testid="new-chat-landing-submit"
                           className="size-8 rounded-full bg-foreground text-card transition-opacity hover:opacity-80 disabled:opacity-50"
                         >
-                          <ArrowUpIcon className="size-4" />
+                          {creating ? (
+                            <Loader2Icon className="size-4 animate-spin" />
+                          ) : (
+                            <ArrowUpIcon className="size-4" />
+                          )}
                         </Button>
                       </span>
                     </TooltipTrigger>
@@ -2588,6 +3462,7 @@ export function NewChatLandingScreen() {
                     <DropdownMenuItem
                       key={host.host_id}
                       onSelect={() => selectHost(host.host_id)}
+                      data-testid={`new-chat-landing-host-${host.host_id}`}
                       data-active={host.host_id === selectedHostId ? "true" : undefined}
                       className="text-xs data-[active=true]:bg-accent/60"
                     >
@@ -2760,11 +3635,12 @@ export function NewChatLandingScreen() {
                         }
                         onNavigate={setWorkspace}
                         // Warn when browsing into a directory other live agents
-                        // occupy. Suppressed once a git branch is named — that
-                        // starts an isolated worktree, so there's no shared-dir
-                        // conflict regardless of the picked directory.
+                        // occupy. Suppressed only when a NEW isolated worktree
+                        // will be created (no shared-dir conflict then). When
+                        // starting directly in an existing worktree the branch
+                        // is prefilled but the dir IS shared, so keep warning.
                         occupancyForPath={
-                          branchName.trim() === ""
+                          !shouldCreateWorktree
                             ? (abs) => occupancyByDir.get(normalizeWorkspacePath(abs) ?? "") ?? 0
                             : undefined
                         }
@@ -2779,7 +3655,7 @@ export function NewChatLandingScreen() {
               {/* Git worktree chip — hidden for sandbox sessions (worktree
                 creation requires a caller-supplied host_id). */}
               {!sandboxSelected && (
-                <Popover>
+                <Popover open={worktreePopoverOpen} onOpenChange={setWorktreePopoverOpen}>
                   <PopoverTrigger asChild>
                     <button
                       type="button"
@@ -2795,7 +3671,14 @@ export function NewChatLandingScreen() {
                       <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
                     </button>
                   </PopoverTrigger>
-                  <PopoverContent align="start" className="w-[min(20rem,calc(100vw-2rem))] p-3">
+                  <PopoverContent
+                    align="start"
+                    collisionPadding={16}
+                    // No overflow clip here — the worktree dropdown floats as an
+                    // absolute overlay (below) and must be able to escape the
+                    // popover's padding box.
+                    className="w-[min(20rem,calc(100vw-2rem))] p-3"
+                  >
                     <div className="flex flex-col gap-2">
                       <label
                         htmlFor="landing-branch-name"
@@ -2803,38 +3686,151 @@ export function NewChatLandingScreen() {
                       >
                         Git worktree branch (optional)
                       </label>
-                      <input
-                        id="landing-branch-name"
-                        type="text"
-                        value={branchName}
-                        onChange={(e) => setBranchName(e.target.value)}
-                        placeholder="feature/my-branch"
-                        className="rounded-md border border-input bg-background px-3 py-2 text-xs outline-none transition-colors focus-visible:border-ring"
-                        data-testid="new-chat-landing-branch-input"
-                      />
-                      {branchName.trim() !== "" && (
+                      {/* Help text sits above the field. The warning for a picked
+                        existing worktree stays below the input (contextual to the
+                        selection). */}
+                      <p className="text-xs text-muted-foreground">
+                        New branch name, or pick an existing worktree. Leave blank to start directly
+                        in the working directory.
+                      </p>
+                      {/* The branch field is a combobox: focusing it reveals the
+                        repo's existing worktrees, and typing filters them.
+                        Picking one starts in that worktree; a name matching none
+                        creates a new worktree. */}
+                      <div className="relative flex flex-col">
+                        <input
+                          id="landing-branch-name"
+                          type="text"
+                          value={branchName}
+                          onChange={(e) => setBranchName(e.target.value)}
+                          onFocus={() => setBranchInputFocused(true)}
+                          // Delay so a click on a dropdown option registers
+                          // before the list unmounts on blur.
+                          onBlur={() => setTimeout(() => setBranchInputFocused(false), 120)}
+                          placeholder="feature/my-branch"
+                          role="combobox"
+                          aria-expanded={branchInputFocused && filteredWorktrees.length > 0}
+                          aria-autocomplete="list"
+                          // Suppress the browser's native autofill dropdown so it
+                          // doesn't overlay our worktree combobox. `off` alone is
+                          // ignored by some browsers, so also disable spellcheck /
+                          // autocorrect and give it an unrecognized name.
+                          autoComplete="off"
+                          autoCorrect="off"
+                          autoCapitalize="off"
+                          spellCheck={false}
+                          name="omnigent-worktree-branch"
+                          // pr-9 leaves room for the generate button overlaid at
+                          // the right edge.
+                          className="rounded-md border border-input bg-background py-2 pr-9 pl-3 text-xs outline-none transition-colors focus-visible:border-ring"
+                          data-testid="new-chat-landing-branch-input"
+                        />
+                        {/* Fill a unique branch name for a throwaway worktree.
+                          onMouseDown so it fires before the input's blur closes
+                          the combobox and preventDefault keeps focus on the
+                          input. */}
+                        <button
+                          type="button"
+                          onMouseDown={(e) => {
+                            e.preventDefault();
+                            generateBranchName();
+                          }}
+                          title="Generate a unique branch name"
+                          aria-label="Generate a unique branch name"
+                          className="absolute top-0 right-0 flex h-9 w-9 items-center justify-center text-muted-foreground transition-colors hover:text-foreground"
+                          data-testid="new-chat-landing-branch-generate"
+                        >
+                          <ShuffleIcon className="size-4" />
+                        </button>
+                        {branchInputFocused && filteredWorktrees.length > 0 && (
+                          <div
+                            // Floats over the popover as a combobox popup, so it
+                            // doesn't stretch the box. Bounded height + internal
+                            // scroll keep it from running off the viewport.
+                            className="absolute top-full right-0 left-0 z-20 mt-1 flex max-h-40 flex-col overflow-y-auto rounded-md border border-input bg-popover p-1 shadow-md"
+                            data-testid="new-chat-landing-worktree-dropdown"
+                          >
+                            <span className="px-2 pt-1 pb-0.5 text-[11px] font-medium tracking-wide text-muted-foreground uppercase">
+                              Existing worktrees
+                            </span>
+                            <ul className="flex flex-col gap-0.5">
+                              {filteredWorktrees.map((w) => {
+                                const selected =
+                                  normalizeWorkspacePath(w.path) ===
+                                  normalizeWorkspacePath(workspaceTrimmed);
+                                return (
+                                  <li key={w.path}>
+                                    <button
+                                      type="button"
+                                      // onMouseDown (not onClick): fires before the
+                                      // input's blur, so the selection lands even
+                                      // though blur is about to hide the list.
+                                      onMouseDown={(e) => {
+                                        e.preventDefault();
+                                        setWorkspace(w.path);
+                                        setBranchInputFocused(false);
+                                        setWorktreePopoverOpen(false);
+                                      }}
+                                      className={`flex w-full flex-col items-start gap-0.5 rounded-md px-2 py-1 text-left text-xs transition-colors hover:bg-accent ${
+                                        selected ? "bg-accent" : ""
+                                      }`}
+                                      data-testid="new-chat-landing-worktree-option"
+                                    >
+                                      <span className="font-medium text-foreground">
+                                        {w.branch ?? "(detached)"}
+                                      </span>
+                                      {/* Tail-truncated so the disambiguating
+                                      folder shows, not a shared prefix; full
+                                      path on hover. */}
+                                      <span
+                                        className="w-full truncate text-muted-foreground"
+                                        title={w.path}
+                                      >
+                                        {worktreePathTail(w.path)}
+                                      </span>
+                                    </button>
+                                  </li>
+                                );
+                              })}
+                            </ul>
+                          </div>
+                        )}
+                      </div>
+                      {/* Base branch only matters when creating a NEW worktree
+                        — hidden once the workspace points at an existing one
+                        (no worktree is created, so there's nothing to base). */}
+                      {branchName.trim() !== "" && !startInExistingWorktree && (
                         <input
                           type="text"
                           value={baseBranch}
                           onChange={(e) => setBaseBranch(e.target.value)}
-                          placeholder="Base branch (defaults to current branch)"
+                          placeholder="Base branch (defaults to current)"
                           aria-label="Base branch"
                           className="rounded-md border border-input bg-background px-3 py-2 text-xs outline-none transition-colors focus-visible:border-ring"
                           data-testid="new-chat-landing-base-branch-input"
                         />
                       )}
-                      <p className="text-xs text-muted-foreground">
-                        Creates an isolated git worktree for a new branch. Leave blank to start
-                        directly in the working directory.
-                      </p>
+                      {startInExistingWorktree && (
+                        <p
+                          className="text-xs text-amber-600 dark:text-amber-500"
+                          data-testid="new-chat-landing-existing-worktree-warning"
+                        >
+                          Starts in existing worktree, edit the name to create a new one.
+                        </p>
+                      )}
                     </div>
                   </PopoverContent>
                 </Popover>
               )}
 
               {/* Project chip — files the session under a named project on
-                create. Sits after the worktree chip. */}
-              <LandingProjectPicker value={selectedProject} onChange={setSelectedProject} />
+                create. Sits after the worktree chip. Only shown when a project
+                is already selected (e.g. quick-starting from an existing
+                project's "new session" pencil, which passes `?project=`);
+                otherwise the new-session flow stays unfiled. */}
+              {selectedProject && (
+                <LandingProjectPicker value={selectedProject} onChange={setSelectedProject} />
+              )}
             </div>
             {/* The agent / harness picker moved out of the tray and into the
                 composer's right action cluster (next to Send) — see

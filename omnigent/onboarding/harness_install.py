@@ -40,8 +40,10 @@ import os
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass
+from pathlib import Path
 
+from omnigent._platform import resolve_cli_binary
+from omnigent.harness_install_spec import HarnessInstallSpec
 from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
 
 # Pi is not a configure-menu family (the menu is Claude + Codex), but the
@@ -89,51 +91,7 @@ COPILOT_KEY = "copilot"
 # Omnigent-managed credentials). The ``hermes`` binary must be on PATH.
 HERMES_KEY = "hermes"
 
-
-@dataclass(frozen=True)
-class HarnessInstallSpec:
-    """Install + auth metadata for one coding-harness CLI.
-
-    :param display: Human name shown in menus, e.g. ``"Claude"``.
-    :param binary: The CLI executable name looked up on ``PATH``, e.g.
-        ``"claude"``.
-    :param package: The npm package that provides the binary, e.g.
-        ``"@anthropic-ai/claude-code"``; ``None`` for a CLI not installed via
-        npm (use *install_hint* instead).
-    :param login_args: Argv (after *binary*) for the harness's own interactive
-        subscription login, e.g. ``("auth", "login", "--claudeai")`` for Claude
-        or ``("login",)`` for Codex; ``None`` when the harness has no login
-        command (e.g. Pi).
-    :param logout_args: Argv (after *binary*) for the harness's logout, e.g.
-        ``("auth", "logout")`` / ``("logout",)``; ``None`` when none exists.
-    :param status_args: Argv (after *binary*) for the harness's "am I logged
-        in?" status command, e.g. ``("auth", "status")`` (Claude, prints JSON
-        with a ``loggedIn`` field) / ``("login", "status")`` (Codex, exits 0
-        when logged in); ``None`` when the harness has no status command.
-    :param install_hint: Shell command shown to the user to install the CLI
-        when it has no npm *package* (e.g. cursor-agent's curl installer);
-        ``None`` for npm-installable harnesses.
-    :param login_status_key: The boolean field in the status command's JSON
-        output that reports login state, e.g. ``"loggedIn"`` for Claude or
-        ``"isAuthenticated"`` for cursor-agent. ``None`` means the harness has
-        no JSON verdict (Codex / agy print a human line or model list), so the
-        exit code is authoritative and stdout is never parsed.
-    :param auth_hint: Remediation phrase for a CLI whose sign-in is not a
-        ``login_args`` subcommand — agy authenticates by launching its bare TUI
-        once — appended after the install hint, e.g. ``"run `agy` once and
-        complete the browser sign-in"``; ``None`` when ``login_args`` (or
-        nothing) already covers sign-in.
-    """
-
-    display: str
-    binary: str
-    package: str | None
-    login_args: tuple[str, ...] | None = None
-    logout_args: tuple[str, ...] | None = None
-    status_args: tuple[str, ...] | None = None
-    install_hint: str | None = None
-    login_status_key: str | None = None
-    auth_hint: str | None = None
+_HERMES_INSTALL_HINT = "curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash"
 
 
 # Keyed by harness family (Claude=anthropic, Codex=openai) plus the pi
@@ -240,7 +198,8 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         "Hermes",
         "hermes",
         package=None,
-        install_hint="curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash",
+        install_hint=_HERMES_INSTALL_HINT,
+        install_command=("bash", "-c", _HERMES_INSTALL_HINT),
     ),
 }
 
@@ -309,6 +268,22 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
 }
 
 
+def _all_harness_install() -> dict[str, HarnessInstallSpec]:
+    from omnigent.harness_plugins import install_specs
+
+    merged = dict(_HARNESS_INSTALL)
+    merged.update(install_specs())
+    return merged
+
+
+def _all_harness_name_to_key() -> dict[str, str]:
+    from omnigent.harness_plugins import harness_install_keys
+
+    merged = dict(_HARNESS_NAME_TO_KEY)
+    merged.update(harness_install_keys())
+    return merged
+
+
 def required_cli_for_harness(harness: str) -> HarnessInstallSpec | None:
     """Return the CLI a harness needs on ``PATH`` to launch, or ``None``.
 
@@ -319,19 +294,20 @@ def required_cli_for_harness(harness: str) -> HarnessInstallSpec | None:
         ``PATH`` for *harness* to start; ``None`` for SDK-based / unknown
         harnesses that need no CLI binary.
     """
-    key = _HARNESS_NAME_TO_KEY.get(harness)
-    return _HARNESS_INSTALL.get(key) if key is not None else None
+    key = _all_harness_name_to_key().get(harness)
+    return _all_harness_install().get(key) if key is not None else None
 
 
 def missing_harness_cli(harness: str) -> HarnessInstallSpec | None:
-    """Return a harness's required CLI spec when that CLI is absent from ``PATH``.
+    """Return a harness's required CLI spec when that CLI can't be resolved.
 
     Combines :func:`required_cli_for_harness` with the same
-    ``shutil.which`` probe :func:`harness_cli_installed` uses, so the
-    verdict matches what the harness's own launch will see (both read the
-    process ``PATH``). Used by sub-agent dispatch to fail loud *before*
-    spawning a worker whose harness can never boot here, instead of letting
-    the missing binary surface as a lazy, generic turn failure.
+    :func:`resolve_cli_binary` probe :func:`harness_cli_installed` uses, so the
+    verdict matches what the harness's own launch will see (both check ``PATH``
+    plus the common global install dirs the host daemon's frozen ``PATH`` may
+    omit). Used by sub-agent dispatch to fail loud *before* spawning a worker
+    whose harness can never boot here, instead of letting the missing binary
+    surface as a lazy, generic turn failure.
 
     :param harness: An executor harness identifier, e.g. ``"pi"`` or
         ``"claude-native"``.
@@ -342,7 +318,7 @@ def missing_harness_cli(harness: str) -> HarnessInstallSpec | None:
     spec = required_cli_for_harness(harness)
     if spec is None:
         return None
-    if shutil.which(spec.binary) is not None:
+    if resolve_cli_binary(spec.binary) is not None:
         return None
     return spec
 
@@ -386,50 +362,59 @@ def harness_install_spec(key: str) -> HarnessInstallSpec | None:
     :returns: The :class:`HarnessInstallSpec`, or ``None`` for an unknown key
         (e.g. a gateway-only family with no dedicated CLI).
     """
-    return _HARNESS_INSTALL.get(key)
+    return _all_harness_install().get(key)
 
 
 def harness_cli_installed(key: str) -> bool:
-    """Return whether the harness's CLI binary is on ``PATH``.
+    """Return whether the harness's CLI binary can be resolved.
 
-    "Installed" is deliberately the CLI binary (``shutil.which``), matching
-    ucode and the npm install-prompt UX — even though the SDK-based
-    ``claude-sdk`` harness can run without the ``claude`` CLI.
+    "Installed" is deliberately the CLI binary (:func:`resolve_cli_binary` —
+    ``PATH`` plus the common global install dirs the host daemon's frozen
+    ``PATH`` may omit), matching ucode and the npm install-prompt UX — even
+    though the SDK-based ``claude-sdk`` harness can run without the ``claude``
+    CLI.
 
     :param key: A harness family (``"anthropic"`` / ``"openai"``) or
         :data:`PI_KEY` / :data:`KIMI_KEY`.
-    :returns: ``True`` when the CLI is on ``PATH``; ``False`` when it isn't or
+    :returns: ``True`` when the CLI resolves; ``False`` when it doesn't or
         the key has no associated CLI.
     """
-    spec = _HARNESS_INSTALL.get(key)
+    spec = harness_install_spec(key)
     if spec is None:
         return False
-    return shutil.which(spec.binary) is not None
+    return resolve_cli_binary(spec.binary) is not None
 
 
 def harness_install_command(key: str) -> list[str]:
-    """Return the argv that installs the harness CLI, e.g. ``npm install -g …``.
+    """Return the argv that installs the harness CLI.
 
     :param key: A harness family or :data:`PI_KEY`.
-    :returns: The install command, e.g.
-        ``["npm", "install", "-g", "@anthropic-ai/claude-code"]``.
+    :returns: The install command, e.g. ``["npm", "install", "-g",
+        "@anthropic-ai/claude-code"]`` or an explicitly configured vendor
+        installer command.
     :raises KeyError: If *key* has no install spec (caller should gate on
         :func:`harness_install_spec`).
     :raises ValueError: If *key* has a spec but no npm ``package`` (a CLI
         installed out-of-band, e.g. cursor-agent); show its ``install_hint``.
     """
-    package = _HARNESS_INSTALL[key].package
+    spec = harness_install_spec(key)
+    if spec is None:
+        raise KeyError(key)
+    if spec.install_command is not None:
+        return list(spec.install_command)
+    package = spec.package
     if package is None:
         raise ValueError(f"{key!r} has no npm package; show its install_hint instead")
     return ["npm", "install", "-g", package]
 
 
 def install_harness_cli(key: str) -> bool:
-    """Install the harness CLI via npm; return whether it landed on ``PATH``.
+    """Install the harness CLI; return whether it landed on ``PATH``.
 
     Shells out to :func:`harness_install_command` and re-checks
-    :func:`harness_cli_installed`. Surfaces npm's own output (no capture) so a
-    failing install is visible. Requires ``npm`` on ``PATH``.
+    :func:`harness_cli_installed`. Surfaces the installer's own output (no
+    capture) so a failing install is visible. Harnesses without an npm package
+    or explicit installer command remain manual-only.
 
     :param key: A harness family or :data:`PI_KEY`.
     :returns: ``True`` when the CLI is on ``PATH`` after the install attempt
@@ -437,18 +422,38 @@ def install_harness_cli(key: str) -> bool:
         present), ``False`` if npm is missing or the install failed.
     :raises KeyError: If *key* has no install spec.
     """
-    spec = _HARNESS_INSTALL.get(key)
-    if spec is not None and spec.package is None:
-        # Non-npm CLI (e.g. cursor-agent): no auto-install; caller shows install_hint.
-        return False
-    if shutil.which("npm") is None:
+    spec = harness_install_spec(key)
+    if spec is not None and spec.package is None and spec.install_command is None:
+        # Manual-only CLI (e.g. cursor-agent): caller shows install_hint.
         return False
     cmd = harness_install_command(key)
+    if shutil.which(cmd[0]) is None:
+        return False
     try:
         subprocess.run(cmd, check=False, timeout=300)
     except (OSError, subprocess.TimeoutExpired):
         return False
-    return harness_cli_installed(key)
+    # harness_install_command would have raised for a spec-less key, so spec is
+    # non-None past this point.
+    assert spec is not None
+    # This is the setup flow's own process: check bare ``PATH`` (not the
+    # resolve_cli_binary ladder), because the point of the ~/.local/bin refresh
+    # below is to make the binary reachable via ``PATH`` for this process — the
+    # subsequent harness_login/harness_cli_logged_in shell out with the bare
+    # binary name and rely on the inherited ``PATH``.
+    if shutil.which(spec.binary) is not None:
+        return True
+
+    # uv-based vendor installers commonly place entry points here and update
+    # shell startup files, which cannot change this already-running process.
+    user_bin = Path.home() / ".local" / "bin"
+    candidate = user_bin / spec.binary
+    if candidate.is_file() and os.access(candidate, os.X_OK):
+        current_path = os.environ.get("PATH", "")
+        path_entries = current_path.split(os.pathsep) if current_path else []
+        if str(user_bin) not in path_entries:
+            os.environ["PATH"] = os.pathsep.join([str(user_bin), *path_entries])
+    return shutil.which(spec.binary) is not None
 
 
 def harness_cli_logged_in(key: str) -> bool:
@@ -475,7 +480,7 @@ def harness_cli_logged_in(key: str) -> bool:
         key has no status command, the CLI binary is missing, the status
         process failed to spawn, or the CLI reports no login.
     """
-    spec = _HARNESS_INSTALL.get(key)
+    spec = harness_install_spec(key)
     if spec is None or spec.status_args is None:
         return False
     if shutil.which(spec.binary) is None:
@@ -525,7 +530,7 @@ def harness_login(key: str) -> bool:
         has no login command, the CLI binary is missing, the login process
         failed to spawn, or the user did not complete the login.
     """
-    spec = _HARNESS_INSTALL.get(key)
+    spec = harness_install_spec(key)
     if spec is None or spec.login_args is None:
         return False
     if shutil.which(spec.binary) is None:
@@ -576,7 +581,7 @@ def harness_logout(key: str) -> bool:
         ``False`` when the key has no logout command, the binary is missing, the
         process failed to spawn, or a login still resolves afterward.
     """
-    spec = _HARNESS_INSTALL.get(key)
+    spec = harness_install_spec(key)
     if spec is None or spec.logout_args is None:
         return False
     if shutil.which(spec.binary) is None:
