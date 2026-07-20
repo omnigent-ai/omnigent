@@ -24,7 +24,7 @@ import {
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
 import { authenticatedFetch } from "@/lib/identity";
-import { useHosts, type Host } from "@/hooks/useHosts";
+import { useHostModelOptions, useHosts, type Host } from "@/hooks/useHosts";
 import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useHostFilesystem, type HostFilesystemEntry } from "@/hooks/useHostFilesystem";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
@@ -42,7 +42,7 @@ vi.mock("@/lib/identity", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/lib/identity")>()),
   authenticatedFetch: vi.fn(),
 }));
-vi.mock("@/hooks/useHosts", () => ({ useHosts: vi.fn() }));
+vi.mock("@/hooks/useHosts", () => ({ useHosts: vi.fn(), useHostModelOptions: vi.fn() }));
 vi.mock("@/hooks/useAvailableAgents", () => ({
   useAvailableAgents: vi.fn(),
   prefetchAvailableAgentDetails: vi.fn(),
@@ -95,6 +95,7 @@ vi.mock("@/store/chatStore", async (importOriginal) => ({
 
 const authenticatedFetchMock = vi.mocked(authenticatedFetch);
 const useHostsMock = vi.mocked(useHosts);
+const useHostModelOptionsMock = vi.mocked(useHostModelOptions);
 const useAvailableAgentsMock = vi.mocked(useAvailableAgents);
 const useHostFilesystemMock = vi.mocked(useHostFilesystem);
 const useHostWorktreesMock = vi.mocked(useHostWorktrees);
@@ -592,6 +593,7 @@ function mockAgents(agents: AvailableAgent[]) {
 function setupLandingMocks() {
   authenticatedFetchMock.mockReset();
   useHostsMock.mockReset();
+  useHostModelOptionsMock.mockReset();
   useAvailableAgentsMock.mockReset();
   useHostFilesystemMock.mockReset();
   useHostWorktreesMock.mockReset();
@@ -617,6 +619,19 @@ function setupLandingMocks() {
     data: undefined,
   } as unknown as ReturnType<typeof useHostWorktrees>);
   mockHosts([host("online")]);
+  useHostModelOptionsMock.mockReturnValue({
+    data: [
+      { id: "opus", model: "system.ai.claude-opus-4-8[1m]", displayName: "Opus 4.8" },
+      {
+        id: "sonnet",
+        model: "system.ai.claude-sonnet-4-6[1m]",
+        displayName: "Sonnet 4.6",
+      },
+      { id: "haiku", model: "system.ai.claude-haiku-4-5", displayName: "Haiku 4.5" },
+    ],
+    isLoading: false,
+    isError: false,
+  } as unknown as ReturnType<typeof useHostModelOptions>);
   mockAgents([
     {
       id: "a1",
@@ -969,6 +984,10 @@ describe("NewChatLandingScreen", () => {
     // submenu: model + effort + permission-mode radios all appear together.
     openAgentConfig("a1");
     expect(screen.getByTestId("new-chat-landing-model-sonnet")).toBeTruthy();
+    expect(screen.getByTestId("new-chat-landing-model-opus").textContent).toContain("Opus 4.8");
+    expect(screen.getByTestId("new-chat-landing-model-sonnet").textContent).toContain("Sonnet 4.6");
+    expect(screen.queryByTestId("new-chat-landing-model-fable")).toBeNull();
+    expect(screen.queryByTestId("new-chat-landing-model-sonnet_5")).toBeNull();
     expect(screen.getByTestId("new-chat-landing-effort-medium")).toBeTruthy();
     const planOption = screen.getByTestId("new-chat-landing-permission-plan");
     expect(planOption.textContent).toContain("Plan");

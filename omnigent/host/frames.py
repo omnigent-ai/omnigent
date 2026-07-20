@@ -60,6 +60,8 @@ class HostFrameKind(str, Enum):
     CREATE_DIR_RESULT = "host.create_dir_result"
     FS_REQUEST = "host.fs_request"
     FS_RESULT = "host.fs_result"
+    MODEL_OPTIONS = "host.model_options"
+    MODEL_OPTIONS_RESULT = "host.model_options_result"
 
 
 # ── Frame dataclasses ────────────────────────────────────
@@ -632,6 +634,24 @@ class HostFsResultFrame:
     error: str | None = None
 
 
+@dataclass
+class HostModelOptionsFrame:
+    """Server → host: resolve pre-launch model choices for a harness."""
+
+    request_id: str
+    harness: str
+
+
+@dataclass
+class HostModelOptionsResultFrame:
+    """Host → server: pre-launch model choices resolved on that machine."""
+
+    request_id: str
+    status: str
+    models: list[dict[str, Any]] = field(default_factory=list)
+    error: str | None = None
+
+
 HostFrame = (
     HostHelloFrame
     | HostHarnessReadinessFrame
@@ -656,6 +676,8 @@ HostFrame = (
     | HostCreateDirResultFrame
     | HostFsRequestFrame
     | HostFsResultFrame
+    | HostModelOptionsFrame
+    | HostModelOptionsResultFrame
 )
 
 
@@ -926,6 +948,24 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "error": frame.error,
             }
         )
+    if isinstance(frame, HostModelOptionsFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.MODEL_OPTIONS.value,
+                "request_id": frame.request_id,
+                "harness": frame.harness,
+            }
+        )
+    if isinstance(frame, HostModelOptionsResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.MODEL_OPTIONS_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
+                "models": frame.models,
+                "error": frame.error,
+            }
+        )
     raise TypeError(f"unknown host frame type: {type(frame).__name__}")
 
 
@@ -1032,6 +1072,10 @@ def _decode_known_host_frame(
             return _decode_fs_request(msg)
         case HostFrameKind.FS_RESULT:
             return _decode_fs_result(msg)
+        case HostFrameKind.MODEL_OPTIONS:
+            return _decode_model_options(msg)
+        case HostFrameKind.MODEL_OPTIONS_RESULT:
+            return _decode_model_options_result(msg)
     raise ValueError(f"unhandled host frame kind: {kind.value!r}")  # pragma: no cover
 
 
@@ -1419,6 +1463,27 @@ def _decode_fs_result(msg: dict[str, Any]) -> HostFsResultFrame:
         payload=payload,
         error_status=error_status,
         error_code=_optional_nullable_str(msg, "error_code"),
+        error=_optional_nullable_str(msg, "error"),
+    )
+
+
+def _decode_model_options(msg: dict[str, Any]) -> HostModelOptionsFrame:
+    """Decode a host.model_options request frame."""
+    return HostModelOptionsFrame(
+        request_id=_required_str(msg, "request_id"),
+        harness=_required_str(msg, "harness"),
+    )
+
+
+def _decode_model_options_result(msg: dict[str, Any]) -> HostModelOptionsResultFrame:
+    """Decode a host.model_options_result frame."""
+    models = msg.get("models", [])
+    if not isinstance(models, list) or not all(isinstance(model, dict) for model in models):
+        raise ValueError("frame field must be a list of JSON objects: 'models'")
+    return HostModelOptionsResultFrame(
+        request_id=_required_str(msg, "request_id"),
+        status=_required_str(msg, "status"),
+        models=models,
         error=_optional_nullable_str(msg, "error"),
     )
 

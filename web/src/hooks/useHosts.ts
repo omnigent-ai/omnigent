@@ -1,5 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
+import type { NativeModelOption } from "@/lib/types";
 
 export interface Host {
   host_id: string;
@@ -58,5 +59,28 @@ export function useHosts(options: UseHostsOptions = {}) {
     // Host status is pushed via WS (hosts_changed frame in SessionUpdatesProvider).
     // 60 s fallback poll catches any missed events (tab backgrounded, reconnect gap).
     refetchInterval: enabled ? 60_000 : false,
+  });
+}
+
+async function fetchHostModelOptions(
+  hostId: string,
+  harness: string,
+): Promise<NativeModelOption[]> {
+  const res = await authenticatedFetch(
+    `/v1/hosts/${encodeURIComponent(hostId)}/harnesses/${encodeURIComponent(harness)}/model-options`,
+  );
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  const body = (await res.json()) as { models?: NativeModelOption[] };
+  return body.models ?? [];
+}
+
+/** Model choices available before launch, resolved on the selected host. */
+export function useHostModelOptions(hostId: string | null, harness: string, enabled = true) {
+  return useQuery({
+    queryKey: ["host-model-options", hostId, harness],
+    queryFn: () => fetchHostModelOptions(hostId as string, harness),
+    enabled: enabled && hostId !== null,
+    staleTime: 30_000,
+    retry: false,
   });
 }

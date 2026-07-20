@@ -33,6 +33,7 @@ from omnigent.host.frames import (
     HostCreateDirFrame,
     HostLaunchRunnerFrame,
     HostListDirFrame,
+    HostModelOptionsFrame,
     encode_host_frame,
 )
 from omnigent.runner.identity import token_bound_runner_id
@@ -59,6 +60,43 @@ _LIST_DIR_MAX_LIMIT = 1000
 # fast syscall on the host side; 5s matches list_dir and is generous
 # for transient network slowness without making the picker feel hung.
 _CREATE_DIR_TIMEOUT_S = 5.0
+_MODEL_OPTIONS_TIMEOUT_S = 15.0
+
+
+async def _proxy_model_options(
+    *,
+    host_registry: HostRegistry,
+    host_conn: HostConnection,
+    harness: str,
+) -> dict[str, Any]:
+    """Ask a host for the model catalog it would use for a new session."""
+    request_id = secrets.token_hex(8)
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[dict[str, Any]] = loop.create_future()
+    host_conn.pending_model_options[request_id] = future
+    frame = encode_host_frame(
+        HostModelOptionsFrame(request_id=request_id, harness=harness),
+    )
+    try:
+        try:
+            host_registry.send_text(host_conn, frame)
+        except ConnectionError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"host '{host_conn.host_id}' connection lost",
+            ) from exc
+        try:
+            return await asyncio.wait_for(future, timeout=_MODEL_OPTIONS_TIMEOUT_S)
+        except asyncio.TimeoutError as exc:
+            raise HTTPException(
+                status_code=504,
+                detail=(
+                    f"host '{host_conn.host_id}' did not resolve model options within "
+                    f"{_MODEL_OPTIONS_TIMEOUT_S:.0f}s"
+                ),
+            ) from exc
+    finally:
+        host_conn.pending_model_options.pop(request_id, None)
 
 
 async def _proxy_list_dir(
@@ -404,6 +442,36 @@ def create_hosts_router(
             "configured_harnesses": host.configured_harnesses,
             "runners": [],
         }
+
+    @router.get("/hosts/{host_id}/harnesses/{harness}/model-options")
+    async def get_host_model_options(
+        request: Request,
+        host_id: str,
+        harness: str,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Return pre-launch model choices resolved by the selected host."""
+        user_id = require_user(request, auth_provider)
+        host = await asyncio.to_thread(host_store.get_host, host_id)
+        if host is None:
+            raise HTTPException(status_code=404, detail="host not found")
+        if user_id is not None and host.owner != user_id:
+            raise HTTPException(status_code=403, detail="not your host")
+        conn = host_registry.get(host.host_id)
+        if conn is None:
+            raise HTTPException(status_code=409, detail="host is offline")
+
+        result = await _proxy_model_options(
+            host_registry=host_registry,
+            host_conn=conn,
+            harness=canonicalize_harness(harness) or harness,
+        )
+        if result.get("status") != "ok":
+            raise HTTPException(
+                status_code=502,
+                detail=str(result.get("error") or "host model-options lookup failed"),
+            )
+        models = result.get("models")
+        return {"models": models if isinstance(models, list) else []}
 
     @router.post("/hosts/{host_id}/runners")
     async def launch_runner(

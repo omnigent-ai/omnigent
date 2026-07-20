@@ -23,6 +23,8 @@ from omnigent.host.frames import (
     HostListDirResultFrame,
     HostListWorktreesFrame,
     HostListWorktreesResultFrame,
+    HostModelOptionsFrame,
+    HostModelOptionsResultFrame,
     HostRemoveWorktreeFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
@@ -35,6 +37,43 @@ from omnigent.host.frames import (
     decode_host_frame,
     encode_host_frame,
 )
+
+
+def test_model_options_frames_round_trip() -> None:
+    """Pre-launch model catalogs survive both directions of the host tunnel."""
+    request = decode_host_frame(
+        encode_host_frame(
+            HostModelOptionsFrame(request_id="req_models", harness="claude-native"),
+        )
+    )
+    assert request == HostModelOptionsFrame(
+        request_id="req_models",
+        harness="claude-native",
+    )
+
+    result = decode_host_frame(
+        encode_host_frame(
+            HostModelOptionsResultFrame(
+                request_id="req_models",
+                status="ok",
+                models=[
+                    {
+                        "id": "sonnet",
+                        "model": "system.ai.claude-sonnet-4-6[1m]",
+                        "displayName": "Sonnet 4.6",
+                    }
+                ],
+            )
+        )
+    )
+    assert isinstance(result, HostModelOptionsResultFrame)
+    assert result.models == [
+        {
+            "id": "sonnet",
+            "model": "system.ai.claude-sonnet-4-6[1m]",
+            "displayName": "Sonnet 4.6",
+        }
+    ]
 
 
 def test_encode_injects_traceparent_under_active_span() -> None:

@@ -3,7 +3,7 @@ import { cleanup, renderHook, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { useHosts } from "./useHosts";
+import { useHostModelOptions, useHosts } from "./useHosts";
 
 const fetchMock = vi.fn();
 
@@ -198,5 +198,37 @@ describe("useHosts", () => {
 
     expect(result.current.error).toBeInstanceOf(Error);
     expect((result.current.error as Error).message).toContain("503");
+  });
+});
+
+describe("useHostModelOptions", () => {
+  it("loads the selected host's pre-launch catalog", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        models: [
+          {
+            id: "sonnet",
+            model: "system.ai.claude-sonnet-4-6[1m]",
+            displayName: "Sonnet 4.6",
+          },
+        ],
+      }),
+    );
+
+    const { result } = renderHook(() => useHostModelOptions("host_1", "claude-native"), {
+      wrapper,
+    });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "/v1/hosts/host_1/harnesses/claude-native/model-options",
+    );
+    expect(result.current.data?.map((model) => model.displayName)).toEqual(["Sonnet 4.6"]);
+  });
+
+  it("does not fetch without a selected host", async () => {
+    renderHook(() => useHostModelOptions(null, "claude-native"), { wrapper });
+    await Promise.resolve();
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });
