@@ -452,6 +452,7 @@ class SandboxLauncher(ABC):
         repo_name: str | None = None,
         host_config: dict[str, object] | None = None,
         on_stage: Callable[[str], None] | None = None,
+        extra_env: dict[str, str] | None = None,
     ) -> str:
         """
         Start ``omnigent host`` in the sandbox and return the workspace path.
@@ -495,6 +496,8 @@ class SandboxLauncher(ABC):
             clone (when *repo_url* is set) and ``"starting"`` before the host
             launches. Runs on this (worker) thread, so it must be thread-safe.
             ``None`` disables progress reporting.
+        :param extra_env: Per-launch env pairs for the host process (e.g. the
+            session owner's ``GIT_TOKEN``), or ``None`` for none.
         :returns: The absolute in-sandbox workspace path (the cloned repository
             directory when *repo_url* is set).
         :raises click.ClickException: If a sandbox command fails, the clone
@@ -535,6 +538,7 @@ class SandboxLauncher(ABC):
                 (HOST_TOKEN_ENV_VAR, token),
                 (HOST_ID_ENV_VAR, host_id),
                 (HOST_NAME_ENV_VAR, host_name),
+                *sorted((extra_env or {}).items()),
             )
         )
         self.run_background(

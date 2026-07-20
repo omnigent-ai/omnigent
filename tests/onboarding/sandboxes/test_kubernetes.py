@@ -629,3 +629,43 @@ def test_provision_reserves_pod_name_and_run_is_unsupported() -> None:
     # run is unsupported: the host is the Pod entrypoint, there is no exec-in.
     with pytest.raises(SandboxCapabilityError):
         launcher.run("sb", "echo hi")
+
+
+# ── extra_env (per-user credentials, e.g. GIT_TOKEN) ────────────────
+
+
+def test_token_secret_carries_extra_env() -> None:
+    """Extra env pairs ride the per-Pod launch-token Secret's stringData."""
+    manifest = build_token_secret_manifest(
+        secret_name="s",
+        namespace="ns",
+        token=_TOKEN,
+        extra={"GIT_TOKEN": "gho_x"},
+    )
+    assert manifest["stringData"]["GIT_TOKEN"] == "gho_x"
+    assert manifest["stringData"][HOST_TOKEN_ENV_VAR] == _TOKEN
+
+
+def test_pod_manifest_references_extra_env_keys_in_both_containers() -> None:
+    """Extra keys land as secretKeyRef env in the host AND init containers."""
+    manifest = build_pod_manifest(**_MANIFEST_KW, extra_env_keys=["GIT_TOKEN"])
+    spec = manifest["spec"]
+    expected = {
+        "name": "GIT_TOKEN",
+        "valueFrom": {
+            "secretKeyRef": {
+                "name": _MANIFEST_KW["token_secret_name"],
+                "key": "GIT_TOKEN",
+            }
+        },
+    }
+    assert expected in spec["containers"][0]["env"]
+    assert expected in spec["initContainers"][0]["env"]
+
+
+def test_pod_manifest_never_inlines_extra_env_values() -> None:
+    """The value only ever lives in the Secret — never in the Pod spec."""
+    import json
+
+    manifest = build_pod_manifest(**_MANIFEST_KW, extra_env_keys=["GIT_TOKEN"])
+    assert "gho_" not in json.dumps(manifest)

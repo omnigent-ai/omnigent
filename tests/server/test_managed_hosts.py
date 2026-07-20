@@ -1588,6 +1588,7 @@ class _EntrypointFakeLauncher(FakeSandboxLauncher):
         repo_name: str | None = None,
         host_config: dict[str, object] | None = None,
         on_stage=None,
+        extra_env: dict[str, str] | None = None,
     ) -> str:
         """Record the call, prove the token already resolves, and connect."""
         self.start_calls.append(
