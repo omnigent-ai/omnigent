@@ -648,6 +648,10 @@ def _kiro_session_workspace(session_workspace: str | None) -> Path:
     return Path(raw.strip()).expanduser().resolve()
 
 
+_KIRO_MODEL_OPTIONS_TOTAL_TIMEOUT_S = 20.0
+_KIRO_MODEL_OPTIONS_SUBPROCESS_MARGIN_S = 0.5
+
+
 async def _kiro_native_launch_config(
     *,
     session_id: str,
@@ -11159,6 +11163,57 @@ def create_runner_app(
                 await codex_client.close()
         return options
 
+    async def _kiro_native_model_options(conv_id: str) -> list[dict[str, Any]]:
+        """Discover model options from the Kiro CLI installed on this runner.
+
+        The runner owns both the Kiro binary and its authenticated credential
+        home. Use the same workspace and sanitized environment as the live TUI
+        so remote runners report their own available catalog, not the AP host's.
+
+        :param conv_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+        :returns: Normalized Web-picker model objects.
+        :raises RuntimeError: If launch config or Kiro discovery fails.
+        """
+        from omnigent.kiro_native import (
+            discover_kiro_model_options,
+            resolve_kiro_executable,
+        )
+        from omnigent.kiro_native_bridge import (
+            KIRO_NATIVE_ENV_UNSET,
+            build_kiro_native_discovery_env,
+        )
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _KIRO_MODEL_OPTIONS_TOTAL_TIMEOUT_S
+        worker_deadline = time.monotonic() + _KIRO_MODEL_OPTIONS_TOTAL_TIMEOUT_S
+        async with asyncio.timeout_at(deadline):
+            launch_config = await _kiro_native_launch_config(
+                session_id=conv_id,
+                server_client=server_client,
+            )
+            env = build_kiro_native_discovery_env()
+            for key in KIRO_NATIVE_ENV_UNSET:
+                env.pop(key, None)
+            env["KIRO_LOG_NO_COLOR"] = "true"
+            executable = resolve_kiro_executable()
+
+            def _discover_before_deadline() -> list[dict[str, Any]]:
+                remaining_s = (
+                    worker_deadline - time.monotonic() - _KIRO_MODEL_OPTIONS_SUBPROCESS_MARGIN_S
+                )
+                if remaining_s <= 0:
+                    raise TimeoutError("Kiro model-options deadline exhausted before discovery")
+                return discover_kiro_model_options(
+                    executable,
+                    cwd=launch_config.workspace,
+                    env=env,
+                    timeout_s=min(10.0, remaining_s),
+                )
+
+            return await asyncio.to_thread(
+                _discover_before_deadline,
+            )
+
     async def _handle_pi_native_interrupt(conv_id: str) -> Response:
         """
         Stop a pi-native turn by asking the resident Pi extension to abort.
@@ -17843,6 +17898,48 @@ def create_runner_app(
                 content={
                     "error": "codex_native_model_options_failed",
                     "detail": _client_safe_error_detail(exc, context="codex-native model options"),
+                },
+            )
+
+    @app.get("/v1/sessions/{session_id}/kiro-model-options")
+    async def get_session_kiro_model_options(session_id: str) -> JSONResponse:
+        """Return the live Kiro CLI model catalog for a kiro-native session.
+
+        :param session_id: Session/conversation identifier, e.g.
+            ``"conv_abc123"``.
+        :returns: JSON ``{"models": [...]}``. Wrong-harness sessions return an
+            empty list. Failures requiring a retry cooldown return HTTP 424;
+            transient not-ready failures return HTTP 503.
+        """
+        from omnigent.kiro_native import KiroModelDiscoveryUnavailable
+
+        if _session_harness_name(session_id) != "kiro-native":
+            return JSONResponse(status_code=200, content={"models": []})
+        try:
+            return JSONResponse(
+                status_code=200,
+                content={"models": await _kiro_native_model_options(session_id)},
+            )
+        except KiroModelDiscoveryUnavailable as exc:
+            _logger.info("Kiro model discovery unavailable for session=%s", session_id)
+            return JSONResponse(
+                status_code=424,
+                content={
+                    "error": "kiro_native_model_options_unavailable",
+                    "detail": _client_safe_error_detail(exc, context="kiro-native model options"),
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 - surface transient runner failures to AP.
+            _logger.warning(
+                "Kiro model discovery failed for session=%s",
+                session_id,
+                exc_info=True,
+            )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "kiro_native_model_options_failed",
+                    "detail": _client_safe_error_detail(exc, context="kiro-native model options"),
                 },
             )
 

@@ -1751,10 +1751,9 @@ class SessionResponse(BaseModel):
         runner at startup. Empty list when the agent spec
         cannot be loaded, or when bundled + host discovery
         yields nothing.
-    :param model_options: Codex app-server ``model/list`` options
-        for codex-native sessions, including each model's supported
-        reasoning efforts. Empty for non-codex-native sessions or while
-        the bound runner / Codex app-server cannot answer yet.
+    :param model_options: Native model-picker options. Codex entries may include
+        supported reasoning efforts; Kiro entries come from CLI discovery.
+        Empty for sessions without a picker or while the runner cannot answer.
     :param terminal_pending: ``True`` while the runner is auto-creating
         a terminal-first session's terminal (claude-native /
         codex-native), so the Web UI shows a spinner on the Terminal

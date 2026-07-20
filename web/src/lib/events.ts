@@ -787,9 +787,9 @@ export interface SessionSkillsEvent {
 }
 
 /**
- * `session.model_options` — the Codex app-server model catalog just
- * resolved for a session. Consumers refetch the session snapshot and apply
- * its now-populated `codexModelOptions`.
+ * `session.model_options` — a native model catalog just resolved for a
+ * session. Consumers refetch the session snapshot and apply its now-populated
+ * `codexModelOptions` compatibility field.
  */
 export interface SessionModelOptionsEvent {
   type: "session_model_options";

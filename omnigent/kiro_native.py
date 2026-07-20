@@ -6,6 +6,8 @@ import asyncio
 import json
 import os
 import shutil
+import subprocess
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -45,44 +47,163 @@ _DEFAULT_KIRO_COMMAND = "kiro-cli"
 _KIRO_PATH_ENV = "OMNIGENT_KIRO_PATH"
 _AGENT_NAME = "kiro-native-ui"
 
-# Curated kiro-cli base models for the Web UI picker. Static (like cursor-native,
-# the other launch-only-model vendor) rather than runner-discovered: the list is
-# global and fixed, not account-scoped. ids match what ``kiro-cli --model`` accepts
-# (and ``--list-models`` reports); ``auto`` is kiro's default and a real literal id.
-# Refresh by hand from ``kiro-cli chat --list-models --format json`` if Kiro
-# ships/renames a model.
-_KIRO_BASE_MODELS: list[dict[str, Any]] = [
-    {"id": "auto", "displayName": "Auto", "isDefault": True},
-    {"id": "claude-sonnet-4.5", "displayName": "Claude Sonnet 4.5"},
-    {"id": "claude-sonnet-4", "displayName": "Claude Sonnet 4"},
-    {"id": "claude-haiku-4.5", "displayName": "Claude Haiku 4.5"},
-    {"id": "deepseek-3.2", "displayName": "DeepSeek V3.2"},
-    {"id": "minimax-m2.5", "displayName": "MiniMax M2.5"},
-    {"id": "minimax-m2.1", "displayName": "MiniMax M2.1"},
-    {"id": "glm-5", "displayName": "GLM-5"},
-    {"id": "qwen3-coder-next", "displayName": "Qwen3 Coder Next"},
-]
+_KIRO_MODEL_DISCOVERY_TIMEOUT_S = 10.0
 
 
-def kiro_base_model_options() -> list[dict[str, Any]]:
-    """Return the curated kiro base-model options for the Web UI picker.
+class KiroModelDiscoveryUnavailable(RuntimeError):
+    """Kiro model discovery should pause before a later retry."""
 
-    Mirrors :func:`omnigent.cursor_native.cursor_base_model_options`: each option
-    carries ``id`` (the value ``kiro-cli --model`` accepts), ``displayName``, and
-    ``isDefault``/``isCurrent`` flags. kiro applies the model only at launch, so
-    the picked id is persisted as ``model_override`` and consumed by the runner.
 
-    :returns: Fresh option dicts (callers may mutate); base order preserved.
+class KiroModelDiscoveryNotReady(RuntimeError):
+    """Kiro model discovery may succeed when retried shortly."""
+
+
+def normalize_kiro_model_options(payload: Any) -> list[dict[str, Any]]:
+    """Normalize ``kiro-cli chat --list-models --format json`` output.
+
+    Accept a top-level array or an object containing ``models`` so minor CLI
+    envelope changes do not blank the picker. Model entries may be strings or
+    objects. Preserve CLI order, discard duplicate ids, and fail loudly on
+    malformed or empty catalogs so callers never cache a partial list.
+
+    :param payload: Decoded JSON emitted by Kiro.
+    :returns: Web-picker options with ``id``, ``displayName``, and ``isDefault``.
+    :raises ValueError: If the catalog shape or an entry is invalid or empty.
     """
-    return [
-        {
-            "id": m["id"],
-            "displayName": m["displayName"],
-            "isDefault": bool(m.get("isDefault", False)),
-            "isCurrent": False,
-        }
-        for m in _KIRO_BASE_MODELS
-    ]
+    raw_models = payload.get("models") if isinstance(payload, dict) else payload
+    if not isinstance(raw_models, list):
+        raise ValueError("Kiro model catalog must be a list or an object containing models")
+    catalog_default = (
+        next(
+            (
+                value.strip()
+                for key in ("defaultModel", "default_model", "defaultModelId", "default_model_id")
+                if isinstance((value := payload.get(key)), str) and value.strip()
+            ),
+            None,
+        )
+        if isinstance(payload, dict)
+        else None
+    )
+
+    options: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    supplied_default_ids: list[str] = []
+    for raw in raw_models:
+        if isinstance(raw, str):
+            model_id = raw.strip()
+            display_name = model_id
+            supplied_default = False
+        elif isinstance(raw, dict):
+            model_id = next(
+                (
+                    value.strip()
+                    for key in ("id", "modelId", "model_id", "model")
+                    if isinstance((value := raw.get(key)), str) and value.strip()
+                ),
+                "",
+            )
+            display_name = next(
+                (
+                    value.strip()
+                    for key in ("displayName", "display_name", "name")
+                    if isinstance((value := raw.get(key)), str) and value.strip()
+                ),
+                model_id,
+            )
+            supplied_default = any(
+                raw.get(key) is True for key in ("isDefault", "is_default", "default")
+            )
+        else:
+            raise ValueError("Kiro model catalog entries must be strings or objects")
+        if not model_id:
+            raise ValueError("Kiro model catalog entry is missing an id")
+        if supplied_default and model_id not in supplied_default_ids:
+            supplied_default_ids.append(model_id)
+        if model_id in seen:
+            continue
+        seen.add(model_id)
+        options.append(
+            {
+                "id": model_id,
+                "displayName": display_name,
+                "isDefault": False,
+            }
+        )
+    if not options:
+        raise ValueError("Kiro model catalog is empty")
+    default_id = catalog_default if catalog_default in seen else None
+    if default_id is None:
+        default_id = next(
+            (model_id for model_id in supplied_default_ids if model_id in seen), None
+        )
+    if default_id is None and "auto" in seen:
+        default_id = "auto"
+    for option in options:
+        option["isDefault"] = option["id"] == default_id
+    return options
+
+
+def discover_kiro_model_options(
+    executable: str,
+    *,
+    cwd: Path,
+    env: Mapping[str, str],
+    timeout_s: float = _KIRO_MODEL_DISCOVERY_TIMEOUT_S,
+) -> list[dict[str, Any]]:
+    """Run Kiro's machine-readable model discovery command.
+
+    :param executable: Resolved ``kiro-cli`` executable path.
+    :param cwd: Session workspace, matching the live Kiro terminal.
+    :param env: Sanitized Kiro child environment.
+    :param timeout_s: Maximum combined runtime for authentication and discovery.
+    :returns: Normalized Web-picker model options.
+    :raises KiroModelDiscoveryUnavailable: If Kiro is unauthenticated, cannot
+        run, exits non-zero, or emits invalid JSON/catalog data.
+    :raises KiroModelDiscoveryNotReady: If a bounded CLI check times out.
+    """
+
+    deadline = time.monotonic() + timeout_s
+
+    def _run(argv: list[str], *, action: str) -> subprocess.CompletedProcess[str]:
+        remaining_s = deadline - time.monotonic()
+        if remaining_s <= 0:
+            raise KiroModelDiscoveryNotReady(f"Kiro {action} timed out")
+        try:
+            completed = subprocess.run(
+                argv,
+                cwd=cwd,
+                env=dict(env),
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=remaining_s,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise KiroModelDiscoveryNotReady(f"Kiro {action} timed out") from exc
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise KiroModelDiscoveryUnavailable(f"Kiro {action} failed: {exc}") from exc
+        if completed.returncode != 0:
+            detail = completed.stderr.strip() or completed.stdout.strip() or "unknown error"
+            raise KiroModelDiscoveryUnavailable(
+                f"Kiro {action} exited {completed.returncode}: {detail}"
+            )
+        return completed
+
+    _run([executable, "whoami", "--format", "json"], action="authentication check")
+
+    completed = _run(
+        [executable, "chat", "--list-models", "--format", "json"],
+        action="model discovery",
+    )
+    try:
+        payload = json.loads(completed.stdout)
+        return normalize_kiro_model_options(payload)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise KiroModelDiscoveryUnavailable(
+            f"Kiro model discovery returned invalid JSON: {exc}"
+        ) from exc
 
 
 _TERMINAL_NAME = "kiro"

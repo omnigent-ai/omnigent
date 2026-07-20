@@ -489,7 +489,7 @@ export interface ChatState {
    */
   skills: SkillSummary[];
   /**
-   * Codex app-server model options for the active codex-native session.
+   * Server-provided model options for the active native session.
    * Populated from the session snapshot and updated when the server's
    * background Codex ``model/list`` fetch lands.
    */
@@ -3845,7 +3845,7 @@ interface RefetchRunnerBackedSessionStateOptions {
 /**
  * Refetch runner-backed session state and apply it to the store.
  *
- * Skills and codex-native model options are runner-owned. When a session
+ * Skills and native model options are runner-owned. When a session
  * binds before those background fetches land, the snapshot carries empty
  * lists. The server later sends a bare nudge; refetching the snapshot is
  * how the store pulls the cache-warmed fields without clobbering live chat
@@ -4536,9 +4536,9 @@ export function handleSessionEvent(event: StreamEvent): void {
       void refetchRunnerBackedSessionState(event.conversationId);
       return;
     case "session_model_options":
-      // Codex app-server `model/list` just resolved. Refetch the
-      // cache-warmed snapshot and apply `codexModelOptions`; the picker
-      // derives both model rows and effort levels from that catalog.
+      // A runner-owned native model catalog just resolved. Refetch the
+      // cache-warmed snapshot and apply `codexModelOptions`; model rows use
+      // it for every supported native picker, while Codex also derives effort.
       void refetchRunnerBackedSessionState(event.conversationId);
       return;
     case "tool_result":

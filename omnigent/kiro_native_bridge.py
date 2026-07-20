@@ -215,12 +215,20 @@ def build_kiro_native_terminal_env(
     source_env: dict[str, str] | None = None,
 ) -> dict[str, str]:
     """Build the allowlisted child environment for ``kiro-cli``."""
-    env = os.environ if source_env is None else source_env
-    child = {key: env[key] for key in _CHILD_ENV_ALLOWLIST if env.get(key)}
+    child = build_kiro_native_discovery_env(source_env=source_env)
     bridge_dir = prepare_bridge_dir(session_id)
     child[KIRO_NATIVE_BRIDGE_DIR_ENV_VAR] = str(bridge_dir)
     child[KIRO_ACP_RECORD_PATH_ENV_VAR] = str(acp_record_path(bridge_dir))
     return child
+
+
+def build_kiro_native_discovery_env(
+    *,
+    source_env: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Build Kiro's allowlisted environment without live-session bridge state."""
+    env = os.environ if source_env is None else source_env
+    return {key: env[key] for key in _CHILD_ENV_ALLOWLIST if env.get(key)}
 
 
 def write_tmux_target(

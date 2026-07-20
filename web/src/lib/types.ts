@@ -410,10 +410,9 @@ export interface Session {
    */
   skills?: SkillSummary[];
   /**
-   * Codex app-server model options for codex-native sessions. Each option
-   * comes from Codex ``model/list`` and carries the model-specific reasoning
-   * efforts the picker should offer. Empty for non-codex-native sessions or
-   * while the runner has not answered yet.
+   * Server-provided native model options. Codex entries may carry
+   * model-specific reasoning efforts; Cursor, Kiro, and Pi use the common
+   * id/display metadata. Empty while the runner has not answered yet.
    */
   codexModelOptions?: CodexModelOption[];
   /**
