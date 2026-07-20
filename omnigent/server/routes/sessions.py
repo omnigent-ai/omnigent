@@ -297,6 +297,7 @@ from omnigent.stores.conversation_store import (
     ConversationNotFoundError,
     NameAlreadyExistsError,
 )
+from omnigent.stores.credential_store import CredentialStore
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.host_store import Host, HostStore
 from omnigent.stores.permission_store import PermissionStore
@@ -6818,6 +6819,7 @@ async def _run_managed_launch(
     host_registry: HostRegistry | None,
     tunnel_registry: TunnelRegistry | None,
     relaunch_host: Host | None = None,
+    credential_store: CredentialStore | None = None,
 ) -> None:
     """
     Provision a managed sandbox for a session in the background.
@@ -6875,6 +6877,7 @@ async def _run_managed_launch(
         tracker=tracker,
         host_store=host_store,
         relaunch_host=relaunch_host,
+        credential_store=credential_store,
     )
     if managed is None:
         return
@@ -6890,6 +6893,31 @@ async def _run_managed_launch(
     )
 
 
+async def _owner_credential_env(
+    credential_store: CredentialStore | None, owner: str
+) -> dict[str, str] | None:
+    """
+    Build the per-launch env from the owner's connected credentials.
+
+    :param credential_store: The app's credential store, or ``None`` when
+        the deployment has none configured.
+    :param owner: The launching user, e.g. ``"alice@example.com"``.
+    :returns: ``{"GIT_TOKEN": <token>}`` when the owner has a usable
+        GitHub credential, else ``None`` (today's exact behavior). An
+        undecryptable token (key rotated) logs and launches without.
+    """
+    if credential_store is None:
+        return None
+    cred = await asyncio.to_thread(credential_store.get, owner, "github")
+    if cred is None:
+        return None
+    token = credential_store.decrypt_token(cred)
+    if not token:
+        _logger.warning("github credential for %s is undecryptable — launching without it", owner)
+        return None
+    return {"GIT_TOKEN": token}
+
+
 async def _provision_managed_sandbox(
     *,
     session_id: str,
@@ -6899,6 +6927,7 @@ async def _provision_managed_sandbox(
     tracker: ManagedLaunchTracker,
     host_store: HostStore,
     relaunch_host: Host | None,
+    credential_store: CredentialStore | None = None,
 ) -> ManagedHostLaunch | None:
     """
     Run the provision phase of a background managed launch.
@@ -6933,6 +6962,7 @@ async def _provision_managed_sandbox(
         """
         _publish_sandbox_status(session_id, stage)
 
+    extra_env = await _owner_credential_env(credential_store, owner)
     try:
         if relaunch_host is not None:
             return await relaunch_managed_host(
@@ -6941,6 +6971,7 @@ async def _provision_managed_sandbox(
                 host_store=host_store,
                 repo=repo,
                 on_stage=_on_stage,
+                extra_env=extra_env,
             )
         return await launch_managed_host(
             config=sandbox_config,
@@ -6948,6 +6979,7 @@ async def _provision_managed_sandbox(
             host_store=host_store,
             repo=repo,
             on_stage=_on_stage,
+            extra_env=extra_env,
         )
     except HTTPException as exc:
         _logger.warning(
@@ -7375,6 +7407,7 @@ def _kick_managed_relaunch(
             tracker=tracker,
             conversation_store=conversation_store,
             host_store=host_store,
+            credential_store=getattr(app_state, "credential_store", None),
             host_registry=getattr(app_state, "host_registry", None),
             tunnel_registry=getattr(app_state, "tunnel_registry", None),
             relaunch_host=host,
@@ -14995,6 +15028,7 @@ def create_sessions_router(
                     tracker=managed_launches,
                     conversation_store=conversation_store,
                     host_store=host_store_for_managed,
+                    credential_store=getattr(request.app.state, "credential_store", None),
                     host_registry=getattr(request.app.state, "host_registry", None),
                     tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
                 )

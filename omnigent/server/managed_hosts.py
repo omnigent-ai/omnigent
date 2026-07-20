@@ -2073,9 +2073,10 @@ async def _arm_and_start_host(
             repo_name=repo.repo_name if repo is not None else None,
             on_stage=on_stage,
             # Omitted entirely when unset: a deployment-injected launcher
-            # predating the host_config parameter must keep launching.
+            # predating the host_config / extra_env parameters must keep
+            # launching.
             **({"host_config": config.host_config} if config.host_config is not None else {}),
-            extra_env=extra_env,
+            **({"extra_env": extra_env} if extra_env else {}),
         )
         await _wait_for_host_online(host_store, host_id)
     except Exception as exc:

@@ -1456,6 +1456,7 @@ def create_app(
     app.state.runner_router = runner_router
     app.state.host_registry = host_registry
     app.state.host_store = host_store
+    app.state.credential_store = credential_store
     app.state.sandbox_config = sandbox_config
     # Admin roster: the config ``admins:`` list (canonical) union'd with the
     # runtime-editable ``<data_dir>/admins`` file. Built once here so BOTH the
