@@ -565,8 +565,7 @@ export function TableHandles({
           // Scope hit-testing to the source table's rows only — prevents the
           // ghost/indicator from jumping to rows in other tables.
           const sourceRow = dom.querySelectorAll("tr")[tableRowIndex] as
-            | HTMLTableRowElement
-            | undefined;
+            HTMLTableRowElement | undefined;
           const sourceTableEl = sourceRow?.closest("table");
           if (!sourceTableEl) return;
           const tableRows = Array.from(sourceTableEl.querySelectorAll("tr"));
@@ -602,8 +601,7 @@ export function TableHandles({
         } else {
           // Look up target column by X band within the source table only.
           const sourceRow = dom.querySelectorAll("tr")[tableRowIndex] as
-            | HTMLTableRowElement
-            | undefined;
+            HTMLTableRowElement | undefined;
           const tableEl = sourceRow?.closest("table");
           const firstRow = tableEl?.querySelector("tr") as HTMLTableRowElement | null;
           if (!firstRow) return;

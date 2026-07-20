@@ -10,6 +10,8 @@
     "type-check": "tsc -b",
     "preview": "vite preview",
     "lint": "oxlint .",
+    "lint:design": "node scripts/check-design-system.mjs",
+    "lint:design:test": "node scripts/check-design-system.mjs --self-test",
     "lint:fix": "oxlint --fix .",
     "format": "prettier --write .",
     "format:check": "prettier --check .",

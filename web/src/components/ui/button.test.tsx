@@ -49,6 +49,12 @@ describe("buttonVariants translate/transform composition", () => {
     },
   );
 
+  it.each(SIZES)("keeps size=$size compact while opting into coarse-pointer targets", (size) => {
+    const classes = buttonVariants({ size });
+    expect(classes).toContain("touch-target-button");
+    expect(classes).not.toMatch(/md:(?:h|size)-/);
+  });
+
   it("keeps the pressed-state nudge on the transform property", () => {
     // The press feedback must exist and must be an arbitrary `transform:`
     // property under the active: variant. If this fails, either the press

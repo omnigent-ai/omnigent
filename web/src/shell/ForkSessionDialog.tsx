@@ -600,7 +600,7 @@ export function ForkSessionForm({
               shares its directory with the still-active original. */}
         {showConflictHint && (
           <p
-            className="flex items-start gap-1.5 text-xs text-warning"
+            className="flex items-start gap-1.5 text-xs text-warning-foreground"
             data-testid="fork-session-conflict-hint"
           >
             <AlertTriangleIcon className="mt-0.5 size-3.5 shrink-0" />
@@ -695,7 +695,7 @@ export function ForkSessionForm({
                         )}
                         {showMismatchWarning && (
                           <p
-                            className="flex items-start gap-1.5 text-xs text-warning"
+                            className="flex items-start gap-1.5 text-xs text-warning-foreground"
                             data-testid="fork-session-mismatch-warning"
                           >
                             <AlertTriangleIcon className="mt-0.5 size-3.5 shrink-0" />

@@ -192,8 +192,7 @@ export function ChatHeader({
         // centered, and actions right. Only active sessions paint the flat,
         // translucent surface; the landing page keeps its canvas clear.
         "chat-header absolute top-0 right-0 left-0 z-30 flex h-14 items-center justify-between px-2 py-3 md:right-[var(--workspace-panel-offset,0px)] md:h-10 md:py-2",
-        conversationId &&
-          "chat-header-session md:bg-background/95 md:backdrop-blur-xl",
+        conversationId && "chat-header-session md:bg-background/95 md:backdrop-blur-xl",
       )}
     >
       {/* Left slot: sidebar toggle (when sidebar is closed) and a
@@ -293,7 +292,7 @@ export function ChatHeader({
               aria-label="Chat"
               onClick={() => terminalFirst.setView("chat")}
               className={cn(
-                "flex h-[22px] cursor-pointer items-center gap-1 rounded-[5px] px-2 text-xs transition-[background-color,color,box-shadow] duration-[var(--duration-otto-fast)] ease-[var(--ease-otto)]",
+                "flex h-[22px] cursor-pointer items-center gap-1 rounded-[var(--radius-otto-xs)] px-2 text-xs transition-[background-color,color,box-shadow] duration-[var(--duration-otto-fast)] ease-[var(--ease-otto)]",
                 terminalFirst.view === "chat"
                   ? "bg-card text-foreground shadow-sm"
                   : "text-muted-foreground hover:text-foreground",
@@ -310,7 +309,7 @@ export function ChatHeader({
               title={terminalFirst.terminalStartingUp ? "Terminal is starting up…" : undefined}
               onClick={() => terminalFirst.setView("terminal")}
               className={cn(
-                "flex h-[22px] cursor-pointer items-center gap-1 rounded-[5px] px-2 text-xs transition-[background-color,color,box-shadow] duration-[var(--duration-otto-fast)] ease-[var(--ease-otto)] disabled:cursor-not-allowed disabled:opacity-50",
+                "flex h-[22px] cursor-pointer items-center gap-1 rounded-[var(--radius-otto-xs)] px-2 text-xs transition-[background-color,color,box-shadow] duration-[var(--duration-otto-fast)] ease-[var(--ease-otto)] disabled:cursor-not-allowed disabled:opacity-50",
                 terminalFirst.view === "terminal"
                   ? "bg-card text-foreground shadow-sm"
                   : "text-muted-foreground hover:text-foreground",
@@ -508,7 +507,7 @@ export function ChatHeader({
                       TAB_BADGE_BASE,
                       "ml-auto",
                       mobileMenu.subagentsWorking > 0
-                        ? "bg-success/15 text-success"
+                        ? "bg-success/15 text-success-foreground"
                         : "bg-muted text-muted-foreground",
                     )}
                   >

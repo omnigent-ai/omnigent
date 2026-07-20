@@ -35,7 +35,7 @@ function NodeStatusDot({ activity }: { activity: AgentActivity }) {
   if (activity === "working") return <RunningDot />;
   if (activity === "awaiting") {
     return (
-      <Badge className="border-transparent bg-warning/15 text-warning text-[9px] px-1 py-0">
+      <Badge className="border-transparent bg-warning/15 text-warning-foreground text-10 px-1 py-0">
         !
       </Badge>
     );

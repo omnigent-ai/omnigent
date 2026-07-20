@@ -11,7 +11,7 @@ import { AlertTriangleIcon } from "lucide-react";
 export function TruncatedBanner() {
   return (
     <div className="flex items-center gap-2 border-b border-border bg-warning/10 px-4 py-1.5 text-xs text-foreground shrink-0">
-      <AlertTriangleIcon className="size-3.5 shrink-0 text-warning" />
+      <AlertTriangleIcon className="size-3.5 shrink-0 text-warning-foreground" />
       <span>
         This file is too large to load fully — showing a truncated preview. Editing is disabled to
         avoid overwriting the rest of the file; download it to view or edit the full content.

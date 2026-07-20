@@ -499,7 +499,7 @@ function MarkdownRichTextViewerInner({
       )}
       {canEdit && isDirty && hasExternalUpdate && (
         <div className="absolute bottom-0 left-0 right-0 z-10 flex items-center gap-2 border-t border-border bg-warning/10 px-4 py-1.5 text-xs text-foreground backdrop-blur-sm">
-          <AlertTriangleIcon className="size-3.5 shrink-0 text-warning" />
+          <AlertTriangleIcon className="size-3.5 shrink-0 text-warning-foreground" />
           <span className="flex-1">This file was modified externally while you were editing.</span>
           <button
             type="button"
@@ -519,7 +519,7 @@ function MarkdownRichTextViewerInner({
       )}
       {canEdit && isDirty && !hasExternalUpdate && saveDisabled && (
         <div className="absolute bottom-0 left-0 right-0 z-10 flex items-center gap-1.5 border-t border-border bg-warning/10 px-4 py-1.5 text-xs text-foreground backdrop-blur-sm">
-          <MessageSquareOffIcon className="size-3.5 shrink-0 text-warning" />
+          <MessageSquareOffIcon className="size-3.5 shrink-0 text-warning-foreground" />
           Runner offline — changes save and commenting resumes once it reconnects.
         </div>
       )}

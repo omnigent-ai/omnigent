@@ -469,7 +469,7 @@ export function ToolbarPlugin({
             "flex items-center gap-1 rounded px-2 py-0.5 text-xs transition-colors",
             saveStatus.tone === "error" &&
               "text-destructive hover:bg-destructive/10 cursor-pointer",
-            saveStatus.tone === "offline" && "text-warning cursor-default",
+            saveStatus.tone === "offline" && "text-warning-foreground cursor-default",
             saveStatus.tone === "pending" &&
               (saveClickable
                 ? "text-muted-foreground hover:bg-muted hover:text-foreground cursor-pointer"

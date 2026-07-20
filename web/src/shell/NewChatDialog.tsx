@@ -814,7 +814,7 @@ function LandingProjectPicker({
       <PopoverTrigger asChild>
         <button
           type="button"
-          className="flex h-6 min-w-0 max-w-full items-center gap-1 rounded-md border border-transparent bg-transparent px-2 text-xs leading-4 font-normal text-muted-foreground transition-colors hover:bg-transparent hover:text-foreground"
+          className="flex h-6 min-w-0 max-w-full items-center gap-1 rounded-md border border-transparent bg-transparent px-2 text-xs leading-4 font-normal text-landing-footer transition-colors hover:bg-transparent hover:text-foreground"
           data-testid="new-chat-landing-project-chip"
         >
           <TagIcon className="size-3 shrink-0" />
@@ -1083,7 +1083,7 @@ function BypassSandboxOption({
         <div
           role="alert"
           data-testid="new-chat-landing-bypass-sandbox-banner"
-          className="mt-1.5 flex items-start gap-1.5 rounded-[var(--radius-otto-sm)] border border-destructive bg-destructive/10 px-2 py-1.5 text-[11px] font-medium leading-relaxed text-destructive [box-shadow:var(--elevation-otto-1)]"
+          className="mt-1.5 flex items-start gap-1.5 rounded-[var(--radius-otto-sm)] border border-destructive bg-destructive/10 px-2 py-1.5 text-card-meta font-medium leading-relaxed text-destructive [box-shadow:var(--elevation-otto-1)]"
         >
           <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0" />
           <span>
@@ -2988,7 +2988,7 @@ export function NewChatLandingScreen() {
   const workspaceChip = (
     <button
       type="button"
-      className="flex h-6 min-w-0 max-w-full items-center gap-1 rounded-md border border-transparent bg-transparent px-2 text-xs leading-4 font-normal text-muted-foreground transition-colors hover:bg-transparent hover:text-foreground"
+      className="flex h-6 min-w-0 max-w-full items-center gap-1 rounded-md border border-transparent bg-transparent px-2 text-xs leading-4 font-normal text-landing-footer transition-colors hover:bg-transparent hover:text-foreground"
       data-testid="new-chat-landing-workspace-chip"
     >
       <FolderTreeIcon className="size-3 shrink-0" />
@@ -3019,14 +3019,14 @@ export function NewChatLandingScreen() {
             aria-hidden="true"
             data-testid="new-chat-landing-otto"
           >
-            <div className="otto-landing-halo absolute -inset-3 rounded-full bg-[radial-gradient(circle,rgba(245,59,157,0.21),rgba(245,59,157,0.052)_44%,rgba(77,197,160,0.028)_58%,transparent_73%)] blur-[3px]" />
-            <span className="otto-landing-orbit otto-landing-orbit--pink absolute top-[26px] left-2 h-[34px] w-[92px] rounded-[50%] border border-[#F53B9D]/40 shadow-[inset_0_0_16px_rgba(245,59,157,0.055)]" />
-            <span className="otto-landing-orbit otto-landing-orbit--green absolute top-[31px] left-4 h-[26px] w-[77px] rounded-[50%] border border-[#4DC5A0]/30" />
-            <span className="otto-landing-satellite otto-landing-satellite--pink absolute top-6 right-3 size-1 rounded-full bg-[#F53B9D] shadow-[0_0_9px_#F53B9D]" />
-            <span className="otto-landing-satellite otto-landing-satellite--green absolute bottom-[21px] left-4 size-1 rounded-full bg-[#4DC5A0] shadow-[0_0_9px_#4DC5A0]" />
-            <OttoEyes className="otto-landing-mascot absolute top-5 left-[30px] h-12 w-auto drop-shadow-[0_16px_25px_rgba(245,59,157,0.21)]" />
+            <div className="otto-landing-halo absolute inset-1 rounded-full" />
+            <span className="otto-landing-orbit otto-landing-orbit--pink absolute top-[26px] left-2 h-[34px] w-[92px] rounded-[50%] border" />
+            <span className="otto-landing-orbit otto-landing-orbit--green absolute top-[31px] left-4 h-[26px] w-[77px] rounded-[50%] border" />
+            <span className="otto-landing-satellite otto-landing-satellite--pink absolute top-6 right-3 size-1 rounded-full" />
+            <span className="otto-landing-satellite otto-landing-satellite--green absolute bottom-[21px] left-4 size-1 rounded-full" />
+            <OttoEyes className="otto-landing-mascot absolute top-5 left-[30px] h-12 w-auto" />
           </div>
-          <h1 className="brand-display-title buoyant-enter buoyant-enter--title text-center text-[28px] leading-8 font-[450] tracking-[-0.035em] text-foreground">
+          <h1 className="brand-display-title buoyant-enter buoyant-enter--title text-center text-brand-title font-[450] tracking-[-0.035em] text-foreground">
             What should we build?
           </h1>
         </div>
@@ -3167,7 +3167,7 @@ export function NewChatLandingScreen() {
               // Six pixels of block padding centers the 20px line inside the
               // 32px control. useAutoGrowTextarea includes that padding when
               // measuring additional lines.
-              className="order-2 h-8 max-h-[180px] min-h-8 min-w-0 flex-1 resize-none overflow-y-auto bg-transparent px-0 py-[6px] font-['SF_Pro_Text',-apple-system,BlinkMacSystemFont,system-ui,sans-serif] text-[13px] leading-5 text-foreground outline-none placeholder:text-muted-foreground md:select-text"
+              className="order-2 h-8 max-h-[180px] min-h-8 min-w-0 flex-1 resize-none overflow-y-auto bg-transparent px-0 py-[6px] font-['SF_Pro_Text',-apple-system,BlinkMacSystemFont,system-ui,sans-serif] text-13 text-foreground outline-none placeholder:text-muted-foreground md:select-text"
             />
             {/* Gated on an empty draft so it reads as the placeholder.
                 pointer-events-none lets clicks fall through to focus the
@@ -3263,7 +3263,7 @@ export function NewChatLandingScreen() {
                   type="button"
                   size="icon"
                   variant="ghost"
-                  className="size-8 rounded-[8px] text-muted-foreground hover:text-foreground"
+                  className="size-8 rounded-[var(--radius-otto-xs)] text-muted-foreground hover:text-foreground"
                   disabled={creating}
                   onClick={() => fileInputRef.current?.click()}
                   title="Attach files"
@@ -3352,7 +3352,7 @@ export function NewChatLandingScreen() {
           {/* Borderless context row beneath the composer, matching the reference:
               36px tall with transparent 24px controls and no inter-chip gap. */}
           <div className="relative z-0 w-full [&_button]:hover:!bg-transparent">
-            <div className="ml-2 flex min-h-9 min-w-0 flex-nowrap items-center gap-0 overflow-hidden rounded-b-[20px] px-0 py-1.5">
+            <div className="ml-2 flex min-h-9 min-w-0 flex-nowrap items-center gap-0 overflow-hidden rounded-b-[var(--radius-otto-lg)] px-0 py-1.5">
               {/* Host chip */}
               <DropdownMenu
                 onOpenChange={(open) => {
@@ -3367,7 +3367,7 @@ export function NewChatLandingScreen() {
                 <DropdownMenuTrigger asChild>
                   <button
                     type="button"
-                    className="flex h-6 min-w-0 max-w-full items-center gap-1 rounded-md border border-transparent bg-transparent px-2 text-xs leading-4 font-normal text-muted-foreground transition-colors hover:bg-transparent hover:text-foreground"
+                    className="flex h-6 min-w-0 max-w-full items-center gap-1 rounded-md border border-transparent bg-transparent px-2 text-xs leading-4 font-normal text-landing-footer transition-colors hover:bg-transparent hover:text-foreground"
                     data-testid="new-chat-landing-host-chip"
                   >
                     <MonitorCloudIcon className="size-3 shrink-0" />
@@ -3524,7 +3524,7 @@ export function NewChatLandingScreen() {
                   <PopoverTrigger asChild>
                     <button
                       type="button"
-                      className="flex h-6 min-w-0 max-w-full items-center gap-1 rounded-md border border-transparent bg-transparent px-2 text-xs leading-4 font-normal text-muted-foreground transition-colors hover:bg-transparent hover:text-foreground"
+                      className="flex h-6 min-w-0 max-w-full items-center gap-1 rounded-md border border-transparent bg-transparent px-2 text-xs leading-4 font-normal text-landing-footer transition-colors hover:bg-transparent hover:text-foreground"
                       data-testid="new-chat-landing-repo-chip"
                     >
                       <GitBranchIcon className="size-3 shrink-0" />
@@ -3631,7 +3631,7 @@ export function NewChatLandingScreen() {
                   <PopoverTrigger asChild>
                     <button
                       type="button"
-                      className="flex h-6 min-w-0 max-w-full items-center gap-1 rounded-md border border-transparent bg-transparent px-2 text-xs leading-4 font-normal text-muted-foreground transition-colors hover:bg-transparent hover:text-foreground"
+                      className="flex h-6 min-w-0 max-w-full items-center gap-1 rounded-md border border-transparent bg-transparent px-2 text-xs leading-4 font-normal text-landing-footer transition-colors hover:bg-transparent hover:text-foreground"
                       data-testid="new-chat-landing-branch-chip"
                     >
                       <GitForkIcon className="size-3 shrink-0" />

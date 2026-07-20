@@ -219,14 +219,7 @@ function ViewModeToggle({
 // NOT genuinely fail, so it renders a quiet, non-destructive grey dot rather
 // than the red "Failed" one.
 type AgentActivity =
-  | "launching"
-  | "working"
-  | "awaiting"
-  | "done"
-  | "failed"
-  | "disconnected"
-  | "idle"
-  | "other";
+  "launching" | "working" | "awaiting" | "done" | "failed" | "disconnected" | "idle" | "other";
 
 // Error codes that mean "the runner went away", not "the task failed".
 // ``runner_disconnected`` is published when the SSE relay's tunnel drops
@@ -488,7 +481,9 @@ function StatusIndicator({ activity, label, details }: AgentStatus) {
         data-testid="subagent-status-dot"
         className="inline-flex shrink-0 items-center text-xs"
       >
-        <Badge className="border-transparent bg-warning/15 text-warning">Needs response</Badge>
+        <Badge className="border-transparent bg-warning/15 text-warning-foreground">
+          Needs response
+        </Badge>
       </span>
     );
   }

@@ -709,7 +709,10 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByTestId("new-chat-landing-input")).toBeTruthy();
     expect(screen.getByPlaceholderText("Ask anything...")).toBeTruthy();
     const otto = screen.getByTestId("new-chat-landing-otto");
-    expect(otto.querySelector(".otto-landing-mascot")).toBeTruthy();
+    const mascot = otto.querySelector(".otto-landing-mascot");
+    expect(mascot).toBeTruthy();
+    expect(mascot).toHaveClass("otto-landing-mascot");
+    expect(otto.querySelector(".otto-landing-halo")).toBeTruthy();
     expect(otto.querySelectorAll(".otto-landing-orbit")).toHaveLength(2);
   });
 
@@ -1181,6 +1184,22 @@ describe("NewChatLandingScreen", () => {
     expect(
       screen.getByTestId("new-chat-landing-branch-chip").querySelector("svg.lucide-git-fork"),
     ).toBeTruthy();
+  });
+
+  it("uses the lighter reference color for every landing footer badge", async () => {
+    renderLanding({}, "/?project=docs");
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+
+    for (const testId of [
+      "new-chat-landing-host-chip",
+      "new-chat-landing-project-chip",
+      "new-chat-landing-workspace-chip",
+      "new-chat-landing-branch-chip",
+    ]) {
+      expect(screen.getByTestId(testId)).toHaveClass("text-landing-footer");
+    }
   });
 
   it("suppresses the conflict banner once a git branch is named", async () => {

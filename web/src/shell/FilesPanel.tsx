@@ -98,7 +98,7 @@ function HiddenFilesToggle({
             aria-label={ariaLabel}
             className={cn(
               FILES_HEADER_ICON_BUTTON_CLASS,
-              hasHidden && "text-warning hover:text-warning/80",
+              hasHidden && "text-warning-foreground hover:text-warning-foreground/80",
             )}
             onClick={onToggle}
           >

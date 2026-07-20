@@ -51,9 +51,15 @@ import {
 import { formatPreview } from "@/lib/previewFormat";
 import type { RenderItem } from "@/lib/renderItems";
 import type { RememberScope } from "@/lib/types";
+import { cn } from "@/lib/utils";
 import { useChatStore } from "@/store/chatStore";
 import { AskUserQuestionForm, type AskUserQuestionAnswers } from "./AskUserQuestionForm";
 import { ExitPlanModeReview } from "./ExitPlanModeReview";
+import {
+  TRANSCRIPT_CARD_BODY_CLASS,
+  TRANSCRIPT_CARD_META_CLASS,
+  TRANSCRIPT_CARD_TITLE_CLASS,
+} from "./toolSurface";
 
 /**
  * Extract the answer-option labels from an AskUserQuestion-shaped
@@ -380,24 +386,24 @@ export function ApprovalCard({
       icon = <InfoIcon className="size-4 text-muted-foreground" />;
       label = "Resolved elsewhere";
     } else if (submittedAnswers !== null) {
-      icon = <CheckIcon className="size-4 text-success" />;
+      icon = <CheckIcon className="size-4 text-success-foreground" />;
       label = "Submitted";
     } else if (selectedAnswer !== null) {
-      icon = <CheckIcon className="size-4 text-success" />;
+      icon = <CheckIcon className="size-4 text-success-foreground" />;
       label = `Selected: ${selectedAnswer}`;
     } else if (acceptedWithExecPolicy) {
-      icon = <CheckIcon className="size-4 text-success" />;
+      icon = <CheckIcon className="size-4 text-success-foreground" />;
       label = "Approved and remembered";
     } else if (acceptedAllEdits) {
-      icon = <CheckIcon className="size-4 text-success" />;
+      icon = <CheckIcon className="size-4 text-success-foreground" />;
       label = isExitPlanMode ? "Plan approved · auto mode" : "Approved · auto-accepting edits";
     } else if (acceptedRemember) {
-      icon = <CheckIcon className="size-4 text-success" />;
+      icon = <CheckIcon className="size-4 text-success-foreground" />;
       label = rememberTarget
         ? `Approved · won't ask again for ${rememberTarget}`
         : "Approved · won't ask again";
     } else if (accepted) {
-      icon = <CheckIcon className="size-4 text-success" />;
+      icon = <CheckIcon className="size-4 text-success-foreground" />;
       label = isExitPlanMode ? "Plan approved" : "Approved";
     }
 
@@ -407,12 +413,16 @@ export function ApprovalCard({
         data-state="responded"
         className="flex flex-col gap-1 border-muted"
       >
-        <AlertTitle className="flex items-center gap-2 text-sm">
+        <AlertTitle className={cn("flex items-center gap-2", TRANSCRIPT_CARD_TITLE_CLASS)}>
           {icon}
           {label}
-          {policyName && <span className="text-muted-foreground text-xs">· {policyName}</span>}
+          {policyName && (
+            <span className={cn("text-muted-foreground", TRANSCRIPT_CARD_META_CLASS)}>
+              · {policyName}
+            </span>
+          )}
         </AlertTitle>
-        <AlertDescription className="flex flex-col gap-1 text-xs">
+        <AlertDescription className={cn("flex flex-col gap-1", TRANSCRIPT_CARD_BODY_CLASS)}>
           {isCodexCommandApproval ? (
             <>
               {codexCommand.reason && <span>{codexCommand.reason}</span>}
@@ -458,13 +468,13 @@ export function ApprovalCard({
       data-state="pending"
       className="flex flex-col gap-2 py-3 px-4"
     >
-      <AlertTitle className="flex items-center gap-2 text-sm">
+      <AlertTitle className={cn("flex items-center gap-2", TRANSCRIPT_CARD_TITLE_CLASS)}>
         {isCodexCommandApproval ? (
-          <TerminalIcon className="size-4 text-yellow-600 dark:text-yellow-400" />
+          <TerminalIcon className="size-4 text-warning-foreground" />
         ) : isExitPlanMode ? (
-          <ClipboardListIcon className="size-4 text-yellow-600 dark:text-yellow-400" />
+          <ClipboardListIcon className="size-4 text-warning-foreground" />
         ) : (
-          <MessageCircleQuestionMark className="size-4 text-yellow-600 dark:text-yellow-400" />
+          <MessageCircleQuestionMark className="size-4 text-warning-foreground" />
         )}
         {isCodexCommandApproval
           ? "Command approval"
@@ -476,13 +486,15 @@ export function ApprovalCard({
                 ? "Choose an option"
                 : "Approval required"}
         {policyName && !isAskUserQuestion && !isExitPlanMode && (
-          <span className="text-muted-foreground text-xs">· {policyName}</span>
+          <span className={cn("text-muted-foreground", TRANSCRIPT_CARD_META_CLASS)}>
+            · {policyName}
+          </span>
         )}
         {phase && !isMultiChoice && !isAskUserQuestion && !isExitPlanMode && (
-          <span className="text-muted-foreground text-xs">({phase})</span>
+          <span className={cn("text-muted-foreground", TRANSCRIPT_CARD_META_CLASS)}>({phase})</span>
         )}
       </AlertTitle>
-      <AlertDescription className="flex flex-col gap-2">
+      <AlertDescription className={cn("flex flex-col gap-2", TRANSCRIPT_CARD_BODY_CLASS)}>
         {isExitPlanMode ? (
           <>
             <span>Claude finished planning and wants to proceed.</span>

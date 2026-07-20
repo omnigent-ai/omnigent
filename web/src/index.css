@@ -35,6 +35,16 @@
      * the composer footer selectors and slash-command menu rows. */
   --text-13: 13px;
   --text-13--line-height: 20px;
+  --text-10: 10px;
+  --text-10--line-height: 14px;
+  --text-brand-title: 28px;
+  --text-brand-title--line-height: 32px;
+  --text-card-title: 13px;
+  --text-card-title--line-height: 20px;
+  --text-card-body: 12px;
+  --text-card-body--line-height: 18px;
+  --text-card-meta: 11px;
+  --text-card-meta--line-height: 16px;
   /* Hero/title step — overrides Tailwind's default text-3xl (30/36)
      * with a slightly larger 32px face on the same 36px line. */
   --text-3xl: 32px;
@@ -62,14 +72,21 @@
   --color-destructive: var(--destructive);
   --color-destructive-foreground: var(--destructive-foreground);
   --color-success: var(--success);
+  --color-success-foreground: var(--success-foreground);
   --color-warning: var(--warning);
+  --color-warning-foreground: var(--warning-foreground);
   --color-info: var(--info);
+  --color-info-foreground: var(--info-foreground);
   /* Dedicated blue for the sub-agent "session active / idle-alive" states
      * (launching/idle/done) — distinct from the shared amber --warning (still
      * used by the "Needs response" badge). */
   --color-session-active: var(--session-active);
   /* Brand pink — reserved for brand moments, not status. */
   --color-brand-accent: var(--brand-accent);
+  --color-landing-footer: var(--landing-footer-foreground);
+  --color-file-reference: var(--file-reference);
+  --color-otto-pink: var(--otto-pink);
+  --color-otto-green: var(--otto-green);
   /* Named status hues — success/warning/info are repointed to the
      * green/yellow/blue of this set below, so the two stay in lockstep. */
   --color-status-blue: var(--status-blue);
@@ -110,11 +127,9 @@
   --radius-4xl: calc(var(--radius) * 2.6);
 }
 
-/* Apple system-blue accent (hue 256, matches iOS / macOS systemBlue —
- * ~#007AFF light, ~#0A84FF dark). Reserved for focus rings, charts,
- * unread state, and the active sidebar highlight; surfaces and primary
- * buttons stay neutral grey (hue 240). See designs/UI/WEB_UI.md (still
- * describes the older cobalt direction). */
+/* System blue is reserved for focus rings, links, selection, information,
+ * and browser-native interaction cues. Pink remains the brand/action hue;
+ * green remains semantic success. See web/docs/design-system.md. */
 :root {
   /* User-controlled UI font size, as a unitless multiplier on the root
    * font-size (see Appearance settings / lib/uiFontPreferences.ts). 1 = the
@@ -230,6 +245,9 @@
   --secondary-foreground: #11171c;
   --muted: rgba(61, 57, 41, 0.06);
   --muted-foreground: #6e6c68;
+  /* Landing composer context badges follow the Vercel reference's lighter
+     * zinc-500 tier without weakening muted text across the rest of the app. */
+  --landing-footer-foreground: #71717a;
   /* Dedicated chip background for inline code — a hair darker than the
      * white card so the chip reads as a tile. Kept separate from --muted
      * (now a translucent black wash reused for hover/quote surfaces). */
@@ -248,8 +266,11 @@
   /* success/warning/info repointed onto the named status hues below so
      * the ~45 existing badges/indicators adopt the brand status palette. */
   --success: #2ea65c;
+  --success-foreground: color-mix(in srgb, var(--success) 70%, #11171c);
   --warning: #d4972a;
+  --warning-foreground: color-mix(in srgb, var(--warning) 65%, #11171c);
   --info: #3b8ff5;
+  --info-foreground: color-mix(in srgb, var(--info) 70%, #11171c);
   /* Session active / idle-alive green — Otto's sidekick hue, deepened for
      * accessible contrast on the white card surface. */
   --session-active: #237d63;
@@ -263,6 +284,9 @@
   --ring: #0969da;
   /* Brand pink — reserved for brand moments, not status. */
   --brand-accent: #df3c85;
+  --file-reference: #bc2f72;
+  --otto-pink: #f53b9d;
+  --otto-green: #4dc5a0;
   /* Named status hues. success/warning/info above mirror green/yellow/blue. */
   --status-blue: #3b8ff5;
   --status-green: #2ea65c;
@@ -334,6 +358,7 @@
        through; the frosted look is reserved for the .dark .bg-card rule. */
   --muted: color-mix(in srgb, var(--muted-foreground) 13%, #242126);
   --muted-foreground: #999397;
+  --landing-footer-foreground: #92a4b3;
   --code-bg: #201d22;
   --code-block-bg: #1b191c;
   --code-block-header-bg: rgba(255, 255, 255, 0.018);
@@ -349,8 +374,11 @@
   /* success/warning/info repointed onto the status hues below, mirroring
      * light mode so dark mode doesn't carry a second green/yellow/blue. */
   --success: #2ea65c;
+  --success-foreground: color-mix(in srgb, var(--success) 72%, white);
   --warning: #d4972a;
+  --warning-foreground: color-mix(in srgb, var(--warning) 76%, white);
   --info: #3b8ff5;
+  --info-foreground: color-mix(in srgb, var(--info) 76%, white);
   /* Session active / idle-alive green — Otto's sidekick mint stays legible
      * against the dark glass card without competing with working-state pink. */
   --session-active: #4dc5a0;
@@ -358,6 +386,9 @@
      * status palette is hue-stable across themes). Defined explicitly here
      * rather than inheriting from :root so dark mode is self-contained. */
   --brand-accent: #df3c85;
+  --file-reference: #f58abd;
+  --otto-pink: #f53b9d;
+  --otto-green: #4dc5a0;
   --status-blue: #3b8ff5;
   --status-green: #2ea65c;
   --status-yellow: #d4972a;
@@ -383,6 +414,11 @@
   --tooltip-bg: #242126;
   --scrollbar-thumb: rgba(255, 255, 255, 0.08);
   --scrollbar-thumb-hover: rgba(255, 255, 255, 0.16);
+}
+
+/* Non-default palettes keep the footer aligned with their own muted tier. */
+:root[data-theme] {
+  --landing-footer-foreground: var(--muted-foreground);
 }
 
 /* SP2K-style auto-hiding scrollbars: a 10px hit area with a 6px painted
@@ -713,6 +749,28 @@ html.dark .app-shell aside[aria-label="Conversations"].conversations-sidebar:not
 
 .dark .sidebar-primary-nav-item {
   color: hsl(55 9% 74%);
+}
+
+/* Sidebar rows intentionally sit between text-xs and Button's text-sm.
+ * This named class wins reliably when Button contributes its own text-sm. */
+.sidebar-compact-text {
+  font-size: 13px;
+  line-height: 20px;
+}
+
+.button-text-compact {
+  font-size: 13px;
+  line-height: 20px;
+}
+
+/* Touch accessibility should follow the input device, not viewport width.
+ * A narrow desktop split pane still uses compact controls; actual touch
+ * devices receive a 44px minimum target without changing visual padding. */
+@media (pointer: coarse) {
+  .touch-target-button:not(.absolute) {
+    min-width: 44px;
+    min-height: 44px;
+  }
 }
 
 html.dark .app-shell .reference-composer-surface {
@@ -1635,8 +1693,39 @@ html.dark:not([data-theme]) .chat-conversation-content {
 
 .otto-landing-mascot {
   transform-origin: 55% 65%;
+  filter: drop-shadow(0 8px 14px color-mix(in srgb, var(--otto-pink) 7.5%, transparent));
   animation: otto-landing-drift 3.2s ease-in-out infinite;
   will-change: transform;
+}
+
+.otto-working-shadow {
+  filter: drop-shadow(0 10px 18px color-mix(in srgb, var(--otto-pink) 16%, transparent));
+}
+
+.otto-landing-halo {
+  background: radial-gradient(
+    circle,
+    color-mix(in srgb, var(--otto-pink) 11%, transparent) 0%,
+    color-mix(in srgb, var(--otto-pink) 3.5%, transparent) 42%,
+    color-mix(in srgb, var(--otto-green) 1.5%, transparent) 58%,
+    transparent 72%
+  );
+  filter: blur(2px);
+}
+
+.dark .otto-landing-halo {
+  background: radial-gradient(
+    circle,
+    color-mix(in srgb, var(--otto-pink) 17%, transparent) 0%,
+    color-mix(in srgb, var(--otto-pink) 6%, transparent) 42%,
+    color-mix(in srgb, var(--otto-green) 2%, transparent) 58%,
+    transparent 72%
+  );
+  filter: blur(3px);
+}
+
+.dark .otto-landing-mascot {
+  filter: drop-shadow(0 8px 16px color-mix(in srgb, var(--otto-pink) 13%, transparent));
 }
 
 .otto-landing-orbit {
@@ -1645,10 +1734,13 @@ html.dark:not([data-theme]) .chat-conversation-content {
 }
 
 .otto-landing-orbit--pink {
+  border-color: color-mix(in srgb, var(--otto-pink) 40%, transparent);
+  box-shadow: inset 0 0 16px color-mix(in srgb, var(--otto-pink) 5.5%, transparent);
   animation: otto-landing-orbit-pink 5.2s ease-in-out infinite;
 }
 
 .otto-landing-orbit--green {
+  border-color: color-mix(in srgb, var(--otto-green) 30%, transparent);
   animation: otto-landing-orbit-green 6.2s ease-in-out infinite;
 }
 
@@ -1656,7 +1748,14 @@ html.dark:not([data-theme]) .chat-conversation-content {
   animation: otto-landing-satellite-pulse 2.6s ease-in-out infinite;
 }
 
+.otto-landing-satellite--pink {
+  background: var(--otto-pink);
+  box-shadow: 0 0 9px var(--otto-pink);
+}
+
 .otto-landing-satellite--green {
+  background: var(--otto-green);
+  box-shadow: 0 0 9px var(--otto-green);
   animation-delay: -1.3s;
 }
 
@@ -2242,9 +2341,6 @@ html.dark:not([data-theme]) .chat-conversation-content {
 :root:not(.dark)[data-theme="omni-rose"] .app-shell {
   background: var(--shell-surface);
 }
-:root:not(.dark)[data-theme="omni-rose"] .otto-landing-mascot {
-  filter: drop-shadow(0 10px 14px rgba(166, 58, 104, 0.12));
-}
 :root:not(.dark)[data-theme="omni-rose"]
   .reference-composer-surface
   [data-testid="new-chat-landing-submit"]:not(:disabled),
@@ -2461,24 +2557,6 @@ html.dark:not([data-theme]) .chat-conversation-content {
   color: var(--foreground);
   font-weight: 520;
   letter-spacing: -0.045em;
-}
-
-:root:not(.dark)[data-theme="otto-dream"] .otto-landing-halo {
-  background: rgba(244, 93, 156, 0.17);
-  filter: blur(7px);
-  box-shadow:
-    -64px 18px 62px rgba(200, 107, 224, 0.2),
-    68px -8px 64px rgba(111, 183, 247, 0.23),
-    24px 56px 54px rgba(77, 197, 160, 0.14);
-}
-
-.dark[data-theme="otto-dream"] .otto-landing-halo {
-  background: rgba(255, 117, 181, 0.18);
-  filter: blur(8px);
-  box-shadow:
-    -64px 18px 68px rgba(214, 138, 240, 0.2),
-    68px -8px 68px rgba(131, 200, 255, 0.18),
-    24px 58px 58px rgba(116, 214, 160, 0.1);
 }
 
 :is(:root:not(.dark), .dark)[data-theme="otto-dream"] .otto-landing-orbit--pink {

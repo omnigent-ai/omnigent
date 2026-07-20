@@ -559,7 +559,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                 // px-2 + gap-1 puts the icon on the sidebar's left (red) column
                 // and the label on the label (blue) column — matching section
                 // headers and project folders.
-                "sidebar-primary-nav-item h-7 w-full justify-start gap-2 rounded-[var(--radius-otto-sm)] border-0 px-2 text-[13px] leading-5 font-normal",
+                "sidebar-primary-nav-item sidebar-compact-text h-7 w-full justify-start gap-2 rounded-[var(--radius-otto-sm)] border-0 px-2 font-normal",
                 SIDEBAR_HOVER_HIGHLIGHT,
                 isNewChatPage && SIDEBAR_ACTIVE_HIGHLIGHT,
               )}
@@ -596,7 +596,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                   asChild
                   variant="ghost"
                   className={cn(
-                    "sidebar-primary-nav-item h-7 w-full justify-start gap-2 rounded-[var(--radius-otto-sm)] border-0 px-2 text-[13px] leading-5 font-normal",
+                    "sidebar-primary-nav-item sidebar-compact-text h-7 w-full justify-start gap-2 rounded-[var(--radius-otto-sm)] border-0 px-2 font-normal",
                     SIDEBAR_HOVER_HIGHLIGHT,
                   )}
                 >
@@ -611,7 +611,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                       type="button"
                       variant="ghost"
                       className={cn(
-                        "sidebar-primary-nav-item h-7 w-full justify-start gap-2 rounded-[var(--radius-otto-sm)] border-0 px-2 text-[13px] leading-5 font-normal",
+                        "sidebar-primary-nav-item sidebar-compact-text h-7 w-full justify-start gap-2 rounded-[var(--radius-otto-sm)] border-0 px-2 font-normal",
                         SIDEBAR_HOVER_HIGHLIGHT,
                       )}
                       data-testid="sidebar-more-button"
@@ -619,7 +619,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                       <MoreHorizontalIcon className="size-3.5 text-muted-foreground" />
                       More
                       {inboxCount > 0 && (
-                        <span className="ml-auto inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-warning/15 px-1 text-[10px] font-medium text-warning tabular-nums">
+                        <span className="ml-auto inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-warning/15 px-1 text-10 font-medium text-warning-foreground tabular-nums">
                           {inboxCount}
                         </span>
                       )}
@@ -658,14 +658,14 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                   <TabsTrigger
                     value="mine"
                     data-testid="sidebar-tab-mine"
-                    className="min-w-0 text-[13px] font-normal hover:bg-[var(--sidebar-hover)] data-active:bg-[var(--sidebar-active)] data-active:text-[var(--sidebar-active-foreground)] data-active:shadow-none"
+                    className="sidebar-compact-text min-w-0 font-normal hover:bg-[var(--sidebar-hover)] data-active:bg-[var(--sidebar-active)] data-active:text-[var(--sidebar-active-foreground)] data-active:shadow-none"
                   >
                     <span className="min-w-0 truncate">My sessions</span>
                   </TabsTrigger>
                   <TabsTrigger
                     value="shared"
                     data-testid="sidebar-tab-shared"
-                    className="min-w-0 text-[13px] font-normal hover:bg-[var(--sidebar-hover)] data-active:bg-[var(--sidebar-active)] data-active:text-[var(--sidebar-active-foreground)] data-active:shadow-none"
+                    className="sidebar-compact-text min-w-0 font-normal hover:bg-[var(--sidebar-hover)] data-active:bg-[var(--sidebar-active)] data-active:text-[var(--sidebar-active-foreground)] data-active:shadow-none"
                   >
                     <span className="min-w-0 truncate">Shared with me</span>
                   </TabsTrigger>
@@ -1799,15 +1799,14 @@ function SectionHeader({
         type="button"
         aria-expanded={!collapsed}
         onClick={onToggleCollapsed}
-        className={cn(
-          "group flex w-full items-center border-0 text-left transition-colors",
+        className={
           icon
-            ? cn(
-                "gap-2 rounded-[6px] px-2 py-[3px] text-[13px] leading-5 text-foreground",
+            ? `${cn(
+                "group flex w-full items-center gap-2 rounded-[var(--radius-otto-xs)] border-0 px-2 py-[3px] text-left transition-colors",
                 SIDEBAR_HOVER_HIGHLIGHT,
-              )
-            : "gap-1 pt-0 pr-0 pb-1 pl-2 text-xs leading-4 text-muted-foreground hover:text-foreground",
-        )}
+              )} sidebar-compact-text text-foreground`
+            : "group flex w-full items-center gap-1 border-0 pt-0 pr-0 pb-1 pl-2 text-left text-xs leading-4 text-muted-foreground transition-colors hover:text-foreground"
+        }
       >
         {icon ? (
           // Headers with a leading icon (project folders) swap the folder for a
@@ -2746,10 +2745,9 @@ function ConversationRow({
     <Link
       to={selectionMode ? "#" : `/c/${conversation.id}`}
       className={cn(
-        "relative flex min-h-7 w-full flex-col gap-0.5 rounded-[var(--radius-otto-sm)] px-2 py-0.5 text-left text-[13px] leading-5 text-foreground transition-[color,background-color,transform] duration-[var(--duration-otto-fast)] ease-[var(--ease-otto)] motion-safe:hover:-translate-y-px",
+        "sidebar-compact-text relative flex min-h-7 w-full flex-col gap-0.5 rounded-[var(--radius-otto-sm)] px-2 py-0.5 text-left text-foreground transition-[color,background-color,transform] duration-[var(--duration-otto-fast)] ease-[var(--ease-otto)] motion-safe:hover:-translate-y-px",
         SIDEBAR_HOVER_HIGHLIGHT,
-        !selectionMode &&
-          (sessionState?.kind === "awaiting" ? "pr-48 md:pr-29" : "pr-28 md:pr-[52px]"),
+        !selectionMode && (sessionState?.kind === "awaiting" ? "pr-48 md:pr-29" : "pr-28 md:pr-14"),
         selectionMode && "pr-10",
         isActive && SIDEBAR_ACTIVE_HIGHLIGHT,
         selectionMode && isSelected && SIDEBAR_ACTIVE_HIGHLIGHT,
@@ -2893,11 +2891,11 @@ function ConversationRow({
         <Button
           type="button"
           variant="ghost"
-          size="icon-sm"
+          size="icon-xs"
           aria-label={isPinned ? "Unpin conversation" : "Pin conversation"}
           data-testid="quick-pin-conversation"
           className={cn(
-            "-translate-y-1/2 absolute top-1/2 right-9 transition-opacity",
+            "-translate-y-1/2 absolute top-1/2 right-[30px] transition-opacity",
             // Desktop-only quick affordance: hidden on mobile (the kebab's
             // Pin item below covers that), hover/focus-revealed from `md` up.
             // Pinned rows no longer keep a persistent pin marker, since the
@@ -2930,7 +2928,7 @@ function ConversationRow({
             <Button
               type="button"
               variant="ghost"
-              size="icon-sm"
+              size="icon-xs"
               aria-label="Conversation actions"
               data-testid="conversation-actions"
               // Absolute-positioned trigger. On mobile (no hover state)
@@ -3804,7 +3802,7 @@ function BulkActionBar({
             </DialogDescription>
           </DialogHeader>
           <p className="flex items-start gap-2 rounded-[var(--radius-otto-sm)] border border-warning/40 bg-warning/5 p-3 text-xs text-muted-foreground [box-shadow:var(--elevation-otto-1)]">
-            <AlertTriangleIcon className="mt-0.5 size-3.5 shrink-0 text-warning" />
+            <AlertTriangleIcon className="mt-0.5 size-3.5 shrink-0 text-warning-foreground" />
             Branches are not cleaned up. Use single-session delete for branch surgery.
           </p>
           <DialogFooter className="border-t-0 bg-transparent">

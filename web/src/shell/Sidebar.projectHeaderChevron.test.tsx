@@ -122,11 +122,10 @@ describe("project folder header icon/chevron", () => {
     // and regular 13px foreground text.
     expect(header).toHaveClass(
       "gap-2",
-      "rounded-[6px]",
+      "rounded-[var(--radius-otto-xs)]",
       "px-2",
       "py-[3px]",
-      "text-[13px]",
-      "leading-5",
+      "sidebar-compact-text",
       "text-foreground",
     );
 

@@ -1720,7 +1720,7 @@ function MainAgentSurface({
                 <ConversationEmptyState>
                   <div className="flex flex-col items-center gap-2.5 text-center">
                     <OttoIcon
-                      className="buoyant-enter h-14 w-auto drop-shadow-[0_10px_18px_rgba(245,59,157,0.16)]"
+                      className="buoyant-enter otto-working-shadow h-14 w-auto"
                       aria-hidden="true"
                     />
                     <h3 className="brand-display-title buoyant-enter buoyant-enter--title text-2xl font-[450] tracking-[-0.025em]">
@@ -3488,7 +3488,11 @@ function ContextRing({ contextWindow, tokensUsed }: { contextWindow: number; tok
   const usedPct = Math.round(pct * 100);
 
   const color =
-    pct > 0.8 ? "text-destructive" : pct > 0.6 ? "text-warning" : "text-muted-foreground";
+    pct > 0.8
+      ? "text-destructive"
+      : pct > 0.6
+        ? "text-warning-foreground"
+        : "text-muted-foreground";
 
   return (
     <Tooltip>
@@ -4886,7 +4890,7 @@ export function Composer({
               type="button"
               size="icon"
               variant="ghost"
-              className="size-8 rounded-[8px] text-muted-foreground hover:text-foreground"
+              className="size-8 rounded-[var(--radius-otto-xs)] text-muted-foreground hover:text-foreground"
               disabled={disabled || isReadOnly || hasPendingElicitation}
               onClick={() => fileInputRef.current?.click()}
               title="Attach files"

@@ -152,6 +152,11 @@ function renderSidebar() {
   );
 }
 
+function enterSelectionMode() {
+  fireEvent.pointerDown(screen.getByTestId("sidebar-more-button"), { button: 0 });
+  fireEvent.click(screen.getByRole("menuitem", { name: "Select sessions" }));
+}
+
 beforeEach(() => {
   useConvMock.mockReset();
   localStorage.clear();
@@ -167,8 +172,7 @@ describe("Sidebar shift-click selection", () => {
     renderSidebar();
 
     // Enter selection mode
-    const selectBtn = screen.getByRole("button", { name: /select/i });
-    fireEvent.click(selectBtn);
+    enterSelectionMode();
 
     // Click first session (sets anchor)
     const row1 = screen.getByTitle("s1").closest("a")!;
@@ -202,8 +206,7 @@ describe("Sidebar shift-click selection", () => {
     renderSidebar();
 
     // Enter selection mode
-    const selectBtn = screen.getByRole("button", { name: /select/i });
-    fireEvent.click(selectBtn);
+    enterSelectionMode();
 
     // Click c1 (first chat session, sets anchor)
     const rowC1 = screen.getByTitle("c1").closest("a")!;
@@ -224,8 +227,7 @@ describe("Sidebar shift-click selection", () => {
     mockConversations(sessions);
     renderSidebar();
 
-    const selectBtn = screen.getByRole("button", { name: /select/i });
-    fireEvent.click(selectBtn);
+    enterSelectionMode();
 
     // Click s1 (anchor), shift-click s2 (range: s1, s2)
     fireEvent.click(screen.getByTitle("s1").closest("a")!);
@@ -264,8 +266,7 @@ describe("Sidebar shift-click selection", () => {
 
     renderSidebar();
 
-    const selectBtn = screen.getByRole("button", { name: /select/i });
-    fireEvent.click(selectBtn);
+    enterSelectionMode();
 
     // Click p1 (anchor) then shift-click p3 — the range should include
     // p1, p2, p3 (all from the folder's own query, including p3 which
@@ -284,12 +285,12 @@ describe("Sidebar shift-click selection", () => {
     renderSidebar();
 
     // Enter, click s1, exit
-    fireEvent.click(screen.getByRole("button", { name: /select/i }));
+    enterSelectionMode();
     fireEvent.click(screen.getByTitle("s1").closest("a")!);
     fireEvent.click(screen.getByRole("button", { name: /exit/i }));
 
     // Re-enter, shift-click s3 — should single-toggle (no anchor)
-    fireEvent.click(screen.getByRole("button", { name: /select/i }));
+    enterSelectionMode();
     fireEvent.click(screen.getByTitle("s3").closest("a")!, { shiftKey: true });
 
     await waitFor(() => {

@@ -37,6 +37,17 @@ recording, or paste a link. Expected for UI / frontend changes (check the
 use `N/A` for non-visual changes.
 -->
 
+### UI design-system check
+
+<!-- Complete for UI / frontend changes; use N/A for non-visual changes. -->
+
+- [ ] Uses semantic tokens and canonical component primitives (no new raw colors, radii, type sizes, or shadows)
+- [ ] Verified default light and dark themes
+- [ ] Verified a custom palette when changing tokens or broad surfaces
+- [ ] Verified desktop and mobile/narrow layouts
+- [ ] Verified keyboard focus, touch targets, and reduced motion where applicable
+- [ ] Added or updated visual evidence/snapshots for user-visible changes
+
 ## Type of change
 
 - [ ] Bug fix

@@ -6,10 +6,67 @@ import { readFileSync } from "node:fs";
 // (resolved from its dependency tree, so we test the version the build uses).
 import { transform } from "lightningcss";
 import { describe, expect, it } from "vitest";
+import { PALETTES } from "./lib/themePalette";
 
 // Relative to the vitest root (web/) — import.meta.url is not a file://
 // URL inside vitest's module graph, so it can't locate the file.
 const cssSource = readFileSync("src/index.css", "utf8");
+
+function customPropertiesFor(selector: string): Map<string, string> {
+  const start = cssSource.indexOf(`${selector} {`);
+  if (start < 0) throw new Error(`Missing CSS rule: ${selector}`);
+  const bodyStart = cssSource.indexOf("{", start) + 1;
+  const bodyEnd = cssSource.indexOf("}", bodyStart);
+  return new Map(
+    [...cssSource.slice(bodyStart, bodyEnd).matchAll(/--([\w-]+):\s*([^;]+);/g)].map(
+      ([, name, value]) => [name, value.trim()],
+    ),
+  );
+}
+
+function normalizeHex(value: string): string {
+  return value.replace(/^#([0-9a-f])([0-9a-f])([0-9a-f])$/i, "#$1$1$2$2$3$3").toLowerCase();
+}
+
+describe("index.css semantic token contract", () => {
+  const light = customPropertiesFor(":root");
+  const dark = customPropertiesFor(".dark");
+  const omni = PALETTES.find((palette) => palette.id === "omni")!;
+
+  it.each([
+    "success-foreground",
+    "warning-foreground",
+    "info-foreground",
+    "file-reference",
+    "landing-footer-foreground",
+    "otto-pink",
+    "otto-green",
+  ])("defines %s in both default modes", (token) => {
+    expect(light.has(token)).toBe(true);
+    expect(dark.has(token)).toBe(true);
+  });
+
+  it("keeps the Omni palette preview aligned with real surface and brand tokens", () => {
+    expect(normalizeHex(omni.light.bg)).toBe(normalizeHex(light.get("background")!));
+    expect(normalizeHex(omni.light.card)).toBe(normalizeHex(light.get("card-solid")!));
+    expect(normalizeHex(omni.light.accent)).toBe(normalizeHex(light.get("brand-accent")!));
+    expect(normalizeHex(omni.dark.bg)).toBe(normalizeHex(dark.get("background")!));
+    expect(normalizeHex(omni.dark.card)).toBe(normalizeHex(dark.get("card-solid")!));
+    expect(normalizeHex(omni.dark.accent)).toBe(normalizeHex(dark.get("brand-accent")!));
+  });
+
+  it("exposes the named transcript typography scale", () => {
+    expect(cssSource).toContain("--text-card-title: 13px;");
+    expect(cssSource).toContain("--text-card-body: 12px;");
+    expect(cssSource).toContain("--text-card-meta: 11px;");
+  });
+
+  it("matches the reference landing-footer foregrounds in both default modes", () => {
+    expect(light.get("landing-footer-foreground")).toBe("#71717a");
+    expect(dark.get("landing-footer-foreground")).toBe("#92a4b3");
+    expect(cssSource).toContain("--color-landing-footer: var(--landing-footer-foreground);");
+  });
+});
 
 /* Regression test for the "transparent dropdown in prod" bug.
  *
@@ -175,6 +232,20 @@ describe("index.css landing atmosphere scope", () => {
       /\.app-shell\[data-landing="true"\]::before \{[\s\S]*?background: none;/,
     );
     expect(cssSource).not.toContain("radial-gradient(circle at 66% 18%");
+  });
+
+  it("uses only a restrained local halo behind Otto", () => {
+    expect(cssSource).toContain(".otto-landing-halo {");
+    expect(cssSource).toContain("color-mix(in srgb, var(--otto-pink) 11%, transparent) 0%");
+    expect(cssSource).toContain("color-mix(in srgb, var(--otto-pink) 3.5%, transparent) 42%");
+    expect(cssSource).toContain("filter: blur(2px);");
+    expect(cssSource).toContain(".dark .otto-landing-halo {");
+    expect(cssSource).toContain("color-mix(in srgb, var(--otto-pink) 17%, transparent) 0%");
+    expect(cssSource).toContain("filter: blur(3px);");
+    expect(cssSource).toContain(".dark .otto-landing-mascot {");
+    expect(cssSource).toContain(
+      "drop-shadow(0 8px 16px color-mix(in srgb, var(--otto-pink) 13%, transparent))",
+    );
   });
 });
 

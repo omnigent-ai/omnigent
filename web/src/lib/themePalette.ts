@@ -77,13 +77,13 @@ export const PALETTES: readonly PaletteMeta[] = [
     label: "Omnigent",
     blurb: "The signature pink brand look.",
     light: {
-      bg: "#fdf7fb",
+      bg: "#fdfdfc",
       card: "#ffffff",
       accent: "#df3c85",
-      border: "#e8ecf0",
-      text: "#11171c",
+      border: "#e7e5e2",
+      text: "#464247",
     },
-    dark: { bg: "#160e24", card: "#28223a", accent: "#df3c85", border: "#2a2440", text: "#f4f5f7" },
+    dark: { bg: "#121113", card: "#242126", accent: "#df3c85", border: "#343136", text: "#f2edf0" },
   },
   {
     id: "omni-rose",

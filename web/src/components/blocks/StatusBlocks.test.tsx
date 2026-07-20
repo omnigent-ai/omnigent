@@ -21,7 +21,8 @@ describe("Status card surfaces", () => {
       "[box-shadow:none]",
     );
     expect(screen.getByText("!")).toHaveClass("rounded-full", "bg-destructive/15");
-    expect(screen.getByText("Connection failed")).toHaveClass("font-mono", "text-xs");
+    expect(screen.getByText(/Error · runner · E_CONN/)).toHaveClass("text-card-title");
+    expect(screen.getByText("Connection failed")).toHaveClass("font-mono", "text-card-body");
   });
 
   it("uses the same geometry with a warning tint for policy blocks", () => {
@@ -32,6 +33,8 @@ describe("Status card surfaces", () => {
       "border-warning/20",
       "bg-warning/[0.04]",
     );
+    expect(screen.getByText(/Blocked by policy/)).toHaveClass("text-card-title");
+    expect(screen.getByText("Command not allowed")).toHaveClass("text-card-body");
   });
 });
 

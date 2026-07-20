@@ -323,7 +323,7 @@ export function WorkspacePanel({
                 value="files"
                 aria-label={changedCount > 0 ? `Files ${changedCount} changed` : "Files"}
                 title="Files"
-                className="size-8 shrink-0 rounded-[8px] p-0"
+                className="size-8 shrink-0 rounded-[var(--radius-otto-xs)] p-0"
               >
                 <FilePenLineIcon className="size-4" />
                 <span className="sr-only">Files</span>
@@ -338,7 +338,7 @@ export function WorkspacePanel({
                   : `Agents ${agentCount}`
               }
               title="Agents"
-              className="size-8 shrink-0 rounded-[8px] p-0"
+              className="size-8 shrink-0 rounded-[var(--radius-otto-xs)] p-0"
             >
               <BotIcon className="size-4" />
               <span className="sr-only">Agents</span>
@@ -346,7 +346,7 @@ export function WorkspacePanel({
                 className={cn(
                   TAB_BADGE_BASE,
                   "sr-only",
-                  subagentsWorking > 0 ? "text-success" : "text-muted-foreground",
+                  subagentsWorking > 0 ? "text-success-foreground" : "text-muted-foreground",
                 )}
               >
                 {subagentsWorking > 0 ? `${subagentsWorking}/${agentCount}` : agentCount}
@@ -357,7 +357,7 @@ export function WorkspacePanel({
                 value="terminals"
                 aria-label={terminalsLength > 0 ? `Shells ${terminalsLength}` : "Shells"}
                 title="Shells"
-                className="size-8 shrink-0 rounded-[8px] p-0"
+                className="size-8 shrink-0 rounded-[var(--radius-otto-xs)] p-0"
               >
                 <SquareTerminalIcon className="size-4" />
                 <span className="sr-only">Shells</span>
@@ -373,7 +373,7 @@ export function WorkspacePanel({
                 value="todos"
                 aria-label={`Tasks ${todosCompleted} of ${todosTotal} completed`}
                 title="Tasks"
-                className="size-8 shrink-0 rounded-[8px] p-0"
+                className="size-8 shrink-0 rounded-[var(--radius-otto-xs)] p-0"
               >
                 <ListTodoIcon className="size-4" />
                 <span className="sr-only">Tasks</span>
@@ -387,7 +387,7 @@ export function WorkspacePanel({
               aria-label={showBrowserTab ? "Browser" : "Browser — available in the desktop app"}
               title={showBrowserTab ? "Browser" : "Browser — available in the desktop app"}
               disabled={!showBrowserTab}
-              className="size-8 shrink-0 rounded-[8px] p-0 disabled:opacity-55"
+              className="size-8 shrink-0 rounded-[var(--radius-otto-xs)] p-0 disabled:opacity-55"
             >
               <GlobeIcon className="size-4" />
               <span className="sr-only">Browser</span>

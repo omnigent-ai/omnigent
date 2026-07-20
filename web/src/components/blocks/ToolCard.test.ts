@@ -80,7 +80,7 @@ describe("ToolCard rendering", () => {
     expect(screen.getByText("3.3s")).toBeInTheDocument();
     expect(container.querySelector(".tool-call-trigger")).toHaveClass(
       "gap-2.5",
-      "text-sm",
+      "text-13",
       "font-normal",
     );
     expect(container.querySelector(".tool-step-icon-node")).toBeInTheDocument();
@@ -93,7 +93,7 @@ describe("ToolCard rendering", () => {
       "git status",
       ["font-mono", "bg-foreground/[0.065]"],
     ],
-    ["sys_os_read", { path: "/tmp/file.ts" }, "/tmp/file.ts", ["font-mono", "text-[#BC2F72]"]],
+    ["sys_os_read", { path: "/tmp/file.ts" }, "/tmp/file.ts", ["font-mono", "text-file-reference"]],
     [
       "sys_session_get_info",
       { session_id: "session_42" },
@@ -159,10 +159,9 @@ describe("ToolCard rendering", () => {
     expect(screen.getByText(message)).toBeInTheDocument();
   });
 
-  it("makes a workspace file path clickable for file-path tools inside a FileViewer", () => {
-    // WHY: sys_os_read with a relative path renders the path as a role="link"
-    // that calls the FileViewer's openFile; clicking it must not toggle the
-    // collapsible (stopPropagation).
+  it("renders file-open and expand as sibling actions", () => {
+    // WHY: the collapsible trigger is already a button. File opening must be a
+    // sibling button rather than nested interactive content inside that trigger.
     const openFile = vi.fn();
     const ctx = {
       openFile,
@@ -187,8 +186,12 @@ describe("ToolCard rendering", () => {
         ),
       ),
     );
-    const link = screen.getByRole("link", { name: "src/a.ts" });
-    fireEvent.click(link);
+    const expandButton = screen.getByRole("button", { name: /Read src\/a\.ts/i });
+    const openButton = screen.getByRole("button", { name: "Open src/a.ts" });
+    expect(expandButton.contains(openButton)).toBe(false);
+    expect(screen.queryByRole("link", { name: "src/a.ts" })).toBeNull();
+
+    fireEvent.click(openButton);
     expect(openFile).toHaveBeenCalledWith("src/a.ts");
   });
 
@@ -254,7 +257,7 @@ describe("ToolGroupSummary", () => {
     expect(screen.getByText("alpha_tool")).toBeInTheDocument();
     expect(screen.getByText("beta_tool")).toBeInTheDocument();
     expect(container.querySelector(".tool-group-timeline")).toHaveClass(
-      "border-l-2",
+      "border-l",
       "border-border/70",
       "pl-3",
     );

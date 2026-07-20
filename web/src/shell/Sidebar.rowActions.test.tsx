@@ -252,6 +252,11 @@ describe("quick pin/unpin hover button", () => {
     // container — see the centering regression test below.
     const quickButton = screen.getByTestId("quick-pin-conversation");
     expect(quickButton).toHaveClass("hidden", "md:inline-flex");
+    expect(quickButton).toHaveClass("size-6", "right-[30px]");
+
+    const actionsButton = screen.getByTestId("conversation-actions");
+    expect(actionsButton).toHaveClass("size-6", "right-1");
+    expect(screen.getByRole("link", { name: /My Session/ })).toHaveClass("md:pr-14");
 
     // Kebab Pin item: present in the menu but hidden from `md` up, so it only
     // surfaces on mobile.

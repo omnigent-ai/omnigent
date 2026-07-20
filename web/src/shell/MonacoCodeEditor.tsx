@@ -473,7 +473,7 @@ function MonacoCodeEditorInner({
         isDirty &&
         (hasExternalUpdate ? (
           <div className="flex items-center gap-2 border-b border-border bg-warning/10 px-4 py-1.5 text-xs text-foreground shrink-0">
-            <AlertTriangleIcon className="size-3.5 shrink-0 text-warning" />
+            <AlertTriangleIcon className="size-3.5 shrink-0 text-warning-foreground" />
             <span className="flex-1">
               This file was modified externally while you were editing.
             </span>

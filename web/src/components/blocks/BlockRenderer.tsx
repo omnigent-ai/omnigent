@@ -42,6 +42,7 @@ import { SmartRoutingCard } from "./SmartRoutingCard";
 import { TerminalCommandCard } from "./TerminalCommandCard";
 import { ErrorBanner, PolicyDeniedBanner, RetryIndicator } from "./StatusBlocks";
 import { ToolCard, ToolGroupSummary } from "./ToolCard";
+import { TRANSCRIPT_RAIL_CLASS } from "./toolSurface";
 
 /**
  * Visual file-reference sniff, intentionally broader than workspace linking.
@@ -377,7 +378,12 @@ export function BlockRenderer({ items, sessionStatus }: BlockRendererProps) {
           <div key={`tool-group-with-tail:${runStart}`}>
             <ToolGroupSummary tools={group.tools} count={group.count} className="mb-0" />
             {tail.length > 0 && (
-              <div className="mt-1 ml-2 space-y-1 border-l pl-3 py-1 peer-data-[state=open]:mt-0">
+              <div
+                className={cn(
+                  "mt-1 ml-2 space-y-1 py-1 peer-data-[state=open]:mt-0",
+                  TRANSCRIPT_RAIL_CLASS,
+                )}
+              >
                 {tail.map((fragment, idx) => renderToolRunFragment(fragment, runStart, idx))}
               </div>
             )}
