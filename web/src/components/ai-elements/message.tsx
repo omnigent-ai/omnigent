@@ -330,7 +330,7 @@ function extractCodeText(children: ReactNode): string {
 // positioning lives on the container in ChatCodeBlockPre, not here, so the
 // buttons stay layout-agnostic.
 const CODE_BLOCK_OVERLAY_BUTTON_CLASS =
-  "size-8 bg-sidebar/80 text-muted-foreground hover:text-foreground supports-[backdrop-filter]:bg-sidebar/70 supports-[backdrop-filter]:backdrop-blur";
+  "code-block-action size-6 rounded-[var(--radius-otto-xs)] border border-transparent bg-transparent text-muted-foreground hover:text-foreground";
 
 function ChatCodeBlockCopyButton({ getCode }: { getCode: () => string }) {
   const [isCopied, setIsCopied] = useState(false);
@@ -374,7 +374,7 @@ function ChatCodeBlockCopyButton({ getCode }: { getCode: () => string }) {
       type="button"
       variant="ghost"
     >
-      <Icon size={14} />
+      <Icon className="size-3.5" />
     </Button>
   );
 }
@@ -392,7 +392,7 @@ function ChatCodeBlockWrapToggle({ wrap, onToggle }: { wrap: boolean; onToggle: 
       type="button"
       variant="ghost"
     >
-      <WrapTextIcon size={14} />
+      <WrapTextIcon className="size-3.5" />
     </Button>
   );
 }
@@ -415,7 +415,7 @@ function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
       {/* Overlay actions, anchored left of Streamdown's own download button
           (which sits at the header's right edge). A flex row lets the buttons
           self-arrange, so neither needs a hardcoded horizontal offset. */}
-      <div className="absolute top-2 right-12 z-10 flex items-center gap-1">
+      <div className="absolute top-[7px] right-[27px] z-10 flex items-center gap-0.5">
         <ChatCodeBlockWrapToggle onToggle={toggleWrap} wrap={wrap} />
         <ChatCodeBlockCopyButton getCode={getCode} />
       </div>

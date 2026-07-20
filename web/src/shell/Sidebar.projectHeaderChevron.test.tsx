@@ -117,6 +117,19 @@ describe("project folder header icon/chevron", () => {
     renderSidebar();
     const header = headerButton("My Project");
 
+    // Project folders are real rows, not muted section labels: match the
+    // mockup's 26px row (20px line + 3px vertical padding), 8px insets/gap,
+    // and regular 13px foreground text.
+    expect(header).toHaveClass(
+      "gap-2",
+      "rounded-[6px]",
+      "px-2",
+      "py-[3px]",
+      "text-[13px]",
+      "leading-5",
+      "text-foreground",
+    );
+
     const folder = header.querySelector(".lucide-folder") as HTMLElement;
     expect(folder).not.toBeNull();
 
@@ -157,6 +170,9 @@ describe("project folder header icon/chevron", () => {
     renderSidebar();
     // The "Projects" group header carries no leading icon.
     const header = headerButton("Projects");
+
+    // The parent section label remains the compact muted caption tier.
+    expect(header).toHaveClass("gap-1", "pb-1", "pl-2", "text-xs", "leading-4");
 
     expect(header.querySelector(".lucide-folder")).toBeNull();
 

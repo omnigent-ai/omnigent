@@ -230,7 +230,15 @@ export function ToolCard({
  * once a streaming-tail of the most recent ones has been peeled off,
  * or all completed tools once streaming finishes).
  */
-export function ToolGroupSummary({ tools, count }: { tools: RenderItem[]; count?: number }) {
+export function ToolGroupSummary({
+  tools,
+  count,
+  className,
+}: {
+  tools: RenderItem[];
+  count?: number;
+  className?: string;
+}) {
   // Label the FULL contiguous run, not just the folded tools — during
   // streaming the most-recent tools render as a visible tail outside this
   // group, so counting only `tools` would undercount ("See 2 steps" when
@@ -246,7 +254,10 @@ export function ToolGroupSummary({ tools, count }: { tools: RenderItem[]; count?
     // chevrons of inner tool cards when this outer group is open).
     // `peer` lets `BlockRenderer`'s trailing tail react to this
     // collapsible's open/closed state for the border-join effect.
-    <Collapsible defaultOpen={false} className="group/tool-summary peer not-prose w-full">
+    <Collapsible
+      defaultOpen={false}
+      className={cn("group/tool-summary peer not-prose mb-1.5 w-full", className)}
+    >
       <CollapsibleTrigger className="tool-group-summary-trigger inline-flex max-w-full cursor-pointer items-center gap-1.5 py-[3px] text-left text-sm font-normal leading-[1.4] text-muted-foreground transition-colors hover:text-foreground">
         <span>{label}</span>
         <ChevronRightIcon className="size-3 shrink-0 opacity-75 transition-transform group-data-[state=open]/tool-summary:rotate-90" />

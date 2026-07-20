@@ -283,7 +283,7 @@ function SessionItemEntry({ item, index }: { item: RawSessionItem; index: number
   const collapsed = JSON.stringify(item);
   const expanded = JSON.stringify(item, null, 2);
   return (
-    <div className="rounded-md border border-border bg-muted/40">
+    <div className="rounded-[var(--radius-otto-sm)] border border-[var(--border-otto-container)] bg-muted/40 [box-shadow:var(--elevation-otto-1)]">
       <button
         type="button"
         aria-expanded={isExpanded}

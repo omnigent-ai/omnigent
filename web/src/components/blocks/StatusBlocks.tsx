@@ -8,7 +8,6 @@
 //   the "Working…" indicator.
 
 import {
-  AlertCircleIcon,
   BrainCircuitIcon,
   ChevronRightIcon,
   RotateCcwIcon,
@@ -20,7 +19,7 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/component
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { shortModelName } from "@/components/CostRoutingControl";
 import { cn } from "@/lib/utils";
-import { TOOL_SURFACE_WIDTH_CLASS } from "./toolSurface";
+import { COMPACT_TRANSCRIPT_CARD_CLASS, TOOL_SURFACE_WIDTH_CLASS } from "./toolSurface";
 
 interface ErrorBannerProps {
   message: string;
@@ -29,24 +28,28 @@ interface ErrorBannerProps {
 }
 
 /**
- * Loud destructive banner for `error` blocks. Falls back to `code` when
- * `message` is empty (matches the reducer's intent — never show a blank
- * panel even when the LLM error payload omits the message).
+ * Restrained inline error card for `error` blocks. Falls back to `code`
+ * when `message` is empty (matches the reducer's intent — never show a
+ * blank panel even when the LLM error payload omits the message).
  */
 export function ErrorBanner({ message, source, code }: ErrorBannerProps) {
   const display = message || code || "Unknown error";
   return (
     <Alert
-      variant="destructive"
-      className="min-w-0 max-w-full overflow-hidden has-[>svg]:grid-cols-[auto_minmax(0,1fr)]"
+      className="min-w-0 max-w-full grid-cols-[18px_minmax(0,1fr)] gap-x-2.5 overflow-hidden border-[0.5px] border-destructive/30 bg-destructive/[0.045] px-3 py-2.5 [box-shadow:none] dark:border-destructive/35 dark:bg-destructive/[0.07]"
     >
-      <AlertCircleIcon />
-      <AlertTitle className="min-w-0 break-words [overflow-wrap:anywhere]">
+      <span
+        aria-hidden="true"
+        className="row-span-2 mt-px grid size-[18px] shrink-0 place-items-center rounded-full bg-destructive/15 font-semibold text-[11px] text-destructive leading-none dark:bg-destructive/20"
+      >
+        !
+      </span>
+      <AlertTitle className="col-start-2 min-w-0 break-words font-semibold text-destructive [overflow-wrap:anywhere]">
         Error{source ? ` · ${source}` : ""}
         {code && message ? ` · ${code}` : ""}
       </AlertTitle>
-      <AlertDescription className="min-w-0 max-w-full overflow-hidden">
-        <span className="block max-w-full whitespace-pre-wrap break-words [overflow-wrap:anywhere] [text-wrap:wrap]">
+      <AlertDescription className="col-start-2 min-w-0 max-w-full overflow-hidden">
+        <span className="mt-1 block max-w-full whitespace-pre-wrap break-words font-mono text-foreground/90 text-xs leading-5 [overflow-wrap:anywhere] [text-wrap:wrap]">
           {display}
         </span>
       </AlertDescription>
@@ -65,8 +68,8 @@ interface PolicyDeniedBannerProps {
  */
 export function PolicyDeniedBanner({ reason, phase }: PolicyDeniedBannerProps) {
   return (
-    <Alert>
-      <ShieldXIcon />
+    <Alert className="border-warning/20 bg-warning/[0.04] dark:border-warning/25 dark:bg-warning/[0.065]">
+      <ShieldXIcon className="text-warning" />
       <AlertTitle>Blocked by policy{phase ? ` · ${phase}` : ""}</AlertTitle>
       <AlertDescription>{reason}</AlertDescription>
     </Alert>
@@ -185,7 +188,8 @@ export function RoutingDecisionCard({
     <Collapsible
       defaultOpen={false}
       className={cn(
-        "group not-prose my-1 flex flex-col gap-1.5 rounded-md border border-border bg-muted/30 px-3 py-2",
+        "group not-prose my-1 flex flex-col gap-1.5 px-3 py-2",
+        COMPACT_TRANSCRIPT_CARD_CLASS,
         TOOL_SURFACE_WIDTH_CLASS,
       )}
       data-testid="routing-decision-card"

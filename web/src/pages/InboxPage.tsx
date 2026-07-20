@@ -207,7 +207,7 @@ export function InboxPage() {
       {failedSessionCount > 0 && (
         <div
           data-testid="inbox-load-error"
-          className="mb-4 flex items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm"
+          className="mb-4 flex items-center gap-2 rounded-[var(--radius-otto-sm)] border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm [box-shadow:var(--elevation-otto-1)]"
         >
           <AlertTriangleIcon className="size-4 shrink-0 text-destructive" />
           <span className="flex-1">
@@ -264,7 +264,7 @@ export function InboxPage() {
               key={elicitationId}
               data-testid="inbox-item"
               data-expanded={expanded}
-              className="flex flex-col gap-2 rounded-xl border border-border bg-card p-4"
+              className="flex flex-col gap-2 rounded-[var(--radius-otto-md)] border border-[var(--border-otto-container)] bg-card p-4 [box-shadow:var(--elevation-otto-1)]"
             >
               <div className="flex items-center gap-2">
                 {/* The toggle is a sibling of the Open-session link (not a
@@ -343,7 +343,7 @@ export function InboxPage() {
             <div
               key={comment.id}
               data-testid="inbox-comment"
-              className="flex gap-3 rounded-xl border border-border bg-card p-4"
+              className="flex gap-3 rounded-[var(--radius-otto-md)] border border-[var(--border-otto-container)] bg-card p-4 [box-shadow:var(--elevation-otto-1)]"
             >
               {/* The item's icon: the author's avatar pill (same
                   deterministic initials + color as presence circles). */}

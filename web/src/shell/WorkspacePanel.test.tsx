@@ -196,14 +196,16 @@ describe("WorkspacePanel content area", () => {
 });
 
 describe("WorkspacePanel browser tab", () => {
-  it("renders the Browser tab only when showBrowserTab is set", () => {
+  it("enables the Browser tab when the desktop bridge is available", () => {
     renderWorkspace({ showBrowserTab: true });
-    expect(screen.getByRole("tab", { name: /browser/i })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Browser" })).toBeEnabled();
   });
 
-  it("omits the Browser tab when showBrowserTab is false", () => {
+  it("keeps a disabled Browser icon visible when the desktop bridge is unavailable", () => {
     renderWorkspace({ showBrowserTab: false });
-    expect(screen.queryByRole("tab", { name: /browser/i })).toBeNull();
+    expect(
+      screen.getByRole("tab", { name: "Browser — available in the desktop app" }),
+    ).toBeDisabled();
   });
 
   it("mounts the browser pane when the browser tab is selected", () => {

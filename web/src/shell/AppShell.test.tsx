@@ -368,6 +368,18 @@ function renderShell(path: string, info?: ServerInfo) {
   return render(info ? <CapabilitiesProvider info={info}>{tree}</CapabilitiesProvider> : tree);
 }
 
+describe("AppShell landing atmosphere", () => {
+  it("marks only the landing route for the greeting glow", () => {
+    mockConversations([]);
+    const landing = renderShell("/");
+    expect(document.querySelector(".app-shell")).toHaveAttribute("data-landing", "true");
+    landing.unmount();
+
+    renderShell("/c/conv_abc");
+    expect(document.querySelector(".app-shell")).not.toHaveAttribute("data-landing");
+  });
+});
+
 function mockConversations(
   convs: Array<{
     id: string;

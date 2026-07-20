@@ -9,6 +9,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { copyText } from "@/lib/clipboard";
+import { DARK_SYNTAX_THEME, LIGHT_SYNTAX_THEME, SYNTAX_THEMES } from "@/lib/syntaxTheme";
 import { cn } from "@/lib/utils";
 import { CheckIcon, CopyIcon } from "lucide-react";
 import type { ComponentProps, CSSProperties, HTMLAttributes } from "react";
@@ -77,10 +78,10 @@ const LINE_NUMBER_CLASSES = cn(
   "before:content-[counter(line)]",
   "before:inline-block",
   "before:[counter-increment:line]",
-  "before:w-8",
-  "before:mr-4",
+  "before:w-7",
+  "before:mr-3",
   "before:text-right",
-  "before:text-muted-foreground/50",
+  "before:text-[var(--code-block-gutter)]",
   "before:font-mono",
   "before:select-none",
 );
@@ -153,7 +154,7 @@ const getHighlighter = (
   const highlighterPromise = import("shiki").then(({ createHighlighter }) =>
     createHighlighter({
       langs: [language],
-      themes: ["github-light", "github-dark"],
+      themes: SYNTAX_THEMES,
     }),
   );
 
@@ -210,8 +211,8 @@ export const highlightCode = (
       const result = highlighter.codeToTokens(code, {
         lang: langToUse,
         themes: {
-          dark: "github-dark",
-          light: "github-light",
+          dark: DARK_SYNTAX_THEME,
+          light: LIGHT_SYNTAX_THEME,
         },
       });
 
@@ -265,14 +266,14 @@ const CodeBlockBody = memo(
     return (
       <pre
         className={cn(
-          "dark:!bg-[var(--shiki-dark-bg)] dark:!text-[var(--shiki-dark)] m-0 p-4 text-sm",
+          "m-0 bg-transparent px-3 py-3 text-[13px] leading-5 text-[var(--code-block-text)] dark:!bg-transparent dark:!text-[var(--code-block-text)]",
           className,
         )}
         style={preStyle}
       >
         <code
           className={cn(
-            "font-mono text-sm",
+            "font-mono text-[13px] leading-5",
             showLineNumbers && "[counter-increment:line_0] [counter-reset:line]",
           )}
         >
@@ -299,7 +300,7 @@ export const CodeBlockContainer = ({
 }: HTMLAttributes<HTMLDivElement> & { language: string }) => (
   <div
     className={cn(
-      "group relative w-full overflow-hidden rounded-md border bg-background text-foreground",
+      "group relative w-full overflow-hidden rounded-[10px] border border-[var(--code-block-border)] bg-[var(--code-block-bg)] text-[var(--code-block-text)] shadow-[var(--code-block-shadow)]",
       className,
     )}
     data-language={language}
@@ -319,7 +320,7 @@ export const CodeBlockHeader = ({
 }: HTMLAttributes<HTMLDivElement>) => (
   <div
     className={cn(
-      "flex items-center justify-between border-b bg-muted/80 px-3 py-2 text-muted-foreground text-xs",
+      "flex h-9 items-center justify-between border-b border-[var(--code-block-border)] bg-[var(--code-block-header-bg)] px-3 text-[11px] font-medium tracking-[0.04em] text-muted-foreground",
       className,
     )}
     {...props}
@@ -353,7 +354,7 @@ export const CodeBlockActions = ({
   className,
   ...props
 }: HTMLAttributes<HTMLDivElement>) => (
-  <div className={cn("-my-1 -mr-1 flex items-center gap-2", className)} {...props}>
+  <div className={cn("flex items-center gap-0.5", className)} {...props}>
     {children}
   </div>
 );

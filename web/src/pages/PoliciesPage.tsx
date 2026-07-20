@@ -381,7 +381,7 @@ function AddDefaultPolicyDialog({
           {(paramError || addPolicy.isError) && (
             <div
               role="alert"
-              className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+              className="rounded-[var(--radius-otto-sm)] border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive [box-shadow:var(--elevation-otto-1)]"
             >
               {paramError ?? addPolicy.error?.message}
             </div>
@@ -515,7 +515,7 @@ export function PoliciesPage() {
             return (
               <div
                 key={p.id ?? p.name}
-                className="rounded-lg border border-border bg-background p-4"
+                className="rounded-[var(--radius-otto-md)] border border-[var(--border-otto-container)] bg-background p-4 [box-shadow:var(--elevation-otto-1)]"
               >
                 <div className="flex items-start justify-between gap-3">
                   <div className="flex items-start gap-2.5 min-w-0">
@@ -572,7 +572,7 @@ export function PoliciesPage() {
                   </div>
                 </div>
                 {hasParams && (
-                  <div className="ml-6.5 mt-2 rounded-md border border-border/60 bg-muted/40 px-3 py-2">
+                  <div className="ml-6.5 mt-2 rounded-[var(--radius-otto-sm)] border border-[var(--border-otto-hairline)] bg-muted/40 px-3 py-2 [box-shadow:var(--elevation-otto-1)]">
                     <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground/70">
                       Parameters
                     </span>
@@ -630,7 +630,7 @@ export function PoliciesPage() {
           {actionError !== null && (
             <div
               role="alert"
-              className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+              className="rounded-[var(--radius-otto-sm)] border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive [box-shadow:var(--elevation-otto-1)]"
             >
               {actionError}
             </div>

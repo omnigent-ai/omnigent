@@ -1201,7 +1201,8 @@ function ConversationList({
   );
   const handleDragStart = useCallback((event: DragStartEvent) => {
     const data = event.active.data.current as
-      { label?: string; project?: string | null; isPinned?: boolean } | undefined;
+      | { label?: string; project?: string | null; isPinned?: boolean }
+      | undefined;
     setActiveDrag({
       id: String(event.active.id),
       label: data?.label ?? String(event.active.id),
@@ -1798,7 +1799,15 @@ function SectionHeader({
         type="button"
         aria-expanded={!collapsed}
         onClick={onToggleCollapsed}
-        className="group flex w-full items-center gap-1 border-0 pt-0 pr-0 pb-1 pl-2 text-left text-xs leading-4 text-muted-foreground transition-colors hover:text-foreground"
+        className={cn(
+          "group flex w-full items-center border-0 text-left transition-colors",
+          icon
+            ? cn(
+                "gap-2 rounded-[6px] px-2 py-[3px] text-[13px] leading-5 text-foreground",
+                SIDEBAR_HOVER_HIGHLIGHT,
+              )
+            : "gap-1 pt-0 pr-0 pb-1 pl-2 text-xs leading-4 text-muted-foreground hover:text-foreground",
+        )}
       >
         {icon ? (
           // Headers with a leading icon (project folders) swap the folder for a
@@ -1979,7 +1988,7 @@ function ConversationSection({
             </p>
           ) : (
             // Indent project chats a step under the project-folder name above.
-            <ul className={cn("flex flex-col gap-0.5", indentRows && "pl-3")}>
+            <ul className={cn("flex flex-col", indentRows ? "gap-0 pl-6" : "gap-0.5")}>
               {conversations.map((conv) => (
                 <ConversationRow
                   key={conv.id}
@@ -2978,7 +2987,7 @@ function ConversationRow({
             </DialogDescription>
           </DialogHeader>
           {gitBranch !== null && (
-            <div className="flex flex-col gap-2 rounded-md border border-destructive/40 bg-destructive/5 p-3">
+            <div className="flex flex-col gap-2 rounded-[var(--radius-otto-sm)] border border-destructive/40 bg-destructive/5 p-3 [box-shadow:var(--elevation-otto-1)]">
               <p className="text-xs text-muted-foreground">
                 Optionally clean up the git worktree. These actions are{" "}
                 <span className="font-semibold text-destructive">irreversible</span>.
@@ -3794,7 +3803,7 @@ function BulkActionBar({
               be undone.
             </DialogDescription>
           </DialogHeader>
-          <p className="flex items-start gap-2 rounded-md border border-warning/40 bg-warning/5 p-3 text-xs text-muted-foreground">
+          <p className="flex items-start gap-2 rounded-[var(--radius-otto-sm)] border border-warning/40 bg-warning/5 p-3 text-xs text-muted-foreground [box-shadow:var(--elevation-otto-1)]">
             <AlertTriangleIcon className="mt-0.5 size-3.5 shrink-0 text-warning" />
             Branches are not cleaned up. Use single-session delete for branch surgery.
           </p>

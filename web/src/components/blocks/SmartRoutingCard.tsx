@@ -13,7 +13,7 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/component
 import { shortModelName } from "@/components/CostRoutingControl";
 import type { ToolState } from "@/lib/renderItems";
 import { cn } from "@/lib/utils";
-import { TOOL_SURFACE_WIDTH_CLASS } from "./toolSurface";
+import { COMPACT_TRANSCRIPT_CARD_CLASS, TOOL_SURFACE_WIDTH_CLASS } from "./toolSurface";
 
 /** One dispatch the orchestrator planned (from the tool's `tasks` args). */
 interface PlannedTask {
@@ -165,7 +165,10 @@ export function SmartRoutingCard({ arguments: args, output, state }: SmartRoutin
     <Collapsible
       defaultOpen={false}
       className={cn(
-        "group not-prose my-1 flex flex-col gap-1.5 rounded-md border border-border bg-muted/30 px-3 py-2",
+        "group not-prose my-1 flex flex-col gap-1.5 px-3 py-2",
+        COMPACT_TRANSCRIPT_CARD_CLASS,
+        failed &&
+          "border-destructive/20 bg-destructive/[0.035] dark:border-destructive/25 dark:bg-destructive/[0.06]",
         TOOL_SURFACE_WIDTH_CLASS,
       )}
       data-testid="smart-routing-card"

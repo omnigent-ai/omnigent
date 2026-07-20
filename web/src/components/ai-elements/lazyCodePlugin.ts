@@ -1,4 +1,5 @@
 import type { CodeHighlighterPlugin, HighlightOptions, ThemeInput } from "streamdown";
+import { SYNTAX_THEMES } from "@/lib/syntaxTheme";
 
 // streamdown exports the plugin interface but not its HighlightResult type;
 // recover it from the highlight method's signature.
@@ -15,14 +16,15 @@ type HighlightResult = NonNullable<ReturnType<CodeHighlighterPlugin["highlight"]
 // default themes synchronously, and highlight() returns null while the engine
 // loads, resolving tokens through the callback once it's ready.
 
-const DEFAULT_THEMES: [ThemeInput, ThemeInput] = ["github-light", "github-dark"];
+const DEFAULT_THEMES: [ThemeInput, ThemeInput] = SYNTAX_THEMES;
 
 let realCode: CodeHighlighterPlugin | null = null;
 let codePromise: Promise<CodeHighlighterPlugin> | null = null;
 
 const loadCode = (): Promise<CodeHighlighterPlugin> => {
   // oxlint-disable-next-line eslint-plugin-promise(prefer-await-to-then)
-  codePromise ??= import("@streamdown/code").then(({ code }) => {
+  codePromise ??= import("@streamdown/code").then(({ createCodePlugin }) => {
+    const code = createCodePlugin({ themes: SYNTAX_THEMES });
     realCode = code;
     return code;
   });

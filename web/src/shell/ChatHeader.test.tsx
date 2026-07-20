@@ -102,6 +102,7 @@ describe("ChatHeader — left-aligned session title", () => {
     expect(title).not.toHaveClass("absolute");
     expect(title.parentElement).toHaveClass("flex-1");
     expect(screen.getByTestId("chat-header")).toHaveClass("chat-header-session");
+    expect(screen.getByTestId("chat-header")).not.toHaveClass("md:border-b", "md:border-border");
   });
 
   it("does not render a title without an active session", () => {

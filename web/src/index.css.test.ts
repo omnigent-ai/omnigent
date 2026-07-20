@@ -130,3 +130,61 @@ describe("index.css bg-card glass rule selector", () => {
     aside.remove();
   });
 });
+
+describe("index.css default light composer action", () => {
+  it("uses the soft pink fill and rose outline without changing the darker global primary", () => {
+    expect(cssSource).toContain("--primary: #d4387f;");
+    expect(cssSource).toMatch(
+      /:root:not\(\.dark\):not\(\[data-theme\]\)[\s\S]*?new-chat-landing-submit[\s\S]*?border-color: #c94f89 !important;[\s\S]*?background: #e468a1 !important;/,
+    );
+  });
+});
+
+describe("index.css text selection", () => {
+  it("uses restrained macOS system-blue washes instead of the brand accent", () => {
+    expect(cssSource).toContain("background: rgba(0, 122, 255, 0.22);");
+    expect(cssSource).toContain("background: rgba(10, 132, 255, 0.28);");
+    expect(cssSource).not.toContain("background: var(--brand-accent);\n    color: #ffffff;");
+  });
+});
+
+describe("index.css default dark chat contrast", () => {
+  it("brightens transcript text without changing the muted surface mix", () => {
+    expect(cssSource).toMatch(
+      /html\.dark:not\(\[data-theme\]\) \.chat-conversation-content \{[\s\S]*?--assistant-foreground: #f2edf0;[\s\S]*?--muted-foreground: #aaa4a8;[\s\S]*?--muted: color-mix\(in srgb, #999397 13%, #242126\);/,
+    );
+  });
+});
+
+describe("index.css default light sidebar contrast", () => {
+  it("uses softer primary ink while preserving the muted text tier", () => {
+    expect(cssSource).toMatch(
+      /:root:not\(\.dark\) \.conversations-sidebar:not\(\[data-collapsed\]\) \{[\s\S]*?--foreground: #464247;[\s\S]*?--sidebar-foreground: #464247;[\s\S]*?--muted-foreground: #6e6c68;[\s\S]*?color: var\(--foreground\);/,
+    );
+  });
+});
+
+describe("index.css landing atmosphere scope", () => {
+  it("uses explicit route state instead of descendant detection", () => {
+    expect(cssSource).toContain('.app-shell[data-landing="true"]::before');
+    expect(cssSource).not.toContain(':has([data-testid="new-chat-landing"])');
+  });
+});
+
+describe("index.css Omnigent code surfaces", () => {
+  it("uses a compact shared code surface with quiet gutters and rose identity", () => {
+    expect(cssSource).toContain("--code-block-bg: #f7f6f3;");
+    expect(cssSource).toContain("--code-block-bg: #1b191c;");
+    expect(cssSource).toContain('[data-streamdown="code-block"] {');
+    expect(cssSource).toContain("border-radius: 10px;");
+    expect(cssSource).toContain("background: var(--code-block-bg);");
+    expect(cssSource).toContain('[data-streamdown="code-block-header"] > span::before');
+    expect(cssSource).toContain("var(--brand-accent)");
+    expect(cssSource).toContain('[data-streamdown="code-block-body"] code > span::before');
+    expect(cssSource).toContain("color: var(--code-block-gutter);");
+    expect(cssSource).toContain('[data-streamdown="code-block-actions"] button {');
+    expect(cssSource).toContain("top: -6px;");
+    expect(cssSource).toContain("width: 24px;");
+    expect(cssSource).toContain("height: 14px;");
+  });
+});

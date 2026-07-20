@@ -25,6 +25,10 @@ describe("ApprovalCard — binary approve/reject", () => {
       />,
     );
 
+    expect(screen.getByTestId("approval-card")).toHaveClass(
+      "rounded-[var(--radius-otto-sm)]",
+      "border-[var(--border-otto-container)]",
+    );
     expect(screen.getByRole("button", { name: /approve/i })).toBeDefined();
     expect(screen.getByRole("button", { name: /reject/i })).toBeDefined();
     expect(screen.queryByTestId("approval-card-options")).toBeNull();

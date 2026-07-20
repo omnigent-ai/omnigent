@@ -335,7 +335,7 @@ export function ConnectHostInstructions({
   // hints) until known, so the clean UI shows first and lakebox never flashes.
   const databricksFeatures = info !== "loading" && info.databricks_features;
   return (
-    <div className="flex flex-col gap-4 rounded-lg border border-dashed border-border p-4">
+    <div className="flex flex-col gap-4 rounded-[var(--radius-otto-md)] border border-dashed border-[var(--border-otto-container)] p-4 [box-shadow:var(--elevation-otto-1)]">
       {label && <p className="text-xs text-muted-foreground">{label}</p>}
       {databricksFeatures ? (
         <Tabs defaultValue="local">
@@ -1083,7 +1083,7 @@ function BypassSandboxOption({
         <div
           role="alert"
           data-testid="new-chat-landing-bypass-sandbox-banner"
-          className="mt-1.5 flex items-start gap-1.5 rounded-md border border-destructive bg-destructive/10 px-2 py-1.5 text-[11px] font-medium leading-relaxed text-destructive"
+          className="mt-1.5 flex items-start gap-1.5 rounded-[var(--radius-otto-sm)] border border-destructive bg-destructive/10 px-2 py-1.5 text-[11px] font-medium leading-relaxed text-destructive [box-shadow:var(--elevation-otto-1)]"
         >
           <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0" />
           <span>
@@ -2625,15 +2625,17 @@ export function NewChatLandingScreen() {
     if (mentionFsQuery.isPlaceholderData) return [];
     const rows = (mentionFsQuery.data?.entries ?? [])
       .filter((e) => e.type === "directory" || e.type === "file")
-      .map((e): WorkspaceFile => ({
-        path: e.path.startsWith(workspaceRoot)
-          ? e.path.slice(workspaceRoot.length).replace(/^\/+/, "")
-          : e.name,
-        name: e.name,
-        type: e.type === "directory" ? "directory" : "file",
-        bytes: e.bytes,
-        modified_at: e.modified_at,
-      }));
+      .map(
+        (e): WorkspaceFile => ({
+          path: e.path.startsWith(workspaceRoot)
+            ? e.path.slice(workspaceRoot.length).replace(/^\/+/, "")
+            : e.name,
+          name: e.name,
+          type: e.type === "directory" ? "directory" : "file",
+          bytes: e.bytes,
+          modified_at: e.modified_at,
+        }),
+      );
     return rankMentionEntries(rows, mentionFilter);
   }, [
     mentionEnabled,
@@ -3834,7 +3836,7 @@ export function NewChatLandingScreen() {
           {supportsApprovalMode && bypassSandbox && (
             <p
               role="alert"
-              className="flex items-center gap-1.5 rounded-md border border-destructive bg-destructive/10 px-2 py-1.5 text-xs font-medium text-destructive"
+              className="flex items-center gap-1.5 rounded-[var(--radius-otto-sm)] border border-destructive bg-destructive/10 px-2 py-1.5 text-xs font-medium text-destructive [box-shadow:var(--elevation-otto-1)]"
               data-testid="new-chat-landing-bypass-sandbox-active-banner"
             >
               <TriangleAlertIcon className="size-3.5 shrink-0" />

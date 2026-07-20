@@ -375,7 +375,7 @@ export function BlockRenderer({ items, sessionStatus }: BlockRendererProps) {
         // group is expanded.
         rendered.push(
           <div key={`tool-group-with-tail:${runStart}`}>
-            <ToolGroupSummary tools={group.tools} count={group.count} />
+            <ToolGroupSummary tools={group.tools} count={group.count} className="mb-0" />
             {tail.length > 0 && (
               <div className="mt-1 ml-2 space-y-1 border-l pl-3 py-1 peer-data-[state=open]:mt-0">
                 {tail.map((fragment, idx) => renderToolRunFragment(fragment, runStart, idx))}

@@ -1052,6 +1052,10 @@ describe("NewChatLandingScreen", () => {
       ).getAttribute("aria-checked"),
     ).toBe("true");
     const banner = screen.getByTestId("new-chat-landing-bypass-sandbox-banner");
+    expect(banner).toHaveClass(
+      "rounded-[var(--radius-otto-sm)]",
+      "[box-shadow:var(--elevation-otto-1)]",
+    );
     expect(banner.textContent).toContain("approvals and the sandbox disabled");
   });
 
@@ -1067,7 +1071,10 @@ describe("NewChatLandingScreen", () => {
     fireEvent.click(screen.getByTestId("new-chat-landing-bypass-sandbox-switch"));
     closeMenu();
     // Armed → the persistent banner is up under the composer.
-    expect(screen.getByTestId("new-chat-landing-bypass-sandbox-active-banner")).toBeTruthy();
+    expect(screen.getByTestId("new-chat-landing-bypass-sandbox-active-banner")).toHaveClass(
+      "rounded-[var(--radius-otto-sm)]",
+      "[box-shadow:var(--elevation-otto-1)]",
+    );
 
     // Switch away to Claude (a1): the armed bypass must clear immediately, so
     // the persistent banner disappears (Claude has no bypass toggle at all).

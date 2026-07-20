@@ -70,7 +70,7 @@ function GoalSummary({ loading, goal }: GoalSummaryProps) {
   return (
     <div
       data-testid="goal-current"
-      className="space-y-1 rounded-lg border border-border bg-muted/30 p-3"
+      className="space-y-1 rounded-[var(--radius-otto-sm)] border border-[var(--border-otto-container)] bg-muted/30 p-3 [box-shadow:var(--elevation-otto-1)]"
     >
       <div className="flex items-center justify-between gap-3 text-xs">
         <span className="font-medium text-foreground">{formatGoalStatus(goal.status)}</span>

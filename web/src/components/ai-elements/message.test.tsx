@@ -97,7 +97,14 @@ describe("MessageResponse code-block copy", () => {
       <MessageResponse>{"```ts\nconst value = 1;\nconsole.log(value);\n```"}</MessageResponse>,
     );
 
-    fireEvent.click(await screen.findByRole("button", { name: "Copy Code" }));
+    const wrapButton = await screen.findByRole("button", { name: "Toggle word wrap" });
+    const copyButton = screen.getByRole("button", { name: "Copy Code" });
+    expect(wrapButton).toHaveClass("size-6");
+    expect(copyButton).toHaveClass("size-6");
+    expect(wrapButton).toHaveClass("rounded-[var(--radius-otto-xs)]");
+    expect(copyButton).toHaveClass("rounded-[var(--radius-otto-xs)]");
+
+    fireEvent.click(copyButton);
 
     await waitFor(() => {
       expect(copiedText).toEqual(["const value = 1;\nconsole.log(value);\n"]);

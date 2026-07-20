@@ -246,11 +246,7 @@ describe("Sidebar session list", () => {
 
     const settings = screen.getByTestId("settings-button");
     expect(settings).toHaveAttribute("aria-label", "Settings");
-    expect(settings).toHaveClass(
-      "size-6",
-      "text-muted-foreground",
-      "hover:text-foreground",
-    );
+    expect(settings).toHaveClass("size-6", "text-muted-foreground", "hover:text-foreground");
     expect(screen.getByTestId("sidebar-search-button")).toHaveClass(
       "text-muted-foreground",
       "hover:text-foreground",
@@ -715,6 +711,10 @@ describe("Sidebar project sections", () => {
     const projectSection = screen.getByText("Customer X").closest("section")!;
     expect(within(projectSection).getByText("conv_far_1")).toBeInTheDocument();
     expect(within(projectSection).getByText("conv_far_2")).toBeInTheDocument();
+    const nestedList = within(projectSection)
+      .getByRole("link", { name: /conv_far_1/ })
+      .closest("ul");
+    expect(nestedList).toHaveClass("pl-6", "gap-0");
   });
 
   it("offers a pencil that starts a new session pre-filed under the project", () => {

@@ -45,6 +45,16 @@ function chosenIcon(a: AvailableAgent): string | null | undefined {
 
 afterEach(cleanup);
 
+describe("AgentCard surface", () => {
+  it("uses the standard Otto card geometry", () => {
+    render(<AgentCard agent={agent()} selected={false} onSelect={() => {}} />);
+    expect(screen.getByRole("button")).toHaveClass(
+      "rounded-[var(--radius-otto-md)]",
+      "[box-shadow:var(--elevation-otto-1)]",
+    );
+  });
+});
+
 describe("AgentCard icon selection", () => {
   it.each([
     // The whole point of keying on harness: a custom reviewer named

@@ -121,7 +121,7 @@ export function SharingPage() {
         ) : (
           <>
             {!editable && (
-              <p className="mb-4 rounded-md border border-border bg-muted/40 px-3 py-2 text-sm text-muted-foreground">
+              <p className="mb-4 rounded-[var(--radius-otto-sm)] border border-[var(--border-otto-container)] bg-muted/40 px-3 py-2 text-sm text-muted-foreground [box-shadow:var(--elevation-otto-1)]">
                 The sharing mode is managed by this deployment and can't be changed here.
               </p>
             )}
@@ -162,7 +162,7 @@ export function SharingPage() {
             </fieldset>
 
             {/* Public access — a separate switch from the tiers above. */}
-            <div className="mt-6 flex items-center justify-between rounded-lg border px-4 py-3">
+            <div className="mt-6 flex items-center justify-between rounded-[var(--radius-otto-md)] border border-[var(--border-otto-container)] px-4 py-3 [box-shadow:var(--elevation-otto-1)]">
               <div className="pr-4">
                 <p className="text-sm font-medium">Public access</p>
                 <p className="mt-0.5 text-xs text-muted-foreground">

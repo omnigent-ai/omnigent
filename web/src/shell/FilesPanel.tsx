@@ -70,15 +70,16 @@ interface FilesPanelProps {
 // HiddenFilesToggle
 // ---------------------------------------------------------------------------
 
+const FILES_HEADER_ICON_BUTTON_CLASS =
+  "inline-flex size-6 shrink-0 cursor-pointer items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground";
+
 function HiddenFilesToggle({
   showHidden,
   onToggle,
-  size,
   hiddenCount,
 }: {
   showHidden: boolean;
   onToggle: () => void;
-  size: "4" | "3.5";
   hiddenCount: number;
 }) {
   const hasHidden = hiddenCount > 0 && !showHidden;
@@ -88,7 +89,6 @@ function HiddenFilesToggle({
     : hasHidden
       ? `${hiddenCount} file${hiddenCount === 1 ? "" : "s"} in hidden directories. Click to show.`
       : "Show hidden files";
-  const iconSize = size === "4" ? "size-4" : "size-3.5";
   return (
     <TooltipProvider>
       <Tooltip>
@@ -97,14 +97,12 @@ function HiddenFilesToggle({
             type="button"
             aria-label={ariaLabel}
             className={cn(
-              "cursor-pointer rounded p-1 hover:bg-muted",
-              hasHidden
-                ? "text-warning hover:text-warning/80"
-                : "text-muted-foreground hover:text-foreground",
+              FILES_HEADER_ICON_BUTTON_CLASS,
+              hasHidden && "text-warning hover:text-warning/80",
             )}
             onClick={onToggle}
           >
-            {showHidden ? <EyeOffIcon className={iconSize} /> : <EyeIcon className={iconSize} />}
+            {showHidden ? <EyeOffIcon className="size-3.5" /> : <EyeIcon className="size-3.5" />}
           </button>
         </TooltipTrigger>
         <TooltipContent side="bottom">{tooltipLabel}</TooltipContent>
@@ -393,17 +391,16 @@ export function FilesPanel({
           <HiddenFilesToggle
             showHidden={showHidden}
             onToggle={() => onShowHiddenChange(!showHidden)}
-            size={isDrawer ? "4" : "3.5"}
             hiddenCount={hiddenFilesCount}
           />
           {onClose && (
             <button
               type="button"
               aria-label="Close files"
-              className="cursor-pointer rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
+              className={FILES_HEADER_ICON_BUTTON_CLASS}
               onClick={onClose}
             >
-              <XIcon className="size-4" />
+              <XIcon className="size-3.5" />
             </button>
           )}
         </div>

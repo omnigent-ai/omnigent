@@ -613,7 +613,7 @@ function ColorThemeControl() {
       title="Color theme"
       helper="Choose a preset, then tune it across light and dark mode."
     >
-      <div className="overflow-hidden rounded-xl border bg-card/55 shadow-xs">
+      <div className="overflow-hidden rounded-[var(--radius-otto-md)] border border-[var(--border-otto-container)] bg-card/55 [box-shadow:var(--elevation-otto-1)]">
         <div className="flex flex-col gap-3 border-b bg-muted/30 p-4 sm:flex-row sm:items-center sm:justify-between">
           <div className="flex min-w-0 items-center gap-3">
             <div className="w-28 shrink-0 overflow-hidden rounded-lg shadow-sm">
@@ -1350,7 +1350,7 @@ function LocalCliSection() {
               <span className="text-xs text-muted-foreground">
                 {status.source === "configured" ? "Path (custom)" : "Path (auto-detected)"}
               </span>
-              <code className="block overflow-x-auto rounded-md border border-border bg-muted/40 px-3 py-2 text-xs">
+              <code className="block overflow-x-auto rounded-[var(--radius-otto-sm)] border border-[var(--border-otto-hairline)] bg-muted/40 px-3 py-2 text-xs [box-shadow:var(--elevation-otto-1)]">
                 {status.path}
               </code>
             </div>
@@ -1361,7 +1361,7 @@ function LocalCliSection() {
                 screen:
               </p>
               {status.installCommand && (
-                <code className="block overflow-x-auto rounded-md border border-border bg-muted/40 px-3 py-2 text-xs">
+                <code className="block overflow-x-auto rounded-[var(--radius-otto-sm)] border border-[var(--border-otto-hairline)] bg-muted/40 px-3 py-2 text-xs [box-shadow:var(--elevation-otto-1)]">
                   {status.installCommand}
                 </code>
               )}
@@ -1499,7 +1499,7 @@ function UpdatesSection() {
             </Select>
           </label>
 
-          <div className="flex items-center justify-between gap-4 rounded-lg border border-border px-4 py-3">
+          <div className="flex items-center justify-between gap-4 rounded-[var(--radius-otto-md)] border border-[var(--border-otto-container)] px-4 py-3 [box-shadow:var(--elevation-otto-1)]">
             <div className="flex flex-col gap-1">
               <span className="text-sm font-medium">Install downloaded updates on next quit</span>
               <span className="text-xs text-muted-foreground">
@@ -1522,7 +1522,7 @@ function UpdatesSection() {
           </div>
 
           {lastCheckError && (
-            <div className="flex items-start gap-2 rounded-lg border border-border bg-muted/50 px-3 py-2 text-sm">
+            <div className="flex items-start gap-2 rounded-[var(--radius-otto-sm)] border border-[var(--border-otto-container)] bg-muted/50 px-3 py-2 text-sm [box-shadow:var(--elevation-otto-1)]">
               <AlertTriangleIcon className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
               <div>
                 <div className="font-medium">Last check failed</div>
@@ -1710,7 +1710,7 @@ function AccountSection() {
               {pwError !== null && (
                 <div
                   role="alert"
-                  className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+                  className="rounded-[var(--radius-otto-sm)] border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive [box-shadow:var(--elevation-otto-1)]"
                 >
                   {pwError}
                 </div>

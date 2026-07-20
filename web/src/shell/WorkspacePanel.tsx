@@ -382,17 +382,16 @@ export function WorkspacePanel({
                 </span>
               </TabsTrigger>
             )}
-            {showBrowserTab && (
-              <TabsTrigger
-                value="browser"
-                aria-label="Browser"
-                title="Browser"
-                className="size-8 shrink-0 rounded-[8px] p-0"
-              >
-                <GlobeIcon className="size-4" />
-                <span className="sr-only">Browser</span>
-              </TabsTrigger>
-            )}
+            <TabsTrigger
+              value="browser"
+              aria-label={showBrowserTab ? "Browser" : "Browser — available in the desktop app"}
+              title={showBrowserTab ? "Browser" : "Browser — available in the desktop app"}
+              disabled={!showBrowserTab}
+              className="size-8 shrink-0 rounded-[8px] p-0 disabled:opacity-55"
+            >
+              <GlobeIcon className="size-4" />
+              <span className="sr-only">Browser</span>
+            </TabsTrigger>
           </TabsList>
         </Tabs>
         {openFiles.length > 0 && (

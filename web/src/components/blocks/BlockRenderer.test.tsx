@@ -219,6 +219,9 @@ describe("BlockRenderer dispatch", () => {
     expect(sections).toHaveLength(2);
     expect(sections[0]!).not.toHaveClass("mt-2");
     expect(sections[1]!).not.toHaveClass("mt-2");
+    expect(screen.getByText("See 1 step").closest('[data-slot="collapsible"]')).toHaveClass(
+      "mb-1.5",
+    );
   });
 
   it("'See N steps' counts the whole tool run, including the streaming tail", () => {
@@ -254,6 +257,9 @@ describe("BlockRenderer dispatch", () => {
     render(<BlockRenderer items={items} sessionStatus="running" />);
     expect(screen.getByText("See 5 steps")).toBeDefined();
     expect(screen.queryByText("See 2 steps")).toBeNull();
+    expect(screen.getByText("See 5 steps").closest('[data-slot="collapsible"]')).toHaveClass(
+      "mb-0",
+    );
     // The label counts the WHOLE run, but the recent tools must still be
     // visible as a tail OUTSIDE the collapsed group — the most-recent tool
     // renders (the collapsed group's content is unmounted), while an older

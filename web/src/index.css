@@ -234,6 +234,13 @@
      * white card so the chip reads as a tile. Kept separate from --muted
      * (now a translucent black wash reused for hover/quote surfaces). */
   --code-bg: #f2f1ee;
+  --code-block-bg: #f7f6f3;
+  --code-block-header-bg: rgba(61, 57, 41, 0.025);
+  --code-block-border: rgba(61, 57, 41, 0.12);
+  --code-block-text: #2d302d;
+  --code-block-gutter: #aaa79f;
+  --code-block-action-hover: rgba(61, 57, 41, 0.07);
+  --code-block-shadow: 0 1px 2px rgba(36, 31, 24, 0.04);
   --accent: #f5e9ef;
   --accent-foreground: #6e304c;
   --destructive: #c8324c;
@@ -328,6 +335,13 @@
   --muted: color-mix(in srgb, var(--muted-foreground) 13%, #242126);
   --muted-foreground: #999397;
   --code-bg: #201d22;
+  --code-block-bg: #1b191c;
+  --code-block-header-bg: rgba(255, 255, 255, 0.018);
+  --code-block-border: rgba(255, 255, 255, 0.09);
+  --code-block-text: #e8e4e6;
+  --code-block-gutter: #777176;
+  --code-block-action-hover: rgba(255, 255, 255, 0.075);
+  --code-block-shadow: 0 1px 2px rgba(0, 0, 0, 0.22);
   --accent: #30262c;
   --accent-foreground: #e8b0ca;
   --destructive: #e65b77;
@@ -420,10 +434,12 @@
  * quiet pairing shared by Isaac Light and macOS Light, where navigation reads
  * as part of the window rather than a card floating beside it. */
 :root:not(.dark) .conversations-sidebar:not([data-collapsed]) {
-  --foreground: #27272a;
+  --foreground: #464247;
+  --sidebar-foreground: #464247;
   --muted: rgba(61, 57, 41, 0.06);
   --muted-foreground: #6e6c68;
 
+  color: var(--foreground);
   border-color: rgba(61, 57, 41, 0.08);
   box-shadow: 0 1px 3px rgba(20, 20, 19, 0.06);
   background: var(--side-pane-surface);
@@ -444,7 +460,7 @@
  * without replacing the established app or sidebar surface colors. The
  * generated layer paints behind the real shell children and disappears on
  * every non-landing route. */
-.app-shell:has([data-testid="new-chat-landing"])::before {
+.app-shell[data-landing="true"]::before {
   position: absolute;
   inset: 0;
   content: "";
@@ -627,16 +643,6 @@ html.dark .app-shell .workspace-panel-surface {
   );
 }
 
-/* Compact active-session header: backdrop blur handles content passing beneath
- * it; this low, warm shadow only separates the chrome from the thread. */
-.chat-header-session {
-  box-shadow: 0 8px 20px -14px rgba(61, 57, 41, 0.32);
-}
-
-.dark .chat-header-session {
-  box-shadow: 0 10px 24px -14px rgba(0, 0, 0, 0.65);
-}
-
 /* Turn rail's edges dissolve so it's clear the ticks scroll past both ends.
  * Short symmetric ramps since the ticks are small and evenly spaced. The ramp
  * width comes from --turn-rail-fade, set inline from TurnRail's FADE constant
@@ -708,7 +714,7 @@ html.dark .app-shell aside[aria-label="Conversations"].conversations-sidebar:not
     inset -1px 0 rgba(255, 255, 255, 0.025) !important;
 }
 
-html.dark .app-shell:has([data-testid="new-chat-landing"])::before {
+html.dark .app-shell[data-landing="true"]::before {
   background:
     radial-gradient(circle at 66% 18%, rgba(245, 59, 157, 0.075), transparent 28%),
     radial-gradient(circle at 54% 92%, rgba(77, 197, 160, 0.035), transparent 28%);
@@ -1142,16 +1148,20 @@ html[data-theme] .reference-composer-surface button[aria-label="Send"]:not(:disa
   .xterm {
     font-family: var(--font-mono);
   }
-  /* Text selection tracks the palette's brand accent so it stays cohesive
-   * across themes (pink on Omni, blue on GitHub, coral on Claude, …). Light:
-   * gentle accent wash + accent-colored text. Dark: solid accent + white. */
+  /* Text selection follows the familiar macOS system-blue wash rather than
+   * the active palette's brand accent. Keep the original text color intact so
+   * selections remain quiet and readable across prose, code, and themed UI. */
   ::selection {
-    background: color-mix(in srgb, var(--brand-accent) 22%, transparent);
-    color: var(--brand-accent);
+    background: rgba(0, 122, 255, 0.22);
+  }
+  ::-moz-selection {
+    background: rgba(0, 122, 255, 0.22);
   }
   .dark ::selection {
-    background: var(--brand-accent);
-    color: #ffffff;
+    background: rgba(10, 132, 255, 0.28);
+  }
+  .dark ::-moz-selection {
+    background: rgba(10, 132, 255, 0.28);
   }
 }
 
@@ -1186,6 +1196,15 @@ html[data-theme] .reference-composer-surface button[aria-label="Send"]:not(:disa
 [data-streamdown="inline-code"] {
   font-size: 0.875em;
   background-color: var(--code-bg);
+}
+
+/* The default dark transcript uses a slightly brighter reading hierarchy
+ * than the surrounding application chrome. Keep muted surfaces on their
+ * original mix so this lifts text contrast without lightening cards/bubbles. */
+html.dark:not([data-theme]) .chat-conversation-content {
+  --assistant-foreground: #f2edf0;
+  --muted-foreground: #aaa4a8;
+  --muted: color-mix(in srgb, #999397 13%, #242126);
 }
 
 /* Session keyword chips keep the Vercel prototype's compact 12/18 geometry,
@@ -1236,8 +1255,90 @@ html[data-theme] .reference-composer-surface button[aria-label="Send"]:not(:disa
   color: #ffc0dc !important;
 }
 
+[data-streamdown="code-block"] {
+  gap: 0;
+  padding: 0;
+  overflow: hidden;
+  border-color: var(--code-block-border);
+  border-radius: 10px;
+  background: var(--code-block-bg);
+  box-shadow: var(--code-block-shadow);
+}
+
+[data-streamdown="code-block-header"] {
+  height: 36px;
+  padding: 0 10px;
+  border-bottom: 1px solid var(--code-block-border);
+  background: var(--code-block-header-bg);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+}
+
+[data-streamdown="code-block-header"] > span {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-left: 0;
+}
+
+[data-streamdown="code-block-header"] > span::before {
+  width: 5px;
+  height: 5px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--brand-accent) 76%, var(--foreground));
+  content: "";
+}
+
+[data-streamdown="code-block-actions"] {
+  position: relative;
+  top: -6px;
+  gap: 2px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  backdrop-filter: none;
+}
+
+[data-streamdown="code-block-actions"] button {
+  display: inline-flex;
+  width: 24px;
+  height: 24px;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border-radius: 6px;
+}
+
+[data-streamdown="code-block-actions"] button svg {
+  width: 14px;
+  height: 14px;
+}
+
 [data-streamdown="code-block-body"] {
-  font-size: 0.875em;
+  padding: 12px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--code-block-text);
+  font-size: 13px;
+  line-height: 20px;
+}
+
+[data-streamdown="code-block-body"] pre {
+  background: transparent !important;
+}
+
+[data-streamdown="code-block-body"] code > span::before {
+  width: 28px;
+  margin-right: 12px;
+  color: var(--code-block-gutter);
+  font-size: 11px;
+}
+
+.code-block-action:hover,
+[data-streamdown="code-block-actions"] button:hover {
+  background: var(--code-block-action-hover);
 }
 
 /* Word-wrap toggle for chat code blocks (see ChatCodeBlockPre in message.tsx).
@@ -2150,7 +2251,7 @@ html[data-theme] .reference-composer-surface button[aria-label="Send"]:not(:disa
 :root:not(.dark)[data-theme="omni-rose"] .app-shell {
   background: var(--shell-surface);
 }
-:root:not(.dark)[data-theme="omni-rose"] .app-shell:has([data-testid="new-chat-landing"])::before {
+:root:not(.dark)[data-theme="omni-rose"] .app-shell[data-landing="true"]::before {
   background:
     radial-gradient(circle at 66% 18%, rgba(245, 59, 157, 0.09), transparent 29%),
     radial-gradient(circle at 54% 92%, rgba(77, 197, 160, 0.072), transparent 30%);
@@ -2174,9 +2275,15 @@ html[data-theme] .reference-composer-surface button[aria-label="Send"]:not(:disa
 :root:not(.dark):not([data-theme])
   .reference-composer-surface
   button[aria-label="Send"]:not(:disabled) {
-  color: var(--primary-foreground) !important;
-  background: var(--primary) !important;
-  box-shadow: 0 8px 20px color-mix(in srgb, var(--primary) 22%, transparent) !important;
+  /* Soft bubblegum fill + darker rose outline + pale halo, sampled from the
+   * user's reference. The fill is nudged darker than the sample so the white
+   * glyph retains 3:1 non-text contrast. */
+  color: #fff !important;
+  border-color: #c94f89 !important;
+  background: #e468a1 !important;
+  box-shadow:
+    0 0 0 3px rgba(228, 104, 161, 0.12),
+    0 8px 18px rgba(201, 79, 137, 0.24) !important;
 }
 :root:not(.dark)[data-theme="omni-rose"] [data-slot="switch"][data-checked],
 :root:not(.dark):not([data-theme]) [data-slot="switch"][data-checked] {
@@ -2359,8 +2466,8 @@ html[data-theme] .reference-composer-surface button[aria-label="Send"]:not(:disa
   color: var(--foreground);
 }
 
-:root:not(.dark)[data-theme="otto-dream"] .app-shell:has([data-testid="new-chat-landing"])::before,
-.dark[data-theme="otto-dream"] .app-shell:has([data-testid="new-chat-landing"])::before {
+:root:not(.dark)[data-theme="otto-dream"] .app-shell[data-landing="true"]::before,
+.dark[data-theme="otto-dream"] .app-shell[data-landing="true"]::before {
   background: none;
 }
 
