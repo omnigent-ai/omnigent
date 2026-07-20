@@ -89,6 +89,7 @@ from omnigent.stores import (
 )
 from omnigent.stores.comment_store import CommentStore
 from omnigent.stores.conversation_store import SessionConnectivity, runner_seen_is_fresh
+from omnigent.stores.credential_store import CredentialStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.policy_store import PolicyStore
@@ -1096,6 +1097,7 @@ def create_app(
     scheduled_task_store: ScheduledTaskStore | None = None,
     auth_provider: AuthProvider | None = None,
     host_store: HostStore | None = None,
+    credential_store: CredentialStore | None = None,
     account_store: Any | None = None,  # SqlAlchemyAccountStore — accounts mode only
     extra_routers: list[tuple[Any, str, list[str]]] | None = None,
     policy_modules: list[str] | None = None,
@@ -1147,6 +1149,9 @@ def create_app(
     :param host_store: Store for host registrations. ``None``
         disables host connectivity features (list hosts, launch
         runners on remote hosts).
+    :param credential_store: Store for per-user external-service
+        credentials (Settings → Credentials). ``None`` disables the
+        credentials routes.
     :param policy_modules: Additional dotted module paths to
         scan for ``POLICY_REGISTRY`` lists at startup, e.g.
         ``["myorg.policies.safety"]``. Sourced from the server
@@ -2251,6 +2256,16 @@ def create_app(
         prefix="/v1",
         tags=["sharing"],
     )
+
+    # Per-user external-service credentials (Settings → Credentials). Mounted
+    # at the root: the OAuth callback lives under /auth, the API under /v1.
+    if credential_store is not None:
+        from omnigent.server.routes.credentials import create_credentials_router
+
+        app.include_router(
+            create_credentials_router(credential_store, auth_provider),
+            tags=["credentials"],
+        )
 
     # ── Tunnel lifecycle callbacks (Step 8.5 crash recovery) ───
     async def _on_runner_disconnect(runner_id: str) -> None:

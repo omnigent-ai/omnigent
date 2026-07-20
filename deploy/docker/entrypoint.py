@@ -300,6 +300,9 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
     permission_store = SqlAlchemyPermissionStore(database_url)
     host_store = HostStore(database_url)
     policy_store = SqlAlchemyPolicyStore(database_url)
+    from omnigent.stores.credential_store import CredentialStore
+
+    credential_store = CredentialStore(database_url)
     # Fail startup loud on a malformed `sandbox:` section (an operator
     # typo should not surface as a runtime 502 on the first managed
     # session); the startup catch-all below logs it.
@@ -348,6 +351,7 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
         permission_store=permission_store,
         policy_store=policy_store,
         host_store=host_store,
+        credential_store=credential_store,
         auth_provider=auth_provider,
         account_store=account_store,
         # Non-secret auth settings from the config file (admins are the
