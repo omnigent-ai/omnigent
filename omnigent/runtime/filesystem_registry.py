@@ -732,9 +732,15 @@ class GitFilesystemRegistry(FilesystemRegistry):
         Runs at most once per git-root per process (guarded by
         :data:`_untracked_cache_enabled`) so the host fallback path — which
         builds a fresh registry per fs request — doesn't re-spawn the config
-        write each time.  Failures are ignored (old git, read-only .git, or an
-        mtime-unreliable filesystem) since the setting is a pure speedup with
-        no behavioral effect.
+        write each time.
+
+        Gated on ``git update-index --test-untracked-cache`` (git's own
+        recommended probe): on filesystems with unreliable directory mtimes the
+        cache can return stale results — a newly-untracked file could then be
+        missing from the changed-files panel.  We only enable when the probe
+        passes.  Failures anywhere (old git, read-only .git, unsupported
+        filesystem) are ignored since the setting is a pure speedup with no
+        behavioral effect.
         """
         root_key = str(self._git_root)
         with _untracked_cache_lock:
@@ -742,6 +748,20 @@ class GitFilesystemRegistry(FilesystemRegistry):
                 return
             _untracked_cache_enabled.add(root_key)
         try:
+            # Read-only probe: exit 0 iff the filesystem's mtime is reliable
+            # enough for the untracked cache to be correct here.
+            probe = subprocess.run(
+                ["git", "update-index", "--test-untracked-cache"],
+                cwd=root_key,
+                capture_output=True,
+                timeout=_git_timeout_seconds(),
+            )
+            if probe.returncode != 0:
+                _logger.debug(
+                    "GitFilesystemRegistry: untracked cache unsupported in %s; not enabling",
+                    self._git_root,
+                )
+                return
             subprocess.run(
                 ["git", "config", "core.untrackedCache", "true"],
                 cwd=root_key,

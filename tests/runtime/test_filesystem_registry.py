@@ -852,6 +852,51 @@ def test_untracked_cache_config_written_once_per_root(tmp_path: Path, monkeypatc
     )
 
 
+def test_untracked_cache_not_enabled_when_probe_fails(tmp_path: Path, monkeypatch) -> None:
+    """When ``--test-untracked-cache`` fails, the cache config is not written.
+
+    On mtime-unreliable filesystems git's probe exits non-zero; enabling the
+    cache there risks a newly-untracked file missing from the panel, so the
+    registry must leave ``core.untrackedCache`` unset.
+    """
+    from omnigent.runtime import filesystem_registry as fsr
+
+    env = _git_env()
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, env=env)
+
+    monkeypatch.setattr(fsr, "_untracked_cache_enabled", set())
+
+    config_calls: list[tuple] = []
+    real_run = subprocess.run
+
+    def _probe_fails_run(args, *a, **kw):
+        if args[:2] == ["git", "update-index"]:
+            return subprocess.CompletedProcess(
+                args=args, returncode=1, stdout=b"", stderr=b"mtime unreliable"
+            )
+        if args[:3] == ["git", "config", "core.untrackedCache"]:
+            config_calls.append(tuple(args))
+        return real_run(args, *a, **kw)
+
+    monkeypatch.setattr(fsr.subprocess, "run", _probe_fails_run)
+
+    GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+
+    assert config_calls == [], (
+        f"Expected no config write when the probe fails, got {config_calls}."
+    )
+    result = subprocess.run(
+        ["git", "config", "--get", "core.untrackedCache"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert result.stdout.strip() == "", (
+        f"core.untrackedCache should be unset when the probe fails, got {result.stdout.strip()!r}."
+    )
+
+
 # ── _normalize_path ──────────────────────────────────────────────────────────
 
 
