@@ -8706,7 +8706,7 @@ async def _stop_session_host_runner(
     host_id: str,
     runner_id: str,
     host_registry: Any,
-) -> None:
+) -> bool:
     """
     Terminate the host-launched runner backing a host-spawned session.
 
@@ -8743,10 +8743,14 @@ async def _stop_session_host_runner(
     :param host_registry: The :class:`HostRegistry` tracking live host
         tunnels on this replica, or ``None`` when host support is not wired
         (in-process / test setups without a host tunnel).
-    :returns: None.
+    :returns: ``True`` when the stop was delivered and acknowledged (the
+        runner is exiting, so a tunnel drop is expected); ``False`` on any
+        best-effort early-out (no host registry, host offline/replaced,
+        ack timeout, or host-reported failure) where the runner may keep
+        running and no tunnel drop will follow.
     """
     if host_registry is None:
-        return
+        return False
     conn = host_registry.get(host_id)
     if conn is None:
         _logger.warning(
@@ -8757,7 +8761,7 @@ async def _stop_session_host_runner(
             session_id,
             host_id,
         )
-        return
+        return False
     from omnigent.host.frames import HostStopRunnerFrame, encode_host_frame
 
     request_id = secrets.token_hex(8)
@@ -8776,7 +8780,7 @@ async def _stop_session_host_runner(
             session_id,
             host_id,
         )
-        return
+        return False
     try:
         result = await asyncio.wait_for(
             future,
@@ -8790,7 +8794,7 @@ async def _stop_session_host_runner(
             runner_id,
             session_id,
         )
-        return
+        return False
     if result.get("status") == "failed":
         _logger.warning(
             "Host %s failed to stop runner %s for session %s: %s",
@@ -8799,6 +8803,8 @@ async def _stop_session_host_runner(
             session_id,
             result.get("error"),
         )
+        return False
+    return True
 
 
 def _build_new_item(
@@ -10393,11 +10399,6 @@ async def _relay_runner_stream(
                     if session_id in _interrupt_fenced_sessions:
                         if evt_type == "session.status" and event.get("status") == "running":
                             _interrupt_fenced_sessions.discard(session_id)
-                            # A new turn proves the runner is live again: a stop
-                            # that never dropped the tunnel must not leave the
-                            # intentional-stop marker to swallow a later genuine
-                            # disconnect.
-                            _intentional_stop_sessions.discard(session_id)
                         elif evt_type in _TERMINAL_RESPONSE_EVENT_TYPES:
                             # Terminal proves the stopped turn is over (completed =
                             # the stop lost the race); process it normally.
@@ -10434,6 +10435,13 @@ async def _relay_runner_stream(
                                     None,
                                     conversation_store,
                                 )
+                                # A new turn proves the runner is live again, so
+                                # a prior Stop that never dropped the tunnel must
+                                # not leave the intentional-stop marker to swallow
+                                # this turn's genuine disconnect. Fence-independent
+                                # (the fence may already be cleared by a terminal
+                                # stop event), so it fires on every running edge.
+                                _intentional_stop_sessions.discard(session_id)
                             # PTY-activity status is a UI signal only. Terminal
                             # sub-agent delivery rides the Stop/StopFailure hook
                             # via external_session_status (the codex-shared path)
@@ -10796,6 +10804,12 @@ async def _relay_runner_stream(
         # mid-turn, or a rebind cancellation) can't strand it forever.
         # Normal turn-ends already clear via record_publish.
         inflight_text.discard(session_id)
+        # The intentional-stop marker is consumed by the disconnect handler
+        # above on the expected path; discard it here too so a relay that
+        # exits some other way (clean [DONE], rebind cancellation) can't
+        # leave a stale marker to swallow a later genuine disconnect on the
+        # reused per-session relay task.
+        _intentional_stop_sessions.discard(session_id)
         # Relay ended (runner dropped/rebound): re-discover runner-backed
         # snapshot overlays next time. Cancel in-flight fetches so they can't
         # land stale values from the dead runner after this pop.
@@ -20311,12 +20325,20 @@ def create_sessions_router(
                 # sessions drop the tunnel on Stop; other harnesses leave the
                 # runner connected, so there is nothing to suppress for them.
                 _intentional_stop_sessions.add(session_id)
-                await _stop_session_host_runner(
+                teardown_delivered = await _stop_session_host_runner(
                     session_id,
                     stop_conv.host_id,
                     stop_conv.runner_id,
                     getattr(request.app.state, "host_registry", None),
                 )
+                if not teardown_delivered:
+                    # Best-effort stop did not land (host offline / timeout /
+                    # failure): no tunnel drop will follow, so the relay won't
+                    # reach the disconnect handler that consumes the marker.
+                    # Discard it now so it can't outlive this turn on the
+                    # reused per-session relay task and later swallow a genuine
+                    # runner_disconnected as a quiet idle.
+                    _intentional_stop_sessions.discard(session_id)
             # Stop is non-sticky: no persistent marker is written. The
             # runner tunnel dropping above flips ``runner_online`` to false
             # honestly, and the next message auto-relaunches the session on
