@@ -366,6 +366,74 @@ def test_install_harness_cli_requires_npm(monkeypatch: pytest.MonkeyPatch) -> No
     assert hi.install_harness_cli(ANTHROPIC_FAMILY) is False
 
 
+def test_install_harness_cli_with_reason_missing_npm(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No npm on PATH → ``(False, reason)`` naming the missing installer.
+
+    The UI-driven install shows this reason instead of a bare failure, so the
+    user knows the host lacks npm rather than guessing.
+    """
+    monkeypatch.setattr(hi.shutil, "which", lambda name: None)
+    monkeypatch.setattr(
+        hi.subprocess,
+        "run",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not shell out")),
+    )
+    installed, reason = hi.install_harness_cli_with_reason(ANTHROPIC_FAMILY)
+    assert installed is False
+    assert reason is not None and "npm" in reason
+
+
+def test_install_harness_cli_with_reason_manual_only() -> None:
+    """A manual-only CLI (no npm package, no install_command) → ``(False, reason)``.
+
+    Cursor installs out-of-band; the reason tells the caller it can't be
+    auto-installed so the UI can fall back to showing the install hint.
+    """
+    installed, reason = hi.install_harness_cli_with_reason(hi.CURSOR_KEY)
+    assert installed is False
+    assert reason is not None and "automatically" in reason
+
+
+def test_install_harness_cli_with_reason_nonzero_exit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A non-zero installer exit with the binary still absent → ``(False, reason)``.
+
+    Surfaces the installer's exit code so a failed npm install is actionable.
+    """
+
+    def _which(name: str) -> str | None:
+        return "/usr/bin/npm" if name == "npm" else None
+
+    monkeypatch.setattr(hi.shutil, "which", _which)
+    monkeypatch.setattr(
+        hi.subprocess,
+        "run",
+        lambda argv, **k: subprocess.CompletedProcess(args=argv, returncode=1),
+    )
+    installed, reason = hi.install_harness_cli_with_reason(OPENAI_FAMILY)
+    assert installed is False
+    assert reason is not None and "code 1" in reason
+
+
+def test_install_harness_cli_with_reason_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A successful install → ``(True, None)``; the bool wrapper agrees."""
+    state = {"installed": False}
+
+    def _which(name: str) -> str | None:
+        if name == "npm":
+            return "/usr/bin/npm"
+        if name == "codex":
+            return "/usr/bin/codex" if state["installed"] else None
+        return None
+
+    def _run(argv: list[str], **k: object):
+        state["installed"] = True
+        return subprocess.CompletedProcess(args=argv, returncode=0)
+
+    monkeypatch.setattr(hi.shutil, "which", _which)
+    monkeypatch.setattr(hi.subprocess, "run", _run)
+    assert hi.install_harness_cli_with_reason(OPENAI_FAMILY) == (True, None)
+
+
 def test_install_harness_cli_runs_npm_then_rechecks(monkeypatch: pytest.MonkeyPatch) -> None:
     """Installs via ``npm install -g <package>`` and reports the post-install
     PATH state (True once the binary appears)."""
