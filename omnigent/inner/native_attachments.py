@@ -14,6 +14,7 @@ that shared decode-and-write step.
 from __future__ import annotations
 
 import base64
+import hashlib
 import logging
 import re
 import urllib.parse
@@ -123,13 +124,32 @@ def materialize_attachment(block: dict[str, Any], bridge_dir: Path) -> Path | No
     if dest.exists():
         # Same bytes already on disk (e.g. the same history re-materialized
         # on every resume) — reuse it instead of accumulating copies.
-        if dest.stat().st_size == len(raw_bytes) and dest.read_bytes() == raw_bytes:
+        if _holds_bytes(dest, raw_bytes):
             return dest
-        stem = dest.stem
-        dest = uploads_dir / f"{stem}_{uuid.uuid4().hex[:6]}{dest.suffix}"
+        # Same name, different bytes. The collision suffix is derived from the
+        # content so a history carrying two distinct "image.png" uploads keeps
+        # one file per payload instead of gaining a random copy per rebuild.
+        digest = hashlib.sha256(raw_bytes).hexdigest()[:12]
+        dest = uploads_dir / f"{dest.stem}_{digest}{dest.suffix}"
+        if _holds_bytes(dest, raw_bytes):
+            return dest
 
     dest.write_bytes(raw_bytes)
     return dest
+
+
+def _holds_bytes(path: Path, raw_bytes: bytes) -> bool:
+    """
+    True if *path* already holds exactly *raw_bytes*.
+
+    :param path: Candidate destination that may or may not exist.
+    :param raw_bytes: Decoded attachment payload.
+    :returns: Whether the existing file can be reused as-is. The size
+        check short-circuits the read for the common mismatch.
+    """
+    if not path.exists():
+        return False
+    return path.stat().st_size == len(raw_bytes) and path.read_bytes() == raw_bytes
 
 
 # Regex source matching the exact line unresolved_attachment_marker() emits.

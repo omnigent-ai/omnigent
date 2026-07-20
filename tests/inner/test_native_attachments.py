@@ -197,6 +197,46 @@ def test_materialize_attachment_reuses_identical_existing_file(tmp_path: Path) -
     assert len(list((tmp_path / "uploads").iterdir())) == 2
 
 
+def test_materialize_attachment_same_name_collision_is_bounded(tmp_path: Path) -> None:
+    """
+    Same-named attachments with different bytes stay bounded across rebuilds.
+
+    A transcript that carries two distinct ``image.png`` uploads is
+    re-materialized on every runner restart. A randomized collision path
+    would hand the second attachment a fresh name each rebuild and grow
+    ``uploads/`` without bound; the collision path must be derived from
+    the content so each distinct payload keeps exactly one file.
+    """
+    first_payload = base64.b64encode(b"first-image-bytes").decode()
+    second_payload = base64.b64encode(b"second-image-bytes").decode()
+    first_block = {
+        "type": "input_image",
+        "image_url": f"data:image/png;base64,{first_payload}",
+        "filename": "image.png",
+    }
+    second_block = {
+        "type": "input_image",
+        "image_url": f"data:image/png;base64,{second_payload}",
+        "filename": "image.png",
+    }
+
+    rebuilds = [
+        (
+            materialize_attachment(first_block, tmp_path),
+            materialize_attachment(second_block, tmp_path),
+        )
+        for _ in range(4)
+    ]
+
+    uploads = tmp_path / "uploads"
+    assert len(list(uploads.iterdir())) == 2
+    # Every rebuild resolves to the same pair of paths.
+    assert all(pair == rebuilds[0] for pair in rebuilds)
+    assert rebuilds[0][0] != rebuilds[0][1]
+    assert rebuilds[0][0].read_bytes() == base64.b64decode(first_payload)
+    assert rebuilds[0][1].read_bytes() == base64.b64decode(second_payload)
+
+
 def test_materialize_attachment_sanitizes_bracketed_filenames(tmp_path: Path) -> None:
     """
     Brackets in the filename cannot break the "[Attached: ...]" line.
