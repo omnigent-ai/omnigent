@@ -62,6 +62,14 @@ def _git_timeout_seconds() -> float:
     return _DEFAULT_GIT_TIMEOUT_SECONDS
 
 
+# Git roots whose ``core.untrackedCache`` we've already enabled this process, so
+# the one-shot config write doesn't repeat.  The host fallback path builds a
+# fresh registry per fs request (unlike the runner, which caches per session),
+# so without this guard every request would re-spawn the ``git config``.
+_untracked_cache_enabled: set[str] = set()
+_untracked_cache_lock = threading.Lock()
+
+
 class GitStatusUnavailable(RuntimeError):
     """A ``git`` invocation backing the changed-files view could not complete.
 
@@ -721,14 +729,22 @@ class GitFilesystemRegistry(FilesystemRegistry):
         The untracked cache (upstream git ≥ 2.8) records untracked file/dir
         mtimes in the index so ``git status --untracked-files=all`` skips
         re-stat'ing every untracked path — the dominant cost on large repos.
-        Idempotent and safe to run once per registry; failures are ignored
-        (old git, read-only .git, or an mtime-unreliable filesystem) since the
-        setting is a pure speedup with no behavioral effect.
+        Runs at most once per git-root per process (guarded by
+        :data:`_untracked_cache_enabled`) so the host fallback path — which
+        builds a fresh registry per fs request — doesn't re-spawn the config
+        write each time.  Failures are ignored (old git, read-only .git, or an
+        mtime-unreliable filesystem) since the setting is a pure speedup with
+        no behavioral effect.
         """
+        root_key = str(self._git_root)
+        with _untracked_cache_lock:
+            if root_key in _untracked_cache_enabled:
+                return
+            _untracked_cache_enabled.add(root_key)
         try:
             subprocess.run(
                 ["git", "config", "core.untrackedCache", "true"],
-                cwd=str(self._git_root),
+                cwd=root_key,
                 capture_output=True,
                 timeout=_git_timeout_seconds(),
             )

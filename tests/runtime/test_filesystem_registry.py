@@ -818,6 +818,40 @@ def test_untracked_cache_failure_does_not_break_init(tmp_path: Path, monkeypatch
     GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
 
 
+def test_untracked_cache_config_written_once_per_root(tmp_path: Path, monkeypatch) -> None:
+    """The ``git config`` write runs at most once per git-root per process.
+
+    The host fallback path builds a fresh registry per fs request, so without
+    the one-shot guard every request would re-spawn ``git config``. Building
+    several registries on the same root must issue the config write only once.
+    """
+    from omnigent.runtime import filesystem_registry as fsr
+
+    env = _git_env()
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, env=env)
+
+    # Reset the process-global guard so this test is order-independent.
+    monkeypatch.setattr(fsr, "_untracked_cache_enabled", set())
+
+    config_calls: list[tuple] = []
+    real_run = subprocess.run
+
+    def _counting_run(args, *a, **kw):
+        if args[:3] == ["git", "config", "core.untrackedCache"]:
+            config_calls.append(tuple(args))
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout=b"", stderr=b"")
+        return real_run(args, *a, **kw)
+
+    monkeypatch.setattr(fsr.subprocess, "run", _counting_run)
+
+    for _ in range(3):
+        GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+
+    assert len(config_calls) == 1, (
+        f"Expected core.untrackedCache config write exactly once, got {len(config_calls)}."
+    )
+
+
 # ── _normalize_path ──────────────────────────────────────────────────────────
 
 
