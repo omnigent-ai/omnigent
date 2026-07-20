@@ -454,7 +454,7 @@ def _render_host_command(server_url: str) -> list[str]:
 
 
 def build_token_secret_manifest(
-    *, secret_name: str, namespace: str, token: str
+    *, secret_name: str, namespace: str, token: str, extra: dict[str, str] | None = None
 ) -> dict[str, object]:
     """
     Build the per-Pod launch-token Secret manifest as a plain dict.
@@ -470,6 +470,8 @@ def build_token_secret_manifest(
     :param namespace: Namespace the Secret is created in.
     :param token: The raw launch token (the apiserver base64-encodes
         ``stringData``).
+    :param extra: Additional per-launch env pairs riding the same Secret
+        (e.g. the session owner's ``GIT_TOKEN``), or ``None`` for none.
     :returns: The Secret manifest dict.
     """
     return {
@@ -481,7 +483,7 @@ def build_token_secret_manifest(
             "labels": {_MANAGED_BY_LABEL: _MANAGED_BY_VALUE, _ROLE_LABEL: _ROLE_VALUE},
         },
         "type": "Opaque",
-        "stringData": {HOST_TOKEN_ENV_VAR: token},
+        "stringData": {HOST_TOKEN_ENV_VAR: token, **(extra or {})},
     }
 
 
@@ -507,6 +509,7 @@ def build_pod_manifest(
     pvc_mounts: Sequence[Mapping[str, object]] | None = None,
     secret_mounts: Sequence[Mapping[str, object]] | None = None,
     agent_name: str | None = None,
+    extra_env_keys: Sequence[str] = (),
 ) -> dict[str, object]:
     """
     Build the sandbox Pod manifest as a plain dict.
@@ -585,6 +588,11 @@ def build_pod_manifest(
         ``None``/empty → omit fail-safe): the value selects which credential an
         admission policy injects, so it must equal the agent name exactly rather
         than be coerced into a collision with a different name.
+    :param extra_env_keys: Names of per-launch env entries riding the token
+        Secret (see :func:`build_token_secret_manifest` ``extra``), projected
+        via ``secretKeyRef`` into both containers — the init container so a
+        per-user ``GIT_TOKEN`` covers the clone, the host container for the
+        session. Values never enter the Pod spec.
     :returns: The Pod manifest dict.
     """
     pod_resources = _resolve_pod_resources(resources)
@@ -680,6 +688,19 @@ def build_pod_manifest(
     if harness_secret:
         # The clone may need GIT_TOKEN (private repos) from the harness Secret.
         init_container["envFrom"] = [{"secretRef": {"name": harness_secret}}]
+    extra_env: list[dict[str, object]] = [
+        {
+            "name": key,
+            "valueFrom": {"secretKeyRef": {"name": token_secret_name, "key": key}},
+        }
+        for key in extra_env_keys
+    ]
+    if extra_env:
+        # Per-user creds beat the shared harness Secret: explicit env wins
+        # over envFrom, and the clone needs them too.
+        init_env = init_container["env"]
+        assert isinstance(init_env, list)
+        init_env.extend(extra_env)
 
     host_env: list[dict[str, object]] = [
         {"name": "HOME", "value": _HOME_DIR},
@@ -692,6 +713,7 @@ def build_pod_manifest(
         },
     ]
     host_env.extend({"name": name, "value": value} for name, value in env_literals.items())
+    host_env.extend(extra_env)
 
     host_container: dict[str, object] = {
         "name": _CONTAINER_NAME,
@@ -1203,6 +1225,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         host_config: dict[str, object] | None = None,
         agent_name: str | None = None,
         on_stage: Callable[[str], None] | None = None,
+        extra_env: dict[str, str] | None = None,
     ) -> str:
         """
         Create the token Secret + runner Pod and wait for the host to start.
@@ -1234,6 +1257,8 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
             leave the runner unclassified. Threaded only because this provider
             declares ``classifies_runner_by_agent``.
         :param on_stage: Progress observer; invoked with ``"starting"``.
+        :param extra_env: Per-launch env pairs (e.g. the session owner's
+            ``GIT_TOKEN``) riding the per-Pod Secret, or ``None`` for none.
         :returns: The absolute in-sandbox workspace path (the cloned repository
             directory when *repo_url* is set).
         :raises click.ClickException: When creation fails or the host does not
@@ -1281,6 +1306,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                     pvc_mounts=self._pvc_mounts,
                     secret_mounts=self._secret_mounts,
                     agent_name=agent_name,
+                    extra_env_keys=sorted(extra_env) if extra_env else (),
                 )
                 # Secret before Pod so the Pod's secretKeyRef resolves
                 # immediately — a Pod referencing a missing Secret would sit in
@@ -1289,7 +1315,10 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                 core.create_namespaced_secret(
                     namespace,
                     build_token_secret_manifest(
-                        secret_name=secret_name, namespace=namespace, token=token
+                        secret_name=secret_name,
+                        namespace=namespace,
+                        token=token,
+                        extra=extra_env,
                     ),
                     _request_timeout=_POD_READY_REQUEST_TIMEOUT_S,
                 )

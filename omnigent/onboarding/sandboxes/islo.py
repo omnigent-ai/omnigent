@@ -540,6 +540,7 @@ class IsloSandboxLauncher(SandboxLauncher):
         repo_name: str | None = None,
         host_config: dict[str, object] | None = None,
         on_stage: Callable[[str], None] | None = None,
+        extra_env: dict[str, str] | None = None,
     ) -> str:
         """Stop any memory-preserved host daemon, then start with a fresh token."""
         self._stop_preserved_host_daemon(sandbox_id)
@@ -554,6 +555,7 @@ class IsloSandboxLauncher(SandboxLauncher):
             repo_name=repo_name,
             host_config=host_config,
             on_stage=on_stage,
+            extra_env=extra_env,
         )
 
     def _stop_preserved_host_daemon(self, sandbox_id: str) -> None:
