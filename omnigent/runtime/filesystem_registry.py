@@ -26,6 +26,7 @@ from __future__ import annotations
 import dataclasses
 import fnmatch
 import logging
+import os
 import subprocess
 import threading
 import time
@@ -35,10 +36,30 @@ from typing import Any
 
 _logger = logging.getLogger(__name__)
 
-# Wall-clock cap for git subprocesses backing the changed-files view. Kept
-# short so a slow/hung repo can't block the panel; each call degrades cleanly
-# on timeout rather than raising. Bump if very large repos need more headroom.
-_GIT_TIMEOUT_SECONDS = 5
+# Wall-clock cap for git subprocesses backing the changed-files view. Large
+# repos (many untracked files, slow disk) can make `git status` slow, so this
+# is generous by default and overridable via OMNIGENT_GIT_STATUS_TIMEOUT_SECONDS
+# for repos that need more (or less) headroom. It still bounds a genuinely hung
+# git so the panel surfaces a failure rather than blocking forever.
+_DEFAULT_GIT_TIMEOUT_SECONDS = 30.0
+
+
+def _git_timeout_seconds() -> float:
+    """Return the git-subprocess timeout, honoring the env override.
+
+    Reads ``OMNIGENT_GIT_STATUS_TIMEOUT_SECONDS`` on each call so operators can
+    tune it without a restart. Falls back to the default on unset/invalid/
+    non-positive values.
+    """
+    raw = os.environ.get("OMNIGENT_GIT_STATUS_TIMEOUT_SECONDS")
+    if raw is not None:
+        try:
+            value = float(raw)
+        except ValueError:
+            value = 0.0
+        if value > 0:
+            return value
+    return _DEFAULT_GIT_TIMEOUT_SECONDS
 
 
 class GitStatusUnavailable(RuntimeError):
@@ -692,6 +713,31 @@ class GitFilesystemRegistry(FilesystemRegistry):
         """
         super().__init__(watch_path)
         self._git_root = git_root
+        self._enable_untracked_cache()
+
+    def _enable_untracked_cache(self) -> None:
+        """Best-effort ``core.untrackedCache=true`` on this repo.
+
+        The untracked cache (upstream git ≥ 2.8) records untracked file/dir
+        mtimes in the index so ``git status --untracked-files=all`` skips
+        re-stat'ing every untracked path — the dominant cost on large repos.
+        Idempotent and safe to run once per registry; failures are ignored
+        (old git, read-only .git, or an mtime-unreliable filesystem) since the
+        setting is a pure speedup with no behavioral effect.
+        """
+        try:
+            subprocess.run(
+                ["git", "config", "core.untrackedCache", "true"],
+                cwd=str(self._git_root),
+                capture_output=True,
+                timeout=_git_timeout_seconds(),
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            _logger.debug(
+                "GitFilesystemRegistry: could not enable core.untrackedCache in %s",
+                self._git_root,
+                exc_info=True,
+            )
 
     def list_changed_files(self, conversation_id: str, *, limit: int) -> list[dict[str, Any]]:
         """Return all uncommitted changes in the working tree, newest first.
@@ -709,14 +755,21 @@ class GitFilesystemRegistry(FilesystemRegistry):
         # inside a brand-new directory tree collapses to a single ``?? dir/``
         # line, so the UI would show the directory (stat'd as ~96 B) instead
         # of the added file.
+        #
+        # The ``:(exclude)`` pathspecs stop git from walking large untracked
+        # build/cache trees (node_modules/, .venv/ …) that we would discard
+        # below anyway.  With ``-uall`` git otherwise stat's every file in them,
+        # which dominates the runtime on big repos.  These mirror the
+        # ``_SKIP_DIRS`` root-level prune (kept below as a safety net).
         argv = ["git", "status", "--porcelain", "--untracked-files=all"]
+        argv.extend(self._skip_dir_pathspecs())
         started = time.monotonic()
         try:
             result = subprocess.run(
                 argv,
                 cwd=str(self._git_root),
                 capture_output=True,
-                timeout=_GIT_TIMEOUT_SECONDS,
+                timeout=_git_timeout_seconds(),
             )
         except subprocess.TimeoutExpired as exc:
             elapsed = time.monotonic() - started
@@ -811,7 +864,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
                 argv,
                 cwd=str(self._git_root),
                 capture_output=True,
-                timeout=_GIT_TIMEOUT_SECONDS,
+                timeout=_git_timeout_seconds(),
             )
         except subprocess.TimeoutExpired as exc:
             elapsed = time.monotonic() - started
@@ -879,7 +932,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
                 ["git", "show", f"HEAD:{git_path}"],
                 cwd=str(self._git_root),
                 capture_output=True,
-                timeout=_GIT_TIMEOUT_SECONDS,
+                timeout=_git_timeout_seconds(),
             )
             if result.returncode == 0:
                 return result.stdout.decode("utf-8", errors="replace")
@@ -892,6 +945,25 @@ class GitFilesystemRegistry(FilesystemRegistry):
         return None
 
     # ── Internals ─────────────────────────────────────────────────
+
+    def _skip_dir_pathspecs(self) -> list[str]:
+        """Return ``:(exclude)`` pathspecs pruning :data:`_SKIP_DIRS` from status.
+
+        The post-filter in :meth:`list_changed_files` only prunes skip dirs at
+        the *workspace root* (first path component), so the pathspecs are
+        anchored to the workspace's location within the git root to match —
+        e.g. a workspace at ``repo/sub`` yields ``:(exclude)sub/node_modules``,
+        which leaves a ``node_modules/`` elsewhere in the repo untouched.
+        Returns an empty list when the workspace escapes the git root (in which
+        case the post-filter alone still applies).
+        """
+        try:
+            prefix = self._cwd.relative_to(self._git_root)
+        except ValueError:
+            return []
+        prefix_posix = prefix.as_posix()
+        base = "" if prefix_posix == "." else f"{prefix_posix}/"
+        return [f":(exclude){base}{name}" for name in sorted(_SKIP_DIRS)]
 
     def _git_to_rel(self, git_path: str) -> str | None:
         """Convert a git-root-relative path to a cwd-relative path.
@@ -964,7 +1036,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
                 argv,
                 cwd=str(self._git_root),
                 capture_output=True,
-                timeout=_GIT_TIMEOUT_SECONDS,
+                timeout=_git_timeout_seconds(),
             )
         except (subprocess.TimeoutExpired, OSError):
             _logger.warning(
