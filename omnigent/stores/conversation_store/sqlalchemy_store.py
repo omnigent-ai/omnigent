@@ -2863,6 +2863,36 @@ class SqlAlchemyConversationStore(ConversationStore):
             for r in ap_rows
         ]
 
+    def list_runner_ids_for_host(self, host_id: str) -> set[str]:
+        """
+        Return the distinct non-null runner ids bound to conversations
+        on ``host_id`` in the current workspace.
+
+        Used by the host tunnel's connect reconciliation to diff the
+        DB's view of which runners a host is running against the
+        authoritative ``runners`` list in that host's ``host.hello``
+        frame. A runner the DB still has bound but the reconnecting host
+        no longer reports died while the tunnel was down (issue #1857);
+        the caller fails its still-active session(s).
+
+        :param host_id: Stable host identifier, e.g.
+            ``"host_a1b2c3d4..."``.
+        :returns: Set of runner ids currently bound to the host.
+        """
+        with self._session() as session:
+            rows = (
+                session.execute(
+                    select(SqlConversationMetadata.runner_id).where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.host_id == host_id,
+                        SqlConversationMetadata.runner_id.is_not(None),
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        return {r for r in rows if r is not None}
+
     def set_host_id(
         self,
         conversation_id: str,

@@ -73,6 +73,7 @@ def create_host_tunnel_router(
     on_host_disconnect: Callable[[str, str | None], Awaitable[None]] | None = None,
     on_host_update: Callable[[str, str | None], Awaitable[None]] | None = None,
     on_runner_exited: Callable[[str, str], Awaitable[None]] | None = None,
+    on_host_reconcile: Callable[[str, list[str]], Awaitable[None]] | None = None,
     local_single_user: bool | None = None,
     runner_exit_reports: RunnerExitReports | None = None,
 ) -> APIRouter:
@@ -102,6 +103,12 @@ def create_host_tunnel_router(
         and push the cause to the open view — the only failure signal
         for a runner that crashed before connecting its tunnel (so the
         runner-tunnel ``on_runner_disconnect`` path never fires).
+    :param on_host_reconcile: Optional async callback fired once on host
+        connect with ``(host_id, runners)`` taken from the ``host.hello``
+        frame. The server wires this to fail sessions whose runner the
+        reconnecting host no longer reports - runners that died while the
+        tunnel was down and so never sent ``host.runner_exited``
+        (issue #1857).
     :param on_host_disconnect: Optional async callback fired when
         a host's tunnel closes. Receives the ``host_id``.
     :param on_host_update: Optional async callback fired when a connected
@@ -283,6 +290,18 @@ def create_host_tunnel_router(
                 ),
                 name=f"host-receive:{host_id}",
             )
+
+            # Reconcile after the loops are running so a slow reconcile
+            # (one query per orphaned runner) never delays the first
+            # heartbeat. Mirrors the on_host_connect placement below.
+            if on_host_reconcile is not None:
+                try:
+                    await on_host_reconcile(host_id, list(frame.runners))
+                except Exception:
+                    _logger.exception(
+                        "on_host_reconcile callback failed for %s",
+                        host_id,
+                    )
 
             if on_host_connect is not None:
                 try:

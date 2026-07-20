@@ -2529,6 +2529,45 @@ def test_set_host_id(
     assert fetched.workspace == "/Users/corey/projects/myapp"
 
 
+def test_list_runner_ids_for_host(
+    conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
+) -> None:
+    """Return exactly the distinct non-null runner ids bound to a host.
+
+    The host tunnel's connect reconciliation diffs this against the
+    ``runners`` list in the reconnecting host's ``host.hello`` frame to
+    find runners that died while the tunnel was down (issue #1857).
+    Runners on other hosts, and host-bound conversations with no runner,
+    must not leak into the result, and a runner driving two sessions
+    collapses to one entry.
+    """
+    host = "292dfcdf8a31f1319b469f4fa179ac6b"
+    other_host = "4f64b6ee625f4e8259185c35c6e63f3d"
+    _register_host(db_uri, host)
+    _register_host(db_uri, other_host)
+
+    # Two sessions on the same runner, one on a second runner - same host.
+    a1 = conversation_store.create_conversation(runner_id="runner_a", workspace="/w")
+    conversation_store.set_host_id(a1.id, host)
+    a2 = conversation_store.create_conversation(runner_id="runner_a", workspace="/w")
+    conversation_store.set_host_id(a2.id, host)
+    b = conversation_store.create_conversation(runner_id="runner_b", workspace="/w")
+    conversation_store.set_host_id(b.id, host)
+
+    # Host-bound but no runner - must be ignored.
+    none_bound = conversation_store.create_conversation(workspace="/w")
+    conversation_store.set_host_id(none_bound.id, host)
+
+    # Runner on a different host - must not leak.
+    other = conversation_store.create_conversation(runner_id="runner_c", workspace="/w")
+    conversation_store.set_host_id(other.id, other_host)
+
+    assert conversation_store.list_runner_ids_for_host(host) == {"runner_a", "runner_b"}
+    assert conversation_store.list_runner_ids_for_host(other_host) == {"runner_c"}
+    assert conversation_store.list_runner_ids_for_host("f" * 32) == set()
+
+
 def test_set_host_id_missing_conversation_raises(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:

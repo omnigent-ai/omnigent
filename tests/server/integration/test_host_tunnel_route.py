@@ -365,6 +365,44 @@ async def test_host_tunnel_refreshes_harness_readiness_without_reconnect(
     assert updates == [_HOST_ID]
 
 
+async def test_host_tunnel_invokes_on_host_reconcile_with_runners(
+    db_uri: str,
+) -> None:
+    """The tunnel forwards the hello frame's ``runners`` to on_host_reconcile.
+
+    This is the connect-time hook the server uses to fail sessions whose
+    runner a reconnecting host no longer reports - runners that died while
+    the tunnel was down (issue #1857). The tunnel must hand over the
+    authoritative live-runner list from the ``host.hello`` frame, not an
+    empty or stale one, or the reconciliation has nothing to diff against.
+    """
+    registry = HostRegistry()
+    store = HostStore(db_uri)
+    reconciled: list[tuple[str, list[str]]] = []
+
+    async def _on_host_reconcile(host_id: str, runners: list[str]) -> None:
+        reconciled.append((host_id, runners))
+
+    app = FastAPI()
+    app.include_router(
+        create_host_tunnel_router(
+            registry,
+            store,
+            on_host_reconcile=_on_host_reconcile,
+        ),
+        prefix="/v1",
+    )
+    comm = await _connect_route(app, _TUNNEL_PATH)
+    await _send_hello_and_wait(comm, registry, runners=["runner_x", "runner_y"])
+
+    async def _wait_reconciled() -> None:
+        while not reconciled:
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(_wait_reconciled(), timeout=1.0)
+    assert reconciled == [(_HOST_ID, ["runner_x", "runner_y"])]
+
+
 async def test_host_tunnel_sets_offline_on_disconnect(
     host_app: tuple[FastAPI, HostRegistry, HostStore],
 ) -> None:

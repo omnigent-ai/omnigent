@@ -2373,6 +2373,73 @@ def create_app(
             _session_status_cache[session_id] = "failed"
             _publish_status(session_id, "failed", error=detail)
 
+    async def _reconcile_host_runners(host_id: str, alive_runners: list[str]) -> None:
+        """Fail sessions orphaned while a host was disconnected.
+
+        The ``host.hello`` frame carries ``runners`` - the runner ids
+        alive on the host right now. A runner the DB still has bound to
+        this host but that is absent from that list died while the tunnel
+        was down, so its session(s) never got a ``host.runner_exited``
+        report (issue #1857) and the open view spins on "running"
+        forever. Fail those sessions through the same status path a
+        reported crash uses.
+
+        Only sessions actively depending on the runner right now are
+        touched (running / waiting / starting / ready) - the states that
+        genuinely cannot proceed once the runner is gone. A finished or
+        between-turns session rests at "idle" (there is no separate
+        "completed" cache status), so "idle" is left alone rather than
+        mislabeled failed; terminal ("failed") sessions and an unknown
+        status - an empty cache after a server restart - are skipped too.
+
+        :param host_id: The reconnecting host's id.
+        :param alive_runners: Runner ids the host reports as alive.
+        """
+        from omnigent.server.routes.sessions import (
+            _publish_status,
+            _session_status_cache,
+        )
+        from omnigent.server.schemas import ErrorDetail
+
+        bound = await asyncio.to_thread(conversation_store.list_runner_ids_for_host, host_id)
+        orphaned = bound - set(alive_runners)
+        if not orphaned:
+            return
+
+        # A finished or between-turns session rests at "idle" (there is no
+        # separate "completed" status), so failing "idle" would mislabel a
+        # done session; only fail the states that cannot proceed without
+        # the runner.
+        active_statuses = {"running", "waiting", "starting", "ready"}
+        detail = ErrorDetail(
+            code="runner_lost_while_host_offline",
+            message=(
+                "Host reconnected without this runner; the session was "
+                "lost while the host was disconnected."
+            ),
+        )
+        reconciled = 0
+        for runner_id in orphaned:
+            affected = [
+                c.id
+                for c in await asyncio.to_thread(
+                    conversation_store.list_conversations_by_runner_id, runner_id
+                )
+            ]
+            for session_id in affected:
+                if _session_status_cache.get(session_id) not in active_statuses:
+                    continue
+                _session_status_cache[session_id] = "failed"
+                _publish_status(session_id, "failed", error=detail)
+                reconciled += 1
+        _logger.warning(
+            "Host %s reconnected; failed %d session(s) across %d orphaned runner(s): %s",
+            host_id,
+            reconciled,
+            len(orphaned),
+            sorted(orphaned),
+        )
+
     async def _on_runner_connect(runner_id: str) -> None:
         """Re-assign sessions and restart SSE relays on reconnect.
 
@@ -2533,6 +2600,7 @@ def create_app(
                 auth_provider=auth_provider,
                 runner_exit_reports=runner_exit_reports,
                 on_runner_exited=_on_runner_exited,
+                on_host_reconcile=_reconcile_host_runners,
                 on_host_connect=_on_hosts_changed,
                 on_host_disconnect=_on_hosts_changed,
                 on_host_update=_on_hosts_changed,

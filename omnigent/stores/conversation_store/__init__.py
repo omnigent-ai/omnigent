@@ -1201,6 +1201,25 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def list_runner_ids_for_host(self, host_id: str) -> set[str]:
+        """
+        Return the distinct non-null runner ids bound to conversations
+        on ``host_id`` in the current workspace.
+
+        Used by the host tunnel's connect reconciliation to find runners
+        the DB still has bound that a reconnecting host no longer reports
+        in its ``host.hello`` ``runners`` list (issue #1857). Must be
+        read-after-write consistent with ``set_runner_id`` /
+        ``set_host_id`` for the same reason
+        :meth:`list_conversations_by_runner_id` is.
+
+        :param host_id: Stable host identifier, e.g.
+            ``"host_a1b2c3d4..."``.
+        :returns: Set of runner ids currently bound to the host.
+        """
+        ...
+
+    @abstractmethod
     def set_host_id(
         self,
         conversation_id: str,
