@@ -268,6 +268,47 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
 }
 
 
+# UI-installable harnesses: the identifiers the web UI's New Chat dialog may
+# request an install for, mapped to their :data:`_HARNESS_INSTALL` key. This is
+# the single source of truth shared by the host install handler (which resolves
+# the key to run the installer) and the server route (which allowlists the
+# request). Deliberately a small, explicit map rather than a reuse of
+# ``_HARNESS_NAME_TO_KEY``: that map is keyed on *executor* spellings and maps
+# the bare ``claude`` / ``codex`` / ``opencode`` spellings to SDK harnesses with
+# no CLI (``claude`` → ``claude-sdk``), whereas the UI install surface wants the
+# npm-installable CLI family. Scope: npm-installable, key/env-auth harnesses
+# only — curl/brew-installer harnesses (cursor, kimi, kiro, antigravity, goose)
+# and shell-installer harnesses (hermes, whose ``install_command`` would run a
+# ``curl | bash``) are intentionally absent, so an install request for them is
+# rejected before any installer runs.
+_UI_INSTALLABLE_HARNESS_TO_KEY: dict[str, str] = {
+    "claude": ANTHROPIC_FAMILY,
+    "codex": OPENAI_FAMILY,
+    PI_KEY: PI_KEY,
+    OPENCODE_KEY: OPENCODE_KEY,
+    QWEN_KEY: QWEN_KEY,
+}
+
+
+def ui_installable_harnesses() -> frozenset[str]:
+    """Return the set of harness identifiers the web UI may install.
+
+    :returns: The allowlist of UI-installable harness identifiers, e.g.
+        ``{"claude", "codex", "pi", "opencode", "qwen"}``.
+    """
+    return frozenset(_UI_INSTALLABLE_HARNESS_TO_KEY)
+
+
+def ui_install_key(harness: str) -> str | None:
+    """Resolve a UI-install harness identifier to its install-spec key.
+
+    :param harness: A harness identifier from the web UI, e.g. ``"claude"``.
+    :returns: The :data:`_HARNESS_INSTALL` key (e.g. ``"anthropic"``) when the
+        harness is UI-installable; ``None`` otherwise (caller rejects it).
+    """
+    return _UI_INSTALLABLE_HARNESS_TO_KEY.get(harness)
+
+
 def _all_harness_install() -> dict[str, HarnessInstallSpec]:
     from omnigent.harness_plugins import install_specs
 

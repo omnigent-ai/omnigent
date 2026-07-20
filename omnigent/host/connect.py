@@ -35,6 +35,8 @@ from omnigent.host.frames import (
     HostFsResultFrame,
     HostHarnessReadinessFrame,
     HostHelloFrame,
+    HostInstallHarnessFrame,
+    HostInstallHarnessResultFrame,
     HostLaunchRunnerFrame,
     HostLaunchRunnerResultFrame,
     HostListDirEntry,
@@ -61,7 +63,11 @@ from omnigent.host.git_worktree import (
     remove_worktree,
 )
 from omnigent.host.identity import HostIdentity, load_or_create_host_identity
-from omnigent.onboarding.harness_install import harness_setup_hint
+from omnigent.onboarding.harness_install import (
+    harness_setup_hint,
+    install_harness_cli_with_reason,
+    ui_install_key,
+)
 from omnigent.onboarding.harness_readiness import (
     configured_harness_map,
     harness_is_configured,
@@ -1558,6 +1564,49 @@ class HostProcess:
             path=created,
         )
 
+    def _handle_install_harness(
+        self, frame: HostInstallHarnessFrame
+    ) -> HostInstallHarnessResultFrame:
+        """Handle a ``host.install_harness`` request from the server.
+
+        Runs the same :func:`install_harness_cli_with_reason` the ``omnigent
+        setup`` wizard uses, then recomputes readiness so the result frame can
+        carry a fresh ``configured_harnesses`` map — letting the UI flip the
+        harness badge without waiting for a reconnect. Both the install and the
+        readiness recompute shell out / probe ``PATH``, so they run off the
+        event loop.
+
+        The server already allowlists the harness before sending this frame;
+        the extra ``ui_install_key`` guard here is defence in depth so a stray
+        or spoofed frame can never drive the installer for a non-allowlisted
+        harness (e.g. one whose installer is a ``curl | bash``).
+
+        :param frame: The install request frame. ``frame.harness`` is a UI
+            harness identifier, e.g. ``"claude"``.
+        :returns: Result frame with ``status`` ``"ok"``/``"failed"``, the
+            refreshed readiness map on success, and a reason on failure.
+        """
+        key = ui_install_key(frame.harness)
+        if key is None:
+            return HostInstallHarnessResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error=f"harness {frame.harness!r} is not installable from the UI",
+            )
+        installed, reason = install_harness_cli_with_reason(key)
+        if not installed:
+            return HostInstallHarnessResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error=reason or "install failed",
+            )
+        _logger.info("Installed harness %s via UI request", frame.harness)
+        return HostInstallHarnessResultFrame(
+            request_id=frame.request_id,
+            status="ok",
+            configured_harnesses=configured_harness_map(),
+        )
+
     def _handle_fs_request(self, frame: HostFsRequestFrame) -> HostFsResultFrame:
         """Serve a read-only workspace filesystem request from the host.
 
@@ -2199,6 +2248,11 @@ class HostProcess:
             await ws.send(encode_host_frame(self._handle_list_dir(frame)))
         elif isinstance(frame, HostCreateDirFrame):
             await ws.send(encode_host_frame(self._handle_create_dir(frame)))
+        elif isinstance(frame, HostInstallHarnessFrame):
+            # The installer shells out (npm) and can run for minutes, so run
+            # it off the event loop and reply when it completes.
+            result = await asyncio.to_thread(self._handle_install_harness, frame)
+            await ws.send(encode_host_frame(result))
         elif isinstance(frame, HostCreateWorktreeFrame):
             await ws.send(encode_host_frame(await self._handle_create_worktree(frame)))
         elif isinstance(frame, HostRemoveWorktreeFrame):
