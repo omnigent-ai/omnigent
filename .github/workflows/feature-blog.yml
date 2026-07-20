@@ -483,7 +483,7 @@ jobs:
             fi
 
             if [ -n "$post" ]; then
-              printf '\n---\n\n**Enjoying Omnigent?** If this is useful to you, [give us a star on GitHub ⭐](https://github.com/omnigent-ai/omnigent). Come say hi on [Discord](https://discord.gg/omnigent), or [download the latest release](https://omnigent.ai/download).\n' \
+              printf '\n---\n\n**Enjoying Omnigent?** If this is useful to you, [give us a star on GitHub ⭐](https://github.com/omnigent-ai/omnigent). Come say hi on [Discord](https://discord.gg/omnigent), or [check the latest release](https://omnigent.ai/releases).\n' \
                 >> "${SITE}/${post}"
             fi
 
