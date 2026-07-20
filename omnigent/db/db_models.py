@@ -1436,9 +1436,6 @@ class SqlScheduledTask(OmnigentBase):
         CheckConstraint("execution_target IN (1, 2)", name="ck_scheduled_tasks_execution_target"),
         Index("ix_scheduled_tasks_created_at", "workspace_id", "created_at", "id"),
         Index("ix_scheduled_tasks_owner_user_id", "workspace_id", "owner_user_id", "id"),
-        # Covers the scheduler's read path:
-        # WHERE workspace_id + state ORDER BY created_at, id.
-        Index("ix_scheduled_tasks_state", "workspace_id", "state", "created_at", "id"),
     )
 
 

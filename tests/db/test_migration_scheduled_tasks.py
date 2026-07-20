@@ -123,9 +123,13 @@ def test_expected_indexes(db_engine: Engine) -> None:
     assert {
         "ix_scheduled_tasks_created_at",
         "ix_scheduled_tasks_owner_user_id",
-        "ix_scheduled_tasks_state",
     } <= scheduled_tasks_idx
     assert "ix_scheduled_tasks_agent_id" not in scheduled_tasks_idx
+    # ix_scheduled_tasks_state was dropped: list_active's per-workspace shape
+    # has no production caller, and the boot-time list_active_all_workspaces
+    # scan is served by ix_scheduled_tasks_created_at with state as a residual
+    # filter (see migration e5c8b1f4a2d7).
+    assert "ix_scheduled_tasks_state" not in scheduled_tasks_idx
     runs_idx = {i["name"] for i in insp.get_indexes("scheduled_task_runs")}
     assert "ix_scheduled_task_runs_scheduled_task_id" in runs_idx
     runs_idx_cols = {
