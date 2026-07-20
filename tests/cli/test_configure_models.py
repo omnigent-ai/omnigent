@@ -1985,9 +1985,7 @@ def test_installed_native_cli_auth_unknown_rows_are_not_configured(
     assert descriptions[row_index]
 
 
-def test_overview_kimi_row_is_ready_when_login_is_detected(
-    isolated_config, monkeypatch
-) -> None:
+def test_overview_kimi_row_is_ready_when_login_is_detected(isolated_config, monkeypatch) -> None:
     """An installed, logged-in Kimi CLI is shown as ready in setup."""
     from rich.text import Text
 
