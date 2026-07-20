@@ -9,6 +9,7 @@ from omnigent.db.converters import sql_agent_to_entity
 from omnigent.db.db_models import (
     SqlAgent,
     SqlAgentConfiguration,
+    SqlConversation,
     current_workspace_id,
 )
 from omnigent.db.enum_codecs import encode_agent_kind
@@ -75,10 +76,19 @@ class SqlAlchemyAgentStore(AgentStore):
         with self._conv_session() as conv_sess:
             return conv_sess.execute(
                 select(SqlAgentConfiguration.conversation_id)
+                .join(
+                    SqlConversation,
+                    and_(
+                        SqlConversation.workspace_id == SqlAgentConfiguration.workspace_id,
+                        SqlConversation.id == SqlAgentConfiguration.conversation_id,
+                    ),
+                )
                 .where(
                     SqlAgentConfiguration.workspace_id == current_workspace_id(),
                     SqlAgentConfiguration.agent_id == agent_id,
                 )
+                # Named children break the one-conversation-per-agent assumption.
+                .order_by(asc(SqlConversation.created_at), asc(SqlConversation.id))
                 .limit(1)
             ).scalar_one_or_none()
 

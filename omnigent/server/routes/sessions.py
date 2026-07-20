@@ -12936,28 +12936,44 @@ async def _create_session_from_existing_agent(
             code=ErrorCode.NOT_FOUND,
         )
 
-    # Session-scoped agents belong to a specific session.
-    # The caller must have at least READ access to that owning
-    # session — otherwise they can execute another user's private
-    # agent by guessing the raw agent id.
-    if agent.session_id is not None:
-        await _require_access(
-            user_id,
-            agent.session_id,
-            LEVEL_READ,
-            permission_store,
-            conversation_store,
-        )
-
     # Authorize parent_session_id before inheriting anything.
     # The caller must own or have READ access to the parent session;
     # otherwise a forged parent link lets them inherit runner
     # bindings and establish a parent-child relationship with a
     # session they don't control.
+    named_child_uses_parent_agent = False
     if body.parent_session_id is not None:
         await _require_access(
             user_id,
             body.parent_session_id,
+            LEVEL_READ,
+            permission_store,
+            conversation_store,
+        )
+        if body.sub_agent_name is not None:
+            parent_conv = await asyncio.to_thread(
+                conversation_store.get_conversation,
+                body.parent_session_id,
+            )
+            if parent_conv is None:
+                raise OmnigentError(
+                    "Conversation not found",
+                    code=ErrorCode.NOT_FOUND,
+                )
+            if parent_conv.agent_id != body.agent_id:
+                raise OmnigentError(
+                    "Named sub-agent sessions must use the parent session's agent",
+                    code=ErrorCode.FORBIDDEN,
+                )
+            named_child_uses_parent_agent = True
+
+    # Session-scoped agents belong to a specific session. Named children
+    # reuse their authorized parent's agent, so that parent check is the
+    # ownership boundary; all other creates must authorize the owning session.
+    if agent.session_id is not None and not named_child_uses_parent_agent:
+        await _require_access(
+            user_id,
+            agent.session_id,
             LEVEL_READ,
             permission_store,
             conversation_store,
