@@ -64,6 +64,7 @@ from omnigent.host.git_worktree import (
 )
 from omnigent.host.identity import HostIdentity, load_or_create_host_identity
 from omnigent.onboarding.harness_install import (
+    harness_cli_installed,
     harness_setup_hint,
     install_harness_cli_with_reason,
     ui_install_key,
@@ -1581,6 +1582,11 @@ class HostProcess:
         or spoofed frame can never drive the installer for a non-allowlisted
         harness (e.g. one whose installer is a ``curl | bash``).
 
+        Idempotent: when the CLI is already on ``PATH`` the installer is
+        skipped entirely — ``npm install -g`` re-resolves the package over the
+        network and can take minutes even for an already-present binary, so a
+        re-request just recomputes and returns readiness.
+
         :param frame: The install request frame. ``frame.harness`` is a UI
             harness identifier, e.g. ``"claude"``.
         :returns: Result frame with ``status`` ``"ok"``/``"failed"``, the
@@ -1592,6 +1598,15 @@ class HostProcess:
                 request_id=frame.request_id,
                 status="failed",
                 error=f"harness {frame.harness!r} is not installable from the UI",
+            )
+        if harness_cli_installed(key):
+            # Already installed — skip the slow npm re-resolve and just report
+            # current readiness (which may still be "needs-auth", e.g. codex).
+            _logger.info("Harness %s already installed; skipping install", frame.harness)
+            return HostInstallHarnessResultFrame(
+                request_id=frame.request_id,
+                status="ok",
+                configured_harnesses=configured_harness_map(),
             )
         installed, reason = install_harness_cli_with_reason(key)
         if not installed:

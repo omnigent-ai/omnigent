@@ -2059,6 +2059,8 @@ def test_handle_install_harness_success_returns_refreshed_readiness(
     """
     import omnigent.host.connect as connect
 
+    # Not yet installed, so the handler runs the installer.
+    monkeypatch.setattr(connect, "harness_cli_installed", lambda key: False)
     monkeypatch.setattr(connect, "install_harness_cli_with_reason", lambda key: (True, None))
     monkeypatch.setattr(
         connect,
@@ -2077,6 +2079,36 @@ def test_handle_install_harness_success_returns_refreshed_readiness(
     assert result.configured_harnesses == {"claude-native": True, "codex-native": "needs-auth"}
 
 
+def test_handle_install_harness_already_installed_skips_installer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An already-installed harness returns fresh readiness without running npm.
+
+    ``npm install -g`` re-resolves over the network and can take minutes even
+    when the binary is already present, so a re-request must short-circuit —
+    otherwise a user clicking Install on an installed harness waits pointlessly
+    (and can hit the request timeout).
+    """
+    import omnigent.host.connect as connect
+
+    monkeypatch.setattr(connect, "harness_cli_installed", lambda key: True)
+
+    def _must_not_install(key: str) -> tuple[bool, str | None]:
+        raise AssertionError("installer ran despite the harness already being installed")
+
+    monkeypatch.setattr(connect, "install_harness_cli_with_reason", _must_not_install)
+    monkeypatch.setattr(connect, "configured_harness_map", lambda: {"opencode-native": True})
+
+    host = _make_host_process()
+    result = host._handle_install_harness(
+        HostInstallHarnessFrame(request_id="i0", harness="opencode")
+    )
+
+    assert result.status == "ok"
+    assert result.configured_harnesses == {"opencode-native": True}
+
+
 def test_handle_install_harness_failure_surfaces_reason(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2086,6 +2118,7 @@ def test_handle_install_harness_failure_surfaces_reason(
     """
     import omnigent.host.connect as connect
 
+    monkeypatch.setattr(connect, "harness_cli_installed", lambda key: False)
     monkeypatch.setattr(
         connect,
         "install_harness_cli_with_reason",

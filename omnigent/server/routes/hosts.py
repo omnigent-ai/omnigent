@@ -64,10 +64,14 @@ _LIST_DIR_MAX_LIMIT = 1000
 # for transient network slowness without making the picker feel hung.
 _CREATE_DIR_TIMEOUT_S = 5.0
 # Per-call timeout for host.install_harness round-trips. The host runs
-# `npm install -g <pkg>` (install_harness_cli caps the subprocess at 300s),
-# then recomputes readiness — so the server must wait longer than that
-# ceiling to receive the result before giving up.
-_INSTALL_HARNESS_TIMEOUT_S = 330.0
+# `npm install -g <pkg>` — install_harness_cli caps that subprocess at 300s —
+# then recomputes readiness and sends the result back over the tunnel. The
+# server must wait comfortably longer than the 300s subprocess ceiling, not
+# just a hair over it: a cold npm install can run near the full cap, and the
+# readiness recompute + tunnel round-trip add more on top. 420s (300s + 2min
+# headroom) keeps a genuine slow install from timing out at the server while
+# the host is still succeeding — a "504 but actually installed" outcome.
+_INSTALL_HARNESS_TIMEOUT_S = 420.0
 
 
 async def _proxy_list_dir(
