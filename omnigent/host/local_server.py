@@ -28,6 +28,7 @@ from pathlib import Path
 import click
 import psutil
 
+from omnigent.config import global_config_path
 from omnigent.inner import _proc
 from omnigent.process_logging import (
     PROCESS_LOG_FILE_ENV_VAR,
@@ -661,6 +662,7 @@ def _spawn_local_server(port: int) -> _SpawnedLocalServer:
                     db_uri,
                     "--artifact-location",
                     str(artifact_path),
+                    *(["--config", str(p)] if (p := global_config_path()).exists() else []),
                 ],
                 env=child_env,
                 stdout=log_fh,
