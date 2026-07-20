@@ -140,6 +140,13 @@ _HEALTH_BODY = {"sessions": {_SESSION_ID: {"runner_online": True, "host_online":
 _DONE_SSE = "data: [DONE]\n\n"
 
 _BUBBLE = '[data-testid="message-bubble"]'
+# Shiki now loads from a lazy chunk, so the fenced block first paints as raw
+# (uncolored) text and only re-renders with per-token colored spans once the
+# deferred `@streamdown/code` import resolves. Streamdown emits one span per
+# highlighted token carrying its color via the `--sdm-c` custom property; the
+# raw path has none. Waiting for these before capture keeps the render (and thus
+# the baseline) syntax-highlighted instead of racing the lazy import.
+_TOKEN_SPANS = '[data-streamdown="code-block-body"] span[style*="--sdm-c"]'
 
 
 @pytest.mark.visual
@@ -187,6 +194,16 @@ def test_chat_conversation_matches_baseline(
     expect(page.locator(f'{_BUBBLE}[data-role="assistant"]')).to_be_visible(timeout=30_000)
     # No live turn is in flight, so the working shimmer must be absent.
     expect(page.locator('[data-testid="working-indicator"]')).to_have_count(0)
+
+    # Shiki loads lazily now: wait for the fenced block to re-render with
+    # syntax-highlighted token spans so the capture isn't the raw pre-highlight
+    # frame (which would drift from the committed, highlighted baseline).
+    token_spans = page.locator(_TOKEN_SPANS)
+    expect(token_spans.first).to_be_visible(timeout=30_000)
+    page.wait_for_function(
+        "() => document.querySelectorAll('" + _TOKEN_SPANS.replace("'", "\\'") + "').length > 1",
+        timeout=30_000,
+    )
 
     # Settle web fonts + kill the blinking caret (both time-dependent).
     settle_for_snapshot(page)
