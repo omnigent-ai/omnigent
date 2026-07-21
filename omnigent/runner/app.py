@@ -7986,14 +7986,43 @@ def create_runner_app(
         )
 
     async def _ensure_native_terminal_for_turn(conv_id: str, harness_name: str | None) -> None:
+        """Re-create a reaped native pane before forwarding a turn (#1349 self-heal).
+
+        The native-pane idle reaper may reclaim an idle pane while a session sits
+        between turns. ``NativeServerHarness.run_turn`` forwards into the live
+        pane and assumes it exists, so a turn arriving WITHOUT a client handshake
+        (a sub-agent or API forward to a long-idle session) would otherwise inject
+        into a dead tmux target and lose the message. This re-ensures the pane
+        first. Idempotent: a no-op when the harness is not a native CLI harness or
+        the pane is already live. Reuses ``create_session_terminal``'s
+        ``ensure_native_terminal`` path, so the pane resumes via the vendor CLI's
+        own ``--resume`` (no fresh-start, no lost history).
+
+        Detection has two layers: (1) the reaper POPPING the registry entry
+        when it reaps (``registry.close()`` -> ``get()`` returns ``None``),
+        and (2) an ``is_alive()`` probe when the registry entry exists, catching
+        crashed-but-registered panes (tmux killed externally without
+        ``close()``). The probe runs only when a turn arrives, not on a
+        poll. Every native short-name this can target has a matching
+        ``ensure_native_terminal`` branch in ``create_session_terminal``
+        (kept in lockstep with ``harness_aliases.NATIVE_HARNESSES``).
+        """
         terminal_name = native_terminal_name(harness_name)
         if terminal_name is None:
             return
         terminal_registry = resource_registry.terminal_registry if resource_registry else None
         if terminal_registry is None:
             return
-        if terminal_registry.get(conv_id, terminal_name, "main") is not None:
-            return  # a pane is still registered — nothing to heal
+        instance = terminal_registry.get(conv_id, terminal_name, "main")
+        if instance is not None:
+            if await instance.is_alive():
+                return  # pane is registered and alive — nothing to heal
+            _logger.info(
+                "native pane registered but dead for conv=%s harness=%s; closing stale entry",
+                conv_id,
+                harness_name,
+            )
+            await terminal_registry.close(conv_id, terminal_name, "main")
         _logger.info(
             "native pane missing for conv=%s harness=%s; re-ensuring before turn (#1349)",
             conv_id,
