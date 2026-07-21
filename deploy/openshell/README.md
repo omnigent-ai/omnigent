@@ -58,9 +58,9 @@ curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | 
 > **The gateway host must be amd64 Linux.** OpenShell's supervisor
 > (Landlock/seccomp/netns) does not run reliably under emulation — on an arm64
 > host (e.g. Apple Silicon via colima) the sandbox never reaches READY. The
-> official host image now publishes multi-arch (amd64 + arm64), but its arm64
-> variant omits `cel-expr-python` (no linux-arm64 wheel — CEL policies degrade to
-> unavailable there), so the amd64 variant is the one to run with OpenShell. On an
+> official host image now publishes multi-arch (amd64 + arm64). CEL policies are
+> available on all architectures (cel-python is pure Python), so the amd64 variant
+> is the one to run with OpenShell for supervisor reasons. On an
 > Apple-Silicon laptop, point the gateway at a remote **amd64 Linux** box (and the
 > server at that gateway) rather than the local Docker VM.
 
