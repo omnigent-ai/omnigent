@@ -12,11 +12,13 @@ from omnigent.claude_native_bridge import read_transcript_items_from_offset
 from omnigent.codex_native import _CODEX_THREAD_ID_RE, _find_codex_rollout
 from omnigent.entities import NewConversationItem, parse_item_data
 from omnigent.kimi_native_credentials import resolve_user_kimi_home
-from omnigent.kimi_native_forwarder import _read_new_items as _read_new_kimi_items
-from omnigent.kimi_native_forwarder import _workdirs_for_sessions
+from omnigent.kimi_native_forwarder import (
+    read_kimi_wire_items,
+    workdirs_for_kimi_sessions,
+)
 from omnigent.kiro_native_session_forwarder import (
-    _kiro_cli_sessions_dir,
-    _parse_kiro_jsonl_line,
+    kiro_cli_sessions_dir,
+    parse_kiro_jsonl_line,
 )
 from omnigent.session_import.models import (
     ImportSource,
@@ -26,6 +28,17 @@ from omnigent.session_import.models import (
 
 _PI_IMPORT_SESSION_ID_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?")
 _MAX_EXTERNAL_SESSION_ID_LENGTH = 128
+_MAX_RESPONSE_ID_LENGTH = 64
+
+
+def _bounded_response_id(response_id: str) -> str:
+    """Keep short native ids readable and hash long ids without collisions."""
+    if len(response_id) <= _MAX_RESPONSE_ID_LENGTH:
+        return response_id
+    harness, separator, _ = response_id.partition(":")
+    prefix = f"{harness}:sha256:" if separator else "sha256:"
+    digest_length = _MAX_RESPONSE_ID_LENGTH - len(prefix)
+    return prefix + sha256(response_id.encode()).hexdigest()[:digest_length]
 
 
 def _find_transcript(root: Path, session_id: str) -> Path | None:
@@ -83,10 +96,15 @@ def _is_safe_pi_import_session_id(session_id: str) -> bool:
 def _qwen_session_locator(path: Path) -> str:
     """Qualify a Qwen id by project while staying within API limits."""
     project = path.parent.parent.name
-    locator = f"{project}:{path.stem}"
+    session_id = path.stem
+    locator = f"{project}:{session_id}"
     if len(locator) <= _MAX_EXTERNAL_SESSION_ID_LENGTH:
         return locator
-    return f"{sha256(project.encode()).hexdigest()[:16]}:{path.stem}"
+    project_digest = sha256(project.encode()).hexdigest()[:16]
+    locator = f"{project_digest}:{session_id}"
+    if len(locator) <= _MAX_EXTERNAL_SESSION_ID_LENGTH:
+        return locator
+    return f"{project_digest}:{sha256(session_id.encode()).hexdigest()}"
 
 
 def list_recent_local_session_ids(
@@ -114,7 +132,7 @@ def list_recent_local_session_ids(
         return _recent_unique_session_ids(candidates, limit=limit)
 
     if source == "kiro":
-        root = _kiro_cli_sessions_dir()
+        root = kiro_cli_sessions_dir()
         candidates = [
             (path, path.stem)
             for path in root.glob("*.jsonl")
@@ -129,6 +147,7 @@ def list_recent_local_session_ids(
             if configured_home
             else Path.home() / ".pi" / "agent"
         )
+        # Pi stores ids in the header, so discovery intentionally reads one line per file.
         candidates = [
             (path, session_id)
             for path in (home / "sessions").rglob("*.jsonl")
@@ -394,6 +413,7 @@ def load_codex_session(
 
 def _qwen_message_data(record: dict[str, object]) -> dict[str, object] | None:
     """Convert one visible Qwen recording row to Omnigent message data."""
+    # Qwen records assistant events as type="assistant" while message.role is "model".
     record_type = record.get("type")
     if record_type == "user":
         role = "user"
@@ -501,7 +521,7 @@ def load_qwen_session(
         items.append(
             NewConversationItem(
                 type="message",
-                response_id=response_id[:64],
+                response_id=_bounded_response_id(response_id),
                 data=parse_item_data("message", data),
             )
         )
@@ -523,7 +543,7 @@ def load_kiro_session(
     kiro_home: Path | None = None,
 ) -> LocalSessionImport:
     """Load one Kiro CLI session from its metadata and JSONL transcript."""
-    root = _kiro_cli_sessions_dir(kiro_home)
+    root = kiro_cli_sessions_dir(kiro_home)
     transcript_path = next(
         (path for path in root.glob("*.jsonl") if path.is_file() and path.stem == session_id),
         None,
@@ -545,7 +565,7 @@ def load_kiro_session(
         messages = [
             message
             for line in transcript_path.read_text(encoding="utf-8").splitlines()
-            if (message := _parse_kiro_jsonl_line(line)) is not None
+            if (message := parse_kiro_jsonl_line(line)) is not None
         ]
     except OSError as exc:
         raise SessionImportNotFoundError(
@@ -554,7 +574,7 @@ def load_kiro_session(
     items = tuple(
         NewConversationItem(
             type="message",
-            response_id=f"kiro:{message.message_id}"[:64],
+            response_id=_bounded_response_id(f"kiro:{message.message_id}"),
             data=parse_item_data(
                 "message",
                 {
@@ -686,7 +706,7 @@ def _pi_message_items(record: dict[str, object]) -> tuple[NewConversationItem, .
         return (
             NewConversationItem(
                 type="message",
-                response_id=response_id[:64],
+                response_id=_bounded_response_id(response_id),
                 data=parse_item_data(
                     "message",
                     {
@@ -719,7 +739,7 @@ def _pi_message_items(record: dict[str, object]) -> tuple[NewConversationItem, .
         return (
             NewConversationItem(
                 type="function_call_output",
-                response_id=response_id[:64],
+                response_id=_bounded_response_id(response_id),
                 data=parse_item_data(
                     "function_call_output",
                     {"call_id": call_id, "output": _pi_text(message.get("content"))},
@@ -738,7 +758,7 @@ def _pi_message_items(record: dict[str, object]) -> tuple[NewConversationItem, .
         items.append(
             NewConversationItem(
                 type="message",
-                response_id=response_id[:64],
+                response_id=_bounded_response_id(response_id),
                 data=parse_item_data(
                     "message",
                     {"role": "user", "content": normalized},
@@ -762,7 +782,7 @@ def _pi_message_items(record: dict[str, object]) -> tuple[NewConversationItem, .
         items.append(
             NewConversationItem(
                 type="message",
-                response_id=response_id[:64],
+                response_id=_bounded_response_id(response_id),
                 data=parse_item_data("message", data),
             )
         )
@@ -796,10 +816,11 @@ def _pi_message_items(record: dict[str, object]) -> tuple[NewConversationItem, .
                 if isinstance(arguments, str)
                 else json.dumps(arguments if arguments is not None else {}, separators=(",", ":"))
             )
+            # Only message items support interrupted state; retain aborted-turn tool calls.
             items.append(
                 NewConversationItem(
                     type="function_call",
-                    response_id=response_id[:64],
+                    response_id=_bounded_response_id(response_id),
                     data=parse_item_data(
                         "function_call",
                         {
@@ -885,13 +906,13 @@ def load_kimi_session(
         )
     wire_path = matches[0]
     session_dir = wire_path.parent.parent.parent
-    workspace_value = _workdirs_for_sessions(home).get(str(session_dir))
+    workspace_value = workdirs_for_kimi_sessions(home).get(str(session_dir))
     workspace = workspace_value.strip() if isinstance(workspace_value, str) else None
-    mirrored = _read_new_kimi_items(wire_path, 0)
+    mirrored = read_kimi_wire_items(wire_path, 0)
     items = tuple(
         NewConversationItem(
             type="message",
-            response_id=item.response_id[:64],
+            response_id=_bounded_response_id(item.response_id),
             data=parse_item_data(
                 "message",
                 {

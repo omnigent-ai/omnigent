@@ -8,6 +8,11 @@ from pathlib import Path
 
 import pytest
 
+from omnigent.kimi_native_forwarder import KimiWireItem, read_kimi_wire_items
+from omnigent.kiro_native_session_forwarder import (
+    KiroConversationMessage,
+    parse_kiro_jsonl_line,
+)
 from omnigent.session_import.local import (
     list_recent_local_session_ids,
     load_claude_session,
@@ -18,6 +23,149 @@ from omnigent.session_import.local import (
     load_qwen_session,
 )
 from omnigent.session_import.models import SessionImportNotFoundError
+
+
+def test_import_adapters_use_stable_forwarder_parser_contracts(tmp_path: Path) -> None:
+    """Shared Kiro and Kimi parsers expose the fields offline import consumes."""
+    kiro = parse_kiro_jsonl_line(
+        json.dumps(
+            {
+                "kind": "Prompt",
+                "data": {
+                    "message_id": "kiro-1",
+                    "content": [{"kind": "text", "data": "hello"}],
+                },
+            }
+        )
+    )
+    assert kiro == KiroConversationMessage(message_id="kiro-1", role="user", text="hello")
+
+    wire = tmp_path / "wire.jsonl"
+    wire.write_text(
+        json.dumps(
+            {
+                "type": "turn.prompt",
+                "origin": {"kind": "user"},
+                "input": [{"type": "text", "text": "hello"}],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    items = read_kimi_wire_items(wire, 0)
+    assert items == [
+        KimiWireItem(
+            line_no=0,
+            kind="message",
+            role="user",
+            text="hello",
+            response_id="kimi:turn:0",
+        )
+    ]
+
+
+@pytest.mark.parametrize("source", ["qwen", "kiro", "pi", "kimi"])
+def test_long_source_ids_get_distinct_bounded_response_ids(
+    tmp_path: Path,
+    source: str,
+) -> None:
+    """Long native entry ids remain distinct after normalization."""
+    native_ids = ("x" * 100 + "a", "x" * 100 + "b")
+    if source == "qwen":
+        home = tmp_path / "qwen"
+        session_id = "qwen-session"
+        transcript = home / "projects" / "-repo" / "chats" / f"{session_id}.jsonl"
+        records = [
+            {
+                "uuid": native_ids[0],
+                "parentUuid": None,
+                "type": "user",
+                "message": {"parts": [{"text": "first"}]},
+            },
+            {
+                "uuid": native_ids[1],
+                "parentUuid": native_ids[0],
+                "type": "assistant",
+                "message": {"parts": [{"text": "second"}]},
+            },
+        ]
+        loader = load_qwen_session
+        loader_kwargs = {"qwen_home": home}
+    elif source == "kiro":
+        home = tmp_path / "kiro"
+        session_id = "kiro-session"
+        root = home / ".kiro" / "sessions" / "cli"
+        transcript = root / f"{session_id}.jsonl"
+        root.mkdir(parents=True)
+        (root / f"{session_id}.json").write_text("{}\n", encoding="utf-8")
+        records = [
+            {
+                "kind": kind,
+                "data": {
+                    "message_id": native_id,
+                    "content": [{"kind": "text", "data": text}],
+                },
+            }
+            for kind, native_id, text in zip(
+                ("Prompt", "AssistantMessage"),
+                native_ids,
+                ("first", "second"),
+                strict=True,
+            )
+        ]
+        loader = load_kiro_session
+        loader_kwargs = {"kiro_home": home}
+    elif source == "pi":
+        home = tmp_path / "pi"
+        session_id = "pi-session"
+        transcript = home / "sessions" / "--repo--" / f"stamp_{session_id}.jsonl"
+        records = [
+            {"type": "session", "version": 3, "id": session_id},
+            {
+                "type": "message",
+                "id": native_ids[0],
+                "parentId": None,
+                "message": {"role": "user", "content": "first"},
+            },
+            {
+                "type": "message",
+                "id": native_ids[1],
+                "parentId": native_ids[0],
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "second"}],
+                },
+            },
+        ]
+        loader = load_pi_session
+        loader_kwargs = {"pi_home": home}
+    else:
+        home = tmp_path / "kimi"
+        session_id = "session_long_ids"
+        transcript = home / "sessions" / "wd_repo" / session_id / "agents" / "main" / "wire.jsonl"
+        records = [
+            {
+                "type": "context.append_loop_event",
+                "event": {
+                    "type": "content.part",
+                    "uuid": native_id,
+                    "part": {"type": "text", "text": text},
+                },
+            }
+            for native_id, text in zip(native_ids, ("first", "second"), strict=True)
+        ]
+        loader = load_kimi_session
+        loader_kwargs = {"kimi_home": home}
+
+    transcript.parent.mkdir(parents=True, exist_ok=True)
+    transcript.write_text(
+        "".join(f"{json.dumps(record)}\n" for record in records), encoding="utf-8"
+    )
+
+    response_ids = [item.response_id for item in loader(session_id, **loader_kwargs).items]
+    assert len(response_ids) == 2
+    assert response_ids[0] != response_ids[1]
+    assert all(len(response_id) <= 64 for response_id in response_ids)
 
 
 def test_load_claude_session_normalizes_parent_transcript(tmp_path: Path) -> None:
@@ -518,6 +666,31 @@ def test_list_recent_qwen_sessions_scans_projects(tmp_path: Path, monkeypatch) -
     recent = list_recent_local_session_ids("qwen", limit=2)
 
     assert recent == ("-new:new", "-middle:middle")
+
+
+def test_qwen_locator_bounds_an_overlong_session_stem(tmp_path: Path, monkeypatch) -> None:
+    """Canonical Qwen identity always fits the import API's 128-char limit."""
+    monkeypatch.setenv("QWEN_HOME", str(tmp_path))
+    session_id = "s" * 180
+    transcript = tmp_path / "projects" / "-repo" / "chats" / f"{session_id}.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text(
+        json.dumps(
+            {
+                "uuid": "user-1",
+                "type": "user",
+                "message": {"parts": [{"text": "hello"}]},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    (locator,) = list_recent_local_session_ids("qwen", limit=1)
+    imported = load_qwen_session(locator, qwen_home=tmp_path)
+
+    assert len(locator) <= 128
+    assert imported.external_session_id == locator
 
 
 def test_load_kiro_session_uses_metadata_and_visible_messages(tmp_path: Path) -> None:
