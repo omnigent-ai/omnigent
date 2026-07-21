@@ -1296,3 +1296,62 @@ async def test_delete_missing_host_is_idempotent(
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.delete("/v1/hosts/host_never_existed_xyz")
     assert resp.status_code == 204
+
+
+async def test_delete_managed_host_refused(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """
+    DELETE refuses an offline MANAGED host (403).
+
+    Its row is the sandbox's credential and only ``terminate_managed_host``
+    terminates the VM first, so pruning it here would orphan a running
+    sandbox and strand any session that would relaunch it.
+    """
+    app, _reg, host_store, _cs = host_api_app
+    host_store.register_managed_host(
+        host_id="host_managed_prune",
+        name="managed-prune",
+        # Auth is disabled in this fixture, so the caller resolves to the
+        # reserved "local" owner.
+        owner="local",
+        token="launch-token-secret",
+        provider="modal",
+        sandbox_id="sb-12345",
+        token_expires_at=int(time.time()) + 3600,
+    )
+    # Registered offline already — the guard must fire on the provider,
+    # not on liveness.
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.delete("/v1/hosts/host_managed_prune")
+    assert resp.status_code == 403, (
+        f"Expected 403 for a managed host, got {resp.status_code}. "
+        "Deleting the row without terminating leaks the sandbox."
+    )
+    assert host_store.get_host("host_managed_prune") is not None
+
+
+async def test_delete_host_403_wrong_owner(
+    multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """
+    DELETE /v1/hosts/{id} returns 403 when the requesting user doesn't
+    own the host.
+
+    If it returns 204, any user can prune another user's hosts and
+    unbind their sessions.
+    """
+    _app, _reg, host_store, _cs = multi_user_app
+    host_store.upsert_on_connect("host_alice4", "alice-laptop", "alice@test.com")
+
+    async with AsyncClient(transport=ASGITransport(app=_app), base_url="http://test") as client:
+        resp = await client.delete(
+            "/v1/hosts/host_alice4",
+            headers={"x-test-user": "bob@test.com"},
+        )
+    assert resp.status_code == 403, (
+        f"Expected 403 for wrong owner, got {resp.status_code}. "
+        "Owner check on DELETE /v1/hosts/{{id}} is missing."
+    )
+    # Bob must not be able to delete Alice's host.
+    assert host_store.get_host("host_alice4") is not None
