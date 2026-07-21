@@ -23,6 +23,7 @@ import pytest
 
 from omnigent import crash_handler as ch
 from omnigent import crash_ui
+from omnigent.version import VERSION
 
 
 # --------------------------------------------------------------------------- #
@@ -66,7 +67,7 @@ def test_build_report_contains_required_fields(data_dir: Path) -> None:
     )
     assert "# Crash Report — omnigent" in report
     assert "ValueError" in report
-    assert "omnigent 0.6.0.dev0" in report or "omnigent unknown" in report  # version line
+    assert f"omnigent {VERSION}" in report or "omnigent unknown" in report  # version line
     assert "https://github.com/omnigent-ai/omnigent" in report
     assert "Source:** uncaught" in report
     assert "the frobnicator failed" in report

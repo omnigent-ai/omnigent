@@ -14,11 +14,12 @@ import argparse
 from pathlib import Path
 from typing import cast
 
+import httpx
 import pytest
 
 from dev.benchmarks.omnigent import run as bench_run
 from dev.benchmarks.omnigent.environment import BenchEnvironment
-from dev.benchmarks.omnigent.journeys import ALL_JOURNEYS, Journey, run_latency
+from dev.benchmarks.omnigent.journeys import ALL_JOURNEYS, Journey, run_latency, run_throughput
 from dev.benchmarks.omnigent.measure import RunResult, aggregate, check_thresholds
 from dev.benchmarks.omnigent.schema import SCHEMA_VERSION, build_report
 
@@ -83,19 +84,91 @@ def test_aggregate_summary_keys() -> None:
     run_rows = cast(list[dict[str, object]], block["runs"])
     assert len(run_rows) == 2
     assert set(_d(block["summary"])) == {
+        "runs_total",
+        "runs_ok",
         "avg_mean_ms",
         "avg_p50_ms",
         "avg_p95_ms",
         "avg_p99_ms",
         "avg_rps",
     }
+    assert _d(block["summary"])["runs_total"] == 2
+    assert _d(block["summary"])["runs_ok"] == 2
     assert run_rows[0]["n_success"] == 2
+
+
+def test_aggregate_excludes_fully_failed_run_from_summary() -> None:
+    """A run where every op failed doesn't drag the averages toward zero."""
+    good = RunResult(latencies_ms=[10.0, 10.0], wall_time=1.0)
+    failed = RunResult(wall_time=1.0)  # no successes
+    failed.record_failure("HTTP 500")
+    block = aggregate([good, failed])
+
+    summary = _d(block["summary"])
+    assert summary["runs_total"] == 2
+    assert summary["runs_ok"] == 1
+    # Averaged over the one successful run only — not (10 + 0) / 2 = 5.
+    assert summary["avg_p50_ms"] == 10.0
+    # The failed run is still visible in the per-run detail.
+    run_rows = cast(list[dict[str, object]], block["runs"])
+    assert run_rows[1]["n_failures"] == 1
+    assert run_rows[1]["n_success"] == 0
+
+
+def test_aggregate_all_failed_runs_has_no_metric_keys() -> None:
+    """When every run failed, the summary carries counts but no fake metrics."""
+    failed = RunResult(wall_time=1.0)
+    failed.record_failure("HTTP 500")
+    block = aggregate([failed])
+    summary = _d(block["summary"])
+    assert summary == {"runs_total": 1, "runs_ok": 0}
 
 
 def test_check_thresholds_pass_and_fail() -> None:
     runs = [RunResult(latencies_ms=[10.0, 10.0], wall_time=1.0)]
     assert check_thresholds(runs, min_rps=None, max_p50_ms=1000.0, max_p99_ms=None)
     assert not check_thresholds(runs, min_rps=None, max_p50_ms=0.001, max_p99_ms=None)
+
+
+def test_check_thresholds_ignores_failed_run() -> None:
+    """A fully-failed run's zeros don't fabricate a passing (or failing) p50."""
+    good = RunResult(latencies_ms=[10.0, 10.0], wall_time=1.0)
+    failed = RunResult(wall_time=1.0)
+    failed.record_failure("HTTP 500")
+    # p50 over the successful run is 10ms — a 20ms bound passes despite the
+    # failed run's 0.0 (which would otherwise pull the average to 5ms).
+    assert check_thresholds([good, failed], min_rps=None, max_p50_ms=20.0, max_p99_ms=None)
+
+
+def test_check_thresholds_all_failed_fails_when_gated() -> None:
+    """No successful sample + a supplied threshold can't be verified → fail."""
+    failed = RunResult(wall_time=1.0)
+    failed.record_failure("HTTP 500")
+    # With a threshold supplied, an all-failed journey fails the gate.
+    assert not check_thresholds([failed], min_rps=None, max_p50_ms=1000.0, max_p99_ms=None)
+    # With no threshold supplied, resilience wins — it's vacuously fine.
+    assert check_thresholds([failed], min_rps=None, max_p50_ms=None, max_p99_ms=None)
+
+
+def test_skipped_block_shape() -> None:
+    """A skipped journey keeps the report shape but carries no fake metrics."""
+    journey = ALL_JOURNEYS["fork_session"]
+    block = bench_run._skipped_block(journey, "postgres", RuntimeError("boom"))
+    assert block["skipped"] is True
+    assert block["runs"] == []
+    assert block["summary"] == {}
+    assert block["backend"] == "postgres"
+    assert block["needs_runner"] is journey.needs_runner
+    assert block["error"] == "RuntimeError: boom"
+
+
+def test_thresholds_supplied() -> None:
+    assert not bench_run._thresholds_supplied(
+        argparse.Namespace(min_rps=None, max_p50_ms=None, max_p99_ms=None)
+    )
+    assert bench_run._thresholds_supplied(
+        argparse.Namespace(min_rps=None, max_p50_ms=25.0, max_p99_ms=None)
+    )
 
 
 def test_build_report_shape() -> None:
@@ -196,6 +269,73 @@ async def test_latency_prepare_runs_before_warmup_and_timed_operations() -> None
     ]
 
 
+def _http_status_error(status_code: int) -> httpx.HTTPStatusError:
+    """Build an ``HTTPStatusError`` like ``raise_for_status`` raises."""
+    request = httpx.Request("GET", "http://localhost/v1/sessions")
+    response = httpx.Response(status_code, request=request)
+    return httpx.HTTPStatusError("boom", request=request, response=response)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("runner", [run_latency, run_throughput])
+async def test_setup_failure_is_recorded_not_raised(runner: object) -> None:
+    """A journey whose setup raises yields a failed run, not a crash.
+
+    This is the exact failure from the field: ``_setup_target_session`` calling
+    ``raise_for_status()`` on a 500. Before the fix it propagated and aborted
+    the whole suite; now it is recorded as a failed run.
+    """
+
+    async def _setup(_env: BenchEnvironment) -> object:
+        raise _http_status_error(500)
+
+    async def _measure(_env: BenchEnvironment, _ctx: object) -> None:  # pragma: no cover
+        raise AssertionError("measure must not run when setup failed")
+
+    journey = Journey(name="broken-setup", kind="latency", setup=_setup, measure=_measure)
+    result = await runner(  # type: ignore[operator]
+        journey,
+        cast(BenchEnvironment, object()),
+        **({"iterations": 3} if runner is run_latency else {"requests": 3, "concurrency": 2}),
+        warmup=1,
+    )
+
+    assert result.n_success == 0
+    assert result.n_failures == 1  # one failed run, not one-per-iteration
+    assert result.failures == {"setup: HTTP 500": 1}
+
+
+@pytest.mark.asyncio
+async def test_teardown_failure_does_not_mask_results() -> None:
+    """A teardown that raises is suppressed — the run's results still return."""
+
+    async def _measure(_env: BenchEnvironment, _ctx: object) -> None:
+        return None
+
+    async def _teardown(_env: BenchEnvironment, _ctx: object) -> None:
+        raise RuntimeError("teardown blew up")
+
+    journey = Journey(name="broken-teardown", kind="latency", measure=_measure, teardown=_teardown)
+    result = await run_latency(journey, cast(BenchEnvironment, object()), iterations=2, warmup=0)
+    assert result.n_success == 2
+
+
+@pytest.mark.asyncio
+async def test_operation_failure_is_recorded_per_op() -> None:
+    """A measure op that raises records one failure per op and keeps timing."""
+    calls = {"n": 0}
+
+    async def _measure(_env: BenchEnvironment, _ctx: object) -> None:
+        calls["n"] += 1
+        if calls["n"] == 2:  # fail exactly one timed op (warmup=0)
+            raise _http_status_error(503)
+
+    journey = Journey(name="flaky", kind="latency", measure=_measure)
+    result = await run_latency(journey, cast(BenchEnvironment, object()), iterations=3, warmup=0)
+    assert result.n_success == 2
+    assert result.failures == {"HTTP 503": 1}
+
+
 # ── end-to-end smoke (boots the server) ──────────────────────
 
 
@@ -231,6 +371,59 @@ async def test_benchmark_smoke_threshold_failure_exits_nonzero() -> None:
     """An impossible p50 bound trips the threshold gate (passed=False)."""
     _, passed = await bench_run.run_benchmark(
         _smoke_args(journeys=["list_sessions"], max_p50_ms=0.0001)
+    )
+    assert not passed
+
+
+@pytest.mark.timeout(180)
+async def test_benchmark_smoke_erroring_journey_is_skipped_not_fatal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unexpected per-journey error is recorded as skipped; the suite continues.
+
+    Guards the outer safety net in ``run_benchmark``: the field crash was a
+    setup 500 aborting the whole process. Here a middle journey raises and the
+    journeys on either side still run and report.
+    """
+    real_run_journey = bench_run._run_journey
+    calls: list[str] = []
+
+    async def _fake_run_journey(journey: Journey, env: object, args: object) -> object:
+        calls.append(journey.name)
+        if journey.name == "get_session":
+            raise RuntimeError("kaboom")
+        return await real_run_journey(journey, env, args)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(bench_run, "_run_journey", _fake_run_journey)
+
+    report, passed = await bench_run.run_benchmark(
+        _smoke_args(journeys=["list_sessions", "get_session", "add_comment"])
+    )
+
+    # Every journey was attempted despite the middle one erroring.
+    assert calls == ["list_sessions", "get_session", "add_comment"]
+    journeys = _d(report["journeys"])
+    assert _d(journeys["get_session"])["skipped"] is True
+    assert _d(journeys["get_session"])["summary"] == {}
+    assert _d(journeys["list_sessions"]).get("skipped") is None
+    assert _d(journeys["add_comment"]).get("skipped") is None
+    # No thresholds supplied → a skip is non-fatal.
+    assert passed
+
+
+@pytest.mark.timeout(180)
+async def test_benchmark_smoke_skip_fails_gate_when_thresholds_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A skipped journey fails the CI gate when a threshold was requested."""
+
+    async def _fake_run_journey(journey: Journey, env: object, args: object) -> object:
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(bench_run, "_run_journey", _fake_run_journey)
+
+    _, passed = await bench_run.run_benchmark(
+        _smoke_args(journeys=["list_sessions"], max_p50_ms=1000.0)
     )
     assert not passed
 
