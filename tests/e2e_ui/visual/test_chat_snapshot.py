@@ -140,12 +140,10 @@ _HEALTH_BODY = {"sessions": {_SESSION_ID: {"runner_online": True, "host_online":
 _DONE_SSE = "data: [DONE]\n\n"
 
 _BUBBLE = '[data-testid="message-bubble"]'
-# Shiki now loads from a lazy chunk, so the fenced block first paints as raw
-# (uncolored) text and only re-renders with per-token colored spans once the
-# deferred `@streamdown/code` import resolves. Streamdown emits one span per
-# token carrying its color via the `--sdm-c` custom property. Waiting for these
-# pins the capture to the settled post-import DOM so the frame is deterministic;
-# the committed baseline reflects that render.
+# Shiki loads lazily, so the fenced block paints raw first and re-renders with
+# per-token spans (colored via the `--sdm-c` custom property) once the import
+# resolves. Span *presence* races the paint — the spans mount a frame before
+# their colors are composited — so the capture waits on the computed colors.
 _TOKEN_SPANS = '[data-streamdown="code-block-body"] span[style*="--sdm-c"]'
 
 
@@ -195,14 +193,24 @@ def test_chat_conversation_matches_baseline(
     # No live turn is in flight, so the working shimmer must be absent.
     expect(page.locator('[data-testid="working-indicator"]')).to_have_count(0)
 
-    # Shiki loads lazily now: wait for the fenced block to re-render with its
-    # token spans so the capture is the settled post-import DOM, not a partial
-    # frame mid-tokenization (which would drift the capture nondeterministically).
-    token_spans = page.locator(_TOKEN_SPANS)
-    expect(token_spans.first).to_be_visible(timeout=30_000)
+    # Shiki loads lazily: the colored token spans mount a frame after the block
+    # first paints raw. Wait until the tokens resolve more than one distinct
+    # color (the raw fallback is uniform `inherit`), then flush two animation
+    # frames so those colors are composited before the screenshot — waiting on
+    # span presence alone races the paint and captured a raw frame.
     page.wait_for_function(
-        "() => document.querySelectorAll('" + _TOKEN_SPANS.replace("'", "\\'") + "').length > 1",
+        """(selector) => {
+            const spans = Array.from(document.querySelectorAll(selector));
+            if (spans.length < 2) return false;
+            const colors = new Set(spans.map((el) => getComputedStyle(el).color));
+            return colors.size > 1;
+        }""",
+        arg=_TOKEN_SPANS,
         timeout=30_000,
+    )
+    page.evaluate(
+        "() => new Promise((resolve) => "
+        "requestAnimationFrame(() => requestAnimationFrame(resolve)))"
     )
 
     # Settle web fonts + kill the blinking caret (both time-dependent).
