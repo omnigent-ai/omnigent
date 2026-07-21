@@ -19,6 +19,7 @@ import {
   ChevronRightIcon,
   GitBranchIcon,
   ArrowUpIcon,
+  Loader2Icon,
   FileTextIcon,
   FolderIcon,
   ImageIcon,
@@ -3338,11 +3339,16 @@ export function NewChatLandingScreen() {
                           type="submit"
                           size="icon"
                           disabled={!canSubmit}
-                          aria-label="Start session"
+                          aria-label={creating ? "Starting session" : "Start session"}
+                          aria-busy={creating}
                           data-testid="new-chat-landing-submit"
                           className="size-8 rounded-full bg-foreground text-card transition-opacity hover:opacity-80 disabled:opacity-50"
                         >
-                          <ArrowUpIcon className="size-4" />
+                          {creating ? (
+                            <Loader2Icon className="size-4 animate-spin" />
+                          ) : (
+                            <ArrowUpIcon className="size-4" />
+                          )}
                         </Button>
                       </span>
                     </TooltipTrigger>

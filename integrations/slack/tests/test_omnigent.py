@@ -5,6 +5,7 @@ import httpx
 import respx
 from omnigent_slack.omnigent import (
     AuthRequiredError,
+    HarnessNotConfiguredError,
     HostUnavailableError,
     OmnigentClient,
     OmnigentClientPool,
@@ -16,27 +17,42 @@ from omnigent_slack.omnigent import (
     extract_output_file,
     extract_policy_denied,
     extract_todos,
-    is_terminal_event,
+    is_hard_terminal_event,
     iter_sse_events,
+    session_status,
 )
 
 
-def test_is_terminal_event_only_ends_on_session_idle_or_failed() -> None:
-    # Per-response completions are NOT terminal: an orchestrator emits one each
-    # time it ends a turn to wait on a sub-agent, then resumes the same turn.
-    assert not is_terminal_event({"type": "response.completed"})
-    assert not is_terminal_event({"type": "turn.completed"})
-    assert not is_terminal_event({"type": "response.output_text.delta", "delta": "x"})
-    assert not is_terminal_event({"type": "session.status", "status": "running"})
-    assert not is_terminal_event({"type": "session.status", "status": "waiting"})
+def test_session_status_parses_status_and_response_id() -> None:
+    # The turn-end signal is a session.status carrying a response_id (Stop hook);
+    # a bare idle (no response_id) is a PTY-watcher flap and must be
+    # distinguishable — response_id parses to None there.
+    assert session_status(
+        {"type": "session.status", "status": "running", "response_id": "resp_1"}
+    ) == ("running", "resp_1")
+    assert session_status({"type": "session.status", "status": "idle"}) == ("idle", None)
+    assert session_status(
+        {"type": "session.status", "status": "idle", "response_id": "resp_1"}
+    ) == ("idle", "resp_1")
+    # Empty/blank response_id normalizes to None.
+    assert session_status({"type": "session.status", "status": "idle", "response_id": ""}) == (
+        "idle",
+        None,
+    )
+    # Non-status events → None.
+    assert session_status({"type": "response.output_text.delta", "delta": "x"}) is None
+    assert session_status({"type": "response.completed"}) is None
 
-    # The session settling is the authoritative turn boundary.
-    assert is_terminal_event({"type": "session.status", "status": "idle"})
-    assert is_terminal_event({"type": "session.status", "status": "failed"})
 
-    # Explicit failure/cancel still ends the turn as a fallback.
-    assert is_terminal_event({"type": "response.failed"})
-    assert is_terminal_event({"type": "turn.cancelled"})
+def test_is_hard_terminal_event() -> None:
+    # Explicit failure/cancel end the turn regardless of response_id tracking.
+    assert is_hard_terminal_event({"type": "response.failed"})
+    assert is_hard_terminal_event({"type": "response.cancelled"})
+    assert is_hard_terminal_event({"type": "turn.failed"})
+    assert is_hard_terminal_event({"type": "turn.cancelled"})
+    # A normal completion / delta / status is NOT hard-terminal.
+    assert not is_hard_terminal_event({"type": "response.completed"})
+    assert not is_hard_terminal_event({"type": "session.status", "status": "idle"})
 
 
 async def _lines(values: list[str]) -> AsyncIterator[str]:
@@ -372,18 +388,17 @@ async def test_request_wraps_transport_failure_as_server_unreachable() -> None:
 
 
 @respx.mock
-async def test_run_turn_streams_across_multiple_responses_until_session_idle() -> None:
+async def test_run_turn_streams_across_multiple_responses_until_id_terminal() -> None:
     # An orchestrator ends its first response to wait on a sub-agent, then
-    # resumes with the real answer in a second response. The turn is only over
-    # once the session settles to idle — `response.completed` alone must not
-    # cut the stream off after the "dispatched, waiting" message.
+    # resumes with the real answer in a second response. `response.completed`
+    # alone must NOT end the turn; only the id-bearing terminal session.status
+    # (the Stop-hook edge) does.
     sse_body = (
         'data: {"type":"response.output_text.delta","delta":"Explorer dispatched."}\n\n'
         'data: {"type":"response.completed","response":{"status":"completed"}}\n\n'
         'data: {"type":"response.output_text.delta","delta":"Here is the report."}\n\n'
         'data: {"type":"response.completed","response":{"status":"completed"}}\n\n'
-        'data: {"type":"session.status","conversation_id":"conv_1","status":"idle"}\n\n'
-        "data: [DONE]\n\n"
+        'data: {"type":"session.status","status":"idle","response_id":"resp_1"}\n\n'
     )
     respx.get("http://omnigent.test/v1/sessions/conv_1/stream").mock(
         return_value=httpx.Response(200, text=sse_body)
@@ -407,19 +422,19 @@ async def test_run_turn_streams_across_multiple_responses_until_session_idle() -
 
 
 @respx.mock
-async def test_run_turn_resumes_after_idle_when_stream_continues() -> None:
-    # A fan-out orchestrator ends its turn to wait on sub-agents, settling to
-    # `idle` between wake cycles, then resumes with more output when a sub-agent
-    # completes. The bot must NOT stop at the first idle: within the grace
-    # window the stream delivers more, so the turn keeps going to the real end.
+async def test_run_turn_ignores_bare_idle_flaps_until_id_terminal() -> None:
+    # claude-native's PTY watcher emits `session.status: idle` WITH NO
+    # response_id mid-answer, between output bursts, while still generating. Those
+    # flaps must be IGNORED — ending on one truncates the reply. The turn ends
+    # only on the id-bearing idle (the Stop hook), after all bursts.
     sse_body = (
-        'data: {"type":"response.output_text.delta","delta":"Fanning out."}\n\n'
-        'data: {"type":"session.status","conversation_id":"conv_1","status":"idle"}\n\n'
-        'data: {"type":"response.output_text.delta","delta":"Collecting results."}\n\n'
-        'data: {"type":"session.status","conversation_id":"conv_1","status":"idle"}\n\n'
-        'data: {"type":"response.output_text.delta","delta":"All done."}\n\n'
-        'data: {"type":"session.status","conversation_id":"conv_1","status":"idle"}\n\n'
-        "data: [DONE]\n\n"
+        'data: {"type":"session.status","status":"running","response_id":"resp_1"}\n\n'
+        'data: {"type":"response.output_text.delta","delta":"Part one. "}\n\n'
+        'data: {"type":"session.status","status":"idle"}\n\n'  # bare flap — ignore
+        'data: {"type":"response.output_text.delta","delta":"Part two. "}\n\n'
+        'data: {"type":"session.status","status":"idle"}\n\n'  # bare flap — ignore
+        'data: {"type":"response.output_text.delta","delta":"Part three."}\n\n'
+        'data: {"type":"session.status","status":"idle","response_id":"resp_1"}\n\n'  # real end
     )
     respx.get("http://omnigent.test/v1/sessions/conv_1/stream").mock(
         return_value=httpx.Response(200, text=sse_body)
@@ -432,65 +447,63 @@ async def test_run_turn_resumes_after_idle_when_stream_continues() -> None:
     try:
         deltas = [
             event.get("delta")
-            async for event in client.run_turn("conv_1", "go", idle_grace_seconds=5.0)
+            async for event in client.run_turn("conv_1", "go")
             if event.get("type") == "response.output_text.delta"
         ]
     finally:
         await client.aclose()
 
-    # All three segments streamed across the intermediate idle edges — the turn
-    # only ends at the final idle when the stream itself closes.
-    assert deltas == ["Fanning out.", "Collecting results.", "All done."]
+    # All three bursts delivered — the bare-idle flaps did not truncate.
+    assert deltas == ["Part one. ", "Part two. ", "Part three."]
 
 
 @respx.mock
-async def test_run_turn_transient_idle_midstream_does_not_truncate() -> None:
-    # claude-native oscillates running/idle WHILE still streaming its answer,
-    # with a sub-second gap before the next burst — and the snapshot reads `idle`
-    # during that gap. The settle wait must catch the resumption rather than
-    # ending the turn on the transient idle (which truncated the reply).
-    async def _bursty_stream() -> AsyncIterator[bytes]:
-        yield b'data: {"type":"response.output_text.delta","delta":"Part one. "}\n\n'
-        yield b'data: {"type":"session.status","status":"idle"}\n\n'
-        # Real gap before the next burst — shorter than the settle window.
-        await asyncio.sleep(0.2)
-        yield b'data: {"type":"response.output_text.delta","delta":"Part two. "}\n\n'
-        yield b'data: {"type":"session.status","status":"idle"}\n\n'
-        await asyncio.sleep(0.2)
-        yield b'data: {"type":"response.output_text.delta","delta":"Part three."}\n\n'
-        yield b'data: {"type":"session.status","status":"idle"}\n\n'
-        yield b"data: [DONE]\n\n"
+async def test_run_turn_ends_on_idless_idle_for_in_process_harness() -> None:
+    # Incident dc05b28 (debby / claude-sdk in-process harness): ALL session.status
+    # events are id-LESS for this harness (verified live + in schema). The turn
+    # brackets are: id-less running -> deltas -> id-less WAITING (mid-fan-out,
+    # sub-agents dispatched) -> id-less running -> final summary -> id-less IDLE.
+    # The turn must: NOT end on the mid-fan-out `waiting`, stream the summary that
+    # follows it, and END on the final id-less `idle`. (No response_id is ever
+    # stamped, so the claude-native id-match strategy can't apply here.)
+    async def _in_process_stream() -> AsyncIterator[bytes]:
+        yield b'data: {"type":"session.status","status":"running"}\n\n'
+        yield b'data: {"type":"response.output_text.delta","delta":"Dispatching partners."}\n\n'
+        yield b'data: {"type":"response.completed","response":{"status":"completed"}}\n\n'
+        yield b'data: {"type":"session.status","status":"waiting"}\n\n'  # mid-fan-out
+        yield b'data: {"type":"session.status","status":"running"}\n\n'
+        yield b'data: {"type":"response.output_text.delta","delta":"Both partners are back."}\n\n'
+        yield b'data: {"type":"response.completed","response":{"status":"completed"}}\n\n'
+        yield b'data: {"type":"session.status","status":"idle"}\n\n'  # id-less REAL end
+        # The real server does NOT close after idle — it stays open with 15s
+        # heartbeats. So ending REQUIRES recognizing the id-less idle; otherwise
+        # the loop hangs to the liveness timeout. Model that with a long silence.
+        await asyncio.sleep(30)
 
     respx.get("http://omnigent.test/v1/sessions/conv_1/stream").mock(
-        return_value=httpx.Response(200, stream=_bursty_stream())
+        return_value=httpx.Response(200, stream=_in_process_stream())
     )
     respx.post("http://omnigent.test/v1/sessions/conv_1/events").mock(
         return_value=httpx.Response(200, json={})
     )
-    # Snapshot reads `idle` during the gaps — the WRONG signal to end on. The
-    # settle wait must win over it while text is still coming.
-    respx.get("http://omnigent.test/v1/sessions/conv_1").mock(
-        return_value=httpx.Response(200, json={"status": "idle"})
-    )
     client = OmnigentClient("http://omnigent.test")
 
-    try:
-        deltas = [
+    async def _drain() -> list[str | None]:
+        return [
             event.get("delta")
-            async for event in client.run_turn(
-                "conv_1",
-                "go",
-                idle_grace_seconds=5.0,
-                idle_poll_seconds=5.0,
-                idle_settle_seconds=1.0,
-            )
+            async for event in client.run_turn("conv_1", "fan out", idle_grace_seconds=5.0)
             if event.get("type") == "response.output_text.delta"
         ]
+
+    try:
+        # Must end on the id-less idle, well within the 30s silence.
+        deltas = await asyncio.wait_for(_drain(), timeout=5.0)
     finally:
         await client.aclose()
 
-    # All three bursts delivered — no mid-answer truncation despite the idles.
-    assert deltas == ["Part one. ", "Part two. ", "Part three."]
+    # The post-`waiting` summary streamed (waiting didn't end the turn), and the
+    # id-less idle ended it cleanly — no truncation, no hang.
+    assert deltas == ["Dispatching partners.", "Both partners are back."]
 
 
 @respx.mock
@@ -503,7 +516,7 @@ async def test_run_turn_ends_when_stream_goes_silent_without_idle_event() -> Non
     # snapshot shows the server is idle.
     async def _silent_after_output() -> AsyncIterator[bytes]:
         yield b'data: {"type":"response.output_text.delta","delta":"Some answer."}\n\n'
-        await asyncio.sleep(30)  # then nothing: no idle, no [DONE] — a bare read hangs
+        await asyncio.sleep(30)  # then nothing: no terminal, no heartbeat, no [DONE]
 
     respx.get("http://omnigent.test/v1/sessions/conv_1/stream").mock(
         return_value=httpx.Response(200, stream=_silent_after_output())
@@ -511,91 +524,70 @@ async def test_run_turn_ends_when_stream_goes_silent_without_idle_event() -> Non
     respx.post("http://omnigent.test/v1/sessions/conv_1/events").mock(
         return_value=httpx.Response(200, json={})
     )
-    # The server is actually done (idle) — the stream just never told us.
-    respx.get("http://omnigent.test/v1/sessions/conv_1").mock(
-        return_value=httpx.Response(200, json={"status": "idle"})
-    )
     client = OmnigentClient("http://omnigent.test")
 
     async def _drain() -> list[str | None]:
+        # A live connection heartbeats every ~15s; no event for idle_grace_seconds
+        # means the socket is dead → end (the liveness backstop).
         return [
             event.get("delta")
-            async for event in client.run_turn(
-                "conv_1",
-                "go",
-                idle_grace_seconds=5.0,
-                idle_poll_seconds=0.05,
-                idle_settle_seconds=0.05,
-            )
+            async for event in client.run_turn("conv_1", "go", idle_grace_seconds=0.3)
             if event.get("type") == "response.output_text.delta"
         ]
 
     try:
-        # Must finish well within the 30s silent stall — bounded by the poll.
         deltas = await asyncio.wait_for(_drain(), timeout=5.0)
     finally:
         await client.aclose()
 
-    assert deltas == ["Some answer."]  # delivered, then the turn ended cleanly
+    assert deltas == ["Some answer."]  # delivered, then the dead socket ended it
 
 
 @respx.mock
-async def test_run_turn_ends_when_idle_grace_elapses_and_snapshot_idle() -> None:
-    # A truly-final idle: the stream stays open briefly (no `[DONE]`) but nothing
-    # more arrives within the grace window, and the snapshot confirms the session
-    # is idle — so the turn ends rather than hanging on the late delta.
-    async def _slow_stream() -> AsyncIterator[bytes]:
+async def test_run_turn_ends_on_id_terminal_ignoring_later_deltas() -> None:
+    # The id-bearing terminal is authoritative: once it arrives, the turn is over.
+    # A stray later delta on the same (now-stale) stream is not delivered.
+    async def _stream() -> AsyncIterator[bytes]:
+        yield b'data: {"type":"session.status","status":"running","response_id":"resp_1"}\n\n'
         yield b'data: {"type":"response.output_text.delta","delta":"Answer."}\n\n'
-        yield b'data: {"type":"session.status","status":"idle"}\n\n'
+        yield b'data: {"type":"session.status","status":"idle","response_id":"resp_1"}\n\n'
         await asyncio.sleep(0.4)
         yield b'data: {"type":"response.output_text.delta","delta":"too late"}\n\n'
 
     respx.get("http://omnigent.test/v1/sessions/conv_1/stream").mock(
-        return_value=httpx.Response(200, stream=_slow_stream())
+        return_value=httpx.Response(200, stream=_stream())
     )
     respx.post("http://omnigent.test/v1/sessions/conv_1/events").mock(
         return_value=httpx.Response(200, json={})
-    )
-    # Snapshot says idle → nothing outstanding → end the turn.
-    respx.get("http://omnigent.test/v1/sessions/conv_1").mock(
-        return_value=httpx.Response(200, json={"status": "idle"})
     )
     client = OmnigentClient("http://omnigent.test")
 
     try:
         deltas = [
             event.get("delta")
-            async for event in client.run_turn(
-                "conv_1",
-                "go",
-                idle_grace_seconds=5.0,
-                idle_poll_seconds=0.05,
-                idle_settle_seconds=0.05,
-            )
+            async for event in client.run_turn("conv_1", "go")
             if event.get("type") == "response.output_text.delta"
         ]
     finally:
         await client.aclose()
 
-    # The settle window (0.05s) was quiet and the snapshot is idle, so the turn
-    # ended at the idle before the late delta (0.4s); it was never delivered.
+    # Ended at the id-terminal; the late delta after it was never delivered.
     assert deltas == ["Answer."]
 
 
 @respx.mock
 async def test_run_turn_does_not_hang_after_elicitation_when_stream_silent() -> None:
     # Incident 10f1d893: after an elicitation, the consumer parks to handle it,
-    # leaving the SSE connection unread. When it resumes, the (now stale) stream
-    # delivers nothing more and never closes — a bare read would hang forever,
-    # wedging the thread. The loop must treat the elicitation like a soft idle:
-    # settle-wait, then poll the snapshot, and END when the session is idle.
+    # leaving the SSE connection unread. If the stream then delivers nothing and
+    # never closes, a bare read would hang forever, wedging the thread. The
+    # liveness backstop (no event for idle_grace_seconds) ends the turn.
     async def _stalls_after_elicitation() -> AsyncIterator[bytes]:
         yield b'data: {"type":"response.output_text.delta","delta":"Before deleting."}\n\n'
         yield (
             b'data: {"type":"response.elicitation_request",'
             b'"elicitation_id":"e1","params":{"message":"Approve?"}}\n\n'
         )
-        # Then nothing: no more events, no [DONE]. A bare read here hangs.
+        # Then nothing: no more events, no [DONE], no heartbeat.
         await asyncio.sleep(30)
 
     respx.get("http://omnigent.test/v1/sessions/conv_1/stream").mock(
@@ -604,147 +596,22 @@ async def test_run_turn_does_not_hang_after_elicitation_when_stream_silent() -> 
     respx.post("http://omnigent.test/v1/sessions/conv_1/events").mock(
         return_value=httpx.Response(200, json={})
     )
-    # The server has gone idle (the turn actually finished server-side).
-    respx.get("http://omnigent.test/v1/sessions/conv_1").mock(
-        return_value=httpx.Response(200, json={"status": "idle"})
-    )
     client = OmnigentClient("http://omnigent.test")
 
     async def _drain() -> list[str]:
         return [
             event.get("type")
-            async for event in client.run_turn(
-                "conv_1",
-                "go",
-                idle_grace_seconds=5.0,
-                idle_poll_seconds=0.05,
-                idle_settle_seconds=0.05,
-            )
+            async for event in client.run_turn("conv_1", "go", idle_grace_seconds=0.3)
         ]
 
     try:
-        # Must complete well within the stream's 30s stall — bounded by the poll,
-        # not hanging on the read.
+        # Must complete well within the 30s stall — bounded by the liveness window.
         types = await asyncio.wait_for(_drain(), timeout=5.0)
     finally:
         await client.aclose()
 
     # The elicitation event was surfaced, then the turn ended cleanly (no hang).
     assert "response.elicitation_request" in types
-
-
-async def test_await_within_grace_waits_while_snapshot_running() -> None:
-    # The idle-disambiguation helper: each quiet poll consults the snapshot.
-    # While the rolled-up status is `running` (a sub-agent child is still
-    # working), it keeps waiting past the poll interval rather than ending;
-    # once the in-flight read completes it reports resumption.
-    from omnigent_slack.omnigent import _NO_RESUMPTION
-
-    async def _slow_read() -> dict[str, object]:
-        # Longer than the poll interval, so several polls fire first.
-        await asyncio.sleep(0.15)
-        return {"type": "response.output_text.delta", "delta": "Collected."}
-
-    client = OmnigentClient("http://omnigent.test")
-
-    async def _running_status(session_id: str) -> str | None:
-        return "running"  # child still working across every quiet poll
-
-    client.get_session_status = _running_status  # type: ignore[method-assign]
-    pending = asyncio.ensure_future(_slow_read())
-    try:
-        # Poll every 0.05s, generous 5s cap — resumes well before the cap.
-        result = await client._await_within_grace(pending, "conv_1", 5.0, 0.05, 0.05)
-    finally:
-        await client.aclose()
-
-    # Snapshot said running across the quiet polls, so it waited for the read
-    # to complete (resumption) instead of returning the end sentinel.
-    assert result is not _NO_RESUMPTION
-    assert pending.done() and pending.result()["delta"] == "Collected."
-
-
-async def test_await_within_grace_ends_when_snapshot_not_running() -> None:
-    from omnigent_slack.omnigent import _NO_RESUMPTION
-
-    async def _silent_read() -> dict[str, object]:
-        await asyncio.sleep(5.0)  # never completes within the poll interval
-        return {"type": "response.output_text.delta", "delta": "too late"}
-
-    client = OmnigentClient("http://omnigent.test")
-
-    async def _idle_status(session_id: str) -> str | None:
-        return "idle"
-
-    client.get_session_status = _idle_status  # type: ignore[method-assign]
-    pending = asyncio.ensure_future(_silent_read())
-    try:
-        result = await client._await_within_grace(pending, "conv_1", 5.0, 0.02, 0.02)
-    finally:
-        pending.cancel()
-        await client.aclose()
-
-    # First quiet poll + snapshot idle → the turn is genuinely over.
-    assert result is _NO_RESUMPTION
-
-
-async def test_await_within_grace_keeps_waiting_on_transient_status_none() -> None:
-    # A None status is a best-effort snapshot failure (transient blip), NOT a
-    # confirmed end. Treating it as "done" would truncate a still-live fan-out on
-    # a momentary hiccup. The loop must keep waiting until the grace cap instead.
-    from omnigent_slack.omnigent import _NO_RESUMPTION
-
-    async def _never_read() -> dict[str, object]:
-        await asyncio.sleep(60.0)
-        return {"type": "response.output_text.delta", "delta": "never"}
-
-    client = OmnigentClient("http://omnigent.test")
-    calls = 0
-
-    async def _flaky_status(session_id: str) -> str | None:
-        nonlocal calls
-        calls += 1
-        return None  # snapshot fetch keeps failing
-
-    client.get_session_status = _flaky_status  # type: ignore[method-assign]
-    pending = asyncio.ensure_future(_never_read())
-    try:
-        # Cap 0.08s, poll 0.02s → several polls; each returns None but must not
-        # end early — only the cap ends it.
-        result = await client._await_within_grace(pending, "conv_1", 0.08, 0.02, 0.02)
-    finally:
-        pending.cancel()
-        await client.aclose()
-
-    assert result is _NO_RESUMPTION  # ended by the cap, not the first None
-    assert calls >= 2  # kept polling through the transient failures
-
-
-async def test_await_within_grace_cap_ends_even_while_running() -> None:
-    # The cap is a backstop: if the snapshot stays `running` forever (stuck
-    # session), the turn still ends once the total grace cap elapses rather than
-    # parking indefinitely.
-    from omnigent_slack.omnigent import _NO_RESUMPTION
-
-    async def _never_read() -> dict[str, object]:
-        await asyncio.sleep(60.0)
-        return {"type": "response.output_text.delta", "delta": "never"}
-
-    client = OmnigentClient("http://omnigent.test")
-
-    async def _stuck_running(session_id: str) -> str | None:
-        return "running"  # never settles
-
-    client.get_session_status = _stuck_running  # type: ignore[method-assign]
-    pending = asyncio.ensure_future(_never_read())
-    try:
-        # Poll 0.02s, cap 0.05s → a couple of polls then the cap ends it.
-        result = await client._await_within_grace(pending, "conv_1", 0.05, 0.02, 0.02)
-    finally:
-        pending.cancel()
-        await client.aclose()
-
-    assert result is _NO_RESUMPTION
 
 
 @respx.mock
@@ -768,6 +635,64 @@ async def test_client_raises_runner_unavailable() -> None:
         await client.aclose()
 
     assert raised is True
+
+
+@respx.mock
+async def test_launch_runner_412_propagates_harness_not_configured_message() -> None:
+    # A 412 harness_not_configured is an actionable precondition failure — the
+    # server's curated error.message must reach the user, not collapse to the
+    # generic "failed with status 412".
+    respx.post("http://omnigent.test/v1/hosts/host_1/runners").mock(
+        return_value=httpx.Response(
+            412,
+            json={
+                "error": {
+                    "code": "harness_not_configured",
+                    "message": "launch failed: claude CLI missing; run omnigent setup",
+                }
+            },
+        )
+    )
+    client = OmnigentClient("http://omnigent.test")
+    try:
+        raised: HarnessNotConfiguredError | None = None
+        try:
+            await client.launch_runner("conv_1", workspace="/home/u", host_id="host_1")
+        except HarnessNotConfiguredError as exc:
+            raised = exc
+    finally:
+        await client.aclose()
+
+    assert raised is not None
+    # The server's message is preserved verbatim (it's the actionable guidance).
+    assert "omnigent setup" in str(raised)
+    assert "status 412" not in str(raised)  # not the generic fallback
+
+
+@respx.mock
+async def test_stream_401_raises_auth_required_not_response_not_read() -> None:
+    # A 401 on the SSE stream must classify as AuthRequiredError so the bot can
+    # prompt "/omnigent to log in again". The stream response body is unread, so
+    # the error classifier must read it before inspecting — otherwise httpx
+    # raises ResponseNotRead and the real 401 is masked as a generic failure.
+    respx.get("http://omnigent.test/v1/sessions/conv_1/stream").mock(
+        return_value=httpx.Response(
+            401, json={"error": {"code": "unauthorized", "message": "Authentication required"}}
+        )
+    )
+    client = OmnigentClient("http://omnigent.test")
+    try:
+        raised: Exception | None = None
+        try:
+            async with client.stream_session_events("conv_1") as events:
+                async for _event in events:
+                    pass
+        except Exception as exc:
+            raised = exc
+    finally:
+        await client.aclose()
+
+    assert isinstance(raised, AuthRequiredError)
 
 
 def test_extract_elicitation_request_parses_fields() -> None:

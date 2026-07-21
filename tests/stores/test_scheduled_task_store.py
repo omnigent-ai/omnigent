@@ -11,13 +11,14 @@ import uuid
 
 import pytest
 
+from omnigent.db.db_models import workspace_scope
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 
 
 # scheduled_tasks.id / scheduled_task_runs.id / scheduled_task_id are Uuid16
 # columns (16 raw bytes), read back as bare 32-char hex strings. ``_uid`` maps a
 # readable seed to a deterministic bare-hex UUID so tests stay legible while the
-# store still round-trips real UUIDs. agent_id / owner_user_id / conversation_id
+# store still round-trips real UUIDs. agent_id / user_id / conversation_id
 # stay plain strings — those columns are still ``String``.
 def _uid(seed: str) -> str:
     """Deterministic bare 32-char hex UUID string from a short readable seed."""
@@ -46,27 +47,26 @@ def test_create_returns_scheduled_task_with_all_fields(
         name="nightly triage",
         prompt="Triage the inbox",
         rrule="FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
-        owner_user_id="alice@example.com",
+        user_id="alice@example.com",
         agent_id=_uid("ag_abc"),
         timezone="America/Los_Angeles",
         model_override="claude-opus-4-7",
         reasoning_effort="high",
         workspace="/home/alice/repo",
-        base_branch="main",
-        execution_target="connected_host",
         host_id=_uid("host_abc123"),
     )
     assert task.id == _uid("st_1")
+    assert task.workspace_id == 0
     assert task.name == "nightly triage"
     assert task.prompt == "Triage the inbox"
     assert task.rrule == "FREQ=DAILY;BYHOUR=9;BYMINUTE=0"
-    assert task.owner_user_id == "alice@example.com"
+    assert task.user_id == "alice@example.com"
     assert task.agent_id == _uid("ag_abc")
     assert task.timezone == "America/Los_Angeles"
     assert task.model_override == "claude-opus-4-7"
     assert task.reasoning_effort == "high"
     assert task.workspace == "/home/alice/repo"
-    assert task.base_branch == "main"
+    assert task.base_branch is None
     assert task.execution_target == "connected_host"
     assert task.host_id == _uid("host_abc123")
     assert task.state == "active"
@@ -83,7 +83,7 @@ def test_create_minimal_defaults(store: SqlAlchemyScheduledTaskStore) -> None:
         name="minimal",
         prompt="do a thing",
         rrule="FREQ=MINUTELY",
-        owner_user_id="bob@example.com",
+        user_id="bob@example.com",
         agent_id=_uid("ag_min"),
         timezone="UTC",
     )
@@ -110,7 +110,7 @@ def test_state_round_trips_as_string(store: SqlAlchemyScheduledTaskStore) -> Non
             name="n",
             prompt="p",
             rrule="FREQ=MINUTELY",
-            owner_user_id="u",
+            user_id="u",
             agent_id=_uid("ag"),
             timezone="UTC",
             state=name,
@@ -127,70 +127,27 @@ def test_create_rejects_invalid_state(store: SqlAlchemyScheduledTaskStore) -> No
             name="n",
             prompt="p",
             rrule="FREQ=MINUTELY",
-            owner_user_id="u",
+            user_id="u",
             agent_id=_uid("ag"),
             timezone="UTC",
             state="bogus",
         )
 
 
-# ── execution target ──────────────────────────────────────────────────────────
-
-
-def test_execution_target_round_trips_as_string(store: SqlAlchemyScheduledTaskStore) -> None:
-    """Every valid execution_target name survives the string→int→string round trip.
-
-    The entity exposes ``execution_target`` as a string; the column stores an
-    int code.
-    """
-    for i, name in enumerate(("connected_host", "managed_sandbox")):
-        task = store.create(
-            scheduled_task_id=_uid(f"st_target_{i}"),
-            name="n",
-            prompt="p",
-            rrule="FREQ=MINUTELY",
-            owner_user_id="u",
-            agent_id=_uid("ag"),
-            timezone="UTC",
-            execution_target=name,
-        )
-        assert task.execution_target == name
-        assert isinstance(task.execution_target, str)
-
-
-def test_create_rejects_invalid_execution_target(store: SqlAlchemyScheduledTaskStore) -> None:
-    """An unknown execution_target name is rejected by the codec (never reaches the DB)."""
-    with pytest.raises(ValueError, match=r"scheduled_tasks\.execution_target"):
-        store.create(
-            scheduled_task_id=_uid("st_badtarget"),
-            name="n",
-            prompt="p",
-            rrule="FREQ=MINUTELY",
-            owner_user_id="u",
-            agent_id=_uid("ag"),
-            timezone="UTC",
-            execution_target="bogus",
-        )
-
-
-def test_update_execution_target_and_host_id_read_back(
-    store: SqlAlchemyScheduledTaskStore,
-) -> None:
-    """Updating ``execution_target`` / ``host_id`` reads the new values back."""
+def test_update_host_id_reads_back(store: SqlAlchemyScheduledTaskStore) -> None:
+    """Updating ``host_id`` reads the new value back."""
     store.create(
-        scheduled_task_id=_uid("st_upd_target"),
+        scheduled_task_id=_uid("st_upd_host"),
         name="n",
         prompt="p",
         rrule="FREQ=MINUTELY",
-        owner_user_id="u",
+        user_id="u",
         agent_id=_uid("ag"),
         timezone="UTC",
     )
-    updated = store.update(
-        _uid("st_upd_target"), execution_target="managed_sandbox", host_id=_uid("host_xyz")
-    )
+    updated = store.update(_uid("st_upd_host"), host_id=_uid("host_xyz"))
     assert updated is not None
-    assert updated.execution_target == "managed_sandbox"
+    assert updated.execution_target == "connected_host"
     assert updated.host_id == _uid("host_xyz")
 
 
@@ -201,7 +158,7 @@ def test_update_state_reads_back(store: SqlAlchemyScheduledTaskStore) -> None:
         name="n",
         prompt="p",
         rrule="FREQ=MINUTELY",
-        owner_user_id="u",
+        user_id="u",
         agent_id=_uid("ag"),
         timezone="UTC",
     )
@@ -220,7 +177,7 @@ def test_create_recurring_task(store: SqlAlchemyScheduledTaskStore) -> None:
         name="recurring",
         prompt="p",
         rrule="FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
-        owner_user_id="u",
+        user_id="u",
         agent_id=_uid("ag"),
         timezone="UTC",
     )
@@ -234,7 +191,7 @@ def test_update_changes_rrule(store: SqlAlchemyScheduledTaskStore) -> None:
         name="n",
         prompt="p",
         rrule="FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
-        owner_user_id="u",
+        user_id="u",
         agent_id=_uid("ag"),
         timezone="UTC",
     )
@@ -250,7 +207,7 @@ def test_get_returns_created_task(store: SqlAlchemyScheduledTaskStore) -> None:
         name="n",
         prompt="p",
         rrule="FREQ=MINUTELY",
-        owner_user_id="u",
+        user_id="u",
         agent_id=_uid("ag_1"),
         timezone="UTC",
     )
@@ -282,7 +239,7 @@ def test_list_orders_by_created_at_then_id(store: SqlAlchemyScheduledTaskStore) 
         name="a",
         prompt="p",
         rrule="FREQ=MINUTELY",
-        owner_user_id="u",
+        user_id="u",
         agent_id=_uid("ag"),
         timezone="UTC",
     )
@@ -291,7 +248,7 @@ def test_list_orders_by_created_at_then_id(store: SqlAlchemyScheduledTaskStore) 
         name="b",
         prompt="p",
         rrule="FREQ=MINUTELY",
-        owner_user_id="u",
+        user_id="u",
         agent_id=_uid("ag"),
         timezone="UTC",
     )
@@ -306,7 +263,7 @@ def test_list_active_excludes_non_active(store: SqlAlchemyScheduledTaskStore) ->
         name="active",
         prompt="p",
         rrule="FREQ=MINUTELY",
-        owner_user_id="u",
+        user_id="u",
         agent_id=_uid("ag"),
         timezone="UTC",
         state="active",
@@ -317,13 +274,44 @@ def test_list_active_excludes_non_active(store: SqlAlchemyScheduledTaskStore) ->
             name=other_state,
             prompt="p",
             rrule="FREQ=MINUTELY",
-            owner_user_id="u",
+            user_id="u",
             agent_id=_uid("ag"),
             timezone="UTC",
             state=other_state,
         )
     active_ids = [r.id for r in store.list_active()]
     assert active_ids == [_uid("st_active")]
+
+
+def test_list_active_all_workspaces_includes_tenant_tasks(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """Scheduler startup can discover active tasks outside ambient workspace 0."""
+    with workspace_scope(42):
+        task_42 = store.create(
+            scheduled_task_id=_uid("st_active_ws42"),
+            name="tenant",
+            prompt="p",
+            rrule="FREQ=MINUTELY",
+            user_id="u",
+            agent_id=_uid("ag"),
+            timezone="UTC",
+        )
+    with workspace_scope(7):
+        store.create(
+            scheduled_task_id=_uid("st_paused_ws7"),
+            name="paused",
+            prompt="p",
+            rrule="FREQ=MINUTELY",
+            user_id="u",
+            agent_id=_uid("ag"),
+            timezone="UTC",
+            state="paused",
+        )
+
+    tasks = store.list_active_all_workspaces()
+
+    assert [(t.workspace_id, t.id) for t in tasks] == [(42, task_42.id)]
 
 
 # ── update ────────────────────────────────────────────────────────────────────
@@ -336,7 +324,7 @@ def test_update_changes_fields_and_stamps_updated_at(store: SqlAlchemyScheduledT
         name="before",
         prompt="p",
         rrule="FREQ=MINUTELY",
-        owner_user_id="u",
+        user_id="u",
         agent_id=_uid("ag"),
         timezone="UTC",
     )
@@ -344,7 +332,6 @@ def test_update_changes_fields_and_stamps_updated_at(store: SqlAlchemyScheduledT
         _uid("st_u"),
         name="after",
         rrule="FREQ=DAILY;BYHOUR=0;BYMINUTE=0",
-        base_branch="develop",
         state="paused",
         last_run_at=1700000000,
         last_run_conversation_id=_uid("conv_x"),
@@ -352,7 +339,7 @@ def test_update_changes_fields_and_stamps_updated_at(store: SqlAlchemyScheduledT
     assert updated is not None
     assert updated.name == "after"
     assert updated.rrule == "FREQ=DAILY;BYHOUR=0;BYMINUTE=0"
-    assert updated.base_branch == "develop"
+    assert updated.base_branch is None
     assert updated.state == "paused"
     assert updated.last_run_at == 1700000000
     assert updated.last_run_conversation_id == _uid("conv_x")
@@ -366,7 +353,7 @@ def test_update_noop_leaves_updated_at_none(store: SqlAlchemyScheduledTaskStore)
         name="n",
         prompt="p",
         rrule="FREQ=MINUTELY",
-        owner_user_id="u",
+        user_id="u",
         agent_id=_uid("ag"),
         timezone="UTC",
     )
@@ -390,7 +377,7 @@ def test_delete_removes_task(store: SqlAlchemyScheduledTaskStore) -> None:
         name="n",
         prompt="p",
         rrule="FREQ=MINUTELY",
-        owner_user_id="u",
+        user_id="u",
         agent_id=_uid("ag"),
         timezone="UTC",
     )
@@ -413,7 +400,7 @@ def test_create_run_and_list_runs(store: SqlAlchemyScheduledTaskStore) -> None:
         name="n",
         prompt="p",
         rrule="FREQ=MINUTELY",
-        owner_user_id="u",
+        user_id="u",
         agent_id=_uid("ag"),
         timezone="UTC",
     )
@@ -453,7 +440,7 @@ def test_list_runs_scoped_to_task(store: SqlAlchemyScheduledTaskStore) -> None:
             name=rid,
             prompt="p",
             rrule="FREQ=MINUTELY",
-            owner_user_id="u",
+            user_id="u",
             agent_id=_uid("ag"),
             timezone="UTC",
         )
@@ -483,7 +470,7 @@ def test_run_status_round_trips_as_string(store: SqlAlchemyScheduledTaskStore) -
         name="n",
         prompt="p",
         rrule="FREQ=MINUTELY",
-        owner_user_id="u",
+        user_id="u",
         agent_id=_uid("ag"),
         timezone="UTC",
     )
@@ -505,7 +492,7 @@ def test_create_run_rejects_invalid_status_name(store: SqlAlchemyScheduledTaskSt
         name="n",
         prompt="p",
         rrule="FREQ=MINUTELY",
-        owner_user_id="u",
+        user_id="u",
         agent_id=_uid("ag"),
         timezone="UTC",
     )
@@ -528,15 +515,14 @@ def test_update_host_id_can_be_cleared_to_null(store: SqlAlchemyScheduledTaskSto
         name="n",
         prompt="p",
         rrule="FREQ=MINUTELY",
-        owner_user_id="u",
+        user_id="u",
         agent_id=_uid("ag"),
         timezone="UTC",
-        execution_target="connected_host",
         host_id=_uid("host_abc"),
     )
-    updated = store.update(_uid("st_clear_host"), execution_target="managed_sandbox", host_id=None)
+    updated = store.update(_uid("st_clear_host"), host_id=None)
     assert updated is not None
-    assert updated.execution_target == "managed_sandbox"
+    assert updated.execution_target == "connected_host"
     assert updated.host_id is None
     fetched = store.get(_uid("st_clear_host"))
     assert fetched is not None
@@ -552,7 +538,7 @@ def test_update_last_run_conversation_id_can_be_cleared_to_null(
         name="n",
         prompt="p",
         rrule="FREQ=MINUTELY",
-        owner_user_id="u",
+        user_id="u",
         agent_id=_uid("ag"),
         timezone="UTC",
     )
@@ -574,7 +560,7 @@ def test_update_omitting_nullable_param_leaves_field_unchanged(
         name="n",
         prompt="p",
         rrule="FREQ=MINUTELY",
-        owner_user_id="u",
+        user_id="u",
         agent_id=_uid("ag"),
         timezone="UTC",
         host_id=_uid("host_keep"),
@@ -596,7 +582,7 @@ def test_update_clearing_already_null_field_is_noop_for_updated_at(
         name="n",
         prompt="p",
         rrule="FREQ=MINUTELY",
-        owner_user_id="u",
+        user_id="u",
         agent_id=_uid("ag"),
         timezone="UTC",
     )
@@ -616,7 +602,7 @@ def test_delete_also_removes_associated_runs(store: SqlAlchemyScheduledTaskStore
         name="n",
         prompt="p",
         rrule="FREQ=MINUTELY",
-        owner_user_id="u",
+        user_id="u",
         agent_id=_uid("ag"),
         timezone="UTC",
     )
@@ -645,7 +631,7 @@ def test_delete_does_not_remove_other_tasks_runs(store: SqlAlchemyScheduledTaskS
             name=tid,
             prompt="p",
             rrule="FREQ=MINUTELY",
-            owner_user_id="u",
+            user_id="u",
             agent_id=_uid("ag"),
             timezone="UTC",
         )

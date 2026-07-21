@@ -284,6 +284,30 @@ def test_configured_harness_map_all_true_with_clis(
     assert all(result.values())
 
 
+def test_configured_harness_map_probes_codex_readiness_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex aliases share one potentially expensive readiness probe."""
+    calls = 0
+
+    def _codex_reason() -> str:
+        nonlocal calls
+        calls += 1
+        return "needs-auth"
+
+    monkeypatch.setattr(
+        "omnigent.codex_native._codex_auth_unavailable_reason",
+        _codex_reason,
+    )
+
+    result = configured_harness_map()
+
+    assert calls == 1
+    assert result["codex"] == "needs-auth"
+    assert result["codex-native"] == "needs-auth"
+    assert result["native-codex"] == "needs-auth"
+
+
 def test_kimi_readiness_keys_off_binary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

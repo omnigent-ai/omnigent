@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import pytest
 
-cel = pytest.importorskip("cel_expr_python", reason="cel-expr-python not installed")
+pytest.importorskip("celpy", reason="cel-python not installed")
 
-from omnigent.policies.builtins.cel import cel_policy  # noqa: E402
+from omnigent.policies.builtins.cel import cel_policy
 
 # ── Map return: DENY ────────────────────────────────────────────
 
@@ -170,3 +170,17 @@ def test_invalid_syntax_raises() -> None:
     """Invalid CEL syntax is rejected at compile time."""
     with pytest.raises(ValueError, match="CEL"):
         cel_policy(expression="event.type ==== bad")
+
+
+def test_llm_client_stripped_from_cel_event() -> None:
+    """llm_client is dropped before json_to_cel; the expression still evaluates."""
+
+    class _FakeLLMClient:
+        pass
+
+    evaluate = cel_policy(expression='{"result": "DENY"}')
+    # The engine injects llm_client (a live object) into every real event.
+    # CEL expressions cannot use it and json_to_cel cannot convert it, so it
+    # is stripped before marshalling. The expression must evaluate normally.
+    result = evaluate({"type": "request", "llm_client": _FakeLLMClient()})  # type: ignore[typeddict-unknown-key]
+    assert result == {"result": "DENY", "reason": "Denied by policy."}

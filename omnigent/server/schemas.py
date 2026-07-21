@@ -54,10 +54,9 @@ class MCPServerSummary(BaseModel):
     """
     Safe subset of an MCP server's configuration for API exposure.
 
-    Secret-bearing fields (``headers``, ``env``) are intentionally
-    excluded. This model is the wire shape returned inside
-    :class:`AgentObject` so clients can display which MCP servers
-    an agent is connected to without leaking credentials.
+    Header values are redacted (``"[REDACTED]"``) so callers can see
+    which headers are configured without leaking the actual secrets.
+    ``env`` is still fully excluded.
 
     :param name: Server name as declared in the agent spec,
         e.g. ``"github"``.
@@ -67,6 +66,9 @@ class MCPServerSummary(BaseModel):
     :param url: HTTP(S) endpoint URL for ``transport="http"``
         servers, e.g. ``"https://mcp.example.com/sse"``. ``None``
         for stdio servers.
+    :param headers: HTTP headers for ``transport="http"`` servers.
+        Values are always ``"[REDACTED]"``; only the key names are
+        exposed.
     :param command: Executable path for ``transport="stdio"``
         servers, e.g. ``"uvx"``. ``None`` for http servers.
     :param args: Command-line arguments for ``transport="stdio"``
@@ -78,6 +80,7 @@ class MCPServerSummary(BaseModel):
     transport: str
     description: str | None = None
     url: str | None = None
+    headers: dict[str, str] = Field(default_factory=dict)
     command: str | None = None
     args: list[str] = Field(default_factory=list)
 
@@ -89,15 +92,15 @@ class UpsertMCPServerRequest(BaseModel):
     """
     Request body for creating or updating a session agent MCP server.
 
-    Secret-bearing fields (``headers`` and ``env``) are intentionally
-    not accepted by the UI route. Existing secrets are preserved when a
-    server is edited without changing transport.
+    ``env`` is still excluded. ``headers`` is accepted for HTTP servers;
+    when omitted, existing headers in the bundle are preserved unchanged.
     """
 
     name: str = Field(min_length=1, max_length=128, pattern=_MCP_SERVER_NAME_RE)
     transport: Literal["http", "stdio"]
     description: str | None = Field(default=None, max_length=512)
     url: str | None = None
+    headers: dict[str, str] | None = None
     command: str | None = None
     args: list[str] = Field(default_factory=list, max_length=64)
 

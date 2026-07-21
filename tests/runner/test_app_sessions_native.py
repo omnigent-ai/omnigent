@@ -64,10 +64,12 @@ from omnigent.runner.app import (
     _auto_create_repl_terminal,
     _deliver_subagent_wake_post,
     _KiroNativeLaunchConfig,
+    _load_claude_launch_metadata,
     _log_terminal_lookup_miss,
     _PiNativeLaunchConfig,
     _publish_native_terminal_start_error,
     _publish_terminal_pending,
+    _refresh_claude_permission_hook_auth,
     _resolved_workdir_for_spec,
     _session_labels_for_runner_spawn,
     _terminal_lookup_miss_log_state,
@@ -83,6 +85,7 @@ from omnigent.runner.resource_registry import (
     PI_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
 )
+from omnigent.runner.session_init_protocol import RunnerSessionInitEnvelope
 from omnigent.spec.types import AgentSpec, ExecutorSpec, LocalToolInfo, MCPServerConfig
 from omnigent.terminals import TerminalRegistry
 from tests.runner.helpers import NullServerClient
@@ -2713,6 +2716,7 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
     #   worktree    — the session's stored workspace (correct answer)
     runner_env = tmp_path / "runner_workspace"
     runner_env.mkdir()
+    monkeypatch.setenv("OMNIGENT_SESSION_RENAME", "on")
     bundle_dir = tmp_path / "runner-specs" / f"{session_id}-v1"
     bundle_dir.mkdir(parents=True)
     worktree = tmp_path / "repo-worktrees" / "feature-x"
@@ -4343,6 +4347,82 @@ async def test_create_session() -> None:
     assert "created_at" in body
     assert body["items"] == []
     assert pm.has_session("8e32600337d08f59ad381caf96a90659")
+
+
+@pytest.mark.asyncio
+async def test_create_session_envelope_is_single_flight_and_skips_metadata_callbacks() -> None:
+    """Concurrent v2 initialization resolves once and uses supplied metadata."""
+
+    class _ServerClient:
+        def __init__(self) -> None:
+            self.get_paths: list[str] = []
+
+        async def get(self, path: str, **_kwargs: Any) -> Any:
+            self.get_paths.append(path)
+            if path.endswith("/items"):
+                return type(
+                    "Response",
+                    (),
+                    {"status_code": 200, "json": lambda self: {"data": []}},
+                )()
+            raise AssertionError(f"unexpected metadata callback: {path}")
+
+    server_client = _ServerClient()
+    harness_client = _ScriptedHarnessClient([])
+    pm = _FakeProcessManager(harness_client)
+    resolver_entered = asyncio.Event()
+    release_resolver = asyncio.Event()
+    resolver_calls = 0
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        nonlocal resolver_calls
+        del agent_id, session_id
+        resolver_calls += 1
+        resolver_entered.set()
+        await release_resolver.wait()
+        return AgentSpec(spec_version=1, name="single-flight")
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=server_client,  # type: ignore[arg-type]
+        resource_registry=SessionResourceRegistry(terminal_registry=None),
+    )
+    session_id = "initv2_8e32600337d08f59ad381caf96a90659"
+    agent_id = "agentv2_880b5afda28ad55ff74cbeb9b5fc67fb"
+    payload = {
+        "session_id": session_id,
+        "agent_id": agent_id,
+        "sub_agent_name": None,
+        "session_init": {
+            "protocol_version": 2,
+            "server_version": "0.6.0.dev0",
+            "session_id": session_id,
+            "agent_id": agent_id,
+            "sub_agent_name": None,
+            "snapshot": {
+                "created_at": 1234,
+                "updated_at": 1234,
+                "workspace": None,
+                "labels": {},
+            },
+        },
+    }
+
+    async with _runner_client(app) as client:
+        first = asyncio.create_task(client.post("/v1/sessions", json=payload))
+        await resolver_entered.wait()
+        second = asyncio.create_task(client.post("/v1/sessions", json=payload))
+        await asyncio.sleep(0)
+        release_resolver.set()
+        first_response, second_response = await asyncio.gather(first, second)
+
+    assert first_response.status_code == second_response.status_code == 201
+    assert first_response.json()["created_at"] == 1234
+    assert first_response.json()["session_init_protocol_version"] == 2
+    assert resolver_calls == 1
+    assert len(pm.get_client_calls) == 1
+    assert server_client.get_paths == [f"/v1/sessions/{session_id}/items"]
 
 
 @pytest.mark.asyncio
@@ -14243,9 +14323,25 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
     SessionStart/Stop/.../PreCompact + statusLine but no
     PermissionRequest).
     """
+    monkeypatch.setenv("OMNIGENT_SESSION_RENAME", "on")
     monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+
+    token_calls: list[int] = []
+
+    def _shared_auth_factory() -> str:
+        token_calls.append(1)
+        return "shared-runner-token"
+
+    def _unexpected_auth_resolution(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        raise AssertionError("terminal launch must reuse the runner auth factory")
+
+    monkeypatch.setattr(
+        "omnigent.runner._entry._make_auth_token_factory",
+        _unexpected_auth_resolution,
+    )
 
     # The real forwarder opens an HTTP stream to the server; stub it so
     # the auto-create flow runs without network. The created task is
@@ -14296,6 +14392,7 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
         _FakeResourceRegistry(),
         lambda _sid, _evt: None,
         server_client=NullServerClient(),  # type: ignore[arg-type]
+        auth_token_factory=_shared_auth_factory,
     )
 
     spec = captured["spec"]
@@ -14322,6 +14419,8 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
         bridge_dir_for_bridge_id("4e92b5a0c0ee6db3f874f9c4a3f855a5")
     )
     assert config["ap_server_url"] == "http://127.0.0.1:8000"
+    assert config["ap_auth_headers"]["Authorization"] == "Bearer shared-runner-token"
+    assert token_calls == [1]
 
     # The forwarder must get a refresh-capable httpx.Auth (not just a
     # one-shot Authorization header) so a long-running host-spawned
@@ -14332,6 +14431,49 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
 
     await asyncio.sleep(0)
     assert isinstance(forwarder_kwargs.get("auth"), _RunnerDatabricksAuth)
+
+
+@pytest.mark.asyncio
+async def test_claude_permission_hook_snapshot_refreshes_without_binding_token(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The parent runner refreshes delegated hook auth in the bridge file."""
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    bridge_dir = prepare_bridge_dir("refresh-hook-auth", workspace=tmp_path)
+    claude_native_bridge.build_hook_settings(
+        bridge_dir,
+        ap_server_url="https://omnigent.example.com",
+        ap_auth_headers={"Authorization": "Bearer old-token"},
+    )
+
+    task = asyncio.create_task(
+        _refresh_claude_permission_hook_auth(
+            bridge_dir=bridge_dir,
+            server_url="https://omnigent.example.com",
+            auth_token_factory=lambda: "fresh-delegated-token",
+            refresh_interval_s=0.01,
+        )
+    )
+    try:
+
+        async def _wait_for_refresh() -> None:
+            while True:
+                config = read_permission_hook_config(bridge_dir)
+                if config.get("ap_auth_headers", {}).get("Authorization") == (
+                    "Bearer fresh-delegated-token"
+                ):
+                    return
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(_wait_for_refresh(), timeout=1.0)
+    finally:
+        task.cancel()
+        _ = await asyncio.gather(task, return_exceptions=True)
+
+    config = read_permission_hook_config(bridge_dir)
+    assert config["ap_auth_headers"]["Authorization"] == "Bearer fresh-delegated-token"
 
 
 @pytest.mark.asyncio
@@ -14766,7 +14908,9 @@ async def test_auto_create_pi_terminal_inherits_agent_sandbox(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("use_envelope", [False, True], ids=["legacy", "envelope"])
 async def test_auto_create_claude_terminal_passes_session_effort(
+    use_envelope: bool,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -14822,21 +14966,46 @@ async def test_auto_create_claude_terminal_passes_session_effort(
             )
 
     # Fake Omnigent server client that returns a session with reasoning_effort.
+    def _handle_request(_request: httpx.Request) -> httpx.Response:
+        if use_envelope:
+            raise AssertionError("envelope terminal startup made a legacy HTTP callback")
+        return httpx.Response(
+            200,
+            json={"reasoning_effort": "high", "labels": {}},
+        )
+
     fake_client = httpx.AsyncClient(
         base_url="http://test-server",
-        transport=httpx.MockTransport(
-            lambda req: httpx.Response(
-                200,
-                json={"reasoning_effort": "high", "labels": {}},
-            )
-        ),
+        transport=httpx.MockTransport(_handle_request),
+    )
+
+    session_id = "f89fd41f6eefee45b2117ac0fcbc73fa"
+    session_init = (
+        RunnerSessionInitEnvelope.model_validate(
+            {
+                "protocol_version": 2,
+                "server_version": "0.6.0.dev0",
+                "session_id": session_id,
+                "agent_id": "agent",
+                "snapshot": {
+                    "created_at": 10,
+                    "updated_at": 11,
+                    "workspace": str(tmp_path),
+                    "reasoning_effort": "high",
+                    "labels": {},
+                },
+            }
+        )
+        if use_envelope
+        else None
     )
 
     await _auto_create_claude_terminal(
-        "f89fd41f6eefee45b2117ac0fcbc73fa",
+        session_id,
         _FakeResourceRegistry(),
         lambda _sid, _evt: None,
         server_client=fake_client,
+        session_init=session_init,
     )
 
     args = captured["spec"].args
@@ -14845,6 +15014,46 @@ async def test_auto_create_claude_terminal_passes_session_effort(
     assert args[effort_idx + 1] == "high"
 
     await fake_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_claude_launch_metadata_envelope_never_calls_server() -> None:
+    """Resume configuration comes entirely from a v2 envelope."""
+
+    class _NoCallbackClient:
+        async def get(self, path: str, **_kwargs: Any) -> Any:
+            raise AssertionError(f"envelope path made legacy callback: {path}")
+
+    envelope = RunnerSessionInitEnvelope.model_validate(
+        {
+            "protocol_version": 2,
+            "server_version": "0.6.0.dev0",
+            "session_id": "conv_resume",
+            "agent_id": "agent_resume",
+            "snapshot": {
+                "created_at": 10,
+                "updated_at": 11,
+                "workspace": "/tmp/worktree",
+                "reasoning_effort": "high",
+                "model_override": "claude-opus-4-7",
+                "terminal_launch_args": ["--verbose"],
+                "external_session_id": "claude-session-id",
+                "labels": {"omnigent.fork.carry_history": "1"},
+            },
+        }
+    )
+
+    metadata = await _load_claude_launch_metadata(
+        server_client=_NoCallbackClient(),  # type: ignore[arg-type]
+        session_id="conv_resume",
+        session_init=envelope,
+    )
+
+    assert metadata.reasoning_effort == "high"
+    assert metadata.model_override == "claude-opus-4-7"
+    assert metadata.terminal_launch_args == ["--verbose"]
+    assert metadata.external_session_id == "claude-session-id"
+    assert metadata.fork_carry_history is True
 
 
 def test_agent_os_env_from_spec_unwraps_resolved_and_handles_none() -> None:
@@ -15317,6 +15526,7 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
     :param tmp_path: Pytest-provided temporary directory.
     :param monkeypatch: Pytest monkeypatch fixture.
     """
+    monkeypatch.setenv("OMNIGENT_SESSION_RENAME", "on")
     monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
@@ -16199,8 +16409,10 @@ _AUTO_CREATE_SCENARIOS = [
 @pytest.mark.parametrize(
     "scenario", _AUTO_CREATE_SCENARIOS, ids=[s.case_id for s in _AUTO_CREATE_SCENARIOS]
 )
+@pytest.mark.parametrize("use_envelope", [False, True], ids=["legacy", "envelope"])
 async def test_create_session_auto_create_guard_skips_rotation_targets(
     scenario: _AutoCreateScenario,
+    use_envelope: bool,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -16302,13 +16514,28 @@ async def test_create_session_auto_create_guard_skips_rotation_targets(
         terminal_registry=terminal_registry,
     )
 
+    payload: dict[str, Any] = {
+        "session_id": "2d1b1a96e3e08f2cd43c0cc4b695ac5d",
+        "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+    }
+    if use_envelope:
+        payload["session_init"] = {
+            "protocol_version": 2,
+            "server_version": "0.6.0.dev0",
+            "session_id": payload["session_id"],
+            "agent_id": payload["agent_id"],
+            "snapshot": {
+                "created_at": 10,
+                "updated_at": 11,
+                "workspace": str(tmp_path),
+                "labels": {BRIDGE_ID_LABEL_KEY: scenario.bridge_id_label},
+            },
+        }
+
     async with _runner_client(app) as client:
         resp = await client.post(
             "/v1/sessions",
-            json={
-                "session_id": "2d1b1a96e3e08f2cd43c0cc4b695ac5d",
-                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
-            },
+            json=payload,
         )
     assert resp.status_code == 201, resp.text
 

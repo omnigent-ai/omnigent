@@ -10,6 +10,7 @@ drift.
 from __future__ import annotations
 
 from omnigent import harness_plugins as hp
+from omnigent.harness_availability import CODEX_CANONICAL_HARNESSES
 from omnigent.harness_capabilities import (
     AuthModel,
     EffortFamily,
@@ -29,7 +30,6 @@ from omnigent.harness_plugins import (
 from omnigent.model_override import (
     _ANTIGRAVITY_FAMILY_HARNESSES,
     _CLAUDE_FAMILY_HARNESSES,
-    _CODEX_FAMILY_HARNESSES,
 )
 
 _NATIVE_MODES = frozenset({IntegrationMode.NATIVE_TUI, IntegrationMode.NATIVE_SERVER})
@@ -61,7 +61,7 @@ def test_model_family_matches_model_override_sets() -> None:
         family = capability.model_family
         if harness in _CLAUDE_FAMILY_HARNESSES:
             assert family is ModelFamily.CLAUDE, harness
-        elif harness in _CODEX_FAMILY_HARNESSES:
+        elif harness in CODEX_CANONICAL_HARNESSES:
             assert family is ModelFamily.GPT, harness
         elif harness in _ANTIGRAVITY_FAMILY_HARNESSES:
             assert family is ModelFamily.GEMINI, harness

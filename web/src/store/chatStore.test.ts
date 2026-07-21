@@ -2484,8 +2484,9 @@ describe("chatStore — send while streaming (queueing)", () => {
     // The denied queued message was never persisted, so its optimistic
     // bubble must disappear even though the previous response is still live.
     expect(state.pendingUserMessages).toEqual([]);
-    // Denying the queued input must not mark the already-streaming prior
-    // response idle; that response still needs its own response_end.
+    // The denied branch of `send` only settles status when NOT already
+    // streaming, so the POST-return path leaves the prior turn's
+    // running/streaming state intact here.
     expect(state.status).toBe("streaming");
     expect(state.sessionStatus).toBe("running");
     expect(state.activeResponse).toEqual({
@@ -2494,17 +2495,28 @@ describe("chatStore — send while streaming (queueing)", () => {
       error: null,
     });
 
+    // Accepted trade-off: the server's deny short-circuit still publishes a
+    // session-level running→idle pair for the denied out-of-band input, and
+    // the client now trusts `session.status` 1:1 (the guard that used to
+    // suppress this stray idle was removed to fix the fresh-session
+    // "Working…" persists bug). So this idle DOES flip `sessionStatus` to
+    // idle mid-stream. The bubble lifecycle is unaffected — `status` /
+    // `activeResponse` still defer to the streaming turn's own response_end —
+    // and the next real status edge re-asserts running, so the effect is a
+    // brief indicator blip confined to the rare deny-while-streaming case.
     handleSessionEvent({
       type: "session_status",
       conversationId: "conv_abc",
       status: "idle",
     });
     const afterIdle = useChatStore.getState();
-    // The server's deny short-circuit publishes running→idle for the
-    // queued input. That idle must not clear the prior response's
-    // running/working signal while its active response is still streaming.
+    expect(afterIdle.sessionStatus).toBe("idle");
     expect(afterIdle.status).toBe("streaming");
-    expect(afterIdle.sessionStatus).toBe("running");
+    expect(afterIdle.activeResponse).toEqual({
+      responseId: "resp_in_flight",
+      state: "streaming",
+      error: null,
+    });
   });
 });
 
@@ -3209,7 +3221,7 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       ]);
     });
 
-    it("idle preserves a still-streaming active response until response_end arrives", () => {
+    it("idle settles sessionStatus but preserves a still-streaming bubble until response_end", () => {
       useChatStore.setState({
         status: "streaming",
         sessionStatus: "running",
@@ -3223,16 +3235,20 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       });
 
       const state = useChatStore.getState();
-      // A real response bubble is closed by response_end, not by the
-      // coarser session.status signal. Clearing status here would make
-      // the bubble lifecycle disagree with the streaming reducer.
+      // sessionStatus tracks the server's session-level status 1:1 — a server
+      // idle means idle, and the "Working…" indicator (which reads only
+      // sessionStatus) must turn off. The bubble lifecycle is separate: a real
+      // response bubble is still closed by response_end, not by the coarser
+      // session.status signal, so the local `status`/`activeResponse` stay
+      // streaming until response_end lands (dropping the guard that used to
+      // strand sessionStatus at "running" — the "Working…" persists bug).
+      expect(state.sessionStatus).toBe("idle");
       expect(state.status).toBe("streaming");
       expect(state.activeResponse).toEqual({
         responseId: "resp_live",
         state: "streaming",
         error: null,
       });
-      expect(state.sessionStatus).toBe("running");
     });
 
     it("idle refetches the parent's child list when the conversation is a child", () => {
