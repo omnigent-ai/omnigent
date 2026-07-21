@@ -420,3 +420,43 @@ async def test_install_harness_offline_host_returns_409(
         resp = await client.post(f"/v1/hosts/{_HOST_ID}/harnesses/claude/install")
 
     assert resp.status_code == 409
+
+
+async def test_install_harness_non_owner_returns_403(
+    install_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """A host owned by another user returns 403 — not installable by non-owners.
+
+    Exercises the ownership branch with a real authenticated ``user_id`` (the
+    default fixtures run unauthenticated, so ``user_id`` is ``None`` and the
+    comparison is skipped): a host owned by alice, hit with bob's identity, must
+    403. Guards the ``host.user_id`` owner check against a field rename.
+    """
+    from omnigent.server.auth import AuthProvider
+
+    _app, _reg, host_store, conv_store = install_app
+
+    class _Stub(AuthProvider):
+        def get_user_id(self, request: Any) -> str | None:
+            return request.headers.get("X-Test-User")
+
+    auth = _Stub()
+    auth_app = FastAPI()
+    registry = HostRegistry()
+    auth_app.include_router(
+        create_host_tunnel_router(registry, host_store, auth_provider=auth), prefix="/v1"
+    )
+    auth_app.include_router(
+        create_hosts_router(registry, host_store, conv_store, auth_provider=auth), prefix="/v1"
+    )
+    host_store.upsert_on_connect(host_id=_HOST_ID, name=_HOST_NAME, user_id="alice@example.com")
+
+    async with AsyncClient(
+        transport=ASGITransport(app=auth_app), base_url="http://test"
+    ) as client:
+        resp = await client.post(
+            f"/v1/hosts/{_HOST_ID}/harnesses/claude/install",
+            headers={"X-Test-User": "bob@example.com"},
+        )
+
+    assert resp.status_code == 403

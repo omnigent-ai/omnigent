@@ -1062,7 +1062,7 @@ def create_hosts_router(
         host = await asyncio.to_thread(host_store.get_host, host_id)
         if host is None:
             raise HTTPException(status_code=404, detail="host not found")
-        if user_id is not None and host.owner != user_id:
+        if user_id is not None and host.user_id != user_id:
             raise HTTPException(status_code=403, detail="not your host")
 
         conn = host_registry.get(host.host_id)
