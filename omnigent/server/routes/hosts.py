@@ -72,6 +72,10 @@ _CREATE_DIR_TIMEOUT_S = 5.0
 # headroom) keeps a genuine slow install from timing out at the server while
 # the host is still succeeding — a "504 but actually installed" outcome.
 _INSTALL_HARNESS_TIMEOUT_S = 420.0
+# Env var that opts a deployment into the UI harness-install feature (default
+# off). Named once here and shared by the route (this file) and the /v1/info
+# flag in app.py so the two reads can never diverge on a typo.
+HARNESS_INSTALL_ENABLED_ENV = "OMNIGENT_HARNESS_INSTALL_ENABLED"
 
 
 async def _proxy_list_dir(
@@ -1039,7 +1043,7 @@ def create_hosts_router(
         """
         # Feature flag (default off): a disabled route is indistinguishable
         # from a non-existent one, so the feature is fully dark until opted in.
-        if not env_truthy(os.environ.get("OMNIGENT_HARNESS_INSTALL_ENABLED")):
+        if not env_truthy(os.environ.get(HARNESS_INSTALL_ENABLED_ENV)):
             raise HTTPException(status_code=404, detail="not found")
 
         # Allowlist (400) is checked before the ownership check (403) so error
@@ -1073,7 +1077,7 @@ def create_hosts_router(
         if existing is not None:
             result = await asyncio.shield(existing)
         else:
-            task = asyncio.ensure_future(
+            task = asyncio.create_task(
                 _proxy_install_harness(
                     host_registry=host_registry,
                     host_conn=conn,

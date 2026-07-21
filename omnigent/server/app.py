@@ -2076,9 +2076,12 @@ def create_app(
         # (OMNIGENT_HARNESS_INSTALL_ENABLED=1 opts in) while the feature rolls
         # out; when false the SPA keeps the prior "run omnigent setup" hint.
         # Read live so flipping the env var takes effect without a rebuild.
+        # The env-var name is shared with the install route so the flag the UI
+        # sees and the flag the route enforces can never drift apart.
         from omnigent.process_logging import env_truthy
+        from omnigent.server.routes.hosts import HARNESS_INSTALL_ENABLED_ENV
 
-        harness_install_enabled = env_truthy(os.environ.get("OMNIGENT_HARNESS_INSTALL_ENABLED"))
+        harness_install_enabled = env_truthy(os.environ.get(HARNESS_INSTALL_ENABLED_ENV))
         return {
             "accounts_enabled": accounts_enabled,
             "single_user": single_user,
