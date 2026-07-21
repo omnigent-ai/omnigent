@@ -419,6 +419,15 @@ async def _resolve_effective_task(deps: FireDeps, task: ScheduledTask) -> Schedu
         host_id = await _resolve_owner_host(deps, task)
     workspace = task.workspace
     if workspace is None:
+        # Authorize a PINNED host's ownership BEFORE the home-dir stat below.
+        # ``_resolve_default_workspace`` issues a ``host.stat`` RPC to the host,
+        # and the ownership check otherwise lives in the preflight, which runs
+        # AFTER resolution — so a task pinning another owner's host would dispatch
+        # a stat to a host it doesn't own before being rejected. A host resolved
+        # above (``task.host_id`` was None) is by construction the owner's own, so
+        # only the pinned case needs this pre-RPC check.
+        if task.host_id is not None:
+            await _authorize_pinned_host(deps, task, host_id)
         # Canonicalize the host's home dir to an ABSOLUTE realpath rather than
         # persisting the literal ``~``. ``conv.workspace`` is contracted to be an
         # already-resolved absolute path (many consumers do plain ``Path`` math /
@@ -643,6 +652,33 @@ def _validate_connected_host_inputs(task: ScheduledTask) -> tuple[str, str] | No
     return None
 
 
+async def _authorize_pinned_host(deps: FireDeps, task: ScheduledTask, host_id: str) -> None:
+    """Verify a host belongs to the task owner (local store read, no host RPC).
+
+    Shared by the preflight and by :func:`_resolve_effective_task`'s pre-stat
+    check so a task pinning another owner's host is rejected before any RPC
+    reaches that host. ``get_host`` is a local DB lookup — it never contacts the
+    host. When ``owner_user_id`` is ``None`` (single-user / auth disabled) the
+    owner check is skipped, matching the preflight and the rest of the server.
+    """
+    if deps.host_store is None:
+        raise _CannotLaunchScheduledFire(
+            "connected host registry/store is not configured",
+            error_code="host_registry_unavailable",
+        )
+    host = await asyncio.to_thread(deps.host_store.get_host, host_id)
+    if host is None:
+        raise _CannotLaunchScheduledFire(
+            f"connected host {host_id!r} was not found",
+            error_code="host_not_found",
+        )
+    if task.owner_user_id is not None and host.owner != task.owner_user_id:
+        raise _CannotLaunchScheduledFire(
+            f"connected host {host_id!r} is not owned by the scheduled task owner",
+            error_code="host_not_owned",
+        )
+
+
 def _make_connected_host_preflight(deps: FireDeps) -> ConnectedHostPreflight:
     """Build a preflight check for the connected-host execution target."""
 
@@ -655,17 +691,8 @@ def _make_connected_host_preflight(deps: FireDeps) -> ConnectedHostPreflight:
 
         host_id = task.host_id
         assert host_id is not None  # guarded by _validate_connected_host_inputs
-        host = await asyncio.to_thread(deps.host_store.get_host, host_id)
-        if host is None:
-            raise _CannotLaunchScheduledFire(
-                f"connected host {host_id!r} was not found",
-                error_code="host_not_found",
-            )
-        if task.owner_user_id is not None and host.owner != task.owner_user_id:
-            raise _CannotLaunchScheduledFire(
-                f"connected host {host_id!r} is not owned by the scheduled task owner",
-                error_code="host_not_owned",
-            )
+        # Existence + ownership (local store read; no RPC to the host).
+        await _authorize_pinned_host(deps, task, host_id)
         if deps.host_registry.get(host_id) is None:
             raise _CannotLaunchScheduledFire(
                 f"connected host {host_id!r} is not online on this server",

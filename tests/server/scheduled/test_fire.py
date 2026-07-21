@@ -731,6 +731,49 @@ async def test_pinned_host_no_workspace_defaults_to_host_home(
 
 
 @pytest.mark.asyncio
+async def test_pinned_nonowned_host_no_workspace_rejected_before_stat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pinning ANOTHER owner's online host with no workspace fails host_not_owned
+    WITHOUT dispatching the default-workspace stat RPC to the non-owned host —
+    ownership is authorized before any RPC reaches it."""
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(
+        rows={
+            "task_1": _task(owner_user_id="alice@example.com", host_id="host_bob", workspace=None)
+        }
+    )
+
+    resolve_calls: list[str] = []
+
+    async def _spy_resolve(deps: Any, host_id: str) -> str:
+        resolve_calls.append(host_id)
+        return "/home/bob"
+
+    monkeypatch.setattr(fire_mod, "_resolve_default_workspace", _spy_resolve)
+
+    on_fire = build_on_fire(
+        _deps(
+            store,
+            conversation_store=conv_store,
+            # The pinned host is online but owned by bob, not alice.
+            host_store=FakeHostStore({"host_bob": _FakeHost("host_bob", "bob@example.com")}),
+            host_registry=FakeHostRegistry(online={"host_bob"}),
+        )
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    # Rejected on ownership; NO stat RPC dispatched to the non-owned host.
+    assert resolve_calls == []
+    assert conv_store.created == []
+    assert len(store.runs) == 1
+    assert store.runs[0]["status"] == "failed"
+    assert store.runs[0]["error_code"] == "host_not_owned"
+    assert store.runs[0]["conversation_id"] is None
+
+
+@pytest.mark.asyncio
 async def test_no_workspace_unresolvable_home_records_failed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
