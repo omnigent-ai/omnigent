@@ -7309,7 +7309,7 @@ def _kick_managed_relaunch(
     relaunch_task = asyncio.create_task(
         _run_managed_launch(
             session_id=session_id,
-            owner=host.owner,
+            owner=host.user_id,
             sandbox_config=sandbox_config,
             repo=repo,
             tracker=tracker,
@@ -21683,6 +21683,7 @@ def create_sessions_router(
                         transport=srv.transport,
                         description=srv.description,
                         url=srv.url,
+                        headers=dict.fromkeys(srv.headers, "[REDACTED]") if srv.headers else {},
                         command=srv.command,
                         args=srv.args,
                     )

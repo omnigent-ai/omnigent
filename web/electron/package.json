@@ -22,7 +22,15 @@
     "build:mac": "electron-builder --mac",
     "build:mac:release": "electron-builder --mac -c.mac.notarize=true",
     "build:linux": "electron-builder --linux",
-    "build:win": "electron-builder --win"
+    "build:win": "electron-builder --win",
+    "build:overlay": "npm --prefix ../ run build:overlay",
+    "predev": "npm run build:overlay",
+    "prestart": "npm run build:overlay",
+    "prebuild": "npm run build:overlay",
+    "prebuild:mac": "npm run build:overlay",
+    "prebuild:mac:release": "npm run build:overlay",
+    "prebuild:linux": "npm run build:overlay",
+    "prebuild:win": "npm run build:overlay"
   },
   "devDependencies": {
     "electron": "^42.3.2",
@@ -44,9 +52,8 @@
     ],
     "publish": [
       {
-        "provider": "github",
-        "owner": "omnigent-ai",
-        "repo": "omnigent"
+        "provider": "generic",
+        "url": "https://omnigent.ai/_desktop/updates/"
       }
     ],
     "afterPack": "build/afterPack.js",
@@ -54,7 +61,8 @@
       "src/**/*",
       "setup/**/*",
       "find/**/*",
-      "icons/**/*"
+      "icons/**/*",
+      "overlay/**/*"
     ],
     "extraResources": [
       {
@@ -86,7 +94,7 @@
       "publish": [
         {
           "provider": "generic",
-          "url": "https://diksk5m140cfbma7.public.blob.vercel-storage.com/mac/"
+          "url": "https://omnigent.ai/_desktop/updates/"
         }
       ]
     },
@@ -122,7 +130,7 @@
       "publish": [
         {
           "provider": "generic",
-          "url": "https://diksk5m140cfbma7.public.blob.vercel-storage.com/linux/"
+          "url": "https://omnigent.ai/_desktop/updates/"
         }
       ]
     },
@@ -134,7 +142,7 @@
       "publish": [
         {
           "provider": "generic",
-          "url": "https://diksk5m140cfbma7.public.blob.vercel-storage.com/win/"
+          "url": "https://omnigent.ai/_desktop/updates/"
         }
       ]
     }

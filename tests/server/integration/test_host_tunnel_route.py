@@ -550,7 +550,7 @@ async def test_cross_owner_refused_with_409_before_accept(db_uri: str) -> None:
     """
     app, registry, store = _owned_app(db_uri, authed_user="bob@example.com")
     # The host_id is already owned by someone else.
-    store.upsert_on_connect(host_id=_HOST_ID, name="alices-laptop", owner="alice@example.com")
+    store.upsert_on_connect(host_id=_HOST_ID, name="alices-laptop", user_id="alice@example.com")
 
     scope = _websocket_scope(_TUNNEL_PATH)
     # Advertise the denial-response extension, as uvicorn does in prod.
@@ -570,7 +570,7 @@ async def test_cross_owner_refused_with_409_before_accept(db_uri: str) -> None:
     assert registry.get(_HOST_ID) is None
     host = store.get_host(_HOST_ID)
     assert host is not None
-    assert host.owner == "alice@example.com"
+    assert host.user_id == "alice@example.com"
     assert host.status == "online"
 
 
@@ -582,7 +582,7 @@ async def test_cross_owner_refused_with_close_when_no_denial_extension(db_uri: s
     just with the less specific message.
     """
     app, registry, store = _owned_app(db_uri, authed_user="bob@example.com")
-    store.upsert_on_connect(host_id=_HOST_ID, name="alices-laptop", owner="alice@example.com")
+    store.upsert_on_connect(host_id=_HOST_ID, name="alices-laptop", user_id="alice@example.com")
 
     # No "extensions" key in the scope → fallback path.
     comm = ApplicationCommunicator(app, _websocket_scope(_TUNNEL_PATH))
@@ -601,7 +601,7 @@ async def test_same_owner_reconnect_still_accepts(db_uri: str) -> None:
     otherwise the new check would break normal reconnection.
     """
     app, registry, store = _owned_app(db_uri, authed_user="bob@example.com")
-    store.upsert_on_connect(host_id=_HOST_ID, name="bobs-laptop", owner="bob@example.com")
+    store.upsert_on_connect(host_id=_HOST_ID, name="bobs-laptop", user_id="bob@example.com")
 
     comm = await _connect_route(app, _TUNNEL_PATH)
     await _send_hello_and_wait(comm, registry, name="bobs-laptop")
@@ -609,7 +609,7 @@ async def test_same_owner_reconnect_still_accepts(db_uri: str) -> None:
     assert _HOST_ID in registry.online_host_ids()
     host = store.get_host(_HOST_ID)
     assert host is not None
-    assert host.owner == "bob@example.com"
+    assert host.user_id == "bob@example.com"
     assert host.status == "online"
 
     await comm.send_input({"type": "websocket.disconnect", "code": 1000})
@@ -652,7 +652,7 @@ def _register_managed(
     store.register_managed_host(
         host_id=host_id,
         name=f"managed-{host_id}",
-        owner="alice@example.com",
+        user_id="alice@example.com",
         token=token,
         provider="modal",
         sandbox_id="sb-tunnel-1",
@@ -683,7 +683,7 @@ async def test_managed_token_authenticates_as_record_owner(
 
     host = store.get_host(_HOST_ID)
     assert host is not None
-    assert host.owner == "alice@example.com"
+    assert host.user_id == "alice@example.com"
     assert host.status == "online"
     # The managed binding survives the connect upsert.
     assert host.sandbox_id == "sb-tunnel-1"

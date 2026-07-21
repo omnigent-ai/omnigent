@@ -56,6 +56,7 @@ def _stub_host_workspace_validation(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.fixture()
 def auth_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
     from omnigent.server.auth import UnifiedAuthProvider
+    from omnigent.stores.host_store import HostStore
 
     artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
     return create_app(
@@ -66,8 +67,22 @@ def auth_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
         agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
         permission_store=SqlAlchemyPermissionStore(db_uri),
         scheduled_task_store=SqlAlchemyScheduledTaskStore(db_uri),
+        # A real host store so pinned-host create authorization (existence +
+        # ownership) resolves against actual host rows. Without it,
+        # ``app.state.host_store`` is None and the route skips the check.
+        host_store=HostStore(db_uri),
         auth_provider=UnifiedAuthProvider(source="header"),
     )
+
+
+def _register_host(app: FastAPI, host_id: str, owner: str) -> None:
+    """Persist a host owned by ``owner`` so the pinned-host owner check resolves.
+
+    A local store row is all the create-time authorization needs — it never
+    contacts the host (no ``host.stat`` / workspace RPC in the no-workspace
+    path), so the host does not need to be online in the registry.
+    """
+    app.state.host_store.upsert_on_connect(host_id, f"{owner}-laptop", owner)
 
 
 @pytest_asyncio.fixture()
@@ -144,6 +159,40 @@ async def test_create_lists_and_gets(auth_client: httpx.AsyncClient, db_uri: str
     assert got.json()["id"] == task_id
 
 
+async def test_create_no_workspace_task_persists_null_host_and_workspace(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """A task that does no code work omits workspace + host_id; the row persists
+    both as null and the connected-host workspace validation is skipped."""
+    _make_user(db_uri)
+    body = _create_body()
+    del body["workspace"]
+    del body["host_id"]
+    resp = await auth_client.post("/v1/scheduled-tasks", json=body, headers=_headers())
+    assert resp.status_code == 200, resp.text
+    created = resp.json()
+    assert created["workspace"] is None
+    assert created["host_id"] is None
+    task_id = created["id"]
+
+    # The null binding survives a round-trip read.
+    got = await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
+    assert got.status_code == 200
+    assert got.json()["workspace"] is None
+    assert got.json()["host_id"] is None
+
+
+async def test_create_rejects_workspace_without_host(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """A workspace with no host is a broken binding, not a no-workspace task."""
+    _make_user(db_uri)
+    body = _create_body()
+    del body["host_id"]
+    resp = await auth_client.post("/v1/scheduled-tasks", json=body, headers=_headers())
+    assert resp.status_code == 400, resp.text
+
+
 async def test_create_rejects_invalid_rrule(auth_client: httpx.AsyncClient, db_uri: str) -> None:
     _make_user(db_uri)
     # FREQ=SECONDLY fires far below the 1-hour floor.
@@ -202,16 +251,95 @@ async def test_create_rejects_relative_workspace(
     assert resp.status_code == 400, resp.text
 
 
-async def test_create_rejects_missing_connected_host_inputs(
+async def test_create_pinned_host_without_workspace_persists_null_workspace(
+    auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """A pinned host with NO workspace is allowed (e.g. an MCP-only task) WHEN
+    the caller owns the host: the row persists the host and a null workspace, and
+    the connected-host workspace RPC is skipped. The fire path defaults the
+    workspace to host HOME. Ownership is still authorized at create (local read),
+    so an owned/existing host is required — see the rejection tests below."""
+    _make_user(db_uri)
+    _register_host(auth_app, "4b653f6031f35d168cc0b37caa1306d1", "alice@example.com")
+    body = _create_body()
+    del body["workspace"]
+    resp = await auth_client.post("/v1/scheduled-tasks", json=body, headers=_headers())
+    assert resp.status_code == 200, resp.text
+    created = resp.json()
+    assert created["host_id"] == "4b653f6031f35d168cc0b37caa1306d1"
+    assert created["workspace"] is None
+
+    got = await auth_client.get(f"/v1/scheduled-tasks/{created['id']}", headers=_headers())
+    assert got.status_code == 200
+    assert got.json()["host_id"] == "4b653f6031f35d168cc0b37caa1306d1"
+    assert got.json()["workspace"] is None
+
+
+async def test_create_pinned_host_without_workspace_rejects_nonexistent_host(
     auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:
+    """A pinned host with NO workspace that references a NONEXISTENT host is
+    rejected at create (404) instead of persisting an unvalidated host that only
+    fails at fire time. No host was registered, so the owner check 404s."""
     _make_user(db_uri)
+    body = _create_body()
+    del body["workspace"]  # host_id set, no workspace → the fixed authz gap
+    resp = await auth_client.post("/v1/scheduled-tasks", json=body, headers=_headers())
+    assert resp.status_code == 404, resp.text
+
+
+async def test_create_pinned_host_without_workspace_rejects_nonowned_host(
+    auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """A pinned host with NO workspace owned by ANOTHER user is rejected at
+    create (403) — create-time authorization mirrors the fire-path owner check so
+    a caller cannot persist a reference to a host they do not own."""
+    _make_user(db_uri, email="alice@example.com")
+    _make_user(db_uri, email="bob@example.com")
+    # The host belongs to bob; alice pins it with no workspace.
+    _register_host(auth_app, "4b653f6031f35d168cc0b37caa1306d1", "bob@example.com")
+    body = _create_body()
+    del body["workspace"]
     resp = await auth_client.post(
-        "/v1/scheduled-tasks",
-        json=_create_body(host_id=None),
+        "/v1/scheduled-tasks", json=body, headers=_headers("alice@example.com")
+    )
+    assert resp.status_code == 403, resp.text
+
+
+async def test_patch_add_host_without_workspace_authorizes_owner(
+    auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """PATCH shares ``_validate_launch_inputs``: adding a host_id with no
+    workspace authorizes the pin. An owned host succeeds; a non-owned host is
+    rejected (403)."""
+    _make_user(db_uri, email="alice@example.com")
+    _make_user(db_uri, email="bob@example.com")
+    # Start from a no-host, no-workspace task (a valid MCP-only task).
+    body = _create_body()
+    del body["workspace"]
+    del body["host_id"]
+    created = (await auth_client.post("/v1/scheduled-tasks", json=body, headers=_headers())).json()
+    task_id = created["id"]
+
+    # PATCH in a host alice owns, still no workspace → 200.
+    _register_host(auth_app, "aaaa1111bbbb2222cccc3333dddd4444", "alice@example.com")
+    ok = await auth_client.patch(
+        f"/v1/scheduled-tasks/{task_id}",
+        json={"host_id": "aaaa1111bbbb2222cccc3333dddd4444"},
         headers=_headers(),
     )
-    assert resp.status_code == 422, resp.text
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["host_id"] == "aaaa1111bbbb2222cccc3333dddd4444"
+    assert ok.json()["workspace"] is None
+
+    # PATCH in a host bob owns → 403 (not authorized), no drift from the fire path.
+    _register_host(auth_app, "eeee5555ffff6666aaaa7777bbbb8888", "bob@example.com")
+    denied = await auth_client.patch(
+        f"/v1/scheduled-tasks/{task_id}",
+        json={"host_id": "eeee5555ffff6666aaaa7777bbbb8888"},
+        headers=_headers("alice@example.com"),
+    )
+    assert denied.status_code == 403, denied.text
 
 
 async def test_create_rejects_unsupported_public_fields(

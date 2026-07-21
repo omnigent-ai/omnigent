@@ -197,7 +197,7 @@ async def test_list_hosts_reports_sandbox_provider_for_managed_host(
         # Auth is disabled in this fixture, so list_hosts resolves the
         # caller to the reserved "local" owner — the managed host must
         # belong to it to be visible.
-        owner="local",
+        user_id="local",
         token="launch-token-secret",
         provider="modal",
         sandbox_id="sb-12345",
@@ -953,7 +953,7 @@ async def test_tunnel_accepts_authenticated_owner(
     assert conn.owner == "alice@test.com"
     stored = host_store.get_host(host_id)
     assert stored is not None
-    assert stored.owner == "alice@test.com"
+    assert stored.user_id == "alice@test.com"
 
 
 def _register_fake_host(registry: HostRegistry, host_id: str, owner: str) -> None:
@@ -1011,7 +1011,7 @@ async def test_resolve_host_launch_enforces_host_and_session_ownership(
         **stores,
     )
     assert isinstance(target, HostLaunchTarget)
-    assert target.host.owner == "alice@test.com"
+    assert target.host.user_id == "alice@test.com"
     assert target.conv.id == conv.id
 
     # Bob targets Alice's HOST → 403. Blocks the inline-launch RCE
@@ -1137,7 +1137,7 @@ async def test_failed_connect_does_not_offline_another_users_host(
     after = host_store.get_host("be2a05c6f9530d33276f7c4b34bc39ad")
     assert after is not None
     # Bob never claimed the host_id...
-    assert after.owner == "alice@test.com"
+    assert after.user_id == "alice@test.com"
     # ...and crucially, Alice's host is still online: the pre-accept
     # refusal never runs set_offline on Bob's never-registered connection.
     assert after.status == "online", (

@@ -381,7 +381,7 @@ async def test_list_filesystem_offline_host_returns_409(
     host_store.upsert_on_connect(
         host_id="3d9665477127e41f42de3f4109418173",
         name="offline-host",
-        owner="local",
+        user_id="local",
     )
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.get("/v1/hosts/3d9665477127e41f42de3f4109418173/filesystem")
@@ -521,7 +521,7 @@ async def test_list_filesystem_owner_check_blocks_other_users(
     host_store.upsert_on_connect(
         host_id="f54bb9272002938a3a934bfcb6bb228a",
         name="alice-laptop",
-        owner="alice@example.com",
+        user_id="alice@example.com",
     )
 
     async with AsyncClient(

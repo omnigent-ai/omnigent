@@ -98,7 +98,7 @@ _SOCKET_MODE = 0o600
 # Per §Deployment knobs vs spec self-containment, this is a
 # deployment-level capacity knob — operators may tune; specs MUST
 # NOT depend on a specific value.
-_DEFAULT_IDLE_TIMEOUT_S = 30 * 60  # 30 minutes
+_DEFAULT_IDLE_TIMEOUT_S = 60 * 60  # 1 hour
 
 # How often the idle reaper wakes up to check for stale entries.
 # Picking 1/30th of the timeout keeps reaping reasonably prompt
@@ -115,7 +115,7 @@ def _resolve_harness_idle_timeout_s() -> float:
     """Resolve the harness idle-reap window in seconds.
 
     Honors :envvar:`OMNIGENT_HARNESS_IDLE_TIMEOUT_S` (``0`` disables reaping);
-    otherwise the 30-minute default. An unparseable or negative value logs a
+    otherwise the 1-hour default. An unparseable or negative value logs a
     warning and falls back to the default rather than failing the runner at
     boot — an env typo shouldn't take the runner down.
     """
@@ -526,7 +526,7 @@ class HarnessProcessManager:
 
     :param idle_timeout_s: Seconds of inactivity after which a
         subprocess gets reaped. Deployment-level capacity knob;
-        defaults to 30 minutes. Specs MUST NOT depend on a
+        defaults to 1 hour. Specs MUST NOT depend on a
         specific value.
     :param reaper_interval_s: Seconds between idle-reaper passes.
         Defaults to 60.
@@ -546,7 +546,7 @@ class HarnessProcessManager:
         tmp_parent: Path | None = None,
     ) -> None:
         # ``None`` (the default at both construction sites) resolves from the
-        # OMNIGENT_HARNESS_IDLE_TIMEOUT_S env var, else the 30-minute default.
+        # OMNIGENT_HARNESS_IDLE_TIMEOUT_S env var, else the 1-hour default.
         self._idle_timeout_s = (
             idle_timeout_s if idle_timeout_s is not None else _resolve_harness_idle_timeout_s()
         )
