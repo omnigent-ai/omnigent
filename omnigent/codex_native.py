@@ -57,7 +57,12 @@ from omnigent.codex_native_bridge import (
     socket_path_for_bridge_dir,
     write_bridge_state,
 )
-from omnigent.codex_native_forwarder import supervise_forwarder
+from omnigent.codex_native_forwarder import (
+    _THREAD_START_TIMEOUT_SECONDS as _CODEX_THREAD_START_TIMEOUT_SECONDS,
+)
+from omnigent.codex_native_forwarder import (
+    supervise_forwarder,
+)
 from omnigent.codex_native_state import read_launch_state, write_launch_state
 from omnigent.conversation_browser import conversation_url, open_conversation_link_if_enabled
 from omnigent.entities.session_resources import terminal_resource_id
@@ -96,7 +101,6 @@ _DEFAULT_CODEX_COMMAND = "codex"
 _TERMINAL_NAME = "codex"
 _TERMINAL_SESSION_KEY = "main"
 _CODEX_TERMINAL_SCROLLBACK_LINES = 100_000
-_CODEX_THREAD_START_TIMEOUT_SECONDS = 15.0
 _SESSION_LABELS = {
     "omnigent.ui": "terminal",
     _WRAPPER_LABEL_KEY: _WRAPPER_LABEL_VALUE,

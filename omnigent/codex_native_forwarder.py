@@ -62,9 +62,10 @@ _logger = logging.getLogger(__name__)
 _AGENT_NAME = "codex-native-ui"
 _SUBSCRIBE_RETRY_DELAY_SECONDS = 0.2
 # How long to wait for a freshly launched Codex TUI to create its
-# app-server thread (emit ``thread/started``) before giving up. Generous
-# because a host-spawned TUI cold-starts over the runner.
-_THREAD_START_TIMEOUT_SECONDS = 30.0
+# app-server thread (emit ``thread/started``) before giving up. A first launch
+# can populate remote plugin caches on a slow or recently reconnected network,
+# so this must cover more than the app-server's own lightweight startup.
+_THREAD_START_TIMEOUT_SECONDS = 120.0
 _NO_ROLLOUT_FRAGMENT = "no rollout found for thread id"
 # A freshly created thread passes through a second transient state: its rollout
 # file exists but is still empty (the TUI created the thread but no turn has
