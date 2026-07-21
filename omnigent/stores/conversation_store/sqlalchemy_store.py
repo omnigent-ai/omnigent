@@ -36,7 +36,6 @@ from omnigent.db.db_models import (
     SqlPolicy,
     SqlSessionPermission,
     SqlUserDailyCost,
-    conversation_title_hash,
     current_workspace_id,
     uuid_to_bytes,
 )
@@ -900,6 +899,30 @@ class SqlAlchemyConversationStore(ConversationStore):
             if parent_conversation_id is not None and not title:
                 title = f"untitled:{new_id}"
             with self._conv_session() as ap_sess:
+                # Application-level (parent, title) uniqueness — there is no DB
+                # unique constraint. Only children are scoped; top-level sessions
+                # (NULL parent) may reuse titles freely. The SELECT seeks this
+                # parent's children via idx_conversations_parent and filters
+                # title as a residual. Best-effort: a concurrent same-name create
+                # can still race past this check, yielding a duplicate child
+                # rather than an error (the common repeat-send path is served by
+                # the runner's find-or-create pre-check, so this fires only on a
+                # genuine collision).
+                if parent_conversation_id is not None:
+                    duplicate = ap_sess.execute(
+                        select(SqlConversation.id)
+                        .where(
+                            SqlConversation.workspace_id == current_workspace_id(),
+                            SqlConversation.parent_conversation_id == parent_conversation_id,
+                            SqlConversation.title == (title or ""),
+                        )
+                        .limit(1)
+                    ).first()
+                    if duplicate is not None:
+                        raise NameAlreadyExistsError(
+                            f"sub-agent name already exists under parent "
+                            f"{parent_conversation_id!r}: title={title!r}"
+                        )
                 row = SqlConversation(
                     id=new_id,
                     created_at=now,
@@ -926,21 +949,17 @@ class SqlAlchemyConversationStore(ConversationStore):
                 meta_sess.add(meta)
             return _to_conversation(row, meta)
         except IntegrityError as exc:
-            # Translate the unique-index violation into a
-            # clean exception type the spawn/send tools can map
-            # to a name_already_exists tool error. Other integrity
-            # violations (FK, check constraints) re-raise.
+            # Translate a caller-supplied-id PK collision into a clean exception
+            # type. Per-parent title uniqueness is enforced by the SELECT above,
+            # not a DB constraint, so only the id PK violation is handled here;
+            # other integrity violations (FK, check constraints) re-raise.
             #
             # Detection prefers the PK constraint name (Postgres/MySQL surface it
             # directly), and falls back on SQLite's failed-column signature:
             #   Postgres → "pk_conversations" (repo naming convention; the stock
             #     "conversations_pkey" is kept as a defensive fallback)
             #   MySQL    → duplicate entry ... for key '...PRIMARY'
-            #   SQLite   → "conversations.id" (dotted) — appears only in the
-            #     "UNIQUE constraint failed: …" clause, never in the INSERT
-            #     column list, so it cleanly separates from the title-uniqueness
-            #     index (which names title_hash, not id).
-            # id is checked before title. Other integrity violations re-raise.
+            #   SQLite   → "conversations.id" (dotted) in the failed-UNIQUE clause.
             msg = str(exc).lower()
             is_id_unique_violation = conversation_id is not None and (
                 "pk_conversations" in msg
@@ -954,14 +973,6 @@ class SqlAlchemyConversationStore(ConversationStore):
             if is_id_unique_violation:
                 raise ConversationAlreadyExistsError(
                     f"conversation id {conversation_id!r} already exists"
-                ) from exc
-            is_title_unique_violation = "ix_conversations_parent_title_unique" in msg or (
-                "unique" in msg and "parent_conversation_id" in msg and "title" in msg
-            )
-            if is_title_unique_violation:
-                raise NameAlreadyExistsError(
-                    f"sub-agent name already exists under parent "
-                    f"{parent_conversation_id!r}: title={title!r}"
                 ) from exc
             raise
 
@@ -2427,8 +2438,6 @@ class SqlAlchemyConversationStore(ConversationStore):
             ap_changed = False
             if title is not None:
                 row.title = title or ""
-                # Column default only fires on INSERT; keep the hash in sync here.
-                row.title_hash = conversation_title_hash(row.title)
                 ap_changed = True
             # Read-modify-write the override blob so partial updates preserve the
             # keys they don't touch. Only re-encode when something actually changed.
@@ -2502,10 +2511,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                     SqlConversation.id == conversation_id,
                     SqlConversation.title == expected_title,
                 )
-                # Bulk UPDATE bypasses the column default, so stamp the hash here.
                 .values(
                     title=title,
-                    title_hash=conversation_title_hash(title),
                     updated_at=now_epoch(),
                 )
             )

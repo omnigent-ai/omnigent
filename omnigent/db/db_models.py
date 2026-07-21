@@ -36,11 +36,6 @@ from omnigent.db.compression import CompressedText
 # BINARY(32) there — an exact fit for the digest and fully indexable.
 _CKSUM32 = LargeBinary(32).with_variant(MySQLBinary(32), "mysql")
 
-# 16-byte (truncated sha256) digest column, same rationale as _CKSUM32 but half
-# the width. 128 bits of collision resistance is ample for a per-parent unique
-# key, so the conversation title hash uses this narrower form.
-_CKSUM16 = LargeBinary(16).with_variant(MySQLBinary(16), "mysql")
-
 
 # Hex length of a bare uuid4 id, the canonical Python-side form.
 _UUID_HEX_LEN = 32
@@ -659,28 +654,6 @@ class SqlConversationMetadata(OmnigentBase):
     )
 
 
-def conversation_title_hash(title: str) -> bytes:
-    """Return the 16-byte truncated sha256 digest of a conversation title.
-
-    ``ix_conversations_parent_title_unique`` keys on this instead of a wide
-    512-char title prefix, so the unique index stays a fixed 16 bytes. The full
-    title is hashed verbatim (no normalization), so two titles collide iff their
-    digests do — uniqueness is exact and case-sensitive.
-    """
-    return hashlib.sha256(title.encode("utf-8")).digest()[:16]
-
-
-def _default_conversation_title_hash(context: Any) -> bytes:
-    """Column default: derive ``title_hash`` from the bound ``title`` on INSERT.
-
-    ``title`` carries a ``server_default=""``, so an INSERT that omits it leaves
-    ``title`` out of the bound params — fall back to ``""`` to match the stored
-    value. Column defaults do not fire on UPDATE, so the store recomputes it
-    explicitly on the rename paths.
-    """
-    return conversation_title_hash(context.get_current_parameters().get("title") or "")
-
-
 class SqlConversation(ConversationBase):
     """
     SQLAlchemy model for the ``conversations`` table.
@@ -726,14 +699,6 @@ class SqlConversation(ConversationBase):
     created_at: Mapped[int] = mapped_column(Integer)
     updated_at: Mapped[int] = mapped_column(Integer)
     title: Mapped[str] = mapped_column(String(768), nullable=False, server_default="")
-    # Fixed-width sha256(title)[:16] mirror of ``title`` that the unique index
-    # keys on instead of a wide title prefix. The ORM default stamps it on INSERT
-    # and the store recomputes it on rename, so every app-created row has a hash;
-    # it is nullable only so raw-SQL inserts (tests/tooling that bypass the ORM
-    # default) don't have to supply it.
-    title_hash: Mapped[bytes | None] = mapped_column(
-        _CKSUM16, nullable=True, default=_default_conversation_title_hash
-    )
     parent_conversation_id: Mapped[str | None] = mapped_column(
         Uuid16(),
         nullable=True,
@@ -782,18 +747,10 @@ class SqlConversation(ConversationBase):
             "agent_id",
             "id",
         ),
-        # Unique index on (parent_conversation_id, title_hash) prevents two
-        # same-named children under the same parent. Keys on the fixed-width
-        # title_hash rather than a wide title prefix. NULLs are distinct in a
-        # unique index, so top-level conversations (NULL parent) are exempt.
-        Index(
-            "ix_conversations_parent_title_unique",
-            "workspace_id",
-            "parent_conversation_id",
-            "title_hash",
-            unique=True,
-        ),
-        # Composite index for child-session listing.
+        # Child-session listing, and the per-parent title lookup that backs the
+        # application-level (parent, title) uniqueness check in create_conversation
+        # (no DB unique constraint: the check seeks this parent's children here and
+        # filters title as a residual).
         Index(
             "idx_conversations_parent",
             "workspace_id",
