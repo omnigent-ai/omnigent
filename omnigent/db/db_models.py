@@ -1471,8 +1471,16 @@ class SqlScheduledTask(OmnigentBase):
     __table_args__ = (
         CheckConstraint("state IN (1, 2, 3)", name="ck_scheduled_tasks_state"),
         CheckConstraint("execution_target IN (1, 2)", name="ck_scheduled_tasks_execution_target"),
-        Index("ix_scheduled_tasks_created_at", "workspace_id", "created_at", "id"),
-        Index("ix_scheduled_tasks_user_id", "workspace_id", "user_id", "id"),
+        # One user-scoped listing index. Covers "a user's tasks ordered by
+        # created_at" (GET /scheduled-tasks) as a covered seek; the scheduler's
+        # state scan reads whole rows regardless of any index.
+        Index(
+            "ix_scheduled_tasks_user_scope",
+            "workspace_id",
+            "user_id",
+            "created_at",
+            "id",
+        ),
     )
 
 
