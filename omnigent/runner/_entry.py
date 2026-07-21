@@ -29,6 +29,8 @@ from omnigent.runner.transports.ws_tunnel.serve import RUNNER_TUNNEL_REJECTION_P
 from omnigent.version import VERSION
 
 if TYPE_CHECKING:
+    from types import TracebackType
+
     from omnigent.runner.app import ResolvedSpec
     from omnigent.runner.transports.ws_tunnel.serve import _ASGIApp
 
@@ -809,6 +811,15 @@ def _run_parent_death_killer(
         return
     request_shutdown()
     time.sleep(grace_s)
+    # The hard exit is a backstop reached only when graceful shutdown did not
+    # finish within the grace window; record it since os._exit skips the
+    # exit-reason logging in _run_tunnel_from_env's finally block. The file
+    # handler flushes per record, so this lands even though os._exit follows.
+    _logger.warning(
+        "runner exiting: parent process died and graceful shutdown did not "
+        "complete within %.1fs; forcing hard exit",
+        grace_s,
+    )
     # os._exit skips buffer flushing, so flush logs first for diagnosability.
     with contextlib.suppress(Exception):
         sys.stderr.flush()
@@ -1227,10 +1238,29 @@ async def _run_tunnel_from_env() -> None:
             return False
         return bool(callback())
 
+    # Human-readable reason for why the runner is shutting down, recorded
+    # by whichever path wins the shutdown race and logged on the way out so
+    # the runner log explains the exit instead of just stopping.
+    exit_reason: str | None = None
+
+    def _record_exit_reason(reason: str) -> None:
+        """Record the first observed shutdown reason.
+
+        :param reason: Human-readable cause, e.g. ``"received SIGTERM"``.
+        :returns: None.
+        """
+        nonlocal exit_reason
+        if exit_reason is None:
+            exit_reason = reason
+
     # Set when the launcher adopts this runner (tmux detach); makes the
     # parent-death killer stand down so the runner outlives the CLI.
     adopted_event = threading.Event()
-    _install_signal_handlers(stop_event, adopted_event=adopted_event)
+    _install_signal_handlers(
+        stop_event,
+        adopted_event=adopted_event,
+        record_reason=_record_exit_reason,
+    )
     tunnel_task = asyncio.create_task(
         serve_tunnel(
             cast("_ASGIApp", app),  # FastAPI is ASGI-compatible; cast narrows for mypy
@@ -1248,16 +1278,37 @@ async def _run_tunnel_from_env() -> None:
     stop_task = asyncio.create_task(stop_event.wait(), name="runner-signal-wait")
     idle_task: asyncio.Task[None] | None = None
     if idle_timeout_s > 0:
+
+        def _request_idle_shutdown() -> None:
+            """Attribute the exit to the idle watchdog, then stop.
+
+            :returns: None.
+            """
+            _record_exit_reason("idle timeout reached")
+            stop_event.set()
+
         idle_task = asyncio.create_task(
             _run_inactivity_monitor(
                 idle_timeout_s=idle_timeout_s,
                 get_last_activity=_last_activity,
                 has_active_work=_has_active_work,
-                request_shutdown=stop_event.set,
+                request_shutdown=_request_idle_shutdown,
             ),
             name=f"runner-idle-monitor:{runner_id}",
         )
     if parent_pid is not None:
+
+        def _request_parent_death_shutdown() -> None:
+            """Attribute the exit to parent death, then stop on the loop.
+
+            Invoked from the parent-death daemon thread, so the reason is
+            recorded and the stop event set via the event loop.
+
+            :returns: None.
+            """
+            _record_exit_reason("parent process died")
+            loop.call_soon_threadsafe(stop_event.set)
+
         # Orphan guard runs on a dedicated daemon thread, not the event
         # loop: if the loop wedges during shutdown (harness mid-boot when
         # the host dies), an event-loop watchdog could never fire. The
@@ -1265,7 +1316,7 @@ async def _run_tunnel_from_env() -> None:
         # as a backstop. See _run_parent_death_killer.
         threading.Thread(
             target=_run_parent_death_killer,
-            args=(parent_pid, lambda: loop.call_soon_threadsafe(stop_event.set)),
+            args=(parent_pid, _request_parent_death_shutdown),
             kwargs={"adopted": adopted_event},
             name=f"runner-parent-killer:{parent_pid}",
             daemon=True,
@@ -1279,8 +1330,16 @@ async def _run_tunnel_from_env() -> None:
             return_when=asyncio.FIRST_COMPLETED,
         )
         if tunnel_task in done:
+            # The tunnel returning first means the WS connection ended on its
+            # own rather than a signal/idle/parent-death shutdown request.
+            _record_exit_reason("websocket tunnel closed")
             await tunnel_task
     finally:
+        # Log why the runner is stopping so the runner log explains the exit.
+        # A crash unwinding through here is attributed by sys.excepthook with
+        # its traceback, so only record the reason for an orderly shutdown.
+        if sys.exc_info()[0] is None:
+            _logger.info("runner exiting: %s", exit_reason or "shutdown requested")
         for task in wait_tasks:
             task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -1296,6 +1355,7 @@ async def _run_tunnel_from_env() -> None:
 def _install_signal_handlers(
     stop_event: asyncio.Event,
     adopted_event: threading.Event | None = None,
+    record_reason: Callable[[str], None] | None = None,
 ) -> None:
     """Install process signal handlers that request graceful shutdown.
 
@@ -1304,12 +1364,26 @@ def _install_signal_handlers(
         :data:`RUNNER_ADOPT_SIGNAL` arrives, telling the parent-death
         killer to stand down so the runner survives an intentional CLI
         exit (tmux detach). ``None`` skips the handler.
+    :param record_reason: Optional callback given the signal name when a
+        shutdown signal arrives, so the exit log line can attribute the
+        cause. ``None`` skips attribution.
     :returns: None.
     """
     loop = asyncio.get_running_loop()
+
+    def _handle_shutdown_signal(sig: int) -> None:
+        """Record the triggering signal and request graceful shutdown.
+
+        :param sig: The delivered signal number, e.g. ``signal.SIGTERM``.
+        :returns: None.
+        """
+        if record_reason is not None:
+            record_reason(f"received {signal.Signals(sig).name}")
+        stop_event.set()
+
     for sig in (signal.SIGINT, signal.SIGTERM):
         with contextlib.suppress(NotImplementedError):
-            loop.add_signal_handler(sig, stop_event.set)
+            loop.add_signal_handler(sig, _handle_shutdown_signal, sig)
     if adopted_event is not None:
         from omnigent.runner.identity import RUNNER_ADOPT_SIGNAL
 
@@ -1317,6 +1391,50 @@ def _install_signal_handlers(
             return
         with contextlib.suppress(NotImplementedError):
             loop.add_signal_handler(RUNNER_ADOPT_SIGNAL, adopted_event.set)
+
+
+def _install_crash_logging() -> None:
+    """Log the exit reason for otherwise-silent runner crashes.
+
+    Chains a ``sys.excepthook`` that records any uncaught exception (the
+    "randomly dying" case) to the runner log before the interpreter
+    prints its traceback and exits. Signals, idle timeout, and tunnel
+    drops are attributed at their own sites; this covers the crashes that
+    would otherwise leave only a bare traceback on stderr.
+
+    Note: neither this hook nor ``atexit`` fires on ``os._exit`` (the
+    parent-death backstop, which logs its own reason) or on ``SIGKILL``.
+    Idempotent: a second call is a no-op so repeated installs never stack.
+
+    :returns: None.
+    """
+    previous_hook = sys.excepthook
+    if getattr(previous_hook, "_omnigent_runner_crash_hook", False):
+        return
+
+    def _log_uncaught(
+        exc_type: type[BaseException],
+        exc: BaseException,
+        traceback: TracebackType | None,
+    ) -> None:
+        """Record an uncaught exception, then defer to the prior hook.
+
+        :param exc_type: The exception class, e.g. ``RuntimeError``.
+        :param exc: The exception instance.
+        :param traceback: The associated traceback object.
+        :returns: None.
+        """
+        with contextlib.suppress(Exception):
+            _logger.critical(
+                "runner exiting: uncaught %s: %s",
+                exc_type.__name__,
+                exc,
+                exc_info=(exc_type, exc, traceback),
+            )
+        previous_hook(exc_type, exc, traceback)
+
+    _log_uncaught._omnigent_runner_crash_hook = True  # type: ignore[attr-defined]
+    sys.excepthook = _log_uncaught
 
 
 def main() -> None:
@@ -1327,11 +1445,15 @@ def main() -> None:
     from omnigent.process_logging import configure_process_logging
 
     configure_process_logging("runner", force=True)
+    _install_crash_logging()
     try:
         asyncio.run(_run_tunnel_from_env())
     except RuntimeError as exc:
         if not str(exc).startswith(RUNNER_TUNNEL_REJECTION_PREFIX):
             raise
+        # A fatal server rejection is an expected, actionable exit — log the
+        # reason but keep stderr to the concise message (no traceback).
+        _logger.error("runner exiting: %s", exc)
         print(f"error: {exc}", file=sys.stderr)
         raise SystemExit(1) from None
 

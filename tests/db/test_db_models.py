@@ -846,7 +846,7 @@ class TestSqlHost:
 
         now = _now()
         host = SqlHost(
-            owner="corey@example.com",
+            user_id="corey@example.com",
             name="corey-laptop",
             host_id="4f64b6ee625f4e8259185c35c6e63f3d",
             status=encode_host_status("online"),
@@ -885,7 +885,7 @@ class TestSqlHost:
 
         now = _now()
         h1 = SqlHost(
-            owner="a@x.com",
+            user_id="a@x.com",
             name="h1",
             host_id="2690ed5ead1b05791d642d85e6847680",
             status=encode_host_status("online"),
@@ -897,7 +897,7 @@ class TestSqlHost:
             session.add(h1)
 
         h2 = SqlHost(
-            owner="b@x.com",
+            user_id="b@x.com",
             name="h2",
             host_id="2690ed5ead1b05791d642d85e6847680",
             status=encode_host_status("offline"),

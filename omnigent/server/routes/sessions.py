@@ -7307,7 +7307,7 @@ def _kick_managed_relaunch(
     relaunch_task = asyncio.create_task(
         _run_managed_launch(
             session_id=session_id,
-            owner=host.owner,
+            owner=host.user_id,
             sandbox_config=sandbox_config,
             repo=repo,
             tracker=tracker,
@@ -13209,7 +13209,9 @@ async def _create_session_from_existing_agent(
                 _TelSessionCreatedEvent(
                     session_id=conv.id,
                     agent_id=agent.id,
-                    harness=native_agent.harness if native_agent is not None else None,
+                    harness=native_agent.harness
+                    if native_agent is not None
+                    else _resolve_harness(conv),
                     surface=_surface,
                     installation_id=_install_id,
                     anon_user_id=_anon_uid,
@@ -21679,6 +21681,7 @@ def create_sessions_router(
                         transport=srv.transport,
                         description=srv.description,
                         url=srv.url,
+                        headers=dict.fromkeys(srv.headers, "[REDACTED]") if srv.headers else {},
                         command=srv.command,
                         args=srv.args,
                     )
