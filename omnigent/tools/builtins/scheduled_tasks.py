@@ -39,10 +39,11 @@ class SysScheduledTaskCreateTool(Tool):
         return (
             "Create a scheduled task: a saved prompt that runs an agent session "
             "on a recurring schedule (RRULE). Provide the agent to run, the "
-            "prompt to send it, and the recurrence rule. Optionally pin a "
-            "connected host and an existing workspace on it for tasks that do "
-            "code work; omit both for research / summaries / chat-only tasks. "
-            "The task fires automatically on its schedule until deleted."
+            "prompt to send it, and the recurrence rule. Optionally PIN a "
+            "connected host and an existing workspace on it; omit both to run on "
+            "your live host at fire time (the owner must have an online host "
+            "then, else the run is recorded as failed). The task fires "
+            "automatically on its schedule until deleted."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -94,16 +95,17 @@ class SysScheduledTaskCreateTool(Tool):
                             "type": "string",
                             "description": (
                                 "Optional existing absolute path where the run's runner "
-                                "starts. Omit (with host_id) for a task that does no code "
-                                "work — research, summaries, chat-only."
+                                "starts. Omit (with host_id) to default to the resolved "
+                                "host's home directory."
                             ),
                         },
                         "host_id": {
                             "type": "string",
                             "description": (
-                                "Optional connected host to run on, from the current "
-                                "workspace's host list. Omit (with workspace) for a "
-                                "no-workspace task."
+                                "Optional PIN of a connected host to run on, from the "
+                                "current workspace's host list. Omit (with workspace) to "
+                                "run on the owner's online host at fire time; a failed run "
+                                "is recorded if none is online."
                             ),
                         },
                     },

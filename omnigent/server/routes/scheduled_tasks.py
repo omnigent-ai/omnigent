@@ -49,12 +49,13 @@ class CreateScheduledTaskRequest(BaseModel):
     timezone: str = "UTC"
     model_override: str | None = None
     reasoning_effort: str | None = None
-    # Optional: a task that does no code work (research, summaries, chat-only)
-    # needs neither a workspace nor a connected host. When both are unset the
-    # task fires as a default/no-workspace session. ``min_length=1`` still
-    # rejects an empty string (the field is unset via omission / null, not
-    # ""), mirroring the PATCH request. PATCH still cannot null an already-set
-    # workspace/host_id (see ``UpdateScheduledTaskRequest``).
+    # Optional: no PINNED host/workspace. When both are unset the fire path
+    # resolves the owner's online host at fire time and defaults the workspace to
+    # that host's home directory (a failed run is recorded if none is online) —
+    # it does not run hostless. ``min_length=1`` still rejects an empty string
+    # (the field is unset via omission / null, not ""), mirroring the PATCH
+    # request. PATCH still cannot null an already-set workspace/host_id (see
+    # ``UpdateScheduledTaskRequest``).
     workspace: str | None = Field(default=None, min_length=1)
     host_id: str | None = Field(default=None, min_length=1)
 
@@ -169,12 +170,14 @@ def create_scheduled_tasks_router(
     ) -> tuple[str | None, str | None, str | None]:
         """Validate inputs that scheduled tasks persist into future sessions.
 
-        A task that does no code work needs neither a workspace nor a connected
-        host: when BOTH are unset, connected-host workspace validation is
-        skipped and the canonical workspace is ``None`` (a default/no-workspace
-        session fires at run time). Supplying just one of the pair is still an
-        error — :func:`validate_existing_host_workspace` requires a workspace
-        when a host is set, and a host is required when a workspace is set.
+        When BOTH host and workspace are unset (no PINNED host/workspace),
+        connected-host workspace validation is skipped here and the canonical
+        workspace persists as ``None``; the fire path then resolves the owner's
+        live host and defaults the workspace to that host's home directory (and
+        records a failed run if no host is online). Supplying just one of the
+        pair is still an error — :func:`validate_existing_host_workspace`
+        requires a workspace when a host is set, and a host is required when a
+        workspace is set.
         """
         user_id = None if owner == RESERVED_USER_LOCAL else owner
         agent = await validate_session_agent(
