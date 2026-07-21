@@ -1,40 +1,43 @@
-"""Scheduled-task run reconciler — the run-lifecycle completion backstop.
+"""Scheduled-task run-completion backstop — startup sweep + lazy-on-read.
 
 The fire path (:mod:`omnigent.server.scheduled.fire`) creates a conversation,
 dispatches the prompt, and records a ``scheduled_task_runs`` row as
 ``running`` — then returns immediately, WITHOUT waiting for the agent turn to
-finish. Nothing in that path ever revisits the row, so historically a run
-stayed ``running`` with ``finished_at = NULL`` forever, even after the agent
-completed.
+finish.
 
-There is no durable completion callback to hang the transition on: the
-pub-sub event bus (:mod:`omnigent.runtime.session_stream`) fans terminal
-``response.*`` events only to live SSE subscribers with no durable buffer, so
-a scheduled fire (which has no attached client) would miss them, and any
-in-memory listener would not survive a server restart.
+**The PRIMARY completion mechanism is event-driven** and lives elsewhere:
+:func:`omnigent.server.session_live_state.persist_scheduled_run_completion`,
+fired from ``_publish_status`` the instant a fired conversation's turn reaches
+a terminal edge, flips the run ``running`` → ``succeeded``/``failed``. That
+handler rides the same long-lived SSE relay that already persists the
+conversation's ``live_status`` for a browserless scheduled fire, so it needs
+no live client and no periodic poll.
 
-This module closes the gap with a **periodic reconciliation sweep**. Every
-:data:`RECONCILE_INTERVAL_SECONDS` it lists every still-``running`` run across
-all workspaces and, for each, reads the DURABLE state its conversation left
-behind (see :func:`classify_conversation_terminal_state`):
+This module is only the **orphan backstop** for the case the event path cannot
+cover: a run left ``running`` because the terminal event never fired or was
+lost (host died mid-turn, or the server restarted while a fire was in flight).
+It enforces the invariant "every run eventually reaches a terminal state"
+WITHOUT a recurring background poll, via two cheap catches:
 
-- the conversation's ``live_status`` (relay-persisted; a cheap pre-filter), and
-- the conversation's committed items + failure labels (the authoritative
-  transcript, which survives with no client attached and across restarts).
+- :meth:`ScheduledRunReconciler.run_startup_sweep` — runs ONCE per server boot
+  (wired into the lifespan). It lists every still-``running`` run across all
+  workspaces and force-fails those whose conversation is already terminal /
+  missing, or that are past :data:`STALE_RUN_MAX_AGE_SECONDS`. This catches
+  runs orphaned by a restart mid-fire.
+- lazy-on-read at ``GET /v1/scheduled-tasks/{id}/runs`` (in the route, not
+  here) — force-fails a task's runs still ``running`` past the max age when
+  run history is read.
 
-A conversation whose turn has completed flips the run to ``succeeded``; an
-errored/cancelled turn flips it to ``failed`` with an ``error_code``. A run
-that has been ``running`` longer than :data:`STALE_RUN_MAX_AGE_SECONDS`
-without reaching a terminal conversation state is force-failed with
-``error_code = "incomplete"`` (the host-died-mid-turn case) so the invariant
-"every run eventually reaches a terminal state" always holds. The store's
-:meth:`update_run` is conditional (``WHERE status = running``) and idempotent,
-so a run already terminal (a fire-time ``skipped``/``failed``, or a prior
-sweep) is never clobbered and two sweeps cannot double-transition.
+Both reuse :func:`classify_conversation_terminal_state` (reads the durable
+``live_status`` + committed transcript + failure labels the conversation left
+behind) and the idempotent, conditional :meth:`update_run`
+(``WHERE status = running``), so a run already terminal — via the event hook, a
+fire-time ``skipped``/``failed``, or the other backstop — is never clobbered.
 
-A lower-latency relay hook (transition the run the instant the relay observes
-``response.completed``) is a possible future optimization; it is deliberately
-NOT part of this backstop, which must work without any live subscription.
+There is deliberately NO periodic sweep of any cadence: the event hook makes
+one unnecessary, and startup-sweep + lazy-on-read match how the sibling
+scheduled-task systems reconcile orphans (at a lifecycle boundary, not on a
+timer).
 """
 
 from __future__ import annotations
@@ -58,16 +61,12 @@ if TYPE_CHECKING:
 
 _logger = logging.getLogger(__name__)
 
-# How often the sweep runs. The RRULE floor is 1 hour, so runs are not
-# high-frequency; 60s is responsive without churning the DB. Module constant
-# so it stays tunable.
-RECONCILE_INTERVAL_SECONDS: int = 60
-
 # A run still ``running`` longer than this — with no terminal conversation
 # state — is force-failed with ``error_code = "incomplete"`` (host died
 # mid-turn, runner never reported completion). Deliberately generous (6h) so a
 # legitimately long agent turn is never killed; a stuck-``running`` row is a
-# far milder bug than a falsely-``failed`` one.
+# far milder bug than a falsely-``failed`` one. Shared by the startup sweep and
+# the lazy-on-read backstop.
 STALE_RUN_MAX_AGE_SECONDS: int = 6 * 60 * 60
 
 # error_code recorded on the stale-run force-fail path.
@@ -167,12 +166,13 @@ def classify_conversation_terminal_state(
 
 
 class ScheduledRunReconciler:
-    """Periodic backstop that transitions ``running`` runs to terminal states.
+    """Orphan backstop that transitions stranded ``running`` runs to terminal.
 
-    Owns its own asyncio loop, kept OFF the :class:`ScheduledTaskScheduler`
-    (which is purely per-job timers) so the scan responsibility stays
-    separate. Wire :meth:`start` / :meth:`stop` into the server lifespan next
-    to the scheduler.
+    NOT a periodic poll — the primary completion path is the event hook
+    (:func:`omnigent.server.session_live_state.persist_scheduled_run_completion`).
+    This runs its sweep ONCE per boot via :meth:`run_startup_sweep` (wired into
+    the server lifespan) to catch runs orphaned by a restart mid-fire; the
+    lazy-on-read backstop in the runs route covers the rest.
     """
 
     def __init__(
@@ -180,48 +180,35 @@ class ScheduledRunReconciler:
         scheduled_task_store: ScheduledTaskStore,
         conversation_store: ConversationStore,
         *,
-        interval_seconds: int = RECONCILE_INTERVAL_SECONDS,
         stale_max_age_seconds: int = STALE_RUN_MAX_AGE_SECONDS,
         now: Callable[[], float] = time.time,
     ) -> None:
         self._scheduled_task_store = scheduled_task_store
         self._conversation_store = conversation_store
-        self._interval = interval_seconds
         self._stale_max_age = stale_max_age_seconds
         self._now = now
-        self._task: asyncio.Task[None] | None = None
 
-    async def start(self) -> None:
-        """Start the periodic sweep loop. Idempotent."""
-        if self._task is not None and not self._task.done():
-            return
-        self._task = asyncio.ensure_future(self._loop())
+    async def run_startup_sweep(self) -> int:
+        """Reconcile all ``running`` runs once at server startup.
+
+        Catches runs orphaned by a server restart that happened while a fire
+        was in flight (the terminal event fired on the old process, or never).
+        A run whose conversation is already terminal/missing is transitioned to
+        the mapped status; one past the max age with no terminal state is
+        force-failed ``incomplete``; a young in-flight run is left alone for the
+        event hook to complete.
+
+        :returns: The number of runs transitioned to a terminal state.
+        """
+        transitioned = await self._sweep_running_runs()
         _logger.info(
-            "ScheduledRunReconciler started (interval=%ds, stale_max_age=%ds)",
-            self._interval,
-            self._stale_max_age,
+            "ScheduledRunReconciler startup sweep: transitioned %d orphaned run(s)",
+            transitioned,
         )
+        return transitioned
 
-    def stop(self) -> None:
-        """Cancel the sweep loop. Idempotent."""
-        if self._task is not None:
-            self._task.cancel()
-            self._task = None
-
-    async def _loop(self) -> None:
-        """Run :meth:`reconcile_once` every ``interval`` seconds until cancelled."""
-        while True:
-            try:
-                await asyncio.sleep(self._interval)
-                await self.reconcile_once()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                # A sweep failure must not kill the loop.
-                _logger.exception("ScheduledRunReconciler sweep failed; continuing")
-
-    async def reconcile_once(self) -> int:
-        """Run a single sweep over all ``running`` runs across every workspace.
+    async def _sweep_running_runs(self) -> int:
+        """List all ``running`` runs across workspaces and reconcile each.
 
         :returns: The number of runs transitioned to a terminal state.
         """

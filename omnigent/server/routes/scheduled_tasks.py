@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -33,6 +34,10 @@ from omnigent.server.routes._session_create_validation import (
     validate_session_model_metadata,
 )
 from omnigent.server.scheduled.rrule import RRuleValidationError, validate_rrule
+from omnigent.server.scheduled.run_reconciler import (
+    STALE_RUN_ERROR_CODE,
+    STALE_RUN_MAX_AGE_SECONDS,
+)
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 
@@ -330,12 +335,51 @@ def create_scheduled_tasks_router(
         ``_require_owned``, so runs aren't enumerable across users. Runs come
         back most-recent-first (``scheduled_at DESC``); an empty history is an
         empty list.
+
+        Lazy-on-read backstop: before listing, force-fail any of this task's
+        runs still ``running`` past the 6h max age (``incomplete``). Completion
+        itself is event-driven (the ``_publish_status`` hook); this only
+        catches a genuine orphan — a run whose terminal event never fired
+        (host died mid-turn) that no restart-time startup sweep has reaped yet
+        — so the "every run eventually terminal" invariant holds without a
+        background poll. A young in-flight run is untouched, and the
+        conditional ``update_run`` never clobbers an already-terminal row.
         """
         owner = _owner(request)
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
         _require_owned(scheduled_task_id, owner_id)
         runs = store.list_runs(scheduled_task_id)
+        runs = _force_fail_stale_runs(runs)
         return {"runs": [_run_to_response(r) for r in runs]}
+
+    def _force_fail_stale_runs(runs: list[ScheduledTaskRun]) -> list[ScheduledTaskRun]:
+        """Force-fail ``running`` runs older than the max age; return the list.
+
+        Applied on the read path (lazy-on-read backstop). Only rows past
+        :data:`STALE_RUN_MAX_AGE_SECONDS` are touched; the store's conditional
+        ``update_run`` (``WHERE status = running``) makes it idempotent and
+        safe against a run that just transitioned via the event hook. The
+        returned list reflects any transition so the response is consistent
+        with the write.
+        """
+        now = int(time.time())
+        result: list[ScheduledTaskRun] = []
+        for run in runs:
+            if run.status == "running" and (now - run.scheduled_at) >= STALE_RUN_MAX_AGE_SECONDS:
+                updated = store.update_run(
+                    run.id,
+                    status="failed",
+                    finished_at=now,
+                    error=(
+                        "scheduled run did not reach a terminal state within "
+                        f"{STALE_RUN_MAX_AGE_SECONDS}s"
+                    ),
+                    error_code=STALE_RUN_ERROR_CODE,
+                )
+                result.append(updated if updated is not None else run)
+            else:
+                result.append(run)
+        return result
 
     @router.patch("/scheduled-tasks/{scheduled_task_id}")
     async def update_scheduled_task(

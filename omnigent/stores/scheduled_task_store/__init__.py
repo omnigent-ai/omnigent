@@ -243,12 +243,35 @@ class ScheduledTaskStore(ABC):
         ...
 
     @abstractmethod
+    def get_running_run_by_conversation(self, conversation_id: str) -> ScheduledTaskRun | None:
+        """
+        Return the ``running`` run for a conversation, or ``None``.
+
+        The event-driven completion hook (fired when a conversation's turn
+        reaches a terminal state) uses this reverse lookup to find the
+        scheduled-task run to transition. Workspace-scoped like every other
+        store read (filters on ``current_workspace_id()``), so the caller must
+        run it inside the run's ``workspace_scope``. Backed by the
+        ``ix_scheduled_task_runs_conversation_id`` index on
+        ``(workspace_id, conversation_id)``.
+
+        A conversation maps to at most one ``running`` run (a fire creates one
+        run per conversation), so this returns a single row rather than a list.
+
+        :param conversation_id: The fired conversation to look up.
+        :returns: The matching ``running`` :class:`ScheduledTaskRun`, or
+            ``None`` if the conversation has no run, or its run is already
+            terminal.
+        """
+        ...
+
+    @abstractmethod
     def list_runs_by_status_all_workspaces(self, status: str) -> list[ScheduledTaskRun]:
         """
         List every run in ``status`` across all workspaces.
 
-        Used by the run reconciler at sweep time to find ``running`` runs to
-        reconcile against their conversations. Mirrors
+        Used by the startup orphan sweep to find ``running`` runs left behind
+        by a server restart mid-fire. Mirrors
         :meth:`ScheduledTaskStore.list_active_all_workspaces` — the caller
         re-enters each run's ``workspace_scope`` before acting on it.
 

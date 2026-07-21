@@ -614,3 +614,82 @@ async def test_list_runs_404_for_nonowned_task(
         f"/v1/scheduled-tasks/{created['id']}/runs", headers=_headers("bob@example.com")
     )
     assert resp.status_code == 404, resp.text
+
+
+# ── lazy-on-read orphan backstop ─────────────────────────────────────────────
+
+
+async def test_list_runs_force_fails_stale_running_run(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """Reading history force-fails a run left ``running`` past the 6h max age.
+
+    The lazy-on-read backstop for a genuine orphan (terminal event never
+    fired). ``scheduled_at`` is set well beyond the max age, so the read
+    transitions it to ``failed(incomplete)`` with ``finished_at`` stamped.
+    """
+    import time
+    import uuid
+
+    from omnigent.server.scheduled.run_reconciler import STALE_RUN_MAX_AGE_SECONDS
+
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    task_id = created["id"]
+    run_id = uuid.uuid4().hex
+    stale_scheduled_at = int(time.time()) - STALE_RUN_MAX_AGE_SECONDS - 60
+    _seed_run(
+        db_uri,
+        task_id,
+        run_id,
+        status="running",
+        scheduled_at=stale_scheduled_at,
+        fired_at=stale_scheduled_at + 1,
+        finished_at=None,
+        conversation_id=uuid.uuid4().hex,
+    )
+
+    resp = await auth_client.get(f"/v1/scheduled-tasks/{task_id}/runs", headers=_headers())
+    assert resp.status_code == 200, resp.text
+    run = resp.json()["runs"][0]
+    assert run["status"] == "failed"
+    assert run["error_code"] == "incomplete"
+    assert run["finished_at"] is not None
+
+
+async def test_list_runs_leaves_young_running_run_untouched(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """A recently-fired ``running`` run is NOT force-failed on read.
+
+    Only runs past the max age are reaped; a young in-flight run is left for
+    the event hook to complete normally.
+    """
+    import time
+    import uuid
+
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    task_id = created["id"]
+    run_id = uuid.uuid4().hex
+    recent = int(time.time()) - 30  # 30s ago, well within the max age
+    _seed_run(
+        db_uri,
+        task_id,
+        run_id,
+        status="running",
+        scheduled_at=recent,
+        fired_at=recent + 1,
+        finished_at=None,
+        conversation_id=uuid.uuid4().hex,
+    )
+
+    resp = await auth_client.get(f"/v1/scheduled-tasks/{task_id}/runs", headers=_headers())
+    assert resp.status_code == 200, resp.text
+    run = resp.json()["runs"][0]
+    assert run["status"] == "running"
+    assert run["finished_at"] is None

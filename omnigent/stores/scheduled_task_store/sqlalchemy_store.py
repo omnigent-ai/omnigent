@@ -354,8 +354,26 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             session.flush()
             return _run_to_entity(row)
 
+    def get_running_run_by_conversation(self, conversation_id: str) -> ScheduledTaskRun | None:
+        """Return the ``running`` run for a conversation, or ``None``.
+
+        Workspace-scoped reverse lookup for the event-driven completion hook;
+        backed by ``ix_scheduled_task_runs_conversation_id``. A conversation has
+        at most one ``running`` run, so ``.first()`` is exact rather than lossy.
+        """
+        running_code = encode_scheduled_task_run_status("running")
+        with self._session() as session:
+            stmt = (
+                select(SqlScheduledTaskRun)
+                .where(SqlScheduledTaskRun.workspace_id == current_workspace_id())
+                .where(SqlScheduledTaskRun.conversation_id == conversation_id)
+                .where(SqlScheduledTaskRun.status == running_code)
+            )
+            row = session.execute(stmt).scalars().first()
+            return _run_to_entity(row) if row is not None else None
+
     def list_runs_by_status_all_workspaces(self, status: str) -> list[ScheduledTaskRun]:
-        """List every run in ``status`` across all workspaces (reconciler sweep)."""
+        """List every run in ``status`` across all workspaces (startup sweep)."""
         with self._session() as session:
             stmt = (
                 select(SqlScheduledTaskRun)

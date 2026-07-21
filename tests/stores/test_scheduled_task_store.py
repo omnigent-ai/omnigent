@@ -791,3 +791,71 @@ def test_list_runs_by_status_all_workspaces_spans_tenants(
     by_id = {r.id: r for r in running}
     assert by_id[_uid("run_w11")].workspace_id == 11
     assert by_id[_uid("run_w22")].workspace_id == 22
+
+
+# ── get_running_run_by_conversation (event-hook reverse lookup) ───────────────
+
+
+def test_get_running_run_by_conversation_returns_running_run(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """The reverse lookup finds the ``running`` run for a conversation."""
+    run_id = _seed_running_run(store, "hook")
+    found = store.get_running_run_by_conversation(_uid("conv_hook"))
+    assert found is not None
+    assert found.id == run_id
+    assert found.status == "running"
+
+
+def test_get_running_run_by_conversation_none_when_terminal(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """Once the run is terminal the reverse lookup returns ``None`` (hook no-op).
+
+    This is what makes the event hook idempotent: a second terminal edge finds
+    no ``running`` run to transition.
+    """
+    run_id = _seed_running_run(store, "term")
+    store.update_run(run_id, status="succeeded", finished_at=202)
+    assert store.get_running_run_by_conversation(_uid("conv_term")) is None
+
+
+def test_get_running_run_by_conversation_none_for_unknown_conversation(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """An interactive (non-scheduled) conversation has no run → ``None``."""
+    assert store.get_running_run_by_conversation(_uid("conv_absent")) is None
+
+
+def test_get_running_run_by_conversation_is_workspace_scoped(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """The lookup filters on the current workspace, like every other store read.
+
+    A run seeded in workspace 11 is invisible from the default workspace and
+    visible only inside its own ``workspace_scope`` — the property the event
+    hook relies on to write to the fired run's workspace.
+    """
+    with workspace_scope(11):
+        store.create(
+            scheduled_task_id=_uid("task_ws"),
+            name="ws",
+            prompt="p",
+            rrule="FREQ=MINUTELY",
+            user_id="a",
+            agent_id=_uid("ag"),
+            timezone="UTC",
+        )
+        store.create_run(
+            run_id=_uid("run_ws"),
+            scheduled_task_id=_uid("task_ws"),
+            status="running",
+            scheduled_at=100,
+            conversation_id=_uid("conv_ws"),
+        )
+    # Default workspace cannot see the workspace-11 run.
+    assert store.get_running_run_by_conversation(_uid("conv_ws")) is None
+    # Inside its own scope it resolves.
+    with workspace_scope(11):
+        found = store.get_running_run_by_conversation(_uid("conv_ws"))
+        assert found is not None and found.id == _uid("run_ws")

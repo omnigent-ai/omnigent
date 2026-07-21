@@ -1426,30 +1426,32 @@ def create_app(
                     exc,
                 )
 
-            # Run-completion backstop: the fire path records a run as
-            # ``running`` and never revisits it, so a periodic reconciler
-            # transitions completed runs to ``succeeded``/``failed`` (and
-            # force-fails stale ones). Also non-critical — a start failure
-            # must not abort boot.
+            # Run-completion orphan backstop. Completion itself is
+            # event-driven (persist_scheduled_run_completion fires from
+            # _publish_status the instant a fired conversation's turn ends —
+            # no poll). This startup sweep runs ONCE to reconcile runs left
+            # ``running`` by a restart mid-fire; lazy-on-read at GET
+            # /scheduled-tasks/{id}/runs covers the rest. Non-critical — a
+            # sweep failure must not abort boot.
             scheduled_run_reconciler = ScheduledRunReconciler(
                 scheduled_task_store=scheduled_task_store,
                 conversation_store=conversation_store,
             )
             app_inst.state.scheduled_run_reconciler = scheduled_run_reconciler
             try:
-                await scheduled_run_reconciler.start()
+                await scheduled_run_reconciler.run_startup_sweep()
             except Exception as exc:
                 _logger.exception(
-                    "scheduled run reconciler failed to start; continuing "
-                    "without run-completion tracking (%s)",
+                    "scheduled run startup sweep failed; continuing without "
+                    "orphaned-run reconciliation (%s)",
                     exc,
                 )
 
         try:
             yield
         finally:
-            if scheduled_run_reconciler is not None:
-                scheduled_run_reconciler.stop()
+            # The run reconciler is a one-shot startup sweep (no periodic task
+            # to cancel); only the per-job scheduler needs stopping.
             if scheduled_task_scheduler is not None:
                 scheduled_task_scheduler.stop()
             metrics_publish_task.cancel()
@@ -1579,8 +1581,11 @@ def create_app(
     set_server_runner_router(runner_router)
     # Mirror per-session live state (turn status, pending-approval count,
     # runner liveness) onto the conversations row so replicas that don't
-    # hold a session's runner tunnel serve the same sidebar fields.
-    session_live_state.configure(conversation_store)
+    # hold a session's runner tunnel serve the same sidebar fields. The
+    # scheduled-task store additionally enables the event-driven
+    # run-completion hook (persist_scheduled_run_completion) fired from
+    # _publish_status when a fired conversation's turn reaches terminal.
+    session_live_state.configure(conversation_store, scheduled_task_store)
     pending_elicitations.set_count_persist_hook(session_live_state.persist_pending_count)
 
     @app.middleware("http")

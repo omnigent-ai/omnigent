@@ -1,8 +1,9 @@
-"""Tests for the scheduled-task run reconciler.
+"""Tests for the scheduled-task run-completion orphan backstop.
 
-Exercises the terminal-state classification matrix and the sweep's
+Exercises the terminal-state classification matrix and the startup sweep's
 transition/idempotency/stale-fallback behavior against fakes, with no live
-server or database.
+server or database. (The primary, event-driven completion path lives in
+``session_live_state`` and is covered in ``tests/server/test_session_live_state.py``.)
 """
 
 from __future__ import annotations
@@ -88,7 +89,7 @@ class _RunRow:
 
 
 class _FakeScheduledTaskStore:
-    """Fake store exposing the two methods the reconciler uses."""
+    """Fake store exposing the methods the backstop uses."""
 
     def __init__(self, runs: list[_RunRow]) -> None:
         self._runs = {r.id: r for r in runs}
@@ -96,6 +97,12 @@ class _FakeScheduledTaskStore:
 
     def list_runs_by_status_all_workspaces(self, status: str) -> list[_RunRow]:
         return [r for r in self._runs.values() if r.status == status]
+
+    def get_running_run_by_conversation(self, conversation_id: str) -> _RunRow | None:
+        for r in self._runs.values():
+            if r.conversation_id == conversation_id and r.status == "running":
+                return r
+        return None
 
     def update_run(
         self,
@@ -180,7 +187,7 @@ def test_classify_missing_conversation_is_failed() -> None:
     assert decision.error_code == "conversation_missing"
 
 
-# ── reconcile_once (sweep) ───────────────────────────────────────────────────
+# ── run_startup_sweep (orphan sweep) ─────────────────────────────────────────
 
 
 @pytest.mark.asyncio
@@ -191,7 +198,7 @@ async def test_reconcile_transitions_completed_run_to_succeeded() -> None:
     conv = _FakeConversation(live_status="idle")
     convs = _FakeConversationStore({"conv_ok": conv}, {"conv_ok": [_FakeItem(status="completed")]})
     rec = ScheduledRunReconciler(sched, convs, now=lambda: 1000)
-    n = await rec.reconcile_once()
+    n = await rec.run_startup_sweep()
     assert n == 1
     assert run.status == "succeeded"
     assert run.finished_at == 1000
@@ -207,7 +214,7 @@ async def test_reconcile_transitions_errored_run_to_failed() -> None:
     )
     convs = _FakeConversationStore({"conv_bad": conv})
     rec = ScheduledRunReconciler(sched, convs, now=lambda: 1000)
-    n = await rec.reconcile_once()
+    n = await rec.run_startup_sweep()
     assert n == 1
     assert run.status == "failed"
     assert run.error_code == "runner_disconnected"
@@ -222,7 +229,7 @@ async def test_reconcile_leaves_young_running_run_alone() -> None:
     conv = _FakeConversation(live_status="running")
     convs = _FakeConversationStore({"conv_young": conv})
     rec = ScheduledRunReconciler(sched, convs, now=lambda: 1000)  # age 10s
-    n = await rec.reconcile_once()
+    n = await rec.run_startup_sweep()
     assert n == 0
     assert run.status == "running"
     assert run.finished_at is None
@@ -239,7 +246,7 @@ async def test_reconcile_force_fails_stale_running_run() -> None:
     conv = _FakeConversation(live_status="running")  # still "in flight" but stale
     convs = _FakeConversationStore({"conv_stale": conv})
     rec = ScheduledRunReconciler(sched, convs, now=lambda: now)
-    n = await rec.reconcile_once()
+    n = await rec.run_startup_sweep()
     assert n == 1
     assert run.status == "failed"
     assert run.error_code == STALE_RUN_ERROR_CODE
@@ -258,7 +265,7 @@ async def test_reconcile_stale_run_still_prefers_real_terminal_state() -> None:
         {"conv_staleok": conv}, {"conv_staleok": [_FakeItem(status="completed")]}
     )
     rec = ScheduledRunReconciler(sched, convs, now=lambda: now)
-    n = await rec.reconcile_once()
+    n = await rec.run_startup_sweep()
     assert n == 1
     assert run.status == "succeeded"
     assert run.error_code is None
@@ -284,5 +291,5 @@ async def test_reconcile_idempotent_when_run_already_terminal() -> None:
         {"conv_race": conv}, {"conv_race": [_FakeItem(status="completed")]}
     )
     rec = ScheduledRunReconciler(racing, convs, now=lambda: 1000)
-    n = await rec.reconcile_once()
+    n = await rec.run_startup_sweep()
     assert n == 0  # update returned None; not counted as a transition
