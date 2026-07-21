@@ -17,6 +17,7 @@ import {
   isAgentTerminalKey,
   PANEL_NO_TERMINAL_KEY,
   PENDING_RECONCILE_INTERVAL_MS,
+  restoredShellExitView,
   shellViewIsStale,
   terminalInfoFromResource,
   terminalsReconcileInterval,
@@ -529,6 +530,22 @@ describe("shellViewIsStale", () => {
 
   it("is false while the list is empty (loading / offline) so a pending restore isn't clobbered", () => {
     expect(shellViewIsStale(shellKey, [])).toBe(false);
+  });
+});
+
+describe("restoredShellExitView", () => {
+  it("returns chat only when the prior view was chat (null)", () => {
+    expect(restoredShellExitView(null)).toBe("chat");
+  });
+
+  it("returns terminal when the prior view was the agent terminal", () => {
+    expect(restoredShellExitView("terminal:terminal_claude_main")).toBe("terminal");
+  });
+
+  it("returns terminal for the no-target sentinel (Terminal open before any terminal existed)", () => {
+    // PANEL_NO_TERMINAL_KEY is the empty string — falsy, so it must not be
+    // lumped in with the chat (null) case and routed back to chat.
+    expect(restoredShellExitView(PANEL_NO_TERMINAL_KEY)).toBe("terminal");
   });
 });
 

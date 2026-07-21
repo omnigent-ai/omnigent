@@ -49,6 +49,7 @@ import {
   inventoryTerminals,
   isAgentTerminalKey,
   PANEL_NO_TERMINAL_KEY,
+  restoredShellExitView,
   shellViewIsStale,
   terminalTabKey,
   useTerminals,
@@ -1172,9 +1173,7 @@ export function AppShell() {
   // from it, otherwise chat. `setView` resolves the agent terminal
   // robustly (and falls back to chat when none is open).
   const exitShellView = useCallback(() => {
-    const prev = lastNonShellKeyRef.current;
-    if (prev && isAgentTerminalKey(prev)) setView("terminal");
-    else setView("chat");
+    setView(restoredShellExitView(lastNonShellKeyRef.current));
   }, [setView]);
 
   // Auto-exit shell view when the active shell leaves the terminal list

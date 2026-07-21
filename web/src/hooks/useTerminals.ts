@@ -120,6 +120,28 @@ export function shellViewIsStale(panelKey: string | null, terminals: TerminalInf
 }
 
 /**
+ * The view to restore when leaving a shell, given the last non-shell
+ * panel key that was showing before the shell took over.
+ *
+ * ``null`` means the user came from chat. Both the agent-terminal key and
+ * :data:`PANEL_NO_TERMINAL_KEY` (the Terminal view open with no specific
+ * target — e.g. Terminal picked before any terminal existed) mean the
+ * user came from the Terminal surface, so both restore ``"terminal"``.
+ * The empty-string sentinel is falsy, so it must be matched explicitly
+ * rather than lumped in with the chat (null) case.
+ *
+ * :param prevNonShellKey: Last non-shell panel key, or null for chat.
+ * :returns: The view the pill's ``setView`` should restore.
+ */
+export function restoredShellExitView(prevNonShellKey: string | null): "chat" | "terminal" {
+  if (prevNonShellKey === null) return "chat";
+  if (prevNonShellKey === PANEL_NO_TERMINAL_KEY || isAgentTerminalKey(prevNonShellKey)) {
+    return "terminal";
+  }
+  return "chat";
+}
+
+/**
  * Project the terminal list down to the session's *inventory* — the
  * shells shown in the right-rail Shells tab, its count badge, and the
  * mobile menu entry.
