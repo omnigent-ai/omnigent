@@ -5,6 +5,7 @@ import android.annotation.SuppressLint
 import android.app.DownloadManager
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -31,6 +32,7 @@ import androidx.core.view.MenuCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
+import androidx.webkit.WebSettingsCompat
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
 
@@ -146,6 +148,9 @@ class MainActivity : ComponentActivity() {
                     downloadFile(downloadUrl, contentDisposition, mimeType)
                 }
             }
+        if (WebViewFeature.isFeatureSupported(WebViewFeature.ALGORITHMIC_DARKENING)) {
+            WebSettingsCompat.setAlgorithmicDarkeningAllowed(webView.settings, true)
+        }
         // Wrap the WebView in a FrameLayout so the floating server-switcher
         // pill can sit on top of it. The pill uses the app's brand palette
         // (values/values-night colors.xml) so it adapts to light/dark mode.
@@ -269,6 +274,14 @@ class MainActivity : ComponentActivity() {
 
         ensureNotificationPermission()
         webView.loadUrl(serverUrl)
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        if (::webView.isInitialized) {
+            // Notify matchMedia listeners without reloading the SPA.
+            webView.dispatchConfigurationChanged(newConfig)
+        }
     }
 
     /**
