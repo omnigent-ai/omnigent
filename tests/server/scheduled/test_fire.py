@@ -111,7 +111,6 @@ class FakeConversationStore:
     def __init__(self, *, fail_create: bool = False) -> None:
         self.created: list[dict[str, Any]] = []
         self.create_workspace_ids: list[int] = []
-        self.appended: list[tuple[str, list[Any]]] = []
         self._seq = 0
         self.fail_create = fail_create
 
@@ -135,10 +134,6 @@ class FakeConversationStore:
 
     def get_conversation(self, conversation_id: str) -> _FakeConversation | None:
         return _FakeConversation(id=conversation_id, agent_id="ag_1")
-
-    def append(self, conversation_id: str, items: list[Any]) -> list[Any]:
-        self.appended.append((conversation_id, items))
-        return items
 
 
 class FakePermissionStore:
@@ -171,6 +166,11 @@ class FakeHostStore:
 
     def get_host(self, host_id: str) -> _FakeHost | None:
         return self.hosts.get(host_id)
+
+    def list_hosts(self, owner: str) -> list[_FakeHost]:
+        # Mirrors the real store: most-recently-active first. Insertion order in
+        # the dict stands in for that ordering here.
+        return [h for h in self.hosts.values() if h.owner == owner]
 
 
 class FakeHostRegistry:
@@ -558,18 +558,67 @@ async def test_grant_failure_records_failed_with_session() -> None:
 
 
 @pytest.mark.asyncio
-async def test_partial_binding_workspace_without_host_records_failed() -> None:
-    """A workspace with no host_id is a broken connected-host binding, not a
-    no-workspace task — it must still record a failed run, not silently fire."""
+async def test_unset_host_resolves_owner_online_host_and_runs() -> None:
+    """An unset host_id means 'run on the owner's live host', not 'run hostless':
+    the fire resolves the owner's online host, creates a session bound to it, and
+    records a run."""
+    perm = FakePermissionStore()
     conv_store = FakeConversationStore()
-    store = FakeScheduledTaskStore(rows={"task_1": _task(host_id=None, workspace="/repo")})
+    store = FakeScheduledTaskStore(
+        rows={"task_1": _task(owner_user_id="alice@example.com", host_id=None, workspace="/repo")}
+    )
+    launched: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        launched.append((conv, task))
+
+    on_fire = build_on_fire(
+        _deps(
+            store,
+            permission_store=perm,
+            conversation_store=conv_store,
+            host_store=FakeHostStore({"host_9": _FakeHost("host_9", "alice@example.com")}),
+            host_registry=FakeHostRegistry(online={"host_9"}),
+        ),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    # The session bound to the RESOLVED host (not None), carrying the workspace.
+    assert len(conv_store.created) == 1
+    assert conv_store.created[0]["host_id"] == "host_9"
+    assert conv_store.created[0]["workspace"] == "/repo"
+    # The dispatch saw the resolved host on its effective task.
+    assert len(launched) == 1
+    assert launched[0][1].host_id == "host_9"
+    # A running run was recorded; the stored row keeps its null host_id.
+    assert len(store.runs) == 1
+    assert store.runs[0]["status"] == "running"
+    assert store._rows["task_1"].host_id is None
+
+
+@pytest.mark.asyncio
+async def test_unset_host_no_online_host_records_failed() -> None:
+    """An unset host_id with no live host is an honest failure, not a no-op: it
+    records a failed run with the no_online_host code and creates no session."""
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(
+        rows={"task_1": _task(owner_user_id="alice@example.com", host_id=None, workspace=None)}
+    )
     launched: list[Any] = []
 
     async def _launch(conv: Any, task: Any) -> None:
         launched.append(conv)
 
     on_fire = build_on_fire(
-        _deps(store, conversation_store=conv_store),
+        _deps(
+            store,
+            conversation_store=conv_store,
+            # Owner has a host, but it is offline (not in the registry).
+            host_store=FakeHostStore({"host_9": _FakeHost("host_9", "alice@example.com")}),
+            host_registry=FakeHostRegistry(online=set()),
+        ),
         launch_dispatch=_launch,
     )
     await on_fire(0, "task_1")
@@ -579,68 +628,207 @@ async def test_partial_binding_workspace_without_host_records_failed() -> None:
     assert conv_store.created == []
     assert len(store.runs) == 1
     assert store.runs[0]["status"] == "failed"
-    assert store.runs[0]["error_code"] == "missing_host_id"
+    assert store.runs[0]["error_code"] == "no_online_host"
     assert store.runs[0]["conversation_id"] is None
 
 
 @pytest.mark.asyncio
-async def test_no_workspace_task_creates_session_and_records_run() -> None:
-    """A task with neither host_id nor workspace fires as a no-workspace session:
-    it creates a conversation, grants ownership, dispatches, and records a run —
-    it does NOT skip or fail the way a broken connected-host binding does."""
-    perm = FakePermissionStore()
+async def test_no_workspace_resolved_host_launches_with_canonical_home(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A task with no workspace still launches: the fire resolves the host's home
+    dir to an ABSOLUTE realpath (never the literal '~') and stores that."""
     conv_store = FakeConversationStore()
-    store = FakeScheduledTaskStore(rows={"task_1": _task(host_id=None, workspace=None)})
+    store = FakeScheduledTaskStore(
+        rows={"task_1": _task(owner_user_id="alice@example.com", host_id=None, workspace=None)}
+    )
     launched: list[Any] = []
 
     async def _launch(conv: Any, task: Any) -> None:
         launched.append((conv, task))
 
+    # The default-workspace resolution is a host.stat round-trip; stub it to the
+    # canonical home path the host would return so the fire path is exercised
+    # without a live host tunnel.
+    async def _fake_resolve(deps: Any, host_id: str) -> str:
+        assert host_id == "host_9"
+        return "/home/alice"
+
+    monkeypatch.setattr(fire_mod, "_resolve_default_workspace", _fake_resolve)
+
     on_fire = build_on_fire(
-        _deps(store, permission_store=perm, conversation_store=conv_store),
+        _deps(
+            store,
+            conversation_store=conv_store,
+            host_store=FakeHostStore({"host_9": _FakeHost("host_9", "alice@example.com")}),
+            host_registry=FakeHostRegistry(online={"host_9"}),
+        ),
         launch_dispatch=_launch,
     )
     await on_fire(0, "task_1")
     await _drain()
 
-    # A conversation was created with no host / workspace binding.
+    # Resolved host + absolute canonical workspace (not the literal '~').
     assert len(conv_store.created) == 1
-    assert conv_store.created[0]["agent_id"] == "ag_1"
-    assert conv_store.created[0]["host_id"] is None
-    assert conv_store.created[0]["workspace"] is None
-    # Owner grant + dispatch still ran.
-    assert perm.grants and perm.grants[0][0] == RESERVED_USER_LOCAL
-    assert len(launched) == 1
-    # A running run was recorded.
+    assert conv_store.created[0]["host_id"] == "host_9"
+    assert conv_store.created[0]["workspace"] == "/home/alice"
+    assert launched[0][1].workspace == "/home/alice"
     assert len(store.runs) == 1
     assert store.runs[0]["status"] == "running"
-    assert store.runs[0]["conversation_id"] == "conv_1"
 
 
 @pytest.mark.asyncio
-async def test_no_workspace_task_seeds_prompt_via_default_dispatch() -> None:
-    """The production default dispatch seeds a no-workspace task's prompt as a
-    user message (no host to launch a runner on)."""
+async def test_no_workspace_unresolvable_home_records_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the host can't resolve its home dir, the fire records an honest failed
+    run rather than launching with a bogus workspace."""
     conv_store = FakeConversationStore()
     store = FakeScheduledTaskStore(
-        rows={"task_1": _task(host_id=None, workspace=None, prompt="summarize the inbox")}
+        rows={"task_1": _task(owner_user_id="alice@example.com", host_id=None, workspace=None)}
     )
 
-    # No launch_dispatch override → the real _make_default_dispatch is used.
-    on_fire = build_on_fire(_deps(store, conversation_store=conv_store))
+    async def _boom(deps: Any, host_id: str) -> str:
+        raise fire_mod._CannotLaunchScheduledFire(
+            "home dir unresolved", error_code="default_workspace_unresolved"
+        )
+
+    monkeypatch.setattr(fire_mod, "_resolve_default_workspace", _boom)
+
+    on_fire = build_on_fire(
+        _deps(
+            store,
+            conversation_store=conv_store,
+            host_store=FakeHostStore({"host_9": _FakeHost("host_9", "alice@example.com")}),
+            host_registry=FakeHostRegistry(online={"host_9"}),
+        )
+    )
     await on_fire(0, "task_1")
     await _drain()
 
-    assert len(conv_store.created) == 1
-    assert conv_store.appended, "expected the prompt to be seeded as a user message"
-    conversation_id, items = conv_store.appended[0]
-    assert conversation_id == "conv_1"
-    assert len(items) == 1
-    assert items[0].type == "message"
-    assert items[0].data.role == "user"
-    assert items[0].data.content[0]["text"] == "summarize the inbox"
+    assert conv_store.created == []
     assert len(store.runs) == 1
-    assert store.runs[0]["status"] == "running"
+    assert store.runs[0]["status"] == "failed"
+    assert store.runs[0]["error_code"] == "default_workspace_unresolved"
+
+
+@pytest.mark.asyncio
+async def test_defaulted_workspace_is_boundary_validated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The resolved default HOME workspace is validated against the agent's
+    os_env.cwd boundary, exactly like a caller-supplied one — the check is gated
+    on the RESOLVED workspace, not the (null) stored value. A boundary failure
+    records a failed run and creates no session."""
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(
+        rows={"task_1": _task(owner_user_id="alice@example.com", host_id=None, workspace=None)}
+    )
+
+    async def _fake_resolve(deps: Any, host_id: str) -> str:
+        return "/home/alice"
+
+    seen: dict[str, Any] = {}
+
+    async def _fake_validate(deps: Any, task: Any, *, validate_workspace: bool):
+        # Record that the boundary check was requested for the resolved workspace.
+        seen["validate_workspace"] = validate_workspace
+        seen["workspace"] = task.workspace
+        if validate_workspace:
+            return ("workspace is outside the agent boundary", "invalid_input")
+        return None
+
+    monkeypatch.setattr(fire_mod, "_resolve_default_workspace", _fake_resolve)
+    monkeypatch.setattr(fire_mod, "_validate_fire_session_inputs", _fake_validate)
+
+    # No launch_dispatch override → the real preflight runs, so validation is on.
+    on_fire = build_on_fire(
+        _deps(
+            store,
+            conversation_store=conv_store,
+            host_store=FakeHostStore({"host_9": _FakeHost("host_9", "alice@example.com")}),
+            host_registry=FakeHostRegistry(online={"host_9"}),
+        )
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    # The boundary check ran against the resolved absolute workspace.
+    assert seen["validate_workspace"] is True
+    assert seen["workspace"] == "/home/alice"
+    # The boundary failure was recorded honestly; no session was created.
+    assert conv_store.created == []
+    assert len(store.runs) == 1
+    assert store.runs[0]["status"] == "failed"
+    assert store.runs[0]["error_code"] == "invalid_input"
+
+
+@pytest.mark.asyncio
+async def test_no_host_store_records_failed_when_host_unset() -> None:
+    """No host store/registry configured + an unset host is an honest failure."""
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(host_id=None, workspace=None)})
+
+    on_fire = build_on_fire(
+        _deps(store, conversation_store=conv_store, host_store=None, host_registry=None),
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert conv_store.created == []
+    assert len(store.runs) == 1
+    assert store.runs[0]["status"] == "failed"
+    assert store.runs[0]["error_code"] == "host_registry_unavailable"
+    assert store.runs[0]["conversation_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_default_workspace_returns_canonical_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The default workspace is the host's stat'd canonical home path, not '~'."""
+    import omnigent.server.routes._workspace_validation as wsv
+
+    captured: dict[str, Any] = {}
+
+    async def _fake_stat(*, host_registry: Any, host_conn: Any, path: str) -> dict[str, Any]:
+        captured["path"] = path
+        return {
+            "status": "ok",
+            "exists": True,
+            "type": "directory",
+            "canonical_path": "/home/alice",
+        }
+
+    monkeypatch.setattr(wsv, "_ask_host_stat", _fake_stat)
+    deps = _deps(
+        FakeScheduledTaskStore(),
+        host_registry=FakeHostRegistry(online={"host_9"}),
+    )
+    result = await fire_mod._resolve_default_workspace(deps, "host_9")
+    assert result == "/home/alice"
+    # The server sends the tilde; the host expands it (server never expands ~).
+    assert captured["path"] == "~"
+
+
+@pytest.mark.asyncio
+async def test_resolve_default_workspace_raises_when_home_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stat that returns no canonical path is an honest launch failure."""
+    import omnigent.server.routes._workspace_validation as wsv
+
+    async def _fake_stat(*, host_registry: Any, host_conn: Any, path: str) -> dict[str, Any]:
+        return {"status": "ok", "exists": False, "type": None, "canonical_path": None}
+
+    monkeypatch.setattr(wsv, "_ask_host_stat", _fake_stat)
+    deps = _deps(
+        FakeScheduledTaskStore(),
+        host_registry=FakeHostRegistry(online={"host_9"}),
+    )
+    with pytest.raises(fire_mod._CannotLaunchScheduledFire) as excinfo:
+        await fire_mod._resolve_default_workspace(deps, "host_9")
+    assert excinfo.value.error_code == "default_workspace_unresolved"
 
 
 @pytest.mark.asyncio

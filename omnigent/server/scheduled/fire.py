@@ -8,13 +8,15 @@ firing:
 #. **Re-reads the row.** The armed timer is never trusted: the row is re-read by
    id, and a row that vanished (deleted between arming and firing) or is no
    longer ``active`` (paused/deleted) is a logged no-op.
-#. **Validates the launch target.** A task bound to a connected host must reach
-   a reachable host — a partial binding or an unreachable host is recorded as a
-   failed/skipped run instead of a running run. A task with neither a host nor a
-   workspace (research / summaries / chat-only) skips that check and fires as a
-   default/no-workspace session.
-#. **Creates a session** bound to the task's agent, carrying the stored
-   ``workspace`` / ``host_id`` / ``model_override`` / ``reasoning_effort``.
+#. **Resolves and validates the launch target.** A task that pinned no
+   ``host_id`` resolves the owner's most-recently-active live host at fire time;
+   a task that pinned no ``workspace`` (research / summaries / chat-only) starts
+   the runner in the host's home directory. A pinned host that is missing or
+   offline — and an owner with no live host at all — records a failed/skipped
+   run instead of a running run.
+#. **Creates a session** bound to the task's agent, carrying the resolved
+   ``workspace`` / ``host_id`` and the stored ``model_override`` /
+   ``reasoning_effort``.
 #. **Grants ownership.** The spawned session gets a ``LEVEL_OWNER`` grant for the
    task's ``owner_user_id`` — or :data:`RESERVED_USER_LOCAL` when it is NULL
    (single-user / OSS). Without the grant the run is invisible.
@@ -47,7 +49,7 @@ import logging
 import time
 import uuid
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from omnigent.db.db_models import workspace_scope
@@ -67,6 +69,15 @@ _logger = logging.getLogger(__name__)
 # dispatching the prompt this fire. The session + grant are already persisted, so
 # a timeout leaves an owner-visible session the runner can still pick up later.
 _RUNNER_CONNECT_TIMEOUT_S = 30.0
+
+# The path stat'd on the resolved host to derive a fallback workspace for a task
+# that pinned no workspace (research / summaries / chat-only). The runner still
+# needs a real cwd and the DB check constraint
+# ``ck_conversations_workspace_required_for_host`` requires a workspace once a
+# host is bound. Only the host knows its own ``HOME``, so the server sends this
+# tilde and stores the absolute ``canonical_path`` the host resolves it to (never
+# the literal ``~`` — see ``_resolve_default_workspace``).
+_DEFAULT_WORKSPACE = "~"
 
 # Strong references to in-flight background fire tasks. ``loop.create_task`` holds
 # only a weak reference, so without this a fire could be garbage-collected
@@ -140,7 +151,7 @@ def build_on_fire(
     """
     preflight: ConnectedHostPreflight | None = None
     if launch_dispatch is None:
-        dispatch = _make_default_dispatch(deps)
+        dispatch = _make_connected_host_dispatch(deps)
         preflight = _make_connected_host_preflight(deps)
     else:
         dispatch = launch_dispatch
@@ -241,49 +252,73 @@ async def _run_fire_for_task(
             )
             return
 
-        # No-workspace task: a task that does no code work (research, summaries,
-        # chat-only) binds neither a host nor a workspace, so the connected-host
-        # input check, preflight, and workspace validation are all skipped and
-        # the run fires as a default/no-workspace session. A task that specifies
-        # a host_id (with or without a workspace) is NOT no-workspace — it stays
-        # on the honest connected-host path below, which still records a
-        # failed/skipped run when that host is missing or offline.
-        no_workspace = task.host_id is None and task.workspace is None
+        # Resolve the effective launch target. An unset ``host_id`` means "you
+        # didn't pin WHICH host", not "run hostless": resolve the owner's live
+        # host at fire time. An unset ``workspace`` (research / summaries /
+        # chat-only) defaults to the host's home directory so the runner still
+        # has a real cwd. If no live host can be resolved, this records a
+        # failed run — the same honest behavior as a pinned host that is offline.
+        #
+        # ``task`` stays the source of truth for the persisted row; ``effective``
+        # carries the resolved host_id / defaulted workspace through preflight,
+        # validation, create, and dispatch WITHOUT writing them back to the row
+        # (the next fire re-resolves the live host).
+        try:
+            effective = await _resolve_effective_task(deps, task)
+        except _CannotLaunchScheduledFire as exc:
+            _logger.warning("scheduled fire: task %s cannot launch: %s", task.id, exc)
+            await _record_run(
+                deps,
+                task,
+                None,
+                scheduled_at,
+                status="failed",
+                error=str(exc),
+                error_code=exc.error_code,
+            )
+            return
 
-        if not no_workspace:
-            input_error = _validate_connected_host_inputs(task)
-            if input_error is not None:
-                error, error_code = input_error
-                _logger.warning("scheduled fire: task %s cannot run: %s", task.id, error)
+        input_error = _validate_connected_host_inputs(effective)
+        if input_error is not None:
+            error, error_code = input_error
+            _logger.warning("scheduled fire: task %s cannot run: %s", task.id, error)
+            await _record_run(
+                deps,
+                task,
+                None,
+                scheduled_at,
+                status="failed",
+                error=error,
+                error_code=error_code,
+            )
+            return
+
+        if preflight is not None:
+            try:
+                await preflight(effective)
+            except _CannotLaunchScheduledFire as exc:
+                _logger.warning("scheduled fire: task %s cannot launch: %s", task.id, exc)
                 await _record_run(
                     deps,
                     task,
                     None,
                     scheduled_at,
                     status="failed",
-                    error=error,
-                    error_code=error_code,
+                    error=str(exc),
+                    error_code=exc.error_code,
                 )
                 return
 
-            if preflight is not None:
-                try:
-                    await preflight(task)
-                except _CannotLaunchScheduledFire as exc:
-                    _logger.warning("scheduled fire: task %s cannot launch: %s", task.id, exc)
-                    await _record_run(
-                        deps,
-                        task,
-                        None,
-                        scheduled_at,
-                        status="failed",
-                        error=str(exc),
-                        error_code=exc.error_code,
-                    )
-                    return
-
+        # Validate the RESOLVED host/workspace. ``effective.workspace`` is always
+        # an absolute realpath by this point — a caller-supplied path or the
+        # canonicalized default (HOME). Gating on ``effective.workspace`` (not the
+        # stored ``task.workspace``) means the agent's ``os_env.cwd`` boundary is
+        # enforced even for a defaulted workspace, exactly as ``POST /v1/sessions``
+        # does — an agent that pins an absolute cwd outside HOME records a failed
+        # run instead of silently launching outside its declared boundary.
+        validate_workspace = preflight is not None and effective.workspace is not None
         validation_error = await _validate_fire_session_inputs(
-            deps, task, validate_workspace=preflight is not None and not no_workspace
+            deps, effective, validate_workspace=validate_workspace
         )
         if validation_error is not None:
             error, error_code = validation_error
@@ -300,7 +335,7 @@ async def _run_fire_for_task(
             return
 
         try:
-            conv = await _create_session(deps, task)
+            conv = await _create_session(deps, effective)
         except Exception:
             _logger.exception("scheduled fire: failed to create session for task %s", task.id)
             await _record_run(
@@ -334,7 +369,7 @@ async def _run_fire_for_task(
             return
 
         try:
-            await dispatch(conv, task)
+            await dispatch(conv, effective)
         except Exception:
             # The session + grant are already persisted and owner-visible, so a
             # launch/dispatch failure still records a run — just a failed one.
@@ -358,6 +393,108 @@ async def _run_fire_for_task(
         _logger.info("scheduled fire: task %s fired session %s", task.id, conv.id)
     except Exception:
         _logger.exception("scheduled fire: task %s failed", task.id)
+
+
+async def _resolve_effective_task(deps: FireDeps, task: ScheduledTask) -> ScheduledTask:
+    """Resolve the host/workspace the fire actually launches against.
+
+    A task may omit ``host_id`` (run on the owner's live host, whichever it is)
+    and/or ``workspace`` (a task that does no code work). This returns a copy of
+    *task* with those holes filled for this one fire:
+
+    * ``host_id`` unset → the owner's most-recently-active ONLINE host. No live
+      host (or no host store/registry) raises :class:`_CannotLaunchScheduledFire`
+      so the caller records a failed run instead of silently no-oping.
+    * ``workspace`` unset → the host's home directory, canonicalized to an
+      absolute realpath via a ``host.stat`` round-trip, so the runner launches
+      with a real cwd and the stored row never holds a literal ``~``.
+
+    A pinned ``host_id`` is left untouched — its liveness is enforced by the
+    existing preflight, not here. The resolved values are never written back to
+    the stored row; the next fire re-resolves the live host.
+    """
+    host_id = task.host_id
+    if host_id is None:
+        host_id = await _resolve_owner_host(deps, task)
+    workspace = task.workspace
+    if workspace is None:
+        # Canonicalize the host's home dir to an ABSOLUTE realpath rather than
+        # persisting the literal ``~``. ``conv.workspace`` is contracted to be an
+        # already-resolved absolute path (many consumers do plain ``Path`` math /
+        # ``startswith('/')`` on it without expanding ``~``), so a stat round-trip
+        # here mirrors how the normal session-create path stores canonical_path.
+        workspace = await _resolve_default_workspace(deps, host_id)
+    if host_id is task.host_id and workspace is task.workspace:
+        return task
+    return replace(task, host_id=host_id, workspace=workspace)
+
+
+async def _resolve_owner_host(deps: FireDeps, task: ScheduledTask) -> str:
+    """Pick the owner's most-recently-active online host for an unpinned task.
+
+    ``list_hosts`` returns the owner's hosts most-recently-active first and
+    includes offline ones, so the first that is live in the registry is the
+    natural default. First-online is the v1 tiebreak.
+    """
+    if deps.host_store is None or deps.host_registry is None:
+        raise _CannotLaunchScheduledFire(
+            "connected host registry/store is not configured",
+            error_code="host_registry_unavailable",
+        )
+    owner = task.owner_user_id or RESERVED_USER_LOCAL
+    hosts = await asyncio.to_thread(deps.host_store.list_hosts, owner)
+    for host in hosts:
+        if deps.host_registry.get(host.host_id) is not None:
+            return host.host_id
+    raise _CannotLaunchScheduledFire(
+        "no online host is available for the scheduled task owner",
+        error_code="no_online_host",
+    )
+
+
+async def _resolve_default_workspace(deps: FireDeps, host_id: str) -> str:
+    """Canonicalize the host's home directory to an absolute realpath.
+
+    Sends a ``host.stat`` for :data:`_DEFAULT_WORKSPACE` (``~``) to the resolved
+    host — the host expands the tilde against its own ``HOME`` and returns the
+    absolute ``canonical_path``, the same value the normal session-create path
+    stores. Raises :class:`_CannotLaunchScheduledFire` if the host is gone or
+    can't resolve its home dir, so the caller records an honest failed run.
+    """
+    from omnigent.server.routes._workspace_validation import (
+        WorkspaceValidationError,
+        _ask_host_stat,
+    )
+
+    if deps.host_registry is None:
+        raise _CannotLaunchScheduledFire(
+            "connected host registry is not configured",
+            error_code="host_registry_unavailable",
+        )
+    host_conn = deps.host_registry.get(host_id)
+    if host_conn is None:
+        raise _CannotLaunchScheduledFire(
+            f"connected host {host_id!r} is not online on this server",
+            error_code="host_offline",
+        )
+    try:
+        stat = await _ask_host_stat(
+            host_registry=deps.host_registry,
+            host_conn=host_conn,
+            path=_DEFAULT_WORKSPACE,
+        )
+    except WorkspaceValidationError as exc:
+        raise _CannotLaunchScheduledFire(
+            f"could not resolve a default workspace on host {host_id!r}: {exc}",
+            error_code="default_workspace_unresolved",
+        ) from exc
+    canonical = stat.get("canonical_path")
+    if not stat.get("exists") or not isinstance(canonical, str):
+        raise _CannotLaunchScheduledFire(
+            f"host {host_id!r} did not resolve a home directory for the default workspace",
+            error_code="default_workspace_unresolved",
+        )
+    return canonical
 
 
 async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:
@@ -540,54 +677,6 @@ def _make_connected_host_preflight(deps: FireDeps) -> ConnectedHostPreflight:
 def _new_id() -> str:
     """A bare 32-char hex UUID, matching the store's id convention."""
     return uuid.uuid4().hex
-
-
-def _make_default_dispatch(deps: FireDeps) -> LaunchDispatch:
-    """Build the production dispatch that routes on the task's binding.
-
-    A task with a connected host runs on it (launch runner + dispatch prompt); a
-    no-workspace task (neither ``host_id`` nor ``workspace``) seeds its prompt
-    into a default/no-workspace session so a runner can pick it up, mirroring how
-    a CLI-initiated session with no host records its starting prompt.
-    """
-    connected_host_dispatch = _make_connected_host_dispatch(deps)
-    no_workspace_dispatch = _make_no_workspace_dispatch(deps)
-
-    async def _dispatch(conv: Conversation, task: ScheduledTask) -> None:
-        if task.host_id is None and task.workspace is None:
-            await no_workspace_dispatch(conv, task)
-        else:
-            await connected_host_dispatch(conv, task)
-
-    return _dispatch
-
-
-def _make_no_workspace_dispatch(deps: FireDeps) -> LaunchDispatch:
-    """Build the no-workspace dispatch seam.
-
-    A no-workspace task has no host to launch a runner on, so the fire seeds the
-    task's prompt as a durable user message on the freshly created session. The
-    session is already owner-visible (the grant ran before dispatch), so the
-    prompt appears as the opening turn and a runner started against this session
-    picks it up — the no-host analog of the connected-host launch+dispatch.
-    """
-
-    async def _dispatch(conv: Conversation, task: ScheduledTask) -> None:
-        from omnigent.db.utils import generate_task_id
-        from omnigent.entities import MessageData, NewConversationItem
-
-        item = NewConversationItem(
-            type="message",
-            response_id=generate_task_id(),
-            data=MessageData(
-                role="user",
-                content=[{"type": "input_text", "text": task.prompt}],
-            ),
-            created_by=task.owner_user_id,
-        )
-        await asyncio.to_thread(deps.conversation_store.append, conv.id, [item])
-
-    return _dispatch
 
 
 def _make_connected_host_dispatch(deps: FireDeps) -> LaunchDispatch:
