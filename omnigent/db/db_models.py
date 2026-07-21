@@ -342,7 +342,9 @@ class SqlFile(OmnigentBase):
     session_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
 
     __table_args__ = (
-        Index("ix_files_created_at", "workspace_id", "created_at", "id"),
+        # Files are only ever listed per session (WHERE session_id = ?),
+        # so a session-scoped composite is the only index needed. There is
+        # no session-less "all files" listing.
         Index(
             "ix_files_session_id_created_at",
             "workspace_id",
@@ -1009,8 +1011,16 @@ class SqlComment(OmnigentBase):
         server_default="0",
         default=current_workspace_id,
     )
+    # conversation_id leads id in the PK so a conversation's comments stay
+    # contiguous for the per-conversation prefix scans that dominate reads
+    # (list_for_conversation, fingerprints, cascade delete). This subsumes the
+    # old ix_comments_conversation_id secondary index; list_for_conversation's
+    # ORDER BY created_at now filesorts the (small) per-conversation row set.
+    conversation_id: Mapped[str] = mapped_column(
+        Uuid16(),
+        primary_key=True,
+    )
     id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
-    conversation_id: Mapped[str] = mapped_column(Uuid16())
     path: Mapped[str] = mapped_column(String(4096))
     start_index: Mapped[int] = mapped_column(Integer)
     end_index: Mapped[int] = mapped_column(Integer)
@@ -1023,20 +1033,7 @@ class SqlComment(OmnigentBase):
     anchor_content: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
-    __table_args__ = (
-        CheckConstraint("status IN (1, 2)", name="ck_comments_status"),
-        # Serves list_for_conversation: WHERE workspace_id + conversation_id
-        # ORDER BY created_at, id. Folds created_at in (over a bare
-        # conversation_id index) so the sort is index-ordered; trails id to
-        # complete the PK.
-        Index(
-            "ix_comments_conversation_id",
-            "workspace_id",
-            "conversation_id",
-            "created_at",
-            "id",
-        ),
-    )
+    __table_args__ = (CheckConstraint("status IN (1, 2)", name="ck_comments_status"),)
 
 
 def policy_name_cksum(name: str) -> bytes:
@@ -1074,12 +1071,14 @@ class SqlPolicy(OmnigentBase):
     :param id: Opaque PK, e.g. ``"pol_a1b2c3..."``.
     :param name: Human-readable name. UNIQUE per session for
         session policies; globally unique for default policies
-        (``session_id IS NULL``). Uniqueness is enforced on
-        ``name_cksum`` rather than this column.
+        (``session_id IS NULL``). Uniqueness is enforced in the
+        store (application layer), not by a DB constraint, and
+        keys on ``name_cksum`` rather than this column.
     :param name_cksum: sha256 digest of ``name`` (32 bytes). The
-        name-uniqueness indexes key on this compact digest instead
-        of the wide ``VARCHAR(256)`` name. Stamped on INSERT by a
-        column default; recomputed by the store on rename.
+        store's name-uniqueness checks key on this compact digest
+        instead of the wide ``VARCHAR(256)`` name, backed by
+        ``ix_policies_name_cksum``. Stamped on INSERT by a column
+        default; recomputed by the store on rename.
     :param session_id: FK to ``conversations.id``. ``None`` for
         server-wide default policies. ``ON DELETE CASCADE`` so
         removing a session cleans up its policies.
@@ -1151,21 +1150,24 @@ class SqlPolicy(OmnigentBase):
     __table_args__ = (
         CheckConstraint("type IN (1, 2)", name="ck_policies_type"),
         CheckConstraint("scope IN (1, 2)", name="ck_policies_scope"),
-        Index("ix_policies_created_at", "workspace_id", "created_at", "id"),
-        Index("ix_policies_session_id", "workspace_id", "session_id", "id"),
-        # Name uniqueness keys on name_cksum (sha256 of name) rather than the
-        # wide name column, for a compact 32-byte index entry.
-        UniqueConstraint(
-            "workspace_id",
-            "session_id",
-            "name_cksum",
-            name="uq_policies_session_id_name_cksum",
-        ),
-        # Default policies must have unique names; session-scoped policies
-        # may reuse the same name. That "unique only within the default set"
-        # rule can't be a partial unique index (MySQL has none), so it is
-        # enforced in the store (add_default / update_default). This plain
-        # index just backs the name_cksum lookup those checks perform.
+        # One index serves both listing paths. scope leads (the global-vs-
+        # session discriminator), then session_id:
+        #   - list_defaults:     WHERE workspace_id=? AND scope='default'
+        #   - list_for_session:  WHERE workspace_id=? AND scope='session'
+        #                              AND session_id=?
+        # scope must precede session_id so the defaults query (which does not
+        # constrain session_id) can still seek. Both listings sort their small
+        # result set by created_at in memory (created_at is deliberately left
+        # out — it can't cover both sorts, see migration d4c1b9e6f3a2).
+        # Any future session_id lookup must also constrain scope to seek here.
+        Index("ix_policies_scope_session", "workspace_id", "scope", "session_id", "id"),
+        # Name uniqueness is enforced in the store, not by a DB constraint:
+        # default policies must have globally-unique names while session
+        # policies must be unique only within their session — a "unique within
+        # a subset" rule that can't be a partial unique index (MySQL has none).
+        # The store's create/update checks (session) and create_default/
+        # update_default (default) key on name_cksum; this plain index backs
+        # those lookups.
         Index("ix_policies_name_cksum", "workspace_id", "name_cksum", "id"),
     )
 
