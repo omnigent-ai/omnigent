@@ -716,7 +716,10 @@ class TestSqlComment:
             session.add(comment)
 
         with managed() as session:
-            loaded = session.get(SqlComment, (0, "cccccccccccccccccccccccccccccc01"))
+            loaded = session.get(
+                SqlComment,
+                (0, "a9930027fd3e2e979e65844f7af7bf88", "cccccccccccccccccccccccccccccc01"),
+            )
             assert loaded is not None
             assert loaded.path == "src/App.tsx"
             assert loaded.body == "Looks good!"
@@ -746,7 +749,10 @@ class TestSqlComment:
             session.add(comment)
 
         with managed() as session:
-            loaded = session.get(SqlComment, (0, "cccccccccccccccccccccccccccccc02"))
+            loaded = session.get(
+                SqlComment,
+                (0, "a9930027fd3e2e979e65844f7af7bf88", "cccccccccccccccccccccccccccccc02"),
+            )
             assert loaded is not None
             assert loaded.anchor_content is None
             assert loaded.created_by is None

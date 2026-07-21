@@ -164,7 +164,10 @@ def test_remap_repoints_comments_policies_tokens_hosts(db_uri: str) -> None:
 
     with Session(engine) as s:
         assert (
-            s.get(SqlComment, (0, "747618b4b2dd94383e50ddf180ceddc3")).created_by
+            s.get(
+                SqlComment,
+                (0, "8af356d908005a65f872c246158c6293", "747618b4b2dd94383e50ddf180ceddc3"),
+            ).created_by
             == "alice@example.com"
         )
         assert (

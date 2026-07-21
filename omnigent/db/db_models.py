@@ -1011,8 +1011,16 @@ class SqlComment(OmnigentBase):
         server_default="0",
         default=current_workspace_id,
     )
+    # conversation_id leads id in the PK so a conversation's comments stay
+    # contiguous for the per-conversation prefix scans that dominate reads
+    # (list_for_conversation, fingerprints, cascade delete). This subsumes the
+    # old ix_comments_conversation_id secondary index; list_for_conversation's
+    # ORDER BY created_at now filesorts the (small) per-conversation row set.
+    conversation_id: Mapped[str] = mapped_column(
+        Uuid16(),
+        primary_key=True,
+    )
     id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
-    conversation_id: Mapped[str] = mapped_column(Uuid16())
     path: Mapped[str] = mapped_column(String(4096))
     start_index: Mapped[int] = mapped_column(Integer)
     end_index: Mapped[int] = mapped_column(Integer)
@@ -1025,20 +1033,7 @@ class SqlComment(OmnigentBase):
     anchor_content: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
-    __table_args__ = (
-        CheckConstraint("status IN (1, 2)", name="ck_comments_status"),
-        # Serves list_for_conversation: WHERE workspace_id + conversation_id
-        # ORDER BY created_at, id. Folds created_at in (over a bare
-        # conversation_id index) so the sort is index-ordered; trails id to
-        # complete the PK.
-        Index(
-            "ix_comments_conversation_id",
-            "workspace_id",
-            "conversation_id",
-            "created_at",
-            "id",
-        ),
-    )
+    __table_args__ = (CheckConstraint("status IN (1, 2)", name="ck_comments_status"),)
 
 
 def policy_name_cksum(name: str) -> bytes:
