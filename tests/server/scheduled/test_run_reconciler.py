@@ -32,7 +32,6 @@ class _RunRow:
     finished_at: int | None = None
     error: str | None = None
     error_code: str | None = None
-    workspace_id: int = 0
 
 
 class _FakeScheduledTaskStore:

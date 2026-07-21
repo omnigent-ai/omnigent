@@ -80,7 +80,6 @@ def _run_to_entity(row: SqlScheduledTaskRun) -> ScheduledTaskRun:
         finished_at=row.finished_at,
         error=row.error,
         error_code=row.error_code,
-        workspace_id=row.workspace_id or DEFAULT_WORKSPACE_ID,
     )
 
 
