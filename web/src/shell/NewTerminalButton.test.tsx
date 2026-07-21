@@ -39,6 +39,7 @@ function terminalFirstCtx(isNativeWrapper: boolean): TerminalFirstContextValue {
     view: "chat",
     terminalViewKey: null,
     setView: () => {},
+    exitShellView: () => {},
     terminalsAvailable: true,
     terminalStartingUp: false,
   } as TerminalFirstContextValue;

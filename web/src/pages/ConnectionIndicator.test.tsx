@@ -22,6 +22,7 @@ function makeCtx(overrides: Partial<TerminalFirstContextValue> = {}): TerminalFi
     view: "chat",
     terminalViewKey: null,
     setView: vi.fn(),
+    exitShellView: vi.fn(),
     terminalsAvailable: true,
     terminalStartingUp: false,
     ...overrides,

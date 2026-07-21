@@ -229,6 +229,15 @@ export function AppShell() {
     () => readFilesPanelPreferences().sort,
   );
   const [panelInitialKey, setPanelInitialKeyState] = useState<string | null>(null);
+  // Remember the last non-shell view (chat = null, or the agent terminal)
+  // so closing a user shell returns there instead of a hard-coded
+  // destination. Opening a shell overwrites `panelInitialKey` with the
+  // shell key; this ref keeps whatever was showing just before that.
+  const lastNonShellKeyRef = useRef<string | null>(null);
+  useEffect(() => {
+    const inShell = !!panelInitialKey && !isAgentTerminalKey(panelInitialKey);
+    if (!inShell) lastNonShellKeyRef.current = panelInitialKey;
+  }, [panelInitialKey]);
   const [executionLogsKey, setExecutionLogsKey] = useState<string | null>(null);
   const [filesPanelOpen, setFilesPanelOpen] = useState(false);
   // Mobile-only full-screen drawers for the rail tabs that have no desktop
@@ -1157,6 +1166,16 @@ export function AppShell() {
     [terminalFirst, terminals, setPanelInitialKey],
   );
 
+  // Close (✕) affordance for a user-shell view: return to whatever was
+  // showing before the shell took over — the agent terminal if we came
+  // from it, otherwise chat. `setView` resolves the agent terminal
+  // robustly (and falls back to chat when none is open).
+  const exitShellView = useCallback(() => {
+    const prev = lastNonShellKeyRef.current;
+    if (prev && isAgentTerminalKey(prev)) setView("terminal");
+    else setView("chat");
+  }, [setView]);
+
   // `terminals` is already runner-accurate (useTerminals empties it when the
   // runner is offline), so a non-empty list means an openable PTY.
   const terminalsAvailable = terminals.length > 0;
@@ -1197,6 +1216,7 @@ export function AppShell() {
       view: panelOpen ? "terminal" : "chat",
       terminalViewKey: panelInitialKey,
       setView,
+      exitShellView,
       terminalsAvailable,
       terminalStartingUp,
     }),
@@ -1208,6 +1228,7 @@ export function AppShell() {
       panelOpen,
       panelInitialKey,
       setView,
+      exitShellView,
       terminalsAvailable,
       terminalStartingUp,
     ],

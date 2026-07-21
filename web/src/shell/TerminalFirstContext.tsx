@@ -60,6 +60,14 @@ export interface TerminalFirstContextValue {
   /** Switch view. `"terminal"` opens the terminal surface. */
   setView: (view: TerminalFirstView) => void;
   /**
+   * Leave the current user-shell view, returning to whatever was showing
+   * before the shell took over the main view — the agent terminal if that
+   * was the prior view, otherwise chat. The shell view's close (✕)
+   * affordance calls this so closing a shell never strands the user on a
+   * hard-coded destination.
+   */
+  exitShellView: () => void;
+  /**
    * True when a terminal exists AND is reachable (the runner is online) —
    * i.e. there's a PTY the "Terminal" pill can open right now. False on a
    * stopped/offline runner, which greys the button.

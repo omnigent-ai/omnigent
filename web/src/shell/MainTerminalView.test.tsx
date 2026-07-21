@@ -57,12 +57,12 @@ const BASH_SHELL: TerminalInfo = {
  * TerminalFirst context for the two session shapes under test — the
  * terminal-first SDK session and the native wrapper; both render the
  * agent terminal chrome-free and shells via the shell view.
- * `setView` is a spy so the shell view's close affordance is
+ * `exitShellView` is a spy so the shell view's close affordance is
  * assertable.
  */
 function makeCtx(
   isNativeWrapper: boolean,
-  setView: (view: "chat" | "terminal") => void = () => {},
+  exitShellView: () => void = () => {},
 ): TerminalFirstContextValue {
   return {
     isClaudeNative: isNativeWrapper,
@@ -71,7 +71,8 @@ function makeCtx(
     isShellView: false,
     view: "terminal",
     terminalViewKey: null,
-    setView,
+    setView: () => {},
+    exitShellView,
     terminalsAvailable: true,
     terminalStartingUp: false,
   } as TerminalFirstContextValue;
@@ -82,17 +83,17 @@ function renderView({
   isNativeWrapper = false,
   initialTerminalKey = null,
   readOnly = false,
-  setView,
+  exitShellView,
 }: {
   terminals: TerminalInfo[];
   isNativeWrapper?: boolean;
   initialTerminalKey?: string | null;
   readOnly?: boolean;
-  setView?: (view: "chat" | "terminal") => void;
+  exitShellView?: () => void;
 }) {
   useTerminalsMock.mockReturnValue({ terminals, isLoading: false, error: null });
   return render(
-    <TerminalFirstContextProvider value={makeCtx(isNativeWrapper, setView)}>
+    <TerminalFirstContextProvider value={makeCtx(isNativeWrapper, exitShellView)}>
       <MainTerminalView
         conversationId="conv_sdk"
         initialTerminalKey={initialTerminalKey}
@@ -151,11 +152,11 @@ describe("MainTerminalView — terminal-first SDK sessions", () => {
   });
 
   it("renders a rail-opened shell chrome-free: shell header + close, no agent tab", () => {
-    const setView = vi.fn();
+    const exitShellView = vi.fn();
     renderView({
       terminals: [REPL_TERMINAL, BASH_SHELL],
       initialTerminalKey: "terminal:terminal_bash_s1",
-      setView,
+      exitShellView,
     });
 
     // The shell replaced the view (this is the rail row's target).
@@ -170,10 +171,12 @@ describe("MainTerminalView — terminal-first SDK sessions", () => {
     expect(screen.queryByText("tui")).toBeNull();
     expect(screen.queryByTestId("new-shell-button")).toBeNull();
 
-    // The close X is the way back to chat (the Chat/Terminal pill is
-    // hidden in shell view — ConnectionIndicator gates on isShellView).
+    // The close X delegates to exitShellView, which restores the pre-shell
+    // view (chat or the agent terminal — AppShell owns which). The
+    // Chat/Terminal pill is hidden in shell view (ConnectionIndicator gates
+    // on isShellView), so this ✕ is the way out.
     fireEvent.click(screen.getByRole("button", { name: "Close shell" }));
-    expect(setView).toHaveBeenCalledWith("chat");
+    expect(exitShellView).toHaveBeenCalled();
   });
 });
 
@@ -210,22 +213,22 @@ describe("MainTerminalView — native wrapper sessions", () => {
       session: "main",
       running: true,
     };
-    const setView = vi.fn();
+    const exitShellView = vi.fn();
     renderView({
       terminals: [claudePane, BASH_SHELL],
       isNativeWrapper: true,
       initialTerminalKey: "terminal:terminal_bash_s1",
-      setView,
+      exitShellView,
     });
 
     // Same shell-view contract as SDK sessions: shell header only, no
-    // vendor-pane tab, X back to chat.
+    // vendor-pane tab, X delegates to exitShellView (restore prior view).
     expect(screen.getByTestId("terminal-view")).toHaveAttribute(
       "data-terminal-id",
       "terminal_bash_s1",
     );
     expect(screen.queryByText("claude")).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Close shell" }));
-    expect(setView).toHaveBeenCalledWith("chat");
+    expect(exitShellView).toHaveBeenCalled();
   });
 });

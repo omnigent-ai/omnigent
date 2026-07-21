@@ -99,7 +99,8 @@ export function MainTerminalView({
   // a single header row naming the shell plus a close X — no agent tab
   // (the shell is not the agent). The Chat/Terminal pill is hidden in
   // this state too (ConnectionIndicator gates on the context's
-  // `isShellView`), so the X is the way back to chat.
+  // `isShellView`), so the X is the way out — back to whatever showed
+  // before the shell took over (chat or the agent terminal).
   const isShellView =
     (terminalFirstCtx?.isTerminalFirst ?? false) &&
     activeTerminal !== null &&
@@ -151,7 +152,7 @@ export function MainTerminalView({
                 <button
                   type="button"
                   aria-label="Close shell"
-                  onClick={() => terminalFirstCtx?.setView("chat")}
+                  onClick={() => terminalFirstCtx?.exitShellView()}
                   className="cursor-pointer rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
                 >
                   <XIcon className="size-3.5" />
