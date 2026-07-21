@@ -89,6 +89,7 @@ const _bootProbe: Promise<ServerInfo> = Promise.race([
           public_sharing_enabled: true,
           server_version: null,
           smart_routing_enabled: false,
+          branding: null,
         }),
       1500,
     ),
@@ -96,6 +97,20 @@ const _bootProbe: Promise<ServerInfo> = Promise.race([
 ]);
 
 void _bootProbe.then((info) => {
+  if (info.branding?.app_name) {
+    document.title = info.branding.app_name;
+  }
+  const faviconUrl = info.branding?.logos?.favicon;
+  if (faviconUrl) {
+    let link = document.querySelector<HTMLLinkElement>('link[rel="icon"]');
+    if (!link) {
+      link = document.createElement("link");
+      link.rel = "icon";
+      document.head.appendChild(link);
+    }
+    link.removeAttribute("type"); // let the browser sniff the custom file's type
+    link.href = faviconUrl;
+  }
   createRoot(document.getElementById("root")!).render(
     <StrictMode>
       <CapabilitiesProvider info={info}>

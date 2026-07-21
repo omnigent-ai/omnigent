@@ -54,6 +54,7 @@ import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { sandboxOptionLabel } from "@/lib/capabilities";
+import { useHeading, usePoweredBy } from "@/lib/branding";
 import { isSlashCommandText, SlashCommandMenu } from "@/components/SlashCommandMenu";
 import { setPendingInitialPrompt } from "@/store/chatStore";
 import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
@@ -121,7 +122,8 @@ import {
   parseMentionToken,
   rankMentionEntries,
 } from "@/lib/composerMentions";
-import { OttoEyes } from "@/components/OttoEyes";
+import { BrandLogo } from "@/components/BrandLogo";
+import { PoweredByOmnigent } from "@/components/PoweredByOmnigent";
 import { SkillPills } from "@/components/SkillPills";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
 import { IntelligentModelControl, type CostControlMode } from "@/components/CostRoutingControl";
@@ -1788,6 +1790,8 @@ export function NewChatLandingScreen() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const queryClient = useQueryClient();
+  const heading = useHeading();
+  const poweredBy = usePoweredBy();
   const serverUrl = getCliServerUrl();
   const { data: agents } = useAvailableAgents();
   const brainHarnessLabels = useBrainHarnessLabels();
@@ -3011,7 +3015,7 @@ export function NewChatLandingScreen() {
     // the hero reads better optically.
     <div
       ref={setLandingSurface}
-      className="flex flex-1 items-center justify-center"
+      className="relative flex flex-1 items-center justify-center"
       data-testid="new-chat-landing"
     >
       {/* Padding lives inside the 840px cap, so the composer renders at
@@ -3020,10 +3024,12 @@ export function NewChatLandingScreen() {
           edges; widens to the full px-10 at the md breakpoint and up. */}
       <div className="flex w-full max-w-[840px] flex-col items-center gap-8 px-4 pt-8 pb-16 md:select-none md:px-10">
         <div className="flex flex-col items-center gap-3.5 sm:flex-row">
-          <OttoEyes className="h-18 w-auto shrink-0" />
-          <h1 className="text-center text-3xl font-medium tracking-[-0.03em] text-foreground sm:text-left">
-            What should we do?
-          </h1>
+          <BrandLogo variant="eyes" className="h-18 w-auto shrink-0" />
+          {heading ? (
+            <h1 className="text-center text-3xl font-medium tracking-[-0.03em] text-foreground sm:text-left">
+              {heading}
+            </h1>
+          ) : null}
         </div>
         <div className="relative flex w-full flex-col gap-3">
           <form
@@ -3885,6 +3891,15 @@ export function NewChatLandingScreen() {
           )}
         </div>
       </div>
+
+      {/* pointer-events: the bar ignores clicks, only the mark is interactive. */}
+      {poweredBy ? (
+        <footer className="pointer-events-none absolute inset-x-0 bottom-0 flex justify-center pb-4">
+          <div className="pointer-events-auto">
+            <PoweredByOmnigent />
+          </div>
+        </footer>
+      ) : null}
 
       {/* Connect-host instructions, reachable from the host dropdown even when
           no hosts are online — the zero-host escape hatch. */}

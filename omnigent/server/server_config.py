@@ -142,3 +142,85 @@ def copy_total_bytes_limit() -> int:
     from omnigent.runtime.content_resolver import MAX_COPY_TOTAL_BYTES
 
     return _config_positive_int("copy_max_total_bytes", MAX_COPY_TOTAL_BYTES)
+
+
+def _branding_section() -> dict[str, Any]:
+    """Return the ``branding:`` mapping, or ``{}`` when absent/not a map."""
+    section = load_server_config().get("branding")
+    return section if isinstance(section, dict) else {}
+
+
+def _branding_str(key: str) -> str | None:
+    """Return a stripped non-empty branding string for *key*, else None."""
+    raw = _branding_section().get(key)
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    return text or None
+
+
+def _branding_heading() -> str | None:
+    """Return the heading, preserving an explicit ``""``; None only when unset."""
+    section = _branding_section()
+    if section.get("heading") is None:
+        return None
+    return str(section["heading"]).strip()
+
+
+def _branding_powered_by() -> bool:
+    """Whether to show the "Powered by Omnigent" attribution (default True)."""
+    value = _branding_section().get("powered_by")
+    return True if value is None else bool(value)
+
+
+LOGO_VARIANTS: tuple[str, ...] = ("main", "loading", "favicon")
+
+
+def _resolve_under_config_dir(name: str) -> Path | None:
+    """Resolve *name* under the config file's directory, or None if it escapes it or is missing."""
+    config_path = resolve_config_path()
+    base = (config_path.parent if config_path is not None else resolve_data_dir()).resolve()
+    path = (base / name).resolve()
+    try:
+        path.relative_to(base)
+    except ValueError:
+        logger.warning("branding.logo %r escapes the config directory — ignoring", name)
+        return None
+    return path if path.is_file() else None
+
+
+def _branding_logo_names() -> dict[str, str]:
+    """Map logo variant to filename from ``branding.logo`` (a bare string sets ``main``)."""
+    raw = _branding_section().get("logo")
+    if isinstance(raw, str):
+        name = raw.strip()
+        return {"main": name} if name else {}
+    if isinstance(raw, dict):
+        names: dict[str, str] = {}
+        for variant in LOGO_VARIANTS:
+            value = raw.get(variant)
+            if isinstance(value, str) and value.strip():
+                names[variant] = value.strip()
+        return names
+    return {}
+
+
+def branding_logo_file(variant: str = "main") -> Path | None:
+    """Resolve the configured logo file for *variant*, or None."""
+    name = _branding_logo_names().get(variant)
+    if name is None:
+        return None
+    return _resolve_under_config_dir(name)
+
+
+def branding_config() -> dict[str, Any]:
+    """Branding block surfaced by ``GET /v1/info`` for the web UI."""
+    return {
+        "app_name": _branding_str("app_name"),
+        "heading": _branding_heading(),
+        "logos": {
+            variant: (f"/v1/branding/logo/{variant}" if branding_logo_file(variant) else None)
+            for variant in LOGO_VARIANTS
+        },
+        "powered_by": _branding_powered_by(),
+    }

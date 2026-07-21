@@ -32,6 +32,26 @@ import { hostFetch } from "./host";
 export type SharingMode = "on" | "read_only" | "restricted_read_only" | "off";
 const _SHARING_MODES: readonly SharingMode[] = ["on", "read_only", "restricted_read_only", "off"];
 
+/**
+ * Operator branding from ``GET /v1/info``.
+ *
+ * - ``app_name`` — null when unset (UI uses "Omnigent").
+ * - ``heading`` — null when unset (UI uses its default); an explicit empty
+ *   string ``""`` is preserved and hides the hero heading.
+ * - ``logos`` — per-variant logo routes (``main``, ``loading``, ``favicon``);
+ *   each is null when that variant has no configured file (the UI keeps its
+ *   built-in default — the Otto mascot in-app, the shipped favicon in the tab).
+ * - ``powered_by`` — whether to show the "Powered by Omnigent" attribution
+ *   under the landing composer (only rendered when custom branding is set).
+ *   Defaults to true; an explicit false hides it.
+ */
+export interface Branding {
+  app_name: string | null;
+  heading: string | null;
+  logos: { main: string | null; loading: string | null; favicon: string | null };
+  powered_by: boolean;
+}
+
 /** Shape of the response from ``GET /v1/info``. */
 export interface ServerInfo {
   accounts_enabled: boolean;
@@ -103,6 +123,41 @@ export interface ServerInfo {
    * (``OMNIGENT_SMART_ROUTING=1`` + ``llm:`` config). Hidden by default.
    */
   smart_routing_enabled: boolean;
+  /**
+   * Operator branding (custom app name / hero heading / logo). ``null`` when
+   * the server sets no branding, so the UI uses its built-in defaults.
+   * Optional so older probe payloads / test fixtures that omit it still
+   * satisfy the shape — a missing value is treated the same as ``null``.
+   */
+  branding?: Branding | null;
+}
+
+/**
+ * Normalize the raw ``branding`` blob from ``/v1/info`` into {@link Branding}.
+ *
+ * Returns null when absent or when every field is empty, so callers can treat
+ * "no branding" as a single null check and fall back to defaults.
+ */
+function parseBranding(raw: unknown): Branding | null {
+  if (raw === null || typeof raw !== "object") return null;
+  const b = raw as Record<string, unknown>;
+  const nonEmpty = (v: unknown): string | null =>
+    typeof v === "string" && v.trim() !== "" ? v : null;
+  const app_name = nonEmpty(b.app_name);
+  // heading preserves an explicit "" (hides the heading); null only when unset.
+  const heading = typeof b.heading === "string" ? b.heading : null;
+  const rawLogos = (b.logos ?? {}) as Record<string, unknown>;
+  const logos = {
+    main: nonEmpty(rawLogos.main),
+    loading: nonEmpty(rawLogos.loading),
+    favicon: nonEmpty(rawLogos.favicon),
+  };
+  const noLogos = logos.main === null && logos.loading === null && logos.favicon === null;
+  const powered_by = b.powered_by !== false;
+  if (app_name === null && heading === null && noLogos && powered_by) {
+    return null;
+  }
+  return { app_name, heading, logos, powered_by };
 }
 
 /** Sentinel used when the probe fails — accounts is off, no login URL. */
@@ -121,6 +176,7 @@ const _OFF: ServerInfo = {
   public_sharing_enabled: true,
   server_version: null,
   smart_routing_enabled: false,
+  branding: null,
 };
 
 let _cached: ServerInfo | null = null;
@@ -161,6 +217,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           public_sharing_enabled: data.public_sharing_enabled !== false,
           server_version: typeof data.server_version === "string" ? data.server_version : null,
           smart_routing_enabled: data.smart_routing_enabled === true,
+          branding: parseBranding(data.branding),
         };
         return _cached;
       }
