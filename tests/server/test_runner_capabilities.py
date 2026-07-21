@@ -157,6 +157,7 @@ def test_relaunch_invalidates_previous_token(
         "APPEND_EVENT",
         "REPORT_USAGE",
         "EVALUATE_POLICY",
+        "PROXY_MCP",
     ],
 )
 def test_runner_action_allow_list(

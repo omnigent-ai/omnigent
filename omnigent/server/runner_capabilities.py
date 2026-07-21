@@ -25,6 +25,13 @@ class RunnerAction(str, Enum):
     APPEND_EVENT = "append_event"
     REPORT_USAGE = "report_usage"
     EVALUATE_POLICY = "evaluate_policy"
+    # Dispatch the session's own MCP tool calls through the server MCP
+    # proxy. Needed when the runner's inherited credential is not the
+    # session owner (in-app / shared host, where session owner differs
+    # from host owner) and so cannot pass a human EDIT check. Server-side
+    # TOOL_CALL / TOOL_RESULT policy still runs on every proxied call, so
+    # this never widens a runner into general edit authority.
+    PROXY_MCP = "proxy_mcp"
 
 
 _ALLOWED_ACTIONS: frozenset[RunnerAction] = frozenset(RunnerAction)

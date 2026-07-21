@@ -252,6 +252,52 @@ async def test_runner_can_evaluate_policy(
     )
 
 
+async def test_runner_can_proxy_mcp(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A runner can dispatch its session's MCP tool calls via the proxy.
+
+    Regression guard: the MCP proxy (``POST /v1/sessions/{id}/mcp``) is
+    how SDK harnesses (pi, claude) dispatch tools. When the session owner
+    differs from the host owner (in-app / shared host), the runner's only
+    credential is its binding token, so the proxy must authorize it as a
+    runner capability. Auth succeeding is proven by reaching the JSON-RPC
+    layer (200 with a ``-32000`` "no runner bound" body) rather than an
+    HTTP 401/403/404 from the auth check.
+    """
+    session_id, token = await _create_session(auth_client, _USER, db_uri)
+
+    resp = await auth_client.post(
+        f"/v1/sessions/{session_id}/mcp",
+        json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+        headers={**_runner_headers(token), "Content-Type": "application/json"},
+    )
+    assert resp.status_code == 200, (
+        f"runner MCP proxy should be authorized; got {resp.status_code}: {resp.text}"
+    )
+
+
+async def test_runner_cannot_proxy_mcp_on_other_session(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A runner token bound to session A grants no MCP proxy on session B."""
+    _session_a, token_a = await _create_session(auth_client, _USER, db_uri)
+    session_b, _token_b = await _create_session(
+        auth_client, _USER, db_uri, binding_token=_OTHER_TOKEN
+    )
+
+    resp = await auth_client.post(
+        f"/v1/sessions/{session_b}/mcp",
+        json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+        headers={**_runner_headers(token_a), "Content-Type": "application/json"},
+    )
+    assert resp.status_code in (401, 403, 404), (
+        f"runner token A on session B MCP should be denied; got {resp.status_code}: {resp.text}"
+    )
+
+
 # ── Forbidden routes: runner token must not confer general access ──
 
 
