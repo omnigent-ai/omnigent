@@ -2,6 +2,7 @@ package ai.omnigent.android
 
 import android.content.res.Configuration
 import androidx.core.view.WindowInsetsControllerCompat
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -13,11 +14,15 @@ import org.robolectric.annotation.Config
 @Config(sdk = [35])
 class MainActivityTest {
     @Test
-    fun `configuration change preserves explicit light system bars`() {
+    fun `configuration change preserves SPA-applied system bar polarity`() {
         // Skip onCreate to isolate the bare config-change path from WebView dispatch.
         val activity = Robolectric.buildActivity(MainActivity::class.java).get()
         activity.applyColorScheme(isLight = true)
         val insetsController = WindowInsetsControllerCompat(activity.window, activity.window.decorView)
+        val statusBarsWereLight = insetsController.isAppearanceLightStatusBars
+        val navigationBarsWereLight = insetsController.isAppearanceLightNavigationBars
+        assertTrue(statusBarsWereLight)
+        assertTrue(navigationBarsWereLight)
 
         val darkConfiguration =
             Configuration(activity.resources.configuration).apply {
@@ -27,8 +32,9 @@ class MainActivityTest {
             }
         activity.onConfigurationChanged(darkConfiguration)
 
-        assertTrue(insetsController.isAppearanceLightStatusBars)
-        assertTrue(insetsController.isAppearanceLightNavigationBars)
+        // The SPA owns resolved polarity; config changes must not re-derive it from uiMode.
+        assertEquals(statusBarsWereLight, insetsController.isAppearanceLightStatusBars)
+        assertEquals(navigationBarsWereLight, insetsController.isAppearanceLightNavigationBars)
     }
 
     private fun MainActivity.applyColorScheme(isLight: Boolean) {

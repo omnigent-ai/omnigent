@@ -63,6 +63,15 @@ class OmnigentBridgeListenerTest {
     }
 
     @Test
+    fun `setColorScheme rejects non-string schemes`() {
+        listener.handle("""{"method":"setColorScheme","scheme":123}""")
+        listener.handle("""{"method":"setColorScheme","scheme":{"value":"light"}}""")
+        shadowOf(Looper.getMainLooper()).idle()
+
+        assertEquals(emptyList<Boolean>(), appliedLightValues)
+    }
+
+    @Test
     fun `setBadgeCount message posts the badge with parsed fields`() {
         listener.handle(
             """{"method":"setBadgeCount","count":3,"navigatePath":"/inbox","title":"T","body":"B"}""",
