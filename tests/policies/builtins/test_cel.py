@@ -172,13 +172,15 @@ def test_invalid_syntax_raises() -> None:
         cel_policy(expression="event.type ==== bad")
 
 
-def test_non_serializable_field_abstains() -> None:
-    """Events with non-JSON-serializable fields (e.g. llm_client) abstain."""
+def test_llm_client_stripped_from_cel_event() -> None:
+    """llm_client is dropped before json_to_cel; the expression still evaluates."""
 
     class _FakeLLMClient:
         pass
 
     evaluate = cel_policy(expression='{"result": "DENY"}')
     # The engine injects llm_client (a live object) into every real event.
-    # json_to_cel raises ValueError on it; the policy must abstain, not crash.
-    assert evaluate({"type": "request", "llm_client": _FakeLLMClient()}) is None  # type: ignore[typeddict-unknown-key]
+    # CEL expressions cannot use it and json_to_cel cannot convert it, so it
+    # is stripped before marshalling. The expression must evaluate normally.
+    result = evaluate({"type": "request", "llm_client": _FakeLLMClient()})  # type: ignore[typeddict-unknown-key]
+    assert result == {"result": "DENY", "reason": "Denied by policy."}
